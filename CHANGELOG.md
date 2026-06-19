@@ -1,0 +1,360 @@
+# Changelog
+
+This file tracks what has already landed in ripclone. For upcoming work see `ROADMAP.md`.
+
+## Adversarial review fixes
+
+- **Fixed Fly client archive-extraction benchmark** (`scripts/fly_client_test.sh`, `docs/ARCHIVE_AB_RESULTS.md`)
+  - The benchmark script now captures `ripclone` logs so performance debugging is possible.
+  - It also unmounts overlay targets and deletes `/dev/shm/ripclone-overlay-*` staging directories between runs.
+  - Previously, leftover staging consumed `/dev/shm` and forced archive extraction to fall back to the slow rootfs, making it look ~8× slower than it really is.
+  - Updated A/B numbers: archive extraction on Fly client (overlay) is ~10.5 s vs ~6.0 s for `git checkout-index`, not ~49 s.
+
+- **Fixed overlay space estimation** (`rust/src/client.rs`)
+  - `should_use_overlay` was using only the last archive chunk's size as the compressed estimate.
+  - It now sums `compressed_len` across all frames, which equals the total compressed archive size.
+
+- **Fixed benchmark cleanup** (`scripts/benchmark_archive.sh`, `scripts/benchmark_latency.sh`, `scripts/benchmark_remote.sh`, `scripts/e2e_clonepack.sh`)
+  - Added overlay unmount and `/dev/shm/ripclone-overlay-*` cleanup so repeated local runs do not fall back to rootfs.
+  - Removed undefined `frame_count` references from benchmark summaries.
+
+- **Removed stale server env vars** (`Dockerfile`)
+  - Dropped unused `REPOLAYER_*` variables left over from an earlier name.
+
+## Roadmap cleanup
+
+- Moved completed roadmap items to this changelog: clonepack format, integration tests, overlay staging, S3/storage backend, retention, smart-HTTP fallback, git remote helper, token auth, rate limiting, metrics, and health endpoints.
+- Added the four cloud-session changes to the active plan in `ROADMAP.md`.
+
+## Protobuf clonepack format
+
+- **Protobuf schema for all clonepack artifacts** (`rust/proto/clonepack.proto`, `rust/build.rs`, `rust/Cargo.toml`)
+  - Added `prost` + `prost-build` and a `proto/clonepack.proto` schema.
+  - `ClonepackManifest` is the top-level per-commit protobuf.
+  - `MetadataChunk` bundles skeleton pack/idx, HEAD-blobs pack/idx, prebuilt `.git/index`, frame table, and file table.
+  - `ChunkRef` stores SHA-256 hash bytes + byte length for every content-addressed chunk.
+
+- **CAS uses SHA-256** (`rust/src/cas.rs`, `rust/src/retention.rs`)
+  - Content-addressed chunks are now hashed with SHA-256 instead of SHA-1.
+  - Updated retention scanning to recognize 64-byte hashes.
+
+- **Archive builder emits content-addressed chunks** (`rust/src/archive.rs`)
+  - `ArchiveBuilder::build_chunks` groups zstd frames into 1–8 MB archive chunks.
+  - Frame table records `chunk_index` + `chunk_offset` so commits can share chunks.
+  - `ArchiveBuilder::build` still writes a single local archive file for CLI/debug use.
+
+- **Metadata chunk helpers** (`rust/src/manifest.rs`, `rust/src/clonepack.rs`)
+  - Replaced the custom binary manifest with protobuf `MetadataChunk` encode/decode.
+  - Added `verify_archive`, `fragments_by_frame`, and `archive_chunk_lengths` helpers.
+
+- **Server builds and stores clonepack manifests** (`rust/src/server.rs`, `rust/src/lib.rs`)
+  - `do_sync` assembles the full `MetadataChunk`, stores archive chunks separately, builds a `ClonepackManifest`, and stores it in the CAS.
+  - `RefInfo` and `RefResponse` now include `clonepack_manifest`.
+  - Storage upload and retention protection cover archive chunks and the clonepack manifest.
+
+- **Client downloads the metadata chunk** (`rust/src/client.rs`)
+  - `install_ref`, `install_worktree_files`, and `install_git_dir` now fetch a single metadata chunk protobuf and write the skeleton/HEAD-blobs packs and prebuilt index from it.
+  - Eliminates five separate artifact round-trips on the hot clone path.
+
+- **Client fetches the top-level clonepack manifest** (`rust/src/client.rs`, `rust/src/extract.rs`)
+  - `Client::fetch_clonepack` decodes the `ClonepackManifest`, then fetches the metadata chunk it references.
+  - `install_repo` and `add_worktree` now discover metadata and archive chunks through the clonepack manifest.
+  - Added `extract::extract_clonepack_streaming` to materialize the working tree directly from archive chunks.
+  - Archive-chunk extraction is behind `RIPCLONE_EXTRACT_ARCHIVE=1` so it can be A/B tested against the default `git checkout-index` path.
+
+- **A/B test archive extraction vs. checkout-index** (`docs/ARCHIVE_AB_RESULTS.md`)
+  - Measured locally, macOS → Fly, and Fly client → Fly server for `pandas-dev/pandas` and `oven-sh/bun`.
+  - Checkout-index is faster over the network and in the cloud; archive extraction wins only locally.
+  - Decision: keep `git checkout-index` as the default; archive extraction stays opt-in.
+
+- **Cleaned up legacy `RefResponse` fields** (`rust/src/server.rs`, `rust/src/client.rs`)
+  - Removed `skeleton_pack`, `skeleton_idx`, `head_blobs_pack`, `head_blobs_idx`, `prebuilt_index`, `archive`, and `manifest` from the public `/v1/repos/.../refs/...` JSON response.
+  - Wired `install_git_dir` and `skeleton_clone` through `fetch_clonepack` so the git remote helper no longer relies on the legacy `manifest` field.
+  - Updated benchmark scripts to use `clonepack_manifest` instead of the removed fields.
+
+- **Integration test for clonepack round-trip** (`scripts/e2e_clonepack.sh`)
+  - Starts a local server, syncs `octocat/Hello-World`, decodes the clonepack manifest, verifies the metadata chunk protobuf, and clones with both default and archive paths.
+  - Confirms both paths produce a clean `git status` and identical file lists.
+
+## Overlay staging and fast worktrees
+
+- **Overlay staging for `ripclone clone`** (`rust/src/overlay.rs`, `rust/src/client.rs`)
+  - On Linux, materializes the working tree in a fast staging dir (`/dev/shm` or
+    `RIPCLONE_STAGING_DIR`) and overlay-mounts it at the target.
+  - Avoids slow rootfs write storms on cloud VMs.
+  - Falls back to direct extraction if overlay is unavailable or space is insufficient.
+  - Tunable via `RIPCLONE_NO_OVERLAY`, `RIPCLONE_OVERLAY_THRESHOLD_MB`, and
+    `RIPCLONE_OVERLAY_MARGIN_MB`.
+
+- **`ripclone worktree`** (`rust/src/bin/cli.rs`, `rust/src/client.rs`, `rust/src/git.rs`)
+  - Adds `ripclone worktree <path> -b <branch>` for fast worktree creation.
+  - Reuses the main clone's local `.git/index` and object DB when the commit
+    matches, so no network download is needed for the common case.
+  - Falls back to fetching prebuilt artifacts for a different commit.
+  - Uses the same overlay-staging path as `ripclone clone`.
+
+
+## Client auth and cache cleanup
+
+- **Pre-hashed token support** (`rust/src/bin/cli.rs`, `rust/src/bin/git-remote-ripclone.rs`)
+  - Added `RIPCLONE_TOKEN_HASH` env var so CI and 1Password users can provide the
+    SHA-256 hash directly instead of the raw secret.
+  - `RIPCLONE_TOKEN` is still hashed before sending.
+
+- **Opt-in local cache** (`rust/src/client.rs`, `docs/BACKENDS.md`)
+  - Removed the default `~/.cache/ripclone` artifact cache.
+  - Caching is now opt-in via `RIPCLONE_CACHE_DIR`.
+  - `RIPCLONE_NO_CACHE=1` forcibly disables caching.
+
+## GitHub Actions workflow example
+
+- **Updated trigger example** (`README.md`, `docs/examples/github-actions-trigger.yml`)
+  - Replaced the old `/v1/build` webhook example with the current
+    `/v1/repos/{owner}/{repo}/sync` endpoint.
+  - Shows how consumer repos can notify a ripclone server on every push using
+    `Authorization: Ripclone <token>`.
+  - Notes that private repos require `RIPCLONE_GITHUB_TOKEN` on the server.
+
+## Smart-HTTP fallback endpoints
+
+- **Vanilla git compatibility** (`rust/src/server.rs`)
+  - `GET /v1/git/{owner}/{repo}/info/refs?service=git-upload-pack` advertises
+    refs using the local bare mirror.
+  - `POST /v1/git/{owner}/{repo}/git-upload-pack` runs `git upload-pack
+    --stateless-rpc` against the mirror so a plain `git clone
+    http://server/v1/git/owner/repo` works without the archive-first path.
+  - Useful for cold caches or clients that cannot use the remote helper.
+
+- **Validation**
+  - `scripts/e2e_smart_http.sh` verifies `git clone` through the fallback
+    endpoints end-to-end.
+
+## Private-repo sync
+
+- **`RIPCLONE_GITHUB_TOKEN`** (`rust/src/server.rs`, `rust/src/git.rs`)
+  - Server reads `RIPCLONE_GITHUB_TOKEN` and passes it to `git::sync_bare_mirror`.
+  - `sync_bare_mirror` injects it as `Authorization: token <token>` through git's
+    `http.extraHeader` config, so private GitHub repos can be mirrored without
+    embedding the secret in the remote URL.
+  - Works for personal access tokens and installation tokens alike.
+
+## Local CAS retention / eviction
+
+- **Retention manager** (`rust/src/retention.rs`)
+  - Scans the local content-addressed store on a configurable interval.
+  - Keeps a persisted set of "protected" hashes (artifacts referenced by the
+    current HEAD of each synced repo).
+  - Evicts unprotected objects by age (`RIPCLONE_RETENTION_MAX_AGE_DAYS`,
+    default 7 days) and by disk pressure (`RIPCLONE_RETENTION_MAX_GB`,
+    default 100 GB), removing oldest unprotected objects first.
+  - Tunable interval via `RIPCLONE_RETENTION_INTERVAL_SECS` (default 300 s).
+  - Exposes retention counters on `/metrics`: runs, evicted bytes/objects,
+    errors.
+
+- **Server integration** (`rust/src/server.rs`)
+  - The retention task starts automatically when the server boots.
+  - After each successful sync, the current HEAD's artifact hashes are marked
+    protected so they survive the next eviction pass.
+
+## Server hardening (auth, metrics, rate limiting)
+
+- **Token auth** (`rust/src/server.rs`)
+  - Optional `RIPCLONE_TOKEN` env var on the server. If set, all non-health
+    endpoints require `Authorization: Ripclone <sha256(token)>`.
+  - Both server and client hash the raw token with SHA-256 once at startup/login
+    so the hash, not the raw secret, travels on the wire.
+  - `Client::new_with_token` sends the hashed token on every request.
+
+- **Metrics and readiness** (`rust/src/metrics.rs`, `rust/src/server.rs`)
+  - `GET /metrics` returns JSON counters: ref lookups, syncs, sync duration,
+    artifact requests, bytes served, and errors.
+  - `GET /readyz` reports readiness and includes a timestamp; `GET /healthz`
+    remains public for load balancer health checks.
+
+- **Rate limiting** (`rust/src/rate_limit.rs`)
+  - Token-bucket rate limiter keyed by auth header or `anonymous`.
+  - Env tunables: `RIPCLONE_RATE_LIMIT_BURST` (default 60) and
+    `RIPCLONE_RATE_LIMIT_PER_SEC` (default 10.0).
+  - Returns `429 Too Many Requests` with a `Retry-After` header when the bucket
+    is empty.
+
+## Native git remote helper
+
+- **`git-remote-ripclone`** (`rust/src/bin/git-remote-ripclone.rs`)
+  - Speaks the git remote-helper protocol (`capabilities`, `list`, `option`,
+    `connect git-upload-pack`).
+  - Parses `ripclone://owner/repo.git` and `ripclone://owner/repo.git#branch`.
+  - Resolves the ref through the ripclone server, downloads the prebuilt
+    skeleton pack, head-blobs pack, and prebuilt `.git/index`, and seeds the
+    local object database so `git clone` can finish with its normal checkout.
+  - Runs a local `git upload-pack` against the seeded repo so the rest of the
+    clone is a normal git transport.
+  - Reads `RIPCLONE_URL` and hashes `RIPCLONE_TOKEN` with SHA-256 before
+    sending it in the `Authorization` header.
+
+- **`Client` additions** (`rust/src/client.rs`)
+  - `Client::new_with_token` builds an HTTP client that sends the ripclone
+    token on every request.
+  - `Client::install_git_dir` downloads only the `.git` artifacts needed by
+    the remote helper.
+  - Ref responses now include `default_branch` so the helper can create the
+    correct local branch ref for `HEAD` clones.
+
+- **Validation**
+  - `scripts/e2e_remote_helper.sh` verifies `git clone ripclone://oven-sh/bun.git`
+    end-to-end; the resulting repo has a clean `git status` and working `git log`.
+
+## Direct index mutation
+
+- **No more `git update-index` on the clone path** (`rust/src/git.rs`)
+  - `set_skip_worktree_all` and `clear_skip_worktree_index` now mutate the
+    `.git/index` directly through `git2`.
+  - Replaced the remaining subprocess callers in `extract.rs`, `sidecar.rs`,
+    `snapshot.rs`, and `cli.rs`.
+  - Verified with the full `oven-sh/bun` e2e suite and the S3/MinIO e2e suite.
+
+## S3-compatible object storage
+
+- **`S3Storage` backend** (`rust/src/storage/s3_storage.rs`)
+  - Implements the `StorageBackend` trait for S3, R2, Tigris, and MinIO.
+  - Configured with `RIPCLONE_S3_ENDPOINT`, `RIPCLONE_S3_REGION`,
+    `RIPCLONE_S3_BUCKET`, `RIPCLONE_S3_PREFIX`, and `RIPCLONE_S3_CACHE_DIR`.
+  - Credentials come from standard `AWS_*` environment variables via the `s3`
+    crate's `Auth::from_env()`.
+  - Reads the local cache first; on miss fetches the full object or a byte range
+    from S3 and writes it into the local cache.
+  - Supports `Range: bytes=start-end` via `get_range` so the server can still
+    proxy partial requests when signed URLs are unavailable.
+
+- **Signed-URL serving** (`rust/src/server.rs`)
+  - `serve_artifact` calls `storage.signed_url()` and returns a
+    `307 Temporary Redirect` when the backend supports direct client reads.
+  - Clients range-GET archives directly from object storage/CDN; the server only
+    serves the small manifest/ref response.
+
+- **Server upload after build** (`rust/src/server.rs`)
+  - `do_sync` pushes every built artifact (skeleton pack/idx, head-blobs pack/idx,
+    prebuilt index, archive, manifest) to the configured storage backend.
+  - For local storage this is a no-op; for S3-compatible backends it makes the
+    artifacts durable and CDN-addressable.
+
+- **Validation**
+  - End-to-end test passed against a local MinIO container: server uploads
+    artifacts, client follows signed-URL redirects, and the resulting repo has a
+    clean `git status`.
+
+## Archive-first clone (v1)
+
+- **Archive builder** (`rust/src/archive.rs`)
+  - Walks the git tree directly so every tracked file is included, even files
+    that `git archive` would omit because of `export-ignore` attributes.
+  - Streams files into 2 MB zstd frames.
+  - Default archive compression level is **zstd 6** (tuned for size; build time
+    is server-side).
+  - Optional custom zstd dictionary training (`train-dictionary`, `--dictionary`);
+    measured as a net loss on `oven-sh/bun`, so it remains opt-in.
+
+- **Binary manifest** (`rust/src/manifest.rs`)
+  - Content-addressed frame table + per-file entries (path, mode, git blob
+    SHA-1, frame index, frame offset, compressed/raw length).
+  - Rust unit tests for roundtrip, happy-path verification, and SHA-1 mismatch
+    detection.
+
+- **Parallel extractor** (`rust/src/extract.rs`)
+  - Decompresses all zstd frames in parallel.
+  - POSIX path: parallel file writes with modes set in `open()`.
+  - Linux path: io_uring batched `open/write/close` syscalls.
+  - Batches directory creation up front.
+  - Verifies every extracted file against its manifest SHA-1.
+  - Sets deterministic mtime so repeated extractions are idempotent.
+
+- **Skeleton clone**
+  - Server builds a git packfile containing the commit object and every
+    reachable tree.
+  - Client installs a bare `.git` with `HEAD`, index, `skip-worktree`, and an
+    `origin` remote pointing at the upstream GitHub URL.
+  - Removed `core.fileMode=false`; skeleton clones keep the platform default.
+
+- **CLI commands**
+  - `ripclone sync <owner/repo>`
+  - `ripclone build-archive <owner/repo> --archive <path> --manifest <path>`
+  - `ripclone clone <owner/repo> --dir <path> --skeleton`
+  - `ripclone extract-archive --archive <path> --manifest <path> --dir <path>`
+
+- **E2E coverage** (`scripts/e2e_archive.sh`)
+  - Compares the extracted tree against an independent `git archive` reference
+    (for repos without `export-ignore`).
+  - Verifies all tracked files present, symlinks, executable bits, `git status`,
+    `git diff`, `git log`, `core.fileMode=true`, `origin` remote, idempotent
+    re-extraction, corruption detection, and missing-manifest failure.
+
+- **Benchmarks**
+  - `scripts/benchmark_archive.sh` compares zstd levels and extracts level 6.
+  - Measured on macOS and in a Linux Docker container (io_uring path).
+
+## Parallel downloads, streaming extraction, and range requests
+
+- **Parallel artifact downloads** (`rust/src/client.rs`)
+  - The client now fetches skeleton pack/idx, head-blobs pack/idx, prebuilt
+    index, and manifest concurrently with `tokio::try_join!`.
+
+- **Streaming frame extraction** (`rust/src/extract.rs`)
+  - Added `extract_archive_with_fetcher`, which decouples archive layout from
+    I/O so the same extraction code can read from a local file or from
+    arbitrary byte sources.
+  - Added `extract_archive_streaming`, which fetches each zstd frame with an
+    HTTP range request and decompresses/writes files without loading the whole
+    archive into memory.
+
+- **Server range-request support** (`rust/src/server.rs`, `rust/src/storage.rs`)
+  - Added a `StorageBackend` trait so local CAS and future object-storage
+    backends share one interface.
+  - Artifact endpoints (`/v1/artifacts/{hash}`, `/v1/archives/{hash}`,
+    `/v1/manifests/{hash}`) now honor `Range: bytes=start-end` and return
+    `206 Partial Content`.
+  - Backends that support signed URLs can return a `307 Temporary Redirect` so
+    clients range-GET directly from object storage/CDN.
+
+- **Updated E2E** (`scripts/e2e_archive.sh`)
+  - Content verification now compares every regular file's SHA-1 against the
+    bare mirror's HEAD blobs, so export-ignored files are also checked.
+
+## Prebuilt `.git` artifacts + direct install
+
+- **Server-side artifact builders** (`rust/src/pack.rs`)
+  - Skeleton pack + `.idx`: commit object + every reachable tree + symlink blobs.
+  - HEAD-blobs pack + `.idx`: every blob referenced by `HEAD` so `git diff`,
+    `git show`, and edits work immediately.
+  - Prebuilt `.git/index`: built from the skeleton pack with accurate cached
+    blob sizes and `skip-worktree` set on every tracked path.
+
+- **CAS storage for all artifacts** (`rust/src/cas.rs`)
+  - Packs, indexes, archives, and manifests are stored by content hash.
+
+- **Extended ref entry** (`rust/src/lib.rs`)
+  - `RefInfo` now carries hashes for `skeleton_pack`, `skeleton_idx`,
+    `head_blobs_pack`, `head_blobs_idx`, `prebuilt_index`, `archive`,
+    `manifest`, and the optional `full_pack`.
+
+- **New artifact endpoints** (`rust/src/server.rs`)
+  - `/v1/artifacts/{hash}` serves any CAS object.
+  - `/v1/archives/{hash}` and `/v1/manifests/{hash}` are convenience aliases.
+
+- **Direct `.git` install** (`rust/src/client.rs`)
+  - `Client::install_repo` downloads all prebuilt artifacts and writes `.git/`,
+    the object packs, and the working tree without running `git init`,
+    `index-pack`, `read-tree`, or `update-index`.
+
+- **Removed client-side HEAD blob pack generation** (`rust/src/extract.rs`)
+  - The temporary loose-object/pack helper that ran on every extraction is gone;
+    blob objects now arrive in the server-built head-blobs pack.
+
+- **Updated scripts**
+  - `scripts/e2e_archive.sh` now tests the direct-install path end-to-end.
+  - `scripts/benchmark_archive.sh` reports artifact sizes and install time.
+
+## Removed / reversed
+
+- **CoW extracted-tree cache** was implemented and then removed. For repos the
+  size of `oven-sh/bun`, copying 15k files with APFS clonefile was slower than
+  re-extracting the local zstd archive, so the `--cache-dir` option was dropped.

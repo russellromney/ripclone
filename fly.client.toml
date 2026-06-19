@@ -1,0 +1,11 @@
+app = 'ripclone-client-test'
+primary_region = 'ewr'
+
+[build]
+  dockerfile = 'Dockerfile.client'
+
+[[vm]]
+  size = 'shared-cpu-4x'
+  memory = '1gb'
+
+

@@ -1,0 +1,37 @@
+version: "3.8"
+
+# Self-hosted ripclone server with local filesystem storage.
+# This is the easiest open-source setup: no S3 account required.
+# Data persists in named Docker volumes.
+
+services:
+  ripclone-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8000"
+    volumes:
+      - ripclone-cache:/data/cache
+      - ripclone-repos:/data/repos
+    environment:
+      - RUST_LOG=info
+      # Change this to a long random secret. The client sets the same value
+      # in RIPCLONE_TOKEN to authenticate.
+      - RIPCLONE_TOKEN=change-me-in-production
+    command:
+      - ripclone-server
+      - --host=0.0.0.0
+      - --port=8000
+      - --cas-dir=/data/cache
+      - --repo-root=/data/repos
+      - --default-depth=50
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  ripclone-cache:
+  ripclone-repos:

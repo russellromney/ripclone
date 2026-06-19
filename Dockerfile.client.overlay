@@ -1,0 +1,17 @@
+FROM ubuntu:24.04
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git ca-certificates curl libfuse2 libgit2-1.7 libssl3 time coreutils \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY dist/ripclone /usr/local/bin/ripclone
+COPY dist/git-remote-ripclone /usr/local/bin/git-remote-ripclone
+COPY scripts/fly_client_test.sh /run-tests.sh
+RUN chmod +x /run-tests.sh
+
+ENV RUST_LOG=info
+ENV PATH="/usr/local/bin:${PATH}"
+
+CMD ["/bin/bash", "/run-tests.sh"]

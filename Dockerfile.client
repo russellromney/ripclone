@@ -1,0 +1,36 @@
+# Build stage
+FROM rust:1.96.0-slim AS builder
+
+WORKDIR /app
+
+# Install build-time deps for git2, fuser, and openssl.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git pkg-config libssl-dev libfuse-dev libgit2-dev protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy manifests and build script first for layer caching.
+COPY rust/Cargo.toml rust/Cargo.lock rust/build.rs ./
+COPY rust/proto ./proto
+COPY rust/src ./src
+
+RUN cargo build --release
+
+# Runtime stage
+FROM ubuntu:24.04
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git ca-certificates curl libfuse2 libgit2-1.7 time coreutils \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY --from=builder /app/target/release/ripclone /usr/local/bin/ripclone
+COPY --from=builder /app/target/release/git-remote-ripclone /usr/local/bin/git-remote-ripclone
+COPY --from=builder /app/target/release/ripclone-server /usr/local/bin/ripclone-server
+COPY scripts/fly_client_test.sh /run-tests.sh
+RUN chmod +x /run-tests.sh
+
+ENV RUST_LOG=info
+ENV PATH="/usr/local/bin:${PATH}"
+
+CMD ["/bin/bash", "/run-tests.sh"]

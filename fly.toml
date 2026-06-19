@@ -1,0 +1,26 @@
+app = 'ripclone'
+primary_region = 'iad'
+
+[build]
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = true
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ['app']
+
+[[vm]]
+  size = 'shared-cpu-2x'
+  memory = '1gb'
+
+[env]
+  # Git pack-objects creates temp packs in TMPDIR and renames them into the
+  # mirror repo. Keep TMPDIR on the same filesystem as the repo root so the
+  # rename succeeds.
+  TMPDIR = '/data/repos'
+
+[mounts]
+  source = 'ripclone_data'
+  destination = '/data'
