@@ -668,8 +668,9 @@ pub fn object_type<P: AsRef<Path>>(repo: P, sha: &str) -> Result<String> {
 }
 
 /// Sync a bare mirror of a GitHub repo. Creates if missing, fetches if exists.
-/// If `github_token` is provided, it is sent as `Authorization: token <token>`
-/// via git's `http.extraHeader` config so private repos can be mirrored.
+/// If `github_token` is provided, it is embedded in the HTTPS URL as
+/// `https://x-access-token:<token>@github.com/...` so private repos can be
+/// mirrored. This form works for both PATs and GitHub App installation tokens.
 pub fn sync_bare_mirror<P: AsRef<Path>>(
     mirror_dir: P,
     owner: &str,
@@ -689,52 +690,53 @@ pub fn sync_bare_mirror<P: AsRef<Path>>(
             .with_context(|| format!("invalid branch: {}", branch))?;
         format!("refs/heads/{}", branch)
     };
-    let url = format!("https://github.com/{}/{}.git", owner, repo);
-    let auth_header = github_token.map(|t| format!("Authorization: token {}", t));
+    let url = match github_token {
+        Some(token) => format!(
+            "https://x-access-token:{}@github.com/{}/{}.git",
+            token, owner, repo
+        ),
+        None => format!("https://github.com/{}/{}.git", owner, repo),
+    };
     if mirror_dir.as_ref().exists() {
-        let mut cmd = Command::new("git");
-        cmd.arg("-C").arg(mirror_dir.as_ref().as_os_str()).args([
-            "fetch",
-            "--depth",
-            &depth.to_string(),
-            "origin",
-            &fetch_ref,
-        ]);
-        if let Some(header) = &auth_header {
-            cmd.arg("-c").arg(format!("http.extraHeader={}", header));
-        }
-        let status = cmd.status().context("git fetch")?;
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(mirror_dir.as_ref().as_os_str())
+            .args([
+                "fetch",
+                "--depth",
+                &depth.to_string(),
+                "origin",
+                &fetch_ref,
+            ])
+            .status()
+            .context("git fetch")?;
         if !status.success() {
             bail!("fetch failed");
         }
     } else {
         std::fs::create_dir_all(mirror_dir.as_ref().parent().unwrap_or(Path::new("")))?;
-        let mut cmd = Command::new("git");
-        cmd.args([
-            "clone",
-            "--mirror",
-            "--depth",
-            &depth.to_string(),
-            &url,
-            &mirror_dir.as_ref().to_string_lossy(),
-        ]);
-        if let Some(header) = &auth_header {
-            cmd.arg("-c").arg(format!("http.extraHeader={}", header));
-        }
-        let status = cmd.status().context("git clone mirror")?;
+        let status = Command::new("git")
+            .args([
+                "clone",
+                "--mirror",
+                "--depth",
+                &depth.to_string(),
+                &url,
+                &mirror_dir.as_ref().to_string_lossy(),
+            ])
+            .status()
+            .context("git clone mirror")?;
         if !status.success() {
             bail!("clone mirror failed");
         }
         // If a specific branch was requested, fetch it into the new mirror.
         if branch != "HEAD" {
-            let mut cmd = Command::new("git");
-            cmd.arg("-C")
+            let status = Command::new("git")
+                .arg("-C")
                 .arg(mirror_dir.as_ref().as_os_str())
-                .args(["fetch", "--depth", &depth.to_string(), "origin", &fetch_ref]);
-            if let Some(header) = &auth_header {
-                cmd.arg("-c").arg(format!("http.extraHeader={}", header));
-            }
-            let status = cmd.status().context("git fetch branch")?;
+                .args(["fetch", "--depth", &depth.to_string(), "origin", &fetch_ref])
+                .status()
+                .context("git fetch branch")?;
             if !status.success() {
                 bail!("fetch branch failed");
             }
