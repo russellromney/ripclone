@@ -57,6 +57,7 @@ cleanup_overlay() {
 cleanup() {
   cleanup_overlay
   rm -rf "$BASE_DIR"
+  rm -f "$clonepack_tmp" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -100,10 +101,12 @@ if [ -z "$clonepack_manifest_hash" ]; then
 fi
 
 # Decode the clonepack manifest protobuf enough to report metadata/archive sizes.
-clonepack_data=$(curl -fsSL "${CURL_AUTH[@]}" "$SERVER_URL/v1/artifacts/$clonepack_manifest_hash")
-metadata_hash=$(echo "$clonepack_data" | python3 -c '
+# Keep the manifest in a temp file because shell variables cannot hold binary.
+clonepack_tmp=$(mktemp)
+curl -fsSL "${CURL_AUTH[@]}" "$SERVER_URL/v1/artifacts/$clonepack_manifest_hash" -o "$clonepack_tmp"
+parsed=$(python3 - "$clonepack_tmp" <<'PY'
 import sys
-data = sys.stdin.buffer.read()
+data = open(sys.argv[1], 'rb').read()
 i = 0
 def varint(d, i):
     x = s = 0
@@ -113,6 +116,9 @@ def varint(d, i):
         if not b & 0x80: break
         s += 7
     return x, i
+metadata_hash = None
+archive_count = 0
+head_blobs_count = 0
 while i < len(data):
     tag, i = varint(data, i)
     field, wire = tag >> 3, tag & 7
@@ -122,7 +128,6 @@ while i < len(data):
     else:
         value = b""; i += 1
     if field == 4 and wire == 2:  # metadata_chunk ChunkRef
-        # embedded message: hash (field 1, bytes), len (field 2, varint)
         j = 0
         while j < len(value):
             t, j = varint(value, j)
@@ -133,40 +138,27 @@ while i < len(data):
             else:
                 v = b""; j += 1
             if f == 1:
-                print(v.hex())
-')
-archive_chunk_count=$(echo "$clonepack_data" | python3 -c '
-import sys
-data = sys.stdin.buffer.read()
-count = 0
-i = 0
-def varint(d, i):
-    x = s = 0
-    while True:
-        b = d[i]; i += 1
-        x |= (b & 0x7f) << s
-        if not b & 0x80: break
-        s += 7
-    return x, i
-while i < len(data):
-    tag, i = varint(data, i)
-    field, wire = tag >> 3, tag & 7
-    if wire == 2:
-        length, i = varint(data, i)
-        value = data[i:i+length]; i += length
-    else:
-        value = b""; i += 1
-    if field == 5:
-        count += 1
-print(count)
-')
+                metadata_hash = v.hex()
+    elif field == 5:
+        archive_count += 1
+    elif field == 8:
+        head_blobs_count += 1
+print(metadata_hash or "")
+print(archive_count)
+print(head_blobs_count)
+PY
+)
+metadata_hash=$(echo "$parsed" | sed -n '1p')
+archive_chunk_count=$(echo "$parsed" | sed -n '2p')
+head_blobs_chunk_count=$(echo "$parsed" | sed -n '3p')
 metadata_size=$(curl -fsSL "${CURL_AUTH[@]}" "$SERVER_URL/v1/artifacts/$metadata_hash" | wc -c)
 
 echo ""
 echo "==> Ref metadata"
-printf "  clonepack manifest: %s\n" "$clonepack_manifest_hash"
-printf "  metadata chunk:     %s (%s bytes)\n" "$metadata_hash" "$metadata_size"
-printf "  archive chunks:     %s\n" "$archive_chunk_count"
+printf "  clonepack manifest:  %s\n" "$clonepack_manifest_hash"
+printf "  metadata chunk:      %s (%s bytes)\n" "$metadata_hash" "$metadata_size"
+printf "  archive chunks:      %s\n" "$archive_chunk_count"
+printf "  head-blobs chunks:   %s\n" "$head_blobs_chunk_count"
 
 echo ""
 echo "==> Direct-install clone ($ITER runs)..."
@@ -201,7 +193,8 @@ echo ""
 echo "=========================================================="
 echo "Remote benchmark complete for $REPO."
 echo "  server:          $SERVER_URL"
-echo "  metadata chunk:  $metadata_size bytes"
-echo "  archive chunks:  $archive_chunk_count"
-echo "  avg install:     ${avg} ms"
+echo "  metadata chunk:    $metadata_size bytes"
+echo "  archive chunks:    $archive_chunk_count"
+echo "  head-blobs chunks: $head_blobs_chunk_count"
+echo "  avg install:       ${avg} ms"
 echo "=========================================================="
