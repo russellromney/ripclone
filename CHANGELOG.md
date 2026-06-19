@@ -2,6 +2,24 @@
 
 This file tracks what has already landed in ripclone. For upcoming work see `ROADMAP.md`.
 
+## Head-blobs pack chunking and repository cleanup
+
+- **Split head-blobs pack into parallel-fetch chunks** (`rust/proto/clonepack.proto`, `rust/src/server.rs`, `rust/src/client.rs`, `rust/src/lib.rs`, `rust/src/ref_store.rs`)
+  - The head-blobs pack is no longer embedded in the metadata chunk or fetched as a single monolithic object.
+  - `ClonepackManifest` now carries `repeated ChunkRef head_blobs_chunks` (default 8 MB each).
+  - `RefInfo` and `RefResponse` carry the chunk hashes and signed URLs.
+  - Client `fetch_chunk_refs` downloads chunks concurrently with configurable `RIPCLONE_FETCH_CONCURRENCY`.
+  - Old single-pack manifests are still parsed for compatibility.
+
+- **Fixed `scripts/benchmark_remote.sh` manifest parsing**
+  - The script no longer stores binary protobuf in a shell variable, which corrupted the data and reported `archive chunks: 1`.
+  - It now writes the clonepack manifest to a temp file and reports archive-chunk and head-blobs-chunk counts correctly.
+
+- **Removed Python prototype and committed binaries**
+  - Deleted `lazygit.py`, the `ripclone/` Python package, `pyproject.toml`, `requirements.txt`, and committed `dist/` release binaries.
+  - Added `dist/` and `target/` to `.gitignore`.
+  - Created public repo at `https://github.com/russellromney/ripclone` and rewrote history with `git filter-repo` to purge binaries.
+
 ## Adversarial review fixes
 
 - **Fixed Fly client archive-extraction benchmark** (`scripts/fly_client_test.sh`, `docs/ARCHIVE_AB_RESULTS.md`)
@@ -133,10 +151,9 @@ This file tracks what has already landed in ripclone. For upcoming work see `ROA
 
 - **`RIPCLONE_GITHUB_TOKEN`** (`rust/src/server.rs`, `rust/src/git.rs`)
   - Server reads `RIPCLONE_GITHUB_TOKEN` and passes it to `git::sync_bare_mirror`.
-  - `sync_bare_mirror` injects it as `Authorization: token <token>` through git's
-    `http.extraHeader` config, so private GitHub repos can be mirrored without
-    embedding the secret in the remote URL.
-  - Works for personal access tokens and installation tokens alike.
+  - `sync_bare_mirror` embeds the token in the HTTPS URL as
+    `https://x-access-token:<token>@github.com/<owner>/<repo>.git`, which works
+    for both personal access tokens and GitHub App installation tokens.
 
 ## Local CAS retention / eviction
 
