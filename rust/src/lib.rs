@@ -42,6 +42,11 @@ pub struct RefInfo {
     pub skeleton_idx: String,
     pub head_blobs_pack: String,
     pub head_blobs_idx: String,
+    /// Content-addressed chunks of the head-blobs pack. The full pack is the
+    /// concatenation of these chunks in order. New builds split the pack so the
+    /// client can fetch it in parallel.
+    #[serde(default)]
+    pub head_blobs_chunks: Vec<String>,
     pub prebuilt_index: String,
     pub archive: String,
     pub manifest: String,

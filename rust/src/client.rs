@@ -29,9 +29,21 @@ pub struct RefResponse {
     #[serde(default)]
     pub archive_chunk_urls: Option<Vec<Option<String>>>,
     #[serde(default)]
-    pub head_blobs_pack_url: Option<String>,
+    pub head_blobs_chunk_urls: Option<Vec<Option<String>>>,
     #[serde(default)]
     pub head_blobs_idx_url: Option<String>,
+}
+
+/// Return the chunk refs that make up the head-blobs pack, falling back to the
+/// deprecated single-pack field for older manifests.
+fn head_blobs_chunk_refs(clonepack: &ClonepackManifest) -> Vec<crate::clonepack::ChunkRef> {
+    if !clonepack.head_blobs_chunks.is_empty() {
+        clonepack.head_blobs_chunks.clone()
+    } else if let Some(pack) = &clonepack.head_blobs_pack {
+        vec![pack.clone()]
+    } else {
+        Vec::new()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -229,6 +241,49 @@ impl Client {
             );
         }
         Ok(data)
+    }
+
+    /// Fetch many chunk refs in parallel, preserving order.
+    ///
+    /// `signed_urls` is indexed by chunk position; `None` entries fall back to
+    /// the gateway. Concurrency defaults to 6 but can be overridden with
+    /// `RIPCLONE_FETCH_CONCURRENCY`.
+    pub async fn fetch_chunk_refs(
+        &self,
+        chunks: &[crate::clonepack::ChunkRef],
+        signed_urls: Option<&[Option<String>]>,
+    ) -> Result<Vec<Vec<u8>>> {
+        use futures::stream::{self, StreamExt};
+        use futures::TryStreamExt;
+        if chunks.is_empty() {
+            return Ok(Vec::new());
+        }
+        let concurrency: usize = std::env::var("RIPCLONE_FETCH_CONCURRENCY")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(6)
+            .max(1);
+        let jobs: Vec<(usize, crate::clonepack::ChunkRef, Option<String>)> = chunks
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(i, chunk)| {
+                let signed_url = signed_urls
+                    .and_then(|urls| urls.get(i))
+                    .and_then(|o| o.clone());
+                (i, chunk, signed_url)
+            })
+            .collect();
+        let mut results: Vec<(usize, Vec<u8>)> = stream::iter(jobs)
+            .map(|(i, chunk, signed_url)| async move {
+                let data = self.fetch_chunk_ref(&chunk, signed_url.as_deref()).await?;
+                Ok::<_, anyhow::Error>((i, data))
+            })
+            .buffer_unordered(concurrency)
+            .try_collect()
+            .await?;
+        results.sort_by_key(|(i, _)| *i);
+        Ok(results.into_iter().map(|(_, d)| d).collect())
     }
 
     /// Fetch the top-level clonepack manifest and the metadata chunk it points to.
@@ -488,28 +543,31 @@ impl Client {
         let use_archive = std::env::var_os("RIPCLONE_EXTRACT_ARCHIVE").is_some()
             && !archive_chunks.is_empty();
         if !use_archive {
-            if let (Some(pack_ref), Some(idx_ref)) =
-                (&clonepack.head_blobs_pack, &clonepack.head_blobs_idx)
-            {
-                let pack_data = self
-                    .fetch_chunk_ref(pack_ref, info.head_blobs_pack_url.as_deref())
-                    .await?;
-                let idx_data = self
-                    .fetch_chunk_ref(idx_ref, info.head_blobs_idx_url.as_deref())
-                    .await?;
-                let head_blobs_hash = cas_hash(&pack_data);
-                std::fs::write(
-                    pack_dir.join(format!("pack-{}.pack", head_blobs_hash)),
-                    &pack_data,
-                )?;
-                std::fs::write(
-                    pack_dir.join(format!("pack-{}.idx", head_blobs_hash)),
-                    &idx_data,
-                )?;
-                info!("wrote head-blobs pack ({} bytes)", pack_data.len());
-            } else {
+            let head_blobs_refs = head_blobs_chunk_refs(clonepack);
+            if head_blobs_refs.is_empty() {
                 anyhow::bail!("clonepack missing head-blobs pack for direct-install");
             }
+            let idx_ref = clonepack
+                .head_blobs_idx
+                .as_ref()
+                .context("clonepack missing head-blobs idx")?;
+            let (chunks, idx_data) = tokio::join!(
+                self.fetch_chunk_refs(&head_blobs_refs, info.head_blobs_chunk_urls.as_deref()),
+                self.fetch_chunk_ref(idx_ref, info.head_blobs_idx_url.as_deref()),
+            );
+            let chunks = chunks?;
+            let idx_data = idx_data?;
+            let pack_data: Vec<u8> = chunks.into_iter().flatten().collect();
+            let head_blobs_hash = cas_hash(&pack_data);
+            std::fs::write(
+                pack_dir.join(format!("pack-{}.pack", head_blobs_hash)),
+                &pack_data,
+            )?;
+            std::fs::write(
+                pack_dir.join(format!("pack-{}.idx", head_blobs_hash)),
+                &idx_data,
+            )?;
+            info!("wrote head-blobs pack ({} bytes)", pack_data.len());
         }
 
         std::fs::write(git_dir.join("index"), &metadata.prebuilt_index)?;
@@ -851,28 +909,31 @@ impl Client {
             &metadata.skeleton_idx,
         )?;
 
-        if let (Some(pack_ref), Some(idx_ref)) =
-            (&clonepack.head_blobs_pack, &clonepack.head_blobs_idx)
-        {
-            let pack_data = self
-                .fetch_chunk_ref(pack_ref, info.head_blobs_pack_url.as_deref())
-                .await?;
-            let idx_data = self
-                .fetch_chunk_ref(idx_ref, info.head_blobs_idx_url.as_deref())
-                .await?;
-            let head_blobs_hash = cas_hash(&pack_data);
-            std::fs::write(
-                pack_dir.join(format!("pack-{}.pack", head_blobs_hash)),
-                &pack_data,
-            )?;
-            std::fs::write(
-                pack_dir.join(format!("pack-{}.idx", head_blobs_hash)),
-                &idx_data,
-            )?;
-            info!("wrote head-blobs pack ({} bytes)", pack_data.len());
-        } else {
+        let head_blobs_refs = head_blobs_chunk_refs(&clonepack);
+        if head_blobs_refs.is_empty() {
             anyhow::bail!("clonepack missing head-blobs pack");
         }
+        let idx_ref = clonepack
+            .head_blobs_idx
+            .as_ref()
+            .context("clonepack missing head-blobs idx")?;
+        let (chunks, idx_data) = tokio::join!(
+            self.fetch_chunk_refs(&head_blobs_refs, info.head_blobs_chunk_urls.as_deref()),
+            self.fetch_chunk_ref(idx_ref, info.head_blobs_idx_url.as_deref()),
+        );
+        let chunks = chunks?;
+        let idx_data = idx_data?;
+        let pack_data: Vec<u8> = chunks.into_iter().flatten().collect();
+        let head_blobs_hash = cas_hash(&pack_data);
+        std::fs::write(
+            pack_dir.join(format!("pack-{}.pack", head_blobs_hash)),
+            &pack_data,
+        )?;
+        std::fs::write(
+            pack_dir.join(format!("pack-{}.idx", head_blobs_hash)),
+            &idx_data,
+        )?;
+        info!("wrote head-blobs pack ({} bytes)", pack_data.len());
 
         std::fs::write(git_dir.join("index"), &metadata.prebuilt_index)?;
 
@@ -961,28 +1022,31 @@ impl Client {
         let use_archive = std::env::var_os("RIPCLONE_EXTRACT_ARCHIVE").is_some()
             && !archive_chunks.is_empty();
         if !use_archive {
-            if let (Some(pack_ref), Some(idx_ref)) =
-                (&clonepack.head_blobs_pack, &clonepack.head_blobs_idx)
-            {
-                let pack_data = self
-                    .fetch_chunk_ref(pack_ref, info.head_blobs_pack_url.as_deref())
-                    .await?;
-                let idx_data = self
-                    .fetch_chunk_ref(idx_ref, info.head_blobs_idx_url.as_deref())
-                    .await?;
-                let head_blobs_hash = cas_hash(&pack_data);
-                std::fs::write(
-                    pack_dir.join(format!("pack-{}.pack", head_blobs_hash)),
-                    &pack_data,
-                )?;
-                std::fs::write(
-                    pack_dir.join(format!("pack-{}.idx", head_blobs_hash)),
-                    &idx_data,
-                )?;
-                info!("wrote head-blobs pack ({} bytes)", pack_data.len());
-            } else {
+            let head_blobs_refs = head_blobs_chunk_refs(clonepack);
+            if head_blobs_refs.is_empty() {
                 anyhow::bail!("clonepack missing head-blobs pack for direct-install");
             }
+            let idx_ref = clonepack
+                .head_blobs_idx
+                .as_ref()
+                .context("clonepack missing head-blobs idx")?;
+            let (chunks, idx_data) = tokio::join!(
+                self.fetch_chunk_refs(&head_blobs_refs, info.head_blobs_chunk_urls.as_deref()),
+                self.fetch_chunk_ref(idx_ref, info.head_blobs_idx_url.as_deref()),
+            );
+            let chunks = chunks?;
+            let idx_data = idx_data?;
+            let pack_data: Vec<u8> = chunks.into_iter().flatten().collect();
+            let head_blobs_hash = cas_hash(&pack_data);
+            std::fs::write(
+                pack_dir.join(format!("pack-{}.pack", head_blobs_hash)),
+                &pack_data,
+            )?;
+            std::fs::write(
+                pack_dir.join(format!("pack-{}.idx", head_blobs_hash)),
+                &idx_data,
+            )?;
+            info!("wrote head-blobs pack ({} bytes)", pack_data.len());
         }
 
         // Prebuilt index.

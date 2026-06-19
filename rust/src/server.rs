@@ -1,7 +1,7 @@
 use crate::RefInfo;
 use crate::archive::ArchiveBuilder;
 use crate::cas::Cas;
-use crate::clonepack::{ChunkRef, ClonepackManifest, hash_from_hex};
+use crate::clonepack::{ChunkRef, ClonepackManifest, hash_from_hex, hash_to_hex};
 use crate::git;
 use crate::metrics::Metrics;
 use crate::oidc::OidcVerifier;
@@ -253,9 +253,9 @@ pub struct RefResponse {
     /// gateway's `/v1/artifacts/{hash}` endpoint.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub archive_chunk_urls: Option<Vec<Option<String>>>,
-    /// Signed URL for the optional head-blobs pack.
+    /// Signed URL for each chunk of the head-blobs pack, in order.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub head_blobs_pack_url: Option<String>,
+    pub head_blobs_chunk_urls: Option<Vec<Option<String>>>,
     /// Signed URL for the optional head-blobs idx.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub head_blobs_idx_url: Option<String>,
@@ -717,6 +717,7 @@ async fn get_ref(
                 skeleton_idx: String::new(),
                 head_blobs_pack: String::new(),
                 head_blobs_idx: String::new(),
+                head_blobs_chunks: Vec::new(),
                 prebuilt_index: String::new(),
                 archive: String::new(),
                 manifest: String::new(),
@@ -772,7 +773,20 @@ fn ref_response(
         }
     };
 
-    let head_blobs_pack_url = signed_url(storage, &info.head_blobs_pack);
+    let head_blobs_chunk_urls = if info.head_blobs_chunks.is_empty() {
+        None
+    } else {
+        let urls: Vec<Option<String>> = info
+            .head_blobs_chunks
+            .iter()
+            .map(|h| signed_url(storage, h))
+            .collect();
+        if urls.iter().all(|u| u.is_none()) {
+            None
+        } else {
+            Some(urls)
+        }
+    };
     let head_blobs_idx_url = signed_url(storage, &info.head_blobs_idx);
 
     RefResponse {
@@ -787,7 +801,7 @@ fn ref_response(
         clonepack_manifest_url,
         metadata_chunk_url,
         archive_chunk_urls,
-        head_blobs_pack_url,
+        head_blobs_chunk_urls,
         head_blobs_idx_url,
     }
 }
@@ -797,6 +811,24 @@ fn signed_url(storage: &crate::storage::StorageRef, hash: &str) -> Option<String
         return None;
     }
     storage.signed_url(hash, REF_SIGNED_URL_TTL)
+}
+
+/// Target size for each chunk of the head-blobs pack on the client fetch path.
+/// 8 MB matches the archive chunk target and keeps per-request overhead low.
+const HEAD_BLOBS_CHUNK_SIZE: usize = 8 * 1024 * 1024;
+
+/// Split a pack file into content-addressed chunks and store them in the CAS.
+/// Returns the `ChunkRef`s in the order needed to reconstruct the pack.
+fn split_and_store_pack(cas: &crate::cas::Cas, pack: &[u8]) -> Result<Vec<ChunkRef>> {
+    let mut refs = Vec::new();
+    for chunk in pack.chunks(HEAD_BLOBS_CHUNK_SIZE) {
+        let hash = cas.put(chunk)?;
+        refs.push(ChunkRef {
+            hash: hash_from_hex(&hash)?,
+            len: chunk.len() as u64,
+        });
+    }
+    Ok(refs)
 }
 
 async fn sync_repo(
@@ -1513,9 +1545,11 @@ async fn do_sync(
     let metadata_data = metadata_chunk.encode_to_vec();
     let metadata_hash = cas.put(&metadata_data)?;
 
-    // Read head-blobs pack/idx lengths for the top-level clonepack manifest.
+    // Split the head-blobs pack into fixed-size chunks so the client can fetch
+    // it in parallel. The idx stays small and is fetched as a single object.
     let head_blobs_pack_data = cas.get(&head_blobs_pack)?;
     let head_blobs_idx_data = cas.get(&head_blobs_idx)?;
+    let head_blobs_chunk_refs = split_and_store_pack(&cas, &head_blobs_pack_data)?;
 
     let archive_chunk_lengths = crate::clonepack::archive_chunk_lengths(&metadata_chunk);
     let archive_chunks: Vec<ChunkRef> = archive_chunk_hashes
@@ -1537,14 +1571,12 @@ async fn do_sync(
             len: metadata_data.len() as u64,
         }),
         archive_chunks,
-        head_blobs_pack: Some(ChunkRef {
-            hash: hash_from_hex(&head_blobs_pack)?,
-            len: head_blobs_pack_data.len() as u64,
-        }),
+        head_blobs_chunks: head_blobs_chunk_refs.clone(),
         head_blobs_idx: Some(ChunkRef {
             hash: hash_from_hex(&head_blobs_idx)?,
             len: head_blobs_idx_data.len() as u64,
         }),
+        ..Default::default()
     };
     let clonepack_data = clonepack_manifest.encode_to_vec();
     let clonepack_hash = cas.put(&clonepack_data)?;
@@ -1563,14 +1595,20 @@ async fn do_sync(
         String::new()
     };
 
+    let head_blobs_chunk_hashes: Vec<String> = head_blobs_chunk_refs
+        .iter()
+        .map(|r| hash_to_hex(&r.hash))
+        .collect();
+
     let info = RefInfo {
         commit: commit.clone(),
         parent_commit: parent.clone(),
         default_branch: default_branch.clone(),
         skeleton_pack,
         skeleton_idx,
-        head_blobs_pack,
+        head_blobs_pack: String::new(),
         head_blobs_idx,
+        head_blobs_chunks: head_blobs_chunk_hashes,
         prebuilt_index,
         archive: archive_chunk_hashes.first().cloned().unwrap_or_default(),
         manifest: metadata_hash.clone(),
@@ -1591,12 +1629,12 @@ async fn do_sync(
     let mut artifact_hashes: Vec<&str> = vec![
         &info.skeleton_pack,
         &info.skeleton_idx,
-        &info.head_blobs_pack,
         &info.head_blobs_idx,
         &info.prebuilt_index,
         &info.manifest,
         &info.clonepack_manifest,
     ];
+    artifact_hashes.extend(info.head_blobs_chunks.iter().map(|s| s.as_str()));
     artifact_hashes.extend(info.archive_chunks.iter().map(|s| s.as_str()));
     for hash in artifact_hashes.iter().filter(|h| !h.is_empty()) {
         let data = cas
@@ -1696,6 +1734,7 @@ async fn update_build_status(
             skeleton_idx: String::new(),
             head_blobs_pack: String::new(),
             head_blobs_idx: String::new(),
+            head_blobs_chunks: Vec::new(),
             prebuilt_index: String::new(),
             archive: String::new(),
             manifest: String::new(),
@@ -1905,6 +1944,7 @@ mod tests {
             skeleton_idx: String::new(),
             head_blobs_pack: String::new(),
             head_blobs_idx: String::new(),
+            head_blobs_chunks: Vec::new(),
             prebuilt_index: String::new(),
             archive: String::new(),
             manifest: String::new(),

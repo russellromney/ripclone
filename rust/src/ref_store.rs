@@ -316,6 +316,7 @@ mod tests {
             skeleton_idx: String::new(),
             head_blobs_pack: String::new(),
             head_blobs_idx: String::new(),
+            head_blobs_chunks: Vec::new(),
             prebuilt_index: String::new(),
             archive: String::new(),
             manifest: String::new(),

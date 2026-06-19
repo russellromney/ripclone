@@ -33,8 +33,16 @@ message ClonepackManifest {
   // direct-install needs them so `git checkout-index` can materialize files,
   // but archive-extraction can skip them because the working tree is built
   // from archive chunks.
-  ChunkRef head_blobs_pack = 6;
+  //
+  // The pack is split into multiple content-addressed chunks so the client can
+  // fetch it in parallel. The chunks are concatenated in order to reconstruct
+  // the original pack file.
+  repeated ChunkRef head_blobs_chunks = 8;
   ChunkRef head_blobs_idx = 7;
+
+  // Deprecated: kept for compatibility with older manifests. New builds write
+  // `head_blobs_chunks` instead.
+  ChunkRef head_blobs_pack = 6 [deprecated = true];
 }
 
 // Per-commit metadata chunk. This is the only chunk that changes on every
