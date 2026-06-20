@@ -463,8 +463,8 @@ where
                             }
                             if let Some(ref target_dir) = target_dir2 {
                                 write_entry(target_dir, entry, content)?;
+                                written += 1;
                             }
-                            written += 1;
                         } else {
                             let mut guard = pending_files2.lock().unwrap();
                             let pending = guard.get_mut(file_idx).ok_or_else(|| {
@@ -491,6 +491,7 @@ where
                                 }
                                 if let Some(ref target_dir) = target_dir2 {
                                     write_entry(target_dir, entry, &full)?;
+                                    written += 1;
                                 }
                                 if let Some(ref tx) = blob_pack_tx2 {
                                     let sha1 = blob_sha1_to_array(&entry.blob_sha1)?;
@@ -500,7 +501,6 @@ where
                                     })
                                     .context("blob pack builder closed")?;
                                 }
-                                written += 1;
                             }
                         }
                     }
@@ -1431,8 +1431,8 @@ pub fn extract_archive_from_chunk_receiver(
                             }
                             if let Some(ref target_dir) = target_dir2 {
                                 write_entry(target_dir, entry, content)?;
+                                written += 1;
                             }
-                            written += 1;
                         } else {
                             let mut guard = pending_files2.lock().unwrap();
                             let pending = guard.get_mut(file_idx).ok_or_else(|| {
@@ -1459,6 +1459,7 @@ pub fn extract_archive_from_chunk_receiver(
                                 }
                                 if let Some(ref target_dir) = target_dir2 {
                                     write_entry(target_dir, entry, &full)?;
+                                    written += 1;
                                 }
                                 if let Some(ref tx) = blob_pack_tx2 {
                                     let sha1 = blob_sha1_to_array(&entry.blob_sha1)?;
@@ -1468,7 +1469,6 @@ pub fn extract_archive_from_chunk_receiver(
                                     })
                                     .context("blob pack builder closed")?;
                                 }
-                                written += 1;
                             }
                         }
                     }
