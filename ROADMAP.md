@@ -4,6 +4,35 @@
 >
 > This repo is the **headless open-source backend**: the Rust server, the CLI, the archive format, and the GitHub Actions trigger. Billing, workspaces, and the web UI live in the separate `ripclone-cloud` project.
 
+## Clone modes & pack architecture (active plan)
+
+We support **exactly three** clone modes — no arbitrary `--depth N` (it's finicky and almost nobody uses it; people pick depth=1 or full):
+
+- **`editable --depth 1`** (default): HEAD snapshot, full object DB for HEAD. The agent/CI hot path.
+- **`editable --depth 0` (full)**: HEAD + all history.
+- **`files`**: worktree only, no git objects (zstd archive) — fastest CI path.
+
+This collapses the server to **two pack buckets** (no range/geometric depth buckets):
+
+- **HEAD-closure packs** — every current blob + HEAD commit/trees. **Undeltified**, many small (~2 MB) packs so the client downloads in parallel and hand-parses for the working tree. Used by *every* depth. *(done)*
+- **History packs** — full history minus HEAD closure (ancestor commits/trees, old blob versions). **Deltified** (undeltified history is multi-GB), fewer/larger packs. Only **installed** for the object DB; the client never hand-parses or materializes the worktree from them (git reads them, resolving deltas). *(history bucket built; needs deltify flip)*
+
+depth=1 clonepack lists HEAD-closure packs; full lists HEAD + history. The depth=1 set is a **content-addressed subset** of the full set — no separate HEAD pack is built.
+
+**MIDX (the "many packs but git stays fast" lever):** the server pre-builds a `multi-pack-index` per variant (head-MIDX, full-MIDX) in a temp pack dir using the client's deterministic `pack-<trailer>.{pack,idx}` filenames, stores it as a content-addressed artifact, and the client drops it into `.git/objects/pack/`. Object lookups become O(log) across all packs regardless of count — so many small packs (great download parallelism) coexist with fast `git status`/`diff`/`log`. Cheap to build (indexes existing idx files; no pack rewrite). Optionally `--bitmap`.
+
+**Full-clone correctness:** a "full" clone from a shallow mirror is bounded; it must either come from an **unshallow mirror** or carry a `.git/shallow` boundary marker, or `git fsck`/traversal breaks at the boundary (observed bug).
+
+### Immediate next
+1. **Deltify the history bucket** — kills the full-history size blowup (client unchanged; it only hand-parses HEAD packs).
+2. **Pre-generate MIDX** (head + full) and install it on the client.
+3. **Unshallow mirror + `.git/shallow`** so depth=0 is a true, fsck-clean full clone.
+
+### Deferred
+- **LSM incremental build** — don't rebuild full history every sync (append an L0 pack at HEAD, compact older into immutable range packs; LSM levels). Optimization only.
+- **io_uring** durable-disk worktree writes — orthogonal speedup so `--temp` (ephemeral tmpfs) isn't required for fast durable clones.
+- **Blobless partial clone** (`--filter=blob:none` via a git promisor pointing at the server) — distinct from `files`; a separate project for huge monorepos.
+
 ## What already works
 
 See `CHANGELOG.md` for the full list. The important baseline for current work:
