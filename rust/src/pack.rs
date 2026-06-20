@@ -186,7 +186,64 @@ impl<'a> PackBuilder<'a> {
         if oids.is_empty() {
             bail!("no objects to pack for {}", commit);
         }
-        let sizes = git::object_sizes(&self.repo, &oids)?;
+        self.build_packs_from_oids(&oids, target_raw_bytes)
+    }
+
+    /// Build the depth content as two layers of mini-packs:
+    ///   - `head`: the HEAD-tree closure (commit + trees + every *current* blob).
+    ///     Needed by every clone depth; this is the working tree.
+    ///   - `history`: every other reachable object (old blob versions, ancestor
+    ///     commits/trees) — i.e. full history minus the HEAD closure. Needed only
+    ///     for deeper clones.
+    ///
+    /// A depth=1 clonepack lists only `head`; a full (depth=0) clonepack lists
+    /// `head` + `history`. The packs are content-addressed, so the depth=1 set is
+    /// literally a subset of the full set — no separate HEAD pack is built.
+    ///
+    /// `history` is empty for a single-commit repo. Note: `history` is only as
+    /// complete as the mirror's available history (deepen/unshallow the mirror
+    /// for a true full clone).
+    pub fn build_layered_packs(
+        &self,
+        commit: &str,
+        target_raw_bytes: u64,
+    ) -> Result<(
+        Vec<(String, u64, String, u64)>,
+        Vec<(String, u64, String, u64)>,
+    )> {
+        use std::collections::HashSet;
+        let head_oids = git::list_object_shas_with_depth(&self.repo, commit, Some(1))?;
+        if head_oids.is_empty() {
+            bail!("no objects to pack for {}", commit);
+        }
+        let head_set: HashSet<&str> = head_oids.iter().map(String::as_str).collect();
+        let all_oids = git::list_object_shas_with_depth(&self.repo, commit, None)?;
+        let history_oids: Vec<String> = all_oids
+            .into_iter()
+            .filter(|o| !head_set.contains(o.as_str()))
+            .collect();
+
+        let head_packs = self.build_packs_from_oids(&head_oids, target_raw_bytes)?;
+        let history_packs = if history_oids.is_empty() {
+            Vec::new()
+        } else {
+            self.build_packs_from_oids(&history_oids, target_raw_bytes)?
+        };
+        Ok((head_packs, history_packs))
+    }
+
+    /// Partition `oids` greedily by raw size into `~target_raw_bytes` batches and
+    /// pack each as a self-contained, undeltified (`--window=0`) mini-pack.
+    /// Returns `(pack_hash, pack_len, idx_hash, idx_len)` per pack.
+    fn build_packs_from_oids(
+        &self,
+        oids: &[String],
+        target_raw_bytes: u64,
+    ) -> Result<Vec<(String, u64, String, u64)>> {
+        if oids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sizes = git::object_sizes(&self.repo, oids)?;
 
         // Greedy size-based partitioning. A single object larger than the target
         // gets its own pack (we can't split one object across packs).
@@ -195,12 +252,12 @@ impl<'a> PackBuilder<'a> {
         let mut cur: Vec<String> = Vec::new();
         let mut cur_bytes = 0u64;
         for oid in oids {
-            let sz = sizes.get(&oid).copied().unwrap_or(0);
+            let sz = sizes.get(oid).copied().unwrap_or(0);
             if !cur.is_empty() && cur_bytes + sz > target {
                 batches.push(std::mem::take(&mut cur));
                 cur_bytes = 0;
             }
-            cur.push(oid);
+            cur.push(oid.clone());
             cur_bytes += sz;
         }
         if !cur.is_empty() {
@@ -211,9 +268,8 @@ impl<'a> PackBuilder<'a> {
         for batch in batches {
             // Undeltified (`--window=0`): each object is stored whole, so the
             // client can read blobs straight from the downloaded pack bytes
-            // (plain zlib, no delta resolution, no shared-repo access). For a
-            // HEAD-only snapshot deltas barely help anyway. Each pack is also
-            // self-contained (non-thin).
+            // (plain zlib, no delta resolution, no shared-repo access). Each pack
+            // is also self-contained (non-thin).
             let (pack_hash, idx_hash) = self.pack_and_index_inner(&batch, true)?;
             let pack_len = self.cas.get(&pack_hash)?.len() as u64;
             let idx_len = self.cas.get(&idx_hash)?.len() as u64;

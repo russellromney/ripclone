@@ -1757,7 +1757,8 @@ async fn do_sync(
     let commit3 = commit.clone();
     let depth_packs_handle = tokio::task::spawn_blocking(move || {
         let builder = PackBuilder::new(&mirror_dir3, &cas3);
-        builder.build_depth_packs(&commit3, Some(1), pack_target_raw)
+        // Two layers: HEAD-closure packs (every depth) + history packs (full only).
+        builder.build_layered_packs(&commit3, pack_target_raw)
     });
 
     // Working-tree archive + manifest.
@@ -1774,7 +1775,7 @@ async fn do_sync(
     let (shallow_skeleton_pack, shallow_skeleton_idx) = shallow_skeleton_handle
         .await
         .context("shallow skeleton pack task")??;
-    let depth_packs = depth_packs_handle.await.context("depth packs task")??;
+    let (head_packs, history_packs) = depth_packs_handle.await.context("depth packs task")??;
     let (archive_chunk_hashes, mut metadata_chunk) =
         archive_handle.await.context("archive task")??;
 
@@ -1821,31 +1822,42 @@ async fn do_sync(
     let shallow_metadata_data = shallow_metadata_chunk.encode_to_vec();
     let shallow_metadata_hash = cas.put(&shallow_metadata_data)?;
 
-    // Build the manifest `packs` list from the small depth packs. Each entry is
-    // a self-contained git pack + its idx, fetched and installed independently.
-    let pack_entries: Vec<crate::clonepack::PackEntry> = depth_packs
-        .iter()
-        .map(|(pack_hash, pack_len, idx_hash, idx_len)| {
-            anyhow::Ok(crate::clonepack::PackEntry {
-                pack: Some(ChunkRef {
-                    hash: hash_from_hex(pack_hash)?,
-                    len: *pack_len,
-                }),
-                idx: Some(ChunkRef {
-                    hash: hash_from_hex(idx_hash)?,
-                    len: *idx_len,
-                }),
+    // Build manifest `packs` entries. Each is a self-contained git pack + idx,
+    // fetched and installed independently. The shallow (depth=1) clonepack lists
+    // only the HEAD-closure packs; the full clonepack lists HEAD + history. Order
+    // is HEAD-first so a shallow client's URL indices line up with the prefix of
+    // the (head+history) signed-URL list.
+    let to_entries = |packs: &[(String, u64, String, u64)]| -> Result<Vec<crate::clonepack::PackEntry>> {
+        packs
+            .iter()
+            .map(|(ph, pl, ih, il)| {
+                anyhow::Ok(crate::clonepack::PackEntry {
+                    pack: Some(ChunkRef {
+                        hash: hash_from_hex(ph)?,
+                        len: *pl,
+                    }),
+                    idx: Some(ChunkRef {
+                        hash: hash_from_hex(ih)?,
+                        len: *il,
+                    }),
+                })
             })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    // All pack + idx hashes, for storage upload and retention protection.
-    let depth_pack_hashes: Vec<String> = depth_packs
+            .collect()
+    };
+    let head_entries = to_entries(&head_packs)?;
+    let history_entries = to_entries(&history_packs)?;
+    let mut full_entries = head_entries.clone();
+    full_entries.extend(history_entries.iter().cloned());
+
+    // HEAD + history, for storage upload, retention protection, and RefInfo
+    // signing (ordered HEAD-first to match the manifests).
+    let all_packs: Vec<&(String, u64, String, u64)> =
+        head_packs.iter().chain(history_packs.iter()).collect();
+    let depth_pack_hashes: Vec<String> = all_packs
         .iter()
         .flat_map(|(p, _, i, _)| [p.clone(), i.clone()])
         .collect();
-    // Ordered (pack, idx) hashes for RefInfo so the ref endpoint can sign each
-    // pack/idx URL without decoding the manifest. Matches `pack_entries` order.
-    let pack_artifacts: Vec<crate::PackArtifact> = depth_packs
+    let pack_artifacts: Vec<crate::PackArtifact> = all_packs
         .iter()
         .map(|(p, _, i, _)| crate::PackArtifact {
             pack: p.clone(),
@@ -1865,29 +1877,32 @@ async fn do_sync(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let make_clonepack = |metadata_hash: String, metadata_len: u64| -> Result<ClonepackManifest> {
-        Ok(ClonepackManifest {
-            commit: commit.clone(),
-            parent_commit: parent.clone(),
-            default_branch: default_branch.clone(),
-            metadata_chunk: Some(ChunkRef {
-                hash: hash_from_hex(&metadata_hash)?,
-                len: metadata_len,
-            }),
-            archive_chunks: archive_chunks.clone(),
-            packs: pack_entries.clone(),
-            ..Default::default()
-        })
-    };
+    let make_clonepack =
+        |metadata_hash: String, metadata_len: u64, packs: Vec<crate::clonepack::PackEntry>| -> Result<ClonepackManifest> {
+            Ok(ClonepackManifest {
+                commit: commit.clone(),
+                parent_commit: parent.clone(),
+                default_branch: default_branch.clone(),
+                metadata_chunk: Some(ChunkRef {
+                    hash: hash_from_hex(&metadata_hash)?,
+                    len: metadata_len,
+                }),
+                archive_chunks: archive_chunks.clone(),
+                packs,
+                ..Default::default()
+            })
+        };
 
+    // Full clonepack: HEAD closure + all history. Shallow: HEAD closure only.
     let full_clonepack_manifest =
-        make_clonepack(metadata_hash.clone(), metadata_data.len() as u64)?;
+        make_clonepack(metadata_hash.clone(), metadata_data.len() as u64, full_entries)?;
     let full_clonepack_data = full_clonepack_manifest.encode_to_vec();
     let full_clonepack_hash = cas.put(&full_clonepack_data)?;
 
     let shallow_clonepack_manifest = make_clonepack(
         shallow_metadata_hash.clone(),
         shallow_metadata_data.len() as u64,
+        head_entries,
     )?;
     let shallow_clonepack_data = shallow_clonepack_manifest.encode_to_vec();
     let shallow_clonepack_hash = cas.put(&shallow_clonepack_data)?;
