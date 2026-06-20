@@ -195,6 +195,7 @@ for cores in $CORES; do
       install_start=$(now_ms)
       if [ "$MODE" = "rcgit" ]; then
         RIPCLONE_FETCH_THREADS="$threads" RIPCLONE_WRITE_THREADS="$threads" \
+          RIPCLONE_FETCH_CONCURRENCY="$threads" \
           "$RCGIT" --server "$PROXY_URL" clone "$REPO" --dir "$install_dir" 2>&1
       else
         RIPCLONE_FETCH_THREADS="$threads" RIPCLONE_WRITE_THREADS="$threads" \

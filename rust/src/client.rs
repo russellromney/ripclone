@@ -9,9 +9,7 @@ use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, bounded};
 use prost::Message;
 use serde::Deserialize;
-use sha1::{Digest as Sha1Digest, Sha1};
-use std::collections::BTreeMap;
-use std::io::{BufWriter, Write};
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -49,7 +47,7 @@ pub struct RefResponse {
 /// Return the chunk refs that make up the head-blobs pack, falling back to the
 /// deprecated single-pack field for older manifests.
 #[allow(deprecated)]
-fn head_blobs_chunk_refs(clonepack: &ClonepackManifest) -> Vec<crate::clonepack::ChunkRef> {
+pub(crate) fn head_blobs_chunk_refs(clonepack: &ClonepackManifest) -> Vec<crate::clonepack::ChunkRef> {
     if !clonepack.head_blobs_chunks.is_empty() {
         clonepack.head_blobs_chunks.clone()
     } else if let Some(pack) = &clonepack.head_blobs_pack {
@@ -759,9 +757,10 @@ impl Client {
     /// Download the pre-built head-blobs pack + index and install them into
     /// `.git/objects/pack/`. Returns the total bytes downloaded.
     ///
-    /// Chunks are downloaded with bounded concurrency and streamed to a temp
-    /// file in index order, so peak memory stays at ~`concurrency * chunk_size`
-    /// instead of holding the whole pack in RAM.
+    /// Chunks are downloaded with bounded concurrency and written directly into
+    /// a pre-allocated temp pack file at their final offsets. Peak memory is
+    /// ~`concurrency * chunk_size`, no bytes are re-hashed, and the pack is
+    /// written exactly once.
     #[allow(deprecated)]
     pub async fn install_prebuilt_blob_pack(
         &self,
@@ -769,6 +768,8 @@ impl Client {
         info: &RefResponse,
         pack_dir: &std::path::Path,
     ) -> Result<u64> {
+        use std::os::unix::fs::FileExt;
+
         let head_blobs_refs = head_blobs_chunk_refs(clonepack);
         if head_blobs_refs.is_empty() {
             anyhow::bail!("clonepack missing head-blobs pack for hybrid install");
@@ -790,66 +791,95 @@ impl Client {
             .suffix(".tmp")
             .tempfile_in(pack_dir)
             .context("create temp head-blobs pack")?;
-        let mut writer = BufWriter::new(
-            tmp.as_file()
-                .try_clone()
-                .context("clone temp head-blobs pack file handle")?,
-        );
-        let mut hasher = Sha1::new();
+        let file = tmp
+            .as_file()
+            .try_clone()
+            .context("clone temp head-blobs pack fd")?;
 
-        // Stream chunks in index order with bounded concurrency.
         let signed_urls = info.head_blobs_chunk_urls.as_deref().unwrap_or(&[]);
         let concurrency: usize = std::env::var("RIPCLONE_FETCH_CONCURRENCY")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(6)
             .max(1);
-        let jobs: Vec<(usize, ChunkRef, Option<String>)> = head_blobs_refs
+
+        // Compute final pack size and per-chunk byte offsets.
+        let mut offsets = Vec::with_capacity(head_blobs_refs.len());
+        let mut total_len = 0u64;
+        for chunk in &head_blobs_refs {
+            offsets.push(total_len);
+            total_len += chunk.len;
+        }
+
+        // Pre-allocate the temp file on the blocking pool so the async worker
+        // is not pinned during the syscall.
+        {
+            let file = file.try_clone().context("clone fd for preallocate")?;
+            tokio::task::spawn_blocking(move || {
+                file.set_len(total_len)
+                    .context("preallocate temp head-blobs pack file")
+            })
+            .await
+            .context("spawn preallocate task")??;
+        }
+
+        let jobs: Vec<(usize, ChunkRef, Option<String>, u64)> = head_blobs_refs
             .into_iter()
             .enumerate()
             .map(|(i, chunk)| {
                 let signed_url = signed_urls.get(i).and_then(|o| o.clone());
-                (i, chunk, signed_url)
+                let offset = offsets[i];
+                (i, chunk, signed_url, offset)
             })
             .collect();
 
-        use futures::stream::{self, StreamExt};
-        let mut results = stream::iter(jobs)
-            .map(|(i, chunk, signed_url)| async move {
-                let data = self
-                    .fetch_chunk_ref(&chunk, signed_url.as_deref())
+        use futures::stream::{self, StreamExt, TryStreamExt};
+        let pack_bytes: u64 = stream::iter(jobs)
+            .map(|(i, chunk, signed_url, offset)| {
+                let client = self.clone();
+                let file = file
+                    .try_clone()
+                    .with_context(|| format!("clone pack fd for head-blobs chunk {}", i));
+                async move {
+                    let file = file?;
+                    let data = client
+                        .fetch_chunk_ref(&chunk, signed_url.as_deref())
+                        .await
+                        .with_context(|| format!("fetch head-blobs chunk {}", i))?;
+                    let len = data.len() as u64;
+                    tokio::task::spawn_blocking(move || {
+                        file.write_all_at(&data, offset).with_context(|| {
+                            format!("write head-blobs chunk {} at offset {}", i, offset)
+                        })
+                    })
                     .await
-                    .with_context(|| format!("fetch head-blobs chunk {}", i))?;
-                Ok::<_, anyhow::Error>((i, data))
+                    .context("spawn chunk write task")??;
+                    Ok::<_, anyhow::Error>(len)
+                }
             })
-            .buffer_unordered(concurrency);
+            .buffer_unordered(concurrency)
+            .try_fold(0u64, |acc, len| async move { Ok(acc + len) })
+            .await?;
 
-        let mut next_index = 0usize;
-        let mut pending: BTreeMap<usize, Vec<u8>> = BTreeMap::new();
-        let mut pack_bytes = 0u64;
-        while let Some(res) = results.next().await {
-            let (i, data) = res?;
-            pending.insert(i, data);
-            while let Some(data) = pending.remove(&next_index) {
-                hasher.update(&data);
-                writer
-                    .write_all(&data)
-                    .with_context(|| format!("write head-blobs chunk {}", next_index))?;
-                pack_bytes += data.len() as u64;
-                next_index += 1;
-            }
+        // Git names pack files after the 20-byte SHA-1 trailer at the end of the
+        // pack. Read it directly instead of re-hashing the whole file.
+        if total_len < 20 {
+            anyhow::bail!("head-blobs pack is too short ({} bytes)", total_len);
         }
-        if !pending.is_empty() {
-            anyhow::bail!(
-                "missing head-blobs chunks: {:?}",
-                pending.keys().collect::<Vec<_>>()
-            );
-        }
+        let pack_hash = {
+            let file = file.try_clone().context("clone fd for trailer read")?;
+            let trailer = tokio::task::spawn_blocking(move || {
+                let mut trailer = [0u8; 20];
+                file.read_at(&mut trailer, total_len - 20)
+                    .context("read head-blobs pack trailer")?;
+                Ok::<_, anyhow::Error>(trailer)
+            })
+            .await
+            .context("spawn read trailer task")??;
+            hex::encode(trailer)
+        };
+        drop(file);
 
-        writer.flush().context("flush head-blobs pack")?;
-        drop(writer);
-
-        let pack_hash = hex::encode(hasher.finalize());
         let final_path = pack_dir.join(format!("pack-{}.pack", pack_hash));
         tmp.persist(&final_path)
             .with_context(|| format!("rename head-blobs pack to {}", final_path.display()))?;
@@ -996,7 +1026,7 @@ impl Client {
 
     fn write_origin_config(&self, owner: &str, repo: &str, git_dir: &Path) -> Result<()> {
         let config = format!(
-            "[core]\n\tsymlinks = true\n\tcheckstat = minimal\n[remote \"origin\"]\n\turl = https://github.com/{}/{}.git\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n",
+            "[core]\n\tsymlinks = true\n\tcheckStat = minimal\n[remote \"origin\"]\n\turl = https://github.com/{}/{}.git\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n",
             owner, repo
         );
         std::fs::write(git_dir.join("config"), config)?;
@@ -1727,7 +1757,7 @@ impl Client {
         std::process::Command::new("git")
             .arg("-C")
             .arg(target.as_os_str())
-            .args(["config", "core.checkstat", "minimal"])
+            .args(["config", "core.checkStat", "minimal"])
             .status()
             .ok();
 

@@ -1,30 +1,24 @@
 use crate::cas::hash as cas_hash;
-use crate::client::Client;
-use crate::clonepack::{ClonepackManifest, FileEntry, MetadataChunk};
-use crate::extract::{extract_archive_with_chunk_fetcher, Chunk};
+use crate::client::{head_blobs_chunk_refs, Client};
+use crate::clonepack::{ClonepackManifest, MetadataChunk};
+use crate::extract::extract_archive_from_chunk_receiver;
 use anyhow::{Context, Result};
+use crossbeam_channel::{bounded, Receiver, Sender};
 use prost::Message;
-use sha1::Digest;
-use std::collections::HashMap;
 use std::fs::File;
-use std::io::Write;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::path::Path;
 use std::time::Instant;
 
 /// On-disk layout for a lazy rcgit repo:
 ///
 ///   <target>/.git/                    skeleton git dir (commit/trees/index)
 ///   <target>/.git/ripclone/manifest.pb
-///   <target>/.git/ripclone/archive/<0..N>   raw archive chunk files (only when
-///                                            the server has no head-blobs pack)
 ///
-/// The working tree itself is intentionally empty. When the server provides a
-/// head-blobs pack, HEAD blobs live as real git objects in `.git/objects/pack`.
-/// Otherwise they are built locally from the archive chunks.
+/// The working tree itself is intentionally empty. HEAD blobs live as real git
+/// objects in `.git/objects/pack`; when the server has no head-blobs pack they
+/// are built locally from streamed archive chunks.
 
 const RIPCLONE_DIR: &str = ".git/ripclone";
-const ARCHIVE_DIR: &str = "archive";
 const MANIFEST_NAME: &str = "manifest.pb";
 
 /// Lazy-clone a repo: download the skeleton, the manifest, and the HEAD blobs,
@@ -125,7 +119,15 @@ pub async fn lazy_clone(
     // exactly the same format git uses, so we just concatenate the chunks and
     // write the pack+idx into `.git/objects/pack`. No decompression, no
     // re-encoding, and no second on-disk copy.
-    if !clonepack.head_blobs_chunks.is_empty() {
+    let head_blobs_refs = head_blobs_chunk_refs(&clonepack);
+    let has_head_blobs = !head_blobs_refs.is_empty()
+        && clonepack
+            .head_blobs_idx
+            .as_ref()
+            .map(|c| c.hash.len())
+            .unwrap_or(0)
+            == 32;
+    if has_head_blobs {
         let t4 = Instant::now();
         client
             .install_prebuilt_blob_pack(&clonepack, &info, &pack_dir)
@@ -134,43 +136,29 @@ pub async fn lazy_clone(
         eprintln!("  head-blobs pack: {:?}", t4.elapsed());
     } else {
         // Fallback for older clonepacks that do not ship a head-blobs pack:
-        // download the archive chunks and build a local blob pack from them.
-        let t2 = Instant::now();
-        let archive_dir = ripclone_dir.join(ARCHIVE_DIR);
-        std::fs::create_dir_all(&archive_dir)?;
-        let signed_urls = info.archive_chunk_urls.unwrap_or_default();
-        let chunks = client
-            .fetch_chunk_refs(&clonepack.archive_chunks, Some(&signed_urls))
-            .await
-            .context("fetch archive chunks")?;
-        for (idx, data) in chunks.into_iter().enumerate() {
-            let path = archive_dir.join(format!("{}", idx));
-            std::fs::write(&path, data).with_context(|| format!("write archive chunk {}", idx))?;
-        }
-        eprintln!("  archive chunks: {:?}", t2.elapsed());
-
+        // stream archive chunks directly into the core extractor (no archive
+        // directory on disk, no double I/O).
         let t4 = Instant::now();
-        let archive_dir_for_closure = archive_dir.clone();
-        extract_archive_with_chunk_fetcher(
+        let signed_urls = info.archive_chunk_urls.unwrap_or_default();
+        stream_archive_to_blob_pack(
+            client,
+            &clonepack.archive_chunks,
+            &signed_urls,
             &manifest_path,
-            None,
-            Some(&git_dir),
-            None,
-            u64::MAX,
-            move |chunk: &Chunk| {
-                let path = archive_dir_for_closure.join(format!("{}", chunk.chunk_index));
-                let bytes = std::fs::read(&path)
-                    .with_context(|| format!("read archive chunk {}", chunk.chunk_index))?;
-                Ok(bytes)
-            },
+            &git_dir,
         )
-        .context("build blob pack from archive chunks")?;
+        .await
+        .context("stream archive chunks to blob pack")?;
         eprintln!("  blob pack: {:?}", t4.elapsed());
     }
 
-    // Tell git to assume every tracked path is unchanged so it does not try to
-    // stat missing working-tree files.
-    set_skip_worktree_all(&git_dir, &metadata)?;
+    // The working tree is intentionally empty; ensure every tracked path is
+    // marked skip-worktree. The server now writes this into the prebuilt index,
+    // so on freshly-synced repos this is a fast no-op.
+    let target2 = target.to_path_buf();
+    tokio::task::spawn_blocking(move || crate::git::ensure_skip_worktree_all(&target2))
+        .await
+        .context("spawn skip-worktree task")??;
     eprintln!("  skeleton+skip-worktree: {:?}", t3.elapsed());
     eprintln!("  total: {:?}", t0.elapsed());
 
@@ -180,139 +168,108 @@ pub async fn lazy_clone(
 fn write_origin_config(owner: &str, repo: &str, git_dir: &Path) -> Result<()> {
     std::fs::create_dir_all(git_dir.join("info"))?;
     let config = format!(
-        "[core]\n\tsymlinks = true\n\tcheckstat = minimal\n[remote \"origin\"]\n\turl = https://github.com/{}/{}.git\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n",
+        "[core]\n\tsymlinks = true\n\tcheckStat = minimal\n[remote \"origin\"]\n\turl = https://github.com/{}/{}.git\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n",
         owner, repo
     );
     std::fs::write(git_dir.join("config"), config)?;
     Ok(())
 }
 
-fn set_skip_worktree_all(git_dir: &Path, metadata: &MetadataChunk) -> Result<()> {
-    let paths: Vec<String> = metadata
-        .files
-        .iter()
-        .map(|e| String::from_utf8_lossy(&e.path).into_owned())
-        .collect();
-    if paths.is_empty() {
-        return Ok(());
-    }
-    let mut child = Command::new("git")
-        .arg("-C")
-        .arg(git_dir.parent().unwrap_or(git_dir))
-        .args(["update-index", "--skip-worktree", "--stdin"])
-        .stdin(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("spawn git update-index (PATH={:?})", std::env::var("PATH")))?;
-    {
-        let stdin = child.stdin.as_mut().context("open update-index stdin")?;
-        for p in &paths {
-            writeln!(stdin, "{}", p)?;
-        }
-    }
-    let status = child.wait().context("wait for git update-index")?;
-    if !status.success() {
-        anyhow::bail!("git update-index --skip-worktree failed");
-    }
-    Ok(())
-}
+/// Return the HEAD-blobs chunk refs from a clonepack, handling both the new
+/// `head_blobs_chunks` field and the deprecated single `head_blobs_pack`.
+/// Stream archive chunks directly into the core extractor without writing them
+/// to disk first. Downloads run with bounded concurrency while extraction runs
+/// on the blocking pool, so the async worker threads are not pinned.
+async fn stream_archive_to_blob_pack(
+    client: &Client,
+    archive_chunks: &[crate::clonepack::ChunkRef],
+    signed_urls: &[Option<String>],
+    manifest_path: &Path,
+    git_dir: &Path,
+) -> Result<()> {
+    let concurrency: usize = std::env::var("RIPCLONE_FETCH_CONCURRENCY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(6)
+        .max(1);
+    let (chunk_tx, chunk_rx): (Sender<(usize, Result<Vec<u8>>)>, Receiver<(usize, Result<Vec<u8>>)>) =
+        bounded(concurrency * 2);
+    // Use an async tokio channel for the download task so `.send().await`
+    // provides backpressure without blocking a runtime worker. A small bridge
+    // thread forwards into the crossbeam channel consumed by the sync extractor.
+    let (async_tx, mut async_rx) = tokio::sync::mpsc::channel(concurrency * 2);
 
-/// Open a lazy repo from an existing directory.
-pub struct LazyRepo {
-    git_dir: PathBuf,
-    manifest: MetadataChunk,
-    archive_dir: PathBuf,
-    /// Cache decompressed chunks to avoid repeated zstd work.
-    chunk_cache: std::sync::Mutex<HashMap<u32, Vec<u8>>>,
-}
+    let client = client.clone();
+    let archive_chunks: Vec<_> = archive_chunks.to_vec();
+    let signed_urls: Vec<Option<String>> = signed_urls.to_vec();
+    let manifest_path = manifest_path.to_path_buf();
+    let git_dir = git_dir.to_path_buf();
 
-impl LazyRepo {
-    pub fn open(target: &Path) -> Result<Self> {
-        let git_dir = target.join(".git");
-        if !git_dir.is_dir() {
-            anyhow::bail!("not an rcgit repo: missing .git");
+    let bridge = tokio::task::spawn_blocking(move || {
+        while let Some(item) = async_rx.blocking_recv() {
+            if chunk_tx.send(item).is_err() {
+                break;
+            }
         }
-        let ripclone_dir = git_dir.join("ripclone");
-        let manifest_path = ripclone_dir.join(MANIFEST_NAME);
-        let archive_dir = ripclone_dir.join(ARCHIVE_DIR);
-        let mut f = File::open(&manifest_path)
-            .with_context(|| format!("open manifest {}", manifest_path.display()))?;
-        let manifest = MetadataChunk::read(&mut f)
-            .with_context(|| format!("read manifest {}", manifest_path.display()))?;
-        Ok(Self {
-            git_dir,
-            manifest,
-            archive_dir,
-            chunk_cache: std::sync::Mutex::new(HashMap::new()),
+        Ok::<_, anyhow::Error>(())
+    });
+
+    let download = {
+        let async_tx = async_tx.clone();
+        tokio::spawn(async move {
+            use futures::stream::{self, StreamExt, TryStreamExt};
+            let jobs: Vec<_> = archive_chunks
+                .into_iter()
+                .enumerate()
+                .map(|(i, chunk)| {
+                    let signed_url = signed_urls.get(i).cloned().flatten();
+                    (i, chunk, signed_url)
+                })
+                .collect();
+            stream::iter(jobs)
+                .map(|(i, chunk, signed_url)| {
+                    let client = client.clone();
+                    async move {
+                        let data = client
+                            .fetch_chunk_ref(&chunk, signed_url.as_deref())
+                            .await
+                            .with_context(|| format!("fetch archive chunk {}", i))?;
+                        Ok::<_, anyhow::Error>((i, data))
+                    }
+                })
+                .buffer_unordered(concurrency)
+                .try_for_each(|(i, data)| {
+                    let async_tx = async_tx.clone();
+                    async move {
+                        async_tx
+                            .send((i, Ok(data)))
+                            .await
+                            .map_err(|_| anyhow::anyhow!("archive extractor closed"))?;
+                        Ok(())
+                    }
+                })
+                .await?;
+            drop(async_tx);
+            Ok::<_, anyhow::Error>(())
         })
-    }
+    };
+    // Drop the original async sender so the bridge closes once the download task finishes.
+    drop(async_tx);
 
-    /// Read a file from the archive by its working-tree path.
-    pub fn read_path(&self, path: &str) -> Result<Vec<u8>> {
-        let entry = self
-            .manifest
-            .files
-            .iter()
-            .find(|e| e.path == path.as_bytes())
-            .with_context(|| format!("path not in manifest: {}", path))?;
-        self.read_entry(entry)
-    }
+    let extract = tokio::task::spawn_blocking(move || {
+        extract_archive_from_chunk_receiver(
+            &manifest_path,
+            None,
+            Some(&git_dir),
+            None,
+            chunk_rx,
+        )
+    });
 
-    fn read_entry(&self, entry: &FileEntry) -> Result<Vec<u8>> {
-        let mut out = Vec::with_capacity(entry.total_len() as usize);
-        for fragment in &entry.fragments {
-            let raw = self.frame_raw(fragment.frame_index)?;
-            let off = fragment.frame_offset as usize;
-            let len = fragment.raw_len as usize;
-            if off + len > raw.len() {
-                anyhow::bail!(
-                    "fragment for {} extends past frame",
-                    String::from_utf8_lossy(&entry.path)
-                );
-            }
-            out.extend_from_slice(&raw[off..off + len]);
-        }
-        // Optional integrity check.
-        let hash = sha1::Sha1::digest(&out);
-        if hash.as_slice() != entry.blob_sha1 {
-            anyhow::bail!("sha1 mismatch for {}", String::from_utf8_lossy(&entry.path));
-        }
-        Ok(out)
-    }
-
-    fn frame_raw(&self, frame_index: u32) -> Result<Vec<u8>> {
-        {
-            let cache = self.chunk_cache.lock().unwrap();
-            if let Some(data) = cache.get(&frame_index) {
-                return Ok(data.clone());
-            }
-        }
-        let frame = &self.manifest.frames[frame_index as usize];
-        let chunk_path = self.archive_dir.join(format!("{}", frame.chunk_index));
-        let chunk = std::fs::read(&chunk_path)
-            .with_context(|| format!("read archive chunk {}", frame.chunk_index))?;
-        let start = frame.chunk_offset as usize;
-        let end = start + frame.compressed_len as usize;
-        if end > chunk.len() {
-            anyhow::bail!("frame {} extends past chunk end", frame_index);
-        }
-        let raw = zstd::decode_all(&chunk[start..end])
-            .with_context(|| format!("decompress frame {}", frame_index))?;
-        if raw.len() != frame.raw_len as usize {
-            anyhow::bail!(
-                "frame {} raw length mismatch: {} vs {}",
-                frame_index,
-                raw.len(),
-                frame.raw_len
-            );
-        }
-        {
-            let mut cache = self.chunk_cache.lock().unwrap();
-            cache.insert(frame_index, raw.clone());
-        }
-        Ok(raw)
-    }
-
-    pub fn git_dir(&self) -> &Path {
-        &self.git_dir
-    }
+    let (bridge_res, dl_res, ex_res) = tokio::try_join!(bridge, download, extract)
+        .context("archive download/extract join")?;
+    bridge_res.context("bridge archive chunks to extractor")?;
+    dl_res.context("download archive chunks")?;
+    ex_res.context("extract archive chunks")?;
+    Ok(())
 }

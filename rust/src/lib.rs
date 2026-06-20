@@ -22,7 +22,6 @@ pub mod mode;
 pub mod oidc;
 pub mod overlay;
 pub mod pack;
-pub mod pack_writer;
 pub mod rcgit;
 pub mod ref_store;
 pub mod retention;

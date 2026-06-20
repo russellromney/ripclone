@@ -71,7 +71,7 @@ impl<'a> SnapshotBuilder<'a> {
         // by the archive/sidecar materialization, so we leave core.fileMode at
         // its default (true on Unix).
         git::run_git(work, &["config", "core.symlinks", "true"])?;
-        git::run_git(work, &["config", "core.checkstat", "minimal"])?;
+        git::run_git(work, &["config", "core.checkStat", "minimal"])?;
 
         // Materialize hot files into the working tree.
         let hot_files = git::hot_files(&self.mirror, commit, hot_file_count, 5)?;
