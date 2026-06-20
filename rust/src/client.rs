@@ -6,7 +6,7 @@ use crate::git;
 use crate::mode::CloneMode;
 use crate::overlay;
 use anyhow::{Context, Result};
-use crossbeam_channel::{Receiver, Sender, unbounded};
+use crossbeam_channel::{Receiver, Sender, bounded};
 use prost::Message;
 use serde::Deserialize;
 use sha1::{Digest, Sha1};
