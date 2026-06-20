@@ -15,17 +15,6 @@ use tracing::info;
 
 const INDEX_MTIME: FileTime = FileTime::from_unix_time(1, 0);
 
-/// Check whether per-blob SHA-1 verification should be skipped.
-///
-/// **Unsafe:** archive chunk hashes are still verified, and `git index-pack`
-/// recomputes object hashes when the local pack is built, but skipping the
-/// per-blob check means a malicious or buggy server could serve wrong content
-/// that still passes chunk-level checks. Only use this when you fully trust the
-/// server and need the extra CPU savings.
-fn skip_sha1_verify() -> bool {
-    std::env::var_os("RIPCLONE_UNSAFE_SKIP_SHA1_VERIFY").is_some()
-}
-
 /// Convert a manifest blob_sha1 slice to a fixed 20-byte array.
 fn blob_sha1_to_array(sha1: &[u8]) -> Result<[u8; 20]> {
     sha1.try_into()
@@ -53,6 +42,7 @@ struct PendingFile {
     remaining: usize,
 }
 
+#[derive(Debug)]
 pub struct ExtractStats {
     pub files: usize,
     pub raw_bytes: u64,
@@ -204,6 +194,17 @@ where
         .read_to_end(&mut manifest_bytes)
         .context("read manifest")?;
     let manifest = Manifest::read(&mut manifest_bytes.as_slice())?;
+
+    // Validate every blob_sha1 length up front so downstream code can rely on
+    // a fixed 20-byte representation.
+    for entry in manifest.files.iter() {
+        blob_sha1_to_array(&entry.blob_sha1).with_context(|| {
+            format!(
+                "invalid blob_sha1 for {}",
+                String::from_utf8_lossy(&entry.path)
+            )
+        })?;
+    }
 
     // Validate every path before creating any directories, then create parents
     // safely (refusing symlinks and parent-dir escapes).
@@ -440,14 +441,12 @@ where
                         let content = &raw[off..off + len];
 
                         if entry.fragments.len() == 1 {
-                            if !skip_sha1_verify() {
-                                let hash = <Sha1 as Sha1Digest>::digest(content);
-                                if hash.as_slice() != entry.blob_sha1 {
-                                    anyhow::bail!(
-                                        "sha1 mismatch for {}",
-                                        String::from_utf8_lossy(&entry.path)
-                                    );
-                                }
+                            let hash = <Sha1 as Sha1Digest>::digest(content);
+                            if hash.as_slice() != entry.blob_sha1 {
+                                anyhow::bail!(
+                                    "sha1 mismatch for {}",
+                                    String::from_utf8_lossy(&entry.path)
+                                );
                             }
                             if let Some(ref tx) = blob_pack_tx2 {
                                 let sha1 = blob_sha1_to_array(&entry.blob_sha1)?;
@@ -478,14 +477,12 @@ where
                                 for frag in pending.fragments {
                                     full.extend_from_slice(&frag.expect("fragment missing"));
                                 }
-                                if !skip_sha1_verify() {
-                                    let hash = <Sha1 as Sha1Digest>::digest(&full);
-                                    if hash.as_slice() != entry.blob_sha1 {
-                                        anyhow::bail!(
-                                            "sha1 mismatch for {}",
-                                            String::from_utf8_lossy(&entry.path)
-                                        );
-                                    }
+                                let hash = <Sha1 as Sha1Digest>::digest(&full);
+                                if hash.as_slice() != entry.blob_sha1 {
+                                    anyhow::bail!(
+                                        "sha1 mismatch for {}",
+                                        String::from_utf8_lossy(&entry.path)
+                                    );
                                 }
                                 write_entry(&target_dir2, entry, &full)?;
                                 if let Some(ref tx) = blob_pack_tx2 {
@@ -763,10 +760,9 @@ mod tests {
     }
 
     fn git_blob_hash(content: &[u8]) -> [u8; 20] {
-        let mut data = Vec::new();
-        data.extend_from_slice(b"blob ");
-        data.extend_from_slice(content.len().to_string().as_bytes());
-        data.push(0);
+        let header = format!("blob {}\0", content.len());
+        let mut data = Vec::with_capacity(header.len() + content.len());
+        data.extend_from_slice(header.as_bytes());
         data.extend_from_slice(content);
         sha1_bytes(&data)
     }
@@ -991,6 +987,43 @@ mod tests {
     }
 
     #[test]
+    fn rejects_malformed_blob_sha1() {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("out");
+        std::fs::create_dir(&target).unwrap();
+
+        let mut bad_sha1 = sha1_bytes(b"").to_vec();
+        bad_sha1.truncate(19);
+
+        let mut manifest = empty_manifest();
+        manifest.files.push(FileEntry {
+            path: b"bad.txt".to_vec(),
+            mode: 0o100644,
+            blob_sha1: bad_sha1,
+            fragments: vec![Fragment {
+                frame_index: 0,
+                frame_offset: 0,
+                raw_len: 0,
+            }],
+        });
+        manifest.frames.push(FrameInfo {
+            chunk_index: 0,
+            chunk_offset: 0,
+            compressed_len: 0,
+            raw_len: 0,
+        });
+
+        let err = extract_manifest(&manifest, &target, vec![vec![]])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("invalid blob_sha1 for bad.txt"),
+            "expected malformed blob_sha1 error, got: {}",
+            err
+        );
+    }
+
+    #[test]
     fn archive_extract_builds_blob_pack() {
         let tmp = TempDir::new().unwrap();
         let target = tmp.path().join("out");
@@ -1116,6 +1149,17 @@ pub fn extract_archive_from_chunk_receiver(
         .read_to_end(&mut manifest_bytes)
         .context("read manifest")?;
     let manifest = Manifest::read(&mut manifest_bytes.as_slice())?;
+
+    // Validate every blob_sha1 length up front so downstream code can rely on
+    // a fixed 20-byte representation.
+    for entry in manifest.files.iter() {
+        blob_sha1_to_array(&entry.blob_sha1).with_context(|| {
+            format!(
+                "invalid blob_sha1 for {}",
+                String::from_utf8_lossy(&entry.path)
+            )
+        })?;
+    }
 
     // Validate every path before creating any directories, then create parents
     // safely (refusing symlinks and parent-dir escapes).
@@ -1351,14 +1395,12 @@ pub fn extract_archive_from_chunk_receiver(
                         let content = &raw[off..off + len];
 
                         if entry.fragments.len() == 1 {
-                            if !skip_sha1_verify() {
-                                let hash = <Sha1 as Sha1Digest>::digest(content);
-                                if hash.as_slice() != entry.blob_sha1 {
-                                    anyhow::bail!(
-                                        "sha1 mismatch for {}",
-                                        String::from_utf8_lossy(&entry.path)
-                                    );
-                                }
+                            let hash = <Sha1 as Sha1Digest>::digest(content);
+                            if hash.as_slice() != entry.blob_sha1 {
+                                anyhow::bail!(
+                                    "sha1 mismatch for {}",
+                                    String::from_utf8_lossy(&entry.path)
+                                );
                             }
                             if let Some(ref tx) = blob_pack_tx2 {
                                 let sha1 = blob_sha1_to_array(&entry.blob_sha1)?;
@@ -1389,14 +1431,12 @@ pub fn extract_archive_from_chunk_receiver(
                                 for frag in pending.fragments {
                                     full.extend_from_slice(&frag.expect("fragment missing"));
                                 }
-                                if !skip_sha1_verify() {
-                                    let hash = <Sha1 as Sha1Digest>::digest(&full);
-                                    if hash.as_slice() != entry.blob_sha1 {
-                                        anyhow::bail!(
-                                            "sha1 mismatch for {}",
-                                            String::from_utf8_lossy(&entry.path)
-                                        );
-                                    }
+                                let hash = <Sha1 as Sha1Digest>::digest(&full);
+                                if hash.as_slice() != entry.blob_sha1 {
+                                    anyhow::bail!(
+                                        "sha1 mismatch for {}",
+                                        String::from_utf8_lossy(&entry.path)
+                                    );
                                 }
                                 write_entry(&target_dir2, entry, &full)?;
                                 if let Some(ref tx) = blob_pack_tx2 {

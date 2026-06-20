@@ -183,7 +183,6 @@ Environment variables for tuning clone performance:
 - `RIPCLONE_FETCH_CONCURRENCY` — max concurrent chunk downloads (default 6).
 - `RIPCLONE_FETCH_THREADS` / `RIPCLONE_WRITE_THREADS` — thread counts for archive extraction.
 - `RIPCLONE_BLOB_PACK_THREADS` — threads used when building a local blob pack in `full` mode.
-- `RIPCLONE_UNSAFE_SKIP_SHA1_VERIFY` — skip per-blob SHA-1 verification during extraction. Only use when you fully trust the server.
 
 ## License
 

@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, bounded};
 use prost::Message;
 use serde::Deserialize;
-use sha2::{Digest as Sha256Digest, Sha256};
+use sha1::{Digest, Sha1};
 use std::collections::BTreeMap;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -796,7 +796,7 @@ impl Client {
                 .try_clone()
                 .context("clone temp head-blobs pack file handle")?,
         );
-        let mut hasher = Sha256::new();
+        let mut hasher = Sha1::new();
 
         // Stream chunks in index order with bounded concurrency.
         let signed_urls = info.head_blobs_chunk_urls.as_deref().unwrap_or(&[]);
@@ -814,7 +814,6 @@ impl Client {
             })
             .collect();
 
-        use futures::TryStreamExt;
         use futures::stream::{self, StreamExt};
         let mut results = stream::iter(jobs)
             .map(|(i, chunk, signed_url)| async move {

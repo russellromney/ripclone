@@ -40,12 +40,27 @@ echo "==> cloning $MODE..."
 cd "$BASE_DIR/$MODE"
 echo "==> git status"
 git status --short
+echo "==> git diff"
+git diff --exit-code
+echo "==> git diff --cached"
+git diff --cached --exit-code
 echo "==> git fsck"
 git fsck --full 2>&1 | tail -5
 echo "==> git log"
 git log --oneline -1
+echo "==> git show HEAD:README.md"
+git show HEAD:README.md >/dev/null
+echo "==> git cat-file blob"
+BLOB=$(git ls-tree HEAD README.md | awk '{print $3}')
+git cat-file -t "$BLOB" | grep -q '^blob$'
+echo "==> git checkout-index"
+git checkout-index -a -f
+git status --short
 echo "==> verifying a few tracked files exist"
 ls -l README.md package.json 2>/dev/null || true
+echo "==> checking symlinks"
+SYMLINK=$(find . -type l | head -1 || true)
+if [ -n "$SYMLINK" ]; then echo "found symlink: $SYMLINK -> $(readlink "$SYMLINK")"; fi
 
 echo ""
 echo "BASE_DIR=$BASE_DIR"

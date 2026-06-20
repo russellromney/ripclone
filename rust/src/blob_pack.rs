@@ -208,7 +208,7 @@ impl StreamingBlobPackBuilder {
             .write_all(&trailer)
             .context("write blob pack trailer")?;
         self.writer.flush().context("flush blob pack")?;
-        let mut file = self
+        let file = self
             .writer
             .into_inner()
             .context("unwrap blob pack writer")?;
@@ -388,16 +388,6 @@ impl<'a, W: Write> Write for HashingWriter<'a, W> {
     }
 }
 
-/// Return the raw git object data for a blob: `blob <size>\0<content>`.
-fn git_blob_object_data(content: &[u8]) -> Vec<u8> {
-    let mut data = Vec::with_capacity(5 + content.len().to_string().len() + 1 + content.len());
-    data.extend_from_slice(b"blob ");
-    data.extend_from_slice(content.len().to_string().as_bytes());
-    data.push(0);
-    data.extend_from_slice(content);
-    data
-}
-
 /// Encode a pack object entry: variable-length type+size header followed by
 /// zlib-compressed object content. `size` is the uncompressed content length;
 /// git reconstructs the serialized object header when indexing.
@@ -458,12 +448,6 @@ mod tests {
         assert_eq!(encode_type_and_size(3, 15), vec![0b011_1111]);
         // Needs continuation: size 16 = 0b1_0000, type 3 -> 0b011_0000 | 0x80.
         assert_eq!(encode_type_and_size(3, 16), vec![0b1011_0000, 0b0000_0001]);
-    }
-
-    #[test]
-    fn test_git_blob_object_data() {
-        let data = git_blob_object_data(b"hello");
-        assert_eq!(&data, b"blob 5\0hello");
     }
 
     #[test]
