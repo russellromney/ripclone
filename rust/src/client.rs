@@ -1,6 +1,6 @@
 use crate::bench::Benchmark;
 use crate::cas::{Cas, hash as cas_hash};
-use crate::clonepack::{ClonepackManifest, MetadataChunk, hash_to_hex};
+use crate::clonepack::{ChunkRef, ClonepackManifest, MetadataChunk, hash_to_hex};
 use crate::extract::{extract_archive_from_chunk_receiver, extract_clonepack_streaming};
 use crate::git;
 use crate::mode::CloneMode;
@@ -9,6 +9,11 @@ use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, bounded};
 use prost::Message;
 use serde::Deserialize;
+use sha1::{Digest as Sha1Digest, Sha1};
+use sha2::{Digest as Sha256Digest, Sha256};
+use std::collections::BTreeMap;
+use std::fs::File;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -55,8 +60,6 @@ fn head_blobs_chunk_refs(clonepack: &ClonepackManifest) -> Vec<crate::clonepack:
         Vec::new()
     }
 }
-
-
 
 fn metadata_bytes(metadata: &MetadataChunk) -> u64 {
     // The metadata chunk is the protobuf encoding of skeleton pack/idx, index,
@@ -698,9 +701,7 @@ impl Client {
         }
         let mut prebuilt_blob_pack_bytes = 0u64;
         if let Some(handle) = prebuilt_blob_pack_download {
-            let bytes = handle
-                .await
-                .context("prebuilt blob pack download task")??;
+            let bytes = handle.await.context("prebuilt blob pack download task")??;
             prebuilt_blob_pack_bytes = bytes;
         }
         if let Some(handle) = archive_worker {
@@ -760,6 +761,10 @@ impl Client {
 
     /// Download the pre-built head-blobs pack + index and install them into
     /// `.git/objects/pack/`. Returns the total bytes downloaded.
+    ///
+    /// Chunks are downloaded with bounded concurrency and streamed to a temp
+    /// file in index order, so peak memory stays at ~`concurrency * chunk_size`
+    /// instead of holding the whole pack in RAM.
     #[allow(deprecated)]
     async fn install_prebuilt_blob_pack(
         &self,
@@ -775,26 +780,86 @@ impl Client {
             .head_blobs_idx
             .as_ref()
             .context("clonepack missing head-blobs idx")?;
-        let (chunks, idx_data) = tokio::join!(
-            self.fetch_chunk_refs(&head_blobs_refs, info.head_blobs_chunk_urls.as_deref()),
-            self.fetch_chunk_ref(idx_ref, info.head_blobs_idx_url.as_deref()),
+
+        // Download the small index concurrently with the pack chunks.
+        let idx_data = self
+            .fetch_chunk_ref(idx_ref, info.head_blobs_idx_url.as_deref())
+            .await
+            .context("fetch head-blobs idx")?;
+
+        std::fs::create_dir_all(pack_dir)
+            .with_context(|| format!("create pack dir {}", pack_dir.display()))?;
+        let tmp_path = pack_dir.join("head-blobs-tmp.pack");
+        let mut writer = BufWriter::new(
+            File::create(&tmp_path)
+                .with_context(|| format!("create temp head-blobs pack {}", tmp_path.display()))?,
         );
-        let chunks = chunks?;
-        let idx_data = idx_data?;
-        let pack_data: Vec<u8> = chunks.into_iter().flatten().collect();
-        let head_blobs_hash = cas_hash(&pack_data);
-        std::fs::write(
-            pack_dir.join(format!("pack-{}.pack", head_blobs_hash)),
-            &pack_data,
-        )
-        .with_context(|| format!("write head-blobs pack {}", head_blobs_hash))?;
-        std::fs::write(
-            pack_dir.join(format!("pack-{}.idx", head_blobs_hash)),
-            &idx_data,
-        )
-        .with_context(|| format!("write head-blobs idx {}", head_blobs_hash))?;
-        info!("wrote prebuilt head-blobs pack ({} bytes)", pack_data.len());
-        Ok(pack_data.len() as u64 + idx_data.len() as u64)
+        let mut hasher = Sha256::new();
+
+        // Stream chunks in index order with bounded concurrency.
+        let signed_urls = info.head_blobs_chunk_urls.as_deref().unwrap_or(&[]);
+        let concurrency: usize = std::env::var("RIPCLONE_FETCH_CONCURRENCY")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(6)
+            .max(1);
+        let jobs: Vec<(usize, ChunkRef, Option<String>)> = head_blobs_refs
+            .into_iter()
+            .enumerate()
+            .map(|(i, chunk)| {
+                let signed_url = signed_urls.get(i).and_then(|o| o.clone());
+                (i, chunk, signed_url)
+            })
+            .collect();
+
+        use futures::TryStreamExt;
+        use futures::stream::{self, StreamExt};
+        let mut results = stream::iter(jobs)
+            .map(|(i, chunk, signed_url)| async move {
+                let data = self
+                    .fetch_chunk_ref(&chunk, signed_url.as_deref())
+                    .await
+                    .with_context(|| format!("fetch head-blobs chunk {}", i))?;
+                Ok::<_, anyhow::Error>((i, data))
+            })
+            .buffer_unordered(concurrency);
+
+        let mut next_index = 0usize;
+        let mut pending: BTreeMap<usize, Vec<u8>> = BTreeMap::new();
+        let mut pack_bytes = 0u64;
+        while let Some(res) = results.next().await {
+            let (i, data) = res?;
+            pending.insert(i, data);
+            while let Some(data) = pending.remove(&next_index) {
+                hasher.update(&data);
+                writer
+                    .write_all(&data)
+                    .with_context(|| format!("write head-blobs chunk {}", next_index))?;
+                pack_bytes += data.len() as u64;
+                next_index += 1;
+            }
+        }
+        if !pending.is_empty() {
+            anyhow::bail!(
+                "missing head-blobs chunks: {:?}",
+                pending.keys().collect::<Vec<_>>()
+            );
+        }
+
+        writer.flush().context("flush head-blobs pack")?;
+        drop(writer);
+
+        let pack_hash = hex::encode(hasher.finalize());
+        let final_path = pack_dir.join(format!("pack-{}.pack", pack_hash));
+        std::fs::rename(&tmp_path, &final_path)
+            .with_context(|| format!("rename head-blobs pack to {}", final_path.display()))?;
+        std::fs::write(pack_dir.join(format!("pack-{}.idx", pack_hash)), &idx_data)
+            .with_context(|| format!("write head-blobs idx {}", pack_hash))?;
+        info!(
+            "wrote prebuilt head-blobs pack {} ({} bytes)",
+            pack_hash, pack_bytes
+        );
+        Ok(pack_bytes + idx_data.len() as u64)
     }
 
     #[allow(deprecated)]
@@ -872,7 +937,9 @@ impl Client {
                         let bytes = client
                             .fetch_chunk_ref(&chunk_ref, None)
                             .await
-                            .with_context(|| format!("fetch archive chunk {} via gateway", index))?;
+                            .with_context(|| {
+                                format!("fetch archive chunk {} via gateway", index)
+                            })?;
                         let len = bytes.len() as u64;
                         tx.send((index, Ok(bytes))).map_err(|_| {
                             anyhow::anyhow!("archive chunk {} receiver dropped", index)
@@ -896,11 +963,14 @@ impl Client {
                             .await
                             .clone()
                             .context("manifest missing after notify")?;
-                        let chunk_ref = manifest
-                            .archive_chunks
-                            .get(index)
-                            .cloned()
-                            .with_context(|| format!("archive chunk {} missing from manifest", index))?;
+                        let chunk_ref =
+                            manifest
+                                .archive_chunks
+                                .get(index)
+                                .cloned()
+                                .with_context(|| {
+                                    format!("archive chunk {} missing from manifest", index)
+                                })?;
                         let bytes = client
                             .fetch_chunk_ref(&chunk_ref, signed_url.as_deref())
                             .await

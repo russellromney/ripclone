@@ -19,6 +19,13 @@ path = "src/bin/ripclone-proxy.rs"
 name = "git-remote-ripclone"
 path = "src/bin/git-remote-ripclone.rs"
 
+[features]
+default = ["zlib-ng"]
+# Use zlib-ng for faster pack compression/decompression. Disable this feature
+# (e.g. `cargo build --no-default-features`) on platforms where cmake is not
+# available.
+zlib-ng = ["flate2/zlib-ng"]
+
 [dependencies]
 anyhow = "1"
 axum = "0.8"
@@ -27,7 +34,7 @@ byteorder = "1.5"
 crossbeam-channel = "0.5"
 clap = { version = "4", features = ["derive", "env"] }
 filetime = "0.2"
-flate2 = { version = "1", features = ["zlib-ng"] }
+flate2 = "1"
 fuser = "0.15.0"
 futures = "0.3"
 git2 = "0.20"

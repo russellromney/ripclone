@@ -15,12 +15,21 @@ use tracing::info;
 
 const INDEX_MTIME: FileTime = FileTime::from_unix_time(1, 0);
 
-/// Check whether per-blob SHA-1 verification should be skipped. The archive
-/// chunk hashes are still verified, and `git index-pack` will recompute object
-/// hashes when the local pack is built, so this is primarily a performance
-/// toggle for trusted server output.
+/// Check whether per-blob SHA-1 verification should be skipped.
+///
+/// **Unsafe:** archive chunk hashes are still verified, and `git index-pack`
+/// recomputes object hashes when the local pack is built, but skipping the
+/// per-blob check means a malicious or buggy server could serve wrong content
+/// that still passes chunk-level checks. Only use this when you fully trust the
+/// server and need the extra CPU savings.
 fn skip_sha1_verify() -> bool {
-    std::env::var_os("RIPCLONE_SKIP_SHA1_VERIFY").is_some()
+    std::env::var_os("RIPCLONE_UNSAFE_SKIP_SHA1_VERIFY").is_some()
+}
+
+/// Convert a manifest blob_sha1 slice to a fixed 20-byte array.
+fn blob_sha1_to_array(sha1: &[u8]) -> Result<[u8; 20]> {
+    sha1.try_into()
+        .map_err(|_| anyhow::anyhow!("manifest blob_sha1 must be 20 bytes, got {}", sha1.len()))
 }
 
 /// Convert a raw path byte slice to a `Path`. On Unix this preserves arbitrary
@@ -383,24 +392,25 @@ where
                     let frame = &manifest2.frames[idx];
                     // Empty frames (produced by empty files) have no compressed
                     // bytes and decompress to an empty buffer.
-                    let raw: Arc<Vec<u8>> = Arc::new(if frame.compressed_len == 0 && frame.raw_len == 0 {
-                        Vec::new()
-                    } else {
-                        match dictionary2.as_ref() {
-                            Some(dict) => {
-                                let mut decompressor =
-                                    zstd::bulk::Decompressor::with_dictionary(dict.as_slice())
-                                        .context("create zstd decompressor with dictionary")?;
-                                decompressor
-                                    .decompress(&compressed, frame.raw_len as usize)
-                                    .with_context(|| {
-                                        format!("decompress frame {} with dictionary", idx)
-                                    })?
+                    let raw: Arc<Vec<u8>> =
+                        Arc::new(if frame.compressed_len == 0 && frame.raw_len == 0 {
+                            Vec::new()
+                        } else {
+                            match dictionary2.as_ref() {
+                                Some(dict) => {
+                                    let mut decompressor =
+                                        zstd::bulk::Decompressor::with_dictionary(dict.as_slice())
+                                            .context("create zstd decompressor with dictionary")?;
+                                    decompressor
+                                        .decompress(&compressed, frame.raw_len as usize)
+                                        .with_context(|| {
+                                            format!("decompress frame {} with dictionary", idx)
+                                        })?
+                                }
+                                None => zstd::decode_all(compressed.as_slice())
+                                    .with_context(|| format!("decompress frame {}", idx))?,
                             }
-                            None => zstd::decode_all(compressed.as_slice())
-                                .with_context(|| format!("decompress frame {}", idx))?,
-                        }
-                    });
+                        });
                     if raw.len() != frame.raw_len as usize {
                         anyhow::bail!(
                             "frame {} raw length mismatch: {} vs {}",
@@ -440,18 +450,14 @@ where
                                 }
                             }
                             if let Some(ref tx) = blob_pack_tx2 {
-                                let sha1: [u8; 20] = entry
-                                    .blob_sha1
-                                    .as_slice()
-                                    .try_into()
-                                    .expect("blob_sha1 must be 20 bytes");
+                                let sha1 = blob_sha1_to_array(&entry.blob_sha1)?;
                                 tx.send(crate::blob_pack::BlobPackInput::FrameSlice {
                                     sha1,
                                     frame: Arc::clone(&raw),
                                     offset: off,
                                     len,
                                 })
-                                .ok();
+                                .context("blob pack builder closed")?;
                             }
                             write_entry(&target_dir2, entry, content)?;
                             written += 1;
@@ -483,16 +489,12 @@ where
                                 }
                                 write_entry(&target_dir2, entry, &full)?;
                                 if let Some(ref tx) = blob_pack_tx2 {
-                                    let sha1: [u8; 20] = entry
-                                        .blob_sha1
-                                        .as_slice()
-                                        .try_into()
-                                        .expect("blob_sha1 must be 20 bytes");
+                                    let sha1 = blob_sha1_to_array(&entry.blob_sha1)?;
                                     tx.send(crate::blob_pack::BlobPackInput::Owned {
                                         sha1,
                                         content: full,
                                     })
-                                    .ok();
+                                    .context("blob pack builder closed")?;
                                 }
                                 written += 1;
                             }
@@ -1301,24 +1303,25 @@ pub fn extract_archive_from_chunk_receiver(
                 let result: Result<usize> = (|| {
                     let compressed = res?;
                     let frame = &manifest2.frames[idx];
-                    let raw: Arc<Vec<u8>> = Arc::new(if frame.compressed_len == 0 && frame.raw_len == 0 {
-                        Vec::new()
-                    } else {
-                        match dictionary2.as_ref() {
-                            Some(dict) => {
-                                let mut decompressor =
-                                    zstd::bulk::Decompressor::with_dictionary(dict.as_slice())
-                                        .context("create zstd decompressor with dictionary")?;
-                                decompressor
-                                    .decompress(&compressed, frame.raw_len as usize)
-                                    .with_context(|| {
-                                        format!("decompress frame {} with dictionary", idx)
-                                    })?
+                    let raw: Arc<Vec<u8>> =
+                        Arc::new(if frame.compressed_len == 0 && frame.raw_len == 0 {
+                            Vec::new()
+                        } else {
+                            match dictionary2.as_ref() {
+                                Some(dict) => {
+                                    let mut decompressor =
+                                        zstd::bulk::Decompressor::with_dictionary(dict.as_slice())
+                                            .context("create zstd decompressor with dictionary")?;
+                                    decompressor
+                                        .decompress(&compressed, frame.raw_len as usize)
+                                        .with_context(|| {
+                                            format!("decompress frame {} with dictionary", idx)
+                                        })?
+                                }
+                                None => zstd::decode_all(compressed.as_slice())
+                                    .with_context(|| format!("decompress frame {}", idx))?,
                             }
-                            None => zstd::decode_all(compressed.as_slice())
-                                .with_context(|| format!("decompress frame {}", idx))?,
-                        }
-                    });
+                        });
                     if raw.len() != frame.raw_len as usize {
                         anyhow::bail!(
                             "frame {} raw length mismatch: {} vs {}",
@@ -1358,18 +1361,14 @@ pub fn extract_archive_from_chunk_receiver(
                                 }
                             }
                             if let Some(ref tx) = blob_pack_tx2 {
-                                let sha1: [u8; 20] = entry
-                                    .blob_sha1
-                                    .as_slice()
-                                    .try_into()
-                                    .expect("blob_sha1 must be 20 bytes");
+                                let sha1 = blob_sha1_to_array(&entry.blob_sha1)?;
                                 tx.send(crate::blob_pack::BlobPackInput::FrameSlice {
                                     sha1,
                                     frame: Arc::clone(&raw),
                                     offset: off,
                                     len,
                                 })
-                                .ok();
+                                .context("blob pack builder closed")?;
                             }
                             write_entry(&target_dir2, entry, content)?;
                             written += 1;
@@ -1401,16 +1400,12 @@ pub fn extract_archive_from_chunk_receiver(
                                 }
                                 write_entry(&target_dir2, entry, &full)?;
                                 if let Some(ref tx) = blob_pack_tx2 {
-                                    let sha1: [u8; 20] = entry
-                                        .blob_sha1
-                                        .as_slice()
-                                        .try_into()
-                                        .expect("blob_sha1 must be 20 bytes");
+                                    let sha1 = blob_sha1_to_array(&entry.blob_sha1)?;
                                     tx.send(crate::blob_pack::BlobPackInput::Owned {
                                         sha1,
                                         content: full,
                                     })
-                                    .ok();
+                                    .context("blob pack builder closed")?;
                                 }
                                 written += 1;
                             }

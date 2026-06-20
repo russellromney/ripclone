@@ -1,8 +1,8 @@
 use crate::git;
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, bounded};
-use flate2::write::ZlibEncoder;
 use flate2::Compression;
+use flate2::write::ZlibEncoder;
 use sha1::{Digest, Sha1};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -18,7 +18,10 @@ use std::thread::JoinHandle;
 /// data is re-hashed by `git index-pack` when the index is built.
 ///
 /// Returns the SHA-1 hash (hex) of the packfile content.
-pub fn build_blob_pack<P: AsRef<Path>>(pack_path: P, blobs: &[(String, Vec<u8>)]) -> Result<String> {
+pub fn build_blob_pack<P: AsRef<Path>>(
+    pack_path: P,
+    blobs: &[(String, Vec<u8>)],
+) -> Result<String> {
     if blobs.is_empty() {
         anyhow::bail!("no blobs to pack");
     }
@@ -31,7 +34,9 @@ pub fn build_blob_pack<P: AsRef<Path>>(pack_path: P, blobs: &[(String, Vec<u8>)]
     // packfiles cannot contain duplicate objects.
     let mut unique: HashMap<&str, &[u8]> = HashMap::new();
     for (sha1_hex, content) in blobs {
-        unique.entry(sha1_hex.as_str()).or_insert(content.as_slice());
+        unique
+            .entry(sha1_hex.as_str())
+            .or_insert(content.as_slice());
     }
 
     // Header: "PACK" + version 2 + object count.
@@ -43,8 +48,7 @@ pub fn build_blob_pack<P: AsRef<Path>>(pack_path: P, blobs: &[(String, Vec<u8>)]
         h.extend_from_slice(&count.to_be_bytes());
         h
     };
-    file.write_all(&header)
-        .context("write blob pack header")?;
+    file.write_all(&header).context("write blob pack header")?;
     hasher.update(&header);
 
     // Sort by sha1 hex for deterministic pack output.
@@ -134,7 +138,9 @@ impl StreamingBlobPackBuilder {
             h.extend_from_slice(&expected_count.to_be_bytes());
             h
         };
-        writer.write_all(&header).context("write blob pack header")?;
+        writer
+            .write_all(&header)
+            .context("write blob pack header")?;
 
         let mut hasher = Sha1::new();
         hasher.update(&header);
@@ -202,8 +208,10 @@ impl StreamingBlobPackBuilder {
             .write_all(&trailer)
             .context("write blob pack trailer")?;
         self.writer.flush().context("flush blob pack")?;
-        let mut file = self.writer.into_inner().context("unwrap blob pack writer")?;
-        file.sync_all().context("sync blob pack")?;
+        let mut file = self
+            .writer
+            .into_inner()
+            .context("unwrap blob pack writer")?;
         drop(file);
 
         let pack_hash = hex::encode(trailer);
@@ -233,10 +241,7 @@ pub enum BlobPackInput {
         len: usize,
     },
     /// An already-assembled blob owned by the caller.
-    Owned {
-        sha1: [u8; 20],
-        content: Vec<u8>,
-    },
+    Owned { sha1: [u8; 20], content: Vec<u8> },
 }
 
 impl BlobPackInput {
@@ -304,9 +309,8 @@ pub fn spawn_blob_pack_builder<P: AsRef<Path>>(
 
     // Shared deduplication set. Compressors claim a SHA-1 before compressing so
     // duplicate blobs are only written once.
-    let seen: Arc<Mutex<HashSet<[u8; 20]>>> = Arc::new(Mutex::new(HashSet::with_capacity(
-        expected_objects,
-    )));
+    let seen: Arc<Mutex<HashSet<[u8; 20]>>> =
+        Arc::new(Mutex::new(HashSet::with_capacity(expected_objects)));
 
     // Spawn compressor threads.
     let mut compressor_handles: Vec<JoinHandle<()>> = Vec::with_capacity(threads);
@@ -319,7 +323,7 @@ pub fn spawn_blob_pack_builder<P: AsRef<Path>>(
                 let sha1 = *input.sha1();
                 // Claim this SHA-1; if another thread already has it, skip.
                 let is_new = {
-                    let mut set = seen.lock().unwrap();
+                    let mut set = seen.lock().unwrap_or_else(|e| e.into_inner());
                     set.insert(sha1)
                 };
                 if !is_new {
@@ -540,10 +544,7 @@ mod tests {
             .unwrap();
         assert!(output.status.success(), "verify-pack failed: {:?}", output);
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let lines: Vec<&str> = stdout
-            .lines()
-            .filter(|l| l.contains("blob"))
-            .collect();
+        let lines: Vec<&str> = stdout.lines().filter(|l| l.contains("blob")).collect();
         assert_eq!(lines.len(), 2, "expected 2 unique blobs, got: {:?}", lines);
     }
 }

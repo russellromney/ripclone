@@ -9,8 +9,8 @@ use futures::StreamExt;
 use reqwest::Client;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+use tokio::sync::Mutex;
 use tokio::time::{Instant, sleep};
 
 #[derive(Parser)]
@@ -35,74 +35,57 @@ struct Args {
     forward_auth: bool,
 }
 
-/// Lock-free token bucket for per-stream bandwidth shaping.
-///
-/// Stores token balance as micro-bytes in an atomic u64 so many concurrent
-/// streams can consume from the shared bucket without serializing on a mutex.
-/// Each stream CAS-loops to deduct its byte count; if there are insufficient
-/// tokens it sleeps and retries.
-struct AtomicTokenBucket {
+/// Token-bucket state protected by a mutex. The critical section is tiny, so
+/// the mutex is simpler than a lock-free implementation and avoids the
+/// token-accounting races that come from splitting `last_ns` and `tokens_micro`
+/// into separate atomics.
+struct TokenBucketState {
     rate: f64,
     max: f64,
-    base: Instant,
-    /// Token balance in micro-bytes at `last_ns`.
-    tokens_micro: AtomicU64,
-    /// Nanoseconds since `base` when `tokens_micro` was last updated.
-    last_ns: AtomicU64,
+    tokens: f64,
+    last: Instant,
 }
 
-impl AtomicTokenBucket {
+struct TokenBucket {
+    state: Mutex<TokenBucketState>,
+}
+
+impl TokenBucket {
     fn new(bandwidth_mbps: f64) -> Self {
         let rate = bandwidth_mbps * 1_000_000.0 / 8.0;
-        let base = Instant::now();
-        // Start with a full one-second burst.
-        let tokens_micro = (rate * 1_000_000.0) as u64;
+        let now = Instant::now();
         Self {
-            rate,
-            max: rate,
-            base,
-            tokens_micro: AtomicU64::new(tokens_micro),
-            last_ns: AtomicU64::new(0),
+            state: Mutex::new(TokenBucketState {
+                rate,
+                max: rate,
+                // Start with a full one-second burst.
+                tokens: rate,
+                last: now,
+            }),
         }
     }
 
     async fn consume(&self, bytes: usize) {
-        if self.rate <= 0.0 || bytes == 0 {
+        if bytes == 0 {
             return;
         }
         let needed = bytes as f64;
         loop {
-            let now_ns = self.base.elapsed().as_nanos() as u64;
-            let tokens_micro = self.tokens_micro.load(Ordering::Acquire);
-            let last_ns = self.last_ns.load(Ordering::Acquire);
-            let elapsed = (now_ns.saturating_sub(last_ns)) as f64 / 1_000_000_000.0;
-            let mut tokens = tokens_micro as f64 / 1_000_000.0 + elapsed * self.rate;
-            if tokens > self.max {
-                tokens = self.max;
-            }
+            let sleep_secs = {
+                let mut state = self.state.lock().await;
+                let now = Instant::now();
+                let elapsed = now.duration_since(state.last).as_secs_f64();
+                state.tokens = (state.tokens + elapsed * state.rate).min(state.max);
+                state.last = now;
 
-            if tokens >= needed {
-                let new_tokens = tokens - needed;
-                let new_tokens_micro = (new_tokens * 1_000_000.0) as u64;
-                if self
-                    .tokens_micro
-                    .compare_exchange(
-                        tokens_micro,
-                        new_tokens_micro,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    )
-                    .is_ok()
-                {
-                    self.last_ns.store(now_ns, Ordering::Release);
+                if state.tokens >= needed {
+                    state.tokens -= needed;
                     return;
                 }
-                // CAS failed, another stream won; retry immediately.
-                continue;
-            }
 
-            let deficit = needed - tokens;
-            let sleep_secs = deficit / self.rate;
+                let deficit = needed - state.tokens;
+                deficit / state.rate
+            };
             sleep(Duration::from_secs_f64(sleep_secs)).await;
         }
     }
@@ -113,7 +96,7 @@ struct ProxyState {
     client: Client,
     upstream: String,
     latency: Duration,
-    bucket: Option<Arc<AtomicTokenBucket>>,
+    bucket: Option<Arc<TokenBucket>>,
     forward_auth: bool,
 }
 
@@ -159,7 +142,12 @@ async fn proxy_handler(State(state): State<ProxyState>, req: Request<Body>) -> i
 
     let mut upstream_req = state.client.request(parts.method, &url).body(upstream_body);
     let mut headers = HeaderMap::new();
-    copy_headers(&parts.headers, &mut headers, &state.upstream, state.forward_auth);
+    copy_headers(
+        &parts.headers,
+        &mut headers,
+        &state.upstream,
+        state.forward_auth,
+    );
     for (key, value) in headers.iter() {
         upstream_req = upstream_req.header(key, value);
     }
@@ -224,7 +212,7 @@ async fn main() -> anyhow::Result<()> {
     }
     let latency = Duration::from_secs_f64(args.latency.max(0.0));
     let bucket = if args.bandwidth_mbps > 0.0 {
-        Some(Arc::new(AtomicTokenBucket::new(args.bandwidth_mbps)))
+        Some(Arc::new(TokenBucket::new(args.bandwidth_mbps)))
     } else {
         None
     };
