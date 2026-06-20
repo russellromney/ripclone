@@ -4,7 +4,7 @@
 
 # ripclone
 
-ripclone is the fastest way to clone git repos. Large repos see 5x-10x speedup; small repos are also a bit faster.
+ripclone is the fastest way to clone git repos. Large repos see 5x-10x speedup; small repos are also faster.
 
 ripclone pre-builds git artifacts for every pushed commit so that agents, CI systems, and humans can clone a repo and start working in seconds instead of waiting for a full `git clone`. It is **read-only** and **clone-only**: it does not proxy commits or pushes. You use normal git with your own GitHub tokens for writes.
 
@@ -18,15 +18,15 @@ ripclone is one answer.
 
 ## How it works
 
-A normal `git clone` downloads a packfile of commits, trees, and blobs, then runs `git init`, `git index-pack`, `git read-tree`, and `git checkout-index` to build the `.git` directory and working tree. ripclone runs those steps ahead of time on the server so the client can skip them.
+A normal `git clone` downloads a packfile of commits, trees, and blobs, then runs `git init`, `git index-pack`, `git read-tree`, and `git checkout-index` to build the `.git` directory and working tree. 
 
-On every push, ripclone mirrors the repo and builds a **clonepack** for `HEAD`. A clonepack has three pieces:
+ripclone runs those steps ahead of time on the server so the client can skip them. On every push, ripclone mirrors the repo and builds a **clonepack** for `HEAD`. A clonepack has three pieces:
 
-**Manifest.** A small file that lists the hashes of the metadata chunk and every content chunk. The client downloads this first to know what to fetch.
+The ***manifest*** is a small file that lists the signed object storage URL and file hashes of the metadata chunk and every content chunk. The client downloads this first to know what to fetch.
 
-**Metadata chunk.** Contains a skeleton pack and index, a prebuilt `.git/index`, and tables that map every file path to its mode, blob hash, and byte location in the archive. The client uses this to assemble `.git/` without running any git commands.
+The ***metadata*** contains a ***skeleton pack*** (a git packfile of the structure of the commits from HEAD), a prebuilt `.git/index`, and tables that map every file path to its mode, blob hash, and byte location in the content chunks. The ripclone client uses this to assemble `.git/` without running any git commands.
 
-**Content chunks.** The actual file bytes for `HEAD`.
+The **content chunks** are zstd-encoded blobs in object storage that contain the actual file blob bytes.
 
 ### The skeleton
 
@@ -42,13 +42,24 @@ ripclone stores the same `HEAD` file bytes in two formats so you can choose the 
 
 ### Clone modes
 
-`--mode=full` (the default) downloads the metadata chunk and the head-blobs pack, installs the prebuilt `.git/` artifacts, and runs `git checkout-index` to write the working tree. The result is indistinguishable from `git clone --depth=1`.
+| Mode | Downloads | Working tree | `.git` blobs | Use for |
+|---|---|---|---|---|
+| `full` (default) | metadata + head-blobs pack | `git checkout-index` from pack | head-blobs pack | Normal git workflows; `git diff`/`git show` work |
+| `fast` | metadata + archive chunks | direct from zstd frames | none | Agents that only edit and commit; fastest materialization |
+| `hybrid` | metadata + archive chunks + head-blobs pack | direct from zstd frames | head-blobs pack | Fast materialization + full git compatibility |
+| `skeleton` | metadata only | none | none | Inspect history or sparse checkout |
 
-`--mode=fast` downloads the metadata chunk and the archive chunks, then writes files directly from the zstd frames without using git checkout. This is the fastest way to get a working tree for agents that only edit and commit.
+`full` behaves like `git clone --depth=1` once it finishes. `fast` skips the head-blobs pack and writes files directly from archive chunks, so `git diff` and `git show` do not work. `hybrid` runs both streams concurrently so the working tree appears quickly while the head-blobs pack catches up in the background. `skeleton` gives you a valid `.git/` with history and tree structure but no working tree and no blob objects.
 
-`--mode=hybrid` downloads both the head-blobs pack and the archive chunks concurrently, writes files from the archive, and also installs the head-blobs pack so the repo has full git compatibility as soon as the pack lands.
+### Design
 
-`--mode=skeleton` downloads only the metadata chunk. It gives you a valid `.git/` with history and tree structure but no working tree and no blob objects.
+A normal `git clone` is slow because it interleaves several expensive steps. The client and server negotiate which objects to send; the client indexes the pack; git builds the index; then it checks out every file. Each step is fine on its own, but together they create a long chain of round trips and disk operations that are hard to parallelize.
+
+ripclone unbundles that chain. The server runs the negotiation, indexing, and tree walking once per push and stores the results. The client only downloads what it needs and writes it to disk.
+
+That split creates a few constraints. Git still expects a real packfile if you want `git diff` and `git checkout-index` to work, so ripclone builds a real head-blobs pack and ships it as-is. Materializing thousands of small files from a pack is serial and disk-heavy, so ripclone also compresses the same bytes into zstd archive chunks that can be fetched and decompressed in parallel. And because object storage rewards large parallel requests over small serial ones, the archive is split into independent zstd frames so a point lookup can fetch just the frame it needs instead of the whole chunk.
+
+The result is a git repo built from precomputed parts rather than reconstructed on the fly.
 
 ### Performance
 
@@ -168,6 +179,40 @@ Object storage   Local disk
 - **Clients** download manifests, skeletons, and archives; stream-decompress frames; and write files directly.
 - **GitHub remains the source of truth** for repos, refs, permissions, and writes.
 - **IP rate limiting** protects public endpoints from abuse.
+
+## Benchmarking
+
+`ripclone clone --bench` emits a JSON report with per-phase timings.
+
+```bash
+ripclone clone oven-sh/bun --dir bun --bench
+```
+
+Phases include: resolve, metadata_download, skeleton_install, head_blobs_download, archive_download, checkout, and total. Use it to compare modes or measure where a clone spends its time:
+
+```bash
+ripclone clone oven-sh/bun --dir bun --mode=fast --bench
+ripclone clone oven-sh/bun --dir bun --mode=hybrid --bench
+```
+
+## Development
+
+```bash
+cd rust
+cargo build --release
+cargo test
+cargo clippy -- -D warnings
+cargo fmt --check
+```
+
+End-to-end tests live in `scripts/`:
+
+```bash
+./scripts/e2e_clonepack.sh
+./scripts/e2e_archive.sh
+```
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for how to contribute.
 
 ## License
 

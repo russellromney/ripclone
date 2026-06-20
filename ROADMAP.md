@@ -137,3 +137,22 @@ Once warm full clones are fast and predictable, move from full clonepacks per co
 
 - See `CHANGELOG.md` for completed work.
 - See `docs/ADVERSARIAL_REVIEW_2026-06-18.md` for the security review that drove recent hardening.
+
+## Distribution (future)
+
+Make ripclone installable through the two most common package managers.
+
+### `cargo install ripclone`
+
+Add the required metadata to `rust/Cargo.toml` (description, `license = "Elastic-2.0"`, repository, readme) and publish the crate to crates.io. The crate already exposes a lib plus four binaries (`ripclone`, `ripclone-server`, `ripclone-proxy`, `git-remote-ripclone`), so `cargo install` gives users everything.
+
+### `pip install ripclone`
+
+Use [maturin](https://www.maturin.rs/) to build wheels that ship the Rust executables. The simplest first version uses `bindings = "bin"` in a root `pyproject.toml` pointing at `rust/Cargo.toml`; the resulting wheel installs the binaries on `PATH`. Later we can add PyO3 bindings if we want a native Python API.
+
+Build targets to start:
+- macOS aarch64 and x86_64
+- Linux x86_64 (manylinux)
+- Windows x86_64
+
+Add a GitHub Actions workflow that builds and uploads wheels on every release tag, plus a manual trigger for testing.

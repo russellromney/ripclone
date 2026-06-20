@@ -7,13 +7,13 @@ use crate::mode::CloneMode;
 use crate::overlay;
 use crate::pack_writer::HeadBlobsWriter;
 use anyhow::{Context, Result};
-use crossbeam_channel::{Receiver, Sender, bounded};
+use crossbeam_channel::{Receiver, Sender, unbounded};
 use prost::Message;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::{Mutex as TokioMutex, Notify};
+
 use tracing::{info, warn};
 
 #[derive(Debug, Clone, Deserialize)]
@@ -553,20 +553,10 @@ impl Client {
             anyhow::bail!("ref is missing clonepack manifest; run sync first");
         }
 
-        // Shared manifest slot. Download tasks wait on this before verifying the
-        // content hash of each chunk.
-        let manifest_slot: Arc<TokioMutex<Option<Arc<ClonepackManifest>>>> =
-            Arc::new(TokioMutex::new(None));
-        let manifest_ready: Arc<Notify> = Arc::new(Notify::new());
-
         // 2. Start manifest + metadata downloads concurrently.
-        let manifest_slot2 = Arc::clone(&manifest_slot);
-        let manifest_ready2 = Arc::clone(&manifest_ready);
         let manifest_task = self.clone().spawn_fetch_manifest(
             info.clonepack_manifest.clone(),
             info.clonepack_manifest_url.clone(),
-            manifest_slot2,
-            manifest_ready2,
         );
 
         let metadata_hash = info.metadata_chunk.clone();
@@ -575,17 +565,24 @@ impl Client {
             .clone()
             .spawn_fetch_metadata(metadata_hash, metadata_url);
 
-        // 3. Start archive and head-blobs chunk downloads concurrently with the
-        // manifest. They will buffer until the manifest is decoded, then verify
-        // and forward chunks to the workers.
+        // 3. Wait for manifest + metadata.
+        let (manifest, metadata) =
+            tokio::try_join!(manifest_task, metadata_task).context("fetch manifest/metadata")?;
+        let manifest = manifest.context("fetch clonepack manifest")?;
+        let metadata = metadata.context("fetch metadata chunk")?;
+        let metadata = Arc::new(metadata);
+
+        // 4. Start archive and head-blobs chunk downloads now that we have the
+        // manifest. The workers need the decoded manifest to verify chunk hashes
+        // and lengths.
         let (archive_tx, archive_rx): (
             Sender<(usize, Result<Vec<u8>>)>,
             Receiver<(usize, Result<Vec<u8>>)>,
-        ) = bounded(2);
+        ) = unbounded();
         let (head_blobs_tx, head_blobs_rx): (
             Sender<(usize, Result<Vec<u8>>)>,
             Receiver<(usize, Result<Vec<u8>>)>,
-        ) = bounded(2);
+        ) = unbounded();
 
         let archive_urls = info.archive_chunk_urls.clone();
         let archive_downloads = if mode.needs_archive() {
@@ -593,8 +590,7 @@ impl Client {
             Some(self.clone().spawn_chunk_downloads(
                 ChunkKind::Archive,
                 archive_urls,
-                Arc::clone(&manifest_slot),
-                Arc::clone(&manifest_ready),
+                Arc::clone(&manifest),
                 archive_tx,
             ))
         } else {
@@ -608,21 +604,13 @@ impl Client {
             Some(self.clone().spawn_chunk_downloads(
                 ChunkKind::HeadBlobs,
                 head_blobs_urls,
-                Arc::clone(&manifest_slot),
-                Arc::clone(&manifest_ready),
+                Arc::clone(&manifest),
                 head_blobs_tx,
             ))
         } else {
             drop(head_blobs_tx);
             None
         };
-
-        // 4. Wait for manifest + metadata.
-        let (manifest, metadata) =
-            tokio::try_join!(manifest_task, metadata_task).context("fetch manifest/metadata")?;
-        let manifest = manifest.context("fetch clonepack manifest")?;
-        let metadata = metadata.context("fetch metadata chunk")?;
-        let metadata = Arc::new(metadata);
         bench.mark_manifest();
         bench.add_bytes(metadata_bytes(&metadata), 0, 0);
 
@@ -861,8 +849,6 @@ impl Client {
         self,
         hash: String,
         signed_url: Option<String>,
-        manifest_slot: Arc<TokioMutex<Option<Arc<ClonepackManifest>>>>,
-        manifest_ready: Arc<Notify>,
     ) -> tokio::task::JoinHandle<Result<Arc<ClonepackManifest>>> {
         tokio::spawn(async move {
             let data = self
@@ -879,10 +865,7 @@ impl Client {
                     manifest.head_blobs_chunks.push(pack);
                 }
             }
-            let manifest = Arc::new(manifest);
-            *manifest_slot.lock().await = Some(Arc::clone(&manifest));
-            manifest_ready.notify_waiters();
-            Ok(manifest)
+            Ok(Arc::new(manifest))
         })
     }
 
@@ -906,8 +889,7 @@ impl Client {
         self,
         kind: ChunkKind,
         signed_urls: Option<Vec<Option<String>>>,
-        manifest_slot: Arc<TokioMutex<Option<Arc<ClonepackManifest>>>>,
-        manifest_ready: Arc<Notify>,
+        manifest: Arc<ClonepackManifest>,
         tx: Sender<(usize, Result<Vec<u8>>)>,
     ) -> tokio::task::JoinHandle<Result<u64>> {
         tokio::spawn(async move {
@@ -916,15 +898,8 @@ impl Client {
             let mut handles = Vec::new();
 
             if signed_urls.is_empty() {
-                // No signed URLs (e.g. local storage backend). Wait for the
-                // manifest so we have the chunk hashes, then fetch through the
-                // gateway.
-                manifest_ready.notified().await;
-                let manifest = manifest_slot
-                    .lock()
-                    .await
-                    .clone()
-                    .context("manifest missing after notify")?;
+                // No signed URLs (e.g. local storage backend). Fetch through the
+                // gateway using the chunk refs from the manifest.
                 let chunk_refs = kind.all_chunk_refs(&manifest);
                 for (index, chunk_ref) in chunk_refs.into_iter().enumerate() {
                     let client = self.clone();
@@ -948,19 +923,10 @@ impl Client {
             } else {
                 for (index, signed_url) in signed_urls.into_iter().enumerate() {
                     let client = self.clone();
-                    let manifest_slot = Arc::clone(&manifest_slot);
-                    let manifest_ready = Arc::clone(&manifest_ready);
+                    let manifest = Arc::clone(&manifest);
                     let tx = tx.clone();
                     let kind = kind;
                     let handle = tokio::spawn(async move {
-                        // Wait until the manifest is available so we know the
-                        // expected content hash and length for this chunk.
-                        manifest_ready.notified().await;
-                        let manifest = manifest_slot
-                            .lock()
-                            .await
-                            .clone()
-                            .context("manifest missing after notify")?;
                         let chunk_ref = kind.get_chunk_ref(&manifest, index)?;
                         let bytes = client
                             .fetch_chunk_ref(&chunk_ref, signed_url.as_deref())
