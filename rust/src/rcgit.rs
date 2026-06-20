@@ -16,17 +16,19 @@ use std::time::Instant;
 ///
 ///   <target>/.git/                    skeleton git dir (commit/trees/index)
 ///   <target>/.git/ripclone/manifest.pb
-///   <target>/.git/ripclone/archive/<0..N>   raw archive chunk files
+///   <target>/.git/ripclone/archive/<0..N>   raw archive chunk files (only when
+///                                            the server has no head-blobs pack)
 ///
-/// The working tree itself is intentionally empty. Files are served from the
-/// archive chunks on demand.
+/// The working tree itself is intentionally empty. When the server provides a
+/// head-blobs pack, HEAD blobs live as real git objects in `.git/objects/pack`.
+/// Otherwise they are built locally from the archive chunks.
 
 const RIPCLONE_DIR: &str = ".git/ripclone";
 const ARCHIVE_DIR: &str = "archive";
 const MANIFEST_NAME: &str = "manifest.pb";
 
-/// Lazy-clone a repo: download the skeleton, the manifest, and the archive
-/// chunks, but do not materialize the working tree.
+/// Lazy-clone a repo: download the skeleton, the manifest, and the HEAD blobs,
+/// but do not materialize the working tree.
 pub async fn lazy_clone(
     client: &Client,
     owner: &str,
@@ -65,29 +67,14 @@ pub async fn lazy_clone(
         MetadataChunk::decode(metadata_data.as_slice()).context("decode metadata chunk")?;
     eprintln!("  manifest+metadata: {:?}", t1.elapsed());
 
-    // Persist metadata.
+    // Persist metadata for future rcgit operations (it is tiny).
     let ripclone_dir = target.join(RIPCLONE_DIR);
-    let archive_dir = ripclone_dir.join(ARCHIVE_DIR);
-    std::fs::create_dir_all(&archive_dir)?;
+    std::fs::create_dir_all(&ripclone_dir)?;
     let manifest_path = ripclone_dir.join(MANIFEST_NAME);
     {
         let mut f = File::create(&manifest_path)?;
         metadata.write(&mut f)?;
     }
-
-    // Download archive chunks in parallel. We still write them by index so
-    // frame lookups are O(1).
-    let t2 = Instant::now();
-    let signed_urls = info.archive_chunk_urls.unwrap_or_default();
-    let chunks = client
-        .fetch_chunk_refs(&clonepack.archive_chunks, Some(&signed_urls))
-        .await
-        .context("fetch archive chunks")?;
-    for (idx, data) in chunks.into_iter().enumerate() {
-        let path = archive_dir.join(format!("{}", idx));
-        std::fs::write(&path, data).with_context(|| format!("write archive chunk {}", idx))?;
-    }
-    eprintln!("  archive chunks: {:?}", t2.elapsed());
 
     // Build the skeleton .git directory.
     let t3 = Instant::now();
@@ -134,27 +121,52 @@ pub async fn lazy_clone(
 
     write_origin_config(owner, repo, &git_dir)?;
 
-    // Build a local blob pack from the downloaded archive chunks. This is the
-    // same extraction pipeline full/hybrid mode use; we just pass no target_dir
-    // so the working tree is not materialized. The result is a complete git
-    // object store (skeleton pack + blob pack), so real git can read any HEAD
-    // blob via cat-file/show/checkout.
-    let t4 = Instant::now();
-    extract_archive_with_chunk_fetcher(
-        &manifest_path,
-        None,
-        Some(&git_dir),
-        None,
-        u64::MAX,
-        move |chunk: &Chunk| {
-            let path = archive_dir.join(format!("{}", chunk.chunk_index));
-            let bytes = std::fs::read(&path)
-                .with_context(|| format!("read archive chunk {}", chunk.chunk_index))?;
-            Ok(bytes)
-        },
-    )
-    .context("build blob pack from archive chunks")?;
-    eprintln!("  blob pack: {:?}", t4.elapsed());
+    // Prefer the server's pre-built HEAD-blobs pack if it is available. This is
+    // exactly the same format git uses, so we just concatenate the chunks and
+    // write the pack+idx into `.git/objects/pack`. No decompression, no
+    // re-encoding, and no second on-disk copy.
+    if !clonepack.head_blobs_chunks.is_empty() {
+        let t4 = Instant::now();
+        client
+            .install_prebuilt_blob_pack(&clonepack, &info, &pack_dir)
+            .await
+            .context("install head-blobs pack")?;
+        eprintln!("  head-blobs pack: {:?}", t4.elapsed());
+    } else {
+        // Fallback for older clonepacks that do not ship a head-blobs pack:
+        // download the archive chunks and build a local blob pack from them.
+        let t2 = Instant::now();
+        let archive_dir = ripclone_dir.join(ARCHIVE_DIR);
+        std::fs::create_dir_all(&archive_dir)?;
+        let signed_urls = info.archive_chunk_urls.unwrap_or_default();
+        let chunks = client
+            .fetch_chunk_refs(&clonepack.archive_chunks, Some(&signed_urls))
+            .await
+            .context("fetch archive chunks")?;
+        for (idx, data) in chunks.into_iter().enumerate() {
+            let path = archive_dir.join(format!("{}", idx));
+            std::fs::write(&path, data).with_context(|| format!("write archive chunk {}", idx))?;
+        }
+        eprintln!("  archive chunks: {:?}", t2.elapsed());
+
+        let t4 = Instant::now();
+        let archive_dir_for_closure = archive_dir.clone();
+        extract_archive_with_chunk_fetcher(
+            &manifest_path,
+            None,
+            Some(&git_dir),
+            None,
+            u64::MAX,
+            move |chunk: &Chunk| {
+                let path = archive_dir_for_closure.join(format!("{}", chunk.chunk_index));
+                let bytes = std::fs::read(&path)
+                    .with_context(|| format!("read archive chunk {}", chunk.chunk_index))?;
+                Ok(bytes)
+            },
+        )
+        .context("build blob pack from archive chunks")?;
+        eprintln!("  blob pack: {:?}", t4.elapsed());
+    }
 
     // Tell git to assume every tracked path is unchanged so it does not try to
     // stat missing working-tree files.

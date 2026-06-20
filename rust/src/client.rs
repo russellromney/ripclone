@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, bounded};
 use prost::Message;
 use serde::Deserialize;
-use sha1::{Digest, Sha1};
+use sha1::{Digest as Sha1Digest, Sha1};
 use std::collections::BTreeMap;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -763,7 +763,7 @@ impl Client {
     /// file in index order, so peak memory stays at ~`concurrency * chunk_size`
     /// instead of holding the whole pack in RAM.
     #[allow(deprecated)]
-    async fn install_prebuilt_blob_pack(
+    pub async fn install_prebuilt_blob_pack(
         &self,
         clonepack: &ClonepackManifest,
         info: &RefResponse,
@@ -1043,31 +1043,9 @@ impl Client {
         let use_archive =
             std::env::var_os("RIPCLONE_EXTRACT_ARCHIVE").is_some() && !archive_chunks.is_empty();
         if !use_archive {
-            let head_blobs_refs = head_blobs_chunk_refs(clonepack);
-            if head_blobs_refs.is_empty() {
-                anyhow::bail!("clonepack missing head-blobs pack for direct-install");
-            }
-            let idx_ref = clonepack
-                .head_blobs_idx
-                .as_ref()
-                .context("clonepack missing head-blobs idx")?;
-            let (chunks, idx_data) = tokio::join!(
-                self.fetch_chunk_refs(&head_blobs_refs, info.head_blobs_chunk_urls.as_deref()),
-                self.fetch_chunk_ref(idx_ref, info.head_blobs_idx_url.as_deref()),
-            );
-            let chunks = chunks?;
-            let idx_data = idx_data?;
-            let pack_data: Vec<u8> = chunks.into_iter().flatten().collect();
-            let head_blobs_hash = cas_hash(&pack_data);
-            std::fs::write(
-                pack_dir.join(format!("pack-{}.pack", head_blobs_hash)),
-                &pack_data,
-            )?;
-            std::fs::write(
-                pack_dir.join(format!("pack-{}.idx", head_blobs_hash)),
-                &idx_data,
-            )?;
-            info!("wrote head-blobs pack ({} bytes)", pack_data.len());
+            self.install_prebuilt_blob_pack(clonepack, info, &pack_dir)
+                .await
+                .context("install head-blobs pack")?;
         }
 
         std::fs::write(git_dir.join("index"), &metadata.prebuilt_index)?;
