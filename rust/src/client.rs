@@ -561,7 +561,7 @@ impl Client {
         // 4. Wait for manifest + metadata.
         let (manifest, metadata) =
             tokio::try_join!(manifest_task, metadata_task).context("fetch manifest/metadata")?;
-        manifest.context("fetch clonepack manifest")?;
+        let manifest = manifest.context("fetch clonepack manifest")?;
         let metadata = metadata.context("fetch metadata chunk")?;
         let metadata = Arc::new(metadata);
         bench.mark_manifest();
@@ -647,6 +647,22 @@ impl Client {
             .context("write temp manifest")?;
         let manifest_path = manifest_tmp.path().to_path_buf();
 
+        // For Hybrid mode, download the pre-built head-blobs pack in parallel
+        // with the archive extraction. The working tree still comes from the archive.
+        let prebuilt_blob_pack_download = if mode.needs_prebuilt_blob_pack() {
+            let client = self.clone();
+            let pack_dir = pack_dir.clone();
+            let clonepack = Arc::clone(&manifest);
+            let info = info.clone();
+            Some(tokio::spawn(async move {
+                client
+                    .install_prebuilt_blob_pack(&clonepack, &info, &pack_dir)
+                    .await
+            }))
+        } else {
+            None
+        };
+
         let archive_worker = if mode.needs_archive() {
             let rx = archive_rx;
             let manifest_path = manifest_path.clone();
@@ -680,6 +696,13 @@ impl Client {
             let bytes = handle.await.context("archive download coordinator")??;
             archive_bytes = bytes;
         }
+        let mut prebuilt_blob_pack_bytes = 0u64;
+        if let Some(handle) = prebuilt_blob_pack_download {
+            let bytes = handle
+                .await
+                .context("prebuilt blob pack download task")??;
+            prebuilt_blob_pack_bytes = bytes;
+        }
         if let Some(handle) = archive_worker {
             let stats = handle
                 .await
@@ -691,8 +714,8 @@ impl Client {
                 stats.files, stats.raw_bytes
             );
         }
-        bench.add_bytes(0, archive_bytes);
-        bench.mark_archive_download(archive_bytes);
+        bench.add_bytes(0, archive_bytes + prebuilt_blob_pack_bytes);
+        bench.mark_archive_download(archive_bytes + prebuilt_blob_pack_bytes);
 
         // 9. Origin config + finalization.
         self.write_origin_config(owner, repo, &git_dir)?;
@@ -733,6 +756,45 @@ impl Client {
             mode
         );
         Ok(())
+    }
+
+    /// Download the pre-built head-blobs pack + index and install them into
+    /// `.git/objects/pack/`. Returns the total bytes downloaded.
+    #[allow(deprecated)]
+    async fn install_prebuilt_blob_pack(
+        &self,
+        clonepack: &ClonepackManifest,
+        info: &RefResponse,
+        pack_dir: &std::path::Path,
+    ) -> Result<u64> {
+        let head_blobs_refs = head_blobs_chunk_refs(clonepack);
+        if head_blobs_refs.is_empty() {
+            anyhow::bail!("clonepack missing head-blobs pack for hybrid install");
+        }
+        let idx_ref = clonepack
+            .head_blobs_idx
+            .as_ref()
+            .context("clonepack missing head-blobs idx")?;
+        let (chunks, idx_data) = tokio::join!(
+            self.fetch_chunk_refs(&head_blobs_refs, info.head_blobs_chunk_urls.as_deref()),
+            self.fetch_chunk_ref(idx_ref, info.head_blobs_idx_url.as_deref()),
+        );
+        let chunks = chunks?;
+        let idx_data = idx_data?;
+        let pack_data: Vec<u8> = chunks.into_iter().flatten().collect();
+        let head_blobs_hash = cas_hash(&pack_data);
+        std::fs::write(
+            pack_dir.join(format!("pack-{}.pack", head_blobs_hash)),
+            &pack_data,
+        )
+        .with_context(|| format!("write head-blobs pack {}", head_blobs_hash))?;
+        std::fs::write(
+            pack_dir.join(format!("pack-{}.idx", head_blobs_hash)),
+            &idx_data,
+        )
+        .with_context(|| format!("write head-blobs idx {}", head_blobs_hash))?;
+        info!("wrote prebuilt head-blobs pack ({} bytes)", pack_data.len());
+        Ok(pack_data.len() as u64 + idx_data.len() as u64)
     }
 
     #[allow(deprecated)]

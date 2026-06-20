@@ -13,6 +13,7 @@ set -euo pipefail
 #   RTTS      - space-separated list in ms (default "50 125 250")
 
 REPO="${REPO:-oven-sh/bun}"
+MODE="${MODE:-full}"
 BANDWIDTH="${BANDWIDTH:-250}"
 ITER="${ITER:-3}"
 CORES="${CORES:-4 8}"
@@ -179,7 +180,7 @@ for cores in $CORES; do
       install_dir="$BASE_DIR/install-${cores}-${rtt_ms}-${n}"
       install_start=$(now_ms)
       RIPCLONE_FETCH_THREADS="$threads" RIPCLONE_WRITE_THREADS="$threads" \
-        "$RIPCLONE" --server "$PROXY_URL" clone "$REPO" --dir "$install_dir" 2>&1
+        "$RIPCLONE" --server "$PROXY_URL" clone "$REPO" --mode "$MODE" --dir "$install_dir" 2>&1
       install_end=$(now_ms)
       elapsed=$((install_end - install_start))
       total_ms=$((total_ms + elapsed))

@@ -18,8 +18,10 @@ pub enum CloneMode {
     #[value(name = "fast")]
     Fast,
 
-    /// Alias for `Full`. The old "hybrid" path downloaded both archive chunks
-    /// and a separate head-blobs pack; that dual download has been removed.
+    /// Complete `.git` like `Full`, but HEAD blobs come from a pre-built
+    /// head-blobs pack downloaded in parallel with the archive chunks instead
+    /// of being recompressed locally. Faster when bandwidth is plentiful;
+    /// slower on very constrained links because it downloads extra bytes.
     #[value(name = "hybrid")]
     Hybrid,
 
@@ -32,7 +34,13 @@ pub enum CloneMode {
 impl CloneMode {
     /// True for modes that build a local blob pack from extracted archive bytes.
     pub fn needs_blob_pack(self) -> bool {
-        matches!(self, CloneMode::Full | CloneMode::Hybrid)
+        matches!(self, CloneMode::Full)
+    }
+
+    /// True for modes that download a pre-built head-blobs pack in parallel
+    /// with the archive.
+    pub fn needs_prebuilt_blob_pack(self) -> bool {
+        matches!(self, CloneMode::Hybrid)
     }
 
     pub fn needs_archive(self) -> bool {

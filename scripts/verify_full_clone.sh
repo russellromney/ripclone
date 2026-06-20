@@ -2,6 +2,7 @@
 set -euo pipefail
 
 REPO="${REPO:-oven-sh/bun}"
+MODE="${MODE:-full}"
 RIPCLONE_TOKEN="${RIPCLONE_TOKEN:-bench-token}"
 export RIPCLONE_TOKEN
 
@@ -33,10 +34,10 @@ done
 echo "==> syncing $REPO..."
 "$RIPCLONE" --server "$SERVER_URL" sync "$REPO" > "$BASE_DIR/sync.log" 2>&1
 
-echo "==> cloning full..."
-"$RIPCLONE" --server "$SERVER_URL" clone "$REPO" --mode full --dir "$BASE_DIR/full" > "$BASE_DIR/clone.log" 2>&1
+echo "==> cloning $MODE..."
+"$RIPCLONE" --server "$SERVER_URL" clone "$REPO" --mode "$MODE" --dir "$BASE_DIR/$MODE" > "$BASE_DIR/clone.log" 2>&1
 
-cd "$BASE_DIR/full"
+cd "$BASE_DIR/$MODE"
 echo "==> git status"
 git status --short
 echo "==> git fsck"
