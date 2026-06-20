@@ -145,7 +145,7 @@ pub fn extract_archive(
     // into several chunks and let the fetcher/writer pools parallelize.
     extract_archive_with_chunk_fetcher(
         manifest_path,
-        target_dir,
+        Some(target_dir),
         git_dir,
         dictionary,
         DEFAULT_LOCAL_CHUNK_SIZE,
@@ -177,7 +177,7 @@ pub fn extract_archive(
 /// archive download satisfy both the working tree and the git object store.
 pub fn extract_archive_with_chunk_fetcher<F>(
     manifest_path: &Path,
-    target_dir: &Path,
+    target_dir: Option<&Path>,
     git_dir: Option<&Path>,
     dictionary: Option<&[u8]>,
     chunk_size: u64,
@@ -206,36 +206,39 @@ where
         })?;
     }
 
-    // Validate every path before creating any directories, then create parents
-    // safely (refusing symlinks and parent-dir escapes).
-    for entry in manifest.files.iter() {
-        validate_relative_path(path_from_bytes(&entry.path)).with_context(|| {
-            format!(
-                "invalid manifest path: {}",
-                String::from_utf8_lossy(&entry.path)
-            )
-        })?;
-    }
-    let dirs: HashSet<PathBuf> = manifest
-        .files
-        .iter()
-        .filter_map(|e| {
-            let p = path_from_bytes(&e.path);
-            let parent = p.parent()?;
-            if parent.as_os_str().is_empty() {
-                return None;
-            }
-            Some(parent.to_path_buf())
-        })
-        .collect();
-    let mut dirs: Vec<_> = dirs.into_iter().collect();
-    dirs.sort();
-    for dir in dirs {
-        safe_create_dir_all(target_dir, &dir)
-            .with_context(|| format!("create dir {}", dir.display()))?;
+    // Validate every path and create parent directories only when we are
+    // materializing the working tree. rcgit calls this with no target dir to
+    // build only a local blob pack.
+    if let Some(target_dir) = target_dir {
+        for entry in manifest.files.iter() {
+            validate_relative_path(path_from_bytes(&entry.path)).with_context(|| {
+                format!(
+                    "invalid manifest path: {}",
+                    String::from_utf8_lossy(&entry.path)
+                )
+            })?;
+        }
+        let dirs: HashSet<PathBuf> = manifest
+            .files
+            .iter()
+            .filter_map(|e| {
+                let p = path_from_bytes(&e.path);
+                let parent = p.parent()?;
+                if parent.as_os_str().is_empty() {
+                    return None;
+                }
+                Some(parent.to_path_buf())
+            })
+            .collect();
+        let mut dirs: Vec<_> = dirs.into_iter().collect();
+        dirs.sort();
+        for dir in dirs {
+            safe_create_dir_all(target_dir, &dir)
+                .with_context(|| format!("create dir {}", dir.display()))?;
+        }
     }
 
-    let target_dir = target_dir.to_path_buf();
+    let target_dir = target_dir.map(Path::to_path_buf);
     let manifest = Arc::new(manifest);
 
     // If the caller wants a local blob pack, spawn a background builder thread.
@@ -458,7 +461,9 @@ where
                                 })
                                 .context("blob pack builder closed")?;
                             }
-                            write_entry(&target_dir2, entry, content)?;
+                            if let Some(ref target_dir) = target_dir2 {
+                                write_entry(target_dir, entry, content)?;
+                            }
                             written += 1;
                         } else {
                             let mut guard = pending_files2.lock().unwrap();
@@ -484,7 +489,9 @@ where
                                         String::from_utf8_lossy(&entry.path)
                                     );
                                 }
-                                write_entry(&target_dir2, entry, &full)?;
+                                if let Some(ref target_dir) = target_dir2 {
+                                    write_entry(target_dir, entry, &full)?;
+                                }
                                 if let Some(ref tx) = blob_pack_tx2 {
                                     let sha1 = blob_sha1_to_array(&entry.blob_sha1)?;
                                     tx.send(crate::blob_pack::BlobPackInput::Owned {
@@ -527,11 +534,16 @@ where
             }
         }
     }
-    if files_written != manifest.files.len() && error.is_none() {
+    let expected_files = if target_dir.is_some() {
+        manifest.files.len()
+    } else {
+        0
+    };
+    if files_written != expected_files && error.is_none() {
         error = Some(anyhow::anyhow!(
-            "extractor wrote {} files but manifest contains {}; frames={}",
+            "extractor wrote {} files but expected {}; frames={}",
             files_written,
-            manifest.files.len(),
+            expected_files,
             manifest.frames.len()
         ));
     }
@@ -552,22 +564,24 @@ where
     let raw_total: u64 = manifest.files.iter().map(|e| e.total_len()).sum();
 
     // Clear skip-worktree for every materialized path, but only if extraction
-    // succeeded. If it failed we still need to shut down the pack builder.
+    // succeeded and we are materializing a working tree.
     if error.is_none() {
-        let clear_start = Instant::now();
-        let paths: Vec<String> = manifest
-            .files
-            .iter()
-            .map(|e| String::from_utf8_lossy(&e.path).into_owned())
-            .collect();
-        if let Err(e) = git::clear_skip_worktree_index(&target_dir, &paths) {
-            error = Some(e);
-        } else {
-            info!(
-                "cleared skip-worktree for {} paths in {:?}",
-                paths.len(),
-                clear_start.elapsed()
-            );
+        if let Some(ref target_dir) = target_dir {
+            let clear_start = Instant::now();
+            let paths: Vec<String> = manifest
+                .files
+                .iter()
+                .map(|e| String::from_utf8_lossy(&e.path).into_owned())
+                .collect();
+            if let Err(e) = git::clear_skip_worktree_index(target_dir, &paths) {
+                error = Some(e);
+            } else {
+                info!(
+                    "cleared skip-worktree for {} paths in {:?}",
+                    paths.len(),
+                    clear_start.elapsed()
+                );
+            }
         }
     }
 
@@ -794,7 +808,7 @@ mod tests {
         }
         extract_archive_with_chunk_fetcher(
             &manifest_path,
-            target,
+            Some(target),
             None,
             None,
             u64::MAX,
@@ -1073,7 +1087,7 @@ mod tests {
 
         extract_archive_with_chunk_fetcher(
             &manifest_path,
-            &target,
+            Some(&target),
             Some(&target.join(".git")),
             None,
             u64::MAX,
@@ -1135,7 +1149,7 @@ const DEFAULT_LOCAL_CHUNK_SIZE: u64 = 2 * 1024 * 1024;
 /// into `.git/objects/pack` as a locally-built packfile.
 pub fn extract_archive_from_chunk_receiver(
     manifest_path: &Path,
-    target_dir: &Path,
+    target_dir: Option<&Path>,
     git_dir: Option<&Path>,
     dictionary: Option<&[u8]>,
     chunk_rx: Receiver<(usize, Result<Vec<u8>>)>,
@@ -1161,36 +1175,39 @@ pub fn extract_archive_from_chunk_receiver(
         })?;
     }
 
-    // Validate every path before creating any directories, then create parents
-    // safely (refusing symlinks and parent-dir escapes).
-    for entry in manifest.files.iter() {
-        validate_relative_path(path_from_bytes(&entry.path)).with_context(|| {
-            format!(
-                "invalid manifest path: {}",
-                String::from_utf8_lossy(&entry.path)
-            )
-        })?;
-    }
-    let dirs: HashSet<PathBuf> = manifest
-        .files
-        .iter()
-        .filter_map(|e| {
-            let p = path_from_bytes(&e.path);
-            let parent = p.parent()?;
-            if parent.as_os_str().is_empty() {
-                return None;
-            }
-            Some(parent.to_path_buf())
-        })
-        .collect();
-    let mut dirs: Vec<_> = dirs.into_iter().collect();
-    dirs.sort();
-    for dir in dirs {
-        safe_create_dir_all(target_dir, &dir)
-            .with_context(|| format!("create dir {}", dir.display()))?;
+    // Validate every path and create parent directories only when we are
+    // materializing the working tree. rcgit calls this with no target dir to
+    // build only a local blob pack.
+    if let Some(target_dir) = target_dir {
+        for entry in manifest.files.iter() {
+            validate_relative_path(path_from_bytes(&entry.path)).with_context(|| {
+                format!(
+                    "invalid manifest path: {}",
+                    String::from_utf8_lossy(&entry.path)
+                )
+            })?;
+        }
+        let dirs: HashSet<PathBuf> = manifest
+            .files
+            .iter()
+            .filter_map(|e| {
+                let p = path_from_bytes(&e.path);
+                let parent = p.parent()?;
+                if parent.as_os_str().is_empty() {
+                    return None;
+                }
+                Some(parent.to_path_buf())
+            })
+            .collect();
+        let mut dirs: Vec<_> = dirs.into_iter().collect();
+        dirs.sort();
+        for dir in dirs {
+            safe_create_dir_all(target_dir, &dir)
+                .with_context(|| format!("create dir {}", dir.display()))?;
+        }
     }
 
-    let target_dir = target_dir.to_path_buf();
+    let target_dir = target_dir.map(Path::to_path_buf);
     let manifest = Arc::new(manifest);
 
     let expected_blob_count = git_dir.map(|_| {
@@ -1412,7 +1429,9 @@ pub fn extract_archive_from_chunk_receiver(
                                 })
                                 .context("blob pack builder closed")?;
                             }
-                            write_entry(&target_dir2, entry, content)?;
+                            if let Some(ref target_dir) = target_dir2 {
+                                write_entry(target_dir, entry, content)?;
+                            }
                             written += 1;
                         } else {
                             let mut guard = pending_files2.lock().unwrap();
@@ -1438,7 +1457,9 @@ pub fn extract_archive_from_chunk_receiver(
                                         String::from_utf8_lossy(&entry.path)
                                     );
                                 }
-                                write_entry(&target_dir2, entry, &full)?;
+                                if let Some(ref target_dir) = target_dir2 {
+                                    write_entry(target_dir, entry, &full)?;
+                                }
                                 if let Some(ref tx) = blob_pack_tx2 {
                                     let sha1 = blob_sha1_to_array(&entry.blob_sha1)?;
                                     tx.send(crate::blob_pack::BlobPackInput::Owned {
@@ -1475,11 +1496,16 @@ pub fn extract_archive_from_chunk_receiver(
             }
         }
     }
-    if files_written != manifest.files.len() && error.is_none() {
+    let expected_files = if target_dir.is_some() {
+        manifest.files.len()
+    } else {
+        0
+    };
+    if files_written != expected_files && error.is_none() {
         error = Some(anyhow::anyhow!(
-            "extractor wrote {} files but manifest contains {}; frames={}",
+            "extractor wrote {} files but expected {}; frames={}",
             files_written,
-            manifest.files.len(),
+            expected_files,
             manifest.frames.len()
         ));
     }
@@ -1498,20 +1524,22 @@ pub fn extract_archive_from_chunk_receiver(
     let raw_total: u64 = manifest.files.iter().map(|e| e.total_len()).sum();
 
     if error.is_none() {
-        let clear_start = Instant::now();
-        let paths: Vec<String> = manifest
-            .files
-            .iter()
-            .map(|e| String::from_utf8_lossy(&e.path).into_owned())
-            .collect();
-        if let Err(e) = git::clear_skip_worktree_index(&target_dir, &paths) {
-            error = Some(e);
-        } else {
-            info!(
-                "cleared skip-worktree for {} paths in {:?}",
-                paths.len(),
-                clear_start.elapsed()
-            );
+        if let Some(ref target_dir) = target_dir {
+            let clear_start = Instant::now();
+            let paths: Vec<String> = manifest
+                .files
+                .iter()
+                .map(|e| String::from_utf8_lossy(&e.path).into_owned())
+                .collect();
+            if let Err(e) = git::clear_skip_worktree_index(target_dir, &paths) {
+                error = Some(e);
+            } else {
+                info!(
+                    "cleared skip-worktree for {} paths in {:?}",
+                    paths.len(),
+                    clear_start.elapsed()
+                );
+            }
         }
     }
 
@@ -1576,7 +1604,7 @@ pub fn extract_archive_streaming(
 
     extract_archive_with_chunk_fetcher(
         manifest_path,
-        target_dir,
+        Some(target_dir),
         git_dir,
         dictionary,
         chunk_size,
@@ -1659,7 +1687,7 @@ pub fn extract_clonepack_streaming(
 
     extract_archive_with_chunk_fetcher(
         manifest_path,
-        target_dir,
+        Some(target_dir),
         git_dir,
         dictionary,
         u64::MAX,

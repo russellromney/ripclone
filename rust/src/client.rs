@@ -677,7 +677,7 @@ impl Client {
                 let _guard = manifest_tmp;
                 extract_archive_from_chunk_receiver(
                     &manifest_path,
-                    &work_tree,
+                    Some(&work_tree),
                     git_dir_for_blobs.as_deref(),
                     None,
                     rx,
