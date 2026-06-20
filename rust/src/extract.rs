@@ -660,15 +660,15 @@ fn write_entry(target_dir: &Path, entry: &FileEntry, content: &[u8]) -> Result<(
     validate_relative_path(path)
         .with_context(|| format!("refusing to extract unsafe path: {}", path.display()))?;
 
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            safe_create_dir_all(target_dir, parent).with_context(|| {
-                format!(
-                    "create parent dir for {}",
-                    String::from_utf8_lossy(&entry.path)
-                )
-            })?;
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        safe_create_dir_all(target_dir, parent).with_context(|| {
+            format!(
+                "create parent dir for {}",
+                String::from_utf8_lossy(&entry.path)
+            )
+        })?;
     }
 
     let target = target_dir.join(path);

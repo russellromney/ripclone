@@ -117,10 +117,10 @@ impl S3Storage {
 
 impl StorageBackend for S3Storage {
     fn get(&self, hash: &str) -> Result<Vec<u8>> {
-        if let Some(cache) = &self.cache {
-            if let Ok(data) = cache.get(hash) {
-                return Ok(data);
-            }
+        if let Some(cache) = &self.cache
+            && let Ok(data) = cache.get(hash)
+        {
+            return Ok(data);
         }
         let key = self.key(hash)?;
         let output = self.block_on(self.client.objects().get(&self.bucket, &key).send())?;
@@ -128,15 +128,15 @@ impl StorageBackend for S3Storage {
         let data = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(Self::collect_stream(output.body))
         })?;
-        if let Some(expected) = content_length {
-            if data.len() as u64 != expected {
-                anyhow::bail!(
-                    "S3 object {} length mismatch: expected {}, got {}",
-                    hash,
-                    expected,
-                    data.len()
-                );
-            }
+        if let Some(expected) = content_length
+            && data.len() as u64 != expected
+        {
+            anyhow::bail!(
+                "S3 object {} length mismatch: expected {}, got {}",
+                hash,
+                expected,
+                data.len()
+            );
         }
         let actual_hash = format!("{:x}", sha2::Sha256::digest(&data));
         if actual_hash != hash {
@@ -166,16 +166,16 @@ impl StorageBackend for S3Storage {
         let data = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(Self::collect_stream(output.body))
         })?;
-        if let Some(expected) = content_length {
-            if data.len() as u64 != expected {
-                anyhow::bail!(
-                    "S3 range {}+{} length mismatch: expected {}, got {}",
-                    start,
-                    len,
-                    expected,
-                    data.len()
-                );
-            }
+        if let Some(expected) = content_length
+            && data.len() as u64 != expected
+        {
+            anyhow::bail!(
+                "S3 range {}+{} length mismatch: expected {}, got {}",
+                start,
+                len,
+                expected,
+                data.len()
+            );
         }
         Ok(data)
     }

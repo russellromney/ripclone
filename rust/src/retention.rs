@@ -139,25 +139,25 @@ impl Retention {
                         remaining.push(entry);
                         continue;
                     }
-                    if let Some(max_age) = max_age {
-                        if entry.age >= max_age {
-                            if !is_durable(&entry.hash) {
-                                warn!(
-                                    "skipping eviction of {}: not confirmed in durable storage",
-                                    entry.hash
-                                );
-                                remaining.push(entry);
-                                continue;
-                            }
-                            if let Err(e) = std::fs::remove_file(&entry.path) {
-                                warn!("failed to remove old CAS object {}: {}", entry.hash, e);
-                                remaining.push(entry);
-                                continue;
-                            }
-                            deleted_age_bytes += entry.size;
-                            deleted_age_count += 1;
+                    if let Some(max_age) = max_age
+                        && entry.age >= max_age
+                    {
+                        if !is_durable(&entry.hash) {
+                            warn!(
+                                "skipping eviction of {}: not confirmed in durable storage",
+                                entry.hash
+                            );
+                            remaining.push(entry);
                             continue;
                         }
+                        if let Err(e) = std::fs::remove_file(&entry.path) {
+                            warn!("failed to remove old CAS object {}: {}", entry.hash, e);
+                            remaining.push(entry);
+                            continue;
+                        }
+                        deleted_age_bytes += entry.size;
+                        deleted_age_count += 1;
+                        continue;
                     }
                     remaining.push(entry);
                 }

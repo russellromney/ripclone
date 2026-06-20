@@ -84,12 +84,11 @@ impl OidcVerifier {
         // Fast path: look in the current cache.
         {
             let cache = self.cache.read().await;
-            if let Some(cached) = cache.as_ref() {
-                if cached.fetched_at.elapsed() < JWKS_TTL {
-                    if let Some(jwk) = cached.jwks.find(kid) {
-                        return Ok(jwk.clone());
-                    }
-                }
+            if let Some(cached) = cache.as_ref()
+                && cached.fetched_at.elapsed() < JWKS_TTL
+                && let Some(jwk) = cached.jwks.find(kid)
+            {
+                return Ok(jwk.clone());
             }
         }
 

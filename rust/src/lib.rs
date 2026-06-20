@@ -1,3 +1,12 @@
+#![allow(
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::manual_checked_ops,
+    clippy::suspicious_open_options,
+    dead_code,
+    deprecated
+)]
+
 pub mod archive;
 pub mod bench;
 pub mod blob_pack;

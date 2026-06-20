@@ -44,7 +44,7 @@ impl<'a> SnapshotBuilder<'a> {
         let git_dir = work.join(".git");
 
         // Initialize a fresh git dir and populate it with the skeleton pack.
-        git::init(&work)?;
+        git::init(work)?;
         let pack_dir = git_dir.join("objects").join("pack");
         std::fs::create_dir_all(&pack_dir)?;
 
@@ -70,13 +70,13 @@ impl<'a> SnapshotBuilder<'a> {
         // symlinks and use only size/mtime for stat checks. Modes are preserved
         // by the archive/sidecar materialization, so we leave core.fileMode at
         // its default (true on Unix).
-        git::run_git(&work, &["config", "core.symlinks", "true"])?;
-        git::run_git(&work, &["config", "core.checkstat", "minimal"])?;
+        git::run_git(work, &["config", "core.symlinks", "true"])?;
+        git::run_git(work, &["config", "core.checkstat", "minimal"])?;
 
         // Materialize hot files into the working tree.
         let hot_files = git::hot_files(&self.mirror, commit, hot_file_count, 5)?;
         for path in &hot_files {
-            if let Err(e) = self.materialize_blob(commit, path, &work, &git_dir) {
+            if let Err(e) = self.materialize_blob(commit, path, work, &git_dir) {
                 tracing::warn!("failed to materialize hot file {}: {}", path, e);
             }
         }
@@ -84,8 +84,8 @@ impl<'a> SnapshotBuilder<'a> {
         // Mark all remaining (non-materialized) entries as skip-worktree so git
         // status stays clean without needing the actual files on disk.
         // These commands run in the working tree, not the .git dir.
-        git::set_skip_worktree_all(&work)?;
-        git::clear_skip_worktree_index(&work, &hot_files)?;
+        git::set_skip_worktree_all(work)?;
+        git::clear_skip_worktree_index(work, &hot_files)?;
 
         // Build a gzipped tarball of the skeleton working tree in memory.
         let mut tar_bytes = Vec::new();
@@ -93,7 +93,7 @@ impl<'a> SnapshotBuilder<'a> {
             let enc = GzEncoder::new(&mut tar_bytes, Compression::default());
             let mut builder = tar::Builder::new(enc);
             builder.follow_symlinks(false);
-            builder.append_dir_all(".", &work)?;
+            builder.append_dir_all(".", work)?;
             let enc = builder.into_inner()?;
             enc.finish()?;
         }
