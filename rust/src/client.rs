@@ -39,6 +39,12 @@ pub struct RefResponse {
     pub head_blobs_chunk_urls: Option<Vec<Option<String>>>,
     #[serde(default)]
     pub head_blobs_idx_url: Option<String>,
+    /// Signed URL for each editable pack, ordered to match `manifest.packs`.
+    #[serde(default)]
+    pub pack_chunk_urls: Option<Vec<Option<String>>>,
+    /// Signed URL for each editable pack's idx, ordered to match `manifest.packs`.
+    #[serde(default)]
+    pub pack_idx_urls: Option<Vec<Option<String>>>,
     /// True when the returned clonepack is a shallow (depth=1) snapshot.
     #[serde(default)]
     pub shallow: bool,
@@ -789,7 +795,7 @@ impl Client {
     async fn install_editable_packs(
         &self,
         manifest: &ClonepackManifest,
-        _info: &RefResponse,
+        info: &RefResponse,
         pack_dir: &std::path::Path,
         work_tree: &std::path::Path,
         metadata: &MetadataChunk,
@@ -842,12 +848,20 @@ impl Client {
             .unwrap_or(default_par)
             .max(1);
 
+        // Signed URLs (one per pack/idx, matching manifest.packs order). Empty
+        // entries fall back to the gateway by hash; with an object-store backend
+        // these point straight at the bucket so bytes bypass the server.
+        let pack_urls = info.pack_chunk_urls.clone().unwrap_or_default();
+        let idx_urls = info.pack_idx_urls.clone().unwrap_or_default();
+
         let jobs: Vec<(usize, PackEntry)> =
             manifest.packs.iter().cloned().enumerate().collect();
 
         // Stage 1: download packs (network concurrency `download_conc`).
         let downloads = stream::iter(jobs).map(|(i, entry)| {
             let client = self.clone();
+            let pack_url = pack_urls.get(i).and_then(|o| o.clone());
+            let idx_url = idx_urls.get(i).and_then(|o| o.clone());
             async move {
                 let pack_ref = entry
                     .pack
@@ -857,11 +871,9 @@ impl Client {
                     .idx
                     .as_ref()
                     .with_context(|| format!("pack {} missing idx ref", i))?;
-                // Phase 1: fetch by content hash via the gateway (signed URLs
-                // for packs are a follow-up for object-store backends).
                 let (pack_bytes, idx_bytes) = tokio::try_join!(
-                    client.fetch_chunk_ref(pack_ref, None),
-                    client.fetch_chunk_ref(idx_ref, None),
+                    client.fetch_chunk_ref(pack_ref, pack_url.as_deref()),
+                    client.fetch_chunk_ref(idx_ref, idx_url.as_deref()),
                 )
                 .with_context(|| format!("fetch pack {}", i))?;
                 Ok::<(usize, Vec<u8>, Vec<u8>), anyhow::Error>((i, pack_bytes, idx_bytes))

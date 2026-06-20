@@ -282,6 +282,12 @@ pub struct RefResponse {
     /// Signed URL for the optional head-blobs idx.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub head_blobs_idx_url: Option<String>,
+    /// Signed URL for each editable pack, ordered to match `manifest.packs`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pack_chunk_urls: Option<Vec<Option<String>>>,
+    /// Signed URL for each editable pack's idx, ordered to match `manifest.packs`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pack_idx_urls: Option<Vec<Option<String>>>,
     /// True when the returned clonepack is a shallow (depth=1) snapshot.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub shallow: bool,
@@ -795,6 +801,7 @@ async fn get_ref(
                 head_blobs_pack: String::new(),
                 head_blobs_idx: String::new(),
                 head_blobs_chunks: Vec::new(),
+                packs: Vec::new(),
                 prebuilt_index: String::new(),
                 archive: String::new(),
                 manifest: String::new(),
@@ -895,6 +902,21 @@ fn ref_response(
     };
     let head_blobs_idx_url = signed_url(storage, &info.head_blobs_idx);
 
+    // Sign each editable pack + idx so the client fetches them straight from
+    // object storage. `None` entries (e.g. local backend) fall back to the
+    // gateway. Ordered to match the manifest's `packs` list.
+    let (pack_chunk_urls, pack_idx_urls) = if info.packs.is_empty() {
+        (None, None)
+    } else {
+        let packs: Vec<Option<String>> =
+            info.packs.iter().map(|p| signed_url(storage, &p.pack)).collect();
+        let idxs: Vec<Option<String>> =
+            info.packs.iter().map(|p| signed_url(storage, &p.idx)).collect();
+        let packs = if packs.iter().all(Option::is_none) { None } else { Some(packs) };
+        let idxs = if idxs.iter().all(Option::is_none) { None } else { Some(idxs) };
+        (packs, idxs)
+    };
+
     RefResponse {
         owner,
         repo,
@@ -910,6 +932,8 @@ fn ref_response(
         archive_chunk_urls,
         head_blobs_chunk_urls,
         head_blobs_idx_url,
+        pack_chunk_urls,
+        pack_idx_urls,
         shallow: clonepack_kind == "shallow",
     }
 }
@@ -1819,6 +1843,15 @@ async fn do_sync(
         .iter()
         .flat_map(|(p, _, i, _)| [p.clone(), i.clone()])
         .collect();
+    // Ordered (pack, idx) hashes for RefInfo so the ref endpoint can sign each
+    // pack/idx URL without decoding the manifest. Matches `pack_entries` order.
+    let pack_artifacts: Vec<crate::PackArtifact> = depth_packs
+        .iter()
+        .map(|(p, _, i, _)| crate::PackArtifact {
+            pack: p.clone(),
+            idx: i.clone(),
+        })
+        .collect();
 
     let archive_chunk_lengths = crate::clonepack::archive_chunk_lengths(&metadata_chunk);
     let archive_chunks: Vec<ChunkRef> = archive_chunk_hashes
@@ -1882,6 +1915,7 @@ async fn do_sync(
         head_blobs_pack: String::new(),
         head_blobs_idx: String::new(),
         head_blobs_chunks: Vec::new(),
+        packs: pack_artifacts.clone(),
         prebuilt_index: prebuilt_index.clone(),
         archive: archive_chunk_hashes.first().cloned().unwrap_or_default(),
         manifest: metadata_hash.clone(),
@@ -2030,6 +2064,7 @@ async fn update_build_status(
             head_blobs_pack: String::new(),
             head_blobs_idx: String::new(),
             head_blobs_chunks: Vec::new(),
+            packs: Vec::new(),
             prebuilt_index: String::new(),
             archive: String::new(),
             manifest: String::new(),
@@ -2290,6 +2325,7 @@ mod tests {
             head_blobs_pack: String::new(),
             head_blobs_idx: String::new(),
             head_blobs_chunks: Vec::new(),
+            packs: Vec::new(),
             prebuilt_index: String::new(),
             archive: String::new(),
             manifest: String::new(),
@@ -2380,6 +2416,7 @@ mod tests {
             head_blobs_pack: String::new(),
             head_blobs_idx: String::new(),
             head_blobs_chunks: vec![],
+            packs: vec![],
             prebuilt_index: String::new(),
             archive: String::new(),
             manifest: manifest_hash.clone(),
@@ -2461,6 +2498,7 @@ mod tests {
             head_blobs_pack: String::new(),
             head_blobs_idx: String::new(),
             head_blobs_chunks: vec![],
+            packs: vec![],
             prebuilt_index: String::new(),
             archive: String::new(),
             manifest: manifest_hash.clone(),
