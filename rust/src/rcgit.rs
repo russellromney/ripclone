@@ -1,6 +1,7 @@
 use crate::cas::hash as cas_hash;
 use crate::client::Client;
 use crate::clonepack::{ClonepackManifest, FileEntry, MetadataChunk};
+use crate::extract::{extract_archive_with_chunk_fetcher, Chunk};
 use anyhow::{Context, Result};
 use prost::Message;
 use sha1::Digest;
@@ -132,6 +133,28 @@ pub async fn lazy_clone(
     }
 
     write_origin_config(owner, repo, &git_dir)?;
+
+    // Build a local blob pack from the downloaded archive chunks. This is the
+    // same extraction pipeline full/hybrid mode use; we just pass no target_dir
+    // so the working tree is not materialized. The result is a complete git
+    // object store (skeleton pack + blob pack), so real git can read any HEAD
+    // blob via cat-file/show/checkout.
+    let t4 = Instant::now();
+    extract_archive_with_chunk_fetcher(
+        &manifest_path,
+        None,
+        Some(&git_dir),
+        None,
+        u64::MAX,
+        move |chunk: &Chunk| {
+            let path = archive_dir.join(format!("{}", chunk.chunk_index));
+            let bytes = std::fs::read(&path)
+                .with_context(|| format!("read archive chunk {}", chunk.chunk_index))?;
+            Ok(bytes)
+        },
+    )
+    .context("build blob pack from archive chunks")?;
+    eprintln!("  blob pack: {:?}", t4.elapsed());
 
     // Tell git to assume every tracked path is unchanged so it does not try to
     // stat missing working-tree files.

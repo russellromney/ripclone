@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/logo.png" alt="ripclone logo" width="200">
+  <img src="assets/logo.png" alt="ripclone logo" width="200">
 </p>
 
 # ripclone
@@ -50,11 +50,11 @@ ripclone stores the same `HEAD` file bytes in two formats so you can choose the 
 
 ### Design
 
-A normal `git clone` is slow because it interleaves several expensive steps. The client and server negotiate which objects to send; the client indexes the pack; git builds the index; then it checks out every file. Each step is fine on its own, but together they create a long chain of round trips and disk operations that are hard to parallelize.
+A normal `git clone` is slow because it interleaves several expensive steps. The client and server ***negotiate*** which objects to send; the client ***indexes*** the pack; git builds the index; then it checks out every file. Each step is fine on its own, but together they create a long chain of round trips and disk operations that are hard to parallelize.
 
-ripclone unbundles that chain. The server runs the negotiation, indexing, and tree walking once per push and stores the results. The client only downloads what it needs and writes it to disk.
+ripclone unbundles that chain. The server runs the ***negotiation***, ***indexing***, and ***tree walking*** once per push and stores the results. The client only downloads what it needs and writes it to disk.
 
-That split creates a few constraints. Git still expects a real packfile if you want `git diff` and `git checkout-index` to work, so ripclone builds a real head-blobs pack and ships it as-is. Materializing thousands of small files from a pack is serial and disk-heavy, so ripclone also compresses the same bytes into zstd archive chunks that can be fetched and decompressed in parallel. And because object storage rewards large parallel requests over small serial ones, the archive is split into independent zstd frames so a point lookup can fetch just the frame it needs instead of the whole chunk.
+That split creates a few constraints. Git still expects a real packfile if you want `git diff` and `git checkout-index` to work, so ripclone builds a real ***head-blobs pack*** and ships it as-is. Materializing thousands of small files from a pack is serial and disk-heavy, so ripclone also compresses the same bytes into ***zstd archive chunks*** that can be fetched and decompressed in parallel. And because object storage rewards large parallel requests over small serial ones, the archive is split into independent ***zstd frames*** so a point lookup can fetch just the frame it needs instead of the whole chunk.
 
 The result is a git repo built from precomputed parts rather than reconstructed on the fly.
 

@@ -12,7 +12,7 @@ See `CHANGELOG.md` for the full list. The important baseline for current work:
 - **Signed URLs**: ref response returns presigned Tigris URLs for the manifest, metadata chunk, archive chunks, and head-blobs chunks.
 - **Shared ref store**: `RefStore` trait with file-backed, S3-backed, and caching implementations.
 - **Async builds**: `/v1/build` accepts an OIDC token from GitHub Actions and enqueues the build.
-- **Security**: the critical findings from the adversarial review are fixed (artifact-id validation, atomic CAS writes, hash verification, path safety, mode validation, rate limiting keyed by IP).
+- **Security**: artifact-id validation, atomic CAS writes, hash verification, path safety, mode validation, and IP-keyed rate limiting are implemented.
 - **Client paths**: direct-install (`git checkout-index` using a head-blobs pack) and archive extraction (zstd frames written directly) are both implemented and A/B tested.
 - **Tests**: 27 unit tests, but no CI, no integration-test suite, and no fuzz/property tests yet.
 
@@ -136,7 +136,6 @@ Once warm full clones are fast and predictable, move from full clonepacks per co
 ## Notes
 
 - See `CHANGELOG.md` for completed work.
-- See `docs/ADVERSARIAL_REVIEW_2026-06-18.md` for the security review that drove recent hardening.
 
 ## Distribution (future)
 

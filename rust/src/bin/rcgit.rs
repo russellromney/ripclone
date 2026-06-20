@@ -1,10 +1,9 @@
 use anyhow::{Context, Result};
 use ripclone::client::Client;
-use ripclone::rcgit::{LazyRepo, lazy_clone};
+use ripclone::rcgit::lazy_clone;
 use sha2::{Digest, Sha256};
 use std::env;
 use std::ffi::OsString;
-use std::io::{self, Write};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
@@ -122,34 +121,8 @@ async fn cmd_clone(args: &[String], server: String) -> Result<()> {
     Ok(())
 }
 
-fn find_repo_dir() -> Result<PathBuf> {
-    let cwd = env::current_dir()?;
-    let mut dir = cwd.as_path();
-    loop {
-        if dir.join(".git").is_dir() && dir.join(".git/ripclone/manifest.pb").is_file() {
-            return Ok(dir.to_path_buf());
-        }
-        match dir.parent() {
-            Some(p) => dir = p,
-            None => anyhow::bail!("not inside an rcgit repo"),
-        }
-    }
-}
-
 fn cmd_show(args: &[String]) -> Result<()> {
-    // git show [<options>] <object>   e.g. HEAD:src/main.rs
-    let object = args.last().context("usage: rcgit show <object>")?;
-    let (rev, path) = object
-        .split_once(':')
-        .context("rcgit show only supports <rev>:<path> syntax")?;
-    if rev != "HEAD" {
-        // Fallback to real git for non-HEAD revs (may fail if objects missing).
-        return exec_real_git(args.to_vec());
-    }
-
-    let repo_dir = find_repo_dir()?;
-    let repo = LazyRepo::open(&repo_dir)?;
-    let content = repo.read_path(path)?;
-    io::stdout().write_all(&content)?;
-    Ok(())
+    // The local blob pack built during clone contains every HEAD blob, so real
+    // git can handle show/cat-file/checkout without materializing the tree.
+    exec_real_git(args.to_vec())
 }
