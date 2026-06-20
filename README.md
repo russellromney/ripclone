@@ -42,14 +42,11 @@ ripclone stores the same `HEAD` file bytes in two formats so you can choose the 
 
 ### Clone modes
 
-| Mode | Downloads | Working tree | `.git` blobs | Use for |
-|---|---|---|---|---|
-| `full` (default) | metadata + head-blobs pack | `git checkout-index` from pack | head-blobs pack | Normal git workflows; `git diff`/`git show` work |
-| `fast` | metadata + archive chunks | direct from zstd frames | none | Agents that only edit and commit; fastest materialization |
-| `hybrid` | metadata + archive chunks + head-blobs pack | direct from zstd frames | head-blobs pack | Fast materialization + full git compatibility |
-| `skeleton` | metadata only | none | none | Inspect history or sparse checkout |
+`--mode=full` (the default) downloads the metadata chunk and the archive chunks, writes the working tree directly from the zstd frames, and builds a local HEAD-blobs pack from those bytes so `git diff`, `git show`, and `git checkout-index` all work. The result is indistinguishable from `git clone --depth=1`.
 
-`full` behaves like `git clone --depth=1` once it finishes. `fast` skips the head-blobs pack and writes files directly from archive chunks, so `git diff` and `git show` do not work. `hybrid` runs both streams concurrently so the working tree appears quickly while the head-blobs pack catches up in the background. `skeleton` gives you a valid `.git/` with history and tree structure but no working tree and no blob objects.
+`--mode=fast` downloads the metadata chunk and the archive chunks, then writes files directly from the zstd frames without building a blob pack. This is the fastest way to get a working tree for agents that only edit and commit; `git diff`/`git show` do not work.
+
+`--mode=hybrid` downloads the pre-built HEAD-blobs pack in parallel with the archive chunks and writes the working tree from the archive. Faster than `full` when bandwidth is plentiful because it avoids the local pack-build CPU cost; slower on constrained links because it downloads extra bytes.
 
 ### Design
 
@@ -180,39 +177,20 @@ Object storage   Local disk
 - **GitHub remains the source of truth** for repos, refs, permissions, and writes.
 - **IP rate limiting** protects public endpoints from abuse.
 
-## Benchmarking
+## Build options
 
-`ripclone clone --bench` emits a JSON report with per-phase timings.
-
-```bash
-ripclone clone oven-sh/bun --dir bun --bench
-```
-
-Phases include: resolve, metadata_download, skeleton_install, head_blobs_download, archive_download, checkout, and total. Use it to compare modes or measure where a clone spends its time:
-
-```bash
-ripclone clone oven-sh/bun --dir bun --mode=fast --bench
-ripclone clone oven-sh/bun --dir bun --mode=hybrid --bench
-```
-
-## Development
+By default the Rust crate uses `zlib-ng` for faster pack compression. On platforms without cmake you can build with the stock zlib instead:
 
 ```bash
 cd rust
-cargo build --release
-cargo test
-cargo clippy -- -D warnings
-cargo fmt --check
+cargo build --release --no-default-features
 ```
 
-End-to-end tests live in `scripts/`:
+Environment variables for tuning clone performance:
 
-```bash
-./scripts/e2e_clonepack.sh
-./scripts/e2e_archive.sh
-```
-
-See [`CONTRIBUTING.md`](CONTRIBUTING.md) for how to contribute.
+- `RIPCLONE_FETCH_CONCURRENCY` — max concurrent chunk downloads (default 6).
+- `RIPCLONE_FETCH_THREADS` / `RIPCLONE_WRITE_THREADS` — thread counts for archive extraction.
+- `RIPCLONE_BLOB_PACK_THREADS` — threads used when building a local blob pack in `full` mode.
 
 ## License
 

@@ -15,6 +15,12 @@ use tracing::info;
 
 const INDEX_MTIME: FileTime = FileTime::from_unix_time(1, 0);
 
+/// Convert a manifest blob_sha1 slice to a fixed 20-byte array.
+fn blob_sha1_to_array(sha1: &[u8]) -> Result<[u8; 20]> {
+    sha1.try_into()
+        .map_err(|_| anyhow::anyhow!("manifest blob_sha1 must be 20 bytes, got {}", sha1.len()))
+}
+
 /// Convert a raw path byte slice to a `Path`. On Unix this preserves arbitrary
 /// git path bytes; on other platforms we fall back to UTF-8.
 fn path_from_bytes(bytes: &[u8]) -> &std::path::Path {
@@ -36,6 +42,7 @@ struct PendingFile {
     remaining: usize,
 }
 
+#[derive(Debug)]
 pub struct ExtractStats {
     pub files: usize,
     pub raw_bytes: u64,
@@ -116,10 +123,14 @@ fn compute_chunks(frames: &[FrameInfo], chunk_size: u64) -> Vec<Chunk> {
 ///
 /// `target_dir` must already contain a skeleton `.git` with skip-worktree set
 /// on all tracked paths. After extraction those paths are cleared.
+///
+/// If `git_dir` is `Some`, every verified blob is also written into
+/// `.git/objects/pack` as a locally-built packfile.
 pub fn extract_archive(
     archive_path: &Path,
     manifest_path: &Path,
     target_dir: &Path,
+    git_dir: Option<&Path>,
     dictionary: Option<&[u8]>,
 ) -> Result<ExtractStats> {
     let mut archive_file = File::open(archive_path)
@@ -134,7 +145,8 @@ pub fn extract_archive(
     // into several chunks and let the fetcher/writer pools parallelize.
     extract_archive_with_chunk_fetcher(
         manifest_path,
-        target_dir,
+        Some(target_dir),
+        git_dir,
         dictionary,
         DEFAULT_LOCAL_CHUNK_SIZE,
         move |chunk: &Chunk| {
@@ -159,9 +171,14 @@ pub fn extract_archive(
 /// Frames are grouped into chunks of at most `chunk_size` compressed bytes so
 /// that a single range request can satisfy several frames. On high-latency
 /// links this dramatically reduces the number of round-trips.
+///
+/// If `git_dir` is `Some`, every verified blob is also collected and written
+/// into `.git/objects/pack` as a locally-built packfile. This lets a single
+/// archive download satisfy both the working tree and the git object store.
 pub fn extract_archive_with_chunk_fetcher<F>(
     manifest_path: &Path,
-    target_dir: &Path,
+    target_dir: Option<&Path>,
+    git_dir: Option<&Path>,
     dictionary: Option<&[u8]>,
     chunk_size: u64,
     fetch_chunk: F,
@@ -178,37 +195,78 @@ where
         .context("read manifest")?;
     let manifest = Manifest::read(&mut manifest_bytes.as_slice())?;
 
-    // Validate every path before creating any directories, then create parents
-    // safely (refusing symlinks and parent-dir escapes).
+    // Validate every blob_sha1 length up front so downstream code can rely on
+    // a fixed 20-byte representation.
     for entry in manifest.files.iter() {
-        validate_relative_path(path_from_bytes(&entry.path)).with_context(|| {
+        blob_sha1_to_array(&entry.blob_sha1).with_context(|| {
             format!(
-                "invalid manifest path: {}",
+                "invalid blob_sha1 for {}",
                 String::from_utf8_lossy(&entry.path)
             )
         })?;
     }
-    let dirs: HashSet<PathBuf> = manifest
-        .files
-        .iter()
-        .filter_map(|e| {
-            let p = path_from_bytes(&e.path);
-            let parent = p.parent()?;
-            if parent.as_os_str().is_empty() {
-                return None;
-            }
-            Some(parent.to_path_buf())
-        })
-        .collect();
-    let mut dirs: Vec<_> = dirs.into_iter().collect();
-    dirs.sort();
-    for dir in dirs {
-        safe_create_dir_all(target_dir, &dir)
-            .with_context(|| format!("create dir {}", dir.display()))?;
+
+    // Validate every path and create parent directories only when we are
+    // materializing the working tree. rcgit calls this with no target dir to
+    // build only a local blob pack.
+    if let Some(target_dir) = target_dir {
+        for entry in manifest.files.iter() {
+            validate_relative_path(path_from_bytes(&entry.path)).with_context(|| {
+                format!(
+                    "invalid manifest path: {}",
+                    String::from_utf8_lossy(&entry.path)
+                )
+            })?;
+        }
+        let dirs: HashSet<PathBuf> = manifest
+            .files
+            .iter()
+            .filter_map(|e| {
+                let p = path_from_bytes(&e.path);
+                let parent = p.parent()?;
+                if parent.as_os_str().is_empty() {
+                    return None;
+                }
+                Some(parent.to_path_buf())
+            })
+            .collect();
+        let mut dirs: Vec<_> = dirs.into_iter().collect();
+        dirs.sort();
+        for dir in dirs {
+            safe_create_dir_all(target_dir, &dir)
+                .with_context(|| format!("create dir {}", dir.display()))?;
+        }
     }
 
-    let target_dir = target_dir.to_path_buf();
+    let target_dir = target_dir.map(Path::to_path_buf);
     let manifest = Arc::new(manifest);
+
+    // If the caller wants a local blob pack, spawn a background builder thread.
+    // It receives (sha1, content) pairs over a bounded channel and writes them
+    // to a temp pack file, so peak memory stays bounded.
+    let expected_blob_count = git_dir.map(|_| {
+        let mut unique: HashSet<[u8; 20]> = HashSet::new();
+        for entry in manifest.files.iter() {
+            let sha1: [u8; 20] = entry
+                .blob_sha1
+                .as_slice()
+                .try_into()
+                .expect("manifest blob_sha1 must be 20 bytes");
+            unique.insert(sha1);
+        }
+        unique.len()
+    });
+    let (blob_pack_tx, blob_pack_handle): (
+        Option<crossbeam_channel::Sender<crate::blob_pack::BlobPackInput>>,
+        Option<std::thread::JoinHandle<Result<PathBuf>>>,
+    ) = if let Some(git_dir) = git_dir {
+        let expected = expected_blob_count.expect("expected count present with git_dir");
+        let (tx, handle) = crate::blob_pack::spawn_blob_pack_builder(git_dir, expected)
+            .context("spawn blob pack builder")?;
+        (Some(tx), Some(handle))
+    } else {
+        (None, None)
+    };
 
     // Group fragments by frame so each writer thread can write every file
     // slice that belongs to a given decompressed frame.
@@ -330,6 +388,7 @@ where
         let pending_files2 = pending_files.clone();
         let target_dir2 = target_dir.clone();
         let dictionary2 = dictionary.clone();
+        let blob_pack_tx2 = blob_pack_tx.clone();
         std::thread::spawn(move || {
             while let Ok((idx, res)) = compressed_rx.recv() {
                 let result: Result<usize> = (|| {
@@ -337,24 +396,25 @@ where
                     let frame = &manifest2.frames[idx];
                     // Empty frames (produced by empty files) have no compressed
                     // bytes and decompress to an empty buffer.
-                    let raw = if frame.compressed_len == 0 && frame.raw_len == 0 {
-                        Vec::new()
-                    } else {
-                        match dictionary2.as_ref() {
-                            Some(dict) => {
-                                let mut decompressor =
-                                    zstd::bulk::Decompressor::with_dictionary(dict.as_slice())
-                                        .context("create zstd decompressor with dictionary")?;
-                                decompressor
-                                    .decompress(&compressed, frame.raw_len as usize)
-                                    .with_context(|| {
-                                        format!("decompress frame {} with dictionary", idx)
-                                    })?
+                    let raw: Arc<Vec<u8>> =
+                        Arc::new(if frame.compressed_len == 0 && frame.raw_len == 0 {
+                            Vec::new()
+                        } else {
+                            match dictionary2.as_ref() {
+                                Some(dict) => {
+                                    let mut decompressor =
+                                        zstd::bulk::Decompressor::with_dictionary(dict.as_slice())
+                                            .context("create zstd decompressor with dictionary")?;
+                                    decompressor
+                                        .decompress(&compressed, frame.raw_len as usize)
+                                        .with_context(|| {
+                                            format!("decompress frame {} with dictionary", idx)
+                                        })?
+                                }
+                                None => zstd::decode_all(compressed.as_slice())
+                                    .with_context(|| format!("decompress frame {}", idx))?,
                             }
-                            None => zstd::decode_all(compressed.as_slice())
-                                .with_context(|| format!("decompress frame {}", idx))?,
-                        }
-                    };
+                        });
                     if raw.len() != frame.raw_len as usize {
                         anyhow::bail!(
                             "frame {} raw length mismatch: {} vs {}",
@@ -391,7 +451,19 @@ where
                                     String::from_utf8_lossy(&entry.path)
                                 );
                             }
-                            write_entry(&target_dir2, entry, content)?;
+                            if let Some(ref tx) = blob_pack_tx2 {
+                                let sha1 = blob_sha1_to_array(&entry.blob_sha1)?;
+                                tx.send(crate::blob_pack::BlobPackInput::FrameSlice {
+                                    sha1,
+                                    frame: Arc::clone(&raw),
+                                    offset: off,
+                                    len,
+                                })
+                                .context("blob pack builder closed")?;
+                            }
+                            if let Some(ref target_dir) = target_dir2 {
+                                write_entry(target_dir, entry, content)?;
+                            }
                             written += 1;
                         } else {
                             let mut guard = pending_files2.lock().unwrap();
@@ -417,7 +489,17 @@ where
                                         String::from_utf8_lossy(&entry.path)
                                     );
                                 }
-                                write_entry(&target_dir2, entry, &full)?;
+                                if let Some(ref target_dir) = target_dir2 {
+                                    write_entry(target_dir, entry, &full)?;
+                                }
+                                if let Some(ref tx) = blob_pack_tx2 {
+                                    let sha1 = blob_sha1_to_array(&entry.blob_sha1)?;
+                                    tx.send(crate::blob_pack::BlobPackInput::Owned {
+                                        sha1,
+                                        content: full,
+                                    })
+                                    .context("blob pack builder closed")?;
+                                }
                                 written += 1;
                             }
                         }
@@ -452,45 +534,82 @@ where
             }
         }
     }
-    if let Some(e) = error {
-        return Err(e);
+    let expected_files = if target_dir.is_some() {
+        manifest.files.len()
+    } else {
+        0
+    };
+    if files_written != expected_files && error.is_none() {
+        error = Some(anyhow::anyhow!(
+            "extractor wrote {} files but expected {}; frames={}",
+            files_written,
+            expected_files,
+            manifest.frames.len()
+        ));
     }
 
-    if files_written != manifest.files.len() {
-        anyhow::bail!(
-            "extractor wrote {} files but manifest contains {}; frames={}",
+    if error.is_none() {
+        info!(
+            "fetched/decompressed/wrote {} frames ({} chunks) and {} files in {:?} ({} fetchers, {} writers, chunk_size={})",
+            manifest.frames.len(),
+            chunks.len(),
             files_written,
-            manifest.files.len(),
-            manifest.frames.len()
+            fetch_start.elapsed(),
+            fetch_threads,
+            write_threads,
+            chunk_size,
         );
     }
 
-    info!(
-        "fetched/decompressed/wrote {} frames ({} chunks) and {} files in {:?} ({} fetchers, {} writers, chunk_size={})",
-        manifest.frames.len(),
-        chunks.len(),
-        files_written,
-        fetch_start.elapsed(),
-        fetch_threads,
-        write_threads,
-        chunk_size,
-    );
-
     let raw_total: u64 = manifest.files.iter().map(|e| e.total_len()).sum();
 
-    // Clear skip-worktree for every materialized path.
-    let clear_start = Instant::now();
-    let paths: Vec<String> = manifest
-        .files
-        .iter()
-        .map(|e| String::from_utf8_lossy(&e.path).into_owned())
-        .collect();
-    git::clear_skip_worktree_index(&target_dir, &paths)?;
-    info!(
-        "cleared skip-worktree for {} paths in {:?}",
-        paths.len(),
-        clear_start.elapsed()
-    );
+    // Clear skip-worktree for every materialized path, but only if extraction
+    // succeeded and we are materializing a working tree.
+    if error.is_none() {
+        if let Some(ref target_dir) = target_dir {
+            let clear_start = Instant::now();
+            let paths: Vec<String> = manifest
+                .files
+                .iter()
+                .map(|e| String::from_utf8_lossy(&e.path).into_owned())
+                .collect();
+            if let Err(e) = git::clear_skip_worktree_index(target_dir, &paths) {
+                error = Some(e);
+            } else {
+                info!(
+                    "cleared skip-worktree for {} paths in {:?}",
+                    paths.len(),
+                    clear_start.elapsed()
+                );
+            }
+        }
+    }
+
+    // Always shut down the pack builder so the thread does not leak, even
+    // when extraction failed.
+    drop(blob_pack_tx);
+    let pack_result: Option<Result<PathBuf>> = blob_pack_handle.map(|handle| {
+        let pack_start = Instant::now();
+        match handle.join() {
+            Ok(Ok(path)) => {
+                info!(
+                    "built and installed local blob pack at {} in {:?}",
+                    path.display(),
+                    pack_start.elapsed()
+                );
+                Ok(path)
+            }
+            Ok(Err(e)) => Err(e).context("build and install local blob pack"),
+            Err(_) => Err(anyhow::anyhow!("blob pack builder thread panicked")),
+        }
+    });
+
+    if let Some(e) = error {
+        return Err(e);
+    }
+    if let Some(Err(e)) = pack_result {
+        return Err(e);
+    }
 
     Ok(ExtractStats {
         files: files_written,
@@ -555,15 +674,15 @@ fn write_entry(target_dir: &Path, entry: &FileEntry, content: &[u8]) -> Result<(
     validate_relative_path(path)
         .with_context(|| format!("refusing to extract unsafe path: {}", path.display()))?;
 
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            safe_create_dir_all(target_dir, parent).with_context(|| {
-                format!(
-                    "create parent dir for {}",
-                    String::from_utf8_lossy(&entry.path)
-                )
-            })?;
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        safe_create_dir_all(target_dir, parent).with_context(|| {
+            format!(
+                "create parent dir for {}",
+                String::from_utf8_lossy(&entry.path)
+            )
+        })?;
     }
 
     let target = target_dir.join(path);
@@ -654,6 +773,14 @@ mod tests {
         Sha1::digest(data).into()
     }
 
+    fn git_blob_hash(content: &[u8]) -> [u8; 20] {
+        let header = format!("blob {}\0", content.len());
+        let mut data = Vec::with_capacity(header.len() + content.len());
+        data.extend_from_slice(header.as_bytes());
+        data.extend_from_slice(content);
+        sha1_bytes(&data)
+    }
+
     fn empty_manifest() -> MetadataChunk {
         MetadataChunk::new()
     }
@@ -679,12 +806,19 @@ mod tests {
             let mut f = File::create(&manifest_path)?;
             manifest.write(&mut f)?;
         }
-        extract_archive_with_chunk_fetcher(&manifest_path, target, None, u64::MAX, move |chunk| {
-            archive_chunks
-                .get(chunk.chunk_index)
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("missing chunk {}", chunk.chunk_index))
-        })
+        extract_archive_with_chunk_fetcher(
+            &manifest_path,
+            Some(target),
+            None,
+            None,
+            u64::MAX,
+            move |chunk| {
+                archive_chunks
+                    .get(chunk.chunk_index)
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("missing chunk {}", chunk.chunk_index))
+            },
+        )
     }
 
     #[test]
@@ -865,6 +999,128 @@ mod tests {
         assert!(extract_manifest(&manifest, &target, vec![vec![]]).is_err());
         assert!(!target.join("setuid.txt").exists());
     }
+
+    #[test]
+    fn rejects_malformed_blob_sha1() {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("out");
+        std::fs::create_dir(&target).unwrap();
+
+        let mut bad_sha1 = sha1_bytes(b"").to_vec();
+        bad_sha1.truncate(19);
+
+        let mut manifest = empty_manifest();
+        manifest.files.push(FileEntry {
+            path: b"bad.txt".to_vec(),
+            mode: 0o100644,
+            blob_sha1: bad_sha1,
+            fragments: vec![Fragment {
+                frame_index: 0,
+                frame_offset: 0,
+                raw_len: 0,
+            }],
+        });
+        manifest.frames.push(FrameInfo {
+            chunk_index: 0,
+            chunk_offset: 0,
+            compressed_len: 0,
+            raw_len: 0,
+        });
+
+        let err = extract_manifest(&manifest, &target, vec![vec![]])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("invalid blob_sha1 for bad.txt"),
+            "expected malformed blob_sha1 error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn archive_extract_builds_blob_pack() {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("out");
+        std::fs::create_dir(&target).unwrap();
+        init_git_dir(&target);
+
+        let data_a = b"hello blob pack";
+        let data_b = b"second file";
+        let mut manifest = empty_manifest();
+        manifest.files.push(FileEntry {
+            path: b"a.txt".to_vec(),
+            mode: 0o100644,
+            blob_sha1: sha1_bytes(data_a).to_vec(),
+            fragments: vec![Fragment {
+                frame_index: 0,
+                frame_offset: 0,
+                raw_len: data_a.len() as u32,
+            }],
+        });
+        manifest.files.push(FileEntry {
+            path: b"b.txt".to_vec(),
+            mode: 0o100644,
+            blob_sha1: sha1_bytes(data_b).to_vec(),
+            fragments: vec![Fragment {
+                frame_index: 0,
+                frame_offset: data_a.len() as u32,
+                raw_len: data_b.len() as u32,
+            }],
+        });
+
+        let mut raw_frame = Vec::new();
+        raw_frame.extend_from_slice(data_a);
+        raw_frame.extend_from_slice(data_b);
+        let compressed = zstd::encode_all(raw_frame.as_slice(), 1).unwrap();
+        manifest.frames.push(FrameInfo {
+            chunk_index: 0,
+            chunk_offset: 0,
+            compressed_len: compressed.len() as u32,
+            raw_len: raw_frame.len() as u32,
+        });
+
+        let manifest_path = target.join("manifest.pb");
+        {
+            let mut f = File::create(&manifest_path).unwrap();
+            manifest.write(&mut f).unwrap();
+        }
+
+        extract_archive_with_chunk_fetcher(
+            &manifest_path,
+            Some(&target),
+            Some(&target.join(".git")),
+            None,
+            u64::MAX,
+            move |_chunk| Ok(compressed.clone()),
+        )
+        .unwrap();
+
+        let pack_dir = target.join(".git").join("objects").join("pack");
+        let packs: Vec<_> = std::fs::read_dir(&pack_dir)
+            .unwrap()
+            .filter_map(|e| {
+                let p = e.ok()?.path();
+                if p.extension()? == "pack" {
+                    Some(p)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(packs.len(), 1, "expected one blob pack");
+
+        // Verify git can read both blobs.
+        for data in [data_a.as_slice(), data_b.as_slice()] {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&target)
+                .args(["cat-file", "blob", &hex::encode(git_blob_hash(data))])
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git cat-file failed: {:?}", output);
+            assert_eq!(output.stdout, data);
+        }
+    }
 }
 
 /// Default compressed chunk size for streaming extractions. A chunk contains
@@ -888,9 +1144,13 @@ const DEFAULT_LOCAL_CHUNK_SIZE: u64 = 2 * 1024 * 1024;
 /// `manifest_path` must point to a protobuf `MetadataChunk`. The chunk index in
 /// each received message must match `FrameInfo.chunk_index` for the frames in
 /// that chunk.
+///
+/// If `git_dir` is `Some`, every verified blob is also collected and written
+/// into `.git/objects/pack` as a locally-built packfile.
 pub fn extract_archive_from_chunk_receiver(
     manifest_path: &Path,
-    target_dir: &Path,
+    target_dir: Option<&Path>,
+    git_dir: Option<&Path>,
     dictionary: Option<&[u8]>,
     chunk_rx: Receiver<(usize, Result<Vec<u8>>)>,
 ) -> Result<ExtractStats> {
@@ -904,37 +1164,75 @@ pub fn extract_archive_from_chunk_receiver(
         .context("read manifest")?;
     let manifest = Manifest::read(&mut manifest_bytes.as_slice())?;
 
-    // Validate every path before creating any directories, then create parents
-    // safely (refusing symlinks and parent-dir escapes).
+    // Validate every blob_sha1 length up front so downstream code can rely on
+    // a fixed 20-byte representation.
     for entry in manifest.files.iter() {
-        validate_relative_path(path_from_bytes(&entry.path)).with_context(|| {
+        blob_sha1_to_array(&entry.blob_sha1).with_context(|| {
             format!(
-                "invalid manifest path: {}",
+                "invalid blob_sha1 for {}",
                 String::from_utf8_lossy(&entry.path)
             )
         })?;
     }
-    let dirs: HashSet<PathBuf> = manifest
-        .files
-        .iter()
-        .filter_map(|e| {
-            let p = path_from_bytes(&e.path);
-            let parent = p.parent()?;
-            if parent.as_os_str().is_empty() {
-                return None;
-            }
-            Some(parent.to_path_buf())
-        })
-        .collect();
-    let mut dirs: Vec<_> = dirs.into_iter().collect();
-    dirs.sort();
-    for dir in dirs {
-        safe_create_dir_all(target_dir, &dir)
-            .with_context(|| format!("create dir {}", dir.display()))?;
+
+    // Validate every path and create parent directories only when we are
+    // materializing the working tree. rcgit calls this with no target dir to
+    // build only a local blob pack.
+    if let Some(target_dir) = target_dir {
+        for entry in manifest.files.iter() {
+            validate_relative_path(path_from_bytes(&entry.path)).with_context(|| {
+                format!(
+                    "invalid manifest path: {}",
+                    String::from_utf8_lossy(&entry.path)
+                )
+            })?;
+        }
+        let dirs: HashSet<PathBuf> = manifest
+            .files
+            .iter()
+            .filter_map(|e| {
+                let p = path_from_bytes(&e.path);
+                let parent = p.parent()?;
+                if parent.as_os_str().is_empty() {
+                    return None;
+                }
+                Some(parent.to_path_buf())
+            })
+            .collect();
+        let mut dirs: Vec<_> = dirs.into_iter().collect();
+        dirs.sort();
+        for dir in dirs {
+            safe_create_dir_all(target_dir, &dir)
+                .with_context(|| format!("create dir {}", dir.display()))?;
+        }
     }
 
-    let target_dir = target_dir.to_path_buf();
+    let target_dir = target_dir.map(Path::to_path_buf);
     let manifest = Arc::new(manifest);
+
+    let expected_blob_count = git_dir.map(|_| {
+        let mut unique: HashSet<[u8; 20]> = HashSet::new();
+        for entry in manifest.files.iter() {
+            let sha1: [u8; 20] = entry
+                .blob_sha1
+                .as_slice()
+                .try_into()
+                .expect("manifest blob_sha1 must be 20 bytes");
+            unique.insert(sha1);
+        }
+        unique.len()
+    });
+    let (blob_pack_tx, blob_pack_handle): (
+        Option<crossbeam_channel::Sender<crate::blob_pack::BlobPackInput>>,
+        Option<std::thread::JoinHandle<Result<PathBuf>>>,
+    ) = if let Some(git_dir) = git_dir {
+        let expected = expected_blob_count.expect("expected count present with git_dir");
+        let (tx, handle) = crate::blob_pack::spawn_blob_pack_builder(git_dir, expected)
+            .context("spawn blob pack builder")?;
+        (Some(tx), Some(handle))
+    } else {
+        (None, None)
+    };
 
     let fragments_by_frame = Arc::new(manifest.fragments_by_frame());
 
@@ -1060,29 +1358,31 @@ pub fn extract_archive_from_chunk_receiver(
         let pending_files2 = pending_files.clone();
         let target_dir2 = target_dir.clone();
         let dictionary2 = dictionary.clone();
+        let blob_pack_tx2 = blob_pack_tx.clone();
         std::thread::spawn(move || {
             while let Ok((idx, res)) = compressed_rx.recv() {
                 let result: Result<usize> = (|| {
                     let compressed = res?;
                     let frame = &manifest2.frames[idx];
-                    let raw = if frame.compressed_len == 0 && frame.raw_len == 0 {
-                        Vec::new()
-                    } else {
-                        match dictionary2.as_ref() {
-                            Some(dict) => {
-                                let mut decompressor =
-                                    zstd::bulk::Decompressor::with_dictionary(dict.as_slice())
-                                        .context("create zstd decompressor with dictionary")?;
-                                decompressor
-                                    .decompress(&compressed, frame.raw_len as usize)
-                                    .with_context(|| {
-                                        format!("decompress frame {} with dictionary", idx)
-                                    })?
+                    let raw: Arc<Vec<u8>> =
+                        Arc::new(if frame.compressed_len == 0 && frame.raw_len == 0 {
+                            Vec::new()
+                        } else {
+                            match dictionary2.as_ref() {
+                                Some(dict) => {
+                                    let mut decompressor =
+                                        zstd::bulk::Decompressor::with_dictionary(dict.as_slice())
+                                            .context("create zstd decompressor with dictionary")?;
+                                    decompressor
+                                        .decompress(&compressed, frame.raw_len as usize)
+                                        .with_context(|| {
+                                            format!("decompress frame {} with dictionary", idx)
+                                        })?
+                                }
+                                None => zstd::decode_all(compressed.as_slice())
+                                    .with_context(|| format!("decompress frame {}", idx))?,
                             }
-                            None => zstd::decode_all(compressed.as_slice())
-                                .with_context(|| format!("decompress frame {}", idx))?,
-                        }
-                    };
+                        });
                     if raw.len() != frame.raw_len as usize {
                         anyhow::bail!(
                             "frame {} raw length mismatch: {} vs {}",
@@ -1119,7 +1419,19 @@ pub fn extract_archive_from_chunk_receiver(
                                     String::from_utf8_lossy(&entry.path)
                                 );
                             }
-                            write_entry(&target_dir2, entry, content)?;
+                            if let Some(ref tx) = blob_pack_tx2 {
+                                let sha1 = blob_sha1_to_array(&entry.blob_sha1)?;
+                                tx.send(crate::blob_pack::BlobPackInput::FrameSlice {
+                                    sha1,
+                                    frame: Arc::clone(&raw),
+                                    offset: off,
+                                    len,
+                                })
+                                .context("blob pack builder closed")?;
+                            }
+                            if let Some(ref target_dir) = target_dir2 {
+                                write_entry(target_dir, entry, content)?;
+                            }
                             written += 1;
                         } else {
                             let mut guard = pending_files2.lock().unwrap();
@@ -1145,7 +1457,17 @@ pub fn extract_archive_from_chunk_receiver(
                                         String::from_utf8_lossy(&entry.path)
                                     );
                                 }
-                                write_entry(&target_dir2, entry, &full)?;
+                                if let Some(ref target_dir) = target_dir2 {
+                                    write_entry(target_dir, entry, &full)?;
+                                }
+                                if let Some(ref tx) = blob_pack_tx2 {
+                                    let sha1 = blob_sha1_to_array(&entry.blob_sha1)?;
+                                    tx.send(crate::blob_pack::BlobPackInput::Owned {
+                                        sha1,
+                                        content: full,
+                                    })
+                                    .context("blob pack builder closed")?;
+                                }
                                 written += 1;
                             }
                         }
@@ -1174,43 +1496,76 @@ pub fn extract_archive_from_chunk_receiver(
             }
         }
     }
-    if let Some(e) = error {
-        return Err(e);
+    let expected_files = if target_dir.is_some() {
+        manifest.files.len()
+    } else {
+        0
+    };
+    if files_written != expected_files && error.is_none() {
+        error = Some(anyhow::anyhow!(
+            "extractor wrote {} files but expected {}; frames={}",
+            files_written,
+            expected_files,
+            manifest.frames.len()
+        ));
     }
 
-    if files_written != manifest.files.len() {
-        anyhow::bail!(
-            "extractor wrote {} files but manifest contains {}; frames={}",
+    if error.is_none() {
+        info!(
+            "fetched/decompressed/wrote {} frames and {} files in {:?} ({} fetchers, {} writers)",
+            manifest.frames.len(),
             files_written,
-            manifest.files.len(),
-            manifest.frames.len()
+            fetch_start.elapsed(),
+            fetch_threads,
+            write_threads,
         );
     }
 
-    info!(
-        "fetched/decompressed/wrote {} frames and {} files in {:?} ({} fetchers, {} writers)",
-        manifest.frames.len(),
-        files_written,
-        fetch_start.elapsed(),
-        fetch_threads,
-        write_threads,
-    );
-
     let raw_total: u64 = manifest.files.iter().map(|e| e.total_len()).sum();
 
-    // Clear skip-worktree for every materialized path.
-    let clear_start = Instant::now();
-    let paths: Vec<String> = manifest
-        .files
-        .iter()
-        .map(|e| String::from_utf8_lossy(&e.path).into_owned())
-        .collect();
-    git::clear_skip_worktree_index(&target_dir, &paths)?;
-    info!(
-        "cleared skip-worktree for {} paths in {:?}",
-        paths.len(),
-        clear_start.elapsed()
-    );
+    if error.is_none() {
+        if let Some(ref target_dir) = target_dir {
+            let clear_start = Instant::now();
+            let paths: Vec<String> = manifest
+                .files
+                .iter()
+                .map(|e| String::from_utf8_lossy(&e.path).into_owned())
+                .collect();
+            if let Err(e) = git::clear_skip_worktree_index(target_dir, &paths) {
+                error = Some(e);
+            } else {
+                info!(
+                    "cleared skip-worktree for {} paths in {:?}",
+                    paths.len(),
+                    clear_start.elapsed()
+                );
+            }
+        }
+    }
+
+    drop(blob_pack_tx);
+    let pack_result: Option<Result<PathBuf>> = blob_pack_handle.map(|handle| {
+        let pack_start = Instant::now();
+        match handle.join() {
+            Ok(Ok(path)) => {
+                info!(
+                    "built and installed local blob pack at {} in {:?}",
+                    path.display(),
+                    pack_start.elapsed()
+                );
+                Ok(path)
+            }
+            Ok(Err(e)) => Err(e).context("build and install local blob pack"),
+            Err(_) => Err(anyhow::anyhow!("blob pack builder thread panicked")),
+        }
+    });
+
+    if let Some(e) = error {
+        return Err(e);
+    }
+    if let Some(Err(e)) = pack_result {
+        return Err(e);
+    }
 
     Ok(ExtractStats {
         files: files_written,
@@ -1222,9 +1577,13 @@ pub fn extract_archive_from_chunk_receiver(
 /// This is the streaming/parallel client path: the archive is never loaded into
 /// memory as a single object. Consecutive frames are coalesced into chunks to
 /// reduce the number of round-trips.
+///
+/// If `git_dir` is `Some`, every verified blob is also written into
+/// `.git/objects/pack` as a locally-built packfile.
 pub fn extract_archive_streaming(
     manifest_path: &Path,
     target_dir: &Path,
+    git_dir: Option<&Path>,
     dictionary: Option<&[u8]>,
     archive_hash: &str,
     server: &str,
@@ -1245,7 +1604,8 @@ pub fn extract_archive_streaming(
 
     extract_archive_with_chunk_fetcher(
         manifest_path,
-        target_dir,
+        Some(target_dir),
+        git_dir,
         dictionary,
         chunk_size,
         move |chunk: &Chunk| {
@@ -1303,11 +1663,15 @@ pub fn extract_archive_streaming(
 /// `signed_chunk_urls` may be omitted or may contain one entry per archive
 /// chunk hash. A `Some(url)` entry is fetched directly; `None` falls back to
 /// the gateway's `/v1/artifacts/{hash}` endpoint.
+///
+/// If `git_dir` is `Some`, every verified blob is also written into
+/// `.git/objects/pack` as a locally-built packfile.
 pub fn extract_clonepack_streaming(
     manifest_path: &Path,
     archive_chunk_hashes: &[String],
     signed_chunk_urls: Option<Vec<Option<String>>>,
     target_dir: &Path,
+    git_dir: Option<&Path>,
     dictionary: Option<&[u8]>,
     server: &str,
     token: Option<&str>,
@@ -1323,7 +1687,8 @@ pub fn extract_clonepack_streaming(
 
     extract_archive_with_chunk_fetcher(
         manifest_path,
-        target_dir,
+        Some(target_dir),
+        git_dir,
         dictionary,
         u64::MAX,
         move |chunk: &Chunk| {

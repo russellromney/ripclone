@@ -112,6 +112,8 @@ impl RateLimiter {
 #[derive(Deserialize)]
 pub struct SyncRequest {
     pub depth: Option<usize>,
+    #[serde(default = "default_branch_value")]
+    pub branch: String,
 }
 
 #[derive(Deserialize)]
@@ -295,10 +297,29 @@ pub struct SnapshotResponse {
     pub hot_files: usize,
 }
 
+#[derive(Serialize, Deserialize)]
+pub struct RepoStatusResponse {
+    pub owner: String,
+    pub repo: String,
+    pub refs: Vec<BranchStatusEntry>,
+    pub total_bytes: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct BranchStatusEntry {
+    pub branch: String,
+    pub commit: String,
+    pub manifest: String,
+    pub bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub built_at: Option<String>,
+}
+
 pub fn build_app(state: ServerState) -> Router {
     let protected = Router::new()
         .route("/v1/repos/{owner}/{repo}/refs/{branch}", get(get_ref))
         .route("/v1/repos/{owner}/{repo}/sync", post(sync_repo))
+        .route("/v1/repos/{owner}/{repo}/status", get(repo_status))
         .route("/v1/repos/{owner}/{repo}/cat", get(cat_file))
         .route("/v1/repos/{owner}/{repo}/sizes", get(file_sizes))
         .route("/v1/repos/{owner}/{repo}/snapshot", post(create_snapshot))
@@ -390,18 +411,16 @@ fn check_auth_header(header: &str, expected: &str) -> bool {
     if let Some(token) = header.strip_prefix("Ripclone ") {
         return constant_time_eq_str(token, expected);
     }
-    if let Some(credentials) = header.strip_prefix("Basic ") {
-        if let Ok(decoded) =
+    if let Some(credentials) = header.strip_prefix("Basic ")
+        && let Ok(decoded) =
             base64::Engine::decode(&base64::engine::general_purpose::STANDARD, credentials)
-        {
-            if let Ok(decoded) = String::from_utf8(decoded) {
-                // Accept "<username>:<password>"; compare the password to the
-                // expected hash so vanilla git can use
-                // http://user:<hash>@host/... URLs.
-                if let Some((_, password)) = decoded.split_once(':') {
-                    return constant_time_eq_str(password, expected);
-                }
-            }
+        && let Ok(decoded) = String::from_utf8(decoded)
+    {
+        // Accept "<username>:<password>"; compare the password to the
+        // expected hash so vanilla git can use
+        // http://user:<hash>@host/... URLs.
+        if let Some((_, password)) = decoded.split_once(':') {
+            return constant_time_eq_str(password, expected);
         }
     }
     false
@@ -716,8 +735,13 @@ async fn get_ref(
     }
     drop(_guard);
 
-    // Load the stored HEAD info for this repo, if any.
-    let fallback = state.ref_store.load(&owner, &repo).await.ok().flatten();
+    // Load the stored info for this branch, if any.
+    let fallback = state
+        .ref_store
+        .load_branch(&owner, &repo, &branch)
+        .await
+        .ok()
+        .flatten();
 
     let branch2 = branch.clone();
     let mirror_dir2 = mirror_dir.clone();
@@ -863,6 +887,88 @@ fn signed_url(storage: &crate::storage::StorageRef, hash: &str) -> Option<String
     storage.signed_url(hash, REF_SIGNED_URL_TTL)
 }
 
+async fn repo_status(
+    Path((owner, repo)): Path<(String, String)>,
+    State(state): State<ServerState>,
+) -> impl IntoResponse {
+    if let Some(resp) = reject_invalid_repo_ids(&owner, &repo) {
+        return resp;
+    }
+    match build_repo_status(&state, &owner, &repo).await {
+        Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
+        Err(e) => {
+            state.metrics.record_error();
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("status failed: {}", e),
+                }),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn build_repo_status(
+    state: &ServerState,
+    owner: &str,
+    repo: &str,
+) -> Result<RepoStatusResponse> {
+    let branches = state.ref_store.list_branches(owner, repo).await?;
+    let mut refs = Vec::new();
+    let mut unique_chunks: HashMap<String, u64> = HashMap::new();
+
+    for branch in branches {
+        let Some(info) = state.ref_store.load_branch(owner, repo, &branch).await? else {
+            continue;
+        };
+        let manifest_hash = if info.full_clonepack.manifest.is_empty() {
+            info.clonepack_manifest.clone()
+        } else {
+            info.full_clonepack.manifest.clone()
+        };
+        if manifest_hash.is_empty() {
+            continue;
+        }
+
+        let manifest_bytes = state.cas.get(&manifest_hash)?;
+        let manifest = ClonepackManifest::decode(manifest_bytes.as_slice())
+            .context("decode clonepack manifest for status")?;
+
+        let mut ref_bytes = 0u64;
+        if let Some(meta) = manifest.metadata_chunk {
+            ref_bytes += meta.len;
+            unique_chunks.insert(hash_to_hex(&meta.hash), meta.len);
+        }
+        for chunk in manifest.archive_chunks {
+            ref_bytes += chunk.len;
+            unique_chunks.insert(hash_to_hex(&chunk.hash), chunk.len);
+        }
+
+        let built_at = info.synced_at.and_then(|secs| {
+            chrono::DateTime::from_timestamp(secs as i64, 0).map(|dt| dt.to_rfc3339())
+        });
+
+        refs.push(BranchStatusEntry {
+            branch,
+            commit: info.commit,
+            manifest: manifest_hash,
+            bytes: ref_bytes,
+            built_at,
+        });
+    }
+
+    refs.sort_by(|a, b| a.branch.cmp(&b.branch));
+    let total_bytes = unique_chunks.values().sum();
+
+    Ok(RepoStatusResponse {
+        owner: owner.to_string(),
+        repo: repo.to_string(),
+        refs,
+        total_bytes,
+    })
+}
+
 /// Target size for each chunk of the head-blobs pack on the client fetch path.
 /// 8 MB matches the archive chunk target and keeps per-request overhead low.
 const HEAD_BLOBS_CHUNK_SIZE: usize = 8 * 1024 * 1024;
@@ -890,9 +996,15 @@ async fn sync_repo(
     if let Some(resp) = reject_invalid_repo_ids(&owner, &repo) {
         return resp;
     }
+    if let Some(resp) =
+        validation::reject_if_invalid(|| validation::validate_git_rev(&params.branch))
+    {
+        return resp;
+    }
     let start = Instant::now();
     let mirror_dir = state.repo_root.join(format!("{}_{}.git", owner, repo));
     let depth = params.depth.unwrap_or(state.default_depth);
+    let branch = params.branch;
     let github_token = headers
         .get("X-GitHub-Token")
         .and_then(|v| v.to_str().ok())
@@ -910,7 +1022,7 @@ async fn sync_repo(
         &mirror_dir,
         &owner,
         &repo,
-        "HEAD",
+        &branch,
         &state.ref_store,
         depth,
         false,
@@ -922,14 +1034,7 @@ async fn sync_repo(
     {
         Ok(info) => {
             state.metrics.record_sync(start.elapsed());
-            let resp = ref_response(
-                owner,
-                repo,
-                "HEAD".to_string(),
-                &info,
-                &state.storage,
-                "full",
-            );
+            let resp = ref_response(owner, repo, branch.clone(), &info, &state.storage, "full");
             drop(_guard);
             (StatusCode::OK, Json(resp)).into_response()
         }
@@ -1295,10 +1400,10 @@ async fn batch_files(
     {
         return resp;
     }
-    if let Some(commit) = &body.commit {
-        if let Some(resp) = validation::reject_if_invalid(|| validation::validate_git_rev(commit)) {
-            return resp;
-        }
+    if let Some(commit) = &body.commit
+        && let Some(resp) = validation::reject_if_invalid(|| validation::validate_git_rev(commit))
+    {
+        return resp;
     }
     let mirror_dir = state.repo_root.join(format!("{}_{}.git", owner, repo));
     let branch = body.branch;
@@ -1652,7 +1757,7 @@ async fn do_sync(
     // it in parallel. The idx stays small and is fetched as a single object.
     let head_blobs_pack_data = cas.get(&head_blobs_pack)?;
     let head_blobs_idx_data = cas.get(&head_blobs_idx)?;
-    let head_blobs_chunk_refs = split_and_store_pack(&cas, &head_blobs_pack_data)?;
+    let head_blobs_chunk_refs = split_and_store_pack(cas, &head_blobs_pack_data)?;
 
     let archive_chunk_lengths = crate::clonepack::archive_chunk_lengths(&metadata_chunk);
     let archive_chunks: Vec<ChunkRef> = archive_chunk_hashes
@@ -1793,9 +1898,9 @@ async fn do_sync(
     let mut info = info;
     info.build_status = None;
     ref_store
-        .save(owner, repo, &info)
+        .save_branch(owner, repo, branch, &info)
         .await
-        .with_context(|| format!("persist ref store for {owner}/{repo}"))?;
+        .with_context(|| format!("persist ref store for {owner}/{repo}@{branch}"))?;
 
     info!("synced {}/{} at {}", owner, repo, &commit[..7]);
     Ok(info)
@@ -2010,6 +2115,40 @@ pub async fn run_server(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tower::util::ServiceExt;
+
+    fn test_state(tmp: &tempfile::TempDir) -> ServerState {
+        let cas_root = tmp.path().join("cas");
+        let cas = Cas::new(&cas_root).unwrap();
+        let storage = crate::storage::local(&cas_root).unwrap();
+        let repo_root = tmp.path().join("repos");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        let ref_store: Arc<dyn RefStore> = Arc::new(FileRefStore::new(&repo_root));
+        let token_hash = format!("{:x}", Sha256::digest("secret"));
+        let metrics = Metrics::new();
+        let retention = Arc::new(Retention::new(cas.clone(), metrics.clone()).unwrap());
+        let (build_queue, _build_rx) = tokio::sync::mpsc::channel::<BuildJob>(16);
+        ServerState {
+            cas,
+            storage,
+            repo_root,
+            ref_store,
+            default_depth: 1,
+            token_hash: Some(token_hash),
+            github_token: None,
+            metrics,
+            rate_limiter: RateLimiter::new(100, 100.0),
+            retention,
+            build_queue,
+            build_queue_depth: Arc::new(AtomicUsize::new(0)),
+            oidc_verifier: None,
+            sync_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn auth_header() -> String {
+        format!("Ripclone {:x}", Sha256::digest("secret"))
+    }
 
     #[test]
     fn validate_repo_id_accepts_github_identifiers() {
@@ -2111,5 +2250,209 @@ mod tests {
         assert!(resp.clonepack_manifest_url.is_none());
         assert!(resp.metadata_chunk_url.is_none());
         assert!(resp.archive_chunk_urls.is_none());
+    }
+
+    fn test_request(method: &str, uri: &str) -> axum::http::Request<Body> {
+        axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))))
+            .header("Authorization", auth_header())
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn repo_status_returns_empty_for_cold_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(&tmp);
+        let app = build_app(state);
+        let response = app
+            .oneshot(test_request("GET", "/v1/repos/acme/secret/status"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let status: RepoStatusResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(status.owner, "acme");
+        assert_eq!(status.repo, "secret");
+        assert!(status.refs.is_empty());
+        assert_eq!(status.total_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn repo_status_reports_warmed_branch_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(&tmp);
+
+        let metadata = ChunkRef {
+            hash: hash_from_hex(&"a".repeat(64)).unwrap(),
+            len: 100,
+        };
+        let archive = ChunkRef {
+            hash: hash_from_hex(&"b".repeat(64)).unwrap(),
+            len: 200,
+        };
+        let manifest = ClonepackManifest {
+            commit: "commit1".to_string(),
+            parent_commit: None,
+            default_branch: "main".to_string(),
+            metadata_chunk: Some(metadata),
+            archive_chunks: vec![archive],
+            head_blobs_idx: None,
+            head_blobs_chunks: vec![],
+            ..Default::default()
+        };
+        let manifest_data = manifest.encode_to_vec();
+        let manifest_hash = state.cas.put(&manifest_data).unwrap();
+
+        let info = RefInfo {
+            commit: "commit1".to_string(),
+            parent_commit: None,
+            default_branch: "main".to_string(),
+            skeleton_pack: String::new(),
+            skeleton_idx: String::new(),
+            head_blobs_pack: String::new(),
+            head_blobs_idx: String::new(),
+            head_blobs_chunks: vec![],
+            prebuilt_index: String::new(),
+            archive: String::new(),
+            manifest: manifest_hash.clone(),
+            full_pack: String::new(),
+            clonepack_manifest: manifest_hash.clone(),
+            metadata_chunk: "a".repeat(64),
+            archive_chunks: vec!["b".repeat(64)],
+            full_clonepack: crate::ClonepackArtifacts {
+                manifest: manifest_hash.clone(),
+                metadata_chunk: "a".repeat(64),
+                skeleton_pack: String::new(),
+                skeleton_idx: String::new(),
+                prebuilt_index: String::new(),
+            },
+            shallow_clonepack: crate::ClonepackArtifacts::default(),
+            build_status: None,
+            synced_at: Some(1_718_812_800),
+        };
+        state
+            .ref_store
+            .save_branch("acme", "secret", "main", &info)
+            .await
+            .unwrap();
+
+        let app = build_app(state);
+        let response = app
+            .oneshot(test_request("GET", "/v1/repos/acme/secret/status"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let status: RepoStatusResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(status.refs.len(), 1);
+        let branch = &status.refs[0];
+        assert_eq!(branch.branch, "main");
+        assert_eq!(branch.commit, "commit1");
+        assert_eq!(branch.manifest, manifest_hash);
+        assert_eq!(branch.bytes, 300);
+        assert!(branch.built_at.is_some());
+        assert_eq!(status.total_bytes, 300);
+    }
+
+    #[tokio::test]
+    async fn repo_status_dedups_shared_chunks_across_branches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(&tmp);
+
+        let metadata_hash = "a".repeat(64);
+        let archive_hash = "b".repeat(64);
+        let metadata = ChunkRef {
+            hash: hash_from_hex(&metadata_hash).unwrap(),
+            len: 100,
+        };
+        let archive = ChunkRef {
+            hash: hash_from_hex(&archive_hash).unwrap(),
+            len: 200,
+        };
+        let manifest = ClonepackManifest {
+            commit: "commit1".to_string(),
+            parent_commit: None,
+            default_branch: "main".to_string(),
+            metadata_chunk: Some(metadata),
+            archive_chunks: vec![archive],
+            head_blobs_idx: None,
+            head_blobs_chunks: vec![],
+            ..Default::default()
+        };
+        let manifest_data = manifest.encode_to_vec();
+        let manifest_hash = state.cas.put(&manifest_data).unwrap();
+
+        let info = RefInfo {
+            commit: "commit1".to_string(),
+            parent_commit: None,
+            default_branch: "main".to_string(),
+            skeleton_pack: String::new(),
+            skeleton_idx: String::new(),
+            head_blobs_pack: String::new(),
+            head_blobs_idx: String::new(),
+            head_blobs_chunks: vec![],
+            prebuilt_index: String::new(),
+            archive: String::new(),
+            manifest: manifest_hash.clone(),
+            full_pack: String::new(),
+            clonepack_manifest: manifest_hash.clone(),
+            metadata_chunk: metadata_hash.clone(),
+            archive_chunks: vec![archive_hash.clone()],
+            full_clonepack: crate::ClonepackArtifacts {
+                manifest: manifest_hash.clone(),
+                metadata_chunk: metadata_hash.clone(),
+                skeleton_pack: String::new(),
+                skeleton_idx: String::new(),
+                prebuilt_index: String::new(),
+            },
+            shallow_clonepack: crate::ClonepackArtifacts::default(),
+            build_status: None,
+            synced_at: None,
+        };
+        state
+            .ref_store
+            .save_branch("acme", "secret", "main", &info)
+            .await
+            .unwrap();
+        state
+            .ref_store
+            .save_branch("acme", "secret", "develop", &info)
+            .await
+            .unwrap();
+
+        let app = build_app(state);
+        let response = app
+            .oneshot(test_request("GET", "/v1/repos/acme/secret/status"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let status: RepoStatusResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(status.refs.len(), 2);
+        assert_eq!(status.total_bytes, 300);
+    }
+
+    #[tokio::test]
+    async fn sync_rejects_invalid_branch_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(&tmp);
+        let app = build_app(state);
+        let response = app
+            .oneshot(test_request(
+                "POST",
+                "/v1/repos/acme/secret/sync?branch=../evil",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }

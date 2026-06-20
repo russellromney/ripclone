@@ -9,6 +9,22 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
+/// Encode a branch name so it is safe to use in a filesystem path or S3 key.
+fn branch_slug(branch: &str) -> String {
+    base64::Engine::encode(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+        branch.as_bytes(),
+    )
+}
+
+/// Decode a branch slug back into the original branch name.
+fn unbranch_slug(slug: &str) -> Option<String> {
+    String::from_utf8(
+        base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, slug).ok()?,
+    )
+    .ok()
+}
+
 /// Abstract store for repo → `RefInfo` mappings.
 ///
 /// Implementations are expected to be shared across multiple ripclone backend
@@ -24,6 +40,21 @@ pub trait RefStore: Send + Sync {
 
     /// List all repos that have a stored `RefInfo`.
     async fn list(&self) -> Result<Vec<(String, String)>>;
+
+    /// Load the `RefInfo` for a specific branch.
+    async fn load_branch(&self, owner: &str, repo: &str, branch: &str) -> Result<Option<RefInfo>>;
+
+    /// Save the `RefInfo` for a specific branch.
+    async fn save_branch(
+        &self,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+        info: &RefInfo,
+    ) -> Result<()>;
+
+    /// List all branches that have a stored `RefInfo` for this repo.
+    async fn list_branches(&self, owner: &str, repo: &str) -> Result<Vec<String>>;
 }
 
 /// Local filesystem-backed ref store. One JSON file per repo.
@@ -40,8 +71,19 @@ impl FileRefStore {
         Self { root }
     }
 
+    /// Path to the legacy HEAD ref file. Kept for backward compatibility with
+    /// refs created before branch-specific storage.
     fn path(&self, owner: &str, repo: &str) -> PathBuf {
         self.root.join(owner).join(format!("{}.json", repo))
+    }
+
+    fn branch_dir(&self, owner: &str, repo: &str) -> PathBuf {
+        self.root.join(owner).join(repo)
+    }
+
+    fn branch_path(&self, owner: &str, repo: &str, branch: &str) -> PathBuf {
+        self.branch_dir(owner, repo)
+            .join(format!("{}.json", branch_slug(branch)))
     }
 }
 
@@ -90,15 +132,87 @@ impl RefStore for FileRefStore {
             let owner = entry.file_name().to_string_lossy().to_string();
             let mut repos = tokio::fs::read_dir(entry.path()).await?;
             while let Some(repo_entry) = repos.next_entry().await? {
-                if !repo_entry.file_type().await?.is_file() {
-                    continue;
-                }
+                let ft = repo_entry.file_type().await?;
                 let name = repo_entry.file_name().to_string_lossy().to_string();
-                if let Some(repo) = name.strip_suffix(".json") {
-                    out.push((owner.clone(), repo.to_string()));
+                if ft.is_file() {
+                    // Legacy HEAD ref: {owner}/{repo}.json
+                    if let Some(repo) = name.strip_suffix(".json") {
+                        out.push((owner.clone(), repo.to_string()));
+                    }
+                } else if ft.is_dir() {
+                    // Branch-specific refs: {owner}/{repo}/{branch_slug}.json
+                    out.push((owner.clone(), name));
                 }
             }
         }
+        Ok(out)
+    }
+
+    async fn load_branch(&self, owner: &str, repo: &str, branch: &str) -> Result<Option<RefInfo>> {
+        if branch == "HEAD" {
+            return self.load(owner, repo).await;
+        }
+        let path = self.branch_path(owner, repo, branch);
+        match tokio::fs::read(&path).await {
+            Ok(data) => {
+                let info = serde_json::from_slice(&data)
+                    .with_context(|| format!("parse ref store {}", path.display()))?;
+                Ok(Some(info))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(anyhow::anyhow!("read ref store {}: {}", path.display(), e)),
+        }
+    }
+
+    async fn save_branch(
+        &self,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+        info: &RefInfo,
+    ) -> Result<()> {
+        if branch == "HEAD" {
+            return self.save(owner, repo, info).await;
+        }
+        let path = self.branch_path(owner, repo, branch);
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .with_context(|| format!("create ref store dir {}", parent.display()))?;
+        }
+        let data = serde_json::to_vec_pretty(info).context("serialize RefInfo")?;
+        let tmp_path = path.with_extension("json.tmp");
+        tokio::fs::write(&tmp_path, data)
+            .await
+            .with_context(|| format!("write temp ref store {}", tmp_path.display()))?;
+        tokio::fs::rename(&tmp_path, &path)
+            .await
+            .with_context(|| format!("rename {} to {}", tmp_path.display(), path.display()))?;
+        Ok(())
+    }
+
+    async fn list_branches(&self, owner: &str, repo: &str) -> Result<Vec<String>> {
+        let mut out = Vec::new();
+        if self.path(owner, repo).exists() {
+            out.push("HEAD".to_string());
+        }
+        let dir = self.branch_dir(owner, repo);
+        if dir.exists() {
+            let mut entries = tokio::fs::read_dir(&dir).await?;
+            while let Some(entry) = entries.next_entry().await? {
+                if !entry.file_type().await?.is_file() {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().to_string();
+                if let Some(slug) = name.strip_suffix(".json")
+                    && let Some(branch) = unbranch_slug(slug)
+                {
+                    out.push(branch);
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
         Ok(out)
     }
 }
@@ -116,6 +230,14 @@ impl S3RefStore {
 
     fn key(&self, owner: &str, repo: &str) -> String {
         format!("refs/{owner}/{repo}.json")
+    }
+
+    fn branch_key(&self, owner: &str, repo: &str, branch: &str) -> String {
+        format!("refs/{owner}/{repo}/{}.json", branch_slug(branch))
+    }
+
+    fn branch_prefix(&self, owner: &str, repo: &str) -> String {
+        format!("refs/{owner}/{repo}/")
     }
 }
 
@@ -186,19 +308,90 @@ impl RefStore for S3RefStore {
             .list_objects(prefix)
             .await
             .context("list S3 ref store")?;
+        let mut seen = std::collections::HashSet::new();
         let mut out = Vec::new();
         for key in keys {
             let Some(rest) = key.strip_prefix(prefix) else {
                 continue;
             };
-            let Some((owner, repo_file)) = rest.split_once('/') else {
+            let Some((owner, tail)) = rest.split_once('/') else {
                 continue;
             };
-            let Some(repo) = repo_file.strip_suffix(".json") else {
+            let repo = if let Some(repo_file) = tail.strip_suffix(".json") {
+                // Legacy HEAD key: refs/{owner}/{repo}.json
+                repo_file.to_string()
+            } else if let Some((repo, _branch_file)) = tail.split_once('/') {
+                // Branch key: refs/{owner}/{repo}/{branch_slug}.json
+                repo.to_string()
+            } else {
                 continue;
             };
-            out.push((owner.to_string(), repo.to_string()));
+            if seen.insert((owner.to_string(), repo.clone())) {
+                out.push((owner.to_string(), repo));
+            }
         }
+        Ok(out)
+    }
+
+    async fn load_branch(&self, owner: &str, repo: &str, branch: &str) -> Result<Option<RefInfo>> {
+        if branch == "HEAD" {
+            return self.load(owner, repo).await;
+        }
+        let key = self.branch_key(owner, repo, branch);
+        match self.storage.get_object(&key).await {
+            Ok(Some((_, data))) => {
+                let info = serde_json::from_slice(&data)
+                    .with_context(|| format!("parse S3 ref store {key}"))?;
+                Ok(Some(info))
+            }
+            Ok(None) => Ok(None),
+            Err(e) => Err(e).with_context(|| format!("load S3 ref store {key}")),
+        }
+    }
+
+    async fn save_branch(
+        &self,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+        info: &RefInfo,
+    ) -> Result<()> {
+        if branch == "HEAD" {
+            return self.save(owner, repo, info).await;
+        }
+        let key = self.branch_key(owner, repo, branch);
+        let data = serde_json::to_vec_pretty(info).context("serialize RefInfo")?;
+        self.storage
+            .put_object(&key, &data, None)
+            .await
+            .with_context(|| format!("write S3 ref store {key}"))?;
+        Ok(())
+    }
+
+    async fn list_branches(&self, owner: &str, repo: &str) -> Result<Vec<String>> {
+        let mut out = Vec::new();
+        if self.load(owner, repo).await?.is_some() {
+            out.push("HEAD".to_string());
+        }
+        let prefix = self.branch_prefix(owner, repo);
+        let keys = self
+            .storage
+            .list_objects(&prefix)
+            .await
+            .context("list S3 ref store branches")?;
+        for key in keys {
+            let Some(file) = key.strip_prefix(&prefix) else {
+                continue;
+            };
+            let Some(slug) = file.strip_suffix(".json") else {
+                continue;
+            };
+            if let Some(branch) = unbranch_slug(slug) {
+                out.push(branch);
+            }
+        }
+        out.sort();
+        out.dedup();
         Ok(out)
     }
 }
@@ -207,7 +400,7 @@ impl RefStore for S3RefStore {
 pub struct CachingRefStore<T: RefStore> {
     inner: T,
     ttl: Duration,
-    cache: RwLock<HashMap<(String, String), (Instant, RefInfo)>>,
+    cache: RwLock<HashMap<(String, String, String), (Instant, RefInfo)>>,
 }
 
 impl<T: RefStore> CachingRefStore<T> {
@@ -223,38 +416,58 @@ impl<T: RefStore> CachingRefStore<T> {
             cache: RwLock::new(HashMap::new()),
         }
     }
+
+    fn cache_key(owner: &str, repo: &str, branch: &str) -> (String, String, String) {
+        (owner.to_string(), repo.to_string(), branch.to_string())
+    }
 }
 
 #[async_trait]
 impl<T: RefStore> RefStore for CachingRefStore<T> {
     async fn load(&self, owner: &str, repo: &str) -> Result<Option<RefInfo>> {
-        let key = (owner.to_string(), repo.to_string());
+        self.load_branch(owner, repo, "HEAD").await
+    }
+
+    async fn save(&self, owner: &str, repo: &str, info: &RefInfo) -> Result<()> {
+        self.save_branch(owner, repo, "HEAD", info).await
+    }
+
+    async fn list(&self) -> Result<Vec<(String, String)>> {
+        self.inner.list().await
+    }
+
+    async fn load_branch(&self, owner: &str, repo: &str, branch: &str) -> Result<Option<RefInfo>> {
+        let key = Self::cache_key(owner, repo, branch);
         let mut cache = self.cache.write().await;
-        if let Some((ts, info)) = cache.get(&key) {
-            if ts.elapsed() < self.ttl {
-                return Ok(Some(info.clone()));
-            }
+        if let Some((ts, info)) = cache.get(&key)
+            && ts.elapsed() < self.ttl
+        {
+            return Ok(Some(info.clone()));
         }
 
-        let info = self.inner.load(owner, repo).await?;
+        let info = self.inner.load_branch(owner, repo, branch).await?;
         if let Some(info) = &info {
             cache.insert(key, (Instant::now(), info.clone()));
         }
         Ok(info)
     }
 
-    async fn save(&self, owner: &str, repo: &str, info: &RefInfo) -> Result<()> {
-        // Hold the cache lock across the persist so a concurrent load cannot
-        // observe a stale value after the write completes.
+    async fn save_branch(
+        &self,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+        info: &RefInfo,
+    ) -> Result<()> {
+        let key = Self::cache_key(owner, repo, branch);
         let mut cache = self.cache.write().await;
-        self.inner.save(owner, repo, info).await?;
-        let key = (owner.to_string(), repo.to_string());
+        self.inner.save_branch(owner, repo, branch, info).await?;
         cache.insert(key, (Instant::now(), info.clone()));
         Ok(())
     }
 
-    async fn list(&self) -> Result<Vec<(String, String)>> {
-        self.inner.list().await
+    async fn list_branches(&self, owner: &str, repo: &str) -> Result<Vec<String>> {
+        self.inner.list_branches(owner, repo).await
     }
 }
 
@@ -280,20 +493,20 @@ pub async fn migrate_legacy_refs(store: &dyn RefStore, legacy_path: &Path) -> Re
         if !key.ends_with("/HEAD") {
             continue;
         }
-        if let Some((owner_repo, _branch)) = key.rsplit_once('/') {
-            if let Some((owner, repo)) = owner_repo.split_once('/') {
-                // Only save if the repo doesn't already have a stored ref.
-                match store.load(owner, repo).await {
-                    Ok(None) => {
-                        store.save(owner, repo, &info).await?;
-                        migrated += 1;
-                    }
-                    Ok(Some(_)) => {
-                        info!("ref store already has {owner}/{repo}; skipping legacy entry");
-                    }
-                    Err(e) => {
-                        warn!("failed to check ref store for {owner}/{repo}: {e}");
-                    }
+        if let Some((owner_repo, _branch)) = key.rsplit_once('/')
+            && let Some((owner, repo)) = owner_repo.split_once('/')
+        {
+            // Only save if the repo doesn't already have a stored ref.
+            match store.load(owner, repo).await {
+                Ok(None) => {
+                    store.save(owner, repo, &info).await?;
+                    migrated += 1;
+                }
+                Ok(Some(_)) => {
+                    info!("ref store already has {owner}/{repo}; skipping legacy entry");
+                }
+                Err(e) => {
+                    warn!("failed to check ref store for {owner}/{repo}: {e}");
                 }
             }
         }
@@ -392,5 +605,59 @@ mod tests {
 
         let loaded = store.load("ripclone", "test").await.unwrap().unwrap();
         assert_eq!(loaded.commit, "head-commit");
+    }
+
+    #[tokio::test]
+    async fn file_ref_store_branch_roundtrip_and_list() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileRefStore::new(tmp.path());
+
+        let info_main = dummy_ref_info("main-commit");
+        store
+            .save_branch("o", "r", "main", &info_main)
+            .await
+            .unwrap();
+
+        let info_feature = dummy_ref_info("feature-commit");
+        store
+            .save_branch("o", "r", "feature/foo-bar", &info_feature)
+            .await
+            .unwrap();
+
+        let loaded_main = store.load_branch("o", "r", "main").await.unwrap().unwrap();
+        assert_eq!(loaded_main.commit, "main-commit");
+
+        let loaded_feature = store
+            .load_branch("o", "r", "feature/foo-bar")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded_feature.commit, "feature-commit");
+
+        let mut branches = store.list_branches("o", "r").await.unwrap();
+        branches.sort();
+        assert_eq!(branches, vec!["feature/foo-bar", "main"]);
+
+        let repos = store.list().await.unwrap();
+        assert_eq!(repos, vec![("o".to_string(), "r".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn file_ref_store_head_and_branch_coexist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileRefStore::new(tmp.path());
+
+        let head_info = dummy_ref_info("head-commit");
+        store.save("o", "r", &head_info).await.unwrap();
+
+        let branch_info = dummy_ref_info("branch-commit");
+        store
+            .save_branch("o", "r", "main", &branch_info)
+            .await
+            .unwrap();
+
+        let branches = store.list_branches("o", "r").await.unwrap();
+        assert!(branches.contains(&"HEAD".to_string()));
+        assert!(branches.contains(&"main".to_string()));
     }
 }

@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
-use tracing::{debug, warn};
+use tracing::warn;
 
 const TTL: Duration = Duration::from_secs(60);
 const GIT_INODE: u64 = 2;
@@ -251,7 +251,7 @@ impl RipcloneFs {
         FileAttr {
             ino: entry.ino,
             size: entry.size,
-            blocks: (entry.size + BLOCK_SIZE - 1) / BLOCK_SIZE,
+            blocks: entry.size.div_ceil(BLOCK_SIZE),
             atime: t,
             mtime: t,
             ctime: t,
@@ -316,14 +316,14 @@ impl RipcloneFs {
             }
         }
         // Try loose object in git dir first (only works if the skeleton included it).
-        if let Some(sha) = self.tree_entry(path)?.map(|e| e.sha) {
-            if let Ok(data) = git::cat_file(&self.git_dir, &sha) {
-                self.blob_cache
-                    .lock()
-                    .unwrap()
-                    .insert(path.to_string(), data.clone());
-                return Ok(data);
-            }
+        if let Some(sha) = self.tree_entry(path)?.map(|e| e.sha)
+            && let Ok(data) = git::cat_file(&self.git_dir, &sha)
+        {
+            self.blob_cache
+                .lock()
+                .unwrap()
+                .insert(path.to_string(), data.clone());
+            return Ok(data);
         }
         let url = format!(
             "{}/v1/repos/{}/{}/cat?path={}&branch={}",
@@ -392,13 +392,7 @@ fn mode_to_file_mode(raw: &str, kind: FileType) -> u32 {
     match kind {
         FileType::Directory => 0o40755,
         FileType::Symlink => 0o120777,
-        FileType::RegularFile => {
-            if raw.starts_with("100755") {
-                0o100755
-            } else {
-                0o100644
-            }
-        }
+        FileType::RegularFile if raw.starts_with("100755") => 0o100755,
         _ => 0o100644,
     }
 }
@@ -434,16 +428,15 @@ impl Filesystem for RipcloneFs {
         };
 
         // Fast path: if we already have a stable inode for this path, reuse it.
-        if !self.deleted.lock().unwrap().contains(&child_path) {
-            if let Some(&ino) = self.path_to_inode.lock().unwrap().get(&child_path) {
-                if let Some(mut e) = self.inodes.lock().unwrap().get(&ino).cloned() {
-                    if let Some(data) = self.overlay.lock().unwrap().get(&child_path) {
-                        e.size = data.len() as u64;
-                    }
-                    reply.entry(&TTL, &self.attr_for(&e), 0);
-                    return;
-                }
+        if !self.deleted.lock().unwrap().contains(&child_path)
+            && let Some(&ino) = self.path_to_inode.lock().unwrap().get(&child_path)
+            && let Some(mut e) = self.inodes.lock().unwrap().get(&ino).cloned()
+        {
+            if let Some(data) = self.overlay.lock().unwrap().get(&child_path) {
+                e.size = data.len() as u64;
             }
+            reply.entry(&TTL, &self.attr_for(&e), 0);
+            return;
         }
 
         // .git passthrough: stat the real file in the backing git dir.
@@ -552,43 +545,42 @@ impl Filesystem for RipcloneFs {
             return;
         }
 
-        if let Some(path) = self.path_for_inode(ino) {
-            if let Some(real) = self.real_git_path(&path) {
-                if let Ok(meta) = std::fs::symlink_metadata(&real) {
-                    let kind = if meta.is_dir() {
-                        FileType::Directory
-                    } else if meta.file_type().is_symlink() {
-                        FileType::Symlink
-                    } else {
-                        FileType::RegularFile
-                    };
-                    let mode = if meta.is_dir() {
-                        0o40755
-                    } else if meta.file_type().is_symlink() {
-                        0o120777
-                    } else if meta.permissions().mode() & 0o111 != 0 {
-                        0o100755
-                    } else {
-                        0o100644
-                    };
-                    let size = if meta.file_type().is_symlink() {
-                        std::fs::read_link(&real)
-                            .map(|t| t.as_os_str().len() as u64)
-                            .unwrap_or(0)
-                    } else {
-                        meta.len()
-                    };
-                    let entry = InodeEntry {
-                        ino,
-                        path,
-                        kind,
-                        size,
-                        mode,
-                    };
-                    reply.attr(&TTL, &self.attr_for(&entry));
-                    return;
-                }
-            }
+        if let Some(path) = self.path_for_inode(ino)
+            && let Some(real) = self.real_git_path(&path)
+            && let Ok(meta) = std::fs::symlink_metadata(&real)
+        {
+            let kind = if meta.is_dir() {
+                FileType::Directory
+            } else if meta.file_type().is_symlink() {
+                FileType::Symlink
+            } else {
+                FileType::RegularFile
+            };
+            let mode = if meta.is_dir() {
+                0o40755
+            } else if meta.file_type().is_symlink() {
+                0o120777
+            } else if meta.permissions().mode() & 0o111 != 0 {
+                0o100755
+            } else {
+                0o100644
+            };
+            let size = if meta.file_type().is_symlink() {
+                std::fs::read_link(&real)
+                    .map(|t| t.as_os_str().len() as u64)
+                    .unwrap_or(0)
+            } else {
+                meta.len()
+            };
+            let entry = InodeEntry {
+                ino,
+                path,
+                kind,
+                size,
+                mode,
+            };
+            reply.attr(&TTL, &self.attr_for(&entry));
+            return;
         }
 
         let entry = match self.inodes.lock().unwrap().get(&ino).cloned() {

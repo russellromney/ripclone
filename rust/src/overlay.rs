@@ -33,7 +33,7 @@ pub fn available_space(path: &Path) -> Option<u64> {
             return None;
         }
         let buf = buf.assume_init();
-        Some(buf.f_bavail as u64 * buf.f_bsize as u64)
+        Some(buf.f_bavail as u64 * buf.f_bsize)
     }
 }
 

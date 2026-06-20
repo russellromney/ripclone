@@ -101,10 +101,10 @@ fi
 # Start latency/bandwidth proxy between client and server.
 UPSTREAM_URL="http://127.0.0.1:$SERVER_PORT"
 if [ "$BANDWIDTH" != "0" ]; then
-  "$PROXY" "127.0.0.1:$PROXY_PORT" "$UPSTREAM_URL" "$LATENCY" "$BANDWIDTH" \
+  "$PROXY" "127.0.0.1:$PROXY_PORT" "$UPSTREAM_URL" "$LATENCY" "$BANDWIDTH" --forward-auth \
     > "$BASE_DIR/proxy.log" 2>&1 &
 else
-  "$PROXY" "127.0.0.1:$PROXY_PORT" "$UPSTREAM_URL" "$LATENCY" \
+  "$PROXY" "127.0.0.1:$PROXY_PORT" "$UPSTREAM_URL" "$LATENCY" --forward-auth \
     > "$BASE_DIR/proxy.log" 2>&1 &
 fi
 PROXY_PID=$!

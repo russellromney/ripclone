@@ -23,11 +23,19 @@ path = "src/bin/git-remote-ripclone.rs"
 name = "rcgit"
 path = "src/bin/rcgit.rs"
 
+[features]
+default = ["zlib-ng"]
+# Use zlib-ng for faster pack compression/decompression. Disable this feature
+# (e.g. `cargo build --no-default-features`) on platforms where cmake is not
+# available.
+zlib-ng = ["flate2/zlib-ng"]
+
 [dependencies]
 anyhow = "1"
 axum = "0.8"
 base64 = "0.22"
 byteorder = "1.5"
+chrono = "0.4"
 crossbeam-channel = "0.5"
 clap = { version = "4", features = ["derive", "env"] }
 filetime = "0.2"
@@ -62,6 +70,9 @@ subtle = "2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 tokio-uring = "0.5"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
 
 [build-dependencies]
 prost-build = "0.13"

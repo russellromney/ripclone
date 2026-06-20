@@ -189,7 +189,7 @@ fn parse_repo(repo: &str) -> Result<(&str, &str)> {
 fn parse_origin_url(url: &str) -> Result<(String, String)> {
     let url = url.trim();
     let url = url.strip_suffix(".git").unwrap_or(url);
-    let parts: Vec<&str> = url.rsplitn(3, |c| c == '/' || c == ':').collect();
+    let parts: Vec<&str> = url.rsplitn(3, ['/', ':']).collect();
     if parts.len() != 3 {
         anyhow::bail!("cannot parse owner/repo from remote URL: {}", url);
     }
@@ -556,7 +556,7 @@ async fn main() -> Result<()> {
             };
             let start = std::time::Instant::now();
             let stats = tokio::task::spawn_blocking(move || {
-                extract_archive(&archive, &manifest, &dir, dict_bytes.as_deref())
+                extract_archive(&archive, &manifest, &dir, None, dict_bytes.as_deref())
             })
             .await
             .context("archive extract task")??;

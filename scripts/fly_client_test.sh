@@ -101,7 +101,7 @@ echo "==> [2/6] ripclone direct-install (overlay staging, archive extraction)"
 run_clone \
   "ripclone archive-extraction (overlay)" \
   "/tmp/bun-archive" \
-  "RIPCLONE_EXTRACT_ARCHIVE=1" \
+  "RIPCLONE_MODE=fast" \
   "ripclone --server $SERVER clone $REPO --dir /tmp/bun-archive" \
   install_archive_ms \
   install_archive_cpu
@@ -129,7 +129,7 @@ run_clone \
   "smart-HTTP fallback" \
   "/tmp/bun-http" \
   "" \
-  "git clone http://ripclone:${TOKEN_HASH}@${SERVER#https://}/v1/git/${REPO} /tmp/bun-http" \
+  "git clone http://ripclone:${TOKEN_HASH}@${SERVER#*://}/v1/git/${REPO} /tmp/bun-http" \
   http_ms \
   http_cpu
 

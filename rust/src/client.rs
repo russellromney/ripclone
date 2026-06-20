@@ -5,15 +5,17 @@ use crate::extract::{extract_archive_from_chunk_receiver, extract_clonepack_stre
 use crate::git;
 use crate::mode::CloneMode;
 use crate::overlay;
-use crate::pack_writer::HeadBlobsWriter;
 use anyhow::{Context, Result};
-use crossbeam_channel::{Receiver, Sender, unbounded};
+use crossbeam_channel::{Receiver, Sender, bounded};
 use prost::Message;
 use serde::Deserialize;
+use sha1::{Digest, Sha1};
+use std::collections::BTreeMap;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
-
+use tokio::sync::{Mutex as TokioMutex, Notify};
 use tracing::{info, warn};
 
 #[derive(Debug, Clone, Deserialize)]
@@ -54,46 +56,6 @@ fn head_blobs_chunk_refs(clonepack: &ClonepackManifest) -> Vec<crate::clonepack:
         vec![pack.clone()]
     } else {
         Vec::new()
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-enum ChunkKind {
-    Archive,
-    HeadBlobs,
-}
-
-#[allow(deprecated)]
-fn head_blobs_refs(manifest: &ClonepackManifest) -> Vec<ChunkRef> {
-    if !manifest.head_blobs_chunks.is_empty() {
-        manifest.head_blobs_chunks.clone()
-    } else if let Some(pack) = &manifest.head_blobs_pack {
-        vec![pack.clone()]
-    } else {
-        Vec::new()
-    }
-}
-
-impl ChunkKind {
-    fn get_chunk_ref(self, manifest: &ClonepackManifest, index: usize) -> Result<ChunkRef> {
-        match self {
-            ChunkKind::Archive => manifest
-                .archive_chunks
-                .get(index)
-                .cloned()
-                .with_context(|| format!("archive chunk {} missing from manifest", index)),
-            ChunkKind::HeadBlobs => head_blobs_refs(manifest)
-                .get(index)
-                .cloned()
-                .with_context(|| format!("head-blobs chunk {} missing from manifest", index)),
-        }
-    }
-
-    fn all_chunk_refs(self, manifest: &ClonepackManifest) -> Vec<ChunkRef> {
-        match self {
-            ChunkKind::Archive => manifest.archive_chunks.clone(),
-            ChunkKind::HeadBlobs => head_blobs_refs(manifest),
-        }
     }
 }
 
@@ -275,12 +237,11 @@ impl Client {
         let fetch_url = signed_url.unwrap_or(&gateway_url);
         let use_signed_url = signed_url.is_some();
 
-        if let Some(cache) = &self.cache {
-            if let Some(key) = self.cache_key_from_artifact_url(&gateway_url) {
-                if let Ok(data) = cache.get(&key) {
-                    return Ok(data);
-                }
-            }
+        if let Some(cache) = &self.cache
+            && let Some(key) = self.cache_key_from_artifact_url(&gateway_url)
+            && let Ok(data) = cache.get(&key)
+        {
+            return Ok(data);
         }
 
         // Presigned URLs are self-authenticating; use a client without the
@@ -307,10 +268,10 @@ impl Client {
             );
         }
 
-        if let Some(cache) = &self.cache {
-            if let Some(key) = self.cache_key_from_artifact_url(&gateway_url) {
-                let _ = cache.put_with_hash(&key, &data);
-            }
+        if let Some(cache) = &self.cache
+            && let Some(key) = self.cache_key_from_artifact_url(&gateway_url)
+        {
+            let _ = cache.put_with_hash(&key, &data);
         }
 
         Ok(data)
@@ -553,10 +514,20 @@ impl Client {
             anyhow::bail!("ref is missing clonepack manifest; run sync first");
         }
 
+        // Shared manifest slot. Download tasks wait on this before verifying the
+        // content hash of each chunk.
+        let manifest_slot: Arc<TokioMutex<Option<Arc<ClonepackManifest>>>> =
+            Arc::new(TokioMutex::new(None));
+        let manifest_ready: Arc<Notify> = Arc::new(Notify::new());
+
         // 2. Start manifest + metadata downloads concurrently.
+        let manifest_slot2 = Arc::clone(&manifest_slot);
+        let manifest_ready2 = Arc::clone(&manifest_ready);
         let manifest_task = self.clone().spawn_fetch_manifest(
             info.clonepack_manifest.clone(),
             info.clonepack_manifest_url.clone(),
+            manifest_slot2,
+            manifest_ready2,
         );
 
         let metadata_hash = info.metadata_chunk.clone();
@@ -565,32 +536,21 @@ impl Client {
             .clone()
             .spawn_fetch_metadata(metadata_hash, metadata_url);
 
-        // 3. Wait for manifest + metadata.
-        let (manifest, metadata) =
-            tokio::try_join!(manifest_task, metadata_task).context("fetch manifest/metadata")?;
-        let manifest = manifest.context("fetch clonepack manifest")?;
-        let metadata = metadata.context("fetch metadata chunk")?;
-        let metadata = Arc::new(metadata);
-
-        // 4. Start archive and head-blobs chunk downloads now that we have the
-        // manifest. The workers need the decoded manifest to verify chunk hashes
-        // and lengths.
+        // 3. Start archive chunk downloads concurrently with the manifest. They
+        // will buffer until the manifest is decoded, then verify and forward
+        // chunks to the extractor.
         let (archive_tx, archive_rx): (
             Sender<(usize, Result<Vec<u8>>)>,
             Receiver<(usize, Result<Vec<u8>>)>,
-        ) = unbounded();
-        let (head_blobs_tx, head_blobs_rx): (
-            Sender<(usize, Result<Vec<u8>>)>,
-            Receiver<(usize, Result<Vec<u8>>)>,
-        ) = unbounded();
+        ) = bounded(2);
 
         let archive_urls = info.archive_chunk_urls.clone();
         let archive_downloads = if mode.needs_archive() {
             bench.start_archive_download();
             Some(self.clone().spawn_chunk_downloads(
-                ChunkKind::Archive,
                 archive_urls,
-                Arc::clone(&manifest),
+                Arc::clone(&manifest_slot),
+                Arc::clone(&manifest_ready),
                 archive_tx,
             ))
         } else {
@@ -598,21 +558,14 @@ impl Client {
             None
         };
 
-        let head_blobs_urls = info.head_blobs_chunk_urls.clone();
-        let head_blobs_downloads = if mode.needs_head_blobs() {
-            bench.start_head_blobs_download();
-            Some(self.clone().spawn_chunk_downloads(
-                ChunkKind::HeadBlobs,
-                head_blobs_urls,
-                Arc::clone(&manifest),
-                head_blobs_tx,
-            ))
-        } else {
-            drop(head_blobs_tx);
-            None
-        };
+        // 4. Wait for manifest + metadata.
+        let (manifest, metadata) =
+            tokio::try_join!(manifest_task, metadata_task).context("fetch manifest/metadata")?;
+        let manifest = manifest.context("fetch clonepack manifest")?;
+        let metadata = metadata.context("fetch metadata chunk")?;
+        let metadata = Arc::new(metadata);
         bench.mark_manifest();
-        bench.add_bytes(metadata_bytes(&metadata), 0, 0);
+        bench.add_bytes(metadata_bytes(&metadata), 0);
 
         // 5. Decide where to install (temp dir, possibly overlay).
         let staging_dir = overlay::staging_dir();
@@ -694,14 +647,41 @@ impl Client {
             .context("write temp manifest")?;
         let manifest_path = manifest_tmp.path().to_path_buf();
 
+        // For Hybrid mode, download the pre-built head-blobs pack in parallel
+        // with the archive extraction. The working tree still comes from the archive.
+        let prebuilt_blob_pack_download = if mode.needs_prebuilt_blob_pack() {
+            let client = self.clone();
+            let pack_dir = pack_dir.clone();
+            let clonepack = Arc::clone(&manifest);
+            let info = info.clone();
+            Some(tokio::spawn(async move {
+                client
+                    .install_prebuilt_blob_pack(&clonepack, &info, &pack_dir)
+                    .await
+            }))
+        } else {
+            None
+        };
+
         let archive_worker = if mode.needs_archive() {
             let rx = archive_rx;
             let manifest_path = manifest_path.clone();
             let work_tree = install_root.clone();
+            let git_dir_for_blobs = if mode.needs_blob_pack() {
+                Some(git_dir.clone())
+            } else {
+                None
+            };
             Some(tokio::task::spawn_blocking(move || {
                 // Keep the temp manifest file alive for the duration of extraction.
                 let _guard = manifest_tmp;
-                extract_archive_from_chunk_receiver(&manifest_path, &work_tree, None, rx)
+                extract_archive_from_chunk_receiver(
+                    &manifest_path,
+                    Some(&work_tree),
+                    git_dir_for_blobs.as_deref(),
+                    None,
+                    rx,
+                )
             }))
         } else {
             drop(archive_rx);
@@ -710,55 +690,16 @@ impl Client {
             None
         };
 
-        let head_blobs_worker = if mode.needs_head_blobs() {
-            let rx = head_blobs_rx;
-            let pack_dir = pack_dir.clone();
-            let idx_ref = manifest
-                .head_blobs_idx
-                .clone()
-                .context("clonepack missing head-blobs idx")?;
-            let chunk_refs: Vec<ChunkRef> = manifest.head_blobs_chunks.clone();
-            let client = self.clone();
-            let idx_url = info.head_blobs_idx_url.clone();
-            Some(tokio::spawn(async move {
-                let idx_data = client
-                    .fetch_chunk_ref(&idx_ref, idx_url.as_deref())
-                    .await
-                    .context("fetch head-blobs idx")?;
-                tokio::task::spawn_blocking(move || {
-                    let mut writer = HeadBlobsWriter::new(&pack_dir, &chunk_refs)
-                        .context("create head-blobs pack writer")?;
-                    for _ in 0..chunk_refs.len() {
-                        let (idx, res) = rx
-                            .recv()
-                            .map_err(|_| anyhow::anyhow!("head-blobs channel closed early"))?;
-                        let bytes = res.context("download head-blobs chunk")?;
-                        writer
-                            .write_chunk(idx, &bytes)
-                            .with_context(|| format!("write head-blobs chunk {}", idx))?;
-                    }
-                    writer
-                        .finalize(&idx_data)
-                        .context("finalize head-blobs pack")
-                })
-                .await
-                .context("head-blobs writer task")?
-            }))
-        } else {
-            drop(head_blobs_rx);
-            None
-        };
-
         // 8. Wait for downloads + workers.
-        let mut head_blobs_bytes = 0u64;
         let mut archive_bytes = 0u64;
         if let Some(handle) = archive_downloads {
             let bytes = handle.await.context("archive download coordinator")??;
             archive_bytes = bytes;
         }
-        if let Some(handle) = head_blobs_downloads {
-            let bytes = handle.await.context("head-blobs download coordinator")??;
-            head_blobs_bytes = bytes;
+        let mut prebuilt_blob_pack_bytes = 0u64;
+        if let Some(handle) = prebuilt_blob_pack_download {
+            let bytes = handle.await.context("prebuilt blob pack download task")??;
+            prebuilt_blob_pack_bytes = bytes;
         }
         if let Some(handle) = archive_worker {
             let stats = handle
@@ -771,37 +712,10 @@ impl Client {
                 stats.files, stats.raw_bytes
             );
         }
-        if let Some(handle) = head_blobs_worker {
-            let (hash, _path) = handle
-                .await
-                .context("head-blobs worker join")?
-                .context("head-blobs pack write")?;
-            info!(
-                "wrote head-blobs pack {} ({} bytes)",
-                hash, head_blobs_bytes
-            );
-        }
-        bench.add_bytes(0, head_blobs_bytes, archive_bytes);
-        bench.mark_head_blobs_download(head_blobs_bytes);
-        bench.mark_archive_download(archive_bytes);
+        bench.add_bytes(0, archive_bytes + prebuilt_blob_pack_bytes);
+        bench.mark_archive_download(archive_bytes + prebuilt_blob_pack_bytes);
 
-        // 9. Full mode: run git checkout-index to materialize files from the
-        // head-blobs pack.
-        if mode.needs_checkout() {
-            let checkout_start = Instant::now();
-            let git_dir = git_dir.clone();
-            let work_tree = install_root.clone();
-            tokio::task::spawn_blocking(move || {
-                git::clear_skip_worktree_all_git_dir(&git_dir)?;
-                git::checkout_index_with_git_dir(&git_dir, &work_tree)
-            })
-            .await
-            .context("checkout task")??;
-            bench.mark_checkout();
-            info!("checked out working tree in {:?}", checkout_start.elapsed());
-        }
-
-        // 10. Origin config + finalization.
+        // 9. Origin config + finalization.
         self.write_origin_config(owner, repo, &git_dir)?;
 
         if let Some(dirs) = overlay_dirs {
@@ -821,14 +735,12 @@ impl Client {
         let report = bench.finish();
         if report.total_ms > 0 {
             info!(
-                "clone benchmark: resolve={}ms manifest={}ms metadata={}ms head_blobs_download={}ms archive_download={}ms write={}ms checkout={}ms total={}ms",
+                "clone benchmark: resolve={}ms manifest={}ms metadata={}ms archive_download={}ms write={}ms total={}ms",
                 report.resolve_ms,
                 report.manifest_ms,
                 report.metadata_ms,
-                report.head_blobs_download_ms,
                 report.archive_download_ms,
                 report.write_ms,
-                report.checkout_ms,
                 report.total_ms,
             );
         }
@@ -844,11 +756,119 @@ impl Client {
         Ok(())
     }
 
+    /// Download the pre-built head-blobs pack + index and install them into
+    /// `.git/objects/pack/`. Returns the total bytes downloaded.
+    ///
+    /// Chunks are downloaded with bounded concurrency and streamed to a temp
+    /// file in index order, so peak memory stays at ~`concurrency * chunk_size`
+    /// instead of holding the whole pack in RAM.
+    #[allow(deprecated)]
+    async fn install_prebuilt_blob_pack(
+        &self,
+        clonepack: &ClonepackManifest,
+        info: &RefResponse,
+        pack_dir: &std::path::Path,
+    ) -> Result<u64> {
+        let head_blobs_refs = head_blobs_chunk_refs(clonepack);
+        if head_blobs_refs.is_empty() {
+            anyhow::bail!("clonepack missing head-blobs pack for hybrid install");
+        }
+        let idx_ref = clonepack
+            .head_blobs_idx
+            .as_ref()
+            .context("clonepack missing head-blobs idx")?;
+
+        // Download the small index concurrently with the pack chunks.
+        let idx_data = self
+            .fetch_chunk_ref(idx_ref, info.head_blobs_idx_url.as_deref())
+            .await
+            .context("fetch head-blobs idx")?;
+
+        std::fs::create_dir_all(pack_dir)
+            .with_context(|| format!("create pack dir {}", pack_dir.display()))?;
+        let tmp = tempfile::Builder::new()
+            .suffix(".tmp")
+            .tempfile_in(pack_dir)
+            .context("create temp head-blobs pack")?;
+        let mut writer = BufWriter::new(
+            tmp.as_file()
+                .try_clone()
+                .context("clone temp head-blobs pack file handle")?,
+        );
+        let mut hasher = Sha1::new();
+
+        // Stream chunks in index order with bounded concurrency.
+        let signed_urls = info.head_blobs_chunk_urls.as_deref().unwrap_or(&[]);
+        let concurrency: usize = std::env::var("RIPCLONE_FETCH_CONCURRENCY")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(6)
+            .max(1);
+        let jobs: Vec<(usize, ChunkRef, Option<String>)> = head_blobs_refs
+            .into_iter()
+            .enumerate()
+            .map(|(i, chunk)| {
+                let signed_url = signed_urls.get(i).and_then(|o| o.clone());
+                (i, chunk, signed_url)
+            })
+            .collect();
+
+        use futures::stream::{self, StreamExt};
+        let mut results = stream::iter(jobs)
+            .map(|(i, chunk, signed_url)| async move {
+                let data = self
+                    .fetch_chunk_ref(&chunk, signed_url.as_deref())
+                    .await
+                    .with_context(|| format!("fetch head-blobs chunk {}", i))?;
+                Ok::<_, anyhow::Error>((i, data))
+            })
+            .buffer_unordered(concurrency);
+
+        let mut next_index = 0usize;
+        let mut pending: BTreeMap<usize, Vec<u8>> = BTreeMap::new();
+        let mut pack_bytes = 0u64;
+        while let Some(res) = results.next().await {
+            let (i, data) = res?;
+            pending.insert(i, data);
+            while let Some(data) = pending.remove(&next_index) {
+                hasher.update(&data);
+                writer
+                    .write_all(&data)
+                    .with_context(|| format!("write head-blobs chunk {}", next_index))?;
+                pack_bytes += data.len() as u64;
+                next_index += 1;
+            }
+        }
+        if !pending.is_empty() {
+            anyhow::bail!(
+                "missing head-blobs chunks: {:?}",
+                pending.keys().collect::<Vec<_>>()
+            );
+        }
+
+        writer.flush().context("flush head-blobs pack")?;
+        drop(writer);
+
+        let pack_hash = hex::encode(hasher.finalize());
+        let final_path = pack_dir.join(format!("pack-{}.pack", pack_hash));
+        tmp.persist(&final_path)
+            .with_context(|| format!("rename head-blobs pack to {}", final_path.display()))?;
+        std::fs::write(pack_dir.join(format!("pack-{}.idx", pack_hash)), &idx_data)
+            .with_context(|| format!("write head-blobs idx {}", pack_hash))?;
+        info!(
+            "wrote prebuilt head-blobs pack {} ({} bytes)",
+            pack_hash, pack_bytes
+        );
+        Ok(pack_bytes + idx_data.len() as u64)
+    }
+
     #[allow(deprecated)]
     fn spawn_fetch_manifest(
         self,
         hash: String,
         signed_url: Option<String>,
+        manifest_slot: Arc<TokioMutex<Option<Arc<ClonepackManifest>>>>,
+        manifest_ready: Arc<Notify>,
     ) -> tokio::task::JoinHandle<Result<Arc<ClonepackManifest>>> {
         tokio::spawn(async move {
             let data = self
@@ -860,12 +880,15 @@ impl Client {
             // Backwards compatibility: older manifests store the head-blobs pack as
             // a single `head_blobs_pack` field. Treat it as one chunk so the
             // pipeline can use it without special cases.
-            if manifest.head_blobs_chunks.is_empty() {
-                if let Some(pack) = manifest.head_blobs_pack.take() {
-                    manifest.head_blobs_chunks.push(pack);
-                }
+            if manifest.head_blobs_chunks.is_empty()
+                && let Some(pack) = manifest.head_blobs_pack.take()
+            {
+                manifest.head_blobs_chunks.push(pack);
             }
-            Ok(Arc::new(manifest))
+            let manifest = Arc::new(manifest);
+            *manifest_slot.lock().await = Some(Arc::clone(&manifest));
+            manifest_ready.notify_waiters();
+            Ok(manifest)
         })
     }
 
@@ -887,9 +910,9 @@ impl Client {
 
     fn spawn_chunk_downloads(
         self,
-        kind: ChunkKind,
         signed_urls: Option<Vec<Option<String>>>,
-        manifest: Arc<ClonepackManifest>,
+        manifest_slot: Arc<TokioMutex<Option<Arc<ClonepackManifest>>>>,
+        manifest_ready: Arc<Notify>,
         tx: Sender<(usize, Result<Vec<u8>>)>,
     ) -> tokio::task::JoinHandle<Result<u64>> {
         tokio::spawn(async move {
@@ -898,23 +921,28 @@ impl Client {
             let mut handles = Vec::new();
 
             if signed_urls.is_empty() {
-                // No signed URLs (e.g. local storage backend). Fetch through the
-                // gateway using the chunk refs from the manifest.
-                let chunk_refs = kind.all_chunk_refs(&manifest);
-                for (index, chunk_ref) in chunk_refs.into_iter().enumerate() {
+                // No signed URLs (e.g. local storage backend). Wait for the
+                // manifest so we have the chunk hashes, then fetch through the
+                // gateway.
+                manifest_ready.notified().await;
+                let manifest = manifest_slot
+                    .lock()
+                    .await
+                    .clone()
+                    .context("manifest missing after notify")?;
+                for (index, chunk_ref) in manifest.archive_chunks.iter().cloned().enumerate() {
                     let client = self.clone();
                     let tx = tx.clone();
-                    let kind = kind;
                     let handle = tokio::spawn(async move {
                         let bytes = client
                             .fetch_chunk_ref(&chunk_ref, None)
                             .await
                             .with_context(|| {
-                                format!("fetch {:?} chunk {} via gateway", kind, index)
+                                format!("fetch archive chunk {} via gateway", index)
                             })?;
                         let len = bytes.len() as u64;
                         tx.send((index, Ok(bytes))).map_err(|_| {
-                            anyhow::anyhow!("{:?} chunk {} receiver dropped", kind, index)
+                            anyhow::anyhow!("archive chunk {} receiver dropped", index)
                         })?;
                         Ok::<u64, anyhow::Error>(len)
                     });
@@ -923,18 +951,33 @@ impl Client {
             } else {
                 for (index, signed_url) in signed_urls.into_iter().enumerate() {
                     let client = self.clone();
-                    let manifest = Arc::clone(&manifest);
+                    let manifest_slot = Arc::clone(&manifest_slot);
+                    let manifest_ready = Arc::clone(&manifest_ready);
                     let tx = tx.clone();
-                    let kind = kind;
                     let handle = tokio::spawn(async move {
-                        let chunk_ref = kind.get_chunk_ref(&manifest, index)?;
+                        // Wait until the manifest is available so we know the
+                        // expected content hash and length for this chunk.
+                        manifest_ready.notified().await;
+                        let manifest = manifest_slot
+                            .lock()
+                            .await
+                            .clone()
+                            .context("manifest missing after notify")?;
+                        let chunk_ref =
+                            manifest
+                                .archive_chunks
+                                .get(index)
+                                .cloned()
+                                .with_context(|| {
+                                    format!("archive chunk {} missing from manifest", index)
+                                })?;
                         let bytes = client
                             .fetch_chunk_ref(&chunk_ref, signed_url.as_deref())
                             .await
-                            .with_context(|| format!("fetch {:?} chunk {}", kind, index))?;
+                            .with_context(|| format!("fetch archive chunk {}", index))?;
                         let len = bytes.len() as u64;
                         tx.send((index, Ok(bytes))).map_err(|_| {
-                            anyhow::anyhow!("{:?} chunk {} receiver dropped", kind, index)
+                            anyhow::anyhow!("archive chunk {} receiver dropped", index)
                         })?;
                         Ok::<u64, anyhow::Error>(len)
                     });
@@ -1055,6 +1098,7 @@ impl Client {
                     &archive_chunks,
                     signed_chunk_urls,
                     &work_tree2,
+                    None,
                     None,
                     &server,
                     token.as_deref(),
@@ -1550,6 +1594,7 @@ impl Client {
                     signed_chunk_urls,
                     &work_tree2,
                     None,
+                    None,
                     &server,
                     token.as_deref(),
                 )
@@ -1688,7 +1733,7 @@ impl Client {
 
         // Pre-fill cached file sizes in the index so git status can rely on stat
         // instead of re-reading every blob through the lazy filesystem.
-        let sizes = self.fetch_sizes(owner, repo, &branch).await?;
+        let sizes = self.fetch_sizes(owner, repo, branch).await?;
         git::update_index_sizes(&git_dir, &sizes)?;
 
         // Keep symlinks as symlinks and trust only size/mtime for index stat
