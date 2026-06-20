@@ -186,7 +186,7 @@ impl<'a> PackBuilder<'a> {
         if oids.is_empty() {
             bail!("no objects to pack for {}", commit);
         }
-        self.build_packs_from_oids(&oids, target_raw_bytes)
+        self.build_packs_from_oids(&oids, target_raw_bytes, true)
     }
 
     /// Build the depth content as two layers of mini-packs:
@@ -223,11 +223,16 @@ impl<'a> PackBuilder<'a> {
             .filter(|o| !head_set.contains(o.as_str()))
             .collect();
 
-        let head_packs = self.build_packs_from_oids(&head_oids, target_raw_bytes)?;
+        // HEAD closure: undeltified so the client can hand-parse blobs straight
+        // from the downloaded bytes for the working tree.
+        let head_packs = self.build_packs_from_oids(&head_oids, target_raw_bytes, true)?;
+        // History: deltified (undeltified history is multi-GB). The client never
+        // hand-parses these — they're only installed for the object DB and git
+        // reads them, resolving deltas itself.
         let history_packs = if history_oids.is_empty() {
             Vec::new()
         } else {
-            self.build_packs_from_oids(&history_oids, target_raw_bytes)?
+            self.build_packs_from_oids(&history_oids, target_raw_bytes, false)?
         };
         Ok((head_packs, history_packs))
     }
@@ -239,6 +244,7 @@ impl<'a> PackBuilder<'a> {
         &self,
         oids: &[String],
         target_raw_bytes: u64,
+        undeltified: bool,
     ) -> Result<Vec<(String, u64, String, u64)>> {
         if oids.is_empty() {
             return Ok(Vec::new());
@@ -266,11 +272,11 @@ impl<'a> PackBuilder<'a> {
 
         let mut packs = Vec::with_capacity(batches.len());
         for batch in batches {
-            // Undeltified (`--window=0`): each object is stored whole, so the
-            // client can read blobs straight from the downloaded pack bytes
-            // (plain zlib, no delta resolution, no shared-repo access). Each pack
-            // is also self-contained (non-thin).
-            let (pack_hash, idx_hash) = self.pack_and_index_inner(&batch, true)?;
+            // `undeltified` (`--window=0`): each object stored whole so the client
+            // can hand-parse blobs from the bytes (HEAD closure). Deltified packs
+            // are compact and only installed for the object DB (history); git
+            // resolves their deltas. Each pack is self-contained (non-thin).
+            let (pack_hash, idx_hash) = self.pack_and_index_inner(&batch, undeltified)?;
             let pack_len = self.cas.get(&pack_hash)?.len() as u64;
             let idx_len = self.cas.get(&idx_hash)?.len() as u64;
             packs.push((pack_hash, pack_len, idx_hash, idx_len));

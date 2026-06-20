@@ -310,6 +310,25 @@ pub fn list_object_shas_with_depth<P: AsRef<Path>>(
     Ok(out.lines().map(|s| s.to_string()).collect())
 }
 
+/// Write a multi-pack-index over all packs in `repo_dir`'s object store so git
+/// object lookups stay O(log n) regardless of how many packs are installed.
+/// Cheap: indexes the existing `.idx` files; no pack data is rewritten. Best
+/// effort — a failure only loses the lookup speedup, not correctness.
+pub fn write_multi_pack_index<P: AsRef<Path>>(repo_dir: P) -> Result<()> {
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(repo_dir.as_ref().as_os_str())
+        .args(["multi-pack-index", "write"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .context("spawn git multi-pack-index write")?;
+    if !status.success() {
+        anyhow::bail!("git multi-pack-index write failed");
+    }
+    Ok(())
+}
+
 /// Return the raw (uncompressed) size of each object via
 /// `git cat-file --batch-check`. Used to partition objects into evenly-sized
 /// pack batches.

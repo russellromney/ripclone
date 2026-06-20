@@ -1827,25 +1827,27 @@ async fn do_sync(
     // only the HEAD-closure packs; the full clonepack lists HEAD + history. Order
     // is HEAD-first so a shallow client's URL indices line up with the prefix of
     // the (head+history) signed-URL list.
-    let to_entries = |packs: &[(String, u64, String, u64)]| -> Result<Vec<crate::clonepack::PackEntry>> {
-        packs
-            .iter()
-            .map(|(ph, pl, ih, il)| {
-                anyhow::Ok(crate::clonepack::PackEntry {
-                    pack: Some(ChunkRef {
-                        hash: hash_from_hex(ph)?,
-                        len: *pl,
-                    }),
-                    idx: Some(ChunkRef {
-                        hash: hash_from_hex(ih)?,
-                        len: *il,
-                    }),
+    let to_entries =
+        |packs: &[(String, u64, String, u64)], history_only: bool| -> Result<Vec<crate::clonepack::PackEntry>> {
+            packs
+                .iter()
+                .map(|(ph, pl, ih, il)| {
+                    anyhow::Ok(crate::clonepack::PackEntry {
+                        pack: Some(ChunkRef {
+                            hash: hash_from_hex(ph)?,
+                            len: *pl,
+                        }),
+                        idx: Some(ChunkRef {
+                            hash: hash_from_hex(ih)?,
+                            len: *il,
+                        }),
+                        history_only,
+                    })
                 })
-            })
-            .collect()
-    };
-    let head_entries = to_entries(&head_packs)?;
-    let history_entries = to_entries(&history_packs)?;
+                .collect()
+        };
+    let head_entries = to_entries(&head_packs, false)?;
+    let history_entries = to_entries(&history_packs, true)?;
     let mut full_entries = head_entries.clone();
     full_entries.extend(history_entries.iter().cloned());
 

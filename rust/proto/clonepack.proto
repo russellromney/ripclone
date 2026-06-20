@@ -63,6 +63,12 @@ message ClonepackManifest {
 message PackEntry {
   ChunkRef pack = 1;
   ChunkRef idx = 2;
+  // When true, this pack is history-only: deltified, installed for the object
+  // database but NOT hand-parsed for the working tree (the client can't parse
+  // deltas, and the worktree comes entirely from the undeltified HEAD-closure
+  // packs). Default false = HEAD-closure pack, hand-parsed for the worktree
+  // (also back-compatible with older manifests built before this field).
+  bool history_only = 3;
 }
 
 // Per-commit metadata chunk. This is the only chunk that changes on every

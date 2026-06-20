@@ -862,6 +862,7 @@ impl Client {
             let client = self.clone();
             let pack_url = pack_urls.get(i).and_then(|o| o.clone());
             let idx_url = idx_urls.get(i).and_then(|o| o.clone());
+            let history_only = entry.history_only;
             async move {
                 let pack_ref = entry
                     .pack
@@ -876,12 +877,18 @@ impl Client {
                     client.fetch_chunk_ref(idx_ref, idx_url.as_deref()),
                 )
                 .with_context(|| format!("fetch pack {}", i))?;
-                Ok::<(usize, Vec<u8>, Vec<u8>), anyhow::Error>((i, pack_bytes, idx_bytes))
+                Ok::<(usize, bool, Vec<u8>, Vec<u8>), anyhow::Error>((
+                    i,
+                    history_only,
+                    pack_bytes,
+                    idx_bytes,
+                ))
             }
         });
 
-        // Stage 2: install + extract each downloaded pack (write concurrency
-        // `write_conc`), overlapping with in-flight downloads.
+        // Stage 2: install each pack; hand-parse for the worktree only when it's
+        // a HEAD-closure (undeltified) pack. History-only packs are deltified —
+        // installed for the object DB, read by git, never hand-parsed.
         let total = downloads
             .buffer_unordered(download_conc)
             .map(|res| {
@@ -889,7 +896,7 @@ impl Client {
                 let work_tree = work_tree.to_path_buf();
                 let blob_map = Arc::clone(&blob_map);
                 async move {
-                    let (i, pack_bytes, idx_bytes) = res?;
+                    let (i, history_only, pack_bytes, idx_bytes) = res?;
                     let bytes = (pack_bytes.len() + idx_bytes.len()) as u64;
                     let written = tokio::task::spawn_blocking(move || -> Result<usize> {
                         if pack_bytes.len() < 20 {
@@ -902,6 +909,9 @@ impl Client {
                             .with_context(|| format!("write pack {}", name))?;
                         std::fs::write(pack_dir.join(format!("pack-{}.idx", name)), &idx_bytes)
                             .with_context(|| format!("write idx {}", name))?;
+                        if history_only {
+                            return Ok(0);
+                        }
                         let n = crate::extract::extract_blobs_from_pack_bytes(
                             &pack_bytes,
                             &blob_map,
@@ -942,6 +952,14 @@ impl Client {
         tokio::task::spawn_blocking(move || crate::git::clear_skip_worktree_index(&work_tree2, &paths))
             .await
             .context("spawn clear skip-worktree")??;
+
+        // Build a multi-pack-index so git lookups stay fast across the many
+        // installed packs. Best effort — if it fails the clone is still correct,
+        // just with slower per-object lookups. (Server pre-generation is a
+        // planned optimization to skip this client-side step.)
+        let work_tree3 = work_tree.to_path_buf();
+        let _ = tokio::task::spawn_blocking(move || crate::git::write_multi_pack_index(&work_tree3))
+            .await;
 
         Ok(total)
     }
