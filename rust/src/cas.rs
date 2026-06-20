@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// A minimal filesystem-backed content-addressed store.
@@ -66,10 +67,15 @@ impl Cas {
         // Use a unique temp file per writer so concurrent puts of the same hash
         // do not collide on the same `.tmp` path.
         let tmp_path = path.with_extension(format!("tmp.{}", std::process::id()));
-        std::fs::write(&tmp_path, data)
+        let mut tmp_file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&tmp_path)
+            .with_context(|| format!("create CAS object tmp {}", hash))?;
+        tmp_file
+            .write_all(data)
             .with_context(|| format!("write CAS object tmp {}", hash))?;
-        let tmp_file = std::fs::File::open(&tmp_path)
-            .with_context(|| format!("open CAS object tmp for fsync {}", hash))?;
         tmp_file
             .sync_all()
             .with_context(|| format!("fsync CAS object tmp {}", hash))?;
