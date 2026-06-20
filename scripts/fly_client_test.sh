@@ -129,7 +129,7 @@ run_clone \
   "smart-HTTP fallback" \
   "/tmp/bun-http" \
   "" \
-  "git clone http://ripclone:${TOKEN_HASH}@${SERVER#https://}/v1/git/${REPO} /tmp/bun-http" \
+  "git clone http://ripclone:${TOKEN_HASH}@${SERVER#*://}/v1/git/${REPO} /tmp/bun-http" \
   http_ms \
   http_cpu
 
