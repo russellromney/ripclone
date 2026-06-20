@@ -275,12 +275,11 @@ impl Client {
         let fetch_url = signed_url.unwrap_or(&gateway_url);
         let use_signed_url = signed_url.is_some();
 
-        if let Some(cache) = &self.cache {
-            if let Some(key) = self.cache_key_from_artifact_url(&gateway_url) {
-                if let Ok(data) = cache.get(&key) {
-                    return Ok(data);
-                }
-            }
+        if let Some(cache) = &self.cache
+            && let Some(key) = self.cache_key_from_artifact_url(&gateway_url)
+            && let Ok(data) = cache.get(&key)
+        {
+            return Ok(data);
         }
 
         // Presigned URLs are self-authenticating; use a client without the
@@ -307,10 +306,10 @@ impl Client {
             );
         }
 
-        if let Some(cache) = &self.cache {
-            if let Some(key) = self.cache_key_from_artifact_url(&gateway_url) {
-                let _ = cache.put_with_hash(&key, &data);
-            }
+        if let Some(cache) = &self.cache
+            && let Some(key) = self.cache_key_from_artifact_url(&gateway_url)
+        {
+            let _ = cache.put_with_hash(&key, &data);
         }
 
         Ok(data)
@@ -874,10 +873,10 @@ impl Client {
             // Backwards compatibility: older manifests store the head-blobs pack as
             // a single `head_blobs_pack` field. Treat it as one chunk so the
             // pipeline can use it without special cases.
-            if manifest.head_blobs_chunks.is_empty() {
-                if let Some(pack) = manifest.head_blobs_pack.take() {
-                    manifest.head_blobs_chunks.push(pack);
-                }
+            if manifest.head_blobs_chunks.is_empty()
+                && let Some(pack) = manifest.head_blobs_pack.take()
+            {
+                manifest.head_blobs_chunks.push(pack);
             }
             let manifest = Arc::new(manifest);
             *manifest_slot.lock().await = Some(Arc::clone(&manifest));
@@ -1722,7 +1721,7 @@ impl Client {
 
         // Pre-fill cached file sizes in the index so git status can rely on stat
         // instead of re-reading every blob through the lazy filesystem.
-        let sizes = self.fetch_sizes(owner, repo, &branch).await?;
+        let sizes = self.fetch_sizes(owner, repo, branch).await?;
         git::update_index_sizes(&git_dir, &sizes)?;
 
         // Keep symlinks as symlinks and trust only size/mtime for index stat

@@ -781,12 +781,11 @@ pub fn find_commit_in_git_dir<P: AsRef<Path>>(git_dir: P) -> Result<String> {
             let sha = rel
                 .to_string_lossy()
                 .replace(&std::path::MAIN_SEPARATOR.to_string(), "");
-            if sha.len() == 40 {
-                if let Ok(t) = object_type(&git_dir, &sha) {
-                    if t == "commit" {
-                        return Ok(sha);
-                    }
-                }
+            if sha.len() == 40
+                && let Ok(t) = object_type(&git_dir, &sha)
+                && t == "commit"
+            {
+                return Ok(sha);
             }
         }
     }

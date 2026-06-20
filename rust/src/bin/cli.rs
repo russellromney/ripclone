@@ -189,7 +189,7 @@ fn parse_repo(repo: &str) -> Result<(&str, &str)> {
 fn parse_origin_url(url: &str) -> Result<(String, String)> {
     let url = url.trim();
     let url = url.strip_suffix(".git").unwrap_or(url);
-    let parts: Vec<&str> = url.rsplitn(3, |c| c == '/' || c == ':').collect();
+    let parts: Vec<&str> = url.rsplitn(3, ['/', ':']).collect();
     if parts.len() != 3 {
         anyhow::bail!("cannot parse owner/repo from remote URL: {}", url);
     }

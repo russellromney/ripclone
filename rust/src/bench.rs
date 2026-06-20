@@ -60,6 +60,12 @@ pub struct Benchmark {
     report: BenchmarkReport,
 }
 
+impl Default for Benchmark {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Benchmark {
     pub fn new() -> Self {
         let now = Instant::now();
