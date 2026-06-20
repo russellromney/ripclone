@@ -9,10 +9,8 @@ use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, bounded};
 use prost::Message;
 use serde::Deserialize;
-use sha1::{Digest as Sha1Digest, Sha1};
 use sha2::{Digest as Sha256Digest, Sha256};
 use std::collections::BTreeMap;
-use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -789,10 +787,14 @@ impl Client {
 
         std::fs::create_dir_all(pack_dir)
             .with_context(|| format!("create pack dir {}", pack_dir.display()))?;
-        let tmp_path = pack_dir.join("head-blobs-tmp.pack");
+        let tmp = tempfile::Builder::new()
+            .suffix(".tmp")
+            .tempfile_in(pack_dir)
+            .context("create temp head-blobs pack")?;
         let mut writer = BufWriter::new(
-            File::create(&tmp_path)
-                .with_context(|| format!("create temp head-blobs pack {}", tmp_path.display()))?,
+            tmp.as_file()
+                .try_clone()
+                .context("clone temp head-blobs pack file handle")?,
         );
         let mut hasher = Sha256::new();
 
@@ -851,7 +853,7 @@ impl Client {
 
         let pack_hash = hex::encode(hasher.finalize());
         let final_path = pack_dir.join(format!("pack-{}.pack", pack_hash));
-        std::fs::rename(&tmp_path, &final_path)
+        tmp.persist(&final_path)
             .with_context(|| format!("rename head-blobs pack to {}", final_path.display()))?;
         std::fs::write(pack_dir.join(format!("pack-{}.idx", pack_hash)), &idx_data)
             .with_context(|| format!("write head-blobs idx {}", pack_hash))?;
