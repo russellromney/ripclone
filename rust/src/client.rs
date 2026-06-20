@@ -7,7 +7,7 @@ use crate::mode::CloneMode;
 use crate::overlay;
 use crate::pack_writer::HeadBlobsWriter;
 use anyhow::{Context, Result};
-use crossbeam_channel::{Receiver, Sender, bounded};
+use crossbeam_channel::{Receiver, Sender, unbounded};
 use prost::Message;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -581,11 +581,11 @@ impl Client {
         let (archive_tx, archive_rx): (
             Sender<(usize, Result<Vec<u8>>)>,
             Receiver<(usize, Result<Vec<u8>>)>,
-        ) = bounded(2);
+        ) = unbounded();
         let (head_blobs_tx, head_blobs_rx): (
             Sender<(usize, Result<Vec<u8>>)>,
             Receiver<(usize, Result<Vec<u8>>)>,
-        ) = bounded(2);
+        ) = unbounded();
 
         let archive_urls = info.archive_chunk_urls.clone();
         let archive_downloads = if mode.needs_archive() {
