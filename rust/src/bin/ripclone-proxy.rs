@@ -29,45 +29,65 @@ struct Args {
     /// Optional aggregate bandwidth cap in Mbps.
     #[arg(default_value = "0")]
     bandwidth_mbps: f64,
+    /// Forward Authorization headers to the upstream. Useful when the upstream
+    /// requires the ripclone token for benchmarking.
+    #[arg(long)]
+    forward_auth: bool,
 }
 
-struct TokenBucket {
-    /// Tokens available in bytes.
+/// Token-bucket state protected by a mutex. The critical section is tiny, so
+/// the mutex is simpler than a lock-free implementation and avoids the
+/// token-accounting races that come from splitting `last_ns` and `tokens_micro`
+/// into separate atomics.
+struct TokenBucketState {
     rate: f64,
-    /// Max burst in bytes (one second at rate).
     max: f64,
     tokens: f64,
     last: Instant,
 }
 
+struct TokenBucket {
+    state: Mutex<TokenBucketState>,
+}
+
 impl TokenBucket {
     fn new(bandwidth_mbps: f64) -> Self {
         let rate = bandwidth_mbps * 1_000_000.0 / 8.0;
+        let now = Instant::now();
         Self {
-            rate,
-            max: rate,
-            tokens: rate,
-            last: Instant::now(),
+            state: Mutex::new(TokenBucketState {
+                rate,
+                max: rate,
+                // Start with a full one-second burst.
+                tokens: rate,
+                last: now,
+            }),
         }
     }
 
-    async fn consume(&mut self, bytes: usize) {
-        if self.rate <= 0.0 || bytes == 0 {
+    async fn consume(&self, bytes: usize) {
+        if bytes == 0 {
             return;
         }
         let needed = bytes as f64;
-        let now = Instant::now();
-        let elapsed = now.duration_since(self.last).as_secs_f64();
-        self.tokens = (self.tokens + elapsed * self.rate).min(self.max);
-        self.last = now;
+        loop {
+            let sleep_secs = {
+                let mut state = self.state.lock().await;
+                let now = Instant::now();
+                let elapsed = now.duration_since(state.last).as_secs_f64();
+                state.tokens = (state.tokens + elapsed * state.rate).min(state.max);
+                state.last = now;
 
-        if self.tokens < needed {
-            let deficit = needed - self.tokens;
-            let sleep_secs = deficit / self.rate;
+                if state.tokens >= needed {
+                    state.tokens -= needed;
+                    return;
+                }
+
+                let deficit = needed - state.tokens;
+                deficit / state.rate
+            };
             sleep(Duration::from_secs_f64(sleep_secs)).await;
-            self.tokens += sleep_secs * self.rate;
         }
-        self.tokens -= needed;
     }
 }
 
@@ -76,10 +96,11 @@ struct ProxyState {
     client: Client,
     upstream: String,
     latency: Duration,
-    bucket: Option<Arc<Mutex<TokenBucket>>>,
+    bucket: Option<Arc<TokenBucket>>,
+    forward_auth: bool,
 }
 
-fn copy_headers(src: &HeaderMap, dst: &mut HeaderMap, upstream_base: &str) {
+fn copy_headers(src: &HeaderMap, dst: &mut HeaderMap, upstream_base: &str, forward_auth: bool) {
     for (key, value) in src.iter() {
         if key == HOST {
             let host = upstream_base
@@ -91,10 +112,11 @@ fn copy_headers(src: &HeaderMap, dst: &mut HeaderMap, upstream_base: &str) {
             }
         } else if key.as_str().eq_ignore_ascii_case("connection")
             || key.as_str().eq_ignore_ascii_case("keep-alive")
-            || key.as_str().eq_ignore_ascii_case("authorization")
             || key.as_str().eq_ignore_ascii_case("cookie")
+            || (!forward_auth && key.as_str().eq_ignore_ascii_case("authorization"))
         {
-            // Do not forward hop-by-hop or credential headers to the upstream.
+            // Do not forward hop-by-hop or credential headers to the upstream
+            // unless explicitly asked to forward auth.
             continue;
         } else {
             dst.append(key, value.clone());
@@ -120,7 +142,12 @@ async fn proxy_handler(State(state): State<ProxyState>, req: Request<Body>) -> i
 
     let mut upstream_req = state.client.request(parts.method, &url).body(upstream_body);
     let mut headers = HeaderMap::new();
-    copy_headers(&parts.headers, &mut headers, &state.upstream);
+    copy_headers(
+        &parts.headers,
+        &mut headers,
+        &state.upstream,
+        state.forward_auth,
+    );
     for (key, value) in headers.iter() {
         upstream_req = upstream_req.header(key, value);
     }
@@ -157,7 +184,7 @@ async fn proxy_handler(State(state): State<ProxyState>, req: Request<Body>) -> i
             match result {
                 Ok(chunk) => {
                     if let Some(b) = bucket {
-                        b.lock().await.consume(chunk.len()).await;
+                        b.consume(chunk.len()).await;
                     }
                     Ok::<_, reqwest::Error>(chunk)
                 }
@@ -185,7 +212,7 @@ async fn main() -> anyhow::Result<()> {
     }
     let latency = Duration::from_secs_f64(args.latency.max(0.0));
     let bucket = if args.bandwidth_mbps > 0.0 {
-        Some(Arc::new(Mutex::new(TokenBucket::new(args.bandwidth_mbps))))
+        Some(Arc::new(TokenBucket::new(args.bandwidth_mbps)))
     } else {
         None
     };
@@ -200,6 +227,7 @@ async fn main() -> anyhow::Result<()> {
         upstream,
         latency,
         bucket,
+        forward_auth: args.forward_auth,
     };
 
     let app = Router::new()

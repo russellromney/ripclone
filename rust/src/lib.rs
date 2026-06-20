@@ -1,5 +1,6 @@
 pub mod archive;
 pub mod bench;
+pub mod blob_pack;
 pub mod cas;
 pub mod client;
 pub mod clonepack;

@@ -556,7 +556,7 @@ async fn main() -> Result<()> {
             };
             let start = std::time::Instant::now();
             let stats = tokio::task::spawn_blocking(move || {
-                extract_archive(&archive, &manifest, &dir, dict_bytes.as_deref())
+                extract_archive(&archive, &manifest, &dir, None, dict_bytes.as_deref())
             })
             .await
             .context("archive extract task")??;

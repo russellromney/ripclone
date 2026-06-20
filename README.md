@@ -42,11 +42,11 @@ ripclone stores the same `HEAD` file bytes in two formats so you can choose the 
 
 ### Clone modes
 
-`--mode=full` (the default) downloads the metadata chunk and the head-blobs pack, installs the prebuilt `.git/` artifacts, and runs `git checkout-index` to write the working tree. The result is indistinguishable from `git clone --depth=1`.
+`--mode=full` (the default) downloads the metadata chunk and the archive chunks, writes the working tree directly from the zstd frames, and builds a local HEAD-blobs pack from those bytes so `git diff`, `git show`, and `git checkout-index` all work. The result is indistinguishable from `git clone --depth=1`.
 
-`--mode=fast` downloads the metadata chunk and the archive chunks, then writes files directly from the zstd frames without using git checkout. This is the fastest way to get a working tree for agents that only edit and commit.
+`--mode=fast` downloads the metadata chunk and the archive chunks, then writes files directly from the zstd frames without building a blob pack. This is the fastest way to get a working tree for agents that only edit and commit; `git diff`/`git show` do not work.
 
-`--mode=hybrid` downloads both the head-blobs pack and the archive chunks concurrently, writes files from the archive, and also installs the head-blobs pack so the repo has full git compatibility as soon as the pack lands.
+`--mode=hybrid` downloads the pre-built HEAD-blobs pack in parallel with the archive chunks and writes the working tree from the archive. Faster than `full` when bandwidth is plentiful because it avoids the local pack-build CPU cost; slower on constrained links because it downloads extra bytes.
 
 `--mode=skeleton` downloads only the metadata chunk. It gives you a valid `.git/` with history and tree structure but no working tree and no blob objects.
 
@@ -168,6 +168,21 @@ Object storage   Local disk
 - **Clients** download manifests, skeletons, and archives; stream-decompress frames; and write files directly.
 - **GitHub remains the source of truth** for repos, refs, permissions, and writes.
 - **IP rate limiting** protects public endpoints from abuse.
+
+## Build options
+
+By default the Rust crate uses `zlib-ng` for faster pack compression. On platforms without cmake you can build with the stock zlib instead:
+
+```bash
+cd rust
+cargo build --release --no-default-features
+```
+
+Environment variables for tuning clone performance:
+
+- `RIPCLONE_FETCH_CONCURRENCY` — max concurrent chunk downloads (default 6).
+- `RIPCLONE_FETCH_THREADS` / `RIPCLONE_WRITE_THREADS` — thread counts for archive extraction.
+- `RIPCLONE_BLOB_PACK_THREADS` — threads used when building a local blob pack in `full` mode.
 
 ## License
 
