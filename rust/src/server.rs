@@ -53,6 +53,12 @@ pub struct ServerState {
     /// Per-repo mutexes so concurrent syncs for the same repo cannot corrupt
     /// the bare mirror directory.
     pub sync_locks: Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Last time each `owner/repo/branch` mirror was fetched. Used to skip a
+    /// redundant `git fetch` on the resolve hot path when the mirror is fresh.
+    pub mirror_freshness: Arc<std::sync::Mutex<HashMap<String, Instant>>>,
+    /// How long a mirror fetch stays "fresh". Resolves within this window skip
+    /// the fetch (`RIPCLONE_MIRROR_FRESH_TTL_SECS`, default 60s).
+    pub mirror_fresh_ttl: Duration,
 }
 
 /// Simple in-memory token-bucket rate limiter keyed by real client IP.
@@ -690,6 +696,27 @@ async fn ensure_mirror(
     .context("ensure mirror task")?
 }
 
+/// True if the mirror for `key` (`owner/repo/branch`) was fetched within the
+/// freshness TTL, so a resolve can skip the `git fetch`.
+fn mirror_is_fresh(state: &ServerState, key: &str) -> bool {
+    state
+        .mirror_freshness
+        .lock()
+        .unwrap()
+        .get(key)
+        .map(|t| t.elapsed() < state.mirror_fresh_ttl)
+        .unwrap_or(false)
+}
+
+/// Record that the mirror for `key` was just fetched. Prunes expired entries so
+/// the map stays bounded by the set of refs active within the TTL.
+fn stamp_mirror_fresh(state: &ServerState, key: &str) {
+    let ttl = state.mirror_fresh_ttl;
+    let mut map = state.mirror_freshness.lock().unwrap();
+    map.retain(|_, t| t.elapsed() < ttl);
+    map.insert(key.to_string(), Instant::now());
+}
+
 async fn get_ref(
     Path((owner, repo, branch)): Path<(String, String, String)>,
     Query(params): Query<RefQuery>,
@@ -711,27 +738,34 @@ async fn get_ref(
         .map(|s| secrecy::SecretString::new(s.into()));
 
     // Serialize syncs for this repo so concurrent fetches do not corrupt the
-    // bare mirror directory.
+    // bare mirror directory. Acquiring the lock also means any in-progress sync
+    // for this repo has finished by the time we proceed.
+    let fresh_key = format!("{}/{}/{}", owner, repo, branch);
     let lock = repo_lock(&state.sync_locks, &owner, &repo).await;
     let _guard = lock.lock().await;
-    if let Err(e) = ensure_mirror(
-        &mirror_dir,
-        &owner,
-        &repo,
-        &branch,
-        state.default_depth,
-        github_token.as_ref(),
-    )
-    .await
-    {
-        state.metrics.record_error();
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: format!("mirror sync failed: {}", e),
-            }),
+    // Skip the `git fetch` when the mirror was refreshed within the TTL — by a
+    // recent resolve, or by the sync we just waited on while holding the lock.
+    if !mirror_is_fresh(&state, &fresh_key) {
+        if let Err(e) = ensure_mirror(
+            &mirror_dir,
+            &owner,
+            &repo,
+            &branch,
+            state.default_depth,
+            github_token.as_ref(),
         )
-            .into_response();
+        .await
+        {
+            state.metrics.record_error();
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("mirror sync failed: {}", e),
+                }),
+            )
+                .into_response();
+        }
+        stamp_mirror_fresh(&state, &fresh_key);
     }
     drop(_guard);
 
@@ -1034,6 +1068,9 @@ async fn sync_repo(
     {
         Ok(info) => {
             state.metrics.record_sync(start.elapsed());
+            // The mirror was just fetched; let the immediately-following resolve
+            // skip its own fetch.
+            stamp_mirror_fresh(&state, &format!("{}/{}/{}", owner, repo, branch));
             let resp = ref_response(owner, repo, branch.clone(), &info, &state.storage, "full");
             drop(_guard);
             (StatusCode::OK, Json(resp)).into_response()
@@ -1682,13 +1719,21 @@ async fn do_sync(
         builder.build_shallow_skeleton_pack(&commit2s)
     });
 
-    // Head-blobs pack + idx.
+    // Depth-1 packs: the complete object closure for HEAD (commit + tree + every
+    // blob), split into many small self-contained packs (~1-2 MB). The client
+    // installs and extracts them in parallel as they download. Carried in the
+    // manifest's `packs` list. (Phase 1 ships only the HEAD-closure depth=1;
+    // deeper-history packs come in Phase 2.)
+    let pack_target_raw: u64 = std::env::var("RIPCLONE_PACK_BYTES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(6 * 1024 * 1024);
     let mirror_dir3 = mirror_dir.clone();
     let cas3 = cas.clone();
     let commit3 = commit.clone();
-    let head_blobs_handle = tokio::task::spawn_blocking(move || {
+    let depth_packs_handle = tokio::task::spawn_blocking(move || {
         let builder = PackBuilder::new(&mirror_dir3, &cas3);
-        builder.build_head_blobs_pack(&commit3)
+        builder.build_depth_packs(&commit3, Some(1), pack_target_raw)
     });
 
     // Working-tree archive + manifest.
@@ -1705,8 +1750,7 @@ async fn do_sync(
     let (shallow_skeleton_pack, shallow_skeleton_idx) = shallow_skeleton_handle
         .await
         .context("shallow skeleton pack task")??;
-    let (head_blobs_pack, head_blobs_idx) =
-        head_blobs_handle.await.context("head blobs pack task")??;
+    let depth_packs = depth_packs_handle.await.context("depth packs task")??;
     let (archive_chunk_hashes, mut metadata_chunk) =
         archive_handle.await.context("archive task")??;
 
@@ -1753,11 +1797,28 @@ async fn do_sync(
     let shallow_metadata_data = shallow_metadata_chunk.encode_to_vec();
     let shallow_metadata_hash = cas.put(&shallow_metadata_data)?;
 
-    // Split the head-blobs pack into fixed-size chunks so the client can fetch
-    // it in parallel. The idx stays small and is fetched as a single object.
-    let head_blobs_pack_data = cas.get(&head_blobs_pack)?;
-    let head_blobs_idx_data = cas.get(&head_blobs_idx)?;
-    let head_blobs_chunk_refs = split_and_store_pack(cas, &head_blobs_pack_data)?;
+    // Build the manifest `packs` list from the small depth packs. Each entry is
+    // a self-contained git pack + its idx, fetched and installed independently.
+    let pack_entries: Vec<crate::clonepack::PackEntry> = depth_packs
+        .iter()
+        .map(|(pack_hash, pack_len, idx_hash, idx_len)| {
+            anyhow::Ok(crate::clonepack::PackEntry {
+                pack: Some(ChunkRef {
+                    hash: hash_from_hex(pack_hash)?,
+                    len: *pack_len,
+                }),
+                idx: Some(ChunkRef {
+                    hash: hash_from_hex(idx_hash)?,
+                    len: *idx_len,
+                }),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    // All pack + idx hashes, for storage upload and retention protection.
+    let depth_pack_hashes: Vec<String> = depth_packs
+        .iter()
+        .flat_map(|(p, _, i, _)| [p.clone(), i.clone()])
+        .collect();
 
     let archive_chunk_lengths = crate::clonepack::archive_chunk_lengths(&metadata_chunk);
     let archive_chunks: Vec<ChunkRef> = archive_chunk_hashes
@@ -1781,11 +1842,7 @@ async fn do_sync(
                 len: metadata_len,
             }),
             archive_chunks: archive_chunks.clone(),
-            head_blobs_chunks: head_blobs_chunk_refs.clone(),
-            head_blobs_idx: Some(ChunkRef {
-                hash: hash_from_hex(&head_blobs_idx)?,
-                len: head_blobs_idx_data.len() as u64,
-            }),
+            packs: pack_entries.clone(),
             ..Default::default()
         })
     };
@@ -1816,11 +1873,6 @@ async fn do_sync(
         String::new()
     };
 
-    let head_blobs_chunk_hashes: Vec<String> = head_blobs_chunk_refs
-        .iter()
-        .map(|r| hash_to_hex(&r.hash))
-        .collect();
-
     let info = RefInfo {
         commit: commit.clone(),
         parent_commit: parent.clone(),
@@ -1828,8 +1880,8 @@ async fn do_sync(
         skeleton_pack: skeleton_pack.clone(),
         skeleton_idx: skeleton_idx.clone(),
         head_blobs_pack: String::new(),
-        head_blobs_idx: head_blobs_idx.clone(),
-        head_blobs_chunks: head_blobs_chunk_hashes.clone(),
+        head_blobs_idx: String::new(),
+        head_blobs_chunks: Vec::new(),
         prebuilt_index: prebuilt_index.clone(),
         archive: archive_chunk_hashes.first().cloned().unwrap_or_default(),
         manifest: metadata_hash.clone(),
@@ -1877,6 +1929,8 @@ async fn do_sync(
     ];
     artifact_hashes.extend(info.head_blobs_chunks.iter().map(|s| s.as_str()));
     artifact_hashes.extend(info.archive_chunks.iter().map(|s| s.as_str()));
+    // The editable depth packs + their idxs.
+    artifact_hashes.extend(depth_pack_hashes.iter().map(|s| s.as_str()));
     for hash in artifact_hashes.iter().filter(|h| !h.is_empty()) {
         let data = cas
             .get(hash)
@@ -2093,6 +2147,13 @@ pub async fn run_server(
         build_queue_depth: Arc::new(AtomicUsize::new(0)),
         oidc_verifier,
         sync_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        mirror_freshness: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        mirror_fresh_ttl: Duration::from_secs(
+            env::var("RIPCLONE_MIRROR_FRESH_TTL_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(60),
+        ),
     };
     let build_queue = spawn_build_worker(state.clone());
     state.build_queue = build_queue;
@@ -2143,6 +2204,8 @@ mod tests {
             build_queue_depth: Arc::new(AtomicUsize::new(0)),
             oidc_verifier: None,
             sync_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            mirror_freshness: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            mirror_fresh_ttl: Duration::from_secs(60),
         }
     }
 

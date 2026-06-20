@@ -152,14 +152,96 @@ impl<'a> PackBuilder<'a> {
         Ok(count)
     }
 
+    /// Build a complete object pack for `commit` limited to the last `depth`
+    /// commits (`None` = full history). The pack contains commits, trees, and
+    /// every blob reachable from those commits — i.e. everything needed to
+    /// materialize the working tree at HEAD and inspect the included history.
+    ///
+    /// Objects are stored undeltified (`git pack-objects --window=0`) so the
+    /// client can extract files without resolving deltas.
+    pub fn build_depth_pack(
+        &self,
+        commit: &str,
+        depth: Option<usize>,
+    ) -> Result<(String, String)> {
+        let object_shas = git::list_object_shas_with_depth(&self.repo, commit, depth)?;
+        self.pack_and_index_inner(&object_shas, true)
+    }
+
+    /// Build the depth content as many small, self-contained git packs, each
+    /// targeting roughly `target_raw_bytes` of uncompressed object content.
+    /// Objects are partitioned greedily by raw size so packs are evenly sized
+    /// (~1-2 MB compressed for a few-MB raw target); each pack is independently
+    /// valid (non-thin), so the client can install and extract them in parallel
+    /// as they download.
+    ///
+    /// Returns `(pack_hash, pack_len, idx_hash, idx_len)` for each pack.
+    pub fn build_depth_packs(
+        &self,
+        commit: &str,
+        depth: Option<usize>,
+        target_raw_bytes: u64,
+    ) -> Result<Vec<(String, u64, String, u64)>> {
+        let oids = git::list_object_shas_with_depth(&self.repo, commit, depth)?;
+        if oids.is_empty() {
+            bail!("no objects to pack for {}", commit);
+        }
+        let sizes = git::object_sizes(&self.repo, &oids)?;
+
+        // Greedy size-based partitioning. A single object larger than the target
+        // gets its own pack (we can't split one object across packs).
+        let target = target_raw_bytes.max(1);
+        let mut batches: Vec<Vec<String>> = Vec::new();
+        let mut cur: Vec<String> = Vec::new();
+        let mut cur_bytes = 0u64;
+        for oid in oids {
+            let sz = sizes.get(&oid).copied().unwrap_or(0);
+            if !cur.is_empty() && cur_bytes + sz > target {
+                batches.push(std::mem::take(&mut cur));
+                cur_bytes = 0;
+            }
+            cur.push(oid);
+            cur_bytes += sz;
+        }
+        if !cur.is_empty() {
+            batches.push(cur);
+        }
+
+        let mut packs = Vec::with_capacity(batches.len());
+        for batch in batches {
+            // Undeltified (`--window=0`): each object is stored whole, so the
+            // client can read blobs straight from the downloaded pack bytes
+            // (plain zlib, no delta resolution, no shared-repo access). For a
+            // HEAD-only snapshot deltas barely help anyway. Each pack is also
+            // self-contained (non-thin).
+            let (pack_hash, idx_hash) = self.pack_and_index_inner(&batch, true)?;
+            let pack_len = self.cas.get(&pack_hash)?.len() as u64;
+            let idx_len = self.cas.get(&idx_hash)?.len() as u64;
+            packs.push((pack_hash, pack_len, idx_hash, idx_len));
+        }
+        Ok(packs)
+    }
+
     fn pack_and_index(&self, object_shas: &[String]) -> Result<(String, String)> {
+        self.pack_and_index_inner(object_shas, false)
+    }
+
+    fn pack_and_index_inner(
+        &self,
+        object_shas: &[String],
+        undeltified: bool,
+    ) -> Result<(String, String)> {
         if object_shas.is_empty() {
             bail!("no objects to pack");
         }
 
         let tmp = tempfile::TempDir::new()?;
         let prefix = tmp.path().join("pack");
-        git::pack_objects_to_prefix(&self.repo, object_shas, &prefix)?;
+        if undeltified {
+            git::pack_objects_undeltified_to_prefix(&self.repo, object_shas, &prefix)?;
+        } else {
+            git::pack_objects_to_prefix(&self.repo, object_shas, &prefix)?;
+        }
 
         let mut pack_path: Option<PathBuf> = None;
         let mut idx_path: Option<PathBuf> = None;

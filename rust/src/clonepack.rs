@@ -2,7 +2,9 @@ pub mod pb {
     include!(concat!(env!("OUT_DIR"), "/ripclone.rs"));
 }
 
-pub use pb::{ChunkRef, ClonepackManifest, FileEntry, Fragment, FrameInfo, MetadataChunk};
+pub use pb::{
+    ChunkRef, ClonepackManifest, FileEntry, Fragment, FrameInfo, MetadataChunk, PackEntry,
+};
 
 impl FileEntry {
     /// Total uncompressed size of the file across all fragments.

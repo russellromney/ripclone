@@ -45,12 +45,18 @@ enum Commands {
         /// Number of hot files to include in the initial snapshot.
         #[arg(long, default_value = "50")]
         hot_files: usize,
-        /// Clone mode: full (default), fast, hybrid, or skeleton.
+        /// Clone mode: editable (default), files, or skeleton.
         #[arg(long)]
         mode: Option<CloneMode>,
-        /// History depth for the clonepack: "shallow" (depth=1, default) or "full".
-        #[arg(long, default_value = "shallow")]
-        history: String,
+        /// History depth: 1 = HEAD only (default), N = last N commits, 0 = full
+        /// history.
+        #[arg(long, default_value = "1")]
+        depth: usize,
+        /// Materialize the working tree in memory (tmpfs) for a fast, EPHEMERAL
+        /// clone. The tree does not survive a reboot — intended for throwaway
+        /// agent/CI machines. Linux only.
+        #[arg(long)]
+        temp: bool,
         /// Print a per-phase benchmark report after the clone.
         #[arg(long)]
         bench: bool,
@@ -250,13 +256,21 @@ async fn main() -> Result<()> {
             branch,
             hot_files: _hot_files,
             mode,
-            history,
+            depth,
+            temp,
             bench,
             skeleton,
         } => {
             let (owner, repo_name) = parse_repo(&repo)?;
             let target = dir.unwrap_or_else(|| PathBuf::from(repo_name));
             let mode = resolve_mode(mode);
+            // Bridge the --temp flag to the env var the overlay check reads. Set
+            // here, before any clone work reads it.
+            if temp {
+                // SAFETY: set once at the start of the clone command, before the
+                // install path (the only reader) runs.
+                unsafe { std::env::set_var("RIPCLONE_TEMP", "1") };
+            }
 
             if skeleton || mode == CloneMode::Skeleton {
                 client
@@ -268,11 +282,7 @@ async fn main() -> Result<()> {
 
             let enable_bench = bench || std::env::var_os("RIPCLONE_BENCH").is_some();
             let mut benchmark = Benchmark::new();
-            let clonepack_kind = if history == "full" {
-                Some("full")
-            } else {
-                Some("shallow")
-            };
+            let clonepack_kind = Some(ripclone::mode::clonepack_kind_for_depth(depth));
             client
                 .install_repo_with_mode(
                     owner,

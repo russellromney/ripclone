@@ -310,6 +310,46 @@ pub fn list_object_shas_with_depth<P: AsRef<Path>>(
     Ok(out.lines().map(|s| s.to_string()).collect())
 }
 
+/// Return the raw (uncompressed) size of each object via
+/// `git cat-file --batch-check`. Used to partition objects into evenly-sized
+/// pack batches.
+pub fn object_sizes<P: AsRef<Path>>(repo: P, oids: &[String]) -> Result<HashMap<String, u64>> {
+    if oids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let mut input = String::with_capacity(oids.len() * 41);
+    for oid in oids {
+        input.push_str(oid);
+        input.push('\n');
+    }
+    let input_file = tempfile::NamedTempFile::new()?;
+    std::fs::write(input_file.path(), input.as_bytes())?;
+    let stdin = std::fs::File::open(input_file.path())?;
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo.as_ref().as_os_str())
+        .args(["cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)"])
+        .stdin(stdin)
+        .stderr(Stdio::inherit())
+        .output()
+        .context("git cat-file --batch-check")?;
+    if !out.status.success() {
+        bail!("git cat-file --batch-check failed");
+    }
+    let text = String::from_utf8(out.stdout).context("batch-check output not UTF-8")?;
+    let mut map = HashMap::with_capacity(oids.len());
+    for line in text.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 3 {
+            continue;
+        }
+        if let Ok(size) = parts[2].parse::<u64>() {
+            map.insert(parts[0].to_string(), size);
+        }
+    }
+    Ok(map)
+}
+
 /// Return the blob SHAs of all symlinks reachable from `commit`.
 pub fn symlink_blob_shas<P: AsRef<Path>>(repo: P, commit: &str) -> Result<Vec<String>> {
     let entries = list_tree_entries(repo, commit)?;
@@ -449,6 +489,27 @@ pub fn pack_objects_to_prefix<P: AsRef<Path>, Q: AsRef<Path>>(
     object_shas: &[String],
     prefix: Q,
 ) -> Result<()> {
+    pack_objects_to_prefix_inner(repo, object_shas, prefix, &[])
+}
+
+/// Like `pack_objects_to_prefix` but stores every object whole — no new delta
+/// search (`--window=0`) and no reuse of deltas already present in the source
+/// repo (`--no-reuse-delta`). Required so the client can read objects with plain
+/// zlib and no delta resolution, at the cost of a larger pack.
+pub fn pack_objects_undeltified_to_prefix<P: AsRef<Path>, Q: AsRef<Path>>(
+    repo: P,
+    object_shas: &[String],
+    prefix: Q,
+) -> Result<()> {
+    pack_objects_to_prefix_inner(repo, object_shas, prefix, &["--window=0", "--no-reuse-delta"])
+}
+
+fn pack_objects_to_prefix_inner<P: AsRef<Path>, Q: AsRef<Path>>(
+    repo: P,
+    object_shas: &[String],
+    prefix: Q,
+    extra_args: &[&str],
+) -> Result<()> {
     if object_shas.is_empty() {
         bail!("no objects to pack");
     }
@@ -468,9 +529,15 @@ pub fn pack_objects_to_prefix<P: AsRef<Path>, Q: AsRef<Path>>(
 
     let repo_str = repo.as_ref().to_str().context("repo path not UTF-8")?;
     let prefix_str = prefix.as_ref().to_str().context("prefix path not UTF-8")?;
+    let extra = if extra_args.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", extra_args.join(" "))
+    };
     let cmd = format!(
-        "git -C '{}' pack-objects '{}' < '{}'",
+        "git -C '{}' pack-objects{} '{}' < '{}'",
         shell_escape(repo_str),
+        extra,
         shell_escape(prefix_str),
         shell_escape(input_file.path().to_str().unwrap())
     );

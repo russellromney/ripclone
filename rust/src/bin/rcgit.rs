@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use ripclone::client::Client;
+use ripclone::mode::CloneMode;
 use ripclone::rcgit::lazy_clone;
 use sha2::{Digest, Sha256};
 use std::env;
@@ -87,9 +88,13 @@ fn parse_repo(repo: &str) -> Result<(&str, &str)> {
 }
 
 async fn cmd_clone(args: &[String], server: String) -> Result<()> {
-    // Minimal clone parser: rcgit clone [--dir <dir>] <owner/repo>
+    // Minimal clone parser:
+    //   rcgit clone [--dir <dir>] [--depth <n>] [--lazy] <owner/repo>
     let mut repo_arg: Option<&str> = None;
     let mut dir_arg: Option<&str> = None;
+    let mut depth: usize = 1;
+    let mut lazy = false;
+    let mut temp = false;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -100,6 +105,20 @@ async fn cmd_clone(args: &[String], server: String) -> Result<()> {
                 }
                 dir_arg = Some(&args[i]);
             }
+            "--depth" => {
+                i += 1;
+                if i >= args.len() {
+                    anyhow::bail!("missing value for --depth");
+                }
+                depth = args[i]
+                    .parse()
+                    .with_context(|| format!("invalid --depth value: {}", args[i]))?;
+            }
+            // Skeleton-only clone: no working tree, blobs available for
+            // show/diff via the installed pack. Opt-in, never the default.
+            "--lazy" => lazy = true,
+            // Materialize in memory (tmpfs): fast but EPHEMERAL (lost on reboot).
+            "--temp" => temp = true,
             _ => {
                 if repo_arg.is_none() && !args[i].starts_with('-') {
                     repo_arg = Some(&args[i]);
@@ -109,15 +128,42 @@ async fn cmd_clone(args: &[String], server: String) -> Result<()> {
         i += 1;
     }
 
-    let repo = repo_arg.context("usage: rcgit clone [--dir <dir>] <owner/repo>")?;
+    let repo =
+        repo_arg.context("usage: rcgit clone [--dir <dir>] [--depth <n>] [--lazy] <owner/repo>")?;
     let (owner, repo_name) = parse_repo(repo)?;
     let target: PathBuf = dir_arg
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(repo_name));
 
+    if temp {
+        // SAFETY: set once before the install path (the only reader) runs.
+        unsafe { std::env::set_var("RIPCLONE_TEMP", "1") };
+    }
+
     let client = Client::new_with_token(server, token_hash());
-    lazy_clone(&client, owner, repo_name, "HEAD", Some("shallow"), &target).await?;
-    eprintln!("lazy-cloned {} into {}", repo, target.display());
+
+    if lazy {
+        lazy_clone(&client, owner, repo_name, "HEAD", Some("shallow"), &target).await?;
+        eprintln!("lazy-cloned {} into {}", repo, target.display());
+        return Ok(());
+    }
+
+    // Default: editable single-download clone. Downloads the depth pack (commit
+    // + tree + every blob), installs it, and materializes the working tree by
+    // walking the HEAD tree. depth selects the clonepack variant.
+    let clonepack_kind = ripclone::mode::clonepack_kind_for_depth(depth);
+    client
+        .install_repo_with_mode(
+            owner,
+            repo_name,
+            "HEAD",
+            &target,
+            CloneMode::Editable,
+            Some(clonepack_kind),
+            None,
+        )
+        .await?;
+    eprintln!("cloned {} into {}", repo, target.display());
     Ok(())
 }
 

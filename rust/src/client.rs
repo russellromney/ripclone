@@ -1,6 +1,6 @@
 use crate::bench::Benchmark;
 use crate::cas::{Cas, hash as cas_hash};
-use crate::clonepack::{ChunkRef, ClonepackManifest, MetadataChunk, hash_to_hex};
+use crate::clonepack::{ChunkRef, ClonepackManifest, MetadataChunk, PackEntry, hash_to_hex};
 use crate::extract::{extract_archive_from_chunk_receiver, extract_clonepack_streaming};
 use crate::git;
 use crate::mode::CloneMode;
@@ -468,7 +468,7 @@ impl Client {
         branch: &str,
         target: P,
     ) -> Result<()> {
-        self.install_repo_with_mode(owner, repo, branch, target, CloneMode::Full, None, None)
+        self.install_repo_with_mode(owner, repo, branch, target, CloneMode::Editable, None, None)
             .await
     }
 
@@ -645,22 +645,6 @@ impl Client {
             .context("write temp manifest")?;
         let manifest_path = manifest_tmp.path().to_path_buf();
 
-        // For Hybrid mode, download the pre-built head-blobs pack in parallel
-        // with the archive extraction. The working tree still comes from the archive.
-        let prebuilt_blob_pack_download = if mode.needs_prebuilt_blob_pack() {
-            let client = self.clone();
-            let pack_dir = pack_dir.clone();
-            let clonepack = Arc::clone(&manifest);
-            let info = info.clone();
-            Some(tokio::spawn(async move {
-                client
-                    .install_prebuilt_blob_pack(&clonepack, &info, &pack_dir)
-                    .await
-            }))
-        } else {
-            None
-        };
-
         let archive_worker = if mode.needs_archive() {
             let rx = archive_rx;
             let manifest_path = manifest_path.clone();
@@ -694,10 +678,21 @@ impl Client {
             let bytes = handle.await.context("archive download coordinator")??;
             archive_bytes = bytes;
         }
+        // Editable single-download path: download the small depth packs in
+        // parallel and, as each lands, install it and extract its blobs into the
+        // working tree. Download and extraction overlap.
         let mut prebuilt_blob_pack_bytes = 0u64;
-        if let Some(handle) = prebuilt_blob_pack_download {
-            let bytes = handle.await.context("prebuilt blob pack download task")??;
-            prebuilt_blob_pack_bytes = bytes;
+        if mode.needs_pack_worktree() {
+            prebuilt_blob_pack_bytes = self
+                .install_editable_packs(&manifest, &info, &pack_dir, &install_root, &metadata)
+                .await
+                .context("install editable packs")?;
+            bench.mark_write();
+            info!(
+                "installed + extracted {} editable packs ({} bytes)",
+                manifest.packs.len(),
+                prebuilt_blob_pack_bytes
+            );
         }
         if let Some(handle) = archive_worker {
             let stats = handle
@@ -768,8 +763,6 @@ impl Client {
         info: &RefResponse,
         pack_dir: &std::path::Path,
     ) -> Result<u64> {
-        use std::os::unix::fs::FileExt;
-
         let head_blobs_refs = head_blobs_chunk_refs(clonepack);
         if head_blobs_refs.is_empty() {
             anyhow::bail!("clonepack missing head-blobs pack for hybrid install");
@@ -778,25 +771,210 @@ impl Client {
             .head_blobs_idx
             .as_ref()
             .context("clonepack missing head-blobs idx")?;
+        self.install_chunked_pack(
+            "head-blobs",
+            &head_blobs_refs,
+            info.head_blobs_chunk_urls.as_deref(),
+            idx_ref,
+            info.head_blobs_idx_url.as_deref(),
+            pack_dir,
+        )
+        .await
+    }
+
+    /// Editable single-download path: download the small depth packs in parallel
+    /// and, as each lands, install it into `pack_dir` and extract the blobs it
+    /// contains into `work_tree` — so download and extraction overlap. Uses the
+    /// manifest file table to map blobs to paths. Returns total bytes downloaded.
+    async fn install_editable_packs(
+        &self,
+        manifest: &ClonepackManifest,
+        _info: &RefResponse,
+        pack_dir: &std::path::Path,
+        work_tree: &std::path::Path,
+        metadata: &MetadataChunk,
+    ) -> Result<u64> {
+        use futures::stream::{self, StreamExt, TryStreamExt};
+
+        if manifest.packs.is_empty() {
+            anyhow::bail!("clonepack has no packs for editable install");
+        }
+        std::fs::create_dir_all(pack_dir)
+            .with_context(|| format!("create pack dir {}", pack_dir.display()))?;
+
+        // Validate every blob sha1 length up front so `build_blob_path_map`
+        // indexes every file and the files-written guard below is exact (a
+        // non-20-byte sha1 would otherwise be silently skipped and trip a
+        // misleading count mismatch).
+        for f in &metadata.files {
+            if f.blob_sha1.len() != 20 {
+                anyhow::bail!(
+                    "manifest blob_sha1 for {} is {} bytes, expected 20",
+                    String::from_utf8_lossy(&f.path),
+                    f.blob_sha1.len()
+                );
+            }
+        }
+
+        // Build the blob→paths map and pre-create directories single-threaded
+        // before the parallel writers run.
+        let blob_map = Arc::new(crate::extract::build_blob_path_map(&metadata.files));
+        crate::extract::prepare_worktree_dirs(work_tree, &metadata.files)
+            .context("prepare worktree dirs")?;
+
+        // Download and extraction are decoupled stages with independent
+        // concurrency. Downloads are network-bound (fill the link); extraction
+        // is disk/CPU-bound, and file creation blocks on syscalls, so ~2x cores
+        // is the sweet spot (oversubscribing past that loses to filesystem
+        // contention). Both default to 2x the core count, env-overridable.
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        let default_par = (cores * 2).max(1);
+        let download_conc: usize = std::env::var("RIPCLONE_FETCH_CONCURRENCY")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(default_par)
+            .max(1);
+        let write_conc: usize = std::env::var("RIPCLONE_WRITE_THREADS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(default_par)
+            .max(1);
+
+        let jobs: Vec<(usize, PackEntry)> =
+            manifest.packs.iter().cloned().enumerate().collect();
+
+        // Stage 1: download packs (network concurrency `download_conc`).
+        let downloads = stream::iter(jobs).map(|(i, entry)| {
+            let client = self.clone();
+            async move {
+                let pack_ref = entry
+                    .pack
+                    .as_ref()
+                    .with_context(|| format!("pack {} missing pack ref", i))?;
+                let idx_ref = entry
+                    .idx
+                    .as_ref()
+                    .with_context(|| format!("pack {} missing idx ref", i))?;
+                // Phase 1: fetch by content hash via the gateway (signed URLs
+                // for packs are a follow-up for object-store backends).
+                let (pack_bytes, idx_bytes) = tokio::try_join!(
+                    client.fetch_chunk_ref(pack_ref, None),
+                    client.fetch_chunk_ref(idx_ref, None),
+                )
+                .with_context(|| format!("fetch pack {}", i))?;
+                Ok::<(usize, Vec<u8>, Vec<u8>), anyhow::Error>((i, pack_bytes, idx_bytes))
+            }
+        });
+
+        // Stage 2: install + extract each downloaded pack (write concurrency
+        // `write_conc`), overlapping with in-flight downloads.
+        let total = downloads
+            .buffer_unordered(download_conc)
+            .map(|res| {
+                let pack_dir = pack_dir.to_path_buf();
+                let work_tree = work_tree.to_path_buf();
+                let blob_map = Arc::clone(&blob_map);
+                async move {
+                    let (i, pack_bytes, idx_bytes) = res?;
+                    let bytes = (pack_bytes.len() + idx_bytes.len()) as u64;
+                    let written = tokio::task::spawn_blocking(move || -> Result<usize> {
+                        if pack_bytes.len() < 20 {
+                            anyhow::bail!("pack {} too short ({} bytes)", i, pack_bytes.len());
+                        }
+                        // Git names packs by the 20-byte trailer sha; the idx
+                        // pairs to the pack by basename.
+                        let name = hex::encode(&pack_bytes[pack_bytes.len() - 20..]);
+                        std::fs::write(pack_dir.join(format!("pack-{}.pack", name)), &pack_bytes)
+                            .with_context(|| format!("write pack {}", name))?;
+                        std::fs::write(pack_dir.join(format!("pack-{}.idx", name)), &idx_bytes)
+                            .with_context(|| format!("write idx {}", name))?;
+                        let n = crate::extract::extract_blobs_from_pack_bytes(
+                            &pack_bytes,
+                            &blob_map,
+                            &work_tree,
+                        )
+                        .with_context(|| format!("extract pack {}", name))?;
+                        Ok(n)
+                    })
+                    .await
+                    .context("spawn pack install task")??;
+                    Ok::<(u64, usize), anyhow::Error>((bytes, written))
+                }
+            })
+            .buffer_unordered(write_conc)
+            .try_fold((0u64, 0usize), |(ab, aw), (b, w)| async move {
+                Ok((ab + b, aw + w))
+            })
+            .await?;
+        let (total, files_written) = total;
+
+        // Guard against silent under-extraction (e.g. a sha/format mismatch):
+        // every tracked path must have been materialized.
+        if files_written != metadata.files.len() {
+            anyhow::bail!(
+                "editable extraction wrote {} files but manifest lists {}",
+                files_written,
+                metadata.files.len()
+            );
+        }
+
+        // Files are materialized; clear skip-worktree for every tracked path.
+        let paths: Vec<String> = metadata
+            .files
+            .iter()
+            .map(|e| String::from_utf8_lossy(&e.path).into_owned())
+            .collect();
+        let work_tree2 = work_tree.to_path_buf();
+        tokio::task::spawn_blocking(move || crate::git::clear_skip_worktree_index(&work_tree2, &paths))
+            .await
+            .context("spawn clear skip-worktree")??;
+
+        Ok(total)
+    }
+
+    /// Download a content-addressed, chunk-split git pack + its idx and install
+    /// them into `pack_dir` (`.git/objects/pack`). Returns total bytes
+    /// downloaded.
+    ///
+    /// Chunks are downloaded with bounded concurrency and written directly into
+    /// a pre-allocated temp pack file at their final offsets. Peak memory is
+    /// ~`concurrency * chunk_size`, no bytes are re-hashed, and the pack is
+    /// written exactly once. `label` is used only for log/error messages.
+    async fn install_chunked_pack(
+        &self,
+        label: &str,
+        chunk_refs: &[ChunkRef],
+        chunk_urls: Option<&[Option<String>]>,
+        idx_ref: &ChunkRef,
+        idx_url: Option<&str>,
+        pack_dir: &std::path::Path,
+    ) -> Result<u64> {
+        use std::os::unix::fs::FileExt;
+
+        if chunk_refs.is_empty() {
+            anyhow::bail!("{} pack has no chunks", label);
+        }
 
         // Download the small index concurrently with the pack chunks.
         let idx_data = self
-            .fetch_chunk_ref(idx_ref, info.head_blobs_idx_url.as_deref())
+            .fetch_chunk_ref(idx_ref, idx_url)
             .await
-            .context("fetch head-blobs idx")?;
+            .with_context(|| format!("fetch {} idx", label))?;
 
         std::fs::create_dir_all(pack_dir)
             .with_context(|| format!("create pack dir {}", pack_dir.display()))?;
         let tmp = tempfile::Builder::new()
             .suffix(".tmp")
             .tempfile_in(pack_dir)
-            .context("create temp head-blobs pack")?;
+            .with_context(|| format!("create temp {} pack", label))?;
         let file = tmp
             .as_file()
             .try_clone()
-            .context("clone temp head-blobs pack fd")?;
+            .with_context(|| format!("clone temp {} pack fd", label))?;
 
-        let signed_urls = info.head_blobs_chunk_urls.as_deref().unwrap_or(&[]);
+        let signed_urls = chunk_urls.unwrap_or(&[]);
         let concurrency: usize = std::env::var("RIPCLONE_FETCH_CONCURRENCY")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -804,9 +982,9 @@ impl Client {
             .max(1);
 
         // Compute final pack size and per-chunk byte offsets.
-        let mut offsets = Vec::with_capacity(head_blobs_refs.len());
+        let mut offsets = Vec::with_capacity(chunk_refs.len());
         let mut total_len = 0u64;
-        for chunk in &head_blobs_refs {
+        for chunk in chunk_refs {
             offsets.push(total_len);
             total_len += chunk.len;
         }
@@ -815,16 +993,18 @@ impl Client {
         // is not pinned during the syscall.
         {
             let file = file.try_clone().context("clone fd for preallocate")?;
+            let label = label.to_string();
             tokio::task::spawn_blocking(move || {
                 file.set_len(total_len)
-                    .context("preallocate temp head-blobs pack file")
+                    .with_context(|| format!("preallocate temp {} pack file", label))
             })
             .await
             .context("spawn preallocate task")??;
         }
 
-        let jobs: Vec<(usize, ChunkRef, Option<String>, u64)> = head_blobs_refs
-            .into_iter()
+        let jobs: Vec<(usize, ChunkRef, Option<String>, u64)> = chunk_refs
+            .iter()
+            .cloned()
             .enumerate()
             .map(|(i, chunk)| {
                 let signed_url = signed_urls.get(i).and_then(|o| o.clone());
@@ -839,17 +1019,18 @@ impl Client {
                 let client = self.clone();
                 let file = file
                     .try_clone()
-                    .with_context(|| format!("clone pack fd for head-blobs chunk {}", i));
+                    .with_context(|| format!("clone pack fd for {} chunk {}", label, i));
+                let write_label = label.to_string();
                 async move {
                     let file = file?;
                     let data = client
                         .fetch_chunk_ref(&chunk, signed_url.as_deref())
                         .await
-                        .with_context(|| format!("fetch head-blobs chunk {}", i))?;
+                        .with_context(|| format!("fetch {} chunk {}", label, i))?;
                     let len = data.len() as u64;
                     tokio::task::spawn_blocking(move || {
                         file.write_all_at(&data, offset).with_context(|| {
-                            format!("write head-blobs chunk {} at offset {}", i, offset)
+                            format!("write {} chunk {} at offset {}", write_label, i, offset)
                         })
                     })
                     .await
@@ -864,14 +1045,15 @@ impl Client {
         // Git names pack files after the 20-byte SHA-1 trailer at the end of the
         // pack. Read it directly instead of re-hashing the whole file.
         if total_len < 20 {
-            anyhow::bail!("head-blobs pack is too short ({} bytes)", total_len);
+            anyhow::bail!("{} pack is too short ({} bytes)", label, total_len);
         }
         let pack_hash = {
             let file = file.try_clone().context("clone fd for trailer read")?;
+            let label = label.to_string();
             let trailer = tokio::task::spawn_blocking(move || {
                 let mut trailer = [0u8; 20];
                 file.read_at(&mut trailer, total_len - 20)
-                    .context("read head-blobs pack trailer")?;
+                    .with_context(|| format!("read {} pack trailer", label))?;
                 Ok::<_, anyhow::Error>(trailer)
             })
             .await
@@ -882,13 +1064,10 @@ impl Client {
 
         let final_path = pack_dir.join(format!("pack-{}.pack", pack_hash));
         tmp.persist(&final_path)
-            .with_context(|| format!("rename head-blobs pack to {}", final_path.display()))?;
+            .with_context(|| format!("rename {} pack to {}", label, final_path.display()))?;
         std::fs::write(pack_dir.join(format!("pack-{}.idx", pack_hash)), &idx_data)
-            .with_context(|| format!("write head-blobs idx {}", pack_hash))?;
-        info!(
-            "wrote prebuilt head-blobs pack {} ({} bytes)",
-            pack_hash, pack_bytes
-        );
+            .with_context(|| format!("write {} idx {}", label, pack_hash))?;
+        info!("wrote {} pack {} ({} bytes)", label, pack_hash, pack_bytes);
         Ok(pack_bytes + idx_data.len() as u64)
     }
 
@@ -1315,14 +1494,9 @@ impl Client {
             .map(|f| f.compressed_len as u64)
             .sum();
 
-        let threshold_mb: u64 = std::env::var("RIPCLONE_OVERLAY_THRESHOLD_MB")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(50);
-        if raw_bytes <= threshold_mb * 1024 * 1024 {
-            return false;
-        }
-
+        // No size threshold: overlay is opt-in (see overlay::is_available), so if
+        // the operator asked for it we honor it for any repo, falling back only
+        // when there isn't enough tmpfs space or the kernel disallows the mount.
         let margin_mb: u64 = std::env::var("RIPCLONE_OVERLAY_MARGIN_MB")
             .ok()
             .and_then(|s| s.parse().ok())

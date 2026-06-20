@@ -4,15 +4,30 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Whether overlay staging is even worth trying on this host.
+/// Whether a temp (in-memory, ephemeral) clone is available on this host.
+///
+/// Opt-in only. A temp clone is materialized on tmpfs (`/dev/shm`) via an
+/// overlay mount that is left in place — so the working tree lives in RAM and
+/// does NOT survive a reboot. That's ideal for ephemeral agent/CI machines but
+/// a surprising durability change for a normal clone, so we never enable it
+/// implicitly. Enable with the `--temp` CLI flag or `RIPCLONE_TEMP=1`.
 pub fn is_available() -> bool {
     if cfg!(not(target_os = "linux")) {
         return false;
     }
-    if std::env::var_os("RIPCLONE_NO_OVERLAY").is_some() {
+    if !env_enabled("RIPCLONE_TEMP") {
         return false;
     }
     Path::new("/dev/shm").is_dir()
+}
+
+fn env_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| {
+            let v = v.trim();
+            !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
+        })
+        .unwrap_or(false)
 }
 
 /// Directory to use for overlay lower/upper/work dirs. Defaults to `/dev/shm`
