@@ -18,9 +18,20 @@ See `CHANGELOG.md` for the full list. The important baseline for current work:
 
 ## Current plan
 
-The next batch of work is about making the client fast, predictable, and globally consistent, and giving users knobs that match their workload.
+The next batch of work is about making the client fast, predictable, and globally consistent, while keeping the default behavior identical to what users expect from `git clone`.
 
-### 1. Unified async download/write pipeline
+### 1. Archive chunks vs. head-blobs pack
+
+Both represent the **same** depth: the `HEAD` commit only. They are not different history depths.
+
+- **Head-blobs pack** = every blob reachable from `HEAD`, stored as a git packfile. This is what makes `git diff`, `git show`, and `git checkout-index` work.
+- **Archive chunks** = the same blob bytes, grouped and zstd-compressed for fast parallel file materialization.
+
+For branches: each branch gets its own clonepack. For history beyond `HEAD`: not supported yet; that is the future “clonepack deltas” item.
+
+Because the two representations contain the same data, fetching both is redundant. The modes below decide which one to use (or whether to use both in parallel for speed).
+
+### 2. Unified async download/write pipeline
 
 The client should not wait for the metadata chunk before it starts downloading data. The manifest is tiny and already lists every chunk hash and length.
 
@@ -30,74 +41,83 @@ Target sequence:
 2. Fetch manifest.
 3. Immediately enqueue into a bounded async fetch pool:
    - metadata chunk (highest priority),
-   - head-blobs chunks,
-   - archive chunks.
+   - head-blobs chunks (for `full`/`hybrid` modes),
+   - archive chunks (for `fast`/`hybrid` modes).
 4. On metadata arrival: decode it, write skeleton pack/idx and prebuilt `.git/index`, and spawn archive extraction workers.
 5. On each archive chunk arrival: push it to the extractor, which decompresses frames and writes files as later chunks still download.
-6. On each head-blobs chunk arrival: write it to the correct byte offset in `pack-{hash}.pack` (streamed, not buffered in a `Vec<u8>`). When all chunks + idx are present, the pack is valid.
+6. On each head-blobs chunk arrival: write it to the correct byte offset in the pack file. Compute the pack SHA-256 incrementally so the filename is known as soon as the last byte lands. Do not collect the whole pack into a `Vec<u8>`.
 7. Materialize the working tree:
-   - archive-first modes: files are already written as chunks arrive.
-   - direct-install mode: run `git checkout-index` as soon as the head-blobs pack is complete.
+   - `full` mode: run `git checkout-index` as soon as the head-blobs pack + idx are complete.
+   - `fast`/`hybrid` modes: files are already written as archive chunks arrive.
+8. The CLI only returns after the working tree **and** the expected `.git` depth for the chosen mode are ready.
 
-This removes the current stalls: metadata-before-data, head-blobs buffered in RAM, and checkout-after-everything.
+Buffering rule for archive chunks that arrive before metadata: spill them to a bounded temp directory keyed by chunk index. If memory pressure is low, keep the first few in RAM; otherwise write all early chunks to disk. Clean up the spill directory on success or failure.
 
-### 2. User-facing clone modes
+Install rule: write into a temp directory beside the target and atomic-rename on success. On failure, delete the temp directory.
 
-Replace the hidden `RIPCLONE_EXTRACT_ARCHIVE=1` flag with explicit modes that match what users expect from git:
+Retry rule: every chunk download is retried with exponential backoff. Because chunks are content-addressed, a retry cannot corrupt the repo.
+
+### 3. User-facing clone modes
+
+Replace the hidden `RIPCLONE_EXTRACT_ARCHIVE=1` flag with explicit modes. The default must behave like `git clone --depth=1`: the repo is complete and ready to use when the command returns.
 
 | Mode | Downloads | Result | Best for |
 |---|---|---|---|
-| `fast` | metadata + archive chunks | Working tree present; HEAD blobs **not** in `.git/objects`. | Agents that edit and commit; rarely run `git diff`/`git show`. |
-| `full` | metadata + head-blobs pack/idx | Complete `.git`; all git commands work. | Agents that need `git diff`, `git show`, `git log -p`, etc. |
-| `hybrid` | metadata + archive chunks + head-blobs chunks (concurrent) | Working tree ready instantly; head-blobs pack written in the background so the repo becomes complete seconds later. | **Default.** Best initial experience; completeness follows. |
+| `full` *(default)* | metadata + head-blobs pack/idx | Complete `.git`; `git status`, `git diff`, `git show`, `git log -p` all work. | **Default.** Matches normal git expectations. |
+| `fast` | metadata + archive chunks | Working tree present; HEAD blobs **not** in `.git/objects`. `git status`/`git add`/`git commit` work; `git diff`/`git show` do not. | Opt-in speed mode for agents that only edit and commit. |
+| `hybrid` | metadata + archive chunks + head-blobs chunks (concurrent) | Archive materializes files while head-blobs download in parallel; CLI blocks until both are done. | Opt-in when bandwidth allows both streams and checkout-index is slow. |
 | `skeleton` | metadata + skeleton pack/idx | `.git` only, no working tree. | Special-purpose, already supported. |
+| `lazy` *(future)* | metadata + archive chunks first; head-blobs fetched by a daemon afterwards | Fast startup; repo becomes complete in the background. | Future mode for interactive use. |
 
-`fast`/`full`/`hybrid` are surfaced as `--mode <name>` and `RIPCLONE_MODE`. The CLI default should be `hybrid`.
+Mode is surfaced as `--mode <name>` and `RIPCLONE_MODE`.
 
-### 3. Edge warmth with Tigris
+### 4. Edge warmth with Tigris
 
 Tigris Global buckets already cache objects near the requester, but the first request from a new region is a cold-cache miss. We keep Tigris and warm the cache instead of adding a separate CDN.
 
-Two complementary tactics:
+**Immediate:** evaluate switching the deployed server from the region-stamped `fly.storage.tigris.dev` endpoint to the canonical `https://t3.storage.dev` endpoint.
 
-1. **Fly-region cache warmers (first)**
-   - Deploy a tiny `ripclone-warmer` app in multiple Fly regions.
-   - After each sync/build, each warmer fetches the latest commit’s chunks for the default branch.
-   - Local data is deleted immediately; the goal is only to pull Tigris objects into that region’s cache.
-   - Cheap, simple, and works with the existing Global bucket.
+**Future optimizations:**
 
-2. **Tigris multi-region bucket for tip commits (optional later)**
-   - Keep a Tigris Multi-region bucket (e.g., `USA`) for the latest commit of each branch.
-   - Write new artifacts to both Global and Multi-region; GC old commits out of Multi-region after a configurable window.
-   - Signed URLs point at the Multi-region bucket for hot commits.
-   - More expensive but guarantees eager replication and strong consistency across the geography.
+1. **Fly-region cache warmers**
+   - Deploy a tiny `ripclone-warmer` daemon in multiple Fly regions.
+   - After each sync/build, fetch the latest commit’s chunks for the default branch (download only; do not materialize a working tree).
+   - Discard bytes locally; the goal is only to pull Tigris objects into that region’s cache.
+   - Warmers authenticate the same way as clients.
 
-Also: evaluate switching the deployed server from the region-stamped `fly.storage.tigris.dev` endpoint to the canonical `https://t3.storage.dev` endpoint.
+2. **Tigris multi-region bucket for tip commits**
+   - For the latest commit of each branch, use a Tigris Multi-region bucket so data is already in every region.
+   - Older commits stay in the cheaper Global bucket.
+   - This is a paid-feature tier, not the immediately important path.
 
-### 4. Per-phase benchmark breakdown
+### 5. Per-phase benchmark breakdown
 
-Add a benchmark mode that reports time spent in each phase, not just end-to-end time:
+Add a benchmark mode that reports time spent in each phase, with precise definitions:
 
-- `resolve_ms`
-- `manifest_ms`
-- `metadata_ms`
-- `head_blobs_download_ms`
-- `archive_download_ms`
-- `write_ms` / `checkout_ms`
-- `total_ms`
+- `resolve_ms`: ref request sent to ref response received.
+- `manifest_ms`: manifest downloaded + decoded.
+- `metadata_ms`: metadata chunk downloaded + decoded + skeleton/index written.
+- `head_blobs_download_ms`: first head-blobs chunk request sent to last head-blobs byte received.
+- `archive_download_ms`: first archive chunk request sent to last archive byte received.
+- `write_ms`: first working-tree byte written to last file closed.
+- `checkout_ms`: `git checkout-index` duration, or extractor worker duration for archive modes.
+- `total_ms`: wall clock from CLI start to exit.
 
-This separates network wins (Tigris warming) from code wins (pipeline overlap, streaming writes).
+Also report bytes per phase and per-chunk throughput. This separates network wins from code wins.
 
-### 5. Production hardening still missing
+### 6. Production hardening still missing
 
 - **Prometheus `/metrics`**: replace the JSON snapshot with Prometheus text format.
 - **Real `/readyz`**: check storage and ref-store health instead of always returning `ok`.
 - **JWT auth flow**: `ripclone auth login` that exchanges a secret for a short-lived JWT, plus `/v1/auth/refresh`.
 - **GitHub App path**: support installation tokens in addition to the env-var PAT.
 - **CI and integration tests**: GitHub Actions workflow with `cargo test`, `cargo clippy -- -D warnings`, `cargo fmt --check`, Docker build, and an end-to-end clone test against a fixture repo.
+- **Extend existing e2e scripts**:
+  - `scripts/e2e_clonepack.sh` already tests default vs. archive extraction for a public fixture; extend it to test `--mode=full`, `--mode=fast`, and `--mode=hybrid` and verify `git diff`/`git show` per mode.
+  - `scripts/e2e_archive.sh` already verifies content, symlinks, executable bits, and edit detection for direct-install; reuse it for all modes.
 - **Fuzz/property tests**: random manifests should either produce the expected tree or return `Err`, never a silently short tree.
 
-### 6. Clonepack deltas / compaction (future)
+### 7. Clonepack deltas / compaction (future)
 
 Once warm full clones are fast and predictable, move from full clonepacks per commit to append-only delta chunks for recent commits, with background compaction. This is on the roadmap but not the current focus.
 
