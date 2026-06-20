@@ -4,21 +4,51 @@
 
 # ripclone
 
-A headless backend for fast git clones.
+ripclone is the fastest way to clone git repos. Large repos see 5x-10x speedup; small repos are also a bit faster.
 
 ripclone pre-builds git artifacts for every pushed commit so that agents, CI systems, and humans can clone a repo and start working in seconds instead of waiting for a full `git clone`. It is **read-only** and **clone-only**: it does not proxy commits or pushes. You use normal git with your own GitHub tokens for writes.
 
 It is designed to be self-hosted and works for private or public repos. For the easiest experience, sign up for free (for public repos) at [Ripclone Cloud](https://ripclone.com).
 
+ripclone started from a simple question asked by [Jarred Sumner](https://x.com/jarredsumner/status/2066420871753838913): 
+
+> *"It's hard to imagine why cloning a git repo should be much slower than downloading an equivalent-sized file. Where are the experiments with custom git clients that clone faster?"* 
+
+ripclone is one answer.
+
 ## How it works
 
-Git stores a repo as a Merkle tree: commits point to trees, trees point to blobs, and blobs are file contents. The `.git/index` is a snapshot of which blobs should be on disk. When you `git clone`, Git downloads a packfile containing commits/trees/blobs, and then writes them to disk.
+A normal `git clone` downloads a packfile of commits, trees, and blobs, then runs `git init`, `git index-pack`, `git read-tree`, and `git checkout-index` to build the `.git` directory and working tree. ripclone runs those steps ahead of time on the server so the client can skip them.
 
-You can speed this up with a shallow clone (`--depth=1`), which skips old history but still fetches every blob for `HEAD`. Or a partial/blobless clone (`--filter=blob:none`), which skips blobs at first but has to fetch them lazily when you run commands like `git diff`. Neither is ideal for a human or agent that wants a fully working repo immediately.
+On every push, ripclone mirrors the repo and builds a **clonepack** for `HEAD`. A clonepack has three pieces:
 
-ripclone takes a different approach. On every push, it builds a **clonepack**: a top-level manifest that points to a metadata chunk (skeleton pack, HEAD-blobs pack, prebuilt `.git/index`, plus file/frame tables) and content-addressed archive chunks holding the working-tree file bytes. When you run `ripclone clone`, the client fetches the manifest, metadata chunk, and data chunks concurrently, installs the prebuilt `.git` artifacts directly, and then materializes the working tree. The default `--mode=full` uses `git checkout-index` from the prebuilt HEAD-blobs pack so the repo behaves exactly like a normal `git clone --depth=1`. `--mode=fast` writes files directly from zstd archive chunks for agents that only edit and commit. `--mode=hybrid` runs both streams concurrently. No `git init`, `git index-pack`, `git read-tree`, or `git update-index`.
+**Manifest.** A small file that lists the hashes of the metadata chunk and every content chunk. The client downloads this first to know what to fetch.
 
-The result is a normal git repo with a clean `git status` and working `git diff`, ready in a fraction of the time.
+**Metadata chunk.** Contains a skeleton pack and index, a prebuilt `.git/index`, and tables that map every file path to its mode, blob hash, and byte location in the archive. The client uses this to assemble `.git/` without running any git commands.
+
+**Content chunks.** The actual file bytes for `HEAD`.
+
+### The skeleton
+
+The skeleton is a git packfile containing the `HEAD` commit object and every tree reachable from it, but no blobs. It is enough for git to understand the shape of the repo — every directory, file path, mode, and blob hash — without the file contents. The client drops the skeleton pack into `.git/objects/pack/` alongside the prebuilt index, so commands like `git ls-tree`, `git log`, and `git status` work immediately.
+
+### Getting the file bytes
+
+ripclone stores the same `HEAD` file bytes in two formats so you can choose the tradeoff.
+
+**Head-blobs pack.** A normal git packfile containing every blob reachable from `HEAD`. When the client installs this pack next to the skeleton, `git diff`, `git show`, and `git checkout-index` all behave exactly like a regular `git clone --depth=1`.
+
+**Archive chunks.** The same blob bytes grouped into zstd-compressed chunks. Each chunk is made of independent zstd frames, so the client can fetch many chunks in parallel and start decompressing and writing files as soon as the first bytes arrive, while later chunks are still downloading. This is faster than a git pack for pure materialization, but it leaves `.git/objects` without blobs, so raw git content commands do not work.
+
+### Clone modes
+
+`--mode=full` (the default) downloads the metadata chunk and the head-blobs pack, installs the prebuilt `.git/` artifacts, and runs `git checkout-index` to write the working tree. The result is indistinguishable from `git clone --depth=1`.
+
+`--mode=fast` downloads the metadata chunk and the archive chunks, then writes files directly from the zstd frames without using git checkout. This is the fastest way to get a working tree for agents that only edit and commit.
+
+`--mode=hybrid` downloads both the head-blobs pack and the archive chunks concurrently, writes files from the archive, and also installs the head-blobs pack so the repo has full git compatibility as soon as the pack lands.
+
+`--mode=skeleton` downloads only the metadata chunk. It gives you a valid `.git/` with history and tree structure but no working tree and no blob objects.
 
 ### Performance
 
@@ -138,17 +168,6 @@ Object storage   Local disk
 - **Clients** download manifests, skeletons, and archives; stream-decompress frames; and write files directly.
 - **GitHub remains the source of truth** for repos, refs, permissions, and writes.
 - **IP rate limiting** protects public endpoints from abuse.
-
-## Docs
-
-- [`ROADMAP.md`](ROADMAP.md) — technical direction for the headless backend.
-- [`docs/GITHUB_INTEGRATION.md`](docs/GITHUB_INTEGRATION.md) — GitHub integration and auth notes.
-- [`docs/ARCHIVE_ADVERSARIAL_REVIEW.md`](docs/ARCHIVE_ADVERSARIAL_REVIEW.md) — code-level review of the archive-first path.
-- [`docs/CAS_CLONE_SPIKES_FINDINGS.md`](docs/CAS_CLONE_SPIKES_FINDINGS.md) — v1 spike results.
-
-## Status
-
-ripclone is under active development. The archive-first clone path, native git remote helper, S3-compatible object storage, token auth, rate limiting, retention, and smart-HTTP fallback are implemented. Streaming extraction and delta updates are future work.
 
 ## License
 
