@@ -5,8 +5,10 @@ use std::str::FromStr;
 /// how the working tree is materialized.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
 pub enum CloneMode {
-    /// Default. Complete `.git` with head-blobs pack; `git checkout-index`
-    /// materializes the working tree. Matches normal `git clone` expectations.
+    /// Default. Complete `.git`: the working tree is materialized directly from
+    /// archive chunks, and HEAD blobs are written into `.git/objects` as a
+    /// locally-built packfile. Matches normal `git clone` expectations without
+    /// the redundant head-blobs download.
     #[default]
     #[value(name = "full")]
     Full,
@@ -16,9 +18,8 @@ pub enum CloneMode {
     #[value(name = "fast")]
     Fast,
 
-    /// Both archive extraction and head-blobs download run concurrently. The CLI
-    /// blocks until the working tree is written and the head-blobs pack is in
-    /// `.git`.
+    /// Alias for `Full`. The old "hybrid" path downloaded both archive chunks
+    /// and a separate head-blobs pack; that dual download has been removed.
     #[value(name = "hybrid")]
     Hybrid,
 
@@ -29,12 +30,13 @@ pub enum CloneMode {
 }
 
 impl CloneMode {
-    pub fn needs_head_blobs(self) -> bool {
+    /// True for modes that build a local blob pack from extracted archive bytes.
+    pub fn needs_blob_pack(self) -> bool {
         matches!(self, CloneMode::Full | CloneMode::Hybrid)
     }
 
     pub fn needs_archive(self) -> bool {
-        matches!(self, CloneMode::Fast | CloneMode::Hybrid)
+        matches!(self, CloneMode::Full | CloneMode::Fast | CloneMode::Hybrid)
     }
 
     pub fn needs_worktree(self) -> bool {
@@ -42,8 +44,9 @@ impl CloneMode {
     }
 
     pub fn needs_checkout(self) -> bool {
-        // Skeleton has no working tree; fast/hybrid use archive extraction.
-        matches!(self, CloneMode::Full)
+        // The working tree is always materialized directly from the archive;
+        // no separate git checkout-index step is required.
+        false
     }
 }
 

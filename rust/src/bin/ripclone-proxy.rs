@@ -9,8 +9,8 @@ use futures::StreamExt;
 use reqwest::Client;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use tokio::sync::Mutex;
 use tokio::time::{Instant, sleep};
 
 #[derive(Parser)]
@@ -29,45 +29,82 @@ struct Args {
     /// Optional aggregate bandwidth cap in Mbps.
     #[arg(default_value = "0")]
     bandwidth_mbps: f64,
+    /// Forward Authorization headers to the upstream. Useful when the upstream
+    /// requires the ripclone token for benchmarking.
+    #[arg(long)]
+    forward_auth: bool,
 }
 
-struct TokenBucket {
-    /// Tokens available in bytes.
+/// Lock-free token bucket for per-stream bandwidth shaping.
+///
+/// Stores token balance as micro-bytes in an atomic u64 so many concurrent
+/// streams can consume from the shared bucket without serializing on a mutex.
+/// Each stream CAS-loops to deduct its byte count; if there are insufficient
+/// tokens it sleeps and retries.
+struct AtomicTokenBucket {
     rate: f64,
-    /// Max burst in bytes (one second at rate).
     max: f64,
-    tokens: f64,
-    last: Instant,
+    base: Instant,
+    /// Token balance in micro-bytes at `last_ns`.
+    tokens_micro: AtomicU64,
+    /// Nanoseconds since `base` when `tokens_micro` was last updated.
+    last_ns: AtomicU64,
 }
 
-impl TokenBucket {
+impl AtomicTokenBucket {
     fn new(bandwidth_mbps: f64) -> Self {
         let rate = bandwidth_mbps * 1_000_000.0 / 8.0;
+        let base = Instant::now();
+        // Start with a full one-second burst.
+        let tokens_micro = (rate * 1_000_000.0) as u64;
         Self {
             rate,
             max: rate,
-            tokens: rate,
-            last: Instant::now(),
+            base,
+            tokens_micro: AtomicU64::new(tokens_micro),
+            last_ns: AtomicU64::new(0),
         }
     }
 
-    async fn consume(&mut self, bytes: usize) {
+    async fn consume(&self, bytes: usize) {
         if self.rate <= 0.0 || bytes == 0 {
             return;
         }
         let needed = bytes as f64;
-        let now = Instant::now();
-        let elapsed = now.duration_since(self.last).as_secs_f64();
-        self.tokens = (self.tokens + elapsed * self.rate).min(self.max);
-        self.last = now;
+        loop {
+            let now_ns = self.base.elapsed().as_nanos() as u64;
+            let tokens_micro = self.tokens_micro.load(Ordering::Acquire);
+            let last_ns = self.last_ns.load(Ordering::Acquire);
+            let elapsed = (now_ns.saturating_sub(last_ns)) as f64 / 1_000_000_000.0;
+            let mut tokens = tokens_micro as f64 / 1_000_000.0 + elapsed * self.rate;
+            if tokens > self.max {
+                tokens = self.max;
+            }
 
-        if self.tokens < needed {
-            let deficit = needed - self.tokens;
+            if tokens >= needed {
+                let new_tokens = tokens - needed;
+                let new_tokens_micro = (new_tokens * 1_000_000.0) as u64;
+                if self
+                    .tokens_micro
+                    .compare_exchange(
+                        tokens_micro,
+                        new_tokens_micro,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    self.last_ns.store(now_ns, Ordering::Release);
+                    return;
+                }
+                // CAS failed, another stream won; retry immediately.
+                continue;
+            }
+
+            let deficit = needed - tokens;
             let sleep_secs = deficit / self.rate;
             sleep(Duration::from_secs_f64(sleep_secs)).await;
-            self.tokens += sleep_secs * self.rate;
         }
-        self.tokens -= needed;
     }
 }
 
@@ -76,10 +113,11 @@ struct ProxyState {
     client: Client,
     upstream: String,
     latency: Duration,
-    bucket: Option<Arc<Mutex<TokenBucket>>>,
+    bucket: Option<Arc<AtomicTokenBucket>>,
+    forward_auth: bool,
 }
 
-fn copy_headers(src: &HeaderMap, dst: &mut HeaderMap, upstream_base: &str) {
+fn copy_headers(src: &HeaderMap, dst: &mut HeaderMap, upstream_base: &str, forward_auth: bool) {
     for (key, value) in src.iter() {
         if key == HOST {
             let host = upstream_base
@@ -91,10 +129,11 @@ fn copy_headers(src: &HeaderMap, dst: &mut HeaderMap, upstream_base: &str) {
             }
         } else if key.as_str().eq_ignore_ascii_case("connection")
             || key.as_str().eq_ignore_ascii_case("keep-alive")
-            || key.as_str().eq_ignore_ascii_case("authorization")
             || key.as_str().eq_ignore_ascii_case("cookie")
+            || (!forward_auth && key.as_str().eq_ignore_ascii_case("authorization"))
         {
-            // Do not forward hop-by-hop or credential headers to the upstream.
+            // Do not forward hop-by-hop or credential headers to the upstream
+            // unless explicitly asked to forward auth.
             continue;
         } else {
             dst.append(key, value.clone());
@@ -120,7 +159,7 @@ async fn proxy_handler(State(state): State<ProxyState>, req: Request<Body>) -> i
 
     let mut upstream_req = state.client.request(parts.method, &url).body(upstream_body);
     let mut headers = HeaderMap::new();
-    copy_headers(&parts.headers, &mut headers, &state.upstream);
+    copy_headers(&parts.headers, &mut headers, &state.upstream, state.forward_auth);
     for (key, value) in headers.iter() {
         upstream_req = upstream_req.header(key, value);
     }
@@ -157,7 +196,7 @@ async fn proxy_handler(State(state): State<ProxyState>, req: Request<Body>) -> i
             match result {
                 Ok(chunk) => {
                     if let Some(b) = bucket {
-                        b.lock().await.consume(chunk.len()).await;
+                        b.consume(chunk.len()).await;
                     }
                     Ok::<_, reqwest::Error>(chunk)
                 }
@@ -185,7 +224,7 @@ async fn main() -> anyhow::Result<()> {
     }
     let latency = Duration::from_secs_f64(args.latency.max(0.0));
     let bucket = if args.bandwidth_mbps > 0.0 {
-        Some(Arc::new(Mutex::new(TokenBucket::new(args.bandwidth_mbps))))
+        Some(Arc::new(AtomicTokenBucket::new(args.bandwidth_mbps)))
     } else {
         None
     };
@@ -200,6 +239,7 @@ async fn main() -> anyhow::Result<()> {
         upstream,
         latency,
         bucket,
+        forward_auth: args.forward_auth,
     };
 
     let app = Router::new()
