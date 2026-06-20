@@ -6,7 +6,9 @@ set -euo pipefail
 # pack/idx, index, archive, manifest) during sync. The client only downloads
 # and writes files.
 
-REPO="oven-sh/bun"
+REPO="${REPO:-oven-sh/bun}"
+OWNER="${REPO%%/*}"
+NAME="${REPO#*/}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
@@ -23,6 +25,10 @@ done
 file_size() {
   stat -f%z "$1" 2>/dev/null || stat -c%s "$1"
 }
+
+if [ -z "${RIPCLONE_TOKEN:-}" ]; then
+  export RIPCLONE_TOKEN="test-token"
+fi
 
 now_ms() {
   perl -MTime::HiRes=time -e 'printf "%d\n", time * 1000'
@@ -74,6 +80,115 @@ require_clean_status() {
   fi
 }
 
+verify_contents() {
+  local dir="$1"
+  local label="$2"
+
+  echo ""
+  echo "==> Verifying $label file contents against HEAD..."
+  local content_errors=0
+  while IFS= read -r -d '' record; do
+    local meta_path="${record%%$'\t'*}"
+    local path="${record#*$'\t'}"
+    local meta=( $meta_path )
+    local mode="${meta[0]}"
+    local obj_type="${meta[1]}"
+    if [ -z "$path" ] || [ "$obj_type" != "blob" ]; then
+      continue
+    fi
+    # Symlinks are verified separately by comparing the link target.
+    if [[ "$mode" == 120* ]]; then
+      continue
+    fi
+    # Use git's own diff so clean/smudge filters (e.g. core.autocrlf,
+    # .gitattributes text=auto) are respected.
+    if ! (cd "$dir" && git diff --quiet HEAD -- "$path"); then
+      echo "error: content mismatch for $path"
+      content_errors=$((content_errors + 1))
+    fi
+  done < <(git -C "$MIRROR_DIR" ls-tree -r -z HEAD)
+  if [ "$content_errors" -ne 0 ]; then
+    exit 1
+  fi
+  echo "$label file contents match HEAD"
+
+  echo "==> Verifying $label git status is clean..."
+  require_clean_status "$dir" "git status not clean after $label"
+
+  echo "==> Verifying $label tracked files are present..."
+  local missing=0
+  while IFS= read -r -d '' path; do
+    if [ ! -e "$dir/$path" ] && [ ! -L "$dir/$path" ]; then
+      echo "error: tracked file missing: $path"
+      missing=$((missing + 1))
+    fi
+  done < <(cd "$dir" && git ls-files -z)
+  if [ "$missing" -ne 0 ]; then
+    exit 1
+  fi
+  echo "$label all tracked files present"
+
+  echo "==> Verifying $label symlinks..."
+  local symlink_errors=0
+  while IFS= read -r -d '' record; do
+    local meta_path="${record%%$'\t'*}"
+    local path="${record#*$'\t'}"
+    local meta=( $meta_path )
+    local mode="${meta[0]}"
+    if [[ "$mode" == 120* ]]; then
+      local expected
+      expected=$(git -C "$MIRROR_DIR" cat-file blob "HEAD:$path" 2>/dev/null || true)
+      local actual
+      actual=$(readlink "$dir/$path" || true)
+      if [ "$expected" != "$actual" ]; then
+        echo "error: symlink mismatch for $path: expected '$expected', got '$actual'"
+        symlink_errors=$((symlink_errors + 1))
+      fi
+    fi
+  done < <(git -C "$MIRROR_DIR" ls-tree -r -z HEAD)
+  if [ "$symlink_errors" -ne 0 ]; then
+    exit 1
+  fi
+  echo "$label symlinks OK"
+
+  echo "==> Verifying $label executable bits..."
+  local exe_errors=0
+  while IFS= read -r -d '' record; do
+    local meta_path="${record%%$'\t'*}"
+    local path="${record#*$'\t'}"
+    local meta=( $meta_path )
+    local mode="${meta[0]}"
+    if [ -z "$path" ]; then continue; fi
+    if [ "$mode" = "100755" ]; then
+      if [ ! -x "$dir/$path" ]; then
+        echo "error: expected executable: $path"
+        exe_errors=$((exe_errors + 1))
+      fi
+    elif [ "$mode" = "100644" ]; then
+      if [ -x "$dir/$path" ]; then
+        echo "error: unexpected executable bit: $path"
+        exe_errors=$((exe_errors + 1))
+      fi
+    fi
+  done < <(git -C "$MIRROR_DIR" ls-tree -r -z HEAD)
+  if [ "$exe_errors" -ne 0 ]; then
+    exit 1
+  fi
+  echo "$label executable bits OK"
+
+  echo "==> Verifying $label basic git operations..."
+  cd "$dir"
+  if ! git log --oneline -1 >/dev/null; then
+    echo "error: git log failed for $label"
+    exit 1
+  fi
+  if ! git diff --quiet HEAD; then
+    echo "error: git diff reports changes for $label"
+    exit 1
+  fi
+  echo "$label git operations OK"
+}
+
 echo "==> Starting server..."
 start_server
 
@@ -84,140 +199,32 @@ sync_start=$(now_ms)
 sync_end=$(now_ms)
 printf "sync took %d ms\n" $((sync_end - sync_start))
 
-MIRROR_DIR="$REPO_ROOT/oven-sh_bun.git"
+MIRROR_DIR="$REPO_ROOT/${OWNER}_${NAME}.git"
 if [ ! -d "$MIRROR_DIR" ]; then
   echo "error: mirror not found at $MIRROR_DIR"
   exit 1
 fi
 
 echo ""
-echo "==> Direct-install clone..."
+echo "==> Full mode clone (git checkout-index)..."
 install_dir="$BASE_DIR/bun-install"
 install_start=$(now_ms)
-"$RIPCLONE" --server "$SERVER_URL" clone "$REPO" --dir "$install_dir"
+"$RIPCLONE" --server "$SERVER_URL" clone "$REPO" --dir "$install_dir" --mode=full
 install_end=$(now_ms)
-printf "install took %d ms\n" $((install_end - install_start))
+printf "full install took %d ms\n" $((install_end - install_start))
 
-# -----------------------------------------------------------------------------
-# Content correctness: every regular file's bytes must match its HEAD blob.
-# We use the bare mirror as the source of truth so export-ignored files are
-# also checked (our archive builder intentionally includes them).
-# -----------------------------------------------------------------------------
-echo ""
-echo "==> Verifying file contents against HEAD blobs..."
-content_errors=0
-while IFS= read -r -d '' record; do
-  meta_path="${record%%$'\t'*}"
-  path="${record#*$'\t'}"
-  meta=( $meta_path )
-  mode="${meta[0]}"
-  obj_type="${meta[1]}"
-  sha="${meta[2]}"
-  if [ -z "$path" ] || [ "$obj_type" != "blob" ]; then
-    continue
-  fi
-  # Symlinks are verified separately by comparing the link target.
-  if [[ "$mode" == 120* ]]; then
-    continue
-  fi
-  actual=$(git hash-object "$install_dir/$path" 2>/dev/null || true)
-  if [ "$actual" != "$sha" ]; then
-    echo "error: content mismatch for $path: expected $sha got $actual"
-    content_errors=$((content_errors + 1))
-  fi
-done < <(git -C "$MIRROR_DIR" ls-tree -r -z HEAD)
-if [ "$content_errors" -ne 0 ]; then
-  exit 1
-fi
-echo "file contents match HEAD blobs"
-
-# -----------------------------------------------------------------------------
-# Git-level sanity checks.
-# -----------------------------------------------------------------------------
-echo ""
-echo "==> Verifying git status is clean..."
-require_clean_status "$install_dir" "git status not clean after install"
-
-echo "==> Verifying all tracked files are present..."
-missing=0
-while IFS= read -r -d '' path; do
-  if [ ! -e "$install_dir/$path" ] && [ ! -L "$install_dir/$path" ]; then
-    echo "error: tracked file missing: $path"
-    missing=$((missing + 1))
-  fi
-done < <(cd "$install_dir" && git ls-files -z)
-if [ "$missing" -ne 0 ]; then
-  exit 1
-fi
-echo "all tracked files present"
-
-echo "==> Verifying symlinks..."
-symlink_errors=0
-while IFS= read -r -d '' record; do
-  meta_path="${record%%$'\t'*}"
-  path="${record#*$'\t'}"
-  meta=( $meta_path )
-  mode="${meta[0]}"
-  if [[ "$mode" == 120* ]]; then
-    expected=$(git -C "$MIRROR_DIR" cat-file blob "HEAD:$path" 2>/dev/null || true)
-    actual=$(readlink "$install_dir/$path" || true)
-    if [ "$expected" != "$actual" ]; then
-      echo "error: symlink mismatch for $path: expected '$expected', got '$actual'"
-      symlink_errors=$((symlink_errors + 1))
-    fi
-  fi
-done < <(git -C "$MIRROR_DIR" ls-tree -r -z HEAD)
-if [ "$symlink_errors" -ne 0 ]; then
-  exit 1
-fi
-echo "symlinks OK"
-
-echo "==> Verifying executable bits..."
-exe_errors=0
-while IFS= read -r -d '' record; do
-  meta_path="${record%%$'\t'*}"
-  path="${record#*$'\t'}"
-  meta=( $meta_path )
-  mode="${meta[0]}"
-  if [ -z "$path" ]; then continue; fi
-  if [ "$mode" = "100755" ]; then
-    if [ ! -x "$install_dir/$path" ]; then
-      echo "error: expected executable: $path"
-      exe_errors=$((exe_errors + 1))
-    fi
-  elif [ "$mode" = "100644" ]; then
-    if [ -x "$install_dir/$path" ]; then
-      echo "error: unexpected executable bit: $path"
-      exe_errors=$((exe_errors + 1))
-    fi
-  fi
-done < <(git -C "$MIRROR_DIR" ls-tree -r -z HEAD)
-if [ "$exe_errors" -ne 0 ]; then
-  exit 1
-fi
-echo "executable bits OK"
-
-echo "==> Verifying basic git operations..."
-cd "$install_dir"
-if ! git log --oneline -1 >/dev/null; then
-  echo "error: git log failed"
-  exit 1
-fi
-if ! git diff --quiet HEAD; then
-  echo "error: git diff reports changes"
-  exit 1
-fi
-echo "git operations OK"
+verify_contents "$install_dir" "full"
 
 echo "==> Verifying origin remote is configured..."
-origin_url=$(git remote get-url origin 2>/dev/null || true)
-if [ "$origin_url" != "https://github.com/oven-sh/bun.git" ]; then
+origin_url=$(cd "$install_dir" && git remote get-url origin 2>/dev/null || true)
+if [ "$origin_url" != "https://github.com/$REPO.git" ]; then
   echo "error: unexpected origin url: '$origin_url'"
   exit 1
 fi
 echo "origin remote OK: $origin_url"
 
 echo "==> Verifying edits are detected..."
+cd "$install_dir"
 echo "# modified" >> README.md
 if git diff --quiet HEAD; then
   echo "error: git diff did not detect an edit"
@@ -228,9 +235,20 @@ require_clean_status "$install_dir" "git status not clean after reverting edit"
 echo "edit detection OK"
 
 echo "==> Verifying git status stays clean with core.fileMode=true..."
+cd "$install_dir"
 git config core.fileMode true
 require_clean_status "$install_dir" "git status not clean after enabling core.fileMode"
 echo "core.fileMode=true OK"
+
+echo ""
+echo "==> Fast mode clone (archive extraction only)..."
+fast_dir="$BASE_DIR/bun-fast"
+fast_start=$(now_ms)
+"$RIPCLONE" --server "$SERVER_URL" clone "$REPO" --dir "$fast_dir" --mode=fast
+fast_end=$(now_ms)
+printf "fast install took %d ms\n" $((fast_end - fast_start))
+
+verify_contents "$fast_dir" "fast"
 
 # -----------------------------------------------------------------------------
 # Summary
@@ -239,5 +257,6 @@ echo ""
 echo "=========================================================="
 echo "All e2e checks passed for $REPO."
 echo "  sync:    $((sync_end - sync_start)) ms"
-echo "  install: $((install_end - install_start)) ms"
+echo "  full:    $((install_end - install_start)) ms"
+echo "  fast:    $((fast_end - fast_start)) ms"
 echo "=========================================================="

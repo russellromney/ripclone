@@ -181,8 +181,12 @@ where
     // Validate every path before creating any directories, then create parents
     // safely (refusing symlinks and parent-dir escapes).
     for entry in manifest.files.iter() {
-        validate_relative_path(path_from_bytes(&entry.path))
-            .with_context(|| format!("invalid manifest path: {}", String::from_utf8_lossy(&entry.path)))?;
+        validate_relative_path(path_from_bytes(&entry.path)).with_context(|| {
+            format!(
+                "invalid manifest path: {}",
+                String::from_utf8_lossy(&entry.path)
+            )
+        })?;
     }
     let dirs: HashSet<PathBuf> = manifest
         .files
@@ -530,7 +534,10 @@ fn safe_create_dir_all(root: &Path, rel: &Path) -> Result<()> {
         if let std::path::Component::Normal(name) = comp {
             current.push(name);
             if current.is_symlink() {
-                anyhow::bail!("refusing to follow symlinked directory: {}", current.display());
+                anyhow::bail!(
+                    "refusing to follow symlinked directory: {}",
+                    current.display()
+                );
             }
             if !current.exists() {
                 std::fs::create_dir(&current)
@@ -564,12 +571,8 @@ fn write_entry(target_dir: &Path, entry: &FileEntry, content: &[u8]) -> Result<(
     // Refuse to operate through an existing symlink at the final component.
     // `OpenOptions::create` would follow it and write outside the target dir.
     if target.is_symlink() {
-        std::fs::remove_file(&target).with_context(|| {
-            format!(
-                "remove existing symlink {}",
-                target.display()
-            )
-        })?;
+        std::fs::remove_file(&target)
+            .with_context(|| format!("remove existing symlink {}", target.display()))?;
     }
 
     match entry.mode {
@@ -613,10 +616,7 @@ fn write_entry(target_dir: &Path, entry: &FileEntry, content: &[u8]) -> Result<(
                 use std::os::unix::fs::OpenOptionsExt;
                 let mode = if entry.mode == 0o100755 { 0o755 } else { 0o644 };
                 let mut opts = OpenOptions::new();
-                opts.write(true)
-                    .create(true)
-                    .truncate(true)
-                    .mode(mode);
+                opts.write(true).create(true).truncate(true).mode(mode);
                 let mut file = opts
                     .open(&target)
                     .with_context(|| format!("open {}", target.display()))?;
@@ -679,18 +679,12 @@ mod tests {
             let mut f = File::create(&manifest_path)?;
             manifest.write(&mut f)?;
         }
-        extract_archive_with_chunk_fetcher(
-            &manifest_path,
-            target,
-            None,
-            u64::MAX,
-            move |chunk| {
-                archive_chunks
-                    .get(chunk.chunk_index)
-                    .cloned()
-                    .ok_or_else(|| anyhow::anyhow!("missing chunk {}", chunk.chunk_index))
-            },
-        )
+        extract_archive_with_chunk_fetcher(&manifest_path, target, None, u64::MAX, move |chunk| {
+            archive_chunks
+                .get(chunk.chunk_index)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("missing chunk {}", chunk.chunk_index))
+        })
     }
 
     #[test]
@@ -885,6 +879,345 @@ const DEFAULT_STREAMING_CHUNK_SIZE: u64 = 6 * 1024 * 1024;
 /// more parallel slicing/decompression.
 const DEFAULT_LOCAL_CHUNK_SIZE: u64 = 2 * 1024 * 1024;
 
+/// Extract a working-tree archive from a channel of pre-fetched archive chunks.
+///
+/// This is the unified pipeline path: async download tasks fetch archive chunks
+/// concurrently and push them into `chunk_rx`. The extractor decompresses frames
+/// and writes files while later chunks are still downloading.
+///
+/// `manifest_path` must point to a protobuf `MetadataChunk`. The chunk index in
+/// each received message must match `FrameInfo.chunk_index` for the frames in
+/// that chunk.
+pub fn extract_archive_from_chunk_receiver(
+    manifest_path: &Path,
+    target_dir: &Path,
+    dictionary: Option<&[u8]>,
+    chunk_rx: Receiver<(usize, Result<Vec<u8>>)>,
+) -> Result<ExtractStats> {
+    let fetch_start = Instant::now();
+
+    let mut manifest_file = File::open(manifest_path)
+        .with_context(|| format!("open manifest {}", manifest_path.display()))?;
+    let mut manifest_bytes = Vec::new();
+    manifest_file
+        .read_to_end(&mut manifest_bytes)
+        .context("read manifest")?;
+    let manifest = Manifest::read(&mut manifest_bytes.as_slice())?;
+
+    // Validate every path before creating any directories, then create parents
+    // safely (refusing symlinks and parent-dir escapes).
+    for entry in manifest.files.iter() {
+        validate_relative_path(path_from_bytes(&entry.path)).with_context(|| {
+            format!(
+                "invalid manifest path: {}",
+                String::from_utf8_lossy(&entry.path)
+            )
+        })?;
+    }
+    let dirs: HashSet<PathBuf> = manifest
+        .files
+        .iter()
+        .filter_map(|e| {
+            let p = path_from_bytes(&e.path);
+            let parent = p.parent()?;
+            if parent.as_os_str().is_empty() {
+                return None;
+            }
+            Some(parent.to_path_buf())
+        })
+        .collect();
+    let mut dirs: Vec<_> = dirs.into_iter().collect();
+    dirs.sort();
+    for dir in dirs {
+        safe_create_dir_all(target_dir, &dir)
+            .with_context(|| format!("create dir {}", dir.display()))?;
+    }
+
+    let target_dir = target_dir.to_path_buf();
+    let manifest = Arc::new(manifest);
+
+    let fragments_by_frame = Arc::new(manifest.fragments_by_frame());
+
+    let mut pending_files: HashMap<usize, PendingFile> = HashMap::new();
+    for (file_idx, entry) in manifest.files.iter().enumerate() {
+        if entry.fragments.len() > 1 {
+            pending_files.insert(
+                file_idx,
+                PendingFile {
+                    fragments: vec![None; entry.fragments.len()],
+                    remaining: entry.fragments.len(),
+                },
+            );
+        }
+    }
+    let pending_files = Arc::new(Mutex::new(pending_files));
+
+    let chunks = compute_chunks(&manifest.frames, u64::MAX);
+
+    let num_cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let fetch_threads = std::env::var("RIPCLONE_FETCH_THREADS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| (num_cpus - 1).max(1));
+    let write_threads = std::env::var("RIPCLONE_WRITE_THREADS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| (num_cpus - 1).max(1));
+    let queue_depth = (fetch_threads * 2).max(write_threads * 2);
+
+    info!(
+        "extracting {} files across {} frames in {} archive chunks (fetch_threads={}, write_threads={}, queue_depth={})",
+        manifest.files.len(),
+        manifest.frames.len(),
+        chunks.len(),
+        fetch_threads,
+        write_threads,
+        queue_depth
+    );
+
+    let chunks_by_index: HashMap<usize, Chunk> =
+        chunks.into_iter().map(|c| (c.chunk_index, c)).collect();
+
+    let (compressed_tx, compressed_rx): (
+        Sender<(usize, Result<Vec<u8>>)>,
+        Receiver<(usize, Result<Vec<u8>>)>,
+    ) = bounded(queue_depth);
+    let (done_tx, done_rx): (Sender<Result<usize>>, Receiver<Result<usize>>) =
+        bounded(manifest.frames.len());
+
+    let dictionary = dictionary.map(|d| Arc::new(d.to_vec()));
+
+    // Fetcher threads read whole archive chunks from the channel, slice them into
+    // per-frame compressed buffers, and push those to the writer pool.
+    for _ in 0..fetch_threads {
+        let chunk_rx: Receiver<(usize, Result<Vec<u8>>)> = chunk_rx.clone();
+        let compressed_tx: Sender<(usize, Result<Vec<u8>>)> = compressed_tx.clone();
+        let chunks_by_index = chunks_by_index.clone();
+        let manifest2 = manifest.clone();
+        std::thread::spawn(move || {
+            while let Ok((idx, res)) = chunk_rx.recv() {
+                let chunk = match chunks_by_index.get(&idx) {
+                    Some(c) => c.clone(),
+                    None => {
+                        let _ = compressed_tx.send((
+                            idx,
+                            Err(anyhow::anyhow!("unknown archive chunk index {}", idx)),
+                        ));
+                        continue;
+                    }
+                };
+                match res {
+                    Ok(bytes) => {
+                        for frame_idx in chunk.start_frame..chunk.end_frame {
+                            let frame = &manifest2.frames[frame_idx];
+                            let off = (frame.chunk_offset - chunk.byte_start) as usize;
+                            let len = frame.compressed_len as usize;
+                            let out = if off + len > bytes.len() {
+                                Err(anyhow::anyhow!(
+                                    "frame {} (off={} len={}) out of chunk {} bounds (len={})",
+                                    frame_idx,
+                                    off,
+                                    len,
+                                    idx,
+                                    bytes.len()
+                                ))
+                            } else {
+                                Ok(bytes[off..off + len].to_vec())
+                            };
+                            if compressed_tx.send((frame_idx, out)).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        for frame_idx in chunk.start_frame..chunk.end_frame {
+                            if compressed_tx
+                                .send((
+                                    frame_idx,
+                                    Err(anyhow::anyhow!("chunk {} failed: {}", idx, e)),
+                                ))
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+    drop(chunk_rx);
+    drop(compressed_tx);
+
+    // Spawn writer threads: they decompress frames and write files.
+    for _ in 0..write_threads {
+        let compressed_rx: Receiver<(usize, Result<Vec<u8>>)> = compressed_rx.clone();
+        let done_tx: Sender<Result<usize>> = done_tx.clone();
+        let manifest2 = manifest.clone();
+        let fragments_by_frame2 = fragments_by_frame.clone();
+        let pending_files2 = pending_files.clone();
+        let target_dir2 = target_dir.clone();
+        let dictionary2 = dictionary.clone();
+        std::thread::spawn(move || {
+            while let Ok((idx, res)) = compressed_rx.recv() {
+                let result: Result<usize> = (|| {
+                    let compressed = res?;
+                    let frame = &manifest2.frames[idx];
+                    let raw = if frame.compressed_len == 0 && frame.raw_len == 0 {
+                        Vec::new()
+                    } else {
+                        match dictionary2.as_ref() {
+                            Some(dict) => {
+                                let mut decompressor =
+                                    zstd::bulk::Decompressor::with_dictionary(dict.as_slice())
+                                        .context("create zstd decompressor with dictionary")?;
+                                decompressor
+                                    .decompress(&compressed, frame.raw_len as usize)
+                                    .with_context(|| {
+                                        format!("decompress frame {} with dictionary", idx)
+                                    })?
+                            }
+                            None => zstd::decode_all(compressed.as_slice())
+                                .with_context(|| format!("decompress frame {}", idx))?,
+                        }
+                    };
+                    if raw.len() != frame.raw_len as usize {
+                        anyhow::bail!(
+                            "frame {} raw length mismatch: {} vs {}",
+                            idx,
+                            raw.len(),
+                            frame.raw_len
+                        );
+                    }
+
+                    let pairs = fragments_by_frame2
+                        .get(&(idx as u32))
+                        .cloned()
+                        .unwrap_or_default();
+                    let mut written = 0usize;
+                    for (file_idx, frag_idx) in &pairs {
+                        let entry = &manifest2.files[*file_idx];
+                        let fragment = &entry.fragments[*frag_idx];
+                        let off = fragment.frame_offset as usize;
+                        let len = fragment.raw_len as usize;
+                        if off + len > raw.len() {
+                            anyhow::bail!(
+                                "fragment for {} extends past frame {}",
+                                String::from_utf8_lossy(&entry.path),
+                                idx
+                            );
+                        }
+                        let content = &raw[off..off + len];
+
+                        if entry.fragments.len() == 1 {
+                            let hash = <Sha1 as Sha1Digest>::digest(content);
+                            if hash.as_slice() != entry.blob_sha1 {
+                                anyhow::bail!(
+                                    "sha1 mismatch for {}",
+                                    String::from_utf8_lossy(&entry.path)
+                                );
+                            }
+                            write_entry(&target_dir2, entry, content)?;
+                            written += 1;
+                        } else {
+                            let mut guard = pending_files2.lock().unwrap();
+                            let pending = guard.get_mut(file_idx).ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "missing pending state for {}",
+                                    String::from_utf8_lossy(&entry.path)
+                                )
+                            })?;
+                            pending.fragments[*frag_idx] = Some(content.to_vec());
+                            pending.remaining -= 1;
+                            if pending.remaining == 0 {
+                                let pending = guard.remove(file_idx).expect("pending file missing");
+                                drop(guard);
+                                let mut full = Vec::with_capacity(entry.total_len() as usize);
+                                for frag in pending.fragments {
+                                    full.extend_from_slice(&frag.expect("fragment missing"));
+                                }
+                                let hash = <Sha1 as Sha1Digest>::digest(&full);
+                                if hash.as_slice() != entry.blob_sha1 {
+                                    anyhow::bail!(
+                                        "sha1 mismatch for {}",
+                                        String::from_utf8_lossy(&entry.path)
+                                    );
+                                }
+                                write_entry(&target_dir2, entry, &full)?;
+                                written += 1;
+                            }
+                        }
+                    }
+                    Ok(written)
+                })();
+                if done_tx.send(result).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    drop(compressed_rx);
+    drop(done_tx);
+
+    // Collect results from all writers.
+    let mut files_written = 0usize;
+    let mut error: Option<anyhow::Error> = None;
+    for _ in 0..manifest.frames.len() {
+        match done_rx.recv() {
+            Ok(Ok(n)) => files_written += n,
+            Ok(Err(e)) => error = Some(e),
+            Err(_) => {
+                error = Some(anyhow::anyhow!("writer thread disappeared"));
+                break;
+            }
+        }
+    }
+    if let Some(e) = error {
+        return Err(e);
+    }
+
+    if files_written != manifest.files.len() {
+        anyhow::bail!(
+            "extractor wrote {} files but manifest contains {}; frames={}",
+            files_written,
+            manifest.files.len(),
+            manifest.frames.len()
+        );
+    }
+
+    info!(
+        "fetched/decompressed/wrote {} frames and {} files in {:?} ({} fetchers, {} writers)",
+        manifest.frames.len(),
+        files_written,
+        fetch_start.elapsed(),
+        fetch_threads,
+        write_threads,
+    );
+
+    let raw_total: u64 = manifest.files.iter().map(|e| e.total_len()).sum();
+
+    // Clear skip-worktree for every materialized path.
+    let clear_start = Instant::now();
+    let paths: Vec<String> = manifest
+        .files
+        .iter()
+        .map(|e| String::from_utf8_lossy(&e.path).into_owned())
+        .collect();
+    git::clear_skip_worktree_index(&target_dir, &paths)?;
+    info!(
+        "cleared skip-worktree for {} paths in {:?}",
+        paths.len(),
+        clear_start.elapsed()
+    );
+
+    Ok(ExtractStats {
+        files: files_written,
+        raw_bytes: raw_total,
+    })
+}
+
 /// Fetch and extract a working-tree archive using parallel HTTP range requests.
 /// This is the streaming/parallel client path: the archive is never loaded into
 /// memory as a single object. Consecutive frames are coalesced into chunks to
@@ -930,9 +1263,9 @@ pub fn extract_archive_streaming(
                 .send()
                 .with_context(|| format!("range request bytes={}-{} from {}", start, end, url))?;
             if resp.status() == reqwest::StatusCode::PARTIAL_CONTENT {
-                let data = resp.bytes().with_context(|| {
-                    format!("read bytes={}-{} response", start, end)
-                })?;
+                let data = resp
+                    .bytes()
+                    .with_context(|| format!("read bytes={}-{} response", start, end))?;
                 if data.len() as u64 != expected_len {
                     anyhow::bail!(
                         "range request bytes={}-{} length mismatch: expected {}, got {}",

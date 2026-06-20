@@ -31,45 +31,21 @@ For branches: each branch gets its own clonepack. For history beyond `HEAD`: not
 
 Because the two representations contain the same data, fetching both is redundant. The modes below decide which one to use (or whether to use both in parallel for speed).
 
-### 2. Unified async download/write pipeline
+### 2. Unified async download/write pipeline ✅
 
-The client should not wait for the metadata chunk before it starts downloading data. The manifest is tiny and already lists every chunk hash and length.
+Implemented in `rust/src/client.rs`, `rust/src/extract.rs`, and `rust/src/pack_writer.rs`. See `CHANGELOG.md` for details.
 
-Target sequence:
+Remaining future improvements:
+- Buffer early archive chunks to a bounded temp spill directory when they arrive before metadata (currently the bounded channel holds up to two chunks in memory).
+- Retry each chunk download with exponential backoff.
+- Delete the temp install directory on failure.
 
-1. Resolve ref → get manifest hash + signed URLs.
-2. Fetch manifest.
-3. Immediately enqueue into a bounded async fetch pool:
-   - metadata chunk (highest priority),
-   - head-blobs chunks (for `full`/`hybrid` modes),
-   - archive chunks (for `fast`/`hybrid` modes).
-4. On metadata arrival: decode it, write skeleton pack/idx and prebuilt `.git/index`, and spawn archive extraction workers.
-5. On each archive chunk arrival: push it to the extractor, which decompresses frames and writes files as later chunks still download.
-6. On each head-blobs chunk arrival: write it to the correct byte offset in the pack file. Compute the pack SHA-256 incrementally so the filename is known as soon as the last byte lands. Do not collect the whole pack into a `Vec<u8>`.
-7. Materialize the working tree:
-   - `full` mode: run `git checkout-index` as soon as the head-blobs pack + idx are complete.
-   - `fast`/`hybrid` modes: files are already written as archive chunks arrive.
-8. The CLI only returns after the working tree **and** the expected `.git` depth for the chosen mode are ready.
+### 3. User-facing clone modes ✅
 
-Buffering rule for archive chunks that arrive before metadata: spill them to a bounded temp directory keyed by chunk index. If memory pressure is low, keep the first few in RAM; otherwise write all early chunks to disk. Clean up the spill directory on success or failure.
+Implemented as `--mode full|fast|hybrid|skeleton` and `RIPCLONE_MODE`. See `CHANGELOG.md` for details.
 
-Install rule: write into a temp directory beside the target and atomic-rename on success. On failure, delete the temp directory.
-
-Retry rule: every chunk download is retried with exponential backoff. Because chunks are content-addressed, a retry cannot corrupt the repo.
-
-### 3. User-facing clone modes
-
-Replace the hidden `RIPCLONE_EXTRACT_ARCHIVE=1` flag with explicit modes. The default must behave like `git clone --depth=1`: the repo is complete and ready to use when the command returns.
-
-| Mode | Downloads | Result | Best for |
-|---|---|---|---|
-| `full` *(default)* | metadata + head-blobs pack/idx | Complete `.git`; `git status`, `git diff`, `git show`, `git log -p` all work. | **Default.** Matches normal git expectations. |
-| `fast` | metadata + archive chunks | Working tree present; HEAD blobs **not** in `.git/objects`. `git status`/`git add`/`git commit` work; `git diff`/`git show` do not. | Opt-in speed mode for agents that only edit and commit. |
-| `hybrid` | metadata + archive chunks + head-blobs chunks (concurrent) | Archive materializes files while head-blobs download in parallel; CLI blocks until both are done. | Opt-in when bandwidth allows both streams and checkout-index is slow. |
-| `skeleton` | metadata + skeleton pack/idx | `.git` only, no working tree. | Special-purpose, already supported. |
-| `lazy` *(future)* | metadata + archive chunks first; head-blobs fetched by a daemon afterwards | Fast startup; repo becomes complete in the background. | Future mode for interactive use. |
-
-Mode is surfaced as `--mode <name>` and `RIPCLONE_MODE`.
+Remaining future item:
+- `lazy` mode (metadata + archive chunks first; head-blobs fetched by a background daemon afterwards).
 
 ### 4. Edge warmth with Tigris
 
@@ -90,20 +66,9 @@ Tigris Global buckets already cache objects near the requester, but the first re
    - Older commits stay in the cheaper Global bucket.
    - This is a paid-feature tier, not the immediately important path.
 
-### 5. Per-phase benchmark breakdown
+### 5. Per-phase benchmark breakdown ✅
 
-Add a benchmark mode that reports time spent in each phase, with precise definitions:
-
-- `resolve_ms`: ref request sent to ref response received.
-- `manifest_ms`: manifest downloaded + decoded.
-- `metadata_ms`: metadata chunk downloaded + decoded + skeleton/index written.
-- `head_blobs_download_ms`: first head-blobs chunk request sent to last head-blobs byte received.
-- `archive_download_ms`: first archive chunk request sent to last archive byte received.
-- `write_ms`: first working-tree byte written to last file closed.
-- `checkout_ms`: `git checkout-index` duration, or extractor worker duration for archive modes.
-- `total_ms`: wall clock from CLI start to exit.
-
-Also report bytes per phase and per-chunk throughput. This separates network wins from code wins.
+Implemented as `--bench` / `RIPCLONE_BENCH=1` with a JSON report covering all defined phases. See `CHANGELOG.md` for details.
 
 ### 6. Production hardening still missing
 

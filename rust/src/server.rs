@@ -246,6 +246,9 @@ pub struct RefResponse {
     /// Signed URL for the clonepack manifest itself, if the backend supports it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub clonepack_manifest_url: Option<String>,
+    /// Metadata chunk hash (protobuf). The client uses this to verify the
+    /// metadata bytes it downloads concurrently with the manifest.
+    pub metadata_chunk: String,
     /// Signed URL for the metadata chunk, if the backend supports it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata_chunk_url: Option<String>,
@@ -799,6 +802,7 @@ fn ref_response(
         full_pack: info.full_pack.clone(),
         clonepack_manifest: info.clonepack_manifest.clone(),
         clonepack_manifest_url,
+        metadata_chunk: info.metadata_chunk.clone(),
         metadata_chunk_url,
         archive_chunk_urls,
         head_blobs_chunk_urls,
@@ -898,10 +902,13 @@ async fn build_handler(
     if let Some(resp) = reject_invalid_repo_ids(&body.owner, &body.repo) {
         return resp;
     }
-    if let Some(resp) = validation::reject_if_invalid(|| validation::validate_git_rev(&body.commit)) {
+    if let Some(resp) = validation::reject_if_invalid(|| validation::validate_git_rev(&body.commit))
+    {
         return resp;
     }
-    if let Some(resp) = validation::reject_if_invalid(|| validation::validate_git_rev(&body.ref_name)) {
+    if let Some(resp) =
+        validation::reject_if_invalid(|| validation::validate_git_rev(&body.ref_name))
+    {
         return resp;
     }
     // The build endpoint accepts GitHub's OIDC token in the standard
@@ -1012,7 +1019,9 @@ async fn cat_file(
     if let Some(resp) = reject_invalid_repo_ids(&owner, &repo) {
         return resp;
     }
-    if let Some(resp) = validation::reject_if_invalid(|| validation::validate_git_rev(&query.branch)) {
+    if let Some(resp) =
+        validation::reject_if_invalid(|| validation::validate_git_rev(&query.branch))
+    {
         return resp;
     }
     let mirror_dir = state.repo_root.join(format!("{}_{}.git", owner, repo));
@@ -1054,7 +1063,9 @@ async fn file_sizes(
     if let Some(resp) = reject_invalid_repo_ids(&owner, &repo) {
         return resp;
     }
-    if let Some(resp) = validation::reject_if_invalid(|| validation::validate_git_rev(&query.branch)) {
+    if let Some(resp) =
+        validation::reject_if_invalid(|| validation::validate_git_rev(&query.branch))
+    {
         return resp;
     }
     let mirror_dir = state.repo_root.join(format!("{}_{}.git", owner, repo));
@@ -1093,7 +1104,9 @@ async fn create_snapshot(
     if let Some(resp) = reject_invalid_repo_ids(&owner, &repo) {
         return resp;
     }
-    if let Some(resp) = validation::reject_if_invalid(|| validation::validate_git_rev(&query.branch)) {
+    if let Some(resp) =
+        validation::reject_if_invalid(|| validation::validate_git_rev(&query.branch))
+    {
         return resp;
     }
     let mirror_dir = state.repo_root.join(format!("{}_{}.git", owner, repo));
@@ -1225,7 +1238,8 @@ async fn batch_files(
     if let Some(resp) = reject_invalid_repo_ids(&owner, &repo) {
         return resp;
     }
-    if let Some(resp) = validation::reject_if_invalid(|| validation::validate_git_rev(&body.branch)) {
+    if let Some(resp) = validation::reject_if_invalid(|| validation::validate_git_rev(&body.branch))
+    {
         return resp;
     }
     if let Some(commit) = &body.commit {
@@ -1320,7 +1334,9 @@ async fn get_artifact(
     if let Some(resp) = validate_artifact_hash(&hash) {
         return resp;
     }
-    serve_artifact(hash, state, Some(headers)).await.into_response()
+    serve_artifact(hash, state, Some(headers))
+        .await
+        .into_response()
 }
 
 async fn serve_artifact(
@@ -1766,9 +1782,7 @@ pub async fn run_server(
         .filter(|t| !t.is_empty())
         .map(|t| format!("{:x}", Sha256::digest(t.as_bytes())));
     if token_hash.is_none() {
-        anyhow::bail!(
-            "RIPCLONE_TOKEN is not set. Refusing to start an unauthenticated server."
-        );
+        anyhow::bail!("RIPCLONE_TOKEN is not set. Refusing to start an unauthenticated server.");
     }
     info!("RIPCLONE_TOKEN configured; auth middleware enabled");
 
@@ -1903,9 +1917,16 @@ mod tests {
             50,
         )
         .await;
-        assert!(result.is_err(), "server must refuse to start without RIPCLONE_TOKEN");
+        assert!(
+            result.is_err(),
+            "server must refuse to start without RIPCLONE_TOKEN"
+        );
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("RIPCLONE_TOKEN"), "error should mention missing token: {}", err);
+        assert!(
+            err.contains("RIPCLONE_TOKEN"),
+            "error should mention missing token: {}",
+            err
+        );
     }
 
     #[test]

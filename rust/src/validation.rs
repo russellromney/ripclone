@@ -74,7 +74,10 @@ pub fn validate_object_id(id: &str) -> Result<()> {
     if id.len() != 40 && id.len() != 64 {
         anyhow::bail!("object id must be 40 or 64 hex characters");
     }
-    if !id.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)) {
+    if !id
+        .chars()
+        .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+    {
         anyhow::bail!("object id must be lowercase hex");
     }
     Ok(())

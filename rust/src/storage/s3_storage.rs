@@ -49,8 +49,11 @@ impl S3Storage {
         let endpoint = match std::env::var("RIPCLONE_S3_ENDPOINT")
             .ok()
             .filter(|e| !e.is_empty())
-            .or_else(|| std::env::var("AWS_ENDPOINT_URL_S3").ok().filter(|e| !e.is_empty()))
-        {
+            .or_else(|| {
+                std::env::var("AWS_ENDPOINT_URL_S3")
+                    .ok()
+                    .filter(|e| !e.is_empty())
+            }) {
             Some(e) => e,
             _ => return Ok(None),
         };
@@ -64,7 +67,9 @@ impl S3Storage {
             .filter(|e| !e.is_empty())
             .or_else(|| std::env::var("BUCKET_NAME").ok().filter(|e| !e.is_empty()))
             .context("RIPCLONE_S3_BUCKET or BUCKET_NAME is required when S3 is enabled")?;
-        let prefix = std::env::var("RIPCLONE_S3_PREFIX").ok().filter(|e| !e.is_empty());
+        let prefix = std::env::var("RIPCLONE_S3_PREFIX")
+            .ok()
+            .filter(|e| !e.is_empty());
         let cache_dir: Option<PathBuf> = std::env::var("RIPCLONE_S3_CACHE_DIR")
             .ok()
             .filter(|e| !e.is_empty())
@@ -135,11 +140,7 @@ impl StorageBackend for S3Storage {
         }
         let actual_hash = format!("{:x}", sha2::Sha256::digest(&data));
         if actual_hash != hash {
-            anyhow::bail!(
-                "S3 object {} hash mismatch: actual {}",
-                hash,
-                actual_hash
-            );
+            anyhow::bail!("S3 object {} hash mismatch: actual {}", hash, actual_hash);
         }
         if let Some(cache) = &self.cache {
             let _ = cache.put_with_hash(hash, &data);

@@ -1,8 +1,10 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use ripclone::archive::ArchiveBuilder;
+use ripclone::bench::Benchmark;
 use ripclone::client::Client;
 use ripclone::extract::extract_archive;
+use ripclone::mode::{CloneMode, resolve_mode};
 use ripclone::snapshot::extract_snapshot;
 use sha2::{Digest, Sha256};
 use std::env;
@@ -39,6 +41,12 @@ enum Commands {
         /// Number of hot files to include in the initial snapshot.
         #[arg(long, default_value = "50")]
         hot_files: usize,
+        /// Clone mode: full (default), fast, hybrid, or skeleton.
+        #[arg(long)]
+        mode: Option<CloneMode>,
+        /// Print a per-phase benchmark report after the clone.
+        #[arg(long)]
+        bench: bool,
         /// Install a skeleton clone only (no sidecar). Useful for archive extraction.
         #[arg(long, hide = true)]
         skeleton: bool,
@@ -230,11 +238,15 @@ async fn main() -> Result<()> {
             dir,
             branch,
             hot_files: _hot_files,
+            mode,
+            bench,
             skeleton,
         } => {
             let (owner, repo_name) = parse_repo(&repo)?;
             let target = dir.unwrap_or_else(|| PathBuf::from(repo_name));
-            if skeleton {
+            let mode = resolve_mode(mode);
+
+            if skeleton || mode == CloneMode::Skeleton {
                 client
                     .skeleton_clone(owner, repo_name, &branch, &target)
                     .await?;
@@ -242,10 +254,27 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
 
+            let enable_bench = bench || std::env::var_os("RIPCLONE_BENCH").is_some();
+            let mut benchmark = Benchmark::new();
             client
-                .install_repo(owner, repo_name, &branch, &target)
+                .install_repo_with_mode(
+                    owner,
+                    repo_name,
+                    &branch,
+                    &target,
+                    mode,
+                    if enable_bench {
+                        Some(&mut benchmark)
+                    } else {
+                        None
+                    },
+                )
                 .await?;
             println!("installed {} into {}", repo, target.display());
+            if enable_bench {
+                let report = benchmark.finish();
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            }
         }
         Commands::Sidecar { dir } => {
             ripclone::sidecar::run(&dir)

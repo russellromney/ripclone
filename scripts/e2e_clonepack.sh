@@ -3,7 +3,7 @@ set -euo pipefail
 
 # End-to-end clonepack round-trip test.
 # Builds a clonepack for a small public fixture repo on a local server, then
-# clones it with both the default (checkout-index) and archive-extraction paths.
+# clones it with all supported modes (full, fast, hybrid, skeleton).
 
 REPO="${REPO:-octocat/Hello-World}"
 OWNER="${REPO%%/*}"
@@ -128,7 +128,7 @@ def parse(data):
     return out
 
 cpm_parsed = parse(cpm)
-assert set(cpm_parsed.keys()) <= {1,2,3,4,5}, f'unexpected fields: {cpm_parsed.keys()}'
+assert set(cpm_parsed.keys()) <= {1,2,3,4,5,7,8}, f'unexpected fields: {cpm_parsed.keys()}'
 commit = cpm_parsed.get(1, [b''])[0].decode()
 branch = cpm_parsed.get(3, [b''])[0].decode()
 print(f'commit: {commit}')
@@ -144,6 +144,12 @@ for i, ref in enumerate(cpm_parsed.get(5, [])):
     arc_hash = arc[1][0].hex()
     arc_len = arc[2][0]
     print(f'archive_chunk[{i}]: {arc_hash} ({arc_len} bytes)')
+
+for i, ref in enumerate(cpm_parsed.get(8, [])):
+    hb = parse(ref)
+    hb_hash = hb[1][0].hex()
+    hb_len = hb[2][0]
+    print(f'head_blobs_chunk[{i}]: {hb_hash} ({hb_len} bytes)')
 PY
 curl -fsS "${CURL_AUTH[@]}" "$SERVER_URL/v1/artifacts/$clonepack_manifest_hash" | python3 "$BASE_DIR/parse_clonepack.py" | tee "$BASE_DIR/clonepack.txt"
 
@@ -172,65 +178,106 @@ if ! protoc --decode_raw < "$BASE_DIR/metadata.chunk" > "$BASE_DIR/metadata.txt"
 fi
 echo "metadata chunk protobuf decode OK"
 
-echo ""
-echo "==> Default clone (git checkout-index)..."
-default_dir="$BASE_DIR/default-clone"
-default_start=$(now_ms)
-"$RIPCLONE" --server "$SERVER_URL" clone "$REPO" --dir "$default_dir"
-default_end=$(now_ms)
-printf "default clone took %d ms\n" $((default_end - default_start))
+verify_clone() {
+  local dir="$1"
+  local mode="$2"
+  local expect_blobs="$3"
+  cd "$dir"
+  if [ -n "$(git status --short)" ]; then
+    echo "error: git status not clean after $mode clone"
+    git status --short
+    exit 1
+  fi
+  if ! git diff --quiet HEAD; then
+    echo "error: git diff reports changes after $mode clone"
+    exit 1
+  fi
+  if ! git log --oneline -1 >/dev/null; then
+    echo "error: git log failed after $mode clone"
+    exit 1
+  fi
+
+  local sample_file
+  sample_file=$(git ls-files | sed -n '1p')
+  if [ -z "$sample_file" ]; then
+    echo "error: no tracked files to verify blob availability"
+    exit 1
+  fi
+  if [ "$expect_blobs" = "yes" ]; then
+    if ! git show "HEAD:$sample_file" >/dev/null 2>&1; then
+      echo "error: expected blob objects in $mode mode, but git show failed for $sample_file"
+      exit 1
+    fi
+  else
+    if git show "HEAD:$sample_file" >/dev/null 2>&1; then
+      echo "error: expected blob objects to be missing in $mode mode, but git show succeeded for $sample_file"
+      exit 1
+    fi
+  fi
+  echo "$mode clone OK"
+}
 
 echo ""
-echo "==> Archive-extraction clone..."
-archive_dir="$BASE_DIR/archive-clone"
-archive_start=$(now_ms)
-RIPCLONE_EXTRACT_ARCHIVE=1 "$RIPCLONE" --server "$SERVER_URL" clone "$REPO" --dir "$archive_dir"
-archive_end=$(now_ms)
-printf "archive clone took %d ms\n" $((archive_end - archive_start))
+echo "==> Full mode clone (git checkout-index)..."
+full_dir="$BASE_DIR/full-clone"
+full_start=$(now_ms)
+"$RIPCLONE" --server "$SERVER_URL" clone "$REPO" --dir "$full_dir" --mode=full
+full_end=$(now_ms)
+printf "full clone took %d ms\n" $((full_end - full_start))
+verify_clone "$full_dir" full yes
 
 echo ""
-echo "==> Verifying default clone..."
-cd "$default_dir"
-if [ -n "$(git status --short)" ]; then
-  echo "error: git status not clean after default clone"
-  git status --short
-  exit 1
-fi
-if ! git diff --quiet HEAD; then
-  echo "error: git diff reports changes after default clone"
-  exit 1
-fi
-if ! git log --oneline -1 >/dev/null; then
-  echo "error: git log failed after default clone"
-  exit 1
-fi
-echo "default clone OK"
+echo "==> Fast mode clone (archive extraction only)..."
+fast_dir="$BASE_DIR/fast-clone"
+fast_start=$(now_ms)
+"$RIPCLONE" --server "$SERVER_URL" clone "$REPO" --dir "$fast_dir" --mode=fast
+fast_end=$(now_ms)
+printf "fast clone took %d ms\n" $((fast_end - fast_start))
+verify_clone "$fast_dir" fast no
 
 echo ""
-echo "==> Verifying archive clone..."
-cd "$archive_dir"
-if [ -n "$(git status --short)" ]; then
-  echo "error: git status not clean after archive clone"
-  git status --short
+echo "==> Hybrid mode clone (archive + head-blobs)..."
+hybrid_dir="$BASE_DIR/hybrid-clone"
+hybrid_start=$(now_ms)
+"$RIPCLONE" --server "$SERVER_URL" clone "$REPO" --dir "$hybrid_dir" --mode=hybrid
+hybrid_end=$(now_ms)
+printf "hybrid clone took %d ms\n" $((hybrid_end - hybrid_start))
+verify_clone "$hybrid_dir" hybrid yes
+
+echo ""
+echo "==> Skeleton mode clone (.git only)..."
+skeleton_dir="$BASE_DIR/skeleton-clone"
+skeleton_start=$(now_ms)
+"$RIPCLONE" --server "$SERVER_URL" clone "$REPO" --dir "$skeleton_dir" --mode=skeleton
+skeleton_end=$(now_ms)
+printf "skeleton clone took %d ms\n" $((skeleton_end - skeleton_start))
+if [ ! -d "$skeleton_dir/.git" ]; then
+  echo "error: skeleton clone missing .git directory"
   exit 1
 fi
-if ! git diff --quiet HEAD; then
-  echo "error: git diff reports changes after archive clone"
+if [ -n "$(find "$skeleton_dir" -mindepth 1 -maxdepth 1 -not -name '.git' -print -quit 2>/dev/null)" ]; then
+  echo "error: skeleton clone has unexpected working tree files"
   exit 1
 fi
-if ! git log --oneline -1 >/dev/null; then
-  echo "error: git log failed after archive clone"
+if ! (cd "$skeleton_dir" && git rev-parse HEAD >/dev/null); then
+  echo "error: git rev-parse failed after skeleton clone"
   exit 1
 fi
-echo "archive clone OK"
+echo "skeleton clone OK"
 
 echo ""
 echo "==> Comparing file lists..."
-(cd "$default_dir" && git ls-files -z | sort -z) > "$BASE_DIR/default-files.txt"
-(cd "$archive_dir" && git ls-files -z | sort -z) > "$BASE_DIR/archive-files.txt"
-if ! diff -q "$BASE_DIR/default-files.txt" "$BASE_DIR/archive-files.txt" >/dev/null; then
-  echo "error: file lists differ between default and archive clones"
-  diff "$BASE_DIR/default-files.txt" "$BASE_DIR/archive-files.txt" | head -20
+(cd "$full_dir" && git ls-files -z | sort -z) > "$BASE_DIR/files-full.txt"
+(cd "$fast_dir" && git ls-files -z | sort -z) > "$BASE_DIR/files-fast.txt"
+(cd "$hybrid_dir" && git ls-files -z | sort -z) > "$BASE_DIR/files-hybrid.txt"
+if ! diff -q "$BASE_DIR/files-full.txt" "$BASE_DIR/files-fast.txt" >/dev/null; then
+  echo "error: file lists differ between full and fast clones"
+  diff "$BASE_DIR/files-full.txt" "$BASE_DIR/files-fast.txt" | head -20
+  exit 1
+fi
+if ! diff -q "$BASE_DIR/files-full.txt" "$BASE_DIR/files-hybrid.txt" >/dev/null; then
+  echo "error: file lists differ between full and hybrid clones"
+  diff "$BASE_DIR/files-full.txt" "$BASE_DIR/files-hybrid.txt" | head -20
   exit 1
 fi
 echo "file lists match"
@@ -239,6 +286,8 @@ echo ""
 echo "=========================================================="
 echo "Clonepack round-trip test passed for $REPO."
 echo "  sync:    $((sync_end - sync_start)) ms"
-echo "  default: $((default_end - default_start)) ms"
-echo "  archive: $((archive_end - archive_start)) ms"
+echo "  full:    $((full_end - full_start)) ms"
+echo "  fast:    $((fast_end - fast_start)) ms"
+echo "  hybrid:  $((hybrid_end - hybrid_start)) ms"
+echo "  skeleton:$((skeleton_end - skeleton_start)) ms"
 echo "=========================================================="

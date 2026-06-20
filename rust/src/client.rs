@@ -1,14 +1,19 @@
+use crate::bench::Benchmark;
 use crate::cas::{Cas, hash as cas_hash};
-use crate::clonepack::{ClonepackManifest, MetadataChunk, hash_to_hex};
-use crate::extract::extract_clonepack_streaming;
+use crate::clonepack::{ChunkRef, ClonepackManifest, MetadataChunk, hash_to_hex};
+use crate::extract::{extract_archive_from_chunk_receiver, extract_clonepack_streaming};
 use crate::git;
+use crate::mode::CloneMode;
 use crate::overlay;
+use crate::pack_writer::HeadBlobsWriter;
 use anyhow::{Context, Result};
+use crossbeam_channel::{Receiver, Sender, bounded};
 use prost::Message;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
+use tokio::sync::{Mutex as TokioMutex, Notify};
 use tracing::{info, warn};
 
 #[derive(Debug, Clone, Deserialize)]
@@ -25,6 +30,8 @@ pub struct RefResponse {
     #[serde(default)]
     pub clonepack_manifest_url: Option<String>,
     #[serde(default)]
+    pub metadata_chunk: String,
+    #[serde(default)]
     pub metadata_chunk_url: Option<String>,
     #[serde(default)]
     pub archive_chunk_urls: Option<Vec<Option<String>>>,
@@ -36,6 +43,7 @@ pub struct RefResponse {
 
 /// Return the chunk refs that make up the head-blobs pack, falling back to the
 /// deprecated single-pack field for older manifests.
+#[allow(deprecated)]
 fn head_blobs_chunk_refs(clonepack: &ClonepackManifest) -> Vec<crate::clonepack::ChunkRef> {
     if !clonepack.head_blobs_chunks.is_empty() {
         clonepack.head_blobs_chunks.clone()
@@ -44,6 +52,73 @@ fn head_blobs_chunk_refs(clonepack: &ClonepackManifest) -> Vec<crate::clonepack:
     } else {
         Vec::new()
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ChunkKind {
+    Archive,
+    HeadBlobs,
+}
+
+#[allow(deprecated)]
+fn head_blobs_refs(manifest: &ClonepackManifest) -> Vec<ChunkRef> {
+    if !manifest.head_blobs_chunks.is_empty() {
+        manifest.head_blobs_chunks.clone()
+    } else if let Some(pack) = &manifest.head_blobs_pack {
+        vec![pack.clone()]
+    } else {
+        Vec::new()
+    }
+}
+
+impl ChunkKind {
+    fn get_chunk_ref(self, manifest: &ClonepackManifest, index: usize) -> Result<ChunkRef> {
+        match self {
+            ChunkKind::Archive => manifest
+                .archive_chunks
+                .get(index)
+                .cloned()
+                .with_context(|| format!("archive chunk {} missing from manifest", index)),
+            ChunkKind::HeadBlobs => head_blobs_refs(manifest)
+                .get(index)
+                .cloned()
+                .with_context(|| format!("head-blobs chunk {} missing from manifest", index)),
+        }
+    }
+
+    fn all_chunk_refs(self, manifest: &ClonepackManifest) -> Vec<ChunkRef> {
+        match self {
+            ChunkKind::Archive => manifest.archive_chunks.clone(),
+            ChunkKind::HeadBlobs => head_blobs_refs(manifest),
+        }
+    }
+}
+
+fn metadata_bytes(metadata: &MetadataChunk) -> u64 {
+    // The metadata chunk is the protobuf encoding of skeleton pack/idx, index,
+    // frame table, and file table. The actual encoded size is dominated by the
+    // three byte blobs; add a small estimate for the repeated message overhead.
+    (metadata.skeleton_pack.len()
+        + metadata.skeleton_idx.len()
+        + metadata.prebuilt_index.len()
+        + metadata.frames.len() * 24
+        + metadata.files.len() * 64) as u64
+}
+
+fn temp_install_dir(target: &Path) -> Result<PathBuf> {
+    let parent = target.parent().filter(|p| !p.as_os_str().is_empty());
+    let dir = tempfile::Builder::new()
+        .prefix(&format!(
+            "{}.",
+            target
+                .file_name()
+                .unwrap_or_else(|| std::ffi::OsStr::new("ripclone"))
+                .to_string_lossy()
+        ))
+        .suffix(".tmp")
+        .tempdir_in(parent.unwrap_or_else(|| Path::new(".")))
+        .context("create temp install directory")?;
+    Ok(dir.into_path())
 }
 
 #[derive(Debug, Deserialize)]
@@ -253,8 +328,8 @@ impl Client {
         chunks: &[crate::clonepack::ChunkRef],
         signed_urls: Option<&[Option<String>]>,
     ) -> Result<Vec<Vec<u8>>> {
-        use futures::stream::{self, StreamExt};
         use futures::TryStreamExt;
+        use futures::stream::{self, StreamExt};
         if chunks.is_empty() {
             return Ok(Vec::new());
         }
@@ -413,58 +488,306 @@ impl Client {
         branch: &str,
         target: P,
     ) -> Result<()> {
+        self.install_repo_with_mode(owner, repo, branch, target, CloneMode::Full, None)
+            .await
+    }
+
+    /// Install a repo with a specific clone mode and optional per-phase benchmark
+    /// instrumentation.
+    pub async fn install_repo_with_mode<P: AsRef<Path>>(
+        &self,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+        target: P,
+        mode: CloneMode,
+        bench: Option<&mut Benchmark>,
+    ) -> Result<()> {
         let target = target.as_ref().to_path_buf();
         info!(
-            "installing {}/{}#{} into {}",
+            "installing {}/{}#{} into {} with mode {:?}",
             owner,
             repo,
             branch,
-            target.display()
+            target.display(),
+            mode
         );
 
         if target.exists() {
             anyhow::bail!("target directory already exists: {}", target.display());
         }
 
-        let ref_start = Instant::now();
+        let mut local_bench = Benchmark::new();
+        let bench = bench.unwrap_or(&mut local_bench);
+
+        // 1. Resolve ref.
         let info = self.resolve_ref(owner, repo, branch).await?;
-        info!(
-            "resolved to commit {} in {:?}",
-            &info.commit[..7],
-            ref_start.elapsed()
+        bench.mark_resolve();
+        info!("resolved to commit {}", &info.commit[..7]);
+
+        if info.clonepack_manifest.is_empty() {
+            anyhow::bail!("ref is missing clonepack manifest; run sync first");
+        }
+
+        // Shared manifest slot. Download tasks wait on this before verifying the
+        // content hash of each chunk.
+        let manifest_slot: Arc<TokioMutex<Option<Arc<ClonepackManifest>>>> =
+            Arc::new(TokioMutex::new(None));
+        let manifest_ready: Arc<Notify> = Arc::new(Notify::new());
+
+        // 2. Start manifest + metadata downloads concurrently.
+        let manifest_slot2 = Arc::clone(&manifest_slot);
+        let manifest_ready2 = Arc::clone(&manifest_ready);
+        let manifest_task = self.clone().spawn_fetch_manifest(
+            info.clonepack_manifest.clone(),
+            info.clonepack_manifest_url.clone(),
+            manifest_slot2,
+            manifest_ready2,
         );
 
-        let (clonepack, metadata) = self.fetch_clonepack(&info).await?;
-        let archive_chunks: Vec<String> = clonepack
-            .archive_chunks
-            .iter()
-            .map(|r| hash_to_hex(&r.hash))
-            .collect();
+        let metadata_hash = info.metadata_chunk.clone();
+        let metadata_url = info.metadata_chunk_url.clone();
+        let metadata_task = self
+            .clone()
+            .spawn_fetch_metadata(metadata_hash, metadata_url);
 
-        // Decide whether to stage the materialized tree in tmpfs and expose it
-        // through an overlay mount. Cloud VM root filesystems are often extremely
-        // slow for many small files, so this can be 5-10x faster for large repos.
+        // 3. Start archive and head-blobs chunk downloads concurrently with the
+        // manifest. They will buffer until the manifest is decoded, then verify
+        // and forward chunks to the workers.
+        let (archive_tx, archive_rx): (
+            Sender<(usize, Result<Vec<u8>>)>,
+            Receiver<(usize, Result<Vec<u8>>)>,
+        ) = bounded(2);
+        let (head_blobs_tx, head_blobs_rx): (
+            Sender<(usize, Result<Vec<u8>>)>,
+            Receiver<(usize, Result<Vec<u8>>)>,
+        ) = bounded(2);
+
+        let archive_urls = info.archive_chunk_urls.clone();
+        let archive_downloads = if mode.needs_archive() {
+            bench.start_archive_download();
+            Some(self.clone().spawn_chunk_downloads(
+                ChunkKind::Archive,
+                archive_urls,
+                Arc::clone(&manifest_slot),
+                Arc::clone(&manifest_ready),
+                archive_tx,
+            ))
+        } else {
+            drop(archive_tx);
+            None
+        };
+
+        let head_blobs_urls = info.head_blobs_chunk_urls.clone();
+        let head_blobs_downloads = if mode.needs_head_blobs() {
+            bench.start_head_blobs_download();
+            Some(self.clone().spawn_chunk_downloads(
+                ChunkKind::HeadBlobs,
+                head_blobs_urls,
+                Arc::clone(&manifest_slot),
+                Arc::clone(&manifest_ready),
+                head_blobs_tx,
+            ))
+        } else {
+            drop(head_blobs_tx);
+            None
+        };
+
+        // 4. Wait for manifest + metadata.
+        let (manifest, metadata) =
+            tokio::try_join!(manifest_task, metadata_task).context("fetch manifest/metadata")?;
+        let manifest = manifest.context("fetch clonepack manifest")?;
+        let metadata = metadata.context("fetch metadata chunk")?;
+        let metadata = Arc::new(metadata);
+        bench.mark_manifest();
+        bench.add_bytes(metadata_bytes(&metadata), 0, 0);
+
+        // 5. Decide where to install (temp dir, possibly overlay).
         let staging_dir = overlay::staging_dir();
-        let use_overlay = self.should_use_overlay(&metadata, &staging_dir).await;
+        let use_overlay =
+            mode.needs_worktree() && self.should_use_overlay(&metadata, &staging_dir).await;
 
-        if use_overlay {
-            let dirs = overlay::OverlayDirs::create(&staging_dir, &target)
-                .context("create overlay staging dirs")?;
-            let lower_git_dir = dirs.lower.join(".git");
-            self.install_ref(
-                owner,
-                repo,
-                branch,
-                &info,
-                &clonepack,
-                Arc::clone(&metadata),
-                &archive_chunks,
-                info.archive_chunk_urls.clone(),
-                &lower_git_dir,
-                &dirs.lower,
+        let overlay_dirs = if use_overlay {
+            Some(
+                overlay::OverlayDirs::create(&staging_dir, &target)
+                    .context("create overlay staging dirs")?,
             )
-            .await?;
-            self.write_origin_config(owner, repo, &lower_git_dir)?;
+        } else {
+            None
+        };
+
+        let install_root = if let Some(ref dirs) = overlay_dirs {
+            dirs.lower.clone()
+        } else {
+            temp_install_dir(&target)?
+        };
+        let git_dir = install_root.join(".git");
+
+        std::fs::create_dir_all(&git_dir)?;
+        std::fs::create_dir_all(git_dir.join("refs").join("heads"))?;
+        std::fs::create_dir_all(git_dir.join("refs").join("tags"))?;
+        std::fs::create_dir_all(git_dir.join("info"))?;
+
+        let branch_name = if branch == "HEAD" {
+            if info.default_branch.is_empty() {
+                "main"
+            } else {
+                &info.default_branch
+            }
+        } else {
+            branch
+        };
+
+        std::fs::write(
+            git_dir.join("HEAD"),
+            format!("ref: refs/heads/{branch_name}\n"),
+        )?;
+        let branch_ref = git_dir.join("refs").join("heads").join(branch_name);
+        if let Some(parent) = branch_ref.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(branch_ref, format!("{}\n", info.commit))?;
+        std::fs::write(git_dir.join("info").join("exclude"), b".ripclone/\n")?;
+
+        // 6. Write the small .git artifacts from the metadata chunk.
+        let pack_dir = git_dir.join("objects").join("pack");
+        std::fs::create_dir_all(&pack_dir)?;
+        let skeleton_hash = cas_hash(&metadata.skeleton_pack);
+        std::fs::write(
+            pack_dir.join(format!("pack-{}.pack", skeleton_hash)),
+            &metadata.skeleton_pack,
+        )?;
+        std::fs::write(
+            pack_dir.join(format!("pack-{}.idx", skeleton_hash)),
+            &metadata.skeleton_idx,
+        )?;
+        std::fs::write(git_dir.join("index"), &metadata.prebuilt_index)?;
+        bench.mark_metadata();
+        info!(
+            "wrote skeleton pack + idx + prebuilt index ({} bytes)",
+            metadata.skeleton_pack.len()
+                + metadata.skeleton_idx.len()
+                + metadata.prebuilt_index.len()
+        );
+
+        // 7. Start the working-tree materialization workers.
+        let mut manifest_tmp = tempfile::NamedTempFile::new().context("create temp manifest")?;
+        metadata
+            .write(&mut manifest_tmp)
+            .context("write temp manifest")?;
+        let manifest_path = manifest_tmp.path().to_path_buf();
+
+        let archive_worker = if mode.needs_archive() {
+            let rx = archive_rx;
+            let manifest_path = manifest_path.clone();
+            let work_tree = install_root.clone();
+            Some(tokio::task::spawn_blocking(move || {
+                // Keep the temp manifest file alive for the duration of extraction.
+                let _guard = manifest_tmp;
+                extract_archive_from_chunk_receiver(&manifest_path, &work_tree, None, rx)
+            }))
+        } else {
+            drop(archive_rx);
+            // The temp file can be dropped; nothing needs the manifest on disk.
+            drop(manifest_tmp);
+            None
+        };
+
+        let head_blobs_worker = if mode.needs_head_blobs() {
+            let rx = head_blobs_rx;
+            let pack_dir = pack_dir.clone();
+            let idx_ref = manifest
+                .head_blobs_idx
+                .clone()
+                .context("clonepack missing head-blobs idx")?;
+            let chunk_refs: Vec<ChunkRef> = manifest.head_blobs_chunks.clone();
+            let client = self.clone();
+            let idx_url = info.head_blobs_idx_url.clone();
+            Some(tokio::spawn(async move {
+                let idx_data = client
+                    .fetch_chunk_ref(&idx_ref, idx_url.as_deref())
+                    .await
+                    .context("fetch head-blobs idx")?;
+                tokio::task::spawn_blocking(move || {
+                    let mut writer = HeadBlobsWriter::new(&pack_dir, &chunk_refs)
+                        .context("create head-blobs pack writer")?;
+                    for _ in 0..chunk_refs.len() {
+                        let (idx, res) = rx
+                            .recv()
+                            .map_err(|_| anyhow::anyhow!("head-blobs channel closed early"))?;
+                        let bytes = res.context("download head-blobs chunk")?;
+                        writer
+                            .write_chunk(idx, &bytes)
+                            .with_context(|| format!("write head-blobs chunk {}", idx))?;
+                    }
+                    writer
+                        .finalize(&idx_data)
+                        .context("finalize head-blobs pack")
+                })
+                .await
+                .context("head-blobs writer task")?
+            }))
+        } else {
+            drop(head_blobs_rx);
+            None
+        };
+
+        // 8. Wait for downloads + workers.
+        let mut head_blobs_bytes = 0u64;
+        let mut archive_bytes = 0u64;
+        if let Some(handle) = archive_downloads {
+            let bytes = handle.await.context("archive download coordinator")??;
+            archive_bytes = bytes;
+        }
+        if let Some(handle) = head_blobs_downloads {
+            let bytes = handle.await.context("head-blobs download coordinator")??;
+            head_blobs_bytes = bytes;
+        }
+        if let Some(handle) = archive_worker {
+            let stats = handle
+                .await
+                .context("archive worker join")?
+                .context("archive extraction")?;
+            bench.mark_write();
+            info!(
+                "extracted {} files ({} raw bytes) from archive chunks",
+                stats.files, stats.raw_bytes
+            );
+        }
+        if let Some(handle) = head_blobs_worker {
+            let (hash, _path) = handle
+                .await
+                .context("head-blobs worker join")?
+                .context("head-blobs pack write")?;
+            info!(
+                "wrote head-blobs pack {} ({} bytes)",
+                hash, head_blobs_bytes
+            );
+        }
+        bench.add_bytes(0, head_blobs_bytes, archive_bytes);
+        bench.mark_head_blobs_download(head_blobs_bytes);
+        bench.mark_archive_download(archive_bytes);
+
+        // 9. Full mode: run git checkout-index to materialize files from the
+        // head-blobs pack.
+        if mode.needs_checkout() {
+            let checkout_start = Instant::now();
+            let git_dir = git_dir.clone();
+            let work_tree = install_root.clone();
+            tokio::task::spawn_blocking(move || {
+                git::clear_skip_worktree_all_git_dir(&git_dir)?;
+                git::checkout_index_with_git_dir(&git_dir, &work_tree)
+            })
+            .await
+            .context("checkout task")??;
+            bench.mark_checkout();
+            info!("checked out working tree in {:?}", checkout_start.elapsed());
+        }
+
+        // 10. Origin config + finalization.
+        self.write_origin_config(owner, repo, &git_dir)?;
+
+        if let Some(dirs) = overlay_dirs {
             overlay::mount_dirs(&dirs).context("mount overlay at target")?;
             info!(
                 "mounted overlay {} -> {} (staging {})",
@@ -473,25 +796,164 @@ impl Client {
                 staging_dir.display()
             );
         } else {
-            let git_dir = target.join(".git");
-            self.install_ref(
-                owner,
-                repo,
-                branch,
-                &info,
-                &clonepack,
-                Arc::clone(&metadata),
-                &archive_chunks,
-                info.archive_chunk_urls.clone(),
-                &git_dir,
-                &target,
-            )
-            .await?;
-            self.write_origin_config(owner, repo, &git_dir)?;
+            std::fs::rename(&install_root, &target).with_context(|| {
+                format!("rename {} to {}", install_root.display(), target.display())
+            })?;
         }
 
-        info!("installed {}/{}#{} from ref response", owner, repo, branch);
+        let report = bench.finish();
+        if report.total_ms > 0 {
+            info!(
+                "clone benchmark: resolve={}ms manifest={}ms metadata={}ms head_blobs_download={}ms archive_download={}ms write={}ms checkout={}ms total={}ms",
+                report.resolve_ms,
+                report.manifest_ms,
+                report.metadata_ms,
+                report.head_blobs_download_ms,
+                report.archive_download_ms,
+                report.write_ms,
+                report.checkout_ms,
+                report.total_ms,
+            );
+        }
+
+        info!(
+            "installed {}/{}#{} into {} with mode {:?}",
+            owner,
+            repo,
+            branch,
+            target.display(),
+            mode
+        );
         Ok(())
+    }
+
+    #[allow(deprecated)]
+    fn spawn_fetch_manifest(
+        self,
+        hash: String,
+        signed_url: Option<String>,
+        manifest_slot: Arc<TokioMutex<Option<Arc<ClonepackManifest>>>>,
+        manifest_ready: Arc<Notify>,
+    ) -> tokio::task::JoinHandle<Result<Arc<ClonepackManifest>>> {
+        tokio::spawn(async move {
+            let data = self
+                .fetch_artifact_with_url(&hash, signed_url.as_deref())
+                .await
+                .context("fetch clonepack manifest")?;
+            let mut manifest =
+                ClonepackManifest::decode(data.as_slice()).context("decode clonepack manifest")?;
+            // Backwards compatibility: older manifests store the head-blobs pack as
+            // a single `head_blobs_pack` field. Treat it as one chunk so the
+            // pipeline can use it without special cases.
+            if manifest.head_blobs_chunks.is_empty() {
+                if let Some(pack) = manifest.head_blobs_pack.take() {
+                    manifest.head_blobs_chunks.push(pack);
+                }
+            }
+            let manifest = Arc::new(manifest);
+            *manifest_slot.lock().await = Some(Arc::clone(&manifest));
+            manifest_ready.notify_waiters();
+            Ok(manifest)
+        })
+    }
+
+    fn spawn_fetch_metadata(
+        self,
+        hash: String,
+        signed_url: Option<String>,
+    ) -> tokio::task::JoinHandle<Result<MetadataChunk>> {
+        tokio::spawn(async move {
+            let data = self
+                .fetch_artifact_with_url(&hash, signed_url.as_deref())
+                .await
+                .context("fetch metadata chunk")?;
+            let metadata =
+                MetadataChunk::decode(data.as_slice()).context("decode metadata chunk")?;
+            Ok(metadata)
+        })
+    }
+
+    fn spawn_chunk_downloads(
+        self,
+        kind: ChunkKind,
+        signed_urls: Option<Vec<Option<String>>>,
+        manifest_slot: Arc<TokioMutex<Option<Arc<ClonepackManifest>>>>,
+        manifest_ready: Arc<Notify>,
+        tx: Sender<(usize, Result<Vec<u8>>)>,
+    ) -> tokio::task::JoinHandle<Result<u64>> {
+        tokio::spawn(async move {
+            let signed_urls: Vec<Option<String>> = signed_urls.unwrap_or_default();
+            let mut total_bytes = 0u64;
+            let mut handles = Vec::new();
+
+            if signed_urls.is_empty() {
+                // No signed URLs (e.g. local storage backend). Wait for the
+                // manifest so we have the chunk hashes, then fetch through the
+                // gateway.
+                manifest_ready.notified().await;
+                let manifest = manifest_slot
+                    .lock()
+                    .await
+                    .clone()
+                    .context("manifest missing after notify")?;
+                let chunk_refs = kind.all_chunk_refs(&manifest);
+                for (index, chunk_ref) in chunk_refs.into_iter().enumerate() {
+                    let client = self.clone();
+                    let tx = tx.clone();
+                    let kind = kind;
+                    let handle = tokio::spawn(async move {
+                        let bytes = client
+                            .fetch_chunk_ref(&chunk_ref, None)
+                            .await
+                            .with_context(|| {
+                                format!("fetch {:?} chunk {} via gateway", kind, index)
+                            })?;
+                        let len = bytes.len() as u64;
+                        tx.send((index, Ok(bytes))).map_err(|_| {
+                            anyhow::anyhow!("{:?} chunk {} receiver dropped", kind, index)
+                        })?;
+                        Ok::<u64, anyhow::Error>(len)
+                    });
+                    handles.push(handle);
+                }
+            } else {
+                for (index, signed_url) in signed_urls.into_iter().enumerate() {
+                    let client = self.clone();
+                    let manifest_slot = Arc::clone(&manifest_slot);
+                    let manifest_ready = Arc::clone(&manifest_ready);
+                    let tx = tx.clone();
+                    let kind = kind;
+                    let handle = tokio::spawn(async move {
+                        // Wait until the manifest is available so we know the
+                        // expected content hash and length for this chunk.
+                        manifest_ready.notified().await;
+                        let manifest = manifest_slot
+                            .lock()
+                            .await
+                            .clone()
+                            .context("manifest missing after notify")?;
+                        let chunk_ref = kind.get_chunk_ref(&manifest, index)?;
+                        let bytes = client
+                            .fetch_chunk_ref(&chunk_ref, signed_url.as_deref())
+                            .await
+                            .with_context(|| format!("fetch {:?} chunk {}", kind, index))?;
+                        let len = bytes.len() as u64;
+                        tx.send((index, Ok(bytes))).map_err(|_| {
+                            anyhow::anyhow!("{:?} chunk {} receiver dropped", kind, index)
+                        })?;
+                        Ok::<u64, anyhow::Error>(len)
+                    });
+                    handles.push(handle);
+                }
+            }
+
+            drop(tx);
+
+            for handle in handles {
+                total_bytes += handle.await.context("chunk download task")??;
+            }
+            Ok(total_bytes)
+        })
     }
 
     fn write_origin_config(&self, owner: &str, repo: &str, git_dir: &Path) -> Result<()> {
@@ -540,8 +1002,8 @@ impl Client {
 
         // Head-blobs pack is fetched separately. Archive-extraction does not
         // need it; direct-install needs the blob objects for checkout-index.
-        let use_archive = std::env::var_os("RIPCLONE_EXTRACT_ARCHIVE").is_some()
-            && !archive_chunks.is_empty();
+        let use_archive =
+            std::env::var_os("RIPCLONE_EXTRACT_ARCHIVE").is_some() && !archive_chunks.is_empty();
         if !use_archive {
             let head_blobs_refs = head_blobs_chunk_refs(clonepack);
             if head_blobs_refs.is_empty() {
@@ -1019,8 +1481,8 @@ impl Client {
         // Head-blobs pack is fetched separately. Archive-extraction does not
         // need it because the working tree is built from archive chunks; only
         // direct-install (`git checkout-index`) needs the blob objects.
-        let use_archive = std::env::var_os("RIPCLONE_EXTRACT_ARCHIVE").is_some()
-            && !archive_chunks.is_empty();
+        let use_archive =
+            std::env::var_os("RIPCLONE_EXTRACT_ARCHIVE").is_some() && !archive_chunks.is_empty();
         if !use_archive {
             let head_blobs_refs = head_blobs_chunk_refs(clonepack);
             if head_blobs_refs.is_empty() {

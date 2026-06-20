@@ -52,7 +52,8 @@ fn bench_cas(size: usize) {
         raw_elapsed.as_secs_f64() * 1000.0,
         throughput(size as u64, raw_elapsed),
         if get_elapsed.as_secs_f64() > 0.0 {
-            ((get_elapsed.as_secs_f64() - raw_elapsed.as_secs_f64()) / get_elapsed.as_secs_f64()) * 100.0
+            ((get_elapsed.as_secs_f64() - raw_elapsed.as_secs_f64()) / get_elapsed.as_secs_f64())
+                * 100.0
         } else {
             0.0
         }

@@ -2,6 +2,29 @@
 
 This file tracks what has already landed in ripclone. For upcoming work see `ROADMAP.md`.
 
+## Unified async pipeline, clone modes, and per-phase benchmarks
+
+- **User-facing clone modes** (`rust/src/mode.rs`, `rust/src/bin/cli.rs`, `rust/src/client.rs`)
+  - Replaced the hidden `RIPCLONE_EXTRACT_ARCHIVE=1` flag with `--mode full|fast|hybrid|skeleton`.
+  - `full` is the default and behaves like `git clone --depth=1`: complete `.git`, head-blobs pack, and `git checkout-index`.
+  - `fast` materializes the working tree directly from archive chunks; no head-blobs pack.
+  - `hybrid` downloads archive chunks and head-blobs chunks concurrently; the working tree is extracted while the pack is written.
+  - `skeleton` installs only `.git` (commit + tree objects, prebuilt index) with no working tree.
+  - Mode can also be set with `RIPCLONE_MODE`.
+
+- **Unified async download/write pipeline** (`rust/src/client.rs`, `rust/src/extract.rs`, `rust/src/pack_writer.rs`)
+  - After resolving the ref, the client fetches the manifest, metadata chunk, archive chunks, and head-blobs chunks concurrently.
+  - Archive chunks are pushed into a channel consumed by a new `extract_archive_from_chunk_receiver` worker, so files are written while later chunks are still downloading.
+  - Head-blobs chunks are pushed into a channel consumed by `HeadBlobsWriter`, which writes each chunk to the correct pack-file offset and computes the SHA-256 hash incrementally.
+  - The install is written into a temp directory and atomically renamed onto the target on success.
+
+- **Per-phase benchmark instrumentation** (`rust/src/bench.rs`, `rust/src/bin/cli.rs`)
+  - Added `--bench` and `RIPCLONE_BENCH=1` to print a JSON report with `resolve_ms`, `manifest_ms`, `metadata_ms`, `head_blobs_download_ms`, `archive_download_ms`, `write_ms`, `checkout_ms`, and `total_ms` plus bytes per phase.
+
+- **Updated e2e coverage** (`scripts/e2e_clonepack.sh`, `scripts/e2e_archive.sh`)
+  - `e2e_clonepack.sh` now tests `full`, `fast`, `hybrid`, and `skeleton` modes and verifies blob availability per mode.
+  - `e2e_archive.sh` now tests both `full` and `fast` modes against `oven-sh/bun`.
+
 ## Head-blobs pack chunking and repository cleanup
 
 - **Split head-blobs pack into parallel-fetch chunks** (`rust/proto/clonepack.proto`, `rust/src/server.rs`, `rust/src/client.rs`, `rust/src/lib.rs`, `rust/src/ref_store.rs`)

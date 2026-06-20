@@ -258,8 +258,7 @@ pub fn run_git<P: AsRef<Path>>(repo: P, args: &[&str]) -> Result<String> {
 }
 
 pub fn resolve_commit<P: AsRef<Path>>(repo: P, rev: &str) -> Result<String> {
-    crate::validation::validate_git_rev(rev)
-        .with_context(|| format!("invalid rev: {}", rev))?;
+    crate::validation::validate_git_rev(rev).with_context(|| format!("invalid rev: {}", rev))?;
     // git rev-parse does not support --end-of-options; the rev is already
     // validated, so pass it directly.
     run_git(repo, &["rev-parse", rev])
@@ -530,7 +529,10 @@ pub fn read_tree<P: AsRef<Path>>(git_dir: P, commit: &str) -> Result<()> {
 pub fn ls_tree_sizes<P: AsRef<Path>>(repo: P, commit: &str) -> Result<HashMap<String, u64>> {
     crate::validation::validate_git_rev(commit)
         .with_context(|| format!("invalid commit: {}", commit))?;
-    let out = run_git(repo, &["ls-tree", "-r", "-l", "-z", "--end-of-options", commit])?;
+    let out = run_git(
+        repo,
+        &["ls-tree", "-r", "-l", "-z", "--end-of-options", commit],
+    )?;
     let mut map = HashMap::new();
     for record in out.split('\0') {
         if record.is_empty() {
@@ -681,8 +683,7 @@ pub fn sync_bare_mirror<P: AsRef<Path>>(
 ) -> Result<()> {
     crate::validation::validate_repo_id(owner)
         .with_context(|| format!("invalid owner: {}", owner))?;
-    crate::validation::validate_repo_id(repo)
-        .with_context(|| format!("invalid repo: {}", repo))?;
+    crate::validation::validate_repo_id(repo).with_context(|| format!("invalid repo: {}", repo))?;
     let fetch_ref = if branch == "HEAD" {
         "HEAD".to_string()
     } else {
@@ -701,13 +702,7 @@ pub fn sync_bare_mirror<P: AsRef<Path>>(
         let status = Command::new("git")
             .arg("-C")
             .arg(mirror_dir.as_ref().as_os_str())
-            .args([
-                "fetch",
-                "--depth",
-                &depth.to_string(),
-                "origin",
-                &fetch_ref,
-            ])
+            .args(["fetch", "--depth", &depth.to_string(), "origin", &fetch_ref])
             .status()
             .context("git fetch")?;
         if !status.success() {

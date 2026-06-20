@@ -1,4 +1,5 @@
 pub mod archive;
+pub mod bench;
 pub mod cas;
 pub mod client;
 pub mod clonepack;
@@ -7,9 +8,11 @@ pub mod fusefs;
 pub mod git;
 pub mod manifest;
 pub mod metrics;
+pub mod mode;
 pub mod oidc;
 pub mod overlay;
 pub mod pack;
+pub mod pack_writer;
 pub mod ref_store;
 pub mod retention;
 pub mod server;

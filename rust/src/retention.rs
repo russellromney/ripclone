@@ -30,13 +30,7 @@ pub struct Retention {
 
 impl Retention {
     pub fn new(cas: Cas, metrics: Arc<Metrics>) -> Result<Self> {
-        Self::with_config_and_storage(
-            cas,
-            metrics,
-            Self::parse_age(),
-            Self::parse_size(),
-            None,
-        )
+        Self::with_config_and_storage(cas, metrics, Self::parse_age(), Self::parse_size(), None)
     }
 
     pub fn with_config(
@@ -433,11 +427,17 @@ mod tests {
 
         // Without the object in durable storage, retention must keep it.
         retention.run_once().await.unwrap();
-        assert!(path.exists(), "object not in durable storage should not be evicted");
+        assert!(
+            path.exists(),
+            "object not in durable storage should not be evicted"
+        );
 
         // After copying it to durable storage, retention may evict it.
         durable.put(&sha1_hash, data).unwrap();
         retention.run_once().await.unwrap();
-        assert!(!path.exists(), "object confirmed durable should be evictable");
+        assert!(
+            !path.exists(),
+            "object confirmed durable should be evictable"
+        );
     }
 }

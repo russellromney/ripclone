@@ -1,18 +1,22 @@
+<p align="center">
+  <img src="docs/logo.png" alt="ripclone logo" width="200">
+</p>
+
 # ripclone
 
 A headless backend for fast git clones.
 
-ripclone pre-builds git artifacts for every pushed commit so that agents, CI systems, and humans can clone a repo and start working in seconds instead of waiting for a full `git clone`. It is **read-only** and **clone-only**: it does not proxy commits or pushes. Agents use normal git with their own GitHub tokens for writes.
+ripclone pre-builds git artifacts for every pushed commit so that agents, CI systems, and humans can clone a repo and start working in seconds instead of waiting for a full `git clone`. It is **read-only** and **clone-only**: it does not proxy commits or pushes. You use normal git with your own GitHub tokens for writes.
 
-It is designed to be self-hosted on Fly, your own infrastructure, or any cloud.
+It is designed to be self-hosted and works for private or public repos. For the easiest experience, sign up for free (for public repos) at [Ripclone Cloud](https://ripclone.com).
 
 ## How it works
 
-Git stores a repo as a Merkle tree: commits point to trees, trees point to blobs, and blobs are file contents. The `.git/index` is a snapshot of which blobs should be on disk and what mode they should have. When you `git clone`, Git downloads a packfile containing commits/trees/blobs, and then checks out the files.
+Git stores a repo as a Merkle tree: commits point to trees, trees point to blobs, and blobs are file contents. The `.git/index` is a snapshot of which blobs should be on disk. When you `git clone`, Git downloads a packfile containing commits/trees/blobs, and then writes them to disk.
 
-You can speed this up with a shallow clone (`--depth=1`), which skips old history but still fetches every blob for `HEAD`. Or a partial/blobless clone (`--filter=blob:none`), which skips blobs at first but has to fetch them lazily when you run commands like `git diff`. Neither is ideal for an agent that wants a fully working repo immediately.
+You can speed this up with a shallow clone (`--depth=1`), which skips old history but still fetches every blob for `HEAD`. Or a partial/blobless clone (`--filter=blob:none`), which skips blobs at first but has to fetch them lazily when you run commands like `git diff`. Neither is ideal for a human or agent that wants a fully working repo immediately.
 
-ripclone takes a different approach. On every push, it builds a **clonepack**: a top-level manifest that points to a metadata chunk (skeleton pack, HEAD-blobs pack, prebuilt `.git/index`, plus file/frame tables) and content-addressed archive chunks holding the working-tree file bytes. When you run `ripclone clone`, the client fetches the manifest and metadata chunk, installs the prebuilt `.git` artifacts directly, and then materializes the working tree. By default it uses `git checkout-index` from the prebuilt HEAD-blobs pack; an opt-in archive-chunk extraction path (`RIPCLONE_EXTRACT_ARCHIVE=1`) writes files directly from zstd frames. No `git init`, `git index-pack`, `git read-tree`, or `git update-index`.
+ripclone takes a different approach. On every push, it builds a **clonepack**: a top-level manifest that points to a metadata chunk (skeleton pack, HEAD-blobs pack, prebuilt `.git/index`, plus file/frame tables) and content-addressed archive chunks holding the working-tree file bytes. When you run `ripclone clone`, the client fetches the manifest, metadata chunk, and data chunks concurrently, installs the prebuilt `.git` artifacts directly, and then materializes the working tree. The default `--mode=full` uses `git checkout-index` from the prebuilt HEAD-blobs pack so the repo behaves exactly like a normal `git clone --depth=1`. `--mode=fast` writes files directly from zstd archive chunks for agents that only edit and commit. `--mode=hybrid` runs both streams concurrently. No `git init`, `git index-pack`, `git read-tree`, or `git update-index`.
 
 The result is a normal git repo with a clean `git status` and working `git diff`, ready in a fraction of the time.
 
@@ -145,3 +149,11 @@ Object storage   Local disk
 ## Status
 
 ripclone is under active development. The archive-first clone path, native git remote helper, S3-compatible object storage, token auth, rate limiting, retention, and smart-HTTP fallback are implemented. Streaming extraction and delta updates are future work.
+
+## License
+
+ripclone is licensed under the [Elastic License 2.0](LICENSE).
+
+You may use, modify, and distribute the software freely. You may not provide
+ripclone to third parties as a hosted or managed service. See the full text in
+[`LICENSE`](LICENSE) for details.

@@ -32,7 +32,10 @@ impl Cas {
     }
 
     fn validate_lowercase_hex(hash: &str) -> Result<()> {
-        if !hash.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)) {
+        if !hash
+            .chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+        {
             anyhow::bail!("string must be lowercase hex");
         }
         Ok(())
@@ -63,8 +66,7 @@ impl Cas {
             .sync_all()
             .with_context(|| format!("fsync CAS object tmp {}", hash))?;
         drop(tmp_file);
-        std::fs::rename(&tmp_path, &path)
-            .with_context(|| format!("rename CAS object {}", hash))?;
+        std::fs::rename(&tmp_path, &path).with_context(|| format!("rename CAS object {}", hash))?;
         Ok(())
     }
 
@@ -91,7 +93,13 @@ impl Cas {
         let meta = file.metadata().context("stat CAS object for range read")?;
         let file_len = meta.len();
         if start >= file_len || len > file_len - start {
-            anyhow::bail!("range {}+{} exceeds CAS object {} length {}", start, len, hash, file_len);
+            anyhow::bail!(
+                "range {}+{} exceeds CAS object {} length {}",
+                start,
+                len,
+                hash,
+                file_len
+            );
         }
         file.seek(SeekFrom::Start(start))
             .with_context(|| format!("seek CAS object {}", hash))?;
@@ -108,7 +116,8 @@ impl Cas {
     pub fn path(&self, hash: &str) -> PathBuf {
         // Fall back to a validated path so callers can still use it for local
         // existence checks; invalid hashes produce a path that cannot escape.
-        self.object_path(hash).unwrap_or_else(|_| self.root.join("__invalid__"))
+        self.object_path(hash)
+            .unwrap_or_else(|_| self.root.join("__invalid__"))
     }
 
     pub fn root(&self) -> &Path {
