@@ -4,7 +4,7 @@
 
 # ripclone
 
-ripclone is the fastest way to clone git repos. Large repos see 5x-10x speedup; small repos are also faster.
+ripclone is the fastest way to clone git repos. Large repos see 5x-10x speedup; small repos are also a bit faster.
 
 ripclone pre-builds git artifacts for every pushed commit so that agents, CI systems, and humans can clone a repo and start working in seconds instead of waiting for a full `git clone`. It is **read-only** and **clone-only**: it does not proxy commits or pushes. You use normal git with your own GitHub tokens for writes.
 
@@ -18,41 +18,37 @@ ripclone is one answer.
 
 ## How it works
 
-A normal `git clone` downloads a packfile of commits, trees, and blobs, then runs `git init`, `git index-pack`, `git read-tree`, and `git checkout-index` to build the `.git` directory and working tree. 
+A normal `git clone` is slow because it interleaves several expensive steps. The client and server ***negotiate*** which objects to send; the client ***indexes*** the pack; git builds the index; then it checks out every file. Each step is fine on its own, but together they create a long chain of round trips and disk operations that are hard to parallelize.
 
-ripclone runs those steps ahead of time on the server so the client can skip them. On every push, ripclone mirrors the repo and builds a **clonepack** for the requested depth. A clonepack has two pieces:
+ripclone unbundles that chain. The server runs the ***negotiation***, ***indexing***, and ***tree walking*** once per push and stores the results. The client only downloads precomputed artifacts and writes them to disk.
 
-The ***manifest*** is a small file that lists the signed object storage URLs and hashes of the pack chunks and the optional files artifact. The client downloads this first to know what to fetch.
+On every push, ripclone mirrors the repo and builds a **clonepack** for `HEAD`. A clonepack has three pieces:
 
-The ***depth pack*** is a git packfile containing the commits, trees, and blobs for the requested history depth. The client installs it into `.git/objects/pack/` and uses it for both git operations and working-tree extraction.
+- **Manifest.** A small file that lists the hashes of the metadata chunk and every content chunk. The client downloads this first to know what to fetch.
+- **Metadata chunk.** Contains a skeleton pack and index, a prebuilt `.git/index`, and tables that map every file path to its mode, blob hash, and byte location in the archive. The client uses this to assemble `.git/` without running any git commands.
+- **Content chunks.** The actual file bytes for `HEAD`.
 
-The optional ***files artifact*** is the working tree as zstd-compressed raw bytes, used by `--mode files` for the fastest possible file-only clones.
+### The skeleton
 
-### The depth pack
+The skeleton is a git packfile containing the `HEAD` commit object and every tree reachable from it, but no blobs. It is enough for git to understand the shape of the repo — every directory, file path, mode, and blob hash — without the file contents. The client drops the skeleton pack into `.git/objects/pack/` alongside the prebuilt index, so commands like `git ls-tree`, `git log`, and `git status` work immediately.
 
-The depth pack is a normal git packfile containing the commits, trees, and blobs for the requested history depth. For `--depth 1` it includes the `HEAD` commit, its tree, and every blob reachable from `HEAD`. The client drops the pack into `.git/objects/pack/` alongside its prebuilt idx, so commands like `git status`, `git diff`, `git show`, and `git checkout` work immediately.
+### Getting the file bytes
 
-### The files artifact
+ripclone stores the same `HEAD` file bytes in two formats so you can choose the tradeoff.
 
-For `--mode files`, ripclone also builds the working tree as zstd-compressed raw bytes. This is faster than extracting from a git pack when you only need files and do not need a usable `.git` directory.
+***Head-blobs pack.*** A normal git packfile containing every blob reachable from `HEAD`. When the client installs this pack next to the skeleton, `git diff`, `git show`, and `git checkout-index` all behave exactly like a regular `git clone --depth=1`.
+
+***Archive chunks.*** The same blob bytes grouped into zstd-compressed chunks. Each chunk is made of independent ***zstd frames***, so the client can fetch many chunks in parallel and start decompressing and writing files as soon as the first bytes arrive, while later chunks are still downloading. The frame-level split also means a point lookup can fetch just the frame it needs instead of the whole chunk. This is faster than a git pack for pure materialization, but it leaves `.git/objects` without blobs, so raw git content commands do not work.
 
 ### Clone modes
 
-`--mode=editable` (the default) downloads the depth pack for `--depth N` and installs it as a real git repo. The working tree is extracted directly from the pack in parallel. The result is indistinguishable from `git clone --depth=N`.
+`--mode=full` (the default) downloads the metadata chunk and the archive chunks, writes the working tree directly from the zstd frames, and builds a local HEAD-blobs pack from those bytes so `git diff`, `git show`, and `git checkout-index` all work. The result is indistinguishable from `git clone --depth=1`.
 
-`--mode=files` downloads the optional zstd files artifact and writes the working tree as fast as possible. This is ideal for CI / build-only workflows. It is not a usable git repo.
+`--mode=fast` downloads the metadata chunk and the archive chunks, then writes files directly from the zstd frames without building a blob pack. This is the fastest way to get a working tree for agents that only edit and commit; `git diff`/`git show` do not work.
 
-`--mode=skeleton` installs only the `.git` metadata (commit and tree objects) with no working tree or blobs.
+`--mode=hybrid` downloads the pre-built HEAD-blobs pack in parallel with the archive chunks and writes the working tree from the archive. Faster than `full` when bandwidth is plentiful because it avoids the local pack-build CPU cost; slower on constrained links because it downloads extra bytes.
 
-### Design
-
-A normal `git clone` is slow because it interleaves several expensive steps. The client and server ***negotiate*** which objects to send; the client ***indexes*** the pack; git builds the index; then it checks out every file. Each step is fine on its own, but together they create a long chain of round trips and disk operations that are hard to parallelize.
-
-ripclone unbundles that chain. The server runs the ***negotiation***, ***indexing***, and ***tree walking*** once per push and stores the results as a git pack. The client only downloads the pack chunks it needs, installs the pack, and extracts the working tree in parallel.
-
-For CI workflows that only need files, the server can also build a ***zstd files artifact***. This trades a small amount of extra storage for the fastest possible file materialization.
-
-The result is a git repo built from precomputed parts rather than reconstructed on the fly.
+`--mode=skeleton` downloads only the metadata chunk. It gives you a valid `.git/` with history and tree structure but no working tree and no blob objects.
 
 ### Performance
 
@@ -92,12 +88,6 @@ Clone it:
 
 ```bash
 cargo run --release --bin ripclone -- clone oven-sh/bun --dir bun
-```
-
-Clone just the files for CI:
-
-```bash
-cargo run --release --bin ripclone -- clone oven-sh/bun --mode files --dir bun
 ```
 
 Add a fast worktree (Linux, reuses local objects and overlay staging):
@@ -175,7 +165,7 @@ Object storage   Local disk
 
 - **Object storage** is the source of truth for all artifacts.
 - **Local disk** is a ring-buffer hot cache.
-- **Clients** download manifests and pack chunks, install the pack, and extract files in parallel.
+- **Clients** download manifests, skeletons, and archives; stream-decompress frames; and write files directly.
 - **GitHub remains the source of truth** for repos, refs, permissions, and writes.
 - **IP rate limiting** protects public endpoints from abuse.
 
@@ -191,7 +181,8 @@ cargo build --release --no-default-features
 Environment variables for tuning clone performance:
 
 - `RIPCLONE_FETCH_CONCURRENCY` — max concurrent chunk downloads (default 6).
-- `RIPCLONE_FETCH_THREADS` / `RIPCLONE_WRITE_THREADS` — thread counts for pack-to-files extraction.
+- `RIPCLONE_FETCH_THREADS` / `RIPCLONE_WRITE_THREADS` — thread counts for archive extraction.
+- `RIPCLONE_BLOB_PACK_THREADS` — threads used when building a local blob pack in `full` mode.
 
 ## License
 

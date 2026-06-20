@@ -4,7 +4,7 @@ set -euo pipefail
 # Benchmark the direct-install clone path against a remote ripclone-server.
 #
 # Usage:
-#   SERVER_URL=http://ripclone.fly.dev:8080 REPO=oven-sh/bun ITER=3 ./scripts/benchmark_remote.sh
+#   SERVER_URL=http://ripclone.fly.dev:8080 REPO=oven-sh/bun ITER=3 ./benchmark/remote.sh
 #
 # Environment:
 #   SERVER_URL - URL of the ripclone-server (required)
@@ -17,7 +17,7 @@ SERVER_URL="${SERVER_URL:-}"
 
 if [ -z "$SERVER_URL" ]; then
   echo "error: SERVER_URL is required"
-  echo "usage: SERVER_URL=http://... REPO=owner/repo ITER=3 ./scripts/benchmark_remote.sh"
+  echo "usage: SERVER_URL=http://... REPO=owner/repo ITER=3 ./benchmark/remote.sh"
   exit 1
 fi
 

@@ -4,7 +4,7 @@ set -euo pipefail
 # Benchmark the direct-install clone path through a latency-injecting proxy.
 #
 # Usage:
-#   LATENCY=0.05 REPO=oven-sh/bun ./scripts/benchmark_latency.sh
+#   LATENCY=0.05 REPO=oven-sh/bun ./benchmark/latency.sh
 #
 # Environment:
 #   LATENCY   - one-way delay in seconds; request and response are each delayed,
