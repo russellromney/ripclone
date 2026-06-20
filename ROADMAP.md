@@ -31,7 +31,36 @@ For branches: each branch gets its own clonepack. For history beyond `HEAD`: not
 
 Because the two representations contain the same data, fetching both is redundant. The modes below decide which one to use (or whether to use both in parallel for speed).
 
-### 2. Unified async download/write pipeline ✅
+### 2. History depths and clonepack variants ✅
+
+Implemented in `rust/src/lib.rs`, `rust/src/server.rs`, `rust/src/client.rs`, `rust/src/pack.rs`, and `rust/src/git.rs`. See `CHANGELOG.md` for details.
+
+- The server now produces both a `shallow` (depth=1) and a `full` clonepack for every sync.
+- The ref endpoint selects the variant with `?clonepack=shallow|full`.
+- The CLI exposes `--history shallow|full` on clone and `--depth N` on sync.
+
+Remaining work:
+- **Repo/branch-specific depth configuration** (see section below).
+- Support more than two hard-coded depths (e.g., depth=10, depth=50) without recompiling.
+
+### 2a. Repo/branch-specific configuration (planned)
+
+Right now the server hard-codes two clonepack variants (`shallow` = depth 1, `full` = unlimited). Users and orgs should be able to configure this per repo/branch without recompiling.
+
+Proposed design:
+
+- Add a `RepoConfig` store backed by the same storage as the ref store (file for local dev, S3 for production).
+- Key by `owner/repo[/branch]`, with branch-level entries overriding repo-level entries.
+- Config fields:
+  - `clonepack_depths: Vec<DepthSpec>` where `DepthSpec` is `{ name: "shallow", depth: 1 }`, `{ name: "full", depth: null }`, or arbitrary depths like `{ name: "recent", depth: 50 }`.
+  - `compression_level`, `dictionary_id`, `hot_files`, `archive_chunk_size`, `head_blobs_chunk_size`.
+  - `enabled_modes: ["full", "fast", "hybrid", "skeleton"]` if a repo wants to disable some paths.
+- On sync/build, the server reads the config for the repo/branch and builds exactly the requested set of clonepacks.
+- The ref endpoint accepts `?clonepack=<name>`; the name maps to one of the configured depths.
+- Default config (when none is stored) produces `shallow` and `full` exactly like today, so behavior is unchanged for unconfigured repos.
+- A simple admin CLI or API endpoint (`POST /v1/admin/config/{owner}/{repo}`) can write the config; eventually this is exposed in the ripclone-cloud UI.
+
+### 3. Unified async download/write pipeline ✅
 
 Implemented in `rust/src/client.rs`, `rust/src/extract.rs`, and `rust/src/pack_writer.rs`. See `CHANGELOG.md` for details.
 
@@ -40,14 +69,14 @@ Remaining future improvements:
 - Retry each chunk download with exponential backoff.
 - Delete the temp install directory on failure.
 
-### 3. User-facing clone modes ✅
+### 4. User-facing clone modes ✅
 
 Implemented as `--mode full|fast|hybrid|skeleton` and `RIPCLONE_MODE`. See `CHANGELOG.md` for details.
 
 Remaining future item:
 - `lazy` mode (metadata + archive chunks first; head-blobs fetched by a background daemon afterwards).
 
-### 4. Edge warmth with Tigris
+### 5. Edge warmth with Tigris
 
 Tigris Global buckets already cache objects near the requester, but the first request from a new region is a cold-cache miss. We keep Tigris and warm the cache instead of adding a separate CDN.
 
@@ -66,11 +95,11 @@ Tigris Global buckets already cache objects near the requester, but the first re
    - Older commits stay in the cheaper Global bucket.
    - This is a paid-feature tier, not the immediately important path.
 
-### 5. Per-phase benchmark breakdown ✅
+### 6. Per-phase benchmark breakdown ✅
 
 Implemented as `--bench` / `RIPCLONE_BENCH=1` with a JSON report covering all defined phases. See `CHANGELOG.md` for details.
 
-### 6. Production hardening still missing
+### 7. Production hardening still missing
 
 - **Prometheus `/metrics`**: replace the JSON snapshot with Prometheus text format.
 - **Real `/readyz`**: check storage and ref-store health instead of always returning `ok`.
@@ -82,7 +111,7 @@ Implemented as `--bench` / `RIPCLONE_BENCH=1` with a JSON report covering all de
   - `scripts/e2e_archive.sh` already verifies content, symlinks, executable bits, and edit detection for direct-install; reuse it for all modes.
 - **Fuzz/property tests**: random manifests should either produce the expected tree or return `Err`, never a silently short tree.
 
-### 7. Clonepack deltas / compaction (future)
+### 8. Clonepack deltas / compaction (future)
 
 Once warm full clones are fast and predictable, move from full clonepacks per commit to append-only delta chunks for recent commits, with background compaction. This is on the roadmap but not the current focus.
 

@@ -21,7 +21,17 @@ impl<'a> PackBuilder<'a> {
     /// Symlink blobs are small and let `git status` verify symlinks without
     /// fetching them lazily.
     pub fn build_skeleton_pack(&self, commit: &str) -> Result<(String, String)> {
-        let shas = git::list_object_shas(&self.repo, commit)?;
+        self.build_skeleton_pack_with_depth(commit, None)
+    }
+
+    /// Build a skeleton pack limited to `max_depth` commits. `max_depth = None`
+    /// is the full history; `Some(1)` produces a depth=1 skeleton.
+    pub fn build_skeleton_pack_with_depth(
+        &self,
+        commit: &str,
+        max_depth: Option<usize>,
+    ) -> Result<(String, String)> {
+        let shas = git::list_object_shas_with_depth(&self.repo, commit, max_depth)?;
         let types = git::classify_objects(&self.repo, &shas.iter().cloned().collect())?;
         let mut skeleton_shas: Vec<String> = shas
             .into_iter()
@@ -37,6 +47,11 @@ impl<'a> PackBuilder<'a> {
         skeleton_shas.extend(symlink_shas);
 
         self.pack_and_index(&skeleton_shas)
+    }
+
+    /// Build a depth=1 skeleton pack (single commit + HEAD trees + symlinks).
+    pub fn build_shallow_skeleton_pack(&self, commit: &str) -> Result<(String, String)> {
+        self.build_skeleton_pack_with_depth(commit, Some(1))
     }
 
     /// Build a packfile + idx containing all objects reachable from a commit.

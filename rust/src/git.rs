@@ -287,18 +287,33 @@ pub fn last_commits<P: AsRef<Path>>(repo: P, branch: &str, count: usize) -> Resu
 }
 
 pub fn list_object_shas<P: AsRef<Path>>(repo: P, commit: &str) -> Result<Vec<String>> {
+    list_object_shas_with_depth(repo, commit, None)
+}
+
+/// List objects reachable from `commit`, optionally limiting the commit history
+/// depth. `max_depth = None` returns the full history. With a depth of `1`, only
+/// the HEAD commit and the trees/blobs reachable from it are returned, which is
+/// exactly what `git clone --depth=1` needs.
+pub fn list_object_shas_with_depth<P: AsRef<Path>>(
+    repo: P,
+    commit: &str,
+    max_depth: Option<usize>,
+) -> Result<Vec<String>> {
     crate::validation::validate_git_rev(commit)
         .with_context(|| format!("invalid commit: {}", commit))?;
-    let out = run_git(
-        repo,
-        &[
-            "rev-list",
-            "--objects",
-            "--no-object-names",
-            "--end-of-options",
-            commit,
-        ],
-    )?;
+    let depth_str = max_depth.map(|d| d.to_string());
+    let mut args: Vec<&str> = vec![
+        "rev-list",
+        "--objects",
+        "--no-object-names",
+        "--end-of-options",
+        commit,
+    ];
+    if let Some(d) = depth_str.as_deref() {
+        args.insert(1, "-n");
+        args.insert(2, d);
+    }
+    let out = run_git(repo, &args)?;
     Ok(out.lines().map(|s| s.to_string()).collect())
 }
 

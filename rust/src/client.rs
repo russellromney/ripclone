@@ -39,6 +39,9 @@ pub struct RefResponse {
     pub head_blobs_chunk_urls: Option<Vec<Option<String>>>,
     #[serde(default)]
     pub head_blobs_idx_url: Option<String>,
+    /// True when the returned clonepack is a shallow (depth=1) snapshot.
+    #[serde(default)]
+    pub shallow: bool,
 }
 
 /// Return the chunk refs that make up the head-blobs pack, falling back to the
@@ -214,10 +217,24 @@ fn default_cache_dir() -> Option<PathBuf> {
 
 impl Client {
     pub async fn resolve_ref(&self, owner: &str, repo: &str, branch: &str) -> Result<RefResponse> {
-        let url = format!(
+        self.resolve_ref_with_clonepack(owner, repo, branch, None)
+            .await
+    }
+
+    pub async fn resolve_ref_with_clonepack(
+        &self,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+        clonepack: Option<&str>,
+    ) -> Result<RefResponse> {
+        let mut url = format!(
             "{}/v1/repos/{}/{}/refs/{}",
             self.server, owner, repo, branch
         );
+        if let Some(kind) = clonepack {
+            url.push_str(&format!("?clonepack={}", kind));
+        }
         let resp = self.http.get(&url).send().await?;
         if !resp.status().is_success() {
             let text = resp.text().await.unwrap_or_default();
@@ -461,9 +478,13 @@ impl Client {
         &self,
         owner: &str,
         repo: &str,
+        depth: Option<usize>,
         github_token: Option<&str>,
     ) -> Result<RefResponse> {
-        let url = format!("{}/v1/repos/{}/{}/sync", self.server, owner, repo);
+        let mut url = format!("{}/v1/repos/{}/{}/sync", self.server, owner, repo);
+        if let Some(d) = depth {
+            url.push_str(&format!("?depth={}", d));
+        }
         let mut req = self.http.post(&url);
         if let Some(token) = github_token {
             req = req.header("X-GitHub-Token", token);
@@ -488,7 +509,7 @@ impl Client {
         branch: &str,
         target: P,
     ) -> Result<()> {
-        self.install_repo_with_mode(owner, repo, branch, target, CloneMode::Full, None)
+        self.install_repo_with_mode(owner, repo, branch, target, CloneMode::Full, None, None)
             .await
     }
 
@@ -501,6 +522,7 @@ impl Client {
         branch: &str,
         target: P,
         mode: CloneMode,
+        clonepack: Option<&str>,
         bench: Option<&mut Benchmark>,
     ) -> Result<()> {
         let target = target.as_ref().to_path_buf();
@@ -520,8 +542,10 @@ impl Client {
         let mut local_bench = Benchmark::new();
         let bench = bench.unwrap_or(&mut local_bench);
 
-        // 1. Resolve ref.
-        let info = self.resolve_ref(owner, repo, branch).await?;
+        // 1. Resolve ref (full-history by default; fast clones can request shallow).
+        let info = self
+            .resolve_ref_with_clonepack(owner, repo, branch, clonepack)
+            .await?;
         bench.mark_resolve();
         info!("resolved to commit {}", &info.commit[..7]);
 
@@ -648,6 +672,11 @@ impl Client {
         }
         std::fs::write(branch_ref, format!("{}\n", info.commit))?;
         std::fs::write(git_dir.join("info").join("exclude"), b".ripclone/\n")?;
+        if info.shallow {
+            // Mark HEAD as a shallow boundary so git does not try to traverse
+            // missing parents.
+            std::fs::write(git_dir.join("shallow"), format!("{}\n", info.commit))?;
+        }
 
         // 6. Write the small .git artifacts from the metadata chunk.
         let pack_dir = git_dir.join("objects").join("pack");
@@ -1347,6 +1376,9 @@ impl Client {
         }
         std::fs::write(branch_ref, format!("{}\n", info.commit))?;
         std::fs::write(git_dir.join("info").join("exclude"), b".ripclone/\n")?;
+        if info.shallow {
+            std::fs::write(git_dir.join("shallow"), format!("{}\n", info.commit))?;
+        }
 
         let pack_dir = git_dir.join("objects").join("pack");
         std::fs::create_dir_all(&pack_dir)?;

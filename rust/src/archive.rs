@@ -10,8 +10,9 @@ use std::path::{Path, PathBuf};
 /// Target uncompressed frame size for the common case.
 const FRAME_TARGET: usize = 6 * 1024 * 1024;
 /// Maximum uncompressed frame size. Single files up to this size get one frame;
-/// anything bigger is split across multiple frames.
-const FRAME_MAX: usize = 64 * 1024 * 1024;
+/// anything bigger is split across multiple frames. Keep this at or below the
+/// chunk target so a single compressed frame can never overflow a chunk.
+const FRAME_MAX: usize = FRAME_TARGET;
 /// Default compressed size cap for a single archive chunk.
 pub const DEFAULT_ARCHIVE_CHUNK_SIZE: u64 = 8 * 1024 * 1024;
 
@@ -167,20 +168,18 @@ impl ArchiveBuilder {
                              chunks: &mut Vec<Vec<u8>>,
                              target_chunk_size: u64|
              -> Result<u64> {
-                let chunk_index = chunks.len() as u32;
+                let mut chunk_index = chunks.len() as u32;
                 let size = flush_frame_to_chunk(
                     manifest,
                     frame_raw,
                     frame_index,
-                    chunk_index,
+                    &mut chunk_index,
                     current_chunk,
+                    chunks,
+                    target_chunk_size,
                     level,
                     &mut compressor,
                 )?;
-                if !current_chunk.is_empty() && current_chunk.len() as u64 >= target_chunk_size {
-                    let finished = std::mem::take(current_chunk);
-                    chunks.push(finished);
-                }
                 Ok(size)
             };
 
@@ -297,12 +296,15 @@ impl ArchiveBuilder {
         }
 
         if !frame_raw.is_empty() {
+            let mut chunk_index = chunks.len() as u32;
             flush_frame_to_chunk(
                 &mut manifest,
                 &mut frame_raw,
                 frame_index,
-                chunks.len() as u32,
+                &mut chunk_index,
                 &mut current_chunk,
+                &mut chunks,
+                target_chunk_size,
                 level,
                 &mut compressor,
             )?;
@@ -392,8 +394,10 @@ fn flush_frame_to_chunk(
     manifest: &mut MetadataChunk,
     frame_raw: &mut Vec<u8>,
     frame_index: u32,
-    chunk_index: u32,
+    chunk_index: &mut u32,
     chunk: &mut Vec<u8>,
+    chunks: &mut Vec<Vec<u8>>,
+    target_chunk_size: u64,
     level: i32,
     compressor: &mut Option<zstd::bulk::Compressor<'static>>,
 ) -> Result<u64> {
@@ -403,9 +407,18 @@ fn flush_frame_to_chunk(
             .context("zstd compress frame with dictionary")?,
         None => zstd::encode_all(frame_raw.as_slice(), level).context("zstd compress frame")?,
     };
+
+    // Never let a single frame overflow the chunk target. If the current chunk
+    // is non-empty and adding this frame would exceed the cap, finalize it now.
+    if !chunk.is_empty() && chunk.len() as u64 + compressed.len() as u64 > target_chunk_size {
+        let finished = std::mem::take(chunk);
+        chunks.push(finished);
+        *chunk_index = chunks.len() as u32;
+    }
+
     let chunk_offset = chunk.len() as u64;
     let frame_info = FrameInfo {
-        chunk_index,
+        chunk_index: *chunk_index,
         chunk_offset,
         compressed_len: compressed.len() as u32,
         raw_len: frame_raw.len() as u32,
@@ -421,6 +434,14 @@ fn flush_frame_to_chunk(
         );
     }
     manifest.frames.push(frame_info);
+
+    // Finalize the chunk as soon as it reaches the target so the next frame
+    // starts fresh.
+    if chunk.len() as u64 >= target_chunk_size {
+        let finished = std::mem::take(chunk);
+        chunks.push(finished);
+        *chunk_index = chunks.len() as u32;
+    }
 
     let size = compressed.len() as u64;
     frame_raw.clear();
@@ -525,4 +546,74 @@ pub fn train_dictionary(
 
     let dict = zstd::dict::from_samples(&samples, max_size).context("train zstd dictionary")?;
     Ok(dict)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn commit_files(files: &[(&str, &[u8])]) -> (tempfile::TempDir, String) {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init_bare(tmp.path()).unwrap();
+        let sig = git2::Signature::now("test", "test@example.com").unwrap();
+        let mut idx = repo.index().unwrap();
+        let zero_time = git2::IndexTime::new(0, 0);
+        for (path, bytes) in files {
+            let blob_oid = repo.blob(bytes).unwrap();
+            let entry = git2::IndexEntry {
+                ctime: zero_time,
+                mtime: zero_time,
+                dev: 0,
+                ino: 0,
+                mode: 0o100644,
+                uid: 0,
+                gid: 0,
+                file_size: bytes.len() as u32,
+                id: blob_oid,
+                flags: 0,
+                flags_extended: 0,
+                path: path.as_bytes().to_vec(),
+            };
+            idx.add(&entry).unwrap();
+        }
+        idx.write().unwrap();
+        let tree_id = idx.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let commit_oid = repo
+            .commit(Some("HEAD"), &sig, &sig, "test", &tree, &[])
+            .unwrap();
+        (tmp, commit_oid.to_string())
+    }
+
+    #[test]
+    fn archive_chunks_respect_target_size() {
+        let pseudo_random = |len: usize| {
+            (0..len)
+                .map(|i| (i.wrapping_mul(0x9E3779B9) as u8))
+                .collect::<Vec<u8>>()
+        };
+        let files: Vec<(&str, Vec<u8>)> = vec![
+            ("zero.bin", vec![0u8; 3 * 1024 * 1024]),
+            ("one.bin", vec![1u8; 5 * 1024 * 1024]),
+            ("random_4m.bin", pseudo_random(4 * 1024 * 1024)),
+            ("random_8m.bin", pseudo_random(8 * 1024 * 1024)),
+            ("big_random.bin", pseudo_random(12 * 1024 * 1024)),
+        ];
+        let files_ref: Vec<(&str, &[u8])> = files.iter().map(|(p, b)| (*p, b.as_slice())).collect();
+        let (tmp, commit) = commit_files(&files_ref);
+        let builder = ArchiveBuilder::new(tmp.path());
+        let (_metadata, chunks, _stats) = builder
+            .build_chunks(&commit, 6, None, 8 * 1024 * 1024)
+            .unwrap();
+        let target = 8 * 1024 * 1024;
+        for (i, chunk) in chunks.iter().enumerate() {
+            assert!(
+                chunk.len() as u64 <= target,
+                "chunk {} exceeds {} byte target: {}",
+                i,
+                target,
+                chunk.len()
+            );
+        }
+    }
 }

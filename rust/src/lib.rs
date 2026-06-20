@@ -32,6 +32,16 @@ pub fn parse_repo(repo: &str) -> Result<(&str, &str)> {
     Ok((parts[0], parts[1]))
 }
 
+/// Artifact hashes for one clonepack variant (e.g. shallow depth=1 or full).
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct ClonepackArtifacts {
+    pub manifest: String,
+    pub metadata_chunk: String,
+    pub skeleton_pack: String,
+    pub skeleton_idx: String,
+    pub prebuilt_index: String,
+}
+
 /// Artifact hashes returned by the server for a single ref.
 ///
 /// Every artifact is stored in the CAS and can be fetched by its hash from
@@ -56,16 +66,24 @@ pub struct RefInfo {
     /// Optional full-history pack (empty when not built).
     pub full_pack: String,
     /// Clonepack manifest hash (protobuf). Archive chunks are referenced inside it.
+    /// Kept for backward compatibility; use `full_clonepack.manifest`.
     #[serde(default)]
     pub clonepack_manifest: String,
     /// Metadata chunk hash (protobuf). Kept at the top level so the ref endpoint
     /// can hand out a signed URL for it without re-decoding the manifest.
+    /// Kept for backward compatibility; use `full_clonepack.metadata_chunk`.
     #[serde(default)]
     pub metadata_chunk: String,
     /// Archive chunk hashes referenced by the clonepack manifest. Kept for
     /// retention protection and debugging.
     #[serde(default)]
     pub archive_chunks: Vec<String>,
+    /// Full-history clonepack (all reachable commits/trees).
+    #[serde(default)]
+    pub full_clonepack: ClonepackArtifacts,
+    /// Shallow clonepack (single commit + HEAD trees). Matches `git clone --depth=1`.
+    #[serde(default)]
+    pub shallow_clonepack: ClonepackArtifacts,
     /// Optional build status used by the async /v1/build worker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_status: Option<String>,

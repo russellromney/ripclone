@@ -115,6 +115,18 @@ pub struct SyncRequest {
 }
 
 #[derive(Deserialize)]
+pub struct RefQuery {
+    /// Clonepack variant to return: "full" (all reachable history) or
+    /// "shallow" (depth=1). Defaults to "full" for backward compatibility.
+    #[serde(default = "default_clonepack_kind")]
+    pub clonepack: String,
+}
+
+fn default_clonepack_kind() -> String {
+    "full".to_string()
+}
+
+#[derive(Deserialize)]
 pub struct CatRequest {
     pub path: String,
     #[serde(default = "default_branch_value")]
@@ -262,6 +274,9 @@ pub struct RefResponse {
     /// Signed URL for the optional head-blobs idx.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub head_blobs_idx_url: Option<String>,
+    /// True when the returned clonepack is a shallow (depth=1) snapshot.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub shallow: bool,
 }
 
 #[derive(Serialize)]
@@ -658,6 +673,7 @@ async fn ensure_mirror(
 
 async fn get_ref(
     Path((owner, repo, branch)): Path<(String, String, String)>,
+    Query(params): Query<RefQuery>,
     State(state): State<ServerState>,
 ) -> impl IntoResponse {
     if let Some(resp) = reject_invalid_repo_ids(&owner, &repo) {
@@ -728,10 +744,19 @@ async fn get_ref(
                 clonepack_manifest: String::new(),
                 metadata_chunk: String::new(),
                 archive_chunks: Vec::new(),
+                full_clonepack: crate::ClonepackArtifacts::default(),
+                shallow_clonepack: crate::ClonepackArtifacts::default(),
                 build_status: None,
                 synced_at: None,
             });
-            let resp = ref_response(owner, repo, branch, &info, &state.storage);
+            let resp = ref_response(
+                owner,
+                repo,
+                branch,
+                &info,
+                &state.storage,
+                &params.clonepack,
+            );
             (StatusCode::OK, Json(resp)).into_response()
         }
         _ => {
@@ -758,9 +783,29 @@ fn ref_response(
     branch: String,
     info: &RefInfo,
     storage: &crate::storage::StorageRef,
+    clonepack_kind: &str,
 ) -> RefResponse {
-    let clonepack_manifest_url = signed_url(storage, &info.clonepack_manifest);
-    let metadata_chunk_url = signed_url(storage, &info.metadata_chunk);
+    let artifacts = if clonepack_kind == "shallow" && !info.shallow_clonepack.manifest.is_empty() {
+        &info.shallow_clonepack
+    } else {
+        &info.full_clonepack
+    };
+
+    // Fallback to the legacy top-level fields if the new struct is empty (older
+    // stored refs).
+    let clonepack_manifest = if artifacts.manifest.is_empty() {
+        info.clonepack_manifest.clone()
+    } else {
+        artifacts.manifest.clone()
+    };
+    let metadata_chunk = if artifacts.metadata_chunk.is_empty() {
+        info.metadata_chunk.clone()
+    } else {
+        artifacts.metadata_chunk.clone()
+    };
+
+    let clonepack_manifest_url = signed_url(storage, &clonepack_manifest);
+    let metadata_chunk_url = signed_url(storage, &metadata_chunk);
     let archive_chunk_urls = if info.archive_chunks.is_empty() {
         None
     } else {
@@ -800,13 +845,14 @@ fn ref_response(
         commit: info.commit.clone(),
         parent_commit: info.parent_commit.clone(),
         full_pack: info.full_pack.clone(),
-        clonepack_manifest: info.clonepack_manifest.clone(),
+        clonepack_manifest,
         clonepack_manifest_url,
-        metadata_chunk: info.metadata_chunk.clone(),
+        metadata_chunk,
         metadata_chunk_url,
         archive_chunk_urls,
         head_blobs_chunk_urls,
         head_blobs_idx_url,
+        shallow: clonepack_kind == "shallow",
     }
 }
 
@@ -876,7 +922,14 @@ async fn sync_repo(
     {
         Ok(info) => {
             state.metrics.record_sync(start.elapsed());
-            let resp = ref_response(owner, repo, "HEAD".to_string(), &info, &state.storage);
+            let resp = ref_response(
+                owner,
+                repo,
+                "HEAD".to_string(),
+                &info,
+                &state.storage,
+                "full",
+            );
             drop(_guard);
             (StatusCode::OK, Json(resp)).into_response()
         }
@@ -1506,13 +1559,22 @@ async fn do_sync(
 
     info!("building artifacts for {}", &commit[..7]);
 
-    // Skeleton pack + idx.
+    // Full-history skeleton pack + idx.
     let mirror_dir2 = mirror_dir.clone();
     let cas2 = cas.clone();
     let commit2 = commit.clone();
     let skeleton_handle = tokio::task::spawn_blocking(move || {
         let builder = PackBuilder::new(&mirror_dir2, &cas2);
         builder.build_skeleton_pack(&commit2)
+    });
+
+    // Shallow depth=1 skeleton pack + idx.
+    let mirror_dir2s = mirror_dir.clone();
+    let cas2s = cas.clone();
+    let commit2s = commit.clone();
+    let shallow_skeleton_handle = tokio::task::spawn_blocking(move || {
+        let builder = PackBuilder::new(&mirror_dir2s, &cas2s);
+        builder.build_shallow_skeleton_pack(&commit2s)
     });
 
     // Head-blobs pack + idx.
@@ -1533,26 +1595,42 @@ async fn do_sync(
         builder.build_into_cas(&commit4, &cas4, 6, None)
     });
 
-    let (skeleton_pack, skeleton_idx) = skeleton_handle.await.context("skeleton pack task")??;
+    let (skeleton_pack, skeleton_idx) =
+        skeleton_handle.await.context("full skeleton pack task")??;
+    let (shallow_skeleton_pack, shallow_skeleton_idx) = shallow_skeleton_handle
+        .await
+        .context("shallow skeleton pack task")??;
     let (head_blobs_pack, head_blobs_idx) =
         head_blobs_handle.await.context("head blobs pack task")??;
     let (archive_chunk_hashes, mut metadata_chunk) =
         archive_handle.await.context("archive task")??;
 
-    // Prebuilt index depends on the skeleton pack being in the CAS.
+    // Prebuilt indexes for both skeletons.
     let mirror_dir5 = mirror_dir.clone();
     let cas5 = cas.clone();
     let commit5 = commit.clone();
     let skeleton_pack_for_index = skeleton_pack.clone();
-    let prebuilt_index = tokio::task::spawn_blocking(move || {
+    let prebuilt_index_handle = tokio::task::spawn_blocking(move || {
         let builder = PackBuilder::new(&mirror_dir5, &cas5);
         builder.build_prebuilt_index(&commit5, &skeleton_pack_for_index)
-    })
-    .await
-    .context("prebuilt index task")??;
+    });
+    let mirror_dir5s = mirror_dir.clone();
+    let cas5s = cas.clone();
+    let commit5s = commit.clone();
+    let shallow_skeleton_pack_for_index = shallow_skeleton_pack.clone();
+    let shallow_prebuilt_index_handle = tokio::task::spawn_blocking(move || {
+        let builder = PackBuilder::new(&mirror_dir5s, &cas5s);
+        builder.build_prebuilt_index(&commit5s, &shallow_skeleton_pack_for_index)
+    });
+    let prebuilt_index = prebuilt_index_handle
+        .await
+        .context("full prebuilt index task")??;
+    let shallow_prebuilt_index = shallow_prebuilt_index_handle
+        .await
+        .context("shallow prebuilt index task")??;
 
-    // Assemble the metadata chunk with the small .git artifacts and the
-    // frame/file tables. The head-blobs pack is kept as its own artifact
+    // Assemble the full-history metadata chunk with the small .git artifacts and
+    // the frame/file tables. The head-blobs pack is kept as its own artifact
     // because it is ~65 MB of file contents and is not needed for archive
     // extraction.
     metadata_chunk.skeleton_pack = cas.get(&skeleton_pack)?;
@@ -1560,6 +1638,15 @@ async fn do_sync(
     metadata_chunk.prebuilt_index = cas.get(&prebuilt_index)?;
     let metadata_data = metadata_chunk.encode_to_vec();
     let metadata_hash = cas.put(&metadata_data)?;
+
+    // Assemble the shallow depth=1 metadata chunk. The archive and head-blobs
+    // chunks are identical; only the skeleton/index differ.
+    let mut shallow_metadata_chunk = metadata_chunk.clone();
+    shallow_metadata_chunk.skeleton_pack = cas.get(&shallow_skeleton_pack)?;
+    shallow_metadata_chunk.skeleton_idx = cas.get(&shallow_skeleton_idx)?;
+    shallow_metadata_chunk.prebuilt_index = cas.get(&shallow_prebuilt_index)?;
+    let shallow_metadata_data = shallow_metadata_chunk.encode_to_vec();
+    let shallow_metadata_hash = cas.put(&shallow_metadata_data)?;
 
     // Split the head-blobs pack into fixed-size chunks so the client can fetch
     // it in parallel. The idx stays small and is fetched as a single object.
@@ -1578,24 +1665,37 @@ async fn do_sync(
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    let clonepack_manifest = ClonepackManifest {
-        commit: commit.clone(),
-        parent_commit: parent.clone(),
-        default_branch: default_branch.clone(),
-        metadata_chunk: Some(ChunkRef {
-            hash: hash_from_hex(&metadata_hash)?,
-            len: metadata_data.len() as u64,
-        }),
-        archive_chunks,
-        head_blobs_chunks: head_blobs_chunk_refs.clone(),
-        head_blobs_idx: Some(ChunkRef {
-            hash: hash_from_hex(&head_blobs_idx)?,
-            len: head_blobs_idx_data.len() as u64,
-        }),
-        ..Default::default()
+
+    let make_clonepack = |metadata_hash: String, metadata_len: u64| -> Result<ClonepackManifest> {
+        Ok(ClonepackManifest {
+            commit: commit.clone(),
+            parent_commit: parent.clone(),
+            default_branch: default_branch.clone(),
+            metadata_chunk: Some(ChunkRef {
+                hash: hash_from_hex(&metadata_hash)?,
+                len: metadata_len,
+            }),
+            archive_chunks: archive_chunks.clone(),
+            head_blobs_chunks: head_blobs_chunk_refs.clone(),
+            head_blobs_idx: Some(ChunkRef {
+                hash: hash_from_hex(&head_blobs_idx)?,
+                len: head_blobs_idx_data.len() as u64,
+            }),
+            ..Default::default()
+        })
     };
-    let clonepack_data = clonepack_manifest.encode_to_vec();
-    let clonepack_hash = cas.put(&clonepack_data)?;
+
+    let full_clonepack_manifest =
+        make_clonepack(metadata_hash.clone(), metadata_data.len() as u64)?;
+    let full_clonepack_data = full_clonepack_manifest.encode_to_vec();
+    let full_clonepack_hash = cas.put(&full_clonepack_data)?;
+
+    let shallow_clonepack_manifest = make_clonepack(
+        shallow_metadata_hash.clone(),
+        shallow_metadata_data.len() as u64,
+    )?;
+    let shallow_clonepack_data = shallow_clonepack_manifest.encode_to_vec();
+    let shallow_clonepack_hash = cas.put(&shallow_clonepack_data)?;
 
     let full_pack = if build_full_pack {
         let mirror_dir6 = mirror_dir.clone();
@@ -1620,18 +1720,32 @@ async fn do_sync(
         commit: commit.clone(),
         parent_commit: parent.clone(),
         default_branch: default_branch.clone(),
-        skeleton_pack,
-        skeleton_idx,
+        skeleton_pack: skeleton_pack.clone(),
+        skeleton_idx: skeleton_idx.clone(),
         head_blobs_pack: String::new(),
-        head_blobs_idx,
-        head_blobs_chunks: head_blobs_chunk_hashes,
-        prebuilt_index,
+        head_blobs_idx: head_blobs_idx.clone(),
+        head_blobs_chunks: head_blobs_chunk_hashes.clone(),
+        prebuilt_index: prebuilt_index.clone(),
         archive: archive_chunk_hashes.first().cloned().unwrap_or_default(),
         manifest: metadata_hash.clone(),
         full_pack,
-        clonepack_manifest: clonepack_hash,
-        metadata_chunk: metadata_hash,
-        archive_chunks: archive_chunk_hashes,
+        clonepack_manifest: full_clonepack_hash.clone(),
+        metadata_chunk: metadata_hash.clone(),
+        archive_chunks: archive_chunk_hashes.clone(),
+        full_clonepack: crate::ClonepackArtifacts {
+            manifest: full_clonepack_hash.clone(),
+            metadata_chunk: metadata_hash.clone(),
+            skeleton_pack: skeleton_pack.clone(),
+            skeleton_idx: skeleton_idx.clone(),
+            prebuilt_index: prebuilt_index.clone(),
+        },
+        shallow_clonepack: crate::ClonepackArtifacts {
+            manifest: shallow_clonepack_hash.clone(),
+            metadata_chunk: shallow_metadata_hash.clone(),
+            skeleton_pack: shallow_skeleton_pack.clone(),
+            skeleton_idx: shallow_skeleton_idx.clone(),
+            prebuilt_index: shallow_prebuilt_index.clone(),
+        },
         build_status: None,
         synced_at: SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -1641,7 +1755,8 @@ async fn do_sync(
 
     // Push every built artifact to the configured storage backend. For a local
     // backend this is a no-op (CAS already holds it); for S3/R2/Tigris this
-    // makes the artifact durable and available via signed URL.
+    // makes the artifact durable and available via signed URL. Include both the
+    // full and the shallow clonepack artifacts.
     let mut artifact_hashes: Vec<&str> = vec![
         &info.skeleton_pack,
         &info.skeleton_idx,
@@ -1649,6 +1764,11 @@ async fn do_sync(
         &info.prebuilt_index,
         &info.manifest,
         &info.clonepack_manifest,
+        &info.shallow_clonepack.skeleton_pack,
+        &info.shallow_clonepack.skeleton_idx,
+        &info.shallow_clonepack.prebuilt_index,
+        &info.shallow_clonepack.metadata_chunk,
+        &info.shallow_clonepack.manifest,
     ];
     artifact_hashes.extend(info.head_blobs_chunks.iter().map(|s| s.as_str()));
     artifact_hashes.extend(info.archive_chunks.iter().map(|s| s.as_str()));
@@ -1758,6 +1878,8 @@ async fn update_build_status(
             clonepack_manifest: String::new(),
             metadata_chunk: String::new(),
             archive_chunks: Vec::new(),
+            full_clonepack: crate::ClonepackArtifacts::default(),
+            shallow_clonepack: crate::ClonepackArtifacts::default(),
             build_status: None,
             synced_at: None,
         },
@@ -1973,6 +2095,8 @@ mod tests {
             clonepack_manifest: "manifest".to_string(),
             metadata_chunk: "metadata".to_string(),
             archive_chunks: vec!["chunk1".to_string(), "chunk2".to_string()],
+            full_clonepack: crate::ClonepackArtifacts::default(),
+            shallow_clonepack: crate::ClonepackArtifacts::default(),
             build_status: None,
             synced_at: None,
         };
@@ -1982,6 +2106,7 @@ mod tests {
             "main".to_string(),
             &info,
             &storage,
+            "full",
         );
         assert!(resp.clonepack_manifest_url.is_none());
         assert!(resp.metadata_chunk_url.is_none());

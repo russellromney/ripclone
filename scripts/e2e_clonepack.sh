@@ -8,6 +8,7 @@ set -euo pipefail
 REPO="${REPO:-octocat/Hello-World}"
 OWNER="${REPO%%/*}"
 NAME="${REPO#*/}"
+SYNC_DEPTH="${SYNC_DEPTH:-}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
@@ -80,7 +81,11 @@ start_server
 echo ""
 echo "==> Syncing $REPO (one-time)..."
 sync_start=$(now_ms)
-"$RIPCLONE" --server "$SERVER_URL" sync "$REPO"
+if [ -n "$SYNC_DEPTH" ]; then
+  "$RIPCLONE" --server "$SERVER_URL" sync "$REPO" --depth "$SYNC_DEPTH"
+else
+  "$RIPCLONE" --server "$SERVER_URL" sync "$REPO"
+fi
 sync_end=$(now_ms)
 printf "sync took %d ms\n" $((sync_end - sync_start))
 
@@ -221,7 +226,7 @@ echo ""
 echo "==> Full mode clone (git checkout-index)..."
 full_dir="$BASE_DIR/full-clone"
 full_start=$(now_ms)
-"$RIPCLONE" --server "$SERVER_URL" clone "$REPO" --dir "$full_dir" --mode=full
+"$RIPCLONE" --server "$SERVER_URL" clone "$REPO" --dir "$full_dir" --mode=full --bench
 full_end=$(now_ms)
 printf "full clone took %d ms\n" $((full_end - full_start))
 verify_clone "$full_dir" full yes
@@ -230,7 +235,7 @@ echo ""
 echo "==> Fast mode clone (archive extraction only)..."
 fast_dir="$BASE_DIR/fast-clone"
 fast_start=$(now_ms)
-"$RIPCLONE" --server "$SERVER_URL" clone "$REPO" --dir "$fast_dir" --mode=fast
+"$RIPCLONE" --server "$SERVER_URL" clone "$REPO" --dir "$fast_dir" --mode=fast --bench
 fast_end=$(now_ms)
 printf "fast clone took %d ms\n" $((fast_end - fast_start))
 verify_clone "$fast_dir" fast no
@@ -239,7 +244,7 @@ echo ""
 echo "==> Hybrid mode clone (archive + head-blobs)..."
 hybrid_dir="$BASE_DIR/hybrid-clone"
 hybrid_start=$(now_ms)
-"$RIPCLONE" --server "$SERVER_URL" clone "$REPO" --dir "$hybrid_dir" --mode=hybrid
+"$RIPCLONE" --server "$SERVER_URL" clone "$REPO" --dir "$hybrid_dir" --mode=hybrid --bench
 hybrid_end=$(now_ms)
 printf "hybrid clone took %d ms\n" $((hybrid_end - hybrid_start))
 verify_clone "$hybrid_dir" hybrid yes

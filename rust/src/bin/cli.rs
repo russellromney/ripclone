@@ -27,6 +27,10 @@ enum Commands {
     /// Sync a repo on the server.
     Sync {
         repo: String,
+        /// Git history depth to mirror. 1 gives a shallow clonepack; 0 means no
+        /// depth limit (full history). Defaults to the server's configured default.
+        #[arg(short, long)]
+        depth: Option<usize>,
         /// GitHub token to use for this sync only. Overrides RIPCLONE_GITHUB_TOKEN.
         #[arg(short, long, env = "RIPCLONE_GITHUB_TOKEN")]
         github_token: Option<String>,
@@ -44,6 +48,9 @@ enum Commands {
         /// Clone mode: full (default), fast, hybrid, or skeleton.
         #[arg(long)]
         mode: Option<CloneMode>,
+        /// History depth for the clonepack: "shallow" (depth=1, default) or "full".
+        #[arg(long, default_value = "shallow")]
+        history: String,
         /// Print a per-phase benchmark report after the clone.
         #[arg(long)]
         bench: bool,
@@ -226,10 +233,14 @@ async fn main() -> Result<()> {
     };
 
     match args.command {
-        Commands::Sync { repo, github_token } => {
+        Commands::Sync {
+            repo,
+            depth,
+            github_token,
+        } => {
             let (owner, repo_name) = parse_repo(&repo)?;
             let info = client
-                .sync_repo(owner, repo_name, github_token.as_deref())
+                .sync_repo(owner, repo_name, depth, github_token.as_deref())
                 .await?;
             println!("synced {} to {}", repo, info.commit);
         }
@@ -239,6 +250,7 @@ async fn main() -> Result<()> {
             branch,
             hot_files: _hot_files,
             mode,
+            history,
             bench,
             skeleton,
         } => {
@@ -256,6 +268,11 @@ async fn main() -> Result<()> {
 
             let enable_bench = bench || std::env::var_os("RIPCLONE_BENCH").is_some();
             let mut benchmark = Benchmark::new();
+            let clonepack_kind = if history == "full" {
+                Some("full")
+            } else {
+                Some("shallow")
+            };
             client
                 .install_repo_with_mode(
                     owner,
@@ -263,6 +280,7 @@ async fn main() -> Result<()> {
                     &branch,
                     &target,
                     mode,
+                    clonepack_kind,
                     if enable_bench {
                         Some(&mut benchmark)
                     } else {
@@ -485,7 +503,7 @@ async fn main() -> Result<()> {
             let (owner, repo_name) = parse_repo(&repo)?;
             let owner = owner.to_string();
             let repo_name = repo_name.to_string();
-            let info = client.sync_repo(&owner, &repo_name, None).await?;
+            let info = client.sync_repo(&owner, &repo_name, None, None).await?;
             let commit = if branch == "HEAD" {
                 info.commit
             } else {
@@ -577,7 +595,7 @@ async fn main() -> Result<()> {
             repo_root,
         } => {
             let (owner, repo_name) = parse_repo(&repo)?;
-            let info = client.sync_repo(owner, repo_name, None).await?;
+            let info = client.sync_repo(owner, repo_name, None, None).await?;
             let commit = if branch == "HEAD" {
                 info.commit
             } else {

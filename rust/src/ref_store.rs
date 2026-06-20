@@ -324,6 +324,8 @@ mod tests {
             clonepack_manifest: String::new(),
             metadata_chunk: String::new(),
             archive_chunks: Vec::new(),
+            full_clonepack: crate::ClonepackArtifacts::default(),
+            shallow_clonepack: crate::ClonepackArtifacts::default(),
             build_status: None,
             synced_at: None,
         }

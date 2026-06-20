@@ -54,10 +54,18 @@ impl Cas {
 
     pub fn put_with_hash(&self, hash: &str, data: &[u8]) -> Result<()> {
         let path = self.object_path(hash)?;
+        // Content-addressed storage: if the object already exists, it is
+        // guaranteed to be the same data. This also makes concurrent writers
+        // idempotent.
+        if path.exists() {
+            return Ok(());
+        }
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let tmp_path = path.with_extension("tmp");
+        // Use a unique temp file per writer so concurrent puts of the same hash
+        // do not collide on the same `.tmp` path.
+        let tmp_path = path.with_extension(format!("tmp.{}", std::process::id()));
         std::fs::write(&tmp_path, data)
             .with_context(|| format!("write CAS object tmp {}", hash))?;
         let tmp_file = std::fs::File::open(&tmp_path)
@@ -66,7 +74,18 @@ impl Cas {
             .sync_all()
             .with_context(|| format!("fsync CAS object tmp {}", hash))?;
         drop(tmp_file);
-        std::fs::rename(&tmp_path, &path).with_context(|| format!("rename CAS object {}", hash))?;
+        std::fs::rename(&tmp_path, &path)
+            .or_else(|e| {
+                // Another concurrent writer may have won the race. Since the CAS
+                // is content-addressed, the existing file is the correct data.
+                if path.exists() {
+                    let _ = std::fs::remove_file(&tmp_path);
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            })
+            .with_context(|| format!("rename CAS object {}", hash))?;
         Ok(())
     }
 

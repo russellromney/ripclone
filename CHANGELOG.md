@@ -2,6 +2,34 @@
 
 This file tracks what has already landed in ripclone. For upcoming work see `ROADMAP.md`.
 
+## Shallow/full clonepacks, archive chunk sizing, and sync depth
+
+- **Dual clonepacks: shallow (depth=1) and full history** (`rust/src/lib.rs`, `rust/src/server.rs`, `rust/src/client.rs`, `rust/src/pack.rs`, `rust/src/git.rs`)
+  - The server now builds two clonepack manifests per sync:
+    - `shallow` = single commit + HEAD trees (matches `git clone --depth=1`).
+    - `full` = all reachable commits/trees (existing behavior).
+  - Archive and head-blobs chunks are shared between the two variants; only the skeleton pack, idx, and prebuilt index differ.
+  - The ref endpoint accepts `?clonepack=shallow|full` (default `full`).
+  - The CLI clone command gained `--history shallow|full` (default `shallow`).
+  - Shallow clones write `.git/shallow` so `git log` and other history walkers stop at the boundary instead of failing on missing parents.
+
+- **Configurable sync depth** (`rust/src/bin/cli.rs`, `rust/src/client.rs`, `rust/src/server.rs`)
+  - `ripclone sync owner/repo --depth N` now passes `N` to the server, controlling how much history the bare mirror fetches.
+  - `--depth 1` gives a shallow mirror; omitting it uses the server's configured default.
+
+- **Archive chunks capped at 8 MB** (`rust/src/archive.rs`)
+  - The chunker now finalizes the current chunk before a new frame would push it over the target.
+  - The max uncompressed frame size is lowered to the frame target (6 MB) so a single compressed frame can never overflow an 8 MB chunk.
+  - Added `archive::tests::archive_chunks_respect_target_size` to enforce the cap.
+
+- **Idempotent CAS writes** (`rust/src/cas.rs`)
+  - `Cas::put_with_hash` now skips writing when the target object already exists and tolerates concurrent writers racing to create the same content-addressed object.
+  - Uses a per-process unique temp filename to avoid collisions between concurrent writers.
+
+- **e2e script improvements** (`scripts/e2e_clonepack.sh`)
+  - `SYNC_DEPTH` environment variable lets the script sync at a chosen depth.
+  - Clone commands now pass `--bench` so the per-phase JSON report is captured.
+
 ## Unified async pipeline, clone modes, and per-phase benchmarks
 
 - **User-facing clone modes** (`rust/src/mode.rs`, `rust/src/bin/cli.rs`, `rust/src/client.rs`)
