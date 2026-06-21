@@ -427,16 +427,26 @@ mod linux_uring {
     use std::ffi::CString;
     use std::io;
     use std::os::unix::ffi::OsStrExt;
+    use std::sync::Once;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     const QUEUE_DEPTH: u32 = 1024;
     const MAX_BATCH_FILES: usize = 256;
+    static DIRECT_DESCRIPTOR_ENABLED_LOG: Once = Once::new();
+    static DIRECT_DESCRIPTOR_FALLBACK_LOG: Once = Once::new();
 
     #[derive(Clone, Copy)]
     pub(super) struct UringWriter;
 
     struct RawUringWriter {
         ring: IoUring,
+        descriptor_mode: DescriptorMode,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum DescriptorMode {
+        NormalFd,
+        DirectFd,
     }
 
     struct InFlightWrite {
@@ -534,7 +544,26 @@ mod linux_uring {
     impl RawUringWriter {
         fn new() -> Result<Self> {
             let ring = IoUring::new(QUEUE_DEPTH).context("initialize io_uring queue")?;
-            Ok(Self { ring })
+            let descriptor_mode = match ring
+                .submitter()
+                .register_files_sparse(MAX_BATCH_FILES as u32)
+            {
+                Ok(()) => {
+                    DIRECT_DESCRIPTOR_ENABLED_LOG
+                        .call_once(|| tracing::info!("io_uring direct descriptors enabled"));
+                    DescriptorMode::DirectFd
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        "io_uring direct descriptor registration unavailable; using normal fds: {e}"
+                    );
+                    DescriptorMode::NormalFd
+                }
+            };
+            Ok(Self {
+                ring,
+                descriptor_mode,
+            })
         }
 
         fn write_regular_batch(&mut self, mut writes: Vec<PreparedRegularWrite>) -> Result<()> {
@@ -581,6 +610,25 @@ mod linux_uring {
                 });
             }
 
+            match self.descriptor_mode {
+                DescriptorMode::NormalFd => self.write_regular_window_normal(in_flight),
+                DescriptorMode::DirectFd => match self.write_regular_window_direct(in_flight) {
+                    Ok(()) => Ok(()),
+                    Err(DirectWriteError::Unsupported(in_flight)) => {
+                        DIRECT_DESCRIPTOR_FALLBACK_LOG.call_once(|| {
+                            tracing::info!(
+                                "io_uring direct descriptors rejected by kernel; retrying with normal fds"
+                            )
+                        });
+                        self.descriptor_mode = DescriptorMode::NormalFd;
+                        self.write_regular_window_normal(in_flight)
+                    }
+                    Err(DirectWriteError::Other(e)) => Err(e),
+                },
+            }
+        }
+
+        fn write_regular_window_normal(&mut self, mut in_flight: Vec<InFlightWrite>) -> Result<()> {
             let mut entries = Vec::with_capacity(in_flight.len());
             for (idx, write) in in_flight.iter().enumerate() {
                 entries.push(
@@ -681,6 +729,86 @@ mod linux_uring {
             Ok(())
         }
 
+        fn write_regular_window_direct(
+            &mut self,
+            mut in_flight: Vec<InFlightWrite>,
+        ) -> std::result::Result<(), DirectWriteError> {
+            let mut entries = Vec::with_capacity(in_flight.len() * 3);
+            for idx in 0..in_flight.len() {
+                let write = &in_flight[idx];
+                let slot = idx as u32;
+                let dest = types::DestinationSlot::try_from_slot_target(slot).map_err(|_| {
+                    DirectWriteError::Other(anyhow::anyhow!("invalid fixed file slot {slot}"))
+                })?;
+                entries.push(
+                    opcode::OpenAt::new(types::Fd(libc::AT_FDCWD), write.path.as_ptr())
+                        .flags(write.flags & !libc::O_CLOEXEC)
+                        .mode(write.mode)
+                        .file_index(Some(dest))
+                        .build()
+                        .flags(squeue::Flags::IO_LINK)
+                        .user_data(user_data(idx, FileOp::Open)),
+                );
+                if write.content.is_empty() {
+                    in_flight[idx].write_res = Some(0);
+                } else {
+                    entries.push(
+                        opcode::Write::new(
+                            types::Fixed(slot),
+                            write.content.as_ptr(),
+                            write.content.len() as u32,
+                        )
+                        .offset(0)
+                        .build()
+                        .flags(squeue::Flags::IO_HARDLINK)
+                        .user_data(user_data(idx, FileOp::Write)),
+                    );
+                }
+                entries.push(
+                    opcode::Close::new(types::Fixed(slot))
+                        .build()
+                        .user_data(user_data(idx, FileOp::Close)),
+                );
+            }
+
+            self.submit_entries(&entries, "submit io_uring direct open/write/close batch")
+                .map_err(DirectWriteError::Other)?;
+            let completions = self
+                .collect_completions(
+                    entries.len(),
+                    "wait for io_uring direct open/write/close batch completion",
+                )
+                .map_err(DirectWriteError::Other)?;
+            for (idx, op, res) in completions {
+                let write = in_flight
+                    .get_mut(idx)
+                    .ok_or_else(|| anyhow::anyhow!("invalid io_uring completion index {idx}"))
+                    .map_err(DirectWriteError::Other)?;
+                match op {
+                    FileOp::Open => {
+                        write.open_res = Some(res);
+                    }
+                    FileOp::Write => {
+                        write.write_res = Some(res);
+                    }
+                    FileOp::Close => {
+                        write.close_res = Some(res);
+                    }
+                }
+            }
+
+            if direct_descriptors_unsupported(&in_flight) {
+                return Err(DirectWriteError::Unsupported(in_flight));
+            }
+
+            for write in &in_flight {
+                check_open_result(write).map_err(DirectWriteError::Other)?;
+                check_write_result(write).map_err(DirectWriteError::Other)?;
+                check_close_result(write).map_err(DirectWriteError::Other)?;
+            }
+            Ok(())
+        }
+
         fn submit_entries(&mut self, entries: &[squeue::Entry], context: &str) -> Result<()> {
             if entries.is_empty() {
                 return Ok(());
@@ -726,6 +854,21 @@ mod linux_uring {
 
     fn user_data(idx: usize, op: FileOp) -> u64 {
         ((idx as u64) << 2) | op as u64
+    }
+
+    enum DirectWriteError {
+        Unsupported(Vec<InFlightWrite>),
+        Other(anyhow::Error),
+    }
+
+    fn direct_descriptors_unsupported(writes: &[InFlightWrite]) -> bool {
+        !writes.is_empty()
+            && writes.iter().all(|write| {
+                matches!(
+                    write.open_res,
+                    Some(res) if res == -libc::EINVAL || res == -libc::EOPNOTSUPP
+                )
+            })
     }
 
     fn parse_user_data(data: u64) -> Result<(usize, FileOp)> {
