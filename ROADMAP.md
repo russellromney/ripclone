@@ -33,7 +33,9 @@ depth=1 clonepack lists HEAD-closure packs; full lists HEAD + history. The depth
 ### Known scaling cost
 The full (depth=0) build **rebuilds the entire deltified history on every sync**. This is now fast enough for medium repos — bun (15.7k commits, 6.2 GiB raw) builds in ~1m40 on a 2 GB server after history packs were given their own large target (`RIPCLONE_HISTORY_PACK_BYTES`, default 512 MiB raw → ~13–39 MB download pieces; previously the 6 MB HEAD target exploded it into 1058 packs / a 26-min build that failed). depth=1 and files are unaffected. The remaining cost is that the work is O(full history) on *every* sync; the **LSM incremental build** below removes that by building history once and appending.
 
-## LSM incremental history build (active plan)
+## LSM incremental history build
+
+**Status: v1 shipped behind `RIPCLONE_LSM=1` (default off).** Validated live on bun: first sync (build all + seal level 0) 110s → second sync (empty tail, level 0 reused by hash) 21s; the full clone stays complete (15.7k commits, fsck-clean, client-built MIDX). Integration tests in `rust/tests/lsm_incremental.rs` cover the incremental-tail completeness (incl. the head-exclusion trap) and the empty-tail no-op. Compaction/GC remain deferred (below).
 
 Goal: drop steady-state sync cost from O(all history) to **O(new commits since last sync)** by treating history as immutable, content-addressed **commit-range levels** instead of rebuilding it all each time.
 
