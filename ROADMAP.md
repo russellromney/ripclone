@@ -9,7 +9,7 @@
 We support **exactly three** clone modes — no arbitrary `--depth N` (it's finicky and almost nobody uses it; people pick depth=1 or full). Three content tiers:
 
 - **head** = **`editable --depth 1`** (default): HEAD snapshot, full object DB for HEAD, `.git/shallow` boundary written. The agent/CI hot path. *(done & validated clean)*
-- **full** = **`editable --depth 0`**: HEAD + all history, complete `git fsck`-clean clone, no shallow marker. *(was a stub — see below)*
+- **full** = **`editable --depth 0`**: HEAD + all history, complete `git fsck`-clean clone, no shallow marker. *(done for small/medium repos; the full-history rebuild is too heavy for huge repos like bun — see LSM below)*
 - **worktree** = **`files`**: worktree only, no git objects (zstd archive) — fastest CI path. *(done)*
 
 This collapses the server to **two pack buckets** (no range/geometric depth buckets):
@@ -27,8 +27,11 @@ depth=1 clonepack lists HEAD-closure packs; full lists HEAD + history. The depth
 
 ### Immediate next
 1. **Deltify the history bucket** — kills the full-history size blowup (client unchanged; it only hand-parses HEAD packs). *(done)*
-2. **Always-full mirror** so depth=0 is a true, fsck-clean full clone. Drop the `--depth 50` default; unshallow existing mirrors. *(in progress)*
-3. **Server-pregenerate + ship MIDX** (head + full) as a content-addressed artifact the client drops in. Today MIDX is only built **client-side** (`git multi-pack-index write` per clone) — works, but burns CPU on the hot path. *(not done)*
+2. **Always-full mirror** so depth=0 is a true, fsck-clean full clone. Drop the `--depth 50` default; unshallow existing mirrors. *(done — validated on sharkdp/hyperfine: rev-list to root, fsck clean, no shallow marker)*
+3. **Server-pregenerate + ship MIDX** (head + full) as a content-addressed artifact the client drops in (signed `midx_url`); the client falls back to building locally only for older manifests. *(done — `git multi-pack-index verify` passes on the server-built MIDX)*
+
+### Known scaling limit
+The full (depth=0) build **rebuilds the entire deltified history on every sync**, partitioned into mini-packs. For a huge repo (bun, ~30k commits) this OOMs/times out on a 2 GB server (observed: `sync failed:` after 26 min; the stale ref was served instead). depth=1 and files are unaffected. Mitigations, in order: bigger build VM, then the **LSM incremental build** below so full history is built once and appended to, not rebuilt.
 
 ### Deferred
 - **LSM incremental build** — don't rebuild full history every sync (append an L0 pack at HEAD, compact older into immutable range packs; LSM levels). Optimization only.

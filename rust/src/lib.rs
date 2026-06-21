@@ -59,6 +59,10 @@ pub struct ClonepackArtifacts {
     pub skeleton_pack: String,
     pub skeleton_idx: String,
     pub prebuilt_index: String,
+    /// CAS hash of the pre-built multi-pack-index over this variant's packs.
+    /// Empty for older refs (client falls back to building the MIDX itself).
+    #[serde(default)]
+    pub midx: String,
 }
 
 /// Artifact hashes returned by the server for a single ref.

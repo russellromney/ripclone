@@ -329,6 +329,53 @@ pub fn write_multi_pack_index<P: AsRef<Path>>(repo_dir: P) -> Result<()> {
     Ok(())
 }
 
+/// Build a multi-pack-index over the given packs (each a `(pack_bytes,
+/// idx_bytes)` pair) and return the raw `multi-pack-index` file bytes. The packs
+/// are laid out with the same `pack-<trailer>.{pack,idx}` filenames the client
+/// uses, so the MIDX references them by those names and is byte-for-byte usable
+/// on the client once it installs the same packs — no client-side
+/// `git multi-pack-index write` needed.
+pub fn build_multi_pack_index_bytes(packs: &[(Vec<u8>, Vec<u8>)]) -> Result<Vec<u8>> {
+    if packs.is_empty() {
+        anyhow::bail!("no packs to index");
+    }
+    let tmp = tempfile::TempDir::new()?;
+    let dir = tmp.path();
+    // Minimal bare object store so `git multi-pack-index write` has a repo and
+    // an `objects/pack` directory laid out exactly like the client's.
+    let status = Command::new("git")
+        .args(["init", "--bare", "-q"])
+        .arg(dir.as_os_str())
+        .status()
+        .context("git init --bare for midx")?;
+    if !status.success() {
+        anyhow::bail!("git init --bare for midx failed");
+    }
+    let pack_dir = dir.join("objects").join("pack");
+    std::fs::create_dir_all(&pack_dir)?;
+    for (pack_bytes, idx_bytes) in packs {
+        if pack_bytes.len() < 20 {
+            anyhow::bail!("pack too short to name by trailer");
+        }
+        // Git names packs by the 20-byte trailer sha; match the client exactly.
+        let name = hex::encode(&pack_bytes[pack_bytes.len() - 20..]);
+        std::fs::write(pack_dir.join(format!("pack-{}.pack", name)), pack_bytes)?;
+        std::fs::write(pack_dir.join(format!("pack-{}.idx", name)), idx_bytes)?;
+    }
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(dir.as_os_str())
+        .args(["multi-pack-index", "write"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .context("spawn git multi-pack-index write")?;
+    if !status.success() {
+        anyhow::bail!("git multi-pack-index write (server pregen) failed");
+    }
+    std::fs::read(pack_dir.join("multi-pack-index")).context("read generated multi-pack-index")
+}
+
 /// Return the raw (uncompressed) size of each object via
 /// `git cat-file --batch-check`. Used to partition objects into evenly-sized
 /// pack batches.
@@ -772,7 +819,6 @@ pub fn sync_bare_mirror<P: AsRef<Path>>(
     owner: &str,
     repo: &str,
     branch: &str,
-    depth: usize,
     github_token: Option<&str>,
 ) -> Result<()> {
     crate::validation::validate_repo_id(owner)
@@ -792,11 +838,30 @@ pub fn sync_bare_mirror<P: AsRef<Path>>(
         ),
         None => format!("https://github.com/{}/{}.git", owner, repo),
     };
+    // The mirror is always a *complete* clone. The "full" (depth=0) clonepack is
+    // built from `rev-list HEAD` over this mirror, so any shallow boundary would
+    // silently truncate it and break `git rev-list`/`fsck` on the client. We
+    // therefore never pass `--depth`: a depth-limited fetch would re-shallow an
+    // already-complete mirror. depth=1 ("head") clones are still cheap — they're
+    // a content-addressed subset built at pack time, not a shallower mirror.
     if mirror_dir.as_ref().exists() {
+        // A leftover shallow mirror (from the old `--depth 50` default) carries a
+        // `shallow` marker file. Convert it to a complete clone once with
+        // `--unshallow`; afterwards plain fetches keep it complete.
+        let is_shallow = mirror_dir.as_ref().join("shallow").exists();
+        let mut args: Vec<&str> = vec!["fetch"];
+        if is_shallow {
+            // Unshallow every ref so the marker is removed and history is whole.
+            args.push("--unshallow");
+            args.push("origin");
+        } else {
+            args.push("origin");
+            args.push(&fetch_ref);
+        }
         let status = Command::new("git")
             .arg("-C")
             .arg(mirror_dir.as_ref().as_os_str())
-            .args(["fetch", "--depth", &depth.to_string(), "origin", &fetch_ref])
+            .args(&args)
             .status()
             .context("git fetch")?;
         if !status.success() {
@@ -808,8 +873,6 @@ pub fn sync_bare_mirror<P: AsRef<Path>>(
             .args([
                 "clone",
                 "--mirror",
-                "--depth",
-                &depth.to_string(),
                 &url,
                 &mirror_dir.as_ref().to_string_lossy(),
             ])
@@ -823,7 +886,7 @@ pub fn sync_bare_mirror<P: AsRef<Path>>(
             let status = Command::new("git")
                 .arg("-C")
                 .arg(mirror_dir.as_ref().as_os_str())
-                .args(["fetch", "--depth", &depth.to_string(), "origin", &fetch_ref])
+                .args(["fetch", "origin", &fetch_ref])
                 .status()
                 .context("git fetch branch")?;
             if !status.success() {
