@@ -148,6 +148,17 @@ impl Cas {
     pub fn root(&self) -> &Path {
         &self.root
     }
+
+    /// Remove a local object. Best-effort: a missing object is not an error
+    /// (used to evict build scratch once it is durable in remote storage).
+    pub fn remove(&self, hash: &str) -> Result<()> {
+        let path = self.object_path(hash)?;
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e).with_context(|| format!("remove CAS object {}", hash)),
+        }
+    }
 }
 
 pub fn hash(data: &[u8]) -> String {

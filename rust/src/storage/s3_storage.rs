@@ -219,6 +219,10 @@ impl StorageBackend for S3Storage {
             .ok()?;
         Some(presigned.url.to_string())
     }
+
+    fn is_remote(&self) -> bool {
+        true
+    }
 }
 
 impl S3Storage {
