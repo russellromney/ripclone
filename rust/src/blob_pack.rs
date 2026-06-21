@@ -404,7 +404,7 @@ fn compress_blob(content: &[u8]) -> Result<Vec<u8>> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(3);
-    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::new(level.min(9).max(0)));
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::new(level.min(9)));
     encoder
         .write_all(content)
         .context("compress blob content")?;

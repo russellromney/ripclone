@@ -589,7 +589,7 @@ mod tests {
     fn archive_chunks_respect_target_size() {
         let pseudo_random = |len: usize| {
             (0..len)
-                .map(|i| (i.wrapping_mul(0x9E3779B9) as u8))
+                .map(|i| i.wrapping_mul(0x9E3779B9) as u8)
                 .collect::<Vec<u8>>()
         };
         let files: Vec<(&str, Vec<u8>)> = vec![

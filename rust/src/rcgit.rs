@@ -1,22 +1,22 @@
 use crate::cas::hash as cas_hash;
-use crate::client::{head_blobs_chunk_refs, Client};
+use crate::client::{Client, head_blobs_chunk_refs};
 use crate::clonepack::{ClonepackManifest, MetadataChunk};
 use crate::extract::extract_archive_from_chunk_receiver;
 use anyhow::{Context, Result};
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, bounded};
 use prost::Message;
 use std::fs::File;
 use std::path::Path;
 use std::time::Instant;
 
-/// On-disk layout for a lazy rcgit repo:
-///
-///   <target>/.git/                    skeleton git dir (commit/trees/index)
-///   <target>/.git/ripclone/manifest.pb
-///
-/// The working tree itself is intentionally empty. HEAD blobs live as real git
-/// objects in `.git/objects/pack`; when the server has no head-blobs pack they
-/// are built locally from streamed archive chunks.
+// On-disk layout for a lazy rcgit repo:
+//
+//   <target>/.git/                    skeleton git dir (commit/trees/index)
+//   <target>/.git/ripclone/manifest.pb
+//
+// The working tree itself is intentionally empty. HEAD blobs live as real git
+// objects in `.git/objects/pack`; when the server has no head-blobs pack they
+// are built locally from streamed archive chunks.
 
 const RIPCLONE_DIR: &str = ".git/ripclone";
 const MANIFEST_NAME: &str = "manifest.pb";
@@ -192,8 +192,10 @@ async fn stream_archive_to_blob_pack(
         .and_then(|s| s.parse().ok())
         .unwrap_or(6)
         .max(1);
-    let (chunk_tx, chunk_rx): (Sender<(usize, Result<Vec<u8>>)>, Receiver<(usize, Result<Vec<u8>>)>) =
-        bounded(concurrency * 2);
+    let (chunk_tx, chunk_rx): (
+        Sender<(usize, Result<Vec<u8>>)>,
+        Receiver<(usize, Result<Vec<u8>>)>,
+    ) = bounded(concurrency * 2);
     // Use an async tokio channel for the download task so `.send().await`
     // provides backpressure without blocking a runtime worker. A small bridge
     // thread forwards into the crossbeam channel consumed by the sync extractor.
@@ -257,17 +259,11 @@ async fn stream_archive_to_blob_pack(
     drop(async_tx);
 
     let extract = tokio::task::spawn_blocking(move || {
-        extract_archive_from_chunk_receiver(
-            &manifest_path,
-            None,
-            Some(&git_dir),
-            None,
-            chunk_rx,
-        )
+        extract_archive_from_chunk_receiver(&manifest_path, None, Some(&git_dir), None, chunk_rx)
     });
 
-    let (bridge_res, dl_res, ex_res) = tokio::try_join!(bridge, download, extract)
-        .context("archive download/extract join")?;
+    let (bridge_res, dl_res, ex_res) =
+        tokio::try_join!(bridge, download, extract).context("archive download/extract join")?;
     bridge_res.context("bridge archive chunks to extractor")?;
     dl_res.context("download archive chunks")?;
     ex_res.context("extract archive chunks")?;

@@ -170,11 +170,7 @@ impl<'a> PackBuilder<'a> {
     ///
     /// Objects are stored undeltified (`git pack-objects --window=0`) so the
     /// client can extract files without resolving deltas.
-    pub fn build_depth_pack(
-        &self,
-        commit: &str,
-        depth: Option<usize>,
-    ) -> Result<(String, String)> {
+    pub fn build_depth_pack(&self, commit: &str, depth: Option<usize>) -> Result<(String, String)> {
         let object_shas = git::list_object_shas_with_depth(&self.repo, commit, depth)?;
         let (ph, _, ih, _) = self.pack_and_index_inner(&object_shas, true)?;
         Ok((ph, ih))
@@ -247,7 +243,8 @@ impl<'a> PackBuilder<'a> {
 
         // HEAD closure: undeltified so the client can hand-parse blobs straight
         // from the downloaded bytes for the working tree.
-        let (head_packs, _) = self.build_packs_from_oids(&head_oids, head_target_raw_bytes, true)?;
+        let (head_packs, _) =
+            self.build_packs_from_oids(&head_oids, head_target_raw_bytes, true)?;
         // History: deltified (undeltified history is multi-GB). The client never
         // hand-parses these — they're only installed for the object DB and git
         // reads them, resolving deltas itself. Few large packs, not many small
@@ -285,7 +282,8 @@ impl<'a> PackBuilder<'a> {
         }
         let tail_oids = git::list_object_shas_in_range(&self.repo, sealed_tip, commit)?;
 
-        let (head_packs, _) = self.build_packs_from_oids(&head_oids, head_target_raw_bytes, true)?;
+        let (head_packs, _) =
+            self.build_packs_from_oids(&head_oids, head_target_raw_bytes, true)?;
         let (tail_packs, tail_raw_bytes) = if tail_oids.is_empty() {
             (Vec::new(), 0)
         } else {
@@ -313,7 +311,10 @@ impl<'a> PackBuilder<'a> {
             return Ok((Vec::new(), 0));
         }
         let sizes = git::object_sizes(&self.repo, oids)?;
-        let total_raw: u64 = oids.iter().map(|o| sizes.get(o).copied().unwrap_or(0)).sum();
+        let total_raw: u64 = oids
+            .iter()
+            .map(|o| sizes.get(o).copied().unwrap_or(0))
+            .sum();
 
         // Greedy size-based partitioning. A single object larger than the target
         // gets its own pack (we can't split one object across packs).

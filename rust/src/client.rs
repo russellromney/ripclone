@@ -56,7 +56,9 @@ pub struct RefResponse {
 /// Return the chunk refs that make up the head-blobs pack, falling back to the
 /// deprecated single-pack field for older manifests.
 #[allow(deprecated)]
-pub(crate) fn head_blobs_chunk_refs(clonepack: &ClonepackManifest) -> Vec<crate::clonepack::ChunkRef> {
+pub(crate) fn head_blobs_chunk_refs(
+    clonepack: &ClonepackManifest,
+) -> Vec<crate::clonepack::ChunkRef> {
     if !clonepack.head_blobs_chunks.is_empty() {
         clonepack.head_blobs_chunks.clone()
     } else if let Some(pack) = &clonepack.head_blobs_pack {
@@ -857,8 +859,7 @@ impl Client {
         let pack_urls = info.pack_chunk_urls.clone().unwrap_or_default();
         let idx_urls = info.pack_idx_urls.clone().unwrap_or_default();
 
-        let jobs: Vec<(usize, PackEntry)> =
-            manifest.packs.iter().cloned().enumerate().collect();
+        let jobs: Vec<(usize, PackEntry)> = manifest.packs.iter().cloned().enumerate().collect();
 
         // Stage 1: download packs (network concurrency `download_conc`).
         let downloads = stream::iter(jobs).map(|(i, entry)| {
@@ -952,9 +953,11 @@ impl Client {
             .map(|e| String::from_utf8_lossy(&e.path).into_owned())
             .collect();
         let work_tree2 = work_tree.to_path_buf();
-        tokio::task::spawn_blocking(move || crate::git::clear_skip_worktree_index(&work_tree2, &paths))
-            .await
-            .context("spawn clear skip-worktree")??;
+        tokio::task::spawn_blocking(move || {
+            crate::git::clear_skip_worktree_index(&work_tree2, &paths)
+        })
+        .await
+        .context("spawn clear skip-worktree")??;
 
         // Install the multi-pack-index so git object lookups stay O(log) across
         // the many installed packs. Prefer the server-pregenerated MIDX (zero
@@ -983,9 +986,10 @@ impl Client {
             }
         } else {
             let work_tree3 = work_tree.to_path_buf();
-            let _ =
-                tokio::task::spawn_blocking(move || crate::git::write_multi_pack_index(&work_tree3))
-                    .await;
+            let _ = tokio::task::spawn_blocking(move || {
+                crate::git::write_multi_pack_index(&work_tree3)
+            })
+            .await;
         }
 
         Ok(total)

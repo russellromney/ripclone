@@ -47,28 +47,6 @@ pub fn validate_git_rev(rev: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn validate_git_rev_rejects_injection_attempts() {
-        assert!(validate_git_rev("--output=/tmp/x").is_err());
-        assert!(validate_git_rev("--all").is_err());
-        assert!(validate_git_rev("HEAD..main").is_err());
-        assert!(validate_git_rev("../secret").is_err());
-        assert!(validate_git_rev("-").is_err());
-    }
-
-    #[test]
-    fn validate_git_rev_accepts_normal_refs() {
-        assert!(validate_git_rev("HEAD").is_ok());
-        assert!(validate_git_rev("main").is_ok());
-        assert!(validate_git_rev("feature/foo-bar").is_ok());
-        assert!(validate_git_rev("abc123").is_ok());
-    }
-}
-
 /// Validate a 40-character (SHA-1) or 64-character (SHA-256) hex object id.
 pub fn validate_object_id(id: &str) -> Result<()> {
     if id.len() != 40 && id.len() != 64 {
@@ -101,4 +79,26 @@ where
         );
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_git_rev_rejects_injection_attempts() {
+        assert!(validate_git_rev("--output=/tmp/x").is_err());
+        assert!(validate_git_rev("--all").is_err());
+        assert!(validate_git_rev("HEAD..main").is_err());
+        assert!(validate_git_rev("../secret").is_err());
+        assert!(validate_git_rev("-").is_err());
+    }
+
+    #[test]
+    fn validate_git_rev_accepts_normal_refs() {
+        assert!(validate_git_rev("HEAD").is_ok());
+        assert!(validate_git_rev("main").is_ok());
+        assert!(validate_git_rev("feature/foo-bar").is_ok());
+        assert!(validate_git_rev("abc123").is_ok());
+    }
 }
