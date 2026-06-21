@@ -44,6 +44,31 @@ The entire cold→warm delta is `resolve`: a stale mirror makes the server do a
 always fresh and `resolve` is ~30 ms. Even cold (3.3 s) beats `git clone
 --depth 1` (4.0 s).
 
+## Laptop over home wifi (network-bound)
+
+Same repo, but cloned to a laptop (8-core Mac) over home wifi — i.e. the
+download link, not git's server compute, is the bottleneck. This is the *worst*
+case for ripclone and the fairest stress test.
+
+| clone | ripclone | native `git clone` |
+|---|---|---|
+| depth=1 | 18.1 s | **16.3 s** |
+| full | **90.9 s** | 148.4 s |
+
+- **depth=1 is roughly tied (git slightly ahead).** ripclone's HEAD-closure
+  packs are **undeltified** (zero client CPU to hand-parse) — but that means more
+  bytes on the wire than git's delta-compressed shallow pack. On a fat pipe the
+  no-`index-pack` win dominates; on a slow link the extra bytes swamp it.
+- **full is ~1.6× faster** (fewer bytes: 628 vs 840 MB, plus no server
+  pack-compute / client `index-pack`).
+
+**Takeaway:** ripclone's large wins are where git's *server-side* work dominates
+(CI runners, cloud dev boxes, fast/colocated networks — see the Fly numbers
+above, 4×/17×). On a bandwidth-constrained client it's download-bound: still a
+clear win on full, a wash on depth=1. Closing the depth=1 gap on slow links would
+mean a delta-compressed/zstd transport for the head closure (trade a little
+client CPU for fewer bytes), or the `files` zstd-archive mode.
+
 ## Why ripclone is faster
 
 `git clone` makes GitHub **compute and stream a pack on demand** (delta
