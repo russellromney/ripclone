@@ -31,12 +31,101 @@ depth=1 clonepack lists HEAD-closure packs; full lists HEAD + history. The depth
 3. **Server-pregenerate + ship MIDX** (head + full) as a content-addressed artifact the client drops in (signed `midx_url`); the client falls back to building locally only for older manifests. *(done — `git multi-pack-index verify` passes on the server-built MIDX)*
 
 ### Known scaling cost
-The full (depth=0) build **rebuilds the entire deltified history on every sync**. This is now fast enough — bun (15.7k commits, 6.2 GiB raw) builds in ~2 min on a 2 GB server after history packs were given their own large target (`RIPCLONE_HISTORY_PACK_BYTES`, default 256 MiB raw; previously the 6 MB HEAD target exploded it into 1058 packs / a 26-min build that failed). depth=1 and files are unaffected. The remaining cost is that the work is O(full history) on *every* sync; the **LSM incremental build** below removes that by building history once and appending.
+The full (depth=0) build **rebuilds the entire deltified history on every sync**. This is now fast enough for medium repos — bun (15.7k commits, 6.2 GiB raw) builds in ~1m40 on a 2 GB server after history packs were given their own large target (`RIPCLONE_HISTORY_PACK_BYTES`, default 512 MiB raw → ~13–39 MB download pieces; previously the 6 MB HEAD target exploded it into 1058 packs / a 26-min build that failed). depth=1 and files are unaffected. The remaining cost is that the work is O(full history) on *every* sync; the **LSM incremental build** below removes that by building history once and appending.
+
+## LSM incremental history build
+
+**Status: v1 shipped behind `RIPCLONE_LSM=1` (default off).** Validated live on bun: first sync (build all + seal level 0) 110s → second sync (empty tail, level 0 reused by hash) 21s; the full clone stays complete (15.7k commits, fsck-clean, client-built MIDX). Integration tests in `rust/tests/lsm_incremental.rs` cover the incremental-tail completeness (incl. the head-exclusion trap) and the empty-tail no-op. Compaction/GC remain deferred (below).
+
+Goal: drop steady-state sync cost from O(all history) to **O(new commits since last sync)** by treating history as immutable, content-addressed **commit-range levels** instead of rebuilding it all each time.
+
+**Model.** History is split at commit boundaries into levels; each level packs the objects introduced in its range and is content-addressed (so it is reused across syncs and shared across branches, and lives in object storage forever):
+- **Sealed levels** `L0..Ln` — immutable. Level `i` = `git rev-list <Bi> --not <Bi-1> --objects` (full range, deltified). Built once, never rebuilt; the manifest just references their hashes.
+- **Tail** — `git rev-list HEAD --not <last-sealed-tip> --objects`, rebuilt each sync (only the new commits). When the tail exceeds `RIPCLONE_LSM_SEAL_BYTES` (raw), it is **sealed** into a new level and the next tail starts from HEAD.
+- **HEAD closure** is unchanged (undeltified small packs, depth-1 hot path) and shipped *additively*.
+
+**Correctness rule (subtle, do not break):** sealed levels and the tail must pack the **full** range — they must **not** subtract the HEAD closure. A blob that is current at seal time but later changes would otherwise be excluded from the immutable level *and* absent from every future HEAD closure → a missing object. The HEAD closure therefore overlaps the deltified history (current blobs appear in both); git dedups by OID on read. (The non-LSM rebuild-all path can keep excluding the head set because it ships a fresh head closure every sync.)
+
+**Coverage:** `union(sealed levels) ∪ tail` = every object reachable from HEAD (reachability set-partition), so a full clone is complete even across force-push/rebase — a rewrite just leaves some unreachable (dangling, fsck-clean) objects in old levels until compaction.
+
+**Sync flow (behind `RIPCLONE_LSM=1`, default off):**
+1. Load the previous ref's `history_levels`; `sealed_tip = levels.last().tip`.
+2. Build HEAD closure + tail `(sealed_tip..HEAD)`.
+3. This manifest's history = `flatten(prev levels) + tail` (prior levels referenced by hash, already in object storage).
+4. **Upload + evict only the newly built packs** (head + tail); prior levels are untouched.
+5. Persist `history_levels` = seal ? `prev + [tail-as-level @ HEAD]` : `prev`.
+
+**Interactions:**
+- **MIDX:** the head/shallow MIDX is still server-built (head packs are local this sync). The *full* MIDX is omitted under LSM (prior-level packs aren't local to index) and the client builds it — acceptable since full clones are rarer. Future: keep `.idx` files local (small) to pregenerate the full MIDX without re-downloading packs.
+- **Eviction:** unchanged — only the new packs are evicted; prior levels were already evicted on their own sync.
+
+**Deferred within LSM:** geometric **compaction** (merge adjacent levels so level count stays bounded) and **GC** of dangling objects after rewrites. v1 seals without compacting; level count grows slowly.
 
 ### Deferred
-- **LSM incremental build** — don't rebuild full history every sync (append an L0 pack at HEAD, compact older into immutable range packs; LSM levels). Optimization only.
+- **LSM compaction/GC** — see above.
 - **io_uring** durable-disk worktree writes — orthogonal speedup so `--temp` (ephemeral tmpfs) isn't required for fast durable clones.
 - **Blobless partial clone** (`--filter=blob:none` via a git promisor pointing at the server) — distinct from `files`; a separate project for huge monorepos.
+
+## Cloud integration & cross-repo dedup (planned — `ripclone-cloud` depends on this)
+
+Three things the managed layer needs from this backend. Forks come **first**
+because they change the storage model; the other two are small endpoint additions.
+
+### a. Fork / shared-history dedup (the deep one — do first)
+
+Forks share ~all of their history with the upstream. If the cache namespaces
+storage per repo, a popular repo's fork network stores near-identical packs
+thousands of times — and **object storage is the only real variable cost of the
+service**, so this is the thing that blows up the bill.
+
+The LSM history levels are already content-addressed and "shared across branches
+and live in object storage forever." The work is to extend that sharing **across
+repos in a fork network**:
+
+- **Global CAS, not per-repo.** Sealed levels / page-group chunks are keyed purely
+  by content hash in a store that is global (or at least shared within a fork
+  network), so identical history is stored once. A fork's history becomes
+  `references to the upstream's existing levels + a small tail of its unique
+  commits`. Sync for a fork is then O(unique commits), not O(history).
+- **Authorization on fetch — a content hash must NOT be a bearer capability.**
+  Once chunks are shared across trust boundaries (a private fork sharing history
+  with a public upstream; two private repos that share history), "knows the hash"
+  cannot imply "may fetch the bytes." The serve path must verify the caller is
+  authorized for *some repo whose manifest references this chunk*, then mint a
+  short-lived signed URL for that request. Signed URLs must never be globally
+  guessable or long-lived. This is a security requirement, not an optimization.
+- **No cross-tenant leakage.** Dedup decisions and byte accounting must not let one
+  tenant infer another's private content (e.g. via "this chunk already existed"
+  timing/size oracles). Treat shared-history *existence* as private.
+
+### b. `GET /v1/repos/{owner}/{repo}/status`
+
+One call returning a repo's warm coverage + storage, for the cloud dashboard and
+**storage metering**:
+
+- `refs: [{ branch, commit, bytes_total, bytes_unique }]` — `bytes_unique` =
+  bytes this repo adds that are *not* shared with the commons or other repos (the
+  marginal figure from dedup above).
+- repo totals `{ total_bytes, unique_bytes }`.
+
+Cloud uses `commit` + presence for the warm display, and **`unique_bytes` for
+billing** (customers are billed on marginal storage, so dedup savings pass through
+to them). Until this exists, cloud shows storage as `—` and bills flat per-seat.
+
+### c. Per-branch sync
+
+`POST /v1/repos/{owner}/{repo}/sync` currently builds HEAD only (`SyncRequest`
+has just `depth`). Add `?branch=<name>` so non-default branches can be warmed —
+cloud tracks and warms specific branches per repo.
+
+### Already covered elsewhere
+
+- **Custom clone depth** (a cloud Pro feature) is just UI over **§2a
+  Repo/branch-specific configuration** (`?clonepack=<name>`, configurable
+  `DepthSpec`s) — no new backend work beyond 2a.
+- **Region "boosts"** (a future cloud feature: keep a chosen repo warm in chosen
+  Tigris regions, funded by sponsors) ride the **§5 Fly-region cache warmers** —
+  cloud will need a "warm repo X in region R" request against that mechanism.
 
 ## What already works
 

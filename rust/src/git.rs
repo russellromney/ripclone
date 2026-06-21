@@ -283,6 +283,36 @@ pub fn list_object_shas<P: AsRef<Path>>(repo: P, commit: &str) -> Result<Vec<Str
     list_object_shas_with_depth(repo, commit, None)
 }
 
+/// List objects reachable from `to` but not from `from` — i.e. the objects
+/// introduced in the commit range `(from, to]`. `from = None` means "everything
+/// reachable from `to`". Used by the LSM build to pack a single history range.
+pub fn list_object_shas_in_range<P: AsRef<Path>>(
+    repo: P,
+    from: Option<&str>,
+    to: &str,
+) -> Result<Vec<String>> {
+    crate::validation::validate_git_rev(to).with_context(|| format!("invalid commit: {}", to))?;
+    if let Some(f) = from {
+        crate::validation::validate_git_rev(f).with_context(|| format!("invalid commit: {}", f))?;
+    }
+    // `rev-list --objects <to> ^<from>`: objects reachable from `to` but not from
+    // `from`. The `^<from>` exclude form (rather than `--not`) composes with
+    // `--end-of-options`, so every flag stays before the revs.
+    let exclude = from.map(|f| format!("^{}", f));
+    let mut args: Vec<&str> = vec![
+        "rev-list",
+        "--objects",
+        "--no-object-names",
+        "--end-of-options",
+        to,
+    ];
+    if let Some(e) = exclude.as_deref() {
+        args.push(e);
+    }
+    let out = run_git(repo, &args)?;
+    Ok(out.lines().map(|s| s.to_string()).collect())
+}
+
 /// List objects reachable from `commit`, optionally limiting the commit history
 /// depth. `max_depth = None` returns the full history. With a depth of `1`, only
 /// the HEAD commit and the trees/blobs reachable from it are returned, which is

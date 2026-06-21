@@ -51,6 +51,26 @@ pub struct PackArtifact {
     pub idx: String,
 }
 
+/// A pack + idx with their byte lengths. Used for LSM sealed levels, where the
+/// lengths must be remembered (the bytes have been evicted from local CAS) so a
+/// later sync can reference them in the manifest without re-reading them.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct SizedPack {
+    pub pack: String,
+    pub pack_len: u64,
+    pub idx: String,
+    pub idx_len: u64,
+}
+
+/// One immutable, content-addressed history level in the LSM build: the deltified
+/// packs for the commit range `(<previous level tip>, tip_commit]`. Sealed once
+/// and thereafter referenced by hash; never rebuilt.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct HistoryLevel {
+    pub tip_commit: String,
+    pub packs: Vec<SizedPack>,
+}
+
 /// Artifact hashes for one clonepack variant (e.g. shallow depth=1 or full).
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ClonepackArtifacts {
@@ -112,6 +132,11 @@ pub struct RefInfo {
     /// Shallow clonepack (single commit + HEAD trees). Matches `git clone --depth=1`.
     #[serde(default)]
     pub shallow_clonepack: ClonepackArtifacts,
+    /// LSM sealed history levels (oldest first). Empty unless the LSM build is
+    /// enabled. Each level is immutable and content-addressed; a sync only builds
+    /// the tail past the last level's tip. See ROADMAP "LSM incremental history".
+    #[serde(default)]
+    pub history_levels: Vec<HistoryLevel>,
     /// Optional build status used by the async /v1/build worker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_status: Option<String>,
