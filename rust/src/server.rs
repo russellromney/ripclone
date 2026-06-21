@@ -41,7 +41,6 @@ pub struct ServerState {
     pub storage: StorageRef,
     pub repo_root: PathBuf,
     pub ref_store: Arc<dyn RefStore>,
-    pub default_depth: usize,
     pub token_hash: Option<String>,
     pub github_token: Option<String>,
     pub metrics: Arc<Metrics>,
@@ -117,7 +116,6 @@ impl RateLimiter {
 
 #[derive(Deserialize)]
 pub struct SyncRequest {
-    pub depth: Option<usize>,
     #[serde(default = "default_branch_value")]
     pub branch: String,
 }
@@ -288,6 +286,9 @@ pub struct RefResponse {
     /// Signed URL for each editable pack's idx, ordered to match `manifest.packs`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pack_idx_urls: Option<Vec<Option<String>>>,
+    /// Signed URL for the pre-built multi-pack-index (`manifest.midx`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub midx_url: Option<String>,
     /// True when the returned clonepack is a shallow (depth=1) snapshot.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub shallow: bool,
@@ -506,7 +507,6 @@ async fn git_info_refs(
         &owner,
         &repo,
         "HEAD",
-        state.default_depth,
         github_token.as_ref(),
     )
     .await
@@ -594,7 +594,6 @@ async fn git_upload_pack(
         &owner,
         &repo,
         "HEAD",
-        state.default_depth,
         github_token.as_ref(),
     )
     .await
@@ -680,7 +679,6 @@ async fn ensure_mirror(
     owner: &str,
     repo: &str,
     branch: &str,
-    depth: usize,
     github_token: Option<&secrecy::SecretString>,
 ) -> Result<()> {
     let mirror_dir = mirror_dir.to_path_buf();
@@ -689,14 +687,7 @@ async fn ensure_mirror(
     let branch = branch.to_string();
     let github_token = github_token.map(|s| s.expose_secret().to_string());
     tokio::task::spawn_blocking(move || {
-        git::sync_bare_mirror(
-            &mirror_dir,
-            &owner,
-            &repo,
-            &branch,
-            depth,
-            github_token.as_deref(),
-        )
+        git::sync_bare_mirror(&mirror_dir, &owner, &repo, &branch, github_token.as_deref())
     })
     .await
     .context("ensure mirror task")?
@@ -757,7 +748,6 @@ async fn get_ref(
             &owner,
             &repo,
             &branch,
-            state.default_depth,
             github_token.as_ref(),
         )
         .await
@@ -917,6 +907,10 @@ fn ref_response(
         (packs, idxs)
     };
 
+    // Sign the pre-built MIDX for the selected variant so the client installs it
+    // directly instead of running `git multi-pack-index write`.
+    let midx_url = signed_url(storage, &artifacts.midx);
+
     RefResponse {
         owner,
         repo,
@@ -934,6 +928,7 @@ fn ref_response(
         head_blobs_idx_url,
         pack_chunk_urls,
         pack_idx_urls,
+        midx_url,
         shallow: clonepack_kind == "shallow",
     }
 }
@@ -1061,7 +1056,6 @@ async fn sync_repo(
     }
     let start = Instant::now();
     let mirror_dir = state.repo_root.join(format!("{}_{}.git", owner, repo));
-    let depth = params.depth.unwrap_or(state.default_depth);
     let branch = params.branch;
     let github_token = headers
         .get("X-GitHub-Token")
@@ -1082,7 +1076,6 @@ async fn sync_repo(
         &repo,
         &branch,
         &state.ref_store,
-        depth,
         false,
         &state.storage,
         &state.retention,
@@ -1344,7 +1337,6 @@ async fn create_snapshot(
         &repo,
         &branch,
         &state.ref_store,
-        state.default_depth,
         false,
         &state.storage,
         &state.retention,
@@ -1691,7 +1683,6 @@ async fn do_sync(
     repo: &str,
     branch: &str,
     ref_store: &Arc<dyn RefStore>,
-    depth: usize,
     build_full_pack: bool,
     storage: &crate::storage::StorageRef,
     retention: &Arc<Retention>,
@@ -1712,7 +1703,6 @@ async fn do_sync(
             &owner_sync,
             &repo_sync,
             &branch_sync,
-            depth,
             github_token.as_deref(),
         )
     })
@@ -1851,6 +1841,35 @@ async fn do_sync(
     let mut full_entries = head_entries.clone();
     full_entries.extend(history_entries.iter().cloned());
 
+    // Pre-build a multi-pack-index per variant over exactly the packs that
+    // variant ships, using the client's `pack-<trailer>` filenames. The client
+    // drops it in directly instead of spending CPU on `git multi-pack-index
+    // write`. Returns (manifest ChunkRef, CAS hash) — the hash is also tracked
+    // for upload + retention.
+    let build_midx = |packs: &[(String, u64, String, u64)]| -> Result<(Option<ChunkRef>, String)> {
+        if packs.is_empty() {
+            return Ok((None, String::new()));
+        }
+        let mut pairs = Vec::with_capacity(packs.len());
+        for (ph, _, ih, _) in packs {
+            pairs.push((cas.get(ph)?, cas.get(ih)?));
+        }
+        let midx = crate::git::build_multi_pack_index_bytes(&pairs)?;
+        let len = midx.len() as u64;
+        let hash = cas.put(&midx)?;
+        Ok((
+            Some(ChunkRef {
+                hash: hash_from_hex(&hash)?,
+                len,
+            }),
+            hash,
+        ))
+    };
+    let full_pack_list: Vec<(String, u64, String, u64)> =
+        head_packs.iter().chain(history_packs.iter()).cloned().collect();
+    let (head_midx_ref, head_midx_hash) = build_midx(&head_packs)?;
+    let (full_midx_ref, full_midx_hash) = build_midx(&full_pack_list)?;
+
     // HEAD + history, for storage upload, retention protection, and RefInfo
     // signing (ordered HEAD-first to match the manifests).
     let all_packs: Vec<&(String, u64, String, u64)> =
@@ -1880,7 +1899,7 @@ async fn do_sync(
         .collect::<Result<Vec<_>>>()?;
 
     let make_clonepack =
-        |metadata_hash: String, metadata_len: u64, packs: Vec<crate::clonepack::PackEntry>| -> Result<ClonepackManifest> {
+        |metadata_hash: String, metadata_len: u64, packs: Vec<crate::clonepack::PackEntry>, midx: Option<ChunkRef>| -> Result<ClonepackManifest> {
             Ok(ClonepackManifest {
                 commit: commit.clone(),
                 parent_commit: parent.clone(),
@@ -1891,13 +1910,18 @@ async fn do_sync(
                 }),
                 archive_chunks: archive_chunks.clone(),
                 packs,
+                midx,
                 ..Default::default()
             })
         };
 
     // Full clonepack: HEAD closure + all history. Shallow: HEAD closure only.
-    let full_clonepack_manifest =
-        make_clonepack(metadata_hash.clone(), metadata_data.len() as u64, full_entries)?;
+    let full_clonepack_manifest = make_clonepack(
+        metadata_hash.clone(),
+        metadata_data.len() as u64,
+        full_entries,
+        full_midx_ref.clone(),
+    )?;
     let full_clonepack_data = full_clonepack_manifest.encode_to_vec();
     let full_clonepack_hash = cas.put(&full_clonepack_data)?;
 
@@ -1905,6 +1929,7 @@ async fn do_sync(
         shallow_metadata_hash.clone(),
         shallow_metadata_data.len() as u64,
         head_entries,
+        head_midx_ref.clone(),
     )?;
     let shallow_clonepack_data = shallow_clonepack_manifest.encode_to_vec();
     let shallow_clonepack_hash = cas.put(&shallow_clonepack_data)?;
@@ -1946,6 +1971,7 @@ async fn do_sync(
             skeleton_pack: skeleton_pack.clone(),
             skeleton_idx: skeleton_idx.clone(),
             prebuilt_index: prebuilt_index.clone(),
+            midx: full_midx_hash.clone(),
         },
         shallow_clonepack: crate::ClonepackArtifacts {
             manifest: shallow_clonepack_hash.clone(),
@@ -1953,6 +1979,7 @@ async fn do_sync(
             skeleton_pack: shallow_skeleton_pack.clone(),
             skeleton_idx: shallow_skeleton_idx.clone(),
             prebuilt_index: shallow_prebuilt_index.clone(),
+            midx: head_midx_hash.clone(),
         },
         build_status: None,
         synced_at: SystemTime::now()
@@ -1977,6 +2004,8 @@ async fn do_sync(
         &info.shallow_clonepack.prebuilt_index,
         &info.shallow_clonepack.metadata_chunk,
         &info.shallow_clonepack.manifest,
+        &info.full_clonepack.midx,
+        &info.shallow_clonepack.midx,
     ];
     artifact_hashes.extend(info.head_blobs_chunks.iter().map(|s| s.as_str()));
     artifact_hashes.extend(info.archive_chunks.iter().map(|s| s.as_str()));
@@ -2035,7 +2064,6 @@ fn spawn_build_worker(state: ServerState) -> tokio::sync::mpsc::Sender<BuildJob>
                 &repo,
                 "HEAD",
                 &state.ref_store,
-                state.default_depth,
                 false,
                 &state.storage,
                 &state.retention,
@@ -2105,7 +2133,6 @@ pub async fn run_server(
     repo_root: &std::path::Path,
     host: &str,
     port: u16,
-    default_depth: usize,
 ) -> Result<()> {
     std::fs::create_dir_all(cas_dir)?;
     std::fs::create_dir_all(repo_root)?;
@@ -2189,7 +2216,6 @@ pub async fn run_server(
         storage,
         repo_root: repo_root.to_path_buf(),
         ref_store,
-        default_depth,
         token_hash,
         github_token,
         metrics,
@@ -2246,7 +2272,6 @@ mod tests {
             storage,
             repo_root,
             ref_store,
-            default_depth: 1,
             token_hash: Some(token_hash),
             github_token: None,
             metrics,
@@ -2290,7 +2315,6 @@ mod tests {
             tmp.path().join("repos").as_path(),
             "127.0.0.1",
             0,
-            50,
         )
         .await;
         assert!(
@@ -2447,6 +2471,7 @@ mod tests {
                 skeleton_pack: String::new(),
                 skeleton_idx: String::new(),
                 prebuilt_index: String::new(),
+                midx: String::new(),
             },
             shallow_clonepack: crate::ClonepackArtifacts::default(),
             build_status: None,
@@ -2529,6 +2554,7 @@ mod tests {
                 skeleton_pack: String::new(),
                 skeleton_idx: String::new(),
                 prebuilt_index: String::new(),
+                midx: String::new(),
             },
             shallow_clonepack: crate::ClonepackArtifacts::default(),
             build_status: None,

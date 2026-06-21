@@ -57,6 +57,14 @@ message ClonepackManifest {
   // contains — overlapping download and extraction. This list IS the index;
   // no separate per-pack table is needed.
   repeated PackEntry packs = 11;
+
+  // Pre-built multi-pack-index over exactly the packs in `packs`, built
+  // server-side using the client's deterministic `pack-<trailer>.{pack,idx}`
+  // filenames. The client drops it into `.git/objects/pack/multi-pack-index`
+  // so object lookups stay O(log) across many packs without spending CPU on a
+  // client-side `git multi-pack-index write`. Optional: if absent (older
+  // manifests), the client builds the MIDX itself.
+  ChunkRef midx = 12;
 }
 
 // One self-contained git pack plus its index, addressed by content hash.

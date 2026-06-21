@@ -19,13 +19,6 @@ struct Args {
 
     #[arg(long, default_value = "8000")]
     port: u16,
-
-    #[arg(
-        long,
-        default_value = "50",
-        help = "Default git history depth for repo mirrors"
-    )]
-    default_depth: usize,
 }
 
 #[tokio::main]
@@ -35,12 +28,5 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    run_server(
-        &args.cas_dir,
-        &args.repo_root,
-        &args.host,
-        args.port,
-        args.default_depth,
-    )
-    .await
+    run_server(&args.cas_dir, &args.repo_root, &args.host, args.port).await
 }

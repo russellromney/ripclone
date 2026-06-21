@@ -45,6 +45,9 @@ pub struct RefResponse {
     /// Signed URL for each editable pack's idx, ordered to match `manifest.packs`.
     #[serde(default)]
     pub pack_idx_urls: Option<Vec<Option<String>>>,
+    /// Signed URL for the pre-built multi-pack-index (`manifest.midx`).
+    #[serde(default)]
+    pub midx_url: Option<String>,
     /// True when the returned clonepack is a shallow (depth=1) snapshot.
     #[serde(default)]
     pub shallow: bool,
@@ -953,13 +956,37 @@ impl Client {
             .await
             .context("spawn clear skip-worktree")??;
 
-        // Build a multi-pack-index so git lookups stay fast across the many
-        // installed packs. Best effort — if it fails the clone is still correct,
-        // just with slower per-object lookups. (Server pre-generation is a
-        // planned optimization to skip this client-side step.)
-        let work_tree3 = work_tree.to_path_buf();
-        let _ = tokio::task::spawn_blocking(move || crate::git::write_multi_pack_index(&work_tree3))
-            .await;
+        // Install the multi-pack-index so git object lookups stay O(log) across
+        // the many installed packs. Prefer the server-pregenerated MIDX (zero
+        // client CPU; it indexes the same `pack-<trailer>` files we just wrote);
+        // fall back to building it locally for older manifests without one. Best
+        // effort either way — without a MIDX the clone is still correct, just
+        // with slower per-object lookups.
+        if let Some(midx_ref) = manifest.midx.as_ref() {
+            match self
+                .fetch_chunk_ref(midx_ref, info.midx_url.as_deref())
+                .await
+            {
+                Ok(midx_bytes) => {
+                    tokio::fs::write(pack_dir.join("multi-pack-index"), &midx_bytes)
+                        .await
+                        .context("write pre-built multi-pack-index")?;
+                }
+                Err(e) => {
+                    tracing::warn!("pre-built MIDX fetch failed ({e:#}); building locally");
+                    let work_tree3 = work_tree.to_path_buf();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        crate::git::write_multi_pack_index(&work_tree3)
+                    })
+                    .await;
+                }
+            }
+        } else {
+            let work_tree3 = work_tree.to_path_buf();
+            let _ =
+                tokio::task::spawn_blocking(move || crate::git::write_multi_pack_index(&work_tree3))
+                    .await;
+        }
 
         Ok(total)
     }
