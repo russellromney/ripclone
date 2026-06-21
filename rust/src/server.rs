@@ -21,6 +21,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use futures::{StreamExt, TryStreamExt};
 use prost::Message;
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
@@ -1782,6 +1783,13 @@ async fn do_sync(
     let parent = git::parent_commit(&mirror_dir, &commit).ok().flatten();
     let default_branch = git::default_branch(&mirror_dir).unwrap_or_else(|_| "HEAD".to_string());
 
+    // Write a commit-graph so the rev-list walks in the skeleton + layered-pack
+    // builds below are fast (a fresh --mirror clone has none). Best-effort.
+    let cg_dir = mirror_dir.clone();
+    let _ = tokio::task::spawn_blocking(move || git::write_commit_graph(&cg_dir)).await;
+    info!("sync phase: commit-graph {:?}", t.elapsed());
+    t = Instant::now();
+
     info!("building artifacts for {}", &commit[..7]);
 
     // Full-history skeleton pack + idx.
@@ -2267,17 +2275,42 @@ async fn do_sync(
         t.elapsed()
     );
     t = Instant::now();
-    for hash in artifact_hashes.iter().filter(|h| !h.is_empty()) {
-        let data = cas
-            .get(hash)
-            .with_context(|| format!("read artifact {} from CAS for upload", hash))?;
-        storage
-            .put(hash, &data)
-            .with_context(|| format!("upload artifact {} to storage", hash))?;
-    }
+    // Upload with bounded concurrency instead of one-at-a-time. Each put is a
+    // blocking S3 call, so run them on the blocking pool; ~400 MB of serial
+    // wall-clock collapses to roughly bandwidth-bound.
+    let upload_hashes: Vec<String> = artifact_hashes
+        .iter()
+        .filter(|h| !h.is_empty())
+        .map(|h| h.to_string())
+        .collect();
+    let upload_count = upload_hashes.len();
+    let upload_conc: usize = std::env::var("RIPCLONE_UPLOAD_CONCURRENCY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(16)
+        .max(1);
+    futures::stream::iter(upload_hashes.into_iter().map(|hash| {
+        let cas = cas.clone();
+        let storage = storage.clone();
+        async move {
+            tokio::task::spawn_blocking(move || {
+                let data = cas
+                    .get(&hash)
+                    .with_context(|| format!("read artifact {} from CAS for upload", hash))?;
+                storage
+                    .put(&hash, &data)
+                    .with_context(|| format!("upload artifact {} to storage", hash))
+            })
+            .await
+            .context("upload task")?
+        }
+    }))
+    .buffer_unordered(upload_conc)
+    .try_collect::<Vec<()>>()
+    .await?;
     info!(
         "sync phase: upload {} artifacts {:?}",
-        artifact_hashes.iter().filter(|h| !h.is_empty()).count(),
+        upload_count,
         t.elapsed()
     );
 
