@@ -83,6 +83,10 @@ pub struct ClonepackArtifacts {
     /// Empty for older refs (client falls back to building the MIDX itself).
     #[serde(default)]
     pub midx: String,
+    /// CAS hash of the concatenated idx bundle for this variant's packs. Empty
+    /// for older refs (client falls back to fetching each idx individually).
+    #[serde(default)]
+    pub idx_bundle: String,
 }
 
 /// Artifact hashes returned by the server for a single ref.

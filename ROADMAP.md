@@ -68,60 +68,55 @@ Goal: drop steady-state sync cost from O(all history) to **O(new commits since l
 
 ## Cross-repo dedup & status endpoint (planned)
 
-Forks come **first** because they change the storage model; the other two are
-small endpoint additions.
+Do forks first — they change how storage works. The other two are small.
 
-### a. Fork / shared-history dedup (the deep one — do first)
+### a. Fork dedup (the big one — do first)
 
-Forks share ~all of their history with the upstream. If the cache namespaces
-storage per repo, a popular repo's fork network stores near-identical packs
-thousands of times — and **object storage is the dominant cost**, so this is the
-thing that blows it up.
+A fork shares almost all its history with the repo it came from. Right now the
+cache stores each repo's packs on its own. So a popular repo with thousands of
+forks stores almost the same bytes thousands of times. Object storage is the
+biggest cost, so this is what makes it blow up.
 
-The LSM history levels are already content-addressed and "shared across branches
-and live in object storage forever." The work is to extend that sharing **across
-repos in a fork network**:
+The LSM history levels are already content-addressed: built once, shared across
+branches, kept in object storage. We just need to share them **across repos** too,
+not only across branches.
 
-- **Global CAS, not per-repo.** Sealed levels / page-group chunks are keyed purely
-  by content hash in a store that is global (or at least shared within a fork
-  network), so identical history is stored once. A fork's history becomes
-  `references to the upstream's existing levels + a small tail of its unique
-  commits`. Sync for a fork is then O(unique commits), not O(history).
-- **Authorization on fetch — a content hash must NOT be a bearer capability.**
-  Once chunks are shared across trust boundaries (a private fork sharing history
-  with a public upstream; two private repos that share history), "knows the hash"
-  cannot imply "may fetch the bytes." The serve path must verify the caller is
-  authorized for *some repo whose manifest references this chunk*, then mint a
-  short-lived signed URL for that request. Signed URLs must never be globally
-  guessable or long-lived. This is a security requirement, not an optimization.
-- **No cross-repo leakage.** Dedup decisions and byte accounting must not let the
-  reader of one repo infer another repo's private content (e.g. via "this chunk
-  already existed" timing/size oracles). Treat shared-history *existence* as
-  private.
+- **One shared store, not one per repo.** Key the sealed levels and chunks by their
+  content hash in a store shared across the whole fork network. The same history is
+  stored once. A fork's history becomes "point at the parent's existing levels + a
+  small pack of its own new commits." Syncing a fork then builds only its new
+  commits, not all of history.
+- **Check access on every fetch. A hash is not a key to the bytes.** Once repos
+  share chunks, knowing a chunk's hash must not be enough to download it — a
+  private fork can share history with a public repo, and two private repos can
+  overlap. On each fetch, check that the caller can read *some* repo that uses this
+  chunk, then hand out a short-lived signed URL. Signed URLs must be short-lived and
+  not guessable. This is a security rule, not a nice-to-have.
+- **Don't leak between repos.** Dedup must not let the reader of one repo learn
+  what's in another. For example, "this chunk already exists" timing or size hints
+  can reveal that two repos share history — keep that hidden.
 
 ### b. `GET /v1/repos/{owner}/{repo}/status`
 
-One call returning a repo's warm coverage + storage, so an operator (or a CLI) can
-see what's built and how much it occupies:
+One call that says what is built for a repo and how big it is, so an operator (or
+the CLI) can see it:
 
-- `refs: [{ branch, commit, bytes_total, bytes_unique }]` — `bytes_unique` =
-  bytes this repo adds that are *not* shared with other repos (the marginal figure
-  from dedup above); `bytes_total` = the logical size.
+- `refs: [{ branch, commit, bytes_total, bytes_unique }]` — `bytes_total` is the
+  full size; `bytes_unique` is only the bytes this repo adds that no other repo
+  shares (the number that matters after dedup).
 - repo totals `{ total_bytes, unique_bytes }`.
 
 ### c. Per-branch sync
 
-`POST /v1/repos/{owner}/{repo}/sync` currently builds HEAD only (`SyncRequest`
-has just `depth`). Add `?branch=<name>` so a non-default branch can be warmed
-explicitly.
+`POST /v1/repos/{owner}/{repo}/sync` only builds HEAD today (`SyncRequest` has just
+`depth`). Add `?branch=<name>` so you can warm one chosen branch.
 
 ### Related
 
-- **Configurable clone depth** is already planned in **§2a Repo/branch-specific
-  configuration** (`?clonepack=<name>`, configurable `DepthSpec`s) — no new work
-  beyond 2a.
-- **On-demand per-region warming** (warm repo X in region R) rides the **§5
-  Fly-region cache warmers**.
+- **Configurable clone depth** is already planned in **§2a** (`?clonepack=<name>`,
+  configurable `DepthSpec`s) — nothing new beyond 2a.
+- **Warm a repo in a chosen region on demand** rides the **§5 Fly-region cache
+  warmers**.
 
 ## What already works
 

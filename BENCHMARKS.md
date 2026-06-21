@@ -52,28 +52,30 @@ case for ripclone and the fairest stress test.
 
 | clone | ripclone | native `git clone` |
 |---|---|---|
-| depth=1 | 18.1 s | **16.3 s** |
+| depth=1 | ~15.7 s | 17.1 s |
 | full | **90.9 s** | 148.4 s |
 
-- **depth=1 is roughly tied (git slightly ahead).** Measured download is nearly
-  identical — ripclone 70.8 MB packs (72.1 MB `.git/objects` incl. idx) vs git
-  69.2 MB (~4% apart). At a single commit there is almost nothing to
-  delta-compress, so the undeltified HEAD closure is barely larger. The tie is
-  **latency, not bytes**: ripclone makes ~70 round-trips (resolve + manifest +
-  34 pack + 34 idx GETs to the server/Tigris) where git does one negotiation +
-  one pack stream. On a fat low-latency pipe those round-trips are nearly free
-  (Fly), so ripclone's no-`index-pack` CPU win shows; on high-latency home wifi
-  the round-trips roughly cancel it.
+- **depth=1 is now tied/slightly ahead.** Measured download is nearly identical —
+  ripclone 70.8 MB packs vs git 69.2 MB (~4% apart): at a single commit there's
+  almost nothing to delta-compress, so the undeltified HEAD closure is barely
+  larger. The gap was never bytes, it was **round-trips**: ripclone originally
+  made ~70 GETs (resolve + manifest + 34 pack + 34 idx). Two changes cut that to
+  ~23 — **4 MB frames** (34 packs → 18) and the **idx bundle** (34 idx GETs → 1).
+  That moved laptop depth=1 from ~18.1 s (behind git) to ~15.7 s (ahead). On a
+  fat low-latency pipe (Fly) the round-trips were always nearly free, so the win
+  shows mostly on slow/high-latency links. What's left is bandwidth (~70 MB over
+  wifi); the next lever there is *fewer bytes* (deltified/zstd head transport).
 - **full is ~1.6× faster** — here it *is* bytes: 628 vs 840 MB (deltified
   history), plus no server pack-compute / client `index-pack`. That byte gap
   dwarfs the round-trip overhead, so the win survives the slow link.
 
 **Takeaway:** ripclone's large wins are where git's *server-side* work dominates
 and round-trips are cheap (CI runners, cloud dev boxes, fast/colocated networks —
-see the Fly numbers above, 4×/17×). On a high-latency client, depth=1 is a wash
-(round-trip-bound) while full still wins (byte-bound). Levers to also win depth=1
-on slow links: fewer requests (a single concatenated head pack, or bundle
-idx into the pack download) rather than 34+34 separate GETs.
+see the Fly numbers above, 4×/17×). The round-trip cost that made depth=1 lose on
+slow links has been cut (4 MB frames + idx bundle: ~70 GETs → ~23), so depth=1 is
+now tied/ahead there too. The remaining slow-link lever is *bytes* — a
+deltified/zstd HEAD-closure transport (trade a little client CPU for fewer bytes),
+or the `files` zstd-archive mode.
 
 ## Why ripclone is faster
 

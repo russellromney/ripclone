@@ -65,6 +65,15 @@ message ClonepackManifest {
   // client-side `git multi-pack-index write`. Optional: if absent (older
   // manifests), the client builds the MIDX itself.
   ChunkRef midx = 12;
+
+  // All pack idx files concatenated into one content-addressed blob. The idx
+  // for `packs[i]` lives at `[packs[i].idx_bundle_offset, +packs[i].idx.len)`.
+  // The client fetches this ONCE and slices each idx out locally, instead of a
+  // separate GET per pack idx — cutting per-pack round-trips from 2 to 1 (a big
+  // win on high-latency links). Each slice is still verified against
+  // `packs[i].idx.hash`. Optional: if absent (older manifests), the client
+  // fetches each idx individually via its `idx` ref.
+  ChunkRef idx_bundle = 13;
 }
 
 // One self-contained git pack plus its index, addressed by content hash.
@@ -77,6 +86,11 @@ message PackEntry {
   // packs). Default false = HEAD-closure pack, hand-parsed for the worktree
   // (also back-compatible with older manifests built before this field).
   bool history_only = 3;
+
+  // Byte offset of this pack's idx within the manifest's `idx_bundle`. The idx
+  // length is `idx.len`. Only meaningful when `idx_bundle` is set. (0 for the
+  // first pack is valid; gate on `idx_bundle` being present, not on offset.)
+  uint64 idx_bundle_offset = 4;
 }
 
 // Per-commit metadata chunk. This is the only chunk that changes on every

@@ -48,6 +48,9 @@ pub struct RefResponse {
     /// Signed URL for the pre-built multi-pack-index (`manifest.midx`).
     #[serde(default)]
     pub midx_url: Option<String>,
+    /// Signed URL for the concatenated idx bundle (`manifest.idx_bundle`).
+    #[serde(default)]
+    pub idx_bundle_url: Option<String>,
     /// True when the returned clonepack is a shallow (depth=1) snapshot.
     #[serde(default)]
     pub shallow: bool,
@@ -859,6 +862,19 @@ impl Client {
         let pack_urls = info.pack_chunk_urls.clone().unwrap_or_default();
         let idx_urls = info.pack_idx_urls.clone().unwrap_or_default();
 
+        // If the manifest ships a single idx bundle, fetch it ONCE and slice each
+        // pack's idx out of it locally — instead of one GET per pack idx (cuts
+        // per-pack round-trips from 2 to 1). Falls back to per-pack idx fetches
+        // for older manifests without a bundle.
+        let idx_bundle: Option<Arc<Vec<u8>>> = match manifest.idx_bundle.as_ref() {
+            Some(b) => Some(Arc::new(
+                self.fetch_chunk_ref(b, info.idx_bundle_url.as_deref())
+                    .await
+                    .context("fetch idx bundle")?,
+            )),
+            None => None,
+        };
+
         let jobs: Vec<(usize, PackEntry)> = manifest.packs.iter().cloned().enumerate().collect();
 
         // Stage 1: download packs (network concurrency `download_conc`).
@@ -866,6 +882,7 @@ impl Client {
             let client = self.clone();
             let pack_url = pack_urls.get(i).and_then(|o| o.clone());
             let idx_url = idx_urls.get(i).and_then(|o| o.clone());
+            let idx_bundle = idx_bundle.clone();
             let history_only = entry.history_only;
             async move {
                 let pack_ref = entry
@@ -876,11 +893,36 @@ impl Client {
                     .idx
                     .as_ref()
                     .with_context(|| format!("pack {} missing idx ref", i))?;
-                let (pack_bytes, idx_bytes) = tokio::try_join!(
-                    client.fetch_chunk_ref(pack_ref, pack_url.as_deref()),
-                    client.fetch_chunk_ref(idx_ref, idx_url.as_deref()),
-                )
-                .with_context(|| format!("fetch pack {}", i))?;
+                let (pack_bytes, idx_bytes) = if let Some(bundle) = idx_bundle.as_ref() {
+                    // Slice this pack's idx from the bundle and verify its hash;
+                    // only the pack itself needs a network fetch.
+                    let off = entry.idx_bundle_offset as usize;
+                    let end = off
+                        .checked_add(idx_ref.len as usize)
+                        .context("idx bundle offset overflow")?;
+                    let slice = bundle
+                        .get(off..end)
+                        .with_context(|| format!("idx {} slice out of bundle range", i))?
+                        .to_vec();
+                    let want = hash_to_hex(&idx_ref.hash);
+                    let got = crate::cas::hash(&slice);
+                    if got != want {
+                        anyhow::bail!(
+                            "idx {i} bundle slice hash mismatch: expected {want}, got {got}"
+                        );
+                    }
+                    let pack_bytes = client
+                        .fetch_chunk_ref(pack_ref, pack_url.as_deref())
+                        .await
+                        .with_context(|| format!("fetch pack {}", i))?;
+                    (pack_bytes, slice)
+                } else {
+                    tokio::try_join!(
+                        client.fetch_chunk_ref(pack_ref, pack_url.as_deref()),
+                        client.fetch_chunk_ref(idx_ref, idx_url.as_deref()),
+                    )
+                    .with_context(|| format!("fetch pack {}", i))?
+                };
                 Ok::<(usize, bool, Vec<u8>, Vec<u8>), anyhow::Error>((
                     i,
                     history_only,
