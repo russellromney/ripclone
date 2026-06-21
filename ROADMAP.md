@@ -6,11 +6,11 @@
 
 ## Clone modes & pack architecture (active plan)
 
-We support **exactly three** clone modes — no arbitrary `--depth N` (it's finicky and almost nobody uses it; people pick depth=1 or full):
+We support **exactly three** clone modes — no arbitrary `--depth N` (it's finicky and almost nobody uses it; people pick depth=1 or full). Three content tiers:
 
-- **`editable --depth 1`** (default): HEAD snapshot, full object DB for HEAD. The agent/CI hot path.
-- **`editable --depth 0` (full)**: HEAD + all history.
-- **`files`**: worktree only, no git objects (zstd archive) — fastest CI path.
+- **head** = **`editable --depth 1`** (default): HEAD snapshot, full object DB for HEAD, `.git/shallow` boundary written. The agent/CI hot path. *(done & validated clean)*
+- **full** = **`editable --depth 0`**: HEAD + all history, complete `git fsck`-clean clone, no shallow marker. *(was a stub — see below)*
+- **worktree** = **`files`**: worktree only, no git objects (zstd archive) — fastest CI path. *(done)*
 
 This collapses the server to **two pack buckets** (no range/geometric depth buckets):
 
@@ -21,12 +21,14 @@ depth=1 clonepack lists HEAD-closure packs; full lists HEAD + history. The depth
 
 **MIDX (the "many packs but git stays fast" lever):** the server pre-builds a `multi-pack-index` per variant (head-MIDX, full-MIDX) in a temp pack dir using the client's deterministic `pack-<trailer>.{pack,idx}` filenames, stores it as a content-addressed artifact, and the client drops it into `.git/objects/pack/`. Object lookups become O(log) across all packs regardless of count — so many small packs (great download parallelism) coexist with fast `git status`/`diff`/`log`. Cheap to build (indexes existing idx files; no pack rewrite). Optionally `--bitmap`.
 
-**Full-clone correctness:** a "full" clone from a shallow mirror is bounded; it must either come from an **unshallow mirror** or carry a `.git/shallow` boundary marker, or `git fsck`/traversal breaks at the boundary (observed bug).
+**Full-clone correctness (two distinct tiers, do not conflate):**
+- **head/depth-1** is *shallow* and must carry a `.git/shallow` boundary marker so `git log`/`deepen` stop cleanly at HEAD. *(done — the client writes it)*
+- **full/depth-0** is *complete* and must carry **no** marker; it requires the **mirror to hold the entire history**. The mirror was created with `--depth 50`, so "full" silently meant "last 50 commits" and `git rev-list HEAD` broke at the boundary (observed bug). Fix: the mirror is **always a complete clone** — the `--depth` knob is removed entirely; existing shallow mirrors are `fetch --unshallow`'d on next sync.
 
 ### Immediate next
-1. **Deltify the history bucket** — kills the full-history size blowup (client unchanged; it only hand-parses HEAD packs).
-2. **Pre-generate MIDX** (head + full) and install it on the client.
-3. **Unshallow mirror + `.git/shallow`** so depth=0 is a true, fsck-clean full clone.
+1. **Deltify the history bucket** — kills the full-history size blowup (client unchanged; it only hand-parses HEAD packs). *(done)*
+2. **Always-full mirror** so depth=0 is a true, fsck-clean full clone. Drop the `--depth 50` default; unshallow existing mirrors. *(in progress)*
+3. **Server-pregenerate + ship MIDX** (head + full) as a content-addressed artifact the client drops in. Today MIDX is only built **client-side** (`git multi-pack-index write` per clone) — works, but burns CPU on the hot path. *(not done)*
 
 ### Deferred
 - **LSM incremental build** — don't rebuild full history every sync (append an L0 pack at HEAD, compact older into immutable range packs; LSM levels). Optimization only.

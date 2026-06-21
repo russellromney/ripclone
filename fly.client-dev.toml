@@ -1,0 +1,22 @@
+app = 'ripclone-client-dev'
+primary_region = 'ewr'
+
+[build]
+  dockerfile = 'Dockerfile.client'
+
+[env]
+  RIPCLONE_URL = 'https://ripclone-server-dev.fly.dev'
+
+# Keep the machine alive so we can run controlled clones over SSH instead of the
+# one-shot multi-mode benchmark script.
+[experimental]
+  cmd = ['sleep', '86400']
+
+[[vm]]
+  size = 'shared-cpu-4x'
+  memory = '1gb'
+
+# Durable-disk target so we can benchmark the real disk write floor (vs tmpfs).
+[mounts]
+  source = 'ripclone_data'
+  destination = '/data'
