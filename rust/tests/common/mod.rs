@@ -207,6 +207,31 @@ pub fn make_origin(owner: &str, repo: &str) -> Origin {
     }
 }
 
+/// Enable two-phase publish for this test binary (set before `init`/server).
+pub fn enable_two_phase() {
+    static O: Once = Once::new();
+    O.call_once(|| unsafe { std::env::set_var("RIPCLONE_TWO_PHASE", "1") });
+}
+
+/// Install (clone) without syncing first — returns Result so callers can retry
+/// (e.g. waiting for two-phase phase 2 to publish the full clonepack).
+pub async fn clone_only(
+    server: &Server,
+    owner: &str,
+    repo: &str,
+    depth: usize,
+    mode: ripclone::mode::CloneMode,
+) -> anyhow::Result<(TempDir, std::path::PathBuf)> {
+    let client = server.client();
+    let out = tempfile::tempdir().unwrap();
+    let target = out.path().join("clone");
+    let kind = ripclone::mode::clonepack_kind_for_depth(depth);
+    client
+        .install_repo_with_mode(owner, repo, "HEAD", &target, mode, Some(kind), None)
+        .await?;
+    Ok((out, target))
+}
+
 /// Clone helper: sync then install with the given depth, returning the dir.
 pub async fn sync_and_clone(
     server: &Server,

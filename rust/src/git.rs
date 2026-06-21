@@ -359,6 +359,25 @@ pub fn write_multi_pack_index<P: AsRef<Path>>(repo_dir: P) -> Result<()> {
     Ok(())
 }
 
+/// Write a commit-graph over all reachable commits so the many `rev-list` /
+/// graph walks during a build (skeleton + layered packs) don't re-parse commit
+/// objects from the packfile each time. A fresh `--mirror` clone has none. Cheap
+/// to build and best-effort — a failure only loses the speedup.
+pub fn write_commit_graph<P: AsRef<Path>>(repo_dir: P) -> Result<()> {
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(repo_dir.as_ref().as_os_str())
+        .args(["commit-graph", "write", "--reachable", "--no-progress"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .context("spawn git commit-graph write")?;
+    if !status.success() {
+        anyhow::bail!("git commit-graph write failed");
+    }
+    Ok(())
+}
+
 /// Build a multi-pack-index over the given packs (each a `(pack_bytes,
 /// idx_bytes)` pair) and return the raw `multi-pack-index` file bytes. The packs
 /// are laid out with the same `pack-<trailer>.{pack,idx}` filenames the client

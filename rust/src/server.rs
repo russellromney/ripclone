@@ -21,6 +21,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use futures::{StreamExt, TryStreamExt};
 use prost::Message;
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
@@ -33,7 +34,7 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 #[derive(Clone)]
 pub struct ServerState {
@@ -909,12 +910,22 @@ fn ref_response(
     // Sign the idx bundle so the client fetches all idx in one GET.
     let idx_bundle_url = signed_url(storage, &artifacts.idx_bundle);
 
+    // The served commit is the selected variant's commit — which may differ from
+    // RefInfo.commit during two-phase publish (depth=0 serves the previous commit
+    // until the new full history is built). The client writes HEAD to this, so it
+    // must match the installed objects.
+    let served_commit = if artifacts.commit.is_empty() {
+        info.commit.clone()
+    } else {
+        artifacts.commit.clone()
+    };
+
     RefResponse {
         owner,
         repo,
         branch,
         default_branch: info.default_branch.clone(),
-        commit: info.commit.clone(),
+        commit: served_commit,
         parent_commit: info.parent_commit.clone(),
         full_pack: info.full_pack.clone(),
         clonepack_manifest,
@@ -1729,6 +1740,180 @@ fn sized_to_tuple(p: &crate::SizedPack) -> (String, u64, String, u64) {
     (p.pack.clone(), p.pack_len, p.idx.clone(), p.idx_len)
 }
 
+/// True when two-phase publish is enabled (publish depth=1 first, build full
+/// history in the background). Off by default.
+fn two_phase_enabled() -> bool {
+    std::env::var("RIPCLONE_TWO_PHASE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+fn env_bytes(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+}
+
+/// Build one variant's PackEntry list + concatenated idx bundle. Free-function
+/// form (used by the two-phase sync path and its background phase-2 task).
+fn assemble_variant(
+    cas: &Cas,
+    storage: &crate::storage::StorageRef,
+    tagged: &[(&(String, u64, String, u64), bool)],
+) -> Result<(Vec<crate::clonepack::PackEntry>, Option<ChunkRef>, String)> {
+    if tagged.is_empty() {
+        return Ok((Vec::new(), None, String::new()));
+    }
+    let mut buf: Vec<u8> = Vec::new();
+    let mut entries = Vec::with_capacity(tagged.len());
+    for &(pack, history_only) in tagged {
+        let offset = buf.len() as u64;
+        let idx_bytes = cas.get(&pack.2).or_else(|_| storage.get(&pack.2))?;
+        buf.extend_from_slice(&idx_bytes);
+        entries.push(crate::clonepack::PackEntry {
+            pack: Some(ChunkRef {
+                hash: hash_from_hex(&pack.0)?,
+                len: pack.1,
+            }),
+            idx: Some(ChunkRef {
+                hash: hash_from_hex(&pack.2)?,
+                len: pack.3,
+            }),
+            history_only,
+            idx_bundle_offset: offset,
+        });
+    }
+    let len = buf.len() as u64;
+    let hash = cas.put(&buf)?;
+    Ok((
+        entries,
+        Some(ChunkRef {
+            hash: hash_from_hex(&hash)?,
+            len,
+        }),
+        hash,
+    ))
+}
+
+/// Build a multi-pack-index over `packs` from local CAS. Free-function form.
+fn assemble_midx(
+    cas: &Cas,
+    packs: &[(String, u64, String, u64)],
+) -> Result<(Option<ChunkRef>, String)> {
+    if packs.is_empty() {
+        return Ok((None, String::new()));
+    }
+    let mut pairs = Vec::with_capacity(packs.len());
+    for (ph, _, ih, _) in packs {
+        pairs.push((cas.get(ph)?, cas.get(ih)?));
+    }
+    let midx = crate::git::build_multi_pack_index_bytes(&pairs)?;
+    let len = midx.len() as u64;
+    let hash = cas.put(&midx)?;
+    Ok((
+        Some(ChunkRef {
+            hash: hash_from_hex(&hash)?,
+            len,
+        }),
+        hash,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn make_manifest(
+    commit: &str,
+    parent: &Option<String>,
+    default_branch: &str,
+    archive_chunks: &[ChunkRef],
+    metadata_hash: &str,
+    metadata_len: u64,
+    packs: Vec<crate::clonepack::PackEntry>,
+    midx: Option<ChunkRef>,
+    idx_bundle: Option<ChunkRef>,
+) -> Result<ClonepackManifest> {
+    Ok(ClonepackManifest {
+        commit: commit.to_string(),
+        parent_commit: parent.clone(),
+        default_branch: default_branch.to_string(),
+        metadata_chunk: Some(ChunkRef {
+            hash: hash_from_hex(metadata_hash)?,
+            len: metadata_len,
+        }),
+        archive_chunks: archive_chunks.to_vec(),
+        packs,
+        midx,
+        idx_bundle,
+        ..Default::default()
+    })
+}
+
+/// Build the `[ChunkRef]` list for the archive chunks of a metadata chunk.
+fn archive_chunk_refs(
+    archive_chunk_hashes: &[String],
+    metadata_chunk: &crate::clonepack::MetadataChunk,
+) -> Result<Vec<ChunkRef>> {
+    let lengths = crate::clonepack::archive_chunk_lengths(metadata_chunk);
+    archive_chunk_hashes
+        .iter()
+        .zip(lengths.iter())
+        .map(|(hash, len)| {
+            Ok(ChunkRef {
+                hash: hash_from_hex(hash)?,
+                len: *len,
+            })
+        })
+        .collect()
+}
+
+/// Upload `hashes` from CAS to storage with bounded concurrency.
+async fn upload_artifacts(
+    cas: &Cas,
+    storage: &crate::storage::StorageRef,
+    hashes: Vec<String>,
+    conc: usize,
+) -> Result<()> {
+    futures::stream::iter(hashes.into_iter().map(|hash| {
+        let cas = cas.clone();
+        let storage = storage.clone();
+        async move {
+            tokio::task::spawn_blocking(move || {
+                let data = cas
+                    .get(&hash)
+                    .with_context(|| format!("read artifact {} for upload", hash))?;
+                storage
+                    .put(&hash, &data)
+                    .with_context(|| format!("upload artifact {}", hash))
+            })
+            .await
+            .context("upload task")?
+        }
+    }))
+    .buffer_unordered(conc.max(1))
+    .try_collect::<Vec<()>>()
+    .await
+    .map(|_| ())
+}
+
+/// After upload: on a remote backend drop local pack copies (keeping the tiny
+/// idx files for future bundle/MIDX rebuilds); on a local backend protect them
+/// from retention instead.
+async fn settle_storage(
+    cas: &Cas,
+    storage: &crate::storage::StorageRef,
+    retention: &Arc<Retention>,
+    uploaded: Vec<String>,
+    keep_idx: std::collections::HashSet<String>,
+) {
+    if storage.is_remote() {
+        for h in uploaded.iter().filter(|h| !keep_idx.contains(*h)) {
+            let _ = cas.remove(h);
+        }
+    } else {
+        retention.protect(uploaded).await;
+    }
+}
+
 async fn do_sync(
     cas: &Cas,
     mirror_dir: &std::path::Path,
@@ -1742,6 +1927,12 @@ async fn do_sync(
     github_token: Option<&secrecy::SecretString>,
 ) -> Result<RefInfo> {
     info!("syncing {}/{}@{}", owner, repo, branch);
+
+    // Per-phase timers so sync cost can be tuned with real numbers (RIPCLONE_LOG
+    // shows them at INFO). `t_total` spans the whole build; `t` is reset at each
+    // phase boundary.
+    let t_total = Instant::now();
+    let mut t = t_total;
 
     // Best-effort: remove stale build temp dirs left by a previously killed
     // sync. `tempfile` cleans up on drop, but not on SIGKILL/OOM, so a crashed
@@ -1769,20 +1960,53 @@ async fn do_sync(
     })
     .await
     .context("sync task")??;
+    info!("sync phase: mirror fetch {:?}", t.elapsed());
+    t = Instant::now();
 
     let commit = git::resolve_commit(&mirror_dir, branch)?;
     let parent = git::parent_commit(&mirror_dir, &commit).ok().flatten();
     let default_branch = git::default_branch(&mirror_dir).unwrap_or_else(|_| "HEAD".to_string());
 
+    // Write a commit-graph so the rev-list walks in the skeleton + layered-pack
+    // builds below are fast (a fresh --mirror clone has none). Best-effort.
+    let cg_dir = mirror_dir.clone();
+    let _ = tokio::task::spawn_blocking(move || git::write_commit_graph(&cg_dir)).await;
+    info!("sync phase: commit-graph {:?}", t.elapsed());
+    t = Instant::now();
+
     info!("building artifacts for {}", &commit[..7]);
+
+    // Two-phase publish: build + publish the depth=1 clonepack now, build full
+    // history in the background. Removes the dominant history-deltification cost
+    // from "time to clonable".
+    if two_phase_enabled() {
+        return build_and_publish_two_phase(
+            cas,
+            &mirror_dir,
+            owner,
+            repo,
+            branch,
+            &commit,
+            parent,
+            &default_branch,
+            ref_store,
+            storage,
+            retention,
+            t_total,
+        )
+        .await;
+    }
 
     // Full-history skeleton pack + idx.
     let mirror_dir2 = mirror_dir.clone();
     let cas2 = cas.clone();
     let commit2 = commit.clone();
     let skeleton_handle = tokio::task::spawn_blocking(move || {
+        let s = Instant::now();
         let builder = PackBuilder::new(&mirror_dir2, &cas2);
-        builder.build_skeleton_pack(&commit2)
+        let r = builder.build_skeleton_pack(&commit2);
+        info!("build task: full skeleton {:?}", s.elapsed());
+        r
     });
 
     // Shallow depth=1 skeleton pack + idx.
@@ -1845,8 +2069,9 @@ async fn do_sync(
     let commit3 = commit.clone();
     let sealed_tip3 = sealed_tip.clone();
     let depth_packs_handle = tokio::task::spawn_blocking(move || -> Result<DepthBuild> {
+        let s = Instant::now();
         let builder = PackBuilder::new(&mirror_dir3, &cas3);
-        if lsm {
+        let r = if lsm {
             // LSM: build only the tail (HEAD closure + objects since last seal).
             let inc = builder.build_incremental_packs(
                 &commit3,
@@ -1854,16 +2079,18 @@ async fn do_sync(
                 pack_target_raw,
                 history_target_raw,
             )?;
-            Ok(DepthBuild::Lsm(inc))
+            DepthBuild::Lsm(inc)
         } else {
             // Default: small HEAD-closure packs + few large full-history packs.
             let (head_packs, history_packs) =
                 builder.build_layered_packs(&commit3, pack_target_raw, history_target_raw)?;
-            Ok(DepthBuild::Full {
+            DepthBuild::Full {
                 head_packs,
                 history_packs,
-            })
-        }
+            }
+        };
+        info!("build task: depth packs (head+history) {:?}", s.elapsed());
+        Ok(r)
     });
 
     // Working-tree archive + manifest.
@@ -1871,8 +2098,11 @@ async fn do_sync(
     let cas4 = cas.clone();
     let commit4 = commit.clone();
     let archive_handle = tokio::task::spawn_blocking(move || {
+        let s = Instant::now();
         let builder = ArchiveBuilder::new(&mirror_dir4);
-        builder.build_into_cas(&commit4, &cas4, 6, None)
+        let r = builder.build_into_cas(&commit4, &cas4, 6, None);
+        info!("build task: working-tree archive {:?}", s.elapsed());
+        r
     });
 
     let (skeleton_pack, skeleton_idx) =
@@ -1883,6 +2113,11 @@ async fn do_sync(
     let depth_build = depth_packs_handle.await.context("depth packs task")??;
     let (archive_chunk_hashes, mut metadata_chunk) =
         archive_handle.await.context("archive task")??;
+    info!(
+        "sync phase: build skeletons+packs+archive {:?}",
+        t.elapsed()
+    );
+    t = Instant::now();
 
     // Resolve the build into:
     // - head_packs:        undeltified HEAD-closure packs (worktree source).
@@ -1965,6 +2200,8 @@ async fn do_sync(
     let shallow_prebuilt_index = shallow_prebuilt_index_handle
         .await
         .context("shallow prebuilt index task")??;
+    info!("sync phase: prebuilt indexes {:?}", t.elapsed());
+    t = Instant::now();
 
     // Assemble the full-history metadata chunk with the small .git artifacts and
     // the frame/file tables. The head-blobs pack is kept as its own artifact
@@ -2195,6 +2432,7 @@ async fn do_sync(
             prebuilt_index: prebuilt_index.clone(),
             midx: full_midx_hash.clone(),
             idx_bundle: full_idx_bundle_hash.clone(),
+            commit: commit.clone(),
         },
         shallow_clonepack: crate::ClonepackArtifacts {
             manifest: shallow_clonepack_hash.clone(),
@@ -2204,6 +2442,7 @@ async fn do_sync(
             prebuilt_index: shallow_prebuilt_index.clone(),
             midx: head_midx_hash.clone(),
             idx_bundle: head_idx_bundle_hash.clone(),
+            commit: commit.clone(),
         },
         history_levels: new_levels,
         build_status: None,
@@ -2238,14 +2477,49 @@ async fn do_sync(
     artifact_hashes.extend(info.archive_chunks.iter().map(|s| s.as_str()));
     // The editable depth packs + their idxs.
     artifact_hashes.extend(depth_pack_hashes.iter().map(|s| s.as_str()));
-    for hash in artifact_hashes.iter().filter(|h| !h.is_empty()) {
-        let data = cas
-            .get(hash)
-            .with_context(|| format!("read artifact {} from CAS for upload", hash))?;
-        storage
-            .put(hash, &data)
-            .with_context(|| format!("upload artifact {} to storage", hash))?;
-    }
+    info!(
+        "sync phase: assemble metadata/idx-bundles/midx/manifests {:?}",
+        t.elapsed()
+    );
+    t = Instant::now();
+    // Upload with bounded concurrency instead of one-at-a-time. Each put is a
+    // blocking S3 call, so run them on the blocking pool; ~400 MB of serial
+    // wall-clock collapses to roughly bandwidth-bound.
+    let upload_hashes: Vec<String> = artifact_hashes
+        .iter()
+        .filter(|h| !h.is_empty())
+        .map(|h| h.to_string())
+        .collect();
+    let upload_count = upload_hashes.len();
+    let upload_conc: usize = std::env::var("RIPCLONE_UPLOAD_CONCURRENCY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(16)
+        .max(1);
+    futures::stream::iter(upload_hashes.into_iter().map(|hash| {
+        let cas = cas.clone();
+        let storage = storage.clone();
+        async move {
+            tokio::task::spawn_blocking(move || {
+                let data = cas
+                    .get(&hash)
+                    .with_context(|| format!("read artifact {} from CAS for upload", hash))?;
+                storage
+                    .put(&hash, &data)
+                    .with_context(|| format!("upload artifact {} to storage", hash))
+            })
+            .await
+            .context("upload task")?
+        }
+    }))
+    .buffer_unordered(upload_conc)
+    .try_collect::<Vec<()>>()
+    .await?;
+    info!(
+        "sync phase: upload {} artifacts {:?}",
+        upload_count,
+        t.elapsed()
+    );
 
     if storage.is_remote() {
         // Object storage is now the source of truth and clients read straight
@@ -2301,8 +2575,382 @@ async fn do_sync(
         .await
         .with_context(|| format!("persist ref store for {owner}/{repo}@{branch}"))?;
 
-    info!("synced {}/{} at {}", owner, repo, &commit[..7]);
+    info!(
+        "synced {}/{} at {} (total build {:?})",
+        owner,
+        repo,
+        &commit[..7],
+        t_total.elapsed()
+    );
     Ok(info)
+}
+
+fn pack_artifacts_of(packs: &[(String, u64, String, u64)]) -> Vec<crate::PackArtifact> {
+    packs
+        .iter()
+        .map(|(p, _, i, _)| crate::PackArtifact {
+            pack: p.clone(),
+            idx: i.clone(),
+        })
+        .collect()
+}
+
+/// Two-phase publish. Phase 1 (foreground) builds + publishes the depth=1
+/// clonepack and returns; phase 2 (background) builds full history and upgrades
+/// the full clonepack. depth=0 keeps serving the previous commit until phase 2
+/// finishes (option A — never fails, briefly one commit stale).
+#[allow(clippy::too_many_arguments)]
+async fn build_and_publish_two_phase(
+    cas: &Cas,
+    mirror_dir: &std::path::Path,
+    owner: &str,
+    repo: &str,
+    branch: &str,
+    commit: &str,
+    parent: Option<String>,
+    default_branch: &str,
+    ref_store: &Arc<dyn RefStore>,
+    storage: &crate::storage::StorageRef,
+    retention: &Arc<Retention>,
+    t_total: Instant,
+) -> Result<RefInfo> {
+    let head_target = env_bytes("RIPCLONE_PACK_BYTES", 12 * 1024 * 1024);
+    let history_target = env_bytes("RIPCLONE_HISTORY_PACK_BYTES", 512 * 1024 * 1024);
+    let upload_conc = env_bytes("RIPCLONE_UPLOAD_CONCURRENCY", 16) as usize;
+
+    // ---- PHASE 1: HEAD closure + archive + shallow skeleton -> publish depth=1 ----
+    let mut t = Instant::now();
+    let (md1, c1, cm1) = (mirror_dir.to_path_buf(), cas.clone(), commit.to_string());
+    let shallow_skeleton_handle = tokio::task::spawn_blocking(move || {
+        PackBuilder::new(&md1, &c1).build_shallow_skeleton_pack(&cm1)
+    });
+    let (md2, c2, cm2) = (mirror_dir.to_path_buf(), cas.clone(), commit.to_string());
+    let head_handle = tokio::task::spawn_blocking(move || {
+        PackBuilder::new(&md2, &c2).build_head_packs(&cm2, head_target)
+    });
+    let (md3, c3, cm3) = (mirror_dir.to_path_buf(), cas.clone(), commit.to_string());
+    let archive_handle = tokio::task::spawn_blocking(move || {
+        ArchiveBuilder::new(&md3).build_into_cas(&cm3, &c3, 6, None)
+    });
+    let (shallow_skeleton_pack, shallow_skeleton_idx) = shallow_skeleton_handle
+        .await
+        .context("shallow skeleton")??;
+    let head_packs = head_handle.await.context("head packs")??;
+    let (archive_chunk_hashes, metadata_base) = archive_handle.await.context("archive")??;
+    info!(
+        "two-phase p1: head+shallow-skeleton+archive {:?}",
+        t.elapsed()
+    );
+    t = Instant::now();
+
+    let (md4, c4, cm4, skp) = (
+        mirror_dir.to_path_buf(),
+        cas.clone(),
+        commit.to_string(),
+        shallow_skeleton_pack.clone(),
+    );
+    let shallow_prebuilt_index = tokio::task::spawn_blocking(move || {
+        PackBuilder::new(&md4, &c4).build_prebuilt_index(&cm4, &skp)
+    })
+    .await
+    .context("shallow prebuilt index")??;
+
+    let mut shallow_meta = metadata_base.clone();
+    shallow_meta.skeleton_pack = cas.get(&shallow_skeleton_pack)?;
+    shallow_meta.skeleton_idx = cas.get(&shallow_skeleton_idx)?;
+    shallow_meta.prebuilt_index = cas.get(&shallow_prebuilt_index)?;
+    let shallow_meta_data = shallow_meta.encode_to_vec();
+    let shallow_metadata_hash = cas.put(&shallow_meta_data)?;
+
+    let archive_chunks = archive_chunk_refs(&archive_chunk_hashes, &metadata_base)?;
+    let head_tagged: Vec<(&(String, u64, String, u64), bool)> =
+        head_packs.iter().map(|p| (p, false)).collect();
+    let (head_entries, head_idx_bundle_ref, head_idx_bundle_hash) =
+        assemble_variant(cas, storage, &head_tagged)?;
+    let (head_midx_ref, head_midx_hash) = assemble_midx(cas, &head_packs)?;
+
+    let shallow_manifest = make_manifest(
+        commit,
+        &parent,
+        default_branch,
+        &archive_chunks,
+        &shallow_metadata_hash,
+        shallow_meta_data.len() as u64,
+        head_entries,
+        head_midx_ref,
+        head_idx_bundle_ref,
+    )?;
+    let shallow_clonepack_hash = cas.put(&shallow_manifest.encode_to_vec())?;
+
+    // Option A: carry the previous commit's full clonepack so depth=0 keeps
+    // working (one commit stale) until phase 2 publishes the new full.
+    let prev = ref_store
+        .load_branch(owner, repo, branch)
+        .await
+        .ok()
+        .flatten();
+    let carried_full = prev
+        .as_ref()
+        .map(|p| p.full_clonepack.clone())
+        .unwrap_or_default();
+    let carried_full_manifest = prev
+        .as_ref()
+        .map(|p| p.clonepack_manifest.clone())
+        .unwrap_or_default();
+    let carried_full_pack = prev
+        .as_ref()
+        .map(|p| p.full_pack.clone())
+        .unwrap_or_default();
+    let carried_levels = prev
+        .as_ref()
+        .map(|p| p.history_levels.clone())
+        .unwrap_or_default();
+
+    let info = RefInfo {
+        commit: commit.to_string(),
+        parent_commit: parent.clone(),
+        default_branch: default_branch.to_string(),
+        skeleton_pack: shallow_skeleton_pack.clone(),
+        skeleton_idx: shallow_skeleton_idx.clone(),
+        head_blobs_pack: String::new(),
+        head_blobs_idx: String::new(),
+        head_blobs_chunks: Vec::new(),
+        packs: pack_artifacts_of(&head_packs),
+        prebuilt_index: shallow_prebuilt_index.clone(),
+        archive: archive_chunk_hashes.first().cloned().unwrap_or_default(),
+        manifest: shallow_metadata_hash.clone(),
+        full_pack: carried_full_pack,
+        clonepack_manifest: carried_full_manifest,
+        metadata_chunk: shallow_metadata_hash.clone(),
+        archive_chunks: archive_chunk_hashes.clone(),
+        full_clonepack: carried_full,
+        shallow_clonepack: crate::ClonepackArtifacts {
+            manifest: shallow_clonepack_hash.clone(),
+            metadata_chunk: shallow_metadata_hash.clone(),
+            skeleton_pack: shallow_skeleton_pack.clone(),
+            skeleton_idx: shallow_skeleton_idx.clone(),
+            prebuilt_index: shallow_prebuilt_index.clone(),
+            midx: head_midx_hash.clone(),
+            idx_bundle: head_idx_bundle_hash.clone(),
+            commit: commit.to_string(),
+        },
+        history_levels: carried_levels,
+        build_status: Some("full history building".to_string()),
+        synced_at: SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_secs()),
+    };
+
+    // Upload phase-1 artifacts (head packs+idx, shallow skeleton/index/metadata,
+    // archive chunks, head idx-bundle + midx, shallow manifest).
+    let mut p1: Vec<String> = vec![
+        shallow_skeleton_pack.clone(),
+        shallow_skeleton_idx.clone(),
+        shallow_prebuilt_index.clone(),
+        shallow_metadata_hash.clone(),
+        shallow_clonepack_hash.clone(),
+        head_idx_bundle_hash.clone(),
+        head_midx_hash.clone(),
+    ];
+    p1.extend(archive_chunk_hashes.iter().cloned());
+    for (p, _, i, _) in &head_packs {
+        p1.push(p.clone());
+        p1.push(i.clone());
+    }
+    p1.retain(|h| !h.is_empty());
+    let head_idx_keep: std::collections::HashSet<String> =
+        head_packs.iter().map(|(_, _, ih, _)| ih.clone()).collect();
+    upload_artifacts(cas, storage, p1.clone(), upload_conc).await?;
+    settle_storage(cas, storage, retention, p1, head_idx_keep).await;
+
+    ref_store
+        .save_branch(owner, repo, branch, &info)
+        .await
+        .with_context(|| format!("persist depth=1 ref for {owner}/{repo}@{branch}"))?;
+    info!(
+        "two-phase p1: published depth=1 for {} in {:?} (full history building in background)",
+        &commit[..7.min(commit.len())],
+        t_total.elapsed()
+    );
+    let _ = t; // p1 assemble/upload time folded into the total above
+
+    // ---- PHASE 2: full history, in the background (survives the request) ----
+    let cas2 = cas.clone();
+    let storage2 = storage.clone();
+    let ref_store2 = ref_store.clone();
+    let retention2 = retention.clone();
+    let mirror2 = mirror_dir.to_path_buf();
+    let (owner2, repo2, branch2) = (owner.to_string(), repo.to_string(), branch.to_string());
+    let commit2 = commit.to_string();
+    let parent2 = parent.clone();
+    let default_branch2 = default_branch.to_string();
+    tokio::spawn(async move {
+        let started = Instant::now();
+        let res = build_full_in_background(
+            &cas2,
+            &mirror2,
+            &owner2,
+            &repo2,
+            &branch2,
+            &commit2,
+            parent2,
+            &default_branch2,
+            &ref_store2,
+            &storage2,
+            &retention2,
+            head_packs,
+            archive_chunk_hashes,
+            metadata_base,
+            head_idx_bundle_hash,
+            head_midx_hash,
+            history_target,
+            upload_conc,
+        )
+        .await;
+        match res {
+            Ok(()) => info!(
+                "two-phase p2: published full history for {} in {:?}",
+                &commit2[..7.min(commit2.len())],
+                started.elapsed()
+            ),
+            Err(e) => error!("two-phase p2: full history build failed for {owner2}/{repo2}: {e:#}"),
+        }
+    });
+
+    Ok(info)
+}
+
+/// Phase 2 of two-phase publish: build the full-history artifacts and upgrade
+/// the ref's full clonepack. The depth=1 clonepack is already live.
+#[allow(clippy::too_many_arguments)]
+async fn build_full_in_background(
+    cas: &Cas,
+    mirror_dir: &std::path::Path,
+    owner: &str,
+    repo: &str,
+    branch: &str,
+    commit: &str,
+    parent: Option<String>,
+    default_branch: &str,
+    ref_store: &Arc<dyn RefStore>,
+    storage: &crate::storage::StorageRef,
+    retention: &Arc<Retention>,
+    head_packs: Vec<(String, u64, String, u64)>,
+    archive_chunk_hashes: Vec<String>,
+    metadata_base: crate::clonepack::MetadataChunk,
+    _head_idx_bundle_hash: String,
+    _head_midx_hash: String,
+    history_target: u64,
+    upload_conc: usize,
+) -> Result<()> {
+    // Full skeleton + history packs (the expensive part), concurrently.
+    let (md1, c1, cm1) = (mirror_dir.to_path_buf(), cas.clone(), commit.to_string());
+    let skeleton_handle =
+        tokio::task::spawn_blocking(move || PackBuilder::new(&md1, &c1).build_skeleton_pack(&cm1));
+    let (md2, c2, cm2) = (mirror_dir.to_path_buf(), cas.clone(), commit.to_string());
+    let history_handle = tokio::task::spawn_blocking(move || {
+        PackBuilder::new(&md2, &c2).build_history_packs(&cm2, history_target)
+    });
+    let (skeleton_pack, skeleton_idx) = skeleton_handle.await.context("full skeleton")??;
+    let history_packs = history_handle.await.context("history packs")??;
+
+    let (md3, c3, cm3, skp) = (
+        mirror_dir.to_path_buf(),
+        cas.clone(),
+        commit.to_string(),
+        skeleton_pack.clone(),
+    );
+    let prebuilt_index = tokio::task::spawn_blocking(move || {
+        PackBuilder::new(&md3, &c3).build_prebuilt_index(&cm3, &skp)
+    })
+    .await
+    .context("full prebuilt index")??;
+
+    let mut full_meta = metadata_base;
+    full_meta.skeleton_pack = cas.get(&skeleton_pack)?;
+    full_meta.skeleton_idx = cas.get(&skeleton_idx)?;
+    full_meta.prebuilt_index = cas.get(&prebuilt_index)?;
+    let full_meta_data = full_meta.encode_to_vec();
+    let metadata_hash = cas.put(&full_meta_data)?;
+
+    let archive_chunks = archive_chunk_refs(&archive_chunk_hashes, &full_meta)?;
+    // Full variant entries + idx-bundle (head idx is kept local, history is fresh).
+    let full_tagged: Vec<(&(String, u64, String, u64), bool)> = head_packs
+        .iter()
+        .map(|p| (p, false))
+        .chain(history_packs.iter().map(|p| (p, true)))
+        .collect();
+    let (full_entries, full_idx_bundle_ref, full_idx_bundle_hash) =
+        assemble_variant(cas, storage, &full_tagged)?;
+    // Full MIDX is omitted: head packs were evicted after phase 1, so it can't be
+    // built without re-fetching them. The client builds the full MIDX itself.
+    let full_manifest = make_manifest(
+        commit,
+        &parent,
+        default_branch,
+        &archive_chunks,
+        &metadata_hash,
+        full_meta_data.len() as u64,
+        full_entries,
+        None,
+        full_idx_bundle_ref,
+    )?;
+    let full_clonepack_hash = cas.put(&full_manifest.encode_to_vec())?;
+
+    // Upload phase-2 artifacts (history packs+idx, full skeleton/index/metadata,
+    // full idx-bundle, full manifest). Head packs are already in storage.
+    let mut p2: Vec<String> = vec![
+        skeleton_pack.clone(),
+        skeleton_idx.clone(),
+        prebuilt_index.clone(),
+        metadata_hash.clone(),
+        full_clonepack_hash.clone(),
+        full_idx_bundle_hash.clone(),
+    ];
+    for (p, _, i, _) in &history_packs {
+        p2.push(p.clone());
+        p2.push(i.clone());
+    }
+    p2.retain(|h| !h.is_empty());
+    let hist_idx_keep: std::collections::HashSet<String> = history_packs
+        .iter()
+        .map(|(_, _, ih, _)| ih.clone())
+        .collect();
+    upload_artifacts(cas, storage, p2.clone(), upload_conc).await?;
+
+    // Upgrade the ref's full clonepack (preserve the live depth=1 clonepack).
+    let mut info = ref_store
+        .load_branch(owner, repo, branch)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("ref vanished before phase 2"))?;
+    let mut all_packs = head_packs.clone();
+    all_packs.extend(history_packs.iter().cloned());
+    info.packs = pack_artifacts_of(&all_packs);
+    info.skeleton_pack = skeleton_pack.clone();
+    info.skeleton_idx = skeleton_idx.clone();
+    info.prebuilt_index = prebuilt_index.clone();
+    info.metadata_chunk = metadata_hash.clone();
+    info.manifest = metadata_hash.clone();
+    info.clonepack_manifest = full_clonepack_hash.clone();
+    info.full_clonepack = crate::ClonepackArtifacts {
+        manifest: full_clonepack_hash.clone(),
+        metadata_chunk: metadata_hash.clone(),
+        skeleton_pack: skeleton_pack.clone(),
+        skeleton_idx: skeleton_idx.clone(),
+        prebuilt_index: prebuilt_index.clone(),
+        midx: String::new(),
+        idx_bundle: full_idx_bundle_hash.clone(),
+        commit: commit.to_string(),
+    };
+    info.build_status = None;
+    ref_store
+        .save_branch(owner, repo, branch, &info)
+        .await
+        .with_context(|| format!("persist full ref for {owner}/{repo}@{branch}"))?;
+
+    settle_storage(cas, storage, retention, p2, hist_idx_keep).await;
+    Ok(())
 }
 
 fn spawn_build_worker(state: ServerState) -> tokio::sync::mpsc::Sender<BuildJob> {
@@ -2740,6 +3388,7 @@ mod tests {
                 prebuilt_index: String::new(),
                 midx: String::new(),
                 idx_bundle: String::new(),
+                commit: String::new(),
             },
             shallow_clonepack: crate::ClonepackArtifacts::default(),
             history_levels: Vec::new(),
@@ -2825,6 +3474,7 @@ mod tests {
                 prebuilt_index: String::new(),
                 midx: String::new(),
                 idx_bundle: String::new(),
+                commit: String::new(),
             },
             shallow_clonepack: crate::ClonepackArtifacts::default(),
             history_levels: Vec::new(),

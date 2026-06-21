@@ -15,8 +15,8 @@ primary_region = 'iad'
   processes = ['app']
 
 [[vm]]
-  size = 'shared-cpu-4x'
-  memory = '2gb'
+  size = 'shared-cpu-8x'
+  memory = '8gb'
 
 [env]
   # Git pack-objects creates temp packs in TMPDIR and renames them into the

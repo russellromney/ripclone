@@ -258,6 +258,47 @@ impl<'a> PackBuilder<'a> {
         Ok((head_packs, history_packs))
     }
 
+    /// Build just the HEAD closure (undeltified small packs) — the depth=1
+    /// payload. Used by two-phase publish to get a clonable depth=1 fast, before
+    /// the (slow) history packs are built.
+    pub fn build_head_packs(
+        &self,
+        commit: &str,
+        head_target_raw_bytes: u64,
+    ) -> Result<Vec<(String, u64, String, u64)>> {
+        let head_oids = git::list_object_shas_with_depth(&self.repo, commit, Some(1))?;
+        if head_oids.is_empty() {
+            bail!("no objects to pack for {}", commit);
+        }
+        Ok(self
+            .build_packs_from_oids(&head_oids, head_target_raw_bytes, true)?
+            .0)
+    }
+
+    /// Build just the history packs (deltified, everything reachable from
+    /// `commit` minus the HEAD closure). Used by two-phase publish in the
+    /// background after the depth=1 clonepack is already published.
+    pub fn build_history_packs(
+        &self,
+        commit: &str,
+        history_target_raw_bytes: u64,
+    ) -> Result<Vec<(String, u64, String, u64)>> {
+        use std::collections::HashSet;
+        let head_oids = git::list_object_shas_with_depth(&self.repo, commit, Some(1))?;
+        let head_set: HashSet<&str> = head_oids.iter().map(String::as_str).collect();
+        let all_oids = git::list_object_shas_with_depth(&self.repo, commit, None)?;
+        let history_oids: Vec<String> = all_oids
+            .into_iter()
+            .filter(|o| !head_set.contains(o.as_str()))
+            .collect();
+        if history_oids.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(self
+            .build_packs_from_oids(&history_oids, history_target_raw_bytes, false)?
+            .0)
+    }
+
     /// LSM incremental build. Packs the HEAD closure (undeltified, for the
     /// worktree) and the *tail* — the objects introduced in `(sealed_tip, commit]`
     /// (deltified, for the object DB). When `sealed_tip` is `None` the tail is the
