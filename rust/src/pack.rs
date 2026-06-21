@@ -165,7 +165,8 @@ impl<'a> PackBuilder<'a> {
         depth: Option<usize>,
     ) -> Result<(String, String)> {
         let object_shas = git::list_object_shas_with_depth(&self.repo, commit, depth)?;
-        self.pack_and_index_inner(&object_shas, true)
+        let (ph, _, ih, _) = self.pack_and_index_inner(&object_shas, true)?;
+        Ok((ph, ih))
     }
 
     /// Build the depth content as many small, self-contained git packs, each
@@ -203,10 +204,20 @@ impl<'a> PackBuilder<'a> {
     /// `history` is empty for a single-commit repo. Note: `history` is only as
     /// complete as the mirror's available history (deepen/unshallow the mirror
     /// for a true full clone).
+    /// Build the two pack buckets for `commit`:
+    /// - HEAD closure: undeltified, partitioned at `head_target_raw_bytes` into
+    ///   many small packs the client downloads in parallel and hand-parses.
+    /// - History (everything else): deltified, partitioned at the much larger
+    ///   `history_target_raw_bytes` into a *handful* of packs. The client only
+    ///   installs these (git reads them), so they must be few and large — using
+    ///   the small HEAD target here would explode a big repo into ~1k packs and
+    ///   ~1k `git pack-objects` spawns (observed: bun = 6.2 GiB raw → 1058 packs,
+    ///   26-minute build).
     pub fn build_layered_packs(
         &self,
         commit: &str,
-        target_raw_bytes: u64,
+        head_target_raw_bytes: u64,
+        history_target_raw_bytes: u64,
     ) -> Result<(
         Vec<(String, u64, String, u64)>,
         Vec<(String, u64, String, u64)>,
@@ -225,14 +236,15 @@ impl<'a> PackBuilder<'a> {
 
         // HEAD closure: undeltified so the client can hand-parse blobs straight
         // from the downloaded bytes for the working tree.
-        let head_packs = self.build_packs_from_oids(&head_oids, target_raw_bytes, true)?;
+        let head_packs = self.build_packs_from_oids(&head_oids, head_target_raw_bytes, true)?;
         // History: deltified (undeltified history is multi-GB). The client never
         // hand-parses these — they're only installed for the object DB and git
-        // reads them, resolving deltas itself.
+        // reads them, resolving deltas itself. Few large packs, not many small
+        // ones.
         let history_packs = if history_oids.is_empty() {
             Vec::new()
         } else {
-            self.build_packs_from_oids(&history_oids, target_raw_bytes, false)?
+            self.build_packs_from_oids(&history_oids, history_target_raw_bytes, false)?
         };
         Ok((head_packs, history_packs))
     }
@@ -276,23 +288,26 @@ impl<'a> PackBuilder<'a> {
             // can hand-parse blobs from the bytes (HEAD closure). Deltified packs
             // are compact and only installed for the object DB (history); git
             // resolves their deltas. Each pack is self-contained (non-thin).
-            let (pack_hash, idx_hash) = self.pack_and_index_inner(&batch, undeltified)?;
-            let pack_len = self.cas.get(&pack_hash)?.len() as u64;
-            let idx_len = self.cas.get(&idx_hash)?.len() as u64;
+            let (pack_hash, pack_len, idx_hash, idx_len) =
+                self.pack_and_index_inner(&batch, undeltified)?;
             packs.push((pack_hash, pack_len, idx_hash, idx_len));
         }
         Ok(packs)
     }
 
     fn pack_and_index(&self, object_shas: &[String]) -> Result<(String, String)> {
-        self.pack_and_index_inner(object_shas, false)
+        let (ph, _, ih, _) = self.pack_and_index_inner(object_shas, false)?;
+        Ok((ph, ih))
     }
 
+    /// Pack `object_shas` and store the pack + idx in the CAS. Returns
+    /// `(pack_hash, pack_len, idx_hash, idx_len)` — the lengths come straight
+    /// from the bytes we already read, so callers never re-`get` from the CAS.
     fn pack_and_index_inner(
         &self,
         object_shas: &[String],
         undeltified: bool,
-    ) -> Result<(String, String)> {
+    ) -> Result<(String, u64, String, u64)> {
         if object_shas.is_empty() {
             bail!("no objects to pack");
         }
@@ -324,9 +339,11 @@ impl<'a> PackBuilder<'a> {
 
         let pack_data = std::fs::read(&pack_path)?;
         let idx_data = std::fs::read(&idx_path)?;
+        let pack_len = pack_data.len() as u64;
+        let idx_len = idx_data.len() as u64;
         let pack_hash = self.cas.put(&pack_data)?;
         let idx_hash = self.cas.put(&idx_data)?;
 
-        Ok((pack_hash, idx_hash))
+        Ok((pack_hash, pack_len, idx_hash, idx_len))
     }
 }

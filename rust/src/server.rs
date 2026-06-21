@@ -1742,13 +1742,21 @@ async fn do_sync(
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(6 * 1024 * 1024);
+    // History packs are install-only (git reads them; the client never
+    // hand-parses), so they must be FEW and LARGE — using the small HEAD target
+    // explodes a big repo into ~1k packs/spawns. Default 256 MiB raw per pack.
+    let history_target_raw: u64 = std::env::var("RIPCLONE_HISTORY_PACK_BYTES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(256 * 1024 * 1024);
     let mirror_dir3 = mirror_dir.clone();
     let cas3 = cas.clone();
     let commit3 = commit.clone();
     let depth_packs_handle = tokio::task::spawn_blocking(move || {
         let builder = PackBuilder::new(&mirror_dir3, &cas3);
-        // Two layers: HEAD-closure packs (every depth) + history packs (full only).
-        builder.build_layered_packs(&commit3, pack_target_raw)
+        // Two layers: small HEAD-closure packs (every depth) + few large history
+        // packs (full only).
+        builder.build_layered_packs(&commit3, pack_target_raw, history_target_raw)
     });
 
     // Working-tree archive + manifest.
