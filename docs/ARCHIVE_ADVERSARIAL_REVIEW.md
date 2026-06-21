@@ -117,10 +117,10 @@ parallel decompression.
 **Fix:** Two passes:
 - macOS / general: parallel POSIX file writes + single-syscall file creation
   (mode set in `open()`). Extraction on bun dropped from ~4 s to ~2.2 s.
-- Linux: added an io_uring code path that batches `open/write/close` syscalls
-  in kernel space, with up to 256 in-flight operations. This path is
-  conditionally compiled and untested on macOS but should be significantly
-  faster on Linux.
+- Linux: added an opt-in io_uring worktree writer. The first implementation was
+  slower than POSIX for Bun's many-small-files workload on Fly volumes, so the
+  default remains POSIX and io_uring is currently an experimental fast path
+  enabled with `RIPCLONE_IO_URING=1` or probed with `RIPCLONE_IO_URING=auto`.
 
 ## Residual limitations
 
