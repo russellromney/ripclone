@@ -9,6 +9,17 @@ pub struct PackBuilder<'a> {
     cas: &'a Cas,
 }
 
+/// Result of an LSM incremental build. Each pack is `(pack_hash, pack_len,
+/// idx_hash, idx_len)`.
+pub struct IncrementalPacks {
+    /// Undeltified HEAD-closure packs (the worktree source).
+    pub head_packs: Vec<(String, u64, String, u64)>,
+    /// Deltified packs for the new commit range since the last sealed level.
+    pub tail_packs: Vec<(String, u64, String, u64)>,
+    /// Total raw (uncompressed) size of the tail objects, for sealing decisions.
+    pub tail_raw_bytes: u64,
+}
+
 impl<'a> PackBuilder<'a> {
     pub fn new<P: AsRef<Path>>(repo: P, cas: &'a Cas) -> Self {
         Self {
@@ -187,7 +198,7 @@ impl<'a> PackBuilder<'a> {
         if oids.is_empty() {
             bail!("no objects to pack for {}", commit);
         }
-        self.build_packs_from_oids(&oids, target_raw_bytes, true)
+        Ok(self.build_packs_from_oids(&oids, target_raw_bytes, true)?.0)
     }
 
     /// Build the depth content as two layers of mini-packs:
@@ -236,7 +247,7 @@ impl<'a> PackBuilder<'a> {
 
         // HEAD closure: undeltified so the client can hand-parse blobs straight
         // from the downloaded bytes for the working tree.
-        let head_packs = self.build_packs_from_oids(&head_oids, head_target_raw_bytes, true)?;
+        let (head_packs, _) = self.build_packs_from_oids(&head_oids, head_target_raw_bytes, true)?;
         // History: deltified (undeltified history is multi-GB). The client never
         // hand-parses these — they're only installed for the object DB and git
         // reads them, resolving deltas itself. Few large packs, not many small
@@ -245,23 +256,64 @@ impl<'a> PackBuilder<'a> {
             Vec::new()
         } else {
             self.build_packs_from_oids(&history_oids, history_target_raw_bytes, false)?
+                .0
         };
         Ok((head_packs, history_packs))
     }
 
+    /// LSM incremental build. Packs the HEAD closure (undeltified, for the
+    /// worktree) and the *tail* — the objects introduced in `(sealed_tip, commit]`
+    /// (deltified, for the object DB). When `sealed_tip` is `None` the tail is the
+    /// whole history.
+    ///
+    /// Unlike [`build_layered_packs`], the tail is NOT reduced by the HEAD closure:
+    /// a sealed level must hold the full range so it stays correct as an immutable
+    /// artifact even after the HEAD closure changes in later syncs. Current blobs
+    /// therefore appear in both the (undeltified) HEAD packs and the (deltified)
+    /// history packs; git dedups by OID on read. Returns the tail's total raw size
+    /// so the caller can decide whether to seal it into a new level.
+    pub fn build_incremental_packs(
+        &self,
+        commit: &str,
+        sealed_tip: Option<&str>,
+        head_target_raw_bytes: u64,
+        history_target_raw_bytes: u64,
+    ) -> Result<IncrementalPacks> {
+        let head_oids = git::list_object_shas_with_depth(&self.repo, commit, Some(1))?;
+        if head_oids.is_empty() {
+            bail!("no objects to pack for {}", commit);
+        }
+        let tail_oids = git::list_object_shas_in_range(&self.repo, sealed_tip, commit)?;
+
+        let (head_packs, _) = self.build_packs_from_oids(&head_oids, head_target_raw_bytes, true)?;
+        let (tail_packs, tail_raw_bytes) = if tail_oids.is_empty() {
+            (Vec::new(), 0)
+        } else {
+            self.build_packs_from_oids(&tail_oids, history_target_raw_bytes, false)?
+        };
+        Ok(IncrementalPacks {
+            head_packs,
+            tail_packs,
+            tail_raw_bytes,
+        })
+    }
+
     /// Partition `oids` greedily by raw size into `~target_raw_bytes` batches and
-    /// pack each as a self-contained, undeltified (`--window=0`) mini-pack.
-    /// Returns `(pack_hash, pack_len, idx_hash, idx_len)` per pack.
+    /// pack each as a self-contained mini-pack. Returns the per-pack
+    /// `(pack_hash, pack_len, idx_hash, idx_len)` tuples plus the total raw
+    /// (uncompressed) size of all `oids` (so callers can make sealing decisions
+    /// without a second `object_sizes` pass).
     fn build_packs_from_oids(
         &self,
         oids: &[String],
         target_raw_bytes: u64,
         undeltified: bool,
-    ) -> Result<Vec<(String, u64, String, u64)>> {
+    ) -> Result<(Vec<(String, u64, String, u64)>, u64)> {
         if oids.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0));
         }
         let sizes = git::object_sizes(&self.repo, oids)?;
+        let total_raw: u64 = oids.iter().map(|o| sizes.get(o).copied().unwrap_or(0)).sum();
 
         // Greedy size-based partitioning. A single object larger than the target
         // gets its own pack (we can't split one object across packs).
@@ -292,7 +344,7 @@ impl<'a> PackBuilder<'a> {
                 self.pack_and_index_inner(&batch, undeltified)?;
             packs.push((pack_hash, pack_len, idx_hash, idx_len));
         }
-        Ok(packs)
+        Ok((packs, total_raw))
     }
 
     fn pack_and_index(&self, object_shas: &[String]) -> Result<(String, String)> {
