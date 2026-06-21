@@ -213,6 +213,12 @@ pub fn enable_two_phase() {
     O.call_once(|| unsafe { std::env::set_var("RIPCLONE_TWO_PHASE", "1") });
 }
 
+/// Route `/sync` through the bounded background build queue for this test binary.
+pub fn enable_async_build() {
+    static O: Once = Once::new();
+    O.call_once(|| unsafe { std::env::set_var("RIPCLONE_ASYNC_BUILD", "1") });
+}
+
 /// Install (clone) without syncing first — returns Result so callers can retry
 /// (e.g. waiting for two-phase phase 2 to publish the full clonepack).
 pub async fn clone_only(
