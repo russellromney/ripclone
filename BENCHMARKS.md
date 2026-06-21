@@ -55,19 +55,25 @@ case for ripclone and the fairest stress test.
 | depth=1 | 18.1 s | **16.3 s** |
 | full | **90.9 s** | 148.4 s |
 
-- **depth=1 is roughly tied (git slightly ahead).** ripclone's HEAD-closure
-  packs are **undeltified** (zero client CPU to hand-parse) — but that means more
-  bytes on the wire than git's delta-compressed shallow pack. On a fat pipe the
-  no-`index-pack` win dominates; on a slow link the extra bytes swamp it.
-- **full is ~1.6× faster** (fewer bytes: 628 vs 840 MB, plus no server
-  pack-compute / client `index-pack`).
+- **depth=1 is roughly tied (git slightly ahead).** Measured download is nearly
+  identical — ripclone 70.8 MB packs (72.1 MB `.git/objects` incl. idx) vs git
+  69.2 MB (~4% apart). At a single commit there is almost nothing to
+  delta-compress, so the undeltified HEAD closure is barely larger. The tie is
+  **latency, not bytes**: ripclone makes ~70 round-trips (resolve + manifest +
+  34 pack + 34 idx GETs to the server/Tigris) where git does one negotiation +
+  one pack stream. On a fat low-latency pipe those round-trips are nearly free
+  (Fly), so ripclone's no-`index-pack` CPU win shows; on high-latency home wifi
+  the round-trips roughly cancel it.
+- **full is ~1.6× faster** — here it *is* bytes: 628 vs 840 MB (deltified
+  history), plus no server pack-compute / client `index-pack`. That byte gap
+  dwarfs the round-trip overhead, so the win survives the slow link.
 
 **Takeaway:** ripclone's large wins are where git's *server-side* work dominates
-(CI runners, cloud dev boxes, fast/colocated networks — see the Fly numbers
-above, 4×/17×). On a bandwidth-constrained client it's download-bound: still a
-clear win on full, a wash on depth=1. Closing the depth=1 gap on slow links would
-mean a delta-compressed/zstd transport for the head closure (trade a little
-client CPU for fewer bytes), or the `files` zstd-archive mode.
+and round-trips are cheap (CI runners, cloud dev boxes, fast/colocated networks —
+see the Fly numbers above, 4×/17×). On a high-latency client, depth=1 is a wash
+(round-trip-bound) while full still wins (byte-bound). Levers to also win depth=1
+on slow links: fewer requests (a single concatenated head pack, or bundle
+idx into the pack download) rather than 34+34 separate GETs.
 
 ## Why ripclone is faster
 
