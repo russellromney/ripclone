@@ -64,6 +64,67 @@ Goal: drop steady-state sync cost from O(all history) to **O(new commits since l
 - **io_uring** durable-disk worktree writes — orthogonal speedup so `--temp` (ephemeral tmpfs) isn't required for fast durable clones.
 - **Blobless partial clone** (`--filter=blob:none` via a git promisor pointing at the server) — distinct from `files`; a separate project for huge monorepos.
 
+## Cloud integration & cross-repo dedup (planned — `ripclone-cloud` depends on this)
+
+Three things the managed layer needs from this backend. Forks come **first**
+because they change the storage model; the other two are small endpoint additions.
+
+### a. Fork / shared-history dedup (the deep one — do first)
+
+Forks share ~all of their history with the upstream. If the cache namespaces
+storage per repo, a popular repo's fork network stores near-identical packs
+thousands of times — and **object storage is the only real variable cost of the
+service**, so this is the thing that blows up the bill.
+
+The LSM history levels are already content-addressed and "shared across branches
+and live in object storage forever." The work is to extend that sharing **across
+repos in a fork network**:
+
+- **Global CAS, not per-repo.** Sealed levels / page-group chunks are keyed purely
+  by content hash in a store that is global (or at least shared within a fork
+  network), so identical history is stored once. A fork's history becomes
+  `references to the upstream's existing levels + a small tail of its unique
+  commits`. Sync for a fork is then O(unique commits), not O(history).
+- **Authorization on fetch — a content hash must NOT be a bearer capability.**
+  Once chunks are shared across trust boundaries (a private fork sharing history
+  with a public upstream; two private repos that share history), "knows the hash"
+  cannot imply "may fetch the bytes." The serve path must verify the caller is
+  authorized for *some repo whose manifest references this chunk*, then mint a
+  short-lived signed URL for that request. Signed URLs must never be globally
+  guessable or long-lived. This is a security requirement, not an optimization.
+- **No cross-tenant leakage.** Dedup decisions and byte accounting must not let one
+  tenant infer another's private content (e.g. via "this chunk already existed"
+  timing/size oracles). Treat shared-history *existence* as private.
+
+### b. `GET /v1/repos/{owner}/{repo}/status`
+
+One call returning a repo's warm coverage + storage, for the cloud dashboard and
+**storage metering**:
+
+- `refs: [{ branch, commit, bytes_total, bytes_unique }]` — `bytes_unique` =
+  bytes this repo adds that are *not* shared with the commons or other repos (the
+  marginal figure from dedup above).
+- repo totals `{ total_bytes, unique_bytes }`.
+
+Cloud uses `commit` + presence for the warm display, and **`unique_bytes` for
+billing** (customers are billed on marginal storage, so dedup savings pass through
+to them). Until this exists, cloud shows storage as `—` and bills flat per-seat.
+
+### c. Per-branch sync
+
+`POST /v1/repos/{owner}/{repo}/sync` currently builds HEAD only (`SyncRequest`
+has just `depth`). Add `?branch=<name>` so non-default branches can be warmed —
+cloud tracks and warms specific branches per repo.
+
+### Already covered elsewhere
+
+- **Custom clone depth** (a cloud Pro feature) is just UI over **§2a
+  Repo/branch-specific configuration** (`?clonepack=<name>`, configurable
+  `DepthSpec`s) — no new backend work beyond 2a.
+- **Region "boosts"** (a future cloud feature: keep a chosen repo warm in chosen
+  Tigris regions, funded by sponsors) ride the **§5 Fly-region cache warmers** —
+  cloud will need a "warm repo X in region R" request against that mechanism.
+
 ## What already works
 
 See `CHANGELOG.md` for the full list. The important baseline for current work:

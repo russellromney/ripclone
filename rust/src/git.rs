@@ -295,12 +295,19 @@ pub fn list_object_shas_in_range<P: AsRef<Path>>(
     if let Some(f) = from {
         crate::validation::validate_git_rev(f).with_context(|| format!("invalid commit: {}", f))?;
     }
-    // `rev-list --objects <to> --not <from>`: revs before `--not` are included,
-    // revs after are excluded. With no `from`, this is just everything from `to`.
-    let mut args: Vec<&str> = vec!["rev-list", "--objects", "--no-object-names", to];
-    if let Some(f) = from {
-        args.push("--not");
-        args.push(f);
+    // `rev-list --objects <to> ^<from>`: objects reachable from `to` but not from
+    // `from`. The `^<from>` exclude form (rather than `--not`) composes with
+    // `--end-of-options`, so every flag stays before the revs.
+    let exclude = from.map(|f| format!("^{}", f));
+    let mut args: Vec<&str> = vec![
+        "rev-list",
+        "--objects",
+        "--no-object-names",
+        "--end-of-options",
+        to,
+    ];
+    if let Some(e) = exclude.as_deref() {
+        args.push(e);
     }
     let out = run_git(repo, &args)?;
     Ok(out.lines().map(|s| s.to_string()).collect())
