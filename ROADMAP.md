@@ -9,7 +9,7 @@
 We support **exactly three** clone modes — no arbitrary `--depth N` (it's finicky and almost nobody uses it; people pick depth=1 or full). Three content tiers:
 
 - **head** = **`editable --depth 1`** (default): HEAD snapshot, full object DB for HEAD, `.git/shallow` boundary written. The agent/CI hot path. *(done & validated clean)*
-- **full** = **`editable --depth 0`**: HEAD + all history, complete `git fsck`-clean clone, no shallow marker. *(done for small/medium repos; the full-history rebuild is too heavy for huge repos like bun — see LSM below)*
+- **full** = **`editable --depth 0`**: HEAD + all history, complete `git fsck`-clean clone, no shallow marker. *(done — validated on bun: 60 packs, rev-list to root, fsck clean, shipped MIDX verifies)*
 - **worktree** = **`files`**: worktree only, no git objects (zstd archive) — fastest CI path. *(done)*
 
 This collapses the server to **two pack buckets** (no range/geometric depth buckets):
@@ -30,8 +30,8 @@ depth=1 clonepack lists HEAD-closure packs; full lists HEAD + history. The depth
 2. **Always-full mirror** so depth=0 is a true, fsck-clean full clone. Drop the `--depth 50` default; unshallow existing mirrors. *(done — validated on sharkdp/hyperfine: rev-list to root, fsck clean, no shallow marker)*
 3. **Server-pregenerate + ship MIDX** (head + full) as a content-addressed artifact the client drops in (signed `midx_url`); the client falls back to building locally only for older manifests. *(done — `git multi-pack-index verify` passes on the server-built MIDX)*
 
-### Known scaling limit
-The full (depth=0) build **rebuilds the entire deltified history on every sync**, partitioned into mini-packs. For a huge repo (bun, ~30k commits) this OOMs/times out on a 2 GB server (observed: `sync failed:` after 26 min; the stale ref was served instead). depth=1 and files are unaffected. Mitigations, in order: bigger build VM, then the **LSM incremental build** below so full history is built once and appended to, not rebuilt.
+### Known scaling cost
+The full (depth=0) build **rebuilds the entire deltified history on every sync**. This is now fast enough — bun (15.7k commits, 6.2 GiB raw) builds in ~2 min on a 2 GB server after history packs were given their own large target (`RIPCLONE_HISTORY_PACK_BYTES`, default 256 MiB raw; previously the 6 MB HEAD target exploded it into 1058 packs / a 26-min build that failed). depth=1 and files are unaffected. The remaining cost is that the work is O(full history) on *every* sync; the **LSM incremental build** below removes that by building history once and appending.
 
 ### Deferred
 - **LSM incremental build** — don't rebuild full history every sync (append an L0 pack at HEAD, compact older into immutable range packs; LSM levels). Optimization only.
