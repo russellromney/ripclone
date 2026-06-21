@@ -502,15 +502,7 @@ async fn git_info_refs(
         .map(|s| secrecy::SecretString::new(s.into()));
     let lock = repo_lock(&state.sync_locks, &owner, &repo).await;
     let _guard = lock.lock().await;
-    if let Err(e) = ensure_mirror(
-        &mirror_dir,
-        &owner,
-        &repo,
-        "HEAD",
-        github_token.as_ref(),
-    )
-    .await
-    {
+    if let Err(e) = ensure_mirror(&mirror_dir, &owner, &repo, "HEAD", github_token.as_ref()).await {
         state.metrics.record_error();
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -589,15 +581,7 @@ async fn git_upload_pack(
         .map(|s| secrecy::SecretString::new(s.into()));
     let lock = repo_lock(&state.sync_locks, &owner, &repo).await;
     let _guard = lock.lock().await;
-    if let Err(e) = ensure_mirror(
-        &mirror_dir,
-        &owner,
-        &repo,
-        "HEAD",
-        github_token.as_ref(),
-    )
-    .await
-    {
+    if let Err(e) = ensure_mirror(&mirror_dir, &owner, &repo, "HEAD", github_token.as_ref()).await {
         state.metrics.record_error();
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -743,14 +727,8 @@ async fn get_ref(
     // Skip the `git fetch` when the mirror was refreshed within the TTL — by a
     // recent resolve, or by the sync we just waited on while holding the lock.
     if !mirror_is_fresh(&state, &fresh_key) {
-        if let Err(e) = ensure_mirror(
-            &mirror_dir,
-            &owner,
-            &repo,
-            &branch,
-            github_token.as_ref(),
-        )
-        .await
+        if let Err(e) =
+            ensure_mirror(&mirror_dir, &owner, &repo, &branch, github_token.as_ref()).await
         {
             state.metrics.record_error();
             return (
@@ -899,12 +877,26 @@ fn ref_response(
     let (pack_chunk_urls, pack_idx_urls) = if info.packs.is_empty() {
         (None, None)
     } else {
-        let packs: Vec<Option<String>> =
-            info.packs.iter().map(|p| signed_url(storage, &p.pack)).collect();
-        let idxs: Vec<Option<String>> =
-            info.packs.iter().map(|p| signed_url(storage, &p.idx)).collect();
-        let packs = if packs.iter().all(Option::is_none) { None } else { Some(packs) };
-        let idxs = if idxs.iter().all(Option::is_none) { None } else { Some(idxs) };
+        let packs: Vec<Option<String>> = info
+            .packs
+            .iter()
+            .map(|p| signed_url(storage, &p.pack))
+            .collect();
+        let idxs: Vec<Option<String>> = info
+            .packs
+            .iter()
+            .map(|p| signed_url(storage, &p.idx))
+            .collect();
+        let packs = if packs.iter().all(Option::is_none) {
+            None
+        } else {
+            Some(packs)
+        };
+        let idxs = if idxs.iter().all(Option::is_none) {
+            None
+        } else {
+            Some(idxs)
+        };
         (packs, idxs)
     };
 
@@ -1894,51 +1886,52 @@ async fn do_sync(
     // - new_levels:        the LSM levels to persist for the next sync.
     // - server_full_midx:  whether to pre-build the full-variant MIDX (only when
     //                      all its packs are local this sync — i.e. non-LSM).
-    let (head_packs, history_packs, new_pack_tuples, new_levels, server_full_midx) = match depth_build
-    {
-        DepthBuild::Full {
-            head_packs,
-            history_packs,
-        } => {
-            let mut new_tuples = head_packs.clone();
-            new_tuples.extend(history_packs.iter().cloned());
-            (head_packs, history_packs, new_tuples, Vec::new(), true)
-        }
-        DepthBuild::Lsm(inc) => {
-            // Manifest history = prior sealed levels (by hash) + the new tail.
-            let mut history_packs: Vec<(String, u64, String, u64)> = prev_levels
-                .iter()
-                .flat_map(|l| l.packs.iter().map(sized_to_tuple))
-                .collect();
-            history_packs.extend(inc.tail_packs.iter().cloned());
-
-            // Newly built this sync = HEAD closure + tail (the only packs to
-            // upload/evict; prior levels are already in object storage).
-            let mut new_tuples = inc.head_packs.clone();
-            new_tuples.extend(inc.tail_packs.iter().cloned());
-
-            // Seal the tail into a new immutable level once it is large enough
-            // and actually advances past the last sealed tip.
-            let advances = sealed_tip.as_deref() != Some(commit.as_str());
-            let seal =
-                advances && !inc.tail_packs.is_empty() && inc.tail_raw_bytes >= seal_threshold_raw;
-            let mut new_levels = prev_levels.clone();
-            if seal {
-                new_levels.push(crate::HistoryLevel {
-                    tip_commit: commit.clone(),
-                    packs: inc.tail_packs.iter().map(tuple_to_sized).collect(),
-                });
-                info!(
-                    "LSM: sealed level {} at {} ({} packs, {} MiB raw tail)",
-                    new_levels.len() - 1,
-                    &commit[..7.min(commit.len())],
-                    inc.tail_packs.len(),
-                    inc.tail_raw_bytes / (1024 * 1024)
-                );
+    let (head_packs, history_packs, new_pack_tuples, new_levels, server_full_midx) =
+        match depth_build {
+            DepthBuild::Full {
+                head_packs,
+                history_packs,
+            } => {
+                let mut new_tuples = head_packs.clone();
+                new_tuples.extend(history_packs.iter().cloned());
+                (head_packs, history_packs, new_tuples, Vec::new(), true)
             }
-            (inc.head_packs, history_packs, new_tuples, new_levels, false)
-        }
-    };
+            DepthBuild::Lsm(inc) => {
+                // Manifest history = prior sealed levels (by hash) + the new tail.
+                let mut history_packs: Vec<(String, u64, String, u64)> = prev_levels
+                    .iter()
+                    .flat_map(|l| l.packs.iter().map(sized_to_tuple))
+                    .collect();
+                history_packs.extend(inc.tail_packs.iter().cloned());
+
+                // Newly built this sync = HEAD closure + tail (the only packs to
+                // upload/evict; prior levels are already in object storage).
+                let mut new_tuples = inc.head_packs.clone();
+                new_tuples.extend(inc.tail_packs.iter().cloned());
+
+                // Seal the tail into a new immutable level once it is large enough
+                // and actually advances past the last sealed tip.
+                let advances = sealed_tip.as_deref() != Some(commit.as_str());
+                let seal = advances
+                    && !inc.tail_packs.is_empty()
+                    && inc.tail_raw_bytes >= seal_threshold_raw;
+                let mut new_levels = prev_levels.clone();
+                if seal {
+                    new_levels.push(crate::HistoryLevel {
+                        tip_commit: commit.clone(),
+                        packs: inc.tail_packs.iter().map(tuple_to_sized).collect(),
+                    });
+                    info!(
+                        "LSM: sealed level {} at {} ({} packs, {} MiB raw tail)",
+                        new_levels.len() - 1,
+                        &commit[..7.min(commit.len())],
+                        inc.tail_packs.len(),
+                        inc.tail_raw_bytes / (1024 * 1024)
+                    );
+                }
+                (inc.head_packs, history_packs, new_tuples, new_levels, false)
+            }
+        };
 
     // Prebuilt indexes for both skeletons.
     let mirror_dir5 = mirror_dir.clone();
@@ -1988,25 +1981,26 @@ async fn do_sync(
     // only the HEAD-closure packs; the full clonepack lists HEAD + history. Order
     // is HEAD-first so a shallow client's URL indices line up with the prefix of
     // the (head+history) signed-URL list.
-    let to_entries =
-        |packs: &[(String, u64, String, u64)], history_only: bool| -> Result<Vec<crate::clonepack::PackEntry>> {
-            packs
-                .iter()
-                .map(|(ph, pl, ih, il)| {
-                    anyhow::Ok(crate::clonepack::PackEntry {
-                        pack: Some(ChunkRef {
-                            hash: hash_from_hex(ph)?,
-                            len: *pl,
-                        }),
-                        idx: Some(ChunkRef {
-                            hash: hash_from_hex(ih)?,
-                            len: *il,
-                        }),
-                        history_only,
-                    })
+    let to_entries = |packs: &[(String, u64, String, u64)],
+                      history_only: bool|
+     -> Result<Vec<crate::clonepack::PackEntry>> {
+        packs
+            .iter()
+            .map(|(ph, pl, ih, il)| {
+                anyhow::Ok(crate::clonepack::PackEntry {
+                    pack: Some(ChunkRef {
+                        hash: hash_from_hex(ph)?,
+                        len: *pl,
+                    }),
+                    idx: Some(ChunkRef {
+                        hash: hash_from_hex(ih)?,
+                        len: *il,
+                    }),
+                    history_only,
                 })
-                .collect()
-        };
+            })
+            .collect()
+    };
     let head_entries = to_entries(&head_packs, false)?;
     let history_entries = to_entries(&history_packs, true)?;
     let mut full_entries = head_entries.clone();
@@ -2041,8 +2035,11 @@ async fn do_sync(
     // prior levels were evicted, so only build it on the rebuild-all path; the
     // LSM client builds its own full MIDX.
     let (full_midx_ref, full_midx_hash) = if server_full_midx {
-        let full_pack_list: Vec<(String, u64, String, u64)> =
-            head_packs.iter().chain(history_packs.iter()).cloned().collect();
+        let full_pack_list: Vec<(String, u64, String, u64)> = head_packs
+            .iter()
+            .chain(history_packs.iter())
+            .cloned()
+            .collect();
         build_midx(&full_pack_list)?
     } else {
         (None, String::new())
@@ -2078,22 +2075,25 @@ async fn do_sync(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let make_clonepack =
-        |metadata_hash: String, metadata_len: u64, packs: Vec<crate::clonepack::PackEntry>, midx: Option<ChunkRef>| -> Result<ClonepackManifest> {
-            Ok(ClonepackManifest {
-                commit: commit.clone(),
-                parent_commit: parent.clone(),
-                default_branch: default_branch.clone(),
-                metadata_chunk: Some(ChunkRef {
-                    hash: hash_from_hex(&metadata_hash)?,
-                    len: metadata_len,
-                }),
-                archive_chunks: archive_chunks.clone(),
-                packs,
-                midx,
-                ..Default::default()
-            })
-        };
+    let make_clonepack = |metadata_hash: String,
+                          metadata_len: u64,
+                          packs: Vec<crate::clonepack::PackEntry>,
+                          midx: Option<ChunkRef>|
+     -> Result<ClonepackManifest> {
+        Ok(ClonepackManifest {
+            commit: commit.clone(),
+            parent_commit: parent.clone(),
+            default_branch: default_branch.clone(),
+            metadata_chunk: Some(ChunkRef {
+                hash: hash_from_hex(&metadata_hash)?,
+                len: metadata_len,
+            }),
+            archive_chunks: archive_chunks.clone(),
+            packs,
+            midx,
+            ..Default::default()
+        })
+    };
 
     // Full clonepack: HEAD closure + all history. Shallow: HEAD closure only.
     let full_clonepack_manifest = make_clonepack(

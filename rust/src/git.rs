@@ -424,7 +424,10 @@ pub fn object_sizes<P: AsRef<Path>>(repo: P, oids: &[String]) -> Result<HashMap<
     let out = Command::new("git")
         .arg("-C")
         .arg(repo.as_ref().as_os_str())
-        .args(["cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)"])
+        .args([
+            "cat-file",
+            "--batch-check=%(objectname) %(objecttype) %(objectsize)",
+        ])
         .stdin(stdin)
         .stderr(Stdio::inherit())
         .output()
@@ -597,7 +600,12 @@ pub fn pack_objects_undeltified_to_prefix<P: AsRef<Path>, Q: AsRef<Path>>(
     object_shas: &[String],
     prefix: Q,
 ) -> Result<()> {
-    pack_objects_to_prefix_inner(repo, object_shas, prefix, &["--window=0", "--no-reuse-delta"])
+    pack_objects_to_prefix_inner(
+        repo,
+        object_shas,
+        prefix,
+        &["--window=0", "--no-reuse-delta"],
+    )
 }
 
 fn pack_objects_to_prefix_inner<P: AsRef<Path>, Q: AsRef<Path>>(
@@ -854,19 +862,26 @@ pub fn sync_bare_mirror<P: AsRef<Path>>(
     crate::validation::validate_repo_id(owner)
         .with_context(|| format!("invalid owner: {}", owner))?;
     crate::validation::validate_repo_id(repo).with_context(|| format!("invalid repo: {}", repo))?;
-    let fetch_ref = if branch == "HEAD" {
-        "HEAD".to_string()
-    } else {
+    // Validate the branch name (used later for commit resolution). The mirror
+    // itself always fetches *all* refs, so the branch is not part of the fetch.
+    if branch != "HEAD" {
         crate::validation::validate_git_rev(branch)
             .with_context(|| format!("invalid branch: {}", branch))?;
-        format!("refs/heads/{}", branch)
-    };
+    }
+    // The origin base is normally GitHub, but is overridable via
+    // RIPCLONE_ORIGIN_BASE so tests (and self-hosted setups) can mirror from a
+    // local `file://` origin without any network. Tokens are only injected for
+    // the real GitHub host.
+    let base = std::env::var("RIPCLONE_ORIGIN_BASE")
+        .ok()
+        .filter(|b| !b.is_empty())
+        .unwrap_or_else(|| "https://github.com".to_string());
     let url = match github_token {
-        Some(token) => format!(
+        Some(token) if base == "https://github.com" => format!(
             "https://x-access-token:{}@github.com/{}/{}.git",
             token, owner, repo
         ),
-        None => format!("https://github.com/{}/{}.git", owner, repo),
+        _ => format!("{}/{}/{}.git", base.trim_end_matches('/'), owner, repo),
     };
     // The mirror is always a *complete* clone. The "full" (depth=0) clonepack is
     // built from `rev-list HEAD` over this mirror, so any shallow boundary would
@@ -875,19 +890,21 @@ pub fn sync_bare_mirror<P: AsRef<Path>>(
     // already-complete mirror. depth=1 ("head") clones are still cheap — they're
     // a content-addressed subset built at pack time, not a shallower mirror.
     if mirror_dir.as_ref().exists() {
+        // A `--mirror` clone is configured with `+refs/*:refs/*` (and prunes), so
+        // a plain `git fetch origin` advances every branch + HEAD to the latest.
+        // Do NOT fetch an explicit ref like `HEAD` here: that only updates
+        // FETCH_HEAD and leaves the mirror's branch refs stale, so a re-sync after
+        // a new push would silently keep serving the old commit.
+        //
         // A leftover shallow mirror (from the old `--depth 50` default) carries a
-        // `shallow` marker file. Convert it to a complete clone once with
-        // `--unshallow`; afterwards plain fetches keep it complete.
+        // `shallow` marker file; `--unshallow` completes it (and still fetches all
+        // refs) once, after which plain fetches keep it complete.
         let is_shallow = mirror_dir.as_ref().join("shallow").exists();
         let mut args: Vec<&str> = vec!["fetch"];
         if is_shallow {
-            // Unshallow every ref so the marker is removed and history is whole.
             args.push("--unshallow");
-            args.push("origin");
-        } else {
-            args.push("origin");
-            args.push(&fetch_ref);
         }
+        args.push("origin");
         let status = Command::new("git")
             .arg("-C")
             .arg(mirror_dir.as_ref().as_os_str())
@@ -898,6 +915,8 @@ pub fn sync_bare_mirror<P: AsRef<Path>>(
             bail!("fetch failed");
         }
     } else {
+        // A fresh `--mirror` clone copies every ref (branches, tags, HEAD), so no
+        // follow-up branch fetch is needed.
         std::fs::create_dir_all(mirror_dir.as_ref().parent().unwrap_or(Path::new("")))?;
         let status = Command::new("git")
             .args([
@@ -910,18 +929,6 @@ pub fn sync_bare_mirror<P: AsRef<Path>>(
             .context("git clone mirror")?;
         if !status.success() {
             bail!("clone mirror failed");
-        }
-        // If a specific branch was requested, fetch it into the new mirror.
-        if branch != "HEAD" {
-            let status = Command::new("git")
-                .arg("-C")
-                .arg(mirror_dir.as_ref().as_os_str())
-                .args(["fetch", "origin", &fetch_ref])
-                .status()
-                .context("git fetch branch")?;
-            if !status.success() {
-                bail!("fetch branch failed");
-            }
         }
     }
     Ok(())
@@ -962,69 +969,6 @@ pub fn find_commit_in_git_dir<P: AsRef<Path>>(git_dir: P) -> Result<String> {
         }
     }
     bail!("no commit object found")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    #[ignore]
-    fn debug_list_objects() {
-        let repo = Path::new("/tmp/ripclone-repos/oven-sh_bun.git");
-        let start = std::time::Instant::now();
-        let shas = list_object_shas(repo, "HEAD").unwrap();
-        println!("list_object_shas: {} in {:?}", shas.len(), start.elapsed());
-    }
-
-    #[test]
-    #[ignore]
-    fn debug_classify() {
-        let repo = Path::new("/tmp/ripclone-repos/oven-sh_bun.git");
-        let shas = list_object_shas(repo, "HEAD").unwrap();
-        let set: HashSet<String> = shas.into_iter().collect();
-        let start = std::time::Instant::now();
-        let types = classify_objects(repo, &set).unwrap();
-        println!("classify_objects: {} in {:?}", types.len(), start.elapsed());
-    }
-
-    #[test]
-    #[ignore]
-    fn debug_pack() {
-        let repo = Path::new("/tmp/ripclone-repos/oven-sh_bun.git");
-        let shas = list_object_shas(repo, "HEAD").unwrap();
-        let set: HashSet<String> = shas.into_iter().collect();
-        let types = classify_objects(repo, &set).unwrap();
-        let skel: Vec<String> = set
-            .into_iter()
-            .filter(|sha| {
-                matches!(
-                    types.get(sha).map(|s| s.as_str()),
-                    Some("commit") | Some("tree")
-                )
-            })
-            .collect();
-        let out = std::path::Path::new("/tmp/test-skel.pack");
-        let start = std::time::Instant::now();
-        pack_objects(repo, &skel, out).unwrap();
-        println!(
-            "pack_objects: {} bytes in {:?}",
-            std::fs::metadata(out).unwrap().len(),
-            start.elapsed()
-        );
-    }
-
-    #[test]
-    fn test_cat_file_batch() {
-        let repo = Path::new("/tmp/bun-inspect.git");
-        if !repo.exists() {
-            return;
-        }
-        let shas = vec!["5ff4e6424be88db31ae443f926f289aa726a88b1".to_string()];
-        let map = cat_file_batch(repo, &shas).unwrap();
-        assert_eq!(map.len(), 1);
-        assert!(map.contains_key(&shas[0]));
-    }
 }
 
 /// Return a list of paths likely to be needed by an agent, ordered by priority.
@@ -1165,4 +1109,67 @@ pub fn materialize_file<P: AsRef<Path>, Q: AsRef<Path>>(
     }
 
     Ok(content.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore]
+    fn debug_list_objects() {
+        let repo = Path::new("/tmp/ripclone-repos/oven-sh_bun.git");
+        let start = std::time::Instant::now();
+        let shas = list_object_shas(repo, "HEAD").unwrap();
+        println!("list_object_shas: {} in {:?}", shas.len(), start.elapsed());
+    }
+
+    #[test]
+    #[ignore]
+    fn debug_classify() {
+        let repo = Path::new("/tmp/ripclone-repos/oven-sh_bun.git");
+        let shas = list_object_shas(repo, "HEAD").unwrap();
+        let set: HashSet<String> = shas.into_iter().collect();
+        let start = std::time::Instant::now();
+        let types = classify_objects(repo, &set).unwrap();
+        println!("classify_objects: {} in {:?}", types.len(), start.elapsed());
+    }
+
+    #[test]
+    #[ignore]
+    fn debug_pack() {
+        let repo = Path::new("/tmp/ripclone-repos/oven-sh_bun.git");
+        let shas = list_object_shas(repo, "HEAD").unwrap();
+        let set: HashSet<String> = shas.into_iter().collect();
+        let types = classify_objects(repo, &set).unwrap();
+        let skel: Vec<String> = set
+            .into_iter()
+            .filter(|sha| {
+                matches!(
+                    types.get(sha).map(|s| s.as_str()),
+                    Some("commit") | Some("tree")
+                )
+            })
+            .collect();
+        let out = std::path::Path::new("/tmp/test-skel.pack");
+        let start = std::time::Instant::now();
+        pack_objects(repo, &skel, out).unwrap();
+        println!(
+            "pack_objects: {} bytes in {:?}",
+            std::fs::metadata(out).unwrap().len(),
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn test_cat_file_batch() {
+        let repo = Path::new("/tmp/bun-inspect.git");
+        if !repo.exists() {
+            return;
+        }
+        let shas = vec!["5ff4e6424be88db31ae443f926f289aa726a88b1".to_string()];
+        let map = cat_file_batch(repo, &shas).unwrap();
+        assert_eq!(map.len(), 1);
+        assert!(map.contains_key(&shas[0]));
+    }
 }

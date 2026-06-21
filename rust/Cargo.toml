@@ -75,6 +75,9 @@ tokio-uring = "0.5"
 tower = { version = "0.5", features = ["util"] }
 tempfile = "3"
 hex = "0.4"
+tokio = { version = "1", features = ["full"] }
+sha2 = "0.10"
+serde_json = "1"
 
 [build-dependencies]
 prost-build = "0.13"

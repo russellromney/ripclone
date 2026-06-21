@@ -315,7 +315,6 @@ fn list_cas_entries(root: &Path) -> Result<Vec<CasEntry>> {
 mod tests {
     use super::*;
     use crate::metrics::Metrics;
-    use std::io::Write;
 
     fn make_cas(root: &Path) -> Cas {
         Cas::new(root).unwrap()
