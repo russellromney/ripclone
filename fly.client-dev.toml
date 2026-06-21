@@ -7,14 +7,26 @@ primary_region = 'ewr'
 [env]
   RIPCLONE_URL = 'https://ripclone-server-dev.fly.dev'
 
-# Keep the machine alive so we can run controlled clones over SSH instead of the
-# one-shot multi-mode benchmark script.
+# Keep-alive process: run ripclone-server on :8000 purely so the machine is a
+# valid Fly service that can auto-stop when idle (and auto-start on demand). The
+# actual client testing is done over SSH with the `ripclone` CLI against
+# ripclone-server-dev — this server is just the idle/health target.
 [experimental]
-  cmd = ['sleep', '86400']
+  cmd = ['ripclone-server']
 
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = 'stop'
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ['app']
+
+# 8 dedicated performance vCPUs to mirror a developer laptop for realistic clone
+# timings. Memory is omitted so Fly uses the size's minimum (performance CPUs
+# require 2 GB per core).
 [[vm]]
-  size = 'shared-cpu-4x'
-  memory = '1gb'
+  size = 'performance-8x'
 
 # Durable-disk target so we can benchmark the real disk write floor (vs tmpfs).
 [mounts]

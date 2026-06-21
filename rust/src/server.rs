@@ -289,6 +289,9 @@ pub struct RefResponse {
     /// Signed URL for the pre-built multi-pack-index (`manifest.midx`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub midx_url: Option<String>,
+    /// Signed URL for the concatenated idx bundle (`manifest.idx_bundle`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idx_bundle_url: Option<String>,
     /// True when the returned clonepack is a shallow (depth=1) snapshot.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub shallow: bool,
@@ -903,6 +906,8 @@ fn ref_response(
     // Sign the pre-built MIDX for the selected variant so the client installs it
     // directly instead of running `git multi-pack-index write`.
     let midx_url = signed_url(storage, &artifacts.midx);
+    // Sign the idx bundle so the client fetches all idx in one GET.
+    let idx_bundle_url = signed_url(storage, &artifacts.idx_bundle);
 
     RefResponse {
         owner,
@@ -922,6 +927,7 @@ fn ref_response(
         pack_chunk_urls,
         pack_idx_urls,
         midx_url,
+        idx_bundle_url,
         shallow: clonepack_kind == "shallow",
     }
 }
@@ -1984,30 +1990,59 @@ async fn do_sync(
     // only the HEAD-closure packs; the full clonepack lists HEAD + history. Order
     // is HEAD-first so a shallow client's URL indices line up with the prefix of
     // the (head+history) signed-URL list.
-    let to_entries = |packs: &[(String, u64, String, u64)],
-                      history_only: bool|
-     -> Result<Vec<crate::clonepack::PackEntry>> {
-        packs
-            .iter()
-            .map(|(ph, pl, ih, il)| {
-                anyhow::Ok(crate::clonepack::PackEntry {
-                    pack: Some(ChunkRef {
-                        hash: hash_from_hex(ph)?,
-                        len: *pl,
-                    }),
-                    idx: Some(ChunkRef {
-                        hash: hash_from_hex(ih)?,
-                        len: *il,
-                    }),
-                    history_only,
-                })
-            })
-            .collect()
+    // Build a variant's PackEntry list AND its idx bundle in one pass: every
+    // pack's idx is concatenated into a single content-addressed blob, and each
+    // entry records its offset into it. The client fetches the bundle once and
+    // slices each idx locally, instead of one GET per pack idx. idx bytes come
+    // from the local CAS (kept after upload) with an object-storage fallback.
+    // Returns (entries, bundle ChunkRef, bundle CAS hash).
+    let build_variant = |tagged: &[(&(String, u64, String, u64), bool)]| -> Result<(
+        Vec<crate::clonepack::PackEntry>,
+        Option<ChunkRef>,
+        String,
+    )> {
+        if tagged.is_empty() {
+            return Ok((Vec::new(), None, String::new()));
+        }
+        let mut buf: Vec<u8> = Vec::new();
+        let mut entries = Vec::with_capacity(tagged.len());
+        for &(pack, history_only) in tagged {
+            let offset = buf.len() as u64;
+            let idx_bytes = cas.get(&pack.2).or_else(|_| storage.get(&pack.2))?;
+            buf.extend_from_slice(&idx_bytes);
+            entries.push(crate::clonepack::PackEntry {
+                pack: Some(ChunkRef {
+                    hash: hash_from_hex(&pack.0)?,
+                    len: pack.1,
+                }),
+                idx: Some(ChunkRef {
+                    hash: hash_from_hex(&pack.2)?,
+                    len: pack.3,
+                }),
+                history_only,
+                idx_bundle_offset: offset,
+            });
+        }
+        let len = buf.len() as u64;
+        let hash = cas.put(&buf)?;
+        Ok((
+            entries,
+            Some(ChunkRef {
+                hash: hash_from_hex(&hash)?,
+                len,
+            }),
+            hash,
+        ))
     };
-    let head_entries = to_entries(&head_packs, false)?;
-    let history_entries = to_entries(&history_packs, true)?;
-    let mut full_entries = head_entries.clone();
-    full_entries.extend(history_entries.iter().cloned());
+    let head_tagged: Vec<(&(String, u64, String, u64), bool)> =
+        head_packs.iter().map(|p| (p, false)).collect();
+    let full_tagged: Vec<(&(String, u64, String, u64), bool)> = head_packs
+        .iter()
+        .map(|p| (p, false))
+        .chain(history_packs.iter().map(|p| (p, true)))
+        .collect();
+    let (head_entries, head_idx_bundle_ref, head_idx_bundle_hash) = build_variant(&head_tagged)?;
+    let (full_entries, full_idx_bundle_ref, full_idx_bundle_hash) = build_variant(&full_tagged)?;
 
     // Pre-build a multi-pack-index per variant over exactly the packs that
     // variant ships, using the client's `pack-<trailer>` filenames. The client
@@ -2081,7 +2116,8 @@ async fn do_sync(
     let make_clonepack = |metadata_hash: String,
                           metadata_len: u64,
                           packs: Vec<crate::clonepack::PackEntry>,
-                          midx: Option<ChunkRef>|
+                          midx: Option<ChunkRef>,
+                          idx_bundle: Option<ChunkRef>|
      -> Result<ClonepackManifest> {
         Ok(ClonepackManifest {
             commit: commit.clone(),
@@ -2094,6 +2130,7 @@ async fn do_sync(
             archive_chunks: archive_chunks.clone(),
             packs,
             midx,
+            idx_bundle,
             ..Default::default()
         })
     };
@@ -2104,6 +2141,7 @@ async fn do_sync(
         metadata_data.len() as u64,
         full_entries,
         full_midx_ref.clone(),
+        full_idx_bundle_ref.clone(),
     )?;
     let full_clonepack_data = full_clonepack_manifest.encode_to_vec();
     let full_clonepack_hash = cas.put(&full_clonepack_data)?;
@@ -2113,6 +2151,7 @@ async fn do_sync(
         shallow_metadata_data.len() as u64,
         head_entries,
         head_midx_ref.clone(),
+        head_idx_bundle_ref.clone(),
     )?;
     let shallow_clonepack_data = shallow_clonepack_manifest.encode_to_vec();
     let shallow_clonepack_hash = cas.put(&shallow_clonepack_data)?;
@@ -2155,6 +2194,7 @@ async fn do_sync(
             skeleton_idx: skeleton_idx.clone(),
             prebuilt_index: prebuilt_index.clone(),
             midx: full_midx_hash.clone(),
+            idx_bundle: full_idx_bundle_hash.clone(),
         },
         shallow_clonepack: crate::ClonepackArtifacts {
             manifest: shallow_clonepack_hash.clone(),
@@ -2163,6 +2203,7 @@ async fn do_sync(
             skeleton_idx: shallow_skeleton_idx.clone(),
             prebuilt_index: shallow_prebuilt_index.clone(),
             midx: head_midx_hash.clone(),
+            idx_bundle: head_idx_bundle_hash.clone(),
         },
         history_levels: new_levels,
         build_status: None,
@@ -2190,6 +2231,8 @@ async fn do_sync(
         &info.shallow_clonepack.manifest,
         &info.full_clonepack.midx,
         &info.shallow_clonepack.midx,
+        &info.full_clonepack.idx_bundle,
+        &info.shallow_clonepack.idx_bundle,
     ];
     artifact_hashes.extend(info.head_blobs_chunks.iter().map(|s| s.as_str()));
     artifact_hashes.extend(info.archive_chunks.iter().map(|s| s.as_str()));
@@ -2209,8 +2252,19 @@ async fn do_sync(
         // from it via signed URLs. The local CAS copies were only build scratch
         // (a full bun sync writes ~400 MB), so drop them to keep the volume
         // small. They are re-fetched from storage on the rare gateway path.
+        //
+        // EXCEPT pack idx files: they are tiny and reused every sync to rebuild
+        // the idx bundle + MIDX (incl. for prior LSM levels), so keeping them
+        // local avoids re-downloading them from object storage on each build.
+        let keep_idx: std::collections::HashSet<&str> = new_pack_tuples
+            .iter()
+            .map(|(_, _, ih, _)| ih.as_str())
+            .collect();
         let mut freed = 0u64;
         for hash in artifact_hashes.iter().filter(|h| !h.is_empty()) {
+            if keep_idx.contains(*hash) {
+                continue;
+            }
             if let Ok(sz) = cas.path(hash).metadata().map(|m| m.len()) {
                 freed += sz;
             }
@@ -2685,6 +2739,7 @@ mod tests {
                 skeleton_idx: String::new(),
                 prebuilt_index: String::new(),
                 midx: String::new(),
+                idx_bundle: String::new(),
             },
             shallow_clonepack: crate::ClonepackArtifacts::default(),
             history_levels: Vec::new(),
@@ -2769,6 +2824,7 @@ mod tests {
                 skeleton_idx: String::new(),
                 prebuilt_index: String::new(),
                 midx: String::new(),
+                idx_bundle: String::new(),
             },
             shallow_clonepack: crate::ClonepackArtifacts::default(),
             history_levels: Vec::new(),
