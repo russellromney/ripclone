@@ -1789,14 +1789,17 @@ async fn do_sync(
     });
 
     // Depth-1 packs: the complete object closure for HEAD (commit + tree + every
-    // blob), split into many small self-contained packs (~1-2 MB). The client
-    // installs and extracts them in parallel as they download. Carried in the
-    // manifest's `packs` list. (Phase 1 ships only the HEAD-closure depth=1;
-    // deeper-history packs come in Phase 2.)
+    // blob), split into self-contained packs the client installs + extracts in
+    // parallel. This is a RAW (uncompressed) target; the undeltified HEAD closure
+    // compresses ~3x, so 12 MiB raw lands ~4 MB download frames. Bigger frames =
+    // fewer packs = fewer round-trips (each pack costs a pack GET + an idx GET),
+    // which is a wash on a fast link but a real win on a slow/high-latency one;
+    // still many frames, so parallelism is preserved. Carried in the manifest's
+    // `packs` list.
     let pack_target_raw: u64 = std::env::var("RIPCLONE_PACK_BYTES")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(6 * 1024 * 1024);
+        .unwrap_or(12 * 1024 * 1024);
     // History packs are install-only (git reads them; the client never
     // hand-parses). They must be bigger than the small HEAD packs — the 6 MB
     // HEAD target explodes a big repo into ~1k packs/spawns — but still many, so
