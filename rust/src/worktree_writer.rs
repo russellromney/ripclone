@@ -607,7 +607,7 @@ mod linux_uring {
                 }
             }
 
-            entries.clear();
+            entries = Vec::with_capacity(in_flight.len() * 2);
             for (idx, write) in in_flight.iter_mut().enumerate() {
                 if let Some(fd) = write.fd {
                     if write.content.is_empty() {
@@ -621,40 +621,10 @@ mod linux_uring {
                             )
                             .offset(0)
                             .build()
+                            .flags(squeue::Flags::IO_HARDLINK)
                             .user_data(user_data(idx, FileOp::Write)),
                         );
                     }
-                }
-            }
-            if !entries.is_empty() {
-                if let Err(e) = self.submit_entries(&entries, "submit io_uring write batch") {
-                    close_open_fds_sync(&mut in_flight);
-                    return Err(e);
-                }
-                match self
-                    .collect_completions(entries.len(), "wait for io_uring write batch completion")
-                {
-                    Ok(completions) => {
-                        for (idx, op, res) in completions {
-                            if op != FileOp::Write {
-                                anyhow::bail!("unexpected io_uring completion in write phase");
-                            }
-                            let write = in_flight.get_mut(idx).ok_or_else(|| {
-                                anyhow::anyhow!("invalid io_uring completion index {idx}")
-                            })?;
-                            write.write_res = Some(res);
-                        }
-                    }
-                    Err(e) => {
-                        close_open_fds_sync(&mut in_flight);
-                        return Err(e);
-                    }
-                }
-            }
-
-            entries.clear();
-            for (idx, write) in in_flight.iter().enumerate() {
-                if let Some(fd) = write.fd {
                     entries.push(
                         opcode::Close::new(types::Fd(fd))
                             .build()
@@ -663,23 +633,42 @@ mod linux_uring {
                 }
             }
             if !entries.is_empty() {
-                if let Err(e) = self.submit_entries(&entries, "submit io_uring close batch") {
+                if let Err(e) = self.submit_entries(&entries, "submit io_uring write/close batch") {
                     close_open_fds_sync(&mut in_flight);
                     return Err(e);
                 }
-                for (idx, op, res) in self.collect_completions(
+                match self.collect_completions(
                     entries.len(),
-                    "wait for io_uring close batch completion",
-                )? {
-                    if op != FileOp::Close {
-                        anyhow::bail!("unexpected io_uring completion in close phase");
+                    "wait for io_uring write/close batch completion",
+                ) {
+                    Ok(completions) => {
+                        for (idx, op, res) in completions {
+                            match op {
+                                FileOp::Write => {
+                                    let write = in_flight.get_mut(idx).ok_or_else(|| {
+                                        anyhow::anyhow!("invalid io_uring completion index {idx}")
+                                    })?;
+                                    write.write_res = Some(res);
+                                }
+                                FileOp::Close => {
+                                    let write = in_flight.get_mut(idx).ok_or_else(|| {
+                                        anyhow::anyhow!("invalid io_uring completion index {idx}")
+                                    })?;
+                                    write.close_res = Some(res);
+                                    write.fd = None;
+                                }
+                                FileOp::Open => {
+                                    close_open_fds_sync(&mut in_flight);
+                                    anyhow::bail!(
+                                        "unexpected io_uring completion in write/close phase"
+                                    );
+                                }
+                            }
+                        }
                     }
-                    let write = in_flight.get_mut(idx).ok_or_else(|| {
-                        anyhow::anyhow!("invalid io_uring completion index {idx}")
-                    })?;
-                    write.close_res = Some(res);
-                    if res >= 0 {
-                        write.fd = None;
+                    Err(e) => {
+                        close_open_fds_sync(&mut in_flight);
+                        return Err(e);
                     }
                 }
             }
