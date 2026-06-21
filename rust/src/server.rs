@@ -1743,6 +1743,12 @@ async fn do_sync(
 ) -> Result<RefInfo> {
     info!("syncing {}/{}@{}", owner, repo, branch);
 
+    // Per-phase timers so sync cost can be tuned with real numbers (RIPCLONE_LOG
+    // shows them at INFO). `t_total` spans the whole build; `t` is reset at each
+    // phase boundary.
+    let t_total = Instant::now();
+    let mut t = t_total;
+
     // Best-effort: remove stale build temp dirs left by a previously killed
     // sync. `tempfile` cleans up on drop, but not on SIGKILL/OOM, so a crashed
     // build leaks a `.tmp*` dir in TMPDIR (= repo_root). Only sweep old ones so a
@@ -1769,6 +1775,8 @@ async fn do_sync(
     })
     .await
     .context("sync task")??;
+    info!("sync phase: mirror fetch {:?}", t.elapsed());
+    t = Instant::now();
 
     let commit = git::resolve_commit(&mirror_dir, branch)?;
     let parent = git::parent_commit(&mirror_dir, &commit).ok().flatten();
@@ -1781,8 +1789,11 @@ async fn do_sync(
     let cas2 = cas.clone();
     let commit2 = commit.clone();
     let skeleton_handle = tokio::task::spawn_blocking(move || {
+        let s = Instant::now();
         let builder = PackBuilder::new(&mirror_dir2, &cas2);
-        builder.build_skeleton_pack(&commit2)
+        let r = builder.build_skeleton_pack(&commit2);
+        info!("build task: full skeleton {:?}", s.elapsed());
+        r
     });
 
     // Shallow depth=1 skeleton pack + idx.
@@ -1845,8 +1856,9 @@ async fn do_sync(
     let commit3 = commit.clone();
     let sealed_tip3 = sealed_tip.clone();
     let depth_packs_handle = tokio::task::spawn_blocking(move || -> Result<DepthBuild> {
+        let s = Instant::now();
         let builder = PackBuilder::new(&mirror_dir3, &cas3);
-        if lsm {
+        let r = if lsm {
             // LSM: build only the tail (HEAD closure + objects since last seal).
             let inc = builder.build_incremental_packs(
                 &commit3,
@@ -1854,16 +1866,18 @@ async fn do_sync(
                 pack_target_raw,
                 history_target_raw,
             )?;
-            Ok(DepthBuild::Lsm(inc))
+            DepthBuild::Lsm(inc)
         } else {
             // Default: small HEAD-closure packs + few large full-history packs.
             let (head_packs, history_packs) =
                 builder.build_layered_packs(&commit3, pack_target_raw, history_target_raw)?;
-            Ok(DepthBuild::Full {
+            DepthBuild::Full {
                 head_packs,
                 history_packs,
-            })
-        }
+            }
+        };
+        info!("build task: depth packs (head+history) {:?}", s.elapsed());
+        Ok(r)
     });
 
     // Working-tree archive + manifest.
@@ -1871,8 +1885,11 @@ async fn do_sync(
     let cas4 = cas.clone();
     let commit4 = commit.clone();
     let archive_handle = tokio::task::spawn_blocking(move || {
+        let s = Instant::now();
         let builder = ArchiveBuilder::new(&mirror_dir4);
-        builder.build_into_cas(&commit4, &cas4, 6, None)
+        let r = builder.build_into_cas(&commit4, &cas4, 6, None);
+        info!("build task: working-tree archive {:?}", s.elapsed());
+        r
     });
 
     let (skeleton_pack, skeleton_idx) =
@@ -1883,6 +1900,11 @@ async fn do_sync(
     let depth_build = depth_packs_handle.await.context("depth packs task")??;
     let (archive_chunk_hashes, mut metadata_chunk) =
         archive_handle.await.context("archive task")??;
+    info!(
+        "sync phase: build skeletons+packs+archive {:?}",
+        t.elapsed()
+    );
+    t = Instant::now();
 
     // Resolve the build into:
     // - head_packs:        undeltified HEAD-closure packs (worktree source).
@@ -1965,6 +1987,8 @@ async fn do_sync(
     let shallow_prebuilt_index = shallow_prebuilt_index_handle
         .await
         .context("shallow prebuilt index task")??;
+    info!("sync phase: prebuilt indexes {:?}", t.elapsed());
+    t = Instant::now();
 
     // Assemble the full-history metadata chunk with the small .git artifacts and
     // the frame/file tables. The head-blobs pack is kept as its own artifact
@@ -2238,6 +2262,11 @@ async fn do_sync(
     artifact_hashes.extend(info.archive_chunks.iter().map(|s| s.as_str()));
     // The editable depth packs + their idxs.
     artifact_hashes.extend(depth_pack_hashes.iter().map(|s| s.as_str()));
+    info!(
+        "sync phase: assemble metadata/idx-bundles/midx/manifests {:?}",
+        t.elapsed()
+    );
+    t = Instant::now();
     for hash in artifact_hashes.iter().filter(|h| !h.is_empty()) {
         let data = cas
             .get(hash)
@@ -2246,6 +2275,11 @@ async fn do_sync(
             .put(hash, &data)
             .with_context(|| format!("upload artifact {} to storage", hash))?;
     }
+    info!(
+        "sync phase: upload {} artifacts {:?}",
+        artifact_hashes.iter().filter(|h| !h.is_empty()).count(),
+        t.elapsed()
+    );
 
     if storage.is_remote() {
         // Object storage is now the source of truth and clients read straight
@@ -2301,7 +2335,13 @@ async fn do_sync(
         .await
         .with_context(|| format!("persist ref store for {owner}/{repo}@{branch}"))?;
 
-    info!("synced {}/{} at {}", owner, repo, &commit[..7]);
+    info!(
+        "synced {}/{} at {} (total build {:?})",
+        owner,
+        repo,
+        &commit[..7],
+        t_total.elapsed()
+    );
     Ok(info)
 }
 
