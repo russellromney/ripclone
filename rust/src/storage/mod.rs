@@ -31,6 +31,14 @@ pub trait StorageBackend: Send + Sync {
     fn signed_url(&self, _hash: &str, _expires_in: Duration) -> Option<String> {
         None
     }
+
+    /// True when this backend is a durable remote object store (S3/R2/Tigris)
+    /// that is the source of truth. When true, the local CAS is only a build
+    /// cache and its copies can be dropped after upload. When false (local
+    /// backend), the CAS *is* the source of truth and must be kept.
+    fn is_remote(&self) -> bool {
+        false
+    }
 }
 
 /// Filesystem-backed storage using the existing CAS layout.

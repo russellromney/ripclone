@@ -1676,6 +1676,37 @@ fn parse_byte_range(range: &str, size: u64) -> Option<(u64, u64)> {
     Some((start, end))
 }
 
+/// Remove `.tmp*` entries under `dir` whose mtime is older than `max_age`.
+/// Best-effort cleanup of build temp dirs leaked by a killed sync.
+fn sweep_stale_tempdirs(dir: &std::path::Path, max_age: Duration) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with(".tmp") {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .map(|age| age > max_age)
+            .unwrap_or(false);
+        if !stale {
+            continue;
+        }
+        let path = entry.path();
+        let _ = if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+    }
+}
+
 async fn do_sync(
     cas: &Cas,
     mirror_dir: &std::path::Path,
@@ -1689,6 +1720,14 @@ async fn do_sync(
     github_token: Option<&secrecy::SecretString>,
 ) -> Result<RefInfo> {
     info!("syncing {}/{}@{}", owner, repo, branch);
+
+    // Best-effort: remove stale build temp dirs left by a previously killed
+    // sync. `tempfile` cleans up on drop, but not on SIGKILL/OOM, so a crashed
+    // build leaks a `.tmp*` dir in TMPDIR (= repo_root). Only sweep old ones so a
+    // concurrent build's temp dir is never touched.
+    if let Some(repo_root) = mirror_dir.parent() {
+        sweep_stale_tempdirs(repo_root, Duration::from_secs(2 * 3600));
+    }
 
     // Sync the bare mirror synchronously (blocking git call).
     let mirror_dir_sync = mirror_dir.to_path_buf();
@@ -1743,12 +1782,15 @@ async fn do_sync(
         .and_then(|s| s.parse().ok())
         .unwrap_or(6 * 1024 * 1024);
     // History packs are install-only (git reads them; the client never
-    // hand-parses), so they must be FEW and LARGE — using the small HEAD target
-    // explodes a big repo into ~1k packs/spawns. Default 256 MiB raw per pack.
+    // hand-parses). They must be bigger than the small HEAD packs — the 6 MB
+    // HEAD target explodes a big repo into ~1k packs/spawns — but still many, so
+    // the client downloads them in parallel. This is a RAW (uncompressed) target;
+    // deltified history compresses ~18-20x, so 512 MiB raw lands ~28-32 MB
+    // download pieces (bun: ~12 history packs fetched concurrently).
     let history_target_raw: u64 = std::env::var("RIPCLONE_HISTORY_PACK_BYTES")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(256 * 1024 * 1024);
+        .unwrap_or(512 * 1024 * 1024);
     let mirror_dir3 = mirror_dir.clone();
     let cas3 = cas.clone();
     let commit3 = commit.clone();
@@ -2028,14 +2070,34 @@ async fn do_sync(
             .with_context(|| format!("upload artifact {} to storage", hash))?;
     }
 
-    // Protect the current HEAD's artifacts from retention eviction.
-    let protect_hashes: Vec<String> = artifact_hashes
-        .iter()
-        .filter(|h| !h.is_empty())
-        .map(|h| h.to_string())
-        .chain(std::iter::once(info.full_pack.clone()).filter(|h| !h.is_empty()))
-        .collect();
-    retention.protect(protect_hashes).await;
+    if storage.is_remote() {
+        // Object storage is now the source of truth and clients read straight
+        // from it via signed URLs. The local CAS copies were only build scratch
+        // (a full bun sync writes ~400 MB), so drop them to keep the volume
+        // small. They are re-fetched from storage on the rare gateway path.
+        let mut freed = 0u64;
+        for hash in artifact_hashes.iter().filter(|h| !h.is_empty()) {
+            if let Ok(sz) = cas.path(hash).metadata().map(|m| m.len()) {
+                freed += sz;
+            }
+            let _ = cas.remove(hash);
+        }
+        info!(
+            "evicted {} local CAS artifacts after upload (~{} MiB freed)",
+            artifact_hashes.iter().filter(|h| !h.is_empty()).count(),
+            freed / (1024 * 1024)
+        );
+    } else {
+        // Local backend: the CAS is the source of truth — protect the current
+        // HEAD's artifacts from retention eviction instead of dropping them.
+        let protect_hashes: Vec<String> = artifact_hashes
+            .iter()
+            .filter(|h| !h.is_empty())
+            .map(|h| h.to_string())
+            .chain(std::iter::once(info.full_pack.clone()).filter(|h| !h.is_empty()))
+            .collect();
+        retention.protect(protect_hashes).await;
+    }
 
     let mut info = info;
     info.build_status = None;
