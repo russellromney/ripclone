@@ -99,7 +99,7 @@ cd my-clone
 ripclone worktree ../my-clone-wt -b HEAD
 ```
 
-For the same commit as the main clone, it reuses the local `.git/index` and object database, so nothing is downloaded. For a different branch/commit, it falls back to fetching the prebuilt index and head-blobs pack from the server.
+For the same commit as the main clone, it reuses the local `.git/index` and object database, so nothing is downloaded. For a different branch/commit, it falls back to fetching the prebuilt depth pack from the server.
 
 On cloud VMs with slow overlay rootfs, point the staging directory at a fast volume:
 

@@ -53,6 +53,12 @@ pub struct ServerState {
     /// Per-repo mutexes so concurrent syncs for the same repo cannot corrupt
     /// the bare mirror directory.
     pub sync_locks: Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Last time each `owner/repo/branch` mirror was fetched. Used to skip a
+    /// redundant `git fetch` on the resolve hot path when the mirror is fresh.
+    pub mirror_freshness: Arc<std::sync::Mutex<HashMap<String, Instant>>>,
+    /// How long a mirror fetch stays "fresh". Resolves within this window skip
+    /// the fetch (`RIPCLONE_MIRROR_FRESH_TTL_SECS`, default 60s).
+    pub mirror_fresh_ttl: Duration,
 }
 
 /// Simple in-memory token-bucket rate limiter keyed by real client IP.
@@ -276,6 +282,12 @@ pub struct RefResponse {
     /// Signed URL for the optional head-blobs idx.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub head_blobs_idx_url: Option<String>,
+    /// Signed URL for each editable pack, ordered to match `manifest.packs`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pack_chunk_urls: Option<Vec<Option<String>>>,
+    /// Signed URL for each editable pack's idx, ordered to match `manifest.packs`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pack_idx_urls: Option<Vec<Option<String>>>,
     /// True when the returned clonepack is a shallow (depth=1) snapshot.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub shallow: bool,
@@ -690,6 +702,27 @@ async fn ensure_mirror(
     .context("ensure mirror task")?
 }
 
+/// True if the mirror for `key` (`owner/repo/branch`) was fetched within the
+/// freshness TTL, so a resolve can skip the `git fetch`.
+fn mirror_is_fresh(state: &ServerState, key: &str) -> bool {
+    state
+        .mirror_freshness
+        .lock()
+        .unwrap()
+        .get(key)
+        .map(|t| t.elapsed() < state.mirror_fresh_ttl)
+        .unwrap_or(false)
+}
+
+/// Record that the mirror for `key` was just fetched. Prunes expired entries so
+/// the map stays bounded by the set of refs active within the TTL.
+fn stamp_mirror_fresh(state: &ServerState, key: &str) {
+    let ttl = state.mirror_fresh_ttl;
+    let mut map = state.mirror_freshness.lock().unwrap();
+    map.retain(|_, t| t.elapsed() < ttl);
+    map.insert(key.to_string(), Instant::now());
+}
+
 async fn get_ref(
     Path((owner, repo, branch)): Path<(String, String, String)>,
     Query(params): Query<RefQuery>,
@@ -711,27 +744,34 @@ async fn get_ref(
         .map(|s| secrecy::SecretString::new(s.into()));
 
     // Serialize syncs for this repo so concurrent fetches do not corrupt the
-    // bare mirror directory.
+    // bare mirror directory. Acquiring the lock also means any in-progress sync
+    // for this repo has finished by the time we proceed.
+    let fresh_key = format!("{}/{}/{}", owner, repo, branch);
     let lock = repo_lock(&state.sync_locks, &owner, &repo).await;
     let _guard = lock.lock().await;
-    if let Err(e) = ensure_mirror(
-        &mirror_dir,
-        &owner,
-        &repo,
-        &branch,
-        state.default_depth,
-        github_token.as_ref(),
-    )
-    .await
-    {
-        state.metrics.record_error();
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: format!("mirror sync failed: {}", e),
-            }),
+    // Skip the `git fetch` when the mirror was refreshed within the TTL — by a
+    // recent resolve, or by the sync we just waited on while holding the lock.
+    if !mirror_is_fresh(&state, &fresh_key) {
+        if let Err(e) = ensure_mirror(
+            &mirror_dir,
+            &owner,
+            &repo,
+            &branch,
+            state.default_depth,
+            github_token.as_ref(),
         )
-            .into_response();
+        .await
+        {
+            state.metrics.record_error();
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("mirror sync failed: {}", e),
+                }),
+            )
+                .into_response();
+        }
+        stamp_mirror_fresh(&state, &fresh_key);
     }
     drop(_guard);
 
@@ -761,6 +801,7 @@ async fn get_ref(
                 head_blobs_pack: String::new(),
                 head_blobs_idx: String::new(),
                 head_blobs_chunks: Vec::new(),
+                packs: Vec::new(),
                 prebuilt_index: String::new(),
                 archive: String::new(),
                 manifest: String::new(),
@@ -861,6 +902,21 @@ fn ref_response(
     };
     let head_blobs_idx_url = signed_url(storage, &info.head_blobs_idx);
 
+    // Sign each editable pack + idx so the client fetches them straight from
+    // object storage. `None` entries (e.g. local backend) fall back to the
+    // gateway. Ordered to match the manifest's `packs` list.
+    let (pack_chunk_urls, pack_idx_urls) = if info.packs.is_empty() {
+        (None, None)
+    } else {
+        let packs: Vec<Option<String>> =
+            info.packs.iter().map(|p| signed_url(storage, &p.pack)).collect();
+        let idxs: Vec<Option<String>> =
+            info.packs.iter().map(|p| signed_url(storage, &p.idx)).collect();
+        let packs = if packs.iter().all(Option::is_none) { None } else { Some(packs) };
+        let idxs = if idxs.iter().all(Option::is_none) { None } else { Some(idxs) };
+        (packs, idxs)
+    };
+
     RefResponse {
         owner,
         repo,
@@ -876,6 +932,8 @@ fn ref_response(
         archive_chunk_urls,
         head_blobs_chunk_urls,
         head_blobs_idx_url,
+        pack_chunk_urls,
+        pack_idx_urls,
         shallow: clonepack_kind == "shallow",
     }
 }
@@ -1034,6 +1092,9 @@ async fn sync_repo(
     {
         Ok(info) => {
             state.metrics.record_sync(start.elapsed());
+            // The mirror was just fetched; let the immediately-following resolve
+            // skip its own fetch.
+            stamp_mirror_fresh(&state, &format!("{}/{}/{}", owner, repo, branch));
             let resp = ref_response(owner, repo, branch.clone(), &info, &state.storage, "full");
             drop(_guard);
             (StatusCode::OK, Json(resp)).into_response()
@@ -1682,13 +1743,22 @@ async fn do_sync(
         builder.build_shallow_skeleton_pack(&commit2s)
     });
 
-    // Head-blobs pack + idx.
+    // Depth-1 packs: the complete object closure for HEAD (commit + tree + every
+    // blob), split into many small self-contained packs (~1-2 MB). The client
+    // installs and extracts them in parallel as they download. Carried in the
+    // manifest's `packs` list. (Phase 1 ships only the HEAD-closure depth=1;
+    // deeper-history packs come in Phase 2.)
+    let pack_target_raw: u64 = std::env::var("RIPCLONE_PACK_BYTES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(6 * 1024 * 1024);
     let mirror_dir3 = mirror_dir.clone();
     let cas3 = cas.clone();
     let commit3 = commit.clone();
-    let head_blobs_handle = tokio::task::spawn_blocking(move || {
+    let depth_packs_handle = tokio::task::spawn_blocking(move || {
         let builder = PackBuilder::new(&mirror_dir3, &cas3);
-        builder.build_head_blobs_pack(&commit3)
+        // Two layers: HEAD-closure packs (every depth) + history packs (full only).
+        builder.build_layered_packs(&commit3, pack_target_raw)
     });
 
     // Working-tree archive + manifest.
@@ -1705,8 +1775,7 @@ async fn do_sync(
     let (shallow_skeleton_pack, shallow_skeleton_idx) = shallow_skeleton_handle
         .await
         .context("shallow skeleton pack task")??;
-    let (head_blobs_pack, head_blobs_idx) =
-        head_blobs_handle.await.context("head blobs pack task")??;
+    let (head_packs, history_packs) = depth_packs_handle.await.context("depth packs task")??;
     let (archive_chunk_hashes, mut metadata_chunk) =
         archive_handle.await.context("archive task")??;
 
@@ -1753,11 +1822,50 @@ async fn do_sync(
     let shallow_metadata_data = shallow_metadata_chunk.encode_to_vec();
     let shallow_metadata_hash = cas.put(&shallow_metadata_data)?;
 
-    // Split the head-blobs pack into fixed-size chunks so the client can fetch
-    // it in parallel. The idx stays small and is fetched as a single object.
-    let head_blobs_pack_data = cas.get(&head_blobs_pack)?;
-    let head_blobs_idx_data = cas.get(&head_blobs_idx)?;
-    let head_blobs_chunk_refs = split_and_store_pack(cas, &head_blobs_pack_data)?;
+    // Build manifest `packs` entries. Each is a self-contained git pack + idx,
+    // fetched and installed independently. The shallow (depth=1) clonepack lists
+    // only the HEAD-closure packs; the full clonepack lists HEAD + history. Order
+    // is HEAD-first so a shallow client's URL indices line up with the prefix of
+    // the (head+history) signed-URL list.
+    let to_entries =
+        |packs: &[(String, u64, String, u64)], history_only: bool| -> Result<Vec<crate::clonepack::PackEntry>> {
+            packs
+                .iter()
+                .map(|(ph, pl, ih, il)| {
+                    anyhow::Ok(crate::clonepack::PackEntry {
+                        pack: Some(ChunkRef {
+                            hash: hash_from_hex(ph)?,
+                            len: *pl,
+                        }),
+                        idx: Some(ChunkRef {
+                            hash: hash_from_hex(ih)?,
+                            len: *il,
+                        }),
+                        history_only,
+                    })
+                })
+                .collect()
+        };
+    let head_entries = to_entries(&head_packs, false)?;
+    let history_entries = to_entries(&history_packs, true)?;
+    let mut full_entries = head_entries.clone();
+    full_entries.extend(history_entries.iter().cloned());
+
+    // HEAD + history, for storage upload, retention protection, and RefInfo
+    // signing (ordered HEAD-first to match the manifests).
+    let all_packs: Vec<&(String, u64, String, u64)> =
+        head_packs.iter().chain(history_packs.iter()).collect();
+    let depth_pack_hashes: Vec<String> = all_packs
+        .iter()
+        .flat_map(|(p, _, i, _)| [p.clone(), i.clone()])
+        .collect();
+    let pack_artifacts: Vec<crate::PackArtifact> = all_packs
+        .iter()
+        .map(|(p, _, i, _)| crate::PackArtifact {
+            pack: p.clone(),
+            idx: i.clone(),
+        })
+        .collect();
 
     let archive_chunk_lengths = crate::clonepack::archive_chunk_lengths(&metadata_chunk);
     let archive_chunks: Vec<ChunkRef> = archive_chunk_hashes
@@ -1771,33 +1879,32 @@ async fn do_sync(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let make_clonepack = |metadata_hash: String, metadata_len: u64| -> Result<ClonepackManifest> {
-        Ok(ClonepackManifest {
-            commit: commit.clone(),
-            parent_commit: parent.clone(),
-            default_branch: default_branch.clone(),
-            metadata_chunk: Some(ChunkRef {
-                hash: hash_from_hex(&metadata_hash)?,
-                len: metadata_len,
-            }),
-            archive_chunks: archive_chunks.clone(),
-            head_blobs_chunks: head_blobs_chunk_refs.clone(),
-            head_blobs_idx: Some(ChunkRef {
-                hash: hash_from_hex(&head_blobs_idx)?,
-                len: head_blobs_idx_data.len() as u64,
-            }),
-            ..Default::default()
-        })
-    };
+    let make_clonepack =
+        |metadata_hash: String, metadata_len: u64, packs: Vec<crate::clonepack::PackEntry>| -> Result<ClonepackManifest> {
+            Ok(ClonepackManifest {
+                commit: commit.clone(),
+                parent_commit: parent.clone(),
+                default_branch: default_branch.clone(),
+                metadata_chunk: Some(ChunkRef {
+                    hash: hash_from_hex(&metadata_hash)?,
+                    len: metadata_len,
+                }),
+                archive_chunks: archive_chunks.clone(),
+                packs,
+                ..Default::default()
+            })
+        };
 
+    // Full clonepack: HEAD closure + all history. Shallow: HEAD closure only.
     let full_clonepack_manifest =
-        make_clonepack(metadata_hash.clone(), metadata_data.len() as u64)?;
+        make_clonepack(metadata_hash.clone(), metadata_data.len() as u64, full_entries)?;
     let full_clonepack_data = full_clonepack_manifest.encode_to_vec();
     let full_clonepack_hash = cas.put(&full_clonepack_data)?;
 
     let shallow_clonepack_manifest = make_clonepack(
         shallow_metadata_hash.clone(),
         shallow_metadata_data.len() as u64,
+        head_entries,
     )?;
     let shallow_clonepack_data = shallow_clonepack_manifest.encode_to_vec();
     let shallow_clonepack_hash = cas.put(&shallow_clonepack_data)?;
@@ -1816,11 +1923,6 @@ async fn do_sync(
         String::new()
     };
 
-    let head_blobs_chunk_hashes: Vec<String> = head_blobs_chunk_refs
-        .iter()
-        .map(|r| hash_to_hex(&r.hash))
-        .collect();
-
     let info = RefInfo {
         commit: commit.clone(),
         parent_commit: parent.clone(),
@@ -1828,8 +1930,9 @@ async fn do_sync(
         skeleton_pack: skeleton_pack.clone(),
         skeleton_idx: skeleton_idx.clone(),
         head_blobs_pack: String::new(),
-        head_blobs_idx: head_blobs_idx.clone(),
-        head_blobs_chunks: head_blobs_chunk_hashes.clone(),
+        head_blobs_idx: String::new(),
+        head_blobs_chunks: Vec::new(),
+        packs: pack_artifacts.clone(),
         prebuilt_index: prebuilt_index.clone(),
         archive: archive_chunk_hashes.first().cloned().unwrap_or_default(),
         manifest: metadata_hash.clone(),
@@ -1877,6 +1980,8 @@ async fn do_sync(
     ];
     artifact_hashes.extend(info.head_blobs_chunks.iter().map(|s| s.as_str()));
     artifact_hashes.extend(info.archive_chunks.iter().map(|s| s.as_str()));
+    // The editable depth packs + their idxs.
+    artifact_hashes.extend(depth_pack_hashes.iter().map(|s| s.as_str()));
     for hash in artifact_hashes.iter().filter(|h| !h.is_empty()) {
         let data = cas
             .get(hash)
@@ -1976,6 +2081,7 @@ async fn update_build_status(
             head_blobs_pack: String::new(),
             head_blobs_idx: String::new(),
             head_blobs_chunks: Vec::new(),
+            packs: Vec::new(),
             prebuilt_index: String::new(),
             archive: String::new(),
             manifest: String::new(),
@@ -2093,6 +2199,13 @@ pub async fn run_server(
         build_queue_depth: Arc::new(AtomicUsize::new(0)),
         oidc_verifier,
         sync_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        mirror_freshness: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        mirror_fresh_ttl: Duration::from_secs(
+            env::var("RIPCLONE_MIRROR_FRESH_TTL_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(60),
+        ),
     };
     let build_queue = spawn_build_worker(state.clone());
     state.build_queue = build_queue;
@@ -2143,6 +2256,8 @@ mod tests {
             build_queue_depth: Arc::new(AtomicUsize::new(0)),
             oidc_verifier: None,
             sync_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            mirror_freshness: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            mirror_fresh_ttl: Duration::from_secs(60),
         }
     }
 
@@ -2227,6 +2342,7 @@ mod tests {
             head_blobs_pack: String::new(),
             head_blobs_idx: String::new(),
             head_blobs_chunks: Vec::new(),
+            packs: Vec::new(),
             prebuilt_index: String::new(),
             archive: String::new(),
             manifest: String::new(),
@@ -2317,6 +2433,7 @@ mod tests {
             head_blobs_pack: String::new(),
             head_blobs_idx: String::new(),
             head_blobs_chunks: vec![],
+            packs: vec![],
             prebuilt_index: String::new(),
             archive: String::new(),
             manifest: manifest_hash.clone(),
@@ -2398,6 +2515,7 @@ mod tests {
             head_blobs_pack: String::new(),
             head_blobs_idx: String::new(),
             head_blobs_chunks: vec![],
+            packs: vec![],
             prebuilt_index: String::new(),
             archive: String::new(),
             manifest: manifest_hash.clone(),

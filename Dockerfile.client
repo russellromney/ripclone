@@ -3,9 +3,9 @@ FROM rust:1.96.0-slim AS builder
 
 WORKDIR /app
 
-# Install build-time deps for git2, fuser, and openssl.
+# Install build-time deps for git2, fuser, openssl, and zlib-ng (cmake).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git pkg-config libssl-dev libfuse-dev libgit2-dev protobuf-compiler \
+    git pkg-config libssl-dev libfuse-dev libgit2-dev protobuf-compiler cmake build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy manifests and build script first for layer caching.

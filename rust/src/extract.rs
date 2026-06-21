@@ -1,6 +1,7 @@
 use crate::git;
 use crate::manifest::{FileEntry, FrameInfo, MetadataChunk as Manifest};
 use anyhow::{Context, Result};
+use flate2::read::ZlibDecoder;
 use crossbeam_channel::{Receiver, Sender, bounded};
 use filetime::{FileTime, set_file_mtime, set_symlink_file_times};
 use sha1::{Digest as Sha1Digest, Sha1};
@@ -9,6 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tracing::info;
@@ -1121,6 +1123,71 @@ mod tests {
             assert_eq!(output.stdout, data);
         }
     }
+
+    #[test]
+    fn pack_materialize_roundtrip() {
+        // Exercises the single-download path: a HEAD commit/tree + blobs live in
+        // the object database and the working tree is materialized by walking
+        // that tree.
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("out");
+        std::fs::create_dir(&target).unwrap();
+        init_git_dir(&target);
+
+        let repo = git2::Repository::open(&target).unwrap();
+
+        let data_a = b"hello from the pack\n";
+        let data_x = b"#!/bin/sh\necho hi\n";
+        let link_target = b"a.txt";
+
+        let oid_a = repo.blob(data_a).unwrap();
+        let oid_x = repo.blob(data_x).unwrap();
+        let oid_l = repo.blob(link_target).unwrap();
+
+        // Build a tree: a.txt (file), link (symlink), dir/run.sh (executable).
+        let mut sub = repo.treebuilder(None).unwrap();
+        sub.insert("run.sh", oid_x, 0o100755).unwrap();
+        let sub_oid = sub.write().unwrap();
+        let mut top = repo.treebuilder(None).unwrap();
+        top.insert("a.txt", oid_a, 0o100644).unwrap();
+        top.insert("link", oid_l, 0o120000).unwrap();
+        top.insert("dir", sub_oid, 0o040000).unwrap();
+        let tree_oid = top.write().unwrap();
+        let tree = repo.find_tree(tree_oid).unwrap();
+        let sig = git2::Signature::now("t", "t@e").unwrap();
+        let commit_oid = repo
+            .commit(Some("HEAD"), &sig, &sig, "msg", &tree, &[])
+            .unwrap();
+
+        let stats = materialize_worktree_from_pack(&target, &commit_oid.to_string()).unwrap();
+        assert_eq!(stats.files, 3);
+
+        // Content lands on disk, including nested directories.
+        assert_eq!(std::fs::read(target.join("a.txt")).unwrap(), data_a);
+        assert_eq!(std::fs::read(target.join("dir/run.sh")).unwrap(), data_x);
+
+        // Symlink is created as a real symlink pointing at its target.
+        let link = target.join("link");
+        let meta = std::fs::symlink_metadata(&link).unwrap();
+        assert!(meta.file_type().is_symlink(), "link should be a symlink");
+        assert_eq!(std::fs::read_link(&link).unwrap(), Path::new("a.txt"));
+
+        // Executable bit is preserved for 0o100755 entries.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perm = std::fs::metadata(target.join("dir/run.sh"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(perm & 0o111, 0o111, "exec bit should be set");
+            let perm_a = std::fs::metadata(target.join("a.txt"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(perm_a & 0o111, 0, "plain file should not be executable");
+        }
+    }
 }
 
 /// Default compressed chunk size for streaming extractions. A chunk contains
@@ -1571,6 +1638,356 @@ pub fn extract_archive_from_chunk_receiver(
         files: files_written,
         raw_bytes: raw_total,
     })
+}
+
+/// Materialize the working tree directly from an installed git packfile.
+///
+/// `repo_root` is the install root containing `.git`, with the depth pack + idx
+/// already written into `.git/objects/pack`. `commit` is the HEAD commit hex sha.
+///
+/// The HEAD tree is walked to enumerate every working-tree path, its mode, and
+/// its blob oid; each blob is then read out of the object database (libgit2
+/// resolves pack deltas + zlib) and written to disk in parallel. After
+/// materialization the skip-worktree bit is cleared for every path so git treats
+/// the tree normally.
+///
+/// This is the single-download clone path: the depth pack is both the object
+/// database and the working-tree source, so no archive is fetched and no
+/// separate file table is needed.
+pub fn materialize_worktree_from_pack(repo_root: &Path, commit: &str) -> Result<ExtractStats> {
+    let start = Instant::now();
+
+    // Enumerate working-tree entries by walking the HEAD tree from the pack.
+    struct WorkItem {
+        path: Vec<u8>,
+        mode: u32,
+        oid: git2::Oid,
+    }
+
+    let items: Vec<WorkItem> = {
+        let repo = git2::Repository::open(repo_root)
+            .with_context(|| format!("open repo {}", repo_root.display()))?;
+        let oid = git2::Oid::from_str(commit)
+            .with_context(|| format!("invalid commit sha {}", commit))?;
+        let tree = repo
+            .find_commit(oid)
+            .with_context(|| format!("find HEAD commit {}", commit))?
+            .tree()
+            .with_context(|| format!("read tree for commit {}", commit))?;
+
+        let mut items: Vec<WorkItem> = Vec::new();
+        let mut walk_err: Option<anyhow::Error> = None;
+        tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
+            if walk_err.is_some() {
+                return git2::TreeWalkResult::Skip;
+            }
+            // Only blobs become files; trees are recursed into and gitlinks
+            // (submodule commit entries) are skipped.
+            if entry.kind() == Some(git2::ObjectType::Blob) {
+                let mut path = root.as_bytes().to_vec();
+                path.extend_from_slice(entry.name_bytes());
+                if let Err(e) = validate_relative_path(path_from_bytes(&path)) {
+                    walk_err = Some(e).map(|e| {
+                        e.context(format!("invalid path {}", String::from_utf8_lossy(&path)))
+                    });
+                    return git2::TreeWalkResult::Skip;
+                }
+                items.push(WorkItem {
+                    path,
+                    mode: entry.filemode() as u32,
+                    oid: entry.id(),
+                });
+            }
+            git2::TreeWalkResult::Ok
+        })
+        .context("walk HEAD tree")?;
+        if let Some(e) = walk_err {
+            return Err(e);
+        }
+        items
+    };
+
+    if items.is_empty() {
+        return Ok(ExtractStats {
+            files: 0,
+            raw_bytes: 0,
+        });
+    }
+
+    // Pre-create parent directories single-threaded so the per-file writers race
+    // neither on mkdir nor on directory existence checks.
+    let dirs: HashSet<PathBuf> = items
+        .iter()
+        .filter_map(|it| {
+            let p = path_from_bytes(&it.path);
+            let parent = p.parent()?;
+            if parent.as_os_str().is_empty() {
+                return None;
+            }
+            Some(parent.to_path_buf())
+        })
+        .collect();
+    let mut dirs: Vec<_> = dirs.into_iter().collect();
+    dirs.sort();
+    for dir in &dirs {
+        safe_create_dir_all(repo_root, dir)
+            .with_context(|| format!("create dir {}", dir.display()))?;
+    }
+
+    let num_cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let write_threads = std::env::var("RIPCLONE_WRITE_THREADS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| num_cpus.max(1))
+        .max(1)
+        .min(items.len());
+
+    info!(
+        "materializing {} files from pack with {} threads",
+        items.len(),
+        write_threads
+    );
+
+    let cursor = AtomicUsize::new(0);
+    let written = AtomicUsize::new(0);
+    let raw_bytes = AtomicUsize::new(0);
+    let error: Mutex<Option<anyhow::Error>> = Mutex::new(None);
+
+    std::thread::scope(|scope| {
+        for _ in 0..write_threads {
+            scope.spawn(|| {
+                // Each thread owns its own Repository handle: git2 odb readers
+                // are not Sync, but per-thread handles share the mmap'd pack
+                // through the OS page cache with no cross-thread locking.
+                let repo = match git2::Repository::open(repo_root)
+                    .with_context(|| format!("open repo {}", repo_root.display()))
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        *error.lock().unwrap() = Some(e);
+                        return;
+                    }
+                };
+                let odb = match repo.odb().context("open object database") {
+                    Ok(o) => o,
+                    Err(e) => {
+                        *error.lock().unwrap() = Some(e);
+                        return;
+                    }
+                };
+
+                loop {
+                    // Stop pulling new work as soon as any thread has failed.
+                    if error.lock().unwrap().is_some() {
+                        return;
+                    }
+                    let idx = cursor.fetch_add(1, Ordering::Relaxed);
+                    if idx >= items.len() {
+                        return;
+                    }
+                    let item = &items[idx];
+                    let res: Result<usize> = (|| {
+                        let obj = odb.read(item.oid).with_context(|| {
+                            format!(
+                                "read blob {} for {}",
+                                item.oid,
+                                String::from_utf8_lossy(&item.path)
+                            )
+                        })?;
+                        let content = obj.data();
+                        // write_entry only reads `path` and `mode`; blob_sha1 and
+                        // fragments are unused on this path.
+                        let entry = FileEntry {
+                            path: item.path.clone(),
+                            mode: item.mode,
+                            blob_sha1: Vec::new(),
+                            fragments: Vec::new(),
+                        };
+                        write_entry(repo_root, &entry, content)?;
+                        Ok(content.len())
+                    })();
+                    match res {
+                        Ok(len) => {
+                            written.fetch_add(1, Ordering::Relaxed);
+                            raw_bytes.fetch_add(len, Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            *error.lock().unwrap() = Some(e);
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    if let Some(e) = error.into_inner().unwrap() {
+        return Err(e);
+    }
+    let files_written = written.load(Ordering::Relaxed);
+    if files_written != items.len() {
+        anyhow::bail!(
+            "pack extractor wrote {} files but expected {}",
+            files_written,
+            items.len()
+        );
+    }
+
+    // The files now exist on disk; clear skip-worktree so git diffs/status see
+    // them as ordinary tracked paths.
+    let paths: Vec<String> = items
+        .iter()
+        .map(|it| String::from_utf8_lossy(&it.path).into_owned())
+        .collect();
+    git::clear_skip_worktree_index(repo_root, &paths)
+        .context("clear skip-worktree after pack materialization")?;
+
+    let raw_total = raw_bytes.load(Ordering::Relaxed) as u64;
+    info!(
+        "materialized {} files ({} raw bytes) from pack in {:?}",
+        files_written,
+        raw_total,
+        start.elapsed()
+    );
+
+    Ok(ExtractStats {
+        files: files_written,
+        raw_bytes: raw_total,
+    })
+}
+
+/// Map from a 20-byte git blob sha1 to the working-tree paths (and modes) that
+/// contain that blob. Built from the manifest file table.
+pub type BlobPathMap = HashMap<[u8; 20], Vec<(Vec<u8>, u32)>>;
+
+/// Build a [`BlobPathMap`] from the manifest file entries.
+pub fn build_blob_path_map(files: &[FileEntry]) -> BlobPathMap {
+    let mut map: BlobPathMap = HashMap::new();
+    for f in files {
+        if f.blob_sha1.len() == 20 {
+            let mut key = [0u8; 20];
+            key.copy_from_slice(&f.blob_sha1);
+            map.entry(key).or_default().push((f.path.clone(), f.mode));
+        }
+    }
+    map
+}
+
+/// Validate every path and pre-create all parent directories single-threaded, so
+/// the parallel per-pack writers never race on `mkdir`.
+pub fn prepare_worktree_dirs(target_dir: &Path, files: &[FileEntry]) -> Result<()> {
+    for entry in files {
+        validate_relative_path(path_from_bytes(&entry.path)).with_context(|| {
+            format!(
+                "invalid manifest path: {}",
+                String::from_utf8_lossy(&entry.path)
+            )
+        })?;
+    }
+    let dirs: HashSet<PathBuf> = files
+        .iter()
+        .filter_map(|e| {
+            let parent = path_from_bytes(&e.path).parent()?;
+            if parent.as_os_str().is_empty() {
+                return None;
+            }
+            Some(parent.to_path_buf())
+        })
+        .collect();
+    let mut dirs: Vec<_> = dirs.into_iter().collect();
+    dirs.sort();
+    for dir in &dirs {
+        safe_create_dir_all(target_dir, dir)
+            .with_context(|| format!("create dir {}", dir.display()))?;
+    }
+    Ok(())
+}
+
+/// Parse an in-memory, undeltified git pack and write every blob whose sha1 is
+/// in `blob_paths` to its working-tree path(s) under `target_dir`. Returns the
+/// number of files written.
+///
+/// Only OBJ_COMMIT/TREE/BLOB/TAG are handled; delta objects are rejected (the
+/// server builds these packs with `--window=0`). Parent directories must already
+/// exist (see [`prepare_worktree_dirs`]).
+pub fn extract_blobs_from_pack_bytes(
+    pack: &[u8],
+    blob_paths: &BlobPathMap,
+    target_dir: &Path,
+) -> Result<usize> {
+    if pack.len() < 12 || &pack[0..4] != b"PACK" {
+        anyhow::bail!("invalid pack header");
+    }
+    let count = u32::from_be_bytes([pack[8], pack[9], pack[10], pack[11]]) as usize;
+    let mut off = 12usize;
+    let mut written = 0usize;
+
+    for i in 0..count {
+        if off >= pack.len() {
+            anyhow::bail!("pack object {} starts past end of pack", i);
+        }
+        let (obj_type, size, hdr_len) = parse_pack_obj_header(&pack[off..])
+            .with_context(|| format!("parse object {} header", i))?;
+        let data_start = off + hdr_len;
+        if obj_type == 6 || obj_type == 7 {
+            anyhow::bail!("unexpected delta object (type {}) in undeltified pack", obj_type);
+        }
+        if data_start > pack.len() {
+            anyhow::bail!("pack object {} data starts past end of pack", i);
+        }
+        let mut dec = ZlibDecoder::new(&pack[data_start..]);
+        let mut content = Vec::with_capacity(size as usize);
+        dec.read_to_end(&mut content)
+            .with_context(|| format!("inflate pack object {}", i))?;
+        off = data_start + dec.total_in() as usize;
+
+        // type 3 == OBJ_BLOB. The manifest keys blobs by the plain sha1 of the
+        // raw content (no git "blob <len>\0" header), so match that.
+        if obj_type == 3 {
+            let sha: [u8; 20] = Sha1::digest(&content).into();
+            if let Some(paths) = blob_paths.get(&sha) {
+                for (path, mode) in paths {
+                    let entry = FileEntry {
+                        path: path.clone(),
+                        mode: *mode,
+                        blob_sha1: Vec::new(),
+                        fragments: Vec::new(),
+                    };
+                    write_entry(target_dir, &entry, &content)?;
+                    written += 1;
+                }
+            }
+        }
+    }
+    Ok(written)
+}
+
+/// Parse a git pack object header: 3-bit type + little-endian base-128 size.
+/// Returns `(type, uncompressed_size, header_byte_len)`.
+fn parse_pack_obj_header(buf: &[u8]) -> Result<(u8, u64, usize)> {
+    if buf.is_empty() {
+        anyhow::bail!("truncated pack object header");
+    }
+    let mut i = 0usize;
+    let b = buf[i];
+    i += 1;
+    let obj_type = (b >> 4) & 0x07;
+    let mut size = (b & 0x0f) as u64;
+    let mut shift = 4u32;
+    let mut cont = b & 0x80 != 0;
+    while cont {
+        if i >= buf.len() {
+            anyhow::bail!("truncated pack object size varint");
+        }
+        let b = buf[i];
+        i += 1;
+        size |= ((b & 0x7f) as u64) << shift;
+        shift += 7;
+        cont = b & 0x80 != 0;
+    }
+    Ok((obj_type, size, i))
 }
 
 /// Fetch and extract a working-tree archive using parallel HTTP range requests.

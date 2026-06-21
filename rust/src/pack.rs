@@ -152,14 +152,158 @@ impl<'a> PackBuilder<'a> {
         Ok(count)
     }
 
+    /// Build a complete object pack for `commit` limited to the last `depth`
+    /// commits (`None` = full history). The pack contains commits, trees, and
+    /// every blob reachable from those commits — i.e. everything needed to
+    /// materialize the working tree at HEAD and inspect the included history.
+    ///
+    /// Objects are stored undeltified (`git pack-objects --window=0`) so the
+    /// client can extract files without resolving deltas.
+    pub fn build_depth_pack(
+        &self,
+        commit: &str,
+        depth: Option<usize>,
+    ) -> Result<(String, String)> {
+        let object_shas = git::list_object_shas_with_depth(&self.repo, commit, depth)?;
+        self.pack_and_index_inner(&object_shas, true)
+    }
+
+    /// Build the depth content as many small, self-contained git packs, each
+    /// targeting roughly `target_raw_bytes` of uncompressed object content.
+    /// Objects are partitioned greedily by raw size so packs are evenly sized
+    /// (~1-2 MB compressed for a few-MB raw target); each pack is independently
+    /// valid (non-thin), so the client can install and extract them in parallel
+    /// as they download.
+    ///
+    /// Returns `(pack_hash, pack_len, idx_hash, idx_len)` for each pack.
+    pub fn build_depth_packs(
+        &self,
+        commit: &str,
+        depth: Option<usize>,
+        target_raw_bytes: u64,
+    ) -> Result<Vec<(String, u64, String, u64)>> {
+        let oids = git::list_object_shas_with_depth(&self.repo, commit, depth)?;
+        if oids.is_empty() {
+            bail!("no objects to pack for {}", commit);
+        }
+        self.build_packs_from_oids(&oids, target_raw_bytes, true)
+    }
+
+    /// Build the depth content as two layers of mini-packs:
+    ///   - `head`: the HEAD-tree closure (commit + trees + every *current* blob).
+    ///     Needed by every clone depth; this is the working tree.
+    ///   - `history`: every other reachable object (old blob versions, ancestor
+    ///     commits/trees) — i.e. full history minus the HEAD closure. Needed only
+    ///     for deeper clones.
+    ///
+    /// A depth=1 clonepack lists only `head`; a full (depth=0) clonepack lists
+    /// `head` + `history`. The packs are content-addressed, so the depth=1 set is
+    /// literally a subset of the full set — no separate HEAD pack is built.
+    ///
+    /// `history` is empty for a single-commit repo. Note: `history` is only as
+    /// complete as the mirror's available history (deepen/unshallow the mirror
+    /// for a true full clone).
+    pub fn build_layered_packs(
+        &self,
+        commit: &str,
+        target_raw_bytes: u64,
+    ) -> Result<(
+        Vec<(String, u64, String, u64)>,
+        Vec<(String, u64, String, u64)>,
+    )> {
+        use std::collections::HashSet;
+        let head_oids = git::list_object_shas_with_depth(&self.repo, commit, Some(1))?;
+        if head_oids.is_empty() {
+            bail!("no objects to pack for {}", commit);
+        }
+        let head_set: HashSet<&str> = head_oids.iter().map(String::as_str).collect();
+        let all_oids = git::list_object_shas_with_depth(&self.repo, commit, None)?;
+        let history_oids: Vec<String> = all_oids
+            .into_iter()
+            .filter(|o| !head_set.contains(o.as_str()))
+            .collect();
+
+        // HEAD closure: undeltified so the client can hand-parse blobs straight
+        // from the downloaded bytes for the working tree.
+        let head_packs = self.build_packs_from_oids(&head_oids, target_raw_bytes, true)?;
+        // History: deltified (undeltified history is multi-GB). The client never
+        // hand-parses these — they're only installed for the object DB and git
+        // reads them, resolving deltas itself.
+        let history_packs = if history_oids.is_empty() {
+            Vec::new()
+        } else {
+            self.build_packs_from_oids(&history_oids, target_raw_bytes, false)?
+        };
+        Ok((head_packs, history_packs))
+    }
+
+    /// Partition `oids` greedily by raw size into `~target_raw_bytes` batches and
+    /// pack each as a self-contained, undeltified (`--window=0`) mini-pack.
+    /// Returns `(pack_hash, pack_len, idx_hash, idx_len)` per pack.
+    fn build_packs_from_oids(
+        &self,
+        oids: &[String],
+        target_raw_bytes: u64,
+        undeltified: bool,
+    ) -> Result<Vec<(String, u64, String, u64)>> {
+        if oids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sizes = git::object_sizes(&self.repo, oids)?;
+
+        // Greedy size-based partitioning. A single object larger than the target
+        // gets its own pack (we can't split one object across packs).
+        let target = target_raw_bytes.max(1);
+        let mut batches: Vec<Vec<String>> = Vec::new();
+        let mut cur: Vec<String> = Vec::new();
+        let mut cur_bytes = 0u64;
+        for oid in oids {
+            let sz = sizes.get(oid).copied().unwrap_or(0);
+            if !cur.is_empty() && cur_bytes + sz > target {
+                batches.push(std::mem::take(&mut cur));
+                cur_bytes = 0;
+            }
+            cur.push(oid.clone());
+            cur_bytes += sz;
+        }
+        if !cur.is_empty() {
+            batches.push(cur);
+        }
+
+        let mut packs = Vec::with_capacity(batches.len());
+        for batch in batches {
+            // `undeltified` (`--window=0`): each object stored whole so the client
+            // can hand-parse blobs from the bytes (HEAD closure). Deltified packs
+            // are compact and only installed for the object DB (history); git
+            // resolves their deltas. Each pack is self-contained (non-thin).
+            let (pack_hash, idx_hash) = self.pack_and_index_inner(&batch, undeltified)?;
+            let pack_len = self.cas.get(&pack_hash)?.len() as u64;
+            let idx_len = self.cas.get(&idx_hash)?.len() as u64;
+            packs.push((pack_hash, pack_len, idx_hash, idx_len));
+        }
+        Ok(packs)
+    }
+
     fn pack_and_index(&self, object_shas: &[String]) -> Result<(String, String)> {
+        self.pack_and_index_inner(object_shas, false)
+    }
+
+    fn pack_and_index_inner(
+        &self,
+        object_shas: &[String],
+        undeltified: bool,
+    ) -> Result<(String, String)> {
         if object_shas.is_empty() {
             bail!("no objects to pack");
         }
 
         let tmp = tempfile::TempDir::new()?;
         let prefix = tmp.path().join("pack");
-        git::pack_objects_to_prefix(&self.repo, object_shas, &prefix)?;
+        if undeltified {
+            git::pack_objects_undeltified_to_prefix(&self.repo, object_shas, &prefix)?;
+        } else {
+            git::pack_objects_to_prefix(&self.repo, object_shas, &prefix)?;
+        }
 
         let mut pack_path: Option<PathBuf> = None;
         let mut idx_path: Option<PathBuf> = None;

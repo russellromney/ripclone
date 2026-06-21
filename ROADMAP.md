@@ -4,44 +4,73 @@
 >
 > This repo is the **headless open-source backend**: the Rust server, the CLI, the archive format, and the GitHub Actions trigger. Billing, workspaces, and the web UI live in the separate `ripclone-cloud` project.
 
+## Clone modes & pack architecture (active plan)
+
+We support **exactly three** clone modes — no arbitrary `--depth N` (it's finicky and almost nobody uses it; people pick depth=1 or full). Three content tiers:
+
+- **head** = **`editable --depth 1`** (default): HEAD snapshot, full object DB for HEAD, `.git/shallow` boundary written. The agent/CI hot path. *(done & validated clean)*
+- **full** = **`editable --depth 0`**: HEAD + all history, complete `git fsck`-clean clone, no shallow marker. *(was a stub — see below)*
+- **worktree** = **`files`**: worktree only, no git objects (zstd archive) — fastest CI path. *(done)*
+
+This collapses the server to **two pack buckets** (no range/geometric depth buckets):
+
+- **HEAD-closure packs** — every current blob + HEAD commit/trees. **Undeltified**, many small (~2 MB) packs so the client downloads in parallel and hand-parses for the working tree. Used by *every* depth. *(done)*
+- **History packs** — full history minus HEAD closure (ancestor commits/trees, old blob versions). **Deltified** (undeltified history is multi-GB), fewer/larger packs. Only **installed** for the object DB; the client never hand-parses or materializes the worktree from them (git reads them, resolving deltas). *(history bucket built; needs deltify flip)*
+
+depth=1 clonepack lists HEAD-closure packs; full lists HEAD + history. The depth=1 set is a **content-addressed subset** of the full set — no separate HEAD pack is built.
+
+**MIDX (the "many packs but git stays fast" lever):** the server pre-builds a `multi-pack-index` per variant (head-MIDX, full-MIDX) in a temp pack dir using the client's deterministic `pack-<trailer>.{pack,idx}` filenames, stores it as a content-addressed artifact, and the client drops it into `.git/objects/pack/`. Object lookups become O(log) across all packs regardless of count — so many small packs (great download parallelism) coexist with fast `git status`/`diff`/`log`. Cheap to build (indexes existing idx files; no pack rewrite). Optionally `--bitmap`.
+
+**Full-clone correctness (two distinct tiers, do not conflate):**
+- **head/depth-1** is *shallow* and must carry a `.git/shallow` boundary marker so `git log`/`deepen` stop cleanly at HEAD. *(done — the client writes it)*
+- **full/depth-0** is *complete* and must carry **no** marker; it requires the **mirror to hold the entire history**. The mirror was created with `--depth 50`, so "full" silently meant "last 50 commits" and `git rev-list HEAD` broke at the boundary (observed bug). Fix: the mirror is **always a complete clone** — the `--depth` knob is removed entirely; existing shallow mirrors are `fetch --unshallow`'d on next sync.
+
+### Immediate next
+1. **Deltify the history bucket** — kills the full-history size blowup (client unchanged; it only hand-parses HEAD packs). *(done)*
+2. **Always-full mirror** so depth=0 is a true, fsck-clean full clone. Drop the `--depth 50` default; unshallow existing mirrors. *(in progress)*
+3. **Server-pregenerate + ship MIDX** (head + full) as a content-addressed artifact the client drops in. Today MIDX is only built **client-side** (`git multi-pack-index write` per clone) — works, but burns CPU on the hot path. *(not done)*
+
+### Deferred
+- **LSM incremental build** — don't rebuild full history every sync (append an L0 pack at HEAD, compact older into immutable range packs; LSM levels). Optimization only.
+- **io_uring** durable-disk worktree writes — orthogonal speedup so `--temp` (ephemeral tmpfs) isn't required for fast durable clones.
+- **Blobless partial clone** (`--filter=blob:none` via a git promisor pointing at the server) — distinct from `files`; a separate project for huge monorepos.
+
 ## What already works
 
 See `CHANGELOG.md` for the full list. The important baseline for current work:
 
-- **Clonepack format**: top-level `ClonepackManifest` + `MetadataChunk` + content-addressed archive chunks + separate head-blobs chunks.
-- **Signed URLs**: ref response returns presigned Tigris URLs for the manifest, metadata chunk, archive chunks, and head-blobs chunks.
+- **Clonepack format**: top-level `ClonepackManifest` + content-addressed depth-pack chunks + optional files artifact.
+- **Signed URLs**: ref response returns presigned object-storage URLs for the manifest, pack chunks, and optional files artifact.
 - **Shared ref store**: `RefStore` trait with file-backed, S3-backed, and caching implementations.
 - **Async builds**: `/v1/build` accepts an OIDC token from GitHub Actions and enqueues the build.
-- **Security**: the critical findings from the adversarial review are fixed (artifact-id validation, atomic CAS writes, hash verification, path safety, mode validation, rate limiting keyed by IP).
-- **Client paths**: direct-install (`git checkout-index` using a head-blobs pack) and archive extraction (zstd frames written directly) are both implemented and A/B tested.
-- **Tests**: 27 unit tests, but no CI, no integration-test suite, and no fuzz/property tests yet.
+- **Security**: artifact-id validation, atomic CAS writes, hash verification, path safety, mode validation, and IP-keyed rate limiting are implemented.
+- **Client paths**: pack install + parallel worktree extraction, and optional zstd files-artifact extraction.
+- **Tests**: unit tests exist, but CI and a full integration-test suite are still needed.
 
 ## Current plan
 
 The next batch of work is about making the client fast, predictable, and globally consistent, while keeping the default behavior identical to what users expect from `git clone`.
 
-### 1. Archive chunks vs. head-blobs pack
+### 1. Clonepack artifacts
 
-Both represent the **same** depth: the `HEAD` commit only. They are not different history depths.
+A clonepack is now built from two optional artifacts:
 
-- **Head-blobs pack** = every blob reachable from `HEAD`, stored as a git packfile. This is what makes `git diff`, `git show`, and `git checkout-index` work.
-- **Archive chunks** = the same blob bytes, grouped and zstd-compressed for fast parallel file materialization.
+- **Depth pack** = a git packfile containing the commit(s), tree(s), and blob(s) for a requested history depth. This is what makes `git diff`, `git show`, `git checkout`, and edit/push work.
+- **Files artifact** = the working tree files as zstd-compressed raw bytes. This is the fastest path when you only need files (CI / build-only).
 
-For branches: each branch gets its own clonepack. For history beyond `HEAD`: not supported yet; that is the future “clonepack deltas” item.
+The server builds one depth pack per requested depth. `--depth 1` includes the HEAD commit, its tree, and every blob reachable from HEAD. `--depth 0` includes all history.
 
-Because the two representations contain the same data, fetching both is redundant. The modes below decide which one to use (or whether to use both in parallel for speed).
+The files artifact is optional. When the server builds it, `--mode files` can skip the git pack entirely.
 
-### 2. History depths and clonepack variants ✅
+### 2. History depths
 
-Implemented in `rust/src/lib.rs`, `rust/src/server.rs`, `rust/src/client.rs`, `rust/src/pack.rs`, and `rust/src/git.rs`. See `CHANGELOG.md` for details.
-
-- The server now produces both a `shallow` (depth=1) and a `full` clonepack for every sync.
-- The ref endpoint selects the variant with `?clonepack=shallow|full`.
-- The CLI exposes `--history shallow|full` on clone and `--depth N` on sync.
+- The CLI clone command takes `--depth N` where `N` is the number of commits, and `0` means unlimited/full history.
+- The server builds a single git pack containing the objects for that depth using `git rev-list --max-count=$DEPTH --objects HEAD | git pack-objects --window=0`.
+- The pack is split into content-addressed chunks. The manifest lists the chunks (and their signed URLs) plus the pack idx.
+- The client downloads the chunks, concatenates them into a valid git pack, installs it, and extracts the working tree.
 
 Remaining work:
 - **Repo/branch-specific depth configuration** (see section below).
-- Support more than two hard-coded depths (e.g., depth=10, depth=50) without recompiling.
 
 ### 2a. Repo/branch-specific configuration (planned)
 
@@ -54,7 +83,7 @@ Proposed design:
 - Config fields:
   - `clonepack_depths: Vec<DepthSpec>` where `DepthSpec` is `{ name: "shallow", depth: 1 }`, `{ name: "full", depth: null }`, or arbitrary depths like `{ name: "recent", depth: 50 }`.
   - `compression_level`, `dictionary_id`, `hot_files`, `archive_chunk_size`, `head_blobs_chunk_size`.
-  - `enabled_modes: ["full", "fast", "hybrid", "skeleton"]` if a repo wants to disable some paths.
+  - `enabled_modes: ["editable", "files", "skeleton"]` if a repo wants to disable some paths.
 - On sync/build, the server reads the config for the repo/branch and builds exactly the requested set of clonepacks.
 - The ref endpoint accepts `?clonepack=<name>`; the name maps to one of the configured depths.
 - Default config (when none is stored) produces `shallow` and `full` exactly like today, so behavior is unchanged for unconfigured repos.
@@ -62,19 +91,21 @@ Proposed design:
 
 ### 3. Unified async download/write pipeline ✅
 
-Implemented in `rust/src/client.rs`, `rust/src/extract.rs`, and `rust/src/pack_writer.rs`. See `CHANGELOG.md` for details.
+Implemented in `rust/src/client.rs`, `rust/src/extract.rs`, and `rust/src/pack.rs`. See `CHANGELOG.md` for details.
 
 Remaining future improvements:
-- Buffer early archive chunks to a bounded temp spill directory when they arrive before metadata (currently the bounded channel holds up to two chunks in memory).
 - Retry each chunk download with exponential backoff.
 - Delete the temp install directory on failure.
 
 ### 4. User-facing clone modes ✅
 
-Implemented as `--mode full|fast|hybrid|skeleton` and `RIPCLONE_MODE`. See `CHANGELOG.md` for details.
+Implemented as `--mode editable|files|skeleton` and `RIPCLONE_MODE`. `rcgit clone` is always `editable`.
 
-Remaining future item:
-- `lazy` mode (metadata + archive chunks first; head-blobs fetched by a background daemon afterwards).
+- `editable` (default) downloads the depth pack for `--depth N` and extracts a real git repo.
+- `files` downloads only the optional zstd files artifact; fastest for CI but not a usable git repo.
+- `skeleton` installs only `.git` metadata with no working tree or blobs.
+
+The old `full`, `fast`, `hybrid`, and `lazy` modes are removed.
 
 ### 5. Edge warmth with Tigris
 
@@ -107,13 +138,19 @@ Implemented as `--bench` / `RIPCLONE_BENCH=1` with a JSON report covering all de
 - **GitHub App path**: support installation tokens in addition to the env-var PAT.
 - **CI and integration tests**: GitHub Actions workflow with `cargo test`, `cargo clippy -- -D warnings`, `cargo fmt --check`, Docker build, and an end-to-end clone test against a fixture repo.
 - **Extend existing e2e scripts**:
-  - `scripts/e2e_clonepack.sh` already tests default vs. archive extraction for a public fixture; extend it to test `--mode=full`, `--mode=fast`, and `--mode=hybrid` and verify `git diff`/`git show` per mode.
-  - `scripts/e2e_archive.sh` already verifies content, symlinks, executable bits, and edit detection for direct-install; reuse it for all modes.
+  - `scripts/e2e_clonepack.sh` should test `--mode=editable`, `--mode=files`, and `--mode=skeleton` and verify `git diff`/`git show` in `editable` mode.
+  - `scripts/e2e_archive.sh` should verify content, symlinks, executable bits, and edit detection for `editable` mode; reuse it for `files` mode where applicable.
 - **Fuzz/property tests**: random manifests should either produce the expected tree or return `Err`, never a silently short tree.
 
-### 8. Clonepack deltas / compaction (future)
+### 8. Incremental syncs and cross-branch sharing
 
-Once warm full clones are fast and predictable, move from full clonepacks per commit to append-only delta chunks for recent commits, with background compaction. This is on the roadmap but not the current focus.
+The long-term storage model is an append-only, chunked pack per branch with a mutable tail:
+
+- Normal syncs append new objects to the tail chunk and seal it at the size limit.
+- Branches share immutable history chunks because the chunk store is content-addressed.
+- History rewrite (force-push, filter-repo) is detected by checking whether the new HEAD is a descendant of the previous HEAD. When rewrite happens, the server does a full rebuild.
+
+The current implementation rebuilds the entire depth pack on each sync; the LSM tail model is future work once the single-pack path is proven.
 
 ## Storage model
 
@@ -130,10 +167,28 @@ Once warm full clones are fast and predictable, move from full clonepacks per co
 | Warm full clone of `oven-sh/bun` from a laptop after regional cache is warm | < 5 s |
 | Client setup + disk write time (after chunks land) | < 500 ms |
 | `git status` after clone | clean |
-| `git diff <file>` after editing | works immediately in `full`/`hybrid` modes |
+| `git diff <file>` after editing | works immediately in `editable` mode |
 | Per-phase benchmark | downloadable for every clone |
 
 ## Notes
 
 - See `CHANGELOG.md` for completed work.
-- See `docs/ADVERSARIAL_REVIEW_2026-06-18.md` for the security review that drove recent hardening.
+
+## Distribution (future)
+
+Make ripclone installable through the two most common package managers.
+
+### `cargo install ripclone`
+
+Add the required metadata to `rust/Cargo.toml` (description, `license = "Elastic-2.0"`, repository, readme) and publish the crate to crates.io. The crate already exposes a lib plus four binaries (`ripclone`, `ripclone-server`, `ripclone-proxy`, `git-remote-ripclone`), so `cargo install` gives users everything.
+
+### `pip install ripclone`
+
+Use [maturin](https://www.maturin.rs/) to build wheels that ship the Rust executables. The simplest first version uses `bindings = "bin"` in a root `pyproject.toml` pointing at `rust/Cargo.toml`; the resulting wheel installs the binaries on `PATH`. Later we can add PyO3 bindings if we want a native Python API.
+
+Build targets to start:
+- macOS aarch64 and x86_64
+- Linux x86_64 (manylinux)
+- Windows x86_64
+
+Add a GitHub Actions workflow that builds and uploads wheels on every release tag, plus a manual trigger for testing.

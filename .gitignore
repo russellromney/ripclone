@@ -7,3 +7,6 @@ data/
 *.egg-info/
 .pytest_cache/
 .mypy_cache/
+/bun/
+/openclaw/
+/pandas/

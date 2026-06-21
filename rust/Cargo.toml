@@ -19,6 +19,10 @@ path = "src/bin/ripclone-proxy.rs"
 name = "git-remote-ripclone"
 path = "src/bin/git-remote-ripclone.rs"
 
+[[bin]]
+name = "rcgit"
+path = "src/bin/rcgit.rs"
+
 [features]
 default = ["zlib-ng"]
 # Use zlib-ng for faster pack compression/decompression. Disable this feature

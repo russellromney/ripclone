@@ -37,12 +37,38 @@ message ClonepackManifest {
   // The pack is split into multiple content-addressed chunks so the client can
   // fetch it in parallel. The chunks are concatenated in order to reconstruct
   // the original pack file.
+  // The complete object pack for the requested depth: commits, trees, and every
+  // blob reachable from HEAD (and from the last `depth` commits). Built with
+  // `git pack-objects --window=0` so objects are undeltified. This is the single
+  // pack the client installs and materializes the working tree from. Split into
+  // content-addressed chunks for parallel fetch; the chunks concatenate in order
+  // to reconstruct the pack. (Field names are historical; the pack now carries
+  // the full closure, not only HEAD blobs.)
   repeated ChunkRef head_blobs_chunks = 8;
   ChunkRef head_blobs_idx = 7;
 
   // Deprecated: kept for compatibility with older manifests. New builds write
   // `head_blobs_chunks` instead.
   ChunkRef head_blobs_pack = 6 [deprecated = true];
+
+  // The editable clone payload: many small, self-contained git packs (each
+  // ~1-2 MB with its own idx). The client downloads them in parallel and, as
+  // each lands, installs it into `.git/objects/pack` and extracts the files it
+  // contains — overlapping download and extraction. This list IS the index;
+  // no separate per-pack table is needed.
+  repeated PackEntry packs = 11;
+}
+
+// One self-contained git pack plus its index, addressed by content hash.
+message PackEntry {
+  ChunkRef pack = 1;
+  ChunkRef idx = 2;
+  // When true, this pack is history-only: deltified, installed for the object
+  // database but NOT hand-parsed for the working tree (the client can't parse
+  // deltas, and the worktree comes entirely from the undeltified HEAD-closure
+  // packs). Default false = HEAD-closure pack, hand-parsed for the worktree
+  // (also back-compatible with older manifests built before this field).
+  bool history_only = 3;
 }
 
 // Per-commit metadata chunk. This is the only chunk that changes on every

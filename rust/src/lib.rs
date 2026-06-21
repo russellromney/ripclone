@@ -22,7 +22,7 @@ pub mod mode;
 pub mod oidc;
 pub mod overlay;
 pub mod pack;
-pub mod pack_writer;
+pub mod rcgit;
 pub mod ref_store;
 pub mod retention;
 pub mod server;
@@ -40,6 +40,15 @@ pub fn parse_repo(repo: &str) -> Result<(&str, &str)> {
         anyhow::bail!("repo must be owner/name, got: {}", repo);
     }
     Ok((parts[0], parts[1]))
+}
+
+/// One editable-clone pack and its idx, by content hash. Ordered to match the
+/// `packs` list in the clonepack manifest so the ref endpoint can sign each
+/// without re-decoding the manifest.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct PackArtifact {
+    pub pack: String,
+    pub idx: String,
 }
 
 /// Artifact hashes for one clonepack variant (e.g. shallow depth=1 or full).
@@ -70,6 +79,11 @@ pub struct RefInfo {
     /// client can fetch it in parallel.
     #[serde(default)]
     pub head_blobs_chunks: Vec<String>,
+    /// Editable-clone packs (pack + idx hashes), ordered to match the manifest's
+    /// `packs` list. Kept here so the ref endpoint can sign each pack/idx URL
+    /// without decoding the manifest, and for retention protection.
+    #[serde(default)]
+    pub packs: Vec<PackArtifact>,
     pub prebuilt_index: String,
     pub archive: String,
     pub manifest: String,

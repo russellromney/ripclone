@@ -141,7 +141,8 @@ cas_path() {
   local h="$1"
   echo "$CAS_DIR/${h:0:2}/${h}"
 }
-ref_json=$(curl -fsS "$SERVER_URL/v1/repos/$OWNER/$NAME/refs/HEAD")
+AUTH_HASH=$(printf '%s' "$RIPCLONE_TOKEN" | shasum -a 256 | awk '{print $1}')
+ref_json=$(curl -fsS -H "Authorization: Ripclone $AUTH_HASH" "$SERVER_URL/v1/repos/$OWNER/$NAME/refs/HEAD")
 clonepack_manifest=$(echo "$ref_json" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("clonepack_manifest",""))')
 
 echo ""

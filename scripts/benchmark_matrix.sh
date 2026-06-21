@@ -27,15 +27,25 @@ AUTH_HEADER="Authorization: Ripclone $TOKEN_HASH"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 RIPCLONE="$ROOT_DIR/rust/target/release/ripclone"
+RCGIT="$ROOT_DIR/rust/target/release/rcgit"
 SERVER="$ROOT_DIR/rust/target/release/ripclone-server"
 PROXY="$ROOT_DIR/rust/target/release/ripclone-proxy"
 
-for bin in "$RIPCLONE" "$SERVER" "$PROXY"; do
-  if [ ! -x "$bin" ]; then
-    echo "error: missing binary $bin (run cargo build --release in rust/)"
-    exit 1
-  fi
-done
+if [ "$MODE" = "rcgit" ]; then
+  for bin in "$RCGIT" "$SERVER" "$PROXY"; do
+    if [ ! -x "$bin" ]; then
+      echo "error: missing binary $bin (run cargo build --release in rust/)"
+      exit 1
+    fi
+  done
+else
+  for bin in "$RIPCLONE" "$SERVER" "$PROXY"; do
+    if [ ! -x "$bin" ]; then
+      echo "error: missing binary $bin (run cargo build --release in rust/)"
+      exit 1
+    fi
+  done
+fi
 
 now_ms() {
   perl -MTime::HiRes=time -e 'printf "%d\n", time * 1000'
@@ -133,7 +143,11 @@ fi
 echo ""
 echo "==> Warm-up clone (unmeasured, direct server)..."
 warmup_start=$(now_ms)
-"$RIPCLONE" --server "$SERVER_URL" clone "$REPO" --dir "$BASE_DIR/warmup" 2>&1 || true
+if [ "$MODE" = "rcgit" ]; then
+  "$RCGIT" --server "$SERVER_URL" clone "$REPO" --dir "$BASE_DIR/warmup" 2>&1 || true
+else
+  "$RIPCLONE" --server "$SERVER_URL" clone "$REPO" --mode "$MODE" --dir "$BASE_DIR/warmup" 2>&1 || true
+fi
 warmup_end=$(now_ms)
 printf "warmup=%d ms\n" $((warmup_end - warmup_start))
 rm -rf "$BASE_DIR/warmup"
@@ -179,8 +193,14 @@ for cores in $CORES; do
     for n in $(seq 1 "$ITER"); do
       install_dir="$BASE_DIR/install-${cores}-${rtt_ms}-${n}"
       install_start=$(now_ms)
-      RIPCLONE_FETCH_THREADS="$threads" RIPCLONE_WRITE_THREADS="$threads" \
-        "$RIPCLONE" --server "$PROXY_URL" clone "$REPO" --mode "$MODE" --dir "$install_dir" 2>&1
+      if [ "$MODE" = "rcgit" ]; then
+        RIPCLONE_FETCH_THREADS="$threads" RIPCLONE_WRITE_THREADS="$threads" \
+          RIPCLONE_FETCH_CONCURRENCY="$threads" \
+          "$RCGIT" --server "$PROXY_URL" clone "$REPO" --dir "$install_dir" 2>&1
+      else
+        RIPCLONE_FETCH_THREADS="$threads" RIPCLONE_WRITE_THREADS="$threads" \
+          "$RIPCLONE" --server "$PROXY_URL" clone "$REPO" --mode "$MODE" --dir "$install_dir" 2>&1
+      fi
       install_end=$(now_ms)
       elapsed=$((install_end - install_start))
       total_ms=$((total_ms + elapsed))

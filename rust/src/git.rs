@@ -60,110 +60,118 @@ pub fn update_index_sizes<P: AsRef<Path>>(git_dir: P, sizes: &HashMap<String, u6
     Ok(())
 }
 
-/// Mark every tracked path in the index as skip-worktree directly via `git2`.
+const SKIP_WORKTREE_BIT: u16 = 1 << 4;
+
+/// Update the skip-worktree bit for a set of paths directly via `git2`.
+/// `repo_dir` is the working tree (containing `.git`).
+/// This avoids spawning a `git update-index` subprocess.
+pub fn update_index_skip_worktree<P: AsRef<Path>>(
+    repo_dir: P,
+    paths: &[String],
+    set: bool,
+) -> Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let index_path = repo_dir.as_ref().join(".git").join("index");
+    update_index_skip_worktree_at(&index_path, paths, set)
+}
+
+fn update_index_skip_worktree_at(
+    index_path: &std::path::Path,
+    paths: &[String],
+    set: bool,
+) -> Result<()> {
+    let mut index = git2::Index::open(index_path)
+        .with_context(|| format!("opening index at {}", index_path.display()))?;
+
+    let target: HashSet<&str> = paths.iter().map(|s| s.as_str()).collect();
+    let entries: Vec<_> = index.iter().collect();
+    let mut changed = false;
+    for entry in entries {
+        let path = String::from_utf8_lossy(&entry.path).to_string();
+        if target.contains(path.as_str()) {
+            let current = entry.flags_extended & SKIP_WORKTREE_BIT != 0;
+            if current == set {
+                continue;
+            }
+            let flags_extended = if set {
+                entry.flags_extended | SKIP_WORKTREE_BIT
+            } else {
+                entry.flags_extended & !SKIP_WORKTREE_BIT
+            };
+            let updated = git2::IndexEntry {
+                flags_extended,
+                ..entry
+            };
+            index
+                .add(&updated)
+                .with_context(|| format!("update skip-worktree for {}", path))?;
+            changed = true;
+        }
+    }
+    if changed {
+        index
+            .write()
+            .with_context(|| format!("writing index at {}", index_path.display()))?;
+    }
+    Ok(())
+}
+
+/// Mark every tracked path in the index as skip-worktree.
 /// `repo_dir` is the working tree (containing `.git`).
 /// This lets git treat the working tree as clean even when files are not
 /// materialized yet, which is essential for skeleton/lazy-checkout snapshots.
+pub fn set_skip_worktree_all<P: AsRef<Path>>(repo_dir: P) -> Result<()> {
+    let repo_dir = repo_dir.as_ref();
+    let index_path = repo_dir.join(".git").join("index");
+    let index = git2::Index::open(&index_path)
+        .with_context(|| format!("opening index at {}", index_path.display()))?;
+    let paths: Vec<String> = index
+        .iter()
+        .map(|entry| String::from_utf8_lossy(&entry.path).to_string())
+        .collect();
+    update_index_skip_worktree(repo_dir, &paths, true)
+}
+
+/// Set skip-worktree on every tracked path only if at least one entry is
+/// missing the bit. Use this on a client that receives a prebuilt index from
+/// the server: it is a fast no-op when the server already set the bit.
+pub fn ensure_skip_worktree_all<P: AsRef<Path>>(repo_dir: P) -> Result<()> {
+    let repo_dir = repo_dir.as_ref();
+    let index_path = repo_dir.join(".git").join("index");
+    let index = git2::Index::open(&index_path)
+        .with_context(|| format!("opening index at {}", index_path.display()))?;
+    let paths: Vec<String> = index
+        .iter()
+        .filter(|entry| entry.flags_extended & SKIP_WORKTREE_BIT == 0)
+        .map(|entry| String::from_utf8_lossy(&entry.path).to_string())
+        .collect();
+    update_index_skip_worktree(repo_dir, &paths, true)
+}
+
 /// Clear the skip-worktree bit for every entry in the index.
 /// Returns the number of entries that were cleared.
 pub fn clear_skip_worktree_all<P: AsRef<Path>>(repo_dir: P) -> Result<usize> {
-    let index_path = repo_dir.as_ref().join(".git").join("index");
-    let mut index = git2::Index::open(&index_path)
+    let repo_dir = repo_dir.as_ref();
+    let index_path = repo_dir.join(".git").join("index");
+    let index = git2::Index::open(&index_path)
         .with_context(|| format!("opening index at {}", index_path.display()))?;
-
-    const SKIP_WORKTREE_BIT: u16 = 1 << 4;
-    let entries: Vec<_> = index.iter().collect();
-    let mut cleared = 0;
-    for entry in entries {
-        if entry.flags_extended & SKIP_WORKTREE_BIT != 0 {
-            let updated = git2::IndexEntry {
-                flags_extended: entry.flags_extended & !SKIP_WORKTREE_BIT,
-                ..entry
-            };
-            index.add(&updated).with_context(|| {
-                format!(
-                    "clear skip-worktree for {}",
-                    String::from_utf8_lossy(&updated.path)
-                )
-            })?;
-            cleared += 1;
-        }
-    }
-    index
-        .write()
-        .with_context(|| format!("writing index at {}", index_path.display()))?;
+    let paths: Vec<String> = index
+        .iter()
+        .filter(|entry| entry.flags_extended & SKIP_WORKTREE_BIT != 0)
+        .map(|entry| String::from_utf8_lossy(&entry.path).to_string())
+        .collect();
+    let cleared = paths.len();
+    update_index_skip_worktree(repo_dir, &paths, false)?;
     Ok(cleared)
-}
-
-pub fn set_skip_worktree_all<P: AsRef<Path>>(repo_dir: P) -> Result<()> {
-    let index_path = repo_dir.as_ref().join(".git").join("index");
-    let mut index = git2::Index::open(&index_path)
-        .with_context(|| format!("opening index at {}", index_path.display()))?;
-
-    const SKIP_WORKTREE_BIT: u16 = 1 << 4;
-    let entries: Vec<_> = index.iter().collect();
-    for entry in entries {
-        let updated = git2::IndexEntry {
-            ctime: entry.ctime,
-            mtime: entry.mtime,
-            dev: entry.dev,
-            ino: entry.ino,
-            mode: entry.mode,
-            uid: entry.uid,
-            gid: entry.gid,
-            file_size: entry.file_size,
-            id: entry.id,
-            flags: entry.flags,
-            flags_extended: entry.flags_extended | SKIP_WORKTREE_BIT,
-            path: entry.path.to_vec(),
-        };
-        index.add(&updated).with_context(|| {
-            format!(
-                "set skip-worktree for {}",
-                String::from_utf8_lossy(&updated.path)
-            )
-        })?;
-    }
-    index
-        .write()
-        .with_context(|| format!("writing index at {}", index_path.display()))?;
-    Ok(())
 }
 
 /// Clear the skip-worktree bit for a set of paths directly via `git2`.
 /// `repo_dir` is the working tree (containing `.git`).
 /// This avoids spawning a `git update-index` subprocess for every extraction.
 pub fn clear_skip_worktree_index<P: AsRef<Path>>(repo_dir: P, paths: &[String]) -> Result<()> {
-    if paths.is_empty() {
-        return Ok(());
-    }
-    let index_path = repo_dir.as_ref().join(".git").join("index");
-    let mut index = git2::Index::open(&index_path)
-        .with_context(|| format!("opening index at {}", index_path.display()))?;
-
-    let to_clear: std::collections::HashSet<&str> = paths.iter().map(|s| s.as_str()).collect();
-    let mut updates = Vec::new();
-    for entry in index.iter() {
-        let path = String::from_utf8_lossy(&entry.path).to_string();
-        if to_clear.contains(path.as_str()) {
-            let mut flags_extended = entry.flags_extended;
-            flags_extended &= !(1 << 4); // clear SKIP_WORKTREE bit (bit 4)
-            updates.push((path, flags_extended, entry));
-        }
-    }
-    for (path, flags_extended, entry) in updates {
-        let updated = git2::IndexEntry {
-            flags_extended,
-            ..entry
-        };
-        index
-            .add(&updated)
-            .with_context(|| format!("clear skip-worktree for {}", path))?;
-    }
-    index
-        .write()
-        .with_context(|| format!("writing index at {}", index_path.display()))?;
-    Ok(())
+    update_index_skip_worktree(repo_dir, paths, false)
 }
 
 /// Materialize the entire index into the working tree using `git checkout-index`.
@@ -213,30 +221,15 @@ pub fn checkout_index_with_git_dir(git_dir: &Path, work_tree: &Path) -> Result<(
 /// Returns the number of entries that were cleared.
 pub fn clear_skip_worktree_all_git_dir<P: AsRef<Path>>(git_dir: P) -> Result<usize> {
     let index_path = git_dir.as_ref().join("index");
-    let mut index = git2::Index::open(&index_path)
+    let index = git2::Index::open(&index_path)
         .with_context(|| format!("opening index at {}", index_path.display()))?;
-
-    const SKIP_WORKTREE_BIT: u16 = 1 << 4;
-    let entries: Vec<_> = index.iter().collect();
-    let mut cleared = 0;
-    for entry in entries {
-        if entry.flags_extended & SKIP_WORKTREE_BIT != 0 {
-            let updated = git2::IndexEntry {
-                flags_extended: entry.flags_extended & !SKIP_WORKTREE_BIT,
-                ..entry
-            };
-            index.add(&updated).with_context(|| {
-                format!(
-                    "clear skip-worktree for {}",
-                    String::from_utf8_lossy(&updated.path)
-                )
-            })?;
-            cleared += 1;
-        }
-    }
-    index
-        .write()
-        .with_context(|| format!("writing index at {}", index_path.display()))?;
+    let paths: Vec<String> = index
+        .iter()
+        .filter(|entry| entry.flags_extended & SKIP_WORKTREE_BIT != 0)
+        .map(|entry| String::from_utf8_lossy(&entry.path).to_string())
+        .collect();
+    let cleared = paths.len();
+    update_index_skip_worktree_at(&index_path, &paths, false)?;
     Ok(cleared)
 }
 
@@ -315,6 +308,65 @@ pub fn list_object_shas_with_depth<P: AsRef<Path>>(
     }
     let out = run_git(repo, &args)?;
     Ok(out.lines().map(|s| s.to_string()).collect())
+}
+
+/// Write a multi-pack-index over all packs in `repo_dir`'s object store so git
+/// object lookups stay O(log n) regardless of how many packs are installed.
+/// Cheap: indexes the existing `.idx` files; no pack data is rewritten. Best
+/// effort — a failure only loses the lookup speedup, not correctness.
+pub fn write_multi_pack_index<P: AsRef<Path>>(repo_dir: P) -> Result<()> {
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(repo_dir.as_ref().as_os_str())
+        .args(["multi-pack-index", "write"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .context("spawn git multi-pack-index write")?;
+    if !status.success() {
+        anyhow::bail!("git multi-pack-index write failed");
+    }
+    Ok(())
+}
+
+/// Return the raw (uncompressed) size of each object via
+/// `git cat-file --batch-check`. Used to partition objects into evenly-sized
+/// pack batches.
+pub fn object_sizes<P: AsRef<Path>>(repo: P, oids: &[String]) -> Result<HashMap<String, u64>> {
+    if oids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let mut input = String::with_capacity(oids.len() * 41);
+    for oid in oids {
+        input.push_str(oid);
+        input.push('\n');
+    }
+    let input_file = tempfile::NamedTempFile::new()?;
+    std::fs::write(input_file.path(), input.as_bytes())?;
+    let stdin = std::fs::File::open(input_file.path())?;
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo.as_ref().as_os_str())
+        .args(["cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)"])
+        .stdin(stdin)
+        .stderr(Stdio::inherit())
+        .output()
+        .context("git cat-file --batch-check")?;
+    if !out.status.success() {
+        bail!("git cat-file --batch-check failed");
+    }
+    let text = String::from_utf8(out.stdout).context("batch-check output not UTF-8")?;
+    let mut map = HashMap::with_capacity(oids.len());
+    for line in text.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 3 {
+            continue;
+        }
+        if let Ok(size) = parts[2].parse::<u64>() {
+            map.insert(parts[0].to_string(), size);
+        }
+    }
+    Ok(map)
 }
 
 /// Return the blob SHAs of all symlinks reachable from `commit`.
@@ -456,6 +508,27 @@ pub fn pack_objects_to_prefix<P: AsRef<Path>, Q: AsRef<Path>>(
     object_shas: &[String],
     prefix: Q,
 ) -> Result<()> {
+    pack_objects_to_prefix_inner(repo, object_shas, prefix, &[])
+}
+
+/// Like `pack_objects_to_prefix` but stores every object whole — no new delta
+/// search (`--window=0`) and no reuse of deltas already present in the source
+/// repo (`--no-reuse-delta`). Required so the client can read objects with plain
+/// zlib and no delta resolution, at the cost of a larger pack.
+pub fn pack_objects_undeltified_to_prefix<P: AsRef<Path>, Q: AsRef<Path>>(
+    repo: P,
+    object_shas: &[String],
+    prefix: Q,
+) -> Result<()> {
+    pack_objects_to_prefix_inner(repo, object_shas, prefix, &["--window=0", "--no-reuse-delta"])
+}
+
+fn pack_objects_to_prefix_inner<P: AsRef<Path>, Q: AsRef<Path>>(
+    repo: P,
+    object_shas: &[String],
+    prefix: Q,
+    extra_args: &[&str],
+) -> Result<()> {
     if object_shas.is_empty() {
         bail!("no objects to pack");
     }
@@ -475,9 +548,15 @@ pub fn pack_objects_to_prefix<P: AsRef<Path>, Q: AsRef<Path>>(
 
     let repo_str = repo.as_ref().to_str().context("repo path not UTF-8")?;
     let prefix_str = prefix.as_ref().to_str().context("prefix path not UTF-8")?;
+    let extra = if extra_args.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", extra_args.join(" "))
+    };
     let cmd = format!(
-        "git -C '{}' pack-objects '{}' < '{}'",
+        "git -C '{}' pack-objects{} '{}' < '{}'",
         shell_escape(repo_str),
+        extra,
         shell_escape(prefix_str),
         shell_escape(input_file.path().to_str().unwrap())
     );
