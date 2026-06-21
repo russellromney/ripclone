@@ -30,6 +30,7 @@ pub mod sidecar;
 pub mod snapshot;
 pub mod storage;
 pub mod validation;
+pub mod worktree_writer;
 
 use anyhow::Result;
 
