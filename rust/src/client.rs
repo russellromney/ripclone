@@ -458,16 +458,37 @@ impl Client {
         if let Some(d) = depth {
             url.push_str(&format!("?depth={}", d));
         }
-        let mut req = self.http.post(&url);
-        if let Some(token) = github_token {
-            req = req.header("X-GitHub-Token", token);
-        }
-        let resp = req.send().await?;
-        if !resp.status().is_success() {
+        // With the async build queue the server may return 202 (build still
+        // running) or 503 (queue full). Each POST blocks server-side until its
+        // wait window elapses, so we just retry — coalescing means a retry
+        // re-attaches to the same in-flight build rather than starting a new one.
+        let max_attempts = std::env::var("RIPCLONE_SYNC_MAX_ATTEMPTS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(40usize);
+        for attempt in 0..max_attempts {
+            let mut req = self.http.post(&url);
+            if let Some(token) = github_token {
+                req = req.header("X-GitHub-Token", token);
+            }
+            let resp = req.send().await?;
+            let status = resp.status();
+            if status == reqwest::StatusCode::OK {
+                return Ok(resp.json().await?);
+            }
+            if status == reqwest::StatusCode::ACCEPTED
+                || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+            {
+                if attempt + 1 < max_attempts {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    continue;
+                }
+                anyhow::bail!("sync still building after {max_attempts} attempts");
+            }
             let text = resp.text().await.unwrap_or_default();
             anyhow::bail!("sync failed: {}", text);
         }
-        Ok(resp.json().await?)
+        anyhow::bail!("sync did not complete")
     }
 
     /// Fast install: download prebuilt `.git` artifacts and the working-tree

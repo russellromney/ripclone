@@ -49,6 +49,11 @@ pub struct ServerState {
     pub retention: Arc<Retention>,
     pub build_queue: tokio::sync::mpsc::Sender<BuildJob>,
     pub build_queue_depth: Arc<AtomicUsize>,
+    /// Waiters for in-flight background builds, keyed by `owner/repo/branch`. A
+    /// `/sync` registers a oneshot here and enqueues a job only if it is the
+    /// first waiter for that key (coalescing); the worker signals all waiters
+    /// when the build finishes.
+    pub build_waiters: BuildWaiters,
     pub oidc_verifier: Option<Arc<OidcVerifier>>,
     /// Per-repo mutexes so concurrent syncs for the same repo cannot corrupt
     /// the bare mirror directory.
@@ -185,10 +190,19 @@ pub struct BuildResponse {
     pub queue_depth: usize,
 }
 
+/// Waiters for in-flight background builds, keyed by `owner/repo/branch`.
+pub type BuildWaiters = Arc<
+    tokio::sync::Mutex<
+        std::collections::HashMap<String, Vec<tokio::sync::oneshot::Sender<Result<(), String>>>>,
+    >,
+>;
+
 #[derive(Clone)]
 pub struct BuildJob {
     pub owner: String,
     pub repo: String,
+    #[allow(dead_code)]
+    pub branch: String,
     pub github_token: Option<secrecy::SecretString>,
 }
 
@@ -1077,6 +1091,94 @@ async fn sync_repo(
                 .clone()
                 .map(|s| secrecy::SecretString::new(s.into()))
         });
+
+    // Async build queue: enqueue the build onto the bounded background worker so
+    // it survives client disconnect / HTTP timeout (the key win for huge repos)
+    // and is rate-bounded under load. Coalesce concurrent `/sync` for the same
+    // key onto one build, wait up to RIPCLONE_SYNC_WAIT_SECS, then 202.
+    if async_build_enabled() {
+        let key = format!("{owner}/{repo}/{branch}");
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+        let first = {
+            let mut w = state.build_waiters.lock().await;
+            let v = w.entry(key.clone()).or_default();
+            let was_empty = v.is_empty();
+            v.push(tx);
+            was_empty
+        };
+        if first {
+            state.build_queue_depth.fetch_add(1, Ordering::Relaxed);
+            let job = BuildJob {
+                owner: owner.clone(),
+                repo: repo.clone(),
+                branch: branch.clone(),
+                github_token,
+            };
+            if state.build_queue.try_send(job).is_err() {
+                state.build_queue_depth.fetch_sub(1, Ordering::Relaxed);
+                state.build_waiters.lock().await.remove(&key);
+                state.metrics.record_error();
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(ErrorResponse {
+                        error: "build queue full; retry shortly".to_string(),
+                    }),
+                )
+                    .into_response();
+            }
+        }
+        let wait = Duration::from_secs(env_bytes("RIPCLONE_SYNC_WAIT_SECS", 45));
+        match tokio::time::timeout(wait, rx).await {
+            Ok(Ok(Ok(()))) => match state.ref_store.load_branch(&owner, &repo, &branch).await {
+                Ok(Some(info)) => {
+                    state.metrics.record_sync(start.elapsed());
+                    let resp =
+                        ref_response(owner, repo, branch.clone(), &info, &state.storage, "full");
+                    return (StatusCode::OK, Json(resp)).into_response();
+                }
+                _ => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse {
+                            error: "build finished but ref missing".to_string(),
+                        }),
+                    )
+                        .into_response();
+                }
+            },
+            Ok(Ok(Err(e))) => {
+                state.metrics.record_error();
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("sync failed: {e}"),
+                    }),
+                )
+                    .into_response();
+            }
+            Ok(Err(_)) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: "build worker dropped".to_string(),
+                    }),
+                )
+                    .into_response();
+            }
+            Err(_) => {
+                // Still building — tell the client to poll/retry.
+                return (
+                    StatusCode::ACCEPTED,
+                    Json(BuildResponse {
+                        status: "building".to_string(),
+                        queue_depth: state.build_queue_depth.load(Ordering::Relaxed),
+                    }),
+                )
+                    .into_response();
+            }
+        }
+    }
+
     let lock = repo_lock(&state.sync_locks, &owner, &repo).await;
     let _guard = lock.lock().await;
     match do_sync(
@@ -1198,6 +1300,7 @@ async fn build_handler(
     let job = BuildJob {
         owner: body.owner,
         repo: body.repo,
+        branch: "HEAD".to_string(),
         github_token: state
             .github_token
             .clone()
@@ -1744,6 +1847,14 @@ fn sized_to_tuple(p: &crate::SizedPack) -> (String, u64, String, u64) {
 /// history in the background). Off by default.
 fn two_phase_enabled() -> bool {
     std::env::var("RIPCLONE_TWO_PHASE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// True when `/sync` routes the build through the bounded background worker
+/// (survives client disconnect, rate-bounded). Off by default.
+fn async_build_enabled() -> bool {
+    std::env::var("RIPCLONE_ASYNC_BUILD")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
 }
@@ -2961,6 +3072,7 @@ fn spawn_build_worker(state: ServerState) -> tokio::sync::mpsc::Sender<BuildJob>
         while let Some(job) = rx.recv().await {
             let owner = job.owner.clone();
             let repo = job.repo.clone();
+            let branch = job.branch.clone();
             let state = state.clone();
 
             // Mark as building in the shared ref store.
@@ -2975,7 +3087,7 @@ fn spawn_build_worker(state: ServerState) -> tokio::sync::mpsc::Sender<BuildJob>
                 &mirror_dir,
                 &owner,
                 &repo,
-                "HEAD",
+                &branch,
                 &state.ref_store,
                 false,
                 &state.storage,
@@ -2986,17 +3098,29 @@ fn spawn_build_worker(state: ServerState) -> tokio::sync::mpsc::Sender<BuildJob>
             drop(_guard);
 
             state.build_queue_depth.fetch_sub(1, Ordering::Relaxed);
-            match result {
+            let waiter_result: Result<(), String> = match &result {
                 Ok(_) => {
                     state.metrics.record_build_completed(start.elapsed());
                     let _ = update_build_status(&state, &owner, &repo, "done").await;
-                    info!("background build completed for {owner}/{repo}");
+                    // A successful sync marks the mirror fresh so the waiter's
+                    // resolve doesn't re-fetch.
+                    stamp_mirror_fresh(&state, &format!("{owner}/{repo}/{branch}"));
+                    info!("background build completed for {owner}/{repo}@{branch}");
+                    Ok(())
                 }
                 Err(e) => {
                     state.metrics.record_build_failed();
                     let _ =
                         update_build_status(&state, &owner, &repo, &format!("failed: {e}")).await;
-                    warn!("background build failed for {owner}/{repo}: {e}");
+                    warn!("background build failed for {owner}/{repo}@{branch}: {e}");
+                    Err(format!("{e}"))
+                }
+            };
+            // Signal every waiter for this key (coalesced /sync requests).
+            let key = format!("{owner}/{repo}/{branch}");
+            if let Some(senders) = state.build_waiters.lock().await.remove(&key) {
+                for s in senders {
+                    let _ = s.send(waiter_result.clone());
                 }
             }
         }
@@ -3137,6 +3261,7 @@ pub async fn run_server(
         retention,
         build_queue: tokio::sync::mpsc::channel(1).0, // placeholder
         build_queue_depth: Arc::new(AtomicUsize::new(0)),
+        build_waiters: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         oidc_verifier,
         sync_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         mirror_freshness: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -3193,6 +3318,7 @@ mod tests {
             retention,
             build_queue,
             build_queue_depth: Arc::new(AtomicUsize::new(0)),
+            build_waiters: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             oidc_verifier: None,
             sync_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             mirror_freshness: Arc::new(std::sync::Mutex::new(HashMap::new())),
