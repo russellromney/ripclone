@@ -154,7 +154,7 @@ impl WorktreeWriter {
                 Ok(writer) => Ok(writer),
                 Err(e) => {
                     tracing::warn!(
-                        "io_uring writer unavailable; falling back to POSIX writer: {e}"
+                        "io_uring writer unavailable; falling back to POSIX writer: {e:#}"
                     );
                     Ok(Self::posix())
                 }
@@ -422,99 +422,49 @@ fn write_regular_posix(target: &Path, mode: u32, content: &[u8]) -> Result<()> {
 #[cfg(target_os = "linux")]
 mod linux_uring {
     use super::*;
-    use crossbeam_channel::bounded;
-    use std::panic::{AssertUnwindSafe, catch_unwind};
-    use std::sync::{Arc, Mutex};
-    use std::time::Duration;
+    use io_uring::{IoUring, opcode, squeue, types};
+    use std::cell::RefCell;
+    use std::ffi::CString;
+    use std::io;
+    use std::os::unix::ffi::OsStrExt;
     use std::time::{SystemTime, UNIX_EPOCH};
-    use tokio::sync::mpsc;
 
-    enum UringRequest {
-        Write(WriteRequest),
-        WriteBatch(WriteBatchRequest),
-        Shutdown(crossbeam_channel::Sender<()>),
+    const QUEUE_DEPTH: u32 = 1024;
+    const MAX_BATCH_FILES: usize = 256;
+
+    #[derive(Clone, Copy)]
+    pub(super) struct UringWriter;
+
+    struct RawUringWriter {
+        ring: IoUring,
     }
 
-    struct WriteRequest {
+    struct InFlightWrite {
         target: PathBuf,
-        mode: u32,
+        path: CString,
+        flags: i32,
+        mode: libc::mode_t,
         content: Vec<u8>,
-        reply: crossbeam_channel::Sender<Result<()>>,
+        fd: Option<i32>,
+        open_res: Option<i32>,
+        write_res: Option<i32>,
+        close_res: Option<i32>,
     }
 
-    struct WriteBatchRequest {
-        writes: Vec<PreparedRegularWrite>,
-        reply: crossbeam_channel::Sender<Result<()>>,
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum FileOp {
+        Open = 0,
+        Write = 1,
+        Close = 2,
     }
 
-    #[derive(Clone)]
-    pub(super) struct UringWriter {
-        inner: Arc<UringInner>,
-    }
-
-    struct UringInner {
-        tx: mpsc::UnboundedSender<UringRequest>,
-        handle: Mutex<Option<std::thread::JoinHandle<()>>>,
+    thread_local! {
+        static THREAD_WRITER: RefCell<Option<RawUringWriter>> = const { RefCell::new(None) };
     }
 
     impl UringWriter {
         pub(super) fn new() -> Result<Self> {
-            let (tx, mut rx) = mpsc::unbounded_channel::<UringRequest>();
-            let (ready_tx, ready_rx) = bounded::<Result<()>>(1);
-
-            let handle = std::thread::Builder::new()
-                .name("ripclone-io-uring-writer".to_string())
-                .spawn(move || {
-                    let ready_for_runtime = ready_tx.clone();
-                    let result = catch_unwind(AssertUnwindSafe(move || {
-                        tokio_uring::builder().entries(256).start(async move {
-                            let _ = ready_for_runtime.send(Ok(()));
-                            while let Some(req) = rx.recv().await {
-                                match req {
-                                    UringRequest::Write(req) => {
-                                        tokio_uring::spawn(async move {
-                                            let result = write_regular_uring(
-                                                req.target,
-                                                req.mode,
-                                                req.content,
-                                            )
-                                            .await;
-                                            let _ = req.reply.send(result);
-                                        });
-                                    }
-                                    UringRequest::WriteBatch(req) => {
-                                        tokio_uring::spawn(async move {
-                                            let result =
-                                                write_regular_batch_uring(req.writes).await;
-                                            let _ = req.reply.send(result);
-                                        });
-                                    }
-                                    UringRequest::Shutdown(reply) => {
-                                        let _ = reply.send(());
-                                        break;
-                                    }
-                                }
-                            }
-                        });
-                    }));
-                    if result.is_err() {
-                        let _ = ready_tx.send(Err(anyhow::anyhow!(
-                            "io_uring runtime initialization panicked"
-                        )));
-                    }
-                })
-                .context("spawn io_uring writer thread")?;
-
-            match ready_rx.recv_timeout(Duration::from_secs(2)) {
-                Ok(Ok(())) => Ok(Self {
-                    inner: Arc::new(UringInner {
-                        tx,
-                        handle: Mutex::new(Some(handle)),
-                    }),
-                }),
-                Ok(Err(e)) => Err(e),
-                Err(e) => Err(anyhow::anyhow!("io_uring writer did not start: {e}")),
-            }
+            RawUringWriter::new().map(|_| Self)
         }
 
         pub(super) fn write_regular(&self, target: &Path, mode: u32, content: &[u8]) -> Result<()> {
@@ -530,39 +480,21 @@ mod linux_uring {
             if target.exists() {
                 std::fs::remove_file(target).ok();
             }
-
-            let (reply_tx, reply_rx) = bounded(1);
-            self.inner
-                .tx
-                .send(UringRequest::Write(WriteRequest {
+            with_thread_writer(|writer| {
+                writer.write_regular_batch(vec![PreparedRegularWrite {
                     target: target.to_path_buf(),
                     mode,
                     content,
-                    reply: reply_tx,
-                }))
-                .map_err(|_| anyhow::anyhow!("io_uring writer thread stopped"))?;
-            reply_rx
-                .recv()
-                .context("receive io_uring write result")?
-                .with_context(|| format!("write {}", target.display()))
+                }])
+            })
+            .with_context(|| format!("write {}", target.display()))
         }
 
         pub(super) fn write_regular_batch(&self, writes: Vec<PreparedRegularWrite>) -> Result<()> {
             if writes.is_empty() {
                 return Ok(());
             }
-
-            let (reply_tx, reply_rx) = bounded(1);
-            self.inner
-                .tx
-                .send(UringRequest::WriteBatch(WriteBatchRequest {
-                    writes,
-                    reply: reply_tx,
-                }))
-                .map_err(|_| anyhow::anyhow!("io_uring writer thread stopped"))?;
-            reply_rx
-                .recv()
-                .context("receive io_uring batch write result")?
+            with_thread_writer(|writer| writer.write_regular_batch(writes))
         }
 
         pub(super) fn probe(&self) -> Result<()> {
@@ -587,51 +519,295 @@ mod linux_uring {
         }
     }
 
-    impl Drop for UringInner {
-        fn drop(&mut self) {
-            let (reply_tx, reply_rx) = bounded(1);
-            let _ = self.tx.send(UringRequest::Shutdown(reply_tx));
-            let _ = reply_rx.recv_timeout(Duration::from_secs(2));
-            if let Some(handle) = self.handle.lock().ok().and_then(|mut h| h.take()) {
-                let _ = handle.join();
+    fn with_thread_writer<T>(f: impl FnOnce(&mut RawUringWriter) -> Result<T>) -> Result<T> {
+        THREAD_WRITER.with(|cell| {
+            let mut writer = cell.borrow_mut();
+            if writer.is_none() {
+                *writer = Some(RawUringWriter::new()?);
+            }
+            f(writer
+                .as_mut()
+                .expect("thread-local io_uring writer initialized"))
+        })
+    }
+
+    impl RawUringWriter {
+        fn new() -> Result<Self> {
+            let ring = IoUring::new(QUEUE_DEPTH).context("initialize io_uring queue")?;
+            Ok(Self { ring })
+        }
+
+        fn write_regular_batch(&mut self, mut writes: Vec<PreparedRegularWrite>) -> Result<()> {
+            while !writes.is_empty() {
+                let n = writes.len().min(MAX_BATCH_FILES);
+                let batch: Vec<_> = writes.drain(..n).collect();
+                self.write_regular_window(batch)?;
+            }
+            Ok(())
+        }
+
+        fn write_regular_window(&mut self, writes: Vec<PreparedRegularWrite>) -> Result<()> {
+            if writes.is_empty() {
+                return Ok(());
+            }
+
+            let mut in_flight = Vec::with_capacity(writes.len());
+            for write in writes {
+                if write.content.len() > u32::MAX as usize {
+                    anyhow::bail!(
+                        "file too large for single io_uring write: {}",
+                        write.target.display()
+                    );
+                }
+                let path =
+                    CString::new(write.target.as_os_str().as_bytes()).with_context(|| {
+                        format!("path contains NUL byte: {}", write.target.display())
+                    })?;
+                let flags = libc::O_WRONLY
+                    | libc::O_CREAT
+                    | libc::O_TRUNC
+                    | libc::O_CLOEXEC
+                    | libc::O_NOFOLLOW;
+                in_flight.push(InFlightWrite {
+                    target: write.target,
+                    path,
+                    flags,
+                    mode: write.mode as libc::mode_t,
+                    content: write.content,
+                    fd: None,
+                    open_res: None,
+                    write_res: None,
+                    close_res: None,
+                });
+            }
+
+            let mut entries = Vec::with_capacity(in_flight.len());
+            for (idx, write) in in_flight.iter().enumerate() {
+                entries.push(
+                    opcode::OpenAt::new(types::Fd(libc::AT_FDCWD), write.path.as_ptr())
+                        .flags(write.flags)
+                        .mode(write.mode)
+                        .build()
+                        .user_data(user_data(idx, FileOp::Open)),
+                );
+            }
+            self.submit_entries(&entries, "submit io_uring open batch")?;
+            for (idx, op, res) in
+                self.collect_completions(entries.len(), "wait for io_uring open batch completion")?
+            {
+                if op != FileOp::Open {
+                    anyhow::bail!("unexpected io_uring completion in open phase");
+                }
+                let write = in_flight
+                    .get_mut(idx)
+                    .ok_or_else(|| anyhow::anyhow!("invalid io_uring completion index {idx}"))?;
+                write.open_res = Some(res);
+                if res >= 0 {
+                    write.fd = Some(res);
+                }
+            }
+
+            entries.clear();
+            for (idx, write) in in_flight.iter_mut().enumerate() {
+                if let Some(fd) = write.fd {
+                    if write.content.is_empty() {
+                        write.write_res = Some(0);
+                    } else {
+                        entries.push(
+                            opcode::Write::new(
+                                types::Fd(fd),
+                                write.content.as_ptr(),
+                                write.content.len() as u32,
+                            )
+                            .offset(0)
+                            .build()
+                            .user_data(user_data(idx, FileOp::Write)),
+                        );
+                    }
+                }
+            }
+            if !entries.is_empty() {
+                if let Err(e) = self.submit_entries(&entries, "submit io_uring write batch") {
+                    close_open_fds_sync(&mut in_flight);
+                    return Err(e);
+                }
+                match self
+                    .collect_completions(entries.len(), "wait for io_uring write batch completion")
+                {
+                    Ok(completions) => {
+                        for (idx, op, res) in completions {
+                            if op != FileOp::Write {
+                                anyhow::bail!("unexpected io_uring completion in write phase");
+                            }
+                            let write = in_flight.get_mut(idx).ok_or_else(|| {
+                                anyhow::anyhow!("invalid io_uring completion index {idx}")
+                            })?;
+                            write.write_res = Some(res);
+                        }
+                    }
+                    Err(e) => {
+                        close_open_fds_sync(&mut in_flight);
+                        return Err(e);
+                    }
+                }
+            }
+
+            entries.clear();
+            for (idx, write) in in_flight.iter().enumerate() {
+                if let Some(fd) = write.fd {
+                    entries.push(
+                        opcode::Close::new(types::Fd(fd))
+                            .build()
+                            .user_data(user_data(idx, FileOp::Close)),
+                    );
+                }
+            }
+            if !entries.is_empty() {
+                if let Err(e) = self.submit_entries(&entries, "submit io_uring close batch") {
+                    close_open_fds_sync(&mut in_flight);
+                    return Err(e);
+                }
+                for (idx, op, res) in self.collect_completions(
+                    entries.len(),
+                    "wait for io_uring close batch completion",
+                )? {
+                    if op != FileOp::Close {
+                        anyhow::bail!("unexpected io_uring completion in close phase");
+                    }
+                    let write = in_flight.get_mut(idx).ok_or_else(|| {
+                        anyhow::anyhow!("invalid io_uring completion index {idx}")
+                    })?;
+                    write.close_res = Some(res);
+                    if res >= 0 {
+                        write.fd = None;
+                    }
+                }
+            }
+
+            for write in &in_flight {
+                check_open_result(write)?;
+                check_write_result(write)?;
+                check_close_result(write)?;
+            }
+            Ok(())
+        }
+
+        fn submit_entries(&mut self, entries: &[squeue::Entry], context: &str) -> Result<()> {
+            if entries.is_empty() {
+                return Ok(());
+            }
+            {
+                let mut sq = self.ring.submission();
+                unsafe {
+                    sq.push_multiple(entries)
+                        .map_err(|_| anyhow::anyhow!("io_uring submission queue is full"))?;
+                }
+            }
+            self.ring
+                .submitter()
+                .submit_and_wait(1)
+                .with_context(|| context.to_string())?;
+            Ok(())
+        }
+
+        fn collect_completions(
+            &mut self,
+            expected: usize,
+            context: &str,
+        ) -> Result<Vec<(usize, FileOp, i32)>> {
+            let mut completions = Vec::with_capacity(expected);
+            while completions.len() < expected {
+                {
+                    let mut cq = self.ring.completion();
+                    for cqe in &mut cq {
+                        let (idx, op) = parse_user_data(cqe.user_data())?;
+                        completions.push((idx, op, cqe.result()));
+                    }
+                }
+                if completions.len() < expected {
+                    self.ring
+                        .submitter()
+                        .submit_and_wait(1)
+                        .with_context(|| context.to_string())?;
+                }
+            }
+            Ok(completions)
+        }
+    }
+
+    fn user_data(idx: usize, op: FileOp) -> u64 {
+        ((idx as u64) << 2) | op as u64
+    }
+
+    fn parse_user_data(data: u64) -> Result<(usize, FileOp)> {
+        let idx = (data >> 2) as usize;
+        let op = match data & 0b11 {
+            0 => FileOp::Open,
+            1 => FileOp::Write,
+            2 => FileOp::Close,
+            other => anyhow::bail!("invalid io_uring completion op {other}"),
+        };
+        Ok((idx, op))
+    }
+
+    fn check_open_result(write: &InFlightWrite) -> Result<()> {
+        let res = write.open_res.ok_or_else(|| {
+            anyhow::anyhow!("missing open completion for {}", write.target.display())
+        })?;
+        if res < 0 {
+            Err(cqe_error(res)).with_context(|| format!("open {}", write.target.display()))?;
+        }
+        Ok(())
+    }
+
+    fn check_write_result(write: &InFlightWrite) -> Result<()> {
+        if write.open_res.is_some_and(|res| res < 0) {
+            return Ok(());
+        }
+        let res = write.write_res.ok_or_else(|| {
+            anyhow::anyhow!("missing write completion for {}", write.target.display())
+        })?;
+        if res < 0 {
+            Err(cqe_error(res)).with_context(|| format!("write {}", write.target.display()))?;
+        }
+        let expected = write.content.len();
+        if res as usize != expected {
+            anyhow::bail!(
+                "short io_uring write {}: wrote {} of {} bytes",
+                write.target.display(),
+                res,
+                expected
+            );
+        }
+        Ok(())
+    }
+
+    fn check_close_result(write: &InFlightWrite) -> Result<()> {
+        if write.open_res.is_some_and(|res| res < 0) {
+            return Ok(());
+        }
+        let res = write.close_res.ok_or_else(|| {
+            anyhow::anyhow!("missing close completion for {}", write.target.display())
+        })?;
+        if res < 0 {
+            Err(cqe_error(res)).with_context(|| format!("close {}", write.target.display()))?;
+        }
+        Ok(())
+    }
+
+    fn cqe_error(res: i32) -> io::Error {
+        debug_assert!(res < 0);
+        io::Error::from_raw_os_error(-res)
+    }
+
+    fn close_open_fds_sync(writes: &mut [InFlightWrite]) {
+        for write in writes {
+            if let Some(fd) = write.fd.take() {
+                unsafe {
+                    libc::close(fd);
+                }
             }
         }
-    }
-
-    async fn write_regular_batch_uring(writes: Vec<PreparedRegularWrite>) -> Result<()> {
-        let mut tasks = Vec::with_capacity(writes.len());
-        for write in writes {
-            tasks.push(tokio_uring::spawn(write_regular_uring(
-                write.target,
-                write.mode,
-                write.content,
-            )));
-        }
-        for task in tasks {
-            task.await??;
-        }
-        Ok(())
-    }
-
-    async fn write_regular_uring(target: PathBuf, mode: u32, content: Vec<u8>) -> Result<()> {
-        use std::os::unix::fs::OpenOptionsExt;
-
-        let mut opts = tokio_uring::fs::OpenOptions::new();
-        opts.write(true)
-            .create(true)
-            .truncate(true)
-            .mode(mode)
-            .custom_flags(libc::O_NOFOLLOW);
-        let file = opts
-            .open(&target)
-            .await
-            .with_context(|| format!("open {}", target.display()))?;
-        let (res, _content) = file.write_all_at(content, 0).await;
-        res.with_context(|| format!("write {}", target.display()))?;
-        file.close()
-            .await
-            .with_context(|| format!("close {}", target.display()))?;
-        Ok(())
     }
 }
 

@@ -69,7 +69,7 @@ jsonwebtoken = "10.4.0"
 subtle = "2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-tokio-uring = "0.5"
+io-uring = "0.7"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
