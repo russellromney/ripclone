@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Tests mirror from local file:// origins, never GitHub — no network needed.
+  RIPCLONE_ORIGIN_BASE_DEFAULT: ""
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Install build deps
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler cmake build-essential pkg-config libssl-dev libfuse-dev libgit2-dev
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: rustfmt
+        run: cargo fmt --all --check
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install build deps
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler cmake build-essential pkg-config libssl-dev libfuse-dev libgit2-dev git
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: Unit + integration tests
+        run: cargo test --release --all-targets
+
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install build deps
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler cmake build-essential pkg-config libssl-dev libfuse-dev libgit2-dev git
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: Build release binaries
+        working-directory: rust
+        run: cargo build --release --bins
+      - name: End-to-end (local origin, real binaries)
+        env:
+          RIPCLONE_TOKEN: ci-e2e-token
+        run: bash scripts/e2e_local.sh

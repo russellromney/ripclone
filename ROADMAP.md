@@ -2,7 +2,7 @@
 
 > Goal: the fastest practical way to clone a GitHub repo and be ready to work on it (`git status`, `git diff`, `git edit`, `git commit`) without rebuilding git or leaving GitHub.
 >
-> This repo is the **headless open-source backend**: the Rust server, the CLI, the archive format, and the GitHub Actions trigger. Billing, workspaces, and the web UI live in the separate `ripclone-cloud` project.
+> This repo is the **headless open-source backend**: the Rust server, the CLI, the archive format, and the GitHub Actions trigger.
 
 ## Clone modes & pack architecture (active plan)
 
@@ -66,17 +66,17 @@ Goal: drop steady-state sync cost from O(all history) to **O(new commits since l
 - **io_uring** durable-disk worktree writes — orthogonal speedup so `--temp` (ephemeral tmpfs) isn't required for fast durable clones.
 - **Blobless partial clone** (`--filter=blob:none` via a git promisor pointing at the server) — distinct from `files`; a separate project for huge monorepos.
 
-## Cloud integration & cross-repo dedup (planned — `ripclone-cloud` depends on this)
+## Cross-repo dedup & status endpoint (planned)
 
-Three things the managed layer needs from this backend. Forks come **first**
-because they change the storage model; the other two are small endpoint additions.
+Forks come **first** because they change the storage model; the other two are
+small endpoint additions.
 
 ### a. Fork / shared-history dedup (the deep one — do first)
 
 Forks share ~all of their history with the upstream. If the cache namespaces
 storage per repo, a popular repo's fork network stores near-identical packs
-thousands of times — and **object storage is the only real variable cost of the
-service**, so this is the thing that blows up the bill.
+thousands of times — and **object storage is the dominant cost**, so this is the
+thing that blows it up.
 
 The LSM history levels are already content-addressed and "shared across branches
 and live in object storage forever." The work is to extend that sharing **across
@@ -94,38 +94,34 @@ repos in a fork network**:
   authorized for *some repo whose manifest references this chunk*, then mint a
   short-lived signed URL for that request. Signed URLs must never be globally
   guessable or long-lived. This is a security requirement, not an optimization.
-- **No cross-tenant leakage.** Dedup decisions and byte accounting must not let one
-  tenant infer another's private content (e.g. via "this chunk already existed"
-  timing/size oracles). Treat shared-history *existence* as private.
+- **No cross-repo leakage.** Dedup decisions and byte accounting must not let the
+  reader of one repo infer another repo's private content (e.g. via "this chunk
+  already existed" timing/size oracles). Treat shared-history *existence* as
+  private.
 
 ### b. `GET /v1/repos/{owner}/{repo}/status`
 
-One call returning a repo's warm coverage + storage, for the cloud dashboard and
-**storage metering**:
+One call returning a repo's warm coverage + storage, so an operator (or a CLI) can
+see what's built and how much it occupies:
 
 - `refs: [{ branch, commit, bytes_total, bytes_unique }]` — `bytes_unique` =
-  bytes this repo adds that are *not* shared with the commons or other repos (the
-  marginal figure from dedup above).
+  bytes this repo adds that are *not* shared with other repos (the marginal figure
+  from dedup above); `bytes_total` = the logical size.
 - repo totals `{ total_bytes, unique_bytes }`.
-
-Cloud uses `commit` + presence for the warm display, and **`unique_bytes` for
-billing** (customers are billed on marginal storage, so dedup savings pass through
-to them). Until this exists, cloud shows storage as `—` and bills flat per-seat.
 
 ### c. Per-branch sync
 
 `POST /v1/repos/{owner}/{repo}/sync` currently builds HEAD only (`SyncRequest`
-has just `depth`). Add `?branch=<name>` so non-default branches can be warmed —
-cloud tracks and warms specific branches per repo.
+has just `depth`). Add `?branch=<name>` so a non-default branch can be warmed
+explicitly.
 
-### Already covered elsewhere
+### Related
 
-- **Custom clone depth** (a cloud Pro feature) is just UI over **§2a
-  Repo/branch-specific configuration** (`?clonepack=<name>`, configurable
-  `DepthSpec`s) — no new backend work beyond 2a.
-- **Region "boosts"** (a future cloud feature: keep a chosen repo warm in chosen
-  Tigris regions, funded by sponsors) ride the **§5 Fly-region cache warmers** —
-  cloud will need a "warm repo X in region R" request against that mechanism.
+- **Configurable clone depth** is already planned in **§2a Repo/branch-specific
+  configuration** (`?clonepack=<name>`, configurable `DepthSpec`s) — no new work
+  beyond 2a.
+- **On-demand per-region warming** (warm repo X in region R) rides the **§5
+  Fly-region cache warmers**.
 
 ## What already works
 
@@ -179,7 +175,7 @@ Proposed design:
 - On sync/build, the server reads the config for the repo/branch and builds exactly the requested set of clonepacks.
 - The ref endpoint accepts `?clonepack=<name>`; the name maps to one of the configured depths.
 - Default config (when none is stored) produces `shallow` and `full` exactly like today, so behavior is unchanged for unconfigured repos.
-- A simple admin CLI or API endpoint (`POST /v1/admin/config/{owner}/{repo}`) can write the config; eventually this is exposed in the ripclone-cloud UI.
+- A simple admin CLI or API endpoint (`POST /v1/admin/config/{owner}/{repo}`) can write the config.
 
 ### 3. Unified async download/write pipeline ✅
 
