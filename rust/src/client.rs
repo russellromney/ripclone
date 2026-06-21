@@ -1234,7 +1234,7 @@ impl Client {
             let data = self
                 .fetch_artifact_with_url(&hash, signed_url.as_deref())
                 .await
-                .context("fetch metadata chunk")?;
+                .with_context(|| format!("fetch metadata chunk {hash}"))?;
             let metadata =
                 MetadataChunk::decode(data.as_slice()).context("decode metadata chunk")?;
             Ok(metadata)

@@ -20,6 +20,14 @@ pub struct IncrementalPacks {
     pub tail_raw_bytes: u64,
 }
 
+/// Result of compacting LSM levels: the new (bounded) level set, plus the pack
+/// tuples that were freshly built by the merges (to upload). Packs that were
+/// merged away are now unreferenced and left for GC.
+pub struct CompactResult {
+    pub levels: Vec<crate::HistoryLevel>,
+    pub new_packs: Vec<(String, u64, String, u64)>,
+}
+
 impl<'a> PackBuilder<'a> {
     pub fn new<P: AsRef<Path>>(repo: P, cas: &'a Cas) -> Self {
         Self {
@@ -335,6 +343,80 @@ impl<'a> PackBuilder<'a> {
             tail_packs,
             tail_raw_bytes,
         })
+    }
+
+    /// Build only the deltified *tail* — objects introduced in `(sealed_tip,
+    /// commit]` (the whole history when `sealed_tip` is `None`). This is the
+    /// history half of [`build_incremental_packs`], for callers (two-phase
+    /// phase 2) that already built the HEAD closure earlier. Returns the tail
+    /// packs and their total raw size (for sealing decisions).
+    pub fn build_history_tail(
+        &self,
+        commit: &str,
+        sealed_tip: Option<&str>,
+        history_target_raw_bytes: u64,
+    ) -> Result<(Vec<(String, u64, String, u64)>, u64)> {
+        let tail_oids = git::list_object_shas_in_range(&self.repo, sealed_tip, commit)?;
+        if tail_oids.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+        self.build_packs_from_oids(&tail_oids, history_target_raw_bytes, false)
+    }
+
+    /// Size-tiered compaction of LSM history levels. Levels are ordered oldest →
+    /// newest, each covering the commit range `(prev_level.tip, this.tip]`. While
+    /// there are more than `max_levels`, the adjacent pair with the smallest
+    /// combined byte size is merged: their union range is re-packed into one new
+    /// level. Choosing the smallest pair keeps the large base level untouched —
+    /// only small recent tails are merged — so each compaction re-deltifies a
+    /// small range, not the whole history.
+    pub fn compact_levels(
+        &self,
+        mut levels: Vec<crate::HistoryLevel>,
+        max_levels: usize,
+        history_target_raw_bytes: u64,
+    ) -> Result<CompactResult> {
+        let mut new_packs = Vec::new();
+        let level_bytes =
+            |l: &crate::HistoryLevel| -> u64 { l.packs.iter().map(|p| p.pack_len).sum() };
+        while levels.len() > max_levels.max(1) && levels.len() >= 2 {
+            // Adjacent pair (best, best+1) with the smallest combined size.
+            let mut best = 0usize;
+            let mut best_bytes = u64::MAX;
+            for i in 0..levels.len() - 1 {
+                let b = level_bytes(&levels[i]) + level_bytes(&levels[i + 1]);
+                if b < best_bytes {
+                    best_bytes = b;
+                    best = i;
+                }
+            }
+            // Merged range: (start, tip] where start is the tip of the level
+            // before `best` (None when best is the base), tip is level[best+1].
+            let start = best.checked_sub(1).map(|i| levels[i].tip_commit.clone());
+            let tip = levels[best + 1].tip_commit.clone();
+            let oids = git::list_object_shas_in_range(&self.repo, start.as_deref(), &tip)?;
+            let packs = if oids.is_empty() {
+                Vec::new()
+            } else {
+                self.build_packs_from_oids(&oids, history_target_raw_bytes, false)?
+                    .0
+            };
+            new_packs.extend(packs.iter().cloned());
+            let merged = crate::HistoryLevel {
+                tip_commit: tip,
+                packs: packs
+                    .iter()
+                    .map(|p| crate::SizedPack {
+                        pack: p.0.clone(),
+                        pack_len: p.1,
+                        idx: p.2.clone(),
+                        idx_len: p.3,
+                    })
+                    .collect(),
+            };
+            levels.splice(best..best + 2, [merged]);
+        }
+        Ok(CompactResult { levels, new_packs })
     }
 
     /// Partition `oids` greedily by raw size into `~target_raw_bytes` batches and

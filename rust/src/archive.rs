@@ -366,6 +366,78 @@ impl ArchiveBuilder {
         builder.build(commit, archive_path, manifest_path, level, dictionary)
     }
 
+    /// Build only the metadata *files table* (path, mode, blob sha1) — no zstd
+    /// frames. Editable clones materialize the worktree from the HEAD-closure
+    /// packs, not the archive, so they only need this table; the expensive frame
+    /// compression ([`build_chunks`]) is only needed for files mode. This still
+    /// reads each blob (to hash it) but skips compression, so it is much cheaper
+    /// — letting two-phase publish depth=1 without waiting on the archive.
+    /// `frames` is left empty.
+    pub fn build_files_table(&self, commit: &str) -> Result<MetadataChunk> {
+        if !self.mirror.exists() {
+            anyhow::bail!("mirror not found: {}", self.mirror.display());
+        }
+        let repo = git2::Repository::open_bare(&self.mirror)
+            .with_context(|| format!("open bare repo {}", self.mirror.display()))?;
+        let oid = repo
+            .revparse_single(commit)
+            .with_context(|| format!("resolve commit {}", commit))?
+            .id();
+        let tree = repo
+            .find_commit(oid)
+            .with_context(|| format!("find commit {}", oid))?
+            .tree()
+            .with_context(|| format!("read commit tree for {}", oid))?;
+
+        let mut manifest = MetadataChunk::new();
+        let mut walk_err: Option<anyhow::Error> = None;
+        tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
+            if walk_err.is_some() {
+                return git2::TreeWalkResult::Skip;
+            }
+            if entry.kind() != Some(git2::ObjectType::Blob) {
+                return git2::TreeWalkResult::Ok;
+            }
+            let name = entry.name().unwrap_or("");
+            let path = if root.is_empty() {
+                name.to_string()
+            } else {
+                format!("{}/{}", root.trim_end_matches('/'), name)
+            };
+            let mode = entry.filemode_raw() as u32;
+            let obj = match entry.to_object(&repo) {
+                Ok(o) => o,
+                Err(e) => {
+                    walk_err =
+                        Some(anyhow::Error::from(e).context(format!("read object for {}", path)));
+                    return git2::TreeWalkResult::Skip;
+                }
+            };
+            match obj.as_blob() {
+                Some(blob) => manifest.files.push(FileEntry {
+                    path: path.into_bytes(),
+                    mode,
+                    blob_sha1: sha1_bytes(blob.content()).to_vec(),
+                    fragments: Vec::new(),
+                }),
+                None => {
+                    walk_err = Some(anyhow::anyhow!(
+                        "expected blob for {} but got {:?}",
+                        path,
+                        obj.kind()
+                    ));
+                    return git2::TreeWalkResult::Skip;
+                }
+            }
+            git2::TreeWalkResult::Ok
+        })
+        .context("walk git tree")?;
+        if let Some(err) = walk_err {
+            return Err(err).context("build files table from tree");
+        }
+        Ok(manifest)
+    }
+
     /// Build the archive chunks and store them in `cas`.
     ///
     /// The returned metadata chunk contains only the frame/file tables; the
