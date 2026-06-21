@@ -87,6 +87,12 @@ pub struct ClonepackArtifacts {
     /// for older refs (client falls back to fetching each idx individually).
     #[serde(default)]
     pub idx_bundle: String,
+    /// The commit this variant's clonepack is built for. May differ from
+    /// `RefInfo.commit` during two-phase publish (depth=0 briefly serves the
+    /// previous commit while the new full history builds). Empty = same as
+    /// `RefInfo.commit`.
+    #[serde(default)]
+    pub commit: String,
 }
 
 /// Artifact hashes returned by the server for a single ref.
