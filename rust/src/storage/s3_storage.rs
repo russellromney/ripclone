@@ -13,6 +13,7 @@ use std::time::Duration;
 /// and are also cached locally if a cache directory is configured.
 pub struct S3Storage {
     client: Client,
+    region: String,
     bucket: String,
     prefix: String,
     cache: Option<Cas>,
@@ -36,6 +37,7 @@ impl S3Storage {
         let cache = cache_dir.map(Cas::new).transpose()?;
         Ok(Self {
             client,
+            region: region.to_string(),
             bucket: bucket.to_string(),
             prefix: prefix.unwrap_or("").to_string(),
             cache,
@@ -222,6 +224,18 @@ impl StorageBackend for S3Storage {
 
     fn is_remote(&self) -> bool {
         true
+    }
+
+    fn regions(&self) -> Vec<String> {
+        std::env::var("RIPCLONE_STORAGE_REGIONS")
+            .ok()
+            .map(|s| {
+                s.split(',')
+                    .map(|r| r.trim().to_string())
+                    .filter(|r| !r.is_empty())
+                    .collect()
+            })
+            .unwrap_or_else(|| vec![self.region.clone()])
     }
 }
 

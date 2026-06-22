@@ -356,6 +356,8 @@ pub struct RepoStatusResponse {
     pub repo: String,
     pub refs: Vec<BranchStatusEntry>,
     pub total_bytes: u64,
+    pub total_unique_bytes: u64,
+    pub regions: Vec<RegionStorageEntry>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -364,8 +366,15 @@ pub struct BranchStatusEntry {
     pub commit: String,
     pub manifest: String,
     pub bytes: u64,
+    pub unique_bytes: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub built_at: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct RegionStorageEntry {
+    pub region: String,
+    pub unique_bytes: u64,
 }
 
 pub fn build_app(state: ServerState) -> Router {
@@ -1066,14 +1075,31 @@ fn signed_url(storage: &crate::storage::StorageRef, hash: &str) -> Option<String
     storage.signed_url(hash, REF_SIGNED_URL_TTL)
 }
 
+#[derive(Deserialize, Default)]
+struct RepoStatusQuery {
+    #[serde(default)]
+    public: bool,
+    #[serde(default)]
+    fork_of: Option<String>,
+}
+
 async fn repo_status(
     Path((owner, repo)): Path<(String, String)>,
+    Query(query): Query<RepoStatusQuery>,
     State(state): State<ServerState>,
 ) -> impl IntoResponse {
     if let Some(resp) = reject_invalid_repo_ids(&owner, &repo) {
         return resp;
     }
-    match build_repo_status(&state, &owner, &repo).await {
+    match build_repo_status(
+        &state,
+        &owner,
+        &repo,
+        query.public,
+        query.fork_of.as_deref(),
+    )
+    .await
+    {
         Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
         Err(e) => {
             state.metrics.record_error();
@@ -1088,10 +1114,59 @@ async fn repo_status(
     }
 }
 
+fn manifest_chunk_refs(manifest: &ClonepackManifest) -> Vec<&ChunkRef> {
+    let mut refs = Vec::new();
+    if let Some(ref meta) = manifest.metadata_chunk {
+        refs.push(meta);
+    }
+    refs.extend(&manifest.archive_chunks);
+    refs.extend(&manifest.head_blobs_chunks);
+    if let Some(ref idx) = manifest.head_blobs_idx {
+        refs.push(idx);
+    }
+    for pack in &manifest.packs {
+        if let Some(ref pack_chunk) = pack.pack {
+            refs.push(pack_chunk);
+        }
+        if let Some(ref idx_chunk) = pack.idx {
+            refs.push(idx_chunk);
+        }
+    }
+    refs
+}
+
+fn record_chunk(unique_chunks: &mut HashMap<String, u64>, hash: &str, len: u64) {
+    if hash.is_empty() || len == 0 {
+        return;
+    }
+    unique_chunks.insert(hash.to_string(), len);
+}
+
+fn collect_manifest_hashes(info: &crate::RefInfo) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    if !info.full_clonepack.manifest.is_empty()
+        && seen.insert(info.full_clonepack.manifest.clone())
+    {
+        out.push(info.full_clonepack.manifest.clone());
+    }
+    if !info.shallow_clonepack.manifest.is_empty()
+        && seen.insert(info.shallow_clonepack.manifest.clone())
+    {
+        out.push(info.shallow_clonepack.manifest.clone());
+    }
+    if !info.clonepack_manifest.is_empty() && seen.insert(info.clonepack_manifest.clone()) {
+        out.push(info.clonepack_manifest.clone());
+    }
+    out
+}
+
 async fn build_repo_status(
     state: &ServerState,
     owner: &str,
     repo: &str,
+    public: bool,
+    fork_of: Option<&str>,
 ) -> Result<RepoStatusResponse> {
     let branches = state.ref_store.list_branches(owner, repo).await?;
     let mut refs = Vec::new();
@@ -1101,50 +1176,97 @@ async fn build_repo_status(
         let Some(info) = state.ref_store.load_branch(owner, repo, &branch).await? else {
             continue;
         };
-        let manifest_hash = if info.full_clonepack.manifest.is_empty() {
-            info.clonepack_manifest.clone()
-        } else {
-            info.full_clonepack.manifest.clone()
-        };
-        if manifest_hash.is_empty() {
+
+        let manifest_hashes = collect_manifest_hashes(&info);
+        if manifest_hashes.is_empty() && info.history_levels.is_empty() {
             continue;
         }
 
-        let manifest_bytes = state.cas.get(&manifest_hash)?;
-        let manifest = ClonepackManifest::decode(manifest_bytes.as_slice())
-            .context("decode clonepack manifest for status")?;
-
         let mut ref_bytes = 0u64;
-        if let Some(meta) = manifest.metadata_chunk {
-            ref_bytes += meta.len;
-            unique_chunks.insert(hash_to_hex(&meta.hash), meta.len);
+
+        // Manifest-based clonepack variants (shallow, full, legacy). Each
+        // manifest is itself a stored artifact and references chunks.
+        for manifest_hash in manifest_hashes {
+            let manifest_bytes = state.cas.get(&manifest_hash)?;
+            let manifest_len = manifest_bytes.len() as u64;
+            record_chunk(&mut unique_chunks, &manifest_hash, manifest_len);
+            ref_bytes += manifest_len;
+
+            let manifest = ClonepackManifest::decode(manifest_bytes.as_slice())
+                .context("decode clonepack manifest for status")?;
+            for chunk in manifest_chunk_refs(&manifest) {
+                ref_bytes += chunk.len;
+                record_chunk(&mut unique_chunks, &hash_to_hex(&chunk.hash), chunk.len);
+            }
         }
-        for chunk in manifest.archive_chunks {
-            ref_bytes += chunk.len;
-            unique_chunks.insert(hash_to_hex(&chunk.hash), chunk.len);
+
+        // LSM sealed history levels: each level stores its own pack/idx hashes.
+        for level in &info.history_levels {
+            for pack in &level.packs {
+                if !pack.pack.is_empty() {
+                    record_chunk(&mut unique_chunks, &pack.pack, pack.pack_len);
+                    ref_bytes += pack.pack_len;
+                }
+                if !pack.idx.is_empty() {
+                    record_chunk(&mut unique_chunks, &pack.idx, pack.idx_len);
+                    ref_bytes += pack.idx_len;
+                }
+            }
         }
+
+
 
         let built_at = info.synced_at.and_then(|secs| {
             chrono::DateTime::from_timestamp(secs as i64, 0).map(|dt| dt.to_rfc3339())
         });
 
+        // Report the primary manifest: prefer full, then shallow, then legacy.
+        let primary_manifest = if !info.full_clonepack.manifest.is_empty() {
+            info.full_clonepack.manifest.clone()
+        } else if !info.shallow_clonepack.manifest.is_empty() {
+            info.shallow_clonepack.manifest.clone()
+        } else {
+            info.clonepack_manifest.clone()
+        };
+
+        // Public forks of public projects are free; everything else pays its
+        // own logical bytes for now.
+        let is_public_fork = public && fork_of.is_some();
+        let branch_unique_bytes = if is_public_fork { 0 } else { ref_bytes };
+
         refs.push(BranchStatusEntry {
             branch,
             commit: info.commit,
-            manifest: manifest_hash,
+            manifest: primary_manifest,
             bytes: ref_bytes,
+            unique_bytes: branch_unique_bytes,
             built_at,
         });
     }
 
     refs.sort_by(|a, b| a.branch.cmp(&b.branch));
     let total_bytes = unique_chunks.values().sum();
+    // TODO: cross-repo fork-network dedup for private repos. For now, public
+    // forks are free and everything else pays logical repo bytes.
+    let is_public_fork = public && fork_of.is_some();
+    let total_unique_bytes = if is_public_fork { 0 } else { total_bytes };
+    let regions = state
+        .storage
+        .regions()
+        .into_iter()
+        .map(|region| RegionStorageEntry {
+            region,
+            unique_bytes: total_unique_bytes,
+        })
+        .collect();
 
     Ok(RepoStatusResponse {
         owner: owner.to_string(),
         repo: repo.to_string(),
         refs,
         total_bytes,
+        total_unique_bytes,
+        regions,
     })
 }
 
@@ -3993,6 +4115,10 @@ mod tests {
         assert_eq!(status.repo, "secret");
         assert!(status.refs.is_empty());
         assert_eq!(status.total_bytes, 0);
+        assert_eq!(status.total_unique_bytes, 0);
+        assert_eq!(status.regions.len(), 1);
+        assert_eq!(status.regions[0].region, "local");
+        assert_eq!(status.regions[0].unique_bytes, 0);
     }
 
     #[tokio::test]
@@ -4076,9 +4202,15 @@ mod tests {
         assert_eq!(branch.branch, "main");
         assert_eq!(branch.commit, "commit1");
         assert_eq!(branch.manifest, manifest_hash);
-        assert_eq!(branch.bytes, 300);
+        let expected_bytes = 300 + manifest_data.len() as u64;
+        assert_eq!(branch.bytes, expected_bytes);
+        assert_eq!(branch.unique_bytes, expected_bytes); // fallback until cross-repo dedup
         assert!(branch.built_at.is_some());
-        assert_eq!(status.total_bytes, 300);
+        assert_eq!(status.total_bytes, expected_bytes);
+        assert_eq!(status.total_unique_bytes, expected_bytes);
+        assert_eq!(status.regions.len(), 1);
+        assert_eq!(status.regions[0].region, "local");
+        assert_eq!(status.regions[0].unique_bytes, expected_bytes);
     }
 
     #[tokio::test]
@@ -4165,7 +4297,264 @@ mod tests {
             .unwrap();
         let status: RepoStatusResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(status.refs.len(), 2);
-        assert_eq!(status.total_bytes, 300);
+        let expected_total = 300 + manifest_data.len() as u64;
+        assert_eq!(status.total_bytes, expected_total);
+        assert_eq!(status.total_unique_bytes, expected_total); // fallback: no dedup
+        for branch in &status.refs {
+            assert_eq!(branch.bytes, expected_total);
+            assert_eq!(branch.unique_bytes, expected_total); // per-branch fallback
+        }
+        assert_eq!(status.regions.len(), 1);
+        assert_eq!(status.regions[0].unique_bytes, expected_total);
+    }
+
+    #[tokio::test]
+    async fn repo_status_public_fork_is_free() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(&tmp);
+
+        let metadata = ChunkRef {
+            hash: hash_from_hex(&"a".repeat(64)).unwrap(),
+            len: 100,
+        };
+        let archive = ChunkRef {
+            hash: hash_from_hex(&"b".repeat(64)).unwrap(),
+            len: 200,
+        };
+        let manifest = ClonepackManifest {
+            commit: "commit1".to_string(),
+            parent_commit: None,
+            default_branch: "main".to_string(),
+            metadata_chunk: Some(metadata),
+            archive_chunks: vec![archive],
+            head_blobs_idx: None,
+            head_blobs_chunks: vec![],
+            ..Default::default()
+        };
+        let manifest_data = manifest.encode_to_vec();
+        let manifest_hash = state.cas.put(&manifest_data).unwrap();
+
+        let info = RefInfo {
+            commit: "commit1".to_string(),
+            parent_commit: None,
+            default_branch: "main".to_string(),
+            skeleton_pack: String::new(),
+            skeleton_idx: String::new(),
+            head_blobs_pack: String::new(),
+            head_blobs_idx: String::new(),
+            head_blobs_chunks: vec![],
+            packs: vec![],
+            prebuilt_index: String::new(),
+            archive: String::new(),
+            manifest: manifest_hash.clone(),
+            full_pack: String::new(),
+            clonepack_manifest: manifest_hash.clone(),
+            metadata_chunk: "a".repeat(64),
+            archive_chunks: vec!["b".repeat(64)],
+            full_clonepack: crate::ClonepackArtifacts {
+                manifest: manifest_hash.clone(),
+                metadata_chunk: String::new(),
+                skeleton_pack: String::new(),
+                skeleton_idx: String::new(),
+                prebuilt_index: String::new(),
+                midx: String::new(),
+                idx_bundle: String::new(),
+                commit: String::new(),
+            },
+            shallow_clonepack: crate::ClonepackArtifacts::default(),
+            history_levels: Vec::new(),
+            build_status: None,
+            synced_at: None,
+        };
+        state
+            .ref_store
+            .save_branch("acme", "fork", "main", &info)
+            .await
+            .unwrap();
+
+        let app = build_app(state);
+        let response = app
+            .oneshot(test_request(
+                "GET",
+                "/v1/repos/acme/fork/status?public=true&fork_of=oven-sh/bun",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let status: RepoStatusResponse = serde_json::from_slice(&body).unwrap();
+        let expected_total = 300 + manifest_data.len() as u64;
+        assert_eq!(status.total_bytes, expected_total);
+        assert_eq!(status.total_unique_bytes, 0);
+        assert_eq!(status.refs[0].bytes, expected_total);
+        assert_eq!(status.refs[0].unique_bytes, 0);
+        assert_eq!(status.regions[0].unique_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn repo_status_counts_history_levels() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(&tmp);
+
+        let manifest = ClonepackManifest {
+            commit: "commit1".to_string(),
+            parent_commit: None,
+            default_branch: "main".to_string(),
+            ..Default::default()
+        };
+        let manifest_data = manifest.encode_to_vec();
+        let manifest_hash = state.cas.put(&manifest_data).unwrap();
+
+        let info = RefInfo {
+            commit: "commit1".to_string(),
+            parent_commit: None,
+            default_branch: "main".to_string(),
+            skeleton_pack: String::new(),
+            skeleton_idx: String::new(),
+            head_blobs_pack: String::new(),
+            head_blobs_idx: String::new(),
+            head_blobs_chunks: vec![],
+            packs: vec![],
+            prebuilt_index: String::new(),
+            archive: String::new(),
+            manifest: manifest_hash.clone(),
+            full_pack: String::new(),
+            clonepack_manifest: manifest_hash.clone(),
+            metadata_chunk: String::new(),
+            archive_chunks: vec![],
+            full_clonepack: crate::ClonepackArtifacts {
+                manifest: manifest_hash.clone(),
+                metadata_chunk: String::new(),
+                skeleton_pack: String::new(),
+                skeleton_idx: String::new(),
+                prebuilt_index: String::new(),
+                midx: String::new(),
+                idx_bundle: String::new(),
+                commit: String::new(),
+            },
+            shallow_clonepack: crate::ClonepackArtifacts::default(),
+            history_levels: vec![crate::HistoryLevel {
+                tip_commit: "older".to_string(),
+                packs: vec![
+                    crate::SizedPack {
+                        pack: "p1".to_string(),
+                        pack_len: 500,
+                        idx: "i1".to_string(),
+                        idx_len: 50,
+                    },
+                    crate::SizedPack {
+                        pack: "p2".to_string(),
+                        pack_len: 700,
+                        idx: "i2".to_string(),
+                        idx_len: 70,
+                    },
+                ],
+            }],
+            build_status: None,
+            synced_at: None,
+        };
+        state
+            .ref_store
+            .save_branch("acme", "secret", "main", &info)
+            .await
+            .unwrap();
+
+        let app = build_app(state);
+        let response = app
+            .oneshot(test_request("GET", "/v1/repos/acme/secret/status"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let status: RepoStatusResponse = serde_json::from_slice(&body).unwrap();
+        let expected = manifest_data.len() as u64 + 500 + 50 + 700 + 70;
+        assert_eq!(status.refs.len(), 1);
+        assert_eq!(status.refs[0].bytes, expected);
+        assert_eq!(status.total_bytes, expected);
+        assert_eq!(status.total_unique_bytes, expected);
+    }
+
+    #[tokio::test]
+    async fn repo_status_counts_pack_entries_in_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(&tmp);
+
+        let pack = crate::clonepack::PackEntry {
+            pack: Some(ChunkRef {
+                hash: hash_from_hex(&"c".repeat(64)).unwrap(),
+                len: 400,
+            }),
+            idx: Some(ChunkRef {
+                hash: hash_from_hex(&"d".repeat(64)).unwrap(),
+                len: 40,
+            }),
+            ..Default::default()
+        };
+        let manifest = ClonepackManifest {
+            commit: "commit1".to_string(),
+            parent_commit: None,
+            default_branch: "main".to_string(),
+            packs: vec![pack],
+            ..Default::default()
+        };
+        let manifest_data = manifest.encode_to_vec();
+        let manifest_hash = state.cas.put(&manifest_data).unwrap();
+
+        let info = RefInfo {
+            commit: "commit1".to_string(),
+            parent_commit: None,
+            default_branch: "main".to_string(),
+            skeleton_pack: String::new(),
+            skeleton_idx: String::new(),
+            head_blobs_pack: String::new(),
+            head_blobs_idx: String::new(),
+            head_blobs_chunks: vec![],
+            packs: vec![],
+            prebuilt_index: String::new(),
+            archive: String::new(),
+            manifest: manifest_hash.clone(),
+            full_pack: String::new(),
+            clonepack_manifest: manifest_hash.clone(),
+            metadata_chunk: String::new(),
+            archive_chunks: vec![],
+            full_clonepack: crate::ClonepackArtifacts {
+                manifest: manifest_hash.clone(),
+                metadata_chunk: String::new(),
+                skeleton_pack: String::new(),
+                skeleton_idx: String::new(),
+                prebuilt_index: String::new(),
+                midx: String::new(),
+                idx_bundle: String::new(),
+                commit: String::new(),
+            },
+            shallow_clonepack: crate::ClonepackArtifacts::default(),
+            history_levels: Vec::new(),
+            build_status: None,
+            synced_at: None,
+        };
+        state
+            .ref_store
+            .save_branch("acme", "secret", "main", &info)
+            .await
+            .unwrap();
+
+        let app = build_app(state);
+        let response = app
+            .oneshot(test_request("GET", "/v1/repos/acme/secret/status"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let status: RepoStatusResponse = serde_json::from_slice(&body).unwrap();
+        let expected = manifest_data.len() as u64 + 400 + 40;
+        assert_eq!(status.refs[0].bytes, expected);
+        assert_eq!(status.total_bytes, expected);
     }
 
     #[tokio::test]

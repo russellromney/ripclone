@@ -39,6 +39,12 @@ pub trait StorageBackend: Send + Sync {
     fn is_remote(&self) -> bool {
         false
     }
+
+    /// Regions where this backend stores durable bytes. Used for storage-status
+    /// billing breakdown. Defaults to "local" for filesystem-backed storage.
+    fn regions(&self) -> Vec<String> {
+        vec!["local".to_string()]
+    }
 }
 
 /// Filesystem-backed storage using the existing CAS layout.
