@@ -245,11 +245,13 @@ pub fn clear_skip_worktree_index_with_stats<P: AsRef<Path>>(
     Ok(())
 }
 
+#[derive(Debug)]
 pub struct MaterializedPathStat {
     pub path: String,
     stat: IndexStat,
 }
 
+#[derive(Debug)]
 struct IndexStat {
     ctime: git2::IndexTime,
     mtime: git2::IndexTime,
@@ -560,11 +562,21 @@ pub fn write_multi_pack_index<P: AsRef<Path>>(repo_dir: P) -> Result<()> {
 /// graph walks during a build (skeleton + layered packs) don't re-parse commit
 /// objects from the packfile each time. A fresh `--mirror` clone has none. Cheap
 /// to build and best-effort — a failure only loses the speedup.
+///
+/// Uses `--split`: on a re-sync only the new commits are written into a new
+/// graph layer instead of rewriting the whole graph, so this stays O(new
+/// commits) rather than O(all commits) every sync.
 pub fn write_commit_graph<P: AsRef<Path>>(repo_dir: P) -> Result<()> {
     let status = Command::new("git")
         .arg("-C")
         .arg(repo_dir.as_ref().as_os_str())
-        .args(["commit-graph", "write", "--reachable", "--no-progress"])
+        .args([
+            "commit-graph",
+            "write",
+            "--reachable",
+            "--split",
+            "--no-progress",
+        ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()

@@ -64,6 +64,16 @@ pub struct ServerState {
     /// How long a mirror fetch stays "fresh". Resolves within this window skip
     /// the fetch (`RIPCLONE_MIRROR_FRESH_TTL_SECS`, default 60s).
     pub mirror_fresh_ttl: Duration,
+    /// Short-lived cache of complete ref responses, including signed URLs.
+    /// This smooths repeated clone startup latency when signing or ref-store
+    /// lookup has a cold tail.
+    pub ref_response_cache: Arc<std::sync::Mutex<HashMap<String, CachedRefResponse>>>,
+}
+
+#[derive(Clone)]
+pub struct CachedRefResponse {
+    response: RefResponse,
+    inserted: Instant,
 }
 
 /// Simple in-memory token-bucket rate limiter keyed by real client IP.
@@ -266,7 +276,7 @@ fn reject_invalid_repo_ids(owner: &str, repo: &str) -> Option<Response> {
     None
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct RefResponse {
     pub owner: String,
     pub repo: String,
@@ -716,6 +726,63 @@ fn stamp_mirror_fresh(state: &ServerState, key: &str) {
     map.insert(key.to_string(), Instant::now());
 }
 
+const REF_RESPONSE_CACHE_TTL: Duration = Duration::from_secs(30);
+
+fn ref_response_cache_key(owner: &str, repo: &str, branch: &str, clonepack: &str) -> String {
+    format!("{owner}\0{repo}\0{branch}\0{clonepack}")
+}
+
+fn ref_response_cache_ttl(state: &ServerState) -> Duration {
+    std::cmp::min(REF_RESPONSE_CACHE_TTL, state.mirror_fresh_ttl)
+}
+
+fn cached_ref_response(
+    state: &ServerState,
+    owner: &str,
+    repo: &str,
+    branch: &str,
+    clonepack: &str,
+) -> Option<RefResponse> {
+    let ttl = ref_response_cache_ttl(state);
+    if ttl.is_zero() {
+        return None;
+    }
+    let key = ref_response_cache_key(owner, repo, branch, clonepack);
+    let mut cache = state.ref_response_cache.lock().unwrap();
+    cache.retain(|_, cached| cached.inserted.elapsed() < ttl);
+    cache.get(&key).map(|cached| cached.response.clone())
+}
+
+fn cache_ref_response(
+    state: &ServerState,
+    owner: &str,
+    repo: &str,
+    branch: &str,
+    clonepack: &str,
+    response: &RefResponse,
+) {
+    let ttl = ref_response_cache_ttl(state);
+    if ttl.is_zero() {
+        return;
+    }
+    let key = ref_response_cache_key(owner, repo, branch, clonepack);
+    let mut cache = state.ref_response_cache.lock().unwrap();
+    cache.retain(|_, cached| cached.inserted.elapsed() < ttl);
+    cache.insert(
+        key,
+        CachedRefResponse {
+            response: response.clone(),
+            inserted: Instant::now(),
+        },
+    );
+}
+
+fn invalidate_ref_response_cache(state: &ServerState, owner: &str, repo: &str, branch: &str) {
+    let prefix = format!("{owner}\0{repo}\0{branch}\0");
+    let mut cache = state.ref_response_cache.lock().unwrap();
+    cache.retain(|key, _| !key.starts_with(&prefix));
+}
+
 async fn get_ref(
     Path((owner, repo, branch)): Path<(String, String, String)>,
     Query(params): Query<RefQuery>,
@@ -742,6 +809,9 @@ async fn get_ref(
     let fresh_key = format!("{}/{}/{}", owner, repo, branch);
     let lock = repo_lock(&state.sync_locks, &owner, &repo).await;
     let _guard = lock.lock().await;
+    if let Some(resp) = cached_ref_response(&state, &owner, &repo, &branch, &params.clonepack) {
+        return (StatusCode::OK, Json(resp)).into_response();
+    }
     // Skip the `git fetch` when the mirror was refreshed within the TTL — by a
     // recent resolve, or by the sync we just waited on while holding the lock.
     if !mirror_is_fresh(&state, &fresh_key) {
@@ -802,13 +872,16 @@ async fn get_ref(
                 synced_at: None,
             });
             let resp = ref_response(
-                owner,
-                repo,
-                branch,
+                owner.clone(),
+                repo.clone(),
+                branch.clone(),
                 &info,
                 &state.storage,
                 &params.clonepack,
             );
+            if info.build_status.is_none() {
+                cache_ref_response(&state, &owner, &repo, &branch, &params.clonepack, &resp);
+            }
             (StatusCode::OK, Json(resp)).into_response()
         }
         _ => {
@@ -1203,6 +1276,7 @@ async fn sync_repo(
             // The mirror was just fetched; let the immediately-following resolve
             // skip its own fetch.
             stamp_mirror_fresh(&state, &format!("{}/{}/{}", owner, repo, branch));
+            invalidate_ref_response_cache(&state, &owner, &repo, &branch);
             let resp = ref_response(owner, repo, branch.clone(), &info, &state.storage, "full");
             drop(_guard);
             (StatusCode::OK, Json(resp)).into_response()
@@ -1461,6 +1535,7 @@ async fn create_snapshot(
     .await
     {
         Ok(info) => {
+            invalidate_ref_response_cache(&state, &owner, &repo, &branch);
             drop(_guard);
             info
         }
@@ -1966,12 +2041,19 @@ async fn seal_and_compact(
         info!("LSM: compacted {} levels -> {}", before, levels.len());
     }
 
-    // Manifest history = every level's packs (prior reused by hash + new tail +
-    // any compaction output), flattened.
-    let history_packs: Vec<(String, u64, String, u64)> = levels
+    // Manifest history = every sealed level's packs (prior reused by hash + any
+    // compaction output), flattened. When the tail was NOT sealed this sync (it
+    // is below the seal threshold), it is not in `levels` — but its commits/trees
+    // are still reachable from HEAD and must ship, so append it. Without this the
+    // full clone would be missing the unsealed `(sealed_tip, HEAD]` range (the
+    // old full skeleton used to backstop this; it no longer exists).
+    let mut history_packs: Vec<(String, u64, String, u64)> = levels
         .iter()
         .flat_map(|l| l.packs.iter().map(sized_to_tuple))
         .collect();
+    if !seal {
+        history_packs.extend(tail_packs.iter().cloned());
+    }
     Ok((history_packs, new_tuples, levels))
 }
 
@@ -2187,6 +2269,27 @@ async fn do_sync(
     let parent = git::parent_commit(&mirror_dir, &commit).ok().flatten();
     let default_branch = git::default_branch(&mirror_dir).unwrap_or_else(|_| "HEAD".to_string());
 
+    // No-op fast path: if a *completed full* build already exists for exactly
+    // this commit, the prior clonepack artifacts are still valid — reuse them and
+    // build nothing (skips commit-graph/bitmap/skeleton/history/archive), so a
+    // poke-to-check sync of an unchanged repo returns near-instantly. Keying on
+    // `full_clonepack.commit == commit` (not `build_status`) is robust: it is set
+    // only when phase 2 finishes for this commit, so it correctly excludes the
+    // Option-A carried-prior case, in-flight/failed phase 2, and the async
+    // worker's transient "building" status (which would otherwise mask a prior
+    // completed build).
+    if let Ok(Some(prev)) = ref_store.load_branch(owner, repo, branch).await
+        && prev.full_clonepack.commit == commit
+        && !prev.full_clonepack.manifest.is_empty()
+    {
+        info!(
+            "sync no-op: {} already current at {} (reusing prior clonepack)",
+            repo,
+            &commit[..7.min(commit.len())]
+        );
+        return Ok(prev);
+    }
+
     // Write a commit-graph so the rev-list walks in the skeleton + layered-pack
     // builds below are fast (a fresh --mirror clone has none). Best-effort.
     let cg_dir = mirror_dir.clone();
@@ -2225,17 +2328,8 @@ async fn do_sync(
     info!("sync phase: reachability bitmap {:?}", t.elapsed());
     t = Instant::now();
 
-    // Full-history skeleton pack + idx.
-    let mirror_dir2 = mirror_dir.clone();
-    let cas2 = cas.clone();
-    let commit2 = commit.clone();
-    let skeleton_handle = tokio::task::spawn_blocking(move || {
-        let s = Instant::now();
-        let builder = PackBuilder::new(&mirror_dir2, &cas2);
-        let r = builder.build_skeleton_pack(&commit2);
-        info!("build task: full skeleton {:?}", s.elapsed());
-        r
-    });
+    // No full skeleton: the full variant reuses the shallow (HEAD) skeleton; the
+    // full history's commits+trees live in the history packs.
 
     // Shallow depth=1 skeleton pack + idx.
     let mirror_dir2s = mirror_dir.clone();
@@ -2330,8 +2424,6 @@ async fn do_sync(
         r
     });
 
-    let (skeleton_pack, skeleton_idx) =
-        skeleton_handle.await.context("full skeleton pack task")??;
     let (shallow_skeleton_pack, shallow_skeleton_idx) = shallow_skeleton_handle
         .await
         .context("shallow skeleton pack task")??;
@@ -2388,15 +2480,8 @@ async fn do_sync(
             }
         };
 
-    // Prebuilt indexes for both skeletons.
-    let mirror_dir5 = mirror_dir.clone();
-    let cas5 = cas.clone();
-    let commit5 = commit.clone();
-    let skeleton_pack_for_index = skeleton_pack.clone();
-    let prebuilt_index_handle = tokio::task::spawn_blocking(move || {
-        let builder = PackBuilder::new(&mirror_dir5, &cas5);
-        builder.build_prebuilt_index(&commit5, &skeleton_pack_for_index)
-    });
+    // Prebuilt index from the shallow (HEAD) skeleton — the HEAD index is the
+    // same for both variants, so the full variant reuses it.
     let mirror_dir5s = mirror_dir.clone();
     let cas5s = cas.clone();
     let commit5s = commit.clone();
@@ -2405,22 +2490,18 @@ async fn do_sync(
         let builder = PackBuilder::new(&mirror_dir5s, &cas5s);
         builder.build_prebuilt_index(&commit5s, &shallow_skeleton_pack_for_index)
     });
-    let prebuilt_index = prebuilt_index_handle
-        .await
-        .context("full prebuilt index task")??;
     let shallow_prebuilt_index = shallow_prebuilt_index_handle
         .await
         .context("shallow prebuilt index task")??;
-    info!("sync phase: prebuilt indexes {:?}", t.elapsed());
+    info!("sync phase: prebuilt index {:?}", t.elapsed());
     t = Instant::now();
 
-    // Assemble the full-history metadata chunk with the small .git artifacts and
-    // the frame/file tables. The head-blobs pack is kept as its own artifact
-    // because it is ~65 MB of file contents and is not needed for archive
-    // extraction.
-    metadata_chunk.skeleton_pack = cas.get(&skeleton_pack)?;
-    metadata_chunk.skeleton_idx = cas.get(&skeleton_idx)?;
-    metadata_chunk.prebuilt_index = cas.get(&prebuilt_index)?;
+    // Assemble the full-history metadata chunk. The skeleton + prebuilt index are
+    // the shallow (HEAD) ones; the full history's commits+trees come from the
+    // history packs. The frame/file tables describe the working tree.
+    metadata_chunk.skeleton_pack = cas.get(&shallow_skeleton_pack)?;
+    metadata_chunk.skeleton_idx = cas.get(&shallow_skeleton_idx)?;
+    metadata_chunk.prebuilt_index = cas.get(&shallow_prebuilt_index)?;
     let metadata_data = metadata_chunk.encode_to_vec();
     let metadata_hash = cas.put(&metadata_data)?;
 
@@ -2622,13 +2703,13 @@ async fn do_sync(
         commit: commit.clone(),
         parent_commit: parent.clone(),
         default_branch: default_branch.clone(),
-        skeleton_pack: skeleton_pack.clone(),
-        skeleton_idx: skeleton_idx.clone(),
+        skeleton_pack: shallow_skeleton_pack.clone(),
+        skeleton_idx: shallow_skeleton_idx.clone(),
         head_blobs_pack: String::new(),
         head_blobs_idx: String::new(),
         head_blobs_chunks: Vec::new(),
         packs: pack_artifacts.clone(),
-        prebuilt_index: prebuilt_index.clone(),
+        prebuilt_index: shallow_prebuilt_index.clone(),
         archive: archive_chunk_hashes.first().cloned().unwrap_or_default(),
         manifest: metadata_hash.clone(),
         full_pack,
@@ -2638,9 +2719,9 @@ async fn do_sync(
         full_clonepack: crate::ClonepackArtifacts {
             manifest: full_clonepack_hash.clone(),
             metadata_chunk: metadata_hash.clone(),
-            skeleton_pack: skeleton_pack.clone(),
-            skeleton_idx: skeleton_idx.clone(),
-            prebuilt_index: prebuilt_index.clone(),
+            skeleton_pack: shallow_skeleton_pack.clone(),
+            skeleton_idx: shallow_skeleton_idx.clone(),
+            prebuilt_index: shallow_prebuilt_index.clone(),
             midx: full_midx_hash.clone(),
             idx_bundle: full_idx_bundle_hash.clone(),
             commit: commit.clone(),
@@ -3002,6 +3083,9 @@ async fn build_and_publish_two_phase(
     let commit2 = commit.to_string();
     let parent2 = parent.clone();
     let default_branch2 = default_branch.to_string();
+    let sk_pack = shallow_skeleton_pack.clone();
+    let sk_idx = shallow_skeleton_idx.clone();
+    let sk_prebuilt = shallow_prebuilt_index.clone();
     tokio::spawn(async move {
         let started = Instant::now();
         let res = build_full_in_background(
@@ -3017,6 +3101,9 @@ async fn build_and_publish_two_phase(
             &storage2,
             &retention2,
             head_packs,
+            sk_pack,
+            sk_idx,
+            sk_prebuilt,
             head_idx_bundle_hash,
             head_midx_hash,
             history_target,
@@ -3053,6 +3140,12 @@ async fn build_full_in_background(
     storage: &crate::storage::StorageRef,
     retention: &Arc<Retention>,
     head_packs: Vec<(String, u64, String, u64)>,
+    // Phase 1's shallow skeleton + prebuilt index (HEAD trees + HEAD index). The
+    // full variant reuses these — the full history's commits+trees are already in
+    // the history packs, so a separate full skeleton is redundant. (hashes)
+    shallow_skeleton_pack: String,
+    shallow_skeleton_idx: String,
+    shallow_prebuilt_index: String,
     _head_idx_bundle_hash: String,
     _head_midx_hash: String,
     history_target: u64,
@@ -3074,11 +3167,9 @@ async fn build_full_in_background(
     let bm_dir = mirror_dir.to_path_buf();
     let _ = tokio::task::spawn_blocking(move || git::write_bitmap(&bm_dir)).await;
 
-    // Full skeleton + history + the full zstd archive (deferred from phase 1),
-    // all concurrently.
-    let (md1, c1, cm1) = (mirror_dir.to_path_buf(), cas.clone(), commit.to_string());
-    let skeleton_handle =
-        tokio::task::spawn_blocking(move || PackBuilder::new(&md1, &c1).build_skeleton_pack(&cm1));
+    // History tail + the full zstd archive (deferred from phase 1), concurrently.
+    // No full skeleton: the full variant reuses phase 1's shallow skeleton, and
+    // the full history's commits+trees live in the history packs.
     let (mda, ca, cma) = (mirror_dir.to_path_buf(), cas.clone(), commit.to_string());
     let archive_handle = tokio::task::spawn_blocking(move || {
         ArchiveBuilder::new(&mda).build_into_cas(&cma, &ca, 6, None)
@@ -3100,7 +3191,6 @@ async fn build_full_in_background(
             Ok((b.build_history_packs(&cm2, history_target)?, 0, false))
         }
     });
-    let (skeleton_pack, skeleton_idx) = skeleton_handle.await.context("full skeleton")??;
     let (built_history, tail_raw_bytes, is_tail) =
         history_handle.await.context("history packs")??;
     let (archive_chunk_hashes, metadata_base) = archive_handle.await.context("full archive")??;
@@ -3124,22 +3214,14 @@ async fn build_full_in_background(
         (built_history.clone(), built_history, Vec::new())
     };
 
-    let (md3, c3, cm3, skp) = (
-        mirror_dir.to_path_buf(),
-        cas.clone(),
-        commit.to_string(),
-        skeleton_pack.clone(),
-    );
-    let prebuilt_index = tokio::task::spawn_blocking(move || {
-        PackBuilder::new(&md3, &c3).build_prebuilt_index(&cm3, &skp)
-    })
-    .await
-    .context("full prebuilt index")??;
-
+    // Reuse phase 1's shallow skeleton + prebuilt index (HEAD trees + HEAD index)
+    // for the full variant. Bytes come from local CAS or object storage (they may
+    // have been evicted locally after phase 1's upload).
+    let fetch = |h: &str| -> Result<Vec<u8>> { cas.get(h).or_else(|_| storage.get(h)) };
     let mut full_meta = metadata_base;
-    full_meta.skeleton_pack = cas.get(&skeleton_pack)?;
-    full_meta.skeleton_idx = cas.get(&skeleton_idx)?;
-    full_meta.prebuilt_index = cas.get(&prebuilt_index)?;
+    full_meta.skeleton_pack = fetch(&shallow_skeleton_pack)?;
+    full_meta.skeleton_idx = fetch(&shallow_skeleton_idx)?;
+    full_meta.prebuilt_index = fetch(&shallow_prebuilt_index)?;
     let full_meta_data = full_meta.encode_to_vec();
     let metadata_hash = cas.put(&full_meta_data)?;
 
@@ -3167,12 +3249,10 @@ async fn build_full_in_background(
     )?;
     let full_clonepack_hash = cas.put(&full_manifest.encode_to_vec())?;
 
-    // Upload phase-2 artifacts (history packs+idx, full skeleton/index/metadata,
-    // full idx-bundle, full manifest). Head packs are already in storage.
+    // Upload phase-2 artifacts (history packs+idx, full metadata, full idx-bundle,
+    // full manifest). Head packs + the shallow skeleton/index are already in
+    // storage from phase 1.
     let mut p2: Vec<String> = vec![
-        skeleton_pack.clone(),
-        skeleton_idx.clone(),
-        prebuilt_index.clone(),
         metadata_hash.clone(),
         full_clonepack_hash.clone(),
         full_idx_bundle_hash.clone(),
@@ -3199,9 +3279,9 @@ async fn build_full_in_background(
     let mut all_packs = head_packs.clone();
     all_packs.extend(history_packs.iter().cloned());
     info.packs = pack_artifacts_of(&all_packs);
-    info.skeleton_pack = skeleton_pack.clone();
-    info.skeleton_idx = skeleton_idx.clone();
-    info.prebuilt_index = prebuilt_index.clone();
+    info.skeleton_pack = shallow_skeleton_pack.clone();
+    info.skeleton_idx = shallow_skeleton_idx.clone();
+    info.prebuilt_index = shallow_prebuilt_index.clone();
     info.metadata_chunk = metadata_hash.clone();
     info.manifest = metadata_hash.clone();
     info.archive = archive_chunk_hashes.first().cloned().unwrap_or_default();
@@ -3210,9 +3290,9 @@ async fn build_full_in_background(
     info.full_clonepack = crate::ClonepackArtifacts {
         manifest: full_clonepack_hash.clone(),
         metadata_chunk: metadata_hash.clone(),
-        skeleton_pack: skeleton_pack.clone(),
-        skeleton_idx: skeleton_idx.clone(),
-        prebuilt_index: prebuilt_index.clone(),
+        skeleton_pack: shallow_skeleton_pack.clone(),
+        skeleton_idx: shallow_skeleton_idx.clone(),
+        prebuilt_index: shallow_prebuilt_index.clone(),
         midx: String::new(),
         idx_bundle: full_idx_bundle_hash.clone(),
         commit: commit.to_string(),
@@ -3241,6 +3321,7 @@ fn spawn_build_worker(state: ServerState) -> tokio::sync::mpsc::Sender<BuildJob>
 
             // Mark as building in the shared ref store.
             let _ = update_build_status(&state, &owner, &repo, "building").await;
+            invalidate_ref_response_cache(&state, &owner, &repo, &branch);
 
             let start = std::time::Instant::now();
             let mirror_dir = state.repo_root.join(format!("{}_{}.git", owner, repo));
@@ -3269,6 +3350,7 @@ fn spawn_build_worker(state: ServerState) -> tokio::sync::mpsc::Sender<BuildJob>
                     // A successful sync marks the mirror fresh so the waiter's
                     // resolve doesn't re-fetch.
                     stamp_mirror_fresh(&state, &format!("{owner}/{repo}/{branch}"));
+                    invalidate_ref_response_cache(&state, &owner, &repo, &branch);
                     info!("background build completed for {owner}/{repo}@{branch}");
                     Ok(())
                 }
@@ -3276,6 +3358,7 @@ fn spawn_build_worker(state: ServerState) -> tokio::sync::mpsc::Sender<BuildJob>
                     state.metrics.record_build_failed();
                     let _ =
                         update_build_status(&state, &owner, &repo, &format!("failed: {e}")).await;
+                    invalidate_ref_response_cache(&state, &owner, &repo, &branch);
                     warn!("background build failed for {owner}/{repo}@{branch}: {e}");
                     Err(format!("{e}"))
                 }
@@ -3435,6 +3518,7 @@ pub async fn run_server(
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(60),
         ),
+        ref_response_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
     };
     let build_queue = spawn_build_worker(state.clone());
     state.build_queue = build_queue;
@@ -3487,6 +3571,7 @@ mod tests {
             sync_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             mirror_freshness: Arc::new(std::sync::Mutex::new(HashMap::new())),
             mirror_fresh_ttl: Duration::from_secs(60),
+            ref_response_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -3595,6 +3680,53 @@ mod tests {
         assert!(resp.clonepack_manifest_url.is_none());
         assert!(resp.metadata_chunk_url.is_none());
         assert!(resp.archive_chunk_urls.is_none());
+    }
+
+    #[test]
+    fn ref_response_cache_hits_and_invalidates_by_ref() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(&tmp);
+        let resp = RefResponse {
+            owner: "acme".to_string(),
+            repo: "secret".to_string(),
+            branch: "main".to_string(),
+            default_branch: "main".to_string(),
+            commit: "commit1".to_string(),
+            parent_commit: None,
+            full_pack: String::new(),
+            clonepack_manifest: "manifest".to_string(),
+            clonepack_manifest_url: Some("https://example.invalid/manifest".to_string()),
+            metadata_chunk: "metadata".to_string(),
+            metadata_chunk_url: Some("https://example.invalid/metadata".to_string()),
+            archive_chunk_urls: Some(vec![Some("https://example.invalid/archive".to_string())]),
+            head_blobs_chunk_urls: None,
+            head_blobs_idx_url: None,
+            pack_chunk_urls: None,
+            pack_idx_urls: None,
+            midx_url: None,
+            idx_bundle_url: None,
+            shallow: true,
+        };
+
+        cache_ref_response(&state, "acme", "secret", "main", "shallow", &resp);
+        let cached = cached_ref_response(&state, "acme", "secret", "main", "shallow")
+            .expect("cached ref response");
+        assert_eq!(cached.commit, "commit1");
+        assert_eq!(
+            cached.clonepack_manifest_url.as_deref(),
+            Some("https://example.invalid/manifest")
+        );
+        assert!(cached_ref_response(&state, "acme", "secret", "main", "full").is_none());
+
+        invalidate_ref_response_cache(&state, "acme", "secret", "main");
+        assert!(cached_ref_response(&state, "acme", "secret", "main", "shallow").is_none());
+
+        let mut no_cache_state = state;
+        no_cache_state.mirror_fresh_ttl = Duration::ZERO;
+        cache_ref_response(&no_cache_state, "acme", "secret", "main", "shallow", &resp);
+        assert!(
+            cached_ref_response(&no_cache_state, "acme", "secret", "main", "shallow").is_none()
+        );
     }
 
     fn test_request(method: &str, uri: &str) -> axum::http::Request<Body> {
