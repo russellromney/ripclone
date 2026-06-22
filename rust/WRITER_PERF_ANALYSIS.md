@@ -198,6 +198,45 @@ run. In this rebased path, io_uring won every matched concurrency point on
 `write_ms`; the best observed setting was the default 16/16 io_uring run at
 `1187 ms` write time.
 
+### Default policy plus optimized ring setup
+
+After changing editable defaults to POSIX `fetch=cores, write=cores` and
+io_uring `fetch=cores, write=2*cores`, and after enabling the optimized
+single-issuer/defer-taskrun ring setup, the editable clone was rerun on the
+isolated io_uring Fly apps:
+
+- Server: `ripclone-io-uring-server`, warmed before timed runs. It was
+  temporarily resized to 8 performance CPUs for the initial unshallow/index-pack
+  warm-up, then restored to shared-2x and stopped after the benchmark.
+- Client: disposable `ripclone-io-uring-client` machine, 8 performance CPUs,
+  16 GB RAM, ext4 volume mounted at `/data`.
+- Client env: `RIPCLONE_NO_CACHE=1`, `RIPCLONE_NO_OVERLAY=1`.
+- Target: `oven-sh/bun` at `7a5293c`, editable mode.
+
+The timed runs alternated POSIX and io_uring. No explicit fetch/write thread env
+vars were set; each backend used its new default policy.
+
+```
+posix-1:    total 969 ms  | write 808 ms | real 0.98 s
+io_uring-1: total 966 ms  | write 750 ms | real 0.98 s
+posix-2:    total 1000 ms | write 847 ms | real 1.01 s
+io_uring-2: total 973 ms  | write 753 ms | real 0.99 s
+posix-3:    total 931 ms  | write 778 ms | real 0.95 s
+io_uring-3: total 945 ms  | write 790 ms | real 0.96 s
+```
+
+Summary:
+
+```
+posix:    total avg 966.7 ms, median 969 ms | write avg 811.0 ms, median 808 ms
+io_uring: total avg 961.3 ms, median 966 ms | write avg 764.3 ms, median 753 ms
+```
+
+The optimized ring path logged both `single-issuer/defer-taskrun ring enabled`
+and direct descriptor registration on every io_uring run. At this scale the
+end-to-end wall time is nearly tied, but io_uring is now consistently ahead on
+`write_ms` for the first two runs and about 6% faster on average.
+
 ### Full Bun clone after optimized writer changes
 
 Target: `oven-sh/bun` at
