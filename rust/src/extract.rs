@@ -1369,28 +1369,36 @@ pub fn materialize_worktree_from_pack(repo_root: &Path, commit: &str) -> Result<
                 };
                 let mut pending_writes: Vec<OwnedFileWrite> =
                     Vec::with_capacity(PACK_WRITE_BATCH_FILES);
-                let mut pending_bytes = 0usize;
 
                 loop {
                     // Stop pulling new work as soon as any thread has failed.
                     if error.lock().unwrap().is_some() {
+                        let _ = writer.flush_deferred_writes();
                         return;
                     }
                     let idx = cursor.fetch_add(1, Ordering::Relaxed);
                     if idx >= items.len() {
                         if !pending_writes.is_empty() {
-                            match writer.write_owned_entries_for_fresh_indexed_checkout(
+                            match writer.write_owned_entries_for_fresh_indexed_checkout_deferred(
                                 repo_root,
                                 std::mem::take(&mut pending_writes),
                             ) {
                                 Ok(outcome) => {
                                     written.fetch_add(outcome.written, Ordering::Relaxed);
-                                    raw_bytes.fetch_add(pending_bytes, Ordering::Relaxed);
                                     stat_cache.lock().unwrap().extend(outcome.stats);
                                 }
                                 Err(e) => {
                                     *error.lock().unwrap() = Some(e);
                                 }
+                            }
+                        }
+                        match writer.flush_deferred_writes() {
+                            Ok(outcome) => {
+                                written.fetch_add(outcome.written, Ordering::Relaxed);
+                                stat_cache.lock().unwrap().extend(outcome.stats);
+                            }
+                            Err(e) => {
+                                *error.lock().unwrap() = Some(e);
                             }
                         }
                         return;
@@ -1421,17 +1429,16 @@ pub fn materialize_worktree_from_pack(repo_root: &Path, commit: &str) -> Result<
                     })();
                     match res {
                         Ok(len) => {
-                            pending_bytes += len;
+                            raw_bytes.fetch_add(len, Ordering::Relaxed);
                             if pending_writes.len() >= PACK_WRITE_BATCH_FILES {
-                                match writer.write_owned_entries_for_fresh_indexed_checkout(
-                                    repo_root,
-                                    std::mem::take(&mut pending_writes),
-                                ) {
+                                match writer
+                                    .write_owned_entries_for_fresh_indexed_checkout_deferred(
+                                        repo_root,
+                                        std::mem::take(&mut pending_writes),
+                                    ) {
                                     Ok(outcome) => {
                                         written.fetch_add(outcome.written, Ordering::Relaxed);
-                                        raw_bytes.fetch_add(pending_bytes, Ordering::Relaxed);
                                         stat_cache.lock().unwrap().extend(outcome.stats);
-                                        pending_bytes = 0;
                                     }
                                     Err(e) => {
                                         *error.lock().unwrap() = Some(e);
@@ -1600,10 +1607,11 @@ pub fn extract_blobs_from_pack_bytes(
                         content: content.into(),
                     });
                     if pending_writes.len() >= PACK_WRITE_BATCH_FILES {
-                        let outcome = writer.write_owned_entries_for_fresh_indexed_checkout(
-                            target_dir,
-                            std::mem::take(&mut pending_writes),
-                        )?;
+                        let outcome = writer
+                            .write_owned_entries_for_fresh_indexed_checkout_deferred(
+                                target_dir,
+                                std::mem::take(&mut pending_writes),
+                            )?;
                         written += outcome.written;
                         stats.extend(outcome.stats);
                     }
@@ -1611,8 +1619,11 @@ pub fn extract_blobs_from_pack_bytes(
             }
         }
     }
-    let outcome =
-        writer.write_owned_entries_for_fresh_indexed_checkout(target_dir, pending_writes)?;
+    let outcome = writer
+        .write_owned_entries_for_fresh_indexed_checkout_deferred(target_dir, pending_writes)?;
+    written += outcome.written;
+    stats.extend(outcome.stats);
+    let outcome = writer.flush_deferred_writes()?;
     written += outcome.written;
     stats.extend(outcome.stats);
     Ok(PackExtractResult {
