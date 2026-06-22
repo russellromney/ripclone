@@ -152,6 +152,52 @@ io_uring: wall 133.5 ms | mtime 89.7 ms
 Removing the regular-file mtime loop improved this Fly run from 133.5 ms to
 97.4 ms for io_uring.
 
+### Rebased main: editable pack materialization
+
+After rebasing onto `main`, the default editable clone path no longer rebuilds
+blob packs locally. It downloads prebuilt editable packs, installs them into
+`.git/objects`, and materializes the working tree by parsing HEAD packs. The
+pack parser now batches file writes through `WorktreeWriter`, so the io_uring
+backend is exercised on the default editable path.
+
+Target: `oven-sh/bun` at
+`88417471cb28aab8943eb6227c014ac3f1c50cbc`, synced immediately before the run.
+Client ran on a one-off Fly machine with 8 performance CPUs, 16 GB RAM,
+`--rm --restart no --autostop=stop --autostart=false`, and a fresh ext4 volume
+mounted at `/data`. Overlay staging was disabled with `RIPCLONE_NO_OVERLAY=1`.
+
+Command shape:
+
+```
+RIPCLONE_NO_OVERLAY=1 RIPCLONE_BENCH=1 \
+RIPCLONE_FETCH_CONCURRENCY=<n> RIPCLONE_WRITE_THREADS=<n> \
+RIPCLONE_IO_URING=<0|1> \
+  ripclone --server https://ripclone.fly.dev clone oven-sh/bun \
+  --dir /data/bun-<label> --mode editable
+```
+
+Results:
+
+```
+posix  fetch=16 write=16: total 2344 ms | write 1387 ms | real 2.40 s
+uring  fetch=16 write=16: total 1368 ms | write 1187 ms | real 1.38 s
+
+posix  fetch=8  write=8:  total 1667 ms | write 1494 ms | real 1.68 s
+uring  fetch=8  write=8:  total 1518 ms | write 1328 ms | real 1.53 s
+
+posix  fetch=4  write=4:  total 1729 ms | write 1549 ms | real 1.74 s
+uring  fetch=4  write=4:  total 1574 ms | write 1437 ms | real 1.59 s
+
+posix  fetch=8  write=4:  total 1624 ms | write 1370 ms | real 1.64 s
+uring  fetch=8  write=4:  total 1481 ms | write 1323 ms | real 1.50 s
+```
+
+All runs had a clean `git status` and installed/extracted 33 editable packs
+(68.6 MB downloaded). io_uring direct descriptors were enabled in every io_uring
+run. In this rebased path, io_uring won every matched concurrency point on
+`write_ms`; the best observed setting was the default 16/16 io_uring run at
+`1187 ms` write time.
+
 ### Full Bun clone after optimized writer changes
 
 Target: `oven-sh/bun` at
