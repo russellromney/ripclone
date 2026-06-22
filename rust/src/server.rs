@@ -2057,6 +2057,24 @@ async fn seal_and_compact(
     Ok((history_packs, new_tuples, levels))
 }
 
+/// Load and decode a prior sync's metadata chunk and return its files table.
+/// Bytes come from local CAS or object storage (the metadata may have been
+/// evicted locally after a prior upload). Returns `None` on any failure — the
+/// caller then falls back to a full (non-incremental) build, so this is purely
+/// best-effort optimization, never a correctness dependency.
+fn load_metadata_files(
+    cas: &Cas,
+    storage: &crate::storage::StorageRef,
+    metadata_hash: &str,
+) -> Option<Vec<crate::clonepack::FileEntry>> {
+    let bytes = cas
+        .get(metadata_hash)
+        .or_else(|_| storage.get(metadata_hash))
+        .ok()?;
+    let md = crate::clonepack::MetadataChunk::decode(bytes.as_slice()).ok()?;
+    Some(md.files)
+}
+
 /// Build one variant's PackEntry list + concatenated idx bundle. Free-function
 /// form (used by the two-phase sync path and its background phase-2 task).
 fn assemble_variant(
@@ -2910,23 +2928,86 @@ async fn build_and_publish_two_phase(
     let history_target = env_bytes("RIPCLONE_HISTORY_PACK_BYTES", 512 * 1024 * 1024);
     let upload_conc = env_bytes("RIPCLONE_UPLOAD_CONCURRENCY", 16) as usize;
 
+    // Load the previous synced ref once: used both for the files-table by-diff
+    // below and for Option-A full-clonepack carry later in this phase.
+    let prev = ref_store
+        .load_branch(owner, repo, branch)
+        .await
+        .ok()
+        .flatten();
+
     // ---- PHASE 1: HEAD closure + archive + shallow skeleton -> publish depth=1 ----
     let mut t = Instant::now();
     let (md1, c1, cm1) = (mirror_dir.to_path_buf(), cas.clone(), commit.to_string());
     let shallow_skeleton_handle = tokio::task::spawn_blocking(move || {
-        PackBuilder::new(&md1, &c1).build_shallow_skeleton_pack(&cm1)
+        let s = Instant::now();
+        let r = PackBuilder::new(&md1, &c1).build_shallow_skeleton_pack(&cm1);
+        info!("p1 sub: shallow skeleton {:?}", s.elapsed());
+        r
     });
     let (md2, c2, cm2) = (mirror_dir.to_path_buf(), cas.clone(), commit.to_string());
     let head_handle = tokio::task::spawn_blocking(move || {
-        PackBuilder::new(&md2, &c2).build_head_packs(&cm2, head_target)
+        let s = Instant::now();
+        let r = PackBuilder::new(&md2, &c2).build_head_packs(&cm2, head_target);
+        info!("p1 sub: head packs {:?}", s.elapsed());
+        r
     });
     // Phase 1 builds only the cheap files table (no zstd frames): editable
     // depth=1 materializes the worktree from the HEAD-closure packs, so it does
     // not need the archive. The full zstd archive (for files mode) is built in
     // phase 2, off the time-to-depth=1 critical path.
+    //
+    // Files-table by-diff: when a prior sync exists, reuse its content hashes for
+    // unchanged paths and read+hash only the blobs that changed since the prior
+    // commit (O(changed) instead of O(worktree)). The no-op fast path in do_sync
+    // guarantees commit != prev.commit here, so the diff is non-trivial. Falls
+    // back to a full table when there is no prior table.
+    let prev_files: Option<Vec<crate::clonepack::FileEntry>> = match prev.as_ref() {
+        Some(p) if !p.commit.is_empty() && !p.shallow_clonepack.metadata_chunk.is_empty() => {
+            load_metadata_files(cas, storage, &p.shallow_clonepack.metadata_chunk)
+        }
+        _ => None,
+    };
+    let prev_commit_for_diff = prev.as_ref().map(|p| p.commit.clone());
     let (md3, cm3) = (mirror_dir.to_path_buf(), commit.to_string());
-    let files_table_handle =
-        tokio::task::spawn_blocking(move || ArchiveBuilder::new(&md3).build_files_table(&cm3));
+    let files_table_handle = match (prev_files, prev_commit_for_diff) {
+        (Some(pf), Some(from)) if !from.is_empty() => {
+            let (md, cm, frm) = (md3.clone(), cm3.clone(), from);
+            tokio::task::spawn_blocking(move || {
+                let s = Instant::now();
+                // If the diff fails (e.g. prev.commit was pruned after a
+                // force-push), fall back to a full rebuild rather than failing
+                // the sync — reuse is purely an optimization.
+                match crate::git::diff_name_set(&md, &frm, &cm) {
+                    Ok(changed) => {
+                        let r = ArchiveBuilder::new(&md)
+                            .build_files_table_incremental(&cm, &pf, &changed);
+                        info!(
+                            "p1 sub: files-table (incremental, {} changed) {:?}",
+                            changed.len(),
+                            s.elapsed()
+                        );
+                        r
+                    }
+                    Err(e) => {
+                        warn!("files-table diff failed ({e:#}); full rebuild");
+                        let r = ArchiveBuilder::new(&md).build_files_table(&cm);
+                        info!(
+                            "p1 sub: files-table (full, diff fallback) {:?}",
+                            s.elapsed()
+                        );
+                        r
+                    }
+                }
+            })
+        }
+        _ => tokio::task::spawn_blocking(move || {
+            let s = Instant::now();
+            let r = ArchiveBuilder::new(&md3).build_files_table(&cm3);
+            info!("p1 sub: files-table (full) {:?}", s.elapsed());
+            r
+        }),
+    };
     let (shallow_skeleton_pack, shallow_skeleton_idx) = shallow_skeleton_handle
         .await
         .context("shallow skeleton")??;
@@ -2980,12 +3061,8 @@ async fn build_and_publish_two_phase(
     let shallow_clonepack_hash = cas.put(&shallow_manifest.encode_to_vec())?;
 
     // Option A: carry the previous commit's full clonepack so depth=0 keeps
-    // working (one commit stale) until phase 2 publishes the new full.
-    let prev = ref_store
-        .load_branch(owner, repo, branch)
-        .await
-        .ok()
-        .flatten();
+    // working (one commit stale) until phase 2 publishes the new full. (`prev`
+    // was loaded at the top of this phase.)
     let carried_full = prev
         .as_ref()
         .map(|p| p.full_clonepack.clone())

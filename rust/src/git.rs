@@ -508,6 +508,52 @@ pub fn list_object_shas_in_range<P: AsRef<Path>>(
     Ok(out.lines().map(|s| s.to_string()).collect())
 }
 
+/// Set of worktree paths (raw bytes) that differ between commits `from` and
+/// `to` — added, modified, deleted, or mode-changed. Used to rebuild only the
+/// changed entries on a re-sync (files-table by-diff, etc.).
+///
+/// Uses `-z` (NUL-separated, never quoted) so the returned bytes match the tree
+/// walk's raw path bytes exactly — a quoted path could otherwise fail to match
+/// and be wrongly treated as unchanged (a correctness hazard). `--no-renames`
+/// makes a rename a delete+add so the new path is reported (and rebuilt).
+pub fn diff_name_set<P: AsRef<Path>>(
+    repo: P,
+    from: &str,
+    to: &str,
+) -> Result<std::collections::HashSet<Vec<u8>>> {
+    crate::validation::validate_git_rev(from)
+        .with_context(|| format!("invalid commit: {}", from))?;
+    crate::validation::validate_git_rev(to).with_context(|| format!("invalid commit: {}", to))?;
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo.as_ref().as_os_str())
+        .args([
+            "diff",
+            "--name-only",
+            "-z",
+            "--no-renames",
+            "--end-of-options",
+            from,
+            to,
+        ])
+        .output()
+        .with_context(|| format!("git diff {}..{}", from, to))?;
+    if !output.status.success() {
+        bail!(
+            "git diff {}..{} failed: {}",
+            from,
+            to,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(output
+        .stdout
+        .split(|&b| b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_vec())
+        .collect())
+}
+
 /// List objects reachable from `commit`, optionally limiting the commit history
 /// depth. `max_depth = None` returns the full history. With a depth of `1`, only
 /// the HEAD commit and the trees/blobs reachable from it are returned, which is
