@@ -237,6 +237,43 @@ and direct descriptor registration on every io_uring run. At this scale the
 end-to-end wall time is nearly tied, but io_uring is now consistently ahead on
 `write_ms` for the first two runs and about 6% faster on average.
 
+### Direct-open CQE skip, 512-file windows, and index stat refresh
+
+Follow-up run on the same isolated io_uring Fly apps after:
+
+- growing io_uring queue depth to 4096 and write windows to 512 files,
+- skipping successful direct-open CQEs while keeping write CQEs for short-write
+  detection,
+- replacing regular-file mtime stamping with an index stat refresh while
+  clearing skip-worktree.
+
+The timed runs again alternated POSIX and io_uring. `git status --short` was
+blank after every clone, confirming the refreshed stat cache matched the
+materialized files.
+
+```
+posix-1:    total 1130 ms | write 945 ms | real 1.15 s
+io_uring-1: total 987 ms  | write 810 ms | real 1.00 s
+posix-2:    total 1049 ms | write 842 ms | real 1.06 s
+io_uring-2: total 1018 ms | write 824 ms | real 1.04 s
+posix-3:    total 1084 ms | write 870 ms | real 1.10 s
+io_uring-3: total 1012 ms | write 823 ms | real 1.03 s
+```
+
+Summary:
+
+```
+posix:    total avg 1087.7 ms, median 1084 ms | write avg 885.7 ms, median 870 ms
+io_uring: total avg 1005.7 ms, median 1012 ms | write avg 819.0 ms, median 823 ms
+```
+
+This widens the io_uring-vs-POSIX gap to about 8% total / 7.5% write time, but
+absolute clone times are slower than the previous mtime-stamped run because the
+current F implementation still does a post-write metadata syscall per path.
+The next version should collect stats while the fd is already open (POSIX) or
+batch `statx` in the ring (io_uring) instead of doing a separate index-refresh
+stat pass.
+
 ### Full Bun clone after optimized writer changes
 
 Target: `oven-sh/bun` at
