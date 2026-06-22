@@ -123,11 +123,27 @@ pub fn safe_create_dir_all(root: &Path, rel: &Path) -> Result<()> {
                     current.display()
                 );
             }
-            if !current.exists() {
-                std::fs::create_dir(&current)
-                    .with_context(|| format!("create dir {}", current.display()))?;
-            } else if !current.is_dir() {
-                anyhow::bail!("path is not a directory: {}", current.display());
+            // Create unconditionally and tolerate a concurrent creator. Probing
+            // with `exists()` first would race when several producer threads
+            // create the same parent directory at once (one would win, the
+            // others would hit EEXIST). `create_dir` + `AlreadyExists` is the
+            // atomic form.
+            match std::fs::create_dir(&current) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if current.is_symlink() {
+                        anyhow::bail!(
+                            "refusing to follow symlinked directory: {}",
+                            current.display()
+                        );
+                    }
+                    if !current.is_dir() {
+                        anyhow::bail!("path is not a directory: {}", current.display());
+                    }
+                }
+                Err(e) => {
+                    return Err(e).with_context(|| format!("create dir {}", current.display()));
+                }
             }
         }
     }
@@ -795,7 +811,15 @@ mod linux_uring {
 
     const QUEUE_DEPTH: u32 = 4096;
     const MAX_BATCH_FILES: usize = 512;
-    const REGISTERED_FILE_SLOTS: usize = MAX_BATCH_FILES * 2;
+    /// Largest per-ring overlap depth a submitter can request. Each in-flight
+    /// window owns its own fixed-file slot range, so the registered slot
+    /// table holds this many `MAX_BATCH_FILES`-sized ranges.
+    const MAX_INFLIGHT_WINDOWS: usize = 4;
+    const REGISTERED_FILE_SLOTS: usize = MAX_BATCH_FILES * MAX_INFLIGHT_WINDOWS;
+    /// Completion-queue capacity. A window submits up to four ops per file
+    /// (open/write/statx/close); with `MAX_INFLIGHT_WINDOWS` windows un-harvested
+    /// the CQ must hold all of their completions without overflowing.
+    const CQ_ENTRIES: u32 = (MAX_INFLIGHT_WINDOWS * MAX_BATCH_FILES * 4) as u32;
     static DIRECT_DESCRIPTOR_ENABLED_LOG: Once = Once::new();
     static DIRECT_DESCRIPTOR_FALLBACK_LOG: Once = Once::new();
     static SKIP_OPEN_CQE_ENABLED_LOG: Once = Once::new();
@@ -812,7 +836,14 @@ mod linux_uring {
         ring: IoUring,
         descriptor_mode: DescriptorMode,
         skip_open_success_cqe: bool,
-        pending_direct: Option<PendingDirectWindow>,
+        /// Windows submitted but not yet harvested, oldest at the front. Bounded
+        /// by `max_inflight`; the front is harvested before exceeding it.
+        pending_windows: std::collections::VecDeque<PendingDirectWindow>,
+        /// Overlap depth: how many windows may be in flight before we block to
+        /// harvest the oldest.
+        max_inflight: usize,
+        /// Next fixed-file slot range to use, in units of `MAX_BATCH_FILES`.
+        slot_cursor: usize,
         next_window_id: u32,
         direct_window_verified: bool,
     }
@@ -871,6 +902,17 @@ mod linux_uring {
 
     thread_local! {
         static THREAD_WRITER: RefCell<Option<RawUringWriter>> = const { RefCell::new(None) };
+        // Desired per-ring overlap depth for the *next* ring created on this
+        // thread. The scheduler sets this before its submitter writes anything;
+        // the default (2) preserves the established double-buffered behavior for
+        // every other caller.
+        static DESIRED_INFLIGHT: std::cell::Cell<usize> = const { std::cell::Cell::new(2) };
+    }
+
+    /// Set the overlap depth for the io_uring ring on the current thread. Must
+    /// be called before the thread's first write (the ring is created lazily).
+    pub(super) fn set_thread_inflight(depth: usize) {
+        DESIRED_INFLIGHT.with(|c| c.set(depth.clamp(1, MAX_INFLIGHT_WINDOWS)));
     }
 
     impl UringWriter {
@@ -992,11 +1034,23 @@ mod linux_uring {
                     DescriptorMode::NormalFd
                 }
             };
+            // Cap overlap depth so all in-flight windows' completions always fit
+            // in the completion queue. A window posts up to 4 ops per file
+            // (open/write/statx/close). If a fallback ring built with a smaller
+            // CQ than requested, this keeps us from ever overflowing it.
+            let cq_window_capacity =
+                (ring.params().cq_entries() as usize / (MAX_BATCH_FILES * 4)).max(1);
+            let max_inflight = DESIRED_INFLIGHT
+                .with(|c| c.get())
+                .clamp(1, MAX_INFLIGHT_WINDOWS)
+                .min(cq_window_capacity);
             Ok(Self {
                 ring,
                 descriptor_mode,
                 skip_open_success_cqe,
-                pending_direct: None,
+                pending_windows: std::collections::VecDeque::new(),
+                max_inflight,
+                slot_cursor: 0,
                 next_window_id: 1,
                 direct_window_verified: false,
             })
@@ -1010,7 +1064,7 @@ mod linux_uring {
                 });
             if use_sqpoll {
                 let mut builder = IoUring::builder();
-                builder.setup_sqpoll(1_000);
+                builder.setup_sqpoll(1_000).setup_cqsize(CQ_ENTRIES);
                 match builder.build(QUEUE_DEPTH) {
                     Ok(ring) => {
                         SQPOLL_RING_ENABLED_LOG
@@ -1031,7 +1085,8 @@ mod linux_uring {
             builder
                 .setup_single_issuer()
                 .setup_defer_taskrun()
-                .setup_coop_taskrun();
+                .setup_coop_taskrun()
+                .setup_cqsize(CQ_ENTRIES);
             match builder.build(QUEUE_DEPTH) {
                 Ok(ring) => {
                     OPTIMIZED_RING_ENABLED_LOG.call_once(|| {
@@ -1047,7 +1102,11 @@ mod linux_uring {
                             "io_uring optimized ring setup unavailable; using default setup: {e}"
                         )
                     });
-                    IoUring::new(QUEUE_DEPTH)
+                    // Still need a CQ large enough for the overlap depth.
+                    IoUring::builder()
+                        .setup_cqsize(CQ_ENTRIES)
+                        .build(QUEUE_DEPTH)
+                        .or_else(|_| IoUring::new(QUEUE_DEPTH))
                 }
             }
         }
@@ -1057,7 +1116,7 @@ mod linux_uring {
             mut writes: Vec<PreparedRegularWrite>,
             collect_stats: bool,
         ) -> Result<Vec<crate::git::MaterializedPathStat>> {
-            if self.pending_direct.is_some() {
+            if !self.pending_windows.is_empty() {
                 anyhow::bail!(
                     "cannot run synchronous io_uring writes while deferred writes are pending"
                 );
@@ -1282,36 +1341,39 @@ mod linux_uring {
                     }
                 }
                 DescriptorMode::DirectFd => {
-                    let previous = self.pending_direct.take();
-                    let slot_base = previous
-                        .as_ref()
-                        .map(|pending| {
-                            if pending.slot_base == 0 {
-                                MAX_BATCH_FILES
-                            } else {
-                                0
-                            }
-                        })
-                        .unwrap_or(0);
+                    // If we are already at our overlap depth, harvest the oldest
+                    // window first — that frees the fixed-file slot range the new
+                    // window is about to reuse.
+                    let (prev_written, prev_stats) =
+                        if self.pending_windows.len() >= self.max_inflight {
+                            let front = self
+                                .pending_windows
+                                .pop_front()
+                                .expect("pending window present at depth");
+                            let written = front.in_flight.len();
+                            let stats = self
+                                .harvest_direct_window(front)
+                                .map_err(DirectWriteError::into_anyhow)?;
+                            (written, stats)
+                        } else {
+                            (0, Vec::new())
+                        };
+                    let slot_base = self.slot_cursor * MAX_BATCH_FILES;
                     match self.submit_direct_window(in_flight, collect_stats, true, slot_base) {
                         Ok(current) => {
-                            self.pending_direct = Some(current);
-                            if let Some(previous) = previous {
-                                let written = previous.in_flight.len();
-                                let stats = self
-                                    .harvest_direct_window(previous)
-                                    .map_err(DirectWriteError::into_anyhow)?;
-                                Ok(WriteOutcome { written, stats })
-                            } else {
-                                Ok(WriteOutcome {
-                                    written: 0,
-                                    stats: Vec::new(),
-                                })
-                            }
+                            self.slot_cursor = (self.slot_cursor + 1) % self.max_inflight;
+                            self.pending_windows.push_back(current);
+                            Ok(WriteOutcome {
+                                written: prev_written,
+                                stats: prev_stats,
+                            })
                         }
                         Err(DirectWriteError::Unsupported(in_flight)) => {
-                            self.pending_direct = previous;
+                            // Drain whatever is still in flight, fall back to
+                            // normal fds, and write this window synchronously.
                             let mut completed = self.flush_deferred_writes()?;
+                            completed.written += prev_written;
+                            completed.stats.extend(prev_stats);
                             self.descriptor_mode = DescriptorMode::NormalFd;
                             let io_start = Instant::now();
                             let stats =
@@ -1321,10 +1383,7 @@ mod linux_uring {
                             completed.stats.extend(stats);
                             Ok(completed)
                         }
-                        Err(DirectWriteError::Other(e)) => {
-                            self.pending_direct = previous;
-                            Err(e)
-                        }
+                        Err(DirectWriteError::Other(e)) => Err(e),
                     }
                 }
                 DescriptorMode::NormalFd => {
@@ -1340,10 +1399,18 @@ mod linux_uring {
         }
 
         fn flush_deferred_writes(&mut self) -> Result<WriteOutcome> {
-            if let Some(pending) = self.pending_direct.take() {
-                let written = pending.in_flight.len();
+            let mut written = 0usize;
+            let mut stats = Vec::new();
+            // Harvest oldest-first so each window's slot range is reclaimed in
+            // submission order.
+            while let Some(pending) = self.pending_windows.pop_front() {
+                let window_written = pending.in_flight.len();
+                let collect_stats = pending.collect_stats;
                 match self.harvest_direct_window(pending) {
-                    Ok(stats) => Ok(WriteOutcome { written, stats }),
+                    Ok(s) => {
+                        written += window_written;
+                        stats.extend(s);
+                    }
                     Err(DirectWriteError::Unsupported(in_flight)) => {
                         DIRECT_DESCRIPTOR_FALLBACK_LOG.call_once(|| {
                             tracing::info!(
@@ -1351,17 +1418,16 @@ mod linux_uring {
                             )
                         });
                         self.descriptor_mode = DescriptorMode::NormalFd;
-                        let stats = self.write_regular_window_normal(in_flight, true)?;
-                        Ok(WriteOutcome { written, stats })
+                        let s = self.write_regular_window_normal(in_flight, collect_stats)?;
+                        written += window_written;
+                        stats.extend(s);
                     }
-                    Err(DirectWriteError::Other(e)) => Err(e),
+                    Err(DirectWriteError::Other(e)) => return Err(e),
                 }
-            } else {
-                Ok(WriteOutcome {
-                    written: 0,
-                    stats: Vec::new(),
-                })
             }
+            // All windows drained: the next window can start from range 0 again.
+            self.slot_cursor = 0;
+            Ok(WriteOutcome { written, stats })
         }
 
         fn submit_direct_window(
@@ -1614,9 +1680,13 @@ mod linux_uring {
                         let (window_id, idx, op) = parse_user_data(cqe.user_data())?;
                         if window_id == target.window_id {
                             apply_direct_completion(target, idx, op, cqe.result())?;
-                        } else if let Some(pending) = self.pending_direct.as_mut()
-                            && window_id == pending.window_id
+                        } else if let Some(pending) = self
+                            .pending_windows
+                            .iter_mut()
+                            .find(|w| w.window_id == window_id)
                         {
+                            // A completion for another still-in-flight window;
+                            // record it so its later harvest sees a full set.
                             apply_direct_completion(pending, idx, op, cqe.result())?;
                         } else {
                             anyhow::bail!("unexpected io_uring completion for window {window_id}");
@@ -1832,6 +1902,435 @@ mod linux_uring {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Write scheduler
+// ---------------------------------------------------------------------------
+//
+// By default each extraction worker owns its own writer and io_uring ring, so a
+// worker can only batch the files in its own chunk. When frames are small the
+// windows stay small.
+//
+// `WorktreeWriteScheduler` (opt-in via `RIPCLONE_IO_URING_SCHEDULER`) splits the
+// work: workers still do the CPU part (validate paths, make dirs, write
+// symlinks), then hand the regular-file writes to a small pool of submitter
+// threads. Each submitter owns one ring and groups writes from every worker
+// routed to it, so windows fill up even when single frames are tiny. POSIX
+// works too (submitters just write right away), so this is testable off Linux.
+//
+// Use it as: `submit(writes)` from each worker, then one `flush()` once all
+// workers are done. `Drop` closes the channels and joins the threads.
+
+/// Most files a submitter puts in one window. Two windows can be in flight at
+/// once using separate slot ranges, so a window must fit `MAX_BATCH_FILES`.
+const SCHEDULER_MAX_WINDOW_FILES: usize = 512;
+
+/// Scheduler knobs. All can be set from the environment so the benchmark can
+/// sweep them without recompiling.
+#[derive(Debug, Clone, Copy)]
+pub struct SchedulerConfig {
+    /// Submitter threads, each with its own ring.
+    pub submitters: usize,
+    /// Windows allowed in flight per submitter. `1` means no overlap.
+    pub inflight: usize,
+    /// Most files per window.
+    pub batch_files: usize,
+    /// Cut a window once it reaches this many bytes, even if it has fewer files.
+    pub byte_cap: usize,
+    /// How long a submitter waits for more work before writing a partial window.
+    pub flush_timeout: Duration,
+    /// Work-channel size per submitter. Blocks a producer when its submitter is
+    /// behind.
+    pub queue_depth: usize,
+}
+
+impl Default for SchedulerConfig {
+    fn default() -> Self {
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        Self {
+            submitters: (cores / 2).clamp(1, 4),
+            inflight: 2,
+            batch_files: SCHEDULER_MAX_WINDOW_FILES,
+            byte_cap: 16 * 1024 * 1024,
+            flush_timeout: Duration::from_micros(200),
+            queue_depth: 8,
+        }
+    }
+}
+
+impl SchedulerConfig {
+    /// True when `RIPCLONE_IO_URING_SCHEDULER` is set to a truthy value.
+    pub fn enabled() -> bool {
+        std::env::var("RIPCLONE_IO_URING_SCHEDULER")
+            .ok()
+            .map(|v| {
+                let v = v.trim();
+                !(v.is_empty()
+                    || v == "0"
+                    || v.eq_ignore_ascii_case("false")
+                    || v.eq_ignore_ascii_case("off")
+                    || v.eq_ignore_ascii_case("no"))
+            })
+            .unwrap_or(false)
+    }
+
+    /// Build a config from defaults, overlaying any env knobs that are set.
+    pub fn from_env() -> Self {
+        let mut cfg = Self::default();
+        if let Some(v) = env_usize("RIPCLONE_IO_URING_SUBMITTERS") {
+            cfg.submitters = v.max(1);
+        }
+        if let Some(v) = env_usize("RIPCLONE_IO_URING_INFLIGHT") {
+            cfg.inflight = v.max(1);
+        }
+        if let Some(v) = env_usize("RIPCLONE_IO_URING_BATCH_FILES") {
+            cfg.batch_files = v.clamp(1, SCHEDULER_MAX_WINDOW_FILES);
+        }
+        if let Some(v) = env_usize("RIPCLONE_IO_URING_BYTE_CAP") {
+            cfg.byte_cap = v.max(1);
+        }
+        if let Some(v) = env_usize("RIPCLONE_IO_URING_FLUSH_US") {
+            cfg.flush_timeout = Duration::from_micros(v as u64);
+        }
+        if let Some(v) = env_usize("RIPCLONE_IO_URING_QUEUE_DEPTH") {
+            cfg.queue_depth = v.max(1);
+        }
+        // A window must never exceed the slot-range cap regardless of overrides.
+        cfg.batch_files = cfg.batch_files.clamp(1, SCHEDULER_MAX_WINDOW_FILES);
+        cfg
+    }
+}
+
+fn env_usize(name: &str) -> Option<usize> {
+    std::env::var(name).ok().and_then(|s| s.trim().parse().ok())
+}
+
+/// Build the per-submitter backend writer. Enabling the scheduler implies
+/// "try io_uring" by default; `RIPCLONE_IO_URING=0` still forces POSIX.
+fn scheduler_backend_writer() -> Result<WorktreeWriter> {
+    match IoUringMode::from_env() {
+        // `from_env` returns `Disabled` for both "unset" and an explicit falsey
+        // value. Distinguish them: unset means "scheduler default → auto".
+        IoUringMode::Disabled if std::env::var_os("RIPCLONE_IO_URING").is_some() => {
+            Ok(WorktreeWriter::posix())
+        }
+        IoUringMode::Force => WorktreeWriter::io_uring(),
+        _ => WorktreeWriter::auto(),
+    }
+}
+
+enum SubmitterMsg {
+    Write(Vec<PreparedRegularWrite>),
+    Flush(crossbeam_channel::Sender<Result<Vec<crate::git::MaterializedPathStat>>>),
+}
+
+struct SubmitterHandle {
+    tx: crossbeam_channel::Sender<SubmitterMsg>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+pub struct WorktreeWriteScheduler {
+    target_dir: PathBuf,
+    options: WriteOptions,
+    submitters: Vec<SubmitterHandle>,
+}
+
+impl WorktreeWriteScheduler {
+    /// Create a scheduler that writes into `target_dir`, reading knobs from the
+    /// environment.
+    pub fn new(target_dir: PathBuf, options: WriteOptions) -> Result<Self> {
+        Self::with_config(target_dir, options, SchedulerConfig::from_env())
+    }
+
+    pub fn with_config(
+        target_dir: PathBuf,
+        options: WriteOptions,
+        config: SchedulerConfig,
+    ) -> Result<Self> {
+        let n = config.submitters.max(1);
+        let mut submitters = Vec::with_capacity(n);
+        for i in 0..n {
+            let (tx, rx) = crossbeam_channel::bounded::<SubmitterMsg>(config.queue_depth);
+            let opts = options;
+            let cfg = config;
+            let join = std::thread::Builder::new()
+                .name(format!("rc-uring-submit-{i}"))
+                .spawn(move || run_submitter(rx, opts, cfg))
+                .context("spawn io_uring submitter thread")?;
+            submitters.push(SubmitterHandle {
+                tx,
+                join: Some(join),
+            });
+        }
+        Ok(Self {
+            target_dir,
+            options,
+            submitters,
+        })
+    }
+
+    pub fn submitter_count(&self) -> usize {
+        self.submitters.len()
+    }
+
+    /// Prepare `writes` on this thread, then send the regular-file writes to the
+    /// submitter pool. Returns the file count (symlinks written here plus
+    /// regular files queued).
+    pub fn submit(&self, writes: Vec<OwnedFileWrite>) -> Result<usize> {
+        if writes.is_empty() {
+            return Ok(0);
+        }
+        let (written, regulars) = prepare_owned_entries(&self.target_dir, writes, self.options)?;
+        if regulars.is_empty() {
+            return Ok(written);
+        }
+
+        // Send each write to a submitter picked by path hash, so one submitter
+        // collects many frames' writes into full windows.
+        let n = self.submitters.len();
+        if n == 1 {
+            self.send_to(0, regulars)?;
+        } else {
+            let mut buckets: Vec<Vec<PreparedRegularWrite>> = (0..n).map(|_| Vec::new()).collect();
+            for write in regulars {
+                let slot = route_index(write.index_path.as_bytes(), n);
+                buckets[slot].push(write);
+            }
+            for (i, bucket) in buckets.into_iter().enumerate() {
+                if !bucket.is_empty() {
+                    self.send_to(i, bucket)?;
+                }
+            }
+        }
+        Ok(written)
+    }
+
+    fn send_to(&self, i: usize, writes: Vec<PreparedRegularWrite>) -> Result<()> {
+        self.submitters[i]
+            .tx
+            .send(SubmitterMsg::Write(writes))
+            .map_err(|_| anyhow::anyhow!("io_uring submitter {i} stopped accepting writes"))
+    }
+
+    /// Wait for every submitter to finish and return the collected stats. Call
+    /// once, after all `submit` calls have returned.
+    pub fn flush(&self) -> Result<WriteOutcome> {
+        let mut acks = Vec::with_capacity(self.submitters.len());
+        for (i, handle) in self.submitters.iter().enumerate() {
+            let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
+            handle
+                .tx
+                .send(SubmitterMsg::Flush(ack_tx))
+                .map_err(|_| anyhow::anyhow!("io_uring submitter {i} stopped before flush"))?;
+            acks.push(ack_rx);
+        }
+        let mut stats = Vec::new();
+        let mut first_err: Option<anyhow::Error> = None;
+        for (i, ack_rx) in acks.into_iter().enumerate() {
+            match ack_rx.recv() {
+                Ok(Ok(s)) => stats.extend(s),
+                Ok(Err(e)) => {
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+                Err(_) => {
+                    if first_err.is_none() {
+                        first_err = Some(anyhow::anyhow!("io_uring submitter {i} died before ack"));
+                    }
+                }
+            }
+        }
+        if let Some(e) = first_err {
+            return Err(e);
+        }
+        Ok(WriteOutcome { written: 0, stats })
+    }
+}
+
+impl Drop for WorktreeWriteScheduler {
+    fn drop(&mut self) {
+        // Drop the senders so each submitter sees a closed channel and exits,
+        // then join.
+        for handle in &mut self.submitters {
+            let (dummy_tx, _dummy_rx) = crossbeam_channel::bounded::<SubmitterMsg>(0);
+            let live = std::mem::replace(&mut handle.tx, dummy_tx);
+            drop(live);
+        }
+        for handle in &mut self.submitters {
+            if let Some(join) = handle.join.take() {
+                let _ = join.join();
+            }
+        }
+    }
+}
+
+/// Pick a submitter for a path. FNV-1a: cheap and stable, same path always maps
+/// to the same submitter.
+fn route_index(bytes: &[u8], n: usize) -> usize {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    (hash % n as u64) as usize
+}
+
+fn run_submitter(
+    rx: crossbeam_channel::Receiver<SubmitterMsg>,
+    options: WriteOptions,
+    cfg: SchedulerConfig,
+) {
+    let mut state = SubmitterState::new(options, cfg);
+    loop {
+        let msg = if state.buf.is_empty() {
+            // Nothing pending: block until work or shutdown.
+            match rx.recv() {
+                Ok(msg) => msg,
+                Err(_) => break,
+            }
+        } else {
+            // Holding a partial window: flush it if no work arrives promptly.
+            match rx.recv_timeout(cfg.flush_timeout) {
+                Ok(msg) => msg,
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    state.flush_partial();
+                    continue;
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+            }
+        };
+        match msg {
+            SubmitterMsg::Write(writes) => state.accept(writes),
+            SubmitterMsg::Flush(ack) => {
+                let result = state.drain_and_report();
+                let _ = ack.send(result);
+            }
+        }
+    }
+    // Channel closed: the scheduler was dropped without `flush()`. Write out
+    // anything left. No one can read a Result now, so a failure here would be
+    // lost — log it so a partial write can't pass silently. Callers that call
+    // `flush()` first leave nothing here, so this is usually a no-op.
+    if let Err(e) = state.drain_and_report() {
+        tracing::error!("io_uring submitter dropped with unflushed write failure: {e:#}");
+    }
+}
+
+struct SubmitterState {
+    writer: std::result::Result<WorktreeWriter, String>,
+    options: WriteOptions,
+    cfg: SchedulerConfig,
+    buf: Vec<PreparedRegularWrite>,
+    buf_bytes: usize,
+    acc_stats: Vec<crate::git::MaterializedPathStat>,
+    acc_err: Option<anyhow::Error>,
+}
+
+impl SubmitterState {
+    fn new(options: WriteOptions, cfg: SchedulerConfig) -> Self {
+        // Set the ring overlap depth before the writer makes this thread's ring
+        // (it makes one during its probe).
+        #[cfg(target_os = "linux")]
+        linux_uring::set_thread_inflight(cfg.inflight);
+        let writer = scheduler_backend_writer().map_err(|e| format!("{e:#}"));
+        Self {
+            writer,
+            options,
+            cfg,
+            buf: Vec::new(),
+            buf_bytes: 0,
+            acc_stats: Vec::new(),
+            acc_err: None,
+        }
+    }
+
+    fn accept(&mut self, writes: Vec<PreparedRegularWrite>) {
+        if self.acc_err.is_some() {
+            return; // already failed; swallow until flush reports it
+        }
+        for w in &writes {
+            self.buf_bytes += w.content.len();
+        }
+        self.buf.extend(writes);
+        // Emit full windows while we have enough to fill one.
+        while self.buf.len() >= self.cfg.batch_files || self.buf_bytes >= self.cfg.byte_cap {
+            let take = self.next_window_len();
+            self.emit(take);
+            if self.acc_err.is_some() {
+                break;
+            }
+        }
+    }
+
+    /// How many buffered files go in the next window: up to `batch_files`, or
+    /// fewer if `byte_cap` is reached first. Always at least one.
+    fn next_window_len(&self) -> usize {
+        let mut bytes = 0usize;
+        let mut count = 0usize;
+        for w in &self.buf {
+            bytes += w.content.len();
+            count += 1;
+            if count >= self.cfg.batch_files || bytes >= self.cfg.byte_cap {
+                break;
+            }
+        }
+        count.max(1).min(self.buf.len())
+    }
+
+    fn emit(&mut self, take: usize) {
+        if take == 0 || self.acc_err.is_some() {
+            return;
+        }
+        let window: Vec<PreparedRegularWrite> = self.buf.drain(..take).collect();
+        let win_bytes: usize = window.iter().map(|w| w.content.len()).sum();
+        self.buf_bytes = self.buf_bytes.saturating_sub(win_bytes);
+        let writer = match &self.writer {
+            Ok(w) => w,
+            Err(e) => {
+                self.acc_err = Some(anyhow::anyhow!("create worktree writer: {e}"));
+                return;
+            }
+        };
+        // The ring's own overlap depth (set from `cfg.inflight`) decides how
+        // many windows stay in flight; a depth of 1 harvests each window before
+        // the next is submitted, so no explicit flush is needed here.
+        match writer.write_regular_batch_deferred(window, self.options) {
+            Ok(outcome) => self.acc_stats.extend(outcome.stats),
+            Err(e) => self.acc_err = Some(e),
+        }
+    }
+
+    fn flush_partial(&mut self) {
+        while !self.buf.is_empty() && self.acc_err.is_none() {
+            let take = self.next_window_len();
+            self.emit(take);
+        }
+    }
+
+    /// Write out everything left (buffer plus any in-flight windows) and return
+    /// the stats collected since the last drain, or the first error.
+    fn drain_and_report(&mut self) -> Result<Vec<crate::git::MaterializedPathStat>> {
+        self.flush_partial();
+        if self.acc_err.is_none()
+            && let Ok(w) = &self.writer
+        {
+            match w.flush_deferred_writes() {
+                Ok(outcome) => self.acc_stats.extend(outcome.stats),
+                Err(e) => self.acc_err = Some(e),
+            }
+        }
+        self.buf.clear();
+        self.buf_bytes = 0;
+        let stats = std::mem::take(&mut self.acc_stats);
+        match self.acc_err.take() {
+            Some(e) => Err(e),
+            None => Ok(stats),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2043,6 +2542,333 @@ mod tests {
                     std::fs::read(dir.path().join(rel)).unwrap(),
                     content.as_bytes()
                 );
+            }
+        }
+    }
+
+    // ----- scheduler tests (backend-agnostic: io_uring on Linux, POSIX else) --
+
+    fn sched_config(
+        submitters: usize,
+        inflight: usize,
+        batch_files: usize,
+        byte_cap: usize,
+    ) -> SchedulerConfig {
+        SchedulerConfig {
+            submitters,
+            inflight,
+            batch_files,
+            byte_cap,
+            flush_timeout: Duration::from_micros(200),
+            queue_depth: 4,
+        }
+    }
+
+    fn archive_opts() -> WriteOptions {
+        // Matches the archive write path: dirs created on demand here (the unit
+        // test does not pre-create them), no mtime stamp so stats are collected.
+        WriteOptions {
+            parents_prepared: false,
+            stamp_mtime: false,
+            fresh_target: false,
+        }
+    }
+
+    fn regular(path: &str, content: &[u8]) -> OwnedFileWrite {
+        OwnedFileWrite {
+            entry: FileEntry {
+                path: path.as_bytes().to_vec(),
+                mode: 0o100644,
+                blob_sha1: Vec::new(),
+                fragments: Vec::new(),
+            },
+            content: content.to_vec().into(),
+        }
+    }
+
+    fn run_scheduler_case(cfg: SchedulerConfig) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let scheduler =
+            WorktreeWriteScheduler::with_config(dir.path().to_path_buf(), archive_opts(), cfg)
+                .unwrap();
+
+        let mut total = 0usize;
+        let batches = 6;
+        let per = 17; // not a multiple of batch_files, to exercise partial windows
+        for b in 0..batches {
+            let writes: Vec<_> = (0..per)
+                .map(|i| {
+                    let rel = format!("dir{}/file-{b}-{i}.txt", i % 4);
+                    let content = format!("batch={b} file={i} payload payload payload\n");
+                    regular(&rel, content.as_bytes())
+                })
+                .collect();
+            total += scheduler.submit(writes).unwrap();
+        }
+        let outcome = scheduler.flush().unwrap();
+
+        assert_eq!(total, batches * per, "all files accounted for");
+        // stamp_mtime=false → every regular file produces a stat.
+        assert_eq!(
+            outcome.stats.len(),
+            batches * per,
+            "one stat per regular file"
+        );
+        for b in 0..batches {
+            for i in 0..per {
+                let rel = format!("dir{}/file-{b}-{i}.txt", i % 4);
+                let content = format!("batch={b} file={i} payload payload payload\n");
+                assert_eq!(
+                    std::fs::read(dir.path().join(&rel)).unwrap(),
+                    content.as_bytes(),
+                    "content for {rel}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scheduler_single_submitter_writes_all() {
+        run_scheduler_case(sched_config(1, 2, 8, 1 << 20));
+    }
+
+    #[test]
+    fn scheduler_multi_submitter_writes_all() {
+        run_scheduler_case(sched_config(4, 2, 8, 1 << 20));
+    }
+
+    #[test]
+    fn scheduler_inflight_one_writes_all() {
+        run_scheduler_case(sched_config(2, 1, 8, 1 << 20));
+    }
+
+    #[test]
+    fn scheduler_inflight_four_writes_all() {
+        run_scheduler_case(sched_config(2, 4, 8, 1 << 20));
+    }
+
+    #[test]
+    fn scheduler_deep_overlap_cycles_slot_ranges() {
+        // One submitter, max overlap, small windows, and far more windows than
+        // the overlap depth — forces the harvest-front / slot-range-reuse path
+        // to cycle many times.
+        let dir = tempfile::TempDir::new().unwrap();
+        let scheduler = WorktreeWriteScheduler::with_config(
+            dir.path().to_path_buf(),
+            archive_opts(),
+            sched_config(1, 4, 8, 1 << 20),
+        )
+        .unwrap();
+        let n = 300;
+        let writes: Vec<_> = (0..n)
+            .map(|i| {
+                regular(
+                    &format!("deep/f{i:04}.txt"),
+                    format!("payload-{i}").as_bytes(),
+                )
+            })
+            .collect();
+        let written = scheduler.submit(writes).unwrap();
+        let outcome = scheduler.flush().unwrap();
+        assert_eq!(written, n);
+        assert_eq!(outcome.stats.len(), n);
+        for i in 0..n {
+            assert_eq!(
+                std::fs::read(dir.path().join(format!("deep/f{i:04}.txt"))).unwrap(),
+                format!("payload-{i}").as_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn scheduler_tiny_byte_cap_forces_small_windows() {
+        // byte_cap smaller than one file → every window is a single file, but
+        // everything must still land.
+        run_scheduler_case(sched_config(2, 2, 512, 1));
+    }
+
+    #[test]
+    fn scheduler_large_batch_spanning_window_cap_writes_all() {
+        // A single submit larger than the window cap must split into windows.
+        let dir = tempfile::TempDir::new().unwrap();
+        let scheduler = WorktreeWriteScheduler::with_config(
+            dir.path().to_path_buf(),
+            archive_opts(),
+            sched_config(1, 2, 16, 1 << 20),
+        )
+        .unwrap();
+        let writes: Vec<_> = (0..200)
+            .map(|i| regular(&format!("flat/f{i}.txt"), format!("v{i}").as_bytes()))
+            .collect();
+        let written = scheduler.submit(writes).unwrap();
+        let outcome = scheduler.flush().unwrap();
+        assert_eq!(written, 200);
+        assert_eq!(outcome.stats.len(), 200);
+        for i in 0..200 {
+            assert_eq!(
+                std::fs::read(dir.path().join(format!("flat/f{i}.txt"))).unwrap(),
+                format!("v{i}").as_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn scheduler_materializes_symlinks_inline() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let scheduler = WorktreeWriteScheduler::with_config(
+            dir.path().to_path_buf(),
+            archive_opts(),
+            sched_config(2, 2, 8, 1 << 20),
+        )
+        .unwrap();
+        let mut writes = vec![regular("real.txt", b"hello")];
+        writes.push(OwnedFileWrite {
+            entry: FileEntry {
+                path: b"link.txt".to_vec(),
+                mode: 0o120000,
+                blob_sha1: Vec::new(),
+                fragments: Vec::new(),
+            },
+            content: b"real.txt".to_vec().into(),
+        });
+        let written = scheduler.submit(writes).unwrap();
+        scheduler.flush().unwrap();
+        assert_eq!(written, 2, "symlink + regular both counted");
+        assert_eq!(
+            std::fs::read(dir.path().join("real.txt")).unwrap(),
+            b"hello"
+        );
+        #[cfg(unix)]
+        {
+            let meta = std::fs::symlink_metadata(dir.path().join("link.txt")).unwrap();
+            assert!(meta.file_type().is_symlink(), "link.txt is a symlink");
+            assert_eq!(
+                std::fs::read_link(dir.path().join("link.txt")).unwrap(),
+                std::path::Path::new("real.txt")
+            );
+        }
+    }
+
+    #[test]
+    fn scheduler_rejects_unsafe_path() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let scheduler = WorktreeWriteScheduler::with_config(
+            dir.path().to_path_buf(),
+            archive_opts(),
+            sched_config(1, 2, 8, 1 << 20),
+        )
+        .unwrap();
+        let err = scheduler
+            .submit(vec![regular("../escape.txt", b"nope")])
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("unsafe path") || format!("{err:#}").contains("parent-dir"),
+            "expected path-validation error, got: {err:#}"
+        );
+        // Nothing should have escaped the target dir.
+        assert!(!dir.path().parent().unwrap().join("escape.txt").exists());
+    }
+
+    #[test]
+    fn scheduler_empty_submit_and_flush_are_noops() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let scheduler = WorktreeWriteScheduler::with_config(
+            dir.path().to_path_buf(),
+            archive_opts(),
+            sched_config(2, 2, 8, 1 << 20),
+        )
+        .unwrap();
+        assert_eq!(scheduler.submit(Vec::new()).unwrap(), 0);
+        let outcome = scheduler.flush().unwrap();
+        assert_eq!(outcome.written, 0);
+        assert!(outcome.stats.is_empty());
+    }
+
+    #[test]
+    fn scheduler_concurrent_producers_share_dir_without_eexist() {
+        // Many producers create files under the SAME parent directory with
+        // parents_prepared=false, so safe_create_dir_all races on the shared
+        // dir. Must not fail with EEXIST.
+        let dir = tempfile::TempDir::new().unwrap();
+        let scheduler = std::sync::Arc::new(
+            WorktreeWriteScheduler::with_config(
+                dir.path().to_path_buf(),
+                archive_opts(),
+                sched_config(3, 2, 8, 1 << 20),
+            )
+            .unwrap(),
+        );
+        std::thread::scope(|scope| {
+            for w in 0..8 {
+                let scheduler = std::sync::Arc::clone(&scheduler);
+                scope.spawn(move || {
+                    let writes: Vec<_> = (0..25)
+                        .map(|i| {
+                            // All under one shared/nested directory.
+                            regular(
+                                &format!("shared/nested/w{w}_f{i}.txt"),
+                                format!("w{w}f{i}").as_bytes(),
+                            )
+                        })
+                        .collect();
+                    scheduler.submit(writes).unwrap();
+                });
+            }
+        });
+        let outcome = scheduler.flush().unwrap();
+        assert_eq!(outcome.stats.len(), 8 * 25);
+        for w in 0..8 {
+            for i in 0..25 {
+                let rel = format!("shared/nested/w{w}_f{i}.txt");
+                assert_eq!(
+                    std::fs::read(dir.path().join(&rel)).unwrap(),
+                    format!("w{w}f{i}").as_bytes()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scheduler_concurrent_producers_write_all() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let scheduler = std::sync::Arc::new(
+            WorktreeWriteScheduler::with_config(
+                dir.path().to_path_buf(),
+                archive_opts(),
+                sched_config(3, 2, 8, 1 << 20),
+            )
+            .unwrap(),
+        );
+        std::thread::scope(|scope| {
+            for w in 0..6 {
+                let scheduler = std::sync::Arc::clone(&scheduler);
+                scope.spawn(move || {
+                    for chunk in 0..4 {
+                        let writes: Vec<_> = (0..10)
+                            .map(|i| {
+                                regular(
+                                    &format!("w{w}/c{chunk}/f{i}.txt"),
+                                    format!("w{w}c{chunk}f{i}").as_bytes(),
+                                )
+                            })
+                            .collect();
+                        scheduler.submit(writes).unwrap();
+                    }
+                });
+            }
+        });
+        let outcome = scheduler.flush().unwrap();
+        assert_eq!(outcome.stats.len(), 6 * 4 * 10);
+        for w in 0..6 {
+            for chunk in 0..4 {
+                for i in 0..10 {
+                    let rel = format!("w{w}/c{chunk}/f{i}.txt");
+                    assert_eq!(
+                        std::fs::read(dir.path().join(&rel)).unwrap(),
+                        format!("w{w}c{chunk}f{i}").as_bytes(),
+                        "content for {rel}"
+                    );
+                }
             }
         }
     }

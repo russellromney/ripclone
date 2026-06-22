@@ -7,6 +7,12 @@ primary_region = 'ewr'
 [env]
   RIPCLONE_URL = 'http://157.230.7.238:8080'
 
+# Persistent SSD volume so clones (and the writer benchmark) land on /data, the
+# device that matters, instead of the slow rootfs overlay.
+[mounts]
+  source = 'ripclone_client_data'
+  destination = '/data'
+
 # Keep the machine alive so we can run controlled clones over SSH instead of the
 # one-shot multi-mode benchmark script.
 [experimental]
