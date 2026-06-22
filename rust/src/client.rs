@@ -191,7 +191,7 @@ fn default_cache_dir() -> Option<PathBuf> {
 
 impl Client {
     pub async fn resolve_ref(&self, owner: &str, repo: &str, branch: &str) -> Result<RefResponse> {
-        self.resolve_ref_with_clonepack(owner, repo, branch, None)
+        self.resolve_ref_with_clonepack(owner, repo, branch, None, None)
             .await
     }
 
@@ -201,13 +201,22 @@ impl Client {
         repo: &str,
         branch: &str,
         clonepack: Option<&str>,
+        rev: Option<&str>,
     ) -> Result<RefResponse> {
         let mut url = format!(
             "{}/v1/repos/{}/{}/refs/{}",
             self.server, owner, repo, branch
         );
+        let mut q: Vec<String> = Vec::new();
         if let Some(kind) = clonepack {
-            url.push_str(&format!("?clonepack={}", kind));
+            q.push(format!("clonepack={}", kind));
+        }
+        if let Some(r) = rev {
+            q.push(format!("rev={}", urlencoding::encode(r)));
+        }
+        if !q.is_empty() {
+            url.push('?');
+            url.push_str(&q.join("&"));
         }
         let resp = self.http.get(&url).send().await?;
         if !resp.status().is_success() {
@@ -454,9 +463,33 @@ impl Client {
         depth: Option<usize>,
         github_token: Option<&str>,
     ) -> Result<RefResponse> {
+        self.sync_repo_at(owner, repo, None, depth, github_token)
+            .await
+    }
+
+    /// Like [`sync_repo`] but builds at `rev` (e.g. "HEAD~5" or a SHA) instead of
+    /// the branch tip. The branch is still the ref-store key; only the build
+    /// commit is overridden. Useful for exercising the incremental build path
+    /// deterministically without waiting for upstream to advance.
+    pub async fn sync_repo_at(
+        &self,
+        owner: &str,
+        repo: &str,
+        rev: Option<&str>,
+        depth: Option<usize>,
+        github_token: Option<&str>,
+    ) -> Result<RefResponse> {
         let mut url = format!("{}/v1/repos/{}/{}/sync", self.server, owner, repo);
+        let mut q: Vec<String> = Vec::new();
         if let Some(d) = depth {
-            url.push_str(&format!("?depth={}", d));
+            q.push(format!("depth={}", d));
+        }
+        if let Some(r) = rev {
+            q.push(format!("rev={}", urlencoding::encode(r)));
+        }
+        if !q.is_empty() {
+            url.push('?');
+            url.push_str(&q.join("&"));
         }
         // With the async build queue the server may return 202 (build still
         // running) or 503 (queue full). Each POST blocks server-side until its
@@ -509,11 +542,30 @@ impl Client {
 
     /// Install a repo with a specific clone mode and optional per-phase benchmark
     /// instrumentation.
+    #[allow(clippy::too_many_arguments)]
     pub async fn install_repo_with_mode<P: AsRef<Path>>(
         &self,
         owner: &str,
         repo: &str,
         branch: &str,
+        target: P,
+        mode: CloneMode,
+        clonepack: Option<&str>,
+        bench: Option<&mut Benchmark>,
+    ) -> Result<()> {
+        self.install_repo_with_mode_at(owner, repo, branch, None, target, mode, clonepack, bench)
+            .await
+    }
+
+    /// Like [`install_repo_with_mode`] but resolves `rev` (e.g. "HEAD~5") instead
+    /// of the branch tip — clones the artifacts a `sync --at <rev>` built.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn install_repo_with_mode_at<P: AsRef<Path>>(
+        &self,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+        rev: Option<&str>,
         target: P,
         mode: CloneMode,
         clonepack: Option<&str>,
@@ -538,7 +590,7 @@ impl Client {
 
         // 1. Resolve ref (full-history by default; fast clones can request shallow).
         let info = self
-            .resolve_ref_with_clonepack(owner, repo, branch, clonepack)
+            .resolve_ref_with_clonepack(owner, repo, branch, clonepack, rev)
             .await?;
         bench.mark_resolve();
         info!("resolved to commit {}", &info.commit[..7]);

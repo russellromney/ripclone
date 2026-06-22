@@ -31,6 +31,11 @@ enum Commands {
         /// depth limit (full history). Defaults to the server's configured default.
         #[arg(short, long)]
         depth: Option<usize>,
+        /// Build at this git rev instead of the branch tip (e.g. "HEAD~5" or a
+        /// SHA). The branch is still the ref key; only the build commit changes.
+        /// Lets you exercise the incremental path without upstream advancing.
+        #[arg(long)]
+        at: Option<String>,
         /// GitHub token to use for this sync only. Overrides RIPCLONE_GITHUB_TOKEN.
         #[arg(short, long, env = "RIPCLONE_GITHUB_TOKEN")]
         github_token: Option<String>,
@@ -52,6 +57,10 @@ enum Commands {
         /// history.
         #[arg(long, default_value = "1")]
         depth: usize,
+        /// Clone the artifacts built for this git rev (e.g. "HEAD~5") instead of
+        /// the branch tip. Pairs with `sync --at <rev>`.
+        #[arg(long)]
+        at: Option<String>,
         /// Materialize the working tree in memory (tmpfs) for a fast, EPHEMERAL
         /// clone. The tree does not survive a reboot — intended for throwaway
         /// agent/CI machines. Linux only.
@@ -242,11 +251,18 @@ async fn main() -> Result<()> {
         Commands::Sync {
             repo,
             depth,
+            at,
             github_token,
         } => {
             let (owner, repo_name) = parse_repo(&repo)?;
             let info = client
-                .sync_repo(owner, repo_name, depth, github_token.as_deref())
+                .sync_repo_at(
+                    owner,
+                    repo_name,
+                    at.as_deref(),
+                    depth,
+                    github_token.as_deref(),
+                )
                 .await?;
             println!("synced {} to {}", repo, info.commit);
         }
@@ -257,6 +273,7 @@ async fn main() -> Result<()> {
             hot_files: _hot_files,
             mode,
             depth,
+            at,
             temp,
             bench,
             skeleton,
@@ -284,10 +301,11 @@ async fn main() -> Result<()> {
             let mut benchmark = Benchmark::new();
             let clonepack_kind = Some(ripclone::mode::clonepack_kind_for_depth(depth));
             client
-                .install_repo_with_mode(
+                .install_repo_with_mode_at(
                     owner,
                     repo_name,
                     &branch,
+                    at.as_deref(),
                     &target,
                     mode,
                     clonepack_kind,

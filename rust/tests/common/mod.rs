@@ -258,12 +258,25 @@ pub async fn clone_only(
     depth: usize,
     mode: ripclone::mode::CloneMode,
 ) -> anyhow::Result<(TempDir, std::path::PathBuf)> {
+    clone_only_at(server, owner, repo, None, depth, mode).await
+}
+
+/// Like [`clone_only`] but clones the artifacts built for `rev` (e.g. "HEAD~2"),
+/// pairing with a `sync` at that rev.
+pub async fn clone_only_at(
+    server: &Server,
+    owner: &str,
+    repo: &str,
+    rev: Option<&str>,
+    depth: usize,
+    mode: ripclone::mode::CloneMode,
+) -> anyhow::Result<(TempDir, std::path::PathBuf)> {
     let client = server.client();
     let out = tempfile::tempdir().unwrap();
     let target = out.path().join("clone");
     let kind = ripclone::mode::clonepack_kind_for_depth(depth);
     client
-        .install_repo_with_mode(owner, repo, "HEAD", &target, mode, Some(kind), None)
+        .install_repo_with_mode_at(owner, repo, "HEAD", rev, &target, mode, Some(kind), None)
         .await?;
     Ok((out, target))
 }

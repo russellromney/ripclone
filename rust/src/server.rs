@@ -134,6 +134,12 @@ impl RateLimiter {
 pub struct SyncRequest {
     #[serde(default = "default_branch_value")]
     pub branch: String,
+    /// Optional git rev to build at instead of the branch tip (e.g. `HEAD~5` or
+    /// a SHA). The branch is still fetched and used as the ref-store key; only
+    /// the build commit is overridden. Useful for testing the incremental path
+    /// (sync at HEAD~N, then HEAD~N-1) without waiting for upstream to advance.
+    #[serde(default)]
+    pub rev: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -142,6 +148,10 @@ pub struct RefQuery {
     /// "shallow" (depth=1). Defaults to "full" for backward compatibility.
     #[serde(default = "default_clonepack_kind")]
     pub clonepack: String,
+    /// Optional git rev to resolve instead of the branch tip (e.g. "HEAD~5").
+    /// Pairs with `sync?rev=...`: clone the artifacts built for that commit.
+    #[serde(default)]
+    pub rev: Option<String>,
 }
 
 fn default_clonepack_kind() -> String {
@@ -213,6 +223,8 @@ pub struct BuildJob {
     pub repo: String,
     #[allow(dead_code)]
     pub branch: String,
+    /// Optional build-commit override (see SyncRequest.rev).
+    pub rev: Option<String>,
     pub github_token: Option<secrecy::SecretString>,
 }
 
@@ -794,8 +806,17 @@ async fn get_ref(
     if let Some(resp) = validation::reject_if_invalid(|| validation::validate_git_rev(&branch)) {
         return resp;
     }
+    if let Some(rev) = params.rev.as_deref()
+        && let Some(resp) = validation::reject_if_invalid(|| validation::validate_git_rev(rev))
+    {
+        return resp;
+    }
     state.metrics.record_ref_lookup();
     let key = format!("{}/{}/{}", owner, repo, branch);
+    // Optional build-commit override: resolve this rev instead of the branch tip
+    // so a clone can fetch the artifacts a `sync?rev=...` built. The response
+    // cache is bypassed for rev requests (a testing path, low volume).
+    let resolve_target = params.rev.clone().unwrap_or_else(|| branch.clone());
 
     let mirror_dir = state.repo_root.join(format!("{}_{}.git", owner, repo));
     let github_token = state
@@ -809,7 +830,9 @@ async fn get_ref(
     let fresh_key = format!("{}/{}/{}", owner, repo, branch);
     let lock = repo_lock(&state.sync_locks, &owner, &repo).await;
     let _guard = lock.lock().await;
-    if let Some(resp) = cached_ref_response(&state, &owner, &repo, &branch, &params.clonepack) {
+    if params.rev.is_none()
+        && let Some(resp) = cached_ref_response(&state, &owner, &repo, &branch, &params.clonepack)
+    {
         return (StatusCode::OK, Json(resp)).into_response();
     }
     // Skip the `git fetch` when the mirror was refreshed within the TTL — by a
@@ -831,17 +854,21 @@ async fn get_ref(
     }
     drop(_guard);
 
-    // Load the stored info for this branch, if any.
+    // Load the stored info, if any. A rev request loads the rolling test key the
+    // matching `sync?rev=...` stored under (isolated from the real branch entry).
+    let store_key = ref_store_key(&branch, params.rev.as_deref());
     let fallback = state
         .ref_store
-        .load_branch(&owner, &repo, &branch)
+        .load_branch(&owner, &repo, &store_key)
         .await
         .ok()
         .flatten();
 
-    let branch2 = branch.clone();
+    let resolve_target2 = resolve_target.clone();
     let mirror_dir2 = mirror_dir.clone();
-    match tokio::task::spawn_blocking(move || git::resolve_commit(&mirror_dir2, &branch2)).await {
+    match tokio::task::spawn_blocking(move || git::resolve_commit(&mirror_dir2, &resolve_target2))
+        .await
+    {
         Ok(Ok(commit)) => {
             let default_branch =
                 git::default_branch(&mirror_dir).unwrap_or_else(|_| "HEAD".to_string());
@@ -879,7 +906,7 @@ async fn get_ref(
                 &state.storage,
                 &params.clonepack,
             );
-            if info.build_status.is_none() {
+            if info.build_status.is_none() && params.rev.is_none() {
                 cache_ref_response(&state, &owner, &repo, &branch, &params.clonepack, &resp);
             }
             (StatusCode::OK, Json(resp)).into_response()
@@ -1151,9 +1178,19 @@ async fn sync_repo(
     {
         return resp;
     }
+    if let Some(rev) = params.rev.as_deref()
+        && let Some(resp) = validation::reject_if_invalid(|| validation::validate_git_rev(rev))
+    {
+        return resp;
+    }
     let start = Instant::now();
     let mirror_dir = state.repo_root.join(format!("{}_{}.git", owner, repo));
     let branch = params.branch;
+    let at_rev = params.rev;
+    // Ref-store key: rev builds use a rolling test key isolated from the real
+    // branch entry (see ref_store_key). Used when loading the result for the
+    // sync response below.
+    let ref_key = ref_store_key(&branch, at_rev.as_deref());
     let github_token = headers
         .get("X-GitHub-Token")
         .and_then(|v| v.to_str().ok())
@@ -1170,7 +1207,12 @@ async fn sync_repo(
     // and is rate-bounded under load. Coalesce concurrent `/sync` for the same
     // key onto one build, wait up to RIPCLONE_SYNC_WAIT_SECS, then 202.
     if async_build_enabled() {
-        let key = format!("{owner}/{repo}/{branch}");
+        // Include the rev override in the coalescing key so syncs targeting
+        // different build commits don't share one build.
+        let key = format!(
+            "{owner}/{repo}/{branch}#{}",
+            at_rev.as_deref().unwrap_or("")
+        );
         let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
         let first = {
             let mut w = state.build_waiters.lock().await;
@@ -1185,6 +1227,7 @@ async fn sync_repo(
                 owner: owner.clone(),
                 repo: repo.clone(),
                 branch: branch.clone(),
+                rev: at_rev.clone(),
                 github_token,
             };
             if state.build_queue.try_send(job).is_err() {
@@ -1205,7 +1248,7 @@ async fn sync_repo(
         // than holding the connection until it is reset mid-request.
         let wait = Duration::from_secs(env_bytes("RIPCLONE_SYNC_WAIT_SECS", 25));
         match tokio::time::timeout(wait, rx).await {
-            Ok(Ok(Ok(()))) => match state.ref_store.load_branch(&owner, &repo, &branch).await {
+            Ok(Ok(Ok(()))) => match state.ref_store.load_branch(&owner, &repo, &ref_key).await {
                 Ok(Some(info)) => {
                     state.metrics.record_sync(start.elapsed());
                     let resp =
@@ -1263,6 +1306,7 @@ async fn sync_repo(
         &owner,
         &repo,
         &branch,
+        at_rev.as_deref(),
         &state.ref_store,
         false,
         &state.storage,
@@ -1378,6 +1422,7 @@ async fn build_handler(
         owner: body.owner,
         repo: body.repo,
         branch: "HEAD".to_string(),
+        rev: None,
         github_token: state
             .github_token
             .clone()
@@ -1526,6 +1571,7 @@ async fn create_snapshot(
         &owner,
         &repo,
         &branch,
+        None,
         &state.ref_store,
         false,
         &state.storage,
@@ -1908,6 +1954,20 @@ enum DepthBuild {
     Lsm(crate::pack::IncrementalPacks),
 }
 
+/// Ref-store key for a build. Rev-targeted builds (sync/clone `--at <rev>`) use a
+/// rolling test key so they never overwrite the real branch entry that normal
+/// tip clients depend on; sequential rev syncs still share this key, so they stay
+/// incremental (each rev build's prev is the previous rev build). Tip builds use
+/// the branch directly. The git ref-name grammar forbids `#`, so this can never
+/// collide with a real branch.
+fn ref_store_key(branch: &str, at_rev: Option<&str>) -> String {
+    if at_rev.is_some() {
+        format!("{branch}#atrev")
+    } else {
+        branch.to_string()
+    }
+}
+
 fn tuple_to_sized(p: &(String, u64, String, u64)) -> crate::SizedPack {
     crate::SizedPack {
         pack: p.0.clone(),
@@ -2234,12 +2294,16 @@ async fn settle_storage(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn do_sync(
     cas: &Cas,
     mirror_dir: &std::path::Path,
     owner: &str,
     repo: &str,
     branch: &str,
+    // Optional build-commit override (e.g. "HEAD~5"); when None the branch tip is
+    // used. The branch is still the ref-store key and fetch target.
+    at_rev: Option<&str>,
     ref_store: &Arc<dyn RefStore>,
     build_full_pack: bool,
     storage: &crate::storage::StorageRef,
@@ -2283,9 +2347,17 @@ async fn do_sync(
     info!("sync phase: mirror fetch {:?}", t.elapsed());
     t = Instant::now();
 
-    let commit = git::resolve_commit(&mirror_dir, branch)?;
+    // Resolve the build commit: the rev override (e.g. "HEAD~5") when given,
+    // else the branch tip. The override is relative to the just-fetched mirror.
+    let commit = git::resolve_commit(&mirror_dir, at_rev.unwrap_or(branch))?;
     let parent = git::parent_commit(&mirror_dir, &commit).ok().flatten();
     let default_branch = git::default_branch(&mirror_dir).unwrap_or_else(|_| "HEAD".to_string());
+
+    // Ref-store key. Rev builds use a rolling test key so they never overwrite
+    // the real branch entry; everything below stores/loads under this key. The
+    // mirror fetch + commit resolution above used the real branch/rev.
+    let ref_key = ref_store_key(branch, at_rev);
+    let branch = ref_key.as_str();
 
     // No-op fast path: if a *completed full* build already exists for exactly
     // this commit, the prior clonepack artifacts are still valid — reuse them and
@@ -3394,6 +3466,7 @@ fn spawn_build_worker(state: ServerState) -> tokio::sync::mpsc::Sender<BuildJob>
             let owner = job.owner.clone();
             let repo = job.repo.clone();
             let branch = job.branch.clone();
+            let at_rev = job.rev.clone();
             let state = state.clone();
 
             // Mark as building in the shared ref store.
@@ -3410,6 +3483,7 @@ fn spawn_build_worker(state: ServerState) -> tokio::sync::mpsc::Sender<BuildJob>
                 &owner,
                 &repo,
                 &branch,
+                at_rev.as_deref(),
                 &state.ref_store,
                 false,
                 &state.storage,
@@ -3440,8 +3514,12 @@ fn spawn_build_worker(state: ServerState) -> tokio::sync::mpsc::Sender<BuildJob>
                     Err(format!("{e}"))
                 }
             };
-            // Signal every waiter for this key (coalesced /sync requests).
-            let key = format!("{owner}/{repo}/{branch}");
+            // Signal every waiter for this key (coalesced /sync requests). Must
+            // match the enqueue key, which includes the rev override.
+            let key = format!(
+                "{owner}/{repo}/{branch}#{}",
+                at_rev.as_deref().unwrap_or("")
+            );
             if let Some(senders) = state.build_waiters.lock().await.remove(&key) {
                 for s in senders {
                     let _ = s.send(waiter_result.clone());
