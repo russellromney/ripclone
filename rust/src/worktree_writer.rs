@@ -4,7 +4,7 @@ use filetime::{FileTime, set_file_mtime, set_symlink_file_times};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
 
@@ -2034,6 +2034,7 @@ pub struct WorktreeWriteScheduler {
     target_dir: PathBuf,
     options: WriteOptions,
     submitters: Vec<SubmitterHandle>,
+    next_submitter: AtomicUsize,
 }
 
 impl WorktreeWriteScheduler {
@@ -2067,6 +2068,7 @@ impl WorktreeWriteScheduler {
             target_dir,
             options,
             submitters,
+            next_submitter: AtomicUsize::new(0),
         })
     }
 
@@ -2086,23 +2088,16 @@ impl WorktreeWriteScheduler {
             return Ok(written);
         }
 
-        // Send each write to a submitter picked by path hash, so one submitter
-        // collects many frames' writes into full windows.
+        // Send the whole batch to one submitter, round-robin across calls. A
+        // batch is ~one frame's files, so this keeps them together (one consumer
+        // core, fuller windows) and avoids per-file hashing and bucket allocation.
         let n = self.submitters.len();
-        if n == 1 {
-            self.send_to(0, regulars)?;
+        let i = if n == 1 {
+            0
         } else {
-            let mut buckets: Vec<Vec<PreparedRegularWrite>> = (0..n).map(|_| Vec::new()).collect();
-            for write in regulars {
-                let slot = route_index(write.index_path.as_bytes(), n);
-                buckets[slot].push(write);
-            }
-            for (i, bucket) in buckets.into_iter().enumerate() {
-                if !bucket.is_empty() {
-                    self.send_to(i, bucket)?;
-                }
-            }
-        }
+            self.next_submitter.fetch_add(1, Ordering::Relaxed) % n
+        };
+        self.send_to(i, regulars)?;
         Ok(written)
     }
 
@@ -2164,17 +2159,6 @@ impl Drop for WorktreeWriteScheduler {
             }
         }
     }
-}
-
-/// Pick a submitter for a path. FNV-1a: cheap and stable, same path always maps
-/// to the same submitter.
-fn route_index(bytes: &[u8], n: usize) -> usize {
-    let mut hash: u64 = 0xcbf29ce484222325;
-    for &b in bytes {
-        hash ^= b as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    (hash % n as u64) as usize
 }
 
 fn run_submitter(
