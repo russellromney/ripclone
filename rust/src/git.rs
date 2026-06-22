@@ -174,6 +174,124 @@ pub fn clear_skip_worktree_index<P: AsRef<Path>>(repo_dir: P, paths: &[String]) 
     update_index_skip_worktree(repo_dir, paths, false)
 }
 
+/// Clear skip-worktree and refresh cached stat data for materialized paths.
+///
+/// This lets fresh checkout/materialization paths skip the per-file mtime stamp:
+/// the index is updated to match the actual files on disk instead.
+pub fn clear_skip_worktree_index_and_refresh_stats<P: AsRef<Path>>(
+    repo_dir: P,
+    paths: &[String],
+) -> Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let repo_dir = repo_dir.as_ref();
+    let index_path = repo_dir.join(".git").join("index");
+    let mut index = git2::Index::open(&index_path)
+        .with_context(|| format!("opening index at {}", index_path.display()))?;
+
+    let target: HashSet<&str> = paths.iter().map(|s| s.as_str()).collect();
+    let entries: Vec<_> = index.iter().collect();
+    let mut changed = false;
+    for entry in entries {
+        let path = String::from_utf8_lossy(&entry.path).to_string();
+        if !target.contains(path.as_str()) {
+            continue;
+        }
+        let full_path = repo_dir.join(index_path_from_bytes(&entry.path));
+        let metadata = std::fs::symlink_metadata(&full_path)
+            .with_context(|| format!("stat materialized file {}", full_path.display()))?;
+        let stat = index_stat_from_metadata(&metadata);
+        let updated = git2::IndexEntry {
+            ctime: stat.ctime,
+            mtime: stat.mtime,
+            dev: stat.dev,
+            ino: stat.ino,
+            mode: entry.mode,
+            uid: stat.uid,
+            gid: stat.gid,
+            file_size: stat.file_size,
+            id: entry.id,
+            flags: entry.flags,
+            flags_extended: entry.flags_extended & !SKIP_WORKTREE_BIT,
+            path: entry.path,
+        };
+        index
+            .add(&updated)
+            .with_context(|| format!("refresh index stats for {}", path))?;
+        changed = true;
+    }
+    if changed {
+        index
+            .write()
+            .with_context(|| format!("writing index at {}", index_path.display()))?;
+    }
+    Ok(())
+}
+
+struct IndexStat {
+    ctime: git2::IndexTime,
+    mtime: git2::IndexTime,
+    dev: u32,
+    ino: u32,
+    uid: u32,
+    gid: u32,
+    file_size: u32,
+}
+
+#[cfg(unix)]
+fn index_path_from_bytes(path: &[u8]) -> std::path::PathBuf {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    std::path::PathBuf::from(OsStr::from_bytes(path))
+}
+
+#[cfg(not(unix))]
+fn index_path_from_bytes(path: &[u8]) -> std::path::PathBuf {
+    std::path::PathBuf::from(String::from_utf8_lossy(path).into_owned())
+}
+
+#[cfg(unix)]
+fn index_stat_from_metadata(metadata: &std::fs::Metadata) -> IndexStat {
+    use std::os::unix::fs::MetadataExt;
+    IndexStat {
+        ctime: git2::IndexTime::new(
+            clamp_i64_to_i32(metadata.ctime()),
+            metadata.ctime_nsec() as u32,
+        ),
+        mtime: git2::IndexTime::new(
+            clamp_i64_to_i32(metadata.mtime()),
+            metadata.mtime_nsec() as u32,
+        ),
+        dev: truncate_u64_to_u32(metadata.dev()),
+        ino: truncate_u64_to_u32(metadata.ino()),
+        uid: metadata.uid(),
+        gid: metadata.gid(),
+        file_size: truncate_u64_to_u32(metadata.len()),
+    }
+}
+
+#[cfg(not(unix))]
+fn index_stat_from_metadata(metadata: &std::fs::Metadata) -> IndexStat {
+    IndexStat {
+        ctime: git2::IndexTime::new(0, 0),
+        mtime: git2::IndexTime::new(0, 0),
+        dev: 0,
+        ino: 0,
+        uid: 0,
+        gid: 0,
+        file_size: truncate_u64_to_u32(metadata.len()),
+    }
+}
+
+fn clamp_i64_to_i32(value: i64) -> i32 {
+    value.clamp(i32::MIN as i64, i32::MAX as i64) as i32
+}
+
+fn truncate_u64_to_u32(value: u64) -> u32 {
+    value.min(u32::MAX as u64) as u32
+}
+
 /// Materialize the entire index into the working tree using `git checkout-index`.
 /// This is typically much faster than writing files one-by-one from an archive
 /// because git batches reads through the pack index and uses fewer syscalls.

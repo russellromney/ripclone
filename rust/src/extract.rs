@@ -578,7 +578,7 @@ where
             .iter()
             .map(|e| String::from_utf8_lossy(&e.path).into_owned())
             .collect();
-        if let Err(e) = git::clear_skip_worktree_index(target_dir, &paths) {
+        if let Err(e) = git::clear_skip_worktree_index_and_refresh_stats(target_dir, &paths) {
             error = Some(e);
         } else {
             info!(
@@ -1175,7 +1175,7 @@ pub fn extract_archive_from_chunk_receiver(
             .iter()
             .map(|e| String::from_utf8_lossy(&e.path).into_owned())
             .collect();
-        if let Err(e) = git::clear_skip_worktree_index(target_dir, &paths) {
+        if let Err(e) = git::clear_skip_worktree_index_and_refresh_stats(target_dir, &paths) {
             error = Some(e);
         } else {
             info!(
@@ -1372,7 +1372,7 @@ pub fn materialize_worktree_from_pack(repo_root: &Path, commit: &str) -> Result<
                     let idx = cursor.fetch_add(1, Ordering::Relaxed);
                     if idx >= items.len() {
                         if !pending_writes.is_empty() {
-                            match writer.write_owned_entries_for_fresh_checkout(
+                            match writer.write_owned_entries_for_fresh_indexed_checkout(
                                 repo_root,
                                 std::mem::take(&mut pending_writes),
                             ) {
@@ -1415,7 +1415,7 @@ pub fn materialize_worktree_from_pack(repo_root: &Path, commit: &str) -> Result<
                         Ok(len) => {
                             pending_bytes += len;
                             if pending_writes.len() >= PACK_WRITE_BATCH_FILES {
-                                match writer.write_owned_entries_for_fresh_checkout(
+                                match writer.write_owned_entries_for_fresh_indexed_checkout(
                                     repo_root,
                                     std::mem::take(&mut pending_writes),
                                 ) {
@@ -1459,8 +1459,8 @@ pub fn materialize_worktree_from_pack(repo_root: &Path, commit: &str) -> Result<
         .iter()
         .map(|it| String::from_utf8_lossy(&it.path).into_owned())
         .collect();
-    git::clear_skip_worktree_index(repo_root, &paths)
-        .context("clear skip-worktree after pack materialization")?;
+    git::clear_skip_worktree_index_and_refresh_stats(repo_root, &paths)
+        .context("clear skip-worktree and refresh index stats after pack materialization")?;
 
     let raw_total = raw_bytes.load(Ordering::Relaxed) as u64;
     info!(
@@ -1589,7 +1589,7 @@ pub fn extract_blobs_from_pack_bytes(
                         content: content.into(),
                     });
                     if pending_writes.len() >= PACK_WRITE_BATCH_FILES {
-                        written += writer.write_owned_entries_for_fresh_checkout(
+                        written += writer.write_owned_entries_for_fresh_indexed_checkout(
                             target_dir,
                             std::mem::take(&mut pending_writes),
                         )?;
@@ -1598,7 +1598,7 @@ pub fn extract_blobs_from_pack_bytes(
             }
         }
     }
-    written += writer.write_owned_entries_for_fresh_checkout(target_dir, pending_writes)?;
+    written += writer.write_owned_entries_for_fresh_indexed_checkout(target_dir, pending_writes)?;
     Ok(written)
 }
 
