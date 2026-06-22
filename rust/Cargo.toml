@@ -23,6 +23,10 @@ path = "src/bin/git-remote-ripclone.rs"
 name = "rcgit"
 path = "src/bin/rcgit.rs"
 
+[[bin]]
+name = "writer_bench"
+path = "src/bin/writer_bench.rs"
+
 [features]
 default = ["zlib-ng"]
 # Use zlib-ng for faster pack compression/decompression. Disable this feature
@@ -69,7 +73,7 @@ jsonwebtoken = "10.4.0"
 subtle = "2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-tokio-uring = "0.5"
+io-uring = "0.7"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

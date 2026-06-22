@@ -1,5 +1,6 @@
 use crate::git;
 use crate::manifest::{FileEntry, FrameInfo, MetadataChunk as Manifest};
+use crate::worktree_writer::{OwnedFileWrite, WorktreeWriter};
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, bounded};
 use filetime::{FileTime, set_file_mtime, set_symlink_file_times};
@@ -16,6 +17,7 @@ use std::time::Instant;
 use tracing::info;
 
 const INDEX_MTIME: FileTime = FileTime::from_unix_time(1, 0);
+const PACK_WRITE_BATCH_FILES: usize = 512;
 
 /// Convert a manifest blob_sha1 slice to a fixed 20-byte array.
 fn blob_sha1_to_array(sha1: &[u8]) -> Result<[u8; 20]> {
@@ -48,6 +50,11 @@ struct PendingFile {
 pub struct ExtractStats {
     pub files: usize,
     pub raw_bytes: u64,
+}
+
+pub struct PackExtractResult {
+    pub files: usize,
+    pub stats: Vec<crate::git::MaterializedPathStat>,
 }
 
 /// A consecutive group of archive frames fetched in a single HTTP range request.
@@ -576,7 +583,7 @@ where
             .iter()
             .map(|e| String::from_utf8_lossy(&e.path).into_owned())
             .collect();
-        if let Err(e) = git::clear_skip_worktree_index(target_dir, &paths) {
+        if let Err(e) = git::clear_skip_worktree_index_and_refresh_stats(target_dir, &paths) {
             error = Some(e);
         } else {
             info!(
@@ -1173,7 +1180,7 @@ pub fn extract_archive_from_chunk_receiver(
             .iter()
             .map(|e| String::from_utf8_lossy(&e.path).into_owned())
             .collect();
-        if let Err(e) = git::clear_skip_worktree_index(target_dir, &paths) {
+        if let Err(e) = git::clear_skip_worktree_index_and_refresh_stats(target_dir, &paths) {
             error = Some(e);
         } else {
             info!(
@@ -1327,11 +1334,20 @@ pub fn materialize_worktree_from_pack(repo_root: &Path, commit: &str) -> Result<
     let cursor = AtomicUsize::new(0);
     let written = AtomicUsize::new(0);
     let raw_bytes = AtomicUsize::new(0);
+    let stat_cache: Mutex<Vec<crate::git::MaterializedPathStat>> = Mutex::new(Vec::new());
     let error: Mutex<Option<anyhow::Error>> = Mutex::new(None);
+    let writer = WorktreeWriter::new().context("create worktree writer")?;
 
     std::thread::scope(|scope| {
         for _ in 0..write_threads {
-            scope.spawn(|| {
+            let writer = writer.clone();
+            let cursor = &cursor;
+            let written = &written;
+            let raw_bytes = &raw_bytes;
+            let stat_cache = &stat_cache;
+            let error = &error;
+            let items = &items;
+            scope.spawn(move || {
                 // Each thread owns its own Repository handle: git2 odb readers
                 // are not Sync, but per-thread handles share the mmap'd pack
                 // through the OS page cache with no cross-thread locking.
@@ -1351,6 +1367,9 @@ pub fn materialize_worktree_from_pack(repo_root: &Path, commit: &str) -> Result<
                         return;
                     }
                 };
+                let mut pending_writes: Vec<OwnedFileWrite> =
+                    Vec::with_capacity(PACK_WRITE_BATCH_FILES);
+                let mut pending_bytes = 0usize;
 
                 loop {
                     // Stop pulling new work as soon as any thread has failed.
@@ -1359,6 +1378,21 @@ pub fn materialize_worktree_from_pack(repo_root: &Path, commit: &str) -> Result<
                     }
                     let idx = cursor.fetch_add(1, Ordering::Relaxed);
                     if idx >= items.len() {
+                        if !pending_writes.is_empty() {
+                            match writer.write_owned_entries_for_fresh_indexed_checkout(
+                                repo_root,
+                                std::mem::take(&mut pending_writes),
+                            ) {
+                                Ok(outcome) => {
+                                    written.fetch_add(outcome.written, Ordering::Relaxed);
+                                    raw_bytes.fetch_add(pending_bytes, Ordering::Relaxed);
+                                    stat_cache.lock().unwrap().extend(outcome.stats);
+                                }
+                                Err(e) => {
+                                    *error.lock().unwrap() = Some(e);
+                                }
+                            }
+                        }
                         return;
                     }
                     let item = &items[idx];
@@ -1379,13 +1413,32 @@ pub fn materialize_worktree_from_pack(repo_root: &Path, commit: &str) -> Result<
                             blob_sha1: Vec::new(),
                             fragments: Vec::new(),
                         };
-                        write_entry(repo_root, &entry, content)?;
+                        pending_writes.push(OwnedFileWrite {
+                            entry,
+                            content: content.to_vec().into(),
+                        });
                         Ok(content.len())
                     })();
                     match res {
                         Ok(len) => {
-                            written.fetch_add(1, Ordering::Relaxed);
-                            raw_bytes.fetch_add(len, Ordering::Relaxed);
+                            pending_bytes += len;
+                            if pending_writes.len() >= PACK_WRITE_BATCH_FILES {
+                                match writer.write_owned_entries_for_fresh_indexed_checkout(
+                                    repo_root,
+                                    std::mem::take(&mut pending_writes),
+                                ) {
+                                    Ok(outcome) => {
+                                        written.fetch_add(outcome.written, Ordering::Relaxed);
+                                        raw_bytes.fetch_add(pending_bytes, Ordering::Relaxed);
+                                        stat_cache.lock().unwrap().extend(outcome.stats);
+                                        pending_bytes = 0;
+                                    }
+                                    Err(e) => {
+                                        *error.lock().unwrap() = Some(e);
+                                        return;
+                                    }
+                                }
+                            }
                         }
                         Err(e) => {
                             *error.lock().unwrap() = Some(e);
@@ -1415,8 +1468,9 @@ pub fn materialize_worktree_from_pack(repo_root: &Path, commit: &str) -> Result<
         .iter()
         .map(|it| String::from_utf8_lossy(&it.path).into_owned())
         .collect();
-    git::clear_skip_worktree_index(repo_root, &paths)
-        .context("clear skip-worktree after pack materialization")?;
+    let stats = stat_cache.into_inner().unwrap();
+    git::clear_skip_worktree_index_with_stats(repo_root, &paths, &stats)
+        .context("clear skip-worktree and refresh index stats after pack materialization")?;
 
     let raw_total = raw_bytes.load(Ordering::Relaxed) as u64;
     info!(
@@ -1490,13 +1544,16 @@ pub fn extract_blobs_from_pack_bytes(
     pack: &[u8],
     blob_paths: &BlobPathMap,
     target_dir: &Path,
-) -> Result<usize> {
+    writer: &WorktreeWriter,
+) -> Result<PackExtractResult> {
     if pack.len() < 12 || &pack[0..4] != b"PACK" {
         anyhow::bail!("invalid pack header");
     }
     let count = u32::from_be_bytes([pack[8], pack[9], pack[10], pack[11]]) as usize;
     let mut off = 12usize;
     let mut written = 0usize;
+    let mut stats = Vec::new();
+    let mut pending_writes: Vec<OwnedFileWrite> = Vec::with_capacity(PACK_WRITE_BATCH_FILES);
 
     for i in 0..count {
         if off >= pack.len() {
@@ -1525,20 +1582,43 @@ pub fn extract_blobs_from_pack_bytes(
         if obj_type == 3 {
             let sha: [u8; 20] = Sha1::digest(&content).into();
             if let Some(paths) = blob_paths.get(&sha) {
-                for (path, mode) in paths {
+                let path_count = paths.len();
+                for (idx, (path, mode)) in paths.iter().enumerate() {
                     let entry = FileEntry {
                         path: path.clone(),
                         mode: *mode,
                         blob_sha1: Vec::new(),
                         fragments: Vec::new(),
                     };
-                    write_entry(target_dir, &entry, &content)?;
-                    written += 1;
+                    let content = if idx + 1 == path_count {
+                        std::mem::take(&mut content)
+                    } else {
+                        content.clone()
+                    };
+                    pending_writes.push(OwnedFileWrite {
+                        entry,
+                        content: content.into(),
+                    });
+                    if pending_writes.len() >= PACK_WRITE_BATCH_FILES {
+                        let outcome = writer.write_owned_entries_for_fresh_indexed_checkout(
+                            target_dir,
+                            std::mem::take(&mut pending_writes),
+                        )?;
+                        written += outcome.written;
+                        stats.extend(outcome.stats);
+                    }
                 }
             }
         }
     }
-    Ok(written)
+    let outcome =
+        writer.write_owned_entries_for_fresh_indexed_checkout(target_dir, pending_writes)?;
+    written += outcome.written;
+    stats.extend(outcome.stats);
+    Ok(PackExtractResult {
+        files: written,
+        stats,
+    })
 }
 
 /// Parse a git pack object header: 3-bit type + little-endian base-128 size.

@@ -572,10 +572,18 @@ impl Client {
         // 3. Start archive chunk downloads concurrently with the manifest. They
         // will buffer until the manifest is decoded, then verify and forward
         // chunks to the extractor.
+        let archive_channel_depth = std::env::var("RIPCLONE_ARCHIVE_CHANNEL_DEPTH")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| {
+                info.archive_chunk_urls
+                    .as_ref()
+                    .map_or(2, |urls| urls.len().clamp(2, 64))
+            });
         let (archive_tx, archive_rx): (
             Sender<(usize, Result<Vec<u8>>)>,
             Receiver<(usize, Result<Vec<u8>>)>,
-        ) = bounded(2);
+        ) = bounded(archive_channel_depth);
 
         let archive_urls = info.archive_chunk_urls.clone();
         let archive_downloads = if mode.needs_archive() {
@@ -856,25 +864,30 @@ impl Client {
         let blob_map = Arc::new(crate::extract::build_blob_path_map(&metadata.files));
         crate::extract::prepare_worktree_dirs(work_tree, &metadata.files)
             .context("prepare worktree dirs")?;
+        let worktree_writer = Arc::new(crate::worktree_writer::WorktreeWriter::new()?);
 
         // Download and extraction are decoupled stages with independent
-        // concurrency. Downloads are network-bound (fill the link); extraction
-        // is disk/CPU-bound, and file creation blocks on syscalls, so ~2x cores
-        // is the sweet spot (oversubscribing past that loses to filesystem
-        // contention). Both default to 2x the core count, env-overridable.
+        // concurrency. POSIX performed best at one fetch/write worker per core;
+        // io_uring benefits from one fetch worker and two write workers per
+        // core because each writer can submit larger batched windows.
         let cores = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4);
-        let default_par = (cores * 2).max(1);
+        let default_download_conc = cores.max(1);
+        let default_write_conc = if worktree_writer.is_io_uring() {
+            (cores * 2).max(1)
+        } else {
+            cores.max(1)
+        };
         let download_conc: usize = std::env::var("RIPCLONE_FETCH_CONCURRENCY")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(default_par)
+            .unwrap_or(default_download_conc)
             .max(1);
         let write_conc: usize = std::env::var("RIPCLONE_WRITE_THREADS")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(default_par)
+            .unwrap_or(default_write_conc)
             .max(1);
 
         // Signed URLs (one per pack/idx, matching manifest.packs order). Empty
@@ -962,42 +975,55 @@ impl Client {
                 let pack_dir = pack_dir.to_path_buf();
                 let work_tree = work_tree.to_path_buf();
                 let blob_map = Arc::clone(&blob_map);
+                let worktree_writer = Arc::clone(&worktree_writer);
                 async move {
                     let (i, history_only, pack_bytes, idx_bytes) = res?;
                     let bytes = (pack_bytes.len() + idx_bytes.len()) as u64;
-                    let written = tokio::task::spawn_blocking(move || -> Result<usize> {
-                        if pack_bytes.len() < 20 {
-                            anyhow::bail!("pack {} too short ({} bytes)", i, pack_bytes.len());
-                        }
-                        // Git names packs by the 20-byte trailer sha; the idx
-                        // pairs to the pack by basename.
-                        let name = hex::encode(&pack_bytes[pack_bytes.len() - 20..]);
-                        std::fs::write(pack_dir.join(format!("pack-{}.pack", name)), &pack_bytes)
+                    let result = tokio::task::spawn_blocking(
+                        move || -> Result<crate::extract::PackExtractResult> {
+                            if pack_bytes.len() < 20 {
+                                anyhow::bail!("pack {} too short ({} bytes)", i, pack_bytes.len());
+                            }
+                            // Git names packs by the 20-byte trailer sha; the idx
+                            // pairs to the pack by basename.
+                            let name = hex::encode(&pack_bytes[pack_bytes.len() - 20..]);
+                            std::fs::write(
+                                pack_dir.join(format!("pack-{}.pack", name)),
+                                &pack_bytes,
+                            )
                             .with_context(|| format!("write pack {}", name))?;
-                        std::fs::write(pack_dir.join(format!("pack-{}.idx", name)), &idx_bytes)
-                            .with_context(|| format!("write idx {}", name))?;
-                        if history_only {
-                            return Ok(0);
-                        }
-                        let n = crate::extract::extract_blobs_from_pack_bytes(
-                            &pack_bytes,
-                            &blob_map,
-                            &work_tree,
-                        )
-                        .with_context(|| format!("extract pack {}", name))?;
-                        Ok(n)
-                    })
+                            std::fs::write(pack_dir.join(format!("pack-{}.idx", name)), &idx_bytes)
+                                .with_context(|| format!("write idx {}", name))?;
+                            if history_only {
+                                return Ok(crate::extract::PackExtractResult {
+                                    files: 0,
+                                    stats: Vec::new(),
+                                });
+                            }
+                            crate::extract::extract_blobs_from_pack_bytes(
+                                &pack_bytes,
+                                &blob_map,
+                                &work_tree,
+                                &worktree_writer,
+                            )
+                            .with_context(|| format!("extract pack {}", name))
+                        },
+                    )
                     .await
                     .context("spawn pack install task")??;
-                    Ok::<(u64, usize), anyhow::Error>((bytes, written))
+                    Ok::<(u64, crate::extract::PackExtractResult), anyhow::Error>((bytes, result))
                 }
             })
             .buffer_unordered(write_conc)
-            .try_fold((0u64, 0usize), |(ab, aw), (b, w)| async move {
-                Ok((ab + b, aw + w))
-            })
+            .try_fold(
+                (0u64, 0usize, Vec::new()),
+                |(ab, aw, mut stats), (b, result)| async move {
+                    stats.extend(result.stats);
+                    Ok((ab + b, aw + result.files, stats))
+                },
+            )
             .await?;
-        let (total, files_written) = total;
+        let (total, files_written, stat_cache) = total;
 
         // Guard against silent under-extraction (e.g. a sha/format mismatch):
         // every tracked path must have been materialized.
@@ -1017,10 +1043,10 @@ impl Client {
             .collect();
         let work_tree2 = work_tree.to_path_buf();
         tokio::task::spawn_blocking(move || {
-            crate::git::clear_skip_worktree_index(&work_tree2, &paths)
+            crate::git::clear_skip_worktree_index_with_stats(&work_tree2, &paths, &stat_cache)
         })
         .await
-        .context("spawn clear skip-worktree")??;
+        .context("spawn clear skip-worktree and refresh index stats")??;
 
         // Install the multi-pack-index so git object lookups stay O(log) across
         // the many installed packs. Prefer the server-pregenerated MIDX (zero
