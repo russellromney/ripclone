@@ -289,6 +289,7 @@ fn run_writers(
                         WriteOptions {
                             parents_prepared: true,
                             stamp_mtime,
+                            ..WriteOptions::default()
                         },
                     )?;
                 }
