@@ -667,10 +667,11 @@ mod linux_uring {
     use std::sync::Once;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    const QUEUE_DEPTH: u32 = 1024;
-    const MAX_BATCH_FILES: usize = 256;
+    const QUEUE_DEPTH: u32 = 4096;
+    const MAX_BATCH_FILES: usize = 512;
     static DIRECT_DESCRIPTOR_ENABLED_LOG: Once = Once::new();
     static DIRECT_DESCRIPTOR_FALLBACK_LOG: Once = Once::new();
+    static SKIP_OPEN_CQE_ENABLED_LOG: Once = Once::new();
     static OPTIMIZED_RING_ENABLED_LOG: Once = Once::new();
     static OPTIMIZED_RING_FALLBACK_LOG: Once = Once::new();
 
@@ -680,6 +681,7 @@ mod linux_uring {
     struct RawUringWriter {
         ring: IoUring,
         descriptor_mode: DescriptorMode,
+        skip_open_success_cqe: bool,
     }
 
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -783,6 +785,12 @@ mod linux_uring {
     impl RawUringWriter {
         fn new() -> Result<Self> {
             let ring = Self::new_ring().context("initialize io_uring queue")?;
+            let skip_open_success_cqe = ring.params().is_feature_skip_cqe_on_success();
+            if skip_open_success_cqe {
+                SKIP_OPEN_CQE_ENABLED_LOG.call_once(|| {
+                    tracing::info!("io_uring successful direct-open CQEs will be skipped")
+                });
+            }
             let descriptor_mode = match ring
                 .submitter()
                 .register_files_sparse(MAX_BATCH_FILES as u32)
@@ -802,6 +810,7 @@ mod linux_uring {
             Ok(Self {
                 ring,
                 descriptor_mode,
+                skip_open_success_cqe,
             })
         }
 
@@ -1010,13 +1019,17 @@ mod linux_uring {
                 let dest = types::DestinationSlot::try_from_slot_target(slot).map_err(|_| {
                     DirectWriteError::Other(anyhow::anyhow!("invalid fixed file slot {slot}"))
                 })?;
+                let mut open_flags = squeue::Flags::IO_LINK;
+                if self.skip_open_success_cqe {
+                    open_flags |= squeue::Flags::SKIP_SUCCESS;
+                }
                 entries.push(
                     opcode::OpenAt::new(types::Fd(libc::AT_FDCWD), write.path.as_ptr())
                         .flags(write.flags & !libc::O_CLOEXEC)
                         .mode(write.mode)
                         .file_index(Some(dest))
                         .build()
-                        .flags(squeue::Flags::IO_LINK)
+                        .flags(open_flags)
                         .user_data(user_data(idx, FileOp::Open)),
                 );
                 if write.content.is_empty() {
@@ -1042,18 +1055,30 @@ mod linux_uring {
                 );
             }
 
+            let expected_completions = if self.skip_open_success_cqe {
+                entries.len() - in_flight.len()
+            } else {
+                entries.len()
+            };
             self.submit_entries(
                 &entries,
-                entries.len(),
+                expected_completions,
                 "submit io_uring direct open/write/close batch",
             )
             .map_err(DirectWriteError::Other)?;
-            let completions = self
-                .collect_completions(
-                    entries.len(),
+            let completions = if self.skip_open_success_cqe {
+                self.collect_direct_completions(
+                    in_flight.len(),
+                    expected_completions,
                     "wait for io_uring direct open/write/close batch completion",
                 )
-                .map_err(DirectWriteError::Other)?;
+            } else {
+                self.collect_completions(
+                    expected_completions,
+                    "wait for io_uring direct open/write/close batch completion",
+                )
+            }
+            .map_err(DirectWriteError::Other)?;
             for (idx, op, res) in completions {
                 let write = in_flight
                     .get_mut(idx)
@@ -1068,6 +1093,13 @@ mod linux_uring {
                     }
                     FileOp::Close => {
                         write.close_res = Some(res);
+                    }
+                }
+            }
+            if self.skip_open_success_cqe {
+                for write in &mut in_flight {
+                    if write.open_res.is_none() {
+                        write.open_res = Some(0);
                     }
                 }
             }
@@ -1130,6 +1162,36 @@ mod linux_uring {
                 }
                 if completions.len() < expected {
                     let remaining = expected - completions.len();
+                    self.ring
+                        .submitter()
+                        .submit_and_wait(remaining)
+                        .with_context(|| context.to_string())?;
+                }
+            }
+            Ok(completions)
+        }
+
+        fn collect_direct_completions(
+            &mut self,
+            expected_closes: usize,
+            min_expected: usize,
+            context: &str,
+        ) -> Result<Vec<(usize, FileOp, i32)>> {
+            let mut completions = Vec::with_capacity(min_expected);
+            let mut closes = 0usize;
+            while closes < expected_closes {
+                {
+                    let mut cq = self.ring.completion();
+                    for cqe in &mut cq {
+                        let (idx, op) = parse_user_data(cqe.user_data())?;
+                        if op == FileOp::Close {
+                            closes += 1;
+                        }
+                        completions.push((idx, op, cqe.result()));
+                    }
+                }
+                if closes < expected_closes {
+                    let remaining = min_expected.saturating_sub(completions.len()).max(1);
                     self.ring
                         .submitter()
                         .submit_and_wait(remaining)

@@ -17,7 +17,7 @@ use std::time::Instant;
 use tracing::info;
 
 const INDEX_MTIME: FileTime = FileTime::from_unix_time(1, 0);
-const PACK_WRITE_BATCH_FILES: usize = 256;
+const PACK_WRITE_BATCH_FILES: usize = 512;
 
 /// Convert a manifest blob_sha1 slice to a fixed 20-byte array.
 fn blob_sha1_to_array(sha1: &[u8]) -> Result<[u8; 20]> {
