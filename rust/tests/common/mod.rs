@@ -33,10 +33,24 @@ pub fn init(lsm: bool) {
         unsafe {
             std::env::set_var("RIPCLONE_TOKEN", TOKEN);
             std::env::set_var("RIPCLONE_NO_CACHE", "1");
+            // Tests poll clones aggressively; don't let the default rate limiter
+            // (burst 60) throttle them. Test-only — production keeps its limits.
+            std::env::set_var("RIPCLONE_RATE_LIMIT_BURST", "1000000");
+            std::env::set_var("RIPCLONE_RATE_LIMIT_PER_SEC", "1000000");
             std::env::set_var(
                 "RIPCLONE_ORIGIN_BASE",
                 format!("file://{}", origin_root().display()),
             );
+            // Two-phase + async are on by default in production; legacy tests
+            // here expect synchronous single-phase builds (depth=0 ready as soon
+            // as sync returns). Pin them off unless a test opted in via
+            // enable_two_phase()/enable_async_build() (which run before init).
+            if std::env::var_os("RIPCLONE_TWO_PHASE").is_none() {
+                std::env::set_var("RIPCLONE_TWO_PHASE", "0");
+            }
+            if std::env::var_os("RIPCLONE_ASYNC_BUILD").is_none() {
+                std::env::set_var("RIPCLONE_ASYNC_BUILD", "0");
+            }
             if lsm {
                 std::env::set_var("RIPCLONE_LSM", "1");
                 std::env::set_var("RIPCLONE_LSM_SEAL_BYTES", "1");
@@ -76,7 +90,23 @@ impl Server {
     }
 }
 
+/// Initialize a tracing subscriber once so server-side `info!`/`warn!`/`error!`
+/// (e.g. background phase-2 failures) surface under `RUST_LOG` during tests.
+fn init_tracing() {
+    static T: Once = Once::new();
+    T.call_once(|| {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+            )
+            .with_test_writer()
+            .try_init();
+    });
+}
+
 pub async fn start_server() -> Server {
+    init_tracing();
     let dir = tempfile::tempdir().expect("server dir");
     let cas_dir = dir.path().join("cas");
     let repo_root = dir.path().join("repos");
@@ -236,6 +266,231 @@ pub async fn clone_only(
         .install_repo_with_mode(owner, repo, "HEAD", &target, mode, Some(kind), None)
         .await?;
     Ok((out, target))
+}
+
+/// Read a file from a clone (panics if missing).
+pub fn read(dir: &Path, name: &str) -> String {
+    std::fs::read_to_string(dir.join(name))
+        .unwrap_or_else(|e| panic!("read {} in {}: {e}", name, dir.display()))
+}
+
+/// Unified per-binary configuration: base env plus an explicit server build
+/// config. Because the flags are read from process env, each test binary pins
+/// exactly one config; call this at the top of every test in the binary.
+/// `seal_bytes`/`max_levels` tune the LSM build (1 / 16 are the battery
+/// defaults — seal every tail, compact at 16).
+pub fn setup(two_phase: bool, lsm: bool, async_build: bool) {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| unsafe {
+        std::env::set_var("RIPCLONE_TOKEN", TOKEN);
+        std::env::set_var("RIPCLONE_NO_CACHE", "1");
+        // Tests poll clones aggressively; don't let the default rate limiter
+        // throttle them. Test-only — production keeps its configured limits.
+        std::env::set_var("RIPCLONE_RATE_LIMIT_BURST", "1000000");
+        std::env::set_var("RIPCLONE_RATE_LIMIT_PER_SEC", "1000000");
+        std::env::set_var(
+            "RIPCLONE_ORIGIN_BASE",
+            format!("file://{}", origin_root().display()),
+        );
+        std::env::set_var("RIPCLONE_TWO_PHASE", if two_phase { "1" } else { "0" });
+        std::env::set_var("RIPCLONE_LSM", if lsm { "1" } else { "0" });
+        std::env::set_var("RIPCLONE_LSM_SEAL_BYTES", "1");
+        std::env::set_var("RIPCLONE_ASYNC_BUILD", if async_build { "1" } else { "0" });
+    });
+}
+
+/// Clone the full (depth=0) editable variant, waiting for it to reach
+/// `want_count` commits. Under two-phase the full variant is built in the
+/// background, so poll; otherwise it is ready as soon as sync returns.
+pub async fn clone_full_at(
+    server: &Server,
+    owner: &str,
+    repo: &str,
+    want_count: &str,
+    two_phase: bool,
+) -> (TempDir, PathBuf) {
+    let attempts = if two_phase { 160 } else { 1 };
+    let mut last = String::from("<no successful clone>");
+    for _ in 0..attempts {
+        match clone_only(server, owner, repo, 0, ripclone::mode::CloneMode::Editable).await {
+            Ok((g, d)) => {
+                let c = git(&d, &["rev-list", "--count", "HEAD"]);
+                if c == want_count {
+                    return (g, d);
+                }
+                last = format!("count={c}");
+            }
+            Err(e) => last = format!("clone err: {e:#}"),
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    panic!("depth=0 never reached {want_count} for {owner}/{repo} (last: {last})");
+}
+
+/// Clone files mode, waiting until `probe` exists with `want` contents (the
+/// full archive is built in phase 2 under two-phase).
+pub async fn clone_files_when(
+    server: &Server,
+    owner: &str,
+    repo: &str,
+    probe: &str,
+    want: &str,
+    two_phase: bool,
+) -> (TempDir, PathBuf) {
+    let attempts = if two_phase { 160 } else { 1 };
+    for _ in 0..attempts {
+        if let Ok((g, d)) =
+            clone_only(server, owner, repo, 0, ripclone::mode::CloneMode::Files).await
+            && d.join(probe).exists()
+            && read(&d, probe) == want
+        {
+            return (g, d);
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    panic!("files-mode clone never materialized {probe}={want:?} for {owner}/{repo}");
+}
+
+/// Assert a depth=1 editable clone is immediately correct: a real, shallow git
+/// repo with HEAD content present and a clean status.
+pub async fn assert_depth1(server: &Server, owner: &str, repo: &str, files: &[(&str, &str)]) {
+    let (_g, d) = clone_only(server, owner, repo, 1, ripclone::mode::CloneMode::Editable)
+        .await
+        .expect("depth=1 clone right after sync");
+    assert!(d.join(".git/shallow").exists(), "depth=1 is shallow");
+    assert_eq!(
+        git(&d, &["rev-list", "--count", "HEAD"]),
+        "1",
+        "depth=1 count"
+    );
+    for (name, want) in files {
+        assert_eq!(&read(&d, name), want, "depth=1 {name}");
+    }
+    assert_eq!(
+        git(&d, &["status", "--porcelain"]),
+        "",
+        "depth=1 status clean"
+    );
+}
+
+/// Assert a full clone is a real, usable git repo: history walks, `show` works,
+/// and a fresh local commit lands on top.
+pub fn assert_repo_usable(dir: &Path, want_count: &str) {
+    assert!(
+        git_ok(dir, &["rev-list", "--objects", "HEAD"]),
+        "full object closure complete"
+    );
+    assert!(
+        git_ok(dir, &["fsck", "--connectivity-only", "HEAD"]),
+        "fsck"
+    );
+    assert_eq!(
+        git(dir, &["rev-list", "--count", "HEAD"]),
+        want_count,
+        "count"
+    );
+    assert!(!dir.join(".git/shallow").exists(), "full clone not shallow");
+    assert_eq!(git(dir, &["status", "--porcelain"]), "", "status clean");
+    assert!(git_ok(dir, &["show", "--stat", "HEAD"]), "git show HEAD");
+    assert!(git_ok(dir, &["log", "--oneline"]), "git log");
+    // A new local commit must succeed and advance the count.
+    std::fs::write(dir.join("WORKED.txt"), b"local edit\n").unwrap();
+    git(dir, &["add", "WORKED.txt"]);
+    git(
+        dir,
+        &[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-q",
+            "-m",
+            "local",
+        ],
+    );
+    let want_plus_one = (want_count.parse::<u64>().unwrap() + 1).to_string();
+    assert_eq!(
+        git(dir, &["rev-list", "--count", "HEAD"]),
+        want_plus_one,
+        "local commit advances history"
+    );
+}
+
+/// The full correctness lifecycle for one server config: first sync, re-sync on
+/// a new commit, and multi-commit growth — each verified across depth=1,
+/// depth=0 (real usable repo), and files mode. `two_phase` controls whether the
+/// full/files variants are polled for (background) or expected immediately.
+pub async fn lifecycle_battery(server: &Server, origin: &Origin, two_phase: bool) {
+    let client = server.client();
+    let (o, r) = (origin.owner.clone(), origin.repo.clone());
+
+    // ---- initial history: c1, c2 ----
+    origin.commit(&[("a.txt", "1\n")], "c1");
+    origin.commit(&[("a.txt", "2\n"), ("dir/b.txt", "B\n")], "c2");
+    origin.publish();
+    client.sync_repo(&o, &r, None, None).await.expect("sync c2");
+
+    assert_depth1(server, &o, &r, &[("a.txt", "2\n"), ("dir/b.txt", "B\n")]).await;
+    {
+        let (_g, d) = clone_full_at(server, &o, &r, "2", two_phase).await;
+        assert_eq!(read(&d, "a.txt"), "2\n");
+        assert_eq!(read(&d, "dir/b.txt"), "B\n");
+        assert_repo_usable(&d, "2");
+    }
+    {
+        let (_g, d) = clone_files_when(server, &o, &r, "a.txt", "2\n", two_phase).await;
+        assert_eq!(read(&d, "dir/b.txt"), "B\n");
+    }
+
+    // ---- re-sync: new commit c3 (incremental tail under LSM) ----
+    origin.commit(&[("a.txt", "3\n"), ("c.txt", "C\n")], "c3");
+    origin.publish();
+    client
+        .sync_repo(&o, &r, None, None)
+        .await
+        .expect("resync c3");
+
+    assert_depth1(server, &o, &r, &[("a.txt", "3\n"), ("c.txt", "C\n")]).await;
+    {
+        let (_g, d) = clone_full_at(server, &o, &r, "3", two_phase).await;
+        assert_eq!(read(&d, "a.txt"), "3\n");
+        assert_eq!(read(&d, "c.txt"), "C\n");
+        assert_repo_usable(&d, "3");
+    }
+    {
+        let (_g, d) = clone_files_when(server, &o, &r, "a.txt", "3\n", two_phase).await;
+        assert_eq!(read(&d, "c.txt"), "C\n");
+    }
+
+    // ---- multi-commit growth: exercises level accumulation + reuse +
+    // compaction (LSM) or repeated full rebuild (non-LSM). ----
+    for i in 4..=8u32 {
+        let f = format!("f{i}.txt");
+        let c = format!("{i}\n");
+        let m = format!("c{i}");
+        origin.commit(&[(f.as_str(), c.as_str())], &m);
+        origin.publish();
+        client
+            .sync_repo(&o, &r, None, None)
+            .await
+            .expect("resync loop");
+        // Under two-phase the full builds in the background; wait for each step
+        // to land before advancing so successive phase-2 builds don't run
+        // concurrently on the same mirror (the async queue serializes this in
+        // production). Also verifies the full clone at every incremental step.
+        if two_phase {
+            let _ = clone_full_at(server, &o, &r, &i.to_string(), true).await;
+        }
+    }
+    let (_g, d) = clone_full_at(server, &o, &r, "8", two_phase).await;
+    for i in 4..=8u32 {
+        assert!(
+            d.join(format!("f{i}.txt")).exists(),
+            "f{i}.txt after growth"
+        );
+    }
+    assert_repo_usable(&d, "8");
 }
 
 /// Clone helper: sync then install with the given depth, returning the dir.

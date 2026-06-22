@@ -299,10 +299,14 @@ pub fn list_object_shas_in_range<P: AsRef<Path>>(
     // `from`. The `^<from>` exclude form (rather than `--not`) composes with
     // `--end-of-options`, so every flag stays before the revs.
     let exclude = from.map(|f| format!("^{}", f));
+    // `--use-bitmap-index` lets git answer this from the mirror's reachability
+    // bitmap when one exists (see `write_bitmap`); it falls back to a normal
+    // walk otherwise, so it is always safe to pass.
     let mut args: Vec<&str> = vec![
         "rev-list",
         "--objects",
         "--no-object-names",
+        "--use-bitmap-index",
         "--end-of-options",
         to,
     ];
@@ -335,6 +339,10 @@ pub fn list_object_shas_with_depth<P: AsRef<Path>>(
     if let Some(d) = depth_str.as_deref() {
         args.insert(1, "-n");
         args.insert(2, d);
+    } else {
+        // Full reachability: use the mirror's bitmap when present (no-op
+        // otherwise). Skipped for depth-limited walks, where it doesn't apply.
+        args.insert(1, "--use-bitmap-index");
     }
     let out = run_git(repo, &args)?;
     Ok(out.lines().map(|s| s.to_string()).collect())
@@ -374,6 +382,29 @@ pub fn write_commit_graph<P: AsRef<Path>>(repo_dir: P) -> Result<()> {
         .context("spawn git commit-graph write")?;
     if !status.success() {
         anyhow::bail!("git commit-graph write failed");
+    }
+    Ok(())
+}
+
+/// Write a multi-pack-index *with a reachability bitmap* over the mirror's packs
+/// so `rev-list`/`pack-objects` can answer reachability by OR-ing precomputed
+/// bitmaps instead of walking the commit+tree graph. This is what makes the
+/// full skeleton/history enumerations fast on a fresh `--mirror` clone (GitHub
+/// ships bitmaps, but our `git fetch` of all refs can leave them stale/absent).
+/// Best-effort — a failure only loses the speedup. Building the bitmap itself
+/// costs one reachability walk, so call it once after fetch, before the heavy
+/// builds, not on the depth=1 fast path.
+pub fn write_bitmap<P: AsRef<Path>>(repo_dir: P) -> Result<()> {
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(repo_dir.as_ref().as_os_str())
+        .args(["multi-pack-index", "write", "--bitmap", "--no-progress"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .context("spawn git multi-pack-index write --bitmap")?;
+    if !status.success() {
+        anyhow::bail!("git multi-pack-index write --bitmap failed");
     }
     Ok(())
 }

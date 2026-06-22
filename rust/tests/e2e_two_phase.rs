@@ -66,6 +66,43 @@ async fn two_phase_depth1_immediate_then_full() {
     assert_eq!(git(&c0, &["status", "--porcelain"]), "");
 }
 
+/// Files mode works under two-phase: the zstd archive is deferred to phase 2,
+/// so a files-mode clone of the full variant materializes the worktree from the
+/// frames built in the background.
+#[tokio::test]
+async fn two_phase_files_mode_after_phase2() {
+    enable_two_phase();
+    init(false);
+    let server = start_server().await;
+    let origin = make_origin("acme", "tpf");
+    origin.commit(&[("a.txt", "hello\n"), ("nested/b.txt", "world\n")], "c1");
+    origin.commit(&[("a.txt", "hello2\n")], "c2");
+    origin.publish();
+    server
+        .client()
+        .sync_repo("acme", "tpf", None, None)
+        .await
+        .expect("sync");
+
+    // Poll until phase 2 publishes the full variant, then clone files mode.
+    let mut materialized = false;
+    for _ in 0..120 {
+        if let Ok((_g, d)) = clone_only(&server, "acme", "tpf", 0, CloneMode::Files).await
+            && d.join("a.txt").exists()
+        {
+            assert_eq!(read(&d, "a.txt"), "hello2\n");
+            assert_eq!(read(&d, "nested/b.txt"), "world\n");
+            materialized = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(
+        materialized,
+        "files-mode worktree materializes after phase 2"
+    );
+}
+
 /// Option A: after upstream advances, depth=0 keeps serving the PREVIOUS commit
 /// during the gap (never fails), then upgrades to the new commit. We assert the
 /// end state — depth=0 reaches the new commit and is complete — across a second

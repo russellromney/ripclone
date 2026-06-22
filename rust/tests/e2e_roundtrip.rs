@@ -159,6 +159,8 @@ async fn corrupt_artifact_fails_clone() {
     assert!(p.exists(), "manifest should be in local CAS");
     std::fs::write(&p, b"garbage not a manifest").unwrap();
 
+    // Clone the same (full) variant whose manifest we corrupted, so the
+    // hash-verification path is exercised on the tampered artifact.
     let out = tempfile::tempdir().unwrap();
     let res = client
         .install_repo_with_mode(
@@ -167,7 +169,7 @@ async fn corrupt_artifact_fails_clone() {
             "HEAD",
             out.path().join("clone"),
             CloneMode::Editable,
-            Some("shallow"),
+            Some("full"),
             None,
         )
         .await;
@@ -191,6 +193,7 @@ async fn missing_artifact_fails_clone() {
     let p = server.cas_path(&resp.clonepack_manifest);
     std::fs::remove_file(&p).unwrap();
 
+    // Clone the same (full) variant whose manifest we removed.
     let out = tempfile::tempdir().unwrap();
     let res = client
         .install_repo_with_mode(
@@ -199,7 +202,7 @@ async fn missing_artifact_fails_clone() {
             "HEAD",
             out.path().join("clone"),
             CloneMode::Editable,
-            Some("shallow"),
+            Some("full"),
             None,
         )
         .await;

@@ -1127,7 +1127,10 @@ async fn sync_repo(
                     .into_response();
             }
         }
-        let wait = Duration::from_secs(env_bytes("RIPCLONE_SYNC_WAIT_SECS", 45));
+        // Keep this comfortably under edge/proxy request timeouts (e.g. Fly's
+        // ~60s): on a long build we return 202 and let the client retry, rather
+        // than holding the connection until it is reset mid-request.
+        let wait = Duration::from_secs(env_bytes("RIPCLONE_SYNC_WAIT_SECS", 25));
         match tokio::time::timeout(wait, rx).await {
             Ok(Ok(Ok(()))) => match state.ref_store.load_branch(&owner, &repo, &branch).await {
                 Ok(Some(info)) => {
@@ -1844,19 +1847,21 @@ fn sized_to_tuple(p: &crate::SizedPack) -> (String, u64, String, u64) {
 }
 
 /// True when two-phase publish is enabled (publish depth=1 first, build full
-/// history in the background). Off by default.
+/// history in the background). On by default — the depth=1-first path is the
+/// largest lever for fast sync. Disable with `RIPCLONE_TWO_PHASE=0`.
 fn two_phase_enabled() -> bool {
     std::env::var("RIPCLONE_TWO_PHASE")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+        .unwrap_or(true)
 }
 
 /// True when `/sync` routes the build through the bounded background worker
-/// (survives client disconnect, rate-bounded). Off by default.
+/// (survives client disconnect, rate-bounded). On by default — disable with
+/// `RIPCLONE_ASYNC_BUILD=0`.
 fn async_build_enabled() -> bool {
     std::env::var("RIPCLONE_ASYNC_BUILD")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+        .unwrap_or(true)
 }
 
 fn env_bytes(key: &str, default: u64) -> u64 {
@@ -1864,6 +1869,110 @@ fn env_bytes(key: &str, default: u64) -> u64 {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(default)
+}
+
+/// LSM incremental-history configuration.
+struct LsmConfig {
+    /// When on, only the tail past the last sealed level is built each sync;
+    /// prior levels are reused by hash from object storage (Tigris). On by
+    /// default — disable with `RIPCLONE_LSM=0`.
+    enabled: bool,
+    /// Seal the tail into a new immutable level once it reaches this many raw
+    /// bytes. Default 1 (seal every advancing, non-empty tail) so the next sync
+    /// reuses everything and only builds its own new commits.
+    seal_threshold: u64,
+    /// Compact down to at most this many levels (merging the smallest adjacent
+    /// pair) so the level count stays bounded under seal-every-sync.
+    max_levels: usize,
+}
+
+fn lsm_config() -> LsmConfig {
+    let enabled = std::env::var("RIPCLONE_LSM")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(true);
+    let seal_threshold = env_bytes("RIPCLONE_LSM_SEAL_BYTES", 1);
+    let max_levels = std::env::var("RIPCLONE_LSM_MAX_LEVELS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(16usize);
+    LsmConfig {
+        enabled,
+        seal_threshold,
+        max_levels,
+    }
+}
+
+/// Given the prior sealed levels and a freshly built tail, decide whether to
+/// seal the tail into a new level, then compact the level set back under
+/// `max_levels`. Returns `(history_packs, new_pack_tuples, new_levels)` where
+/// `history_packs` is every history pack this manifest references (all levels
+/// flattened — prior levels reused by hash), `new_pack_tuples` is the packs
+/// freshly built this sync (the tail plus any compaction output — what to
+/// upload/evict), and `new_levels` is the levels to persist for the next sync.
+/// `head_packs` is not included here (the caller handles the HEAD closure).
+#[allow(clippy::too_many_arguments)]
+async fn seal_and_compact(
+    mirror_dir: &std::path::Path,
+    cas: &Cas,
+    commit: &str,
+    prev_levels: Vec<crate::HistoryLevel>,
+    sealed_tip: Option<String>,
+    tail_packs: Vec<(String, u64, String, u64)>,
+    tail_raw_bytes: u64,
+    history_target: u64,
+    cfg: &LsmConfig,
+) -> Result<(
+    Vec<(String, u64, String, u64)>,
+    Vec<(String, u64, String, u64)>,
+    Vec<crate::HistoryLevel>,
+)> {
+    // Seal the tail into a new immutable level once it is large enough and HEAD
+    // actually advanced past the last sealed tip.
+    let advances = sealed_tip.as_deref() != Some(commit);
+    let seal = advances && !tail_packs.is_empty() && tail_raw_bytes >= cfg.seal_threshold;
+    let mut levels = prev_levels;
+    let mut new_tuples = tail_packs.clone();
+    if seal {
+        levels.push(crate::HistoryLevel {
+            tip_commit: commit.to_string(),
+            packs: tail_packs.iter().map(tuple_to_sized).collect(),
+        });
+        info!(
+            "LSM: sealed level {} at {} ({} packs, {} MiB raw tail)",
+            levels.len() - 1,
+            &commit[..7.min(commit.len())],
+            tail_packs.len(),
+            tail_raw_bytes / (1024 * 1024)
+        );
+    }
+
+    // Compact (off-thread; it re-packs ranges) so the level count stays bounded.
+    if levels.len() > cfg.max_levels {
+        let before = levels.len();
+        let (md, c, levels_in, max, tgt) = (
+            mirror_dir.to_path_buf(),
+            cas.clone(),
+            levels.clone(),
+            cfg.max_levels,
+            history_target,
+        );
+        let res = tokio::task::spawn_blocking(move || {
+            PackBuilder::new(&md, &c).compact_levels(levels_in, max, tgt)
+        })
+        .await
+        .context("compaction task")??;
+        new_tuples.extend(res.new_packs.iter().cloned());
+        levels = res.levels;
+        info!("LSM: compacted {} levels -> {}", before, levels.len());
+    }
+
+    // Manifest history = every level's packs (prior reused by hash + new tail +
+    // any compaction output), flattened.
+    let history_packs: Vec<(String, u64, String, u64)> = levels
+        .iter()
+        .flat_map(|l| l.packs.iter().map(sized_to_tuple))
+        .collect();
+    Ok((history_packs, new_tuples, levels))
 }
 
 /// Build one variant's PackEntry list + concatenated idx bundle. Free-function
@@ -2108,6 +2217,14 @@ async fn do_sync(
         .await;
     }
 
+    // Single-phase: write a reachability bitmap before the heavy full-history
+    // enumerations (skeleton + history). Best-effort; off the two-phase depth=1
+    // path (that branch returned above).
+    let bm_dir = mirror_dir.clone();
+    let _ = tokio::task::spawn_blocking(move || git::write_bitmap(&bm_dir)).await;
+    info!("sync phase: reachability bitmap {:?}", t.elapsed());
+    t = Instant::now();
+
     // Full-history skeleton pack + idx.
     let mirror_dir2 = mirror_dir.clone();
     let cas2 = cas.clone();
@@ -2152,16 +2269,13 @@ async fn do_sync(
         .and_then(|s| s.parse().ok())
         .unwrap_or(512 * 1024 * 1024);
 
-    // LSM incremental history build (opt-in via RIPCLONE_LSM). When on, only the
-    // tail past the last sealed level is built; prior levels are reused by hash
-    // from object storage. See ROADMAP "LSM incremental history build".
-    let lsm = std::env::var("RIPCLONE_LSM")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-    let seal_threshold_raw: u64 = std::env::var("RIPCLONE_LSM_SEAL_BYTES")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1024 * 1024 * 1024);
+    // LSM incremental history build (default on; disable with RIPCLONE_LSM=0).
+    // When on, only the tail past the last sealed level is built; prior levels
+    // are reused by hash from object storage (Tigris). The level set is sealed
+    // every advancing sync and compacted back under a bound. See ROADMAP "LSM
+    // incremental history build".
+    let lsm_cfg = lsm_config();
+    let lsm = lsm_cfg.enabled;
     let prev_levels: Vec<crate::HistoryLevel> = if lsm {
         ref_store
             .load_branch(owner, repo, branch)
@@ -2252,38 +2366,24 @@ async fn do_sync(
                 (head_packs, history_packs, new_tuples, Vec::new(), true)
             }
             DepthBuild::Lsm(inc) => {
-                // Manifest history = prior sealed levels (by hash) + the new tail.
-                let mut history_packs: Vec<(String, u64, String, u64)> = prev_levels
-                    .iter()
-                    .flat_map(|l| l.packs.iter().map(sized_to_tuple))
-                    .collect();
-                history_packs.extend(inc.tail_packs.iter().cloned());
-
-                // Newly built this sync = HEAD closure + tail (the only packs to
-                // upload/evict; prior levels are already in object storage).
+                // Seal the new tail + compact; prior levels are reused by hash
+                // from object storage (Tigris) — never rebuilt.
+                let (history_packs, tail_tuples, new_levels) = seal_and_compact(
+                    &mirror_dir,
+                    cas,
+                    &commit,
+                    prev_levels,
+                    sealed_tip.clone(),
+                    inc.tail_packs,
+                    inc.tail_raw_bytes,
+                    history_target_raw,
+                    &lsm_cfg,
+                )
+                .await?;
+                // Newly built this sync = HEAD closure (always fresh) + tail +
+                // any compaction output. Prior levels are already durable.
                 let mut new_tuples = inc.head_packs.clone();
-                new_tuples.extend(inc.tail_packs.iter().cloned());
-
-                // Seal the tail into a new immutable level once it is large enough
-                // and actually advances past the last sealed tip.
-                let advances = sealed_tip.as_deref() != Some(commit.as_str());
-                let seal = advances
-                    && !inc.tail_packs.is_empty()
-                    && inc.tail_raw_bytes >= seal_threshold_raw;
-                let mut new_levels = prev_levels.clone();
-                if seal {
-                    new_levels.push(crate::HistoryLevel {
-                        tip_commit: commit.clone(),
-                        packs: inc.tail_packs.iter().map(tuple_to_sized).collect(),
-                    });
-                    info!(
-                        "LSM: sealed level {} at {} ({} packs, {} MiB raw tail)",
-                        new_levels.len() - 1,
-                        &commit[..7.min(commit.len())],
-                        inc.tail_packs.len(),
-                        inc.tail_raw_bytes / (1024 * 1024)
-                    );
-                }
+                new_tuples.extend(tail_tuples);
                 (inc.head_packs, history_packs, new_tuples, new_levels, false)
             }
         };
@@ -2739,17 +2839,20 @@ async fn build_and_publish_two_phase(
     let head_handle = tokio::task::spawn_blocking(move || {
         PackBuilder::new(&md2, &c2).build_head_packs(&cm2, head_target)
     });
-    let (md3, c3, cm3) = (mirror_dir.to_path_buf(), cas.clone(), commit.to_string());
-    let archive_handle = tokio::task::spawn_blocking(move || {
-        ArchiveBuilder::new(&md3).build_into_cas(&cm3, &c3, 6, None)
-    });
+    // Phase 1 builds only the cheap files table (no zstd frames): editable
+    // depth=1 materializes the worktree from the HEAD-closure packs, so it does
+    // not need the archive. The full zstd archive (for files mode) is built in
+    // phase 2, off the time-to-depth=1 critical path.
+    let (md3, cm3) = (mirror_dir.to_path_buf(), commit.to_string());
+    let files_table_handle =
+        tokio::task::spawn_blocking(move || ArchiveBuilder::new(&md3).build_files_table(&cm3));
     let (shallow_skeleton_pack, shallow_skeleton_idx) = shallow_skeleton_handle
         .await
         .context("shallow skeleton")??;
     let head_packs = head_handle.await.context("head packs")??;
-    let (archive_chunk_hashes, metadata_base) = archive_handle.await.context("archive")??;
+    let metadata_base = files_table_handle.await.context("files table")??;
     info!(
-        "two-phase p1: head+shallow-skeleton+archive {:?}",
+        "two-phase p1: head+shallow-skeleton+files-table {:?}",
         t.elapsed()
     );
     t = Instant::now();
@@ -2773,7 +2876,9 @@ async fn build_and_publish_two_phase(
     let shallow_meta_data = shallow_meta.encode_to_vec();
     let shallow_metadata_hash = cas.put(&shallow_meta_data)?;
 
-    let archive_chunks = archive_chunk_refs(&archive_chunk_hashes, &metadata_base)?;
+    // No archive frames in phase 1 (files mode is served by the full variant
+    // after phase 2). Editable depth=1 ignores archive chunks.
+    let archive_chunks = archive_chunk_refs(&[], &metadata_base)?;
     let head_tagged: Vec<(&(String, u64, String, u64), bool)> =
         head_packs.iter().map(|p| (p, false)).collect();
     let (head_entries, head_idx_bundle_ref, head_idx_bundle_hash) =
@@ -2816,6 +2921,8 @@ async fn build_and_publish_two_phase(
         .as_ref()
         .map(|p| p.history_levels.clone())
         .unwrap_or_default();
+    // Prior sealed levels for phase 2's incremental build (reuse from Tigris).
+    let prev_levels_for_p2 = carried_levels.clone();
 
     let info = RefInfo {
         commit: commit.to_string(),
@@ -2828,12 +2935,12 @@ async fn build_and_publish_two_phase(
         head_blobs_chunks: Vec::new(),
         packs: pack_artifacts_of(&head_packs),
         prebuilt_index: shallow_prebuilt_index.clone(),
-        archive: archive_chunk_hashes.first().cloned().unwrap_or_default(),
+        archive: String::new(),
         manifest: shallow_metadata_hash.clone(),
         full_pack: carried_full_pack,
         clonepack_manifest: carried_full_manifest,
         metadata_chunk: shallow_metadata_hash.clone(),
-        archive_chunks: archive_chunk_hashes.clone(),
+        archive_chunks: Vec::new(),
         full_clonepack: carried_full,
         shallow_clonepack: crate::ClonepackArtifacts {
             manifest: shallow_clonepack_hash.clone(),
@@ -2854,7 +2961,7 @@ async fn build_and_publish_two_phase(
     };
 
     // Upload phase-1 artifacts (head packs+idx, shallow skeleton/index/metadata,
-    // archive chunks, head idx-bundle + midx, shallow manifest).
+    // head idx-bundle + midx, shallow manifest). No archive frames in phase 1.
     let mut p1: Vec<String> = vec![
         shallow_skeleton_pack.clone(),
         shallow_skeleton_idx.clone(),
@@ -2864,7 +2971,6 @@ async fn build_and_publish_two_phase(
         head_idx_bundle_hash.clone(),
         head_midx_hash.clone(),
     ];
-    p1.extend(archive_chunk_hashes.iter().cloned());
     for (p, _, i, _) in &head_packs {
         p1.push(p.clone());
         p1.push(i.clone());
@@ -2911,12 +3017,11 @@ async fn build_and_publish_two_phase(
             &storage2,
             &retention2,
             head_packs,
-            archive_chunk_hashes,
-            metadata_base,
             head_idx_bundle_hash,
             head_midx_hash,
             history_target,
             upload_conc,
+            prev_levels_for_p2,
         )
         .await;
         match res {
@@ -2948,23 +3053,76 @@ async fn build_full_in_background(
     storage: &crate::storage::StorageRef,
     retention: &Arc<Retention>,
     head_packs: Vec<(String, u64, String, u64)>,
-    archive_chunk_hashes: Vec<String>,
-    metadata_base: crate::clonepack::MetadataChunk,
     _head_idx_bundle_hash: String,
     _head_midx_hash: String,
     history_target: u64,
     upload_conc: usize,
+    prev_levels: Vec<crate::HistoryLevel>,
 ) -> Result<()> {
-    // Full skeleton + history packs (the expensive part), concurrently.
+    // Incremental history: build only the tail past the last sealed level; prior
+    // levels are reused by hash from object storage (Tigris) — never rebuilt.
+    let lsm_cfg = lsm_config();
+    let sealed_tip: Option<String> = if lsm_cfg.enabled {
+        prev_levels.last().map(|l| l.tip_commit.clone())
+    } else {
+        None
+    };
+
+    // Write a reachability bitmap once, before the heavy full enumerations
+    // (skeleton + history). This is in the background phase, so it never delays
+    // the depth=1 publish. Best-effort.
+    let bm_dir = mirror_dir.to_path_buf();
+    let _ = tokio::task::spawn_blocking(move || git::write_bitmap(&bm_dir)).await;
+
+    // Full skeleton + history + the full zstd archive (deferred from phase 1),
+    // all concurrently.
     let (md1, c1, cm1) = (mirror_dir.to_path_buf(), cas.clone(), commit.to_string());
     let skeleton_handle =
         tokio::task::spawn_blocking(move || PackBuilder::new(&md1, &c1).build_skeleton_pack(&cm1));
-    let (md2, c2, cm2) = (mirror_dir.to_path_buf(), cas.clone(), commit.to_string());
-    let history_handle = tokio::task::spawn_blocking(move || {
-        PackBuilder::new(&md2, &c2).build_history_packs(&cm2, history_target)
+    let (mda, ca, cma) = (mirror_dir.to_path_buf(), cas.clone(), commit.to_string());
+    let archive_handle = tokio::task::spawn_blocking(move || {
+        ArchiveBuilder::new(&mda).build_into_cas(&cma, &ca, 6, None)
+    });
+    let (md2, c2, cm2, st2, lsm2) = (
+        mirror_dir.to_path_buf(),
+        cas.clone(),
+        commit.to_string(),
+        sealed_tip.clone(),
+        lsm_cfg.enabled,
+    );
+    type BuiltHistory = (Vec<(String, u64, String, u64)>, u64, bool);
+    let history_handle = tokio::task::spawn_blocking(move || -> Result<BuiltHistory> {
+        let b = PackBuilder::new(&md2, &c2);
+        if lsm2 {
+            let (tail, raw) = b.build_history_tail(&cm2, st2.as_deref(), history_target)?;
+            Ok((tail, raw, true))
+        } else {
+            Ok((b.build_history_packs(&cm2, history_target)?, 0, false))
+        }
     });
     let (skeleton_pack, skeleton_idx) = skeleton_handle.await.context("full skeleton")??;
-    let history_packs = history_handle.await.context("history packs")??;
+    let (built_history, tail_raw_bytes, is_tail) =
+        history_handle.await.context("history packs")??;
+    let (archive_chunk_hashes, metadata_base) = archive_handle.await.context("full archive")??;
+
+    // Resolve manifest history (all levels flattened), the packs to upload (only
+    // freshly built this sync), and the levels to persist for the next sync.
+    let (history_packs, new_history_tuples, new_levels) = if is_tail {
+        seal_and_compact(
+            mirror_dir,
+            cas,
+            commit,
+            prev_levels,
+            sealed_tip,
+            built_history,
+            tail_raw_bytes,
+            history_target,
+            &lsm_cfg,
+        )
+        .await?
+    } else {
+        (built_history.clone(), built_history, Vec::new())
+    };
 
     let (md3, c3, cm3, skp) = (
         mirror_dir.to_path_buf(),
@@ -3019,12 +3177,15 @@ async fn build_full_in_background(
         full_clonepack_hash.clone(),
         full_idx_bundle_hash.clone(),
     ];
-    for (p, _, i, _) in &history_packs {
+    // Only freshly built packs are uploaded/evicted; prior levels are already
+    // durable in object storage and are referenced by hash.
+    for (p, _, i, _) in &new_history_tuples {
         p2.push(p.clone());
         p2.push(i.clone());
     }
+    p2.extend(archive_chunk_hashes.iter().cloned());
     p2.retain(|h| !h.is_empty());
-    let hist_idx_keep: std::collections::HashSet<String> = history_packs
+    let hist_idx_keep: std::collections::HashSet<String> = new_history_tuples
         .iter()
         .map(|(_, _, ih, _)| ih.clone())
         .collect();
@@ -3043,6 +3204,8 @@ async fn build_full_in_background(
     info.prebuilt_index = prebuilt_index.clone();
     info.metadata_chunk = metadata_hash.clone();
     info.manifest = metadata_hash.clone();
+    info.archive = archive_chunk_hashes.first().cloned().unwrap_or_default();
+    info.archive_chunks = archive_chunk_hashes.clone();
     info.clonepack_manifest = full_clonepack_hash.clone();
     info.full_clonepack = crate::ClonepackArtifacts {
         manifest: full_clonepack_hash.clone(),
@@ -3054,6 +3217,7 @@ async fn build_full_in_background(
         idx_bundle: full_idx_bundle_hash.clone(),
         commit: commit.to_string(),
     };
+    info.history_levels = new_levels;
     info.build_status = None;
     ref_store
         .save_branch(owner, repo, branch, &info)
