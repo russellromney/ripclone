@@ -412,6 +412,41 @@ impl WorktreeWriter {
         )
     }
 
+    pub fn write_owned_entries_for_fresh_indexed_checkout_deferred(
+        &self,
+        target_dir: &Path,
+        writes: Vec<OwnedFileWrite>,
+    ) -> Result<WriteOutcome> {
+        let options = WriteOptions {
+            parents_prepared: true,
+            stamp_mtime: false,
+            fresh_target: true,
+        };
+        if writes.is_empty() {
+            return self.flush_deferred_writes();
+        }
+
+        let prep_start = Instant::now();
+        let (written, regulars) = prepare_owned_entries(target_dir, writes, options)?;
+        let immediate_written = written - regulars.len();
+        record_prep(prep_start.elapsed());
+
+        let mut outcome = self.write_regular_batch_deferred(regulars, options)?;
+        outcome.written += immediate_written;
+        Ok(outcome)
+    }
+
+    pub fn flush_deferred_writes(&self) -> Result<WriteOutcome> {
+        match &self.backend {
+            WriterBackend::Posix => Ok(WriteOutcome {
+                written: 0,
+                stats: Vec::new(),
+            }),
+            #[cfg(target_os = "linux")]
+            WriterBackend::IoUring(writer) => writer.flush_deferred_writes(),
+        }
+    }
+
     pub fn write_owned_entries_with_options(
         &self,
         target_dir: &Path,
@@ -426,63 +461,7 @@ impl WorktreeWriter {
         }
 
         let prep_start = Instant::now();
-        let mut regulars = Vec::new();
-        let mut written = 0usize;
-        for write in writes {
-            let path = path_from_bytes(&write.entry.path);
-            validate_relative_path(path)
-                .with_context(|| format!("refusing to extract unsafe path: {}", path.display()))?;
-
-            if !options.parents_prepared
-                && let Some(parent) = path.parent()
-                && !parent.as_os_str().is_empty()
-            {
-                safe_create_dir_all(target_dir, parent).with_context(|| {
-                    format!(
-                        "create parent dir for {}",
-                        String::from_utf8_lossy(&write.entry.path)
-                    )
-                })?;
-            }
-
-            let target = target_dir.join(path);
-            if !options.fresh_target && target.is_symlink() {
-                std::fs::remove_file(&target)
-                    .with_context(|| format!("remove existing symlink {}", target.display()))?;
-            }
-
-            match write.entry.mode {
-                0o120000 => {
-                    write_symlink_entry(&target, &write.entry.path, write.content.as_slice())?;
-                    written += 1;
-                }
-                0o100755 | 0o100644 => {
-                    if !options.fresh_target && target.exists() {
-                        std::fs::remove_file(&target).ok();
-                    }
-                    let mode = if write.entry.mode == 0o100755 {
-                        0o755
-                    } else {
-                        0o644
-                    };
-                    regulars.push(PreparedRegularWrite {
-                        target,
-                        index_path: String::from_utf8_lossy(&write.entry.path).into_owned(),
-                        mode,
-                        content: write.content,
-                    });
-                    written += 1;
-                }
-                _ => {
-                    anyhow::bail!(
-                        "refusing to extract file {} with illegal mode 0o{:o}",
-                        String::from_utf8_lossy(&write.entry.path),
-                        write.entry.mode
-                    );
-                }
-            }
-        }
-
+        let (written, regulars) = prepare_owned_entries(target_dir, writes, options)?;
         record_prep(prep_start.elapsed());
         let stats = self.write_regular_batch(regulars, options)?;
         Ok(WriteOutcome { written, stats })
@@ -603,11 +582,113 @@ impl WorktreeWriter {
             }
         }
     }
+
+    fn write_regular_batch_deferred(
+        &self,
+        writes: Vec<PreparedRegularWrite>,
+        options: WriteOptions,
+    ) -> Result<WriteOutcome> {
+        if writes.is_empty() {
+            return self.flush_deferred_writes();
+        }
+        let files = writes.len() as u64;
+        let bytes: u64 = writes.iter().map(|w| w.content.len() as u64).sum();
+        let collect_stats = !options.stamp_mtime;
+        match &self.backend {
+            WriterBackend::Posix => {
+                let io_start = Instant::now();
+                let stats = write_regular_batch_posix(&writes, collect_stats)?;
+                record_io(io_start.elapsed(), files, bytes);
+                Ok(WriteOutcome {
+                    written: writes.len(),
+                    stats,
+                })
+            }
+            #[cfg(target_os = "linux")]
+            WriterBackend::IoUring(writer) => {
+                if should_use_posix_for_io_uring_batch(&writes) {
+                    let mut completed = writer.flush_deferred_writes()?;
+                    let io_start = Instant::now();
+                    let stats = write_regular_batch_posix(&writes, collect_stats)?;
+                    record_io(io_start.elapsed(), files, bytes);
+                    completed.written += writes.len();
+                    completed.stats.extend(stats);
+                    Ok(completed)
+                } else {
+                    writer.write_regular_batch_deferred(writes, collect_stats)
+                }
+            }
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
 fn should_use_posix_for_io_uring_batch(writes: &[PreparedRegularWrite]) -> bool {
     writes.len() < IO_URING_MIN_BATCH_FILES
+}
+
+fn prepare_owned_entries(
+    target_dir: &Path,
+    writes: Vec<OwnedFileWrite>,
+    options: WriteOptions,
+) -> Result<(usize, Vec<PreparedRegularWrite>)> {
+    let mut regulars = Vec::new();
+    let mut written = 0usize;
+    for write in writes {
+        let path = path_from_bytes(&write.entry.path);
+        validate_relative_path(path)
+            .with_context(|| format!("refusing to extract unsafe path: {}", path.display()))?;
+
+        if !options.parents_prepared
+            && let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            safe_create_dir_all(target_dir, parent).with_context(|| {
+                format!(
+                    "create parent dir for {}",
+                    String::from_utf8_lossy(&write.entry.path)
+                )
+            })?;
+        }
+
+        let target = target_dir.join(path);
+        if !options.fresh_target && target.is_symlink() {
+            std::fs::remove_file(&target)
+                .with_context(|| format!("remove existing symlink {}", target.display()))?;
+        }
+
+        match write.entry.mode {
+            0o120000 => {
+                write_symlink_entry(&target, &write.entry.path, write.content.as_slice())?;
+                written += 1;
+            }
+            0o100755 | 0o100644 => {
+                if !options.fresh_target && target.exists() {
+                    std::fs::remove_file(&target).ok();
+                }
+                let mode = if write.entry.mode == 0o100755 {
+                    0o755
+                } else {
+                    0o644
+                };
+                regulars.push(PreparedRegularWrite {
+                    target,
+                    index_path: String::from_utf8_lossy(&write.entry.path).into_owned(),
+                    mode,
+                    content: write.content,
+                });
+                written += 1;
+            }
+            _ => {
+                anyhow::bail!(
+                    "refusing to extract file {} with illegal mode 0o{:o}",
+                    String::from_utf8_lossy(&write.entry.path),
+                    write.entry.mode
+                );
+            }
+        }
+    }
+    Ok((written, regulars))
 }
 
 enum RegularContent<'a> {
@@ -714,11 +795,15 @@ mod linux_uring {
 
     const QUEUE_DEPTH: u32 = 4096;
     const MAX_BATCH_FILES: usize = 512;
+    const REGISTERED_FILE_SLOTS: usize = MAX_BATCH_FILES * 2;
     static DIRECT_DESCRIPTOR_ENABLED_LOG: Once = Once::new();
     static DIRECT_DESCRIPTOR_FALLBACK_LOG: Once = Once::new();
     static SKIP_OPEN_CQE_ENABLED_LOG: Once = Once::new();
+    static SKIP_WRITE_CQE_ENABLED_LOG: Once = Once::new();
     static OPTIMIZED_RING_ENABLED_LOG: Once = Once::new();
     static OPTIMIZED_RING_FALLBACK_LOG: Once = Once::new();
+    static SQPOLL_RING_ENABLED_LOG: Once = Once::new();
+    static SQPOLL_RING_FALLBACK_LOG: Once = Once::new();
 
     #[derive(Clone, Copy)]
     pub(super) struct UringWriter;
@@ -727,6 +812,9 @@ mod linux_uring {
         ring: IoUring,
         descriptor_mode: DescriptorMode,
         skip_open_success_cqe: bool,
+        pending_direct: Option<PendingDirectWindow>,
+        next_window_id: u32,
+        direct_window_verified: bool,
     }
 
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -745,8 +833,32 @@ mod linux_uring {
         fd: Option<i32>,
         open_res: Option<i32>,
         write_res: Option<i32>,
+        write_success_cqe_skipped: bool,
         statx_res: Option<i32>,
         close_res: Option<i32>,
+    }
+
+    struct PendingDirectWindow {
+        window_id: u32,
+        slot_base: usize,
+        in_flight: Vec<InFlightWrite>,
+        statx_buffers: Vec<libc::statx>,
+        collect_stats: bool,
+        expected_completions: usize,
+        expected_closes: usize,
+        completions_seen: usize,
+        closes_seen: usize,
+        submitted_ns: u64,
+        record_io_on_harvest: bool,
+        files: u64,
+        bytes: u64,
+    }
+
+    impl PendingDirectWindow {
+        fn is_complete(&self) -> bool {
+            self.closes_seen >= self.expected_closes
+                && self.completions_seen >= self.expected_completions
+        }
     }
 
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -806,6 +918,21 @@ mod linux_uring {
             with_thread_writer(|writer| writer.write_regular_batch(writes, collect_stats))
         }
 
+        pub(super) fn write_regular_batch_deferred(
+            &self,
+            writes: Vec<PreparedRegularWrite>,
+            collect_stats: bool,
+        ) -> Result<WriteOutcome> {
+            if writes.is_empty() {
+                return self.flush_deferred_writes();
+            }
+            with_thread_writer(|writer| writer.write_regular_batch_deferred(writes, collect_stats))
+        }
+
+        pub(super) fn flush_deferred_writes(&self) -> Result<WriteOutcome> {
+            with_thread_writer(|writer| writer.flush_deferred_writes())
+        }
+
         pub(super) fn probe(&self) -> Result<()> {
             let nanos = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -851,7 +978,7 @@ mod linux_uring {
             }
             let descriptor_mode = match ring
                 .submitter()
-                .register_files_sparse(MAX_BATCH_FILES as u32)
+                .register_files_sparse(REGISTERED_FILE_SLOTS as u32)
             {
                 Ok(()) => {
                     DIRECT_DESCRIPTOR_ENABLED_LOG
@@ -869,10 +996,37 @@ mod linux_uring {
                 ring,
                 descriptor_mode,
                 skip_open_success_cqe,
+                pending_direct: None,
+                next_window_id: 1,
+                direct_window_verified: false,
             })
         }
 
         fn new_ring() -> io::Result<IoUring> {
+            let use_sqpoll = std::env::var("RIPCLONE_IO_URING_SQPOLL")
+                .ok()
+                .is_some_and(|value| {
+                    matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES")
+                });
+            if use_sqpoll {
+                let mut builder = IoUring::builder();
+                builder.setup_sqpoll(1_000);
+                match builder.build(QUEUE_DEPTH) {
+                    Ok(ring) => {
+                        SQPOLL_RING_ENABLED_LOG
+                            .call_once(|| tracing::info!("io_uring SQPOLL ring enabled"));
+                        return Ok(ring);
+                    }
+                    Err(e) => {
+                        SQPOLL_RING_FALLBACK_LOG.call_once(|| {
+                            tracing::debug!(
+                                "io_uring SQPOLL ring setup unavailable; using non-SQPOLL ring: {e}"
+                            )
+                        });
+                    }
+                }
+            }
+
             let mut builder = IoUring::builder();
             builder
                 .setup_single_issuer()
@@ -903,6 +1057,11 @@ mod linux_uring {
             mut writes: Vec<PreparedRegularWrite>,
             collect_stats: bool,
         ) -> Result<Vec<crate::git::MaterializedPathStat>> {
+            if self.pending_direct.is_some() {
+                anyhow::bail!(
+                    "cannot run synchronous io_uring writes while deferred writes are pending"
+                );
+            }
             let mut stats = Vec::new();
             while !writes.is_empty() {
                 let n = writes.len().min(MAX_BATCH_FILES);
@@ -921,37 +1080,7 @@ mod linux_uring {
                 return Ok(Vec::new());
             }
 
-            let mut in_flight = Vec::with_capacity(writes.len());
-            for write in writes {
-                if write.content.len() > u32::MAX as usize {
-                    anyhow::bail!(
-                        "file too large for single io_uring write: {}",
-                        write.target.display()
-                    );
-                }
-                let path =
-                    CString::new(write.target.as_os_str().as_bytes()).with_context(|| {
-                        format!("path contains NUL byte: {}", write.target.display())
-                    })?;
-                let flags = libc::O_WRONLY
-                    | libc::O_CREAT
-                    | libc::O_TRUNC
-                    | libc::O_CLOEXEC
-                    | libc::O_NOFOLLOW;
-                in_flight.push(InFlightWrite {
-                    target: write.target,
-                    index_path: write.index_path,
-                    path,
-                    flags,
-                    mode: write.mode as libc::mode_t,
-                    content: write.content,
-                    fd: None,
-                    open_res: None,
-                    write_res: None,
-                    statx_res: None,
-                    close_res: None,
-                });
-            }
+            let in_flight = prepare_in_flight(writes)?;
 
             match self.descriptor_mode {
                 DescriptorMode::NormalFd => {
@@ -987,7 +1116,7 @@ mod linux_uring {
                         .flags(write.flags)
                         .mode(write.mode)
                         .build()
-                        .user_data(user_data(idx, FileOp::Open)),
+                        .user_data(user_data(0, idx, FileOp::Open)),
                 );
             }
             self.submit_entries(&entries, entries.len(), "submit io_uring open batch")?;
@@ -1022,13 +1151,17 @@ mod linux_uring {
                             .offset(0)
                             .build()
                             .flags(squeue::Flags::IO_HARDLINK)
-                            .user_data(user_data(idx, FileOp::Write)),
+                            .user_data(user_data(
+                                0,
+                                idx,
+                                FileOp::Write,
+                            )),
                         );
                     }
                     entries.push(
                         opcode::Close::new(types::Fd(fd))
                             .build()
-                            .user_data(user_data(idx, FileOp::Close)),
+                            .user_data(user_data(0, idx, FileOp::Close)),
                     );
                 }
             }
@@ -1103,15 +1236,158 @@ mod linux_uring {
 
         fn write_regular_window_direct(
             &mut self,
-            mut in_flight: Vec<InFlightWrite>,
+            in_flight: Vec<InFlightWrite>,
             collect_stats: bool,
         ) -> std::result::Result<Vec<crate::git::MaterializedPathStat>, DirectWriteError> {
+            let pending = self.submit_direct_window(in_flight, collect_stats, false, 0)?;
+            self.harvest_direct_window(pending)
+        }
+
+        fn write_regular_batch_deferred(
+            &mut self,
+            writes: Vec<PreparedRegularWrite>,
+            collect_stats: bool,
+        ) -> Result<WriteOutcome> {
+            let files = writes.len();
+            let bytes: u64 = writes.iter().map(|write| write.content.len() as u64).sum();
+            let in_flight = prepare_in_flight(writes)?;
+
+            match self.descriptor_mode {
+                DescriptorMode::DirectFd if !self.direct_window_verified => {
+                    let io_start = Instant::now();
+                    match self.write_regular_window_direct(in_flight, collect_stats) {
+                        Ok(stats) => {
+                            record_io(io_start.elapsed(), files as u64, bytes);
+                            Ok(WriteOutcome {
+                                written: files,
+                                stats,
+                            })
+                        }
+                        Err(DirectWriteError::Unsupported(in_flight)) => {
+                            DIRECT_DESCRIPTOR_FALLBACK_LOG.call_once(|| {
+                                tracing::info!(
+                                    "io_uring direct descriptors rejected by kernel; retrying with normal fds"
+                                )
+                            });
+                            self.descriptor_mode = DescriptorMode::NormalFd;
+                            let stats =
+                                self.write_regular_window_normal(in_flight, collect_stats)?;
+                            record_io(io_start.elapsed(), files as u64, bytes);
+                            Ok(WriteOutcome {
+                                written: files,
+                                stats,
+                            })
+                        }
+                        Err(DirectWriteError::Other(e)) => Err(e),
+                    }
+                }
+                DescriptorMode::DirectFd => {
+                    let previous = self.pending_direct.take();
+                    let slot_base = previous
+                        .as_ref()
+                        .map(|pending| {
+                            if pending.slot_base == 0 {
+                                MAX_BATCH_FILES
+                            } else {
+                                0
+                            }
+                        })
+                        .unwrap_or(0);
+                    match self.submit_direct_window(in_flight, collect_stats, true, slot_base) {
+                        Ok(current) => {
+                            self.pending_direct = Some(current);
+                            if let Some(previous) = previous {
+                                let written = previous.in_flight.len();
+                                let stats = self
+                                    .harvest_direct_window(previous)
+                                    .map_err(DirectWriteError::into_anyhow)?;
+                                Ok(WriteOutcome { written, stats })
+                            } else {
+                                Ok(WriteOutcome {
+                                    written: 0,
+                                    stats: Vec::new(),
+                                })
+                            }
+                        }
+                        Err(DirectWriteError::Unsupported(in_flight)) => {
+                            self.pending_direct = previous;
+                            let mut completed = self.flush_deferred_writes()?;
+                            self.descriptor_mode = DescriptorMode::NormalFd;
+                            let io_start = Instant::now();
+                            let stats =
+                                self.write_regular_window_normal(in_flight, collect_stats)?;
+                            record_io(io_start.elapsed(), files as u64, bytes);
+                            completed.written += files;
+                            completed.stats.extend(stats);
+                            Ok(completed)
+                        }
+                        Err(DirectWriteError::Other(e)) => {
+                            self.pending_direct = previous;
+                            Err(e)
+                        }
+                    }
+                }
+                DescriptorMode::NormalFd => {
+                    let mut completed = self.flush_deferred_writes()?;
+                    let io_start = Instant::now();
+                    let stats = self.write_regular_window_normal(in_flight, collect_stats)?;
+                    record_io(io_start.elapsed(), files as u64, bytes);
+                    completed.written += files;
+                    completed.stats.extend(stats);
+                    Ok(completed)
+                }
+            }
+        }
+
+        fn flush_deferred_writes(&mut self) -> Result<WriteOutcome> {
+            if let Some(pending) = self.pending_direct.take() {
+                let written = pending.in_flight.len();
+                match self.harvest_direct_window(pending) {
+                    Ok(stats) => Ok(WriteOutcome { written, stats }),
+                    Err(DirectWriteError::Unsupported(in_flight)) => {
+                        DIRECT_DESCRIPTOR_FALLBACK_LOG.call_once(|| {
+                            tracing::info!(
+                                "io_uring direct descriptors rejected by kernel; retrying with normal fds"
+                            )
+                        });
+                        self.descriptor_mode = DescriptorMode::NormalFd;
+                        let stats = self.write_regular_window_normal(in_flight, true)?;
+                        Ok(WriteOutcome { written, stats })
+                    }
+                    Err(DirectWriteError::Other(e)) => Err(e),
+                }
+            } else {
+                Ok(WriteOutcome {
+                    written: 0,
+                    stats: Vec::new(),
+                })
+            }
+        }
+
+        fn submit_direct_window(
+            &mut self,
+            mut in_flight: Vec<InFlightWrite>,
+            collect_stats: bool,
+            record_io_on_harvest: bool,
+            slot_base: usize,
+        ) -> std::result::Result<PendingDirectWindow, DirectWriteError> {
             let mut statx_buffers: Vec<libc::statx> = (0..in_flight.len())
                 .map(|_| unsafe { std::mem::zeroed() })
                 .collect();
             let mut entries = Vec::with_capacity(in_flight.len() * 4);
+            let mut skipped_success_cqes = 0usize;
+            let mut expected_closes = 0usize;
+            let skip_write_success_cqe = self.skip_open_success_cqe && collect_stats;
+            if skip_write_success_cqe {
+                SKIP_WRITE_CQE_ENABLED_LOG.call_once(|| {
+                    tracing::info!(
+                        "io_uring successful direct-write CQEs will be skipped with statx size verification"
+                    )
+                });
+            }
+            let window_id = self.next_window_id();
             for idx in 0..in_flight.len() {
-                let slot = idx as u32;
+                let slot = (slot_base + idx) as u32;
                 let path_ptr = in_flight[idx].path.as_ptr();
                 let flags = in_flight[idx].flags;
                 let mode = in_flight[idx].mode;
@@ -1121,6 +1397,7 @@ mod linux_uring {
                 let mut open_flags = squeue::Flags::IO_LINK;
                 if self.skip_open_success_cqe {
                     open_flags |= squeue::Flags::SKIP_SUCCESS;
+                    skipped_success_cqes += 1;
                 }
                 entries.push(
                     opcode::OpenAt::new(types::Fd(libc::AT_FDCWD), path_ptr)
@@ -1129,22 +1406,27 @@ mod linux_uring {
                         .file_index(Some(dest))
                         .build()
                         .flags(open_flags)
-                        .user_data(user_data(idx, FileOp::Open)),
+                        .user_data(user_data(window_id, idx, FileOp::Open)),
                 );
                 if in_flight[idx].content.is_empty() {
                     in_flight[idx].write_res = Some(0);
                 } else {
-                    let content = in_flight[idx].content.as_slice();
+                    let (content_ptr, content_len) = {
+                        let content = in_flight[idx].content.as_slice();
+                        (content.as_ptr(), content.len() as u32)
+                    };
+                    let mut write_flags = squeue::Flags::IO_HARDLINK;
+                    if skip_write_success_cqe {
+                        write_flags |= squeue::Flags::SKIP_SUCCESS;
+                        in_flight[idx].write_success_cqe_skipped = true;
+                        skipped_success_cqes += 1;
+                    }
                     entries.push(
-                        opcode::Write::new(
-                            types::Fixed(slot),
-                            content.as_ptr(),
-                            content.len() as u32,
-                        )
-                        .offset(0)
-                        .build()
-                        .flags(squeue::Flags::IO_HARDLINK)
-                        .user_data(user_data(idx, FileOp::Write)),
+                        opcode::Write::new(types::Fixed(slot), content_ptr, content_len)
+                            .offset(0)
+                            .build()
+                            .flags(write_flags)
+                            .user_data(user_data(window_id, idx, FileOp::Write)),
                     );
                 }
                 if collect_stats {
@@ -1158,84 +1440,92 @@ mod linux_uring {
                         .mask(libc::STATX_BASIC_STATS)
                         .build()
                         .flags(squeue::Flags::IO_HARDLINK)
-                        .user_data(user_data(idx, FileOp::Statx)),
+                        .user_data(user_data(
+                            window_id,
+                            idx,
+                            FileOp::Statx,
+                        )),
                     );
                 }
+                expected_closes += 1;
                 entries.push(
                     opcode::Close::new(types::Fixed(slot))
                         .build()
-                        .user_data(user_data(idx, FileOp::Close)),
+                        .user_data(user_data(window_id, idx, FileOp::Close)),
                 );
             }
 
-            let expected_completions = if self.skip_open_success_cqe {
-                entries.len() - in_flight.len()
-            } else {
-                entries.len()
-            };
+            let expected_completions = entries.len() - skipped_success_cqes;
+            let files = in_flight.len() as u64;
+            let bytes = in_flight
+                .iter()
+                .map(|write| write.content.len() as u64)
+                .sum();
+            let submit_start = Instant::now();
             self.submit_entries(
                 &entries,
-                expected_completions,
-                "submit io_uring direct open/write/close batch",
+                0,
+                "submit io_uring direct open/write/statx/close batch",
             )
             .map_err(DirectWriteError::Other)?;
-            let completions = if self.skip_open_success_cqe {
-                self.collect_direct_completions(
-                    in_flight.len(),
-                    expected_completions,
-                    "wait for io_uring direct open/write/close batch completion",
-                )
-            } else {
-                self.collect_completions(
-                    expected_completions,
-                    "wait for io_uring direct open/write/close batch completion",
-                )
-            }
+            Ok(PendingDirectWindow {
+                window_id,
+                slot_base,
+                in_flight,
+                statx_buffers,
+                collect_stats,
+                expected_completions,
+                expected_closes,
+                completions_seen: 0,
+                closes_seen: 0,
+                submitted_ns: submit_start.elapsed().as_nanos() as u64,
+                record_io_on_harvest,
+                files,
+                bytes,
+            })
+        }
+
+        fn harvest_direct_window(
+            &mut self,
+            mut pending: PendingDirectWindow,
+        ) -> std::result::Result<Vec<crate::git::MaterializedPathStat>, DirectWriteError> {
+            let wait_start = Instant::now();
+            self.collect_direct_window_completions(
+                &mut pending,
+                "wait for io_uring direct open/write/statx/close batch completion",
+            )
             .map_err(DirectWriteError::Other)?;
-            for (idx, op, res) in completions {
-                let write = in_flight
-                    .get_mut(idx)
-                    .ok_or_else(|| anyhow::anyhow!("invalid io_uring completion index {idx}"))
-                    .map_err(DirectWriteError::Other)?;
-                match op {
-                    FileOp::Open => {
-                        write.open_res = Some(res);
-                    }
-                    FileOp::Write => {
-                        write.write_res = Some(res);
-                    }
-                    FileOp::Statx => {
-                        write.statx_res = Some(res);
-                    }
-                    FileOp::Close => {
-                        write.close_res = Some(res);
-                    }
-                }
+            if pending.record_io_on_harvest {
+                let io_ns = pending.submitted_ns + wait_start.elapsed().as_nanos() as u64;
+                record_io(Duration::from_nanos(io_ns), pending.files, pending.bytes);
             }
             if self.skip_open_success_cqe {
-                for write in &mut in_flight {
+                for write in &mut pending.in_flight {
                     if write.open_res.is_none() {
                         write.open_res = Some(0);
                     }
                 }
             }
 
-            if direct_descriptors_unsupported(&in_flight) {
-                return Err(DirectWriteError::Unsupported(in_flight));
+            if direct_descriptors_unsupported(&pending.in_flight) {
+                return Err(DirectWriteError::Unsupported(pending.in_flight));
             }
 
-            for write in &in_flight {
+            for (idx, write) in pending.in_flight.iter().enumerate() {
                 check_open_result(write).map_err(DirectWriteError::Other)?;
                 check_write_result(write).map_err(DirectWriteError::Other)?;
-                if collect_stats {
-                    check_statx_result(write).map_err(DirectWriteError::Other)?;
+                if pending.collect_stats {
+                    let statx = &pending.statx_buffers[idx];
+                    check_statx_result(write, statx).map_err(DirectWriteError::Other)?;
                 }
                 check_close_result(write).map_err(DirectWriteError::Other)?;
             }
-            if collect_stats {
-                Ok(in_flight
+            self.direct_window_verified = true;
+            if pending.collect_stats {
+                Ok(pending
+                    .in_flight
                     .iter()
-                    .zip(statx_buffers.iter())
+                    .zip(pending.statx_buffers.iter())
                     .map(|(write, statx)| {
                         crate::git::materialized_path_stat_from_statx(
                             write.index_path.clone(),
@@ -1246,6 +1536,15 @@ mod linux_uring {
             } else {
                 Ok(Vec::new())
             }
+        }
+
+        fn next_window_id(&mut self) -> u32 {
+            let id = self.next_window_id;
+            self.next_window_id = self.next_window_id.wrapping_add(1);
+            if self.next_window_id == 0 {
+                self.next_window_id = 1;
+            }
+            id
         }
 
         fn submit_entries(
@@ -1288,7 +1587,7 @@ mod linux_uring {
                 {
                     let mut cq = self.ring.completion();
                     for cqe in &mut cq {
-                        let (idx, op) = parse_user_data(cqe.user_data())?;
+                        let (_window_id, idx, op) = parse_user_data(cqe.user_data())?;
                         completions.push((idx, op, cqe.result()));
                     }
                 }
@@ -1303,44 +1602,122 @@ mod linux_uring {
             Ok(completions)
         }
 
-        fn collect_direct_completions(
+        fn collect_direct_window_completions(
             &mut self,
-            expected_closes: usize,
-            min_expected: usize,
+            target: &mut PendingDirectWindow,
             context: &str,
-        ) -> Result<Vec<(usize, FileOp, i32)>> {
-            let mut completions = Vec::with_capacity(min_expected);
-            let mut closes = 0usize;
-            while closes < expected_closes {
+        ) -> Result<()> {
+            while !target.is_complete() {
                 {
                     let mut cq = self.ring.completion();
                     for cqe in &mut cq {
-                        let (idx, op) = parse_user_data(cqe.user_data())?;
-                        if op == FileOp::Close {
-                            closes += 1;
+                        let (window_id, idx, op) = parse_user_data(cqe.user_data())?;
+                        if window_id == target.window_id {
+                            apply_direct_completion(target, idx, op, cqe.result())?;
+                        } else if let Some(pending) = self.pending_direct.as_mut()
+                            && window_id == pending.window_id
+                        {
+                            apply_direct_completion(pending, idx, op, cqe.result())?;
+                        } else {
+                            anyhow::bail!("unexpected io_uring completion for window {window_id}");
                         }
-                        completions.push((idx, op, cqe.result()));
                     }
                 }
-                if closes < expected_closes {
-                    let remaining = min_expected.saturating_sub(completions.len()).max(1);
+                if !target.is_complete() {
                     self.ring
                         .submitter()
-                        .submit_and_wait(remaining)
+                        .submit_and_wait(1)
                         .with_context(|| context.to_string())?;
                 }
             }
-            Ok(completions)
+            Ok(())
         }
     }
 
-    fn user_data(idx: usize, op: FileOp) -> u64 {
-        ((idx as u64) << 2) | op as u64
+    impl Drop for RawUringWriter {
+        fn drop(&mut self) {
+            let _ = self.flush_deferred_writes();
+        }
+    }
+
+    fn prepare_in_flight(writes: Vec<PreparedRegularWrite>) -> Result<Vec<InFlightWrite>> {
+        let mut in_flight = Vec::with_capacity(writes.len());
+        for write in writes {
+            if write.content.len() > u32::MAX as usize {
+                anyhow::bail!(
+                    "file too large for single io_uring write: {}",
+                    write.target.display()
+                );
+            }
+            let path = CString::new(write.target.as_os_str().as_bytes())
+                .with_context(|| format!("path contains NUL byte: {}", write.target.display()))?;
+            let flags =
+                libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+            in_flight.push(InFlightWrite {
+                target: write.target,
+                index_path: write.index_path,
+                path,
+                flags,
+                mode: write.mode as libc::mode_t,
+                content: write.content,
+                fd: None,
+                open_res: None,
+                write_res: None,
+                write_success_cqe_skipped: false,
+                statx_res: None,
+                close_res: None,
+            });
+        }
+        Ok(in_flight)
+    }
+
+    fn apply_direct_completion(
+        window: &mut PendingDirectWindow,
+        idx: usize,
+        op: FileOp,
+        res: i32,
+    ) -> Result<()> {
+        let write = window
+            .in_flight
+            .get_mut(idx)
+            .ok_or_else(|| anyhow::anyhow!("invalid io_uring completion index {idx}"))?;
+        match op {
+            FileOp::Open => {
+                write.open_res = Some(res);
+            }
+            FileOp::Write => {
+                write.write_res = Some(res);
+            }
+            FileOp::Statx => {
+                write.statx_res = Some(res);
+            }
+            FileOp::Close => {
+                write.close_res = Some(res);
+                window.closes_seen += 1;
+            }
+        }
+        window.completions_seen += 1;
+        Ok(())
+    }
+
+    fn user_data(window_id: u32, idx: usize, op: FileOp) -> u64 {
+        ((window_id as u64) << 32) | ((idx as u64) << 2) | op as u64
     }
 
     enum DirectWriteError {
         Unsupported(Vec<InFlightWrite>),
         Other(anyhow::Error),
+    }
+
+    impl DirectWriteError {
+        fn into_anyhow(self) -> anyhow::Error {
+            match self {
+                DirectWriteError::Unsupported(_) => {
+                    anyhow::anyhow!("io_uring direct descriptors became unsupported after probe")
+                }
+                DirectWriteError::Other(e) => e,
+            }
+        }
     }
 
     fn direct_descriptors_unsupported(writes: &[InFlightWrite]) -> bool {
@@ -1353,8 +1730,9 @@ mod linux_uring {
             })
     }
 
-    fn parse_user_data(data: u64) -> Result<(usize, FileOp)> {
-        let idx = (data >> 2) as usize;
+    fn parse_user_data(data: u64) -> Result<(u32, usize, FileOp)> {
+        let window_id = (data >> 32) as u32;
+        let idx = ((data & 0xffff_ffff) >> 2) as usize;
         let op = match data & 0b11 {
             0 => FileOp::Open,
             1 => FileOp::Write,
@@ -1362,7 +1740,7 @@ mod linux_uring {
             3 => FileOp::Statx,
             other => anyhow::bail!("invalid io_uring completion op {other}"),
         };
-        Ok((idx, op))
+        Ok((window_id, idx, op))
     }
 
     fn check_open_result(write: &InFlightWrite) -> Result<()> {
@@ -1377,6 +1755,9 @@ mod linux_uring {
 
     fn check_write_result(write: &InFlightWrite) -> Result<()> {
         if write.open_res.is_some_and(|res| res < 0) {
+            return Ok(());
+        }
+        if write.write_success_cqe_skipped && write.write_res.is_none() {
             return Ok(());
         }
         let res = write.write_res.ok_or_else(|| {
@@ -1397,7 +1778,7 @@ mod linux_uring {
         Ok(())
     }
 
-    fn check_statx_result(write: &InFlightWrite) -> Result<()> {
+    fn check_statx_result(write: &InFlightWrite, statx: &libc::statx) -> Result<()> {
         if write.open_res.is_some_and(|res| res < 0) {
             return Ok(());
         }
@@ -1409,6 +1790,15 @@ mod linux_uring {
         })?;
         if res < 0 {
             Err(cqe_error(res)).with_context(|| format!("statx {}", write.target.display()))?;
+        }
+        let expected = write.content.len() as u64;
+        if statx.stx_size != expected {
+            anyhow::bail!(
+                "short io_uring write {}: file size {} after writing {} bytes",
+                write.target.display(),
+                statx.stx_size,
+                expected
+            );
         }
         Ok(())
     }
@@ -1487,6 +1877,48 @@ mod tests {
         assert!(writer.write_entry(dir.path(), &entry, b"nope").is_err());
     }
 
+    #[test]
+    fn deferred_fresh_indexed_writer_flushes_all_batches() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let writer = WorktreeWriter::posix();
+        let mut total = 0usize;
+
+        for batch in 0..3 {
+            let writes = (0..4)
+                .map(|i| {
+                    let rel = format!("file-{batch}-{i}.txt");
+                    let content = format!("batch={batch} file={i}\n").into_bytes();
+                    OwnedFileWrite {
+                        entry: FileEntry {
+                            path: rel.as_bytes().to_vec(),
+                            mode: 0o100644,
+                            blob_sha1: Vec::new(),
+                            fragments: Vec::new(),
+                        },
+                        content: content.into(),
+                    }
+                })
+                .collect();
+            let outcome = writer
+                .write_owned_entries_for_fresh_indexed_checkout_deferred(dir.path(), writes)
+                .unwrap();
+            total += outcome.written;
+        }
+        total += writer.flush_deferred_writes().unwrap().written;
+
+        assert_eq!(total, 12);
+        for batch in 0..3 {
+            for i in 0..4 {
+                let rel = format!("file-{batch}-{i}.txt");
+                let content = format!("batch={batch} file={i}\n");
+                assert_eq!(
+                    std::fs::read(dir.path().join(rel)).unwrap(),
+                    content.as_bytes()
+                );
+            }
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn io_uring_writer_writes_regular_file_when_available() {
@@ -1558,6 +1990,55 @@ mod tests {
             for i in 0..32 {
                 let rel = format!("shard-{worker}/file-{i}.txt");
                 let content = format!("worker={worker} file={i}\n");
+                assert_eq!(
+                    std::fs::read(dir.path().join(rel)).unwrap(),
+                    content.as_bytes()
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn io_uring_deferred_writer_flushes_all_batches_when_available() {
+        let writer = match WorktreeWriter::io_uring() {
+            Ok(writer) => writer,
+            Err(e) => {
+                eprintln!("skipping io_uring deferred smoke test: {e:#}");
+                return;
+            }
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut total = 0usize;
+
+        for batch in 0..4 {
+            let writes = (0..8)
+                .map(|i| {
+                    let rel = format!("deferred-{batch}-{i}.txt");
+                    let content = format!("batch={batch} file={i}\n").into_bytes();
+                    OwnedFileWrite {
+                        entry: FileEntry {
+                            path: rel.as_bytes().to_vec(),
+                            mode: 0o100644,
+                            blob_sha1: Vec::new(),
+                            fragments: Vec::new(),
+                        },
+                        content: content.into(),
+                    }
+                })
+                .collect();
+            let outcome = writer
+                .write_owned_entries_for_fresh_indexed_checkout_deferred(dir.path(), writes)
+                .unwrap();
+            total += outcome.written;
+        }
+        total += writer.flush_deferred_writes().unwrap().written;
+
+        assert_eq!(total, 32);
+        for batch in 0..4 {
+            for i in 0..8 {
+                let rel = format!("deferred-{batch}-{i}.txt");
+                let content = format!("batch={batch} file={i}\n");
                 assert_eq!(
                     std::fs::read(dir.path().join(rel)).unwrap(),
                     content.as_bytes()
