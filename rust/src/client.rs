@@ -572,10 +572,18 @@ impl Client {
         // 3. Start archive chunk downloads concurrently with the manifest. They
         // will buffer until the manifest is decoded, then verify and forward
         // chunks to the extractor.
+        let archive_channel_depth = std::env::var("RIPCLONE_ARCHIVE_CHANNEL_DEPTH")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| {
+                info.archive_chunk_urls
+                    .as_ref()
+                    .map_or(2, |urls| urls.len().clamp(2, 64))
+            });
         let (archive_tx, archive_rx): (
             Sender<(usize, Result<Vec<u8>>)>,
             Receiver<(usize, Result<Vec<u8>>)>,
-        ) = bounded(2);
+        ) = bounded(archive_channel_depth);
 
         let archive_urls = info.archive_chunk_urls.clone();
         let archive_downloads = if mode.needs_archive() {
@@ -856,6 +864,7 @@ impl Client {
         let blob_map = Arc::new(crate::extract::build_blob_path_map(&metadata.files));
         crate::extract::prepare_worktree_dirs(work_tree, &metadata.files)
             .context("prepare worktree dirs")?;
+        let worktree_writer = Arc::new(crate::worktree_writer::WorktreeWriter::new()?);
 
         // Download and extraction are decoupled stages with independent
         // concurrency. Downloads are network-bound (fill the link); extraction
@@ -962,6 +971,7 @@ impl Client {
                 let pack_dir = pack_dir.to_path_buf();
                 let work_tree = work_tree.to_path_buf();
                 let blob_map = Arc::clone(&blob_map);
+                let worktree_writer = Arc::clone(&worktree_writer);
                 async move {
                     let (i, history_only, pack_bytes, idx_bytes) = res?;
                     let bytes = (pack_bytes.len() + idx_bytes.len()) as u64;
@@ -983,6 +993,7 @@ impl Client {
                             &pack_bytes,
                             &blob_map,
                             &work_tree,
+                            &worktree_writer,
                         )
                         .with_context(|| format!("extract pack {}", name))?;
                         Ok(n)

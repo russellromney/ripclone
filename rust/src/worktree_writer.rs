@@ -147,6 +147,9 @@ pub struct WriteOptions {
     /// Archive extraction can disable this when it refreshes the git index stat
     /// cache after materialization. Other callers keep the conservative default.
     pub stamp_mtime: bool,
+    /// Skip final-component existence/symlink probes for a freshly-created
+    /// install root whose parent directories were already validated.
+    pub fresh_target: bool,
 }
 
 impl Default for WriteOptions {
@@ -154,6 +157,7 @@ impl Default for WriteOptions {
         Self {
             parents_prepared: false,
             stamp_mtime: true,
+            fresh_target: false,
         }
     }
 }
@@ -353,6 +357,23 @@ impl WorktreeWriter {
             WriteOptions {
                 parents_prepared: true,
                 stamp_mtime: false,
+                fresh_target: true,
+            },
+        )
+    }
+
+    pub fn write_owned_entries_for_fresh_checkout(
+        &self,
+        target_dir: &Path,
+        writes: Vec<OwnedFileWrite>,
+    ) -> Result<usize> {
+        self.write_owned_entries_with_options(
+            target_dir,
+            writes,
+            WriteOptions {
+                parents_prepared: true,
+                fresh_target: true,
+                ..WriteOptions::default()
             },
         )
     }
@@ -388,7 +409,7 @@ impl WorktreeWriter {
             }
 
             let target = target_dir.join(path);
-            if target.is_symlink() {
+            if !options.fresh_target && target.is_symlink() {
                 std::fs::remove_file(&target)
                     .with_context(|| format!("remove existing symlink {}", target.display()))?;
             }
@@ -399,7 +420,7 @@ impl WorktreeWriter {
                     written += 1;
                 }
                 0o100755 | 0o100644 => {
-                    if target.exists() {
+                    if !options.fresh_target && target.exists() {
                         std::fs::remove_file(&target).ok();
                     }
                     let mode = if write.entry.mode == 0o100755 {
