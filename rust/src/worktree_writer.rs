@@ -2,12 +2,73 @@ use crate::manifest::FileEntry;
 use anyhow::{Context, Result};
 use filetime::{FileTime, set_file_mtime, set_symlink_file_times};
 use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
+use std::time::{Duration, Instant};
 
 pub(crate) const INDEX_MTIME: FileTime = FileTime::from_unix_time(1, 0);
+#[cfg(target_os = "linux")]
+const IO_URING_MIN_BATCH_FILES: usize = 2;
+
+// Process-wide write-phase timing counters. These let a caller (notably the
+// `writer_bench` binary) split the worktree-write cost into three buckets that
+// the per-clone benchmark conflates inside `write_ms`:
+//
+//   * prep  — path validation, parent-dir creation, symlink/exists probes, and
+//             the per-file classification done before any bytes are written.
+//   * io    — the actual open/write/close work (POSIX syscalls or the io_uring
+//             submission), and nothing else.
+//   * mtime — the serial `utimensat` loop that stamps `INDEX_MTIME` on every
+//             regular file *after* the batch has been written.
+//
+// All three are accumulated across every writer thread, so a caller reads them
+// once after extraction with `take_write_timing`. The recording cost is a
+// handful of atomic adds per batch (never per file), so it is always on.
+static PREP_NS: AtomicU64 = AtomicU64::new(0);
+static IO_NS: AtomicU64 = AtomicU64::new(0);
+static MTIME_NS: AtomicU64 = AtomicU64::new(0);
+static IO_FILES: AtomicU64 = AtomicU64::new(0);
+static IO_BYTES: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Default, Debug, Clone, Copy)]
+pub struct WriteTiming {
+    pub prep_ns: u64,
+    pub io_ns: u64,
+    pub mtime_ns: u64,
+    pub files: u64,
+    pub bytes: u64,
+}
+
+/// Read and reset the process-wide write-phase timing counters.
+pub fn take_write_timing() -> WriteTiming {
+    WriteTiming {
+        prep_ns: PREP_NS.swap(0, Ordering::Relaxed),
+        io_ns: IO_NS.swap(0, Ordering::Relaxed),
+        mtime_ns: MTIME_NS.swap(0, Ordering::Relaxed),
+        files: IO_FILES.swap(0, Ordering::Relaxed),
+        bytes: IO_BYTES.swap(0, Ordering::Relaxed),
+    }
+}
+
+fn record_prep(d: Duration) {
+    PREP_NS.fetch_add(d.as_nanos() as u64, Ordering::Relaxed);
+}
+
+fn record_io(d: Duration, files: u64, bytes: u64) {
+    IO_NS.fetch_add(d.as_nanos() as u64, Ordering::Relaxed);
+    IO_FILES.fetch_add(files, Ordering::Relaxed);
+    IO_BYTES.fetch_add(bytes, Ordering::Relaxed);
+}
+
+fn record_mtime(d: Duration) {
+    MTIME_NS.fetch_add(d.as_nanos() as u64, Ordering::Relaxed);
+}
 
 /// Convert a raw path byte slice to a `Path`. On Unix this preserves arbitrary
 /// git path bytes; on other platforms we fall back to UTF-8.
-pub(crate) fn path_from_bytes(bytes: &[u8]) -> &Path {
+pub fn path_from_bytes(bytes: &[u8]) -> &Path {
     #[cfg(unix)]
     {
         use std::ffi::OsStr;
@@ -73,20 +134,83 @@ pub fn safe_create_dir_all(root: &Path, rel: &Path) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct WriteOptions {
+    /// Skip per-file parent directory creation/checks.
+    ///
+    /// Use this only when the caller has already validated every path and
+    /// created all parent directories with `safe_create_dir_all` in the same
+    /// extraction root.
+    pub parents_prepared: bool,
+    /// Stamp regular files with `INDEX_MTIME` after writing.
+    ///
+    /// Archive extraction can disable this when it refreshes the git index stat
+    /// cache after materialization. Other callers keep the conservative default.
+    pub stamp_mtime: bool,
+}
+
+impl Default for WriteOptions {
+    fn default() -> Self {
+        Self {
+            parents_prepared: false,
+            stamp_mtime: true,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct WorktreeWriter {
     backend: WriterBackend,
 }
 
-pub(crate) struct OwnedFileWrite {
-    pub(crate) entry: FileEntry,
-    pub(crate) content: Vec<u8>,
+pub struct OwnedFileWrite {
+    pub entry: FileEntry,
+    pub content: FileWriteContent,
+}
+
+pub enum FileWriteContent {
+    Owned(Vec<u8>),
+    Shared {
+        data: Arc<Vec<u8>>,
+        offset: usize,
+        len: usize,
+    },
+}
+
+impl FileWriteContent {
+    pub fn shared(data: Arc<Vec<u8>>, offset: usize, len: usize) -> Self {
+        Self::Shared { data, offset, len }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Owned(content) => content.as_slice(),
+            Self::Shared { data, offset, len } => &data[*offset..*offset + *len],
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Owned(content) => content.len(),
+            Self::Shared { len, .. } => *len,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl From<Vec<u8>> for FileWriteContent {
+    fn from(value: Vec<u8>) -> Self {
+        Self::Owned(value)
+    }
 }
 
 struct PreparedRegularWrite {
     target: PathBuf,
     mode: u32,
-    content: Vec<u8>,
+    content: FileWriteContent,
 }
 
 #[derive(Clone)]
@@ -166,7 +290,7 @@ impl WorktreeWriter {
         }
     }
 
-    fn io_uring() -> Result<Self> {
+    pub fn io_uring() -> Result<Self> {
         #[cfg(target_os = "linux")]
         {
             let writer = linux_uring::UringWriter::new().context("start io_uring writer")?;
@@ -195,15 +319,55 @@ impl WorktreeWriter {
         self.write_entry_inner(target_dir, entry, RegularContent::Owned(content))
     }
 
-    pub(crate) fn write_owned_entries(
+    pub fn write_owned_entries(
         &self,
         target_dir: &Path,
         writes: Vec<OwnedFileWrite>,
+    ) -> Result<usize> {
+        self.write_owned_entries_with_options(target_dir, writes, WriteOptions::default())
+    }
+
+    pub fn write_owned_entries_in_prepared_dirs(
+        &self,
+        target_dir: &Path,
+        writes: Vec<OwnedFileWrite>,
+    ) -> Result<usize> {
+        self.write_owned_entries_with_options(
+            target_dir,
+            writes,
+            WriteOptions {
+                parents_prepared: true,
+                ..WriteOptions::default()
+            },
+        )
+    }
+
+    pub fn write_owned_entries_for_archive(
+        &self,
+        target_dir: &Path,
+        writes: Vec<OwnedFileWrite>,
+    ) -> Result<usize> {
+        self.write_owned_entries_with_options(
+            target_dir,
+            writes,
+            WriteOptions {
+                parents_prepared: true,
+                stamp_mtime: false,
+            },
+        )
+    }
+
+    pub fn write_owned_entries_with_options(
+        &self,
+        target_dir: &Path,
+        writes: Vec<OwnedFileWrite>,
+        options: WriteOptions,
     ) -> Result<usize> {
         if writes.is_empty() {
             return Ok(0);
         }
 
+        let prep_start = Instant::now();
         let mut regulars = Vec::new();
         let mut written = 0usize;
         for write in writes {
@@ -211,7 +375,8 @@ impl WorktreeWriter {
             validate_relative_path(path)
                 .with_context(|| format!("refusing to extract unsafe path: {}", path.display()))?;
 
-            if let Some(parent) = path.parent()
+            if !options.parents_prepared
+                && let Some(parent) = path.parent()
                 && !parent.as_os_str().is_empty()
             {
                 safe_create_dir_all(target_dir, parent).with_context(|| {
@@ -230,7 +395,7 @@ impl WorktreeWriter {
 
             match write.entry.mode {
                 0o120000 => {
-                    write_symlink_entry(&target, &write.entry.path, &write.content)?;
+                    write_symlink_entry(&target, &write.entry.path, write.content.as_slice())?;
                     written += 1;
                 }
                 0o100755 | 0o100644 => {
@@ -259,7 +424,8 @@ impl WorktreeWriter {
             }
         }
 
-        self.write_regular_batch(regulars)?;
+        record_prep(prep_start.elapsed());
+        self.write_regular_batch(regulars, options)?;
         Ok(written)
     }
 
@@ -323,28 +489,63 @@ impl WorktreeWriter {
         }
     }
 
-    fn write_regular_batch(&self, writes: Vec<PreparedRegularWrite>) -> Result<()> {
+    fn write_regular_batch(
+        &self,
+        writes: Vec<PreparedRegularWrite>,
+        options: WriteOptions,
+    ) -> Result<()> {
+        if writes.is_empty() {
+            return Ok(());
+        }
+        let files = writes.len() as u64;
+        let bytes: u64 = writes.iter().map(|w| w.content.len() as u64).sum();
         match &self.backend {
             WriterBackend::Posix => {
-                for write in writes {
-                    write_regular_posix(&write.target, write.mode, &write.content)?;
-                    set_file_mtime(&write.target, INDEX_MTIME)
-                        .with_context(|| format!("set mtime {}", write.target.display()))?;
+                // Write every file first, then stamp mtimes, so the two phases
+                // are measured separately and the shape matches the io_uring
+                // backend (batched writes followed by a serial utimensat loop).
+                let io_start = Instant::now();
+                write_regular_batch_posix(&writes)?;
+                record_io(io_start.elapsed(), files, bytes);
+
+                if options.stamp_mtime {
+                    let mtime_start = Instant::now();
+                    for write in &writes {
+                        set_file_mtime(&write.target, INDEX_MTIME)
+                            .with_context(|| format!("set mtime {}", write.target.display()))?;
+                    }
+                    record_mtime(mtime_start.elapsed());
                 }
                 Ok(())
             }
             #[cfg(target_os = "linux")]
             WriterBackend::IoUring(writer) => {
                 let targets: Vec<_> = writes.iter().map(|write| write.target.clone()).collect();
-                writer.write_regular_batch(writes)?;
-                for target in targets {
-                    set_file_mtime(&target, INDEX_MTIME)
-                        .with_context(|| format!("set mtime {}", target.display()))?;
+                let io_start = Instant::now();
+                if should_use_posix_for_io_uring_batch(&writes) {
+                    write_regular_batch_posix(&writes)?;
+                } else {
+                    writer.write_regular_batch(writes)?;
+                }
+                record_io(io_start.elapsed(), files, bytes);
+
+                if options.stamp_mtime {
+                    let mtime_start = Instant::now();
+                    for target in targets {
+                        set_file_mtime(&target, INDEX_MTIME)
+                            .with_context(|| format!("set mtime {}", target.display()))?;
+                    }
+                    record_mtime(mtime_start.elapsed());
                 }
                 Ok(())
             }
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn should_use_posix_for_io_uring_batch(writes: &[PreparedRegularWrite]) -> bool {
+    writes.len() < IO_URING_MIN_BATCH_FILES
 }
 
 enum RegularContent<'a> {
@@ -359,6 +560,13 @@ impl<'a> RegularContent<'a> {
             RegularContent::Owned(content) => content.as_slice(),
         }
     }
+}
+
+fn write_regular_batch_posix(writes: &[PreparedRegularWrite]) -> Result<()> {
+    for write in writes {
+        write_regular_posix(&write.target, write.mode, write.content.as_slice())?;
+    }
+    Ok(())
 }
 
 fn write_symlink_entry(target: &Path, path_bytes: &[u8], content: &[u8]) -> Result<()> {
@@ -454,7 +662,7 @@ mod linux_uring {
         path: CString,
         flags: i32,
         mode: libc::mode_t,
-        content: Vec<u8>,
+        content: FileWriteContent,
         fd: Option<i32>,
         open_res: Option<i32>,
         write_res: Option<i32>,
@@ -494,7 +702,7 @@ mod linux_uring {
                 writer.write_regular_batch(vec![PreparedRegularWrite {
                     target: target.to_path_buf(),
                     mode,
-                    content,
+                    content: content.into(),
                 }])
             })
             .with_context(|| format!("write {}", target.display()))
@@ -661,11 +869,12 @@ mod linux_uring {
                     if write.content.is_empty() {
                         write.write_res = Some(0);
                     } else {
+                        let content = write.content.as_slice();
                         entries.push(
                             opcode::Write::new(
                                 types::Fd(fd),
-                                write.content.as_ptr(),
-                                write.content.len() as u32,
+                                content.as_ptr(),
+                                content.len() as u32,
                             )
                             .offset(0)
                             .build()
@@ -752,11 +961,12 @@ mod linux_uring {
                 if write.content.is_empty() {
                     in_flight[idx].write_res = Some(0);
                 } else {
+                    let content = write.content.as_slice();
                     entries.push(
                         opcode::Write::new(
                             types::Fixed(slot),
-                            write.content.as_ptr(),
-                            write.content.len() as u32,
+                            content.as_ptr(),
+                            content.len() as u32,
                         )
                         .offset(0)
                         .build()
