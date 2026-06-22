@@ -458,16 +458,26 @@ impl<'a> PackBuilder<'a> {
             batches.push(cur);
         }
 
-        let mut packs = Vec::with_capacity(batches.len());
-        for batch in batches {
-            // `undeltified` (`--window=0`): each object stored whole so the client
-            // can hand-parse blobs from the bytes (HEAD closure). Deltified packs
-            // are compact and only installed for the object DB (history); git
-            // resolves their deltas. Each pack is self-contained (non-thin).
-            let (pack_hash, pack_len, idx_hash, idx_len) =
-                self.pack_and_index_inner(&batch, undeltified)?;
-            packs.push((pack_hash, pack_len, idx_hash, idx_len));
-        }
+        // `undeltified` (`--window=0`): each object stored whole so the client
+        // can hand-parse blobs from the bytes (HEAD closure). Deltified packs are
+        // compact and only installed for the object DB (history); git resolves
+        // their deltas. Each pack is self-contained (non-thin).
+        //
+        // Undeltified packs are single-threaded + CPU-light, so pack the batches
+        // across cores. Deltified `pack-objects` is already git-internally
+        // threaded, so we keep those serial to avoid CPU oversubscription.
+        let packs: Vec<(String, u64, String, u64)> = if undeltified && batches.len() > 1 {
+            use rayon::prelude::*;
+            batches
+                .par_iter()
+                .map(|batch| self.pack_and_index_inner(batch, undeltified))
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            batches
+                .iter()
+                .map(|batch| self.pack_and_index_inner(batch, undeltified))
+                .collect::<Result<Vec<_>>>()?
+        };
         Ok((packs, total_raw))
     }
 

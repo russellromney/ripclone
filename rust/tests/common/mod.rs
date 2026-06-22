@@ -41,6 +41,16 @@ pub fn init(lsm: bool) {
                 "RIPCLONE_ORIGIN_BASE",
                 format!("file://{}", origin_root().display()),
             );
+            // Two-phase + async are on by default in production; legacy tests
+            // here expect synchronous single-phase builds (depth=0 ready as soon
+            // as sync returns). Pin them off unless a test opted in via
+            // enable_two_phase()/enable_async_build() (which run before init).
+            if std::env::var_os("RIPCLONE_TWO_PHASE").is_none() {
+                std::env::set_var("RIPCLONE_TWO_PHASE", "0");
+            }
+            if std::env::var_os("RIPCLONE_ASYNC_BUILD").is_none() {
+                std::env::set_var("RIPCLONE_ASYNC_BUILD", "0");
+            }
             if lsm {
                 std::env::set_var("RIPCLONE_LSM", "1");
                 std::env::set_var("RIPCLONE_LSM_SEAL_BYTES", "1");

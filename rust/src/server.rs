@@ -1847,19 +1847,21 @@ fn sized_to_tuple(p: &crate::SizedPack) -> (String, u64, String, u64) {
 }
 
 /// True when two-phase publish is enabled (publish depth=1 first, build full
-/// history in the background). Off by default.
+/// history in the background). On by default — the depth=1-first path is the
+/// largest lever for fast sync. Disable with `RIPCLONE_TWO_PHASE=0`.
 fn two_phase_enabled() -> bool {
     std::env::var("RIPCLONE_TWO_PHASE")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+        .unwrap_or(true)
 }
 
 /// True when `/sync` routes the build through the bounded background worker
-/// (survives client disconnect, rate-bounded). Off by default.
+/// (survives client disconnect, rate-bounded). On by default — disable with
+/// `RIPCLONE_ASYNC_BUILD=0`.
 fn async_build_enabled() -> bool {
     std::env::var("RIPCLONE_ASYNC_BUILD")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+        .unwrap_or(true)
 }
 
 fn env_bytes(key: &str, default: u64) -> u64 {

@@ -83,14 +83,6 @@ impl ArchiveBuilder {
             anyhow::bail!("mirror not found: {}", self.mirror.display());
         }
 
-        let mut compressor = match dictionary {
-            Some(dict) => Some(
-                zstd::bulk::Compressor::with_dictionary(level, dict)
-                    .context("create zstd compressor with dictionary")?,
-            ),
-            None => None,
-        };
-
         let repo = git2::Repository::open_bare(&self.mirror)
             .with_context(|| format!("open bare repo {}", self.mirror.display()))?;
         let oid = repo
@@ -109,8 +101,11 @@ impl ArchiveBuilder {
         let mut frame_raw: Vec<u8> = Vec::with_capacity(FRAME_TARGET);
         let mut raw_total: u64 = 0;
 
-        let mut chunks: Vec<Vec<u8>> = Vec::new();
-        let mut current_chunk: Vec<u8> = Vec::new();
+        // Collect the raw (uncompressed) frames during the walk; compression is
+        // done in parallel afterwards (frames are independent). The fragment
+        // geometry (frame_index + offset within a raw frame) is fixed here and
+        // is unaffected by compression.
+        let mut raw_frames: Vec<Vec<u8>> = Vec::new();
 
         let mut walk_err: Option<anyhow::Error> = None;
         tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
@@ -161,28 +156,6 @@ impl ArchiveBuilder {
             let content = blob.content();
             let mut fragments: Vec<Fragment> = Vec::new();
 
-            let mut flush = |manifest: &mut MetadataChunk,
-                             frame_raw: &mut Vec<u8>,
-                             frame_index: u32,
-                             current_chunk: &mut Vec<u8>,
-                             chunks: &mut Vec<Vec<u8>>,
-                             target_chunk_size: u64|
-             -> Result<u64> {
-                let mut chunk_index = chunks.len() as u32;
-                let size = flush_frame_to_chunk(
-                    manifest,
-                    frame_raw,
-                    frame_index,
-                    &mut chunk_index,
-                    current_chunk,
-                    chunks,
-                    target_chunk_size,
-                    level,
-                    &mut compressor,
-                )?;
-                Ok(size)
-            };
-
             if content.is_empty() {
                 // Empty files don't need any frame bytes, but we still record
                 // where they would have started so extraction can create them.
@@ -195,20 +168,7 @@ impl ArchiveBuilder {
                 // Big blobs get split into FRAME_MAX-sized frames. Flush any
                 // partial frame first so the split starts on a clean boundary.
                 if !frame_raw.is_empty() {
-                    match flush(
-                        &mut manifest,
-                        &mut frame_raw,
-                        frame_index,
-                        &mut current_chunk,
-                        &mut chunks,
-                        target_chunk_size,
-                    ) {
-                        Ok(_) => {}
-                        Err(e) => {
-                            walk_err = Some(e);
-                            return git2::TreeWalkResult::Skip;
-                        }
-                    }
+                    raw_frames.push(std::mem::take(&mut frame_raw));
                     frame_index += 1;
                 }
                 for chunk in content.chunks(FRAME_MAX) {
@@ -218,40 +178,14 @@ impl ArchiveBuilder {
                         raw_len: chunk.len() as u32,
                     });
                     frame_raw.extend_from_slice(chunk);
-                    match flush(
-                        &mut manifest,
-                        &mut frame_raw,
-                        frame_index,
-                        &mut current_chunk,
-                        &mut chunks,
-                        target_chunk_size,
-                    ) {
-                        Ok(_) => {}
-                        Err(e) => {
-                            walk_err = Some(e);
-                            return git2::TreeWalkResult::Skip;
-                        }
-                    }
+                    raw_frames.push(std::mem::take(&mut frame_raw));
                     frame_index += 1;
                 }
             } else {
                 // Normal files: keep frames around the target size, but let a
                 // single file grow the frame up to FRAME_MAX.
                 if !frame_raw.is_empty() && frame_raw.len() + content.len() > FRAME_TARGET {
-                    match flush(
-                        &mut manifest,
-                        &mut frame_raw,
-                        frame_index,
-                        &mut current_chunk,
-                        &mut chunks,
-                        target_chunk_size,
-                    ) {
-                        Ok(_) => {}
-                        Err(e) => {
-                            walk_err = Some(e);
-                            return git2::TreeWalkResult::Skip;
-                        }
-                    }
+                    raw_frames.push(std::mem::take(&mut frame_raw));
                     frame_index += 1;
                 }
                 fragments.push(Fragment {
@@ -261,20 +195,7 @@ impl ArchiveBuilder {
                 });
                 frame_raw.extend_from_slice(content);
                 if frame_raw.len() >= FRAME_TARGET {
-                    match flush(
-                        &mut manifest,
-                        &mut frame_raw,
-                        frame_index,
-                        &mut current_chunk,
-                        &mut chunks,
-                        target_chunk_size,
-                    ) {
-                        Ok(_) => {}
-                        Err(e) => {
-                            walk_err = Some(e);
-                            return git2::TreeWalkResult::Skip;
-                        }
-                    }
+                    raw_frames.push(std::mem::take(&mut frame_raw));
                     frame_index += 1;
                 }
             }
@@ -295,40 +216,64 @@ impl ArchiveBuilder {
             return Err(err).context("build archive from tree");
         }
 
+        // Flush the last partial frame.
         if !frame_raw.is_empty() {
-            let mut chunk_index = chunks.len() as u32;
-            flush_frame_to_chunk(
-                &mut manifest,
-                &mut frame_raw,
-                frame_index,
-                &mut chunk_index,
-                &mut current_chunk,
-                &mut chunks,
-                target_chunk_size,
-                level,
-                &mut compressor,
-            )?;
+            raw_frames.push(std::mem::take(&mut frame_raw));
         }
-
-        // Empty files record fragments pointing at a frame that may never have
-        // been flushed (e.g. an all-empty-blob commit or a trailing empty file).
-        // Create empty frames for any frame indices that are referenced but
-        // missing so the manifest geometry is self-consistent.
+        // Pad empty frames for any indices referenced by a fragment but never
+        // flushed (e.g. a trailing empty file), so the geometry is consistent.
         let max_frame_index = manifest
             .files
             .iter()
             .flat_map(|e| e.fragments.iter().map(|f| f.frame_index))
             .max()
-            .unwrap_or(0);
-        while manifest.frames.len() <= max_frame_index as usize {
+            .unwrap_or(0) as usize;
+        while raw_frames.len() <= max_frame_index {
+            raw_frames.push(Vec::new());
+        }
+
+        // Compress the frames in parallel — they are independent. Empty frames
+        // stay empty (compressed_len 0). The common path has no dictionary; a
+        // dictionary, when present, needs a per-frame compressor (cheap relative
+        // to compressing a multi-MB frame).
+        use rayon::prelude::*;
+        let compressed_frames: Vec<Vec<u8>> = raw_frames
+            .par_iter()
+            .map(|raw| -> Result<Vec<u8>> {
+                if raw.is_empty() {
+                    return Ok(Vec::new());
+                }
+                match dictionary {
+                    Some(dict) => zstd::bulk::Compressor::with_dictionary(level, dict)
+                        .context("create zstd compressor with dictionary")?
+                        .compress(raw)
+                        .context("zstd compress frame with dictionary"),
+                    None => zstd::encode_all(raw.as_slice(), level).context("zstd compress frame"),
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        // Assemble compressed frames into chunks of ~target_chunk_size, recording
+        // each frame's placement. Mirrors the previous inline chunk packing.
+        let mut chunks: Vec<Vec<u8>> = Vec::new();
+        let mut current_chunk: Vec<u8> = Vec::new();
+        for (i, compressed) in compressed_frames.iter().enumerate() {
+            if !current_chunk.is_empty()
+                && current_chunk.len() as u64 + compressed.len() as u64 > target_chunk_size
+            {
+                chunks.push(std::mem::take(&mut current_chunk));
+            }
             manifest.frames.push(FrameInfo {
                 chunk_index: chunks.len() as u32,
                 chunk_offset: current_chunk.len() as u64,
-                compressed_len: 0,
-                raw_len: 0,
+                compressed_len: compressed.len() as u32,
+                raw_len: raw_frames[i].len() as u32,
             });
+            current_chunk.extend_from_slice(compressed);
+            if current_chunk.len() as u64 >= target_chunk_size {
+                chunks.push(std::mem::take(&mut current_chunk));
+            }
         }
-
         if !current_chunk.is_empty() {
             chunks.push(current_chunk);
         }
@@ -460,64 +405,6 @@ impl ArchiveBuilder {
         }
         Ok((archive_chunk_hashes, metadata))
     }
-}
-
-fn flush_frame_to_chunk(
-    manifest: &mut MetadataChunk,
-    frame_raw: &mut Vec<u8>,
-    frame_index: u32,
-    chunk_index: &mut u32,
-    chunk: &mut Vec<u8>,
-    chunks: &mut Vec<Vec<u8>>,
-    target_chunk_size: u64,
-    level: i32,
-    compressor: &mut Option<zstd::bulk::Compressor<'static>>,
-) -> Result<u64> {
-    let compressed = match compressor {
-        Some(c) => c
-            .compress(frame_raw.as_slice())
-            .context("zstd compress frame with dictionary")?,
-        None => zstd::encode_all(frame_raw.as_slice(), level).context("zstd compress frame")?,
-    };
-
-    // Never let a single frame overflow the chunk target. If the current chunk
-    // is non-empty and adding this frame would exceed the cap, finalize it now.
-    if !chunk.is_empty() && chunk.len() as u64 + compressed.len() as u64 > target_chunk_size {
-        let finished = std::mem::take(chunk);
-        chunks.push(finished);
-        *chunk_index = chunks.len() as u32;
-    }
-
-    let chunk_offset = chunk.len() as u64;
-    let frame_info = FrameInfo {
-        chunk_index: *chunk_index,
-        chunk_offset,
-        compressed_len: compressed.len() as u32,
-        raw_len: frame_raw.len() as u32,
-    };
-
-    chunk.extend_from_slice(&compressed);
-
-    if frame_index as usize != manifest.frames.len() {
-        anyhow::bail!(
-            "frame index mismatch: {} vs {}",
-            frame_index,
-            manifest.frames.len()
-        );
-    }
-    manifest.frames.push(frame_info);
-
-    // Finalize the chunk as soon as it reaches the target so the next frame
-    // starts fresh.
-    if chunk.len() as u64 >= target_chunk_size {
-        let finished = std::mem::take(chunk);
-        chunks.push(finished);
-        *chunk_index = chunks.len() as u32;
-    }
-
-    let size = compressed.len() as u64;
-    frame_raw.clear();
-    Ok(size)
 }
 
 pub fn sha1_bytes(data: &[u8]) -> [u8; 20] {
@@ -686,6 +573,44 @@ mod tests {
                 target,
                 chunk.len()
             );
+        }
+    }
+
+    /// Round-trip across multiple frames: content larger than FRAME_MAX is split
+    /// into several frames, compressed in parallel, then must extract byte-exact.
+    /// Guards the parallel-compression + chunk-assembly refactor.
+    #[test]
+    fn archive_roundtrip_multiframe() {
+        let pr = |len: usize, seed: u8| {
+            (0..len)
+                .map(|i| (i.wrapping_mul(2654435761) as u8) ^ seed)
+                .collect::<Vec<u8>>()
+        };
+        let files: Vec<(&str, Vec<u8>)> = vec![
+            ("a.txt", b"hello world\n".to_vec()),
+            ("empty.txt", Vec::new()),
+            ("dir/small.bin", pr(4096, 9)),
+            ("dir/medium.bin", pr(7 * 1024 * 1024, 3)), // spans 2 frames
+            ("big.bin", pr(14 * 1024 * 1024, 7)),       // spans 3 frames
+            ("tail.txt", b"after the big blob\n".to_vec()),
+        ];
+        let files_ref: Vec<(&str, &[u8])> = files.iter().map(|(p, b)| (*p, b.as_slice())).collect();
+        let (tmp, commit) = commit_files(&files_ref);
+
+        let out = tempfile::tempdir().unwrap();
+        let arch = out.path().join("a.zst");
+        let man = out.path().join("a.manifest");
+        ArchiveBuilder::new(tmp.path())
+            .build(&commit, &arch, &man, 6, None)
+            .unwrap();
+
+        let dest = out.path().join("extracted");
+        std::fs::create_dir_all(&dest).unwrap();
+        crate::extract::extract_archive(&arch, &man, &dest, None, None).unwrap();
+
+        for (name, content) in &files {
+            let got = std::fs::read(dest.join(name)).unwrap_or_else(|e| panic!("read {name}: {e}"));
+            assert_eq!(&got, content, "roundtrip mismatch for {name}");
         }
     }
 }
