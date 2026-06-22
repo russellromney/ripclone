@@ -1032,10 +1032,10 @@ impl Client {
             .collect();
         let work_tree2 = work_tree.to_path_buf();
         tokio::task::spawn_blocking(move || {
-            crate::git::clear_skip_worktree_index(&work_tree2, &paths)
+            crate::git::clear_skip_worktree_index_and_refresh_stats(&work_tree2, &paths)
         })
         .await
-        .context("spawn clear skip-worktree")??;
+        .context("spawn clear skip-worktree and refresh index stats")??;
 
         // Install the multi-pack-index so git object lookups stay O(log) across
         // the many installed packs. Prefer the server-pregenerated MIDX (zero

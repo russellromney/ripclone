@@ -386,6 +386,22 @@ impl WorktreeWriter {
         )
     }
 
+    pub fn write_owned_entries_for_fresh_indexed_checkout(
+        &self,
+        target_dir: &Path,
+        writes: Vec<OwnedFileWrite>,
+    ) -> Result<usize> {
+        self.write_owned_entries_with_options(
+            target_dir,
+            writes,
+            WriteOptions {
+                parents_prepared: true,
+                stamp_mtime: false,
+                fresh_target: true,
+            },
+        )
+    }
+
     pub fn write_owned_entries_with_options(
         &self,
         target_dir: &Path,
