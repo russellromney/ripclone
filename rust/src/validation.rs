@@ -1,3 +1,5 @@
+#![allow(clippy::items_after_test_module)]
+
 use anyhow::Result;
 use axum::response::IntoResponse;
 

@@ -23,6 +23,10 @@ path = "src/bin/git-remote-ripclone.rs"
 name = "rcgit"
 path = "src/bin/rcgit.rs"
 
+[[bin]]
+name = "writer_bench"
+path = "src/bin/writer_bench.rs"
+
 [features]
 default = ["zlib-ng"]
 # Use zlib-ng for faster pack compression/decompression. Disable this feature
