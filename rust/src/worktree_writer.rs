@@ -717,6 +717,7 @@ mod linux_uring {
     static DIRECT_DESCRIPTOR_ENABLED_LOG: Once = Once::new();
     static DIRECT_DESCRIPTOR_FALLBACK_LOG: Once = Once::new();
     static SKIP_OPEN_CQE_ENABLED_LOG: Once = Once::new();
+    static SKIP_WRITE_CQE_ENABLED_LOG: Once = Once::new();
     static OPTIMIZED_RING_ENABLED_LOG: Once = Once::new();
     static OPTIMIZED_RING_FALLBACK_LOG: Once = Once::new();
 
@@ -745,6 +746,7 @@ mod linux_uring {
         fd: Option<i32>,
         open_res: Option<i32>,
         write_res: Option<i32>,
+        write_success_cqe_skipped: bool,
         statx_res: Option<i32>,
         close_res: Option<i32>,
     }
@@ -948,6 +950,7 @@ mod linux_uring {
                     fd: None,
                     open_res: None,
                     write_res: None,
+                    write_success_cqe_skipped: false,
                     statx_res: None,
                     close_res: None,
                 });
@@ -1110,6 +1113,15 @@ mod linux_uring {
                 .map(|_| unsafe { std::mem::zeroed() })
                 .collect();
             let mut entries = Vec::with_capacity(in_flight.len() * 4);
+            let mut skipped_success_cqes = 0usize;
+            let skip_write_success_cqe = self.skip_open_success_cqe && collect_stats;
+            if skip_write_success_cqe {
+                SKIP_WRITE_CQE_ENABLED_LOG.call_once(|| {
+                    tracing::info!(
+                        "io_uring successful direct-write CQEs will be skipped with statx size verification"
+                    )
+                });
+            }
             for idx in 0..in_flight.len() {
                 let slot = idx as u32;
                 let path_ptr = in_flight[idx].path.as_ptr();
@@ -1121,6 +1133,7 @@ mod linux_uring {
                 let mut open_flags = squeue::Flags::IO_LINK;
                 if self.skip_open_success_cqe {
                     open_flags |= squeue::Flags::SKIP_SUCCESS;
+                    skipped_success_cqes += 1;
                 }
                 entries.push(
                     opcode::OpenAt::new(types::Fd(libc::AT_FDCWD), path_ptr)
@@ -1134,17 +1147,22 @@ mod linux_uring {
                 if in_flight[idx].content.is_empty() {
                     in_flight[idx].write_res = Some(0);
                 } else {
-                    let content = in_flight[idx].content.as_slice();
+                    let (content_ptr, content_len) = {
+                        let content = in_flight[idx].content.as_slice();
+                        (content.as_ptr(), content.len() as u32)
+                    };
+                    let mut write_flags = squeue::Flags::IO_HARDLINK;
+                    if skip_write_success_cqe {
+                        write_flags |= squeue::Flags::SKIP_SUCCESS;
+                        in_flight[idx].write_success_cqe_skipped = true;
+                        skipped_success_cqes += 1;
+                    }
                     entries.push(
-                        opcode::Write::new(
-                            types::Fixed(slot),
-                            content.as_ptr(),
-                            content.len() as u32,
-                        )
-                        .offset(0)
-                        .build()
-                        .flags(squeue::Flags::IO_HARDLINK)
-                        .user_data(user_data(idx, FileOp::Write)),
+                        opcode::Write::new(types::Fixed(slot), content_ptr, content_len)
+                            .offset(0)
+                            .build()
+                            .flags(write_flags)
+                            .user_data(user_data(idx, FileOp::Write)),
                     );
                 }
                 if collect_stats {
@@ -1168,11 +1186,7 @@ mod linux_uring {
                 );
             }
 
-            let expected_completions = if self.skip_open_success_cqe {
-                entries.len() - in_flight.len()
-            } else {
-                entries.len()
-            };
+            let expected_completions = entries.len() - skipped_success_cqes;
             self.submit_entries(
                 &entries,
                 expected_completions,
@@ -1224,11 +1238,12 @@ mod linux_uring {
                 return Err(DirectWriteError::Unsupported(in_flight));
             }
 
-            for write in &in_flight {
+            for (idx, write) in in_flight.iter().enumerate() {
                 check_open_result(write).map_err(DirectWriteError::Other)?;
                 check_write_result(write).map_err(DirectWriteError::Other)?;
                 if collect_stats {
-                    check_statx_result(write).map_err(DirectWriteError::Other)?;
+                    let statx = &statx_buffers[idx];
+                    check_statx_result(write, statx).map_err(DirectWriteError::Other)?;
                 }
                 check_close_result(write).map_err(DirectWriteError::Other)?;
             }
@@ -1311,7 +1326,7 @@ mod linux_uring {
         ) -> Result<Vec<(usize, FileOp, i32)>> {
             let mut completions = Vec::with_capacity(min_expected);
             let mut closes = 0usize;
-            while closes < expected_closes {
+            while closes < expected_closes || completions.len() < min_expected {
                 {
                     let mut cq = self.ring.completion();
                     for cqe in &mut cq {
@@ -1322,7 +1337,7 @@ mod linux_uring {
                         completions.push((idx, op, cqe.result()));
                     }
                 }
-                if closes < expected_closes {
+                if closes < expected_closes || completions.len() < min_expected {
                     let remaining = min_expected.saturating_sub(completions.len()).max(1);
                     self.ring
                         .submitter()
@@ -1379,6 +1394,9 @@ mod linux_uring {
         if write.open_res.is_some_and(|res| res < 0) {
             return Ok(());
         }
+        if write.write_success_cqe_skipped && write.write_res.is_none() {
+            return Ok(());
+        }
         let res = write.write_res.ok_or_else(|| {
             anyhow::anyhow!("missing write completion for {}", write.target.display())
         })?;
@@ -1397,7 +1415,7 @@ mod linux_uring {
         Ok(())
     }
 
-    fn check_statx_result(write: &InFlightWrite) -> Result<()> {
+    fn check_statx_result(write: &InFlightWrite, statx: &libc::statx) -> Result<()> {
         if write.open_res.is_some_and(|res| res < 0) {
             return Ok(());
         }
@@ -1409,6 +1427,15 @@ mod linux_uring {
         })?;
         if res < 0 {
             Err(cqe_error(res)).with_context(|| format!("statx {}", write.target.display()))?;
+        }
+        let expected = write.content.len() as u64;
+        if statx.stx_size != expected {
+            anyhow::bail!(
+                "short io_uring write {}: file size {} after writing {} bytes",
+                write.target.display(),
+                statx.stx_size,
+                expected
+            );
         }
         Ok(())
     }
