@@ -867,23 +867,27 @@ impl Client {
         let worktree_writer = Arc::new(crate::worktree_writer::WorktreeWriter::new()?);
 
         // Download and extraction are decoupled stages with independent
-        // concurrency. Downloads are network-bound (fill the link); extraction
-        // is disk/CPU-bound, and file creation blocks on syscalls, so ~2x cores
-        // is the sweet spot (oversubscribing past that loses to filesystem
-        // contention). Both default to 2x the core count, env-overridable.
+        // concurrency. POSIX performed best at one fetch/write worker per core;
+        // io_uring benefits from one fetch worker and two write workers per
+        // core because each writer can submit larger batched windows.
         let cores = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4);
-        let default_par = (cores * 2).max(1);
+        let default_download_conc = cores.max(1);
+        let default_write_conc = if worktree_writer.is_io_uring() {
+            (cores * 2).max(1)
+        } else {
+            cores.max(1)
+        };
         let download_conc: usize = std::env::var("RIPCLONE_FETCH_CONCURRENCY")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(default_par)
+            .unwrap_or(default_download_conc)
             .max(1);
         let write_conc: usize = std::env::var("RIPCLONE_WRITE_THREADS")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(default_par)
+            .unwrap_or(default_write_conc)
             .max(1);
 
         // Signed URLs (one per pack/idx, matching manifest.packs order). Empty

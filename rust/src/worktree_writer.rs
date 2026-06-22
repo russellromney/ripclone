@@ -275,6 +275,14 @@ impl WorktreeWriter {
         }
     }
 
+    pub fn is_io_uring(&self) -> bool {
+        match &self.backend {
+            WriterBackend::Posix => false,
+            #[cfg(target_os = "linux")]
+            WriterBackend::IoUring(_) => true,
+        }
+    }
+
     fn auto() -> Result<Self> {
         #[cfg(target_os = "linux")]
         {
@@ -663,6 +671,8 @@ mod linux_uring {
     const MAX_BATCH_FILES: usize = 256;
     static DIRECT_DESCRIPTOR_ENABLED_LOG: Once = Once::new();
     static DIRECT_DESCRIPTOR_FALLBACK_LOG: Once = Once::new();
+    static OPTIMIZED_RING_ENABLED_LOG: Once = Once::new();
+    static OPTIMIZED_RING_FALLBACK_LOG: Once = Once::new();
 
     #[derive(Clone, Copy)]
     pub(super) struct UringWriter;
@@ -772,7 +782,7 @@ mod linux_uring {
 
     impl RawUringWriter {
         fn new() -> Result<Self> {
-            let ring = IoUring::new(QUEUE_DEPTH).context("initialize io_uring queue")?;
+            let ring = Self::new_ring().context("initialize io_uring queue")?;
             let descriptor_mode = match ring
                 .submitter()
                 .register_files_sparse(MAX_BATCH_FILES as u32)
@@ -793,6 +803,32 @@ mod linux_uring {
                 ring,
                 descriptor_mode,
             })
+        }
+
+        fn new_ring() -> io::Result<IoUring> {
+            let mut builder = IoUring::builder();
+            builder
+                .setup_single_issuer()
+                .setup_defer_taskrun()
+                .setup_coop_taskrun();
+            match builder.build(QUEUE_DEPTH) {
+                Ok(ring) => {
+                    OPTIMIZED_RING_ENABLED_LOG.call_once(|| {
+                        tracing::info!(
+                            "io_uring optimized single-issuer/defer-taskrun ring enabled"
+                        )
+                    });
+                    Ok(ring)
+                }
+                Err(e) => {
+                    OPTIMIZED_RING_FALLBACK_LOG.call_once(|| {
+                        tracing::debug!(
+                            "io_uring optimized ring setup unavailable; using default setup: {e}"
+                        )
+                    });
+                    IoUring::new(QUEUE_DEPTH)
+                }
+            }
         }
 
         fn write_regular_batch(&mut self, mut writes: Vec<PreparedRegularWrite>) -> Result<()> {
@@ -868,7 +904,7 @@ mod linux_uring {
                         .user_data(user_data(idx, FileOp::Open)),
                 );
             }
-            self.submit_entries(&entries, "submit io_uring open batch")?;
+            self.submit_entries(&entries, entries.len(), "submit io_uring open batch")?;
             for (idx, op, res) in
                 self.collect_completions(entries.len(), "wait for io_uring open batch completion")?
             {
@@ -911,7 +947,11 @@ mod linux_uring {
                 }
             }
             if !entries.is_empty() {
-                if let Err(e) = self.submit_entries(&entries, "submit io_uring write/close batch") {
+                if let Err(e) = self.submit_entries(
+                    &entries,
+                    entries.len(),
+                    "submit io_uring write/close batch",
+                ) {
                     close_open_fds_sync(&mut in_flight);
                     return Err(e);
                 }
@@ -1002,8 +1042,12 @@ mod linux_uring {
                 );
             }
 
-            self.submit_entries(&entries, "submit io_uring direct open/write/close batch")
-                .map_err(DirectWriteError::Other)?;
+            self.submit_entries(
+                &entries,
+                entries.len(),
+                "submit io_uring direct open/write/close batch",
+            )
+            .map_err(DirectWriteError::Other)?;
             let completions = self
                 .collect_completions(
                     entries.len(),
@@ -1040,7 +1084,12 @@ mod linux_uring {
             Ok(())
         }
 
-        fn submit_entries(&mut self, entries: &[squeue::Entry], context: &str) -> Result<()> {
+        fn submit_entries(
+            &mut self,
+            entries: &[squeue::Entry],
+            wait_for: usize,
+            context: &str,
+        ) -> Result<()> {
             if entries.is_empty() {
                 return Ok(());
             }
@@ -1051,10 +1100,17 @@ mod linux_uring {
                         .map_err(|_| anyhow::anyhow!("io_uring submission queue is full"))?;
                 }
             }
-            self.ring
-                .submitter()
-                .submit_and_wait(1)
-                .with_context(|| context.to_string())?;
+            if wait_for == 0 {
+                self.ring
+                    .submitter()
+                    .submit()
+                    .with_context(|| context.to_string())?;
+            } else {
+                self.ring
+                    .submitter()
+                    .submit_and_wait(wait_for)
+                    .with_context(|| context.to_string())?;
+            }
             Ok(())
         }
 
@@ -1073,9 +1129,10 @@ mod linux_uring {
                     }
                 }
                 if completions.len() < expected {
+                    let remaining = expected - completions.len();
                     self.ring
                         .submitter()
-                        .submit_and_wait(1)
+                        .submit_and_wait(remaining)
                         .with_context(|| context.to_string())?;
                 }
             }
