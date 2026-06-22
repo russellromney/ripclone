@@ -38,7 +38,7 @@ pub async fn lazy_clone(
 
     let t0 = Instant::now();
     let info = client
-        .resolve_ref_with_clonepack(owner, repo, branch, clonepack)
+        .resolve_ref_with_clonepack(owner, repo, branch, clonepack, None)
         .await?;
     if info.clonepack_manifest.is_empty() {
         anyhow::bail!("ref is missing clonepack manifest; run sync first");
