@@ -62,7 +62,7 @@ This file tracks what has already landed in ripclone. For upcoming work see `ROA
   - Client `fetch_chunk_refs` downloads chunks concurrently with configurable `RIPCLONE_FETCH_CONCURRENCY`.
   - Old single-pack manifests are still parsed for compatibility.
 
-- **Fixed `scripts/benchmark_remote.sh` manifest parsing**
+- **Fixed `benchmark/remote.sh` manifest parsing**
   - The script no longer stores binary protobuf in a shell variable, which corrupted the data and reported `archive chunks: 1`.
   - It now writes the clonepack manifest to a temp file and reports archive-chunk and head-blobs-chunk counts correctly.
 
@@ -83,7 +83,7 @@ This file tracks what has already landed in ripclone. For upcoming work see `ROA
   - `should_use_overlay` was using only the last archive chunk's size as the compressed estimate.
   - It now sums `compressed_len` across all frames, which equals the total compressed archive size.
 
-- **Fixed benchmark cleanup** (`scripts/benchmark_archive.sh`, `scripts/benchmark_latency.sh`, `scripts/benchmark_remote.sh`, `scripts/e2e_clonepack.sh`)
+- **Fixed benchmark cleanup** (`benchmark/archive.sh`, `benchmark/latency.sh`, `benchmark/remote.sh`, `scripts/e2e_clonepack.sh`)
   - Added overlay unmount and `/dev/shm/ripclone-overlay-*` cleanup so repeated local runs do not fall back to rootfs.
   - Removed undefined `frame_count` references from benchmark summaries.
 
@@ -357,7 +357,7 @@ This file tracks what has already landed in ripclone. For upcoming work see `ROA
     re-extraction, corruption detection, and missing-manifest failure.
 
 - **Benchmarks**
-  - `scripts/benchmark_archive.sh` compares zstd levels and extracts level 6.
+  - `benchmark/archive.sh` compares zstd levels and extracts level 6.
   - Measured on macOS and in a Linux Docker container (io_uring path).
 
 ## Parallel downloads, streaming extraction, and range requests
@@ -419,7 +419,7 @@ This file tracks what has already landed in ripclone. For upcoming work see `ROA
 
 - **Updated scripts**
   - `scripts/e2e_archive.sh` now tests the direct-install path end-to-end.
-  - `scripts/benchmark_archive.sh` reports artifact sizes and install time.
+  - `benchmark/archive.sh` reports artifact sizes and install time.
 
 ## Removed / reversed
 

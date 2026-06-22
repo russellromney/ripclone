@@ -3,8 +3,8 @@
 
 Use it to simulate a remote ripclone server without leaving your laptop:
 
-  python3 scripts/latency_proxy.py 127.0.0.1:8000 127.0.0.1:9000 0.05
-  python3 scripts/latency_proxy.py 127.0.0.1:8000 127.0.0.1:9000 0.01 1000
+  python3 benchmark/latency_proxy.py 127.0.0.1:8000 127.0.0.1:9000 0.05
+  python3 benchmark/latency_proxy.py 127.0.0.1:8000 127.0.0.1:9000 0.01 1000
 
 The proxy listens on the first address and forwards to the second. It sleeps
 for `latency` seconds before forwarding the request and again before sending
