@@ -607,6 +607,12 @@ impl Client {
         let metadata = Arc::new(metadata);
         bench.mark_manifest();
         bench.add_bytes(metadata_bytes(&metadata), 0);
+        if mode.needs_archive() && !metadata.files.is_empty() && manifest.archive_chunks.is_empty()
+        {
+            anyhow::bail!(
+                "selected clonepack has no archive chunks for files mode; rerun sync or request a clonepack variant with archive chunks"
+            );
+        }
 
         // 5. Decide where to install (temp dir, possibly overlay).
         let staging_dir = overlay::staging_dir();
@@ -1279,69 +1285,41 @@ impl Client {
             let mut total_bytes = 0u64;
             let mut handles = Vec::new();
 
-            if signed_urls.is_empty() {
-                // No signed URLs (e.g. local storage backend). Wait for the
-                // manifest so we have the chunk hashes, then fetch through the
-                // gateway.
-                manifest_ready.notified().await;
-                let manifest = manifest_slot
-                    .lock()
-                    .await
-                    .clone()
-                    .context("manifest missing after notify")?;
-                for (index, chunk_ref) in manifest.archive_chunks.iter().cloned().enumerate() {
-                    let client = self.clone();
-                    let tx = tx.clone();
-                    let handle = tokio::spawn(async move {
-                        let bytes = client
+            // Wait until the manifest is available so the downloader follows
+            // the manifest's chunk table, not a possibly stale signed URL list.
+            manifest_ready.notified().await;
+            let manifest = manifest_slot
+                .lock()
+                .await
+                .clone()
+                .context("manifest missing after notify")?;
+            for (index, chunk_ref) in manifest.archive_chunks.iter().cloned().enumerate() {
+                let client = self.clone();
+                let tx = tx.clone();
+                let signed_url = signed_urls.get(index).cloned().flatten();
+                let handle = tokio::spawn(async move {
+                    let bytes = match client
+                        .fetch_chunk_ref(&chunk_ref, signed_url.as_deref())
+                        .await
+                    {
+                        Ok(bytes) => bytes,
+                        Err(e) if signed_url.is_some() => client
                             .fetch_chunk_ref(&chunk_ref, None)
                             .await
                             .with_context(|| {
-                                format!("fetch archive chunk {} via gateway", index)
-                            })?;
-                        let len = bytes.len() as u64;
-                        tx.send((index, Ok(bytes))).map_err(|_| {
-                            anyhow::anyhow!("archive chunk {} receiver dropped", index)
-                        })?;
-                        Ok::<u64, anyhow::Error>(len)
-                    });
-                    handles.push(handle);
-                }
-            } else {
-                for (index, signed_url) in signed_urls.into_iter().enumerate() {
-                    let client = self.clone();
-                    let manifest_slot = Arc::clone(&manifest_slot);
-                    let manifest_ready = Arc::clone(&manifest_ready);
-                    let tx = tx.clone();
-                    let handle = tokio::spawn(async move {
-                        // Wait until the manifest is available so we know the
-                        // expected content hash and length for this chunk.
-                        manifest_ready.notified().await;
-                        let manifest = manifest_slot
-                            .lock()
-                            .await
-                            .clone()
-                            .context("manifest missing after notify")?;
-                        let chunk_ref =
-                            manifest
-                                .archive_chunks
-                                .get(index)
-                                .cloned()
-                                .with_context(|| {
-                                    format!("archive chunk {} missing from manifest", index)
-                                })?;
-                        let bytes = client
-                            .fetch_chunk_ref(&chunk_ref, signed_url.as_deref())
-                            .await
-                            .with_context(|| format!("fetch archive chunk {}", index))?;
-                        let len = bytes.len() as u64;
-                        tx.send((index, Ok(bytes))).map_err(|_| {
-                            anyhow::anyhow!("archive chunk {} receiver dropped", index)
-                        })?;
-                        Ok::<u64, anyhow::Error>(len)
-                    });
-                    handles.push(handle);
-                }
+                                format!(
+                                    "fetch archive chunk {} via gateway after signed URL failed: {e:#}",
+                                    index
+                                )
+                            })?,
+                        Err(e) => return Err(e).with_context(|| format!("fetch archive chunk {}", index)),
+                    };
+                    let len = bytes.len() as u64;
+                    tx.send((index, Ok(bytes)))
+                        .map_err(|_| anyhow::anyhow!("archive chunk {} receiver dropped", index))?;
+                    Ok::<u64, anyhow::Error>(len)
+                });
+                handles.push(handle);
             }
 
             drop(tx);

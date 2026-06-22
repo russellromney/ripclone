@@ -1,6 +1,6 @@
 use crate::git;
 use crate::manifest::{FileEntry, FrameInfo, MetadataChunk as Manifest};
-use crate::worktree_writer::{OwnedFileWrite, WorktreeWriter};
+use crate::worktree_writer::{FileWriteContent, OwnedFileWrite, WorktreeWriter};
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, bounded};
 use filetime::{FileTime, set_file_mtime, set_symlink_file_times};
@@ -399,8 +399,14 @@ where
         let dictionary2 = dictionary.clone();
         let blob_pack_tx2 = blob_pack_tx.clone();
         std::thread::spawn(move || {
+            let writer = target_dir2.as_ref().map(|_| WorktreeWriter::new());
             while let Ok((idx, res)) = compressed_rx.recv() {
                 let result: Result<usize> = (|| {
+                    let writer = match writer.as_ref() {
+                        Some(Ok(writer)) => Some(writer),
+                        Some(Err(e)) => anyhow::bail!("create worktree writer: {e:#}"),
+                        None => None,
+                    };
                     let compressed = res?;
                     let frame = &manifest2.frames[idx];
                     // Empty frames (produced by empty files) have no compressed
@@ -438,6 +444,8 @@ where
                         .cloned()
                         .unwrap_or_default();
                     let mut written = 0usize;
+                    let mut pending_writes: Vec<OwnedFileWrite> =
+                        Vec::with_capacity(PACK_WRITE_BATCH_FILES);
                     for (file_idx, frag_idx) in &pairs {
                         let entry = &manifest2.files[*file_idx];
                         let fragment = &entry.fragments[*frag_idx];
@@ -471,8 +479,17 @@ where
                                 .context("blob pack builder closed")?;
                             }
                             if let Some(ref target_dir) = target_dir2 {
-                                write_entry(target_dir, entry, content)?;
-                                written += 1;
+                                pending_writes.push(OwnedFileWrite {
+                                    entry: entry.clone(),
+                                    content: FileWriteContent::shared(Arc::clone(&raw), off, len),
+                                });
+                                if pending_writes.len() >= PACK_WRITE_BATCH_FILES {
+                                    written += flush_archive_writes(
+                                        writer,
+                                        Some(target_dir),
+                                        &mut pending_writes,
+                                    )?;
+                                }
                             }
                         } else {
                             let mut guard = pending_files2.lock().unwrap();
@@ -498,21 +515,44 @@ where
                                         String::from_utf8_lossy(&entry.path)
                                     );
                                 }
-                                if let Some(ref target_dir) = target_dir2 {
-                                    write_entry(target_dir, entry, &full)?;
-                                    written += 1;
-                                }
                                 if let Some(ref tx) = blob_pack_tx2 {
+                                    if let Some(ref target_dir) = target_dir2 {
+                                        pending_writes.push(OwnedFileWrite {
+                                            entry: entry.clone(),
+                                            content: full.clone().into(),
+                                        });
+                                        if pending_writes.len() >= PACK_WRITE_BATCH_FILES {
+                                            written += flush_archive_writes(
+                                                writer,
+                                                Some(target_dir),
+                                                &mut pending_writes,
+                                            )?;
+                                        }
+                                    }
                                     let sha1 = blob_sha1_to_array(&entry.blob_sha1)?;
                                     tx.send(crate::blob_pack::BlobPackInput::Owned {
                                         sha1,
                                         content: full,
                                     })
                                     .context("blob pack builder closed")?;
+                                } else if let Some(ref target_dir) = target_dir2 {
+                                    pending_writes.push(OwnedFileWrite {
+                                        entry: entry.clone(),
+                                        content: full.into(),
+                                    });
+                                    if pending_writes.len() >= PACK_WRITE_BATCH_FILES {
+                                        written += flush_archive_writes(
+                                            writer,
+                                            Some(target_dir),
+                                            &mut pending_writes,
+                                        )?;
+                                    }
                                 }
                             }
                         }
                     }
+                    written +=
+                        flush_archive_writes(writer, target_dir2.as_ref(), &mut pending_writes)?;
                     Ok(written)
                 })();
                 if done_tx.send(result).is_err() {
@@ -771,6 +811,19 @@ fn write_entry(target_dir: &Path, entry: &FileEntry, content: &[u8]) -> Result<(
     Ok(())
 }
 
+fn flush_archive_writes(
+    writer: Option<&WorktreeWriter>,
+    target_dir: Option<&PathBuf>,
+    pending_writes: &mut Vec<OwnedFileWrite>,
+) -> Result<usize> {
+    if pending_writes.is_empty() {
+        return Ok(0);
+    }
+    let writer = writer.expect("archive writes only queued when target_dir is present");
+    let target_dir = target_dir.expect("archive writes only queued when target_dir is present");
+    writer.write_owned_entries_in_prepared_dirs(target_dir, std::mem::take(pending_writes))
+}
+
 /// Default compressed chunk size for streaming extractions. A chunk contains
 /// one or more consecutive frames fetched with a single HTTP range request.
 /// 6 MiB is a middle ground: big enough to amortize per-request overhead on
@@ -1008,8 +1061,14 @@ pub fn extract_archive_from_chunk_receiver(
         let dictionary2 = dictionary.clone();
         let blob_pack_tx2 = blob_pack_tx.clone();
         std::thread::spawn(move || {
+            let writer = target_dir2.as_ref().map(|_| WorktreeWriter::new());
             while let Ok((idx, res)) = compressed_rx.recv() {
                 let result: Result<usize> = (|| {
+                    let writer = match writer.as_ref() {
+                        Some(Ok(writer)) => Some(writer),
+                        Some(Err(e)) => anyhow::bail!("create worktree writer: {e:#}"),
+                        None => None,
+                    };
                     let compressed = res?;
                     let frame = &manifest2.frames[idx];
                     let raw: Arc<Vec<u8>> =
@@ -1045,6 +1104,8 @@ pub fn extract_archive_from_chunk_receiver(
                         .cloned()
                         .unwrap_or_default();
                     let mut written = 0usize;
+                    let mut pending_writes: Vec<OwnedFileWrite> =
+                        Vec::with_capacity(PACK_WRITE_BATCH_FILES);
                     for (file_idx, frag_idx) in &pairs {
                         let entry = &manifest2.files[*file_idx];
                         let fragment = &entry.fragments[*frag_idx];
@@ -1078,8 +1139,17 @@ pub fn extract_archive_from_chunk_receiver(
                                 .context("blob pack builder closed")?;
                             }
                             if let Some(ref target_dir) = target_dir2 {
-                                write_entry(target_dir, entry, content)?;
-                                written += 1;
+                                pending_writes.push(OwnedFileWrite {
+                                    entry: entry.clone(),
+                                    content: FileWriteContent::shared(Arc::clone(&raw), off, len),
+                                });
+                                if pending_writes.len() >= PACK_WRITE_BATCH_FILES {
+                                    written += flush_archive_writes(
+                                        writer,
+                                        Some(target_dir),
+                                        &mut pending_writes,
+                                    )?;
+                                }
                             }
                         } else {
                             let mut guard = pending_files2.lock().unwrap();
@@ -1105,21 +1175,44 @@ pub fn extract_archive_from_chunk_receiver(
                                         String::from_utf8_lossy(&entry.path)
                                     );
                                 }
-                                if let Some(ref target_dir) = target_dir2 {
-                                    write_entry(target_dir, entry, &full)?;
-                                    written += 1;
-                                }
                                 if let Some(ref tx) = blob_pack_tx2 {
+                                    if let Some(ref target_dir) = target_dir2 {
+                                        pending_writes.push(OwnedFileWrite {
+                                            entry: entry.clone(),
+                                            content: full.clone().into(),
+                                        });
+                                        if pending_writes.len() >= PACK_WRITE_BATCH_FILES {
+                                            written += flush_archive_writes(
+                                                writer,
+                                                Some(target_dir),
+                                                &mut pending_writes,
+                                            )?;
+                                        }
+                                    }
                                     let sha1 = blob_sha1_to_array(&entry.blob_sha1)?;
                                     tx.send(crate::blob_pack::BlobPackInput::Owned {
                                         sha1,
                                         content: full,
                                     })
                                     .context("blob pack builder closed")?;
+                                } else if let Some(ref target_dir) = target_dir2 {
+                                    pending_writes.push(OwnedFileWrite {
+                                        entry: entry.clone(),
+                                        content: full.into(),
+                                    });
+                                    if pending_writes.len() >= PACK_WRITE_BATCH_FILES {
+                                        written += flush_archive_writes(
+                                            writer,
+                                            Some(target_dir),
+                                            &mut pending_writes,
+                                        )?;
+                                    }
                                 }
                             }
                         }
                     }
+                    written +=
+                        flush_archive_writes(writer, target_dir2.as_ref(), &mut pending_writes)?;
                     Ok(written)
                 })();
                 if done_tx.send(result).is_err() {

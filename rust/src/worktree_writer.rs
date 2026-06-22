@@ -802,6 +802,8 @@ mod linux_uring {
     static SKIP_WRITE_CQE_ENABLED_LOG: Once = Once::new();
     static OPTIMIZED_RING_ENABLED_LOG: Once = Once::new();
     static OPTIMIZED_RING_FALLBACK_LOG: Once = Once::new();
+    static SQPOLL_RING_ENABLED_LOG: Once = Once::new();
+    static SQPOLL_RING_FALLBACK_LOG: Once = Once::new();
 
     #[derive(Clone, Copy)]
     pub(super) struct UringWriter;
@@ -1001,6 +1003,30 @@ mod linux_uring {
         }
 
         fn new_ring() -> io::Result<IoUring> {
+            let use_sqpoll = std::env::var("RIPCLONE_IO_URING_SQPOLL")
+                .ok()
+                .is_some_and(|value| {
+                    matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES")
+                });
+            if use_sqpoll {
+                let mut builder = IoUring::builder();
+                builder.setup_sqpoll(1_000);
+                match builder.build(QUEUE_DEPTH) {
+                    Ok(ring) => {
+                        SQPOLL_RING_ENABLED_LOG
+                            .call_once(|| tracing::info!("io_uring SQPOLL ring enabled"));
+                        return Ok(ring);
+                    }
+                    Err(e) => {
+                        SQPOLL_RING_FALLBACK_LOG.call_once(|| {
+                            tracing::debug!(
+                                "io_uring SQPOLL ring setup unavailable; using non-SQPOLL ring: {e}"
+                            )
+                        });
+                    }
+                }
+            }
+
             let mut builder = IoUring::builder();
             builder
                 .setup_single_issuer()
