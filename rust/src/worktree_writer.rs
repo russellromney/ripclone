@@ -181,6 +181,11 @@ pub enum FileWriteContent {
     },
 }
 
+pub struct WriteOutcome {
+    pub written: usize,
+    pub stats: Vec<crate::git::MaterializedPathStat>,
+}
+
 impl FileWriteContent {
     pub fn shared(data: Arc<Vec<u8>>, offset: usize, len: usize) -> Self {
         Self::Shared { data, offset, len }
@@ -213,6 +218,7 @@ impl From<Vec<u8>> for FileWriteContent {
 
 struct PreparedRegularWrite {
     target: PathBuf,
+    index_path: String,
     mode: u32,
     content: FileWriteContent,
 }
@@ -337,6 +343,7 @@ impl WorktreeWriter {
         writes: Vec<OwnedFileWrite>,
     ) -> Result<usize> {
         self.write_owned_entries_with_options(target_dir, writes, WriteOptions::default())
+            .map(|outcome| outcome.written)
     }
 
     pub fn write_owned_entries_in_prepared_dirs(
@@ -352,6 +359,7 @@ impl WorktreeWriter {
                 ..WriteOptions::default()
             },
         )
+        .map(|outcome| outcome.written)
     }
 
     pub fn write_owned_entries_for_archive(
@@ -368,6 +376,7 @@ impl WorktreeWriter {
                 fresh_target: true,
             },
         )
+        .map(|outcome| outcome.written)
     }
 
     pub fn write_owned_entries_for_fresh_checkout(
@@ -384,13 +393,14 @@ impl WorktreeWriter {
                 ..WriteOptions::default()
             },
         )
+        .map(|outcome| outcome.written)
     }
 
     pub fn write_owned_entries_for_fresh_indexed_checkout(
         &self,
         target_dir: &Path,
         writes: Vec<OwnedFileWrite>,
-    ) -> Result<usize> {
+    ) -> Result<WriteOutcome> {
         self.write_owned_entries_with_options(
             target_dir,
             writes,
@@ -407,9 +417,12 @@ impl WorktreeWriter {
         target_dir: &Path,
         writes: Vec<OwnedFileWrite>,
         options: WriteOptions,
-    ) -> Result<usize> {
+    ) -> Result<WriteOutcome> {
         if writes.is_empty() {
-            return Ok(0);
+            return Ok(WriteOutcome {
+                written: 0,
+                stats: Vec::new(),
+            });
         }
 
         let prep_start = Instant::now();
@@ -454,6 +467,7 @@ impl WorktreeWriter {
                     };
                     regulars.push(PreparedRegularWrite {
                         target,
+                        index_path: String::from_utf8_lossy(&write.entry.path).into_owned(),
                         mode,
                         content: write.content,
                     });
@@ -470,8 +484,8 @@ impl WorktreeWriter {
         }
 
         record_prep(prep_start.elapsed());
-        self.write_regular_batch(regulars, options)?;
-        Ok(written)
+        let stats = self.write_regular_batch(regulars, options)?;
+        Ok(WriteOutcome { written, stats })
     }
 
     fn write_entry_inner(
@@ -525,7 +539,9 @@ impl WorktreeWriter {
 
     fn write_regular(&self, target: &Path, mode: u32, content: RegularContent<'_>) -> Result<()> {
         match &self.backend {
-            WriterBackend::Posix => write_regular_posix(target, mode, content.as_slice()),
+            WriterBackend::Posix => {
+                write_regular_posix(target, mode, content.as_slice()).map(|_| ())
+            }
             #[cfg(target_os = "linux")]
             WriterBackend::IoUring(writer) => match content {
                 RegularContent::Borrowed(content) => writer.write_regular(target, mode, content),
@@ -538,19 +554,20 @@ impl WorktreeWriter {
         &self,
         writes: Vec<PreparedRegularWrite>,
         options: WriteOptions,
-    ) -> Result<()> {
+    ) -> Result<Vec<crate::git::MaterializedPathStat>> {
         if writes.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let files = writes.len() as u64;
         let bytes: u64 = writes.iter().map(|w| w.content.len() as u64).sum();
+        let collect_stats = !options.stamp_mtime;
         match &self.backend {
             WriterBackend::Posix => {
                 // Write every file first, then stamp mtimes, so the two phases
                 // are measured separately and the shape matches the io_uring
                 // backend (batched writes followed by a serial utimensat loop).
                 let io_start = Instant::now();
-                write_regular_batch_posix(&writes)?;
+                let stats = write_regular_batch_posix(&writes, collect_stats)?;
                 record_io(io_start.elapsed(), files, bytes);
 
                 if options.stamp_mtime {
@@ -561,17 +578,17 @@ impl WorktreeWriter {
                     }
                     record_mtime(mtime_start.elapsed());
                 }
-                Ok(())
+                Ok(stats)
             }
             #[cfg(target_os = "linux")]
             WriterBackend::IoUring(writer) => {
                 let targets: Vec<_> = writes.iter().map(|write| write.target.clone()).collect();
                 let io_start = Instant::now();
-                if should_use_posix_for_io_uring_batch(&writes) {
-                    write_regular_batch_posix(&writes)?;
+                let stats = if should_use_posix_for_io_uring_batch(&writes) {
+                    write_regular_batch_posix(&writes, collect_stats)?
                 } else {
-                    writer.write_regular_batch(writes)?;
-                }
+                    writer.write_regular_batch(writes, collect_stats)?
+                };
                 record_io(io_start.elapsed(), files, bytes);
 
                 if options.stamp_mtime {
@@ -582,7 +599,7 @@ impl WorktreeWriter {
                     }
                     record_mtime(mtime_start.elapsed());
                 }
-                Ok(())
+                Ok(stats)
             }
         }
     }
@@ -607,11 +624,21 @@ impl<'a> RegularContent<'a> {
     }
 }
 
-fn write_regular_batch_posix(writes: &[PreparedRegularWrite]) -> Result<()> {
+fn write_regular_batch_posix(
+    writes: &[PreparedRegularWrite],
+    collect_stats: bool,
+) -> Result<Vec<crate::git::MaterializedPathStat>> {
+    let mut stats = Vec::new();
     for write in writes {
-        write_regular_posix(&write.target, write.mode, write.content.as_slice())?;
+        let metadata = write_regular_posix(&write.target, write.mode, write.content.as_slice())?;
+        if collect_stats {
+            stats.push(crate::git::materialized_path_stat_from_metadata(
+                write.index_path.clone(),
+                &metadata,
+            ));
+        }
     }
-    Ok(())
+    Ok(stats)
 }
 
 fn write_symlink_entry(target: &Path, path_bytes: &[u8], content: &[u8]) -> Result<()> {
@@ -643,7 +670,7 @@ fn write_symlink_entry(target: &Path, path_bytes: &[u8], content: &[u8]) -> Resu
     Ok(())
 }
 
-fn write_regular_posix(target: &Path, mode: u32, content: &[u8]) -> Result<()> {
+fn write_regular_posix(target: &Path, mode: u32, content: &[u8]) -> Result<std::fs::Metadata> {
     if target.exists() {
         std::fs::remove_file(target).ok();
     }
@@ -664,12 +691,14 @@ fn write_regular_posix(target: &Path, mode: u32, content: &[u8]) -> Result<()> {
             .with_context(|| format!("open {}", target.display()))?;
         file.write_all(content)
             .with_context(|| format!("write {}", target.display()))?;
+        file.metadata()
+            .with_context(|| format!("stat {}", target.display()))
     }
     #[cfg(not(unix))]
     {
         std::fs::write(target, content).with_context(|| format!("write {}", target.display()))?;
+        std::fs::metadata(target).with_context(|| format!("stat {}", target.display()))
     }
-    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -708,6 +737,7 @@ mod linux_uring {
 
     struct InFlightWrite {
         target: PathBuf,
+        index_path: String,
         path: CString,
         flags: i32,
         mode: libc::mode_t,
@@ -715,6 +745,7 @@ mod linux_uring {
         fd: Option<i32>,
         open_res: Option<i32>,
         write_res: Option<i32>,
+        statx_res: Option<i32>,
         close_res: Option<i32>,
     }
 
@@ -723,6 +754,7 @@ mod linux_uring {
         Open = 0,
         Write = 1,
         Close = 2,
+        Statx = 3,
     }
 
     thread_local! {
@@ -748,20 +780,30 @@ mod linux_uring {
                 std::fs::remove_file(target).ok();
             }
             with_thread_writer(|writer| {
-                writer.write_regular_batch(vec![PreparedRegularWrite {
-                    target: target.to_path_buf(),
-                    mode,
-                    content: content.into(),
-                }])
+                writer
+                    .write_regular_batch(
+                        vec![PreparedRegularWrite {
+                            target: target.to_path_buf(),
+                            index_path: target.to_string_lossy().into_owned(),
+                            mode,
+                            content: content.into(),
+                        }],
+                        false,
+                    )
+                    .map(|_| ())
             })
             .with_context(|| format!("write {}", target.display()))
         }
 
-        pub(super) fn write_regular_batch(&self, writes: Vec<PreparedRegularWrite>) -> Result<()> {
+        pub(super) fn write_regular_batch(
+            &self,
+            writes: Vec<PreparedRegularWrite>,
+            collect_stats: bool,
+        ) -> Result<Vec<crate::git::MaterializedPathStat>> {
             if writes.is_empty() {
-                return Ok(());
+                return Ok(Vec::new());
             }
-            with_thread_writer(|writer| writer.write_regular_batch(writes))
+            with_thread_writer(|writer| writer.write_regular_batch(writes, collect_stats))
         }
 
         pub(super) fn probe(&self) -> Result<()> {
@@ -856,18 +898,27 @@ mod linux_uring {
             }
         }
 
-        fn write_regular_batch(&mut self, mut writes: Vec<PreparedRegularWrite>) -> Result<()> {
+        fn write_regular_batch(
+            &mut self,
+            mut writes: Vec<PreparedRegularWrite>,
+            collect_stats: bool,
+        ) -> Result<Vec<crate::git::MaterializedPathStat>> {
+            let mut stats = Vec::new();
             while !writes.is_empty() {
                 let n = writes.len().min(MAX_BATCH_FILES);
                 let batch: Vec<_> = writes.drain(..n).collect();
-                self.write_regular_window(batch)?;
+                stats.extend(self.write_regular_window(batch, collect_stats)?);
             }
-            Ok(())
+            Ok(stats)
         }
 
-        fn write_regular_window(&mut self, writes: Vec<PreparedRegularWrite>) -> Result<()> {
+        fn write_regular_window(
+            &mut self,
+            writes: Vec<PreparedRegularWrite>,
+            collect_stats: bool,
+        ) -> Result<Vec<crate::git::MaterializedPathStat>> {
             if writes.is_empty() {
-                return Ok(());
+                return Ok(Vec::new());
             }
 
             let mut in_flight = Vec::with_capacity(writes.len());
@@ -889,6 +940,7 @@ mod linux_uring {
                     | libc::O_NOFOLLOW;
                 in_flight.push(InFlightWrite {
                     target: write.target,
+                    index_path: write.index_path,
                     path,
                     flags,
                     mode: write.mode as libc::mode_t,
@@ -896,29 +948,38 @@ mod linux_uring {
                     fd: None,
                     open_res: None,
                     write_res: None,
+                    statx_res: None,
                     close_res: None,
                 });
             }
 
             match self.descriptor_mode {
-                DescriptorMode::NormalFd => self.write_regular_window_normal(in_flight),
-                DescriptorMode::DirectFd => match self.write_regular_window_direct(in_flight) {
-                    Ok(()) => Ok(()),
-                    Err(DirectWriteError::Unsupported(in_flight)) => {
-                        DIRECT_DESCRIPTOR_FALLBACK_LOG.call_once(|| {
+                DescriptorMode::NormalFd => {
+                    self.write_regular_window_normal(in_flight, collect_stats)
+                }
+                DescriptorMode::DirectFd => {
+                    match self.write_regular_window_direct(in_flight, collect_stats) {
+                        Ok(stats) => Ok(stats),
+                        Err(DirectWriteError::Unsupported(in_flight)) => {
+                            DIRECT_DESCRIPTOR_FALLBACK_LOG.call_once(|| {
                             tracing::info!(
                                 "io_uring direct descriptors rejected by kernel; retrying with normal fds"
                             )
                         });
-                        self.descriptor_mode = DescriptorMode::NormalFd;
-                        self.write_regular_window_normal(in_flight)
+                            self.descriptor_mode = DescriptorMode::NormalFd;
+                            self.write_regular_window_normal(in_flight, collect_stats)
+                        }
+                        Err(DirectWriteError::Other(e)) => Err(e),
                     }
-                    Err(DirectWriteError::Other(e)) => Err(e),
-                },
+                }
             }
         }
 
-        fn write_regular_window_normal(&mut self, mut in_flight: Vec<InFlightWrite>) -> Result<()> {
+        fn write_regular_window_normal(
+            &mut self,
+            mut in_flight: Vec<InFlightWrite>,
+            collect_stats: bool,
+        ) -> Result<Vec<crate::git::MaterializedPathStat>> {
             let mut entries = Vec::with_capacity(in_flight.len());
             for (idx, write) in in_flight.iter().enumerate() {
                 entries.push(
@@ -1000,7 +1061,7 @@ mod linux_uring {
                                     write.close_res = Some(res);
                                     write.fd = None;
                                 }
-                                FileOp::Open => {
+                                FileOp::Open | FileOp::Statx => {
                                     close_open_fds_sync(&mut in_flight);
                                     anyhow::bail!(
                                         "unexpected io_uring completion in write/close phase"
@@ -1021,17 +1082,39 @@ mod linux_uring {
                 check_write_result(write)?;
                 check_close_result(write)?;
             }
-            Ok(())
+            if collect_stats {
+                in_flight
+                    .iter()
+                    .map(|write| {
+                        std::fs::metadata(&write.target)
+                            .with_context(|| format!("stat {}", write.target.display()))
+                            .map(|metadata| {
+                                crate::git::materialized_path_stat_from_metadata(
+                                    write.index_path.clone(),
+                                    &metadata,
+                                )
+                            })
+                    })
+                    .collect()
+            } else {
+                Ok(Vec::new())
+            }
         }
 
         fn write_regular_window_direct(
             &mut self,
             mut in_flight: Vec<InFlightWrite>,
-        ) -> std::result::Result<(), DirectWriteError> {
-            let mut entries = Vec::with_capacity(in_flight.len() * 3);
+            collect_stats: bool,
+        ) -> std::result::Result<Vec<crate::git::MaterializedPathStat>, DirectWriteError> {
+            let mut statx_buffers: Vec<libc::statx> = (0..in_flight.len())
+                .map(|_| unsafe { std::mem::zeroed() })
+                .collect();
+            let mut entries = Vec::with_capacity(in_flight.len() * 4);
             for idx in 0..in_flight.len() {
-                let write = &in_flight[idx];
                 let slot = idx as u32;
+                let path_ptr = in_flight[idx].path.as_ptr();
+                let flags = in_flight[idx].flags;
+                let mode = in_flight[idx].mode;
                 let dest = types::DestinationSlot::try_from_slot_target(slot).map_err(|_| {
                     DirectWriteError::Other(anyhow::anyhow!("invalid fixed file slot {slot}"))
                 })?;
@@ -1040,18 +1123,18 @@ mod linux_uring {
                     open_flags |= squeue::Flags::SKIP_SUCCESS;
                 }
                 entries.push(
-                    opcode::OpenAt::new(types::Fd(libc::AT_FDCWD), write.path.as_ptr())
-                        .flags(write.flags & !libc::O_CLOEXEC)
-                        .mode(write.mode)
+                    opcode::OpenAt::new(types::Fd(libc::AT_FDCWD), path_ptr)
+                        .flags(flags & !libc::O_CLOEXEC)
+                        .mode(mode)
                         .file_index(Some(dest))
                         .build()
                         .flags(open_flags)
                         .user_data(user_data(idx, FileOp::Open)),
                 );
-                if write.content.is_empty() {
+                if in_flight[idx].content.is_empty() {
                     in_flight[idx].write_res = Some(0);
                 } else {
-                    let content = write.content.as_slice();
+                    let content = in_flight[idx].content.as_slice();
                     entries.push(
                         opcode::Write::new(
                             types::Fixed(slot),
@@ -1062,6 +1145,20 @@ mod linux_uring {
                         .build()
                         .flags(squeue::Flags::IO_HARDLINK)
                         .user_data(user_data(idx, FileOp::Write)),
+                    );
+                }
+                if collect_stats {
+                    entries.push(
+                        opcode::Statx::new(
+                            types::Fd(libc::AT_FDCWD),
+                            path_ptr,
+                            &mut statx_buffers[idx] as *mut libc::statx as *mut types::statx,
+                        )
+                        .flags(libc::AT_SYMLINK_NOFOLLOW)
+                        .mask(libc::STATX_BASIC_STATS)
+                        .build()
+                        .flags(squeue::Flags::IO_HARDLINK)
+                        .user_data(user_data(idx, FileOp::Statx)),
                     );
                 }
                 entries.push(
@@ -1107,6 +1204,9 @@ mod linux_uring {
                     FileOp::Write => {
                         write.write_res = Some(res);
                     }
+                    FileOp::Statx => {
+                        write.statx_res = Some(res);
+                    }
                     FileOp::Close => {
                         write.close_res = Some(res);
                     }
@@ -1127,9 +1227,25 @@ mod linux_uring {
             for write in &in_flight {
                 check_open_result(write).map_err(DirectWriteError::Other)?;
                 check_write_result(write).map_err(DirectWriteError::Other)?;
+                if collect_stats {
+                    check_statx_result(write).map_err(DirectWriteError::Other)?;
+                }
                 check_close_result(write).map_err(DirectWriteError::Other)?;
             }
-            Ok(())
+            if collect_stats {
+                Ok(in_flight
+                    .iter()
+                    .zip(statx_buffers.iter())
+                    .map(|(write, statx)| {
+                        crate::git::materialized_path_stat_from_statx(
+                            write.index_path.clone(),
+                            statx,
+                        )
+                    })
+                    .collect())
+            } else {
+                Ok(Vec::new())
+            }
         }
 
         fn submit_entries(
@@ -1243,6 +1359,7 @@ mod linux_uring {
             0 => FileOp::Open,
             1 => FileOp::Write,
             2 => FileOp::Close,
+            3 => FileOp::Statx,
             other => anyhow::bail!("invalid io_uring completion op {other}"),
         };
         Ok((idx, op))
@@ -1276,6 +1393,22 @@ mod linux_uring {
                 res,
                 expected
             );
+        }
+        Ok(())
+    }
+
+    fn check_statx_result(write: &InFlightWrite) -> Result<()> {
+        if write.open_res.is_some_and(|res| res < 0) {
+            return Ok(());
+        }
+        if write.write_res.is_some_and(|res| res < 0) {
+            return Ok(());
+        }
+        let res = write.statx_res.ok_or_else(|| {
+            anyhow::anyhow!("missing statx completion for {}", write.target.display())
+        })?;
+        if res < 0 {
+            Err(cqe_error(res)).with_context(|| format!("statx {}", write.target.display()))?;
         }
         Ok(())
     }

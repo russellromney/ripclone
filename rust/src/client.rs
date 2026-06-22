@@ -979,40 +979,51 @@ impl Client {
                 async move {
                     let (i, history_only, pack_bytes, idx_bytes) = res?;
                     let bytes = (pack_bytes.len() + idx_bytes.len()) as u64;
-                    let written = tokio::task::spawn_blocking(move || -> Result<usize> {
-                        if pack_bytes.len() < 20 {
-                            anyhow::bail!("pack {} too short ({} bytes)", i, pack_bytes.len());
-                        }
-                        // Git names packs by the 20-byte trailer sha; the idx
-                        // pairs to the pack by basename.
-                        let name = hex::encode(&pack_bytes[pack_bytes.len() - 20..]);
-                        std::fs::write(pack_dir.join(format!("pack-{}.pack", name)), &pack_bytes)
+                    let result = tokio::task::spawn_blocking(
+                        move || -> Result<crate::extract::PackExtractResult> {
+                            if pack_bytes.len() < 20 {
+                                anyhow::bail!("pack {} too short ({} bytes)", i, pack_bytes.len());
+                            }
+                            // Git names packs by the 20-byte trailer sha; the idx
+                            // pairs to the pack by basename.
+                            let name = hex::encode(&pack_bytes[pack_bytes.len() - 20..]);
+                            std::fs::write(
+                                pack_dir.join(format!("pack-{}.pack", name)),
+                                &pack_bytes,
+                            )
                             .with_context(|| format!("write pack {}", name))?;
-                        std::fs::write(pack_dir.join(format!("pack-{}.idx", name)), &idx_bytes)
-                            .with_context(|| format!("write idx {}", name))?;
-                        if history_only {
-                            return Ok(0);
-                        }
-                        let n = crate::extract::extract_blobs_from_pack_bytes(
-                            &pack_bytes,
-                            &blob_map,
-                            &work_tree,
-                            &worktree_writer,
-                        )
-                        .with_context(|| format!("extract pack {}", name))?;
-                        Ok(n)
-                    })
+                            std::fs::write(pack_dir.join(format!("pack-{}.idx", name)), &idx_bytes)
+                                .with_context(|| format!("write idx {}", name))?;
+                            if history_only {
+                                return Ok(crate::extract::PackExtractResult {
+                                    files: 0,
+                                    stats: Vec::new(),
+                                });
+                            }
+                            crate::extract::extract_blobs_from_pack_bytes(
+                                &pack_bytes,
+                                &blob_map,
+                                &work_tree,
+                                &worktree_writer,
+                            )
+                            .with_context(|| format!("extract pack {}", name))
+                        },
+                    )
                     .await
                     .context("spawn pack install task")??;
-                    Ok::<(u64, usize), anyhow::Error>((bytes, written))
+                    Ok::<(u64, crate::extract::PackExtractResult), anyhow::Error>((bytes, result))
                 }
             })
             .buffer_unordered(write_conc)
-            .try_fold((0u64, 0usize), |(ab, aw), (b, w)| async move {
-                Ok((ab + b, aw + w))
-            })
+            .try_fold(
+                (0u64, 0usize, Vec::new()),
+                |(ab, aw, mut stats), (b, result)| async move {
+                    stats.extend(result.stats);
+                    Ok((ab + b, aw + result.files, stats))
+                },
+            )
             .await?;
-        let (total, files_written) = total;
+        let (total, files_written, stat_cache) = total;
 
         // Guard against silent under-extraction (e.g. a sha/format mismatch):
         // every tracked path must have been materialized.
@@ -1032,7 +1043,7 @@ impl Client {
             .collect();
         let work_tree2 = work_tree.to_path_buf();
         tokio::task::spawn_blocking(move || {
-            crate::git::clear_skip_worktree_index_and_refresh_stats(&work_tree2, &paths)
+            crate::git::clear_skip_worktree_index_with_stats(&work_tree2, &paths, &stat_cache)
         })
         .await
         .context("spawn clear skip-worktree and refresh index stats")??;

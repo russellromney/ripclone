@@ -182,6 +182,14 @@ pub fn clear_skip_worktree_index_and_refresh_stats<P: AsRef<Path>>(
     repo_dir: P,
     paths: &[String],
 ) -> Result<()> {
+    clear_skip_worktree_index_with_stats(repo_dir, paths, &[])
+}
+
+pub fn clear_skip_worktree_index_with_stats<P: AsRef<Path>>(
+    repo_dir: P,
+    paths: &[String],
+    stats: &[MaterializedPathStat],
+) -> Result<()> {
     if paths.is_empty() {
         return Ok(());
     }
@@ -191,6 +199,8 @@ pub fn clear_skip_worktree_index_and_refresh_stats<P: AsRef<Path>>(
         .with_context(|| format!("opening index at {}", index_path.display()))?;
 
     let target: HashSet<&str> = paths.iter().map(|s| s.as_str()).collect();
+    let stats_by_path: HashMap<&str, &IndexStat> =
+        stats.iter().map(|s| (s.path.as_str(), &s.stat)).collect();
     let entries: Vec<_> = index.iter().collect();
     let mut changed = false;
     for entry in entries {
@@ -198,10 +208,16 @@ pub fn clear_skip_worktree_index_and_refresh_stats<P: AsRef<Path>>(
         if !target.contains(path.as_str()) {
             continue;
         }
-        let full_path = repo_dir.join(index_path_from_bytes(&entry.path));
-        let metadata = std::fs::symlink_metadata(&full_path)
-            .with_context(|| format!("stat materialized file {}", full_path.display()))?;
-        let stat = index_stat_from_metadata(&metadata);
+        let fallback_stat;
+        let stat = if let Some(stat) = stats_by_path.get(path.as_str()) {
+            *stat
+        } else {
+            let full_path = repo_dir.join(index_path_from_bytes(&entry.path));
+            let metadata = std::fs::symlink_metadata(&full_path)
+                .with_context(|| format!("stat materialized file {}", full_path.display()))?;
+            fallback_stat = index_stat_from_metadata(&metadata);
+            &fallback_stat
+        };
         let updated = git2::IndexEntry {
             ctime: stat.ctime,
             mtime: stat.mtime,
@@ -229,6 +245,11 @@ pub fn clear_skip_worktree_index_and_refresh_stats<P: AsRef<Path>>(
     Ok(())
 }
 
+pub struct MaterializedPathStat {
+    pub path: String,
+    stat: IndexStat,
+}
+
 struct IndexStat {
     ctime: git2::IndexTime,
     mtime: git2::IndexTime,
@@ -237,6 +258,27 @@ struct IndexStat {
     uid: u32,
     gid: u32,
     file_size: u32,
+}
+
+pub fn materialized_path_stat_from_metadata(
+    path: String,
+    metadata: &std::fs::Metadata,
+) -> MaterializedPathStat {
+    MaterializedPathStat {
+        path,
+        stat: index_stat_from_metadata(metadata),
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn materialized_path_stat_from_statx(
+    path: String,
+    statx: &libc::statx,
+) -> MaterializedPathStat {
+    MaterializedPathStat {
+        path,
+        stat: index_stat_from_statx(statx),
+    }
 }
 
 #[cfg(unix)]
@@ -282,6 +324,35 @@ fn index_stat_from_metadata(metadata: &std::fs::Metadata) -> IndexStat {
         gid: 0,
         file_size: truncate_u64_to_u32(metadata.len()),
     }
+}
+
+#[cfg(target_os = "linux")]
+fn index_stat_from_statx(statx: &libc::statx) -> IndexStat {
+    IndexStat {
+        ctime: git2::IndexTime::new(
+            clamp_i64_to_i32(statx.stx_ctime.tv_sec),
+            statx.stx_ctime.tv_nsec,
+        ),
+        mtime: git2::IndexTime::new(
+            clamp_i64_to_i32(statx.stx_mtime.tv_sec),
+            statx.stx_mtime.tv_nsec,
+        ),
+        dev: truncate_u64_to_u32(make_dev(statx.stx_dev_major, statx.stx_dev_minor)),
+        ino: truncate_u64_to_u32(statx.stx_ino),
+        uid: statx.stx_uid,
+        gid: statx.stx_gid,
+        file_size: truncate_u64_to_u32(statx.stx_size),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn make_dev(major: u32, minor: u32) -> u64 {
+    let major = major as u64;
+    let minor = minor as u64;
+    ((major & 0x00000fff) << 8)
+        | (minor & 0x000000ff)
+        | ((minor & 0xffffff00) << 12)
+        | ((major & 0xfffff000) << 32)
 }
 
 fn clamp_i64_to_i32(value: i64) -> i32 {
