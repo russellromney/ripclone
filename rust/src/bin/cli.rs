@@ -20,7 +20,9 @@ use std::time::Duration;
 #[command(name = "ripclone")]
 #[command(about = "CAS-based git clone helper")]
 struct Args {
-    #[arg(short, long, default_value = "http://localhost:8000")]
+    /// ripclone server. Defaults to the managed cloud; set RIPCLONE_SERVER or
+    /// pass --server http://localhost:8000 to point at a self-hosted backend.
+    #[arg(short, long, env = "RIPCLONE_SERVER", default_value = "https://ripclone.com")]
     server: String,
 
     #[command(subcommand)]
