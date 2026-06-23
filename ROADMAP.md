@@ -73,8 +73,9 @@ Remaining future improvements:
 
 Implemented as `--mode full|fast|hybrid|skeleton` and `RIPCLONE_MODE`. See `CHANGELOG.md` for details.
 
-Remaining future item:
-- `lazy` mode (metadata + archive chunks first; head-blobs fetched by a background daemon afterwards).
+(A `lazy` mode — metadata + archive chunks first, head-blobs fetched by a
+background daemon — was considered and dropped: people want a clone to be fast
+and complete, not a half-materialized one. Not pursuing it.)
 
 ### 5. Edge warmth with Tigris
 
