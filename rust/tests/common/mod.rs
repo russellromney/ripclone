@@ -76,7 +76,7 @@ pub struct Server {
     pub url: String,
     pub cas_dir: PathBuf,
     pub repo_root: PathBuf,
-    _dir: TempDir,
+    pub _dir: TempDir,
 }
 
 impl Server {

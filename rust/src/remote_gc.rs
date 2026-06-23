@@ -484,6 +484,7 @@ mod tests {
             history_levels: Vec::new(),
             build_status: None,
             synced_at: None,
+            ..Default::default()
         }
     }
 
@@ -655,6 +656,7 @@ mod tests {
             }],
             build_status: None,
             synced_at: None,
+            ..Default::default()
         };
         ref_store.save("o", "r", &info).await.unwrap();
 

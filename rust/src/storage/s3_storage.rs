@@ -35,6 +35,11 @@ impl S3Storage {
             .context("build S3 client")?
             .region(region)
             .auth(auth)
+            .addressing_style(s3::AddressingStyle::Path)
+            .tls_root_store(s3::AsyncTlsRootStore::System)
+            .max_attempts(5)
+            .base_retry_delay(Duration::from_millis(200))
+            .max_retry_delay(Duration::from_secs(5))
             .build()
             .context("create S3 client")?;
         let cache = cache_dir.map(Cas::new).transpose()?;
@@ -107,16 +112,63 @@ impl S3Storage {
         Ok(out)
     }
 
-    fn block_on<F, T>(&self, f: F) -> Result<T>
+    fn block_on<F, Fut, T>(&self, make_future: F) -> Result<T>
     where
-        F: std::future::Future<Output = std::result::Result<T, s3::Error>>,
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<T>> + Send + 'static,
+        T: Send + 'static,
     {
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                f.await
-                    .map_err(|e| anyhow::anyhow!("S3 request failed: {}", e))
-            })
-        })
+        // We may be called from a Tokio worker thread (e.g. do_sync), from a
+        // spawn_blocking thread (e.g. artifact handlers / RemoteGc), or from a
+        // non-Tokio thread (e.g. CLI before a runtime exists). Use the right
+        // blocking strategy for each, but always execute the actual S3 request
+        // on a long-lived runtime so that hyper connection dispatch tasks are
+        // not torn down between calls.
+        fn run_on_handle<F, Fut, T>(handle: &tokio::runtime::Handle, make_future: F) -> Result<T>
+        where
+            F: FnOnce() -> Fut + Send,
+            Fut: std::future::Future<Output = Result<T>> + Send,
+            T: Send,
+        {
+            handle.block_on(async { make_future().await })
+        }
+
+        fn run_on_global<F, Fut, T>(make_future: F) -> Result<T>
+        where
+            F: FnOnce() -> Fut + Send + 'static,
+            Fut: std::future::Future<Output = Result<T>> + Send + 'static,
+            T: Send + 'static,
+        {
+            static S3_RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> =
+                std::sync::OnceLock::new();
+            let rt = S3_RUNTIME.get_or_init(|| tokio::runtime::Runtime::new().expect("S3 runtime"));
+            let (tx, rx) = std::sync::mpsc::channel();
+            rt.spawn(async move {
+                let res = make_future().await;
+                let _ = tx.send(res);
+            });
+            rx.recv().context("S3 result channel")?
+        }
+
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                // Worker threads are named "tokio-runtime-worker" by default.
+                // Use block_in_place there so we don't starve the executor.
+                if std::thread::current()
+                    .name()
+                    .is_some_and(|n| n.starts_with("tokio-runtime-worker"))
+                {
+                    tokio::task::block_in_place(|| run_on_handle(&handle, make_future))
+                } else {
+                    // On blocking/runtime threads we can't call block_on directly
+                    // on the current runtime (Tokio panics). Run the request on a
+                    // dedicated global runtime instead of the current one so we
+                    // never starve the runtime we're called from.
+                    run_on_global(make_future)
+                }
+            }
+            Err(_) => run_on_global(make_future),
+        }
     }
 }
 
@@ -128,10 +180,21 @@ impl StorageBackend for S3Storage {
             return Ok(data);
         }
         let key = self.key(hash)?;
-        let output = self.block_on(self.client.objects().get(&self.bucket, &key).send())?;
-        let content_length = output.content_length;
-        let data = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(Self::collect_stream(output.body))
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        let key_owned = key.clone();
+        let (content_length, data) = self.block_on(move || async move {
+            let output = client
+                .objects()
+                .get(&bucket, &key_owned)
+                .send()
+                .await
+                .context("S3 get_object")?;
+            let content_length = output.content_length;
+            let data = Self::collect_stream(output.body)
+                .await
+                .context("read S3 object body")?;
+            Ok::<_, anyhow::Error>((content_length, data))
         })?;
         if let Some(expected) = content_length
             && data.len() as u64 != expected
@@ -159,17 +222,23 @@ impl StorageBackend for S3Storage {
         }
         let key = self.key(hash)?;
         let end_inclusive = start + len.saturating_sub(1);
-        let output = self.block_on(
-            self.client
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        let key_owned = key.clone();
+        let (content_length, data) = self.block_on(move || async move {
+            let output = client
                 .objects()
-                .get(&self.bucket, &key)
+                .get(&bucket, &key_owned)
                 .range_bytes(start, end_inclusive)
                 .context("set S3 range")?
-                .send(),
-        )?;
-        let content_length = output.content_length;
-        let data = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(Self::collect_stream(output.body))
+                .send()
+                .await
+                .context("S3 get_object_range")?;
+            let content_length = output.content_length;
+            let data = Self::collect_stream(output.body)
+                .await
+                .context("read S3 object body")?;
+            Ok::<_, anyhow::Error>((content_length, data))
         })?;
         if let Some(expected) = content_length
             && data.len() as u64 != expected
@@ -188,14 +257,25 @@ impl StorageBackend for S3Storage {
     fn put(&self, hash: &str, data: &[u8]) -> Result<()> {
         let key = self.key(hash)?;
         let data_owned = data.to_vec();
-        self.block_on(
-            self.client
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        let key_owned = key.clone();
+        let result = self.block_on(move || async move {
+            client
                 .objects()
-                .put(&self.bucket, &key)
+                .put(&bucket, &key_owned)
                 .body_bytes(data_owned)
-                .send(),
-        )
-        .context("S3 put_object")?;
+                .send()
+                .await
+                .context("S3 put_object")
+        });
+        if let Err(ref e) = result {
+            eprintln!("S3 put_object {key} raw error: {e:?}");
+            if let Some(s3_err) = e.downcast_ref::<s3::Error>() {
+                eprintln!("s3::Error debug: {s3_err:#?}");
+            }
+        }
+        result.context("S3 put_object")?;
         if let Some(cache) = &self.cache {
             cache.put_with_hash(hash, data)?;
         }
@@ -204,9 +284,17 @@ impl StorageBackend for S3Storage {
 
     fn size(&self, hash: &str) -> Result<u64> {
         let key = self.key(hash)?;
-        let output = self
-            .block_on(self.client.objects().head(&self.bucket, &key).send())
-            .context("S3 head_object")?;
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        let key_owned = key.clone();
+        let output = self.block_on(move || async move {
+            client
+                .objects()
+                .head(&bucket, &key_owned)
+                .send()
+                .await
+                .context("S3 head_object")
+        })?;
         output
             .content_length
             .ok_or_else(|| anyhow::anyhow!("S3 head_object missing Content-Length"))
@@ -243,8 +331,17 @@ impl StorageBackend for S3Storage {
 
     fn delete(&self, hash: &str) -> Result<()> {
         let key = self.key(hash)?;
-        self.block_on(self.client.objects().delete(&self.bucket, &key).send())
-            .context("S3 delete_object")?;
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        let key_owned = key.clone();
+        self.block_on(move || async move {
+            client
+                .objects()
+                .delete(&bucket, &key_owned)
+                .send()
+                .await
+                .context("S3 delete_object")
+        })?;
         Ok(())
     }
 
@@ -252,16 +349,18 @@ impl StorageBackend for S3Storage {
         let mut total = 0u64;
         for chunk in hashes.chunks(DELETE_BATCH_SIZE) {
             let keys: Vec<String> = chunk.iter().map(|h| self.key(h)).collect::<Result<_>>()?;
-            let output = self
-                .block_on(
-                    self.client
-                        .objects()
-                        .delete_objects(&self.bucket)
-                        .objects(&keys)?
-                        .quiet(true)
-                        .send(),
-                )
-                .context("S3 delete_objects")?;
+            let client = self.client.clone();
+            let bucket = self.bucket.clone();
+            let output = self.block_on(move || async move {
+                client
+                    .objects()
+                    .delete_objects(&bucket)
+                    .objects(&keys)
+                    .context("set S3 delete_objects keys")?
+                    .send()
+                    .await
+                    .context("S3 delete_objects")
+            })?;
             if !output.errors.is_empty() {
                 let sample = output
                     .errors
@@ -277,24 +376,32 @@ impl StorageBackend for S3Storage {
     }
 
     fn list_hashes(&self) -> Result<Vec<HashEntry>> {
-        let prefix = &self.prefix;
+        let prefix = self.prefix.clone();
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
         let mut out = Vec::new();
         let mut continuation = None::<String>;
         loop {
-            let mut req = self
-                .client
-                .objects()
-                .list_v2(&self.bucket)
-                .prefix(prefix)
-                .context("set S3 list prefix")?;
-            if let Some(token) = continuation.take() {
-                req = req
-                    .continuation_token(token)
-                    .context("set S3 list continuation token")?;
-            }
-            let output = self.block_on(req.send()).context("S3 list_hashes")?;
+            let prefix = prefix.clone();
+            let prefix_for_hash = prefix.clone();
+            let client = client.clone();
+            let bucket = bucket.clone();
+            let token = continuation.take();
+            let output = self.block_on(move || async move {
+                let mut req = client
+                    .objects()
+                    .list_v2(&bucket)
+                    .prefix(&prefix)
+                    .context("set S3 list prefix")?;
+                if let Some(token) = token {
+                    req = req
+                        .continuation_token(token)
+                        .context("set S3 list continuation token")?;
+                }
+                req.send().await.context("S3 list_objects_v2")
+            })?;
             for obj in output.contents {
-                let hash = match Self::hash_from_key(prefix, &obj.key) {
+                let hash = match Self::hash_from_key(&prefix_for_hash, &obj.key) {
                     Ok(h) => h,
                     Err(e) => {
                         tracing::debug!("skipping non-hash S3 key {}: {}", obj.key, e);

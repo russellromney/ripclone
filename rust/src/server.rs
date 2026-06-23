@@ -1187,7 +1187,10 @@ async fn build_repo_status(
         // Manifest-based clonepack variants (shallow, full, legacy). Each
         // manifest is itself a stored artifact and references chunks.
         for manifest_hash in manifest_hashes {
-            let manifest_bytes = state.cas.get(&manifest_hash)?;
+            // Read the manifest from the authoritative storage backend rather
+            // than the local CAS, because remote backends remove local copies
+            // after upload to save disk.
+            let manifest_bytes = state.storage.get(&manifest_hash)?;
             let manifest_len = manifest_bytes.len() as u64;
             record_chunk(&mut unique_chunks, &manifest_hash, manifest_len);
             ref_bytes += manifest_len;
@@ -4371,6 +4374,7 @@ mod tests {
             history_levels: Vec::new(),
             build_status: None,
             synced_at: None,
+            ..Default::default()
         };
         state
             .ref_store
@@ -4460,6 +4464,7 @@ mod tests {
             }],
             build_status: None,
             synced_at: None,
+            ..Default::default()
         };
         state
             .ref_store
@@ -4541,6 +4546,7 @@ mod tests {
             history_levels: Vec::new(),
             build_status: None,
             synced_at: None,
+            ..Default::default()
         };
         state
             .ref_store
