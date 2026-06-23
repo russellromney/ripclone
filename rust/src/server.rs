@@ -899,7 +899,9 @@ async fn get_ref(
     Path((owner, repo, branch)): Path<(String, String, String)>,
     Query(params): Query<RefQuery>,
     State(state): State<ServerState>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
+    let private = visibility_is_private(&headers);
     if let Some(resp) = reject_invalid_repo_ids(&owner, &repo) {
         return resp;
     }
@@ -1007,6 +1009,7 @@ async fn get_ref(
                 &info,
                 &state.storage,
                 &params.clonepack,
+                private,
             );
             if info.build_status.is_none() && params.rev.is_none() {
                 cache_ref_response(&state, &owner, &repo, &branch, &params.clonepack, &resp);
@@ -1026,10 +1029,29 @@ async fn get_ref(
     }
 }
 
-/// TTL for signed chunk URLs returned in ref responses. 20 minutes gives slow
-/// clones and large archives enough time to finish without keeping the window
-/// open too long.
-const REF_SIGNED_URL_TTL: Duration = Duration::from_secs(1200);
+/// TTL for signed chunk URLs returned in ref responses. Public repos get a long
+/// window (20 min) so slow clones and large archives finish. Private repos get a
+/// short window (5 min) so a leaked signed URL — or a caller who later loses
+/// GitHub access — only works briefly; this is the revocation window for the
+/// direct-to-storage path that bypasses the gateway. The cloud gateway tags the
+/// request with `X-Ripclone-Visibility`; absent (e.g. a self-hosted client
+/// talking to the backend directly) means the public TTL. Both are env-tunable.
+const REF_SIGNED_URL_TTL_PUBLIC_SECS: u64 = 1200;
+const REF_SIGNED_URL_TTL_PRIVATE_SECS: u64 = 300;
+
+fn ref_signed_url_ttl(private: bool) -> Duration {
+    if private {
+        Duration::from_secs(env_bytes(
+            "RIPCLONE_SIGNED_URL_TTL_PRIVATE_SECS",
+            REF_SIGNED_URL_TTL_PRIVATE_SECS,
+        ))
+    } else {
+        Duration::from_secs(env_bytes(
+            "RIPCLONE_SIGNED_URL_TTL_SECS",
+            REF_SIGNED_URL_TTL_PUBLIC_SECS,
+        ))
+    }
+}
 
 fn ref_response(
     owner: String,
@@ -1038,7 +1060,9 @@ fn ref_response(
     info: &RefInfo,
     storage: &crate::storage::StorageRef,
     clonepack_kind: &str,
+    private: bool,
 ) -> RefResponse {
+    let ttl = ref_signed_url_ttl(private);
     let artifacts = if clonepack_kind == "shallow" && !info.shallow_clonepack.manifest.is_empty() {
         &info.shallow_clonepack
     } else {
@@ -1058,15 +1082,15 @@ fn ref_response(
         artifacts.metadata_chunk.clone()
     };
 
-    let clonepack_manifest_url = signed_url(storage, &clonepack_manifest);
-    let metadata_chunk_url = signed_url(storage, &metadata_chunk);
+    let clonepack_manifest_url = signed_url(storage, ttl, &clonepack_manifest);
+    let metadata_chunk_url = signed_url(storage, ttl, &metadata_chunk);
     let archive_chunk_urls = if info.archive_chunks.is_empty() {
         None
     } else {
         let urls: Vec<Option<String>> = info
             .archive_chunks
             .iter()
-            .map(|h| signed_url(storage, h))
+            .map(|h| signed_url(storage, ttl, h))
             .collect();
         if urls.iter().all(|u| u.is_none()) {
             None
@@ -1081,7 +1105,7 @@ fn ref_response(
         let urls: Vec<Option<String>> = info
             .head_blobs_chunks
             .iter()
-            .map(|h| signed_url(storage, h))
+            .map(|h| signed_url(storage, ttl, h))
             .collect();
         if urls.iter().all(|u| u.is_none()) {
             None
@@ -1089,7 +1113,7 @@ fn ref_response(
             Some(urls)
         }
     };
-    let head_blobs_idx_url = signed_url(storage, &info.head_blobs_idx);
+    let head_blobs_idx_url = signed_url(storage, ttl, &info.head_blobs_idx);
 
     // Sign each editable pack + idx so the client fetches them straight from
     // object storage. `None` entries (e.g. local backend) fall back to the
@@ -1100,12 +1124,12 @@ fn ref_response(
         let packs: Vec<Option<String>> = info
             .packs
             .iter()
-            .map(|p| signed_url(storage, &p.pack))
+            .map(|p| signed_url(storage, ttl, &p.pack))
             .collect();
         let idxs: Vec<Option<String>> = info
             .packs
             .iter()
-            .map(|p| signed_url(storage, &p.idx))
+            .map(|p| signed_url(storage, ttl, &p.idx))
             .collect();
         let packs = if packs.iter().all(Option::is_none) {
             None
@@ -1122,9 +1146,9 @@ fn ref_response(
 
     // Sign the pre-built MIDX for the selected variant so the client installs it
     // directly instead of running `git multi-pack-index write`.
-    let midx_url = signed_url(storage, &artifacts.midx);
+    let midx_url = signed_url(storage, ttl, &artifacts.midx);
     // Sign the idx bundle so the client fetches all idx in one GET.
-    let idx_bundle_url = signed_url(storage, &artifacts.idx_bundle);
+    let idx_bundle_url = signed_url(storage, ttl, &artifacts.idx_bundle);
 
     // The served commit is the selected variant's commit — which may differ from
     // RefInfo.commit during two-phase publish (depth=0 serves the previous commit
@@ -1159,11 +1183,22 @@ fn ref_response(
     }
 }
 
-fn signed_url(storage: &crate::storage::StorageRef, hash: &str) -> Option<String> {
+fn signed_url(storage: &crate::storage::StorageRef, ttl: Duration, hash: &str) -> Option<String> {
     if hash.is_empty() {
         return None;
     }
-    storage.signed_url(hash, REF_SIGNED_URL_TTL)
+    storage.signed_url(hash, ttl)
+}
+
+/// The cloud gateway tags every control-plane request with the repo visibility it
+/// resolved via GitHub. Absent → treat as public (a self-hosted client may talk
+/// to the backend directly, with no gateway in front).
+fn visibility_is_private(headers: &HeaderMap) -> bool {
+    headers
+        .get("x-ripclone-visibility")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.eq_ignore_ascii_case("private"))
+        .unwrap_or(false)
 }
 
 #[derive(Deserialize, Default)]
@@ -1416,6 +1451,7 @@ async fn sync_repo(
                 .clone()
                 .map(|s| secrecy::SecretString::new(s.into()))
         });
+    let private = visibility_is_private(&headers);
 
     // Async build queue: enqueue the build onto the bounded background worker so
     // it survives client disconnect / HTTP timeout (the key win for huge repos)
@@ -1471,8 +1507,15 @@ async fn sync_repo(
             Ok(Ok(Ok(()))) => match state.ref_store.load_branch(&owner, &repo, &ref_key).await {
                 Ok(Some(info)) => {
                     state.metrics.record_sync(start.elapsed());
-                    let resp =
-                        ref_response(owner, repo, branch.clone(), &info, &state.storage, "full");
+                    let resp = ref_response(
+                        owner,
+                        repo,
+                        branch.clone(),
+                        &info,
+                        &state.storage,
+                        "full",
+                        private,
+                    );
                     return (StatusCode::OK, Json(resp)).into_response();
                 }
                 _ => {
@@ -1541,7 +1584,15 @@ async fn sync_repo(
             // skip its own fetch.
             stamp_mirror_fresh(&state, &format!("{}/{}/{}", owner, repo, branch));
             invalidate_ref_response_cache(&state, &owner, &repo, &branch);
-            let resp = ref_response(owner, repo, branch.clone(), &info, &state.storage, "full");
+            let resp = ref_response(
+                owner,
+                repo,
+                branch.clone(),
+                &info,
+                &state.storage,
+                "full",
+                private,
+            );
             drop(_guard);
             (StatusCode::OK, Json(resp)).into_response()
         }
@@ -4164,10 +4215,34 @@ mod tests {
             &info,
             &storage,
             "full",
+            false,
         );
         assert!(resp.clonepack_manifest_url.is_none());
         assert!(resp.metadata_chunk_url.is_none());
         assert!(resp.archive_chunk_urls.is_none());
+    }
+
+    #[test]
+    fn signed_url_ttl_is_shorter_for_private() {
+        // Defaults (no env override): public 20m, private 5m. Private must be the
+        // shorter window — it bounds how long a leaked/stale signed URL works
+        // after a caller loses GitHub access.
+        assert_eq!(ref_signed_url_ttl(false), Duration::from_secs(1200));
+        assert_eq!(ref_signed_url_ttl(true), Duration::from_secs(300));
+        assert!(ref_signed_url_ttl(true) < ref_signed_url_ttl(false));
+    }
+
+    #[test]
+    fn visibility_header_is_parsed_case_insensitively() {
+        use axum::http::HeaderValue;
+        let mut h = HeaderMap::new();
+        assert!(!visibility_is_private(&h)); // absent → public (self-host direct)
+        h.insert("x-ripclone-visibility", HeaderValue::from_static("private"));
+        assert!(visibility_is_private(&h));
+        h.insert("x-ripclone-visibility", HeaderValue::from_static("PRIVATE"));
+        assert!(visibility_is_private(&h));
+        h.insert("x-ripclone-visibility", HeaderValue::from_static("public"));
+        assert!(!visibility_is_private(&h));
     }
 
     #[test]
