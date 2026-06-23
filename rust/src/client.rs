@@ -1345,11 +1345,26 @@ impl Client {
                 .await
                 .clone()
                 .context("manifest missing after notify")?;
+            // Bound concurrent chunk downloads. With CDC the archive can have
+            // hundreds-to-thousands of chunks (one per ~4 MiB frame); without a
+            // cap, spawning a request + buffering a frame for every chunk at once
+            // would exhaust the connection pool and spike memory.
+            let conc = std::env::var("RIPCLONE_FETCH_CONCURRENCY")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(16usize)
+                .max(1);
+            let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(conc));
             for (index, chunk_ref) in manifest.archive_chunks.iter().cloned().enumerate() {
                 let client = self.clone();
                 let tx = tx.clone();
                 let signed_url = signed_urls.get(index).cloned().flatten();
+                let sem = std::sync::Arc::clone(&sem);
                 let handle = tokio::spawn(async move {
+                    let _permit = sem
+                        .acquire()
+                        .await
+                        .map_err(|_| anyhow::anyhow!("download semaphore closed"))?;
                     let bytes = match client
                         .fetch_chunk_ref(&chunk_ref, signed_url.as_deref())
                         .await
