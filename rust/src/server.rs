@@ -6,6 +6,7 @@ use crate::git;
 use crate::metrics::Metrics;
 use crate::oidc::OidcVerifier;
 use crate::pack::PackBuilder;
+use crate::provider::{ProviderRegistry, RepoId};
 use crate::ref_store::{CachingRefStore, FileRefStore, RefStore, S3RefStore, migrate_legacy_refs};
 use crate::remote_gc::{GcConfig, RemoteGc};
 use crate::retention::Retention;
@@ -43,6 +44,7 @@ pub struct ServerState {
     pub storage: StorageRef,
     pub repo_root: PathBuf,
     pub ref_store: Arc<dyn RefStore>,
+    pub provider_registry: ProviderRegistry,
     pub token_hash: Option<String>,
     pub github_token: Option<String>,
     pub metrics: Arc<Metrics>,
@@ -246,8 +248,7 @@ pub type BuildWaiters = Arc<
 
 #[derive(Clone)]
 pub struct BuildJob {
-    pub owner: String,
-    pub repo: String,
+    pub repo_id: RepoId,
     #[allow(dead_code)]
     pub branch: String,
     /// Optional build-commit override (see SyncRequest.rev).
@@ -290,10 +291,9 @@ fn validate_repo_id(id: &str) -> Result<()> {
 
 async fn repo_lock(
     locks: &Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
-    owner: &str,
-    repo: &str,
+    repo_id: &RepoId,
 ) -> Arc<tokio::sync::Mutex<()>> {
-    let key = format!("{}/{}", owner, repo);
+    let key = repo_id.storage_key();
     let mut map = locks.lock().await;
     map.entry(key)
         .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
@@ -678,14 +678,15 @@ async fn git_info_refs(
             .into_response();
     }
 
-    let mirror_dir = state.repo_root.join(format!("{}_{}.git", owner, repo));
+    let repo_id = RepoId::github(format!("{owner}/{repo}"));
+    let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
     let github_token = state
         .github_token
         .clone()
         .map(|s| secrecy::SecretString::new(s.into()));
-    let lock = repo_lock(&state.sync_locks, &owner, &repo).await;
+    let lock = repo_lock(&state.sync_locks, &repo_id).await;
     let _guard = lock.lock().await;
-    if let Err(e) = ensure_mirror(&mirror_dir, &owner, &repo, "HEAD", github_token.as_ref()).await {
+    if let Err(e) = ensure_mirror(&mirror_dir, &repo_id, "HEAD", github_token.as_ref()).await {
         state.metrics.record_error();
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -757,14 +758,15 @@ async fn git_upload_pack(
     if let Some(resp) = reject_invalid_repo_ids(&owner, &repo) {
         return resp;
     }
-    let mirror_dir = state.repo_root.join(format!("{}_{}.git", owner, repo));
+    let repo_id = RepoId::github(format!("{owner}/{repo}"));
+    let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
     let github_token = state
         .github_token
         .clone()
         .map(|s| secrecy::SecretString::new(s.into()));
-    let lock = repo_lock(&state.sync_locks, &owner, &repo).await;
+    let lock = repo_lock(&state.sync_locks, &repo_id).await;
     let _guard = lock.lock().await;
-    if let Err(e) = ensure_mirror(&mirror_dir, &owner, &repo, "HEAD", github_token.as_ref()).await {
+    if let Err(e) = ensure_mirror(&mirror_dir, &repo_id, "HEAD", github_token.as_ref()).await {
         state.metrics.record_error();
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -843,18 +845,16 @@ async fn upload_pack_rpc(mirror_dir: &std::path::Path, input: Bytes) -> Result<V
 
 async fn ensure_mirror(
     mirror_dir: &std::path::Path,
-    owner: &str,
-    repo: &str,
+    repo_id: &RepoId,
     branch: &str,
     github_token: Option<&secrecy::SecretString>,
 ) -> Result<()> {
     let mirror_dir = mirror_dir.to_path_buf();
-    let owner = owner.to_string();
-    let repo = repo.to_string();
+    let repo_id = repo_id.clone();
     let branch = branch.to_string();
     let github_token = github_token.map(|s| s.expose_secret().to_string());
     tokio::task::spawn_blocking(move || {
-        git::sync_bare_mirror(&mirror_dir, &owner, &repo, &branch, github_token.as_deref())
+        git::sync_bare_mirror(&mirror_dir, &repo_id, &branch, github_token.as_deref())
     })
     .await
     .context("ensure mirror task")?
@@ -883,8 +883,8 @@ fn stamp_mirror_fresh(state: &ServerState, key: &str) {
 
 const REF_RESPONSE_CACHE_TTL: Duration = Duration::from_secs(30);
 
-fn ref_response_cache_key(owner: &str, repo: &str, branch: &str, clonepack: &str) -> String {
-    format!("{owner}\0{repo}\0{branch}\0{clonepack}")
+fn ref_response_cache_key(repo_id: &RepoId, branch: &str, clonepack: &str) -> String {
+    format!("{}\0{branch}\0{clonepack}", repo_id.storage_key())
 }
 
 fn ref_response_cache_ttl(state: &ServerState) -> Duration {
@@ -893,8 +893,7 @@ fn ref_response_cache_ttl(state: &ServerState) -> Duration {
 
 fn cached_ref_response(
     state: &ServerState,
-    owner: &str,
-    repo: &str,
+    repo_id: &RepoId,
     branch: &str,
     clonepack: &str,
 ) -> Option<RefResponse> {
@@ -902,7 +901,7 @@ fn cached_ref_response(
     if ttl.is_zero() {
         return None;
     }
-    let key = ref_response_cache_key(owner, repo, branch, clonepack);
+    let key = ref_response_cache_key(repo_id, branch, clonepack);
     let mut cache = state
         .ref_response_cache
         .lock()
@@ -913,8 +912,7 @@ fn cached_ref_response(
 
 fn cache_ref_response(
     state: &ServerState,
-    owner: &str,
-    repo: &str,
+    repo_id: &RepoId,
     branch: &str,
     clonepack: &str,
     response: &RefResponse,
@@ -923,7 +921,7 @@ fn cache_ref_response(
     if ttl.is_zero() {
         return;
     }
-    let key = ref_response_cache_key(owner, repo, branch, clonepack);
+    let key = ref_response_cache_key(repo_id, branch, clonepack);
     let mut cache = state
         .ref_response_cache
         .lock()
@@ -938,8 +936,8 @@ fn cache_ref_response(
     );
 }
 
-fn invalidate_ref_response_cache(state: &ServerState, owner: &str, repo: &str, branch: &str) {
-    let prefix = format!("{owner}\0{repo}\0{branch}\0");
+fn invalidate_ref_response_cache(state: &ServerState, repo_id: &RepoId, branch: &str) {
+    let prefix = format!("{}\0{branch}\0", repo_id.storage_key());
     let mut cache = state
         .ref_response_cache
         .lock()
@@ -966,13 +964,14 @@ async fn get_ref(
         return resp;
     }
     state.metrics.record_ref_lookup();
-    let key = format!("{}/{}/{}", owner, repo, branch);
+    let repo_id = RepoId::github(format!("{owner}/{repo}"));
+    let key = format!("{}/{}", repo_id.storage_key(), branch);
     // Optional build-commit override: resolve this rev instead of the branch tip
     // so a clone can fetch the artifacts a `sync?rev=...` built. The response
     // cache is bypassed for rev requests (a testing path, low volume).
     let resolve_target = params.rev.clone().unwrap_or_else(|| branch.clone());
 
-    let mirror_dir = state.repo_root.join(format!("{}_{}.git", owner, repo));
+    let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
     let github_token = state
         .github_token
         .clone()
@@ -981,20 +980,18 @@ async fn get_ref(
     // Serialize syncs for this repo so concurrent fetches do not corrupt the
     // bare mirror directory. Acquiring the lock also means any in-progress sync
     // for this repo has finished by the time we proceed.
-    let fresh_key = format!("{}/{}/{}", owner, repo, branch);
-    let lock = repo_lock(&state.sync_locks, &owner, &repo).await;
+    let fresh_key = format!("{}/{}", repo_id.storage_key(), branch);
+    let lock = repo_lock(&state.sync_locks, &repo_id).await;
     let _guard = lock.lock().await;
     if params.rev.is_none()
-        && let Some(resp) = cached_ref_response(&state, &owner, &repo, &branch, &params.clonepack)
+        && let Some(resp) = cached_ref_response(&state, &repo_id, &branch, &params.clonepack)
     {
         return (StatusCode::OK, Json(resp)).into_response();
     }
     // Skip the `git fetch` when the mirror was refreshed within the TTL — by a
     // recent resolve, or by the sync we just waited on while holding the lock.
     if !mirror_is_fresh(&state, &fresh_key) {
-        if let Err(e) =
-            ensure_mirror(&mirror_dir, &owner, &repo, &branch, github_token.as_ref()).await
-        {
+        if let Err(e) = ensure_mirror(&mirror_dir, &repo_id, &branch, github_token.as_ref()).await {
             state.metrics.record_error();
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1013,7 +1010,7 @@ async fn get_ref(
     let store_key = ref_store_key(&branch, params.rev.as_deref());
     let fallback = state
         .ref_store
-        .load_branch(&owner, &repo, &store_key)
+        .load_branch(&repo_id, &store_key)
         .await
         .ok()
         .flatten();
@@ -1056,9 +1053,13 @@ async fn get_ref(
                 build_status: None,
                 synced_at: None,
             });
+            let (resp_owner, resp_repo) = repo_id
+                .github_owner_repo()
+                .map(|(o, r)| (o.to_string(), r.to_string()))
+                .unwrap_or_else(|| (owner.clone(), repo.clone()));
             let resp = ref_response(
-                owner.clone(),
-                repo.clone(),
+                resp_owner,
+                resp_repo,
                 branch.clone(),
                 &info,
                 &state.storage,
@@ -1066,7 +1067,7 @@ async fn get_ref(
                 private,
             );
             if info.build_status.is_none() && params.rev.is_none() {
-                cache_ref_response(&state, &owner, &repo, &branch, &params.clonepack, &resp);
+                cache_ref_response(&state, &repo_id, &branch, &params.clonepack, &resp);
             }
             (StatusCode::OK, Json(resp)).into_response()
         }
@@ -1272,15 +1273,8 @@ async fn repo_status(
     if let Some(resp) = reject_invalid_repo_ids(&owner, &repo) {
         return resp;
     }
-    match build_repo_status(
-        &state,
-        &owner,
-        &repo,
-        query.public,
-        query.fork_of.as_deref(),
-    )
-    .await
-    {
+    let repo_id = RepoId::github(format!("{owner}/{repo}"));
+    match build_repo_status(&state, &repo_id, query.public, query.fork_of.as_deref()).await {
         Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
         Err(e) => {
             state.metrics.record_error();
@@ -1343,17 +1337,16 @@ fn collect_manifest_hashes(info: &crate::RefInfo) -> Vec<String> {
 
 async fn build_repo_status(
     state: &ServerState,
-    owner: &str,
-    repo: &str,
+    repo_id: &RepoId,
     public: bool,
     fork_of: Option<&str>,
 ) -> Result<RepoStatusResponse> {
-    let branches = state.ref_store.list_branches(owner, repo).await?;
+    let branches = state.ref_store.list_branches(repo_id).await?;
     let mut refs = Vec::new();
     let mut unique_chunks: HashMap<String, u64> = HashMap::new();
 
     for branch in branches {
-        let Some(info) = state.ref_store.load_branch(owner, repo, &branch).await? else {
+        let Some(info) = state.ref_store.load_branch(repo_id, &branch).await? else {
             continue;
         };
 
@@ -1441,9 +1434,13 @@ async fn build_repo_status(
         })
         .collect();
 
+    let (owner, repo) = repo_id
+        .github_owner_repo()
+        .map(|(o, r)| (o.to_string(), r.to_string()))
+        .unwrap_or_default();
     Ok(RepoStatusResponse {
-        owner: owner.to_string(),
-        repo: repo.to_string(),
+        owner,
+        repo,
         refs,
         total_bytes,
         total_unique_bytes,
@@ -1489,7 +1486,8 @@ async fn sync_repo(
         return resp;
     }
     let start = Instant::now();
-    let mirror_dir = state.repo_root.join(format!("{}_{}.git", owner, repo));
+    let repo_id = RepoId::github(format!("{owner}/{repo}"));
+    let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
     let branch = params.branch;
     let at_rev = params.rev;
     // Ref-store key: rev builds use a rolling test key isolated from the real
@@ -1516,7 +1514,8 @@ async fn sync_repo(
         // Include the rev override in the coalescing key so syncs targeting
         // different build commits don't share one build.
         let key = format!(
-            "{owner}/{repo}/{branch}#{}",
+            "{}/{branch}#{}",
+            repo_id.storage_key(),
             at_rev.as_deref().unwrap_or("")
         );
         let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
@@ -1534,8 +1533,7 @@ async fn sync_repo(
             // the gauge underflows).
             state.metrics.record_build_queued();
             let job = BuildJob {
-                owner: owner.clone(),
-                repo: repo.clone(),
+                repo_id: repo_id.clone(),
                 branch: branch.clone(),
                 rev: at_rev.clone(),
                 github_token,
@@ -1559,12 +1557,16 @@ async fn sync_repo(
         // than holding the connection until it is reset mid-request.
         let wait = Duration::from_secs(env_bytes("RIPCLONE_SYNC_WAIT_SECS", 25));
         match tokio::time::timeout(wait, rx).await {
-            Ok(Ok(Ok(()))) => match state.ref_store.load_branch(&owner, &repo, &ref_key).await {
+            Ok(Ok(Ok(()))) => match state.ref_store.load_branch(&repo_id, &ref_key).await {
                 Ok(Some(info)) => {
                     state.metrics.record_sync(start.elapsed());
+                    let (resp_owner, resp_repo) = repo_id
+                        .github_owner_repo()
+                        .map(|(o, r)| (o.to_string(), r.to_string()))
+                        .unwrap_or_else(|| (owner.clone(), repo.clone()));
                     let resp = ref_response(
-                        owner,
-                        repo,
+                        resp_owner,
+                        resp_repo,
                         branch.clone(),
                         &info,
                         &state.storage,
@@ -1616,13 +1618,12 @@ async fn sync_repo(
         }
     }
 
-    let lock = repo_lock(&state.sync_locks, &owner, &repo).await;
+    let lock = repo_lock(&state.sync_locks, &repo_id).await;
     let _guard = lock.lock().await;
     match do_sync(
         &state.cas,
         &mirror_dir,
-        &owner,
-        &repo,
+        &repo_id,
         &branch,
         at_rev.as_deref(),
         &state.ref_store,
@@ -1637,11 +1638,15 @@ async fn sync_repo(
             state.metrics.record_sync(start.elapsed());
             // The mirror was just fetched; let the immediately-following resolve
             // skip its own fetch.
-            stamp_mirror_fresh(&state, &format!("{}/{}/{}", owner, repo, branch));
-            invalidate_ref_response_cache(&state, &owner, &repo, &branch);
+            stamp_mirror_fresh(&state, &format!("{}/{}", repo_id.storage_key(), branch));
+            invalidate_ref_response_cache(&state, &repo_id, &branch);
+            let (resp_owner, resp_repo) = repo_id
+                .github_owner_repo()
+                .map(|(o, r)| (o.to_string(), r.to_string()))
+                .unwrap_or_else(|| (owner.clone(), repo.clone()));
             let resp = ref_response(
-                owner,
-                repo,
+                resp_owner,
+                resp_repo,
                 branch.clone(),
                 &info,
                 &state.storage,
@@ -1744,9 +1749,9 @@ async fn build_handler(
             .into_response();
     }
 
+    let job_repo_id = RepoId::github(format!("{}/{}", body.owner, body.repo));
     let job = BuildJob {
-        owner: body.owner,
-        repo: body.repo,
+        repo_id: job_repo_id,
         branch: "HEAD".to_string(),
         rev: None,
         github_token: state
@@ -1797,7 +1802,8 @@ async fn cat_file(
     {
         return resp;
     }
-    let mirror_dir = state.repo_root.join(format!("{}_{}.git", owner, repo));
+    let repo_id = RepoId::github(format!("{owner}/{repo}"));
+    let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
     let path = query.path;
     let branch = query.branch;
 
@@ -1841,7 +1847,8 @@ async fn file_sizes(
     {
         return resp;
     }
-    let mirror_dir = state.repo_root.join(format!("{}_{}.git", owner, repo));
+    let repo_id = RepoId::github(format!("{owner}/{repo}"));
+    let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
     let branch = query.branch;
 
     let result = tokio::task::spawn_blocking(move || {
@@ -1882,20 +1889,20 @@ async fn create_snapshot(
     {
         return resp;
     }
-    let mirror_dir = state.repo_root.join(format!("{}_{}.git", owner, repo));
+    let repo_id = RepoId::github(format!("{owner}/{repo}"));
+    let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
     let github_token = state
         .github_token
         .clone()
         .map(|s| secrecy::SecretString::new(s.into()));
     let branch = query.branch.clone();
 
-    let lock = repo_lock(&state.sync_locks, &owner, &repo).await;
+    let lock = repo_lock(&state.sync_locks, &repo_id).await;
     let _guard = lock.lock().await;
     let info = match do_sync(
         &state.cas,
         &mirror_dir,
-        &owner,
-        &repo,
+        &repo_id,
         &branch,
         None,
         &state.ref_store,
@@ -1907,7 +1914,7 @@ async fn create_snapshot(
     .await
     {
         Ok(info) => {
-            invalidate_ref_response_cache(&state, &owner, &repo, &branch);
+            invalidate_ref_response_cache(&state, &repo_id, &branch);
             drop(_guard);
             info
         }
@@ -1973,7 +1980,8 @@ async fn get_hotfiles(
     if let Some(resp) = reject_invalid_repo_ids(&owner, &repo) {
         return resp;
     }
-    let mirror_dir = state.repo_root.join(format!("{}_{}.git", owner, repo));
+    let repo_id = RepoId::github(format!("{owner}/{repo}"));
+    let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
     let branch = query.branch;
     let count = query.count;
 
@@ -2021,7 +2029,8 @@ async fn batch_files(
     {
         return resp;
     }
-    let mirror_dir = state.repo_root.join(format!("{}_{}.git", owner, repo));
+    let repo_id = RepoId::github(format!("{owner}/{repo}"));
+    let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
     let branch = body.branch;
     let commit_hint = body.commit;
     let paths = body.paths;
@@ -2678,8 +2687,7 @@ async fn settle_storage(
 async fn do_sync(
     cas: &Cas,
     mirror_dir: &std::path::Path,
-    owner: &str,
-    repo: &str,
+    repo_id: &RepoId,
     branch: &str,
     // Optional build-commit override (e.g. "HEAD~5"); when None the branch tip is
     // used. The branch is still the ref-store key and fetch target.
@@ -2690,7 +2698,7 @@ async fn do_sync(
     retention: &Arc<Retention>,
     github_token: Option<&secrecy::SecretString>,
 ) -> Result<RefInfo> {
-    info!("syncing {}/{}@{}", owner, repo, branch);
+    info!("syncing {}@{}", repo_id.storage_key(), branch);
 
     // Per-phase timers so sync cost can be tuned with real numbers (RIPCLONE_LOG
     // shows them at INFO). `t_total` spans the whole build; `t` is reset at each
@@ -2709,15 +2717,13 @@ async fn do_sync(
     // Sync the bare mirror synchronously (blocking git call).
     let mirror_dir_sync = mirror_dir.to_path_buf();
     let mirror_dir = mirror_dir.to_path_buf();
-    let owner_sync = owner.to_string();
-    let repo_sync = repo.to_string();
+    let repo_id_sync = repo_id.clone();
     let branch_sync = branch.to_string();
     let github_token = github_token.map(|s| s.expose_secret().to_string());
     tokio::task::spawn_blocking(move || {
         git::sync_bare_mirror(
             &mirror_dir_sync,
-            &owner_sync,
-            &repo_sync,
+            &repo_id_sync,
             &branch_sync,
             github_token.as_deref(),
         )
@@ -2748,13 +2754,13 @@ async fn do_sync(
     // Option-A carried-prior case, in-flight/failed phase 2, and the async
     // worker's transient "building" status (which would otherwise mask a prior
     // completed build).
-    if let Ok(Some(prev)) = ref_store.load_branch(owner, repo, branch).await
+    if let Ok(Some(prev)) = ref_store.load_branch(repo_id, branch).await
         && prev.full_clonepack.commit == commit
         && !prev.full_clonepack.manifest.is_empty()
     {
         info!(
             "sync no-op: {} already current at {} (reusing prior clonepack)",
-            repo,
+            repo_id.storage_key(),
             &commit[..7.min(commit.len())]
         );
         return Ok(prev);
@@ -2776,8 +2782,7 @@ async fn do_sync(
         return build_and_publish_two_phase(
             cas,
             &mirror_dir,
-            owner,
-            repo,
+            repo_id,
             branch,
             &commit,
             parent,
@@ -2842,7 +2847,7 @@ async fn do_sync(
     let lsm = lsm_cfg.enabled;
     let prev_levels: Vec<crate::HistoryLevel> = if lsm {
         ref_store
-            .load_branch(owner, repo, branch)
+            .load_branch(repo_id, branch)
             .await
             .ok()
             .flatten()
@@ -3336,14 +3341,13 @@ async fn do_sync(
     let mut info = info;
     info.build_status = None;
     ref_store
-        .save_branch(owner, repo, branch, &info)
+        .save_branch(repo_id, branch, &info)
         .await
-        .with_context(|| format!("persist ref store for {owner}/{repo}@{branch}"))?;
+        .with_context(|| format!("persist ref store for {}@{branch}", repo_id.storage_key()))?;
 
     info!(
-        "synced {}/{} at {} (total build {:?})",
-        owner,
-        repo,
+        "synced {} at {} (total build {:?})",
+        repo_id.storage_key(),
         &commit[..7],
         t_total.elapsed()
     );
@@ -3384,8 +3388,7 @@ struct HeadBuild {
 async fn build_and_publish_two_phase(
     cas: &Cas,
     mirror_dir: &std::path::Path,
-    owner: &str,
-    repo: &str,
+    repo_id: &RepoId,
     branch: &str,
     commit: &str,
     parent: Option<String>,
@@ -3400,11 +3403,7 @@ async fn build_and_publish_two_phase(
 
     // Load the previous synced ref once: used both for the files-table by-diff
     // below and for Option-A full-clonepack carry later in this phase.
-    let prev = ref_store
-        .load_branch(owner, repo, branch)
-        .await
-        .ok()
-        .flatten();
+    let prev = ref_store.load_branch(repo_id, branch).await.ok().flatten();
 
     // ---- PHASE 1: HEAD closure + archive + shallow skeleton -> publish depth=1 ----
     let mut t = Instant::now();
@@ -3693,9 +3692,9 @@ async fn build_and_publish_two_phase(
     settle_storage(cas, storage, retention, p1, head_idx_keep).await;
 
     ref_store
-        .save_branch(owner, repo, branch, &info)
+        .save_branch(repo_id, branch, &info)
         .await
-        .with_context(|| format!("persist depth=1 ref for {owner}/{repo}@{branch}"))?;
+        .with_context(|| format!("persist depth=1 ref for {}@{branch}", repo_id.storage_key()))?;
     info!(
         "two-phase p1: published depth=1 for {} in {:?} (full history building in background)",
         &commit[..7.min(commit.len())],
@@ -3709,7 +3708,8 @@ async fn build_and_publish_two_phase(
     let ref_store2 = ref_store.clone();
     let retention2 = retention.clone();
     let mirror2 = mirror_dir.to_path_buf();
-    let (owner2, repo2, branch2) = (owner.to_string(), repo.to_string(), branch.to_string());
+    let repo_id2 = repo_id.clone();
+    let branch2 = branch.to_string();
     let commit2 = commit.to_string();
     let parent2 = parent.clone();
     let default_branch2 = default_branch.to_string();
@@ -3724,8 +3724,7 @@ async fn build_and_publish_two_phase(
         let res = build_full_in_background(
             &cas2,
             &mirror2,
-            &owner2,
-            &repo2,
+            &repo_id2,
             &branch2,
             &commit2,
             parent2,
@@ -3756,7 +3755,10 @@ async fn build_and_publish_two_phase(
                 &commit2[..7.min(commit2.len())],
                 started.elapsed()
             ),
-            Err(e) => error!("full clone build failed for {owner2}/{repo2}: {e:#}"),
+            Err(e) => error!(
+                "full clone build failed for {}: {e:#}",
+                repo_id2.storage_key()
+            ),
         }
     });
 
@@ -3769,8 +3771,7 @@ async fn build_and_publish_two_phase(
 async fn build_full_in_background(
     cas: &Cas,
     mirror_dir: &std::path::Path,
-    owner: &str,
-    repo: &str,
+    repo_id: &RepoId,
     branch: &str,
     commit: &str,
     parent: Option<String>,
@@ -3986,7 +3987,7 @@ async fn build_full_in_background(
     // archive is built below; a files clone waits for it.
     {
         let mut info = ref_store
-            .load_branch(owner, repo, branch)
+            .load_branch(repo_id, branch)
             .await?
             .ok_or_else(|| anyhow::anyhow!("ref vanished before editable publish"))?;
         let mut all_packs = head_packs.clone();
@@ -4023,9 +4024,9 @@ async fn build_full_in_background(
         }
         info.build_status = Some("archive building".to_string());
         ref_store
-            .save_branch(owner, repo, branch, &info)
+            .save_branch(repo_id, branch, &info)
             .await
-            .with_context(|| format!("persist editable ref for {owner}/{repo}@{branch}"))?;
+            .with_context(|| format!("persist editable ref for {}@{branch}", repo_id.storage_key()))?;
     }
     settle_storage(cas, storage, retention, uploads, idx_keep).await;
     info!(
@@ -4082,7 +4083,7 @@ async fn build_full_in_background(
     // commit (a newer sync owns it otherwise, and brings its own archive).
     {
         let mut info = ref_store
-            .load_branch(owner, repo, branch)
+            .load_branch(repo_id, branch)
             .await?
             .ok_or_else(|| anyhow::anyhow!("ref vanished before archive publish"))?;
         if info.commit == commit {
@@ -4096,9 +4097,9 @@ async fn build_full_in_background(
             info.archive_frames = archive_frames;
             info.build_status = None;
             ref_store
-                .save_branch(owner, repo, branch, &info)
+                .save_branch(repo_id, branch, &info)
                 .await
-                .with_context(|| format!("persist files ref for {owner}/{repo}@{branch}"))?;
+                .with_context(|| format!("persist files ref for {}@{branch}", repo_id.storage_key()))?;
         }
     }
     settle_storage(
@@ -4123,25 +4124,23 @@ fn spawn_build_worker(state: ServerState) -> tokio::sync::mpsc::Sender<BuildJob>
 
     tokio::spawn(async move {
         while let Some(job) = rx.recv().await {
-            let owner = job.owner.clone();
-            let repo = job.repo.clone();
+            let repo_id = job.repo_id.clone();
             let branch = job.branch.clone();
             let at_rev = job.rev.clone();
             let state = state.clone();
 
             // Mark as building in the shared ref store.
-            let _ = update_build_status(&state, &owner, &repo, "building").await;
-            invalidate_ref_response_cache(&state, &owner, &repo, &branch);
+            let _ = update_build_status(&state, &repo_id, "building").await;
+            invalidate_ref_response_cache(&state, &repo_id, &branch);
 
             let start = std::time::Instant::now();
-            let mirror_dir = state.repo_root.join(format!("{}_{}.git", owner, repo));
-            let lock = repo_lock(&state.sync_locks, &owner, &repo).await;
+            let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
+            let lock = repo_lock(&state.sync_locks, &repo_id).await;
             let _guard = lock.lock().await;
             let result = do_sync(
                 &state.cas,
                 &mirror_dir,
-                &owner,
-                &repo,
+                &repo_id,
                 &branch,
                 at_rev.as_deref(),
                 &state.ref_store,
@@ -4157,27 +4156,33 @@ fn spawn_build_worker(state: ServerState) -> tokio::sync::mpsc::Sender<BuildJob>
             let waiter_result: Result<(), String> = match &result {
                 Ok(_) => {
                     state.metrics.record_build_completed(start.elapsed());
-                    let _ = update_build_status(&state, &owner, &repo, "done").await;
+                    let _ = update_build_status(&state, &repo_id, "done").await;
                     // A successful sync marks the mirror fresh so the waiter's
                     // resolve doesn't re-fetch.
-                    stamp_mirror_fresh(&state, &format!("{owner}/{repo}/{branch}"));
-                    invalidate_ref_response_cache(&state, &owner, &repo, &branch);
-                    info!("background build completed for {owner}/{repo}@{branch}");
+                    stamp_mirror_fresh(&state, &format!("{}/{branch}", repo_id.storage_key()));
+                    invalidate_ref_response_cache(&state, &repo_id, &branch);
+                    info!(
+                        "background build completed for {}@{branch}",
+                        repo_id.storage_key()
+                    );
                     Ok(())
                 }
                 Err(e) => {
                     state.metrics.record_build_failed();
-                    let _ =
-                        update_build_status(&state, &owner, &repo, &format!("failed: {e}")).await;
-                    invalidate_ref_response_cache(&state, &owner, &repo, &branch);
-                    warn!("background build failed for {owner}/{repo}@{branch}: {e}");
+                    let _ = update_build_status(&state, &repo_id, &format!("failed: {e}")).await;
+                    invalidate_ref_response_cache(&state, &repo_id, &branch);
+                    warn!(
+                        "background build failed for {}@{branch}: {e}",
+                        repo_id.storage_key()
+                    );
                     Err(format!("{e}"))
                 }
             };
             // Signal every waiter for this key (coalesced /sync requests). Must
             // match the enqueue key, which includes the rev override.
             let key = format!(
-                "{owner}/{repo}/{branch}#{}",
+                "{}/{branch}#{}",
+                repo_id.storage_key(),
                 at_rev.as_deref().unwrap_or("")
             );
             if let Some(senders) = state.build_waiters.lock().await.remove(&key) {
@@ -4191,13 +4196,8 @@ fn spawn_build_worker(state: ServerState) -> tokio::sync::mpsc::Sender<BuildJob>
     tx
 }
 
-async fn update_build_status(
-    state: &ServerState,
-    owner: &str,
-    repo: &str,
-    status: &str,
-) -> Result<()> {
-    let mut info = match state.ref_store.load(owner, repo).await? {
+async fn update_build_status(state: &ServerState, repo_id: &RepoId, status: &str) -> Result<()> {
+    let mut info = match state.ref_store.load(repo_id).await? {
         Some(info) => info,
         None => RefInfo {
             commit: String::new(),
@@ -4228,7 +4228,7 @@ async fn update_build_status(
         },
     };
     info.build_status = Some(status.to_string());
-    state.ref_store.save(owner, repo, &info).await?;
+    state.ref_store.save(repo_id, &info).await?;
     Ok(())
 }
 
@@ -4262,6 +4262,8 @@ pub async fn run_server(
     if github_token.is_some() {
         info!("RIPCLONE_GITHUB_TOKEN configured; private repo sync enabled");
     }
+
+    let provider_registry = ProviderRegistry::new();
 
     let rate_burst: u32 = env::var("RIPCLONE_RATE_LIMIT_BURST")
         .ok()
@@ -4334,6 +4336,7 @@ pub async fn run_server(
         storage,
         repo_root: repo_root.to_path_buf(),
         ref_store,
+        provider_registry,
         token_hash: Some(token_hash),
         github_token,
         metrics,
@@ -4395,6 +4398,7 @@ mod tests {
             storage,
             repo_root,
             ref_store,
+            provider_registry: ProviderRegistry::new(),
             token_hash: Some(token_hash),
             github_token: None,
             metrics,
@@ -4569,25 +4573,24 @@ mod tests {
             archive_ready: true,
         };
 
-        cache_ref_response(&state, "acme", "secret", "main", "shallow", &resp);
-        let cached = cached_ref_response(&state, "acme", "secret", "main", "shallow")
+        let cache_repo_id = RepoId::github("acme/secret");
+        cache_ref_response(&state, &cache_repo_id, "main", "shallow", &resp);
+        let cached = cached_ref_response(&state, &cache_repo_id, "main", "shallow")
             .expect("cached ref response");
         assert_eq!(cached.commit, "commit1");
         assert_eq!(
             cached.clonepack_manifest_url.as_deref(),
             Some("https://example.invalid/manifest")
         );
-        assert!(cached_ref_response(&state, "acme", "secret", "main", "full").is_none());
+        assert!(cached_ref_response(&state, &cache_repo_id, "main", "full").is_none());
 
-        invalidate_ref_response_cache(&state, "acme", "secret", "main");
-        assert!(cached_ref_response(&state, "acme", "secret", "main", "shallow").is_none());
+        invalidate_ref_response_cache(&state, &cache_repo_id, "main");
+        assert!(cached_ref_response(&state, &cache_repo_id, "main", "shallow").is_none());
 
         let mut no_cache_state = state;
         no_cache_state.mirror_fresh_ttl = Duration::ZERO;
-        cache_ref_response(&no_cache_state, "acme", "secret", "main", "shallow", &resp);
-        assert!(
-            cached_ref_response(&no_cache_state, "acme", "secret", "main", "shallow").is_none()
-        );
+        cache_ref_response(&no_cache_state, &cache_repo_id, "main", "shallow", &resp);
+        assert!(cached_ref_response(&no_cache_state, &cache_repo_id, "main", "shallow").is_none());
     }
 
     fn test_request(method: &str, uri: &str) -> axum::http::Request<Body> {
@@ -4888,7 +4891,7 @@ mod tests {
         };
         state
             .ref_store
-            .save_branch("acme", "secret", "main", &info)
+            .save_branch(&RepoId::github("acme/secret"), "main", &info)
             .await
             .unwrap();
 
@@ -4984,12 +4987,12 @@ mod tests {
         };
         state
             .ref_store
-            .save_branch("acme", "secret", "main", &info)
+            .save_branch(&RepoId::github("acme/secret"), "main", &info)
             .await
             .unwrap();
         state
             .ref_store
-            .save_branch("acme", "secret", "develop", &info)
+            .save_branch(&RepoId::github("acme/secret"), "develop", &info)
             .await
             .unwrap();
 
@@ -5076,7 +5079,7 @@ mod tests {
         };
         state
             .ref_store
-            .save_branch("acme", "fork", "main", &info)
+            .save_branch(&RepoId::github("acme/fork"), "main", &info)
             .await
             .unwrap();
 
@@ -5166,7 +5169,7 @@ mod tests {
         };
         state
             .ref_store
-            .save_branch("acme", "secret", "main", &info)
+            .save_branch(&RepoId::github("acme/secret"), "main", &info)
             .await
             .unwrap();
 
@@ -5248,7 +5251,7 @@ mod tests {
         };
         state
             .ref_store
-            .save_branch("acme", "secret", "main", &info)
+            .save_branch(&RepoId::github("acme/secret"), "main", &info)
             .await
             .unwrap();
 
