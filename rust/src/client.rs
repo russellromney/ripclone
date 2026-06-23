@@ -13,7 +13,6 @@ use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::{Mutex as TokioMutex, Notify};
 use tracing::{info, warn};
 
 #[derive(Debug, Clone, Deserialize)]
@@ -723,20 +722,17 @@ impl Client {
             anyhow::bail!("ref is missing clonepack manifest; run sync first");
         }
 
-        // Shared manifest slot. Download tasks wait on this before verifying the
-        // content hash of each chunk.
-        let manifest_slot: Arc<TokioMutex<Option<Arc<ClonepackManifest>>>> =
-            Arc::new(TokioMutex::new(None));
-        let manifest_ready: Arc<Notify> = Arc::new(Notify::new());
+        // Hand the decoded manifest to the archive downloader over a oneshot.
+        // It latches the value (no lost-wakeup race) and signals manifest
+        // failure by dropping the sender (the receiver then errors), so the
+        // downloader can never hang waiting for a manifest that will never come.
+        let (manifest_tx, manifest_rx) = tokio::sync::oneshot::channel::<Arc<ClonepackManifest>>();
 
         // 2. Start manifest + metadata downloads concurrently.
-        let manifest_slot2 = Arc::clone(&manifest_slot);
-        let manifest_ready2 = Arc::clone(&manifest_ready);
         let manifest_task = self.clone().spawn_fetch_manifest(
             info.clonepack_manifest.clone(),
             info.clonepack_manifest_url.clone(),
-            manifest_slot2,
-            manifest_ready2,
+            manifest_tx,
         );
 
         let metadata_hash = info.metadata_chunk.clone();
@@ -767,14 +763,13 @@ impl Client {
         let archive_urls = info.archive_chunk_urls.clone();
         let archive_downloads = if mode.needs_archive() {
             bench.start_archive_download();
-            Some(self.clone().spawn_chunk_downloads(
-                archive_urls,
-                Arc::clone(&manifest_slot),
-                Arc::clone(&manifest_ready),
-                archive_tx,
-            ))
+            Some(
+                self.clone()
+                    .spawn_chunk_downloads(archive_urls, manifest_rx, archive_tx),
+            )
         } else {
             drop(archive_tx);
+            drop(manifest_rx);
             None
         };
 
@@ -1421,8 +1416,7 @@ impl Client {
         self,
         hash: String,
         signed_url: Option<String>,
-        manifest_slot: Arc<TokioMutex<Option<Arc<ClonepackManifest>>>>,
-        manifest_ready: Arc<Notify>,
+        manifest_tx: tokio::sync::oneshot::Sender<Arc<ClonepackManifest>>,
     ) -> tokio::task::JoinHandle<Result<Arc<ClonepackManifest>>> {
         tokio::spawn(async move {
             let data = self
@@ -1440,8 +1434,10 @@ impl Client {
                 manifest.head_blobs_chunks.push(pack);
             }
             let manifest = Arc::new(manifest);
-            *manifest_slot.lock().await = Some(Arc::clone(&manifest));
-            manifest_ready.notify_waiters();
+            // Hand the manifest to the downloader. Ignore the error: the receiver
+            // is absent in non-archive modes. On the failure paths above, the
+            // sender is dropped instead, so the receiver observes the failure.
+            let _ = manifest_tx.send(Arc::clone(&manifest));
             Ok(manifest)
         })
     }
@@ -1465,8 +1461,7 @@ impl Client {
     fn spawn_chunk_downloads(
         self,
         signed_urls: Option<Vec<Option<String>>>,
-        manifest_slot: Arc<TokioMutex<Option<Arc<ClonepackManifest>>>>,
-        manifest_ready: Arc<Notify>,
+        manifest_rx: tokio::sync::oneshot::Receiver<Arc<ClonepackManifest>>,
         tx: Sender<(usize, Result<Vec<u8>>)>,
     ) -> tokio::task::JoinHandle<Result<u64>> {
         tokio::spawn(async move {
@@ -1474,14 +1469,15 @@ impl Client {
             let mut total_bytes = 0u64;
             let mut handles = Vec::new();
 
-            // Wait until the manifest is available so the downloader follows
-            // the manifest's chunk table, not a possibly stale signed URL list.
-            manifest_ready.notified().await;
-            let manifest = manifest_slot
-                .lock()
-                .await
-                .clone()
-                .context("manifest missing after notify")?;
+            // Wait for the manifest so the downloader follows its chunk table,
+            // not a possibly-stale signed-URL list. A receive error means the
+            // manifest fetch failed (sender dropped); stop and let `tx` drop so
+            // the extractor sees EOF. The real error surfaces from the manifest
+            // task itself.
+            let manifest = match manifest_rx.await {
+                Ok(manifest) => manifest,
+                Err(_) => return Ok(0),
+            };
             // Bound concurrent chunk downloads. With CDC the archive can have
             // hundreds-to-thousands of chunks (one per ~4 MiB frame); without a
             // cap, spawning a request + buffering a frame for every chunk at once

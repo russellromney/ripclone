@@ -431,14 +431,19 @@ impl StorageBackend for S3Storage {
     }
 
     fn health(&self) -> Result<()> {
-        // NOTE: no dedicated S3 probe here. The sync StorageBackend::health would
-        // have to drive an S3 round-trip through block_on, which is awkward and
-        // hard to verify. In the normal all-S3 deployment the ref store is also
-        // S3-backed (S3RefStore), and S3RefStore::health performs a real bucket
-        // reachability probe — so /readyz still fails when the bucket is down. A
-        // dedicated storage-side S3 probe is a follow-up for the rare mixed
-        // (S3 storage + non-S3 ref store) configuration.
-        Ok(())
+        // Reachability probe: list with a prefix that matches nothing. Reachable
+        // + authorized => Ok (even if empty); unreachable / bad creds => Err.
+        // Relies on the S3 client's request timeout; the readiness handler
+        // caches the result (~3s) so this runs at most once per TTL. Mirrors the
+        // `block_on` pattern used by `size()`/`get()`.
+        let req = self
+            .client
+            .objects()
+            .list_v2(&self.bucket)
+            .prefix("__ripclone_readyz_probe__/none/")
+            .context("build S3 health list request")?;
+        self.block_on(move || async move { req.send().await.context("S3 storage unreachable") })
+            .map(|_| ())
     }
 }
 

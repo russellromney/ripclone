@@ -67,9 +67,8 @@ pub trait StorageBackend: Send + Sync {
 
     /// Cheap readiness probe used by `/readyz`. Should confirm the backend is
     /// reachable without doing real work. Default assumes healthy; the local
-    /// backend does a real write probe. The S3 backend relies on the (also
-    /// S3-backed) ref-store probe for bucket reachability in the normal all-S3
-    /// deployment — see the note on `S3Storage`.
+    /// backend does a write probe and the S3 backend does a bucket-reachability
+    /// probe. Any new durable/remote backend should override this.
     fn health(&self) -> Result<()> {
         Ok(())
     }
