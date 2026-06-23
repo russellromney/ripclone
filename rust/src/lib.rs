@@ -13,6 +13,7 @@ pub mod blob_pack;
 pub mod cas;
 pub mod client;
 pub mod clonepack;
+pub mod config;
 pub mod extract;
 pub mod fusefs;
 pub mod git;

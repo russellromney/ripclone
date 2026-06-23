@@ -5,23 +5,22 @@ use ripclone::bench::Benchmark;
 use ripclone::client::Client;
 use ripclone::extract::extract_archive;
 use ripclone::mode::{CloneMode, resolve_mode};
-use ripclone::ref_store::{CachingRefStore, FileRefStore, S3RefStore};
-use ripclone::remote_gc::{GcConfig, RemoteGc};
 use ripclone::snapshot::extract_snapshot;
-use ripclone::storage::{S3Storage, local};
 use sha2::{Digest, Sha256};
 use std::env;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Duration;
 
 #[derive(Parser)]
 #[command(name = "ripclone")]
 #[command(about = "CAS-based git clone helper")]
 struct Args {
-    #[arg(short, long, default_value = "http://localhost:8000")]
-    server: String,
+    /// ripclone server. Defaults to the managed cloud; set RIPCLONE_SERVER or
+    /// pass --server http://localhost:8000 to point at a self-hosted backend.
+    /// When unset, falls back to the server saved by `ripclone login`, then the
+    /// managed cloud. (Resolution: --server > RIPCLONE_SERVER > config > cloud.)
+    #[arg(short, long, env = "RIPCLONE_SERVER")]
+    server: Option<String>,
 
     #[command(subcommand)]
     command: Commands,
@@ -29,6 +28,10 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Authorize this machine against the ripclone cloud (saves a token).
+    Login,
+    /// Remove the saved token.
+    Logout,
     /// Sync a repo on the server.
     Sync {
         repo: String,
@@ -44,21 +47,6 @@ enum Commands {
         /// GitHub token to use for this sync only. Overrides RIPCLONE_GITHUB_TOKEN.
         #[arg(short, long, env = "RIPCLONE_GITHUB_TOKEN")]
         github_token: Option<String>,
-    },
-    /// Run remote garbage collection against the configured storage backend.
-    RemoteGc {
-        /// Local CAS / cache directory.
-        #[arg(long, default_value = "/data/cache")]
-        cas_dir: PathBuf,
-        /// Local repo root (used for the filesystem ref store when S3 is off).
-        #[arg(long, default_value = "/data/repos")]
-        repo_root: PathBuf,
-        /// Grace period in hours before an unreferenced object can be deleted.
-        #[arg(long)]
-        grace_hours: Option<u64>,
-        /// Log what would be deleted without deleting.
-        #[arg(long)]
-        dry_run: bool,
     },
     /// Clone a repo using a snapshot and a background sidecar.
     Clone {
@@ -246,6 +234,101 @@ fn owner_repo_from_origin(repo_dir: &std::path::Path) -> Result<(String, String)
     parse_origin_url(&url)
 }
 
+#[derive(serde::Deserialize)]
+struct DeviceStart {
+    device_code: String,
+    user_code: String,
+    verification_uri: String,
+    verification_uri_complete: String,
+    #[serde(default)]
+    interval: u64,
+    #[serde(default)]
+    expires_in: u64,
+}
+
+#[derive(serde::Deserialize)]
+struct DevicePoll {
+    status: String,
+    #[serde(default)]
+    token: Option<String>,
+}
+
+/// `ripclone login`: start a device flow, wait for browser approval, save the token.
+async fn run_login(server: &str) -> Result<()> {
+    let http = reqwest::Client::builder()
+        .user_agent(concat!("ripclone/", env!("CARGO_PKG_VERSION")))
+        .build()?;
+
+    let start: DeviceStart = http
+        .post(format!("{server}/cli/device"))
+        .send()
+        .await?
+        .error_for_status()
+        .context("starting login")?
+        .json()
+        .await?;
+
+    println!();
+    println!("  To authorize ripclone, open:\n");
+    println!("    {}\n", start.verification_uri);
+    println!("  and enter the code:  {}\n", start.user_code);
+    open_browser(&start.verification_uri_complete);
+    println!("  Waiting for approval…");
+
+    let interval = start.interval.max(1);
+    let max_secs = if start.expires_in == 0 {
+        600
+    } else {
+        start.expires_in
+    };
+    let mut waited = 0u64;
+    let token = loop {
+        tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+        waited += interval;
+        if waited > max_secs {
+            anyhow::bail!("login timed out — run `ripclone login` again");
+        }
+        let resp = http
+            .post(format!("{server}/cli/device/token"))
+            .json(&serde_json::json!({ "device_code": start.device_code }))
+            .send()
+            .await?;
+        let poll: DevicePoll = resp.json().await?;
+        match poll.status.as_str() {
+            "approved" => {
+                break poll.token.context("approved but no token returned")?;
+            }
+            "pending" => continue,
+            "denied" => anyhow::bail!("login was denied"),
+            "expired" => anyhow::bail!("login expired — run `ripclone login` again"),
+            other => anyhow::bail!("login failed: {other}"),
+        }
+    };
+
+    let mut cfg = ripclone::config::load();
+    cfg.token = Some(token);
+    cfg.server = Some(server.to_string());
+    ripclone::config::save(&cfg)?;
+    let where_ = ripclone::config::config_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    println!("\n  ✓ Logged in. Token saved to {where_}");
+    Ok(())
+}
+
+/// Best-effort: open the verification URL in the user's browser. Never fails.
+fn open_browser(url: &str) {
+    #[cfg(target_os = "macos")]
+    let prog: Option<&str> = Some("open");
+    #[cfg(target_os = "linux")]
+    let prog: Option<&str> = Some("xdg-open");
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let prog: Option<&str> = None;
+    if let Some(cmd) = prog {
+        let _ = std::process::Command::new(cmd).arg(url).spawn();
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -253,6 +336,30 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+    let config = ripclone::config::load();
+
+    // Server precedence: --server / RIPCLONE_SERVER (both land in args.server) >
+    // the server saved by `ripclone login` > the managed cloud default. This is
+    // what makes a self-host `login` then bare `clone` talk to the right server.
+    let server = args
+        .server
+        .clone()
+        .or_else(|| config.server.clone())
+        .unwrap_or_else(|| "https://ripclone.com".to_string());
+
+    // login/logout don't need an authenticated client.
+    match &args.command {
+        Commands::Login => return run_login(&server).await,
+        Commands::Logout => {
+            ripclone::config::clear_token()?;
+            println!("Logged out — token removed.");
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    // Token precedence: RIPCLONE_TOKEN_HASH > RIPCLONE_TOKEN (env) > the token
+    // saved by `ripclone login`. Raw tokens are hashed before being sent.
     let token_hash = env::var("RIPCLONE_TOKEN_HASH")
         .ok()
         .filter(|t| !t.is_empty())
@@ -261,13 +368,22 @@ async fn main() -> Result<()> {
                 .ok()
                 .filter(|t| !t.is_empty())
                 .map(|t| format!("{:x}", Sha256::digest(t.as_bytes())))
+        })
+        .or_else(|| {
+            config
+                .token
+                .as_deref()
+                .filter(|t| !t.is_empty())
+                .map(|t| format!("{:x}", Sha256::digest(t.as_bytes())))
         });
     let client = match token_hash {
-        Some(token) => Client::new_with_token(args.server.clone(), Some(token)),
-        None => Client::new(args.server.clone()),
+        Some(token) => Client::new_with_token(server.clone(), Some(token)),
+        None => Client::new(server.clone()),
     };
 
     match args.command {
+        // Handled before the client is built.
+        Commands::Login | Commands::Logout => unreachable!(),
         Commands::Sync {
             repo,
             depth,
@@ -285,38 +401,6 @@ async fn main() -> Result<()> {
                 )
                 .await?;
             println!("synced {} to {}", repo, info.commit);
-        }
-        Commands::RemoteGc {
-            cas_dir,
-            repo_root,
-            grace_hours,
-            dry_run,
-        } => {
-            std::fs::create_dir_all(&cas_dir)?;
-            std::fs::create_dir_all(&repo_root)?;
-
-            let s3_storage = S3Storage::from_env().context("initialize S3 storage")?;
-            let (storage, ref_store): (
-                ripclone::storage::StorageRef,
-                Arc<dyn ripclone::ref_store::RefStore>,
-            ) = if let Some(s3) = s3_storage {
-                let s3 = Arc::new(s3);
-                let store = CachingRefStore::new(S3RefStore::new(s3.clone()));
-                (s3 as ripclone::storage::StorageRef, Arc::new(store))
-            } else {
-                let store = CachingRefStore::new(FileRefStore::new(&repo_root));
-                (local(&cas_dir)?, Arc::new(store))
-            };
-
-            let mut config = GcConfig::from_env();
-            if let Some(hours) = grace_hours {
-                config.grace_period = Duration::from_secs(hours * 60 * 60);
-            }
-            config.dry_run = dry_run;
-
-            let gc = RemoteGc::new(storage, ref_store, config);
-            let report = gc.run().await?;
-            println!("remote GC report: {:#?}", report);
         }
         Commands::Clone {
             repo,
@@ -416,7 +500,7 @@ async fn main() -> Result<()> {
                 .output()?
                 .stdout;
             let commit = String::from_utf8(commit)?.trim().to_string();
-            let server = args.server.clone();
+            let server = server.clone();
             let branch = branch.to_string();
             let sizes = client.fetch_sizes(&owner, &repo_name, &branch).await?;
             println!(

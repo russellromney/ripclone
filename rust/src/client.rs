@@ -15,6 +15,68 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::{info, warn};
 
+/// Sent on every request so the server can attribute usage and nudge upgrades.
+const USER_AGENT: &str = concat!("ripclone/", env!("CARGO_PKG_VERSION"));
+
+#[derive(Debug, Deserialize)]
+struct ServerError {
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    code: Option<String>,
+}
+
+/// Turn a non-success HTTP response into a clear, actionable error. Parses the
+/// `{ "error", "code" }` body the gateway returns and appends a next-step hint
+/// keyed on status/code. Surfaces an upgrade nudge from `X-Ripclone-Upgrade`.
+async fn server_error(context: &str, resp: reqwest::Response) -> anyhow::Error {
+    let status = resp.status();
+    let upgrade = resp
+        .headers()
+        .get("x-ripclone-upgrade")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let text = resp.text().await.unwrap_or_default();
+    let parsed: Option<ServerError> = serde_json::from_str(&text).ok();
+    let code = parsed.as_ref().and_then(|p| p.code.as_deref());
+    let msg: String = parsed
+        .as_ref()
+        .and_then(|p| p.error.clone())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            if text.is_empty() {
+                status.to_string()
+            } else {
+                text.clone()
+            }
+        });
+    let hint = match (status.as_u16(), code) {
+        (401, _) => "\n  → set RIPCLONE_TOKEN (create one at https://ripclone.com/tokens)",
+        (403, Some("no_plan")) => {
+            "\n  → this org needs a plan; the owner can subscribe at https://ripclone.com"
+        }
+        (403, Some("no_access")) => "\n  → you don't have GitHub access to this repo",
+        (403, _) => "\n  → the org may need a plan, or you lack GitHub access",
+        (429, _) => "\n  → rate limited; wait a moment and retry",
+        (502 | 503, _) => "\n  → ripclone is briefly unavailable; retry shortly",
+        _ => "",
+    };
+    if let Some(u) = upgrade {
+        eprintln!("ripclone: {u}");
+    }
+    anyhow::anyhow!("{context}: {msg}{hint}")
+}
+
+/// Build a reqwest client that always sends our User-Agent (and any default
+/// headers, e.g. the auth token).
+fn build_http_client(headers: reqwest::header::HeaderMap) -> reqwest::Client {
+    reqwest::ClientBuilder::new()
+        .user_agent(USER_AGENT)
+        .default_headers(headers)
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct RefResponse {
     pub owner: String,
@@ -274,25 +336,19 @@ impl Client {
         token: Option<String>,
         cache_dir: Option<&Path>,
     ) -> Self {
-        let http = match &token {
-            Some(token) => {
-                let mut headers = reqwest::header::HeaderMap::new();
-                let value = format!("Ripclone {}", token);
-                if let Ok(header_value) = reqwest::header::HeaderValue::from_str(&value) {
-                    headers.insert(reqwest::header::AUTHORIZATION, header_value);
-                }
-                reqwest::ClientBuilder::new()
-                    .default_headers(headers)
-                    .build()
-                    .unwrap_or_else(|_| reqwest::Client::new())
+        let mut headers = reqwest::header::HeaderMap::new();
+        if let Some(token) = &token {
+            let value = format!("Ripclone {}", token);
+            if let Ok(header_value) = reqwest::header::HeaderValue::from_str(&value) {
+                headers.insert(reqwest::header::AUTHORIZATION, header_value);
             }
-            None => reqwest::Client::new(),
-        };
+        }
+        let http = build_http_client(headers);
         let cache = cache_dir.and_then(|dir| Cas::new(dir).ok());
         Self {
             server,
             http,
-            raw_http: reqwest::Client::new(),
+            raw_http: build_http_client(reqwest::header::HeaderMap::new()),
             token,
             cache,
         }
@@ -341,12 +397,34 @@ impl Client {
             url.push('?');
             url.push_str(&q.join("&"));
         }
-        let resp = self.http.get(&url).send().await?;
-        if !resp.status().is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("ref lookup failed: {}", text);
+        // The cloud returns 202 while it warms a cold repo (the webhook-sync
+        // queue builds it on demand), or 503 if its queue is briefly full. Poll
+        // the same request until it's built, then read the ref.
+        let max_attempts = std::env::var("RIPCLONE_CLONE_MAX_ATTEMPTS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(40usize);
+        for attempt in 0..max_attempts {
+            let resp = self.http.get(&url).send().await?;
+            let status = resp.status();
+            if status.is_success() {
+                return Ok(resp.json().await?);
+            }
+            if status == reqwest::StatusCode::ACCEPTED
+                || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+            {
+                if attempt == 0 {
+                    eprintln!("ripclone: warming {owner}/{repo} — this can take a moment…");
+                }
+                if attempt + 1 < max_attempts {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    continue;
+                }
+                anyhow::bail!("{owner}/{repo} is still building after {max_attempts} attempts");
+            }
+            return Err(server_error("ref lookup failed", resp).await);
         }
-        Ok(resp.json().await?)
+        anyhow::bail!("ref lookup did not complete")
     }
 
     pub async fn fetch_pack(&self, hash: &str) -> Result<Vec<u8>> {
@@ -526,8 +604,7 @@ impl Client {
         );
         let resp = self.http.post(&url).send().await?;
         if !resp.status().is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("snapshot create failed: {}", text);
+            return Err(server_error("snapshot create failed", resp).await);
         }
         Ok(resp.json().await?)
     }
@@ -549,8 +626,7 @@ impl Client {
         );
         let resp = self.http.get(&url).send().await?;
         if !resp.status().is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("hotfiles failed: {}", text);
+            return Err(server_error("hotfiles failed", resp).await);
         }
         let body: HotfilesResponse = resp.json().await?;
         Ok(body.files)
@@ -573,8 +649,7 @@ impl Client {
         });
         let resp = self.http.post(&url).json(&body).send().await?;
         if !resp.status().is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("batch fetch failed: {}", text);
+            return Err(server_error("batch fetch failed", resp).await);
         }
         Ok(resp.bytes().await?.to_vec())
     }
@@ -641,8 +716,7 @@ impl Client {
                 }
                 anyhow::bail!("sync still building after {max_attempts} attempts");
             }
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("sync failed: {}", text);
+            return Err(server_error("sync failed", resp).await);
         }
         anyhow::bail!("sync did not complete")
     }
@@ -2312,8 +2386,7 @@ impl Client {
         );
         let resp = self.http.get(&url).send().await?;
         if !resp.status().is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("cat failed: {}", text);
+            return Err(server_error("cat failed", resp).await);
         }
         Ok(resp.bytes().await?.to_vec())
     }
@@ -2331,8 +2404,7 @@ impl Client {
         );
         let resp = self.http.get(&url).send().await?;
         if !resp.status().is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("sizes failed: {}", text);
+            return Err(server_error("sizes failed", resp).await);
         }
         Ok(resp.json().await?)
     }
