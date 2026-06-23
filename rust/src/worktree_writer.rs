@@ -1040,8 +1040,14 @@ mod linux_uring {
             // CQ than requested, this keeps us from ever overflowing it.
             let cq_window_capacity =
                 (ring.params().cq_entries() as usize / (MAX_BATCH_FILES * 4)).max(1);
-            let max_inflight = DESIRED_INFLIGHT
-                .with(|c| c.get())
+            // The scheduler sets the depth per submitter via the thread-local;
+            // for the plain per-thread path, `RIPCLONE_IO_URING_DEPTH` lets us
+            // tune overlap without the scheduler at all.
+            let desired = std::env::var("RIPCLONE_IO_URING_DEPTH")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or_else(|| DESIRED_INFLIGHT.with(|c| c.get()));
+            let max_inflight = desired
                 .clamp(1, MAX_INFLIGHT_WINDOWS)
                 .min(cq_window_capacity);
             Ok(Self {
