@@ -71,6 +71,126 @@ pub(crate) fn head_blobs_chunk_refs(
     }
 }
 
+/// `(max_attempts, base_backoff_ms)` for artifact downloads, from the
+/// environment. Defaults: 3 attempts, 100 ms base backoff.
+fn fetch_retry_config() -> (u32, u64) {
+    let attempts = std::env::var("RIPCLONE_FETCH_MAX_ATTEMPTS")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(3)
+        .max(1);
+    let backoff_ms = std::env::var("RIPCLONE_FETCH_BACKOFF_MS")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(100);
+    (attempts, backoff_ms)
+}
+
+/// Exponential backoff with jitter for retry `attempt` (1-based), capped at 5 s.
+/// Jitter (in `[capped/2, capped]`) decorrelates the retries of concurrent
+/// fetches so they don't hammer a recovering server in lockstep.
+fn fetch_backoff(base_ms: u64, attempt: u32) -> std::time::Duration {
+    let mult = 1u64 << attempt.saturating_sub(1).min(16);
+    let capped = base_ms.saturating_mul(mult).min(5_000);
+    if capped == 0 {
+        return std::time::Duration::from_millis(0);
+    }
+    let half = capped / 2;
+    let span = capped - half;
+    let jitter = pseudo_rand_u64() % (span + 1);
+    std::time::Duration::from_millis(half + jitter)
+}
+
+/// Cheap thread-local pseudo-randomness (xorshift64) for backoff jitter, so we
+/// don't pull in a `rand` dependency for this.
+fn pseudo_rand_u64() -> u64 {
+    use std::cell::Cell;
+    thread_local!(static STATE: Cell<u64> = const { Cell::new(0) });
+    STATE.with(|s| {
+        let mut x = s.get();
+        if x == 0 {
+            x = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0x9E37_79B9_7F4A_7C15)
+                | 1;
+        }
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        s.set(x);
+        x
+    })
+}
+
+/// Run the download-with-retry loop against a specific client and URL.
+async fn fetch_artifact_with_retry(
+    client: &reqwest::Client,
+    url: &str,
+    hash: &str,
+) -> Result<Vec<u8>> {
+    let (max_attempts, base_backoff_ms) = fetch_retry_config();
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        match fetch_artifact_once(client, url, hash).await {
+            Ok(bytes) => return Ok(bytes),
+            Err((retryable, err)) => {
+                if retryable && attempt < max_attempts {
+                    let backoff = fetch_backoff(base_backoff_ms, attempt);
+                    tracing::debug!(
+                        "artifact {hash} fetch attempt {attempt}/{max_attempts} failed: {err:#}; retrying in {backoff:?}"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    continue;
+                }
+                return Err(err);
+            }
+        }
+    }
+}
+
+/// Fetch an artifact once and verify its hash. Returns `(retryable, error)` on
+/// failure so the caller can decide whether to retry.
+async fn fetch_artifact_once(
+    client: &reqwest::Client,
+    fetch_url: &str,
+    hash: &str,
+) -> std::result::Result<Vec<u8>, (bool, anyhow::Error)> {
+    let resp = match client.get(fetch_url).send().await {
+        Ok(r) => r,
+        // Transport errors (connect/reset/timeout) are transient.
+        Err(e) => return Err((true, anyhow::anyhow!("artifact fetch transport error: {e}"))),
+    };
+    let status = resp.status();
+    if !status.is_success() {
+        let retryable = status.is_server_error()
+            || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+            || status == reqwest::StatusCode::REQUEST_TIMEOUT;
+        return Err((
+            retryable,
+            anyhow::anyhow!("artifact fetch failed: {status}"),
+        ));
+    }
+    let data = match resp.bytes().await {
+        Ok(b) => b.to_vec(),
+        // A body read can fail mid-stream; retry.
+        Err(e) => return Err((true, anyhow::anyhow!("artifact body read error: {e}"))),
+    };
+    // Content-addressed artifacts must match their hash. A full body with the
+    // wrong hash is deterministic corruption (retrying re-fetches the same
+    // bytes), so treat it as permanent. Genuine truncation surfaces as a
+    // transport/body-read error above, which *is* retried.
+    let actual_hash = crate::cas::hash(&data);
+    if actual_hash != hash {
+        return Err((
+            false,
+            anyhow::anyhow!("artifact hash mismatch: expected {hash}, got {actual_hash}"),
+        ));
+    }
+    Ok(data)
+}
+
 fn metadata_bytes(metadata: &MetadataChunk) -> u64 {
     // The metadata chunk is the protobuf encoding of skeleton pack/idx, index,
     // frame table, and file table. The actual encoded size is dominated by the
@@ -265,29 +385,29 @@ impl Client {
             return Ok(data);
         }
 
-        // Presigned URLs are self-authenticating; use a client without the
-        // ripclone auth token so we don't leak credentials to object storage.
-        let client = if use_signed_url {
-            &self.raw_http
+        // Fetch with retry+backoff. Presigned URLs are self-authenticating, so
+        // use the no-auth client to avoid leaking the ripclone token to object
+        // storage. If a presigned URL fails for good (e.g. expired), fall back
+        // to the authenticated gateway once.
+        let data = if use_signed_url {
+            match fetch_artifact_with_retry(&self.raw_http, fetch_url, hash).await {
+                Ok(d) => d,
+                Err(signed_err) => {
+                    tracing::debug!(
+                        "signed-URL fetch for {hash} failed ({signed_err:#}); falling back to gateway"
+                    );
+                    fetch_artifact_with_retry(&self.http, &gateway_url, hash)
+                        .await
+                        .map_err(|gw_err| {
+                            anyhow::anyhow!(
+                                "artifact {hash} fetch failed via signed URL ({signed_err:#}) and gateway ({gw_err:#})"
+                            )
+                        })?
+                }
+            }
         } else {
-            &self.http
+            fetch_artifact_with_retry(&self.http, &gateway_url, hash).await?
         };
-        let resp = client.get(fetch_url).send().await?;
-        if !resp.status().is_success() {
-            anyhow::bail!("artifact fetch failed: {}", resp.status());
-        }
-        let data = resp.bytes().await?.to_vec();
-
-        // Content-addressed artifacts must match their hash, whether they came
-        // from the gateway or a presigned URL.
-        let actual_hash = crate::cas::hash(&data);
-        if actual_hash != hash {
-            anyhow::bail!(
-                "artifact hash mismatch: expected {}, got {}",
-                hash,
-                actual_hash
-            );
-        }
 
         if let Some(cache) = &self.cache
             && let Some(key) = self.cache_key_from_artifact_url(&gateway_url)

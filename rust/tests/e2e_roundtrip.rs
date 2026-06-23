@@ -209,6 +209,81 @@ async fn missing_artifact_fails_clone() {
     assert!(res.is_err(), "missing manifest must fail the clone, got Ok");
 }
 
+/// Positive: transient artifact-fetch failures (503) must be retried with
+/// backoff and the clone must still succeed with a correct worktree. The server
+/// is told to fail its first few artifact GETs via `RIPCLONE_TEST_FAIL_FIRST_FETCHES`.
+/// The e2e suite runs single-threaded, so toggling these env vars is safe.
+#[tokio::test]
+async fn transient_fetch_failure_is_retried() {
+    init(false);
+    unsafe {
+        std::env::set_var("RIPCLONE_TEST_FAIL_FIRST_FETCHES", "3");
+        std::env::set_var("RIPCLONE_FETCH_MAX_ATTEMPTS", "6");
+        std::env::set_var("RIPCLONE_FETCH_BACKOFF_MS", "5");
+    }
+    let server = start_server().await;
+    let origin = make_origin("acme", "retry");
+    origin.commit(&[("a.txt", "hi\n"), ("dir/b.txt", "x\n")], "c1");
+    origin.publish();
+
+    let (_g, c) = sync_and_clone(&server, &origin, 1, CloneMode::Files).await;
+    let a = read(&c, "a.txt");
+    let b = read(&c, "dir/b.txt");
+    unsafe {
+        std::env::remove_var("RIPCLONE_TEST_FAIL_FIRST_FETCHES");
+        std::env::remove_var("RIPCLONE_FETCH_MAX_ATTEMPTS");
+        std::env::remove_var("RIPCLONE_FETCH_BACKOFF_MS");
+    }
+    assert_eq!(a, "hi\n", "retried fetches must still materialize the tree");
+    assert_eq!(b, "x\n");
+}
+
+/// Negative: when failures persist beyond the retry budget, the clone must fail
+/// cleanly — not hang, not produce a partial tree.
+#[tokio::test]
+async fn persistent_fetch_failure_fails_clone() {
+    init(false);
+    // The fault threshold is read when the server is built, so set it first.
+    // Fail far more artifact fetches than the small attempt budget allows.
+    unsafe {
+        std::env::set_var("RIPCLONE_TEST_FAIL_FIRST_FETCHES", "100000");
+        std::env::set_var("RIPCLONE_FETCH_MAX_ATTEMPTS", "2");
+        std::env::set_var("RIPCLONE_FETCH_BACKOFF_MS", "1");
+    }
+    let server = start_server().await;
+    let origin = make_origin("acme", "retryfail");
+    origin.commit(&[("a", "1\n")], "c1");
+    origin.publish();
+    let client = server.client();
+    // sync talks to the server directly (not artifact GETs), so it succeeds.
+    client
+        .sync_repo("acme", "retryfail", None, None)
+        .await
+        .unwrap();
+
+    let out = tempfile::tempdir().unwrap();
+    let res = client
+        .install_repo_with_mode(
+            "acme",
+            "retryfail",
+            "HEAD",
+            out.path().join("clone"),
+            CloneMode::Files,
+            Some("shallow"),
+            None,
+        )
+        .await;
+    unsafe {
+        std::env::remove_var("RIPCLONE_TEST_FAIL_FIRST_FETCHES");
+        std::env::remove_var("RIPCLONE_FETCH_MAX_ATTEMPTS");
+        std::env::remove_var("RIPCLONE_FETCH_BACKOFF_MS");
+    }
+    assert!(
+        res.is_err(),
+        "persistent fetch failure must fail the clone, got Ok"
+    );
+}
+
 /// RefInfo with LSM levels round-trips through serde, and old records (no
 /// `history_levels`) deserialize to an empty vec (back-compat).
 #[test]
