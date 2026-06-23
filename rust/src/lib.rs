@@ -72,6 +72,19 @@ pub struct HistoryLevel {
     pub packs: Vec<SizedPack>,
 }
 
+/// One content-defined archive frame from the last build, for incremental reuse:
+/// `raw_hash` is the hash of the frame's raw (uncompressed) bytes — the reuse key
+/// — and `chunk_hash` is the content-addressed compressed chunk. On a re-sync, a
+/// frame whose raw bytes are unchanged reuses the prior compressed chunk: no
+/// recompression, no re-upload.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct ArchiveFrame {
+    pub raw_hash: String,
+    pub chunk_hash: String,
+    pub compressed_len: u64,
+    pub raw_len: u64,
+}
+
 /// One bucket of the HEAD-closure (depth=1) packs. Objects are partitioned into
 /// fixed buckets by oid prefix, so a re-sync only rebuilds the buckets whose
 /// object set changed and reuses the rest by hash (`git pack-objects` is
@@ -166,6 +179,11 @@ pub struct RefInfo {
     /// the two-phase build; empty otherwise. See [`HeadBucket`].
     #[serde(default)]
     pub head_buckets: Vec<HeadBucket>,
+    /// Content-defined archive frames from the last build, for incremental reuse:
+    /// a re-sync recompresses + re-uploads only the frames whose raw bytes
+    /// changed. See [`ArchiveFrame`].
+    #[serde(default)]
+    pub archive_frames: Vec<ArchiveFrame>,
     /// Optional build status used by the async /v1/build worker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_status: Option<String>,

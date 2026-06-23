@@ -896,6 +896,7 @@ async fn get_ref(
                 shallow_clonepack: crate::ClonepackArtifacts::default(),
                 history_levels: Vec::new(),
                 head_buckets: Vec::new(),
+                archive_frames: Vec::new(),
                 build_status: None,
                 synced_at: None,
             });
@@ -2837,6 +2838,9 @@ async fn do_sync(
         // Bucketed head-pack reuse is two-phase only; single-phase leaves this
         // empty (a later two-phase sync starts its buckets fresh).
         head_buckets: Vec::new(),
+        // Single-phase builds the full archive non-incrementally (build_into_cas);
+        // it does not populate the frame index (a later two-phase sync rebuilds).
+        archive_frames: Vec::new(),
         build_status: None,
         synced_at: SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -3197,6 +3201,13 @@ async fn build_and_publish_two_phase(
         .unwrap_or_default();
     // Prior sealed levels for phase 2's incremental build (reuse from Tigris).
     let prev_levels_for_p2 = carried_levels.clone();
+    // Carry the prior archive frame index so phase 2 can reuse unchanged frames;
+    // phase 2 overwrites this with the freshly built index.
+    let carried_archive_frames = prev
+        .as_ref()
+        .map(|p| p.archive_frames.clone())
+        .unwrap_or_default();
+    let prev_archive_frames_for_p2 = carried_archive_frames.clone();
 
     let info = RefInfo {
         commit: commit.to_string(),
@@ -3228,6 +3239,7 @@ async fn build_and_publish_two_phase(
         },
         history_levels: carried_levels,
         head_buckets: head_built.buckets.clone(),
+        archive_frames: carried_archive_frames,
         build_status: Some("full history building".to_string()),
         synced_at: SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -3304,6 +3316,7 @@ async fn build_and_publish_two_phase(
             history_target,
             upload_conc,
             prev_levels_for_p2,
+            prev_archive_frames_for_p2,
         )
         .await;
         match res {
@@ -3346,6 +3359,7 @@ async fn build_full_in_background(
     history_target: u64,
     upload_conc: usize,
     prev_levels: Vec<crate::HistoryLevel>,
+    prev_archive_frames: Vec<crate::ArchiveFrame>,
 ) -> Result<()> {
     // Incremental history: build only the tail past the last sealed level; prior
     // levels are reused by hash from object storage (Tigris) — never rebuilt.
@@ -3365,9 +3379,17 @@ async fn build_full_in_background(
     // History tail + the full zstd archive (deferred from phase 1), concurrently.
     // No full skeleton: the full variant reuses phase 1's shallow skeleton, and
     // the full history's commits+trees live in the history packs.
+    //
+    // The archive is built with per-frame CDC reuse: frames whose raw bytes are
+    // unchanged since the prior sync reuse the prior compressed chunk (no
+    // recompression, no re-upload), so the archive cost is O(changed worktree).
+    let prev_frame_map: std::collections::HashMap<String, (String, u64)> = prev_archive_frames
+        .iter()
+        .map(|f| (f.raw_hash.clone(), (f.chunk_hash.clone(), f.compressed_len)))
+        .collect();
     let (mda, ca, cma) = (mirror_dir.to_path_buf(), cas.clone(), commit.to_string());
     let archive_handle = tokio::task::spawn_blocking(move || {
-        ArchiveBuilder::new(&mda).build_into_cas(&cma, &ca, 6, None)
+        ArchiveBuilder::new(&mda).build_into_cas_incremental(&cma, &ca, 6, None, &prev_frame_map)
     });
     let (md2, c2, cm2, st2, lsm2) = (
         mirror_dir.to_path_buf(),
@@ -3388,7 +3410,13 @@ async fn build_full_in_background(
     });
     let (built_history, tail_raw_bytes, is_tail) =
         history_handle.await.context("history packs")??;
-    let (archive_chunk_hashes, metadata_base) = archive_handle.await.context("full archive")??;
+    let (archive_chunk_hashes, metadata_base, new_archive_chunks, archive_frames) =
+        archive_handle.await.context("full archive")??;
+    info!(
+        "two-phase p2: archive {} frames ({} rebuilt)",
+        archive_frames.len(),
+        new_archive_chunks.len()
+    );
 
     // Resolve manifest history (all levels flattened), the packs to upload (only
     // freshly built this sync), and the levels to persist for the next sync.
@@ -3458,7 +3486,9 @@ async fn build_full_in_background(
         p2.push(p.clone());
         p2.push(i.clone());
     }
-    p2.extend(archive_chunk_hashes.iter().cloned());
+    // Only freshly built archive chunks are uploaded; reused frames' chunks are
+    // already durable in storage from a prior sync.
+    p2.extend(new_archive_chunks.iter().cloned());
     p2.retain(|h| !h.is_empty());
     let hist_idx_keep: std::collections::HashSet<String> = new_history_tuples
         .iter()
@@ -3493,6 +3523,7 @@ async fn build_full_in_background(
         commit: commit.to_string(),
     };
     info.history_levels = new_levels;
+    info.archive_frames = archive_frames;
     info.build_status = None;
     ref_store
         .save_branch(owner, repo, branch, &info)
@@ -3606,6 +3637,7 @@ async fn update_build_status(
             shallow_clonepack: crate::ClonepackArtifacts::default(),
             history_levels: Vec::new(),
             head_buckets: Vec::new(),
+            archive_frames: Vec::new(),
             build_status: None,
             synced_at: None,
         },
@@ -3869,6 +3901,7 @@ mod tests {
             shallow_clonepack: crate::ClonepackArtifacts::default(),
             history_levels: Vec::new(),
             head_buckets: Vec::new(),
+            archive_frames: Vec::new(),
             build_status: None,
             synced_at: None,
         };
@@ -4018,6 +4051,7 @@ mod tests {
             shallow_clonepack: crate::ClonepackArtifacts::default(),
             history_levels: Vec::new(),
             head_buckets: Vec::new(),
+            archive_frames: Vec::new(),
             build_status: None,
             synced_at: Some(1_718_812_800),
         };
@@ -4105,6 +4139,7 @@ mod tests {
             shallow_clonepack: crate::ClonepackArtifacts::default(),
             history_levels: Vec::new(),
             head_buckets: Vec::new(),
+            archive_frames: Vec::new(),
             build_status: None,
             synced_at: None,
         };
