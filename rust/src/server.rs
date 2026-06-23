@@ -3776,7 +3776,9 @@ fn auth_token_hash(raw: Option<String>) -> Result<String> {
     raw.filter(|t| !t.is_empty())
         .map(|t| format!("{:x}", Sha256::digest(t.as_bytes())))
         .ok_or_else(|| {
-            anyhow::anyhow!("RIPCLONE_TOKEN is not set. Refusing to start an unauthenticated server.")
+            anyhow::anyhow!(
+                "RIPCLONE_TOKEN is not set. Refusing to start an unauthenticated server."
+            )
         })
 }
 
