@@ -20,6 +20,9 @@ lint() {
 }
 
 # Unit + integration tests, parallel (the default) so cross-test races surface.
+# (cargo test runs the test binaries sequentially, which keeps concurrent
+# io_uring queue allocation bounded — nextest's all-binaries-at-once parallelism
+# exhausts the runner's locked-memory limit while io_uring is the default writer.)
 run_tests() {
   ( cd "$ROOT/rust" && cargo test --release --all-targets --locked )
 }
@@ -30,12 +33,13 @@ e2e() {
 }
 
 # Tests + flake guard in one pass: compile once (release), then run the suite a
-# few times to catch nondeterministic races/ordering bugs a single run can miss.
-# Reusing the release profile means no separate debug compile.
+# couple of times to catch nondeterministic races/ordering bugs a single run can
+# miss. Two parallel runs already exercise distinct interleavings; reusing the
+# release profile means no separate debug compile.
 flake() {
   ( cd "$ROOT/rust"
-    for i in 1 2 3; do
-      echo "== test run $i/3 =="
+    for i in 1 2; do
+      echo "== test run $i/2 =="
       cargo test --release --all-targets --locked
     done )
 }

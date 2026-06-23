@@ -1,0 +1,21 @@
+# syntax=docker/dockerfile:1
+# CI-only server image. The workflow compiles the binaries first (with the
+# cached host toolchain), so CI doesn't recompile in a container — it just
+# assembles the runtime image from the prebuilt binaries. The real multi-stage
+# Dockerfile (cache-mount builder) is what ships and is validated on the Fly/Depot
+# deploy builder. Keep the runtime deps below in sync with Dockerfile.
+FROM ubuntu:24.04
+
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates curl libfuse2 && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Binaries staged by the workflow into ci-bins/ (rust/target/ is .dockerignored).
+COPY ci-bins/ripclone /usr/local/bin/ripclone
+COPY ci-bins/ripclone-server /usr/local/bin/ripclone-server
+
+ENV RUST_LOG=info
+
+EXPOSE 8000
+
+CMD ["ripclone-server"]

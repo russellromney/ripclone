@@ -10,3 +10,6 @@ data/
 /bun/
 /openclaw/
 /pandas/
+
+# CI-staged binaries for the runtime-only docker image build
+/ci-bins/
