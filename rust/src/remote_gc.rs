@@ -214,18 +214,19 @@ impl RemoteGc {
     async fn collect_reachable_hashes(&self) -> Result<HashSet<String>> {
         let mut reachable: HashSet<String> = HashSet::new();
         let repos = self.ref_store.list().await.context("list repos for GC")?;
-        for (owner, repo) in repos {
+        for repo_id in repos {
+            let key = repo_id.storage_key();
             let branches = self
                 .ref_store
-                .list_branches(&owner, &repo)
+                .list_branches(&repo_id)
                 .await
-                .with_context(|| format!("list branches for {owner}/{repo}"))?;
+                .with_context(|| format!("list branches for {key}"))?;
             for branch in branches {
                 let Some(info) = self
                     .ref_store
-                    .load_branch(&owner, &repo, &branch)
+                    .load_branch(&repo_id, &branch)
                     .await
-                    .with_context(|| format!("load ref {owner}/{repo}/{branch}"))?
+                    .with_context(|| format!("load ref {key}/{branch}"))?
                 else {
                     continue;
                 };
@@ -239,7 +240,7 @@ impl RemoteGc {
                         .await
                     {
                         warn!(
-                            "failed to collect manifest refs for {owner}/{repo}/{branch} manifest {manifest_hash}: {e}"
+                            "failed to collect manifest refs for {key}/{branch} manifest {manifest_hash}: {e}"
                         );
                     }
                 }
@@ -387,6 +388,7 @@ mod tests {
     use super::*;
     use crate::cas::Cas;
     use crate::clonepack::hash_from_hex;
+    use crate::provider::RepoId;
     use crate::ref_store::FileRefStore;
     use crate::storage::{HashEntry, StorageBackend, local};
     use std::time::Duration;
@@ -511,7 +513,7 @@ mod tests {
 
         // Build a ref with a manifest that points at metadata + archive chunks.
         let info = make_ref_info_with_manifest(&cas);
-        ref_store.save("o", "r", &info).await.unwrap();
+        ref_store.save(&RepoId::github("o/r"), &info).await.unwrap();
 
         // Create an orphan object and age it so it passes the grace period.
         let orphan_data = b"orphan";
@@ -559,7 +561,7 @@ mod tests {
         let ref_store: Arc<dyn RefStore> = Arc::new(FileRefStore::new(&repo_root));
 
         let info = make_ref_info_with_manifest(&cas);
-        ref_store.save("o", "r", &info).await.unwrap();
+        ref_store.save(&RepoId::github("o/r"), &info).await.unwrap();
 
         let orphan_data = b"orphan";
         let orphan_hash = cas.put(orphan_data).unwrap();
@@ -599,7 +601,7 @@ mod tests {
         let ref_store: Arc<dyn RefStore> = Arc::new(FileRefStore::new(&repo_root));
 
         let info = make_ref_info_with_manifest(&cas);
-        ref_store.save("o", "r", &info).await.unwrap();
+        ref_store.save(&RepoId::github("o/r"), &info).await.unwrap();
 
         // Orphan is only one hour old.
         let orphan_data = b"orphan";
@@ -665,7 +667,7 @@ mod tests {
             synced_at: None,
             ..Default::default()
         };
-        ref_store.save("o", "r", &info).await.unwrap();
+        ref_store.save(&RepoId::github("o/r"), &info).await.unwrap();
 
         let orphan_hash = cas.put(b"orphan").unwrap();
         let orphan_path = cas.path(&orphan_hash);
