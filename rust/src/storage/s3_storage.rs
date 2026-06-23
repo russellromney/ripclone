@@ -1,11 +1,14 @@
 use crate::cas::Cas;
-use crate::storage::StorageBackend;
+use crate::storage::{HashEntry, StorageBackend};
 use anyhow::{Context, Result};
+use chrono::DateTime;
 use futures::StreamExt;
 use s3::{Auth, Client};
 use sha2::Digest;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
+
+const DELETE_BATCH_SIZE: usize = 1000;
 
 /// S3-compatible storage backend with an optional local filesystem cache.
 ///
@@ -237,6 +240,105 @@ impl StorageBackend for S3Storage {
             })
             .unwrap_or_else(|| vec![self.region.clone()])
     }
+
+    fn delete(&self, hash: &str) -> Result<()> {
+        let key = self.key(hash)?;
+        self.block_on(self.client.objects().delete(&self.bucket, &key).send())
+            .context("S3 delete_object")?;
+        Ok(())
+    }
+
+    fn delete_batch(&self, hashes: &[String]) -> Result<u64> {
+        let mut total = 0u64;
+        for chunk in hashes.chunks(DELETE_BATCH_SIZE) {
+            let keys: Vec<String> = chunk.iter().map(|h| self.key(h)).collect::<Result<_>>()?;
+            let output = self
+                .block_on(
+                    self.client
+                        .objects()
+                        .delete_objects(&self.bucket)
+                        .objects(&keys)?
+                        .quiet(true)
+                        .send(),
+                )
+                .context("S3 delete_objects")?;
+            if !output.errors.is_empty() {
+                let sample = output
+                    .errors
+                    .iter()
+                    .map(|e| format!("{}: {:?}", e.key.as_deref().unwrap_or("?"), e.message))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                anyhow::bail!("S3 delete_objects returned errors: {}", sample);
+            }
+            total += output.deleted.len() as u64;
+        }
+        Ok(total)
+    }
+
+    fn list_hashes(&self) -> Result<Vec<HashEntry>> {
+        let prefix = &self.prefix;
+        let mut out = Vec::new();
+        let mut continuation = None::<String>;
+        loop {
+            let mut req = self
+                .client
+                .objects()
+                .list_v2(&self.bucket)
+                .prefix(prefix)
+                .context("set S3 list prefix")?;
+            if let Some(token) = continuation.take() {
+                req = req
+                    .continuation_token(token)
+                    .context("set S3 list continuation token")?;
+            }
+            let output = self.block_on(req.send()).context("S3 list_hashes")?;
+            for obj in output.contents {
+                let hash = match Self::hash_from_key(prefix, &obj.key) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        tracing::debug!("skipping non-hash S3 key {}: {}", obj.key, e);
+                        continue;
+                    }
+                };
+                let modified = obj
+                    .last_modified
+                    .as_deref()
+                    .and_then(parse_s3_time)
+                    .unwrap_or(SystemTime::UNIX_EPOCH);
+                out.push(HashEntry {
+                    hash,
+                    size: obj.size,
+                    modified,
+                });
+            }
+            if !output.is_truncated {
+                break;
+            }
+            continuation = output.next_continuation_token;
+            if continuation.is_none() {
+                break;
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl S3Storage {
+    fn hash_from_key(prefix: &str, key: &str) -> Result<String> {
+        let rest = key
+            .strip_prefix(prefix)
+            .ok_or_else(|| anyhow::anyhow!("key {} does not start with prefix {}", key, prefix))?;
+        crate::cas::Cas::validate_artifact_id(rest)
+            .with_context(|| format!("key {} is not a valid artifact id", key))?;
+        Ok(rest.to_string())
+    }
+}
+
+fn parse_s3_time(s: &str) -> Option<SystemTime> {
+    DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|dt| dt.with_timezone(&chrono::Utc).into())
 }
 
 impl S3Storage {

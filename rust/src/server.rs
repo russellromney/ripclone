@@ -7,6 +7,7 @@ use crate::metrics::Metrics;
 use crate::oidc::OidcVerifier;
 use crate::pack::PackBuilder;
 use crate::ref_store::{CachingRefStore, FileRefStore, RefStore, S3RefStore, migrate_legacy_refs};
+use crate::remote_gc::{GcConfig, RemoteGc};
 use crate::retention::Retention;
 use crate::snapshot::SnapshotBuilder;
 use crate::storage::{S3Storage, StorageRef, local};
@@ -1145,8 +1146,7 @@ fn record_chunk(unique_chunks: &mut HashMap<String, u64>, hash: &str, len: u64) 
 fn collect_manifest_hashes(info: &crate::RefInfo) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
-    if !info.full_clonepack.manifest.is_empty()
-        && seen.insert(info.full_clonepack.manifest.clone())
+    if !info.full_clonepack.manifest.is_empty() && seen.insert(info.full_clonepack.manifest.clone())
     {
         out.push(info.full_clonepack.manifest.clone());
     }
@@ -1213,8 +1213,6 @@ async fn build_repo_status(
                 }
             }
         }
-
-
 
         let built_at = info.synced_at.and_then(|secs| {
             chrono::DateTime::from_timestamp(secs as i64, 0).map(|dt| dt.to_rfc3339())
@@ -3838,6 +3836,14 @@ pub async fn run_server(
         .map(Duration::from_secs)
         .unwrap_or(Duration::from_secs(300));
     Retention::clone(&retention).spawn(retention_interval);
+
+    let remote_gc_interval: Duration = env::var("RIPCLONE_REMOTE_GC_INTERVAL_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(0));
+    let remote_gc = RemoteGc::new(storage.clone(), ref_store.clone(), GcConfig::from_env());
+    remote_gc.spawn(remote_gc_interval);
 
     let refs_path = repo_root.join(".ripclone-refs.json");
     if let Err(e) = migrate_legacy_refs(ref_store.as_ref(), &refs_path).await {

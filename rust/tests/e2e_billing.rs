@@ -39,7 +39,7 @@ async fn status_reports_zero_for_unsynced_repo() {
     assert!(status["refs"].as_array().unwrap().is_empty());
     assert_eq!(status["total_bytes"], 0);
     assert_eq!(status["total_unique_bytes"], 0);
-    assert!(status["regions"].as_array().unwrap().len() >= 1);
+    assert!(!status["regions"].as_array().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -81,9 +81,13 @@ async fn status_public_fork_is_free() {
         .await
         .expect("sync");
 
-    let status =
-        get_status(&server, "acme", "forkbilling", Some("public=true&fork_of=upstream/repo"))
-            .await;
+    let status = get_status(
+        &server,
+        "acme",
+        "forkbilling",
+        Some("public=true&fork_of=upstream/repo"),
+    )
+    .await;
     assert!(status["total_bytes"].as_u64().unwrap() > 0);
     assert_eq!(status["total_unique_bytes"], 0);
     assert_eq!(status["refs"][0]["unique_bytes"], 0);
@@ -99,7 +103,10 @@ async fn status_shape_is_backwards_compatible() {
     origin.publish();
 
     let client = server.client();
-    client.sync_repo("acme", "compat", None, None).await.expect("sync");
+    client
+        .sync_repo("acme", "compat", None, None)
+        .await
+        .expect("sync");
 
     let status = get_status(&server, "acme", "compat", None).await;
     // Fields ripclone-cloud already parses must exist.
