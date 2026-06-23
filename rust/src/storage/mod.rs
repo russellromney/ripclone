@@ -64,6 +64,15 @@ pub trait StorageBackend: Send + Sync {
     /// last-modified time. Only objects whose keys are valid artifact IDs
     /// (64-character lowercase hex SHA-256) are returned.
     fn list_hashes(&self) -> Result<Vec<HashEntry>>;
+
+    /// Cheap readiness probe used by `/readyz`. Should confirm the backend is
+    /// reachable without doing real work. Default assumes healthy; the local
+    /// backend does a real write probe. The S3 backend relies on the (also
+    /// S3-backed) ref-store probe for bucket reachability in the normal all-S3
+    /// deployment — see the note on `S3Storage`.
+    fn health(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// One content-addressed object seen by the storage backend.
@@ -88,6 +97,12 @@ impl LocalStorage {
 
     pub fn cas(&self) -> &Cas {
         &self.cas
+    }
+
+    fn validate_hash_name(name: &str) -> Result<String> {
+        crate::cas::Cas::validate_artifact_id(name)
+            .with_context(|| format!("invalid CAS object name: {}", name))?;
+        Ok(name.to_string())
     }
 }
 
@@ -167,14 +182,29 @@ impl StorageBackend for LocalStorage {
         }
         Ok(out)
     }
+
+    fn health(&self) -> Result<()> {
+        // Write+read+remove a tiny probe file under the CAS root. This catches
+        // the realistic production failures a dir-stat misses: the data volume
+        // unmounted/gone, remounted read-only, full (ENOSPC), or with lost
+        // permissions. The temp file is removed on drop.
+        probe_dir_writable(self.cas.root(), "CAS root")
+    }
 }
 
-impl LocalStorage {
-    fn validate_hash_name(name: &str) -> Result<String> {
-        crate::cas::Cas::validate_artifact_id(name)
-            .with_context(|| format!("invalid CAS object name: {}", name))?;
-        Ok(name.to_string())
-    }
+/// Create, write, and drop a tiny probe file under `dir` to verify it is a
+/// writable directory. Used by readiness checks.
+fn probe_dir_writable(dir: &Path, label: &str) -> Result<()> {
+    use std::io::Write;
+    let mut f = tempfile::Builder::new()
+        .prefix(".readyz-probe-")
+        .tempfile_in(dir)
+        .with_context(|| format!("{label} not writable: {}", dir.display()))?;
+    f.write_all(b"ok")
+        .with_context(|| format!("{label} write failed: {}", dir.display()))?;
+    f.flush()
+        .with_context(|| format!("{label} flush failed: {}", dir.display()))?;
+    Ok(())
 }
 
 pub type StorageRef = Arc<dyn StorageBackend>;

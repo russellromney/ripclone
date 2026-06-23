@@ -429,6 +429,17 @@ impl StorageBackend for S3Storage {
         }
         Ok(out)
     }
+
+    fn health(&self) -> Result<()> {
+        // NOTE: no dedicated S3 probe here. The sync StorageBackend::health would
+        // have to drive an S3 round-trip through block_on, which is awkward and
+        // hard to verify. In the normal all-S3 deployment the ref store is also
+        // S3-backed (S3RefStore), and S3RefStore::health performs a real bucket
+        // reachability probe — so /readyz still fails when the bucket is down. A
+        // dedicated storage-side S3 probe is a follow-up for the rare mixed
+        // (S3 storage + non-S3 ref store) configuration.
+        Ok(())
+    }
 }
 
 impl S3Storage {

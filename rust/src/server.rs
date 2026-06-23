@@ -76,6 +76,9 @@ pub struct ServerState {
     /// Read once from `RIPCLONE_TEST_FAIL_FIRST_FETCHES` at construction (0 =
     /// off), so the hot path never touches the environment in production.
     pub fail_first_fetches: usize,
+    /// Cached `/readyz` result `(checked_at, ready)`. Bounds backend probe cost
+    /// (S3 round-trips) and damps load-balancer flapping on a transient blip.
+    pub readyz_cache: Arc<std::sync::Mutex<Option<(Instant, bool)>>>,
 }
 
 /// Read the test-only fault-injection threshold once at startup. Logs loudly if
@@ -535,8 +538,57 @@ async fn healthz() -> impl IntoResponse {
     Json(serde_json::json!({"status": "ok"}))
 }
 
-async fn readyz() -> impl IntoResponse {
-    Json(serde_json::json!({"status": "ok"}))
+/// Readiness probe: 200 only when storage and the ref store are both reachable,
+/// 503 otherwise (with the specific problems). Unlike `/healthz` (liveness),
+/// this fails when a dependency is broken (e.g. the data volume is unmounted) so
+/// a load balancer stops routing to a server that can't serve clones.
+const READYZ_CACHE_TTL: Duration = Duration::from_secs(3);
+
+async fn readyz(State(state): State<ServerState>) -> impl IntoResponse {
+    // Serve a cached result within the TTL: bounds backend probe cost (e.g. S3
+    // round-trips on this unauthenticated endpoint) and damps load-balancer
+    // flapping on a single transient blip.
+    if let Some((at, ready)) = *state.readyz_cache.lock().unwrap_or_else(|e| e.into_inner())
+        && at.elapsed() < READYZ_CACHE_TTL
+    {
+        return readyz_response(ready);
+    }
+
+    let mut problems: Vec<String> = Vec::new();
+
+    // The storage probe is synchronous (filesystem / S3); keep it off the async
+    // worker.
+    let storage = state.storage.clone();
+    match tokio::task::spawn_blocking(move || storage.health()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => problems.push(format!("storage: {e:#}")),
+        Err(e) => problems.push(format!("storage probe failed to run: {e}")),
+    }
+
+    if let Err(e) = state.ref_store.health().await {
+        problems.push(format!("ref_store: {e:#}"));
+    }
+
+    let ready = problems.is_empty();
+    if !ready {
+        // Log details server-side; the public (unauthenticated) body stays
+        // generic so internal paths aren't leaked.
+        warn!("readiness check failed: {}", problems.join("; "));
+    }
+    *state.readyz_cache.lock().unwrap_or_else(|e| e.into_inner()) = Some((Instant::now(), ready));
+    readyz_response(ready)
+}
+
+fn readyz_response(ready: bool) -> Response {
+    if ready {
+        (StatusCode::OK, Json(serde_json::json!({"status": "ready"}))).into_response()
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"status": "not_ready"})),
+        )
+            .into_response()
+    }
 }
 
 async fn metrics_handler(State(state): State<ServerState>) -> impl IntoResponse {
@@ -3936,6 +3988,7 @@ pub async fn run_server(
         ref_response_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
         artifact_fetch_count: Arc::new(AtomicUsize::new(0)),
         fail_first_fetches: fail_first_fetches_from_env(),
+        readyz_cache: Arc::new(std::sync::Mutex::new(None)),
     };
     let build_queue = spawn_build_worker(state.clone());
     state.build_queue = build_queue;
@@ -3991,6 +4044,7 @@ mod tests {
             ref_response_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             artifact_fetch_count: Arc::new(AtomicUsize::new(0)),
             fail_first_fetches: fail_first_fetches_from_env(),
+            readyz_cache: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -4175,6 +4229,65 @@ mod tests {
         assert_eq!(status.regions.len(), 1);
         assert_eq!(status.regions[0].region, "local");
         assert_eq!(status.regions[0].unique_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn readyz_ready_when_healthy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(&tmp);
+        let app = build_app(state);
+        let response = app.oneshot(test_request("GET", "/readyz")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn readyz_not_ready_when_storage_gone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(&tmp);
+        // Simulate the data volume being unmounted/removed under the server.
+        std::fs::remove_dir_all(tmp.path().join("cas")).unwrap();
+        let app = build_app(state);
+        let response = app.oneshot(test_request("GET", "/readyz")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn readyz_not_ready_when_storage_read_only() {
+        // root ignores directory permissions, so this probe can't be exercised
+        // as root (common in CI containers); skip there.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping read-only probe test: running as root");
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(&tmp);
+        let cas = tmp.path().join("cas");
+        // r-x only: the dir still stats as a directory, but writes fail — the
+        // case the old is_dir() check missed.
+        std::fs::set_permissions(&cas, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let app = build_app(state);
+        let response = app
+            .oneshot(test_request("GET", "/readyz"))
+            .await
+            .unwrap();
+        std::fs::set_permissions(&cas, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "read-only CAS must report not ready"
+        );
+    }
+
+    #[tokio::test]
+    async fn readyz_not_ready_when_ref_store_gone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(&tmp);
+        std::fs::remove_dir_all(tmp.path().join("repos")).unwrap();
+        let app = build_app(state);
+        let response = app.oneshot(test_request("GET", "/readyz")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]

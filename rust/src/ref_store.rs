@@ -55,6 +55,14 @@ pub trait RefStore: Send + Sync {
 
     /// List all branches that have a stored `RefInfo` for this repo.
     async fn list_branches(&self, owner: &str, repo: &str) -> Result<Vec<String>>;
+
+    /// Cheap readiness probe used by `/readyz`. Should confirm the store is
+    /// reachable without listing everything. Default assumes healthy; any new
+    /// durable/remote backend MUST override this so readiness doesn't silently
+    /// report "ready" while the store is unreachable.
+    async fn health(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Local filesystem-backed ref store. One JSON file per repo.
@@ -214,6 +222,27 @@ impl RefStore for FileRefStore {
         out.sort();
         out.dedup();
         Ok(out)
+    }
+
+    async fn health(&self) -> Result<()> {
+        // Write+read probe of the ref-store root, off the async worker. Catches
+        // an unmounted/removed/read-only/full data volume — not just a missing
+        // dir.
+        let root = self.root.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            use std::io::Write;
+            let mut f = tempfile::Builder::new()
+                .prefix(".readyz-probe-")
+                .tempfile_in(&root)
+                .with_context(|| format!("ref-store root not writable: {}", root.display()))?;
+            f.write_all(b"ok")
+                .with_context(|| format!("ref-store root write failed: {}", root.display()))?;
+            f.flush()
+                .with_context(|| format!("ref-store root flush failed: {}", root.display()))?;
+            Ok(())
+        })
+        .await
+        .context("ref-store health probe failed to run")?
     }
 }
 
@@ -394,6 +423,20 @@ impl RefStore for S3RefStore {
         out.dedup();
         Ok(out)
     }
+
+    async fn health(&self) -> Result<()> {
+        // Reachability probe with a prefix that matches nothing, bounded by a
+        // short timeout. The readiness handler caches the result.
+        match tokio::time::timeout(
+            Duration::from_secs(3),
+            self.storage.list_objects("__ripclone_readyz_probe__/none/"),
+        )
+        .await
+        {
+            Ok(r) => r.map(|_| ()).context("S3 ref-store unreachable"),
+            Err(_) => anyhow::bail!("S3 ref-store health check timed out"),
+        }
+    }
 }
 
 /// In-memory caching wrapper around a `RefStore`.
@@ -468,6 +511,10 @@ impl<T: RefStore> RefStore for CachingRefStore<T> {
 
     async fn list_branches(&self, owner: &str, repo: &str) -> Result<Vec<String>> {
         self.inner.list_branches(owner, repo).await
+    }
+
+    async fn health(&self) -> Result<()> {
+        self.inner.health().await
     }
 }
 
