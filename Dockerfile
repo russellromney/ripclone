@@ -6,12 +6,25 @@ WORKDIR /app
 # Install git and fuse headers for build-time git operations and fuser.
 RUN apt-get update && apt-get install -y --no-install-recommends git pkg-config libssl-dev libfuse-dev libgit2-dev protobuf-compiler cmake build-essential && rm -rf /var/lib/apt/lists/*
 
-# Copy manifests and build script first for layer caching.
+# 1. Compile dependencies in their own layer, keyed only by the manifests, proto,
+#    and build script. Stub sources let cargo build the whole dependency graph
+#    without the app code, so this layer is reused until a dependency changes.
 COPY rust/Cargo.toml rust/Cargo.lock rust/build.rs ./
 COPY rust/proto ./proto
-COPY rust/src ./src
+RUN mkdir -p src/bin \
+    && echo '' > src/lib.rs \
+    && for b in cli server ripclone-proxy git-remote-ripclone rcgit writer_bench; do \
+         echo 'fn main() {}' > "src/bin/$b.rs"; \
+       done \
+    && cargo build --release \
+    && rm -rf src
 
-RUN cargo build --release
+# 2. Build the real binaries. `touch` makes the copied sources newer than the
+#    stub artifacts so cargo recompiles the workspace crate (COPY can preserve an
+#    older mtime, which would otherwise leave the stub binaries in place). The
+#    cached dependency layer above is reused; only the workspace crate rebuilds.
+COPY rust/src ./src
+RUN find src -name '*.rs' -exec touch {} + && cargo build --release
 
 # Runtime stage
 FROM ubuntu:24.04

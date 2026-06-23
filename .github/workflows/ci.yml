@@ -60,11 +60,28 @@ jobs:
         run: bash scripts/ci.sh e2e
 
   # Build the shipped images so a broken Dockerfile is caught in CI, not at deploy.
+  # buildx + the GitHub Actions layer cache persist the (slow) dependency-compile
+  # layer across runs; ignore-error means a cache hiccup never fails the build.
   docker:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
       - name: Build server image
-        run: docker build -f Dockerfile -t ripclone-server:ci .
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          tags: ripclone-server:ci
+          load: true
+          cache-from: type=gha,scope=server
+          cache-to: type=gha,mode=max,scope=server,ignore-error=true
       - name: Build client image
-        run: docker build -f Dockerfile.client -t ripclone-client:ci .
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.client
+          tags: ripclone-client:ci
+          load: true
+          cache-from: type=gha,scope=client
+          cache-to: type=gha,mode=max,scope=client,ignore-error=true
