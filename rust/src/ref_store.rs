@@ -541,6 +541,7 @@ mod tests {
             full_clonepack: crate::ClonepackArtifacts::default(),
             shallow_clonepack: crate::ClonepackArtifacts::default(),
             history_levels: Vec::new(),
+            head_buckets: Vec::new(),
             build_status: None,
             synced_at: None,
         }
