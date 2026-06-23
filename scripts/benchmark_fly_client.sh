@@ -19,16 +19,16 @@ printf "%-25s %-20s %10s %10s\n" "repo" "mode" "ms" ".git size"
 for repo in oven-sh/bun pandas-dev/pandas openclaw/openclaw; do
   name=$(basename "$repo")
 
-  # rcgit clone
-  rm -rf "/tmp/fly-${name}-rcgit"
+  # ripclone editable clone
+  rm -rf "/tmp/fly-${name}-ripclone"
   start=$(now_ms)
-  rcgit --server "$SERVER_URL" clone "$repo" --dir "/tmp/fly-${name}-rcgit" >/dev/null 2>&1
+  ripclone --server "$SERVER_URL" clone "$repo" --dir "/tmp/fly-${name}-ripclone" >/dev/null 2>&1
   end=$(now_ms)
-  size=$(du -s "/tmp/fly-${name}-rcgit/.git" 2>/dev/null | awk '{print $1}')
-  printf "%-25s %-20s %10s %10s\n" "$repo" "rcgit" "$((end - start))" "${size}K"
+  size=$(du -s "/tmp/fly-${name}-ripclone/.git" 2>/dev/null | awk '{print $1}')
+  printf "%-25s %-20s %10s %10s\n" "$repo" "ripclone" "$((end - start))" "${size}K"
 
   # verify
-  cd "/tmp/fly-${name}-rcgit"
+  cd "/tmp/fly-${name}-ripclone"
   git show HEAD:README.md >/dev/null 2>&1 || true
   git status --short >/dev/null 2>&1 || true
   cd - >/dev/null
@@ -41,5 +41,5 @@ for repo in oven-sh/bun pandas-dev/pandas openclaw/openclaw; do
   size=$(du -s "/tmp/fly-${name}-git-d1/.git" 2>/dev/null | awk '{print $1}')
   printf "%-25s %-20s %10s %10s\n" "$repo" "git clone --depth=1" "$((end - start))" "${size}K"
 
-  rm -rf "/tmp/fly-${name}-rcgit" "/tmp/fly-${name}-git-d1"
+  rm -rf "/tmp/fly-${name}-ripclone" "/tmp/fly-${name}-git-d1"
 done

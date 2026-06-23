@@ -22,8 +22,8 @@ pub mod mode;
 pub mod oidc;
 pub mod overlay;
 pub mod pack;
-pub mod rcgit;
 pub mod ref_store;
+pub mod remote_gc;
 pub mod retention;
 pub mod server;
 pub mod sidecar;
@@ -126,7 +126,7 @@ pub struct ClonepackArtifacts {
 ///
 /// Every artifact is stored in the CAS and can be fetched by its hash from
 /// `/v1/artifacts/{hash}` (or the `/v1/packs/{hash}` legacy endpoint).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct RefInfo {
     pub commit: String,
     pub parent_commit: Option<String>,

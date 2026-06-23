@@ -21,7 +21,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends git ca-certific
 WORKDIR /app
 
 COPY --from=builder /app/target/release/ripclone /usr/local/bin/ripclone
-COPY --from=builder /app/target/release/rcgit /usr/local/bin/rcgit
 COPY --from=builder /app/target/release/ripclone-server /usr/local/bin/ripclone-server
 
 ENV RUST_LOG=info
