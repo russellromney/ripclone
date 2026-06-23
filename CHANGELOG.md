@@ -9,6 +9,13 @@ This file tracks what has already landed in ripclone. For upcoming work see `ROA
 - **Real `/readyz`** (`rust/src/server.rs`, `rust/src/storage/`, `rust/src/ref_store.rs`): returns 503 when storage or the ref store is unreachable (write probe for local backends, bucket reachability for S3), result cached ~3s; generic public body with details logged.
 - **Prometheus `/metrics`** (`rust/src/metrics.rs`): served as Prometheus text exposition format (`text/plain; version=0.0.4`) instead of JSON. Fixed a `build_queue_depth` gauge underflow (async `/sync` builds now balance the gauge; decrements saturate at 0).
 
+## io_uring worktree writer: default on Linux + tunable overlap
+
+- **io_uring is now the default worktree writer on Linux** (`rust/src/worktree_writer.rs`)
+  - With `RIPCLONE_IO_URING` unset, the writer uses io_uring on Linux (auto mode: falls back to POSIX if the kernel lacks support); other platforms stay POSIX. Set `RIPCLONE_IO_URING=0` to force POSIX. Real-clone A/B on Fly `/data` showed io_uring faster-or-equal vs POSIX on dedicated cores.
+- **Tunable per-thread ring overlap depth** via `RIPCLONE_IO_URING_DEPTH` (default 2). Throttled/shared CPUs can set `=3` for ~10% on the write phase; dedicated cores are best at 2.
+- An opt-in submitter-pool scheduler (`RIPCLONE_IO_URING_SCHEDULER`) was prototyped and rejected — see `docs/WRITER_SCHEDULER_EXPERIMENT.md`. Superseded by the depth knob and slated for removal.
+
 ## Shallow/full clonepacks, archive chunk sizing, and sync depth
 
 - **Dual clonepacks: shallow (depth=1) and full history** (`rust/src/lib.rs`, `rust/src/server.rs`, `rust/src/client.rs`, `rust/src/pack.rs`, `rust/src/git.rs`)

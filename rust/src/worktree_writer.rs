@@ -277,7 +277,15 @@ impl IoUringMode {
                     IoUringMode::Auto
                 }
             }
-            Err(_) => IoUringMode::Disabled,
+            // Unset: default to trying io_uring on Linux (auto falls back to
+            // POSIX if the kernel lacks support), POSIX on other platforms.
+            Err(_) => {
+                if cfg!(target_os = "linux") {
+                    IoUringMode::Auto
+                } else {
+                    IoUringMode::Disabled
+                }
+            }
         }
     }
 }
@@ -2533,6 +2541,25 @@ mod tests {
                     content.as_bytes()
                 );
             }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn new_defaults_to_io_uring_on_linux_when_available() {
+        // With the env unset, the default backend on Linux should be io_uring
+        // (falling back to POSIX only if the kernel can't provide it).
+        if std::env::var_os("RIPCLONE_IO_URING").is_some() {
+            eprintln!("skipping: RIPCLONE_IO_URING is set in this environment");
+            return;
+        }
+        // Only assert when io_uring is actually constructible on this kernel;
+        // otherwise auto() legitimately falls back to POSIX.
+        if WorktreeWriter::io_uring().is_ok() {
+            assert!(
+                WorktreeWriter::new().unwrap().is_io_uring(),
+                "new() must default to io_uring on Linux when available"
+            );
         }
     }
 
