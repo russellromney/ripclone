@@ -29,13 +29,14 @@ e2e() {
   bash "$ROOT/scripts/e2e_local.sh"
 }
 
-# Flake guard: run the (debug) suite a few times to catch nondeterministic
-# races/ordering bugs that a single run can miss.
+# Tests + flake guard in one pass: compile once (release), then run the suite a
+# few times to catch nondeterministic races/ordering bugs a single run can miss.
+# Reusing the release profile means no separate debug compile.
 flake() {
   ( cd "$ROOT/rust"
     for i in 1 2 3; do
-      echo "== flake run $i/3 =="
-      cargo test --all-targets --locked
+      echo "== test run $i/3 =="
+      cargo test --release --all-targets --locked
     done )
 }
 

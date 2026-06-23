@@ -5,26 +5,28 @@ on:
     branches: [main]
   pull_request:
 
-# Cancel superseded runs on the same ref to save minutes.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
-  # Tests mirror from local file:// origins, never GitHub — no network needed.
   RIPCLONE_ORIGIN_BASE_DEFAULT: ""
+  # sccache shares the compilation cache across all jobs and runs, so the same
+  # crate is compiled once instead of per-job. Backed by the GitHub Actions cache.
+  SCCACHE_GHA_ENABLED: "true"
+  RUSTC_WRAPPER: "sccache"
+  # Incremental compilation conflicts with sccache and isn't useful in CI.
+  CARGO_INCREMENTAL: "0"
 
 jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # Reads the pinned channel + components from rust-toolchain.toml, and
-      # caches the cargo registry + target dir (keyed by Cargo.lock).
-      # cache-workspaces points it at the project in rust/ so caching works —
-      # without it the action can't find Cargo.toml and silently disables the
-      # cache, recompiling everything on every run.
+      - uses: mozilla-actions/sccache-action@v0.0.6
+      # Reads the pinned channel + components from rust-toolchain.toml; caches the
+      # cargo registry (keyed by Cargo.lock). cache-workspaces points it at rust/.
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           cache-workspaces: rust
@@ -33,22 +35,26 @@ jobs:
       - name: Lint (fmt + clippy)
         run: bash scripts/ci.sh lint
 
+  # Unit + integration tests (release), run a few times as a flake guard. One
+  # compile, multiple runs — catches nondeterministic races a single run misses.
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: mozilla-actions/sccache-action@v0.0.6
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           cache-workspaces: rust
       - name: Install build deps
         run: bash scripts/install-build-deps.sh
-      - name: Unit + integration tests (release, parallel)
-        run: bash scripts/ci.sh test
+      - name: Tests + flake guard (release, repeated)
+        run: bash scripts/ci.sh flake
 
   e2e:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: mozilla-actions/sccache-action@v0.0.6
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           cache-workspaces: rust
@@ -56,20 +62,6 @@ jobs:
         run: bash scripts/install-build-deps.sh
       - name: End-to-end (local origin, real binaries)
         run: bash scripts/ci.sh e2e
-
-  # Catch nondeterministic races/ordering bugs that a single test run can miss
-  # (e.g. cross-test state leaks). Runs the debug suite a few times.
-  flake:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          cache-workspaces: rust
-      - name: Install build deps
-        run: bash scripts/install-build-deps.sh
-      - name: Flake guard (repeat suite)
-        run: bash scripts/ci.sh flake
 
   # Build the shipped images so a broken Dockerfile is caught in CI, not at deploy.
   docker:
