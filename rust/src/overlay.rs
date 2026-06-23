@@ -48,7 +48,8 @@ pub fn available_space(path: &Path) -> Option<u64> {
             return None;
         }
         let buf = buf.assume_init();
-        Some(buf.f_bavail as u64 * buf.f_bsize)
+        let avail = u128::from(buf.f_bavail) * u128::from(buf.f_bsize);
+        avail.try_into().ok()
     }
 }
 
