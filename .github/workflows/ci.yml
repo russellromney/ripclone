@@ -12,21 +12,19 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RIPCLONE_ORIGIN_BASE_DEFAULT: ""
-  # sccache shares the compilation cache across all jobs and runs, so the same
-  # crate is compiled once instead of per-job. Backed by the GitHub Actions cache.
-  SCCACHE_GHA_ENABLED: "true"
-  RUSTC_WRAPPER: "sccache"
-  # Incremental compilation conflicts with sccache and isn't useful in CI.
-  CARGO_INCREMENTAL: "0"
 
+# Caching: setup-rust-toolchain (Swatinem/rust-cache) restores each job's cargo
+# registry + target/ dir across runs, keyed by Cargo.lock — so a job recompiles
+# only what changed, not the whole dep tree every run. (sccache's GHA backend was
+# tried but its server hits GitHub's retired v1 cache API and fails to start,
+# killing every cargo invocation; the per-job target cache is the robust choice.)
 jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: mozilla-actions/sccache-action@v0.0.6
       # Reads the pinned channel + components from rust-toolchain.toml; caches the
-      # cargo registry (keyed by Cargo.lock). cache-workspaces points it at rust/.
+      # cargo registry + target/ (keyed by Cargo.lock). cache-workspaces -> rust/.
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           cache-workspaces: rust
@@ -41,7 +39,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: mozilla-actions/sccache-action@v0.0.6
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           cache-workspaces: rust
@@ -54,7 +51,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: mozilla-actions/sccache-action@v0.0.6
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           cache-workspaces: rust
