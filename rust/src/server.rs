@@ -4227,6 +4227,69 @@ mod tests {
             .unwrap()
     }
 
+    /// Like `test_request` but with an explicit (or absent) `Authorization`
+    /// header, for exercising the auth middleware's reject path.
+    fn request_with_auth(method: &str, uri: &str, auth: Option<&str>) -> axum::http::Request<Body> {
+        let mut b = axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))));
+        if let Some(a) = auth {
+            b = b.header("Authorization", a);
+        }
+        b.body(Body::empty()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn protected_route_rejects_missing_and_wrong_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(&tmp);
+        let app = build_app(state);
+        // No Authorization header.
+        let missing = app
+            .clone()
+            .oneshot(request_with_auth(
+                "GET",
+                "/v1/repos/acme/secret/status",
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+        // Present but wrong token.
+        let wrong = app
+            .oneshot(request_with_auth(
+                "GET",
+                "/v1/repos/acme/secret/status",
+                Some("Ripclone deadbeef"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn public_endpoints_require_no_auth() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(&tmp);
+        let app = build_app(state);
+        // Liveness, readiness, and the Prometheus scrape must be reachable with
+        // no credentials (load balancers / scrapers don't authenticate). They
+        // must never return 401 from the auth middleware.
+        for path in ["/healthz", "/readyz", "/metrics"] {
+            let resp = app
+                .clone()
+                .oneshot(request_with_auth("GET", path, None))
+                .await
+                .unwrap();
+            assert_ne!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "{path} must not require auth"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn repo_status_returns_empty_for_cold_repo() {
         let tmp = tempfile::tempdir().unwrap();

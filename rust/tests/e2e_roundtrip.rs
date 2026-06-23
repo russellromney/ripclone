@@ -216,12 +216,17 @@ async fn missing_artifact_fails_clone() {
 #[tokio::test]
 async fn transient_fetch_failure_is_retried() {
     init(false);
-    let server = start_server_faulting(3).await;
+    // The injected faults are a single per-server counter shared across the
+    // concurrent manifest/metadata/chunk fetches. Keep it below the default
+    // retry budget (3 attempts) so that even if every fault lands on one
+    // artifact's attempts, its 3rd attempt still succeeds — the test recovers
+    // regardless of how faults distribute, never flaking on scheduling.
+    let server = start_server_faulting(2).await;
     let origin = make_origin("acme", "retry");
     origin.commit(&[("a.txt", "hi\n"), ("dir/b.txt", "x\n")], "c1");
     origin.publish();
 
-    // Default retry budget (3 attempts) recovers from the 3 injected faults.
+    // The default retry budget (3 attempts) recovers from the injected faults.
     let (_g, c) = sync_and_clone(&server, &origin, 1, CloneMode::Files).await;
     assert_eq!(
         read(&c, "a.txt"),
@@ -229,6 +234,33 @@ async fn transient_fetch_failure_is_retried() {
         "retried fetches must still materialize the tree"
     );
     assert_eq!(read(&c, "dir/b.txt"), "x\n");
+}
+
+/// Negative: a client presenting the wrong auth token must be rejected by the
+/// server (the protected routes sit behind the auth middleware), so a
+/// misconfigured token can never silently sync or clone.
+#[tokio::test]
+async fn wrong_token_is_rejected() {
+    init(false);
+    let server = start_server().await;
+    let origin = make_origin("acme", "authz");
+    origin.commit(&[("a.txt", "hi\n")], "c1");
+    origin.publish();
+
+    // A correctly-tokened client can sync (control).
+    server
+        .client()
+        .sync_repo("acme", "authz", None, None)
+        .await
+        .expect("correct token must be accepted");
+
+    // A wrong-token client is rejected on a protected route.
+    let bad = ripclone::client::Client::new_with_token(
+        server.url.clone(),
+        Some("deadbeefdeadbeef".to_string()),
+    );
+    let res = bad.sync_repo("acme", "authz", None, None).await;
+    assert!(res.is_err(), "wrong token must be rejected, got Ok");
 }
 
 /// Negative: when failures persist beyond the retry budget, the clone must fail
