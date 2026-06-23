@@ -5,16 +5,11 @@ use ripclone::bench::Benchmark;
 use ripclone::client::Client;
 use ripclone::extract::extract_archive;
 use ripclone::mode::{CloneMode, resolve_mode};
-use ripclone::ref_store::{CachingRefStore, FileRefStore, S3RefStore};
-use ripclone::remote_gc::{GcConfig, RemoteGc};
 use ripclone::snapshot::extract_snapshot;
-use ripclone::storage::{S3Storage, local};
 use sha2::{Digest, Sha256};
 use std::env;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Duration;
 
 #[derive(Parser)]
 #[command(name = "ripclone")]
@@ -22,8 +17,10 @@ use std::time::Duration;
 struct Args {
     /// ripclone server. Defaults to the managed cloud; set RIPCLONE_SERVER or
     /// pass --server http://localhost:8000 to point at a self-hosted backend.
-    #[arg(short, long, env = "RIPCLONE_SERVER", default_value = "https://ripclone.com")]
-    server: String,
+    /// When unset, falls back to the server saved by `ripclone login`, then the
+    /// managed cloud. (Resolution: --server > RIPCLONE_SERVER > config > cloud.)
+    #[arg(short, long, env = "RIPCLONE_SERVER")]
+    server: Option<String>,
 
     #[command(subcommand)]
     command: Commands,
@@ -50,21 +47,6 @@ enum Commands {
         /// GitHub token to use for this sync only. Overrides RIPCLONE_GITHUB_TOKEN.
         #[arg(short, long, env = "RIPCLONE_GITHUB_TOKEN")]
         github_token: Option<String>,
-    },
-    /// Run remote garbage collection against the configured storage backend.
-    RemoteGc {
-        /// Local CAS / cache directory.
-        #[arg(long, default_value = "/data/cache")]
-        cas_dir: PathBuf,
-        /// Local repo root (used for the filesystem ref store when S3 is off).
-        #[arg(long, default_value = "/data/repos")]
-        repo_root: PathBuf,
-        /// Grace period in hours before an unreferenced object can be deleted.
-        #[arg(long)]
-        grace_hours: Option<u64>,
-        /// Log what would be deleted without deleting.
-        #[arg(long)]
-        dry_run: bool,
     },
     /// Clone a repo using a snapshot and a background sidecar.
     Clone {
@@ -350,10 +332,20 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+    let config = ripclone::config::load();
+
+    // Server precedence: --server / RIPCLONE_SERVER (both land in args.server) >
+    // the server saved by `ripclone login` > the managed cloud default. This is
+    // what makes a self-host `login` then bare `clone` talk to the right server.
+    let server = args
+        .server
+        .clone()
+        .or_else(|| config.server.clone())
+        .unwrap_or_else(|| "https://ripclone.com".to_string());
 
     // login/logout don't need an authenticated client.
     match &args.command {
-        Commands::Login => return run_login(&args.server).await,
+        Commands::Login => return run_login(&server).await,
         Commands::Logout => {
             ripclone::config::clear_token()?;
             println!("Logged out — token removed.");
@@ -374,11 +366,15 @@ async fn main() -> Result<()> {
                 .map(|t| format!("{:x}", Sha256::digest(t.as_bytes())))
         })
         .or_else(|| {
-            ripclone::config::token().map(|t| format!("{:x}", Sha256::digest(t.as_bytes())))
+            config
+                .token
+                .as_deref()
+                .filter(|t| !t.is_empty())
+                .map(|t| format!("{:x}", Sha256::digest(t.as_bytes())))
         });
     let client = match token_hash {
-        Some(token) => Client::new_with_token(args.server.clone(), Some(token)),
-        None => Client::new(args.server.clone()),
+        Some(token) => Client::new_with_token(server.clone(), Some(token)),
+        None => Client::new(server.clone()),
     };
 
     match args.command {
@@ -401,38 +397,6 @@ async fn main() -> Result<()> {
                 )
                 .await?;
             println!("synced {} to {}", repo, info.commit);
-        }
-        Commands::RemoteGc {
-            cas_dir,
-            repo_root,
-            grace_hours,
-            dry_run,
-        } => {
-            std::fs::create_dir_all(&cas_dir)?;
-            std::fs::create_dir_all(&repo_root)?;
-
-            let s3_storage = S3Storage::from_env().context("initialize S3 storage")?;
-            let (storage, ref_store): (
-                ripclone::storage::StorageRef,
-                Arc<dyn ripclone::ref_store::RefStore>,
-            ) = if let Some(s3) = s3_storage {
-                let s3 = Arc::new(s3);
-                let store = CachingRefStore::new(S3RefStore::new(s3.clone()));
-                (s3 as ripclone::storage::StorageRef, Arc::new(store))
-            } else {
-                let store = CachingRefStore::new(FileRefStore::new(&repo_root));
-                (local(&cas_dir)?, Arc::new(store))
-            };
-
-            let mut config = GcConfig::from_env();
-            if let Some(hours) = grace_hours {
-                config.grace_period = Duration::from_secs(hours * 60 * 60);
-            }
-            config.dry_run = dry_run;
-
-            let gc = RemoteGc::new(storage, ref_store, config);
-            let report = gc.run().await?;
-            println!("remote GC report: {:#?}", report);
         }
         Commands::Clone {
             repo,
@@ -532,7 +496,7 @@ async fn main() -> Result<()> {
                 .output()?
                 .stdout;
             let commit = String::from_utf8(commit)?.trim().to_string();
-            let server = args.server.clone();
+            let server = server.clone();
             let branch = branch.to_string();
             let sizes = client.fetch_sizes(&owner, &repo_name, &branch).await?;
             println!(
