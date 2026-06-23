@@ -43,7 +43,13 @@ async fn server_error(context: &str, resp: reqwest::Response) -> anyhow::Error {
         .as_ref()
         .and_then(|p| p.error.clone())
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| if text.is_empty() { status.to_string() } else { text.clone() });
+        .unwrap_or_else(|| {
+            if text.is_empty() {
+                status.to_string()
+            } else {
+                text.clone()
+            }
+        });
     let hint = match (status.as_u16(), code) {
         (401, _) => "\n  → set RIPCLONE_TOKEN (create one at https://ripclone.com/tokens)",
         (403, Some("no_plan")) => {

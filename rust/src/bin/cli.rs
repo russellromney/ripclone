@@ -276,7 +276,11 @@ async fn run_login(server: &str) -> Result<()> {
     println!("  Waiting for approval…");
 
     let interval = start.interval.max(1);
-    let max_secs = if start.expires_in == 0 { 600 } else { start.expires_in };
+    let max_secs = if start.expires_in == 0 {
+        600
+    } else {
+        start.expires_in
+    };
     let mut waited = 0u64;
     let token = loop {
         tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
