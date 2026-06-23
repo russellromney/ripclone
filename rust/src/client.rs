@@ -745,9 +745,12 @@ impl Client {
             .clone()
             .spawn_fetch_metadata(metadata_hash, metadata_url);
 
-        // 3. Start archive chunk downloads concurrently with the manifest. They
-        // will buffer until the manifest is decoded, then verify and forward
-        // chunks to the extractor.
+        // 3. Spawn the archive-chunk downloader. It waits for the manifest to be
+        // decoded before fetching anything (so it follows the manifest's chunk
+        // table, not a possibly-stale signed-URL list), then fetches chunks with
+        // a bounded concurrency semaphore and forwards them over this bounded
+        // channel. Peak memory is therefore bounded by the fetch concurrency
+        // plus the channel depth, not the chunk count.
         let archive_channel_depth = std::env::var("RIPCLONE_ARCHIVE_CHANNEL_DEPTH")
             .ok()
             .and_then(|s| s.parse().ok())

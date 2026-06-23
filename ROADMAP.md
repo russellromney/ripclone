@@ -65,9 +65,12 @@ Proposed design:
 Implemented in `rust/src/client.rs`, `rust/src/extract.rs`, and `rust/src/pack_writer.rs`. See `CHANGELOG.md` for details.
 
 Remaining future improvements:
-- Buffer early archive chunks to a bounded temp spill directory when they arrive before metadata (currently the bounded channel holds up to two chunks in memory).
-- Retry each chunk download with exponential backoff.
-- Delete the temp install directory on failure.
+- Retry each chunk download with exponential backoff. ✅ (`RIPCLONE_FETCH_MAX_ATTEMPTS`/`RIPCLONE_FETCH_BACKOFF_MS`)
+- Delete the temp install directory on failure. ✅ (RAII on the temp dir + overlay staging)
+
+(The earlier "spill early chunks to disk before metadata" idea is obsolete: the
+downloader now waits for the manifest before fetching, and peak memory is bounded
+by the fetch-concurrency semaphore plus the bounded channel — not the chunk count.)
 
 ### 4. User-facing clone modes ✅
 
