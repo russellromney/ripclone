@@ -28,6 +28,17 @@ pub struct CompactResult {
     pub new_packs: Vec<(String, u64, String, u64)>,
 }
 
+/// Result of a bucketed HEAD-closure build (see `build_head_packs_bucketed`).
+pub struct BucketedHeadPacks {
+    /// Every bucket's pack `(pack, pack_len, idx, idx_len)`, in manifest order.
+    pub packs: Vec<(String, u64, String, u64)>,
+    /// Buckets to persist for next-sync reuse.
+    pub buckets: Vec<crate::HeadBucket>,
+    /// Only the packs freshly built this sync (to upload). Reused buckets are
+    /// already durable in storage.
+    pub new_built: Vec<(String, u64, String, u64)>,
+}
+
 impl<'a> PackBuilder<'a> {
     pub fn new<P: AsRef<Path>>(repo: P, cas: &'a Cas) -> Self {
         Self {
@@ -283,6 +294,74 @@ impl<'a> PackBuilder<'a> {
             .0)
     }
 
+    /// Build the HEAD closure as fixed, stable buckets keyed by oid prefix, so a
+    /// re-sync reuses the buckets whose object set is unchanged and rebuilds only
+    /// the rest. Each bucket is packed undeltified (`git pack-objects` is
+    /// deterministic for a fixed sorted oid list, so an unchanged bucket
+    /// reproduces the exact same pack hash → safe content-addressed reuse). The
+    /// bucket assignment depends only on the oid, so it is stable as the repo
+    /// grows. `prev` maps a bucket's `oidset_hash` to the pack built for it last
+    /// time. Returns all bucket packs (manifest order), the buckets to persist,
+    /// and only the freshly built packs (to upload). Undeltified packs compress
+    /// each object independently, so bucketing has no compression cost.
+    pub fn build_head_packs_bucketed(
+        &self,
+        commit: &str,
+        num_buckets: usize,
+        prev: &std::collections::HashMap<String, crate::SizedPack>,
+    ) -> Result<BucketedHeadPacks> {
+        let head_oids = git::list_object_shas_with_depth(&self.repo, commit, Some(1))?;
+        if head_oids.is_empty() {
+            bail!("no objects to pack for {}", commit);
+        }
+        let n = num_buckets.max(1);
+        let mut buckets: Vec<Vec<String>> = vec![Vec::new(); n];
+        for oid in head_oids {
+            // First byte of the oid → bucket. Stable (oid-only) and uniform.
+            let first = u8::from_str_radix(oid.get(0..2).unwrap_or("00"), 16).unwrap_or(0);
+            buckets[first as usize % n].push(oid);
+        }
+
+        let mut packs = Vec::new();
+        let mut out_buckets = Vec::new();
+        let mut new_built = Vec::new();
+        for mut boids in buckets {
+            if boids.is_empty() {
+                continue;
+            }
+            boids.sort();
+            let oidset_hash = crate::cas::hash(boids.join("\n").as_bytes());
+            if let Some(sp) = prev.get(&oidset_hash) {
+                // Reuse: the prior pack is byte-identical (determinism) and
+                // already durable in storage; reference it, don't rebuild/upload.
+                let tup = (sp.pack.clone(), sp.pack_len, sp.idx.clone(), sp.idx_len);
+                packs.push(tup);
+                out_buckets.push(crate::HeadBucket {
+                    oidset_hash,
+                    pack: sp.clone(),
+                });
+            } else {
+                let tup = self.pack_and_index_inner(&boids, true)?;
+                packs.push(tup.clone());
+                new_built.push(tup.clone());
+                out_buckets.push(crate::HeadBucket {
+                    oidset_hash,
+                    pack: crate::SizedPack {
+                        pack: tup.0,
+                        pack_len: tup.1,
+                        idx: tup.2,
+                        idx_len: tup.3,
+                    },
+                });
+            }
+        }
+        Ok(BucketedHeadPacks {
+            packs,
+            buckets: out_buckets,
+            new_built,
+        })
+    }
+
     /// Build just the history packs (deltified, everything reachable from
     /// `commit` minus the HEAD closure). Used by two-phase publish in the
     /// background after the depth=1 clonepack is already published.
@@ -531,5 +610,110 @@ impl<'a> PackBuilder<'a> {
         let idx_hash = self.cas.put(&idx_data)?;
 
         Ok((pack_hash, pack_len, idx_hash, idx_len))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// Commit `files` onto a bare repo's HEAD (parent = current HEAD if any) and
+    /// return the new commit oid.
+    fn commit_onto(repo: &git2::Repository, files: &[(&str, &[u8])]) -> String {
+        let sig = git2::Signature::now("t", "t@t").unwrap();
+        let mut idx = repo.index().unwrap();
+        let zero = git2::IndexTime::new(0, 0);
+        for (path, bytes) in files {
+            let blob = repo.blob(bytes).unwrap();
+            idx.add(&git2::IndexEntry {
+                ctime: zero,
+                mtime: zero,
+                dev: 0,
+                ino: 0,
+                mode: 0o100644,
+                uid: 0,
+                gid: 0,
+                file_size: bytes.len() as u32,
+                id: blob,
+                flags: 0,
+                flags_extended: 0,
+                path: path.as_bytes().to_vec(),
+            })
+            .unwrap();
+        }
+        idx.write().unwrap();
+        let tree = repo.find_tree(idx.write_tree().unwrap()).unwrap();
+        let parents: Vec<git2::Commit> = match repo.head().ok().and_then(|h| h.target()) {
+            Some(t) => vec![repo.find_commit(t).unwrap()],
+            None => vec![],
+        };
+        let prefs: Vec<&git2::Commit> = parents.iter().collect();
+        repo.commit(Some("HEAD"), &sig, &sig, "c", &tree, &prefs)
+            .unwrap()
+            .to_string()
+    }
+
+    /// First build packs every bucket; a re-sync after changing one file rebuilds
+    /// only the affected buckets and reuses the rest by hash (identical pack).
+    #[test]
+    fn head_buckets_reuse_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init_bare(tmp.path()).unwrap();
+        let cas_dir = tempfile::tempdir().unwrap();
+        let cas = Cas::new(cas_dir.path()).unwrap();
+        let pb = PackBuilder::new(tmp.path(), &cas);
+
+        // c1 with several files spread across buckets.
+        let files1: Vec<(&str, &[u8])> = vec![
+            ("a", b"aaa"),
+            ("b", b"bbb"),
+            ("c", b"ccc"),
+            ("d", b"ddd"),
+            ("e", b"eee"),
+            ("f", b"fff"),
+        ];
+        let c1 = commit_onto(&repo, &files1);
+        let empty: HashMap<String, crate::SizedPack> = HashMap::new();
+        let r1 = pb.build_head_packs_bucketed(&c1, 8, &empty).unwrap();
+        // First build: every bucket is freshly built.
+        assert_eq!(r1.new_built.len(), r1.buckets.len());
+        assert!(!r1.buckets.is_empty());
+
+        // Re-build the same commit with the prior buckets → everything reused.
+        let prev: HashMap<String, crate::SizedPack> = r1
+            .buckets
+            .iter()
+            .map(|b| (b.oidset_hash.clone(), b.pack.clone()))
+            .collect();
+        let r1b = pb.build_head_packs_bucketed(&c1, 8, &prev).unwrap();
+        assert_eq!(r1b.new_built.len(), 0, "same commit → full reuse");
+        // Determinism: identical bucket set + pack hashes.
+        let h1: Vec<_> = r1.buckets.iter().map(|b| b.pack.pack.clone()).collect();
+        let h1b: Vec<_> = r1b.buckets.iter().map(|b| b.pack.pack.clone()).collect();
+        assert_eq!(h1, h1b, "deterministic pack hashes across rebuilds");
+
+        // c2 changes one file's content (its blob, the root tree, and the commit
+        // change → a few buckets dirty), keeps the rest.
+        let files2: Vec<(&str, &[u8])> = vec![
+            ("a", b"aaa"),
+            ("b", b"bbb-CHANGED"),
+            ("c", b"ccc"),
+            ("d", b"ddd"),
+            ("e", b"eee"),
+            ("f", b"fff"),
+        ];
+        let c2 = commit_onto(&repo, &files2);
+        let r2 = pb.build_head_packs_bucketed(&c2, 8, &prev).unwrap();
+        assert!(
+            r2.new_built.len() < r2.buckets.len(),
+            "re-sync reuses unchanged buckets (built {} of {})",
+            r2.new_built.len(),
+            r2.buckets.len()
+        );
+        assert!(
+            !r2.new_built.is_empty(),
+            "the changed bucket(s) must be rebuilt"
+        );
     }
 }

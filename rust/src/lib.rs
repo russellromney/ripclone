@@ -72,6 +72,19 @@ pub struct HistoryLevel {
     pub packs: Vec<SizedPack>,
 }
 
+/// One bucket of the HEAD-closure (depth=1) packs. Objects are partitioned into
+/// fixed buckets by oid prefix, so a re-sync only rebuilds the buckets whose
+/// object set changed and reuses the rest by hash (`git pack-objects` is
+/// deterministic for a fixed oid list, so an unchanged bucket reproduces the
+/// exact same pack). `oidset_hash` is the hash of the bucket's sorted oid list —
+/// the reuse key. Undeltified packs compress each object independently, so this
+/// bucketing has no compression cost.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct HeadBucket {
+    pub oidset_hash: String,
+    pub pack: SizedPack,
+}
+
 /// Artifact hashes for one clonepack variant (e.g. shallow depth=1 or full).
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ClonepackArtifacts {
@@ -148,6 +161,11 @@ pub struct RefInfo {
     /// the tail past the last level's tip. See ROADMAP "LSM incremental history".
     #[serde(default)]
     pub history_levels: Vec<HistoryLevel>,
+    /// HEAD-closure pack buckets from the last build, for incremental reuse: a
+    /// re-sync rebuilds only the buckets whose object set changed. Populated by
+    /// the two-phase build; empty otherwise. See [`HeadBucket`].
+    #[serde(default)]
+    pub head_buckets: Vec<HeadBucket>,
     /// Optional build status used by the async /v1/build worker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_status: Option<String>,

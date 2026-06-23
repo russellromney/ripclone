@@ -895,6 +895,7 @@ async fn get_ref(
                 full_clonepack: crate::ClonepackArtifacts::default(),
                 shallow_clonepack: crate::ClonepackArtifacts::default(),
                 history_levels: Vec::new(),
+                head_buckets: Vec::new(),
                 build_status: None,
                 synced_at: None,
             });
@@ -2177,6 +2178,12 @@ fn assemble_variant(
 }
 
 /// Build a multi-pack-index over `packs` from local CAS. Free-function form.
+///
+/// Reads each pack's bytes from the *local* CAS (no object-storage fallback), so
+/// only call this when every pack was built this sync and is still local — e.g.
+/// the head MIDX is shipped only when all head buckets were freshly built. For a
+/// set with reused (already-evicted) packs, omit the MIDX and let the client
+/// build its own.
 fn assemble_midx(
     cas: &Cas,
     packs: &[(String, u64, String, u64)],
@@ -2827,6 +2834,9 @@ async fn do_sync(
             commit: commit.clone(),
         },
         history_levels: new_levels,
+        // Bucketed head-pack reuse is two-phase only; single-phase leaves this
+        // empty (a later two-phase sync starts its buckets fresh).
+        head_buckets: Vec::new(),
         build_status: None,
         synced_at: SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -2996,7 +3006,8 @@ async fn build_and_publish_two_phase(
     retention: &Arc<Retention>,
     t_total: Instant,
 ) -> Result<RefInfo> {
-    let head_target = env_bytes("RIPCLONE_PACK_BYTES", 12 * 1024 * 1024);
+    // (Head packs are now built in oid-prefix buckets, not size-greedy batches,
+    // so RIPCLONE_PACK_BYTES no longer applies to the two-phase head closure.)
     let history_target = env_bytes("RIPCLONE_HISTORY_PACK_BYTES", 512 * 1024 * 1024);
     let upload_conc = env_bytes("RIPCLONE_UPLOAD_CONCURRENCY", 16) as usize;
 
@@ -3017,11 +3028,35 @@ async fn build_and_publish_two_phase(
         info!("p1 sub: shallow skeleton {:?}", s.elapsed());
         r
     });
+    // Head-closure packs, bucketed for incremental reuse: rebuild only the
+    // buckets whose object set changed since the prior sync, reuse the rest by
+    // hash. `prev_head_map` maps each prior bucket's oidset hash to its pack.
+    let num_head_buckets = env_bytes("RIPCLONE_HEAD_BUCKETS", 64) as usize;
+    let prev_head_map: std::collections::HashMap<String, crate::SizedPack> = prev
+        .as_ref()
+        .map(|p| {
+            p.head_buckets
+                .iter()
+                .map(|b| (b.oidset_hash.clone(), b.pack.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
     let (md2, c2, cm2) = (mirror_dir.to_path_buf(), cas.clone(), commit.to_string());
     let head_handle = tokio::task::spawn_blocking(move || {
         let s = Instant::now();
-        let r = PackBuilder::new(&md2, &c2).build_head_packs(&cm2, head_target);
-        info!("p1 sub: head packs {:?}", s.elapsed());
+        let r = PackBuilder::new(&md2, &c2).build_head_packs_bucketed(
+            &cm2,
+            num_head_buckets,
+            &prev_head_map,
+        );
+        if let Ok(b) = &r {
+            info!(
+                "p1 sub: head packs ({} buckets, {} rebuilt) {:?}",
+                b.buckets.len(),
+                b.new_built.len(),
+                s.elapsed()
+            );
+        }
         r
     });
     // Phase 1 builds only the cheap files table (no zstd frames): editable
@@ -3083,7 +3118,8 @@ async fn build_and_publish_two_phase(
     let (shallow_skeleton_pack, shallow_skeleton_idx) = shallow_skeleton_handle
         .await
         .context("shallow skeleton")??;
-    let head_packs = head_handle.await.context("head packs")??;
+    let head_built = head_handle.await.context("head packs")??;
+    let head_packs = head_built.packs.clone();
     let metadata_base = files_table_handle.await.context("files table")??;
     info!(
         "two-phase p1: head+shallow-skeleton+files-table {:?}",
@@ -3117,7 +3153,15 @@ async fn build_and_publish_two_phase(
         head_packs.iter().map(|p| (p, false)).collect();
     let (head_entries, head_idx_bundle_ref, head_idx_bundle_hash) =
         assemble_variant(cas, storage, &head_tagged)?;
-    let (head_midx_ref, head_midx_hash) = assemble_midx(cas, &head_packs)?;
+    // Ship the head MIDX only when every bucket was built this sync (so all pack
+    // bytes are still local). On an incremental re-sync some buckets are reused
+    // and already evicted, so omit it — the client builds its own MIDX.
+    let all_built = head_built.new_built.len() == head_built.packs.len();
+    let (head_midx_ref, head_midx_hash) = if all_built {
+        assemble_midx(cas, &head_packs)?
+    } else {
+        (None, String::new())
+    };
 
     let shallow_manifest = make_manifest(
         commit,
@@ -3183,6 +3227,7 @@ async fn build_and_publish_two_phase(
             commit: commit.to_string(),
         },
         history_levels: carried_levels,
+        head_buckets: head_built.buckets.clone(),
         build_status: Some("full history building".to_string()),
         synced_at: SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -3190,8 +3235,9 @@ async fn build_and_publish_two_phase(
             .map(|d| d.as_secs()),
     };
 
-    // Upload phase-1 artifacts (head packs+idx, shallow skeleton/index/metadata,
-    // head idx-bundle + midx, shallow manifest). No archive frames in phase 1.
+    // Upload phase-1 artifacts (shallow skeleton/index/metadata, head idx-bundle
+    // + midx, shallow manifest, and only the FRESHLY BUILT head packs+idx).
+    // Reused bucket packs are already durable in storage from a prior sync.
     let mut p1: Vec<String> = vec![
         shallow_skeleton_pack.clone(),
         shallow_skeleton_idx.clone(),
@@ -3201,7 +3247,7 @@ async fn build_and_publish_two_phase(
         head_idx_bundle_hash.clone(),
         head_midx_hash.clone(),
     ];
-    for (p, _, i, _) in &head_packs {
+    for (p, _, i, _) in &head_built.new_built {
         p1.push(p.clone());
         p1.push(i.clone());
     }
@@ -3559,6 +3605,7 @@ async fn update_build_status(
             full_clonepack: crate::ClonepackArtifacts::default(),
             shallow_clonepack: crate::ClonepackArtifacts::default(),
             history_levels: Vec::new(),
+            head_buckets: Vec::new(),
             build_status: None,
             synced_at: None,
         },
@@ -3821,6 +3868,7 @@ mod tests {
             full_clonepack: crate::ClonepackArtifacts::default(),
             shallow_clonepack: crate::ClonepackArtifacts::default(),
             history_levels: Vec::new(),
+            head_buckets: Vec::new(),
             build_status: None,
             synced_at: None,
         };
@@ -3969,6 +4017,7 @@ mod tests {
             },
             shallow_clonepack: crate::ClonepackArtifacts::default(),
             history_levels: Vec::new(),
+            head_buckets: Vec::new(),
             build_status: None,
             synced_at: Some(1_718_812_800),
         };
@@ -4055,6 +4104,7 @@ mod tests {
             },
             shallow_clonepack: crate::ClonepackArtifacts::default(),
             history_levels: Vec::new(),
+            head_buckets: Vec::new(),
             build_status: None,
             synced_at: None,
         };
