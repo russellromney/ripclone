@@ -202,9 +202,14 @@ fn metadata_bytes(metadata: &MetadataChunk) -> u64 {
         + metadata.files.len() * 64) as u64
 }
 
-fn temp_install_dir(target: &Path) -> Result<PathBuf> {
+/// Create a temp install directory next to `target`. Returns the `TempDir`
+/// handle (not a bare path): the caller must keep it alive so that on *any*
+/// failure before the final rename, the partial install is removed on drop. On
+/// success the dir is renamed onto `target`, after which the handle's drop is a
+/// harmless no-op (the path no longer exists).
+fn temp_install_dir(target: &Path) -> Result<tempfile::TempDir> {
     let parent = target.parent().filter(|p| !p.as_os_str().is_empty());
-    let dir = tempfile::Builder::new()
+    tempfile::Builder::new()
         .prefix(&format!(
             "{}.",
             target
@@ -214,8 +219,7 @@ fn temp_install_dir(target: &Path) -> Result<PathBuf> {
         ))
         .suffix(".tmp")
         .tempdir_in(parent.unwrap_or_else(|| Path::new(".")))
-        .context("create temp install directory")?;
-    Ok(dir.into_path())
+        .context("create temp install directory")
 }
 
 #[derive(Debug, Deserialize)]
@@ -800,10 +804,17 @@ impl Client {
             None
         };
 
+        // Hold the temp-dir handle for the whole install so any early failure
+        // removes the partial directory on drop. After a successful rename onto
+        // `target`, its drop is a no-op.
+        let mut _temp_install: Option<tempfile::TempDir> = None;
         let install_root = if let Some(ref dirs) = overlay_dirs {
             dirs.lower.clone()
         } else {
-            temp_install_dir(&target)?
+            let tmp = temp_install_dir(&target)?;
+            let path = tmp.path().to_path_buf();
+            _temp_install = Some(tmp);
+            path
         };
         let git_dir = install_root.join(".git");
 
@@ -934,6 +945,9 @@ impl Client {
 
         if let Some(dirs) = overlay_dirs {
             overlay::mount_dirs(&dirs).context("mount overlay at target")?;
+            // Mount succeeded; keep the staging tree (it backs the mount). Any
+            // failure before this point drops `dirs` and removes the staging.
+            dirs.mark_mounted();
             info!(
                 "mounted overlay {} -> {} (staging {})",
                 dirs.lower.display(),

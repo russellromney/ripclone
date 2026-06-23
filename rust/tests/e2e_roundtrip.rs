@@ -284,6 +284,101 @@ async fn persistent_fetch_failure_fails_clone() {
     );
 }
 
+/// Positive: a successful clone renames the temp install dir onto the target and
+/// leaves no `.tmp` leftovers in the parent.
+#[tokio::test]
+async fn successful_clone_leaves_no_temp_dir() {
+    init(false);
+    unsafe {
+        std::env::set_var("RIPCLONE_NO_OVERLAY", "1");
+    }
+    let server = start_server().await;
+    let origin = make_origin("acme", "clean");
+    origin.commit(&[("a.txt", "hi\n"), ("d/b.txt", "y\n")], "c1");
+    origin.publish();
+    let (_g, c) = sync_and_clone(&server, &origin, 1, CloneMode::Files).await;
+    unsafe {
+        std::env::remove_var("RIPCLONE_NO_OVERLAY");
+    }
+    assert_eq!(read(&c, "a.txt"), "hi\n");
+    assert_eq!(read(&c, "d/b.txt"), "y\n");
+    let parent = c.parent().unwrap();
+    let tmps: Vec<String> = std::fs::read_dir(parent)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".tmp"))
+        .collect();
+    assert!(tmps.is_empty(), "successful clone left temp dirs: {tmps:?}");
+}
+
+/// Negative: a clone that fails *after* the temp install dir is created (here a
+/// corrupt archive chunk fails extraction) must remove the partial dir and leave
+/// no target behind.
+#[tokio::test]
+async fn failed_clone_after_temp_dir_leaves_nothing() {
+    init(false);
+    unsafe {
+        std::env::set_var("RIPCLONE_NO_OVERLAY", "1");
+    }
+    let server = start_server().await;
+    let origin = make_origin("acme", "notemp");
+    origin.commit(&[("a.txt", "hello\n")], "c1");
+    origin.publish();
+    let client = server.client();
+    client
+        .sync_repo("acme", "notemp", None, None)
+        .await
+        .unwrap();
+
+    // Corrupt the first archive chunk so extraction (which runs after the temp
+    // install dir is created and the skeleton is written) fails deterministically.
+    let info = client
+        .resolve_ref_with_clonepack("acme", "notemp", "HEAD", Some("shallow"), None)
+        .await
+        .unwrap();
+    let (manifest, _meta) = client.fetch_clonepack(&info).await.unwrap();
+    assert!(
+        !manifest.archive_chunks.is_empty(),
+        "test needs an archive chunk to corrupt"
+    );
+    let chunk_hex = ripclone::clonepack::hash_to_hex(&manifest.archive_chunks[0].hash);
+    let p = server.cas_path(&chunk_hex);
+    assert!(p.exists(), "archive chunk should be in CAS");
+    std::fs::write(&p, b"corrupt-not-the-real-chunk").unwrap();
+
+    let out = tempfile::tempdir().unwrap();
+    let target = out.path().join("clone");
+    let res = client
+        .install_repo_with_mode(
+            "acme",
+            "notemp",
+            "HEAD",
+            &target,
+            CloneMode::Files,
+            Some("shallow"),
+            None,
+        )
+        .await;
+    unsafe {
+        std::env::remove_var("RIPCLONE_NO_OVERLAY");
+    }
+    assert!(res.is_err(), "corrupt archive chunk must fail the clone");
+    assert!(
+        !target.exists(),
+        "failed clone must not leave the target dir"
+    );
+    let leftovers: Vec<String> = std::fs::read_dir(out.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "failed clone left orphaned files in parent: {leftovers:?}"
+    );
+}
+
 /// RefInfo with LSM levels round-trips through serde, and old records (no
 /// `history_levels`) deserialize to an empty vec (back-compat).
 #[test]

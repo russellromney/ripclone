@@ -15,6 +15,10 @@ pub fn is_available() -> bool {
     if cfg!(not(target_os = "linux")) {
         return false;
     }
+    // Explicit opt-out wins, even if `RIPCLONE_TEMP` is set.
+    if env_enabled("RIPCLONE_NO_OVERLAY") {
+        return false;
+    }
     if !env_enabled("RIPCLONE_TEMP") {
         return false;
     }
@@ -62,12 +66,28 @@ pub struct OverlayDirs {
     pub upper: PathBuf,
     pub work: PathBuf,
     pub mount_point: PathBuf,
+    /// Set once the overlay is mounted. Until then, dropping `OverlayDirs`
+    /// removes the staging tree so a failed clone leaves nothing behind. After a
+    /// successful mount the staging dirs must persist (the mount references
+    /// them), so drop becomes a no-op.
+    mounted: std::sync::atomic::AtomicBool,
+}
+
+impl Drop for OverlayDirs {
+    fn drop(&mut self) {
+        if !self.mounted.load(std::sync::atomic::Ordering::Relaxed) {
+            let _ = std::fs::remove_dir_all(&self.base);
+        }
+    }
 }
 
 impl OverlayDirs {
-    /// Create lower/upper/work dirs under `staging_dir`. The caller keeps the
-    /// returned paths alive; dropping this value does not delete anything.
+    /// Create lower/upper/work dirs under `staging_dir`. If the clone fails
+    /// before [`mount_dirs`] succeeds, dropping this value removes the staging
+    /// tree; after a successful mount it is kept.
     pub fn create(staging_dir: &Path, mount_point: &Path) -> Result<OverlayDirs> {
+        // Keep the temp dir's path but manage cleanup ourselves via `Drop`
+        // (keyed on `mounted`), so a mounted overlay's staging survives.
         let base = tempfile::Builder::new()
             .prefix("ripclone-overlay-")
             .tempdir_in(staging_dir)
@@ -86,7 +106,14 @@ impl OverlayDirs {
             upper,
             work,
             mount_point: mount_point.to_path_buf(),
+            mounted: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// Mark the staging tree as mounted so `Drop` keeps it.
+    pub fn mark_mounted(&self) {
+        self.mounted
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -151,4 +178,40 @@ pub fn mount(lower: &Path, upper: &Path, work: &Path, mount_point: &Path) -> Res
 /// Mount helper that takes an `OverlayDirs`.
 pub fn mount_dirs(dirs: &OverlayDirs) -> Result<()> {
     mount(&dirs.lower, &dirs.upper, &dirs.work, &dirs.mount_point)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unmounted_overlay_staging_is_removed_on_drop() {
+        let staging = tempfile::tempdir().unwrap();
+        let mp = tempfile::tempdir().unwrap();
+        let base = {
+            let dirs = OverlayDirs::create(staging.path(), &mp.path().join("mnt")).unwrap();
+            assert!(dirs.base.exists());
+            dirs.base.clone()
+        };
+        assert!(
+            !base.exists(),
+            "unmounted overlay staging must be removed on drop"
+        );
+    }
+
+    #[test]
+    fn mounted_overlay_staging_is_kept_on_drop() {
+        let staging = tempfile::tempdir().unwrap();
+        let mp = tempfile::tempdir().unwrap();
+        let base = {
+            let dirs = OverlayDirs::create(staging.path(), &mp.path().join("mnt")).unwrap();
+            dirs.mark_mounted();
+            dirs.base.clone()
+        };
+        assert!(
+            base.exists(),
+            "mounted overlay staging must be kept on drop"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }
