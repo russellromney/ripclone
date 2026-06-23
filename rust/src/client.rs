@@ -1072,7 +1072,7 @@ impl Client {
     ) -> Result<u64> {
         let head_blobs_refs = head_blobs_chunk_refs(clonepack);
         if head_blobs_refs.is_empty() {
-            anyhow::bail!("clonepack missing head-blobs pack for hybrid install");
+            anyhow::bail!("clonepack missing head-blobs pack");
         }
         let idx_ref = clonepack
             .head_blobs_idx

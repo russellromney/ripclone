@@ -11,13 +11,13 @@ pub enum CloneMode {
     /// blobs straight out of it. `git diff`/`show`/`log` and edits/commits all
     /// work. One download of HEAD content, no archive, no local pack rebuild.
     #[default]
-    #[value(name = "editable", alias = "full", alias = "hybrid")]
+    #[value(name = "editable")]
     Editable,
 
     /// Working tree only, materialized from the zstd files artifact. No git
     /// object database, so `git diff`/`show` do not work. Fastest path for CI
     /// jobs that only need the files.
-    #[value(name = "files", alias = "fast")]
+    #[value(name = "files")]
     Files,
 
     /// `.git` skeleton only (commit + tree objects, prebuilt index). No working
@@ -66,13 +66,9 @@ impl FromStr for CloneMode {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            // Current names.
             "editable" => Ok(CloneMode::Editable),
             "files" => Ok(CloneMode::Files),
             "skeleton" => Ok(CloneMode::Skeleton),
-            // Deprecated aliases.
-            "full" | "hybrid" => Ok(CloneMode::Editable),
-            "fast" => Ok(CloneMode::Files),
             other => anyhow::bail!("unknown clone mode: {}", other),
         }
     }

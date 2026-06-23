@@ -2,7 +2,7 @@
 set -euo pipefail
 
 REPO="${REPO:-oven-sh/bun}"
-MODE="${MODE:-full}"
+MODE="${MODE:-editable}"
 RIPCLONE_TOKEN="${RIPCLONE_TOKEN:-bench-token}"
 export RIPCLONE_TOKEN
 

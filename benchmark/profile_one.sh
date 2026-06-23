@@ -70,7 +70,7 @@ done
 
 threads=$(( CORES - 1 )); [ "$threads" -lt 1 ] && threads=1
 
-for mode in fast full hybrid; do
+for mode in files editable; do
   rm -rf "$BASE_DIR/install-$mode"
   echo ""
   echo "==> cloning $mode (cores=$CORES rtt=${RTT_MS}ms bw=${BANDWIDTH}Mbps)..."

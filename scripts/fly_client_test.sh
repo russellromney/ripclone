@@ -101,7 +101,7 @@ echo "==> [2/6] ripclone direct-install (overlay staging, archive extraction)"
 run_clone \
   "ripclone archive-extraction (overlay)" \
   "/tmp/bun-archive" \
-  "RIPCLONE_MODE=fast" \
+  "RIPCLONE_MODE=files" \
   "ripclone --server $SERVER clone $REPO --dir /tmp/bun-archive" \
   install_archive_ms \
   install_archive_cpu

@@ -13,7 +13,7 @@ set -euo pipefail
 #   RTTS      - space-separated list in ms (default "50 125 250")
 
 REPO="${REPO:-oven-sh/bun}"
-MODE="${MODE:-full}"
+MODE="${MODE:-editable}"
 BANDWIDTH="${BANDWIDTH:-250}"
 ITER="${ITER:-3}"
 CORES="${CORES:-4 8}"
