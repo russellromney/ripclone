@@ -72,6 +72,12 @@ Remaining future improvements:
 downloader now waits for the manifest before fetching, and peak memory is bounded
 by the fetch-concurrency semaphore plus the bounded channel — not the chunk count.)
 
+Writer overlap depth is tunable via `RIPCLONE_IO_URING_DEPTH` (default 2; set 3
+on throttled/shared CPUs for ~10%). We are **not** pursuing a work-stealing
+writer or the dedicated submitter-pool scheduler — see
+[docs/WRITER_SCHEDULER_EXPERIMENT.md](docs/WRITER_SCHEDULER_EXPERIMENT.md) for
+the A/B data and reasoning.
+
 ### 4. User-facing clone modes ✅
 
 Implemented as `--mode full|fast|hybrid|skeleton` and `RIPCLONE_MODE`. See `CHANGELOG.md` for details.

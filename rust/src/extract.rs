@@ -1,6 +1,9 @@
 use crate::git;
 use crate::manifest::{FileEntry, FrameInfo, MetadataChunk as Manifest};
-use crate::worktree_writer::{FileWriteContent, OwnedFileWrite, WorktreeWriter};
+use crate::worktree_writer::{
+    FileWriteContent, OwnedFileWrite, SchedulerConfig, WorktreeWriteScheduler, WorktreeWriter,
+    WriteOptions,
+};
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, bounded};
 use filetime::{FileTime, set_file_mtime, set_symlink_file_times};
@@ -14,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tracing::info;
+use tracing::{info, warn};
 
 const INDEX_MTIME: FileTime = FileTime::from_unix_time(1, 0);
 const PACK_WRITE_BATCH_FILES: usize = 512;
@@ -50,11 +53,17 @@ struct PendingFile {
 pub struct ExtractStats {
     pub files: usize,
     pub raw_bytes: u64,
+    pub stats: Vec<crate::git::MaterializedPathStat>,
 }
 
 pub struct PackExtractResult {
     pub files: usize,
     pub stats: Vec<crate::git::MaterializedPathStat>,
+}
+
+struct ArchiveFrameWriteResult {
+    written: usize,
+    stats: Vec<crate::git::MaterializedPathStat>,
 }
 
 /// A consecutive group of archive frames fetched in a single HTTP range request.
@@ -299,21 +308,7 @@ where
 
     let chunks = compute_chunks(&manifest.frames, chunk_size);
 
-    let num_cpus = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
-    // Launch roughly one fetcher per core minus one so high-latency links can
-    // keep a large number of HTTP range requests in flight. Writers decompress
-    // and write files; give them the same count so fast networks don't stall
-    // behind a single writer while fetchers are idle.
-    let fetch_threads = std::env::var("RIPCLONE_FETCH_THREADS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| (num_cpus - 1).max(1));
-    let write_threads = std::env::var("RIPCLONE_WRITE_THREADS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| (num_cpus - 1).max(1));
+    let (fetch_threads, write_threads) = archive_thread_counts();
     // Use a small bounded queue so we don't buffer the whole archive in memory.
     let queue_depth = (fetch_threads * 2).max(write_threads * 2);
     info!(
@@ -331,8 +326,10 @@ where
         Sender<(usize, Result<Vec<u8>>)>,
         Receiver<(usize, Result<Vec<u8>>)>,
     ) = bounded(queue_depth);
-    let (done_tx, done_rx): (Sender<Result<usize>>, Receiver<Result<usize>>) =
-        bounded(manifest.frames.len());
+    let (done_tx, done_rx): (
+        Sender<Result<ArchiveFrameWriteResult>>,
+        Receiver<Result<ArchiveFrameWriteResult>>,
+    ) = bounded(manifest.frames.len());
 
     let fetcher = Arc::new(fetch_chunk);
     let dictionary = dictionary.map(|d| Arc::new(d.to_vec()));
@@ -388,20 +385,27 @@ where
     drop(job_rx);
     drop(compressed_tx);
 
+    let scheduler = build_archive_scheduler(target_dir.as_ref())?;
+
     // Spawn writer threads: they decompress frames and write files.
     for _ in 0..write_threads {
         let compressed_rx: Receiver<(usize, Result<Vec<u8>>)> = compressed_rx.clone();
-        let done_tx: Sender<Result<usize>> = done_tx.clone();
+        let done_tx: Sender<Result<ArchiveFrameWriteResult>> = done_tx.clone();
         let manifest2 = manifest.clone();
         let fragments_by_frame2 = fragments_by_frame.clone();
         let pending_files2 = pending_files.clone();
         let target_dir2 = target_dir.clone();
         let dictionary2 = dictionary.clone();
         let blob_pack_tx2 = blob_pack_tx.clone();
+        let scheduler2 = scheduler.clone();
         std::thread::spawn(move || {
-            let writer = target_dir2.as_ref().map(|_| WorktreeWriter::new());
+            let writer = if scheduler2.is_some() {
+                None
+            } else {
+                target_dir2.as_ref().map(|_| WorktreeWriter::new())
+            };
             while let Ok((idx, res)) = compressed_rx.recv() {
-                let result: Result<usize> = (|| {
+                let result: Result<ArchiveFrameWriteResult> = (|| {
                     let writer = match writer.as_ref() {
                         Some(Ok(writer)) => Some(writer),
                         Some(Err(e)) => anyhow::bail!("create worktree writer: {e:#}"),
@@ -444,6 +448,7 @@ where
                         .cloned()
                         .unwrap_or_default();
                     let mut written = 0usize;
+                    let mut stats = Vec::new();
                     let mut pending_writes: Vec<OwnedFileWrite> =
                         Vec::with_capacity(PACK_WRITE_BATCH_FILES);
                     for (file_idx, frag_idx) in &pairs {
@@ -484,11 +489,14 @@ where
                                     content: FileWriteContent::shared(Arc::clone(&raw), off, len),
                                 });
                                 if pending_writes.len() >= PACK_WRITE_BATCH_FILES {
-                                    written += flush_archive_writes(
+                                    let outcome = flush_archive_writes(
+                                        scheduler2.as_deref(),
                                         writer,
                                         Some(target_dir),
                                         &mut pending_writes,
                                     )?;
+                                    written += outcome.written;
+                                    stats.extend(outcome.stats);
                                 }
                             }
                         } else {
@@ -522,11 +530,14 @@ where
                                             content: full.clone().into(),
                                         });
                                         if pending_writes.len() >= PACK_WRITE_BATCH_FILES {
-                                            written += flush_archive_writes(
+                                            let outcome = flush_archive_writes(
+                                                scheduler2.as_deref(),
                                                 writer,
                                                 Some(target_dir),
                                                 &mut pending_writes,
                                             )?;
+                                            written += outcome.written;
+                                            stats.extend(outcome.stats);
                                         }
                                     }
                                     let sha1 = blob_sha1_to_array(&entry.blob_sha1)?;
@@ -541,19 +552,28 @@ where
                                         content: full.into(),
                                     });
                                     if pending_writes.len() >= PACK_WRITE_BATCH_FILES {
-                                        written += flush_archive_writes(
+                                        let outcome = flush_archive_writes(
+                                            scheduler2.as_deref(),
                                             writer,
                                             Some(target_dir),
                                             &mut pending_writes,
                                         )?;
+                                        written += outcome.written;
+                                        stats.extend(outcome.stats);
                                     }
                                 }
                             }
                         }
                     }
-                    written +=
-                        flush_archive_writes(writer, target_dir2.as_ref(), &mut pending_writes)?;
-                    Ok(written)
+                    let outcome = flush_archive_writes(
+                        scheduler2.as_deref(),
+                        writer,
+                        target_dir2.as_ref(),
+                        &mut pending_writes,
+                    )?;
+                    written += outcome.written;
+                    stats.extend(outcome.stats);
+                    Ok(ArchiveFrameWriteResult { written, stats })
                 })();
                 if done_tx.send(result).is_err() {
                     break;
@@ -572,10 +592,14 @@ where
 
     // Collect results from all writers.
     let mut files_written = 0usize;
+    let mut stat_cache = Vec::new();
     let mut error: Option<anyhow::Error> = None;
     for _ in 0..manifest.frames.len() {
         match done_rx.recv() {
-            Ok(Ok(n)) => files_written += n,
+            Ok(Ok(result)) => {
+                files_written += result.written;
+                stat_cache.extend(result.stats);
+            }
             Ok(Err(e)) => error = Some(e),
             Err(_) => {
                 error = Some(anyhow::anyhow!("writer thread disappeared"));
@@ -583,6 +607,20 @@ where
             }
         }
     }
+    // The scheduler writes in the background. Now that every writer thread is
+    // done submitting, drain it to finish any buffered writes and collect their
+    // stats. Write errors show up here.
+    if let Some(scheduler) = scheduler.as_ref() {
+        match scheduler.flush() {
+            Ok(outcome) => stat_cache.extend(outcome.stats),
+            Err(e) => {
+                if error.is_none() {
+                    error = Some(e);
+                }
+            }
+        }
+    }
+
     let expected_files = if target_dir.is_some() {
         manifest.files.len()
     } else {
@@ -623,7 +661,7 @@ where
             .iter()
             .map(|e| String::from_utf8_lossy(&e.path).into_owned())
             .collect();
-        if let Err(e) = git::clear_skip_worktree_index_and_refresh_stats(target_dir, &paths) {
+        if let Err(e) = git::clear_skip_worktree_index_with_stats(target_dir, &paths, &stat_cache) {
             error = Some(e);
         } else {
             info!(
@@ -663,6 +701,7 @@ where
     Ok(ExtractStats {
         files: files_written,
         raw_bytes: raw_total,
+        stats: stat_cache,
     })
 }
 
@@ -811,17 +850,73 @@ fn write_entry(target_dir: &Path, entry: &FileEntry, content: &[u8]) -> Result<(
     Ok(())
 }
 
+/// `WriteOptions` shared by every archive regular-file write, whether it goes
+/// through a per-thread writer or the shared scheduler.
+const ARCHIVE_WRITE_OPTIONS: WriteOptions = WriteOptions {
+    parents_prepared: true,
+    stamp_mtime: false,
+    fresh_target: false,
+};
+
 fn flush_archive_writes(
+    scheduler: Option<&WorktreeWriteScheduler>,
     writer: Option<&WorktreeWriter>,
     target_dir: Option<&PathBuf>,
     pending_writes: &mut Vec<OwnedFileWrite>,
-) -> Result<usize> {
+) -> Result<crate::worktree_writer::WriteOutcome> {
     if pending_writes.is_empty() {
-        return Ok(0);
+        return Ok(crate::worktree_writer::WriteOutcome {
+            written: 0,
+            stats: Vec::new(),
+        });
+    }
+    // When the scheduler is enabled, hand the writes to the submitter pool. The
+    // stats come back later from `scheduler.flush()`, so report only the count
+    // here.
+    if let Some(scheduler) = scheduler {
+        let written = scheduler.submit(std::mem::take(pending_writes))?;
+        return Ok(crate::worktree_writer::WriteOutcome {
+            written,
+            stats: Vec::new(),
+        });
     }
     let writer = writer.expect("archive writes only queued when target_dir is present");
     let target_dir = target_dir.expect("archive writes only queued when target_dir is present");
-    writer.write_owned_entries_in_prepared_dirs(target_dir, std::mem::take(pending_writes))
+    writer.write_owned_entries_with_options(
+        target_dir,
+        std::mem::take(pending_writes),
+        ARCHIVE_WRITE_OPTIONS,
+    )
+}
+
+/// Build the shared write scheduler for an archive extraction, if turned on via
+/// `RIPCLONE_IO_URING_SCHEDULER` and we are actually writing a worktree.
+///
+/// DEPRECATED: the scheduler is superseded by `RIPCLONE_IO_URING_DEPTH` and
+/// slated for removal. See `docs/WRITER_SCHEDULER_EXPERIMENT.md`.
+fn build_archive_scheduler(
+    target_dir: Option<&PathBuf>,
+) -> Result<Option<Arc<WorktreeWriteScheduler>>> {
+    if !SchedulerConfig::enabled() {
+        return Ok(None);
+    }
+    let Some(target_dir) = target_dir else {
+        return Ok(None);
+    };
+    let scheduler = WorktreeWriteScheduler::new(target_dir.clone(), ARCHIVE_WRITE_OPTIONS)
+        .context("create io_uring write scheduler")?;
+    let cfg = SchedulerConfig::from_env();
+    warn!(
+        "RIPCLONE_IO_URING_SCHEDULER is deprecated and slated for removal; it is \
+         superseded by RIPCLONE_IO_URING_DEPTH (see docs/WRITER_SCHEDULER_EXPERIMENT.md). \
+         enabled (submitters={}, inflight={}, batch_files={}, byte_cap={} B, flush={:?})",
+        scheduler.submitter_count(),
+        cfg.inflight,
+        cfg.batch_files,
+        cfg.byte_cap,
+        cfg.flush_timeout,
+    );
+    Ok(Some(Arc::new(scheduler)))
 }
 
 /// Default compressed chunk size for streaming extractions. A chunk contains
@@ -835,6 +930,24 @@ const DEFAULT_STREAMING_CHUNK_SIZE: u64 = 6 * 1024 * 1024;
 /// the streaming default because the local path is CPU-bound and benefits from
 /// more parallel slicing/decompression.
 const DEFAULT_LOCAL_CHUNK_SIZE: u64 = 2 * 1024 * 1024;
+
+fn available_parallelism() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .max(1)
+}
+
+fn env_usize(name: &str) -> Option<usize> {
+    std::env::var(name).ok().and_then(|s| s.parse().ok())
+}
+
+fn archive_thread_counts() -> (usize, usize) {
+    let cores = available_parallelism();
+    let fetch_threads = env_usize("RIPCLONE_FETCH_THREADS").unwrap_or(cores).max(1);
+    let write_threads = env_usize("RIPCLONE_WRITE_THREADS").unwrap_or(cores).max(1);
+    (fetch_threads, write_threads)
+}
 
 /// Extract a working-tree archive from a channel of pre-fetched archive chunks.
 ///
@@ -953,17 +1066,7 @@ pub fn extract_archive_from_chunk_receiver(
 
     let chunks = compute_chunks(&manifest.frames, u64::MAX);
 
-    let num_cpus = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
-    let fetch_threads = std::env::var("RIPCLONE_FETCH_THREADS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| (num_cpus - 1).max(1));
-    let write_threads = std::env::var("RIPCLONE_WRITE_THREADS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| (num_cpus - 1).max(1));
+    let (fetch_threads, write_threads) = archive_thread_counts();
     let queue_depth = (fetch_threads * 2).max(write_threads * 2);
 
     info!(
@@ -983,8 +1086,10 @@ pub fn extract_archive_from_chunk_receiver(
         Sender<(usize, Result<Vec<u8>>)>,
         Receiver<(usize, Result<Vec<u8>>)>,
     ) = bounded(queue_depth);
-    let (done_tx, done_rx): (Sender<Result<usize>>, Receiver<Result<usize>>) =
-        bounded(manifest.frames.len());
+    let (done_tx, done_rx): (
+        Sender<Result<ArchiveFrameWriteResult>>,
+        Receiver<Result<ArchiveFrameWriteResult>>,
+    ) = bounded(manifest.frames.len());
 
     let dictionary = dictionary.map(|d| Arc::new(d.to_vec()));
 
@@ -1050,20 +1155,27 @@ pub fn extract_archive_from_chunk_receiver(
     drop(chunk_rx);
     drop(compressed_tx);
 
+    let scheduler = build_archive_scheduler(target_dir.as_ref())?;
+
     // Spawn writer threads: they decompress frames and write files.
     for _ in 0..write_threads {
         let compressed_rx: Receiver<(usize, Result<Vec<u8>>)> = compressed_rx.clone();
-        let done_tx: Sender<Result<usize>> = done_tx.clone();
+        let done_tx: Sender<Result<ArchiveFrameWriteResult>> = done_tx.clone();
         let manifest2 = manifest.clone();
         let fragments_by_frame2 = fragments_by_frame.clone();
         let pending_files2 = pending_files.clone();
         let target_dir2 = target_dir.clone();
         let dictionary2 = dictionary.clone();
         let blob_pack_tx2 = blob_pack_tx.clone();
+        let scheduler2 = scheduler.clone();
         std::thread::spawn(move || {
-            let writer = target_dir2.as_ref().map(|_| WorktreeWriter::new());
+            let writer = if scheduler2.is_some() {
+                None
+            } else {
+                target_dir2.as_ref().map(|_| WorktreeWriter::new())
+            };
             while let Ok((idx, res)) = compressed_rx.recv() {
-                let result: Result<usize> = (|| {
+                let result: Result<ArchiveFrameWriteResult> = (|| {
                     let writer = match writer.as_ref() {
                         Some(Ok(writer)) => Some(writer),
                         Some(Err(e)) => anyhow::bail!("create worktree writer: {e:#}"),
@@ -1104,6 +1216,7 @@ pub fn extract_archive_from_chunk_receiver(
                         .cloned()
                         .unwrap_or_default();
                     let mut written = 0usize;
+                    let mut stats = Vec::new();
                     let mut pending_writes: Vec<OwnedFileWrite> =
                         Vec::with_capacity(PACK_WRITE_BATCH_FILES);
                     for (file_idx, frag_idx) in &pairs {
@@ -1144,11 +1257,14 @@ pub fn extract_archive_from_chunk_receiver(
                                     content: FileWriteContent::shared(Arc::clone(&raw), off, len),
                                 });
                                 if pending_writes.len() >= PACK_WRITE_BATCH_FILES {
-                                    written += flush_archive_writes(
+                                    let outcome = flush_archive_writes(
+                                        scheduler2.as_deref(),
                                         writer,
                                         Some(target_dir),
                                         &mut pending_writes,
                                     )?;
+                                    written += outcome.written;
+                                    stats.extend(outcome.stats);
                                 }
                             }
                         } else {
@@ -1182,11 +1298,14 @@ pub fn extract_archive_from_chunk_receiver(
                                             content: full.clone().into(),
                                         });
                                         if pending_writes.len() >= PACK_WRITE_BATCH_FILES {
-                                            written += flush_archive_writes(
+                                            let outcome = flush_archive_writes(
+                                                scheduler2.as_deref(),
                                                 writer,
                                                 Some(target_dir),
                                                 &mut pending_writes,
                                             )?;
+                                            written += outcome.written;
+                                            stats.extend(outcome.stats);
                                         }
                                     }
                                     let sha1 = blob_sha1_to_array(&entry.blob_sha1)?;
@@ -1201,19 +1320,28 @@ pub fn extract_archive_from_chunk_receiver(
                                         content: full.into(),
                                     });
                                     if pending_writes.len() >= PACK_WRITE_BATCH_FILES {
-                                        written += flush_archive_writes(
+                                        let outcome = flush_archive_writes(
+                                            scheduler2.as_deref(),
                                             writer,
                                             Some(target_dir),
                                             &mut pending_writes,
                                         )?;
+                                        written += outcome.written;
+                                        stats.extend(outcome.stats);
                                     }
                                 }
                             }
                         }
                     }
-                    written +=
-                        flush_archive_writes(writer, target_dir2.as_ref(), &mut pending_writes)?;
-                    Ok(written)
+                    let outcome = flush_archive_writes(
+                        scheduler2.as_deref(),
+                        writer,
+                        target_dir2.as_ref(),
+                        &mut pending_writes,
+                    )?;
+                    written += outcome.written;
+                    stats.extend(outcome.stats);
+                    Ok(ArchiveFrameWriteResult { written, stats })
                 })();
                 if done_tx.send(result).is_err() {
                     break;
@@ -1226,10 +1354,14 @@ pub fn extract_archive_from_chunk_receiver(
 
     // Collect results from all writers.
     let mut files_written = 0usize;
+    let mut stat_cache = Vec::new();
     let mut error: Option<anyhow::Error> = None;
     for _ in 0..manifest.frames.len() {
         match done_rx.recv() {
-            Ok(Ok(n)) => files_written += n,
+            Ok(Ok(result)) => {
+                files_written += result.written;
+                stat_cache.extend(result.stats);
+            }
             Ok(Err(e)) => error = Some(e),
             Err(_) => {
                 error = Some(anyhow::anyhow!("writer thread disappeared"));
@@ -1237,6 +1369,20 @@ pub fn extract_archive_from_chunk_receiver(
             }
         }
     }
+    // The scheduler writes in the background. Now that every writer thread is
+    // done submitting, drain it to finish any buffered writes and collect their
+    // stats. Write errors show up here.
+    if let Some(scheduler) = scheduler.as_ref() {
+        match scheduler.flush() {
+            Ok(outcome) => stat_cache.extend(outcome.stats),
+            Err(e) => {
+                if error.is_none() {
+                    error = Some(e);
+                }
+            }
+        }
+    }
+
     let expected_files = if target_dir.is_some() {
         manifest.files.len()
     } else {
@@ -1273,7 +1419,7 @@ pub fn extract_archive_from_chunk_receiver(
             .iter()
             .map(|e| String::from_utf8_lossy(&e.path).into_owned())
             .collect();
-        if let Err(e) = git::clear_skip_worktree_index_and_refresh_stats(target_dir, &paths) {
+        if let Err(e) = git::clear_skip_worktree_index_with_stats(target_dir, &paths, &stat_cache) {
             error = Some(e);
         } else {
             info!(
@@ -1311,6 +1457,7 @@ pub fn extract_archive_from_chunk_receiver(
     Ok(ExtractStats {
         files: files_written,
         raw_bytes: raw_total,
+        stats: stat_cache,
     })
 }
 
@@ -1385,6 +1532,7 @@ pub fn materialize_worktree_from_pack(repo_root: &Path, commit: &str) -> Result<
         return Ok(ExtractStats {
             files: 0,
             raw_bytes: 0,
+            stats: Vec::new(),
         });
     }
 
@@ -1583,6 +1731,7 @@ pub fn materialize_worktree_from_pack(repo_root: &Path, commit: &str) -> Result<
     Ok(ExtractStats {
         files: files_written,
         raw_bytes: raw_total,
+        stats,
     })
 }
 

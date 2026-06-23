@@ -40,6 +40,7 @@ WORKDIR /app
 COPY --from=builder /app/target/release/ripclone /usr/local/bin/ripclone
 COPY --from=builder /app/target/release/git-remote-ripclone /usr/local/bin/git-remote-ripclone
 COPY --from=builder /app/target/release/ripclone-server /usr/local/bin/ripclone-server
+COPY --from=builder /app/target/release/writer_bench /usr/local/bin/writer_bench
 COPY scripts/fly_client_test.sh /run-tests.sh
 RUN chmod +x /run-tests.sh
 
