@@ -592,7 +592,13 @@ fn readyz_response(ready: bool) -> Response {
 }
 
 async fn metrics_handler(State(state): State<ServerState>) -> impl IntoResponse {
-    Json(state.metrics.snapshot())
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        state.metrics.prometheus(),
+    )
 }
 
 #[derive(Deserialize)]
@@ -1423,6 +1429,10 @@ async fn sync_repo(
         };
         if first {
             state.build_queue_depth.fetch_add(1, Ordering::Relaxed);
+            // Mirror the /build handler: the worker decrements the metrics gauge
+            // for every job it drains, so every enqueue must increment it (else
+            // the gauge underflows).
+            state.metrics.record_build_queued();
             let job = BuildJob {
                 owner: owner.clone(),
                 repo: repo.clone(),
@@ -1432,6 +1442,7 @@ async fn sync_repo(
             };
             if state.build_queue.try_send(job).is_err() {
                 state.build_queue_depth.fetch_sub(1, Ordering::Relaxed);
+                state.metrics.record_build_rejected();
                 state.build_waiters.lock().await.remove(&key);
                 state.metrics.record_error();
                 return (
@@ -4251,6 +4262,30 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
+    #[tokio::test]
+    async fn metrics_endpoint_is_prometheus_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(&tmp);
+        state.metrics.record_ref_lookup();
+        let app = build_app(state);
+        let response = app.oneshot(test_request("GET", "/metrics")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let ct = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert!(ct.starts_with("text/plain"), "content-type was {ct}");
+        assert!(ct.contains("version=0.0.4"), "content-type was {ct}");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("# TYPE ripclone_ref_lookups_total counter"));
+        assert!(text.contains("\nripclone_ref_lookups_total 1\n"));
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn readyz_not_ready_when_storage_read_only() {
@@ -4268,10 +4303,7 @@ mod tests {
         // case the old is_dir() check missed.
         std::fs::set_permissions(&cas, std::fs::Permissions::from_mode(0o500)).unwrap();
         let app = build_app(state);
-        let response = app
-            .oneshot(test_request("GET", "/readyz"))
-            .await
-            .unwrap();
+        let response = app.oneshot(test_request("GET", "/readyz")).await.unwrap();
         std::fs::set_permissions(&cas, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert_eq!(
             response.status(),

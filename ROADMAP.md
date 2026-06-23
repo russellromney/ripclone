@@ -103,10 +103,12 @@ Tigris Global buckets already cache objects near the requester, but the first re
 
 Implemented as `--bench` / `RIPCLONE_BENCH=1` with a JSON report covering all defined phases. See `CHANGELOG.md` for details.
 
-### 7. Production hardening still missing
+### 7. Production hardening
 
-- **Prometheus `/metrics`**: replace the JSON snapshot with Prometheus text format.
-- **Real `/readyz`**: check storage and ref-store health instead of always returning `ok`.
+- **Prometheus `/metrics`** ✅: served in Prometheus text exposition format.
+- **Real `/readyz`** ✅: probes storage + ref-store health (write probe for local backends; bucket reachability for S3); 503 when a dependency is down, cached briefly to damp flapping.
+
+Still missing:
 - **JWT auth flow**: `ripclone auth login` that exchanges a secret for a short-lived JWT, plus `/v1/auth/refresh`.
 - **GitHub App path**: support installation tokens in addition to the env-var PAT.
 - **CI and integration tests**: GitHub Actions workflow with `cargo test`, `cargo clippy -- -D warnings`, `cargo fmt --check`, Docker build, and an end-to-end clone test against a fixture repo.
