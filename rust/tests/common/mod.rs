@@ -106,16 +106,46 @@ fn init_tracing() {
 }
 
 pub async fn start_server() -> Server {
+    start_server_inner(0).await
+}
+
+/// Like `start_server`, but the server fails its first `fail_first` artifact
+/// GETs (via `RIPCLONE_TEST_FAIL_FIRST_FETCHES`) so client retry/backoff can be
+/// exercised end to end. The fault threshold is read once at construction; the
+/// env var is set only while holding `SERVER_START_LOCK` and removed before the
+/// lock drops, so no other server is constructed while it is set — keeping the
+/// suite correct under parallel `cargo test`.
+pub async fn start_server_faulting(fail_first: usize) -> Server {
+    start_server_inner(fail_first).await
+}
+
+/// Serializes server *construction* (the brief startup window only, not whole
+/// tests) so the per-server `RIPCLONE_TEST_FAIL_FIRST_FETCHES` env var, read
+/// once at construction, can't leak into a concurrently-starting server.
+static SERVER_START_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+async fn start_server_inner(fail_first: usize) -> Server {
     init_tracing();
     let dir = tempfile::tempdir().expect("server dir");
     let cas_dir = dir.path().join("cas");
     let repo_root = dir.path().join("repos");
     let port = free_port();
     let (cas2, repos2) = (cas_dir.clone(), repo_root.clone());
+
+    let _start_guard = SERVER_START_LOCK.lock().await;
+    if fail_first > 0 {
+        // SAFETY: set under SERVER_START_LOCK and removed before it drops, so no
+        // concurrently-constructing server observes it.
+        unsafe {
+            std::env::set_var("RIPCLONE_TEST_FAIL_FIRST_FETCHES", fail_first.to_string());
+        }
+    }
     tokio::spawn(async move {
         let _ = run_server(&cas2, &repos2, "127.0.0.1", port).await;
     });
-    // Wait until the port accepts connections.
+    // Wait until the port accepts connections. The server state (including the
+    // fault threshold read) is constructed before the listener binds, so by the
+    // time the port is up the env var has been consumed.
     let mut ready = false;
     for _ in 0..400 {
         if tokio::net::TcpStream::connect(("127.0.0.1", port))
@@ -127,6 +157,12 @@ pub async fn start_server() -> Server {
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+    if fail_first > 0 {
+        unsafe {
+            std::env::remove_var("RIPCLONE_TEST_FAIL_FIRST_FETCHES");
+        }
+    }
+    drop(_start_guard);
     assert!(ready, "server on port {port} did not become ready");
     Server {
         url: format!("http://127.0.0.1:{port}"),

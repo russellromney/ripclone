@@ -72,7 +72,7 @@ impl Metrics {
     /// Roll back a queue-depth increment when the queue is full and the job is
     /// rejected.
     pub fn record_build_rejected(&self) {
-        self.build_queue_depth.fetch_sub(1, Ordering::Relaxed);
+        Self::dec_saturating(&self.build_queue_depth);
     }
 
     /// Record that a job was actually enqueued successfully.
@@ -84,12 +84,108 @@ impl Metrics {
         self.builds_completed.fetch_add(1, Ordering::Relaxed);
         self.build_duration_ms_total
             .fetch_add(duration.as_millis() as u64, Ordering::Relaxed);
-        self.build_queue_depth.fetch_sub(1, Ordering::Relaxed);
+        Self::dec_saturating(&self.build_queue_depth);
     }
 
     pub fn record_build_failed(&self) {
         self.builds_failed.fetch_add(1, Ordering::Relaxed);
-        self.build_queue_depth.fetch_sub(1, Ordering::Relaxed);
+        Self::dec_saturating(&self.build_queue_depth);
+    }
+
+    /// Decrement a gauge but never wrap below zero — a gauge that underflowed to
+    /// `u64::MAX` would render as a garbage Prometheus value.
+    fn dec_saturating(g: &AtomicU64) {
+        let _ = g.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            Some(v.saturating_sub(1))
+        });
+    }
+
+    /// Render metrics in the Prometheus text exposition format (v0.0.4).
+    /// Counters use the `_total` suffix; `build_queue_depth` is a gauge.
+    pub fn prometheus(&self) -> String {
+        use std::fmt::Write as _;
+        let s = self.snapshot();
+        let mut out = String::with_capacity(2048);
+
+        let counters: [(&str, &str, u64); 14] = [
+            (
+                "ripclone_ref_lookups_total",
+                "Ref lookups served",
+                s.ref_lookups,
+            ),
+            ("ripclone_syncs_total", "Repo syncs performed", s.syncs),
+            (
+                "ripclone_sync_duration_ms_total",
+                "Total sync wall time in milliseconds",
+                s.sync_duration_ms_total,
+            ),
+            (
+                "ripclone_artifact_requests_total",
+                "Artifact requests served",
+                s.artifact_requests,
+            ),
+            (
+                "ripclone_artifact_bytes_served_total",
+                "Artifact bytes served",
+                s.artifact_bytes_served,
+            ),
+            ("ripclone_errors_total", "Request errors", s.errors),
+            (
+                "ripclone_retention_runs_total",
+                "Retention runs",
+                s.retention_runs,
+            ),
+            (
+                "ripclone_retention_evicted_bytes_total",
+                "Bytes evicted by retention",
+                s.retention_evicted_bytes,
+            ),
+            (
+                "ripclone_retention_evicted_objects_total",
+                "Objects evicted by retention",
+                s.retention_evicted_objects,
+            ),
+            (
+                "ripclone_retention_errors_total",
+                "Retention errors",
+                s.retention_errors,
+            ),
+            (
+                "ripclone_builds_queued_total",
+                "Builds enqueued",
+                s.builds_queued,
+            ),
+            (
+                "ripclone_builds_completed_total",
+                "Builds completed",
+                s.builds_completed,
+            ),
+            (
+                "ripclone_build_duration_ms_total",
+                "Total build wall time in milliseconds",
+                s.build_duration_ms_total,
+            ),
+            (
+                "ripclone_builds_failed_total",
+                "Builds failed",
+                s.builds_failed,
+            ),
+        ];
+        for (name, help, value) in counters {
+            let _ = writeln!(out, "# HELP {name} {}", escape_help(help));
+            let _ = writeln!(out, "# TYPE {name} counter");
+            let _ = writeln!(out, "{name} {value}");
+        }
+
+        let _ = writeln!(
+            out,
+            "# HELP ripclone_build_queue_depth {}",
+            escape_help("Builds currently queued or in flight")
+        );
+        let _ = writeln!(out, "# TYPE ripclone_build_queue_depth gauge");
+        let _ = writeln!(out, "ripclone_build_queue_depth {}", s.build_queue_depth);
+
+        out
     }
 
     pub fn snapshot(&self) -> MetricsSnapshot {
@@ -123,6 +219,13 @@ impl Metrics {
     }
 }
 
+/// Escape HELP text per the Prometheus exposition format (backslash and
+/// newline). All current strings are plain, but this keeps the renderer correct
+/// if a future HELP string contains a special character.
+fn escape_help(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('\n', "\\n")
+}
+
 #[derive(Serialize)]
 pub struct MetricsSnapshot {
     pub ref_lookups: u64,
@@ -142,4 +245,54 @@ pub struct MetricsSnapshot {
     pub build_duration_ms_total: u64,
     pub builds_failed: u64,
     pub build_queue_depth: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prometheus_format_has_help_type_and_values() {
+        let m = Metrics::new();
+        m.record_ref_lookup();
+        m.record_ref_lookup();
+        m.record_sync(std::time::Duration::from_millis(10));
+        m.record_artifact_request(1234);
+        m.record_build_queued();
+
+        let out = m.prometheus();
+
+        // Counter: HELP + TYPE + value.
+        assert!(out.contains("# HELP ripclone_ref_lookups_total Ref lookups served"));
+        assert!(out.contains("# TYPE ripclone_ref_lookups_total counter"));
+        assert!(out.contains("\nripclone_ref_lookups_total 2\n"));
+        assert!(out.contains("\nripclone_artifact_bytes_served_total 1234\n"));
+
+        // Gauge.
+        assert!(out.contains("# TYPE ripclone_build_queue_depth gauge"));
+        assert!(out.contains("\nripclone_build_queue_depth 1\n"));
+
+        // Every metric (14 counters + 1 gauge) carries a TYPE line.
+        assert_eq!(out.matches("# TYPE ").count(), 15);
+        // Output is a complete set of lines (no dangling partial line).
+        assert!(out.ends_with('\n'));
+    }
+
+    #[test]
+    fn build_queue_depth_gauge_is_balanced_and_saturating() {
+        let m = Metrics::new();
+        m.record_build_queued();
+        m.record_build_completed(std::time::Duration::from_millis(1));
+        assert!(
+            m.prometheus().contains("\nripclone_build_queue_depth 0\n"),
+            "balanced queue/complete should return the gauge to 0"
+        );
+        // Underflow guard: a stray decrement must clamp at 0, never wrap to
+        // u64::MAX (which would render as a garbage gauge value).
+        m.record_build_failed();
+        assert!(
+            m.prometheus().contains("\nripclone_build_queue_depth 0\n"),
+            "decrement below zero must saturate at 0"
+        );
+    }
 }

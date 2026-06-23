@@ -65,9 +65,12 @@ Proposed design:
 Implemented in `rust/src/client.rs`, `rust/src/extract.rs`, and `rust/src/pack_writer.rs`. See `CHANGELOG.md` for details.
 
 Remaining future improvements:
-- Buffer early archive chunks to a bounded temp spill directory when they arrive before metadata (currently the bounded channel holds up to two chunks in memory).
-- Retry each chunk download with exponential backoff.
-- Delete the temp install directory on failure.
+- Retry each chunk download with exponential backoff. ✅ (`RIPCLONE_FETCH_MAX_ATTEMPTS`/`RIPCLONE_FETCH_BACKOFF_MS`)
+- Delete the temp install directory on failure. ✅ (RAII on the temp dir + overlay staging)
+
+(The earlier "spill early chunks to disk before metadata" idea is obsolete: the
+downloader now waits for the manifest before fetching, and peak memory is bounded
+by the fetch-concurrency semaphore plus the bounded channel — not the chunk count.)
 
 ### 4. User-facing clone modes ✅
 
@@ -100,10 +103,12 @@ Tigris Global buckets already cache objects near the requester, but the first re
 
 Implemented as `--bench` / `RIPCLONE_BENCH=1` with a JSON report covering all defined phases. See `CHANGELOG.md` for details.
 
-### 7. Production hardening still missing
+### 7. Production hardening
 
-- **Prometheus `/metrics`**: replace the JSON snapshot with Prometheus text format.
-- **Real `/readyz`**: check storage and ref-store health instead of always returning `ok`.
+- **Prometheus `/metrics`** ✅: served in Prometheus text exposition format.
+- **Real `/readyz`** ✅: probes storage + ref-store health (write probe for local backends; bucket reachability for S3); 503 when a dependency is down, cached briefly to damp flapping.
+
+Still missing:
 - **JWT auth flow**: `ripclone auth login` that exchanges a secret for a short-lived JWT, plus `/v1/auth/refresh`.
 - **GitHub App path**: support installation tokens in addition to the env-var PAT.
 - **CI and integration tests**: GitHub Actions workflow with `cargo test`, `cargo clippy -- -D warnings`, `cargo fmt --check`, Docker build, and an end-to-end clone test against a fixture repo.

@@ -2,6 +2,13 @@
 
 This file tracks what has already landed in ripclone. For upcoming work see `ROADMAP.md`.
 
+## Client robustness + server observability
+
+- **Chunk download retry with backoff** (`rust/src/client.rs`): all artifact/chunk fetches retry transient failures (transport errors, 5xx/429/408, mid-stream body errors) with jittered exponential backoff; permanent failures (other 4xx, deterministic hash mismatch) fail fast; a failed/expired presigned URL falls back to the gateway. Tunable via `RIPCLONE_FETCH_MAX_ATTEMPTS` (3) and `RIPCLONE_FETCH_BACKOFF_MS` (100).
+- **No orphaned install dir on failure** (`rust/src/client.rs`, `rust/src/overlay.rs`): a failed clone now removes its partial temp install dir (RAII) and its overlay staging tree; `RIPCLONE_NO_OVERLAY` is a real opt-out.
+- **Real `/readyz`** (`rust/src/server.rs`, `rust/src/storage/`, `rust/src/ref_store.rs`): returns 503 when storage or the ref store is unreachable (write probe for local backends, bucket reachability for S3), result cached ~3s; generic public body with details logged.
+- **Prometheus `/metrics`** (`rust/src/metrics.rs`): served as Prometheus text exposition format (`text/plain; version=0.0.4`) instead of JSON. Fixed a `build_queue_depth` gauge underflow (async `/sync` builds now balance the gauge; decrements saturate at 0).
+
 ## Shallow/full clonepacks, archive chunk sizing, and sync depth
 
 - **Dual clonepacks: shallow (depth=1) and full history** (`rust/src/lib.rs`, `rust/src/server.rs`, `rust/src/client.rs`, `rust/src/pack.rs`, `rust/src/git.rs`)

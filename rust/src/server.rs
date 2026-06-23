@@ -69,6 +69,32 @@ pub struct ServerState {
     /// This smooths repeated clone startup latency when signing or ref-store
     /// lookup has a cold tail.
     pub ref_response_cache: Arc<std::sync::Mutex<HashMap<String, CachedRefResponse>>>,
+    /// Count of artifact GETs served, used only by the test-only fault injector.
+    /// Per-server so tests don't leak state into each other.
+    pub artifact_fetch_count: Arc<AtomicUsize>,
+    /// Test-only fault injection: make the first N artifact GETs fail with 503.
+    /// Read once from `RIPCLONE_TEST_FAIL_FIRST_FETCHES` at construction (0 =
+    /// off), so the hot path never touches the environment in production.
+    pub fail_first_fetches: usize,
+    /// Cached `/readyz` result `(checked_at, ready)`. Bounds backend probe cost
+    /// (S3 round-trips) and damps load-balancer flapping on a transient blip.
+    pub readyz_cache: Arc<std::sync::Mutex<Option<(Instant, bool)>>>,
+}
+
+/// Read the test-only fault-injection threshold once at startup. Logs loudly if
+/// it is active so it can never silently degrade a production server.
+fn fail_first_fetches_from_env() -> usize {
+    let n = std::env::var("RIPCLONE_TEST_FAIL_FIRST_FETCHES")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0);
+    if n > 0 {
+        tracing::warn!(
+            "TEST FAULT INJECTION ACTIVE: failing the first {n} artifact fetches \
+             (RIPCLONE_TEST_FAIL_FIRST_FETCHES); this must NOT be set in production"
+        );
+    }
+    n
 }
 
 #[derive(Clone)]
@@ -512,12 +538,67 @@ async fn healthz() -> impl IntoResponse {
     Json(serde_json::json!({"status": "ok"}))
 }
 
-async fn readyz() -> impl IntoResponse {
-    Json(serde_json::json!({"status": "ok"}))
+/// Readiness probe: 200 only when storage and the ref store are both reachable,
+/// 503 otherwise (with the specific problems). Unlike `/healthz` (liveness),
+/// this fails when a dependency is broken (e.g. the data volume is unmounted) so
+/// a load balancer stops routing to a server that can't serve clones.
+const READYZ_CACHE_TTL: Duration = Duration::from_secs(3);
+
+async fn readyz(State(state): State<ServerState>) -> impl IntoResponse {
+    // Serve a cached result within the TTL: bounds backend probe cost (e.g. S3
+    // round-trips on this unauthenticated endpoint) and damps load-balancer
+    // flapping on a single transient blip.
+    if let Some((at, ready)) = *state.readyz_cache.lock().unwrap_or_else(|e| e.into_inner())
+        && at.elapsed() < READYZ_CACHE_TTL
+    {
+        return readyz_response(ready);
+    }
+
+    let mut problems: Vec<String> = Vec::new();
+
+    // The storage probe is synchronous (filesystem / S3); keep it off the async
+    // worker.
+    let storage = state.storage.clone();
+    match tokio::task::spawn_blocking(move || storage.health()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => problems.push(format!("storage: {e:#}")),
+        Err(e) => problems.push(format!("storage probe failed to run: {e}")),
+    }
+
+    if let Err(e) = state.ref_store.health().await {
+        problems.push(format!("ref_store: {e:#}"));
+    }
+
+    let ready = problems.is_empty();
+    if !ready {
+        // Log details server-side; the public (unauthenticated) body stays
+        // generic so internal paths aren't leaked.
+        warn!("readiness check failed: {}", problems.join("; "));
+    }
+    *state.readyz_cache.lock().unwrap_or_else(|e| e.into_inner()) = Some((Instant::now(), ready));
+    readyz_response(ready)
+}
+
+fn readyz_response(ready: bool) -> Response {
+    if ready {
+        (StatusCode::OK, Json(serde_json::json!({"status": "ready"}))).into_response()
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"status": "not_ready"})),
+        )
+            .into_response()
+    }
 }
 
 async fn metrics_handler(State(state): State<ServerState>) -> impl IntoResponse {
-    Json(state.metrics.snapshot())
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        state.metrics.prometheus(),
+    )
 }
 
 #[derive(Deserialize)]
@@ -770,7 +851,10 @@ fn cached_ref_response(
         return None;
     }
     let key = ref_response_cache_key(owner, repo, branch, clonepack);
-    let mut cache = state.ref_response_cache.lock().unwrap();
+    let mut cache = state
+        .ref_response_cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     cache.retain(|_, cached| cached.inserted.elapsed() < ttl);
     cache.get(&key).map(|cached| cached.response.clone())
 }
@@ -788,7 +872,10 @@ fn cache_ref_response(
         return;
     }
     let key = ref_response_cache_key(owner, repo, branch, clonepack);
-    let mut cache = state.ref_response_cache.lock().unwrap();
+    let mut cache = state
+        .ref_response_cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     cache.retain(|_, cached| cached.inserted.elapsed() < ttl);
     cache.insert(
         key,
@@ -801,7 +888,10 @@ fn cache_ref_response(
 
 fn invalidate_ref_response_cache(state: &ServerState, owner: &str, repo: &str, branch: &str) {
     let prefix = format!("{owner}\0{repo}\0{branch}\0");
-    let mut cache = state.ref_response_cache.lock().unwrap();
+    let mut cache = state
+        .ref_response_cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     cache.retain(|key, _| !key.starts_with(&prefix));
 }
 
@@ -1348,6 +1438,10 @@ async fn sync_repo(
         };
         if first {
             state.build_queue_depth.fetch_add(1, Ordering::Relaxed);
+            // Mirror the /build handler: the worker decrements the metrics gauge
+            // for every job it drains, so every enqueue must increment it (else
+            // the gauge underflows).
+            state.metrics.record_build_queued();
             let job = BuildJob {
                 owner: owner.clone(),
                 repo: repo.clone(),
@@ -1357,6 +1451,7 @@ async fn sync_repo(
             };
             if state.build_queue.try_send(job).is_err() {
                 state.build_queue_depth.fetch_sub(1, Ordering::Relaxed);
+                state.metrics.record_build_rejected();
                 state.build_waiters.lock().await.remove(&key);
                 state.metrics.record_error();
                 return (
@@ -1899,11 +1994,32 @@ async fn get_object(
     serve_artifact(sha, state, None).await.into_response()
 }
 
+/// Test-only fault injection. When the server was started with
+/// `RIPCLONE_TEST_FAIL_FIRST_FETCHES=N`, the first N artifact GETs return 503 so
+/// the client's retry/backoff can be exercised end to end. The threshold is read
+/// once at construction (0 = off, the production default), so this is a single
+/// atomic load on the hot path. The counter lives in `ServerState`, so each
+/// test's server starts fresh.
+fn maybe_inject_artifact_fault(state: &ServerState) -> Option<Response> {
+    if state.fail_first_fetches == 0 {
+        return None;
+    }
+    let seen = state.artifact_fetch_count.fetch_add(1, Ordering::Relaxed);
+    if seen < state.fail_first_fetches {
+        Some((StatusCode::SERVICE_UNAVAILABLE, "injected transient fault").into_response())
+    } else {
+        None
+    }
+}
+
 async fn get_artifact(
     Path(hash): Path<String>,
     headers: axum::http::HeaderMap,
     State(state): State<ServerState>,
 ) -> impl IntoResponse {
+    if let Some(resp) = maybe_inject_artifact_fault(&state) {
+        return resp;
+    }
     if let Some(resp) = validate_artifact_hash(&hash) {
         return resp;
     }
@@ -3890,6 +4006,9 @@ pub async fn run_server(
                 .unwrap_or(60),
         ),
         ref_response_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        artifact_fetch_count: Arc::new(AtomicUsize::new(0)),
+        fail_first_fetches: fail_first_fetches_from_env(),
+        readyz_cache: Arc::new(std::sync::Mutex::new(None)),
     };
     let build_queue = spawn_build_worker(state.clone());
     state.build_queue = build_queue;
@@ -3943,6 +4062,9 @@ mod tests {
             mirror_freshness: Arc::new(std::sync::Mutex::new(HashMap::new())),
             mirror_fresh_ttl: Duration::from_secs(60),
             ref_response_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            artifact_fetch_count: Arc::new(AtomicUsize::new(0)),
+            fail_first_fetches: fail_first_fetches_from_env(),
+            readyz_cache: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -4127,6 +4249,86 @@ mod tests {
         assert_eq!(status.regions.len(), 1);
         assert_eq!(status.regions[0].region, "local");
         assert_eq!(status.regions[0].unique_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn readyz_ready_when_healthy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(&tmp);
+        let app = build_app(state);
+        let response = app.oneshot(test_request("GET", "/readyz")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn readyz_not_ready_when_storage_gone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(&tmp);
+        // Simulate the data volume being unmounted/removed under the server.
+        std::fs::remove_dir_all(tmp.path().join("cas")).unwrap();
+        let app = build_app(state);
+        let response = app.oneshot(test_request("GET", "/readyz")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_is_prometheus_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(&tmp);
+        state.metrics.record_ref_lookup();
+        let app = build_app(state);
+        let response = app.oneshot(test_request("GET", "/metrics")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let ct = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert!(ct.starts_with("text/plain"), "content-type was {ct}");
+        assert!(ct.contains("version=0.0.4"), "content-type was {ct}");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("# TYPE ripclone_ref_lookups_total counter"));
+        assert!(text.contains("\nripclone_ref_lookups_total 1\n"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn readyz_not_ready_when_storage_read_only() {
+        // root ignores directory permissions, so this probe can't be exercised
+        // as root (common in CI containers); skip there.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping read-only probe test: running as root");
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(&tmp);
+        let cas = tmp.path().join("cas");
+        // r-x only: the dir still stats as a directory, but writes fail — the
+        // case the old is_dir() check missed.
+        std::fs::set_permissions(&cas, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let app = build_app(state);
+        let response = app.oneshot(test_request("GET", "/readyz")).await.unwrap();
+        std::fs::set_permissions(&cas, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "read-only CAS must report not ready"
+        );
+    }
+
+    #[tokio::test]
+    async fn readyz_not_ready_when_ref_store_gone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(&tmp);
+        std::fs::remove_dir_all(tmp.path().join("repos")).unwrap();
+        let app = build_app(state);
+        let response = app.oneshot(test_request("GET", "/readyz")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]

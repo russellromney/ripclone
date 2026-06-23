@@ -13,7 +13,6 @@ use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::{Mutex as TokioMutex, Notify};
 use tracing::{info, warn};
 
 #[derive(Debug, Clone, Deserialize)]
@@ -71,6 +70,126 @@ pub(crate) fn head_blobs_chunk_refs(
     }
 }
 
+/// `(max_attempts, base_backoff_ms)` for artifact downloads, from the
+/// environment. Defaults: 3 attempts, 100 ms base backoff.
+fn fetch_retry_config() -> (u32, u64) {
+    let attempts = std::env::var("RIPCLONE_FETCH_MAX_ATTEMPTS")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(3)
+        .max(1);
+    let backoff_ms = std::env::var("RIPCLONE_FETCH_BACKOFF_MS")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(100);
+    (attempts, backoff_ms)
+}
+
+/// Exponential backoff with jitter for retry `attempt` (1-based), capped at 5 s.
+/// Jitter (in `[capped/2, capped]`) decorrelates the retries of concurrent
+/// fetches so they don't hammer a recovering server in lockstep.
+fn fetch_backoff(base_ms: u64, attempt: u32) -> std::time::Duration {
+    let mult = 1u64 << attempt.saturating_sub(1).min(16);
+    let capped = base_ms.saturating_mul(mult).min(5_000);
+    if capped == 0 {
+        return std::time::Duration::from_millis(0);
+    }
+    let half = capped / 2;
+    let span = capped - half;
+    let jitter = pseudo_rand_u64() % (span + 1);
+    std::time::Duration::from_millis(half + jitter)
+}
+
+/// Cheap thread-local pseudo-randomness (xorshift64) for backoff jitter, so we
+/// don't pull in a `rand` dependency for this.
+fn pseudo_rand_u64() -> u64 {
+    use std::cell::Cell;
+    thread_local!(static STATE: Cell<u64> = const { Cell::new(0) });
+    STATE.with(|s| {
+        let mut x = s.get();
+        if x == 0 {
+            x = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0x9E37_79B9_7F4A_7C15)
+                | 1;
+        }
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        s.set(x);
+        x
+    })
+}
+
+/// Run the download-with-retry loop against a specific client and URL.
+async fn fetch_artifact_with_retry(
+    client: &reqwest::Client,
+    url: &str,
+    hash: &str,
+) -> Result<Vec<u8>> {
+    let (max_attempts, base_backoff_ms) = fetch_retry_config();
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        match fetch_artifact_once(client, url, hash).await {
+            Ok(bytes) => return Ok(bytes),
+            Err((retryable, err)) => {
+                if retryable && attempt < max_attempts {
+                    let backoff = fetch_backoff(base_backoff_ms, attempt);
+                    tracing::debug!(
+                        "artifact {hash} fetch attempt {attempt}/{max_attempts} failed: {err:#}; retrying in {backoff:?}"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    continue;
+                }
+                return Err(err);
+            }
+        }
+    }
+}
+
+/// Fetch an artifact once and verify its hash. Returns `(retryable, error)` on
+/// failure so the caller can decide whether to retry.
+async fn fetch_artifact_once(
+    client: &reqwest::Client,
+    fetch_url: &str,
+    hash: &str,
+) -> std::result::Result<Vec<u8>, (bool, anyhow::Error)> {
+    let resp = match client.get(fetch_url).send().await {
+        Ok(r) => r,
+        // Transport errors (connect/reset/timeout) are transient.
+        Err(e) => return Err((true, anyhow::anyhow!("artifact fetch transport error: {e}"))),
+    };
+    let status = resp.status();
+    if !status.is_success() {
+        let retryable = status.is_server_error()
+            || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+            || status == reqwest::StatusCode::REQUEST_TIMEOUT;
+        return Err((
+            retryable,
+            anyhow::anyhow!("artifact fetch failed: {status}"),
+        ));
+    }
+    let data = match resp.bytes().await {
+        Ok(b) => b.to_vec(),
+        // A body read can fail mid-stream; retry.
+        Err(e) => return Err((true, anyhow::anyhow!("artifact body read error: {e}"))),
+    };
+    // Content-addressed artifacts must match their hash. A full body with the
+    // wrong hash is deterministic corruption (retrying re-fetches the same
+    // bytes), so treat it as permanent. Genuine truncation surfaces as a
+    // transport/body-read error above, which *is* retried.
+    let actual_hash = crate::cas::hash(&data);
+    if actual_hash != hash {
+        return Err((
+            false,
+            anyhow::anyhow!("artifact hash mismatch: expected {hash}, got {actual_hash}"),
+        ));
+    }
+    Ok(data)
+}
+
 fn metadata_bytes(metadata: &MetadataChunk) -> u64 {
     // The metadata chunk is the protobuf encoding of skeleton pack/idx, index,
     // frame table, and file table. The actual encoded size is dominated by the
@@ -82,9 +201,14 @@ fn metadata_bytes(metadata: &MetadataChunk) -> u64 {
         + metadata.files.len() * 64) as u64
 }
 
-fn temp_install_dir(target: &Path) -> Result<PathBuf> {
+/// Create a temp install directory next to `target`. Returns the `TempDir`
+/// handle (not a bare path): the caller must keep it alive so that on *any*
+/// failure before the final rename, the partial install is removed on drop. On
+/// success the dir is renamed onto `target`, after which the handle's drop is a
+/// harmless no-op (the path no longer exists).
+fn temp_install_dir(target: &Path) -> Result<tempfile::TempDir> {
     let parent = target.parent().filter(|p| !p.as_os_str().is_empty());
-    let dir = tempfile::Builder::new()
+    tempfile::Builder::new()
         .prefix(&format!(
             "{}.",
             target
@@ -94,8 +218,7 @@ fn temp_install_dir(target: &Path) -> Result<PathBuf> {
         ))
         .suffix(".tmp")
         .tempdir_in(parent.unwrap_or_else(|| Path::new(".")))
-        .context("create temp install directory")?;
-    Ok(dir.into_path())
+        .context("create temp install directory")
 }
 
 #[derive(Debug, Deserialize)]
@@ -265,29 +388,29 @@ impl Client {
             return Ok(data);
         }
 
-        // Presigned URLs are self-authenticating; use a client without the
-        // ripclone auth token so we don't leak credentials to object storage.
-        let client = if use_signed_url {
-            &self.raw_http
+        // Fetch with retry+backoff. Presigned URLs are self-authenticating, so
+        // use the no-auth client to avoid leaking the ripclone token to object
+        // storage. If a presigned URL fails for good (e.g. expired), fall back
+        // to the authenticated gateway once.
+        let data = if use_signed_url {
+            match fetch_artifact_with_retry(&self.raw_http, fetch_url, hash).await {
+                Ok(d) => d,
+                Err(signed_err) => {
+                    tracing::debug!(
+                        "signed-URL fetch for {hash} failed ({signed_err:#}); falling back to gateway"
+                    );
+                    fetch_artifact_with_retry(&self.http, &gateway_url, hash)
+                        .await
+                        .map_err(|gw_err| {
+                            anyhow::anyhow!(
+                                "artifact {hash} fetch failed via signed URL ({signed_err:#}) and gateway ({gw_err:#})"
+                            )
+                        })?
+                }
+            }
         } else {
-            &self.http
+            fetch_artifact_with_retry(&self.http, &gateway_url, hash).await?
         };
-        let resp = client.get(fetch_url).send().await?;
-        if !resp.status().is_success() {
-            anyhow::bail!("artifact fetch failed: {}", resp.status());
-        }
-        let data = resp.bytes().await?.to_vec();
-
-        // Content-addressed artifacts must match their hash, whether they came
-        // from the gateway or a presigned URL.
-        let actual_hash = crate::cas::hash(&data);
-        if actual_hash != hash {
-            anyhow::bail!(
-                "artifact hash mismatch: expected {}, got {}",
-                hash,
-                actual_hash
-            );
-        }
 
         if let Some(cache) = &self.cache
             && let Some(key) = self.cache_key_from_artifact_url(&gateway_url)
@@ -599,20 +722,17 @@ impl Client {
             anyhow::bail!("ref is missing clonepack manifest; run sync first");
         }
 
-        // Shared manifest slot. Download tasks wait on this before verifying the
-        // content hash of each chunk.
-        let manifest_slot: Arc<TokioMutex<Option<Arc<ClonepackManifest>>>> =
-            Arc::new(TokioMutex::new(None));
-        let manifest_ready: Arc<Notify> = Arc::new(Notify::new());
+        // Hand the decoded manifest to the archive downloader over a oneshot.
+        // It latches the value (no lost-wakeup race) and signals manifest
+        // failure by dropping the sender (the receiver then errors), so the
+        // downloader can never hang waiting for a manifest that will never come.
+        let (manifest_tx, manifest_rx) = tokio::sync::oneshot::channel::<Arc<ClonepackManifest>>();
 
         // 2. Start manifest + metadata downloads concurrently.
-        let manifest_slot2 = Arc::clone(&manifest_slot);
-        let manifest_ready2 = Arc::clone(&manifest_ready);
         let manifest_task = self.clone().spawn_fetch_manifest(
             info.clonepack_manifest.clone(),
             info.clonepack_manifest_url.clone(),
-            manifest_slot2,
-            manifest_ready2,
+            manifest_tx,
         );
 
         let metadata_hash = info.metadata_chunk.clone();
@@ -621,9 +741,12 @@ impl Client {
             .clone()
             .spawn_fetch_metadata(metadata_hash, metadata_url);
 
-        // 3. Start archive chunk downloads concurrently with the manifest. They
-        // will buffer until the manifest is decoded, then verify and forward
-        // chunks to the extractor.
+        // 3. Spawn the archive-chunk downloader. It waits for the manifest to be
+        // decoded before fetching anything (so it follows the manifest's chunk
+        // table, not a possibly-stale signed-URL list), then fetches chunks with
+        // a bounded concurrency semaphore and forwards them over this bounded
+        // channel. Peak memory is therefore bounded by the fetch concurrency
+        // plus the channel depth, not the chunk count.
         let archive_channel_depth = std::env::var("RIPCLONE_ARCHIVE_CHANNEL_DEPTH")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -640,14 +763,13 @@ impl Client {
         let archive_urls = info.archive_chunk_urls.clone();
         let archive_downloads = if mode.needs_archive() {
             bench.start_archive_download();
-            Some(self.clone().spawn_chunk_downloads(
-                archive_urls,
-                Arc::clone(&manifest_slot),
-                Arc::clone(&manifest_ready),
-                archive_tx,
-            ))
+            Some(
+                self.clone()
+                    .spawn_chunk_downloads(archive_urls, manifest_rx, archive_tx),
+            )
         } else {
             drop(archive_tx);
+            drop(manifest_rx);
             None
         };
 
@@ -680,10 +802,17 @@ impl Client {
             None
         };
 
+        // Hold the temp-dir handle for the whole install so any early failure
+        // removes the partial directory on drop. After a successful rename onto
+        // `target`, its drop is a no-op.
+        let mut _temp_install: Option<tempfile::TempDir> = None;
         let install_root = if let Some(ref dirs) = overlay_dirs {
             dirs.lower.clone()
         } else {
-            temp_install_dir(&target)?
+            let tmp = temp_install_dir(&target)?;
+            let path = tmp.path().to_path_buf();
+            _temp_install = Some(tmp);
+            path
         };
         let git_dir = install_root.join(".git");
 
@@ -814,6 +943,9 @@ impl Client {
 
         if let Some(dirs) = overlay_dirs {
             overlay::mount_dirs(&dirs).context("mount overlay at target")?;
+            // Mount succeeded; keep the staging tree (it backs the mount). Any
+            // failure before this point drops `dirs` and removes the staging.
+            dirs.mark_mounted();
             info!(
                 "mounted overlay {} -> {} (staging {})",
                 dirs.lower.display(),
@@ -1284,8 +1416,7 @@ impl Client {
         self,
         hash: String,
         signed_url: Option<String>,
-        manifest_slot: Arc<TokioMutex<Option<Arc<ClonepackManifest>>>>,
-        manifest_ready: Arc<Notify>,
+        manifest_tx: tokio::sync::oneshot::Sender<Arc<ClonepackManifest>>,
     ) -> tokio::task::JoinHandle<Result<Arc<ClonepackManifest>>> {
         tokio::spawn(async move {
             let data = self
@@ -1303,8 +1434,10 @@ impl Client {
                 manifest.head_blobs_chunks.push(pack);
             }
             let manifest = Arc::new(manifest);
-            *manifest_slot.lock().await = Some(Arc::clone(&manifest));
-            manifest_ready.notify_waiters();
+            // Hand the manifest to the downloader. Ignore the error: the receiver
+            // is absent in non-archive modes. On the failure paths above, the
+            // sender is dropped instead, so the receiver observes the failure.
+            let _ = manifest_tx.send(Arc::clone(&manifest));
             Ok(manifest)
         })
     }
@@ -1328,8 +1461,7 @@ impl Client {
     fn spawn_chunk_downloads(
         self,
         signed_urls: Option<Vec<Option<String>>>,
-        manifest_slot: Arc<TokioMutex<Option<Arc<ClonepackManifest>>>>,
-        manifest_ready: Arc<Notify>,
+        manifest_rx: tokio::sync::oneshot::Receiver<Arc<ClonepackManifest>>,
         tx: Sender<(usize, Result<Vec<u8>>)>,
     ) -> tokio::task::JoinHandle<Result<u64>> {
         tokio::spawn(async move {
@@ -1337,14 +1469,15 @@ impl Client {
             let mut total_bytes = 0u64;
             let mut handles = Vec::new();
 
-            // Wait until the manifest is available so the downloader follows
-            // the manifest's chunk table, not a possibly stale signed URL list.
-            manifest_ready.notified().await;
-            let manifest = manifest_slot
-                .lock()
-                .await
-                .clone()
-                .context("manifest missing after notify")?;
+            // Wait for the manifest so the downloader follows its chunk table,
+            // not a possibly-stale signed-URL list. A receive error means the
+            // manifest fetch failed (sender dropped); stop and let `tx` drop so
+            // the extractor sees EOF. The real error surfaces from the manifest
+            // task itself.
+            let manifest = match manifest_rx.await {
+                Ok(manifest) => manifest,
+                Err(_) => return Ok(0),
+            };
             // Bound concurrent chunk downloads. With CDC the archive can have
             // hundreds-to-thousands of chunks (one per ~4 MiB frame); without a
             // cap, spawning a request + buffering a frame for every chunk at once

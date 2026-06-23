@@ -429,6 +429,22 @@ impl StorageBackend for S3Storage {
         }
         Ok(out)
     }
+
+    fn health(&self) -> Result<()> {
+        // Reachability probe: list with a prefix that matches nothing. Reachable
+        // + authorized => Ok (even if empty); unreachable / bad creds => Err.
+        // Relies on the S3 client's request timeout; the readiness handler
+        // caches the result (~3s) so this runs at most once per TTL. Mirrors the
+        // `block_on` pattern used by `size()`/`get()`.
+        let req = self
+            .client
+            .objects()
+            .list_v2(&self.bucket)
+            .prefix("__ripclone_readyz_probe__/none/")
+            .context("build S3 health list request")?;
+        self.block_on(move || async move { req.send().await.context("S3 storage unreachable") })
+            .map(|_| ())
+    }
 }
 
 impl S3Storage {
