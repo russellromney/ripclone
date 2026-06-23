@@ -30,13 +30,19 @@ ripclone moves that work to the server, ahead of time (see [Building a clonepack
 
 ### Performance
 
-| repo | files | `git clone --depth=1` | ripclone | speedup |
-|---|---|---|---|---|
-| `oven-sh/bun` | ~15k | ~8 s | **~4.0 s** | **2×** |
-| `facebook/react` | ~7.2k | ~3.8 s | **~1.0 s** | **3.8×** |
-| `pandas-dev/pandas` | ~2.6k | ~3.3 s | **~0.5 s** | **6.6×** |
+ripclone vs native `git clone`, at all three levels. Lower is better; **bold** is ripclone.
 
-Measured on macOS over a 1 Gb/s link with a warm ripclone cache. On slower networks the absolute times grow, but ripclone is usually still faster because it transfers fewer bytes and overlaps download with extraction.
+| repo | files | `git --depth 1` | ripclone `--depth 1` | `git clone` (full) | ripclone (full) | ripclone (files) |
+|---|---|---|---|---|---|---|
+| `facebook/react` (medium) | ~7k | 2.4 s | **0.5 s** | 50.8 s | **1.6 s** | **0.5 s** |
+| `oven-sh/bun` (large) | ~19k | 3.6 s | **0.9 s** | 37.0 s | **2.5 s** | **0.7 s** |
+| `torvalds/linux` (huge) | ~95k | 34.3 s | **~6 s** | — | — | — |
+
+The wins grow with repo size and history depth. For `--depth 1` ripclone is **4–6× faster**; for a full clone it is **15–32× faster**, because git makes GitHub compute and stream the whole history pack on demand while ripclone just downloads pre-built, content-addressed packs in parallel. `files` mode (working tree only, from the zstd archive) is the fastest of all.
+
+Measured on a Fly `performance-8x` client (Newark) against a ripclone server in Ashburn with artifacts in Tigris; warm server cache, client artifact cache disabled, written to an NVMe volume. git clones are from GitHub over the same link. Median of 3 runs.
+
+> `torvalds/linux` is shown at `--depth 1` only — the realistic case for a repo this size. Pre-building its full ~1.3M-commit history is a heavy one-time job that our dev box couldn't complete (the object-storage upload of that much data times out); the depth=1 path, which is what CI and agents actually use, is unaffected.
 
 ## Building a clonepack
 
@@ -72,6 +78,20 @@ A clone that only wants `HEAD` is ready as soon as phase 1 finishes. A clone tha
 The archive is split by content, not by fixed size: cut points land on the data itself (frames run about 1–16 MB). Each frame is compressed on its own and named by the hash of its bytes.
 
 This makes re-syncs cheap. When a new commit lands, frames that didn't change hash to the same name and are reused as-is — no recompressing, no re-uploading. Only the frames that actually changed get rebuilt, so the work matches the size of the diff, not the whole repo. The builder also streams one file at a time, so memory stays flat no matter how big the repo gets.
+
+### Sync performance
+
+How long a sync takes to build the artifacts (server-side, the same hardware as the clone numbers above). There's no git equivalent — git builds nothing ahead of time.
+
+| repo | phase 1 (depth=1 clone-ready) | phase 2 (full history, background) |
+|---|---|---|
+| `facebook/react` | 5.4 s | +32 s |
+| `oven-sh/bun` | ~8 s | +13 s |
+| `torvalds/linux` | ~40 s | very large |
+
+Phase 1 is what a `--depth 1` clone waits for; phase 2 runs in the background and only gates full clones. react's phase 2 is a cold first build; bun's is much shorter because the incremental re-sync reuses unchanged history levels and archive frames. linux's phase 1 is dominated by building the HEAD-closure pack for its ~95k-file tree, and its full history is large enough that we don't pre-build it on the dev box.
+
+> In production the server syncs on push, so this happens once per commit, ahead of any clone — by the time a CI runner or agent asks for the repo, the artifacts are already built.
 
 ## Quick start
 
