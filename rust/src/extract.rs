@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tracing::info;
+use tracing::{info, warn};
 
 const INDEX_MTIME: FileTime = FileTime::from_unix_time(1, 0);
 const PACK_WRITE_BATCH_FILES: usize = 512;
@@ -891,6 +891,9 @@ fn flush_archive_writes(
 
 /// Build the shared write scheduler for an archive extraction, if turned on via
 /// `RIPCLONE_IO_URING_SCHEDULER` and we are actually writing a worktree.
+///
+/// DEPRECATED: the scheduler is superseded by `RIPCLONE_IO_URING_DEPTH` and
+/// slated for removal. See `docs/WRITER_SCHEDULER_EXPERIMENT.md`.
 fn build_archive_scheduler(
     target_dir: Option<&PathBuf>,
 ) -> Result<Option<Arc<WorktreeWriteScheduler>>> {
@@ -903,8 +906,10 @@ fn build_archive_scheduler(
     let scheduler = WorktreeWriteScheduler::new(target_dir.clone(), ARCHIVE_WRITE_OPTIONS)
         .context("create io_uring write scheduler")?;
     let cfg = SchedulerConfig::from_env();
-    info!(
-        "io_uring write scheduler enabled (submitters={}, inflight={}, batch_files={}, byte_cap={} B, flush={:?})",
+    warn!(
+        "RIPCLONE_IO_URING_SCHEDULER is deprecated and slated for removal; it is \
+         superseded by RIPCLONE_IO_URING_DEPTH (see docs/WRITER_SCHEDULER_EXPERIMENT.md). \
+         enabled (submitters={}, inflight={}, batch_files={}, byte_cap={} B, flush={:?})",
         scheduler.submitter_count(),
         cfg.inflight,
         cfg.batch_files,

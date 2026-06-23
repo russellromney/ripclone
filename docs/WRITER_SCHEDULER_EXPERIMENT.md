@@ -86,3 +86,16 @@ CPUs, it's the io_uring-idiomatic shape (thread-per-core), and it's one number.
 
   Work-stealing is bespoke, swims against io_uring best practice, and gives
   nothing for the dedicated-core target. Not planned.
+
+## Where the code lives
+
+On branch `perf/io-uring-scheduler`:
+
+- `b65467f` — scheduler implementation (submitter pool, multi-window deque).
+- `84be137` — batch routing change.
+- `20bd51e` — the keeper: tunable per-thread overlap depth (`RIPCLONE_IO_URING_DEPTH`).
+
+The scheduler is marked deprecated and slated for removal. If it is ever
+removed, the implementation can be recovered from `b65467f`. The depth machinery
+it introduced (the multi-window deque in `RawUringWriter`) stays — that is what
+`RIPCLONE_IO_URING_DEPTH` drives.

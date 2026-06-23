@@ -1917,8 +1917,12 @@ mod linux_uring {
 }
 
 // ---------------------------------------------------------------------------
-// Write scheduler
+// Write scheduler  (DEPRECATED — slated for removal)
 // ---------------------------------------------------------------------------
+//
+// Superseded by per-thread overlap depth (`RIPCLONE_IO_URING_DEPTH`), which is
+// faster on throttled CPUs and free on dedicated ones. Kept opt-in for now; see
+// docs/WRITER_SCHEDULER_EXPERIMENT.md for the A/B data and removal note.
 //
 // By default each extraction worker owns its own writer and io_uring ring, so a
 // worker can only batch the files in its own chunk. When frames are small the
@@ -1940,6 +1944,10 @@ const SCHEDULER_MAX_WINDOW_FILES: usize = 512;
 
 /// Scheduler knobs. All can be set from the environment so the benchmark can
 /// sweep them without recompiling.
+///
+/// DEPRECATED: the submitter-pool scheduler is superseded by per-thread overlap
+/// (`RIPCLONE_IO_URING_DEPTH`) and slated for removal. See
+/// `docs/WRITER_SCHEDULER_EXPERIMENT.md`.
 #[derive(Debug, Clone, Copy)]
 pub struct SchedulerConfig {
     /// Submitter threads, each with its own ring.
