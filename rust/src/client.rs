@@ -418,7 +418,7 @@ impl Client {
             }
             return Err(server_error("ref lookup failed", resp).await);
         }
-        unreachable!("resolve_ref loop exits via return")
+        anyhow::bail!("ref lookup did not complete")
     }
 
     pub async fn fetch_pack(&self, hash: &str) -> Result<Vec<u8>> {
