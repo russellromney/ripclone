@@ -216,8 +216,8 @@ where
     }
 
     // Validate every path and create parent directories only when we are
-    // materializing the working tree. rcgit calls this with no target dir to
-    // build only a local blob pack.
+    // materializing the working tree. Lazy callers pass no target dir to build
+    // only a local blob pack.
     if let Some(target_dir) = target_dir {
         for entry in manifest.files.iter() {
             validate_relative_path(path_from_bytes(&entry.path)).with_context(|| {
@@ -877,8 +877,8 @@ pub fn extract_archive_from_chunk_receiver(
     }
 
     // Validate every path and create parent directories only when we are
-    // materializing the working tree. rcgit calls this with no target dir to
-    // build only a local blob pack.
+    // materializing the working tree. Lazy callers pass no target dir to build
+    // only a local blob pack.
     if let Some(target_dir) = target_dir {
         for entry in manifest.files.iter() {
             validate_relative_path(path_from_bytes(&entry.path)).with_context(|| {
