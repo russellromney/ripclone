@@ -1,3 +1,4 @@
+use crate::provider::RepoId;
 use anyhow::{Context, Result, bail};
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
@@ -1060,17 +1061,21 @@ pub fn object_type<P: AsRef<Path>>(repo: P, sha: &str) -> Result<String> {
     crate::gix_util::object_type(repo, sha)
 }
 
-/// Sync a bare mirror of a GitHub repo. Creates if missing, fetches if exists.
-/// If `github_token` is provided, it is embedded in the HTTPS URL as
-/// `https://x-access-token:<token>@github.com/...` so private repos can be
-/// mirrored. This form works for both PATs and GitHub App installation tokens.
+/// Sync a bare mirror of a repo. Creates if missing, fetches if exists.
+///
+/// Phase 0 is GitHub-only: `repo_id` must be a GitHub default instance and the
+/// URL form remains `https://x-access-token:<token>@github.com/...`. Phase 1
+/// will generalize this to provider-aware `clone_url` + credential-header
+/// injection.
 pub fn sync_bare_mirror<P: AsRef<Path>>(
     mirror_dir: P,
-    owner: &str,
-    repo: &str,
+    repo_id: &RepoId,
     branch: &str,
     github_token: Option<&str>,
 ) -> Result<()> {
+    let (owner, repo) = repo_id
+        .github_owner_repo()
+        .with_context(|| format!("unsupported repo path for sync: {}", repo_id.storage_key()))?;
     crate::validation::validate_repo_id(owner)
         .with_context(|| format!("invalid owner: {}", owner))?;
     crate::validation::validate_repo_id(repo).with_context(|| format!("invalid repo: {}", repo))?;
