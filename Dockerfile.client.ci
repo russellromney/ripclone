@@ -1,0 +1,24 @@
+# syntax=docker/dockerfile:1
+# CI-only client image. Assembled from prebuilt binaries (see Dockerfile.ci); the
+# real Dockerfile.client is validated on the Fly/Depot deploy builder. Keep the
+# runtime deps below in sync with Dockerfile.client.
+FROM ubuntu:24.04
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git ca-certificates curl libfuse2 libgit2-1.7 time coreutils \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Binaries staged by the workflow into ci-bins/ (rust/target/ is .dockerignored).
+COPY ci-bins/ripclone /usr/local/bin/ripclone
+COPY ci-bins/git-remote-ripclone /usr/local/bin/git-remote-ripclone
+COPY ci-bins/ripclone-server /usr/local/bin/ripclone-server
+COPY ci-bins/writer_bench /usr/local/bin/writer_bench
+COPY scripts/fly_client_test.sh /run-tests.sh
+RUN chmod +x /run-tests.sh
+
+ENV RUST_LOG=info
+ENV PATH="/usr/local/bin:${PATH}"
+
+CMD ["/bin/bash", "/run-tests.sh"]
