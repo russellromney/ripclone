@@ -17,6 +17,13 @@ for bin in "$SERVER_BIN" "$CLI_BIN"; do
 done
 
 export RIPCLONE_TOKEN="${RIPCLONE_TOKEN:-e2e-local-token}"
+# This script does `sync` then immediately `clone`. Production defaults to
+# asynchronous, two-phase builds, where `sync` returns before the clonepack is
+# ready (the clone would then fail "ref is missing clonepack manifest"). Pin
+# synchronous single-phase builds so the sync->clone sequence is deterministic,
+# matching the in-process e2e harness.
+export RIPCLONE_ASYNC_BUILD=0
+export RIPCLONE_TWO_PHASE=0
 sha256() { if command -v sha256sum >/dev/null; then sha256sum | awk '{print $1}'; else shasum -a 256 | awk '{print $1}'; fi; }
 TOKEN_HASH=$(printf '%s' "$RIPCLONE_TOKEN" | sha256)
 

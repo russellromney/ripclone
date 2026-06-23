@@ -19,4 +19,5 @@ $SUDO apt-get install -y --no-install-recommends \
   libssl-dev \
   libfuse-dev \
   libgit2-dev \
-  git
+  git \
+  curl
