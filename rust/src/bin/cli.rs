@@ -31,6 +31,10 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Authorize this machine against the ripclone cloud (saves a token).
+    Login,
+    /// Remove the saved token.
+    Logout,
     /// Sync a repo on the server.
     Sync {
         repo: String,
@@ -248,6 +252,97 @@ fn owner_repo_from_origin(repo_dir: &std::path::Path) -> Result<(String, String)
     parse_origin_url(&url)
 }
 
+#[derive(serde::Deserialize)]
+struct DeviceStart {
+    device_code: String,
+    user_code: String,
+    verification_uri: String,
+    verification_uri_complete: String,
+    #[serde(default)]
+    interval: u64,
+    #[serde(default)]
+    expires_in: u64,
+}
+
+#[derive(serde::Deserialize)]
+struct DevicePoll {
+    status: String,
+    #[serde(default)]
+    token: Option<String>,
+}
+
+/// `ripclone login`: start a device flow, wait for browser approval, save the token.
+async fn run_login(server: &str) -> Result<()> {
+    let http = reqwest::Client::builder()
+        .user_agent(concat!("ripclone/", env!("CARGO_PKG_VERSION")))
+        .build()?;
+
+    let start: DeviceStart = http
+        .post(format!("{server}/cli/device"))
+        .send()
+        .await?
+        .error_for_status()
+        .context("starting login")?
+        .json()
+        .await?;
+
+    println!();
+    println!("  To authorize ripclone, open:\n");
+    println!("    {}\n", start.verification_uri);
+    println!("  and enter the code:  {}\n", start.user_code);
+    open_browser(&start.verification_uri_complete);
+    println!("  Waiting for approval…");
+
+    let interval = start.interval.max(1);
+    let max_secs = if start.expires_in == 0 { 600 } else { start.expires_in };
+    let mut waited = 0u64;
+    let token = loop {
+        tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+        waited += interval;
+        if waited > max_secs {
+            anyhow::bail!("login timed out — run `ripclone login` again");
+        }
+        let resp = http
+            .post(format!("{server}/cli/device/token"))
+            .json(&serde_json::json!({ "device_code": start.device_code }))
+            .send()
+            .await?;
+        let poll: DevicePoll = resp.json().await?;
+        match poll.status.as_str() {
+            "approved" => {
+                break poll.token.context("approved but no token returned")?;
+            }
+            "pending" => continue,
+            "denied" => anyhow::bail!("login was denied"),
+            "expired" => anyhow::bail!("login expired — run `ripclone login` again"),
+            other => anyhow::bail!("login failed: {other}"),
+        }
+    };
+
+    let mut cfg = ripclone::config::load();
+    cfg.token = Some(token);
+    cfg.server = Some(server.to_string());
+    ripclone::config::save(&cfg)?;
+    let where_ = ripclone::config::config_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    println!("\n  ✓ Logged in. Token saved to {where_}");
+    Ok(())
+}
+
+/// Best-effort: open the verification URL in the user's browser. Never fails.
+fn open_browser(url: &str) {
+    #[cfg(target_os = "macos")]
+    let prog: Option<&str> = Some("open");
+    #[cfg(target_os = "linux")]
+    let prog: Option<&str> = Some("xdg-open");
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let prog: Option<&str> = None;
+    if let Some(cmd) = prog {
+        let _ = std::process::Command::new(cmd).arg(url).spawn();
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -255,6 +350,20 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+
+    // login/logout don't need an authenticated client.
+    match &args.command {
+        Commands::Login => return run_login(&args.server).await,
+        Commands::Logout => {
+            ripclone::config::clear_token()?;
+            println!("Logged out — token removed.");
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    // Token precedence: RIPCLONE_TOKEN_HASH > RIPCLONE_TOKEN (env) > the token
+    // saved by `ripclone login`. Raw tokens are hashed before being sent.
     let token_hash = env::var("RIPCLONE_TOKEN_HASH")
         .ok()
         .filter(|t| !t.is_empty())
@@ -263,6 +372,9 @@ async fn main() -> Result<()> {
                 .ok()
                 .filter(|t| !t.is_empty())
                 .map(|t| format!("{:x}", Sha256::digest(t.as_bytes())))
+        })
+        .or_else(|| {
+            ripclone::config::token().map(|t| format!("{:x}", Sha256::digest(t.as_bytes())))
         });
     let client = match token_hash {
         Some(token) => Client::new_with_token(args.server.clone(), Some(token)),
@@ -270,6 +382,8 @@ async fn main() -> Result<()> {
     };
 
     match args.command {
+        // Handled before the client is built.
+        Commands::Login | Commands::Logout => unreachable!(),
         Commands::Sync {
             repo,
             depth,
