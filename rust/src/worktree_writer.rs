@@ -815,6 +815,7 @@ mod linux_uring {
     use std::io;
     use std::os::unix::ffi::OsStrExt;
     use std::sync::Once;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     const QUEUE_DEPTH: u32 = 4096;
@@ -836,6 +837,19 @@ mod linux_uring {
     static OPTIMIZED_RING_FALLBACK_LOG: Once = Once::new();
     static SQPOLL_RING_ENABLED_LOG: Once = Once::new();
     static SQPOLL_RING_FALLBACK_LOG: Once = Once::new();
+
+    /// Set once a per-thread io_uring ring fails to initialize (e.g. ENOMEM or
+    /// the locked-memory rlimit under heavy parallelism). Once set, every writer
+    /// uses the POSIX path instead of hard-failing the clone. Process-wide: a
+    /// memlock shortage affects every thread, and this also avoids a thundering
+    /// herd of repeated ring-creation attempts that would each fail.
+    static IO_URING_RUNTIME_DISABLED: AtomicBool = AtomicBool::new(false);
+    static IO_URING_DISABLED_LOG: Once = Once::new();
+
+    #[cfg(test)]
+    pub(super) fn set_runtime_disabled_for_test(disabled: bool) {
+        IO_URING_RUNTIME_DISABLED.store(disabled, Ordering::Relaxed);
+    }
 
     #[derive(Clone, Copy)]
     pub(super) struct UringWriter;
@@ -928,6 +942,15 @@ mod linux_uring {
             RawUringWriter::new().map(|_| Self)
         }
 
+        /// Ensure this thread's io_uring ring exists. Returns `Err` if io_uring is
+        /// unavailable — disabled at runtime, or the ring can't be created (e.g.
+        /// ENOMEM). Callers below treat that as "use the POSIX writer". Checking
+        /// this *before* consuming the write payload lets us fall back without
+        /// having to clone it.
+        fn ensure_ready(&self) -> Result<()> {
+            with_thread_writer(|_| Ok(()))
+        }
+
         pub(super) fn write_regular(&self, target: &Path, mode: u32, content: &[u8]) -> Result<()> {
             self.write_regular_owned(target, mode, content.to_vec())
         }
@@ -940,6 +963,11 @@ mod linux_uring {
         ) -> Result<()> {
             if target.exists() {
                 std::fs::remove_file(target).ok();
+            }
+            if self.ensure_ready().is_err() {
+                return write_regular_posix(target, mode, &content)
+                    .map(|_| ())
+                    .with_context(|| format!("write {}", target.display()));
             }
             with_thread_writer(|writer| {
                 writer
@@ -965,6 +993,9 @@ mod linux_uring {
             if writes.is_empty() {
                 return Ok(Vec::new());
             }
+            if self.ensure_ready().is_err() {
+                return write_regular_batch_posix(&writes, collect_stats);
+            }
             with_thread_writer(|writer| writer.write_regular_batch(writes, collect_stats))
         }
 
@@ -976,10 +1007,28 @@ mod linux_uring {
             if writes.is_empty() {
                 return self.flush_deferred_writes();
             }
+            if self.ensure_ready().is_err() {
+                // io_uring unavailable: nothing was deferred on this thread, so a
+                // straight POSIX write of this batch is the whole result.
+                let written = writes.len();
+                let stats = write_regular_batch_posix(&writes, collect_stats)?;
+                return Ok(WriteOutcome { written, stats });
+            }
             with_thread_writer(|writer| writer.write_regular_batch_deferred(writes, collect_stats))
         }
 
         pub(super) fn flush_deferred_writes(&self) -> Result<WriteOutcome> {
+            // If this thread never created a ring (io_uring disabled, or it only
+            // ever took the POSIX fallback), nothing was deferred here, so there
+            // is nothing to flush — and creating a ring just to flush could
+            // re-fail. Report an empty outcome.
+            let has_ring = THREAD_WRITER.with(|cell| cell.borrow().is_some());
+            if !has_ring {
+                return Ok(WriteOutcome {
+                    written: 0,
+                    stats: Vec::new(),
+                });
+            }
             with_thread_writer(|writer| writer.flush_deferred_writes())
         }
 
@@ -1009,7 +1058,29 @@ mod linux_uring {
         THREAD_WRITER.with(|cell| {
             let mut writer = cell.borrow_mut();
             if writer.is_none() {
-                *writer = Some(RawUringWriter::new()?);
+                // Only *new* ring creation is gated by the runtime-disabled flag.
+                // A thread that already has a working ring keeps using it, so any
+                // writes it already deferred there are still flushed.
+                if IO_URING_RUNTIME_DISABLED.load(Ordering::Relaxed) {
+                    anyhow::bail!("io_uring disabled at runtime; using POSIX writer");
+                }
+                match RawUringWriter::new() {
+                    Ok(w) => *writer = Some(w),
+                    Err(e) => {
+                        // A ring couldn't be created — typically ENOMEM / the
+                        // locked-memory rlimit under heavy parallelism. Disable
+                        // io_uring for the rest of the run so callers fall back to
+                        // the POSIX writer instead of failing the clone.
+                        IO_URING_RUNTIME_DISABLED.store(true, Ordering::Relaxed);
+                        IO_URING_DISABLED_LOG.call_once(|| {
+                            tracing::warn!(
+                                "io_uring ring creation failed ({e:#}); disabling io_uring \
+                                 and using the POSIX writer for the rest of this run"
+                            )
+                        });
+                        return Err(e);
+                    }
+                }
             }
             f(writer
                 .as_mut()
@@ -2380,6 +2451,57 @@ mod tests {
         };
 
         assert!(writer.write_entry(dir.path(), &entry, b"nope").is_err());
+    }
+
+    // A mid-run io_uring ring-allocation failure (e.g. ENOMEM / the locked-memory
+    // rlimit under heavy parallelism) must degrade to the POSIX writer, never fail
+    // the clone.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn io_uring_falls_back_to_posix_when_runtime_disabled() {
+        // Build a real io_uring writer; skip where io_uring is unavailable.
+        let writer = match WorktreeWriter::io_uring() {
+            Ok(w) => w,
+            Err(_) => {
+                eprintln!("skipping: io_uring unavailable on this host");
+                return;
+            }
+        };
+        // Simulate a per-thread ring allocation having failed and disabled
+        // io_uring for the run.
+        linux_uring::set_runtime_disabled_for_test(true);
+        let dir = tempfile::TempDir::new().unwrap();
+        let dir_path = dir.path().to_path_buf();
+        // More than IO_URING_MIN_BATCH_FILES so the io_uring batch path is taken
+        // (and then falls back), not the small-batch POSIX shortcut.
+        let writes: Vec<OwnedFileWrite> = (0..8)
+            .map(|i| OwnedFileWrite {
+                entry: FileEntry {
+                    path: format!("dir/file-{i}.txt").into_bytes(),
+                    mode: 0o100644,
+                    blob_sha1: Vec::new(),
+                    fragments: Vec::new(),
+                },
+                content: format!("content {i}\n").into_bytes().into(),
+            })
+            .collect();
+        // Run on a fresh thread that has no ring yet, so ring creation is what's
+        // attempted (and refused) — exercising the POSIX fallback rather than
+        // reusing the ring this test thread created during the probe above.
+        let result =
+            std::thread::spawn(move || writer.write_owned_entries(&dir_path, writes)).join();
+        // Restore before asserting so a failure can't leak the flag to other tests.
+        linux_uring::set_runtime_disabled_for_test(false);
+        let written = result
+            .expect("writer thread panicked")
+            .expect("disabled io_uring must fall back to POSIX, not fail");
+        assert_eq!(written, 8);
+        for i in 0..8 {
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join(format!("dir/file-{i}.txt"))).unwrap(),
+                format!("content {i}\n")
+            );
+        }
     }
 
     #[test]

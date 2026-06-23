@@ -13,6 +13,7 @@ This file tracks what has already landed in ripclone. For upcoming work see `ROA
 
 - **io_uring is now the default worktree writer on Linux** (`rust/src/worktree_writer.rs`)
   - With `RIPCLONE_IO_URING` unset, the writer uses io_uring on Linux (auto mode: falls back to POSIX if the kernel lacks support); other platforms stay POSIX. Set `RIPCLONE_IO_URING=0` to force POSIX. Real-clone A/B on Fly `/data` showed io_uring faster-or-equal vs POSIX on dedicated cores.
+- **Graceful fallback when a ring can't be allocated** (`rust/src/worktree_writer.rs`): auto mode previously fell back to POSIX only when the *kernel* lacked io_uring support. Per-thread rings are created lazily at write time, so under heavy parallelism (many concurrent clones, or the test suite) ring creation could fail with `ENOMEM`/the locked-memory rlimit *after* startup and hard-fail the clone. Now any ring-creation failure disables io_uring for the rest of the run and the writer degrades to POSIX instead of failing; threads that already hold a working ring keep using it so deferred writes still flush.
 - **Tunable per-thread ring overlap depth** via `RIPCLONE_IO_URING_DEPTH` (default 2). Throttled/shared CPUs can set `=3` for ~10% on the write phase; dedicated cores are best at 2.
 - An opt-in submitter-pool scheduler (`RIPCLONE_IO_URING_SCHEDULER`) was prototyped and rejected — see `docs/WRITER_SCHEDULER_EXPERIMENT.md`. Superseded by the depth knob and slated for removal.
 
