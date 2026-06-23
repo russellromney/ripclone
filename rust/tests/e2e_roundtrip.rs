@@ -211,31 +211,24 @@ async fn missing_artifact_fails_clone() {
 
 /// Positive: transient artifact-fetch failures (503) must be retried with
 /// backoff and the clone must still succeed with a correct worktree. The server
-/// is told to fail its first few artifact GETs via `RIPCLONE_TEST_FAIL_FIRST_FETCHES`.
-/// The e2e suite runs single-threaded, so toggling these env vars is safe.
+/// fails its first few artifact GETs (per-server fault, no global env), so this
+/// is safe under parallel test execution.
 #[tokio::test]
 async fn transient_fetch_failure_is_retried() {
     init(false);
-    unsafe {
-        std::env::set_var("RIPCLONE_TEST_FAIL_FIRST_FETCHES", "3");
-        std::env::set_var("RIPCLONE_FETCH_MAX_ATTEMPTS", "6");
-        std::env::set_var("RIPCLONE_FETCH_BACKOFF_MS", "5");
-    }
-    let server = start_server().await;
+    let server = start_server_faulting(3).await;
     let origin = make_origin("acme", "retry");
     origin.commit(&[("a.txt", "hi\n"), ("dir/b.txt", "x\n")], "c1");
     origin.publish();
 
+    // Default retry budget (3 attempts) recovers from the 3 injected faults.
     let (_g, c) = sync_and_clone(&server, &origin, 1, CloneMode::Files).await;
-    let a = read(&c, "a.txt");
-    let b = read(&c, "dir/b.txt");
-    unsafe {
-        std::env::remove_var("RIPCLONE_TEST_FAIL_FIRST_FETCHES");
-        std::env::remove_var("RIPCLONE_FETCH_MAX_ATTEMPTS");
-        std::env::remove_var("RIPCLONE_FETCH_BACKOFF_MS");
-    }
-    assert_eq!(a, "hi\n", "retried fetches must still materialize the tree");
-    assert_eq!(b, "x\n");
+    assert_eq!(
+        read(&c, "a.txt"),
+        "hi\n",
+        "retried fetches must still materialize the tree"
+    );
+    assert_eq!(read(&c, "dir/b.txt"), "x\n");
 }
 
 /// Negative: when failures persist beyond the retry budget, the clone must fail
@@ -243,14 +236,8 @@ async fn transient_fetch_failure_is_retried() {
 #[tokio::test]
 async fn persistent_fetch_failure_fails_clone() {
     init(false);
-    // The fault threshold is read when the server is built, so set it first.
-    // Fail far more artifact fetches than the small attempt budget allows.
-    unsafe {
-        std::env::set_var("RIPCLONE_TEST_FAIL_FIRST_FETCHES", "100000");
-        std::env::set_var("RIPCLONE_FETCH_MAX_ATTEMPTS", "2");
-        std::env::set_var("RIPCLONE_FETCH_BACKOFF_MS", "1");
-    }
-    let server = start_server().await;
+    // Fail far more artifact fetches than the retry budget allows.
+    let server = start_server_faulting(100_000).await;
     let origin = make_origin("acme", "retryfail");
     origin.commit(&[("a", "1\n")], "c1");
     origin.publish();
@@ -273,11 +260,6 @@ async fn persistent_fetch_failure_fails_clone() {
             None,
         )
         .await;
-    unsafe {
-        std::env::remove_var("RIPCLONE_TEST_FAIL_FIRST_FETCHES");
-        std::env::remove_var("RIPCLONE_FETCH_MAX_ATTEMPTS");
-        std::env::remove_var("RIPCLONE_FETCH_BACKOFF_MS");
-    }
     assert!(
         res.is_err(),
         "persistent fetch failure must fail the clone, got Ok"
@@ -285,21 +267,16 @@ async fn persistent_fetch_failure_fails_clone() {
 }
 
 /// Positive: a successful clone renames the temp install dir onto the target and
-/// leaves no `.tmp` leftovers in the parent.
+/// leaves no `.tmp` leftovers in the parent. (Overlay is off by default in
+/// tests — `RIPCLONE_TEMP` is unset — so the temp-dir path is exercised.)
 #[tokio::test]
 async fn successful_clone_leaves_no_temp_dir() {
     init(false);
-    unsafe {
-        std::env::set_var("RIPCLONE_NO_OVERLAY", "1");
-    }
     let server = start_server().await;
     let origin = make_origin("acme", "clean");
     origin.commit(&[("a.txt", "hi\n"), ("d/b.txt", "y\n")], "c1");
     origin.publish();
     let (_g, c) = sync_and_clone(&server, &origin, 1, CloneMode::Files).await;
-    unsafe {
-        std::env::remove_var("RIPCLONE_NO_OVERLAY");
-    }
     assert_eq!(read(&c, "a.txt"), "hi\n");
     assert_eq!(read(&c, "d/b.txt"), "y\n");
     let parent = c.parent().unwrap();
@@ -318,9 +295,6 @@ async fn successful_clone_leaves_no_temp_dir() {
 #[tokio::test]
 async fn failed_clone_after_temp_dir_leaves_nothing() {
     init(false);
-    unsafe {
-        std::env::set_var("RIPCLONE_NO_OVERLAY", "1");
-    }
     let server = start_server().await;
     let origin = make_origin("acme", "notemp");
     origin.commit(&[("a.txt", "hello\n")], "c1");
@@ -360,9 +334,6 @@ async fn failed_clone_after_temp_dir_leaves_nothing() {
             None,
         )
         .await;
-    unsafe {
-        std::env::remove_var("RIPCLONE_NO_OVERLAY");
-    }
     assert!(res.is_err(), "corrupt archive chunk must fail the clone");
     assert!(
         !target.exists(),

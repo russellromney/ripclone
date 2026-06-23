@@ -851,7 +851,10 @@ fn cached_ref_response(
         return None;
     }
     let key = ref_response_cache_key(owner, repo, branch, clonepack);
-    let mut cache = state.ref_response_cache.lock().unwrap();
+    let mut cache = state
+        .ref_response_cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     cache.retain(|_, cached| cached.inserted.elapsed() < ttl);
     cache.get(&key).map(|cached| cached.response.clone())
 }
@@ -869,7 +872,10 @@ fn cache_ref_response(
         return;
     }
     let key = ref_response_cache_key(owner, repo, branch, clonepack);
-    let mut cache = state.ref_response_cache.lock().unwrap();
+    let mut cache = state
+        .ref_response_cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     cache.retain(|_, cached| cached.inserted.elapsed() < ttl);
     cache.insert(
         key,
@@ -882,7 +888,10 @@ fn cache_ref_response(
 
 fn invalidate_ref_response_cache(state: &ServerState, owner: &str, repo: &str, branch: &str) {
     let prefix = format!("{owner}\0{repo}\0{branch}\0");
-    let mut cache = state.ref_response_cache.lock().unwrap();
+    let mut cache = state
+        .ref_response_cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     cache.retain(|key, _| !key.starts_with(&prefix));
 }
 
