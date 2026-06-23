@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 # Build stage
 FROM rust:1.96.0-slim AS builder
 
@@ -6,25 +7,21 @@ WORKDIR /app
 # Install git and fuse headers for build-time git operations and fuser.
 RUN apt-get update && apt-get install -y --no-install-recommends git pkg-config libssl-dev libfuse-dev libgit2-dev protobuf-compiler cmake build-essential && rm -rf /var/lib/apt/lists/*
 
-# 1. Compile dependencies in their own layer, keyed only by the manifests, proto,
-#    and build script. Stub sources let cargo build the whole dependency graph
-#    without the app code, so this layer is reused until a dependency changes.
 COPY rust/Cargo.toml rust/Cargo.lock rust/build.rs ./
 COPY rust/proto ./proto
-RUN mkdir -p src/bin \
-    && echo '' > src/lib.rs \
-    && for b in cli server ripclone-proxy git-remote-ripclone rcgit writer_bench; do \
-         echo 'fn main() {}' > "src/bin/$b.rs"; \
-       done \
-    && cargo build --release \
-    && rm -rf src
-
-# 2. Build the real binaries. `touch` makes the copied sources newer than the
-#    stub artifacts so cargo recompiles the workspace crate (COPY can preserve an
-#    older mtime, which would otherwise leave the stub binaries in place). The
-#    cached dependency layer above is reused; only the workspace crate rebuilds.
 COPY rust/src ./src
-RUN find src -name '*.rs' -exec touch {} + && cargo build --release
+
+# Cache the cargo registry/git and the target dir across builds (BuildKit cache
+# mounts, persisted by Depot). A code-only change then recompiles just the
+# ripclone crates instead of all ~400 dependencies. The target dir is a cache
+# mount (not an image layer), so the binaries are copied out to /out in the same
+# RUN for the runtime stage to pick up.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/app/target \
+    cargo build --release && \
+    mkdir -p /out && \
+    cp target/release/ripclone target/release/ripclone-server /out/
 
 # Runtime stage
 FROM ubuntu:24.04
@@ -33,8 +30,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends git ca-certific
 
 WORKDIR /app
 
-COPY --from=builder /app/target/release/ripclone /usr/local/bin/ripclone
-COPY --from=builder /app/target/release/ripclone-server /usr/local/bin/ripclone-server
+COPY --from=builder /out/ripclone /usr/local/bin/ripclone
+COPY --from=builder /out/ripclone-server /usr/local/bin/ripclone-server
 
 ENV RUST_LOG=info
 

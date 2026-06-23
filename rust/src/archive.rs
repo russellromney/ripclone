@@ -2,10 +2,13 @@ use crate::cas::Cas;
 use crate::clonepack::{FileEntry, Fragment, FrameInfo};
 use crate::manifest::MetadataChunk;
 use anyhow::{Context, Result};
+use fastcdc::v2020::StreamCDC;
 use sha1::{Digest, Sha1};
+use std::cell::RefCell;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 /// Default compressed size cap for a single archive chunk.
 pub const DEFAULT_ARCHIVE_CHUNK_SIZE: u64 = 8 * 1024 * 1024;
@@ -20,9 +23,35 @@ const CDC_MIN: usize = 1024 * 1024;
 const CDC_AVG: usize = 4 * 1024 * 1024;
 const CDC_MAX: usize = 16 * 1024 * 1024;
 
+/// How many raw frame bytes to buffer before compressing a batch in parallel.
+/// The worktree is streamed through the chunker one frame at a time, so peak
+/// memory is bounded to roughly this batch plus the largest single blob —
+/// instead of the whole worktree at once — while still handing rayon enough
+/// frames per batch to keep every core busy.
+const STREAM_BATCH_BYTES: usize = 64 * 1024 * 1024;
+
+/// Compress one CDC frame with zstd (optionally with a trained dictionary).
+/// Empty frames stay empty. Frames are independent, so this is the unit of both
+/// parallel compression and content-addressed reuse.
+fn compress_frame(raw: &[u8], level: i32, dictionary: Option<&[u8]>) -> Result<Vec<u8>> {
+    if raw.is_empty() {
+        return Ok(Vec::new());
+    }
+    match dictionary {
+        Some(dict) => zstd::bulk::Compressor::with_dictionary(level, dict)
+            .context("create zstd compressor with dictionary")?
+            .compress(raw)
+            .context("zstd compress frame with dictionary"),
+        None => zstd::encode_all(raw, level).context("zstd compress frame"),
+    }
+}
+
 /// Cut `stream` into content-defined frames; returns each frame's `(start, end)`
 /// byte range. An empty stream yields a single empty frame so empty-file
-/// fragments always have a frame to point at.
+/// fragments always have a frame to point at. Production code streams the tree
+/// through [`StreamCDC`] instead (see [`ArchiveBuilder::stream_cdc`]); this
+/// slice-based form is kept as the reference the tests check streaming against.
+#[cfg(test)]
 fn cdc_frame_bounds(stream: &[u8]) -> Vec<(usize, usize)> {
     if stream.is_empty() {
         return vec![(0, 0)];
@@ -161,28 +190,18 @@ impl ArchiveBuilder {
             .tree()
             .with_context(|| format!("read commit tree for {}", oid))?;
 
-        // CDC-frame the path-ordered worktree stream and map files to fragments.
-        let (stream, bounds, mut manifest, raw_total) = self.cdc_frames_from_tree(&repo, &tree)?;
-
-        // Compress the frames in parallel — they are independent — directly from
-        // stream slices (no per-frame copies). Empty frames stay empty.
-        use rayon::prelude::*;
-        let compressed_frames: Vec<Vec<u8>> = bounds
-            .par_iter()
-            .map(|&(s, e)| -> Result<Vec<u8>> {
-                let raw = &stream[s..e];
-                if raw.is_empty() {
-                    return Ok(Vec::new());
-                }
-                match dictionary {
-                    Some(dict) => zstd::bulk::Compressor::with_dictionary(level, dict)
-                        .context("create zstd compressor with dictionary")?
-                        .compress(raw)
-                        .context("zstd compress frame with dictionary"),
-                    None => zstd::encode_all(raw, level).context("zstd compress frame"),
-                }
-            })
-            .collect::<Result<Vec<_>>>()?;
+        // Stream the path-ordered worktree through the chunker, compressing each
+        // batch of frames in parallel. The whole worktree is never held in
+        // memory — peak stays ~one batch + the largest blob. Frames are
+        // independent, so compression parallelizes cleanly within a batch.
+        let (mut manifest, bounds, raw_total, compressed_frames) =
+            self.stream_cdc(&repo, &tree, |batch| {
+                use rayon::prelude::*;
+                batch
+                    .par_iter()
+                    .map(|&(_, raw)| compress_frame(raw, level, dictionary))
+                    .collect::<Result<Vec<_>>>()
+            })?;
 
         // Assemble compressed frames into chunks of ~target_chunk_size, recording
         // each frame's placement.
@@ -225,68 +244,84 @@ impl ArchiveBuilder {
         ))
     }
 
-    /// Walk the commit tree in path order, build the concatenated worktree byte
-    /// stream, and cut it into content-defined frames. Returns `(stream, bounds,
-    /// manifest_with_files, raw_total)` where `bounds[i] = (start, end)` is frame
-    /// i's byte range in `stream`; the manifest has `files` (with fragments)
-    /// populated but `frames` empty. Callers compress each frame directly from
-    /// `&stream[start..end]` — the stream is not copied into per-frame buffers, so
-    /// peak memory stays ~1× the worktree.
+    /// Stream the path-ordered worktree through content-defined chunking without
+    /// ever materializing the whole worktree in memory.
+    ///
+    /// Blobs are served one at a time (peak memory is the largest single blob,
+    /// not the sum of all files) and cut into frames by [`StreamCDC`], which
+    /// produces byte-identical boundaries to the slice-based chunker for the same
+    /// content. Frames are handed to `process_batch` in batches bounded by
+    /// [`STREAM_BATCH_BYTES`], so the per-frame work (compression, hashing) can
+    /// run in parallel while peak memory stays ~one batch + one blob.
+    ///
+    /// Returns `(manifest_with_files, bounds, raw_total, outputs)` where
+    /// `bounds[i] = (start, end)` is frame i's byte range, the manifest has its
+    /// `files` (with fragments) populated but `frames` empty, and `outputs[i]` is
+    /// `process_batch`'s result for frame i (one per frame, in order).
     #[allow(clippy::type_complexity)]
-    fn cdc_frames_from_tree(
+    fn stream_cdc<T, P>(
         &self,
         repo: &git2::Repository,
         tree: &git2::Tree,
-    ) -> Result<(Vec<u8>, Vec<(usize, usize)>, MetadataChunk, u64)> {
-        let mut stream: Vec<u8> = Vec::new();
-        let mut files: Vec<FileEntry> = Vec::new();
-        let mut ranges: Vec<(usize, usize)> = Vec::new();
-        let mut walk_err: Option<anyhow::Error> = None;
-        tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
-            if walk_err.is_some() {
-                return git2::TreeWalkResult::Skip;
+        mut process_batch: P,
+    ) -> Result<(MetadataChunk, Vec<(usize, usize)>, u64, Vec<T>)>
+    where
+        P: FnMut(&[(usize, &[u8])]) -> Result<Vec<T>>,
+    {
+        // Enumerate blobs (raw paths, oids, modes) up front — cheap metadata, no
+        // content. Raw `name_bytes()` paths keep the file table byte-exact for
+        // non-UTF8 names (matching the worktree the client extracts).
+        let mut blobs: Vec<(Vec<u8>, git2::Oid, u32)> = Vec::new();
+        collect_blobs_raw(repo, tree, &[], &mut blobs).context("walk git tree for archive")?;
+
+        // The reader records each file's (path, mode, sha1) + byte range as it
+        // serves blob bytes; we recover that table after the stream is drained.
+        let rec: FileRec = Rc::new(RefCell::new(FileTable::default()));
+        let reader = TreeBlobReader::new(repo, blobs, rec.clone());
+
+        let mut bounds: Vec<(usize, usize)> = Vec::new();
+        let mut outputs: Vec<T> = Vec::new();
+        let mut batch: Vec<(usize, Vec<u8>)> = Vec::new();
+        let mut batch_bytes = 0usize;
+
+        for chunk in StreamCDC::new(reader, CDC_MIN, CDC_AVG, CDC_MAX) {
+            let chunk = chunk.map_err(|e| anyhow::anyhow!("content-defined chunking: {e}"))?;
+            let start = chunk.offset as usize;
+            bounds.push((start, start + chunk.length));
+            batch_bytes += chunk.data.len();
+            batch.push((bounds.len() - 1, chunk.data));
+            if batch_bytes >= STREAM_BATCH_BYTES {
+                flush_batch(&mut batch, &mut outputs, &mut process_batch)?;
+                batch_bytes = 0;
             }
-            if entry.kind() != Some(git2::ObjectType::Blob) {
-                return git2::TreeWalkResult::Ok;
-            }
-            let name = entry.name().unwrap_or("");
-            let path = if root.is_empty() {
-                name.to_string()
-            } else {
-                format!("{}/{}", root.trim_end_matches('/'), name)
-            };
-            let mode = entry.filemode_raw() as u32;
-            let content = match entry.to_object(repo).and_then(|o| {
-                o.into_blob()
-                    .map_err(|_| git2::Error::from_str("not a blob"))
-            }) {
-                Ok(b) => b.content().to_vec(),
-                Err(e) => {
-                    walk_err = Some(anyhow::Error::from(e).context(format!("read blob {}", path)));
-                    return git2::TreeWalkResult::Skip;
-                }
-            };
-            let start = stream.len();
-            stream.extend_from_slice(&content);
-            ranges.push((start, content.len()));
-            files.push(FileEntry {
-                path: path.into_bytes(),
-                mode,
-                blob_sha1: sha1_bytes(&content).to_vec(),
-                fragments: Vec::new(),
-            });
-            git2::TreeWalkResult::Ok
-        })
-        .context("walk git tree")?;
-        if let Some(err) = walk_err {
+        }
+        flush_batch(&mut batch, &mut outputs, &mut process_batch)?;
+
+        // Propagate any blob-read error the reader hit (surfaced as io::Other).
+        let table = Rc::try_unwrap(rec)
+            .map_err(|_| anyhow::anyhow!("file table still referenced after stream"))?
+            .into_inner();
+        if let Some(err) = table.err {
             return Err(err).context("build archive from tree");
         }
+        let (mut files, ranges) = (table.files, table.ranges);
+        let raw_total = ranges.last().map(|&(s, l)| (s + l) as u64).unwrap_or(0);
 
-        let raw_total = stream.len() as u64;
-        let bounds = cdc_frame_bounds(&stream);
+        // Empty worktree: synthesize one empty frame so empty-file fragments
+        // always have a frame to point at (matches the slice-based chunker).
+        if bounds.is_empty() {
+            bounds.push((0, 0));
+            let res = process_batch(&[(0, &[][..])])?;
+            anyhow::ensure!(
+                res.len() == 1,
+                "process_batch returned {} outputs for the empty frame",
+                res.len()
+            );
+            outputs.extend(res);
+        }
 
-        // Map each file's byte range to fragments (two-pointer; files are in
-        // stream order, frames sorted by start).
+        // Map each file's byte range to fragments (two-pointer; files and frames
+        // are both in increasing stream order).
         let mut hint = 0usize;
         for (i, &(start, len)) in ranges.iter().enumerate() {
             let (frags, new_hint) = fragments_for(&bounds, start, len, hint);
@@ -296,7 +331,7 @@ impl ArchiveBuilder {
 
         let mut manifest = MetadataChunk::new();
         manifest.files = files;
-        Ok((stream, bounds, manifest, raw_total))
+        Ok((manifest, bounds, raw_total, outputs))
     }
 
     /// Convenience: build from a repo string "owner/repo" by locating the bare
@@ -526,46 +561,35 @@ impl ArchiveBuilder {
             .tree()
             .with_context(|| format!("read commit tree for {}", oid))?;
 
-        let (stream, bounds, mut manifest, _raw_total) = self.cdc_frames_from_tree(&repo, &tree)?;
-
-        use rayon::prelude::*;
-        // Hash every raw frame (the reuse key), and compress only the frames not
-        // present in `prev` — both in parallel, directly from stream slices.
-        let raw_hashes: Vec<String> = bounds
-            .par_iter()
-            .map(|&(s, e)| crate::cas::hash(&stream[s..e]))
-            .collect();
-        let compressed: Vec<Option<Vec<u8>>> = bounds
-            .par_iter()
-            .zip(raw_hashes.par_iter())
-            .map(|(&(s, e), h)| -> Result<Option<Vec<u8>>> {
-                if prev.contains_key(h) {
-                    return Ok(None); // reuse — skip compression
-                }
-                let raw = &stream[s..e];
-                if raw.is_empty() {
-                    return Ok(Some(Vec::new()));
-                }
-                let c = match dictionary {
-                    Some(dict) => zstd::bulk::Compressor::with_dictionary(level, dict)
-                        .context("create zstd compressor with dictionary")?
-                        .compress(raw)
-                        .context("zstd compress frame with dictionary")?,
-                    None => zstd::encode_all(raw, level).context("zstd compress frame")?,
-                };
-                Ok(Some(c))
-            })
-            .collect::<Result<Vec<_>>>()?;
+        // Stream the worktree through the chunker. For each frame, hash the raw
+        // bytes (the reuse key) and compress only frames not already in `prev` —
+        // in parallel per batch, never holding the whole worktree in memory.
+        let (mut manifest, bounds, _raw_total, processed) =
+            self.stream_cdc(&repo, &tree, |batch| {
+                use rayon::prelude::*;
+                batch
+                    .par_iter()
+                    .map(|&(_, raw)| -> Result<(String, Option<Vec<u8>>)> {
+                        let h = crate::cas::hash(raw);
+                        if prev.contains_key(&h) {
+                            Ok((h, None)) // reuse — skip compression
+                        } else {
+                            Ok((h, Some(compress_frame(raw, level, dictionary)?)))
+                        }
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })?;
 
         let mut all_chunks = Vec::with_capacity(bounds.len());
         let mut new_chunks = Vec::new();
         let mut frames = Vec::with_capacity(bounds.len());
         for i in 0..bounds.len() {
             let raw_len = (bounds[i].1 - bounds[i].0) as u64;
-            let (chunk_hash, compressed_len) = match prev.get(&raw_hashes[i]) {
+            let (raw_hash, comp_opt) = &processed[i];
+            let (chunk_hash, compressed_len) = match prev.get(raw_hash) {
                 Some((ch, cl)) => (ch.clone(), *cl),
                 None => {
-                    let comp = compressed[i].as_ref().expect("non-reused frame compressed");
+                    let comp = comp_opt.as_ref().expect("non-reused frame compressed");
                     let ch = cas.put(comp)?;
                     new_chunks.push(ch.clone());
                     (ch, comp.len() as u64)
@@ -580,7 +604,7 @@ impl ArchiveBuilder {
             });
             all_chunks.push(chunk_hash.clone());
             frames.push(crate::ArchiveFrame {
-                raw_hash: raw_hashes[i].clone(),
+                raw_hash: raw_hash.clone(),
                 chunk_hash,
                 compressed_len,
                 raw_len,
@@ -592,6 +616,129 @@ impl ArchiveBuilder {
 
 pub fn sha1_bytes(data: &[u8]) -> [u8; 20] {
     Sha1::digest(data).into()
+}
+
+/// Run `process_batch` over one batch of frames and append the results to
+/// `outputs` in frame order, then clear `batch`. Used by [`ArchiveBuilder::stream_cdc`]
+/// to flush a bounded window of frames (mid-stream and at the end).
+fn flush_batch<T, P>(
+    batch: &mut Vec<(usize, Vec<u8>)>,
+    outputs: &mut Vec<T>,
+    process_batch: &mut P,
+) -> Result<()>
+where
+    P: FnMut(&[(usize, &[u8])]) -> Result<Vec<T>>,
+{
+    if batch.is_empty() {
+        return Ok(());
+    }
+    let view: Vec<(usize, &[u8])> = batch.iter().map(|(i, d)| (*i, d.as_slice())).collect();
+    let res = process_batch(&view)?;
+    anyhow::ensure!(
+        res.len() == view.len(),
+        "process_batch returned {} outputs for {} frames",
+        res.len(),
+        view.len()
+    );
+    outputs.extend(res);
+    batch.clear();
+    Ok(())
+}
+
+/// File table accumulated by [`TreeBlobReader`] while it streams blob bytes: one
+/// [`FileEntry`] per blob (fragments filled in later) and the parallel
+/// `(start, len)` byte range of each file in the stream. `err` holds the first
+/// blob-read failure, since the `Read` trait can only surface an `io::Error`.
+#[derive(Default)]
+struct FileTable {
+    files: Vec<FileEntry>,
+    ranges: Vec<(usize, usize)>,
+    err: Option<anyhow::Error>,
+}
+
+type FileRec = Rc<RefCell<FileTable>>;
+
+/// A [`Read`] over the path-ordered concatenation of a tree's blob contents.
+/// Loads one blob at a time (peak memory is the largest blob, never the whole
+/// worktree) and records each file's entry + byte range into the shared
+/// [`FileTable`] as it serves bytes. A blob-read error is stored in the table
+/// and surfaced as an `io::Error` so the streaming chunker stops.
+struct TreeBlobReader<'r> {
+    repo: &'r git2::Repository,
+    blobs: std::vec::IntoIter<(Vec<u8>, git2::Oid, u32)>,
+    cur: Vec<u8>,
+    pos: usize,
+    next_start: usize,
+    rec: FileRec,
+}
+
+impl<'r> TreeBlobReader<'r> {
+    fn new(
+        repo: &'r git2::Repository,
+        blobs: Vec<(Vec<u8>, git2::Oid, u32)>,
+        rec: FileRec,
+    ) -> Self {
+        Self {
+            repo,
+            blobs: blobs.into_iter(),
+            cur: Vec::new(),
+            pos: 0,
+            next_start: 0,
+            rec,
+        }
+    }
+
+    /// Load the next blob into `cur`, recording its file entry + byte range.
+    /// Returns Ok(true) if a blob was loaded (possibly empty), Ok(false) at EOF.
+    fn load_next(&mut self) -> Result<bool> {
+        let (path, oid, mode) = match self.blobs.next() {
+            Some(b) => b,
+            None => return Ok(false),
+        };
+        let content = self
+            .repo
+            .find_blob(oid)
+            .with_context(|| format!("read blob {} for {:?}", oid, String::from_utf8_lossy(&path)))?
+            .content()
+            .to_vec();
+        let start = self.next_start;
+        let len = content.len();
+        {
+            let mut t = self.rec.borrow_mut();
+            t.files.push(FileEntry {
+                path,
+                mode,
+                blob_sha1: sha1_bytes(&content).to_vec(),
+                fragments: Vec::new(),
+            });
+            t.ranges.push((start, len));
+        }
+        self.next_start = start + len;
+        self.cur = content;
+        self.pos = 0;
+        Ok(true)
+    }
+}
+
+impl Read for TreeBlobReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            if self.pos < self.cur.len() {
+                let n = (self.cur.len() - self.pos).min(buf.len());
+                buf[..n].copy_from_slice(&self.cur[self.pos..self.pos + n]);
+                self.pos += n;
+                return Ok(n);
+            }
+            match self.load_next() {
+                Ok(true) => continue,
+                Ok(false) => return Ok(0),
+                Err(e) => {
+                    self.rec.borrow_mut().err = Some(e);
+                    return Err(std::io::Error::other("blob read failed"));
+                }
+            }
+        }
+    }
 }
 
 /// Recursively collect every blob in `tree` as `(raw_path_bytes, blob_oid,
@@ -1039,5 +1186,93 @@ mod tests {
             let got = std::fs::read(dest.join(name)).unwrap_or_else(|e| panic!("read {name}: {e}"));
             assert_eq!(&got, content, "roundtrip mismatch for {name}");
         }
+    }
+
+    /// The streaming chunker must produce byte-identical frame boundaries to the
+    /// slice-based chunker over the same path-ordered worktree. This is what lets
+    /// us drop the whole-worktree buffer without invalidating already-stored
+    /// archives or per-frame reuse keys.
+    #[test]
+    fn stream_cdc_bounds_match_slice_cdc() {
+        // High-entropy xorshift bytes so CDC finds real content-defined cut
+        // points (not just max-size cuts) — that's what makes the streaming vs.
+        // slice boundary equivalence a meaningful check.
+        let pr = |len: usize, seed: u64| {
+            let mut s = seed ^ 0x9E3779B97F4A7C15;
+            (0..len)
+                .map(|_| {
+                    s ^= s << 13;
+                    s ^= s >> 7;
+                    s ^= s << 17;
+                    (s >> 33) as u8
+                })
+                .collect::<Vec<u8>>()
+        };
+        let files: Vec<(&str, Vec<u8>)> = vec![
+            ("a.txt", b"hello\n".to_vec()),
+            ("empty.txt", Vec::new()),
+            ("dir/m.bin", pr(7 * 1024 * 1024, 3)),
+            ("big.bin", pr(20 * 1024 * 1024, 7)),
+            ("z.txt", b"tail\n".to_vec()),
+        ];
+        let files_ref: Vec<(&str, &[u8])> = files.iter().map(|(p, b)| (*p, b.as_slice())).collect();
+        let (tmp, commit) = commit_files(&files_ref);
+
+        let builder = ArchiveBuilder::new(tmp.path());
+        let repo = git2::Repository::open_bare(tmp.path()).unwrap();
+        let tree = repo
+            .find_commit(repo.revparse_single(&commit).unwrap().id())
+            .unwrap()
+            .tree()
+            .unwrap();
+
+        // Streaming bounds (process closure is a no-op: one unit per frame).
+        let (_m, stream_bounds, raw_total, outputs) = builder
+            .stream_cdc(&repo, &tree, |batch| Ok(vec![(); batch.len()]))
+            .unwrap();
+        assert_eq!(outputs.len(), stream_bounds.len(), "one output per frame");
+
+        // Reference: concatenate the same blobs in walk order and slice-CDC them.
+        let mut blobs = Vec::new();
+        collect_blobs_raw(&repo, &tree, &[], &mut blobs).unwrap();
+        let mut full = Vec::new();
+        for (_p, oid, _mode) in &blobs {
+            full.extend_from_slice(repo.find_blob(*oid).unwrap().content());
+        }
+        let ref_bounds = cdc_frame_bounds(&full);
+
+        assert_eq!(
+            stream_bounds, ref_bounds,
+            "streaming CDC boundaries must match slice CDC"
+        );
+        assert_eq!(
+            raw_total,
+            full.len() as u64,
+            "raw_total must match stream len"
+        );
+        assert!(
+            stream_bounds.len() >= 3,
+            "test data should span many frames"
+        );
+    }
+
+    /// A non-UTF8 filename must survive into the archive manifest byte-exact (the
+    /// streaming walk uses raw `name_bytes()` paths, not lossy UTF-8), so the
+    /// client materializes the right path.
+    #[test]
+    fn archive_manifest_preserves_non_utf8_path() {
+        let weird: &[u8] = b"caf\xe9.txt"; // invalid UTF-8 (Latin-1 é)
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init_bare(tmp.path()).unwrap();
+        let commit = commit_onto_bytes(&repo, &[(b"a.txt", b"hi"), (weird, b"payload")]);
+
+        let (manifest, _chunks, _stats) = ArchiveBuilder::new(tmp.path())
+            .build_chunks(&commit, 6, None, u64::MAX)
+            .unwrap();
+
+        assert!(
+            manifest.files.iter().any(|f| f.path == weird),
+            "archive manifest must keep the raw non-UTF8 path"
+        );
     }
 }
