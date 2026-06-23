@@ -75,6 +75,16 @@ publish() { # work_dir owner repo
 }
 
 start_server() {
+  # Fully reap any previous server and bind a fresh port. Reusing the same port
+  # right after killing the old process races the OS releasing it ("Address
+  # already in use"), e.g. on the LSM restart below.
+  if [ -n "$SERVER_PID" ]; then
+    kill "$SERVER_PID" 2>/dev/null || true
+    wait "$SERVER_PID" 2>/dev/null || true
+    SERVER_PID=""
+  fi
+  PORT=$(( 20000 + RANDOM % 40000 ))
+  SERVER_URL="http://127.0.0.1:$PORT"
   RUST_LOG=warn "$SERVER_BIN" --cas-dir "$CAS_DIR" --repo-root "$REPO_ROOT" \
     --host 127.0.0.1 --port "$PORT" >"$BASE_DIR/server.log" 2>&1 &
   SERVER_PID=$!
@@ -181,7 +191,7 @@ pass "re-sync served the new commit"
 
 # === LSM incremental build ====================================================
 echo "==> LSM incremental (restarting server with RIPCLONE_LSM=1)"
-kill "$SERVER_PID" 2>/dev/null || true; SERVER_PID=""
+# start_server reaps the running server and rebinds a fresh port.
 export RIPCLONE_LSM=1 RIPCLONE_LSM_SEAL_BYTES=1
 start_server
 w=$(new_origin acme lsm)

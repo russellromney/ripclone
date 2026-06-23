@@ -20,8 +20,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # Reads the pinned channel + components from rust-toolchain.toml and caches.
+      # Reads the pinned channel + components from rust-toolchain.toml, and
+      # caches the cargo registry + target dir (keyed by Cargo.lock).
+      # cache-workspaces points it at the project in rust/ so caching works —
+      # without it the action can't find Cargo.toml and silently disables the
+      # cache, recompiling everything on every run.
       - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache-workspaces: rust
       - name: Install build deps
         run: bash scripts/install-build-deps.sh
       - name: Lint (fmt + clippy)
@@ -32,6 +38,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache-workspaces: rust
       - name: Install build deps
         run: bash scripts/install-build-deps.sh
       - name: Unit + integration tests (release, parallel)
@@ -42,6 +50,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache-workspaces: rust
       - name: Install build deps
         run: bash scripts/install-build-deps.sh
       - name: End-to-end (local origin, real binaries)
@@ -54,6 +64,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache-workspaces: rust
       - name: Install build deps
         run: bash scripts/install-build-deps.sh
       - name: Flake guard (repeat suite)
