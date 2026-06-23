@@ -1,0 +1,6 @@
+# Single source of truth for the Rust toolchain. CI, local dev, and any
+# container all resolve to this exact version + components, so "passes locally"
+# means "passes in CI" (no floating `stable` drift). Bump deliberately in a PR.
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]

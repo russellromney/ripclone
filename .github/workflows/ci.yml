@@ -5,6 +5,11 @@ on:
     branches: [main]
   pull_request:
 
+# Cancel superseded runs on the same ref to save minutes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   # Tests mirror from local file:// origins, never GitHub — no network needed.
@@ -13,54 +18,53 @@ env:
 jobs:
   lint:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: rust
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      # Reads the pinned channel + components from rust-toolchain.toml and caches.
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
       - name: Install build deps
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler cmake build-essential pkg-config libssl-dev libfuse-dev libgit2-dev
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: rust
-      - name: rustfmt
-        run: cargo fmt --all --check
-      - name: clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: bash scripts/install-build-deps.sh
+      - name: Lint (fmt + clippy)
+        run: bash scripts/ci.sh lint
 
   test:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: rust
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
       - name: Install build deps
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler cmake build-essential pkg-config libssl-dev libfuse-dev libgit2-dev git
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: rust
-      - name: Unit + integration tests
-        run: cargo test --release --all-targets
+        run: bash scripts/install-build-deps.sh
+      - name: Unit + integration tests (release, parallel)
+        run: bash scripts/ci.sh test
 
   e2e:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
       - name: Install build deps
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler cmake build-essential pkg-config libssl-dev libfuse-dev libgit2-dev git
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: rust
-      - name: Build release binaries
-        working-directory: rust
-        run: cargo build --release --bins
+        run: bash scripts/install-build-deps.sh
       - name: End-to-end (local origin, real binaries)
-        env:
-          RIPCLONE_TOKEN: ci-e2e-token
-        run: bash scripts/e2e_local.sh
+        run: bash scripts/ci.sh e2e
+
+  # Catch nondeterministic races/ordering bugs that a single test run can miss
+  # (e.g. cross-test state leaks). Runs the debug suite a few times.
+  flake:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: Install build deps
+        run: bash scripts/install-build-deps.sh
+      - name: Flake guard (repeat suite)
+        run: bash scripts/ci.sh flake
+
+  # Build the shipped images so a broken Dockerfile is caught in CI, not at deploy.
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build server image
+        run: docker build -f Dockerfile -t ripclone-server:ci .
+      - name: Build client image
+        run: docker build -f Dockerfile.client -t ripclone-client:ci .

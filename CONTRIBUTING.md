@@ -19,9 +19,16 @@ cargo test
 ## Submitting changes
 
 1. Open an issue or PR describing the change.
-2. Run `cargo fmt`, `cargo clippy`, and `cargo test`.
+2. Run the exact checks CI runs: **`scripts/ci.sh`** (lint + tests + e2e). Running
+   this is the best way to avoid "passed locally, failed in CI" — it uses the
+   same commands and the pinned toolchain (`rust-toolchain.toml`) as CI. Run a
+   single stage with `scripts/ci.sh lint|test|e2e|flake`.
 3. Add tests for new behavior.
 4. Keep commits focused and the diff minimal.
+
+> Tests run in **parallel** (as in CI), so they must not depend on global
+> process state (e.g. shared env vars) leaking between tests. `scripts/ci.sh flake`
+> re-runs the suite to surface such races.
 
 ## Questions
 
