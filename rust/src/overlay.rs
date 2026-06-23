@@ -40,6 +40,9 @@ pub fn staging_dir() -> PathBuf {
 }
 
 /// Available bytes on the filesystem that backs `path`.
+// `statvfs` field widths differ by platform (the casts are needed on macOS,
+// redundant on 64-bit Linux), so the cast is portability, not a clippy nit.
+#[allow(clippy::unnecessary_cast)]
 pub fn available_space(path: &Path) -> Option<u64> {
     let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
     let mut buf: std::mem::MaybeUninit<libc::statvfs> = std::mem::MaybeUninit::uninit();
@@ -48,8 +51,7 @@ pub fn available_space(path: &Path) -> Option<u64> {
             return None;
         }
         let buf = buf.assume_init();
-        let avail = u128::from(buf.f_bavail) * u128::from(buf.f_bsize);
-        avail.try_into().ok()
+        Some(buf.f_bavail as u64 * buf.f_bsize as u64)
     }
 }
 

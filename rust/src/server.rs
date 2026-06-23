@@ -3770,6 +3770,18 @@ async fn update_build_status(
     Ok(())
 }
 
+/// Hash the auth token, or fail if it is missing/empty. Pure (no env access) so
+/// it is unit-testable without starting a server or touching global state.
+fn auth_token_hash(raw: Option<String>) -> Result<String> {
+    raw.filter(|t| !t.is_empty())
+        .map(|t| format!("{:x}", Sha256::digest(t.as_bytes())))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "RIPCLONE_TOKEN is not set. Refusing to start an unauthenticated server."
+            )
+        })
+}
+
 pub async fn run_server(
     cas_dir: &std::path::Path,
     repo_root: &std::path::Path,
@@ -3779,13 +3791,7 @@ pub async fn run_server(
     std::fs::create_dir_all(cas_dir)?;
     std::fs::create_dir_all(repo_root)?;
 
-    let token_hash = env::var("RIPCLONE_TOKEN")
-        .ok()
-        .filter(|t| !t.is_empty())
-        .map(|t| format!("{:x}", Sha256::digest(t.as_bytes())));
-    if token_hash.is_none() {
-        anyhow::bail!("RIPCLONE_TOKEN is not set. Refusing to start an unauthenticated server.");
-    }
+    let token_hash = auth_token_hash(env::var("RIPCLONE_TOKEN").ok())?;
     info!("RIPCLONE_TOKEN configured; auth middleware enabled");
 
     let github_token = env::var("RIPCLONE_GITHUB_TOKEN")
@@ -3866,7 +3872,7 @@ pub async fn run_server(
         storage,
         repo_root: repo_root.to_path_buf(),
         ref_store,
-        token_hash,
+        token_hash: Some(token_hash),
         github_token,
         metrics,
         rate_limiter,
@@ -3961,26 +3967,19 @@ mod tests {
         assert!(validate_repo_id("").is_err());
     }
 
-    #[tokio::test]
-    async fn run_server_refuses_to_start_without_token() {
-        let tmp = tempfile::tempdir().unwrap();
-        let result = run_server(
-            tmp.path().join("cas").as_path(),
-            tmp.path().join("repos").as_path(),
-            "127.0.0.1",
-            0,
-        )
-        .await;
-        assert!(
-            result.is_err(),
-            "server must refuse to start without RIPCLONE_TOKEN"
-        );
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("RIPCLONE_TOKEN"),
-            "error should mention missing token: {}",
-            err
-        );
+    #[test]
+    fn auth_token_hash_requires_a_nonempty_token() {
+        // Missing or empty token must be rejected with a clear message...
+        for missing in [None, Some(String::new())] {
+            let err = auth_token_hash(missing).unwrap_err().to_string();
+            assert!(
+                err.contains("RIPCLONE_TOKEN"),
+                "error should mention missing token: {err}"
+            );
+        }
+        // ...and a real token hashes to the same digest the auth middleware checks.
+        let hash = auth_token_hash(Some("secret".to_string())).unwrap();
+        assert_eq!(hash, format!("{:x}", Sha256::digest("secret")));
     }
 
     #[test]
