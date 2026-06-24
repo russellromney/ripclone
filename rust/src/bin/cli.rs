@@ -100,14 +100,6 @@ enum Commands {
         #[arg(short, long, default_value = "HEAD")]
         branch: String,
     },
-    /// Mount a repo as a FUSE filesystem.
-    Mount {
-        repo: String,
-        #[arg(short, long)]
-        dir: PathBuf,
-        #[arg(short, long, default_value = "HEAD")]
-        branch: String,
-    },
     /// Snapshot operations for agent-ready repo skeletons.
     Snapshot {
         #[command(subcommand)]
@@ -581,57 +573,6 @@ async fn main() -> Result<()> {
             let (owner, repo_name) = parse_repo(&repo)?;
             let content = client.cat_file(owner, repo_name, &branch, &path).await?;
             std::io::stdout().write_all(&content)?;
-        }
-        Commands::Mount { repo, dir, branch } => {
-            let (owner, repo_name) = parse_repo(&repo)?;
-            let owner = owner.to_string();
-            let repo_name = repo_name.to_string();
-
-            // Mountpoint must exist and be empty.
-            if !dir.exists() {
-                std::fs::create_dir_all(&dir)?;
-            } else if dir.read_dir()?.next().is_some() {
-                anyhow::bail!("mountpoint must be empty: {}", dir.display());
-            }
-
-            // Skeleton lives in a backing directory outside the mountpoint.
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-            let backing = PathBuf::from(home)
-                .join(".cache")
-                .join("ripclone")
-                .join("mounts")
-                .join(owner.clone())
-                .join(repo_name.clone());
-            if !backing.join(".git").exists() {
-                client
-                    .skeleton_clone(&owner, &repo_name, &branch, &backing)
-                    .await?;
-            }
-            let commit = std::process::Command::new("git")
-                .args(["-C", backing.to_str().unwrap(), "rev-parse", "HEAD"])
-                .output()?
-                .stdout;
-            let commit = String::from_utf8(commit)?.trim().to_string();
-            let server = server.clone();
-            let branch = branch.to_string();
-            let sizes = client.fetch_sizes(&owner, &repo_name, &branch).await?;
-            println!(
-                "mounting {} on {} (backing {}) with {} size entries",
-                repo,
-                dir.display(),
-                backing.display(),
-                sizes.len()
-            );
-            // Run FUSE on a dedicated thread so reqwest::blocking can start its own
-            // Tokio runtime inside the FUSE callbacks.
-            let mount_handle = std::thread::spawn(move || {
-                ripclone::fusefs::mount(
-                    &owner, &repo_name, &branch, &server, &backing, &commit, sizes, &dir,
-                )
-            });
-            mount_handle
-                .join()
-                .map_err(|e| anyhow::anyhow!("mount thread panicked: {:?}", e))??;
         }
         Commands::Snapshot { action } => match action {
             SnapshotAction::Create {

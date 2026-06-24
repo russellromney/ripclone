@@ -12,15 +12,10 @@
 version = 2
 # A yanked crate in the lockfile is a problem worth failing on.
 yanked = "deny"
-# Pre-existing `unsound` advisories surfaced when this guard was added
-# (2026-06-24). Each is fixed by a dependency bump (not a code change here), so
-# they're tracked for a focused, validated dep-upgrade PR rather than blocking
-# the guard from landing. Remove an entry once its upgrade lands.
-ignore = [
-  { id = "RUSTSEC-2021-0154", reason = "fuser 0.15 (FUSE sidecar): libfuse null-ops uninitialized read; fix is fuser >=0.16. Tracked for a dep-upgrade PR." },
-  { id = "RUSTSEC-2026-0183", reason = "git2 0.20: Remote::list() null-slice UB on a remote advertising no refs; fix is git2 >=0.21. Tracked for a dep-upgrade PR." },
-  { id = "RUSTSEC-2026-0184", reason = "git2 0.20: BlameHunk Signature null-ptr UB via blame_buffer (unused by ripclone); fix is git2 >=0.21. Tracked for a dep-upgrade PR." },
-]
+# Triaged-but-unfixable advisories go here, each with a dated reason:
+# ignore = [
+#   { id = "RUSTSEC-0000-0000", reason = "..." },
+# ]
 
 [bans]
 # Duplicate versions of a crate are a warning, not a hard failure — they're
@@ -33,8 +28,8 @@ wildcards = "deny"
 version = 2
 # Permissive licenses only. This is the set actually present in the dependency
 # tree (plus the components of a few OR/AND expressions), so a new dependency
-# under a copyleft or unlisted license fails CI for a human to evaluate. ripclone
-# itself is `MIT OR Apache-2.0`.
+# under a strong-copyleft or unlisted license fails CI for a human to evaluate.
+# ripclone itself is `MIT OR Apache-2.0`.
 allow = [
   "MIT",
   "MIT-0",
@@ -49,6 +44,9 @@ allow = [
   "CDLA-Permissive-2.0",
   "BSL-1.0",
   "Unlicense",
+  # Weak/file-level copyleft — safe to depend on from a permissive project
+  # (does not relicense our code). Currently: uluru (via gix).
+  "MPL-2.0",
 ]
 
 [sources]

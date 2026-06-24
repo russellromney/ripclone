@@ -75,7 +75,7 @@ cargo install ripclone --locked
 pip install ripclone
 ```
 
-The prebuilt binaries link their C libraries (libgit2, openssl, fuse, zstd) dynamically; on Linux install the runtime packages (`libgit2`, `libssl3`, `libfuse2`), on macOS `brew install libgit2 openssl@3`. `cargo install` builds them from source instead.
+The prebuilt binaries link their C libraries (libgit2, openssl, zstd) dynamically; on Linux install the runtime packages (`libgit2`, `libssl3`), on macOS `brew install libgit2 openssl@3`. `cargo install` builds them from source instead.
 
 Check your version and whether the configured server is compatible:
 
