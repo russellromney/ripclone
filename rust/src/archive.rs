@@ -377,19 +377,18 @@ impl ArchiveBuilder {
         collect_blobs_raw_gix(&repo, tree_id, &mut blobs)
             .context("collect blobs for files table")?;
 
+        // Hash blobs in parallel. Many-file repos (e.g. node_modules) spend most
+        // of the files-table time reading/decompressing small blobs; per-thread
+        // gix handles share the mmap'd ODB and keep order deterministically.
+        let hashes =
+            hash_blobs_parallel(&self.mirror, blobs).context("hash blobs for files table")?;
+
         let mut manifest = MetadataChunk::new();
-        for (path, oid, mode) in blobs {
-            let content = repo
-                .find_blob(oid)
-                .with_context(|| {
-                    format!("read blob {} for {}", oid, String::from_utf8_lossy(&path))
-                })?
-                .data
-                .clone();
+        for (path, mode, blob_sha1) in hashes {
             manifest.files.push(FileEntry {
                 path,
                 mode,
-                blob_sha1: sha1_bytes(&content).to_vec(),
+                blob_sha1,
                 fragments: Vec::new(),
             });
         }
@@ -1046,6 +1045,65 @@ fn collect_blobs_raw_gix(
         ));
     }
     Ok(())
+}
+
+/// Hash a list of `(path, blob_oid, mode)` tuples in parallel using per-thread
+/// gix handles. Returns the same order as `blobs` so the manifest order stays
+/// deterministic.
+fn hash_blobs_parallel(
+    mirror: &std::path::Path,
+    blobs: Vec<(Vec<u8>, gix::hash::ObjectId, u32)>,
+) -> anyhow::Result<Vec<(Vec<u8>, u32, Vec<u8>)>> {
+    const PARALLEL_HASH_THRESHOLD: usize = 64;
+
+    if blobs.len() < PARALLEL_HASH_THRESHOLD {
+        let repo = crate::gix_util::open_repo(mirror)?;
+        return blobs
+            .into_iter()
+            .map(|(path, oid, mode)| {
+                let blob = repo.find_blob(oid).with_context(|| {
+                    format!("read blob {} for {}", oid, String::from_utf8_lossy(&path))
+                })?;
+                Ok((path, mode, sha1_bytes(&blob.data).to_vec()))
+            })
+            .collect::<anyhow::Result<Vec<_>>>();
+    }
+
+    let sync_repo = crate::gix_util::open_sync_repo(mirror)?;
+    let num_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2)
+        .min(blobs.len());
+    let chunk_size = blobs.len().div_ceil(num_threads);
+
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(num_threads);
+        for chunk in blobs.chunks(chunk_size.max(1)) {
+            let sync = &sync_repo;
+            handles.push(scope.spawn(move || {
+                let repo = sync.to_thread_local();
+                chunk
+                    .iter()
+                    .map(|(path, oid, mode)| {
+                        let blob = repo.find_blob(*oid).with_context(|| {
+                            format!("read blob {} for {}", oid, String::from_utf8_lossy(path))
+                        })?;
+                        Ok((path.clone(), *mode, sha1_bytes(&blob.data).to_vec()))
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()
+            }));
+        }
+
+        let mut combined = Vec::with_capacity(blobs.len());
+        for handle in handles {
+            combined.extend(
+                handle
+                    .join()
+                    .map_err(|e| anyhow::anyhow!("blob hash worker panicked: {:?}", e))??,
+            );
+        }
+        Ok(combined)
+    })
 }
 
 /// Maximum size of a single file sample used for dictionary training.

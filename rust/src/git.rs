@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::AtomicBool;
@@ -28,17 +29,20 @@ pub fn update_index_sizes<P: AsRef<Path>>(git_dir: P, sizes: &HashMap<String, u6
     let index_path = git_dir.as_ref().join("index");
     let mut index = open_index_file(&index_path)?;
 
-    for (entry, path) in index.entries_mut_with_paths() {
-        let path_str = String::from_utf8_lossy(path);
-        if let Some(&size) = sizes.get(path_str.as_ref()) {
-            entry.stat.size = size as u32;
-            entry.stat.ctime = gix::index::entry::stat::Time { secs: 1, nsecs: 0 };
-            entry.stat.mtime = gix::index::entry::stat::Time { secs: 1, nsecs: 0 };
-            entry.stat.dev = 0;
-            entry.stat.ino = 0;
-            entry.stat.uid = 0;
-            entry.stat.gid = 0;
-        }
+    for (path, &size) in sizes {
+        let entry = index
+            .entry_mut_by_path_and_stage(
+                gix::bstr::BStr::new(path.as_bytes()),
+                gix::index::entry::Stage::Unconflicted,
+            )
+            .with_context(|| format!("path {path} not in index"))?;
+        entry.stat.size = size as u32;
+        entry.stat.ctime = gix::index::entry::stat::Time { secs: 1, nsecs: 0 };
+        entry.stat.mtime = gix::index::entry::stat::Time { secs: 1, nsecs: 0 };
+        entry.stat.dev = 0;
+        entry.stat.ino = 0;
+        entry.stat.uid = 0;
+        entry.stat.gid = 0;
     }
 
     write_index_file(&mut index)
@@ -66,24 +70,27 @@ fn update_index_skip_worktree_at(
 ) -> Result<()> {
     let mut index = open_index_file(index_path)?;
 
-    let target: HashSet<&str> = paths.iter().map(|s| s.as_str()).collect();
     let mut changed = false;
-    for (entry, path) in index.entries_mut_with_paths() {
-        if target.contains(String::from_utf8_lossy(path).as_ref()) {
-            let current = entry.flags.contains(SKIP_WORKTREE_FLAG);
-            if current == set {
-                continue;
-            }
-            entry.flags.set(SKIP_WORKTREE_FLAG, set);
-            if set {
-                entry.flags.insert(gix::index::entry::Flags::EXTENDED);
-            } else if (entry.flags & (gix::index::entry::Flags::INTENT_TO_ADD | SKIP_WORKTREE_FLAG))
-                .is_empty()
-            {
-                entry.flags.remove(gix::index::entry::Flags::EXTENDED);
-            }
-            changed = true;
+    for path in paths {
+        let Some(entry) = index.entry_mut_by_path_and_stage(
+            gix::bstr::BStr::new(path.as_bytes()),
+            gix::index::entry::Stage::Unconflicted,
+        ) else {
+            continue;
+        };
+        let current = entry.flags.contains(SKIP_WORKTREE_FLAG);
+        if current == set {
+            continue;
         }
+        entry.flags.set(SKIP_WORKTREE_FLAG, set);
+        if set {
+            entry.flags.insert(gix::index::entry::Flags::EXTENDED);
+        } else if (entry.flags & (gix::index::entry::Flags::INTENT_TO_ADD | SKIP_WORKTREE_FLAG))
+            .is_empty()
+        {
+            entry.flags.remove(gix::index::entry::Flags::EXTENDED);
+        }
+        changed = true;
     }
     if changed {
         write_index_file(&mut index)?;
@@ -175,26 +182,25 @@ pub fn clear_skip_worktree_index_with_stats<P: AsRef<Path>>(
     }
     let mut index = open_index_file(&index_path)?;
 
-    let target: HashSet<&str> = paths.iter().map(|s| s.as_str()).collect();
     let stats_by_path: HashMap<&str, &IndexStat> =
         stats.iter().map(|s| (s.path.as_str(), &s.stat)).collect();
     let mut changed = false;
-    for (entry, path) in index.entries_mut_with_paths() {
-        let path_str = String::from_utf8_lossy(path);
-        if !target.contains(path_str.as_ref()) {
+    for path in paths {
+        let Some(entry) = index.entry_mut_by_path_and_stage(
+            gix::bstr::BStr::new(path.as_bytes()),
+            gix::index::entry::Stage::Unconflicted,
+        ) else {
             continue;
-        }
-        let fallback_stat;
-        let stat = if let Some(stat) = stats_by_path.get(path_str.as_ref()) {
-            *stat
+        };
+        let stat = if let Some(stat) = stats_by_path.get(path.as_str()) {
+            **stat
         } else {
-            let full_path = repo_dir.join(index_path_from_bytes(path));
+            let full_path = repo_dir.join(index_path_from_bytes(path.as_bytes()));
             let metadata = std::fs::symlink_metadata(&full_path)
                 .with_context(|| format!("stat materialized file {}", full_path.display()))?;
-            fallback_stat = index_stat_from_metadata(&metadata);
-            &fallback_stat
+            index_stat_from_metadata(&metadata)
         };
-        entry.stat = *stat;
+        entry.stat = stat;
         entry.flags.remove(SKIP_WORKTREE_FLAG);
         if (entry.flags & (gix::index::entry::Flags::INTENT_TO_ADD | SKIP_WORKTREE_FLAG)).is_empty()
         {
@@ -770,6 +776,76 @@ fn shell_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('\'', "'\\''")
 }
 
+/// Read and encode objects as pack base entries in parallel. Per-thread gix
+/// handles share the ODB, and the returned vector is sorted by object id so the
+/// final pack is deterministic.
+fn encode_objects_parallel(
+    repo: &gix::Repository,
+    ids: Vec<gix::hash::ObjectId>,
+) -> Result<Vec<gix_pack::data::output::Entry>> {
+    const PARALLEL_ENCODE_THRESHOLD: usize = 128;
+
+    if ids.len() < PARALLEL_ENCODE_THRESHOLD {
+        return ids
+            .into_iter()
+            .map(|id| {
+                let obj = repo
+                    .find_object(id)
+                    .with_context(|| format!("find object {id}"))?;
+                let count = gix_pack::data::output::Count::from_data(id, None);
+                let data = gix::objs::Data::new(&obj.data, obj.kind, gix::hash::Kind::Sha1);
+                let entry = gix_pack::data::output::Entry::from_data(&count, &data)
+                    .with_context(|| format!("encode object {id}"))?;
+                Ok(entry)
+            })
+            .collect::<Result<Vec<_>>>();
+    }
+
+    let sync_repo = repo.clone().into_sync();
+    let num_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2)
+        .min(ids.len());
+    let chunk_size = ids.len().div_ceil(num_threads);
+
+    let mut entries: Vec<gix_pack::data::output::Entry> =
+        std::thread::scope(|scope| -> Result<Vec<gix_pack::data::output::Entry>> {
+            let mut handles = Vec::with_capacity(num_threads);
+            for chunk in ids.chunks(chunk_size.max(1)) {
+                let sync = &sync_repo;
+                handles.push(scope.spawn(move || {
+                    let repo = sync.to_thread_local();
+                    chunk
+                        .iter()
+                        .map(|id| {
+                            let obj = repo
+                                .find_object(*id)
+                                .with_context(|| format!("find object {id}"))?;
+                            let count = gix_pack::data::output::Count::from_data(*id, None);
+                            let data =
+                                gix::objs::Data::new(&obj.data, obj.kind, gix::hash::Kind::Sha1);
+                            let entry = gix_pack::data::output::Entry::from_data(&count, &data)
+                                .with_context(|| format!("encode object {id}"))?;
+                            Ok(entry)
+                        })
+                        .collect::<Result<Vec<_>>>()
+                }));
+            }
+
+            let mut combined = Vec::with_capacity(ids.len());
+            for handle in handles {
+                combined.extend(
+                    handle
+                        .join()
+                        .map_err(|e| anyhow::anyhow!("pack encode worker panicked: {:?}", e))??,
+                );
+            }
+            Ok(combined)
+        })?;
+    entries.sort_by_key(|a| a.id);
+    Ok(entries)
+}
+
 /// Build a packfile + index containing the given object SHAs using gix instead of
 /// the `git pack-objects` subprocess. Objects are stored whole (no deltas) so the
 /// output is deterministic for a fixed sorted OID input, but not byte-identical
@@ -800,76 +876,61 @@ pub fn pack_objects_to_prefix_gix<P: AsRef<Path>, Q: AsRef<Path>>(
     // Encode objects as base entries. This is undeltified and therefore
     // deterministic for a sorted input, at the cost of a larger pack than
     // C-git would produce.
-    let mut pack_data = Vec::new();
-    {
-        let entries: Vec<gix_pack::data::output::Entry> = ids
-            .iter()
-            .map(|id| {
-                let obj = repo
-                    .find_object(*id)
-                    .with_context(|| format!("find object {id}"))?;
-                let count = gix_pack::data::output::Count::from_data(*id, None);
-                let data = gix::objs::Data::new(&obj.data, obj.kind, gix::hash::Kind::Sha1);
-                let entry = gix_pack::data::output::Entry::from_data(&count, &data)
-                    .with_context(|| format!("encode object {id}"))?;
-                Ok(entry)
-            })
-            .collect::<Result<_>>()
-            .context("collect objects for gix pack")?;
-
-        let input = entries
-            .into_iter()
-            .map(|e| Ok::<_, std::convert::Infallible>(vec![e]));
-        let mut writer = gix_pack::data::output::bytes::FromEntriesIter::new(
-            input,
-            &mut pack_data,
-            num_entries,
-            gix_pack::data::Version::V2,
-            gix::hash::Kind::Sha1,
-        );
-        for _ in writer.by_ref() {}
-        writer
-            .digest()
-            .context("gix pack writer did not produce a checksum")?;
-    }
-
-    // Generate the matching .idx file from the pack bytes.
-    let tmp = tempfile::tempdir().context("create temp dir for gix pack index")?;
-    let mut cursor = std::io::Cursor::new(&pack_data);
-    let mut progress = gix::features::progress::Discard;
-    let outcome = gix_pack::Bundle::write_to_directory(
-        &mut cursor,
-        Some(tmp.path()),
-        &mut progress,
-        &AtomicBool::new(false),
-        None::<&gix::Repository>,
-        gix_pack::bundle::write::Options {
-            thread_limit: None,
-            iteration_mode: gix_pack::data::input::Mode::Verify,
-            index_version: gix_pack::index::Version::default(),
-            object_hash: gix::hash::Kind::Sha1,
-        },
-    )
-    .context("gix pack index generation")?;
-
-    let data_path = outcome.data_path.context("gix pack data missing")?;
-    let idx_path = outcome.index_path.context("gix pack index missing")?;
+    // Stream the pack bytes straight to a temp file so peak memory stays flat
+    // regardless of pack size; only the object entries are buffered in memory.
+    let entries = encode_objects_parallel(&repo, ids).context("collect objects for gix pack")?;
 
     if let Some(parent) = prefix.as_ref().parent() {
         std::fs::create_dir_all(parent).context("create pack prefix directory")?;
     }
-    let hash = outcome.index.data_hash.to_hex();
+    let parent = prefix
+        .as_ref()
+        .parent()
+        .context("prefix must have a parent directory")?;
     let base = prefix
         .as_ref()
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("pack");
-    let pack_out = prefix
-        .as_ref()
-        .with_file_name(format!("{}-{}.pack", base, hash));
+
+    let mut tmp_pack = tempfile::Builder::new()
+        .prefix(&format!("{}-tmp-", base))
+        .suffix(".pack")
+        .tempfile_in(parent)
+        .context("create temp pack file")?;
+
+    let pack_hash = {
+        let input = entries
+            .into_iter()
+            .map(|e| Ok::<_, std::convert::Infallible>(vec![e]));
+        let mut buf = std::io::BufWriter::new(tmp_pack.as_file_mut());
+        let mut writer = gix_pack::data::output::bytes::FromEntriesIter::new(
+            input,
+            &mut buf,
+            num_entries,
+            gix_pack::data::Version::V2,
+            gix::hash::Kind::Sha1,
+        );
+        for _ in writer.by_ref() {}
+        let hash = writer
+            .digest()
+            .context("gix pack writer did not produce a checksum")?
+            .to_hex()
+            .to_string();
+        drop(writer);
+        buf.flush().context("flush pack file")?;
+        hash
+    };
+
+    let pack_out = parent.join(format!("{}-{}.pack", base, pack_hash));
     let idx_out = pack_out.with_extension("idx");
-    std::fs::rename(&data_path, &pack_out).context("rename gix pack file")?;
-    std::fs::rename(&idx_path, &idx_out).context("rename gix index file")?;
+    tmp_pack
+        .persist(&pack_out)
+        .with_context(|| format!("rename pack to {}", pack_out.display()))?;
+
+    // Generate the matching .idx file from the just-written pack file.
+    index_pack(parent.join(".git"), &pack_out)
+        .with_context(|| format!("index pack {} -> {}", pack_out.display(), idx_out.display()))?;
     Ok(())
 }
 
@@ -886,6 +947,9 @@ pub fn index_pack<P: AsRef<Path>, Q: AsRef<Path>>(_git_dir: P, pack_path: Q) -> 
             .with_context(|| format!("open pack {}", pack_path.display()))?,
     );
     let mut progress = gix::features::progress::Discard;
+    let thread_limit = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2);
     let outcome = gix_pack::Bundle::write_to_directory(
         &mut reader,
         Some(directory),
@@ -893,7 +957,7 @@ pub fn index_pack<P: AsRef<Path>, Q: AsRef<Path>>(_git_dir: P, pack_path: Q) -> 
         &AtomicBool::new(false),
         None::<&gix::Repository>,
         gix_pack::bundle::write::Options {
-            thread_limit: None,
+            thread_limit: Some(thread_limit),
             iteration_mode: gix_pack::data::input::Mode::Verify,
             index_version: gix_pack::index::Version::default(),
             object_hash: gix::hash::Kind::Sha1,

@@ -184,17 +184,57 @@ pub fn list_tree_entries<P: AsRef<Path>>(
 }
 
 /// Return the raw (uncompressed) size of each object.
+const PARALLEL_LOOKUP_THRESHOLD: usize = 256;
+
 pub fn object_sizes<P: AsRef<Path>>(repo_path: P, oids: &[String]) -> Result<HashMap<String, u64>> {
-    let repo = open_repo(repo_path)?;
-    let mut map = HashMap::with_capacity(oids.len());
-    for oid_str in oids {
-        let id = parse_oid(oid_str)?;
-        let header = repo
-            .find_header(id)
-            .with_context(|| format!("find header {}", oid_str))?;
-        map.insert(oid_str.clone(), header.size());
+    if oids.len() < PARALLEL_LOOKUP_THRESHOLD {
+        let repo = open_repo(repo_path)?;
+        let mut map = HashMap::with_capacity(oids.len());
+        for oid_str in oids {
+            let id = parse_oid(oid_str)?;
+            let header = repo
+                .find_header(id)
+                .with_context(|| format!("find header {}", oid_str))?;
+            map.insert(oid_str.clone(), header.size());
+        }
+        return Ok(map);
     }
-    Ok(map)
+
+    let sync_repo = open_sync_repo(repo_path)?;
+    let num_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2)
+        .min(oids.len());
+    let chunk_size = oids.len().div_ceil(num_threads);
+
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(num_threads);
+        for chunk in oids.chunks(chunk_size.max(1)) {
+            let sync = &sync_repo;
+            handles.push(scope.spawn(move || {
+                let repo = sync.to_thread_local();
+                let mut local = HashMap::with_capacity(chunk.len());
+                for oid_str in chunk {
+                    let id = parse_oid(oid_str)?;
+                    let header = repo
+                        .find_header(id)
+                        .with_context(|| format!("find header {}", oid_str))?;
+                    local.insert(oid_str.clone(), header.size());
+                }
+                Ok::<_, anyhow::Error>(local)
+            }));
+        }
+
+        let mut map = HashMap::with_capacity(oids.len());
+        for handle in handles {
+            map.extend(
+                handle
+                    .join()
+                    .map_err(|e| anyhow::anyhow!("object_sizes worker panicked: {:?}", e))??,
+            );
+        }
+        Ok(map)
+    })
 }
 
 /// Classify many objects by type.
@@ -202,16 +242,55 @@ pub fn classify_objects<P: AsRef<Path>>(
     repo_path: P,
     shas: &HashSet<String>,
 ) -> Result<HashMap<String, String>> {
-    let repo = open_repo(repo_path)?;
-    let mut map = HashMap::with_capacity(shas.len());
-    for sha in shas {
-        let id = parse_oid(sha)?;
-        let header = repo
-            .find_header(id)
-            .with_context(|| format!("find header {}", sha))?;
-        map.insert(sha.clone(), kind_to_str(header.kind()).to_string());
+    let shas: Vec<String> = shas.iter().cloned().collect();
+    if shas.len() < PARALLEL_LOOKUP_THRESHOLD {
+        let repo = open_repo(repo_path)?;
+        let mut map = HashMap::with_capacity(shas.len());
+        for sha in &shas {
+            let id = parse_oid(sha)?;
+            let header = repo
+                .find_header(id)
+                .with_context(|| format!("find header {}", sha))?;
+            map.insert(sha.clone(), kind_to_str(header.kind()).to_string());
+        }
+        return Ok(map);
     }
-    Ok(map)
+
+    let sync_repo = open_sync_repo(repo_path)?;
+    let num_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2)
+        .min(shas.len());
+    let chunk_size = shas.len().div_ceil(num_threads);
+
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(num_threads);
+        for chunk in shas.chunks(chunk_size.max(1)) {
+            let sync = &sync_repo;
+            handles.push(scope.spawn(move || {
+                let repo = sync.to_thread_local();
+                let mut local = HashMap::with_capacity(chunk.len());
+                for sha in chunk {
+                    let id = parse_oid(sha)?;
+                    let header = repo
+                        .find_header(id)
+                        .with_context(|| format!("find header {}", sha))?;
+                    local.insert(sha.clone(), kind_to_str(header.kind()).to_string());
+                }
+                Ok::<_, anyhow::Error>(local)
+            }));
+        }
+
+        let mut map = HashMap::with_capacity(shas.len());
+        for handle in handles {
+            map.extend(
+                handle
+                    .join()
+                    .map_err(|e| anyhow::anyhow!("classify_objects worker panicked: {:?}", e))??,
+            );
+        }
+        Ok(map)
+    })
 }
 
 /// Return the type of an object.
