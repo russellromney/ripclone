@@ -778,20 +778,6 @@ async fn git_info_refs_inner(
     }
 }
 
-async fn git_info_refs(
-    Path((owner, repo)): Path<(String, String)>,
-    Query(query): Query<GitServiceQuery>,
-    headers: HeaderMap,
-    State(state): State<ServerState>,
-) -> Response {
-    if let Some(resp) = reject_invalid_repo_ids(&owner, &repo) {
-        return resp;
-    }
-    let repo_id = RepoId::github(format!("{owner}/{repo}"));
-    let provider = state.provider_registry.default_provider().clone();
-    git_info_refs_inner(repo_id, provider, query, headers, state).await
-}
-
 async fn advertise_refs(mirror_dir: &std::path::Path) -> Result<Vec<u8>> {
     let mirror_dir = mirror_dir.to_path_buf();
     let output = tokio::task::spawn_blocking(move || {
@@ -887,20 +873,6 @@ async fn git_upload_pack_inner(
                 .into_response()
         }
     }
-}
-
-async fn git_upload_pack(
-    Path((owner, repo)): Path<(String, String)>,
-    headers: HeaderMap,
-    State(state): State<ServerState>,
-    body: Body,
-) -> Response {
-    if let Some(resp) = reject_invalid_repo_ids(&owner, &repo) {
-        return resp;
-    }
-    let repo_id = RepoId::github(format!("{owner}/{repo}"));
-    let provider = state.provider_registry.default_provider().clone();
-    git_upload_pack_inner(repo_id, provider, body, headers, state).await
 }
 
 async fn dispatch_repos_get(
@@ -1480,20 +1452,6 @@ async fn get_ref_inner(
     }
 }
 
-async fn get_ref(
-    Path((owner, repo, branch)): Path<(String, String, String)>,
-    Query(params): Query<RefQuery>,
-    headers: HeaderMap,
-    State(state): State<ServerState>,
-) -> impl IntoResponse {
-    if let Some(resp) = reject_invalid_repo_ids(&owner, &repo) {
-        return resp;
-    }
-    let repo_id = RepoId::github(format!("{owner}/{repo}"));
-    let provider = state.provider_registry.default_provider().clone();
-    get_ref_inner(repo_id, provider, branch, params, headers, state).await
-}
-
 /// TTL for signed chunk URLs returned in ref responses. Public repos get a long
 /// window (20 min) so slow clones and large archives finish. Private repos get a
 /// short window (5 min) so a leaked signed URL — or a caller who later loses
@@ -1702,19 +1660,6 @@ async fn repo_status_inner(
                 .into_response()
         }
     }
-}
-
-async fn repo_status(
-    Path((owner, repo)): Path<(String, String)>,
-    Query(query): Query<RepoStatusQuery>,
-    State(state): State<ServerState>,
-) -> impl IntoResponse {
-    if let Some(resp) = reject_invalid_repo_ids(&owner, &repo) {
-        return resp;
-    }
-    let repo_id = RepoId::github(format!("{owner}/{repo}"));
-    let provider = state.provider_registry.default_provider().clone();
-    repo_status_inner(repo_id, provider, query, state).await
 }
 
 fn manifest_chunk_refs(manifest: &ClonepackManifest) -> Vec<&ChunkRef> {
@@ -2082,20 +2027,6 @@ async fn sync_repo_inner(
     }
 }
 
-async fn sync_repo(
-    Path((owner, repo)): Path<(String, String)>,
-    Query(params): Query<SyncRequest>,
-    headers: HeaderMap,
-    State(state): State<ServerState>,
-) -> impl IntoResponse {
-    if let Some(resp) = reject_invalid_repo_ids(&owner, &repo) {
-        return resp;
-    }
-    let repo_id = RepoId::github(format!("{owner}/{repo}"));
-    let provider = state.provider_registry.default_provider().clone();
-    sync_repo_inner(repo_id, provider, params, headers, state).await
-}
-
 async fn build_handler(
     headers: HeaderMap,
     State(state): State<ServerState>,
@@ -2255,19 +2186,6 @@ async fn cat_file_inner(
     }
 }
 
-async fn cat_file(
-    Path((owner, repo)): Path<(String, String)>,
-    Query(query): Query<CatRequest>,
-    State(state): State<ServerState>,
-) -> impl IntoResponse {
-    if let Some(resp) = reject_invalid_repo_ids(&owner, &repo) {
-        return resp;
-    }
-    let repo_id = RepoId::github(format!("{owner}/{repo}"));
-    let provider = state.provider_registry.default_provider().clone();
-    cat_file_inner(repo_id, provider, query, state).await
-}
-
 async fn file_sizes_inner(
     repo_id: RepoId,
     _provider: ProviderInstance,
@@ -2305,19 +2223,6 @@ async fn file_sizes_inner(
         )
             .into_response(),
     }
-}
-
-async fn file_sizes(
-    Path((owner, repo)): Path<(String, String)>,
-    Query(query): Query<SizesRequest>,
-    State(state): State<ServerState>,
-) -> impl IntoResponse {
-    if let Some(resp) = reject_invalid_repo_ids(&owner, &repo) {
-        return resp;
-    }
-    let repo_id = RepoId::github(format!("{owner}/{repo}"));
-    let provider = state.provider_registry.default_provider().clone();
-    file_sizes_inner(repo_id, provider, query, state).await
 }
 
 async fn create_snapshot_inner(
@@ -2421,20 +2326,6 @@ async fn create_snapshot_inner(
     }
 }
 
-async fn create_snapshot(
-    Path((owner, repo)): Path<(String, String)>,
-    Query(query): Query<SnapshotRequest>,
-    headers: HeaderMap,
-    State(state): State<ServerState>,
-) -> impl IntoResponse {
-    if let Some(resp) = reject_invalid_repo_ids(&owner, &repo) {
-        return resp;
-    }
-    let repo_id = RepoId::github(format!("{owner}/{repo}"));
-    let provider = state.provider_registry.default_provider().clone();
-    create_snapshot_inner(repo_id, provider, query, headers, state).await
-}
-
 async fn get_hotfiles_inner(
     repo_id: RepoId,
     _provider: ProviderInstance,
@@ -2470,19 +2361,6 @@ async fn get_hotfiles_inner(
         )
             .into_response(),
     }
-}
-
-async fn get_hotfiles(
-    Path((owner, repo)): Path<(String, String)>,
-    Query(query): Query<HotfilesRequest>,
-    State(state): State<ServerState>,
-) -> impl IntoResponse {
-    if let Some(resp) = reject_invalid_repo_ids(&owner, &repo) {
-        return resp;
-    }
-    let repo_id = RepoId::github(format!("{owner}/{repo}"));
-    let provider = state.provider_registry.default_provider().clone();
-    get_hotfiles_inner(repo_id, provider, query, state).await
 }
 
 async fn batch_files_inner(
@@ -2545,19 +2423,6 @@ async fn batch_files_inner(
         )
             .into_response(),
     }
-}
-
-async fn batch_files(
-    Path((owner, repo)): Path<(String, String)>,
-    State(state): State<ServerState>,
-    Json(body): Json<BatchRequest>,
-) -> impl IntoResponse {
-    if let Some(resp) = reject_invalid_repo_ids(&owner, &repo) {
-        return resp;
-    }
-    let repo_id = RepoId::github(format!("{owner}/{repo}"));
-    let provider = state.provider_registry.default_provider().clone();
-    batch_files_inner(repo_id, provider, body, state).await
 }
 
 fn validate_artifact_hash(hash: &str) -> Option<Response> {

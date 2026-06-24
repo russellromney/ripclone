@@ -116,11 +116,13 @@ impl ProviderInstance {
     /// Phase 0 back-compat: the github default instance renders
     /// `https://github.com/{owner}/{repo}.git`.
     pub fn clone_url(&self, path: &str) -> String {
-        format!(
-            "https://{}/{}.git",
-            self.host.trim_end_matches('/'),
-            path.trim_start_matches('/')
-        )
+        let host = self.host.trim_end_matches('/');
+        let path = path.trim_start_matches('/');
+        if host.starts_with("http://") || host.starts_with("https://") {
+            format!("{}/{}.git", host, path)
+        } else {
+            format!("https://{}/{}.git", host, path)
+        }
     }
 
     /// Build the `Authorization` (or other) header for the given token.
@@ -683,6 +685,20 @@ mod tests {
         assert_eq!(
             github.clone_url("owner/repo"),
             "https://github.com/owner/repo.git"
+        );
+    }
+
+    #[test]
+    fn generic_clone_url_preserves_http_scheme() {
+        let generic = ProviderInstance {
+            id: ProviderInstanceId::new("local"),
+            kind: ProviderKind::Generic,
+            host: "http://127.0.0.1:8080".to_string(),
+            auth_template: Some("token {token}".to_string()),
+        };
+        assert_eq!(
+            generic.clone_url("acme/http"),
+            "http://127.0.0.1:8080/acme/http.git"
         );
     }
 
