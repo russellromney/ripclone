@@ -785,13 +785,14 @@ pub fn pack_objects_to_prefix_gix<P: AsRef<Path>, Q: AsRef<Path>>(
     }
 
     let repo = crate::gix_util::open_repo(repo)?;
-    let mut ids: Vec<gix::hash::ObjectId> = object_shas
+    let ids: HashSet<gix::hash::ObjectId> = object_shas
         .iter()
         .map(|s| {
             gix::hash::ObjectId::from_hex(s.as_bytes())
                 .with_context(|| format!("invalid object id: {s}"))
         })
         .collect::<Result<_>>()?;
+    let mut ids: Vec<_> = ids.into_iter().collect();
     ids.sort();
 
     let num_entries: u32 = ids.len().try_into().context("too many objects for pack")?;
@@ -1653,6 +1654,69 @@ mod tests {
         assert!(pack_objects_to_prefix_gix(repo, &bad, &prefix).is_err());
     }
 
+    /// gix pack encode deduplicates duplicate OIDs and rejects invalid hex.
+    #[test]
+    fn gix_pack_encode_dedup_and_invalid_hex() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        let _ = Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .arg(repo)
+            .output()
+            .unwrap();
+        for (key, val) in [("user.email", "t@t"), ("user.name", "t")] {
+            let _ = Command::new("git")
+                .args(["-C", repo.to_str().unwrap(), "config", key, val])
+                .output()
+                .unwrap();
+        }
+        std::fs::write(repo.join("a.txt"), "a\n").unwrap();
+        let _ = Command::new("git")
+            .args(["-C", repo.to_str().unwrap(), "add", "a.txt"])
+            .output()
+            .unwrap();
+        let _ = Command::new("git")
+            .args(["-C", repo.to_str().unwrap(), "commit", "-q", "-m", "c"])
+            .output()
+            .unwrap();
+        let out = Command::new("git")
+            .args([
+                "-C",
+                repo.to_str().unwrap(),
+                "rev-list",
+                "--objects",
+                "--no-object-names",
+                "HEAD",
+            ])
+            .output()
+            .unwrap();
+        let objects: Vec<String> = String::from_utf8(out.stdout)
+            .unwrap()
+            .lines()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(!objects.is_empty());
+        // Duplicate every OID.
+        let duplicated: Vec<String> = objects
+            .iter()
+            .cloned()
+            .chain(objects.iter().cloned())
+            .collect();
+
+        let out_dir = tempfile::tempdir().unwrap();
+        let prefix = out_dir.path().join("pack");
+        pack_objects_to_prefix_gix(repo, &duplicated, &prefix).unwrap();
+        let idx_file = std::fs::read_dir(out_dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.extension().and_then(|e| e.to_str()) == Some("idx"))
+            .unwrap();
+        let bundle = gix_pack::Bundle::at(&idx_file, gix::hash::Kind::Sha1).unwrap();
+        assert_eq!(bundle.index.num_objects() as usize, objects.len());
+
+        assert!(pack_objects_to_prefix_gix(repo, &["zzzz".to_string()], &prefix).is_err());
+    }
+
     /// gix index generation for an existing pack (Phase 3) produces an idx that
     /// git can use to read objects.
     #[test]
@@ -1888,5 +1952,138 @@ mod tests {
             .unwrap();
         assert_eq!(a.stat.size, 42);
         assert_eq!(b.stat.size, 9); // untouched
+    }
+
+    /// Basic metadata queries via gix (Phase 1).
+    #[test]
+    fn gix_basic_metadata_queries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        let _ = Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .arg(repo)
+            .output()
+            .unwrap();
+        for (key, val) in [("user.email", "t@t"), ("user.name", "t")] {
+            let _ = Command::new("git")
+                .args(["-C", repo.to_str().unwrap(), "config", key, val])
+                .output()
+                .unwrap();
+        }
+        std::fs::write(repo.join("a.txt"), "a\n").unwrap();
+        let _ = Command::new("git")
+            .args(["-C", repo.to_str().unwrap(), "add", "a.txt"])
+            .output()
+            .unwrap();
+        let _ = Command::new("git")
+            .args(["-C", repo.to_str().unwrap(), "commit", "-q", "-m", "c1"])
+            .output()
+            .unwrap();
+
+        assert_eq!(default_branch(repo).unwrap(), "main");
+
+        let commit = resolve_commit(repo, "HEAD").unwrap();
+        assert_eq!(resolve_commit(repo, "main").unwrap(), commit);
+
+        assert_eq!(parent_commit(repo, &commit).unwrap(), None);
+
+        let commits = last_commits(repo, "main", 1).unwrap();
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0], commit);
+
+        let empty = last_commits(repo, "main", 0).unwrap();
+        assert!(empty.is_empty());
+
+        // ls-tree entry and symlink detection.
+        let entry = ls_tree_entry(repo, "HEAD", "a.txt").unwrap();
+        assert!(entry.is_some(), "ls_tree_entry should find a.txt");
+        let (mode, sha) = entry.unwrap();
+        assert_eq!(mode, "100644");
+        assert!(!sha.is_empty());
+
+        let missing = ls_tree_entry(repo, "HEAD", "does-not-exist.txt").unwrap();
+        assert!(missing.is_none());
+
+        let symlinks = symlink_blob_shas(repo, "HEAD").unwrap();
+        assert!(symlinks.is_empty());
+
+        let oids = list_object_shas(repo, &commit).unwrap();
+        assert!(!oids.is_empty());
+    }
+
+    /// Negative cases for gix metadata queries (Phase 1).
+    #[test]
+    fn gix_metadata_negative_cases() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        let _ = Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .arg(repo)
+            .output()
+            .unwrap();
+
+        assert!(resolve_commit(repo, "not-a-real-ref").is_err());
+        assert!(resolve_commit(repo, "HEAD").is_err()); // no commits yet
+        assert!(last_commits(repo, "main", 1).is_err());
+        assert!(ls_tree_entry(repo, "HEAD", "x").is_err());
+
+        let not_repo = tempfile::tempdir().unwrap();
+        assert!(crate::gix_util::open_repo(not_repo.path()).is_err());
+    }
+
+    /// A commit chain: parent_commit and last_commits order (Phase 1).
+    #[test]
+    fn gix_commit_chain_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        let _ = Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .arg(repo)
+            .output()
+            .unwrap();
+        for (key, val) in [("user.email", "t@t"), ("user.name", "t")] {
+            let _ = Command::new("git")
+                .args(["-C", repo.to_str().unwrap(), "config", key, val])
+                .output()
+                .unwrap();
+        }
+        let mut shas = Vec::new();
+        for i in 0..3 {
+            std::fs::write(repo.join("f.txt"), format!("{i}\n")).unwrap();
+            let _ = Command::new("git")
+                .args(["-C", repo.to_str().unwrap(), "add", "f.txt"])
+                .output()
+                .unwrap();
+            let out = Command::new("git")
+                .args([
+                    "-C",
+                    repo.to_str().unwrap(),
+                    "commit",
+                    "-q",
+                    "-m",
+                    &format!("c{i}"),
+                ])
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+            let out = Command::new("git")
+                .args(["-C", repo.to_str().unwrap(), "rev-parse", "HEAD"])
+                .output()
+                .unwrap();
+            shas.push(String::from_utf8(out.stdout).unwrap().trim().to_string());
+        }
+
+        assert_eq!(
+            parent_commit(repo, &shas[2]).unwrap().as_deref(),
+            Some(shas[1].as_str())
+        );
+        assert_eq!(parent_commit(repo, &shas[0]).unwrap(), None);
+
+        let last = last_commits(repo, "main", 2).unwrap();
+        assert_eq!(last, vec![shas[2].clone(), shas[1].clone()]);
+
+        let range = list_object_shas_in_range(repo, Some(shas[1].as_str()), &shas[2]).unwrap();
+        assert!(!range.is_empty());
+        assert!(range.contains(&shas[2]));
     }
 }

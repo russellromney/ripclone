@@ -2330,6 +2330,44 @@ mod tests {
         );
     }
 
+    /// Negative: content that does not match the recorded blob_sha1 must fail.
+    #[test]
+    fn rejects_blob_sha1_mismatch() {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("out");
+        std::fs::create_dir(&target).unwrap();
+
+        let mut manifest = empty_manifest();
+        manifest.files.push(FileEntry {
+            path: b"x.txt".to_vec(),
+            mode: 0o100644,
+            blob_sha1: sha1_bytes(b"not-the-frame-content").to_vec(),
+            fragments: vec![Fragment {
+                frame_index: 0,
+                frame_offset: 0,
+                raw_len: 3,
+            }],
+        });
+        manifest.frames.push(FrameInfo {
+            chunk_index: 0,
+            chunk_offset: 0,
+            compressed_len: 3,
+            raw_len: 3,
+        });
+
+        assert!(extract_manifest(&manifest, &target, vec![vec![b'y'; 3]]).is_err());
+    }
+
+    /// Negative: materializing from an invalid commit SHA must fail cleanly.
+    #[test]
+    fn materialize_from_invalid_commit_errors() {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("out");
+        std::fs::create_dir(&target).unwrap();
+        init_git_dir(&target);
+        assert!(materialize_worktree_from_pack(&target, "not-a-sha").is_err());
+    }
+
     #[test]
     fn archive_extract_builds_blob_pack() {
         let tmp = TempDir::new().unwrap();

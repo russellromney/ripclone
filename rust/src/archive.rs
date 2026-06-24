@@ -1693,6 +1693,38 @@ mod tests {
         }
     }
 
+    /// An empty tree must produce an empty manifest and zero chunks.
+    #[test]
+    fn archive_empty_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init_bare(tmp.path()).unwrap();
+        let sig = git2::Signature::now("test", "test@example.com").unwrap();
+        let tree = repo.treebuilder(None).unwrap().write().unwrap();
+        let tree = repo.find_tree(tree).unwrap();
+        let commit = repo
+            .commit(Some("HEAD"), &sig, &sig, "empty", &tree, &[])
+            .unwrap()
+            .to_string();
+
+        let builder = ArchiveBuilder::new(tmp.path());
+        let manifest = builder.build_files_table(&commit).unwrap();
+        assert!(manifest.files.is_empty());
+        let (metadata, chunks, stats) = builder
+            .build_chunks(&commit, 1, None, DEFAULT_ARCHIVE_CHUNK_SIZE)
+            .unwrap();
+        assert!(chunks.is_empty());
+        assert_eq!(stats.raw_bytes, 0);
+        assert!(metadata.files.is_empty());
+    }
+
+    /// Negative: building from a missing mirror must error cleanly.
+    #[test]
+    fn archive_missing_mirror_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let builder = ArchiveBuilder::new(tmp.path().join("does-not-exist"));
+        assert!(builder.build_files_table("HEAD").is_err());
+    }
+
     /// Round-trip across multiple frames: content larger than FRAME_MAX is split
     /// into several frames, compressed in parallel, then must extract byte-exact.
     /// Guards the parallel-compression + chunk-assembly refactor.
