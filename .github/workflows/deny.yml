@@ -1,0 +1,25 @@
+name: supply-chain
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly, so a newly-published advisory against an unchanged dependency still
+    # gets caught even when nothing in the repo changed.
+    - cron: "0 6 * * 1"
+
+concurrency:
+  group: deny-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cargo-deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          manifest-path: rust/Cargo.toml
+          # Licenses are intentionally not enforced yet (see rust/deny.toml).
+          command: check advisories bans sources
