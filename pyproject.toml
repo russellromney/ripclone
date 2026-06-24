@@ -1,0 +1,22 @@
+# Packages the ripclone CLI as a PyPI wheel via maturin (binary distribution,
+# not a Python extension). `pip install ripclone` then puts the binaries on PATH.
+# The Rust crate lives in rust/; maturin reads its version.
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "ripclone"
+description = "CAS-based git clone helper: fast clones served by a content-addressed backend"
+requires-python = ">=3.8"
+license = "MIT OR Apache-2.0"
+license-files = ["LICENSE-MIT", "LICENSE-APACHE"]
+readme = "README.md"
+dynamic = ["version"]
+
+[project.urls]
+Repository = "https://github.com/russellromney/ripclone"
+
+[tool.maturin]
+manifest-path = "rust/Cargo.toml"
+bindings = "bin"
