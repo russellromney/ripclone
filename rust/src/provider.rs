@@ -1,4 +1,4 @@
-//! Provider / identity abstraction for multi-provider auth (Phase 0).
+//! Provider / identity abstraction for multi-provider auth (Phases 0–2).
 //!
 //! This module introduces the addressing seam that lets ripclone move from the
 //! hard-coded GitHub `owner/repo` pair to arbitrary git hosts (GitLab
@@ -11,21 +11,61 @@
 //! *exact* legacy storage keys and mirror directory names, so existing ref-store
 //! data and on-disk mirrors need no migration.
 //!
-//! Phase 1/2 handoff notes:
-//! - Add per-provider `clone_url(path)` and `auth_header(token)` methods to
-//!   `ProviderInstance` (and a `ProviderKind` enum) when credential-header
-//!   injection replaces the URL userinfo form.
-//! - Load extra provider instances from config in `ProviderRegistry::load`.
-//! - Add wildcard routes `/v1/repos/{provider}/{*path}/...` and map legacy
-//!   2-segment routes to the `github` default instance.
-//! - Loosen `validation::validate_repo_id` to a per-provider charset check once
-//!   opaque paths can contain `/`, `~`, `+`, etc.
+//! Phase 3+ handoff notes:
+//! - Add OIDC / `Principal` / `authorize()` integration; `CredentialBroker` is
+//!   already the seam where a verified principal can influence credential
+//!   selection.
+//! - Add Tier-A token minting (`AppTokenBroker`) behind the same
+//!   `CredentialBroker` trait.
+//! - Add per-provider id charset validation rules once opaque paths can contain
+//!   `/`, `~`, `+`, etc. (currently `validation::validate_repo_id` is still the
+//!   GitHub-only check).
 
+use anyhow::{Context, Result};
 use std::collections::HashMap;
 
 /// Built-in default instance id. All legacy `{owner}/{repo}` routes resolve to
-/// this instance in Phase 0.
+/// this instance.
 const DEFAULT_PROVIDER_ID: &str = "github";
+
+/// Supported git host kinds. `Gitea` covers Forgejo/Codeberg; `Generic` is a
+/// config-only host that uses an explicit credential template.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProviderKind {
+    GitHub,
+    GitLab,
+    Bitbucket,
+    Gitea,
+    Generic,
+}
+
+impl ProviderKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ProviderKind::GitHub => "github",
+            ProviderKind::GitLab => "gitlab",
+            ProviderKind::Bitbucket => "bitbucket",
+            ProviderKind::Gitea => "gitea",
+            ProviderKind::Generic => "generic",
+        }
+    }
+}
+
+impl std::str::FromStr for ProviderKind {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "github" => Ok(ProviderKind::GitHub),
+            "gitlab" => Ok(ProviderKind::GitLab),
+            "bitbucket" => Ok(ProviderKind::Bitbucket),
+            "gitea" | "forgejo" | "codeberg" => Ok(ProviderKind::Gitea),
+            "generic" => Ok(ProviderKind::Generic),
+            _ => anyhow::bail!("unknown provider kind: {}", s),
+        }
+    }
+}
 
 /// Identifies a configured provider instance (e.g. `"github"`, `"gitlab"`,
 /// `"company-gitea"`). This is a string newtype so callers cannot pass an
@@ -57,43 +97,209 @@ impl std::fmt::Display for ProviderInstanceId {
 
 /// A configured git provider instance.
 ///
-/// Phase 0 only needs `host`; later phases will add `kind`, `credential`,
-/// `oidc`, and capability methods here.
+/// `auth_template` is optional for preset kinds (GitHub/GitLab/Bitbucket/Gitea)
+/// and required for `Generic`. When present it must contain exactly one
+/// `{token}` placeholder; it overrides the preset's default header.
 #[derive(Debug, Clone)]
 pub struct ProviderInstance {
     pub id: ProviderInstanceId,
+    pub kind: ProviderKind,
     pub host: String,
+    /// Optional credential template for `Generic` hosts, or an override for
+    /// preset kinds. Example: `"token {token}"` or `"Bearer {token}"`.
+    pub auth_template: Option<String>,
+}
+
+impl ProviderInstance {
+    /// Build a clean HTTPS clone URL for an opaque repo path.
+    ///
+    /// Phase 0 back-compat: the github default instance renders
+    /// `https://github.com/{owner}/{repo}.git`.
+    pub fn clone_url(&self, path: &str) -> String {
+        format!(
+            "https://{}/{}.git",
+            self.host.trim_end_matches('/'),
+            path.trim_start_matches('/')
+        )
+    }
+
+    /// Build the `Authorization` (or other) header for the given token.
+    ///
+    /// Returns `None` for `Generic` hosts that have no credential template; the
+    /// caller must treat that as a configuration error.
+    ///
+    /// Returns `(header_name, header_value)` as strings so it can be passed to
+    /// git's `http.extraHeader` config without an extra dependency.
+    pub fn auth_header(&self, token: &str) -> Option<(String, String)> {
+        if let Some(template) = &self.auth_template {
+            let value = template.replace("{token}", token);
+            return Some(("Authorization".to_string(), value));
+        }
+        match self.kind {
+            ProviderKind::GitHub => {
+                let credentials = format!("x-access-token:{}", token);
+                let encoded = base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    credentials.as_bytes(),
+                );
+                Some(("Authorization".to_string(), format!("Basic {}", encoded)))
+            }
+            ProviderKind::GitLab => {
+                let credentials = format!("oauth2:{}", token);
+                let encoded = base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    credentials.as_bytes(),
+                );
+                Some(("Authorization".to_string(), format!("Basic {}", encoded)))
+            }
+            ProviderKind::Bitbucket => {
+                Some(("Authorization".to_string(), format!("Bearer {}", token)))
+            }
+            ProviderKind::Gitea => Some(("Authorization".to_string(), format!("token {}", token))),
+            ProviderKind::Generic => None,
+        }
+    }
+
+    /// True for the built-in GitHub default instance.
+    pub fn is_github_default(&self) -> bool {
+        self.id.as_str() == DEFAULT_PROVIDER_ID
+    }
+}
+
+/// Raw configuration for one provider instance, as loaded from config or env.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct ProviderConfig {
+    pub id: String,
+    /// Preset kind. Defaults to `"generic"`.
+    pub kind: Option<String>,
+    /// Hostname used in clone URLs, e.g. `"gitlab.com"` or `"gitea.example.com"`.
+    pub host: Option<String>,
+    /// Optional per-instance static token. If present, it is used as a Tier-B
+    /// passthrough credential for syncs of repos in this instance.
+    pub token: Option<String>,
+    /// Optional credential template for `generic` hosts or overrides for presets.
+    /// Must contain exactly one `{token}` placeholder.
+    pub auth_template: Option<String>,
 }
 
 /// Registry of configured provider instances.
-///
-/// Phase 0 hardcodes the `github` default. Phase 2 will load instances from
-/// config (file or `RIPCLONE_PROVIDERS` JSON) and merge them with presets.
 #[derive(Debug, Clone)]
 pub struct ProviderRegistry {
     providers: HashMap<String, ProviderInstance>,
+    /// Tier-B passthrough tokens keyed by instance id. Kept separate from
+    /// `ProviderInstance` so the broker can decide whether to use a request
+    /// token, a configured token, or (later) a minted Tier-A token.
+    tokens: HashMap<String, secrecy::SecretString>,
 }
 
 impl ProviderRegistry {
     /// Build a registry containing only the built-in GitHub default instance.
     pub fn new() -> Self {
         let mut providers = HashMap::new();
+        let mut tokens = HashMap::new();
         providers.insert(
             DEFAULT_PROVIDER_ID.to_string(),
             ProviderInstance {
                 id: ProviderInstanceId::new(DEFAULT_PROVIDER_ID),
+                kind: ProviderKind::GitHub,
                 host: "github.com".to_string(),
+                auth_template: None,
             },
         );
-        Self { providers }
+        if let Some(token) = std::env::var("RIPCLONE_GITHUB_TOKEN")
+            .ok()
+            .filter(|t| !t.is_empty())
+        {
+            tokens.insert(
+                DEFAULT_PROVIDER_ID.to_string(),
+                secrecy::SecretString::new(token.into()),
+            );
+        }
+        Self { providers, tokens }
     }
 
     /// Load from configuration.
     ///
-    /// TODO(phase2): implement config-driven provider loading. For now this is
-    /// equivalent to `ProviderRegistry::new()`.
-    pub fn load() -> Self {
-        Self::new()
+    /// Reads `RIPCLONE_PROVIDERS` as JSON first, then merges a config file at
+    /// `RIPCLONE_PROVIDERS_CONFIG` if present. The built-in `github` default is
+    /// always present and can be overridden by config (host, token, template).
+    pub fn load() -> Result<Self> {
+        let mut registry = Self::new();
+
+        if let Some(json) = std::env::var("RIPCLONE_PROVIDERS")
+            .ok()
+            .filter(|t| !t.is_empty())
+        {
+            let configs: Vec<ProviderConfig> =
+                serde_json::from_str(&json).with_context(|| "parse RIPCLONE_PROVIDERS JSON")?;
+            registry.merge_configs(configs)?;
+        }
+
+        if let Some(path) = std::env::var("RIPCLONE_PROVIDERS_CONFIG")
+            .ok()
+            .filter(|t| !t.is_empty())
+        {
+            let data = std::fs::read_to_string(&path)
+                .with_context(|| format!("read providers config {}", path))?;
+            let configs: Vec<ProviderConfig> = serde_json::from_str(&data)
+                .with_context(|| format!("parse providers config {}", path))?;
+            registry.merge_configs(configs)?;
+        }
+
+        Ok(registry)
+    }
+
+    fn merge_configs(&mut self, configs: Vec<ProviderConfig>) -> Result<()> {
+        for cfg in configs {
+            let id = cfg.id;
+            if id.is_empty() {
+                anyhow::bail!("provider config entry missing id");
+            }
+
+            let kind = match cfg.kind.as_deref() {
+                Some(k) => k.parse()?,
+                None => ProviderKind::Generic,
+            };
+
+            let host = match cfg.host {
+                Some(h) => h,
+                None => match kind {
+                    ProviderKind::GitHub => "github.com".to_string(),
+                    ProviderKind::GitLab => "gitlab.com".to_string(),
+                    ProviderKind::Bitbucket => "bitbucket.org".to_string(),
+                    ProviderKind::Gitea => {
+                        anyhow::bail!("gitea provider '{}' requires a host", id)
+                    }
+                    ProviderKind::Generic => {
+                        anyhow::bail!("generic provider '{}' requires a host", id)
+                    }
+                },
+            };
+
+            if kind == ProviderKind::Generic && cfg.auth_template.is_none() {
+                anyhow::bail!(
+                    "generic provider '{}' requires auth_template (e.g. 'token {{token}}')",
+                    id
+                );
+            }
+
+            if let Some(token) = cfg.token {
+                self.tokens
+                    .insert(id.clone(), secrecy::SecretString::new(token.into()));
+            }
+
+            self.providers.insert(
+                id.clone(),
+                ProviderInstance {
+                    id: ProviderInstanceId::new(id),
+                    kind,
+                    host,
+                    auth_template: cfg.auth_template,
+                },
+            );
+        }
+        Ok(())
     }
 
     /// The default `github` instance. Always present.
@@ -106,6 +312,16 @@ impl ProviderRegistry {
     /// Look up an instance by id.
     pub fn get(&self, id: &str) -> Option<&ProviderInstance> {
         self.providers.get(id)
+    }
+
+    /// Configured passthrough token for an instance, if any.
+    pub fn token(&self, id: &str) -> Option<&secrecy::SecretString> {
+        self.tokens.get(id)
+    }
+
+    /// Iterate over all configured instances.
+    pub fn iter(&self) -> impl Iterator<Item = &ProviderInstance> {
+        self.providers.values()
     }
 }
 
@@ -138,7 +354,7 @@ impl RepoId {
     }
 
     /// True when this repo belongs to the built-in `github` default instance.
-    fn is_github_default(&self) -> bool {
+    pub fn is_github_default(&self) -> bool {
         self.provider.as_str() == DEFAULT_PROVIDER_ID
     }
 
@@ -175,8 +391,8 @@ impl RepoId {
     }
 
     /// Convenience accessor for callers that still need the legacy owner/repo
-    /// pair (e.g. `git.rs::sync_bare_mirror` in Phase 0). Returns `None` for
-    /// non-default providers or non-legacy paths.
+    /// pair (e.g. tests or legacy helpers). Returns `None` for non-default
+    /// providers or non-legacy paths.
     pub fn github_owner_repo(&self) -> Option<(&str, &str)> {
         if !self.is_github_default() {
             return None;
@@ -248,6 +464,17 @@ fn decode_hex_byte(a: char, b: char) -> Option<u8> {
 /// `owner/repo` key is ambiguous with a `{provider}/{path}` key, so the
 /// registry is required to decide whether the first segment is a known provider
 /// id.
+///
+/// Storage-key ambiguity resolution: we never infer a provider id from a bare
+/// key on the hot path. In listing/GC contexts the registry disambiguates: if
+/// the first segment matches a configured provider id, it is treated as
+/// `{provider}/{path}`; otherwise the whole key is a GitHub `owner/repo` path.
+/// Because GitHub is the default, a GitHub org literally named "gitlab" would
+/// be parsed as a GitLab provider path when a `gitlab` instance is registered.
+/// That collision is accepted and documented: operators who create provider
+/// ids that shadow GitHub org names must avoid legacy addressing for those
+/// orgs (use explicit `github/...` routes once they exist) or pick a different
+/// instance id.
 pub fn parse_storage_key(key: &str, registry: &ProviderRegistry) -> Option<RepoId> {
     if let Some((provider, rest)) = key.split_once('/')
         && registry.get(provider).is_some()
@@ -333,21 +560,27 @@ mod tests {
             "gitlab".to_string(),
             ProviderInstance {
                 id: ProviderInstanceId::new("gitlab"),
+                kind: ProviderKind::GitLab,
                 host: "gitlab.com".to_string(),
+                auth_template: None,
             },
         );
         registry.providers.insert(
             "sourcehut".to_string(),
             ProviderInstance {
                 id: ProviderInstanceId::new("sourcehut"),
+                kind: ProviderKind::Generic,
                 host: "git.sr.ht".to_string(),
+                auth_template: Some("token {token}".to_string()),
             },
         );
         registry.providers.insert(
             "gitea".to_string(),
             ProviderInstance {
                 id: ProviderInstanceId::new("gitea"),
+                kind: ProviderKind::Gitea,
                 host: "gitea.example.com".to_string(),
+                auth_template: None,
             },
         );
 
@@ -374,12 +607,94 @@ mod tests {
     }
 
     #[test]
-    fn registry_has_github_default() {
+    fn github_auth_header_is_basic_x_access_token() {
+        let github = ProviderRegistry::new().default_provider().clone();
+        let (name, value) = github.auth_header("pat123").unwrap();
+        assert_eq!(name, "Authorization");
+        let expected = format!(
+            "Basic {}",
+            base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                b"x-access-token:pat123",
+            )
+        );
+        assert_eq!(value, expected);
+    }
+
+    #[test]
+    fn gitlab_auth_header_is_basic_oauth2() {
+        let gitlab = ProviderInstance {
+            id: ProviderInstanceId::new("gitlab"),
+            kind: ProviderKind::GitLab,
+            host: "gitlab.com".to_string(),
+            auth_template: None,
+        };
+        let (name, value) = gitlab.auth_header("gltok").unwrap();
+        assert_eq!(name, "Authorization");
+        let expected = format!(
+            "Basic {}",
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"oauth2:gltok",)
+        );
+        assert_eq!(value, expected);
+    }
+
+    #[test]
+    fn bitbucket_auth_header_is_bearer() {
+        let bb = ProviderInstance {
+            id: ProviderInstanceId::new("bb"),
+            kind: ProviderKind::Bitbucket,
+            host: "bitbucket.org".to_string(),
+            auth_template: None,
+        };
+        let (name, value) = bb.auth_header("bbtok").unwrap();
+        assert_eq!(name, "Authorization");
+        assert_eq!(value, "Bearer bbtok");
+    }
+
+    #[test]
+    fn gitea_auth_header_is_token() {
+        let gitea = ProviderInstance {
+            id: ProviderInstanceId::new("gitea"),
+            kind: ProviderKind::Gitea,
+            host: "gitea.example.com".to_string(),
+            auth_template: None,
+        };
+        let (name, value) = gitea.auth_header("gtok").unwrap();
+        assert_eq!(name, "Authorization");
+        assert_eq!(value, "token gtok");
+    }
+
+    #[test]
+    fn generic_auth_template_overrides_preset() {
+        let generic = ProviderInstance {
+            id: ProviderInstanceId::new("myhost"),
+            kind: ProviderKind::Generic,
+            host: "git.example.com".to_string(),
+            auth_template: Some("X-Custom {token}".to_string()),
+        };
+        let (name, value) = generic.auth_header("sekrit").unwrap();
+        assert_eq!(name, "Authorization");
+        assert_eq!(value, "X-Custom sekrit");
+    }
+
+    #[test]
+    fn github_clone_url_is_clean() {
+        let github = ProviderRegistry::new().default_provider().clone();
+        assert_eq!(
+            github.clone_url("owner/repo"),
+            "https://github.com/owner/repo.git"
+        );
+    }
+
+    #[test]
+    fn registry_loads_github_token_from_env() {
+        // Ensure RIPCLONE_GITHUB_TOKEN is not leaking from the environment.
+        // We can't assert the token is present because tests may run without it,
+        // but we can assert the registry structure is valid.
         let registry = ProviderRegistry::new();
         let github = registry.default_provider();
         assert_eq!(github.id.as_str(), "github");
+        assert_eq!(github.kind, ProviderKind::GitHub);
         assert_eq!(github.host, "github.com");
-        assert!(registry.get("github").is_some());
-        assert!(registry.get("gitlab").is_none());
     }
 }

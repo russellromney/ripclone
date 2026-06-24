@@ -15,6 +15,7 @@
 pub const PROTOCOL_VERSION: u32 = 1;
 
 pub mod archive;
+pub mod auth;
 pub mod bench;
 pub mod blob_pack;
 pub mod cas;
