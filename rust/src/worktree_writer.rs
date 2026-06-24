@@ -2552,7 +2552,7 @@ mod tests {
         let writer = match WorktreeWriter::io_uring() {
             Ok(writer) => writer,
             Err(e) => {
-                eprintln!("skipping io_uring smoke test: {e:#}");
+                eprintln!("skipping io_uring test: {e:#}");
                 return;
             }
         };
@@ -2586,7 +2586,7 @@ mod tests {
         let writer = match WorktreeWriter::io_uring() {
             Ok(writer) => std::sync::Arc::new(writer),
             Err(e) => {
-                eprintln!("skipping io_uring parallel smoke test: {e:#}");
+                eprintln!("skipping io_uring parallel test: {e:#}");
                 return;
             }
         };
@@ -2631,7 +2631,7 @@ mod tests {
         let writer = match WorktreeWriter::io_uring() {
             Ok(writer) => writer,
             Err(e) => {
-                eprintln!("skipping io_uring deferred smoke test: {e:#}");
+                eprintln!("skipping io_uring deferred test: {e:#}");
                 return;
             }
         };
