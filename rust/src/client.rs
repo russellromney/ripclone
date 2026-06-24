@@ -428,8 +428,8 @@ fn default_cache_dir() -> Option<PathBuf> {
 }
 
 impl Client {
-    pub async fn resolve_ref(&self, owner: &str, repo: &str, branch: &str) -> Result<RefResponse> {
-        self.resolve_ref_with_clonepack(&format!("{owner}/{repo}"), branch, None, None)
+    pub async fn resolve_ref(&self, repo_path: &str, branch: &str) -> Result<RefResponse> {
+        self.resolve_ref_with_clonepack(repo_path, branch, None, None)
             .await
     }
 
@@ -2301,7 +2301,7 @@ impl Client {
             target.display()
         );
 
-        let info = self.resolve_ref(owner, repo, branch).await?;
+        let info = self.resolve_ref(&format!("{owner}/{repo}"), branch).await?;
         info!("resolved to commit {}", &info.commit[..7]);
 
         if target.exists() {

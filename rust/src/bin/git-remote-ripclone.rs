@@ -24,7 +24,7 @@ async fn main() -> Result<()> {
     let _remote_name = &args[1];
     let url = &args[2];
 
-    let (owner, repo, requested_branch) = parse_url(url)?;
+    let (provider, repo_path, requested_branch) = parse_url(url)?;
     let server_url =
         env::var("RIPCLONE_URL").context("RIPCLONE_URL environment variable is required")?;
     let token_hash = env::var("RIPCLONE_TOKEN_HASH")
@@ -37,7 +37,7 @@ async fn main() -> Result<()> {
                 .map(|t| format!("{:x}", Sha256::digest(t.as_bytes())))
         });
 
-    let client = Client::new_with_token(server_url, token_hash);
+    let client = Client::new_with_token(server_url, token_hash).with_provider(&provider);
 
     let (git_dir, work_tree) = git_dirs()?;
 
@@ -62,7 +62,7 @@ async fn main() -> Result<()> {
                 } else {
                     &requested_branch
                 };
-                let info = client.resolve_ref(&owner, &repo, branch).await?;
+                let info = client.resolve_ref(&repo_path, branch).await?;
                 let branch_name = effective_branch(branch, &info.default_branch);
                 stdout
                     .write_all(format!("{} refs/heads/{}\n", info.commit, branch_name).as_bytes())
@@ -101,7 +101,7 @@ async fn main() -> Result<()> {
                 };
                 let info = match resolved {
                     Some(ref info) => info.clone(),
-                    None => client.resolve_ref(&owner, &repo, branch).await?,
+                    None => client.resolve_ref(&repo_path, branch).await?,
                 };
 
                 client
@@ -184,20 +184,21 @@ fn parse_url(url: &str) -> Result<(String, String, String)> {
     if parsed.scheme() != "ripclone" {
         anyhow::bail!("unsupported scheme: {}", parsed.scheme());
     }
-    let owner = parsed
+    // Provider-aware URL: ripclone://<provider>/<repo-path>[.git][#branch]
+    let provider = parsed
         .host_str()
-        .context("missing owner in ripclone URL")?
+        .context("missing provider in ripclone URL")?
         .to_string();
     let path = parsed.path();
-    let repo = {
+    let repo_path = {
         let p = path.strip_prefix('/').unwrap_or(path);
         p.strip_suffix(".git").unwrap_or(p).to_string()
     };
-    if owner.is_empty() || repo.is_empty() {
+    if provider.is_empty() || repo_path.is_empty() {
         anyhow::bail!("invalid ripclone URL: {}", url);
     }
     let branch = parsed.fragment().unwrap_or("").to_string();
-    Ok((owner, repo, branch))
+    Ok((provider, repo_path, branch))
 }
 
 fn git_dirs() -> Result<(PathBuf, PathBuf)> {
