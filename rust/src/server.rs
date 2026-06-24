@@ -428,6 +428,7 @@ pub fn build_app(state: ServerState) -> Router {
             state.clone(),
             auth_middleware,
         ))
+        .route_layer(middleware::from_fn(protocol_guard))
         .with_state(state.clone());
 
     let rate_limited = Router::new()
@@ -453,6 +454,36 @@ pub fn build_app(state: ServerState) -> Router {
 /// `git-upload-pack` body and any other large POST payload.
 const MAX_REQUEST_BODY_BYTES: usize = 256 * 1024 * 1024;
 const MAX_UPLOAD_PACK_BODY_BYTES: usize = 256 * 1024 * 1024;
+
+/// Reject a client whose wire protocol is newer than this server understands,
+/// with a clear 426 instead of a confusing downstream error. A missing header
+/// (a legacy client) or an older/equal protocol is allowed, so this never breaks
+/// existing clients. Compatibility is keyed on `PROTOCOL_VERSION`, not the build
+/// version.
+async fn protocol_guard(
+    headers: HeaderMap,
+    request: axum::http::Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    if let Some(client_proto) = headers
+        .get("x-ripclone-protocol")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        && client_proto > crate::PROTOCOL_VERSION
+    {
+        return (
+            StatusCode::UPGRADE_REQUIRED,
+            Json(ErrorResponse {
+                error: format!(
+                    "client protocol {client_proto} is newer than this server's {}; upgrade the server (or use an older ripclone)",
+                    crate::PROTOCOL_VERSION
+                ),
+            }),
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
 
 async fn auth_middleware(
     State(state): State<ServerState>,
@@ -4317,6 +4348,45 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(v["protocol"], crate::PROTOCOL_VERSION);
+    }
+
+    fn protocol_request(uri: &str, protocol: Option<&str>) -> axum::http::Request<Body> {
+        let mut b = axum::http::Request::builder()
+            .method("GET")
+            .uri(uri)
+            .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))))
+            .header("Authorization", auth_header());
+        if let Some(p) = protocol {
+            b = b.header("x-ripclone-protocol", p);
+        }
+        b.body(Body::empty()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn protocol_guard_rejects_newer_client_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(&tmp);
+        let app = build_app(state);
+        // A client advertising a newer protocol than the server -> 426.
+        let too_new = app
+            .clone()
+            .oneshot(protocol_request(
+                "/v1/repos/acme/secret/status",
+                Some("999"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(too_new.status(), StatusCode::UPGRADE_REQUIRED);
+        // The current protocol, and a missing header (legacy client), are allowed.
+        let current = crate::PROTOCOL_VERSION.to_string();
+        for proto in [Some(current.as_str()), None] {
+            let resp = app
+                .clone()
+                .oneshot(protocol_request("/v1/repos/acme/secret/status", proto))
+                .await
+                .unwrap();
+            assert_ne!(resp.status(), StatusCode::UPGRADE_REQUIRED);
+        }
     }
 
     #[tokio::test]

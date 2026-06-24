@@ -343,6 +343,12 @@ impl Client {
                 headers.insert(reqwest::header::AUTHORIZATION, header_value);
             }
         }
+        // Advertise the wire protocol so the server can reject an incompatible
+        // (too-new) client with an actionable error instead of a confusing 4xx.
+        if let Ok(pv) = reqwest::header::HeaderValue::from_str(&crate::PROTOCOL_VERSION.to_string())
+        {
+            headers.insert("x-ripclone-protocol", pv);
+        }
         let http = build_http_client(headers);
         let cache = cache_dir.and_then(|dir| Cas::new(dir).ok());
         Self {
