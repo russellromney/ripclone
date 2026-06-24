@@ -94,7 +94,8 @@ cd rust
 cargo build --release
 
 # Start the server locally
-./target/release/ripclone-server \
+RIPCLONE_TOKEN=your-ripclone-admin-token \
+  ./target/release/ripclone-server \
   --cas-dir ./data/cache \
   --repo-root ./data/repos \
   --storage-dir ./data/storage \
@@ -106,13 +107,13 @@ The default mirror depth is 50 commits. Increase it if you need to serve older c
 Build artifacts for a commit:
 
 ```bash
-cargo run --release --bin ripclone -- build oven-sh/bun --commit abc123
+cargo run --release --bin ripclone -- build github/oven-sh/bun --commit abc123
 ```
 
 Clone it:
 
 ```bash
-cargo run --release --bin ripclone -- clone oven-sh/bun --dir bun
+cargo run --release --bin ripclone -- clone github/oven-sh/bun --dir bun
 ```
 
 Add a fast worktree (Linux, reuses local objects and overlay staging):
@@ -137,37 +138,68 @@ jobs:
         run: |
           curl -fsSL -X POST \
             -H "Authorization: Ripclone ${{ secrets.RIPCLONE_TOKEN }}" \
-            "${{ vars.RIPCLONE_URL }}/v1/repos/${{ github.repository_owner }}/${{ github.event.repository.name }}/sync"
+            "${{ vars.RIPCLONE_URL }}/v1/repos/github/${{ github.repository_owner }}/${{ github.event.repository.name }}/sync"
 ```
 
-For private repos the ripclone server also needs a GitHub token with read access; set `RIPCLONE_GITHUB_TOKEN` on the server.
+For private repos the ripclone server also needs a GitHub token with read access; set `RIPCLONE_GITHUB_TOKEN` on the server, or pass the token per-request in the `X-Upstream-Token` header.
 
 ripclone validates the `RIPCLONE_TOKEN`, syncs the mirror, builds artifacts for the new HEAD, and returns the artifact hashes.
 
 ## CLI usage
 
 ```bash
-# Clone a repo (public or private)
-ripclone clone owner/repo
-ripclone clone owner/repo --branch feat/x --dir ./my-dir
+# Clone a repo (public or private) from the built-in github provider
+ripclone clone github/owner/repo
+ripclone clone github/owner/repo --branch feat/x --dir ./my-dir
+
+# Clone from a different provider instance
+ripclone --provider gitlab --token $GITLAB_TOKEN clone mygroup/subgroup/project
 
 # Check for a newer ripclone release
 ripclone update
 
 # Build artifacts for a specific commit (server-side)
-ripclone build owner/repo --commit abc123
+ripclone build github/owner/repo --commit abc123
 
 # Show resolved ref and artifact status
 ripclone status
 ```
 
-For private repos, pass a GitHub token:
+For private repos, pass an upstream credential token. This is sent to the ripclone server as `X-Upstream-Token`, and the server translates it to the provider's expected auth form (`Basic x-access-token:...` for GitHub, `Basic oauth2:...` for GitLab, `token ...` for Gitea, etc.):
 
 ```bash
-GITHUB_TOKEN=ghp_xxx ripclone clone my-org/private-repo
+# GitHub
+ripclone --token ghp_xxx clone github/my-org/private-repo
+
+# GitLab
+ripclone --provider gitlab --token glpat-xxx clone mygroup/subgroup/project
 ```
 
-Pushes go to GitHub directly, not through ripclone.
+Pushes go to the upstream host directly, not through ripclone.
+
+## Multi-provider configuration
+
+By default ripclone only knows about the built-in `github` instance. To mirror repos from GitLab, Gitea/Forgejo/Codeberg, Bitbucket, or a self-hosted host, register provider instances via the `RIPCLONE_PROVIDERS` environment variable or `RIPCLONE_PROVIDERS_CONFIG` JSON file:
+
+```bash
+export RIPCLONE_PROVIDERS='[
+  {"id":"gitlab","kind":"gitlab","host":"gitlab.com"},
+  {"id":"company-gitea","kind":"gitea","host":"git.example.com","token":"gitea-token"}
+]'
+```
+
+Supported `kind` values: `github`, `gitlab`, `bitbucket`, `gitea`, `generic`. Generic hosts require an `auth_template` (e.g. `"token {token}"`) so ripclone knows how to build the `Authorization` header.
+
+Once configured, address repos as `/v1/repos/<instance-id>/<repo-path>/...`:
+
+```bash
+curl -fsSL -X POST \
+  -H "Authorization: Ripclone $RIPCLONE_TOKEN_HASH" \
+  -H "X-Upstream-Token: $GITLAB_TOKEN" \
+  "http://localhost:8080/v1/repos/gitlab/mygroup/subgroup/project/sync?branch=main"
+```
+
+The server stores credentials via `git -c http.extraHeader="Authorization: ..."` so the token never appears in the clone URL.
 
 ## Architecture
 
