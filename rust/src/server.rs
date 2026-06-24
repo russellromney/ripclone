@@ -264,52 +264,44 @@ fn default_branch_value() -> String {
 /// Resolve a `{*rest}` path segment from `/v1/repos/{*rest}/...` into a
 /// `(RepoId, ProviderInstance)` pair.
 ///
-/// - If `rest` has exactly one slash and the first segment is NOT a registered
-///   provider id, treat it as the legacy GitHub `owner/repo` form.
-/// - Otherwise, the first segment is the provider id and the remainder is the
-///   opaque repo path.
-///
-/// This preserves backward compatibility for all existing 2-segment GitHub
-/// URLs. The documented collision is that a GitHub org whose name equals a
-/// registered provider id will be parsed as that provider; operators who hit
-/// this can avoid it by not shadowing provider ids.
+/// The first path segment MUST be a registered provider instance id; the
+/// remainder is the opaque repo path. There is no legacy fallback: callers
+/// must address repos as `/v1/repos/{provider}/{path}/...`, even for the
+/// built-in `github` default instance.
 fn resolve_repo_id<'a>(
     registry: &'a ProviderRegistry,
     rest: &str,
-) -> (RepoId, &'a ProviderInstance) {
+) -> Option<(RepoId, &'a ProviderInstance)> {
     let segments: Vec<&str> = rest.split('/').collect();
-    if segments.len() == 2 {
-        let potential_provider = segments[0];
-        if let Some(provider) = registry.get(potential_provider) {
-            let repo_id = RepoId {
-                provider: provider.id.clone(),
-                path: segments[1].to_string(),
-            };
-            return (repo_id, provider);
-        }
-        return (RepoId::github(rest), registry.default_provider());
-    }
-    if segments.is_empty() {
-        // Degenerate case; fall back to github default with empty path so
-        // downstream validation produces a clear error.
-        return (RepoId::github(rest), registry.default_provider());
+    if segments.len() < 2 {
+        return None;
     }
     let provider_id = segments[0];
     let path = segments[1..].join("/");
-    let provider = registry
-        .get(provider_id)
-        .unwrap_or_else(|| registry.default_provider());
-    let repo_id = RepoId {
-        provider: provider.id.clone(),
-        path,
-    };
-    (repo_id, provider)
+    let provider = registry.get(provider_id)?;
+    Some((
+        RepoId {
+            provider: provider.id.clone(),
+            path,
+        },
+        provider,
+    ))
 }
 
 /// Extract an upstream credential token from request headers.
 ///
 /// `X-Upstream-Token` is the canonical header; `X-GitHub-Token` is accepted as a
 /// back-compat alias for existing clients and scripts.
+fn unknown_provider_response() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse {
+            error: "unknown provider".to_string(),
+        }),
+    )
+        .into_response()
+}
+
 fn upstream_token_from_headers(headers: &HeaderMap) -> Option<secrecy::SecretString> {
     headers
         .get("X-Upstream-Token")
@@ -919,7 +911,9 @@ async fn dispatch_repos_get(
     OriginalUri(uri): OriginalUri,
 ) -> impl IntoResponse {
     if let Some((repo_path, branch)) = path.rsplit_once("/refs/") {
-        let (repo_id, provider) = resolve_repo_id(&state.provider_registry, repo_path);
+        let Some((repo_id, provider)) = resolve_repo_id(&state.provider_registry, repo_path) else {
+            return unknown_provider_response();
+        };
         if let Some(resp) =
             validation::reject_if_invalid(|| validation::validate_repo_path(provider, &repo_id))
         {
@@ -938,7 +932,9 @@ async fn dispatch_repos_get(
 
     if path.ends_with("/status") {
         let repo_path = path.strip_suffix("/status").unwrap();
-        let (repo_id, provider) = resolve_repo_id(&state.provider_registry, repo_path);
+        let Some((repo_id, provider)) = resolve_repo_id(&state.provider_registry, repo_path) else {
+            return unknown_provider_response();
+        };
         if let Some(resp) =
             validation::reject_if_invalid(|| validation::validate_repo_path(provider, &repo_id))
         {
@@ -961,7 +957,9 @@ async fn dispatch_repos_get(
 
     if path.ends_with("/cat") {
         let repo_path = path.strip_suffix("/cat").unwrap();
-        let (repo_id, provider) = resolve_repo_id(&state.provider_registry, repo_path);
+        let Some((repo_id, provider)) = resolve_repo_id(&state.provider_registry, repo_path) else {
+            return unknown_provider_response();
+        };
         if let Some(resp) =
             validation::reject_if_invalid(|| validation::validate_repo_path(provider, &repo_id))
         {
@@ -984,7 +982,9 @@ async fn dispatch_repos_get(
 
     if path.ends_with("/sizes") {
         let repo_path = path.strip_suffix("/sizes").unwrap();
-        let (repo_id, provider) = resolve_repo_id(&state.provider_registry, repo_path);
+        let Some((repo_id, provider)) = resolve_repo_id(&state.provider_registry, repo_path) else {
+            return unknown_provider_response();
+        };
         if let Some(resp) =
             validation::reject_if_invalid(|| validation::validate_repo_path(provider, &repo_id))
         {
@@ -1007,7 +1007,9 @@ async fn dispatch_repos_get(
 
     if path.ends_with("/hotfiles") {
         let repo_path = path.strip_suffix("/hotfiles").unwrap();
-        let (repo_id, provider) = resolve_repo_id(&state.provider_registry, repo_path);
+        let Some((repo_id, provider)) = resolve_repo_id(&state.provider_registry, repo_path) else {
+            return unknown_provider_response();
+        };
         if let Some(resp) =
             validation::reject_if_invalid(|| validation::validate_repo_path(provider, &repo_id))
         {
@@ -1046,7 +1048,9 @@ async fn dispatch_repos_post(
 ) -> impl IntoResponse {
     if path.ends_with("/sync") {
         let repo_path = path.strip_suffix("/sync").unwrap();
-        let (repo_id, provider) = resolve_repo_id(&state.provider_registry, repo_path);
+        let Some((repo_id, provider)) = resolve_repo_id(&state.provider_registry, repo_path) else {
+            return unknown_provider_response();
+        };
         if let Some(resp) =
             validation::reject_if_invalid(|| validation::validate_repo_path(provider, &repo_id))
         {
@@ -1069,7 +1073,9 @@ async fn dispatch_repos_post(
 
     if path.ends_with("/snapshot") {
         let repo_path = path.strip_suffix("/snapshot").unwrap();
-        let (repo_id, provider) = resolve_repo_id(&state.provider_registry, repo_path);
+        let Some((repo_id, provider)) = resolve_repo_id(&state.provider_registry, repo_path) else {
+            return unknown_provider_response();
+        };
         if let Some(resp) =
             validation::reject_if_invalid(|| validation::validate_repo_path(provider, &repo_id))
         {
@@ -1092,7 +1098,9 @@ async fn dispatch_repos_post(
 
     if path.ends_with("/batch") {
         let repo_path = path.strip_suffix("/batch").unwrap();
-        let (repo_id, provider) = resolve_repo_id(&state.provider_registry, repo_path);
+        let Some((repo_id, provider)) = resolve_repo_id(&state.provider_registry, repo_path) else {
+            return unknown_provider_response();
+        };
         if let Some(resp) =
             validation::reject_if_invalid(|| validation::validate_repo_path(provider, &repo_id))
         {
@@ -1142,7 +1150,9 @@ async fn dispatch_git_get(
 ) -> Response {
     if path.ends_with("/info/refs") {
         let repo_path = path.strip_suffix("/info/refs").unwrap();
-        let (repo_id, provider) = resolve_repo_id(&state.provider_registry, repo_path);
+        let Some((repo_id, provider)) = resolve_repo_id(&state.provider_registry, repo_path) else {
+            return unknown_provider_response();
+        };
         if let Some(resp) =
             validation::reject_if_invalid(|| validation::validate_repo_path(provider, &repo_id))
         {
@@ -1168,7 +1178,9 @@ async fn dispatch_git_post(
 ) -> Response {
     if path.ends_with("/git-upload-pack") {
         let repo_path = path.strip_suffix("/git-upload-pack").unwrap();
-        let (repo_id, provider) = resolve_repo_id(&state.provider_registry, repo_path);
+        let Some((repo_id, provider)) = resolve_repo_id(&state.provider_registry, repo_path) else {
+            return unknown_provider_response();
+        };
         if let Some(resp) =
             validation::reject_if_invalid(|| validation::validate_repo_path(provider, &repo_id))
         {
@@ -5119,7 +5131,7 @@ mod tests {
             .clone()
             .oneshot(request_with_auth(
                 "GET",
-                "/v1/repos/acme/secret/status",
+                "/v1/repos/github/acme/secret/status",
                 None,
             ))
             .await
@@ -5129,7 +5141,7 @@ mod tests {
         let wrong = app
             .oneshot(request_with_auth(
                 "GET",
-                "/v1/repos/acme/secret/status",
+                "/v1/repos/github/acme/secret/status",
                 Some("Ripclone deadbeef"),
             ))
             .await
@@ -5222,7 +5234,7 @@ mod tests {
         let state = test_state(&tmp);
         let app = build_app(state);
         let response = app
-            .oneshot(test_request("GET", "/v1/repos/acme/secret/status"))
+            .oneshot(test_request("GET", "/v1/repos/github/acme/secret/status"))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -5390,7 +5402,7 @@ mod tests {
 
         let app = build_app(state);
         let response = app
-            .oneshot(test_request("GET", "/v1/repos/acme/secret/status"))
+            .oneshot(test_request("GET", "/v1/repos/github/acme/secret/status"))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -5491,7 +5503,7 @@ mod tests {
 
         let app = build_app(state);
         let response = app
-            .oneshot(test_request("GET", "/v1/repos/acme/secret/status"))
+            .oneshot(test_request("GET", "/v1/repos/github/acme/secret/status"))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -5580,7 +5592,7 @@ mod tests {
         let response = app
             .oneshot(test_request(
                 "GET",
-                "/v1/repos/acme/fork/status?public=true&fork_of=oven-sh/bun",
+                "/v1/repos/github/acme/fork/status?public=true&fork_of=oven-sh/bun",
             ))
             .await
             .unwrap();
@@ -5668,7 +5680,7 @@ mod tests {
 
         let app = build_app(state);
         let response = app
-            .oneshot(test_request("GET", "/v1/repos/acme/secret/status"))
+            .oneshot(test_request("GET", "/v1/repos/github/acme/secret/status"))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -5750,7 +5762,7 @@ mod tests {
 
         let app = build_app(state);
         let response = app
-            .oneshot(test_request("GET", "/v1/repos/acme/secret/status"))
+            .oneshot(test_request("GET", "/v1/repos/github/acme/secret/status"))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -5771,7 +5783,7 @@ mod tests {
         let response = app
             .oneshot(test_request(
                 "POST",
-                "/v1/repos/acme/secret/sync?branch=../evil",
+                "/v1/repos/github/acme/secret/sync?branch=../evil",
             ))
             .await
             .unwrap();

@@ -1,17 +1,17 @@
-//! End-to-end tests for the `/v1/repos/{owner}/{repo}/status` billing endpoint.
+//! End-to-end tests for the `/v1/repos/{provider}/{owner}/{repo}/status` billing endpoint.
 
 mod common;
 
 use common::*;
 
-/// Helper: GET /v1/repos/{owner}/{repo}/status with optional query params.
+/// Helper: GET /v1/repos/{provider}/{owner}/{repo}/status with optional query params.
 async fn get_status(
     server: &Server,
     owner: &str,
     repo: &str,
     query: Option<&str>,
 ) -> serde_json::Value {
-    let mut url = format!("{}/v1/repos/{owner}/{repo}/status", server.url);
+    let mut url = format!("{}/v1/repos/github/{owner}/{repo}/status", server.url);
     if let Some(q) = query {
         url.push('?');
         url.push_str(q);

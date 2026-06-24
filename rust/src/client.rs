@@ -399,14 +399,10 @@ impl Client {
     /// `/v1/repos/{owner}/{repo}` shape; other providers are routed under
     /// `/v1/repos/{provider}/{repo_path}`.
     fn repo_url(&self, repo_path: &str, suffix: &str) -> String {
-        if self.provider == "github" {
-            format!("{}/v1/repos/{repo_path}{suffix}", self.server)
-        } else {
-            format!(
-                "{}/v1/repos/{}/{repo_path}{suffix}",
-                self.server, self.provider
-            )
-        }
+        format!(
+            "{}/v1/repos/{}/{repo_path}{suffix}",
+            self.server, self.provider
+        )
     }
 
     /// Start a request against the ripclone server, attaching the upstream
