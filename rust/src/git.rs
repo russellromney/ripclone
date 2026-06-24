@@ -75,6 +75,13 @@ fn update_index_skip_worktree_at(
                 continue;
             }
             entry.flags.set(SKIP_WORKTREE_FLAG, set);
+            if set {
+                entry.flags.insert(gix::index::entry::Flags::EXTENDED);
+            } else if (entry.flags & (gix::index::entry::Flags::INTENT_TO_ADD | SKIP_WORKTREE_FLAG))
+                .is_empty()
+            {
+                entry.flags.remove(gix::index::entry::Flags::EXTENDED);
+            }
             changed = true;
         }
     }
@@ -189,6 +196,10 @@ pub fn clear_skip_worktree_index_with_stats<P: AsRef<Path>>(
         };
         entry.stat = *stat;
         entry.flags.remove(SKIP_WORKTREE_FLAG);
+        if (entry.flags & (gix::index::entry::Flags::INTENT_TO_ADD | SKIP_WORKTREE_FLAG)).is_empty()
+        {
+            entry.flags.remove(gix::index::entry::Flags::EXTENDED);
+        }
         changed = true;
     }
     if changed {
@@ -1640,5 +1651,242 @@ mod tests {
         let prefix = out_dir.path().join("pack");
         let bad = vec!["0000000000000000000000000000000000000000".to_string()];
         assert!(pack_objects_to_prefix_gix(repo, &bad, &prefix).is_err());
+    }
+
+    /// gix index generation for an existing pack (Phase 3) produces an idx that
+    /// git can use to read objects.
+    #[test]
+    fn gix_index_pack_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        let _ = Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .arg(repo)
+            .output()
+            .unwrap();
+        for (key, val) in [("user.email", "t@t"), ("user.name", "t")] {
+            let _ = Command::new("git")
+                .args(["-C", repo.to_str().unwrap(), "config", key, val])
+                .output()
+                .unwrap();
+        }
+        std::fs::write(repo.join("file.txt"), "hello\n").unwrap();
+        let _ = Command::new("git")
+            .args(["-C", repo.to_str().unwrap(), "add", "file.txt"])
+            .output()
+            .unwrap();
+        let _ = Command::new("git")
+            .args(["-C", repo.to_str().unwrap(), "commit", "-q", "-m", "c"])
+            .output()
+            .unwrap();
+
+        // Build a pack with C-git, then index it with gix.
+        let pack_dir = tmp.path().join("packs");
+        std::fs::create_dir(&pack_dir).unwrap();
+        let pack_prefix = pack_dir.join("objects");
+        let out = Command::new("git")
+            .args([
+                "-C",
+                repo.to_str().unwrap(),
+                "rev-list",
+                "--objects",
+                "--no-object-names",
+                "HEAD",
+            ])
+            .output()
+            .unwrap();
+        let objects: Vec<String> = String::from_utf8(out.stdout)
+            .unwrap()
+            .lines()
+            .map(|s| s.to_string())
+            .collect();
+        let mut child = std::process::Command::new("git")
+            .args([
+                "-C",
+                repo.to_str().unwrap(),
+                "pack-objects",
+                "--window=0",
+                pack_prefix.to_str().unwrap(),
+            ])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        {
+            use std::io::Write;
+            let stdin = child.stdin.as_mut().unwrap();
+            for oid in &objects {
+                writeln!(stdin, "{}", oid).unwrap();
+            }
+        }
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success());
+
+        let pack_file = std::fs::read_dir(&pack_dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.extension().and_then(|e| e.to_str()) == Some("pack"))
+            .unwrap();
+        index_pack(repo.join(".git"), &pack_file).unwrap();
+
+        let idx_file = pack_file.with_extension("idx");
+        assert!(idx_file.exists(), "gix index_pack must write .idx");
+
+        let bundle = gix_pack::Bundle::at(&idx_file, gix::hash::Kind::Sha1).unwrap();
+        assert_eq!(bundle.index.num_objects() as usize, objects.len());
+        for oid in &objects {
+            let id = gix::hash::ObjectId::from_hex(oid.as_bytes()).unwrap();
+            assert!(
+                bundle.index.lookup(id).is_some(),
+                "gix-generated index must contain {oid}"
+            );
+        }
+    }
+
+    /// gix index generation rejects a corrupt/truncated pack.
+    #[test]
+    fn gix_index_pack_rejects_truncated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pack_dir = tmp.path().join("packs");
+        std::fs::create_dir(&pack_dir).unwrap();
+        let pack_file = pack_dir.join("pack-0000000000000000000000000000000000000000.pack");
+        std::fs::write(&pack_file, b"PKT\x00\x00").unwrap();
+        assert!(index_pack(pack_dir.join(".git"), &pack_file).is_err());
+    }
+
+    /// Setting and clearing skip-worktree via gix (Phase 5) round-trips through
+    /// a real git index.
+    #[test]
+    fn gix_index_skip_worktree_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        let _ = Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .arg(repo)
+            .output()
+            .unwrap();
+        for (key, val) in [("user.email", "t@t"), ("user.name", "t")] {
+            let _ = Command::new("git")
+                .args(["-C", repo.to_str().unwrap(), "config", key, val])
+                .output()
+                .unwrap();
+        }
+        std::fs::write(repo.join("a.txt"), "a\n").unwrap();
+        std::fs::write(repo.join("b.txt"), "b\n").unwrap();
+        let _ = Command::new("git")
+            .args(["-C", repo.to_str().unwrap(), "add", "."])
+            .output()
+            .unwrap();
+
+        set_skip_worktree_all(repo).unwrap();
+        assert_skip_worktree_flag(repo, "a.txt", true);
+        assert_skip_worktree_flag(repo, "b.txt", true);
+
+        let cleared = clear_skip_worktree_all(repo).unwrap();
+        assert_eq!(cleared, 2);
+        assert_skip_worktree_flag(repo, "a.txt", false);
+        assert_skip_worktree_flag(repo, "b.txt", false);
+    }
+
+    fn assert_skip_worktree_flag(repo: &Path, path: &str, expected: bool) {
+        let out = Command::new("git")
+            .args(["-C", repo.to_str().unwrap(), "ls-files", "-v", "--", path])
+            .output()
+            .unwrap();
+        let line = String::from_utf8(out.stdout).unwrap();
+        let flag = line.starts_with('S');
+        assert_eq!(
+            flag, expected,
+            "skip-worktree for {}: expected {}, got {} ({:?})",
+            path, expected, flag, line
+        );
+    }
+
+    /// Clearing skip-worktree and refreshing stats via gix (Phase 5) writes
+    /// real stat metadata back into the index.
+    #[test]
+    fn gix_index_clear_skip_worktree_with_stats() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        let _ = Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .arg(repo)
+            .output()
+            .unwrap();
+        for (key, val) in [("user.email", "t@t"), ("user.name", "t")] {
+            let _ = Command::new("git")
+                .args(["-C", repo.to_str().unwrap(), "config", key, val])
+                .output()
+                .unwrap();
+        }
+        std::fs::write(repo.join("a.txt"), "aaaa\n").unwrap();
+        let _ = Command::new("git")
+            .args(["-C", repo.to_str().unwrap(), "add", "a.txt"])
+            .output()
+            .unwrap();
+
+        set_skip_worktree_all(repo).unwrap();
+
+        let stats = vec![materialized_path_stat_from_metadata(
+            "a.txt".to_string(),
+            &std::fs::symlink_metadata(repo.join("a.txt")).unwrap(),
+        )];
+        clear_skip_worktree_index_with_stats(repo, &["a.txt".to_string()], &stats).unwrap();
+
+        assert_skip_worktree_flag(repo, "a.txt", false);
+
+        // Index should now reflect the real on-disk size.
+        let index = open_index_file(&repo.join(".git").join("index")).unwrap();
+        let entry = index
+            .entry_by_path_and_stage(
+                gix::bstr::BStr::new(b"a.txt"),
+                gix::index::entry::Stage::Unconflicted,
+            )
+            .expect("a.txt in index");
+        assert_eq!(entry.stat.size, 5);
+    }
+
+    /// update_index_sizes via gix (Phase 5) updates cached sizes and leaves
+    /// non-targeted entries untouched.
+    #[test]
+    fn gix_update_index_sizes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        let _ = Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .arg(repo)
+            .output()
+            .unwrap();
+        for (key, val) in [("user.email", "t@t"), ("user.name", "t")] {
+            let _ = Command::new("git")
+                .args(["-C", repo.to_str().unwrap(), "config", key, val])
+                .output()
+                .unwrap();
+        }
+        std::fs::write(repo.join("a.txt"), "aaaa\n").unwrap();
+        std::fs::write(repo.join("b.txt"), "bbbbbbbb\n").unwrap();
+        let _ = Command::new("git")
+            .args(["-C", repo.to_str().unwrap(), "add", "."])
+            .output()
+            .unwrap();
+
+        let mut sizes = std::collections::HashMap::new();
+        sizes.insert("a.txt".to_string(), 42u64);
+        update_index_sizes(repo.join(".git"), &sizes).unwrap();
+
+        let index = open_index_file(&repo.join(".git").join("index")).unwrap();
+        let a = index
+            .entry_by_path_and_stage(
+                gix::bstr::BStr::new(b"a.txt"),
+                gix::index::entry::Stage::Unconflicted,
+            )
+            .unwrap();
+        let b = index
+            .entry_by_path_and_stage(
+                gix::bstr::BStr::new(b"b.txt"),
+                gix::index::entry::Stage::Unconflicted,
+            )
+            .unwrap();
+        assert_eq!(a.stat.size, 42);
+        assert_eq!(b.stat.size, 9); // untouched
     }
 }
