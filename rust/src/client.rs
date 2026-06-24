@@ -2005,6 +2005,97 @@ impl Client {
     /// git to check out the working tree itself. Used by the git remote helper
     /// so that `git clone`/`git fetch` can proceed normally after the helper
     /// seeds the object database.
+    /// Install every pack referenced by `manifest.packs` into `pack_dir`. The
+    /// git remote helper acts as a first-class transport, so a `git clone
+    /// ripclone://...` must materialize the full history (not just the HEAD
+    /// closure) just like any other remote.
+    async fn install_manifest_packs(
+        &self,
+        manifest: &ClonepackManifest,
+        info: &RefResponse,
+        pack_dir: &std::path::Path,
+    ) -> Result<u64> {
+        use futures::stream::{self, StreamExt, TryStreamExt};
+
+        let packs: Vec<_> = manifest.packs.to_vec();
+        if packs.is_empty() {
+            anyhow::bail!("clonepack has no packs for git-dir install");
+        }
+
+        let idx_bundle: Option<Arc<Vec<u8>>> = match manifest.idx_bundle.as_ref() {
+            Some(b) => Some(Arc::new(
+                self.fetch_chunk_ref(b, info.idx_bundle_url.as_deref())
+                    .await
+                    .context("fetch idx bundle")?,
+            )),
+            None => None,
+        };
+
+        let pack_urls = info.pack_chunk_urls.clone().unwrap_or_default();
+        let idx_urls = info.pack_idx_urls.clone().unwrap_or_default();
+
+        let downloads = stream::iter(packs.into_iter().enumerate()).map(|(i, entry)| {
+            let client = self.clone();
+            let pack_url = pack_urls.get(i).and_then(|o| o.clone());
+            let idx_url = idx_urls.get(i).and_then(|o| o.clone());
+            let idx_bundle = idx_bundle.clone();
+            async move {
+                let pack_ref = entry
+                    .pack
+                    .as_ref()
+                    .with_context(|| format!("pack {} missing pack ref", i))?;
+                let idx_ref = entry
+                    .idx
+                    .as_ref()
+                    .with_context(|| format!("pack {} missing idx ref", i))?;
+                let (pack_bytes, idx_bytes) = if let Some(bundle) = idx_bundle.as_ref() {
+                    let off = entry.idx_bundle_offset as usize;
+                    let end = off
+                        .checked_add(idx_ref.len as usize)
+                        .context("idx bundle offset overflow")?;
+                    let slice = bundle
+                        .get(off..end)
+                        .with_context(|| format!("idx {} slice out of bundle range", i))?
+                        .to_vec();
+                    let want = hash_to_hex(&idx_ref.hash);
+                    let got = crate::cas::hash(&slice);
+                    if got != want {
+                        anyhow::bail!(
+                            "idx {i} bundle slice hash mismatch: expected {want}, got {got}"
+                        );
+                    }
+                    let pack_bytes = client
+                        .fetch_chunk_ref(pack_ref, pack_url.as_deref())
+                        .await
+                        .with_context(|| format!("fetch pack {}", i))?;
+                    (pack_bytes, slice)
+                } else {
+                    tokio::try_join!(
+                        client.fetch_chunk_ref(pack_ref, pack_url.as_deref()),
+                        client.fetch_chunk_ref(idx_ref, idx_url.as_deref()),
+                    )
+                    .with_context(|| format!("fetch pack {}", i))?
+                };
+                Ok::<(Vec<u8>, Vec<u8>), anyhow::Error>((pack_bytes, idx_bytes))
+            }
+        });
+
+        let results: Vec<_> = downloads.buffer_unordered(4).try_collect().await?;
+        let mut total = 0u64;
+        for (pack_bytes, idx_bytes) in results {
+            if pack_bytes.len() < 20 {
+                anyhow::bail!("pack too short ({} bytes)", pack_bytes.len());
+            }
+            let name = hex::encode(&pack_bytes[pack_bytes.len() - 20..]);
+            std::fs::write(pack_dir.join(format!("pack-{}.pack", name)), &pack_bytes)
+                .with_context(|| format!("write pack {}", name))?;
+            std::fs::write(pack_dir.join(format!("pack-{}.idx", name)), &idx_bytes)
+                .with_context(|| format!("write idx {}", name))?;
+            total += (pack_bytes.len() + idx_bytes.len()) as u64;
+        }
+        Ok(total)
+    }
+
     pub async fn install_git_dir<P: AsRef<Path>>(
         &self,
         branch: &str,
@@ -2070,37 +2161,44 @@ impl Client {
         )?;
 
         let head_blobs_refs = head_blobs_chunk_refs(&clonepack);
-        if head_blobs_refs.is_empty() {
+        let total = if !head_blobs_refs.is_empty() {
+            let idx_ref = clonepack
+                .head_blobs_idx
+                .as_ref()
+                .context("clonepack missing head-blobs idx")?;
+            let (chunks, idx_data) = tokio::join!(
+                self.fetch_chunk_refs(&head_blobs_refs, info.head_blobs_chunk_urls.as_deref()),
+                self.fetch_chunk_ref(idx_ref, info.head_blobs_idx_url.as_deref()),
+            );
+            let chunks = chunks?;
+            let idx_data = idx_data?;
+            let pack_data: Vec<u8> = chunks.into_iter().flatten().collect();
+            let head_blobs_hash = cas_hash(&pack_data);
+            std::fs::write(
+                pack_dir.join(format!("pack-{}.pack", head_blobs_hash)),
+                &pack_data,
+            )?;
+            std::fs::write(
+                pack_dir.join(format!("pack-{}.idx", head_blobs_hash)),
+                &idx_data,
+            )?;
+            info!("wrote legacy head-blobs pack ({} bytes)", pack_data.len());
+            (pack_data.len() + idx_data.len()) as u64
+        } else if clonepack.packs.iter().any(|p| !p.history_only) {
+            self.install_manifest_packs(&clonepack, info, &pack_dir)
+                .await
+                .context("install HEAD-closure packs")?
+        } else {
             anyhow::bail!("clonepack missing head-blobs pack");
-        }
-        let idx_ref = clonepack
-            .head_blobs_idx
-            .as_ref()
-            .context("clonepack missing head-blobs idx")?;
-        let (chunks, idx_data) = tokio::join!(
-            self.fetch_chunk_refs(&head_blobs_refs, info.head_blobs_chunk_urls.as_deref()),
-            self.fetch_chunk_ref(idx_ref, info.head_blobs_idx_url.as_deref()),
-        );
-        let chunks = chunks?;
-        let idx_data = idx_data?;
-        let pack_data: Vec<u8> = chunks.into_iter().flatten().collect();
-        let head_blobs_hash = cas_hash(&pack_data);
-        std::fs::write(
-            pack_dir.join(format!("pack-{}.pack", head_blobs_hash)),
-            &pack_data,
-        )?;
-        std::fs::write(
-            pack_dir.join(format!("pack-{}.idx", head_blobs_hash)),
-            &idx_data,
-        )?;
-        info!("wrote head-blobs pack ({} bytes)", pack_data.len());
+        };
 
         std::fs::write(git_dir.join("index"), &metadata.prebuilt_index)?;
 
         info!(
-            "installed .git for {} refs/heads/{}",
+            "installed .git for {} refs/heads/{} ({} bytes)",
             &info.commit[..7],
-            branch_name
+            branch_name,
+            total
         );
         Ok(())
     }

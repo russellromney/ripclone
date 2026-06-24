@@ -1377,9 +1377,19 @@ async fn get_ref_inner(
     }
     drop(_guard);
 
+    // Resolve HEAD to the default branch for artifact lookup and the response.
+    // The client may request refs/HEAD; we still need to hand back the artifacts
+    // stored under the concrete default branch name.
+    let default_branch = git::default_branch(&mirror_dir).unwrap_or_else(|_| "HEAD".to_string());
+    let effective_branch = if branch == "HEAD" {
+        default_branch.clone()
+    } else {
+        branch.clone()
+    };
+
     // Load the stored info, if any. A rev request loads the rolling test key the
     // matching `sync?rev=...` stored under (isolated from the real branch entry).
-    let store_key = ref_store_key(&branch, params.rev.as_deref());
+    let store_key = ref_store_key(&effective_branch, params.rev.as_deref());
     let fallback = state
         .ref_store
         .load_branch(&repo_id, &store_key)
@@ -1393,8 +1403,6 @@ async fn get_ref_inner(
         .await
     {
         Ok(Ok(commit)) => {
-            let default_branch =
-                git::default_branch(&mirror_dir).unwrap_or_else(|_| "HEAD".to_string());
             // Only reuse stored artifact hashes when they match the resolved
             // commit; otherwise we would hand out signed URLs for stale chunks.
             let fallback = fallback.filter(|info| info.commit == commit);
@@ -1428,14 +1436,20 @@ async fn get_ref_inner(
             let resp = ref_response(
                 &repo_id,
                 &provider,
-                branch.clone(),
+                effective_branch.clone(),
                 &info,
                 &state.storage,
                 &params.clonepack,
                 private,
             );
             if info.build_status.is_none() && params.rev.is_none() {
-                cache_ref_response(&state, &repo_id, &branch, &params.clonepack, &resp);
+                cache_ref_response(
+                    &state,
+                    &repo_id,
+                    &effective_branch,
+                    &params.clonepack,
+                    &resp,
+                );
             }
             (StatusCode::OK, Json(resp)).into_response()
         }
@@ -1860,10 +1874,7 @@ async fn sync_repo_inner(
     let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
     let branch = params.branch;
     let at_rev = params.rev;
-    // Ref-store key: rev builds use a rolling test key isolated from the real
-    // branch entry (see ref_store_key). Used when loading the result for the
-    // sync response below.
-    let ref_key = ref_store_key(&branch, at_rev.as_deref());
+
     let request_token = upstream_token_from_headers(&headers);
     let credential = state
         .broker
@@ -1921,30 +1932,43 @@ async fn sync_repo_inner(
         // than holding the connection until it is reset mid-request.
         let wait = Duration::from_secs(env_bytes("RIPCLONE_SYNC_WAIT_SECS", 25));
         match tokio::time::timeout(wait, rx).await {
-            Ok(Ok(Ok(()))) => match state.ref_store.load_branch(&repo_id, &ref_key).await {
-                Ok(Some(info)) => {
-                    state.metrics.record_sync(start.elapsed());
-                    let resp = ref_response(
-                        &repo_id,
-                        &provider,
-                        branch.clone(),
-                        &info,
-                        &state.storage,
-                        "full",
-                        private,
-                    );
-                    return (StatusCode::OK, Json(resp)).into_response();
+            Ok(Ok(Ok(()))) => {
+                // Resolve HEAD to the concrete default branch before loading the
+                // persisted ref; do_sync stores artifacts under the real branch.
+                let effective_branch = if branch == "HEAD" {
+                    git::default_branch(&mirror_dir)
+                        .ok()
+                        .filter(|b| !b.is_empty())
+                        .unwrap_or_else(|| branch.clone())
+                } else {
+                    branch.clone()
+                };
+                let load_key = ref_store_key(&effective_branch, at_rev.as_deref());
+                match state.ref_store.load_branch(&repo_id, &load_key).await {
+                    Ok(Some(info)) => {
+                        state.metrics.record_sync(start.elapsed());
+                        let resp = ref_response(
+                            &repo_id,
+                            &provider,
+                            effective_branch,
+                            &info,
+                            &state.storage,
+                            "full",
+                            private,
+                        );
+                        return (StatusCode::OK, Json(resp)).into_response();
+                    }
+                    _ => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(ErrorResponse {
+                                error: "build finished but ref missing".to_string(),
+                            }),
+                        )
+                            .into_response();
+                    }
                 }
-                _ => {
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(ErrorResponse {
-                            error: "build finished but ref missing".to_string(),
-                        }),
-                    )
-                        .into_response();
-                }
-            },
+            }
             Ok(Ok(Err(e))) => {
                 state.metrics.record_error();
                 return (
@@ -1997,14 +2021,28 @@ async fn sync_repo_inner(
     {
         Ok(info) => {
             state.metrics.record_sync(start.elapsed());
+            // Resolve HEAD to the concrete default branch for caching/response.
+            let effective_branch = if branch == "HEAD" {
+                info.default_branch.clone()
+            } else {
+                branch.clone()
+            };
             // The mirror was just fetched; let the immediately-following resolve
-            // skip its own fetch.
-            stamp_mirror_fresh(&state, &format!("{}/{}", repo_id.storage_key(), branch));
-            invalidate_ref_response_cache(&state, &repo_id, &branch);
+            // skip its own fetch. Stamp both the concrete branch and the original
+            // requested branch (e.g. HEAD) so callers resolving either key avoid a
+            // redundant fetch.
+            stamp_mirror_fresh(
+                &state,
+                &format!("{}/{}", repo_id.storage_key(), effective_branch),
+            );
+            if branch != effective_branch {
+                stamp_mirror_fresh(&state, &format!("{}/{}", repo_id.storage_key(), branch));
+            }
+            invalidate_ref_response_cache(&state, &repo_id, &effective_branch);
             let resp = ref_response(
                 &repo_id,
                 &provider,
-                branch.clone(),
+                effective_branch,
                 &info,
                 &state.storage,
                 "full",
@@ -3089,6 +3127,14 @@ async fn do_sync(
     let commit = git::resolve_commit(&mirror_dir, at_rev.unwrap_or(branch))?;
     let parent = git::parent_commit(&mirror_dir, &commit).ok().flatten();
     let default_branch = git::default_branch(&mirror_dir).unwrap_or_else(|_| "HEAD".to_string());
+
+    // If the caller asked for HEAD, store artifacts under the concrete default
+    // branch name so both /refs/HEAD and /refs/<branch> find the same build.
+    let branch = if branch == "HEAD" {
+        default_branch.as_str()
+    } else {
+        branch
+    };
 
     // Ref-store key. Rev builds use a rolling test key so they never overwrite
     // the real branch entry; everything below stores/loads under this key. The
@@ -4517,16 +4563,28 @@ fn spawn_build_worker(state: ServerState) -> tokio::sync::mpsc::Sender<BuildJob>
             drop(_guard);
 
             state.build_queue_depth.fetch_sub(1, Ordering::Relaxed);
+            // Resolve HEAD to the concrete default branch for cache/log keys.
+            let effective_branch = match &result {
+                Ok(info) if branch == "HEAD" => info.default_branch.clone(),
+                _ => branch.clone(),
+            };
             let waiter_result: Result<(), String> = match &result {
                 Ok(_) => {
                     state.metrics.record_build_completed(start.elapsed());
                     let _ = update_build_status(&state, &repo_id, "done").await;
                     // A successful sync marks the mirror fresh so the waiter's
-                    // resolve doesn't re-fetch.
-                    stamp_mirror_fresh(&state, &format!("{}/{branch}", repo_id.storage_key()));
-                    invalidate_ref_response_cache(&state, &repo_id, &branch);
+                    // resolve doesn't re-fetch. Stamp both the concrete branch and
+                    // the original requested branch (e.g. HEAD).
+                    stamp_mirror_fresh(
+                        &state,
+                        &format!("{}/{effective_branch}", repo_id.storage_key()),
+                    );
+                    if branch != effective_branch {
+                        stamp_mirror_fresh(&state, &format!("{}/{branch}", repo_id.storage_key()));
+                    }
+                    invalidate_ref_response_cache(&state, &repo_id, &effective_branch);
                     info!(
-                        "background build completed for {}@{branch}",
+                        "background build completed for {}@{effective_branch}",
                         repo_id.storage_key()
                     );
                     Ok(())
@@ -4534,9 +4592,9 @@ fn spawn_build_worker(state: ServerState) -> tokio::sync::mpsc::Sender<BuildJob>
                 Err(e) => {
                     state.metrics.record_build_failed();
                     let _ = update_build_status(&state, &repo_id, &format!("failed: {e}")).await;
-                    invalidate_ref_response_cache(&state, &repo_id, &branch);
+                    invalidate_ref_response_cache(&state, &repo_id, &effective_branch);
                     warn!(
-                        "background build failed for {}@{branch}: {e}",
+                        "background build failed for {}@{effective_branch}: {e}",
                         repo_id.storage_key()
                     );
                     Err(format!("{e}"))
