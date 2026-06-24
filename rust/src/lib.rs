@@ -7,6 +7,13 @@
     deprecated
 )]
 
+/// Wire-protocol version negotiated between the CLI and the server. Bump this
+/// only on a breaking change to the client/server protocol — independent of the
+/// crate version, so the two binaries can be released on their own cadence as
+/// long as their protocol versions match. Surfaced at `/v1/version` and by
+/// `ripclone version`.
+pub const PROTOCOL_VERSION: u32 = 1;
+
 pub mod archive;
 pub mod bench;
 pub mod blob_pack;

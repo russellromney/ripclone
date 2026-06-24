@@ -7,6 +7,7 @@ use tracing_subscriber::EnvFilter;
 #[derive(Parser)]
 #[command(name = "ripclone-server")]
 #[command(about = "CAS-based git clone helper server")]
+#[command(version)]
 struct Args {
     #[arg(long, default_value = "/data/cache")]
     cas_dir: PathBuf,
