@@ -1,12 +1,13 @@
 use crate::RefInfo;
 use crate::archive::ArchiveBuilder;
+use crate::auth::broker::{CredentialBroker, StaticBroker};
 use crate::cas::Cas;
 use crate::clonepack::{ChunkRef, ClonepackManifest, hash_from_hex, hash_to_hex};
 use crate::git;
 use crate::metrics::Metrics;
 use crate::oidc::OidcVerifier;
 use crate::pack::PackBuilder;
-use crate::provider::{ProviderRegistry, RepoId};
+use crate::provider::{ProviderInstance, ProviderRegistry, RepoId};
 use crate::ref_store::{CachingRefStore, FileRefStore, RefStore, S3RefStore, migrate_legacy_refs};
 use crate::remote_gc::{GcConfig, RemoteGc};
 use crate::retention::Retention;
@@ -17,7 +18,7 @@ use anyhow::{Context, Result};
 use axum::{
     Json, Router,
     body::{Body, Bytes},
-    extract::{ConnectInfo, DefaultBodyLimit, Path, Query, State},
+    extract::{ConnectInfo, DefaultBodyLimit, OriginalUri, Path, Query, State},
     http::{HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -25,7 +26,6 @@ use axum::{
 };
 use futures::{StreamExt, TryStreamExt};
 use prost::Message;
-use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -45,8 +45,8 @@ pub struct ServerState {
     pub repo_root: PathBuf,
     pub ref_store: Arc<dyn RefStore>,
     pub provider_registry: ProviderRegistry,
+    pub broker: Arc<dyn CredentialBroker>,
     pub token_hash: Option<String>,
-    pub github_token: Option<String>,
     pub metrics: Arc<Metrics>,
     pub rate_limiter: RateLimiter,
     pub retention: Arc<Retention>,
@@ -253,11 +253,69 @@ pub struct BuildJob {
     pub branch: String,
     /// Optional build-commit override (see SyncRequest.rev).
     pub rev: Option<String>,
-    pub github_token: Option<secrecy::SecretString>,
+    /// Upstream credential (Tier-B passthrough) used when syncing the mirror.
+    pub credential: Option<secrecy::SecretString>,
 }
 
 fn default_branch_value() -> String {
     "HEAD".to_string()
+}
+
+/// Resolve a `{*rest}` path segment from `/v1/repos/{*rest}/...` into a
+/// `(RepoId, ProviderInstance)` pair.
+///
+/// - If `rest` has exactly one slash and the first segment is NOT a registered
+///   provider id, treat it as the legacy GitHub `owner/repo` form.
+/// - Otherwise, the first segment is the provider id and the remainder is the
+///   opaque repo path.
+///
+/// This preserves backward compatibility for all existing 2-segment GitHub
+/// URLs. The documented collision is that a GitHub org whose name equals a
+/// registered provider id will be parsed as that provider; operators who hit
+/// this can avoid it by not shadowing provider ids.
+fn resolve_repo_id<'a>(
+    registry: &'a ProviderRegistry,
+    rest: &str,
+) -> (RepoId, &'a ProviderInstance) {
+    let segments: Vec<&str> = rest.split('/').collect();
+    if segments.len() == 2 {
+        let potential_provider = segments[0];
+        if let Some(provider) = registry.get(potential_provider) {
+            let repo_id = RepoId {
+                provider: provider.id.clone(),
+                path: segments[1].to_string(),
+            };
+            return (repo_id, provider);
+        }
+        return (RepoId::github(rest), registry.default_provider());
+    }
+    if segments.is_empty() {
+        // Degenerate case; fall back to github default with empty path so
+        // downstream validation produces a clear error.
+        return (RepoId::github(rest), registry.default_provider());
+    }
+    let provider_id = segments[0];
+    let path = segments[1..].join("/");
+    let provider = registry
+        .get(provider_id)
+        .unwrap_or_else(|| registry.default_provider());
+    let repo_id = RepoId {
+        provider: provider.id.clone(),
+        path,
+    };
+    (repo_id, provider)
+}
+
+/// Extract an upstream credential token from request headers.
+///
+/// `X-Upstream-Token` is the canonical header; `X-GitHub-Token` is accepted as a
+/// back-compat alias for existing clients and scripts.
+fn upstream_token_from_headers(headers: &HeaderMap) -> Option<secrecy::SecretString> {
+    headers
+        .get("X-Upstream-Token")
+        .or_else(|| headers.get("X-GitHub-Token"))
+        .and_then(|v| v.to_str().ok())
+        .map(|s| secrecy::SecretString::new(s.to_string().into()))
 }
 
 fn default_hot_files() -> usize {
@@ -319,6 +377,12 @@ fn reject_invalid_repo_ids(owner: &str, repo: &str) -> Option<Response> {
 pub struct RefResponse {
     pub owner: String,
     pub repo: String,
+    /// Provider instance id (e.g. "github", "gitlab", "my-gitea").
+    pub provider: String,
+    /// Hostname of the upstream git provider.
+    pub host: String,
+    /// Canonical HTTPS origin URL for the repo.
+    pub origin_url: String,
     pub branch: String,
     pub default_branch: String,
     pub commit: String,
@@ -416,24 +480,19 @@ pub struct RegionStorageEntry {
 
 pub fn build_app(state: ServerState) -> Router {
     let protected = Router::new()
-        .route("/v1/repos/{owner}/{repo}/refs/{branch}", get(get_ref))
-        .route("/v1/repos/{owner}/{repo}/sync", post(sync_repo))
-        .route("/v1/repos/{owner}/{repo}/status", get(repo_status))
-        .route("/v1/repos/{owner}/{repo}/cat", get(cat_file))
-        .route("/v1/repos/{owner}/{repo}/sizes", get(file_sizes))
-        .route("/v1/repos/{owner}/{repo}/snapshot", post(create_snapshot))
-        .route("/v1/repos/{owner}/{repo}/hotfiles", get(get_hotfiles))
-        .route("/v1/repos/{owner}/{repo}/batch", post(batch_files))
+        // Single catch-all route for all repo endpoints. The dispatcher parses
+        // the legacy 2-segment GitHub form ("owner/repo/refs/main") and the
+        // multi-provider form ("gitlab/group/sub/proj/sync") from the path.
+        .route("/v1/repos/{*path}", get(dispatch_repos_get))
+        .route("/v1/repos/{*path}", post(dispatch_repos_post))
         .route("/v1/packs/{hash}", get(get_pack))
         .route("/v1/objects/{sha}", get(get_object))
         .route("/v1/artifacts/{hash}", get(get_artifact))
         .route("/v1/archives/{hash}", get(get_artifact))
         .route("/v1/manifests/{hash}", get(get_artifact))
-        .route("/v1/git/{owner}/{repo}/info/refs", get(git_info_refs))
-        .route(
-            "/v1/git/{owner}/{repo}/git-upload-pack",
-            post(git_upload_pack),
-        )
+        // Single catch-all route for git smart-http endpoints.
+        .route("/v1/git/{*path}", get(dispatch_git_get))
+        .route("/v1/git/{*path}", post(dispatch_git_post))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -660,14 +719,13 @@ struct GitServiceQuery {
 
 /// Smart-HTTP `info/refs` fallback. Advertises refs so a vanilla git client can
 /// talk to ripclone when the archive-first path is not available.
-async fn git_info_refs(
-    Path((owner, repo)): Path<(String, String)>,
-    Query(query): Query<GitServiceQuery>,
-    State(state): State<ServerState>,
+async fn git_info_refs_inner(
+    repo_id: RepoId,
+    provider: ProviderInstance,
+    query: GitServiceQuery,
+    headers: HeaderMap,
+    state: ServerState,
 ) -> Response {
-    if let Some(resp) = reject_invalid_repo_ids(&owner, &repo) {
-        return resp;
-    }
     if query.service != "git-upload-pack" {
         return (
             StatusCode::FORBIDDEN,
@@ -678,15 +736,22 @@ async fn git_info_refs(
             .into_response();
     }
 
-    let repo_id = RepoId::github(format!("{owner}/{repo}"));
     let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
-    let github_token = state
-        .github_token
-        .clone()
-        .map(|s| secrecy::SecretString::new(s.into()));
+    let request_token = upstream_token_from_headers(&headers);
+    let credential = state
+        .broker
+        .fetch_credential(&repo_id, request_token.as_ref());
     let lock = repo_lock(&state.sync_locks, &repo_id).await;
     let _guard = lock.lock().await;
-    if let Err(e) = ensure_mirror(&mirror_dir, &repo_id, "HEAD", github_token.as_ref()).await {
+    if let Err(e) = ensure_mirror(
+        &mirror_dir,
+        &provider,
+        &repo_id,
+        "HEAD",
+        credential.as_ref(),
+    )
+    .await
+    {
         state.metrics.record_error();
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -721,6 +786,20 @@ async fn git_info_refs(
     }
 }
 
+async fn git_info_refs(
+    Path((owner, repo)): Path<(String, String)>,
+    Query(query): Query<GitServiceQuery>,
+    headers: HeaderMap,
+    State(state): State<ServerState>,
+) -> Response {
+    if let Some(resp) = reject_invalid_repo_ids(&owner, &repo) {
+        return resp;
+    }
+    let repo_id = RepoId::github(format!("{owner}/{repo}"));
+    let provider = state.provider_registry.default_provider().clone();
+    git_info_refs_inner(repo_id, provider, query, headers, state).await
+}
+
 async fn advertise_refs(mirror_dir: &std::path::Path) -> Result<Vec<u8>> {
     let mirror_dir = mirror_dir.to_path_buf();
     let output = tokio::task::spawn_blocking(move || {
@@ -750,23 +829,29 @@ async fn advertise_refs(mirror_dir: &std::path::Path) -> Result<Vec<u8>> {
 
 /// Smart-HTTP `git-upload-pack` RPC fallback. Pipes the client's request body
 /// through `git upload-pack --stateless-rpc` on the local bare mirror.
-async fn git_upload_pack(
-    Path((owner, repo)): Path<(String, String)>,
-    State(state): State<ServerState>,
+async fn git_upload_pack_inner(
+    repo_id: RepoId,
+    provider: ProviderInstance,
     body: Body,
+    headers: HeaderMap,
+    state: ServerState,
 ) -> Response {
-    if let Some(resp) = reject_invalid_repo_ids(&owner, &repo) {
-        return resp;
-    }
-    let repo_id = RepoId::github(format!("{owner}/{repo}"));
     let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
-    let github_token = state
-        .github_token
-        .clone()
-        .map(|s| secrecy::SecretString::new(s.into()));
+    let request_token = upstream_token_from_headers(&headers);
+    let credential = state
+        .broker
+        .fetch_credential(&repo_id, request_token.as_ref());
     let lock = repo_lock(&state.sync_locks, &repo_id).await;
     let _guard = lock.lock().await;
-    if let Err(e) = ensure_mirror(&mirror_dir, &repo_id, "HEAD", github_token.as_ref()).await {
+    if let Err(e) = ensure_mirror(
+        &mirror_dir,
+        &provider,
+        &repo_id,
+        "HEAD",
+        credential.as_ref(),
+    )
+    .await
+    {
         state.metrics.record_error();
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -812,6 +897,295 @@ async fn git_upload_pack(
     }
 }
 
+async fn git_upload_pack(
+    Path((owner, repo)): Path<(String, String)>,
+    headers: HeaderMap,
+    State(state): State<ServerState>,
+    body: Body,
+) -> Response {
+    if let Some(resp) = reject_invalid_repo_ids(&owner, &repo) {
+        return resp;
+    }
+    let repo_id = RepoId::github(format!("{owner}/{repo}"));
+    let provider = state.provider_registry.default_provider().clone();
+    git_upload_pack_inner(repo_id, provider, body, headers, state).await
+}
+
+async fn dispatch_repos_get(
+    Path(path): Path<String>,
+    Query(params): Query<RefQuery>,
+    headers: HeaderMap,
+    State(state): State<ServerState>,
+    OriginalUri(uri): OriginalUri,
+) -> impl IntoResponse {
+    if let Some((repo_path, branch)) = path.rsplit_once("/refs/") {
+        let (repo_id, provider) = resolve_repo_id(&state.provider_registry, repo_path);
+        if let Some(resp) =
+            validation::reject_if_invalid(|| validation::validate_repo_path(provider, &repo_id))
+        {
+            return resp;
+        }
+        return get_ref_inner(
+            repo_id,
+            provider.clone(),
+            branch.to_string(),
+            params,
+            headers,
+            state,
+        )
+        .await;
+    }
+
+    if path.ends_with("/status") {
+        let repo_path = path.strip_suffix("/status").unwrap();
+        let (repo_id, provider) = resolve_repo_id(&state.provider_registry, repo_path);
+        if let Some(resp) =
+            validation::reject_if_invalid(|| validation::validate_repo_path(provider, &repo_id))
+        {
+            return resp;
+        }
+        let query = match Query::<RepoStatusQuery>::try_from_uri(&uri) {
+            Ok(q) => q.0,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: e.to_string(),
+                    }),
+                )
+                    .into_response();
+            }
+        };
+        return repo_status_inner(repo_id, provider.clone(), query, state).await;
+    }
+
+    if path.ends_with("/cat") {
+        let repo_path = path.strip_suffix("/cat").unwrap();
+        let (repo_id, provider) = resolve_repo_id(&state.provider_registry, repo_path);
+        if let Some(resp) =
+            validation::reject_if_invalid(|| validation::validate_repo_path(provider, &repo_id))
+        {
+            return resp;
+        }
+        let query = match Query::<CatRequest>::try_from_uri(&uri) {
+            Ok(q) => q.0,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: e.to_string(),
+                    }),
+                )
+                    .into_response();
+            }
+        };
+        return cat_file_inner(repo_id, provider.clone(), query, state).await;
+    }
+
+    if path.ends_with("/sizes") {
+        let repo_path = path.strip_suffix("/sizes").unwrap();
+        let (repo_id, provider) = resolve_repo_id(&state.provider_registry, repo_path);
+        if let Some(resp) =
+            validation::reject_if_invalid(|| validation::validate_repo_path(provider, &repo_id))
+        {
+            return resp;
+        }
+        let query = match Query::<SizesRequest>::try_from_uri(&uri) {
+            Ok(q) => q.0,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: e.to_string(),
+                    }),
+                )
+                    .into_response();
+            }
+        };
+        return file_sizes_inner(repo_id, provider.clone(), query, state).await;
+    }
+
+    if path.ends_with("/hotfiles") {
+        let repo_path = path.strip_suffix("/hotfiles").unwrap();
+        let (repo_id, provider) = resolve_repo_id(&state.provider_registry, repo_path);
+        if let Some(resp) =
+            validation::reject_if_invalid(|| validation::validate_repo_path(provider, &repo_id))
+        {
+            return resp;
+        }
+        let query = match Query::<HotfilesRequest>::try_from_uri(&uri) {
+            Ok(q) => q.0,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: e.to_string(),
+                    }),
+                )
+                    .into_response();
+            }
+        };
+        return get_hotfiles_inner(repo_id, provider.clone(), query, state).await;
+    }
+
+    (
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse {
+            error: "not found".to_string(),
+        }),
+    )
+        .into_response()
+}
+
+async fn dispatch_repos_post(
+    Path(path): Path<String>,
+    headers: HeaderMap,
+    State(state): State<ServerState>,
+    OriginalUri(uri): OriginalUri,
+    body: Body,
+) -> impl IntoResponse {
+    if path.ends_with("/sync") {
+        let repo_path = path.strip_suffix("/sync").unwrap();
+        let (repo_id, provider) = resolve_repo_id(&state.provider_registry, repo_path);
+        if let Some(resp) =
+            validation::reject_if_invalid(|| validation::validate_repo_path(provider, &repo_id))
+        {
+            return resp;
+        }
+        let query = match Query::<SyncRequest>::try_from_uri(&uri) {
+            Ok(q) => q.0,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: format!("invalid sync request: {}", e),
+                    }),
+                )
+                    .into_response();
+            }
+        };
+        return sync_repo_inner(repo_id, provider.clone(), query, headers, state).await;
+    }
+
+    if path.ends_with("/snapshot") {
+        let repo_path = path.strip_suffix("/snapshot").unwrap();
+        let (repo_id, provider) = resolve_repo_id(&state.provider_registry, repo_path);
+        if let Some(resp) =
+            validation::reject_if_invalid(|| validation::validate_repo_path(provider, &repo_id))
+        {
+            return resp;
+        }
+        let query = match Query::<SnapshotRequest>::try_from_uri(&uri) {
+            Ok(q) => q.0,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: e.to_string(),
+                    }),
+                )
+                    .into_response();
+            }
+        };
+        return create_snapshot_inner(repo_id, provider.clone(), query, headers, state).await;
+    }
+
+    if path.ends_with("/batch") {
+        let repo_path = path.strip_suffix("/batch").unwrap();
+        let (repo_id, provider) = resolve_repo_id(&state.provider_registry, repo_path);
+        if let Some(resp) =
+            validation::reject_if_invalid(|| validation::validate_repo_path(provider, &repo_id))
+        {
+            return resp;
+        }
+        let bytes = match axum::body::to_bytes(body, MAX_REQUEST_BODY_BYTES).await {
+            Ok(b) => b,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: format!("read body failed: {}", e),
+                    }),
+                )
+                    .into_response();
+            }
+        };
+        let body: BatchRequest = match serde_json::from_slice(&bytes) {
+            Ok(b) => b,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: format!("invalid batch request: {}", e),
+                    }),
+                )
+                    .into_response();
+            }
+        };
+        return batch_files_inner(repo_id, provider.clone(), body, state).await;
+    }
+
+    (
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse {
+            error: "not found".to_string(),
+        }),
+    )
+        .into_response()
+}
+
+async fn dispatch_git_get(
+    Path(path): Path<String>,
+    Query(query): Query<GitServiceQuery>,
+    headers: HeaderMap,
+    State(state): State<ServerState>,
+) -> Response {
+    if path.ends_with("/info/refs") {
+        let repo_path = path.strip_suffix("/info/refs").unwrap();
+        let (repo_id, provider) = resolve_repo_id(&state.provider_registry, repo_path);
+        if let Some(resp) =
+            validation::reject_if_invalid(|| validation::validate_repo_path(provider, &repo_id))
+        {
+            return resp;
+        }
+        return git_info_refs_inner(repo_id, provider.clone(), query, headers, state).await;
+    }
+
+    (
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse {
+            error: "not found".to_string(),
+        }),
+    )
+        .into_response()
+}
+
+async fn dispatch_git_post(
+    Path(path): Path<String>,
+    headers: HeaderMap,
+    State(state): State<ServerState>,
+    body: Body,
+) -> Response {
+    if path.ends_with("/git-upload-pack") {
+        let repo_path = path.strip_suffix("/git-upload-pack").unwrap();
+        let (repo_id, provider) = resolve_repo_id(&state.provider_registry, repo_path);
+        if let Some(resp) =
+            validation::reject_if_invalid(|| validation::validate_repo_path(provider, &repo_id))
+        {
+            return resp;
+        }
+        return git_upload_pack_inner(repo_id, provider.clone(), body, headers, state).await;
+    }
+
+    (
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse {
+            error: "not found".to_string(),
+        }),
+    )
+        .into_response()
+}
+
 async fn upload_pack_rpc(mirror_dir: &std::path::Path, input: Bytes) -> Result<Vec<u8>> {
     let mirror_dir = mirror_dir.to_path_buf();
     tokio::task::spawn_blocking(move || {
@@ -845,16 +1219,24 @@ async fn upload_pack_rpc(mirror_dir: &std::path::Path, input: Bytes) -> Result<V
 
 async fn ensure_mirror(
     mirror_dir: &std::path::Path,
+    provider: &ProviderInstance,
     repo_id: &RepoId,
     branch: &str,
-    github_token: Option<&secrecy::SecretString>,
+    credential: Option<&secrecy::SecretString>,
 ) -> Result<()> {
     let mirror_dir = mirror_dir.to_path_buf();
+    let provider = provider.clone();
     let repo_id = repo_id.clone();
     let branch = branch.to_string();
-    let github_token = github_token.map(|s| s.expose_secret().to_string());
+    let credential = credential.cloned();
     tokio::task::spawn_blocking(move || {
-        git::sync_bare_mirror(&mirror_dir, &repo_id, &branch, github_token.as_deref())
+        git::sync_bare_mirror(
+            &mirror_dir,
+            &provider,
+            &repo_id,
+            &branch,
+            credential.as_ref(),
+        )
     })
     .await
     .context("ensure mirror task")?
@@ -945,16 +1327,15 @@ fn invalidate_ref_response_cache(state: &ServerState, repo_id: &RepoId, branch: 
     cache.retain(|key, _| !key.starts_with(&prefix));
 }
 
-async fn get_ref(
-    Path((owner, repo, branch)): Path<(String, String, String)>,
-    Query(params): Query<RefQuery>,
-    State(state): State<ServerState>,
+async fn get_ref_inner(
+    repo_id: RepoId,
+    provider: ProviderInstance,
+    branch: String,
+    params: RefQuery,
     headers: HeaderMap,
-) -> impl IntoResponse {
+    state: ServerState,
+) -> Response {
     let private = visibility_is_private(&headers);
-    if let Some(resp) = reject_invalid_repo_ids(&owner, &repo) {
-        return resp;
-    }
     if let Some(resp) = validation::reject_if_invalid(|| validation::validate_git_rev(&branch)) {
         return resp;
     }
@@ -964,7 +1345,6 @@ async fn get_ref(
         return resp;
     }
     state.metrics.record_ref_lookup();
-    let repo_id = RepoId::github(format!("{owner}/{repo}"));
     let key = format!("{}/{}", repo_id.storage_key(), branch);
     // Optional build-commit override: resolve this rev instead of the branch tip
     // so a clone can fetch the artifacts a `sync?rev=...` built. The response
@@ -972,10 +1352,10 @@ async fn get_ref(
     let resolve_target = params.rev.clone().unwrap_or_else(|| branch.clone());
 
     let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
-    let github_token = state
-        .github_token
-        .clone()
-        .map(|s| secrecy::SecretString::new(s.into()));
+    let request_token = upstream_token_from_headers(&headers);
+    let credential = state
+        .broker
+        .fetch_credential(&repo_id, request_token.as_ref());
 
     // Serialize syncs for this repo so concurrent fetches do not corrupt the
     // bare mirror directory. Acquiring the lock also means any in-progress sync
@@ -991,7 +1371,15 @@ async fn get_ref(
     // Skip the `git fetch` when the mirror was refreshed within the TTL — by a
     // recent resolve, or by the sync we just waited on while holding the lock.
     if !mirror_is_fresh(&state, &fresh_key) {
-        if let Err(e) = ensure_mirror(&mirror_dir, &repo_id, &branch, github_token.as_ref()).await {
+        if let Err(e) = ensure_mirror(
+            &mirror_dir,
+            &provider,
+            &repo_id,
+            &branch,
+            credential.as_ref(),
+        )
+        .await
+        {
             state.metrics.record_error();
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1053,13 +1441,9 @@ async fn get_ref(
                 build_status: None,
                 synced_at: None,
             });
-            let (resp_owner, resp_repo) = repo_id
-                .github_owner_repo()
-                .map(|(o, r)| (o.to_string(), r.to_string()))
-                .unwrap_or_else(|| (owner.clone(), repo.clone()));
             let resp = ref_response(
-                resp_owner,
-                resp_repo,
+                &repo_id,
+                &provider,
                 branch.clone(),
                 &info,
                 &state.storage,
@@ -1082,6 +1466,20 @@ async fn get_ref(
                 .into_response()
         }
     }
+}
+
+async fn get_ref(
+    Path((owner, repo, branch)): Path<(String, String, String)>,
+    Query(params): Query<RefQuery>,
+    headers: HeaderMap,
+    State(state): State<ServerState>,
+) -> impl IntoResponse {
+    if let Some(resp) = reject_invalid_repo_ids(&owner, &repo) {
+        return resp;
+    }
+    let repo_id = RepoId::github(format!("{owner}/{repo}"));
+    let provider = state.provider_registry.default_provider().clone();
+    get_ref_inner(repo_id, provider, branch, params, headers, state).await
 }
 
 /// TTL for signed chunk URLs returned in ref responses. Public repos get a long
@@ -1109,8 +1507,8 @@ fn ref_signed_url_ttl(private: bool) -> Duration {
 }
 
 fn ref_response(
-    owner: String,
-    repo: String,
+    repo_id: &RepoId,
+    provider: &ProviderInstance,
     branch: String,
     info: &RefInfo,
     storage: &crate::storage::StorageRef,
@@ -1215,9 +1613,17 @@ fn ref_response(
         artifacts.commit.clone()
     };
 
+    let (owner, repo) = repo_id
+        .github_owner_repo()
+        .map(|(o, r)| (o.to_string(), r.to_string()))
+        .unwrap_or_else(|| (repo_id.provider.as_str().to_string(), repo_id.path.clone()));
+    let origin_url = provider.clone_url(&repo_id.path);
     RefResponse {
         owner,
         repo,
+        provider: provider.id.as_str().to_string(),
+        host: provider.host.clone(),
+        origin_url,
         branch,
         default_branch: info.default_branch.clone(),
         commit: served_commit,
@@ -1265,15 +1671,12 @@ struct RepoStatusQuery {
     fork_of: Option<String>,
 }
 
-async fn repo_status(
-    Path((owner, repo)): Path<(String, String)>,
-    Query(query): Query<RepoStatusQuery>,
-    State(state): State<ServerState>,
-) -> impl IntoResponse {
-    if let Some(resp) = reject_invalid_repo_ids(&owner, &repo) {
-        return resp;
-    }
-    let repo_id = RepoId::github(format!("{owner}/{repo}"));
+async fn repo_status_inner(
+    repo_id: RepoId,
+    _provider: ProviderInstance,
+    query: RepoStatusQuery,
+    state: ServerState,
+) -> Response {
     match build_repo_status(&state, &repo_id, query.public, query.fork_of.as_deref()).await {
         Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
         Err(e) => {
@@ -1287,6 +1690,19 @@ async fn repo_status(
                 .into_response()
         }
     }
+}
+
+async fn repo_status(
+    Path((owner, repo)): Path<(String, String)>,
+    Query(query): Query<RepoStatusQuery>,
+    State(state): State<ServerState>,
+) -> impl IntoResponse {
+    if let Some(resp) = reject_invalid_repo_ids(&owner, &repo) {
+        return resp;
+    }
+    let repo_id = RepoId::github(format!("{owner}/{repo}"));
+    let provider = state.provider_registry.default_provider().clone();
+    repo_status_inner(repo_id, provider, query, state).await
 }
 
 fn manifest_chunk_refs(manifest: &ClonepackManifest) -> Vec<&ChunkRef> {
@@ -1466,15 +1882,13 @@ fn split_and_store_pack(cas: &crate::cas::Cas, pack: &[u8]) -> Result<Vec<ChunkR
     Ok(refs)
 }
 
-async fn sync_repo(
-    Path((owner, repo)): Path<(String, String)>,
-    Query(params): Query<SyncRequest>,
+async fn sync_repo_inner(
+    repo_id: RepoId,
+    provider: ProviderInstance,
+    params: SyncRequest,
     headers: HeaderMap,
-    State(state): State<ServerState>,
-) -> impl IntoResponse {
-    if let Some(resp) = reject_invalid_repo_ids(&owner, &repo) {
-        return resp;
-    }
+    state: ServerState,
+) -> Response {
     if let Some(resp) =
         validation::reject_if_invalid(|| validation::validate_git_rev(&params.branch))
     {
@@ -1486,7 +1900,6 @@ async fn sync_repo(
         return resp;
     }
     let start = Instant::now();
-    let repo_id = RepoId::github(format!("{owner}/{repo}"));
     let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
     let branch = params.branch;
     let at_rev = params.rev;
@@ -1494,16 +1907,10 @@ async fn sync_repo(
     // branch entry (see ref_store_key). Used when loading the result for the
     // sync response below.
     let ref_key = ref_store_key(&branch, at_rev.as_deref());
-    let github_token = headers
-        .get("X-GitHub-Token")
-        .and_then(|v| v.to_str().ok())
-        .map(|t| secrecy::SecretString::new(t.into()))
-        .or_else(|| {
-            state
-                .github_token
-                .clone()
-                .map(|s| secrecy::SecretString::new(s.into()))
-        });
+    let request_token = upstream_token_from_headers(&headers);
+    let credential = state
+        .broker
+        .fetch_credential(&repo_id, request_token.as_ref());
     let private = visibility_is_private(&headers);
 
     // Async build queue: enqueue the build onto the bounded background worker so
@@ -1536,7 +1943,7 @@ async fn sync_repo(
                 repo_id: repo_id.clone(),
                 branch: branch.clone(),
                 rev: at_rev.clone(),
-                github_token,
+                credential,
             };
             if state.build_queue.try_send(job).is_err() {
                 state.build_queue_depth.fetch_sub(1, Ordering::Relaxed);
@@ -1560,13 +1967,9 @@ async fn sync_repo(
             Ok(Ok(Ok(()))) => match state.ref_store.load_branch(&repo_id, &ref_key).await {
                 Ok(Some(info)) => {
                     state.metrics.record_sync(start.elapsed());
-                    let (resp_owner, resp_repo) = repo_id
-                        .github_owner_repo()
-                        .map(|(o, r)| (o.to_string(), r.to_string()))
-                        .unwrap_or_else(|| (owner.clone(), repo.clone()));
                     let resp = ref_response(
-                        resp_owner,
-                        resp_repo,
+                        &repo_id,
+                        &provider,
                         branch.clone(),
                         &info,
                         &state.storage,
@@ -1630,7 +2033,8 @@ async fn sync_repo(
         false,
         &state.storage,
         &state.retention,
-        github_token.as_ref(),
+        &provider,
+        credential.as_ref(),
     )
     .await
     {
@@ -1640,13 +2044,9 @@ async fn sync_repo(
             // skip its own fetch.
             stamp_mirror_fresh(&state, &format!("{}/{}", repo_id.storage_key(), branch));
             invalidate_ref_response_cache(&state, &repo_id, &branch);
-            let (resp_owner, resp_repo) = repo_id
-                .github_owner_repo()
-                .map(|(o, r)| (o.to_string(), r.to_string()))
-                .unwrap_or_else(|| (owner.clone(), repo.clone()));
             let resp = ref_response(
-                resp_owner,
-                resp_repo,
+                &repo_id,
+                &provider,
                 branch.clone(),
                 &info,
                 &state.storage,
@@ -1668,6 +2068,20 @@ async fn sync_repo(
                 .into_response()
         }
     }
+}
+
+async fn sync_repo(
+    Path((owner, repo)): Path<(String, String)>,
+    Query(params): Query<SyncRequest>,
+    headers: HeaderMap,
+    State(state): State<ServerState>,
+) -> impl IntoResponse {
+    if let Some(resp) = reject_invalid_repo_ids(&owner, &repo) {
+        return resp;
+    }
+    let repo_id = RepoId::github(format!("{owner}/{repo}"));
+    let provider = state.provider_registry.default_provider().clone();
+    sync_repo_inner(repo_id, provider, params, headers, state).await
 }
 
 async fn build_handler(
@@ -1750,14 +2164,12 @@ async fn build_handler(
     }
 
     let job_repo_id = RepoId::github(format!("{}/{}", body.owner, body.repo));
+    let credential = state.broker.fetch_credential(&job_repo_id, None);
     let job = BuildJob {
         repo_id: job_repo_id,
         branch: "HEAD".to_string(),
         rev: None,
-        github_token: state
-            .github_token
-            .clone()
-            .map(|s| secrecy::SecretString::new(s.into())),
+        credential,
     };
 
     // Increment counters before enqueueing so a fast worker cannot decrement
@@ -1789,20 +2201,17 @@ async fn build_handler(
         .into_response()
 }
 
-async fn cat_file(
-    Path((owner, repo)): Path<(String, String)>,
-    Query(query): Query<CatRequest>,
-    State(state): State<ServerState>,
-) -> impl IntoResponse {
-    if let Some(resp) = reject_invalid_repo_ids(&owner, &repo) {
-        return resp;
-    }
+async fn cat_file_inner(
+    repo_id: RepoId,
+    _provider: ProviderInstance,
+    query: CatRequest,
+    state: ServerState,
+) -> Response {
     if let Some(resp) =
         validation::reject_if_invalid(|| validation::validate_git_rev(&query.branch))
     {
         return resp;
     }
-    let repo_id = RepoId::github(format!("{owner}/{repo}"));
     let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
     let path = query.path;
     let branch = query.branch;
@@ -1834,20 +2243,30 @@ async fn cat_file(
     }
 }
 
-async fn file_sizes(
+async fn cat_file(
     Path((owner, repo)): Path<(String, String)>,
-    Query(query): Query<SizesRequest>,
+    Query(query): Query<CatRequest>,
     State(state): State<ServerState>,
 ) -> impl IntoResponse {
     if let Some(resp) = reject_invalid_repo_ids(&owner, &repo) {
         return resp;
     }
+    let repo_id = RepoId::github(format!("{owner}/{repo}"));
+    let provider = state.provider_registry.default_provider().clone();
+    cat_file_inner(repo_id, provider, query, state).await
+}
+
+async fn file_sizes_inner(
+    repo_id: RepoId,
+    _provider: ProviderInstance,
+    query: SizesRequest,
+    state: ServerState,
+) -> Response {
     if let Some(resp) =
         validation::reject_if_invalid(|| validation::validate_git_rev(&query.branch))
     {
         return resp;
     }
-    let repo_id = RepoId::github(format!("{owner}/{repo}"));
     let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
     let branch = query.branch;
 
@@ -1876,25 +2295,36 @@ async fn file_sizes(
     }
 }
 
-async fn create_snapshot(
+async fn file_sizes(
     Path((owner, repo)): Path<(String, String)>,
-    Query(query): Query<SnapshotRequest>,
+    Query(query): Query<SizesRequest>,
     State(state): State<ServerState>,
 ) -> impl IntoResponse {
     if let Some(resp) = reject_invalid_repo_ids(&owner, &repo) {
         return resp;
     }
+    let repo_id = RepoId::github(format!("{owner}/{repo}"));
+    let provider = state.provider_registry.default_provider().clone();
+    file_sizes_inner(repo_id, provider, query, state).await
+}
+
+async fn create_snapshot_inner(
+    repo_id: RepoId,
+    provider: ProviderInstance,
+    query: SnapshotRequest,
+    headers: HeaderMap,
+    state: ServerState,
+) -> Response {
     if let Some(resp) =
         validation::reject_if_invalid(|| validation::validate_git_rev(&query.branch))
     {
         return resp;
     }
-    let repo_id = RepoId::github(format!("{owner}/{repo}"));
     let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
-    let github_token = state
-        .github_token
-        .clone()
-        .map(|s| secrecy::SecretString::new(s.into()));
+    let request_token = upstream_token_from_headers(&headers);
+    let credential = state
+        .broker
+        .fetch_credential(&repo_id, request_token.as_ref());
     let branch = query.branch.clone();
 
     let lock = repo_lock(&state.sync_locks, &repo_id).await;
@@ -1909,7 +2339,8 @@ async fn create_snapshot(
         false,
         &state.storage,
         &state.retention,
-        github_token.as_ref(),
+        &provider,
+        credential.as_ref(),
     )
     .await
     {
@@ -1942,19 +2373,25 @@ async fn create_snapshot(
     })
     .await
     {
-        Ok(Ok(snap)) => (
-            StatusCode::OK,
-            Json(SnapshotResponse {
-                owner,
-                repo,
-                branch: query.branch,
-                commit: snap.commit,
-                snapshot_hash: snap.hash,
-                size: snap.size,
-                hot_files: snap.hot_files,
-            }),
-        )
-            .into_response(),
+        Ok(Ok(snap)) => {
+            let (resp_owner, resp_repo) = repo_id
+                .github_owner_repo()
+                .map(|(o, r)| (o.to_string(), r.to_string()))
+                .unwrap_or_else(|| (repo_id.provider.as_str().to_string(), repo_id.path.clone()));
+            (
+                StatusCode::OK,
+                Json(SnapshotResponse {
+                    owner: resp_owner,
+                    repo: resp_repo,
+                    branch: query.branch,
+                    commit: snap.commit,
+                    snapshot_hash: snap.hash,
+                    size: snap.size,
+                    hot_files: snap.hot_files,
+                }),
+            )
+                .into_response()
+        }
         Ok(Err(e)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
@@ -1972,15 +2409,26 @@ async fn create_snapshot(
     }
 }
 
-async fn get_hotfiles(
+async fn create_snapshot(
     Path((owner, repo)): Path<(String, String)>,
-    Query(query): Query<HotfilesRequest>,
+    Query(query): Query<SnapshotRequest>,
+    headers: HeaderMap,
     State(state): State<ServerState>,
 ) -> impl IntoResponse {
     if let Some(resp) = reject_invalid_repo_ids(&owner, &repo) {
         return resp;
     }
     let repo_id = RepoId::github(format!("{owner}/{repo}"));
+    let provider = state.provider_registry.default_provider().clone();
+    create_snapshot_inner(repo_id, provider, query, headers, state).await
+}
+
+async fn get_hotfiles_inner(
+    repo_id: RepoId,
+    _provider: ProviderInstance,
+    query: HotfilesRequest,
+    state: ServerState,
+) -> Response {
     let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
     let branch = query.branch;
     let count = query.count;
@@ -2012,14 +2460,25 @@ async fn get_hotfiles(
     }
 }
 
-async fn batch_files(
+async fn get_hotfiles(
     Path((owner, repo)): Path<(String, String)>,
+    Query(query): Query<HotfilesRequest>,
     State(state): State<ServerState>,
-    Json(body): Json<BatchRequest>,
 ) -> impl IntoResponse {
     if let Some(resp) = reject_invalid_repo_ids(&owner, &repo) {
         return resp;
     }
+    let repo_id = RepoId::github(format!("{owner}/{repo}"));
+    let provider = state.provider_registry.default_provider().clone();
+    get_hotfiles_inner(repo_id, provider, query, state).await
+}
+
+async fn batch_files_inner(
+    repo_id: RepoId,
+    _provider: ProviderInstance,
+    body: BatchRequest,
+    state: ServerState,
+) -> Response {
     if let Some(resp) = validation::reject_if_invalid(|| validation::validate_git_rev(&body.branch))
     {
         return resp;
@@ -2029,7 +2488,6 @@ async fn batch_files(
     {
         return resp;
     }
-    let repo_id = RepoId::github(format!("{owner}/{repo}"));
     let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
     let branch = body.branch;
     let commit_hint = body.commit;
@@ -2075,6 +2533,19 @@ async fn batch_files(
         )
             .into_response(),
     }
+}
+
+async fn batch_files(
+    Path((owner, repo)): Path<(String, String)>,
+    State(state): State<ServerState>,
+    Json(body): Json<BatchRequest>,
+) -> impl IntoResponse {
+    if let Some(resp) = reject_invalid_repo_ids(&owner, &repo) {
+        return resp;
+    }
+    let repo_id = RepoId::github(format!("{owner}/{repo}"));
+    let provider = state.provider_registry.default_provider().clone();
+    batch_files_inner(repo_id, provider, body, state).await
 }
 
 fn validate_artifact_hash(hash: &str) -> Option<Response> {
@@ -2696,7 +3167,8 @@ async fn do_sync(
     build_full_pack: bool,
     storage: &crate::storage::StorageRef,
     retention: &Arc<Retention>,
-    github_token: Option<&secrecy::SecretString>,
+    provider: &ProviderInstance,
+    credential: Option<&secrecy::SecretString>,
 ) -> Result<RefInfo> {
     info!("syncing {}@{}", repo_id.storage_key(), branch);
 
@@ -2717,15 +3189,17 @@ async fn do_sync(
     // Sync the bare mirror synchronously (blocking git call).
     let mirror_dir_sync = mirror_dir.to_path_buf();
     let mirror_dir = mirror_dir.to_path_buf();
+    let provider_sync = provider.clone();
     let repo_id_sync = repo_id.clone();
     let branch_sync = branch.to_string();
-    let github_token = github_token.map(|s| s.expose_secret().to_string());
+    let credential_sync = credential.cloned();
     tokio::task::spawn_blocking(move || {
         git::sync_bare_mirror(
             &mirror_dir_sync,
+            &provider_sync,
             &repo_id_sync,
             &branch_sync,
-            github_token.as_deref(),
+            credential_sync.as_ref(),
         )
     })
     .await
@@ -4135,6 +4609,18 @@ fn spawn_build_worker(state: ServerState) -> tokio::sync::mpsc::Sender<BuildJob>
 
             let start = std::time::Instant::now();
             let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
+            let provider = match state.provider_registry.get(repo_id.provider.as_str()) {
+                Some(p) => p.clone(),
+                None => {
+                    let _ = update_build_status(&state, &repo_id, "error").await;
+                    warn!(
+                        "unknown provider {} for build job",
+                        repo_id.provider.as_str()
+                    );
+                    state.build_queue_depth.fetch_sub(1, Ordering::Relaxed);
+                    continue;
+                }
+            };
             let lock = repo_lock(&state.sync_locks, &repo_id).await;
             let _guard = lock.lock().await;
             let result = do_sync(
@@ -4147,7 +4633,8 @@ fn spawn_build_worker(state: ServerState) -> tokio::sync::mpsc::Sender<BuildJob>
                 false,
                 &state.storage,
                 &state.retention,
-                job.github_token.as_ref(),
+                &provider,
+                job.credential.as_ref(),
             )
             .await;
             drop(_guard);
@@ -4256,14 +4743,12 @@ pub async fn run_server(
     let token_hash = auth_token_hash(env::var("RIPCLONE_TOKEN").ok())?;
     info!("RIPCLONE_TOKEN configured; auth middleware enabled");
 
-    let github_token = env::var("RIPCLONE_GITHUB_TOKEN")
-        .ok()
-        .filter(|t| !t.is_empty());
-    if github_token.is_some() {
-        info!("RIPCLONE_GITHUB_TOKEN configured; private repo sync enabled");
-    }
-
-    let provider_registry = ProviderRegistry::new();
+    let provider_registry = ProviderRegistry::load().context("load provider registry")?;
+    info!(
+        "provider registry loaded with {} instance(s)",
+        provider_registry.iter().count()
+    );
+    let broker: Arc<dyn CredentialBroker> = Arc::new(StaticBroker::new(provider_registry.clone()));
 
     let rate_burst: u32 = env::var("RIPCLONE_RATE_LIMIT_BURST")
         .ok()
@@ -4337,8 +4822,8 @@ pub async fn run_server(
         repo_root: repo_root.to_path_buf(),
         ref_store,
         provider_registry,
+        broker,
         token_hash: Some(token_hash),
-        github_token,
         metrics,
         rate_limiter,
         retention,
@@ -4393,14 +4878,17 @@ mod tests {
         let metrics = Metrics::new();
         let retention = Arc::new(Retention::new(cas.clone(), metrics.clone()).unwrap());
         let (build_queue, _build_rx) = tokio::sync::mpsc::channel::<BuildJob>(16);
+        let provider_registry = ProviderRegistry::new();
+        let broker: Arc<dyn CredentialBroker> =
+            Arc::new(StaticBroker::new(provider_registry.clone()));
         ServerState {
             cas,
             storage,
             repo_root,
             ref_store,
-            provider_registry: ProviderRegistry::new(),
+            provider_registry,
+            broker,
             token_hash: Some(token_hash),
-            github_token: None,
             metrics,
             rate_limiter: RateLimiter::new(100, 100.0),
             retention,
@@ -4509,9 +4997,11 @@ mod tests {
             build_status: None,
             synced_at: None,
         };
+        let provider = ProviderRegistry::new().default_provider().clone();
+        let repo_id = RepoId::github("o/r");
         let resp = ref_response(
-            "o".to_string(),
-            "r".to_string(),
+            &repo_id,
+            &provider,
             "main".to_string(),
             &info,
             &storage,
@@ -4553,6 +5043,9 @@ mod tests {
         let resp = RefResponse {
             owner: "acme".to_string(),
             repo: "secret".to_string(),
+            provider: "github".to_string(),
+            host: "github.com".to_string(),
+            origin_url: "https://github.com/acme/secret.git".to_string(),
             branch: "main".to_string(),
             default_branch: "main".to_string(),
             commit: "commit1".to_string(),
