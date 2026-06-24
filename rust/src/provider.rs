@@ -24,6 +24,8 @@
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 
+pub use crate::provider_config::load_registry_with_token_store;
+
 /// Built-in default instance id. All legacy `{owner}/{repo}` routes resolve to
 /// this instance.
 const DEFAULT_PROVIDER_ID: &str = "github";
@@ -224,82 +226,71 @@ impl ProviderRegistry {
     /// Load from configuration.
     ///
     /// Reads `RIPCLONE_PROVIDERS` as JSON first, then merges a config file at
-    /// `RIPCLONE_PROVIDERS_CONFIG` if present. The built-in `github` default is
-    /// always present and can be overridden by config (host, token, template).
+    /// `RIPCLONE_PROVIDERS_CONFIG` if present, then merges the default
+    /// `~/.config/ripclone/providers.json`. Tokens are resolved from the
+    /// `RIPCLONE_PROVIDER_<ID>_TOKEN` env var, the OS keyring, or a fallback
+    /// token file. The built-in `github` default is always present and can be
+    /// overridden by config (host, token, template).
     pub fn load() -> Result<Self> {
-        let mut registry = Self::new();
+        let token_store = crate::auth::token_store::FallbackTokenStore::new()
+            .context("initialize token store")?;
+        crate::provider_config::load_registry_with_token_store(&token_store)
+    }
 
-        if let Some(json) = std::env::var("RIPCLONE_PROVIDERS")
-            .ok()
-            .filter(|t| !t.is_empty())
-        {
-            let configs: Vec<ProviderConfig> =
-                serde_json::from_str(&json).with_context(|| "parse RIPCLONE_PROVIDERS JSON")?;
-            registry.merge_configs(configs)?;
+    /// Merge a single provider config into the registry.
+    pub fn merge_one(&mut self, cfg: ProviderConfig) -> Result<()> {
+        let id = cfg.id;
+        if id.is_empty() {
+            anyhow::bail!("provider config entry missing id");
         }
 
-        if let Some(path) = std::env::var("RIPCLONE_PROVIDERS_CONFIG")
-            .ok()
-            .filter(|t| !t.is_empty())
-        {
-            let data = std::fs::read_to_string(&path)
-                .with_context(|| format!("read providers config {}", path))?;
-            let configs: Vec<ProviderConfig> = serde_json::from_str(&data)
-                .with_context(|| format!("parse providers config {}", path))?;
-            registry.merge_configs(configs)?;
+        let kind = match cfg.kind.as_deref() {
+            Some(k) => k.parse()?,
+            None => ProviderKind::Generic,
+        };
+
+        let host = match cfg.host {
+            Some(h) => h,
+            None => match kind {
+                ProviderKind::GitHub => "github.com".to_string(),
+                ProviderKind::GitLab => "gitlab.com".to_string(),
+                ProviderKind::Bitbucket => "bitbucket.org".to_string(),
+                ProviderKind::Gitea => {
+                    anyhow::bail!("gitea provider '{}' requires a host", id)
+                }
+                ProviderKind::Generic => {
+                    anyhow::bail!("generic provider '{}' requires a host", id)
+                }
+            },
+        };
+
+        if kind == ProviderKind::Generic && cfg.auth_template.is_none() {
+            anyhow::bail!(
+                "generic provider '{}' requires auth_template (e.g. 'token {{token}}')",
+                id
+            );
         }
 
-        Ok(registry)
+        if let Some(token) = cfg.token {
+            self.tokens
+                .insert(id.clone(), secrecy::SecretString::new(token.into()));
+        }
+
+        self.providers.insert(
+            id.clone(),
+            ProviderInstance {
+                id: ProviderInstanceId::new(id),
+                kind,
+                host,
+                auth_template: cfg.auth_template,
+            },
+        );
+        Ok(())
     }
 
     fn merge_configs(&mut self, configs: Vec<ProviderConfig>) -> Result<()> {
         for cfg in configs {
-            let id = cfg.id;
-            if id.is_empty() {
-                anyhow::bail!("provider config entry missing id");
-            }
-
-            let kind = match cfg.kind.as_deref() {
-                Some(k) => k.parse()?,
-                None => ProviderKind::Generic,
-            };
-
-            let host = match cfg.host {
-                Some(h) => h,
-                None => match kind {
-                    ProviderKind::GitHub => "github.com".to_string(),
-                    ProviderKind::GitLab => "gitlab.com".to_string(),
-                    ProviderKind::Bitbucket => "bitbucket.org".to_string(),
-                    ProviderKind::Gitea => {
-                        anyhow::bail!("gitea provider '{}' requires a host", id)
-                    }
-                    ProviderKind::Generic => {
-                        anyhow::bail!("generic provider '{}' requires a host", id)
-                    }
-                },
-            };
-
-            if kind == ProviderKind::Generic && cfg.auth_template.is_none() {
-                anyhow::bail!(
-                    "generic provider '{}' requires auth_template (e.g. 'token {{token}}')",
-                    id
-                );
-            }
-
-            if let Some(token) = cfg.token {
-                self.tokens
-                    .insert(id.clone(), secrecy::SecretString::new(token.into()));
-            }
-
-            self.providers.insert(
-                id.clone(),
-                ProviderInstance {
-                    id: ProviderInstanceId::new(id),
-                    kind,
-                    host,
-                    auth_template: cfg.auth_template,
-                },
-            );
+            self.merge_one(cfg)?;
         }
         Ok(())
     }

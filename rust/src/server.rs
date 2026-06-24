@@ -4661,9 +4661,46 @@ fn auth_token_hash(raw: Option<String>) -> Result<String> {
         .map(|t| format!("{:x}", Sha256::digest(t.as_bytes())))
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "RIPCLONE_TOKEN is not set. Refusing to start an unauthenticated server."
+                "RIPCLONE_SERVER_TOKEN is not set. Refusing to start an unauthenticated server."
             )
         })
+}
+
+/// Read the server auth token from the environment.
+///
+/// Precedence:
+///   1. RIPCLONE_SERVER_TOKEN_HASH (already hashed)
+///   2. RIPCLONE_SERVER_TOKEN (raw)
+///   3. RIPCLONE_TOKEN_HASH (deprecated, already hashed)
+///   4. RIPCLONE_TOKEN (deprecated, raw)
+fn read_server_auth_token() -> Result<String> {
+    if let Some(hash) = env::var("RIPCLONE_SERVER_TOKEN_HASH")
+        .ok()
+        .filter(|t| !t.is_empty())
+    {
+        return Ok(hash);
+    }
+    if let Some(raw) = env::var("RIPCLONE_SERVER_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty())
+    {
+        return Ok(format!("{:x}", Sha256::digest(raw.as_bytes())));
+    }
+    if let Some(hash) = env::var("RIPCLONE_TOKEN_HASH")
+        .ok()
+        .filter(|t| !t.is_empty())
+    {
+        eprintln!("warning: RIPCLONE_TOKEN_HASH is deprecated for server auth; use RIPCLONE_SERVER_TOKEN_HASH");
+        return Ok(hash);
+    }
+    if let Some(raw) = env::var("RIPCLONE_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty())
+    {
+        eprintln!("warning: RIPCLONE_TOKEN is deprecated for server auth; use RIPCLONE_SERVER_TOKEN");
+        return Ok(format!("{:x}", Sha256::digest(raw.as_bytes())));
+    }
+    auth_token_hash(None)
 }
 
 pub async fn run_server(
@@ -4675,8 +4712,8 @@ pub async fn run_server(
     std::fs::create_dir_all(cas_dir)?;
     std::fs::create_dir_all(repo_root)?;
 
-    let token_hash = auth_token_hash(env::var("RIPCLONE_TOKEN").ok())?;
-    info!("RIPCLONE_TOKEN configured; auth middleware enabled");
+    let token_hash = read_server_auth_token()?;
+    info!("server auth token configured; auth middleware enabled");
 
     let provider_registry = ProviderRegistry::load().context("load provider registry")?;
     info!(
@@ -4868,13 +4905,35 @@ mod tests {
         for missing in [None, Some(String::new())] {
             let err = auth_token_hash(missing).unwrap_err().to_string();
             assert!(
-                err.contains("RIPCLONE_TOKEN"),
+                err.contains("RIPCLONE_SERVER_TOKEN"),
                 "error should mention missing token: {err}"
             );
         }
         // ...and a real token hashes to the same digest the auth middleware checks.
         let hash = auth_token_hash(Some("secret".to_string())).unwrap();
         assert_eq!(hash, format!("{:x}", Sha256::digest("secret")));
+    }
+
+    #[test]
+    fn read_server_auth_token_prefers_new_env_vars() {
+        // Clean deprecated vars.
+        unsafe {
+            env::remove_var("RIPCLONE_TOKEN");
+            env::remove_var("RIPCLONE_TOKEN_HASH");
+            env::remove_var("RIPCLONE_SERVER_TOKEN");
+            env::remove_var("RIPCLONE_SERVER_TOKEN_HASH");
+        }
+        unsafe { env::set_var("RIPCLONE_SERVER_TOKEN", "new-secret") };
+        assert_eq!(
+            read_server_auth_token().unwrap(),
+            format!("{:x}", Sha256::digest("new-secret"))
+        );
+        unsafe { env::set_var("RIPCLONE_SERVER_TOKEN_HASH", "prefixed-hash") };
+        assert_eq!(read_server_auth_token().unwrap(), "prefixed-hash");
+        unsafe {
+            env::remove_var("RIPCLONE_SERVER_TOKEN");
+            env::remove_var("RIPCLONE_SERVER_TOKEN_HASH");
+        }
     }
 
     #[test]

@@ -21,23 +21,17 @@ async fn main() -> Result<()> {
     if args.len() != 3 {
         anyhow::bail!("usage: git-remote-ripclone <remote> <url>");
     }
-    let _remote_name = &args[1];
+    let remote_name = &args[1];
     let url = &args[2];
 
     let (provider, repo_path, requested_branch) = parse_url(url)?;
-    let server_url =
-        env::var("RIPCLONE_URL").context("RIPCLONE_URL environment variable is required")?;
-    let token_hash = env::var("RIPCLONE_TOKEN_HASH")
-        .ok()
-        .filter(|t| !t.is_empty())
-        .or_else(|| {
-            env::var("RIPCLONE_TOKEN")
-                .ok()
-                .filter(|t| !t.is_empty())
-                .map(|t| format!("{:x}", Sha256::digest(t.as_bytes())))
-        });
+    let server_url = resolve_server_url(remote_name)?;
+    let token_hash = resolve_server_token();
+    let insecure = env::var_os("RIPCLONE_INSECURE").is_some();
 
-    let client = Client::new_with_token(server_url, token_hash).with_provider(&provider);
+    let client = Client::new_with_token(server_url, token_hash)
+        .with_provider(&provider)
+        .with_insecure(insecure);
 
     let (git_dir, work_tree) = git_dirs()?;
 
@@ -46,6 +40,7 @@ async fn main() -> Result<()> {
     let mut lines = reader.lines();
     let mut stdout = tokio::io::stdout();
     let mut resolved: Option<RefResponse> = None;
+    let mut requested_depth: Option<usize> = None;
 
     while let Some(line) = lines.next_line().await? {
         match line.trim() {
@@ -53,6 +48,7 @@ async fn main() -> Result<()> {
                 stdout.write_all(b"connect\n").await?;
                 stdout.write_all(b"list\n").await?;
                 stdout.write_all(b"option\n").await?;
+                stdout.write_all(b"shallow\n").await?;
                 stdout.write_all(b"\n").await?;
                 stdout.flush().await?;
             }
@@ -77,14 +73,20 @@ async fn main() -> Result<()> {
             cmd if cmd.starts_with("option ") => {
                 // Accept all options we know about; ignore the rest.
                 let rest = &cmd[7..];
-                let (name, _value) = rest.split_once(' ').unwrap_or((rest, ""));
+                let (name, value) = rest.split_once(' ').unwrap_or((rest, ""));
                 match name {
                     "verbosity" | "progress" | "followtags" => {
                         stdout.write_all(b"ok\n").await?;
                     }
-                    "depth" | "dry-run" => {
-                        // Tell git these options are not implemented by this
-                        // helper so git does not assume they were honored.
+                    "depth" => {
+                        if let Ok(d) = value.parse::<usize>() {
+                            requested_depth = Some(d);
+                            stdout.write_all(b"ok\n").await?;
+                        } else {
+                            stdout.write_all(b"unsupported\n").await?;
+                        }
+                    }
+                    "dry-run" => {
                         stdout.write_all(b"unsupported\n").await?;
                     }
                     _ => {
@@ -99,9 +101,17 @@ async fn main() -> Result<()> {
                 } else {
                     &requested_branch
                 };
+                let clonepack_kind = match requested_depth {
+                    Some(1) => Some("shallow"),
+                    _ => Some("full"),
+                };
                 let info = match resolved {
                     Some(ref info) => info.clone(),
-                    None => client.resolve_ref(&repo_path, branch).await?,
+                    None => {
+                        client
+                            .resolve_ref_with_clonepack(&repo_path, branch, clonepack_kind, None)
+                            .await?
+                    }
                 };
 
                 client
@@ -201,6 +211,84 @@ fn parse_url(url: &str) -> Result<(String, String, String)> {
     Ok((provider, repo_path, branch))
 }
 
+/// Resolve the ripclone server URL.
+///
+/// Precedence:
+///   1. RIPCLONE_SERVER environment variable
+///   2. RIPCLONE_URL environment variable (deprecated)
+///   3. git config remote.<name>.ripcloneServer
+fn resolve_server_url(remote_name: &str) -> Result<String> {
+    if let Some(url) = env::var("RIPCLONE_SERVER")
+        .ok()
+        .filter(|t| !t.is_empty())
+    {
+        return Ok(url);
+    }
+    if let Some(url) = env::var("RIPCLONE_URL")
+        .ok()
+        .filter(|t| !t.is_empty())
+    {
+        eprintln!(
+            "warning: RIPCLONE_URL is deprecated; use RIPCLONE_SERVER or git config remote.{}.ripcloneServer",
+            remote_name
+        );
+        return Ok(url);
+    }
+    let key = format!("remote.{}.ripcloneServer", remote_name);
+    let output = std::process::Command::new("git")
+        .args(["config", "--local", &key])
+        .output()
+        .context("read git config for ripcloneServer")?;
+    if output.status.success() {
+        let url = String::from_utf8(output.stdout)?
+            .trim()
+            .to_string();
+        if !url.is_empty() {
+            return Ok(url);
+        }
+    }
+    anyhow::bail!(
+        "RIPCLONE_SERVER is not set and no ripcloneServer config found for remote '{}'",
+        remote_name
+    )
+}
+
+/// Resolve the server auth token.
+///
+/// Precedence:
+///   1. RIPCLONE_SERVER_TOKEN_HASH (already hashed)
+///   2. RIPCLONE_SERVER_TOKEN (raw)
+///   3. RIPCLONE_TOKEN_HASH (deprecated)
+///   4. RIPCLONE_TOKEN (deprecated)
+fn resolve_server_token() -> Option<String> {
+    if let Some(hash) = env::var("RIPCLONE_SERVER_TOKEN_HASH")
+        .ok()
+        .filter(|t| !t.is_empty())
+    {
+        return Some(hash);
+    }
+    if let Some(raw) = env::var("RIPCLONE_SERVER_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty())
+    {
+        return Some(format!("{:x}", Sha256::digest(raw.as_bytes())));
+    }
+    if let Some(hash) = env::var("RIPCLONE_TOKEN_HASH")
+        .ok()
+        .filter(|t| !t.is_empty())
+    {
+        eprintln!("warning: RIPCLONE_TOKEN_HASH is deprecated for server auth; use RIPCLONE_SERVER_TOKEN_HASH");
+        return Some(hash);
+    }
+    env::var("RIPCLONE_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty())
+        .map(|t| {
+            eprintln!("warning: RIPCLONE_TOKEN is deprecated for server auth; use RIPCLONE_SERVER_TOKEN");
+            format!("{:x}", Sha256::digest(t.as_bytes()))
+        })
+}
+
 fn git_dirs() -> Result<(PathBuf, PathBuf)> {
     let git_dir = env::var("GIT_DIR")
         .map(PathBuf::from)
@@ -218,5 +306,66 @@ fn effective_branch<'a>(requested: &'a str, default: &'a str) -> &'a str {
         if default.is_empty() { "main" } else { default }
     } else {
         requested
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_url_extracts_provider_repo_and_branch() {
+        let (provider, repo, branch) = parse_url("ripclone://gitlab/oven-sh/bun.git#dev").unwrap();
+        assert_eq!(provider, "gitlab");
+        assert_eq!(repo, "oven-sh/bun");
+        assert_eq!(branch, "dev");
+    }
+
+    #[test]
+    fn parse_url_defaults_branch_to_empty() {
+        let (_, _, branch) = parse_url("ripclone://github/oven-sh/bun").unwrap();
+        assert_eq!(branch, "");
+    }
+
+    #[test]
+    fn parse_url_rejects_non_ripclone_scheme() {
+        assert!(parse_url("https://github.com/oven-sh/bun").is_err());
+    }
+
+    #[test]
+    fn resolve_server_url_prefers_ripclone_server() {
+        unsafe {
+            env::set_var("RIPCLONE_SERVER", "https://new.example.com");
+            env::set_var("RIPCLONE_URL", "https://old.example.com");
+        }
+        assert_eq!(
+            resolve_server_url("origin").unwrap(),
+            "https://new.example.com"
+        );
+        unsafe {
+            env::remove_var("RIPCLONE_SERVER");
+            env::remove_var("RIPCLONE_URL");
+        }
+    }
+
+    #[test]
+    fn resolve_server_token_prefers_new_env_vars() {
+        unsafe {
+            env::remove_var("RIPCLONE_SERVER_TOKEN");
+            env::remove_var("RIPCLONE_SERVER_TOKEN_HASH");
+            env::remove_var("RIPCLONE_TOKEN");
+            env::remove_var("RIPCLONE_TOKEN_HASH");
+        }
+        unsafe { env::set_var("RIPCLONE_SERVER_TOKEN", "new-secret") };
+        assert_eq!(
+            resolve_server_token().unwrap(),
+            format!("{:x}", Sha256::digest("new-secret"))
+        );
+        unsafe { env::set_var("RIPCLONE_SERVER_TOKEN_HASH", "prefixed-hash") };
+        assert_eq!(resolve_server_token().unwrap(), "prefixed-hash");
+        unsafe {
+            env::remove_var("RIPCLONE_SERVER_TOKEN");
+            env::remove_var("RIPCLONE_SERVER_TOKEN_HASH");
+        }
     }
 }

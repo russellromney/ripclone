@@ -69,12 +69,14 @@ async fn server_error(context: &str, resp: reqwest::Response) -> anyhow::Error {
 
 /// Build a reqwest client that always sends our User-Agent (and any default
 /// headers, e.g. the auth token).
-fn build_http_client(headers: reqwest::header::HeaderMap) -> reqwest::Client {
-    reqwest::ClientBuilder::new()
+fn build_http_client(headers: reqwest::header::HeaderMap, insecure: bool) -> reqwest::Client {
+    let mut builder = reqwest::ClientBuilder::new()
         .user_agent(USER_AGENT)
-        .default_headers(headers)
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+        .default_headers(headers);
+    if insecure {
+        builder = builder.danger_accept_invalid_certs(true);
+    }
+    builder.build().unwrap_or_else(|_| reqwest::Client::new())
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -327,6 +329,8 @@ pub struct Client {
     provider: String,
     /// Upstream credential token sent as `X-Upstream-Token`.
     upstream_token: Option<String>,
+    /// Allow invalid certificates (for self-hosted HTTP testing).
+    insecure: bool,
 }
 
 impl Client {
@@ -368,16 +372,17 @@ impl Client {
         {
             headers.insert("x-ripclone-protocol", pv);
         }
-        let http = build_http_client(headers);
+        let http = build_http_client(headers, false);
         let cache = cache_dir.and_then(|dir| Cas::new(dir).ok());
         Self {
             server,
             http,
-            raw_http: build_http_client(reqwest::header::HeaderMap::new()),
+            raw_http: build_http_client(reqwest::header::HeaderMap::new(), false),
             token,
             cache,
             provider: "github".to_string(),
             upstream_token: None,
+            insecure: false,
         }
     }
 
@@ -388,6 +393,28 @@ impl Client {
 
     pub fn with_upstream_token(mut self, token: impl Into<String>) -> Self {
         self.upstream_token = Some(token.into());
+        self
+    }
+
+    pub fn with_upstream_token_opt(mut self, token: Option<String>) -> Self {
+        self.upstream_token = token;
+        self
+    }
+
+    pub fn with_insecure(mut self, insecure: bool) -> Self {
+        if insecure == self.insecure {
+            return self;
+        }
+        self.insecure = insecure;
+        let mut headers = reqwest::header::HeaderMap::new();
+        if let Some(token) = &self.token {
+            let value = format!("Ripclone {}", token);
+            if let Ok(header_value) = reqwest::header::HeaderValue::from_str(&value) {
+                headers.insert(reqwest::header::AUTHORIZATION, header_value);
+            }
+        }
+        self.http = build_http_client(headers, insecure);
+        self.raw_http = build_http_client(reqwest::header::HeaderMap::new(), insecure);
         self
     }
 

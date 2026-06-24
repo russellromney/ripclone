@@ -32,6 +32,7 @@ pub mod oidc;
 pub mod overlay;
 pub mod pack;
 pub mod provider;
+pub mod provider_config;
 pub mod ref_store;
 pub mod remote_gc;
 pub mod retention;
