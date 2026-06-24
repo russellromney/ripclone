@@ -318,6 +318,13 @@ fn collect_ref_info_hashes(info: &RefInfo, reachable: &mut HashSet<String>) {
     for artifact in &info.packs {
         collect_pack_artifact(artifact, reachable);
     }
+    // HEAD-closure base packs carried for incremental delta reuse. These are also
+    // referenced by the live shallow/full manifests, but listing them here keeps
+    // them reachable through a phase-2 rebase window (when the new base is
+    // persisted before the next sync's shallow manifest references it).
+    for pack in &info.head_base_packs {
+        collect_sized_pack(pack, reachable);
+    }
     add_hash(reachable, &info.prebuilt_index);
     add_hash(reachable, &info.archive);
     add_hash(reachable, &info.manifest);

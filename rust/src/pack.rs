@@ -28,17 +28,6 @@ pub struct CompactResult {
     pub new_packs: Vec<(String, u64, String, u64)>,
 }
 
-/// Result of a bucketed HEAD-closure build (see `build_head_packs_bucketed`).
-pub struct BucketedHeadPacks {
-    /// Every bucket's pack `(pack, pack_len, idx, idx_len)`, in manifest order.
-    pub packs: Vec<(String, u64, String, u64)>,
-    /// Buckets to persist for next-sync reuse.
-    pub buckets: Vec<crate::HeadBucket>,
-    /// Only the packs freshly built this sync (to upload). Reused buckets are
-    /// already durable in storage.
-    pub new_built: Vec<(String, u64, String, u64)>,
-}
-
 impl<'a> PackBuilder<'a> {
     pub fn new<P: AsRef<Path>>(repo: P, cas: &'a Cas) -> Self {
         Self {
@@ -294,72 +283,55 @@ impl<'a> PackBuilder<'a> {
             .0)
     }
 
-    /// Build the HEAD closure as fixed, stable buckets keyed by oid prefix, so a
-    /// re-sync reuses the buckets whose object set is unchanged and rebuilds only
-    /// the rest. Each bucket is packed undeltified (`git pack-objects` is
-    /// deterministic for a fixed sorted oid list, so an unchanged bucket
-    /// reproduces the exact same pack hash → safe content-addressed reuse). The
-    /// bucket assignment depends only on the oid, so it is stable as the repo
-    /// grows. `prev` maps a bucket's `oidset_hash` to the pack built for it last
-    /// time. Returns all bucket packs (manifest order), the buckets to persist,
-    /// and only the freshly built packs (to upload). Undeltified packs compress
-    /// each object independently, so bucketing has no compression cost.
-    pub fn build_head_packs_bucketed(
+    /// Build a HEAD-closure *delta* pack against a base commit: only the depth-1
+    /// objects present at `commit` but not at `base_commit`. The base packs
+    /// (closure of `base_commit`) stay immutable; this packs just the difference
+    /// (for a few changed files, the changed blobs + the trees from root to leaf —
+    /// a handful of objects), so the depth=1 payload becomes O(diff-from-base)
+    /// instead of O(worktree).
+    ///
+    /// The delta is the **set difference of the two depth-1 closures**, NOT a
+    /// reachability exclude (`rev-list HEAD ^base`). Two properties matter:
+    /// - **Disjoint:** `delta ∩ closure(base) = ∅` by construction, so no object
+    ///   is ever in both the base and the delta. The client materializes the
+    ///   worktree by writing each blob it finds in a HEAD pack, so a blob present
+    ///   in two packs would be written (and counted) twice.
+    /// - **Re-add safe:** a blob removed after `base_commit` and re-added
+    ///   identically at `commit` is reachable from `base_commit`'s tip tree, so it
+    ///   is already in the base and correctly excluded from the delta — present
+    ///   exactly once. A reachability-exclude (`^base`) would instead drop a blob
+    ///   reachable only from `base`'s history, corrupting the worktree.
+    ///
+    /// `base ∪ delta = closure(base) ∪ (closure(HEAD) − closure(base)) ⊇
+    /// closure(HEAD)`, so every object the worktree needs is present. Listing each
+    /// closure is cheap (`rev-list --objects`, no content); only the small
+    /// difference is packed (undeltified, so the client hand-parses blobs).
+    /// Returns the freshly built delta packs (manifest order); these are also the
+    /// only packs to upload.
+    pub fn build_head_delta_pack(
         &self,
         commit: &str,
-        num_buckets: usize,
-        prev: &std::collections::HashMap<String, crate::SizedPack>,
-    ) -> Result<BucketedHeadPacks> {
+        base_commit: &str,
+        head_target_raw_bytes: u64,
+    ) -> Result<Vec<(String, u64, String, u64)>> {
         let head_oids = git::list_object_shas_with_depth(&self.repo, commit, Some(1))?;
         if head_oids.is_empty() {
             bail!("no objects to pack for {}", commit);
         }
-        let n = num_buckets.max(1);
-        let mut buckets: Vec<Vec<String>> = vec![Vec::new(); n];
-        for oid in head_oids {
-            // First byte of the oid → bucket. Stable (oid-only) and uniform.
-            let first = u8::from_str_radix(oid.get(0..2).unwrap_or("00"), 16).unwrap_or(0);
-            buckets[first as usize % n].push(oid);
+        let base_oids: HashSet<String> =
+            git::list_object_shas_with_depth(&self.repo, base_commit, Some(1))?
+                .into_iter()
+                .collect();
+        let delta_oids: Vec<String> = head_oids
+            .into_iter()
+            .filter(|o| !base_oids.contains(o))
+            .collect();
+        if delta_oids.is_empty() {
+            return Ok(Vec::new());
         }
-
-        let mut packs = Vec::new();
-        let mut out_buckets = Vec::new();
-        let mut new_built = Vec::new();
-        for mut boids in buckets {
-            if boids.is_empty() {
-                continue;
-            }
-            boids.sort();
-            let oidset_hash = crate::cas::hash(boids.join("\n").as_bytes());
-            if let Some(sp) = prev.get(&oidset_hash) {
-                // Reuse: the prior pack is byte-identical (determinism) and
-                // already durable in storage; reference it, don't rebuild/upload.
-                let tup = (sp.pack.clone(), sp.pack_len, sp.idx.clone(), sp.idx_len);
-                packs.push(tup);
-                out_buckets.push(crate::HeadBucket {
-                    oidset_hash,
-                    pack: sp.clone(),
-                });
-            } else {
-                let tup = self.pack_and_index_inner(&boids, true)?;
-                packs.push(tup.clone());
-                new_built.push(tup.clone());
-                out_buckets.push(crate::HeadBucket {
-                    oidset_hash,
-                    pack: crate::SizedPack {
-                        pack: tup.0,
-                        pack_len: tup.1,
-                        idx: tup.2,
-                        idx_len: tup.3,
-                    },
-                });
-            }
-        }
-        Ok(BucketedHeadPacks {
-            packs,
-            buckets: out_buckets,
-            new_built,
-        })
+        Ok(self
+            .build_packs_from_oids(&delta_oids, head_target_raw_bytes, true)?
+            .0)
     }
 
     /// Build just the history packs (deltified, everything reachable from
@@ -616,7 +588,6 @@ impl<'a> PackBuilder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
 
     /// Commit `files` onto a bare repo's HEAD (parent = current HEAD if any) and
     /// return the new commit oid.
@@ -654,17 +625,18 @@ mod tests {
             .to_string()
     }
 
-    /// First build packs every bucket; a re-sync after changing one file rebuilds
-    /// only the affected buckets and reuses the rest by hash (identical pack).
+    /// A cold build packs the full HEAD closure; a re-sync after changing one file
+    /// packs only the *delta* — the depth-1 objects new at the new commit (the
+    /// changed blob + root tree + commit), not the whole worktree. The delta is
+    /// exactly the set difference of the two depth-1 closures.
     #[test]
-    fn head_buckets_reuse_unchanged() {
+    fn head_delta_pack_is_minimal() {
         let tmp = tempfile::tempdir().unwrap();
         let repo = git2::Repository::init_bare(tmp.path()).unwrap();
         let cas_dir = tempfile::tempdir().unwrap();
         let cas = Cas::new(cas_dir.path()).unwrap();
         let pb = PackBuilder::new(tmp.path(), &cas);
 
-        // c1 with several files spread across buckets.
         let files1: Vec<(&str, &[u8])> = vec![
             ("a", b"aaa"),
             ("b", b"bbb"),
@@ -674,27 +646,10 @@ mod tests {
             ("f", b"fff"),
         ];
         let c1 = commit_onto(&repo, &files1);
-        let empty: HashMap<String, crate::SizedPack> = HashMap::new();
-        let r1 = pb.build_head_packs_bucketed(&c1, 8, &empty).unwrap();
-        // First build: every bucket is freshly built.
-        assert_eq!(r1.new_built.len(), r1.buckets.len());
-        assert!(!r1.buckets.is_empty());
+        let base = pb.build_head_packs(&c1, 12 * 1024 * 1024).unwrap();
+        assert!(!base.is_empty(), "cold build packs the full closure");
 
-        // Re-build the same commit with the prior buckets → everything reused.
-        let prev: HashMap<String, crate::SizedPack> = r1
-            .buckets
-            .iter()
-            .map(|b| (b.oidset_hash.clone(), b.pack.clone()))
-            .collect();
-        let r1b = pb.build_head_packs_bucketed(&c1, 8, &prev).unwrap();
-        assert_eq!(r1b.new_built.len(), 0, "same commit → full reuse");
-        // Determinism: identical bucket set + pack hashes.
-        let h1: Vec<_> = r1.buckets.iter().map(|b| b.pack.pack.clone()).collect();
-        let h1b: Vec<_> = r1b.buckets.iter().map(|b| b.pack.pack.clone()).collect();
-        assert_eq!(h1, h1b, "deterministic pack hashes across rebuilds");
-
-        // c2 changes one file's content (its blob, the root tree, and the commit
-        // change → a few buckets dirty), keeps the rest.
+        // c2 changes one file's content (blob b, the root tree, and the commit).
         let files2: Vec<(&str, &[u8])> = vec![
             ("a", b"aaa"),
             ("b", b"bbb-CHANGED"),
@@ -704,16 +659,69 @@ mod tests {
             ("f", b"fff"),
         ];
         let c2 = commit_onto(&repo, &files2);
-        let r2 = pb.build_head_packs_bucketed(&c2, 8, &prev).unwrap();
-        assert!(
-            r2.new_built.len() < r2.buckets.len(),
-            "re-sync reuses unchanged buckets (built {} of {})",
-            r2.new_built.len(),
-            r2.buckets.len()
+        // Delta is always taken against the immutable base commit (c1).
+        let delta = pb
+            .build_head_delta_pack(&c2, &c1, 12 * 1024 * 1024)
+            .unwrap();
+        assert!(!delta.is_empty(), "a changed file yields a non-empty delta");
+
+        // The delta is the set difference of the two depth-1 closures. For a flat
+        // tree with one changed file that is exactly {commit, root tree, blob} = 3
+        // objects — far fewer than the full closure (commit + tree + 6 blobs = 8).
+        let full_c1 = git::list_object_shas_with_depth(tmp.path(), &c1, Some(1)).unwrap();
+        let full_c2 = git::list_object_shas_with_depth(tmp.path(), &c2, Some(1)).unwrap();
+        let base_set: std::collections::HashSet<&str> =
+            full_c1.iter().map(String::as_str).collect();
+        let expected_delta: Vec<&str> = full_c2
+            .iter()
+            .map(String::as_str)
+            .filter(|o| !base_set.contains(o))
+            .collect();
+        assert_eq!(
+            expected_delta.len(),
+            3,
+            "single-file change in a flat tree: changed blob + root tree + commit"
         );
         assert!(
-            !r2.new_built.is_empty(),
-            "the changed bucket(s) must be rebuilt"
+            expected_delta.len() < full_c2.len(),
+            "delta is smaller than the full closure"
+        );
+
+        // Re-add disjointness: c3 deletes b.txt then ... actually re-adds the
+        // ORIGINAL content. The original blob is reachable from the base (c1), so
+        // the delta against the base must NOT contain it — base ∩ delta = ∅, so no
+        // object is ever materialized from two packs.
+        let files3: Vec<(&str, &[u8])> = vec![
+            ("a", b"aaa"),
+            ("b", b"bbb"), // restored to the c1 (base) content
+            ("c", b"ccc"),
+            ("d", b"ddd"),
+            ("e", b"eee"),
+            ("f", b"fff"),
+            ("g", b"ggg"), // one genuinely new file
+        ];
+        let c3 = commit_onto(&repo, &files3);
+        let delta3 = pb
+            .build_head_delta_pack(&c3, &c1, 12 * 1024 * 1024)
+            .unwrap();
+        assert!(!delta3.is_empty(), "new file g yields a non-empty delta");
+        let full_c3 = git::list_object_shas_with_depth(tmp.path(), &c3, Some(1)).unwrap();
+        let delta3_set: std::collections::HashSet<&str> = full_c3
+            .iter()
+            .map(String::as_str)
+            .filter(|o| !base_set.contains(o))
+            .collect();
+        // The restored-to-base "bbb" blob is in the base, so it is absent from the
+        // delta (no duplication); the new "ggg" blob is in the delta.
+        for o in &delta3_set {
+            assert!(
+                !base_set.contains(o),
+                "delta and base must be disjoint (no object in both packs)"
+            );
+        }
+        assert!(
+            full_c3.len() > delta3_set.len(),
+            "base still serves the unchanged + restored objects"
         );
     }
 }

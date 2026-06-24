@@ -182,11 +182,27 @@ pub struct RefInfo {
     /// the tail past the last level's tip. See ROADMAP "LSM incremental history".
     #[serde(default)]
     pub history_levels: Vec<HistoryLevel>,
-    /// HEAD-closure pack buckets from the last build, for incremental reuse: a
-    /// re-sync rebuilds only the buckets whose object set changed. Populated by
-    /// the two-phase build; empty otherwise. See [`HeadBucket`].
+    /// Deprecated: HEAD-closure oid-prefix buckets from the old reuse scheme.
+    /// Retained so refs written by older servers still deserialize; no longer
+    /// populated (replaced by `head_base_commit` + `head_base_packs`).
     #[serde(default)]
     pub head_buckets: Vec<HeadBucket>,
+    /// The commit whose depth-1 closure the HEAD *base* packs cover. A re-sync
+    /// packs only the objects new since this commit (`closure(HEAD) −
+    /// closure(head_base_commit)`) into a fresh delta pack, so the base and the
+    /// delta are disjoint by construction — no object is ever in two HEAD packs
+    /// (which would double-materialize a worktree file). Empty before the first
+    /// two-phase build. The background phase rebases (rebuilds the base at the
+    /// current commit) once the cumulative delta grows past
+    /// `RIPCLONE_HEAD_REBASE_BYTES`. See [`crate::pack::PackBuilder`].
+    #[serde(default)]
+    pub head_base_commit: String,
+    /// The HEAD base packs (closure of `head_base_commit`), with lengths so a
+    /// re-sync can reference these now-evicted packs in the clonepack manifest
+    /// without re-reading their bytes. Carried unchanged across delta syncs;
+    /// replaced wholesale on a rebase.
+    #[serde(default)]
+    pub head_base_packs: Vec<SizedPack>,
     /// Content-defined archive frames from the last build, for incremental reuse:
     /// a re-sync recompresses + re-uploads only the frames whose raw bytes
     /// changed. See [`ArchiveFrame`].
