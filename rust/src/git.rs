@@ -861,17 +861,35 @@ pub fn pack_objects_to_prefix_gix<P: AsRef<Path>, Q: AsRef<Path>>(
     Ok(())
 }
 
-pub fn index_pack<P: AsRef<Path>, Q: AsRef<Path>>(git_dir: P, pack_path: Q) -> Result<()> {
-    let path_str = pack_path.as_ref().to_str().context("pack path not UTF-8")?;
-    let status = Command::new("git")
-        .env("GIT_DIR", git_dir.as_ref().as_os_str())
-        .args(["index-pack", path_str])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .context("git index-pack")?;
-    if !status.success() {
-        bail!("index-pack failed");
+/// Build a `.idx` file for an existing `.pack` using gix instead of the
+/// `git index-pack` subprocess. The pack must already be named `pack-<hash>.pack`
+/// in its directory; gix will detect it and only write the missing `.idx`.
+pub fn index_pack<P: AsRef<Path>, Q: AsRef<Path>>(_git_dir: P, pack_path: Q) -> Result<()> {
+    let pack_path = pack_path.as_ref();
+    let directory = pack_path
+        .parent()
+        .context("pack path must have a parent directory")?;
+    let mut reader = std::io::BufReader::new(
+        std::fs::File::open(pack_path)
+            .with_context(|| format!("open pack {}", pack_path.display()))?,
+    );
+    let mut progress = gix::features::progress::Discard;
+    let outcome = gix_pack::Bundle::write_to_directory(
+        &mut reader,
+        Some(directory),
+        &mut progress,
+        &AtomicBool::new(false),
+        None::<&gix::Repository>,
+        gix_pack::bundle::write::Options {
+            thread_limit: None,
+            iteration_mode: gix_pack::data::input::Mode::Verify,
+            index_version: gix_pack::index::Version::default(),
+            object_hash: gix::hash::Kind::Sha1,
+        },
+    )
+    .context("gix index-pack")?;
+    if outcome.index_path.is_none() {
+        bail!("gix index-pack produced no index (empty pack?)");
     }
     Ok(())
 }
