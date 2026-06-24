@@ -84,7 +84,7 @@ enum Commands {
         /// Number of hot files to include in the initial snapshot.
         #[arg(long, default_value = "50")]
         hot_files: usize,
-        /// Clone mode: editable (default), files, or skeleton.
+        /// Clone mode: editable (default) or files.
         #[arg(long)]
         mode: Option<CloneMode>,
         /// History depth: 1 = HEAD only (default), N = last N commits, 0 = full
@@ -103,9 +103,6 @@ enum Commands {
         /// Print a per-phase benchmark report after the clone.
         #[arg(long)]
         bench: bool,
-        /// Install a skeleton clone only (no sidecar). Useful for archive extraction.
-        #[arg(long, hide = true)]
-        skeleton: bool,
     },
     /// Background sidecar: finish materializing a snapshot clone.
     Sidecar {
@@ -813,7 +810,6 @@ async fn main() -> Result<()> {
             at,
             temp,
             bench,
-            skeleton,
         } => {
             let (provider, repo_path) = resolve_repo(&repo, &args.provider)?;
             let upstream_token = resolve_upstream_token(&provider, &repo_path, args.token.as_deref()).await?;
@@ -831,12 +827,6 @@ async fn main() -> Result<()> {
                 // SAFETY: set once at the start of the clone command, before the
                 // install path (the only reader) runs.
                 unsafe { std::env::set_var("RIPCLONE_TEMP", "1") };
-            }
-
-            if skeleton || mode == CloneMode::Skeleton {
-                client.skeleton_clone(&repo_path, &branch, &target).await?;
-                println!("skeleton cloned {} into {}", repo_path, target.display());
-                return Ok(());
             }
 
             let enable_bench = bench || std::env::var_os("RIPCLONE_BENCH").is_some();

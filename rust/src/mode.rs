@@ -19,11 +19,6 @@ pub enum CloneMode {
     /// jobs that only need the files.
     #[value(name = "files", alias = "fast")]
     Files,
-
-    /// `.git` skeleton only (commit + tree objects, prebuilt index). No working
-    /// tree and no blobs.
-    #[value(name = "skeleton")]
-    Skeleton,
 }
 
 impl CloneMode {
@@ -69,10 +64,10 @@ impl FromStr for CloneMode {
             // Current names.
             "editable" => Ok(CloneMode::Editable),
             "files" => Ok(CloneMode::Files),
-            "skeleton" => Ok(CloneMode::Skeleton),
             // Deprecated aliases.
             "full" | "hybrid" => Ok(CloneMode::Editable),
             "fast" => Ok(CloneMode::Files),
+            "skeleton" => anyhow::bail!("skeleton mode is no longer exposed; use mount for skeleton-backed access"),
             other => anyhow::bail!("unknown clone mode: {}", other),
         }
     }
