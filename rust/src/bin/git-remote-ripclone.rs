@@ -162,7 +162,8 @@ async fn main() -> Result<()> {
             }
             "connect git-receive-pack" => {
                 // Push is intentionally not handled through ripclone; users should
-                // configure url...pushInsteadOf to send pushes to GitHub directly.
+                // configure url...pushInsteadOf to send pushes to the upstream
+                // origin (e.g. GitHub/GitLab/Gitea) directly.
                 stdout
                     .write_all(b"error push through ripclone is not supported\n")
                     .await?;

@@ -81,6 +81,12 @@ fn build_http_client(headers: reqwest::header::HeaderMap) -> reqwest::Client {
 pub struct RefResponse {
     pub owner: String,
     pub repo: String,
+    #[serde(default)]
+    pub provider: String,
+    #[serde(default)]
+    pub host: String,
+    #[serde(default)]
+    pub origin_url: String,
     pub branch: String,
     pub default_branch: String,
     pub commit: String,
@@ -317,6 +323,10 @@ pub struct Client {
     raw_http: reqwest::Client,
     token: Option<String>,
     cache: Option<Cas>,
+    /// Upstream git provider instance id (e.g. "github", "gitlab").
+    provider: String,
+    /// Upstream credential token sent as `X-Upstream-Token`.
+    upstream_token: Option<String>,
 }
 
 impl Client {
@@ -366,11 +376,49 @@ impl Client {
             raw_http: build_http_client(reqwest::header::HeaderMap::new()),
             token,
             cache,
+            provider: "github".to_string(),
+            upstream_token: None,
         }
+    }
+
+    pub fn with_provider(mut self, provider: impl Into<String>) -> Self {
+        self.provider = provider.into();
+        self
+    }
+
+    pub fn with_upstream_token(mut self, token: impl Into<String>) -> Self {
+        self.upstream_token = Some(token.into());
+        self
     }
 
     fn cache_key_from_artifact_url(&self, url: &str) -> Option<String> {
         url.rsplit('/').next().map(|s| s.to_string())
+    }
+
+    /// Build a request URL for `repo_path`. GitHub repos keep the legacy
+    /// `/v1/repos/{owner}/{repo}` shape; other providers are routed under
+    /// `/v1/repos/{provider}/{repo_path}`.
+    fn repo_url(&self, repo_path: &str, suffix: &str) -> String {
+        if self.provider == "github" {
+            format!("{}/v1/repos/{repo_path}{suffix}", self.server)
+        } else {
+            format!(
+                "{}/v1/repos/{}/{repo_path}{suffix}",
+                self.server, self.provider
+            )
+        }
+    }
+
+    /// Start a request against the ripclone server, attaching the upstream
+    /// credential when one was configured.
+    fn request(&self, method: reqwest::Method, url: &str) -> reqwest::RequestBuilder {
+        let mut req = self.http.request(method, url);
+        if let Some(token) = &self.upstream_token
+            && let Ok(value) = reqwest::header::HeaderValue::from_str(token)
+        {
+            req = req.header("X-Upstream-Token", value);
+        }
+        req
     }
 }
 
@@ -385,22 +433,18 @@ fn default_cache_dir() -> Option<PathBuf> {
 
 impl Client {
     pub async fn resolve_ref(&self, owner: &str, repo: &str, branch: &str) -> Result<RefResponse> {
-        self.resolve_ref_with_clonepack(owner, repo, branch, None, None)
+        self.resolve_ref_with_clonepack(&format!("{owner}/{repo}"), branch, None, None)
             .await
     }
 
     pub async fn resolve_ref_with_clonepack(
         &self,
-        owner: &str,
-        repo: &str,
+        repo_path: &str,
         branch: &str,
         clonepack: Option<&str>,
         rev: Option<&str>,
     ) -> Result<RefResponse> {
-        let mut url = format!(
-            "{}/v1/repos/{}/{}/refs/{}",
-            self.server, owner, repo, branch
-        );
+        let mut url = self.repo_url(repo_path, &format!("/refs/{branch}"));
         let mut q: Vec<String> = Vec::new();
         if let Some(kind) = clonepack {
             q.push(format!("clonepack={}", kind));
@@ -420,7 +464,7 @@ impl Client {
             .and_then(|s| s.parse().ok())
             .unwrap_or(40usize);
         for attempt in 0..max_attempts {
-            let resp = self.http.get(&url).send().await?;
+            let resp = self.request(reqwest::Method::GET, &url).send().await?;
             let status = resp.status();
             if status.is_success() {
                 return Ok(resp.json().await?);
@@ -429,13 +473,13 @@ impl Client {
                 || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
             {
                 if attempt == 0 {
-                    eprintln!("ripclone: warming {owner}/{repo} — this can take a moment…");
+                    eprintln!("ripclone: warming {repo_path} — this can take a moment…");
                 }
                 if attempt + 1 < max_attempts {
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                     continue;
                 }
-                anyhow::bail!("{owner}/{repo} is still building after {max_attempts} attempts");
+                anyhow::bail!("{repo_path} is still building after {max_attempts} attempts");
             }
             return Err(server_error("ref lookup failed", resp).await);
         }
@@ -608,16 +652,15 @@ impl Client {
 
     pub async fn create_snapshot(
         &self,
-        owner: &str,
-        repo: &str,
+        repo_path: &str,
         branch: &str,
         hot_files: usize,
     ) -> Result<SnapshotResponse> {
-        let url = format!(
-            "{}/v1/repos/{}/{}/snapshot?branch={}&hot_files={}",
-            self.server, owner, repo, branch, hot_files
+        let url = self.repo_url(
+            repo_path,
+            &format!("/snapshot?branch={branch}&hot_files={hot_files}"),
         );
-        let resp = self.http.post(&url).send().await?;
+        let resp = self.request(reqwest::Method::POST, &url).send().await?;
         if !resp.status().is_success() {
             return Err(server_error("snapshot create failed", resp).await);
         }
@@ -630,16 +673,15 @@ impl Client {
 
     pub async fn hot_files(
         &self,
-        owner: &str,
-        repo: &str,
+        repo_path: &str,
         branch: &str,
         count: usize,
     ) -> Result<Vec<String>> {
-        let url = format!(
-            "{}/v1/repos/{}/{}/hotfiles?branch={}&count={}",
-            self.server, owner, repo, branch, count
+        let url = self.repo_url(
+            repo_path,
+            &format!("/hotfiles?branch={branch}&count={count}"),
         );
-        let resp = self.http.get(&url).send().await?;
+        let resp = self.request(reqwest::Method::GET, &url).send().await?;
         if !resp.status().is_success() {
             return Err(server_error("hotfiles failed", resp).await);
         }
@@ -669,15 +711,8 @@ impl Client {
         Ok(resp.bytes().await?.to_vec())
     }
 
-    pub async fn sync_repo(
-        &self,
-        owner: &str,
-        repo: &str,
-        depth: Option<usize>,
-        github_token: Option<&str>,
-    ) -> Result<RefResponse> {
-        self.sync_repo_at(owner, repo, None, depth, github_token)
-            .await
+    pub async fn sync_repo(&self, repo_path: &str, depth: Option<usize>) -> Result<RefResponse> {
+        self.sync_repo_at(repo_path, None, depth).await
     }
 
     /// Like [`sync_repo`] but builds at `rev` (e.g. "HEAD~5" or a SHA) instead of
@@ -686,13 +721,11 @@ impl Client {
     /// deterministically without waiting for upstream to advance.
     pub async fn sync_repo_at(
         &self,
-        owner: &str,
-        repo: &str,
+        repo_path: &str,
         rev: Option<&str>,
         depth: Option<usize>,
-        github_token: Option<&str>,
     ) -> Result<RefResponse> {
-        let mut url = format!("{}/v1/repos/{}/{}/sync", self.server, owner, repo);
+        let mut url = self.repo_url(repo_path, "/sync");
         let mut q: Vec<String> = Vec::new();
         if let Some(d) = depth {
             q.push(format!("depth={}", d));
@@ -713,11 +746,7 @@ impl Client {
             .and_then(|s| s.parse().ok())
             .unwrap_or(40usize);
         for attempt in 0..max_attempts {
-            let mut req = self.http.post(&url);
-            if let Some(token) = github_token {
-                req = req.header("X-GitHub-Token", token);
-            }
-            let resp = req.send().await?;
+            let resp = self.request(reqwest::Method::POST, &url).send().await?;
             let status = resp.status();
             if status == reqwest::StatusCode::OK {
                 return Ok(resp.json().await?);
@@ -765,8 +794,16 @@ impl Client {
         clonepack: Option<&str>,
         bench: Option<&mut Benchmark>,
     ) -> Result<()> {
-        self.install_repo_with_mode_at(owner, repo, branch, None, target, mode, clonepack, bench)
-            .await
+        self.install_repo_with_mode_at(
+            &format!("{owner}/{repo}"),
+            branch,
+            None,
+            target,
+            mode,
+            clonepack,
+            bench,
+        )
+        .await
     }
 
     /// Like [`install_repo_with_mode`] but resolves `rev` (e.g. "HEAD~5") instead
@@ -774,8 +811,7 @@ impl Client {
     #[allow(clippy::too_many_arguments)]
     pub async fn install_repo_with_mode_at<P: AsRef<Path>>(
         &self,
-        owner: &str,
-        repo: &str,
+        repo_path: &str,
         branch: &str,
         rev: Option<&str>,
         target: P,
@@ -785,9 +821,8 @@ impl Client {
     ) -> Result<()> {
         let target = target.as_ref().to_path_buf();
         info!(
-            "installing {}/{}#{} into {} with mode {:?}",
-            owner,
-            repo,
+            "installing {}#{} into {} with mode {:?}",
+            repo_path,
             branch,
             target.display(),
             mode
@@ -802,7 +837,7 @@ impl Client {
 
         // 1. Resolve ref (full-history by default; fast clones can request shallow).
         let mut info = self
-            .resolve_ref_with_clonepack(owner, repo, branch, clonepack, rev)
+            .resolve_ref_with_clonepack(repo_path, branch, clonepack, rev)
             .await?;
         bench.mark_resolve();
         info!("resolved to commit {}", &info.commit[..7]);
@@ -818,7 +853,7 @@ impl Client {
             for _ in 0..max {
                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                 info = self
-                    .resolve_ref_with_clonepack(owner, repo, branch, clonepack, rev)
+                    .resolve_ref_with_clonepack(repo_path, branch, clonepack, rev)
                     .await?;
                 if info.archive_ready {
                     break;
@@ -1047,7 +1082,16 @@ impl Client {
         bench.mark_archive_download(archive_bytes + prebuilt_blob_pack_bytes);
 
         // 9. Origin config + finalization.
-        self.write_origin_config(owner, repo, &git_dir)?;
+        let origin_url = if info.origin_url.is_empty() {
+            if let Some((owner, repo)) = repo_path.split_once('/') {
+                format!("https://github.com/{owner}/{repo}.git")
+            } else {
+                format!("https://github.com/{repo_path}.git")
+            }
+        } else {
+            info.origin_url.clone()
+        };
+        self.write_origin_config(&origin_url, &git_dir)?;
 
         if let Some(dirs) = overlay_dirs {
             overlay::mount_dirs(&dirs).context("mount overlay at target")?;
@@ -1080,9 +1124,8 @@ impl Client {
         }
 
         info!(
-            "installed {}/{}#{} into {} with mode {:?}",
-            owner,
-            repo,
+            "installed {}#{} into {} with mode {:?}",
+            repo_path,
             branch,
             target.display(),
             mode
@@ -1639,10 +1682,9 @@ impl Client {
         })
     }
 
-    fn write_origin_config(&self, owner: &str, repo: &str, git_dir: &Path) -> Result<()> {
+    fn write_origin_config(&self, origin_url: &str, git_dir: &Path) -> Result<()> {
         let config = format!(
-            "[core]\n\tsymlinks = true\n\tcheckStat = minimal\n[remote \"origin\"]\n\turl = https://github.com/{}/{}.git\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n",
-            owner, repo
+            "[core]\n\tsymlinks = true\n\tcheckStat = minimal\n[remote \"origin\"]\n\turl = {origin_url}\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n",
         );
         std::fs::write(git_dir.join("config"), config)?;
         Ok(())
@@ -1752,14 +1794,13 @@ impl Client {
         Ok(())
     }
 
-    /// Add a git worktree at `target` for `branch` of `owner/repo`, using the
+    /// Add a git worktree at `target` for `branch` of `repo_path`, using the
     /// main repo at `main_repo`. The working tree files are materialized
     /// directly or through overlay staging (when available and beneficial),
     /// just like `install_repo`.
     pub async fn add_worktree<P: AsRef<Path>, Q: AsRef<Path>>(
         &self,
-        owner: &str,
-        repo: &str,
+        repo_path: &str,
         branch: &str,
         main_repo: P,
         target: Q,
@@ -1771,7 +1812,9 @@ impl Client {
             anyhow::bail!("target directory already exists: {}", target.display());
         }
 
-        let info = self.resolve_ref(owner, repo, branch).await?;
+        let info = self
+            .resolve_ref_with_clonepack(repo_path, branch, None, None)
+            .await?;
         let commit = info.commit.clone();
 
         let (clonepack, metadata) = self.fetch_clonepack(&info).await?;
@@ -1859,8 +1902,8 @@ impl Client {
                     .context("materialize worktree files into overlay lower dir")?;
             } else {
                 self.install_worktree_files(
-                    owner,
-                    repo,
+                    "",
+                    "",
                     &info,
                     &clonepack,
                     Arc::clone(&metadata),
@@ -1892,8 +1935,8 @@ impl Client {
                 materialize(&git_dir, &target).context("materialize worktree files")?;
             } else {
                 self.install_worktree_files(
-                    owner,
-                    repo,
+                    "",
+                    "",
                     &info,
                     &clonepack,
                     Arc::clone(&metadata),
@@ -1908,9 +1951,8 @@ impl Client {
         }
 
         info!(
-            "added worktree {} for {}@{} at {}",
-            owner,
-            repo,
+            "added worktree {}@{} at {}",
+            repo_path,
             branch,
             target.display()
         );
@@ -2311,21 +2353,21 @@ impl Client {
     /// Skeleton clone: download skeleton pack, index-pack it, set HEAD. No working tree.
     pub async fn skeleton_clone<P: AsRef<Path>>(
         &self,
-        owner: &str,
-        repo: &str,
+        repo_path: &str,
         branch: &str,
         target: P,
     ) -> Result<()> {
         let target = target.as_ref();
         info!(
-            "skeleton cloning {}/{}#{} into {}",
-            owner,
-            repo,
+            "skeleton cloning {}#{} into {}",
+            repo_path,
             branch,
             target.display()
         );
 
-        let info = self.resolve_ref(owner, repo, branch).await?;
+        let info = self
+            .resolve_ref_with_clonepack(repo_path, branch, None, None)
+            .await?;
         info!("resolved to commit {}", &info.commit[..7]);
 
         if target.exists() {
@@ -2351,7 +2393,7 @@ impl Client {
 
         // Pre-fill cached file sizes in the index so git status can rely on stat
         // instead of re-reading every blob through the lazy filesystem.
-        let sizes = self.fetch_sizes(owner, repo, branch).await?;
+        let sizes = self.fetch_sizes(repo_path, branch).await?;
         git::update_index_sizes(&git_dir, &sizes)?;
 
         // Keep symlinks as symlinks and trust only size/mtime for index stat
@@ -2371,9 +2413,17 @@ impl Client {
             .status()
             .ok();
 
-        // Add the canonical GitHub remote so the resulting repo behaves like a
+        // Add the canonical upstream remote so the resulting repo behaves like a
         // normal clone (fetch/push work, IDEs recognize origin, etc.).
-        let origin_url = format!("https://github.com/{}/{}.git", owner, repo);
+        let origin_url = if info.origin_url.is_empty() {
+            if let Some((owner, repo)) = repo_path.split_once('/') {
+                format!("https://github.com/{owner}/{repo}.git")
+            } else {
+                format!("https://github.com/{repo_path}.git")
+            }
+        } else {
+            info.origin_url.clone()
+        };
         std::process::Command::new("git")
             .arg("-C")
             .arg(target.as_os_str())
@@ -2382,9 +2432,8 @@ impl Client {
             .ok();
 
         info!(
-            "skeleton cloned {}/{}#{} into {}",
-            owner,
-            repo,
+            "skeleton cloned {}#{} into {}",
+            repo_path,
             branch,
             target.display()
         );
@@ -2392,33 +2441,17 @@ impl Client {
     }
 
     /// Fetch a single file's content from the server.
-    pub async fn cat_file(
-        &self,
-        owner: &str,
-        repo: &str,
-        branch: &str,
-        path: &str,
-    ) -> Result<Vec<u8>> {
-        self.fetch_file(owner, repo, branch, path).await
+    pub async fn cat_file(&self, repo_path: &str, branch: &str, path: &str) -> Result<Vec<u8>> {
+        self.fetch_file(repo_path, branch, path).await
     }
 
     /// Fetch a single file's content from the server by path.
-    pub async fn fetch_file(
-        &self,
-        owner: &str,
-        repo: &str,
-        branch: &str,
-        path: &str,
-    ) -> Result<Vec<u8>> {
-        let url = format!(
-            "{}/v1/repos/{}/{}/cat?path={}&branch={}",
-            self.server,
-            owner,
-            repo,
-            urlencoding::encode(path),
-            branch
+    pub async fn fetch_file(&self, repo_path: &str, branch: &str, path: &str) -> Result<Vec<u8>> {
+        let url = self.repo_url(
+            repo_path,
+            &format!("/cat?path={}&branch={}", urlencoding::encode(path), branch),
         );
-        let resp = self.http.get(&url).send().await?;
+        let resp = self.request(reqwest::Method::GET, &url).send().await?;
         if !resp.status().is_success() {
             return Err(server_error("cat failed", resp).await);
         }
@@ -2428,15 +2461,11 @@ impl Client {
     /// Fetch a map of working-tree path to blob size for the given ref.
     pub async fn fetch_sizes(
         &self,
-        owner: &str,
-        repo: &str,
+        repo_path: &str,
         branch: &str,
     ) -> Result<std::collections::HashMap<String, u64>> {
-        let url = format!(
-            "{}/v1/repos/{}/{}/sizes?branch={}",
-            self.server, owner, repo, branch
-        );
-        let resp = self.http.get(&url).send().await?;
+        let url = self.repo_url(repo_path, &format!("/sizes?branch={branch}"));
+        let resp = self.request(reqwest::Method::GET, &url).send().await?;
         if !resp.status().is_success() {
             return Err(server_error("sizes failed", resp).await);
         }

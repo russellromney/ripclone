@@ -23,6 +23,16 @@ struct Args {
     #[arg(short, long, env = "RIPCLONE_SERVER")]
     server: Option<String>,
 
+    /// Upstream git provider instance id (e.g. "github", "gitlab", "my-gitea").
+    /// Defaults to the built-in "github" instance.
+    #[arg(short, long, env = "RIPCLONE_PROVIDER", default_value = "github")]
+    provider: String,
+
+    /// Upstream credential token sent as the X-Upstream-Token header.
+    /// Overrides any per-instance configured token.
+    #[arg(short, long, env = "RIPCLONE_TOKEN")]
+    token: Option<String>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -49,7 +59,8 @@ enum Commands {
         /// Lets you exercise the incremental path without upstream advancing.
         #[arg(long)]
         at: Option<String>,
-        /// GitHub token to use for this sync only. Overrides RIPCLONE_GITHUB_TOKEN.
+        /// Upstream credential token for this sync only (back-compat alias for
+        /// --token / X-Upstream-Token).
         #[arg(short, long, env = "RIPCLONE_GITHUB_TOKEN")]
         github_token: Option<String>,
     },
@@ -532,6 +543,12 @@ async fn main() -> Result<()> {
     let client = match token_hash {
         Some(token) => Client::new_with_token(server.clone(), Some(token)),
         None => Client::new(server.clone()),
+    }
+    .with_provider(&args.provider);
+    let client = if let Some(token) = &args.token {
+        client.with_upstream_token(token.clone())
+    } else {
+        client.clone()
     };
 
     match args.command {
@@ -545,17 +562,25 @@ async fn main() -> Result<()> {
             at,
             github_token,
         } => {
-            let (owner, repo_name) = parse_repo(&repo)?;
+            let client = if args.token.is_none() {
+                if let Some(token) = github_token {
+                    client.with_upstream_token(token)
+                } else {
+                    client.clone()
+                }
+            } else {
+                client.clone()
+            };
+            let repo_path = if args.provider == "github" {
+                let (owner, name) = parse_repo(&repo)?;
+                format!("{owner}/{name}")
+            } else {
+                repo
+            };
             let info = client
-                .sync_repo_at(
-                    owner,
-                    repo_name,
-                    at.as_deref(),
-                    depth,
-                    github_token.as_deref(),
-                )
+                .sync_repo_at(&repo_path, at.as_deref(), depth)
                 .await?;
-            println!("synced {} to {}", repo, info.commit);
+            println!("synced {} to {}", repo_path, info.commit);
         }
         Commands::Clone {
             repo,
@@ -569,8 +594,14 @@ async fn main() -> Result<()> {
             bench,
             skeleton,
         } => {
-            let (owner, repo_name) = parse_repo(&repo)?;
-            let target = dir.unwrap_or_else(|| PathBuf::from(repo_name));
+            let (repo_path, target_name) = if args.provider == "github" {
+                let (owner, name) = parse_repo(&repo)?;
+                (format!("{owner}/{name}"), name.to_string())
+            } else {
+                let target = repo.rsplit('/').next().unwrap_or(&repo).to_string();
+                (repo, target)
+            };
+            let target = dir.unwrap_or_else(|| PathBuf::from(target_name));
             let mode = resolve_mode(mode);
             // Bridge the --temp flag to the env var the overlay check reads. Set
             // here, before any clone work reads it.
@@ -581,10 +612,8 @@ async fn main() -> Result<()> {
             }
 
             if skeleton || mode == CloneMode::Skeleton {
-                client
-                    .skeleton_clone(owner, repo_name, &branch, &target)
-                    .await?;
-                println!("skeleton cloned {} into {}", repo, target.display());
+                client.skeleton_clone(&repo_path, &branch, &target).await?;
+                println!("skeleton cloned {} into {}", repo_path, target.display());
                 return Ok(());
             }
 
@@ -593,8 +622,7 @@ async fn main() -> Result<()> {
             let clonepack_kind = Some(ripclone::mode::clonepack_kind_for_depth(depth));
             client
                 .install_repo_with_mode_at(
-                    owner,
-                    repo_name,
+                    &repo_path,
                     &branch,
                     at.as_deref(),
                     &target,
@@ -607,7 +635,7 @@ async fn main() -> Result<()> {
                     },
                 )
                 .await?;
-            println!("installed {} into {}", repo, target.display());
+            println!("installed {} into {}", repo_path, target.display());
             if enable_bench {
                 let report = benchmark.finish();
                 println!("{}", serde_json::to_string_pretty(&report)?);
@@ -621,10 +649,16 @@ async fn main() -> Result<()> {
         Commands::Cat {
             repo, path, branch, ..
         } => {
-            let (owner, repo_name) = parse_repo(&repo)?;
-            let content = client.cat_file(owner, repo_name, &branch, &path).await?;
+            let repo_path = if args.provider == "github" {
+                let (owner, name) = parse_repo(&repo)?;
+                format!("{owner}/{name}")
+            } else {
+                repo
+            };
+            let content = client.cat_file(&repo_path, &branch, &path).await?;
             std::io::stdout().write_all(&content)?;
         }
+
         Commands::Snapshot { action } => match action {
             SnapshotAction::Create {
                 repo,
@@ -632,9 +666,14 @@ async fn main() -> Result<()> {
                 hot_files,
                 output,
             } => {
-                let (owner, repo_name) = parse_repo(&repo)?;
+                let repo_path = if args.provider == "github" {
+                    let (owner, name) = parse_repo(&repo)?;
+                    format!("{owner}/{name}")
+                } else {
+                    repo.clone()
+                };
                 let info = client
-                    .create_snapshot(owner, repo_name, &branch, hot_files)
+                    .create_snapshot(&repo_path, &branch, hot_files)
                     .await?;
                 println!(
                     "snapshot {} for {}@{}: {} bytes, {} hot files",
@@ -679,8 +718,13 @@ async fn main() -> Result<()> {
             branch,
             count,
         } => {
-            let (owner, repo_name) = parse_repo(&repo)?;
-            let files = client.hot_files(owner, repo_name, &branch, count).await?;
+            let repo_path = if args.provider == "github" {
+                let (owner, name) = parse_repo(&repo)?;
+                format!("{owner}/{name}")
+            } else {
+                repo
+            };
+            let files = client.hot_files(&repo_path, &branch, count).await?;
             println!("prefetching {} files into {}", files.len(), dir.display());
             let start = std::time::Instant::now();
             for path in &files {
@@ -692,7 +736,7 @@ async fn main() -> Result<()> {
                         continue;
                     }
                 };
-                let content = client.fetch_file(owner, repo_name, &branch, path).await?;
+                let content = client.fetch_file(&repo_path, &branch, path).await?;
                 let target = dir.join(path);
                 if let Some(parent) = target.parent() {
                     std::fs::create_dir_all(parent)?;
@@ -768,15 +812,25 @@ async fn main() -> Result<()> {
             repo_root,
             dictionary,
         } => {
-            let (owner, repo_name) = parse_repo(&repo)?;
-            let owner = owner.to_string();
-            let repo_name = repo_name.to_string();
-            let info = client.sync_repo(&owner, &repo_name, None, None).await?;
+            let (repo_path, owner, repo_name) = if args.provider == "github" {
+                let (owner, name) = parse_repo(&repo)?;
+                let owner = owner.to_string();
+                let name = name.to_string();
+                (format!("{owner}/{name}"), owner, name)
+            } else {
+                let repo_path = repo.clone();
+                let (owner, name) = repo_path
+                    .split_once('/')
+                    .map(|(o, n)| (o.to_string(), n.to_string()))
+                    .unwrap_or(("".to_string(), repo_path.clone()));
+                (repo_path, owner, name)
+            };
+            let info = client.sync_repo(&repo_path, None).await?;
             let commit = if branch == "HEAD" {
                 info.commit
             } else {
                 client
-                    .resolve_ref(&owner, &repo_name, &branch)
+                    .resolve_ref_with_clonepack(&repo_path, &branch, None, None)
                     .await?
                     .commit
             };
@@ -787,7 +841,7 @@ async fn main() -> Result<()> {
                 ),
                 None => None,
             };
-            println!("building archive for {} at {}", repo, &commit[..7]);
+            println!("building archive for {} at {}", repo_path, &commit[..7]);
             let start = std::time::Instant::now();
             let stats = tokio::task::spawn_blocking(move || {
                 ArchiveBuilder::build_repo(
@@ -841,16 +895,27 @@ async fn main() -> Result<()> {
             repo,
         } => {
             let main_repo = std::env::current_dir()?.join(dir);
-            let (owner, repo_name) = match repo {
+            let repo_path = match repo {
                 Some(r) => {
-                    let (o, r) = parse_repo(&r)?;
-                    (o.to_string(), r.to_string())
+                    if args.provider == "github" {
+                        let (o, r) = parse_repo(&r)?;
+                        format!("{o}/{r}")
+                    } else {
+                        r
+                    }
                 }
-                None => owner_repo_from_origin(&main_repo)?,
+                None => {
+                    if args.provider == "github" {
+                        let (o, r) = owner_repo_from_origin(&main_repo)?;
+                        format!("{o}/{r}")
+                    } else {
+                        anyhow::bail!("--repo is required for non-github providers")
+                    }
+                }
             };
             let target = std::env::current_dir()?.join(&path);
             client
-                .add_worktree(&owner, &repo_name, &branch, &main_repo, &target)
+                .add_worktree(&repo_path, &branch, &main_repo, &target)
                 .await?;
             println!("added worktree at {}", target.display());
         }
@@ -862,12 +927,27 @@ async fn main() -> Result<()> {
             sample_bytes,
             repo_root,
         } => {
-            let (owner, repo_name) = parse_repo(&repo)?;
-            let info = client.sync_repo(owner, repo_name, None, None).await?;
+            let (repo_path, owner, repo_name) = if args.provider == "github" {
+                let (owner, name) = parse_repo(&repo)?;
+                let owner = owner.to_string();
+                let name = name.to_string();
+                (format!("{owner}/{name}"), owner, name)
+            } else {
+                let repo_path = repo.clone();
+                let (owner, name) = repo_path
+                    .split_once('/')
+                    .map(|(o, n)| (o.to_string(), n.to_string()))
+                    .unwrap_or(("".to_string(), repo_path.clone()));
+                (repo_path, owner, name)
+            };
+            let info = client.sync_repo(&repo_path, None).await?;
             let commit = if branch == "HEAD" {
                 info.commit
             } else {
-                client.resolve_ref(owner, repo_name, &branch).await?.commit
+                client
+                    .resolve_ref_with_clonepack(&repo_path, &branch, None, None)
+                    .await?
+                    .commit
             };
             let mirror = repo_root.join(format!("{}_{}.git", owner, repo_name));
             println!(
