@@ -2,6 +2,11 @@
 
 This file tracks what has already landed in ripclone. For upcoming work see `ROADMAP.md`.
 
+## Licensing
+
+- **ripclone is now licensed `MIT OR Apache-2.0`** (the Rust ecosystem default): `license` set in `rust/Cargo.toml`, with `LICENSE-MIT` and `LICENSE-APACHE` at the repo root. This also unblocks crates.io/PyPI publishing.
+- **cargo-deny now enforces a permissive license allow-list** (`rust/deny.toml`) — a new dependency under a copyleft or unlisted license fails CI for a human to evaluate.
+
 ## Version reconciliation (CLI ↔ server)
 
 - **`ripclone --version` and `ripclone-server --version`** now report the build version (they previously errored).
@@ -11,7 +16,7 @@ This file tracks what has already landed in ripclone. For upcoming work see `ROA
 ## Supply chain
 
 - **Dependencies are pinned and move only deliberately.** `Cargo.lock` is committed and every CI/Docker `cargo` invocation uses `--locked`, so the resolved versions never drift on their own. Updates land only through reviewed **Dependabot** PRs (`.github/dependabot.yml`): one grouped PR per week for Rust crates and one for GitHub Actions — none auto-merged.
-- **`cargo-deny` guards the tree** (`rust/deny.toml`, `.github/workflows/deny.yml`): known security advisories (and yanked crates) fail CI, including on a weekly schedule so a new advisory against an unchanged dependency still surfaces; only crates.io is an allowed source. License enforcement is intentionally deferred to the crates.io publishing work.
+- **`cargo-deny` guards the tree** (`rust/deny.toml`, `.github/workflows/deny.yml`): known security advisories (and yanked crates) fail CI, including on a weekly schedule so a new advisory against an unchanged dependency still surfaces; only crates.io is an allowed source; and every dependency's license must be on a permissive allow-list.
 - **Dependency/security changes get a changelog line here** stating what moved and why (CVE, feature need, or transitive requirement).
 - _Tracked debt:_ the guard surfaced three pre-existing `unsound` advisories — `RUSTSEC-2021-0154` (`fuser` 0.15) and `RUSTSEC-2026-0183`/`-0184` (`git2` 0.20). Each is fixed by a dependency bump (`fuser` ≥0.16, `git2` ≥0.21) and is tracked via `ignore` entries in `rust/deny.toml` for a focused, validated dep-upgrade PR.
 
