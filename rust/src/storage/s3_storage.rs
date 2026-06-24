@@ -188,6 +188,7 @@ impl S3Storage {
     }
 }
 
+#[async_trait::async_trait]
 impl StorageBackend for S3Storage {
     fn get(&self, hash: &str) -> Result<Vec<u8>> {
         if let Some(cache) = &self.cache
@@ -292,6 +293,24 @@ impl StorageBackend for S3Storage {
             }
         }
         result.context("S3 put_object")?;
+        if let Some(cache) = &self.cache {
+            cache.put_with_hash(hash, data)?;
+        }
+        Ok(())
+    }
+
+    /// Run the PUT on the caller's runtime with the shared, pooled client — no
+    /// `block_on` hop to a separate runtime. This is what lets concurrent bulk
+    /// uploads reuse warm connections instead of opening a fresh one per chunk.
+    async fn put_async(&self, hash: &str, data: &[u8]) -> Result<()> {
+        let key = self.key(hash)?;
+        self.client
+            .objects()
+            .put(&self.bucket, &key)
+            .body_bytes(data.to_vec())
+            .send()
+            .await
+            .with_context(|| format!("S3 put_object {key}"))?;
         if let Some(cache) = &self.cache {
             cache.put_with_hash(hash, data)?;
         }

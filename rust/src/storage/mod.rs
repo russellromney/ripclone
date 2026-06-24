@@ -1,5 +1,6 @@
 use crate::cas::Cas;
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -12,6 +13,7 @@ pub use s3_storage::S3Storage;
 /// The local filesystem-backed implementation (`LocalStorage`) is the default.
 /// Object-storage backends (S3/R2/Tigris) can implement the same trait and
 /// return signed URLs so clients read directly from the CDN.
+#[async_trait]
 pub trait StorageBackend: Send + Sync {
     /// Fetch the full object by hash.
     fn get(&self, hash: &str) -> Result<Vec<u8>>;
@@ -21,6 +23,15 @@ pub trait StorageBackend: Send + Sync {
 
     /// Store the full object by hash.
     fn put(&self, hash: &str, data: &[u8]) -> Result<()>;
+
+    /// Async store, used by the bulk upload path. Running the request on the
+    /// caller's runtime (instead of the sync `put`, which hops to a separate
+    /// runtime via `block_on`) keeps the client's HTTP connection pool warm, so
+    /// concurrent uploads reuse connections instead of re-handshaking per chunk.
+    /// Default falls back to the sync `put` (fine for the local backend).
+    async fn put_async(&self, hash: &str, data: &[u8]) -> Result<()> {
+        self.put(hash, data)
+    }
 
     /// Return the object size in bytes, if the backend can determine it
     /// without downloading the whole object.
@@ -105,6 +116,7 @@ impl LocalStorage {
     }
 }
 
+#[async_trait]
 impl StorageBackend for LocalStorage {
     fn get(&self, hash: &str) -> Result<Vec<u8>> {
         self.cas.get(hash)
