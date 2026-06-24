@@ -21,5 +21,4 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           manifest-path: rust/Cargo.toml
-          # Licenses are intentionally not enforced yet (see rust/deny.toml).
-          command: check advisories bans sources
+          command: check advisories bans sources licenses
