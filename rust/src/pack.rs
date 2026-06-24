@@ -551,7 +551,13 @@ impl<'a> PackBuilder<'a> {
 
         let tmp = tempfile::TempDir::new()?;
         let prefix = tmp.path().join("pack");
-        if undeltified {
+        // The gix encoder is currently undeltified (deterministic, sorted OIDs).
+        // Use it for HEAD-closure packs when requested; keep C-git for deltified
+        // history packs so their size stays compact.
+        let use_gix = std::env::var("RIPCLONE_GIX_PACK").ok() == Some("1".to_string());
+        if use_gix && undeltified {
+            git::pack_objects_to_prefix_gix(&self.repo, object_shas, &prefix)?;
+        } else if undeltified {
             git::pack_objects_undeltified_to_prefix(&self.repo, object_shas, &prefix)?;
         } else {
             git::pack_objects_to_prefix(&self.repo, object_shas, &prefix)?;

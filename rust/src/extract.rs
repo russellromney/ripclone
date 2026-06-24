@@ -1467,7 +1467,7 @@ pub fn extract_archive_from_chunk_receiver(
 /// already written into `.git/objects/pack`. `commit` is the HEAD commit hex sha.
 ///
 /// The HEAD tree is walked to enumerate every working-tree path, its mode, and
-/// its blob oid; each blob is then read out of the object database (libgit2
+/// its blob oid; each blob is then read out of the object database (gix
 /// resolves pack deltas + zlib) and written to disk in parallel. After
 /// materialization the skip-worktree bit is cleared for every path so git treats
 /// the tree normally.
@@ -1482,48 +1482,47 @@ pub fn materialize_worktree_from_pack(repo_root: &Path, commit: &str) -> Result<
     struct WorkItem {
         path: Vec<u8>,
         mode: u32,
-        oid: git2::Oid,
+        oid: gix::hash::ObjectId,
     }
 
+    let sync_repo = crate::gix_util::open_sync_repo(repo_root)
+        .with_context(|| format!("open repo {}", repo_root.display()))?;
     let items: Vec<WorkItem> = {
-        let repo = git2::Repository::open(repo_root)
-            .with_context(|| format!("open repo {}", repo_root.display()))?;
-        let oid = git2::Oid::from_str(commit)
-            .with_context(|| format!("invalid commit sha {}", commit))?;
-        let tree = repo
-            .find_commit(oid)
+        let repo = sync_repo.to_thread_local();
+        let id = repo
+            .rev_parse_single(commit)
+            .with_context(|| format!("resolve commit {}", commit))?;
+        let tree_id = repo
+            .find_commit(id)
             .with_context(|| format!("find HEAD commit {}", commit))?
-            .tree()
-            .with_context(|| format!("read tree for commit {}", commit))?;
+            .tree_id()
+            .with_context(|| format!("read tree for commit {}", commit))?
+            .detach();
+
+        let mut recorder = gix::traverse::tree::Recorder::default();
+        gix::traverse::tree::depthfirst(
+            tree_id,
+            gix::traverse::tree::depthfirst::State::default(),
+            &repo.objects,
+            &mut recorder,
+        )
+        .context("walk HEAD tree")?;
 
         let mut items: Vec<WorkItem> = Vec::new();
-        let mut walk_err: Option<anyhow::Error> = None;
-        tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
-            if walk_err.is_some() {
-                return git2::TreeWalkResult::Skip;
+        for entry in recorder.records {
+            // Only blobs/symlinks become files; trees are recursed into and
+            // gitlinks (submodule commit entries) are skipped.
+            if entry.mode.is_tree() || entry.mode.is_commit() {
+                continue;
             }
-            // Only blobs become files; trees are recursed into and gitlinks
-            // (submodule commit entries) are skipped.
-            if entry.kind() == Some(git2::ObjectType::Blob) {
-                let mut path = root.as_bytes().to_vec();
-                path.extend_from_slice(entry.name_bytes());
-                if let Err(e) = validate_relative_path(path_from_bytes(&path)) {
-                    walk_err = Some(e).map(|e| {
-                        e.context(format!("invalid path {}", String::from_utf8_lossy(&path)))
-                    });
-                    return git2::TreeWalkResult::Skip;
-                }
-                items.push(WorkItem {
-                    path,
-                    mode: entry.filemode() as u32,
-                    oid: entry.id(),
-                });
-            }
-            git2::TreeWalkResult::Ok
-        })
-        .context("walk HEAD tree")?;
-        if let Some(e) = walk_err {
-            return Err(e);
+            let path = entry.filepath.to_vec();
+            validate_relative_path(path_from_bytes(&path))
+                .with_context(|| format!("invalid path {}", String::from_utf8_lossy(&path)))?;
+            items.push(WorkItem {
+                path,
+                mode: entry.mode.value() as u32,
+                oid: entry.oid,
+            });
         }
         items
     };
@@ -1578,6 +1577,7 @@ pub fn materialize_worktree_from_pack(repo_root: &Path, commit: &str) -> Result<
     let stat_cache: Mutex<Vec<crate::git::MaterializedPathStat>> = Mutex::new(Vec::new());
     let error: Mutex<Option<anyhow::Error>> = Mutex::new(None);
     let writer = WorktreeWriter::new().context("create worktree writer")?;
+    let sync_repo_ref = &sync_repo;
 
     std::thread::scope(|scope| {
         for _ in 0..write_threads {
@@ -1589,25 +1589,11 @@ pub fn materialize_worktree_from_pack(repo_root: &Path, commit: &str) -> Result<
             let error = &error;
             let items = &items;
             scope.spawn(move || {
-                // Each thread owns its own Repository handle: git2 odb readers
-                // are not Sync, but per-thread handles share the mmap'd pack
-                // through the OS page cache with no cross-thread locking.
-                let repo = match git2::Repository::open(repo_root)
-                    .with_context(|| format!("open repo {}", repo_root.display()))
-                {
-                    Ok(r) => r,
-                    Err(e) => {
-                        *error.lock().unwrap() = Some(e);
-                        return;
-                    }
-                };
-                let odb = match repo.odb().context("open object database") {
-                    Ok(o) => o,
-                    Err(e) => {
-                        *error.lock().unwrap() = Some(e);
-                        return;
-                    }
-                };
+                // Each thread gets its own local Repository handle from the
+                // shared ThreadSafeRepository. gix ODB readers are not Sync, but
+                // per-thread handles share the mmap'd pack through the OS page
+                // cache with no cross-thread locking.
+                let repo = sync_repo_ref.to_thread_local();
                 let mut pending_writes: Vec<OwnedFileWrite> =
                     Vec::with_capacity(PACK_WRITE_BATCH_FILES);
 
@@ -1646,14 +1632,14 @@ pub fn materialize_worktree_from_pack(repo_root: &Path, commit: &str) -> Result<
                     }
                     let item = &items[idx];
                     let res: Result<usize> = (|| {
-                        let obj = odb.read(item.oid).with_context(|| {
+                        let content = repo.find_blob(item.oid).with_context(|| {
                             format!(
                                 "read blob {} for {}",
                                 item.oid,
                                 String::from_utf8_lossy(&item.path)
                             )
                         })?;
-                        let content = obj.data();
+                        let content = content.data.clone();
                         // write_entry only reads `path` and `mode`; blob_sha1 and
                         // fragments are unused on this path.
                         let entry = FileEntry {
@@ -1662,11 +1648,12 @@ pub fn materialize_worktree_from_pack(repo_root: &Path, commit: &str) -> Result<
                             blob_sha1: Vec::new(),
                             fragments: Vec::new(),
                         };
+                        let len = content.len();
                         pending_writes.push(OwnedFileWrite {
                             entry,
-                            content: content.to_vec().into(),
+                            content: content.into(),
                         });
-                        Ok(content.len())
+                        Ok(len)
                     })();
                     match res {
                         Ok(len) => {

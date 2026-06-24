@@ -177,25 +177,24 @@ impl ArchiveBuilder {
             anyhow::bail!("mirror not found: {}", self.mirror.display());
         }
 
-        let repo = git2::Repository::open_bare(&self.mirror)
-            .with_context(|| format!("open bare repo {}", self.mirror.display()))?;
-        let oid = repo
-            .revparse_single(commit)
-            .with_context(|| format!("resolve commit {}", commit))?
-            .id();
-        let commit_obj = repo
-            .find_commit(oid)
-            .with_context(|| format!("find commit {}", oid))?;
-        let tree = commit_obj
-            .tree()
-            .with_context(|| format!("read commit tree for {}", oid))?;
+        let repo = crate::gix_util::open_repo(&self.mirror)
+            .with_context(|| format!("open repo {}", self.mirror.display()))?;
+        let id = repo
+            .rev_parse_single(commit)
+            .with_context(|| format!("resolve commit {}", commit))?;
+        let tree_id = repo
+            .find_commit(id)
+            .with_context(|| format!("find commit {}", id))?
+            .tree_id()
+            .with_context(|| format!("read tree for commit {}", id))?
+            .detach();
 
         // Stream the path-ordered worktree through the chunker, compressing each
         // batch of frames in parallel. The whole worktree is never held in
         // memory — peak stays ~one batch + the largest blob. Frames are
         // independent, so compression parallelizes cleanly within a batch.
         let (mut manifest, bounds, raw_total, compressed_frames) =
-            self.stream_cdc(&repo, &tree, |batch| {
+            self.stream_cdc(&repo, tree_id, |batch| {
                 use rayon::prelude::*;
                 batch
                     .par_iter()
@@ -261,18 +260,18 @@ impl ArchiveBuilder {
     #[allow(clippy::type_complexity)]
     fn stream_cdc<T, P>(
         &self,
-        repo: &git2::Repository,
-        tree: &git2::Tree,
+        repo: &gix::Repository,
+        tree_id: gix::hash::ObjectId,
         mut process_batch: P,
     ) -> Result<(MetadataChunk, Vec<(usize, usize)>, u64, Vec<T>)>
     where
         P: FnMut(&[(usize, &[u8])]) -> Result<Vec<T>>,
     {
         // Enumerate blobs (raw paths, oids, modes) up front — cheap metadata, no
-        // content. Raw `name_bytes()` paths keep the file table byte-exact for
-        // non-UTF8 names (matching the worktree the client extracts).
-        let mut blobs: Vec<(Vec<u8>, git2::Oid, u32)> = Vec::new();
-        collect_blobs_raw(repo, tree, &[], &mut blobs).context("walk git tree for archive")?;
+        // content. Raw byte paths keep the file table byte-exact for non-UTF8
+        // names (matching the worktree the client extracts).
+        let mut blobs: Vec<(Vec<u8>, gix::hash::ObjectId, u32)> = Vec::new();
+        collect_blobs_raw_gix(repo, tree_id, &mut blobs).context("walk git tree for archive")?;
 
         // The reader records each file's (path, mode, sha1) + byte range as it
         // serves blob bytes; we recover that table after the stream is drained.
@@ -362,63 +361,37 @@ impl ArchiveBuilder {
         if !self.mirror.exists() {
             anyhow::bail!("mirror not found: {}", self.mirror.display());
         }
-        let repo = git2::Repository::open_bare(&self.mirror)
-            .with_context(|| format!("open bare repo {}", self.mirror.display()))?;
-        let oid = repo
-            .revparse_single(commit)
-            .with_context(|| format!("resolve commit {}", commit))?
-            .id();
-        let tree = repo
-            .find_commit(oid)
-            .with_context(|| format!("find commit {}", oid))?
-            .tree()
-            .with_context(|| format!("read commit tree for {}", oid))?;
+        let repo = crate::gix_util::open_repo(&self.mirror)
+            .with_context(|| format!("open repo {}", self.mirror.display()))?;
+        let id = repo
+            .rev_parse_single(commit)
+            .with_context(|| format!("resolve commit {}", commit))?;
+        let tree_id = repo
+            .find_commit(id)
+            .with_context(|| format!("find commit {}", id))?
+            .tree_id()
+            .with_context(|| format!("read tree for commit {}", id))?
+            .detach();
+
+        let mut blobs = Vec::new();
+        collect_blobs_raw_gix(&repo, tree_id, &mut blobs)
+            .context("collect blobs for files table")?;
 
         let mut manifest = MetadataChunk::new();
-        let mut walk_err: Option<anyhow::Error> = None;
-        tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
-            if walk_err.is_some() {
-                return git2::TreeWalkResult::Skip;
-            }
-            if entry.kind() != Some(git2::ObjectType::Blob) {
-                return git2::TreeWalkResult::Ok;
-            }
-            let name = entry.name().unwrap_or("");
-            let path = if root.is_empty() {
-                name.to_string()
-            } else {
-                format!("{}/{}", root.trim_end_matches('/'), name)
-            };
-            let mode = entry.filemode_raw() as u32;
-            let obj = match entry.to_object(&repo) {
-                Ok(o) => o,
-                Err(e) => {
-                    walk_err =
-                        Some(anyhow::Error::from(e).context(format!("read object for {}", path)));
-                    return git2::TreeWalkResult::Skip;
-                }
-            };
-            match obj.as_blob() {
-                Some(blob) => manifest.files.push(FileEntry {
-                    path: path.into_bytes(),
-                    mode,
-                    blob_sha1: sha1_bytes(blob.content()).to_vec(),
-                    fragments: Vec::new(),
-                }),
-                None => {
-                    walk_err = Some(anyhow::anyhow!(
-                        "expected blob for {} but got {:?}",
-                        path,
-                        obj.kind()
-                    ));
-                    return git2::TreeWalkResult::Skip;
-                }
-            }
-            git2::TreeWalkResult::Ok
-        })
-        .context("walk git tree")?;
-        if let Some(err) = walk_err {
-            return Err(err).context("build files table from tree");
+        for (path, oid, mode) in blobs {
+            let content = repo
+                .find_blob(oid)
+                .with_context(|| {
+                    format!("read blob {} for {}", oid, String::from_utf8_lossy(&path))
+                })?
+                .data
+                .clone();
+            manifest.files.push(FileEntry {
+                path,
+                mode,
+                blob_sha1: sha1_bytes(&content).to_vec(),
+                fragments: Vec::new(),
+            });
         }
         Ok(manifest)
     }
@@ -449,29 +422,22 @@ impl ArchiveBuilder {
             .map(|f| (f.path.as_slice(), f.blob_sha1.as_slice()))
             .collect();
 
-        let repo = git2::Repository::open_bare(&self.mirror)
-            .with_context(|| format!("open bare repo {}", self.mirror.display()))?;
-        let oid = repo
-            .revparse_single(commit)
-            .with_context(|| format!("resolve commit {}", commit))?
-            .id();
-        let tree = repo
-            .find_commit(oid)
-            .with_context(|| format!("find commit {}", oid))?
-            .tree()
-            .with_context(|| format!("read commit tree for {}", oid))?;
+        let repo = crate::gix_util::open_repo(&self.mirror)
+            .with_context(|| format!("open repo {}", self.mirror.display()))?;
+        let id = repo
+            .rev_parse_single(commit)
+            .with_context(|| format!("resolve commit {}", commit))?;
+        let tree_id = repo
+            .find_commit(id)
+            .with_context(|| format!("find commit {}", id))?
+            .tree_id()
+            .with_context(|| format!("read tree for commit {}", id))?
+            .detach();
 
-        // Manual recursion so paths are built from RAW bytes (`name_bytes()`) at
-        // every level. This is critical for correctness: `changed` comes from
-        // `git diff -z` (raw, unquoted bytes), so a raw walk path matches it
-        // exactly. (git2's `tree.walk` hands back the directory prefix as a lossy
-        // `&str`, which could fail to match a non-UTF8 changed path and wrongly
-        // reuse a stale content hash.) For a path not present in `changed`, we
-        // reuse the prior hash when the path is found in the prior table, and
-        // otherwise read+hash the blob — so a non-UTF8 path simply re-hashes
-        // (safe), never reuses a stale hash.
-        let mut blobs: Vec<(Vec<u8>, git2::Oid, u32)> = Vec::new();
-        collect_blobs_raw(&repo, &tree, &[], &mut blobs)
+        // Paths are built from raw bytes at every level so they match
+        // `git diff -z` and the `changed` set exactly.
+        let mut blobs: Vec<(Vec<u8>, gix::hash::ObjectId, u32)> = Vec::new();
+        collect_blobs_raw_gix(&repo, tree_id, &mut blobs)
             .context("walk git tree for incremental files table")?;
 
         let mut manifest = MetadataChunk::new();
@@ -487,7 +453,7 @@ impl ArchiveBuilder {
                     let blob = repo
                         .find_blob(blob_oid)
                         .with_context(|| format!("read blob {} for {:?}", blob_oid, path))?;
-                    sha1_bytes(blob.content()).to_vec()
+                    sha1_bytes(&blob.data).to_vec()
                 }
             };
             manifest.files.push(FileEntry {
@@ -549,23 +515,23 @@ impl ArchiveBuilder {
         if !self.mirror.exists() {
             anyhow::bail!("mirror not found: {}", self.mirror.display());
         }
-        let repo = git2::Repository::open_bare(&self.mirror)
-            .with_context(|| format!("open bare repo {}", self.mirror.display()))?;
-        let oid = repo
-            .revparse_single(commit)
-            .with_context(|| format!("resolve commit {}", commit))?
-            .id();
-        let tree = repo
-            .find_commit(oid)
-            .with_context(|| format!("find commit {}", oid))?
-            .tree()
-            .with_context(|| format!("read commit tree for {}", oid))?;
+        let repo = crate::gix_util::open_repo(&self.mirror)
+            .with_context(|| format!("open repo {}", self.mirror.display()))?;
+        let id = repo
+            .rev_parse_single(commit)
+            .with_context(|| format!("resolve commit {}", commit))?;
+        let tree_id = repo
+            .find_commit(id)
+            .with_context(|| format!("find commit {}", id))?
+            .tree_id()
+            .with_context(|| format!("read tree for commit {}", id))?
+            .detach();
 
         // Stream the worktree through the chunker. For each frame, hash the raw
         // bytes (the reuse key) and compress only frames not already in `prev` —
         // in parallel per batch, never holding the whole worktree in memory.
         let (mut manifest, bounds, _raw_total, processed) =
-            self.stream_cdc(&repo, &tree, |batch| {
+            self.stream_cdc(&repo, tree_id, |batch| {
                 use rayon::prelude::*;
                 batch
                     .par_iter()
@@ -974,8 +940,8 @@ type FileRec = Rc<RefCell<FileTable>>;
 /// [`FileTable`] as it serves bytes. A blob-read error is stored in the table
 /// and surfaced as an `io::Error` so the streaming chunker stops.
 struct TreeBlobReader<'r> {
-    repo: &'r git2::Repository,
-    blobs: std::vec::IntoIter<(Vec<u8>, git2::Oid, u32)>,
+    repo: &'r gix::Repository,
+    blobs: std::vec::IntoIter<(Vec<u8>, gix::hash::ObjectId, u32)>,
     cur: Vec<u8>,
     pos: usize,
     next_start: usize,
@@ -984,8 +950,8 @@ struct TreeBlobReader<'r> {
 
 impl<'r> TreeBlobReader<'r> {
     fn new(
-        repo: &'r git2::Repository,
-        blobs: Vec<(Vec<u8>, git2::Oid, u32)>,
+        repo: &'r gix::Repository,
+        blobs: Vec<(Vec<u8>, gix::hash::ObjectId, u32)>,
         rec: FileRec,
     ) -> Self {
         Self {
@@ -1009,8 +975,8 @@ impl<'r> TreeBlobReader<'r> {
             .repo
             .find_blob(oid)
             .with_context(|| format!("read blob {} for {:?}", oid, String::from_utf8_lossy(&path)))?
-            .content()
-            .to_vec();
+            .data
+            .clone();
         let start = self.next_start;
         let len = content.len();
         {
@@ -1051,37 +1017,33 @@ impl Read for TreeBlobReader<'_> {
     }
 }
 
-/// Recursively collect every blob in `tree` as `(raw_path_bytes, blob_oid,
-/// mode)` in pre-order. Paths are built from `name_bytes()` at every level so
-/// they are byte-exact (no lossy UTF-8), matching `git diff -z` output.
-/// Directories recurse; submodules (commit entries) are skipped; symlinks are
-/// blobs and are included.
-fn collect_blobs_raw(
-    repo: &git2::Repository,
-    tree: &git2::Tree,
-    prefix: &[u8],
-    out: &mut Vec<(Vec<u8>, git2::Oid, u32)>,
+/// Collect every blob in `tree_id` as `(raw_path_bytes, blob_oid, mode)` in
+/// git pre-order. Paths are built from raw entry names at every level so they
+/// are byte-exact (no lossy UTF-8), matching `git diff -z` output. Submodules
+/// and other non-blob entries are skipped.
+fn collect_blobs_raw_gix(
+    repo: &gix::Repository,
+    tree_id: gix::hash::ObjectId,
+    out: &mut Vec<(Vec<u8>, gix::hash::ObjectId, u32)>,
 ) -> Result<()> {
-    for entry in tree.iter() {
-        let mut path = prefix.to_vec();
-        if !path.is_empty() {
-            path.push(b'/');
+    let mut recorder = gix::traverse::tree::Recorder::default();
+    gix::traverse::tree::depthfirst(
+        tree_id,
+        gix::traverse::tree::depthfirst::State::default(),
+        &repo.objects,
+        &mut recorder,
+    )
+    .context("walk git tree")?;
+    for entry in recorder.records {
+        // Trees are recursed into; submodule commit entries are not worktree files.
+        if entry.mode.is_tree() || entry.mode.is_commit() {
+            continue;
         }
-        path.extend_from_slice(entry.name_bytes());
-        match entry.kind() {
-            Some(git2::ObjectType::Tree) => {
-                let sub = entry
-                    .to_object(repo)
-                    .with_context(|| format!("read subtree {:?}", path))?
-                    .peel_to_tree()
-                    .with_context(|| format!("peel subtree {:?}", path))?;
-                collect_blobs_raw(repo, &sub, &path, out)?;
-            }
-            Some(git2::ObjectType::Blob) => {
-                out.push((path, entry.id(), entry.filemode_raw() as u32));
-            }
-            _ => {} // commit (submodule) or other: not a worktree file
-        }
+        out.push((
+            entry.filepath.to_vec(),
+            entry.oid,
+            entry.mode.value() as u32,
+        ));
     }
     Ok(())
 }
@@ -1524,6 +1486,41 @@ mod tests {
             .to_string()
     }
 
+    /// Helper to commit files with explicit git modes (e.g. symlinks, executables).
+    fn commit_with_modes(repo: &git2::Repository, files: &[(&str, u32, &[u8])]) -> String {
+        let sig = git2::Signature::now("test", "test@example.com").unwrap();
+        let mut idx = repo.index().unwrap();
+        let zero = git2::IndexTime::new(0, 0);
+        for (path, mode, bytes) in files {
+            let blob_oid = repo.blob(bytes).unwrap();
+            idx.add(&git2::IndexEntry {
+                ctime: zero,
+                mtime: zero,
+                dev: 0,
+                ino: 0,
+                mode: *mode,
+                uid: 0,
+                gid: 0,
+                file_size: bytes.len() as u32,
+                id: blob_oid,
+                flags: 0,
+                flags_extended: 0,
+                path: path.as_bytes().to_vec(),
+            })
+            .unwrap();
+        }
+        idx.write().unwrap();
+        let tree = repo.find_tree(idx.write_tree().unwrap()).unwrap();
+        let parents: Vec<git2::Commit> = match repo.head().ok().and_then(|h| h.target()) {
+            Some(t) => vec![repo.find_commit(t).unwrap()],
+            None => vec![],
+        };
+        let parent_refs: Vec<&git2::Commit> = parents.iter().collect();
+        repo.commit(Some("HEAD"), &sig, &sig, "c", &tree, &parent_refs)
+            .unwrap()
+            .to_string()
+    }
+
     /// Regression: a non-UTF8 filename whose CONTENT changes must get a fresh
     /// content hash in the incremental table, never the stale prior hash. The
     /// raw-byte walk keeps the walk path byte-equal to `git diff -z` output so the
@@ -1565,6 +1562,103 @@ mod tests {
             sha1_bytes(b"v1").to_vec(),
             "must not reuse the stale prior hash"
         );
+    }
+
+    /// Modes other than 100644 (regular files) must survive the gix tree walk:
+    /// symlinks (120000) and executable blobs (100755). This is a regression guard
+    /// against interpreting `entry.mode.value()` as only a regular blob mode.
+    #[test]
+    fn archive_preserves_symlink_and_executable_modes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init_bare(tmp.path()).unwrap();
+        let commit = commit_with_modes(
+            &repo,
+            &[
+                ("plain.txt", 0o100644, b"plain".as_slice()),
+                ("run.sh", 0o100755, b"#!/bin/sh\necho hi".as_slice()),
+                ("link", 0o120000, b"plain.txt".as_slice()),
+            ],
+        );
+
+        let builder = ArchiveBuilder::new(tmp.path());
+        let manifest = builder.build_files_table(&commit).unwrap();
+        let by_path: std::collections::HashMap<&[u8], u32> = manifest
+            .files
+            .iter()
+            .map(|f| (f.path.as_slice(), f.mode))
+            .collect();
+
+        assert_eq!(
+            by_path.get(b"plain.txt".as_slice()).copied(),
+            Some(0o100644)
+        );
+        assert_eq!(
+            by_path.get(b"run.sh".as_slice()).copied(),
+            Some(0o100755),
+            "executable mode must be preserved"
+        );
+        assert_eq!(
+            by_path.get(b"link".as_slice()).copied(),
+            Some(0o120000),
+            "symlink mode must be preserved"
+        );
+
+        // The full chunk builder must also stream the symlink target bytes in order.
+        let (_metadata, _chunks, _stats) = builder
+            .build_chunks(&commit, 6, None, DEFAULT_ARCHIVE_CHUNK_SIZE)
+            .unwrap();
+    }
+
+    /// Submodule entries (mode 160000) are not worktree files and must not be
+    /// treated as blobs. This guards against a gix walk that only skipped trees.
+    #[test]
+    fn collect_blobs_raw_gix_skips_submodules() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init_bare(tmp.path()).unwrap();
+        let sig = git2::Signature::now("test", "test@example.com").unwrap();
+        let zero = git2::IndexTime::new(0, 0);
+
+        // An orphan commit that will stand in for a submodule object.
+        let blob_oid = repo.blob(b"submodule-readme").unwrap();
+        let mut idx = repo.index().unwrap();
+        idx.add(&git2::IndexEntry {
+            ctime: zero,
+            mtime: zero,
+            dev: 0,
+            ino: 0,
+            mode: 0o100644,
+            uid: 0,
+            gid: 0,
+            file_size: 16,
+            id: blob_oid,
+            flags: 0,
+            flags_extended: 0,
+            path: b"README.md".to_vec(),
+        })
+        .unwrap();
+        idx.write().unwrap();
+        let sub_tree = repo.find_tree(idx.write_tree().unwrap()).unwrap();
+        let sub_commit = repo
+            .commit(None, &sig, &sig, "submodule", &sub_tree, &[])
+            .unwrap();
+
+        // Main tree contains a regular file and a submodule entry.
+        let file_blob = repo.blob(b"file").unwrap();
+        let empty_tree = repo.treebuilder(None).unwrap().write().unwrap();
+        let empty_tree = repo.find_tree(empty_tree).unwrap();
+        let mut builder = git2::build::TreeUpdateBuilder::new();
+        builder.upsert("file.txt", file_blob, git2::FileMode::Blob);
+        builder.upsert("vendor/sub", sub_commit, git2::FileMode::Commit);
+        let tree_oid = builder.create_updated(&repo, &empty_tree).unwrap();
+
+        let gix_repo = crate::gix_util::open_repo(tmp.path()).unwrap();
+        let tree_id = gix::hash::ObjectId::from_hex(tree_oid.to_string().as_bytes()).unwrap();
+        let mut blobs = Vec::new();
+        collect_blobs_raw_gix(&gix_repo, tree_id, &mut blobs).unwrap();
+
+        assert_eq!(blobs.len(), 1, "submodule entry must be skipped");
+        assert_eq!(blobs[0].0, b"file.txt");
+        assert_eq!(blobs[0].2, 0o100644);
     }
 
     #[test]
@@ -1668,25 +1762,22 @@ mod tests {
         let (tmp, commit) = commit_files(&files_ref);
 
         let builder = ArchiveBuilder::new(tmp.path());
-        let repo = git2::Repository::open_bare(tmp.path()).unwrap();
-        let tree = repo
-            .find_commit(repo.revparse_single(&commit).unwrap().id())
-            .unwrap()
-            .tree()
-            .unwrap();
+        let repo = crate::gix_util::open_repo(tmp.path()).unwrap();
+        let id = repo.rev_parse_single(commit.as_str()).unwrap();
+        let tree_id = repo.find_commit(id).unwrap().tree_id().unwrap().detach();
 
         // Streaming bounds (process closure is a no-op: one unit per frame).
         let (_m, stream_bounds, raw_total, outputs) = builder
-            .stream_cdc(&repo, &tree, |batch| Ok(vec![(); batch.len()]))
+            .stream_cdc(&repo, tree_id, |batch| Ok(vec![(); batch.len()]))
             .unwrap();
         assert_eq!(outputs.len(), stream_bounds.len(), "one output per frame");
 
         // Reference: concatenate the same blobs in walk order and slice-CDC them.
         let mut blobs = Vec::new();
-        collect_blobs_raw(&repo, &tree, &[], &mut blobs).unwrap();
+        collect_blobs_raw_gix(&repo, tree_id, &mut blobs).unwrap();
         let mut full = Vec::new();
         for (_p, oid, _mode) in &blobs {
-            full.extend_from_slice(repo.find_blob(*oid).unwrap().content());
+            full.extend_from_slice(&repo.find_blob(*oid).unwrap().data);
         }
         let ref_bounds = cdc_frame_bounds(&full);
 
