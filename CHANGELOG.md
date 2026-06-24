@@ -2,6 +2,15 @@
 
 This file tracks what has already landed in ripclone. For upcoming work see `ROADMAP.md`.
 
+## Distribution
+
+- **Three install channels**, all driven by a `v*` tag (`.github/workflows/release.yml`):
+  - **Shell installer** — prebuilt per-platform binaries + checksums on a GitHub Release, fetched by `install.sh` (`curl … | sh`).
+  - **crates.io** — `cargo install ripclone` / `cargo add ripclone` (validated end-to-end with `cargo publish --dry-run`).
+  - **PyPI** — `pip install ripclone`, a maturin-built wheel of the CLI binary.
+- **`ripclone update`** checks the latest GitHub release and shows how to update.
+- Binaries build natively per platform (no cross-compile) and link C libraries dynamically — see the README for runtime packages; static binaries are a future refinement. The release jobs need `CARGO_REGISTRY_TOKEN` (crates.io) and PyPI Trusted Publishing configured, and prove out on the first real tag.
+
 ## Licensing
 
 - **ripclone is now licensed `MIT OR Apache-2.0`** (the Rust ecosystem default): `license` set in `rust/Cargo.toml`, with `LICENSE-MIT` and `LICENSE-APACHE` at the repo root. This also unblocks crates.io/PyPI publishing.

@@ -1,0 +1,135 @@
+name: release
+
+# Cut a release by pushing a tag: `git tag v0.1.0 && git push origin v0.1.0`.
+# Each platform builds natively (no cross-compile) so the C dependencies
+# (libgit2, openssl, fuse, zstd) build with the system toolchain. The binaries
+# link those libraries dynamically, so the install instructions list the runtime
+# packages; fully-static binaries are a future refinement.
+#
+# Required repo secrets:
+#   CARGO_REGISTRY_TOKEN  crates.io API token (for the crates-io job)
+#   (PyPI uses OIDC Trusted Publishing — configure the project on PyPI, no token)
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write # create the GitHub Release and upload assets
+
+jobs:
+  # Prebuilt binaries + checksums, one per native platform.
+  binaries:
+    name: binaries (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, platform: linux-x86_64 }
+          - { os: macos-14, platform: macos-arm64 }
+          - { os: macos-13, platform: macos-x86_64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache-workspaces: rust
+      - name: Install build deps (Linux)
+        if: runner.os == 'Linux'
+        run: bash scripts/install-build-deps.sh
+      - name: Install build deps (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf cmake pkg-config libgit2 openssl@3
+      - name: Build binaries
+        working-directory: rust
+        run: cargo build --release --locked --bin ripclone --bin ripclone-server --bin git-remote-ripclone
+      - name: Package
+        run: |
+          dir="ripclone-${{ matrix.platform }}"
+          mkdir -p "$dir"
+          cp rust/target/release/ripclone rust/target/release/ripclone-server rust/target/release/git-remote-ripclone "$dir/"
+          cp LICENSE-MIT LICENSE-APACHE "$dir/"
+          tar -czf "$dir.tar.gz" "$dir"
+          shasum -a 256 "$dir.tar.gz" > "$dir.tar.gz.sha256"
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ripclone-${{ matrix.platform }}.tar.gz
+            ripclone-${{ matrix.platform }}.tar.gz.sha256
+          fail_on_unmatched_files: true
+
+  # Upload the installer alongside the binaries so the curl|sh one-liner and
+  # `ripclone update` can fetch `.../releases/latest/download/install.sh`.
+  installer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: install.sh
+          fail_on_unmatched_files: true
+
+  # crates.io: `cargo install ripclone` / `cargo add ripclone`.
+  crates-io:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache-workspaces: rust
+      - name: Install build deps
+        run: bash scripts/install-build-deps.sh
+      - name: cargo publish
+        working-directory: rust
+        run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  # PyPI: `pip install ripclone`. maturin packages the CLI binary into a wheel.
+  # Linux wheels build in a manylinux container, so the C build deps are
+  # installed there via before-script-linux.
+  pypi:
+    name: pypi (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, platform: linux-x86_64, args: "--manylinux 2_28" }
+          - { os: macos-14, platform: macos-arm64, args: "" }
+          - { os: macos-13, platform: macos-x86_64, args: "" }
+    runs-on: ${{ matrix.os }}
+    permissions:
+      id-token: write # PyPI Trusted Publishing (OIDC)
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build deps (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf cmake pkg-config libgit2 openssl@3
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release --out dist --manifest-path rust/Cargo.toml ${{ matrix.args }}
+          manylinux: ${{ runner.os == 'Linux' && '2_28' || 'auto' }}
+          before-script-linux: |
+            dnf install -y protobuf-compiler protobuf-devel cmake openssl-devel libgit2-devel fuse-devel || \
+            (apt-get update && apt-get install -y protobuf-compiler cmake libssl-dev libgit2-dev libfuse-dev pkg-config)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.platform }}
+          path: dist/*.whl
+
+  pypi-publish:
+    needs: pypi
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist

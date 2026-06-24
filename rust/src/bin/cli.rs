@@ -35,6 +35,8 @@ enum Commands {
     Logout,
     /// Show the CLI version + protocol, and check the configured server's.
     Version,
+    /// Check for a newer ripclone release and show how to update.
+    Update,
     /// Sync a repo on the server.
     Sync {
         repo: String,
@@ -313,6 +315,53 @@ async fn run_version(server: &str) -> Result<()> {
     Ok(())
 }
 
+#[derive(serde::Deserialize)]
+struct LatestRelease {
+    #[serde(default)]
+    tag_name: String,
+}
+
+/// Check the latest published release on GitHub and, if newer, show how to
+/// update. Deliberately does not replace the binary itself — it prints the
+/// install command — so it works the same however ripclone was installed.
+async fn run_update() -> Result<()> {
+    let current = env!("CARGO_PKG_VERSION");
+    println!("ripclone {current}");
+    let http = reqwest::Client::builder()
+        .user_agent(concat!("ripclone/", env!("CARGO_PKG_VERSION")))
+        .build()?;
+    let url = "https://api.github.com/repos/russellromney/ripclone/releases/latest";
+    match http
+        .get(url)
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .and_then(|r| r.error_for_status())
+    {
+        Ok(resp) => match resp.json::<LatestRelease>().await {
+            Ok(rel) => {
+                let latest = rel.tag_name.trim_start_matches('v');
+                if latest.is_empty() {
+                    println!("no published releases yet.");
+                } else if latest == current {
+                    println!("you're on the latest release ({}).", rel.tag_name);
+                } else {
+                    println!("a newer release is available: {}", rel.tag_name);
+                    println!("update with one of:");
+                    println!(
+                        "  curl -fsSL https://github.com/russellromney/ripclone/releases/latest/download/install.sh | sh"
+                    );
+                    println!("  cargo install ripclone --locked");
+                    println!("  pip install --upgrade ripclone");
+                }
+            }
+            Err(e) => println!("could not read the latest release ({e})"),
+        },
+        Err(e) => println!("could not reach GitHub releases ({e})"),
+    }
+    Ok(())
+}
+
 async fn run_login(server: &str) -> Result<()> {
     let http = reqwest::Client::builder()
         .user_agent(concat!("ripclone/", env!("CARGO_PKG_VERSION")))
@@ -415,6 +464,7 @@ async fn main() -> Result<()> {
             return Ok(());
         }
         Commands::Version => return run_version(&server).await,
+        Commands::Update => return run_update().await,
         _ => {}
     }
 
@@ -443,7 +493,9 @@ async fn main() -> Result<()> {
 
     match args.command {
         // Handled before the client is built.
-        Commands::Login | Commands::Logout | Commands::Version => unreachable!(),
+        Commands::Login | Commands::Logout | Commands::Version | Commands::Update => {
+            unreachable!()
+        }
         Commands::Sync {
             repo,
             depth,

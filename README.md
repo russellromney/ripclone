@@ -60,6 +60,31 @@ ripclone stores the same `HEAD` file bytes in two formats so you can choose the 
 
 Measured on macOS over a 1 Gb/s link with a warm ripclone cache. On slower networks the absolute times grow, but ripclone is usually still faster because it transfers fewer bytes and overlaps download with extraction.
 
+## Install
+
+Pick whichever fits. All install the `ripclone` CLI (and `ripclone-server`, `git-remote-ripclone`).
+
+```sh
+# 1. Shell installer (prebuilt binaries)
+curl -fsSL https://github.com/russellromney/ripclone/releases/latest/download/install.sh | sh
+
+# 2. Cargo (builds from source; also `cargo add ripclone` to embed the client lib)
+cargo install ripclone --locked
+
+# 3. pip (prebuilt wheel)
+pip install ripclone
+```
+
+The prebuilt binaries link their C libraries (libgit2, openssl, fuse, zstd) dynamically; on Linux install the runtime packages (`libgit2`, `libssl3`, `libfuse2`), on macOS `brew install libgit2 openssl@3`. `cargo install` builds them from source instead.
+
+Check your version and whether the configured server is compatible:
+
+```sh
+ripclone --version
+ripclone version            # CLI + server versions, with a compatibility verdict
+ripclone update             # check for a newer release
+```
+
 ## Quick start
 
 Build and run the server:
@@ -126,7 +151,7 @@ ripclone validates the `RIPCLONE_TOKEN`, syncs the mirror, builds artifacts for 
 ripclone clone owner/repo
 ripclone clone owner/repo --branch feat/x --dir ./my-dir
 
-# Update an existing clone to the latest commit
+# Check for a newer ripclone release
 ripclone update
 
 # Build artifacts for a specific commit (server-side)
