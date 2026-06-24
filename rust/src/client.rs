@@ -115,6 +115,15 @@ pub struct RefResponse {
     /// True when the returned clonepack is a shallow (depth=1) snapshot.
     #[serde(default)]
     pub shallow: bool,
+    /// True once the full clonepack's archive is built (files mode can clone).
+    /// Defaults true so an older server that always shipped the archive is treated
+    /// as ready.
+    #[serde(default = "ref_archive_ready_default")]
+    pub archive_ready: bool,
+}
+
+fn ref_archive_ready_default() -> bool {
+    true
 }
 
 /// Return the chunk refs that make up the head-blobs pack, falling back to the
@@ -792,11 +801,30 @@ impl Client {
         let bench = bench.unwrap_or(&mut local_bench);
 
         // 1. Resolve ref (full-history by default; fast clones can request shallow).
-        let info = self
+        let mut info = self
             .resolve_ref_with_clonepack(owner, repo, branch, clonepack, rev)
             .await?;
         bench.mark_resolve();
         info!("resolved to commit {}", &info.commit[..7]);
+
+        // Files mode needs the zstd archive. The server publishes an editable
+        // clonepack first and adds the archive a moment later, so wait for it
+        // (editable clones don't need it and skip this).
+        if mode.needs_archive() && !info.archive_ready {
+            let max = std::env::var("RIPCLONE_CLONE_MAX_ATTEMPTS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(40usize);
+            for _ in 0..max {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                info = self
+                    .resolve_ref_with_clonepack(owner, repo, branch, clonepack, rev)
+                    .await?;
+                if info.archive_ready {
+                    break;
+                }
+            }
+        }
 
         if info.clonepack_manifest.is_empty() {
             anyhow::bail!("ref is missing clonepack manifest; run sync first");
