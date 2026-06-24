@@ -1,0 +1,34 @@
+# cargo-deny: supply-chain policy. Run locally with `cargo deny check`.
+#
+# Dependencies are pinned by Cargo.lock (and every CI/Docker cargo invocation
+# uses --locked), so they move only when Cargo.lock is deliberately regenerated —
+# in practice via a reviewed Dependabot PR. This file is the automated guard:
+# known security advisories fail CI (including on a weekly schedule, so a new
+# advisory against an unchanged dependency still surfaces), and only crates.io is
+# an allowed source. License enforcement is intentionally left out for now; it
+# arrives with the crates.io publishing work (which also needs a project license).
+
+[advisories]
+version = 2
+# A yanked crate in the lockfile is a problem worth failing on.
+yanked = "deny"
+# Pre-existing `unsound` advisories surfaced when this guard was added
+# (2026-06-24). Each is fixed by a dependency bump (not a code change here), so
+# they're tracked for a focused, validated dep-upgrade PR rather than blocking
+# the guard from landing. Remove an entry once its upgrade lands.
+ignore = [
+  { id = "RUSTSEC-2021-0154", reason = "fuser 0.15 (FUSE sidecar): libfuse null-ops uninitialized read; fix is fuser >=0.16. Tracked for a dep-upgrade PR." },
+  { id = "RUSTSEC-2026-0183", reason = "git2 0.20: Remote::list() null-slice UB on a remote advertising no refs; fix is git2 >=0.21. Tracked for a dep-upgrade PR." },
+  { id = "RUSTSEC-2026-0184", reason = "git2 0.20: BlameHunk Signature null-ptr UB via blame_buffer (unused by ripclone); fix is git2 >=0.21. Tracked for a dep-upgrade PR." },
+]
+
+[bans]
+# Duplicate versions of a crate are a warning, not a hard failure — they're
+# common and transitive, and denying them causes churn for little safety gain.
+multiple-versions = "warn"
+# We never want a `*` version requirement in our own manifest.
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

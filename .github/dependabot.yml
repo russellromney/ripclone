@@ -1,0 +1,27 @@
+version: 2
+updates:
+  # Rust dependencies: one grouped PR per week so updates are deliberate and
+  # reviewed (never auto-merged). Cargo.lock + --locked keep them pinned until
+  # such a PR lands.
+  - package-ecosystem: cargo
+    directory: /rust
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      cargo:
+        patterns: ["*"]
+    commit-message:
+      prefix: deps
+
+  # GitHub Actions: keep the actions we pin by tag current (a simple alternative
+  # to commit-SHA pinning), also as one grouped weekly PR.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "ci(deps)"
