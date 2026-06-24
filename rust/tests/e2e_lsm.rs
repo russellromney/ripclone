@@ -128,14 +128,8 @@ async fn lsm_resync_same_head_reuses_level() {
     origin.publish();
 
     let client = server.client();
-    client
-        .sync_repo("acme", "lsm-noop", None, None)
-        .await
-        .unwrap(); // seal
-    client
-        .sync_repo("acme", "lsm-noop", None, None)
-        .await
-        .unwrap(); // empty tail, reuse
+    client.sync_repo("acme/lsm-noop", None).await.unwrap(); // seal
+    client.sync_repo("acme/lsm-noop", None).await.unwrap(); // empty tail, reuse
 
     let (_g, c) = full_clone(&server, &origin).await;
     assert_eq!(read(&c, "a"), "2\n");

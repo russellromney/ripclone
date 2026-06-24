@@ -381,7 +381,7 @@ async fn remote_gc_deletes_orphans_on_s3() {
 
     server
         .client()
-        .sync_repo("acme", &repo, None, None)
+        .sync_repo(&format!("acme/{repo}"), None)
         .await
         .expect("sync");
 
@@ -466,7 +466,7 @@ async fn remote_gc_dry_run_does_not_delete_on_s3() {
 
     server
         .client()
-        .sync_repo("acme", &repo, None, None)
+        .sync_repo(&format!("acme/{repo}"), None)
         .await
         .expect("sync");
 
@@ -530,7 +530,7 @@ async fn status_reports_bytes_from_s3() {
 
     server
         .client()
-        .sync_repo("acme", &repo, None, None)
+        .sync_repo(&format!("acme/{repo}"), None)
         .await
         .expect("sync");
 
@@ -577,7 +577,7 @@ async fn public_fork_status_is_free_on_s3() {
 
     server
         .client()
-        .sync_repo("acme", &repo, None, None)
+        .sync_repo(&format!("acme/{repo}"), None)
         .await
         .expect("sync");
 

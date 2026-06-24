@@ -103,11 +103,11 @@ async fn skeleton_mode_installs_git_dir() {
     origin.publish();
 
     let client = server.client();
-    client.sync_repo("acme", "skel", None, None).await.unwrap();
+    client.sync_repo("acme/skel", None).await.unwrap();
     let out = tempfile::tempdir().unwrap();
     let target = out.path().join("clone");
     client
-        .skeleton_clone("acme", "skel", "HEAD", &target)
+        .skeleton_clone("acme/skel", "HEAD", &target)
         .await
         .expect("skeleton clone");
     assert!(target.join(".git").exists(), "skeleton has a .git dir");
@@ -147,10 +147,7 @@ async fn corrupt_artifact_fails_clone() {
     origin.publish();
 
     let client = server.client();
-    let resp = client
-        .sync_repo("acme", "corrupt", None, None)
-        .await
-        .unwrap();
+    let resp = client.sync_repo("acme/corrupt", None).await.unwrap();
 
     // Corrupt the clonepack manifest artifact in the server's CAS.
     let manifest_hash = resp.clonepack_manifest.clone();
@@ -186,10 +183,7 @@ async fn missing_artifact_fails_clone() {
     origin.publish();
 
     let client = server.client();
-    let resp = client
-        .sync_repo("acme", "missing", None, None)
-        .await
-        .unwrap();
+    let resp = client.sync_repo("acme/missing", None).await.unwrap();
     let p = server.cas_path(&resp.clonepack_manifest);
     std::fs::remove_file(&p).unwrap();
 
@@ -250,7 +244,7 @@ async fn wrong_token_is_rejected() {
     // A correctly-tokened client can sync (control).
     server
         .client()
-        .sync_repo("acme", "authz", None, None)
+        .sync_repo("acme/authz", None)
         .await
         .expect("correct token must be accepted");
 
@@ -259,7 +253,7 @@ async fn wrong_token_is_rejected() {
         server.url.clone(),
         Some("deadbeefdeadbeef".to_string()),
     );
-    let res = bad.sync_repo("acme", "authz", None, None).await;
+    let res = bad.sync_repo("acme/authz", None).await;
     assert!(res.is_err(), "wrong token must be rejected, got Ok");
 }
 
@@ -275,10 +269,7 @@ async fn persistent_fetch_failure_fails_clone() {
     origin.publish();
     let client = server.client();
     // sync talks to the server directly (not artifact GETs), so it succeeds.
-    client
-        .sync_repo("acme", "retryfail", None, None)
-        .await
-        .unwrap();
+    client.sync_repo("acme/retryfail", None).await.unwrap();
 
     let out = tempfile::tempdir().unwrap();
     let res = client
@@ -332,15 +323,12 @@ async fn failed_clone_after_temp_dir_leaves_nothing() {
     origin.commit(&[("a.txt", "hello\n")], "c1");
     origin.publish();
     let client = server.client();
-    client
-        .sync_repo("acme", "notemp", None, None)
-        .await
-        .unwrap();
+    client.sync_repo("acme/notemp", None).await.unwrap();
 
     // Corrupt the first archive chunk so extraction (which runs after the temp
     // install dir is created and the skeleton is written) fails deterministically.
     let info = client
-        .resolve_ref_with_clonepack("acme", "notemp", "HEAD", Some("shallow"), None)
+        .resolve_ref_with_clonepack("acme/notemp", "HEAD", Some("shallow"), None)
         .await
         .unwrap();
     let (manifest, _meta) = client.fetch_clonepack(&info).await.unwrap();

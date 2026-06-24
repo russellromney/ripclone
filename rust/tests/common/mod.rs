@@ -312,7 +312,15 @@ pub async fn clone_only_at(
     let target = out.path().join("clone");
     let kind = ripclone::mode::clonepack_kind_for_depth(depth);
     client
-        .install_repo_with_mode_at(owner, repo, "HEAD", rev, &target, mode, Some(kind), None)
+        .install_repo_with_mode_at(
+            &format!("{owner}/{repo}"),
+            "HEAD",
+            rev,
+            &target,
+            mode,
+            Some(kind),
+            None,
+        )
         .await?;
     Ok((out, target))
 }
@@ -478,7 +486,10 @@ pub async fn lifecycle_battery(server: &Server, origin: &Origin, two_phase: bool
     origin.commit(&[("a.txt", "1\n")], "c1");
     origin.commit(&[("a.txt", "2\n"), ("dir/b.txt", "B\n")], "c2");
     origin.publish();
-    client.sync_repo(&o, &r, None, None).await.expect("sync c2");
+    client
+        .sync_repo(&format!("{o}/{r}"), None)
+        .await
+        .expect("sync c2");
 
     assert_depth1(server, &o, &r, &[("a.txt", "2\n"), ("dir/b.txt", "B\n")]).await;
     {
@@ -496,7 +507,7 @@ pub async fn lifecycle_battery(server: &Server, origin: &Origin, two_phase: bool
     origin.commit(&[("a.txt", "3\n"), ("c.txt", "C\n")], "c3");
     origin.publish();
     client
-        .sync_repo(&o, &r, None, None)
+        .sync_repo(&format!("{o}/{r}"), None)
         .await
         .expect("resync c3");
 
@@ -521,7 +532,7 @@ pub async fn lifecycle_battery(server: &Server, origin: &Origin, two_phase: bool
         origin.commit(&[(f.as_str(), c.as_str())], &m);
         origin.publish();
         client
-            .sync_repo(&o, &r, None, None)
+            .sync_repo(&format!("{o}/{r}"), None)
             .await
             .expect("resync loop");
         // Under two-phase the full builds in the background; wait for each step
@@ -551,7 +562,7 @@ pub async fn sync_and_clone(
 ) -> (TempDir, PathBuf) {
     let client = server.client();
     client
-        .sync_repo(&origin.owner, &origin.repo, None, None)
+        .sync_repo(&format!("{}/{}", origin.owner, origin.repo), None)
         .await
         .expect("sync");
     let out = tempfile::tempdir().unwrap();

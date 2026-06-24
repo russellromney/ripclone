@@ -51,10 +51,7 @@ async fn status_reports_nonzero_bytes_after_sync() {
     origin.publish();
 
     let client = server.client();
-    client
-        .sync_repo("acme", "billing", None, None)
-        .await
-        .expect("sync");
+    client.sync_repo("acme/billing", None).await.expect("sync");
 
     let status = get_status(&server, "acme", "billing", None).await;
     assert_eq!(status["refs"].as_array().unwrap().len(), 1);
@@ -77,7 +74,7 @@ async fn status_public_fork_is_free() {
 
     let client = server.client();
     client
-        .sync_repo("acme", "forkbilling", None, None)
+        .sync_repo("acme/forkbilling", None)
         .await
         .expect("sync");
 
@@ -103,10 +100,7 @@ async fn status_shape_is_backwards_compatible() {
     origin.publish();
 
     let client = server.client();
-    client
-        .sync_repo("acme", "compat", None, None)
-        .await
-        .expect("sync");
+    client.sync_repo("acme/compat", None).await.expect("sync");
 
     let status = get_status(&server, "acme", "compat", None).await;
     // Fields ripclone-cloud already parses must exist.
