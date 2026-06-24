@@ -1,8 +1,10 @@
 use anyhow::{Context, Result};
 use gix::objs::tree::EntryMode;
 use gix::traverse::tree::{Visit, visit::Action};
+use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 
 /// Global ceiling on the number of worker threads spawned by any gix parallel
 /// helper. Individual operations can be tuned with their own env vars, but they
@@ -41,6 +43,60 @@ pub fn default_worker_threads() -> usize {
             .map(|n| n.get())
             .unwrap_or(4),
     )
+}
+
+/// Map a vector of work items over a persistent rayon thread pool, with one
+/// gix handle created per chunk. Results are returned in the original order.
+///
+/// This avoids spawning fresh OS threads for every call. The number of active
+/// chunks is bounded by `num_workers`, but the underlying rayon pool may be
+/// sized via `RAYON_NUM_THREADS` (default: host cores).
+pub fn parallel_map_repo<P, I, F, R>(
+    repo_path: P,
+    items: Vec<I>,
+    num_workers: usize,
+    f: F,
+) -> Result<Vec<R>>
+where
+    P: AsRef<Path>,
+    I: Send + Sync,
+    R: Send,
+    F: Fn(&gix::Repository, &I) -> Result<R> + Sync + Send,
+{
+    let num_workers = num_workers
+        .clamp(1, DEFAULT_THREAD_CAP)
+        .min(items.len().max(1));
+    let sync_repo = Arc::new(open_sync_repo(repo_path)?);
+
+    if num_workers == 1 || items.is_empty() {
+        let repo = sync_repo.to_thread_local();
+        return items
+            .iter()
+            .map(|item| f(&repo, item))
+            .collect::<Result<Vec<_>>>();
+    }
+
+    let f = Arc::new(f);
+    let chunk_size = items.len().div_ceil(num_workers);
+
+    let chunks: Vec<&[I]> = items.chunks(chunk_size).collect();
+    let results: Vec<Vec<R>> = chunks
+        .into_par_iter()
+        .map(|chunk| {
+            let repo = sync_repo.to_thread_local();
+            chunk
+                .iter()
+                .map(|item| f(&repo, item))
+                .collect::<Result<Vec<_>>>()
+        })
+        .collect::<Result<Vec<_>>>()
+        .context("parallel repo worker failed")?;
+
+    let mut out = Vec::with_capacity(items.len());
+    for r in results {
+        out.extend(r);
+    }
+    Ok(out)
 }
 
 /// Open a gix repository for single-threaded use.
@@ -222,10 +278,15 @@ pub fn list_tree_entries<P: AsRef<Path>>(
     Ok(out)
 }
 
-/// Return the raw (uncompressed) size of each object.
+/// Threshold below which the overhead of scheduling work on a persistent pool
+/// is not worth it; just run the lookup sequentially.
 const PARALLEL_LOOKUP_THRESHOLD: usize = 256;
 
+/// Return the raw (uncompressed) size of each object.
 pub fn object_sizes<P: AsRef<Path>>(repo_path: P, oids: &[String]) -> Result<HashMap<String, u64>> {
+    if oids.is_empty() {
+        return Ok(HashMap::new());
+    }
     if oids.len() < PARALLEL_LOOKUP_THRESHOLD {
         let repo = open_repo(repo_path)?;
         let mut map = HashMap::with_capacity(oids.len());
@@ -239,39 +300,15 @@ pub fn object_sizes<P: AsRef<Path>>(repo_path: P, oids: &[String]) -> Result<Has
         return Ok(map);
     }
 
-    let sync_repo = open_sync_repo(repo_path)?;
-    let num_threads =
-        worker_threads("RIPCLONE_LOOKUP_THREADS", default_worker_threads()).min(oids.len());
-    let chunk_size = oids.len().div_ceil(num_threads);
-
-    std::thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(num_threads);
-        for chunk in oids.chunks(chunk_size.max(1)) {
-            let sync = &sync_repo;
-            handles.push(scope.spawn(move || {
-                let repo = sync.to_thread_local();
-                let mut local = HashMap::with_capacity(chunk.len());
-                for oid_str in chunk {
-                    let id = parse_oid(oid_str)?;
-                    let header = repo
-                        .find_header(id)
-                        .with_context(|| format!("find header {}", oid_str))?;
-                    local.insert(oid_str.clone(), header.size());
-                }
-                Ok::<_, anyhow::Error>(local)
-            }));
-        }
-
-        let mut map = HashMap::with_capacity(oids.len());
-        for handle in handles {
-            map.extend(
-                handle
-                    .join()
-                    .map_err(|e| anyhow::anyhow!("object_sizes worker panicked: {:?}", e))??,
-            );
-        }
-        Ok(map)
-    })
+    let num_workers = worker_threads("RIPCLONE_LOOKUP_THREADS", default_worker_threads());
+    let pairs = parallel_map_repo(repo_path, oids.to_vec(), num_workers, |repo, oid_str| {
+        let id = parse_oid(oid_str)?;
+        let header = repo
+            .find_header(id)
+            .with_context(|| format!("find header {}", oid_str))?;
+        Ok((oid_str.clone(), header.size()))
+    })?;
+    Ok(pairs.into_iter().collect())
 }
 
 /// Classify many objects by type.
@@ -280,6 +317,9 @@ pub fn classify_objects<P: AsRef<Path>>(
     shas: &HashSet<String>,
 ) -> Result<HashMap<String, String>> {
     let shas: Vec<String> = shas.iter().cloned().collect();
+    if shas.is_empty() {
+        return Ok(HashMap::new());
+    }
     if shas.len() < PARALLEL_LOOKUP_THRESHOLD {
         let repo = open_repo(repo_path)?;
         let mut map = HashMap::with_capacity(shas.len());
@@ -293,39 +333,15 @@ pub fn classify_objects<P: AsRef<Path>>(
         return Ok(map);
     }
 
-    let sync_repo = open_sync_repo(repo_path)?;
-    let num_threads =
-        worker_threads("RIPCLONE_LOOKUP_THREADS", default_worker_threads()).min(shas.len());
-    let chunk_size = shas.len().div_ceil(num_threads);
-
-    std::thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(num_threads);
-        for chunk in shas.chunks(chunk_size.max(1)) {
-            let sync = &sync_repo;
-            handles.push(scope.spawn(move || {
-                let repo = sync.to_thread_local();
-                let mut local = HashMap::with_capacity(chunk.len());
-                for sha in chunk {
-                    let id = parse_oid(sha)?;
-                    let header = repo
-                        .find_header(id)
-                        .with_context(|| format!("find header {}", sha))?;
-                    local.insert(sha.clone(), kind_to_str(header.kind()).to_string());
-                }
-                Ok::<_, anyhow::Error>(local)
-            }));
-        }
-
-        let mut map = HashMap::with_capacity(shas.len());
-        for handle in handles {
-            map.extend(
-                handle
-                    .join()
-                    .map_err(|e| anyhow::anyhow!("classify_objects worker panicked: {:?}", e))??,
-            );
-        }
-        Ok(map)
-    })
+    let num_workers = worker_threads("RIPCLONE_LOOKUP_THREADS", default_worker_threads());
+    let pairs = parallel_map_repo(repo_path, shas, num_workers, |repo, sha| {
+        let id = parse_oid(sha)?;
+        let header = repo
+            .find_header(id)
+            .with_context(|| format!("find header {}", sha))?;
+        Ok((sha.clone(), kind_to_str(header.kind()).to_string()))
+    })?;
+    Ok(pairs.into_iter().collect())
 }
 
 /// Return the type of an object.

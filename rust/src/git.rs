@@ -776,8 +776,8 @@ fn shell_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('\'', "'\\''")
 }
 
-/// Read and encode objects as pack base entries in parallel. Per-thread gix
-/// handles share the ODB, and the returned vector is sorted by object id so the
+/// Read and encode objects as pack base entries using the persistent rayon pool
+/// and per-chunk gix handles. The returned vector is sorted by object id so the
 /// final pack is deterministic.
 fn encode_objects_parallel(
     repo: &gix::Repository,
@@ -801,47 +801,21 @@ fn encode_objects_parallel(
             .collect::<Result<Vec<_>>>();
     }
 
-    let sync_repo = repo.clone().into_sync();
-    let num_threads = crate::gix_util::worker_threads(
+    let num_workers = crate::gix_util::worker_threads(
         "RIPCLONE_PACK_ENCODE_THREADS",
         crate::gix_util::default_worker_threads(),
-    )
-    .min(ids.len());
-    let chunk_size = ids.len().div_ceil(num_threads);
-
+    );
+    let repo_path = repo.path().to_path_buf();
     let mut entries: Vec<gix_pack::data::output::Entry> =
-        std::thread::scope(|scope| -> Result<Vec<gix_pack::data::output::Entry>> {
-            let mut handles = Vec::with_capacity(num_threads);
-            for chunk in ids.chunks(chunk_size.max(1)) {
-                let sync = &sync_repo;
-                handles.push(scope.spawn(move || {
-                    let repo = sync.to_thread_local();
-                    chunk
-                        .iter()
-                        .map(|id| {
-                            let obj = repo
-                                .find_object(*id)
-                                .with_context(|| format!("find object {id}"))?;
-                            let count = gix_pack::data::output::Count::from_data(*id, None);
-                            let data =
-                                gix::objs::Data::new(&obj.data, obj.kind, gix::hash::Kind::Sha1);
-                            let entry = gix_pack::data::output::Entry::from_data(&count, &data)
-                                .with_context(|| format!("encode object {id}"))?;
-                            Ok(entry)
-                        })
-                        .collect::<Result<Vec<_>>>()
-                }));
-            }
-
-            let mut combined = Vec::with_capacity(ids.len());
-            for handle in handles {
-                combined.extend(
-                    handle
-                        .join()
-                        .map_err(|e| anyhow::anyhow!("pack encode worker panicked: {:?}", e))??,
-                );
-            }
-            Ok(combined)
+        crate::gix_util::parallel_map_repo(repo_path, ids, num_workers, |local_repo, id| {
+            let obj = local_repo
+                .find_object(*id)
+                .with_context(|| format!("find object {id}"))?;
+            let count = gix_pack::data::output::Count::from_data(*id, None);
+            let data = gix::objs::Data::new(&obj.data, obj.kind, gix::hash::Kind::Sha1);
+            let entry = gix_pack::data::output::Entry::from_data(&count, &data)
+                .with_context(|| format!("encode object {id}"))?;
+            Ok(entry)
         })?;
     entries.sort_by_key(|a| a.id);
     Ok(entries)

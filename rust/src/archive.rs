@@ -1047,9 +1047,9 @@ fn collect_blobs_raw_gix(
     Ok(())
 }
 
-/// Hash a list of `(path, blob_oid, mode)` tuples in parallel using per-thread
-/// gix handles. Returns the same order as `blobs` so the manifest order stays
-/// deterministic.
+/// Hash a list of `(path, blob_oid, mode)` tuples in parallel using the
+/// persistent rayon pool and per-chunk gix handles. Results keep the input
+/// order so the manifest order stays deterministic.
 fn hash_blobs_parallel(
     mirror: &std::path::Path,
     blobs: Vec<(Vec<u8>, gix::hash::ObjectId, u32)>,
@@ -1069,41 +1069,15 @@ fn hash_blobs_parallel(
             .collect::<anyhow::Result<Vec<_>>>();
     }
 
-    let sync_repo = crate::gix_util::open_sync_repo(mirror)?;
-    let num_threads = crate::gix_util::worker_threads(
+    let num_workers = crate::gix_util::worker_threads(
         "RIPCLONE_HASH_THREADS",
         crate::gix_util::default_worker_threads(),
-    )
-    .min(blobs.len());
-    let chunk_size = blobs.len().div_ceil(num_threads);
-
-    std::thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(num_threads);
-        for chunk in blobs.chunks(chunk_size.max(1)) {
-            let sync = &sync_repo;
-            handles.push(scope.spawn(move || {
-                let repo = sync.to_thread_local();
-                chunk
-                    .iter()
-                    .map(|(path, oid, mode)| {
-                        let blob = repo.find_blob(*oid).with_context(|| {
-                            format!("read blob {} for {}", oid, String::from_utf8_lossy(path))
-                        })?;
-                        Ok((path.clone(), *mode, sha1_bytes(&blob.data).to_vec()))
-                    })
-                    .collect::<anyhow::Result<Vec<_>>>()
-            }));
-        }
-
-        let mut combined = Vec::with_capacity(blobs.len());
-        for handle in handles {
-            combined.extend(
-                handle
-                    .join()
-                    .map_err(|e| anyhow::anyhow!("blob hash worker panicked: {:?}", e))??,
-            );
-        }
-        Ok(combined)
+    );
+    crate::gix_util::parallel_map_repo(mirror, blobs, num_workers, |repo, (path, oid, mode)| {
+        let blob = repo
+            .find_blob(*oid)
+            .with_context(|| format!("read blob {} for {}", oid, String::from_utf8_lossy(path)))?;
+        Ok((path.clone(), *mode, sha1_bytes(&blob.data).to_vec()))
     })
 }
 
