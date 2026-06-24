@@ -8,7 +8,7 @@ This file tracks what has already landed in ripclone. For upcoming work see `ROA
   - **Shell installer** — prebuilt per-platform binaries + checksums on a GitHub Release, fetched by `install.sh` (`curl … | sh`).
   - **crates.io** — `cargo install ripclone` / `cargo add ripclone` (validated end-to-end with `cargo publish --dry-run`).
   - **PyPI** — `pip install ripclone`, a maturin-built wheel of the CLI binary.
-- **`ripclone update`** checks the latest GitHub release and shows how to update.
+- **`ripclone update`** checks the latest GitHub release and shows how to update (a repo with no releases yet reports "no published releases yet" instead of a fetch error).
 - Binaries build natively per platform (no cross-compile) and link C libraries dynamically — see the README for runtime packages; static binaries are a future refinement. The release jobs need `CARGO_REGISTRY_TOKEN` (crates.io) and PyPI Trusted Publishing configured, and prove out on the first real tag.
 
 ## Licensing
