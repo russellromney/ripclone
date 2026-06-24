@@ -2,6 +2,12 @@
 
 This file tracks what has already landed in ripclone. For upcoming work see `ROADMAP.md`.
 
+## Version reconciliation (CLI ↔ server)
+
+- **`ripclone --version` and `ripclone-server --version`** now report the build version (they previously errored).
+- **`/v1/version`** (`rust/src/server.rs`): a public, unauthenticated endpoint returning `{ version, protocol }` so a client can check compatibility without credentials.
+- **`ripclone version`** (`rust/src/bin/cli.rs`): prints the CLI's version + protocol, queries the configured server's `/v1/version`, and reports a compatibility verdict. Compatibility is keyed on a new wire **`PROTOCOL_VERSION`** (`rust/src/lib.rs`), not the build version — so the CLI and server can be released on independent cadences as long as their protocol versions match. Bump `PROTOCOL_VERSION` only on a breaking protocol change.
+
 ## Supply chain
 
 - **Dependencies are pinned and move only deliberately.** `Cargo.lock` is committed and every CI/Docker `cargo` invocation uses `--locked`, so the resolved versions never drift on their own. Updates land only through reviewed **Dependabot** PRs (`.github/dependabot.yml`): one grouped PR per week for Rust crates and one for GitHub Actions — none auto-merged.

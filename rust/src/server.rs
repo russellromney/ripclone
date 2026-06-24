@@ -443,6 +443,7 @@ pub fn build_app(state: ServerState) -> Router {
 
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/v1/version", get(version_handler))
         .merge(rate_limited)
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(state)
@@ -536,6 +537,16 @@ async fn rate_limit_middleware(
 
 async fn healthz() -> impl IntoResponse {
     Json(serde_json::json!({"status": "ok"}))
+}
+
+/// Public version endpoint. Reports the server's build version and the wire
+/// protocol version it speaks, so a client can check compatibility without
+/// authenticating. Compatibility is keyed on `protocol`, not the build version.
+async fn version_handler() -> impl IntoResponse {
+    Json(serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "protocol": crate::PROTOCOL_VERSION,
+    }))
 }
 
 /// Readiness probe: 200 only when storage and the ref store are both reachable,
@@ -4276,7 +4287,7 @@ mod tests {
         // Liveness, readiness, and the Prometheus scrape must be reachable with
         // no credentials (load balancers / scrapers don't authenticate). They
         // must never return 401 from the auth middleware.
-        for path in ["/healthz", "/readyz", "/metrics"] {
+        for path in ["/healthz", "/readyz", "/metrics", "/v1/version"] {
             let resp = app
                 .clone()
                 .oneshot(request_with_auth("GET", path, None))
@@ -4288,6 +4299,24 @@ mod tests {
                 "{path} must not require auth"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn version_endpoint_reports_build_and_protocol() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(&tmp);
+        let app = build_app(state);
+        let response = app
+            .oneshot(request_with_auth("GET", "/v1/version", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(v["protocol"], crate::PROTOCOL_VERSION);
     }
 
     #[tokio::test]

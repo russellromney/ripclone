@@ -14,6 +14,7 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(name = "ripclone")]
 #[command(about = "CAS-based git clone helper")]
+#[command(version)]
 struct Args {
     /// ripclone server. Defaults to the managed cloud; set RIPCLONE_SERVER or
     /// pass --server http://localhost:8000 to point at a self-hosted backend.
@@ -32,6 +33,8 @@ enum Commands {
     Login,
     /// Remove the saved token.
     Logout,
+    /// Show the CLI version + protocol, and check the configured server's.
+    Version,
     /// Sync a repo on the server.
     Sync {
         repo: String,
@@ -254,6 +257,62 @@ struct DevicePoll {
 }
 
 /// `ripclone login`: start a device flow, wait for browser approval, save the token.
+#[derive(serde::Deserialize)]
+struct ServerVersion {
+    #[serde(default)]
+    version: String,
+    #[serde(default)]
+    protocol: u32,
+}
+
+/// Print the CLI's version + protocol, then query the configured server's
+/// `/v1/version` and report whether they're compatible. Compatibility is keyed
+/// on the wire protocol, not the build version, so the CLI and server can be
+/// released independently as long as their protocol versions match.
+async fn run_version(server: &str) -> Result<()> {
+    let local_protocol = ripclone::PROTOCOL_VERSION;
+    println!(
+        "ripclone {}  (protocol {local_protocol})",
+        env!("CARGO_PKG_VERSION")
+    );
+
+    let url = format!("{}/v1/version", server.trim_end_matches('/'));
+    let http = reqwest::Client::builder()
+        .user_agent(concat!("ripclone/", env!("CARGO_PKG_VERSION")))
+        .build()?;
+    match http
+        .get(&url)
+        .send()
+        .await
+        .and_then(|r| r.error_for_status())
+    {
+        Ok(resp) => match resp.json::<ServerVersion>().await {
+            Ok(sv) => {
+                println!(
+                    "server   {}  (protocol {})  at {server}",
+                    sv.version, sv.protocol
+                );
+                if sv.protocol == local_protocol {
+                    println!("✓ compatible");
+                } else if local_protocol < sv.protocol {
+                    println!(
+                        "⚠ this CLI speaks protocol {local_protocol}, the server expects {}. Update ripclone.",
+                        sv.protocol
+                    );
+                } else {
+                    println!(
+                        "⚠ this CLI speaks protocol {local_protocol}, newer than the server's {}. The server needs updating.",
+                        sv.protocol
+                    );
+                }
+            }
+            Err(e) => println!("server   {server}: could not read /v1/version ({e})"),
+        },
+        Err(e) => println!("server   {server}: unreachable ({e})"),
+    }
+    Ok(())
+}
+
 async fn run_login(server: &str) -> Result<()> {
     let http = reqwest::Client::builder()
         .user_agent(concat!("ripclone/", env!("CARGO_PKG_VERSION")))
@@ -347,7 +406,7 @@ async fn main() -> Result<()> {
         .or_else(|| config.server.clone())
         .unwrap_or_else(|| "https://ripclone.com".to_string());
 
-    // login/logout don't need an authenticated client.
+    // login/logout/version don't need an authenticated client.
     match &args.command {
         Commands::Login => return run_login(&server).await,
         Commands::Logout => {
@@ -355,6 +414,7 @@ async fn main() -> Result<()> {
             println!("Logged out — token removed.");
             return Ok(());
         }
+        Commands::Version => return run_version(&server).await,
         _ => {}
     }
 
@@ -383,7 +443,7 @@ async fn main() -> Result<()> {
 
     match args.command {
         // Handled before the client is built.
-        Commands::Login | Commands::Logout => unreachable!(),
+        Commands::Login | Commands::Logout | Commands::Version => unreachable!(),
         Commands::Sync {
             repo,
             depth,
