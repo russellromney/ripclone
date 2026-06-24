@@ -435,11 +435,80 @@ impl<'a> PackBuilder<'a> {
         sealed_tip: Option<&str>,
         history_target_raw_bytes: u64,
     ) -> Result<(Vec<(String, u64, String, u64)>, u64)> {
+        // Cold base build (no sealed level yet): reuse the deltas git already has
+        // via the mirror's reachability bitmap instead of enumerating ~all
+        // objects and re-deltifying them in size-partitioned batches (which also
+        // breaks delta reuse at batch boundaries). This is the dominant cost of a
+        // huge repo's first full sync; bitmap pack-reuse makes it ~I/O-bound.
+        if sealed_tip.is_none() {
+            let packs = self.build_history_pack_reuse(commit)?;
+            // Raw-size estimate (deltified history compresses ~18x) — used only to
+            // decide level sealing, never stored. A full base always clears the
+            // seal threshold so it becomes the level future tails build on.
+            let raw_estimate: u64 = packs.iter().map(|(_, plen, _, _)| plen * 18).sum();
+            return Ok((packs, raw_estimate));
+        }
         let tail_oids = git::list_object_shas_in_range(&self.repo, sealed_tip, commit)?;
         if tail_oids.is_empty() {
             return Ok((Vec::new(), 0));
         }
         self.build_packs_from_oids(&tail_oids, history_target_raw_bytes, false)
+    }
+
+    /// Build the cold full-history packs by reusing existing pack deltas via the
+    /// mirror's bitmap (see `git::pack_objects_reachable_to_prefix`). Output is
+    /// split into download-friendly packs and stored in the CAS. The reachable
+    /// closure includes HEAD's objects (a small duplicate with the depth pack) —
+    /// a deliberate space-for-time trade to avoid an exclusion enumeration.
+    fn build_history_pack_reuse(&self, commit: &str) -> Result<Vec<(String, u64, String, u64)>> {
+        let max_pack_bytes = std::env::var("RIPCLONE_HISTORY_MAX_PACK_BYTES")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(64 * 1024 * 1024);
+        let tmp = tempfile::TempDir::new()?;
+        let prefix = tmp.path().join("pack");
+        git::pack_objects_reachable_to_prefix(&self.repo, commit, &prefix, max_pack_bytes)?;
+        self.store_packs_from_dir(tmp.path())
+    }
+
+    /// Read every `pack-<sha>.{pack,idx}` pair written under `dir`, store both
+    /// halves in the CAS, and return `(pack_hash, pack_len, idx_hash, idx_len)`
+    /// for each (one pack run can emit many under `--max-pack-size`).
+    fn store_packs_from_dir(&self, dir: &Path) -> Result<Vec<(String, u64, String, u64)>> {
+        use std::collections::HashMap;
+        let mut packs: HashMap<String, PathBuf> = HashMap::new();
+        let mut idxs: HashMap<String, PathBuf> = HashMap::new();
+        for entry in std::fs::read_dir(dir)? {
+            let path = entry?.path();
+            let stem = path.file_stem().and_then(|s| s.to_str()).map(String::from);
+            match (path.extension().and_then(|e| e.to_str()), stem) {
+                (Some("pack"), Some(name)) => {
+                    packs.insert(name, path);
+                }
+                (Some("idx"), Some(name)) => {
+                    idxs.insert(name, path);
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for (name, pack_path) in packs {
+            let idx_path = idxs
+                .get(&name)
+                .with_context(|| format!("missing idx for {name}"))?;
+            let pack_data = std::fs::read(&pack_path)?;
+            let idx_data = std::fs::read(idx_path)?;
+            let pack_len = pack_data.len() as u64;
+            let idx_len = idx_data.len() as u64;
+            let pack_hash = self.cas.put(&pack_data)?;
+            let idx_hash = self.cas.put(&idx_data)?;
+            out.push((pack_hash, pack_len, idx_hash, idx_len));
+        }
+        if out.is_empty() {
+            bail!("no packs produced");
+        }
+        Ok(out)
     }
 
     /// Size-tiered compaction of LSM history levels. Levels are ordered oldest →
