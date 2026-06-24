@@ -1070,10 +1070,11 @@ fn hash_blobs_parallel(
     }
 
     let sync_repo = crate::gix_util::open_sync_repo(mirror)?;
-    let num_threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(2)
-        .min(blobs.len());
+    let num_threads = crate::gix_util::worker_threads(
+        "RIPCLONE_HASH_THREADS",
+        crate::gix_util::default_worker_threads(),
+    )
+    .min(blobs.len());
     let chunk_size = blobs.len().div_ceil(num_threads);
 
     std::thread::scope(|scope| {

@@ -4,6 +4,45 @@ use gix::traverse::tree::{Visit, visit::Action};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+/// Global ceiling on the number of worker threads spawned by any gix parallel
+/// helper. Individual operations can be tuned with their own env vars, but they
+/// are always clamped to this value to avoid saturating the host.
+pub const DEFAULT_THREAD_CAP: usize = 64;
+
+/// Threading environment variables:
+///
+/// * `RIPCLONE_MAX_THREADS`        - global ceiling for all gix worker pools (default: host cores).
+/// * `RIPCLONE_HASH_THREADS`       - blob hashing in archive files-table builds.
+/// * `RIPCLONE_PACK_ENCODE_THREADS`- object read/encode in gix pack encoding.
+/// * `RIPCLONE_GIX_INDEX_THREADS`  - gix pack index verification/writing.
+/// * `RIPCLONE_LOOKUP_THREADS`     - bulk object size/type lookups.
+/// * `RIPCLONE_WRITE_THREADS`      - worktree materialization writers (in extract.rs).
+/// * `RIPCLONE_FETCH_THREADS`      - archive chunk fetchers (in extract.rs).
+/// * `RAYON_NUM_THREADS`           - zstd frame compression pool (in archive.rs).
+///
+/// All values are clamped to `[1, DEFAULT_THREAD_CAP]`.
+///
+/// Read a parallelism setting from `env_var`. If missing or unparseable, use
+/// `fallback`. The result is clamped to at least 1 and at most the global cap.
+pub fn worker_threads(env_var: &str, fallback: usize) -> usize {
+    let fallback = fallback.clamp(1, DEFAULT_THREAD_CAP);
+    std::env::var(env_var)
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .map(|n| n.clamp(1, DEFAULT_THREAD_CAP))
+        .unwrap_or(fallback)
+}
+
+/// Number of threads to use when no operation-specific override is set.
+pub fn default_worker_threads() -> usize {
+    worker_threads(
+        "RIPCLONE_MAX_THREADS",
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4),
+    )
+}
+
 /// Open a gix repository for single-threaded use.
 pub fn open_repo<P: AsRef<Path>>(path: P) -> Result<gix::Repository> {
     gix::open(path.as_ref())
@@ -201,10 +240,8 @@ pub fn object_sizes<P: AsRef<Path>>(repo_path: P, oids: &[String]) -> Result<Has
     }
 
     let sync_repo = open_sync_repo(repo_path)?;
-    let num_threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(2)
-        .min(oids.len());
+    let num_threads =
+        worker_threads("RIPCLONE_LOOKUP_THREADS", default_worker_threads()).min(oids.len());
     let chunk_size = oids.len().div_ceil(num_threads);
 
     std::thread::scope(|scope| {
@@ -257,10 +294,8 @@ pub fn classify_objects<P: AsRef<Path>>(
     }
 
     let sync_repo = open_sync_repo(repo_path)?;
-    let num_threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(2)
-        .min(shas.len());
+    let num_threads =
+        worker_threads("RIPCLONE_LOOKUP_THREADS", default_worker_threads()).min(shas.len());
     let chunk_size = shas.len().div_ceil(num_threads);
 
     std::thread::scope(|scope| {

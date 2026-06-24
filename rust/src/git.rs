@@ -802,10 +802,11 @@ fn encode_objects_parallel(
     }
 
     let sync_repo = repo.clone().into_sync();
-    let num_threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(2)
-        .min(ids.len());
+    let num_threads = crate::gix_util::worker_threads(
+        "RIPCLONE_PACK_ENCODE_THREADS",
+        crate::gix_util::default_worker_threads(),
+    )
+    .min(ids.len());
     let chunk_size = ids.len().div_ceil(num_threads);
 
     let mut entries: Vec<gix_pack::data::output::Entry> =
@@ -947,9 +948,10 @@ pub fn index_pack<P: AsRef<Path>, Q: AsRef<Path>>(_git_dir: P, pack_path: Q) -> 
             .with_context(|| format!("open pack {}", pack_path.display()))?,
     );
     let mut progress = gix::features::progress::Discard;
-    let thread_limit = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(2);
+    let thread_limit = crate::gix_util::worker_threads(
+        "RIPCLONE_GIX_INDEX_THREADS",
+        crate::gix_util::default_worker_threads(),
+    );
     let outcome = gix_pack::Bundle::write_to_directory(
         &mut reader,
         Some(directory),

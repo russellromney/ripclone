@@ -943,9 +943,14 @@ fn env_usize(name: &str) -> Option<usize> {
 }
 
 fn archive_thread_counts() -> (usize, usize) {
-    let cores = available_parallelism();
-    let fetch_threads = env_usize("RIPCLONE_FETCH_THREADS").unwrap_or(cores).max(1);
-    let write_threads = env_usize("RIPCLONE_WRITE_THREADS").unwrap_or(cores).max(1);
+    let fetch_threads = crate::gix_util::worker_threads(
+        "RIPCLONE_FETCH_THREADS",
+        crate::gix_util::default_worker_threads(),
+    );
+    let write_threads = crate::gix_util::worker_threads(
+        "RIPCLONE_WRITE_THREADS",
+        crate::gix_util::default_worker_threads(),
+    );
     (fetch_threads, write_threads)
 }
 
@@ -1555,15 +1560,11 @@ pub fn materialize_worktree_from_pack(repo_root: &Path, commit: &str) -> Result<
             .with_context(|| format!("create dir {}", dir.display()))?;
     }
 
-    let num_cpus = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
-    let write_threads = std::env::var("RIPCLONE_WRITE_THREADS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| num_cpus.max(1))
-        .max(1)
-        .min(items.len());
+    let write_threads = crate::gix_util::worker_threads(
+        "RIPCLONE_WRITE_THREADS",
+        crate::gix_util::default_worker_threads(),
+    )
+    .min(items.len());
 
     info!(
         "materializing {} files from pack with {} threads",
