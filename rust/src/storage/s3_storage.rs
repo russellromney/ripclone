@@ -31,12 +31,28 @@ impl S3Storage {
         auth: Auth,
         cache_dir: Option<&Path>,
     ) -> Result<Self> {
+        // Per-request timeout. The client default (~10s) is too tight for the
+        // cold first sync of a huge repo: that build uploads the whole history at
+        // once (hundreds of 8 MB chunks, no incremental reuse yet), and at
+        // upload concurrency N a chunk's share of a ~100 Mbps uplink can land
+        // right around 10s, so PUTs trip the timeout and thrash on retries.
+        // 30s gives ~3x headroom over the worst-case per-chunk time, so the
+        // timeout + retry policy almost never trips, while still failing fast on a
+        // genuinely stuck request. Steady-state re-syncs only upload the delta, so
+        // this barely ever matters.
+        let request_timeout = Duration::from_secs(
+            std::env::var("RIPCLONE_S3_REQUEST_TIMEOUT_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(30),
+        );
         let client = Client::builder(endpoint)
             .context("build S3 client")?
             .region(region)
             .auth(auth)
             .addressing_style(s3::AddressingStyle::Path)
             .tls_root_store(s3::AsyncTlsRootStore::System)
+            .timeout(request_timeout)
             .max_attempts(5)
             .base_retry_delay(Duration::from_millis(200))
             .max_retry_delay(Duration::from_secs(5))
