@@ -42,7 +42,8 @@ COPY --from=builder /app/target/release/git-remote-ripclone /usr/local/bin/git-r
 COPY --from=builder /app/target/release/ripclone-server /usr/local/bin/ripclone-server
 COPY --from=builder /app/target/release/writer_bench /usr/local/bin/writer_bench
 COPY scripts/fly_client_test.sh /run-tests.sh
-RUN chmod +x /run-tests.sh
+COPY scripts/fly_benchmark.sh /fly_benchmark.sh
+RUN chmod +x /run-tests.sh /fly_benchmark.sh
 
 ENV RUST_LOG=info
 ENV PATH="/usr/local/bin:${PATH}"

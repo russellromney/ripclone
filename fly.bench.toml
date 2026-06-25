@@ -1,0 +1,31 @@
+app = 'ripclone-server-dev'
+primary_region = 'iad'
+
+[build]
+  dockerfile = 'Dockerfile'
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = true
+  auto_start_machines = true
+  # Keep one machine warm: clone latency is the product, so we eat the small
+  # always-on cost to avoid cold-start on resolve.
+  min_machines_running = 1
+  processes = ['app']
+
+[[vm]]
+  size = 'performance-8x'
+  memory = '16gb'
+
+[env]
+  # Git pack-objects creates temp packs in TMPDIR and renames them into the
+  # mirror repo. Keep TMPDIR on the same filesystem as the repo root so the
+  # rename succeeds.
+  TMPDIR = '/data/repos'
+  RIPCLONE_ORIGIN_BASE = 'file:///data/bench-origins'
+  RIPCLONE_MIRROR_FRESH_TTL_SECS = '0'
+
+[mounts]
+  source = 'ripclone_data'
+  destination = '/data'
