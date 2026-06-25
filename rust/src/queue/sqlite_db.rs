@@ -3,8 +3,8 @@
 //! atomic conditional claim). For multi-machine use the remote `libsql` backend.
 
 use super::sql::{
-    CREATE_ACTIVE_KEY_INDEX_SQL, CREATE_HISTORY_INDEX_SQL, CREATE_STATUS_INDEX_SQL,
-    CREATE_TABLE_SQL, QueueDb,
+    ADD_CREDENTIAL_COLUMN_SQL, CREATE_ACTIVE_KEY_INDEX_SQL, CREATE_HISTORY_INDEX_SQL,
+    CREATE_STATUS_INDEX_SQL, CREATE_TABLE_SQL, QueueDb,
 };
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -44,6 +44,11 @@ impl QueueDb for SqliteDb {
             .execute(&self.pool)
             .await
             .context("create jobs table")?;
+        // Migrate a legacy table to add the credential column (best-effort: errors
+        // "duplicate column" on a fresh table, which is fine).
+        let _ = sqlx::raw_sql(ADD_CREDENTIAL_COLUMN_SQL)
+            .execute(&self.pool)
+            .await;
         sqlx::raw_sql(CREATE_STATUS_INDEX_SQL)
             .execute(&self.pool)
             .await
@@ -158,9 +163,13 @@ impl QueueDb for SqliteDb {
         finished_at: i64,
         error: Option<&str>,
     ) -> Result<()> {
-        sqlx::query("UPDATE jobs SET status = ?, finished_at = ?, error = ? WHERE id = ?")
-            .bind(status)
-            .bind(finished_at)
+        // Clear the per-job credential on finish so a short-lived upstream token
+        // isn't retained in the (kept-forever) done-job history.
+        sqlx::query(
+            "UPDATE jobs SET status = ?, finished_at = ?, error = ?, credential = NULL WHERE id = ?",
+        )
+        .bind(status)
+        .bind(finished_at)
             .bind(error)
             .bind(id)
             .execute(&self.pool)

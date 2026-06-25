@@ -329,6 +329,13 @@ pub(crate) const CREATE_ACTIVE_KEY_INDEX_SQL: &str =
 /// ("what was synced for this repo over time").
 pub(crate) const CREATE_HISTORY_INDEX_SQL: &str = "CREATE INDEX IF NOT EXISTS idx_jobs_provider_path_finished ON jobs(provider, path, finished_at)";
 
+/// Migration for a `jobs` table created before the `credential` column existed.
+/// `CREATE TABLE IF NOT EXISTS` is a no-op on an existing table, so it never adds
+/// the column — run this ALTER best-effort (it errors "duplicate column" on a
+/// fresh table, which is ignored). SQLite/libsql have no `ADD COLUMN IF NOT
+/// EXISTS`, hence best-effort; Postgres uses its own `IF NOT EXISTS` form.
+pub(crate) const ADD_CREDENTIAL_COLUMN_SQL: &str = "ALTER TABLE jobs ADD COLUMN credential TEXT";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -424,6 +431,57 @@ mod tests {
             let claimed = q.claim("w1").await.unwrap().unwrap();
             assert!(claimed.credential.is_none(), "{engine}");
         }
+    }
+
+    #[tokio::test]
+    async fn finish_clears_the_stored_credential() {
+        // A short-lived upstream token must not linger in the kept-forever
+        // done-job history. (Adapter-level: SqliteDb directly.)
+        let dir = tempfile::tempdir().unwrap();
+        let db = SqliteDb::connect(&dir.path().join("q.db").to_string_lossy())
+            .await
+            .unwrap();
+        db.init().await.unwrap();
+        let id = db
+            .insert_job("k", "github", "o/r", "main", Some("dG9rZW4="), 1)
+            .await
+            .unwrap();
+        let (_, _, _, before) = db.job_fields(id).await.unwrap().unwrap();
+        assert_eq!(before.as_deref(), Some("dG9rZW4="));
+        db.finish(id, "done", 2, None).await.unwrap();
+        let (_, _, _, after) = db.job_fields(id).await.unwrap().unwrap();
+        assert!(after.is_none(), "credential must be cleared on finish");
+    }
+
+    #[tokio::test]
+    async fn init_migrates_a_legacy_jobs_table_and_is_idempotent() {
+        use sqlx::sqlite::SqlitePoolOptions;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q.db");
+        // A pre-credential `jobs` table, created by hand (no credential column).
+        let url = format!("sqlite://{}?mode=rwc", path.display());
+        let pool = SqlitePoolOptions::new().connect(&url).await.unwrap();
+        sqlx::raw_sql(
+            "CREATE TABLE jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT NOT NULL, \
+             provider TEXT NOT NULL, path TEXT NOT NULL, branch TEXT NOT NULL, \
+             status TEXT NOT NULL, worker_id TEXT, created_at INTEGER NOT NULL, \
+             claimed_at INTEGER, finished_at INTEGER, error TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        let db = SqliteDb::connect(&path.to_string_lossy()).await.unwrap();
+        db.init().await.unwrap(); // adds the credential column to the legacy table
+        db.init().await.unwrap(); // idempotent: best-effort ALTER ignores duplicate
+        // Inserting a credential now works because the column exists.
+        let id = db
+            .insert_job("k", "github", "o/r", "main", Some("Y3JlZA=="), 1)
+            .await
+            .unwrap();
+        let (_, _, _, cred) = db.job_fields(id).await.unwrap().unwrap();
+        assert_eq!(cred.as_deref(), Some("Y3JlZA=="));
     }
 
     #[tokio::test]

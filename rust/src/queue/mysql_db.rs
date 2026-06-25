@@ -61,6 +61,12 @@ impl QueueDb for MysqlDb {
         .execute(&self.pool)
         .await
         .context("create jobs table")?;
+        // Migrate a legacy table to add the credential column. MySQL 8 has no
+        // ADD COLUMN IF NOT EXISTS, so this is best-effort: it errors with a
+        // duplicate-column code on an up-to-date table, which we ignore.
+        let _ = sqlx::raw_sql("ALTER TABLE jobs ADD COLUMN credential TEXT")
+            .execute(&self.pool)
+            .await;
         Ok(())
     }
 
@@ -161,11 +167,14 @@ impl QueueDb for MysqlDb {
         finished_at: i64,
         error: Option<&str>,
     ) -> Result<()> {
-        sqlx::query("UPDATE jobs SET status = ?, finished_at = ?, error = ? WHERE id = ?")
-            .bind(status)
-            .bind(finished_at)
-            .bind(error)
-            .bind(id)
+        // Clear the per-job credential on finish (not retained in done-job history).
+        sqlx::query(
+            "UPDATE jobs SET status = ?, finished_at = ?, error = ?, credential = NULL WHERE id = ?",
+        )
+        .bind(status)
+        .bind(finished_at)
+        .bind(error)
+        .bind(id)
             .execute(&self.pool)
             .await
             .context("finish job")?;

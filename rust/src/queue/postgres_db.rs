@@ -56,6 +56,11 @@ impl QueueDb for PostgresDb {
         .execute(&self.pool)
         .await
         .context("create jobs table")?;
+        // Migrate a legacy table (created before the credential column).
+        sqlx::raw_sql("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS credential TEXT")
+            .execute(&self.pool)
+            .await
+            .context("add credential column")?;
         sqlx::raw_sql(
             "CREATE INDEX IF NOT EXISTS idx_jobs_status_created ON jobs(status, created_at)",
         )
@@ -178,11 +183,14 @@ impl QueueDb for PostgresDb {
         finished_at: i64,
         error: Option<&str>,
     ) -> Result<()> {
-        sqlx::query("UPDATE jobs SET status = $1, finished_at = $2, error = $3 WHERE id = $4")
-            .bind(status)
-            .bind(finished_at)
-            .bind(error)
-            .bind(id)
+        // Clear the per-job credential on finish (not retained in done-job history).
+        sqlx::query(
+            "UPDATE jobs SET status = $1, finished_at = $2, error = $3, credential = NULL WHERE id = $4",
+        )
+        .bind(status)
+        .bind(finished_at)
+        .bind(error)
+        .bind(id)
             .execute(&self.pool)
             .await
             .context("finish job")?;

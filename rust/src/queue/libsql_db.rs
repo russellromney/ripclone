@@ -4,8 +4,8 @@
 //! it doesn't bundle SQLite's C core and collide with sqlx.)
 
 use super::sql::{
-    CREATE_ACTIVE_KEY_INDEX_SQL, CREATE_HISTORY_INDEX_SQL, CREATE_STATUS_INDEX_SQL,
-    CREATE_TABLE_SQL, QueueDb,
+    ADD_CREDENTIAL_COLUMN_SQL, CREATE_ACTIVE_KEY_INDEX_SQL, CREATE_HISTORY_INDEX_SQL,
+    CREATE_STATUS_INDEX_SQL, CREATE_TABLE_SQL, QueueDb,
 };
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -43,6 +43,9 @@ impl QueueDb for LibsqlDb {
         conn.execute(CREATE_TABLE_SQL, ())
             .await
             .context("create jobs table")?;
+        // Migrate a legacy table to add the credential column (best-effort: errors
+        // "duplicate column" on a fresh table, which is fine).
+        let _ = conn.execute(ADD_CREDENTIAL_COLUMN_SQL, ()).await;
         conn.execute(CREATE_STATUS_INDEX_SQL, ())
             .await
             .context("create status index")?;
@@ -167,8 +170,9 @@ impl QueueDb for LibsqlDb {
         error: Option<&str>,
     ) -> Result<()> {
         let conn = self.conn().await?;
+        // Clear the per-job credential on finish (not retained in done-job history).
         conn.execute(
-            "UPDATE jobs SET status = ?, finished_at = ?, error = ? WHERE id = ?",
+            "UPDATE jobs SET status = ?, finished_at = ?, error = ?, credential = NULL WHERE id = ?",
             libsql::params![status, finished_at, error, id],
         )
         .await
