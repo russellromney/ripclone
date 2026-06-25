@@ -10,7 +10,7 @@ set -uo pipefail
 #   REPO=oven-sh/bun TARGET=/data RIPCLONE_TOKEN=... \
 #   bash scripts/benchmark_clone_compare.sh
 #
-# Methodology notes (see BENCHMARKS.md):
+# Methodology notes (see docs/BENCHMARKS.md):
 #   * Cache is force-disabled (RIPCLONE_NO_CACHE=1) so nothing is served from a
 #     client-local artifact cache — every clone fetches from object storage.
 #   * The server mirror is warmed first so `resolve` reflects steady state

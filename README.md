@@ -240,7 +240,7 @@ Environment variables for tuning clone performance:
 - `RIPCLONE_MODE` — default clone mode (`editable` or `files`) when `--mode` is omitted.
 - `RIPCLONE_CACHE_DIR` / `RIPCLONE_NO_CACHE` — opt in to (or force off) a local artifact cache; off by default.
 
-Server-side storage and retention (S3-compatible backends, remote GC, local eviction) are configured through `RIPCLONE_S3_*`, `RIPCLONE_RETENTION_*`, and `RIPCLONE_REMOTE_GC_*` variables; see `docs/BACKENDS.md` and `CHANGELOG.md` for the full list.
+Server-side storage and retention (S3-compatible backends, remote GC, local eviction) are configured through `RIPCLONE_S3_*`, `RIPCLONE_RETENTION_*`, and `RIPCLONE_REMOTE_GC_*` variables; see `docs/BACKENDS.md` and `docs/CHANGELOG.md` for the full list.
 
 ## License
 

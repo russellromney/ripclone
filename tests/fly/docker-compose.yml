@@ -7,8 +7,10 @@ version: "3.8"
 services:
   ripclone-server:
     build:
-      context: .
-      dockerfile: Dockerfile
+      # Build context is the repo root (the Dockerfile COPYs rust/ and scripts/);
+      # the compose file lives in tests/fly/, so the context is two levels up.
+      context: ../..
+      dockerfile: tests/fly/Dockerfile
     ports:
       - "8080:8000"
     volumes:

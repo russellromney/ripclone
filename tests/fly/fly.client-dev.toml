@@ -2,7 +2,8 @@ app = 'ripclone-client-dev'
 primary_region = 'ewr'
 
 [build]
-  dockerfile = 'Dockerfile.client'
+  # Deploy from the repo root: `fly deploy --config tests/fly/fly.client-dev.toml`.
+  dockerfile = 'tests/fly/Dockerfile.client'
 
 [env]
   RIPCLONE_URL = 'https://ripclone-server-dev.fly.dev'
