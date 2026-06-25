@@ -72,7 +72,11 @@ fn provider_add_list_rm_lifecycle() {
     );
 
     // The config file should declare the provider but never contain the token.
-    let config = home.path().join(".config").join("ripclone").join("config.toml");
+    let config = home
+        .path()
+        .join(".config")
+        .join("ripclone")
+        .join("config.toml");
     let config_text = std::fs::read_to_string(&config).expect("read config.toml");
     assert!(
         config_text.contains("gitlab"),

@@ -215,16 +215,10 @@ fn parse_url(url: &str) -> Result<(String, String, String)> {
 ///   2. RIPCLONE_URL environment variable (deprecated)
 ///   3. git config remote.<name>.ripcloneServer
 fn resolve_server_url(remote_name: &str) -> Result<String> {
-    if let Some(url) = env::var("RIPCLONE_SERVER")
-        .ok()
-        .filter(|t| !t.is_empty())
-    {
+    if let Some(url) = env::var("RIPCLONE_SERVER").ok().filter(|t| !t.is_empty()) {
         return Ok(url);
     }
-    if let Some(url) = env::var("RIPCLONE_URL")
-        .ok()
-        .filter(|t| !t.is_empty())
-    {
+    if let Some(url) = env::var("RIPCLONE_URL").ok().filter(|t| !t.is_empty()) {
         eprintln!(
             "warning: RIPCLONE_URL is deprecated; use RIPCLONE_SERVER or git config remote.{}.ripcloneServer",
             remote_name
@@ -237,9 +231,7 @@ fn resolve_server_url(remote_name: &str) -> Result<String> {
         .output()
         .context("read git config for ripcloneServer")?;
     if output.status.success() {
-        let url = String::from_utf8(output.stdout)?
-            .trim()
-            .to_string();
+        let url = String::from_utf8(output.stdout)?.trim().to_string();
         if !url.is_empty() {
             return Ok(url);
         }
@@ -274,14 +266,18 @@ fn resolve_server_token() -> Option<String> {
         .ok()
         .filter(|t| !t.is_empty())
     {
-        eprintln!("warning: RIPCLONE_TOKEN_HASH is deprecated for server auth; use RIPCLONE_SERVER_TOKEN_HASH");
+        eprintln!(
+            "warning: RIPCLONE_TOKEN_HASH is deprecated for server auth; use RIPCLONE_SERVER_TOKEN_HASH"
+        );
         return Some(hash);
     }
     env::var("RIPCLONE_TOKEN")
         .ok()
         .filter(|t| !t.is_empty())
         .map(|t| {
-            eprintln!("warning: RIPCLONE_TOKEN is deprecated for server auth; use RIPCLONE_SERVER_TOKEN");
+            eprintln!(
+                "warning: RIPCLONE_TOKEN is deprecated for server auth; use RIPCLONE_SERVER_TOKEN"
+            );
             format!("{:x}", Sha256::digest(t.as_bytes()))
         })
 }

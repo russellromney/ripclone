@@ -53,7 +53,7 @@ async fn files_mode_correct_with_bounded_archive() {
     origin.publish();
     server
         .client()
-        .sync_repo("acme", "arch", None, None)
+        .sync_repo("acme/arch", None)
         .await
         .expect("sync c1");
 
@@ -71,7 +71,7 @@ async fn files_mode_correct_with_bounded_archive() {
     origin.publish();
     server
         .client()
-        .sync_repo("acme", "arch", None, None)
+        .sync_repo("acme/arch", None)
         .await
         .expect("sync c2");
 
@@ -89,7 +89,7 @@ async fn files_mode_correct_with_bounded_archive() {
     origin.publish();
     server
         .client()
-        .sync_repo("acme", "arch", None, None)
+        .sync_repo("acme/arch", None)
         .await
         .expect("sync c3");
 

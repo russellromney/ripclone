@@ -30,7 +30,13 @@ pub fn env_token(id: &str) -> Option<String> {
 pub fn provider_env_var(id: &str) -> String {
     let normalized: String = id
         .chars()
-        .map(|c| if c.is_alphanumeric() { c.to_ascii_uppercase() } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
         .collect();
     format!("RIPCLONE_PROVIDER_{}_TOKEN", normalized)
 }
@@ -152,9 +158,8 @@ pub struct FallbackTokenStore {
 
 impl FallbackTokenStore {
     pub fn new() -> Result<Self> {
-        let file = FileTokenStore::new(
-            FileTokenStore::default_path().context("no HOME for token file")?,
-        );
+        let file =
+            FileTokenStore::new(FileTokenStore::default_path().context("no HOME for token file")?);
         Ok(Self {
             keyring: KeyringTokenStore::new(),
             file,

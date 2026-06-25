@@ -156,8 +156,7 @@ fn save_to(path: &Path, config: &Config) -> Result<()> {
     // Strip any transient token before saving.
     let mut to_save = config.clone();
     to_save.token = None;
-    let data = toml::to_string_pretty(&to_save)
-        .context("serialize config")?;
+    let data = toml::to_string_pretty(&to_save).context("serialize config")?;
     std::fs::write(path, data).with_context(|| format!("write {}", path.display()))?;
     Ok(())
 }
@@ -226,10 +225,7 @@ mod tests {
         let cfg = dir.path().join("ripclone.toml");
         std::fs::write(&cfg, "server = \"https://example.com\"\n").unwrap();
 
-        assert_eq!(
-            project_config_path(&nested),
-            Some(cfg)
-        );
+        assert_eq!(project_config_path(&nested), Some(cfg));
     }
 
     #[test]
@@ -255,7 +251,10 @@ mod tests {
             token: None,
         };
         let merged = merge(project, global);
-        assert_eq!(merged.server.as_deref(), Some("https://project.example.com"));
+        assert_eq!(
+            merged.server.as_deref(),
+            Some("https://project.example.com")
+        );
         assert_eq!(merged.default_provider.as_deref(), Some("github"));
         assert_eq!(merged.clone.depth, Some(10));
         assert_eq!(merged.clone.mode.as_deref(), Some("editable"));
@@ -287,10 +286,16 @@ mod tests {
         save_to(&path, &cfg).unwrap();
 
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(!text.contains("should-not-be-saved"), "token must not be written to config");
+        assert!(
+            !text.contains("should-not-be-saved"),
+            "token must not be written to config"
+        );
 
         let loaded = load_from(&path);
-        assert_eq!(loaded.server.as_deref(), Some("https://ripclone.example.com"));
+        assert_eq!(
+            loaded.server.as_deref(),
+            Some("https://ripclone.example.com")
+        );
         assert_eq!(loaded.default_provider.as_deref(), Some("my-gitea"));
         assert!(loaded.providers.contains_key("my-gitea"));
         assert!(loaded.token.is_none());

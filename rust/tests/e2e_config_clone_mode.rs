@@ -129,6 +129,9 @@ async fn project_config_drives_clone_mode_and_default_provider() {
         pack_entries.len(),
         2,
         "files-mode clone should only have the skeleton pack + idx, got {:?}",
-        pack_entries.iter().map(|e| e.file_name()).collect::<Vec<_>>()
+        pack_entries
+            .iter()
+            .map(|e| e.file_name())
+            .collect::<Vec<_>>()
     );
 }

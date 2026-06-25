@@ -4423,7 +4423,12 @@ async fn build_full_in_background(
         ref_store
             .save_branch(repo_id, branch, &info)
             .await
-            .with_context(|| format!("persist editable ref for {}@{branch}", repo_id.storage_key()))?;
+            .with_context(|| {
+                format!(
+                    "persist editable ref for {}@{branch}",
+                    repo_id.storage_key()
+                )
+            })?;
     }
     settle_storage(cas, storage, retention, uploads, idx_keep).await;
     info!(
@@ -4496,7 +4501,9 @@ async fn build_full_in_background(
             ref_store
                 .save_branch(repo_id, branch, &info)
                 .await
-                .with_context(|| format!("persist files ref for {}@{branch}", repo_id.storage_key()))?;
+                .with_context(|| {
+                    format!("persist files ref for {}@{branch}", repo_id.storage_key())
+                })?;
         }
     }
     settle_storage(
@@ -4690,14 +4697,15 @@ fn read_server_auth_token() -> Result<String> {
         .ok()
         .filter(|t| !t.is_empty())
     {
-        eprintln!("warning: RIPCLONE_TOKEN_HASH is deprecated for server auth; use RIPCLONE_SERVER_TOKEN_HASH");
+        eprintln!(
+            "warning: RIPCLONE_TOKEN_HASH is deprecated for server auth; use RIPCLONE_SERVER_TOKEN_HASH"
+        );
         return Ok(hash);
     }
-    if let Some(raw) = env::var("RIPCLONE_TOKEN")
-        .ok()
-        .filter(|t| !t.is_empty())
-    {
-        eprintln!("warning: RIPCLONE_TOKEN is deprecated for server auth; use RIPCLONE_SERVER_TOKEN");
+    if let Some(raw) = env::var("RIPCLONE_TOKEN").ok().filter(|t| !t.is_empty()) {
+        eprintln!(
+            "warning: RIPCLONE_TOKEN is deprecated for server auth; use RIPCLONE_SERVER_TOKEN"
+        );
         return Ok(format!("{:x}", Sha256::digest(raw.as_bytes())));
     }
     auth_token_hash(None)

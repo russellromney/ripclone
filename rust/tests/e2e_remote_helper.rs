@@ -76,8 +76,14 @@ async fn remote_helper_clones_through_ripclone_server() {
                 if start.elapsed() > std::time::Duration::from_secs(15) {
                     let _ = child.kill();
                     let out = child.wait_with_output().expect("collect output after kill");
-                    eprintln!("git clone stdout:\n{}", String::from_utf8_lossy(&out.stdout));
-                    eprintln!("git clone stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+                    eprintln!(
+                        "git clone stdout:\n{}",
+                        String::from_utf8_lossy(&out.stdout)
+                    );
+                    eprintln!(
+                        "git clone stderr:\n{}",
+                        String::from_utf8_lossy(&out.stderr)
+                    );
                     panic!("git clone through remote helper timed out");
                 }
                 std::thread::sleep(std::time::Duration::from_millis(100));
@@ -88,8 +94,14 @@ async fn remote_helper_clones_through_ripclone_server() {
     .expect("spawn_blocking");
 
     if !output.status.success() {
-        eprintln!("git clone stdout:\n{}", String::from_utf8_lossy(&output.stdout));
-        eprintln!("git clone stderr:\n{}", String::from_utf8_lossy(&output.stderr));
+        eprintln!(
+            "git clone stdout:\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        eprintln!(
+            "git clone stderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         panic!("git clone through remote helper failed");
     }
 
@@ -97,7 +109,10 @@ async fn remote_helper_clones_through_ripclone_server() {
     assert_eq!(readme, "hello from helper\n");
 
     // `--depth 1` should leave a shallow marker.
-    assert!(target.join(".git/shallow").exists(), "expected shallow clone");
+    assert!(
+        target.join(".git/shallow").exists(),
+        "expected shallow clone"
+    );
 
     // Verify origin remote points back at the ripclone remote helper URL.
     let origin_url = git(&target, &["remote", "get-url", "origin"]);

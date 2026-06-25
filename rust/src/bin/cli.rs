@@ -4,9 +4,9 @@ use ripclone::archive::ArchiveBuilder;
 use ripclone::auth::token_store::{FallbackTokenStore, TokenStore};
 use ripclone::bench::Benchmark;
 use ripclone::client::Client;
+use ripclone::config::ProviderEntry;
 use ripclone::extract::extract_archive;
 use ripclone::mode::{CloneMode, resolve_mode};
-use ripclone::config::ProviderEntry;
 use ripclone::provider::ProviderKind;
 use ripclone::snapshot::extract_snapshot;
 use secrecy::ExposeSecret;
@@ -777,11 +777,7 @@ async fn main() -> Result<()> {
             ProviderAction::Rm { id } => {
                 run_provider_rm(&id).await?;
             }
-            ProviderAction::Test {
-                id,
-                repo,
-                branch,
-            } => {
+            ProviderAction::Test { id, repo, branch } => {
                 let test_client = client.with_provider(&id);
                 let info = test_client.resolve_ref(&repo, &branch).await?;
                 println!(
@@ -790,13 +786,10 @@ async fn main() -> Result<()> {
                 );
             }
         },
-        Commands::Sync {
-            repo,
-            depth,
-            at,
-        } => {
+        Commands::Sync { repo, depth, at } => {
             let (provider, repo_path) = resolve_repo(&repo, &default_provider)?;
-            let upstream_token = resolve_upstream_token(&provider, &repo_path, args.token.as_deref()).await?;
+            let upstream_token =
+                resolve_upstream_token(&provider, &repo_path, args.token.as_deref()).await?;
             let client = client
                 .with_provider(&provider)
                 .with_upstream_token_opt(upstream_token);
@@ -819,11 +812,16 @@ async fn main() -> Result<()> {
             bench,
         } => {
             let (provider, repo_path) = resolve_repo(&repo, &default_provider)?;
-            let upstream_token = resolve_upstream_token(&provider, &repo_path, args.token.as_deref()).await?;
+            let upstream_token =
+                resolve_upstream_token(&provider, &repo_path, args.token.as_deref()).await?;
             let client = client
                 .with_provider(&provider)
                 .with_upstream_token_opt(upstream_token);
-            let target_name = repo_path.rsplit('/').next().unwrap_or(&repo_path).to_string();
+            let target_name = repo_path
+                .rsplit('/')
+                .next()
+                .unwrap_or(&repo_path)
+                .to_string();
             let target = dir_pos
                 .or(dir)
                 .unwrap_or_else(|| PathBuf::from(target_name));
@@ -1194,7 +1192,10 @@ async fn resolve_upstream_token(
     git_credential_token(&host, repo_path).await
 }
 
-fn provider_host(provider_id: &str, registry: &ripclone::provider::ProviderRegistry) -> Option<String> {
+fn provider_host(
+    provider_id: &str,
+    registry: &ripclone::provider::ProviderRegistry,
+) -> Option<String> {
     // Preset providers have well-known hosts.
     let preset = match provider_id {
         "github" => Some("github.com"),
@@ -1216,7 +1217,11 @@ fn provider_host(provider_id: &str, registry: &ripclone::provider::ProviderRegis
 
 /// Ask the local git credential helper for a password/token for an HTTPS URL.
 async fn git_credential_token(host: &str, path: &str) -> Result<Option<String>> {
-    let input = format!("protocol=https\nhost={}\npath={}\n\n", host, path.trim_start_matches('/'));
+    let input = format!(
+        "protocol=https\nhost={}\npath={}\n\n",
+        host,
+        path.trim_start_matches('/')
+    );
     let mut child = tokio::process::Command::new("git")
         .arg("credential")
         .arg("fill")
@@ -1245,7 +1250,9 @@ async fn git_credential_token(host: &str, path: &str) -> Result<Option<String>> 
     }
 
     for line in String::from_utf8_lossy(&output.stdout).lines() {
-        if let Some(password) = line.strip_prefix("password=") && !password.is_empty() {
+        if let Some(password) = line.strip_prefix("password=")
+            && !password.is_empty()
+        {
             return Ok(Some(password.to_string()));
         }
     }
@@ -1352,9 +1359,18 @@ mod tests {
     #[test]
     fn provider_host_uses_preset_defaults() {
         let registry = ripclone::provider::ProviderRegistry::new();
-        assert_eq!(provider_host("github", &registry), Some("github.com".to_string()));
-        assert_eq!(provider_host("gitlab", &registry), Some("gitlab.com".to_string()));
-        assert_eq!(provider_host("bitbucket", &registry), Some("bitbucket.org".to_string()));
+        assert_eq!(
+            provider_host("github", &registry),
+            Some("github.com".to_string())
+        );
+        assert_eq!(
+            provider_host("gitlab", &registry),
+            Some("gitlab.com".to_string())
+        );
+        assert_eq!(
+            provider_host("bitbucket", &registry),
+            Some("bitbucket.org".to_string())
+        );
     }
 
     #[test]
@@ -1363,7 +1379,11 @@ mod tests {
         let fake_git = dir.path().join("git");
         #[cfg(unix)]
         {
-            std::fs::write(&fake_git, "#!/bin/sh\nprintf 'password=ghp-test-token\\n'\n").unwrap();
+            std::fs::write(
+                &fake_git,
+                "#!/bin/sh\nprintf 'password=ghp-test-token\\n'\n",
+            )
+            .unwrap();
             use std::os::unix::fs::PermissionsExt;
             let mut perms = std::fs::metadata(&fake_git).unwrap().permissions();
             perms.set_mode(0o755);

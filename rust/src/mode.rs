@@ -67,7 +67,9 @@ impl FromStr for CloneMode {
             // Deprecated aliases.
             "full" | "hybrid" => Ok(CloneMode::Editable),
             "fast" => Ok(CloneMode::Files),
-            "skeleton" => anyhow::bail!("skeleton mode is no longer exposed; use mount for skeleton-backed access"),
+            "skeleton" => anyhow::bail!(
+                "skeleton mode is no longer exposed; use mount for skeleton-backed access"
+            ),
             other => anyhow::bail!("unknown clone mode: {}", other),
         }
     }

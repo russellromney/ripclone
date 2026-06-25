@@ -8,7 +8,7 @@
 //! The legacy `providers.json` path is still read for backward compatibility,
 //! but the CLI now writes provider changes to `config.toml`.
 
-use crate::auth::token_store::{env_token, TokenStore};
+use crate::auth::token_store::{TokenStore, env_token};
 use crate::provider::{ProviderConfig, ProviderRegistry};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -131,8 +131,7 @@ pub fn load_registry_with_config(
         .ok()
         .filter(|t| !t.is_empty())
     {
-        let file = parse_providers_json(&json)
-            .with_context(|| "parse RIPCLONE_PROVIDERS JSON")?;
+        let file = parse_providers_json(&json).with_context(|| "parse RIPCLONE_PROVIDERS JSON")?;
         merge_with_tokens(&mut registry, file.providers, token_store)?;
     }
 
@@ -159,9 +158,7 @@ pub fn load_registry_with_config(
 
 /// Build a registry from env JSON, legacy file config, the current unified
 /// TOML config, and tokens resolved through the token store.
-pub fn load_registry_with_token_store(
-    token_store: &dyn TokenStore,
-) -> Result<ProviderRegistry> {
+pub fn load_registry_with_token_store(token_store: &dyn TokenStore) -> Result<ProviderRegistry> {
     load_registry_with_config(token_store, &crate::config::load())
 }
 
@@ -243,7 +240,8 @@ mod tests {
             std::env::set_var("RIPCLONE_PROVIDERS_CONFIG", &path);
             std::env::set_var("RIPCLONE_PROVIDER_GITLAB_TOKEN", "from-env");
         }
-        let registry = load_registry_with_config(&token_store, &crate::config::Config::default()).unwrap();
+        let registry =
+            load_registry_with_config(&token_store, &crate::config::Config::default()).unwrap();
         let token = registry.token("gitlab").unwrap().expose_secret();
         assert_eq!(token, "from-env");
         unsafe {

@@ -35,7 +35,7 @@ async fn editable_full_ready_before_files() {
     origin.publish();
     server
         .client()
-        .sync_repo("acme", "decouple", None, None)
+        .sync_repo("acme/decouple", None)
         .await
         .expect("sync");
 
