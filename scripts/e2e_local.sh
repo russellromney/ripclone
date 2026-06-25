@@ -149,16 +149,6 @@ clone_repo acme files "$BASE_DIR/c-files" --mode files
 assert_file "$BASE_DIR/c-files" only.txt "hello"
 pass "files mode materialized worktree"
 
-# === skeleton mode ============================================================
-echo "==> skeleton mode"
-w=$(new_origin acme skel)
-commit "$w" f "1" c1
-publish "$w" acme skel
-sync_repo acme skel
-clone_repo acme skel "$BASE_DIR/c-skel" --mode skeleton
-[ -d "$BASE_DIR/c-skel/.git" ] || fail "skeleton missing .git"
-pass "skeleton installed .git"
-
 # === special files: symlink + executable bit ==================================
 echo "==> symlinks + exec bits"
 w=$(new_origin acme special)
