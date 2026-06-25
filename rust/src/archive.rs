@@ -1060,9 +1060,9 @@ fn collect_blobs_raw_gix(
     Ok(())
 }
 
-/// Hash a list of `(path, blob_oid, mode)` tuples in parallel using the
-/// persistent rayon pool and per-chunk gix handles. Results keep the input
-/// order so the manifest order stays deterministic.
+/// Hash a list of `(path, blob_oid, mode)` tuples in parallel using scoped OS
+/// threads and per-chunk gix handles. Results keep the input order so the
+/// manifest order stays deterministic.
 fn hash_blobs_parallel(
     mirror: &std::path::Path,
     blobs: Vec<(Vec<u8>, gix::hash::ObjectId, u32)>,

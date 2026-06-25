@@ -821,8 +821,8 @@ fn shell_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('\'', "'\\''")
 }
 
-/// Read and encode objects as pack base entries using the persistent rayon pool
-/// and per-chunk gix handles. The returned vector is sorted by object id so the
+/// Read and encode objects as pack base entries using scoped OS threads and
+/// per-chunk gix handles. The returned vector is sorted by object id so the
 /// final pack is deterministic.
 fn encode_objects_parallel(
     repo: &gix::Repository,
@@ -1319,6 +1319,7 @@ pub fn materialize_file<P: AsRef<Path>, Q: AsRef<Path>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rayon::scope;
 
     #[test]
     #[ignore]
@@ -2139,5 +2140,40 @@ mod tests {
         let range = list_object_shas_in_range(repo, Some(shas[1].as_str()), &shas[2]).unwrap();
         assert!(!range.is_empty());
         assert!(range.contains(&shas[2]));
+    }
+
+    /// Regression: object lookups for ≥PARALLEL_LOOKUP_THRESHOLD objects must not
+    /// deadlock when called from a rayon context (cold builds hit this path).
+    #[test]
+    fn gix_object_sizes_parallel_path_no_deadlock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = crate::test_fixture::init_bare(tmp.path());
+        let files: Vec<(String, Vec<u8>)> = (0..300)
+            .map(|i| (format!("f{i:03}.txt"), vec![(i % 256) as u8; 100]))
+            .collect();
+        let refs: Vec<(&str, &[u8])> = files
+            .iter()
+            .map(|(p, b)| (p.as_str(), b.as_slice()))
+            .collect();
+        crate::test_fixture::commit(&repo, &refs);
+
+        let objects =
+            crate::gix_util::list_object_shas_with_depth(tmp.path(), "HEAD", None).unwrap();
+        assert!(
+            objects.len() > crate::gix_util::PARALLEL_LOOKUP_THRESHOLD,
+            "test must exercise the parallel path ({} objects)",
+            objects.len()
+        );
+
+        // Call from inside a rayon context, exactly like cold pack builds do.
+        let sizes: HashMap<String, u64> = scope(|_| object_sizes(tmp.path(), &objects)).unwrap();
+        assert_eq!(sizes.len(), objects.len());
+
+        // Sanity: all blobs are 100 bytes, trees/commits are small.
+        let total: u64 = sizes.values().sum();
+        assert!(
+            total >= 30_000,
+            "expected at least 300 * 100 bytes of blob data"
+        );
     }
 }
