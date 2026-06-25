@@ -1038,6 +1038,8 @@ async fn get_ref(
                 shallow_clonepack: crate::ClonepackArtifacts::default(),
                 history_levels: Vec::new(),
                 head_buckets: Vec::new(),
+                head_base_commit: String::new(),
+                head_base_packs: Vec::new(),
                 archive_frames: Vec::new(),
                 build_status: None,
                 synced_at: None,
@@ -3116,9 +3118,11 @@ async fn do_sync(
             commit: commit.clone(),
         },
         history_levels: new_levels,
-        // Bucketed head-pack reuse is two-phase only; single-phase leaves this
-        // empty (a later two-phase sync starts its buckets fresh).
+        // Incremental head-pack reuse is two-phase only; single-phase leaves these
+        // empty (a later two-phase sync starts its base fresh).
         head_buckets: Vec::new(),
+        head_base_commit: String::new(),
+        head_base_packs: Vec::new(),
         // Single-phase builds the full archive non-incrementally (build_into_cas);
         // it does not populate the frame index (a later two-phase sync rebuilds).
         archive_frames: Vec::new(),
@@ -3276,6 +3280,22 @@ fn pack_artifacts_of(packs: &[(String, u64, String, u64)]) -> Vec<crate::PackArt
 /// clonepack and returns; phase 2 (background) builds full history and upgrades
 /// the full clonepack. depth=0 keeps serving the previous commit until phase 2
 /// finishes (option A — never fails, briefly one commit stale).
+/// Result of the phase-1 HEAD-closure build: a small delta pack against the
+/// immutable base, or a fresh full base on a cold sync / rebase. See
+/// `build_head_delta_pack` / `build_head_packs`.
+struct HeadBuild {
+    /// Every current HEAD pack (base + delta), manifest order — for the clonepack.
+    all_packs: Vec<(String, u64, String, u64)>,
+    /// Only the packs built this sync (to upload). Reused base packs are durable.
+    new_built: Vec<(String, u64, String, u64)>,
+    /// The commit whose closure `base_packs` covers (carried, or = commit on cold).
+    base_commit: String,
+    /// The base packs (closure of `base_commit`), carried unchanged across deltas.
+    base_packs: Vec<crate::SizedPack>,
+    /// True when every pack was built this sync (cold/rebase) → head MIDX buildable.
+    all_local: bool,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn build_and_publish_two_phase(
     cas: &Cas,
@@ -3291,8 +3311,6 @@ async fn build_and_publish_two_phase(
     retention: &Arc<Retention>,
     t_total: Instant,
 ) -> Result<RefInfo> {
-    // (Head packs are now built in oid-prefix buckets, not size-greedy batches,
-    // so RIPCLONE_PACK_BYTES no longer applies to the two-phase head closure.)
     let history_target = env_bytes("RIPCLONE_HISTORY_PACK_BYTES", 512 * 1024 * 1024);
     let upload_conc = env_bytes("RIPCLONE_UPLOAD_CONCURRENCY", 16) as usize;
 
@@ -3313,36 +3331,66 @@ async fn build_and_publish_two_phase(
         info!("p1 sub: shallow skeleton {:?}", s.elapsed());
         r
     });
-    // Head-closure packs, bucketed for incremental reuse: rebuild only the
-    // buckets whose object set changed since the prior sync, reuse the rest by
-    // hash. `prev_head_map` maps each prior bucket's oidset hash to its pack.
-    let num_head_buckets = env_bytes("RIPCLONE_HEAD_BUCKETS", 64) as usize;
-    let prev_head_map: std::collections::HashMap<String, crate::SizedPack> = prev
+    // Head-closure packs, incremental by delta against an immutable base: keep the
+    // base packs (closure of `head_base_commit`) and pack only the depth-1 objects
+    // new since that base (`closure(HEAD) − closure(base)`) into a delta pack. The
+    // base and delta are disjoint by construction, so no object is ever in two HEAD
+    // packs (which would double-materialize a worktree file). A cold sync (no base)
+    // packs the full closure as the base. The cumulative delta grows as HEAD moves
+    // from the base; phase 2 rebases (rebuilds the base at HEAD) once it exceeds
+    // RIPCLONE_HEAD_REBASE_BYTES, off the depth=1 critical path.
+    let head_target = env_bytes("RIPCLONE_PACK_BYTES", 12 * 1024 * 1024);
+    let prev_base_commit: Option<String> = prev
         .as_ref()
-        .map(|p| {
-            p.head_buckets
-                .iter()
-                .map(|b| (b.oidset_hash.clone(), b.pack.clone()))
-                .collect()
-        })
+        .map(|p| p.head_base_commit.clone())
+        .filter(|c| !c.is_empty());
+    let prev_base_packs: Vec<crate::SizedPack> = prev
+        .as_ref()
+        .map(|p| p.head_base_packs.clone())
         .unwrap_or_default();
     let (md2, c2, cm2) = (mirror_dir.to_path_buf(), cas.clone(), commit.to_string());
-    let head_handle = tokio::task::spawn_blocking(move || {
+    let head_handle = tokio::task::spawn_blocking(move || -> Result<HeadBuild> {
         let s = Instant::now();
-        let r = PackBuilder::new(&md2, &c2).build_head_packs_bucketed(
-            &cm2,
-            num_head_buckets,
-            &prev_head_map,
-        );
-        if let Ok(b) = &r {
-            info!(
-                "p1 sub: head packs ({} buckets, {} rebuilt) {:?}",
-                b.buckets.len(),
-                b.new_built.len(),
-                s.elapsed()
-            );
+        let b = PackBuilder::new(&md2, &c2);
+        match (prev_base_packs.is_empty(), prev_base_commit) {
+            // Delta path: a base exists; pack only what is new since the base.
+            (false, Some(base_commit)) => {
+                let delta = b.build_head_delta_pack(&cm2, &base_commit, head_target)?;
+                let mut all_packs: Vec<(String, u64, String, u64)> =
+                    prev_base_packs.iter().map(sized_to_tuple).collect();
+                all_packs.extend(delta.iter().cloned());
+                info!(
+                    "p1 sub: head packs (delta vs base: {} new pack(s), {} total) {:?}",
+                    delta.len(),
+                    all_packs.len(),
+                    s.elapsed()
+                );
+                Ok(HeadBuild {
+                    all_packs,
+                    new_built: delta,
+                    base_commit,
+                    base_packs: prev_base_packs,
+                    all_local: false,
+                })
+            }
+            // Cold path: no base yet → pack the full closure as the base.
+            _ => {
+                let base = b.build_head_packs(&cm2, head_target)?;
+                let base_packs = base.iter().map(tuple_to_sized).collect();
+                info!(
+                    "p1 sub: head packs (full base, {} packs) {:?}",
+                    base.len(),
+                    s.elapsed()
+                );
+                Ok(HeadBuild {
+                    all_packs: base.clone(),
+                    new_built: base,
+                    base_commit: cm2,
+                    base_packs,
+                    all_local: true,
+                })
+            }
         }
-        r
     });
     // Phase 1 builds only the cheap files table (no zstd frames): editable
     // depth=1 materializes the worktree from the HEAD-closure packs, so it does
@@ -3404,7 +3452,7 @@ async fn build_and_publish_two_phase(
         .await
         .context("shallow skeleton")??;
     let head_built = head_handle.await.context("head packs")??;
-    let head_packs = head_built.packs.clone();
+    let head_packs = head_built.all_packs.clone();
     let metadata_base = files_table_handle.await.context("files table")??;
     info!(
         "two-phase p1: head+shallow-skeleton+files-table {:?}",
@@ -3438,10 +3486,10 @@ async fn build_and_publish_two_phase(
         head_packs.iter().map(|p| (p, false)).collect();
     let (head_entries, head_idx_bundle_ref, head_idx_bundle_hash) =
         assemble_variant(cas, storage, &head_tagged)?;
-    // Ship the head MIDX only when every bucket was built this sync (so all pack
-    // bytes are still local). On an incremental re-sync some buckets are reused
-    // and already evicted, so omit it — the client builds its own MIDX.
-    let all_built = head_built.new_built.len() == head_built.packs.len();
+    // Ship the head MIDX only on a cold full base (all pack bytes still local).
+    // On a delta re-sync the base packs are already evicted, so omit it — the
+    // client builds its own MIDX from the per-pack idxs.
+    let all_built = head_built.all_local;
     let (head_midx_ref, head_midx_hash) = if all_built {
         assemble_midx(cas, &head_packs)?
     } else {
@@ -3519,7 +3567,9 @@ async fn build_and_publish_two_phase(
             commit: commit.to_string(),
         },
         history_levels: carried_levels,
-        head_buckets: head_built.buckets.clone(),
+        head_buckets: Vec::new(),
+        head_base_commit: head_built.base_commit.clone(),
+        head_base_packs: head_built.base_packs.clone(),
         archive_frames: carried_archive_frames,
         build_status: Some("full history building".to_string()),
         synced_at: SystemTime::now()
@@ -3574,6 +3624,7 @@ async fn build_and_publish_two_phase(
     let sk_pack = shallow_skeleton_pack.clone();
     let sk_idx = shallow_skeleton_idx.clone();
     let sk_prebuilt = shallow_prebuilt_index.clone();
+    let head_base_pack_count_for_p2 = head_built.base_packs.len();
     tokio::spawn(async move {
         let started = Instant::now();
         let res = build_full_in_background(
@@ -3598,6 +3649,7 @@ async fn build_and_publish_two_phase(
             upload_conc,
             prev_levels_for_p2,
             prev_archive_frames_for_p2,
+            head_base_pack_count_for_p2,
         )
         .await;
         match res {
@@ -3641,6 +3693,11 @@ async fn build_full_in_background(
     upload_conc: usize,
     prev_levels: Vec<crate::HistoryLevel>,
     prev_archive_frames: Vec<crate::ArchiveFrame>,
+    // How many of `head_packs` (above) are base packs; the rest are the cumulative
+    // delta. When the delta's byte size exceeds RIPCLONE_HEAD_REBASE_BYTES this
+    // phase rebases — rebuilds a fresh base at the current commit (off the depth=1
+    // critical path) — so the delta never grows unbounded.
+    head_base_pack_count: usize,
 ) -> Result<()> {
     // Incremental history: build only the tail past the last sealed level; prior
     // levels are reused by hash from object storage (Tigris) — never rebuilt.
@@ -3698,6 +3755,44 @@ async fn build_full_in_background(
         archive_frames.len(),
         new_archive_chunks.len()
     );
+
+    // HEAD-pack rebase: once the cumulative delta (the head packs past the base)
+    // grows large, rebuild a fresh base at the current commit here in the
+    // background — depth=1 is already published in phase 1, so this O(worktree)
+    // build is off the critical path. Rebasing keeps the delta small and drops the
+    // stale objects the base accumulates as HEAD moves away from it. The fresh base
+    // is persisted only if the ref hasn't advanced meanwhile (guarded by commit
+    // equality at the save below), so the head reuse state stays consistent with
+    // `RefInfo.commit`. Below the threshold, `head_packs` is unchanged (base +
+    // delta) and nothing new is built.
+    let rebase_bytes = env_bytes("RIPCLONE_HEAD_REBASE_BYTES", 128 * 1024 * 1024);
+    let delta_bytes: u64 = head_packs
+        .iter()
+        .skip(head_base_pack_count)
+        .map(|(_, pack_len, _, _)| *pack_len)
+        .sum();
+    let (head_packs, new_head_packs, rebased_base): (
+        Vec<(String, u64, String, u64)>,
+        Vec<(String, u64, String, u64)>,
+        Option<Vec<crate::SizedPack>>,
+    ) = if delta_bytes >= rebase_bytes {
+        let head_target = env_bytes("RIPCLONE_PACK_BYTES", 12 * 1024 * 1024);
+        let (mdc, cc, cmc) = (mirror_dir.to_path_buf(), cas.clone(), commit.to_string());
+        let base = tokio::task::spawn_blocking(move || {
+            PackBuilder::new(&mdc, &cc).build_head_packs(&cmc, head_target)
+        })
+        .await
+        .context("rebase head base")??;
+        info!(
+            "two-phase p2: rebased HEAD base ({} MiB delta -> fresh base of {} packs)",
+            delta_bytes / (1024 * 1024),
+            base.len()
+        );
+        let sized: Vec<crate::SizedPack> = base.iter().map(tuple_to_sized).collect();
+        (base.clone(), base, Some(sized))
+    } else {
+        (head_packs, Vec::new(), None)
+    };
 
     // Resolve manifest history (all levels flattened), the packs to upload (only
     // freshly built this sync), and the levels to persist for the next sync.
@@ -3770,10 +3865,16 @@ async fn build_full_in_background(
     // Only freshly built archive chunks are uploaded; reused frames' chunks are
     // already durable in storage from a prior sync.
     p2.extend(new_archive_chunks.iter().cloned());
+    // Freshly built compaction base packs (empty on a non-compacting sync).
+    for (p, _, i, _) in &new_head_packs {
+        p2.push(p.clone());
+        p2.push(i.clone());
+    }
     p2.retain(|h| !h.is_empty());
     let hist_idx_keep: std::collections::HashSet<String> = new_history_tuples
         .iter()
         .map(|(_, _, ih, _)| ih.clone())
+        .chain(new_head_packs.iter().map(|(_, _, ih, _)| ih.clone()))
         .collect();
     upload_artifacts(cas, storage, p2.clone(), upload_conc).await?;
 
@@ -3805,6 +3906,19 @@ async fn build_full_in_background(
     };
     info.history_levels = new_levels;
     info.archive_frames = archive_frames;
+    // HEAD base state (the base commit + its packs) is owned by phase 1, which
+    // always writes it consistently with the commit it built. Only adopt a rebase
+    // result here if the ref still points at the commit we built; if a newer sync
+    // advanced it, leave that sync's base intact (its own phase 2 will rebase when
+    // its delta crosses the threshold). A non-rebase sync leaves the base as phase
+    // 1 wrote it.
+    if let Some(sized) = rebased_base
+        && info.commit == commit
+    {
+        info.head_buckets = Vec::new();
+        info.head_base_commit = commit.to_string();
+        info.head_base_packs = sized;
+    }
     info.build_status = None;
     ref_store
         .save_branch(owner, repo, branch, &info)
@@ -3918,6 +4032,8 @@ async fn update_build_status(
             shallow_clonepack: crate::ClonepackArtifacts::default(),
             history_levels: Vec::new(),
             head_buckets: Vec::new(),
+            head_base_commit: String::new(),
+            head_base_packs: Vec::new(),
             archive_frames: Vec::new(),
             build_status: None,
             synced_at: None,
@@ -4195,6 +4311,8 @@ mod tests {
             shallow_clonepack: crate::ClonepackArtifacts::default(),
             history_levels: Vec::new(),
             head_buckets: Vec::new(),
+            head_base_commit: String::new(),
+            head_base_packs: Vec::new(),
             archive_frames: Vec::new(),
             build_status: None,
             synced_at: None,
@@ -4549,6 +4667,8 @@ mod tests {
             shallow_clonepack: crate::ClonepackArtifacts::default(),
             history_levels: Vec::new(),
             head_buckets: Vec::new(),
+            head_base_commit: String::new(),
+            head_base_packs: Vec::new(),
             archive_frames: Vec::new(),
             build_status: None,
             synced_at: Some(1_718_812_800),
@@ -4643,6 +4763,8 @@ mod tests {
             shallow_clonepack: crate::ClonepackArtifacts::default(),
             history_levels: Vec::new(),
             head_buckets: Vec::new(),
+            head_base_commit: String::new(),
+            head_base_packs: Vec::new(),
             archive_frames: Vec::new(),
             build_status: None,
             synced_at: None,
