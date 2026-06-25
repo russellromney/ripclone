@@ -71,12 +71,16 @@ fn provider_add_list_rm_lifecycle() {
         "provider list should show token configured: {list_out}"
     );
 
-    // The config file should not contain the plaintext token.
-    let config = home.path().join(".config").join("ripclone").join("providers.json");
-    let config_text = std::fs::read_to_string(&config).expect("read providers.json");
+    // The config file should declare the provider but never contain the token.
+    let config = home.path().join(".config").join("ripclone").join("config.toml");
+    let config_text = std::fs::read_to_string(&config).expect("read config.toml");
+    assert!(
+        config_text.contains("gitlab"),
+        "config.toml should declare gitlab: {config_text}"
+    );
     assert!(
         !config_text.contains("glpat-test"),
-        "providers.json must not contain the token: {config_text}"
+        "config.toml must not contain the token: {config_text}"
     );
 
     let rm = run(&["provider", "rm", "gitlab"], home.path());

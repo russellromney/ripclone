@@ -1,13 +1,13 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use ripclone::archive::ArchiveBuilder;
-use ripclone::auth::token_store::FallbackTokenStore;
+use ripclone::auth::token_store::{FallbackTokenStore, TokenStore};
 use ripclone::bench::Benchmark;
 use ripclone::client::Client;
 use ripclone::extract::extract_archive;
 use ripclone::mode::{CloneMode, resolve_mode};
-use ripclone::provider::{ProviderConfig, ProviderKind};
-use ripclone::provider_config::{self, ProvidersFile};
+use ripclone::config::ProviderEntry;
+use ripclone::provider::ProviderKind;
 use ripclone::snapshot::extract_snapshot;
 use secrecy::ExposeSecret;
 use sha2::{Digest, Sha256};
@@ -28,10 +28,10 @@ struct Args {
     server: Option<String>,
 
     /// Upstream git provider instance id (e.g. "github", "gitlab", "my-gitea").
-    /// Defaults to the built-in "github" instance. Can be overridden by a
-    /// provider prefix in the repo argument (`gitlab:owner/repo`).
-    #[arg(short, long, env = "RIPCLONE_PROVIDER", default_value = "github")]
-    provider: String,
+    /// Defaults to the built-in "github" instance unless overridden by config
+    /// or a provider prefix in the repo argument (`gitlab:owner/repo`).
+    #[arg(short, long, env = "RIPCLONE_PROVIDER")]
+    provider: Option<String>,
 
     /// Explicit upstream credential token sent as the X-Upstream-Token header.
     /// Overrides git credentials and any configured provider token.
@@ -83,9 +83,9 @@ enum Commands {
         #[arg(long)]
         mode: Option<CloneMode>,
         /// History depth: 1 = HEAD only (default), N = last N commits, 0 = full
-        /// history.
-        #[arg(long, default_value = "1")]
-        depth: usize,
+        /// history. Defaults to the value in `ripclone.toml` or 1.
+        #[arg(long)]
+        depth: Option<usize>,
         /// Clone the artifacts built for this git rev (e.g. "HEAD~5") instead of
         /// the branch tip. Pairs with `sync --at <rev>`.
         #[arg(long)]
@@ -542,19 +542,20 @@ async fn run_login(server: &str) -> Result<()> {
         }
     };
 
-    let mut cfg = ripclone::config::load();
-    cfg.token = Some(token);
+    let mut cfg = ripclone::config::load_global();
     cfg.server = Some(server.to_string());
     ripclone::config::save(&cfg)?;
-    let where_ = ripclone::config::config_path()
-        .map(|p| p.display().to_string())
-        .unwrap_or_default();
-    println!("\n  ✓ Logged in. Token saved to {where_}");
+    token_store()?.set("server", &token)?;
+    println!("\n  ✓ Logged in. Server token saved to secure token store.");
     Ok(())
 }
 
 /// Best-effort: open the verification URL in the user's browser. Never fails.
+/// Skipped when `RIPCLONE_NO_BROWSER` is set so tests don't launch browsers.
 fn open_browser(url: &str) {
+    if std::env::var_os("RIPCLONE_NO_BROWSER").is_some() {
+        return;
+    }
     #[cfg(target_os = "macos")]
     let prog: Option<&str> = Some("open");
     #[cfg(target_os = "linux")]
@@ -564,10 +565,6 @@ fn open_browser(url: &str) {
     if let Some(cmd) = prog {
         let _ = std::process::Command::new(cmd).arg(url).spawn();
     }
-}
-
-fn providers_config_path() -> Result<PathBuf> {
-    provider_config::providers_path().context("cannot determine ripclone config directory")
 }
 
 fn token_store() -> Result<FallbackTokenStore> {
@@ -617,44 +614,44 @@ async fn run_provider_add(
         }
     };
 
-    let cfg = ProviderConfig {
-        id: id.to_string(),
-        kind: Some(kind_str.to_string()),
+    let entry = ProviderEntry {
+        kind: kind_str.to_string(),
         host,
-        token: None,
         auth_template,
     };
 
-    let path = providers_config_path()?;
+    let mut cfg = ripclone::config::load_global();
+    cfg.providers.insert(id.to_string(), entry);
+    ripclone::config::save(&cfg)?;
     let store = token_store()?;
-    provider_config::add_provider(&path, &store, cfg, token.as_deref())?;
+    if let Some(token) = token.as_deref() {
+        store.set(id, token)?;
+    }
     println!("added provider '{}'", id);
     if token.is_some() {
-        println!("  token stored in keyring or {}", path.display());
+        println!("  token stored in secure token store");
     }
     Ok(())
 }
 
 fn run_provider_list() -> Result<()> {
-    let path = providers_config_path()?;
-    let file: ProvidersFile = provider_config::load_providers_file(&path)?;
-    let registry = ripclone::provider_config::load_registry_with_token_store(&token_store()?)?;
+    let cfg = ripclone::config::load_global();
+    let registry = ripclone::provider_config::load_registry_with_config(&token_store()?, &cfg)?;
 
-    if file.providers.is_empty() {
+    if cfg.providers.is_empty() {
         println!("No providers configured.");
         println!("Use 'ripclone provider add <id> --kind <kind> --host <host>' to add one.");
         return Ok(());
     }
 
     println!("{:<16} {:<10} {:<24} TOKEN", "ID", "KIND", "HOST");
-    for cfg in &file.providers {
-        let kind = cfg.kind.as_deref().unwrap_or("generic");
-        let host = cfg.host.as_deref().unwrap_or("-");
-        let has_token = registry.token(&cfg.id).is_some();
+    for (id, entry) in &cfg.providers {
+        let host = entry.host.as_deref().unwrap_or("-");
+        let has_token = registry.token(id).is_some();
         println!(
             "{:<16} {:<10} {:<24} {}",
-            cfg.id,
-            kind,
+            id,
+            entry.kind,
             host,
             if has_token { "configured" } else { "missing" }
         );
@@ -666,9 +663,12 @@ async fn run_provider_rm(id: &str) -> Result<()> {
     if id.is_empty() {
         anyhow::bail!("provider id cannot be empty");
     }
-    let path = providers_config_path()?;
-    let store = token_store()?;
-    provider_config::remove_provider(&path, &store, id)?;
+    let mut cfg = ripclone::config::load_global();
+    if cfg.providers.remove(id).is_none() {
+        anyhow::bail!("provider '{}' not found", id);
+    }
+    ripclone::config::save(&cfg)?;
+    token_store()?.delete(id)?;
     println!("removed provider '{}'", id);
     Ok(())
 }
@@ -690,13 +690,18 @@ async fn main() -> Result<()> {
         .clone()
         .or_else(|| config.server.clone())
         .unwrap_or_else(|| "https://ripclone.com".to_string());
+    let default_provider = args
+        .provider
+        .clone()
+        .or_else(|| config.default_provider.clone())
+        .unwrap_or_else(|| "github".to_string());
 
     // login/logout/version don't need an authenticated client.
     match &args.command {
         Commands::Login => return run_login(&server).await,
         Commands::Logout => {
-            ripclone::config::clear_token()?;
-            println!("Logged out — token removed.");
+            token_store()?.delete("server")?;
+            println!("Logged out — server token removed.");
             return Ok(());
         }
         Commands::Version => return run_version(&server).await,
@@ -737,12 +742,19 @@ async fn main() -> Result<()> {
                 .as_deref()
                 .filter(|t| !t.is_empty())
                 .map(|t| format!("{:x}", Sha256::digest(t.as_bytes())))
+        })
+        .or_else(|| {
+            token_store()
+                .ok()
+                .and_then(|store| store.get("server").ok().flatten())
+                .filter(|t| !t.is_empty())
+                .map(|t| format!("{:x}", Sha256::digest(t.as_bytes())))
         });
     let client = match server_token_hash {
         Some(token) => Client::new_with_token(server.clone(), Some(token)),
         None => Client::new(server.clone()),
     }
-    .with_provider(&args.provider);
+    .with_provider(&default_provider);
 
     match args.command {
         // Handled before the client is built.
@@ -783,11 +795,12 @@ async fn main() -> Result<()> {
             depth,
             at,
         } => {
-            let (provider, repo_path) = resolve_repo(&repo, &args.provider)?;
+            let (provider, repo_path) = resolve_repo(&repo, &default_provider)?;
             let upstream_token = resolve_upstream_token(&provider, &repo_path, args.token.as_deref()).await?;
             let client = client
                 .with_provider(&provider)
                 .with_upstream_token_opt(upstream_token);
+            let depth = depth.or(config.clone.depth);
             let info = client
                 .sync_repo_at(&repo_path, at.as_deref(), depth)
                 .await?;
@@ -805,7 +818,7 @@ async fn main() -> Result<()> {
             temp,
             bench,
         } => {
-            let (provider, repo_path) = resolve_repo(&repo, &args.provider)?;
+            let (provider, repo_path) = resolve_repo(&repo, &default_provider)?;
             let upstream_token = resolve_upstream_token(&provider, &repo_path, args.token.as_deref()).await?;
             let client = client
                 .with_provider(&provider)
@@ -814,7 +827,8 @@ async fn main() -> Result<()> {
             let target = dir_pos
                 .or(dir)
                 .unwrap_or_else(|| PathBuf::from(target_name));
-            let mode = resolve_mode(mode);
+            let depth = depth.or(config.clone.depth).unwrap_or(1);
+            let mode = resolve_mode(mode, config.clone.mode.as_deref());
             // Bridge the --temp flag to the env var the overlay check reads. Set
             // here, before any clone work reads it.
             if temp {
@@ -855,7 +869,7 @@ async fn main() -> Result<()> {
         Commands::Cat {
             repo, path, branch, ..
         } => {
-            let (provider, repo_path) = resolve_repo(&repo, &args.provider)?;
+            let (provider, repo_path) = resolve_repo(&repo, &default_provider)?;
             let client = client.with_provider(&provider);
             let content = client.cat_file(&repo_path, &branch, &path).await?;
             std::io::stdout().write_all(&content)?;
@@ -867,7 +881,7 @@ async fn main() -> Result<()> {
                 hot_files,
                 output,
             } => {
-                let (provider, repo_path) = resolve_repo(&repo, &args.provider)?;
+                let (provider, repo_path) = resolve_repo(&repo, &default_provider)?;
                 let client = client.with_provider(&provider);
                 let info = client
                     .create_snapshot(&repo_path, &branch, hot_files)
@@ -915,7 +929,7 @@ async fn main() -> Result<()> {
             branch,
             count,
         } => {
-            let (provider, repo_path) = resolve_repo(&repo, &args.provider)?;
+            let (provider, repo_path) = resolve_repo(&repo, &default_provider)?;
             let client = client.with_provider(&provider);
             let files = client.hot_files(&repo_path, &branch, count).await?;
             println!("prefetching {} files into {}", files.len(), dir.display());
@@ -1005,7 +1019,7 @@ async fn main() -> Result<()> {
             repo_root,
             dictionary,
         } => {
-            let (provider, repo_path) = resolve_repo(&repo, &args.provider)?;
+            let (provider, repo_path) = resolve_repo(&repo, &default_provider)?;
             let client = client.with_provider(&provider);
             let (owner, repo_name) = repo_path
                 .split_once('/')
@@ -1082,9 +1096,9 @@ async fn main() -> Result<()> {
         } => {
             let main_repo = std::env::current_dir()?.join(dir);
             let repo_path = match repo {
-                Some(r) => resolve_repo(&r, &args.provider)?.1,
+                Some(r) => resolve_repo(&r, &default_provider)?.1,
                 None => {
-                    if args.provider == "github" {
+                    if default_provider == "github" {
                         let (o, r) = owner_repo_from_origin(&main_repo)?;
                         format!("{o}/{r}")
                     } else {
@@ -1106,7 +1120,7 @@ async fn main() -> Result<()> {
             sample_bytes,
             repo_root,
         } => {
-            let (provider, repo_path) = resolve_repo(&repo, &args.provider)?;
+            let (provider, repo_path) = resolve_repo(&repo, &default_provider)?;
             let client = client.with_provider(&provider);
             let (owner, repo_name) = repo_path
                 .split_once('/')

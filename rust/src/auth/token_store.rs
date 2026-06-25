@@ -141,9 +141,13 @@ impl TokenStore for FileTokenStore {
 
 /// Token store that reads from env, then the keyring, then a file; writes to
 /// the keyring if available, otherwise the file.
+///
+/// Set `RIPCLONE_TOKEN_STORE=file` to force the file fallback and skip the
+/// OS keyring. This makes tests deterministic across environments.
 pub struct FallbackTokenStore {
     keyring: KeyringTokenStore,
     file: FileTokenStore,
+    force_file: bool,
 }
 
 impl FallbackTokenStore {
@@ -154,6 +158,7 @@ impl FallbackTokenStore {
         Ok(Self {
             keyring: KeyringTokenStore::new(),
             file,
+            force_file: Self::force_file_from_env(),
         })
     }
 
@@ -161,7 +166,15 @@ impl FallbackTokenStore {
         Self {
             keyring: KeyringTokenStore::new(),
             file: FileTokenStore::new(path),
+            force_file: Self::force_file_from_env(),
         }
+    }
+
+    fn force_file_from_env() -> bool {
+        std::env::var("RIPCLONE_TOKEN_STORE")
+            .ok()
+            .map(|s| s.eq_ignore_ascii_case("file"))
+            .unwrap_or(false)
     }
 }
 
@@ -170,36 +183,42 @@ impl TokenStore for FallbackTokenStore {
         if let Some(t) = env_token(id) {
             return Ok(Some(t));
         }
-        match self.keyring.get(id) {
-            Ok(Some(t)) => return Ok(Some(t)),
-            Ok(None) => {}
-            Err(e) => {
-                tracing::debug!("keyring read failed for {}: {}", id, e);
+        if !self.force_file {
+            match self.keyring.get(id) {
+                Ok(Some(t)) => return Ok(Some(t)),
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::debug!("keyring read failed for {}: {}", id, e);
+                }
             }
         }
         self.file.get(id)
     }
 
     fn set(&self, id: &str, token: &str) -> Result<()> {
-        match self.keyring.set(id, token) {
-            Ok(()) => {
-                // If a fallback file token exists, clean it up.
-                let _ = self.file.delete(id);
-                return Ok(());
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "keyring write failed for {}, falling back to file: {}",
-                    id,
-                    e
-                );
+        if !self.force_file {
+            match self.keyring.set(id, token) {
+                Ok(()) => {
+                    // If a fallback file token exists, clean it up.
+                    let _ = self.file.delete(id);
+                    return Ok(());
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "keyring write failed for {}, falling back to file: {}",
+                        id,
+                        e
+                    );
+                }
             }
         }
         self.file.set(id, token)
     }
 
     fn delete(&self, id: &str) -> Result<()> {
-        let _ = self.keyring.delete(id);
+        if !self.force_file {
+            let _ = self.keyring.delete(id);
+        }
         self.file.delete(id)
     }
 }

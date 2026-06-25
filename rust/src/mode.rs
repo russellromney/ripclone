@@ -73,14 +73,15 @@ impl FromStr for CloneMode {
     }
 }
 
-/// Resolve a mode from the CLI argument or the `RIPCLONE_MODE` environment
-/// variable, falling back to `Editable`.
-pub fn resolve_mode(cli: Option<CloneMode>) -> CloneMode {
+/// Resolve a mode from the CLI argument, the `RIPCLONE_MODE` environment
+/// variable, or a config file value, falling back to `Editable`.
+pub fn resolve_mode(cli: Option<CloneMode>, config: Option<&str>) -> CloneMode {
     cli.or_else(|| {
         std::env::var("RIPCLONE_MODE")
             .ok()
             .and_then(|s| s.parse().ok())
     })
+    .or_else(|| config.and_then(|s| s.parse().ok()))
     .unwrap_or_default()
 }
 

@@ -1,8 +1,12 @@
-//! On-disk provider configuration and token resolution.
+//! Provider configuration and token resolution.
 //!
-//! Providers are declared in `~/.config/ripclone/providers.json`. Tokens are
-//! stored separately via [`crate::auth::token_store::TokenStore`] so the config
-//! file never needs to contain plaintext secrets.
+//! Custom/self-hosted providers are declared in the unified TOML config
+//! (`~/.config/ripclone/config.toml` and optional project `ripclone.toml`).
+//! Tokens are stored separately via [`crate::auth::token_store::TokenStore`] so
+//! the config file never needs to contain plaintext secrets.
+//!
+//! The legacy `providers.json` path is still read for backward compatibility,
+//! but the CLI now writes provider changes to `config.toml`.
 
 use crate::auth::token_store::{env_token, TokenStore};
 use crate::provider::{ProviderConfig, ProviderRegistry};
@@ -115,10 +119,11 @@ pub fn resolve_provider_token(
     token_store.get(&cfg.id)
 }
 
-/// Build a registry from env JSON, file config, and tokens resolved through the
-/// token store.
-pub fn load_registry_with_token_store(
+/// Build a registry from env JSON, legacy file config, the provided unified
+/// config, and tokens resolved through the token store.
+pub fn load_registry_with_config(
     token_store: &dyn TokenStore,
+    config: &crate::config::Config,
 ) -> Result<ProviderRegistry> {
     let mut registry = ProviderRegistry::new();
 
@@ -146,7 +151,18 @@ pub fn load_registry_with_token_store(
         merge_with_tokens(&mut registry, file.providers, token_store)?;
     }
 
+    // Finally, merge providers declared in the unified TOML config (global + project).
+    merge_with_tokens(&mut registry, config.provider_configs(), token_store)?;
+
     Ok(registry)
+}
+
+/// Build a registry from env JSON, legacy file config, the current unified
+/// TOML config, and tokens resolved through the token store.
+pub fn load_registry_with_token_store(
+    token_store: &dyn TokenStore,
+) -> Result<ProviderRegistry> {
+    load_registry_with_config(token_store, &crate::config::load())
 }
 
 fn merge_with_tokens(
@@ -227,7 +243,7 @@ mod tests {
             std::env::set_var("RIPCLONE_PROVIDERS_CONFIG", &path);
             std::env::set_var("RIPCLONE_PROVIDER_GITLAB_TOKEN", "from-env");
         }
-        let registry = load_registry_with_token_store(&token_store).unwrap();
+        let registry = load_registry_with_config(&token_store, &crate::config::Config::default()).unwrap();
         let token = registry.token("gitlab").unwrap().expose_secret();
         assert_eq!(token, "from-env");
         unsafe {
@@ -248,5 +264,37 @@ mod tests {
         let file = load_providers_file(&path).unwrap();
         assert_eq!(file.providers.len(), 1);
         assert_eq!(file.providers[0].id, "gitlab");
+    }
+
+    #[test]
+    fn load_registry_with_config_merges_toml_providers() {
+        use crate::config::{Config, ProviderEntry};
+        use std::collections::HashMap;
+
+        let dir = tempfile::tempdir().unwrap();
+        let token_store = FileTokenStore::new(dir.path().join("tokens.json"));
+        token_store.set("my-gitea", "gitea-secret").unwrap();
+
+        let mut providers = HashMap::new();
+        providers.insert(
+            "my-gitea".to_string(),
+            ProviderEntry {
+                kind: "gitea".into(),
+                host: Some("https://gitea.example.com".into()),
+                auth_template: None,
+            },
+        );
+        let config = Config {
+            providers,
+            ..Config::default()
+        };
+
+        let registry = load_registry_with_config(&token_store, &config).unwrap();
+        let token = registry.token("my-gitea").unwrap().expose_secret();
+        assert_eq!(token, "gitea-secret");
+        assert_eq!(
+            registry.get("my-gitea").map(|p| p.host.as_str()),
+            Some("https://gitea.example.com")
+        );
     }
 }
