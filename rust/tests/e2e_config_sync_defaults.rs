@@ -1,5 +1,6 @@
 //! End-to-end test that project `ripclone.toml` drives `default_provider` and
-//! `clone.depth` for a `ripclone sync`.
+//! `clone.depth` for a `ripclone sync`, even when run from a nested
+//! subdirectory.
 //!
 //! A mock server captures the request path and query; no real upstream or build
 //! is needed.
@@ -90,9 +91,13 @@ async fn project_config_drives_default_provider_and_depth() {
     let project = tempfile::tempdir().unwrap();
     write_project_config(project.path());
 
+    // Run the command from a/nested subdirectory to exercise config discovery.
+    let nested = project.path().join("a").join("b");
+    std::fs::create_dir_all(&nested).unwrap();
+
     let url = format!("http://{addr}");
     let home_path = home.path().to_path_buf();
-    let project_path = project.path().to_path_buf();
+    let nested_path = nested.clone();
     let bin = ripclone_bin();
     let url_for_sync = url.clone();
 
@@ -100,7 +105,7 @@ async fn project_config_drives_default_provider_and_depth() {
         Command::new(&bin)
             .arg("sync")
             .arg("owner/repo")
-            .current_dir(&project_path)
+            .current_dir(&nested_path)
             .env("HOME", &home_path)
             .env("RIPCLONE_SERVER", &url_for_sync)
             .stdout(std::process::Stdio::piped())
