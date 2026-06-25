@@ -53,7 +53,6 @@ pub fn init(lsm: bool) {
             }
             if lsm {
                 std::env::set_var("RIPCLONE_LSM", "1");
-                std::env::set_var("RIPCLONE_LSM_SEAL_BYTES", "1");
             }
         }
     });
@@ -450,8 +449,7 @@ pub fn read(dir: &Path, name: &str) -> String {
 /// Unified per-binary configuration: base env plus an explicit server build
 /// config. Because the flags are read from process env, each test binary pins
 /// exactly one config; call this at the top of every test in the binary.
-/// `seal_bytes`/`max_levels` tune the LSM build (1 / 16 are the battery
-/// defaults — seal every tail, compact at 16).
+/// The LSM build seals every advancing tail and compacts at `max_levels` (16).
 pub fn setup(two_phase: bool, lsm: bool, async_build: bool) {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| unsafe {
@@ -467,7 +465,6 @@ pub fn setup(two_phase: bool, lsm: bool, async_build: bool) {
         );
         std::env::set_var("RIPCLONE_TWO_PHASE", if two_phase { "1" } else { "0" });
         std::env::set_var("RIPCLONE_LSM", if lsm { "1" } else { "0" });
-        std::env::set_var("RIPCLONE_LSM_SEAL_BYTES", "1");
         std::env::set_var("RIPCLONE_ASYNC_BUILD", if async_build { "1" } else { "0" });
     });
 }

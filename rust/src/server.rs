@@ -2754,10 +2754,6 @@ struct LsmConfig {
     /// prior levels are reused by hash from object storage (Tigris). On by
     /// default — disable with `RIPCLONE_LSM=0`.
     enabled: bool,
-    /// Seal the tail into a new immutable level once it reaches this many raw
-    /// bytes. Default 1 (seal every advancing, non-empty tail) so the next sync
-    /// reuses everything and only builds its own new commits.
-    seal_threshold: u64,
     /// Compact down to at most this many levels (merging the smallest adjacent
     /// pair) so the level count stays bounded under seal-every-sync.
     max_levels: usize,
@@ -2767,14 +2763,12 @@ fn lsm_config() -> LsmConfig {
     let enabled = std::env::var("RIPCLONE_LSM")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(true);
-    let seal_threshold = env_bytes("RIPCLONE_LSM_SEAL_BYTES", 1);
     let max_levels = std::env::var("RIPCLONE_LSM_MAX_LEVELS")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(16usize);
     LsmConfig {
         enabled,
-        seal_threshold,
         max_levels,
     }
 }
@@ -2795,7 +2789,6 @@ async fn seal_and_compact(
     prev_levels: Vec<crate::HistoryLevel>,
     sealed_tip: Option<String>,
     tail_packs: Vec<(String, u64, String, u64)>,
-    tail_raw_bytes: u64,
     history_target: u64,
     cfg: &LsmConfig,
 ) -> Result<(
@@ -2803,10 +2796,12 @@ async fn seal_and_compact(
     Vec<(String, u64, String, u64)>,
     Vec<crate::HistoryLevel>,
 )> {
-    // Seal the tail into a new immutable level once it is large enough and HEAD
-    // actually advanced past the last sealed tip.
+    // Seal the tail into a new immutable level whenever HEAD advanced past the
+    // last sealed tip and the tail is non-empty. The cold base (sealed_tip None)
+    // always advances, so it always seals and becomes level 0. Compaction keeps
+    // the level count bounded.
     let advances = sealed_tip.as_deref() != Some(commit);
-    let seal = advances && !tail_packs.is_empty() && tail_raw_bytes >= cfg.seal_threshold;
+    let seal = advances && !tail_packs.is_empty();
     let mut levels = prev_levels;
     let mut new_tuples = tail_packs.clone();
     if seal {
@@ -2814,12 +2809,14 @@ async fn seal_and_compact(
             tip_commit: commit.to_string(),
             packs: tail_packs.iter().map(tuple_to_sized).collect(),
         });
+        let packed_mib: u64 =
+            tail_packs.iter().map(|(_, plen, _, _)| plen).sum::<u64>() / (1024 * 1024);
         info!(
-            "LSM: sealed level {} at {} ({} packs, {} MiB raw tail)",
+            "LSM: sealed level {} at {} ({} packs, {} MiB packed)",
             levels.len() - 1,
             &commit[..7.min(commit.len())],
             tail_packs.len(),
-            tail_raw_bytes / (1024 * 1024)
+            packed_mib
         );
     }
 
@@ -2844,18 +2841,13 @@ async fn seal_and_compact(
     }
 
     // Manifest history = every sealed level's packs (prior reused by hash + any
-    // compaction output), flattened. When the tail was NOT sealed this sync (it
-    // is below the seal threshold), it is not in `levels` — but its commits/trees
-    // are still reachable from HEAD and must ship, so append it. Without this the
-    // full clone would be missing the unsealed `(sealed_tip, HEAD]` range (the
-    // old full skeleton used to backstop this; it no longer exists).
-    let mut history_packs: Vec<(String, u64, String, u64)> = levels
+    // compaction output), flattened. We always seal an advancing non-empty tail,
+    // so there is never an unsealed `(sealed_tip, HEAD]` remainder to append: the
+    // only time `seal` is false is when the tail is empty (HEAD didn't advance).
+    let history_packs: Vec<(String, u64, String, u64)> = levels
         .iter()
         .flat_map(|l| l.packs.iter().map(sized_to_tuple))
         .collect();
-    if !seal {
-        history_packs.extend(tail_packs.iter().cloned());
-    }
     Ok((history_packs, new_tuples, levels))
 }
 
@@ -3339,7 +3331,6 @@ async fn do_sync(
                     prev_levels,
                     sealed_tip.clone(),
                     inc.tail_packs,
-                    inc.tail_raw_bytes,
                     history_target_raw,
                     &lsm_cfg,
                 )
@@ -4263,22 +4254,21 @@ async fn build_full_in_background(
         sealed_tip.clone(),
         lsm_cfg.enabled,
     );
-    type BuiltHistory = (Vec<(String, u64, String, u64)>, u64, bool);
+    type BuiltHistory = (Vec<(String, u64, String, u64)>, bool);
     let history_handle = tokio::task::spawn_blocking(move || -> Result<BuiltHistory> {
         let b = PackBuilder::new(&md2, &c2);
         if lsm2 {
-            let (tail, raw) = b.build_history_tail(&cm2, st2.as_deref(), history_target)?;
-            Ok((tail, raw, true))
+            let tail = b.build_history_tail(&cm2, st2.as_deref(), history_target)?;
+            Ok((tail, true))
         } else {
-            Ok((b.build_history_packs(&cm2, history_target)?, 0, false))
+            Ok((b.build_history_packs(&cm2, history_target)?, false))
         }
     });
     // History is enough to publish an editable clone: it reads only the files
     // table and the packs, never the archive. So publish as soon as history is
     // ready instead of waiting for the zstd archive (which only files mode needs).
     let t_editable = Instant::now();
-    let (built_history, tail_raw_bytes, is_tail) =
-        history_handle.await.context("history packs")??;
+    let (built_history, is_tail) = history_handle.await.context("history packs")??;
 
     // Once the cumulative delta grows past the threshold, rebuild a fresh base at
     // the current commit. depth=1 is already live, so this never blocks a clone.
@@ -4322,7 +4312,6 @@ async fn build_full_in_background(
             prev_levels,
             sealed_tip,
             built_history,
-            tail_raw_bytes,
             history_target,
             &lsm_cfg,
         )

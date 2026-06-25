@@ -120,7 +120,7 @@ fn cold_reuse_multipack_full_clone_is_complete() {
     // build_history_pack_reuse. Force it to split into multiple packs (git clamps
     // the limit up to its 1 MiB minimum, well below our ~4 MiB of content).
     unsafe { std::env::set_var("RIPCLONE_HISTORY_MAX_PACK_BYTES", "1") };
-    let (packs, _raw) = builder
+    let packs = builder
         .build_history_tail(&head, None, 512 * 1024 * 1024)
         .unwrap();
     unsafe { std::env::remove_var("RIPCLONE_HISTORY_MAX_PACK_BYTES") };

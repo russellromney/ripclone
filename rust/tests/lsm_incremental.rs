@@ -172,7 +172,7 @@ fn lsm_no_new_commits_yields_empty_tail() {
         .build_incremental_packs(&head, Some(&head), 6 * 1024 * 1024, 512 * 1024 * 1024)
         .unwrap();
     assert!(
-        again.tail_packs.is_empty() && again.tail_raw_bytes == 0,
+        again.tail_packs.is_empty(),
         "no new commits since the sealed tip -> empty tail"
     );
     assert!(
