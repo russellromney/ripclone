@@ -4,7 +4,7 @@
 
 ## Local filesystem (default, easiest for self-hosting)
 
-If you do not set any S3 environment variables, the server stores artifacts in its CAS directory (`--cas-dir`, default `/data/cache`). This is the path used by `docker-compose.yml`.
+If you do not set any S3 environment variables, the server stores artifacts in its CAS directory (`--cas-dir`, default `/data/cache`). This is the path used by `tests/fly/docker-compose.yml`.
 
 Pros:
 - Works out of the box.

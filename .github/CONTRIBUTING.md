@@ -12,7 +12,7 @@ cargo test
 
 ## What to work on
 
-- Check [`ROADMAP.md`](ROADMAP.md) for current direction.
+- Check [`ROADMAP.md`](../docs/ROADMAP.md) for current direction.
 - Good first issues: tests, documentation, CLI ergonomics, and benchmark improvements.
 - Larger work should start with a brief discussion in an issue or PR so we can align on direction.
 

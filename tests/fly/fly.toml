@@ -2,6 +2,8 @@ app = 'ripclone'
 primary_region = 'iad'
 
 [build]
+  # Deploy from the repo root: `fly deploy --config tests/fly/fly.toml`.
+  dockerfile = 'tests/fly/Dockerfile'
 
 [http_service]
   internal_port = 8000
