@@ -622,28 +622,39 @@ impl ArchiveBuilder {
         if prev_frames.is_empty() || !self.mirror.exists() {
             return full();
         }
-        let repo = git2::Repository::open_bare(&self.mirror)
-            .with_context(|| format!("open bare repo {}", self.mirror.display()))?;
-        let new_tree = repo.revparse_single(commit)?.peel_to_commit()?.tree()?;
-        let prev_tree = match repo
-            .revparse_single(prev_commit)
-            .and_then(|o| o.peel_to_commit())
-            .and_then(|c| c.tree())
-        {
-            Ok(t) => t,
-            Err(_) => return full(), // prev commit pruned — can't bound the read
+        let repo = crate::gix_util::open_repo(&self.mirror)?;
+        let new_tree = repo
+            .find_commit(
+                repo.rev_parse_single(commit)
+                    .with_context(|| format!("resolve commit {commit}"))?,
+            )
+            .with_context(|| format!("find commit {commit}"))?
+            .tree_id()
+            .context("read new tree id")?
+            .detach();
+        let prev_tree = match repo.rev_parse_single(prev_commit) {
+            Ok(id) => repo
+                .find_commit(id)
+                .ok()
+                .and_then(|c| c.tree_id().ok())
+                .map(|id| id.detach()),
+            Err(_) => None,
+        };
+        let Some(prev_tree) = prev_tree else {
+            return full(); // prev commit pruned — can't bound the read
         };
 
-        let mut new_blobs: Vec<(Vec<u8>, git2::Oid, u32)> = Vec::new();
-        collect_blobs_raw(&repo, &new_tree, &[], &mut new_blobs).context("walk new tree")?;
-        let mut old_blobs: Vec<(Vec<u8>, git2::Oid, u32)> = Vec::new();
-        collect_blobs_raw(&repo, &prev_tree, &[], &mut old_blobs).context("walk prev tree")?;
+        let mut new_blobs: Vec<(Vec<u8>, gix::hash::ObjectId, u32)> = Vec::new();
+        collect_blobs_raw_gix(&repo, new_tree, &mut new_blobs).context("walk new tree")?;
+        let mut old_blobs: Vec<(Vec<u8>, gix::hash::ObjectId, u32)> = Vec::new();
+        collect_blobs_raw_gix(&repo, prev_tree, &mut old_blobs).context("walk prev tree")?;
 
         let mut oids: Vec<String> = Vec::with_capacity(new_blobs.len() + old_blobs.len());
         oids.extend(new_blobs.iter().map(|(_, o, _)| o.to_string()));
         oids.extend(old_blobs.iter().map(|(_, o, _)| o.to_string()));
         let sizes = crate::git::object_sizes(&self.mirror, &oids)?;
-        let size_of = |oid: &git2::Oid| sizes.get(&oid.to_string()).copied().unwrap_or(0) as usize;
+        let size_of =
+            |oid: &gix::hash::ObjectId| sizes.get(&oid.to_string()).copied().unwrap_or(0) as usize;
 
         // Byte offset of every file in each path-ordered stream.
         let mut new_starts = Vec::with_capacity(new_blobs.len());
@@ -787,10 +798,12 @@ impl ArchiveBuilder {
                 if be <= g0 || bs >= g1 {
                     continue;
                 }
-                let content = repo.find_blob(*oid)?.content().to_vec();
+                let blob = repo
+                    .find_blob(*oid)
+                    .with_context(|| format!("read blob {oid}"))?;
                 let lo = g0.max(bs) - bs;
                 let hi = g1.min(be) - bs;
-                buf.extend_from_slice(&content[lo..hi]);
+                buf.extend_from_slice(&blob.data[lo..hi]);
             }
             for c in fastcdc::v2020::FastCDC::new(&buf, CDC_MIN, CDC_AVG, CDC_MAX) {
                 let raw = &buf[c.offset..c.offset + c.length];
@@ -866,7 +879,7 @@ impl ArchiveBuilder {
             {
                 h.to_vec()
             } else {
-                sha1_bytes(repo.find_blob(*oid)?.content()).to_vec()
+                sha1_bytes(&repo.find_blob(*oid)?.data).to_vec()
             };
             let (frags, new_hint) = fragments_for(&bounds, bstart, blen, hint);
             hint = new_hint;
