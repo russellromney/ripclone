@@ -101,7 +101,11 @@ fn cold_reuse_multipack_full_clone_is_complete() {
         commit_msg(&src, &format!("c{i}"));
     }
     let head = git(&src, &["rev-parse", "HEAD"]);
-    let first_big = git(&src, &["rev-parse", "HEAD~5:big1.dat"]);
+    // A blob that was current at an intermediate commit but superseded by HEAD —
+    // it lives only in history, so it is NOT materialized by the worktree
+    // checkout below. Only a full fsck (delta resolution across the whole pack
+    // set) proves it survived a cross-pack split.
+    let superseded = git(&src, &["rev-parse", "HEAD~3:growing.dat"]);
 
     let cas = Cas::new(tmp.path().join("cas")).unwrap();
     let builder = PackBuilder::new(&src, &cas);
@@ -130,26 +134,29 @@ fn cold_reuse_multipack_full_clone_is_complete() {
     for (ph, _, ih, _) in packs.iter() {
         install_pack(&cas, &pack_dir, ph, ih);
     }
+    // Point a ref at HEAD so fsck checks reachability from a real ref (otherwise
+    // every object is merely "dangling") and the whole graph is in scope.
+    git(&tgt, &["update-ref", "refs/heads/main", &head]);
 
-    // Every object reachable from HEAD must be present — this is what fails if a
-    // cross-pack delta's base went missing.
+    // FULL fsck (no --connectivity-only): inflates and sha-verifies EVERY object
+    // in the store, which forces resolving each delta against its base — across
+    // sibling packs. This is the assertion that actually catches a cross-pack
+    // split that dropped a delta base; a connectivity-only walk would not, since
+    // it never reads blob content.
     assert!(
-        git_ok(&tgt, &["rev-list", "--objects", &head]),
-        "full object traversal from HEAD must not be missing any object"
+        git_ok(&tgt, &["fsck", "--no-dangling"]),
+        "git fsck must verify every object (delta resolution across the pack set)"
     );
     assert_eq!(
         git(&tgt, &["rev-list", "--count", &head]),
         "6",
         "all 6 commits reachable"
     );
+    // A history-only blob (superseded before HEAD, never checked out) must still
+    // resolve — the pointed case for a cross-pack delta base going missing.
     assert!(
-        git_ok(&tgt, &["fsck", "--connectivity-only", &head]),
-        "git fsck must be connectivity-clean"
-    );
-    // A blob from the first commit (a likely delta base, written early) resolves.
-    assert!(
-        git_ok(&tgt, &["cat-file", "-e", &first_big]),
-        "early-commit blob (delta base) must be present across the pack set"
+        git_ok(&tgt, &["cat-file", "-e", &superseded]),
+        "superseded history blob (a delta base) must resolve across the pack set"
     );
 
     // Worktree materializes byte-for-byte.
