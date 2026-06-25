@@ -1,8 +1,25 @@
-# Storage backends
+# Backends
+
+`ripclone-server` has three independent, pluggable backends, each chosen by
+environment variables. The defaults need zero infrastructure — a single binary
+with local storage and an in-process builder — and you swap any one of them out
+without touching the others:
+
+- **Storage** — where artifacts live (local filesystem or S3-compatible).
+- **Metadata store** — where per-repo/branch refs (the pointers into storage)
+  live (files, S3, or a SQL database).
+- **Build queue** — where sync/build jobs are dispatched (in-process, or a SQL
+  queue drained by standalone `ripclone-worker` processes for farm-out).
+
+Storage and the metadata store hold all durable state; the build queue is just
+coordination. A worker is therefore stateless — that is what lets builds be
+farmed out to other machines.
+
+## Storage
 
 `ripclone-server` can store artifacts on the local filesystem or in any S3-compatible object store.
 
-## Local filesystem (default, easiest for self-hosting)
+### Local filesystem (default, easiest for self-hosting)
 
 If you do not set any S3 environment variables, the server stores artifacts in its CAS directory (`--cas-dir`, default `/data/cache`). This is the path used by `tests/fly/docker-compose.yml`.
 
@@ -15,7 +32,7 @@ Cons:
 - The server must proxy every byte if clients are remote.
 - No built-in CDN for distributed clients.
 
-## S3-compatible object storage
+### S3-compatible object storage
 
 Set these environment variables:
 
@@ -38,7 +55,7 @@ Works with:
 - **AWS S3**
 - Any other S3-compatible provider
 
-## AWS S3 Express One Zone (highest performance)
+### AWS S3 Express One Zone (highest performance)
 
 For a hosted service where you want the lowest latency and highest throughput to clients, use an **S3 Express One Zone directory bucket**.
 
@@ -53,11 +70,105 @@ RIPCLONE_S3_BUCKET=my-bucket--usw2-az1--x-s3
 
 S3 Express is significantly faster than standard S3 for the small, range-heavy reads ripclone clients make. Cost is higher, so it is best for the hosted/new-user path rather than the default open-source setup.
 
-## CDN in front of S3
+### CDN in front of S3
 
 If you want a custom domain or edge cache in front of S3/Tigris/R2, put a CDN or reverse proxy between clients and the object store and point `RIPCLONE_S3_ENDPOINT` at it. The server generates presigned S3-style URLs against that endpoint; the CDN/proxy must forward the `Authorization` header and request path to the origin.
 
 A future improvement is to support provider-specific signed URLs (e.g. CloudFront signed URLs) directly in the server.
+
+## Metadata store
+
+The metadata store holds one small `RefInfo` record per repo/branch — the commit
+and the hashes that point at artifacts in storage. It never holds file bytes.
+Choose it with `RIPCLONE_METADATA`, independently of storage:
+
+| `RIPCLONE_METADATA` | Where refs live | Notes |
+|---|---|---|
+| *(unset)* | follows storage | S3 when S3 is configured, else local files — the historical default |
+| `file` | `--repo-root/.ripclone-refs/` | one JSON file per ref |
+| `s3` | the configured S3 bucket | requires `RIPCLONE_S3_*` |
+| `sqlite` | a local SQLite file | single box |
+| `postgres` | a Postgres database | shared across machines |
+| `mysql` | a MySQL database | shared across machines |
+| `libsql` | a remote Turso Cloud database | shared across machines |
+
+The SQL backends read a connection URL (and a token for `libsql`):
+
+```bash
+RIPCLONE_METADATA=postgres
+RIPCLONE_METADATA_DB_URL=postgres://user:pass@host:5432/ripclone
+# mysql:  RIPCLONE_METADATA_DB_URL=mysql://user:pass@host:3306/ripclone
+# sqlite: RIPCLONE_METADATA_DB_URL=/data/meta.db
+# libsql: RIPCLONE_METADATA_DB_URL=libsql://db.turso.io  RIPCLONE_METADATA_DB_TOKEN=...
+```
+
+`libsql` is remote-only — for a local SQLite file use `sqlite`. The schema is
+created on first start; no migration step. Put the metadata store on a database
+your workers can also reach when you farm builds out (below).
+
+## Build queue & workers (farm-out)
+
+By default the server builds in-process: `/sync` runs the build on the server
+itself. To move that CPU/IO-heavy work onto one or more separate machines, point
+the server and one or more `ripclone-worker` processes at a shared **SQL queue**.
+The server only enqueues; the workers claim, build, and write results to the
+shared storage + metadata store. `/sync` polls the job to completion, so it does
+not care which machine built it.
+
+Choose the queue with `RIPCLONE_QUEUE`:
+
+| `RIPCLONE_QUEUE` | Backend | Use |
+|---|---|---|
+| `local` *(default)* | in-process channel | single binary, no farm-out |
+| `sqlite` | a local SQLite file | single-box farm-out (server + workers share the file) |
+| `postgres` | a Postgres database | multi-machine farm-out |
+| `mysql` | a MySQL database | multi-machine farm-out |
+| `libsql` | a remote Turso Cloud database | multi-machine farm-out |
+
+```bash
+# Server: enqueue onto Postgres (builds run in workers, not here)
+RIPCLONE_QUEUE=postgres
+RIPCLONE_QUEUE_DB_URL=postgres://user:pass@host:5432/ripclone
+# libsql also needs RIPCLONE_QUEUE_DB_TOKEN=...
+
+# Worker(s): same queue + storage + metadata config, plus a scratch repo root
+ripclone-worker --cas-dir /data/cache --repo-root /data/repos
+```
+
+Notes:
+
+- **Same config on both sides.** A worker must see the same storage
+  (`RIPCLONE_S3_*` or the shared `--cas-dir`), the same metadata store
+  (`RIPCLONE_METADATA*`), and the same queue (`RIPCLONE_QUEUE*`) as the server.
+  With a SQL queue, use a SQL metadata store too — a `file` store under a
+  per-machine `--repo-root` would not be shared.
+- **One `repo_root` per worker.** The bare mirror under `--repo-root` is per-repo
+  scratch guarded by an in-process lock; give each worker its own. All durable
+  state is in storage + the metadata store.
+- **Credentials are never put in the queue.** A worker resolves its own upstream
+  credentials from its provider config (`RIPCLONE_PROVIDERS` / `RIPCLONE_GITHUB_TOKEN`),
+  so a per-request `X-Upstream-Token` is ignored on the cross-process path.
+- **Keep async builds on.** `/sync` only enqueues when async builds are enabled
+  (`RIPCLONE_ASYNC_BUILD`, on by default). With it off the server builds
+  synchronously in-process and the queue is unused.
+
+Worker tuning and queue housekeeping:
+
+```bash
+# worker flags
+--idle-poll-ms 1000        # how often to poll an empty queue (default 1000)
+
+# queue env (server + workers)
+RIPCLONE_QUEUE_STALE_SECS=1800              # reclaim a crashed worker's claimed job after N s (default 1800)
+RIPCLONE_QUEUE_FAILED_RETENTION_SECS=604800 # prune failed jobs older than N s (default 7 days)
+```
+
+`done` jobs are kept as build history; only `failed` jobs are pruned.
+
+> Truly diskless workers (no bare mirror on disk, seeded from the clonepack
+> instead of a fresh fetch) are future work — see the dispatcher design. Today a
+> worker fetches the bare mirror it needs, and a server answering a clone fetches
+> it on demand if it lacks one.
 
 ## Client authentication
 
@@ -117,9 +228,11 @@ RIPCLONE_OVERLAY_MARGIN_MB=128       # headroom required in staging dir
 
 ## Recommended matrix
 
-| Use case | Backend | Why |
-|---|---|---|
-| Local dev / single machine | Local filesystem | Zero setup |
-| Small team self-host | MinIO or S3 | Shared storage, still simple |
-| Hosted service / new users | S3 Express One Zone or R2 | Fastest global downloads |
-| Cost-sensitive hosted | R2 + client cache | No egress fees |
+| Use case | Storage | Metadata | Queue | Why |
+|---|---|---|---|---|
+| Local dev / single machine | Local filesystem | *(default)* | `local` | Zero setup, one binary |
+| Small team self-host | MinIO or S3 | *(default = s3)* | `local` | Shared storage, still simple |
+| Single box, offload builds | S3 / MinIO | `sqlite` or `s3` | `sqlite` | Server + workers on one host share the queue file |
+| Multi-machine farm-out | S3 / R2 | `postgres`/`mysql`/`libsql` | `postgres`/`mysql`/`libsql` | Workers on other hosts share a network DB |
+| Hosted service / new users | S3 Express One Zone or R2 | SQL | SQL | Fastest downloads + farm-out builds |
+| Cost-sensitive hosted | R2 + client cache | SQL | SQL | No egress fees |
