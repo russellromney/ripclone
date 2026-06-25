@@ -809,8 +809,9 @@ impl Client {
 
         // Files mode needs the zstd archive. The server publishes an editable
         // clonepack first and adds the archive a moment later, so wait for it
-        // (editable clones don't need it and skip this).
-        if mode.needs_archive() && !info.archive_ready {
+        // (editable clones don't need it and skip this). Files mode has a fast
+        // fallback to the shallow clonepack, so don't burn time waiting.
+        if mode.needs_archive() && !info.archive_ready && mode != CloneMode::Files {
             let max = std::env::var("RIPCLONE_CLONE_MAX_ATTEMPTS")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -826,6 +827,19 @@ impl Client {
             }
         }
 
+        // Files mode prefers the zstd archive, but can fall back to extracting
+        // files from the pre-built head packs when the archive hasn't finished
+        // yet (async two-phase builds). The shallow clonepack has the HEAD-closure
+        // packs and is ready first, so use that for the fallback instead of the
+        // much larger full-history clonepack.
+        let mut use_archive = mode.needs_archive() && info.archive_ready;
+        if mode == CloneMode::Files && !use_archive {
+            info = self
+                .resolve_ref_with_clonepack(owner, repo, branch, Some("shallow"), rev)
+                .await?;
+            // The shallow clonepack never has an archive, so disable the archive path.
+            use_archive = false;
+        }
         if info.clonepack_manifest.is_empty() {
             anyhow::bail!("ref is missing clonepack manifest; run sync first");
         }
@@ -849,36 +863,35 @@ impl Client {
             .clone()
             .spawn_fetch_metadata(metadata_hash, metadata_url);
 
-        // 3. Spawn the archive-chunk downloader. It waits for the manifest to be
-        // decoded before fetching anything (so it follows the manifest's chunk
-        // table, not a possibly-stale signed-URL list), then fetches chunks with
-        // a bounded concurrency semaphore and forwards them over this bounded
-        // channel. Peak memory is therefore bounded by the fetch concurrency
-        // plus the channel depth, not the chunk count.
-        let archive_channel_depth = std::env::var("RIPCLONE_ARCHIVE_CHANNEL_DEPTH")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or_else(|| {
-                info.archive_chunk_urls
-                    .as_ref()
-                    .map_or(2, |urls| urls.len().clamp(2, 64))
-            });
-        let (archive_tx, archive_rx): (
-            Sender<(usize, Result<Vec<u8>>)>,
-            Receiver<(usize, Result<Vec<u8>>)>,
-        ) = bounded(archive_channel_depth);
+        // 3. Spawn the archive-chunk downloader when the archive is available.
+        // It waits for the manifest to be decoded before fetching anything (so it
+        // follows the manifest's chunk table, not a possibly-stale signed-URL
+        // list), then fetches chunks with a bounded concurrency semaphore and
+        // forwards them over this bounded channel. Peak memory is therefore
+        // bounded by the fetch concurrency plus the channel depth, not the chunk
+        // count.
+        let (archive_downloads, archive_rx) = if use_archive {
+            let archive_channel_depth = std::env::var("RIPCLONE_ARCHIVE_CHANNEL_DEPTH")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or_else(|| {
+                    info.archive_chunk_urls
+                        .as_ref()
+                        .map_or(2, |urls| urls.len().clamp(2, 64))
+                });
+            let (archive_tx, archive_rx): (
+                Sender<(usize, Result<Vec<u8>>)>,
+                Receiver<(usize, Result<Vec<u8>>)>,
+            ) = bounded(archive_channel_depth);
 
-        let archive_urls = info.archive_chunk_urls.clone();
-        let archive_downloads = if mode.needs_archive() {
             bench.start_archive_download();
-            Some(
-                self.clone()
-                    .spawn_chunk_downloads(archive_urls, manifest_rx, archive_tx),
-            )
+            let handle = self
+                .clone()
+                .spawn_chunk_downloads(info.archive_chunk_urls.clone(), manifest_rx, archive_tx);
+            (Some(handle), Some(archive_rx))
         } else {
-            drop(archive_tx);
             drop(manifest_rx);
-            None
+            (None, None)
         };
 
         // 4. Wait for manifest + metadata.
@@ -889,8 +902,7 @@ impl Client {
         let metadata = Arc::new(metadata);
         bench.mark_manifest();
         bench.add_bytes(metadata_bytes(&metadata), 0);
-        if mode.needs_archive() && !metadata.files.is_empty() && manifest.archive_chunks.is_empty()
-        {
+        if use_archive && !metadata.files.is_empty() && manifest.archive_chunks.is_empty() {
             anyhow::bail!(
                 "selected clonepack has no archive chunks for files mode; rerun sync or request a clonepack variant with archive chunks"
             );
@@ -983,8 +995,8 @@ impl Client {
             .context("write temp manifest")?;
         let manifest_path = manifest_tmp.path().to_path_buf();
 
-        let archive_worker = if mode.needs_archive() {
-            let rx = archive_rx;
+        let archive_worker = if use_archive {
+            let rx = archive_rx.expect("archive_rx set when use_archive");
             let manifest_path = manifest_path.clone();
             let work_tree = install_root.clone();
             let git_dir_for_blobs = if mode.needs_blob_pack() {
@@ -1004,7 +1016,6 @@ impl Client {
                 )
             }))
         } else {
-            drop(archive_rx);
             // The temp file can be dropped; nothing needs the manifest on disk.
             drop(manifest_tmp);
             None
@@ -1018,11 +1029,24 @@ impl Client {
         }
         // Editable single-download path: download the small depth packs in
         // parallel and, as each lands, install it and extract its blobs into the
-        // working tree. Download and extraction overlap.
+        // working tree. Download and extraction overlap. Files mode falls back to
+        // this path when the zstd archive isn't ready yet.
         let mut prebuilt_blob_pack_bytes = 0u64;
-        if mode.needs_pack_worktree() {
+        let use_pack_worktree =
+            mode.needs_pack_worktree() || (mode == CloneMode::Files && !use_archive);
+        if use_pack_worktree {
+            // Files-mode fallback only needs the HEAD-closure packs; editable mode
+            // also needs history packs for a complete .git object database.
+            let download_history = mode.needs_pack_worktree();
             prebuilt_blob_pack_bytes = self
-                .install_editable_packs(&manifest, &info, &pack_dir, &install_root, &metadata)
+                .install_editable_packs(
+                    &manifest,
+                    &info,
+                    &pack_dir,
+                    &install_root,
+                    &metadata,
+                    download_history,
+                )
                 .await
                 .context("install editable packs")?;
             bench.mark_write();
@@ -1134,6 +1158,7 @@ impl Client {
         pack_dir: &std::path::Path,
         work_tree: &std::path::Path,
         metadata: &MetadataChunk,
+        download_history: bool,
     ) -> Result<u64> {
         use futures::stream::{self, StreamExt, TryStreamExt};
 
@@ -1207,7 +1232,13 @@ impl Client {
             None => None,
         };
 
-        let jobs: Vec<(usize, PackEntry)> = manifest.packs.iter().cloned().enumerate().collect();
+        let jobs: Vec<(usize, PackEntry)> = manifest
+            .packs
+            .iter()
+            .cloned()
+            .enumerate()
+            .filter(|(_, entry)| download_history || !entry.history_only)
+            .collect();
 
         // Stage 1: download packs (network concurrency `download_conc`).
         let downloads = stream::iter(jobs).map(|(i, entry)| {

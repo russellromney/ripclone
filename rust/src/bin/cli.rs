@@ -590,7 +590,11 @@ async fn main() -> Result<()> {
 
             let enable_bench = bench || std::env::var_os("RIPCLONE_BENCH").is_some();
             let mut benchmark = Benchmark::new();
-            let clonepack_kind = Some(ripclone::mode::clonepack_kind_for_depth(depth));
+            let clonepack_kind = Some(if mode == ripclone::mode::CloneMode::Files {
+                "full"
+            } else {
+                ripclone::mode::clonepack_kind_for_depth(depth)
+            });
             client
                 .install_repo_with_mode_at(
                     owner,
