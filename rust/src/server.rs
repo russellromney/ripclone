@@ -3420,6 +3420,14 @@ async fn build_and_publish_two_phase(
         _ => None,
     };
     let prev_commit_for_diff = prev.as_ref().map(|p| p.commit.clone());
+    // Carry the prior files table + commit so the bounded archive can hash only
+    // changed files and reuse frames for the unchanged prefix/suffix.
+    let prev_files_for_archive: Vec<crate::clonepack::FileEntry> =
+        prev_files.clone().unwrap_or_default();
+    let prev_archive_commit: Option<String> = prev
+        .as_ref()
+        .map(|p| p.commit.clone())
+        .filter(|c| !c.is_empty());
     let (md3, cm3) = (mirror_dir.to_path_buf(), commit.to_string());
     let files_table_handle = match (prev_files, prev_commit_for_diff) {
         (Some(pf), Some(from)) if !from.is_empty() => {
@@ -3664,6 +3672,8 @@ async fn build_and_publish_two_phase(
             upload_conc,
             prev_levels_for_p2,
             prev_archive_frames_for_p2,
+            prev_files_for_archive,
+            prev_archive_commit,
             head_base_pack_count_for_p2,
         )
         .await;
@@ -3714,6 +3724,10 @@ async fn build_full_in_background(
     upload_conc: usize,
     prev_levels: Vec<crate::HistoryLevel>,
     prev_archive_frames: Vec<crate::ArchiveFrame>,
+    // The prior sync's files table + commit, for the bounded archive: it hashes
+    // only changed files and reuses frames for the unchanged prefix/suffix.
+    prev_files: Vec<crate::clonepack::FileEntry>,
+    prev_archive_commit: Option<String>,
     // How many of `head_packs` (above) are base packs; the rest are the cumulative
     // delta. When the delta's byte size exceeds RIPCLONE_HEAD_REBASE_BYTES this
     // phase rebases — rebuilds a fresh base at the current commit (off the depth=1
@@ -3739,16 +3753,37 @@ async fn build_full_in_background(
     // No full skeleton: the full variant reuses phase 1's shallow skeleton, and
     // the full history's commits+trees live in the history packs.
     //
-    // The archive is built with per-frame CDC reuse: frames whose raw bytes are
-    // unchanged since the prior sync reuse the prior compressed chunk (no
-    // recompression, no re-upload), so the archive cost is O(changed worktree).
+    // The archive reuses unchanged frames (their raw bytes hash the same, so the
+    // prior compressed chunk is reused — no recompress, no re-upload). When a prior
+    // commit + frames are known, the bounded build also skips *reading* the
+    // unchanged prefix/suffix and only touches the changed middle; it falls back to
+    // the full read on its own when that doesn't apply. RIPCLONE_ARCHIVE_BOUNDED=0
+    // forces the full read.
+    let bounded = std::env::var("RIPCLONE_ARCHIVE_BOUNDED")
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(true)
+        && !prev_archive_frames.is_empty()
+        && prev_archive_commit.is_some();
     let prev_frame_map: std::collections::HashMap<String, (String, u64)> = prev_archive_frames
         .iter()
         .map(|f| (f.raw_hash.clone(), (f.chunk_hash.clone(), f.compressed_len)))
         .collect();
     let (mda, ca, cma) = (mirror_dir.to_path_buf(), cas.clone(), commit.to_string());
     let archive_handle = tokio::task::spawn_blocking(move || {
-        ArchiveBuilder::new(&mda).build_into_cas_incremental(&cma, &ca, 6, None, &prev_frame_map)
+        let b = ArchiveBuilder::new(&mda);
+        if bounded {
+            b.build_into_cas_bounded(
+                &cma,
+                &ca,
+                6,
+                None,
+                &prev_archive_frames,
+                &prev_files,
+                prev_archive_commit.as_deref().unwrap_or_default(),
+            )
+        } else {
+            b.build_into_cas_incremental(&cma, &ca, 6, None, &prev_frame_map)
+        }
     });
     let (md2, c2, cm2, st2, lsm2) = (
         mirror_dir.to_path_buf(),
