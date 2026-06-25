@@ -1284,6 +1284,8 @@ mod tests {
             ReleaseStatus::Newer("v0.2.0".to_string())
         );
     }
+
+    #[test]
     fn parse_repo_arg_without_prefix() {
         assert_eq!(
             parse_repo_arg("oven-sh/bun"),

@@ -36,7 +36,7 @@ async fn current_protocol_client_can_sync() {
     origin.publish();
     server
         .client()
-        .sync_repo("acme", "compat", None, None)
+        .sync_repo("acme/compat", None)
         .await
         .expect("a current-protocol client must pass the guard and sync");
 }
