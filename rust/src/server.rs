@@ -2211,6 +2211,8 @@ async fn sync_repo_inner(
         at_rev.as_deref(),
         &state.ref_store,
         false,
+        // In-process server: phase 2 runs in the background for a fast response.
+        false,
         &state.storage,
         &state.retention,
         &provider,
@@ -2488,6 +2490,8 @@ async fn create_snapshot_inner(
         &branch,
         None,
         &state.ref_store,
+        false,
+        // In-process server: phase 2 runs in the background for a fast response.
         false,
         &state.storage,
         &state.retention,
@@ -3269,6 +3273,14 @@ async fn do_sync(
     at_rev: Option<&str>,
     ref_store: &Arc<dyn RefStore>,
     build_full_pack: bool,
+    // When true, the two-phase build runs phase 2 (full history) inline and only
+    // returns once it is durable, instead of detaching it into a background task.
+    // The caller must hold `repo_lock` for the whole call. Set by an ephemeral
+    // (cross-process) worker so it never acks `done` while phase 2 is still
+    // unbuilt — a detached task would die with the worker and the full clonepack
+    // would never be built (A3). The long-lived in-process server leaves this
+    // false: its detached phase-2 task survives, keeping `/sync` fast.
+    inline_full_history: bool,
     storage: &crate::storage::StorageRef,
     retention: &Arc<Retention>,
     provider: &ProviderInstance,
@@ -3376,6 +3388,7 @@ async fn do_sync(
             ref_store,
             storage,
             retention,
+            inline_full_history,
             t_total,
         )
         .await;
@@ -3981,6 +3994,7 @@ async fn build_and_publish_two_phase(
     ref_store: &Arc<dyn RefStore>,
     storage: &crate::storage::StorageRef,
     retention: &Arc<Retention>,
+    inline_full_history: bool,
     t_total: Instant,
 ) -> Result<RefInfo> {
     let history_target = env_bytes("RIPCLONE_HISTORY_PACK_BYTES", 512 * 1024 * 1024);
@@ -4304,7 +4318,7 @@ async fn build_and_publish_two_phase(
     let sk_meta = shallow_metadata_hash.clone();
     let sk_meta_len = shallow_meta_data.len() as u64;
     let head_base_pack_count_for_p2 = head_built.base_packs.len();
-    tokio::spawn(async move {
+    let phase2 = async move {
         let started = Instant::now();
         let res = build_full_in_background(
             &cas2,
@@ -4334,7 +4348,7 @@ async fn build_and_publish_two_phase(
             head_base_pack_count_for_p2,
         )
         .await;
-        match res {
+        match &res {
             Ok(()) => info!(
                 "full clone ready for {} in {:?}",
                 &commit2[..7.min(commit2.len())],
@@ -4345,7 +4359,23 @@ async fn build_and_publish_two_phase(
                 repo_id2.storage_key()
             ),
         }
-    });
+        res
+    };
+
+    if inline_full_history {
+        // Ephemeral/cross-process worker: build phase 2 now, before returning, so
+        // the job is never acked `done` while the full clonepack is still unbuilt
+        // (A3). This runs under the caller's `repo_lock` (process_build_job holds
+        // it across the whole do_sync), so phase 2 is serialized against other
+        // syncs for this repo. A crash mid-build leaves the claim stale → the
+        // queue reclaims and retries it (and dead-letters after the cap).
+        phase2.await.context("phase 2 (full history) build")?;
+    } else {
+        // Long-lived in-process server: detach so `/sync` returns as soon as the
+        // depth=1 clonepack is live. The task outlives the request because the
+        // server process keeps running.
+        tokio::spawn(phase2);
+    }
 
     Ok(info)
 }
@@ -4740,6 +4770,11 @@ pub async fn process_build_job(state: &ServerState, job: &BuildJob) -> Result<()
     };
     let lock = repo_lock(&state.sync_locks, repo_id).await;
     let _guard = lock.lock().await;
+    // An ephemeral cross-process worker (SQL queue, `inproc_wait() == false`)
+    // must finish the two-phase full history before it acks `done`, or a worker
+    // that exits after acking would lose the detached phase-2 task (A3). The
+    // in-process server keeps phase 2 in the background for a fast `/sync`.
+    let inline_full_history = !state.build_queue.inproc_wait();
     let result = do_sync(
         &state.cas,
         &mirror_dir,
@@ -4748,6 +4783,7 @@ pub async fn process_build_job(state: &ServerState, job: &BuildJob) -> Result<()
         at_rev.as_deref(),
         &state.ref_store,
         false,
+        inline_full_history,
         &state.storage,
         &state.retention,
         &provider,
