@@ -49,7 +49,7 @@ ripclone vs native `git clone`. Lower is better; **bold** is ripclone.
 
 ## Install
 
-Pick whichever fits. All install the `ripclone` CLI (and `ripclone-server`, `git-remote-ripclone`).
+Pick whichever fits. All install the `ripclone` CLI (and `ripclone-server`, `ripclone-worker`, `git-remote-ripclone`).
 
 ```sh
 # 1. Shell installer (prebuilt binaries)
@@ -219,6 +219,7 @@ Object storage   Local disk
 - **Clients** download the pieces, decompress, and write files straight to disk.
 - **Your git host stays the source of truth** for repos, refs, permissions, and writes.
 - **Rate limiting** keeps public endpoints from being abused.
+- **Builds run in-process by default**, or can be farmed out to standalone `ripclone-worker` processes via a pluggable queue (SQLite/Postgres/MySQL/libsql). Ref metadata can live in files, S3, or a SQL database — see [`docs/BACKENDS.md`](docs/BACKENDS.md).
 
 Ops endpoints: `GET /healthz` (alive?), `GET /readyz` (ready? — `503` if storage or the ref store is down), and `GET /metrics` (Prometheus format). There's also a plain-git fallback (`/v1/git/{owner}/{repo}/...`) so a normal `git clone` still works if the fast path is down.
 
@@ -240,7 +241,7 @@ Environment variables for tuning clone performance:
 - `RIPCLONE_MODE` — default clone mode (`editable` or `files`) when `--mode` is omitted.
 - `RIPCLONE_CACHE_DIR` / `RIPCLONE_NO_CACHE` — opt in to (or force off) a local artifact cache; off by default.
 
-Server-side storage and retention (S3-compatible backends, remote GC, local eviction) are configured through `RIPCLONE_S3_*`, `RIPCLONE_RETENTION_*`, and `RIPCLONE_REMOTE_GC_*` variables; see `docs/BACKENDS.md` and `docs/CHANGELOG.md` for the full list.
+Server-side backends are configured through environment variables: storage and retention (`RIPCLONE_S3_*`, `RIPCLONE_RETENTION_*`, `RIPCLONE_REMOTE_GC_*`), the metadata store (`RIPCLONE_METADATA*`), and the build queue / farm-out workers (`RIPCLONE_QUEUE*`). See `docs/BACKENDS.md` and `docs/CHANGELOG.md` for the full list.
 
 ## License
 
