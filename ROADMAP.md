@@ -127,6 +127,10 @@ Still missing:
 
 Once warm full clones are fast and predictable, move from full clonepacks per commit to append-only delta chunks for recent commits, with background compaction. This is on the roadmap but not the current focus.
 
+### 9. Trim the editable-clone build further (future)
+
+The editable full clone now publishes as soon as history is built (the archive is built separately for files mode). On a single-commit linux re-sync that publish is ~7s, and the two biggest remaining costs on that path are the reachability-bitmap write (~2.4s) and the history build. Moving the bitmap write off the editable path — it's only needed to speed history enumeration, which is small for a delta — is the next lever for pushing depth=0-editable lower.
+
 ## Storage model
 
 - **Tigris Global object storage is the source of truth.** No separate CDN.

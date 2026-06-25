@@ -2441,12 +2441,19 @@ fn assemble_variant(
     if tagged.is_empty() {
         return Ok((Vec::new(), None, String::new()));
     }
-    let mut buf: Vec<u8> = Vec::new();
+    // Fetch every pack's idx concurrently — there can be 100+ of them (each a local
+    // read or an object-store GET), so a serial loop dominates the assemble. Results
+    // stay in order, so the concatenation + offsets below are deterministic.
+    use rayon::prelude::*;
+    let idxs: Vec<Vec<u8>> = tagged
+        .par_iter()
+        .map(|&(pack, _)| cas.get(&pack.2).or_else(|_| storage.get(&pack.2)))
+        .collect::<Result<Vec<_>>>()?;
+    let mut buf: Vec<u8> = Vec::with_capacity(idxs.iter().map(|b| b.len()).sum());
     let mut entries = Vec::with_capacity(tagged.len());
-    for &(pack, history_only) in tagged {
+    for (&(pack, history_only), idx_bytes) in tagged.iter().zip(&idxs) {
         let offset = buf.len() as u64;
-        let idx_bytes = cas.get(&pack.2).or_else(|_| storage.get(&pack.2))?;
-        buf.extend_from_slice(&idx_bytes);
+        buf.extend_from_slice(idx_bytes);
         entries.push(crate::clonepack::PackEntry {
             pack: Some(ChunkRef {
                 hash: hash_from_hex(&pack.0)?,
@@ -2486,10 +2493,11 @@ fn assemble_midx(
     if packs.is_empty() {
         return Ok((None, String::new()));
     }
-    let mut pairs = Vec::with_capacity(packs.len());
-    for (ph, _, ih, _) in packs {
-        pairs.push((cas.get(ph)?, cas.get(ih)?));
-    }
+    use rayon::prelude::*;
+    let pairs: Vec<(Vec<u8>, Vec<u8>)> = packs
+        .par_iter()
+        .map(|(ph, _, ih, _)| Ok((cas.get(ph)?, cas.get(ih)?)))
+        .collect::<Result<Vec<_>>>()?;
     let midx = crate::git::build_multi_pack_index_bytes(&pairs)?;
     let len = midx.len() as u64;
     let hash = cas.put(&midx)?;
