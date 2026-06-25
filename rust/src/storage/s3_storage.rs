@@ -550,6 +550,34 @@ impl S3Storage {
         Ok(())
     }
 
+    /// Conditional write for compare-and-swap callers (the ref store's ETag
+    /// ordering). Like [`put_object`](Self::put_object) but a precondition
+    /// failure (the `If-Match` ETag no longer matches because someone else
+    /// wrote first) is returned as `Ok(false)` instead of an error, so the
+    /// caller can re-read and retry. Returns `Ok(true)` when the write landed.
+    pub async fn put_object_cas(
+        &self,
+        key: &str,
+        data: &[u8],
+        if_match: Option<&str>,
+    ) -> Result<bool> {
+        let mut req = self
+            .client
+            .objects()
+            .put(&self.bucket, key)
+            .body_bytes(data.to_vec());
+        if let Some(etag) = if_match {
+            req = req
+                .if_match(etag)
+                .with_context(|| format!("set If-Match for S3 put_object_cas {key}"))?;
+        }
+        match req.send().await {
+            Ok(_) => Ok(true),
+            Err(e) if e.code() == Some("PreconditionFailed") => Ok(false),
+            Err(e) => Err(anyhow::anyhow!("S3 put_object_cas {key}: {e}")),
+        }
+    }
+
     /// List object keys under a prefix.
     pub async fn list_objects(&self, prefix: &str) -> Result<Vec<String>> {
         let mut keys = Vec::new();

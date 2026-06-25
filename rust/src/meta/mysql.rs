@@ -66,7 +66,7 @@ impl MetaDb for MysqlMeta {
         }
     }
 
-    async fn upsert(
+    async fn save_ordered(
         &self,
         repo_key: &str,
         branch: &str,
@@ -74,13 +74,25 @@ impl MetaDb for MysqlMeta {
         commit_id: &str,
         synced_at: Option<i64>,
     ) -> Result<()> {
+        // MySQL's ON DUPLICATE KEY UPDATE has no WHERE clause, so the ordering
+        // decision is computed once into the session variable `@ripl` in the
+        // first (data) assignment — while `commit_id`/`synced_at` still hold
+        // their original values — then reused for the remaining columns. The
+        // assignments evaluate left-to-right, so `data` must come first or the
+        // condition would read already-overwritten columns. `@ripl` is set and
+        // read within this one statement, so the connection pool can't leak it
+        // across calls. Policy is identical to the sqlite adapter's WHERE.
         sqlx::query(
             "INSERT INTO refs (repo_key, branch, commit_id, synced_at, data)
              VALUES (?, ?, ?, ?, ?)
              ON DUPLICATE KEY UPDATE
-                 commit_id = VALUES(commit_id),
-                 synced_at = VALUES(synced_at),
-                 data = VALUES(data)",
+                 data = IF(@ripl := (VALUES(commit_id) = commit_id
+                                     OR synced_at IS NULL
+                                     OR VALUES(synced_at) IS NULL
+                                     OR VALUES(synced_at) >= synced_at),
+                           VALUES(data), data),
+                 commit_id = IF(@ripl, VALUES(commit_id), commit_id),
+                 synced_at = IF(@ripl, VALUES(synced_at), synced_at)",
         )
         .bind(repo_key)
         .bind(branch)
@@ -89,7 +101,7 @@ impl MetaDb for MysqlMeta {
         .bind(data)
         .execute(&self.pool)
         .await
-        .context("upsert ref")?;
+        .context("save_ordered ref")?;
         Ok(())
     }
 
