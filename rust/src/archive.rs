@@ -1197,7 +1197,11 @@ mod tests {
     /// Incremental archive: identical commit reuses every frame; a small edit at
     /// the end of the stream reuses all earlier (unchanged) frames and rebuilds
     /// only the affected one. Verifies the CDC reuse mechanic.
+    ///
+    /// Ignored by default because it CDC-processes ~20 MiB of incompressible
+    /// data in debug mode. Run with `cargo test --release -- --ignored`.
     #[test]
+    #[ignore = "slow: CDC heavy, run in release"]
     fn incremental_archive_reuses_unchanged_frames() {
         use std::collections::HashMap;
         let pr = |len: usize, seed: u8| {
@@ -1304,8 +1308,13 @@ mod tests {
 
     /// ~3 MB of well-mixed (CDC-cuttable) bytes per file (splitmix64).
     fn mix_blob(seed: u64) -> Vec<u8> {
-        (0..3_000_000u64)
+        // 3 MiB pseudo-random bytes. With production CDC settings (avg 4 MiB,
+        // max 16 MiB) ten of these gives the bounded-archive test enough data to
+        // span several frames.
+        const MIX_BLOB_SIZE: usize = 3_000_000;
+        (0..MIX_BLOB_SIZE)
             .map(|i| {
+                let i = i as u64;
                 let mut z = (seed << 40)
                     .wrapping_add(i)
                     .wrapping_add(0x9E37_79B9_7F4A_7C15);
@@ -1385,60 +1394,88 @@ mod tests {
     /// The bounded archive (read only the changed middle) must be byte-identical to
     /// the full incremental build across edit positions and shapes — a wrong
     /// prefix/suffix reuse or a bad offset shift would diverge here.
+    ///
+    /// Ignored by default: it builds ~30 MiB of archives nine times. Run with
+    /// `cargo test --release -- --ignored`; the scenarios run in parallel.
     #[test]
+    #[ignore = "slow: builds ~30 MiB of archives nine times, run in release"]
     fn bounded_archive_matches_incremental() {
         let base: Vec<(String, Vec<u8>)> = (0..10)
             .map(|s| (format!("f{s:02}.bin"), mix_blob(s)))
             .collect();
 
-        // Same-size edit in the middle (unchanged prefix + suffix).
-        let mut middle = base.clone();
-        middle[5].1 = mix_blob(900);
-        assert_bounded_matches(&base, &middle);
+        let scenarios: Vec<
+            Box<dyn Fn(&[(String, Vec<u8>)]) -> Vec<(String, Vec<u8>)> + Send + Sync>,
+        > = vec![
+            Box::new(|base| {
+                // Same-size edit in the middle (unchanged prefix + suffix).
+                let mut middle = base.to_vec();
+                middle[5].1 = mix_blob(900);
+                middle
+            }),
+            Box::new(|base| {
+                // Edit at the head (large unchanged suffix to reuse).
+                let mut head = base.to_vec();
+                head[0].1 = mix_blob(901);
+                head
+            }),
+            Box::new(|base| {
+                // Edit at the tail (large unchanged prefix to reuse).
+                let mut tail = base.to_vec();
+                tail[9].1 = mix_blob(902);
+                tail
+            }),
+            Box::new(|base| {
+                // Size-growing edit in the middle (shifts the suffix by a positive delta).
+                let mut grow = base.to_vec();
+                grow[5].1 = {
+                    let mut v = mix_blob(903);
+                    v.extend(mix_blob(904));
+                    v
+                };
+                grow
+            }),
+            Box::new(|base| {
+                // Deletion in the middle (shifts the suffix by a negative delta).
+                let mut del = base.to_vec();
+                del.remove(5);
+                del
+            }),
+            Box::new(|base| {
+                // Addition in the middle (new file between unchanged neighbors).
+                let mut add = base.to_vec();
+                add.insert(5, ("f05b.bin".to_string(), mix_blob(905)));
+                add
+            }),
+            Box::new(|base| {
+                // Spread edits at several positions (multiple dirty regions with
+                // unchanged frames reused between them).
+                let mut spread = base.to_vec();
+                spread[1].1 = mix_blob(906);
+                spread[5].1 = mix_blob(907);
+                spread[8].1 = mix_blob(908);
+                spread
+            }),
+            Box::new(|base| {
+                // A modify + a delete + an insert at once.
+                let mut mixed = base.to_vec();
+                mixed[2].1 = mix_blob(909);
+                mixed.remove(6);
+                mixed.insert(4, ("f03b.bin".to_string(), mix_blob(910)));
+                mixed
+            }),
+        ];
 
-        // Edit at the head (large unchanged suffix to reuse).
-        let mut head = base.clone();
-        head[0].1 = mix_blob(901);
-        assert_bounded_matches(&base, &head);
-
-        // Edit at the tail (large unchanged prefix to reuse).
-        let mut tail = base.clone();
-        tail[9].1 = mix_blob(902);
-        assert_bounded_matches(&base, &tail);
-
-        // Size-growing edit in the middle (shifts the suffix by a positive delta).
-        let mut grow = base.clone();
-        grow[5].1 = {
-            let mut v = mix_blob(903);
-            v.extend(mix_blob(904));
-            v
-        };
-        assert_bounded_matches(&base, &grow);
-
-        // Deletion in the middle (shifts the suffix by a negative delta).
-        let mut del = base.clone();
-        del.remove(5);
-        assert_bounded_matches(&base, &del);
-
-        // Addition in the middle (new file between unchanged neighbors).
-        let mut add = base.clone();
-        add.insert(5, ("f05b.bin".to_string(), mix_blob(905)));
-        assert_bounded_matches(&base, &add);
-
-        // Spread edits at several positions (multiple dirty regions with unchanged
-        // frames reused between them).
-        let mut spread = base.clone();
-        spread[1].1 = mix_blob(906);
-        spread[5].1 = mix_blob(907);
-        spread[8].1 = mix_blob(908);
-        assert_bounded_matches(&base, &spread);
-
-        // A modify + a delete + an insert at once.
-        let mut mixed = base.clone();
-        mixed[2].1 = mix_blob(909);
-        mixed.remove(6);
-        mixed.insert(4, ("f03b.bin".to_string(), mix_blob(910)));
-        assert_bounded_matches(&base, &mixed);
+        std::thread::scope(|scope| {
+            let base = &base;
+            let mut handles = Vec::with_capacity(scenarios.len());
+            for scenario in scenarios {
+                handles.push(scope.spawn(move || assert_bounded_matches(base, &scenario(base))));
+            }
+            for h in handles {
+                h.join().expect("bounded scenario panicked");
+            }
+        });
     }
 
     /// Commit raw-byte paths (so we can use a non-UTF8 filename).
@@ -1577,7 +1614,10 @@ mod tests {
         assert_eq!(blobs[0].2, 0o100644);
     }
 
+    /// Ignored by default: it builds ~32 MiB of archives. Run with
+    /// `cargo test --release -- --ignored`.
     #[test]
+    #[ignore = "slow: builds ~32 MiB of archives, run in release"]
     fn archive_chunks_respect_target_size() {
         let pseudo_random = |len: usize| {
             (0..len)
@@ -1594,10 +1634,8 @@ mod tests {
         let files_ref: Vec<(&str, &[u8])> = files.iter().map(|(p, b)| (*p, b.as_slice())).collect();
         let (tmp, commit) = commit_files(&files_ref);
         let builder = ArchiveBuilder::new(tmp.path());
-        let (_metadata, chunks, _stats) = builder
-            .build_chunks(&commit, 6, None, 8 * 1024 * 1024)
-            .unwrap();
         let target = 8 * 1024 * 1024;
+        let (_metadata, chunks, _stats) = builder.build_chunks(&commit, 6, None, target).unwrap();
         for (i, chunk) in chunks.iter().enumerate() {
             assert!(
                 chunk.len() as u64 <= target,
@@ -1638,7 +1676,10 @@ mod tests {
     /// Round-trip across multiple frames: content larger than FRAME_MAX is split
     /// into several frames, compressed in parallel, then must extract byte-exact.
     /// Guards the parallel-compression + chunk-assembly refactor.
+    /// Ignored by default: it builds ~21 MiB of archives. Run with
+    /// `cargo test --release -- --ignored`.
     #[test]
+    #[ignore = "slow: builds ~21 MiB of archives, run in release"]
     fn archive_roundtrip_multiframe() {
         let pr = |len: usize, seed: u8| {
             (0..len)
@@ -1677,7 +1718,10 @@ mod tests {
     /// slice-based chunker over the same path-ordered worktree. This is what lets
     /// us drop the whole-worktree buffer without invalidating already-stored
     /// archives or per-frame reuse keys.
+    /// Ignored by default: it CDC-processes ~27 MiB of data. Run with
+    /// `cargo test --release -- --ignored`.
     #[test]
+    #[ignore = "slow: CDC-processes ~27 MiB, run in release"]
     fn stream_cdc_bounds_match_slice_cdc() {
         // High-entropy xorshift bytes so CDC finds real content-defined cut
         // points (not just max-size cuts) — that's what makes the streaming vs.
