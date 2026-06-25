@@ -27,11 +27,11 @@ ripclone is one answer. The goal: get a `git clone` as close as possible to down
 
 ## Clone
 
-ripclone does the slow parts of a clone — negotiation, indexing, the tree walk — once on the server, ahead of time. By the time you clone, the client just downloads the finished pieces and writes them. You pick how much you want with `--mode`:
+On every push, ripclone prebuilds a **clonepack** for `HEAD` — a set of files in object storage laid out so a clone has almost nothing left to do but download and write. Pick how much you pull with `--mode`:
 
-`--mode=editable` (the default) is a real git repo, the same as `git clone --depth=1`: `git diff`/`show`/`log` and commits all work. `--depth N` or `--depth 0` pull more history.
+`--mode=editable` (the default) installs a git pack of `HEAD`'s objects — a real repo, the same as `git clone --depth=1`, where `git diff`/`show`/`log` and commits all work. `--depth N` or `--depth 0` pull more history.
 
-`--mode=files` is the fastest path to just a working tree, for agents and CI that only need the files — no git object database, so `git diff`/`show` don't work.
+`--mode=files` writes the working tree straight from a zstd archive — the fastest path when you only need the files (agents, CI). No git object database, so `git diff`/`show` don't work.
 
 See **[Design](docs/DESIGN.md)** for how a clonepack is built and synced.
 
