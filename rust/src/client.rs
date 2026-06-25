@@ -50,6 +50,14 @@ pub fn is_stale_signed_url(err: &anyhow::Error) -> bool {
     err.chain().any(|e| e.is::<StaleSignedUrl>())
 }
 
+/// The clone driver's retry decision, factored out so it is unit-testable: retry
+/// the next attempt only when this one failed with a stale signed URL and we are
+/// still under `max_retries`. `attempt` is the number of retries already taken
+/// (0 on the first failure).
+pub fn should_retry_stale(attempt: u32, max_retries: u32, err: &anyhow::Error) -> bool {
+    attempt < max_retries && is_stale_signed_url(err)
+}
+
 /// Turn a non-success HTTP response into a clear, actionable error. Parses the
 /// `{ "error", "code" }` body the gateway returns and appends a next-step hint
 /// keyed on status/code. Surfaces an upgrade nudge from `X-Ripclone-Upgrade`.
@@ -2614,5 +2622,23 @@ mod tests {
     fn ordinary_errors_are_not_stale() {
         let err = anyhow::anyhow!("ref lookup failed: 404").context("clone");
         assert!(!is_stale_signed_url(&err));
+    }
+
+    #[test]
+    fn retry_decision_retries_stale_until_the_cap_then_stops() {
+        let stale = anyhow::Error::new(StaleSignedUrl).context("fetch chunk");
+        // The clone driver takes up to 2 retries (attempts 0 and 1), then stops.
+        assert!(should_retry_stale(0, 2, &stale), "first failure retries");
+        assert!(should_retry_stale(1, 2, &stale), "second failure retries");
+        assert!(
+            !should_retry_stale(2, 2, &stale),
+            "stops once the retry cap is reached"
+        );
+    }
+
+    #[test]
+    fn retry_decision_never_retries_a_non_stale_error() {
+        let other = anyhow::anyhow!("repo not found");
+        assert!(!should_retry_stale(0, 2, &other));
     }
 }

@@ -864,8 +864,11 @@ async fn main() -> Result<()> {
                 match res {
                     Ok(()) => break,
                     Err(e)
-                        if stale_retries < STALE_URL_MAX_RETRIES
-                            && ripclone::client::is_stale_signed_url(&e) =>
+                        if ripclone::client::should_retry_stale(
+                            stale_retries,
+                            STALE_URL_MAX_RETRIES,
+                            &e,
+                        ) =>
                     {
                         stale_retries += 1;
                         eprintln!(
