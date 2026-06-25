@@ -27,9 +27,9 @@ impl MysqlMeta {
 #[async_trait]
 impl MetaDb for MysqlMeta {
     async fn init(&self) -> Result<()> {
-        // VARCHAR(768) keeps the composite PK under MySQL's 3072-byte InnoDB key
-        // limit (768 * utf8mb4's 4 bytes = 3072) while comfortably fitting any
-        // real repo key.
+        // VARCHAR sizes keep the composite (repo_key, branch) PK under MySQL's
+        // 3072-byte InnoDB key limit: (512 + 255) * 4 bytes for utf8mb4 = 3068,
+        // while comfortably fitting any real repo key / branch.
         sqlx::raw_sql(
             "CREATE TABLE IF NOT EXISTS refs (
                 repo_key VARCHAR(512) NOT NULL,

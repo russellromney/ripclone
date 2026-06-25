@@ -2042,9 +2042,27 @@ async fn sync_repo_inner(
         } else {
             // Cross-process queue: enqueue (the queue coalesces by repo/branch)
             // and poll the job's status, since the build runs in a separate
-            // ripclone-worker. Per-request upstream tokens are never sent to the
-            // worker (not persisted); warn if one was supplied so a private-repo
-            // sync that needs it isn't silently mis-built.
+            // ripclone-worker.
+            //
+            // The rev override is not carried across the queue (not persisted; the
+            // worker builds the branch tip), so honoring `?rev=` here would build
+            // the wrong commit and then fail to find the `branch#atrev` ref.
+            // Reject it explicitly rather than mis-build. Use the local queue for
+            // rev-targeted builds.
+            if at_rev.is_some() {
+                return (
+                    StatusCode::NOT_IMPLEMENTED,
+                    Json(ErrorResponse {
+                        error: "rev override (?rev=) is not supported on the cross-process \
+                                queue; use the local queue (RIPCLONE_QUEUE=local)"
+                            .to_string(),
+                    }),
+                )
+                    .into_response();
+            }
+            // Per-request upstream tokens are never sent to the worker (not
+            // persisted); warn if one was supplied so a private-repo sync that
+            // needs it isn't silently mis-built.
             if request_token.is_some() {
                 warn!(
                     "per-request upstream token is ignored by the cross-process queue for {}; \
@@ -2052,7 +2070,6 @@ async fn sync_repo_inner(
                     repo_id.storage_key()
                 );
             }
-            state.metrics.record_build_queued();
             let job = BuildJob {
                 repo_id: repo_id.clone(),
                 branch: branch.clone(),
@@ -2072,6 +2089,10 @@ async fn sync_repo_inner(
                         .into_response();
                 }
             };
+            // Only count a genuinely new job (not a coalesced duplicate).
+            if enq.outcome == EnqueueOutcome::Enqueued {
+                state.metrics.record_build_queued();
+            }
             if enq.outcome == EnqueueOutcome::Full {
                 state.metrics.record_build_rejected();
                 state.metrics.record_error();
@@ -2115,7 +2136,10 @@ async fn sync_repo_inner(
                         invalidate_ref_response_cache(&state, &repo_id, &effective_branch);
                         let load_key = ref_store_key(&effective_branch, at_rev.as_deref());
                         match state.ref_store.load_branch(&repo_id, &load_key).await {
-                            Ok(Some(info)) => {
+                            // Guard on a non-empty commit: a HEAD row can exist as
+                            // a build_status placeholder (empty commit). Never
+                            // return that as a successful ref.
+                            Ok(Some(info)) if !info.commit.is_empty() => {
                                 state.metrics.record_sync(start.elapsed());
                                 let resp = ref_response(
                                     &repo_id,
@@ -4739,8 +4763,24 @@ pub async fn process_build_job(state: &ServerState, job: &BuildJob) -> Result<()
         _ => branch.clone(),
     };
     match &result {
-        Ok(_) => {
+        Ok(info) => {
             state.metrics.record_build_completed(start.elapsed());
+            // Cross-process resolution: a server that didn't run this build has no
+            // local mirror, so it cannot map a requested `HEAD` to the concrete
+            // default branch `do_sync` stored the ref under. Persist the real ref
+            // under the literal `HEAD` key too (plain HEAD request, no rev
+            // override) so any process can resolve `/sync HEAD` from the shared
+            // metadata store alone. The `HEAD` row already exists (build_status
+            // placeholder) and already shows in `list_branches`, so this only
+            // fills it with real data. `update_build_status` below then stamps
+            // `done` onto it.
+            if branch == "HEAD"
+                && at_rev.is_none()
+                && effective_branch != "HEAD"
+                && let Err(e) = state.ref_store.save_branch(repo_id, "HEAD", info).await
+            {
+                warn!("failed to write HEAD ref alias for {}: {e}", repo_id.storage_key());
+            }
             let _ = update_build_status(state, repo_id, "done").await;
             // A successful sync marks the mirror fresh so a following resolve
             // doesn't re-fetch. Stamp both the concrete branch and the original
