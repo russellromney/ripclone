@@ -12,14 +12,15 @@ primary_region = 'iad'
   force_https = true
   auto_stop_machines = true
   auto_start_machines = true
-  # Keep one machine warm: clone latency is the product, so we eat the small
-  # always-on cost to avoid cold-start on resolve.
-  min_machines_running = 1
+  # Dev: scale to zero when idle to keep cost low. First request after idle eats
+  # a cold start (machine boot + server start). Revisit when the webhook-driven
+  # sync worker lands — a background build can be stopped mid-flight at min=0.
+  min_machines_running = 0
   processes = ['app']
 
 [[vm]]
-  size = 'performance-8x'
-  memory = '16gb'
+  size = 'shared-cpu-4x'
+  memory = '4gb'
 
 [env]
   # Git pack-objects creates temp packs in TMPDIR and renames them into the

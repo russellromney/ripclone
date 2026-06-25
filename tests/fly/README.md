@@ -14,10 +14,22 @@ production cloud. Kept here (rather than the repo root) to keep root clean.
 ## Deploying
 
 The build context is the **repo root** (the Dockerfiles `COPY rust/` and
-`scripts/`), so run `fly deploy` from the repo root and point it at the config:
+`scripts/`), so deploys must run from the repo root with the Dockerfile given by
+a root-relative path. Use the helper, which handles this for every app:
 
 ```bash
-fly deploy --config tests/fly/fly.server-dev.toml
+scripts/fly_deploy.sh server-dev      # ripclone-server-dev
+scripts/fly_deploy.sh client-dev      # ripclone-client-dev
+scripts/fly_deploy.sh client          # ripclone-client-test
+scripts/fly_deploy.sh prod            # ripclone
+# extra flyctl args pass through, e.g.:
+scripts/fly_deploy.sh server-dev --now
+```
+
+Equivalent raw command (run from the repo root):
+
+```bash
+fly deploy --config tests/fly/fly.server-dev.toml --dockerfile tests/fly/Dockerfile
 ```
 
 Likewise `docker compose -f tests/fly/docker-compose.yml up` builds with the
