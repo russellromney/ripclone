@@ -612,6 +612,316 @@ impl ArchiveBuilder {
         }
         Ok((all_chunks, manifest, new_chunks, frames))
     }
+
+    /// Like [`build_into_cas_incremental`], but reads only the changed region of
+    /// the worktree instead of all of it. It compares the new tree against
+    /// `prev_commit`'s tree by `(path, oid)`, reuses the prior frames for the
+    /// unchanged prefix and suffix (content-defined chunking cuts the same bytes
+    /// the same way, so an unchanged region reproduces the same frames), and
+    /// re-chunks only the changed middle. Unchanged files take their content hash
+    /// from `prev_files`. Returns the same tuple as the full build.
+    ///
+    /// Falls back to the full [`build_into_cas_incremental`] whenever the change is
+    /// spread out (little prefix/suffix to reuse), the prior frames don't line up
+    /// with `prev_commit`, or the middle would be too large — so the result is
+    /// always a correct, complete archive.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_into_cas_bounded(
+        &self,
+        commit: &str,
+        cas: &Cas,
+        level: i32,
+        dictionary: Option<&[u8]>,
+        prev_frames: &[crate::ArchiveFrame],
+        prev_files: &[FileEntry],
+        prev_commit: &str,
+    ) -> Result<(
+        Vec<String>,
+        MetadataChunk,
+        Vec<String>,
+        Vec<crate::ArchiveFrame>,
+    )> {
+        let prev_map: std::collections::HashMap<String, (String, u64)> = prev_frames
+            .iter()
+            .map(|f| (f.raw_hash.clone(), (f.chunk_hash.clone(), f.compressed_len)))
+            .collect();
+        let full = || self.build_into_cas_incremental(commit, cas, level, dictionary, &prev_map);
+
+        // Largest changed middle we'll read into memory; above this the full build
+        // is both simpler and not much slower.
+        let max_middle = std::env::var("RIPCLONE_ARCHIVE_BOUNDED_MAX_BYTES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(256 * 1024 * 1024usize);
+
+        if prev_frames.is_empty() || !self.mirror.exists() {
+            return full();
+        }
+        let repo = git2::Repository::open_bare(&self.mirror)
+            .with_context(|| format!("open bare repo {}", self.mirror.display()))?;
+        let new_tree = repo.revparse_single(commit)?.peel_to_commit()?.tree()?;
+        let prev_tree = match repo
+            .revparse_single(prev_commit)
+            .and_then(|o| o.peel_to_commit())
+            .and_then(|c| c.tree())
+        {
+            Ok(t) => t,
+            Err(_) => return full(), // prev commit pruned — can't bound the read
+        };
+
+        let mut new_blobs: Vec<(Vec<u8>, git2::Oid, u32)> = Vec::new();
+        collect_blobs_raw(&repo, &new_tree, &[], &mut new_blobs).context("walk new tree")?;
+        let mut old_blobs: Vec<(Vec<u8>, git2::Oid, u32)> = Vec::new();
+        collect_blobs_raw(&repo, &prev_tree, &[], &mut old_blobs).context("walk prev tree")?;
+
+        let mut oids: Vec<String> = Vec::with_capacity(new_blobs.len() + old_blobs.len());
+        oids.extend(new_blobs.iter().map(|(_, o, _)| o.to_string()));
+        oids.extend(old_blobs.iter().map(|(_, o, _)| o.to_string()));
+        let sizes = crate::git::object_sizes(&self.mirror, &oids)?;
+        let size_of = |oid: &git2::Oid| sizes.get(&oid.to_string()).copied().unwrap_or(0) as usize;
+
+        // Byte offset of every file in each path-ordered stream.
+        let mut new_starts = Vec::with_capacity(new_blobs.len());
+        let mut acc = 0usize;
+        for (_, oid, _) in &new_blobs {
+            new_starts.push(acc);
+            acc += size_of(oid);
+        }
+        let new_total = acc;
+        let mut old_starts = Vec::with_capacity(old_blobs.len());
+        let mut oacc = 0usize;
+        for (_, oid, _) in &old_blobs {
+            old_starts.push(oacc);
+            oacc += size_of(oid);
+        }
+        let old_total = oacc;
+
+        // Empty trees are cheap; let the full build handle them.
+        if new_total == 0 || old_total == 0 {
+            return full();
+        }
+        // The prior frames must cover exactly the prior stream, or they don't match
+        // prev_commit and we can't trust them.
+        let prior_raw_total: usize = prev_frames.iter().map(|f| f.raw_len as usize).sum();
+        if prior_raw_total != old_total {
+            return full();
+        }
+
+        // Walk both path-ordered file lists together. Files present in both with the
+        // same oid are unchanged; runs of them form "unchanged segments" with the
+        // old byte range, the new byte range, and the constant offset shift between
+        // them. A modified/added/deleted file is changed and breaks the run.
+        let mut new_changed = vec![false; new_blobs.len()];
+        let mut segs: Vec<(usize, usize, i64)> = Vec::new(); // (old_start, old_end, shift)
+        let mut run: Option<(usize, usize, usize)> = None; // (old_start, new_start, len)
+        let mut i = 0usize;
+        let mut j = 0usize;
+        loop {
+            let ord = match (old_blobs.get(i), new_blobs.get(j)) {
+                (Some(o), Some(n)) => o.0.cmp(&n.0),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => break,
+            };
+            let mut flush = false;
+            match ord {
+                std::cmp::Ordering::Equal => {
+                    if old_blobs[i].1 == new_blobs[j].1 {
+                        let sz = size_of(&old_blobs[i].1);
+                        match &mut run {
+                            Some((_, _, len)) => *len += sz,
+                            None => run = Some((old_starts[i], new_starts[j], sz)),
+                        }
+                    } else {
+                        new_changed[j] = true;
+                        flush = true;
+                    }
+                    i += 1;
+                    j += 1;
+                }
+                std::cmp::Ordering::Less => {
+                    flush = true;
+                    i += 1;
+                }
+                std::cmp::Ordering::Greater => {
+                    new_changed[j] = true;
+                    flush = true;
+                    j += 1;
+                }
+            }
+            if flush
+                && let Some((o0, n0, len)) = run.take()
+                && len > 0
+            {
+                segs.push((o0, o0 + len, n0 as i64 - o0 as i64));
+            }
+        }
+        if let Some((o0, n0, len)) = run.take()
+            && len > 0
+        {
+            segs.push((o0, o0 + len, n0 as i64 - o0 as i64));
+        }
+
+        // Prior frame boundaries (prior-stream bytes).
+        let mut prior_starts = Vec::with_capacity(prev_frames.len() + 1);
+        let mut s = 0usize;
+        for f in prev_frames {
+            prior_starts.push(s);
+            s += f.raw_len as usize;
+        }
+        prior_starts.push(s); // == old_total
+
+        // A prior frame is reusable when it sits wholly inside an unchanged segment
+        // and starts far enough into it that content-defined chunking has re-synced
+        // (the segment start, or at least one max-chunk past a change). Its new byte
+        // range is the old range shifted by the segment's offset.
+        let mut reused: Vec<(usize, usize, usize)> = Vec::new(); // (new_start, new_end, frame idx)
+        let mut seg_hint = 0usize;
+        for (k, f) in prev_frames.iter().enumerate() {
+            let fs = prior_starts[k];
+            let fe = prior_starts[k + 1];
+            while seg_hint < segs.len() && segs[seg_hint].1 <= fs {
+                seg_hint += 1;
+            }
+            if let Some(&(o0, o1, shift)) = segs.get(seg_hint)
+                && o0 <= fs
+                && fe <= o1
+                && (o0 == 0 || fs >= o0 + CDC_MAX)
+            {
+                let ns = (fs as i64 + shift) as usize;
+                reused.push((ns, ns + f.raw_len as usize, k));
+            }
+        }
+
+        // No reuse, or the bytes we'd have to re-read are too large to be worth it.
+        let reused_bytes: usize = reused.iter().map(|&(s, e, _)| e - s).sum();
+        if reused.is_empty() || new_total - reused_bytes > max_middle {
+            return full();
+        }
+
+        // Walk the reused frames in new-stream order, re-chunking each gap between
+        // them (the changed regions) from freshly read bytes.
+        let mut all_chunks: Vec<String> = Vec::new();
+        let mut new_chunks: Vec<String> = Vec::new();
+        let mut frames: Vec<crate::ArchiveFrame> = Vec::new();
+        let mut bounds: Vec<(usize, usize)> = Vec::new();
+        let fill_gap = |g0: usize,
+                        g1: usize,
+                        all: &mut Vec<String>,
+                        news: &mut Vec<String>,
+                        frames: &mut Vec<crate::ArchiveFrame>,
+                        bounds: &mut Vec<(usize, usize)>|
+         -> Result<()> {
+            if g1 <= g0 {
+                return Ok(());
+            }
+            let mut buf = Vec::with_capacity(g1 - g0);
+            for (idx, (_, oid, _)) in new_blobs.iter().enumerate() {
+                let bs = new_starts[idx];
+                let be = bs + size_of(oid);
+                if be <= g0 || bs >= g1 {
+                    continue;
+                }
+                let content = repo.find_blob(*oid)?.content().to_vec();
+                let lo = g0.max(bs) - bs;
+                let hi = g1.min(be) - bs;
+                buf.extend_from_slice(&content[lo..hi]);
+            }
+            for c in fastcdc::v2020::FastCDC::new(&buf, CDC_MIN, CDC_AVG, CDC_MAX) {
+                let raw = &buf[c.offset..c.offset + c.length];
+                let raw_hash = crate::cas::hash(raw);
+                let (chunk_hash, compressed_len) = match prev_map.get(&raw_hash) {
+                    Some((ch, cl)) => (ch.clone(), *cl),
+                    None => {
+                        let comp = compress_frame(raw, level, dictionary)?;
+                        let ch = cas.put(&comp)?;
+                        news.push(ch.clone());
+                        (ch, comp.len() as u64)
+                    }
+                };
+                all.push(chunk_hash.clone());
+                bounds.push((g0 + c.offset, g0 + c.offset + c.length));
+                frames.push(crate::ArchiveFrame {
+                    raw_hash,
+                    chunk_hash,
+                    compressed_len,
+                    raw_len: c.length as u64,
+                });
+            }
+            Ok(())
+        };
+
+        let mut pos = 0usize;
+        for &(ns, ne, k) in &reused {
+            fill_gap(
+                pos,
+                ns,
+                &mut all_chunks,
+                &mut new_chunks,
+                &mut frames,
+                &mut bounds,
+            )?;
+            let f = &prev_frames[k];
+            all_chunks.push(f.chunk_hash.clone());
+            bounds.push((ns, ne));
+            frames.push(f.clone());
+            pos = ne;
+        }
+        fill_gap(
+            pos,
+            new_total,
+            &mut all_chunks,
+            &mut new_chunks,
+            &mut frames,
+            &mut bounds,
+        )?;
+
+        // The frames must tile the whole new stream contiguously, or something in
+        // the reuse math is off — rebuild fully rather than ship a wrong archive.
+        let tiled = bounds.first().map(|b| b.0) == Some(0)
+            && bounds.last().map(|b| b.1) == Some(new_total)
+            && bounds.windows(2).all(|w| w[0].1 == w[1].0);
+        if !tiled {
+            return full();
+        }
+
+        // Files table: unchanged files keep their prior content hash; changed files
+        // are read and hashed. Fragments come from the frame bounds.
+        let prev_sha: std::collections::HashMap<&[u8], &[u8]> = prev_files
+            .iter()
+            .map(|f| (f.path.as_slice(), f.blob_sha1.as_slice()))
+            .collect();
+        let mut manifest = MetadataChunk::new();
+        let mut hint = 0usize;
+        for (idx, (path, oid, mode)) in new_blobs.iter().enumerate() {
+            let bstart = new_starts[idx];
+            let blen = size_of(oid);
+            let blob_sha1 = if !new_changed[idx]
+                && let Some(h) = prev_sha.get(path.as_slice())
+            {
+                h.to_vec()
+            } else {
+                sha1_bytes(repo.find_blob(*oid)?.content()).to_vec()
+            };
+            let (frags, new_hint) = fragments_for(&bounds, bstart, blen, hint);
+            hint = new_hint;
+            manifest.files.push(FileEntry {
+                path: path.clone(),
+                mode: *mode,
+                blob_sha1,
+                fragments: frags,
+            });
+        }
+        for (i, f) in frames.iter().enumerate() {
+            manifest.frames.push(FrameInfo {
+                chunk_index: i as u32,
+                chunk_offset: 0,
+                compressed_len: f.compressed_len as u32,
+                raw_len: f.raw_len as u32,
+            });
+        }
+        Ok((all_chunks, manifest, new_chunks, frames))
+    }
 }
 
 pub fn sha1_bytes(data: &[u8]) -> [u8; 20] {
@@ -1038,6 +1348,145 @@ mod tests {
         assert_eq!(sort(&inc), sort(&full), "incremental table != full table");
         // Sanity: the changed set drove a real diff (b modified, e added, c removed).
         assert!(changed.contains(b"b.txt".as_slice()));
+    }
+
+    /// ~3 MB of well-mixed (CDC-cuttable) bytes per file (splitmix64).
+    fn mix_blob(seed: u64) -> Vec<u8> {
+        (0..3_000_000u64)
+            .map(|i| {
+                let mut z = (seed << 40)
+                    .wrapping_add(i)
+                    .wrapping_add(0x9E37_79B9_7F4A_7C15);
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                (z ^ (z >> 31)) as u8
+            })
+            .collect()
+    }
+
+    fn as_refs(fs: &[(String, Vec<u8>)]) -> Vec<(&str, &[u8])> {
+        fs.iter().map(|(p, b)| (p.as_str(), b.as_slice())).collect()
+    }
+
+    /// Build the bounded archive at `files2` (with `files1` as the prior) and assert
+    /// it is byte-identical to the full incremental build: same per-frame chunk
+    /// hashes, frame table, and files table.
+    fn assert_bounded_matches(files1: &[(String, Vec<u8>)], files2: &[(String, Vec<u8>)]) {
+        use std::collections::HashMap;
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init_bare(tmp.path()).unwrap();
+        let cas = Cas::new(tempfile::tempdir().unwrap().path()).unwrap();
+        let builder = ArchiveBuilder::new(tmp.path());
+
+        let c1 = commit_onto(&repo, &as_refs(files1));
+        let empty: HashMap<String, (String, u64)> = HashMap::new();
+        let (_c, c1_meta, _n, c1_frames) = builder
+            .build_into_cas_incremental(&c1, &cas, 3, None, &empty)
+            .unwrap();
+        assert!(c1_frames.len() > 3, "need several frames to exercise reuse");
+
+        let c2 = commit_onto(&repo, &as_refs(files2));
+        let prev_map: HashMap<String, (String, u64)> = c1_frames
+            .iter()
+            .map(|f| (f.raw_hash.clone(), (f.chunk_hash.clone(), f.compressed_len)))
+            .collect();
+        let (inc_chunks, inc_meta, _in, inc_frames) = builder
+            .build_into_cas_incremental(&c2, &cas, 3, None, &prev_map)
+            .unwrap();
+        let (bnd_chunks, bnd_meta, _bn, bnd_frames) = builder
+            .build_into_cas_bounded(&c2, &cas, 3, None, &c1_frames, &c1_meta.files, &c1)
+            .unwrap();
+
+        assert_eq!(inc_chunks, bnd_chunks, "per-frame chunk hashes differ");
+        let fr = |fs: &[crate::ArchiveFrame]| {
+            fs.iter()
+                .map(|f| {
+                    (
+                        f.raw_hash.clone(),
+                        f.chunk_hash.clone(),
+                        f.compressed_len,
+                        f.raw_len,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(fr(&inc_frames), fr(&bnd_frames), "frame tables differ");
+        let fl = |m: &MetadataChunk| {
+            m.files
+                .iter()
+                .map(|f| {
+                    (
+                        f.path.clone(),
+                        f.mode,
+                        f.blob_sha1.clone(),
+                        f.fragments
+                            .iter()
+                            .map(|x| (x.frame_index, x.frame_offset, x.raw_len))
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(fl(&inc_meta), fl(&bnd_meta), "files tables differ");
+    }
+
+    /// The bounded archive (read only the changed middle) must be byte-identical to
+    /// the full incremental build across edit positions and shapes — a wrong
+    /// prefix/suffix reuse or a bad offset shift would diverge here.
+    #[test]
+    fn bounded_archive_matches_incremental() {
+        let base: Vec<(String, Vec<u8>)> = (0..10)
+            .map(|s| (format!("f{s:02}.bin"), mix_blob(s)))
+            .collect();
+
+        // Same-size edit in the middle (unchanged prefix + suffix).
+        let mut middle = base.clone();
+        middle[5].1 = mix_blob(900);
+        assert_bounded_matches(&base, &middle);
+
+        // Edit at the head (large unchanged suffix to reuse).
+        let mut head = base.clone();
+        head[0].1 = mix_blob(901);
+        assert_bounded_matches(&base, &head);
+
+        // Edit at the tail (large unchanged prefix to reuse).
+        let mut tail = base.clone();
+        tail[9].1 = mix_blob(902);
+        assert_bounded_matches(&base, &tail);
+
+        // Size-growing edit in the middle (shifts the suffix by a positive delta).
+        let mut grow = base.clone();
+        grow[5].1 = {
+            let mut v = mix_blob(903);
+            v.extend(mix_blob(904));
+            v
+        };
+        assert_bounded_matches(&base, &grow);
+
+        // Deletion in the middle (shifts the suffix by a negative delta).
+        let mut del = base.clone();
+        del.remove(5);
+        assert_bounded_matches(&base, &del);
+
+        // Addition in the middle (new file between unchanged neighbors).
+        let mut add = base.clone();
+        add.insert(5, ("f05b.bin".to_string(), mix_blob(905)));
+        assert_bounded_matches(&base, &add);
+
+        // Spread edits at several positions (multiple dirty regions with unchanged
+        // frames reused between them).
+        let mut spread = base.clone();
+        spread[1].1 = mix_blob(906);
+        spread[5].1 = mix_blob(907);
+        spread[8].1 = mix_blob(908);
+        assert_bounded_matches(&base, &spread);
+
+        // A modify + a delete + an insert at once.
+        let mut mixed = base.clone();
+        mixed[2].1 = mix_blob(909);
+        mixed.remove(6);
+        mixed.insert(4, ("f03b.bin".to_string(), mix_blob(910)));
+        assert_bounded_matches(&base, &mixed);
     }
 
     /// Commit raw-byte paths (so we can use a non-UTF8 filename).
