@@ -1235,6 +1235,7 @@ async fn git_credential_token(host: &str, path: &str) -> Result<Option<String>> 
     let mut stdin = child.stdin.take().context("take git credential stdin")?;
     tokio::io::AsyncWriteExt::write_all(&mut stdin, input.as_bytes()).await?;
     tokio::io::AsyncWriteExt::shutdown(&mut stdin).await.ok();
+    drop(stdin);
 
     let output = child
         .wait_with_output()
@@ -1383,7 +1384,7 @@ mod tests {
         {
             std::fs::write(
                 &fake_git,
-                "#!/bin/sh\nprintf 'password=ghp-test-token\\n'\n",
+                "#!/bin/sh\ncat >/dev/null\nprintf 'password=ghp-test-token\\n'\n",
             )
             .unwrap();
             use std::os::unix::fs::PermissionsExt;
@@ -1393,7 +1394,11 @@ mod tests {
         }
         #[cfg(not(unix))]
         {
-            std::fs::write(&fake_git, "@echo off\necho password=ghp-test-token\n").unwrap();
+            std::fs::write(
+                &fake_git,
+                "@echo off\nmore > nul\necho password=ghp-test-token\n",
+            )
+            .unwrap();
         }
 
         let old_path = std::env::var("PATH").unwrap_or_default();
