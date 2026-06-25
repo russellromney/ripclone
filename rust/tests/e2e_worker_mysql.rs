@@ -45,10 +45,16 @@ async fn worker_farm_out_mysql() {
     let (_g, c) = clone_only(&server, "acme", &good, 0, CloneMode::Editable)
         .await
         .expect("clone after mysql farm-out build");
-    assert_eq!(std::fs::read_to_string(c.join("a.txt")).unwrap(), "via-mysql\n");
+    assert_eq!(
+        std::fs::read_to_string(c.join("a.txt")).unwrap(),
+        "via-mysql\n"
+    );
     assert!(git_ok(&c, &["fsck", "--connectivity-only", "HEAD"]));
 
-    let result = server.client().sync_repo(&format!("acme/{missing}"), None).await;
+    let result = server
+        .client()
+        .sync_repo(&format!("acme/{missing}"), None)
+        .await;
     assert!(
         result.is_err(),
         "sync of a missing upstream over mysql must fail, got {result:?}"

@@ -39,12 +39,11 @@ async fn sql_queue_farm_out_sync_then_clone() {
     // the same wiring `ripclone-worker` does, just in-process for the test.
     let queue = Arc::new(backends::connect_sql_queue().await.expect("worker queue"));
     let metrics = Metrics::new();
-    let wb =
-        Backends::from_env(&server.cas_dir, &server.repo_root, &metrics)
-            .await
-            .expect("worker backends");
-    let state = ServerState::for_worker(wb, queue.clone() as JobQueueRef, metrics)
-        .expect("worker state");
+    let wb = Backends::from_env(&server.cas_dir, &server.repo_root, &metrics)
+        .await
+        .expect("worker backends");
+    let state =
+        ServerState::for_worker(wb, queue.clone() as JobQueueRef, metrics).expect("worker state");
     let worker_queue = queue.clone();
     let worker = tokio::spawn(async move {
         loop {
@@ -76,7 +75,10 @@ async fn sql_queue_farm_out_sync_then_clone() {
         .sync_repo("acme/sq", None)
         .await
         .expect("sql-queue sync");
-    assert_eq!(resp1.commit, commit1, "first sync resolves the latest commit");
+    assert_eq!(
+        resp1.commit, commit1,
+        "first sync resolves the latest commit"
+    );
 
     // Clone — this also populates the SERVER's ref caches with commit1.
     let (g0, c) = clone_only(&server, "acme", "sq", 0, CloneMode::Editable)

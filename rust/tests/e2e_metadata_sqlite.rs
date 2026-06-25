@@ -35,7 +35,10 @@ async fn metadata_sqlite_sync_then_clone() {
     assert!(!resp.commit.is_empty());
 
     // The metadata db file was created (the ref lives in SQL, not a file/S3).
-    assert!(Path::new(&db_path).exists(), "sqlite metadata db should exist");
+    assert!(
+        Path::new(&db_path).exists(),
+        "sqlite metadata db should exist"
+    );
 
     let (_g, c) = clone_only(&server, "acme", "meta", 0, CloneMode::Editable)
         .await

@@ -48,11 +48,17 @@ async fn worker_farm_out_postgres() {
     let (_g, c) = clone_only(&server, "acme", &good, 0, CloneMode::Editable)
         .await
         .expect("clone after postgres farm-out build");
-    assert_eq!(std::fs::read_to_string(c.join("a.txt")).unwrap(), "via-postgres\n");
+    assert_eq!(
+        std::fs::read_to_string(c.join("a.txt")).unwrap(),
+        "via-postgres\n"
+    );
     assert!(git_ok(&c, &["fsck", "--connectivity-only", "HEAD"]));
 
     // Negative: missing upstream → build fails → /sync errors.
-    let result = server.client().sync_repo(&format!("acme/{missing}"), None).await;
+    let result = server
+        .client()
+        .sync_repo(&format!("acme/{missing}"), None)
+        .await;
     assert!(
         result.is_err(),
         "sync of a missing upstream over postgres must fail, got {result:?}"

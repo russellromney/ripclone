@@ -39,7 +39,11 @@ impl Backends {
     /// out so the server and the worker share it. Does **not** start the
     /// retention sweep loop or migrate legacy refs — those are server-startup
     /// concerns.
-    pub async fn from_env(cas_dir: &Path, repo_root: &Path, metrics: &Arc<Metrics>) -> Result<Self> {
+    pub async fn from_env(
+        cas_dir: &Path,
+        repo_root: &Path,
+        metrics: &Arc<Metrics>,
+    ) -> Result<Self> {
         let cas = Cas::new(cas_dir)?;
         let s3_storage = S3Storage::from_env().context("initialize S3 storage from environment")?;
         let (storage, s3): (StorageRef, Option<Arc<S3Storage>>) = if let Some(s3) = s3_storage {
@@ -76,9 +80,12 @@ impl Backends {
 /// the historical default: S3 when S3 storage is configured, else file. SQL
 /// backends read `RIPCLONE_METADATA_DB_URL` (+ `RIPCLONE_METADATA_DB_TOKEN` for
 /// libsql). The result is always wrapped in `CachingRefStore`.
-async fn select_metadata(repo_root: &Path, s3: Option<&Arc<S3Storage>>) -> Result<Arc<dyn RefStore>> {
-    use crate::meta::{LibsqlMeta, MysqlMeta, PostgresMeta, SqlRefStore, SqliteMeta};
+async fn select_metadata(
+    repo_root: &Path,
+    s3: Option<&Arc<S3Storage>>,
+) -> Result<Arc<dyn RefStore>> {
     use crate::meta::MetaDb;
+    use crate::meta::{LibsqlMeta, MysqlMeta, PostgresMeta, SqlRefStore, SqliteMeta};
 
     let kind = std::env::var("RIPCLONE_METADATA").unwrap_or_default();
     // Each arm wraps its concrete store in CachingRefStore (the read cache) and
@@ -118,9 +125,8 @@ async fn select_metadata(repo_root: &Path, s3: Option<&Arc<S3Storage>>) -> Resul
                              must be a libsql:// or https:// url (local file → use sqlite)"
                         );
                     }
-                    let token = std::env::var("RIPCLONE_METADATA_DB_TOKEN").context(
-                        "RIPCLONE_METADATA=libsql requires RIPCLONE_METADATA_DB_TOKEN",
-                    )?;
+                    let token = std::env::var("RIPCLONE_METADATA_DB_TOKEN")
+                        .context("RIPCLONE_METADATA=libsql requires RIPCLONE_METADATA_DB_TOKEN")?;
                     Box::new(LibsqlMeta::connect_remote(&url, &token).await?)
                 }
                 _ => unreachable!(),

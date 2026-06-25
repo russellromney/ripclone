@@ -86,7 +86,9 @@ async fn main() -> Result<()> {
     let prune_interval = Duration::from_secs(3600);
     let mut pruned_at: Option<Instant> = None;
     loop {
-        let prune_due = pruned_at.map(|t| t.elapsed() >= prune_interval).unwrap_or(true);
+        let prune_due = pruned_at
+            .map(|t| t.elapsed() >= prune_interval)
+            .unwrap_or(true);
         if prune_due {
             match queue.prune_failed().await {
                 Ok(n) if n > 0 => info!("pruned {n} expired failed jobs"),
@@ -118,14 +120,11 @@ async fn main() -> Result<()> {
                 // job (acked as failed) instead of killing the worker and
                 // leaving the row `claimed` until the stale-reclaim timeout.
                 let st = state.clone();
-                let result = match tokio::spawn(async move {
-                    process_build_job(&st, &job).await
-                })
-                .await
-                {
-                    Ok(r) => r,
-                    Err(e) => Err(format!("build task panicked: {e}")),
-                };
+                let result =
+                    match tokio::spawn(async move { process_build_job(&st, &job).await }).await {
+                        Ok(r) => r,
+                        Err(e) => Err(format!("build task panicked: {e}")),
+                    };
                 if let Err(e) = queue.ack(job_id, result).await {
                     error!("failed to ack job {job_id}: {e}");
                 }

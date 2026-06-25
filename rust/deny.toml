@@ -12,10 +12,31 @@
 version = 2
 # A yanked crate in the lockfile is a problem worth failing on.
 yanked = "deny"
-# Triaged-but-unfixable advisories go here, each with a dated reason:
-# ignore = [
-#   { id = "RUSTSEC-0000-0000", reason = "..." },
-# ]
+# Triaged-but-unfixable advisories go here, each with a dated reason.
+# All of the below are transitive deps of the #24 SQL backends (sqlx-mysql,
+# libsql remote/TLS). None has an upstream fix we can reach today: rsa has no
+# patched release, and the rustls-webpki issues are pinned by libsql's
+# hyper-rustls 0.25 -> rustls 0.22 -> webpki 0.102 stack (the fixes are only in
+# webpki 0.103, which rustls 0.22 rejects; no libsql release, incl. 0.10-pre,
+# has moved to rustls 0.23). Triaged 2026-06-25; revisit when libsql adopts
+# rustls 0.23.
+ignore = [
+  # rsa (Marvin Attack): timing sidechannel in RSA *decryption*. Via sqlx-mysql.
+  # ripclone is the MySQL *client* (public-key encryption side); the vulnerable
+  # private-key decryption runs on the server. No fixed release upstream.
+  { id = "RUSTSEC-2023-0071", reason = "rsa via sqlx-mysql; client does encryption, not the vulnerable decryption; no upstream fix" },
+
+  # rustls-pemfile: unmaintained (folded into rustls), not a vulnerability. Via libsql.
+  { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained (no CVE); transitive via libsql; no separate fix" },
+
+  # rustls-webpki, all via libsql's pinned rustls 0.22. These gate on optional
+  # cert-validation features (CRL revocation, name constraints) that our standard
+  # public-CA TLS to a remote libSQL/Turso endpoint does not exercise.
+  { id = "RUSTSEC-2026-0049", reason = "webpki CRL distribution-point matching; CRL revocation checking not used; via libsql rustls 0.22" },
+  { id = "RUSTSEC-2026-0098", reason = "webpki URI name-constraint accept; name-constrained CAs not in our trust path; via libsql rustls 0.22" },
+  { id = "RUSTSEC-2026-0099", reason = "webpki wildcard name-constraint accept; name-constrained CAs not in our trust path; via libsql rustls 0.22" },
+  { id = "RUSTSEC-2026-0104", reason = "webpki CRL-parse panic (DoS); reachable only when parsing attacker CRLs, which we don't; via libsql rustls 0.22" },
+]
 
 [bans]
 # Duplicate versions of a crate are a warning, not a hard failure — they're
