@@ -198,28 +198,34 @@ Supported `kind` values: `github`, `gitlab`, `bitbucket`, `gitea`, `generic`. A 
 ## Architecture
 
 ```
-┌─────────────────┐
-│  push / CI hook │  triggers a sync on every push (token-authenticated)
-└────────┬────────┘
-         │
+┌──────────────────┐
+│  push / CI hook  │  POST /sync
+└────────┬─────────┘
          ▼
-┌─────────────────┐
-│ ripclone-server │  queues builds, serves artifacts, resolves refs
-│   (this repo)   │
-└────────┬────────┘
-         │
-    ┌────┴────┐
-    ▼         ▼
-Object storage   Local disk
-(source of truth)  (hot cache)
+┌──────────────────┐   enqueue   ┌──────────────────┐
+│ ripclone-server  │ ──────────▶ │    sync queue    │
+│ resolve · serve  │             │ in-process / SQL │
+└────────┬─────────┘             └────────┬─────────┘
+         │ serves                  claim  │
+         ▼                                ▼
+      clients               ┌──────────────────┐
+                            │ ripclone-worker  │ ×N
+                            │  fetch · build   │
+                            └────────┬─────────┘
+                                     ▼ writes
+                       ┌────────────────────────────┐
+                       │  artifact store · metadata │
+                       │  object/local · SQLx/file  │
+                       └────────────────────────────┘
 ```
 
-- **Object storage** holds all the artifacts. A background job cleans up objects nothing points at anymore (after a grace period, so it never deletes an upload still in flight).
-- **Local disk** is a hot cache that gets trimmed as it fills up.
-- **Clients** download the pieces, decompress, and write files straight to disk.
-- **Your git host stays the source of truth** for repos, refs, permissions, and writes.
-- **Rate limiting** keeps public endpoints from being abused.
-- **Builds run in-process by default**, or can be farmed out to standalone `ripclone-worker` processes via a pluggable queue (SQLite/Postgres/MySQL/libsql). Ref metadata can live in files, S3, or a SQL database — see [`docs/BACKENDS.md`](docs/BACKENDS.md).
+ripclone splits into a **server** — it resolves refs, serves artifacts, and enqueues a sync job on every push — and one or more **workers** (`ripclone-worker`) that claim jobs from the queue, `git fetch` the upstream, and build the clonepack. On a single box the worker runs inside the server; with a SQL queue you run a farm of workers across machines. Three backends are pluggable, each set with environment variables (see [`docs/BACKENDS.md`](docs/BACKENDS.md)):
+
+- **Artifact store.** Where clonepacks live: object storage (S3 / R2 / Tigris / MinIO), with signed URLs so clients read straight from it, or local disk. Local disk also caches hot artifacts in front of object storage. A background GC drops artifacts nothing references (after a grace period, so an in-flight upload is never deleted).
+- **Metadata store.** The ref → clonepack mapping and build status. Any database SQLx supports (Postgres, MySQL, SQLite, libsql/Turso), or a file / object-storage store. Writes are ordered so a newer sync never loses to an older one.
+- **Sync queue.** Pending build jobs: in-process for a single box, or SQL-backed so workers can claim jobs across machines. Upstream credentials are resolved per worker and never stored in the queue.
+
+**Your git host stays the source of truth** for repos, refs, permissions, and writes. Clients download artifacts (signed URL or server proxy), decompress, and write files straight to disk. Public endpoints are rate-limited.
 
 Ops endpoints: `GET /healthz` (alive?), `GET /readyz` (ready? — `503` if storage or the ref store is down), and `GET /metrics` (Prometheus format). There's also a plain-git fallback (`/v1/git/{owner}/{repo}/...`) so a normal `git clone` still works if the fast path is down.
 
