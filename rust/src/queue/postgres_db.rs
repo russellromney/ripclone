@@ -50,7 +50,8 @@ impl QueueDb for PostgresDb {
                 claimed_at BIGINT,
                 finished_at BIGINT,
                 error TEXT,
-                credential TEXT
+                credential TEXT,
+                attempts BIGINT NOT NULL DEFAULT 0
             )",
         )
         .execute(&self.pool)
@@ -61,6 +62,11 @@ impl QueueDb for PostgresDb {
             .execute(&self.pool)
             .await
             .context("add credential column")?;
+        // Migrate a legacy table for the attempts column (dead-letter bound).
+        sqlx::raw_sql("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS attempts BIGINT NOT NULL DEFAULT 0")
+            .execute(&self.pool)
+            .await
+            .context("add attempts column")?;
         sqlx::raw_sql(
             "CREATE INDEX IF NOT EXISTS idx_jobs_status_created ON jobs(status, created_at)",
         )
@@ -121,12 +127,32 @@ impl QueueDb for PostgresDb {
         .context("insert job")
     }
 
-    async fn reclaim_stale(&self, cutoff: i64) -> Result<()> {
+    async fn reclaim_stale(
+        &self,
+        cutoff: i64,
+        max_attempts: i64,
+        now: i64,
+        dead_letter_error: &str,
+    ) -> Result<()> {
+        // Dead-letter stale claims over the attempt cap; requeue the rest.
+        sqlx::query(
+            "UPDATE jobs SET status = 'failed', finished_at = $1, error = $2,
+                 worker_id = NULL, credential = NULL
+             WHERE status = 'claimed' AND claimed_at <= $3 AND attempts >= $4",
+        )
+        .bind(now)
+        .bind(dead_letter_error)
+        .bind(cutoff)
+        .bind(max_attempts)
+        .execute(&self.pool)
+        .await
+        .context("dead-letter stale jobs")?;
         sqlx::query(
             "UPDATE jobs SET status = 'queued', worker_id = NULL
-             WHERE status = 'claimed' AND claimed_at <= $1",
+             WHERE status = 'claimed' AND claimed_at <= $1 AND attempts < $2",
         )
         .bind(cutoff)
+        .bind(max_attempts)
         .execute(&self.pool)
         .await
         .context("reclaim stale jobs")?;
@@ -144,7 +170,8 @@ impl QueueDb for PostgresDb {
 
     async fn try_claim(&self, id: i64, worker_id: &str, now: i64) -> Result<bool> {
         let res = sqlx::query(
-            "UPDATE jobs SET status = 'claimed', worker_id = $1, claimed_at = $2
+            "UPDATE jobs SET status = 'claimed', worker_id = $1, claimed_at = $2,
+                 attempts = attempts + 1
              WHERE id = $3 AND status = 'queued'",
         )
         .bind(worker_id)
@@ -179,22 +206,26 @@ impl QueueDb for PostgresDb {
     async fn finish(
         &self,
         id: i64,
+        worker_id: &str,
         status: &str,
         finished_at: i64,
         error: Option<&str>,
-    ) -> Result<()> {
-        // Clear the per-job credential on finish (not retained in done-job history).
-        sqlx::query(
-            "UPDATE jobs SET status = $1, finished_at = $2, error = $3, credential = NULL WHERE id = $4",
+    ) -> Result<bool> {
+        // Conditional on still owning the claim (no double-settle after a
+        // reclaim). Clearing the credential keeps a token out of done-job history.
+        let res = sqlx::query(
+            "UPDATE jobs SET status = $1, finished_at = $2, error = $3, credential = NULL
+             WHERE id = $4 AND worker_id = $5 AND status = 'claimed'",
         )
         .bind(status)
         .bind(finished_at)
         .bind(error)
         .bind(id)
-            .execute(&self.pool)
-            .await
-            .context("finish job")?;
-        Ok(())
+        .bind(worker_id)
+        .execute(&self.pool)
+        .await
+        .context("finish job")?;
+        Ok(res.rows_affected() == 1)
     }
 
     async fn status(&self, id: i64) -> Result<Option<(String, Option<String>)>> {
