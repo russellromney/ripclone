@@ -122,6 +122,9 @@ Still missing:
   - `scripts/e2e_clonepack.sh` already tests default vs. archive extraction for a public fixture; extend it to test `--mode=full`, `--mode=fast`, and `--mode=hybrid` and verify `git diff`/`git show` per mode.
   - `scripts/e2e_archive.sh` already verifies content, symlinks, executable bits, and edit detection for direct-install; reuse it for all modes.
 - **Fuzz/property tests**: random manifests should either produce the expected tree or return `Err`, never a silently short tree.
+- **Drop always-on config knobs** (deferred — tracked only for now):
+  - `RIPCLONE_TWO_PHASE` defaults to on and is now always used — make it a hard default and remove the env toggle.
+  - `RIPCLONE_ASYNC_BUILD` likewise defaults to on and is now always used; remove the env toggle and drop the redundant `RIPCLONE_ASYNC_BUILD` from the production Soup environment (a no-op unless set to `0`).
 
 ### 8. Clonepack deltas / compaction (future)
 

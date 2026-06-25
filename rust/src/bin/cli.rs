@@ -259,6 +259,24 @@ struct ServerVersion {
     protocol: u32,
 }
 
+/// Compatibility between this CLI's protocol and a server's, keyed on the wire
+/// protocol version (not the build version).
+#[derive(Debug, PartialEq, Eq)]
+enum ProtocolVerdict {
+    Compatible,
+    ClientOutdated,
+    ServerOutdated,
+}
+
+fn protocol_verdict(client: u32, server: u32) -> ProtocolVerdict {
+    use std::cmp::Ordering;
+    match client.cmp(&server) {
+        Ordering::Equal => ProtocolVerdict::Compatible,
+        Ordering::Less => ProtocolVerdict::ClientOutdated,
+        Ordering::Greater => ProtocolVerdict::ServerOutdated,
+    }
+}
+
 /// Print the CLI's version + protocol, then query the configured server's
 /// `/v1/version` and report whether they're compatible. Compatibility is keyed
 /// on the wire protocol, not the build version, so the CLI and server can be
@@ -286,18 +304,16 @@ async fn run_version(server: &str) -> Result<()> {
                     "server   {}  (protocol {})  at {server}",
                     sv.version, sv.protocol
                 );
-                if sv.protocol == local_protocol {
-                    println!("✓ compatible");
-                } else if local_protocol < sv.protocol {
-                    println!(
+                match protocol_verdict(local_protocol, sv.protocol) {
+                    ProtocolVerdict::Compatible => println!("✓ compatible"),
+                    ProtocolVerdict::ClientOutdated => println!(
                         "⚠ this CLI speaks protocol {local_protocol}, the server expects {}. Update ripclone.",
                         sv.protocol
-                    );
-                } else {
-                    println!(
+                    ),
+                    ProtocolVerdict::ServerOutdated => println!(
                         "⚠ this CLI speaks protocol {local_protocol}, newer than the server's {}. The server needs updating.",
                         sv.protocol
-                    );
+                    ),
                 }
             }
             Err(e) => println!("server   {server}: could not read /v1/version ({e})"),
@@ -313,6 +329,27 @@ struct LatestRelease {
     tag_name: String,
 }
 
+/// How the current build compares to the latest published release tag.
+#[derive(Debug, PartialEq, Eq)]
+enum ReleaseStatus {
+    None,
+    UpToDate,
+    Newer(String),
+}
+
+/// Compare the current build version to a release tag (with or without a leading
+/// `v`). `current` is the bare `CARGO_PKG_VERSION` (no `v`).
+fn release_status(current: &str, latest_tag: &str) -> ReleaseStatus {
+    let latest = latest_tag.trim_start_matches('v');
+    if latest.is_empty() {
+        ReleaseStatus::None
+    } else if latest == current {
+        ReleaseStatus::UpToDate
+    } else {
+        ReleaseStatus::Newer(latest_tag.to_string())
+    }
+}
+
 /// Check the latest published release on GitHub and, if newer, show how to
 /// update. Deliberately does not replace the binary itself — it prints the
 /// install command — so it works the same however ripclone was installed.
@@ -323,33 +360,47 @@ async fn run_update() -> Result<()> {
         .user_agent(concat!("ripclone/", env!("CARGO_PKG_VERSION")))
         .build()?;
     let url = "https://api.github.com/repos/russellromney/ripclone/releases/latest";
-    match http
+    let resp = match http
         .get(url)
         .header("Accept", "application/vnd.github+json")
         .send()
         .await
-        .and_then(|r| r.error_for_status())
     {
-        Ok(resp) => match resp.json::<LatestRelease>().await {
-            Ok(rel) => {
-                let latest = rel.tag_name.trim_start_matches('v');
-                if latest.is_empty() {
-                    println!("no published releases yet.");
-                } else if latest == current {
-                    println!("you're on the latest release ({}).", rel.tag_name);
-                } else {
-                    println!("a newer release is available: {}", rel.tag_name);
-                    println!("update with one of:");
-                    println!(
-                        "  curl -fsSL https://github.com/russellromney/ripclone/releases/latest/download/install.sh | sh"
-                    );
-                    println!("  cargo install ripclone --locked");
-                    println!("  pip install --upgrade ripclone");
-                }
+        Ok(r) => r,
+        Err(e) => {
+            println!("could not reach GitHub releases ({e})");
+            return Ok(());
+        }
+    };
+    // A 404 here means the repo has no published releases yet — not a failure.
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        println!("no published releases yet.");
+        return Ok(());
+    }
+    let resp = match resp.error_for_status() {
+        Ok(r) => r,
+        Err(e) => {
+            println!("could not reach GitHub releases ({e})");
+            return Ok(());
+        }
+    };
+    match resp.json::<LatestRelease>().await {
+        Ok(rel) => match release_status(current, &rel.tag_name) {
+            ReleaseStatus::None => println!("no published releases yet."),
+            ReleaseStatus::UpToDate => {
+                println!("you're on the latest release ({}).", rel.tag_name)
             }
-            Err(e) => println!("could not read the latest release ({e})"),
+            ReleaseStatus::Newer(tag) => {
+                println!("a newer release is available: {tag}");
+                println!("update with one of:");
+                println!(
+                    "  curl -fsSL https://github.com/russellromney/ripclone/releases/latest/download/install.sh | sh"
+                );
+                println!("  cargo install ripclone --locked");
+                println!("  pip install --upgrade ripclone");
+            }
         },
-        Err(e) => println!("could not reach GitHub releases ({e})"),
+        Err(e) => println!("could not read the latest release ({e})"),
     }
     Ok(())
 }
@@ -844,4 +895,32 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn protocol_verdict_compatible_outdated_and_newer() {
+        assert_eq!(protocol_verdict(1, 1), ProtocolVerdict::Compatible);
+        // Client older than the server -> the CLI should update.
+        assert_eq!(protocol_verdict(1, 2), ProtocolVerdict::ClientOutdated);
+        // Client newer than the server -> the server should update.
+        assert_eq!(protocol_verdict(3, 2), ProtocolVerdict::ServerOutdated);
+    }
+
+    #[test]
+    fn release_status_none_uptodate_and_newer() {
+        // No release published / empty tag.
+        assert_eq!(release_status("0.1.0", ""), ReleaseStatus::None);
+        // Up to date, with and without the leading `v` on the tag.
+        assert_eq!(release_status("0.1.0", "v0.1.0"), ReleaseStatus::UpToDate);
+        assert_eq!(release_status("0.1.0", "0.1.0"), ReleaseStatus::UpToDate);
+        // A newer release is reported with its original tag.
+        assert_eq!(
+            release_status("0.1.0", "v0.2.0"),
+            ReleaseStatus::Newer("v0.2.0".to_string())
+        );
+    }
 }
