@@ -1047,21 +1047,46 @@ async fn main() -> Result<()> {
             let enable_bench = bench || std::env::var_os("RIPCLONE_BENCH").is_some();
             let mut benchmark = Benchmark::new();
             let clonepack_kind = Some(ripclone::mode::clonepack_kind_for_depth(depth));
-            client
-                .install_repo_with_mode_at(
-                    &repo_path,
-                    &branch,
-                    at.as_deref(),
-                    &target,
-                    mode,
-                    clonepack_kind,
-                    if enable_bench {
-                        Some(&mut benchmark)
-                    } else {
-                        None
-                    },
-                )
-                .await?;
+            // Content bytes come only from the signed URLs in the ref response. If
+            // one expires mid-clone, re-resolve the ref (mints fresh URLs and
+            // re-runs the server's access check) and retry — a couple of times,
+            // so a short signed-URL TTL stays safe for a long clone. Each attempt
+            // re-resolves, since install_repo_with_mode_at resolves the ref itself.
+            const STALE_URL_MAX_RETRIES: u32 = 2;
+            let mut stale_retries = 0u32;
+            loop {
+                let res = client
+                    .install_repo_with_mode_at(
+                        &repo_path,
+                        &branch,
+                        at.as_deref(),
+                        &target,
+                        mode,
+                        clonepack_kind,
+                        if enable_bench {
+                            Some(&mut benchmark)
+                        } else {
+                            None
+                        },
+                    )
+                    .await;
+                match res {
+                    Ok(()) => break,
+                    Err(e)
+                        if ripclone::client::should_retry_stale(
+                            stale_retries,
+                            STALE_URL_MAX_RETRIES,
+                            &e,
+                        ) =>
+                    {
+                        stale_retries += 1;
+                        eprintln!(
+                            "ripclone: artifact URLs expired mid-clone — re-resolving and retrying (attempt {stale_retries})…"
+                        );
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
             println!("installed {} into {}", repo_path, target.display());
             if enable_bench {
                 let report = benchmark.finish();
