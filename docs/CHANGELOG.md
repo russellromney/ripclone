@@ -31,6 +31,12 @@ This file tracks what has already landed in ripclone. For upcoming work see `ROA
 - **Removed the vestigial `ripclone mount` (FUSE) experiment** — the `fusefs` module, the `Mount` command, and the `fuser` dependency are deleted (~1.1k lines). This clears `RUSTSEC-2021-0154` by removal; the `git2` advisories (`RUSTSEC-2026-0183`/`-0184`) were already cleared by the gix migration removing `git2`. The three now-stale advisory `ignore` entries are dropped from `rust/deny.toml`. Can be re-added later if FUSE mounting is wanted.
 - **Allow `MPL-2.0` in `deny.toml`** (weak/file-level copyleft, safe to depend on from a permissive project) — the gix migration pulls in `uluru` (MPL-2.0), which the license check was rejecting.
 
+## Backend config in config.toml + `ripclone backend` CLI
+
+- **Server-side backends are now configurable from `config.toml`**, not just env vars (`rust/src/config.rs`, `rust/src/backends.rs`). New `[storage]`, `[metadata]`, and `[queue]` sections feed the same selection logic. The matching `RIPCLONE_*` env vars **always override** the file (consistent with the existing `--flag > env > config` precedence). The config is loaded once and consulted as a fallback by `queue_kind`/`queue_db_url`/metadata selection and `S3Storage::from_env_or_config`.
+- **`ripclone backend` CLI** (`rust/src/bin/cli.rs`): `show` prints each backend field's effective value and source (marking env overrides); `queue` / `metadata` / `storage` set the corresponding section in the global `config.toml` (only the flags you pass change). The config file is written `0600` since these sections can hold connection settings.
+- **Credentials stay in the environment.** `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` are never read from config. DB tokens (`[queue].token` / `[metadata].token`) are supported in-file for now (no keyring yet) and masked by `backend show`.
+
 ## Pluggable build queue, standalone worker, and SQL metadata store
 
 - **Pluggable build queue** (`RIPCLONE_QUEUE` = `local` | `sqlite` | `postgres` | `mysql` | `libsql`). A `JobQueue` trait; the in-process channel is now `local` (default). The SQL backends share one `SqlJobQueue` orchestration over a per-engine `QueueDb` adapter (`rust/src/queue/`): atomic conditional-`UPDATE` claim, best-effort coalescing with a partial-unique-index backstop where supported, crashed-worker reclaim (`RIPCLONE_QUEUE_STALE_SECS`, default 1800), and failed-job pruning (`RIPCLONE_QUEUE_FAILED_RETENTION_SECS`, default 7d; `done` jobs kept as build history). `libsql` is remote-only (Turso Cloud).

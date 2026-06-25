@@ -26,6 +26,12 @@ pub struct Config {
     /// Custom/self-hosted provider declarations. Built-in presets (github,
     /// gitlab, bitbucket) are implicit and do not need to be declared.
     pub providers: HashMap<String, ProviderEntry>,
+    /// Server-side artifact storage backend (`[storage]`).
+    pub storage: StorageConfig,
+    /// Server-side metadata (ref) store backend (`[metadata]`).
+    pub metadata: MetadataConfig,
+    /// Server-side build queue backend (`[queue]`).
+    pub queue: QueueConfig,
     /// Legacy raw server token, only populated when reading old `config.json`.
     #[serde(skip)]
     pub token: Option<String>,
@@ -43,6 +49,48 @@ pub struct ProviderEntry {
     pub kind: String,
     pub host: Option<String>,
     pub auth_template: Option<String>,
+}
+
+/// Server-side artifact storage. These are read only by `ripclone-server` /
+/// `ripclone-worker`; the matching `RIPCLONE_S3_*` env vars always override them.
+/// Credentials (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`) are read from the
+/// environment only — never from this file.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StorageConfig {
+    /// `local` | `s3`. Unset auto-detects: S3 when an endpoint is configured,
+    /// else local.
+    pub backend: Option<String>,
+    pub endpoint: Option<String>,
+    pub region: Option<String>,
+    pub bucket: Option<String>,
+    pub prefix: Option<String>,
+    pub cache_dir: Option<String>,
+}
+
+/// Server-side metadata (ref) store. `RIPCLONE_METADATA*` env vars override.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MetadataConfig {
+    /// `file` | `s3` | `sqlite` | `postgres` | `mysql` | `libsql`. Unset follows
+    /// storage (s3 if configured, else file).
+    pub backend: Option<String>,
+    /// Connection URL for the SQL backends.
+    pub url: Option<String>,
+    /// Auth token for `libsql` (remote). No keyring yet — stored as written.
+    pub token: Option<String>,
+}
+
+/// Server-side build queue. `RIPCLONE_QUEUE*` env vars override.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct QueueConfig {
+    /// `local` | `sqlite` | `postgres` | `mysql` | `libsql`. Unset = `local`.
+    pub backend: Option<String>,
+    /// Connection URL for the SQL backends.
+    pub url: Option<String>,
+    /// Auth token for `libsql` (remote). No keyring yet — stored as written.
+    pub token: Option<String>,
 }
 
 /// Path to the global config file (`~/.config/ripclone/config.toml`).
@@ -158,6 +206,13 @@ fn save_to(path: &Path, config: &Config) -> Result<()> {
     to_save.token = None;
     let data = toml::to_string_pretty(&to_save).context("serialize config")?;
     std::fs::write(path, data).with_context(|| format!("write {}", path.display()))?;
+    // The backend sections can hold connection settings (and, until keyring
+    // support lands, DB tokens), so keep the file owner-only.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
     Ok(())
 }
 
@@ -190,6 +245,24 @@ fn merge(overrides: Config, base: Config) -> Config {
             let mut merged = base.providers;
             merged.extend(overrides.providers);
             merged
+        },
+        storage: StorageConfig {
+            backend: overrides.storage.backend.or(base.storage.backend),
+            endpoint: overrides.storage.endpoint.or(base.storage.endpoint),
+            region: overrides.storage.region.or(base.storage.region),
+            bucket: overrides.storage.bucket.or(base.storage.bucket),
+            prefix: overrides.storage.prefix.or(base.storage.prefix),
+            cache_dir: overrides.storage.cache_dir.or(base.storage.cache_dir),
+        },
+        metadata: MetadataConfig {
+            backend: overrides.metadata.backend.or(base.metadata.backend),
+            url: overrides.metadata.url.or(base.metadata.url),
+            token: overrides.metadata.token.or(base.metadata.token),
+        },
+        queue: QueueConfig {
+            backend: overrides.queue.backend.or(base.queue.backend),
+            url: overrides.queue.url.or(base.queue.url),
+            token: overrides.queue.token.or(base.queue.token),
         },
         token: overrides.token.or(base.token),
     }
@@ -239,6 +312,7 @@ mod tests {
             },
             providers: HashMap::new(),
             token: None,
+            ..Default::default()
         };
         let project = Config {
             server: Some("https://project.example.com".into()),
@@ -249,6 +323,7 @@ mod tests {
             },
             providers: HashMap::new(),
             token: None,
+            ..Default::default()
         };
         let merged = merge(project, global);
         assert_eq!(
@@ -281,6 +356,21 @@ mod tests {
                 mode: Some("editable".into()),
             },
             providers,
+            queue: QueueConfig {
+                backend: Some("postgres".into()),
+                url: Some("postgres://db/ripclone".into()),
+                token: None,
+            },
+            metadata: MetadataConfig {
+                backend: Some("postgres".into()),
+                url: Some("postgres://db/ripclone".into()),
+                token: None,
+            },
+            storage: StorageConfig {
+                backend: Some("s3".into()),
+                bucket: Some("my-bucket".into()),
+                ..Default::default()
+            },
             token: Some("should-not-be-saved".into()),
         };
         save_to(&path, &cfg).unwrap();
@@ -298,6 +388,11 @@ mod tests {
         );
         assert_eq!(loaded.default_provider.as_deref(), Some("my-gitea"));
         assert!(loaded.providers.contains_key("my-gitea"));
+        assert_eq!(loaded.queue.backend.as_deref(), Some("postgres"));
+        assert_eq!(loaded.queue.url.as_deref(), Some("postgres://db/ripclone"));
+        assert_eq!(loaded.metadata.backend.as_deref(), Some("postgres"));
+        assert_eq!(loaded.storage.backend.as_deref(), Some("s3"));
+        assert_eq!(loaded.storage.bucket.as_deref(), Some("my-bucket"));
         assert!(loaded.token.is_none());
     }
 

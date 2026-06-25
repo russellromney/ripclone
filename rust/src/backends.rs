@@ -7,6 +7,7 @@
 //! That is why the worker can run anywhere: it owns no durable state.
 
 use crate::cas::Cas;
+use crate::config::Config;
 use crate::metrics::Metrics;
 use crate::queue::sql::QueueDb;
 use crate::queue::{
@@ -18,12 +19,29 @@ use crate::storage::{S3Storage, StorageRef, local};
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::AtomicUsize;
 use tokio::sync::mpsc;
 use tracing::info;
 
 /// Capacity of the in-process queue channel (only used by the local backend).
 pub const LOCAL_QUEUE_CAPACITY: usize = 1024;
+
+/// Merged `config.toml`, loaded once. The backend selectors consult this as a
+/// fallback for their `RIPCLONE_*` env vars (env always wins).
+fn config() -> &'static Config {
+    static CONFIG: OnceLock<Config> = OnceLock::new();
+    CONFIG.get_or_init(crate::config::load)
+}
+
+/// Resolve a setting: the env var wins; otherwise fall back to the config value.
+/// Empty env values are treated as unset.
+fn env_or(key: &str, cfg_val: Option<&str>) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .filter(|v| !v.is_empty())
+        .or_else(|| cfg_val.map(str::to_string))
+}
 
 /// Durable + cache backends needed to run a build.
 pub struct Backends {
@@ -45,7 +63,8 @@ impl Backends {
         metrics: &Arc<Metrics>,
     ) -> Result<Self> {
         let cas = Cas::new(cas_dir)?;
-        let s3_storage = S3Storage::from_env().context("initialize S3 storage from environment")?;
+        let s3_storage =
+            S3Storage::from_env_or_config(&config().storage).context("initialize S3 storage")?;
         let (storage, s3): (StorageRef, Option<Arc<S3Storage>>) = if let Some(s3) = s3_storage {
             info!(
                 "using S3-compatible storage with local cache at {}",
@@ -87,7 +106,8 @@ async fn select_metadata(
     use crate::meta::MetaDb;
     use crate::meta::{LibsqlMeta, MysqlMeta, PostgresMeta, SqlRefStore, SqliteMeta};
 
-    let kind = std::env::var("RIPCLONE_METADATA").unwrap_or_default();
+    let kind =
+        env_or("RIPCLONE_METADATA", config().metadata.backend.as_deref()).unwrap_or_default();
     // Each arm wraps its concrete store in CachingRefStore (the read cache) and
     // coerces to Arc<dyn RefStore>.
     let store: Arc<dyn RefStore> = match kind.as_str() {
@@ -111,8 +131,8 @@ async fn select_metadata(
             Arc::new(CachingRefStore::new(S3RefStore::new(s3.clone())))
         }
         "sqlite" | "postgres" | "mysql" | "libsql" => {
-            let url = std::env::var("RIPCLONE_METADATA_DB_URL").context(
-                "RIPCLONE_METADATA=sqlite|postgres|mysql|libsql requires RIPCLONE_METADATA_DB_URL",
+            let url = env_or("RIPCLONE_METADATA_DB_URL", config().metadata.url.as_deref()).context(
+                "RIPCLONE_METADATA=sqlite|postgres|mysql|libsql requires RIPCLONE_METADATA_DB_URL (or [metadata].url)",
             )?;
             let db: Box<dyn MetaDb> = match kind.as_str() {
                 "sqlite" => Box::new(SqliteMeta::connect(&url).await?),
@@ -125,8 +145,8 @@ async fn select_metadata(
                              must be a libsql:// or https:// url (local file → use sqlite)"
                         );
                     }
-                    let token = std::env::var("RIPCLONE_METADATA_DB_TOKEN")
-                        .context("RIPCLONE_METADATA=libsql requires RIPCLONE_METADATA_DB_TOKEN")?;
+                    let token = env_or("RIPCLONE_METADATA_DB_TOKEN", config().metadata.token.as_deref())
+                        .context("RIPCLONE_METADATA=libsql requires RIPCLONE_METADATA_DB_TOKEN (or [metadata].token)")?;
                     Box::new(LibsqlMeta::connect_remote(&url, &token).await?)
                 }
                 _ => unreachable!(),
@@ -158,7 +178,8 @@ pub enum QueueBackend {
 
 /// Read `RIPCLONE_QUEUE` (default `local`).
 pub fn queue_kind() -> String {
-    std::env::var("RIPCLONE_QUEUE").unwrap_or_else(|_| "local".to_string())
+    env_or("RIPCLONE_QUEUE", config().queue.backend.as_deref())
+        .unwrap_or_else(|| "local".to_string())
 }
 
 /// Select the queue for the **server** from `RIPCLONE_QUEUE`:
@@ -212,8 +233,8 @@ pub async fn connect_sql_queue() -> Result<SqlJobQueue> {
                      libsql:// or https:// url (for a local file use RIPCLONE_QUEUE=sqlite)"
                 );
             }
-            let token = std::env::var("RIPCLONE_QUEUE_DB_TOKEN").context(
-                "RIPCLONE_QUEUE=libsql requires RIPCLONE_QUEUE_DB_TOKEN for the remote database",
+            let token = env_or("RIPCLONE_QUEUE_DB_TOKEN", config().queue.token.as_deref()).context(
+                "RIPCLONE_QUEUE=libsql requires RIPCLONE_QUEUE_DB_TOKEN (or [queue].token) for the remote database",
             )?;
             Box::new(LibsqlDb::connect_remote(&url, &token).await?)
         }
@@ -233,9 +254,31 @@ fn is_remote_url(url: &str) -> bool {
 
 /// The SQL queue connection URL, required by the SQL backends.
 pub fn queue_db_url() -> Result<String> {
-    std::env::var("RIPCLONE_QUEUE_DB_URL").context(
+    env_or("RIPCLONE_QUEUE_DB_URL", config().queue.url.as_deref()).context(
         "RIPCLONE_QUEUE=sqlite|postgres|mysql|libsql requires RIPCLONE_QUEUE_DB_URL \
-         (sqlite: a local path; postgres: postgres://…; mysql: mysql://…; \
-         libsql: a remote libsql:// url)",
+         (or [queue].url in config.toml) — sqlite: a local path; postgres: postgres://…; \
+         mysql: mysql://…; libsql: a remote libsql:// url",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::env_or;
+
+    #[test]
+    fn env_or_prefers_env_then_config() {
+        let key = "RIPCLONE_TEST_ENV_OR_PRECEDENCE";
+        unsafe { std::env::remove_var(key) };
+        // No env → fall back to config.
+        assert_eq!(env_or(key, Some("cfg")), Some("cfg".to_string()));
+        // Empty env counts as unset → still config.
+        unsafe { std::env::set_var(key, "") };
+        assert_eq!(env_or(key, Some("cfg")), Some("cfg".to_string()));
+        // Env set → env wins over config.
+        unsafe { std::env::set_var(key, "envval") };
+        assert_eq!(env_or(key, Some("cfg")), Some("envval".to_string()));
+        // Neither → None.
+        unsafe { std::env::remove_var(key) };
+        assert_eq!(env_or(key, None), None);
+    }
 }

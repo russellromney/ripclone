@@ -72,34 +72,51 @@ impl S3Storage {
     ///   RIPCLONE_S3_ENDPOINT, RIPCLONE_S3_REGION, RIPCLONE_S3_BUCKET,
     ///   RIPCLONE_S3_PREFIX, RIPCLONE_S3_CACHE_DIR, plus AWS_* credentials.
     pub fn from_env() -> Result<Option<Self>> {
-        let endpoint = match std::env::var("RIPCLONE_S3_ENDPOINT")
-            .ok()
-            .filter(|e| !e.is_empty())
-            .or_else(|| {
-                std::env::var("AWS_ENDPOINT_URL_S3")
+        Self::from_env_or_config(&crate::config::StorageConfig::default())
+    }
+
+    /// Like [`from_env`](Self::from_env), but falls back to the `[storage]`
+    /// section of `config.toml` for the non-secret settings (endpoint, region,
+    /// bucket, prefix, cache dir). The env vars always win. Credentials
+    /// (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`) are read from the
+    /// environment only — never from config. `backend = "local"` forces local
+    /// storage (returns `None`) even if S3 settings are present.
+    pub fn from_env_or_config(cfg: &crate::config::StorageConfig) -> Result<Option<Self>> {
+        if cfg.backend.as_deref() == Some("local") {
+            return Ok(None);
+        }
+        let pick =
+            |env_key: &str, alt_env: Option<&str>, cfg_val: Option<&str>| -> Option<String> {
+                std::env::var(env_key)
                     .ok()
                     .filter(|e| !e.is_empty())
-            }) {
+                    .or_else(|| {
+                        alt_env
+                            .and_then(|k| std::env::var(k).ok())
+                            .filter(|e| !e.is_empty())
+                    })
+                    .or_else(|| cfg_val.map(str::to_string).filter(|e| !e.is_empty()))
+            };
+
+        let endpoint = match pick(
+            "RIPCLONE_S3_ENDPOINT",
+            Some("AWS_ENDPOINT_URL_S3"),
+            cfg.endpoint.as_deref(),
+        ) {
             Some(e) => e,
-            _ => return Ok(None),
+            None => return Ok(None),
         };
-        let region = std::env::var("RIPCLONE_S3_REGION")
-            .ok()
-            .filter(|e| !e.is_empty())
-            .or_else(|| std::env::var("AWS_REGION").ok().filter(|e| !e.is_empty()))
-            .unwrap_or_else(|| "us-east-1".to_string());
-        let bucket = std::env::var("RIPCLONE_S3_BUCKET")
-            .ok()
-            .filter(|e| !e.is_empty())
-            .or_else(|| std::env::var("BUCKET_NAME").ok().filter(|e| !e.is_empty()))
-            .context("RIPCLONE_S3_BUCKET or BUCKET_NAME is required when S3 is enabled")?;
-        let prefix = std::env::var("RIPCLONE_S3_PREFIX")
-            .ok()
-            .filter(|e| !e.is_empty());
-        let cache_dir: Option<PathBuf> = std::env::var("RIPCLONE_S3_CACHE_DIR")
-            .ok()
-            .filter(|e| !e.is_empty())
-            .map(PathBuf::from);
+        let region = pick(
+            "RIPCLONE_S3_REGION",
+            Some("AWS_REGION"),
+            cfg.region.as_deref(),
+        )
+        .unwrap_or_else(|| "us-east-1".to_string());
+        let bucket = pick("RIPCLONE_S3_BUCKET", Some("BUCKET_NAME"), cfg.bucket.as_deref())
+            .context("RIPCLONE_S3_BUCKET or BUCKET_NAME (or [storage].bucket) is required when S3 is enabled")?;
+        let prefix = pick("RIPCLONE_S3_PREFIX", None, cfg.prefix.as_deref());
+        let cache_dir: Option<PathBuf> =
+            pick("RIPCLONE_S3_CACHE_DIR", None, cfg.cache_dir.as_deref()).map(PathBuf::from);
         let auth = Auth::from_env().context("read S3 credentials from environment")?;
         Self::new(
             &endpoint,
