@@ -44,13 +44,23 @@ flake() {
     done )
 }
 
+# Real network databases for the queue + metadata adapters the default suite can
+# only compile-check: Postgres + MySQL via throwaway docker containers, and
+# libsql against a local `sqld`. Needs docker; the libsql leg also needs `sqld`
+# on PATH (the test auto-skips without it).
+databases() {
+  bash "$ROOT/scripts/test-queue-sql.sh"
+  ( cd "$ROOT/rust" && cargo test --release --locked --test e2e_worker_libsql -- --nocapture )
+}
+
 case "$STAGE" in
   lint) lint ;;
   test) run_tests ;;
   e2e) e2e ;;
   flake) flake ;;
+  databases) databases ;;
   all) lint; run_tests; e2e ;;
-  *) echo "usage: scripts/ci.sh [lint|test|e2e|flake|all]" >&2; exit 2 ;;
+  *) echo "usage: scripts/ci.sh [lint|test|e2e|flake|databases|all]" >&2; exit 2 ;;
 esac
 
 echo "ci.sh: stage '$STAGE' OK"

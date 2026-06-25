@@ -682,6 +682,23 @@ mod tests {
     /// Full queue lifecycle on a fresh queue: enqueue, coalesce, distinct key,
     /// claim ordering, ack done/failed, drain, and a fresh job after completion.
     async fn exercise_core(q: &SqlJobQueue) {
+        // Per-job credential: round-trips through this engine's INSERT + SELECT
+        // decode, and the ack runs the finish UPDATE that clears it (the cleared
+        // *value* is asserted on sqlite in finish_clears_the_stored_credential).
+        {
+            use secrecy::ExposeSecret;
+            let mut j = job("o", "r", "cred");
+            j.credential = Some(secrecy::SecretString::new("dG9rZW4=".to_string().into()));
+            q.enqueue(j).await.unwrap();
+            let c = q.claim("wc").await.unwrap().unwrap();
+            assert_eq!(
+                c.credential.as_ref().map(|s| s.expose_secret().to_string()),
+                Some("dG9rZW4=".to_string()),
+                "credential round-trips through the queue DB"
+            );
+            q.ack(c.id, Ok(())).await.unwrap();
+        }
+
         let enq = q.enqueue(job("o", "r", "main")).await.unwrap();
         assert_eq!(enq.outcome, EnqueueOutcome::Enqueued);
         let id = enq.job_id.unwrap();
