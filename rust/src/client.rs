@@ -26,6 +26,30 @@ struct ServerError {
     code: Option<String>,
 }
 
+/// A presigned artifact URL failed (most likely expired mid-clone). The bytes
+/// are served ONLY by the signed URLs in the ref response — the managed cloud no
+/// longer serves content by bare hash — so the right recovery is to re-resolve
+/// the ref for fresh URLs and retry, which also re-runs the server's access
+/// check. Surfaced as a typed error so the clone driver can detect it.
+#[derive(Debug)]
+pub struct StaleSignedUrl;
+
+impl std::fmt::Display for StaleSignedUrl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "a presigned artifact URL failed (likely expired); re-resolve the ref for fresh URLs"
+        )
+    }
+}
+
+impl std::error::Error for StaleSignedUrl {}
+
+/// True if `err` (or any cause in its chain) is a [`StaleSignedUrl`].
+pub fn is_stale_signed_url(err: &anyhow::Error) -> bool {
+    err.chain().any(|e| e.is::<StaleSignedUrl>())
+}
+
 /// Turn a non-success HTTP response into a clear, actionable error. Parses the
 /// `{ "error", "code" }` body the gateway returns and appends a next-step hint
 /// keyed on status/code. Surfaces an upgrade nudge from `X-Ripclone-Upgrade`.
@@ -526,26 +550,21 @@ impl Client {
             return Ok(data);
         }
 
-        // Fetch with retry+backoff. Presigned URLs are self-authenticating, so
-        // use the no-auth client to avoid leaking the ripclone token to object
-        // storage. If a presigned URL fails for good (e.g. expired), fall back
-        // to the authenticated gateway once.
+        // Presigned URLs are self-authenticating, so use the no-auth client to
+        // avoid leaking the ripclone token to object storage. On failure (most
+        // likely expiry) we do NOT fall back to a by-hash gateway fetch — the
+        // cloud no longer serves content by hash. Instead surface a typed
+        // StaleSignedUrl so the clone driver re-resolves the ref for fresh URLs.
+        // When there's no signed URL at all (a self-hosted backend without object
+        // storage), the by-hash fetch against that backend IS the path.
         let data = if use_signed_url {
-            match fetch_artifact_with_retry(&self.raw_http, fetch_url, hash).await {
-                Ok(d) => d,
-                Err(signed_err) => {
-                    tracing::debug!(
-                        "signed-URL fetch for {hash} failed ({signed_err:#}); falling back to gateway"
-                    );
-                    fetch_artifact_with_retry(&self.http, &gateway_url, hash)
-                        .await
-                        .map_err(|gw_err| {
-                            anyhow::anyhow!(
-                                "artifact {hash} fetch failed via signed URL ({signed_err:#}) and gateway ({gw_err:#})"
-                            )
-                        })?
-                }
-            }
+            fetch_artifact_with_retry(&self.raw_http, fetch_url, hash)
+                .await
+                .map_err(|signed_err| {
+                    anyhow::Error::new(StaleSignedUrl).context(format!(
+                        "signed-URL fetch for {hash} failed: {signed_err:#}"
+                    ))
+                })?
         } else {
             fetch_artifact_with_retry(&self.http, &gateway_url, hash).await?
         };
@@ -1650,22 +1669,12 @@ impl Client {
                         .acquire()
                         .await
                         .map_err(|_| anyhow::anyhow!("download semaphore closed"))?;
-                    let bytes = match client
+                    // No by-hash gateway fallback: a failed signed URL surfaces as
+                    // StaleSignedUrl and the clone driver re-resolves for fresh URLs.
+                    let bytes = client
                         .fetch_chunk_ref(&chunk_ref, signed_url.as_deref())
                         .await
-                    {
-                        Ok(bytes) => bytes,
-                        Err(e) if signed_url.is_some() => client
-                            .fetch_chunk_ref(&chunk_ref, None)
-                            .await
-                            .with_context(|| {
-                                format!(
-                                    "fetch archive chunk {} via gateway after signed URL failed: {e:#}",
-                                    index
-                                )
-                            })?,
-                        Err(e) => return Err(e).with_context(|| format!("fetch archive chunk {}", index)),
-                    };
+                        .with_context(|| format!("fetch archive chunk {}", index))?;
                     let len = bytes.len() as u64;
                     tx.send((index, Ok(bytes)))
                         .map_err(|_| anyhow::anyhow!("archive chunk {} receiver dropped", index))?;
@@ -2584,4 +2593,26 @@ fn local_rev_parse(main_repo: &Path, branch: &str) -> Result<String> {
         anyhow::bail!("git rev-parse {} failed", branch);
     }
     Ok(String::from_utf8(output.stdout)?.trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_stale_signed_url_through_the_error_chain() {
+        // As surfaced from fetch_artifact_with_url, then wrapped with context as
+        // it propagates up through the install pipeline.
+        let err = anyhow::Error::new(StaleSignedUrl)
+            .context("signed-URL fetch for abc123 failed")
+            .context("fetch archive chunk 4")
+            .context("install editable packs");
+        assert!(is_stale_signed_url(&err));
+    }
+
+    #[test]
+    fn ordinary_errors_are_not_stale() {
+        let err = anyhow::anyhow!("ref lookup failed: 404").context("clone");
+        assert!(!is_stale_signed_url(&err));
+    }
 }
