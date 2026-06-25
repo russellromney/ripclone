@@ -787,6 +787,10 @@ fn set_if(slot: &mut Option<String>, new: Option<String>) {
 /// Print each backend field's effective value and source (a `RIPCLONE_*` env var
 /// always wins over the config file).
 fn print_backends(cfg: &ripclone::config::Config) {
+    match ripclone::config::global_config_path() {
+        Some(p) => println!("config file: {}\n", p.display()),
+        None => println!("config file: <none: set RIPCLONE_CONFIG or $HOME>\n"),
+    }
     fn line(label: &str, env_key: &str, cfg_val: Option<&str>, secret: bool) {
         let env = std::env::var(env_key).ok().filter(|v| !v.is_empty());
         let mask = |v: &str| {

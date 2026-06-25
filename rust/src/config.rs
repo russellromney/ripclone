@@ -95,6 +95,11 @@ pub struct QueueConfig {
 
 /// Path to the global config file (`~/.config/ripclone/config.toml`).
 pub fn global_config_path() -> Option<PathBuf> {
+    // An explicit override wins, so a daemon/container can point at a fixed file
+    // (e.g. /etc/ripclone/config.toml) instead of depending on $HOME.
+    if let Some(p) = std::env::var_os("RIPCLONE_CONFIG").filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(p));
+    }
     std::env::var_os("HOME").map(|home| {
         let mut p = PathBuf::from(home);
         p.push(".config");
@@ -463,5 +468,22 @@ default_provider = "my-gitea"
         assert_eq!(p.host.as_deref(), Some("https://gitea.example.com"));
         assert_eq!(p.auth_template.as_deref(), Some("token {{token}}"));
         assert!(p.token.is_none(), "token must not leak into ProviderConfig");
+    }
+
+    #[test]
+    fn ripclone_config_env_overrides_home_path() {
+        // Shares the HOME mutation lock so the env order can't race other tests.
+        let _guard = HOME_LOCK.lock().unwrap();
+        let old = std::env::var_os("RIPCLONE_CONFIG");
+        unsafe { std::env::set_var("RIPCLONE_CONFIG", "/etc/ripclone/config.toml") };
+        assert_eq!(
+            global_config_path(),
+            Some(PathBuf::from("/etc/ripclone/config.toml")),
+            "RIPCLONE_CONFIG must override the $HOME-based path"
+        );
+        match old {
+            Some(v) => unsafe { std::env::set_var("RIPCLONE_CONFIG", v) },
+            None => unsafe { std::env::remove_var("RIPCLONE_CONFIG") },
+        }
     }
 }
