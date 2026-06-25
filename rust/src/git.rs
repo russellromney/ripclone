@@ -739,6 +739,12 @@ pub fn pack_objects_reachable_to_prefix<P: AsRef<Path>, Q: AsRef<Path>>(
     prefix: Q,
     max_pack_bytes: u64,
 ) -> Result<()> {
+    // `commit` is fed to `pack-objects --revs` via stdin, where each line is a
+    // rev-list arg — a `-`-leading or range value would change the packed set.
+    // Callers pass a resolved hex SHA, but validate here too so this `pub` helper
+    // matches the rest of git.rs and never trusts an unvalidated rev.
+    crate::validation::validate_git_rev(commit)
+        .with_context(|| format!("invalid commit: {commit}"))?;
     let input_file = tempfile::NamedTempFile::new()?;
     std::fs::write(input_file.path(), format!("{commit}\n").as_bytes())?;
 

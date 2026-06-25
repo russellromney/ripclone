@@ -1,11 +1,18 @@
 //! The cold full-history build reuses git's existing pack deltas via
 //! `pack-objects --revs` and splits the output with `--max-pack-size`
-//! (RIPCLONE_HISTORY_MAX_PACK_BYTES). When the base is large enough to split
-//! into several packs, a delta's base can land in a *sibling* pack of the same
-//! set — that only resolves because a full clone installs every base pack
-//! together. This test drives the split (tiny max-pack-size + incompressible
-//! content) and asserts the multi-pack base still produces a complete,
-//! fsck-clean clone with the right worktree.
+//! (RIPCLONE_HISTORY_MAX_PACK_BYTES). That split path — collecting an arbitrary
+//! number of `pack-<sha>.{pack,idx}` pairs in `store_packs_from_dir`, ordering
+//! them, and assembling them into one history level — is new code the existing
+//! single-pack fixtures never exercised. This test forces the split and asserts
+//! the multi-pack base still yields a complete, fsck-clean clone with the right
+//! worktree, so a dropped/mispaired pack would be caught.
+//!
+//! Note: `pack-objects --max-pack-size` keeps each output pack self-contained —
+//! when a delta's base would land in a sibling pack it stores the object whole
+//! instead, so there are NO cross-pack deltas to resolve. Completeness here is
+//! about every object being present across the pack set, not delta resolution
+//! across packs. The full `git fsck` below still inflates and sha-verifies every
+//! object, so it catches any object the split dropped or corrupted.
 //!
 //! It runs in its own test binary so setting the process-global
 //! RIPCLONE_HISTORY_MAX_PACK_BYTES can't race other tests.
@@ -103,8 +110,7 @@ fn cold_reuse_multipack_full_clone_is_complete() {
     let head = git(&src, &["rev-parse", "HEAD"]);
     // A blob that was current at an intermediate commit but superseded by HEAD —
     // it lives only in history, so it is NOT materialized by the worktree
-    // checkout below. Only a full fsck (delta resolution across the whole pack
-    // set) proves it survived a cross-pack split.
+    // checkout below. Only the full fsck proves the split kept it.
     let superseded = git(&src, &["rev-parse", "HEAD~3:growing.dat"]);
 
     let cas = Cas::new(tmp.path().join("cas")).unwrap();
@@ -139,13 +145,14 @@ fn cold_reuse_multipack_full_clone_is_complete() {
     git(&tgt, &["update-ref", "refs/heads/main", &head]);
 
     // FULL fsck (no --connectivity-only): inflates and sha-verifies EVERY object
-    // in the store, which forces resolving each delta against its base — across
-    // sibling packs. This is the assertion that actually catches a cross-pack
-    // split that dropped a delta base; a connectivity-only walk would not, since
-    // it never reads blob content.
+    // in the store, resolving each in-pack delta and confirming nothing is
+    // missing or corrupt. This catches a split that dropped or mispaired a pack;
+    // a connectivity-only walk would not, since it never reads object content
+    // (verified by a negative control: a corrupted pack passes connectivity-only
+    // but fails full fsck).
     assert!(
         git_ok(&tgt, &["fsck", "--no-dangling"]),
-        "git fsck must verify every object (delta resolution across the pack set)"
+        "git fsck must verify every object across the multi-pack base"
     );
     assert_eq!(
         git(&tgt, &["rev-list", "--count", &head]),
@@ -153,10 +160,10 @@ fn cold_reuse_multipack_full_clone_is_complete() {
         "all 6 commits reachable"
     );
     // A history-only blob (superseded before HEAD, never checked out) must still
-    // resolve — the pointed case for a cross-pack delta base going missing.
+    // be present — it would go missing if the split dropped the pack holding it.
     assert!(
         git_ok(&tgt, &["cat-file", "-e", &superseded]),
-        "superseded history blob (a delta base) must resolve across the pack set"
+        "superseded history blob must be present across the multi-pack base"
     );
 
     // Worktree materializes byte-for-byte.
