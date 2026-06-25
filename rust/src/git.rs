@@ -721,6 +721,51 @@ pub fn pack_objects_undeltified_to_prefix<P: AsRef<Path>, Q: AsRef<Path>>(
     )
 }
 
+/// Pack everything reachable from `commit` into deltified packs under `prefix`,
+/// reusing the deltas git already has instead of recomputing them.
+///
+/// `--revs` reads rev-list input from stdin (the commit), so git computes the
+/// reachable closure itself; `--use-bitmap-index` answers that from the mirror's
+/// multi-pack-index bitmap (no graph walk) and lets pack-objects copy existing
+/// pack deltas (`--reuse-delta` is on by default) rather than re-deltifying.
+/// `--max-pack-size` splits the output into download-friendly packs. This is the
+/// fast path for the cold full-history build — it makes the cost ~I/O instead of
+/// ~re-deltify, mirroring how `git clone` serves a full clone.
+pub fn pack_objects_reachable_to_prefix<P: AsRef<Path>, Q: AsRef<Path>>(
+    repo: P,
+    commit: &str,
+    prefix: Q,
+    max_pack_bytes: u64,
+) -> Result<()> {
+    let input_file = tempfile::NamedTempFile::new()?;
+    std::fs::write(input_file.path(), format!("{commit}\n").as_bytes())?;
+
+    if let Some(parent) = prefix.as_ref().parent() {
+        std::fs::create_dir_all(parent).context("create pack prefix directory")?;
+    }
+
+    let repo_str = repo.as_ref().to_str().context("repo path not UTF-8")?;
+    let prefix_str = prefix.as_ref().to_str().context("prefix path not UTF-8")?;
+    let cmd = format!(
+        "git -C '{}' pack-objects --revs --use-bitmap-index --max-pack-size={} '{}' < '{}'",
+        shell_escape(repo_str),
+        max_pack_bytes.max(1),
+        shell_escape(prefix_str),
+        shell_escape(input_file.path().to_str().unwrap())
+    );
+
+    let status = Command::new("sh")
+        .args(["-c", &cmd])
+        .status()
+        .context("git pack-objects (reachable) shell")?;
+
+    if !status.success() {
+        bail!("pack-objects (reachable) failed");
+    }
+
+    Ok(())
+}
+
 fn pack_objects_to_prefix_inner<P: AsRef<Path>, Q: AsRef<Path>>(
     repo: P,
     object_shas: &[String],
