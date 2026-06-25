@@ -17,10 +17,12 @@ farmed out to other machines.
 ## How to configure them
 
 Each setting can come from an **environment variable** or from `config.toml`
-(`~/.config/ripclone/config.toml`). Precedence is **env var > `config.toml` >
-built-in default**, so an env var always wins. The sections below list the env
-vars; the same values live under `[storage]`, `[metadata]`, and `[queue]` in the
-file.
+(`~/.config/ripclone/config.toml`, or the path in `RIPCLONE_CONFIG` — handy for a
+daemon/container with no `$HOME`). Precedence is **env var > `config.toml` >
+built-in default**, so an env var always wins. The server reads only this global
+file (a project `ripclone.toml` in the working directory does not affect server
+backends). The sections below list the env vars; the same values live under
+`[storage]`, `[metadata]`, and `[queue]` in the file.
 
 Set the file values with the CLI (writes the global `config.toml`, `0600`):
 

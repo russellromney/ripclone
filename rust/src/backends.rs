@@ -27,11 +27,16 @@ use tracing::info;
 /// Capacity of the in-process queue channel (only used by the local backend).
 pub const LOCAL_QUEUE_CAPACITY: usize = 1024;
 
-/// Merged `config.toml`, loaded once. The backend selectors consult this as a
-/// fallback for their `RIPCLONE_*` env vars (env always wins).
+/// The **global** `config.toml`, loaded once. Backend selectors consult this as
+/// a fallback for their `RIPCLONE_*` env vars (env always wins).
+///
+/// Deliberately `load_global` (not `load`): server backend config must not be
+/// silently altered by a stray project `ripclone.toml` in the server's working
+/// directory. `RIPCLONE_CONFIG` can point at an explicit file. Project configs
+/// remain a client-side concept (clone defaults, server URL).
 fn config() -> &'static Config {
     static CONFIG: OnceLock<Config> = OnceLock::new();
-    CONFIG.get_or_init(crate::config::load)
+    CONFIG.get_or_init(crate::config::load_global)
 }
 
 /// Resolve a setting: the env var wins; otherwise fall back to the config value.
