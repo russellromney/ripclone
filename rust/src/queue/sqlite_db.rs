@@ -77,16 +77,18 @@ impl QueueDb for SqliteDb {
         provider: &str,
         path: &str,
         branch: &str,
+        credential: Option<&str>,
         created_at: i64,
     ) -> Result<i64> {
         let res = sqlx::query(
-            "INSERT INTO jobs (key, provider, path, branch, status, created_at)
-             VALUES (?, ?, ?, ?, 'queued', ?)",
+            "INSERT INTO jobs (key, provider, path, branch, status, credential, created_at)
+             VALUES (?, ?, ?, ?, 'queued', ?, ?)",
         )
         .bind(key)
         .bind(provider)
         .bind(path)
         .bind(branch)
+        .bind(credential)
         .bind(created_at)
         .execute(&self.pool)
         .await
@@ -129,14 +131,22 @@ impl QueueDb for SqliteDb {
         Ok(res.rows_affected() == 1)
     }
 
-    async fn job_fields(&self, id: i64) -> Result<Option<(String, String, String)>> {
-        let row = sqlx::query("SELECT provider, path, branch FROM jobs WHERE id = ?")
+    async fn job_fields(
+        &self,
+        id: i64,
+    ) -> Result<Option<(String, String, String, Option<String>)>> {
+        let row = sqlx::query("SELECT provider, path, branch, credential FROM jobs WHERE id = ?")
             .bind(id)
             .fetch_optional(&self.pool)
             .await
             .context("fetch job fields")?;
         match row {
-            Some(row) => Ok(Some((row.try_get(0)?, row.try_get(1)?, row.try_get(2)?))),
+            Some(row) => Ok(Some((
+                row.try_get(0)?,
+                row.try_get(1)?,
+                row.try_get(2)?,
+                row.try_get(3)?,
+            ))),
             None => Ok(None),
         }
     }

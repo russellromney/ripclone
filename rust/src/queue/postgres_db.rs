@@ -49,7 +49,8 @@ impl QueueDb for PostgresDb {
                 created_at BIGINT NOT NULL,
                 claimed_at BIGINT,
                 finished_at BIGINT,
-                error TEXT
+                error TEXT,
+                credential TEXT
             )",
         )
         .execute(&self.pool)
@@ -97,16 +98,18 @@ impl QueueDb for PostgresDb {
         provider: &str,
         path: &str,
         branch: &str,
+        credential: Option<&str>,
         created_at: i64,
     ) -> Result<i64> {
         sqlx::query_scalar(
-            "INSERT INTO jobs (key, provider, path, branch, status, created_at)
-             VALUES ($1, $2, $3, $4, 'queued', $5) RETURNING id",
+            "INSERT INTO jobs (key, provider, path, branch, status, credential, created_at)
+             VALUES ($1, $2, $3, $4, 'queued', $5, $6) RETURNING id",
         )
         .bind(key)
         .bind(provider)
         .bind(path)
         .bind(branch)
+        .bind(credential)
         .bind(created_at)
         .fetch_one(&self.pool)
         .await
@@ -148,14 +151,22 @@ impl QueueDb for PostgresDb {
         Ok(res.rows_affected() == 1)
     }
 
-    async fn job_fields(&self, id: i64) -> Result<Option<(String, String, String)>> {
-        let row = sqlx::query("SELECT provider, path, branch FROM jobs WHERE id = $1")
+    async fn job_fields(
+        &self,
+        id: i64,
+    ) -> Result<Option<(String, String, String, Option<String>)>> {
+        let row = sqlx::query("SELECT provider, path, branch, credential FROM jobs WHERE id = $1")
             .bind(id)
             .fetch_optional(&self.pool)
             .await
             .context("fetch job fields")?;
         match row {
-            Some(row) => Ok(Some((row.try_get(0)?, row.try_get(1)?, row.try_get(2)?))),
+            Some(row) => Ok(Some((
+                row.try_get(0)?,
+                row.try_get(1)?,
+                row.try_get(2)?,
+                row.try_get(3)?,
+            ))),
             None => Ok(None),
         }
     }

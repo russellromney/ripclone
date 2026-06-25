@@ -107,9 +107,13 @@ async fn main() -> Result<()> {
                     repo_id.storage_key(),
                     claimed.branch
                 );
-                // The cross-process queue never carries credentials; the worker
-                // resolves its own from the credential broker for this repo.
-                let credential = state.broker.fetch_credential(&repo_id, None);
+                // Prefer the per-job upstream credential the enqueuer persisted
+                // (the cloud's per-request X-Upstream-Token, for a private repo
+                // the worker has no standing credential for); fall back to the
+                // broker's configured token for this provider.
+                let credential = state
+                    .broker
+                    .fetch_credential(&repo_id, claimed.credential.as_ref());
                 let job = BuildJob {
                     repo_id,
                     branch: claimed.branch,
