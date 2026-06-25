@@ -22,10 +22,7 @@ async fn unsealed_tail_full_clone_is_complete() {
     origin.commit(&[("a.txt", "1\n")], "c1");
     origin.publish();
     let client = server.client();
-    client
-        .sync_repo("acme", "unsealed", None, None)
-        .await
-        .unwrap();
+    client.sync_repo("acme/unsealed", None).await.unwrap();
 
     // Several syncs; none seal (tail stays under threshold), so the full clone is
     // served entirely from the unsealed tail.
@@ -35,10 +32,7 @@ async fn unsealed_tail_full_clone_is_complete() {
         let m = format!("c{i}");
         origin.commit(&[(f.as_str(), c.as_str())], &m);
         origin.publish();
-        client
-            .sync_repo("acme", "unsealed", None, None)
-            .await
-            .unwrap();
+        client.sync_repo("acme/unsealed", None).await.unwrap();
 
         let (_g, d) = clone_only(&server, "acme", "unsealed", 0, CloneMode::Editable)
             .await

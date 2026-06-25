@@ -1,14 +1,18 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use ripclone::archive::ArchiveBuilder;
+use ripclone::auth::token_store::{FallbackTokenStore, TokenStore};
 use ripclone::bench::Benchmark;
 use ripclone::client::Client;
+use ripclone::config::ProviderEntry;
 use ripclone::extract::extract_archive;
 use ripclone::mode::{CloneMode, resolve_mode};
+use ripclone::provider::ProviderKind;
 use ripclone::snapshot::extract_snapshot;
+use secrecy::ExposeSecret;
 use sha2::{Digest, Sha256};
 use std::env;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -22,6 +26,17 @@ struct Args {
     /// managed cloud. (Resolution: --server > RIPCLONE_SERVER > config > cloud.)
     #[arg(short, long, env = "RIPCLONE_SERVER")]
     server: Option<String>,
+
+    /// Upstream git provider instance id (e.g. "github", "gitlab", "my-gitea").
+    /// Defaults to the built-in "github" instance unless overridden by config
+    /// or a provider prefix in the repo argument (`gitlab:owner/repo`).
+    #[arg(short, long, env = "RIPCLONE_PROVIDER")]
+    provider: Option<String>,
+
+    /// Explicit upstream credential token sent as the X-Upstream-Token header.
+    /// Overrides git credentials and any configured provider token.
+    #[arg(short, long, env = "RIPCLONE_UPSTREAM_TOKEN")]
+    token: Option<String>,
 
     #[command(subcommand)]
     command: Commands,
@@ -49,27 +64,28 @@ enum Commands {
         /// Lets you exercise the incremental path without upstream advancing.
         #[arg(long)]
         at: Option<String>,
-        /// GitHub token to use for this sync only. Overrides RIPCLONE_GITHUB_TOKEN.
-        #[arg(short, long, env = "RIPCLONE_GITHUB_TOKEN")]
-        github_token: Option<String>,
     },
     /// Clone a repo using a snapshot and a background sidecar.
     Clone {
         repo: String,
-        #[arg(short, long)]
+        /// Directory to clone into. If omitted, the repo name is used.
+        #[arg(value_name = "DIR", group = "target")]
+        dir_pos: Option<PathBuf>,
+        /// Directory to clone into (back-compat alias for the positional DIR).
+        #[arg(short, long, value_name = "DIR", group = "target", hide = true)]
         dir: Option<PathBuf>,
         #[arg(short, long, default_value = "HEAD")]
         branch: String,
         /// Number of hot files to include in the initial snapshot.
         #[arg(long, default_value = "50")]
         hot_files: usize,
-        /// Clone mode: editable (default), files, or skeleton.
+        /// Clone mode: editable (default) or files.
         #[arg(long)]
         mode: Option<CloneMode>,
         /// History depth: 1 = HEAD only (default), N = last N commits, 0 = full
-        /// history.
-        #[arg(long, default_value = "1")]
-        depth: usize,
+        /// history. Defaults to the value in `ripclone.toml` or 1.
+        #[arg(long)]
+        depth: Option<usize>,
         /// Clone the artifacts built for this git rev (e.g. "HEAD~5") instead of
         /// the branch tip. Pairs with `sync --at <rev>`.
         #[arg(long)]
@@ -82,9 +98,6 @@ enum Commands {
         /// Print a per-phase benchmark report after the clone.
         #[arg(long)]
         bench: bool,
-        /// Install a skeleton clone only (no sidecar). Useful for archive extraction.
-        #[arg(long, hide = true)]
-        skeleton: bool,
     },
     /// Background sidecar: finish materializing a snapshot clone.
     Sidecar {
@@ -99,6 +112,11 @@ enum Commands {
         dir: PathBuf,
         #[arg(short, long, default_value = "HEAD")]
         branch: String,
+    },
+    /// Manage configured git providers (GitHub, GitLab, Gitea, …).
+    Provider {
+        #[command(subcommand)]
+        action: ProviderAction,
     },
     /// Snapshot operations for agent-ready repo skeletons.
     Snapshot {
@@ -197,12 +215,80 @@ enum SnapshotAction {
     },
 }
 
+#[derive(Subcommand)]
+enum ProviderAction {
+    /// Add or update a provider.
+    Add {
+        /// Provider instance id (e.g. "gitlab", "company-gitea").
+        id: String,
+        /// Provider kind: github, gitlab, bitbucket, gitea, generic.
+        #[arg(short, long)]
+        kind: Option<String>,
+        /// Hostname or base URL used in clone URLs.
+        #[arg(short = 'H', long)]
+        host: Option<String>,
+        /// Static credential template for generic hosts, e.g. "token {token}".
+        #[arg(long)]
+        auth_template: Option<String>,
+        /// Token to store (prompted if omitted).
+        #[arg(short, long)]
+        token: Option<String>,
+    },
+    /// List configured providers.
+    List,
+    /// Remove a provider and its stored token.
+    Rm { id: String },
+    /// Test provider connectivity by resolving a repo ref.
+    Test {
+        /// Provider instance id.
+        id: String,
+        /// Repo path (e.g. "owner/repo" or a sub-group path).
+        repo: String,
+        #[arg(short, long, default_value = "HEAD")]
+        branch: String,
+    },
+}
+
 fn parse_repo(repo: &str) -> Result<(&str, &str)> {
     let parts: Vec<&str> = repo.splitn(2, '/').collect();
     if parts.len() != 2 {
         anyhow::bail!("repo must be owner/name");
     }
     Ok((parts[0], parts[1]))
+}
+
+/// Resolve a repo argument into `(provider, repo_path)`.
+///
+/// Honors an optional `provider:` prefix, falls back to `default_provider`,
+/// and normalizes GitHub repos to `owner/name`.
+fn resolve_repo(repo: &str, default_provider: &str) -> Result<(String, String)> {
+    let (provider_override, path) = parse_repo_arg(repo);
+    let provider = provider_override.unwrap_or_else(|| default_provider.to_string());
+    let repo_path = if provider == "github" {
+        let (owner, name) = parse_repo(&path)?;
+        format!("{owner}/{name}")
+    } else {
+        path
+    };
+    Ok((provider, repo_path))
+}
+
+/// Parse a repo argument that may include a provider prefix.
+///
+/// Supported forms:
+/// - `owner/name` → (None, "owner/name")
+/// - `gitlab:owner/name` → (Some("gitlab"), "owner/name")
+/// - `gitea.example.com:owner/repo` → (Some("gitea.example.com"), "owner/repo")
+///
+/// Returns `(optional_provider_override, repo_path)`.
+fn parse_repo_arg(repo: &str) -> (Option<String>, String) {
+    if let Some((prefix, path)) = repo.split_once(':')
+        && !prefix.is_empty()
+        && !path.is_empty()
+    {
+        return (Some(prefix.to_string()), path.to_string());
+    }
+    (None, repo.to_string())
 }
 
 /// Parse a GitHub remote URL into (owner, repo).
@@ -456,19 +542,20 @@ async fn run_login(server: &str) -> Result<()> {
         }
     };
 
-    let mut cfg = ripclone::config::load();
-    cfg.token = Some(token);
+    let mut cfg = ripclone::config::load_global();
     cfg.server = Some(server.to_string());
     ripclone::config::save(&cfg)?;
-    let where_ = ripclone::config::config_path()
-        .map(|p| p.display().to_string())
-        .unwrap_or_default();
-    println!("\n  ✓ Logged in. Token saved to {where_}");
+    token_store()?.set("server", &token)?;
+    println!("\n  ✓ Logged in. Server token saved to secure token store.");
     Ok(())
 }
 
 /// Best-effort: open the verification URL in the user's browser. Never fails.
+/// Skipped when `RIPCLONE_NO_BROWSER` is set so tests don't launch browsers.
 fn open_browser(url: &str) {
+    if std::env::var_os("RIPCLONE_NO_BROWSER").is_some() {
+        return;
+    }
     #[cfg(target_os = "macos")]
     let prog: Option<&str> = Some("open");
     #[cfg(target_os = "linux")]
@@ -478,6 +565,112 @@ fn open_browser(url: &str) {
     if let Some(cmd) = prog {
         let _ = std::process::Command::new(cmd).arg(url).spawn();
     }
+}
+
+fn token_store() -> Result<FallbackTokenStore> {
+    FallbackTokenStore::new().context("initialize token store")
+}
+
+async fn run_provider_add(
+    id: &str,
+    kind: Option<String>,
+    host: Option<String>,
+    auth_template: Option<String>,
+    token: Option<String>,
+) -> Result<()> {
+    if id.is_empty() {
+        anyhow::bail!("provider id cannot be empty");
+    }
+    let kind_str = kind.as_deref().unwrap_or("generic");
+    let kind_parsed: ProviderKind = kind_str.parse()?;
+
+    let host = match host {
+        Some(h) => Some(h),
+        None => match kind_parsed {
+            ProviderKind::GitHub => Some("github.com".to_string()),
+            ProviderKind::GitLab => Some("gitlab.com".to_string()),
+            ProviderKind::Bitbucket => Some("bitbucket.org".to_string()),
+            ProviderKind::Gitea | ProviderKind::Generic => None,
+        },
+    };
+
+    if kind_parsed == ProviderKind::Generic && auth_template.is_none() {
+        anyhow::bail!(
+            "generic provider '{}' requires --auth-template (e.g. 'token {{token}}')",
+            id
+        );
+    }
+
+    let token = match token {
+        Some(t) => Some(t),
+        None => {
+            // Prompt for token unless running non-interactively.
+            if std::io::stdin().is_terminal() {
+                let prompt = format!("Token for provider '{}': ", id);
+                Some(rpassword::prompt_password(prompt)?)
+            } else {
+                None
+            }
+        }
+    };
+
+    let entry = ProviderEntry {
+        kind: kind_str.to_string(),
+        host,
+        auth_template,
+    };
+
+    let mut cfg = ripclone::config::load_global();
+    cfg.providers.insert(id.to_string(), entry);
+    ripclone::config::save(&cfg)?;
+    let store = token_store()?;
+    if let Some(token) = token.as_deref() {
+        store.set(id, token)?;
+    }
+    println!("added provider '{}'", id);
+    if token.is_some() {
+        println!("  token stored in secure token store");
+    }
+    Ok(())
+}
+
+fn run_provider_list() -> Result<()> {
+    let cfg = ripclone::config::load_global();
+    let registry = ripclone::provider_config::load_registry_with_config(&token_store()?, &cfg)?;
+
+    if cfg.providers.is_empty() {
+        println!("No providers configured.");
+        println!("Use 'ripclone provider add <id> --kind <kind> --host <host>' to add one.");
+        return Ok(());
+    }
+
+    println!("{:<16} {:<10} {:<24} TOKEN", "ID", "KIND", "HOST");
+    for (id, entry) in &cfg.providers {
+        let host = entry.host.as_deref().unwrap_or("-");
+        let has_token = registry.token(id).is_some();
+        println!(
+            "{:<16} {:<10} {:<24} {}",
+            id,
+            entry.kind,
+            host,
+            if has_token { "configured" } else { "missing" }
+        );
+    }
+    Ok(())
+}
+
+async fn run_provider_rm(id: &str) -> Result<()> {
+    if id.is_empty() {
+        anyhow::bail!("provider id cannot be empty");
+    }
+    let mut cfg = ripclone::config::load_global();
+    if cfg.providers.remove(id).is_none() {
+        anyhow::bail!("provider '{}' not found", id);
+    }
+    ripclone::config::save(&cfg)?;
+    token_store()?.delete(id)?;
+    println!("removed provider '{}'", id);
+    Ok(())
 }
 
 #[tokio::main]
@@ -497,13 +690,18 @@ async fn main() -> Result<()> {
         .clone()
         .or_else(|| config.server.clone())
         .unwrap_or_else(|| "https://ripclone.com".to_string());
+    let default_provider = args
+        .provider
+        .clone()
+        .or_else(|| config.default_provider.clone())
+        .unwrap_or_else(|| "github".to_string());
 
     // login/logout/version don't need an authenticated client.
     match &args.command {
         Commands::Login => return run_login(&server).await,
         Commands::Logout => {
-            ripclone::config::clear_token()?;
-            println!("Logged out — token removed.");
+            token_store()?.delete("server")?;
+            println!("Logged out — server token removed.");
             return Ok(());
         }
         Commands::Version => return run_version(&server).await,
@@ -511,16 +709,32 @@ async fn main() -> Result<()> {
         _ => {}
     }
 
-    // Token precedence: RIPCLONE_TOKEN_HASH > RIPCLONE_TOKEN (env) > the token
-    // saved by `ripclone login`. Raw tokens are hashed before being sent.
-    let token_hash = env::var("RIPCLONE_TOKEN_HASH")
+    // Server-token precedence:
+    //   RIPCLONE_SERVER_TOKEN_HASH > RIPCLONE_SERVER_TOKEN >
+    //   RIPCLONE_TOKEN_HASH > RIPCLONE_TOKEN (deprecated) > saved login token.
+    // Raw tokens are hashed before being sent.
+    let server_token_hash = env::var("RIPCLONE_SERVER_TOKEN_HASH")
         .ok()
         .filter(|t| !t.is_empty())
+        .or_else(|| {
+            env::var("RIPCLONE_SERVER_TOKEN")
+                .ok()
+                .filter(|t| !t.is_empty())
+                .map(|t| format!("{:x}", Sha256::digest(t.as_bytes())))
+        })
+        .or_else(|| {
+            env::var("RIPCLONE_TOKEN_HASH")
+                .ok()
+                .filter(|t| !t.is_empty())
+        })
         .or_else(|| {
             env::var("RIPCLONE_TOKEN")
                 .ok()
                 .filter(|t| !t.is_empty())
-                .map(|t| format!("{:x}", Sha256::digest(t.as_bytes())))
+                .map(|t| {
+                    eprintln!("warning: RIPCLONE_TOKEN is deprecated for server auth; use RIPCLONE_SERVER_TOKEN");
+                    format!("{:x}", Sha256::digest(t.as_bytes()))
+                })
         })
         .or_else(|| {
             config
@@ -528,37 +742,66 @@ async fn main() -> Result<()> {
                 .as_deref()
                 .filter(|t| !t.is_empty())
                 .map(|t| format!("{:x}", Sha256::digest(t.as_bytes())))
+        })
+        .or_else(|| {
+            token_store()
+                .ok()
+                .and_then(|store| store.get("server").ok().flatten())
+                .filter(|t| !t.is_empty())
+                .map(|t| format!("{:x}", Sha256::digest(t.as_bytes())))
         });
-    let client = match token_hash {
+    let client = match server_token_hash {
         Some(token) => Client::new_with_token(server.clone(), Some(token)),
         None => Client::new(server.clone()),
-    };
+    }
+    .with_provider(&default_provider);
 
     match args.command {
         // Handled before the client is built.
         Commands::Login | Commands::Logout | Commands::Version | Commands::Update => {
             unreachable!()
         }
-        Commands::Sync {
-            repo,
-            depth,
-            at,
-            github_token,
-        } => {
-            let (owner, repo_name) = parse_repo(&repo)?;
+        Commands::Provider { action } => match action {
+            ProviderAction::Add {
+                id,
+                kind,
+                host,
+                auth_template,
+                token,
+            } => {
+                run_provider_add(&id, kind, host, auth_template, token).await?;
+            }
+            ProviderAction::List => {
+                run_provider_list()?;
+            }
+            ProviderAction::Rm { id } => {
+                run_provider_rm(&id).await?;
+            }
+            ProviderAction::Test { id, repo, branch } => {
+                let test_client = client.with_provider(&id);
+                let info = test_client.resolve_ref(&repo, &branch).await?;
+                println!(
+                    "provider '{}' resolved {}@{} → {} (default: {})",
+                    id, repo, branch, info.commit, info.default_branch
+                );
+            }
+        },
+        Commands::Sync { repo, depth, at } => {
+            let (provider, repo_path) = resolve_repo(&repo, &default_provider)?;
+            let upstream_token =
+                resolve_upstream_token(&provider, &repo_path, args.token.as_deref()).await?;
+            let client = client
+                .with_provider(&provider)
+                .with_upstream_token_opt(upstream_token);
+            let depth = depth.or(config.clone.depth);
             let info = client
-                .sync_repo_at(
-                    owner,
-                    repo_name,
-                    at.as_deref(),
-                    depth,
-                    github_token.as_deref(),
-                )
+                .sync_repo_at(&repo_path, at.as_deref(), depth)
                 .await?;
-            println!("synced {} to {}", repo, info.commit);
+            println!("synced {} to {}", repo_path, info.commit);
         }
         Commands::Clone {
             repo,
+            dir_pos,
             dir,
             branch,
             hot_files: _hot_files,
@@ -567,11 +810,23 @@ async fn main() -> Result<()> {
             at,
             temp,
             bench,
-            skeleton,
         } => {
-            let (owner, repo_name) = parse_repo(&repo)?;
-            let target = dir.unwrap_or_else(|| PathBuf::from(repo_name));
-            let mode = resolve_mode(mode);
+            let (provider, repo_path) = resolve_repo(&repo, &default_provider)?;
+            let upstream_token =
+                resolve_upstream_token(&provider, &repo_path, args.token.as_deref()).await?;
+            let client = client
+                .with_provider(&provider)
+                .with_upstream_token_opt(upstream_token);
+            let target_name = repo_path
+                .rsplit('/')
+                .next()
+                .unwrap_or(&repo_path)
+                .to_string();
+            let target = dir_pos
+                .or(dir)
+                .unwrap_or_else(|| PathBuf::from(target_name));
+            let depth = depth.or(config.clone.depth).unwrap_or(1);
+            let mode = resolve_mode(mode, config.clone.mode.as_deref());
             // Bridge the --temp flag to the env var the overlay check reads. Set
             // here, before any clone work reads it.
             if temp {
@@ -580,21 +835,12 @@ async fn main() -> Result<()> {
                 unsafe { std::env::set_var("RIPCLONE_TEMP", "1") };
             }
 
-            if skeleton || mode == CloneMode::Skeleton {
-                client
-                    .skeleton_clone(owner, repo_name, &branch, &target)
-                    .await?;
-                println!("skeleton cloned {} into {}", repo, target.display());
-                return Ok(());
-            }
-
             let enable_bench = bench || std::env::var_os("RIPCLONE_BENCH").is_some();
             let mut benchmark = Benchmark::new();
             let clonepack_kind = Some(ripclone::mode::clonepack_kind_for_depth(depth));
             client
                 .install_repo_with_mode_at(
-                    owner,
-                    repo_name,
+                    &repo_path,
                     &branch,
                     at.as_deref(),
                     &target,
@@ -607,7 +853,7 @@ async fn main() -> Result<()> {
                     },
                 )
                 .await?;
-            println!("installed {} into {}", repo, target.display());
+            println!("installed {} into {}", repo_path, target.display());
             if enable_bench {
                 let report = benchmark.finish();
                 println!("{}", serde_json::to_string_pretty(&report)?);
@@ -621,8 +867,9 @@ async fn main() -> Result<()> {
         Commands::Cat {
             repo, path, branch, ..
         } => {
-            let (owner, repo_name) = parse_repo(&repo)?;
-            let content = client.cat_file(owner, repo_name, &branch, &path).await?;
+            let (provider, repo_path) = resolve_repo(&repo, &default_provider)?;
+            let client = client.with_provider(&provider);
+            let content = client.cat_file(&repo_path, &branch, &path).await?;
             std::io::stdout().write_all(&content)?;
         }
         Commands::Snapshot { action } => match action {
@@ -632,9 +879,10 @@ async fn main() -> Result<()> {
                 hot_files,
                 output,
             } => {
-                let (owner, repo_name) = parse_repo(&repo)?;
+                let (provider, repo_path) = resolve_repo(&repo, &default_provider)?;
+                let client = client.with_provider(&provider);
                 let info = client
-                    .create_snapshot(owner, repo_name, &branch, hot_files)
+                    .create_snapshot(&repo_path, &branch, hot_files)
                     .await?;
                 println!(
                     "snapshot {} for {}@{}: {} bytes, {} hot files",
@@ -679,8 +927,9 @@ async fn main() -> Result<()> {
             branch,
             count,
         } => {
-            let (owner, repo_name) = parse_repo(&repo)?;
-            let files = client.hot_files(owner, repo_name, &branch, count).await?;
+            let (provider, repo_path) = resolve_repo(&repo, &default_provider)?;
+            let client = client.with_provider(&provider);
+            let files = client.hot_files(&repo_path, &branch, count).await?;
             println!("prefetching {} files into {}", files.len(), dir.display());
             let start = std::time::Instant::now();
             for path in &files {
@@ -692,7 +941,7 @@ async fn main() -> Result<()> {
                         continue;
                     }
                 };
-                let content = client.fetch_file(owner, repo_name, &branch, path).await?;
+                let content = client.fetch_file(&repo_path, &branch, path).await?;
                 let target = dir.join(path);
                 if let Some(parent) = target.parent() {
                     std::fs::create_dir_all(parent)?;
@@ -768,15 +1017,18 @@ async fn main() -> Result<()> {
             repo_root,
             dictionary,
         } => {
-            let (owner, repo_name) = parse_repo(&repo)?;
-            let owner = owner.to_string();
-            let repo_name = repo_name.to_string();
-            let info = client.sync_repo(&owner, &repo_name, None, None).await?;
+            let (provider, repo_path) = resolve_repo(&repo, &default_provider)?;
+            let client = client.with_provider(&provider);
+            let (owner, repo_name) = repo_path
+                .split_once('/')
+                .map(|(o, n)| (o.to_string(), n.to_string()))
+                .unwrap_or(("".to_string(), repo_path.clone()));
+            let info = client.sync_repo(&repo_path, None).await?;
             let commit = if branch == "HEAD" {
                 info.commit
             } else {
                 client
-                    .resolve_ref(&owner, &repo_name, &branch)
+                    .resolve_ref_with_clonepack(&repo_path, &branch, None, None)
                     .await?
                     .commit
             };
@@ -787,7 +1039,7 @@ async fn main() -> Result<()> {
                 ),
                 None => None,
             };
-            println!("building archive for {} at {}", repo, &commit[..7]);
+            println!("building archive for {} at {}", repo_path, &commit[..7]);
             let start = std::time::Instant::now();
             let stats = tokio::task::spawn_blocking(move || {
                 ArchiveBuilder::build_repo(
@@ -841,16 +1093,20 @@ async fn main() -> Result<()> {
             repo,
         } => {
             let main_repo = std::env::current_dir()?.join(dir);
-            let (owner, repo_name) = match repo {
-                Some(r) => {
-                    let (o, r) = parse_repo(&r)?;
-                    (o.to_string(), r.to_string())
+            let repo_path = match repo {
+                Some(r) => resolve_repo(&r, &default_provider)?.1,
+                None => {
+                    if default_provider == "github" {
+                        let (o, r) = owner_repo_from_origin(&main_repo)?;
+                        format!("{o}/{r}")
+                    } else {
+                        anyhow::bail!("--repo is required for non-github providers")
+                    }
                 }
-                None => owner_repo_from_origin(&main_repo)?,
             };
             let target = std::env::current_dir()?.join(&path);
             client
-                .add_worktree(&owner, &repo_name, &branch, &main_repo, &target)
+                .add_worktree(&repo_path, &branch, &main_repo, &target)
                 .await?;
             println!("added worktree at {}", target.display());
         }
@@ -862,12 +1118,20 @@ async fn main() -> Result<()> {
             sample_bytes,
             repo_root,
         } => {
-            let (owner, repo_name) = parse_repo(&repo)?;
-            let info = client.sync_repo(owner, repo_name, None, None).await?;
+            let (provider, repo_path) = resolve_repo(&repo, &default_provider)?;
+            let client = client.with_provider(&provider);
+            let (owner, repo_name) = repo_path
+                .split_once('/')
+                .map(|(o, n)| (o.to_string(), n.to_string()))
+                .unwrap_or(("".to_string(), repo_path.clone()));
+            let info = client.sync_repo(&repo_path, None).await?;
             let commit = if branch == "HEAD" {
                 info.commit
             } else {
-                client.resolve_ref(owner, repo_name, &branch).await?.commit
+                client
+                    .resolve_ref_with_clonepack(&repo_path, &branch, None, None)
+                    .await?
+                    .commit
             };
             let mirror = repo_root.join(format!("{}_{}.git", owner, repo_name));
             println!(
@@ -897,6 +1161,104 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Resolve an upstream credential for `provider`/`repo_path`.
+///
+/// Precedence:
+///   1. Explicit `--token` / `RIPCLONE_UPSTREAM_TOKEN` override.
+///   2. `git credential fill` for the provider's HTTPS clone URL.
+///   3. Any token stored in the provider registry (env or token store).
+///   4. Anonymous (public repos).
+async fn resolve_upstream_token(
+    provider_id: &str,
+    repo_path: &str,
+    override_token: Option<&str>,
+) -> Result<Option<String>> {
+    if let Some(token) = override_token {
+        return Ok(Some(token.to_string()));
+    }
+
+    let store = token_store().context("initialize token store")?;
+    let registry = ripclone::provider_config::load_registry_with_token_store(&store)
+        .context("load provider registry for upstream auth")?;
+    if let Some(token) = registry.token(provider_id) {
+        return Ok(Some(token.expose_secret().to_string()));
+    }
+
+    let host = match provider_host(provider_id, &registry) {
+        Some(h) => h,
+        None => return Ok(None),
+    };
+
+    git_credential_token(&host, repo_path).await
+}
+
+fn provider_host(
+    provider_id: &str,
+    registry: &ripclone::provider::ProviderRegistry,
+) -> Option<String> {
+    // Preset providers have well-known hosts.
+    let preset = match provider_id {
+        "github" => Some("github.com"),
+        "gitlab" => Some("gitlab.com"),
+        "bitbucket" => Some("bitbucket.org"),
+        _ => None,
+    };
+    if let Some(host) = preset {
+        return Some(host.to_string());
+    }
+    registry.get(provider_id).map(|p| {
+        let h = p.host.trim_end_matches('/');
+        h.strip_prefix("https://")
+            .or_else(|| h.strip_prefix("http://"))
+            .unwrap_or(h)
+            .to_string()
+    })
+}
+
+/// Ask the local git credential helper for a password/token for an HTTPS URL.
+async fn git_credential_token(host: &str, path: &str) -> Result<Option<String>> {
+    let input = format!(
+        "protocol=https\nhost={}\npath={}\n\n",
+        host,
+        path.trim_start_matches('/')
+    );
+    let mut child = tokio::process::Command::new("git")
+        .arg("credential")
+        .arg("fill")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("spawn git credential fill")?;
+
+    let mut stdin = child.stdin.take().context("take git credential stdin")?;
+    tokio::io::AsyncWriteExt::write_all(&mut stdin, input.as_bytes()).await?;
+    tokio::io::AsyncWriteExt::shutdown(&mut stdin).await.ok();
+    drop(stdin);
+
+    let output = child
+        .wait_with_output()
+        .await
+        .context("read git credential fill output")?;
+
+    if !output.status.success() {
+        tracing::debug!(
+            "git credential fill failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return Ok(None);
+    }
+
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        if let Some(password) = line.strip_prefix("password=")
+            && !password.is_empty()
+        {
+            return Ok(Some(password.to_string()));
+        }
+    }
+    Ok(None)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -922,5 +1284,133 @@ mod tests {
             release_status("0.1.0", "v0.2.0"),
             ReleaseStatus::Newer("v0.2.0".to_string())
         );
+    }
+
+    #[test]
+    fn parse_repo_arg_without_prefix() {
+        assert_eq!(
+            parse_repo_arg("oven-sh/bun"),
+            (None, "oven-sh/bun".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_repo_arg_with_provider_prefix() {
+        assert_eq!(
+            parse_repo_arg("gitlab:oven-sh/bun"),
+            (Some("gitlab".to_string()), "oven-sh/bun".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_repo_arg_with_host_prefix() {
+        assert_eq!(
+            parse_repo_arg("gitea.example.com:oven-sh/bun"),
+            (
+                Some("gitea.example.com".to_string()),
+                "oven-sh/bun".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn resolve_repo_defaults_to_github() {
+        let (provider, repo_path) = resolve_repo("oven-sh/bun", "github").unwrap();
+        assert_eq!(provider, "github");
+        assert_eq!(repo_path, "oven-sh/bun");
+    }
+
+    #[test]
+    fn resolve_repo_overrides_provider_from_prefix() {
+        let (provider, repo_path) = resolve_repo("gitlab:oven-sh/bun", "github").unwrap();
+        assert_eq!(provider, "gitlab");
+        assert_eq!(repo_path, "oven-sh/bun");
+    }
+
+    #[test]
+    fn resolve_repo_preserves_non_github_path() {
+        let (provider, repo_path) = resolve_repo("group/sub/repo", "gitlab").unwrap();
+        assert_eq!(provider, "gitlab");
+        assert_eq!(repo_path, "group/sub/repo");
+    }
+
+    #[test]
+    fn clap_accepts_provider_subcommands() {
+        // `ripclone provider add localgit --kind gitea --host localhost:3000`
+        let args = Args::parse_from([
+            "ripclone",
+            "provider",
+            "add",
+            "localgit",
+            "--kind",
+            "gitea",
+            "--host",
+            "localhost:3000",
+        ]);
+        match args.command {
+            Commands::Provider {
+                action: ProviderAction::Add { id, kind, host, .. },
+            } => {
+                assert_eq!(id, "localgit");
+                assert_eq!(kind.as_deref(), Some("gitea"));
+                assert_eq!(host.as_deref(), Some("localhost:3000"));
+            }
+            _ => panic!("expected provider add subcommand"),
+        }
+    }
+
+    #[test]
+    fn provider_host_uses_preset_defaults() {
+        let registry = ripclone::provider::ProviderRegistry::new();
+        assert_eq!(
+            provider_host("github", &registry),
+            Some("github.com".to_string())
+        );
+        assert_eq!(
+            provider_host("gitlab", &registry),
+            Some("gitlab.com".to_string())
+        );
+        assert_eq!(
+            provider_host("bitbucket", &registry),
+            Some("bitbucket.org".to_string())
+        );
+    }
+
+    #[test]
+    fn git_credential_token_uses_local_credential_helper() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake_git = dir.path().join("git");
+        #[cfg(unix)]
+        {
+            std::fs::write(
+                &fake_git,
+                "#!/bin/sh\ncat >/dev/null\nprintf 'password=ghp-test-token\\n'\n",
+            )
+            .unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&fake_git).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&fake_git, perms).unwrap();
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::write(
+                &fake_git,
+                "@echo off\nmore > nul\necho password=ghp-test-token\n",
+            )
+            .unwrap();
+        }
+
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        let new_path = format!("{}:{}", dir.path().display(), old_path);
+        unsafe { std::env::set_var("PATH", &new_path) };
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let token = rt
+            .block_on(git_credential_token("github.com", "owner/repo"))
+            .unwrap();
+
+        unsafe { std::env::set_var("PATH", old_path) };
+        assert_eq!(token, Some("ghp-test-token".to_string()));
     }
 }

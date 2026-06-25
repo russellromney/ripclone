@@ -29,7 +29,7 @@ async fn two_phase_depth1_immediate_then_full() {
     // Sync returns after phase 1 (depth=1 published; full builds in background).
     server
         .client()
-        .sync_repo("acme", "tp", None, None)
+        .sync_repo("acme/tp", None)
         .await
         .expect("sync");
 
@@ -80,7 +80,7 @@ async fn two_phase_files_mode_after_phase2() {
     origin.publish();
     server
         .client()
-        .sync_repo("acme", "tpf", None, None)
+        .sync_repo("acme/tpf", None)
         .await
         .expect("sync");
 
@@ -115,11 +115,7 @@ async fn two_phase_resync_full_upgrades() {
     let origin = make_origin("acme", "tp2");
     origin.commit(&[("a", "1\n")], "c1");
     origin.publish();
-    server
-        .client()
-        .sync_repo("acme", "tp2", None, None)
-        .await
-        .unwrap();
+    server.client().sync_repo("acme/tp2", None).await.unwrap();
 
     // Wait for the first full to land.
     let mut ready = false;
@@ -137,11 +133,7 @@ async fn two_phase_resync_full_upgrades() {
     // Advance upstream and re-sync.
     origin.commit(&[("a", "2\n"), ("c", "new\n")], "c2");
     origin.publish();
-    server
-        .client()
-        .sync_repo("acme", "tp2", None, None)
-        .await
-        .unwrap();
+    server.client().sync_repo("acme/tp2", None).await.unwrap();
 
     // depth=1 immediately reflects the new commit.
     let (_g1, c1) = clone_only(&server, "acme", "tp2", 1, CloneMode::Editable)

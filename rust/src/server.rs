@@ -1,11 +1,13 @@
 use crate::RefInfo;
 use crate::archive::ArchiveBuilder;
+use crate::auth::broker::{CredentialBroker, StaticBroker};
 use crate::cas::Cas;
 use crate::clonepack::{ChunkRef, ClonepackManifest, hash_from_hex, hash_to_hex};
 use crate::git;
 use crate::metrics::Metrics;
 use crate::oidc::OidcVerifier;
 use crate::pack::PackBuilder;
+use crate::provider::{ProviderInstance, ProviderRegistry, RepoId};
 use crate::ref_store::{CachingRefStore, FileRefStore, RefStore, S3RefStore, migrate_legacy_refs};
 use crate::remote_gc::{GcConfig, RemoteGc};
 use crate::retention::Retention;
@@ -16,7 +18,7 @@ use anyhow::{Context, Result};
 use axum::{
     Json, Router,
     body::{Body, Bytes},
-    extract::{ConnectInfo, DefaultBodyLimit, Path, Query, State},
+    extract::{ConnectInfo, DefaultBodyLimit, OriginalUri, Path, Query, State},
     http::{HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -24,7 +26,6 @@ use axum::{
 };
 use futures::{StreamExt, TryStreamExt};
 use prost::Message;
-use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -43,8 +44,9 @@ pub struct ServerState {
     pub storage: StorageRef,
     pub repo_root: PathBuf,
     pub ref_store: Arc<dyn RefStore>,
+    pub provider_registry: ProviderRegistry,
+    pub broker: Arc<dyn CredentialBroker>,
     pub token_hash: Option<String>,
-    pub github_token: Option<String>,
     pub metrics: Arc<Metrics>,
     pub rate_limiter: RateLimiter,
     pub retention: Arc<Retention>,
@@ -246,17 +248,66 @@ pub type BuildWaiters = Arc<
 
 #[derive(Clone)]
 pub struct BuildJob {
-    pub owner: String,
-    pub repo: String,
+    pub repo_id: RepoId,
     #[allow(dead_code)]
     pub branch: String,
     /// Optional build-commit override (see SyncRequest.rev).
     pub rev: Option<String>,
-    pub github_token: Option<secrecy::SecretString>,
+    /// Upstream credential (Tier-B passthrough) used when syncing the mirror.
+    pub credential: Option<secrecy::SecretString>,
 }
 
 fn default_branch_value() -> String {
     "HEAD".to_string()
+}
+
+/// Resolve a `{*rest}` path segment from `/v1/repos/{*rest}/...` into a
+/// `(RepoId, ProviderInstance)` pair.
+///
+/// The first path segment MUST be a registered provider instance id; the
+/// remainder is the opaque repo path. There is no legacy fallback: callers
+/// must address repos as `/v1/repos/{provider}/{path}/...`, even for the
+/// built-in `github` default instance.
+fn resolve_repo_id<'a>(
+    registry: &'a ProviderRegistry,
+    rest: &str,
+) -> Option<(RepoId, &'a ProviderInstance)> {
+    let segments: Vec<&str> = rest.split('/').collect();
+    if segments.len() < 2 {
+        return None;
+    }
+    let provider_id = segments[0];
+    let path = segments[1..].join("/");
+    let provider = registry.get(provider_id)?;
+    Some((
+        RepoId {
+            provider: provider.id.clone(),
+            path,
+        },
+        provider,
+    ))
+}
+
+/// Extract an upstream credential token from request headers.
+///
+/// `X-Upstream-Token` is the canonical header; `X-GitHub-Token` is accepted as a
+/// back-compat alias for existing clients and scripts.
+fn unknown_provider_response() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse {
+            error: "unknown provider".to_string(),
+        }),
+    )
+        .into_response()
+}
+
+fn upstream_token_from_headers(headers: &HeaderMap) -> Option<secrecy::SecretString> {
+    headers
+        .get("X-Upstream-Token")
+        .or_else(|| headers.get("X-GitHub-Token"))
+        .and_then(|v| v.to_str().ok())
+        .map(|s| secrecy::SecretString::new(s.to_string().into()))
 }
 
 fn default_hot_files() -> usize {
@@ -290,10 +341,9 @@ fn validate_repo_id(id: &str) -> Result<()> {
 
 async fn repo_lock(
     locks: &Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
-    owner: &str,
-    repo: &str,
+    repo_id: &RepoId,
 ) -> Arc<tokio::sync::Mutex<()>> {
-    let key = format!("{}/{}", owner, repo);
+    let key = repo_id.storage_key();
     let mut map = locks.lock().await;
     map.entry(key)
         .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
@@ -319,6 +369,12 @@ fn reject_invalid_repo_ids(owner: &str, repo: &str) -> Option<Response> {
 pub struct RefResponse {
     pub owner: String,
     pub repo: String,
+    /// Provider instance id (e.g. "github", "gitlab", "my-gitea").
+    pub provider: String,
+    /// Hostname of the upstream git provider.
+    pub host: String,
+    /// Canonical HTTPS origin URL for the repo.
+    pub origin_url: String,
     pub branch: String,
     pub default_branch: String,
     pub commit: String,
@@ -416,24 +472,19 @@ pub struct RegionStorageEntry {
 
 pub fn build_app(state: ServerState) -> Router {
     let protected = Router::new()
-        .route("/v1/repos/{owner}/{repo}/refs/{branch}", get(get_ref))
-        .route("/v1/repos/{owner}/{repo}/sync", post(sync_repo))
-        .route("/v1/repos/{owner}/{repo}/status", get(repo_status))
-        .route("/v1/repos/{owner}/{repo}/cat", get(cat_file))
-        .route("/v1/repos/{owner}/{repo}/sizes", get(file_sizes))
-        .route("/v1/repos/{owner}/{repo}/snapshot", post(create_snapshot))
-        .route("/v1/repos/{owner}/{repo}/hotfiles", get(get_hotfiles))
-        .route("/v1/repos/{owner}/{repo}/batch", post(batch_files))
+        // Single catch-all route for all repo endpoints. The dispatcher parses
+        // the legacy 2-segment GitHub form ("owner/repo/refs/main") and the
+        // multi-provider form ("gitlab/group/sub/proj/sync") from the path.
+        .route("/v1/repos/{*path}", get(dispatch_repos_get))
+        .route("/v1/repos/{*path}", post(dispatch_repos_post))
         .route("/v1/packs/{hash}", get(get_pack))
         .route("/v1/objects/{sha}", get(get_object))
         .route("/v1/artifacts/{hash}", get(get_artifact))
         .route("/v1/archives/{hash}", get(get_artifact))
         .route("/v1/manifests/{hash}", get(get_artifact))
-        .route("/v1/git/{owner}/{repo}/info/refs", get(git_info_refs))
-        .route(
-            "/v1/git/{owner}/{repo}/git-upload-pack",
-            post(git_upload_pack),
-        )
+        // Single catch-all route for git smart-http endpoints.
+        .route("/v1/git/{*path}", get(dispatch_git_get))
+        .route("/v1/git/{*path}", post(dispatch_git_post))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -660,14 +711,13 @@ struct GitServiceQuery {
 
 /// Smart-HTTP `info/refs` fallback. Advertises refs so a vanilla git client can
 /// talk to ripclone when the archive-first path is not available.
-async fn git_info_refs(
-    Path((owner, repo)): Path<(String, String)>,
-    Query(query): Query<GitServiceQuery>,
-    State(state): State<ServerState>,
+async fn git_info_refs_inner(
+    repo_id: RepoId,
+    provider: ProviderInstance,
+    query: GitServiceQuery,
+    headers: HeaderMap,
+    state: ServerState,
 ) -> Response {
-    if let Some(resp) = reject_invalid_repo_ids(&owner, &repo) {
-        return resp;
-    }
     if query.service != "git-upload-pack" {
         return (
             StatusCode::FORBIDDEN,
@@ -678,14 +728,22 @@ async fn git_info_refs(
             .into_response();
     }
 
-    let mirror_dir = state.repo_root.join(format!("{}_{}.git", owner, repo));
-    let github_token = state
-        .github_token
-        .clone()
-        .map(|s| secrecy::SecretString::new(s.into()));
-    let lock = repo_lock(&state.sync_locks, &owner, &repo).await;
+    let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
+    let request_token = upstream_token_from_headers(&headers);
+    let credential = state
+        .broker
+        .fetch_credential(&repo_id, request_token.as_ref());
+    let lock = repo_lock(&state.sync_locks, &repo_id).await;
     let _guard = lock.lock().await;
-    if let Err(e) = ensure_mirror(&mirror_dir, &owner, &repo, "HEAD", github_token.as_ref()).await {
+    if let Err(e) = ensure_mirror(
+        &mirror_dir,
+        &provider,
+        &repo_id,
+        "HEAD",
+        credential.as_ref(),
+    )
+    .await
+    {
         state.metrics.record_error();
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -749,22 +807,29 @@ async fn advertise_refs(mirror_dir: &std::path::Path) -> Result<Vec<u8>> {
 
 /// Smart-HTTP `git-upload-pack` RPC fallback. Pipes the client's request body
 /// through `git upload-pack --stateless-rpc` on the local bare mirror.
-async fn git_upload_pack(
-    Path((owner, repo)): Path<(String, String)>,
-    State(state): State<ServerState>,
+async fn git_upload_pack_inner(
+    repo_id: RepoId,
+    provider: ProviderInstance,
     body: Body,
+    headers: HeaderMap,
+    state: ServerState,
 ) -> Response {
-    if let Some(resp) = reject_invalid_repo_ids(&owner, &repo) {
-        return resp;
-    }
-    let mirror_dir = state.repo_root.join(format!("{}_{}.git", owner, repo));
-    let github_token = state
-        .github_token
-        .clone()
-        .map(|s| secrecy::SecretString::new(s.into()));
-    let lock = repo_lock(&state.sync_locks, &owner, &repo).await;
+    let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
+    let request_token = upstream_token_from_headers(&headers);
+    let credential = state
+        .broker
+        .fetch_credential(&repo_id, request_token.as_ref());
+    let lock = repo_lock(&state.sync_locks, &repo_id).await;
     let _guard = lock.lock().await;
-    if let Err(e) = ensure_mirror(&mirror_dir, &owner, &repo, "HEAD", github_token.as_ref()).await {
+    if let Err(e) = ensure_mirror(
+        &mirror_dir,
+        &provider,
+        &repo_id,
+        "HEAD",
+        credential.as_ref(),
+    )
+    .await
+    {
         state.metrics.record_error();
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -810,6 +875,301 @@ async fn git_upload_pack(
     }
 }
 
+async fn dispatch_repos_get(
+    Path(path): Path<String>,
+    Query(params): Query<RefQuery>,
+    headers: HeaderMap,
+    State(state): State<ServerState>,
+    OriginalUri(uri): OriginalUri,
+) -> impl IntoResponse {
+    if let Some((repo_path, branch)) = path.rsplit_once("/refs/") {
+        let Some((repo_id, provider)) = resolve_repo_id(&state.provider_registry, repo_path) else {
+            return unknown_provider_response();
+        };
+        if let Some(resp) =
+            validation::reject_if_invalid(|| validation::validate_repo_path(provider, &repo_id))
+        {
+            return resp;
+        }
+        return get_ref_inner(
+            repo_id,
+            provider.clone(),
+            branch.to_string(),
+            params,
+            headers,
+            state,
+        )
+        .await;
+    }
+
+    if path.ends_with("/status") {
+        let repo_path = path.strip_suffix("/status").unwrap();
+        let Some((repo_id, provider)) = resolve_repo_id(&state.provider_registry, repo_path) else {
+            return unknown_provider_response();
+        };
+        if let Some(resp) =
+            validation::reject_if_invalid(|| validation::validate_repo_path(provider, &repo_id))
+        {
+            return resp;
+        }
+        let query = match Query::<RepoStatusQuery>::try_from_uri(&uri) {
+            Ok(q) => q.0,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: e.to_string(),
+                    }),
+                )
+                    .into_response();
+            }
+        };
+        return repo_status_inner(repo_id, provider.clone(), query, state).await;
+    }
+
+    if path.ends_with("/cat") {
+        let repo_path = path.strip_suffix("/cat").unwrap();
+        let Some((repo_id, provider)) = resolve_repo_id(&state.provider_registry, repo_path) else {
+            return unknown_provider_response();
+        };
+        if let Some(resp) =
+            validation::reject_if_invalid(|| validation::validate_repo_path(provider, &repo_id))
+        {
+            return resp;
+        }
+        let query = match Query::<CatRequest>::try_from_uri(&uri) {
+            Ok(q) => q.0,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: e.to_string(),
+                    }),
+                )
+                    .into_response();
+            }
+        };
+        return cat_file_inner(repo_id, provider.clone(), query, state).await;
+    }
+
+    if path.ends_with("/sizes") {
+        let repo_path = path.strip_suffix("/sizes").unwrap();
+        let Some((repo_id, provider)) = resolve_repo_id(&state.provider_registry, repo_path) else {
+            return unknown_provider_response();
+        };
+        if let Some(resp) =
+            validation::reject_if_invalid(|| validation::validate_repo_path(provider, &repo_id))
+        {
+            return resp;
+        }
+        let query = match Query::<SizesRequest>::try_from_uri(&uri) {
+            Ok(q) => q.0,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: e.to_string(),
+                    }),
+                )
+                    .into_response();
+            }
+        };
+        return file_sizes_inner(repo_id, provider.clone(), query, state).await;
+    }
+
+    if path.ends_with("/hotfiles") {
+        let repo_path = path.strip_suffix("/hotfiles").unwrap();
+        let Some((repo_id, provider)) = resolve_repo_id(&state.provider_registry, repo_path) else {
+            return unknown_provider_response();
+        };
+        if let Some(resp) =
+            validation::reject_if_invalid(|| validation::validate_repo_path(provider, &repo_id))
+        {
+            return resp;
+        }
+        let query = match Query::<HotfilesRequest>::try_from_uri(&uri) {
+            Ok(q) => q.0,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: e.to_string(),
+                    }),
+                )
+                    .into_response();
+            }
+        };
+        return get_hotfiles_inner(repo_id, provider.clone(), query, state).await;
+    }
+
+    (
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse {
+            error: "not found".to_string(),
+        }),
+    )
+        .into_response()
+}
+
+async fn dispatch_repos_post(
+    Path(path): Path<String>,
+    headers: HeaderMap,
+    State(state): State<ServerState>,
+    OriginalUri(uri): OriginalUri,
+    body: Body,
+) -> impl IntoResponse {
+    if path.ends_with("/sync") {
+        let repo_path = path.strip_suffix("/sync").unwrap();
+        let Some((repo_id, provider)) = resolve_repo_id(&state.provider_registry, repo_path) else {
+            return unknown_provider_response();
+        };
+        if let Some(resp) =
+            validation::reject_if_invalid(|| validation::validate_repo_path(provider, &repo_id))
+        {
+            return resp;
+        }
+        let query = match Query::<SyncRequest>::try_from_uri(&uri) {
+            Ok(q) => q.0,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: format!("invalid sync request: {}", e),
+                    }),
+                )
+                    .into_response();
+            }
+        };
+        return sync_repo_inner(repo_id, provider.clone(), query, headers, state).await;
+    }
+
+    if path.ends_with("/snapshot") {
+        let repo_path = path.strip_suffix("/snapshot").unwrap();
+        let Some((repo_id, provider)) = resolve_repo_id(&state.provider_registry, repo_path) else {
+            return unknown_provider_response();
+        };
+        if let Some(resp) =
+            validation::reject_if_invalid(|| validation::validate_repo_path(provider, &repo_id))
+        {
+            return resp;
+        }
+        let query = match Query::<SnapshotRequest>::try_from_uri(&uri) {
+            Ok(q) => q.0,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: e.to_string(),
+                    }),
+                )
+                    .into_response();
+            }
+        };
+        return create_snapshot_inner(repo_id, provider.clone(), query, headers, state).await;
+    }
+
+    if path.ends_with("/batch") {
+        let repo_path = path.strip_suffix("/batch").unwrap();
+        let Some((repo_id, provider)) = resolve_repo_id(&state.provider_registry, repo_path) else {
+            return unknown_provider_response();
+        };
+        if let Some(resp) =
+            validation::reject_if_invalid(|| validation::validate_repo_path(provider, &repo_id))
+        {
+            return resp;
+        }
+        let bytes = match axum::body::to_bytes(body, MAX_REQUEST_BODY_BYTES).await {
+            Ok(b) => b,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: format!("read body failed: {}", e),
+                    }),
+                )
+                    .into_response();
+            }
+        };
+        let body: BatchRequest = match serde_json::from_slice(&bytes) {
+            Ok(b) => b,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: format!("invalid batch request: {}", e),
+                    }),
+                )
+                    .into_response();
+            }
+        };
+        return batch_files_inner(repo_id, provider.clone(), body, state).await;
+    }
+
+    (
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse {
+            error: "not found".to_string(),
+        }),
+    )
+        .into_response()
+}
+
+async fn dispatch_git_get(
+    Path(path): Path<String>,
+    Query(query): Query<GitServiceQuery>,
+    headers: HeaderMap,
+    State(state): State<ServerState>,
+) -> Response {
+    if path.ends_with("/info/refs") {
+        let repo_path = path.strip_suffix("/info/refs").unwrap();
+        let Some((repo_id, provider)) = resolve_repo_id(&state.provider_registry, repo_path) else {
+            return unknown_provider_response();
+        };
+        if let Some(resp) =
+            validation::reject_if_invalid(|| validation::validate_repo_path(provider, &repo_id))
+        {
+            return resp;
+        }
+        return git_info_refs_inner(repo_id, provider.clone(), query, headers, state).await;
+    }
+
+    (
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse {
+            error: "not found".to_string(),
+        }),
+    )
+        .into_response()
+}
+
+async fn dispatch_git_post(
+    Path(path): Path<String>,
+    headers: HeaderMap,
+    State(state): State<ServerState>,
+    body: Body,
+) -> Response {
+    if path.ends_with("/git-upload-pack") {
+        let repo_path = path.strip_suffix("/git-upload-pack").unwrap();
+        let Some((repo_id, provider)) = resolve_repo_id(&state.provider_registry, repo_path) else {
+            return unknown_provider_response();
+        };
+        if let Some(resp) =
+            validation::reject_if_invalid(|| validation::validate_repo_path(provider, &repo_id))
+        {
+            return resp;
+        }
+        return git_upload_pack_inner(repo_id, provider.clone(), body, headers, state).await;
+    }
+
+    (
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse {
+            error: "not found".to_string(),
+        }),
+    )
+        .into_response()
+}
+
 async fn upload_pack_rpc(mirror_dir: &std::path::Path, input: Bytes) -> Result<Vec<u8>> {
     let mirror_dir = mirror_dir.to_path_buf();
     tokio::task::spawn_blocking(move || {
@@ -843,18 +1203,24 @@ async fn upload_pack_rpc(mirror_dir: &std::path::Path, input: Bytes) -> Result<V
 
 async fn ensure_mirror(
     mirror_dir: &std::path::Path,
-    owner: &str,
-    repo: &str,
+    provider: &ProviderInstance,
+    repo_id: &RepoId,
     branch: &str,
-    github_token: Option<&secrecy::SecretString>,
+    credential: Option<&secrecy::SecretString>,
 ) -> Result<()> {
     let mirror_dir = mirror_dir.to_path_buf();
-    let owner = owner.to_string();
-    let repo = repo.to_string();
+    let provider = provider.clone();
+    let repo_id = repo_id.clone();
     let branch = branch.to_string();
-    let github_token = github_token.map(|s| s.expose_secret().to_string());
+    let credential = credential.cloned();
     tokio::task::spawn_blocking(move || {
-        git::sync_bare_mirror(&mirror_dir, &owner, &repo, &branch, github_token.as_deref())
+        git::sync_bare_mirror(
+            &mirror_dir,
+            &provider,
+            &repo_id,
+            &branch,
+            credential.as_ref(),
+        )
     })
     .await
     .context("ensure mirror task")?
@@ -883,8 +1249,8 @@ fn stamp_mirror_fresh(state: &ServerState, key: &str) {
 
 const REF_RESPONSE_CACHE_TTL: Duration = Duration::from_secs(30);
 
-fn ref_response_cache_key(owner: &str, repo: &str, branch: &str, clonepack: &str) -> String {
-    format!("{owner}\0{repo}\0{branch}\0{clonepack}")
+fn ref_response_cache_key(repo_id: &RepoId, branch: &str, clonepack: &str) -> String {
+    format!("{}\0{branch}\0{clonepack}", repo_id.storage_key())
 }
 
 fn ref_response_cache_ttl(state: &ServerState) -> Duration {
@@ -893,8 +1259,7 @@ fn ref_response_cache_ttl(state: &ServerState) -> Duration {
 
 fn cached_ref_response(
     state: &ServerState,
-    owner: &str,
-    repo: &str,
+    repo_id: &RepoId,
     branch: &str,
     clonepack: &str,
 ) -> Option<RefResponse> {
@@ -902,7 +1267,7 @@ fn cached_ref_response(
     if ttl.is_zero() {
         return None;
     }
-    let key = ref_response_cache_key(owner, repo, branch, clonepack);
+    let key = ref_response_cache_key(repo_id, branch, clonepack);
     let mut cache = state
         .ref_response_cache
         .lock()
@@ -913,8 +1278,7 @@ fn cached_ref_response(
 
 fn cache_ref_response(
     state: &ServerState,
-    owner: &str,
-    repo: &str,
+    repo_id: &RepoId,
     branch: &str,
     clonepack: &str,
     response: &RefResponse,
@@ -923,7 +1287,7 @@ fn cache_ref_response(
     if ttl.is_zero() {
         return;
     }
-    let key = ref_response_cache_key(owner, repo, branch, clonepack);
+    let key = ref_response_cache_key(repo_id, branch, clonepack);
     let mut cache = state
         .ref_response_cache
         .lock()
@@ -938,8 +1302,8 @@ fn cache_ref_response(
     );
 }
 
-fn invalidate_ref_response_cache(state: &ServerState, owner: &str, repo: &str, branch: &str) {
-    let prefix = format!("{owner}\0{repo}\0{branch}\0");
+fn invalidate_ref_response_cache(state: &ServerState, repo_id: &RepoId, branch: &str) {
+    let prefix = format!("{}\0{branch}\0", repo_id.storage_key());
     let mut cache = state
         .ref_response_cache
         .lock()
@@ -947,16 +1311,15 @@ fn invalidate_ref_response_cache(state: &ServerState, owner: &str, repo: &str, b
     cache.retain(|key, _| !key.starts_with(&prefix));
 }
 
-async fn get_ref(
-    Path((owner, repo, branch)): Path<(String, String, String)>,
-    Query(params): Query<RefQuery>,
-    State(state): State<ServerState>,
+async fn get_ref_inner(
+    repo_id: RepoId,
+    provider: ProviderInstance,
+    branch: String,
+    params: RefQuery,
     headers: HeaderMap,
-) -> impl IntoResponse {
+    state: ServerState,
+) -> Response {
     let private = visibility_is_private(&headers);
-    if let Some(resp) = reject_invalid_repo_ids(&owner, &repo) {
-        return resp;
-    }
     if let Some(resp) = validation::reject_if_invalid(|| validation::validate_git_rev(&branch)) {
         return resp;
     }
@@ -966,34 +1329,40 @@ async fn get_ref(
         return resp;
     }
     state.metrics.record_ref_lookup();
-    let key = format!("{}/{}/{}", owner, repo, branch);
+    let key = format!("{}/{}", repo_id.storage_key(), branch);
     // Optional build-commit override: resolve this rev instead of the branch tip
     // so a clone can fetch the artifacts a `sync?rev=...` built. The response
     // cache is bypassed for rev requests (a testing path, low volume).
     let resolve_target = params.rev.clone().unwrap_or_else(|| branch.clone());
 
-    let mirror_dir = state.repo_root.join(format!("{}_{}.git", owner, repo));
-    let github_token = state
-        .github_token
-        .clone()
-        .map(|s| secrecy::SecretString::new(s.into()));
+    let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
+    let request_token = upstream_token_from_headers(&headers);
+    let credential = state
+        .broker
+        .fetch_credential(&repo_id, request_token.as_ref());
 
     // Serialize syncs for this repo so concurrent fetches do not corrupt the
     // bare mirror directory. Acquiring the lock also means any in-progress sync
     // for this repo has finished by the time we proceed.
-    let fresh_key = format!("{}/{}/{}", owner, repo, branch);
-    let lock = repo_lock(&state.sync_locks, &owner, &repo).await;
+    let fresh_key = format!("{}/{}", repo_id.storage_key(), branch);
+    let lock = repo_lock(&state.sync_locks, &repo_id).await;
     let _guard = lock.lock().await;
     if params.rev.is_none()
-        && let Some(resp) = cached_ref_response(&state, &owner, &repo, &branch, &params.clonepack)
+        && let Some(resp) = cached_ref_response(&state, &repo_id, &branch, &params.clonepack)
     {
         return (StatusCode::OK, Json(resp)).into_response();
     }
     // Skip the `git fetch` when the mirror was refreshed within the TTL — by a
     // recent resolve, or by the sync we just waited on while holding the lock.
     if !mirror_is_fresh(&state, &fresh_key) {
-        if let Err(e) =
-            ensure_mirror(&mirror_dir, &owner, &repo, &branch, github_token.as_ref()).await
+        if let Err(e) = ensure_mirror(
+            &mirror_dir,
+            &provider,
+            &repo_id,
+            &branch,
+            credential.as_ref(),
+        )
+        .await
         {
             state.metrics.record_error();
             return (
@@ -1008,12 +1377,22 @@ async fn get_ref(
     }
     drop(_guard);
 
+    // Resolve HEAD to the default branch for artifact lookup and the response.
+    // The client may request refs/HEAD; we still need to hand back the artifacts
+    // stored under the concrete default branch name.
+    let default_branch = git::default_branch(&mirror_dir).unwrap_or_else(|_| "HEAD".to_string());
+    let effective_branch = if branch == "HEAD" {
+        default_branch.clone()
+    } else {
+        branch.clone()
+    };
+
     // Load the stored info, if any. A rev request loads the rolling test key the
     // matching `sync?rev=...` stored under (isolated from the real branch entry).
-    let store_key = ref_store_key(&branch, params.rev.as_deref());
+    let store_key = ref_store_key(&effective_branch, params.rev.as_deref());
     let fallback = state
         .ref_store
-        .load_branch(&owner, &repo, &store_key)
+        .load_branch(&repo_id, &store_key)
         .await
         .ok()
         .flatten();
@@ -1024,8 +1403,6 @@ async fn get_ref(
         .await
     {
         Ok(Ok(commit)) => {
-            let default_branch =
-                git::default_branch(&mirror_dir).unwrap_or_else(|_| "HEAD".to_string());
             // Only reuse stored artifact hashes when they match the resolved
             // commit; otherwise we would hand out signed URLs for stale chunks.
             let fallback = fallback.filter(|info| info.commit == commit);
@@ -1057,16 +1434,22 @@ async fn get_ref(
                 synced_at: None,
             });
             let resp = ref_response(
-                owner.clone(),
-                repo.clone(),
-                branch.clone(),
+                &repo_id,
+                &provider,
+                effective_branch.clone(),
                 &info,
                 &state.storage,
                 &params.clonepack,
                 private,
             );
             if info.build_status.is_none() && params.rev.is_none() {
-                cache_ref_response(&state, &owner, &repo, &branch, &params.clonepack, &resp);
+                cache_ref_response(
+                    &state,
+                    &repo_id,
+                    &effective_branch,
+                    &params.clonepack,
+                    &resp,
+                );
             }
             (StatusCode::OK, Json(resp)).into_response()
         }
@@ -1108,8 +1491,8 @@ fn ref_signed_url_ttl(private: bool) -> Duration {
 }
 
 fn ref_response(
-    owner: String,
-    repo: String,
+    repo_id: &RepoId,
+    provider: &ProviderInstance,
     branch: String,
     info: &RefInfo,
     storage: &crate::storage::StorageRef,
@@ -1214,9 +1597,17 @@ fn ref_response(
         artifacts.commit.clone()
     };
 
+    let (owner, repo) = repo_id
+        .github_owner_repo()
+        .map(|(o, r)| (o.to_string(), r.to_string()))
+        .unwrap_or_else(|| (repo_id.provider.as_str().to_string(), repo_id.path.clone()));
+    let origin_url = provider.clone_url(&repo_id.path);
     RefResponse {
         owner,
         repo,
+        provider: provider.id.as_str().to_string(),
+        host: provider.host.clone(),
+        origin_url,
         branch,
         default_branch: info.default_branch.clone(),
         commit: served_commit,
@@ -1264,23 +1655,13 @@ struct RepoStatusQuery {
     fork_of: Option<String>,
 }
 
-async fn repo_status(
-    Path((owner, repo)): Path<(String, String)>,
-    Query(query): Query<RepoStatusQuery>,
-    State(state): State<ServerState>,
-) -> impl IntoResponse {
-    if let Some(resp) = reject_invalid_repo_ids(&owner, &repo) {
-        return resp;
-    }
-    match build_repo_status(
-        &state,
-        &owner,
-        &repo,
-        query.public,
-        query.fork_of.as_deref(),
-    )
-    .await
-    {
+async fn repo_status_inner(
+    repo_id: RepoId,
+    _provider: ProviderInstance,
+    query: RepoStatusQuery,
+    state: ServerState,
+) -> Response {
+    match build_repo_status(&state, &repo_id, query.public, query.fork_of.as_deref()).await {
         Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
         Err(e) => {
             state.metrics.record_error();
@@ -1343,17 +1724,16 @@ fn collect_manifest_hashes(info: &crate::RefInfo) -> Vec<String> {
 
 async fn build_repo_status(
     state: &ServerState,
-    owner: &str,
-    repo: &str,
+    repo_id: &RepoId,
     public: bool,
     fork_of: Option<&str>,
 ) -> Result<RepoStatusResponse> {
-    let branches = state.ref_store.list_branches(owner, repo).await?;
+    let branches = state.ref_store.list_branches(repo_id).await?;
     let mut refs = Vec::new();
     let mut unique_chunks: HashMap<String, u64> = HashMap::new();
 
     for branch in branches {
-        let Some(info) = state.ref_store.load_branch(owner, repo, &branch).await? else {
+        let Some(info) = state.ref_store.load_branch(repo_id, &branch).await? else {
             continue;
         };
 
@@ -1441,9 +1821,13 @@ async fn build_repo_status(
         })
         .collect();
 
+    let (owner, repo) = repo_id
+        .github_owner_repo()
+        .map(|(o, r)| (o.to_string(), r.to_string()))
+        .unwrap_or_default();
     Ok(RepoStatusResponse {
-        owner: owner.to_string(),
-        repo: repo.to_string(),
+        owner,
+        repo,
         refs,
         total_bytes,
         total_unique_bytes,
@@ -1469,15 +1853,13 @@ fn split_and_store_pack(cas: &crate::cas::Cas, pack: &[u8]) -> Result<Vec<ChunkR
     Ok(refs)
 }
 
-async fn sync_repo(
-    Path((owner, repo)): Path<(String, String)>,
-    Query(params): Query<SyncRequest>,
+async fn sync_repo_inner(
+    repo_id: RepoId,
+    provider: ProviderInstance,
+    params: SyncRequest,
     headers: HeaderMap,
-    State(state): State<ServerState>,
-) -> impl IntoResponse {
-    if let Some(resp) = reject_invalid_repo_ids(&owner, &repo) {
-        return resp;
-    }
+    state: ServerState,
+) -> Response {
     if let Some(resp) =
         validation::reject_if_invalid(|| validation::validate_git_rev(&params.branch))
     {
@@ -1489,23 +1871,14 @@ async fn sync_repo(
         return resp;
     }
     let start = Instant::now();
-    let mirror_dir = state.repo_root.join(format!("{}_{}.git", owner, repo));
+    let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
     let branch = params.branch;
     let at_rev = params.rev;
-    // Ref-store key: rev builds use a rolling test key isolated from the real
-    // branch entry (see ref_store_key). Used when loading the result for the
-    // sync response below.
-    let ref_key = ref_store_key(&branch, at_rev.as_deref());
-    let github_token = headers
-        .get("X-GitHub-Token")
-        .and_then(|v| v.to_str().ok())
-        .map(|t| secrecy::SecretString::new(t.into()))
-        .or_else(|| {
-            state
-                .github_token
-                .clone()
-                .map(|s| secrecy::SecretString::new(s.into()))
-        });
+
+    let request_token = upstream_token_from_headers(&headers);
+    let credential = state
+        .broker
+        .fetch_credential(&repo_id, request_token.as_ref());
     let private = visibility_is_private(&headers);
 
     // Async build queue: enqueue the build onto the bounded background worker so
@@ -1516,7 +1889,8 @@ async fn sync_repo(
         // Include the rev override in the coalescing key so syncs targeting
         // different build commits don't share one build.
         let key = format!(
-            "{owner}/{repo}/{branch}#{}",
+            "{}/{branch}#{}",
+            repo_id.storage_key(),
             at_rev.as_deref().unwrap_or("")
         );
         let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
@@ -1534,11 +1908,10 @@ async fn sync_repo(
             // the gauge underflows).
             state.metrics.record_build_queued();
             let job = BuildJob {
-                owner: owner.clone(),
-                repo: repo.clone(),
+                repo_id: repo_id.clone(),
                 branch: branch.clone(),
                 rev: at_rev.clone(),
-                github_token,
+                credential,
             };
             if state.build_queue.try_send(job).is_err() {
                 state.build_queue_depth.fetch_sub(1, Ordering::Relaxed);
@@ -1559,30 +1932,43 @@ async fn sync_repo(
         // than holding the connection until it is reset mid-request.
         let wait = Duration::from_secs(env_bytes("RIPCLONE_SYNC_WAIT_SECS", 25));
         match tokio::time::timeout(wait, rx).await {
-            Ok(Ok(Ok(()))) => match state.ref_store.load_branch(&owner, &repo, &ref_key).await {
-                Ok(Some(info)) => {
-                    state.metrics.record_sync(start.elapsed());
-                    let resp = ref_response(
-                        owner,
-                        repo,
-                        branch.clone(),
-                        &info,
-                        &state.storage,
-                        "full",
-                        private,
-                    );
-                    return (StatusCode::OK, Json(resp)).into_response();
+            Ok(Ok(Ok(()))) => {
+                // Resolve HEAD to the concrete default branch before loading the
+                // persisted ref; do_sync stores artifacts under the real branch.
+                let effective_branch = if branch == "HEAD" {
+                    git::default_branch(&mirror_dir)
+                        .ok()
+                        .filter(|b| !b.is_empty())
+                        .unwrap_or_else(|| branch.clone())
+                } else {
+                    branch.clone()
+                };
+                let load_key = ref_store_key(&effective_branch, at_rev.as_deref());
+                match state.ref_store.load_branch(&repo_id, &load_key).await {
+                    Ok(Some(info)) => {
+                        state.metrics.record_sync(start.elapsed());
+                        let resp = ref_response(
+                            &repo_id,
+                            &provider,
+                            effective_branch,
+                            &info,
+                            &state.storage,
+                            "full",
+                            private,
+                        );
+                        return (StatusCode::OK, Json(resp)).into_response();
+                    }
+                    _ => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(ErrorResponse {
+                                error: "build finished but ref missing".to_string(),
+                            }),
+                        )
+                            .into_response();
+                    }
                 }
-                _ => {
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(ErrorResponse {
-                            error: "build finished but ref missing".to_string(),
-                        }),
-                    )
-                        .into_response();
-                }
-            },
+            }
             Ok(Ok(Err(e))) => {
                 state.metrics.record_error();
                 return (
@@ -1616,33 +2002,47 @@ async fn sync_repo(
         }
     }
 
-    let lock = repo_lock(&state.sync_locks, &owner, &repo).await;
+    let lock = repo_lock(&state.sync_locks, &repo_id).await;
     let _guard = lock.lock().await;
     match do_sync(
         &state.cas,
         &mirror_dir,
-        &owner,
-        &repo,
+        &repo_id,
         &branch,
         at_rev.as_deref(),
         &state.ref_store,
         false,
         &state.storage,
         &state.retention,
-        github_token.as_ref(),
+        &provider,
+        credential.as_ref(),
     )
     .await
     {
         Ok(info) => {
             state.metrics.record_sync(start.elapsed());
+            // Resolve HEAD to the concrete default branch for caching/response.
+            let effective_branch = if branch == "HEAD" {
+                info.default_branch.clone()
+            } else {
+                branch.clone()
+            };
             // The mirror was just fetched; let the immediately-following resolve
-            // skip its own fetch.
-            stamp_mirror_fresh(&state, &format!("{}/{}/{}", owner, repo, branch));
-            invalidate_ref_response_cache(&state, &owner, &repo, &branch);
+            // skip its own fetch. Stamp both the concrete branch and the original
+            // requested branch (e.g. HEAD) so callers resolving either key avoid a
+            // redundant fetch.
+            stamp_mirror_fresh(
+                &state,
+                &format!("{}/{}", repo_id.storage_key(), effective_branch),
+            );
+            if branch != effective_branch {
+                stamp_mirror_fresh(&state, &format!("{}/{}", repo_id.storage_key(), branch));
+            }
+            invalidate_ref_response_cache(&state, &repo_id, &effective_branch);
             let resp = ref_response(
-                owner,
-                repo,
-                branch.clone(),
+                &repo_id,
+                &provider,
+                effective_branch,
                 &info,
                 &state.storage,
                 "full",
@@ -1744,15 +2144,13 @@ async fn build_handler(
             .into_response();
     }
 
+    let job_repo_id = RepoId::github(format!("{}/{}", body.owner, body.repo));
+    let credential = state.broker.fetch_credential(&job_repo_id, None);
     let job = BuildJob {
-        owner: body.owner,
-        repo: body.repo,
+        repo_id: job_repo_id,
         branch: "HEAD".to_string(),
         rev: None,
-        github_token: state
-            .github_token
-            .clone()
-            .map(|s| secrecy::SecretString::new(s.into())),
+        credential,
     };
 
     // Increment counters before enqueueing so a fast worker cannot decrement
@@ -1784,20 +2182,18 @@ async fn build_handler(
         .into_response()
 }
 
-async fn cat_file(
-    Path((owner, repo)): Path<(String, String)>,
-    Query(query): Query<CatRequest>,
-    State(state): State<ServerState>,
-) -> impl IntoResponse {
-    if let Some(resp) = reject_invalid_repo_ids(&owner, &repo) {
-        return resp;
-    }
+async fn cat_file_inner(
+    repo_id: RepoId,
+    _provider: ProviderInstance,
+    query: CatRequest,
+    state: ServerState,
+) -> Response {
     if let Some(resp) =
         validation::reject_if_invalid(|| validation::validate_git_rev(&query.branch))
     {
         return resp;
     }
-    let mirror_dir = state.repo_root.join(format!("{}_{}.git", owner, repo));
+    let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
     let path = query.path;
     let branch = query.branch;
 
@@ -1828,20 +2224,18 @@ async fn cat_file(
     }
 }
 
-async fn file_sizes(
-    Path((owner, repo)): Path<(String, String)>,
-    Query(query): Query<SizesRequest>,
-    State(state): State<ServerState>,
-) -> impl IntoResponse {
-    if let Some(resp) = reject_invalid_repo_ids(&owner, &repo) {
-        return resp;
-    }
+async fn file_sizes_inner(
+    repo_id: RepoId,
+    _provider: ProviderInstance,
+    query: SizesRequest,
+    state: ServerState,
+) -> Response {
     if let Some(resp) =
         validation::reject_if_invalid(|| validation::validate_git_rev(&query.branch))
     {
         return resp;
     }
-    let mirror_dir = state.repo_root.join(format!("{}_{}.git", owner, repo));
+    let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
     let branch = query.branch;
 
     let result = tokio::task::spawn_blocking(move || {
@@ -1869,45 +2263,44 @@ async fn file_sizes(
     }
 }
 
-async fn create_snapshot(
-    Path((owner, repo)): Path<(String, String)>,
-    Query(query): Query<SnapshotRequest>,
-    State(state): State<ServerState>,
-) -> impl IntoResponse {
-    if let Some(resp) = reject_invalid_repo_ids(&owner, &repo) {
-        return resp;
-    }
+async fn create_snapshot_inner(
+    repo_id: RepoId,
+    provider: ProviderInstance,
+    query: SnapshotRequest,
+    headers: HeaderMap,
+    state: ServerState,
+) -> Response {
     if let Some(resp) =
         validation::reject_if_invalid(|| validation::validate_git_rev(&query.branch))
     {
         return resp;
     }
-    let mirror_dir = state.repo_root.join(format!("{}_{}.git", owner, repo));
-    let github_token = state
-        .github_token
-        .clone()
-        .map(|s| secrecy::SecretString::new(s.into()));
+    let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
+    let request_token = upstream_token_from_headers(&headers);
+    let credential = state
+        .broker
+        .fetch_credential(&repo_id, request_token.as_ref());
     let branch = query.branch.clone();
 
-    let lock = repo_lock(&state.sync_locks, &owner, &repo).await;
+    let lock = repo_lock(&state.sync_locks, &repo_id).await;
     let _guard = lock.lock().await;
     let info = match do_sync(
         &state.cas,
         &mirror_dir,
-        &owner,
-        &repo,
+        &repo_id,
         &branch,
         None,
         &state.ref_store,
         false,
         &state.storage,
         &state.retention,
-        github_token.as_ref(),
+        &provider,
+        credential.as_ref(),
     )
     .await
     {
         Ok(info) => {
-            invalidate_ref_response_cache(&state, &owner, &repo, &branch);
+            invalidate_ref_response_cache(&state, &repo_id, &branch);
             drop(_guard);
             info
         }
@@ -1935,19 +2328,25 @@ async fn create_snapshot(
     })
     .await
     {
-        Ok(Ok(snap)) => (
-            StatusCode::OK,
-            Json(SnapshotResponse {
-                owner,
-                repo,
-                branch: query.branch,
-                commit: snap.commit,
-                snapshot_hash: snap.hash,
-                size: snap.size,
-                hot_files: snap.hot_files,
-            }),
-        )
-            .into_response(),
+        Ok(Ok(snap)) => {
+            let (resp_owner, resp_repo) = repo_id
+                .github_owner_repo()
+                .map(|(o, r)| (o.to_string(), r.to_string()))
+                .unwrap_or_else(|| (repo_id.provider.as_str().to_string(), repo_id.path.clone()));
+            (
+                StatusCode::OK,
+                Json(SnapshotResponse {
+                    owner: resp_owner,
+                    repo: resp_repo,
+                    branch: query.branch,
+                    commit: snap.commit,
+                    snapshot_hash: snap.hash,
+                    size: snap.size,
+                    hot_files: snap.hot_files,
+                }),
+            )
+                .into_response()
+        }
         Ok(Err(e)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
@@ -1965,15 +2364,13 @@ async fn create_snapshot(
     }
 }
 
-async fn get_hotfiles(
-    Path((owner, repo)): Path<(String, String)>,
-    Query(query): Query<HotfilesRequest>,
-    State(state): State<ServerState>,
-) -> impl IntoResponse {
-    if let Some(resp) = reject_invalid_repo_ids(&owner, &repo) {
-        return resp;
-    }
-    let mirror_dir = state.repo_root.join(format!("{}_{}.git", owner, repo));
+async fn get_hotfiles_inner(
+    repo_id: RepoId,
+    _provider: ProviderInstance,
+    query: HotfilesRequest,
+    state: ServerState,
+) -> Response {
+    let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
     let branch = query.branch;
     let count = query.count;
 
@@ -2004,14 +2401,12 @@ async fn get_hotfiles(
     }
 }
 
-async fn batch_files(
-    Path((owner, repo)): Path<(String, String)>,
-    State(state): State<ServerState>,
-    Json(body): Json<BatchRequest>,
-) -> impl IntoResponse {
-    if let Some(resp) = reject_invalid_repo_ids(&owner, &repo) {
-        return resp;
-    }
+async fn batch_files_inner(
+    repo_id: RepoId,
+    _provider: ProviderInstance,
+    body: BatchRequest,
+    state: ServerState,
+) -> Response {
     if let Some(resp) = validation::reject_if_invalid(|| validation::validate_git_rev(&body.branch))
     {
         return resp;
@@ -2021,7 +2416,7 @@ async fn batch_files(
     {
         return resp;
     }
-    let mirror_dir = state.repo_root.join(format!("{}_{}.git", owner, repo));
+    let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
     let branch = body.branch;
     let commit_hint = body.commit;
     let paths = body.paths;
@@ -2678,8 +3073,7 @@ async fn settle_storage(
 async fn do_sync(
     cas: &Cas,
     mirror_dir: &std::path::Path,
-    owner: &str,
-    repo: &str,
+    repo_id: &RepoId,
     branch: &str,
     // Optional build-commit override (e.g. "HEAD~5"); when None the branch tip is
     // used. The branch is still the ref-store key and fetch target.
@@ -2688,9 +3082,10 @@ async fn do_sync(
     build_full_pack: bool,
     storage: &crate::storage::StorageRef,
     retention: &Arc<Retention>,
-    github_token: Option<&secrecy::SecretString>,
+    provider: &ProviderInstance,
+    credential: Option<&secrecy::SecretString>,
 ) -> Result<RefInfo> {
-    info!("syncing {}/{}@{}", owner, repo, branch);
+    info!("syncing {}@{}", repo_id.storage_key(), branch);
 
     // Per-phase timers so sync cost can be tuned with real numbers (RIPCLONE_LOG
     // shows them at INFO). `t_total` spans the whole build; `t` is reset at each
@@ -2709,17 +3104,17 @@ async fn do_sync(
     // Sync the bare mirror synchronously (blocking git call).
     let mirror_dir_sync = mirror_dir.to_path_buf();
     let mirror_dir = mirror_dir.to_path_buf();
-    let owner_sync = owner.to_string();
-    let repo_sync = repo.to_string();
+    let provider_sync = provider.clone();
+    let repo_id_sync = repo_id.clone();
     let branch_sync = branch.to_string();
-    let github_token = github_token.map(|s| s.expose_secret().to_string());
+    let credential_sync = credential.cloned();
     tokio::task::spawn_blocking(move || {
         git::sync_bare_mirror(
             &mirror_dir_sync,
-            &owner_sync,
-            &repo_sync,
+            &provider_sync,
+            &repo_id_sync,
             &branch_sync,
-            github_token.as_deref(),
+            credential_sync.as_ref(),
         )
     })
     .await
@@ -2732,6 +3127,14 @@ async fn do_sync(
     let commit = git::resolve_commit(&mirror_dir, at_rev.unwrap_or(branch))?;
     let parent = git::parent_commit(&mirror_dir, &commit).ok().flatten();
     let default_branch = git::default_branch(&mirror_dir).unwrap_or_else(|_| "HEAD".to_string());
+
+    // If the caller asked for HEAD, store artifacts under the concrete default
+    // branch name so both /refs/HEAD and /refs/<branch> find the same build.
+    let branch = if branch == "HEAD" {
+        default_branch.as_str()
+    } else {
+        branch
+    };
 
     // Ref-store key. Rev builds use a rolling test key so they never overwrite
     // the real branch entry; everything below stores/loads under this key. The
@@ -2748,13 +3151,13 @@ async fn do_sync(
     // Option-A carried-prior case, in-flight/failed phase 2, and the async
     // worker's transient "building" status (which would otherwise mask a prior
     // completed build).
-    if let Ok(Some(prev)) = ref_store.load_branch(owner, repo, branch).await
+    if let Ok(Some(prev)) = ref_store.load_branch(repo_id, branch).await
         && prev.full_clonepack.commit == commit
         && !prev.full_clonepack.manifest.is_empty()
     {
         info!(
             "sync no-op: {} already current at {} (reusing prior clonepack)",
-            repo,
+            repo_id.storage_key(),
             &commit[..7.min(commit.len())]
         );
         return Ok(prev);
@@ -2776,8 +3179,7 @@ async fn do_sync(
         return build_and_publish_two_phase(
             cas,
             &mirror_dir,
-            owner,
-            repo,
+            repo_id,
             branch,
             &commit,
             parent,
@@ -2842,7 +3244,7 @@ async fn do_sync(
     let lsm = lsm_cfg.enabled;
     let prev_levels: Vec<crate::HistoryLevel> = if lsm {
         ref_store
-            .load_branch(owner, repo, branch)
+            .load_branch(repo_id, branch)
             .await
             .ok()
             .flatten()
@@ -3336,14 +3738,13 @@ async fn do_sync(
     let mut info = info;
     info.build_status = None;
     ref_store
-        .save_branch(owner, repo, branch, &info)
+        .save_branch(repo_id, branch, &info)
         .await
-        .with_context(|| format!("persist ref store for {owner}/{repo}@{branch}"))?;
+        .with_context(|| format!("persist ref store for {}@{branch}", repo_id.storage_key()))?;
 
     info!(
-        "synced {}/{} at {} (total build {:?})",
-        owner,
-        repo,
+        "synced {} at {} (total build {:?})",
+        repo_id.storage_key(),
         &commit[..7],
         t_total.elapsed()
     );
@@ -3384,8 +3785,7 @@ struct HeadBuild {
 async fn build_and_publish_two_phase(
     cas: &Cas,
     mirror_dir: &std::path::Path,
-    owner: &str,
-    repo: &str,
+    repo_id: &RepoId,
     branch: &str,
     commit: &str,
     parent: Option<String>,
@@ -3400,11 +3800,7 @@ async fn build_and_publish_two_phase(
 
     // Load the previous synced ref once: used both for the files-table by-diff
     // below and for Option-A full-clonepack carry later in this phase.
-    let prev = ref_store
-        .load_branch(owner, repo, branch)
-        .await
-        .ok()
-        .flatten();
+    let prev = ref_store.load_branch(repo_id, branch).await.ok().flatten();
 
     // ---- PHASE 1: HEAD closure + archive + shallow skeleton -> publish depth=1 ----
     let mut t = Instant::now();
@@ -3693,9 +4089,9 @@ async fn build_and_publish_two_phase(
     settle_storage(cas, storage, retention, p1, head_idx_keep).await;
 
     ref_store
-        .save_branch(owner, repo, branch, &info)
+        .save_branch(repo_id, branch, &info)
         .await
-        .with_context(|| format!("persist depth=1 ref for {owner}/{repo}@{branch}"))?;
+        .with_context(|| format!("persist depth=1 ref for {}@{branch}", repo_id.storage_key()))?;
     info!(
         "two-phase p1: published depth=1 for {} in {:?} (full history building in background)",
         &commit[..7.min(commit.len())],
@@ -3709,7 +4105,8 @@ async fn build_and_publish_two_phase(
     let ref_store2 = ref_store.clone();
     let retention2 = retention.clone();
     let mirror2 = mirror_dir.to_path_buf();
-    let (owner2, repo2, branch2) = (owner.to_string(), repo.to_string(), branch.to_string());
+    let repo_id2 = repo_id.clone();
+    let branch2 = branch.to_string();
     let commit2 = commit.to_string();
     let parent2 = parent.clone();
     let default_branch2 = default_branch.to_string();
@@ -3724,8 +4121,7 @@ async fn build_and_publish_two_phase(
         let res = build_full_in_background(
             &cas2,
             &mirror2,
-            &owner2,
-            &repo2,
+            &repo_id2,
             &branch2,
             &commit2,
             parent2,
@@ -3756,7 +4152,10 @@ async fn build_and_publish_two_phase(
                 &commit2[..7.min(commit2.len())],
                 started.elapsed()
             ),
-            Err(e) => error!("full clone build failed for {owner2}/{repo2}: {e:#}"),
+            Err(e) => error!(
+                "full clone build failed for {}: {e:#}",
+                repo_id2.storage_key()
+            ),
         }
     });
 
@@ -3769,8 +4168,7 @@ async fn build_and_publish_two_phase(
 async fn build_full_in_background(
     cas: &Cas,
     mirror_dir: &std::path::Path,
-    owner: &str,
-    repo: &str,
+    repo_id: &RepoId,
     branch: &str,
     commit: &str,
     parent: Option<String>,
@@ -3986,7 +4384,7 @@ async fn build_full_in_background(
     // archive is built below; a files clone waits for it.
     {
         let mut info = ref_store
-            .load_branch(owner, repo, branch)
+            .load_branch(repo_id, branch)
             .await?
             .ok_or_else(|| anyhow::anyhow!("ref vanished before editable publish"))?;
         let mut all_packs = head_packs.clone();
@@ -4023,9 +4421,14 @@ async fn build_full_in_background(
         }
         info.build_status = Some("archive building".to_string());
         ref_store
-            .save_branch(owner, repo, branch, &info)
+            .save_branch(repo_id, branch, &info)
             .await
-            .with_context(|| format!("persist editable ref for {owner}/{repo}@{branch}"))?;
+            .with_context(|| {
+                format!(
+                    "persist editable ref for {}@{branch}",
+                    repo_id.storage_key()
+                )
+            })?;
     }
     settle_storage(cas, storage, retention, uploads, idx_keep).await;
     info!(
@@ -4082,7 +4485,7 @@ async fn build_full_in_background(
     // commit (a newer sync owns it otherwise, and brings its own archive).
     {
         let mut info = ref_store
-            .load_branch(owner, repo, branch)
+            .load_branch(repo_id, branch)
             .await?
             .ok_or_else(|| anyhow::anyhow!("ref vanished before archive publish"))?;
         if info.commit == commit {
@@ -4096,9 +4499,11 @@ async fn build_full_in_background(
             info.archive_frames = archive_frames;
             info.build_status = None;
             ref_store
-                .save_branch(owner, repo, branch, &info)
+                .save_branch(repo_id, branch, &info)
                 .await
-                .with_context(|| format!("persist files ref for {owner}/{repo}@{branch}"))?;
+                .with_context(|| {
+                    format!("persist files ref for {}@{branch}", repo_id.storage_key())
+                })?;
         }
     }
     settle_storage(
@@ -4123,61 +4528,90 @@ fn spawn_build_worker(state: ServerState) -> tokio::sync::mpsc::Sender<BuildJob>
 
     tokio::spawn(async move {
         while let Some(job) = rx.recv().await {
-            let owner = job.owner.clone();
-            let repo = job.repo.clone();
+            let repo_id = job.repo_id.clone();
             let branch = job.branch.clone();
             let at_rev = job.rev.clone();
             let state = state.clone();
 
             // Mark as building in the shared ref store.
-            let _ = update_build_status(&state, &owner, &repo, "building").await;
-            invalidate_ref_response_cache(&state, &owner, &repo, &branch);
+            let _ = update_build_status(&state, &repo_id, "building").await;
+            invalidate_ref_response_cache(&state, &repo_id, &branch);
 
             let start = std::time::Instant::now();
-            let mirror_dir = state.repo_root.join(format!("{}_{}.git", owner, repo));
-            let lock = repo_lock(&state.sync_locks, &owner, &repo).await;
+            let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
+            let provider = match state.provider_registry.get(repo_id.provider.as_str()) {
+                Some(p) => p.clone(),
+                None => {
+                    let _ = update_build_status(&state, &repo_id, "error").await;
+                    warn!(
+                        "unknown provider {} for build job",
+                        repo_id.provider.as_str()
+                    );
+                    state.build_queue_depth.fetch_sub(1, Ordering::Relaxed);
+                    continue;
+                }
+            };
+            let lock = repo_lock(&state.sync_locks, &repo_id).await;
             let _guard = lock.lock().await;
             let result = do_sync(
                 &state.cas,
                 &mirror_dir,
-                &owner,
-                &repo,
+                &repo_id,
                 &branch,
                 at_rev.as_deref(),
                 &state.ref_store,
                 false,
                 &state.storage,
                 &state.retention,
-                job.github_token.as_ref(),
+                &provider,
+                job.credential.as_ref(),
             )
             .await;
             drop(_guard);
 
             state.build_queue_depth.fetch_sub(1, Ordering::Relaxed);
+            // Resolve HEAD to the concrete default branch for cache/log keys.
+            let effective_branch = match &result {
+                Ok(info) if branch == "HEAD" => info.default_branch.clone(),
+                _ => branch.clone(),
+            };
             let waiter_result: Result<(), String> = match &result {
                 Ok(_) => {
                     state.metrics.record_build_completed(start.elapsed());
-                    let _ = update_build_status(&state, &owner, &repo, "done").await;
+                    let _ = update_build_status(&state, &repo_id, "done").await;
                     // A successful sync marks the mirror fresh so the waiter's
-                    // resolve doesn't re-fetch.
-                    stamp_mirror_fresh(&state, &format!("{owner}/{repo}/{branch}"));
-                    invalidate_ref_response_cache(&state, &owner, &repo, &branch);
-                    info!("background build completed for {owner}/{repo}@{branch}");
+                    // resolve doesn't re-fetch. Stamp both the concrete branch and
+                    // the original requested branch (e.g. HEAD).
+                    stamp_mirror_fresh(
+                        &state,
+                        &format!("{}/{effective_branch}", repo_id.storage_key()),
+                    );
+                    if branch != effective_branch {
+                        stamp_mirror_fresh(&state, &format!("{}/{branch}", repo_id.storage_key()));
+                    }
+                    invalidate_ref_response_cache(&state, &repo_id, &effective_branch);
+                    info!(
+                        "background build completed for {}@{effective_branch}",
+                        repo_id.storage_key()
+                    );
                     Ok(())
                 }
                 Err(e) => {
                     state.metrics.record_build_failed();
-                    let _ =
-                        update_build_status(&state, &owner, &repo, &format!("failed: {e}")).await;
-                    invalidate_ref_response_cache(&state, &owner, &repo, &branch);
-                    warn!("background build failed for {owner}/{repo}@{branch}: {e}");
+                    let _ = update_build_status(&state, &repo_id, &format!("failed: {e}")).await;
+                    invalidate_ref_response_cache(&state, &repo_id, &effective_branch);
+                    warn!(
+                        "background build failed for {}@{effective_branch}: {e}",
+                        repo_id.storage_key()
+                    );
                     Err(format!("{e}"))
                 }
             };
             // Signal every waiter for this key (coalesced /sync requests). Must
             // match the enqueue key, which includes the rev override.
             let key = format!(
-                "{owner}/{repo}/{branch}#{}",
+                "{}/{branch}#{}",
+                repo_id.storage_key(),
                 at_rev.as_deref().unwrap_or("")
             );
             if let Some(senders) = state.build_waiters.lock().await.remove(&key) {
@@ -4191,13 +4625,8 @@ fn spawn_build_worker(state: ServerState) -> tokio::sync::mpsc::Sender<BuildJob>
     tx
 }
 
-async fn update_build_status(
-    state: &ServerState,
-    owner: &str,
-    repo: &str,
-    status: &str,
-) -> Result<()> {
-    let mut info = match state.ref_store.load(owner, repo).await? {
+async fn update_build_status(state: &ServerState, repo_id: &RepoId, status: &str) -> Result<()> {
+    let mut info = match state.ref_store.load(repo_id).await? {
         Some(info) => info,
         None => RefInfo {
             commit: String::new(),
@@ -4228,7 +4657,7 @@ async fn update_build_status(
         },
     };
     info.build_status = Some(status.to_string());
-    state.ref_store.save(owner, repo, &info).await?;
+    state.ref_store.save(repo_id, &info).await?;
     Ok(())
 }
 
@@ -4239,9 +4668,47 @@ fn auth_token_hash(raw: Option<String>) -> Result<String> {
         .map(|t| format!("{:x}", Sha256::digest(t.as_bytes())))
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "RIPCLONE_TOKEN is not set. Refusing to start an unauthenticated server."
+                "RIPCLONE_SERVER_TOKEN is not set. Refusing to start an unauthenticated server."
             )
         })
+}
+
+/// Read the server auth token from the environment.
+///
+/// Precedence:
+///   1. RIPCLONE_SERVER_TOKEN_HASH (already hashed)
+///   2. RIPCLONE_SERVER_TOKEN (raw)
+///   3. RIPCLONE_TOKEN_HASH (deprecated, already hashed)
+///   4. RIPCLONE_TOKEN (deprecated, raw)
+fn read_server_auth_token() -> Result<String> {
+    if let Some(hash) = env::var("RIPCLONE_SERVER_TOKEN_HASH")
+        .ok()
+        .filter(|t| !t.is_empty())
+    {
+        return Ok(hash);
+    }
+    if let Some(raw) = env::var("RIPCLONE_SERVER_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty())
+    {
+        return Ok(format!("{:x}", Sha256::digest(raw.as_bytes())));
+    }
+    if let Some(hash) = env::var("RIPCLONE_TOKEN_HASH")
+        .ok()
+        .filter(|t| !t.is_empty())
+    {
+        eprintln!(
+            "warning: RIPCLONE_TOKEN_HASH is deprecated for server auth; use RIPCLONE_SERVER_TOKEN_HASH"
+        );
+        return Ok(hash);
+    }
+    if let Some(raw) = env::var("RIPCLONE_TOKEN").ok().filter(|t| !t.is_empty()) {
+        eprintln!(
+            "warning: RIPCLONE_TOKEN is deprecated for server auth; use RIPCLONE_SERVER_TOKEN"
+        );
+        return Ok(format!("{:x}", Sha256::digest(raw.as_bytes())));
+    }
+    auth_token_hash(None)
 }
 
 pub async fn run_server(
@@ -4253,15 +4720,15 @@ pub async fn run_server(
     std::fs::create_dir_all(cas_dir)?;
     std::fs::create_dir_all(repo_root)?;
 
-    let token_hash = auth_token_hash(env::var("RIPCLONE_TOKEN").ok())?;
-    info!("RIPCLONE_TOKEN configured; auth middleware enabled");
+    let token_hash = read_server_auth_token()?;
+    info!("server auth token configured; auth middleware enabled");
 
-    let github_token = env::var("RIPCLONE_GITHUB_TOKEN")
-        .ok()
-        .filter(|t| !t.is_empty());
-    if github_token.is_some() {
-        info!("RIPCLONE_GITHUB_TOKEN configured; private repo sync enabled");
-    }
+    let provider_registry = ProviderRegistry::load().context("load provider registry")?;
+    info!(
+        "provider registry loaded with {} instance(s)",
+        provider_registry.iter().count()
+    );
+    let broker: Arc<dyn CredentialBroker> = Arc::new(StaticBroker::new(provider_registry.clone()));
 
     let rate_burst: u32 = env::var("RIPCLONE_RATE_LIMIT_BURST")
         .ok()
@@ -4334,8 +4801,9 @@ pub async fn run_server(
         storage,
         repo_root: repo_root.to_path_buf(),
         ref_store,
+        provider_registry,
+        broker,
         token_hash: Some(token_hash),
-        github_token,
         metrics,
         rate_limiter,
         retention,
@@ -4390,13 +4858,17 @@ mod tests {
         let metrics = Metrics::new();
         let retention = Arc::new(Retention::new(cas.clone(), metrics.clone()).unwrap());
         let (build_queue, _build_rx) = tokio::sync::mpsc::channel::<BuildJob>(16);
+        let provider_registry = ProviderRegistry::new();
+        let broker: Arc<dyn CredentialBroker> =
+            Arc::new(StaticBroker::new(provider_registry.clone()));
         ServerState {
             cas,
             storage,
             repo_root,
             ref_store,
+            provider_registry,
+            broker,
             token_hash: Some(token_hash),
-            github_token: None,
             metrics,
             rate_limiter: RateLimiter::new(100, 100.0),
             retention,
@@ -4441,13 +4913,35 @@ mod tests {
         for missing in [None, Some(String::new())] {
             let err = auth_token_hash(missing).unwrap_err().to_string();
             assert!(
-                err.contains("RIPCLONE_TOKEN"),
+                err.contains("RIPCLONE_SERVER_TOKEN"),
                 "error should mention missing token: {err}"
             );
         }
         // ...and a real token hashes to the same digest the auth middleware checks.
         let hash = auth_token_hash(Some("secret".to_string())).unwrap();
         assert_eq!(hash, format!("{:x}", Sha256::digest("secret")));
+    }
+
+    #[test]
+    fn read_server_auth_token_prefers_new_env_vars() {
+        // Clean deprecated vars.
+        unsafe {
+            env::remove_var("RIPCLONE_TOKEN");
+            env::remove_var("RIPCLONE_TOKEN_HASH");
+            env::remove_var("RIPCLONE_SERVER_TOKEN");
+            env::remove_var("RIPCLONE_SERVER_TOKEN_HASH");
+        }
+        unsafe { env::set_var("RIPCLONE_SERVER_TOKEN", "new-secret") };
+        assert_eq!(
+            read_server_auth_token().unwrap(),
+            format!("{:x}", Sha256::digest("new-secret"))
+        );
+        unsafe { env::set_var("RIPCLONE_SERVER_TOKEN_HASH", "prefixed-hash") };
+        assert_eq!(read_server_auth_token().unwrap(), "prefixed-hash");
+        unsafe {
+            env::remove_var("RIPCLONE_SERVER_TOKEN");
+            env::remove_var("RIPCLONE_SERVER_TOKEN_HASH");
+        }
     }
 
     #[test]
@@ -4505,9 +4999,11 @@ mod tests {
             build_status: None,
             synced_at: None,
         };
+        let provider = ProviderRegistry::new().default_provider().clone();
+        let repo_id = RepoId::github("o/r");
         let resp = ref_response(
-            "o".to_string(),
-            "r".to_string(),
+            &repo_id,
+            &provider,
             "main".to_string(),
             &info,
             &storage,
@@ -4549,6 +5045,9 @@ mod tests {
         let resp = RefResponse {
             owner: "acme".to_string(),
             repo: "secret".to_string(),
+            provider: "github".to_string(),
+            host: "github.com".to_string(),
+            origin_url: "https://github.com/acme/secret.git".to_string(),
             branch: "main".to_string(),
             default_branch: "main".to_string(),
             commit: "commit1".to_string(),
@@ -4569,25 +5068,24 @@ mod tests {
             archive_ready: true,
         };
 
-        cache_ref_response(&state, "acme", "secret", "main", "shallow", &resp);
-        let cached = cached_ref_response(&state, "acme", "secret", "main", "shallow")
+        let cache_repo_id = RepoId::github("acme/secret");
+        cache_ref_response(&state, &cache_repo_id, "main", "shallow", &resp);
+        let cached = cached_ref_response(&state, &cache_repo_id, "main", "shallow")
             .expect("cached ref response");
         assert_eq!(cached.commit, "commit1");
         assert_eq!(
             cached.clonepack_manifest_url.as_deref(),
             Some("https://example.invalid/manifest")
         );
-        assert!(cached_ref_response(&state, "acme", "secret", "main", "full").is_none());
+        assert!(cached_ref_response(&state, &cache_repo_id, "main", "full").is_none());
 
-        invalidate_ref_response_cache(&state, "acme", "secret", "main");
-        assert!(cached_ref_response(&state, "acme", "secret", "main", "shallow").is_none());
+        invalidate_ref_response_cache(&state, &cache_repo_id, "main");
+        assert!(cached_ref_response(&state, &cache_repo_id, "main", "shallow").is_none());
 
         let mut no_cache_state = state;
         no_cache_state.mirror_fresh_ttl = Duration::ZERO;
-        cache_ref_response(&no_cache_state, "acme", "secret", "main", "shallow", &resp);
-        assert!(
-            cached_ref_response(&no_cache_state, "acme", "secret", "main", "shallow").is_none()
-        );
+        cache_ref_response(&no_cache_state, &cache_repo_id, "main", "shallow", &resp);
+        assert!(cached_ref_response(&no_cache_state, &cache_repo_id, "main", "shallow").is_none());
     }
 
     fn test_request(method: &str, uri: &str) -> axum::http::Request<Body> {
@@ -4623,7 +5121,7 @@ mod tests {
             .clone()
             .oneshot(request_with_auth(
                 "GET",
-                "/v1/repos/acme/secret/status",
+                "/v1/repos/github/acme/secret/status",
                 None,
             ))
             .await
@@ -4633,7 +5131,7 @@ mod tests {
         let wrong = app
             .oneshot(request_with_auth(
                 "GET",
-                "/v1/repos/acme/secret/status",
+                "/v1/repos/github/acme/secret/status",
                 Some("Ripclone deadbeef"),
             ))
             .await
@@ -4726,7 +5224,7 @@ mod tests {
         let state = test_state(&tmp);
         let app = build_app(state);
         let response = app
-            .oneshot(test_request("GET", "/v1/repos/acme/secret/status"))
+            .oneshot(test_request("GET", "/v1/repos/github/acme/secret/status"))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -4888,13 +5386,13 @@ mod tests {
         };
         state
             .ref_store
-            .save_branch("acme", "secret", "main", &info)
+            .save_branch(&RepoId::github("acme/secret"), "main", &info)
             .await
             .unwrap();
 
         let app = build_app(state);
         let response = app
-            .oneshot(test_request("GET", "/v1/repos/acme/secret/status"))
+            .oneshot(test_request("GET", "/v1/repos/github/acme/secret/status"))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -4984,18 +5482,18 @@ mod tests {
         };
         state
             .ref_store
-            .save_branch("acme", "secret", "main", &info)
+            .save_branch(&RepoId::github("acme/secret"), "main", &info)
             .await
             .unwrap();
         state
             .ref_store
-            .save_branch("acme", "secret", "develop", &info)
+            .save_branch(&RepoId::github("acme/secret"), "develop", &info)
             .await
             .unwrap();
 
         let app = build_app(state);
         let response = app
-            .oneshot(test_request("GET", "/v1/repos/acme/secret/status"))
+            .oneshot(test_request("GET", "/v1/repos/github/acme/secret/status"))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -5076,7 +5574,7 @@ mod tests {
         };
         state
             .ref_store
-            .save_branch("acme", "fork", "main", &info)
+            .save_branch(&RepoId::github("acme/fork"), "main", &info)
             .await
             .unwrap();
 
@@ -5084,7 +5582,7 @@ mod tests {
         let response = app
             .oneshot(test_request(
                 "GET",
-                "/v1/repos/acme/fork/status?public=true&fork_of=oven-sh/bun",
+                "/v1/repos/github/acme/fork/status?public=true&fork_of=oven-sh/bun",
             ))
             .await
             .unwrap();
@@ -5166,13 +5664,13 @@ mod tests {
         };
         state
             .ref_store
-            .save_branch("acme", "secret", "main", &info)
+            .save_branch(&RepoId::github("acme/secret"), "main", &info)
             .await
             .unwrap();
 
         let app = build_app(state);
         let response = app
-            .oneshot(test_request("GET", "/v1/repos/acme/secret/status"))
+            .oneshot(test_request("GET", "/v1/repos/github/acme/secret/status"))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -5248,13 +5746,13 @@ mod tests {
         };
         state
             .ref_store
-            .save_branch("acme", "secret", "main", &info)
+            .save_branch(&RepoId::github("acme/secret"), "main", &info)
             .await
             .unwrap();
 
         let app = build_app(state);
         let response = app
-            .oneshot(test_request("GET", "/v1/repos/acme/secret/status"))
+            .oneshot(test_request("GET", "/v1/repos/github/acme/secret/status"))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -5275,7 +5773,7 @@ mod tests {
         let response = app
             .oneshot(test_request(
                 "POST",
-                "/v1/repos/acme/secret/sync?branch=../evil",
+                "/v1/repos/github/acme/secret/sync?branch=../evil",
             ))
             .await
             .unwrap();

@@ -19,11 +19,6 @@ pub enum CloneMode {
     /// jobs that only need the files.
     #[value(name = "files", alias = "fast")]
     Files,
-
-    /// `.git` skeleton only (commit + tree objects, prebuilt index). No working
-    /// tree and no blobs.
-    #[value(name = "skeleton")]
-    Skeleton,
 }
 
 impl CloneMode {
@@ -69,23 +64,26 @@ impl FromStr for CloneMode {
             // Current names.
             "editable" => Ok(CloneMode::Editable),
             "files" => Ok(CloneMode::Files),
-            "skeleton" => Ok(CloneMode::Skeleton),
             // Deprecated aliases.
             "full" | "hybrid" => Ok(CloneMode::Editable),
             "fast" => Ok(CloneMode::Files),
+            "skeleton" => anyhow::bail!(
+                "skeleton mode is no longer exposed; use mount for skeleton-backed access"
+            ),
             other => anyhow::bail!("unknown clone mode: {}", other),
         }
     }
 }
 
-/// Resolve a mode from the CLI argument or the `RIPCLONE_MODE` environment
-/// variable, falling back to `Editable`.
-pub fn resolve_mode(cli: Option<CloneMode>) -> CloneMode {
+/// Resolve a mode from the CLI argument, the `RIPCLONE_MODE` environment
+/// variable, or a config file value, falling back to `Editable`.
+pub fn resolve_mode(cli: Option<CloneMode>, config: Option<&str>) -> CloneMode {
     cli.or_else(|| {
         std::env::var("RIPCLONE_MODE")
             .ok()
             .and_then(|s| s.parse().ok())
     })
+    .or_else(|| config.and_then(|s| s.parse().ok()))
     .unwrap_or_default()
 }
 

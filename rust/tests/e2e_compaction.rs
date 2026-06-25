@@ -21,7 +21,7 @@ async fn compaction_keeps_full_clone_correct() {
     origin.publish();
 
     let client = server.client();
-    client.sync_repo("acme", "cmp", None, None).await.unwrap();
+    client.sync_repo("acme/cmp", None).await.unwrap();
 
     // Each sync adds a commit -> seals a new level -> eventually triggers
     // compaction back down to MAX_LEVELS. Re-clone full each time and verify it
@@ -32,7 +32,7 @@ async fn compaction_keeps_full_clone_correct() {
         let msg = format!("c{i}");
         origin.commit(&[(name.as_str(), content.as_str())], &msg);
         origin.publish();
-        client.sync_repo("acme", "cmp", None, None).await.unwrap();
+        client.sync_repo("acme/cmp", None).await.unwrap();
 
         let (_g, c) = clone_only(&server, "acme", "cmp", 0, CloneMode::Editable)
             .await

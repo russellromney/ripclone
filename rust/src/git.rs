@@ -1,4 +1,6 @@
+use crate::provider::{ProviderInstance, RepoId};
 use anyhow::{Context, Result, bail};
+use secrecy::ExposeSecret;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::Path;
@@ -1060,41 +1062,54 @@ pub fn object_type<P: AsRef<Path>>(repo: P, sha: &str) -> Result<String> {
     crate::gix_util::object_type(repo, sha)
 }
 
-/// Sync a bare mirror of a GitHub repo. Creates if missing, fetches if exists.
-/// If `github_token` is provided, it is embedded in the HTTPS URL as
-/// `https://x-access-token:<token>@github.com/...` so private repos can be
-/// mirrored. This form works for both PATs and GitHub App installation tokens.
+/// Sync a bare mirror of a repo. Creates if missing, fetches if exists.
+///
+/// Phase 1: credentials are passed via git's `http.extraHeader` config, never
+/// embedded in the clone URL. The URL is built from `provider.clone_url(path)`
+/// so it is clean in argv, `.git/config`, and logs.
 pub fn sync_bare_mirror<P: AsRef<Path>>(
     mirror_dir: P,
-    owner: &str,
-    repo: &str,
+    provider: &ProviderInstance,
+    repo_id: &RepoId,
     branch: &str,
-    github_token: Option<&str>,
+    credential: Option<&secrecy::SecretString>,
 ) -> Result<()> {
-    crate::validation::validate_repo_id(owner)
-        .with_context(|| format!("invalid owner: {}", owner))?;
-    crate::validation::validate_repo_id(repo).with_context(|| format!("invalid repo: {}", repo))?;
+    crate::validation::validate_repo_path(provider, repo_id)
+        .with_context(|| format!("invalid repo path: {}", repo_id.storage_key()))?;
     // Validate the branch name (used later for commit resolution). The mirror
     // itself always fetches *all* refs, so the branch is not part of the fetch.
     if branch != "HEAD" {
         crate::validation::validate_git_rev(branch)
             .with_context(|| format!("invalid branch: {}", branch))?;
     }
-    // The origin base is normally GitHub, but is overridable via
-    // RIPCLONE_ORIGIN_BASE so tests (and self-hosted setups) can mirror from a
-    // local `file://` origin without any network. Tokens are only injected for
-    // the real GitHub host.
-    let base = std::env::var("RIPCLONE_ORIGIN_BASE")
-        .ok()
-        .filter(|b| !b.is_empty())
-        .unwrap_or_else(|| "https://github.com".to_string());
-    let url = match github_token {
-        Some(token) if base == "https://github.com" => format!(
-            "https://x-access-token:{}@github.com/{}/{}.git",
-            token, owner, repo
-        ),
-        _ => format!("{}/{}/{}.git", base.trim_end_matches('/'), owner, repo),
+
+    // Build a clean clone URL from the provider. The RIPCLONE_ORIGIN_BASE
+    // override remains supported for the github default instance so existing
+    // offline e2e tests keep working with local `file://` origins.
+    let url = if repo_id.is_github_default() {
+        if let Some(base) = std::env::var("RIPCLONE_ORIGIN_BASE")
+            .ok()
+            .filter(|b| !b.is_empty())
+        {
+            format!("{}/{}.git", base.trim_end_matches('/'), repo_id.path)
+        } else {
+            provider.clone_url(&repo_id.path)
+        }
+    } else {
+        provider.clone_url(&repo_id.path)
     };
+
+    // Build git config args for credential-header injection. The secret is
+    // never embedded in the URL, so it does not leak into process listings,
+    // `.git/config`, or server logs.
+    let mut git_args: Vec<String> = Vec::new();
+    if let Some(token) = credential
+        && let Some((name, value)) = provider.auth_header(token.expose_secret())
+    {
+        let header = format!("{}: {}", name, value);
+        git_args.push("-c".to_string());
+        git_args.push(format!("http.extraHeader={}", header));
+    }
     // The mirror is always a *complete* clone. The "full" (depth=0) clonepack is
     // built from `rev-list HEAD` over this mirror, so any shallow boundary would
     // silently truncate it and break `git rev-list`/`fsck` on the client. We
@@ -1118,6 +1133,7 @@ pub fn sync_bare_mirror<P: AsRef<Path>>(
         }
         args.push("origin");
         let status = Command::new("git")
+            .args(&git_args)
             .arg("-C")
             .arg(mirror_dir.as_ref().as_os_str())
             .args(&args)
@@ -1131,6 +1147,7 @@ pub fn sync_bare_mirror<P: AsRef<Path>>(
         // follow-up branch fetch is needed.
         std::fs::create_dir_all(mirror_dir.as_ref().parent().unwrap_or(Path::new("")))?;
         let status = Command::new("git")
+            .args(&git_args)
             .args([
                 "clone",
                 "--mirror",

@@ -15,6 +15,7 @@
 pub const PROTOCOL_VERSION: u32 = 1;
 
 pub mod archive;
+pub mod auth;
 pub mod bench;
 pub mod blob_pack;
 pub mod cas;
@@ -30,6 +31,8 @@ pub mod mode;
 pub mod oidc;
 pub mod overlay;
 pub mod pack;
+pub mod provider;
+pub mod provider_config;
 pub mod ref_store;
 pub mod remote_gc;
 pub mod retention;

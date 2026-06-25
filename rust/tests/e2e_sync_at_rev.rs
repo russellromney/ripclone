@@ -45,7 +45,7 @@ async fn sync_at_rev_builds_and_clones_older_then_newer() {
 
     // Build at HEAD~2 (= c1); clone at that rev must be exactly c1.
     client
-        .sync_repo_at("acme", "atrev", Some("HEAD~2"), None, None)
+        .sync_repo_at("acme/atrev", Some("HEAD~2"), None)
         .await
         .expect("sync at HEAD~2");
     let (_g1, c1dir) = clone_full_rev(&server, "atrev", "HEAD~2", "1").await;
@@ -57,7 +57,7 @@ async fn sync_at_rev_builds_and_clones_older_then_newer() {
     // advances c1 -> c2, exercising files-table by-diff + history tail without
     // upstream moving). Clone at that rev must be exactly c2.
     client
-        .sync_repo_at("acme", "atrev", Some("HEAD~1"), None, None)
+        .sync_repo_at("acme/atrev", Some("HEAD~1"), None)
         .await
         .expect("sync at HEAD~1");
     let (_g2, c2dir) = clone_full_rev(&server, "atrev", "HEAD~1", "2").await;
@@ -68,7 +68,7 @@ async fn sync_at_rev_builds_and_clones_older_then_newer() {
 
     // Build at the tip (c3) and verify the full latest state (depth=0 + depth=1).
     client
-        .sync_repo_at("acme", "atrev", None, None, None)
+        .sync_repo_at("acme/atrev", None, None)
         .await
         .expect("sync at tip");
     let (_g3, c3dir) = clone_full_at(&server, "acme", "atrev", "3", true).await;
@@ -98,17 +98,14 @@ async fn sync_at_rev_does_not_clobber_tip() {
     let client = server.client();
 
     // Normal tip sync (builds the real branch entry at c3).
-    client
-        .sync_repo("acme", "noclob", None, None)
-        .await
-        .unwrap();
+    client.sync_repo("acme/noclob", None).await.unwrap();
     let (_g0, tip0) = clone_full_at(&server, "acme", "noclob", "3", true).await;
     assert_eq!(read(&tip0, "a.txt"), "3\n");
 
     // Now sync at an OLDER rev. Under the buggy (clobbering) behavior this would
     // overwrite the branch entry with c1 and break the next tip clone.
     client
-        .sync_repo_at("acme", "noclob", Some("HEAD~2"), None, None)
+        .sync_repo_at("acme/noclob", Some("HEAD~2"), None)
         .await
         .unwrap();
 

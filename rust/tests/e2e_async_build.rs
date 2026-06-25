@@ -28,7 +28,7 @@ async fn async_sync_then_clone() {
     // Sync goes through the background worker; the client waits for completion.
     server
         .client()
-        .sync_repo("acme", "aq", None, None)
+        .sync_repo("acme/aq", None)
         .await
         .expect("async sync");
 
@@ -64,7 +64,7 @@ async fn async_concurrent_syncs_coalesce() {
     for _ in 0..6 {
         let client = server.client();
         handles.push(tokio::spawn(async move {
-            client.sync_repo("acme", "aqc", None, None).await
+            client.sync_repo("acme/aqc", None).await
         }));
     }
     let mut commits = Vec::new();

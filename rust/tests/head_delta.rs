@@ -34,7 +34,7 @@ fn setup() {
 async fn sync_and_settle(server: &Server, origin: &Origin, want_count: &str) {
     server
         .client()
-        .sync_repo(&origin.owner, &origin.repo, None, None)
+        .sync_repo(&format!("{}/{}", origin.owner, origin.repo), None)
         .await
         .expect("sync");
     let _ = clone_full_at(server, &origin.owner, &origin.repo, want_count, true).await;
@@ -66,7 +66,7 @@ async fn re_add_identical_blob_survives_in_depth1() {
     origin.publish();
     server
         .client()
-        .sync_repo("acme", "readd", None, None)
+        .sync_repo("acme/readd", None)
         .await
         .expect("sync c3");
 
@@ -115,7 +115,7 @@ async fn force_push_to_non_ancestor_stays_correct() {
     origin.publish(); // force push (publish pushes with --force)
     server
         .client()
-        .sync_repo("acme", "fpush", None, None)
+        .sync_repo("acme/fpush", None)
         .await
         .expect("sync c3prime");
 
@@ -191,7 +191,7 @@ async fn head_compaction_keeps_clones_complete() {
         // (or a freshly compacted base).
         server
             .client()
-            .sync_repo("acme", "compact", None, None)
+            .sync_repo("acme/compact", None)
             .await
             .expect("sync");
         let (_g, d) = clone_only(&server, "acme", "compact", 1, CloneMode::Editable)

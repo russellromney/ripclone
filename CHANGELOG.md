@@ -31,6 +31,25 @@ This file tracks what has already landed in ripclone. For upcoming work see `ROA
 - **Removed the vestigial `ripclone mount` (FUSE) experiment** — the `fusefs` module, the `Mount` command, and the `fuser` dependency are deleted (~1.1k lines). This clears `RUSTSEC-2021-0154` by removal; the `git2` advisories (`RUSTSEC-2026-0183`/`-0184`) were already cleared by the gix migration removing `git2`. The three now-stale advisory `ignore` entries are dropped from `rust/deny.toml`. Can be re-added later if FUSE mounting is wanted.
 - **Allow `MPL-2.0` in `deny.toml`** (weak/file-level copyleft, safe to depend on from a permissive project) — the gix migration pulls in `uluru` (MPL-2.0), which the license check was rejecting.
 
+## Multi-provider auth (Phases 1 & 2)
+
+- **Breaking: explicit-provider addressing** (`rust/src/server.rs`, `rust/src/client.rs`, `rust/src/bin/cli.rs`, `rust/src/bin/git-remote-ripclone.rs`)
+  - Legacy `/v1/repos/{owner}/{repo}/...` routes are removed. All repos are now addressed as `/v1/repos/{provider}/{repo-path}/...`, including GitHub (`/v1/repos/github/owner/repo/...`).
+  - The CLI and git remote helper accept provider-qualified paths (`github/owner/repo`, `gitlab/group/sub/project`).
+- **Provider registry + presets** (`rust/src/provider.rs`)
+  - New `ProviderKind` enum: `github`, `gitlab`, `bitbucket`, `gitea`, `generic`.
+  - `ProviderRegistry::load()` reads instances from `RIPCLONE_PROVIDERS` JSON or `RIPCLONE_PROVIDERS_CONFIG`, merged with the built-in `github` default.
+  - Each instance defines `clone_url(path)` and `auth_header(token)` so the server can speak the right auth dialect to each host.
+- **Credential-header injection** (`rust/src/git.rs`, `rust/src/auth/broker.rs`)
+  - `sync_bare_mirror` builds a clean clone URL and injects credentials via `git -c http.extraHeader="Authorization: ..."`. Secrets no longer appear in URLs.
+  - New `CredentialBroker` seam with a v1 `StaticBroker` (request token → configured token → none). This is the foundation for Tier-A token minting and OIDC in Phase 3.
+- **Origin URL returned to clients** (`rust/src/server.rs`, `rust/src/client.rs`)
+  - `RefResponse` now carries `origin_url`, `provider`, and `host`. Clients use the server-returned URL when configuring the `origin` remote, removing hardcoded `github.com` assumptions.
+- **Per-provider validation** (`rust/src/validation.rs`)
+  - GitHub default keeps strict `owner/repo` rules; other providers accept opaque variable-depth paths (`group/sub/project`, `~user/repo`, etc.).
+- **X-Upstream-Token** (`rust/src/server.rs`, `rust/src/client.rs`)
+  - The canonical upstream credential header is now `X-Upstream-Token`; `X-GitHub-Token` is still accepted as an alias.
+
 ## Client robustness + server observability
 
 - **Chunk download retry with backoff** (`rust/src/client.rs`): all artifact/chunk fetches retry transient failures (transport errors, 5xx/429/408, mid-stream body errors) with jittered exponential backoff; permanent failures (other 4xx, deterministic hash mismatch) fail fast; a failed/expired presigned URL falls back to the gateway. Tunable via `RIPCLONE_FETCH_MAX_ATTEMPTS` (3) and `RIPCLONE_FETCH_BACKOFF_MS` (100).

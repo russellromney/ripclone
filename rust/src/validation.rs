@@ -1,6 +1,7 @@
 #![allow(clippy::items_after_test_module)]
 
-use anyhow::Result;
+use crate::provider::{ProviderInstance, ProviderKind, RepoId};
+use anyhow::{Context, Result};
 use axum::response::IntoResponse;
 
 const MAX_REF_LEN: usize = 256;
@@ -9,6 +10,10 @@ const MAX_REF_LEN: usize = 256;
 /// to ASCII alphanumeric plus `.`, `-`, and `_`, must not be empty, and must
 /// not contain path separators.
 pub fn validate_repo_id(id: &str) -> Result<()> {
+    validate_repo_id_inner(id)
+}
+
+fn validate_repo_id_inner(id: &str) -> Result<()> {
     if id.is_empty() {
         anyhow::bail!("repo identifier must not be empty");
     }
@@ -26,6 +31,36 @@ pub fn validate_repo_id(id: &str) -> Result<()> {
         .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
     {
         anyhow::bail!("repo identifier contains invalid characters: {}", id);
+    }
+    Ok(())
+}
+
+/// Validate an opaque repo path for a specific provider instance.
+///
+/// GitHub keeps the legacy strict segment check; other providers allow the
+/// path to contain `/`, `~`, `+`, etc.
+pub fn validate_repo_path(provider: &ProviderInstance, repo_id: &RepoId) -> Result<()> {
+    if provider.kind == ProviderKind::GitHub
+        && provider.is_github_default()
+        && let Some((owner, repo)) = repo_id.github_owner_repo()
+    {
+        validate_repo_id_inner(owner).with_context(|| format!("invalid owner: {}", owner))?;
+        validate_repo_id_inner(repo).with_context(|| format!("invalid repo: {}", repo))?;
+        return Ok(());
+    }
+    // Non-github providers (and non-default github instances) accept opaque
+    // paths. Reject only the truly dangerous characters.
+    if repo_id.path.is_empty() {
+        anyhow::bail!("repo path must not be empty");
+    }
+    if repo_id.path.len() > 512 {
+        anyhow::bail!("repo path too long: {}", repo_id.path.len());
+    }
+    if repo_id.path.contains('\0') || repo_id.path.contains('\\') {
+        anyhow::bail!("repo path contains unsafe characters: {}", repo_id.path);
+    }
+    if repo_id.path.starts_with('/') {
+        anyhow::bail!("repo path must not start with '/': {}", repo_id.path);
     }
     Ok(())
 }

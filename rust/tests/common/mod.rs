@@ -84,6 +84,15 @@ impl Server {
         Client::new_with_token(self.url.clone(), Some(token_hash()))
     }
 
+    pub fn client_with_provider(&self, provider: &str, upstream_token: Option<&str>) -> Client {
+        let mut client = Client::new_with_token(self.url.clone(), Some(token_hash()));
+        client = client.with_provider(provider);
+        if let Some(token) = upstream_token {
+            client = client.with_upstream_token(token);
+        }
+        client
+    }
+
     /// Path of a CAS object, for negative tests that tamper with storage.
     pub fn cas_path(&self, hash: &str) -> PathBuf {
         self.cas_dir.join(&hash[..2]).join(hash)
@@ -273,6 +282,113 @@ pub fn make_origin(owner: &str, repo: &str) -> Origin {
     }
 }
 
+// ---- local HTTP origin (multi-provider e2e) -------------------------------
+
+/// An HTTP-served git origin for testing non-github providers.
+///
+/// The bare repo is served by `python3 -m http.server` from its directory.
+/// Dumb HTTP is enabled with `git update-server-info`.
+pub struct HttpOrigin {
+    pub path: String,
+    pub work: PathBuf,
+    pub bare: PathBuf,
+    pub url: String,
+    pub port: u16,
+    _dir: TempDir,
+    _server: std::process::Child,
+}
+
+impl HttpOrigin {
+    pub fn commit(&self, files: &[(&str, &str)], msg: &str) -> String {
+        for (name, content) in files {
+            let p = self.work.join(name);
+            if let Some(parent) = p.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(p, content).unwrap();
+        }
+        git(&self.work, &["add", "-A"]);
+        git(
+            &self.work,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-q",
+                "-m",
+                msg,
+            ],
+        );
+        git(&self.work, &["rev-parse", "HEAD"])
+    }
+
+    pub fn publish(&self) {
+        git(
+            &self.work,
+            &["push", "-q", "--force", self.bare_str(), "main"],
+        );
+        git(&self.bare, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        git(&self.bare, &["update-server-info"]);
+    }
+
+    fn bare_str(&self) -> &str {
+        self.bare.to_str().unwrap()
+    }
+}
+
+/// Create a bare repo under `<repo_path>.git`, enable dumb HTTP, and serve the
+/// parent directory on a free port. The resulting clone URL is
+/// `http://127.0.0.1:<port>/<repo_path>.git`, matching the generic provider's
+/// `clone_url(path)` shape.
+pub fn make_http_origin(repo_path: &str) -> HttpOrigin {
+    let dir = tempfile::tempdir().expect("http origin dir");
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    git(&work, &["init", "-q", "-b", "main"]);
+
+    let bare = dir.path().join(format!("{}.git", repo_path));
+    std::fs::create_dir_all(bare.parent().unwrap()).unwrap();
+    git(
+        &PathBuf::from("."),
+        &["init", "--bare", "-q", "-b", "main", bare.to_str().unwrap()],
+    );
+
+    // Enable dumb HTTP.
+    git(&bare, &["config", "http.receivepack", "true"]);
+    git(&bare, &["update-server-info"]);
+
+    let port = free_port();
+    let server = Command::new("python3")
+        .arg("-m")
+        .arg("http.server")
+        .arg(port.to_string())
+        .current_dir(dir.path())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("start python http.server");
+
+    // Wait for the server to accept connections.
+    for _ in 0..100 {
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    HttpOrigin {
+        path: repo_path.to_string(),
+        work,
+        bare,
+        url: format!("http://127.0.0.1:{port}"),
+        port,
+        _dir: dir,
+        _server: server,
+    }
+}
+
 /// Enable two-phase publish for this test binary (set before `init`/server).
 pub fn enable_two_phase() {
     static O: Once = Once::new();
@@ -312,7 +428,15 @@ pub async fn clone_only_at(
     let target = out.path().join("clone");
     let kind = ripclone::mode::clonepack_kind_for_depth(depth);
     client
-        .install_repo_with_mode_at(owner, repo, "HEAD", rev, &target, mode, Some(kind), None)
+        .install_repo_with_mode_at(
+            &format!("{owner}/{repo}"),
+            "HEAD",
+            rev,
+            &target,
+            mode,
+            Some(kind),
+            None,
+        )
         .await?;
     Ok((out, target))
 }
@@ -478,7 +602,10 @@ pub async fn lifecycle_battery(server: &Server, origin: &Origin, two_phase: bool
     origin.commit(&[("a.txt", "1\n")], "c1");
     origin.commit(&[("a.txt", "2\n"), ("dir/b.txt", "B\n")], "c2");
     origin.publish();
-    client.sync_repo(&o, &r, None, None).await.expect("sync c2");
+    client
+        .sync_repo(&format!("{o}/{r}"), None)
+        .await
+        .expect("sync c2");
 
     assert_depth1(server, &o, &r, &[("a.txt", "2\n"), ("dir/b.txt", "B\n")]).await;
     {
@@ -496,7 +623,7 @@ pub async fn lifecycle_battery(server: &Server, origin: &Origin, two_phase: bool
     origin.commit(&[("a.txt", "3\n"), ("c.txt", "C\n")], "c3");
     origin.publish();
     client
-        .sync_repo(&o, &r, None, None)
+        .sync_repo(&format!("{o}/{r}"), None)
         .await
         .expect("resync c3");
 
@@ -521,7 +648,7 @@ pub async fn lifecycle_battery(server: &Server, origin: &Origin, two_phase: bool
         origin.commit(&[(f.as_str(), c.as_str())], &m);
         origin.publish();
         client
-            .sync_repo(&o, &r, None, None)
+            .sync_repo(&format!("{o}/{r}"), None)
             .await
             .expect("resync loop");
         // Under two-phase the full builds in the background; wait for each step
@@ -551,7 +678,7 @@ pub async fn sync_and_clone(
 ) -> (TempDir, PathBuf) {
     let client = server.client();
     client
-        .sync_repo(&origin.owner, &origin.repo, None, None)
+        .sync_repo(&format!("{}/{}", origin.owner, origin.repo), None)
         .await
         .expect("sync");
     let out = tempfile::tempdir().unwrap();
