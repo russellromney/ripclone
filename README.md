@@ -18,10 +18,12 @@ ripclone started from a simple question asked by [Jarred Sumner](https://x.com/j
 
 ripclone is one answer. The goal: get a `git clone` as close as possible to downloading a file from object storage. A few design principles get there:
 
-- **Move the slow work off the clone.** Negotiation, indexing, and the tree walk run once on the server at sync — never on the clone. The client downloads finished pieces and writes them.
-- **Parallelize the downloads.** Packs and the archive are split into content-addressed chunks, so a clone is many parallel range-GETs, not one serial stream.
-- **Keep every resource busy.** Download, decompress, process, and write all run across every core *and* overlap in time — the moment one stage produces output, the next starts on it. Network, CPU, and disk stay saturated instead of taking turns; on Linux the worktree writer uses io_uring to keep the disk queue full.
-- **Process as little as possible.** A re-sync rebuilds only what the diff touched; a clone fetches only the artifacts its mode needs — files mode skips the git object database entirely.
+| Principle | In practice |
+|---|---|
+| **Move slow work off the clone** | Negotiation, indexing, and the tree walk run once on the server at sync — never on the clone. The client just downloads finished pieces and writes them. |
+| **Parallelize the downloads** | Packs and the archive are content-addressed chunks, so a clone is many parallel range-GETs, not one serial stream. |
+| **Keep every resource busy** | Every stage runs across all cores *and* overlaps in time — the next starts the moment the last produces output. Network, CPU, and disk never idle (io_uring on Linux). |
+| **Process as little as possible** | A re-sync rebuilds only what the diff touched; a clone fetches only the artifacts its mode needs — files mode skips the object database entirely. |
 
 ## Clone
 
