@@ -13,3 +13,6 @@ data/
 
 # CI-staged binaries for the runtime-only docker image build
 /ci-bins/
+
+# Local-only dogfood helpers (never committed)
+/scripts/dogfood/

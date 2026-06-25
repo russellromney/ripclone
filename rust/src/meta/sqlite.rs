@@ -1,0 +1,121 @@
+//! [`MetaDb`] backed by local SQLite via `sqlx`.
+
+use super::{MetaDb, RefRow};
+use anyhow::{Context, Result};
+use async_trait::async_trait;
+use sqlx::Row;
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
+use std::str::FromStr;
+use std::time::Duration;
+
+pub struct SqliteMeta {
+    pool: SqlitePool,
+}
+
+impl SqliteMeta {
+    pub async fn connect(path: &str) -> Result<Self> {
+        let opts = SqliteConnectOptions::from_str(path)
+            .with_context(|| format!("parse sqlite url {path}"))?
+            .create_if_missing(true)
+            .busy_timeout(Duration::from_secs(5))
+            .journal_mode(SqliteJournalMode::Wal);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect_with(opts)
+            .await
+            .with_context(|| format!("open sqlite metadata db {path}"))?;
+        Ok(Self { pool })
+    }
+}
+
+#[async_trait]
+impl MetaDb for SqliteMeta {
+    async fn init(&self) -> Result<()> {
+        sqlx::raw_sql(
+            "CREATE TABLE IF NOT EXISTS refs (
+                repo_key TEXT NOT NULL,
+                branch TEXT NOT NULL,
+                commit_id TEXT NOT NULL,
+                synced_at BIGINT,
+                data TEXT NOT NULL,
+                PRIMARY KEY (repo_key, branch)
+            )",
+        )
+        .execute(&self.pool)
+        .await
+        .context("create refs table")?;
+        Ok(())
+    }
+
+    async fn get(&self, repo_key: &str, branch: &str) -> Result<Option<RefRow>> {
+        let row = sqlx::query(
+            "SELECT data, commit_id, synced_at FROM refs
+             WHERE repo_key = ? AND branch = ?",
+        )
+        .bind(repo_key)
+        .bind(branch)
+        .fetch_optional(&self.pool)
+        .await
+        .context("get ref")?;
+        match row {
+            Some(row) => Ok(Some(RefRow {
+                data: row.try_get(0)?,
+                commit_id: row.try_get(1)?,
+                synced_at: row.try_get(2)?,
+            })),
+            None => Ok(None),
+        }
+    }
+
+    async fn upsert(
+        &self,
+        repo_key: &str,
+        branch: &str,
+        data: &str,
+        commit_id: &str,
+        synced_at: Option<i64>,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO refs (repo_key, branch, commit_id, synced_at, data)
+             VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT (repo_key, branch) DO UPDATE SET
+                 commit_id = excluded.commit_id,
+                 synced_at = excluded.synced_at,
+                 data = excluded.data",
+        )
+        .bind(repo_key)
+        .bind(branch)
+        .bind(commit_id)
+        .bind(synced_at)
+        .bind(data)
+        .execute(&self.pool)
+        .await
+        .context("upsert ref")?;
+        Ok(())
+    }
+
+    async fn list_repos(&self) -> Result<Vec<String>> {
+        let rows = sqlx::query("SELECT DISTINCT repo_key FROM refs")
+            .fetch_all(&self.pool)
+            .await
+            .context("list repos")?;
+        rows.iter().map(|r| Ok(r.try_get(0)?)).collect()
+    }
+
+    async fn list_branches(&self, repo_key: &str) -> Result<Vec<String>> {
+        let rows = sqlx::query("SELECT branch FROM refs WHERE repo_key = ?")
+            .bind(repo_key)
+            .fetch_all(&self.pool)
+            .await
+            .context("list branches")?;
+        rows.iter().map(|r| Ok(r.try_get(0)?)).collect()
+    }
+
+    async fn health(&self) -> Result<()> {
+        sqlx::query("SELECT 1")
+            .fetch_one(&self.pool)
+            .await
+            .context("sqlite metadata health")?;
+        Ok(())
+    }
+}

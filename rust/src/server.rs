@@ -1,18 +1,20 @@
 use crate::RefInfo;
 use crate::archive::ArchiveBuilder;
 use crate::auth::broker::{CredentialBroker, StaticBroker};
+use crate::backends::{self, QueueBackend};
 use crate::cas::Cas;
 use crate::clonepack::{ChunkRef, ClonepackManifest, hash_from_hex, hash_to_hex};
 use crate::git;
 use crate::metrics::Metrics;
 use crate::oidc::OidcVerifier;
 use crate::pack::PackBuilder;
+use crate::queue::{BuildJob, EnqueueOutcome, JobQueueRef, JobState};
 use crate::provider::{ProviderInstance, ProviderRegistry, RepoId};
-use crate::ref_store::{CachingRefStore, FileRefStore, RefStore, S3RefStore, migrate_legacy_refs};
+use crate::ref_store::{RefStore, migrate_legacy_refs};
 use crate::remote_gc::{GcConfig, RemoteGc};
 use crate::retention::Retention;
 use crate::snapshot::SnapshotBuilder;
-use crate::storage::{S3Storage, StorageRef, local};
+use crate::storage::StorageRef;
 use crate::validation;
 use anyhow::{Context, Result};
 use axum::{
@@ -50,7 +52,7 @@ pub struct ServerState {
     pub metrics: Arc<Metrics>,
     pub rate_limiter: RateLimiter,
     pub retention: Arc<Retention>,
-    pub build_queue: tokio::sync::mpsc::Sender<BuildJob>,
+    pub build_queue: JobQueueRef,
     pub build_queue_depth: Arc<AtomicUsize>,
     /// Waiters for in-flight background builds, keyed by `owner/repo/branch`. A
     /// `/sync` registers a oneshot here and enqueues a job only if it is the
@@ -81,6 +83,47 @@ pub struct ServerState {
     /// Cached `/readyz` result `(checked_at, ready)`. Bounds backend probe cost
     /// (S3 round-trips) and damps load-balancer flapping on a transient blip.
     pub readyz_cache: Arc<std::sync::Mutex<Option<(Instant, bool)>>>,
+}
+
+impl ServerState {
+    /// Assemble state for a standalone `ripclone-worker`. It uses the real
+    /// durable backends but none of the HTTP-only features (auth, rate limiting,
+    /// OIDC, fault injection) since it never serves requests — it only runs
+    /// [`process_build_job`]. It builds its own provider registry + credential
+    /// broker from the environment, exactly as the server does, so it can resolve
+    /// upstream credentials for the repos it builds.
+    pub fn for_worker(
+        b: backends::Backends,
+        queue: JobQueueRef,
+        metrics: Arc<Metrics>,
+    ) -> Result<Self> {
+        let provider_registry = ProviderRegistry::load().context("load provider registry")?;
+        let broker: Arc<dyn CredentialBroker> =
+            Arc::new(StaticBroker::new(provider_registry.clone()));
+        Ok(ServerState {
+            cas: b.cas,
+            storage: b.storage,
+            repo_root: b.repo_root,
+            ref_store: b.ref_store,
+            provider_registry,
+            broker,
+            token_hash: None,
+            metrics,
+            rate_limiter: RateLimiter::new(60, 10.0),
+            retention: b.retention,
+            build_queue: queue,
+            build_queue_depth: Arc::new(AtomicUsize::new(0)),
+            build_waiters: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            oidc_verifier: None,
+            sync_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            mirror_freshness: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            mirror_fresh_ttl: Duration::from_secs(60),
+            ref_response_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            artifact_fetch_count: Arc::new(AtomicUsize::new(0)),
+            fail_first_fetches: 0,
+            readyz_cache: Arc::new(std::sync::Mutex::new(None)),
+        })
+    }
 }
 
 /// Read the test-only fault-injection threshold once at startup. Logs loudly if
@@ -245,17 +288,6 @@ pub type BuildWaiters = Arc<
         std::collections::HashMap<String, Vec<tokio::sync::oneshot::Sender<Result<(), String>>>>,
     >,
 >;
-
-#[derive(Clone)]
-pub struct BuildJob {
-    pub repo_id: RepoId,
-    #[allow(dead_code)]
-    pub branch: String,
-    /// Optional build-commit override (see SyncRequest.rev).
-    pub rev: Option<String>,
-    /// Upstream credential (Tier-B passthrough) used when syncing the mirror.
-    pub credential: Option<secrecy::SecretString>,
-}
 
 fn default_branch_value() -> String {
     "HEAD".to_string()
@@ -1886,37 +1918,183 @@ async fn sync_repo_inner(
     // and is rate-bounded under load. Coalesce concurrent `/sync` for the same
     // key onto one build, wait up to RIPCLONE_SYNC_WAIT_SECS, then 202.
     if async_build_enabled() {
-        // Include the rev override in the coalescing key so syncs targeting
-        // different build commits don't share one build.
-        let key = format!(
-            "{}/{branch}#{}",
-            repo_id.storage_key(),
-            at_rev.as_deref().unwrap_or("")
-        );
-        let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
-        let first = {
-            let mut w = state.build_waiters.lock().await;
-            let v = w.entry(key.clone()).or_default();
-            let was_empty = v.is_empty();
-            v.push(tx);
-            was_empty
-        };
-        if first {
-            state.build_queue_depth.fetch_add(1, Ordering::Relaxed);
-            // Mirror the /build handler: the worker decrements the metrics gauge
-            // for every job it drains, so every enqueue must increment it (else
-            // the gauge underflows).
-            state.metrics.record_build_queued();
+        // Keep this comfortably under edge/proxy request timeouts (e.g. Fly's
+        // ~60s): on a long build we return 202 and let the client retry, rather
+        // than holding the connection until it is reset mid-request.
+        let wait = Duration::from_secs(env_bytes("RIPCLONE_SYNC_WAIT_SECS", 25));
+
+        if state.build_queue.inproc_wait() {
+            // In-process queue: coalesce via build_waiters; the same-process
+            // worker signals completion on a oneshot. Include the rev override in
+            // the coalescing key so syncs for different build commits don't share
+            // one build.
+            let key = format!(
+                "{}/{branch}#{}",
+                repo_id.storage_key(),
+                at_rev.as_deref().unwrap_or("")
+            );
+            let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+            let first = {
+                let mut w = state.build_waiters.lock().await;
+                let v = w.entry(key.clone()).or_default();
+                let was_empty = v.is_empty();
+                v.push(tx);
+                was_empty
+            };
+            if first {
+                // Mirror the /build handler: the worker decrements the metrics
+                // gauge for every job it drains, so every enqueue must increment
+                // it (else the gauge underflows). The local queue owns the
+                // build_queue_depth counter (enqueue +1, worker -1).
+                state.metrics.record_build_queued();
+                let job = BuildJob {
+                    repo_id: repo_id.clone(),
+                    branch: branch.clone(),
+                    rev: at_rev.clone(),
+                    credential,
+                };
+                let full = match state.build_queue.enqueue(job).await {
+                    Ok(enq) => enq.outcome == EnqueueOutcome::Full,
+                    Err(_) => true,
+                };
+                if full {
+                    state.metrics.record_build_rejected();
+                    state.build_waiters.lock().await.remove(&key);
+                    state.metrics.record_error();
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(ErrorResponse {
+                            error: "build queue full; retry shortly".to_string(),
+                        }),
+                    )
+                        .into_response();
+                }
+            }
+            match tokio::time::timeout(wait, rx).await {
+                Ok(Ok(Ok(()))) => {
+                    // Resolve HEAD to the concrete default branch before loading
+                    // the persisted ref; do_sync stores artifacts under the real
+                    // branch.
+                    let effective_branch = if branch == "HEAD" {
+                        git::default_branch(&mirror_dir)
+                            .ok()
+                            .filter(|b| !b.is_empty())
+                            .unwrap_or_else(|| branch.clone())
+                    } else {
+                        branch.clone()
+                    };
+                    let load_key = ref_store_key(&effective_branch, at_rev.as_deref());
+                    match state.ref_store.load_branch(&repo_id, &load_key).await {
+                        Ok(Some(info)) => {
+                            state.metrics.record_sync(start.elapsed());
+                            let resp = ref_response(
+                                &repo_id,
+                                &provider,
+                                effective_branch,
+                                &info,
+                                &state.storage,
+                                "full",
+                                private,
+                            );
+                            return (StatusCode::OK, Json(resp)).into_response();
+                        }
+                        _ => {
+                            return (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(ErrorResponse {
+                                    error: "build finished but ref missing".to_string(),
+                                }),
+                            )
+                                .into_response();
+                        }
+                    }
+                }
+                Ok(Ok(Err(e))) => {
+                    state.metrics.record_error();
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse {
+                            error: format!("sync failed: {e}"),
+                        }),
+                    )
+                        .into_response();
+                }
+                Ok(Err(_)) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse {
+                            error: "build worker dropped".to_string(),
+                        }),
+                    )
+                        .into_response();
+                }
+                Err(_) => {
+                    return (
+                        StatusCode::ACCEPTED,
+                        Json(BuildResponse {
+                            status: "building".to_string(),
+                            queue_depth: state.build_queue.depth().await,
+                        }),
+                    )
+                        .into_response();
+                }
+            }
+        } else {
+            // Cross-process queue: enqueue (the queue coalesces by repo/branch)
+            // and poll the job's status, since the build runs in a separate
+            // ripclone-worker.
+            //
+            // The rev override is not carried across the queue (not persisted; the
+            // worker builds the branch tip), so honoring `?rev=` here would build
+            // the wrong commit and then fail to find the `branch#atrev` ref.
+            // Reject it explicitly rather than mis-build. Use the local queue for
+            // rev-targeted builds.
+            if at_rev.is_some() {
+                return (
+                    StatusCode::NOT_IMPLEMENTED,
+                    Json(ErrorResponse {
+                        error: "rev override (?rev=) is not supported on the cross-process \
+                                queue; use the local queue (RIPCLONE_QUEUE=local)"
+                            .to_string(),
+                    }),
+                )
+                    .into_response();
+            }
+            // Per-request upstream tokens are never sent to the worker (not
+            // persisted); warn if one was supplied so a private-repo sync that
+            // needs it isn't silently mis-built.
+            if request_token.is_some() {
+                warn!(
+                    "per-request upstream token is ignored by the cross-process queue for {}; \
+                     the ripclone-worker must supply its own credentials",
+                    repo_id.storage_key()
+                );
+            }
             let job = BuildJob {
                 repo_id: repo_id.clone(),
                 branch: branch.clone(),
                 rev: at_rev.clone(),
                 credential,
             };
-            if state.build_queue.try_send(job).is_err() {
-                state.build_queue_depth.fetch_sub(1, Ordering::Relaxed);
+            let enq = match state.build_queue.enqueue(job).await {
+                Ok(enq) => enq,
+                Err(e) => {
+                    state.metrics.record_error();
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(ErrorResponse {
+                            error: format!("failed to enqueue build: {e}"),
+                        }),
+                    )
+                        .into_response();
+                }
+            };
+            // Only count a genuinely new job (not a coalesced duplicate).
+            if enq.outcome == EnqueueOutcome::Enqueued {
+                state.metrics.record_build_queued();
+            }
+            if enq.outcome == EnqueueOutcome::Full {
                 state.metrics.record_build_rejected();
-                state.build_waiters.lock().await.remove(&key);
                 state.metrics.record_error();
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -1926,78 +2104,103 @@ async fn sync_repo_inner(
                 )
                     .into_response();
             }
-        }
-        // Keep this comfortably under edge/proxy request timeouts (e.g. Fly's
-        // ~60s): on a long build we return 202 and let the client retry, rather
-        // than holding the connection until it is reset mid-request.
-        let wait = Duration::from_secs(env_bytes("RIPCLONE_SYNC_WAIT_SECS", 25));
-        match tokio::time::timeout(wait, rx).await {
-            Ok(Ok(Ok(()))) => {
-                // Resolve HEAD to the concrete default branch before loading the
-                // persisted ref; do_sync stores artifacts under the real branch.
-                let effective_branch = if branch == "HEAD" {
-                    git::default_branch(&mirror_dir)
-                        .ok()
-                        .filter(|b| !b.is_empty())
-                        .unwrap_or_else(|| branch.clone())
-                } else {
-                    branch.clone()
-                };
-                let load_key = ref_store_key(&effective_branch, at_rev.as_deref());
-                match state.ref_store.load_branch(&repo_id, &load_key).await {
-                    Ok(Some(info)) => {
-                        state.metrics.record_sync(start.elapsed());
-                        let resp = ref_response(
-                            &repo_id,
-                            &provider,
-                            effective_branch,
-                            &info,
-                            &state.storage,
-                            "full",
-                            private,
-                        );
-                        return (StatusCode::OK, Json(resp)).into_response();
-                    }
-                    _ => {
-                        return (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(ErrorResponse {
-                                error: "build finished but ref missing".to_string(),
-                            }),
-                        )
-                            .into_response();
-                    }
-                }
-            }
-            Ok(Ok(Err(e))) => {
+            // The SQL queue always returns a job id to poll; treat its absence as
+            // an internal error rather than spinning to the deadline.
+            let Some(job_id) = enq.job_id else {
                 state.metrics.record_error();
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(ErrorResponse {
-                        error: format!("sync failed: {e}"),
+                        error: "queue returned no job id".to_string(),
                     }),
                 )
                     .into_response();
-            }
-            Ok(Err(_)) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse {
-                        error: "build worker dropped".to_string(),
-                    }),
-                )
-                    .into_response();
-            }
-            Err(_) => {
-                // Still building — tell the client to poll/retry.
-                return (
-                    StatusCode::ACCEPTED,
-                    Json(BuildResponse {
-                        status: "building".to_string(),
-                        queue_depth: state.build_queue_depth.load(Ordering::Relaxed),
-                    }),
-                )
-                    .into_response();
+            };
+            let deadline = Instant::now() + wait;
+            let mut consecutive_errors = 0u32;
+            loop {
+                match state.build_queue.job_status(job_id).await {
+                    Ok(JobState::Done) => {
+                        // The build ran in another process, so this server's ref
+                        // caches may be stale — drop them before reading.
+                        let effective_branch = if branch == "HEAD" {
+                            git::default_branch(&mirror_dir)
+                                .ok()
+                                .filter(|b| !b.is_empty())
+                                .unwrap_or_else(|| branch.clone())
+                        } else {
+                            branch.clone()
+                        };
+                        state.ref_store.invalidate(&repo_id, &branch).await;
+                        state.ref_store.invalidate(&repo_id, &effective_branch).await;
+                        invalidate_ref_response_cache(&state, &repo_id, &effective_branch);
+                        let load_key = ref_store_key(&effective_branch, at_rev.as_deref());
+                        match state.ref_store.load_branch(&repo_id, &load_key).await {
+                            // Guard on a non-empty commit: a HEAD row can exist as
+                            // a build_status placeholder (empty commit). Never
+                            // return that as a successful ref.
+                            Ok(Some(info)) if !info.commit.is_empty() => {
+                                state.metrics.record_sync(start.elapsed());
+                                let resp = ref_response(
+                                    &repo_id,
+                                    &provider,
+                                    effective_branch,
+                                    &info,
+                                    &state.storage,
+                                    "full",
+                                    private,
+                                );
+                                return (StatusCode::OK, Json(resp)).into_response();
+                            }
+                            _ => {
+                                return (
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    Json(ErrorResponse {
+                                        error: "build finished but ref missing".to_string(),
+                                    }),
+                                )
+                                    .into_response();
+                            }
+                        }
+                    }
+                    Ok(JobState::Failed(e)) => {
+                        state.metrics.record_error();
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(ErrorResponse {
+                                error: format!("sync failed: {e}"),
+                            }),
+                        )
+                            .into_response();
+                    }
+                    Ok(_) => consecutive_errors = 0,
+                    Err(e) => {
+                        // Don't mask a persistent queue outage as backpressure.
+                        consecutive_errors += 1;
+                        warn!("queue job_status poll failed ({consecutive_errors}): {e}");
+                        if consecutive_errors >= 5 {
+                            state.metrics.record_error();
+                            return (
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                Json(ErrorResponse {
+                                    error: format!("build queue unavailable: {e}"),
+                                }),
+                            )
+                                .into_response();
+                        }
+                    }
+                }
+                if Instant::now() >= deadline {
+                    return (
+                        StatusCode::ACCEPTED,
+                        Json(BuildResponse {
+                            status: "building".to_string(),
+                            queue_depth: state.build_queue.depth().await,
+                        }),
+                    )
+                        .into_response();
+                }
+                tokio::time::sleep(Duration::from_millis(400)).await;
             }
         }
     }
@@ -2153,20 +2356,18 @@ async fn build_handler(
         credential,
     };
 
-    // Increment counters before enqueueing so a fast worker cannot decrement
-    // before we account for the job.
     state.metrics.record_build_queued();
-    let queue_depth = state.build_queue_depth.fetch_add(1, Ordering::Relaxed) + 1;
-
-    if let Err(e) = state.build_queue.try_send(job) {
-        // The job never entered the queue; roll back the increments.
+    let enq = state.build_queue.enqueue(job).await;
+    let accepted = matches!(&enq, Ok(e) if e.outcome != EnqueueOutcome::Full);
+    if !accepted {
         state.metrics.record_build_rejected();
-        state.build_queue_depth.fetch_sub(1, Ordering::Relaxed);
+        let error = match enq {
+            Err(e) => format!("build queue unavailable: {e}"),
+            _ => "build queue full".to_string(),
+        };
         return (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse {
-                error: format!("build queue full: {}", e),
-            }),
+            Json(ErrorResponse { error }),
         )
             .into_response();
     }
@@ -2176,7 +2377,7 @@ async fn build_handler(
         StatusCode::ACCEPTED,
         Json(BuildResponse {
             status: "queued".to_string(),
-            queue_depth,
+            queue_depth: state.build_queue.depth().await,
         }),
     )
         .into_response()
@@ -4511,107 +4712,133 @@ async fn build_full_in_background(
     Ok(())
 }
 
-fn spawn_build_worker(state: ServerState) -> tokio::sync::mpsc::Sender<BuildJob> {
-    const QUEUE_SIZE: usize = 1024;
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<BuildJob>(QUEUE_SIZE);
+/// Run one build to completion: mark `building` in the metadata store, sync,
+/// then mark `done`/`failed`. Returns the result string so the caller can signal
+/// in-process waiters (local queue) or ack the job (worker process).
+///
+/// This is the unit of work shared by the in-process worker loop and the
+/// standalone `ripclone-worker`. It touches only the durable backends + provider
+/// registry, so it runs unchanged in any process that shares the same storage,
+/// metadata store, and provider config.
+pub async fn process_build_job(state: &ServerState, job: &BuildJob) -> Result<(), String> {
+    let repo_id = &job.repo_id;
+    let branch = &job.branch;
+    let at_rev = job.rev.clone();
 
+    // Mark as building in the shared metadata store.
+    let _ = update_build_status(state, repo_id, "building").await;
+    invalidate_ref_response_cache(state, repo_id, branch);
+
+    let start = std::time::Instant::now();
+    let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
+    let provider = match state.provider_registry.get(repo_id.provider.as_str()) {
+        Some(p) => p.clone(),
+        None => {
+            let _ = update_build_status(state, repo_id, "error").await;
+            warn!("unknown provider {} for build job", repo_id.provider.as_str());
+            return Err(format!("unknown provider {}", repo_id.provider.as_str()));
+        }
+    };
+    let lock = repo_lock(&state.sync_locks, repo_id).await;
+    let _guard = lock.lock().await;
+    let result = do_sync(
+        &state.cas,
+        &mirror_dir,
+        repo_id,
+        branch,
+        at_rev.as_deref(),
+        &state.ref_store,
+        false,
+        &state.storage,
+        &state.retention,
+        &provider,
+        job.credential.as_ref(),
+    )
+    .await;
+    drop(_guard);
+
+    // Resolve HEAD to the concrete default branch for cache/log keys.
+    let effective_branch = match &result {
+        Ok(info) if branch == "HEAD" => info.default_branch.clone(),
+        _ => branch.clone(),
+    };
+    match &result {
+        Ok(info) => {
+            state.metrics.record_build_completed(start.elapsed());
+            // Cross-process resolution: a server that didn't run this build has no
+            // local mirror, so it cannot map a requested `HEAD` to the concrete
+            // default branch `do_sync` stored the ref under. Persist the real ref
+            // under the literal `HEAD` key too (plain HEAD request, no rev
+            // override) so any process can resolve `/sync HEAD` from the shared
+            // metadata store alone. The `HEAD` row already exists (build_status
+            // placeholder) and already shows in `list_branches`, so this only
+            // fills it with real data. `update_build_status` below then stamps
+            // `done` onto it.
+            if branch == "HEAD"
+                && at_rev.is_none()
+                && effective_branch != "HEAD"
+                && let Err(e) = state.ref_store.save_branch(repo_id, "HEAD", info).await
+            {
+                warn!("failed to write HEAD ref alias for {}: {e}", repo_id.storage_key());
+            }
+            let _ = update_build_status(state, repo_id, "done").await;
+            // A successful sync marks the mirror fresh so a following resolve
+            // doesn't re-fetch. Stamp both the concrete branch and the original
+            // requested branch (e.g. HEAD).
+            stamp_mirror_fresh(state, &format!("{}/{effective_branch}", repo_id.storage_key()));
+            if branch != &effective_branch {
+                stamp_mirror_fresh(state, &format!("{}/{branch}", repo_id.storage_key()));
+            }
+            invalidate_ref_response_cache(state, repo_id, &effective_branch);
+            info!(
+                "background build completed for {}@{effective_branch}",
+                repo_id.storage_key()
+            );
+            Ok(())
+        }
+        Err(e) => {
+            state.metrics.record_build_failed();
+            let _ = update_build_status(state, repo_id, &format!("failed: {e}")).await;
+            invalidate_ref_response_cache(state, repo_id, &effective_branch);
+            warn!(
+                "background build failed for {}@{effective_branch}: {e}",
+                repo_id.storage_key()
+            );
+            Err(format!("{e}"))
+        }
+    }
+}
+
+/// Spawn the in-process worker loop for the local queue. Each finished job
+/// decrements the shared depth counter and signals any coalesced `/sync` waiters
+/// via their oneshots.
+fn spawn_build_worker(state: ServerState, mut rx: tokio::sync::mpsc::Receiver<BuildJob>) {
     tokio::spawn(async move {
         while let Some(job) = rx.recv().await {
-            let repo_id = job.repo_id.clone();
-            let branch = job.branch.clone();
-            let at_rev = job.rev.clone();
-            let state = state.clone();
-
-            // Mark as building in the shared ref store.
-            let _ = update_build_status(&state, &repo_id, "building").await;
-            invalidate_ref_response_cache(&state, &repo_id, &branch);
-
-            let start = std::time::Instant::now();
-            let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
-            let provider = match state.provider_registry.get(repo_id.provider.as_str()) {
-                Some(p) => p.clone(),
-                None => {
-                    let _ = update_build_status(&state, &repo_id, "error").await;
-                    warn!(
-                        "unknown provider {} for build job",
-                        repo_id.provider.as_str()
-                    );
-                    state.build_queue_depth.fetch_sub(1, Ordering::Relaxed);
-                    continue;
-                }
-            };
-            let lock = repo_lock(&state.sync_locks, &repo_id).await;
-            let _guard = lock.lock().await;
-            let result = do_sync(
-                &state.cas,
-                &mirror_dir,
-                &repo_id,
-                &branch,
-                at_rev.as_deref(),
-                &state.ref_store,
-                false,
-                &state.storage,
-                &state.retention,
-                &provider,
-                job.credential.as_ref(),
-            )
-            .await;
-            drop(_guard);
-
-            state.build_queue_depth.fetch_sub(1, Ordering::Relaxed);
-            // Resolve HEAD to the concrete default branch for cache/log keys.
-            let effective_branch = match &result {
-                Ok(info) if branch == "HEAD" => info.default_branch.clone(),
-                _ => branch.clone(),
-            };
-            let waiter_result: Result<(), String> = match &result {
-                Ok(_) => {
-                    state.metrics.record_build_completed(start.elapsed());
-                    let _ = update_build_status(&state, &repo_id, "done").await;
-                    // A successful sync marks the mirror fresh so the waiter's
-                    // resolve doesn't re-fetch. Stamp both the concrete branch and
-                    // the original requested branch (e.g. HEAD).
-                    stamp_mirror_fresh(
-                        &state,
-                        &format!("{}/{effective_branch}", repo_id.storage_key()),
-                    );
-                    if branch != effective_branch {
-                        stamp_mirror_fresh(&state, &format!("{}/{branch}", repo_id.storage_key()));
-                    }
-                    invalidate_ref_response_cache(&state, &repo_id, &effective_branch);
-                    info!(
-                        "background build completed for {}@{effective_branch}",
-                        repo_id.storage_key()
-                    );
-                    Ok(())
-                }
-                Err(e) => {
-                    state.metrics.record_build_failed();
-                    let _ = update_build_status(&state, &repo_id, &format!("failed: {e}")).await;
-                    invalidate_ref_response_cache(&state, &repo_id, &effective_branch);
-                    warn!(
-                        "background build failed for {}@{effective_branch}: {e}",
-                        repo_id.storage_key()
-                    );
-                    Err(format!("{e}"))
-                }
-            };
-            // Signal every waiter for this key (coalesced /sync requests). Must
-            // match the enqueue key, which includes the rev override.
+            // The waiter key must match the enqueue key, which includes the rev
+            // override. Compute it before the job is moved into the build task.
             let key = format!(
-                "{}/{branch}#{}",
-                repo_id.storage_key(),
-                at_rev.as_deref().unwrap_or("")
+                "{}/{}#{}",
+                job.repo_id.storage_key(),
+                job.branch,
+                job.rev.as_deref().unwrap_or("")
             );
+            // Isolate the build so a panic fails just this job (signalling its
+            // waiters) instead of killing the worker and wedging the queue.
+            let st = state.clone();
+            let result =
+                match tokio::spawn(async move { process_build_job(&st, &job).await }).await {
+                    Ok(r) => r,
+                    Err(e) => Err(format!("build task panicked: {e}")),
+                };
+            state.build_queue_depth.fetch_sub(1, Ordering::Relaxed);
             if let Some(senders) = state.build_waiters.lock().await.remove(&key) {
                 for s in senders {
-                    let _ = s.send(waiter_result.clone());
+                    let _ = s.send(result.clone());
                 }
             }
         }
     });
-
-    tx
 }
 
 async fn update_build_status(state: &ServerState, repo_id: &RepoId, status: &str) -> Result<()> {
@@ -4733,47 +4960,26 @@ pub async fn run_server(
         rate_burst, rate_per_sec
     );
 
-    let cas = Cas::new(cas_dir)?;
-    let s3_storage = S3Storage::from_env().context("initialize S3 storage from environment")?;
-    let (storage, ref_store): (StorageRef, Arc<dyn RefStore>) = if let Some(s3) = s3_storage {
-        info!(
-            "using S3-compatible storage with local cache at {}",
-            cas_dir.display()
-        );
-        let s3 = Arc::new(s3);
-        let store = CachingRefStore::new(S3RefStore::new(s3.clone()));
-        (s3 as StorageRef, Arc::new(store))
-    } else {
-        info!("using local storage at {}", cas_dir.display());
-        let store = CachingRefStore::new(FileRefStore::new(repo_root));
-        (local(cas_dir)?, Arc::new(store))
-    };
-
     let metrics = Metrics::new();
-    let retention = Arc::new(Retention::with_config_and_storage(
-        cas.clone(),
-        metrics.clone(),
-        Retention::parse_age(),
-        Retention::parse_size(),
-        Some(storage.clone()),
-    )?);
+    // Pluggable storage + metadata store + retention, shared with ripclone-worker.
+    let b = backends::Backends::from_env(cas_dir, repo_root, &metrics).await?;
     let retention_interval: Duration = env::var("RIPCLONE_RETENTION_INTERVAL_SECS")
         .ok()
         .and_then(|s| s.parse().ok())
         .map(Duration::from_secs)
         .unwrap_or(Duration::from_secs(300));
-    Retention::clone(&retention).spawn(retention_interval);
+    Retention::clone(&b.retention).spawn(retention_interval);
 
     let remote_gc_interval: Duration = env::var("RIPCLONE_REMOTE_GC_INTERVAL_SECS")
         .ok()
         .and_then(|s| s.parse().ok())
         .map(Duration::from_secs)
         .unwrap_or(Duration::from_secs(0));
-    let remote_gc = RemoteGc::new(storage.clone(), ref_store.clone(), GcConfig::from_env());
+    let remote_gc = RemoteGc::new(b.storage.clone(), b.ref_store.clone(), GcConfig::from_env());
     remote_gc.spawn(remote_gc_interval);
 
     let refs_path = repo_root.join(".ripclone-refs.json");
-    if let Err(e) = migrate_legacy_refs(ref_store.as_ref(), &refs_path).await {
+    if let Err(e) = migrate_legacy_refs(b.ref_store.as_ref(), &refs_path).await {
         warn!("failed to migrate legacy refs: {}", e);
     }
 
@@ -4785,19 +4991,27 @@ pub async fn run_server(
         info!("OIDC verification enabled for audience configured via RIPCLONE_OIDC_AUDIENCE");
     }
 
-    let mut state = ServerState {
-        cas,
-        storage,
+    // Select the queue backend. The local queue drives an in-process worker; the
+    // SQL queues' builds run in separate ripclone-worker processes, so the server
+    // only enqueues.
+    let (build_queue, build_queue_depth, local_rx) = match backends::select_queue().await? {
+        QueueBackend::Local { queue, rx, depth } => (queue, depth, Some(rx)),
+        QueueBackend::Sql { queue } => (queue, Arc::new(AtomicUsize::new(0)), None),
+    };
+
+    let state = ServerState {
+        cas: b.cas,
+        storage: b.storage,
         repo_root: repo_root.to_path_buf(),
-        ref_store,
+        ref_store: b.ref_store,
         provider_registry,
         broker,
         token_hash: Some(token_hash),
         metrics,
         rate_limiter,
-        retention,
-        build_queue: tokio::sync::mpsc::channel(1).0, // placeholder
-        build_queue_depth: Arc::new(AtomicUsize::new(0)),
+        retention: b.retention,
+        build_queue,
+        build_queue_depth,
         build_waiters: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         oidc_verifier,
         sync_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -4813,10 +5027,11 @@ pub async fn run_server(
         fail_first_fetches: fail_first_fetches_from_env(),
         readyz_cache: Arc::new(std::sync::Mutex::new(None)),
     };
-    let build_queue = spawn_build_worker(state.clone());
-    state.build_queue = build_queue;
 
-    let state = state;
+    // Only the local queue runs builds in-process.
+    if let Some(rx) = local_rx {
+        spawn_build_worker(state.clone(), rx);
+    }
 
     let app = build_app(state);
     let addr: SocketAddr = format!("{}:{}", host, port).parse()?;
@@ -4842,11 +5057,13 @@ mod tests {
         let storage = crate::storage::local(&cas_root).unwrap();
         let repo_root = tmp.path().join("repos");
         std::fs::create_dir_all(&repo_root).unwrap();
-        let ref_store: Arc<dyn RefStore> = Arc::new(FileRefStore::new(&repo_root));
+        let ref_store: Arc<dyn RefStore> =
+            Arc::new(crate::ref_store::FileRefStore::new(&repo_root));
         let token_hash = format!("{:x}", Sha256::digest("secret"));
         let metrics = Metrics::new();
         let retention = Arc::new(Retention::new(cas.clone(), metrics.clone()).unwrap());
-        let (build_queue, _build_rx) = tokio::sync::mpsc::channel::<BuildJob>(16);
+        let (local_queue, _build_rx, _depth) = crate::queue::LocalJobQueue::new(16);
+        let build_queue: JobQueueRef = Arc::new(local_queue);
         let provider_registry = ProviderRegistry::new();
         let broker: Arc<dyn CredentialBroker> =
             Arc::new(StaticBroker::new(provider_registry.clone()));
