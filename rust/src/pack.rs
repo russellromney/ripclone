@@ -9,12 +9,6 @@ pub struct PackBuilder<'a> {
     cas: &'a Cas,
 }
 
-/// Rough decompression ratio of a deltified history pack (compressed bytes →
-/// raw object bytes). Only used to estimate the cold base's raw size for the LSM
-/// seal decision and a log line — never stored, never affects pack contents.
-/// Deliberately on the high side so a full base always clears the seal threshold.
-const HISTORY_PACK_COMPRESSION_ESTIMATE: u64 = 18;
-
 /// Result of an LSM incremental build. Each pack is `(pack_hash, pack_len,
 /// idx_hash, idx_len)`.
 pub struct IncrementalPacks {
@@ -22,8 +16,6 @@ pub struct IncrementalPacks {
     pub head_packs: Vec<(String, u64, String, u64)>,
     /// Deltified packs for the new commit range since the last sealed level.
     pub tail_packs: Vec<(String, u64, String, u64)>,
-    /// Total raw (uncompressed) size of the tail objects, for sealing decisions.
-    pub tail_raw_bytes: u64,
 }
 
 /// Result of compacting LSM levels: the new (bounded) level set, plus the pack
@@ -373,8 +365,7 @@ impl<'a> PackBuilder<'a> {
     /// a sealed level must hold the full range so it stays correct as an immutable
     /// artifact even after the HEAD closure changes in later syncs. Current blobs
     /// therefore appear in both the (undeltified) HEAD packs and the (deltified)
-    /// history packs; git dedups by OID on read. Returns the tail's total raw size
-    /// so the caller can decide whether to seal it into a new level.
+    /// history packs; git dedups by OID on read.
     pub fn build_incremental_packs(
         &self,
         commit: &str,
@@ -390,15 +381,15 @@ impl<'a> PackBuilder<'a> {
 
         let (head_packs, _) =
             self.build_packs_from_oids(&head_oids, head_target_raw_bytes, true)?;
-        let (tail_packs, tail_raw_bytes) = if tail_oids.is_empty() {
-            (Vec::new(), 0)
+        let tail_packs = if tail_oids.is_empty() {
+            Vec::new()
         } else {
             self.build_packs_from_oids(&tail_oids, history_target_raw_bytes, false)?
+                .0
         };
         Ok(IncrementalPacks {
             head_packs,
             tail_packs,
-            tail_raw_bytes,
         })
     }
 
@@ -406,13 +397,13 @@ impl<'a> PackBuilder<'a> {
     /// commit]` (the whole history when `sealed_tip` is `None`). This is the
     /// history half of [`build_incremental_packs`], for callers (two-phase
     /// phase 2) that already built the HEAD closure earlier. Returns the tail
-    /// packs and their total raw size (for sealing decisions).
+    /// packs.
     pub fn build_history_tail(
         &self,
         commit: &str,
         sealed_tip: Option<&str>,
         history_target_raw_bytes: u64,
-    ) -> Result<(Vec<(String, u64, String, u64)>, u64)> {
+    ) -> Result<Vec<(String, u64, String, u64)>> {
         // Cold base build (no sealed level yet): reuse the deltas git already has
         // via the mirror's reachability bitmap instead of enumerating ~all
         // objects and re-deltifying them in size-partitioned batches (which also
@@ -423,35 +414,29 @@ impl<'a> PackBuilder<'a> {
             // proven enumerate-and-pack path so a cold build never hard-fails on a
             // missing bitmap, an old git, or a pack-objects hiccup. Reuse is an
             // optimization, never the only path to a complete base.
-            let packs = match self.build_history_pack_reuse(commit) {
-                Ok(packs) => packs,
+            return match self.build_history_pack_reuse(commit) {
+                Ok(packs) => Ok(packs),
                 Err(e) => {
                     tracing::warn!(
                         "cold history pack-reuse failed ({e:#}); falling back to enumerate+pack"
                     );
                     let oids = git::list_object_shas_in_range(&self.repo, None, commit)?;
                     if oids.is_empty() {
-                        return Ok((Vec::new(), 0));
+                        return Ok(Vec::new());
                     }
-                    return self.build_packs_from_oids(&oids, history_target_raw_bytes, false);
+                    Ok(self
+                        .build_packs_from_oids(&oids, history_target_raw_bytes, false)?
+                        .0)
                 }
             };
-            // Raw-size estimate: deltified history decompresses by roughly
-            // HISTORY_PACK_COMPRESSION_ESTIMATE. Used only to decide LSM level
-            // sealing and for a log line, never stored. Inflating past the
-            // compressed size keeps a full base above any realistic seal threshold,
-            // so it always seals and becomes the level future tails build on.
-            let raw_estimate: u64 = packs
-                .iter()
-                .map(|(_, plen, _, _)| plen * HISTORY_PACK_COMPRESSION_ESTIMATE)
-                .sum();
-            return Ok((packs, raw_estimate));
         }
         let tail_oids = git::list_object_shas_in_range(&self.repo, sealed_tip, commit)?;
         if tail_oids.is_empty() {
-            return Ok((Vec::new(), 0));
+            return Ok(Vec::new());
         }
-        self.build_packs_from_oids(&tail_oids, history_target_raw_bytes, false)
+        Ok(self
+            .build_packs_from_oids(&tail_oids, history_target_raw_bytes, false)?
+            .0)
     }
 
     /// Build the cold full-history packs by reusing existing pack deltas via the
