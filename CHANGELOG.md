@@ -28,7 +28,8 @@ This file tracks what has already landed in ripclone. For upcoming work see `ROA
 - **Dependencies are pinned and move only deliberately.** `Cargo.lock` is committed and every CI/Docker `cargo` invocation uses `--locked`, so the resolved versions never drift on their own. Updates land only through reviewed **Dependabot** PRs (`.github/dependabot.yml`): one grouped PR per week for Rust crates and one for GitHub Actions — none auto-merged.
 - **`cargo-deny` guards the tree** (`rust/deny.toml`, `.github/workflows/deny.yml`): known security advisories (and yanked crates) fail CI, including on a weekly schedule so a new advisory against an unchanged dependency still surfaces; only crates.io is an allowed source; and every dependency's license must be on a permissive allow-list.
 - **Dependency/security changes get a changelog line here** stating what moved and why (CVE, feature need, or transitive requirement).
-- _Tracked debt:_ the guard surfaced three pre-existing `unsound` advisories — `RUSTSEC-2021-0154` (`fuser` 0.15) and `RUSTSEC-2026-0183`/`-0184` (`git2` 0.20). Each is fixed by a dependency bump (`fuser` ≥0.16, `git2` ≥0.21) and is tracked via `ignore` entries in `rust/deny.toml` for a focused, validated dep-upgrade PR.
+- **Removed the vestigial `ripclone mount` (FUSE) experiment** — the `fusefs` module, the `Mount` command, and the `fuser` dependency are deleted (~1.1k lines). This clears `RUSTSEC-2021-0154` by removal; the `git2` advisories (`RUSTSEC-2026-0183`/`-0184`) were already cleared by the gix migration removing `git2`. The three now-stale advisory `ignore` entries are dropped from `rust/deny.toml`. Can be re-added later if FUSE mounting is wanted.
+- **Allow `MPL-2.0` in `deny.toml`** (weak/file-level copyleft, safe to depend on from a permissive project) — the gix migration pulls in `uluru` (MPL-2.0), which the license check was rejecting.
 
 ## Client robustness + server observability
 

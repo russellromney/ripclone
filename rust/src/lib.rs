@@ -22,7 +22,6 @@ pub mod client;
 pub mod clonepack;
 pub mod config;
 pub mod extract;
-pub mod fusefs;
 pub mod git;
 pub mod gix_util;
 pub mod manifest;
