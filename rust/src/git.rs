@@ -955,10 +955,25 @@ pub fn pack_objects_to_prefix_gix<P: AsRef<Path>, Q: AsRef<Path>>(
 }
 
 /// Build a `.idx` file for an existing `.pack` using gix instead of the
-/// `git index-pack` subprocess. The pack must already be named `pack-<hash>.pack`
-/// in its directory; gix will detect it and only write the missing `.idx`.
-pub fn index_pack<P: AsRef<Path>, Q: AsRef<Path>>(_git_dir: P, pack_path: Q) -> Result<()> {
-    let pack_path = pack_path.as_ref();
+/// `git index-pack` subprocess.
+///
+/// `git_dir` is opened as a gix repository when possible so that ref-delta
+/// objects can be resolved against objects already present in the repo. If the
+/// directory is not a valid git repo, indexing falls back to resolving only
+/// ofs-deltas (suitable for undeltified packs).
+pub fn index_pack<P: AsRef<Path>, Q: AsRef<Path>>(git_dir: P, pack_path: Q) -> Result<()> {
+    let repo = gix::open(git_dir.as_ref()).ok();
+    index_pack_inner(pack_path.as_ref(), repo.as_ref())
+}
+
+/// Like [`index_pack`], but explicitly resolves ref-deltas against `repo_path`.
+pub fn index_pack_with_repo<P: AsRef<Path>, Q: AsRef<Path>>(repo_path: P, pack_path: Q) -> Result<()> {
+    let repo = gix::open(repo_path.as_ref())
+        .with_context(|| format!("open repo {} for index-pack", repo_path.as_ref().display()))?;
+    index_pack_inner(pack_path.as_ref(), Some(&repo))
+}
+
+fn index_pack_inner(pack_path: &Path, repo: Option<&gix::Repository>) -> Result<()> {
     let directory = pack_path
         .parent()
         .context("pack path must have a parent directory")?;
@@ -976,7 +991,7 @@ pub fn index_pack<P: AsRef<Path>, Q: AsRef<Path>>(_git_dir: P, pack_path: Q) -> 
         Some(directory),
         &mut progress,
         &AtomicBool::new(false),
-        None::<&gix::Repository>,
+        repo,
         gix_pack::bundle::write::Options {
             thread_limit: Some(thread_limit),
             iteration_mode: gix_pack::data::input::Mode::Verify,
@@ -984,7 +999,7 @@ pub fn index_pack<P: AsRef<Path>, Q: AsRef<Path>>(_git_dir: P, pack_path: Q) -> 
             object_hash: gix::hash::Kind::Sha1,
         },
     )
-    .context("gix index-pack")?;
+    .map_err(|e| anyhow::anyhow!("gix index-pack on {}: {:#}", pack_path.display(), e))?;
     if outcome.index_path.is_none() {
         bail!("gix index-pack produced no index (empty pack?)");
     }
@@ -1870,6 +1885,49 @@ mod tests {
         let pack_file = pack_dir.join("pack-0000000000000000000000000000000000000000.pack");
         std::fs::write(&pack_file, b"PKT\x00\x00").unwrap();
         assert!(index_pack(pack_dir.join(".git"), &pack_file).is_err());
+    }
+
+    /// gix-encoded pack can be indexed by gix (regression for server builds).
+    #[test]
+    fn gix_pack_objects_to_prefix_can_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let _ = Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .arg(&repo)
+            .output()
+            .unwrap();
+        for (key, val) in [("user.email", "t@t"), ("user.name", "t")] {
+            let _ = Command::new("git")
+                .args(["-C", repo.to_str().unwrap(), "config", key, val])
+                .output()
+                .unwrap();
+        }
+        std::fs::write(repo.join("file.txt"), "hello\n").unwrap();
+        let _ = Command::new("git")
+            .args(["-C", repo.to_str().unwrap(), "add", "file.txt"])
+            .output()
+            .unwrap();
+        let _ = Command::new("git")
+            .args(["-C", repo.to_str().unwrap(), "commit", "-q", "-m", "c"])
+            .output()
+            .unwrap();
+
+        let out = Command::new("git")
+            .args(["-C", repo.to_str().unwrap(), "rev-list", "--objects", "--no-object-names", "HEAD"])
+            .output()
+            .unwrap();
+        let objects: Vec<String> = String::from_utf8(out.stdout).unwrap().lines().map(|s| s.to_string()).collect();
+
+        let pack_dir = tmp.path().join("packs");
+        let prefix = pack_dir.join("pack");
+        pack_objects_to_prefix_gix(&repo, &objects, &prefix).unwrap();
+
+        let pack_file = std::fs::read_dir(&pack_dir).unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.extension().and_then(|e| e.to_str()) == Some("pack"))
+            .unwrap();
+        assert!(pack_file.with_extension("idx").exists(), "index must be created");
     }
 
     /// Setting and clearing skip-worktree via gix (Phase 5) round-trips through

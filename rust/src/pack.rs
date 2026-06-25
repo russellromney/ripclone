@@ -140,7 +140,7 @@ impl<'a> PackBuilder<'a> {
             .context("fetch skeleton pack for index build")?;
         let pack_path = pack_dir.join("skeleton.pack");
         std::fs::write(&pack_path, &pack_data)?;
-        git::index_pack(&git_dir, &pack_path)?;
+        git::index_pack_with_repo(&self.repo, &pack_path)?;
 
         git::set_head(&git_dir, commit)?;
         git::read_tree(&git_dir, commit)?;
