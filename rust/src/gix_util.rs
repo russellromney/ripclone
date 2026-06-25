@@ -1,10 +1,10 @@
 use anyhow::{Context, Result};
 use gix::objs::tree::EntryMode;
 use gix::traverse::tree::{Visit, visit::Action};
-use rayon::prelude::*;
+use rayon::{ThreadPoolBuilder, prelude::*};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// Global ceiling on the number of worker threads spawned by any gix parallel
 /// helper. Individual operations can be tuned with their own env vars, but they
@@ -14,6 +14,8 @@ pub const DEFAULT_THREAD_CAP: usize = 64;
 /// Threading environment variables:
 ///
 /// * `RIPCLONE_MAX_THREADS`        - global ceiling for all gix worker pools (default: host cores).
+/// * `RIPCLONE_GIX_THREADS` - dedicated rayon pool for all gix-backed parallel helpers
+///   (default: half the host cores, so it doesn't fight the zstd compression pool).
 /// * `RIPCLONE_HASH_THREADS`       - blob hashing in archive files-table builds.
 /// * `RIPCLONE_PACK_ENCODE_THREADS`- object read/encode in gix pack encoding.
 /// * `RIPCLONE_GIX_INDEX_THREADS`  - gix pack index verification/writing.
@@ -22,7 +24,7 @@ pub const DEFAULT_THREAD_CAP: usize = 64;
 /// * `RIPCLONE_FETCH_THREADS`      - archive chunk fetchers (in extract.rs).
 /// * `RAYON_NUM_THREADS`           - zstd frame compression pool (in archive.rs).
 ///
-/// All values are clamped to `[1, DEFAULT_THREAD_CAP]`.
+/// All values are clamped to `[1, DEFAULT_THREAD_CAP].`
 ///
 /// Read a parallelism setting from `env_var`. If missing or unparseable, use
 /// `fallback`. The result is clamped to at least 1 and at most the global cap.
@@ -45,12 +47,38 @@ pub fn default_worker_threads() -> usize {
     )
 }
 
-/// Map a vector of work items over a persistent rayon thread pool, with one
-/// gix handle created per chunk. Results are returned in the original order.
+/// Default size of the dedicated gix rayon pool. We use half the cores (min 2,
+/// max 16) so gix work doesn't starve the zstd compression pool or the async
+/// runtime. Override with `RIPCLONE_GIX_THREADS`.
+pub fn default_gix_worker_threads() -> usize {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    cores.div_ceil(2).clamp(2, 16)
+}
+
+static GIX_THREAD_POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+
+/// Dedicated rayon pool for all gix-backed parallel helpers. Kept separate from
+/// the global rayon pool (used for zstd compression) so one workload can't
+/// monopolize threads needed by the other.
+pub fn gix_pool() -> &'static rayon::ThreadPool {
+    GIX_THREAD_POOL.get_or_init(|| {
+        let threads = worker_threads("RIPCLONE_GIX_THREADS", default_gix_worker_threads());
+        ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|i| format!("gix-{i}"))
+            .build()
+            .expect("failed to build gix thread pool")
+    })
+}
+
+/// Map a vector of work items over the dedicated gix rayon pool, with one gix
+/// handle created per chunk. Results are returned in the original order.
 ///
 /// This avoids spawning fresh OS threads for every call. The number of active
-/// chunks is bounded by `num_workers`, but the underlying rayon pool may be
-/// sized via `RAYON_NUM_THREADS` (default: host cores).
+/// chunks is bounded by `num_workers`; the underlying pool is sized via
+/// `RIPCLONE_GIX_THREADS`.
 pub fn parallel_map_repo<P, I, F, R>(
     repo_path: P,
     items: Vec<I>,
@@ -80,16 +108,19 @@ where
     let chunk_size = items.len().div_ceil(num_workers);
 
     let chunks: Vec<&[I]> = items.chunks(chunk_size).collect();
-    let results: Vec<Vec<R>> = chunks
-        .into_par_iter()
-        .map(|chunk| {
-            let repo = sync_repo.to_thread_local();
-            chunk
-                .iter()
-                .map(|item| f(&repo, item))
+    let results: Vec<Vec<R>> = gix_pool()
+        .install(|| {
+            chunks
+                .into_par_iter()
+                .map(|chunk| {
+                    let repo = sync_repo.to_thread_local();
+                    chunk
+                        .iter()
+                        .map(|item| f(&repo, item))
+                        .collect::<Result<Vec<_>>>()
+                })
                 .collect::<Result<Vec<_>>>()
         })
-        .collect::<Result<Vec<_>>>()
         .context("parallel repo worker failed")?;
 
     let mut out = Vec::with_capacity(items.len());
