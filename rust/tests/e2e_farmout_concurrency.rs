@@ -47,7 +47,10 @@ async fn pool_of_worker_processes_drains_queue_and_coalesces() {
         }));
     }
     for (i, h) in handles.into_iter().enumerate() {
-        let resp = h.await.expect("join").expect("each repo syncs via the pool");
+        let resp = h
+            .await
+            .expect("join")
+            .expect("each repo syncs via the pool");
         assert!(!resp.commit.is_empty(), "r{i} produced a commit");
     }
     // Each clones with the right content → built correctly by some worker.
@@ -55,7 +58,10 @@ async fn pool_of_worker_processes_drains_queue_and_coalesces() {
         let (_g, c) = clone_only(&server, "acme", name, 0, CloneMode::Editable)
             .await
             .unwrap_or_else(|e| panic!("clone {name}: {e:?}"));
-        assert_eq!(std::fs::read_to_string(c.join("v")).unwrap(), format!("{i}\n"));
+        assert_eq!(
+            std::fs::read_to_string(c.join("v")).unwrap(),
+            format!("{i}\n")
+        );
     }
 
     // --- Concurrent /sync for the SAME repo coalesces to one resolved commit.

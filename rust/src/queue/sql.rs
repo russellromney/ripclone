@@ -22,7 +22,7 @@
 //!   backstop. A rare duplicate job is wasted compute, not a wrong result — the
 //!   poller watches its own job id and builds are idempotent into the CAS.
 
-use super::{BuildJob, Enqueued, EnqueueOutcome, JobId, JobQueue, JobState};
+use super::{BuildJob, EnqueueOutcome, Enqueued, JobId, JobQueue, JobState};
 use crate::provider::{ProviderInstanceId, RepoId};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -106,8 +106,13 @@ pub trait QueueDb: Send + Sync {
     async fn job_fields(&self, id: i64) -> Result<Option<(String, String, String)>>;
 
     /// Mark a job finished: `status` is `done` or `failed`, with optional error.
-    async fn finish(&self, id: i64, status: &str, finished_at: i64, error: Option<&str>)
-    -> Result<()>;
+    async fn finish(
+        &self,
+        id: i64,
+        status: &str,
+        finished_at: i64,
+        error: Option<&str>,
+    ) -> Result<()>;
 
     /// `(status, error)` for a job id.
     async fn status(&self, id: i64) -> Result<Option<(String, Option<String>)>>;
@@ -255,7 +260,11 @@ impl JobQueue for SqlJobQueue {
     }
 
     async fn depth(&self) -> usize {
-        self.db.count_queued().await.map(|n| n as usize).unwrap_or(0)
+        self.db
+            .count_queued()
+            .await
+            .map(|n| n as usize)
+            .unwrap_or(0)
     }
 
     fn inproc_wait(&self) -> bool {
@@ -288,8 +297,7 @@ pub(crate) const CREATE_ACTIVE_KEY_INDEX_SQL: &str =
 
 /// Index for the build/version history queries over retained `done` jobs
 /// ("what was synced for this repo over time").
-pub(crate) const CREATE_HISTORY_INDEX_SQL: &str =
-    "CREATE INDEX IF NOT EXISTS idx_jobs_provider_path_finished ON jobs(provider, path, finished_at)";
+pub(crate) const CREATE_HISTORY_INDEX_SQL: &str = "CREATE INDEX IF NOT EXISTS idx_jobs_provider_path_finished ON jobs(provider, path, finished_at)";
 
 #[cfg(test)]
 mod tests {
@@ -509,12 +517,14 @@ mod tests {
         let mut hs = Vec::new();
         for _ in 0..24 {
             let q = q.clone();
-            hs.push(tokio::spawn(
-                async move { q.enqueue(job("o", "r", "main")).await },
-            ));
+            hs.push(tokio::spawn(async move {
+                q.enqueue(job("o", "r", "main")).await
+            }));
         }
         for h in hs {
-            h.await.unwrap().expect("enqueue must not error under contention");
+            h.await
+                .unwrap()
+                .expect("enqueue must not error under contention");
         }
         assert_eq!(q.depth().await, 1, "concurrent enqueues coalesced");
 
@@ -529,7 +539,11 @@ mod tests {
             hs.push(tokio::spawn(async move {
                 let wid = format!("w{w}");
                 while let Some(c) = q.claim(&wid).await.unwrap() {
-                    assert!(seen.lock().await.insert(c.id), "job {} double-claimed", c.id);
+                    assert!(
+                        seen.lock().await.insert(c.id),
+                        "job {} double-claimed",
+                        c.id
+                    );
                 }
             }));
         }
@@ -537,7 +551,11 @@ mod tests {
             h.await.unwrap();
         }
         // 20 distinct branches + the 1 coalesced "main".
-        assert_eq!(seen.lock().await.len(), 21, "every job claimed exactly once");
+        assert_eq!(
+            seen.lock().await.len(),
+            21,
+            "every job claimed exactly once"
+        );
     }
 
     // ---- Postgres / MySQL: exercised against a real server (env-gated) --------
@@ -569,7 +587,10 @@ mod tests {
         let first = q.claim("w1").await.unwrap().unwrap();
         assert_eq!(first.branch, "main", "oldest queued claimed first");
         q.ack(first.id, Ok(())).await.unwrap();
-        assert!(matches!(q.job_status(first.id).await.unwrap(), JobState::Done));
+        assert!(matches!(
+            q.job_status(first.id).await.unwrap(),
+            JobState::Done
+        ));
 
         let second = q.claim("w1").await.unwrap().unwrap();
         assert_eq!(second.branch, "dev");
@@ -594,14 +615,18 @@ mod tests {
             eprintln!("SKIP postgres_queue_lifecycle: RIPCLONE_TEST_PG_URL unset");
             return;
         };
-        let pool = sqlx::postgres::PgPool::connect(&url).await.expect("connect pg");
+        let pool = sqlx::postgres::PgPool::connect(&url)
+            .await
+            .expect("connect pg");
         sqlx::query("DROP TABLE IF EXISTS jobs")
             .execute(&pool)
             .await
             .expect("drop jobs");
         pool.close().await;
         let q = SqlJobQueue::new(Box::new(
-            crate::queue::postgres_db::PostgresDb::connect(&url).await.unwrap(),
+            crate::queue::postgres_db::PostgresDb::connect(&url)
+                .await
+                .unwrap(),
         ))
         .await
         .unwrap();
@@ -614,14 +639,18 @@ mod tests {
             eprintln!("SKIP mysql_queue_lifecycle: RIPCLONE_TEST_MYSQL_URL unset");
             return;
         };
-        let pool = sqlx::mysql::MySqlPool::connect(&url).await.expect("connect mysql");
+        let pool = sqlx::mysql::MySqlPool::connect(&url)
+            .await
+            .expect("connect mysql");
         sqlx::query("DROP TABLE IF EXISTS jobs")
             .execute(&pool)
             .await
             .expect("drop jobs");
         pool.close().await;
         let q = SqlJobQueue::new(Box::new(
-            crate::queue::mysql_db::MysqlDb::connect(&url).await.unwrap(),
+            crate::queue::mysql_db::MysqlDb::connect(&url)
+                .await
+                .unwrap(),
         ))
         .await
         .unwrap();

@@ -2,7 +2,7 @@
 //! [`JobQueue`] trait. Builder and waiter share a process, so `/sync` can be
 //! signalled directly via an in-process oneshot (`inproc_wait() == true`).
 
-use super::{BuildJob, Enqueued, EnqueueOutcome, JobQueue};
+use super::{BuildJob, EnqueueOutcome, Enqueued, JobQueue};
 use anyhow::Result;
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -85,7 +85,10 @@ mod tests {
             EnqueueOutcome::Enqueued
         );
         // Second send has nowhere to go → Full, with depth rolled back.
-        assert_eq!(q.enqueue(job()).await.unwrap().outcome, EnqueueOutcome::Full);
+        assert_eq!(
+            q.enqueue(job()).await.unwrap().outcome,
+            EnqueueOutcome::Full
+        );
         assert_eq!(q.depth().await, 1, "Full enqueue must not inflate depth");
     }
 }

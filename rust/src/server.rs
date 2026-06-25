@@ -8,8 +8,8 @@ use crate::git;
 use crate::metrics::Metrics;
 use crate::oidc::OidcVerifier;
 use crate::pack::PackBuilder;
-use crate::queue::{BuildJob, EnqueueOutcome, JobQueueRef, JobState};
 use crate::provider::{ProviderInstance, ProviderRegistry, RepoId};
+use crate::queue::{BuildJob, EnqueueOutcome, JobQueueRef, JobState};
 use crate::ref_store::{RefStore, migrate_legacy_refs};
 use crate::remote_gc::{GcConfig, RemoteGc};
 use crate::retention::Retention;
@@ -2132,7 +2132,10 @@ async fn sync_repo_inner(
                             branch.clone()
                         };
                         state.ref_store.invalidate(&repo_id, &branch).await;
-                        state.ref_store.invalidate(&repo_id, &effective_branch).await;
+                        state
+                            .ref_store
+                            .invalidate(&repo_id, &effective_branch)
+                            .await;
                         invalidate_ref_response_cache(&state, &repo_id, &effective_branch);
                         let load_key = ref_store_key(&effective_branch, at_rev.as_deref());
                         match state.ref_store.load_branch(&repo_id, &load_key).await {
@@ -4735,7 +4738,10 @@ pub async fn process_build_job(state: &ServerState, job: &BuildJob) -> Result<()
         Some(p) => p.clone(),
         None => {
             let _ = update_build_status(state, repo_id, "error").await;
-            warn!("unknown provider {} for build job", repo_id.provider.as_str());
+            warn!(
+                "unknown provider {} for build job",
+                repo_id.provider.as_str()
+            );
             return Err(format!("unknown provider {}", repo_id.provider.as_str()));
         }
     };
@@ -4779,13 +4785,19 @@ pub async fn process_build_job(state: &ServerState, job: &BuildJob) -> Result<()
                 && effective_branch != "HEAD"
                 && let Err(e) = state.ref_store.save_branch(repo_id, "HEAD", info).await
             {
-                warn!("failed to write HEAD ref alias for {}: {e}", repo_id.storage_key());
+                warn!(
+                    "failed to write HEAD ref alias for {}: {e}",
+                    repo_id.storage_key()
+                );
             }
             let _ = update_build_status(state, repo_id, "done").await;
             // A successful sync marks the mirror fresh so a following resolve
             // doesn't re-fetch. Stamp both the concrete branch and the original
             // requested branch (e.g. HEAD).
-            stamp_mirror_fresh(state, &format!("{}/{effective_branch}", repo_id.storage_key()));
+            stamp_mirror_fresh(
+                state,
+                &format!("{}/{effective_branch}", repo_id.storage_key()),
+            );
             if branch != &effective_branch {
                 stamp_mirror_fresh(state, &format!("{}/{branch}", repo_id.storage_key()));
             }
@@ -4826,11 +4838,11 @@ fn spawn_build_worker(state: ServerState, mut rx: tokio::sync::mpsc::Receiver<Bu
             // Isolate the build so a panic fails just this job (signalling its
             // waiters) instead of killing the worker and wedging the queue.
             let st = state.clone();
-            let result =
-                match tokio::spawn(async move { process_build_job(&st, &job).await }).await {
-                    Ok(r) => r,
-                    Err(e) => Err(format!("build task panicked: {e}")),
-                };
+            let result = match tokio::spawn(async move { process_build_job(&st, &job).await }).await
+            {
+                Ok(r) => r,
+                Err(e) => Err(format!("build task panicked: {e}")),
+            };
             state.build_queue_depth.fetch_sub(1, Ordering::Relaxed);
             if let Some(senders) = state.build_waiters.lock().await.remove(&key) {
                 for s in senders {

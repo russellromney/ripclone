@@ -89,7 +89,10 @@ async fn worker_farm_out_libsql_against_real_sqld() {
         // remote-only and compile-checked), and exercises queue + metadata on
         // libsql together.
         std::env::set_var("RIPCLONE_METADATA", "libsql");
-        std::env::set_var("RIPCLONE_METADATA_DB_URL", format!("http://127.0.0.1:{port}"));
+        std::env::set_var(
+            "RIPCLONE_METADATA_DB_URL",
+            format!("http://127.0.0.1:{port}"),
+        );
         std::env::set_var("RIPCLONE_METADATA_DB_TOKEN", "dev");
     }
     enable_async_build();
@@ -113,14 +116,14 @@ async fn worker_farm_out_libsql_against_real_sqld() {
     let (_g, c) = clone_only(&server, "acme", "lq", 0, CloneMode::Editable)
         .await
         .expect("clone after libsql farm-out build");
-    assert_eq!(std::fs::read_to_string(c.join("a.txt")).unwrap(), "via-libsql\n");
+    assert_eq!(
+        std::fs::read_to_string(c.join("a.txt")).unwrap(),
+        "via-libsql\n"
+    );
     assert!(git_ok(&c, &["fsck", "--connectivity-only", "HEAD"]));
 
     // Negative: a missing upstream → the worker's build fails → /sync errors.
-    let result = server
-        .client()
-        .sync_repo("acme/missing-libsql", None)
-        .await;
+    let result = server.client().sync_repo("acme/missing-libsql", None).await;
     assert!(
         result.is_err(),
         "sync of a missing upstream over libsql must fail, got {result:?}"

@@ -178,7 +178,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            store.load_branch(&rid, "dev").await.unwrap().unwrap().commit,
+            store
+                .load_branch(&rid, "dev")
+                .await
+                .unwrap()
+                .unwrap()
+                .commit,
             "c2"
         );
 
@@ -225,8 +230,13 @@ mod tests {
             eprintln!("SKIP postgres_refstore_lifecycle: RIPCLONE_TEST_PG_URL unset");
             return;
         };
-        let pool = sqlx::postgres::PgPool::connect(&url).await.expect("connect pg");
-        sqlx::query("DROP TABLE IF EXISTS refs").execute(&pool).await.unwrap();
+        let pool = sqlx::postgres::PgPool::connect(&url)
+            .await
+            .expect("connect pg");
+        sqlx::query("DROP TABLE IF EXISTS refs")
+            .execute(&pool)
+            .await
+            .unwrap();
         pool.close().await;
         let store = SqlRefStore::new(Box::new(PostgresMeta::connect(&url).await.unwrap()))
             .await
@@ -240,8 +250,13 @@ mod tests {
             eprintln!("SKIP mysql_refstore_lifecycle: RIPCLONE_TEST_MYSQL_URL unset");
             return;
         };
-        let pool = sqlx::mysql::MySqlPool::connect(&url).await.expect("connect mysql");
-        sqlx::query("DROP TABLE IF EXISTS refs").execute(&pool).await.unwrap();
+        let pool = sqlx::mysql::MySqlPool::connect(&url)
+            .await
+            .expect("connect mysql");
+        sqlx::query("DROP TABLE IF EXISTS refs")
+            .execute(&pool)
+            .await
+            .unwrap();
         pool.close().await;
         let store = SqlRefStore::new(Box::new(MysqlMeta::connect(&url).await.unwrap()))
             .await

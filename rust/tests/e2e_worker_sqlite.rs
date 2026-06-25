@@ -46,10 +46,7 @@ async fn worker_binary_farm_out_sqlite() {
 
     // --- Negative: a repo that was never published → the worker's build fails →
     // `/sync` must surface an error to the user, not hang or 200.
-    let result = server
-        .client()
-        .sync_repo("acme/does-not-exist", None)
-        .await;
+    let result = server.client().sync_repo("acme/does-not-exist", None).await;
     assert!(
         result.is_err(),
         "sync of a missing upstream must fail, got {result:?}"
