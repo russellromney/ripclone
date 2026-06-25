@@ -142,6 +142,7 @@ jobs:
           mkdir -p ci-bins
           cp rust/target/release/ripclone \
              rust/target/release/ripclone-server \
+             rust/target/release/ripclone-worker \
              rust/target/release/git-remote-ripclone \
              rust/target/release/writer_bench \
              ci-bins/
@@ -150,4 +151,6 @@ jobs:
           docker build -f tests/fly/Dockerfile.ci -t ripclone-server:ci .
           docker build -f tests/fly/Dockerfile.client.ci -t ripclone-client:ci .
       - name: Smoke-test the binaries run in the image
-        run: docker run --rm ripclone-server:ci ripclone-server --help
+        run: |
+          docker run --rm ripclone-server:ci ripclone-server --help
+          docker run --rm ripclone-server:ci ripclone-worker --help

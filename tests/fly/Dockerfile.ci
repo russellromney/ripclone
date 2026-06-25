@@ -13,6 +13,7 @@ WORKDIR /app
 # Binaries staged by the workflow into ci-bins/ (rust/target/ is .dockerignored).
 COPY ci-bins/ripclone /usr/local/bin/ripclone
 COPY ci-bins/ripclone-server /usr/local/bin/ripclone-server
+COPY ci-bins/ripclone-worker /usr/local/bin/ripclone-worker
 
 ENV RUST_LOG=info
 
