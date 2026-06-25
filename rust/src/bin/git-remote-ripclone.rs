@@ -27,11 +27,8 @@ async fn main() -> Result<()> {
     let (provider, repo_path, requested_branch) = parse_url(url)?;
     let server_url = resolve_server_url(remote_name)?;
     let token_hash = resolve_server_token();
-    let insecure = env::var_os("RIPCLONE_INSECURE").is_some();
 
-    let client = Client::new_with_token(server_url, token_hash)
-        .with_provider(&provider)
-        .with_insecure(insecure);
+    let client = Client::new_with_token(server_url, token_hash).with_provider(&provider);
 
     let (git_dir, work_tree) = git_dirs()?;
 

@@ -60,7 +60,6 @@ async fn remote_helper_clones_through_ripclone_server() {
                 .env("PATH", new_path)
                 .env("RIPCLONE_SERVER", server_url)
                 .env("RIPCLONE_SERVER_TOKEN", TOKEN)
-                .env("RIPCLONE_INSECURE", "1")
                 .env("RUST_LOG", "debug")
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())

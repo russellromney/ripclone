@@ -38,11 +38,6 @@ struct Args {
     #[arg(short, long, env = "RIPCLONE_UPSTREAM_TOKEN")]
     token: Option<String>,
 
-    /// Allow HTTPS connections to servers with invalid/self-signed certificates.
-    /// Useful for self-hosted HTTP deployments; do not use in production.
-    #[arg(long, env = "RIPCLONE_INSECURE")]
-    insecure: bool,
-
     #[command(subcommand)]
     command: Commands,
 }
@@ -747,8 +742,7 @@ async fn main() -> Result<()> {
         Some(token) => Client::new_with_token(server.clone(), Some(token)),
         None => Client::new(server.clone()),
     }
-    .with_provider(&args.provider)
-    .with_insecure(args.insecure);
+    .with_provider(&args.provider);
 
     match args.command {
         // Handled before the client is built.
