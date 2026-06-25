@@ -739,6 +739,12 @@ pub fn pack_objects_reachable_to_prefix<P: AsRef<Path>, Q: AsRef<Path>>(
     prefix: Q,
     max_pack_bytes: u64,
 ) -> Result<()> {
+    // `commit` is fed to `pack-objects --revs` via stdin, where each line is a
+    // rev-list arg — a `-`-leading or range value would change the packed set.
+    // Callers pass a resolved hex SHA, but validate here too so this `pub` helper
+    // matches the rest of git.rs and never trusts an unvalidated rev.
+    crate::validation::validate_git_rev(commit)
+        .with_context(|| format!("invalid commit: {commit}"))?;
     let input_file = tempfile::NamedTempFile::new()?;
     std::fs::write(input_file.path(), format!("{commit}\n").as_bytes())?;
 
@@ -756,13 +762,17 @@ pub fn pack_objects_reachable_to_prefix<P: AsRef<Path>, Q: AsRef<Path>>(
         shell_escape(input_file.path().to_str().unwrap())
     );
 
-    let status = Command::new("sh")
+    // Capture rather than inherit: pack-objects prints each output pack's hash to
+    // stdout (noise in the server log), and stderr carries the real diagnostic when
+    // it fails. We write the packs by base-name, so stdout is not needed.
+    let output = Command::new("sh")
         .args(["-c", &cmd])
-        .status()
+        .output()
         .context("git pack-objects (reachable) shell")?;
 
-    if !status.success() {
-        bail!("pack-objects (reachable) failed");
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("pack-objects (reachable) failed: {}", stderr.trim());
     }
 
     Ok(())
