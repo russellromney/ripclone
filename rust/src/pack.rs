@@ -9,6 +9,12 @@ pub struct PackBuilder<'a> {
     cas: &'a Cas,
 }
 
+/// Rough decompression ratio of a deltified history pack (compressed bytes →
+/// raw object bytes). Only used to estimate the cold base's raw size for the LSM
+/// seal decision and a log line — never stored, never affects pack contents.
+/// Deliberately on the high side so a full base always clears the seal threshold.
+const HISTORY_PACK_COMPRESSION_ESTIMATE: u64 = 18;
+
 /// Result of an LSM incremental build. Each pack is `(pack_hash, pack_len,
 /// idx_hash, idx_len)`.
 pub struct IncrementalPacks {
@@ -413,11 +419,32 @@ impl<'a> PackBuilder<'a> {
         // breaks delta reuse at batch boundaries). This is the dominant cost of a
         // huge repo's first full sync; bitmap pack-reuse makes it ~I/O-bound.
         if sealed_tip.is_none() {
-            let packs = self.build_history_pack_reuse(commit)?;
-            // Raw-size estimate (deltified history compresses ~18x) — used only to
-            // decide level sealing, never stored. A full base always clears the
-            // seal threshold so it becomes the level future tails build on.
-            let raw_estimate: u64 = packs.iter().map(|(_, plen, _, _)| plen * 18).sum();
+            // Try the bitmap/delta-reuse fast path; on any failure fall back to the
+            // proven enumerate-and-pack path so a cold build never hard-fails on a
+            // missing bitmap, an old git, or a pack-objects hiccup. Reuse is an
+            // optimization, never the only path to a complete base.
+            let packs = match self.build_history_pack_reuse(commit) {
+                Ok(packs) => packs,
+                Err(e) => {
+                    tracing::warn!(
+                        "cold history pack-reuse failed ({e:#}); falling back to enumerate+pack"
+                    );
+                    let oids = git::list_object_shas_in_range(&self.repo, None, commit)?;
+                    if oids.is_empty() {
+                        return Ok((Vec::new(), 0));
+                    }
+                    return self.build_packs_from_oids(&oids, history_target_raw_bytes, false);
+                }
+            };
+            // Raw-size estimate: deltified history decompresses by roughly
+            // HISTORY_PACK_COMPRESSION_ESTIMATE. Used only to decide LSM level
+            // sealing and for a log line, never stored. Inflating past the
+            // compressed size keeps a full base above any realistic seal threshold,
+            // so it always seals and becomes the level future tails build on.
+            let raw_estimate: u64 = packs
+                .iter()
+                .map(|(_, plen, _, _)| plen * HISTORY_PACK_COMPRESSION_ESTIMATE)
+                .sum();
             return Ok((packs, raw_estimate));
         }
         let tail_oids = git::list_object_shas_in_range(&self.repo, sealed_tip, commit)?;
@@ -464,12 +491,18 @@ impl<'a> PackBuilder<'a> {
                 _ => {}
             }
         }
+        // Sort by pack name so the level's pack order (and thus the published
+        // manifest) is reproducible across identical rebuilds; `read_dir` and the
+        // HashMap both yield arbitrary order otherwise.
+        let mut names: Vec<String> = packs.keys().cloned().collect();
+        names.sort();
         let mut out = Vec::new();
-        for (name, pack_path) in packs {
+        for name in names {
+            let pack_path = &packs[&name];
             let idx_path = idxs
                 .get(&name)
                 .with_context(|| format!("missing idx for {name}"))?;
-            let pack_data = std::fs::read(&pack_path)?;
+            let pack_data = std::fs::read(pack_path)?;
             let idx_data = std::fs::read(idx_path)?;
             let pack_len = pack_data.len() as u64;
             let idx_len = idx_data.len() as u64;
