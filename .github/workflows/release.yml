@@ -30,7 +30,7 @@ jobs:
           - { os: macos-13, platform: macos-x86_64 }
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           cache-workspaces: rust
@@ -51,7 +51,7 @@ jobs:
           cp LICENSE-MIT LICENSE-APACHE "$dir/"
           tar -czf "$dir.tar.gz" "$dir"
           shasum -a 256 "$dir.tar.gz" > "$dir.tar.gz.sha256"
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           files: |
             ripclone-${{ matrix.platform }}.tar.gz
@@ -63,8 +63,8 @@ jobs:
   installer:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: softprops/action-gh-release@v2
+      - uses: actions/checkout@v7
+      - uses: softprops/action-gh-release@v3
         with:
           files: install.sh
           fail_on_unmatched_files: true
@@ -73,7 +73,7 @@ jobs:
   crates-io:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           cache-workspaces: rust
@@ -101,7 +101,7 @@ jobs:
     permissions:
       id-token: write # PyPI Trusted Publishing (OIDC)
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install build deps (macOS)
         if: runner.os == 'macOS'
         run: brew install protobuf cmake pkg-config libgit2 openssl@3
@@ -114,7 +114,7 @@ jobs:
           before-script-linux: |
             dnf install -y protobuf-compiler protobuf-devel cmake openssl-devel libgit2-devel fuse-devel || \
             (apt-get update && apt-get install -y protobuf-compiler cmake libssl-dev libgit2-dev libfuse-dev pkg-config)
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: wheels-${{ matrix.platform }}
           path: dist/*.whl
@@ -125,7 +125,7 @@ jobs:
     permissions:
       id-token: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: wheels-*
           merge-multiple: true
