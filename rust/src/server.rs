@@ -359,6 +359,16 @@ pub struct RefResponse {
     /// True when the returned clonepack is a shallow (depth=1) snapshot.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub shallow: bool,
+    /// True once the full clonepack's archive is built. The server publishes an
+    /// editable clonepack first and adds the archive a moment later, so a files
+    /// clone waits for this. Editable clones ignore it. Defaults true for older
+    /// servers that always built the archive before publishing.
+    #[serde(default = "default_true")]
+    pub archive_ready: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Serialize)]
@@ -1200,6 +1210,7 @@ fn ref_response(
         midx_url,
         idx_bundle_url,
         shallow: clonepack_kind == "shallow",
+        archive_ready: !info.archive_chunks.is_empty(),
     }
 }
 
@@ -3624,6 +3635,8 @@ async fn build_and_publish_two_phase(
     let sk_pack = shallow_skeleton_pack.clone();
     let sk_idx = shallow_skeleton_idx.clone();
     let sk_prebuilt = shallow_prebuilt_index.clone();
+    let sk_meta = shallow_metadata_hash.clone();
+    let sk_meta_len = shallow_meta_data.len() as u64;
     let head_base_pack_count_for_p2 = head_built.base_packs.len();
     tokio::spawn(async move {
         let started = Instant::now();
@@ -3643,6 +3656,8 @@ async fn build_and_publish_two_phase(
             sk_pack,
             sk_idx,
             sk_prebuilt,
+            sk_meta,
+            sk_meta_len,
             head_idx_bundle_hash,
             head_midx_hash,
             history_target,
@@ -3654,11 +3669,11 @@ async fn build_and_publish_two_phase(
         .await;
         match res {
             Ok(()) => info!(
-                "two-phase p2: published full history for {} in {:?}",
+                "full clone ready for {} in {:?}",
                 &commit2[..7.min(commit2.len())],
                 started.elapsed()
             ),
-            Err(e) => error!("two-phase p2: full history build failed for {owner2}/{repo2}: {e:#}"),
+            Err(e) => error!("full clone build failed for {owner2}/{repo2}: {e:#}"),
         }
     });
 
@@ -3687,6 +3702,12 @@ async fn build_full_in_background(
     shallow_skeleton_pack: String,
     shallow_skeleton_idx: String,
     shallow_prebuilt_index: String,
+    // Phase 1's shallow metadata chunk (files table + skeleton, no archive frames).
+    // The editable full clonepack (phase 2a) reuses it verbatim: an editable depth=0
+    // clone reads only the files table + packs, never the archive frames. Phase 2b
+    // builds a frames-bearing metadata for files mode.
+    shallow_metadata_hash: String,
+    shallow_metadata_len: u64,
     _head_idx_bundle_hash: String,
     _head_midx_hash: String,
     history_target: u64,
@@ -3746,25 +3767,16 @@ async fn build_full_in_background(
             Ok((b.build_history_packs(&cm2, history_target)?, 0, false))
         }
     });
+    // History is enough to publish an editable clone: it reads only the files
+    // table and the packs, never the archive. So publish as soon as history is
+    // ready instead of waiting for the zstd archive (which only files mode needs).
+    let t_editable = Instant::now();
     let (built_history, tail_raw_bytes, is_tail) =
         history_handle.await.context("history packs")??;
-    let (archive_chunk_hashes, metadata_base, new_archive_chunks, archive_frames) =
-        archive_handle.await.context("full archive")??;
-    info!(
-        "two-phase p2: archive {} frames ({} rebuilt)",
-        archive_frames.len(),
-        new_archive_chunks.len()
-    );
 
-    // HEAD-pack rebase: once the cumulative delta (the head packs past the base)
-    // grows large, rebuild a fresh base at the current commit here in the
-    // background — depth=1 is already published in phase 1, so this O(worktree)
-    // build is off the critical path. Rebasing keeps the delta small and drops the
-    // stale objects the base accumulates as HEAD moves away from it. The fresh base
-    // is persisted only if the ref hasn't advanced meanwhile (guarded by commit
-    // equality at the save below), so the head reuse state stays consistent with
-    // `RefInfo.commit`. Below the threshold, `head_packs` is unchanged (base +
-    // delta) and nothing new is built.
+    // Once the cumulative delta grows past the threshold, rebuild a fresh base at
+    // the current commit. depth=1 is already live, so this never blocks a clone.
+    // The fresh base is kept only if the ref still points at our commit.
     let rebase_bytes = env_bytes("RIPCLONE_HEAD_REBASE_BYTES", 128 * 1024 * 1024);
     let delta_bytes: u64 = head_packs
         .iter()
@@ -3784,7 +3796,7 @@ async fn build_full_in_background(
         .await
         .context("rebase head base")??;
         info!(
-            "two-phase p2: rebased HEAD base ({} MiB delta -> fresh base of {} packs)",
+            "rebased HEAD base ({} MiB delta -> fresh base of {} packs)",
             delta_bytes / (1024 * 1024),
             base.len()
         );
@@ -3794,8 +3806,8 @@ async fn build_full_in_background(
         (head_packs, Vec::new(), None)
     };
 
-    // Resolve manifest history (all levels flattened), the packs to upload (only
-    // freshly built this sync), and the levels to persist for the next sync.
+    // Flatten the history levels for the manifest; collect the freshly built packs
+    // to upload and the levels to persist.
     let (history_packs, new_history_tuples, new_levels) = if is_tail {
         seal_and_compact(
             mirror_dir,
@@ -3813,19 +3825,9 @@ async fn build_full_in_background(
         (built_history.clone(), built_history, Vec::new())
     };
 
-    // Reuse phase 1's shallow skeleton + prebuilt index (HEAD trees + HEAD index)
-    // for the full variant. Bytes come from local CAS or object storage (they may
-    // have been evicted locally after phase 1's upload).
-    let fetch = |h: &str| -> Result<Vec<u8>> { cas.get(h).or_else(|_| storage.get(h)) };
-    let mut full_meta = metadata_base;
-    full_meta.skeleton_pack = fetch(&shallow_skeleton_pack)?;
-    full_meta.skeleton_idx = fetch(&shallow_skeleton_idx)?;
-    full_meta.prebuilt_index = fetch(&shallow_prebuilt_index)?;
-    let full_meta_data = full_meta.encode_to_vec();
-    let metadata_hash = cas.put(&full_meta_data)?;
-
-    let archive_chunks = archive_chunk_refs(&archive_chunk_hashes, &full_meta)?;
-    // Full variant entries + idx-bundle (head idx is kept local, history is fresh).
+    // Pack entries + idx bundle over head + history. Built once; the files manifest
+    // below reuses them, since the packs are the same. MIDX is omitted (head packs
+    // were evicted) — the client builds it.
     let full_tagged: Vec<(&(String, u64, String, u64), bool)> = head_packs
         .iter()
         .map(|p| (p, false))
@@ -3833,99 +3835,177 @@ async fn build_full_in_background(
         .collect();
     let (full_entries, full_idx_bundle_ref, full_idx_bundle_hash) =
         assemble_variant(cas, storage, &full_tagged)?;
-    // Full MIDX is omitted: head packs were evicted after phase 1, so it can't be
-    // built without re-fetching them. The client builds the full MIDX itself.
-    let full_manifest = make_manifest(
+
+    // The shallow metadata already has the files table and skeleton, and an
+    // editable clone ignores the archive, so reuse it and leave archive_chunks
+    // empty.
+    let editable_manifest = make_manifest(
+        commit,
+        &parent,
+        default_branch,
+        &[],
+        &shallow_metadata_hash,
+        shallow_metadata_len,
+        full_entries.clone(),
+        None,
+        full_idx_bundle_ref.clone(),
+    )?;
+    let editable_clonepack_hash = cas.put(&editable_manifest.encode_to_vec())?;
+
+    // Upload the history packs+idx, the idx bundle, the manifest, and any rebase
+    // base. Non-rebase head packs + the shallow skeleton are already in storage.
+    let mut uploads: Vec<String> = vec![
+        editable_clonepack_hash.clone(),
+        full_idx_bundle_hash.clone(),
+    ];
+    for (p, _, i, _) in &new_history_tuples {
+        uploads.push(p.clone());
+        uploads.push(i.clone());
+    }
+    for (p, _, i, _) in &new_head_packs {
+        uploads.push(p.clone());
+        uploads.push(i.clone());
+    }
+    uploads.retain(|h| !h.is_empty());
+    let idx_keep: std::collections::HashSet<String> = new_history_tuples
+        .iter()
+        .map(|(_, _, ih, _)| ih.clone())
+        .chain(new_head_packs.iter().map(|(_, _, ih, _)| ih.clone()))
+        .collect();
+    upload_artifacts(cas, storage, uploads.clone(), upload_conc).await?;
+
+    // Publish the editable full clonepack. archive_chunks stays empty until the
+    // archive is built below; a files clone waits for it.
+    {
+        let mut info = ref_store
+            .load_branch(owner, repo, branch)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("ref vanished before editable publish"))?;
+        let mut all_packs = head_packs.clone();
+        all_packs.extend(history_packs.iter().cloned());
+        info.packs = pack_artifacts_of(&all_packs);
+        info.skeleton_pack = shallow_skeleton_pack.clone();
+        info.skeleton_idx = shallow_skeleton_idx.clone();
+        info.prebuilt_index = shallow_prebuilt_index.clone();
+        info.metadata_chunk = shallow_metadata_hash.clone();
+        info.manifest = shallow_metadata_hash.clone();
+        info.archive = String::new();
+        info.archive_chunks = Vec::new();
+        info.clonepack_manifest = editable_clonepack_hash.clone();
+        info.full_clonepack = crate::ClonepackArtifacts {
+            manifest: editable_clonepack_hash.clone(),
+            metadata_chunk: shallow_metadata_hash.clone(),
+            skeleton_pack: shallow_skeleton_pack.clone(),
+            skeleton_idx: shallow_skeleton_idx.clone(),
+            prebuilt_index: shallow_prebuilt_index.clone(),
+            midx: String::new(),
+            idx_bundle: full_idx_bundle_hash.clone(),
+            commit: commit.to_string(),
+        };
+        info.history_levels = new_levels;
+        // The head base is owned by the depth=1 build, which writes it consistently
+        // with the commit. Only adopt a rebase here if the ref still points at our
+        // commit; otherwise a newer sync owns it.
+        if let Some(sized) = rebased_base
+            && info.commit == commit
+        {
+            info.head_buckets = Vec::new();
+            info.head_base_commit = commit.to_string();
+            info.head_base_packs = sized;
+        }
+        info.build_status = Some("archive building".to_string());
+        ref_store
+            .save_branch(owner, repo, branch, &info)
+            .await
+            .with_context(|| format!("persist editable ref for {owner}/{repo}@{branch}"))?;
+    }
+    settle_storage(cas, storage, retention, uploads, idx_keep).await;
+    info!(
+        "published editable full clone for {} in {:?}",
+        &commit[..7.min(commit.len())],
+        t_editable.elapsed()
+    );
+
+    // Test hook: hold the archive back so a test can observe the editable clone
+    // being ready while files mode is not.
+    if let Ok(ms) = std::env::var("RIPCLONE_TEST_ARCHIVE_DELAY_MS")
+        && let Ok(ms) = ms.parse::<u64>()
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+    }
+
+    // Now the zstd archive, which files mode needs.
+    let t_archive = Instant::now();
+    let (archive_chunk_hashes, archive_meta, new_archive_chunks, archive_frames) =
+        archive_handle.await.context("full archive")??;
+    info!(
+        "archive {} frames ({} rebuilt)",
+        archive_frames.len(),
+        new_archive_chunks.len()
+    );
+    let fetch = |h: &str| -> Result<Vec<u8>> { cas.get(h).or_else(|_| storage.get(h)) };
+    let mut full_meta = archive_meta;
+    full_meta.skeleton_pack = fetch(&shallow_skeleton_pack)?;
+    full_meta.skeleton_idx = fetch(&shallow_skeleton_idx)?;
+    full_meta.prebuilt_index = fetch(&shallow_prebuilt_index)?;
+    let full_meta_data = full_meta.encode_to_vec();
+    let files_metadata_hash = cas.put(&full_meta_data)?;
+    let archive_chunks = archive_chunk_refs(&archive_chunk_hashes, &full_meta)?;
+    // Same packs + idx bundle as the editable manifest, now with the archive.
+    let files_manifest = make_manifest(
         commit,
         &parent,
         default_branch,
         &archive_chunks,
-        &metadata_hash,
+        &files_metadata_hash,
         full_meta_data.len() as u64,
         full_entries,
         None,
         full_idx_bundle_ref,
     )?;
-    let full_clonepack_hash = cas.put(&full_manifest.encode_to_vec())?;
+    let files_clonepack_hash = cas.put(&files_manifest.encode_to_vec())?;
 
-    // Upload phase-2 artifacts (history packs+idx, full metadata, full idx-bundle,
-    // full manifest). Head packs + the shallow skeleton/index are already in
-    // storage from phase 1.
-    let mut p2: Vec<String> = vec![
-        metadata_hash.clone(),
-        full_clonepack_hash.clone(),
-        full_idx_bundle_hash.clone(),
-    ];
-    // Only freshly built packs are uploaded/evicted; prior levels are already
-    // durable in object storage and are referenced by hash.
-    for (p, _, i, _) in &new_history_tuples {
-        p2.push(p.clone());
-        p2.push(i.clone());
-    }
-    // Only freshly built archive chunks are uploaded; reused frames' chunks are
-    // already durable in storage from a prior sync.
-    p2.extend(new_archive_chunks.iter().cloned());
-    // Freshly built compaction base packs (empty on a non-compacting sync).
-    for (p, _, i, _) in &new_head_packs {
-        p2.push(p.clone());
-        p2.push(i.clone());
-    }
-    p2.retain(|h| !h.is_empty());
-    let hist_idx_keep: std::collections::HashSet<String> = new_history_tuples
-        .iter()
-        .map(|(_, _, ih, _)| ih.clone())
-        .chain(new_head_packs.iter().map(|(_, _, ih, _)| ih.clone()))
-        .collect();
-    upload_artifacts(cas, storage, p2.clone(), upload_conc).await?;
+    let mut uploads: Vec<String> = vec![files_metadata_hash.clone(), files_clonepack_hash.clone()];
+    uploads.extend(new_archive_chunks.iter().cloned());
+    uploads.retain(|h| !h.is_empty());
+    upload_artifacts(cas, storage, uploads.clone(), upload_conc).await?;
 
-    // Upgrade the ref's full clonepack (preserve the live depth=1 clonepack).
-    let mut info = ref_store
-        .load_branch(owner, repo, branch)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("ref vanished before phase 2"))?;
-    let mut all_packs = head_packs.clone();
-    all_packs.extend(history_packs.iter().cloned());
-    info.packs = pack_artifacts_of(&all_packs);
-    info.skeleton_pack = shallow_skeleton_pack.clone();
-    info.skeleton_idx = shallow_skeleton_idx.clone();
-    info.prebuilt_index = shallow_prebuilt_index.clone();
-    info.metadata_chunk = metadata_hash.clone();
-    info.manifest = metadata_hash.clone();
-    info.archive = archive_chunk_hashes.first().cloned().unwrap_or_default();
-    info.archive_chunks = archive_chunk_hashes.clone();
-    info.clonepack_manifest = full_clonepack_hash.clone();
-    info.full_clonepack = crate::ClonepackArtifacts {
-        manifest: full_clonepack_hash.clone(),
-        metadata_chunk: metadata_hash.clone(),
-        skeleton_pack: shallow_skeleton_pack.clone(),
-        skeleton_idx: shallow_skeleton_idx.clone(),
-        prebuilt_index: shallow_prebuilt_index.clone(),
-        midx: String::new(),
-        idx_bundle: full_idx_bundle_hash.clone(),
-        commit: commit.to_string(),
-    };
-    info.history_levels = new_levels;
-    info.archive_frames = archive_frames;
-    // HEAD base state (the base commit + its packs) is owned by phase 1, which
-    // always writes it consistently with the commit it built. Only adopt a rebase
-    // result here if the ref still points at the commit we built; if a newer sync
-    // advanced it, leave that sync's base intact (its own phase 2 will rebase when
-    // its delta crosses the threshold). A non-rebase sync leaves the base as phase
-    // 1 wrote it.
-    if let Some(sized) = rebased_base
-        && info.commit == commit
+    // Add the archive to the full clonepack, only if the ref still points at our
+    // commit (a newer sync owns it otherwise, and brings its own archive).
     {
-        info.head_buckets = Vec::new();
-        info.head_base_commit = commit.to_string();
-        info.head_base_packs = sized;
+        let mut info = ref_store
+            .load_branch(owner, repo, branch)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("ref vanished before archive publish"))?;
+        if info.commit == commit {
+            info.metadata_chunk = files_metadata_hash.clone();
+            info.manifest = files_metadata_hash.clone();
+            info.archive = archive_chunk_hashes.first().cloned().unwrap_or_default();
+            info.archive_chunks = archive_chunk_hashes.clone();
+            info.clonepack_manifest = files_clonepack_hash.clone();
+            info.full_clonepack.manifest = files_clonepack_hash.clone();
+            info.full_clonepack.metadata_chunk = files_metadata_hash.clone();
+            info.archive_frames = archive_frames;
+            info.build_status = None;
+            ref_store
+                .save_branch(owner, repo, branch, &info)
+                .await
+                .with_context(|| format!("persist files ref for {owner}/{repo}@{branch}"))?;
+        }
     }
-    info.build_status = None;
-    ref_store
-        .save_branch(owner, repo, branch, &info)
-        .await
-        .with_context(|| format!("persist full ref for {owner}/{repo}@{branch}"))?;
-
-    settle_storage(cas, storage, retention, p2, hist_idx_keep).await;
+    settle_storage(
+        cas,
+        storage,
+        retention,
+        uploads,
+        std::collections::HashSet::new(),
+    )
+    .await;
+    info!(
+        "published files archive for {} in {:?}",
+        &commit[..7.min(commit.len())],
+        t_archive.elapsed()
+    );
     Ok(())
 }
 
@@ -4354,6 +4434,7 @@ mod tests {
             midx_url: None,
             idx_bundle_url: None,
             shallow: true,
+            archive_ready: true,
         };
 
         cache_ref_response(&state, "acme", "secret", "main", "shallow", &resp);
