@@ -1521,53 +1521,22 @@ mod tests {
     #[test]
     fn gix_list_tree_entries_skips_submodules() {
         let tmp = tempfile::tempdir().unwrap();
-        let repo = git2::Repository::init_bare(tmp.path()).unwrap();
-        let sig = git2::Signature::now("test", "test@example.com").unwrap();
-        let zero = git2::IndexTime::new(0, 0);
+        let repo = crate::test_fixture::init_bare(tmp.path());
 
-        let blob_oid = repo.blob(b"submodule-readme").unwrap();
-        let mut idx = repo.index().unwrap();
-        idx.add(&git2::IndexEntry {
-            ctime: zero,
-            mtime: zero,
-            dev: 0,
-            ino: 0,
-            mode: 0o100644,
-            uid: 0,
-            gid: 0,
-            file_size: 16,
-            id: blob_oid,
-            flags: 0,
-            flags_extended: 0,
-            path: b"README.md".to_vec(),
-        })
-        .unwrap();
-        idx.write().unwrap();
-        let sub_tree = repo.find_tree(idx.write_tree().unwrap()).unwrap();
-        let sub_commit = repo
-            .commit(None, &sig, &sig, "submodule", &sub_tree, &[])
-            .unwrap();
+        let sub_tmp = tempfile::tempdir().unwrap();
+        let sub_repo = crate::test_fixture::init_bare(sub_tmp.path());
+        let sub_commit =
+            crate::test_fixture::commit(&sub_repo, &[("README.md", b"submodule-readme")]);
 
-        let file_blob = repo.blob(b"file").unwrap();
-        let empty_tree = repo.treebuilder(None).unwrap().write().unwrap();
-        let empty_tree = repo.find_tree(empty_tree).unwrap();
-        let mut builder = git2::build::TreeUpdateBuilder::new();
-        builder.upsert("file.txt", file_blob, git2::FileMode::Blob);
-        builder.upsert("vendor/sub", sub_commit, git2::FileMode::Commit);
-        let tree_oid = builder.create_updated(&repo, &empty_tree).unwrap();
+        let parent_commit = crate::test_fixture::commit_with_modes(
+            &repo,
+            &[
+                ("file.txt", 0o100644, b"file"),
+                ("vendor/sub", 0o160000, sub_commit.as_bytes()),
+            ],
+        );
 
-        let commit = repo
-            .commit(
-                Some("HEAD"),
-                &sig,
-                &sig,
-                "main",
-                &repo.find_tree(tree_oid).unwrap(),
-                &[],
-            )
-            .unwrap();
-
-        let entries = list_tree_entries(tmp.path(), &commit.to_string()).unwrap();
+        let entries = list_tree_entries(tmp.path(), &parent_commit).unwrap();
         assert_eq!(entries.len(), 1, "submodule entry must be skipped");
         assert_eq!(entries[0].0, "file.txt");
         assert_eq!(entries[0].1, "100644");

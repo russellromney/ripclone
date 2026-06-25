@@ -2462,34 +2462,22 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let target = tmp.path().join("out");
         std::fs::create_dir(&target).unwrap();
-        init_git_dir(&target);
-
-        let repo = git2::Repository::open(&target).unwrap();
+        let repo = gix::init(&target).unwrap();
 
         let data_a = b"hello from the pack\n";
         let data_x = b"#!/bin/sh\necho hi\n";
         let link_target = b"a.txt";
 
-        let oid_a = repo.blob(data_a).unwrap();
-        let oid_x = repo.blob(data_x).unwrap();
-        let oid_l = repo.blob(link_target).unwrap();
+        let commit = crate::test_fixture::commit_with_modes(
+            &repo,
+            &[
+                ("a.txt", 0o100644, &data_a[..]),
+                ("link", 0o120000, &link_target[..]),
+                ("dir/run.sh", 0o100755, &data_x[..]),
+            ],
+        );
 
-        // Build a tree: a.txt (file), link (symlink), dir/run.sh (executable).
-        let mut sub = repo.treebuilder(None).unwrap();
-        sub.insert("run.sh", oid_x, 0o100755).unwrap();
-        let sub_oid = sub.write().unwrap();
-        let mut top = repo.treebuilder(None).unwrap();
-        top.insert("a.txt", oid_a, 0o100644).unwrap();
-        top.insert("link", oid_l, 0o120000).unwrap();
-        top.insert("dir", sub_oid, 0o040000).unwrap();
-        let tree_oid = top.write().unwrap();
-        let tree = repo.find_tree(tree_oid).unwrap();
-        let sig = git2::Signature::now("t", "t@e").unwrap();
-        let commit_oid = repo
-            .commit(Some("HEAD"), &sig, &sig, "msg", &tree, &[])
-            .unwrap();
-
-        let stats = materialize_worktree_from_pack(&target, &commit_oid.to_string()).unwrap();
+        let stats = materialize_worktree_from_pack(&target, &commit).unwrap();
         assert_eq!(stats.files, 3);
 
         // Content lands on disk, including nested directories.

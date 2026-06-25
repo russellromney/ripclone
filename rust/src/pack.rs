@@ -597,38 +597,8 @@ mod tests {
 
     /// Commit `files` onto a bare repo's HEAD (parent = current HEAD if any) and
     /// return the new commit oid.
-    fn commit_onto(repo: &git2::Repository, files: &[(&str, &[u8])]) -> String {
-        let sig = git2::Signature::now("t", "t@t").unwrap();
-        let mut idx = repo.index().unwrap();
-        let zero = git2::IndexTime::new(0, 0);
-        for (path, bytes) in files {
-            let blob = repo.blob(bytes).unwrap();
-            idx.add(&git2::IndexEntry {
-                ctime: zero,
-                mtime: zero,
-                dev: 0,
-                ino: 0,
-                mode: 0o100644,
-                uid: 0,
-                gid: 0,
-                file_size: bytes.len() as u32,
-                id: blob,
-                flags: 0,
-                flags_extended: 0,
-                path: path.as_bytes().to_vec(),
-            })
-            .unwrap();
-        }
-        idx.write().unwrap();
-        let tree = repo.find_tree(idx.write_tree().unwrap()).unwrap();
-        let parents: Vec<git2::Commit> = match repo.head().ok().and_then(|h| h.target()) {
-            Some(t) => vec![repo.find_commit(t).unwrap()],
-            None => vec![],
-        };
-        let prefs: Vec<&git2::Commit> = parents.iter().collect();
-        repo.commit(Some("HEAD"), &sig, &sig, "c", &tree, &prefs)
-            .unwrap()
-            .to_string()
+    fn commit_onto(repo: &gix::Repository, files: &[(&str, &[u8])]) -> String {
+        crate::test_fixture::commit(repo, files)
     }
 
     /// A cold build packs the full HEAD closure; a re-sync after changing one file
@@ -638,7 +608,7 @@ mod tests {
     #[test]
     fn head_delta_pack_is_minimal() {
         let tmp = tempfile::tempdir().unwrap();
-        let repo = git2::Repository::init_bare(tmp.path()).unwrap();
+        let repo = crate::test_fixture::init_bare(tmp.path());
         let cas_dir = tempfile::tempdir().unwrap();
         let cas = Cas::new(cas_dir.path()).unwrap();
         let pb = PackBuilder::new(tmp.path(), &cas);

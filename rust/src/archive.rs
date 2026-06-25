@@ -1206,7 +1206,7 @@ mod tests {
                 .collect::<Vec<u8>>()
         };
         let tmp = tempfile::tempdir().unwrap();
-        let repo = git2::Repository::init_bare(tmp.path()).unwrap();
+        let repo = crate::test_fixture::init_bare(tmp.path());
         let cas_dir = tempfile::tempdir().unwrap();
         let cas = Cas::new(cas_dir.path()).unwrap();
         let builder = ArchiveBuilder::new(tmp.path());
@@ -1248,71 +1248,15 @@ mod tests {
 
     fn commit_files(files: &[(&str, &[u8])]) -> (tempfile::TempDir, String) {
         let tmp = tempfile::tempdir().unwrap();
-        let repo = git2::Repository::init_bare(tmp.path()).unwrap();
-        let sig = git2::Signature::now("test", "test@example.com").unwrap();
-        let mut idx = repo.index().unwrap();
-        let zero_time = git2::IndexTime::new(0, 0);
-        for (path, bytes) in files {
-            let blob_oid = repo.blob(bytes).unwrap();
-            let entry = git2::IndexEntry {
-                ctime: zero_time,
-                mtime: zero_time,
-                dev: 0,
-                ino: 0,
-                mode: 0o100644,
-                uid: 0,
-                gid: 0,
-                file_size: bytes.len() as u32,
-                id: blob_oid,
-                flags: 0,
-                flags_extended: 0,
-                path: path.as_bytes().to_vec(),
-            };
-            idx.add(&entry).unwrap();
-        }
-        idx.write().unwrap();
-        let tree_id = idx.write_tree().unwrap();
-        let tree = repo.find_tree(tree_id).unwrap();
-        let commit_oid = repo
-            .commit(Some("HEAD"), &sig, &sig, "test", &tree, &[])
-            .unwrap();
-        (tmp, commit_oid.to_string())
+        let repo = crate::test_fixture::init_bare(tmp.path());
+        let commit = crate::test_fixture::commit(&repo, files);
+        (tmp, commit)
     }
 
     /// Commit `files` onto `repo`'s HEAD (with the current HEAD as parent if any)
     /// and return the new commit oid. Lets a test build a history in one repo.
-    fn commit_onto(repo: &git2::Repository, files: &[(&str, &[u8])]) -> String {
-        let sig = git2::Signature::now("test", "test@example.com").unwrap();
-        let mut idx = repo.index().unwrap();
-        let zero = git2::IndexTime::new(0, 0);
-        for (path, bytes) in files {
-            let blob_oid = repo.blob(bytes).unwrap();
-            idx.add(&git2::IndexEntry {
-                ctime: zero,
-                mtime: zero,
-                dev: 0,
-                ino: 0,
-                mode: 0o100644,
-                uid: 0,
-                gid: 0,
-                file_size: bytes.len() as u32,
-                id: blob_oid,
-                flags: 0,
-                flags_extended: 0,
-                path: path.as_bytes().to_vec(),
-            })
-            .unwrap();
-        }
-        idx.write().unwrap();
-        let tree = repo.find_tree(idx.write_tree().unwrap()).unwrap();
-        let parents: Vec<git2::Commit> = match repo.head().ok().and_then(|h| h.target()) {
-            Some(t) => vec![repo.find_commit(t).unwrap()],
-            None => vec![],
-        };
-        let parent_refs: Vec<&git2::Commit> = parents.iter().collect();
-        repo.commit(Some("HEAD"), &sig, &sig, "c", &tree, &parent_refs)
-            .unwrap()
-            .to_string()
+    fn commit_onto(repo: &gix::Repository, files: &[(&str, &[u8])]) -> String {
+        crate::test_fixture::commit(repo, files)
     }
 
     /// The incremental files table (prior table + diff) must be byte-identical to
@@ -1321,7 +1265,7 @@ mod tests {
     #[test]
     fn incremental_files_table_matches_full() {
         let tmp = tempfile::tempdir().unwrap();
-        let repo = git2::Repository::init_bare(tmp.path()).unwrap();
+        let repo = crate::test_fixture::init_bare(tmp.path());
         // c1: a, b, dir/c. c2: modify b, add dir/e, remove dir/c, keep a.
         let c1 = commit_onto(
             &repo,
@@ -1382,7 +1326,7 @@ mod tests {
     fn assert_bounded_matches(files1: &[(String, Vec<u8>)], files2: &[(String, Vec<u8>)]) {
         use std::collections::HashMap;
         let tmp = tempfile::tempdir().unwrap();
-        let repo = git2::Repository::init_bare(tmp.path()).unwrap();
+        let repo = crate::test_fixture::init_bare(tmp.path());
         let cas = Cas::new(tempfile::tempdir().unwrap().path()).unwrap();
         let builder = ArchiveBuilder::new(tmp.path());
 
@@ -1498,73 +1442,13 @@ mod tests {
     }
 
     /// Commit raw-byte paths (so we can use a non-UTF8 filename).
-    fn commit_onto_bytes(repo: &git2::Repository, files: &[(&[u8], &[u8])]) -> String {
-        let sig = git2::Signature::now("test", "test@example.com").unwrap();
-        let mut idx = repo.index().unwrap();
-        let zero = git2::IndexTime::new(0, 0);
-        for (path, bytes) in files {
-            let blob_oid = repo.blob(bytes).unwrap();
-            idx.add(&git2::IndexEntry {
-                ctime: zero,
-                mtime: zero,
-                dev: 0,
-                ino: 0,
-                mode: 0o100644,
-                uid: 0,
-                gid: 0,
-                file_size: bytes.len() as u32,
-                id: blob_oid,
-                flags: 0,
-                flags_extended: 0,
-                path: path.to_vec(),
-            })
-            .unwrap();
-        }
-        idx.write().unwrap();
-        let tree = repo.find_tree(idx.write_tree().unwrap()).unwrap();
-        let parents: Vec<git2::Commit> = match repo.head().ok().and_then(|h| h.target()) {
-            Some(t) => vec![repo.find_commit(t).unwrap()],
-            None => vec![],
-        };
-        let parent_refs: Vec<&git2::Commit> = parents.iter().collect();
-        repo.commit(Some("HEAD"), &sig, &sig, "c", &tree, &parent_refs)
-            .unwrap()
-            .to_string()
+    fn commit_onto_bytes(repo: &gix::Repository, files: &[(&[u8], &[u8])]) -> String {
+        crate::test_fixture::commit_bytes(repo, files)
     }
 
     /// Helper to commit files with explicit git modes (e.g. symlinks, executables).
-    fn commit_with_modes(repo: &git2::Repository, files: &[(&str, u32, &[u8])]) -> String {
-        let sig = git2::Signature::now("test", "test@example.com").unwrap();
-        let mut idx = repo.index().unwrap();
-        let zero = git2::IndexTime::new(0, 0);
-        for (path, mode, bytes) in files {
-            let blob_oid = repo.blob(bytes).unwrap();
-            idx.add(&git2::IndexEntry {
-                ctime: zero,
-                mtime: zero,
-                dev: 0,
-                ino: 0,
-                mode: *mode,
-                uid: 0,
-                gid: 0,
-                file_size: bytes.len() as u32,
-                id: blob_oid,
-                flags: 0,
-                flags_extended: 0,
-                path: path.as_bytes().to_vec(),
-            })
-            .unwrap();
-        }
-        idx.write().unwrap();
-        let tree = repo.find_tree(idx.write_tree().unwrap()).unwrap();
-        let parents: Vec<git2::Commit> = match repo.head().ok().and_then(|h| h.target()) {
-            Some(t) => vec![repo.find_commit(t).unwrap()],
-            None => vec![],
-        };
-        let parent_refs: Vec<&git2::Commit> = parents.iter().collect();
-        repo.commit(Some("HEAD"), &sig, &sig, "c", &tree, &parent_refs)
-            .unwrap()
-            .to_string()
+    fn commit_with_modes(repo: &gix::Repository, files: &[(&str, u32, &[u8])]) -> String {
+        crate::test_fixture::commit_with_modes(repo, files)
     }
 
     /// Regression: a non-UTF8 filename whose CONTENT changes must get a fresh
@@ -1576,7 +1460,7 @@ mod tests {
     fn incremental_files_table_non_utf8_change_not_stale() {
         let weird: &[u8] = b"caf\xe9.txt"; // invalid UTF-8 (Latin-1 é)
         let tmp = tempfile::tempdir().unwrap();
-        let repo = git2::Repository::init_bare(tmp.path()).unwrap();
+        let repo = crate::test_fixture::init_bare(tmp.path());
         let c1 = commit_onto_bytes(&repo, &[(b"a.txt", b"a"), (weird, b"v1")]);
         let c2 = commit_onto_bytes(&repo, &[(b"a.txt", b"a"), (weird, b"v2-changed")]);
 
@@ -1616,7 +1500,7 @@ mod tests {
     #[test]
     fn archive_preserves_symlink_and_executable_modes() {
         let tmp = tempfile::tempdir().unwrap();
-        let repo = git2::Repository::init_bare(tmp.path()).unwrap();
+        let repo = crate::test_fixture::init_bare(tmp.path());
         let commit = commit_with_modes(
             &repo,
             &[
@@ -1660,45 +1544,31 @@ mod tests {
     #[test]
     fn collect_blobs_raw_gix_skips_submodules() {
         let tmp = tempfile::tempdir().unwrap();
-        let repo = git2::Repository::init_bare(tmp.path()).unwrap();
-        let sig = git2::Signature::now("test", "test@example.com").unwrap();
-        let zero = git2::IndexTime::new(0, 0);
+        let repo = crate::test_fixture::init_bare(tmp.path());
 
         // An orphan commit that will stand in for a submodule object.
-        let blob_oid = repo.blob(b"submodule-readme").unwrap();
-        let mut idx = repo.index().unwrap();
-        idx.add(&git2::IndexEntry {
-            ctime: zero,
-            mtime: zero,
-            dev: 0,
-            ino: 0,
-            mode: 0o100644,
-            uid: 0,
-            gid: 0,
-            file_size: 16,
-            id: blob_oid,
-            flags: 0,
-            flags_extended: 0,
-            path: b"README.md".to_vec(),
-        })
-        .unwrap();
-        idx.write().unwrap();
-        let sub_tree = repo.find_tree(idx.write_tree().unwrap()).unwrap();
-        let sub_commit = repo
-            .commit(None, &sig, &sig, "submodule", &sub_tree, &[])
-            .unwrap();
+        let sub_tmp = tempfile::tempdir().unwrap();
+        let sub_repo = crate::test_fixture::init_bare(sub_tmp.path());
+        let sub_commit =
+            crate::test_fixture::commit(&sub_repo, &[("README.md", b"submodule-readme")]);
 
         // Main tree contains a regular file and a submodule entry.
-        let file_blob = repo.blob(b"file").unwrap();
-        let empty_tree = repo.treebuilder(None).unwrap().write().unwrap();
-        let empty_tree = repo.find_tree(empty_tree).unwrap();
-        let mut builder = git2::build::TreeUpdateBuilder::new();
-        builder.upsert("file.txt", file_blob, git2::FileMode::Blob);
-        builder.upsert("vendor/sub", sub_commit, git2::FileMode::Commit);
-        let tree_oid = builder.create_updated(&repo, &empty_tree).unwrap();
+        let commit = crate::test_fixture::commit_with_modes(
+            &repo,
+            &[
+                ("file.txt", 0o100644, b"file"),
+                ("vendor/sub", 0o160000, sub_commit.as_bytes()),
+            ],
+        );
+        let commit_id = commit.parse::<gix::hash::ObjectId>().unwrap();
+        let tree_id = repo
+            .find_commit(commit_id)
+            .unwrap()
+            .tree_id()
+            .unwrap()
+            .detach();
 
         let gix_repo = crate::gix_util::open_repo(tmp.path()).unwrap();
-        let tree_id = gix::hash::ObjectId::from_hex(tree_oid.to_string().as_bytes()).unwrap();
         let mut blobs = Vec::new();
         collect_blobs_raw_gix(&gix_repo, tree_id, &mut blobs).unwrap();
 
@@ -1743,14 +1613,8 @@ mod tests {
     #[test]
     fn archive_empty_tree() {
         let tmp = tempfile::tempdir().unwrap();
-        let repo = git2::Repository::init_bare(tmp.path()).unwrap();
-        let sig = git2::Signature::now("test", "test@example.com").unwrap();
-        let tree = repo.treebuilder(None).unwrap().write().unwrap();
-        let tree = repo.find_tree(tree).unwrap();
-        let commit = repo
-            .commit(Some("HEAD"), &sig, &sig, "empty", &tree, &[])
-            .unwrap()
-            .to_string();
+        let repo = crate::test_fixture::init_bare(tmp.path());
+        let commit = crate::test_fixture::commit(&repo, &[]);
 
         let builder = ArchiveBuilder::new(tmp.path());
         let manifest = builder.build_files_table(&commit).unwrap();
@@ -1881,7 +1745,7 @@ mod tests {
     fn archive_manifest_preserves_non_utf8_path() {
         let weird: &[u8] = b"caf\xe9.txt"; // invalid UTF-8 (Latin-1 é)
         let tmp = tempfile::tempdir().unwrap();
-        let repo = git2::Repository::init_bare(tmp.path()).unwrap();
+        let repo = crate::test_fixture::init_bare(tmp.path());
         let commit = commit_onto_bytes(&repo, &[(b"a.txt", b"hi"), (weird, b"payload")]);
 
         let (manifest, _chunks, _stats) = ArchiveBuilder::new(tmp.path())

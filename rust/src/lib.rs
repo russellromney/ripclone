@@ -38,6 +38,9 @@ pub mod server;
 pub mod sidecar;
 pub mod snapshot;
 pub mod storage;
+
+#[cfg(test)]
+pub mod test_fixture;
 pub mod validation;
 pub mod worktree_writer;
 
