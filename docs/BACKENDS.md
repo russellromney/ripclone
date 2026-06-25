@@ -1,9 +1,8 @@
 # Backends
 
-`ripclone-server` has three independent, pluggable backends, each chosen by
-environment variables. The defaults need zero infrastructure — a single binary
-with local storage and an in-process builder — and you swap any one of them out
-without touching the others:
+`ripclone-server` has three independent, pluggable backends. The defaults need
+zero infrastructure — a single binary with local storage and an in-process
+builder — and you swap any one of them out without touching the others:
 
 - **Storage** — where artifacts live (local filesystem or S3-compatible).
 - **Metadata store** — where per-repo/branch refs (the pointers into storage)
@@ -14,6 +13,27 @@ without touching the others:
 Storage and the metadata store hold all durable state; the build queue is just
 coordination. A worker is therefore stateless — that is what lets builds be
 farmed out to other machines.
+
+## How to configure them
+
+Each setting can come from an **environment variable** or from `config.toml`
+(`~/.config/ripclone/config.toml`). Precedence is **env var > `config.toml` >
+built-in default**, so an env var always wins. The sections below list the env
+vars; the same values live under `[storage]`, `[metadata]`, and `[queue]` in the
+file.
+
+Set the file values with the CLI (writes the global `config.toml`, `0600`):
+
+```bash
+ripclone backend queue    --backend postgres --url postgres://user:pass@host:5432/ripclone
+ripclone backend metadata --backend postgres --url postgres://user:pass@host:5432/ripclone
+ripclone backend storage  --backend s3 --bucket my-bucket --endpoint https://s3.example.com
+ripclone backend show     # effective values; flags which env var overrides each
+```
+
+Credentials are **never** read from `config.toml`: S3 keys come from
+`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`, and `libsql` DB tokens may be set
+in-file for now (`[queue].token` / `[metadata].token`) or via env.
 
 ## Storage
 
