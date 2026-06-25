@@ -3,8 +3,8 @@
 //! atomic conditional claim). For multi-machine use the remote `libsql` backend.
 
 use super::sql::{
-    CREATE_ACTIVE_KEY_INDEX_SQL, CREATE_HISTORY_INDEX_SQL, CREATE_STATUS_INDEX_SQL,
-    CREATE_TABLE_SQL, QueueDb,
+    ADD_CREDENTIAL_COLUMN_SQL, CREATE_ACTIVE_KEY_INDEX_SQL, CREATE_HISTORY_INDEX_SQL,
+    CREATE_STATUS_INDEX_SQL, CREATE_TABLE_SQL, QueueDb,
 };
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -44,6 +44,11 @@ impl QueueDb for SqliteDb {
             .execute(&self.pool)
             .await
             .context("create jobs table")?;
+        // Migrate a legacy table to add the credential column (best-effort: errors
+        // "duplicate column" on a fresh table, which is fine).
+        let _ = sqlx::raw_sql(ADD_CREDENTIAL_COLUMN_SQL)
+            .execute(&self.pool)
+            .await;
         sqlx::raw_sql(CREATE_STATUS_INDEX_SQL)
             .execute(&self.pool)
             .await
@@ -77,16 +82,18 @@ impl QueueDb for SqliteDb {
         provider: &str,
         path: &str,
         branch: &str,
+        credential: Option<&str>,
         created_at: i64,
     ) -> Result<i64> {
         let res = sqlx::query(
-            "INSERT INTO jobs (key, provider, path, branch, status, created_at)
-             VALUES (?, ?, ?, ?, 'queued', ?)",
+            "INSERT INTO jobs (key, provider, path, branch, status, credential, created_at)
+             VALUES (?, ?, ?, ?, 'queued', ?, ?)",
         )
         .bind(key)
         .bind(provider)
         .bind(path)
         .bind(branch)
+        .bind(credential)
         .bind(created_at)
         .execute(&self.pool)
         .await
@@ -129,14 +136,22 @@ impl QueueDb for SqliteDb {
         Ok(res.rows_affected() == 1)
     }
 
-    async fn job_fields(&self, id: i64) -> Result<Option<(String, String, String)>> {
-        let row = sqlx::query("SELECT provider, path, branch FROM jobs WHERE id = ?")
+    async fn job_fields(
+        &self,
+        id: i64,
+    ) -> Result<Option<(String, String, String, Option<String>)>> {
+        let row = sqlx::query("SELECT provider, path, branch, credential FROM jobs WHERE id = ?")
             .bind(id)
             .fetch_optional(&self.pool)
             .await
             .context("fetch job fields")?;
         match row {
-            Some(row) => Ok(Some((row.try_get(0)?, row.try_get(1)?, row.try_get(2)?))),
+            Some(row) => Ok(Some((
+                row.try_get(0)?,
+                row.try_get(1)?,
+                row.try_get(2)?,
+                row.try_get(3)?,
+            ))),
             None => Ok(None),
         }
     }
@@ -148,9 +163,13 @@ impl QueueDb for SqliteDb {
         finished_at: i64,
         error: Option<&str>,
     ) -> Result<()> {
-        sqlx::query("UPDATE jobs SET status = ?, finished_at = ?, error = ? WHERE id = ?")
-            .bind(status)
-            .bind(finished_at)
+        // Clear the per-job credential on finish so a short-lived upstream token
+        // isn't retained in the (kept-forever) done-job history.
+        sqlx::query(
+            "UPDATE jobs SET status = ?, finished_at = ?, error = ?, credential = NULL WHERE id = ?",
+        )
+        .bind(status)
+        .bind(finished_at)
             .bind(error)
             .bind(id)
             .execute(&self.pool)

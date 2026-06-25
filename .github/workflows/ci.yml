@@ -81,6 +81,39 @@ jobs:
       - name: End-to-end (local origin, real binaries)
         run: bash scripts/ci.sh e2e
 
+  # Queue + metadata adapters against REAL network databases — Postgres + MySQL
+  # (throwaway docker containers brought up by scripts/test-queue-sql.sh) and
+  # libsql (a local `sqld`). The default `test` job only compile-checks these
+  # engines; this job exercises their dialect-specific SQL. Gated on the same
+  # rust-changes filter as docker so docs-only PRs skip it.
+  databases:
+    needs: changes
+    if: ${{ needs.changes.outputs.docker == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache-workspaces: rust
+      - name: Install build deps
+        run: bash scripts/install-build-deps.sh
+      # Put the `sqld` binary on PATH so the libsql e2e runs (it auto-skips
+      # without it). Best-effort: if the image layout changes, libsql is skipped
+      # but the Postgres + MySQL legs still run.
+      - name: Install sqld (libsql server)
+        continue-on-error: true
+        run: |
+          set -x
+          docker create --name sqld-bin ghcr.io/tursodatabase/libsql-server:latest
+          docker cp sqld-bin:/bin/sqld ./sqld \
+            || docker cp sqld-bin:/usr/local/bin/sqld ./sqld
+          docker rm sqld-bin
+          sudo install -m 0755 ./sqld /usr/local/bin/sqld
+          rm -f ./sqld
+          sqld --version
+      - name: Postgres + MySQL + libsql (queue + metadata) on real servers
+        run: bash scripts/ci.sh databases
+
   # Validate the images assemble and the binaries run. The real Dockerfiles use
   # buildkit cargo cache mounts that persist on the Fly/Depot deploy builder but
   # NOT on GitHub-hosted runners, so building them here would recompile ~400

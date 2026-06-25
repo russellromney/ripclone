@@ -45,9 +45,7 @@ pub(crate) fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
-/// A job claimed by a worker. Tokens are never stored, so the worker supplies
-/// its own (from `RIPCLONE_GITHUB_TOKEN` / its credential broker) when turning
-/// this into a [`BuildJob`].
+/// A job claimed by a worker.
 #[derive(Debug, Clone)]
 pub struct ClaimedJob {
     pub id: i64,
@@ -57,6 +55,13 @@ pub struct ClaimedJob {
     /// Opaque repo path (`owner/repo` for GitHub).
     pub path: String,
     pub branch: String,
+    /// Per-job upstream credential the enqueuer passed (the cloud's per-request
+    /// `X-Upstream-Token`), so a cross-process worker can read a private repo it
+    /// has no standing credential for. `None` falls back to the worker's broker.
+    /// SECURITY: stored only base64-obfuscated in the queue DB — treat that DB as
+    /// sensitive and access-controlled. (Tokens are short-lived; encryption-at-
+    /// rest with a worker-shared key is a noted follow-up.)
+    pub credential: Option<secrecy::SecretString>,
 }
 
 impl ClaimedJob {
@@ -67,6 +72,23 @@ impl ClaimedJob {
             path: self.path.clone(),
         }
     }
+}
+
+/// Base64-encode a per-job credential for storage (obfuscation, not encryption —
+/// see [`ClaimedJob::credential`]).
+pub(crate) fn encode_credential(cred: Option<&secrecy::SecretString>) -> Option<String> {
+    use base64::Engine;
+    use secrecy::ExposeSecret;
+    cred.map(|c| base64::engine::general_purpose::STANDARD.encode(c.expose_secret()))
+}
+
+/// Decode a stored credential back into a secret. A malformed value decodes to
+/// `None` (the worker then falls back to its broker) rather than erroring.
+pub(crate) fn decode_credential(enc: Option<String>) -> Option<secrecy::SecretString> {
+    use base64::Engine;
+    enc.and_then(|e| base64::engine::general_purpose::STANDARD.decode(e).ok())
+        .and_then(|b| String::from_utf8(b).ok())
+        .map(|s| secrecy::SecretString::new(s.into()))
 }
 
 /// Per-engine adapter. Each method runs one or two statements on a fresh
@@ -89,6 +111,7 @@ pub trait QueueDb: Send + Sync {
         provider: &str,
         path: &str,
         branch: &str,
+        credential: Option<&str>,
         created_at: i64,
     ) -> Result<i64>;
 
@@ -102,8 +125,10 @@ pub trait QueueDb: Send + Sync {
     /// won the row.
     async fn try_claim(&self, id: i64, worker_id: &str, now: i64) -> Result<bool>;
 
-    /// `(provider, path, branch)` for a job id.
-    async fn job_fields(&self, id: i64) -> Result<Option<(String, String, String)>>;
+    /// `(provider, path, branch, credential)` for a job id. `credential` is the
+    /// stored base64 blob (or `None`).
+    async fn job_fields(&self, id: i64)
+    -> Result<Option<(String, String, String, Option<String>)>>;
 
     /// Mark a job finished: `status` is `done` or `failed`, with optional error.
     async fn finish(
@@ -176,7 +201,8 @@ impl SqlJobQueue {
                 return Ok(None);
             };
             if self.db.try_claim(id, worker_id, now_secs()).await? {
-                let Some((provider, path, branch)) = self.db.job_fields(id).await? else {
+                let Some((provider, path, branch, credential)) = self.db.job_fields(id).await?
+                else {
                     continue;
                 };
                 return Ok(Some(ClaimedJob {
@@ -184,6 +210,7 @@ impl SqlJobQueue {
                     provider,
                     path,
                     branch,
+                    credential: decode_credential(credential),
                 }));
             }
             // Lost the race for this row. Back off briefly before retrying so N
@@ -218,6 +245,7 @@ impl JobQueue for SqlJobQueue {
                 job_id: Some(id),
             });
         }
+        let credential = encode_credential(job.credential.as_ref());
         match self
             .db
             .insert_job(
@@ -225,6 +253,7 @@ impl JobQueue for SqlJobQueue {
                 job.repo_id.provider.as_str(),
                 &job.repo_id.path,
                 &job.branch,
+                credential.as_deref(),
                 now_secs(),
             )
             .await
@@ -284,7 +313,8 @@ pub(crate) const CREATE_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS jobs (
     created_at INTEGER NOT NULL,
     claimed_at INTEGER,
     finished_at INTEGER,
-    error TEXT
+    error TEXT,
+    credential TEXT
 )";
 
 pub(crate) const CREATE_STATUS_INDEX_SQL: &str =
@@ -298,6 +328,13 @@ pub(crate) const CREATE_ACTIVE_KEY_INDEX_SQL: &str =
 /// Index for the build/version history queries over retained `done` jobs
 /// ("what was synced for this repo over time").
 pub(crate) const CREATE_HISTORY_INDEX_SQL: &str = "CREATE INDEX IF NOT EXISTS idx_jobs_provider_path_finished ON jobs(provider, path, finished_at)";
+
+/// Migration for a `jobs` table created before the `credential` column existed.
+/// `CREATE TABLE IF NOT EXISTS` is a no-op on an existing table, so it never adds
+/// the column — run this ALTER best-effort (it errors "duplicate column" on a
+/// fresh table, which is ignored). SQLite/libsql have no `ADD COLUMN IF NOT
+/// EXISTS`, hence best-effort; Postgres uses its own `IF NOT EXISTS` form.
+pub(crate) const ADD_CREDENTIAL_COLUMN_SQL: &str = "ALTER TABLE jobs ADD COLUMN credential TEXT";
 
 #[cfg(test)]
 mod tests {
@@ -370,6 +407,81 @@ mod tests {
                 "{engine}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn per_job_credential_round_trips_through_the_queue() {
+        use secrecy::ExposeSecret;
+        for (engine, q, _dir) in queues().await {
+            let mut j = job("o", "r", "main");
+            j.credential = Some(secrecy::SecretString::new(
+                "ghs_secret123".to_string().into(),
+            ));
+            q.enqueue(j).await.unwrap();
+            let claimed = q.claim("w1").await.unwrap().unwrap();
+            let cred = claimed.credential.expect("credential persisted");
+            assert_eq!(cred.expose_secret(), "ghs_secret123", "{engine}");
+        }
+    }
+
+    #[tokio::test]
+    async fn absent_credential_stays_none() {
+        for (engine, q, _dir) in queues().await {
+            q.enqueue(job("o", "r", "main")).await.unwrap();
+            let claimed = q.claim("w1").await.unwrap().unwrap();
+            assert!(claimed.credential.is_none(), "{engine}");
+        }
+    }
+
+    #[tokio::test]
+    async fn finish_clears_the_stored_credential() {
+        // A short-lived upstream token must not linger in the kept-forever
+        // done-job history. (Adapter-level: SqliteDb directly.)
+        let dir = tempfile::tempdir().unwrap();
+        let db = SqliteDb::connect(&dir.path().join("q.db").to_string_lossy())
+            .await
+            .unwrap();
+        db.init().await.unwrap();
+        let id = db
+            .insert_job("k", "github", "o/r", "main", Some("dG9rZW4="), 1)
+            .await
+            .unwrap();
+        let (_, _, _, before) = db.job_fields(id).await.unwrap().unwrap();
+        assert_eq!(before.as_deref(), Some("dG9rZW4="));
+        db.finish(id, "done", 2, None).await.unwrap();
+        let (_, _, _, after) = db.job_fields(id).await.unwrap().unwrap();
+        assert!(after.is_none(), "credential must be cleared on finish");
+    }
+
+    #[tokio::test]
+    async fn init_migrates_a_legacy_jobs_table_and_is_idempotent() {
+        use sqlx::sqlite::SqlitePoolOptions;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q.db");
+        // A pre-credential `jobs` table, created by hand (no credential column).
+        let url = format!("sqlite://{}?mode=rwc", path.display());
+        let pool = SqlitePoolOptions::new().connect(&url).await.unwrap();
+        sqlx::raw_sql(
+            "CREATE TABLE jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT NOT NULL, \
+             provider TEXT NOT NULL, path TEXT NOT NULL, branch TEXT NOT NULL, \
+             status TEXT NOT NULL, worker_id TEXT, created_at INTEGER NOT NULL, \
+             claimed_at INTEGER, finished_at INTEGER, error TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        let db = SqliteDb::connect(&path.to_string_lossy()).await.unwrap();
+        db.init().await.unwrap(); // adds the credential column to the legacy table
+        db.init().await.unwrap(); // idempotent: best-effort ALTER ignores duplicate
+        // Inserting a credential now works because the column exists.
+        let id = db
+            .insert_job("k", "github", "o/r", "main", Some("Y3JlZA=="), 1)
+            .await
+            .unwrap();
+        let (_, _, _, cred) = db.job_fields(id).await.unwrap().unwrap();
+        assert_eq!(cred.as_deref(), Some("Y3JlZA=="));
     }
 
     #[tokio::test]
@@ -570,6 +682,23 @@ mod tests {
     /// Full queue lifecycle on a fresh queue: enqueue, coalesce, distinct key,
     /// claim ordering, ack done/failed, drain, and a fresh job after completion.
     async fn exercise_core(q: &SqlJobQueue) {
+        // Per-job credential: round-trips through this engine's INSERT + SELECT
+        // decode, and the ack runs the finish UPDATE that clears it (the cleared
+        // *value* is asserted on sqlite in finish_clears_the_stored_credential).
+        {
+            use secrecy::ExposeSecret;
+            let mut j = job("o", "r", "cred");
+            j.credential = Some(secrecy::SecretString::new("dG9rZW4=".to_string().into()));
+            q.enqueue(j).await.unwrap();
+            let c = q.claim("wc").await.unwrap().unwrap();
+            assert_eq!(
+                c.credential.as_ref().map(|s| s.expose_secret().to_string()),
+                Some("dG9rZW4=".to_string()),
+                "credential round-trips through the queue DB"
+            );
+            q.ack(c.id, Ok(())).await.unwrap();
+        }
+
         let enq = q.enqueue(job("o", "r", "main")).await.unwrap();
         assert_eq!(enq.outcome, EnqueueOutcome::Enqueued);
         let id = enq.job_id.unwrap();

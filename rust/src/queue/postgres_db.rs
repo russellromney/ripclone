@@ -49,12 +49,18 @@ impl QueueDb for PostgresDb {
                 created_at BIGINT NOT NULL,
                 claimed_at BIGINT,
                 finished_at BIGINT,
-                error TEXT
+                error TEXT,
+                credential TEXT
             )",
         )
         .execute(&self.pool)
         .await
         .context("create jobs table")?;
+        // Migrate a legacy table (created before the credential column).
+        sqlx::raw_sql("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS credential TEXT")
+            .execute(&self.pool)
+            .await
+            .context("add credential column")?;
         sqlx::raw_sql(
             "CREATE INDEX IF NOT EXISTS idx_jobs_status_created ON jobs(status, created_at)",
         )
@@ -97,16 +103,18 @@ impl QueueDb for PostgresDb {
         provider: &str,
         path: &str,
         branch: &str,
+        credential: Option<&str>,
         created_at: i64,
     ) -> Result<i64> {
         sqlx::query_scalar(
-            "INSERT INTO jobs (key, provider, path, branch, status, created_at)
-             VALUES ($1, $2, $3, $4, 'queued', $5) RETURNING id",
+            "INSERT INTO jobs (key, provider, path, branch, status, credential, created_at)
+             VALUES ($1, $2, $3, $4, 'queued', $5, $6) RETURNING id",
         )
         .bind(key)
         .bind(provider)
         .bind(path)
         .bind(branch)
+        .bind(credential)
         .bind(created_at)
         .fetch_one(&self.pool)
         .await
@@ -148,14 +156,22 @@ impl QueueDb for PostgresDb {
         Ok(res.rows_affected() == 1)
     }
 
-    async fn job_fields(&self, id: i64) -> Result<Option<(String, String, String)>> {
-        let row = sqlx::query("SELECT provider, path, branch FROM jobs WHERE id = $1")
+    async fn job_fields(
+        &self,
+        id: i64,
+    ) -> Result<Option<(String, String, String, Option<String>)>> {
+        let row = sqlx::query("SELECT provider, path, branch, credential FROM jobs WHERE id = $1")
             .bind(id)
             .fetch_optional(&self.pool)
             .await
             .context("fetch job fields")?;
         match row {
-            Some(row) => Ok(Some((row.try_get(0)?, row.try_get(1)?, row.try_get(2)?))),
+            Some(row) => Ok(Some((
+                row.try_get(0)?,
+                row.try_get(1)?,
+                row.try_get(2)?,
+                row.try_get(3)?,
+            ))),
             None => Ok(None),
         }
     }
@@ -167,11 +183,14 @@ impl QueueDb for PostgresDb {
         finished_at: i64,
         error: Option<&str>,
     ) -> Result<()> {
-        sqlx::query("UPDATE jobs SET status = $1, finished_at = $2, error = $3 WHERE id = $4")
-            .bind(status)
-            .bind(finished_at)
-            .bind(error)
-            .bind(id)
+        // Clear the per-job credential on finish (not retained in done-job history).
+        sqlx::query(
+            "UPDATE jobs SET status = $1, finished_at = $2, error = $3, credential = NULL WHERE id = $4",
+        )
+        .bind(status)
+        .bind(finished_at)
+        .bind(error)
+        .bind(id)
             .execute(&self.pool)
             .await
             .context("finish job")?;

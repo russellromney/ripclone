@@ -4,8 +4,8 @@
 //! it doesn't bundle SQLite's C core and collide with sqlx.)
 
 use super::sql::{
-    CREATE_ACTIVE_KEY_INDEX_SQL, CREATE_HISTORY_INDEX_SQL, CREATE_STATUS_INDEX_SQL,
-    CREATE_TABLE_SQL, QueueDb,
+    ADD_CREDENTIAL_COLUMN_SQL, CREATE_ACTIVE_KEY_INDEX_SQL, CREATE_HISTORY_INDEX_SQL,
+    CREATE_STATUS_INDEX_SQL, CREATE_TABLE_SQL, QueueDb,
 };
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -43,6 +43,9 @@ impl QueueDb for LibsqlDb {
         conn.execute(CREATE_TABLE_SQL, ())
             .await
             .context("create jobs table")?;
+        // Migrate a legacy table to add the credential column (best-effort: errors
+        // "duplicate column" on a fresh table, which is fine).
+        let _ = conn.execute(ADD_CREDENTIAL_COLUMN_SQL, ()).await;
         conn.execute(CREATE_STATUS_INDEX_SQL, ())
             .await
             .context("create status index")?;
@@ -78,13 +81,18 @@ impl QueueDb for LibsqlDb {
         provider: &str,
         path: &str,
         branch: &str,
+        credential: Option<&str>,
         created_at: i64,
     ) -> Result<i64> {
         let conn = self.conn().await?;
+        let cred_val = match credential {
+            Some(s) => libsql::Value::Text(s.to_string()),
+            None => libsql::Value::Null,
+        };
         conn.execute(
-            "INSERT INTO jobs (key, provider, path, branch, status, created_at)
-             VALUES (?, ?, ?, ?, 'queued', ?)",
-            libsql::params![key, provider, path, branch, created_at],
+            "INSERT INTO jobs (key, provider, path, branch, status, credential, created_at)
+             VALUES (?, ?, ?, ?, 'queued', ?, ?)",
+            libsql::params![key, provider, path, branch, cred_val, created_at],
         )
         .await
         .context("insert job")?;
@@ -131,10 +139,16 @@ impl QueueDb for LibsqlDb {
         Ok(n == 1)
     }
 
-    async fn job_fields(&self, id: i64) -> Result<Option<(String, String, String)>> {
+    async fn job_fields(
+        &self,
+        id: i64,
+    ) -> Result<Option<(String, String, String, Option<String>)>> {
         let conn = self.conn().await?;
         let mut rows = conn
-            .query("SELECT provider, path, branch FROM jobs WHERE id = ?", [id])
+            .query(
+                "SELECT provider, path, branch, credential FROM jobs WHERE id = ?",
+                [id],
+            )
             .await
             .context("fetch job fields")?;
         match rows.next().await? {
@@ -142,6 +156,7 @@ impl QueueDb for LibsqlDb {
                 row.get::<String>(0)?,
                 row.get::<String>(1)?,
                 row.get::<String>(2)?,
+                row.get::<Option<String>>(3)?,
             ))),
             None => Ok(None),
         }
@@ -155,8 +170,9 @@ impl QueueDb for LibsqlDb {
         error: Option<&str>,
     ) -> Result<()> {
         let conn = self.conn().await?;
+        // Clear the per-job credential on finish (not retained in done-job history).
         conn.execute(
-            "UPDATE jobs SET status = ?, finished_at = ?, error = ? WHERE id = ?",
+            "UPDATE jobs SET status = ?, finished_at = ?, error = ?, credential = NULL WHERE id = ?",
             libsql::params![status, finished_at, error, id],
         )
         .await

@@ -2060,16 +2060,9 @@ async fn sync_repo_inner(
                 )
                     .into_response();
             }
-            // Per-request upstream tokens are never sent to the worker (not
-            // persisted); warn if one was supplied so a private-repo sync that
-            // needs it isn't silently mis-built.
-            if request_token.is_some() {
-                warn!(
-                    "per-request upstream token is ignored by the cross-process queue for {}; \
-                     the ripclone-worker must supply its own credentials",
-                    repo_id.storage_key()
-                );
-            }
+            // The per-request upstream credential rides with the job: the queue
+            // persists it (base64) and the worker uses it for the mirror fetch,
+            // so a private repo the worker has no standing token for still builds.
             let job = BuildJob {
                 repo_id: repo_id.clone(),
                 branch: branch.clone(),
