@@ -46,14 +46,14 @@ flate2 = "1"
 futures = "0.3"
 hex = "0.4"
 libc = "0.2.186"
-prost = "0.13"
+prost = "0.14"
 rayon = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "blocking", "rustls-tls"] }
 s3 = { version = "0.1.36", default-features = false, features = ["async", "rustls", "multipart"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha1 = "0.10"
-sha2 = "0.10"
+sha1 = "0.11"
+sha2 = "0.11"
 fastcdc = "4"
 tar = "0.4"
 tempfile = "3"
@@ -83,9 +83,9 @@ tower = { version = "0.5", features = ["util"] }
 tempfile = "3"
 hex = "0.4"
 tokio = { version = "1", features = ["full"] }
-sha2 = "0.10"
+sha2 = "0.11"
 serde_json = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 [build-dependencies]
-prost-build = "0.13"
+prost-build = "0.14"
