@@ -2556,6 +2556,22 @@ fn archive_chunk_refs(
         .collect()
 }
 
+/// Concurrency for artifact uploads. Defaults to 2x CPU cores — connection
+/// reuse makes high concurrency cheap, so scale it to the machine — overridable
+/// with `RIPCLONE_UPLOAD_CONCURRENCY`.
+fn upload_concurrency() -> usize {
+    std::env::var("RIPCLONE_UPLOAD_CONCURRENCY")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get() * 2)
+                .unwrap_or(8)
+        })
+        .max(1)
+}
+
 /// Upload `hashes` from CAS to storage with bounded concurrency.
 async fn upload_artifacts(
     cas: &Cas,
@@ -2567,16 +2583,19 @@ async fn upload_artifacts(
         let cas = cas.clone();
         let storage = storage.clone();
         async move {
-            tokio::task::spawn_blocking(move || {
-                let data = cas
-                    .get(&hash)
-                    .with_context(|| format!("read artifact {} for upload", hash))?;
-                storage
-                    .put(&hash, &data)
-                    .with_context(|| format!("upload artifact {}", hash))
-            })
-            .await
-            .context("upload task")?
+            // Read the chunk off the async worker (blocking disk I/O), then
+            // upload via the async path so the PUT runs on this runtime with the
+            // pooled client — connections stay warm across chunks instead of
+            // re-handshaking per upload.
+            let read_hash = hash.clone();
+            let data = tokio::task::spawn_blocking(move || cas.get(&read_hash))
+                .await
+                .context("read task")?
+                .with_context(|| format!("read artifact {} for upload", hash))?;
+            storage
+                .put_async(&hash, &data)
+                .await
+                .with_context(|| format!("upload artifact {}", hash))
         }
     }))
     .buffer_unordered(conc.max(1))
@@ -3191,25 +3210,20 @@ async fn do_sync(
         .map(|h| h.to_string())
         .collect();
     let upload_count = upload_hashes.len();
-    let upload_conc: usize = std::env::var("RIPCLONE_UPLOAD_CONCURRENCY")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(16)
-        .max(1);
+    let upload_conc = upload_concurrency();
     futures::stream::iter(upload_hashes.into_iter().map(|hash| {
         let cas = cas.clone();
         let storage = storage.clone();
         async move {
-            tokio::task::spawn_blocking(move || {
-                let data = cas
-                    .get(&hash)
-                    .with_context(|| format!("read artifact {} from CAS for upload", hash))?;
-                storage
-                    .put(&hash, &data)
-                    .with_context(|| format!("upload artifact {} to storage", hash))
-            })
-            .await
-            .context("upload task")?
+            let read_hash = hash.clone();
+            let data = tokio::task::spawn_blocking(move || cas.get(&read_hash))
+                .await
+                .context("read task")?
+                .with_context(|| format!("read artifact {} from CAS for upload", hash))?;
+            storage
+                .put_async(&hash, &data)
+                .await
+                .with_context(|| format!("upload artifact {} to storage", hash))
         }
     }))
     .buffer_unordered(upload_conc)
@@ -3331,7 +3345,7 @@ async fn build_and_publish_two_phase(
     t_total: Instant,
 ) -> Result<RefInfo> {
     let history_target = env_bytes("RIPCLONE_HISTORY_PACK_BYTES", 512 * 1024 * 1024);
-    let upload_conc = env_bytes("RIPCLONE_UPLOAD_CONCURRENCY", 16) as usize;
+    let upload_conc = upload_concurrency();
 
     // Load the previous synced ref once: used both for the files-table by-diff
     // below and for Option-A full-clonepack carry later in this phase.
