@@ -9,7 +9,7 @@ use ripclone::client::Client;
 use ripclone::server::run_server;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
 use std::sync::Once;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -694,4 +694,34 @@ pub async fn sync_and_clone(
         .await
         .expect("install");
     (out, target)
+}
+
+// ---- standalone worker process -------------------------------------------
+
+/// A spawned `ripclone-worker` binary, killed when dropped.
+pub struct WorkerProc(Child);
+
+impl Drop for WorkerProc {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Spawn the real `ripclone-worker` binary sharing `cas_dir` + `repo_root` with
+/// the in-process server. It inherits the test process env (RIPCLONE_QUEUE,
+/// RIPCLONE_QUEUE_DB_URL, RIPCLONE_ORIGIN_BASE, RIPCLONE_TOKEN, …).
+pub fn spawn_worker(cas_dir: &Path, repo_root: &Path) -> WorkerProc {
+    let child = Command::new(env!("CARGO_BIN_EXE_ripclone-worker"))
+        .arg("--cas-dir")
+        .arg(cas_dir)
+        .arg("--repo-root")
+        .arg(repo_root)
+        .arg("--idle-poll-ms")
+        .arg("100")
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn ripclone-worker binary");
+    WorkerProc(child)
 }

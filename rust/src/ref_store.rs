@@ -54,6 +54,13 @@ pub trait RefStore: Send + Sync {
     /// List all branches that have a stored `RefInfo` for this repo.
     async fn list_branches(&self, repo_id: &RepoId) -> Result<Vec<String>>;
 
+    /// Drop any cached entry for this branch so the next load reads through to
+    /// the backing store. Needed after a build completes in *another* process
+    /// (the SQL queue / standalone worker path): this process's cache would
+    /// otherwise keep serving a stale ref until its TTL expires. The default is
+    /// a no-op for stores that don't cache.
+    async fn invalidate(&self, _repo_id: &RepoId, _branch: &str) {}
+
     /// Cheap readiness probe used by `/readyz`. Should confirm the store is
     /// reachable without listing everything. Default assumes healthy; any new
     /// durable/remote backend MUST override this so readiness doesn't silently
@@ -504,6 +511,12 @@ impl<T: RefStore> RefStore for CachingRefStore<T> {
 
     async fn list_branches(&self, repo_id: &RepoId) -> Result<Vec<String>> {
         self.inner.list_branches(repo_id).await
+    }
+
+    async fn invalidate(&self, repo_id: &RepoId, branch: &str) {
+        let mut cache = self.cache.write().await;
+        cache.remove(&Self::cache_key(repo_id, branch));
+        self.inner.invalidate(repo_id, branch).await;
     }
 
     async fn health(&self) -> Result<()> {
