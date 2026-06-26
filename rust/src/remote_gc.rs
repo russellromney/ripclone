@@ -137,7 +137,7 @@ impl RemoteGc {
             return Ok(GcReport::default());
         }
 
-        let reachable = self.collect_reachable_hashes().await?;
+        let reachable = self.collect_reachable_hashes(false).await?;
         let storage = self.storage.clone();
         let entries = tokio::task::spawn_blocking(move || storage.list_hashes())
             .await
@@ -164,6 +164,31 @@ impl RemoteGc {
                 continue;
             }
             to_delete.push(entry);
+        }
+
+        // Reference-time double-check (S1). The grace cutoff above is anchored on
+        // each object's *mtime* — when it was last written — not when it was last
+        // *referenced*. A sync that re-references an already-stored object without
+        // re-uploading it (a reused pack/chunk) leaves that object's mtime old, so
+        // it looks unreachable-and-aged-out here even though a concurrent sync just
+        // started pointing at it. The reachable snapshot above was taken before we
+        // listed every object and walked every manifest — a long window. Re-collect
+        // the reachable set now (reading *through* the ref cache so a just-saved ref
+        // is seen) and drop any candidate that became reachable during the pass, so
+        // GC never deletes an object a sync started referencing while we scanned.
+        // Freshly *written* objects remain protected by the mtime grace; this closes
+        // the reused-object gap, leaving only a sub-second recheck→delete window in
+        // place of the whole-pass window.
+        if !to_delete.is_empty() {
+            let reachable_now = self.collect_reachable_hashes(true).await?;
+            let before = to_delete.len();
+            to_delete.retain(|entry| !reachable_now.contains(&entry.hash));
+            let rescued = before - to_delete.len();
+            if rescued > 0 {
+                info!(
+                    "remote GC: {rescued} candidate(s) became reachable during the pass; keeping them"
+                );
+            }
         }
 
         if to_delete.is_empty() {
@@ -211,7 +236,13 @@ impl RemoteGc {
     }
 
     /// Walk every live ref and collect the set of hashes that must be kept.
-    async fn collect_reachable_hashes(&self) -> Result<HashSet<String>> {
+    ///
+    /// When `fresh` is true, each branch's cache entry is invalidated before it
+    /// is loaded so the read goes through to the durable store — used for the
+    /// pre-delete recheck, where a stale cached ref could let GC delete an object
+    /// a concurrent sync just started referencing (S1). It is a no-op for
+    /// non-caching ref stores.
+    async fn collect_reachable_hashes(&self, fresh: bool) -> Result<HashSet<String>> {
         let mut reachable: HashSet<String> = HashSet::new();
         let repos = self.ref_store.list().await.context("list repos for GC")?;
         for repo_id in repos {
@@ -222,6 +253,9 @@ impl RemoteGc {
                 .await
                 .with_context(|| format!("list branches for {key}"))?;
             for branch in branches {
+                if fresh {
+                    self.ref_store.invalidate(&repo_id, &branch).await;
+                }
                 let Some(info) = self
                     .ref_store
                     .load_branch(&repo_id, &branch)
@@ -389,7 +423,7 @@ mod tests {
     use crate::cas::Cas;
     use crate::clonepack::hash_from_hex;
     use crate::provider::RepoId;
-    use crate::ref_store::FileRefStore;
+    use crate::ref_store::{CachingRefStore, FileRefStore};
     use crate::storage::{HashEntry, StorageBackend, local};
     use std::time::Duration;
 
@@ -544,6 +578,74 @@ mod tests {
         assert!(cas.path(&info.clonepack_manifest).exists());
         assert!(cas.path(&info.metadata_chunk).exists());
         assert!(cas.path(&info.archive_chunks[0]).exists());
+    }
+
+    /// S1: a sync that re-references an already-stored (reused, aged) object
+    /// during a GC pass must not lose it. The object's mtime is old (it was not
+    /// re-uploaded), so the mtime-grace doesn't protect it; the pre-delete
+    /// reference-time recheck must. We reproduce the "ref changed mid-pass"
+    /// window deterministically with a stale ref cache: GC's first reachable
+    /// scan sees the cached (pre-sync) ref where the object is unreachable, but
+    /// the recheck reads through to the fresh durable ref where it is reachable.
+    #[tokio::test]
+    async fn gc_keeps_object_a_concurrent_sync_re_references() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cas_root = tmp.path().join("cas");
+        let repo_root = tmp.path().join("repos");
+        std::fs::create_dir_all(&cas_root).unwrap();
+        std::fs::create_dir_all(&repo_root).unwrap();
+
+        let cas = Cas::new(&cas_root).unwrap();
+        let storage: StorageRef = Arc::new(TestRemoteStorage {
+            inner: local(&cas_root).unwrap(),
+        });
+
+        let repo = RepoId::github("o/r");
+
+        // The ref store GC uses, with the production read cache in front.
+        let cached_store: Arc<dyn RefStore> =
+            Arc::new(CachingRefStore::new(FileRefStore::new(&repo_root)));
+        // A second handle to the same durable files, used to land the
+        // "concurrent sync" out-of-band so the cache above goes stale.
+        let durable_store = FileRefStore::new(&repo_root);
+
+        // An aged, reused artifact: stored long ago, NOT referenced yet.
+        let reused = cas.put(b"reused-pack-bytes").unwrap();
+        let reused_path = cas.path(&reused);
+        let old = std::time::SystemTime::now() - Duration::from_secs(48 * 60 * 60);
+        filetime::set_file_mtime(&reused_path, filetime::FileTime::from_system_time(old)).unwrap();
+
+        // v1 of the ref does NOT reference the reused object. Save it through the
+        // cached store so GC's first scan will hit the cache and see v1.
+        let info_v1 = make_ref_info_with_manifest(&cas);
+        cached_store.save(&repo, &info_v1).await.unwrap();
+        // Warm the cache exactly as a prior load would.
+        let _ = cached_store.load(&repo).await.unwrap();
+
+        // The "concurrent sync" lands v2 — same commit, now referencing the
+        // reused object — directly on the durable files, leaving the cache stale.
+        let mut info_v2 = info_v1.clone();
+        info_v2.head_blobs_chunks = vec![reused.clone()];
+        durable_store.save(&repo, &info_v2).await.unwrap();
+
+        let gc = RemoteGc::new(
+            storage.clone(),
+            cached_store,
+            GcConfig {
+                grace_period: Duration::from_secs(60),
+                dry_run: false,
+            },
+        );
+        let report = gc.run().await.unwrap();
+
+        assert!(
+            reused_path.exists(),
+            "an object a concurrent sync re-referenced must survive GC"
+        );
+        assert_eq!(
+            report.objects_deleted, 0,
+            "the reused object was rescued by the reference-time recheck"
+        );
     }
 
     #[tokio::test]
