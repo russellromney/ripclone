@@ -15,7 +15,7 @@ COPY rust/Cargo.toml rust/Cargo.lock rust/build.rs ./
 COPY rust/proto ./proto
 RUN mkdir -p src/bin \
     && echo '' > src/lib.rs \
-    && for b in cli server ripclone-proxy git-remote-ripclone rcgit writer_bench; do \
+    && for b in cli server ripclone-proxy ripclone-worker git-remote-ripclone rcgit writer_bench; do \
          echo 'fn main() {}' > "src/bin/$b.rs"; \
        done \
     && cargo build --release \

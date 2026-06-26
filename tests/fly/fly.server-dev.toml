@@ -5,7 +5,7 @@ primary_region = 'iad'
   # Paths are relative to the repo root: deploy with
   # `fly deploy --config tests/fly/fly.server-dev.toml` run from the repo root
   # (build context = root, so the Dockerfile can COPY rust/ and scripts/).
-  dockerfile = 'tests/fly/Dockerfile'
+  dockerfile = 'Dockerfile'
 
 [http_service]
   internal_port = 8000
