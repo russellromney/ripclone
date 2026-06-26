@@ -549,7 +549,13 @@ impl<T: RefStore> RefStore for CachingRefStore<T> {
         let key = Self::cache_key(repo_id, branch);
         let mut cache = self.cache.write().await;
         self.inner.save_branch(repo_id, branch, info).await?;
-        cache.insert(key, (Instant::now(), info.clone()));
+        // M5: the inner store may *skip* this write (the ordering policy keeps a
+        // newer ref). Caching `info` here would then poison the cache with the
+        // older ref even though the durable store correctly kept the newer one —
+        // undermining "newer never loses" at the cache layer for the TTL window.
+        // Invalidate instead, so the next load reads the authoritative value
+        // through to the durable store and re-populates.
+        cache.remove(&key);
         Ok(())
     }
 
@@ -682,6 +688,34 @@ mod tests {
 
         let loaded = store.load(&repo_id).await.unwrap().unwrap();
         assert_eq!(loaded.commit, "cached");
+    }
+
+    /// M5: after an older write loses at the durable layer, the cache must not
+    /// keep serving it. The next read must return the newer ref.
+    #[tokio::test]
+    async fn caching_ref_store_does_not_serve_stale_after_losing_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = CachingRefStore {
+            inner: FileRefStore::new(tmp.path()),
+            ttl: Duration::from_secs(60),
+            cache: RwLock::new(HashMap::new()),
+        };
+        let repo_id = RepoId::github("o/r");
+
+        let mut newer = dummy_ref_info("c2");
+        newer.synced_at = Some(2);
+        let mut older = dummy_ref_info("c1");
+        older.synced_at = Some(1);
+
+        store.save_branch(&repo_id, "main", &newer).await.unwrap();
+        // The durable store keeps the newer ref and skips this older one.
+        store.save_branch(&repo_id, "main", &older).await.unwrap();
+
+        let loaded = store.load_branch(&repo_id, "main").await.unwrap().unwrap();
+        assert_eq!(
+            loaded.commit, "c2",
+            "cache must not serve the older ref that lost the durable write"
+        );
     }
 
     #[tokio::test]
