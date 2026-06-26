@@ -578,6 +578,18 @@ impl S3Storage {
         }
     }
 
+    /// Delete an arbitrary object by key. Deleting a missing key is not an
+    /// error (S3 delete is idempotent), so this is safe to call blindly.
+    pub async fn delete_object(&self, key: &str) -> Result<()> {
+        self.client
+            .objects()
+            .delete(&self.bucket, key)
+            .send()
+            .await
+            .with_context(|| format!("S3 delete_object {key}"))?;
+        Ok(())
+    }
+
     /// List object keys under a prefix.
     pub async fn list_objects(&self, prefix: &str) -> Result<Vec<String>> {
         let mut keys = Vec::new();

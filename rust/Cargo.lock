@@ -3622,6 +3622,7 @@ dependencies = [
  "gix",
  "gix-pack",
  "hex",
+ "hmac",
  "io-uring",
  "jsonwebtoken",
  "keyring",

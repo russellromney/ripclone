@@ -150,25 +150,48 @@ self-host is not a second-class citizen — it runs the identical warm-on-push p
 
 ## Implementation checklist
 
-- [ ] `webhook` module: `WebhookProvider` trait + `CanonicalEvent`.
-- [ ] GitHub adapter (HMAC-256; push / branch-delete / ping). GitLab + Gitea after.
-- [ ] `POST /webhooks/{provider}` in `server.rs` — raw-body handler, provider
-      lookup, verify, parse, dispatch.
-- [ ] Factor `enqueue_sync(state, repo, ref_, cred)` out of `sync_repo_inner`;
-      call it from both `/sync` and the webhook.
-- [ ] Config: per-provider webhook secret + static credential + optional allowlist.
-- [ ] Branch-delete cleanup path.
-- [ ] Tests: signature verify (valid / invalid / missing), parse per provider,
-      enqueue invoked on push, delete → cleanup, allowlist gating, no-secret ⇒ 503.
-- [ ] Docs: README mention; cross-link `GITHUB_INTEGRATION.md` and `BACKENDS.md`.
+Phase 1 (GitHub) is implemented:
 
-## Open questions
+- [x] `webhook` module: `WebhookProvider` trait + `CanonicalEvent`
+      (`rust/src/webhook/mod.rs`).
+- [x] GitHub adapter (HMAC-256; push / branch-delete / ping) in
+      `rust/src/webhook/github.rs`. GitLab + Gitea are follow-ups (same trait).
+- [x] `POST /webhooks/{provider}` in `server.rs` — raw-body handler, provider
+      lookup, verify, parse, dispatch. Registered under `rate_limited`, *not*
+      behind `auth_middleware` (the HMAC is the auth).
+- [x] Factored `enqueue_sync(state, repo, branch, rev, cred)` out of
+      `sync_repo_inner`; both `/sync` and the webhook call it.
+- [x] Config: per-provider webhook secret (`RIPCLONE_WEBHOOK_SECRET_<ID>`) +
+      `StaticBroker` credential for private clones + optional
+      `RIPCLONE_WEBHOOK_ALLOWLIST`.
+- [x] Branch-delete cleanup path (`RefStore::delete_branch`, file + S3 + caching
+      impls).
+- [x] Tests: signature verify (valid / invalid / missing), GitHub parse, enqueue
+      invoked on push, delete → cleanup, allowlist gating, no-secret ⇒ 503,
+      tracked/untracked non-default branch.
+- [x] Docs: README "Webhooks" section; cross-links below.
 
-- **Allowlist default:** allow-all (simplest, single-tenant trust) vs
-  deny-until-listed (safer)? Recommend allow-all with a loud startup log:
-  "warming all repos for provider X".
-- **Non-default-branch policy:** warm every pushed branch, or only refs that
-  already have a stored build? Recommend: always warm the default branch; warm
-  other branches only if already tracked.
-- **Multi-instance routing:** how `{provider}` in the path maps to a
-  `ProviderInstance` when several instances of the same type are configured.
+**Follow-ups:** GitLab (`X-Gitlab-Token`) and Gitea/Forgejo
+(`X-Gitea-Signature`) adapters — each is one `WebhookProvider` impl plus a match
+arm in `webhook::provider_for`. Repo-lifecycle events (visibility/rename/delete)
+and tag/release pre-warm (see [Events](#events--phase-1-vs-later)).
+
+## Open questions — resolved
+
+- **Allowlist default:** allow-all (single-tenant trust) with a loud startup log
+  warning that all pushed repos warm. Set `RIPCLONE_WEBHOOK_ALLOWLIST` to
+  restrict. **Done.**
+- **Non-default-branch policy:** always warm the default branch; warm other
+  branches only if a build for them already exists (`ref_store.load_branch`).
+  **Done.**
+- **Multi-instance routing:** `{provider}` in the path is the `ProviderInstance`
+  id (same lookup as `/v1/repos/{provider}/…`), and the secret is keyed per
+  instance id — so several instances of the same kind each get their own
+  endpoint + secret. **Done.**
+
+## See also
+
+- [`GITHUB_INTEGRATION.md`](GITHUB_INTEGRATION.md) — GitHub auth / token setup
+  the webhook reuses for private clones (`StaticBroker`).
+- [`BACKENDS.md`](BACKENDS.md) — the build queue + worker the receiver enqueues
+  onto.

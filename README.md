@@ -129,6 +129,25 @@ The `github` in the path is the provider instance (see [Providers](#providers)).
 
 ripclone validates the `RIPCLONE_TOKEN`, syncs the mirror, builds artifacts for the new `HEAD`, and returns the artifact hashes.
 
+## Webhooks (push → warm, no CI Action)
+
+Instead of the Action above, point a provider webhook straight at the server and pushes warm the cache automatically:
+
+```
+provider push ─▶ POST /webhooks/{provider} ─▶ verify (HMAC over raw body) ─▶ enqueue sync ─▶ worker
+```
+
+Set a per-provider secret and point the provider at the endpoint:
+
+```bash
+# one secret per provider instance: RIPCLONE_WEBHOOK_SECRET_<ID>
+export RIPCLONE_WEBHOOK_SECRET_GITHUB=your-webhook-secret
+# then add a GitHub webhook: Payload URL https://<server>/webhooks/github,
+# content type application/json, secret = the value above.
+```
+
+The receiver verifies the signature over the raw body (constant-time), then enqueues a sync onto the same build queue `/sync` uses — so warm-on-push is identical to the managed cloud. Fail-closed: a provider with no configured secret returns `503`; a bad signature returns `401`. By default every pushed repo is warmed (a loud startup log says so); set `RIPCLONE_WEBHOOK_ALLOWLIST=owner/repo,other/repo` to restrict it. Phase 1 is GitHub; GitLab and Gitea follow the same trait. See [`docs/WEBHOOKS.md`](docs/WEBHOOKS.md).
+
 ## CLI usage
 
 By default the CLI talks to the managed [Ripclone Cloud](https://ripclone.com). Point it at a self-hosted server with `--server`, the `RIPCLONE_SERVER` env var, or `ripclone login`. (Resolution order: `--server` > `RIPCLONE_SERVER` > saved login config > cloud.)

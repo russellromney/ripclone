@@ -17,6 +17,7 @@ use crate::retention::Retention;
 use crate::snapshot::SnapshotBuilder;
 use crate::storage::StorageRef;
 use crate::validation;
+use crate::webhook::{EventKind, WebhookConfig};
 use anyhow::{Context, Result};
 use axum::{
     Json, Router,
@@ -29,6 +30,7 @@ use axum::{
 };
 use futures::{StreamExt, TryStreamExt};
 use prost::Message;
+use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -93,6 +95,9 @@ pub struct ServerState {
     /// self-host that fully trusts whoever holds the shared server token (the old
     /// behavior); then visibility falls back to the client-supplied header.
     pub require_repo_auth: bool,
+    /// Webhook receiver config: per-provider secret + optional repo allowlist.
+    /// Empty (no secrets) means every `/webhooks/{provider}` returns 503.
+    pub webhook_config: Arc<WebhookConfig>,
 }
 
 impl ServerState {
@@ -136,6 +141,8 @@ impl ServerState {
             // but unused, and auth enforcement is irrelevant here.
             access_verifier: Arc::new(HttpAccessVerifier::new()),
             require_repo_auth: false,
+            // The worker never serves HTTP, so it never receives webhooks.
+            webhook_config: Arc::new(WebhookConfig::empty()),
         })
     }
 }
@@ -551,6 +558,10 @@ pub fn build_app(state: ServerState) -> Router {
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics_handler))
         .route("/v1/build", post(build_handler))
+        // Provider-agnostic webhook receiver. Rate-limited like the rest, but
+        // NOT behind `auth_middleware`: a webhook authenticates itself with the
+        // provider HMAC over the raw body, not the server's bearer token.
+        .route("/webhooks/{provider}", post(webhook_handler))
         .merge(protected)
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -2031,6 +2042,325 @@ fn split_and_store_pack(cas: &crate::cas::Cas, pack: &[u8]) -> Result<Vec<ChunkR
     Ok(refs)
 }
 
+/// Outcome of placing a sync on the build queue. The caller decides whether to
+/// wait for the build (`/sync`) or return immediately (the webhook receiver).
+enum SyncEnqueued {
+    /// In-process queue: await `rx` for the build result; the worker signals it
+    /// on completion. Dropping `rx` makes the enqueue fire-and-forget.
+    InProc {
+        rx: tokio::sync::oneshot::Receiver<Result<(), String>>,
+    },
+    /// Cross-process queue: poll `job_id` until the worker reports completion.
+    CrossProc { job_id: crate::queue::JobId },
+}
+
+/// Why a sync could not be queued.
+enum EnqueueError {
+    /// Queue at capacity (HTTP 503).
+    Full,
+    /// `?rev=` override is not supported on the cross-process queue (HTTP 501).
+    RevUnsupported,
+    /// The queue returned no job id to poll (HTTP 500).
+    NoJobId,
+    /// The enqueue call itself failed (HTTP 503).
+    QueueError(String),
+}
+
+/// Place a sync build on the queue: coalesce concurrent requests for the same
+/// `(repo, branch, rev)` onto one build and bump the queue-depth metric. This is
+/// the single enqueue path shared by `POST /sync` and the webhook receiver — do
+/// not duplicate build logic. The caller awaits the returned handle (`/sync`) or
+/// drops it for fire-and-forget warming (webhook).
+async fn enqueue_sync(
+    state: &ServerState,
+    repo_id: &RepoId,
+    branch: &str,
+    rev: Option<&str>,
+    credential: Option<secrecy::SecretString>,
+) -> Result<SyncEnqueued, EnqueueError> {
+    if state.build_queue.inproc_wait() {
+        // In-process queue: coalesce via build_waiters; the same-process worker
+        // signals completion on a oneshot. Include the rev override in the
+        // coalescing key so syncs for different build commits don't share one
+        // build. This key must match the one the worker computes.
+        let key = format!("{}/{branch}#{}", repo_id.storage_key(), rev.unwrap_or(""));
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+        let first = {
+            let mut w = state.build_waiters.lock().await;
+            let v = w.entry(key.clone()).or_default();
+            let was_empty = v.is_empty();
+            v.push(tx);
+            was_empty
+        };
+        if first {
+            // Mirror the /build handler: the worker decrements the metrics gauge
+            // for every job it drains, so every enqueue must increment it (else
+            // the gauge underflows). The local queue owns the build_queue_depth
+            // counter (enqueue +1, worker -1).
+            state.metrics.record_build_queued();
+            let job = BuildJob {
+                repo_id: repo_id.clone(),
+                branch: branch.to_string(),
+                rev: rev.map(|s| s.to_string()),
+                credential,
+            };
+            let full = match state.build_queue.enqueue(job).await {
+                Ok(enq) => enq.outcome == EnqueueOutcome::Full,
+                Err(_) => true,
+            };
+            if full {
+                state.metrics.record_build_rejected();
+                state.build_waiters.lock().await.remove(&key);
+                return Err(EnqueueError::Full);
+            }
+        }
+        Ok(SyncEnqueued::InProc { rx })
+    } else {
+        // Cross-process queue: the build runs in a separate ripclone-worker. The
+        // rev override is not carried across the queue (not persisted; the worker
+        // builds the branch tip), so honoring `?rev=` here would build the wrong
+        // commit. Reject it explicitly rather than mis-build.
+        if rev.is_some() {
+            return Err(EnqueueError::RevUnsupported);
+        }
+        // The per-request upstream credential rides with the job: the queue
+        // persists it (base64) and the worker uses it for the mirror fetch, so a
+        // private repo the worker has no standing token for still builds.
+        let job = BuildJob {
+            repo_id: repo_id.clone(),
+            branch: branch.to_string(),
+            rev: None,
+            credential,
+        };
+        let enq = state
+            .build_queue
+            .enqueue(job)
+            .await
+            .map_err(|e| EnqueueError::QueueError(e.to_string()))?;
+        // Only count a genuinely new job (not a coalesced duplicate).
+        if enq.outcome == EnqueueOutcome::Enqueued {
+            state.metrics.record_build_queued();
+        }
+        if enq.outcome == EnqueueOutcome::Full {
+            state.metrics.record_build_rejected();
+            return Err(EnqueueError::Full);
+        }
+        // The SQL queue always returns a job id to poll; treat its absence as an
+        // internal error rather than spinning to the deadline.
+        let Some(job_id) = enq.job_id else {
+            return Err(EnqueueError::NoJobId);
+        };
+        Ok(SyncEnqueued::CrossProc { job_id })
+    }
+}
+
+#[derive(Serialize)]
+struct WebhookAccepted {
+    ok: bool,
+}
+
+#[derive(Serialize)]
+struct WebhookIgnored {
+    ignored: &'static str,
+}
+
+/// Acknowledge an event we deliberately don't act on. Always `200` so the
+/// provider doesn't retry a delivery we simply chose to ignore.
+fn webhook_ignored(reason: &'static str) -> Response {
+    (StatusCode::OK, Json(WebhookIgnored { ignored: reason })).into_response()
+}
+
+/// `POST /webhooks/{provider}` — provider-agnostic webhook receiver.
+///
+/// verify (HMAC over the RAW body) → normalize → enqueue. Responds 2xx fast and
+/// lets the build run async on the shared queue. Fail-closed: no configured
+/// secret ⇒ 503; bad signature ⇒ 401. The payload is trusted only for routing
+/// (which repo / ref to warm), never to choose a credential or escalate.
+async fn webhook_handler(
+    Path(provider_id): Path<String>,
+    headers: HeaderMap,
+    State(state): State<ServerState>,
+    body: Body,
+) -> Response {
+    // Resolve the configured provider instance from the path.
+    let Some(provider) = state.provider_registry.get(&provider_id).cloned() else {
+        return unknown_provider_response();
+    };
+    // Phase 1: only GitHub has a webhook adapter; other kinds are follow-ups.
+    let Some(adapter) = crate::webhook::provider_for(provider.kind) else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(ErrorResponse {
+                error: format!(
+                    "webhooks not yet implemented for provider kind '{}'",
+                    provider.kind.as_str()
+                ),
+            }),
+        )
+            .into_response();
+    };
+    // Fail closed: no configured secret for this provider ⇒ 503. Never process
+    // an unverified webhook.
+    let Some(secret) = state.webhook_config.secret(provider.id.as_str()).cloned() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: format!(
+                    "no webhook secret configured for provider '{}'",
+                    provider.id
+                ),
+            }),
+        )
+            .into_response();
+    };
+    // Read the RAW body before any JSON parse — the HMAC covers these exact bytes.
+    let raw = match axum::body::to_bytes(body, MAX_REQUEST_BODY_BYTES).await {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: format!("read body failed: {e}"),
+                }),
+            )
+                .into_response();
+        }
+    };
+    // Verify the signature in constant time over the raw bytes.
+    if !adapter.verify(&headers, &raw, secret.expose_secret()) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                error: "invalid webhook signature".to_string(),
+            }),
+        )
+            .into_response();
+    }
+    // Normalize. Unhandled events parse to None and are acknowledged as ignored.
+    let Some(event) = adapter.parse(&headers, &raw) else {
+        return webhook_ignored("unhandled event");
+    };
+    match event.kind {
+        EventKind::Ping => (StatusCode::OK, Json(WebhookAccepted { ok: true })).into_response(),
+        EventKind::Push => webhook_dispatch_push(&state, &provider, event).await,
+        EventKind::BranchDelete => webhook_dispatch_delete(&state, &provider, event).await,
+    }
+}
+
+/// Push → warm. Applies the allowlist gate and the branch policy (always warm
+/// the default branch; other branches only if already tracked), then enqueues
+/// onto the shared build queue and returns immediately (fire-and-forget).
+async fn webhook_dispatch_push(
+    state: &ServerState,
+    provider: &ProviderInstance,
+    event: crate::webhook::CanonicalEvent,
+) -> Response {
+    let repo_id = RepoId {
+        provider: provider.id.clone(),
+        path: event.repo.clone(),
+    };
+    // Validate the payload-supplied path so a hostile push can't escape storage
+    // keys. We trust the payload only for routing.
+    if validation::validate_repo_path(provider, &repo_id).is_err() {
+        return webhook_ignored("invalid repo path");
+    }
+    // Allowlist gate (allow-all when unconfigured).
+    if !state.webhook_config.allows(&repo_id.storage_key()) {
+        return webhook_ignored("repo not in webhook allowlist");
+    }
+    // Phase 1 warms branches only; tags and other refs are ignored.
+    let Some(branch) = event
+        .ref_
+        .strip_prefix("refs/heads/")
+        .filter(|b| !b.is_empty())
+    else {
+        return webhook_ignored("non-branch ref");
+    };
+    let branch = branch.to_string();
+    // Policy: always warm the default branch; warm other branches only if a
+    // build for them already exists, so a webhook can't warm every throwaway
+    // feature branch.
+    let is_default = event.default_branch.as_deref() == Some(branch.as_str());
+    if !is_default {
+        let tracked = matches!(
+            state.ref_store.load_branch(&repo_id, &branch).await,
+            Ok(Some(_))
+        );
+        if !tracked {
+            return webhook_ignored("non-default branch not tracked");
+        }
+    }
+    // The webhook carries no token; use the configured StaticBroker credential
+    // for private clones.
+    let credential = state.broker.fetch_credential(&repo_id, None);
+    match enqueue_sync(state, &repo_id, &branch, None, credential).await {
+        Ok(_) => {
+            info!(
+                "webhook: enqueued sync for {}@{branch}",
+                repo_id.storage_key()
+            );
+            (StatusCode::OK, Json(WebhookAccepted { ok: true })).into_response()
+        }
+        Err(EnqueueError::Full) => {
+            state.metrics.record_error();
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse {
+                    error: "build queue full; retry shortly".to_string(),
+                }),
+            )
+                .into_response()
+        }
+        Err(_) => {
+            state.metrics.record_error();
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "failed to enqueue sync".to_string(),
+                }),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Branch delete → clean up that ref's stored metadata. Never builds.
+async fn webhook_dispatch_delete(
+    state: &ServerState,
+    provider: &ProviderInstance,
+    event: crate::webhook::CanonicalEvent,
+) -> Response {
+    let repo_id = RepoId {
+        provider: provider.id.clone(),
+        path: event.repo.clone(),
+    };
+    if validation::validate_repo_path(provider, &repo_id).is_err() {
+        return webhook_ignored("invalid repo path");
+    }
+    let Some(branch) = event
+        .ref_
+        .strip_prefix("refs/heads/")
+        .filter(|b| !b.is_empty())
+    else {
+        return webhook_ignored("non-branch ref");
+    };
+    // Drop the stored ref and any cached copy. Best-effort: a delete we can't
+    // complete is logged, not surfaced to the provider (it would just retry).
+    if let Err(e) = state.ref_store.delete_branch(&repo_id, branch).await {
+        warn!(
+            "webhook: failed to delete ref {}@{branch}: {e}",
+            repo_id.storage_key()
+        );
+    }
+    state.ref_store.invalidate(&repo_id, branch).await;
+    invalidate_ref_response_cache(state, &repo_id, branch);
+    info!(
+        "webhook: cleaned up deleted branch {}@{branch}",
+        repo_id.storage_key()
+    );
+    (StatusCode::OK, Json(WebhookAccepted { ok: true })).into_response()
+}
+
 async fn sync_repo_inner(
     repo_id: RepoId,
     provider: ProviderInstance,
@@ -2075,54 +2405,14 @@ async fn sync_repo_inner(
         // than holding the connection until it is reset mid-request.
         let wait = Duration::from_secs(env_bytes("RIPCLONE_SYNC_WAIT_SECS", 25));
 
-        if state.build_queue.inproc_wait() {
-            // In-process queue: coalesce via build_waiters; the same-process
-            // worker signals completion on a oneshot. Include the rev override in
-            // the coalescing key so syncs for different build commits don't share
-            // one build.
-            let key = format!(
-                "{}/{branch}#{}",
-                repo_id.storage_key(),
-                at_rev.as_deref().unwrap_or("")
-            );
-            let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
-            let first = {
-                let mut w = state.build_waiters.lock().await;
-                let v = w.entry(key.clone()).or_default();
-                let was_empty = v.is_empty();
-                v.push(tx);
-                was_empty
-            };
-            if first {
-                // Mirror the /build handler: the worker decrements the metrics
-                // gauge for every job it drains, so every enqueue must increment
-                // it (else the gauge underflows). The local queue owns the
-                // build_queue_depth counter (enqueue +1, worker -1).
-                state.metrics.record_build_queued();
-                let job = BuildJob {
-                    repo_id: repo_id.clone(),
-                    branch: branch.clone(),
-                    rev: at_rev.clone(),
-                    credential,
-                };
-                let full = match state.build_queue.enqueue(job).await {
-                    Ok(enq) => enq.outcome == EnqueueOutcome::Full,
-                    Err(_) => true,
-                };
-                if full {
-                    state.metrics.record_build_rejected();
-                    state.build_waiters.lock().await.remove(&key);
-                    state.metrics.record_error();
-                    return (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        Json(ErrorResponse {
-                            error: "build queue full; retry shortly".to_string(),
-                        }),
-                    )
-                        .into_response();
-                }
-            }
-            match tokio::time::timeout(wait, rx).await {
+        // Place the build on the queue via the shared enqueue path (the same one
+        // the webhook receiver uses), then wait for it here so `/sync` can return
+        // the freshly built ref. Webhook callers drop the handle for
+        // fire-and-forget warming.
+        match enqueue_sync(&state, &repo_id, &branch, at_rev.as_deref(), credential).await {
+            // In-process queue: the same-process worker signals completion on a
+            // oneshot. Wait up to `wait`, then 202 and let the client retry.
+            Ok(SyncEnqueued::InProc { rx }) => match tokio::time::timeout(wait, rx).await {
                 Ok(Ok(Ok(()))) => {
                     // Resolve HEAD to the concrete default branch before loading
                     // the persisted ref; do_sync stores artifacts under the real
@@ -2190,18 +2480,111 @@ async fn sync_repo_inner(
                     )
                         .into_response();
                 }
+            },
+            // Cross-process queue: poll the job's status, since the build runs in
+            // a separate ripclone-worker.
+            Ok(SyncEnqueued::CrossProc { job_id }) => {
+                let deadline = Instant::now() + wait;
+                let mut consecutive_errors = 0u32;
+                loop {
+                    match state.build_queue.job_status(job_id).await {
+                        Ok(JobState::Done) => {
+                            // The build ran in another process, so this server's
+                            // ref caches may be stale — drop them before reading.
+                            let effective_branch = if branch == "HEAD" {
+                                git::default_branch(&mirror_dir)
+                                    .ok()
+                                    .filter(|b| !b.is_empty())
+                                    .unwrap_or_else(|| branch.clone())
+                            } else {
+                                branch.clone()
+                            };
+                            state.ref_store.invalidate(&repo_id, &branch).await;
+                            state
+                                .ref_store
+                                .invalidate(&repo_id, &effective_branch)
+                                .await;
+                            invalidate_ref_response_cache(&state, &repo_id, &effective_branch);
+                            let load_key = ref_store_key(&effective_branch, at_rev.as_deref());
+                            match state.ref_store.load_branch(&repo_id, &load_key).await {
+                                // Guard on a non-empty commit: a HEAD row can exist
+                                // as a build_status placeholder (empty commit).
+                                // Never return that as a successful ref.
+                                Ok(Some(info)) if !info.commit.is_empty() => {
+                                    state.metrics.record_sync(start.elapsed());
+                                    let resp = ref_response(
+                                        &repo_id,
+                                        &provider,
+                                        effective_branch,
+                                        &info,
+                                        &state.storage,
+                                        "full",
+                                        private,
+                                    );
+                                    return (StatusCode::OK, Json(resp)).into_response();
+                                }
+                                _ => {
+                                    return (
+                                        StatusCode::INTERNAL_SERVER_ERROR,
+                                        Json(ErrorResponse {
+                                            error: "build finished but ref missing".to_string(),
+                                        }),
+                                    )
+                                        .into_response();
+                                }
+                            }
+                        }
+                        Ok(JobState::Failed(e)) => {
+                            state.metrics.record_error();
+                            return (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(ErrorResponse {
+                                    error: format!("sync failed: {e}"),
+                                }),
+                            )
+                                .into_response();
+                        }
+                        Ok(_) => consecutive_errors = 0,
+                        Err(e) => {
+                            // Don't mask a persistent queue outage as backpressure.
+                            consecutive_errors += 1;
+                            warn!("queue job_status poll failed ({consecutive_errors}): {e}");
+                            if consecutive_errors >= 5 {
+                                state.metrics.record_error();
+                                return (
+                                    StatusCode::SERVICE_UNAVAILABLE,
+                                    Json(ErrorResponse {
+                                        error: format!("build queue unavailable: {e}"),
+                                    }),
+                                )
+                                    .into_response();
+                            }
+                        }
+                    }
+                    if Instant::now() >= deadline {
+                        return (
+                            StatusCode::ACCEPTED,
+                            Json(BuildResponse {
+                                status: "building".to_string(),
+                                queue_depth: state.build_queue.depth().await,
+                            }),
+                        )
+                            .into_response();
+                    }
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                }
             }
-        } else {
-            // Cross-process queue: enqueue (the queue coalesces by repo/branch)
-            // and poll the job's status, since the build runs in a separate
-            // ripclone-worker.
-            //
-            // The rev override is not carried across the queue (not persisted; the
-            // worker builds the branch tip), so honoring `?rev=` here would build
-            // the wrong commit and then fail to find the `branch#atrev` ref.
-            // Reject it explicitly rather than mis-build. Use the local queue for
-            // rev-targeted builds.
-            if at_rev.is_some() {
+            Err(EnqueueError::Full) => {
+                state.metrics.record_error();
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(ErrorResponse {
+                        error: "build queue full; retry shortly".to_string(),
+                    }),
+                )
+                    .into_response();
+            }
+            Err(EnqueueError::RevUnsupported) => {
                 return (
                     StatusCode::NOT_IMPLEMENTED,
                     Json(ErrorResponse {
@@ -2212,46 +2595,17 @@ async fn sync_repo_inner(
                 )
                     .into_response();
             }
-            // The per-request upstream credential rides with the job: the queue
-            // persists it (base64) and the worker uses it for the mirror fetch,
-            // so a private repo the worker has no standing token for still builds.
-            let job = BuildJob {
-                repo_id: repo_id.clone(),
-                branch: branch.clone(),
-                rev: at_rev.clone(),
-                credential,
-            };
-            let enq = match state.build_queue.enqueue(job).await {
-                Ok(enq) => enq,
-                Err(e) => {
-                    state.metrics.record_error();
-                    return (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        Json(ErrorResponse {
-                            error: format!("failed to enqueue build: {e}"),
-                        }),
-                    )
-                        .into_response();
-                }
-            };
-            // Only count a genuinely new job (not a coalesced duplicate).
-            if enq.outcome == EnqueueOutcome::Enqueued {
-                state.metrics.record_build_queued();
-            }
-            if enq.outcome == EnqueueOutcome::Full {
-                state.metrics.record_build_rejected();
+            Err(EnqueueError::QueueError(e)) => {
                 state.metrics.record_error();
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
                     Json(ErrorResponse {
-                        error: "build queue full; retry shortly".to_string(),
+                        error: format!("failed to enqueue build: {e}"),
                     }),
                 )
                     .into_response();
             }
-            // The SQL queue always returns a job id to poll; treat its absence as
-            // an internal error rather than spinning to the deadline.
-            let Some(job_id) = enq.job_id else {
+            Err(EnqueueError::NoJobId) => {
                 state.metrics.record_error();
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -2260,95 +2614,6 @@ async fn sync_repo_inner(
                     }),
                 )
                     .into_response();
-            };
-            let deadline = Instant::now() + wait;
-            let mut consecutive_errors = 0u32;
-            loop {
-                match state.build_queue.job_status(job_id).await {
-                    Ok(JobState::Done) => {
-                        // The build ran in another process, so this server's ref
-                        // caches may be stale — drop them before reading.
-                        let effective_branch = if branch == "HEAD" {
-                            git::default_branch(&mirror_dir)
-                                .ok()
-                                .filter(|b| !b.is_empty())
-                                .unwrap_or_else(|| branch.clone())
-                        } else {
-                            branch.clone()
-                        };
-                        state.ref_store.invalidate(&repo_id, &branch).await;
-                        state
-                            .ref_store
-                            .invalidate(&repo_id, &effective_branch)
-                            .await;
-                        invalidate_ref_response_cache(&state, &repo_id, &effective_branch);
-                        let load_key = ref_store_key(&effective_branch, at_rev.as_deref());
-                        match state.ref_store.load_branch(&repo_id, &load_key).await {
-                            // Guard on a non-empty commit: a HEAD row can exist as
-                            // a build_status placeholder (empty commit). Never
-                            // return that as a successful ref.
-                            Ok(Some(info)) if !info.commit.is_empty() => {
-                                state.metrics.record_sync(start.elapsed());
-                                let resp = ref_response(
-                                    &repo_id,
-                                    &provider,
-                                    effective_branch,
-                                    &info,
-                                    &state.storage,
-                                    "full",
-                                    private,
-                                );
-                                return (StatusCode::OK, Json(resp)).into_response();
-                            }
-                            _ => {
-                                return (
-                                    StatusCode::INTERNAL_SERVER_ERROR,
-                                    Json(ErrorResponse {
-                                        error: "build finished but ref missing".to_string(),
-                                    }),
-                                )
-                                    .into_response();
-                            }
-                        }
-                    }
-                    Ok(JobState::Failed(e)) => {
-                        state.metrics.record_error();
-                        return (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(ErrorResponse {
-                                error: format!("sync failed: {e}"),
-                            }),
-                        )
-                            .into_response();
-                    }
-                    Ok(_) => consecutive_errors = 0,
-                    Err(e) => {
-                        // Don't mask a persistent queue outage as backpressure.
-                        consecutive_errors += 1;
-                        warn!("queue job_status poll failed ({consecutive_errors}): {e}");
-                        if consecutive_errors >= 5 {
-                            state.metrics.record_error();
-                            return (
-                                StatusCode::SERVICE_UNAVAILABLE,
-                                Json(ErrorResponse {
-                                    error: format!("build queue unavailable: {e}"),
-                                }),
-                            )
-                                .into_response();
-                        }
-                    }
-                }
-                if Instant::now() >= deadline {
-                    return (
-                        StatusCode::ACCEPTED,
-                        Json(BuildResponse {
-                            status: "building".to_string(),
-                            queue_depth: state.build_queue.depth().await,
-                        }),
-                    )
-                        .into_response();
-                }
-                tokio::time::sleep(Duration::from_millis(400)).await;
             }
         }
     }
@@ -5192,6 +5457,10 @@ pub async fn run_server(
         QueueBackend::Sql { queue } => (queue, Arc::new(AtomicUsize::new(0)), None),
     };
 
+    // Webhook receiver config (per-provider secret + optional allowlist). Built
+    // before the registry is moved into the state.
+    let webhook_config = Arc::new(WebhookConfig::from_env(&provider_registry));
+
     let state = ServerState {
         cas: b.cas,
         storage: b.storage,
@@ -5221,6 +5490,7 @@ pub async fn run_server(
         readyz_cache: Arc::new(std::sync::Mutex::new(None)),
         access_verifier: Arc::new(HttpAccessVerifier::new()),
         require_repo_auth: require_repo_auth_from_env(),
+        webhook_config,
     };
 
     // Only the local queue runs builds in-process.
@@ -5297,6 +5567,8 @@ mod tests {
             // the authz-specific tests override these two fields with a fake.
             access_verifier: Arc::new(HttpAccessVerifier::new()),
             require_repo_auth: false,
+            // No webhook secret by default; webhook tests install one explicitly.
+            webhook_config: Arc::new(WebhookConfig::empty()),
         }
     }
 
@@ -6303,5 +6575,335 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ---- Webhook receiver ----
+
+    const WEBHOOK_SECRET: &str = "shhh-very-secret";
+
+    /// GitHub-style `sha256=<hex>` HMAC of the body, as a real delivery sends.
+    fn gh_sign(secret: &str, body: &[u8]) -> String {
+        use hmac::{Hmac, Mac};
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(body);
+        format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
+    }
+
+    fn webhook_request(
+        provider: &str,
+        event: &str,
+        signature: Option<&str>,
+        body: Vec<u8>,
+    ) -> axum::http::Request<Body> {
+        let mut b = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/webhooks/{provider}"))
+            .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))))
+            .header("X-GitHub-Event", event);
+        if let Some(sig) = signature {
+            b = b.header("X-Hub-Signature-256", sig);
+        }
+        b.body(Body::from(body)).unwrap()
+    }
+
+    fn gh_push_body(
+        owner: &str,
+        repo: &str,
+        ref_: &str,
+        after: &str,
+        default_branch: &str,
+        deleted: bool,
+    ) -> Vec<u8> {
+        serde_json::json!({
+            "ref": ref_,
+            "after": after,
+            "deleted": deleted,
+            "repository": {
+                "name": repo,
+                "owner": {"login": owner},
+                "default_branch": default_branch,
+                "private": false
+            }
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    /// A test state whose local-queue receiver is kept alive (so an enqueue
+    /// succeeds instead of reporting Full) with a configured `github` webhook
+    /// secret. Returns the receiver so a test can assert what was enqueued.
+    fn webhook_state(
+        tmp: &tempfile::TempDir,
+    ) -> (ServerState, tokio::sync::mpsc::Receiver<BuildJob>) {
+        let mut state = test_state(tmp);
+        let (queue, rx, depth) = crate::queue::LocalJobQueue::new(16);
+        state.build_queue = Arc::new(queue);
+        state.build_queue_depth = depth;
+        state.webhook_config = Arc::new(WebhookConfig::with_secret("github", WEBHOOK_SECRET));
+        (state, rx)
+    }
+
+    #[tokio::test]
+    async fn webhook_without_secret_returns_503() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Default test_state has no webhook secret configured.
+        let state = test_state(&tmp);
+        let app = build_app(state);
+        let body = gh_push_body(
+            "acme",
+            "widget",
+            "refs/heads/main",
+            &"1".repeat(40),
+            "main",
+            false,
+        );
+        let sig = gh_sign(WEBHOOK_SECRET, &body);
+        let resp = app
+            .oneshot(webhook_request("github", "push", Some(&sig), body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn webhook_push_enqueues_sync() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, mut rx) = webhook_state(&tmp);
+        let app = build_app(state);
+        let body = gh_push_body(
+            "acme",
+            "widget",
+            "refs/heads/main",
+            &"1".repeat(40),
+            "main",
+            false,
+        );
+        let sig = gh_sign(WEBHOOK_SECRET, &body);
+        let resp = app
+            .oneshot(webhook_request("github", "push", Some(&sig), body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // The default-branch push must have placed exactly one build on the queue.
+        let job = rx.try_recv().expect("a build job was enqueued");
+        assert_eq!(job.repo_id, RepoId::github("acme/widget"));
+        assert_eq!(job.branch, "main");
+        assert!(rx.try_recv().is_err(), "exactly one job enqueued");
+    }
+
+    #[tokio::test]
+    async fn webhook_invalid_signature_returns_401() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, mut rx) = webhook_state(&tmp);
+        let app = build_app(state);
+        let body = gh_push_body(
+            "acme",
+            "widget",
+            "refs/heads/main",
+            &"1".repeat(40),
+            "main",
+            false,
+        );
+        // Signed with a different secret than the server holds.
+        let sig = gh_sign("wrong-secret", &body);
+        let resp = app
+            .oneshot(webhook_request("github", "push", Some(&sig), body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(rx.try_recv().is_err(), "a bad signature must not enqueue");
+    }
+
+    #[tokio::test]
+    async fn webhook_missing_signature_returns_401() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, _rx) = webhook_state(&tmp);
+        let app = build_app(state);
+        let body = gh_push_body(
+            "acme",
+            "widget",
+            "refs/heads/main",
+            &"1".repeat(40),
+            "main",
+            false,
+        );
+        let resp = app
+            .oneshot(webhook_request("github", "push", None, body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn webhook_ping_is_acknowledged_without_enqueue() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, mut rx) = webhook_state(&tmp);
+        let app = build_app(state);
+        let body = br#"{"zen":"keep it simple"}"#.to_vec();
+        let sig = gh_sign(WEBHOOK_SECRET, &body);
+        let resp = app
+            .oneshot(webhook_request("github", "ping", Some(&sig), body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(rx.try_recv().is_err(), "ping must not enqueue");
+    }
+
+    #[tokio::test]
+    async fn webhook_untracked_non_default_branch_is_ignored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, mut rx) = webhook_state(&tmp);
+        let app = build_app(state);
+        // Push to a non-default branch that has no stored build.
+        let body = gh_push_body(
+            "acme",
+            "widget",
+            "refs/heads/feature",
+            &"1".repeat(40),
+            "main",
+            false,
+        );
+        let sig = gh_sign(WEBHOOK_SECRET, &body);
+        let resp = app
+            .oneshot(webhook_request("github", "push", Some(&sig), body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            rx.try_recv().is_err(),
+            "untracked non-default branch must not enqueue"
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_tracked_non_default_branch_enqueues() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, mut rx) = webhook_state(&tmp);
+        let repo = RepoId::github("acme/widget");
+        // Pre-store a build for the non-default branch so policy warms it.
+        let info = RefInfo {
+            commit: "deadbeef".to_string(),
+            default_branch: "main".to_string(),
+            ..Default::default()
+        };
+        state
+            .ref_store
+            .save_branch(&repo, "feature", &info)
+            .await
+            .unwrap();
+        let app = build_app(state);
+        let body = gh_push_body(
+            "acme",
+            "widget",
+            "refs/heads/feature",
+            &"1".repeat(40),
+            "main",
+            false,
+        );
+        let sig = gh_sign(WEBHOOK_SECRET, &body);
+        let resp = app
+            .oneshot(webhook_request("github", "push", Some(&sig), body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let job = rx.try_recv().expect("tracked branch enqueues");
+        assert_eq!(job.branch, "feature");
+    }
+
+    #[tokio::test]
+    async fn webhook_allowlist_blocks_unlisted_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = test_state(&tmp);
+        let (queue, mut rx, depth) = crate::queue::LocalJobQueue::new(16);
+        state.build_queue = Arc::new(queue);
+        state.build_queue_depth = depth;
+        state.webhook_config = Arc::new(
+            WebhookConfig::with_secret("github", WEBHOOK_SECRET)
+                .with_allowlist(["acme/allowed".to_string()]),
+        );
+        let app = build_app(state);
+        // Push to a repo that is not on the allowlist.
+        let body = gh_push_body(
+            "acme",
+            "widget",
+            "refs/heads/main",
+            &"1".repeat(40),
+            "main",
+            false,
+        );
+        let sig = gh_sign(WEBHOOK_SECRET, &body);
+        let resp = app
+            .oneshot(webhook_request("github", "push", Some(&sig), body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(rx.try_recv().is_err(), "unlisted repo must not enqueue");
+    }
+
+    #[tokio::test]
+    async fn webhook_branch_delete_cleans_up_ref() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, mut rx) = webhook_state(&tmp);
+        let repo = RepoId::github("acme/widget");
+        // Pre-store a ref that the delete webhook should remove.
+        let info = RefInfo {
+            commit: "deadbeef".to_string(),
+            default_branch: "main".to_string(),
+            ..Default::default()
+        };
+        state
+            .ref_store
+            .save_branch(&repo, "feature", &info)
+            .await
+            .unwrap();
+        assert!(
+            state
+                .ref_store
+                .load_branch(&repo, "feature")
+                .await
+                .unwrap()
+                .is_some(),
+            "ref present before delete"
+        );
+        let ref_store = state.ref_store.clone();
+        let app = build_app(state);
+        // GitHub signals a delete with an all-zeros `after` and `deleted: true`.
+        let body = gh_push_body(
+            "acme",
+            "widget",
+            "refs/heads/feature",
+            &"0".repeat(40),
+            "main",
+            true,
+        );
+        let sig = gh_sign(WEBHOOK_SECRET, &body);
+        let resp = app
+            .oneshot(webhook_request("github", "push", Some(&sig), body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            ref_store
+                .load_branch(&repo, "feature")
+                .await
+                .unwrap()
+                .is_none(),
+            "deleted branch ref is cleaned up"
+        );
+        assert!(rx.try_recv().is_err(), "a delete must not enqueue a build");
+    }
+
+    #[tokio::test]
+    async fn webhook_unknown_provider_returns_404() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, _rx) = webhook_state(&tmp);
+        let app = build_app(state);
+        let body = br#"{}"#.to_vec();
+        let sig = gh_sign(WEBHOOK_SECRET, &body);
+        let resp = app
+            .oneshot(webhook_request("nope", "push", Some(&sig), body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }

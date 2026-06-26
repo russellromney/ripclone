@@ -80,6 +80,13 @@ pub trait RefStore: Send + Sync {
     /// Save the `RefInfo` for a specific branch.
     async fn save_branch(&self, repo_id: &RepoId, branch: &str, info: &RefInfo) -> Result<()>;
 
+    /// Delete the stored `RefInfo` for a branch (e.g. on a webhook
+    /// branch-delete). Idempotent: removing a branch that isn't stored is `Ok`.
+    /// The default is a no-op for stores that don't support deletion.
+    async fn delete_branch(&self, _repo_id: &RepoId, _branch: &str) -> Result<()> {
+        Ok(())
+    }
+
     /// List all branches that have a stored `RefInfo` for this repo.
     async fn list_branches(&self, repo_id: &RepoId) -> Result<Vec<String>>;
 
@@ -252,6 +259,25 @@ impl RefStore for FileRefStore {
         }
         self.write_checked(&self.branch_path(repo_id, branch), info)
             .await
+    }
+
+    async fn delete_branch(&self, repo_id: &RepoId, branch: &str) -> Result<()> {
+        // HEAD is the repo's default ref; a branch-delete webhook never targets
+        // it, and removing it would orphan the repo. Refuse.
+        if branch == "HEAD" {
+            return Ok(());
+        }
+        let path = self.branch_path(repo_id, branch);
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => Ok(()),
+            // Already gone — deletion is idempotent.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(anyhow::anyhow!(
+                "delete ref store {}: {}",
+                path.display(),
+                e
+            )),
+        }
     }
 
     async fn list_branches(&self, repo_id: &RepoId) -> Result<Vec<String>> {
@@ -447,6 +473,18 @@ impl RefStore for S3RefStore {
             .await
     }
 
+    async fn delete_branch(&self, repo_id: &RepoId, branch: &str) -> Result<()> {
+        // Never delete the HEAD ref (see FileRefStore::delete_branch).
+        if branch == "HEAD" {
+            return Ok(());
+        }
+        let key = self.branch_key(repo_id, branch);
+        self.storage
+            .delete_object(&key)
+            .await
+            .with_context(|| format!("delete S3 ref store {key}"))
+    }
+
     async fn list_branches(&self, repo_id: &RepoId) -> Result<Vec<String>> {
         let mut out = Vec::new();
         if self.load(repo_id).await?.is_some() {
@@ -550,6 +588,14 @@ impl<T: RefStore> RefStore for CachingRefStore<T> {
         let mut cache = self.cache.write().await;
         self.inner.save_branch(repo_id, branch, info).await?;
         cache.insert(key, (Instant::now(), info.clone()));
+        Ok(())
+    }
+
+    async fn delete_branch(&self, repo_id: &RepoId, branch: &str) -> Result<()> {
+        let key = Self::cache_key(repo_id, branch);
+        let mut cache = self.cache.write().await;
+        self.inner.delete_branch(repo_id, branch).await?;
+        cache.remove(&key);
         Ok(())
     }
 
