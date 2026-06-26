@@ -51,6 +51,31 @@ push → /sync ──► resolve tip (cheap: ls-remote)
 Three properties make this safe and fast: cheap tip resolution, concurrent
 read-only builds, and a publish rule that can't be raced into corruption.
 
+## Triggering builds (build before clone)
+
+The point of ripclone is that the build runs **ahead of** the clone — triggered
+by the push, not by the clone. A clone is then a fast read of artifacts that
+already exist. Three trigger paths, all converging on the same fire-and-forget
+`trigger_build` (enqueue + coalesce, never wait):
+
+1. **Native push webhook** (shipped) — `POST /v1/webhooks/github`. Verifies
+   GitHub's `X-Hub-Signature-256` (HMAC-SHA256 over the raw body) against
+   `RIPCLONE_WEBHOOK_SECRET`, then builds the pushed branch immediately. No
+   per-repo workflow needed; authenticated by signature, so it sits outside the
+   bearer-token auth layer. 501 if unset, 204 for ping/non-push/branch-delete.
+2. **GitHub Actions trigger** (shipped) — a workflow that `curl`s `/sync` on
+   push. Works without configuring a webhook; needs the per-repo workflow file.
+3. **Polling fallback** (shipped) — `RIPCLONE_POLL_INTERVAL_SECS` (default 0 =
+   off). Periodically `ls-remote`s known repos (under the fetch cap) and builds
+   any whose tip moved. A backstop for missed webhook deliveries / repos without
+   a trigger — not the prompt path.
+
+The build is prompt: the in-process worker picks up an enqueue immediately; the
+SQL worker within `idle_poll_ms` (≤1s). So with a webhook wired, the new HEAD is
+typically built before any clone asks for it. Multi-provider webhooks (GitLab,
+Bitbucket — different signature schemes) and cross-replica poll coordination are
+future work; v1 is GitHub-only, single-server.
+
 ## Make syncs not wait
 
 ### 1. Cheap tip resolution (`ls-remote`)
