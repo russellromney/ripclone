@@ -1072,6 +1072,114 @@ pub fn object_type<P: AsRef<Path>>(repo: P, sha: &str) -> Result<String> {
     crate::gix_util::object_type(repo, sha)
 }
 
+/// Disable git's automatic gc on a bare mirror, persisted into the mirror's own
+/// config so it covers every later command, not just one fetch.
+///
+/// Builds read the mirror's packs while a fetch appends to it. Auto-gc, which a
+/// fetch can trigger, repacks or prunes those packs out from under a live reader
+/// and corrupts the read. We gc explicitly instead. Idempotent and cheap.
+pub fn disable_auto_gc(mirror_dir: &Path) -> Result<()> {
+    for (key, value) in [
+        ("gc.auto", "0"),
+        ("gc.autoPackLimit", "0"),
+        ("maintenance.auto", "false"),
+    ] {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(mirror_dir.as_os_str())
+            .args(["config", key, value])
+            .status()
+            .with_context(|| format!("git config {key}"))?;
+        if !status.success() {
+            bail!("failed to disable auto-gc ({key}) on mirror");
+        }
+    }
+    Ok(())
+}
+
+/// Build the upstream URL and the credential-injection git config args for a
+/// repo. The secret rides in `http.extraHeader`, never in the URL, so it stays
+/// out of argv, `.git/config`, and logs. The `RIPCLONE_ORIGIN_BASE` override is
+/// honored for the github default instance so offline e2e tests can use local
+/// `file://` origins.
+fn upstream_url_and_auth(
+    provider: &ProviderInstance,
+    repo_id: &RepoId,
+    credential: Option<&secrecy::SecretString>,
+) -> (String, Vec<String>) {
+    let url = if repo_id.is_github_default()
+        && let Some(base) = std::env::var("RIPCLONE_ORIGIN_BASE")
+            .ok()
+            .filter(|b| !b.is_empty())
+    {
+        format!("{}/{}.git", base.trim_end_matches('/'), repo_id.path)
+    } else {
+        provider.clone_url(&repo_id.path)
+    };
+
+    let mut git_args: Vec<String> = Vec::new();
+    if let Some(token) = credential
+        && let Some((name, value)) = provider.auth_header(token.expose_secret())
+    {
+        git_args.push("-c".to_string());
+        git_args.push(format!("http.extraHeader={}: {}", name, value));
+    }
+    (url, git_args)
+}
+
+/// Resolve the upstream tip of `ref_name` via `git ls-remote` — one
+/// reference-advertisement round-trip with **no object transfer**. Returns the
+/// hex commit SHA, or `None` if the ref is absent upstream. Used as a cheap
+/// pre-check so a `/sync` of an unchanged repo can no-op without a full fetch.
+///
+/// Best-effort by contract: callers treat an `Err` (network blip, host down) as
+/// "unknown" and fall through to the normal fetch+build — never as a failure.
+pub fn ls_remote_commit(
+    provider: &ProviderInstance,
+    repo_id: &RepoId,
+    ref_name: &str,
+    credential: Option<&secrecy::SecretString>,
+) -> Result<Option<String>> {
+    crate::validation::validate_repo_path(provider, repo_id)
+        .with_context(|| format!("invalid repo path: {}", repo_id.storage_key()))?;
+    if ref_name != "HEAD" {
+        crate::validation::validate_git_rev(ref_name)
+            .with_context(|| format!("invalid ref: {}", ref_name))?;
+        // `validate_git_rev` permits glob metacharacters that a real refname can't
+        // contain. In a `refs/heads/<name>` refspec they'd make ls-remote match a
+        // *pattern*, so the first-line parse below could return some other ref's
+        // SHA. Such a name has no build to reuse anyway — skip the probe.
+        if ref_name.contains(['*', '?', '[']) {
+            return Ok(None);
+        }
+    }
+    let (url, git_args) = upstream_url_and_auth(provider, repo_id, credential);
+    // A branch maps to refs/heads/<name>; HEAD is queried directly. Anything else
+    // (e.g. a tag) simply won't match and the caller falls through to a fetch.
+    let query = if ref_name == "HEAD" {
+        "HEAD".to_string()
+    } else {
+        format!("refs/heads/{ref_name}")
+    };
+    let output = Command::new("git")
+        .args(&git_args)
+        .args(["ls-remote", "--", &url, &query])
+        .output()
+        .context("git ls-remote")?;
+    if !output.status.success() {
+        bail!("ls-remote failed");
+    }
+    // Output is lines of "<sha>\t<ref>"; take the first ref's SHA.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let sha = stdout
+        .lines()
+        .next()
+        .and_then(|line| line.split('\t').next())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    Ok(sha)
+}
+
 /// Sync a bare mirror of a repo. Creates if missing, fetches if exists.
 ///
 /// Phase 1: credentials are passed via git's `http.extraHeader` config, never
@@ -1093,33 +1201,7 @@ pub fn sync_bare_mirror<P: AsRef<Path>>(
             .with_context(|| format!("invalid branch: {}", branch))?;
     }
 
-    // Build a clean clone URL from the provider. The RIPCLONE_ORIGIN_BASE
-    // override remains supported for the github default instance so existing
-    // offline e2e tests keep working with local `file://` origins.
-    let url = if repo_id.is_github_default() {
-        if let Some(base) = std::env::var("RIPCLONE_ORIGIN_BASE")
-            .ok()
-            .filter(|b| !b.is_empty())
-        {
-            format!("{}/{}.git", base.trim_end_matches('/'), repo_id.path)
-        } else {
-            provider.clone_url(&repo_id.path)
-        }
-    } else {
-        provider.clone_url(&repo_id.path)
-    };
-
-    // Build git config args for credential-header injection. The secret is
-    // never embedded in the URL, so it does not leak into process listings,
-    // `.git/config`, or server logs.
-    let mut git_args: Vec<String> = Vec::new();
-    if let Some(token) = credential
-        && let Some((name, value)) = provider.auth_header(token.expose_secret())
-    {
-        let header = format!("{}: {}", name, value);
-        git_args.push("-c".to_string());
-        git_args.push(format!("http.extraHeader={}", header));
-    }
+    let (url, git_args) = upstream_url_and_auth(provider, repo_id, credential);
     // The mirror is always a *complete* clone. The "full" (depth=0) clonepack is
     // built from `rev-list HEAD` over this mirror, so any shallow boundary would
     // silently truncate it and break `git rev-list`/`fsck` on the client. We
@@ -1137,6 +1219,9 @@ pub fn sync_bare_mirror<P: AsRef<Path>>(
         // `shallow` marker file; `--unshallow` completes it (and still fetches all
         // refs) once, after which plain fetches keep it complete.
         let is_shallow = mirror_dir.as_ref().join("shallow").exists();
+        // Persist gc-off before fetching, so legacy mirrors (created before this
+        // was set) are covered and the fetch we are about to run cannot auto-gc.
+        disable_auto_gc(mirror_dir.as_ref())?;
         let mut args: Vec<&str> = vec!["fetch"];
         if is_shallow {
             args.push("--unshallow");
@@ -1160,6 +1245,14 @@ pub fn sync_bare_mirror<P: AsRef<Path>>(
             .args(&git_args)
             .args([
                 "clone",
+                // `clone --config` persists into the new repo *before* its initial
+                // fetch, so even the clone's own fetch cannot auto-gc.
+                "--config",
+                "gc.auto=0",
+                "--config",
+                "gc.autoPackLimit=0",
+                "--config",
+                "maintenance.auto=false",
                 "--mirror",
                 &url,
                 &mirror_dir.as_ref().to_string_lossy(),
@@ -1169,6 +1262,9 @@ pub fn sync_bare_mirror<P: AsRef<Path>>(
         if !status.success() {
             bail!("clone mirror failed");
         }
+        // Belt and suspenders: confirm the keys are persisted regardless of how a
+        // given git version applied `clone --config`.
+        disable_auto_gc(mirror_dir.as_ref())?;
     }
     Ok(())
 }
@@ -1347,6 +1443,315 @@ pub fn materialize_file<P: AsRef<Path>, Q: AsRef<Path>>(
 mod tests {
     use super::*;
     use rayon::scope;
+
+    /// Serializes tests that mutate the process-global `RIPCLONE_ORIGIN_BASE`, so
+    /// parallel test threads don't clobber each other's origin redirection.
+    static ORIGIN_BASE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Auto-gc must be persisted off on the mirror, or a fetch could repack
+    /// packs out from under a concurrent read.
+    #[test]
+    fn disable_auto_gc_persists_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q", "--bare"])
+                .arg(repo)
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        disable_auto_gc(repo).unwrap();
+
+        let read = |key: &str| -> String {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(["config", "--get", key])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        assert_eq!(read("gc.auto"), "0");
+        assert_eq!(read("gc.autoPackLimit"), "0");
+        assert_eq!(read("maintenance.auto"), "false");
+
+        // Idempotent: a second call on an already-configured mirror is fine.
+        disable_auto_gc(repo).unwrap();
+        assert_eq!(read("gc.auto"), "0");
+    }
+
+    /// ls-remote reads the upstream tip with no object transfer, and an absent
+    /// ref returns None (not an error) so the caller falls through to a fetch.
+    #[test]
+    fn ls_remote_commit_reads_tip_without_objects() {
+        use crate::provider::{ProviderRegistry, RepoId};
+        let base = tempfile::tempdir().unwrap();
+        let repo_dir = base.path().join("acme").join("widget.git");
+        std::fs::create_dir_all(repo_dir.parent().unwrap()).unwrap();
+        let repo = crate::test_fixture::init_bare(&repo_dir);
+        let sha = crate::test_fixture::commit(&repo, &[("README.md", b"hello")]);
+
+        let registry = ProviderRegistry::new();
+        let provider = registry.default_provider();
+        let repo_id = RepoId::github("acme/widget");
+
+        // Redirect the github default origin to the local bare repo, serialized
+        // against other RIPCLONE_ORIGIN_BASE tests.
+        let _env = ORIGIN_BASE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("RIPCLONE_ORIGIN_BASE", base.path()) };
+        let head = ls_remote_commit(provider, &repo_id, "HEAD", None);
+        let missing = ls_remote_commit(provider, &repo_id, "no-such-branch", None);
+        // A glob in the ref name must not turn the query into a pattern match.
+        let globbed = ls_remote_commit(provider, &repo_id, "wid*", None);
+        unsafe { std::env::remove_var("RIPCLONE_ORIGIN_BASE") };
+
+        assert_eq!(
+            head.unwrap().as_deref(),
+            Some(sha.as_str()),
+            "HEAD tip resolved via ls-remote"
+        );
+        assert_eq!(missing.unwrap(), None, "absent ref yields None, not Err");
+        assert_eq!(
+            globbed.unwrap(),
+            None,
+            "glob ref name is rejected, not matched"
+        );
+    }
+
+    /// The real clone path persists gc.auto=0 into the mirror, so a later fetch
+    /// can't trigger an auto-repack that corrupts a concurrent lock-free read.
+    #[test]
+    fn sync_bare_mirror_clone_persists_gc_off() {
+        use crate::provider::{ProviderRegistry, RepoId};
+        let base = tempfile::tempdir().unwrap();
+        let origin = base.path().join("acme").join("widget.git");
+        std::fs::create_dir_all(origin.parent().unwrap()).unwrap();
+        let src = crate::test_fixture::init_bare(&origin);
+        crate::test_fixture::commit(&src, &[("README.md", b"hi")]);
+
+        let registry = ProviderRegistry::new();
+        let provider = registry.default_provider();
+        let repo_id = RepoId::github("acme/widget");
+        let mirror = base.path().join("mirror.git");
+
+        let _env = ORIGIN_BASE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("RIPCLONE_ORIGIN_BASE", base.path()) };
+        sync_bare_mirror(&mirror, provider, &repo_id, "HEAD", None).unwrap();
+        unsafe { std::env::remove_var("RIPCLONE_ORIGIN_BASE") };
+
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&mirror)
+            .args(["config", "--get", "gc.auto"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "0",
+            "clone path must persist gc.auto=0 into the mirror"
+        );
+    }
+
+    /// Is a read-only build safe while another build fetches and rewrites the
+    /// commit-graph/bitmap on the same mirror, with auto-gc off? One writer thread
+    /// does fetch + commit-graph + bitmap; several readers walk every object. With
+    /// gc off, the writer only appends packs and atomically replaces the
+    /// accelerators, so readers should never see a torn or missing object.
+    /// Run: `cargo test --lib concurrent_prep_and_reads_stay_safe -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn concurrent_prep_and_reads_stay_safe() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::time::{Duration, Instant};
+
+        let base = tempfile::tempdir().unwrap();
+        let origin = base.path().join("origin.git");
+        let src = crate::test_fixture::init_bare(&origin);
+        crate::test_fixture::commit(&src, &[("f0", b"0")]);
+
+        let git = |args: &[&str]| {
+            let out = Command::new("git").args(args).output().unwrap();
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            out
+        };
+
+        // A non-bare clone used to advance the origin during the run.
+        let pusher = base.path().join("pusher");
+        git(&[
+            "clone",
+            "-q",
+            origin.to_str().unwrap(),
+            pusher.to_str().unwrap(),
+        ]);
+        let p = pusher.to_str().unwrap();
+        git(&["-C", p, "config", "user.email", "t@t"]);
+        git(&["-C", p, "config", "user.name", "t"]);
+
+        // The mirror under test, cloned with gc off (the production path).
+        let mirror = base.path().join("mirror.git");
+        git(&[
+            "clone",
+            "--mirror",
+            "--config",
+            "gc.auto=0",
+            origin.to_str().unwrap(),
+            mirror.to_str().unwrap(),
+        ]);
+        let m = mirror.to_string_lossy().to_string();
+        // Keep fetched objects as packfiles (production fetches from GitHub arrive
+        // as packs), so multi-pack-index/bitmap has packs to index — a local
+        // file:// fetch would otherwise unpack to loose objects.
+        git(&["-C", &m, "config", "transfer.unpackLimit", "1"]);
+        git(&["-C", &m, "config", "fetch.unpackLimit", "1"]);
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let read_ok = Arc::new(AtomicU64::new(0));
+        let read_err = Arc::new(AtomicU64::new(0));
+        let prep_rounds = Arc::new(AtomicU64::new(0));
+
+        let prep_err = Arc::new(AtomicU64::new(0));
+        // Writer: advance origin, then run the exclusive-prep trio on the mirror.
+        let writer = {
+            let (m, p, stop, prep_rounds, prep_err) = (
+                m.clone(),
+                p.to_string(),
+                stop.clone(),
+                prep_rounds.clone(),
+                prep_err.clone(),
+            );
+            std::thread::spawn(move || {
+                let run = |args: &[&str], err: &AtomicU64| {
+                    let out = Command::new("git").args(args).output().unwrap();
+                    if !out.status.success() {
+                        err.fetch_add(1, Ordering::Relaxed);
+                        eprintln!(
+                            "PREP FAIL git {:?}: {}",
+                            args,
+                            String::from_utf8_lossy(&out.stderr)
+                        );
+                    }
+                };
+                let mut i = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    i += 1;
+                    let file = pusher_path_write(&p, i);
+                    run(&["-C", &p, "add", &file], &prep_err);
+                    run(
+                        &["-C", &p, "commit", "-q", "-m", &format!("c{i}")],
+                        &prep_err,
+                    );
+                    run(&["-C", &p, "push", "-q", "origin"], &prep_err);
+                    // Exclusive prep, serialized (as the per-repo lock would do it).
+                    run(&["-C", &m, "fetch", "-q", "origin"], &prep_err);
+                    run(
+                        &[
+                            "-C",
+                            &m,
+                            "commit-graph",
+                            "write",
+                            "--reachable",
+                            "--split",
+                            "--no-progress",
+                        ],
+                        &prep_err,
+                    );
+                    // Bitmap is best-effort in production (write_bitmap ignores
+                    // errors); still run it to stress its atomic-replace vs reads,
+                    // but don't count its content prerequisites as a prep failure.
+                    let _ = Command::new("git")
+                        .args([
+                            "-C",
+                            &m,
+                            "multi-pack-index",
+                            "write",
+                            "--bitmap",
+                            "--no-progress",
+                        ])
+                        .output();
+                    prep_rounds.fetch_add(1, Ordering::Relaxed);
+                }
+            })
+        };
+
+        // Readers: walk every object — would surface a torn/missing pack.
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let (m, stop, read_ok, read_err) =
+                    (m.clone(), stop.clone(), read_ok.clone(), read_err.clone());
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let out = Command::new("git")
+                            .args(["-C", &m, "cat-file", "--batch-check", "--batch-all-objects"])
+                            .output()
+                            .unwrap();
+                        let text = String::from_utf8_lossy(&out.stdout);
+                        if out.status.success() && !text.contains("missing") {
+                            read_ok.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            read_err.fetch_add(1, Ordering::Relaxed);
+                            eprintln!(
+                                "READ FAILURE: status={:?} stderr={}",
+                                out.status,
+                                String::from_utf8_lossy(&out.stderr)
+                            );
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(4) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        stop.store(true, Ordering::Relaxed);
+        writer.join().unwrap();
+        for r in readers {
+            r.join().unwrap();
+        }
+
+        eprintln!(
+            "spike: prep_rounds={} prep_err={} read_ok={} read_err={}",
+            prep_rounds.load(Ordering::Relaxed),
+            prep_err.load(Ordering::Relaxed),
+            read_ok.load(Ordering::Relaxed),
+            read_err.load(Ordering::Relaxed),
+        );
+        assert!(
+            prep_rounds.load(Ordering::Relaxed) > 3,
+            "writer should complete several prep rounds"
+        );
+        assert_eq!(
+            prep_err.load(Ordering::Relaxed),
+            0,
+            "an exclusive-prep op failed"
+        );
+        assert!(
+            read_ok.load(Ordering::Relaxed) > 10,
+            "readers should complete many walks"
+        );
+        assert_eq!(
+            read_err.load(Ordering::Relaxed),
+            0,
+            "a read failed concurrent with fetch+graph+bitmap — lock-shrink is NOT safe as-is"
+        );
+    }
+
+    /// Write a unique file into the pusher worktree (for the test above).
+    fn pusher_path_write(pusher: &str, i: u64) -> String {
+        let name = format!("f{i}");
+        std::fs::write(std::path::Path::new(pusher).join(&name), format!("{i}")).unwrap();
+        name
+    }
 
     #[test]
     #[ignore]

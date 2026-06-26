@@ -129,6 +129,21 @@ The `github` in the path is the provider instance (see [Providers](#providers)).
 
 ripclone validates the `RIPCLONE_TOKEN`, syncs the mirror, builds artifacts for the new `HEAD`, and returns the artifact hashes.
 
+### Native push webhook (no per-repo workflow)
+
+Instead of (or alongside) the Actions workflow, point a GitHub webhook at the server so it builds on every push with nothing added to the consumer repo. Set `RIPCLONE_WEBHOOK_SECRET` on the server, then add a repository/org webhook:
+
+- **Payload URL:** `https://ripclone.example.com/v1/webhooks/github`
+- **Content type:** `application/json`
+- **Secret:** the same value as `RIPCLONE_WEBHOOK_SECRET`
+- **Events:** Just the `push` event.
+
+The server verifies GitHub's `X-Hub-Signature-256` (HMAC-SHA256) over the raw body and triggers a build of the pushed branch immediately — so artifacts are ready before any clone. `ping` / non-push / branch-delete events are acknowledged with no build.
+
+### Polling fallback
+
+For repos without a webhook, or to catch a missed delivery, set `RIPCLONE_POLL_INTERVAL_SECS` (default `0` = off). The server periodically `ls-remote`s known repos and builds any whose tip moved. This is a backstop; webhooks/Actions are the prompt path.
+
 ## CLI usage
 
 By default the CLI talks to the managed [Ripclone Cloud](https://ripclone.com). Point it at a self-hosted server with `--server`, the `RIPCLONE_SERVER` env var, or `ripclone login`. (Resolution order: `--server` > `RIPCLONE_SERVER` > saved login config > cloud.)
