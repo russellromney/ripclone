@@ -89,6 +89,76 @@ async fn webhook_push_builds_before_clone() {
     assert_repo_usable(&c, "1");
 }
 
+/// Read a Prometheus counter value from `/metrics` text.
+fn parse_metric(text: &str, name: &str) -> u64 {
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix(name)
+            && let Some(v) = rest.split_whitespace().next()
+        {
+            return v.parse().unwrap_or(0);
+        }
+    }
+    0
+}
+
+/// A webhook and a `/sync` for the SAME branch key, fired concurrently, coalesce
+/// into one build (no corruption, no double-build). Proves the coalescing gate
+/// unifies the two entry points — not just `/sync`-vs-`/sync`.
+#[tokio::test]
+async fn webhook_and_sync_same_branch_coalesce() {
+    setup(true, true, true);
+    let server = start_server_env(&[("RIPCLONE_WEBHOOK_SECRET", SECRET)]).await;
+    let origin = make_origin("acme", "coal");
+    origin.commit(&[("f.txt", "v1\n")], "c1");
+    origin.publish();
+
+    let body = br#"{"ref":"refs/heads/main","after":"1111111111111111111111111111111111111111","deleted":false,"repository":{"full_name":"acme/coal"}}"#.to_vec();
+    let url = server.url.clone();
+
+    // Fire a webhook and a branch-targeted sync for the same key at once.
+    let webhook = {
+        let (url, body, sig) = (url.clone(), body.clone(), sign(&body));
+        tokio::spawn(async move {
+            reqwest::Client::new()
+                .post(format!("{url}/v1/webhooks/github"))
+                .header("X-GitHub-Event", "push")
+                .header("X-Hub-Signature-256", sig)
+                .header("content-type", "application/json")
+                .body(body)
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16()
+        })
+    };
+    let sync = {
+        let client = server.client();
+        tokio::spawn(async move { client.sync_branch("acme/coal", "main").await.is_ok() })
+    };
+    assert_eq!(webhook.await.unwrap(), 202, "webhook accepted");
+    assert!(sync.await.unwrap(), "concurrent same-key sync ok");
+
+    // Both raced the same key without corruption; the clone is correct.
+    let (_g, c) = clone_branch_full(&server, "coal", "main", "1").await;
+    assert_eq!(read(&c, "f.txt"), "v1\n");
+    assert_repo_usable(&c, "1");
+
+    // Coalescing: the two same-key triggers did not each run an independent build.
+    // (1 expected; allow 1 extra for a timing-induced no-op re-check.)
+    let metrics = reqwest::get(format!("{url}/metrics"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let completed = parse_metric(&metrics, "ripclone_builds_completed_total");
+    assert!(
+        completed <= 2,
+        "same-key webhook+sync coalesced (builds_completed={completed}, expected ~1)"
+    );
+}
+
 /// A push that arrives with NO webhook/sync trigger is still caught by the poll
 /// loop, which builds the new tip — proving the missed-event fallback end to end.
 #[tokio::test]

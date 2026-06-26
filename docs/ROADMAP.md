@@ -134,6 +134,13 @@ Once warm full clones are fast and predictable, move from full clonepacks per co
 
 The editable full clone now publishes as soon as history is built (the archive is built separately for files mode). On a single-commit linux re-sync that publish is ~7s, and the two biggest remaining costs on that path are the reachability-bitmap write (~2.4s) and the history build. Moving the bitmap write off the editable path — it's only needed to speed history enumeration, which is small for a delta — is the next lever for pushing depth=0-editable lower.
 
+### 10. Build-before-clone trigger follow-ups (future)
+
+The trigger surface that builds artifacts ahead of a clone is in place: a native GitHub push-webhook receiver (`/v1/webhooks/github`, HMAC-verified), the GitHub Actions trigger, and a polling fallback (`RIPCLONE_POLL_INTERVAL_SECS`). Two extensions are deferred until the product reaches that scale:
+
+- **Multi-provider webhooks.** The receiver is GitHub-only. GitLab (plaintext `X-Gitlab-Token`), Bitbucket (`X-Event-Key`, often unsigned), and Gitea (`X-Gitea-Signature`) each use different signature schemes, event headers, payload shapes, and repo-path semantics (GitLab subgroups). Add a per-kind `WebhookProvider` trait behind a `/v1/webhooks/{provider}` route, keyed off the existing provider registry, with per-provider webhook secrets (`RIPCLONE_PROVIDER_<ID>_WEBHOOK_SECRET`, mirroring per-provider tokens). Do this when onboarding a non-GitHub provider.
+- **Poll scaling: adaptive backoff + cross-replica coordination.** The poll loop currently sweeps every known repo on a fixed interval. At many repos, add per-repo poll state (last-seen tip, quiet-since) to poll active repos frequently and quiet ones rarely. Across multiple server replicas, each loop would multiply the `ls-remote` chatter (the SQL queue dedups the enqueues, not the probes); coordinate via a DB leader-lease (fits the queue's worker-lease idea in `DISPATCHER.md`), repo-set sharding, or a dedicated singleton poller. Both are farm-out-era work.
+
 ## Storage model
 
 - **Tigris Global object storage is the source of truth.** No separate CDN.

@@ -6007,6 +6007,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn webhook_tampered_body_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = test_state(&tmp);
+        state.webhook_secret = Some(secrecy::SecretString::new("whsecret".into()));
+        let app = build_app(state);
+
+        // Sign the canonical body, then send a DIFFERENT body with that signature.
+        // The HMAC must cover the exact bytes (verified before JSON parse), so a
+        // mutated body fails — guards against verifying over re-serialized JSON.
+        let sig = gh_sign("whsecret", PUSH_BODY);
+        let tampered =
+            br#"{"ref":"refs/heads/main","after":"abc1234","deleted":false,"repository":{"full_name":"evil/repo"}}"#
+                .to_vec();
+        let resp = app
+            .oneshot(webhook_request("push", &sig, tampered))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "signature must cover the exact body, not parsed content"
+        );
+    }
+
+    #[tokio::test]
     async fn webhook_unconfigured_returns_501() {
         let tmp = tempfile::tempdir().unwrap();
         let state = test_state(&tmp); // webhook_secret = None
