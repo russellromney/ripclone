@@ -14,7 +14,6 @@ use crate::provider::RepoId;
 use crate::ref_store::RefStore;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use tracing::warn;
 
 pub mod libsql;
 pub mod mysql;
@@ -52,12 +51,21 @@ pub trait MetaDb: Send + Sync {
     /// All ref rows for this repo whose `commit_id` equals `commit` (one per
     /// branch sitting at that commit). Powers commit-keyed reuse: a sync of one
     /// branch can reuse a build another branch already produced for the same
-    /// commit. The `commit_id` column already exists, so this needs no new write.
+    /// commit. Indexed on `(repo_key, commit_id)`; no new write needed.
     async fn get_by_commit(&self, repo_key: &str, commit: &str) -> Result<Vec<RefRow>>;
 
-    /// Insert or replace the row for one ref (unconditional upsert; the
-    /// save-ordering decision is made by [`SqlRefStore`]).
-    async fn upsert(
+    /// Insert-or-update the row for one ref, applying the save-ordering policy
+    /// ("a newer sync never loses to an older one") in a **single atomic
+    /// statement** — no read-then-write TOCTOU. The write lands only when there
+    /// is no existing row, the commit matches (metadata-only update), or the
+    /// new `synced_at` is newer-than-or-equal to the stored one; a NULL
+    /// `synced_at` on either side counts as "no ordering info" and the write
+    /// proceeds. This mirrors [`should_replace_ref`](crate::ref_store) but
+    /// enforced in SQL so concurrent writers across processes can't reorder.
+    ///
+    /// Pairs with the fetch-time `synced_at` stamping in `do_sync`: the stamp
+    /// makes "newer" mean "fetched later", and this enforces it atomically.
+    async fn save_ordered(
         &self,
         repo_key: &str,
         branch: &str,
@@ -144,24 +152,11 @@ impl RefStore for SqlRefStore {
         let data = serde_json::to_string(info).context("serialize RefInfo")?;
         let new_synced = info.synced_at.map(|t| t as i64);
 
-        // Same ordering policy as S3RefStore::save: never overwrite a newer sync
-        // with an older one. Same commit → always write (build_status etc. can
-        // change). Different commit + both timestamps present + existing newer →
-        // skip. Otherwise write.
-        if let Some(existing) = self.db.get(&repo_key, branch).await?
-            && existing.commit_id != info.commit
-            && let (Some(e), Some(n)) = (existing.synced_at, new_synced)
-            && e > n
-        {
-            warn!(
-                "metadata for {repo_key}@{branch} already has newer sync at {e}; \
-                 skipping older {n}"
-            );
-            return Ok(());
-        }
-
+        // Ordering ("a newer sync never loses to an older one") is enforced
+        // atomically inside the single conditional upsert — no get-then-write
+        // TOCTOU, so concurrent writers can't reorder. See `MetaDb::save_ordered`.
         self.db
-            .upsert(&repo_key, branch, &data, &info.commit, new_synced)
+            .save_ordered(&repo_key, branch, &data, &info.commit, new_synced)
             .await
     }
 

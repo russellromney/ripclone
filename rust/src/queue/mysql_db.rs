@@ -54,6 +54,7 @@ impl QueueDb for MysqlDb {
                 finished_at BIGINT,
                 error TEXT,
                 credential TEXT,
+                attempts BIGINT NOT NULL DEFAULT 0,
                 INDEX idx_jobs_status_created (status, created_at),
                 INDEX idx_jobs_provider_path_finished (provider, path, finished_at)
             )",
@@ -65,6 +66,10 @@ impl QueueDb for MysqlDb {
         // ADD COLUMN IF NOT EXISTS, so this is best-effort: it errors with a
         // duplicate-column code on an up-to-date table, which we ignore.
         let _ = sqlx::raw_sql("ALTER TABLE jobs ADD COLUMN credential TEXT")
+            .execute(&self.pool)
+            .await;
+        // Same best-effort migration for the attempts column (dead-letter bound).
+        let _ = sqlx::raw_sql("ALTER TABLE jobs ADD COLUMN attempts BIGINT NOT NULL DEFAULT 0")
             .execute(&self.pool)
             .await;
         Ok(())
@@ -105,12 +110,32 @@ impl QueueDb for MysqlDb {
         Ok(res.last_insert_id() as i64)
     }
 
-    async fn reclaim_stale(&self, cutoff: i64) -> Result<()> {
+    async fn reclaim_stale(
+        &self,
+        cutoff: i64,
+        max_attempts: i64,
+        now: i64,
+        dead_letter_error: &str,
+    ) -> Result<()> {
+        // Dead-letter stale claims over the attempt cap; requeue the rest.
+        sqlx::query(
+            "UPDATE jobs SET status = 'failed', finished_at = ?, error = ?,
+                 worker_id = NULL, credential = NULL
+             WHERE status = 'claimed' AND claimed_at <= ? AND attempts >= ?",
+        )
+        .bind(now)
+        .bind(dead_letter_error)
+        .bind(cutoff)
+        .bind(max_attempts)
+        .execute(&self.pool)
+        .await
+        .context("dead-letter stale jobs")?;
         sqlx::query(
             "UPDATE jobs SET status = 'queued', worker_id = NULL
-             WHERE status = 'claimed' AND claimed_at <= ?",
+             WHERE status = 'claimed' AND claimed_at <= ? AND attempts < ?",
         )
         .bind(cutoff)
+        .bind(max_attempts)
         .execute(&self.pool)
         .await
         .context("reclaim stale jobs")?;
@@ -128,7 +153,8 @@ impl QueueDb for MysqlDb {
 
     async fn try_claim(&self, id: i64, worker_id: &str, now: i64) -> Result<bool> {
         let res = sqlx::query(
-            "UPDATE jobs SET status = 'claimed', worker_id = ?, claimed_at = ?
+            "UPDATE jobs SET status = 'claimed', worker_id = ?, claimed_at = ?,
+                 attempts = attempts + 1
              WHERE id = ? AND status = 'queued'",
         )
         .bind(worker_id)
@@ -163,22 +189,26 @@ impl QueueDb for MysqlDb {
     async fn finish(
         &self,
         id: i64,
+        worker_id: &str,
         status: &str,
         finished_at: i64,
         error: Option<&str>,
-    ) -> Result<()> {
-        // Clear the per-job credential on finish (not retained in done-job history).
-        sqlx::query(
-            "UPDATE jobs SET status = ?, finished_at = ?, error = ?, credential = NULL WHERE id = ?",
+    ) -> Result<bool> {
+        // Conditional on still owning the claim (no double-settle after a
+        // reclaim). Clearing the credential keeps a token out of done-job history.
+        let res = sqlx::query(
+            "UPDATE jobs SET status = ?, finished_at = ?, error = ?, credential = NULL
+             WHERE id = ? AND worker_id = ? AND status = 'claimed'",
         )
         .bind(status)
         .bind(finished_at)
         .bind(error)
         .bind(id)
-            .execute(&self.pool)
-            .await
-            .context("finish job")?;
-        Ok(())
+        .bind(worker_id)
+        .execute(&self.pool)
+        .await
+        .context("finish job")?;
+        Ok(res.rows_affected() == 1)
     }
 
     async fn status(&self, id: i64) -> Result<Option<(String, Option<String>)>> {

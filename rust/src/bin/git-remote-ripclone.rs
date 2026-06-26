@@ -76,11 +76,23 @@ async fn main() -> Result<()> {
                         stdout.write_all(b"ok\n").await?;
                     }
                     "depth" => {
-                        if let Ok(d) = value.parse::<usize>() {
-                            requested_depth = Some(d);
-                            stdout.write_all(b"ok\n").await?;
-                        } else {
-                            stdout.write_all(b"unsupported\n").await?;
+                        match value.parse::<usize>() {
+                            // depth=1 maps to the shallow clonepack.
+                            Ok(1) => {
+                                requested_depth = Some(1);
+                                stdout.write_all(b"ok\n").await?;
+                            }
+                            // Arbitrary depth-N shallow isn't implemented. Tell git
+                            // we can't honor it (and bail at connect) rather than
+                            // silently serving full history with no `.git/shallow`
+                            // — which git would treat as a complete clone (P1).
+                            Ok(d) => {
+                                requested_depth = Some(d);
+                                stdout.write_all(b"unsupported\n").await?;
+                            }
+                            Err(_) => {
+                                stdout.write_all(b"unsupported\n").await?;
+                            }
                         }
                     }
                     "dry-run" => {
@@ -93,6 +105,17 @@ async fn main() -> Result<()> {
                 stdout.flush().await?;
             }
             "connect git-upload-pack" => {
+                // Reject an unsupported depth explicitly instead of quietly
+                // serving full history (which git would record as a complete,
+                // non-shallow clone). depth=1 and full clones are supported.
+                if let Some(d) = requested_depth
+                    && d > 1
+                {
+                    anyhow::bail!(
+                        "ripclone supports --depth 1 (shallow) or a full clone, not --depth {d}; \
+                         re-run with --depth 1 or without --depth"
+                    );
+                }
                 let branch = if requested_branch.is_empty() {
                     "HEAD"
                 } else {

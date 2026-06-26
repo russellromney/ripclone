@@ -96,7 +96,7 @@ impl MetaDb for LibsqlMeta {
         Ok(out)
     }
 
-    async fn upsert(
+    async fn save_ordered(
         &self,
         repo_key: &str,
         branch: &str,
@@ -104,6 +104,8 @@ impl MetaDb for LibsqlMeta {
         commit_id: &str,
         synced_at: Option<i64>,
     ) -> Result<()> {
+        // DO UPDATE ... WHERE makes the ordering check atomic with the write;
+        // a losing write is a silent no-op. Same policy as the sqlite adapter.
         self.conn()
             .await?
             .execute(
@@ -112,11 +114,15 @@ impl MetaDb for LibsqlMeta {
                  ON CONFLICT (repo_key, branch) DO UPDATE SET
                      commit_id = excluded.commit_id,
                      synced_at = excluded.synced_at,
-                     data = excluded.data",
+                     data = excluded.data
+                 WHERE excluded.commit_id = refs.commit_id
+                    OR refs.synced_at IS NULL
+                    OR excluded.synced_at IS NULL
+                    OR excluded.synced_at >= refs.synced_at",
                 libsql::params![repo_key, branch, commit_id, synced_at, data],
             )
             .await
-            .context("upsert ref")?;
+            .context("save_ordered ref")?;
         Ok(())
     }
 

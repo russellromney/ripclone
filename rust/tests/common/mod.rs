@@ -41,6 +41,11 @@ pub fn init(lsm: bool) {
                 "RIPCLONE_ORIGIN_BASE",
                 format!("file://{}", origin_root().display()),
             );
+            // Per-repo access enforcement (AU1) probes the provider over HTTP,
+            // which can't reach these file:// test origins. These are
+            // single-tenant local e2e tests, so use the documented trust-mode
+            // escape hatch (the shared token is the only auth here).
+            std::env::set_var("RIPCLONE_TRUST_GATEWAY", "1");
             // Two-phase + async are on by default in production; legacy tests
             // here expect synchronous single-phase builds (depth=0 ready as soon
             // as sync returns). Pin them off unless a test opted in via
@@ -481,6 +486,9 @@ pub fn setup(two_phase: bool, lsm: bool, async_build: bool) {
             "RIPCLONE_ORIGIN_BASE",
             format!("file://{}", origin_root().display()),
         );
+        // Single-tenant local e2e: AU1 access enforcement can't probe file://
+        // origins over HTTP, so use the documented trust-mode escape hatch.
+        std::env::set_var("RIPCLONE_TRUST_GATEWAY", "1");
         std::env::set_var("RIPCLONE_TWO_PHASE", if two_phase { "1" } else { "0" });
         std::env::set_var("RIPCLONE_LSM", if lsm { "1" } else { "0" });
         std::env::set_var("RIPCLONE_ASYNC_BUILD", if async_build { "1" } else { "0" });

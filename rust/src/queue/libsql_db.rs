@@ -4,8 +4,8 @@
 //! it doesn't bundle SQLite's C core and collide with sqlx.)
 
 use super::sql::{
-    ADD_CREDENTIAL_COLUMN_SQL, CREATE_ACTIVE_KEY_INDEX_SQL, CREATE_HISTORY_INDEX_SQL,
-    CREATE_STATUS_INDEX_SQL, CREATE_TABLE_SQL, QueueDb,
+    ADD_ATTEMPTS_COLUMN_SQL, ADD_CREDENTIAL_COLUMN_SQL, CREATE_ACTIVE_KEY_INDEX_SQL,
+    CREATE_HISTORY_INDEX_SQL, CREATE_STATUS_INDEX_SQL, CREATE_TABLE_SQL, QueueDb,
 };
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -46,6 +46,8 @@ impl QueueDb for LibsqlDb {
         // Migrate a legacy table to add the credential column (best-effort: errors
         // "duplicate column" on a fresh table, which is fine).
         let _ = conn.execute(ADD_CREDENTIAL_COLUMN_SQL, ()).await;
+        // Same best-effort migration for the attempts column (dead-letter bound).
+        let _ = conn.execute(ADD_ATTEMPTS_COLUMN_SQL, ()).await;
         conn.execute(CREATE_STATUS_INDEX_SQL, ())
             .await
             .context("create status index")?;
@@ -99,12 +101,27 @@ impl QueueDb for LibsqlDb {
         Ok(conn.last_insert_rowid())
     }
 
-    async fn reclaim_stale(&self, cutoff: i64) -> Result<()> {
+    async fn reclaim_stale(
+        &self,
+        cutoff: i64,
+        max_attempts: i64,
+        now: i64,
+        dead_letter_error: &str,
+    ) -> Result<()> {
         let conn = self.conn().await?;
+        // Dead-letter stale claims over the attempt cap; requeue the rest.
+        conn.execute(
+            "UPDATE jobs SET status = 'failed', finished_at = ?, error = ?,
+                 worker_id = NULL, credential = NULL
+             WHERE status = 'claimed' AND claimed_at <= ? AND attempts >= ?",
+            libsql::params![now, dead_letter_error, cutoff, max_attempts],
+        )
+        .await
+        .context("dead-letter stale jobs")?;
         conn.execute(
             "UPDATE jobs SET status = 'queued', worker_id = NULL
-             WHERE status = 'claimed' AND claimed_at <= ?",
-            [cutoff],
+             WHERE status = 'claimed' AND claimed_at <= ? AND attempts < ?",
+            libsql::params![cutoff, max_attempts],
         )
         .await
         .context("reclaim stale jobs")?;
@@ -130,7 +147,8 @@ impl QueueDb for LibsqlDb {
         let conn = self.conn().await?;
         let n = conn
             .execute(
-                "UPDATE jobs SET status = 'claimed', worker_id = ?, claimed_at = ?
+                "UPDATE jobs SET status = 'claimed', worker_id = ?, claimed_at = ?,
+                     attempts = attempts + 1
                  WHERE id = ? AND status = 'queued'",
                 libsql::params![worker_id, now, id],
             )
@@ -165,19 +183,23 @@ impl QueueDb for LibsqlDb {
     async fn finish(
         &self,
         id: i64,
+        worker_id: &str,
         status: &str,
         finished_at: i64,
         error: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let conn = self.conn().await?;
-        // Clear the per-job credential on finish (not retained in done-job history).
-        conn.execute(
-            "UPDATE jobs SET status = ?, finished_at = ?, error = ?, credential = NULL WHERE id = ?",
-            libsql::params![status, finished_at, error, id],
-        )
-        .await
-        .context("finish job")?;
-        Ok(())
+        // Conditional on still owning the claim (no double-settle after a
+        // reclaim). Clearing the credential keeps a token out of done-job history.
+        let n = conn
+            .execute(
+                "UPDATE jobs SET status = ?, finished_at = ?, error = ?, credential = NULL
+                 WHERE id = ? AND worker_id = ? AND status = 'claimed'",
+                libsql::params![status, finished_at, error, id, worker_id],
+            )
+            .await
+            .context("finish job")?;
+        Ok(n == 1)
     }
 
     async fn status(&self, id: i64) -> Result<Option<(String, Option<String>)>> {

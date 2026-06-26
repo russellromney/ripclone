@@ -236,7 +236,7 @@ async fn fetch_artifact_with_retry(
     client: &reqwest::Client,
     url: &str,
     hash: &str,
-) -> Result<Vec<u8>> {
+) -> Result<bytes::Bytes> {
     let (max_attempts, base_backoff_ms) = fetch_retry_config();
     let mut attempt = 0u32;
     loop {
@@ -264,7 +264,7 @@ async fn fetch_artifact_once(
     client: &reqwest::Client,
     fetch_url: &str,
     hash: &str,
-) -> std::result::Result<Vec<u8>, (bool, anyhow::Error)> {
+) -> std::result::Result<bytes::Bytes, (bool, anyhow::Error)> {
     let resp = match client.get(fetch_url).send().await {
         Ok(r) => r,
         // Transport errors (connect/reset/timeout) are transient.
@@ -280,8 +280,11 @@ async fn fetch_artifact_once(
             anyhow::anyhow!("artifact fetch failed: {status}"),
         ));
     }
+    // R1: keep the body as `Bytes` (a refcounted buffer) instead of copying it
+    // into a fresh Vec — it flows through the cache and on to the consumer
+    // (decompress/write, which read `&[u8]`) without a second per-artifact copy.
     let data = match resp.bytes().await {
-        Ok(b) => b.to_vec(),
+        Ok(b) => b,
         // A body read can fail mid-stream; retry.
         Err(e) => return Err((true, anyhow::anyhow!("artifact body read error: {e}"))),
     };
@@ -519,7 +522,7 @@ impl Client {
         anyhow::bail!("ref lookup did not complete")
     }
 
-    pub async fn fetch_pack(&self, hash: &str) -> Result<Vec<u8>> {
+    pub async fn fetch_pack(&self, hash: &str) -> Result<bytes::Bytes> {
         self.fetch_artifact(hash).await
     }
 
@@ -536,7 +539,7 @@ impl Client {
     ///
     /// Caches the bytes locally when `RIPCLONE_CACHE_DIR` is set, so repeat
     /// clones of the same repo/commit bypass the network entirely.
-    pub async fn fetch_artifact(&self, hash: &str) -> Result<Vec<u8>> {
+    pub async fn fetch_artifact(&self, hash: &str) -> Result<bytes::Bytes> {
         self.fetch_artifact_with_url(hash, None).await
     }
 
@@ -546,7 +549,7 @@ impl Client {
         &self,
         hash: &str,
         signed_url: Option<&str>,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<bytes::Bytes> {
         let gateway_url = format!("{}/v1/artifacts/{}", self.server, hash);
         let fetch_url = signed_url.unwrap_or(&gateway_url);
         let use_signed_url = signed_url.is_some();
@@ -555,7 +558,7 @@ impl Client {
             && let Some(key) = self.cache_key_from_artifact_url(&gateway_url)
             && let Ok(data) = cache.get(&key)
         {
-            return Ok(data);
+            return Ok(data.into());
         }
 
         // Presigned URLs are self-authenticating, so use the no-auth client to
@@ -591,7 +594,7 @@ impl Client {
         &self,
         chunk: &crate::clonepack::ChunkRef,
         signed_url: Option<&str>,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<bytes::Bytes> {
         let hash = hash_to_hex(&chunk.hash);
         let data = self.fetch_artifact_with_url(&hash, signed_url).await?;
         if data.len() as u64 != chunk.len {
@@ -614,7 +617,7 @@ impl Client {
         &self,
         chunks: &[crate::clonepack::ChunkRef],
         signed_urls: Option<&[Option<String>]>,
-    ) -> Result<Vec<Vec<u8>>> {
+    ) -> Result<Vec<bytes::Bytes>> {
         use futures::TryStreamExt;
         use futures::stream::{self, StreamExt};
         if chunks.is_empty() {
@@ -636,7 +639,7 @@ impl Client {
                 (i, chunk, signed_url)
             })
             .collect();
-        let mut results: Vec<(usize, Vec<u8>)> = stream::iter(jobs)
+        let mut results: Vec<(usize, bytes::Bytes)> = stream::iter(jobs)
             .map(|(i, chunk, signed_url)| async move {
                 let data = self.fetch_chunk_ref(&chunk, signed_url.as_deref()).await?;
                 Ok::<_, anyhow::Error>((i, data))
@@ -663,7 +666,7 @@ impl Client {
                 info.clonepack_manifest_url.as_deref(),
             )
             .await?;
-        let clonepack = ClonepackManifest::decode(manifest_data.as_slice())
+        let clonepack = ClonepackManifest::decode(manifest_data.as_ref())
             .context("decode clonepack manifest")?;
         let metadata_ref = clonepack
             .metadata_chunk
@@ -674,7 +677,7 @@ impl Client {
             .fetch_artifact_with_url(&metadata_hash, info.metadata_chunk_url.as_deref())
             .await?;
         let metadata =
-            MetadataChunk::decode(metadata_data.as_slice()).context("decode metadata chunk")?;
+            MetadataChunk::decode(metadata_data.as_ref()).context("decode metadata chunk")?;
         Ok((clonepack, Arc::new(metadata)))
     }
 
@@ -695,7 +698,7 @@ impl Client {
         Ok(resp.json().await?)
     }
 
-    pub async fn fetch_snapshot(&self, hash: &str) -> Result<Vec<u8>> {
+    pub async fn fetch_snapshot(&self, hash: &str) -> Result<bytes::Bytes> {
         self.fetch_artifact(hash).await
     }
 
@@ -1289,7 +1292,7 @@ impl Client {
         // pack's idx out of it locally — instead of one GET per pack idx (cuts
         // per-pack round-trips from 2 to 1). Falls back to per-pack idx fetches
         // for older manifests without a bundle.
-        let idx_bundle: Option<Arc<Vec<u8>>> = match manifest.idx_bundle.as_ref() {
+        let idx_bundle: Option<Arc<bytes::Bytes>> = match manifest.idx_bundle.as_ref() {
             Some(b) => Some(Arc::new(
                 self.fetch_chunk_ref(b, info.idx_bundle_url.as_deref())
                     .await
@@ -1323,10 +1326,11 @@ impl Client {
                     let end = off
                         .checked_add(idx_ref.len as usize)
                         .context("idx bundle offset overflow")?;
-                    let slice = bundle
-                        .get(off..end)
-                        .with_context(|| format!("idx {} slice out of bundle range", i))?
-                        .to_vec();
+                    // Zero-copy view into the shared bundle (refcounted Bytes).
+                    if bundle.get(off..end).is_none() {
+                        anyhow::bail!("idx {} slice out of bundle range", i);
+                    }
+                    let slice = bundle.slice(off..end);
                     let want = hash_to_hex(&idx_ref.hash);
                     let got = crate::cas::hash(&slice);
                     if got != want {
@@ -1346,7 +1350,7 @@ impl Client {
                     )
                     .with_context(|| format!("fetch pack {}", i))?
                 };
-                Ok::<(usize, bool, Vec<u8>, Vec<u8>), anyhow::Error>((
+                Ok::<(usize, bool, bytes::Bytes, bytes::Bytes), anyhow::Error>((
                     i,
                     history_only,
                     pack_bytes,
@@ -1623,7 +1627,7 @@ impl Client {
                 .await
                 .context("fetch clonepack manifest")?;
             let mut manifest =
-                ClonepackManifest::decode(data.as_slice()).context("decode clonepack manifest")?;
+                ClonepackManifest::decode(data.as_ref()).context("decode clonepack manifest")?;
             // Backwards compatibility: older manifests store the head-blobs pack as
             // a single `head_blobs_pack` field. Treat it as one chunk so the
             // pipeline can use it without special cases.
@@ -1651,8 +1655,7 @@ impl Client {
                 .fetch_artifact_with_url(&hash, signed_url.as_deref())
                 .await
                 .with_context(|| format!("fetch metadata chunk {hash}"))?;
-            let metadata =
-                MetadataChunk::decode(data.as_slice()).context("decode metadata chunk")?;
+            let metadata = MetadataChunk::decode(data.as_ref()).context("decode metadata chunk")?;
             Ok(metadata)
         })
     }
@@ -1704,7 +1707,11 @@ impl Client {
                         .await
                         .with_context(|| format!("fetch archive chunk {}", index))?;
                     let len = bytes.len() as u64;
-                    tx.send((index, Ok(bytes)))
+                    // The archive streaming channel still carries Vec<u8>; this is
+                    // the same single copy the old code made at the fetch boundary
+                    // (no regression). Carrying Bytes through the archive pipeline
+                    // is the separate R4 change, deferred.
+                    tx.send((index, Ok(bytes.to_vec())))
                         .map_err(|_| anyhow::anyhow!("archive chunk {} receiver dropped", index))?;
                     Ok::<u64, anyhow::Error>(len)
                 });
@@ -2064,7 +2071,7 @@ impl Client {
             anyhow::bail!("clonepack has no packs for git-dir install");
         }
 
-        let idx_bundle: Option<Arc<Vec<u8>>> = match manifest.idx_bundle.as_ref() {
+        let idx_bundle: Option<Arc<bytes::Bytes>> = match manifest.idx_bundle.as_ref() {
             Some(b) => Some(Arc::new(
                 self.fetch_chunk_ref(b, info.idx_bundle_url.as_deref())
                     .await
@@ -2095,10 +2102,11 @@ impl Client {
                     let end = off
                         .checked_add(idx_ref.len as usize)
                         .context("idx bundle offset overflow")?;
-                    let slice = bundle
-                        .get(off..end)
-                        .with_context(|| format!("idx {} slice out of bundle range", i))?
-                        .to_vec();
+                    // Zero-copy view into the shared bundle (refcounted Bytes).
+                    if bundle.get(off..end).is_none() {
+                        anyhow::bail!("idx {} slice out of bundle range", i);
+                    }
+                    let slice = bundle.slice(off..end);
                     let want = hash_to_hex(&idx_ref.hash);
                     let got = crate::cas::hash(&slice);
                     if got != want {
@@ -2118,7 +2126,7 @@ impl Client {
                     )
                     .with_context(|| format!("fetch pack {}", i))?
                 };
-                Ok::<(Vec<u8>, Vec<u8>), anyhow::Error>((pack_bytes, idx_bytes))
+                Ok::<(bytes::Bytes, bytes::Bytes), anyhow::Error>((pack_bytes, idx_bytes))
             }
         });
 

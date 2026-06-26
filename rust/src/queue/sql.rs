@@ -38,6 +38,12 @@ const DEFAULT_STALE_CLAIM_SECS: i64 = 1800;
 /// caller polls again). Prevents an unbounded spin if many workers collide.
 const MAX_CLAIM_ATTEMPTS: usize = 64;
 
+/// Default cap on how many times a job may be claimed before it is dead-lettered
+/// to terminal `failed` instead of being requeued. A SIGKILL/OOM crash leaves
+/// the row `claimed` with no ack; the stale-reclaim would otherwise requeue it
+/// forever (a crash-loop). Override with `RIPCLONE_QUEUE_MAX_ATTEMPTS`.
+const DEFAULT_MAX_BUILD_ATTEMPTS: i64 = 5;
+
 pub(crate) fn now_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -115,14 +121,24 @@ pub trait QueueDb: Send + Sync {
         created_at: i64,
     ) -> Result<i64>;
 
-    /// Return any `claimed` job whose `claimed_at <= cutoff` to the queue.
-    async fn reclaim_stale(&self, cutoff: i64) -> Result<()>;
+    /// Resolve `claimed` jobs whose `claimed_at <= cutoff` (a crashed or
+    /// timed-out worker). A job that has already been claimed `max_attempts` or
+    /// more times is dead-lettered to terminal `failed` (with `dead_letter_error`
+    /// and `now` as its finished time) so a hard-killed build can't crash-loop;
+    /// anything under the cap is returned to `queued` for another attempt.
+    async fn reclaim_stale(
+        &self,
+        cutoff: i64,
+        max_attempts: i64,
+        now: i64,
+        dead_letter_error: &str,
+    ) -> Result<()>;
 
     /// Id of the oldest queued job, if any.
     async fn next_queued_id(&self) -> Result<Option<i64>>;
 
-    /// Atomically claim `id` if it is still `queued`. Returns true iff this call
-    /// won the row.
+    /// Atomically claim `id` if it is still `queued`, incrementing its
+    /// `attempts` counter. Returns true iff this call won the row.
     async fn try_claim(&self, id: i64, worker_id: &str, now: i64) -> Result<bool>;
 
     /// `(provider, path, branch, credential)` for a job id. `credential` is the
@@ -130,14 +146,20 @@ pub trait QueueDb: Send + Sync {
     async fn job_fields(&self, id: i64)
     -> Result<Option<(String, String, String, Option<String>)>>;
 
-    /// Mark a job finished: `status` is `done` or `failed`, with optional error.
+    /// Settle a claimed job: `status` is `done` or `failed`, with optional
+    /// error. Conditional on the caller still owning the claim — the UPDATE
+    /// matches only `id = ? AND worker_id = ? AND status = 'claimed'`. Returns
+    /// true iff a row was settled; false means the claim was reclaimed and
+    /// re-owned (or dead-lettered) while this worker was building, so its result
+    /// must be discarded — the row belongs to whoever holds the claim now.
     async fn finish(
         &self,
         id: i64,
+        worker_id: &str,
         status: &str,
         finished_at: i64,
         error: Option<&str>,
-    ) -> Result<()>;
+    ) -> Result<bool>;
 
     /// `(status, error)` for a job id.
     async fn status(&self, id: i64) -> Result<Option<(String, Option<String>)>>;
@@ -160,6 +182,7 @@ pub struct SqlJobQueue {
     db: Box<dyn QueueDb>,
     stale_claim_secs: i64,
     failed_retention_secs: i64,
+    max_build_attempts: i64,
 }
 
 impl SqlJobQueue {
@@ -174,10 +197,16 @@ impl SqlJobQueue {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(DEFAULT_FAILED_RETENTION_SECS);
+        let max_build_attempts = std::env::var("RIPCLONE_QUEUE_MAX_ATTEMPTS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(DEFAULT_MAX_BUILD_ATTEMPTS);
         Ok(Self {
             db,
             stale_claim_secs,
             failed_retention_secs,
+            max_build_attempts,
         })
     }
 
@@ -193,8 +222,17 @@ impl SqlJobQueue {
     /// first. Returns `None` when the queue is empty (or contention exhausted
     /// the retry budget — the caller polls again).
     pub async fn claim(&self, worker_id: &str) -> Result<Option<ClaimedJob>> {
+        let now = now_secs();
         self.db
-            .reclaim_stale(now_secs() - self.stale_claim_secs)
+            .reclaim_stale(
+                now - self.stale_claim_secs,
+                self.max_build_attempts,
+                now,
+                &format!(
+                    "dead-lettered after {} build attempts (worker crashed or timed out)",
+                    self.max_build_attempts
+                ),
+            )
             .await?;
         for attempt in 0..MAX_CLAIM_ATTEMPTS {
             let Some(id) = self.db.next_queued_id().await? else {
@@ -222,14 +260,18 @@ impl SqlJobQueue {
         Ok(None)
     }
 
-    /// Mark a claimed job finished. `Ok` → `done`; `Err(msg)` → `failed`.
-    pub async fn ack(&self, id: i64, result: Result<(), String>) -> Result<()> {
+    /// Settle a claimed job. `Ok` → `done`; `Err(msg)` → `failed`. Conditional
+    /// on `worker_id` still owning the claim; returns `Ok(true)` if it settled,
+    /// `Ok(false)` if the claim had been reclaimed/dead-lettered out from under
+    /// this worker (its result is stale and must be discarded — see
+    /// [`QueueDb::finish`]).
+    pub async fn ack(&self, id: i64, worker_id: &str, result: Result<(), String>) -> Result<bool> {
         let (status, error) = match result {
             Ok(()) => ("done", None),
             Err(e) => ("failed", Some(e)),
         };
         self.db
-            .finish(id, status, now_secs(), error.as_deref())
+            .finish(id, worker_id, status, now_secs(), error.as_deref())
             .await
     }
 }
@@ -314,7 +356,8 @@ pub(crate) const CREATE_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS jobs (
     claimed_at INTEGER,
     finished_at INTEGER,
     error TEXT,
-    credential TEXT
+    credential TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0
 )";
 
 pub(crate) const CREATE_STATUS_INDEX_SQL: &str =
@@ -335,6 +378,12 @@ pub(crate) const CREATE_HISTORY_INDEX_SQL: &str = "CREATE INDEX IF NOT EXISTS id
 /// fresh table, which is ignored). SQLite/libsql have no `ADD COLUMN IF NOT
 /// EXISTS`, hence best-effort; Postgres uses its own `IF NOT EXISTS` form.
 pub(crate) const ADD_CREDENTIAL_COLUMN_SQL: &str = "ALTER TABLE jobs ADD COLUMN credential TEXT";
+
+/// Migration for a `jobs` table created before the `attempts` column existed.
+/// Best-effort like [`ADD_CREDENTIAL_COLUMN_SQL`]: errors "duplicate column" on
+/// a fresh/up-to-date table, which is ignored.
+pub(crate) const ADD_ATTEMPTS_COLUMN_SQL: &str =
+    "ALTER TABLE jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0";
 
 #[cfg(test)]
 mod tests {
@@ -401,7 +450,10 @@ mod tests {
             assert_eq!(q.depth().await, 0, "{engine}: claimed no longer queued");
             assert!(q.claim("w1").await.unwrap().is_none(), "{engine}");
 
-            q.ack(claimed.id, Ok(())).await.unwrap();
+            assert!(
+                q.ack(claimed.id, "w1", Ok(())).await.unwrap(),
+                "{engine}: the owning worker settles its own claim"
+            );
             assert!(
                 matches!(q.job_status(claimed.id).await.unwrap(), JobState::Done),
                 "{engine}"
@@ -448,7 +500,9 @@ mod tests {
             .unwrap();
         let (_, _, _, before) = db.job_fields(id).await.unwrap().unwrap();
         assert_eq!(before.as_deref(), Some("dG9rZW4="));
-        db.finish(id, "done", 2, None).await.unwrap();
+        // finish is conditional on owning the claim: claim it as "w" first.
+        assert!(db.try_claim(id, "w", 2).await.unwrap());
+        assert!(db.finish(id, "w", "done", 3, None).await.unwrap());
         let (_, _, _, after) = db.job_fields(id).await.unwrap().unwrap();
         assert!(after.is_none(), "credential must be cleared on finish");
     }
@@ -489,7 +543,9 @@ mod tests {
         for (engine, q, _dir) in queues().await {
             let enq = q.enqueue(job("o", "r", "main")).await.unwrap();
             let claimed = q.claim("w").await.unwrap().unwrap();
-            q.ack(claimed.id, Err("boom".to_string())).await.unwrap();
+            q.ack(claimed.id, "w", Err("boom".to_string()))
+                .await
+                .unwrap();
             match q.job_status(enq.job_id.unwrap()).await.unwrap() {
                 JobState::Failed(e) => assert_eq!(e, "boom", "{engine}"),
                 other => panic!("{engine}: expected Failed, got {other:?}"),
@@ -532,7 +588,7 @@ mod tests {
         for (engine, q, _dir) in queues().await {
             let first = q.enqueue(job("o", "r", "main")).await.unwrap();
             let claimed = q.claim("w").await.unwrap().unwrap();
-            q.ack(claimed.id, Ok(())).await.unwrap();
+            q.ack(claimed.id, "w", Ok(())).await.unwrap();
             let second = q.enqueue(job("o", "r", "main")).await.unwrap();
             assert_eq!(second.outcome, EnqueueOutcome::Enqueued, "{engine}");
             assert_ne!(first.job_id, second.job_id, "{engine}");
@@ -551,6 +607,7 @@ mod tests {
                 db,
                 stale_claim_secs: 0,
                 failed_retention_secs: DEFAULT_FAILED_RETENTION_SECS,
+                max_build_attempts: DEFAULT_MAX_BUILD_ATTEMPTS,
             };
             q.enqueue(job("o", "r", "main")).await.unwrap();
             let first = q.claim("w1").await.unwrap().unwrap();
@@ -571,6 +628,7 @@ mod tests {
                 db,
                 stale_claim_secs: 3600,
                 failed_retention_secs: DEFAULT_FAILED_RETENTION_SECS,
+                max_build_attempts: DEFAULT_MAX_BUILD_ATTEMPTS,
             };
             q.enqueue(job("o", "r", "main")).await.unwrap();
             let _first = q.claim("w1").await.unwrap().unwrap();
@@ -578,6 +636,98 @@ mod tests {
                 q.claim("w2").await.unwrap().is_none(),
                 "{engine}: a fresh claim must not be reclaimed within the window"
             );
+        }
+    }
+
+    /// A2: after a time-based reclaim re-owns a job, the original (slow but
+    /// alive) worker's late ack must be rejected — not double-settle the row.
+    #[tokio::test]
+    async fn late_ack_from_reclaimed_worker_is_rejected() {
+        for engine in ["sqlite"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("q.db").to_string_lossy().to_string();
+            let db = make_db(engine, &path).await;
+            db.init().await.unwrap();
+            // Zero tolerance: the first claim is immediately reclaimable.
+            let q = SqlJobQueue {
+                db,
+                stale_claim_secs: 0,
+                failed_retention_secs: DEFAULT_FAILED_RETENTION_SECS,
+                max_build_attempts: DEFAULT_MAX_BUILD_ATTEMPTS,
+            };
+            q.enqueue(job("o", "r", "main")).await.unwrap();
+            let slow = q.claim("w1").await.unwrap().unwrap();
+            // w2 reclaims the stale claim and now owns the row.
+            let owner = q.claim("w2").await.unwrap().unwrap();
+            assert_eq!(slow.id, owner.id, "{engine}");
+
+            // The slow worker finally finishes and acks — must be rejected.
+            assert!(
+                !q.ack(slow.id, "w1", Ok(())).await.unwrap(),
+                "{engine}: a reclaimed worker's late ack must not settle the job"
+            );
+            assert!(
+                matches!(q.job_status(slow.id).await.unwrap(), JobState::Pending),
+                "{engine}: the job is still owned by the new worker, not done"
+            );
+
+            // The current owner's ack settles it.
+            assert!(
+                q.ack(owner.id, "w2", Ok(())).await.unwrap(),
+                "{engine}: the owning worker settles the job"
+            );
+            assert!(matches!(
+                q.job_status(owner.id).await.unwrap(),
+                JobState::Done
+            ));
+        }
+    }
+
+    /// A1: a build that is hard-killed (SIGKILL/OOM) never acks, so its claim
+    /// goes stale and is reclaimed; after `max_build_attempts` it must reach a
+    /// terminal `failed` (dead-letter) instead of crash-looping forever.
+    #[tokio::test]
+    async fn hard_killed_build_dead_letters_after_max_attempts() {
+        for engine in ["sqlite"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("q.db").to_string_lossy().to_string();
+            let db = make_db(engine, &path).await;
+            db.init().await.unwrap();
+            let max = 3;
+            // Zero tolerance so each claim's predecessor is immediately stale.
+            let q = SqlJobQueue {
+                db,
+                stale_claim_secs: 0,
+                failed_retention_secs: DEFAULT_FAILED_RETENTION_SECS,
+                max_build_attempts: max,
+            };
+            let enq = q.enqueue(job("o", "r", "main")).await.unwrap();
+            let id = enq.job_id.unwrap();
+
+            // Each claim simulates a worker that gets SIGKILLed mid-build: it
+            // never acks. The next claim reclaims the stale row.
+            for attempt in 1..=max {
+                let c = q.claim("w").await.unwrap();
+                assert!(
+                    c.is_some(),
+                    "{engine}: attempt {attempt} should still be retryable"
+                );
+                assert!(matches!(q.job_status(id).await.unwrap(), JobState::Pending));
+            }
+
+            // The next claim finds the row over the attempt cap: it dead-letters
+            // it to `failed` and there is nothing left to hand out.
+            assert!(
+                q.claim("w").await.unwrap().is_none(),
+                "{engine}: an over-cap job is dead-lettered, not re-handed-out"
+            );
+            match q.job_status(id).await.unwrap() {
+                JobState::Failed(e) => assert!(
+                    e.contains("dead-lettered"),
+                    "{engine}: dead-letter error, got {e:?}"
+                ),
+                other => panic!("{engine}: expected Failed (dead-letter), got {other:?}"),
+            }
         }
     }
 
@@ -593,15 +743,16 @@ mod tests {
             db,
             stale_claim_secs: DEFAULT_STALE_CLAIM_SECS,
             failed_retention_secs: -1,
+            max_build_attempts: DEFAULT_MAX_BUILD_ATTEMPTS,
         };
 
         let failed = q.enqueue(job("o", "r", "fail")).await.unwrap();
         let c = q.claim("w").await.unwrap().unwrap();
-        q.ack(c.id, Err("boom".to_string())).await.unwrap();
+        q.ack(c.id, "w", Err("boom".to_string())).await.unwrap();
 
         let done = q.enqueue(job("o", "r", "ok")).await.unwrap();
         let c = q.claim("w").await.unwrap().unwrap();
-        q.ack(c.id, Ok(())).await.unwrap();
+        q.ack(c.id, "w", Ok(())).await.unwrap();
 
         let removed = q.prune_failed().await.unwrap();
         assert_eq!(removed, 1, "only the failed job is pruned");
@@ -696,7 +847,7 @@ mod tests {
                 Some("dG9rZW4=".to_string()),
                 "credential round-trips through the queue DB"
             );
-            q.ack(c.id, Ok(())).await.unwrap();
+            q.ack(c.id, "wc", Ok(())).await.unwrap();
         }
 
         let enq = q.enqueue(job("o", "r", "main")).await.unwrap();
@@ -715,7 +866,7 @@ mod tests {
 
         let first = q.claim("w1").await.unwrap().unwrap();
         assert_eq!(first.branch, "main", "oldest queued claimed first");
-        q.ack(first.id, Ok(())).await.unwrap();
+        q.ack(first.id, "w1", Ok(())).await.unwrap();
         assert!(matches!(
             q.job_status(first.id).await.unwrap(),
             JobState::Done
@@ -723,7 +874,9 @@ mod tests {
 
         let second = q.claim("w1").await.unwrap().unwrap();
         assert_eq!(second.branch, "dev");
-        q.ack(second.id, Err("boom".to_string())).await.unwrap();
+        q.ack(second.id, "w1", Err("boom".to_string()))
+            .await
+            .unwrap();
         match q.job_status(second.id).await.unwrap() {
             JobState::Failed(e) => assert_eq!(e, "boom"),
             o => panic!("expected Failed, got {o:?}"),

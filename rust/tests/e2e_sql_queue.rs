@@ -56,7 +56,10 @@ async fn sql_queue_farm_out_sync_then_clone() {
                         credential: None,
                     };
                     let result = process_build_job(&state, &job).await;
-                    worker_queue.ack(c.id, result).await.expect("ack");
+                    worker_queue
+                        .ack(c.id, "test-worker", result)
+                        .await
+                        .expect("ack");
                 }
                 None => tokio::time::sleep(Duration::from_millis(50)).await,
             }

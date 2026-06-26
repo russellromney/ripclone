@@ -26,6 +26,35 @@ fn unbranch_slug(slug: &str) -> Option<String> {
     .ok()
 }
 
+/// The one place that decides whether a newly-synced `RefInfo` may replace an
+/// existing stored one. The invariant is the README's "a newer sync never
+/// loses to an older one"; every backend (file, S3, SQL) must apply the *same*
+/// policy or the same race resolves differently depending on where the refs
+/// happen to live.
+///
+/// Accept the write when:
+/// - there is no existing ref, or
+/// - the new ref points at the same commit (a metadata-only update — e.g.
+///   `build_status` flipping to done — must always land), or
+/// - the new ref's `synced_at` is newer-than-or-equal to the stored one.
+///
+/// A missing `synced_at` on either side is treated as "no ordering
+/// information" and the write is accepted; backends that have a stronger
+/// atomic tie-break (the SQL conditional upsert, the S3 ETag CAS) rely on that
+/// for the final ordering, while the file store serializes writes in-process.
+pub(crate) fn should_replace_ref(existing: Option<&RefInfo>, new: &RefInfo) -> bool {
+    let Some(existing) = existing else {
+        return true;
+    };
+    if existing.commit == new.commit {
+        return true;
+    }
+    match (existing.synced_at, new.synced_at) {
+        (Some(existing_ts), Some(new_ts)) => new_ts >= existing_ts,
+        _ => true,
+    }
+}
+
 /// Abstract store for repo → `RefInfo` mappings.
 ///
 /// Implementations are expected to be shared across multiple ripclone backend
@@ -84,6 +113,13 @@ pub trait RefStore: Send + Sync {
 /// Local filesystem-backed ref store. One JSON file per repo.
 pub struct FileRefStore {
     root: PathBuf,
+    /// Serializes the read-compare-then-rename below so concurrent in-process
+    /// writers can't both read the old ref and then race their renames (which
+    /// would let an older sync clobber a newer one, and made two writers fight
+    /// over the shared `.json.tmp` path). The file store is per-host by design;
+    /// in-process serialization is the right scope. Ref writes are off the
+    /// clone hot path, so a single lock is fine.
+    write_lock: tokio::sync::Mutex<()>,
 }
 
 impl FileRefStore {
@@ -92,7 +128,48 @@ impl FileRefStore {
         // Best-effort creation of the root directory up front so `list()` works
         // on a fresh deployment.
         let _ = std::fs::create_dir_all(&root);
-        Self { root }
+        Self {
+            root,
+            write_lock: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    /// Read-compare-then-rename: apply [`should_replace_ref`] against whatever
+    /// is currently on disk and only write when the new ref wins. Held under
+    /// `write_lock` so the compare and the rename are atomic w.r.t. other
+    /// in-process writers.
+    async fn write_checked(&self, path: &Path, info: &RefInfo) -> Result<()> {
+        let _guard = self.write_lock.lock().await;
+
+        let existing: Option<RefInfo> = match tokio::fs::read(path).await {
+            Ok(data) => Some(
+                serde_json::from_slice(&data)
+                    .with_context(|| format!("parse ref store {}", path.display()))?,
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(anyhow::anyhow!("read ref store {}: {}", path.display(), e)),
+        };
+        if !should_replace_ref(existing.as_ref(), info) {
+            let key = path.display();
+            warn!("ref store {key} already has a newer sync; skipping older write");
+            return Ok(());
+        }
+
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .with_context(|| format!("create ref store dir {}", parent.display()))?;
+        }
+        let data = serde_json::to_vec_pretty(info).context("serialize RefInfo")?;
+        // Write to a temp file in the same directory and rename for atomicity.
+        let tmp_path = path.with_extension("json.tmp");
+        tokio::fs::write(&tmp_path, data)
+            .await
+            .with_context(|| format!("write temp ref store {}", tmp_path.display()))?;
+        tokio::fs::rename(&tmp_path, path)
+            .await
+            .with_context(|| format!("rename {} to {}", tmp_path.display(), path.display()))?;
+        Ok(())
     }
 
     /// Path to the legacy HEAD ref file. Kept for backward compatibility with
@@ -135,23 +212,7 @@ impl RefStore for FileRefStore {
     }
 
     async fn save(&self, repo_id: &RepoId, info: &RefInfo) -> Result<()> {
-        let path = self.path(repo_id);
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .with_context(|| format!("create ref store dir {}", parent.display()))?;
-        }
-        let data = serde_json::to_vec_pretty(info).context("serialize RefInfo")?;
-
-        // Write to a temp file in the same directory and rename for atomicity.
-        let tmp_path = path.with_extension("json.tmp");
-        tokio::fs::write(&tmp_path, data)
-            .await
-            .with_context(|| format!("write temp ref store {}", tmp_path.display()))?;
-        tokio::fs::rename(&tmp_path, &path)
-            .await
-            .with_context(|| format!("rename {} to {}", tmp_path.display(), path.display()))?;
-        Ok(())
+        self.write_checked(&self.path(repo_id), info).await
     }
 
     async fn list(&self) -> Result<Vec<RepoId>> {
@@ -200,21 +261,8 @@ impl RefStore for FileRefStore {
         if branch == "HEAD" {
             return self.save(repo_id, info).await;
         }
-        let path = self.branch_path(repo_id, branch);
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .with_context(|| format!("create ref store dir {}", parent.display()))?;
-        }
-        let data = serde_json::to_vec_pretty(info).context("serialize RefInfo")?;
-        let tmp_path = path.with_extension("json.tmp");
-        tokio::fs::write(&tmp_path, data)
+        self.write_checked(&self.branch_path(repo_id, branch), info)
             .await
-            .with_context(|| format!("write temp ref store {}", tmp_path.display()))?;
-        tokio::fs::rename(&tmp_path, &path)
-            .await
-            .with_context(|| format!("rename {} to {}", tmp_path.display(), path.display()))?;
-        Ok(())
     }
 
     async fn list_branches(&self, repo_id: &RepoId) -> Result<Vec<String>> {
@@ -290,6 +338,49 @@ impl S3RefStore {
     fn branch_prefix(&self, repo_id: &RepoId) -> String {
         format!("refs/{}/", repo_id.storage_key())
     }
+
+    /// Read-compare-CAS write shared by HEAD (`save`) and branch
+    /// (`save_branch`) saves. Applies [`should_replace_ref`] and uses the
+    /// object's ETag as the atomic tie-break against a concurrent writer:
+    /// if another sync lands between our read and write, the conditional PUT
+    /// fails and we re-read and re-decide. This is what makes branch refs
+    /// "newer never loses" instead of last-writer-wins.
+    async fn save_keyed(&self, key: &str, info: &RefInfo) -> Result<()> {
+        let data = serde_json::to_vec_pretty(info).context("serialize RefInfo")?;
+        // Bounded so a pathological hot key can't spin forever; in practice one
+        // or two reads settle it.
+        for _ in 0..8 {
+            let if_match = match self.storage.get_object(key).await {
+                Ok(Some((etag, existing_bytes))) => {
+                    let existing: RefInfo = serde_json::from_slice(&existing_bytes)
+                        .with_context(|| format!("parse existing S3 ref store {key}"))?;
+                    if !should_replace_ref(Some(&existing), info) {
+                        warn!("S3 ref store {key} already has a newer sync; skipping older write");
+                        return Ok(());
+                    }
+                    Some(etag)
+                }
+                Ok(None) => None,
+                Err(e) => {
+                    warn!(
+                        "failed to read existing S3 ref store {key}: {e}; writing unconditionally"
+                    );
+                    None
+                }
+            };
+
+            if self
+                .storage
+                .put_object_cas(key, &data, if_match.as_deref())
+                .await
+                .with_context(|| format!("write S3 ref store {key}"))?
+            {
+                return Ok(());
+            }
+            // Lost the CAS race against a concurrent writer; re-read and retry.
+        }
+        anyhow::bail!("S3 ref store {key}: gave up after repeated concurrent-write conflicts")
+    }
 }
 
 #[async_trait]
@@ -308,49 +399,7 @@ impl RefStore for S3RefStore {
     }
 
     async fn save(&self, repo_id: &RepoId, info: &RefInfo) -> Result<()> {
-        let key = self.key(repo_id);
-        let data = serde_json::to_vec_pretty(info).context("serialize RefInfo")?;
-
-        // Avoid overwriting a newer sync with an older one. Read the current
-        // object and only write back if the stored ref is older/missing.
-        let if_match = match self.storage.get_object(&key).await {
-            Ok(Some((etag, existing_bytes))) => {
-                let existing: RefInfo = serde_json::from_slice(&existing_bytes)
-                    .with_context(|| format!("parse existing S3 ref store {key}"))?;
-                if existing.commit == info.commit {
-                    // Same commit; still update so build_status/etc can change.
-                    return self
-                        .storage
-                        .put_object(&key, &data, Some(&etag))
-                        .await
-                        .with_context(|| format!("write S3 ref store {key}"));
-                }
-                // Timestamps are the authoritative ordering signal. A missing
-                // timestamp on either side is treated as "no information" and we
-                // still write, relying on the conditional ETag for safety.
-                match (existing.synced_at, info.synced_at) {
-                    (Some(existing_ts), Some(new_ts)) if existing_ts > new_ts => {
-                        let display_key = repo_id.storage_key();
-                        warn!(
-                            "ref store for {display_key} already has newer sync at {existing_ts}; skipping older {new_ts}"
-                        );
-                        return Ok(());
-                    }
-                    _ => Some(etag),
-                }
-            }
-            Ok(None) => None,
-            Err(e) => {
-                warn!("failed to read existing S3 ref store {key}: {e}; writing unconditionally");
-                None
-            }
-        };
-
-        self.storage
-            .put_object(&key, &data, if_match.as_deref())
-            .await
-            .with_context(|| format!("write S3 ref store {key}"))?;
-        Ok(())
+        self.save_keyed(&self.key(repo_id), info).await
     }
 
     async fn list(&self) -> Result<Vec<RepoId>> {
@@ -405,13 +454,8 @@ impl RefStore for S3RefStore {
         if branch == "HEAD" {
             return self.save(repo_id, info).await;
         }
-        let key = self.branch_key(repo_id, branch);
-        let data = serde_json::to_vec_pretty(info).context("serialize RefInfo")?;
-        self.storage
-            .put_object(&key, &data, None)
+        self.save_keyed(&self.branch_key(repo_id, branch), info)
             .await
-            .with_context(|| format!("write S3 ref store {key}"))?;
-        Ok(())
     }
 
     async fn list_branches(&self, repo_id: &RepoId) -> Result<Vec<String>> {

@@ -94,7 +94,7 @@ impl MetaDb for SqliteMeta {
             .collect()
     }
 
-    async fn upsert(
+    async fn save_ordered(
         &self,
         repo_key: &str,
         branch: &str,
@@ -102,13 +102,21 @@ impl MetaDb for SqliteMeta {
         commit_id: &str,
         synced_at: Option<i64>,
     ) -> Result<()> {
+        // The DO UPDATE ... WHERE makes the ordering check atomic with the
+        // write: on conflict the row is only overwritten when the new sync wins
+        // (same commit, either side has no timestamp, or new >= stored). A
+        // losing write is a silent no-op, exactly like the file/S3 stores.
         sqlx::query(
             "INSERT INTO refs (repo_key, branch, commit_id, synced_at, data)
              VALUES (?, ?, ?, ?, ?)
              ON CONFLICT (repo_key, branch) DO UPDATE SET
                  commit_id = excluded.commit_id,
                  synced_at = excluded.synced_at,
-                 data = excluded.data",
+                 data = excluded.data
+             WHERE excluded.commit_id = refs.commit_id
+                OR refs.synced_at IS NULL
+                OR excluded.synced_at IS NULL
+                OR excluded.synced_at >= refs.synced_at",
         )
         .bind(repo_key)
         .bind(branch)
@@ -117,7 +125,7 @@ impl MetaDb for SqliteMeta {
         .bind(data)
         .execute(&self.pool)
         .await
-        .context("upsert ref")?;
+        .context("save_ordered ref")?;
         Ok(())
     }
 

@@ -295,7 +295,7 @@ on auto-gc being off (so mutations are appends + atomic-replace accelerators) an
 on the per-repo lock still serializing the prep trio against itself (two
 concurrent `commit-graph write`s would collide on git's `.lock`).
 
-**Spike result (validated).** `git::tests::spike_concurrent_prep_vs_reads`
+**Validated.** `git::tests::concurrent_prep_and_reads_stay_safe`
 (`#[ignore]`) runs one writer thread doing serialized fetch + commit-graph +
 bitmap on a mirror (gc off) while four reader threads continuously walk every
 object. Result over ~4s: **17 prep rounds, 0 prep errors, ~1300 reads, 0 read

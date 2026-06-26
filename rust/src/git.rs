@@ -1072,15 +1072,12 @@ pub fn object_type<P: AsRef<Path>>(repo: P, sha: &str) -> Result<String> {
     crate::gix_util::object_type(repo, sha)
 }
 
-/// Disable git's automatic gc/maintenance on a bare mirror, persisted into the
-/// mirror's own config so it covers every later command (not just one fetch).
+/// Disable git's automatic gc on a bare mirror, persisted into the mirror's own
+/// config so it covers every later command, not just one fetch.
 ///
-/// This is load-bearing for concurrent sync: read-only builds (`rev-list` /
-/// `pack-objects`) run lock-free over the mirror's packs while a `git fetch`
-/// appends to it. A fetch can trip git's auto-gc, which repacks/prunes packs out
-/// from under a live reader — a real corruption / object-not-found mode. We run
-/// gc ourselves, explicitly, under the exclusive lock; the automatic one must be
-/// off. Idempotent and cheap (local config writes). See docs/SYNC.md.
+/// Builds read the mirror's packs while a fetch appends to it. Auto-gc, which a
+/// fetch can trigger, repacks or prunes those packs out from under a live reader
+/// and corrupts the read. We gc explicitly instead. Idempotent and cheap.
 pub fn disable_auto_gc(mirror_dir: &Path) -> Result<()> {
     for (key, value) in [
         ("gc.auto", "0"),
@@ -1452,7 +1449,7 @@ mod tests {
     static ORIGIN_BASE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Auto-gc must be persisted off on the mirror, or a fetch could repack
-    /// packs out from under a concurrent lock-free read. See docs/SYNC.md.
+    /// packs out from under a concurrent read.
     #[test]
     fn disable_auto_gc_persists_keys() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1558,17 +1555,15 @@ mod tests {
         );
     }
 
-    /// Lock-shrink spike (docs/SYNC.md): is a read-only build safe while another
-    /// build's exclusive prep (fetch append + commit-graph + multi-pack-index
-    /// bitmap) runs on the SAME mirror, with auto-gc disabled? One writer thread
-    /// serially does fetch+graph+bitmap (as the per-repo exclusive lock would);
-    /// several reader threads continuously walk every object (the build's core
-    /// read). With gc off, mutations are appends (fetch) + atomic-replace
-    /// accelerators (graph/midx) — readers should never see a torn/missing object.
-    /// Run: `cargo test --lib spike_concurrent_prep_vs_reads -- --ignored --nocapture`.
+    /// Is a read-only build safe while another build fetches and rewrites the
+    /// commit-graph/bitmap on the same mirror, with auto-gc off? One writer thread
+    /// does fetch + commit-graph + bitmap; several readers walk every object. With
+    /// gc off, the writer only appends packs and atomically replaces the
+    /// accelerators, so readers should never see a torn or missing object.
+    /// Run: `cargo test --lib concurrent_prep_and_reads_stay_safe -- --ignored --nocapture`.
     #[test]
     #[ignore]
-    fn spike_concurrent_prep_vs_reads() {
+    fn concurrent_prep_and_reads_stay_safe() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
         use std::time::{Duration, Instant};
@@ -1751,7 +1746,7 @@ mod tests {
         );
     }
 
-    /// Helper for the spike: write a unique file into the pusher worktree.
+    /// Write a unique file into the pusher worktree (for the test above).
     fn pusher_path_write(pusher: &str, i: u64) -> String {
         let name = format!("f{i}");
         std::fs::write(std::path::Path::new(pusher).join(&name), format!("{i}")).unwrap();

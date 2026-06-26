@@ -1,5 +1,6 @@
 use crate::RefInfo;
 use crate::archive::ArchiveBuilder;
+use crate::auth::access::{AccessDecision, AccessVerifier, HttpAccessVerifier};
 use crate::auth::broker::{CredentialBroker, StaticBroker};
 use crate::backends::{self, QueueBackend};
 use crate::cas::Cas;
@@ -32,7 +33,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::env;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -86,6 +87,15 @@ pub struct ServerState {
     /// Cached `/readyz` result `(checked_at, ready)`. Bounds backend probe cost
     /// (S3 round-trips) and damps load-balancer flapping on a transient blip.
     pub readyz_cache: Arc<std::sync::Mutex<Option<(Instant, bool)>>>,
+    /// Per-repo read authorization (AU1): proves the caller may read a private
+    /// repo (public repos are anonymous). Used by every repo-read entry point
+    /// before serving content or signing URLs, unless `require_repo_auth` is off.
+    pub access_verifier: Arc<dyn AccessVerifier>,
+    /// When true (default), private repos are gated by `access_verifier` on every
+    /// read. Set false by `RIPCLONE_TRUST_GATEWAY=1` for a single-tenant
+    /// self-host that fully trusts whoever holds the shared server token (the old
+    /// behavior); then visibility falls back to the client-supplied header.
+    pub require_repo_auth: bool,
 }
 
 impl ServerState {
@@ -126,8 +136,21 @@ impl ServerState {
             artifact_fetch_count: Arc::new(AtomicUsize::new(0)),
             fail_first_fetches: 0,
             readyz_cache: Arc::new(std::sync::Mutex::new(None)),
+            // The worker never serves reads; a verifier is required by the type
+            // but unused, and auth enforcement is irrelevant here.
+            access_verifier: Arc::new(HttpAccessVerifier::new()),
+            require_repo_auth: false,
         })
     }
+}
+
+/// Whether per-repo read authz is enforced. On by default (multi-tenant safe);
+/// `RIPCLONE_TRUST_GATEWAY=1` turns it off for a single-tenant self-host that
+/// trusts the shared server token as the only authz layer.
+fn require_repo_auth_from_env() -> bool {
+    !std::env::var("RIPCLONE_TRUST_GATEWAY")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
 }
 
 /// Read the test-only fault-injection threshold once at startup. Logs loudly if
@@ -647,13 +670,60 @@ fn check_auth_header(header: &str, expected: &str) -> bool {
     false
 }
 
+/// Trust a forwarded-for header for the rate-limit key. Off by default: the
+/// header is client-spoofable, so only honor it when the operator has put a
+/// reverse proxy directly in front (`RIPCLONE_TRUST_FORWARDED_FOR=1`). Read once.
+fn trust_forwarded_for() -> bool {
+    static TRUST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *TRUST.get_or_init(|| {
+        std::env::var("RIPCLONE_TRUST_FORWARDED_FOR")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
+/// Rate-limit bucket key for a request. Keying on the raw socket IP is useless
+/// behind a reverse proxy (every request shares the proxy's IP → one global
+/// bucket) and bypassable over IPv6 (a /64 gives 2^64 addresses, each a fresh
+/// bucket). So: derive the client IP from the trusted forwarded-for header when
+/// enabled, and collapse IPv6 to its /64 network so an attacker can't rotate
+/// addresses within their allocation (AU2).
+fn rate_limit_key(headers: &HeaderMap, socket: SocketAddr, trust_forwarded: bool) -> String {
+    let ip = if trust_forwarded {
+        headers
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            // Rightmost entry = the address our immediately-trusted proxy saw;
+            // entries a client prepends are ignored. Assumes a single trusted
+            // proxy directly in front.
+            .and_then(|v| v.rsplit(',').next())
+            .map(str::trim)
+            .and_then(|s| s.parse::<IpAddr>().ok())
+            .unwrap_or_else(|| socket.ip())
+    } else {
+        socket.ip()
+    };
+    normalize_ip_for_rate_limit(ip)
+}
+
+fn normalize_ip_for_rate_limit(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(v6) => {
+            // Collapse to the /64 network (the first four 16-bit groups).
+            let s = v6.segments();
+            format!("{:x}:{:x}:{:x}:{:x}::/64", s[0], s[1], s[2], s[3])
+        }
+    }
+}
+
 async fn rate_limit_middleware(
     State(state): State<ServerState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     request: axum::http::Request<axum::body::Body>,
     next: Next,
 ) -> Response {
-    let key = addr.ip().to_string();
+    let key = rate_limit_key(request.headers(), addr, trust_forwarded_for());
     if !state.rate_limiter.check(&key) {
         return (
             StatusCode::TOO_MANY_REQUESTS,
@@ -772,6 +842,13 @@ async fn git_info_refs_inner(
     let credential = state
         .broker
         .fetch_credential(&repo_id, request_token.as_ref());
+    // AU1: gate the vanilla-git read surface too (it serves the private repo's
+    // refs/objects directly from the mirror).
+    if let Err(resp) =
+        authorize_repo_read(&state, &provider, &repo_id, credential.as_ref(), &headers).await
+    {
+        return resp;
+    }
     let lock = repo_lock(&state.sync_locks, &repo_id).await;
     let _guard = lock.lock().await;
     if let Err(e) = ensure_mirror(
@@ -858,6 +935,12 @@ async fn git_upload_pack_inner(
     let credential = state
         .broker
         .fetch_credential(&repo_id, request_token.as_ref());
+    // AU1: gate the vanilla-git upload-pack read surface.
+    if let Err(resp) =
+        authorize_repo_read(&state, &provider, &repo_id, credential.as_ref(), &headers).await
+    {
+        return resp;
+    }
     let lock = repo_lock(&state.sync_locks, &repo_id).await;
     let _guard = lock.lock().await;
     if let Err(e) = ensure_mirror(
@@ -963,7 +1046,7 @@ async fn dispatch_repos_get(
                     .into_response();
             }
         };
-        return repo_status_inner(repo_id, provider.clone(), query, state).await;
+        return repo_status_inner(repo_id, provider.clone(), query, headers, state).await;
     }
 
     if path.ends_with("/cat") {
@@ -1363,7 +1446,6 @@ async fn get_ref_inner(
     headers: HeaderMap,
     state: ServerState,
 ) -> Response {
-    let private = visibility_is_private(&headers);
     if let Some(resp) = validation::reject_if_invalid(|| validation::validate_git_rev(&branch)) {
         return resp;
     }
@@ -1384,6 +1466,15 @@ async fn get_ref_inner(
     let credential = state
         .broker
         .fetch_credential(&repo_id, request_token.as_ref());
+
+    // AU1: authorize the caller for this repo BEFORE the cache-hit return below,
+    // so a cached private repo is never served to a caller without access.
+    let private =
+        match authorize_repo_read(&state, &provider, &repo_id, credential.as_ref(), &headers).await
+        {
+            Ok(p) => p,
+            Err(resp) => return resp,
+        };
 
     // Serialize syncs for this repo so concurrent fetches do not corrupt the
     // bare mirror directory. Acquiring the lock also means any in-progress sync
@@ -1680,15 +1771,59 @@ fn signed_url(storage: &crate::storage::StorageRef, ttl: Duration, hash: &str) -
     storage.signed_url(hash, ttl)
 }
 
-/// The cloud gateway tags every control-plane request with the repo visibility it
-/// resolved via GitHub. Absent → treat as public (a self-hosted client may talk
-/// to the backend directly, with no gateway in front).
+/// Single-tenant trust mode only: the client tags a request with the visibility
+/// it resolved. Absent → treat as public. This is advisory and trusted ONLY when
+/// `require_repo_auth` is off; the enforced path derives visibility from the
+/// provider via [`authorize_repo_read`] instead.
 fn visibility_is_private(headers: &HeaderMap) -> bool {
     headers
         .get("x-ripclone-visibility")
         .and_then(|v| v.to_str().ok())
         .map(|v| v.eq_ignore_ascii_case("private"))
         .unwrap_or(false)
+}
+
+/// 403 for a caller that may not read this repo.
+fn forbidden_repo_response() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(ErrorResponse {
+            error: "not authorized for this repository".to_string(),
+        }),
+    )
+        .into_response()
+}
+
+/// Per-repo read authorization gate (AU1). Every repo-read entry point calls
+/// this before serving content or signing URLs. On success it returns whether
+/// the repo is private (for signed-URL TTL); on failure it returns a 403 the
+/// caller must propagate.
+///
+/// Enforced path (`require_repo_auth`): public repos are served anonymously,
+/// private repos require the caller's own credential to prove read access
+/// against the provider (cached). This is what stops a holder of the shared
+/// server token from reading an already-cached private repo it has no access to.
+/// Trust mode (`RIPCLONE_TRUST_GATEWAY=1`): the gate is skipped and visibility
+/// comes from the client header (single-tenant self-host behavior).
+async fn authorize_repo_read(
+    state: &ServerState,
+    provider: &ProviderInstance,
+    repo_id: &RepoId,
+    credential: Option<&secrecy::SecretString>,
+    headers: &HeaderMap,
+) -> Result<bool, Response> {
+    if !state.require_repo_auth {
+        return Ok(visibility_is_private(headers));
+    }
+    match state
+        .access_verifier
+        .verify(provider, &repo_id.path, credential)
+        .await
+    {
+        AccessDecision::Public => Ok(false),
+        AccessDecision::PrivateAuthorized => Ok(true),
+        AccessDecision::Denied => Err(forbidden_repo_response()),
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -1701,10 +1836,21 @@ struct RepoStatusQuery {
 
 async fn repo_status_inner(
     repo_id: RepoId,
-    _provider: ProviderInstance,
+    provider: ProviderInstance,
     query: RepoStatusQuery,
+    headers: HeaderMap,
     state: ServerState,
 ) -> Response {
+    // AU1: status reveals a private repo's existence, commit, and byte sizes.
+    let request_token = upstream_token_from_headers(&headers);
+    let credential = state
+        .broker
+        .fetch_credential(&repo_id, request_token.as_ref());
+    if let Err(resp) =
+        authorize_repo_read(&state, &provider, &repo_id, credential.as_ref(), &headers).await
+    {
+        return resp;
+    }
     match build_repo_status(&state, &repo_id, query.public, query.fork_of.as_deref()).await {
         Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
         Err(e) => {
@@ -1923,7 +2069,13 @@ async fn sync_repo_inner(
     let credential = state
         .broker
         .fetch_credential(&repo_id, request_token.as_ref());
-    let private = visibility_is_private(&headers);
+    // AU1: a sync both builds and returns the ref (with signed URLs), so gate it.
+    let private =
+        match authorize_repo_read(&state, &provider, &repo_id, credential.as_ref(), &headers).await
+        {
+            Ok(p) => p,
+            Err(resp) => return resp,
+        };
 
     // Async build queue: enqueue the build onto the bounded background worker so
     // it survives client disconnect / HTTP timeout (the key win for huge repos)
@@ -2221,6 +2373,8 @@ async fn sync_repo_inner(
         &branch,
         at_rev.as_deref(),
         &state.ref_store,
+        false,
+        // In-process server: phase 2 runs in the background for a fast response.
         false,
         &state.storage,
         &state.retention,
@@ -2687,6 +2841,8 @@ async fn create_snapshot_inner(
         &branch,
         None,
         &state.ref_store,
+        false,
+        // In-process server: phase 2 runs in the background for a fast response.
         false,
         &state.storage,
         &state.retention,
@@ -3505,15 +3661,20 @@ async fn do_sync(
     at_rev: Option<&str>,
     ref_store: &Arc<dyn RefStore>,
     build_full_pack: bool,
+    // When true, the two-phase build finishes full history inline and only returns
+    // once it is durable, instead of detaching it into a background task. An
+    // ephemeral cross-process worker sets this so it never acks `done` while the
+    // full history is still unbuilt — a detached task would die with the worker.
+    // The long-lived in-process server leaves it false, keeping `/sync` fast.
+    inline_full_history: bool,
     storage: &crate::storage::StorageRef,
     retention: &Arc<Retention>,
     provider: &ProviderInstance,
     credential: Option<&secrecy::SecretString>,
-    // Per-repo lock. do_sync holds it only across the mirror-mutating prep (fetch
-    // + commit-graph [+ single-phase bitmap]) and drops it before the heavy
-    // read-only build, so builds for different repos — and the read-only phases of
-    // same-repo builds — run concurrently. Safe with auto-gc disabled; see
-    // docs/SYNC.md and git::tests::spike_concurrent_prep_vs_reads.
+    // Per-repo lock. do_sync holds it only while mutating the mirror (fetch +
+    // commit-graph, and the bitmap on the single-phase path), then drops it before
+    // the heavy read-only build, so different repos build concurrently. Safe
+    // because auto-gc is off, so the build only reads the mirror's packs.
     mirror_lock: &Arc<tokio::sync::Mutex<()>>,
 ) -> Result<RefInfo> {
     info!("syncing {}@{}", repo_id.storage_key(), branch);
@@ -3608,14 +3769,11 @@ async fn do_sync(
     .await
     .context("sync task")??;
     drop(fetch_permit);
-    // Stamp the publish-ordering key at FETCH time, not at build construction.
-    // Fetches are serialized by the per-repo lock we hold here, so fetch time is a
-    // correct total order; stamping at build *completion* (the old behavior) lets
-    // an out-of-order finish carry a misleading-newer timestamp and regress the
-    // branch. This also makes the existing save_branch ordering guard sound and
-    // handles force-push (the later fetch wins). Cross-process ordering (multiple
-    // worker processes) wants a DB-monotonic sequence instead — a farm-out-era
-    // addition; see docs/SYNC.md.
+    // Stamp the ordering timestamp at fetch time, not when the build finishes.
+    // Fetches are serialized by the per-repo lock, so fetch time orders syncs
+    // correctly; a timestamp set at build completion lets a build that finishes
+    // out of order look newer and wrongly move the branch back. This feeds the
+    // save_ordered check and makes a force-push (the later fetch) win.
     let fetched_at = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .ok()
@@ -3691,6 +3849,7 @@ async fn do_sync(
             ref_store,
             storage,
             retention,
+            inline_full_history,
             t_total,
             fetched_at,
         )
@@ -4298,6 +4457,7 @@ async fn build_and_publish_two_phase(
     ref_store: &Arc<dyn RefStore>,
     storage: &crate::storage::StorageRef,
     retention: &Arc<Retention>,
+    inline_full_history: bool,
     t_total: Instant,
     // Publish-ordering key, stamped at fetch time by the caller (see do_sync).
     fetched_at: Option<u64>,
@@ -4620,7 +4780,7 @@ async fn build_and_publish_two_phase(
     let sk_meta = shallow_metadata_hash.clone();
     let sk_meta_len = shallow_meta_data.len() as u64;
     let head_base_pack_count_for_p2 = head_built.base_packs.len();
-    tokio::spawn(async move {
+    let phase2 = async move {
         let started = Instant::now();
         let res = build_full_in_background(
             &cas2,
@@ -4650,7 +4810,7 @@ async fn build_and_publish_two_phase(
             head_base_pack_count_for_p2,
         )
         .await;
-        match res {
+        match &res {
             Ok(()) => info!(
                 "full clone ready for {} in {:?}",
                 &commit2[..7.min(commit2.len())],
@@ -4661,7 +4821,22 @@ async fn build_and_publish_two_phase(
                 repo_id2.storage_key()
             ),
         }
-    });
+        res
+    };
+
+    if inline_full_history {
+        // Ephemeral/cross-process worker: build phase 2 now, before returning, so
+        // the job is never acked `done` while the full clonepack is still unbuilt.
+        // This runs after the per-repo lock is dropped (read-only over the mirror,
+        // safe with auto-gc off). A crash mid-build leaves the claim stale → the
+        // queue reclaims and retries it (and dead-letters after the cap).
+        phase2.await.context("phase 2 (full history) build")?;
+    } else {
+        // Long-lived in-process server: detach so `/sync` returns as soon as the
+        // depth=1 clonepack is live. The task outlives the request because the
+        // server process keeps running.
+        tokio::spawn(phase2);
+    }
 
     Ok(info)
 }
@@ -5057,7 +5232,13 @@ pub async fn process_build_job(state: &ServerState, job: &BuildJob) -> Result<()
     // do_sync holds this per-repo lock only across the mirror-mutating prep and
     // releases it before the heavy read-only build, so distinct repos build
     // concurrently across the worker pool.
+    // do_sync takes the per-repo lock itself (via `&lock`) and releases it before
+    // the heavy build, so we don't hold a guard here.
     let lock = repo_lock(&state.sync_locks, repo_id).await;
+    // A cross-process worker must finish the full history before it acks `done`,
+    // or a worker that exits would lose the detached task. The in-process server
+    // builds it in the background instead, for a fast response.
+    let inline_full_history = !state.build_queue.inproc_wait();
     let result = do_sync(
         &state.cas,
         &mirror_dir,
@@ -5066,6 +5247,7 @@ pub async fn process_build_job(state: &ServerState, job: &BuildJob) -> Result<()
         at_rev.as_deref(),
         &state.ref_store,
         false,
+        inline_full_history,
         &state.storage,
         &state.retention,
         &provider,
@@ -5504,6 +5686,8 @@ pub async fn run_server(
         artifact_fetch_count: Arc::new(AtomicUsize::new(0)),
         fail_first_fetches: fail_first_fetches_from_env(),
         readyz_cache: Arc::new(std::sync::Mutex::new(None)),
+        access_verifier: Arc::new(HttpAccessVerifier::new()),
+        require_repo_auth: require_repo_auth_from_env(),
     };
 
     // Only the local queue runs builds in-process.
@@ -5524,6 +5708,15 @@ pub async fn run_server(
     let app = build_app(state);
     let addr: SocketAddr = format!("{}:{}", host, port).parse()?;
 
+    if require_repo_auth_from_env() {
+        info!(
+            "per-repo access enforcement ON: private repos require the caller's credential on every read (RIPCLONE_TRUST_GATEWAY=1 to disable for single-tenant self-host)"
+        );
+    } else {
+        warn!(
+            "per-repo access enforcement OFF (RIPCLONE_TRUST_GATEWAY): any holder of the shared server token can read any cached repo — keep this backend network-isolated and single-tenant"
+        );
+    }
     info!("ripclone server listening on http://{}", addr);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(
@@ -5578,6 +5771,10 @@ mod tests {
             artifact_fetch_count: Arc::new(AtomicUsize::new(0)),
             fail_first_fetches: fail_first_fetches_from_env(),
             readyz_cache: Arc::new(std::sync::Mutex::new(None)),
+            // Default tests to single-tenant trust (no network access checks);
+            // the authz-specific tests override these two fields with a fake.
+            access_verifier: Arc::new(HttpAccessVerifier::new()),
+            require_repo_auth: false,
         }
     }
 
@@ -5664,6 +5861,37 @@ mod tests {
     }
 
     #[test]
+    fn rate_limit_key_collapses_ipv6_and_honors_trusted_forwarded() {
+        use std::net::Ipv6Addr;
+        let socket = SocketAddr::from(([203, 0, 113, 7], 51000));
+
+        // Untrusted: always the socket IP, ignore any forwarded-for header.
+        let mut spoof = HeaderMap::new();
+        spoof.insert("x-forwarded-for", "1.2.3.4".parse().unwrap());
+        assert_eq!(rate_limit_key(&spoof, socket, false), "203.0.113.7");
+
+        // Trusted: take the rightmost forwarded-for entry (what our proxy saw),
+        // ignoring entries a client prepends.
+        let mut xff = HeaderMap::new();
+        xff.insert("x-forwarded-for", "9.9.9.9, 198.51.100.23".parse().unwrap());
+        assert_eq!(rate_limit_key(&xff, socket, true), "198.51.100.23");
+
+        // IPv6 collapses to its /64 so an attacker can't rotate within a /64.
+        let a = SocketAddr::new(
+            std::net::IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0xab, 0xcd, 1, 2, 3, 4)),
+            0,
+        );
+        let b = SocketAddr::new(
+            std::net::IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0xab, 0xcd, 9, 9, 9, 9)),
+            0,
+        );
+        let ka = rate_limit_key(&HeaderMap::new(), a, false);
+        let kb = rate_limit_key(&HeaderMap::new(), b, false);
+        assert_eq!(ka, kb, "same /64 must share a bucket");
+        assert_eq!(ka, "2001:db8:ab:cd::/64");
+    }
+
+    #[test]
     fn local_storage_does_not_produce_signed_urls() {
         let tmp = tempfile::tempdir().unwrap();
         let storage = crate::storage::local(tmp.path()).unwrap();
@@ -5731,6 +5959,86 @@ mod tests {
         assert!(visibility_is_private(&h));
         h.insert("x-ripclone-visibility", HeaderValue::from_static("public"));
         assert!(!visibility_is_private(&h));
+    }
+
+    /// A canned [`AccessVerifier`] for the authz wiring tests.
+    struct StubVerifier(AccessDecision);
+
+    #[async_trait::async_trait]
+    impl AccessVerifier for StubVerifier {
+        async fn verify(
+            &self,
+            _p: &ProviderInstance,
+            _path: &str,
+            _c: Option<&secrecy::SecretString>,
+        ) -> AccessDecision {
+            self.0
+        }
+    }
+
+    /// AU1 gate decisions: trust mode falls back to the header; enforced mode
+    /// maps the verifier's decision to public/private/403.
+    #[tokio::test]
+    async fn authorize_repo_read_maps_decisions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = test_state(&tmp);
+        let provider = state.provider_registry.get("github").unwrap().clone();
+        let repo = RepoId::github("o/r");
+        let headers = HeaderMap::new();
+
+        // Trust mode: gate skipped, visibility from header (absent → public).
+        state.require_repo_auth = false;
+        assert!(
+            !authorize_repo_read(&state, &provider, &repo, None, &headers)
+                .await
+                .unwrap()
+        );
+
+        // Enforced + public → served anonymously (private = false).
+        state.require_repo_auth = true;
+        state.access_verifier = Arc::new(StubVerifier(AccessDecision::Public));
+        assert!(
+            !authorize_repo_read(&state, &provider, &repo, None, &headers)
+                .await
+                .unwrap()
+        );
+
+        // Enforced + authorized private → private = true.
+        state.access_verifier = Arc::new(StubVerifier(AccessDecision::PrivateAuthorized));
+        assert!(
+            authorize_repo_read(&state, &provider, &repo, None, &headers)
+                .await
+                .unwrap()
+        );
+
+        // Enforced + denied → 403.
+        state.access_verifier = Arc::new(StubVerifier(AccessDecision::Denied));
+        let resp = authorize_repo_read(&state, &provider, &repo, None, &headers)
+            .await
+            .unwrap_err();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// End-to-end: a `refs` read for a repo the caller can't access returns 403
+    /// through the real route — and never reaches the build/mirror path. (Before
+    /// AU1, a cached private repo here returned 200 to any shared-token holder.)
+    #[tokio::test]
+    async fn ref_read_is_forbidden_when_access_denied() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = test_state(&tmp);
+        state.require_repo_auth = true;
+        state.access_verifier = Arc::new(StubVerifier(AccessDecision::Denied));
+        let app = build_app(state);
+
+        let resp = app
+            .oneshot(request_with_auth(
+                "GET",
+                "/v1/repos/github/o/r/refs/main",
+                Some(&auth_header()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
     #[test]
