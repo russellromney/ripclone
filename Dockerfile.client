@@ -20,6 +20,7 @@ FROM ubuntu:24.04
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git ca-certificates curl libfuse2 libgit2-1.7 time coreutils \
+    iproute2 nftables kmod perl python3 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -27,8 +28,13 @@ WORKDIR /app
 COPY --from=builder /app/target/release/ripclone /usr/local/bin/ripclone
 COPY --from=builder /app/target/release/git-remote-ripclone /usr/local/bin/git-remote-ripclone
 COPY --from=builder /app/target/release/ripclone-server /usr/local/bin/ripclone-server
+COPY --from=builder /app/target/release/writer_bench /usr/local/bin/writer_bench
 COPY scripts/fly_client_test.sh /run-tests.sh
 RUN chmod +x /run-tests.sh
+
+COPY benchmark/fly_shaped_benchmark.sh /usr/local/bin/fly_shaped_benchmark
+COPY benchmark/run_shaped_sweep.sh /usr/local/bin/run_shaped_sweep
+RUN chmod +x /usr/local/bin/fly_shaped_benchmark /usr/local/bin/run_shaped_sweep
 
 ENV RUST_LOG=info
 ENV PATH="/usr/local/bin:${PATH}"

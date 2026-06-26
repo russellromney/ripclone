@@ -282,7 +282,13 @@ async fn main() -> Result<()> {
 
             let enable_bench = bench || std::env::var_os("RIPCLONE_BENCH").is_some();
             let mut benchmark = Benchmark::new();
-            let clonepack_kind = Some(ripclone::mode::clonepack_kind_for_depth(depth));
+            // `files` mode needs the full clonepack (archive chunks); depth=1 editable
+            // can use the cheaper shallow variant.
+            let clonepack_kind = if mode.needs_archive() {
+                Some("full")
+            } else {
+                Some(ripclone::mode::clonepack_kind_for_depth(depth))
+            };
             client
                 .install_repo_with_mode(
                     owner,

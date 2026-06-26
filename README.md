@@ -52,13 +52,56 @@ ripclone stores the same `HEAD` file bytes in two formats so you can choose the 
 
 ### Performance
 
-| repo | files | `git clone --depth=1` | ripclone | speedup |
-|---|---|---|---|---|
-| `oven-sh/bun` | ~15k | ~8 s | **~4.0 s** | **2×** |
-| `facebook/react` | ~7.2k | ~3.8 s | **~1.0 s** | **3.8×** |
-| `pandas-dev/pandas` | ~2.6k | ~3.3 s | **~0.5 s** | **6.6×** |
+ripclone pre-builds git artifacts so clones are faster than `git clone` across every bandwidth we tested. On a 1000 Mbps link the wins are largest; as bandwidth drops the download itself dominates and the gap narrows.
 
-Measured on macOS over a 1 Gb/s link with a warm ripclone cache. On slower networks the absolute times grow, but ripclone is usually still faster because it transfers fewer bytes and overlaps download with extraction.
+At 1000 Mbps, measured speedups over native `git clone` are:
+
+- **`oven-sh/bun`**: full clone **7.0×**, depth-1 **5.9×**, files **10.1×**.
+- **`pandas-dev/pandas`**: full clone **4.5×**, depth-1 **3.8×**, files **4.6×**.
+- **`torvalds/linux`** (1000 Mbps only): full clone **5.5×**, depth-1 **7.6×**, files **11.2×**.
+- **`facebook/react`** was not included in this shaped sweep; earlier warm-cache measurements showed a depth-1 speedup of about **3.8×**.
+
+The full-clone win is smaller on Linux than on bun because the full pack is so large that the transfer dominates; depth-1 and `files` mode avoid most of that transfer, so they stay well ahead even on huge repos.
+
+#### Shaped bandwidth benchmark
+
+We ran `ripclone` against native `git clone` on a Fly.io `performance-8x` client talking to a `ripclone-server` over shaped links from 50 Mbps to 1000 Mbps. Each cell is a single run (n=1). `oven-sh/bun` and `pandas-dev/pandas` were measured across all five bandwidths. `torvalds/linux` was only measured at 1000 Mbps because a full `git clone` of Linux at lower bandwidths takes ~8 min per run.
+
+**`oven-sh/bun`**
+
+| Mbps | ripclone full | ripclone depth=1 | ripclone files | git clone full | git clone --depth 1 |
+|------|---------------|------------------|----------------|----------------|---------------------|
+| 1000 | 5.1 s | 1.2 s | 0.7 s | 35.9 s | 7.1 s |
+| 500 | 9.6 s | 1.9 s | 1.1 s | 35.0 s | 3.3 s |
+| 250 | 17.0 s | 3.4 s | 1.9 s | 40.7 s | 3.2 s |
+| 100 | 41.7 s | 5.9 s | 4.2 s | 67.2 s | 5.9 s |
+| 50 | 84.4 s | 11.4 s | 9.2 s | 115.6 s | 10.9 s |
+
+**`pandas-dev/pandas`**
+
+| Mbps | ripclone full | ripclone depth=1 | ripclone files | git clone full | git clone --depth 1 |
+|------|---------------|------------------|----------------|----------------|---------------------|
+| 1000 | 4.6 s | 0.6 s | 0.5 s | 20.7 s | 2.3 s |
+| 500 | 7.7 s | 0.8 s | 0.4 s | 20.9 s | 2.3 s |
+| 250 | 14.8 s | 1.3 s | 0.4 s | 24.9 s | 2.3 s |
+| 100 | 33.9 s | 2.1 s | 0.6 s | 43.0 s | 2.4 s |
+| 50 | 65.2 s | 3.0 s | 1.9 s | 75.9 s | 3.0 s |
+
+**`torvalds/linux`** (1000 Mbps only)
+
+Because a full `git clone` of Linux at lower bandwidths takes ~8 min per run, we only measured the 1000 Mbps point.
+
+| Mbps | ripclone full | ripclone depth=1 | ripclone files | git clone full | git clone --depth 1 |
+|------|---------------|------------------|----------------|----------------|---------------------|
+| 1000 | 84.3 s | 4.4 s | 3.0 s | 462.9 s | 33.5 s |
+
+That works out to **5.5×** for full, **7.6×** for depth-1, and **11.2×** for files.
+
+The ratio graph below shows **ripclone time / git time**; anything below the dashed `1.0` line means ripclone was faster.
+
+![shaped benchmark ratios](benchmark/shaped_ratios.png)
+
+At 1000 Mbps, `ripclone depth=1` and `ripclone files` are roughly 5× faster than `git clone --depth 1` for pandas and `torvalds/linux`; the gap narrows as bandwidth drops, but ripclone stays faster across every tested rate.
 
 ## Quick start
 
