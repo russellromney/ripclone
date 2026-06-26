@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicUsize;
 use tokio::sync::mpsc;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Capacity of the in-process queue channel (only used by the local backend).
 pub const LOCAL_QUEUE_CAPACITY: usize = 1024;
@@ -120,19 +120,20 @@ async fn select_metadata(
     let kind =
         env_or("RIPCLONE_METADATA", config().metadata.backend.as_deref()).unwrap_or_default();
 
-    // A per-host file metadata store can't back a queue whose builds run on other
-    // hosts: each worker and the server would read and write their own local ref
-    // files, so a worker's build would be invisible to the server. Refuse the
-    // combination with a clear message instead of silently losing refs.
+    // Warn when a networked queue is paired with per-host file metadata. If the
+    // workers run on other hosts, each reads and writes its own local ref files
+    // and a worker's build is invisible to the server. It's valid when the server
+    // and workers share one filesystem (same box), which we can't tell apart
+    // here, so warn loudly rather than refuse — the point is to break the silence.
     let resolves_to_file = kind == "file" || (kind.is_empty() && s3.is_none());
     if resolves_to_file {
         let queue = queue_kind();
         if matches!(queue.as_str(), "postgres" | "mysql" | "libsql") {
-            anyhow::bail!(
-                "RIPCLONE_QUEUE={queue} runs builds on other hosts, but the metadata store \
-                 resolves to per-host files. Set a shared metadata store \
-                 (RIPCLONE_METADATA=s3|postgres|mysql|libsql) so the server and workers \
-                 share refs."
+            warn!(
+                "RIPCLONE_QUEUE={queue} can run builds on other hosts, but the metadata store \
+                 resolves to per-host files. If workers don't share this filesystem, set a \
+                 shared metadata store (RIPCLONE_METADATA=s3|postgres|mysql|libsql) so the \
+                 server and workers share refs."
             );
         }
     }
