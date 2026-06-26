@@ -430,8 +430,17 @@ where
                                             format!("decompress frame {} with dictionary", idx)
                                         })?
                                 }
-                                None => zstd::decode_all(compressed.as_slice())
-                                    .with_context(|| format!("decompress frame {}", idx))?,
+                                None => {
+                                    // Cap the output at the frame's declared raw
+                                    // length, like the dictionary branch above.
+                                    // `decode_all` is unbounded, so a bad frame
+                                    // could expand without limit before the length
+                                    // check below.
+                                    zstd::bulk::Decompressor::new()
+                                        .context("create zstd decompressor")?
+                                        .decompress(&compressed, frame.raw_len as usize)
+                                        .with_context(|| format!("decompress frame {}", idx))?
+                                }
                             }
                         });
                     if raw.len() != frame.raw_len as usize {
@@ -746,11 +755,25 @@ fn safe_create_dir_all(root: &Path, rel: &Path) -> Result<()> {
                     current.display()
                 );
             }
-            if !current.exists() {
-                std::fs::create_dir(&current)
-                    .with_context(|| format!("create dir {}", current.display()))?;
-            } else if !current.is_dir() {
-                anyhow::bail!("path is not a directory: {}", current.display());
+            // Create unconditionally and tolerate a concurrent creator. Probing
+            // with `exists()` first races when several producer threads create
+            // the same parent at once (one wins, the rest hit EEXIST and error).
+            match std::fs::create_dir(&current) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if current.is_symlink() {
+                        anyhow::bail!(
+                            "refusing to follow symlinked directory: {}",
+                            current.display()
+                        );
+                    }
+                    if !current.is_dir() {
+                        anyhow::bail!("path is not a directory: {}", current.display());
+                    }
+                }
+                Err(e) => {
+                    return Err(e).with_context(|| format!("create dir {}", current.display()));
+                }
             }
         }
     }
@@ -1203,8 +1226,17 @@ pub fn extract_archive_from_chunk_receiver(
                                             format!("decompress frame {} with dictionary", idx)
                                         })?
                                 }
-                                None => zstd::decode_all(compressed.as_slice())
-                                    .with_context(|| format!("decompress frame {}", idx))?,
+                                None => {
+                                    // Cap the output at the frame's declared raw
+                                    // length, like the dictionary branch above.
+                                    // `decode_all` is unbounded, so a bad frame
+                                    // could expand without limit before the length
+                                    // check below.
+                                    zstd::bulk::Decompressor::new()
+                                        .context("create zstd decompressor")?
+                                        .decompress(&compressed, frame.raw_len as usize)
+                                        .with_context(|| format!("decompress frame {}", idx))?
+                                }
                             }
                         });
                     if raw.len() != frame.raw_len as usize {
