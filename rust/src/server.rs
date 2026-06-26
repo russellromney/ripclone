@@ -60,6 +60,9 @@ pub struct ServerState {
     /// when the build finishes.
     pub build_waiters: BuildWaiters,
     pub oidc_verifier: Option<Arc<OidcVerifier>>,
+    /// HMAC secret for the push-webhook receiver (`RIPCLONE_WEBHOOK_SECRET`).
+    /// `None` disables the webhook route (returns 501). Mirrors `oidc_verifier`.
+    pub webhook_secret: Option<secrecy::SecretString>,
     /// Per-repo mutexes so concurrent syncs for the same repo cannot corrupt
     /// the bare mirror directory.
     pub sync_locks: Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
@@ -115,6 +118,7 @@ impl ServerState {
             build_queue_depth: Arc::new(AtomicUsize::new(0)),
             build_waiters: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             oidc_verifier: None,
+            webhook_secret: None,
             sync_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             mirror_freshness: Arc::new(std::sync::Mutex::new(HashMap::new())),
             mirror_fresh_ttl: Duration::from_secs(60),
@@ -528,6 +532,9 @@ pub fn build_app(state: ServerState) -> Router {
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics_handler))
         .route("/v1/build", post(build_handler))
+        // Push-webhook receiver: authenticated by HMAC signature on the body, not
+        // the ripclone bearer token, so it lives outside the `protected` layer.
+        .route("/v1/webhooks/github", post(github_webhook_handler))
         .merge(protected)
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -2274,6 +2281,58 @@ fn inproc_build_key(repo_id: &RepoId, branch: &str, rev: Option<&str>) -> String
     format!("{}/{branch}#{}", repo_id.storage_key(), rev.unwrap_or(""))
 }
 
+/// Fire-and-forget: enqueue a build for `(repo_id, branch)` at the branch tip and
+/// return immediately — the build runs ahead of any clone (build-before-clone).
+/// Used by the `/build` OIDC endpoint, the push-webhook receiver, and the poll
+/// loop. On the in-process queue it coalesces against an in-flight build exactly
+/// like `/sync` (and releases the marker if the enqueue is rejected); the SQL
+/// queue coalesces by key itself. Credentials come from the server's standing
+/// provider token (the caller carries no per-request token). Returns `Ok` if the
+/// build is queued or folded into one already running; `Err(msg)` if the queue is
+/// full or unavailable.
+async fn trigger_build(state: &ServerState, repo_id: &RepoId, branch: &str) -> Result<(), String> {
+    let credential = state.broker.fetch_credential(repo_id, None);
+    let job = BuildJob {
+        repo_id: repo_id.clone(),
+        branch: branch.to_string(),
+        rev: None,
+        credential,
+    };
+
+    if state.build_queue.inproc_wait() {
+        let key = inproc_build_key(repo_id, branch, None);
+        let first = {
+            let mut w = state.build_waiters.lock().await;
+            let first = !w.contains_key(&key);
+            w.entry(key).or_default();
+            first
+        };
+        if !first {
+            // A build for this key is already in flight; fold into it.
+            state.metrics.record_build_accepted();
+            return Ok(());
+        }
+    }
+
+    state.metrics.record_build_queued();
+    let enq = state.build_queue.enqueue(job).await;
+    if matches!(&enq, Ok(e) if e.outcome != EnqueueOutcome::Full) {
+        state.metrics.record_build_accepted();
+        return Ok(());
+    }
+    state.metrics.record_build_rejected();
+    // Release the in-flight marker, or the key stays "building" forever and every
+    // later sync/webhook for it coalesces onto nothing.
+    if state.build_queue.inproc_wait() {
+        let key = inproc_build_key(repo_id, branch, None);
+        state.build_waiters.lock().await.remove(&key);
+    }
+    Err(match enq {
+        Err(e) => format!("build queue unavailable: {e}"),
+        _ => "build queue full".to_string(),
+    })
+}
+
 async fn build_handler(
     headers: HeaderMap,
     State(state): State<ServerState>,
@@ -2354,72 +2413,170 @@ async fn build_handler(
     }
 
     let job_repo_id = RepoId::github(format!("{}/{}", body.owner, body.repo));
-    let credential = state.broker.fetch_credential(&job_repo_id, None);
-    let job = BuildJob {
-        repo_id: job_repo_id.clone(),
-        branch: "HEAD".to_string(),
-        rev: None,
-        credential,
+
+    // Fire-and-forget: the build runs ahead of any clone; we don't wait for it.
+    match trigger_build(&state, &job_repo_id, "HEAD").await {
+        Ok(()) => (
+            StatusCode::ACCEPTED,
+            Json(BuildResponse {
+                status: "queued".to_string(),
+                queue_depth: state.build_queue.depth().await,
+            }),
+        )
+            .into_response(),
+        Err(error) => {
+            state.metrics.record_error();
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse { error }),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Minimal GitHub push-event payload — only the fields the receiver needs.
+#[derive(serde::Deserialize)]
+struct GithubPushEvent {
+    #[serde(rename = "ref")]
+    git_ref: String,
+    #[serde(default)]
+    after: String,
+    #[serde(default)]
+    deleted: bool,
+    repository: GithubPushRepo,
+}
+
+#[derive(serde::Deserialize)]
+struct GithubPushRepo {
+    full_name: String,
+}
+
+/// Verify GitHub's `X-Hub-Signature-256: sha256=<hex>` over the raw body, using
+/// HMAC-SHA256 with the configured secret. Constant-time (hmac's `verify_slice`).
+fn verify_github_signature(secret: &secrecy::SecretString, body: &[u8], header: &str) -> bool {
+    use hmac::{Hmac, Mac};
+    use secrecy::ExposeSecret;
+    use sha2::Sha256;
+
+    let Some(hex_sig) = header.strip_prefix("sha256=") else {
+        return false;
+    };
+    let Ok(expected) = hex::decode(hex_sig) else {
+        return false;
+    };
+    let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(secret.expose_secret().as_bytes()) else {
+        return false;
+    };
+    mac.update(body);
+    mac.verify_slice(&expected).is_ok()
+}
+
+/// Native GitHub push-webhook receiver. Verifies the HMAC signature, then triggers
+/// a build of the pushed branch immediately (fire-and-forget) so artifacts are
+/// ready before any clone — no per-repo Actions workflow required. Authenticated
+/// by signature, not the ripclone bearer token (it sits outside the auth layer).
+async fn github_webhook_handler(
+    headers: HeaderMap,
+    State(state): State<ServerState>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let Some(secret) = &state.webhook_secret else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(ErrorResponse {
+                error: "webhook receiver not configured (set RIPCLONE_WEBHOOK_SECRET)".to_string(),
+            }),
+        )
+            .into_response();
     };
 
-    // On the in-process queue, coalesce against an in-flight build for this key the
-    // same way `/sync` does — otherwise a webhook racing a `/sync` for the same
-    // HEAD enqueues a duplicate build that just serializes on the repo lock and is
-    // thrown away. The SQL queue already coalesces by key, so only the in-process
-    // path needs this gate. Fire-and-forget: mark the key in-flight (no waiter).
-    if state.build_queue.inproc_wait() {
-        let key = inproc_build_key(&job_repo_id, "HEAD", None);
-        let first = {
-            let mut w = state.build_waiters.lock().await;
-            let first = !w.contains_key(&key);
-            w.entry(key).or_default();
-            first
-        };
-        if !first {
-            // A build for this key is already in flight; the webhook folds into it.
-            state.metrics.record_build_accepted();
+    // GitHub sends `ping` and other events to the same URL; only act on pushes.
+    let event = headers
+        .get("X-GitHub-Event")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if event != "push" {
+        return StatusCode::NO_CONTENT.into_response();
+    }
+
+    // Verify the signature over the EXACT bytes GitHub signed, before parsing.
+    let signature = headers
+        .get("X-Hub-Signature-256")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if !verify_github_signature(secret, &body, signature) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                error: "invalid webhook signature".to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    let payload: GithubPushEvent = match serde_json::from_slice(&body) {
+        Ok(p) => p,
+        Err(e) => {
             return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: format!("bad push payload: {e}"),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    // Branch pushes only; ignore tag/other refs and branch deletions.
+    let Some(branch) = payload.git_ref.strip_prefix("refs/heads/") else {
+        return StatusCode::NO_CONTENT.into_response();
+    };
+    if payload.deleted || payload.after.chars().all(|c| c == '0') {
+        return StatusCode::NO_CONTENT.into_response();
+    }
+
+    let Some((owner, repo)) = payload.repository.full_name.split_once('/') else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "bad repository.full_name".to_string(),
+            }),
+        )
+            .into_response();
+    };
+    if let Some(resp) = reject_invalid_repo_ids(owner, repo) {
+        return resp;
+    }
+    if let Some(resp) = validation::reject_if_invalid(|| validation::validate_git_rev(branch)) {
+        return resp;
+    }
+    let repo_id = RepoId::github(format!("{owner}/{repo}"));
+
+    match trigger_build(&state, &repo_id, branch).await {
+        Ok(()) => {
+            info!(
+                "webhook: triggered build for {}@{branch}",
+                repo_id.storage_key()
+            );
+            (
                 StatusCode::ACCEPTED,
                 Json(BuildResponse {
                     status: "queued".to_string(),
                     queue_depth: state.build_queue.depth().await,
                 }),
             )
-                .into_response();
+                .into_response()
+        }
+        Err(error) => {
+            state.metrics.record_error();
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse { error }),
+            )
+                .into_response()
         }
     }
-
-    state.metrics.record_build_queued();
-    let enq = state.build_queue.enqueue(job).await;
-    let accepted = matches!(&enq, Ok(e) if e.outcome != EnqueueOutcome::Full);
-    if !accepted {
-        state.metrics.record_build_rejected();
-        // Release the in-flight marker we set above, or the key stays "building"
-        // forever and every later sync/webhook for it coalesces onto nothing.
-        if state.build_queue.inproc_wait() {
-            let key = inproc_build_key(&job_repo_id, "HEAD", None);
-            state.build_waiters.lock().await.remove(&key);
-        }
-        let error = match enq {
-            Err(e) => format!("build queue unavailable: {e}"),
-            _ => "build queue full".to_string(),
-        };
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse { error }),
-        )
-            .into_response();
-    }
-    state.metrics.record_build_accepted();
-
-    (
-        StatusCode::ACCEPTED,
-        Json(BuildResponse {
-            status: "queued".to_string(),
-            queue_depth: state.build_queue.depth().await,
-        }),
-    )
-        .into_response()
 }
 
 async fn cat_file_inner(
@@ -5201,6 +5358,17 @@ pub async fn run_server(
         info!("OIDC verification enabled for audience configured via RIPCLONE_OIDC_AUDIENCE");
     }
 
+    // Optional push-webhook HMAC secret. When set, /v1/webhooks/github verifies
+    // GitHub's X-Hub-Signature-256 and triggers a build on push (build before
+    // clone, no per-repo Actions workflow needed).
+    let webhook_secret = env::var("RIPCLONE_WEBHOOK_SECRET")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(|s| secrecy::SecretString::new(s.into()));
+    if webhook_secret.is_some() {
+        info!("push-webhook receiver enabled (RIPCLONE_WEBHOOK_SECRET set)");
+    }
+
     // Select the queue backend. The local queue drives an in-process worker; the
     // SQL queues' builds run in separate ripclone-worker processes, so the server
     // only enqueues.
@@ -5224,6 +5392,7 @@ pub async fn run_server(
         build_queue_depth,
         build_waiters: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         oidc_verifier,
+        webhook_secret,
         sync_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         mirror_freshness: Arc::new(std::sync::Mutex::new(HashMap::new())),
         mirror_fresh_ttl: Duration::from_secs(
@@ -5292,6 +5461,7 @@ mod tests {
             build_queue_depth: Arc::new(AtomicUsize::new(0)),
             build_waiters: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             oidc_verifier: None,
+            webhook_secret: None,
             sync_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             mirror_freshness: Arc::new(std::sync::Mutex::new(HashMap::new())),
             mirror_fresh_ttl: Duration::from_secs(60),
@@ -5645,6 +5815,145 @@ mod tests {
                 .commit,
             "X",
             "reuse must advance the pointer to the current tip despite a newer prior synced_at"
+        );
+    }
+
+    /// `test_state` drops the build-queue receiver, so a fire-and-forget enqueue
+    /// would fail. This variant keeps the receiver alive (drained in the
+    /// background) so enqueues succeed — we assert the HTTP response, not the
+    /// build itself.
+    fn test_state_draining(tmp: &tempfile::TempDir) -> ServerState {
+        let mut state = test_state(tmp);
+        let (queue, mut rx, depth) = crate::queue::LocalJobQueue::new(64);
+        state.build_queue = Arc::new(queue);
+        state.build_queue_depth = depth;
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        state
+    }
+
+    fn gh_sign(secret: &str, body: &[u8]) -> String {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(body);
+        format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
+    }
+
+    fn webhook_request(
+        event: &str,
+        signature: &str,
+        body: Vec<u8>,
+    ) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/webhooks/github")
+            .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))))
+            .header("X-GitHub-Event", event)
+            .header("X-Hub-Signature-256", signature)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body))
+            .unwrap()
+    }
+
+    const PUSH_BODY: &[u8] =
+        br#"{"ref":"refs/heads/main","after":"abc1234","deleted":false,"repository":{"full_name":"acme/widget"}}"#;
+
+    #[tokio::test]
+    async fn webhook_valid_push_triggers_build() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = test_state_draining(&tmp);
+        state.webhook_secret = Some(secrecy::SecretString::new("whsecret".into()));
+        let app = build_app(state);
+
+        let sig = gh_sign("whsecret", PUSH_BODY);
+        let resp = app
+            .oneshot(webhook_request("push", &sig, PUSH_BODY.to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::ACCEPTED,
+            "valid push triggers build"
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_bad_signature_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = test_state(&tmp);
+        state.webhook_secret = Some(secrecy::SecretString::new("whsecret".into()));
+        let app = build_app(state);
+
+        // Signed with the wrong secret.
+        let sig = gh_sign("wrong-secret", PUSH_BODY);
+        let resp = app
+            .oneshot(webhook_request("push", &sig, PUSH_BODY.to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "bad signature rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_unconfigured_returns_501() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(&tmp); // webhook_secret = None
+        let app = build_app(state);
+
+        let sig = gh_sign("whsecret", PUSH_BODY);
+        let resp = app
+            .oneshot(webhook_request("push", &sig, PUSH_BODY.to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_IMPLEMENTED,
+            "no secret configured → 501"
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_ping_event_acked_without_build() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = test_state(&tmp);
+        state.webhook_secret = Some(secrecy::SecretString::new("whsecret".into()));
+        let app = build_app(state);
+
+        let body = br#"{"zen":"hi"}"#.to_vec();
+        let sig = gh_sign("whsecret", &body);
+        let resp = app
+            .oneshot(webhook_request("ping", &sig, body))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NO_CONTENT,
+            "ping is acked, no build"
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_branch_delete_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = test_state(&tmp);
+        state.webhook_secret = Some(secrecy::SecretString::new("whsecret".into()));
+        let app = build_app(state);
+
+        let body =
+            br#"{"ref":"refs/heads/dead","after":"0000000000000000000000000000000000000000","deleted":true,"repository":{"full_name":"acme/widget"}}"#
+                .to_vec();
+        let sig = gh_sign("whsecret", &body);
+        let resp = app
+            .oneshot(webhook_request("push", &sig, body))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NO_CONTENT,
+            "branch delete triggers no build"
         );
     }
 
