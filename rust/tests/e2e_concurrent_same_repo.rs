@@ -202,3 +202,61 @@ async fn concurrent_builds_during_tip_advancing_fetch_stay_correct() {
         assert_branch_isolated(&c, branch, *depth, &branches);
     }
 }
+
+/// The fast-moving-repo case on a SINGLE branch: commits land in quick
+/// succession while syncs fire. Concurrent same-branch syncs coalesce (one build
+/// at a time), but the churn still overlaps a build's read of the mirror with the
+/// next sync's fetch + the prior build's background phase 2. The system must
+/// never corrupt and must converge to the final commit with full, correct
+/// history. (Per-commit intermediate states aren't separately retrievable —
+/// the server keeps one entry per branch — so we assert convergence + integrity.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fast_moving_single_branch_converges_and_stays_correct() {
+    unsafe { std::env::set_var("RIPCLONE_BUILD_CONCURRENCY", "8") };
+    setup(true, true, true);
+    let server = start_server().await;
+    let origin = make_origin("acme", "fast");
+
+    const N: usize = 8;
+    let mut handles = Vec::new();
+    for i in 1..=N {
+        // Each commit advances f.txt and adds a unique file, so the final tree is
+        // an exact, checkable fingerprint of all N commits.
+        origin.commit(
+            &[("f.txt", &format!("v{i}\n")), (&format!("c{i}.txt"), "x\n")],
+            &format!("c{i}"),
+        );
+        origin.publish();
+        // Fire a sync without waiting, so it overlaps later commits/fetches.
+        let client = server.client();
+        handles.push(tokio::spawn(async move {
+            client.sync_repo("acme/fast", None).await
+        }));
+    }
+    // Drain the in-flight syncs; intermediate results vary (each returns whatever
+    // tip was current), so we don't assert on them — only that none errored.
+    for h in handles {
+        h.await
+            .expect("join")
+            .unwrap_or_else(|e| panic!("churn sync failed: {e}"));
+    }
+
+    // One clean sync of the settled tip, then verify convergence + integrity:
+    // exactly N commits, the final content, every commit's file present, and a
+    // clean fsck. Mid-churn corruption would surface here.
+    server
+        .client()
+        .sync_repo("acme/fast", None)
+        .await
+        .expect("final sync");
+    let (_g, c) = clone_branch_full(&server, "fast", "HEAD", &N.to_string()).await;
+    assert_eq!(
+        read(&c, "f.txt"),
+        format!("v{N}\n"),
+        "converged to final commit"
+    );
+    for i in 1..=N {
+        assert!(c.join(format!("c{i}.txt")).exists(), "commit c{i} present");
+    }
+    assert_repo_usable(&c, &N.to_string());
+}
