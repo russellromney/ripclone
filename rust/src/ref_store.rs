@@ -566,7 +566,11 @@ impl<T: RefStore> RefStore for CachingRefStore<T> {
         let key = Self::cache_key(repo_id, branch);
         let mut cache = self.cache.write().await;
         self.inner.save_branch(repo_id, branch, info).await?;
-        cache.insert(key, (Instant::now(), info.clone()));
+        // The inner store may skip this write when it already holds a newer ref.
+        // Caching `info` here would then serve the older one until the entry
+        // expires. Drop the cache entry instead; the next load reads the kept
+        // value through and refills the cache.
+        cache.remove(&key);
         Ok(())
     }
 
@@ -699,6 +703,34 @@ mod tests {
 
         let loaded = store.load(&repo_id).await.unwrap().unwrap();
         assert_eq!(loaded.commit, "cached");
+    }
+
+    /// After an older write loses at the durable layer, the cache must not keep
+    /// serving it — the next read must return the newer ref.
+    #[tokio::test]
+    async fn caching_ref_store_does_not_serve_stale_after_losing_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = CachingRefStore {
+            inner: FileRefStore::new(tmp.path()),
+            ttl: Duration::from_secs(60),
+            cache: RwLock::new(HashMap::new()),
+        };
+        let repo_id = RepoId::github("o/r");
+
+        let mut newer = dummy_ref_info("c2");
+        newer.synced_at = Some(2);
+        let mut older = dummy_ref_info("c1");
+        older.synced_at = Some(1);
+
+        store.save_branch(&repo_id, "main", &newer).await.unwrap();
+        // The durable store keeps the newer ref and skips this older one.
+        store.save_branch(&repo_id, "main", &older).await.unwrap();
+
+        let loaded = store.load_branch(&repo_id, "main").await.unwrap().unwrap();
+        assert_eq!(
+            loaded.commit, "c2",
+            "cache must not serve the older ref that lost the durable write"
+        );
     }
 
     #[tokio::test]
