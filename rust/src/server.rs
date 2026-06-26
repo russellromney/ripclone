@@ -61,6 +61,9 @@ pub struct ServerState {
     /// when the build finishes.
     pub build_waiters: BuildWaiters,
     pub oidc_verifier: Option<Arc<OidcVerifier>>,
+    /// HMAC secret for the push-webhook receiver (`RIPCLONE_WEBHOOK_SECRET`).
+    /// `None` disables the webhook route (returns 501). Mirrors `oidc_verifier`.
+    pub webhook_secret: Option<secrecy::SecretString>,
     /// Per-repo mutexes so concurrent syncs for the same repo cannot corrupt
     /// the bare mirror directory.
     pub sync_locks: Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
@@ -125,6 +128,7 @@ impl ServerState {
             build_queue_depth: Arc::new(AtomicUsize::new(0)),
             build_waiters: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             oidc_verifier: None,
+            webhook_secret: None,
             sync_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             mirror_freshness: Arc::new(std::sync::Mutex::new(HashMap::new())),
             mirror_fresh_ttl: Duration::from_secs(60),
@@ -551,6 +555,9 @@ pub fn build_app(state: ServerState) -> Router {
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics_handler))
         .route("/v1/build", post(build_handler))
+        // Push-webhook receiver: authenticated by HMAC signature on the body, not
+        // the ripclone bearer token, so it lives outside the `protected` layer.
+        .route("/v1/webhooks/github", post(github_webhook_handler))
         .merge(protected)
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -1328,6 +1335,11 @@ async fn ensure_mirror(
     let repo_id = repo_id.clone();
     let branch = branch.to_string();
     let credential = credential.cloned();
+    // Same process-global fetch cap as the build path.
+    let _fetch_permit = fetch_semaphore()
+        .acquire()
+        .await
+        .expect("fetch semaphore never closed");
     tokio::task::spawn_blocking(move || {
         git::sync_bare_mirror(
             &mirror_dir,
@@ -2080,18 +2092,16 @@ async fn sync_repo_inner(
             // worker signals completion on a oneshot. Include the rev override in
             // the coalescing key so syncs for different build commits don't share
             // one build.
-            let key = format!(
-                "{}/{branch}#{}",
-                repo_id.storage_key(),
-                at_rev.as_deref().unwrap_or("")
-            );
+            let key = inproc_build_key(&repo_id, &branch, at_rev.as_deref());
             let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
             let first = {
                 let mut w = state.build_waiters.lock().await;
-                let v = w.entry(key.clone()).or_default();
-                let was_empty = v.is_empty();
-                v.push(tx);
-                was_empty
+                // Presence-based: a key present — even an empty marker left by the
+                // /build webhook — means a build is already in flight, so coalesce
+                // onto it rather than enqueueing a duplicate.
+                let first = !w.contains_key(&key);
+                w.entry(key.clone()).or_default().push(tx);
+                first
             };
             if first {
                 // Mirror the /build handler: the worker decrements the metrics
@@ -2353,8 +2363,9 @@ async fn sync_repo_inner(
         }
     }
 
+    // do_sync acquires this per-repo lock itself, holding it only across the
+    // mirror-mutating prep and releasing it before the heavy read-only build.
     let lock = repo_lock(&state.sync_locks, &repo_id).await;
-    let _guard = lock.lock().await;
     match do_sync(
         &state.cas,
         &mirror_dir,
@@ -2369,6 +2380,7 @@ async fn sync_repo_inner(
         &state.retention,
         &provider,
         credential.as_ref(),
+        &lock,
     )
     .await
     {
@@ -2401,11 +2413,9 @@ async fn sync_repo_inner(
                 "full",
                 private,
             );
-            drop(_guard);
             (StatusCode::OK, Json(resp)).into_response()
         }
         Err(e) => {
-            drop(_guard);
             state.metrics.record_error();
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -2416,6 +2426,65 @@ async fn sync_repo_inner(
                 .into_response()
         }
     }
+}
+
+/// Coalescing key for the in-process queue: concurrent builds for the same
+/// `repo/branch#rev` collapse onto one. `/sync` and the `/build` webhook MUST
+/// produce the identical key for the same target, or they double-build.
+fn inproc_build_key(repo_id: &RepoId, branch: &str, rev: Option<&str>) -> String {
+    format!("{}/{branch}#{}", repo_id.storage_key(), rev.unwrap_or(""))
+}
+
+/// Fire-and-forget: enqueue a build for `(repo_id, branch)` at the branch tip and
+/// return immediately — the build runs ahead of any clone (build-before-clone).
+/// Used by the `/build` OIDC endpoint, the push-webhook receiver, and the poll
+/// loop. On the in-process queue it coalesces against an in-flight build exactly
+/// like `/sync` (and releases the marker if the enqueue is rejected); the SQL
+/// queue coalesces by key itself. Credentials come from the server's standing
+/// provider token (the caller carries no per-request token). Returns `Ok` if the
+/// build is queued or folded into one already running; `Err(msg)` if the queue is
+/// full or unavailable.
+async fn trigger_build(state: &ServerState, repo_id: &RepoId, branch: &str) -> Result<(), String> {
+    let credential = state.broker.fetch_credential(repo_id, None);
+    let job = BuildJob {
+        repo_id: repo_id.clone(),
+        branch: branch.to_string(),
+        rev: None,
+        credential,
+    };
+
+    if state.build_queue.inproc_wait() {
+        let key = inproc_build_key(repo_id, branch, None);
+        let first = {
+            let mut w = state.build_waiters.lock().await;
+            let first = !w.contains_key(&key);
+            w.entry(key).or_default();
+            first
+        };
+        if !first {
+            // A build for this key is already in flight; fold into it.
+            state.metrics.record_build_accepted();
+            return Ok(());
+        }
+    }
+
+    state.metrics.record_build_queued();
+    let enq = state.build_queue.enqueue(job).await;
+    if matches!(&enq, Ok(e) if e.outcome != EnqueueOutcome::Full) {
+        state.metrics.record_build_accepted();
+        return Ok(());
+    }
+    state.metrics.record_build_rejected();
+    // Release the in-flight marker, or the key stays "building" forever and every
+    // later sync/webhook for it coalesces onto nothing.
+    if state.build_queue.inproc_wait() {
+        let key = inproc_build_key(repo_id, branch, None);
+        state.build_waiters.lock().await.remove(&key);
+    }
+    Err(match enq {
+        Err(e) => format!("build queue unavailable: {e}"),
+        _ => "build queue full".to_string(),
+    })
 }
 
 async fn build_handler(
@@ -2498,39 +2567,170 @@ async fn build_handler(
     }
 
     let job_repo_id = RepoId::github(format!("{}/{}", body.owner, body.repo));
-    let credential = state.broker.fetch_credential(&job_repo_id, None);
-    let job = BuildJob {
-        repo_id: job_repo_id,
-        branch: "HEAD".to_string(),
-        rev: None,
-        credential,
+
+    // Fire-and-forget: the build runs ahead of any clone; we don't wait for it.
+    match trigger_build(&state, &job_repo_id, "HEAD").await {
+        Ok(()) => (
+            StatusCode::ACCEPTED,
+            Json(BuildResponse {
+                status: "queued".to_string(),
+                queue_depth: state.build_queue.depth().await,
+            }),
+        )
+            .into_response(),
+        Err(error) => {
+            state.metrics.record_error();
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse { error }),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Minimal GitHub push-event payload — only the fields the receiver needs.
+#[derive(serde::Deserialize)]
+struct GithubPushEvent {
+    #[serde(rename = "ref")]
+    git_ref: String,
+    #[serde(default)]
+    after: String,
+    #[serde(default)]
+    deleted: bool,
+    repository: GithubPushRepo,
+}
+
+#[derive(serde::Deserialize)]
+struct GithubPushRepo {
+    full_name: String,
+}
+
+/// Verify GitHub's `X-Hub-Signature-256: sha256=<hex>` over the raw body, using
+/// HMAC-SHA256 with the configured secret. Constant-time (hmac's `verify_slice`).
+fn verify_github_signature(secret: &secrecy::SecretString, body: &[u8], header: &str) -> bool {
+    use hmac::{Hmac, Mac};
+    use secrecy::ExposeSecret;
+    use sha2::Sha256;
+
+    let Some(hex_sig) = header.strip_prefix("sha256=") else {
+        return false;
+    };
+    let Ok(expected) = hex::decode(hex_sig) else {
+        return false;
+    };
+    let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(secret.expose_secret().as_bytes()) else {
+        return false;
+    };
+    mac.update(body);
+    mac.verify_slice(&expected).is_ok()
+}
+
+/// Native GitHub push-webhook receiver. Verifies the HMAC signature, then triggers
+/// a build of the pushed branch immediately (fire-and-forget) so artifacts are
+/// ready before any clone — no per-repo Actions workflow required. Authenticated
+/// by signature, not the ripclone bearer token (it sits outside the auth layer).
+async fn github_webhook_handler(
+    headers: HeaderMap,
+    State(state): State<ServerState>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let Some(secret) = &state.webhook_secret else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(ErrorResponse {
+                error: "webhook receiver not configured (set RIPCLONE_WEBHOOK_SECRET)".to_string(),
+            }),
+        )
+            .into_response();
     };
 
-    state.metrics.record_build_queued();
-    let enq = state.build_queue.enqueue(job).await;
-    let accepted = matches!(&enq, Ok(e) if e.outcome != EnqueueOutcome::Full);
-    if !accepted {
-        state.metrics.record_build_rejected();
-        let error = match enq {
-            Err(e) => format!("build queue unavailable: {e}"),
-            _ => "build queue full".to_string(),
-        };
+    // GitHub sends `ping` and other events to the same URL; only act on pushes.
+    let event = headers
+        .get("X-GitHub-Event")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if event != "push" {
+        return StatusCode::NO_CONTENT.into_response();
+    }
+
+    // Verify the signature over the EXACT bytes GitHub signed, before parsing.
+    let signature = headers
+        .get("X-Hub-Signature-256")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if !verify_github_signature(secret, &body, signature) {
         return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse { error }),
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                error: "invalid webhook signature".to_string(),
+            }),
         )
             .into_response();
     }
-    state.metrics.record_build_accepted();
 
-    (
-        StatusCode::ACCEPTED,
-        Json(BuildResponse {
-            status: "queued".to_string(),
-            queue_depth: state.build_queue.depth().await,
-        }),
-    )
-        .into_response()
+    let payload: GithubPushEvent = match serde_json::from_slice(&body) {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: format!("bad push payload: {e}"),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    // Branch pushes only; ignore tag/other refs and branch deletions.
+    let Some(branch) = payload.git_ref.strip_prefix("refs/heads/") else {
+        return StatusCode::NO_CONTENT.into_response();
+    };
+    if payload.deleted || payload.after.chars().all(|c| c == '0') {
+        return StatusCode::NO_CONTENT.into_response();
+    }
+
+    let Some((owner, repo)) = payload.repository.full_name.split_once('/') else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "bad repository.full_name".to_string(),
+            }),
+        )
+            .into_response();
+    };
+    if let Some(resp) = reject_invalid_repo_ids(owner, repo) {
+        return resp;
+    }
+    if let Some(resp) = validation::reject_if_invalid(|| validation::validate_git_rev(branch)) {
+        return resp;
+    }
+    let repo_id = RepoId::github(format!("{owner}/{repo}"));
+
+    match trigger_build(&state, &repo_id, branch).await {
+        Ok(()) => {
+            info!(
+                "webhook: triggered build for {}@{branch}",
+                repo_id.storage_key()
+            );
+            (
+                StatusCode::ACCEPTED,
+                Json(BuildResponse {
+                    status: "queued".to_string(),
+                    queue_depth: state.build_queue.depth().await,
+                }),
+            )
+                .into_response()
+        }
+        Err(error) => {
+            state.metrics.record_error();
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse { error }),
+            )
+                .into_response()
+        }
+    }
 }
 
 async fn cat_file_inner(
@@ -2634,7 +2834,6 @@ async fn create_snapshot_inner(
     let branch = query.branch.clone();
 
     let lock = repo_lock(&state.sync_locks, &repo_id).await;
-    let _guard = lock.lock().await;
     let info = match do_sync(
         &state.cas,
         &mirror_dir,
@@ -2649,16 +2848,15 @@ async fn create_snapshot_inner(
         &state.retention,
         &provider,
         credential.as_ref(),
+        &lock,
     )
     .await
     {
         Ok(info) => {
             invalidate_ref_response_cache(&state, &repo_id, &branch);
-            drop(_guard);
             info
         }
         Err(e) => {
-            drop(_guard);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
@@ -3414,6 +3612,44 @@ async fn settle_storage(
     }
 }
 
+/// Reuse an existing build for `commit` instead of building, if one exists.
+/// First the branch's own completed full build (the common case), then any other
+/// branch already built at this exact commit (commit-keyed reuse, via the
+/// metadata store's `commit_id` index). On a cross-branch hit, publish the reused
+/// `RefInfo` under `branch` so the next sync/resolve of this branch is a
+/// branch-scoped no-op. The artifacts are commit-specific and branch-independent,
+/// so re-pointing the branch is sound. Returns the reusable build, or None.
+async fn reuse_existing_build(
+    ref_store: &Arc<dyn RefStore>,
+    repo_id: &RepoId,
+    branch: &str,
+    commit: &str,
+) -> Option<RefInfo> {
+    if let Ok(Some(prev)) = ref_store.load_branch(repo_id, branch).await
+        && prev.full_clonepack.commit == commit
+        && !prev.full_clonepack.manifest.is_empty()
+    {
+        return Some(prev);
+    }
+    if let Ok(Some(mut built)) = ref_store.load_build(repo_id, commit).await {
+        // Re-point the branch at this build. Reuse only fires when `commit` is the
+        // current tip (the ls-remote tip, or the freshly-resolved build commit), so
+        // stamp synced_at = now. The reused RefInfo carries the *other* branch's
+        // older build time; without this, save_branch's "don't regress to an older
+        // sync" guard would silently drop the re-point — e.g. after a force-push
+        // back to an older commit, leaving the persisted (and cross-process)
+        // pointer stuck at the prior, no-longer-tip commit. "This branch is at this
+        // commit, confirmed now."
+        built.synced_at = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_secs());
+        let _ = ref_store.save_branch(repo_id, branch, &built).await;
+        return Some(built);
+    }
+    None
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn do_sync(
     cas: &Cas,
@@ -3425,18 +3661,21 @@ async fn do_sync(
     at_rev: Option<&str>,
     ref_store: &Arc<dyn RefStore>,
     build_full_pack: bool,
-    // When true, the two-phase build runs phase 2 (full history) inline and only
-    // returns once it is durable, instead of detaching it into a background task.
-    // The caller must hold `repo_lock` for the whole call. Set by an ephemeral
-    // (cross-process) worker so it never acks `done` while phase 2 is still
-    // unbuilt — a detached task would die with the worker and the full clonepack
-    // would never be built (A3). The long-lived in-process server leaves this
-    // false: its detached phase-2 task survives, keeping `/sync` fast.
+    // When true, the two-phase build finishes full history inline and only returns
+    // once it is durable, instead of detaching it into a background task. An
+    // ephemeral cross-process worker sets this so it never acks `done` while the
+    // full history is still unbuilt — a detached task would die with the worker.
+    // The long-lived in-process server leaves it false, keeping `/sync` fast.
     inline_full_history: bool,
     storage: &crate::storage::StorageRef,
     retention: &Arc<Retention>,
     provider: &ProviderInstance,
     credential: Option<&secrecy::SecretString>,
+    // Per-repo lock. do_sync holds it only while mutating the mirror (fetch +
+    // commit-graph, and the bitmap on the single-phase path), then drops it before
+    // the heavy read-only build, so different repos build concurrently. Safe
+    // because auto-gc is off, so the build only reads the mirror's packs.
+    mirror_lock: &Arc<tokio::sync::Mutex<()>>,
 ) -> Result<RefInfo> {
     info!("syncing {}@{}", repo_id.storage_key(), branch);
 
@@ -3454,6 +3693,57 @@ async fn do_sync(
         sweep_stale_tempdirs(repo_root, Duration::from_secs(2 * 3600));
     }
 
+    // Cheap pre-check: ask upstream for the branch tip via `git ls-remote` — one
+    // round-trip, no object transfer — before paying for a full fetch. If a
+    // *completed full* build already exists for that exact commit, the prior
+    // clonepack is still valid: return it and skip the fetch+build entirely. This
+    // is the dominant case for poke-to-check syncs of a fast-moving repo. Only
+    // for tip builds (a rev override targets a specific commit, not the tip).
+    // Best-effort: any ls-remote error falls through to the normal fetch below.
+    if at_rev.is_none() {
+        let provider_ls = provider.clone();
+        let repo_id_ls = repo_id.clone();
+        let branch_ls = branch.to_string();
+        let credential_ls = credential.cloned();
+        // ls-remote is an upstream round-trip, so it lives under the same fetch cap
+        // as a real fetch — otherwise a thundering herd of no-op syncs is exactly
+        // the uncapped upstream chatter the cap exists to prevent. Held only across
+        // the probe; the real fetch below acquires its own permit (never both at
+        // once, so the cap can't self-deadlock).
+        let tip = {
+            let _probe_permit = fetch_semaphore()
+                .acquire()
+                .await
+                .expect("fetch semaphore never closed");
+            tokio::task::spawn_blocking(move || {
+                git::ls_remote_commit(
+                    &provider_ls,
+                    &repo_id_ls,
+                    &branch_ls,
+                    credential_ls.as_ref(),
+                )
+            })
+            .await
+            .unwrap_or(Ok(None))
+        };
+        if let Ok(Some(tip)) = tip
+            && let Some(prev) = reuse_existing_build(ref_store, repo_id, branch, &tip).await
+        {
+            info!(
+                "sync no-op (ls-remote): {} already current at {} (no fetch)",
+                repo_id.storage_key(),
+                &tip[..7.min(tip.len())]
+            );
+            return Ok(prev);
+        }
+    }
+
+    // Acquire the per-repo exclusive lock for the mirror-mutating prep below. The
+    // ls-remote pre-check above is read-only (ref store + a network probe), so it
+    // stayed lock-free. We hold this only through fetch + commit-graph [+ bitmap]
+    // and drop it before the heavy read-only build (see the drop points below).
+    let _guard = mirror_lock.lock().await;
+
     // Sync the bare mirror synchronously (blocking git call).
     let mirror_dir_sync = mirror_dir.to_path_buf();
     let mirror_dir = mirror_dir.to_path_buf();
@@ -3461,6 +3751,12 @@ async fn do_sync(
     let repo_id_sync = repo_id.clone();
     let branch_sync = branch.to_string();
     let credential_sync = credential.cloned();
+    // Cap concurrent upstream fetches across the process (bandwidth + upstream
+    // abuse limits). Held only across the fetch, not the build.
+    let fetch_permit = fetch_semaphore()
+        .acquire()
+        .await
+        .expect("fetch semaphore never closed");
     tokio::task::spawn_blocking(move || {
         git::sync_bare_mirror(
             &mirror_dir_sync,
@@ -3472,6 +3768,16 @@ async fn do_sync(
     })
     .await
     .context("sync task")??;
+    drop(fetch_permit);
+    // Stamp the ordering timestamp at fetch time, not when the build finishes.
+    // Fetches are serialized by the per-repo lock, so fetch time orders syncs
+    // correctly; a timestamp set at build completion lets a build that finishes
+    // out of order look newer and wrongly move the branch back. This feeds the
+    // save_ordered check and makes a force-push (the later fetch) win.
+    let fetched_at = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs());
     info!("sync phase: mirror fetch {:?}", t.elapsed());
     t = Instant::now();
 
@@ -3498,16 +3804,15 @@ async fn do_sync(
     // No-op fast path: if a *completed full* build already exists for exactly
     // this commit, the prior clonepack artifacts are still valid — reuse them and
     // build nothing (skips commit-graph/bitmap/skeleton/history/archive), so a
-    // poke-to-check sync of an unchanged repo returns near-instantly. Keying on
-    // `full_clonepack.commit == commit` (not `build_status`) is robust: it is set
-    // only when phase 2 finishes for this commit, so it correctly excludes the
-    // Option-A carried-prior case, in-flight/failed phase 2, and the async
-    // worker's transient "building" status (which would otherwise mask a prior
-    // completed build).
-    if let Ok(Some(prev)) = ref_store.load_branch(repo_id, branch).await
-        && prev.full_clonepack.commit == commit
-        && !prev.full_clonepack.manifest.is_empty()
-    {
+    // poke-to-check sync of an unchanged repo returns near-instantly. Reuse is by
+    // this branch first, then any branch built at this commit (commit-keyed).
+    // Keying on `full_clonepack.commit == commit` (not `build_status`) is robust:
+    // it is set only once the full clonepack is published for this commit, so it
+    // excludes the Option-A carried-prior case, an unpublished/failed phase 2, and
+    // the async worker's transient "building" status. (It does *not* require the
+    // archive sub-phase to be done — a files-mode client re-resolves until the
+    // archive is ready, so reusing an archive-pending build is safe.)
+    if let Some(prev) = reuse_existing_build(ref_store, repo_id, branch, &commit).await {
         info!(
             "sync no-op: {} already current at {} (reusing prior clonepack)",
             repo_id.storage_key(),
@@ -3529,6 +3834,10 @@ async fn do_sync(
     // history in the background. Removes the dominant history-deltification cost
     // from "time to clonable".
     if two_phase_enabled() {
+        // Mirror prep (fetch + commit-graph) is done; the depth=1 build and the
+        // background phase-2 are read-only over the mirror, so release the lock so
+        // other repos' builds (and this repo's resolves) proceed concurrently.
+        drop(_guard);
         return build_and_publish_two_phase(
             cas,
             &mirror_dir,
@@ -3542,17 +3851,22 @@ async fn do_sync(
             retention,
             inline_full_history,
             t_total,
+            fetched_at,
         )
         .await;
     }
 
     // Single-phase: write a reachability bitmap before the heavy full-history
     // enumerations (skeleton + history). Best-effort; off the two-phase depth=1
-    // path (that branch returned above).
+    // path (that branch returned above). This is the last mirror mutation.
     let bm_dir = mirror_dir.clone();
     let _ = tokio::task::spawn_blocking(move || git::write_bitmap(&bm_dir)).await;
     info!("sync phase: reachability bitmap {:?}", t.elapsed());
     t = Instant::now();
+
+    // Mirror prep complete; the skeleton/history/archive build below is read-only
+    // over the mirror, so release the per-repo lock and let it run concurrently.
+    drop(_guard);
 
     // No full skeleton: the full variant reuses the shallow (HEAD) skeleton; the
     // full history's commits+trees live in the history packs.
@@ -3971,10 +4285,7 @@ async fn do_sync(
         // it does not populate the frame index (a later two-phase sync rebuilds).
         archive_frames: Vec::new(),
         build_status: None,
-        synced_at: SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .ok()
-            .map(|d| d.as_secs()),
+        synced_at: fetched_at,
     };
 
     // Push every built artifact to the configured storage backend. For a local
@@ -4148,6 +4459,8 @@ async fn build_and_publish_two_phase(
     retention: &Arc<Retention>,
     inline_full_history: bool,
     t_total: Instant,
+    // Publish-ordering key, stamped at fetch time by the caller (see do_sync).
+    fetched_at: Option<u64>,
 ) -> Result<RefInfo> {
     let history_target = env_bytes("RIPCLONE_HISTORY_PACK_BYTES", 512 * 1024 * 1024);
     let upload_conc = upload_concurrency();
@@ -4414,10 +4727,7 @@ async fn build_and_publish_two_phase(
         head_base_packs: head_built.base_packs.clone(),
         archive_frames: carried_archive_frames,
         build_status: Some("full history building".to_string()),
-        synced_at: SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .ok()
-            .map(|d| d.as_secs()),
+        synced_at: fetched_at,
     };
 
     // Upload phase-1 artifacts (shallow skeleton/index/metadata, head idx-bundle
@@ -4516,10 +4826,9 @@ async fn build_and_publish_two_phase(
 
     if inline_full_history {
         // Ephemeral/cross-process worker: build phase 2 now, before returning, so
-        // the job is never acked `done` while the full clonepack is still unbuilt
-        // (A3). This runs under the caller's `repo_lock` (process_build_job holds
-        // it across the whole do_sync), so phase 2 is serialized against other
-        // syncs for this repo. A crash mid-build leaves the claim stale → the
+        // the job is never acked `done` while the full clonepack is still unbuilt.
+        // This runs after the per-repo lock is dropped (read-only over the mirror,
+        // safe with auto-gc off). A crash mid-build leaves the claim stale → the
         // queue reclaims and retries it (and dead-letters after the cap).
         phase2.await.context("phase 2 (full history) build")?;
     } else {
@@ -4920,12 +5229,15 @@ pub async fn process_build_job(state: &ServerState, job: &BuildJob) -> Result<()
             return Err(format!("unknown provider {}", repo_id.provider.as_str()));
         }
     };
+    // do_sync holds this per-repo lock only across the mirror-mutating prep and
+    // releases it before the heavy read-only build, so distinct repos build
+    // concurrently across the worker pool.
+    // do_sync takes the per-repo lock itself (via `&lock`) and releases it before
+    // the heavy build, so we don't hold a guard here.
     let lock = repo_lock(&state.sync_locks, repo_id).await;
-    let _guard = lock.lock().await;
-    // An ephemeral cross-process worker (SQL queue, `inproc_wait() == false`)
-    // must finish the two-phase full history before it acks `done`, or a worker
-    // that exits after acking would lose the detached phase-2 task (A3). The
-    // in-process server keeps phase 2 in the background for a fast `/sync`.
+    // A cross-process worker must finish the full history before it acks `done`,
+    // or a worker that exits would lose the detached task. The in-process server
+    // builds it in the background instead, for a fast response.
     let inline_full_history = !state.build_queue.inproc_wait();
     let result = do_sync(
         &state.cas,
@@ -4940,9 +5252,9 @@ pub async fn process_build_job(state: &ServerState, job: &BuildJob) -> Result<()
         &state.retention,
         &provider,
         job.credential.as_ref(),
+        &lock,
     )
     .await;
-    drop(_guard);
 
     // Resolve HEAD to the concrete default branch for cache/log keys.
     let effective_branch = match &result {
@@ -5002,33 +5314,176 @@ pub async fn process_build_job(state: &ServerState, job: &BuildJob) -> Result<()
     }
 }
 
-/// Spawn the in-process worker loop for the local queue. Each finished job
-/// decrements the shared depth counter and signals any coalesced `/sync` waiters
-/// via their oneshots.
+/// Concurrency cap for in-process builds. Builds are CPU-heavy (history
+/// deltification + zstd), so the default is deliberately small; raise it on a big
+/// box via `RIPCLONE_BUILD_CONCURRENCY`. Different repos build in parallel;
+/// same-repo builds still serialize on the per-repo mirror lock.
+fn build_concurrency() -> usize {
+    std::env::var("RIPCLONE_BUILD_CONCURRENCY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(2)
+}
+
+/// Process-global cap on concurrent upstream fetches/clones. Separate from — and
+/// usually a touch larger than — the build cap: a fetch is network/upstream
+/// bound, a build is CPU bound, so they throttle independently. Bounding fetches
+/// keeps us from saturating bandwidth or tripping upstream (GitHub) abuse limits
+/// when many repos sync at once. Override with `RIPCLONE_FETCH_CONCURRENCY`.
+fn fetch_semaphore() -> &'static tokio::sync::Semaphore {
+    static SEM: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    SEM.get_or_init(|| {
+        let n = std::env::var("RIPCLONE_FETCH_CONCURRENCY")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(4);
+        tokio::sync::Semaphore::new(n)
+    })
+}
+
+/// Spawn the in-process worker loop for the local queue. Up to
+/// `build_concurrency()` jobs run at once (different repos in parallel); each
+/// finished job decrements the shared depth counter and signals any coalesced
+/// `/sync` waiters via their oneshots.
 fn spawn_build_worker(state: ServerState, mut rx: tokio::sync::mpsc::Receiver<BuildJob>) {
+    let sem = Arc::new(tokio::sync::Semaphore::new(build_concurrency()));
     tokio::spawn(async move {
         while let Some(job) = rx.recv().await {
-            // The waiter key must match the enqueue key, which includes the rev
-            // override. Compute it before the job is moved into the build task.
-            let key = format!(
-                "{}/{}#{}",
-                job.repo_id.storage_key(),
-                job.branch,
-                job.rev.as_deref().unwrap_or("")
-            );
-            // Isolate the build so a panic fails just this job (signalling its
-            // waiters) instead of killing the worker and wedging the queue.
-            let st = state.clone();
-            let result = match tokio::spawn(async move { process_build_job(&st, &job).await }).await
-            {
-                Ok(r) => r,
-                Err(e) => Err(format!("build task panicked: {e}")),
-            };
-            state.build_queue_depth.fetch_sub(1, Ordering::Relaxed);
-            if let Some(senders) = state.build_waiters.lock().await.remove(&key) {
-                for s in senders {
-                    let _ = s.send(result.clone());
+            // Block here until a build slot frees, so we never spawn faster than
+            // we drain. The owned permit rides with the build task and frees on
+            // completion.
+            let permit = sem
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("build semaphore never closed");
+            let state = state.clone();
+            tokio::spawn(async move {
+                let _permit = permit;
+                // The waiter key must match the enqueue key, which includes the
+                // rev override.
+                let key = format!(
+                    "{}/{}#{}",
+                    job.repo_id.storage_key(),
+                    job.branch,
+                    job.rev.as_deref().unwrap_or("")
+                );
+                // Inner spawn isolates a panic so it fails just this job
+                // (signalling its waiters) instead of killing the task with
+                // waiters left hanging.
+                let st = state.clone();
+                let result =
+                    match tokio::spawn(async move { process_build_job(&st, &job).await }).await {
+                        Ok(r) => r,
+                        Err(e) => Err(format!("build task panicked: {e}")),
+                    };
+                state.build_queue_depth.fetch_sub(1, Ordering::Relaxed);
+                if let Some(senders) = state.build_waiters.lock().await.remove(&key) {
+                    for s in senders {
+                        let _ = s.send(result.clone());
+                    }
                 }
+            });
+        }
+    });
+}
+
+/// One polling pass: for every known repo+branch, cheaply check the upstream tip
+/// (`ls-remote`, under the fetch cap) and trigger a build if that commit isn't
+/// already built. Catches pushes that arrived without a webhook/Actions trigger,
+/// so build-before-clone still holds. Best-effort: per-repo errors are logged and
+/// skipped. Returns the number of builds triggered. Exposed for tests.
+pub async fn poll_once(state: &ServerState) -> usize {
+    let repos = match state.ref_store.list().await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("poll: list repos failed: {e}");
+            return 0;
+        }
+    };
+    let mut triggered = 0;
+    for repo_id in repos {
+        let Some(provider) = state
+            .provider_registry
+            .get(repo_id.provider.as_str())
+            .cloned()
+        else {
+            continue; // unknown provider; skip
+        };
+        let branches = match state.ref_store.list_branches(&repo_id).await {
+            Ok(b) => b,
+            Err(e) => {
+                warn!("poll: list_branches {} failed: {e}", repo_id.storage_key());
+                continue;
+            }
+        };
+        for branch in branches {
+            // Cheap tip probe, under the same fetch cap as a real fetch so a sweep
+            // can't become uncapped upstream chatter. Best-effort.
+            let provider_ls = provider.clone();
+            let repo_ls = repo_id.clone();
+            let branch_ls = branch.clone();
+            let credential = state.broker.fetch_credential(&repo_id, None);
+            let tip = {
+                let _permit = fetch_semaphore()
+                    .acquire()
+                    .await
+                    .expect("fetch semaphore never closed");
+                tokio::task::spawn_blocking(move || {
+                    git::ls_remote_commit(&provider_ls, &repo_ls, &branch_ls, credential.as_ref())
+                })
+                .await
+                .unwrap_or(Ok(None))
+            };
+            let Ok(Some(tip)) = tip else {
+                continue; // unknown ref / probe failed
+            };
+            // Already built at this tip (branch-scoped, then commit-keyed)? Skip.
+            if reuse_existing_build(&state.ref_store, &repo_id, &branch, &tip)
+                .await
+                .is_some()
+            {
+                continue;
+            }
+            // Tip moved and isn't built — trigger a build (coalesces if one is
+            // already in flight for this key).
+            match trigger_build(state, &repo_id, &branch).await {
+                Ok(()) => {
+                    triggered += 1;
+                    info!(
+                        "poll: triggered build for {}@{branch} at {}",
+                        repo_id.storage_key(),
+                        &tip[..7.min(tip.len())]
+                    );
+                }
+                Err(e) => warn!(
+                    "poll: trigger {}@{branch} failed: {e}",
+                    repo_id.storage_key()
+                ),
+            }
+        }
+    }
+    triggered
+}
+
+/// Spawn the polling-fallback loop. `interval == 0` disables it. Mirrors the
+/// retention/remote-gc interval-loop pattern.
+fn spawn_poll_loop(state: ServerState, interval: Duration) {
+    if interval.is_zero() {
+        info!("poll fallback disabled (RIPCLONE_POLL_INTERVAL_SECS=0)");
+        return;
+    }
+    info!("poll fallback enabled every {:?}", interval);
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            let n = poll_once(&state).await;
+            if n > 0 {
+                info!("poll fallback: triggered {n} build(s)");
             }
         }
     });
@@ -5184,6 +5639,17 @@ pub async fn run_server(
         info!("OIDC verification enabled for audience configured via RIPCLONE_OIDC_AUDIENCE");
     }
 
+    // Optional push-webhook HMAC secret. When set, /v1/webhooks/github verifies
+    // GitHub's X-Hub-Signature-256 and triggers a build on push (build before
+    // clone, no per-repo Actions workflow needed).
+    let webhook_secret = env::var("RIPCLONE_WEBHOOK_SECRET")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(|s| secrecy::SecretString::new(s.into()));
+    if webhook_secret.is_some() {
+        info!("push-webhook receiver enabled (RIPCLONE_WEBHOOK_SECRET set)");
+    }
+
     // Select the queue backend. The local queue drives an in-process worker; the
     // SQL queues' builds run in separate ripclone-worker processes, so the server
     // only enqueues.
@@ -5207,6 +5673,7 @@ pub async fn run_server(
         build_queue_depth,
         build_waiters: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         oidc_verifier,
+        webhook_secret,
         sync_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         mirror_freshness: Arc::new(std::sync::Mutex::new(HashMap::new())),
         mirror_fresh_ttl: Duration::from_secs(
@@ -5227,6 +5694,16 @@ pub async fn run_server(
     if let Some(rx) = local_rx {
         spawn_build_worker(state.clone(), rx);
     }
+
+    // Polling fallback: catches pushes that arrived without a webhook/Actions
+    // trigger so build-before-clone still holds. Off by default.
+    let poll_interval = Duration::from_secs(
+        env::var("RIPCLONE_POLL_INTERVAL_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0),
+    );
+    spawn_poll_loop(state.clone(), poll_interval);
 
     let app = build_app(state);
     let addr: SocketAddr = format!("{}:{}", host, port).parse()?;
@@ -5286,6 +5763,7 @@ mod tests {
             build_queue_depth: Arc::new(AtomicUsize::new(0)),
             build_waiters: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             oidc_verifier: None,
+            webhook_secret: None,
             sync_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             mirror_freshness: Arc::new(std::sync::Mutex::new(HashMap::new())),
             mirror_fresh_ttl: Duration::from_secs(60),
@@ -5684,6 +6162,293 @@ mod tests {
                 "{path} must not require auth"
             );
         }
+    }
+
+    /// Commit-keyed reuse re-points the requested branch — and, critically, does
+    /// so even when that branch currently sits at a newer-synced commit (the
+    /// force-push-to-an-older-commit case). Without stamping `synced_at = now` in
+    /// `reuse_existing_build`, `save_branch`'s "don't regress to an older sync"
+    /// guard silently drops the re-point and the pointer is stranded.
+    #[tokio::test]
+    async fn reuse_existing_build_repoints_branch_past_ordering_guard() {
+        use crate::meta::{SqlRefStore, SqliteMeta};
+
+        fn complete(commit: &str, synced_at: u64) -> RefInfo {
+            RefInfo {
+                commit: commit.to_string(),
+                synced_at: Some(synced_at),
+                full_clonepack: crate::ClonepackArtifacts {
+                    commit: commit.to_string(),
+                    manifest: "m".to_string(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("meta.db").to_string_lossy().to_string();
+        let store: Arc<dyn RefStore> = Arc::new(
+            SqlRefStore::new(Box::new(SqliteMeta::connect(&path).await.unwrap()))
+                .await
+                .unwrap(),
+        );
+        let rid = RepoId::github("o/r");
+
+        // Branch foo built at X (older sync time).
+        store
+            .save_branch(&rid, "foo", &complete("X", 1_000))
+            .await
+            .unwrap();
+
+        // A fresh branch bar at X reuses foo's build and is re-pointed at it.
+        let reused = reuse_existing_build(&store, &rid, "bar", "X").await;
+        assert_eq!(reused.expect("reuse").commit, "X");
+        assert_eq!(
+            store
+                .load_branch(&rid, "bar")
+                .await
+                .unwrap()
+                .unwrap()
+                .full_clonepack
+                .commit,
+            "X",
+            "cross-branch reuse must publish under the requested branch"
+        );
+
+        // Force-push-to-older: main sits at Y with a NEWER sync time than X's build.
+        store
+            .save_branch(&rid, "main", &complete("Y", 5_000))
+            .await
+            .unwrap();
+        let reused = reuse_existing_build(&store, &rid, "main", "X").await;
+        assert_eq!(reused.expect("reuse").commit, "X");
+        assert_eq!(
+            store
+                .load_branch(&rid, "main")
+                .await
+                .unwrap()
+                .unwrap()
+                .commit,
+            "X",
+            "reuse must advance the pointer to the current tip despite a newer prior synced_at"
+        );
+    }
+
+    /// `test_state` drops the build-queue receiver, so a fire-and-forget enqueue
+    /// would fail. This variant keeps the receiver alive (drained in the
+    /// background) so enqueues succeed — we assert the HTTP response, not the
+    /// build itself.
+    fn test_state_draining(tmp: &tempfile::TempDir) -> ServerState {
+        let mut state = test_state(tmp);
+        let (queue, mut rx, depth) = crate::queue::LocalJobQueue::new(64);
+        state.build_queue = Arc::new(queue);
+        state.build_queue_depth = depth;
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        state
+    }
+
+    fn gh_sign(secret: &str, body: &[u8]) -> String {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(body);
+        format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
+    }
+
+    fn webhook_request(
+        event: &str,
+        signature: &str,
+        body: Vec<u8>,
+    ) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/webhooks/github")
+            .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))))
+            .header("X-GitHub-Event", event)
+            .header("X-Hub-Signature-256", signature)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body))
+            .unwrap()
+    }
+
+    const PUSH_BODY: &[u8] =
+        br#"{"ref":"refs/heads/main","after":"abc1234","deleted":false,"repository":{"full_name":"acme/widget"}}"#;
+
+    #[tokio::test]
+    async fn webhook_valid_push_triggers_build() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = test_state_draining(&tmp);
+        state.webhook_secret = Some(secrecy::SecretString::new("whsecret".into()));
+        let app = build_app(state);
+
+        let sig = gh_sign("whsecret", PUSH_BODY);
+        let resp = app
+            .oneshot(webhook_request("push", &sig, PUSH_BODY.to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::ACCEPTED,
+            "valid push triggers build"
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_bad_signature_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = test_state(&tmp);
+        state.webhook_secret = Some(secrecy::SecretString::new("whsecret".into()));
+        let app = build_app(state);
+
+        // Signed with the wrong secret.
+        let sig = gh_sign("wrong-secret", PUSH_BODY);
+        let resp = app
+            .oneshot(webhook_request("push", &sig, PUSH_BODY.to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "bad signature rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_tampered_body_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = test_state(&tmp);
+        state.webhook_secret = Some(secrecy::SecretString::new("whsecret".into()));
+        let app = build_app(state);
+
+        // Sign the canonical body, then send a DIFFERENT body with that signature.
+        // The HMAC must cover the exact bytes (verified before JSON parse), so a
+        // mutated body fails — guards against verifying over re-serialized JSON.
+        let sig = gh_sign("whsecret", PUSH_BODY);
+        let tampered =
+            br#"{"ref":"refs/heads/main","after":"abc1234","deleted":false,"repository":{"full_name":"evil/repo"}}"#
+                .to_vec();
+        let resp = app
+            .oneshot(webhook_request("push", &sig, tampered))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "signature must cover the exact body, not parsed content"
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_unconfigured_returns_501() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(&tmp); // webhook_secret = None
+        let app = build_app(state);
+
+        let sig = gh_sign("whsecret", PUSH_BODY);
+        let resp = app
+            .oneshot(webhook_request("push", &sig, PUSH_BODY.to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_IMPLEMENTED,
+            "no secret configured → 501"
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_ping_event_acked_without_build() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = test_state(&tmp);
+        state.webhook_secret = Some(secrecy::SecretString::new("whsecret".into()));
+        let app = build_app(state);
+
+        let body = br#"{"zen":"hi"}"#.to_vec();
+        let sig = gh_sign("whsecret", &body);
+        let resp = app
+            .oneshot(webhook_request("ping", &sig, body))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NO_CONTENT,
+            "ping is acked, no build"
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_branch_delete_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = test_state(&tmp);
+        state.webhook_secret = Some(secrecy::SecretString::new("whsecret".into()));
+        let app = build_app(state);
+
+        let body =
+            br#"{"ref":"refs/heads/dead","after":"0000000000000000000000000000000000000000","deleted":true,"repository":{"full_name":"acme/widget"}}"#
+                .to_vec();
+        let sig = gh_sign("whsecret", &body);
+        let resp = app
+            .oneshot(webhook_request("push", &sig, body))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NO_CONTENT,
+            "branch delete triggers no build"
+        );
+    }
+
+    /// The polling fallback triggers a build when the upstream tip isn't built,
+    /// and is a no-op once it is. This is the missed-webhook catch-up path.
+    #[tokio::test]
+    async fn poll_triggers_on_unbuilt_tip_and_skips_when_built() {
+        let base = tempfile::tempdir().unwrap();
+        let origin = base.path().join("acme").join("widget.git");
+        std::fs::create_dir_all(origin.parent().unwrap()).unwrap();
+        let repo = crate::test_fixture::init_bare(&origin);
+        let tip = crate::test_fixture::commit(&repo, &[("f.txt", b"v1")]);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state_draining(&tmp);
+        let rid = RepoId::github("acme/widget");
+
+        // Seed a stale ref so the repo is enumerable and its tip looks unbuilt.
+        let stale = RefInfo {
+            commit: "0".repeat(40),
+            synced_at: Some(1),
+            ..Default::default()
+        };
+        state
+            .ref_store
+            .save_branch(&rid, "HEAD", &stale)
+            .await
+            .unwrap();
+
+        unsafe { std::env::set_var("RIPCLONE_ORIGIN_BASE", base.path()) };
+        let on_change = poll_once(&state).await;
+
+        // Mark it built at the real tip → the next poll is a no-op.
+        let built = RefInfo {
+            commit: tip.clone(),
+            synced_at: Some(2),
+            full_clonepack: crate::ClonepackArtifacts {
+                commit: tip.clone(),
+                manifest: "m".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        state
+            .ref_store
+            .save_branch(&rid, "HEAD", &built)
+            .await
+            .unwrap();
+        let when_built = poll_once(&state).await;
+        unsafe { std::env::remove_var("RIPCLONE_ORIGIN_BASE") };
+
+        assert_eq!(on_change, 1, "poll triggers a build for an unbuilt tip");
+        assert_eq!(when_built, 0, "poll is a no-op once the tip is built");
     }
 
     #[tokio::test]
