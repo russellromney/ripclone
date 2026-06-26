@@ -1100,6 +1100,82 @@ pub fn disable_auto_gc(mirror_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Build the upstream URL and the credential-injection git config args for a
+/// repo. The secret rides in `http.extraHeader`, never in the URL, so it stays
+/// out of argv, `.git/config`, and logs. The `RIPCLONE_ORIGIN_BASE` override is
+/// honored for the github default instance so offline e2e tests can use local
+/// `file://` origins.
+fn upstream_url_and_auth(
+    provider: &ProviderInstance,
+    repo_id: &RepoId,
+    credential: Option<&secrecy::SecretString>,
+) -> (String, Vec<String>) {
+    let url = if repo_id.is_github_default()
+        && let Some(base) = std::env::var("RIPCLONE_ORIGIN_BASE")
+            .ok()
+            .filter(|b| !b.is_empty())
+    {
+        format!("{}/{}.git", base.trim_end_matches('/'), repo_id.path)
+    } else {
+        provider.clone_url(&repo_id.path)
+    };
+
+    let mut git_args: Vec<String> = Vec::new();
+    if let Some(token) = credential
+        && let Some((name, value)) = provider.auth_header(token.expose_secret())
+    {
+        git_args.push("-c".to_string());
+        git_args.push(format!("http.extraHeader={}: {}", name, value));
+    }
+    (url, git_args)
+}
+
+/// Resolve the upstream tip of `ref_name` via `git ls-remote` — one
+/// reference-advertisement round-trip with **no object transfer**. Returns the
+/// hex commit SHA, or `None` if the ref is absent upstream. Used as a cheap
+/// pre-check so a `/sync` of an unchanged repo can no-op without a full fetch.
+///
+/// Best-effort by contract: callers treat an `Err` (network blip, host down) as
+/// "unknown" and fall through to the normal fetch+build — never as a failure.
+pub fn ls_remote_commit(
+    provider: &ProviderInstance,
+    repo_id: &RepoId,
+    ref_name: &str,
+    credential: Option<&secrecy::SecretString>,
+) -> Result<Option<String>> {
+    crate::validation::validate_repo_path(provider, repo_id)
+        .with_context(|| format!("invalid repo path: {}", repo_id.storage_key()))?;
+    if ref_name != "HEAD" {
+        crate::validation::validate_git_rev(ref_name)
+            .with_context(|| format!("invalid ref: {}", ref_name))?;
+    }
+    let (url, git_args) = upstream_url_and_auth(provider, repo_id, credential);
+    // A branch maps to refs/heads/<name>; HEAD is queried directly. Anything else
+    // (e.g. a tag) simply won't match and the caller falls through to a fetch.
+    let query = if ref_name == "HEAD" {
+        "HEAD".to_string()
+    } else {
+        format!("refs/heads/{ref_name}")
+    };
+    let output = Command::new("git")
+        .args(&git_args)
+        .args(["ls-remote", "--", &url, &query])
+        .output()
+        .context("git ls-remote")?;
+    if !output.status.success() {
+        bail!("ls-remote failed");
+    }
+    // Output is lines of "<sha>\t<ref>"; take the first ref's SHA.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let sha = stdout
+        .lines()
+        .next()
+        .and_then(|line| line.split('\t').next())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    Ok(sha)
+}
+
 /// Sync a bare mirror of a repo. Creates if missing, fetches if exists.
 ///
 /// Phase 1: credentials are passed via git's `http.extraHeader` config, never
@@ -1121,33 +1197,7 @@ pub fn sync_bare_mirror<P: AsRef<Path>>(
             .with_context(|| format!("invalid branch: {}", branch))?;
     }
 
-    // Build a clean clone URL from the provider. The RIPCLONE_ORIGIN_BASE
-    // override remains supported for the github default instance so existing
-    // offline e2e tests keep working with local `file://` origins.
-    let url = if repo_id.is_github_default() {
-        if let Some(base) = std::env::var("RIPCLONE_ORIGIN_BASE")
-            .ok()
-            .filter(|b| !b.is_empty())
-        {
-            format!("{}/{}.git", base.trim_end_matches('/'), repo_id.path)
-        } else {
-            provider.clone_url(&repo_id.path)
-        }
-    } else {
-        provider.clone_url(&repo_id.path)
-    };
-
-    // Build git config args for credential-header injection. The secret is
-    // never embedded in the URL, so it does not leak into process listings,
-    // `.git/config`, or server logs.
-    let mut git_args: Vec<String> = Vec::new();
-    if let Some(token) = credential
-        && let Some((name, value)) = provider.auth_header(token.expose_secret())
-    {
-        let header = format!("{}: {}", name, value);
-        git_args.push("-c".to_string());
-        git_args.push(format!("http.extraHeader={}", header));
-    }
+    let (url, git_args) = upstream_url_and_auth(provider, repo_id, credential);
     // The mirror is always a *complete* clone. The "full" (depth=0) clonepack is
     // built from `rev-list HEAD` over this mirror, so any shallow boundary would
     // silently truncate it and break `git rev-list`/`fsck` on the client. We
@@ -1423,6 +1473,36 @@ mod tests {
         // Idempotent: a second call on an already-configured mirror is fine.
         disable_auto_gc(repo).unwrap();
         assert_eq!(read("gc.auto"), "0");
+    }
+
+    /// ls-remote reads the upstream tip with no object transfer, and an absent
+    /// ref returns None (not an error) so the caller falls through to a fetch.
+    #[test]
+    fn ls_remote_commit_reads_tip_without_objects() {
+        use crate::provider::{ProviderRegistry, RepoId};
+        let base = tempfile::tempdir().unwrap();
+        let repo_dir = base.path().join("acme").join("widget.git");
+        std::fs::create_dir_all(repo_dir.parent().unwrap()).unwrap();
+        let repo = crate::test_fixture::init_bare(&repo_dir);
+        let sha = crate::test_fixture::commit(&repo, &[("README.md", b"hello")]);
+
+        let registry = ProviderRegistry::new();
+        let provider = registry.default_provider();
+        let repo_id = RepoId::github("acme/widget");
+
+        // Redirect the github default origin to the local bare repo. No other lib
+        // unit test reads RIPCLONE_ORIGIN_BASE, so set+remove here is race-free.
+        unsafe { std::env::set_var("RIPCLONE_ORIGIN_BASE", base.path()) };
+        let head = ls_remote_commit(provider, &repo_id, "HEAD", None);
+        let missing = ls_remote_commit(provider, &repo_id, "no-such-branch", None);
+        unsafe { std::env::remove_var("RIPCLONE_ORIGIN_BASE") };
+
+        assert_eq!(
+            head.unwrap().as_deref(),
+            Some(sha.as_str()),
+            "HEAD tip resolved via ls-remote"
+        );
+        assert_eq!(missing.unwrap(), None, "absent ref yields None, not Err");
     }
 
     #[test]

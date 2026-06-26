@@ -3290,6 +3290,42 @@ async fn do_sync(
         sweep_stale_tempdirs(repo_root, Duration::from_secs(2 * 3600));
     }
 
+    // Cheap pre-check: ask upstream for the branch tip via `git ls-remote` — one
+    // round-trip, no object transfer — before paying for a full fetch. If a
+    // *completed full* build already exists for that exact commit, the prior
+    // clonepack is still valid: return it and skip the fetch+build entirely. This
+    // is the dominant case for poke-to-check syncs of a fast-moving repo. Only
+    // for tip builds (a rev override targets a specific commit, not the tip).
+    // Best-effort: any ls-remote error falls through to the normal fetch below.
+    if at_rev.is_none() {
+        let provider_ls = provider.clone();
+        let repo_id_ls = repo_id.clone();
+        let branch_ls = branch.to_string();
+        let credential_ls = credential.cloned();
+        let tip = tokio::task::spawn_blocking(move || {
+            git::ls_remote_commit(
+                &provider_ls,
+                &repo_id_ls,
+                &branch_ls,
+                credential_ls.as_ref(),
+            )
+        })
+        .await
+        .unwrap_or(Ok(None));
+        if let Ok(Some(tip)) = tip
+            && let Ok(Some(prev)) = ref_store.load_branch(repo_id, branch).await
+            && prev.full_clonepack.commit == tip
+            && !prev.full_clonepack.manifest.is_empty()
+        {
+            info!(
+                "sync no-op (ls-remote): {} already current at {} (no fetch)",
+                repo_id.storage_key(),
+                &tip[..7.min(tip.len())]
+            );
+            return Ok(prev);
+        }
+    }
+
     // Sync the bare mirror synchronously (blocking git call).
     let mirror_dir_sync = mirror_dir.to_path_buf();
     let mirror_dir = mirror_dir.to_path_buf();
