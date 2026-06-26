@@ -3451,6 +3451,18 @@ async fn do_sync(
     .await
     .context("sync task")??;
     drop(fetch_permit);
+    // Stamp the publish-ordering key at FETCH time, not at build construction.
+    // Fetches are serialized by the per-repo lock we hold here, so fetch time is a
+    // correct total order; stamping at build *completion* (the old behavior) lets
+    // an out-of-order finish carry a misleading-newer timestamp and regress the
+    // branch. This also makes the existing save_branch ordering guard sound and
+    // handles force-push (the later fetch wins). Cross-process ordering (multiple
+    // worker processes) wants a DB-monotonic sequence instead — a farm-out-era
+    // addition; see docs/SYNC.md.
+    let fetched_at = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs());
     info!("sync phase: mirror fetch {:?}", t.elapsed());
     t = Instant::now();
 
@@ -3523,6 +3535,7 @@ async fn do_sync(
             storage,
             retention,
             t_total,
+            fetched_at,
         )
         .await;
     }
@@ -3956,10 +3969,7 @@ async fn do_sync(
         // it does not populate the frame index (a later two-phase sync rebuilds).
         archive_frames: Vec::new(),
         build_status: None,
-        synced_at: SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .ok()
-            .map(|d| d.as_secs()),
+        synced_at: fetched_at,
     };
 
     // Push every built artifact to the configured storage backend. For a local
@@ -4132,6 +4142,8 @@ async fn build_and_publish_two_phase(
     storage: &crate::storage::StorageRef,
     retention: &Arc<Retention>,
     t_total: Instant,
+    // Publish-ordering key, stamped at fetch time by the caller (see do_sync).
+    fetched_at: Option<u64>,
 ) -> Result<RefInfo> {
     let history_target = env_bytes("RIPCLONE_HISTORY_PACK_BYTES", 512 * 1024 * 1024);
     let upload_conc = upload_concurrency();
@@ -4398,10 +4410,7 @@ async fn build_and_publish_two_phase(
         head_base_packs: head_built.base_packs.clone(),
         archive_frames: carried_archive_frames,
         build_status: Some("full history building".to_string()),
-        synced_at: SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .ok()
-            .map(|d| d.as_secs()),
+        synced_at: fetched_at,
     };
 
     // Upload phase-1 artifacts (shallow skeleton/index/metadata, head idx-bundle

@@ -161,42 +161,44 @@ When a repo pushes faster than we build, this lags by exactly one build. That is
 correct behavior; surface it as a metric / "behind by N" hint rather than letting
 it be silent.
 
-## Publish: tip-follows-fetch, best-effort monotonic guard
+## Publish: tip-follows-fetch, stamped at fetch time (shipped)
 
 Concurrent builds finish in any order. The publish rule:
 
 > A finished build fills its **commit-keyed slot** (always). It advances the
-> **branch pointer** only if its commit is **not older** than the currently
-> published commit, compared by commit-graph **generation number**.
+> **branch pointer** only if it is **not older** than the currently published
+> entry — ordered by a key **stamped at fetch time**, not at build completion.
 
-This one rule handles every case:
+Why fetch time is the right key (and generation number is not):
 
-- Out-of-order finish (older build A lands after newer B) → A fills its slot,
-  the guard sees A is older, the branch stays at B. No regression.
-- Supersession → B is newer, B publishes, A's slot becomes unreferenced.
-- Force-push to an *older* commit → the **fetch** makes that the tip, and the
-  branch follows the fetched tip, not build topology. (Pure "forward-only" would
-  get force-push wrong; "follow the fetched tip" is the source of truth.)
+- **The bug is *when* the key is stamped, not *what* it is.** `synced_at` was set
+  at build construction (≈completion), so an out-of-order *completion* carried a
+  misleadingly-newer timestamp and could regress the branch. `do_sync` holds the
+  per-repo lock across the fetch, so **fetch order is a correct total order**;
+  stamping the key there makes the existing `save_branch` ordering guard sound.
+- **Force-push is handled for free.** The later fetch gets the later stamp and
+  wins — "follow the fetched tip." A commit-graph *generation* number would get
+  this wrong: it can't tell an out-of-order *stale* build from a *force-push to an
+  older commit* (both look like "new commit is an ancestor of the stored one"),
+  and blocking the force-push case does **not** self-heal. So generation was
+  rejected in favor of fetch-time ordering.
+- **Coalescing already sequentializes same-branch builds**, so the in-process
+  out-of-order window is small. The genuine residual is **cross-process
+  stale-reclaim** (two worker processes), where wall-clock stamps can disagree
+  under clock skew. The correct fix there is a **DB-monotonic sequence** (e.g. the
+  SQL job id) — a farm-out/dispatcher-era addition, not needed for single-server.
 
 ### Why not a real compare-and-set
 
-Today publishing is a blind read-modify-write `save_branch`, last-writer-wins
-(`server.rs:3929`, `:4280`; the S3 *branch* path is fully unconditional,
-`ref_store.rs:381`). A blind overwrite **never corrupts** — the artifacts are
-valid for their commit. Its only failure is a branch *regression* when an older
-build lands last, and that:
-
-1. self-heals on the next sync (re-publishes the real tip), and
-2. risks GC churn (a regressed pointer makes the newer commit's unique chunks
-   look unreachable).
-
-So we add the monotonic guard above — an **in-memory** generation comparison
-before `save_branch` — which removes the regression in the overwhelming majority
-of cases. The guard is racy (TOCTOU), but **losing the race degrades to exactly
-the plain-overwrite case**: a self-healing regression, never corruption. That is
-why a true storage-level conditional put is unnecessary, and we skip its
-portability tail (S3 `If-Match` is not universal; the file backend would need
-cross-process `flock`).
+The guard is a **best-effort, in-memory** comparison in `save_branch` (compare the
+fetch-time key; skip a regressing write). It is racy (TOCTOU), but **losing the
+race degrades to a self-healing re-publish, never corruption** — the artifacts are
+content-addressed and valid for their commit. So a true storage-level conditional
+put is unnecessary, and we skip its portability tail (S3 `If-Match` is not
+universal; the file backend would need cross-process `flock`; **Tigris's
+conditional puts are unreliable** — the whole reason we keep this off the object
+store). The reuse path additionally stamps the key at confirm-time so a re-pointed
+branch isn't dropped by the guard.
 
 ## Garbage collection
 
@@ -240,8 +242,11 @@ Three fixes to make it safe and on:
    the mirror)* **+ shrink the build lock** *(shipped: `do_sync` holds the
    per-repo lock only across fetch + commit-graph [+ single-phase bitmap] and
    drops it before the heavy read-only build — see below).*
-3. ⏳ **Monotonic publish guard** (in-memory generation check before
-   `save_branch`).
+3. ✅ **Monotonic publish guard** *(shipped: the publish-ordering key is stamped
+   at fetch time — under the per-repo lock — so out-of-order build completion
+   can't regress the branch and force-push wins; the existing `save_branch` guard
+   compares it. Generation numbers were evaluated and rejected, see Publish.
+   Cross-process ordering via a DB-monotonic sequence is a farm-out-era follow-up.)*
 4. ◑ **Bounded build pool + separate fetch semaphore** ✅ *(shipped:
    `RIPCLONE_BUILD_CONCURRENCY` pool + `RIPCLONE_FETCH_CONCURRENCY` cap)*
    **+ debounce (model B)** ⏳.
