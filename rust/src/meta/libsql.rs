@@ -42,6 +42,16 @@ impl MetaDb for LibsqlMeta {
             )
             .await
             .context("create refs table")?;
+        // Index for commit-keyed reuse (get_by_commit); the PK is (repo_key,
+        // branch), so a by-commit lookup would otherwise scan the repo's branches.
+        self.conn()
+            .await?
+            .execute(
+                "CREATE INDEX IF NOT EXISTS idx_refs_commit ON refs (repo_key, commit_id)",
+                (),
+            )
+            .await
+            .context("create refs commit index")?;
         Ok(())
     }
 

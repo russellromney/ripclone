@@ -38,6 +38,12 @@ impl MetaDb for PostgresMeta {
         .execute(&self.pool)
         .await
         .context("create refs table")?;
+        // Index for commit-keyed reuse (get_by_commit); the PK is (repo_key,
+        // branch), so a by-commit lookup would otherwise scan the repo's branches.
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_refs_commit ON refs (repo_key, commit_id)")
+            .execute(&self.pool)
+            .await
+            .context("create refs commit index")?;
         Ok(())
     }
 

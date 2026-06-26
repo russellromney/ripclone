@@ -123,9 +123,9 @@ impl RefStore for SqlRefStore {
     }
 
     async fn load_build(&self, repo_id: &RepoId, commit: &str) -> Result<Option<RefInfo>> {
-        // The `commit_id` column narrows the scan to rows at this commit; we then
-        // confirm a completed full build (some rows may be depth=1-only mid
-        // two-phase). First complete match wins.
+        // The `commit_id` index narrows to rows at this commit; we then confirm a
+        // completed full build (some rows may be depth=1-only mid two-phase).
+        // First complete match wins.
         for row in self
             .db
             .get_by_commit(&repo_id.storage_key(), commit)

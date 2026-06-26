@@ -43,6 +43,23 @@ impl MetaDb for MysqlMeta {
         .execute(&self.pool)
         .await
         .context("create refs table")?;
+        // Index for commit-keyed reuse (get_by_commit). MySQL has no
+        // `CREATE INDEX IF NOT EXISTS`, so create it only when absent — keeping
+        // init() idempotent.
+        let index_exists: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM information_schema.statistics
+             WHERE table_schema = DATABASE() AND table_name = 'refs'
+               AND index_name = 'idx_refs_commit'",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .context("check refs commit index")?;
+        if index_exists == 0 {
+            sqlx::query("CREATE INDEX idx_refs_commit ON refs (repo_key, commit_id)")
+                .execute(&self.pool)
+                .await
+                .context("create refs commit index")?;
+        }
         Ok(())
     }
 

@@ -1933,18 +1933,16 @@ async fn sync_repo_inner(
             // worker signals completion on a oneshot. Include the rev override in
             // the coalescing key so syncs for different build commits don't share
             // one build.
-            let key = format!(
-                "{}/{branch}#{}",
-                repo_id.storage_key(),
-                at_rev.as_deref().unwrap_or("")
-            );
+            let key = inproc_build_key(&repo_id, &branch, at_rev.as_deref());
             let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
             let first = {
                 let mut w = state.build_waiters.lock().await;
-                let v = w.entry(key.clone()).or_default();
-                let was_empty = v.is_empty();
-                v.push(tx);
-                was_empty
+                // Presence-based: a key present — even an empty marker left by the
+                // /build webhook — means a build is already in flight, so coalesce
+                // onto it rather than enqueueing a duplicate.
+                let first = !w.contains_key(&key);
+                w.entry(key.clone()).or_default().push(tx);
+                first
             };
             if first {
                 // Mirror the /build handler: the worker decrements the metrics
@@ -2269,6 +2267,13 @@ async fn sync_repo_inner(
     }
 }
 
+/// Coalescing key for the in-process queue: concurrent builds for the same
+/// `repo/branch#rev` collapse onto one. `/sync` and the `/build` webhook MUST
+/// produce the identical key for the same target, or they double-build.
+fn inproc_build_key(repo_id: &RepoId, branch: &str, rev: Option<&str>) -> String {
+    format!("{}/{branch}#{}", repo_id.storage_key(), rev.unwrap_or(""))
+}
+
 async fn build_handler(
     headers: HeaderMap,
     State(state): State<ServerState>,
@@ -2351,17 +2356,50 @@ async fn build_handler(
     let job_repo_id = RepoId::github(format!("{}/{}", body.owner, body.repo));
     let credential = state.broker.fetch_credential(&job_repo_id, None);
     let job = BuildJob {
-        repo_id: job_repo_id,
+        repo_id: job_repo_id.clone(),
         branch: "HEAD".to_string(),
         rev: None,
         credential,
     };
+
+    // On the in-process queue, coalesce against an in-flight build for this key the
+    // same way `/sync` does — otherwise a webhook racing a `/sync` for the same
+    // HEAD enqueues a duplicate build that just serializes on the repo lock and is
+    // thrown away. The SQL queue already coalesces by key, so only the in-process
+    // path needs this gate. Fire-and-forget: mark the key in-flight (no waiter).
+    if state.build_queue.inproc_wait() {
+        let key = inproc_build_key(&job_repo_id, "HEAD", None);
+        let first = {
+            let mut w = state.build_waiters.lock().await;
+            let first = !w.contains_key(&key);
+            w.entry(key).or_default();
+            first
+        };
+        if !first {
+            // A build for this key is already in flight; the webhook folds into it.
+            state.metrics.record_build_accepted();
+            return (
+                StatusCode::ACCEPTED,
+                Json(BuildResponse {
+                    status: "queued".to_string(),
+                    queue_depth: state.build_queue.depth().await,
+                }),
+            )
+                .into_response();
+        }
+    }
 
     state.metrics.record_build_queued();
     let enq = state.build_queue.enqueue(job).await;
     let accepted = matches!(&enq, Ok(e) if e.outcome != EnqueueOutcome::Full);
     if !accepted {
         state.metrics.record_build_rejected();
+        // Release the in-flight marker we set above, or the key stays "building"
+        // forever and every later sync/webhook for it coalesces onto nothing.
+        if state.build_queue.inproc_wait() {
+            let key = inproc_build_key(&job_repo_id, "HEAD", None);
+            state.build_waiters.lock().await.remove(&key);
+        }
         let error = match enq {
             Err(e) => format!("build queue unavailable: {e}"),
             _ => "build queue full".to_string(),
@@ -3266,7 +3304,7 @@ async fn settle_storage(
 /// Reuse an existing build for `commit` instead of building, if one exists.
 /// First the branch's own completed full build (the common case), then any other
 /// branch already built at this exact commit (commit-keyed reuse, via the
-/// metadata store's `commit_id` column). On a cross-branch hit, publish the reused
+/// metadata store's `commit_id` index). On a cross-branch hit, publish the reused
 /// `RefInfo` under `branch` so the next sync/resolve of this branch is a
 /// branch-scoped no-op. The artifacts are commit-specific and branch-independent,
 /// so re-pointing the branch is sound. Returns the reusable build, or None.

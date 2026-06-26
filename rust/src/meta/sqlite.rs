@@ -44,6 +44,12 @@ impl MetaDb for SqliteMeta {
         .execute(&self.pool)
         .await
         .context("create refs table")?;
+        // Index for commit-keyed reuse (get_by_commit). The PK is (repo_key,
+        // branch), so without this a lookup by commit scans the repo's branches.
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_refs_commit ON refs (repo_key, commit_id)")
+            .execute(&self.pool)
+            .await
+            .context("create refs commit index")?;
         Ok(())
     }
 
