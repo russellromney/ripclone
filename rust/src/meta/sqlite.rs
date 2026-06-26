@@ -67,6 +67,27 @@ impl MetaDb for SqliteMeta {
         }
     }
 
+    async fn get_by_commit(&self, repo_key: &str, commit: &str) -> Result<Vec<RefRow>> {
+        let rows = sqlx::query(
+            "SELECT data, commit_id, synced_at FROM refs
+             WHERE repo_key = ? AND commit_id = ?",
+        )
+        .bind(repo_key)
+        .bind(commit)
+        .fetch_all(&self.pool)
+        .await
+        .context("get refs by commit")?;
+        rows.into_iter()
+            .map(|row| -> Result<RefRow> {
+                Ok(RefRow {
+                    data: row.try_get(0)?,
+                    commit_id: row.try_get(1)?,
+                    synced_at: row.try_get(2)?,
+                })
+            })
+            .collect()
+    }
+
     async fn upsert(
         &self,
         repo_key: &str,

@@ -3258,6 +3258,32 @@ async fn settle_storage(
     }
 }
 
+/// Reuse an existing build for `commit` instead of building, if one exists.
+/// First the branch's own completed full build (the common case), then any other
+/// branch already built at this exact commit (commit-keyed reuse, backed by the
+/// metadata store's `commit_id` index). On a cross-branch hit, publish the reused
+/// `RefInfo` under `branch` so the next sync/resolve of this branch is a
+/// branch-scoped no-op. The artifacts are commit-specific and branch-independent,
+/// so re-pointing the branch is sound. Returns the reusable build, or None.
+async fn reuse_existing_build(
+    ref_store: &Arc<dyn RefStore>,
+    repo_id: &RepoId,
+    branch: &str,
+    commit: &str,
+) -> Option<RefInfo> {
+    if let Ok(Some(prev)) = ref_store.load_branch(repo_id, branch).await
+        && prev.full_clonepack.commit == commit
+        && !prev.full_clonepack.manifest.is_empty()
+    {
+        return Some(prev);
+    }
+    if let Ok(Some(built)) = ref_store.load_build(repo_id, commit).await {
+        let _ = ref_store.save_branch(repo_id, branch, &built).await;
+        return Some(built);
+    }
+    None
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn do_sync(
     cas: &Cas,
@@ -3313,9 +3339,7 @@ async fn do_sync(
         .await
         .unwrap_or(Ok(None));
         if let Ok(Some(tip)) = tip
-            && let Ok(Some(prev)) = ref_store.load_branch(repo_id, branch).await
-            && prev.full_clonepack.commit == tip
-            && !prev.full_clonepack.manifest.is_empty()
+            && let Some(prev) = reuse_existing_build(ref_store, repo_id, branch, &tip).await
         {
             info!(
                 "sync no-op (ls-remote): {} already current at {} (no fetch)",
@@ -3370,16 +3394,13 @@ async fn do_sync(
     // No-op fast path: if a *completed full* build already exists for exactly
     // this commit, the prior clonepack artifacts are still valid — reuse them and
     // build nothing (skips commit-graph/bitmap/skeleton/history/archive), so a
-    // poke-to-check sync of an unchanged repo returns near-instantly. Keying on
-    // `full_clonepack.commit == commit` (not `build_status`) is robust: it is set
-    // only when phase 2 finishes for this commit, so it correctly excludes the
-    // Option-A carried-prior case, in-flight/failed phase 2, and the async
-    // worker's transient "building" status (which would otherwise mask a prior
-    // completed build).
-    if let Ok(Some(prev)) = ref_store.load_branch(repo_id, branch).await
-        && prev.full_clonepack.commit == commit
-        && !prev.full_clonepack.manifest.is_empty()
-    {
+    // poke-to-check sync of an unchanged repo returns near-instantly. Reuse is by
+    // this branch first, then any branch built at this commit (commit-keyed).
+    // Keying on `full_clonepack.commit == commit` (not `build_status`) is robust:
+    // it is set only when phase 2 finishes for this commit, so it correctly
+    // excludes the Option-A carried-prior case, in-flight/failed phase 2, and the
+    // async worker's transient "building" status.
+    if let Some(prev) = reuse_existing_build(ref_store, repo_id, branch, &commit).await {
         info!(
             "sync no-op: {} already current at {} (reusing prior clonepack)",
             repo_id.storage_key(),

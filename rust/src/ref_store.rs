@@ -48,6 +48,17 @@ pub trait RefStore: Send + Sync {
     /// Load the `RefInfo` for a specific branch.
     async fn load_branch(&self, repo_id: &RepoId, branch: &str) -> Result<Option<RefInfo>>;
 
+    /// Load a *completed full build* for an exact commit, from any branch of this
+    /// repo (commit-keyed reuse). Lets a sync of branch `bar` reuse a clonepack
+    /// branch `foo` already built at the same commit, instead of rebuilding.
+    ///
+    /// Default is `Ok(None)` — stores without an efficient commit index (file,
+    /// S3) simply fall back to the branch-scoped no-op, no regression. Returns a
+    /// `RefInfo` only when its `full_clonepack` is present and matches `commit`.
+    async fn load_build(&self, _repo_id: &RepoId, _commit: &str) -> Result<Option<RefInfo>> {
+        Ok(None)
+    }
+
     /// Save the `RefInfo` for a specific branch.
     async fn save_branch(&self, repo_id: &RepoId, branch: &str, info: &RefInfo) -> Result<()>;
 
@@ -499,6 +510,12 @@ impl<T: RefStore> RefStore for CachingRefStore<T> {
             cache.insert(key, (Instant::now(), info.clone()));
         }
         Ok(info)
+    }
+
+    async fn load_build(&self, repo_id: &RepoId, commit: &str) -> Result<Option<RefInfo>> {
+        // Commit-keyed reuse is a cold fallback path; read through to the inner
+        // store rather than maintaining a separate commit cache.
+        self.inner.load_build(repo_id, commit).await
     }
 
     async fn save_branch(&self, repo_id: &RepoId, branch: &str, info: &RefInfo) -> Result<()> {
