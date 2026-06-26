@@ -5208,6 +5208,105 @@ fn spawn_build_worker(state: ServerState, mut rx: tokio::sync::mpsc::Receiver<Bu
     });
 }
 
+/// One polling pass: for every known repo+branch, cheaply check the upstream tip
+/// (`ls-remote`, under the fetch cap) and trigger a build if that commit isn't
+/// already built. Catches pushes that arrived without a webhook/Actions trigger,
+/// so build-before-clone still holds. Best-effort: per-repo errors are logged and
+/// skipped. Returns the number of builds triggered. Exposed for tests.
+pub async fn poll_once(state: &ServerState) -> usize {
+    let repos = match state.ref_store.list().await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("poll: list repos failed: {e}");
+            return 0;
+        }
+    };
+    let mut triggered = 0;
+    for repo_id in repos {
+        let Some(provider) = state
+            .provider_registry
+            .get(repo_id.provider.as_str())
+            .cloned()
+        else {
+            continue; // unknown provider; skip
+        };
+        let branches = match state.ref_store.list_branches(&repo_id).await {
+            Ok(b) => b,
+            Err(e) => {
+                warn!("poll: list_branches {} failed: {e}", repo_id.storage_key());
+                continue;
+            }
+        };
+        for branch in branches {
+            // Cheap tip probe, under the same fetch cap as a real fetch so a sweep
+            // can't become uncapped upstream chatter. Best-effort.
+            let provider_ls = provider.clone();
+            let repo_ls = repo_id.clone();
+            let branch_ls = branch.clone();
+            let credential = state.broker.fetch_credential(&repo_id, None);
+            let tip = {
+                let _permit = fetch_semaphore()
+                    .acquire()
+                    .await
+                    .expect("fetch semaphore never closed");
+                tokio::task::spawn_blocking(move || {
+                    git::ls_remote_commit(&provider_ls, &repo_ls, &branch_ls, credential.as_ref())
+                })
+                .await
+                .unwrap_or(Ok(None))
+            };
+            let Ok(Some(tip)) = tip else {
+                continue; // unknown ref / probe failed
+            };
+            // Already built at this tip (branch-scoped, then commit-keyed)? Skip.
+            if reuse_existing_build(&state.ref_store, &repo_id, &branch, &tip)
+                .await
+                .is_some()
+            {
+                continue;
+            }
+            // Tip moved and isn't built — trigger a build (coalesces if one is
+            // already in flight for this key).
+            match trigger_build(state, &repo_id, &branch).await {
+                Ok(()) => {
+                    triggered += 1;
+                    info!(
+                        "poll: triggered build for {}@{branch} at {}",
+                        repo_id.storage_key(),
+                        &tip[..7.min(tip.len())]
+                    );
+                }
+                Err(e) => warn!(
+                    "poll: trigger {}@{branch} failed: {e}",
+                    repo_id.storage_key()
+                ),
+            }
+        }
+    }
+    triggered
+}
+
+/// Spawn the polling-fallback loop. `interval == 0` disables it. Mirrors the
+/// retention/remote-gc interval-loop pattern.
+fn spawn_poll_loop(state: ServerState, interval: Duration) {
+    if interval.is_zero() {
+        info!("poll fallback disabled (RIPCLONE_POLL_INTERVAL_SECS=0)");
+        return;
+    }
+    info!("poll fallback enabled every {:?}", interval);
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            let n = poll_once(&state).await;
+            if n > 0 {
+                info!("poll fallback: triggered {n} build(s)");
+            }
+        }
+    });
+}
+
 async fn update_build_status(state: &ServerState, repo_id: &RepoId, status: &str) -> Result<()> {
     let mut info = match state.ref_store.load(repo_id).await? {
         Some(info) => info,
@@ -5411,6 +5510,16 @@ pub async fn run_server(
     if let Some(rx) = local_rx {
         spawn_build_worker(state.clone(), rx);
     }
+
+    // Polling fallback: catches pushes that arrived without a webhook/Actions
+    // trigger so build-before-clone still holds. Off by default.
+    let poll_interval = Duration::from_secs(
+        env::var("RIPCLONE_POLL_INTERVAL_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0),
+    );
+    spawn_poll_loop(state.clone(), poll_interval);
 
     let app = build_app(state);
     let addr: SocketAddr = format!("{}:{}", host, port).parse()?;
@@ -5955,6 +6064,58 @@ mod tests {
             StatusCode::NO_CONTENT,
             "branch delete triggers no build"
         );
+    }
+
+    /// The polling fallback triggers a build when the upstream tip isn't built,
+    /// and is a no-op once it is. This is the missed-webhook catch-up path.
+    #[tokio::test]
+    async fn poll_triggers_on_unbuilt_tip_and_skips_when_built() {
+        let base = tempfile::tempdir().unwrap();
+        let origin = base.path().join("acme").join("widget.git");
+        std::fs::create_dir_all(origin.parent().unwrap()).unwrap();
+        let repo = crate::test_fixture::init_bare(&origin);
+        let tip = crate::test_fixture::commit(&repo, &[("f.txt", b"v1")]);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state_draining(&tmp);
+        let rid = RepoId::github("acme/widget");
+
+        // Seed a stale ref so the repo is enumerable and its tip looks unbuilt.
+        let stale = RefInfo {
+            commit: "0".repeat(40),
+            synced_at: Some(1),
+            ..Default::default()
+        };
+        state
+            .ref_store
+            .save_branch(&rid, "HEAD", &stale)
+            .await
+            .unwrap();
+
+        unsafe { std::env::set_var("RIPCLONE_ORIGIN_BASE", base.path()) };
+        let on_change = poll_once(&state).await;
+
+        // Mark it built at the real tip → the next poll is a no-op.
+        let built = RefInfo {
+            commit: tip.clone(),
+            synced_at: Some(2),
+            full_clonepack: crate::ClonepackArtifacts {
+                commit: tip.clone(),
+                manifest: "m".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        state
+            .ref_store
+            .save_branch(&rid, "HEAD", &built)
+            .await
+            .unwrap();
+        let when_built = poll_once(&state).await;
+        unsafe { std::env::remove_var("RIPCLONE_ORIGIN_BASE") };
+
+        assert_eq!(on_change, 1, "poll triggers a build for an unbuilt tip");
+        assert_eq!(when_built, 0, "poll is a no-op once the tip is built");
     }
 
     #[tokio::test]
