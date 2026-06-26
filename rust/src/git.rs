@@ -412,6 +412,32 @@ pub fn default_branch<P: AsRef<Path>>(repo: P) -> Result<String> {
     crate::gix_util::default_branch(repo)
 }
 
+/// The commit's depth in history — the number of commits reachable from it
+/// (`git rev-list --count`). It's monotonic along ancestry (a descendant always
+/// reaches strictly more commits than its ancestors), so it orders branch
+/// updates by their place in git history rather than by the builder's clock.
+/// The commit-graph written during sync makes this cheap.
+pub fn commit_depth<P: AsRef<Path>>(repo: P, commit: &str) -> Result<u64> {
+    crate::validation::validate_git_rev(commit)
+        .with_context(|| format!("invalid commit: {}", commit))?;
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo.as_ref())
+        .args(["rev-list", "--count", commit])
+        .output()
+        .context("run git rev-list --count")?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "git rev-list --count {commit} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let s = String::from_utf8_lossy(&out.stdout);
+    s.trim()
+        .parse::<u64>()
+        .with_context(|| format!("parse commit depth {:?}", s.trim()))
+}
+
 pub fn last_commits<P: AsRef<Path>>(repo: P, branch: &str, count: usize) -> Result<Vec<String>> {
     crate::validation::validate_git_rev(branch)
         .with_context(|| format!("invalid branch: {}", branch))?;

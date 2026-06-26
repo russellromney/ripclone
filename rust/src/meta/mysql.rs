@@ -48,6 +48,7 @@ impl MetaDb for MysqlMeta {
                 branch VARCHAR(255) NOT NULL,
                 commit_id VARCHAR(64) NOT NULL,
                 synced_at BIGINT,
+                generation BIGINT,
                 data LONGTEXT NOT NULL,
                 PRIMARY KEY (repo_key, branch)
             )",
@@ -72,6 +73,12 @@ impl MetaDb for MysqlMeta {
                 .await
                 .context("create refs commit index")?;
         }
+        // Add the generation column to a table created before it existed. MySQL 8
+        // has no ADD COLUMN IF NOT EXISTS, so this is best-effort: it errors with
+        // a duplicate-column code on an up-to-date table, which we ignore.
+        let _ = sqlx::raw_sql("ALTER TABLE refs ADD COLUMN generation BIGINT")
+            .execute(&self.pool)
+            .await;
         Ok(())
     }
 
@@ -123,6 +130,7 @@ impl MetaDb for MysqlMeta {
         data: &str,
         commit_id: &str,
         synced_at: Option<i64>,
+        generation: Option<i64>,
     ) -> Result<()> {
         // The key columns are VARCHAR (the composite PK can't be TEXT). Reject an
         // over-long key instead of letting MySQL silently truncate it, which would
@@ -132,28 +140,32 @@ impl MetaDb for MysqlMeta {
         check_len("commit_id", commit_id, 64)?;
         // MySQL's ON DUPLICATE KEY UPDATE has no WHERE clause, so the ordering
         // decision is computed once into the session variable `@ripl` in the
-        // first (data) assignment — while `commit_id`/`synced_at` still hold
-        // their original values — then reused for the remaining columns. The
+        // first (data) assignment — while the other columns still hold their
+        // original values — then reused for the remaining columns. The
         // assignments evaluate left-to-right, so `data` must come first or the
         // condition would read already-overwritten columns. `@ripl` is set and
         // read within this one statement, so the connection pool can't leak it
         // across calls. Policy is identical to the sqlite adapter's WHERE.
         sqlx::query(
-            "INSERT INTO refs (repo_key, branch, commit_id, synced_at, data)
-             VALUES (?, ?, ?, ?, ?)
+            "INSERT INTO refs (repo_key, branch, commit_id, synced_at, generation, data)
+             VALUES (?, ?, ?, ?, ?, ?)
              ON DUPLICATE KEY UPDATE
                  data = IF(@ripl := (VALUES(commit_id) = commit_id
-                                     OR synced_at IS NULL
-                                     OR VALUES(synced_at) IS NULL
-                                     OR VALUES(synced_at) >= synced_at),
+                                     OR (generation IS NOT NULL AND VALUES(generation) IS NOT NULL
+                                         AND VALUES(generation) >= generation)
+                                     OR ((generation IS NULL OR VALUES(generation) IS NULL)
+                                         AND (synced_at IS NULL OR VALUES(synced_at) IS NULL
+                                              OR VALUES(synced_at) >= synced_at))),
                            VALUES(data), data),
                  commit_id = IF(@ripl, VALUES(commit_id), commit_id),
-                 synced_at = IF(@ripl, VALUES(synced_at), synced_at)",
+                 synced_at = IF(@ripl, VALUES(synced_at), synced_at),
+                 generation = IF(@ripl, VALUES(generation), generation)",
         )
         .bind(repo_key)
         .bind(branch)
         .bind(commit_id)
         .bind(synced_at)
+        .bind(generation)
         .bind(data)
         .execute(&self.pool)
         .await

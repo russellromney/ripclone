@@ -37,6 +37,7 @@ impl MetaDb for SqliteMeta {
                 branch TEXT NOT NULL,
                 commit_id TEXT NOT NULL,
                 synced_at BIGINT,
+                generation BIGINT,
                 data TEXT NOT NULL,
                 PRIMARY KEY (repo_key, branch)
             )",
@@ -50,6 +51,11 @@ impl MetaDb for SqliteMeta {
             .execute(&self.pool)
             .await
             .context("create refs commit index")?;
+        // Add the generation column to a table created before it existed
+        // (best-effort: errors "duplicate column" on an up-to-date table).
+        let _ = sqlx::raw_sql("ALTER TABLE refs ADD COLUMN generation BIGINT")
+            .execute(&self.pool)
+            .await;
         Ok(())
     }
 
@@ -101,27 +107,33 @@ impl MetaDb for SqliteMeta {
         data: &str,
         commit_id: &str,
         synced_at: Option<i64>,
+        generation: Option<i64>,
     ) -> Result<()> {
-        // The DO UPDATE ... WHERE makes the ordering check atomic with the
-        // write: on conflict the row is only overwritten when the new sync wins
-        // (same commit, either side has no timestamp, or new >= stored). A
-        // losing write is a silent no-op, exactly like the file/S3 stores.
+        // The DO UPDATE ... WHERE makes the ordering check atomic with the write:
+        // on conflict the row is overwritten only when the new write wins — same
+        // commit, a higher-or-equal generation (commit history depth), or, when
+        // either side has no generation, a newer-or-equal synced_at. A losing
+        // write is a silent no-op, exactly like the file/S3 stores.
         sqlx::query(
-            "INSERT INTO refs (repo_key, branch, commit_id, synced_at, data)
-             VALUES (?, ?, ?, ?, ?)
+            "INSERT INTO refs (repo_key, branch, commit_id, synced_at, generation, data)
+             VALUES (?, ?, ?, ?, ?, ?)
              ON CONFLICT (repo_key, branch) DO UPDATE SET
                  commit_id = excluded.commit_id,
                  synced_at = excluded.synced_at,
+                 generation = excluded.generation,
                  data = excluded.data
              WHERE excluded.commit_id = refs.commit_id
-                OR refs.synced_at IS NULL
-                OR excluded.synced_at IS NULL
-                OR excluded.synced_at >= refs.synced_at",
+                OR (refs.generation IS NOT NULL AND excluded.generation IS NOT NULL
+                    AND excluded.generation >= refs.generation)
+                OR ((refs.generation IS NULL OR excluded.generation IS NULL)
+                    AND (refs.synced_at IS NULL OR excluded.synced_at IS NULL
+                         OR excluded.synced_at >= refs.synced_at))",
         )
         .bind(repo_key)
         .bind(branch)
         .bind(commit_id)
         .bind(synced_at)
+        .bind(generation)
         .bind(data)
         .execute(&self.pool)
         .await

@@ -35,6 +35,7 @@ impl MetaDb for LibsqlMeta {
                     branch TEXT NOT NULL,
                     commit_id TEXT NOT NULL,
                     synced_at BIGINT,
+                    generation BIGINT,
                     data TEXT NOT NULL,
                     PRIMARY KEY (repo_key, branch)
                 )",
@@ -52,6 +53,13 @@ impl MetaDb for LibsqlMeta {
             )
             .await
             .context("create refs commit index")?;
+        // Add the generation column to a table created before it existed
+        // (best-effort: errors on an up-to-date table, which is fine).
+        let _ = self
+            .conn()
+            .await?
+            .execute("ALTER TABLE refs ADD COLUMN generation BIGINT", ())
+            .await;
         Ok(())
     }
 
@@ -103,23 +111,27 @@ impl MetaDb for LibsqlMeta {
         data: &str,
         commit_id: &str,
         synced_at: Option<i64>,
+        generation: Option<i64>,
     ) -> Result<()> {
         // DO UPDATE ... WHERE makes the ordering check atomic with the write;
         // a losing write is a silent no-op. Same policy as the sqlite adapter.
         self.conn()
             .await?
             .execute(
-                "INSERT INTO refs (repo_key, branch, commit_id, synced_at, data)
-                 VALUES (?, ?, ?, ?, ?)
+                "INSERT INTO refs (repo_key, branch, commit_id, synced_at, generation, data)
+                 VALUES (?, ?, ?, ?, ?, ?)
                  ON CONFLICT (repo_key, branch) DO UPDATE SET
                      commit_id = excluded.commit_id,
                      synced_at = excluded.synced_at,
+                     generation = excluded.generation,
                      data = excluded.data
                  WHERE excluded.commit_id = refs.commit_id
-                    OR refs.synced_at IS NULL
-                    OR excluded.synced_at IS NULL
-                    OR excluded.synced_at >= refs.synced_at",
-                libsql::params![repo_key, branch, commit_id, synced_at, data],
+                    OR (refs.generation IS NOT NULL AND excluded.generation IS NOT NULL
+                        AND excluded.generation >= refs.generation)
+                    OR ((refs.generation IS NULL OR excluded.generation IS NULL)
+                        AND (refs.synced_at IS NULL OR excluded.synced_at IS NULL
+                             OR excluded.synced_at >= refs.synced_at))",
+                libsql::params![repo_key, branch, commit_id, synced_at, generation, data],
             )
             .await
             .context("save_ordered ref")?;

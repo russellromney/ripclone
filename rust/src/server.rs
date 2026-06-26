@@ -1567,6 +1567,7 @@ async fn get_ref_inner(
                 archive_frames: Vec::new(),
                 build_status: None,
                 synced_at: None,
+                generation: None,
             });
             let resp = ref_response(
                 &repo_id,
@@ -4286,6 +4287,7 @@ async fn do_sync(
         archive_frames: Vec::new(),
         build_status: None,
         synced_at: fetched_at,
+        generation: git::commit_depth(&mirror_dir, &commit).ok(),
     };
 
     // Push every built artifact to the configured storage backend. For a local
@@ -4728,6 +4730,7 @@ async fn build_and_publish_two_phase(
         archive_frames: carried_archive_frames,
         build_status: Some("full history building".to_string()),
         synced_at: fetched_at,
+        generation: git::commit_depth(mirror_dir, commit).ok(),
     };
 
     // Upload phase-1 artifacts (shallow skeleton/index/metadata, head idx-bundle
@@ -5518,6 +5521,7 @@ async fn update_build_status(state: &ServerState, repo_id: &RepoId, status: &str
             archive_frames: Vec::new(),
             build_status: None,
             synced_at: None,
+            generation: None,
         },
     };
     info.build_status = Some(status.to_string());
@@ -5921,6 +5925,7 @@ mod tests {
             archive_frames: Vec::new(),
             build_status: None,
             synced_at: None,
+            generation: None,
         };
         let provider = ProviderRegistry::new().default_provider().clone();
         let repo_id = RepoId::github("o/r");
@@ -6673,6 +6678,7 @@ mod tests {
             archive_frames: Vec::new(),
             build_status: None,
             synced_at: Some(1_718_812_800),
+            generation: None,
         };
         state
             .ref_store
@@ -6769,6 +6775,7 @@ mod tests {
             archive_frames: Vec::new(),
             build_status: None,
             synced_at: None,
+            generation: None,
         };
         state
             .ref_store

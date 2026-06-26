@@ -36,18 +36,31 @@ fn unbranch_slug(slug: &str) -> Option<String> {
 /// - there is no existing ref, or
 /// - the new ref points at the same commit (a metadata-only update — e.g.
 ///   `build_status` flipping to done — must always land), or
-/// - the new ref's `synced_at` is newer-than-or-equal to the stored one.
+/// - the new commit is at least as deep in git history as the stored one
+///   (`generation`), or
+/// - (fallback, for refs without a generation) the new `synced_at` is
+///   newer-than-or-equal to the stored one.
 ///
-/// A missing `synced_at` on either side is treated as "no ordering
-/// information" and the write is accepted; backends that have a stronger
-/// atomic tie-break (the SQL conditional upsert, the S3 ETag CAS) rely on that
-/// for the final ordering, while the file store serializes writes in-process.
+/// `generation` (the commit's history depth) is the primary signal: recency
+/// follows the commit's place in history, not the builder's clock, so two
+/// builders with skewed clocks still order correctly. `synced_at` is the
+/// fallback for refs written before `generation` existed. A missing value on
+/// either side defers to the backend's atomic tie-break (the SQL conditional
+/// upsert, the S3 ETag CAS); the file store serializes writes in-process.
+///
+/// Known limitation: a force-push that rewinds a branch to an *older* commit has
+/// a lower generation, so it lags here until the next forward push (a same-commit
+/// re-sync still updates). That is the cost of ordering by history rather than
+/// by observation time.
 pub(crate) fn should_replace_ref(existing: Option<&RefInfo>, new: &RefInfo) -> bool {
     let Some(existing) = existing else {
         return true;
     };
     if existing.commit == new.commit {
         return true;
+    }
+    if let (Some(existing_gen), Some(new_gen)) = (existing.generation, new.generation) {
+        return new_gen >= existing_gen;
     }
     match (existing.synced_at, new.synced_at) {
         (Some(existing_ts), Some(new_ts)) => new_ts >= existing_ts,
@@ -666,6 +679,7 @@ mod tests {
             archive_frames: Vec::new(),
             build_status: None,
             synced_at: None,
+            generation: None,
         }
     }
 
@@ -730,6 +744,55 @@ mod tests {
         assert_eq!(
             loaded.commit, "c2",
             "cache must not serve the older ref that lost the durable write"
+        );
+    }
+
+    /// Ordering follows the commit's history depth (generation), not the
+    /// builder's clock: a build with a later wall-clock but shallower history
+    /// must lose to a deeper one.
+    #[tokio::test]
+    async fn file_ref_store_orders_by_generation_not_clock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileRefStore::new(tmp.path());
+        let repo = RepoId::github("o/r");
+
+        let mut deep = dummy_ref_info("c-deep");
+        deep.generation = Some(10);
+        deep.synced_at = Some(1); // old clock
+        store.save_branch(&repo, "main", &deep).await.unwrap();
+
+        // Later clock, shallower history → must lose (skew immunity).
+        let mut recent_shallow = dummy_ref_info("c-shallow");
+        recent_shallow.generation = Some(5);
+        recent_shallow.synced_at = Some(1000);
+        store
+            .save_branch(&repo, "main", &recent_shallow)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .load_branch(&repo, "main")
+                .await
+                .unwrap()
+                .unwrap()
+                .commit,
+            "c-deep",
+            "higher generation wins over a newer wall clock"
+        );
+
+        // A genuinely deeper build wins.
+        let mut deeper = dummy_ref_info("c-deeper");
+        deeper.generation = Some(11);
+        deeper.synced_at = Some(2);
+        store.save_branch(&repo, "main", &deeper).await.unwrap();
+        assert_eq!(
+            store
+                .load_branch(&repo, "main")
+                .await
+                .unwrap()
+                .unwrap()
+                .commit,
+            "c-deeper"
         );
     }
 

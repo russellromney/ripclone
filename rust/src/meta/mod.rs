@@ -56,15 +56,16 @@ pub trait MetaDb: Send + Sync {
 
     /// Insert-or-update the row for one ref, applying the save-ordering policy
     /// ("a newer sync never loses to an older one") in a **single atomic
-    /// statement** — no read-then-write TOCTOU. The write lands only when there
-    /// is no existing row, the commit matches (metadata-only update), or the
-    /// new `synced_at` is newer-than-or-equal to the stored one; a NULL
-    /// `synced_at` on either side counts as "no ordering info" and the write
-    /// proceeds. This mirrors [`should_replace_ref`](crate::ref_store) but
-    /// enforced in SQL so concurrent writers across processes can't reorder.
+    /// statement** — no read-then-write TOCTOU. The write lands when there is no
+    /// existing row, the commit matches (metadata-only update), the new
+    /// `generation` (commit history depth) is >= the stored one, or — for rows
+    /// without a generation — the new `synced_at` is >= the stored one. This
+    /// mirrors [`should_replace_ref`](crate::ref_store) but enforced in SQL so
+    /// concurrent writers across processes can't reorder.
     ///
     /// Pairs with the fetch-time `synced_at` stamping in `do_sync`: the stamp
-    /// makes "newer" mean "fetched later", and this enforces it atomically.
+    /// makes "newer" mean "fetched later", the fallback used when neither side
+    /// carries a generation.
     async fn save_ordered(
         &self,
         repo_key: &str,
@@ -72,6 +73,7 @@ pub trait MetaDb: Send + Sync {
         data: &str,
         commit_id: &str,
         synced_at: Option<i64>,
+        generation: Option<i64>,
     ) -> Result<()>;
 
     /// Distinct `repo_key`s that have at least one stored ref.
@@ -151,12 +153,20 @@ impl RefStore for SqlRefStore {
         let repo_key = repo_id.storage_key();
         let data = serde_json::to_string(info).context("serialize RefInfo")?;
         let new_synced = info.synced_at.map(|t| t as i64);
+        let new_generation = info.generation.map(|g| g as i64);
 
         // Ordering ("a newer sync never loses to an older one") is enforced
         // atomically inside the single conditional upsert — no get-then-write
         // TOCTOU, so concurrent writers can't reorder. See `MetaDb::save_ordered`.
         self.db
-            .save_ordered(&repo_key, branch, &data, &info.commit, new_synced)
+            .save_ordered(
+                &repo_key,
+                branch,
+                &data,
+                &info.commit,
+                new_synced,
+                new_generation,
+            )
             .await
     }
 
@@ -272,6 +282,34 @@ mod tests {
         assert!(
             store.load_build(&rid, "c2").await.unwrap().is_none(),
             "incomplete (depth=1-only) build must not be reused"
+        );
+
+        // Generation (commit history depth) is the primary ordering signal.
+        // Establish a baseline that has one (wins the synced_at fallback vs the
+        // gen-less c3 above).
+        let mut g10 = ref_at("g10", Some(300));
+        g10.generation = Some(10);
+        store.save(&rid, &g10).await.unwrap();
+        assert_eq!(store.load(&rid).await.unwrap().unwrap().commit, "g10");
+
+        // Deeper history wins even with an older wall clock.
+        let mut g20 = ref_at("g20", Some(1));
+        g20.generation = Some(20);
+        store.save(&rid, &g20).await.unwrap();
+        assert_eq!(
+            store.load(&rid).await.unwrap().unwrap().commit,
+            "g20",
+            "higher generation wins over a newer wall clock"
+        );
+
+        // Shallower history loses even with a newer wall clock.
+        let mut g15 = ref_at("g15", Some(99_999));
+        g15.generation = Some(15);
+        store.save(&rid, &g15).await.unwrap();
+        assert_eq!(
+            store.load(&rid).await.unwrap().unwrap().commit,
+            "g20",
+            "lower generation loses despite a newer wall clock"
         );
     }
 
