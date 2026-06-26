@@ -18,9 +18,12 @@ primary_region = 'ewr'
 [http_service]
   internal_port = 8000
   force_https = true
-  auto_stop_machines = 'stop'
+  # Keep the client machine running during long benchmark sweeps; it only runs
+  # when we explicitly SSH in to start a sweep, but the sweep itself can last
+  # hours and Fly's HTTP-idle auto-stop would interrupt it.
+  auto_stop_machines = false
   auto_start_machines = true
-  min_machines_running = 0
+  min_machines_running = 1
   processes = ['app']
 
 # 8 dedicated performance vCPUs to mirror a developer laptop for realistic clone
