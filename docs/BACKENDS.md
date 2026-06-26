@@ -258,3 +258,32 @@ RIPCLONE_OVERLAY_MARGIN_MB=128       # headroom required in staging dir
 | Multi-machine farm-out | S3 / R2 | `postgres`/`mysql`/`libsql` | `postgres`/`mysql`/`libsql` | Workers on other hosts share a network DB |
 | Hosted service / new users | S3 Express One Zone or R2 | SQL | SQL | Fastest downloads + farm-out builds |
 | Cost-sensitive hosted | R2 + client cache | SQL | SQL | No egress fees |
+
+## Access control & the trust boundary (AU1)
+
+ripclone has **no separate auth gateway**. Two layers gate reads:
+
+1. **The shared server token** (`RIPCLONE_SERVER_TOKEN`) authenticates *that a
+   caller may talk to this backend at all*. It is **not** per-repo authorization
+   — every holder of it can address every repo path.
+2. **Per-repo access enforcement** decides whether a given caller may read a
+   given repo:
+   - **Public repos** are served anonymously.
+   - **Private repos** require the caller's *own* git credential (passed via the
+     `X-Upstream-Token` header). On every read — including cache hits — the
+     backend verifies that credential grants access to that repo against the
+     provider (a `git-upload-pack` `info/refs` probe, cached for a short TTL,
+     `RIPCLONE_REPO_AUTH_TTL_SECS`, default 60s). A caller who can't prove
+     access gets `403`, even if the repo is already cached.
+
+This is **on by default**. It is what stops one tenant from reading another
+tenant's cached private repos with only the shared token.
+
+### Single-tenant self-host: `RIPCLONE_TRUST_GATEWAY=1`
+
+If you run a single-tenant backend that fully trusts whoever holds the shared
+token (e.g. one operator, a standing backend credential, no per-request
+tokens), set `RIPCLONE_TRUST_GATEWAY=1` to skip the per-repo check. In that mode
+the backend **must** be kept network-isolated and never shared across tenants —
+anyone with the shared token can read any cached repo. Repo visibility then
+falls back to the client-supplied `x-ripclone-visibility` header.
