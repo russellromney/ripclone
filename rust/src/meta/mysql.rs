@@ -9,6 +9,18 @@ use async_trait::async_trait;
 use sqlx::Row;
 use sqlx::mysql::{MySqlPool, MySqlPoolOptions};
 
+/// Reject a value that wouldn't fit a VARCHAR column, so MySQL never silently
+/// truncates a key (which would merge two distinct repos/branches into one row).
+fn check_len(field: &str, value: &str, max: usize) -> Result<()> {
+    if value.len() > max {
+        anyhow::bail!(
+            "{field} is too long for MySQL ({} bytes, max {max}): {value:?}",
+            value.len()
+        );
+    }
+    Ok(())
+}
+
 pub struct MysqlMeta {
     pool: MySqlPool,
 }
@@ -112,6 +124,12 @@ impl MetaDb for MysqlMeta {
         commit_id: &str,
         synced_at: Option<i64>,
     ) -> Result<()> {
+        // The key columns are VARCHAR (the composite PK can't be TEXT). Reject an
+        // over-long key instead of letting MySQL silently truncate it, which would
+        // collide two distinct repos/branches onto one row.
+        check_len("repo_key", repo_key, 512)?;
+        check_len("branch", branch, 255)?;
+        check_len("commit_id", commit_id, 64)?;
         // MySQL's ON DUPLICATE KEY UPDATE has no WHERE clause, so the ordering
         // decision is computed once into the session variable `@ripl` in the
         // first (data) assignment — while `commit_id`/`synced_at` still hold

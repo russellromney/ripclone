@@ -363,10 +363,20 @@ pub(crate) const CREATE_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS jobs (
 pub(crate) const CREATE_STATUS_INDEX_SQL: &str =
     "CREATE INDEX IF NOT EXISTS idx_jobs_status_created ON jobs(status, created_at)";
 
-/// Best-effort coalescing backstop; not every engine enforces partial indexes.
+/// Drop the older index that made (queued OR claimed) unique per key. That
+/// uniqueness blocked queuing a fresh build for a key whose previous build was
+/// already claimed (and had already fetched), so a push arriving mid-build was
+/// dropped until the next push. Best-effort.
+pub(crate) const DROP_LEGACY_ACTIVE_KEY_INDEX_SQL: &str =
+    "DROP INDEX IF EXISTS idx_jobs_active_key";
+
+/// Best-effort coalescing backstop: at most one *queued* build per key, so
+/// concurrent pushes collapse into one. A claimed build can coexist with a
+/// queued one, so a push that lands while a build is in flight gets its own
+/// queued job and builds the newer commit next.
 pub(crate) const CREATE_ACTIVE_KEY_INDEX_SQL: &str =
-    "CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_active_key
-     ON jobs(key) WHERE status IN ('queued', 'claimed')";
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_queued_key
+     ON jobs(key) WHERE status = 'queued'";
 
 /// Index for the build/version history queries over retained `done` jobs
 /// ("what was synced for this repo over time").
@@ -570,16 +580,28 @@ mod tests {
         }
     }
 
+    /// A push that arrives while the prior build for the same key is already
+    /// claimed (and has already fetched) must get its own queued job, so the
+    /// newer commit is built next — not coalesced onto the in-flight build and
+    /// dropped. A second push while that fresh job is still queued does coalesce.
     #[tokio::test]
-    async fn coalesces_against_a_claimed_job() {
+    async fn enqueues_fresh_job_when_prior_is_claimed() {
         for (engine, q, _dir) in queues().await {
             q.enqueue(job("o", "r", "main")).await.unwrap();
             let _claimed = q.claim("w").await.unwrap().unwrap();
             assert_eq!(
                 q.enqueue(job("o", "r", "main")).await.unwrap().outcome,
-                EnqueueOutcome::Coalesced,
-                "{engine}"
+                EnqueueOutcome::Enqueued,
+                "{engine}: a push during an in-flight build gets its own queued job"
             );
+            assert_eq!(q.depth().await, 1, "{engine}: one fresh queued job");
+            // A further push while that job is queued coalesces onto it.
+            assert_eq!(
+                q.enqueue(job("o", "r", "main")).await.unwrap().outcome,
+                EnqueueOutcome::Coalesced,
+                "{engine}: further pushes collapse into the queued job"
+            );
+            assert_eq!(q.depth().await, 1, "{engine}: still one queued job");
         }
     }
 

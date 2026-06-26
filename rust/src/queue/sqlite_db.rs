@@ -4,7 +4,8 @@
 
 use super::sql::{
     ADD_ATTEMPTS_COLUMN_SQL, ADD_CREDENTIAL_COLUMN_SQL, CREATE_ACTIVE_KEY_INDEX_SQL,
-    CREATE_HISTORY_INDEX_SQL, CREATE_STATUS_INDEX_SQL, CREATE_TABLE_SQL, QueueDb,
+    CREATE_HISTORY_INDEX_SQL, CREATE_STATUS_INDEX_SQL, CREATE_TABLE_SQL,
+    DROP_LEGACY_ACTIVE_KEY_INDEX_SQL, QueueDb,
 };
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -57,6 +58,9 @@ impl QueueDb for SqliteDb {
             .execute(&self.pool)
             .await
             .context("create status index")?;
+        let _ = sqlx::raw_sql(DROP_LEGACY_ACTIVE_KEY_INDEX_SQL)
+            .execute(&self.pool)
+            .await;
         if let Err(e) = sqlx::raw_sql(CREATE_ACTIVE_KEY_INDEX_SQL)
             .execute(&self.pool)
             .await
@@ -71,13 +75,11 @@ impl QueueDb for SqliteDb {
     }
 
     async fn active_job_id(&self, key: &str) -> Result<Option<i64>> {
-        sqlx::query_scalar(
-            "SELECT id FROM jobs WHERE key = ? AND status IN ('queued', 'claimed') LIMIT 1",
-        )
-        .bind(key)
-        .fetch_optional(&self.pool)
-        .await
-        .context("query active job")
+        sqlx::query_scalar("SELECT id FROM jobs WHERE key = ? AND status = 'queued' LIMIT 1")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await
+            .context("query active job")
     }
 
     async fn insert_job(
