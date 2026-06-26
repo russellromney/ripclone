@@ -1245,6 +1245,11 @@ async fn ensure_mirror(
     let repo_id = repo_id.clone();
     let branch = branch.to_string();
     let credential = credential.cloned();
+    // Same process-global fetch cap as the build path.
+    let _fetch_permit = fetch_semaphore()
+        .acquire()
+        .await
+        .expect("fetch semaphore never closed");
     tokio::task::spawn_blocking(move || {
         git::sync_bare_mirror(
             &mirror_dir,
@@ -3357,6 +3362,12 @@ async fn do_sync(
     let repo_id_sync = repo_id.clone();
     let branch_sync = branch.to_string();
     let credential_sync = credential.cloned();
+    // Cap concurrent upstream fetches across the process (bandwidth + upstream
+    // abuse limits). Held only across the fetch, not the build.
+    let fetch_permit = fetch_semaphore()
+        .acquire()
+        .await
+        .expect("fetch semaphore never closed");
     tokio::task::spawn_blocking(move || {
         git::sync_bare_mirror(
             &mirror_dir_sync,
@@ -3368,6 +3379,7 @@ async fn do_sync(
     })
     .await
     .context("sync task")??;
+    drop(fetch_permit);
     info!("sync phase: mirror fetch {:?}", t.elapsed());
     t = Instant::now();
 
@@ -4871,34 +4883,78 @@ pub async fn process_build_job(state: &ServerState, job: &BuildJob) -> Result<()
     }
 }
 
-/// Spawn the in-process worker loop for the local queue. Each finished job
-/// decrements the shared depth counter and signals any coalesced `/sync` waiters
-/// via their oneshots.
+/// Concurrency cap for in-process builds. Builds are CPU-heavy (history
+/// deltification + zstd), so the default is deliberately small; raise it on a big
+/// box via `RIPCLONE_BUILD_CONCURRENCY`. Different repos build in parallel;
+/// same-repo builds still serialize on the per-repo mirror lock.
+fn build_concurrency() -> usize {
+    std::env::var("RIPCLONE_BUILD_CONCURRENCY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(2)
+}
+
+/// Process-global cap on concurrent upstream fetches/clones. Separate from — and
+/// usually a touch larger than — the build cap: a fetch is network/upstream
+/// bound, a build is CPU bound, so they throttle independently. Bounding fetches
+/// keeps us from saturating bandwidth or tripping upstream (GitHub) abuse limits
+/// when many repos sync at once. Override with `RIPCLONE_FETCH_CONCURRENCY`.
+fn fetch_semaphore() -> &'static tokio::sync::Semaphore {
+    static SEM: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    SEM.get_or_init(|| {
+        let n = std::env::var("RIPCLONE_FETCH_CONCURRENCY")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(4);
+        tokio::sync::Semaphore::new(n)
+    })
+}
+
+/// Spawn the in-process worker loop for the local queue. Up to
+/// `build_concurrency()` jobs run at once (different repos in parallel); each
+/// finished job decrements the shared depth counter and signals any coalesced
+/// `/sync` waiters via their oneshots.
 fn spawn_build_worker(state: ServerState, mut rx: tokio::sync::mpsc::Receiver<BuildJob>) {
+    let sem = Arc::new(tokio::sync::Semaphore::new(build_concurrency()));
     tokio::spawn(async move {
         while let Some(job) = rx.recv().await {
-            // The waiter key must match the enqueue key, which includes the rev
-            // override. Compute it before the job is moved into the build task.
-            let key = format!(
-                "{}/{}#{}",
-                job.repo_id.storage_key(),
-                job.branch,
-                job.rev.as_deref().unwrap_or("")
-            );
-            // Isolate the build so a panic fails just this job (signalling its
-            // waiters) instead of killing the worker and wedging the queue.
-            let st = state.clone();
-            let result = match tokio::spawn(async move { process_build_job(&st, &job).await }).await
-            {
-                Ok(r) => r,
-                Err(e) => Err(format!("build task panicked: {e}")),
-            };
-            state.build_queue_depth.fetch_sub(1, Ordering::Relaxed);
-            if let Some(senders) = state.build_waiters.lock().await.remove(&key) {
-                for s in senders {
-                    let _ = s.send(result.clone());
+            // Block here until a build slot frees, so we never spawn faster than
+            // we drain. The owned permit rides with the build task and frees on
+            // completion.
+            let permit = sem
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("build semaphore never closed");
+            let state = state.clone();
+            tokio::spawn(async move {
+                let _permit = permit;
+                // The waiter key must match the enqueue key, which includes the
+                // rev override.
+                let key = format!(
+                    "{}/{}#{}",
+                    job.repo_id.storage_key(),
+                    job.branch,
+                    job.rev.as_deref().unwrap_or("")
+                );
+                // Inner spawn isolates a panic so it fails just this job
+                // (signalling its waiters) instead of killing the task with
+                // waiters left hanging.
+                let st = state.clone();
+                let result =
+                    match tokio::spawn(async move { process_build_job(&st, &job).await }).await {
+                        Ok(r) => r,
+                        Err(e) => Err(format!("build task panicked: {e}")),
+                    };
+                state.build_queue_depth.fetch_sub(1, Ordering::Relaxed);
+                if let Some(senders) = state.build_waiters.lock().await.remove(&key) {
+                    for s in senders {
+                        let _ = s.send(result.clone());
+                    }
                 }
-            }
+            });
         }
     });
 }
