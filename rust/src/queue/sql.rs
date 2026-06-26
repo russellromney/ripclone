@@ -265,12 +265,7 @@ impl SqlJobQueue {
     /// `Ok(false)` if the claim had been reclaimed/dead-lettered out from under
     /// this worker (its result is stale and must be discarded — see
     /// [`QueueDb::finish`]).
-    pub async fn ack(
-        &self,
-        id: i64,
-        worker_id: &str,
-        result: Result<(), String>,
-    ) -> Result<bool> {
+    pub async fn ack(&self, id: i64, worker_id: &str, result: Result<(), String>) -> Result<bool> {
         let (status, error) = match result {
             Ok(()) => ("done", None),
             Err(e) => ("failed", Some(e)),
@@ -548,7 +543,9 @@ mod tests {
         for (engine, q, _dir) in queues().await {
             let enq = q.enqueue(job("o", "r", "main")).await.unwrap();
             let claimed = q.claim("w").await.unwrap().unwrap();
-            q.ack(claimed.id, "w", Err("boom".to_string())).await.unwrap();
+            q.ack(claimed.id, "w", Err("boom".to_string()))
+                .await
+                .unwrap();
             match q.job_status(enq.job_id.unwrap()).await.unwrap() {
                 JobState::Failed(e) => assert_eq!(e, "boom", "{engine}"),
                 other => panic!("{engine}: expected Failed, got {other:?}"),
@@ -877,7 +874,9 @@ mod tests {
 
         let second = q.claim("w1").await.unwrap().unwrap();
         assert_eq!(second.branch, "dev");
-        q.ack(second.id, "w1", Err("boom".to_string())).await.unwrap();
+        q.ack(second.id, "w1", Err("boom".to_string()))
+            .await
+            .unwrap();
         match q.job_status(second.id).await.unwrap() {
             JobState::Failed(e) => assert_eq!(e, "boom"),
             o => panic!("expected Failed, got {o:?}"),

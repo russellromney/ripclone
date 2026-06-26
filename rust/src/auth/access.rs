@@ -138,7 +138,12 @@ impl HttpAccessVerifier {
         public
     }
 
-    async fn caller_authorized(&self, provider: &ProviderInstance, url: &str, cred: &SecretString) -> bool {
+    async fn caller_authorized(
+        &self,
+        provider: &ProviderInstance,
+        url: &str,
+        cred: &SecretString,
+    ) -> bool {
         let key = (url.to_string(), credential_fingerprint(cred));
         if let Some((at, v)) = self.authz_cache.read().await.get(&key)
             && at.elapsed() < self.ttl

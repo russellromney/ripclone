@@ -63,10 +63,12 @@ impl QueueDb for PostgresDb {
             .await
             .context("add credential column")?;
         // Migrate a legacy table for the attempts column (dead-letter bound).
-        sqlx::raw_sql("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS attempts BIGINT NOT NULL DEFAULT 0")
-            .execute(&self.pool)
-            .await
-            .context("add attempts column")?;
+        sqlx::raw_sql(
+            "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS attempts BIGINT NOT NULL DEFAULT 0",
+        )
+        .execute(&self.pool)
+        .await
+        .context("add attempts column")?;
         sqlx::raw_sql(
             "CREATE INDEX IF NOT EXISTS idx_jobs_status_created ON jobs(status, created_at)",
         )

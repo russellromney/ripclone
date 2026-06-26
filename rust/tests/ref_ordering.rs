@@ -154,9 +154,7 @@ async fn libsql_ref_store_newest_wins() {
         std::env::var("RIPCLONE_TEST_LIBSQL_URL"),
         std::env::var("RIPCLONE_TEST_LIBSQL_TOKEN"),
     ) else {
-        eprintln!(
-            "SKIP libsql_ref_store_newest_wins: RIPCLONE_TEST_LIBSQL_URL / _TOKEN unset"
-        );
+        eprintln!("SKIP libsql_ref_store_newest_wins: RIPCLONE_TEST_LIBSQL_URL / _TOKEN unset");
         return;
     };
     let store: Arc<dyn RefStore> = Arc::new(

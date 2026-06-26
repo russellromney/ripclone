@@ -1411,7 +1411,8 @@ async fn get_ref_inner(
     // AU1: authorize the caller for this repo BEFORE the cache-hit return below,
     // so a cached private repo is never served to a caller without access.
     let private =
-        match authorize_repo_read(&state, &provider, &repo_id, credential.as_ref(), &headers).await {
+        match authorize_repo_read(&state, &provider, &repo_id, credential.as_ref(), &headers).await
+        {
             Ok(p) => p,
             Err(resp) => return resp,
         };
@@ -2011,7 +2012,8 @@ async fn sync_repo_inner(
         .fetch_credential(&repo_id, request_token.as_ref());
     // AU1: a sync both builds and returns the ref (with signed URLs), so gate it.
     let private =
-        match authorize_repo_read(&state, &provider, &repo_id, credential.as_ref(), &headers).await {
+        match authorize_repo_read(&state, &provider, &repo_id, credential.as_ref(), &headers).await
+        {
             Ok(p) => p,
             Err(resp) => return resp,
         };

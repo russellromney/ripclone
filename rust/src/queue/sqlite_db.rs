@@ -50,7 +50,9 @@ impl QueueDb for SqliteDb {
             .execute(&self.pool)
             .await;
         // Same best-effort migration for the attempts column (dead-letter bound).
-        let _ = sqlx::raw_sql(ADD_ATTEMPTS_COLUMN_SQL).execute(&self.pool).await;
+        let _ = sqlx::raw_sql(ADD_ATTEMPTS_COLUMN_SQL)
+            .execute(&self.pool)
+            .await;
         sqlx::raw_sql(CREATE_STATUS_INDEX_SQL)
             .execute(&self.pool)
             .await
