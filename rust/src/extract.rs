@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tracing::{info, warn};
@@ -443,15 +443,15 @@ where
                         );
                     }
 
-                    let pairs = fragments_by_frame2
-                        .get(&(idx as u32))
-                        .cloned()
-                        .unwrap_or_default();
+                    // R2: borrow the frame's fragment-pair list from the shared
+                    // map instead of cloning it per frame (the loop only reads it).
+                    let empty = Vec::new();
+                    let pairs = fragments_by_frame2.get(&(idx as u32)).unwrap_or(&empty);
                     let mut written = 0usize;
                     let mut stats = Vec::new();
                     let mut pending_writes: Vec<OwnedFileWrite> =
                         Vec::with_capacity(PACK_WRITE_BATCH_FILES);
-                    for (file_idx, frag_idx) in &pairs {
+                    for (file_idx, frag_idx) in pairs {
                         let entry = &manifest2.files[*file_idx];
                         let fragment = &entry.fragments[*frag_idx];
                         let off = fragment.frame_offset as usize;
@@ -1216,15 +1216,15 @@ pub fn extract_archive_from_chunk_receiver(
                         );
                     }
 
-                    let pairs = fragments_by_frame2
-                        .get(&(idx as u32))
-                        .cloned()
-                        .unwrap_or_default();
+                    // R2: borrow the frame's fragment-pair list from the shared
+                    // map instead of cloning it per frame (the loop only reads it).
+                    let empty = Vec::new();
+                    let pairs = fragments_by_frame2.get(&(idx as u32)).unwrap_or(&empty);
                     let mut written = 0usize;
                     let mut stats = Vec::new();
                     let mut pending_writes: Vec<OwnedFileWrite> =
                         Vec::with_capacity(PACK_WRITE_BATCH_FILES);
-                    for (file_idx, frag_idx) in &pairs {
+                    for (file_idx, frag_idx) in pairs {
                         let entry = &manifest2.files[*file_idx];
                         let fragment = &entry.fragments[*frag_idx];
                         let off = fragment.frame_offset as usize;
@@ -1576,6 +1576,11 @@ pub fn materialize_worktree_from_pack(repo_root: &Path, commit: &str) -> Result<
     let written = AtomicUsize::new(0);
     let raw_bytes = AtomicUsize::new(0);
     let stat_cache: Mutex<Vec<crate::git::MaterializedPathStat>> = Mutex::new(Vec::new());
+    // R3: the per-file "has any thread failed?" poll runs once per file on the
+    // hot path; make it a cheap atomic load instead of taking a Mutex. The Mutex
+    // is kept only to hold the actual error value, written once on the rare
+    // failure path (guarded by `failed`).
+    let failed = AtomicBool::new(false);
     let error: Mutex<Option<anyhow::Error>> = Mutex::new(None);
     let writer = WorktreeWriter::new().context("create worktree writer")?;
     let sync_repo_ref = &sync_repo;
@@ -1587,6 +1592,7 @@ pub fn materialize_worktree_from_pack(repo_root: &Path, commit: &str) -> Result<
             let written = &written;
             let raw_bytes = &raw_bytes;
             let stat_cache = &stat_cache;
+            let failed = &failed;
             let error = &error;
             let items = &items;
             scope.spawn(move || {
@@ -1600,7 +1606,7 @@ pub fn materialize_worktree_from_pack(repo_root: &Path, commit: &str) -> Result<
 
                 loop {
                     // Stop pulling new work as soon as any thread has failed.
-                    if error.lock().unwrap().is_some() {
+                    if failed.load(Ordering::Relaxed) {
                         let _ = writer.flush_deferred_writes();
                         return;
                     }
@@ -1617,6 +1623,7 @@ pub fn materialize_worktree_from_pack(repo_root: &Path, commit: &str) -> Result<
                                 }
                                 Err(e) => {
                                     *error.lock().unwrap() = Some(e);
+                                    failed.store(true, Ordering::Relaxed);
                                 }
                             }
                         }
@@ -1627,6 +1634,7 @@ pub fn materialize_worktree_from_pack(repo_root: &Path, commit: &str) -> Result<
                             }
                             Err(e) => {
                                 *error.lock().unwrap() = Some(e);
+                                failed.store(true, Ordering::Relaxed);
                             }
                         }
                         return;
@@ -1671,6 +1679,7 @@ pub fn materialize_worktree_from_pack(repo_root: &Path, commit: &str) -> Result<
                                     }
                                     Err(e) => {
                                         *error.lock().unwrap() = Some(e);
+                                        failed.store(true, Ordering::Relaxed);
                                         return;
                                     }
                                 }
@@ -1678,6 +1687,7 @@ pub fn materialize_worktree_from_pack(repo_root: &Path, commit: &str) -> Result<
                         }
                         Err(e) => {
                             *error.lock().unwrap() = Some(e);
+                            failed.store(true, Ordering::Relaxed);
                             return;
                         }
                     }
