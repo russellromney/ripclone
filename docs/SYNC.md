@@ -233,14 +233,33 @@ Three fixes to make it safe and on:
 
 ## Phasing
 
-1. **`ls-remote` no-op + commit-keyed index.** Biggest single latency win;
-   self-contained; also powers the debounce dirty-check.
-2. **Disable mirror auto-gc + shrink the build lock** (fetch + commit-graph +
-   bitmap under the exclusive lock, builds lock-free). De-risks everything else —
-   the auto-gc fix is mandatory and tiny.
-3. **Monotonic publish guard** (in-memory generation check before `save_branch`).
-4. **Bounded build pool + separate fetch semaphore + debounce (model B).**
-5. **Harden `remote_gc`** (enable, unreachable-since grace, tie to URL TTL).
+1. ✅ **`ls-remote` no-op + commit-keyed reuse.** Biggest single latency win;
+   self-contained; also powers the debounce dirty-check. *(shipped: ls-remote
+   pre-check in `do_sync`; `RefStore::load_build` + `MetaDb::get_by_commit`.)*
+2. ◑ **Disable mirror auto-gc** ✅ *(shipped: `git::disable_auto_gc`, persisted
+   into the mirror)* **+ shrink the build lock** ⏳ *(deferred — see below).*
+3. ⏳ **Monotonic publish guard** (in-memory generation check before
+   `save_branch`).
+4. ◑ **Bounded build pool + separate fetch semaphore** ✅ *(shipped:
+   `RIPCLONE_BUILD_CONCURRENCY` pool + `RIPCLONE_FETCH_CONCURRENCY` cap)*
+   **+ debounce (model B)** ⏳.
+5. ⏳ **Harden `remote_gc`** (enable, unreachable-since grace, tie to URL TTL).
+
+### Deferred: the lock-shrink
+
+Running read-only builds lock-free during a fetch is **not yet done**. The
+blocker is the two-phase path: it writes the reachability bitmap in its
+*background* phase (`write_bitmap`, `server.rs` ~4409), not up front, so the
+"exclusive prep = fetch + commit-graph + bitmap" boundary the design assumes
+isn't clean — a background bitmap write would race concurrent lock-free reads.
+The bounded pool already delivers the main throughput win (different repos build
+in parallel; same-repo builds still serialize safely on the per-repo lock), so
+the lock-shrink — which only adds *same-repo cross-branch* overlap — is its own
+focused change: move the bitmap into the exclusive prep (accepting a small hit to
+two-phase "time to clonable"), then drop the lock before the heavy build. The
+auto-gc fix is already in place as its prerequisite. Spike first (per the crux
+above): fetch into a mirror while a `rev-list | pack-objects` walk runs over it,
+under load, and check for corruption.
 
 ## Where it runs
 
