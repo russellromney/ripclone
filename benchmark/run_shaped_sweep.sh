@@ -1,12 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Shaped bandwidth sweep for ripclone vs native git.
+# ripclone vs native git clone sweep.
+#
+# By default the network link is shaped to the requested bandwidth using
+# nftables (run on a Linux host with CAP_NET_ADMIN such as the Fly client).
+# Set SHAPED=0 to run without traffic shaping for warm-cache comparisons.
 #
 # Usage (typically run on the Fly ripclone-client-dev machine):
 #   RIPCLONE_URL=https://ripclone-server-dev.fly.dev \
 #   RIPCLONE_TOKEN=... \
 #   ./benchmark/run_shaped_sweep.sh [repos] [rates] [runs]
+#
+#   SHAPED=0 RIPCLONE_URL=https://ripclone-server-dev.fly.dev \
+#   RIPCLONE_TOKEN=... \
+#   ./benchmark/run_shaped_sweep.sh "oven-sh/bun pandas-dev/pandas" "1000" 3
 #
 # Defaults:
 #   repos = "oven-sh/bun torvalds/linux"
@@ -26,7 +34,7 @@ BENCH="$SCRIPT_DIR/fly_shaped_benchmark"
 LOG="/data/shaped_sweep.log"
 mkdir -p "$(dirname "$LOG")"
 
-echo "===== shaped sweep started at $(date -Iseconds) =====" | tee -a "$LOG"
+echo "===== sweep started at $(date -Iseconds) (SHAPED=${SHAPED:-1}) =====" | tee -a "$LOG"
 
 for repo in $REPOS; do
   first_rate=1
@@ -39,7 +47,7 @@ for repo in $REPOS; do
     else
       sync_env="SKIP_SYNC=1"
     fi
-    if env $sync_env "$BENCH" "$repo" "$rate" "$RUNS" 2>&1 | tee -a "$LOG"; then
+    if env $sync_env SHAPED="${SHAPED:-1}" "$BENCH" "$repo" "$rate" "$RUNS" 2>&1 | tee -a "$LOG"; then
       :
     else
       echo "ERROR: benchmark failed for $repo @ ${rate}Mbps" | tee -a "$LOG"
@@ -48,5 +56,5 @@ for repo in $REPOS; do
 done
 
 echo "" | tee -a "$LOG"
-echo "===== shaped sweep finished at $(date -Iseconds) =====" | tee -a "$LOG"
+echo "===== sweep finished at $(date -Iseconds) =====" | tee -a "$LOG"
 echo "Per-run logs: /data/shaped_logs/"

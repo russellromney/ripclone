@@ -63,6 +63,8 @@ At 1000 Mbps, measured speedups over native `git clone` are:
 
 The full-clone win is smaller on Linux than on bun because the full pack is so large that the transfer dominates; depth-1 and `files` mode avoid most of that transfer, so they stay well ahead even on huge repos.
 
+*Mode labels:* `ripclone full` and `ripclone depth=1` are the `editable` CLI mode with `--depth 0` and `--depth 1`, respectively. `ripclone files` is the `files` CLI mode (HEAD worktree only).
+
 #### Shaped bandwidth benchmark
 
 We ran `ripclone` against native `git clone` on a Fly.io `performance-8x` client talking to a `ripclone-server` over shaped links from 50 Mbps to 1000 Mbps. Each cell is a single run (n=1). `oven-sh/bun` and `pandas-dev/pandas` were measured across all five bandwidths. `torvalds/linux` was only measured at 1000 Mbps because a full `git clone` of Linux at lower bandwidths takes ~8 min per run.

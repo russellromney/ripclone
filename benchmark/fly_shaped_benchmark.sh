@@ -197,14 +197,16 @@ git_full() { git clone "https://github.com/$REPO.git" "$1"; }
 # Main
 # ---------------------------------------------------------------------------
 
-echo "=== repo=$REPO commit=${REF:-latest} rate=${RATE_MBPS}Mbps runs=$RUNS host=$(hostname) cpus=$(nproc 2>/dev/null || echo ?) ==="
+echo "=== repo=$REPO commit=${REF:-latest} rate=${RATE_MBPS}Mbps runs=$RUNS shaped=${SHAPED:-1} host=$(hostname) cpus=$(nproc 2>/dev/null || echo ?) ==="
 
 wait_for_server "$SERVER_URL"
 keepalive_server "$SERVER_URL" &
 KEEPALIVE_PID=$!
 
 cleanup() {
-  shape_reset
+  if [ "${SHAPED:-1}" = "1" ]; then
+    shape_reset
+  fi
   kill "$KEEPALIVE_PID" 2>/dev/null || true
   wait "$KEEPALIVE_PID" 2>/dev/null || true
 }
@@ -214,7 +216,11 @@ trap cleanup EXIT
 REF="${REF:-$(get_default_branch)}"
 
 warm_server
-apply_shape "$RATE_MBPS"
+if [ "${SHAPED:-1}" = "1" ]; then
+  apply_shape "$RATE_MBPS"
+else
+  echo "  running unshaped"
+fi
 
 echo "--- rate=${RATE_MBPS}Mbps ---"
 if [ "${SKIP_RIPCLONE:-0}" != "1" ]; then
