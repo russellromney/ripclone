@@ -1072,6 +1072,34 @@ pub fn object_type<P: AsRef<Path>>(repo: P, sha: &str) -> Result<String> {
     crate::gix_util::object_type(repo, sha)
 }
 
+/// Disable git's automatic gc/maintenance on a bare mirror, persisted into the
+/// mirror's own config so it covers every later command (not just one fetch).
+///
+/// This is load-bearing for concurrent sync: read-only builds (`rev-list` /
+/// `pack-objects`) run lock-free over the mirror's packs while a `git fetch`
+/// appends to it. A fetch can trip git's auto-gc, which repacks/prunes packs out
+/// from under a live reader — a real corruption / object-not-found mode. We run
+/// gc ourselves, explicitly, under the exclusive lock; the automatic one must be
+/// off. Idempotent and cheap (local config writes). See docs/SYNC.md.
+pub fn disable_auto_gc(mirror_dir: &Path) -> Result<()> {
+    for (key, value) in [
+        ("gc.auto", "0"),
+        ("gc.autoPackLimit", "0"),
+        ("maintenance.auto", "false"),
+    ] {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(mirror_dir.as_os_str())
+            .args(["config", key, value])
+            .status()
+            .with_context(|| format!("git config {key}"))?;
+        if !status.success() {
+            bail!("failed to disable auto-gc ({key}) on mirror");
+        }
+    }
+    Ok(())
+}
+
 /// Sync a bare mirror of a repo. Creates if missing, fetches if exists.
 ///
 /// Phase 1: credentials are passed via git's `http.extraHeader` config, never
@@ -1137,6 +1165,9 @@ pub fn sync_bare_mirror<P: AsRef<Path>>(
         // `shallow` marker file; `--unshallow` completes it (and still fetches all
         // refs) once, after which plain fetches keep it complete.
         let is_shallow = mirror_dir.as_ref().join("shallow").exists();
+        // Persist gc-off before fetching, so legacy mirrors (created before this
+        // was set) are covered and the fetch we are about to run cannot auto-gc.
+        disable_auto_gc(mirror_dir.as_ref())?;
         let mut args: Vec<&str> = vec!["fetch"];
         if is_shallow {
             args.push("--unshallow");
@@ -1160,6 +1191,14 @@ pub fn sync_bare_mirror<P: AsRef<Path>>(
             .args(&git_args)
             .args([
                 "clone",
+                // `clone --config` persists into the new repo *before* its initial
+                // fetch, so even the clone's own fetch cannot auto-gc.
+                "--config",
+                "gc.auto=0",
+                "--config",
+                "gc.autoPackLimit=0",
+                "--config",
+                "maintenance.auto=false",
                 "--mirror",
                 &url,
                 &mirror_dir.as_ref().to_string_lossy(),
@@ -1169,6 +1208,9 @@ pub fn sync_bare_mirror<P: AsRef<Path>>(
         if !status.success() {
             bail!("clone mirror failed");
         }
+        // Belt and suspenders: confirm the keys are persisted regardless of how a
+        // given git version applied `clone --config`.
+        disable_auto_gc(mirror_dir.as_ref())?;
     }
     Ok(())
 }
@@ -1347,6 +1389,41 @@ pub fn materialize_file<P: AsRef<Path>, Q: AsRef<Path>>(
 mod tests {
     use super::*;
     use rayon::scope;
+
+    /// Auto-gc must be persisted off on the mirror, or a fetch could repack
+    /// packs out from under a concurrent lock-free read. See docs/SYNC.md.
+    #[test]
+    fn disable_auto_gc_persists_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q", "--bare"])
+                .arg(repo)
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        disable_auto_gc(repo).unwrap();
+
+        let read = |key: &str| -> String {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(["config", "--get", key])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        assert_eq!(read("gc.auto"), "0");
+        assert_eq!(read("gc.autoPackLimit"), "0");
+        assert_eq!(read("maintenance.auto"), "false");
+
+        // Idempotent: a second call on an already-configured mirror is fine.
+        disable_auto_gc(repo).unwrap();
+        assert_eq!(read("gc.auto"), "0");
+    }
 
     #[test]
     #[ignore]
