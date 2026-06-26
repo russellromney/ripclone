@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::env;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -640,13 +640,60 @@ fn check_auth_header(header: &str, expected: &str) -> bool {
     false
 }
 
+/// Trust a forwarded-for header for the rate-limit key. Off by default: the
+/// header is client-spoofable, so only honor it when the operator has put a
+/// reverse proxy directly in front (`RIPCLONE_TRUST_FORWARDED_FOR=1`). Read once.
+fn trust_forwarded_for() -> bool {
+    static TRUST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *TRUST.get_or_init(|| {
+        std::env::var("RIPCLONE_TRUST_FORWARDED_FOR")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
+/// Rate-limit bucket key for a request. Keying on the raw socket IP is useless
+/// behind a reverse proxy (every request shares the proxy's IP → one global
+/// bucket) and bypassable over IPv6 (a /64 gives 2^64 addresses, each a fresh
+/// bucket). So: derive the client IP from the trusted forwarded-for header when
+/// enabled, and collapse IPv6 to its /64 network so an attacker can't rotate
+/// addresses within their allocation (AU2).
+fn rate_limit_key(headers: &HeaderMap, socket: SocketAddr, trust_forwarded: bool) -> String {
+    let ip = if trust_forwarded {
+        headers
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            // Rightmost entry = the address our immediately-trusted proxy saw;
+            // entries a client prepends are ignored. Assumes a single trusted
+            // proxy directly in front.
+            .and_then(|v| v.rsplit(',').next())
+            .map(str::trim)
+            .and_then(|s| s.parse::<IpAddr>().ok())
+            .unwrap_or_else(|| socket.ip())
+    } else {
+        socket.ip()
+    };
+    normalize_ip_for_rate_limit(ip)
+}
+
+fn normalize_ip_for_rate_limit(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(v6) => {
+            // Collapse to the /64 network (the first four 16-bit groups).
+            let s = v6.segments();
+            format!("{:x}:{:x}:{:x}:{:x}::/64", s[0], s[1], s[2], s[3])
+        }
+    }
+}
+
 async fn rate_limit_middleware(
     State(state): State<ServerState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     request: axum::http::Request<axum::body::Body>,
     next: Next,
 ) -> Response {
-    let key = addr.ip().to_string();
+    let key = rate_limit_key(request.headers(), addr, trust_forwarded_for());
     if !state.rate_limiter.check(&key) {
         return (
             StatusCode::TOO_MANY_REQUESTS,
@@ -5177,6 +5224,37 @@ mod tests {
         }
         let len = limiter.buckets.lock().unwrap().len();
         assert!(len <= 10_000, "rate limiter map grew unbounded: {}", len);
+    }
+
+    #[test]
+    fn rate_limit_key_collapses_ipv6_and_honors_trusted_forwarded() {
+        use std::net::Ipv6Addr;
+        let socket = SocketAddr::from(([203, 0, 113, 7], 51000));
+
+        // Untrusted: always the socket IP, ignore any forwarded-for header.
+        let mut spoof = HeaderMap::new();
+        spoof.insert("x-forwarded-for", "1.2.3.4".parse().unwrap());
+        assert_eq!(rate_limit_key(&spoof, socket, false), "203.0.113.7");
+
+        // Trusted: take the rightmost forwarded-for entry (what our proxy saw),
+        // ignoring entries a client prepends.
+        let mut xff = HeaderMap::new();
+        xff.insert("x-forwarded-for", "9.9.9.9, 198.51.100.23".parse().unwrap());
+        assert_eq!(rate_limit_key(&xff, socket, true), "198.51.100.23");
+
+        // IPv6 collapses to its /64 so an attacker can't rotate within a /64.
+        let a = SocketAddr::new(
+            std::net::IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0xab, 0xcd, 1, 2, 3, 4)),
+            0,
+        );
+        let b = SocketAddr::new(
+            std::net::IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0xab, 0xcd, 9, 9, 9, 9)),
+            0,
+        );
+        let ka = rate_limit_key(&HeaderMap::new(), a, false);
+        let kb = rate_limit_key(&HeaderMap::new(), b, false);
+        assert_eq!(ka, kb, "same /64 must share a bucket");
+        assert_eq!(ka, "2001:db8:ab:cd::/64");
     }
 
     #[test]

@@ -23,6 +23,7 @@
 
 use anyhow::{Context, Result};
 use std::collections::HashMap;
+use std::net::IpAddr;
 
 pub use crate::provider_config::load_registry_with_token_store;
 
@@ -135,39 +136,112 @@ impl ProviderInstance {
     /// Returns `(header_name, header_value)` as strings so it can be passed to
     /// git's `http.extraHeader` config without an extra dependency.
     pub fn auth_header(&self, token: &str) -> Option<(String, String)> {
-        if let Some(template) = &self.auth_template {
-            let value = template.replace("{token}", token);
-            return Some(("Authorization".to_string(), value));
+        let (name, value) = match &self.auth_template {
+            Some(template) => (
+                "Authorization".to_string(),
+                template.replace("{token}", token),
+            ),
+            None => match self.kind {
+                ProviderKind::GitHub => {
+                    let credentials = format!("x-access-token:{}", token);
+                    let encoded = base64::Engine::encode(
+                        &base64::engine::general_purpose::STANDARD,
+                        credentials.as_bytes(),
+                    );
+                    ("Authorization".to_string(), format!("Basic {}", encoded))
+                }
+                ProviderKind::GitLab => {
+                    let credentials = format!("oauth2:{}", token);
+                    let encoded = base64::Engine::encode(
+                        &base64::engine::general_purpose::STANDARD,
+                        credentials.as_bytes(),
+                    );
+                    ("Authorization".to_string(), format!("Basic {}", encoded))
+                }
+                ProviderKind::Bitbucket => {
+                    ("Authorization".to_string(), format!("Bearer {}", token))
+                }
+                ProviderKind::Gitea => ("Authorization".to_string(), format!("token {}", token)),
+                ProviderKind::Generic => return None,
+            },
+        };
+        // AU5: never emit a header value carrying CR/LF (or NUL) — a token or
+        // `auth_template` containing those would smuggle extra headers into the
+        // upstream git HTTP request. Base64-encoded preset values can't contain
+        // these, so this only fires on a malicious/malformed token or template.
+        if value.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0) {
+            return None;
         }
-        match self.kind {
-            ProviderKind::GitHub => {
-                let credentials = format!("x-access-token:{}", token);
-                let encoded = base64::Engine::encode(
-                    &base64::engine::general_purpose::STANDARD,
-                    credentials.as_bytes(),
-                );
-                Some(("Authorization".to_string(), format!("Basic {}", encoded)))
-            }
-            ProviderKind::GitLab => {
-                let credentials = format!("oauth2:{}", token);
-                let encoded = base64::Engine::encode(
-                    &base64::engine::general_purpose::STANDARD,
-                    credentials.as_bytes(),
-                );
-                Some(("Authorization".to_string(), format!("Basic {}", encoded)))
-            }
-            ProviderKind::Bitbucket => {
-                Some(("Authorization".to_string(), format!("Bearer {}", token)))
-            }
-            ProviderKind::Gitea => Some(("Authorization".to_string(), format!("token {}", token))),
-            ProviderKind::Generic => None,
-        }
+        Some((name, value))
     }
 
     /// True for the built-in GitHub default instance.
     pub fn is_github_default(&self) -> bool {
         self.id.as_str() == DEFAULT_PROVIDER_ID
     }
+}
+
+/// Defense-in-depth SSRF guard for a configured provider host (AU4). The server
+/// fetches the provider host on sync, so reject the literal-internal targets
+/// that are *never* a legitimate git host: the link-local range (which includes
+/// the cloud metadata endpoint `169.254.169.254`) and the unspecified address
+/// (`0.0.0.0` / `::`). Also reject malformed hosts (empty, userinfo, control
+/// characters).
+///
+/// Loopback (`127.0.0.1`, `localhost`, `::1`) and private LAN ranges
+/// (`10/172.16/192.168`) are intentionally allowed: same-box and on-prem LAN
+/// self-host are legitimate, and providers are operator-configured (not
+/// attacker-supplied), so the residual risk is an operator misconfiguring their
+/// own deployment. This is a guard against the classic metadata-SSRF mistake,
+/// not full DNS-rebinding protection.
+fn validate_provider_host(id: &str, host: &str) -> Result<()> {
+    let h = host.trim();
+    if h.is_empty() {
+        anyhow::bail!("provider '{id}' has an empty host");
+    }
+    if h.bytes().any(|b| b.is_ascii_control() || b == b' ') {
+        anyhow::bail!("provider '{id}' host contains control or space characters");
+    }
+    // Allow an optional scheme; everything else must be a bare authority.
+    let after_scheme = h
+        .strip_prefix("https://")
+        .or_else(|| h.strip_prefix("http://"))
+        .unwrap_or(h);
+    let authority = after_scheme.split('/').next().unwrap_or(after_scheme);
+    if authority.contains('@') {
+        anyhow::bail!("provider '{id}' host must not contain userinfo ('@'): {host}");
+    }
+    // Best-effort hostname: drop a `[v6]` bracket or a trailing numeric `:port`.
+    let host_part = if let Some(rest) = authority.strip_prefix('[') {
+        rest.split(']').next().unwrap_or(rest)
+    } else {
+        match authority.rsplit_once(':') {
+            Some((head, tail)) if tail.chars().all(|c| c.is_ascii_digit()) && !head.is_empty() => {
+                head
+            }
+            _ => authority,
+        }
+    };
+    // Check both the trimmed host part and the raw authority (covers a bare,
+    // unbracketed IPv6 literal that the port-split above leaves intact).
+    for candidate in [host_part, authority] {
+        if let Ok(ip) = candidate.parse::<IpAddr>() {
+            if ip.is_unspecified() {
+                anyhow::bail!("provider '{id}' host '{host}' is the unspecified address");
+            }
+            let link_local = match ip {
+                // 169.254.0.0/16 — includes the cloud metadata endpoint.
+                IpAddr::V4(v4) => v4.is_link_local(),
+                IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) == 0xfe80,
+            };
+            if link_local {
+                anyhow::bail!(
+                    "provider '{id}' host '{host}' is a link-local address (SSRF / metadata risk)"
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Raw configuration for one provider instance, as loaded from config or env.
@@ -263,6 +337,8 @@ impl ProviderRegistry {
                 }
             },
         };
+
+        validate_provider_host(&id, &host)?;
 
         if kind == ProviderKind::Generic && cfg.auth_template.is_none() {
             anyhow::bail!(
@@ -485,6 +561,69 @@ pub fn parse_storage_key(key: &str, registry: &ProviderRegistry) -> Option<RepoI
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn provider(kind: ProviderKind, host: &str, tmpl: Option<&str>) -> ProviderInstance {
+        ProviderInstance {
+            id: ProviderInstanceId::new("test"),
+            kind,
+            host: host.to_string(),
+            auth_template: tmpl.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn auth_header_rejects_crlf_injection() {
+        // A token with CR/LF must not be emitted as a header value (AU5).
+        let gh = provider(ProviderKind::GitHub, "github.com", None);
+        // Base64 of the preset Basic value can never contain CR/LF, so a CRLF
+        // token is neutralized there regardless — but a generic template feeds
+        // the token straight in, which is the real injection vector:
+        let generic = provider(ProviderKind::Gitea, "gitea.example.com", None);
+        assert!(generic.auth_header("good-token").is_some());
+        assert!(
+            generic.auth_header("evil\r\nX-Injected: 1").is_none(),
+            "CR/LF token must be rejected"
+        );
+        assert!(generic.auth_header("evil\nX: 1").is_none());
+        // A template with embedded CR/LF is likewise refused.
+        let tmpl = provider(ProviderKind::Generic, "h", Some("token {token}\r\nEvil: 1"));
+        assert!(tmpl.auth_header("t").is_none());
+        // Sanity: the normal GitHub path still works.
+        assert!(gh.auth_header("ghs_token").is_some());
+    }
+
+    #[test]
+    fn validate_provider_host_blocks_internal_targets() {
+        // Legit hosts pass — incl. on-prem LAN, loopback/same-box self-host and
+        // local test origins, and a scheme prefix.
+        for ok in [
+            "github.com",
+            "gitlab.com",
+            "https://gitea.example.com",
+            "git.internal.example.com",
+            "192.168.1.10",
+            "10.0.0.5:3000",
+            "localhost",
+            "http://127.0.0.1:8080",
+            "[::1]:443",
+        ] {
+            assert!(validate_provider_host("p", ok).is_ok(), "should allow {ok}");
+        }
+        // The never-legitimate internal targets are rejected.
+        for bad in [
+            "169.254.169.254",       // cloud metadata endpoint
+            "https://169.254.0.1",   // link-local
+            "0.0.0.0",               // unspecified
+            "https://user@evil.com", // userinfo
+            "host with space",
+            "",
+        ] {
+            assert!(
+                validate_provider_host("p", bad).is_err(),
+                "should reject {bad}"
+            );
+        }
+    }
 
     #[test]
     fn github_default_storage_key_is_legacy_owner_repo() {
