@@ -247,6 +247,37 @@ mod tests {
         // A newer different-commit sync does overwrite.
         store.save(&rid, &ref_at("c3", Some(200))).await.unwrap();
         assert_eq!(store.load(&rid).await.unwrap().unwrap().commit, "c3");
+
+        // Commit-keyed reuse (get_by_commit): a completed full build is found by
+        // commit from any branch; an incomplete row and an unknown commit are not.
+        // Runs for every engine `exercise` covers.
+        store
+            .save_branch(&rid, "release", &complete_build("cf"))
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .load_build(&rid, "cf")
+                .await
+                .unwrap()
+                .expect("completed build reusable by commit")
+                .full_clonepack
+                .commit,
+            "cf"
+        );
+        assert!(
+            store
+                .load_build(&rid, "no-such-commit")
+                .await
+                .unwrap()
+                .is_none(),
+            "unknown commit yields None"
+        );
+        // "dev" was saved at c2 with an empty full_clonepack — not a reusable build.
+        assert!(
+            store.load_build(&rid, "c2").await.unwrap().is_none(),
+            "incomplete (depth=1-only) build must not be reused"
+        );
     }
 
     #[tokio::test]

@@ -3265,8 +3265,8 @@ async fn settle_storage(
 
 /// Reuse an existing build for `commit` instead of building, if one exists.
 /// First the branch's own completed full build (the common case), then any other
-/// branch already built at this exact commit (commit-keyed reuse, backed by the
-/// metadata store's `commit_id` index). On a cross-branch hit, publish the reused
+/// branch already built at this exact commit (commit-keyed reuse, via the
+/// metadata store's `commit_id` column). On a cross-branch hit, publish the reused
 /// `RefInfo` under `branch` so the next sync/resolve of this branch is a
 /// branch-scoped no-op. The artifacts are commit-specific and branch-independent,
 /// so re-pointing the branch is sound. Returns the reusable build, or None.
@@ -3282,7 +3282,19 @@ async fn reuse_existing_build(
     {
         return Some(prev);
     }
-    if let Ok(Some(built)) = ref_store.load_build(repo_id, commit).await {
+    if let Ok(Some(mut built)) = ref_store.load_build(repo_id, commit).await {
+        // Re-point the branch at this build. Reuse only fires when `commit` is the
+        // current tip (the ls-remote tip, or the freshly-resolved build commit), so
+        // stamp synced_at = now. The reused RefInfo carries the *other* branch's
+        // older build time; without this, save_branch's "don't regress to an older
+        // sync" guard would silently drop the re-point — e.g. after a force-push
+        // back to an older commit, leaving the persisted (and cross-process)
+        // pointer stuck at the prior, no-longer-tip commit. "This branch is at this
+        // commit, confirmed now."
+        built.synced_at = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_secs());
         let _ = ref_store.save_branch(repo_id, branch, &built).await;
         return Some(built);
     }
@@ -3333,16 +3345,27 @@ async fn do_sync(
         let repo_id_ls = repo_id.clone();
         let branch_ls = branch.to_string();
         let credential_ls = credential.cloned();
-        let tip = tokio::task::spawn_blocking(move || {
-            git::ls_remote_commit(
-                &provider_ls,
-                &repo_id_ls,
-                &branch_ls,
-                credential_ls.as_ref(),
-            )
-        })
-        .await
-        .unwrap_or(Ok(None));
+        // ls-remote is an upstream round-trip, so it lives under the same fetch cap
+        // as a real fetch — otherwise a thundering herd of no-op syncs is exactly
+        // the uncapped upstream chatter the cap exists to prevent. Held only across
+        // the probe; the real fetch below acquires its own permit (never both at
+        // once, so the cap can't self-deadlock).
+        let tip = {
+            let _probe_permit = fetch_semaphore()
+                .acquire()
+                .await
+                .expect("fetch semaphore never closed");
+            tokio::task::spawn_blocking(move || {
+                git::ls_remote_commit(
+                    &provider_ls,
+                    &repo_id_ls,
+                    &branch_ls,
+                    credential_ls.as_ref(),
+                )
+            })
+            .await
+            .unwrap_or(Ok(None))
+        };
         if let Ok(Some(tip)) = tip
             && let Some(prev) = reuse_existing_build(ref_store, repo_id, branch, &tip).await
         {
@@ -3409,9 +3432,11 @@ async fn do_sync(
     // poke-to-check sync of an unchanged repo returns near-instantly. Reuse is by
     // this branch first, then any branch built at this commit (commit-keyed).
     // Keying on `full_clonepack.commit == commit` (not `build_status`) is robust:
-    // it is set only when phase 2 finishes for this commit, so it correctly
-    // excludes the Option-A carried-prior case, in-flight/failed phase 2, and the
-    // async worker's transient "building" status.
+    // it is set only once the full clonepack is published for this commit, so it
+    // excludes the Option-A carried-prior case, an unpublished/failed phase 2, and
+    // the async worker's transient "building" status. (It does *not* require the
+    // archive sub-phase to be done — a files-mode client re-resolves until the
+    // archive is ready, so reusing an archive-pending build is safe.)
     if let Some(prev) = reuse_existing_build(ref_store, repo_id, branch, &commit).await {
         info!(
             "sync no-op: {} already current at {} (reusing prior clonepack)",
@@ -5483,6 +5508,77 @@ mod tests {
                 "{path} must not require auth"
             );
         }
+    }
+
+    /// Commit-keyed reuse re-points the requested branch — and, critically, does
+    /// so even when that branch currently sits at a newer-synced commit (the
+    /// force-push-to-an-older-commit case). Without stamping `synced_at = now` in
+    /// `reuse_existing_build`, `save_branch`'s "don't regress to an older sync"
+    /// guard silently drops the re-point and the pointer is stranded.
+    #[tokio::test]
+    async fn reuse_existing_build_repoints_branch_past_ordering_guard() {
+        use crate::meta::{SqlRefStore, SqliteMeta};
+
+        fn complete(commit: &str, synced_at: u64) -> RefInfo {
+            RefInfo {
+                commit: commit.to_string(),
+                synced_at: Some(synced_at),
+                full_clonepack: crate::ClonepackArtifacts {
+                    commit: commit.to_string(),
+                    manifest: "m".to_string(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("meta.db").to_string_lossy().to_string();
+        let store: Arc<dyn RefStore> = Arc::new(
+            SqlRefStore::new(Box::new(SqliteMeta::connect(&path).await.unwrap()))
+                .await
+                .unwrap(),
+        );
+        let rid = RepoId::github("o/r");
+
+        // Branch foo built at X (older sync time).
+        store
+            .save_branch(&rid, "foo", &complete("X", 1_000))
+            .await
+            .unwrap();
+
+        // A fresh branch bar at X reuses foo's build and is re-pointed at it.
+        let reused = reuse_existing_build(&store, &rid, "bar", "X").await;
+        assert_eq!(reused.expect("reuse").commit, "X");
+        assert_eq!(
+            store
+                .load_branch(&rid, "bar")
+                .await
+                .unwrap()
+                .unwrap()
+                .full_clonepack
+                .commit,
+            "X",
+            "cross-branch reuse must publish under the requested branch"
+        );
+
+        // Force-push-to-older: main sits at Y with a NEWER sync time than X's build.
+        store
+            .save_branch(&rid, "main", &complete("Y", 5_000))
+            .await
+            .unwrap();
+        let reused = reuse_existing_build(&store, &rid, "main", "X").await;
+        assert_eq!(reused.expect("reuse").commit, "X");
+        assert_eq!(
+            store
+                .load_branch(&rid, "main")
+                .await
+                .unwrap()
+                .unwrap()
+                .commit,
+            "X",
+            "reuse must advance the pointer to the current tip despite a newer prior synced_at"
+        );
     }
 
     #[tokio::test]

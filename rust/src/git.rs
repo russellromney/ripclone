@@ -1148,6 +1148,13 @@ pub fn ls_remote_commit(
     if ref_name != "HEAD" {
         crate::validation::validate_git_rev(ref_name)
             .with_context(|| format!("invalid ref: {}", ref_name))?;
+        // `validate_git_rev` permits glob metacharacters that a real refname can't
+        // contain. In a `refs/heads/<name>` refspec they'd make ls-remote match a
+        // *pattern*, so the first-line parse below could return some other ref's
+        // SHA. Such a name has no build to reuse anyway — skip the probe.
+        if ref_name.contains(['*', '?', '[']) {
+            return Ok(None);
+        }
     }
     let (url, git_args) = upstream_url_and_auth(provider, repo_id, credential);
     // A branch maps to refs/heads/<name>; HEAD is queried directly. Anything else
@@ -1440,6 +1447,10 @@ mod tests {
     use super::*;
     use rayon::scope;
 
+    /// Serializes tests that mutate the process-global `RIPCLONE_ORIGIN_BASE`, so
+    /// parallel test threads don't clobber each other's origin redirection.
+    static ORIGIN_BASE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Auto-gc must be persisted off on the mirror, or a fetch could repack
     /// packs out from under a concurrent lock-free read. See docs/SYNC.md.
     #[test]
@@ -1490,11 +1501,14 @@ mod tests {
         let provider = registry.default_provider();
         let repo_id = RepoId::github("acme/widget");
 
-        // Redirect the github default origin to the local bare repo. No other lib
-        // unit test reads RIPCLONE_ORIGIN_BASE, so set+remove here is race-free.
+        // Redirect the github default origin to the local bare repo, serialized
+        // against other RIPCLONE_ORIGIN_BASE tests.
+        let _env = ORIGIN_BASE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::set_var("RIPCLONE_ORIGIN_BASE", base.path()) };
         let head = ls_remote_commit(provider, &repo_id, "HEAD", None);
         let missing = ls_remote_commit(provider, &repo_id, "no-such-branch", None);
+        // A glob in the ref name must not turn the query into a pattern match.
+        let globbed = ls_remote_commit(provider, &repo_id, "wid*", None);
         unsafe { std::env::remove_var("RIPCLONE_ORIGIN_BASE") };
 
         assert_eq!(
@@ -1503,6 +1517,45 @@ mod tests {
             "HEAD tip resolved via ls-remote"
         );
         assert_eq!(missing.unwrap(), None, "absent ref yields None, not Err");
+        assert_eq!(
+            globbed.unwrap(),
+            None,
+            "glob ref name is rejected, not matched"
+        );
+    }
+
+    /// The real clone path persists gc.auto=0 into the mirror, so a later fetch
+    /// can't trigger an auto-repack that corrupts a concurrent lock-free read.
+    #[test]
+    fn sync_bare_mirror_clone_persists_gc_off() {
+        use crate::provider::{ProviderRegistry, RepoId};
+        let base = tempfile::tempdir().unwrap();
+        let origin = base.path().join("acme").join("widget.git");
+        std::fs::create_dir_all(origin.parent().unwrap()).unwrap();
+        let src = crate::test_fixture::init_bare(&origin);
+        crate::test_fixture::commit(&src, &[("README.md", b"hi")]);
+
+        let registry = ProviderRegistry::new();
+        let provider = registry.default_provider();
+        let repo_id = RepoId::github("acme/widget");
+        let mirror = base.path().join("mirror.git");
+
+        let _env = ORIGIN_BASE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("RIPCLONE_ORIGIN_BASE", base.path()) };
+        sync_bare_mirror(&mirror, provider, &repo_id, "HEAD", None).unwrap();
+        unsafe { std::env::remove_var("RIPCLONE_ORIGIN_BASE") };
+
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&mirror)
+            .args(["config", "--get", "gc.auto"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "0",
+            "clone path must persist gc.auto=0 into the mirror"
+        );
     }
 
     #[test]
