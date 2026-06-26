@@ -784,20 +784,19 @@ fn write_entry(target_dir: &Path, entry: &FileEntry, content: &[u8]) -> Result<(
 
     match entry.mode {
         0o120000 => {
-            // Symlink: content is the target path.
-            let link_target = std::str::from_utf8(content).with_context(|| {
-                format!(
-                    "non-utf8 symlink target for {}",
-                    String::from_utf8_lossy(&entry.path)
-                )
-            })?;
-            // Always unlink first; `exists()` follows symlinks and would miss a
-            // broken symlink left over from a previous extraction.
+            // Symlink: content is the raw target path — arbitrary bytes, not
+            // necessarily valid UTF-8 (git stores the raw blob). Always unlink
+            // first; `exists()` follows symlinks and would miss a broken symlink
+            // left over from a previous extraction.
             if target.exists() || target.is_symlink() {
                 std::fs::remove_file(&target).ok();
             }
             #[cfg(unix)]
             {
+                // Build the target straight from the bytes so a non-UTF-8 target
+                // clones byte-for-byte instead of aborting the whole clone (F1).
+                use std::os::unix::ffi::OsStrExt;
+                let link_target = std::ffi::OsStr::from_bytes(content);
                 std::os::unix::fs::symlink(link_target, &target)
                     .with_context(|| format!("symlink {}", target.display()))?;
                 set_symlink_file_times(&target, INDEX_MTIME, INDEX_MTIME)
@@ -805,7 +804,8 @@ fn write_entry(target_dir: &Path, entry: &FileEntry, content: &[u8]) -> Result<(
             }
             #[cfg(not(unix))]
             {
-                std::fs::write(&target, link_target.as_bytes())
+                // No raw-byte symlinks off unix; keep the best-effort lossy fallback.
+                std::fs::write(&target, String::from_utf8_lossy(content).as_bytes())
                     .with_context(|| format!("write symlink fallback {}", target.display()))?;
                 set_file_mtime(&target, INDEX_MTIME)
                     .with_context(|| format!("set mtime {}", target.display()))?;

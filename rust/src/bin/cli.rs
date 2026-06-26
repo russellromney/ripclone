@@ -1035,6 +1035,16 @@ async fn main() -> Result<()> {
                 .or(dir)
                 .unwrap_or_else(|| PathBuf::from(target_name));
             let depth = depth.or(config.clone.depth).unwrap_or(1);
+            // Only depth 1 (shallow) and depth 0 (full history) are implemented.
+            // Reject an arbitrary depth-N request instead of silently serving
+            // full history that git would record as a complete, non-shallow clone
+            // (P1).
+            if depth > 1 {
+                anyhow::bail!(
+                    "ripclone supports --depth 1 (shallow) or --depth 0 (full history), \
+                     not --depth {depth}"
+                );
+            }
             let mode = resolve_mode(mode, config.clone.mode.as_deref());
             // Bridge the --temp flag to the env var the overlay check reads. Set
             // here, before any clone work reads it.

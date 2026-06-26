@@ -522,7 +522,7 @@ impl WorktreeWriter {
         }
 
         match entry.mode {
-            0o120000 => write_symlink_entry(&target, &entry.path, content.as_slice()),
+            0o120000 => write_symlink_entry(&target, content.as_slice()),
             0o100755 | 0o100644 => {
                 let mode = if entry.mode == 0o100755 { 0o755 } else { 0o644 };
                 self.write_regular(&target, mode, content)?;
@@ -683,7 +683,7 @@ fn prepare_owned_entries(
 
         match write.entry.mode {
             0o120000 => {
-                write_symlink_entry(&target, &write.entry.path, write.content.as_slice())?;
+                write_symlink_entry(&target, write.content.as_slice())?;
                 written += 1;
             }
             0o100755 | 0o100644 => {
@@ -746,13 +746,7 @@ fn write_regular_batch_posix(
     Ok(stats)
 }
 
-fn write_symlink_entry(target: &Path, path_bytes: &[u8], content: &[u8]) -> Result<()> {
-    let link_target = std::str::from_utf8(content).with_context(|| {
-        format!(
-            "non-utf8 symlink target for {}",
-            String::from_utf8_lossy(path_bytes)
-        )
-    })?;
+fn write_symlink_entry(target: &Path, content: &[u8]) -> Result<()> {
     // Always unlink first; `exists()` follows symlinks and would miss a broken
     // symlink left over from a previous extraction.
     if target.exists() || target.is_symlink() {
@@ -760,6 +754,12 @@ fn write_symlink_entry(target: &Path, path_bytes: &[u8], content: &[u8]) -> Resu
     }
     #[cfg(unix)]
     {
+        // A symlink target is an arbitrary byte string (git stores the raw blob);
+        // it need not be valid UTF-8. Build the target straight from the bytes via
+        // `OsStr` so a non-UTF-8 target clones byte-for-byte instead of aborting
+        // the whole clone (F1).
+        use std::os::unix::ffi::OsStrExt;
+        let link_target = std::ffi::OsStr::from_bytes(content);
         std::os::unix::fs::symlink(link_target, target)
             .with_context(|| format!("symlink {}", target.display()))?;
         set_symlink_file_times(target, INDEX_MTIME, INDEX_MTIME)
@@ -767,7 +767,8 @@ fn write_symlink_entry(target: &Path, path_bytes: &[u8], content: &[u8]) -> Resu
     }
     #[cfg(not(unix))]
     {
-        std::fs::write(target, link_target.as_bytes())
+        // No raw-byte symlinks off unix; keep the best-effort lossy fallback.
+        std::fs::write(target, String::from_utf8_lossy(content).as_bytes())
             .with_context(|| format!("write symlink fallback {}", target.display()))?;
         set_file_mtime(target, INDEX_MTIME)
             .with_context(|| format!("set mtime {}", target.display()))?;
@@ -2894,6 +2895,46 @@ mod tests {
                 std::path::Path::new("real.txt")
             );
         }
+    }
+
+    /// F1/F3: a symlink whose target is not valid UTF-8 must still clone, with
+    /// the target preserved byte-for-byte (it used to abort the whole clone via
+    /// `str::from_utf8`).
+    #[cfg(unix)]
+    #[test]
+    fn scheduler_materializes_non_utf8_symlink_target() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let scheduler = WorktreeWriteScheduler::with_config(
+            dir.path().to_path_buf(),
+            archive_opts(),
+            sched_config(2, 2, 8, 1 << 20),
+        )
+        .unwrap();
+        // Invalid UTF-8 in the target bytes (a lone 0xFF / 0xFE).
+        let raw_target = b"weird-\xff\xfe-target".to_vec();
+        let writes = vec![OwnedFileWrite {
+            entry: FileEntry {
+                path: b"link".to_vec(),
+                mode: 0o120000,
+                blob_sha1: Vec::new(),
+                fragments: Vec::new(),
+            },
+            content: raw_target.clone().into(),
+        }];
+        let written = scheduler.submit(writes).unwrap();
+        scheduler.flush().unwrap();
+        assert_eq!(written, 1);
+
+        let link = dir.path().join("link");
+        let meta = std::fs::symlink_metadata(&link).unwrap();
+        assert!(meta.file_type().is_symlink());
+        let got = std::fs::read_link(&link).unwrap();
+        assert_eq!(
+            got.as_os_str().as_bytes(),
+            &raw_target[..],
+            "non-utf8 symlink target round-trips byte-for-byte"
+        );
     }
 
     #[test]
