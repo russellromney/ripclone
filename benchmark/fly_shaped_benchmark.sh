@@ -111,12 +111,22 @@ wait_for_artifacts() {
 }
 
 warm_server() {
+  local owner name auth_hash branch
+  owner=$(echo "$REPO" | cut -d/ -f1)
+  name=$(echo "$REPO" | cut -d/ -f2)
+  auth_hash=$(printf '%s' "$RIPCLONE_TOKEN" | shasum -a 256 | awk '{print $1}')
+  branch="${BENCH_REF:-$(get_default_branch)}"
+  REF="$branch"
+
   if [ "${SKIP_SYNC:-0}" = "1" ]; then
+    echo "  using pinned ref: $REF (skipping sync)"
     return 0
   fi
-  echo "  warming server mirror for $REPO ..."
-  "$RIPCLONE" --server "$SERVER_URL" sync "$REPO" >/dev/null 2>&1
-  REF="${BENCH_REF:-$(get_default_branch)}"
+
+  echo "  warming server mirror for $REPO @ $branch ..."
+  curl -fsS -X POST \
+    -H "Authorization: Ripclone $auth_hash" \
+    "${SERVER_URL%/}/v1/repos/$owner/$name/sync?branch=$branch" >/dev/null 2>&1
   echo "  pinned ref: $REF"
   wait_for_artifacts
 }

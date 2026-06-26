@@ -27,6 +27,15 @@ This directory contains standalone benchmarks and verification scripts. They ass
   ./benchmark/run_shaped_sweep.sh "oven-sh/bun" "1000" 3
   ```
 
+  For very active repos (e.g. `pandas-dev/pandas`), pin to a stable tag so `HEAD`
+  does not move during the sweep:
+
+  ```bash
+  BENCH_REF=v2.2.2 RIPCLONE_URL=https://ripclone-server-dev.fly.dev \
+  RIPCLONE_TOKEN=... \
+  ./benchmark/run_shaped_sweep.sh "pandas-dev/pandas" "1000" 1
+  ```
+
 - **`fly_shaped_benchmark.sh`** — single-rate helper used by `run_shaped_sweep.sh`.
 - **`plot_ratios.py`** — generates the `shaped_ratios.png` graph from the sweep data.
 
@@ -50,6 +59,8 @@ Most scripts read:
 - `REPO` — target repo in `owner/name` form (default `oven-sh/bun`).
 - `RIPCLONE_TOKEN` — bearer token for the server.
 - `RIPCLONE_URL` — server URL for remote/Fly benchmarks.
+- `BENCH_REF` — tag/commit/branch to sync and benchmark (default: repo default branch).
+- `SHAPED` — set to `0` to disable traffic shaping.
 - `RIPCLONE_FETCH_CONCURRENCY` — max concurrent chunk downloads.
 - `RIPCLONE_FETCH_THREADS` / `RIPCLONE_WRITE_THREADS` — extraction parallelism.
 - `RIPCLONE_BLOB_PACK_THREADS` — threads for local pack building in full editable mode.

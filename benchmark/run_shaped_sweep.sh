@@ -16,6 +16,15 @@ set -euo pipefail
 #   RIPCLONE_TOKEN=... \
 #   ./benchmark/run_shaped_sweep.sh "oven-sh/bun pandas-dev/pandas" "1000" 3
 #
+#   BENCH_REF=v2.2.2 RIPCLONE_URL=https://ripclone-server-dev.fly.dev \
+#   RIPCLONE_TOKEN=... \
+#   ./benchmark/run_shaped_sweep.sh "pandas-dev/pandas" "1000" 1
+#
+# Environment:
+#   SHAPED     - 1 (default) to shape bandwidth, 0 for unshaped warm-cache runs.
+#   BENCH_REF  - tag/commit/branch to sync and benchmark. Use a tag for very
+#                active repos where HEAD moves during the sweep.
+#
 # Defaults:
 #   repos = "oven-sh/bun torvalds/linux"
 #   rates = "1000 500 250 100 50"   (Mbps)
@@ -47,7 +56,7 @@ for repo in $REPOS; do
     else
       sync_env="SKIP_SYNC=1"
     fi
-    if env $sync_env SHAPED="${SHAPED:-1}" "$BENCH" "$repo" "$rate" "$RUNS" 2>&1 | tee -a "$LOG"; then
+    if env $sync_env SHAPED="${SHAPED:-1}" BENCH_REF="${BENCH_REF:-}" "$BENCH" "$repo" "$rate" "$RUNS" 2>&1 | tee -a "$LOG"; then
       :
     else
       echo "ERROR: benchmark failed for $repo @ ${rate}Mbps" | tee -a "$LOG"
