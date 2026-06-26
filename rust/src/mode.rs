@@ -88,11 +88,14 @@ pub fn resolve_mode(cli: Option<CloneMode>, config: Option<&str>) -> CloneMode {
 }
 
 /// Map a requested clone depth to the clonepack variant the server should
-/// return. depth == 1 → the shallow (HEAD-only) clonepack; any other depth
-/// (including 0 = full history) → the full clonepack.
+/// return. depth == 1 → the shallow (HEAD-only) clonepack; depth == 0 (full
+/// history) → the full clonepack.
 ///
-/// Phase 1 only ships the HEAD-closure pack, so deeper depths currently
-/// materialize the same HEAD snapshot; the plumbing is in place for Phase 2.
+/// Only depths 0 and 1 are meaningful: arbitrary depth-N shallow clones are not
+/// implemented, and callers (the CLI and the git remote helper) reject `N > 1`
+/// with a clear error rather than silently serving full history that git would
+/// record as a complete, non-shallow clone (P1). This mapping still treats any
+/// other value as full as a defensive default.
 pub fn clonepack_kind_for_depth(depth: usize) -> &'static str {
     if depth == 1 { "shallow" } else { "full" }
 }
