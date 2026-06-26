@@ -236,8 +236,10 @@ Three fixes to make it safe and on:
 1. ✅ **`ls-remote` no-op + commit-keyed reuse.** Biggest single latency win;
    self-contained; also powers the debounce dirty-check. *(shipped: ls-remote
    pre-check in `do_sync`; `RefStore::load_build` + `MetaDb::get_by_commit`.)*
-2. ◑ **Disable mirror auto-gc** ✅ *(shipped: `git::disable_auto_gc`, persisted
-   into the mirror)* **+ shrink the build lock** ⏳ *(deferred — see below).*
+2. ✅ **Disable mirror auto-gc** *(shipped: `git::disable_auto_gc`, persisted into
+   the mirror)* **+ shrink the build lock** *(shipped: `do_sync` holds the
+   per-repo lock only across fetch + commit-graph [+ single-phase bitmap] and
+   drops it before the heavy read-only build — see below).*
 3. ⏳ **Monotonic publish guard** (in-memory generation check before
    `save_branch`).
 4. ◑ **Bounded build pool + separate fetch semaphore** ✅ *(shipped:
@@ -245,19 +247,23 @@ Three fixes to make it safe and on:
    **+ debounce (model B)** ⏳.
 5. ⏳ **Harden `remote_gc`** (enable, unreachable-since grace, tie to URL TTL).
 
-### Deferred: the lock-shrink
+### The lock-shrink (shipped)
 
-Running read-only builds lock-free during a fetch is **not yet done**. The
-blocker is the two-phase path: it writes the reachability bitmap in its
-*background* phase (`write_bitmap`, `server.rs` ~4409), not up front, so the
-"exclusive prep = fetch + commit-graph + bitmap" boundary the design assumes
-isn't clean — a background bitmap write would race concurrent lock-free reads.
-The bounded pool already delivers the main throughput win (different repos build
-in parallel; same-repo builds still serialize safely on the per-repo lock), so
-the lock-shrink — which only adds *same-repo cross-branch* overlap — is its own
-focused change: move the bitmap into the exclusive prep (accepting a small hit to
-two-phase "time to clonable"), then drop the lock before the heavy build. The
-auto-gc fix is already in place as its prerequisite.
+`do_sync` now acquires the per-repo lock itself and holds it only across the
+mirror-mutating prep — fetch + commit-graph, plus the bitmap on the single-phase
+path — then drops it before the heavy read-only build. The two-phase path drops
+the lock before `build_and_publish_two_phase` (its depth=1 build is read-only and
+its phase-2 — including the bitmap — already ran detached, outside the lock,
+before this change). The ls-remote pre-check stays lock-free (read-only). Callers
+(`process_build_job`, the two `/sync` paths) now pass the lock handle instead of
+wrapping the whole build.
+
+Result: different repos build fully concurrently, and a same-repo build's heavy
+phase no longer pins a build-pool permit waiting on the mirror lock — which also
+retires the "same-repo lock-waiters occupy permits" limitation. Correctness rests
+on auto-gc being off (so mutations are appends + atomic-replace accelerators) and
+on the per-repo lock still serializing the prep trio against itself (two
+concurrent `commit-graph write`s would collide on git's `.lock`).
 
 **Spike result (validated).** `git::tests::spike_concurrent_prep_vs_reads`
 (`#[ignore]`) runs one writer thread doing serialized fetch + commit-graph +

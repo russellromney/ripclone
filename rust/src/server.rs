@@ -2204,8 +2204,9 @@ async fn sync_repo_inner(
         }
     }
 
+    // do_sync acquires this per-repo lock itself, holding it only across the
+    // mirror-mutating prep and releasing it before the heavy read-only build.
     let lock = repo_lock(&state.sync_locks, &repo_id).await;
-    let _guard = lock.lock().await;
     match do_sync(
         &state.cas,
         &mirror_dir,
@@ -2218,6 +2219,7 @@ async fn sync_repo_inner(
         &state.retention,
         &provider,
         credential.as_ref(),
+        &lock,
     )
     .await
     {
@@ -2250,11 +2252,9 @@ async fn sync_repo_inner(
                 "full",
                 private,
             );
-            drop(_guard);
             (StatusCode::OK, Json(resp)).into_response()
         }
         Err(e) => {
-            drop(_guard);
             state.metrics.record_error();
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -2523,7 +2523,6 @@ async fn create_snapshot_inner(
     let branch = query.branch.clone();
 
     let lock = repo_lock(&state.sync_locks, &repo_id).await;
-    let _guard = lock.lock().await;
     let info = match do_sync(
         &state.cas,
         &mirror_dir,
@@ -2536,16 +2535,15 @@ async fn create_snapshot_inner(
         &state.retention,
         &provider,
         credential.as_ref(),
+        &lock,
     )
     .await
     {
         Ok(info) => {
             invalidate_ref_response_cache(&state, &repo_id, &branch);
-            drop(_guard);
             info
         }
         Err(e) => {
-            drop(_guard);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
@@ -3354,6 +3352,12 @@ async fn do_sync(
     retention: &Arc<Retention>,
     provider: &ProviderInstance,
     credential: Option<&secrecy::SecretString>,
+    // Per-repo lock. do_sync holds it only across the mirror-mutating prep (fetch
+    // + commit-graph [+ single-phase bitmap]) and drops it before the heavy
+    // read-only build, so builds for different repos — and the read-only phases of
+    // same-repo builds — run concurrently. Safe with auto-gc disabled; see
+    // docs/SYNC.md and git::tests::spike_concurrent_prep_vs_reads.
+    mirror_lock: &Arc<tokio::sync::Mutex<()>>,
 ) -> Result<RefInfo> {
     info!("syncing {}@{}", repo_id.storage_key(), branch);
 
@@ -3415,6 +3419,12 @@ async fn do_sync(
             return Ok(prev);
         }
     }
+
+    // Acquire the per-repo exclusive lock for the mirror-mutating prep below. The
+    // ls-remote pre-check above is read-only (ref store + a network probe), so it
+    // stayed lock-free. We hold this only through fetch + commit-graph [+ bitmap]
+    // and drop it before the heavy read-only build (see the drop points below).
+    let _guard = mirror_lock.lock().await;
 
     // Sync the bare mirror synchronously (blocking git call).
     let mirror_dir_sync = mirror_dir.to_path_buf();
@@ -3497,6 +3507,10 @@ async fn do_sync(
     // history in the background. Removes the dominant history-deltification cost
     // from "time to clonable".
     if two_phase_enabled() {
+        // Mirror prep (fetch + commit-graph) is done; the depth=1 build and the
+        // background phase-2 are read-only over the mirror, so release the lock so
+        // other repos' builds (and this repo's resolves) proceed concurrently.
+        drop(_guard);
         return build_and_publish_two_phase(
             cas,
             &mirror_dir,
@@ -3515,11 +3529,15 @@ async fn do_sync(
 
     // Single-phase: write a reachability bitmap before the heavy full-history
     // enumerations (skeleton + history). Best-effort; off the two-phase depth=1
-    // path (that branch returned above).
+    // path (that branch returned above). This is the last mirror mutation.
     let bm_dir = mirror_dir.clone();
     let _ = tokio::task::spawn_blocking(move || git::write_bitmap(&bm_dir)).await;
     info!("sync phase: reachability bitmap {:?}", t.elapsed());
     t = Instant::now();
+
+    // Mirror prep complete; the skeleton/history/archive build below is read-only
+    // over the mirror, so release the per-repo lock and let it run concurrently.
+    drop(_guard);
 
     // No full skeleton: the full variant reuses the shallow (HEAD) skeleton; the
     // full history's commits+trees live in the history packs.
@@ -4870,8 +4888,10 @@ pub async fn process_build_job(state: &ServerState, job: &BuildJob) -> Result<()
             return Err(format!("unknown provider {}", repo_id.provider.as_str()));
         }
     };
+    // do_sync holds this per-repo lock only across the mirror-mutating prep and
+    // releases it before the heavy read-only build, so distinct repos build
+    // concurrently across the worker pool.
     let lock = repo_lock(&state.sync_locks, repo_id).await;
-    let _guard = lock.lock().await;
     let result = do_sync(
         &state.cas,
         &mirror_dir,
@@ -4884,9 +4904,9 @@ pub async fn process_build_job(state: &ServerState, job: &BuildJob) -> Result<()
         &state.retention,
         &provider,
         job.credential.as_ref(),
+        &lock,
     )
     .await;
-    drop(_guard);
 
     // Resolve HEAD to the concrete default branch for cache/log keys.
     let effective_branch = match &result {
