@@ -40,6 +40,7 @@ zlib-ng = ["flate2/zlib-ng"]
 [dependencies]
 anyhow = "1"
 axum = "0.8"
+bytes = "1"
 base64 = "0.22"
 byteorder = "1.5"
 chrono = "0.4"

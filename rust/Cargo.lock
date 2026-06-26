@@ -3611,6 +3611,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "byteorder",
+ "bytes",
  "chrono",
  "clap",
  "crossbeam-channel",
