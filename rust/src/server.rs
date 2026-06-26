@@ -3087,10 +3087,10 @@ async fn serve_artifact(
 ) -> impl IntoResponse {
     // If the backend can hand out a signed URL, redirect the client there.
     // The client can then use its own Range requests against the CDN/object store.
-    if let Some(url) = state
-        .storage
-        .signed_url(&hash, std::time::Duration::from_secs(900))
-    {
+    // Use the same visibility-aware TTL as the ref path (a private repo gets a
+    // shorter-lived URL) rather than a flat window.
+    let private = headers.as_ref().map(visibility_is_private).unwrap_or(false);
+    if let Some(url) = state.storage.signed_url(&hash, ref_signed_url_ttl(private)) {
         state.metrics.record_artifact_request(0);
         return (
             StatusCode::TEMPORARY_REDIRECT,

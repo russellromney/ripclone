@@ -102,11 +102,15 @@ async fn server_error(context: &str, resp: reqwest::Response) -> anyhow::Error {
 /// Build a reqwest client that always sends our User-Agent (and any default
 /// headers, e.g. the auth token).
 fn build_http_client(headers: reqwest::header::HeaderMap) -> reqwest::Client {
+    // Fail loudly if the client can't be built: the old fallback to
+    // `Client::new()` silently dropped the default headers (including auth), so
+    // every request would go out unauthenticated. A build failure here is a
+    // TLS/config problem worth surfacing at startup, not papering over.
     reqwest::ClientBuilder::new()
         .user_agent(USER_AGENT)
         .default_headers(headers)
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+        .expect("build HTTP client")
 }
 
 #[derive(Debug, Clone, Deserialize)]
