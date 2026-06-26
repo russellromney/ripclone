@@ -1642,11 +1642,17 @@ mod linux_uring {
             mut pending: PendingDirectWindow,
         ) -> std::result::Result<Vec<crate::git::MaterializedPathStat>, DirectWriteError> {
             let wait_start = Instant::now();
-            self.collect_direct_window_completions(
+            if let Err(e) = self.collect_direct_window_completions(
                 &mut pending,
                 "wait for io_uring direct open/write/statx/close batch completion",
-            )
-            .map_err(DirectWriteError::Other)?;
+            ) {
+                // We could not confirm completion (e.g. a fatal ring error after
+                // EINTR retries). The kernel may still own this window's buffers,
+                // so drain it to quiescence before it drops here — freeing
+                // content/path/statx out from under the kernel is a UAF.
+                self.try_quiesce_window(&mut pending);
+                return Err(DirectWriteError::Other(e));
+            }
             if pending.record_io_on_harvest {
                 let io_ns = pending.submitted_ns + wait_start.elapsed().as_nanos() as u64;
                 record_io(Duration::from_nanos(io_ns), pending.files, pending.bytes);
@@ -1710,23 +1716,110 @@ mod linux_uring {
             }
             {
                 let mut sq = self.ring.submission();
+                // SAFETY: every buffer an SQE points at must stay alive and at a
+                // fixed address until the kernel reaps that op's CQE. Each entry
+                // here references memory owned by an `InFlightWrite`/`statx_buffers`
+                // slot inside the `PendingDirectWindow` this batch becomes
+                // (file content, the path `CString`, the kernel-written `statx`).
+                // That window is then held in `self.pending_windows` (or by the
+                // synchronous harvest caller) and is NEVER dropped until
+                // `is_complete()` — see `harvest_direct_window`, the error-path
+                // `try_quiesce_window`, and `Drop`, which all drain to quiescence
+                // first. The entries slice itself only needs to outlive this
+                // `push_multiple` call, which it does.
                 unsafe {
                     sq.push_multiple(entries)
                         .map_err(|_| anyhow::anyhow!("io_uring submission queue is full"))?;
                 }
             }
             if wait_for == 0 {
-                self.ring
-                    .submitter()
-                    .submit()
-                    .with_context(|| context.to_string())?;
+                self.submit_uninterrupted(context)?;
             } else {
-                self.ring
-                    .submitter()
-                    .submit_and_wait(wait_for)
-                    .with_context(|| context.to_string())?;
+                self.submit_and_wait_uninterrupted(wait_for, context)?;
             }
             Ok(())
+        }
+
+        /// `submit()` retrying on `EINTR`. The SQEs are already queued, so a bare
+        /// error return would unwind and drop in-flight windows whose buffers the
+        /// kernel still references; retry the interrupted syscall instead.
+        fn submit_uninterrupted(&self, context: &str) -> Result<()> {
+            loop {
+                match self.ring.submitter().submit() {
+                    Ok(_) => return Ok(()),
+                    Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
+                    Err(e) => return Err(e).with_context(|| context.to_string()),
+                }
+            }
+        }
+
+        /// `submit_and_wait(want)` retrying on `EINTR`. Critical for buffer
+        /// safety: an interrupted wait must not propagate as an error while a
+        /// window is in flight, or the caller would drop that window (freeing the
+        /// content/path/statx buffers the kernel still owns) → UAF/data race.
+        fn submit_and_wait_uninterrupted(&self, want: usize, context: &str) -> Result<()> {
+            loop {
+                match self.ring.submitter().submit_and_wait(want) {
+                    Ok(_) => return Ok(()),
+                    Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
+                    Err(e) => return Err(e).with_context(|| context.to_string()),
+                }
+            }
+        }
+
+        /// Best-effort: reap remaining CQEs for one owned, still-in-flight window
+        /// until it is complete, so the kernel is done with its buffers before the
+        /// window is dropped on an error path. Bounded so a wedged ring can't hang
+        /// us; completions for sibling windows still in `pending_windows` are
+        /// routed to them so they aren't lost.
+        fn try_quiesce_window(&mut self, window: &mut PendingDirectWindow) {
+            let cap = window.expected_completions.saturating_mul(2) + 64;
+            let mut guard = 0usize;
+            while !window.is_complete() {
+                guard += 1;
+                if guard > cap {
+                    break;
+                }
+                {
+                    let mut cq = self.ring.completion();
+                    for cqe in &mut cq {
+                        let Ok((window_id, idx, op)) = parse_user_data(cqe.user_data()) else {
+                            continue;
+                        };
+                        if window_id == window.window_id {
+                            let _ = apply_direct_completion(window, idx, op, cqe.result());
+                        } else if let Some(w) = self
+                            .pending_windows
+                            .iter_mut()
+                            .find(|w| w.window_id == window_id)
+                        {
+                            let _ = apply_direct_completion(w, idx, op, cqe.result());
+                        }
+                    }
+                }
+                if !window.is_complete()
+                    && self
+                        .submit_and_wait_uninterrupted(1, "drain window to quiescence")
+                        .is_err()
+                {
+                    break;
+                }
+            }
+        }
+
+        /// Drain every window still in `pending_windows` to quiescence so none of
+        /// their buffers are freed while the kernel still owns them. Best-effort
+        /// and bounded (a hard ring error or a wedged ring can't be drained, and
+        /// `Drop` must not hang). Results are ignored — on these paths there is no
+        /// one to report write success/failure to; the only goal is kernel
+        /// quiescence before the windows drop.
+        fn drain_pending_to_quiescence(&mut self) {
+            while let Some(mut window) = self.pending_windows.pop_front() {
+                if !window.is_complete() {
+                    self.try_quiesce_window(&mut window);
+                }
+                // `window` drops here, complete (or after a bounded best-effort).
+            }
         }
 
         fn collect_completions(
@@ -1745,10 +1838,7 @@ mod linux_uring {
                 }
                 if completions.len() < expected {
                     let remaining = expected - completions.len();
-                    self.ring
-                        .submitter()
-                        .submit_and_wait(remaining)
-                        .with_context(|| context.to_string())?;
+                    self.submit_and_wait_uninterrupted(remaining, context)?;
                 }
             }
             Ok(completions)
@@ -1780,10 +1870,7 @@ mod linux_uring {
                     }
                 }
                 if !target.is_complete() {
-                    self.ring
-                        .submitter()
-                        .submit_and_wait(1)
-                        .with_context(|| context.to_string())?;
+                    self.submit_and_wait_uninterrupted(1, context)?;
                 }
             }
             Ok(())
@@ -1792,7 +1879,15 @@ mod linux_uring {
 
     impl Drop for RawUringWriter {
         fn drop(&mut self) {
-            let _ = self.flush_deferred_writes();
+            // Buffers referenced by in-flight SQEs (file content, path CStrings,
+            // kernel-written statx) live inside the PendingDirectWindows. The
+            // kernel owns them until their CQEs are reaped, so every window MUST
+            // reach quiescence before it is dropped — otherwise the kernel
+            // writes/reads freed memory (UAF/data race). A best-effort
+            // `flush_deferred_writes` was wrong here: it bails on the first
+            // harvest error, leaving later windows in the deque to drop while
+            // still in flight. Drain to quiescence instead, ignoring results.
+            self.drain_pending_to_quiescence();
         }
     }
 

@@ -3,8 +3,8 @@
 //! atomic conditional claim). For multi-machine use the remote `libsql` backend.
 
 use super::sql::{
-    ADD_CREDENTIAL_COLUMN_SQL, CREATE_ACTIVE_KEY_INDEX_SQL, CREATE_HISTORY_INDEX_SQL,
-    CREATE_STATUS_INDEX_SQL, CREATE_TABLE_SQL, QueueDb,
+    ADD_ATTEMPTS_COLUMN_SQL, ADD_CREDENTIAL_COLUMN_SQL, CREATE_ACTIVE_KEY_INDEX_SQL,
+    CREATE_HISTORY_INDEX_SQL, CREATE_STATUS_INDEX_SQL, CREATE_TABLE_SQL, QueueDb,
 };
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -47,6 +47,10 @@ impl QueueDb for SqliteDb {
         // Migrate a legacy table to add the credential column (best-effort: errors
         // "duplicate column" on a fresh table, which is fine).
         let _ = sqlx::raw_sql(ADD_CREDENTIAL_COLUMN_SQL)
+            .execute(&self.pool)
+            .await;
+        // Same best-effort migration for the attempts column (dead-letter bound).
+        let _ = sqlx::raw_sql(ADD_ATTEMPTS_COLUMN_SQL)
             .execute(&self.pool)
             .await;
         sqlx::raw_sql(CREATE_STATUS_INDEX_SQL)
@@ -101,12 +105,33 @@ impl QueueDb for SqliteDb {
         Ok(res.last_insert_rowid())
     }
 
-    async fn reclaim_stale(&self, cutoff: i64) -> Result<()> {
+    async fn reclaim_stale(
+        &self,
+        cutoff: i64,
+        max_attempts: i64,
+        now: i64,
+        dead_letter_error: &str,
+    ) -> Result<()> {
+        // Dead-letter first: any stale claim already at/over the attempt cap is
+        // terminally failed so it can't crash-loop. Then requeue the rest.
+        sqlx::query(
+            "UPDATE jobs SET status = 'failed', finished_at = ?, error = ?,
+                 worker_id = NULL, credential = NULL
+             WHERE status = 'claimed' AND claimed_at <= ? AND attempts >= ?",
+        )
+        .bind(now)
+        .bind(dead_letter_error)
+        .bind(cutoff)
+        .bind(max_attempts)
+        .execute(&self.pool)
+        .await
+        .context("dead-letter stale jobs")?;
         sqlx::query(
             "UPDATE jobs SET status = 'queued', worker_id = NULL
-             WHERE status = 'claimed' AND claimed_at <= ?",
+             WHERE status = 'claimed' AND claimed_at <= ? AND attempts < ?",
         )
         .bind(cutoff)
+        .bind(max_attempts)
         .execute(&self.pool)
         .await
         .context("reclaim stale jobs")?;
@@ -124,7 +149,8 @@ impl QueueDb for SqliteDb {
 
     async fn try_claim(&self, id: i64, worker_id: &str, now: i64) -> Result<bool> {
         let res = sqlx::query(
-            "UPDATE jobs SET status = 'claimed', worker_id = ?, claimed_at = ?
+            "UPDATE jobs SET status = 'claimed', worker_id = ?, claimed_at = ?,
+                 attempts = attempts + 1
              WHERE id = ? AND status = 'queued'",
         )
         .bind(worker_id)
@@ -159,23 +185,27 @@ impl QueueDb for SqliteDb {
     async fn finish(
         &self,
         id: i64,
+        worker_id: &str,
         status: &str,
         finished_at: i64,
         error: Option<&str>,
-    ) -> Result<()> {
-        // Clear the per-job credential on finish so a short-lived upstream token
-        // isn't retained in the (kept-forever) done-job history.
-        sqlx::query(
-            "UPDATE jobs SET status = ?, finished_at = ?, error = ?, credential = NULL WHERE id = ?",
+    ) -> Result<bool> {
+        // Conditional on still owning the claim, so a slow worker whose claim was
+        // reclaimed (or dead-lettered) can't double-settle the row. Clearing the
+        // per-job credential keeps a short-lived token out of the done-job history.
+        let res = sqlx::query(
+            "UPDATE jobs SET status = ?, finished_at = ?, error = ?, credential = NULL
+             WHERE id = ? AND worker_id = ? AND status = 'claimed'",
         )
         .bind(status)
         .bind(finished_at)
-            .bind(error)
-            .bind(id)
-            .execute(&self.pool)
-            .await
-            .context("finish job")?;
-        Ok(())
+        .bind(error)
+        .bind(id)
+        .bind(worker_id)
+        .execute(&self.pool)
+        .await
+        .context("finish job")?;
+        Ok(res.rows_affected() == 1)
     }
 
     async fn status(&self, id: i64) -> Result<Option<(String, Option<String>)>> {

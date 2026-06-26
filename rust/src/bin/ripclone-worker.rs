@@ -40,7 +40,7 @@ use ripclone::server::{ServerState, process_build_job};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -129,8 +129,13 @@ async fn main() -> Result<()> {
                         Ok(r) => r,
                         Err(e) => Err(format!("build task panicked: {e}")),
                     };
-                if let Err(e) = queue.ack(job_id, result).await {
-                    error!("failed to ack job {job_id}: {e}");
+                match queue.ack(job_id, &worker_id, result).await {
+                    Ok(true) => {}
+                    Ok(false) => warn!(
+                        "job {job_id} was reclaimed (or dead-lettered) before this worker \
+                         finished; discarding its build result"
+                    ),
+                    Err(e) => error!("failed to ack job {job_id}: {e}"),
                 }
             }
             Ok(None) => tokio::time::sleep(idle).await,
