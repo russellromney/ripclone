@@ -21,7 +21,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/target \
     cargo build --release && \
     mkdir -p /out && \
-    cp target/release/ripclone target/release/ripclone-server /out/
+    cp target/release/ripclone target/release/ripclone-server \
+       target/release/ripclone-worker /out/
 
 # Runtime stage
 FROM ubuntu:24.04
@@ -32,6 +33,9 @@ WORKDIR /app
 
 COPY --from=builder /out/ripclone /usr/local/bin/ripclone
 COPY --from=builder /out/ripclone-server /usr/local/bin/ripclone-server
+# The standalone build worker. The same image runs the server (default CMD) or a
+# worker (override the CMD in the worker process group). See ripclone-worker.rs.
+COPY --from=builder /out/ripclone-worker /usr/local/bin/ripclone-worker
 
 ENV RUST_LOG=info
 
