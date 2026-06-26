@@ -257,9 +257,19 @@ in parallel; same-repo builds still serialize safely on the per-repo lock), so
 the lock-shrink — which only adds *same-repo cross-branch* overlap — is its own
 focused change: move the bitmap into the exclusive prep (accepting a small hit to
 two-phase "time to clonable"), then drop the lock before the heavy build. The
-auto-gc fix is already in place as its prerequisite. Spike first (per the crux
-above): fetch into a mirror while a `rev-list | pack-objects` walk runs over it,
-under load, and check for corruption.
+auto-gc fix is already in place as its prerequisite.
+
+**Spike result (validated).** `git::tests::spike_concurrent_prep_vs_reads`
+(`#[ignore]`) runs one writer thread doing serialized fetch + commit-graph +
+bitmap on a mirror (gc off) while four reader threads continuously walk every
+object. Result over ~4s: **17 prep rounds, 0 prep errors, ~1300 reads, 0 read
+failures.** With auto-gc off, mirror mutations are appends (fetch) and
+atomic-replace accelerators (commit-graph, midx/bitmap), and concurrent readers
+never see a torn or missing object. So the lock-shrink is safe *provided* the
+per-repo exclusive lock still serializes the prep trio against itself (two
+concurrent `commit-graph write`s would collide on git's `.lock`). Remaining work
+is purely the `do_sync` restructure (hold the lock across fetch+graph+bitmap,
+drop it before the read-only pack/archive build), not a safety question.
 
 ## Where it runs
 
