@@ -26,6 +26,12 @@ pub struct Retention {
     /// Optional durable storage backend. When set, objects are only evicted
     /// from the local cache after confirming they exist in durable storage.
     durable_storage: Option<crate::storage::StorageRef>,
+    /// Optional ref store + storage used to compute, each run, the set of hashes
+    /// the live refs actually point at. Protecting that set means retention can
+    /// never delete a still-referenced artifact, even if the best-effort
+    /// `protected` side list is stale or incomplete.
+    ref_store: Option<Arc<dyn crate::ref_store::RefStore>>,
+    storage: Option<crate::storage::StorageRef>,
 }
 
 impl Retention {
@@ -63,7 +69,24 @@ impl Retention {
             max_size_bytes,
             metrics,
             durable_storage,
+            ref_store: None,
+            storage: None,
         })
+    }
+
+    /// Protect, on every run, exactly the hashes the live refs point at (read via
+    /// `ref_store`, with manifests fetched from `storage`). Without this the only
+    /// guard is the best-effort `protected` side list, so a stale or incomplete
+    /// list could let retention delete a still-referenced artifact — and on a
+    /// local-only backend (no durable copy) that is the sole copy.
+    pub fn with_ref_store(
+        mut self,
+        ref_store: Arc<dyn crate::ref_store::RefStore>,
+        storage: crate::storage::StorageRef,
+    ) -> Self {
+        self.ref_store = Some(ref_store);
+        self.storage = Some(storage);
+        self
     }
 
     pub fn disabled(&self) -> bool {
@@ -113,7 +136,17 @@ impl Retention {
 
     /// Run a single retention pass. Called by the background task and tests.
     pub async fn run_once(&self) -> Result<()> {
-        let protected = self.protected.read().await.clone();
+        let mut protected = self.protected.read().await.clone();
+        // Union in everything the live refs point at, computed fresh this run, so
+        // a stale/incomplete side list can never cause a referenced artifact to
+        // be deleted. If the ref store can't be read, fail the pass rather than
+        // delete against an incomplete set.
+        if let (Some(ref_store), Some(storage)) = (&self.ref_store, &self.storage) {
+            let reachable = crate::remote_gc::reachable_hashes(ref_store, storage, false)
+                .await
+                .context("compute reachable set for retention")?;
+            protected.extend(reachable);
+        }
         let cas = self.cas.clone();
         let max_age = self.max_age;
         let max_size = self.max_size_bytes;
@@ -323,6 +356,59 @@ mod tests {
     fn hash_of(data: &[u8]) -> String {
         use sha2::{Digest, Sha256};
         format!("{:x}", Sha256::digest(data))
+    }
+
+    /// An artifact a live ref points at must survive retention even when it was
+    /// never added to the best-effort protected side list — the reachable set is
+    /// the real source of truth. (On a local-only backend this is the only copy.)
+    #[tokio::test]
+    async fn retention_keeps_ref_reachable_object_without_side_list() {
+        use crate::RefInfo;
+        use crate::provider::RepoId;
+        use crate::ref_store::{FileRefStore, RefStore};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cas_root = tmp.path().join("cas");
+        let repo_root = tmp.path().join("repos");
+        std::fs::create_dir_all(&cas_root).unwrap();
+        std::fs::create_dir_all(&repo_root).unwrap();
+        let cas = make_cas(&cas_root);
+
+        // Aged artifact, deliberately NOT added to the protected side list.
+        let data = b"referenced-but-not-side-listed";
+        let h = hash_of(data);
+        cas.put(data.as_slice()).unwrap();
+        let path = cas.path(&h);
+        let old = SystemTime::now() - Duration::from_secs(10 * 24 * 60 * 60);
+        filetime::set_file_mtime(&path, filetime::FileTime::from_system_time(old)).unwrap();
+
+        // A live ref points at it.
+        let ref_store: Arc<dyn RefStore> = Arc::new(FileRefStore::new(&repo_root));
+        let info = RefInfo {
+            commit: "c1".to_string(),
+            head_blobs_chunks: vec![h.clone()],
+            ..Default::default()
+        };
+        ref_store
+            .save_branch(&RepoId::github("o/r"), "main", &info)
+            .await
+            .unwrap();
+
+        let retention = Retention::with_config(
+            cas.clone(),
+            Metrics::new(),
+            Some(Duration::from_secs(7 * 24 * 60 * 60)),
+            None,
+        )
+        .unwrap()
+        .with_ref_store(ref_store, crate::storage::local(&cas_root).unwrap());
+
+        retention.run_once().await.unwrap();
+
+        assert!(
+            path.exists(),
+            "a ref-reachable artifact must survive even when absent from the side list"
+        );
     }
 
     #[tokio::test]

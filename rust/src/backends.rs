@@ -82,13 +82,19 @@ impl Backends {
             (local(cas_dir)?, None)
         };
         let ref_store = select_metadata(repo_root, s3.as_ref()).await?;
-        let retention = Arc::new(Retention::with_config_and_storage(
-            cas.clone(),
-            metrics.clone(),
-            Retention::parse_age(),
-            Retention::parse_size(),
-            Some(storage.clone()),
-        )?);
+        let retention = Arc::new(
+            Retention::with_config_and_storage(
+                cas.clone(),
+                metrics.clone(),
+                Retention::parse_age(),
+                Retention::parse_size(),
+                Some(storage.clone()),
+            )?
+            // Protect the ref-reachable set each run so retention never deletes a
+            // referenced artifact (critical on a local-only backend, where the
+            // cache holds the only copy).
+            .with_ref_store(ref_store.clone(), storage.clone()),
+        );
         Ok(Self {
             cas,
             storage,
@@ -113,6 +119,24 @@ async fn select_metadata(
 
     let kind =
         env_or("RIPCLONE_METADATA", config().metadata.backend.as_deref()).unwrap_or_default();
+
+    // A per-host file metadata store can't back a queue whose builds run on other
+    // hosts: each worker and the server would read and write their own local ref
+    // files, so a worker's build would be invisible to the server. Refuse the
+    // combination with a clear message instead of silently losing refs.
+    let resolves_to_file = kind == "file" || (kind.is_empty() && s3.is_none());
+    if resolves_to_file {
+        let queue = queue_kind();
+        if matches!(queue.as_str(), "postgres" | "mysql" | "libsql") {
+            anyhow::bail!(
+                "RIPCLONE_QUEUE={queue} runs builds on other hosts, but the metadata store \
+                 resolves to per-host files. Set a shared metadata store \
+                 (RIPCLONE_METADATA=s3|postgres|mysql|libsql) so the server and workers \
+                 share refs."
+            );
+        }
+    }
+
     // Each arm wraps its concrete store in CachingRefStore (the read cache) and
     // coerces to Arc<dyn RefStore>.
     let store: Arc<dyn RefStore> = match kind.as_str() {

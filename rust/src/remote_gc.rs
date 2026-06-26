@@ -137,7 +137,7 @@ impl RemoteGc {
             return Ok(GcReport::default());
         }
 
-        let reachable = self.collect_reachable_hashes(false).await?;
+        let reachable = reachable_hashes(&self.ref_store, &self.storage, false).await?;
         let storage = self.storage.clone();
         let entries = tokio::task::spawn_blocking(move || storage.list_hashes())
             .await
@@ -180,7 +180,7 @@ impl RemoteGc {
         // the reused-object gap, leaving only a sub-second recheck→delete window in
         // place of the whole-pass window.
         if !to_delete.is_empty() {
-            let reachable_now = self.collect_reachable_hashes(true).await?;
+            let reachable_now = reachable_hashes(&self.ref_store, &self.storage, true).await?;
             let before = to_delete.len();
             to_delete.retain(|entry| !reachable_now.contains(&entry.hash));
             let rescued = before - to_delete.len();
@@ -234,77 +234,76 @@ impl RemoteGc {
 
         Ok(report)
     }
+}
 
-    /// Walk every live ref and collect the set of hashes that must be kept.
-    ///
-    /// When `fresh` is true, each branch's cache entry is invalidated before it
-    /// is loaded so the read goes through to the durable store — used for the
-    /// pre-delete recheck, where a stale cached ref could let GC delete an object
-    /// a concurrent sync just started referencing (S1). It is a no-op for
-    /// non-caching ref stores.
-    async fn collect_reachable_hashes(&self, fresh: bool) -> Result<HashSet<String>> {
-        let mut reachable: HashSet<String> = HashSet::new();
-        let repos = self.ref_store.list().await.context("list repos for GC")?;
-        for repo_id in repos {
-            let key = repo_id.storage_key();
-            let branches = self
-                .ref_store
-                .list_branches(&repo_id)
-                .await
-                .with_context(|| format!("list branches for {key}"))?;
-            for branch in branches {
-                if fresh {
-                    self.ref_store.invalidate(&repo_id, &branch).await;
-                }
-                let Some(info) = self
-                    .ref_store
-                    .load_branch(&repo_id, &branch)
-                    .await
-                    .with_context(|| format!("load ref {key}/{branch}"))?
-                else {
-                    continue;
-                };
-                collect_ref_info_hashes(&info, &mut reachable);
-
-                // Manifests are themselves stored objects and reference more objects.
-                let manifest_hashes = collect_manifest_hashes(&info);
-                for manifest_hash in manifest_hashes {
-                    if let Err(e) = self
-                        .collect_manifest_refs(&manifest_hash, &mut reachable)
-                        .await
-                    {
-                        warn!(
-                            "failed to collect manifest refs for {key}/{branch} manifest {manifest_hash}: {e}"
-                        );
-                    }
-                }
-            }
-        }
-        Ok(reachable)
-    }
-
-    /// Fetch a manifest by hash and add all of its ChunkRef hashes to the reachable set.
-    async fn collect_manifest_refs(
-        &self,
-        manifest_hash: &str,
-        reachable: &mut HashSet<String>,
-    ) -> Result<()> {
-        let storage = self.storage.clone();
-        let hash = manifest_hash.to_string();
-        let bytes = tokio::task::spawn_blocking(move || storage.get(&hash))
+/// Walk every live ref and collect the set of hashes that must be kept. Shared
+/// by remote GC and local retention so both protect exactly what the refs point
+/// at, not a best-effort side list.
+///
+/// When `fresh` is true, each branch's cache entry is invalidated before it is
+/// loaded so the read goes through to the durable store (a stale cached ref
+/// could otherwise let a delete race a just-saved ref). It is a no-op for
+/// non-caching ref stores. A manifest that can't be read fails the whole walk,
+/// so the caller never deletes against an incomplete set.
+pub(crate) async fn reachable_hashes(
+    ref_store: &Arc<dyn RefStore>,
+    storage: &StorageRef,
+    fresh: bool,
+) -> Result<HashSet<String>> {
+    let mut reachable: HashSet<String> = HashSet::new();
+    let repos = ref_store.list().await.context("list repos")?;
+    for repo_id in repos {
+        let key = repo_id.storage_key();
+        let branches = ref_store
+            .list_branches(&repo_id)
             .await
-            .context("fetch manifest task panicked")?
-            .with_context(|| format!("fetch manifest {}", manifest_hash))?;
-        let manifest = ClonepackManifest::decode(bytes.as_slice())
-            .with_context(|| format!("decode manifest {}", manifest_hash))?;
-        for chunk in manifest_chunk_refs(&manifest) {
-            let hash = hash_to_hex(&chunk.hash);
-            if !hash.is_empty() {
-                reachable.insert(hash);
+            .with_context(|| format!("list branches for {key}"))?;
+        for branch in branches {
+            if fresh {
+                ref_store.invalidate(&repo_id, &branch).await;
+            }
+            let Some(info) = ref_store
+                .load_branch(&repo_id, &branch)
+                .await
+                .with_context(|| format!("load ref {key}/{branch}"))?
+            else {
+                continue;
+            };
+            collect_ref_info_hashes(&info, &mut reachable);
+
+            for manifest_hash in collect_manifest_hashes(&info) {
+                collect_manifest_refs(storage, &manifest_hash, &mut reachable)
+                    .await
+                    .with_context(|| {
+                        format!("collect manifest refs for {key}/{branch} manifest {manifest_hash}")
+                    })?;
             }
         }
-        Ok(())
     }
+    Ok(reachable)
+}
+
+/// Fetch a manifest by hash and add all of its ChunkRef hashes to the set.
+async fn collect_manifest_refs(
+    storage: &StorageRef,
+    manifest_hash: &str,
+    reachable: &mut HashSet<String>,
+) -> Result<()> {
+    let storage = storage.clone();
+    let hash = manifest_hash.to_string();
+    let bytes = tokio::task::spawn_blocking(move || storage.get(&hash))
+        .await
+        .context("fetch manifest task panicked")?
+        .with_context(|| format!("fetch manifest {}", manifest_hash))?;
+    let manifest = ClonepackManifest::decode(bytes.as_slice())
+        .with_context(|| format!("decode manifest {}", manifest_hash))?;
+    for chunk in manifest_chunk_refs(&manifest) {
+        let hash = hash_to_hex(&chunk.hash);
+        if !hash.is_empty() {
+            reachable.insert(hash);
+        }
+    }
+    Ok(())
 }
 
 fn add_hash(reachable: &mut HashSet<String>, hash: &str) {
