@@ -6,13 +6,13 @@ use crate::worktree_writer::{
 };
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, bounded};
-use filetime::{FileTime, set_file_mtime, set_symlink_file_times};
+use filetime::FileTime;
 use flate2::read::ZlibDecoder;
 use sha1::{Digest as Sha1Digest, Sha1};
 use sha2::{Digest as Sha256Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -777,99 +777,6 @@ fn safe_create_dir_all(root: &Path, rel: &Path) -> Result<()> {
             }
         }
     }
-    Ok(())
-}
-
-fn write_entry(target_dir: &Path, entry: &FileEntry, content: &[u8]) -> Result<()> {
-    let path = path_from_bytes(&entry.path);
-    validate_relative_path(path)
-        .with_context(|| format!("refusing to extract unsafe path: {}", path.display()))?;
-
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        safe_create_dir_all(target_dir, parent).with_context(|| {
-            format!(
-                "create parent dir for {}",
-                String::from_utf8_lossy(&entry.path)
-            )
-        })?;
-    }
-
-    let target = target_dir.join(path);
-
-    // Refuse to operate through an existing symlink at the final component.
-    // `OpenOptions::create` would follow it and write outside the target dir.
-    if target.is_symlink() {
-        std::fs::remove_file(&target)
-            .with_context(|| format!("remove existing symlink {}", target.display()))?;
-    }
-
-    match entry.mode {
-        0o120000 => {
-            // Symlink: content is the raw target path — arbitrary bytes, not
-            // necessarily valid UTF-8 (git stores the raw blob). Always unlink
-            // first; `exists()` follows symlinks and would miss a broken symlink
-            // left over from a previous extraction.
-            if target.exists() || target.is_symlink() {
-                std::fs::remove_file(&target).ok();
-            }
-            #[cfg(unix)]
-            {
-                // Build the target straight from the bytes so a non-UTF-8 target
-                // clones byte-for-byte instead of aborting the whole clone (F1).
-                use std::os::unix::ffi::OsStrExt;
-                let link_target = std::ffi::OsStr::from_bytes(content);
-                std::os::unix::fs::symlink(link_target, &target)
-                    .with_context(|| format!("symlink {}", target.display()))?;
-                set_symlink_file_times(&target, INDEX_MTIME, INDEX_MTIME)
-                    .with_context(|| format!("set symlink times {}", target.display()))?;
-            }
-            #[cfg(not(unix))]
-            {
-                // No raw-byte symlinks off unix; keep the best-effort lossy fallback.
-                std::fs::write(&target, String::from_utf8_lossy(content).as_bytes())
-                    .with_context(|| format!("write symlink fallback {}", target.display()))?;
-                set_file_mtime(&target, INDEX_MTIME)
-                    .with_context(|| format!("set mtime {}", target.display()))?;
-            }
-        }
-        0o100755 | 0o100644 => {
-            // Only unlink if something is already there; on a fresh clone most paths
-            // are missing, so this saves a syscall per file.
-            if target.exists() {
-                std::fs::remove_file(&target).ok();
-            }
-
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                let mode = if entry.mode == 0o100755 { 0o755 } else { 0o644 };
-                let mut opts = OpenOptions::new();
-                opts.write(true).create(true).truncate(true).mode(mode);
-                let mut file = opts
-                    .open(&target)
-                    .with_context(|| format!("open {}", target.display()))?;
-                file.write_all(content)
-                    .with_context(|| format!("write {}", target.display()))?;
-            }
-            #[cfg(not(unix))]
-            {
-                std::fs::write(&target, content)
-                    .with_context(|| format!("write {}", target.display()))?;
-            }
-            set_file_mtime(&target, INDEX_MTIME)
-                .with_context(|| format!("set mtime {}", target.display()))?;
-        }
-        _ => {
-            anyhow::bail!(
-                "refusing to extract file {} with illegal mode 0o{:o}",
-                String::from_utf8_lossy(&entry.path),
-                entry.mode
-            );
-        }
-    }
-
     Ok(())
 }
 
@@ -1681,8 +1588,8 @@ pub fn materialize_worktree_from_pack(repo_root: &Path, commit: &str) -> Result<
                             )
                         })?;
                         let content = content.data.clone();
-                        // write_entry only reads `path` and `mode`; blob_sha1 and
-                        // fragments are unused on this path.
+                        // The owned-write path only reads `path` and `mode`;
+                        // blob_sha1 and fragments are unused here.
                         let entry = FileEntry {
                             path: item.path.clone(),
                             mode: item.mode,
