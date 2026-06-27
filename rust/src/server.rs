@@ -6455,6 +6455,7 @@ mod tests {
                 manifest: "m".to_string(),
                 ..Default::default()
             },
+            archive_chunks: vec!["a".to_string()],
             ..Default::default()
         };
         state
