@@ -3635,16 +3635,19 @@ async fn reuse_existing_build(
     if let Ok(Some(mut built)) = ref_store.load_build(repo_id, commit).await {
         // Re-point the branch at this build. Reuse only fires when `commit` is the
         // current tip (the ls-remote tip, or the freshly-resolved build commit), so
-        // stamp synced_at = now. The reused RefInfo carries the *other* branch's
-        // older build time; without this, save_branch's "don't regress to an older
-        // sync" guard would silently drop the re-point — e.g. after a force-push
-        // back to an older commit, leaving the persisted (and cross-process)
-        // pointer stuck at the prior, no-longer-tip commit. "This branch is at this
-        // commit, confirmed now."
+        // stamp synced_at = now and drop the history-depth signal. The reused
+        // RefInfo carries the *other* build's older time and — after a force-push
+        // that rewinds to an older commit — a shallower history. save_branch orders
+        // by history depth first, then by sync time, so without overriding both it
+        // would silently drop this re-point and strand the pointer at the prior,
+        // no-longer-tip commit. Clearing generation lets the fresh synced_at win,
+        // because this re-point is authoritative: "this branch is at this commit,
+        // confirmed now." The next build of this commit re-stamps the depth.
         built.synced_at = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .ok()
             .map(|d| d.as_secs());
+        built.generation = None;
         let _ = ref_store.save_branch(repo_id, branch, &built).await;
         return Some(built);
     }
@@ -6170,18 +6173,20 @@ mod tests {
     }
 
     /// Commit-keyed reuse re-points the requested branch — and, critically, does
-    /// so even when that branch currently sits at a newer-synced commit (the
-    /// force-push-to-an-older-commit case). Without stamping `synced_at = now` in
-    /// `reuse_existing_build`, `save_branch`'s "don't regress to an older sync"
-    /// guard silently drops the re-point and the pointer is stranded.
+    /// so even when that branch currently sits at a commit with deeper history and
+    /// a newer sync time (the force-push-to-an-older-commit case). Real refs carry
+    /// a `generation` (history depth), which save_branch orders by *before* sync
+    /// time; `reuse_existing_build` must override both for the authoritative
+    /// re-point, or the pointer is stranded at the prior, no-longer-tip commit.
     #[tokio::test]
     async fn reuse_existing_build_repoints_branch_past_ordering_guard() {
         use crate::meta::{SqlRefStore, SqliteMeta};
 
-        fn complete(commit: &str, synced_at: u64) -> RefInfo {
+        fn complete(commit: &str, synced_at: u64, generation: u64) -> RefInfo {
             RefInfo {
                 commit: commit.to_string(),
                 synced_at: Some(synced_at),
+                generation: Some(generation),
                 full_clonepack: crate::ClonepackArtifacts {
                     commit: commit.to_string(),
                     manifest: "m".to_string(),
@@ -6200,9 +6205,9 @@ mod tests {
         );
         let rid = RepoId::github("o/r");
 
-        // Branch foo built at X (older sync time).
+        // Branch foo built at X — an older commit with shallower history.
         store
-            .save_branch(&rid, "foo", &complete("X", 1_000))
+            .save_branch(&rid, "foo", &complete("X", 1_000, 95))
             .await
             .unwrap();
 
@@ -6221,9 +6226,12 @@ mod tests {
             "cross-branch reuse must publish under the requested branch"
         );
 
-        // Force-push-to-older: main sits at Y with a NEWER sync time than X's build.
+        // Force-push rewind: main sits at Y, a newer commit with DEEPER history and
+        // a newer sync time. Re-pointing main back to the shallower, older-synced X
+        // must still win, because X is the confirmed current tip. This is the case
+        // production hits (real refs always carry a generation).
         store
-            .save_branch(&rid, "main", &complete("Y", 5_000))
+            .save_branch(&rid, "main", &complete("Y", 5_000, 100))
             .await
             .unwrap();
         let reused = reuse_existing_build(&store, &rid, "main", "X").await;
@@ -6236,7 +6244,7 @@ mod tests {
                 .unwrap()
                 .commit,
             "X",
-            "reuse must advance the pointer to the current tip despite a newer prior synced_at"
+            "reuse must move the pointer to the confirmed tip despite deeper, newer-synced prior state"
         );
     }
 

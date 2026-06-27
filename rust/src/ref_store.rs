@@ -48,10 +48,13 @@ fn unbranch_slug(slug: &str) -> Option<String> {
 /// either side defers to the backend's atomic tie-break (the SQL conditional
 /// upsert, the S3 ETag CAS); the file store serializes writes in-process.
 ///
-/// Known limitation: a force-push that rewinds a branch to an *older* commit has
-/// a lower generation, so it lags here until the next forward push (a same-commit
-/// re-sync still updates). That is the cost of ordering by history rather than
-/// by observation time.
+/// Force-push rewinds: an *older* commit has a lower generation, so this guard
+/// would reject it. The sync path handles the common case — when the rewound-to
+/// commit was already built, `reuse_existing_build` re-points authoritatively
+/// (clearing generation so the fresh `synced_at` wins). The residual is a rewind
+/// to a commit that was *never* built as a tip: it lags here until that commit is
+/// built and a later sync reuses it, or until the next forward push. That is the
+/// cost of ordering by history rather than by observation time.
 pub(crate) fn should_replace_ref(existing: Option<&RefInfo>, new: &RefInfo) -> bool {
     let Some(existing) = existing else {
         return true;
