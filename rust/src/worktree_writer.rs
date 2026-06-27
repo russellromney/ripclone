@@ -1316,8 +1316,17 @@ mod linux_uring {
                     entries.len(),
                     "submit io_uring write/close batch",
                 ) {
+                    // Submit failed, so the kernel never took these SQEs and the
+                    // fds are still ours to close.
                     close_open_fds_sync(&mut in_flight);
                     return Err(e);
+                }
+                // Submit succeeded (it waited for every completion), so the kernel
+                // has run the Close op for each fd. Drop our fd handles now: any
+                // error below must NOT close these again — the fd may already be
+                // closed and reused by another thread.
+                for write in in_flight.iter_mut() {
+                    write.fd = None;
                 }
                 match self.collect_completions(
                     entries.len(),
@@ -1337,10 +1346,8 @@ mod linux_uring {
                                         anyhow::anyhow!("invalid io_uring completion index {idx}")
                                     })?;
                                     write.close_res = Some(res);
-                                    write.fd = None;
                                 }
                                 FileOp::Open | FileOp::Statx => {
-                                    close_open_fds_sync(&mut in_flight);
                                     anyhow::bail!(
                                         "unexpected io_uring completion in write/close phase"
                                     );
@@ -1348,10 +1355,7 @@ mod linux_uring {
                             }
                         }
                     }
-                    Err(e) => {
-                        close_open_fds_sync(&mut in_flight);
-                        return Err(e);
-                    }
+                    Err(e) => return Err(e),
                 }
             }
 
@@ -1389,6 +1393,28 @@ mod linux_uring {
         }
 
         fn write_regular_batch_deferred(
+            &mut self,
+            mut writes: Vec<PreparedRegularWrite>,
+            collect_stats: bool,
+        ) -> Result<WriteOutcome> {
+            // A single window claims one fixed-file slot range of MAX_BATCH_FILES.
+            // Split a larger batch so a caller passing more than that can't
+            // overrun its slot range (mirrors the synchronous write_regular_batch).
+            let mut outcome = WriteOutcome {
+                written: 0,
+                stats: Vec::new(),
+            };
+            while !writes.is_empty() {
+                let n = writes.len().min(MAX_BATCH_FILES);
+                let window: Vec<_> = writes.drain(..n).collect();
+                let part = self.write_regular_window_deferred(window, collect_stats)?;
+                outcome.written += part.written;
+                outcome.stats.extend(part.stats);
+            }
+            Ok(outcome)
+        }
+
+        fn write_regular_window_deferred(
             &mut self,
             writes: Vec<PreparedRegularWrite>,
             collect_stats: bool,
