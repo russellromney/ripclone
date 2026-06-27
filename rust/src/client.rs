@@ -337,6 +337,54 @@ fn temp_install_dir(target: &Path) -> Result<tempfile::TempDir> {
         .context("create temp install directory")
 }
 
+/// True when `RIPCLONE_FSYNC` asks for a durability barrier before the clone
+/// reports success. Off by default: the extra fsyncs add latency, and the clone
+/// is already crash-consistent (temp dir + atomic rename). Turn it on when a
+/// crash right after the clone must not leave a torn tree that `git status`
+/// would call clean.
+fn fsync_requested() -> bool {
+    std::env::var("RIPCLONE_FSYNC")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// fsync one directory so its newly created entries survive a crash. On Unix
+/// this opens the directory and syncs it; elsewhere it is a best-effort no-op.
+#[cfg(unix)]
+fn fsync_dir(path: &Path) -> Result<()> {
+    let dir = std::fs::File::open(path)
+        .with_context(|| format!("open dir for fsync {}", path.display()))?;
+    dir.sync_all()
+        .with_context(|| format!("fsync dir {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn fsync_dir(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+/// Recursively fsync every regular file and directory under `root`, so the whole
+/// materialized tree is durable before the clone reports success. A symlink is
+/// persisted by syncing its parent directory, not by following the link.
+fn fsync_tree(root: &Path) -> Result<()> {
+    let meta = std::fs::symlink_metadata(root)
+        .with_context(|| format!("stat for fsync {}", root.display()))?;
+    if meta.is_dir() {
+        for entry in
+            std::fs::read_dir(root).with_context(|| format!("read dir {}", root.display()))?
+        {
+            fsync_tree(&entry?.path())?;
+        }
+        fsync_dir(root)?;
+    } else if meta.is_file() {
+        let f = std::fs::File::open(root)
+            .with_context(|| format!("open file for fsync {}", root.display()))?;
+        f.sync_all()
+            .with_context(|| format!("fsync file {}", root.display()))?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, Deserialize)]
 pub struct SnapshotResponse {
     pub owner: String,
@@ -1160,9 +1208,19 @@ impl Client {
                 staging_dir.display()
             );
         } else {
+            // Optional durability barrier: flush the staged tree, publish it,
+            // then flush the parent directory so the rename itself is durable.
+            if fsync_requested() {
+                fsync_tree(&install_root).context("fsync staged clone before publish")?;
+            }
             std::fs::rename(&install_root, &target).with_context(|| {
                 format!("rename {} to {}", install_root.display(), target.display())
             })?;
+            if fsync_requested()
+                && let Some(parent) = target.parent().filter(|p| !p.as_os_str().is_empty())
+            {
+                fsync_dir(parent).context("fsync parent directory after publish")?;
+            }
         }
 
         let report = bench.finish();
@@ -2638,6 +2696,40 @@ fn local_rev_parse(main_repo: &Path, branch: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fsync_tree_walks_files_dirs_and_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("sub/nested")).unwrap();
+        std::fs::write(root.join("top.txt"), b"hello").unwrap();
+        std::fs::write(root.join("sub/inner.txt"), b"world").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("top.txt", root.join("link")).unwrap();
+        // A full tree with a dangling-capable symlink must fsync cleanly.
+        fsync_tree(root).expect("fsync whole tree");
+    }
+
+    #[test]
+    fn fsync_requested_reads_env_flag() {
+        // Default (unset) is off; explicit truthy values turn it on. Guarded so
+        // the env var is restored regardless of the assertions.
+        let prev = std::env::var("RIPCLONE_FSYNC").ok();
+        unsafe {
+            std::env::remove_var("RIPCLONE_FSYNC");
+        }
+        assert!(!fsync_requested());
+        unsafe {
+            std::env::set_var("RIPCLONE_FSYNC", "1");
+        }
+        assert!(fsync_requested());
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("RIPCLONE_FSYNC", v),
+                None => std::env::remove_var("RIPCLONE_FSYNC"),
+            }
+        }
+    }
 
     #[test]
     fn detects_stale_signed_url_through_the_error_chain() {
