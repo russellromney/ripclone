@@ -203,6 +203,7 @@ mod tests {
             kind: ProviderKind::GitHub,
             host: "github.com".to_string(),
             auth_template: None,
+            auth_header_name: None,
         }
     }
 

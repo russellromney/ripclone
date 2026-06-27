@@ -49,6 +49,8 @@ pub struct ProviderEntry {
     pub kind: String,
     pub host: Option<String>,
     pub auth_template: Option<String>,
+    /// Optional header name for the credential. Defaults to `Authorization`.
+    pub auth_header_name: Option<String>,
 }
 
 /// Server-side artifact storage. These are read only by `ripclone-server` /
@@ -233,6 +235,7 @@ impl Config {
                 host: entry.host.clone(),
                 token: None,
                 auth_template: entry.auth_template.clone(),
+                auth_header_name: entry.auth_header_name.clone(),
             })
             .collect()
     }
@@ -351,6 +354,7 @@ mod tests {
                 kind: "gitea".into(),
                 host: Some("https://gitea.example.com".into()),
                 auth_template: None,
+                auth_header_name: None,
             },
         );
         let cfg = Config {
@@ -453,6 +457,7 @@ default_provider = "my-gitea"
                 kind: "gitea".into(),
                 host: Some("https://gitea.example.com".into()),
                 auth_template: Some("token {{token}}".into()),
+                auth_header_name: None,
             },
         );
         let cfg = Config {
