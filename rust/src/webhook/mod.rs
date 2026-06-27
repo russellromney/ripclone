@@ -17,7 +17,15 @@ use secrecy::SecretString;
 use std::collections::{HashMap, HashSet};
 use tracing::{info, warn};
 
+mod gitea;
 mod github;
+mod gitlab;
+
+/// True for a git "null" object id (a deleted ref's `after`): non-empty and all
+/// ASCII zeros (40 chars for SHA-1, 64 for SHA-256). Shared by the adapters.
+pub(super) fn is_zero_sha(sha: &str) -> bool {
+    !sha.is_empty() && sha.bytes().all(|b| b == b'0')
+}
 
 /// What a provider push tells us, normalized across providers. The receiver
 /// trusts these fields only for **routing** (which repo / ref to warm) — never
@@ -63,14 +71,16 @@ pub trait WebhookProvider {
 }
 
 /// The webhook adapter for a provider kind, or `None` if that kind has no
-/// adapter yet. Phase 1: GitHub only. The adapter is `Send + Sync` so it can be
-/// held across `.await` points inside the (Send) request handler.
+/// adapter yet. The adapter is `Send + Sync` so it can be held across `.await`
+/// points inside the (Send) request handler.
 pub fn provider_for(kind: ProviderKind) -> Option<Box<dyn WebhookProvider + Send + Sync>> {
     match kind {
         ProviderKind::GitHub => Some(Box::new(github::GitHub)),
-        // GitLab (`X-Gitlab-Token`) and Gitea (`X-Gitea-Signature`) are
-        // follow-ups behind this same trait.
-        _ => None,
+        ProviderKind::GitLab => Some(Box::new(gitlab::GitLab)),
+        // `Gitea` covers Forgejo/Codeberg (same payload + signature scheme).
+        ProviderKind::Gitea => Some(Box::new(gitea::Gitea)),
+        // Bitbucket and config-only `Generic` hosts have no adapter yet.
+        ProviderKind::Bitbucket | ProviderKind::Generic => None,
     }
 }
 

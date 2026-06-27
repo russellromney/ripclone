@@ -6906,25 +6906,42 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
-    #[tokio::test]
-    async fn webhook_non_github_provider_returns_501() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut state = test_state(&tmp);
+    /// Build state with a single non-default provider instance configured plus
+    /// its webhook secret. Returns the (non-draining) queue receiver so a test
+    /// can assert what `trigger_build` enqueued.
+    fn provider_webhook_state(
+        tmp: &tempfile::TempDir,
+        id: &str,
+        kind: &str,
+        host: &str,
+    ) -> (ServerState, tokio::sync::mpsc::Receiver<BuildJob>) {
+        let mut state = test_state(tmp);
+        let (queue, rx, depth) = crate::queue::LocalJobQueue::new(16);
+        state.build_queue = Arc::new(queue);
+        state.build_queue_depth = depth;
         let mut registry = ProviderRegistry::new();
         registry
             .merge_one(crate::provider::ProviderConfig {
-                id: "gitlab".to_string(),
-                kind: Some("gitlab".to_string()),
-                host: Some("gitlab.com".to_string()),
+                id: id.to_string(),
+                kind: Some(kind.to_string()),
+                host: Some(host.to_string()),
                 ..Default::default()
             })
             .unwrap();
         state.provider_registry = registry;
-        state.webhook_config = Arc::new(WebhookConfig::with_secret("gitlab", WEBHOOK_SECRET));
+        state.webhook_config = Arc::new(WebhookConfig::with_secret(id, WEBHOOK_SECRET));
+        (state, rx)
+    }
+
+    #[tokio::test]
+    async fn webhook_provider_without_adapter_returns_501() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Bitbucket has no webhook adapter yet → 501 (before any verify).
+        let (state, _rx) = provider_webhook_state(&tmp, "bb", "bitbucket", "bitbucket.org");
         let app = build_app(state);
         let resp = app
             .oneshot(webhook_request(
-                "gitlab",
+                "bb",
                 "push",
                 Some("whatever"),
                 br#"{}"#.to_vec(),
@@ -6932,6 +6949,126 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    }
+
+    #[tokio::test]
+    async fn webhook_gitlab_push_enqueues() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, mut rx) = provider_webhook_state(&tmp, "gitlab", "gitlab", "gitlab.com");
+        let app = build_app(state);
+        let body = br#"{"object_kind":"push","ref":"refs/heads/main","after":"1111111111111111111111111111111111111111","project":{"path_with_namespace":"group/sub/proj","default_branch":"main","visibility_level":0}}"#.to_vec();
+        // GitLab authenticates with the shared token in X-Gitlab-Token.
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/webhooks/gitlab")
+            .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))))
+            .header("X-Gitlab-Event", "Push Hook")
+            .header("X-Gitlab-Token", WEBHOOK_SECRET)
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let job = rx.try_recv().expect("gitlab default-branch push enqueues");
+        assert_eq!(job.repo_id.path, "group/sub/proj");
+        assert_eq!(job.branch, "main");
+    }
+
+    #[tokio::test]
+    async fn webhook_gitlab_bad_token_returns_401() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, mut rx) = provider_webhook_state(&tmp, "gitlab", "gitlab", "gitlab.com");
+        let app = build_app(state);
+        let body = br#"{"ref":"refs/heads/main","after":"abc","project":{"path_with_namespace":"g/p","default_branch":"main"}}"#.to_vec();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/webhooks/gitlab")
+            .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))))
+            .header("X-Gitlab-Event", "Push Hook")
+            .header("X-Gitlab-Token", "wrong-token")
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(rx.try_recv().is_err(), "a bad token must not enqueue");
+    }
+
+    #[tokio::test]
+    async fn webhook_gitea_push_enqueues() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, mut rx) = provider_webhook_state(&tmp, "gitea", "gitea", "gitea.example.com");
+        let app = build_app(state);
+        let body = br#"{"ref":"refs/heads/main","after":"1111111111111111111111111111111111111111","repository":{"full_name":"acme/widget","default_branch":"main","private":true}}"#.to_vec();
+        // Gitea signs the raw body with HMAC-SHA256, bare hex in X-Gitea-Signature.
+        let sig = {
+            use hmac::{Hmac, Mac};
+            use sha2::Sha256;
+            let mut mac = Hmac::<Sha256>::new_from_slice(WEBHOOK_SECRET.as_bytes()).unwrap();
+            mac.update(&body);
+            hex::encode(mac.finalize().into_bytes())
+        };
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/webhooks/gitea")
+            .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))))
+            .header("X-Gitea-Event", "push")
+            .header("X-Gitea-Signature", sig)
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let job = rx.try_recv().expect("gitea default-branch push enqueues");
+        assert_eq!(job.repo_id.path, "acme/widget");
+        assert_eq!(job.branch, "main");
+    }
+
+    #[tokio::test]
+    async fn webhook_gitea_branch_delete_cleans_up_ref() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, mut rx) = provider_webhook_state(&tmp, "gitea", "gitea", "gitea.example.com");
+        let repo = RepoId {
+            provider: crate::provider::ProviderInstanceId::new("gitea"),
+            path: "acme/widget".to_string(),
+        };
+        let info = RefInfo {
+            commit: "deadbeef".to_string(),
+            default_branch: "main".to_string(),
+            ..Default::default()
+        };
+        state
+            .ref_store
+            .save_branch(&repo, "feature", &info)
+            .await
+            .unwrap();
+        let ref_store = state.ref_store.clone();
+        let app = build_app(state);
+        // Gitea's `delete` event uses a bare branch name + ref_type.
+        let body = br#"{"ref":"feature","ref_type":"branch","repository":{"full_name":"acme/widget","default_branch":"main"}}"#.to_vec();
+        let sig = {
+            use hmac::{Hmac, Mac};
+            use sha2::Sha256;
+            let mut mac = Hmac::<Sha256>::new_from_slice(WEBHOOK_SECRET.as_bytes()).unwrap();
+            mac.update(&body);
+            hex::encode(mac.finalize().into_bytes())
+        };
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/webhooks/gitea")
+            .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))))
+            .header("X-Gitea-Event", "delete")
+            .header("X-Gitea-Signature", sig)
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            ref_store
+                .load_branch(&repo, "feature")
+                .await
+                .unwrap()
+                .is_none(),
+            "gitea delete cleans up the stored ref"
+        );
+        assert!(rx.try_recv().is_err(), "a delete must not enqueue");
     }
 
     #[tokio::test]

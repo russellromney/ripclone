@@ -7,7 +7,7 @@
 //! - Fields: `ref`, `after`, `deleted`, and `repository.{owner.login, name,
 //!   default_branch, private}`.
 
-use super::{CanonicalEvent, EventKind, WebhookProvider};
+use super::{CanonicalEvent, EventKind, WebhookProvider, is_zero_sha};
 use axum::http::HeaderMap;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -84,12 +84,6 @@ impl WebhookProvider for GitHub {
             _ => None,
         }
     }
-}
-
-/// True for a git "null" object id (a deleted ref's `after`): non-empty and all
-/// ASCII zeros (40 chars for SHA-1, 64 for SHA-256).
-fn is_zero_sha(sha: &str) -> bool {
-    !sha.is_empty() && sha.bytes().all(|b| b == b'0')
 }
 
 // Minimal projection of the GitHub push payload — only the routing fields. We
