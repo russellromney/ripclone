@@ -94,11 +94,10 @@ Per provider instance:
 ## Action
 
 - **Push** to a synced ref → enqueue a sync for `(provider, owner, repo, ref)`
-  with the configured credential. **Reuse the `/sync` enqueue path**: factor the
-  "enqueue a build job + coalesce + bump `build_queue_depth` + `record_build_queued`"
-  block out of `sync_repo_inner` (`server.rs` ~1916) into a shared
-  `enqueue_sync(state, repo, ref_, cred)` that both `/sync` and the webhook call.
-  Do **not** duplicate build logic.
+  with the configured credential. **Reuse the shared enqueue path**: the webhook
+  calls `trigger_build(state, repo, branch)` — the same fire-and-forget enqueue
+  used by `/build` and the poll loop, which coalesces against an in-flight `/sync`
+  build. Do **not** duplicate build logic.
 - **Branch delete** (`after` all-zeros / `deleted: true`) → clean up that ref's
   metadata; do not try to build a ref that no longer exists.
 - **Ping** → `200`. **Other** → ignore.
@@ -158,12 +157,14 @@ Phase 1 (GitHub) is implemented:
       `rust/src/webhook/github.rs`. GitLab + Gitea are follow-ups (same trait).
 - [x] `POST /webhooks/{provider}` in `server.rs` — raw-body handler, provider
       lookup, verify, parse, dispatch. Registered under `rate_limited`, *not*
-      behind `auth_middleware` (the HMAC is the auth).
-- [x] Factored `enqueue_sync(state, repo, branch, rev, cred)` out of
-      `sync_repo_inner`; both `/sync` and the webhook call it.
-- [x] Config: per-provider webhook secret (`RIPCLONE_WEBHOOK_SECRET_<ID>`) +
-      `StaticBroker` credential for private clones + optional
-      `RIPCLONE_WEBHOOK_ALLOWLIST`.
+      behind `auth_middleware` (the HMAC is the auth). `/v1/webhooks/github` is a
+      back-compat alias into the same receiver.
+- [x] Enqueue via the shared `trigger_build` path (also used by `/build` and the
+      poll loop), which coalesces with `/sync` — no duplicated build logic.
+- [x] Config: per-provider webhook secret (`RIPCLONE_WEBHOOK_SECRET_<ID>`, with
+      legacy `RIPCLONE_WEBHOOK_SECRET` honored for github) + `StaticBroker`
+      credential for private clones + optional `RIPCLONE_WEBHOOK_ALLOWLIST` +
+      `RIPCLONE_WEBHOOK_WARM_ALL` to warm every pushed branch.
 - [x] Branch-delete cleanup path (`RefStore::delete_branch`, file + S3 + caching
       impls).
 - [x] Tests: signature verify (valid / invalid / missing), GitHub parse, enqueue
@@ -181,9 +182,10 @@ and tag/release pre-warm (see [Events](#events--phase-1-vs-later)).
 - **Allowlist default:** allow-all (single-tenant trust) with a loud startup log
   warning that all pushed repos warm. Set `RIPCLONE_WEBHOOK_ALLOWLIST` to
   restrict. **Done.**
-- **Non-default-branch policy:** always warm the default branch; warm other
-  branches only if a build for them already exists (`ref_store.load_branch`).
-  **Done.**
+- **Non-default-branch policy:** always warm the default branch (from the payload
+  or, if absent, the local mirror's HEAD); warm other branches only if a build for
+  them already exists (`ref_store.load_branch`). `RIPCLONE_WEBHOOK_WARM_ALL=1`
+  opts into warming every pushed branch instead. **Done.**
 - **Multi-instance routing:** `{provider}` in the path is the `ProviderInstance`
   id (same lookup as `/v1/repos/{provider}/…`), and the secret is keyed per
   instance id — so several instances of the same kind each get their own

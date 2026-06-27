@@ -119,7 +119,14 @@ fn init_tracing() {
 }
 
 pub async fn start_server() -> Server {
-    start_server_inner(0).await
+    start_server_inner(0, &[]).await
+}
+
+/// Start a server with extra env vars (e.g. `RIPCLONE_WEBHOOK_SECRET`,
+/// `RIPCLONE_POLL_INTERVAL_SECS`) set only during construction, under
+/// `SERVER_START_LOCK`, so they can't leak into a concurrently-starting server.
+pub async fn start_server_env(extra: &[(&str, &str)]) -> Server {
+    start_server_inner(0, extra).await
 }
 
 /// Like `start_server`, but the server fails its first `fail_first` artifact
@@ -129,7 +136,7 @@ pub async fn start_server() -> Server {
 /// lock drops, so no other server is constructed while it is set — keeping the
 /// suite correct under parallel `cargo test`.
 pub async fn start_server_faulting(fail_first: usize) -> Server {
-    start_server_inner(fail_first).await
+    start_server_inner(fail_first, &[]).await
 }
 
 /// Serializes server *construction* (the brief startup window only, not whole
@@ -137,7 +144,7 @@ pub async fn start_server_faulting(fail_first: usize) -> Server {
 /// once at construction, can't leak into a concurrently-starting server.
 static SERVER_START_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-async fn start_server_inner(fail_first: usize) -> Server {
+async fn start_server_inner(fail_first: usize, extra_env: &[(&str, &str)]) -> Server {
     init_tracing();
     let dir = tempfile::tempdir().expect("server dir");
     let cas_dir = dir.path().join("cas");
@@ -151,6 +158,12 @@ async fn start_server_inner(fail_first: usize) -> Server {
         // concurrently-constructing server observes it.
         unsafe {
             std::env::set_var("RIPCLONE_TEST_FAIL_FIRST_FETCHES", fail_first.to_string());
+        }
+    }
+    // Same SAFETY: set under the lock, removed once the server has read them.
+    for (k, v) in extra_env {
+        unsafe {
+            std::env::set_var(k, v);
         }
     }
     tokio::spawn(async move {
@@ -173,6 +186,11 @@ async fn start_server_inner(fail_first: usize) -> Server {
     if fail_first > 0 {
         unsafe {
             std::env::remove_var("RIPCLONE_TEST_FAIL_FIRST_FETCHES");
+        }
+    }
+    for (k, _) in extra_env {
+        unsafe {
+            std::env::remove_var(k);
         }
     }
     drop(_start_guard);

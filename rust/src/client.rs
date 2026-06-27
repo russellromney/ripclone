@@ -756,8 +756,28 @@ impl Client {
         rev: Option<&str>,
         depth: Option<usize>,
     ) -> Result<RefResponse> {
+        self.sync_inner(repo_path, None, rev, depth).await
+    }
+
+    /// Sync a specific branch instead of the repo's default. Each branch is its
+    /// own ref + clonepack, so this lets several distinct builds for one repo run
+    /// at once (unlike `?rev=`, which the server folds into a single rolling slot).
+    pub async fn sync_branch(&self, repo_path: &str, branch: &str) -> Result<RefResponse> {
+        self.sync_inner(repo_path, Some(branch), None, None).await
+    }
+
+    async fn sync_inner(
+        &self,
+        repo_path: &str,
+        branch: Option<&str>,
+        rev: Option<&str>,
+        depth: Option<usize>,
+    ) -> Result<RefResponse> {
         let mut url = self.repo_url(repo_path, "/sync");
         let mut q: Vec<String> = Vec::new();
+        if let Some(b) = branch {
+            q.push(format!("branch={}", urlencoding::encode(b)));
+        }
         if let Some(d) = depth {
             q.push(format!("depth={}", d));
         }

@@ -42,6 +42,16 @@ impl MetaDb for LibsqlMeta {
             )
             .await
             .context("create refs table")?;
+        // Index for commit-keyed reuse (get_by_commit); the PK is (repo_key,
+        // branch), so a by-commit lookup would otherwise scan the repo's branches.
+        self.conn()
+            .await?
+            .execute(
+                "CREATE INDEX IF NOT EXISTS idx_refs_commit ON refs (repo_key, commit_id)",
+                (),
+            )
+            .await
+            .context("create refs commit index")?;
         Ok(())
     }
 
@@ -63,6 +73,27 @@ impl MetaDb for LibsqlMeta {
             })),
             None => Ok(None),
         }
+    }
+
+    async fn get_by_commit(&self, repo_key: &str, commit: &str) -> Result<Vec<RefRow>> {
+        let conn = self.conn().await?;
+        let mut rows = conn
+            .query(
+                "SELECT data, commit_id, synced_at FROM refs
+                 WHERE repo_key = ? AND commit_id = ?",
+                libsql::params![repo_key, commit],
+            )
+            .await
+            .context("get refs by commit")?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(RefRow {
+                data: row.get::<String>(0)?,
+                commit_id: row.get::<String>(1)?,
+                synced_at: row.get::<Option<i64>>(2)?,
+            });
+        }
+        Ok(out)
     }
 
     async fn save_ordered(

@@ -84,6 +84,10 @@ pub struct WebhookConfig {
     /// Allowlist of repo storage keys that may be warmed. `None` ⇒ allow all
     /// (single-tenant trust); `Some` ⇒ only listed repos.
     allowlist: Option<HashSet<String>>,
+    /// When true, warm every pushed branch (the original receiver's behavior)
+    /// instead of the default policy (default branch always; others only if
+    /// already tracked). Set by `RIPCLONE_WEBHOOK_WARM_ALL=1`.
+    warm_all: bool,
 }
 
 impl WebhookConfig {
@@ -104,12 +108,19 @@ impl WebhookConfig {
         Self {
             secrets,
             allowlist: None,
+            warm_all: false,
         }
     }
 
     /// Set the repo allowlist (chainable). Repos are matched by storage key.
     pub fn with_allowlist(mut self, repos: impl IntoIterator<Item = String>) -> Self {
         self.allowlist = Some(repos.into_iter().collect());
+        self
+    }
+
+    /// Set the warm-all policy (chainable).
+    pub fn with_warm_all(mut self, warm_all: bool) -> Self {
+        self.warm_all = warm_all;
         self
     }
 
@@ -127,12 +138,23 @@ impl WebhookConfig {
         for instance in registry.iter() {
             let id = instance.id.as_str();
             let var = format!("RIPCLONE_WEBHOOK_SECRET_{}", env_suffix(id));
-            if let Some(secret) = parse_secret(std::env::var(var).ok()) {
+            let mut value = std::env::var(var).ok();
+            // Back-compat: the original GitHub-only receiver used a single
+            // `RIPCLONE_WEBHOOK_SECRET`. Honor it as the secret for the built-in
+            // `github` instance when the per-provider var isn't set, so existing
+            // deployments keep working.
+            if value.is_none() && id == "github" {
+                value = std::env::var("RIPCLONE_WEBHOOK_SECRET").ok();
+            }
+            if let Some(secret) = parse_secret(value) {
                 secrets.insert(id.to_string(), secret);
             }
         }
 
         let allowlist = parse_allowlist(std::env::var("RIPCLONE_WEBHOOK_ALLOWLIST").ok());
+        let warm_all = std::env::var("RIPCLONE_WEBHOOK_WARM_ALL")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
 
         // Resolve the open questions with the recommended defaults, loudly.
         if secrets.is_empty() {
@@ -155,13 +177,22 @@ impl WebhookConfig {
             }
         }
 
-        Self { secrets, allowlist }
+        Self {
+            secrets,
+            allowlist,
+            warm_all,
+        }
     }
 
     /// The configured secret for a provider instance, if any. No secret ⇒ the
     /// handler must fail closed with 503.
     pub fn secret(&self, provider_id: &str) -> Option<&SecretString> {
         self.secrets.get(provider_id)
+    }
+
+    /// Whether to warm every pushed branch (vs the default-or-tracked policy).
+    pub fn warm_all(&self) -> bool {
+        self.warm_all
     }
 
     /// Whether a repo (by storage key) may be warmed. Allow-all when no
@@ -233,6 +264,7 @@ mod tests {
         let cfg = WebhookConfig {
             secrets: HashMap::new(),
             allowlist: Some(HashSet::from(["acme/widget".to_string()])),
+            warm_all: false,
         };
         assert!(cfg.allows("acme/widget"));
         assert!(!cfg.allows("acme/other"));

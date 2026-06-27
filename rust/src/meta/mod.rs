@@ -48,6 +48,12 @@ pub trait MetaDb: Send + Sync {
     /// Fetch the row for one ref, if present.
     async fn get(&self, repo_key: &str, branch: &str) -> Result<Option<RefRow>>;
 
+    /// All ref rows for this repo whose `commit_id` equals `commit` (one per
+    /// branch sitting at that commit). Powers commit-keyed reuse: a sync of one
+    /// branch can reuse a build another branch already produced for the same
+    /// commit. Indexed on `(repo_key, commit_id)`; no new write needed.
+    async fn get_by_commit(&self, repo_key: &str, commit: &str) -> Result<Vec<RefRow>>;
+
     /// Insert-or-update the row for one ref, applying the save-ordering policy
     /// ("a newer sync never loses to an older one") in a **single atomic
     /// statement** — no read-then-write TOCTOU. The write lands only when there
@@ -56,6 +62,9 @@ pub trait MetaDb: Send + Sync {
     /// `synced_at` on either side counts as "no ordering info" and the write
     /// proceeds. This mirrors [`should_replace_ref`](crate::ref_store) but
     /// enforced in SQL so concurrent writers across processes can't reorder.
+    ///
+    /// Pairs with the fetch-time `synced_at` stamping in `do_sync`: the stamp
+    /// makes "newer" mean "fetched later", and this enforces it atomically.
     async fn save_ordered(
         &self,
         repo_key: &str,
@@ -121,6 +130,23 @@ impl RefStore for SqlRefStore {
         }
     }
 
+    async fn load_build(&self, repo_id: &RepoId, commit: &str) -> Result<Option<RefInfo>> {
+        // The `commit_id` index narrows to rows at this commit; we then confirm a
+        // completed full build (some rows may be depth=1-only mid two-phase).
+        // First complete match wins.
+        for row in self
+            .db
+            .get_by_commit(&repo_id.storage_key(), commit)
+            .await?
+        {
+            let info: RefInfo = serde_json::from_str(&row.data).context("parse stored RefInfo")?;
+            if info.full_clonepack.commit == commit && !info.full_clonepack.manifest.is_empty() {
+                return Ok(Some(info));
+            }
+        }
+        Ok(None)
+    }
+
     async fn save_branch(&self, repo_id: &RepoId, branch: &str, info: &RefInfo) -> Result<()> {
         let repo_key = repo_id.storage_key();
         let data = serde_json::to_string(info).context("serialize RefInfo")?;
@@ -153,6 +179,18 @@ mod tests {
             synced_at,
             ..Default::default()
         }
+    }
+
+    /// A RefInfo with a *completed full* clonepack at `commit` — what commit-keyed
+    /// reuse (`load_build`) requires.
+    fn complete_build(commit: &str) -> RefInfo {
+        let mut info = ref_at(commit, Some(100));
+        info.full_clonepack = crate::ClonepackArtifacts {
+            commit: commit.to_string(),
+            manifest: "manifest-hash".to_string(),
+            ..Default::default()
+        };
+        info
     }
 
     /// The full RefStore lifecycle on a `SqlRefStore`, engine-agnostic. Run
@@ -204,6 +242,37 @@ mod tests {
         // A newer different-commit sync does overwrite.
         store.save(&rid, &ref_at("c3", Some(200))).await.unwrap();
         assert_eq!(store.load(&rid).await.unwrap().unwrap().commit, "c3");
+
+        // Commit-keyed reuse (get_by_commit): a completed full build is found by
+        // commit from any branch; an incomplete row and an unknown commit are not.
+        // Runs for every engine `exercise` covers.
+        store
+            .save_branch(&rid, "release", &complete_build("cf"))
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .load_build(&rid, "cf")
+                .await
+                .unwrap()
+                .expect("completed build reusable by commit")
+                .full_clonepack
+                .commit,
+            "cf"
+        );
+        assert!(
+            store
+                .load_build(&rid, "no-such-commit")
+                .await
+                .unwrap()
+                .is_none(),
+            "unknown commit yields None"
+        );
+        // "dev" was saved at c2 with an empty full_clonepack — not a reusable build.
+        assert!(
+            store.load_build(&rid, "c2").await.unwrap().is_none(),
+            "incomplete (depth=1-only) build must not be reused"
+        );
     }
 
     #[tokio::test]
@@ -214,6 +283,45 @@ mod tests {
             .await
             .unwrap();
         exercise(&store).await;
+    }
+
+    /// Commit-keyed reuse: a completed full build under one branch is found by
+    /// commit, so another branch at the same commit reuses it. Depth=1-only and
+    /// unknown commits return None.
+    #[tokio::test]
+    async fn sqlite_load_build_reuses_across_branches() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("meta.db").to_string_lossy().to_string();
+        let store = SqlRefStore::new(Box::new(SqliteMeta::connect(&path).await.unwrap()))
+            .await
+            .unwrap();
+        let rid = RepoId::github("o/r");
+
+        store
+            .save_branch(&rid, "foo", &complete_build("X"))
+            .await
+            .unwrap();
+        let reused = store.load_build(&rid, "X").await.unwrap();
+        assert_eq!(
+            reused.expect("reuse by commit").full_clonepack.commit,
+            "X",
+            "a completed full build is reusable across branches by commit"
+        );
+
+        assert!(
+            store.load_build(&rid, "Y").await.unwrap().is_none(),
+            "unknown commit yields None"
+        );
+
+        // A depth=1-only entry (empty full_clonepack) is not a reusable full build.
+        store
+            .save_branch(&rid, "bar", &ref_at("Z", Some(100)))
+            .await
+            .unwrap();
+        assert!(
+            store.load_build(&rid, "Z").await.unwrap().is_none(),
+            "incomplete build must not be reused"
+        );
     }
 
     #[tokio::test]

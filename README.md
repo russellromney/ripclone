@@ -129,24 +129,22 @@ The `github` in the path is the provider instance (see [Providers](#providers)).
 
 ripclone validates the `RIPCLONE_TOKEN`, syncs the mirror, builds artifacts for the new `HEAD`, and returns the artifact hashes.
 
-## Webhooks (push → warm, no CI Action)
+### Native push webhook (no per-repo workflow)
 
-Instead of the Action above, point a provider webhook straight at the server and pushes warm the cache automatically:
+Instead of (or alongside) the Actions workflow, point a provider webhook at the server so it builds on every push with nothing added to the consumer repo. Set a per-provider secret, then add a repository/org webhook:
 
-```
-provider push ─▶ POST /webhooks/{provider} ─▶ verify (HMAC over raw body) ─▶ enqueue sync ─▶ worker
-```
+- **Payload URL:** `https://ripclone.example.com/webhooks/github` (`/v1/webhooks/github` is a back-compat alias)
+- **Content type:** `application/json`
+- **Secret:** the value of `RIPCLONE_WEBHOOK_SECRET_GITHUB` (the legacy `RIPCLONE_WEBHOOK_SECRET` is still honored for github)
+- **Events:** the `push` event.
 
-Set a per-provider secret and point the provider at the endpoint:
+The server verifies the provider HMAC (`X-Hub-Signature-256`) over the raw body — constant-time, before any parse — then triggers a build via the same queue `/sync` uses, so artifacts are ready before any clone. Fail-closed: a provider with no configured secret returns `503`; a bad signature `401`. Branch deletes clean up that ref; tags/ping are acknowledged with no build.
 
-```bash
-# one secret per provider instance: RIPCLONE_WEBHOOK_SECRET_<ID>
-export RIPCLONE_WEBHOOK_SECRET_GITHUB=your-webhook-secret
-# then add a GitHub webhook: Payload URL https://<server>/webhooks/github,
-# content type application/json, secret = the value above.
-```
+By default the **default branch** is always warmed and other branches only if already built (so throwaway branches don't warm). Set `RIPCLONE_WEBHOOK_WARM_ALL=1` to warm every pushed branch, or `RIPCLONE_WEBHOOK_ALLOWLIST=owner/repo,other/repo` to restrict which repos warm. The receiver is provider-agnostic (GitHub today; GitLab/Gitea follow the same trait) — see [`docs/WEBHOOKS.md`](docs/WEBHOOKS.md).
 
-The receiver verifies the signature over the raw body (constant-time), then enqueues a sync onto the same build queue `/sync` uses — so warm-on-push is identical to the managed cloud. Fail-closed: a provider with no configured secret returns `503`; a bad signature returns `401`. By default every pushed repo is warmed (a loud startup log says so); set `RIPCLONE_WEBHOOK_ALLOWLIST=owner/repo,other/repo` to restrict it. Phase 1 is GitHub; GitLab and Gitea follow the same trait. See [`docs/WEBHOOKS.md`](docs/WEBHOOKS.md).
+### Polling fallback
+
+For repos without a webhook, or to catch a missed delivery, set `RIPCLONE_POLL_INTERVAL_SECS` (default `0` = off). The server periodically `ls-remote`s known repos and builds any whose tip moved. This is a backstop; webhooks/Actions are the prompt path.
 
 ## CLI usage
 
