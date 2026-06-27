@@ -581,6 +581,12 @@ pub fn build_app(state: ServerState) -> Router {
 /// `git-upload-pack` body and any other large POST payload.
 const MAX_REQUEST_BODY_BYTES: usize = 256 * 1024 * 1024;
 const MAX_UPLOAD_PACK_BODY_BYTES: usize = 256 * 1024 * 1024;
+/// Cap for a webhook request body. The HMAC can only be verified after the whole
+/// body is buffered, so this bounds what an unauthenticated caller can make the
+/// server hold before the signature is checked. GitHub's webhook payloads are
+/// capped at ~25 MiB; this is comfortably above that and far below the global
+/// request limit.
+const MAX_WEBHOOK_BODY_BYTES: usize = 25 * 1024 * 1024;
 
 /// Reject a client whose wire protocol is newer than this server understands,
 /// with a clear 426 instead of a confusing downstream error. A missing header
@@ -2213,14 +2219,18 @@ async fn webhook_handler(
         )
             .into_response();
     };
-    // Read the RAW body before any JSON parse — the HMAC covers these exact bytes.
-    let raw = match axum::body::to_bytes(body, MAX_REQUEST_BODY_BYTES).await {
+    // Read the RAW body before any JSON parse — the HMAC covers these exact
+    // bytes. Cap the buffer at `MAX_WEBHOOK_BODY_BYTES`: the signature can only
+    // be checked after the whole body is buffered, so an *unauthenticated*
+    // caller must not be able to make us hold the full 256 MiB request limit.
+    // GitHub caps webhook payloads well under this.
+    let raw = match axum::body::to_bytes(body, MAX_WEBHOOK_BODY_BYTES).await {
         Ok(b) => b,
         Err(e) => {
             return (
-                StatusCode::BAD_REQUEST,
+                StatusCode::PAYLOAD_TOO_LARGE,
                 Json(ErrorResponse {
-                    error: format!("read body failed: {e}"),
+                    error: format!("webhook body too large or unreadable: {e}"),
                 }),
             )
                 .into_response();
@@ -2277,6 +2287,12 @@ async fn webhook_dispatch_push(
         return webhook_ignored("non-branch ref");
     };
     let branch = branch.to_string();
+    // Validate the payload-derived branch before it reaches the queue / git.
+    // Contained already (storage keys are slugged and git re-validates), but
+    // keep the trust boundary explicit and skip a doomed enqueue+build.
+    if validation::validate_git_rev(&branch).is_err() {
+        return webhook_ignored("invalid branch");
+    }
     // Policy: always warm the default branch; warm other branches only if a
     // build for them already exists, so a webhook can't warm every throwaway
     // feature branch.
@@ -2337,6 +2353,10 @@ async fn webhook_dispatch_delete(
     if validation::validate_repo_path(provider, &repo_id).is_err() {
         return webhook_ignored("invalid repo path");
     }
+    // Note: cleanup deliberately does NOT apply the push allowlist. A repo that
+    // isn't allowlisted was never warmed, so `delete_branch` is a harmless no-op
+    // there; gating it would only risk leaving a stray ref if the allowlist
+    // changed after a build. Cleanup is always safe to run.
     let Some(branch) = event
         .ref_
         .strip_prefix("refs/heads/")
@@ -2344,6 +2364,9 @@ async fn webhook_dispatch_delete(
     else {
         return webhook_ignored("non-branch ref");
     };
+    if validation::validate_git_rev(branch).is_err() {
+        return webhook_ignored("invalid branch");
+    }
     // Drop the stored ref and any cached copy. Best-effort: a delete we can't
     // complete is logged, not surfaced to the provider (it would just retry).
     if let Err(e) = state.ref_store.delete_branch(&repo_id, branch).await {
@@ -6905,5 +6928,205 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn webhook_allowlist_allows_listed_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = test_state(&tmp);
+        let (queue, mut rx, depth) = crate::queue::LocalJobQueue::new(16);
+        state.build_queue = Arc::new(queue);
+        state.build_queue_depth = depth;
+        state.webhook_config = Arc::new(
+            WebhookConfig::with_secret("github", WEBHOOK_SECRET)
+                .with_allowlist(["acme/widget".to_string()]),
+        );
+        let app = build_app(state);
+        let body = gh_push_body(
+            "acme",
+            "widget",
+            "refs/heads/main",
+            &"1".repeat(40),
+            "main",
+            false,
+        );
+        let sig = gh_sign(WEBHOOK_SECRET, &body);
+        let resp = app
+            .oneshot(webhook_request("github", "push", Some(&sig), body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let job = rx.try_recv().expect("a listed repo enqueues");
+        assert_eq!(job.repo_id, RepoId::github("acme/widget"));
+    }
+
+    #[tokio::test]
+    async fn webhook_tag_push_is_ignored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, mut rx) = webhook_state(&tmp);
+        let app = build_app(state);
+        // A tag ref is not a branch; phase 1 warms branches only.
+        let body = gh_push_body(
+            "acme",
+            "widget",
+            "refs/tags/v1.0.0",
+            &"1".repeat(40),
+            "main",
+            false,
+        );
+        let sig = gh_sign(WEBHOOK_SECRET, &body);
+        let resp = app
+            .oneshot(webhook_request("github", "push", Some(&sig), body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(rx.try_recv().is_err(), "a tag push must not enqueue");
+    }
+
+    #[tokio::test]
+    async fn webhook_non_github_provider_returns_501() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = test_state(&tmp);
+        // Register a GitLab instance — phase 1 has no GitLab webhook adapter yet.
+        let mut registry = ProviderRegistry::new();
+        registry
+            .merge_one(crate::provider::ProviderConfig {
+                id: "gitlab".to_string(),
+                kind: Some("gitlab".to_string()),
+                host: Some("gitlab.com".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        state.provider_registry = registry;
+        // A secret is configured, but the kind has no adapter → 501 (before any
+        // verify), not 503.
+        state.webhook_config = Arc::new(WebhookConfig::with_secret("gitlab", WEBHOOK_SECRET));
+        let app = build_app(state);
+        let resp = app
+            .oneshot(webhook_request(
+                "gitlab",
+                "push",
+                Some("whatever"),
+                br#"{}"#.to_vec(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    }
+
+    #[tokio::test]
+    async fn webhook_tampered_body_returns_401() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, mut rx) = webhook_state(&tmp);
+        let app = build_app(state);
+        // Sign body A with the CORRECT secret, then deliver a different body B.
+        // This pins that the handler verifies over the raw bytes it received,
+        // not a re-serialized parse.
+        let body_a = gh_push_body(
+            "acme",
+            "widget",
+            "refs/heads/main",
+            &"1".repeat(40),
+            "main",
+            false,
+        );
+        let sig = gh_sign(WEBHOOK_SECRET, &body_a);
+        let body_b = gh_push_body(
+            "acme",
+            "widget",
+            "refs/heads/main",
+            &"2".repeat(40),
+            "main",
+            false,
+        );
+        assert_ne!(body_a, body_b);
+        let resp = app
+            .oneshot(webhook_request("github", "push", Some(&sig), body_b))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(rx.try_recv().is_err(), "a tampered body must not enqueue");
+    }
+
+    #[tokio::test]
+    async fn webhook_duplicate_pushes_coalesce_to_one_build() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, mut rx) = webhook_state(&tmp);
+        let app = build_app(state);
+        let body = gh_push_body(
+            "acme",
+            "widget",
+            "refs/heads/main",
+            &"1".repeat(40),
+            "main",
+            false,
+        );
+        let sig = gh_sign(WEBHOOK_SECRET, &body);
+        // Two identical signed pushes (no worker draining between them) must
+        // collapse onto a single queued build via the shared coalescing path.
+        let r1 = app
+            .clone()
+            .oneshot(webhook_request("github", "push", Some(&sig), body.clone()))
+            .await
+            .unwrap();
+        assert_eq!(r1.status(), StatusCode::OK);
+        let r2 = app
+            .oneshot(webhook_request("github", "push", Some(&sig), body))
+            .await
+            .unwrap();
+        assert_eq!(r2.status(), StatusCode::OK);
+        assert!(rx.try_recv().is_ok(), "first push enqueues a build");
+        assert!(
+            rx.try_recv().is_err(),
+            "the duplicate push coalesces — exactly one build"
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_tag_delete_is_ignored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, mut rx) = webhook_state(&tmp);
+        let app = build_app(state);
+        // A tag deletion (refs/tags/... with deleted:true) routes to the delete
+        // path but is not a branch — ignored, and never enqueues.
+        let body = gh_push_body(
+            "acme",
+            "widget",
+            "refs/tags/v1.0.0",
+            &"0".repeat(40),
+            "main",
+            true,
+        );
+        let sig = gh_sign(WEBHOOK_SECRET, &body);
+        let resp = app
+            .oneshot(webhook_request("github", "push", Some(&sig), body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(rx.try_recv().is_err(), "a tag delete must not enqueue");
+    }
+
+    #[tokio::test]
+    async fn webhook_hostile_branch_name_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, mut rx) = webhook_state(&tmp);
+        let app = build_app(state);
+        // A signed payload whose branch is a git-rev injection attempt must be
+        // refused before it reaches the queue (defense in depth).
+        let body = gh_push_body(
+            "acme",
+            "widget",
+            "refs/heads/--upload-pack=evil",
+            &"1".repeat(40),
+            "main",
+            false,
+        );
+        let sig = gh_sign(WEBHOOK_SECRET, &body);
+        let resp = app
+            .oneshot(webhook_request("github", "push", Some(&sig), body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(rx.try_recv().is_err(), "an invalid branch must not enqueue");
     }
 }

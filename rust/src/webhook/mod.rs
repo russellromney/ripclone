@@ -127,21 +127,12 @@ impl WebhookConfig {
         for instance in registry.iter() {
             let id = instance.id.as_str();
             let var = format!("RIPCLONE_WEBHOOK_SECRET_{}", env_suffix(id));
-            if let Some(secret) = std::env::var(var).ok().filter(|s| !s.is_empty()) {
-                secrets.insert(id.to_string(), SecretString::new(secret.into()));
+            if let Some(secret) = parse_secret(std::env::var(var).ok()) {
+                secrets.insert(id.to_string(), secret);
             }
         }
 
-        let allowlist = std::env::var("RIPCLONE_WEBHOOK_ALLOWLIST")
-            .ok()
-            .map(|raw| {
-                raw.split(',')
-                    .map(|s| s.trim())
-                    .filter(|s| !s.is_empty())
-                    .map(|s| s.to_string())
-                    .collect::<HashSet<_>>()
-            })
-            .filter(|set| !set.is_empty());
+        let allowlist = parse_allowlist(std::env::var("RIPCLONE_WEBHOOK_ALLOWLIST").ok());
 
         // Resolve the open questions with the recommended defaults, loudly.
         if secrets.is_empty() {
@@ -181,6 +172,29 @@ impl WebhookConfig {
             None => true,
         }
     }
+}
+
+/// Turn a raw env value into a secret. An absent **or empty** value yields no
+/// secret — fail closed: an empty `RIPCLONE_WEBHOOK_SECRET_*` must never be
+/// treated as a usable HMAC key (it would let anyone who knows it is empty forge
+/// a valid signature).
+fn parse_secret(raw: Option<String>) -> Option<SecretString> {
+    raw.filter(|s| !s.is_empty())
+        .map(|s| SecretString::new(s.into()))
+}
+
+/// Parse the comma-separated `RIPCLONE_WEBHOOK_ALLOWLIST` into a set of repo
+/// storage keys. Entries are trimmed; empty entries are dropped. An absent value
+/// or one that yields no entries returns `None` (allow-all).
+fn parse_allowlist(raw: Option<String>) -> Option<HashSet<String>> {
+    raw.map(|raw| {
+        raw.split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect::<HashSet<_>>()
+    })
+    .filter(|set| !set.is_empty())
 }
 
 /// Normalize a provider instance id into the `RIPCLONE_WEBHOOK_SECRET_<...>`
@@ -228,5 +242,30 @@ mod tests {
     fn no_secret_for_provider_is_none() {
         let cfg = WebhookConfig::empty();
         assert!(cfg.secret("github").is_none());
+    }
+
+    #[test]
+    fn parse_secret_rejects_absent_and_empty() {
+        use secrecy::ExposeSecret;
+        // Absent or empty ⇒ no secret (fail closed: never an empty HMAC key).
+        assert!(parse_secret(None).is_none());
+        assert!(parse_secret(Some(String::new())).is_none());
+        // A real value is kept verbatim.
+        let s = parse_secret(Some("hunter2".to_string())).expect("non-empty secret");
+        assert_eq!(s.expose_secret(), "hunter2");
+    }
+
+    #[test]
+    fn parse_allowlist_trims_and_drops_empties() {
+        // Absent ⇒ allow-all.
+        assert!(parse_allowlist(None).is_none());
+        // A value with only separators/whitespace yields no entries ⇒ allow-all.
+        assert!(parse_allowlist(Some("  , ,".to_string())).is_none());
+        // Entries are trimmed and empties dropped.
+        let set = parse_allowlist(Some(" a/b , c/d ,, ".to_string())).expect("non-empty set");
+        assert_eq!(set.len(), 2);
+        assert!(set.contains("a/b"));
+        assert!(set.contains("c/d"));
+        assert!(!set.contains(" a/b "), "entries must be trimmed");
     }
 }

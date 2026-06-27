@@ -818,4 +818,81 @@ mod tests {
         assert!(branches.contains(&"HEAD".to_string()));
         assert!(branches.contains(&"main".to_string()));
     }
+
+    #[tokio::test]
+    async fn file_ref_store_delete_branch_removes_and_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileRefStore::new(tmp.path());
+        let repo_id = RepoId::github("o/r");
+
+        store
+            .save_branch(&repo_id, "feature", &dummy_ref_info("c1"))
+            .await
+            .unwrap();
+        assert!(
+            store
+                .load_branch(&repo_id, "feature")
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        // First delete removes the stored ref.
+        store.delete_branch(&repo_id, "feature").await.unwrap();
+        assert!(
+            store
+                .load_branch(&repo_id, "feature")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // Deleting again (or a never-stored branch) is a no-op, not an error.
+        store.delete_branch(&repo_id, "feature").await.unwrap();
+        store
+            .delete_branch(&repo_id, "never-existed")
+            .await
+            .unwrap();
+
+        // HEAD is never deletable: a branch-delete must not orphan the repo.
+        store.save(&repo_id, &dummy_ref_info("head")).await.unwrap();
+        store.delete_branch(&repo_id, "HEAD").await.unwrap();
+        assert!(
+            store.load(&repo_id).await.unwrap().is_some(),
+            "HEAD ref must survive delete_branch(HEAD)"
+        );
+    }
+
+    #[tokio::test]
+    async fn caching_ref_store_delete_branch_evicts_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = CachingRefStore::new(FileRefStore::new(tmp.path()));
+        let repo_id = RepoId::github("o/r");
+
+        store
+            .save_branch(&repo_id, "feature", &dummy_ref_info("c1"))
+            .await
+            .unwrap();
+        // Prime the in-memory cache so a stale entry could survive a naive delete.
+        assert!(
+            store
+                .load_branch(&repo_id, "feature")
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        store.delete_branch(&repo_id, "feature").await.unwrap();
+
+        // The cached copy must be evicted, not just the backing file — otherwise
+        // a deleted branch would keep being served until the TTL expires.
+        assert!(
+            store
+                .load_branch(&repo_id, "feature")
+                .await
+                .unwrap()
+                .is_none(),
+            "delete must evict the cache, not serve a stale ref"
+        );
+    }
 }

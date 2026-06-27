@@ -173,6 +173,13 @@ mod tests {
         assert!(!GitHub.verify(&headers("push", Some("deadbeef")), body, secret));
         // Right prefix, non-hex payload.
         assert!(!GitHub.verify(&headers("push", Some("sha256=nothex")), body, secret));
+        // Valid hex, but the wrong length: 4 bytes vs the 32-byte MAC. This is
+        // the input that reaches the `ct_eq` length-mismatch branch — a
+        // truncated-but-decodable signature must not match.
+        assert!(!GitHub.verify(&headers("push", Some("sha256=deadbeef")), body, secret));
+        // Valid hex, correct 32-byte length, but wrong bytes.
+        let wrong_len_ok = format!("sha256={}", "00".repeat(32));
+        assert!(!GitHub.verify(&headers("push", Some(&wrong_len_ok)), body, secret));
     }
 
     #[test]
