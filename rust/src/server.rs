@@ -2293,10 +2293,21 @@ async fn webhook_dispatch_push(
     if validation::validate_git_rev(&branch).is_err() {
         return webhook_ignored("invalid branch");
     }
+    // Determine the repo's default branch. Prefer the payload, but fall back to
+    // the local mirror's HEAD (populated by any prior sync) when a provider
+    // omits it. GitHub always sends `default_branch`; the fallback keeps the
+    // policy correct for adapters/payloads that don't. A brand-new repo with
+    // neither is treated as untracked until first warmed via /sync.
+    let default_branch = event.default_branch.clone().or_else(|| {
+        let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
+        git::default_branch(&mirror_dir)
+            .ok()
+            .filter(|b| !b.is_empty())
+    });
     // Policy: always warm the default branch; warm other branches only if a
     // build for them already exists, so a webhook can't warm every throwaway
     // feature branch.
-    let is_default = event.default_branch.as_deref() == Some(branch.as_str());
+    let is_default = default_branch.as_deref() == Some(branch.as_str());
     if !is_default {
         let tracked = matches!(
             state.ref_store.load_branch(&repo_id, &branch).await,
@@ -2353,10 +2364,13 @@ async fn webhook_dispatch_delete(
     if validation::validate_repo_path(provider, &repo_id).is_err() {
         return webhook_ignored("invalid repo path");
     }
-    // Note: cleanup deliberately does NOT apply the push allowlist. A repo that
-    // isn't allowlisted was never warmed, so `delete_branch` is a harmless no-op
-    // there; gating it would only risk leaving a stray ref if the allowlist
-    // changed after a build. Cleanup is always safe to run.
+    // Gate cleanup by the same allowlist as push: the receiver only acts on
+    // in-scope repos, so an out-of-scope delete is ignored just like its push
+    // would be. (Such a repo was never warmed, so this is a no-op either way —
+    // applying the gate just keeps push and delete symmetric.)
+    if !state.webhook_config.allows(&repo_id.storage_key()) {
+        return webhook_ignored("repo not in webhook allowlist");
+    }
     let Some(branch) = event
         .ref_
         .strip_prefix("refs/heads/")
@@ -6652,6 +6666,23 @@ mod tests {
         .into_bytes()
     }
 
+    /// A push payload that omits `repository.default_branch` (as a non-GitHub
+    /// provider might), to exercise the mirror fallback.
+    fn gh_push_body_no_default(owner: &str, repo: &str, ref_: &str, after: &str) -> Vec<u8> {
+        serde_json::json!({
+            "ref": ref_,
+            "after": after,
+            "deleted": false,
+            "repository": {
+                "name": repo,
+                "owner": {"login": owner},
+                "private": false
+            }
+        })
+        .to_string()
+        .into_bytes()
+    }
+
     /// A test state whose local-queue receiver is kept alive (so an enqueue
     /// succeeds instead of reporting Full) with a configured `github` webhook
     /// secret. Returns the receiver so a test can assert what was enqueued.
@@ -7128,5 +7159,104 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(rx.try_recv().is_err(), "an invalid branch must not enqueue");
+    }
+
+    #[tokio::test]
+    async fn webhook_default_branch_resolved_from_mirror_when_payload_omits_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, mut rx) = webhook_state(&tmp);
+        // A prior sync leaves a bare mirror whose HEAD names the default branch.
+        // Recreate that so the handler can resolve the default without a payload
+        // `default_branch` field.
+        let mirror = state
+            .repo_root
+            .join(RepoId::github("acme/widget").mirror_dir_name());
+        gix::init_bare(&mirror).unwrap();
+        std::fs::write(mirror.join("HEAD"), b"ref: refs/heads/trunk\n").unwrap();
+        let app = build_app(state);
+        // Push to the default branch ("trunk") with no default_branch in payload.
+        let body = gh_push_body_no_default("acme", "widget", "refs/heads/trunk", &"1".repeat(40));
+        let sig = gh_sign(WEBHOOK_SECRET, &body);
+        let resp = app
+            .oneshot(webhook_request("github", "push", Some(&sig), body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let job = rx
+            .try_recv()
+            .expect("default branch resolved from the mirror is warmed");
+        assert_eq!(job.branch, "trunk");
+    }
+
+    #[tokio::test]
+    async fn webhook_no_default_no_mirror_untracked_is_ignored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, mut rx) = webhook_state(&tmp);
+        let app = build_app(state);
+        // No payload default_branch, no mirror, branch not tracked → can't prove
+        // it's the default, so it is not warmed (fail-safe).
+        let body =
+            gh_push_body_no_default("acme", "widget", "refs/heads/whatever", &"1".repeat(40));
+        let sig = gh_sign(WEBHOOK_SECRET, &body);
+        let resp = app
+            .oneshot(webhook_request("github", "push", Some(&sig), body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            rx.try_recv().is_err(),
+            "unknowable default + untracked → ignored"
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_delete_outside_allowlist_is_ignored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = test_state(&tmp);
+        let (queue, _rx, depth) = crate::queue::LocalJobQueue::new(16);
+        state.build_queue = Arc::new(queue);
+        state.build_queue_depth = depth;
+        state.webhook_config = Arc::new(
+            WebhookConfig::with_secret("github", WEBHOOK_SECRET)
+                .with_allowlist(["acme/allowed".to_string()]),
+        );
+        // This repo is NOT on the allowlist but happens to have a stored ref.
+        let repo = RepoId::github("acme/widget");
+        let info = RefInfo {
+            commit: "deadbeef".to_string(),
+            default_branch: "main".to_string(),
+            ..Default::default()
+        };
+        state
+            .ref_store
+            .save_branch(&repo, "feature", &info)
+            .await
+            .unwrap();
+        let ref_store = state.ref_store.clone();
+        let app = build_app(state);
+        let body = gh_push_body(
+            "acme",
+            "widget",
+            "refs/heads/feature",
+            &"0".repeat(40),
+            "main",
+            true,
+        );
+        let sig = gh_sign(WEBHOOK_SECRET, &body);
+        let resp = app
+            .oneshot(webhook_request("github", "push", Some(&sig), body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // Delete is gated by the allowlist just like push: out-of-scope repo is
+        // left untouched.
+        assert!(
+            ref_store
+                .load_branch(&repo, "feature")
+                .await
+                .unwrap()
+                .is_some(),
+            "out-of-scope delete must not mutate refs"
+        );
     }
 }
