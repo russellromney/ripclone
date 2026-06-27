@@ -123,13 +123,19 @@ pub fn open_sync_repo<P: AsRef<Path>>(path: P) -> Result<gix::ThreadSafeReposito
     })
 }
 
-/// Resolve a revision expression to a full hex sha.
+/// Resolve a revision expression to a full hex sha of the commit it points to.
+/// Annotated tags are peeled to their target commit.
 pub fn resolve_commit<P: AsRef<Path>>(repo_path: P, rev: &str) -> Result<String> {
     let repo = open_repo(repo_path)?;
     let id = repo
         .rev_parse_single(rev)
         .with_context(|| format!("resolving rev '{}'", rev))?;
-    Ok(id.to_string())
+    let commit = id
+        .object()
+        .with_context(|| format!("finding object for '{}'", rev))?
+        .peel_to_commit()
+        .with_context(|| format!("peeling '{}' to a commit", rev))?;
+    Ok(commit.id.to_string())
 }
 
 /// Return the name of the current branch (e.g. `main`).

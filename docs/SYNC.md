@@ -1,10 +1,10 @@
 # Sync: fast, non-blocking, idempotent
 
-Status: **design, not built.** The model below is the target. It is a re-wiring
-and hardening of primitives ripclone already has (content-addressed CAS, CDC
-dedup, read-only builds, the resolve-path lock pattern, the `commit_id` column,
-the `remote_gc` mark-sweep) — not new machinery. File:line references are to
-`origin/main` and were verified by audit (see "What we verified").
+Status: **partially shipped.** The core commit-keyed no-op/reuse path, the
+`ls-remote` pre-check, the lock-shrink, and the monotonic publish guard are all
+built. The remaining items are the debounce layer and hardening `remote_gc`.
+File:line references are to `origin/main` and were verified by audit (see "What
+we verified").
 
 ## Decision
 
@@ -95,22 +95,17 @@ one `ls-remote` and we stay polite to upstream.
 
 ### 2. Commit-keyed no-op
 
-The no-op check is **branch-scoped** today: `load_branch(repo_id, branch)` then
-`prev.full_clonepack.commit == commit` (`server.rs:3334`). So branch `foo` built
-at commit X cannot satisfy a sync of branch `bar` at the same X — `bar` rebuilds
-from scratch.
+The no-op check is **branch-scoped** for normal tip builds (`load_branch(repo_id,
+branch)` then `prev.full_clonepack.commit == commit`). Rev-targeted builds
+(`sync --at <rev>` / `sync?rev=...`) use a **commit-keyed** ref-store key
+(`{branch}#{commit}`), so different revs that resolve to the same commit share a
+build and stale rev-keyed entries from older server versions are ignored.
 
-The artifacts are already commit-independent in CAS (`cas.rs:50`, SHA-256,
-idempotent put); only the *index* is branch-keyed. Add a `commit → RefInfo`
-pointer written at publish time and read in the fast path:
-
-- Object-store form: `builds/{repo}/{commit}.json` (mirrors
-  `refs/{repo}/{branch}.json` at `ref_store.rs:271`).
-- SQL form: a `builds` table keyed `(repo_key, commit_id)`, or a `get_by_commit`
-  on `MetaDb` (the `commit_id` column already exists, `meta/sqlite.rs:38`).
-
-No rebuild, no artifact-format change — the data exists, it just isn't indexed by
-commit.
+The artifacts are already commit-independent in CAS (SHA-256, idempotent put);
+only the *index* is branch-keyed. The fast path now scans branch refs for any
+completed full build at the requested commit (`RefStore::load_build`), implemented
+for the file, S3, and SQL metadata stores. This lets branch `foo` built at commit
+X satisfy a sync of branch `bar` at the same X without a rebuild.
 
 ### 3. Concurrent read-only builds (shrink the lock)
 
@@ -255,7 +250,7 @@ Three fixes to make it safe and on:
 |---|---|---|
 | Read-only builds safe while fetch appends + other reads run | **Safe with changes** | builds read mirror, write temp+CAS; resolve path already drops lock post-fetch (`server.rs:1380`); but auto-gc not disabled (`git.rs:1145`,`:1159`) and commit-graph/bitmap mutate the mirror (`server.rs:3358`,`:3388`) |
 | Monotonic publish without storage CAS | **Feasible, cheap** | overwrite is non-corrupting; `commit_id`/generation already available; guard is in-memory before `save_branch` (`server.rs:3929`) |
-| Commit-keyed lookup + reuse | **Feasible, mostly indexing** | no-op is branch-scoped (`server.rs:3334`); artifacts already content-addressed (`cas.rs:50`); needs a `commit→RefInfo` index |
+| Commit-keyed lookup + reuse | **Shipped** | no-op is branch-scoped for tip builds; rev builds use commit-keyed keys; `RefStore::load_build` scans branch refs for file/S3/SQL metadata stores |
 | GC of superseded commits | **~80% exists** | `remote_gc.rs` mark-sweep + CDC dedup; off by default; grace is mtime-based, not unreachable-since |
 
 ## Phasing
@@ -319,9 +314,9 @@ dispatcher. The worker stays dumb: claim → build → ack.
 - **Fairness across repos/tenants.** The claim is global FIFO today; a hot repo
   can starve others. Pick oldest among repos not currently building? Defer until
   the pool exists and we can measure.
-- **Concurrent builds chaining off each other.** Reuse discovery is branch-scoped
-  (`load_branch`), so two concurrent builds reuse the shared *prior* baseline but
-  not each other's new output. Chaining (look up the parent commit's build via the
-  commit index) is an optimization, not required for the core win.
+- **Concurrent builds chaining off each other.** Reuse discovery now falls back
+  to a commit-keyed scan (`load_build`), so two concurrent builds can reuse any
+  completed build at the same commit. Chaining off a parent commit's build is an
+  incremental-history optimization, not required for the core win.
 - **`ls-remote` tip cache TTL.** What window balances freshness vs upstream
   chatter for very poll-heavy clients?

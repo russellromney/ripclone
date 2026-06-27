@@ -6,8 +6,8 @@ REPO="${REPO:-oven-sh/bun}"
 BANDWIDTH="${BANDWIDTH:-250}"
 RTT_MS="${RTT_MS:-50}"
 CORES="${CORES:-4}"
-RIPCLONE_TOKEN="${RIPCLONE_TOKEN:-bench-token}"
-export RIPCLONE_TOKEN
+RIPCLONE_SERVER_TOKEN="${RIPCLONE_SERVER_TOKEN:-${RIPCLONE_TOKEN:-bench-token}}"
+export RIPCLONE_SERVER_TOKEN
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
@@ -48,7 +48,7 @@ echo "sync=$((sync_end - sync_start)) ms"
 # Artifact sizes
 OWNER="$(echo "$REPO" | cut -d/ -f1)"
 NAME="$(echo "$REPO" | cut -d/ -f2)"
-TOKEN_HASH=$(printf '%s' "$RIPCLONE_TOKEN" | shasum -a 256 | awk '{print $1}')
+TOKEN_HASH=$(printf '%s' "$RIPCLONE_SERVER_TOKEN" | shasum -a 256 | awk '{print $1}')
 ref_json=$(curl -fsS -H "Authorization: Ripclone $TOKEN_HASH" "$SERVER_URL/v1/repos/$OWNER/$NAME/refs/HEAD")
 clonepack_manifest=$(echo "$ref_json" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("clonepack_manifest",""))')
 echo "clonepack manifest: $clonepack_manifest"

@@ -290,6 +290,23 @@ impl RefStore for FileRefStore {
         Ok(out)
     }
 
+    async fn load_build(&self, repo_id: &RepoId, commit: &str) -> Result<Option<RefInfo>> {
+        // Commit-keyed reuse: scan branch refs for any completed full build at this
+        // commit. This is a cold fallback (only invoked when the requesting branch
+        // lacks a usable build), so a directory scan is acceptable.
+        let branches = self.list_branches(repo_id).await?;
+        for branch in branches {
+            if let Some(info) = self.load_branch(repo_id, &branch).await?
+                && info.full_clonepack.commit == commit
+                && !info.full_clonepack.manifest.is_empty()
+                && !info.archive_chunks.is_empty()
+            {
+                return Ok(Some(info));
+            }
+        }
+        Ok(None)
+    }
+
     async fn health(&self) -> Result<()> {
         // Write+read probe of the ref-store root, off the async worker. Catches
         // an unmounted/removed/read-only/full data volume — not just a missing
@@ -483,6 +500,32 @@ impl RefStore for S3RefStore {
         out.sort();
         out.dedup();
         Ok(out)
+    }
+
+    async fn load_build(&self, repo_id: &RepoId, commit: &str) -> Result<Option<RefInfo>> {
+        // Commit-keyed reuse: scan branch refs for any completed full build at this
+        // commit. This is a cold fallback (only invoked when the requesting branch
+        // lacks a usable build), so an S3 list + per-key GET is acceptable.
+        let prefix = self.branch_prefix(repo_id);
+        let keys = self
+            .storage
+            .list_objects(&prefix)
+            .await
+            .context("list S3 ref store for commit-keyed reuse")?;
+        for key in keys {
+            if !key.ends_with(".json") || key == format!("{}HEAD.json", prefix) {
+                continue;
+            }
+            if let Ok(Some((_, data))) = self.storage.get_object(&key).await
+                && let Ok(info) = serde_json::from_slice::<RefInfo>(&data)
+                && info.full_clonepack.commit == commit
+                && !info.full_clonepack.manifest.is_empty()
+                && !info.archive_chunks.is_empty()
+            {
+                return Ok(Some(info));
+            }
+        }
+        Ok(None)
     }
 
     async fn health(&self) -> Result<()> {

@@ -16,7 +16,8 @@ for bin in "$SERVER_BIN" "$CLI_BIN"; do
   [ -x "$bin" ] || { echo "error: missing binary $bin (cargo build --release)"; exit 1; }
 done
 
-export RIPCLONE_TOKEN="${RIPCLONE_TOKEN:-e2e-local-token}"
+export RIPCLONE_SERVER_TOKEN="${RIPCLONE_SERVER_TOKEN:-${RIPCLONE_TOKEN:-e2e-local-token}}"
+export RIPCLONE_TOKEN="$RIPCLONE_SERVER_TOKEN"
 # This script does `sync` then immediately `clone`. Production defaults to
 # asynchronous, two-phase builds, where `sync` returns before the clonepack is
 # ready (the clone would then fail "ref is missing clonepack manifest"). Pin
@@ -29,7 +30,7 @@ export RIPCLONE_TWO_PHASE=0
 # documented trust-mode escape hatch (the shared token is the only auth here).
 export RIPCLONE_TRUST_GATEWAY=1
 sha256() { if command -v sha256sum >/dev/null; then sha256sum | awk '{print $1}'; else shasum -a 256 | awk '{print $1}'; fi; }
-TOKEN_HASH=$(printf '%s' "$RIPCLONE_TOKEN" | sha256)
+TOKEN_HASH=$(printf '%s' "$RIPCLONE_SERVER_TOKEN" | sha256)
 
 BASE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ripclone-e2e-local.XXXXXX")"
 ORIGIN_ROOT="$BASE_DIR/origins"

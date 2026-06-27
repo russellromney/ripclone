@@ -19,11 +19,12 @@ for bin in "$RIPCLONE" "$SERVER"; do
   fi
 done
 
-if [ -z "${RIPCLONE_TOKEN:-}" ]; then
-  echo "error: RIPCLONE_TOKEN must be set (server is fail-closed)"
+RIPCLONE_SERVER_TOKEN="${RIPCLONE_SERVER_TOKEN:-${RIPCLONE_TOKEN:-}}"
+if [ -z "$RIPCLONE_SERVER_TOKEN" ]; then
+  echo "error: RIPCLONE_SERVER_TOKEN must be set (server is fail-closed)"
   exit 1
 fi
-AUTH_HASH=$(printf '%s' "$RIPCLONE_TOKEN" | shasum -a 256 | awk '{print $1}')
+AUTH_HASH=$(printf '%s' "$RIPCLONE_SERVER_TOKEN" | shasum -a 256 | awk '{print $1}')
 CURL_AUTH=(-H "Authorization: Ripclone $AUTH_HASH")
 
 file_size() {

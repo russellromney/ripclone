@@ -1522,22 +1522,21 @@ async fn get_ref_inner(
         branch.clone()
     };
 
-    // Load the stored info, if any. A rev request loads the rolling test key the
-    // matching `sync?rev=...` stored under (isolated from the real branch entry).
-    let store_key = ref_store_key(&effective_branch, params.rev.as_deref());
-    let fallback = state
-        .ref_store
-        .load_branch(&repo_id, &store_key)
-        .await
-        .ok()
-        .flatten();
-
     let resolve_target2 = resolve_target.clone();
     let mirror_dir2 = mirror_dir.clone();
     match tokio::task::spawn_blocking(move || git::resolve_commit(&mirror_dir2, &resolve_target2))
         .await
     {
         Ok(Ok(commit)) => {
+            // Load the stored info, if any. A rev request uses a commit-keyed
+            // rolling key so it never reuses a stale rev-keyed build.
+            let store_key = ref_store_key(&effective_branch, params.rev.as_deref(), Some(&commit));
+            let fallback = state
+                .ref_store
+                .load_branch(&repo_id, &store_key)
+                .await
+                .ok()
+                .flatten();
             // Only reuse stored artifact hashes when they match the resolved
             // commit; otherwise we would hand out signed URLs for stale chunks.
             let fallback = fallback.filter(|info| info.commit == commit);
@@ -2145,7 +2144,12 @@ async fn sync_repo_inner(
                     } else {
                         branch.clone()
                     };
-                    let load_key = ref_store_key(&effective_branch, at_rev.as_deref());
+                    let load_key = if let Some(rev) = at_rev.as_deref() {
+                        let commit = git::resolve_commit(&mirror_dir, rev).ok();
+                        ref_store_key(&effective_branch, Some(rev), commit.as_deref())
+                    } else {
+                        effective_branch.clone()
+                    };
                     match state.ref_store.load_branch(&repo_id, &load_key).await {
                         Ok(Some(info)) => {
                             state.metrics.record_sync(start.elapsed());
@@ -2208,7 +2212,7 @@ async fn sync_repo_inner(
             //
             // The rev override is not carried across the queue (not persisted; the
             // worker builds the branch tip), so honoring `?rev=` here would build
-            // the wrong commit and then fail to find the `branch#atrev` ref.
+            // the wrong commit and then fail to find the `branch#<rev>` ref.
             // Reject it explicitly rather than mis-build. Use the local queue for
             // rev-targeted builds.
             if at_rev.is_some() {
@@ -2292,7 +2296,7 @@ async fn sync_repo_inner(
                             .invalidate(&repo_id, &effective_branch)
                             .await;
                         invalidate_ref_response_cache(&state, &repo_id, &effective_branch);
-                        let load_key = ref_store_key(&effective_branch, at_rev.as_deref());
+                        let load_key = ref_store_key(&effective_branch, at_rev.as_deref(), None);
                         match state.ref_store.load_branch(&repo_id, &load_key).await {
                             // Guard on a non-empty commit: a HEAD row can exist as
                             // a build_status placeholder (empty commit). Never
@@ -3247,17 +3251,18 @@ enum DepthBuild {
     Lsm(crate::pack::IncrementalPacks),
 }
 
-/// Ref-store key for a build. Rev-targeted builds (sync/clone `--at <rev>`) use a
-/// rolling test key so they never overwrite the real branch entry that normal
-/// tip clients depend on; sequential rev syncs still share this key, so they stay
-/// incremental (each rev build's prev is the previous rev build). Tip builds use
-/// the branch directly. The git ref-name grammar forbids `#`, so this can never
-/// collide with a real branch.
-fn ref_store_key(branch: &str, at_rev: Option<&str>) -> String {
-    if at_rev.is_some() {
-        format!("{branch}#atrev")
-    } else {
-        branch.to_string()
+/// Ref-store key for a build. Rev-targeted builds (sync/clone `--at <rev>`) use
+/// a commit-keyed rolling key (`{branch}#{commit}`) so they never overwrite the
+/// real branch entry and never get stuck reusing a stale/incomplete rev-keyed
+/// build from an older server version. Sequential rev syncs at the same commit
+/// still share this key, so they stay incremental. Tip builds use the branch
+/// directly. The git ref-name grammar forbids `#`, so this can never collide
+/// with a real branch.
+fn ref_store_key(branch: &str, at_rev: Option<&str>, commit: Option<&str>) -> String {
+    match (at_rev, commit) {
+        (Some(_), Some(commit)) => format!("{branch}#{commit}"),
+        (Some(rev), None) => format!("{branch}#{rev}"),
+        (None, _) => branch.to_string(),
     }
 }
 
@@ -3629,7 +3634,19 @@ async fn reuse_existing_build(
         && prev.full_clonepack.commit == commit
         && !prev.full_clonepack.manifest.is_empty()
     {
-        return Some(prev);
+        // A completed full build with no archive chunks is incomplete from the
+        // current server's point of view (files mode needs the zstd archive).
+        // Reusing it would leave files-mode clients polling forever. If the
+        // build is still in progress we reuse and let the client wait for the
+        // background archive phase.
+        let archive_in_progress = prev.archive_chunks.is_empty()
+            && prev
+                .build_status
+                .as_ref()
+                .is_some_and(|s| s == "full history building" || s == "archive building");
+        if !prev.archive_chunks.is_empty() || archive_in_progress {
+            return Some(prev);
+        }
     }
     if let Ok(Some(mut built)) = ref_store.load_build(repo_id, commit).await {
         // Re-point the branch at this build. Reuse only fires when `commit` is the
@@ -3795,10 +3812,11 @@ async fn do_sync(
         branch
     };
 
-    // Ref-store key. Rev builds use a rolling test key so they never overwrite
-    // the real branch entry; everything below stores/loads under this key. The
-    // mirror fetch + commit resolution above used the real branch/rev.
-    let ref_key = ref_store_key(branch, at_rev);
+    // Ref-store key. Rev builds use a commit-keyed rolling key so they never
+    // overwrite the real branch entry and never get stuck reusing a stale
+    // rev-keyed build; everything below stores/loads under this key. The mirror
+    // fetch + commit resolution above used the real branch/rev.
+    let ref_key = ref_store_key(branch, at_rev, Some(&commit));
     let branch = ref_key.as_str();
 
     // No-op fast path: if a *completed full* build already exists for exactly

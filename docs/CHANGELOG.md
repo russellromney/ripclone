@@ -16,6 +16,18 @@ This file tracks what has already landed in ripclone. For upcoming work see `ROA
 - **ripclone is now licensed `MIT OR Apache-2.0`** (the Rust ecosystem default): `license` set in `rust/Cargo.toml`, with `LICENSE-MIT` and `LICENSE-APACHE` at the repo root. This also unblocks crates.io/PyPI publishing.
 - **cargo-deny now enforces a permissive license allow-list** (`rust/deny.toml`) — a new dependency under a copyleft or unlisted license fails CI for a human to evaluate.
 
+## Benchmark harness
+
+- **`benchmark/fly_shaped_benchmark.sh`** now prints the resolved commit in its header instead of `commit=latest`, and prefers `RIPCLONE_SERVER_TOKEN` (falling back to the deprecated `RIPCLONE_TOKEN`).
+- Documentation and example workflow updated to use `RIPCLONE_SERVER_TOKEN` consistently.
+
+## Sync / ref-store correctness
+
+- **Commit-keyed ref-store keys for rev-targeted builds** (`rust/src/server.rs`): `sync --at <rev>` and `sync?rev=<rev>` now store artifacts under `{branch}#{commit}` instead of `{branch}#{rev}`. This prevents stale/incomplete rev-keyed refs from blocking future syncs of the same tag and makes different revs that resolve to the same commit share a build.
+- **Commit-keyed reuse for file and S3 metadata stores** (`rust/src/ref_store.rs`): `RefStore::load_build` is now implemented for `FileRefStore` and `S3RefStore`, so a sync of branch `bar` can reuse a completed build of branch `foo` at the same commit instead of rebuilding.
+- **Don't reuse completed builds that lack a files archive** (`rust/src/server.rs`): `reuse_existing_build` no longer returns a full clonepack whose archive chunks are empty (unless archive generation is still in progress), which previously left files-mode clones polling forever.
+- **git index-pack fallback** (`rust/src/git.rs`): when gix fails to index a pack containing ref deltas (e.g. `oven-sh/bun`), ripclone falls back to the stock `git index-pack` subprocess.
+
 ## Version reconciliation (CLI ↔ server)
 
 - **`ripclone --version` and `ripclone-server --version`** now report the build version (they previously errored).

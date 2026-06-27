@@ -3,7 +3,7 @@
 #
 # Set these in the *consumer* repo:
 #   - Repository variable: RIPCLONE_URL (e.g. https://ripclone.example.com)
-#   - Repository secret:   RIPCLONE_TOKEN (the SHA-256 hash of the token
+#   - Repository secret:   RIPCLONE_SERVER_TOKEN (the SHA-256 hash of the token
 #                          configured on the ripclone server)
 #
 # For private repos, the ripclone server itself must be configured with
@@ -23,5 +23,5 @@ jobs:
       - name: Trigger ripclone sync
         run: |
           curl -fsSL -X POST \
-            -H "Authorization: Ripclone ${{ secrets.RIPCLONE_TOKEN }}" \
+            -H "Authorization: Ripclone ${{ secrets.RIPCLONE_SERVER_TOKEN }}" \
             "${{ vars.RIPCLONE_URL }}/v1/repos/${{ github.repository_owner }}/${{ github.event.repository.name }}/sync"

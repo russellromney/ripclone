@@ -9,15 +9,15 @@ set -euo pipefail
 #
 # Usage (typically run on the Fly ripclone-client-dev machine):
 #   RIPCLONE_URL=https://ripclone-server-dev.fly.dev \
-#   RIPCLONE_TOKEN=... \
+#   RIPCLONE_SERVER_TOKEN=... \
 #   ./benchmark/run_shaped_sweep.sh [repos] [rates] [runs]
 #
 #   SHAPED=0 RIPCLONE_URL=https://ripclone-server-dev.fly.dev \
-#   RIPCLONE_TOKEN=... \
+#   RIPCLONE_SERVER_TOKEN=... \
 #   ./benchmark/run_shaped_sweep.sh "oven-sh/bun pandas-dev/pandas" "1000" 3
 #
 #   BENCH_REF=v2.2.2 RIPCLONE_URL=https://ripclone-server-dev.fly.dev \
-#   RIPCLONE_TOKEN=... \
+#   RIPCLONE_SERVER_TOKEN=... \
 #   ./benchmark/run_shaped_sweep.sh "pandas-dev/pandas" "1000" 1
 #
 # Environment:

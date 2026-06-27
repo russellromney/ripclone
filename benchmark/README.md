@@ -15,7 +15,7 @@ This directory contains standalone benchmarks and verification scripts. They ass
 
   ```bash
   RIPCLONE_URL=https://ripclone-server-dev.fly.dev \
-  RIPCLONE_TOKEN=... \
+  RIPCLONE_SERVER_TOKEN=... \
   ./benchmark/run_shaped_sweep.sh "oven-sh/bun pandas-dev/pandas" "1000 500 250 100 50" 3
   ```
 
@@ -23,7 +23,7 @@ This directory contains standalone benchmarks and verification scripts. They ass
 
   ```bash
   SHAPED=0 RIPCLONE_URL=https://ripclone-server-dev.fly.dev \
-  RIPCLONE_TOKEN=... \
+  RIPCLONE_SERVER_TOKEN=... \
   ./benchmark/run_shaped_sweep.sh "oven-sh/bun" "1000" 3
   ```
 
@@ -32,7 +32,7 @@ This directory contains standalone benchmarks and verification scripts. They ass
 
   ```bash
   BENCH_REF=v2.2.2 RIPCLONE_URL=https://ripclone-server-dev.fly.dev \
-  RIPCLONE_TOKEN=... \
+  RIPCLONE_SERVER_TOKEN=... \
   ./benchmark/run_shaped_sweep.sh "pandas-dev/pandas" "1000" 1
   ```
 
@@ -57,7 +57,7 @@ This directory contains standalone benchmarks and verification scripts. They ass
 Most scripts read:
 
 - `REPO` — target repo in `owner/name` form (default `oven-sh/bun`).
-- `RIPCLONE_TOKEN` — bearer token for the server.
+- `RIPCLONE_SERVER_TOKEN` — bearer token for the server. Falls back to the deprecated `RIPCLONE_TOKEN`.
 - `RIPCLONE_URL` — server URL for remote/Fly benchmarks.
 - `BENCH_REF` — tag/commit/branch to sync and benchmark (default: repo default branch).
 - `SHAPED` — set to `0` to disable traffic shaping.

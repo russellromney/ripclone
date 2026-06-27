@@ -152,7 +152,7 @@ cargo run --release --bin ripclone -- worktree ../bun-wt -b HEAD
 
 ## GitHub Actions trigger
 
-Add a workflow to a repo so ripclone builds artifacts on every push. Set `RIPCLONE_URL` as a repository variable and `RIPCLONE_TOKEN` as a repository secret. (A ready-to-copy version lives in [`docs/examples/github-actions-trigger.yml`](docs/examples/github-actions-trigger.yml).)
+Add a workflow to a repo so ripclone builds artifacts on every push. Set `RIPCLONE_URL` as a repository variable and `RIPCLONE_SERVER_TOKEN` as a repository secret. (A ready-to-copy version lives in [`docs/examples/github-actions-trigger.yml`](docs/examples/github-actions-trigger.yml).)
 
 ```yaml
 name: ripclone cache
@@ -164,13 +164,13 @@ jobs:
       - name: Trigger ripclone sync
         run: |
           curl -fsSL -X POST \
-            -H "Authorization: Ripclone ${{ secrets.RIPCLONE_TOKEN }}" \
+            -H "Authorization: Ripclone ${{ secrets.RIPCLONE_SERVER_TOKEN }}" \
             "${{ vars.RIPCLONE_URL }}/v1/repos/github/${{ github.repository_owner }}/${{ github.event.repository.name }}/sync"
 ```
 
 The `github` in the path is the provider instance (see [Providers](#providers)). For private repos the server needs read access to the upstream — configure a token for the provider, or pass one per request in the `X-Upstream-Token` header.
 
-ripclone validates the `RIPCLONE_TOKEN`, syncs the mirror, builds artifacts for the new `HEAD`, and returns the artifact hashes.
+ripclone validates the `RIPCLONE_SERVER_TOKEN`, syncs the mirror, builds artifacts for the new `HEAD`, and returns the artifact hashes.
 
 ### Native push webhook (no per-repo workflow)
 

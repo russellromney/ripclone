@@ -18,10 +18,10 @@ BANDWIDTH="${BANDWIDTH:-250}"
 ITER="${ITER:-3}"
 CORES="${CORES:-4 8}"
 RTTS="${RTTS:-50 125 250}"
-RIPCLONE_TOKEN="${RIPCLONE_TOKEN:-bench-token}"
-export RIPCLONE_TOKEN
+RIPCLONE_SERVER_TOKEN="${RIPCLONE_SERVER_TOKEN:-${RIPCLONE_TOKEN:-bench-token}}"
+export RIPCLONE_SERVER_TOKEN
 # The server expects the SHA-256 hash of the token in the Authorization header.
-TOKEN_HASH=$(printf '%s' "$RIPCLONE_TOKEN" | shasum -a 256 | awk '{print $1}')
+TOKEN_HASH=$(printf '%s' "$RIPCLONE_SERVER_TOKEN" | shasum -a 256 | awk '{print $1}')
 AUTH_HEADER="Authorization: Ripclone $TOKEN_HASH"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

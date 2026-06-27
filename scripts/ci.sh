@@ -11,7 +11,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 STAGE="${1:-all}"
-export RIPCLONE_TOKEN="${RIPCLONE_TOKEN:-ci-e2e-token}"
+export RIPCLONE_SERVER_TOKEN="${RIPCLONE_SERVER_TOKEN:-${RIPCLONE_TOKEN:-ci-e2e-token}}"
 
 lint() {
   ( cd "$ROOT/rust"

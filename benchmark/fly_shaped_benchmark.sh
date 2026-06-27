@@ -5,7 +5,7 @@ set -euo pipefail
 #
 # Usage (run inside the Fly client machine or any Linux host with CAP_NET_ADMIN):
 #   RIPCLONE_URL=https://ripclone-server-dev.fly.dev \
-#   RIPCLONE_TOKEN=... \
+#   RIPCLONE_SERVER_TOKEN=... \
 #   ./benchmark/fly_shaped_benchmark.sh <owner/repo> <rate_mbps> [runs] [target_dir]
 #
 # Compared modes (each run uses a fresh dir with the client cache disabled):
@@ -21,17 +21,18 @@ RUNS="${3:-3}"
 TARGET="${4:-/data}"
 
 SERVER_URL="${RIPCLONE_URL:-https://ripclone-server-dev.fly.dev}"
-TOKEN="${RIPCLONE_TOKEN:-}"
+TOKEN="${RIPCLONE_SERVER_TOKEN:-${RIPCLONE_TOKEN:-}}"
 RIPCLONE="${RIPCLONE:-ripclone}"
+PROVIDER="${RIPCLONE_PROVIDER:-github}"
 
 REPO_NAME="$(basename "$REPO")"
 LOG_DIR="$TARGET/shaped_logs/${REPO_NAME}/${RATE_MBPS}Mbps"
 mkdir -p "$LOG_DIR"
 
 if [ -z "$TOKEN" ]; then
-  echo "warning: RIPCLONE_TOKEN not set; server auth may fail" >&2
+  echo "warning: RIPCLONE_SERVER_TOKEN not set; server auth may fail" >&2
 fi
-export RIPCLONE_TOKEN="$TOKEN"
+export RIPCLONE_SERVER_TOKEN="$TOKEN"
 export RIPCLONE_NO_CACHE=1
 
 now_ms() { perl -MTime::HiRes=time -e 'printf "%d\n", time * 1000'; }
@@ -39,8 +40,6 @@ now_ms() { perl -MTime::HiRes=time -e 'printf "%d\n", time * 1000'; }
 median() {
   sort -n | awk '{a[NR]=$1} END{print (NR%2)?a[(NR+1)/2]:int((a[NR/2]+a[NR/2+1])/2)}'
 }
-
-COMMIT="${COMMIT:-latest}"
 
 # ---------------------------------------------------------------------------
 # Server warm-up / keep-alive
@@ -73,15 +72,15 @@ get_default_branch() {
   local owner name auth_hash
   owner=$(echo "$REPO" | cut -d/ -f1)
   name=$(echo "$REPO" | cut -d/ -f2)
-  auth_hash=$(printf '%s' "$RIPCLONE_TOKEN" | shasum -a 256 | awk '{print $1}')
-  curl -fsS -H "Authorization: Ripclone $auth_hash" "${SERVER_URL%/}/v1/repos/$owner/$name/refs/HEAD" 2>/dev/null \
+  auth_hash=$(printf '%s' "$RIPCLONE_SERVER_TOKEN" | shasum -a 256 | awk '{print $1}')
+  curl -fsS -H "Authorization: Ripclone $auth_hash" "${SERVER_URL%/}/v1/repos/$PROVIDER/$owner/$name/refs/HEAD" 2>/dev/null \
     | python3 -c 'import sys,json; print(json.load(sys.stdin).get("default_branch","HEAD"))'
 }
 
 probe_full_clone() {
   local dir="$TARGET/probe.$$"
   rm -rf "$dir"
-  if "$RIPCLONE" --server "$SERVER_URL" clone "$REPO" --branch "$REF" --depth 0 --dir "$dir" >/dev/null 2>&1; then
+  if "$RIPCLONE" --server "$SERVER_URL" clone "$REPO" --at "$REF" --depth 0 --dir "$dir" >/dev/null 2>&1; then
     rm -rf "$dir"
     return 0
   else
@@ -111,23 +110,37 @@ wait_for_artifacts() {
 }
 
 warm_server() {
-  local owner name auth_hash branch
+  local owner name auth_hash branch_or_ref resp
   owner=$(echo "$REPO" | cut -d/ -f1)
   name=$(echo "$REPO" | cut -d/ -f2)
-  auth_hash=$(printf '%s' "$RIPCLONE_TOKEN" | shasum -a 256 | awk '{print $1}')
-  branch="${BENCH_REF:-$(get_default_branch)}"
-  REF="$branch"
+  auth_hash=$(printf '%s' "$RIPCLONE_SERVER_TOKEN" | shasum -a 256 | awk '{print $1}')
+  branch_or_ref="${BENCH_REF:-$(get_default_branch)}"
 
   if [ "${SKIP_SYNC:-0}" = "1" ]; then
+    REF="$branch_or_ref"
     echo "  using pinned ref: $REF (skipping sync)"
     return 0
   fi
 
-  echo "  warming server mirror for $REPO @ $branch ..."
-  curl -fsS -X POST \
-    -H "Authorization: Ripclone $auth_hash" \
-    "${SERVER_URL%/}/v1/repos/$owner/$name/sync?branch=$branch" >/dev/null 2>&1
-  echo "  pinned ref: $REF"
+  # If the caller passed a full commit SHA, pin it directly.  Otherwise treat the
+  # value as a branch name, sync it, and capture the exact commit the server built
+  # artifacts for.  That keeps the rest of the run stable even on fast-moving
+  # branches like pandas `main`.
+  if [[ "$branch_or_ref" =~ ^[0-9a-f]{40}$ ]]; then
+    REF="$branch_or_ref"
+    echo "  using pinned commit $REF"
+    curl -fsS -X POST \
+      -H "Authorization: Ripclone $auth_hash" \
+      "${SERVER_URL%/}/v1/repos/$PROVIDER/$owner/$name/sync?rev=$REF" >/dev/null 2>&1
+  else
+    echo "  warming server mirror for $REPO @ $branch_or_ref ..."
+    resp=$(curl -fsS -X POST \
+      -H "Authorization: Ripclone $auth_hash" \
+      "${SERVER_URL%/}/v1/repos/$PROVIDER/$owner/$name/sync?branch=$branch_or_ref")
+    REF=$(echo "$resp" | python3 -c 'import sys,json; print(json.load(sys.stdin)["commit"])')
+    echo "  resolved $branch_or_ref -> $REF"
+  fi
+
   wait_for_artifacts
 }
 
@@ -197,17 +210,15 @@ bench_cmd() {
   printf '  %-26s median=%5dms   runs=[%s]\n' "$label" "$med" "$(IFS=,; echo "${times[*]}")"
 }
 
-rc_full()  { "$RIPCLONE" --server "$SERVER_URL" clone "$REPO" --branch "$REF" --depth 0 --dir "$1"; }
-rc_depth1(){ "$RIPCLONE" --server "$SERVER_URL" clone "$REPO" --branch "$REF" --depth 1 --dir "$1"; }
-rc_files() { "$RIPCLONE" --server "$SERVER_URL" clone "$REPO" --branch "$REF" --depth 1 --mode files --dir "$1"; }
+rc_full()  { "$RIPCLONE" --server "$SERVER_URL" clone "$REPO" --at "$REF" --depth 0 --dir "$1"; }
+rc_depth1(){ "$RIPCLONE" --server "$SERVER_URL" clone "$REPO" --at "$REF" --depth 1 --dir "$1"; }
+rc_files() { "$RIPCLONE" --server "$SERVER_URL" clone "$REPO" --at "$REF" --depth 1 --mode files --dir "$1"; }
 git_depth1(){ git clone --depth 1 "https://github.com/$REPO.git" "$1"; }
 git_full() { git clone "https://github.com/$REPO.git" "$1"; }
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-
-echo "=== repo=$REPO commit=${REF:-latest} rate=${RATE_MBPS}Mbps runs=$RUNS shaped=${SHAPED:-1} host=$(hostname) cpus=$(nproc 2>/dev/null || echo ?) ==="
 
 wait_for_server "$SERVER_URL"
 keepalive_server "$SERVER_URL" &
@@ -226,6 +237,8 @@ trap cleanup EXIT
 REF="${REF:-$(get_default_branch)}"
 
 warm_server
+
+echo "=== repo=$REPO commit=${REF:-latest} rate=${RATE_MBPS}Mbps runs=$RUNS shaped=${SHAPED:-1} host=$(hostname) cpus=$(nproc 2>/dev/null || echo ?) ==="
 if [ "${SHAPED:-1}" = "1" ]; then
   apply_shape "$RATE_MBPS"
 else
