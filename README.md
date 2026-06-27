@@ -131,14 +131,16 @@ ripclone validates the `RIPCLONE_TOKEN`, syncs the mirror, builds artifacts for 
 
 ### Native push webhook (no per-repo workflow)
 
-Instead of (or alongside) the Actions workflow, point a GitHub webhook at the server so it builds on every push with nothing added to the consumer repo. Set `RIPCLONE_WEBHOOK_SECRET` on the server, then add a repository/org webhook:
+Instead of (or alongside) the Actions workflow, point a provider webhook at the server so it builds on every push with nothing added to the consumer repo. Set a per-provider secret, then add a repository/org webhook:
 
-- **Payload URL:** `https://ripclone.example.com/v1/webhooks/github`
+- **Payload URL:** `https://ripclone.example.com/webhooks/github` (`/v1/webhooks/github` is a back-compat alias)
 - **Content type:** `application/json`
-- **Secret:** the same value as `RIPCLONE_WEBHOOK_SECRET`
-- **Events:** Just the `push` event.
+- **Secret:** the value of `RIPCLONE_WEBHOOK_SECRET_GITHUB` (the legacy `RIPCLONE_WEBHOOK_SECRET` is still honored for github)
+- **Events:** the `push` event.
 
-The server verifies GitHub's `X-Hub-Signature-256` (HMAC-SHA256) over the raw body and triggers a build of the pushed branch immediately — so artifacts are ready before any clone. `ping` / non-push / branch-delete events are acknowledged with no build.
+The server verifies the provider HMAC (`X-Hub-Signature-256`) over the raw body — constant-time, before any parse — then triggers a build via the same queue `/sync` uses, so artifacts are ready before any clone. Fail-closed: a provider with no configured secret returns `503`; a bad signature `401`. Branch deletes clean up that ref; tags/ping are acknowledged with no build.
+
+By default the **default branch** is always warmed and other branches only if already built (so throwaway branches don't warm). Set `RIPCLONE_WEBHOOK_WARM_ALL=1` to warm every pushed branch, or `RIPCLONE_WEBHOOK_ALLOWLIST=owner/repo,other/repo` to restrict which repos warm. The receiver is provider-agnostic (GitHub today; GitLab/Gitea follow the same trait) — see [`docs/WEBHOOKS.md`](docs/WEBHOOKS.md).
 
 ### Polling fallback
 

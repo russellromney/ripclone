@@ -47,6 +47,7 @@ pub mod storage;
 #[cfg(test)]
 pub mod test_fixture;
 pub mod validation;
+pub mod webhook;
 pub mod worktree_writer;
 
 use anyhow::Result;

@@ -68,8 +68,9 @@ async fn webhook_push_builds_before_clone() {
     origin.publish();
 
     // GitHub-shaped push payload. `after` only needs to be non-zero (not a
-    // delete); the build resolves the real upstream tip itself.
-    let body = br#"{"ref":"refs/heads/main","after":"1111111111111111111111111111111111111111","deleted":false,"repository":{"full_name":"acme/hook"}}"#.to_vec();
+    // delete); the build resolves the real upstream tip itself. `main` is the
+    // default branch, so the receiver warms it.
+    let body = br#"{"ref":"refs/heads/main","after":"1111111111111111111111111111111111111111","deleted":false,"repository":{"name":"hook","owner":{"login":"acme"},"default_branch":"main","private":false}}"#.to_vec();
     let http = reqwest::Client::new();
     let resp = http
         .post(format!("{}/v1/webhooks/github", server.url))
@@ -80,7 +81,7 @@ async fn webhook_push_builds_before_clone() {
         .send()
         .await
         .expect("webhook POST");
-    assert_eq!(resp.status().as_u16(), 202, "valid signed push accepted");
+    assert_eq!(resp.status().as_u16(), 200, "valid signed push accepted");
 
     // The build runs in the background; the clone proves it produced real,
     // correct artifacts for the pushed commit.
@@ -112,7 +113,7 @@ async fn webhook_and_sync_same_branch_coalesce() {
     origin.commit(&[("f.txt", "v1\n")], "c1");
     origin.publish();
 
-    let body = br#"{"ref":"refs/heads/main","after":"1111111111111111111111111111111111111111","deleted":false,"repository":{"full_name":"acme/coal"}}"#.to_vec();
+    let body = br#"{"ref":"refs/heads/main","after":"1111111111111111111111111111111111111111","deleted":false,"repository":{"name":"coal","owner":{"login":"acme"},"default_branch":"main","private":false}}"#.to_vec();
     let url = server.url.clone();
 
     // Fire a webhook and a branch-targeted sync for the same key at once.
@@ -136,7 +137,7 @@ async fn webhook_and_sync_same_branch_coalesce() {
         let client = server.client();
         tokio::spawn(async move { client.sync_branch("acme/coal", "main").await.is_ok() })
     };
-    assert_eq!(webhook.await.unwrap(), 202, "webhook accepted");
+    assert_eq!(webhook.await.unwrap(), 200, "webhook accepted");
     assert!(sync.await.unwrap(), "concurrent same-key sync ok");
 
     // Both raced the same key without corruption; the clone is correct.

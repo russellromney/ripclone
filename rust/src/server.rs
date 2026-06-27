@@ -17,6 +17,7 @@ use crate::retention::Retention;
 use crate::snapshot::SnapshotBuilder;
 use crate::storage::StorageRef;
 use crate::validation;
+use crate::webhook::{EventKind, WebhookConfig};
 use anyhow::{Context, Result};
 use axum::{
     Json, Router,
@@ -29,6 +30,7 @@ use axum::{
 };
 use futures::{StreamExt, TryStreamExt};
 use prost::Message;
+use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -61,9 +63,11 @@ pub struct ServerState {
     /// when the build finishes.
     pub build_waiters: BuildWaiters,
     pub oidc_verifier: Option<Arc<OidcVerifier>>,
-    /// HMAC secret for the push-webhook receiver (`RIPCLONE_WEBHOOK_SECRET`).
-    /// `None` disables the webhook route (returns 501). Mirrors `oidc_verifier`.
-    pub webhook_secret: Option<secrecy::SecretString>,
+    /// Webhook receiver config: per-provider HMAC secret + optional repo
+    /// allowlist. A provider with no configured secret returns 503. Reads
+    /// `RIPCLONE_WEBHOOK_SECRET_<provider>` (and the legacy
+    /// `RIPCLONE_WEBHOOK_SECRET` for github).
+    pub webhook_config: Arc<WebhookConfig>,
     /// Per-repo mutexes so concurrent syncs for the same repo cannot corrupt
     /// the bare mirror directory.
     pub sync_locks: Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
@@ -128,7 +132,8 @@ impl ServerState {
             build_queue_depth: Arc::new(AtomicUsize::new(0)),
             build_waiters: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             oidc_verifier: None,
-            webhook_secret: None,
+            // No webhook secret here (worker has no HTTP; tests install their own).
+            webhook_config: Arc::new(WebhookConfig::empty()),
             sync_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             mirror_freshness: Arc::new(std::sync::Mutex::new(HashMap::new())),
             mirror_fresh_ttl: Duration::from_secs(60),
@@ -555,9 +560,12 @@ pub fn build_app(state: ServerState) -> Router {
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics_handler))
         .route("/v1/build", post(build_handler))
-        // Push-webhook receiver: authenticated by HMAC signature on the body, not
-        // the ripclone bearer token, so it lives outside the `protected` layer.
-        .route("/v1/webhooks/github", post(github_webhook_handler))
+        // Provider-agnostic push-webhook receiver: authenticated by the provider
+        // HMAC over the raw body (not the ripclone bearer token), so it lives
+        // outside the `protected` layer. `/v1/webhooks/github` is the legacy
+        // GitHub-only alias into the same receiver, kept for back-compat.
+        .route("/webhooks/{provider}", post(webhook_handler))
+        .route("/v1/webhooks/github", post(github_webhook_compat))
         .merge(protected)
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -577,6 +585,11 @@ pub fn build_app(state: ServerState) -> Router {
 /// `git-upload-pack` body and any other large POST payload.
 const MAX_REQUEST_BODY_BYTES: usize = 256 * 1024 * 1024;
 const MAX_UPLOAD_PACK_BODY_BYTES: usize = 256 * 1024 * 1024;
+/// Cap for a webhook request body. The HMAC can only be verified after the whole
+/// body is buffered, so this bounds what an unauthenticated caller can make the
+/// server hold before the signature is checked. GitHub caps webhook payloads at
+/// ~25 MiB; this is comfortably above that and far below the global limit.
+const MAX_WEBHOOK_BODY_BYTES: usize = 25 * 1024 * 1024;
 
 /// Reject a client whose wire protocol is newer than this server understands,
 /// with a clear 426 instead of a confusing downstream error. A missing header
@@ -2589,77 +2602,101 @@ async fn build_handler(
     }
 }
 
-/// Minimal GitHub push-event payload — only the fields the receiver needs.
-#[derive(serde::Deserialize)]
-struct GithubPushEvent {
-    #[serde(rename = "ref")]
-    git_ref: String,
-    #[serde(default)]
-    after: String,
-    #[serde(default)]
-    deleted: bool,
-    repository: GithubPushRepo,
+#[derive(Serialize)]
+struct WebhookAccepted {
+    ok: bool,
 }
 
-#[derive(serde::Deserialize)]
-struct GithubPushRepo {
-    full_name: String,
+#[derive(Serialize)]
+struct WebhookIgnored {
+    ignored: &'static str,
 }
 
-/// Verify GitHub's `X-Hub-Signature-256: sha256=<hex>` over the raw body, using
-/// HMAC-SHA256 with the configured secret. Constant-time (hmac's `verify_slice`).
-fn verify_github_signature(secret: &secrecy::SecretString, body: &[u8], header: &str) -> bool {
-    use hmac::{Hmac, Mac};
-    use secrecy::ExposeSecret;
-    use sha2::Sha256;
-
-    let Some(hex_sig) = header.strip_prefix("sha256=") else {
-        return false;
-    };
-    let Ok(expected) = hex::decode(hex_sig) else {
-        return false;
-    };
-    let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(secret.expose_secret().as_bytes()) else {
-        return false;
-    };
-    mac.update(body);
-    mac.verify_slice(&expected).is_ok()
+/// Acknowledge an event we deliberately don't act on. Always `200` so the
+/// provider doesn't retry a delivery we simply chose to ignore.
+fn webhook_ignored(reason: &'static str) -> Response {
+    (StatusCode::OK, Json(WebhookIgnored { ignored: reason })).into_response()
 }
 
-/// Native GitHub push-webhook receiver. Verifies the HMAC signature, then triggers
-/// a build of the pushed branch immediately (fire-and-forget) so artifacts are
-/// ready before any clone — no per-repo Actions workflow required. Authenticated
-/// by signature, not the ripclone bearer token (it sits outside the auth layer).
-async fn github_webhook_handler(
+/// `POST /v1/webhooks/github` — legacy alias for the built-in github instance,
+/// kept so deployments created against the original receiver keep working.
+async fn github_webhook_compat(
     headers: HeaderMap,
     State(state): State<ServerState>,
-    body: axum::body::Bytes,
-) -> impl IntoResponse {
-    let Some(secret) = &state.webhook_secret else {
+    body: Body,
+) -> Response {
+    handle_webhook(state, "github".to_string(), headers, body).await
+}
+
+/// `POST /webhooks/{provider}` — provider-agnostic webhook receiver.
+async fn webhook_handler(
+    Path(provider_id): Path<String>,
+    headers: HeaderMap,
+    State(state): State<ServerState>,
+    body: Body,
+) -> Response {
+    handle_webhook(state, provider_id, headers, body).await
+}
+
+/// verify (HMAC over the RAW body) → normalize → trigger a build via the shared
+/// `trigger_build` path (so the build runs ahead of any clone, coalescing with
+/// `/sync`). Responds 2xx fast. Fail-closed: no configured secret ⇒ 503; bad
+/// signature ⇒ 401. The payload is trusted only for routing (which repo / ref),
+/// never to choose a credential or escalate.
+async fn handle_webhook(
+    state: ServerState,
+    provider_id: String,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    // Resolve the configured provider instance from the path.
+    let Some(provider) = state.provider_registry.get(&provider_id).cloned() else {
+        return unknown_provider_response();
+    };
+    // Phase 1: only GitHub has a webhook adapter; other kinds are follow-ups.
+    let Some(adapter) = crate::webhook::provider_for(provider.kind) else {
         return (
             StatusCode::NOT_IMPLEMENTED,
             Json(ErrorResponse {
-                error: "webhook receiver not configured (set RIPCLONE_WEBHOOK_SECRET)".to_string(),
+                error: format!(
+                    "webhooks not yet implemented for provider kind '{}'",
+                    provider.kind.as_str()
+                ),
             }),
         )
             .into_response();
     };
-
-    // GitHub sends `ping` and other events to the same URL; only act on pushes.
-    let event = headers
-        .get("X-GitHub-Event")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    if event != "push" {
-        return StatusCode::NO_CONTENT.into_response();
-    }
-
-    // Verify the signature over the EXACT bytes GitHub signed, before parsing.
-    let signature = headers
-        .get("X-Hub-Signature-256")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    if !verify_github_signature(secret, &body, signature) {
+    // Fail closed: no configured secret for this provider ⇒ 503.
+    let Some(secret) = state.webhook_config.secret(provider.id.as_str()).cloned() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: format!(
+                    "no webhook secret configured for provider '{}'",
+                    provider.id
+                ),
+            }),
+        )
+            .into_response();
+    };
+    // Read the RAW body before any JSON parse — the HMAC covers these exact
+    // bytes. Cap the buffer well below the global request limit: the signature
+    // can only be checked after the whole body is buffered, so an unauthenticated
+    // caller must not be able to make us hold a huge request before the 401.
+    let raw = match axum::body::to_bytes(body, MAX_WEBHOOK_BODY_BYTES).await {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(ErrorResponse {
+                    error: format!("webhook body too large or unreadable: {e}"),
+                }),
+            )
+                .into_response();
+        }
+    };
+    // Verify the signature in constant time over the raw bytes.
+    if !adapter.verify(&headers, &raw, secret.expose_secret()) {
         return (
             StatusCode::UNAUTHORIZED,
             Json(ErrorResponse {
@@ -2668,59 +2705,81 @@ async fn github_webhook_handler(
         )
             .into_response();
     }
+    // Normalize. Unhandled events parse to None and are acknowledged as ignored.
+    let Some(event) = adapter.parse(&headers, &raw) else {
+        return webhook_ignored("unhandled event");
+    };
+    match event.kind {
+        EventKind::Ping => (StatusCode::OK, Json(WebhookAccepted { ok: true })).into_response(),
+        EventKind::Push => webhook_dispatch_push(&state, &provider, event).await,
+        EventKind::BranchDelete => webhook_dispatch_delete(&state, &provider, event).await,
+    }
+}
 
-    let payload: GithubPushEvent = match serde_json::from_slice(&body) {
-        Ok(p) => p,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse {
-                    error: format!("bad push payload: {e}"),
-                }),
-            )
-                .into_response();
+/// Push → warm. Applies the allowlist gate and the branch policy, then triggers
+/// a build via the shared fire-and-forget path and returns immediately.
+async fn webhook_dispatch_push(
+    state: &ServerState,
+    provider: &ProviderInstance,
+    event: crate::webhook::CanonicalEvent,
+) -> Response {
+    let repo_id = RepoId {
+        provider: provider.id.clone(),
+        path: event.repo.clone(),
+    };
+    // Validate the payload-supplied path so a hostile push can't escape storage
+    // keys. We trust the payload only for routing.
+    if validation::validate_repo_path(provider, &repo_id).is_err() {
+        return webhook_ignored("invalid repo path");
+    }
+    // Allowlist gate (allow-all when unconfigured).
+    if !state.webhook_config.allows(&repo_id.storage_key()) {
+        return webhook_ignored("repo not in webhook allowlist");
+    }
+    // Phase 1 warms branches only; tags and other refs are ignored.
+    let Some(branch) = event
+        .ref_
+        .strip_prefix("refs/heads/")
+        .filter(|b| !b.is_empty())
+    else {
+        return webhook_ignored("non-branch ref");
+    };
+    let branch = branch.to_string();
+    // Validate the payload-derived branch before it reaches the queue / git.
+    if validation::validate_git_rev(&branch).is_err() {
+        return webhook_ignored("invalid branch");
+    }
+    // Policy: always warm the default branch; warm other branches only if a
+    // build for them already exists — unless RIPCLONE_WEBHOOK_WARM_ALL=1, which
+    // warms every pushed branch. The default branch comes from the payload, or
+    // the local mirror's HEAD when a provider omits it.
+    if !state.webhook_config.warm_all() {
+        let default_branch = event.default_branch.clone().or_else(|| {
+            let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
+            git::default_branch(&mirror_dir)
+                .ok()
+                .filter(|b| !b.is_empty())
+        });
+        let is_default = default_branch.as_deref() == Some(branch.as_str());
+        if !is_default {
+            let tracked = matches!(
+                state.ref_store.load_branch(&repo_id, &branch).await,
+                Ok(Some(_))
+            );
+            if !tracked {
+                return webhook_ignored("non-default branch not tracked");
+            }
         }
-    };
-
-    // Branch pushes only; ignore tag/other refs and branch deletions.
-    let Some(branch) = payload.git_ref.strip_prefix("refs/heads/") else {
-        return StatusCode::NO_CONTENT.into_response();
-    };
-    if payload.deleted || payload.after.chars().all(|c| c == '0') {
-        return StatusCode::NO_CONTENT.into_response();
     }
-
-    let Some((owner, repo)) = payload.repository.full_name.split_once('/') else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: "bad repository.full_name".to_string(),
-            }),
-        )
-            .into_response();
-    };
-    if let Some(resp) = reject_invalid_repo_ids(owner, repo) {
-        return resp;
-    }
-    if let Some(resp) = validation::reject_if_invalid(|| validation::validate_git_rev(branch)) {
-        return resp;
-    }
-    let repo_id = RepoId::github(format!("{owner}/{repo}"));
-
-    match trigger_build(&state, &repo_id, branch).await {
+    // `trigger_build` resolves the upstream credential from the configured
+    // StaticBroker (the webhook carries no token) and coalesces with `/sync`.
+    match trigger_build(state, &repo_id, &branch).await {
         Ok(()) => {
             info!(
                 "webhook: triggered build for {}@{branch}",
                 repo_id.storage_key()
             );
-            (
-                StatusCode::ACCEPTED,
-                Json(BuildResponse {
-                    status: "queued".to_string(),
-                    queue_depth: state.build_queue.depth().await,
-                }),
-            )
-                .into_response()
+            (StatusCode::OK, Json(WebhookAccepted { ok: true })).into_response()
         }
         Err(error) => {
             state.metrics.record_error();
@@ -2731,6 +2790,52 @@ async fn github_webhook_handler(
                 .into_response()
         }
     }
+}
+
+/// Branch delete → clean up that ref's stored metadata. Never builds.
+async fn webhook_dispatch_delete(
+    state: &ServerState,
+    provider: &ProviderInstance,
+    event: crate::webhook::CanonicalEvent,
+) -> Response {
+    let repo_id = RepoId {
+        provider: provider.id.clone(),
+        path: event.repo.clone(),
+    };
+    if validation::validate_repo_path(provider, &repo_id).is_err() {
+        return webhook_ignored("invalid repo path");
+    }
+    // Gate cleanup by the same allowlist as push so the receiver only acts on
+    // in-scope repos (an out-of-scope repo was never warmed, so this is a no-op
+    // either way — the gate just keeps push and delete symmetric).
+    if !state.webhook_config.allows(&repo_id.storage_key()) {
+        return webhook_ignored("repo not in webhook allowlist");
+    }
+    let Some(branch) = event
+        .ref_
+        .strip_prefix("refs/heads/")
+        .filter(|b| !b.is_empty())
+    else {
+        return webhook_ignored("non-branch ref");
+    };
+    if validation::validate_git_rev(branch).is_err() {
+        return webhook_ignored("invalid branch");
+    }
+    // Drop the stored ref and any cached copy. Best-effort: a delete we can't
+    // complete is logged, not surfaced to the provider (it would just retry).
+    if let Err(e) = state.ref_store.delete_branch(&repo_id, branch).await {
+        warn!(
+            "webhook: failed to delete ref {}@{branch}: {e}",
+            repo_id.storage_key()
+        );
+    }
+    state.ref_store.invalidate(&repo_id, branch).await;
+    invalidate_ref_response_cache(state, &repo_id, branch);
+    info!(
+        "webhook: cleaned up deleted branch {}@{branch}",
+        repo_id.storage_key()
+    );
+    (StatusCode::OK, Json(WebhookAccepted { ok: true })).into_response()
 }
 
 async fn cat_file_inner(
@@ -5639,16 +5744,10 @@ pub async fn run_server(
         info!("OIDC verification enabled for audience configured via RIPCLONE_OIDC_AUDIENCE");
     }
 
-    // Optional push-webhook HMAC secret. When set, /v1/webhooks/github verifies
-    // GitHub's X-Hub-Signature-256 and triggers a build on push (build before
-    // clone, no per-repo Actions workflow needed).
-    let webhook_secret = env::var("RIPCLONE_WEBHOOK_SECRET")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(|s| secrecy::SecretString::new(s.into()));
-    if webhook_secret.is_some() {
-        info!("push-webhook receiver enabled (RIPCLONE_WEBHOOK_SECRET set)");
-    }
+    // Webhook receiver config: per-provider secret + optional allowlist (built
+    // before the registry is moved into the state). A push to a configured
+    // webhook triggers a build before any clone — no per-repo Actions workflow.
+    let webhook_config = Arc::new(WebhookConfig::from_env(&provider_registry));
 
     // Select the queue backend. The local queue drives an in-process worker; the
     // SQL queues' builds run in separate ripclone-worker processes, so the server
@@ -5673,7 +5772,7 @@ pub async fn run_server(
         build_queue_depth,
         build_waiters: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         oidc_verifier,
-        webhook_secret,
+        webhook_config,
         sync_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         mirror_freshness: Arc::new(std::sync::Mutex::new(HashMap::new())),
         mirror_fresh_ttl: Duration::from_secs(
@@ -5763,7 +5862,8 @@ mod tests {
             build_queue_depth: Arc::new(AtomicUsize::new(0)),
             build_waiters: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             oidc_verifier: None,
-            webhook_secret: None,
+            // No webhook secret here (worker has no HTTP; tests install their own).
+            webhook_config: Arc::new(WebhookConfig::empty()),
             sync_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             mirror_freshness: Arc::new(std::sync::Mutex::new(HashMap::new())),
             mirror_fresh_ttl: Duration::from_secs(60),
@@ -6256,146 +6356,607 @@ mod tests {
         format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
     }
 
+    const WEBHOOK_SECRET: &str = "shhh-very-secret";
+
     fn webhook_request(
+        provider: &str,
         event: &str,
-        signature: &str,
+        signature: Option<&str>,
         body: Vec<u8>,
     ) -> axum::http::Request<axum::body::Body> {
-        axum::http::Request::builder()
+        let mut b = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/webhooks/{provider}"))
+            .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))))
+            .header("X-GitHub-Event", event);
+        if let Some(sig) = signature {
+            b = b.header("X-Hub-Signature-256", sig);
+        }
+        b.body(axum::body::Body::from(body)).unwrap()
+    }
+
+    fn gh_push_body(
+        owner: &str,
+        repo: &str,
+        ref_: &str,
+        after: &str,
+        default_branch: &str,
+        deleted: bool,
+    ) -> Vec<u8> {
+        serde_json::json!({
+            "ref": ref_,
+            "after": after,
+            "deleted": deleted,
+            "repository": {
+                "name": repo,
+                "owner": {"login": owner},
+                "default_branch": default_branch,
+                "private": false
+            }
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    /// A push payload that omits `repository.default_branch`, to exercise the
+    /// mirror fallback.
+    fn gh_push_body_no_default(owner: &str, repo: &str, ref_: &str, after: &str) -> Vec<u8> {
+        serde_json::json!({
+            "ref": ref_,
+            "after": after,
+            "deleted": false,
+            "repository": {"name": repo, "owner": {"login": owner}, "private": false}
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    /// A test state with a configured `github` webhook secret whose local-queue
+    /// receiver is kept (non-draining) so a test can assert what `trigger_build`
+    /// enqueued.
+    fn webhook_state(
+        tmp: &tempfile::TempDir,
+    ) -> (ServerState, tokio::sync::mpsc::Receiver<BuildJob>) {
+        let mut state = test_state(tmp);
+        let (queue, rx, depth) = crate::queue::LocalJobQueue::new(16);
+        state.build_queue = Arc::new(queue);
+        state.build_queue_depth = depth;
+        state.webhook_config = Arc::new(WebhookConfig::with_secret("github", WEBHOOK_SECRET));
+        (state, rx)
+    }
+
+    #[tokio::test]
+    async fn webhook_without_secret_returns_503() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(&tmp); // no webhook secret configured
+        let app = build_app(state);
+        let body = gh_push_body(
+            "acme",
+            "widget",
+            "refs/heads/main",
+            &"1".repeat(40),
+            "main",
+            false,
+        );
+        let sig = gh_sign(WEBHOOK_SECRET, &body);
+        let resp = app
+            .oneshot(webhook_request("github", "push", Some(&sig), body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn webhook_push_enqueues_build() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, mut rx) = webhook_state(&tmp);
+        let app = build_app(state);
+        let body = gh_push_body(
+            "acme",
+            "widget",
+            "refs/heads/main",
+            &"1".repeat(40),
+            "main",
+            false,
+        );
+        let sig = gh_sign(WEBHOOK_SECRET, &body);
+        let resp = app
+            .oneshot(webhook_request("github", "push", Some(&sig), body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let job = rx.try_recv().expect("a build job was enqueued");
+        assert_eq!(job.repo_id, RepoId::github("acme/widget"));
+        assert_eq!(job.branch, "main");
+        assert!(rx.try_recv().is_err(), "exactly one job enqueued");
+    }
+
+    #[tokio::test]
+    async fn webhook_v1_github_alias_still_works() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, mut rx) = webhook_state(&tmp);
+        let app = build_app(state);
+        // The legacy /v1/webhooks/github alias routes into the same receiver.
+        let body = gh_push_body(
+            "acme",
+            "widget",
+            "refs/heads/main",
+            &"1".repeat(40),
+            "main",
+            false,
+        );
+        let sig = gh_sign(WEBHOOK_SECRET, &body);
+        let req = axum::http::Request::builder()
             .method("POST")
             .uri("/v1/webhooks/github")
             .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))))
-            .header("X-GitHub-Event", event)
-            .header("X-Hub-Signature-256", signature)
-            .header("content-type", "application/json")
+            .header("X-GitHub-Event", "push")
+            .header("X-Hub-Signature-256", sig)
             .body(axum::body::Body::from(body))
-            .unwrap()
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(rx.try_recv().is_ok(), "alias enqueues a build");
     }
 
-    const PUSH_BODY: &[u8] =
-        br#"{"ref":"refs/heads/main","after":"abc1234","deleted":false,"repository":{"full_name":"acme/widget"}}"#;
-
     #[tokio::test]
-    async fn webhook_valid_push_triggers_build() {
+    async fn webhook_invalid_signature_returns_401() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut state = test_state_draining(&tmp);
-        state.webhook_secret = Some(secrecy::SecretString::new("whsecret".into()));
+        let (state, mut rx) = webhook_state(&tmp);
         let app = build_app(state);
-
-        let sig = gh_sign("whsecret", PUSH_BODY);
+        let body = gh_push_body(
+            "acme",
+            "widget",
+            "refs/heads/main",
+            &"1".repeat(40),
+            "main",
+            false,
+        );
+        let sig = gh_sign("wrong-secret", &body);
         let resp = app
-            .oneshot(webhook_request("push", &sig, PUSH_BODY.to_vec()))
+            .oneshot(webhook_request("github", "push", Some(&sig), body))
             .await
             .unwrap();
-        assert_eq!(
-            resp.status(),
-            StatusCode::ACCEPTED,
-            "valid push triggers build"
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(rx.try_recv().is_err(), "a bad signature must not enqueue");
+    }
+
+    #[tokio::test]
+    async fn webhook_missing_signature_returns_401() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, _rx) = webhook_state(&tmp);
+        let app = build_app(state);
+        let body = gh_push_body(
+            "acme",
+            "widget",
+            "refs/heads/main",
+            &"1".repeat(40),
+            "main",
+            false,
+        );
+        let resp = app
+            .oneshot(webhook_request("github", "push", None, body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn webhook_tampered_body_returns_401() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, mut rx) = webhook_state(&tmp);
+        let app = build_app(state);
+        // Sign body A with the correct secret, deliver body B. Proves the handler
+        // verifies over the raw received bytes, not a re-serialized parse.
+        let body_a = gh_push_body(
+            "acme",
+            "widget",
+            "refs/heads/main",
+            &"1".repeat(40),
+            "main",
+            false,
+        );
+        let sig = gh_sign(WEBHOOK_SECRET, &body_a);
+        let body_b = gh_push_body(
+            "acme",
+            "widget",
+            "refs/heads/main",
+            &"2".repeat(40),
+            "main",
+            false,
+        );
+        assert_ne!(body_a, body_b);
+        let resp = app
+            .oneshot(webhook_request("github", "push", Some(&sig), body_b))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(rx.try_recv().is_err(), "a tampered body must not enqueue");
+    }
+
+    #[tokio::test]
+    async fn webhook_ping_is_acknowledged_without_build() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, mut rx) = webhook_state(&tmp);
+        let app = build_app(state);
+        let body = br#"{"zen":"keep it simple"}"#.to_vec();
+        let sig = gh_sign(WEBHOOK_SECRET, &body);
+        let resp = app
+            .oneshot(webhook_request("github", "ping", Some(&sig), body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(rx.try_recv().is_err(), "ping must not enqueue");
+    }
+
+    #[tokio::test]
+    async fn webhook_untracked_non_default_branch_is_ignored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, mut rx) = webhook_state(&tmp);
+        let app = build_app(state);
+        let body = gh_push_body(
+            "acme",
+            "widget",
+            "refs/heads/feature",
+            &"1".repeat(40),
+            "main",
+            false,
+        );
+        let sig = gh_sign(WEBHOOK_SECRET, &body);
+        let resp = app
+            .oneshot(webhook_request("github", "push", Some(&sig), body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            rx.try_recv().is_err(),
+            "untracked non-default must not enqueue"
         );
     }
 
     #[tokio::test]
-    async fn webhook_bad_signature_rejected() {
+    async fn webhook_tracked_non_default_branch_enqueues() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, mut rx) = webhook_state(&tmp);
+        let repo = RepoId::github("acme/widget");
+        let info = RefInfo {
+            commit: "deadbeef".to_string(),
+            default_branch: "main".to_string(),
+            ..Default::default()
+        };
+        state
+            .ref_store
+            .save_branch(&repo, "feature", &info)
+            .await
+            .unwrap();
+        let app = build_app(state);
+        let body = gh_push_body(
+            "acme",
+            "widget",
+            "refs/heads/feature",
+            &"1".repeat(40),
+            "main",
+            false,
+        );
+        let sig = gh_sign(WEBHOOK_SECRET, &body);
+        let resp = app
+            .oneshot(webhook_request("github", "push", Some(&sig), body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let job = rx.try_recv().expect("tracked branch enqueues");
+        assert_eq!(job.branch, "feature");
+    }
+
+    #[tokio::test]
+    async fn webhook_warm_all_warms_every_branch() {
         let tmp = tempfile::tempdir().unwrap();
         let mut state = test_state(&tmp);
-        state.webhook_secret = Some(secrecy::SecretString::new("whsecret".into()));
+        let (queue, mut rx, depth) = crate::queue::LocalJobQueue::new(16);
+        state.build_queue = Arc::new(queue);
+        state.build_queue_depth = depth;
+        state.webhook_config =
+            Arc::new(WebhookConfig::with_secret("github", WEBHOOK_SECRET).with_warm_all(true));
         let app = build_app(state);
-
-        // Signed with the wrong secret.
-        let sig = gh_sign("wrong-secret", PUSH_BODY);
+        // An untracked, non-default branch is warmed when warm-all is on.
+        let body = gh_push_body(
+            "acme",
+            "widget",
+            "refs/heads/random",
+            &"1".repeat(40),
+            "main",
+            false,
+        );
+        let sig = gh_sign(WEBHOOK_SECRET, &body);
         let resp = app
-            .oneshot(webhook_request("push", &sig, PUSH_BODY.to_vec()))
+            .oneshot(webhook_request("github", "push", Some(&sig), body))
             .await
             .unwrap();
-        assert_eq!(
-            resp.status(),
-            StatusCode::UNAUTHORIZED,
-            "bad signature rejected"
-        );
+        assert_eq!(resp.status(), StatusCode::OK);
+        let job = rx
+            .try_recv()
+            .expect("warm-all warms an untracked non-default branch");
+        assert_eq!(job.branch, "random");
     }
 
     #[tokio::test]
-    async fn webhook_tampered_body_rejected() {
+    async fn webhook_allowlist_blocks_unlisted_repo() {
         let tmp = tempfile::tempdir().unwrap();
         let mut state = test_state(&tmp);
-        state.webhook_secret = Some(secrecy::SecretString::new("whsecret".into()));
+        let (queue, mut rx, depth) = crate::queue::LocalJobQueue::new(16);
+        state.build_queue = Arc::new(queue);
+        state.build_queue_depth = depth;
+        state.webhook_config = Arc::new(
+            WebhookConfig::with_secret("github", WEBHOOK_SECRET)
+                .with_allowlist(["acme/allowed".to_string()]),
+        );
         let app = build_app(state);
-
-        // Sign the canonical body, then send a DIFFERENT body with that signature.
-        // The HMAC must cover the exact bytes (verified before JSON parse), so a
-        // mutated body fails — guards against verifying over re-serialized JSON.
-        let sig = gh_sign("whsecret", PUSH_BODY);
-        let tampered =
-            br#"{"ref":"refs/heads/main","after":"abc1234","deleted":false,"repository":{"full_name":"evil/repo"}}"#
-                .to_vec();
+        let body = gh_push_body(
+            "acme",
+            "widget",
+            "refs/heads/main",
+            &"1".repeat(40),
+            "main",
+            false,
+        );
+        let sig = gh_sign(WEBHOOK_SECRET, &body);
         let resp = app
-            .oneshot(webhook_request("push", &sig, tampered))
+            .oneshot(webhook_request("github", "push", Some(&sig), body))
             .await
             .unwrap();
-        assert_eq!(
-            resp.status(),
-            StatusCode::UNAUTHORIZED,
-            "signature must cover the exact body, not parsed content"
-        );
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(rx.try_recv().is_err(), "unlisted repo must not enqueue");
     }
 
     #[tokio::test]
-    async fn webhook_unconfigured_returns_501() {
-        let tmp = tempfile::tempdir().unwrap();
-        let state = test_state(&tmp); // webhook_secret = None
-        let app = build_app(state);
-
-        let sig = gh_sign("whsecret", PUSH_BODY);
-        let resp = app
-            .oneshot(webhook_request("push", &sig, PUSH_BODY.to_vec()))
-            .await
-            .unwrap();
-        assert_eq!(
-            resp.status(),
-            StatusCode::NOT_IMPLEMENTED,
-            "no secret configured → 501"
-        );
-    }
-
-    #[tokio::test]
-    async fn webhook_ping_event_acked_without_build() {
+    async fn webhook_allowlist_allows_listed_repo() {
         let tmp = tempfile::tempdir().unwrap();
         let mut state = test_state(&tmp);
-        state.webhook_secret = Some(secrecy::SecretString::new("whsecret".into()));
+        let (queue, mut rx, depth) = crate::queue::LocalJobQueue::new(16);
+        state.build_queue = Arc::new(queue);
+        state.build_queue_depth = depth;
+        state.webhook_config = Arc::new(
+            WebhookConfig::with_secret("github", WEBHOOK_SECRET)
+                .with_allowlist(["acme/widget".to_string()]),
+        );
         let app = build_app(state);
-
-        let body = br#"{"zen":"hi"}"#.to_vec();
-        let sig = gh_sign("whsecret", &body);
+        let body = gh_push_body(
+            "acme",
+            "widget",
+            "refs/heads/main",
+            &"1".repeat(40),
+            "main",
+            false,
+        );
+        let sig = gh_sign(WEBHOOK_SECRET, &body);
         let resp = app
-            .oneshot(webhook_request("ping", &sig, body))
+            .oneshot(webhook_request("github", "push", Some(&sig), body))
             .await
             .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
-            resp.status(),
-            StatusCode::NO_CONTENT,
-            "ping is acked, no build"
+            rx.try_recv().expect("listed repo enqueues").repo_id,
+            RepoId::github("acme/widget")
         );
     }
 
     #[tokio::test]
-    async fn webhook_branch_delete_skipped() {
+    async fn webhook_tag_push_is_ignored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, mut rx) = webhook_state(&tmp);
+        let app = build_app(state);
+        let body = gh_push_body(
+            "acme",
+            "widget",
+            "refs/tags/v1.0.0",
+            &"1".repeat(40),
+            "main",
+            false,
+        );
+        let sig = gh_sign(WEBHOOK_SECRET, &body);
+        let resp = app
+            .oneshot(webhook_request("github", "push", Some(&sig), body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(rx.try_recv().is_err(), "a tag push must not enqueue");
+    }
+
+    #[tokio::test]
+    async fn webhook_hostile_branch_name_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, mut rx) = webhook_state(&tmp);
+        let app = build_app(state);
+        let body = gh_push_body(
+            "acme",
+            "widget",
+            "refs/heads/--upload-pack=evil",
+            &"1".repeat(40),
+            "main",
+            false,
+        );
+        let sig = gh_sign(WEBHOOK_SECRET, &body);
+        let resp = app
+            .oneshot(webhook_request("github", "push", Some(&sig), body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(rx.try_recv().is_err(), "an invalid branch must not enqueue");
+    }
+
+    #[tokio::test]
+    async fn webhook_branch_delete_cleans_up_ref() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, mut rx) = webhook_state(&tmp);
+        let repo = RepoId::github("acme/widget");
+        let info = RefInfo {
+            commit: "deadbeef".to_string(),
+            default_branch: "main".to_string(),
+            ..Default::default()
+        };
+        state
+            .ref_store
+            .save_branch(&repo, "feature", &info)
+            .await
+            .unwrap();
+        let ref_store = state.ref_store.clone();
+        let app = build_app(state);
+        let body = gh_push_body(
+            "acme",
+            "widget",
+            "refs/heads/feature",
+            &"0".repeat(40),
+            "main",
+            true,
+        );
+        let sig = gh_sign(WEBHOOK_SECRET, &body);
+        let resp = app
+            .oneshot(webhook_request("github", "push", Some(&sig), body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            ref_store
+                .load_branch(&repo, "feature")
+                .await
+                .unwrap()
+                .is_none(),
+            "deleted branch ref is cleaned up"
+        );
+        assert!(rx.try_recv().is_err(), "a delete must not enqueue a build");
+    }
+
+    #[tokio::test]
+    async fn webhook_delete_outside_allowlist_is_ignored() {
         let tmp = tempfile::tempdir().unwrap();
         let mut state = test_state(&tmp);
-        state.webhook_secret = Some(secrecy::SecretString::new("whsecret".into()));
+        let (queue, _rx, depth) = crate::queue::LocalJobQueue::new(16);
+        state.build_queue = Arc::new(queue);
+        state.build_queue_depth = depth;
+        state.webhook_config = Arc::new(
+            WebhookConfig::with_secret("github", WEBHOOK_SECRET)
+                .with_allowlist(["acme/allowed".to_string()]),
+        );
+        let repo = RepoId::github("acme/widget"); // not allowlisted
+        let info = RefInfo {
+            commit: "deadbeef".to_string(),
+            default_branch: "main".to_string(),
+            ..Default::default()
+        };
+        state
+            .ref_store
+            .save_branch(&repo, "feature", &info)
+            .await
+            .unwrap();
+        let ref_store = state.ref_store.clone();
         let app = build_app(state);
+        let body = gh_push_body(
+            "acme",
+            "widget",
+            "refs/heads/feature",
+            &"0".repeat(40),
+            "main",
+            true,
+        );
+        let sig = gh_sign(WEBHOOK_SECRET, &body);
+        let resp = app
+            .oneshot(webhook_request("github", "push", Some(&sig), body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            ref_store
+                .load_branch(&repo, "feature")
+                .await
+                .unwrap()
+                .is_some(),
+            "out-of-scope delete must not mutate refs"
+        );
+    }
 
+    #[tokio::test]
+    async fn webhook_unknown_provider_returns_404() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, _rx) = webhook_state(&tmp);
+        let app = build_app(state);
+        let body = br#"{}"#.to_vec();
+        let sig = gh_sign(WEBHOOK_SECRET, &body);
+        let resp = app
+            .oneshot(webhook_request("nope", "push", Some(&sig), body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn webhook_non_github_provider_returns_501() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = test_state(&tmp);
+        let mut registry = ProviderRegistry::new();
+        registry
+            .merge_one(crate::provider::ProviderConfig {
+                id: "gitlab".to_string(),
+                kind: Some("gitlab".to_string()),
+                host: Some("gitlab.com".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        state.provider_registry = registry;
+        state.webhook_config = Arc::new(WebhookConfig::with_secret("gitlab", WEBHOOK_SECRET));
+        let app = build_app(state);
+        let resp = app
+            .oneshot(webhook_request(
+                "gitlab",
+                "push",
+                Some("whatever"),
+                br#"{}"#.to_vec(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    }
+
+    #[tokio::test]
+    async fn webhook_default_branch_resolved_from_mirror_when_payload_omits_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, mut rx) = webhook_state(&tmp);
+        let mirror = state
+            .repo_root
+            .join(RepoId::github("acme/widget").mirror_dir_name());
+        gix::init_bare(&mirror).unwrap();
+        std::fs::write(mirror.join("HEAD"), b"ref: refs/heads/trunk\n").unwrap();
+        let app = build_app(state);
+        let body = gh_push_body_no_default("acme", "widget", "refs/heads/trunk", &"1".repeat(40));
+        let sig = gh_sign(WEBHOOK_SECRET, &body);
+        let resp = app
+            .oneshot(webhook_request("github", "push", Some(&sig), body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            rx.try_recv()
+                .expect("default branch from mirror is warmed")
+                .branch,
+            "trunk"
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_no_default_no_mirror_untracked_is_ignored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, mut rx) = webhook_state(&tmp);
+        let app = build_app(state);
         let body =
-            br#"{"ref":"refs/heads/dead","after":"0000000000000000000000000000000000000000","deleted":true,"repository":{"full_name":"acme/widget"}}"#
-                .to_vec();
-        let sig = gh_sign("whsecret", &body);
+            gh_push_body_no_default("acme", "widget", "refs/heads/whatever", &"1".repeat(40));
+        let sig = gh_sign(WEBHOOK_SECRET, &body);
         let resp = app
-            .oneshot(webhook_request("push", &sig, body))
+            .oneshot(webhook_request("github", "push", Some(&sig), body))
             .await
             .unwrap();
-        assert_eq!(
-            resp.status(),
-            StatusCode::NO_CONTENT,
-            "branch delete triggers no build"
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            rx.try_recv().is_err(),
+            "unknowable default + untracked → ignored"
         );
     }
 
