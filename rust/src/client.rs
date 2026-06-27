@@ -83,7 +83,7 @@ async fn server_error(context: &str, resp: reqwest::Response) -> anyhow::Error {
             }
         });
     let hint = match (status.as_u16(), code) {
-        (401, _) => "\n  → set RIPCLONE_TOKEN (create one at https://ripclone.com/tokens)",
+        (401, _) => "\n  → set RIPCLONE_SERVER_TOKEN (create one at https://ripclone.com/tokens)",
         (403, Some("no_plan")) => {
             "\n  → this org needs a plan; the owner can subscribe at https://ripclone.com"
         }
@@ -747,9 +747,10 @@ impl Client {
     }
 
     /// Like [`sync_repo`] but builds at `rev` (e.g. "HEAD~5" or a SHA) instead of
-    /// the branch tip. The branch is still the ref-store key; only the build
-    /// commit is overridden. Useful for exercising the incremental build path
-    /// deterministically without waiting for upstream to advance.
+    /// the branch tip. The resolved commit is used as the ref-store key, so
+    /// different revs that resolve to the same commit share a build. Useful for
+    /// exercising the incremental build path deterministically without waiting for
+    /// upstream to advance.
     pub async fn sync_repo_at(
         &self,
         repo_path: &str,
@@ -761,7 +762,7 @@ impl Client {
 
     /// Sync a specific branch instead of the repo's default. Each branch is its
     /// own ref + clonepack, so this lets several distinct builds for one repo run
-    /// at once (unlike `?rev=`, which the server folds into a single rolling slot).
+    /// at once (unlike `?rev=`, which the server keys by resolved commit).
     pub async fn sync_branch(&self, repo_path: &str, branch: &str) -> Result<RefResponse> {
         self.sync_inner(repo_path, Some(branch), None, None).await
     }

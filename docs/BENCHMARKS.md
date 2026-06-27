@@ -1,7 +1,9 @@
 # Benchmarks
 
-Reproduce with [`scripts/benchmark_clone_compare.sh`](scripts/benchmark_clone_compare.sh)
-(run on a client machine pointed at a ripclone server).
+Reproduce with [`benchmark/run_shaped_sweep.sh`](benchmark/run_shaped_sweep.sh)
+(run on a client machine pointed at a ripclone server). Use `SHAPED=0` for the
+unshaped warm-cache numbers below; omit it (or set `SHAPED=1`) for the shaped
+bandwidth sweep in `README.md`.
 
 ## Clone: ripclone vs native `git clone`
 

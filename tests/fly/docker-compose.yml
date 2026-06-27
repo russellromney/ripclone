@@ -19,8 +19,8 @@ services:
     environment:
       - RUST_LOG=info
       # Change this to a long random secret. The client sets the same value
-      # in RIPCLONE_TOKEN to authenticate.
-      - RIPCLONE_TOKEN=change-me-in-production
+      # in RIPCLONE_SERVER_TOKEN to authenticate.
+      - RIPCLONE_SERVER_TOKEN=change-me-in-production
       # git pack-objects renames temp packs into the repo; keep TMPDIR on the
       # same volume as the repo root or the rename fails with EXDEV
       # (cross-device link). Matches the TMPDIR setting in fly.toml.

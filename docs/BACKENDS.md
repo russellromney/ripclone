@@ -194,17 +194,18 @@ RIPCLONE_QUEUE_FAILED_RETENTION_SECS=604800 # prune failed jobs older than N s (
 
 ## Client authentication
 
-If the server is configured with `RIPCLONE_TOKEN`, the client must send a SHA-256 hash of that token in the `Authorization` header. The client never sends the raw secret.
+If the server is configured with `RIPCLONE_SERVER_TOKEN`, the client must send a SHA-256 hash of that token in the `Authorization` header. The client never sends the raw secret.
 
 ```bash
 # Provide the raw token; the client hashes it before sending.
-RIPCLONE_TOKEN=your-secret ripclone clone owner/repo
+RIPCLONE_SERVER_TOKEN=your-secret ripclone clone owner/repo
 
 # Or provide the pre-hashed token directly (useful in CI / 1Password / .env files).
-RIPCLONE_TOKEN_HASH=sha256-of-your-secret ripclone clone owner/repo
+RIPCLONE_SERVER_TOKEN_HASH=sha256-of-your-secret ripclone clone owner/repo
 ```
 
-`git-remote-ripclone` reads the same variables.
+The deprecated `RIPCLONE_TOKEN` / `RIPCLONE_TOKEN_HASH` names are still accepted
+for backward compatibility. `git-remote-ripclone` reads the same variables.
 
 ## Client-side cache
 

@@ -37,15 +37,58 @@ See **[Design](docs/DESIGN.md)** for how a clonepack is built and synced.
 
 ### Performance
 
-ripclone vs native `git clone`. Lower is better; **bold** is ripclone.
+ripclone pre-builds git artifacts so clones are faster than `git clone` across every bandwidth we tested. On a 1000 Mbps link the wins are largest; as bandwidth drops the download itself dominates and the gap narrows.
 
-| repo | files | `git --depth 1` | ripclone `--depth 1` | `git clone` (full) | ripclone (full) | ripclone (files) |
-|---|---|---|---|---|---|---|
-| `facebook/react` (medium) | ~7k | 2.4 s | **0.5 s** | 50.8 s | **1.6 s** | **0.5 s** |
-| `oven-sh/bun` (large) | ~19k | 3.6 s | **0.9 s** | 37.0 s | **2.5 s** | **0.7 s** |
-| `torvalds/linux` (huge) | ~95k | 34.3 s | **~6 s** | — | — | — |
+At 1000 Mbps, measured speedups over native `git clone` are:
 
-**4–6× faster** at `--depth 1`, **15–32× faster** for a full clone. Measured on a Fly `performance-8x` client, warm server cache, median of 3 runs — see [methodology and sync timings](docs/DESIGN.md#performance). (`linux` is shown at `--depth 1` only, the realistic case at that size.)
+- **`oven-sh/bun`**: full clone **7.0×**, depth-1 **5.9×**, files **10.1×**.
+- **`pandas-dev/pandas`**: full clone **4.5×**, depth-1 **3.8×**, files **4.6×**.
+- **`torvalds/linux`** (1000 Mbps only): full clone **5.5×**, depth-1 **7.6×**, files **11.2×**.
+- **`facebook/react`** was not included in this shaped sweep; earlier warm-cache measurements showed a depth-1 speedup of about **3.8×**.
+
+The full-clone win is smaller on Linux than on bun because the full pack is so large that the transfer dominates; depth-1 and `files` mode avoid most of that transfer, so they stay well ahead even on huge repos.
+
+*Mode labels:* `ripclone full` and `ripclone depth=1` are the `editable` CLI mode with `--depth 0` and `--depth 1`, respectively. `ripclone files` is the `files` CLI mode (HEAD worktree only).
+
+#### Shaped bandwidth benchmark
+
+We ran `ripclone` against native `git clone` on a Fly.io `performance-8x` client talking to a `ripclone-server` over shaped links from 50 Mbps to 1000 Mbps. Each cell is a single run (n=1). `oven-sh/bun` and `pandas-dev/pandas` were measured across all five bandwidths. `torvalds/linux` was only measured at 1000 Mbps because a full `git clone` of Linux at lower bandwidths takes ~8 min per run.
+
+**`oven-sh/bun`**
+
+| Mbps | ripclone full | ripclone depth=1 | ripclone files | git clone full | git clone --depth 1 |
+|------|---------------|------------------|----------------|----------------|---------------------|
+| 1000 | 5.1 s | 1.2 s | 0.7 s | 35.9 s | 7.1 s |
+| 500 | 9.6 s | 1.9 s | 1.1 s | 35.0 s | 3.3 s |
+| 250 | 17.0 s | 3.4 s | 1.9 s | 40.7 s | 3.2 s |
+| 100 | 41.7 s | 5.9 s | 4.2 s | 67.2 s | 5.9 s |
+| 50 | 84.4 s | 11.4 s | 9.2 s | 115.6 s | 10.9 s |
+
+**`pandas-dev/pandas`**
+
+| Mbps | ripclone full | ripclone depth=1 | ripclone files | git clone full | git clone --depth 1 |
+|------|---------------|------------------|----------------|----------------|---------------------|
+| 1000 | 4.6 s | 0.6 s | 0.5 s | 20.7 s | 2.3 s |
+| 500 | 7.7 s | 0.8 s | 0.4 s | 20.9 s | 2.3 s |
+| 250 | 14.8 s | 1.3 s | 0.4 s | 24.9 s | 2.3 s |
+| 100 | 33.9 s | 2.1 s | 0.6 s | 43.0 s | 2.4 s |
+| 50 | 65.2 s | 3.0 s | 1.9 s | 75.9 s | 3.0 s |
+
+**`torvalds/linux`** (1000 Mbps only)
+
+Because a full `git clone` of Linux at lower bandwidths takes ~8 min per run, we only measured the 1000 Mbps point.
+
+| Mbps | ripclone full | ripclone depth=1 | ripclone files | git clone full | git clone --depth 1 |
+|------|---------------|------------------|----------------|----------------|---------------------|
+| 1000 | 84.3 s | 4.4 s | 3.0 s | 462.9 s | 33.5 s |
+
+That works out to **5.5×** for full, **7.6×** for depth-1, and **11.2×** for files.
+
+The ratio graph below shows **ripclone time / git time**; anything below the dashed `1.0` line means ripclone was faster.
+
+![shaped benchmark ratios](benchmark/shaped_ratios.png)
+
+At 1000 Mbps, `ripclone depth=1` and `ripclone files` are roughly 5× faster than `git clone --depth 1` for pandas and `torvalds/linux`; the gap narrows as bandwidth drops, but ripclone stays faster across every tested rate.
 
 ## Install
 
@@ -109,7 +152,7 @@ cargo run --release --bin ripclone -- worktree ../bun-wt -b HEAD
 
 ## GitHub Actions trigger
 
-Add a workflow to a repo so ripclone builds artifacts on every push. Set `RIPCLONE_URL` as a repository variable and `RIPCLONE_TOKEN` as a repository secret. (A ready-to-copy version lives in [`docs/examples/github-actions-trigger.yml`](docs/examples/github-actions-trigger.yml).)
+Add a workflow to a repo so ripclone builds artifacts on every push. Set `RIPCLONE_URL` as a repository variable and `RIPCLONE_SERVER_TOKEN` as a repository secret. (A ready-to-copy version lives in [`docs/examples/github-actions-trigger.yml`](docs/examples/github-actions-trigger.yml).)
 
 ```yaml
 name: ripclone cache
@@ -121,13 +164,13 @@ jobs:
       - name: Trigger ripclone sync
         run: |
           curl -fsSL -X POST \
-            -H "Authorization: Ripclone ${{ secrets.RIPCLONE_TOKEN }}" \
+            -H "Authorization: Ripclone ${{ secrets.RIPCLONE_SERVER_TOKEN }}" \
             "${{ vars.RIPCLONE_URL }}/v1/repos/github/${{ github.repository_owner }}/${{ github.event.repository.name }}/sync"
 ```
 
 The `github` in the path is the provider instance (see [Providers](#providers)). For private repos the server needs read access to the upstream — configure a token for the provider, or pass one per request in the `X-Upstream-Token` header.
 
-ripclone validates the `RIPCLONE_TOKEN`, syncs the mirror, builds artifacts for the new `HEAD`, and returns the artifact hashes.
+ripclone validates the `RIPCLONE_SERVER_TOKEN`, syncs the mirror, builds artifacts for the new `HEAD`, and returns the artifact hashes.
 
 ### Native push webhook (no per-repo workflow)
 

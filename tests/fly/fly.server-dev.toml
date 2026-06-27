@@ -5,17 +5,17 @@ primary_region = 'iad'
   # Paths are relative to the repo root: deploy with
   # `fly deploy --config tests/fly/fly.server-dev.toml` run from the repo root
   # (build context = root, so the Dockerfile can COPY rust/ and scripts/).
-  dockerfile = 'tests/fly/Dockerfile'
+  dockerfile = 'Dockerfile'
 
 [http_service]
   internal_port = 8000
   force_https = true
-  auto_stop_machines = true
+  # Keep the server running for the duration of shaped benchmark sweeps.
+  # The benchmark harness also pings healthz, but disabling auto-stop removes
+  # the risk of cold-start timeouts between long git-clone runs.
+  auto_stop_machines = false
   auto_start_machines = true
-  # Dev: scale to zero when idle to keep cost low. First request after idle eats
-  # a cold start (machine boot + server start). Revisit when the webhook-driven
-  # sync worker lands — a background build can be stopped mid-flight at min=0.
-  min_machines_running = 0
+  min_machines_running = 1
   processes = ['app']
 
 [[vm]]

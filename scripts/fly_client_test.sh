@@ -12,7 +12,7 @@ export PATH="/usr/local/bin:$PATH"
 export RIPCLONE_URL="$SERVER"
 export RUST_LOG="${RUST_LOG:-info}"
 
-TOKEN_HASH=$(printf '%s' "${RIPCLONE_TOKEN:-}" | sha256sum | awk '{print $1}')
+TOKEN_HASH=$(printf '%s' "${RIPCLONE_SERVER_TOKEN:-${RIPCLONE_TOKEN:-}}" | sha256sum | awk '{print $1}')
 
 # Clean up any leftover overlay mounts from previous runs so rm -rf does not
 # fail with EBUSY, and free tmpfs staging directories so each run starts with

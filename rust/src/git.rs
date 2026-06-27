@@ -983,7 +983,7 @@ pub fn index_pack<P: AsRef<Path>, Q: AsRef<Path>>(_git_dir: P, pack_path: Q) -> 
         "RIPCLONE_GIX_INDEX_THREADS",
         crate::gix_util::default_worker_threads(),
     );
-    let outcome = gix_pack::Bundle::write_to_directory(
+    let gix_result = gix_pack::Bundle::write_to_directory(
         &mut reader,
         Some(directory),
         &mut progress,
@@ -996,11 +996,41 @@ pub fn index_pack<P: AsRef<Path>, Q: AsRef<Path>>(_git_dir: P, pack_path: Q) -> 
             object_hash: gix::hash::Kind::Sha1,
         },
     )
-    .context("gix index-pack")?;
-    if outcome.index_path.is_none() {
-        bail!("gix index-pack produced no index (empty pack?)");
+    .context("gix index-pack");
+
+    match gix_result {
+        Ok(outcome) => {
+            if outcome.index_path.is_none() {
+                bail!("gix index-pack produced no index (empty pack?)");
+            }
+            Ok(())
+        }
+        Err(e) => {
+            // gix occasionally chokes on very large or unusually-shaped packs
+            // (e.g. oven-sh/bun). Fall back to the stock git implementation,
+            // which has seen these objects before and is more forgiving.
+            tracing::warn!(
+                "gix index-pack failed for {}: {e:#}; falling back to git index-pack",
+                pack_path.display()
+            );
+            let status = Command::new("git")
+                .arg("index-pack")
+                .arg(pack_path)
+                .current_dir(directory)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .with_context(|| format!("spawn git index-pack for {}", pack_path.display()))?;
+            if !status.success() {
+                bail!(
+                    "git index-pack failed for {} (status {:?})",
+                    pack_path.display(),
+                    status.code()
+                );
+            }
+            Ok(())
+        }
     }
-    Ok(())
 }
 
 pub fn init<P: AsRef<Path>>(git_dir: P) -> Result<()> {
@@ -2606,6 +2636,49 @@ mod tests {
         assert!(
             total >= 30_000,
             "expected at least 300 * 100 bytes of blob data"
+        );
+    }
+
+    #[test]
+    fn resolve_commit_peels_annotated_tag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+
+        fn git(repo: &Path, args: &[&str]) -> String {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .unwrap_or_else(|e| panic!("git {:?} failed: {}", args, e));
+            assert!(
+                out.status.success(),
+                "git {:?} stderr: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        }
+
+        git(repo, &["init", "-q", "-b", "main"]);
+        git(repo, &["config", "user.email", "t@t"]);
+        git(repo, &["config", "user.name", "t"]);
+        std::fs::write(repo.join("a.txt"), "a\n").unwrap();
+        git(repo, &["add", "a.txt"]);
+        git(repo, &["commit", "-q", "-m", "c1"]);
+
+        let head = git(repo, &["rev-parse", "HEAD"]);
+        git(repo, &["tag", "-a", "v1.0", "-m", "release"]);
+
+        assert_eq!(
+            resolve_commit(repo, "v1.0").unwrap(),
+            head,
+            "annotated tag should peel to its target commit"
+        );
+        assert_eq!(
+            resolve_commit(repo, "v1.0^{commit}").unwrap(),
+            head,
+            "explicit peel syntax should still work"
         );
     }
 }
