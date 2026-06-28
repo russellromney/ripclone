@@ -1853,13 +1853,29 @@ mod linux_uring {
             expected: usize,
             context: &str,
         ) -> Result<Vec<(usize, FileOp, i32)>> {
+            // This drains only this batch's completions. The normal-fd and
+            // synchronous paths tag their ops with window id 0; deferred direct
+            // windows use ids >= 1 (see next_window_id). A non-zero completion that
+            // shows up here belongs to a deferred window still in flight (e.g. when
+            // flush_deferred_writes falls back to normal fds mid-drain), so route it
+            // to that window instead of miscounting it as one of ours.
             let mut completions = Vec::with_capacity(expected);
             while completions.len() < expected {
                 {
                     let mut cq = self.ring.completion();
                     for cqe in &mut cq {
-                        let (_window_id, idx, op) = parse_user_data(cqe.user_data())?;
-                        completions.push((idx, op, cqe.result()));
+                        let (window_id, idx, op) = parse_user_data(cqe.user_data())?;
+                        if window_id == 0 {
+                            completions.push((idx, op, cqe.result()));
+                        } else if let Some(pending) = self
+                            .pending_windows
+                            .iter_mut()
+                            .find(|w| w.window_id == window_id)
+                        {
+                            apply_direct_completion(pending, idx, op, cqe.result())?;
+                        } else {
+                            anyhow::bail!("unexpected io_uring completion for window {window_id}");
+                        }
                     }
                 }
                 if completions.len() < expected {
