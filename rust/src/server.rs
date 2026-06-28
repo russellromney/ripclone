@@ -5764,7 +5764,18 @@ pub async fn run_server(
         .and_then(|s| s.parse().ok())
         .map(Duration::from_secs)
         .unwrap_or(Duration::from_secs(0));
-    let remote_gc = RemoteGc::new(b.storage.clone(), b.ref_store.clone(), GcConfig::from_env());
+    let mut gc_config = GcConfig::from_env();
+    // Floor the grace at the longest signed-URL lifetime, read from the same
+    // place ref responses sign URLs, so a client still holding a valid URL can
+    // always finish its clone before any of its chunks become collectible.
+    let url_ttl_floor = ref_signed_url_ttl(false).max(ref_signed_url_ttl(true));
+    let configured_grace = gc_config.grace_period;
+    gc_config.floor_grace(url_ttl_floor);
+    info!(
+        "remote GC effective grace = {:?} (configured {:?}, signed-URL TTL floor {:?})",
+        gc_config.grace_period, configured_grace, url_ttl_floor
+    );
+    let remote_gc = RemoteGc::new(b.storage.clone(), b.ref_store.clone(), gc_config);
     remote_gc.spawn(remote_gc_interval);
 
     let refs_path = repo_root.join(".ripclone-refs.json");

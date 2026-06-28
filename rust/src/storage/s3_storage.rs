@@ -334,6 +334,18 @@ impl StorageBackend for S3Storage {
         Ok(())
     }
 
+    async fn get_meta(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        // Namespace the ledger under the storage prefix so multiple deployments
+        // sharing one bucket each keep their own.
+        let full = format!("{}{}", self.prefix, key);
+        Ok(self.get_object(&full).await?.map(|(_, data)| data))
+    }
+
+    async fn put_meta(&self, key: &str, data: &[u8]) -> Result<()> {
+        let full = format!("{}{}", self.prefix, key);
+        self.put_object(&full, data, None).await
+    }
+
     fn size(&self, hash: &str) -> Result<u64> {
         let key = self.key(hash)?;
         let client = self.client.clone();

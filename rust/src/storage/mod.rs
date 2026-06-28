@@ -1,7 +1,7 @@
 use crate::cas::Cas;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -31,6 +31,18 @@ pub trait StorageBackend: Send + Sync {
     /// Default falls back to the sync `put` (fine for the local backend).
     async fn put_async(&self, hash: &str, data: &[u8]) -> Result<()> {
         self.put(hash, data)
+    }
+
+    /// Read a named, non-content-addressed metadata blob — small durable
+    /// bookkeeping such as the GC orphan ledger. Returns `None` when the key
+    /// does not exist. Defaults to unsupported; durable backends override it.
+    async fn get_meta(&self, _key: &str) -> Result<Option<Vec<u8>>> {
+        anyhow::bail!("named metadata objects are not supported by this backend")
+    }
+
+    /// Write a named metadata blob. See [`get_meta`](Self::get_meta).
+    async fn put_meta(&self, _key: &str, _data: &[u8]) -> Result<()> {
+        anyhow::bail!("named metadata objects are not supported by this backend")
     }
 
     /// Return the object size in bytes, if the backend can determine it
@@ -114,6 +126,19 @@ impl LocalStorage {
             .with_context(|| format!("invalid CAS object name: {}", name))?;
         Ok(name.to_string())
     }
+
+    /// Resolve a named metadata key to a path under the CAS root, rejecting
+    /// anything that could escape it. Keys are internal constants, so this is a
+    /// guard, not a parser.
+    fn meta_path(&self, key: &str) -> Result<PathBuf> {
+        if key.is_empty()
+            || key.starts_with('/')
+            || key.split('/').any(|seg| seg.is_empty() || seg == "..")
+        {
+            anyhow::bail!("invalid metadata key: {key}");
+        }
+        Ok(self.cas.root().join(key))
+    }
 }
 
 #[async_trait]
@@ -128,6 +153,27 @@ impl StorageBackend for LocalStorage {
 
     fn put(&self, hash: &str, data: &[u8]) -> Result<()> {
         self.cas.put_with_hash(hash, data)
+    }
+
+    async fn get_meta(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        let path = self.meta_path(key)?;
+        match std::fs::read(&path) {
+            Ok(data) => Ok(Some(data)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e).with_context(|| format!("read metadata {key}")),
+        }
+    }
+
+    async fn put_meta(&self, key: &str, data: &[u8]) -> Result<()> {
+        let path = self.meta_path(key)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create metadata dir for {key}"))?;
+        }
+        let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+        std::fs::write(&tmp, data).with_context(|| format!("write metadata tmp {key}"))?;
+        std::fs::rename(&tmp, &path).with_context(|| format!("rename metadata {key}"))?;
+        Ok(())
     }
 
     fn size(&self, hash: &str) -> Result<u64> {
