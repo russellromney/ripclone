@@ -574,10 +574,6 @@ impl Client {
         anyhow::bail!("ref lookup did not complete")
     }
 
-    pub async fn fetch_pack(&self, hash: &str) -> Result<bytes::Bytes> {
-        self.fetch_artifact(hash).await
-    }
-
     pub async fn fetch_object(&self, sha: &str) -> Result<Vec<u8>> {
         let url = format!("{}/v1/objects/{}", self.server, sha);
         let resp = self.http.get(&url).send().await?;
@@ -2494,158 +2490,6 @@ impl Client {
         Ok(())
     }
 
-    /// Full clone: download full pack, index-pack it, set HEAD, checkout.
-    pub async fn full_clone<P: AsRef<Path>>(
-        &self,
-        owner: &str,
-        repo: &str,
-        branch: &str,
-        target: P,
-    ) -> Result<()> {
-        let target = target.as_ref();
-        info!(
-            "full cloning {}/{}#{} into {}",
-            owner,
-            repo,
-            branch,
-            target.display()
-        );
-
-        let info = self.resolve_ref(&format!("{owner}/{repo}"), branch).await?;
-        info!("resolved to commit {}", &info.commit[..7]);
-
-        if target.exists() {
-            anyhow::bail!("target directory already exists: {}", target.display());
-        }
-
-        if info.full_pack.is_empty() {
-            anyhow::bail!("full pack not available for this ref");
-        }
-
-        let pack_data = self.fetch_pack(&info.full_pack).await?;
-        info!("downloaded full pack: {} bytes", pack_data.len());
-
-        git::init(target)?;
-        let git_dir = target.join(".git");
-        let pack_dir = git_dir.join("objects").join("pack");
-        std::fs::create_dir_all(&pack_dir)?;
-        let pack_path = pack_dir.join("full.pack");
-        std::fs::write(&pack_path, &pack_data)?;
-
-        git::index_pack(&git_dir, &pack_path)?;
-        git::set_head(&git_dir, &info.commit)?;
-
-        info!("checking out working tree...");
-        let status = std::process::Command::new("git")
-            .arg("-C")
-            .arg(target.as_os_str())
-            .args(["checkout", "-f", &info.commit])
-            .status()
-            .context("git checkout")?;
-        if !status.success() {
-            anyhow::bail!("git checkout failed");
-        }
-
-        info!(
-            "cloned {}/{}#{} into {}",
-            owner,
-            repo,
-            branch,
-            target.display()
-        );
-        Ok(())
-    }
-
-    /// Skeleton clone: download skeleton pack, index-pack it, set HEAD. No working tree.
-    pub async fn skeleton_clone<P: AsRef<Path>>(
-        &self,
-        repo_path: &str,
-        branch: &str,
-        target: P,
-    ) -> Result<()> {
-        let target = target.as_ref();
-        info!(
-            "skeleton cloning {}#{} into {}",
-            repo_path,
-            branch,
-            target.display()
-        );
-
-        let info = self
-            .resolve_ref_with_clonepack(repo_path, branch, None, None)
-            .await?;
-        info!("resolved to commit {}", &info.commit[..7]);
-
-        if target.exists() {
-            anyhow::bail!("target directory already exists: {}", target.display());
-        }
-
-        let (_clonepack, metadata) = self.fetch_clonepack(&info).await?;
-        info!(
-            "downloaded skeleton pack: {} bytes",
-            metadata.skeleton_pack.len()
-        );
-
-        git::init(target)?;
-        let git_dir = target.join(".git");
-        let pack_dir = git_dir.join("objects").join("pack");
-        std::fs::create_dir_all(&pack_dir)?;
-        let pack_path = pack_dir.join("skeleton.pack");
-        std::fs::write(&pack_path, &metadata.skeleton_pack)?;
-
-        git::index_pack(&git_dir, &pack_path)?;
-        git::set_head(&git_dir, &info.commit)?;
-        git::read_tree(&git_dir, &info.commit)?;
-
-        // Pre-fill cached file sizes in the index so git status can rely on stat
-        // instead of re-reading every blob through the lazy filesystem.
-        let sizes = self.fetch_sizes(repo_path, branch).await?;
-        git::update_index_sizes(&git_dir, &sizes)?;
-
-        // Keep symlinks as symlinks and trust only size/mtime for index stat
-        // checks. With the materialized archive we set exact modes and mtimes,
-        // so we leave core.fileMode at its default (true on Unix) so mode
-        // changes remain visible to git.
-        std::process::Command::new("git")
-            .arg("-C")
-            .arg(target.as_os_str())
-            .args(["config", "core.symlinks", "true"])
-            .status()
-            .ok();
-        std::process::Command::new("git")
-            .arg("-C")
-            .arg(target.as_os_str())
-            .args(["config", "core.checkStat", "minimal"])
-            .status()
-            .ok();
-
-        // Add the canonical upstream remote so the resulting repo behaves like a
-        // normal clone (fetch/push work, IDEs recognize origin, etc.).
-        let origin_url = if info.origin_url.is_empty() {
-            if let Some((owner, repo)) = repo_path.split_once('/') {
-                format!("https://github.com/{owner}/{repo}.git")
-            } else {
-                format!("https://github.com/{repo_path}.git")
-            }
-        } else {
-            info.origin_url.clone()
-        };
-        std::process::Command::new("git")
-            .arg("-C")
-            .arg(target.as_os_str())
-            .args(["remote", "add", "origin", &origin_url])
-            .status()
-            .ok();
-
-        info!(
-            "skeleton cloned {}#{} into {}",
-            repo_path,
-            branch,
-            target.display()
-        );
-        Ok(())
-    }
-
     /// Fetch a single file's content from the server.
     pub async fn cat_file(&self, repo_path: &str, branch: &str, path: &str) -> Result<Vec<u8>> {
         self.fetch_file(repo_path, branch, path).await
@@ -2662,20 +2506,6 @@ impl Client {
             return Err(server_error("cat failed", resp).await);
         }
         Ok(resp.bytes().await?.to_vec())
-    }
-
-    /// Fetch a map of working-tree path to blob size for the given ref.
-    pub async fn fetch_sizes(
-        &self,
-        repo_path: &str,
-        branch: &str,
-    ) -> Result<std::collections::HashMap<String, u64>> {
-        let url = self.repo_url(repo_path, &format!("/sizes?branch={branch}"));
-        let resp = self.request(reqwest::Method::GET, &url).send().await?;
-        if !resp.status().is_success() {
-            return Err(server_error("sizes failed", resp).await);
-        }
-        Ok(resp.json().await?)
     }
 }
 

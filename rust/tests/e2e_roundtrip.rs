@@ -93,26 +93,6 @@ async fn files_mode_materializes_worktree() {
     assert_eq!(read(&c, "nested/x"), "y\n");
 }
 
-/// skeleton mode: installs `.git` metadata, status works.
-#[tokio::test]
-async fn skeleton_mode_installs_git_dir() {
-    init(false);
-    let server = start_server().await;
-    let origin = make_origin("acme", "skel");
-    origin.commit(&[("f", "1\n")], "c1");
-    origin.publish();
-
-    let client = server.client();
-    client.sync_repo("acme/skel", None).await.unwrap();
-    let out = tempfile::tempdir().unwrap();
-    let target = out.path().join("clone");
-    client
-        .skeleton_clone("acme/skel", "HEAD", &target)
-        .await
-        .expect("skeleton clone");
-    assert!(target.join(".git").exists(), "skeleton has a .git dir");
-}
-
 /// Re-sync after a new push must serve the NEW commit (regression test for the
 /// `git fetch origin HEAD` stale-ref bug — that path never advanced the mirror).
 #[tokio::test]
