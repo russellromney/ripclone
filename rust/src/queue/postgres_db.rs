@@ -75,10 +75,14 @@ impl QueueDb for PostgresDb {
         .execute(&self.pool)
         .await
         .context("create status index")?;
-        // Coalescing backstop: at most one active job per key.
+        // Coalescing backstop: at most one *queued* job per key (a claimed build
+        // can coexist with a queued one, so a push mid-build still gets queued).
+        let _ = sqlx::raw_sql("DROP INDEX IF EXISTS idx_jobs_active_key")
+            .execute(&self.pool)
+            .await;
         if let Err(e) = sqlx::raw_sql(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_active_key
-             ON jobs(key) WHERE status IN ('queued', 'claimed')",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_queued_key
+             ON jobs(key) WHERE status = 'queued'",
         )
         .execute(&self.pool)
         .await
@@ -96,13 +100,11 @@ impl QueueDb for PostgresDb {
     }
 
     async fn active_job_id(&self, key: &str) -> Result<Option<i64>> {
-        sqlx::query_scalar(
-            "SELECT id FROM jobs WHERE key = $1 AND status IN ('queued', 'claimed') LIMIT 1",
-        )
-        .bind(key)
-        .fetch_optional(&self.pool)
-        .await
-        .context("query active job")
+        sqlx::query_scalar("SELECT id FROM jobs WHERE key = $1 AND status = 'queued' LIMIT 1")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await
+            .context("query active job")
     }
 
     async fn insert_job(

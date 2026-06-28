@@ -1579,6 +1579,7 @@ async fn get_ref_inner(
                 archive_frames: Vec::new(),
                 build_status: None,
                 synced_at: None,
+                generation: None,
             });
             let resp = ref_response(
                 &repo_id,
@@ -3196,10 +3197,10 @@ async fn serve_artifact(
 ) -> impl IntoResponse {
     // If the backend can hand out a signed URL, redirect the client there.
     // The client can then use its own Range requests against the CDN/object store.
-    if let Some(url) = state
-        .storage
-        .signed_url(&hash, std::time::Duration::from_secs(900))
-    {
+    // Use the same visibility-aware TTL as the ref path (a private repo gets a
+    // shorter-lived URL) rather than a flat window.
+    let private = headers.as_ref().map(visibility_is_private).unwrap_or(false);
+    if let Some(url) = state.storage.signed_url(&hash, ref_signed_url_ttl(private)) {
         state.metrics.record_artifact_request(0);
         return (
             StatusCode::TEMPORARY_REDIRECT,
@@ -3756,16 +3757,19 @@ async fn reuse_existing_build(
     if let Ok(Some(mut built)) = ref_store.load_build(repo_id, commit).await {
         // Re-point the branch at this build. Reuse only fires when `commit` is the
         // current tip (the ls-remote tip, or the freshly-resolved build commit), so
-        // stamp synced_at = now. The reused RefInfo carries the *other* branch's
-        // older build time; without this, save_branch's "don't regress to an older
-        // sync" guard would silently drop the re-point — e.g. after a force-push
-        // back to an older commit, leaving the persisted (and cross-process)
-        // pointer stuck at the prior, no-longer-tip commit. "This branch is at this
-        // commit, confirmed now."
+        // stamp synced_at = now and drop the history-depth signal. The reused
+        // RefInfo carries the *other* build's older time and — after a force-push
+        // that rewinds to an older commit — a shallower history. save_branch orders
+        // by history depth first, then by sync time, so without overriding both it
+        // would silently drop this re-point and strand the pointer at the prior,
+        // no-longer-tip commit. Clearing generation lets the fresh synced_at win,
+        // because this re-point is authoritative: "this branch is at this commit,
+        // confirmed now." The next build of this commit re-stamps the depth.
         built.synced_at = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .ok()
             .map(|d| d.as_secs());
+        built.generation = None;
         let _ = ref_store.save_branch(repo_id, branch, &built).await;
         return Some(built);
     }
@@ -4409,6 +4413,7 @@ async fn do_sync(
         archive_frames: Vec::new(),
         build_status: None,
         synced_at: fetched_at,
+        generation: git::commit_depth(&mirror_dir, &commit).ok(),
     };
 
     // Push every built artifact to the configured storage backend. For a local
@@ -4851,6 +4856,7 @@ async fn build_and_publish_two_phase(
         archive_frames: carried_archive_frames,
         build_status: Some("full history building".to_string()),
         synced_at: fetched_at,
+        generation: git::commit_depth(mirror_dir, commit).ok(),
     };
 
     // Upload phase-1 artifacts (shallow skeleton/index/metadata, head idx-bundle
@@ -5641,6 +5647,7 @@ async fn update_build_status(state: &ServerState, repo_id: &RepoId, status: &str
             archive_frames: Vec::new(),
             build_status: None,
             synced_at: None,
+            generation: None,
         },
     };
     info.build_status = Some(status.to_string());
@@ -6039,6 +6046,7 @@ mod tests {
             archive_frames: Vec::new(),
             build_status: None,
             synced_at: None,
+            generation: None,
         };
         let provider = ProviderRegistry::new().default_provider().clone();
         let repo_id = RepoId::github("o/r");
@@ -6283,18 +6291,20 @@ mod tests {
     }
 
     /// Commit-keyed reuse re-points the requested branch — and, critically, does
-    /// so even when that branch currently sits at a newer-synced commit (the
-    /// force-push-to-an-older-commit case). Without stamping `synced_at = now` in
-    /// `reuse_existing_build`, `save_branch`'s "don't regress to an older sync"
-    /// guard silently drops the re-point and the pointer is stranded.
+    /// so even when that branch currently sits at a commit with deeper history and
+    /// a newer sync time (the force-push-to-an-older-commit case). Real refs carry
+    /// a `generation` (history depth), which save_branch orders by *before* sync
+    /// time; `reuse_existing_build` must override both for the authoritative
+    /// re-point, or the pointer is stranded at the prior, no-longer-tip commit.
     #[tokio::test]
     async fn reuse_existing_build_repoints_branch_past_ordering_guard() {
         use crate::meta::{SqlRefStore, SqliteMeta};
 
-        fn complete(commit: &str, synced_at: u64) -> RefInfo {
+        fn complete(commit: &str, synced_at: u64, generation: u64) -> RefInfo {
             RefInfo {
                 commit: commit.to_string(),
                 synced_at: Some(synced_at),
+                generation: Some(generation),
                 full_clonepack: crate::ClonepackArtifacts {
                     commit: commit.to_string(),
                     manifest: "m".to_string(),
@@ -6313,9 +6323,9 @@ mod tests {
         );
         let rid = RepoId::github("o/r");
 
-        // Branch foo built at X (older sync time).
+        // Branch foo built at X — an older commit with shallower history.
         store
-            .save_branch(&rid, "foo", &complete("X", 1_000))
+            .save_branch(&rid, "foo", &complete("X", 1_000, 95))
             .await
             .unwrap();
 
@@ -6334,9 +6344,12 @@ mod tests {
             "cross-branch reuse must publish under the requested branch"
         );
 
-        // Force-push-to-older: main sits at Y with a NEWER sync time than X's build.
+        // Force-push rewind: main sits at Y, a newer commit with DEEPER history and
+        // a newer sync time. Re-pointing main back to the shallower, older-synced X
+        // must still win, because X is the confirmed current tip. This is the case
+        // production hits (real refs always carry a generation).
         store
-            .save_branch(&rid, "main", &complete("Y", 5_000))
+            .save_branch(&rid, "main", &complete("Y", 5_000, 100))
             .await
             .unwrap();
         let reused = reuse_existing_build(&store, &rid, "main", "X").await;
@@ -6349,7 +6362,7 @@ mod tests {
                 .unwrap()
                 .commit,
             "X",
-            "reuse must advance the pointer to the current tip despite a newer prior synced_at"
+            "reuse must move the pointer to the confirmed tip despite deeper, newer-synced prior state"
         );
     }
 
@@ -7253,6 +7266,7 @@ mod tests {
             archive_frames: Vec::new(),
             build_status: None,
             synced_at: Some(1_718_812_800),
+            generation: None,
         };
         state
             .ref_store
@@ -7349,6 +7363,7 @@ mod tests {
             archive_frames: Vec::new(),
             build_status: None,
             synced_at: None,
+            generation: None,
         };
         state
             .ref_store

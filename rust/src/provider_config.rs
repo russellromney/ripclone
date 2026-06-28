@@ -194,6 +194,7 @@ mod tests {
                 host: Some("gitlab.com".into()),
                 token: None,
                 auth_template: None,
+                auth_header_name: None,
             }],
         };
         save_providers_file(&path, &file).unwrap();
@@ -212,6 +213,7 @@ mod tests {
             host: Some("gitlab.com".into()),
             token: None,
             auth_template: None,
+            auth_header_name: None,
         };
         add_provider(&path, &token_store, cfg, Some("secret")).unwrap();
         let file = load_providers_file(&path).unwrap();
@@ -233,6 +235,7 @@ mod tests {
             host: Some("gitlab.com".into()),
             token: None,
             auth_template: None,
+            auth_header_name: None,
         };
         add_provider(&path, &token_store, cfg, Some("from-file")).unwrap();
 
@@ -280,6 +283,7 @@ mod tests {
                 kind: "gitea".into(),
                 host: Some("https://gitea.example.com".into()),
                 auth_template: None,
+                auth_header_name: None,
             },
         );
         let config = Config {

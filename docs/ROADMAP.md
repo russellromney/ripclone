@@ -141,6 +141,17 @@ The trigger surface that builds artifacts ahead of a clone is in place: a native
 - **Multi-provider webhooks.** The receiver is GitHub-only. GitLab (plaintext `X-Gitlab-Token`), Bitbucket (`X-Event-Key`, often unsigned), and Gitea (`X-Gitea-Signature`) each use different signature schemes, event headers, payload shapes, and repo-path semantics (GitLab subgroups). Add a per-kind `WebhookProvider` trait behind a `/v1/webhooks/{provider}` route, keyed off the existing provider registry, with per-provider webhook secrets (`RIPCLONE_PROVIDER_<ID>_WEBHOOK_SECRET`, mirroring per-provider tokens). Do this when onboarding a non-GitHub provider.
 - **Poll scaling: adaptive backoff + cross-replica coordination.** The poll loop currently sweeps every known repo on a fixed interval. At many repos, add per-repo poll state (last-seen tip, quiet-since) to poll active repos frequently and quiet ones rarely. Across multiple server replicas, each loop would multiply the `ls-remote` chatter (the SQL queue dedups the enqueues, not the probes); coordinate via a DB leader-lease (fits the queue's worker-lease idea in `DISPATCHER.md`), repo-set sharding, or a dedicated singleton poller. Both are farm-out-era work.
 
+### 11. Empty-repository clones (future)
+
+Cloning a repository with zero commits (an unborn HEAD) is not yet supported.
+The server resolves `HEAD` to a commit, so an empty repo returns 404 at
+resolve and "no objects to pack" at build, and the client would also bail in
+`index_pack` on a 0-object pack. Real support means detecting an unborn HEAD in
+sync/build (skip packs, store an "empty" ref), returning that from resolve
+instead of 404, and having the client `git init` an empty repo with the unborn
+default branch (no checkout). Deferred — it touches the central resolve/build
+path and is a rare case (only freshly created, never-pushed repos).
+
 ## Storage model
 
 - **Tigris Global object storage is the source of truth.** No separate CDN.

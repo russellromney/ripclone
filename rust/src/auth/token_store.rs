@@ -116,12 +116,30 @@ impl FileTokenStore {
                 .with_context(|| format!("create token dir {}", parent.display()))?;
         }
         let data = serde_json::to_string_pretty(map)?;
-        std::fs::write(&self.path, data)
-            .with_context(|| format!("write token file {}", self.path.display()))?;
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600));
+            use std::io::Write;
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            // Create the file 0o600 from the start so the token is never world-
+            // readable, even briefly, and report a permission error instead of
+            // ignoring it. `mode()` only applies on create, so also set it
+            // explicitly for a file that already exists.
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&self.path)
+                .with_context(|| format!("open token file {}", self.path.display()))?;
+            f.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("chmod token file {}", self.path.display()))?;
+            f.write_all(data.as_bytes())
+                .with_context(|| format!("write token file {}", self.path.display()))?;
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::write(&self.path, data)
+                .with_context(|| format!("write token file {}", self.path.display()))?;
         }
         Ok(())
     }

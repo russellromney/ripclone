@@ -102,11 +102,15 @@ async fn server_error(context: &str, resp: reqwest::Response) -> anyhow::Error {
 /// Build a reqwest client that always sends our User-Agent (and any default
 /// headers, e.g. the auth token).
 fn build_http_client(headers: reqwest::header::HeaderMap) -> reqwest::Client {
+    // Fail loudly if the client can't be built: the old fallback to
+    // `Client::new()` silently dropped the default headers (including auth), so
+    // every request would go out unauthenticated. A build failure here is a
+    // TLS/config problem worth surfacing at startup, not papering over.
     reqwest::ClientBuilder::new()
         .user_agent(USER_AGENT)
         .default_headers(headers)
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+        .expect("build HTTP client")
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -333,6 +337,54 @@ fn temp_install_dir(target: &Path) -> Result<tempfile::TempDir> {
         .context("create temp install directory")
 }
 
+/// True when `RIPCLONE_FSYNC` asks for a durability barrier before the clone
+/// reports success. Off by default: the extra fsyncs add latency, and the clone
+/// is already crash-consistent (temp dir + atomic rename). Turn it on when a
+/// crash right after the clone must not leave a torn tree that `git status`
+/// would call clean.
+fn fsync_requested() -> bool {
+    std::env::var("RIPCLONE_FSYNC")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// fsync one directory so its newly created entries survive a crash. On Unix
+/// this opens the directory and syncs it; elsewhere it is a best-effort no-op.
+#[cfg(unix)]
+fn fsync_dir(path: &Path) -> Result<()> {
+    let dir = std::fs::File::open(path)
+        .with_context(|| format!("open dir for fsync {}", path.display()))?;
+    dir.sync_all()
+        .with_context(|| format!("fsync dir {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn fsync_dir(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+/// Recursively fsync every regular file and directory under `root`, so the whole
+/// materialized tree is durable before the clone reports success. A symlink is
+/// persisted by syncing its parent directory, not by following the link.
+fn fsync_tree(root: &Path) -> Result<()> {
+    let meta = std::fs::symlink_metadata(root)
+        .with_context(|| format!("stat for fsync {}", root.display()))?;
+    if meta.is_dir() {
+        for entry in
+            std::fs::read_dir(root).with_context(|| format!("read dir {}", root.display()))?
+        {
+            fsync_tree(&entry?.path())?;
+        }
+        fsync_dir(root)?;
+    } else if meta.is_file() {
+        let f = std::fs::File::open(root)
+            .with_context(|| format!("open file for fsync {}", root.display()))?;
+        f.sync_all()
+            .with_context(|| format!("fsync file {}", root.display()))?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, Deserialize)]
 pub struct SnapshotResponse {
     pub owner: String,
@@ -520,10 +572,6 @@ impl Client {
             return Err(server_error("ref lookup failed", resp).await);
         }
         anyhow::bail!("ref lookup did not complete")
-    }
-
-    pub async fn fetch_pack(&self, hash: &str) -> Result<bytes::Bytes> {
-        self.fetch_artifact(hash).await
     }
 
     pub async fn fetch_object(&self, sha: &str) -> Result<Vec<u8>> {
@@ -1157,9 +1205,19 @@ impl Client {
                 staging_dir.display()
             );
         } else {
+            // Optional durability barrier: flush the staged tree, publish it,
+            // then flush the parent directory so the rename itself is durable.
+            if fsync_requested() {
+                fsync_tree(&install_root).context("fsync staged clone before publish")?;
+            }
             std::fs::rename(&install_root, &target).with_context(|| {
                 format!("rename {} to {}", install_root.display(), target.display())
             })?;
+            if fsync_requested()
+                && let Some(parent) = target.parent().filter(|p| !p.as_os_str().is_empty())
+            {
+                fsync_dir(parent).context("fsync parent directory after publish")?;
+            }
         }
 
         let report = bench.finish();
@@ -2433,158 +2491,6 @@ impl Client {
         Ok(())
     }
 
-    /// Full clone: download full pack, index-pack it, set HEAD, checkout.
-    pub async fn full_clone<P: AsRef<Path>>(
-        &self,
-        owner: &str,
-        repo: &str,
-        branch: &str,
-        target: P,
-    ) -> Result<()> {
-        let target = target.as_ref();
-        info!(
-            "full cloning {}/{}#{} into {}",
-            owner,
-            repo,
-            branch,
-            target.display()
-        );
-
-        let info = self.resolve_ref(&format!("{owner}/{repo}"), branch).await?;
-        info!("resolved to commit {}", &info.commit[..7]);
-
-        if target.exists() {
-            anyhow::bail!("target directory already exists: {}", target.display());
-        }
-
-        if info.full_pack.is_empty() {
-            anyhow::bail!("full pack not available for this ref");
-        }
-
-        let pack_data = self.fetch_pack(&info.full_pack).await?;
-        info!("downloaded full pack: {} bytes", pack_data.len());
-
-        git::init(target)?;
-        let git_dir = target.join(".git");
-        let pack_dir = git_dir.join("objects").join("pack");
-        std::fs::create_dir_all(&pack_dir)?;
-        let pack_path = pack_dir.join("full.pack");
-        std::fs::write(&pack_path, &pack_data)?;
-
-        git::index_pack(&git_dir, &pack_path)?;
-        git::set_head(&git_dir, &info.commit)?;
-
-        info!("checking out working tree...");
-        let status = std::process::Command::new("git")
-            .arg("-C")
-            .arg(target.as_os_str())
-            .args(["checkout", "-f", &info.commit])
-            .status()
-            .context("git checkout")?;
-        if !status.success() {
-            anyhow::bail!("git checkout failed");
-        }
-
-        info!(
-            "cloned {}/{}#{} into {}",
-            owner,
-            repo,
-            branch,
-            target.display()
-        );
-        Ok(())
-    }
-
-    /// Skeleton clone: download skeleton pack, index-pack it, set HEAD. No working tree.
-    pub async fn skeleton_clone<P: AsRef<Path>>(
-        &self,
-        repo_path: &str,
-        branch: &str,
-        target: P,
-    ) -> Result<()> {
-        let target = target.as_ref();
-        info!(
-            "skeleton cloning {}#{} into {}",
-            repo_path,
-            branch,
-            target.display()
-        );
-
-        let info = self
-            .resolve_ref_with_clonepack(repo_path, branch, None, None)
-            .await?;
-        info!("resolved to commit {}", &info.commit[..7]);
-
-        if target.exists() {
-            anyhow::bail!("target directory already exists: {}", target.display());
-        }
-
-        let (_clonepack, metadata) = self.fetch_clonepack(&info).await?;
-        info!(
-            "downloaded skeleton pack: {} bytes",
-            metadata.skeleton_pack.len()
-        );
-
-        git::init(target)?;
-        let git_dir = target.join(".git");
-        let pack_dir = git_dir.join("objects").join("pack");
-        std::fs::create_dir_all(&pack_dir)?;
-        let pack_path = pack_dir.join("skeleton.pack");
-        std::fs::write(&pack_path, &metadata.skeleton_pack)?;
-
-        git::index_pack(&git_dir, &pack_path)?;
-        git::set_head(&git_dir, &info.commit)?;
-        git::read_tree(&git_dir, &info.commit)?;
-
-        // Pre-fill cached file sizes in the index so git status can rely on stat
-        // instead of re-reading every blob through the lazy filesystem.
-        let sizes = self.fetch_sizes(repo_path, branch).await?;
-        git::update_index_sizes(&git_dir, &sizes)?;
-
-        // Keep symlinks as symlinks and trust only size/mtime for index stat
-        // checks. With the materialized archive we set exact modes and mtimes,
-        // so we leave core.fileMode at its default (true on Unix) so mode
-        // changes remain visible to git.
-        std::process::Command::new("git")
-            .arg("-C")
-            .arg(target.as_os_str())
-            .args(["config", "core.symlinks", "true"])
-            .status()
-            .ok();
-        std::process::Command::new("git")
-            .arg("-C")
-            .arg(target.as_os_str())
-            .args(["config", "core.checkStat", "minimal"])
-            .status()
-            .ok();
-
-        // Add the canonical upstream remote so the resulting repo behaves like a
-        // normal clone (fetch/push work, IDEs recognize origin, etc.).
-        let origin_url = if info.origin_url.is_empty() {
-            if let Some((owner, repo)) = repo_path.split_once('/') {
-                format!("https://github.com/{owner}/{repo}.git")
-            } else {
-                format!("https://github.com/{repo_path}.git")
-            }
-        } else {
-            info.origin_url.clone()
-        };
-        std::process::Command::new("git")
-            .arg("-C")
-            .arg(target.as_os_str())
-            .args(["remote", "add", "origin", &origin_url])
-            .status()
-            .ok();
-
-        info!(
-            "skeleton cloned {}#{} into {}",
-            repo_path,
-            branch,
-            target.display()
-        );
-        Ok(())
-    }
-
     /// Fetch a single file's content from the server.
     pub async fn cat_file(&self, repo_path: &str, branch: &str, path: &str) -> Result<Vec<u8>> {
         self.fetch_file(repo_path, branch, path).await
@@ -2601,20 +2507,6 @@ impl Client {
             return Err(server_error("cat failed", resp).await);
         }
         Ok(resp.bytes().await?.to_vec())
-    }
-
-    /// Fetch a map of working-tree path to blob size for the given ref.
-    pub async fn fetch_sizes(
-        &self,
-        repo_path: &str,
-        branch: &str,
-    ) -> Result<std::collections::HashMap<String, u64>> {
-        let url = self.repo_url(repo_path, &format!("/sizes?branch={branch}"));
-        let resp = self.request(reqwest::Method::GET, &url).send().await?;
-        if !resp.status().is_success() {
-            return Err(server_error("sizes failed", resp).await);
-        }
-        Ok(resp.json().await?)
     }
 }
 
@@ -2635,6 +2527,40 @@ fn local_rev_parse(main_repo: &Path, branch: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fsync_tree_walks_files_dirs_and_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("sub/nested")).unwrap();
+        std::fs::write(root.join("top.txt"), b"hello").unwrap();
+        std::fs::write(root.join("sub/inner.txt"), b"world").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("top.txt", root.join("link")).unwrap();
+        // A full tree with a dangling-capable symlink must fsync cleanly.
+        fsync_tree(root).expect("fsync whole tree");
+    }
+
+    #[test]
+    fn fsync_requested_reads_env_flag() {
+        // Default (unset) is off; explicit truthy values turn it on. Guarded so
+        // the env var is restored regardless of the assertions.
+        let prev = std::env::var("RIPCLONE_FSYNC").ok();
+        unsafe {
+            std::env::remove_var("RIPCLONE_FSYNC");
+        }
+        assert!(!fsync_requested());
+        unsafe {
+            std::env::set_var("RIPCLONE_FSYNC", "1");
+        }
+        assert!(fsync_requested());
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("RIPCLONE_FSYNC", v),
+                None => std::env::remove_var("RIPCLONE_FSYNC"),
+            }
+        }
+    }
 
     #[test]
     fn detects_stale_signed_url_through_the_error_chain() {

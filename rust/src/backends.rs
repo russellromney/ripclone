@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicUsize;
 use tokio::sync::mpsc;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Capacity of the in-process queue channel (only used by the local backend).
 pub const LOCAL_QUEUE_CAPACITY: usize = 1024;
@@ -82,13 +82,19 @@ impl Backends {
             (local(cas_dir)?, None)
         };
         let ref_store = select_metadata(repo_root, s3.as_ref()).await?;
-        let retention = Arc::new(Retention::with_config_and_storage(
-            cas.clone(),
-            metrics.clone(),
-            Retention::parse_age(),
-            Retention::parse_size(),
-            Some(storage.clone()),
-        )?);
+        let retention = Arc::new(
+            Retention::with_config_and_storage(
+                cas.clone(),
+                metrics.clone(),
+                Retention::parse_age(),
+                Retention::parse_size(),
+                Some(storage.clone()),
+            )?
+            // Protect the ref-reachable set each run so retention never deletes a
+            // referenced artifact (critical on a local-only backend, where the
+            // cache holds the only copy).
+            .with_ref_store(ref_store.clone(), storage.clone()),
+        );
         Ok(Self {
             cas,
             storage,
@@ -113,6 +119,25 @@ async fn select_metadata(
 
     let kind =
         env_or("RIPCLONE_METADATA", config().metadata.backend.as_deref()).unwrap_or_default();
+
+    // Warn when a networked queue is paired with per-host file metadata. If the
+    // workers run on other hosts, each reads and writes its own local ref files
+    // and a worker's build is invisible to the server. It's valid when the server
+    // and workers share one filesystem (same box), which we can't tell apart
+    // here, so warn loudly rather than refuse — the point is to break the silence.
+    let resolves_to_file = kind == "file" || (kind.is_empty() && s3.is_none());
+    if resolves_to_file {
+        let queue = queue_kind();
+        if matches!(queue.as_str(), "postgres" | "mysql" | "libsql") {
+            warn!(
+                "RIPCLONE_QUEUE={queue} can run builds on other hosts, but the metadata store \
+                 resolves to per-host files. If workers don't share this filesystem, set a \
+                 shared metadata store (RIPCLONE_METADATA=s3|postgres|mysql|libsql) so the \
+                 server and workers share refs."
+            );
+        }
+    }
+
     // Each arm wraps its concrete store in CachingRefStore (the read cache) and
     // coerces to Arc<dyn RefStore>.
     let store: Arc<dyn RefStore> = match kind.as_str() {

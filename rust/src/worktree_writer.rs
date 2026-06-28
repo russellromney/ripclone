@@ -1316,8 +1316,17 @@ mod linux_uring {
                     entries.len(),
                     "submit io_uring write/close batch",
                 ) {
+                    // Submit failed, so the kernel never took these SQEs and the
+                    // fds are still ours to close.
                     close_open_fds_sync(&mut in_flight);
                     return Err(e);
+                }
+                // Submit succeeded (it waited for every completion), so the kernel
+                // has run the Close op for each fd. Drop our fd handles now: any
+                // error below must NOT close these again — the fd may already be
+                // closed and reused by another thread.
+                for write in in_flight.iter_mut() {
+                    write.fd = None;
                 }
                 match self.collect_completions(
                     entries.len(),
@@ -1337,10 +1346,8 @@ mod linux_uring {
                                         anyhow::anyhow!("invalid io_uring completion index {idx}")
                                     })?;
                                     write.close_res = Some(res);
-                                    write.fd = None;
                                 }
                                 FileOp::Open | FileOp::Statx => {
-                                    close_open_fds_sync(&mut in_flight);
                                     anyhow::bail!(
                                         "unexpected io_uring completion in write/close phase"
                                     );
@@ -1348,10 +1355,7 @@ mod linux_uring {
                             }
                         }
                     }
-                    Err(e) => {
-                        close_open_fds_sync(&mut in_flight);
-                        return Err(e);
-                    }
+                    Err(e) => return Err(e),
                 }
             }
 
@@ -1389,6 +1393,28 @@ mod linux_uring {
         }
 
         fn write_regular_batch_deferred(
+            &mut self,
+            mut writes: Vec<PreparedRegularWrite>,
+            collect_stats: bool,
+        ) -> Result<WriteOutcome> {
+            // A single window claims one fixed-file slot range of MAX_BATCH_FILES.
+            // Split a larger batch so a caller passing more than that can't
+            // overrun its slot range (mirrors the synchronous write_regular_batch).
+            let mut outcome = WriteOutcome {
+                written: 0,
+                stats: Vec::new(),
+            };
+            while !writes.is_empty() {
+                let n = writes.len().min(MAX_BATCH_FILES);
+                let window: Vec<_> = writes.drain(..n).collect();
+                let part = self.write_regular_window_deferred(window, collect_stats)?;
+                outcome.written += part.written;
+                outcome.stats.extend(part.stats);
+            }
+            Ok(outcome)
+        }
+
+        fn write_regular_window_deferred(
             &mut self,
             writes: Vec<PreparedRegularWrite>,
             collect_stats: bool,
@@ -1827,13 +1853,29 @@ mod linux_uring {
             expected: usize,
             context: &str,
         ) -> Result<Vec<(usize, FileOp, i32)>> {
+            // This drains only this batch's completions. The normal-fd and
+            // synchronous paths tag their ops with window id 0; deferred direct
+            // windows use ids >= 1 (see next_window_id). A non-zero completion that
+            // shows up here belongs to a deferred window still in flight (e.g. when
+            // flush_deferred_writes falls back to normal fds mid-drain), so route it
+            // to that window instead of miscounting it as one of ours.
             let mut completions = Vec::with_capacity(expected);
             while completions.len() < expected {
                 {
                     let mut cq = self.ring.completion();
                     for cqe in &mut cq {
-                        let (_window_id, idx, op) = parse_user_data(cqe.user_data())?;
-                        completions.push((idx, op, cqe.result()));
+                        let (window_id, idx, op) = parse_user_data(cqe.user_data())?;
+                        if window_id == 0 {
+                            completions.push((idx, op, cqe.result()));
+                        } else if let Some(pending) = self
+                            .pending_windows
+                            .iter_mut()
+                            .find(|w| w.window_id == window_id)
+                        {
+                            apply_direct_completion(pending, idx, op, cqe.result())?;
+                        } else {
+                            anyhow::bail!("unexpected io_uring completion for window {window_id}");
+                        }
                     }
                 }
                 if completions.len() < expected {

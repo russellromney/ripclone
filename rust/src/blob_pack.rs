@@ -379,8 +379,13 @@ struct HashingWriter<'a, W> {
 
 impl<'a, W: Write> Write for HashingWriter<'a, W> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.hasher.update(buf);
-        self.inner.write(buf)
+        // Hash exactly the bytes the inner writer took. Hashing the whole buffer
+        // before a short write would make `write_all` write — and us hash — the
+        // remainder again, producing a wrong trailing checksum that index-pack
+        // then rejects.
+        let n = self.inner.write(buf)?;
+        self.hasher.update(&buf[..n]);
+        Ok(n)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -440,6 +445,48 @@ fn encode_type_and_size(obj_type: u8, mut size: usize) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `Write` that accepts at most `cap` bytes per call, to exercise the
+    /// short-write path a real file can take for large buffers.
+    struct ShortWriter {
+        cap: usize,
+        buf: Vec<u8>,
+    }
+    impl Write for ShortWriter {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            let n = data.len().min(self.cap);
+            self.buf.extend_from_slice(&data[..n]);
+            Ok(n)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn hashing_writer_hashes_only_written_bytes_on_short_write() {
+        let data: Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();
+        let mut hasher = Sha1::new();
+        {
+            let mut hw = HashingWriter {
+                inner: ShortWriter {
+                    cap: 7, // force many short writes
+                    buf: Vec::new(),
+                },
+                hasher: &mut hasher,
+            };
+            hw.write_all(&data).unwrap();
+            // The inner writer must have received exactly the input bytes.
+            assert_eq!(hw.inner.buf, data);
+        }
+        // The streamed hash must equal a one-shot hash of the data — not a
+        // double-hash of the short-write boundaries.
+        assert_eq!(
+            hex::encode(hasher.finalize()),
+            hex::encode(Sha1::digest(&data)),
+            "HashingWriter must hash each byte exactly once across short writes"
+        );
+    }
 
     #[test]
     fn test_encode_type_and_size() {

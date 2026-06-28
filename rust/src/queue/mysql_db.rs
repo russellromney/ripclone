@@ -14,6 +14,18 @@ use async_trait::async_trait;
 use sqlx::Row;
 use sqlx::mysql::{MySqlPool, MySqlPoolOptions};
 
+/// Reject a value that wouldn't fit a VARCHAR column, so MySQL never silently
+/// truncates a queue key (which would collide two distinct jobs onto one row).
+fn check_len(field: &str, value: &str, max: usize) -> Result<()> {
+    if value.len() > max {
+        anyhow::bail!(
+            "{field} is too long for MySQL ({} bytes, max {max}): {value:?}",
+            value.len()
+        );
+    }
+    Ok(())
+}
+
 pub struct MysqlDb {
     pool: MySqlPool,
 }
@@ -76,13 +88,11 @@ impl QueueDb for MysqlDb {
     }
 
     async fn active_job_id(&self, key: &str) -> Result<Option<i64>> {
-        sqlx::query_scalar(
-            "SELECT id FROM jobs WHERE `key` = ? AND status IN ('queued', 'claimed') LIMIT 1",
-        )
-        .bind(key)
-        .fetch_optional(&self.pool)
-        .await
-        .context("query active job")
+        sqlx::query_scalar("SELECT id FROM jobs WHERE `key` = ? AND status = 'queued' LIMIT 1")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await
+            .context("query active job")
     }
 
     async fn insert_job(
@@ -94,6 +104,12 @@ impl QueueDb for MysqlDb {
         credential: Option<&str>,
         created_at: i64,
     ) -> Result<i64> {
+        // VARCHAR key columns: reject an over-long value instead of letting MySQL
+        // silently truncate it (which would collide two jobs onto one key).
+        check_len("key", key, 512)?;
+        check_len("provider", provider, 255)?;
+        check_len("path", path, 255)?;
+        check_len("branch", branch, 255)?;
         let res = sqlx::query(
             "INSERT INTO jobs (`key`, provider, path, branch, status, credential, created_at)
              VALUES (?, ?, ?, ?, 'queued', ?, ?)",

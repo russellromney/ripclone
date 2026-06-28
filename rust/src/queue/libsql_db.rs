@@ -5,7 +5,8 @@
 
 use super::sql::{
     ADD_ATTEMPTS_COLUMN_SQL, ADD_CREDENTIAL_COLUMN_SQL, CREATE_ACTIVE_KEY_INDEX_SQL,
-    CREATE_HISTORY_INDEX_SQL, CREATE_STATUS_INDEX_SQL, CREATE_TABLE_SQL, QueueDb,
+    CREATE_HISTORY_INDEX_SQL, CREATE_STATUS_INDEX_SQL, CREATE_TABLE_SQL,
+    DROP_LEGACY_ACTIVE_KEY_INDEX_SQL, QueueDb,
 };
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -51,6 +52,7 @@ impl QueueDb for LibsqlDb {
         conn.execute(CREATE_STATUS_INDEX_SQL, ())
             .await
             .context("create status index")?;
+        let _ = conn.execute(DROP_LEGACY_ACTIVE_KEY_INDEX_SQL, ()).await;
         if let Err(e) = conn.execute(CREATE_ACTIVE_KEY_INDEX_SQL, ()).await {
             tracing::warn!(
                 "libsql: partial unique index unsupported ({e}); coalescing is best-effort"
@@ -66,7 +68,7 @@ impl QueueDb for LibsqlDb {
         let conn = self.conn().await?;
         let mut rows = conn
             .query(
-                "SELECT id FROM jobs WHERE key = ? AND status IN ('queued', 'claimed') LIMIT 1",
+                "SELECT id FROM jobs WHERE key = ? AND status = 'queued' LIMIT 1",
                 [key],
             )
             .await

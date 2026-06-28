@@ -111,6 +111,16 @@ pub struct ProviderInstance {
     /// Optional credential template for `Generic` hosts, or an override for
     /// preset kinds. Example: `"token {token}"` or `"Bearer {token}"`.
     pub auth_template: Option<String>,
+    /// Optional header name for the credential. Defaults to `Authorization`.
+    /// Some hosts expect a custom name such as `PRIVATE-TOKEN` (GitLab) or a
+    /// proxy header.
+    pub auth_header_name: Option<String>,
+}
+
+/// True for a byte that may appear in an HTTP header field name (an RFC 7230
+/// token): visible ASCII excluding separators.
+fn is_header_name_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
 }
 
 impl ProviderInstance {
@@ -136,11 +146,17 @@ impl ProviderInstance {
     /// Returns `(header_name, header_value)` as strings so it can be passed to
     /// git's `http.extraHeader` config without an extra dependency.
     pub fn auth_header(&self, token: &str) -> Option<(String, String)> {
-        let (name, value) = match &self.auth_template {
-            Some(template) => (
-                "Authorization".to_string(),
-                template.replace("{token}", token),
-            ),
+        // The header name is `Authorization` unless the instance overrides it.
+        let name = self.auth_header_name.as_deref().unwrap_or("Authorization");
+        // A configured name must be a valid HTTP field name: ASCII visible chars
+        // with no separators, whitespace, or control bytes. Reject anything else
+        // so a bad config can't smuggle a second header or a malformed request.
+        if name.is_empty() || !name.bytes().all(is_header_name_byte) {
+            return None;
+        }
+        let name = name.to_string();
+        let value = match &self.auth_template {
+            Some(template) => template.replace("{token}", token),
             None => match self.kind {
                 ProviderKind::GitHub => {
                     let credentials = format!("x-access-token:{}", token);
@@ -148,7 +164,7 @@ impl ProviderInstance {
                         &base64::engine::general_purpose::STANDARD,
                         credentials.as_bytes(),
                     );
-                    ("Authorization".to_string(), format!("Basic {}", encoded))
+                    format!("Basic {}", encoded)
                 }
                 ProviderKind::GitLab => {
                     let credentials = format!("oauth2:{}", token);
@@ -156,12 +172,10 @@ impl ProviderInstance {
                         &base64::engine::general_purpose::STANDARD,
                         credentials.as_bytes(),
                     );
-                    ("Authorization".to_string(), format!("Basic {}", encoded))
+                    format!("Basic {}", encoded)
                 }
-                ProviderKind::Bitbucket => {
-                    ("Authorization".to_string(), format!("Bearer {}", token))
-                }
-                ProviderKind::Gitea => ("Authorization".to_string(), format!("token {}", token)),
+                ProviderKind::Bitbucket => format!("Bearer {}", token),
+                ProviderKind::Gitea => format!("token {}", token),
                 ProviderKind::Generic => return None,
             },
         };
@@ -259,6 +273,9 @@ pub struct ProviderConfig {
     /// Optional credential template for `generic` hosts or overrides for presets.
     /// Must contain exactly one `{token}` placeholder.
     pub auth_template: Option<String>,
+    /// Optional header name for the credential. Defaults to `Authorization`.
+    /// Example: `"PRIVATE-TOKEN"`.
+    pub auth_header_name: Option<String>,
 }
 
 /// Registry of configured provider instances.
@@ -283,6 +300,7 @@ impl ProviderRegistry {
                 kind: ProviderKind::GitHub,
                 host: "github.com".to_string(),
                 auth_template: None,
+                auth_header_name: None,
             },
         );
         if let Some(token) = std::env::var("RIPCLONE_GITHUB_TOKEN")
@@ -359,6 +377,7 @@ impl ProviderRegistry {
                 kind,
                 host,
                 auth_template: cfg.auth_template,
+                auth_header_name: cfg.auth_header_name,
             },
         );
         Ok(())
@@ -568,6 +587,7 @@ mod tests {
             kind,
             host: host.to_string(),
             auth_template: tmpl.map(|s| s.to_string()),
+            auth_header_name: None,
         }
     }
 
@@ -695,6 +715,7 @@ mod tests {
                 kind: ProviderKind::GitLab,
                 host: "gitlab.com".to_string(),
                 auth_template: None,
+                auth_header_name: None,
             },
         );
         registry.providers.insert(
@@ -704,6 +725,7 @@ mod tests {
                 kind: ProviderKind::Generic,
                 host: "git.sr.ht".to_string(),
                 auth_template: Some("token {token}".to_string()),
+                auth_header_name: None,
             },
         );
         registry.providers.insert(
@@ -713,6 +735,7 @@ mod tests {
                 kind: ProviderKind::Gitea,
                 host: "gitea.example.com".to_string(),
                 auth_template: None,
+                auth_header_name: None,
             },
         );
 
@@ -760,6 +783,7 @@ mod tests {
             kind: ProviderKind::GitLab,
             host: "gitlab.com".to_string(),
             auth_template: None,
+            auth_header_name: None,
         };
         let (name, value) = gitlab.auth_header("gltok").unwrap();
         assert_eq!(name, "Authorization");
@@ -777,6 +801,7 @@ mod tests {
             kind: ProviderKind::Bitbucket,
             host: "bitbucket.org".to_string(),
             auth_template: None,
+            auth_header_name: None,
         };
         let (name, value) = bb.auth_header("bbtok").unwrap();
         assert_eq!(name, "Authorization");
@@ -790,6 +815,7 @@ mod tests {
             kind: ProviderKind::Gitea,
             host: "gitea.example.com".to_string(),
             auth_template: None,
+            auth_header_name: None,
         };
         let (name, value) = gitea.auth_header("gtok").unwrap();
         assert_eq!(name, "Authorization");
@@ -803,10 +829,55 @@ mod tests {
             kind: ProviderKind::Generic,
             host: "git.example.com".to_string(),
             auth_template: Some("X-Custom {token}".to_string()),
+            auth_header_name: None,
         };
         let (name, value) = generic.auth_header("sekrit").unwrap();
         assert_eq!(name, "Authorization");
         assert_eq!(value, "X-Custom sekrit");
+    }
+
+    #[test]
+    fn custom_auth_header_name_overrides_authorization() {
+        let p = ProviderInstance {
+            id: ProviderInstanceId::new("gl"),
+            kind: ProviderKind::Generic,
+            host: "git.example.com".to_string(),
+            auth_template: Some("{token}".to_string()),
+            auth_header_name: Some("PRIVATE-TOKEN".to_string()),
+        };
+        let (name, value) = p.auth_header("sekrit").unwrap();
+        assert_eq!(name, "PRIVATE-TOKEN");
+        assert_eq!(value, "sekrit");
+    }
+
+    #[test]
+    fn custom_auth_header_name_applies_to_preset() {
+        let p = ProviderInstance {
+            id: ProviderInstanceId::new("gh"),
+            kind: ProviderKind::GitHub,
+            host: "github.com".to_string(),
+            auth_template: None,
+            auth_header_name: Some("X-Proxy-Auth".to_string()),
+        };
+        let (name, _value) = p.auth_header("pat").unwrap();
+        assert_eq!(name, "X-Proxy-Auth");
+    }
+
+    #[test]
+    fn malformed_auth_header_name_is_rejected() {
+        for bad in ["bad name", "has:colon", "line\r\nfeed", ""] {
+            let p = ProviderInstance {
+                id: ProviderInstanceId::new("x"),
+                kind: ProviderKind::GitHub,
+                host: "github.com".to_string(),
+                auth_template: None,
+                auth_header_name: Some(bad.to_string()),
+            };
+            assert!(
+                p.auth_header("pat").is_none(),
+                "header name {bad:?} must be rejected"
+            );
+        }
     }
 
     #[test]
@@ -825,6 +896,7 @@ mod tests {
             kind: ProviderKind::Generic,
             host: "http://127.0.0.1:8080".to_string(),
             auth_template: Some("token {token}".to_string()),
+            auth_header_name: None,
         };
         assert_eq!(
             generic.clone_url("acme/http"),

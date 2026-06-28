@@ -236,6 +236,9 @@ enum ProviderAction {
         /// Static credential template for generic hosts, e.g. "token {token}".
         #[arg(long)]
         auth_template: Option<String>,
+        /// Header name for the credential. Defaults to "Authorization".
+        #[arg(long)]
+        auth_header_name: Option<String>,
         /// Token to store (prompted if omitted).
         #[arg(short, long)]
         token: Option<String>,
@@ -627,6 +630,7 @@ async fn run_provider_add(
     kind: Option<String>,
     host: Option<String>,
     auth_template: Option<String>,
+    auth_header_name: Option<String>,
     token: Option<String>,
 ) -> Result<()> {
     if id.is_empty() {
@@ -669,6 +673,7 @@ async fn run_provider_add(
         kind: kind_str.to_string(),
         host,
         auth_template,
+        auth_header_name,
     };
 
     let mut cfg = ripclone::config::load_global();
@@ -975,9 +980,10 @@ async fn main() -> Result<()> {
                 kind,
                 host,
                 auth_template,
+                auth_header_name,
                 token,
             } => {
-                run_provider_add(&id, kind, host, auth_template, token).await?;
+                run_provider_add(&id, kind, host, auth_template, auth_header_name, token).await?;
             }
             ProviderAction::List => {
                 run_provider_list()?;

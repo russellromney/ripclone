@@ -221,8 +221,15 @@ pub struct RefInfo {
     /// Optional build status used by the async /v1/build worker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_status: Option<String>,
-    /// Unix timestamp (seconds) when this ref was last synced. Used by shared
-    /// ref stores to avoid overwriting newer commits with older ones.
+    /// Unix timestamp (seconds) when this ref was last synced. Legacy ordering
+    /// signal, kept as a fallback for refs (or repos) without a `generation`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub synced_at: Option<u64>,
+    /// The commit's depth in git history (`git rev-list --count`). This is the
+    /// primary ordering signal for "a newer sync never loses": recency follows
+    /// the commit's place in history, not the builder's clock, so two builders
+    /// with skewed clocks still order correctly. `None` on refs written before
+    /// this field existed, where callers fall back to `synced_at`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
 }
