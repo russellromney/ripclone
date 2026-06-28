@@ -59,7 +59,9 @@ pub fn validate_repo_path(provider: &ProviderInstance, repo_id: &RepoId) -> Resu
     if repo_id.path.contains('\0') || repo_id.path.contains('\\') {
         anyhow::bail!("repo path contains unsafe characters: {}", repo_id.path);
     }
-    if repo_id.path.bytes().any(|b| b.is_ascii_control()) {
+    // Reject any Unicode control char (Cc) — catches NUL/CR/LF and the C1 range
+    // (e.g. U+0085 NEL), not just ASCII controls.
+    if repo_id.path.chars().any(|c| c.is_control()) {
         anyhow::bail!("repo path contains control characters: {}", repo_id.path);
     }
     if repo_id.path.starts_with('/') {

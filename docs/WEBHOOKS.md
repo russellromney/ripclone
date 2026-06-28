@@ -103,7 +103,8 @@ Per provider instance:
   Only enqueue for listed repos; unset ⇒ allow all (single-tenant trust, with a
   loud startup log). Entries use the **natural key**: `owner/repo` for GitHub,
   provider-prefixed for others (`gitlab/group/sub/proj`, `gitea/owner/repo`) —
-  *not* the slash-escaped storage key.
+  *not* the slash-escaped storage key. (For GitHub the prefixed
+  `github/owner/repo` form is also accepted, so the asymmetry isn't a footgun.)
 - **Branch policy** — always warm the default branch (from the payload, or the
   local mirror's HEAD if the provider omits it); warm other branches only if
   already tracked. `RIPCLONE_WEBHOOK_WARM_ALL=1` warms every pushed branch.

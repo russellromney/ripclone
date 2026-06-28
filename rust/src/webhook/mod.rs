@@ -125,7 +125,8 @@ impl WebhookConfig {
         }
     }
 
-    /// Set the repo allowlist (chainable). Repos are matched by storage key.
+    /// Set the repo allowlist (chainable). Entries use the operator-facing
+    /// natural key (`owner/repo` for github, `provider/path` otherwise).
     pub fn with_allowlist(mut self, repos: impl IntoIterator<Item = String>) -> Self {
         self.allowlist = Some(repos.into_iter().collect());
         self
@@ -208,11 +209,13 @@ impl WebhookConfig {
         self.warm_all
     }
 
-    /// Whether a repo (by storage key) may be warmed. Allow-all when no
-    /// allowlist is configured.
-    pub fn allows(&self, storage_key: &str) -> bool {
+    /// Whether a repo (by its natural key — see [`RepoId::natural_key`]) may be
+    /// warmed. Allow-all when no allowlist is configured.
+    ///
+    /// [`RepoId::natural_key`]: crate::provider::RepoId::natural_key
+    pub fn allows(&self, repo_key: &str) -> bool {
         match &self.allowlist {
-            Some(set) => set.contains(storage_key),
+            Some(set) => set.contains(repo_key),
             None => true,
         }
     }
@@ -230,7 +233,7 @@ fn parse_secret(raw: Option<String>) -> Option<SecretString> {
 }
 
 /// Parse the comma-separated `RIPCLONE_WEBHOOK_ALLOWLIST` into a set of repo
-/// storage keys. Entries are trimmed; empty entries are dropped. An absent value
+/// natural keys. Entries are trimmed; empty entries are dropped. An absent value
 /// or one that yields no entries returns `None` (allow-all).
 fn parse_allowlist(raw: Option<String>) -> Option<HashSet<String>> {
     raw.map(|raw| {

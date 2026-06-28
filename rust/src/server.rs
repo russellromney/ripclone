@@ -2720,6 +2720,17 @@ async fn handle_webhook(
     }
 }
 
+/// Whether the webhook allowlist admits this repo. Matches the operator-facing
+/// natural key (`owner/repo` for github, `provider/path` otherwise); for the
+/// github default it ALSO accepts the explicit `github/owner/repo` form, so an
+/// operator generalizing from the `gitlab/...` examples isn't silently bitten by
+/// github's bare-key asymmetry.
+fn webhook_repo_allowed(state: &ServerState, repo_id: &RepoId) -> bool {
+    let cfg = &state.webhook_config;
+    cfg.allows(&repo_id.natural_key())
+        || (repo_id.is_github_default() && cfg.allows(&format!("github/{}", repo_id.path)))
+}
+
 /// Push → warm. Applies the allowlist gate and the branch policy, then triggers
 /// a build via the shared fire-and-forget path and returns immediately.
 async fn webhook_dispatch_push(
@@ -2737,7 +2748,7 @@ async fn webhook_dispatch_push(
         return webhook_ignored("invalid repo path");
     }
     // Allowlist gate (allow-all when unconfigured).
-    if !state.webhook_config.allows(&repo_id.natural_key()) {
+    if !webhook_repo_allowed(state, &repo_id) {
         return webhook_ignored("repo not in webhook allowlist");
     }
     // Phase 1 warms branches only; tags and other refs are ignored.
@@ -2812,7 +2823,7 @@ async fn webhook_dispatch_delete(
     // Gate cleanup by the same allowlist as push so the receiver only acts on
     // in-scope repos (an out-of-scope repo was never warmed, so this is a no-op
     // either way — the gate just keeps push and delete symmetric).
-    if !state.webhook_config.allows(&repo_id.natural_key()) {
+    if !webhook_repo_allowed(state, &repo_id) {
         return webhook_ignored("repo not in webhook allowlist");
     }
     let Some(branch) = event
@@ -6756,6 +6767,40 @@ mod tests {
             rx.try_recv().expect("listed repo enqueues").repo_id,
             RepoId::github("acme/widget")
         );
+    }
+
+    #[tokio::test]
+    async fn webhook_github_allowlist_accepts_bare_and_prefixed() {
+        // Both the canonical `owner/repo` and the forgiving `github/owner/repo`
+        // forms admit a github repo, so github's bare-key asymmetry vs the
+        // `gitlab/...` form isn't a silent footgun.
+        for entry in ["acme/widget", "github/acme/widget"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut state = test_state(&tmp);
+            let (queue, mut rx, depth) = crate::queue::LocalJobQueue::new(16);
+            state.build_queue = Arc::new(queue);
+            state.build_queue_depth = depth;
+            state.webhook_config = Arc::new(
+                WebhookConfig::with_secret("github", WEBHOOK_SECRET)
+                    .with_allowlist([entry.to_string()]),
+            );
+            let app = build_app(state);
+            let body = gh_push_body(
+                "acme",
+                "widget",
+                "refs/heads/main",
+                &"1".repeat(40),
+                "main",
+                false,
+            );
+            let sig = gh_sign(WEBHOOK_SECRET, &body);
+            let resp = app
+                .oneshot(webhook_request("github", "push", Some(&sig), body))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "allowlist entry {entry}");
+            assert!(rx.try_recv().is_ok(), "entry {entry} must admit the repo");
+        }
     }
 
     #[tokio::test]
