@@ -73,8 +73,19 @@ Per-provider specifics:
 | GitLab | `X-Gitlab-Token` == secret (constant-time) | `X-Gitlab-Event` | `project.path_with_namespace`; `ref`, `after`, `before`, `checkout_sha` |
 | Gitea / Forgejo | `X-Gitea-Signature` = HMAC-SHA256(secret, body) hex | `X-Gitea-Event` | `repository.{owner.login, name, default_branch, private}`; `ref`, `after` |
 
-Adding a provider = implement `WebhookProvider`. Ship GitHub first; GitLab + Gitea
-follow the same trait.
+Adding a provider = implement `WebhookProvider`. **GitHub, GitLab, and
+Gitea/Forgejo are implemented** (`rust/src/webhook/{github,gitlab,gitea}.rs`);
+Bitbucket would follow the same trait.
+
+Two adapter notes worth knowing:
+- **GitLab** authenticates with a shared *token* echoed in `X-Gitlab-Token`, not
+  a body HMAC — so its `verify` is a constant-time token equality, and the raw
+  body is unused there. Only `Push Hook` is acted on; visibility comes from
+  `project.visibility_level` (`< 20` ⇒ non-public).
+- **Gitea/Forgejo** sends a *bare* hex HMAC in `X-Gitea-Signature` (no `sha256=`
+  prefix), and its dedicated `delete` event carries a *short* branch name in
+  `ref` — the adapter normalizes it back to `refs/heads/<branch>` so the handler
+  stays uniform.
 
 ## Configuration
 
@@ -88,8 +99,29 @@ Per provider instance:
   (`rust/src/auth/broker.rs`). The webhook carries no token, so private clones use
   the server's configured credential, and the job carries it through the queue
   (#55) so the worker can clone a private repo.
-- **Repo allowlist (optional)** — only enqueue for listed repos. If unset, allow
-  all (single-tenant trust). Document the chosen default explicitly.
+- **Repo allowlist (optional)** — `RIPCLONE_WEBHOOK_ALLOWLIST`, comma-separated.
+  Only enqueue for listed repos; unset ⇒ allow all (single-tenant trust, with a
+  loud startup log). Entries use the **natural key**: `owner/repo` for GitHub,
+  provider-prefixed for others (`gitlab/group/sub/proj`, `gitea/owner/repo`) —
+  *not* the slash-escaped storage key. (For GitHub the prefixed
+  `github/owner/repo` form is also accepted, so the asymmetry isn't a footgun.)
+- **Branch policy** — always warm the default branch (from the payload, or the
+  local mirror's HEAD if the provider omits it); warm other branches only if
+  already tracked. `RIPCLONE_WEBHOOK_WARM_ALL=1` warms every pushed branch.
+
+### Per-provider setup notes
+
+- **GitHub** — set the webhook secret to `RIPCLONE_WEBHOOK_SECRET_GITHUB` (the
+  legacy `RIPCLONE_WEBHOOK_SECRET` is still honored). Point it at
+  `/webhooks/github` (or the back-compat `/v1/webhooks/github`).
+- **GitLab** — use the **Secret token** field (sent verbatim in `X-Gitlab-Token`),
+  *not* the newer signing-token scheme (an HMAC `webhook-signature` header), which
+  this receiver does not implement — it would be rejected (fail-closed), never
+  silently accepted. Set `RIPCLONE_WEBHOOK_SECRET_GITLAB` to the same value.
+- **Gitea / Forgejo** — the `X-Gitea-Signature` HMAC secret is
+  `RIPCLONE_WEBHOOK_SECRET_GITEA`. **Enable the "Delete" event** on the webhook:
+  unlike GitHub, Gitea fires a dedicated `delete` event for branch deletions (not
+  a zero-`after` push), so without it branch-delete cleanup won't fire.
 
 ## Action
 
@@ -154,7 +186,11 @@ Phase 1 (GitHub) is implemented:
 - [x] `webhook` module: `WebhookProvider` trait + `CanonicalEvent`
       (`rust/src/webhook/mod.rs`).
 - [x] GitHub adapter (HMAC-256; push / branch-delete / ping) in
-      `rust/src/webhook/github.rs`. GitLab + Gitea are follow-ups (same trait).
+      `rust/src/webhook/github.rs`.
+- [x] GitLab adapter (`X-Gitlab-Token` constant-time equality; `Push Hook`) in
+      `rust/src/webhook/gitlab.rs`.
+- [x] Gitea/Forgejo adapter (bare-hex HMAC-256; push / delete / ping) in
+      `rust/src/webhook/gitea.rs`.
 - [x] `POST /webhooks/{provider}` in `server.rs` — raw-body handler, provider
       lookup, verify, parse, dispatch. Registered under `rate_limited`, *not*
       behind `auth_middleware` (the HMAC is the auth). `/v1/webhooks/github` is a
@@ -172,10 +208,9 @@ Phase 1 (GitHub) is implemented:
       tracked/untracked non-default branch.
 - [x] Docs: README "Webhooks" section; cross-links below.
 
-**Follow-ups:** GitLab (`X-Gitlab-Token`) and Gitea/Forgejo
-(`X-Gitea-Signature`) adapters — each is one `WebhookProvider` impl plus a match
-arm in `webhook::provider_for`. Repo-lifecycle events (visibility/rename/delete)
-and tag/release pre-warm (see [Events](#events--phase-1-vs-later)).
+**Follow-ups:** a Bitbucket adapter (another `WebhookProvider` impl + a match arm
+in `webhook::provider_for`). Repo-lifecycle events (visibility/rename/delete) and
+tag/release pre-warm (see [Events](#events--phase-1-vs-later)).
 
 ## Open questions — resolved
 

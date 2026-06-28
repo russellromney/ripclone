@@ -17,7 +17,15 @@ use secrecy::SecretString;
 use std::collections::{HashMap, HashSet};
 use tracing::{info, warn};
 
+mod gitea;
 mod github;
+mod gitlab;
+
+/// True for a git "null" object id (a deleted ref's `after`): non-empty and all
+/// ASCII zeros (40 chars for SHA-1, 64 for SHA-256). Shared by the adapters.
+pub(super) fn is_zero_sha(sha: &str) -> bool {
+    !sha.is_empty() && sha.bytes().all(|b| b == b'0')
+}
 
 /// What a provider push tells us, normalized across providers. The receiver
 /// trusts these fields only for **routing** (which repo / ref to warm) — never
@@ -34,7 +42,10 @@ pub struct CanonicalEvent {
     pub after: Option<String>,
     /// The repo's default branch, when the payload carries it.
     pub default_branch: Option<String>,
-    /// Repo visibility, when the payload carries it.
+    /// Repo visibility, when the payload carries it. Currently **informational**
+    /// only: the warm path always resolves the upstream credential from the
+    /// configured broker regardless of visibility, so this does not gate
+    /// behavior today. Kept for parity across adapters and future use.
     pub private: Option<bool>,
 }
 
@@ -63,14 +74,16 @@ pub trait WebhookProvider {
 }
 
 /// The webhook adapter for a provider kind, or `None` if that kind has no
-/// adapter yet. Phase 1: GitHub only. The adapter is `Send + Sync` so it can be
-/// held across `.await` points inside the (Send) request handler.
+/// adapter yet. The adapter is `Send + Sync` so it can be held across `.await`
+/// points inside the (Send) request handler.
 pub fn provider_for(kind: ProviderKind) -> Option<Box<dyn WebhookProvider + Send + Sync>> {
     match kind {
         ProviderKind::GitHub => Some(Box::new(github::GitHub)),
-        // GitLab (`X-Gitlab-Token`) and Gitea (`X-Gitea-Signature`) are
-        // follow-ups behind this same trait.
-        _ => None,
+        ProviderKind::GitLab => Some(Box::new(gitlab::GitLab)),
+        // `Gitea` covers Forgejo/Codeberg (same payload + signature scheme).
+        ProviderKind::Gitea => Some(Box::new(gitea::Gitea)),
+        // Bitbucket and config-only `Generic` hosts have no adapter yet.
+        ProviderKind::Bitbucket | ProviderKind::Generic => None,
     }
 }
 
@@ -112,7 +125,8 @@ impl WebhookConfig {
         }
     }
 
-    /// Set the repo allowlist (chainable). Repos are matched by storage key.
+    /// Set the repo allowlist (chainable). Entries use the operator-facing
+    /// natural key (`owner/repo` for github, `provider/path` otherwise).
     pub fn with_allowlist(mut self, repos: impl IntoIterator<Item = String>) -> Self {
         self.allowlist = Some(repos.into_iter().collect());
         self
@@ -195,27 +209,31 @@ impl WebhookConfig {
         self.warm_all
     }
 
-    /// Whether a repo (by storage key) may be warmed. Allow-all when no
-    /// allowlist is configured.
-    pub fn allows(&self, storage_key: &str) -> bool {
+    /// Whether a repo (by its natural key — see [`RepoId::natural_key`]) may be
+    /// warmed. Allow-all when no allowlist is configured.
+    ///
+    /// [`RepoId::natural_key`]: crate::provider::RepoId::natural_key
+    pub fn allows(&self, repo_key: &str) -> bool {
         match &self.allowlist {
-            Some(set) => set.contains(storage_key),
+            Some(set) => set.contains(repo_key),
             None => true,
         }
     }
 }
 
-/// Turn a raw env value into a secret. An absent **or empty** value yields no
-/// secret — fail closed: an empty `RIPCLONE_WEBHOOK_SECRET_*` must never be
-/// treated as a usable HMAC key (it would let anyone who knows it is empty forge
-/// a valid signature).
+/// Turn a raw env value into a secret. An absent, empty, **or all-whitespace**
+/// value yields no secret — fail closed: a blank `RIPCLONE_WEBHOOK_SECRET_*`
+/// must never be treated as a usable key (for GitLab the secret *is* the bare
+/// token, so a whitespace-only token would be a trivially guessable credential).
+/// The secret is kept verbatim (not trimmed) so a token that legitimately
+/// contains spaces still matches what the provider sends.
 fn parse_secret(raw: Option<String>) -> Option<SecretString> {
-    raw.filter(|s| !s.is_empty())
+    raw.filter(|s| !s.trim().is_empty())
         .map(|s| SecretString::new(s.into()))
 }
 
 /// Parse the comma-separated `RIPCLONE_WEBHOOK_ALLOWLIST` into a set of repo
-/// storage keys. Entries are trimmed; empty entries are dropped. An absent value
+/// natural keys. Entries are trimmed; empty entries are dropped. An absent value
 /// or one that yields no entries returns `None` (allow-all).
 fn parse_allowlist(raw: Option<String>) -> Option<HashSet<String>> {
     raw.map(|raw| {
@@ -277,14 +295,16 @@ mod tests {
     }
 
     #[test]
-    fn parse_secret_rejects_absent_and_empty() {
+    fn parse_secret_rejects_absent_empty_and_whitespace() {
         use secrecy::ExposeSecret;
-        // Absent or empty ⇒ no secret (fail closed: never an empty HMAC key).
+        // Absent / empty / all-whitespace ⇒ no secret (fail closed).
         assert!(parse_secret(None).is_none());
         assert!(parse_secret(Some(String::new())).is_none());
-        // A real value is kept verbatim.
-        let s = parse_secret(Some("hunter2".to_string())).expect("non-empty secret");
-        assert_eq!(s.expose_secret(), "hunter2");
+        assert!(parse_secret(Some("   ".to_string())).is_none());
+        assert!(parse_secret(Some("\t\n".to_string())).is_none());
+        // A real value is kept verbatim (not trimmed).
+        let s = parse_secret(Some(" hunter2 ".to_string())).expect("non-blank secret");
+        assert_eq!(s.expose_secret(), " hunter2 ");
     }
 
     #[test]
