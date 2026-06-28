@@ -99,8 +99,28 @@ Per provider instance:
   (`rust/src/auth/broker.rs`). The webhook carries no token, so private clones use
   the server's configured credential, and the job carries it through the queue
   (#55) so the worker can clone a private repo.
-- **Repo allowlist (optional)** — only enqueue for listed repos. If unset, allow
-  all (single-tenant trust). Document the chosen default explicitly.
+- **Repo allowlist (optional)** — `RIPCLONE_WEBHOOK_ALLOWLIST`, comma-separated.
+  Only enqueue for listed repos; unset ⇒ allow all (single-tenant trust, with a
+  loud startup log). Entries use the **natural key**: `owner/repo` for GitHub,
+  provider-prefixed for others (`gitlab/group/sub/proj`, `gitea/owner/repo`) —
+  *not* the slash-escaped storage key.
+- **Branch policy** — always warm the default branch (from the payload, or the
+  local mirror's HEAD if the provider omits it); warm other branches only if
+  already tracked. `RIPCLONE_WEBHOOK_WARM_ALL=1` warms every pushed branch.
+
+### Per-provider setup notes
+
+- **GitHub** — set the webhook secret to `RIPCLONE_WEBHOOK_SECRET_GITHUB` (the
+  legacy `RIPCLONE_WEBHOOK_SECRET` is still honored). Point it at
+  `/webhooks/github` (or the back-compat `/v1/webhooks/github`).
+- **GitLab** — use the **Secret token** field (sent verbatim in `X-Gitlab-Token`),
+  *not* the newer signing-token scheme (an HMAC `webhook-signature` header), which
+  this receiver does not implement — it would be rejected (fail-closed), never
+  silently accepted. Set `RIPCLONE_WEBHOOK_SECRET_GITLAB` to the same value.
+- **Gitea / Forgejo** — the `X-Gitea-Signature` HMAC secret is
+  `RIPCLONE_WEBHOOK_SECRET_GITEA`. **Enable the "Delete" event** on the webhook:
+  unlike GitHub, Gitea fires a dedicated `delete` event for branch deletions (not
+  a zero-`after` push), so without it branch-delete cleanup won't fire.
 
 ## Action
 

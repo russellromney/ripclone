@@ -2737,7 +2737,7 @@ async fn webhook_dispatch_push(
         return webhook_ignored("invalid repo path");
     }
     // Allowlist gate (allow-all when unconfigured).
-    if !state.webhook_config.allows(&repo_id.storage_key()) {
+    if !state.webhook_config.allows(&repo_id.natural_key()) {
         return webhook_ignored("repo not in webhook allowlist");
     }
     // Phase 1 warms branches only; tags and other refs are ignored.
@@ -2812,7 +2812,7 @@ async fn webhook_dispatch_delete(
     // Gate cleanup by the same allowlist as push so the receiver only acts on
     // in-scope repos (an out-of-scope repo was never warmed, so this is a no-op
     // either way — the gate just keeps push and delete symmetric).
-    if !state.webhook_config.allows(&repo_id.storage_key()) {
+    if !state.webhook_config.allows(&repo_id.natural_key()) {
         return webhook_ignored("repo not in webhook allowlist");
     }
     let Some(branch) = event
@@ -7069,6 +7069,110 @@ mod tests {
             "gitea delete cleans up the stored ref"
         );
         assert!(rx.try_recv().is_err(), "a delete must not enqueue");
+    }
+
+    #[tokio::test]
+    async fn webhook_gitea_bad_signature_returns_401() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, mut rx) = provider_webhook_state(&tmp, "gitea", "gitea", "gitea.example.com");
+        let app = build_app(state);
+        let body = br#"{"ref":"refs/heads/main","after":"1111111111111111111111111111111111111111","repository":{"full_name":"acme/widget","default_branch":"main"}}"#.to_vec();
+        // Sign with the WRONG secret.
+        let sig = {
+            use hmac::{Hmac, Mac};
+            use sha2::Sha256;
+            let mut mac = Hmac::<Sha256>::new_from_slice(b"wrong-secret").unwrap();
+            mac.update(&body);
+            hex::encode(mac.finalize().into_bytes())
+        };
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/webhooks/gitea")
+            .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))))
+            .header("X-Gitea-Event", "push")
+            .header("X-Gitea-Signature", sig)
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            rx.try_recv().is_err(),
+            "a bad gitea signature must not enqueue"
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_gitlab_branch_delete_cleans_up_ref() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, mut rx) = provider_webhook_state(&tmp, "gitlab", "gitlab", "gitlab.com");
+        let repo = RepoId {
+            provider: crate::provider::ProviderInstanceId::new("gitlab"),
+            path: "group/sub/proj".to_string(),
+        };
+        let info = RefInfo {
+            commit: "deadbeef".to_string(),
+            default_branch: "main".to_string(),
+            ..Default::default()
+        };
+        state
+            .ref_store
+            .save_branch(&repo, "feature", &info)
+            .await
+            .unwrap();
+        let ref_store = state.ref_store.clone();
+        let app = build_app(state);
+        // GitLab signals a branch delete with an all-zeros `after` on a Push Hook.
+        let body = br#"{"ref":"refs/heads/feature","after":"0000000000000000000000000000000000000000","project":{"path_with_namespace":"group/sub/proj","default_branch":"main"}}"#.to_vec();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/webhooks/gitlab")
+            .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))))
+            .header("X-Gitlab-Event", "Push Hook")
+            .header("X-Gitlab-Token", WEBHOOK_SECRET)
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            ref_store
+                .load_branch(&repo, "feature")
+                .await
+                .unwrap()
+                .is_none(),
+            "gitlab delete cleans up the stored ref"
+        );
+        assert!(rx.try_recv().is_err(), "a delete must not enqueue");
+    }
+
+    #[tokio::test]
+    async fn webhook_gitlab_allowlist_matches_natural_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut state, mut rx) = provider_webhook_state(&tmp, "gitlab", "gitlab", "gitlab.com");
+        // The allowlist is written in the operator-facing natural form
+        // (provider-prefixed, unescaped) — not the escaped storage key.
+        state.webhook_config = Arc::new(
+            WebhookConfig::with_secret("gitlab", WEBHOOK_SECRET)
+                .with_allowlist(["gitlab/group/sub/proj".to_string()]),
+        );
+        let app = build_app(state);
+        let body = br#"{"ref":"refs/heads/main","after":"1111111111111111111111111111111111111111","project":{"path_with_namespace":"group/sub/proj","default_branch":"main"}}"#.to_vec();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/webhooks/gitlab")
+            .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))))
+            .header("X-Gitlab-Event", "Push Hook")
+            .header("X-Gitlab-Token", WEBHOOK_SECRET)
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            rx.try_recv()
+                .expect("allowlisted gitlab repo enqueues")
+                .repo_id
+                .path,
+            "group/sub/proj"
+        );
     }
 
     #[tokio::test]

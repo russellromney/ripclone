@@ -59,8 +59,20 @@ pub fn validate_repo_path(provider: &ProviderInstance, repo_id: &RepoId) -> Resu
     if repo_id.path.contains('\0') || repo_id.path.contains('\\') {
         anyhow::bail!("repo path contains unsafe characters: {}", repo_id.path);
     }
+    if repo_id.path.bytes().any(|b| b.is_ascii_control()) {
+        anyhow::bail!("repo path contains control characters: {}", repo_id.path);
+    }
     if repo_id.path.starts_with('/') {
         anyhow::bail!("repo path must not start with '/': {}", repo_id.path);
+    }
+    // Defense in depth: a `..` segment is never a legitimate repo path and is
+    // the classic traversal token. Slash-escaping already neutralizes it in
+    // storage keys, but reject it outright so it can't reach a clone URL either.
+    if repo_id.path.split('/').any(|seg| seg == "..") {
+        anyhow::bail!(
+            "repo path must not contain a '..' segment: {}",
+            repo_id.path
+        );
     }
     Ok(())
 }
@@ -137,5 +149,34 @@ mod tests {
         assert!(validate_git_rev("main").is_ok());
         assert!(validate_git_rev("feature/foo-bar").is_ok());
         assert!(validate_git_rev("abc123").is_ok());
+    }
+
+    fn provider(kind: ProviderKind, id: &str) -> ProviderInstance {
+        ProviderInstance {
+            id: crate::provider::ProviderInstanceId::new(id),
+            kind,
+            host: "example.com".to_string(),
+            auth_template: None,
+        }
+    }
+
+    #[test]
+    fn validate_repo_path_rejects_traversal_and_control_for_non_github() {
+        let p = provider(ProviderKind::GitLab, "gitlab");
+        let path = |s: &str| RepoId {
+            provider: crate::provider::ProviderInstanceId::new("gitlab"),
+            path: s.to_string(),
+        };
+        // Legit subgroup paths pass.
+        assert!(validate_repo_path(&p, &path("group/sub/proj")).is_ok());
+        // `..` segments, control chars, backslash, leading slash, empty: rejected.
+        assert!(validate_repo_path(&p, &path("group/../etc")).is_err());
+        assert!(validate_repo_path(&p, &path("..")).is_err());
+        assert!(validate_repo_path(&p, &path("a/..")).is_err());
+        assert!(validate_repo_path(&p, &path("a\u{7}b")).is_err());
+        assert!(validate_repo_path(&p, &path("/abs")).is_err());
+        assert!(validate_repo_path(&p, &path("")).is_err());
+        // A filename merely containing dots (not a `..` segment) is fine.
+        assert!(validate_repo_path(&p, &path("group/a..b")).is_ok());
     }
 }

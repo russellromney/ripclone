@@ -441,6 +441,20 @@ impl RepoId {
         }
     }
 
+    /// Human-readable key for operator-facing config (the webhook allowlist).
+    ///
+    /// Unlike [`storage_key`](Self::storage_key) this does NOT slash-escape the
+    /// path, so it matches what an operator naturally writes. The `github`
+    /// default renders to the bare `owner/repo`; other providers are prefixed
+    /// with the instance id: `gitlab/group/sub/proj`.
+    pub fn natural_key(&self) -> String {
+        if self.is_github_default() {
+            self.path.clone()
+        } else {
+            format!("{}/{}", self.provider.as_str(), self.path)
+        }
+    }
+
     /// Directory name for the local bare mirror.
     ///
     /// Back-compat invariant: the `github` default instance renders to
@@ -630,6 +644,19 @@ mod tests {
         let repo = RepoId::github("ripclone/test");
         assert_eq!(repo.storage_key(), "ripclone/test");
         assert_eq!(repo.mirror_dir_name(), "ripclone_test.git");
+    }
+
+    #[test]
+    fn natural_key_is_unescaped_and_provider_prefixed() {
+        // github default: bare owner/repo (same as storage_key).
+        assert_eq!(RepoId::github("acme/widget").natural_key(), "acme/widget");
+        // non-github: provider-prefixed, NOT slash-escaped (unlike storage_key).
+        let gl = RepoId {
+            provider: ProviderInstanceId::new("gitlab"),
+            path: "group/sub/proj".to_string(),
+        };
+        assert_eq!(gl.natural_key(), "gitlab/group/sub/proj");
+        assert_eq!(gl.storage_key(), "gitlab/group%2Fsub%2Fproj");
     }
 
     #[test]

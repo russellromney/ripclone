@@ -42,7 +42,10 @@ pub struct CanonicalEvent {
     pub after: Option<String>,
     /// The repo's default branch, when the payload carries it.
     pub default_branch: Option<String>,
-    /// Repo visibility, when the payload carries it.
+    /// Repo visibility, when the payload carries it. Currently **informational**
+    /// only: the warm path always resolves the upstream credential from the
+    /// configured broker regardless of visibility, so this does not gate
+    /// behavior today. Kept for parity across adapters and future use.
     pub private: Option<bool>,
 }
 
@@ -215,12 +218,14 @@ impl WebhookConfig {
     }
 }
 
-/// Turn a raw env value into a secret. An absent **or empty** value yields no
-/// secret — fail closed: an empty `RIPCLONE_WEBHOOK_SECRET_*` must never be
-/// treated as a usable HMAC key (it would let anyone who knows it is empty forge
-/// a valid signature).
+/// Turn a raw env value into a secret. An absent, empty, **or all-whitespace**
+/// value yields no secret — fail closed: a blank `RIPCLONE_WEBHOOK_SECRET_*`
+/// must never be treated as a usable key (for GitLab the secret *is* the bare
+/// token, so a whitespace-only token would be a trivially guessable credential).
+/// The secret is kept verbatim (not trimmed) so a token that legitimately
+/// contains spaces still matches what the provider sends.
 fn parse_secret(raw: Option<String>) -> Option<SecretString> {
-    raw.filter(|s| !s.is_empty())
+    raw.filter(|s| !s.trim().is_empty())
         .map(|s| SecretString::new(s.into()))
 }
 
@@ -287,14 +292,16 @@ mod tests {
     }
 
     #[test]
-    fn parse_secret_rejects_absent_and_empty() {
+    fn parse_secret_rejects_absent_empty_and_whitespace() {
         use secrecy::ExposeSecret;
-        // Absent or empty ⇒ no secret (fail closed: never an empty HMAC key).
+        // Absent / empty / all-whitespace ⇒ no secret (fail closed).
         assert!(parse_secret(None).is_none());
         assert!(parse_secret(Some(String::new())).is_none());
-        // A real value is kept verbatim.
-        let s = parse_secret(Some("hunter2".to_string())).expect("non-empty secret");
-        assert_eq!(s.expose_secret(), "hunter2");
+        assert!(parse_secret(Some("   ".to_string())).is_none());
+        assert!(parse_secret(Some("\t\n".to_string())).is_none());
+        // A real value is kept verbatim (not trimmed).
+        let s = parse_secret(Some(" hunter2 ".to_string())).expect("non-blank secret");
+        assert_eq!(s.expose_secret(), " hunter2 ");
     }
 
     #[test]
