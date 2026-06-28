@@ -2127,6 +2127,7 @@ async fn sync_repo_inner(
                     branch: branch.clone(),
                     rev: at_rev.clone(),
                     credential,
+                    recheck: 0,
                 };
                 let full = match state.build_queue.enqueue(job).await {
                     Ok(enq) => enq.outcome == EnqueueOutcome::Full,
@@ -2248,6 +2249,7 @@ async fn sync_repo_inner(
                 branch: branch.clone(),
                 rev: at_rev.clone(),
                 credential,
+                recheck: 0,
             };
             let enq = match state.build_queue.enqueue(job).await {
                 Ok(enq) => enq,
@@ -2469,6 +2471,7 @@ async fn trigger_build(state: &ServerState, repo_id: &RepoId, branch: &str) -> R
         branch: branch.to_string(),
         rev: None,
         credential,
+        recheck: 0,
     };
 
     if state.build_queue.inproc_wait() {
@@ -5439,6 +5442,11 @@ pub async fn process_build_job(state: &ServerState, job: &BuildJob) -> Result<()
                 "background build completed for {}@{effective_branch}",
                 repo_id.storage_key()
             );
+            // A push that landed during this build is invisible to it (the tip was
+            // resolved once, at the start). Re-check the tip now and, if it moved,
+            // build the latest — so a fast-moving repo's served HEAD catches up
+            // within one build cycle instead of waiting for the next poke.
+            post_build_freshness_recheck(state, job, &provider, &info.commit).await;
             Ok(())
         }
         Err(e) => {
@@ -5450,6 +5458,129 @@ pub async fn process_build_job(state: &ServerState, job: &BuildJob) -> Result<()
                 repo_id.storage_key()
             );
             Err(format!("{e}"))
+        }
+    }
+}
+
+/// Max consecutive post-build freshness re-triggers before deferring to the
+/// periodic poller. Bounds how aggressively one fast-moving repo can re-trigger
+/// itself and monopolize a worker; the poller still picks up any remainder.
+/// `0` disables the post-build re-check entirely.
+fn recheck_max() -> u32 {
+    std::env::var("RIPCLONE_RECHECK_MAX")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3)
+}
+
+/// After a tip build completes, check whether the upstream tip moved during the
+/// build and, if so, build the current tip once. `trigger_build` coalesces and
+/// always builds the latest tip, so a burst of pushes collapses to one catch-up
+/// build of the newest commit. Bounded by [`recheck_max`] so a repo pushing
+/// faster than it builds can't pin a worker.
+async fn post_build_freshness_recheck(
+    state: &ServerState,
+    job: &BuildJob,
+    provider: &ProviderInstance,
+    built_commit: &str,
+) {
+    let max = recheck_max();
+    // Tip builds only (a rev-pinned build has no "moving tip" to chase), and stop
+    // once the re-check chain hits the cap.
+    if max == 0 || job.rev.is_some() || job.recheck >= max {
+        return;
+    }
+    let repo_id = &job.repo_id;
+    let branch = &job.branch;
+
+    // Test hook: hold the re-check briefly so a test can move the upstream tip
+    // after the build resolved its commit but before this re-check reads it.
+    if let Ok(ms) = std::env::var("RIPCLONE_TEST_RECHECK_DELAY_MS")
+        && let Ok(ms) = ms.parse::<u64>()
+    {
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+    }
+
+    let credential = state.broker.fetch_credential(repo_id, None);
+
+    // One ls-remote round-trip, under the same cap as a real fetch.
+    let tip = {
+        let provider_ls = provider.clone();
+        let repo_id_ls = repo_id.clone();
+        let branch_ls = branch.clone();
+        let _permit = fetch_semaphore()
+            .acquire()
+            .await
+            .expect("fetch semaphore never closed");
+        tokio::task::spawn_blocking(move || {
+            git::ls_remote_commit(&provider_ls, &repo_id_ls, &branch_ls, credential.as_ref())
+        })
+        .await
+        .unwrap_or(Ok(None))
+    };
+    let Ok(Some(tip)) = tip else {
+        return;
+    };
+    if tip == built_commit {
+        return;
+    }
+
+    // The tip moved during the build. If a concurrent build already produced it,
+    // reuse_existing_build re-points the branch and we're caught up; otherwise
+    // enqueue one build of the current tip (coalesced if one already started).
+    if reuse_existing_build(&state.ref_store, repo_id, branch, &tip)
+        .await
+        .is_some()
+    {
+        return;
+    }
+    info!(
+        "post-build re-check: {} tip moved to {}; building latest",
+        repo_id.storage_key(),
+        &tip[..7.min(tip.len())]
+    );
+    if let Err(e) = enqueue_recheck_build(state, repo_id, branch, job.recheck + 1).await {
+        warn!(
+            "post-build re-check trigger failed for {}: {e}",
+            repo_id.storage_key()
+        );
+    }
+}
+
+/// Enqueue a freshness re-check build. Unlike [`trigger_build`], this does *not*
+/// take the in-process `build_waiters` coalescing slot: it runs at the end of the
+/// just-completed build, whose slot is still held until the worker releases it, so
+/// going through `build_waiters` would fold this re-trigger into the finishing
+/// build and never rebuild. A direct enqueue creates a genuine new job; same-repo
+/// builds still serialize on the per-repo mirror lock and a redundant one no-ops
+/// via the commit-keyed reuse check.
+async fn enqueue_recheck_build(
+    state: &ServerState,
+    repo_id: &RepoId,
+    branch: &str,
+    recheck: u32,
+) -> Result<(), String> {
+    let credential = state.broker.fetch_credential(repo_id, None);
+    let job = BuildJob {
+        repo_id: repo_id.clone(),
+        branch: branch.to_string(),
+        rev: None,
+        credential,
+        recheck,
+    };
+    state.metrics.record_build_queued();
+    match state.build_queue.enqueue(job).await {
+        Ok(enq) if enq.outcome != EnqueueOutcome::Full => {
+            state.metrics.record_build_accepted();
+            Ok(())
+        }
+        Ok(_) => {
+            state.metrics.record_build_rejected();
+            Err("build queue full".to_string())
+        }
+        Err(e) => {
+            state.metrics.record_build_rejected();
+            Err(format!("build queue unavailable: {e}"))
         }
     }
 }

@@ -408,6 +408,7 @@ mod tests {
             branch: branch.into(),
             rev: None,
             credential: None,
+            recheck: 0,
         }
     }
 

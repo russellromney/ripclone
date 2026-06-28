@@ -43,6 +43,12 @@ pub struct BuildJob {
     /// [`SqlJobQueue`] never persists credentials — its worker resolves its own
     /// via the credential broker.
     pub credential: Option<secrecy::SecretString>,
+    /// How many consecutive post-build freshness re-checks led to this job. The
+    /// post-build re-check stops once this reaches `RIPCLONE_RECHECK_MAX`, so a
+    /// repo pushing faster than it builds can't pin a worker. Only carried
+    /// in-process; the cross-process [`SqlJobQueue`] does not persist it (like
+    /// `rev`/`credential`), and the periodic poller is the backstop there.
+    pub recheck: u32,
 }
 
 impl BuildJob {

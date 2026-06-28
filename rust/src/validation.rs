@@ -159,6 +159,7 @@ mod tests {
             kind,
             host: "example.com".to_string(),
             auth_template: None,
+            auth_header_name: None,
         }
     }
 
