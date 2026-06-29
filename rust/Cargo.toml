@@ -73,7 +73,7 @@ walkdir = "2"
 zstd = { version = "0.13", features = ["zdict_builder"] }
 secrecy = "0.10.3"
 async-trait = "0.1.89"
-jsonwebtoken = "10.4.0"
+jsonwebtoken = { version = "10.4.0", features = ["rust_crypto"] }
 subtle = "2"
 # Pluggable SQL queue + metadata backends: sqlite (local), postgres/mysql
 # (network), libsql (remote Turso Cloud).

@@ -442,12 +442,35 @@ impl Client {
         token: Option<String>,
         cache_dir: Option<&Path>,
     ) -> Self {
+        let auth = token.as_ref().map(|t| format!("Ripclone {t}"));
+        Self::new_with_auth(server, token, auth, cache_dir)
+    }
+
+    /// Create a client that authenticates with a `Bearer <jwt>` session token
+    /// (from `ripclone auth login`) instead of the shared `Ripclone <hash>`
+    /// scheme. The JWT is not embedded in git smart-HTTP URLs, so `token` stays
+    /// `None`.
+    pub fn new_with_bearer(server: String, jwt: String) -> Self {
+        let cache_dir = if std::env::var_os("RIPCLONE_NO_CACHE").is_some() {
+            None
+        } else {
+            std::env::var_os("RIPCLONE_CACHE_DIR").map(PathBuf::from)
+        };
+        let auth = Some(format!("Bearer {jwt}"));
+        Self::new_with_auth(server, None, auth, cache_dir.as_deref())
+    }
+
+    fn new_with_auth(
+        server: String,
+        token: Option<String>,
+        auth_value: Option<String>,
+        cache_dir: Option<&Path>,
+    ) -> Self {
         let mut headers = reqwest::header::HeaderMap::new();
-        if let Some(token) = &token {
-            let value = format!("Ripclone {}", token);
-            if let Ok(header_value) = reqwest::header::HeaderValue::from_str(&value) {
-                headers.insert(reqwest::header::AUTHORIZATION, header_value);
-            }
+        if let Some(value) = &auth_value
+            && let Ok(header_value) = reqwest::header::HeaderValue::from_str(value)
+        {
+            headers.insert(reqwest::header::AUTHORIZATION, header_value);
         }
         // Advertise the wire protocol so the server can reject an incompatible
         // (too-new) client with an actionable error instead of a confusing 4xx.

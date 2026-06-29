@@ -20,12 +20,12 @@ use crate::validation;
 use crate::webhook::{EventKind, WebhookConfig};
 use anyhow::{Context, Result};
 use axum::{
-    Json, Router,
+    Form, Json, Router,
     body::{Body, Bytes},
     extract::{ConnectInfo, DefaultBodyLimit, OriginalUri, Path, Query, State},
     http::{HeaderMap, StatusCode},
     middleware::{self, Next},
-    response::{IntoResponse, Response},
+    response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
 };
 use futures::{StreamExt, TryStreamExt};
@@ -52,6 +52,10 @@ pub struct ServerState {
     pub provider_registry: ProviderRegistry,
     pub broker: Arc<dyn CredentialBroker>,
     pub token_hash: Option<String>,
+    /// Signing material for short-lived session tokens (`ripclone auth login`).
+    /// `None` when no signing secret is available (only the token *hash* is
+    /// configured); session-token issuance is then disabled.
+    pub jwt: Option<Arc<crate::auth::jwt::JwtKeys>>,
     pub metrics: Arc<Metrics>,
     pub rate_limiter: RateLimiter,
     pub retention: Arc<Retention>,
@@ -125,6 +129,7 @@ impl ServerState {
             provider_registry,
             broker,
             token_hash: None,
+            jwt: None,
             metrics,
             rate_limiter: RateLimiter::new(60, 10.0),
             retention: b.retention,
@@ -541,6 +546,9 @@ pub fn build_app(state: ServerState) -> Router {
         // multi-provider form ("gitlab/group/sub/proj/sync") from the path.
         .route("/v1/repos/{*path}", get(dispatch_repos_get))
         .route("/v1/repos/{*path}", post(dispatch_repos_post))
+        // Refresh requires a still-valid session token (the auth layer verifies
+        // the Bearer); it mints a fresh one before the current expires.
+        .route("/v1/auth/refresh", post(auth_refresh_handler))
         .route("/v1/packs/{hash}", get(get_pack))
         .route("/v1/objects/{sha}", get(get_object))
         .route("/v1/artifacts/{hash}", get(get_artifact))
@@ -559,6 +567,10 @@ pub fn build_app(state: ServerState) -> Router {
     let rate_limited = Router::new()
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics_handler))
+        // Session-token login: the page and the exchange are unauthenticated (they
+        // prove the secret in the body) but rate-limited against brute force.
+        .route("/login", get(login_page_handler))
+        .route("/v1/auth/login", post(auth_login_handler))
         .route("/v1/build", post(build_handler))
         // Provider-agnostic push-webhook receiver: authenticated by the provider
         // HMAC over the raw body (not the ripclone bearer token), so it lives
@@ -628,11 +640,16 @@ async fn auth_middleware(
     next: Next,
 ) -> Response {
     let path = request.uri().path().to_string();
+    // The login page and the login exchange must be reachable without a
+    // credential — their whole purpose is to mint one by proving the secret.
+    if path == "/login" || path == "/v1/auth/login" {
+        return next.run(request).await;
+    }
     if let Some(expected) = &state.token_hash {
         let authorized = headers
             .get(axum::http::header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
-            .map(|v| check_auth_header(v, expected))
+            .map(|v| check_auth_header(v, expected) || check_bearer_token(v, state.jwt.as_deref()))
             .unwrap_or(false);
         if !authorized {
             // Smart-HTTP clients (vanilla git) expect a Basic challenge so they
@@ -662,6 +679,253 @@ async fn auth_middleware(
 fn constant_time_eq_str(a: &str, b: &str) -> bool {
     use subtle::ConstantTimeEq;
     a.as_bytes().ct_eq(b.as_bytes()).into()
+}
+
+/// Accept a `Bearer <jwt>` session token issued by `/v1/auth/login`. Returns
+/// false when the header isn't a bearer, session tokens are disabled, or the
+/// token fails verification (bad signature, wrong issuer, expired).
+fn check_bearer_token(header: &str, jwt: Option<&crate::auth::jwt::JwtKeys>) -> bool {
+    let Some(token) = header.strip_prefix("Bearer ") else {
+        return false;
+    };
+    jwt.map(|keys| keys.verify(token).is_ok()).unwrap_or(false)
+}
+
+#[derive(Deserialize)]
+struct LoginQuery {
+    /// Loopback URL the browser is redirected to with the minted token, for
+    /// `ripclone auth login`'s auto-capture. Absent → the page shows the token
+    /// for copy-paste.
+    callback: Option<String>,
+    /// Opaque value echoed back to the callback so the CLI can match its request.
+    state: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct LoginForm {
+    secret: String,
+    callback: Option<String>,
+    state: Option<String>,
+}
+
+#[derive(Serialize)]
+struct TokenResponse {
+    token: String,
+    /// Seconds until expiry.
+    expires_in: u64,
+    /// Absolute expiry (epoch seconds).
+    expires_at: u64,
+}
+
+/// Only ever redirect the minted token to a loopback address — never an external
+/// host. This is the open-redirect / token-exfiltration guard for the callback.
+fn is_loopback_callback(raw: &str) -> bool {
+    // Reject control characters outright (CR/LF would let a crafted callback split
+    // the redirect response header).
+    if raw.bytes().any(|b| b.is_ascii_control()) {
+        return false;
+    }
+    let Some(rest) = raw.strip_prefix("http://") else {
+        return false;
+    };
+    let authority = rest.split('/').next().unwrap_or("");
+    // No userinfo: `http://127.0.0.1:80@evil.com/` parses as loopback to a naive
+    // host:port split but a browser connects to `evil.com`. Reject any `@`.
+    if authority.contains('@') {
+        return false;
+    }
+    let host = authority
+        .rsplit_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or(authority);
+    host == "127.0.0.1" || host == "localhost" || host == "[::1]"
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+fn login_page_html(callback: Option<&str>, state: Option<&str>, error: Option<&str>) -> String {
+    let callback_field = callback
+        .map(|c| {
+            format!(
+                r#"<input type="hidden" name="callback" value="{}">"#,
+                html_escape(c)
+            )
+        })
+        .unwrap_or_default();
+    let state_field = state
+        .map(|s| {
+            format!(
+                r#"<input type="hidden" name="state" value="{}">"#,
+                html_escape(s)
+            )
+        })
+        .unwrap_or_default();
+    let error_block = error
+        .map(|e| format!(r#"<p class="err">{}</p>"#, html_escape(e)))
+        .unwrap_or_default();
+    format!(
+        r#"<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ripclone — sign in</title>
+<style>
+  :root {{ color-scheme: light dark; }}
+  body {{ font: 15px/1.5 system-ui, sans-serif; max-width: 26rem; margin: 12vh auto; padding: 0 1.25rem; }}
+  h1 {{ font-size: 1.25rem; margin: 0 0 .25rem; }}
+  p.sub {{ color: #888; margin: 0 0 1.5rem; }}
+  label {{ display: block; font-weight: 600; margin-bottom: .4rem; }}
+  input[type=password] {{ width: 100%; padding: .6rem .7rem; font-size: 1rem; border: 1px solid #8884; border-radius: .5rem; box-sizing: border-box; }}
+  button {{ margin-top: 1rem; width: 100%; padding: .65rem; font-size: 1rem; font-weight: 600; border: 0; border-radius: .5rem; background: #2563eb; color: #fff; cursor: pointer; }}
+  button:hover {{ background: #1d4ed8; }}
+  p.err {{ color: #dc2626; font-weight: 600; }}
+</style></head>
+<body>
+  <h1>ripclone</h1>
+  <p class="sub">Sign in to mint a short-lived session token.</p>
+  {error_block}
+  <form method="post" action="/v1/auth/login">
+    <label for="secret">Server token</label>
+    <input id="secret" name="secret" type="password" autocomplete="current-password" autofocus required>
+    {callback_field}{state_field}
+    <button type="submit">Sign in</button>
+  </form>
+</body></html>"#
+    )
+}
+
+fn token_page_html(token: &str) -> String {
+    format!(
+        r#"<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ripclone — session token</title>
+<style>
+  :root {{ color-scheme: light dark; }}
+  body {{ font: 15px/1.5 system-ui, sans-serif; max-width: 32rem; margin: 12vh auto; padding: 0 1.25rem; }}
+  h1 {{ font-size: 1.25rem; }}
+  p.sub {{ color: #888; }}
+  textarea {{ width: 100%; height: 7rem; font: 13px/1.4 ui-monospace, monospace; padding: .6rem; border: 1px solid #8884; border-radius: .5rem; box-sizing: border-box; }}
+</style></head>
+<body>
+  <h1>Signed in ✓</h1>
+  <p class="sub">Copy this token and paste it into <code>ripclone auth login</code>:</p>
+  <textarea readonly onclick="this.select()">{token}</textarea>
+</body></html>"#,
+        token = html_escape(token)
+    )
+}
+
+async fn login_page_handler(Query(q): Query<LoginQuery>) -> Html<String> {
+    Html(login_page_html(
+        q.callback.as_deref(),
+        q.state.as_deref(),
+        None,
+    ))
+}
+
+async fn auth_login_handler(
+    State(state): State<ServerState>,
+    Form(form): Form<LoginForm>,
+) -> Response {
+    let (Some(expected), Some(keys)) = (state.token_hash.as_deref(), state.jwt.as_deref()) else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Html(login_page_html(
+                form.callback.as_deref(),
+                form.state.as_deref(),
+                Some("Session tokens are not enabled on this server."),
+            )),
+        )
+            .into_response();
+    };
+
+    let presented = format!("{:x}", Sha256::digest(form.secret.as_bytes()));
+    if !constant_time_eq_str(&presented, expected) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Html(login_page_html(
+                form.callback.as_deref(),
+                form.state.as_deref(),
+                Some("Invalid server token."),
+            )),
+        )
+            .into_response();
+    }
+
+    let (token, _exp) = match keys.issue(crate::auth::jwt::ttl()) {
+        Ok(t) => t,
+        Err(e) => {
+            warn!("failed to mint session token: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "failed to mint token".to_string(),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    match form.callback.as_deref() {
+        Some(cb) if is_loopback_callback(cb) => {
+            let st = form.state.as_deref().unwrap_or("");
+            let sep = if cb.contains('?') { '&' } else { '?' };
+            // Percent-encode the query values so an attacker-supplied `state`
+            // can't inject extra parameters or split the Location header.
+            Redirect::to(&format!(
+                "{cb}{sep}token={}&state={}",
+                urlencoding::encode(&token),
+                urlencoding::encode(st)
+            ))
+            .into_response()
+        }
+        Some(_) => (
+            StatusCode::BAD_REQUEST,
+            Html(login_page_html(
+                None,
+                form.state.as_deref(),
+                Some("Refusing to deliver the token to a non-loopback address."),
+            )),
+        )
+            .into_response(),
+        None => Html(token_page_html(&token)).into_response(),
+    }
+}
+
+async fn auth_refresh_handler(State(state): State<ServerState>) -> Response {
+    // The auth layer already verified the caller's current Bearer token; mint a
+    // fresh one so a long-running client can roll its session before expiry.
+    let Some(keys) = state.jwt.as_deref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "session tokens disabled".to_string(),
+            }),
+        )
+            .into_response();
+    };
+    let ttl = crate::auth::jwt::ttl();
+    match keys.issue(ttl) {
+        Ok((token, expires_at)) => Json(TokenResponse {
+            token,
+            expires_in: ttl.as_secs(),
+            expires_at,
+        })
+        .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("failed to mint token: {e}"),
+            }),
+        )
+            .into_response(),
+    }
 }
 
 fn check_auth_header(header: &str, expected: &str) -> bool {
@@ -5881,6 +6145,22 @@ pub async fn run_server(
     let token_hash = read_server_auth_token()?;
     info!("server auth token configured; auth middleware enabled");
 
+    // Session-token signing key. Derived from the *raw* server token (or an
+    // explicit RIPCLONE_JWT_SECRET) — never from the hash clients hold. Disabled
+    // when only the hash is configured, so we never sign with client-known material.
+    let raw_server_token = env::var("RIPCLONE_SERVER_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty())
+        .or_else(|| env::var("RIPCLONE_TOKEN").ok().filter(|t| !t.is_empty()));
+    let jwt = crate::auth::jwt::JwtKeys::from_env(raw_server_token.as_deref()).map(Arc::new);
+    if jwt.is_some() {
+        info!("session tokens enabled: `ripclone auth login` issues short-lived JWTs");
+    } else {
+        info!(
+            "session tokens disabled: set RIPCLONE_JWT_SECRET (or RIPCLONE_SERVER_TOKEN as raw, not _HASH) to enable `ripclone auth login`"
+        );
+    }
+
     let provider_registry = ProviderRegistry::load().context("load provider registry")?;
     info!(
         "provider registry loaded with {} instance(s)",
@@ -5965,6 +6245,7 @@ pub async fn run_server(
         provider_registry,
         broker,
         token_hash: Some(token_hash),
+        jwt,
         metrics,
         rate_limiter,
         retention: b.retention,
@@ -6055,6 +6336,7 @@ mod tests {
             provider_registry,
             broker,
             token_hash: Some(token_hash),
+            jwt: None,
             metrics,
             rate_limiter: RateLimiter::new(100, 100.0),
             retention,

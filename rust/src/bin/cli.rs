@@ -48,6 +48,11 @@ enum Commands {
     Login,
     /// Remove the saved token.
     Logout,
+    /// Session-token auth against a self-hosted backend (`auth login`).
+    Auth {
+        #[command(subcommand)]
+        action: AuthAction,
+    },
     /// Show the CLI version + protocol, and check the configured server's.
     Version,
     /// Check for a newer ripclone release and show how to update.
@@ -219,6 +224,18 @@ enum SnapshotAction {
         #[arg(short, long)]
         dir: PathBuf,
     },
+}
+
+#[derive(Subcommand)]
+enum AuthAction {
+    /// Log in to the configured server: exchange the server token for a
+    /// short-lived session token (opens a browser; falls back to paste).
+    Login,
+    /// Remove the saved session token for the configured server.
+    Logout,
+    /// Show whether a session token is saved for the configured server, and when
+    /// it expires.
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -625,6 +642,220 @@ fn token_store() -> Result<FallbackTokenStore> {
     FallbackTokenStore::new().context("initialize token store")
 }
 
+/// Token-store key for a server's session token. Per-server so logging into one
+/// backend doesn't clobber another's session.
+fn session_key(server: &str) -> String {
+    format!("session:{server}")
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Read a JWT's `exp` claim without verifying the signature (the server holds the
+/// key). Used only to skip an obviously-expired saved token client-side.
+fn jwt_exp_secs(token: &str) -> Option<u64> {
+    let payload = token.split('.').nth(1)?;
+    let bytes =
+        base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, payload).ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    v.get("exp")?.as_u64()
+}
+
+/// Saved session token for `server`, if present and not about to expire. An
+/// unparseable token is returned as-is and left for the server to reject.
+fn load_valid_session_token(server: &str) -> Option<String> {
+    let token = token_store()
+        .ok()?
+        .get(&session_key(server))
+        .ok()
+        .flatten()?;
+    if token.is_empty() {
+        return None;
+    }
+    match jwt_exp_secs(&token) {
+        Some(exp) => (exp > now_secs() + 5).then_some(token),
+        None => Some(token),
+    }
+}
+
+async fn run_auth(server: &str, action: &AuthAction) -> Result<()> {
+    match action {
+        AuthAction::Login => run_auth_login(server).await,
+        AuthAction::Logout => {
+            token_store()?.delete(&session_key(server))?;
+            println!("Logged out of {server} — session token removed.");
+            Ok(())
+        }
+        AuthAction::Status => {
+            if let Some(token) = load_valid_session_token(server) {
+                match jwt_exp_secs(&token) {
+                    Some(exp) => println!(
+                        "Signed in to {server}. Session expires in ~{} min.",
+                        exp.saturating_sub(now_secs()) / 60
+                    ),
+                    None => println!("Signed in to {server} (session token saved)."),
+                }
+            } else {
+                let present = token_store()
+                    .ok()
+                    .and_then(|s| s.get(&session_key(server)).ok().flatten())
+                    .is_some();
+                if present {
+                    println!("Session token for {server} expired. Run `ripclone auth login`.");
+                } else {
+                    println!("Not signed in to {server}. Run `ripclone auth login`.");
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn run_auth_login(server: &str) -> Result<()> {
+    // A CSRF-style nonce echoed back through the callback. The ephemeral loopback
+    // port + 3-minute window are the primary protection; this just binds the
+    // browser round-trip to this CLI invocation, so no crypto-rng dep is needed.
+    let state = format!(
+        "{:x}",
+        Sha256::digest(
+            format!(
+                "{}-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0),
+                std::process::id()
+            )
+            .as_bytes()
+        )
+    );
+
+    // Loopback auto-capture: bind a localhost port, send the browser to /login
+    // with that callback, and wait for the redirect to land the token here.
+    if std::env::var_os("RIPCLONE_NO_BROWSER").is_none()
+        && let Ok(listener) = tokio::net::TcpListener::bind("127.0.0.1:0").await
+    {
+        let port = listener.local_addr()?.port();
+        let callback = format!("http://127.0.0.1:{port}/");
+        let url = format!(
+            "{server}/login?callback={}&state={}",
+            urlencoding::encode(&callback),
+            urlencoding::encode(&state)
+        );
+        println!("\n  Opening your browser to sign in…");
+        println!("  If it doesn't open, visit:\n    {url}\n");
+        open_browser(&url);
+        match capture_loopback_token(listener, &state).await {
+            Ok(Some(token)) => return save_session(server, &token),
+            Ok(None) => eprintln!("  Browser sign-in didn't complete; falling back to paste."),
+            Err(e) => eprintln!("  Loopback capture failed ({e}); falling back to paste."),
+        }
+    }
+
+    // Paste fallback (headless / no loopback): show the token, paste it back.
+    let url = format!("{server}/login");
+    println!("\n  Open this URL, sign in, and copy the token shown:\n    {url}\n");
+    open_browser(&url);
+    print!("  Paste session token: ");
+    std::io::stdout().flush().ok();
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .context("read pasted token")?;
+    let token = line.trim().to_string();
+    if token.is_empty() {
+        anyhow::bail!("no token entered");
+    }
+    save_session(server, &token)
+}
+
+fn save_session(server: &str, token: &str) -> Result<()> {
+    // Default future commands to this server if none is configured yet.
+    let mut cfg = ripclone::config::load_global();
+    if cfg.server.is_none() {
+        cfg.server = Some(server.to_string());
+        let _ = ripclone::config::save(&cfg);
+    }
+    token_store()?.set(&session_key(server), token)?;
+    let when = jwt_exp_secs(token)
+        .map(|exp| format!(" (expires in ~{} min)", exp.saturating_sub(now_secs()) / 60))
+        .unwrap_or_default();
+    println!("\n  ✓ Signed in to {server}{when}. Session token saved.");
+    Ok(())
+}
+
+/// Wait (up to 3 minutes) for the browser to hit the loopback callback and return
+/// the captured token. Ignores stray requests (e.g. `/favicon.ico`) and only
+/// accepts a callback whose `state` matches.
+async fn capture_loopback_token(
+    listener: tokio::net::TcpListener,
+    expected_state: &str,
+) -> Result<Option<String>> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let deadline = tokio::time::sleep(std::time::Duration::from_secs(180));
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            _ = &mut deadline => return Ok(None),
+            res = listener.accept() => {
+                let (mut sock, _) = res.context("accept loopback connection")?;
+                let mut buf = vec![0u8; 8192];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let target = req
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .unwrap_or("");
+                let captured = parse_callback(target, expected_state);
+                let body = if captured.is_some() {
+                    "<!doctype html><meta charset=utf-8><body style=\"font:15px system-ui;margin:12vh auto;max-width:24rem;text-align:center\"><h2>Signed in &#10003;</h2><p>You can close this tab and return to your terminal.</p></body>"
+                } else {
+                    "<!doctype html><meta charset=utf-8><body>Waiting for sign-in…</body>"
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+                if captured.is_some() {
+                    return Ok(captured);
+                }
+                // Stray request (favicon, etc.) — keep waiting for the real one.
+            }
+        }
+    }
+}
+
+/// Extract the `token` from a loopback callback request target
+/// (`/?token=...&state=...`), but only when `state` matches.
+fn parse_callback(target: &str, expected_state: &str) -> Option<String> {
+    let query = target.split_once('?').map(|(_, q)| q)?;
+    let mut token = None;
+    let mut state = None;
+    for pair in query.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            let decoded = urlencoding::decode(v)
+                .map(|c| c.into_owned())
+                .unwrap_or_else(|_| v.to_string());
+            match k {
+                "token" => token = Some(decoded),
+                "state" => state = Some(decoded),
+                _ => {}
+            }
+        }
+    }
+    if state.as_deref() != Some(expected_state) {
+        return None;
+    }
+    token.filter(|t| !t.is_empty())
+}
+
 async fn run_provider_add(
     id: &str,
     kind: Option<String>,
@@ -917,6 +1148,7 @@ async fn main() -> Result<()> {
             println!("Logged out — server token removed.");
             return Ok(());
         }
+        Commands::Auth { action } => return run_auth(&server, action).await,
         Commands::Version => return run_version(&server).await,
         Commands::Update => return run_update().await,
         _ => {}
@@ -963,15 +1195,38 @@ async fn main() -> Result<()> {
                 .filter(|t| !t.is_empty())
                 .map(|t| format!("{:x}", Sha256::digest(t.as_bytes())))
         });
-    let client = match server_token_hash {
-        Some(token) => Client::new_with_token(server.clone(), Some(token)),
-        None => Client::new(server.clone()),
+    // Prefer a session token from `ripclone auth login` over the saved login
+    // token, unless an explicit env server token is configured (that still wins).
+    let env_server_token = [
+        "RIPCLONE_SERVER_TOKEN_HASH",
+        "RIPCLONE_SERVER_TOKEN",
+        "RIPCLONE_TOKEN_HASH",
+        "RIPCLONE_TOKEN",
+    ]
+    .iter()
+    .any(|k| env::var(k).ok().filter(|t| !t.is_empty()).is_some());
+    let session_jwt = if env_server_token {
+        None
+    } else {
+        load_valid_session_token(&server)
+    };
+    let client = if let Some(jwt) = session_jwt {
+        Client::new_with_bearer(server.clone(), jwt)
+    } else {
+        match server_token_hash {
+            Some(token) => Client::new_with_token(server.clone(), Some(token)),
+            None => Client::new(server.clone()),
+        }
     }
     .with_provider(&default_provider);
 
     match args.command {
         // Handled before the client is built.
-        Commands::Login | Commands::Logout | Commands::Version | Commands::Update => {
+        Commands::Login
+        | Commands::Logout
+        | Commands::Auth { .. }
+        | Commands::Version
+        | Commands::Update => {
             unreachable!()
         }
         Commands::Provider { action } => match action {
@@ -1516,6 +1771,74 @@ async fn git_credential_token(host: &str, path: &str) -> Result<Option<String>> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_callback_extracts_token_when_state_matches() {
+        assert_eq!(
+            parse_callback("/?token=abc&state=s", "s"),
+            Some("abc".to_string())
+        );
+        // URL-encoded token is decoded.
+        assert_eq!(
+            parse_callback("/?token=a%2Eb&state=s", "s"),
+            Some("a.b".to_string())
+        );
+        // Order-independent.
+        assert_eq!(
+            parse_callback("/?state=s&token=abc", "s"),
+            Some("abc".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_callback_rejects_mismatched_or_missing() {
+        assert_eq!(parse_callback("/?token=abc&state=other", "s"), None);
+        assert_eq!(parse_callback("/?state=s", "s"), None); // no token
+        assert_eq!(parse_callback("/?token=abc", "s"), None); // no state
+        assert_eq!(parse_callback("/favicon.ico", "s"), None); // no query
+        assert_eq!(parse_callback("/?token=&state=s", "s"), None); // empty token
+    }
+
+    #[test]
+    fn jwt_exp_secs_reads_exp_without_verifying() {
+        use base64::Engine;
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"iss":"ripclone","exp":1893456000}"#);
+        let token = format!("header.{payload}.sig");
+        assert_eq!(jwt_exp_secs(&token), Some(1_893_456_000));
+        assert_eq!(jwt_exp_secs("not-a-jwt"), None);
+        assert_eq!(jwt_exp_secs("a.b.c"), None); // payload isn't valid JSON
+    }
+
+    #[tokio::test]
+    async fn loopback_capture_returns_token_and_ignores_strays() {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let capture = tokio::spawn(async move { capture_loopback_token(listener, "st8").await });
+
+        // A stray request with no token: the capture should keep waiting.
+        let mut favicon = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        favicon
+            .write_all(b"GET /favicon.ico HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        drop(favicon);
+
+        // The real callback with the matching state.
+        let mut cb = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        cb.write_all(b"GET /?token=the-jwt&state=st8 HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        drop(cb);
+
+        let captured = capture.await.unwrap().unwrap();
+        assert_eq!(captured, Some("the-jwt".to_string()));
+    }
 
     #[test]
     fn protocol_verdict_compatible_outdated_and_newer() {
