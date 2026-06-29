@@ -44,10 +44,12 @@ pub struct BuildJob {
     /// via the credential broker.
     pub credential: Option<secrecy::SecretString>,
     /// How many consecutive post-build freshness re-checks led to this job. The
-    /// post-build re-check stops once this reaches `RIPCLONE_RECHECK_MAX`, so a
-    /// repo pushing faster than it builds can't pin a worker. Only carried
-    /// in-process; the cross-process [`SqlJobQueue`] does not persist it (like
-    /// `rev`/`credential`), and the periodic poller is the backstop there.
+    /// post-build re-check stops once this reaches `RIPCLONE_RECHECK_MAX`, so on a
+    /// single box one repo pushing faster than it builds can't pin the worker.
+    /// Only carried in-process; the cross-process [`SqlJobQueue`] does not persist
+    /// it (like `rev`/`credential`), so there the chain is not capped — but it is
+    /// bounded by the real push rate (each re-trigger builds a genuinely newer tip,
+    /// not a spin) and spread across the worker pool, with the poller as backstop.
     pub recheck: u32,
 }
 

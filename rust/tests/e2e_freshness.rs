@@ -143,7 +143,9 @@ async fn recheck_burst_collapses_to_latest() {
 }
 
 /// A repo whose tip keeps moving stops re-triggering after the cap; the chain
-/// does not livelock.
+/// does not livelock. The key: a moved tip is present during the *capped*
+/// re-check's window, so only the cap (not "the tip didn't move") prevents the
+/// extra build — the catch-up test shows an uncapped re-check would build it.
 #[tokio::test]
 async fn recheck_stops_at_cap() {
     let _guard = SERIAL.lock().await;
@@ -157,7 +159,7 @@ async fn recheck_stops_at_cap() {
     let a = origin.commit(&[("f", "a\n")], "A");
     origin.publish();
 
-    // Build A (recheck=0). Its re-check builds B (recheck=1).
+    // Build A (recheck=0). Its re-check (held by the delay) builds B (recheck=1).
     let client = server.client();
     let sync = tokio::spawn(async move { client.sync_repo("acme/fresh3", None).await });
     tokio::time::sleep(Duration::from_millis(700)).await;
@@ -166,20 +168,26 @@ async fn recheck_stops_at_cap() {
     let resp = sync.await.expect("join").expect("sync A");
     assert_eq!(resp.commit, a);
 
-    // B builds and catches up.
+    // B builds and catches up. B's own re-check (recheck=1) is now in its held
+    // window, about to hit the cap.
     wait_until(&server, "acme/fresh3", &b, 2).await;
 
-    // The tip moves again, but B's build is at the cap (recheck=1 == max=1), so it
-    // does not re-trigger. With the poller off, C is never built.
-    origin.commit(&[("f", "c\n")], "C");
+    // Move the tip to C while B's capped re-check is held. An uncapped re-check
+    // would wake, see C, and build it; the cap must stop it instead.
+    let c = origin.commit(&[("f", "c\n")], "C");
     origin.publish();
 
-    // Give any (incorrect) re-trigger time to fire, then assert it didn't.
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    // Wait out B's re-check window plus margin, then assert C was never built.
+    tokio::time::sleep(Duration::from_millis(3000)).await;
+    assert_ne!(
+        served_commit(&server, "acme/fresh3").await.as_deref(),
+        Some(c.as_str()),
+        "C must not be served; the cap stopped the chain"
+    );
     assert_eq!(
         served_commit(&server, "acme/fresh3").await.as_deref(),
         Some(b.as_str()),
-        "served tip stays at B; the cap stopped the chain"
+        "served tip stays at B"
     );
     assert_eq!(
         builds_completed(&server).await,

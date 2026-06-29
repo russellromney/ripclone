@@ -5443,10 +5443,24 @@ pub async fn process_build_job(state: &ServerState, job: &BuildJob) -> Result<()
                 repo_id.storage_key()
             );
             // A push that landed during this build is invisible to it (the tip was
-            // resolved once, at the start). Re-check the tip now and, if it moved,
-            // build the latest — so a fast-moving repo's served HEAD catches up
-            // within one build cycle instead of waiting for the next poke.
-            post_build_freshness_recheck(state, job, &provider, &info.commit).await;
+            // resolved once, at the start). Re-check the tip and, if it moved, build
+            // the latest — so a fast-moving repo's served HEAD catches up within one
+            // build cycle instead of waiting for the next poke. Detached so the
+            // just-finished build signals its /sync waiter and releases its build
+            // permit immediately; the re-check's ls-remote runs off the hot path.
+            let recheck_state = state.clone();
+            let recheck_job = job.clone();
+            let recheck_provider = provider.clone();
+            let recheck_commit = info.commit.clone();
+            tokio::spawn(async move {
+                post_build_freshness_recheck(
+                    &recheck_state,
+                    &recheck_job,
+                    &recheck_provider,
+                    &recheck_commit,
+                )
+                .await;
+            });
             Ok(())
         }
         Err(e) => {
@@ -5485,25 +5499,31 @@ async fn post_build_freshness_recheck(
     built_commit: &str,
 ) {
     let max = recheck_max();
-    // Tip builds only (a rev-pinned build has no "moving tip" to chase), and stop
-    // once the re-check chain hits the cap.
-    if max == 0 || job.rev.is_some() || job.recheck >= max {
+    // Disabled, or a rev-pinned build (no moving tip to chase): nothing to do.
+    if max == 0 || job.rev.is_some() {
         return;
     }
     let repo_id = &job.repo_id;
     let branch = &job.branch;
 
     // Test hook: hold the re-check briefly so a test can move the upstream tip
-    // after the build resolved its commit but before this re-check reads it.
+    // after the build resolved its commit but before this re-check reads it. Kept
+    // ahead of the cap check so a test can exercise a capped re-check too.
     if let Ok(ms) = std::env::var("RIPCLONE_TEST_RECHECK_DELAY_MS")
         && let Ok(ms) = ms.parse::<u64>()
     {
         tokio::time::sleep(Duration::from_millis(ms)).await;
     }
 
+    // Stop once the re-check chain hits the cap; the poller picks up any remainder.
+    if job.recheck >= max {
+        return;
+    }
+
     let credential = state.broker.fetch_credential(repo_id, None);
 
-    // One ls-remote round-trip, under the same cap as a real fetch.
+    // One ls-remote round-trip, under the same cap as a real fetch. Bounded by a
+    // timeout: a hung upstream must not pin a fetch permit on this background path.
     let tip = {
         let provider_ls = provider.clone();
         let repo_id_ls = repo_id.clone();
@@ -5512,11 +5532,13 @@ async fn post_build_freshness_recheck(
             .acquire()
             .await
             .expect("fetch semaphore never closed");
-        tokio::task::spawn_blocking(move || {
+        let probe = tokio::task::spawn_blocking(move || {
             git::ls_remote_commit(&provider_ls, &repo_id_ls, &branch_ls, credential.as_ref())
-        })
-        .await
-        .unwrap_or(Ok(None))
+        });
+        match tokio::time::timeout(Duration::from_secs(30), probe).await {
+            Ok(joined) => joined.unwrap_or(Ok(None)),
+            Err(_) => Ok(None), // timed out; let the poller catch up instead
+        }
     };
     let Ok(Some(tip)) = tip else {
         return;
@@ -5568,20 +5590,20 @@ async fn enqueue_recheck_build(
         credential,
         recheck,
     };
-    state.metrics.record_build_queued();
+    // Count metrics off the outcome so the queue-depth gauge stays balanced: only
+    // a genuinely new job bumps it (and its completion decrements it). A coalesced
+    // enqueue drains no job, so it must not touch the gauge.
     match state.build_queue.enqueue(job).await {
-        Ok(enq) if enq.outcome != EnqueueOutcome::Full => {
-            state.metrics.record_build_accepted();
-            Ok(())
-        }
-        Ok(_) => {
-            state.metrics.record_build_rejected();
-            Err("build queue full".to_string())
-        }
-        Err(e) => {
-            state.metrics.record_build_rejected();
-            Err(format!("build queue unavailable: {e}"))
-        }
+        Ok(enq) => match enq.outcome {
+            EnqueueOutcome::Enqueued => {
+                state.metrics.record_build_queued();
+                state.metrics.record_build_accepted();
+                Ok(())
+            }
+            EnqueueOutcome::Coalesced => Ok(()),
+            EnqueueOutcome::Full => Err("build queue full".to_string()),
+        },
+        Err(e) => Err(format!("build queue unavailable: {e}")),
     }
 }
 
