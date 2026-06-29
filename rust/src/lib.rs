@@ -21,6 +21,7 @@ pub mod bench;
 pub mod blob_pack;
 pub mod cas;
 pub mod client;
+pub mod clone_metrics;
 pub mod clonepack;
 pub mod config;
 pub mod extract;

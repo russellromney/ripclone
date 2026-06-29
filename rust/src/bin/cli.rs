@@ -1074,7 +1074,9 @@ async fn main() -> Result<()> {
             // re-resolves, since install_repo_with_mode_at resolves the ref itself.
             const STALE_URL_MAX_RETRIES: u32 = 2;
             let mut stale_retries = 0u32;
-            loop {
+            // End-to-end wall clock for the clone, for the metrics report.
+            let clone_started = std::time::Instant::now();
+            let outcome = loop {
                 let res = client
                     .install_repo_with_mode_at(
                         &repo_path,
@@ -1091,7 +1093,7 @@ async fn main() -> Result<()> {
                     )
                     .await;
                 match res {
-                    Ok(()) => break,
+                    Ok(outcome) => break outcome,
                     Err(e)
                         if ripclone::client::should_retry_stale(
                             stale_retries,
@@ -1106,12 +1108,17 @@ async fn main() -> Result<()> {
                     }
                     Err(e) => return Err(e),
                 }
-            }
+            };
+            let total_ms = clone_started.elapsed().as_millis() as u64;
             println!("installed {} into {}", repo_path, target.display());
             if enable_bench {
                 let report = benchmark.finish();
                 println!("{}", serde_json::to_string_pretty(&report)?);
             }
+            // Fire-and-forget: report metrics to the managed cloud AFTER printing
+            // success. Best-effort — skipped if the server didn't mint a clone id
+            // (self-host) and never able to affect the clone's exit status.
+            client.report_clone_metrics(&outcome, total_ms).await;
         }
         Commands::Sidecar { dir } => {
             ripclone::sidecar::run(&dir)
