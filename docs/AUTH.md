@@ -21,7 +21,11 @@ identity stays in `ripclone-cloud`).
    shows the token to paste into the CLI instead.
 4. The CLI saves the JWT (OS keyring → file fallback) keyed per server and sends
    it as `Authorization: Bearer <jwt>` on subsequent requests.
-5. `POST /v1/auth/refresh` (authenticated) mints a fresh token before expiry.
+5. `POST /v1/auth/refresh` (authenticated) mints a fresh token before expiry. The
+   re-issued token keeps the **same absolute session deadline** as the original,
+   so a refresh chain can't outlive the session cap — once the deadline passes you
+   must log in again. (The CLI re-logs in rather than auto-refreshing; the endpoint
+   is there for clients/automation that want a sliding session.)
 
 `ripclone auth logout` removes the saved token; `ripclone auth status` shows
 whether one is saved and when it expires.
@@ -47,8 +51,9 @@ rejected — so the server never signs with material a client already holds. Set
 
 | Env | Meaning |
 |---|---|
-| `RIPCLONE_JWT_SECRET` | Explicit HS256 signing secret. Falls back to deriving from the raw server token. |
-| `RIPCLONE_JWT_TTL_SECS` | Session-token lifetime (default 3600). |
+| `RIPCLONE_JWT_SECRET` | Explicit HS256 signing secret (hashed to a 32-byte key; warns if shorter than 32 chars). Falls back to deriving from the raw server token. |
+| `RIPCLONE_JWT_TTL_SECS` | Token lifetime (default 3600). |
+| `RIPCLONE_JWT_SESSION_MAX_SECS` | Absolute session lifetime — the hard cap a refresh can't extend past (default 86400; floored at the TTL). |
 
 ## Security notes
 
@@ -59,4 +64,7 @@ rejected — so the server never signs with material a client already holds. Set
   `[::1]`); userinfo (`…@host`) and control characters are rejected, and query
   values are percent-encoded, so the minted token can't be redirected to an
   external host or used to split the response.
-- Tokens are stateless (no server-side revocation list); keep the TTL short.
+- Tokens are stateless (no server-side revocation list), so leak containment
+  comes from the short TTL plus the absolute session cap (`sxp` claim) that bounds
+  how long a token can be refreshed. Keep both short for sensitive deployments.
+- The login redirect and token page are served `Cache-Control: no-store`.

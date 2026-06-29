@@ -640,11 +640,6 @@ async fn auth_middleware(
     next: Next,
 ) -> Response {
     let path = request.uri().path().to_string();
-    // The login page and the login exchange must be reachable without a
-    // credential — their whole purpose is to mint one by proving the secret.
-    if path == "/login" || path == "/v1/auth/login" {
-        return next.run(request).await;
-    }
     if let Some(expected) = &state.token_hash {
         let authorized = headers
             .get(axum::http::header::AUTHORIZATION)
@@ -720,24 +715,34 @@ struct TokenResponse {
 /// Only ever redirect the minted token to a loopback address — never an external
 /// host. This is the open-redirect / token-exfiltration guard for the callback.
 fn is_loopback_callback(raw: &str) -> bool {
-    // Reject control characters outright (CR/LF would let a crafted callback split
-    // the redirect response header).
-    if raw.bytes().any(|b| b.is_ascii_control()) {
+    // Reject control characters (CR/LF would split the redirect header) and
+    // fragments (a `#` would swallow the appended `?token=…` so the CLI never
+    // sees it — and isn't a valid callback anyway).
+    if raw.bytes().any(|b| b.is_ascii_control()) || raw.contains('#') {
         return false;
     }
     let Some(rest) = raw.strip_prefix("http://") else {
         return false;
     };
-    let authority = rest.split('/').next().unwrap_or("");
+    let authority = rest.split(['/', '?']).next().unwrap_or("");
     // No userinfo: `http://127.0.0.1:80@evil.com/` parses as loopback to a naive
     // host:port split but a browser connects to `evil.com`. Reject any `@`.
     if authority.contains('@') {
         return false;
     }
-    let host = authority
-        .rsplit_once(':')
-        .map(|(h, _)| h)
-        .unwrap_or(authority);
+    // Strip an optional `:port`. For a bracketed IPv6 literal the only port colon
+    // is the one after `]`, so keep the bracketed host intact.
+    let host = if authority.starts_with('[') {
+        match authority.find(']') {
+            Some(end) => &authority[..=end],
+            None => return false,
+        }
+    } else {
+        authority
+            .rsplit_once(':')
+            .map(|(h, _)| h)
+            .unwrap_or(authority)
+    };
     host == "127.0.0.1" || host == "localhost" || host == "[::1]"
 }
 
@@ -858,7 +863,7 @@ async fn auth_login_handler(
             .into_response();
     }
 
-    let (token, _exp) = match keys.issue(crate::auth::jwt::ttl()) {
+    let (token, _exp) = match keys.issue(crate::auth::jwt::ttl(), crate::auth::jwt::session_max()) {
         Ok(t) => t,
         Err(e) => {
             warn!("failed to mint session token: {e}");
@@ -878,12 +883,15 @@ async fn auth_login_handler(
             let sep = if cb.contains('?') { '&' } else { '?' };
             // Percent-encode the query values so an attacker-supplied `state`
             // can't inject extra parameters or split the Location header.
-            Redirect::to(&format!(
-                "{cb}{sep}token={}&state={}",
-                urlencoding::encode(&token),
-                urlencoding::encode(st)
-            ))
-            .into_response()
+            (
+                [("cache-control", "no-store")],
+                Redirect::to(&format!(
+                    "{cb}{sep}token={}&state={}",
+                    urlencoding::encode(&token),
+                    urlencoding::encode(st)
+                )),
+            )
+                .into_response()
         }
         Some(_) => (
             StatusCode::BAD_REQUEST,
@@ -894,13 +902,15 @@ async fn auth_login_handler(
             )),
         )
             .into_response(),
-        None => Html(token_page_html(&token)).into_response(),
+        None => (
+            [("cache-control", "no-store")],
+            Html(token_page_html(&token)),
+        )
+            .into_response(),
     }
 }
 
-async fn auth_refresh_handler(State(state): State<ServerState>) -> Response {
-    // The auth layer already verified the caller's current Bearer token; mint a
-    // fresh one so a long-running client can roll its session before expiry.
+async fn auth_refresh_handler(State(state): State<ServerState>, headers: HeaderMap) -> Response {
     let Some(keys) = state.jwt.as_deref() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -911,17 +921,33 @@ async fn auth_refresh_handler(State(state): State<ServerState>) -> Response {
             .into_response();
     };
     let ttl = crate::auth::jwt::ttl();
-    match keys.issue(ttl) {
+    let bearer = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    // From a session token: re-issue keeping the same absolute session deadline,
+    // so a refresh chain can't outlive the original session. Authed by the shared
+    // token instead (no Bearer): start a fresh session.
+    let minted = match bearer {
+        Some(token) => keys.refresh(token, ttl),
+        None => keys.issue(ttl, crate::auth::jwt::session_max()),
+    };
+    match minted {
         Ok((token, expires_at)) => Json(TokenResponse {
             token,
-            expires_in: ttl.as_secs(),
+            expires_in: expires_at.saturating_sub(
+                SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+            ),
             expires_at,
         })
         .into_response(),
         Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::UNAUTHORIZED,
             Json(ErrorResponse {
-                error: format!("failed to mint token: {e}"),
+                error: format!("{e}"),
             }),
         )
             .into_response(),
@@ -6695,6 +6721,38 @@ mod tests {
             b = b.header("Authorization", a);
         }
         b.body(Body::empty()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn session_tokens_disabled_without_signing_key() {
+        // test_state has token_hash set but jwt = None (no signing key).
+        let tmp = tempfile::tempdir().unwrap();
+        let app = build_app(test_state(&tmp));
+        // Login can't mint a token → 503, never a token.
+        let login = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/auth/login")
+                    .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))))
+                    .header("Content-Type", "application/x-www-form-urlencoded")
+                    .body(Body::from("secret=whatever"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(login.status(), StatusCode::SERVICE_UNAVAILABLE);
+        // A bearer token is never accepted when issuance is disabled.
+        let bearer = app
+            .oneshot(request_with_auth(
+                "GET",
+                "/v1/repos/github/acme/secret/status",
+                Some("Bearer anything.at.all"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(bearer.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

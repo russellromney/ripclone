@@ -192,6 +192,49 @@ async fn non_loopback_callback_is_refused() {
     assert!(bypass.headers().get("location").is_none());
 }
 
+/// A bearer (session-token) client can complete an archive clone whose chunks
+/// are fetched through the authenticated gateway path (no presigned URLs) — the
+/// streaming extractor must send the session token, not re-derive a hash header.
+#[tokio::test]
+async fn bearer_client_clones_through_the_gateway() {
+    init(false);
+    // Exercise the archive-extraction path (gateway artifact fetch with auth).
+    // SAFETY: only this test clones in this binary; the var is read per-clone.
+    unsafe { std::env::set_var("RIPCLONE_EXTRACT_ARCHIVE", "1") };
+    let server = start_server().await;
+    let origin = make_origin("acme", "bearergw");
+    origin.commit(&[("a.txt", "via gateway\n")], "c1");
+    origin.publish();
+    server
+        .client()
+        .sync_repo("acme/bearergw", None)
+        .await
+        .expect("sync");
+
+    let token = mint_token(&server).await;
+    let client = ripclone::client::Client::new_with_bearer(server.url.clone(), token)
+        .with_provider("github");
+    let out = tempfile::tempdir().unwrap();
+    let target = out.path().join("clone");
+    client
+        .install_repo_with_mode_at(
+            "acme/bearergw",
+            "HEAD",
+            None,
+            &target,
+            ripclone::mode::CloneMode::Files,
+            Some(ripclone::mode::clonepack_kind_for_depth(0)),
+            None,
+        )
+        .await
+        .expect("bearer clone via gateway artifact fetch");
+    assert_eq!(
+        std::fs::read_to_string(target.join("a.txt")).unwrap(),
+        "via gateway\n"
+    );
+    unsafe { std::env::remove_var("RIPCLONE_EXTRACT_ARCHIVE") };
+}
+
 #[tokio::test]
 async fn paste_mode_shows_the_token() {
     init(false);

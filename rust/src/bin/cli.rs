@@ -643,9 +643,10 @@ fn token_store() -> Result<FallbackTokenStore> {
 }
 
 /// Token-store key for a server's session token. Per-server so logging into one
-/// backend doesn't clobber another's session.
+/// backend doesn't clobber another's session; the server string is normalized
+/// (trailing slash) so `auth login` and later commands resolve the same key.
 fn session_key(server: &str) -> String {
-    format!("session:{server}")
+    format!("session:{}", server.trim_end_matches('/'))
 }
 
 fn now_secs() -> u64 {
@@ -666,7 +667,8 @@ fn jwt_exp_secs(token: &str) -> Option<u64> {
 }
 
 /// Saved session token for `server`, if present and not about to expire. An
-/// unparseable token is returned as-is and left for the server to reject.
+/// unparseable or expired token returns `None` so it never shadows another
+/// working credential (the command falls through to the saved login token).
 fn load_valid_session_token(server: &str) -> Option<String> {
     let token = token_store()
         .ok()?
@@ -676,10 +678,8 @@ fn load_valid_session_token(server: &str) -> Option<String> {
     if token.is_empty() {
         return None;
     }
-    match jwt_exp_secs(&token) {
-        Some(exp) => (exp > now_secs() + 5).then_some(token),
-        None => Some(token),
-    }
+    let exp = jwt_exp_secs(&token)?;
+    (exp > now_secs() + 5).then_some(token)
 }
 
 async fn run_auth(server: &str, action: &AuthAction) -> Result<()> {
