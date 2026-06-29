@@ -1,6 +1,6 @@
 # Contributing
 
-ripclone is open to contributions. The project is licensed under the Elastic License 2.0; by contributing, you agree that your contributions will be under the same license.
+ripclone is open to contributions. The project is dual-licensed under MIT and Apache-2.0; by contributing, you agree that your contributions will be dual-licensed under the same terms.
 
 ## Getting started
 
