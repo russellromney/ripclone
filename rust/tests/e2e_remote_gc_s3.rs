@@ -405,7 +405,21 @@ async fn remote_gc_deletes_orphans_on_s3() {
             dry_run: false,
         },
     );
-    let report = gc.run().await.expect("remote gc run");
+    // First pass tombstones the orphan in the ledger; it is never deleted on the
+    // pass that first sees it unreferenced.
+    let first = gc.run().await.expect("remote gc first run");
+    assert_eq!(
+        first.objects_deleted, 0,
+        "first pass must only tombstone, got {first:?}"
+    );
+    assert!(
+        storage.size(&orphan_hash).is_ok(),
+        "orphan must survive the tombstoning pass"
+    );
+
+    // After the (1s) grace elapses, a second pass collects it.
+    sleep(Duration::from_secs(2)).await;
+    let report = gc.run().await.expect("remote gc second run");
 
     // The orphan plus every reachable CAS object were scanned.
     assert!(
@@ -488,7 +502,11 @@ async fn remote_gc_dry_run_does_not_delete_on_s3() {
             dry_run: true,
         },
     );
-    let report = gc.run().await.expect("remote gc dry run");
+    // First dry-run pass tombstones (would_delete=0); after grace a second pass
+    // reports it as a would-delete candidate without removing it.
+    let _ = gc.run().await.expect("remote gc dry run first");
+    sleep(Duration::from_secs(2)).await;
+    let report = gc.run().await.expect("remote gc dry run second");
     assert!(
         report.objects_deleted >= 1,
         "dry-run should report at least one deletion, got {report:?}"

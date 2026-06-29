@@ -4,10 +4,24 @@ use crate::storage::{HashEntry, StorageRef};
 use crate::{ClonepackArtifacts, HistoryLevel, PackArtifact, RefInfo, SizedPack};
 use anyhow::{Context, Result};
 use prost::Message;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tracing::{info, warn};
+
+/// Durable record of when each currently-unreferenced chunk was first seen
+/// orphaned, so the grace clock counts from "unreachable-since" rather than the
+/// object's write time. One JSON object in the storage backend.
+const ORPHAN_LEDGER_KEY: &str = "gc/orphans.json";
+
+/// `hash -> first epoch-second it was seen unreferenced`.
+type OrphanLedger = HashMap<String, u64>;
+
+fn unix_secs(t: SystemTime) -> u64 {
+    t.duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
 /// Configuration for remote garbage collection.
 #[derive(Debug, Clone)]
@@ -45,6 +59,15 @@ impl GcConfig {
             dry_run,
         }
     }
+
+    /// Raise the grace to at least `url_ttl` so a client still holding a valid
+    /// signed URL can finish its clone before any of its chunks become eligible
+    /// for deletion. Called at startup with the signed-URL TTL.
+    pub fn floor_grace(&mut self, url_ttl: Duration) {
+        if self.grace_period < url_ttl {
+            self.grace_period = url_ttl;
+        }
+    }
 }
 
 /// Result of one remote GC pass.
@@ -52,6 +75,8 @@ impl GcConfig {
 pub struct GcReport {
     pub objects_scanned: u64,
     pub objects_reachable: u64,
+    /// Unreferenced objects still inside their grace window (tombstoned, kept).
+    pub objects_tombstoned: u64,
     pub objects_deleted: u64,
     pub bytes_reclaimed: u64,
     pub bytes_scanned: u64,
@@ -103,17 +128,19 @@ impl RemoteGc {
                     Ok(report) => {
                         if self.config.dry_run {
                             info!(
-                                "remote GC dry-run: scanned={}, reachable={}, would_delete={}, would_reclaim_bytes={}",
+                                "remote GC dry-run: scanned={}, reachable={}, tombstoned={}, would_delete={}, would_reclaim_bytes={}",
                                 report.objects_scanned,
                                 report.objects_reachable,
+                                report.objects_tombstoned,
                                 report.objects_deleted,
                                 report.bytes_reclaimed
                             );
                         } else {
                             info!(
-                                "remote GC completed: scanned={}, reachable={}, deleted={}, reclaimed_bytes={}",
+                                "remote GC completed: scanned={}, reachable={}, tombstoned={}, deleted={}, reclaimed_bytes={}",
                                 report.objects_scanned,
                                 report.objects_reachable,
+                                report.objects_tombstoned,
                                 report.objects_deleted,
                                 report.bytes_reclaimed
                             );
@@ -144,7 +171,13 @@ impl RemoteGc {
             .context("list remote objects task panicked")?
             .context("list remote objects")?;
 
-        let cutoff = SystemTime::now()
+        let now = unix_secs(SystemTime::now());
+        let grace_secs = self.config.grace_period.as_secs();
+        // Second guard: never delete a chunk whose *file* is younger than the
+        // grace, even if the ledger thinks it has been orphaned long enough. This
+        // protects a chunk a build is writing right now whose ref hasn't published
+        // yet — it looks orphaned but is fresh.
+        let mtime_cutoff = SystemTime::now()
             .checked_sub(self.config.grace_period)
             .unwrap_or(SystemTime::UNIX_EPOCH);
 
@@ -155,30 +188,37 @@ impl RemoteGc {
             ..Default::default()
         };
 
+        // The grace counts from when a chunk was first seen unreferenced, not
+        // from its mtime. A chunk written long ago that *just* lost its last
+        // reference gets a full grace window starting now.
+        let ledger = self.load_ledger().await;
+        let mut next_ledger: OrphanLedger = HashMap::new();
         let mut to_delete: Vec<HashEntry> = Vec::new();
         for entry in entries {
             if reachable.contains(&entry.hash) {
+                // Reachable again (re-pushed, or a build published): drop any
+                // tombstone and keep it.
                 continue;
             }
-            if entry.modified > cutoff {
-                continue;
+            // First sighting starts the clock at `now`; a known orphan keeps its
+            // recorded first-seen time.
+            let first_seen = *ledger.get(&entry.hash).unwrap_or(&now);
+            let unref_age = now.saturating_sub(first_seen);
+            let mtime_old = entry.modified <= mtime_cutoff;
+            if unref_age >= grace_secs && mtime_old {
+                to_delete.push(entry);
+            } else {
+                next_ledger.insert(entry.hash, first_seen);
             }
-            to_delete.push(entry);
         }
 
-        // Reference-time double-check (S1). The grace cutoff above is anchored on
-        // each object's *mtime* — when it was last written — not when it was last
-        // *referenced*. A sync that re-references an already-stored object without
-        // re-uploading it (a reused pack/chunk) leaves that object's mtime old, so
-        // it looks unreachable-and-aged-out here even though a concurrent sync just
-        // started pointing at it. The reachable snapshot above was taken before we
-        // listed every object and walked every manifest — a long window. Re-collect
-        // the reachable set now (reading *through* the ref cache so a just-saved ref
-        // is seen) and drop any candidate that became reachable during the pass, so
-        // GC never deletes an object a sync started referencing while we scanned.
-        // Freshly *written* objects remain protected by the mtime grace; this closes
-        // the reused-object gap, leaving only a sub-second recheck→delete window in
-        // place of the whole-pass window.
+        // Reference-time double-check. The reachable snapshot was taken before we
+        // listed every object and walked every manifest — a long window. A sync
+        // that re-references an already-stored object (a reused pack/chunk) during
+        // that window leaves the object unreachable in the snapshot. Re-collect the
+        // reachable set now (reading *through* the ref cache so a just-saved ref is
+        // seen) and drop any candidate that became reachable during the pass.
+        // Rescued objects are now reachable, so they are not re-tombstoned.
         if !to_delete.is_empty() {
             let reachable_now = reachable_hashes(&self.ref_store, &self.storage, true).await?;
             let before = to_delete.len();
@@ -191,10 +231,6 @@ impl RemoteGc {
             }
         }
 
-        if to_delete.is_empty() {
-            return Ok(report);
-        }
-
         report.objects_deleted = to_delete.len() as u64;
         report.bytes_reclaimed = to_delete.iter().map(|e| e.size).sum();
 
@@ -204,7 +240,20 @@ impl RemoteGc {
                     "remote GC dry-run: would delete {} ({} bytes, modified {:?})",
                     entry.hash, entry.size, entry.modified
                 );
+                // Keep the tombstone so repeated dry-runs keep reporting it
+                // instead of resetting its grace clock each pass.
+                let first_seen = *ledger.get(&entry.hash).unwrap_or(&now);
+                next_ledger.insert(entry.hash.clone(), first_seen);
             }
+            report.objects_tombstoned = next_ledger.len() as u64;
+            self.persist_ledger(&next_ledger, &mut report).await;
+            return Ok(report);
+        }
+
+        report.objects_tombstoned = next_ledger.len() as u64;
+
+        if to_delete.is_empty() {
+            self.persist_ledger(&next_ledger, &mut report).await;
             return Ok(report);
         }
 
@@ -232,7 +281,47 @@ impl RemoteGc {
             }
         }
 
+        // Persist after deleting: a deleted object is already absent from the new
+        // ledger, and if a delete failed the object simply gets re-tombstoned
+        // (a fresh grace window) on the next pass — never deleted prematurely.
+        self.persist_ledger(&next_ledger, &mut report).await;
+
         Ok(report)
+    }
+
+    /// Load the orphan ledger. A missing or unreadable ledger is treated as
+    /// empty: that only ever *adds* grace (everything is re-tombstoned), so it
+    /// can never cause a premature delete.
+    async fn load_ledger(&self) -> OrphanLedger {
+        match self.storage.get_meta(ORPHAN_LEDGER_KEY).await {
+            Ok(Some(bytes)) => match serde_json::from_slice(&bytes) {
+                Ok(ledger) => ledger,
+                Err(e) => {
+                    warn!("remote GC: orphan ledger unreadable ({e}); starting fresh");
+                    OrphanLedger::new()
+                }
+            },
+            Ok(None) => OrphanLedger::new(),
+            Err(e) => {
+                warn!("remote GC: could not read orphan ledger ({e}); starting fresh");
+                OrphanLedger::new()
+            }
+        }
+    }
+
+    /// Write the ledger back. A failure here is recorded but not fatal: the
+    /// tombstones just get rebuilt next pass.
+    async fn persist_ledger(&self, ledger: &OrphanLedger, report: &mut GcReport) {
+        let bytes = match serde_json::to_vec(ledger) {
+            Ok(b) => b,
+            Err(e) => {
+                report.errors.push(format!("serialize orphan ledger: {e}"));
+                return;
+            }
+        };
+        if let Err(e) = self.storage.put_meta(ORPHAN_LEDGER_KEY, &bytes).await {
+            report.errors.push(format!("write orphan ledger: {e}"));
+        }
     }
 }
 
@@ -426,12 +515,30 @@ mod tests {
     use crate::storage::{HashEntry, StorageBackend, local};
     use std::time::Duration;
 
+    /// Write the orphan ledger directly, as a prior GC pass would have, so a test
+    /// can place an object past (or inside) its grace window deterministically.
+    async fn seed_ledger(storage: &StorageRef, entries: &[(&str, u64)]) {
+        let map: OrphanLedger = entries.iter().map(|(h, t)| (h.to_string(), *t)).collect();
+        storage
+            .put_meta(ORPHAN_LEDGER_KEY, &serde_json::to_vec(&map).unwrap())
+            .await
+            .unwrap();
+    }
+
+    async fn read_ledger(storage: &StorageRef) -> OrphanLedger {
+        match storage.get_meta(ORPHAN_LEDGER_KEY).await.unwrap() {
+            Some(bytes) => serde_json::from_slice(&bytes).unwrap(),
+            None => OrphanLedger::new(),
+        }
+    }
+
     /// A storage wrapper that reports `is_remote() == true` so the GC logic runs
     /// against the local filesystem in tests.
     struct TestRemoteStorage {
         inner: StorageRef,
     }
 
+    #[async_trait::async_trait]
     impl StorageBackend for TestRemoteStorage {
         fn get(&self, hash: &str) -> Result<Vec<u8>> {
             self.inner.get(hash)
@@ -441,6 +548,12 @@ mod tests {
         }
         fn put(&self, hash: &str, data: &[u8]) -> Result<()> {
             self.inner.put(hash, data)
+        }
+        async fn get_meta(&self, key: &str) -> Result<Option<Vec<u8>>> {
+            self.inner.get_meta(key).await
+        }
+        async fn put_meta(&self, key: &str, data: &[u8]) -> Result<()> {
+            self.inner.put_meta(key, data).await
         }
         fn size(&self, hash: &str) -> Result<u64> {
             self.inner.size(hash)
@@ -555,6 +668,10 @@ mod tests {
         let old = std::time::SystemTime::now() - Duration::from_secs(48 * 60 * 60);
         filetime::set_file_mtime(&orphan_path, filetime::FileTime::from_system_time(old)).unwrap();
 
+        // The orphan was first seen unreferenced long ago, so it is past grace.
+        let long_ago = unix_secs(std::time::SystemTime::now()) - 1_000_000;
+        seed_ledger(&storage, &[(orphan_hash.as_str(), long_ago)]).await;
+
         let gc = RemoteGc::new(
             storage.clone(),
             ref_store,
@@ -577,6 +694,175 @@ mod tests {
         assert!(cas.path(&info.clonepack_manifest).exists());
         assert!(cas.path(&info.metadata_chunk).exists());
         assert!(cas.path(&info.archive_chunks[0]).exists());
+    }
+
+    /// The core fix: a chunk written long ago that has *only just* lost its last
+    /// reference is NOT deleted on the first pass. Its mtime is old, so the old
+    /// mtime-only gate would have deleted it; the unreachable-since ledger gives
+    /// it a full grace window starting now instead.
+    #[tokio::test]
+    async fn gc_tombstones_just_orphaned_chunk_with_old_mtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cas_root = tmp.path().join("cas");
+        let repo_root = tmp.path().join("repos");
+        std::fs::create_dir_all(&cas_root).unwrap();
+        std::fs::create_dir_all(&repo_root).unwrap();
+
+        let cas = Cas::new(&cas_root).unwrap();
+        let storage: StorageRef = Arc::new(TestRemoteStorage {
+            inner: local(&cas_root).unwrap(),
+        });
+        let ref_store: Arc<dyn RefStore> = Arc::new(FileRefStore::new(&repo_root));
+
+        let info = make_ref_info_with_manifest(&cas);
+        ref_store.save(&RepoId::github("o/r"), &info).await.unwrap();
+
+        // An orphan with an OLD mtime but no ledger entry: just-orphaned.
+        let orphan_hash = cas.put(b"orphan").unwrap();
+        let orphan_path = cas.path(&orphan_hash);
+        let old = std::time::SystemTime::now() - Duration::from_secs(48 * 60 * 60);
+        filetime::set_file_mtime(&orphan_path, filetime::FileTime::from_system_time(old)).unwrap();
+
+        let gc = RemoteGc::new(
+            storage.clone(),
+            ref_store,
+            GcConfig {
+                grace_period: Duration::from_secs(3600),
+                dry_run: false,
+            },
+        );
+        let report = gc.run().await.unwrap();
+
+        assert_eq!(report.objects_deleted, 0, "first pass must not delete");
+        assert_eq!(report.objects_tombstoned, 1);
+        assert!(orphan_path.exists(), "freshly orphaned chunk must survive");
+
+        // The ledger now tombstones the orphan with a recent first-seen time.
+        let ledger = read_ledger(&storage).await;
+        assert!(ledger.contains_key(&orphan_hash));
+    }
+
+    /// After the grace window elapses, a tombstoned orphan is collected. Pass one
+    /// tombstones; we age the ledger entry past grace; pass two deletes.
+    #[tokio::test]
+    async fn gc_deletes_orphan_after_grace_elapses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cas_root = tmp.path().join("cas");
+        let repo_root = tmp.path().join("repos");
+        std::fs::create_dir_all(&cas_root).unwrap();
+        std::fs::create_dir_all(&repo_root).unwrap();
+
+        let cas = Cas::new(&cas_root).unwrap();
+        let storage: StorageRef = Arc::new(TestRemoteStorage {
+            inner: local(&cas_root).unwrap(),
+        });
+        let ref_store: Arc<dyn RefStore> = Arc::new(FileRefStore::new(&repo_root));
+
+        let info = make_ref_info_with_manifest(&cas);
+        ref_store.save(&RepoId::github("o/r"), &info).await.unwrap();
+
+        let orphan_hash = cas.put(b"orphan").unwrap();
+        let orphan_path = cas.path(&orphan_hash);
+        let old = std::time::SystemTime::now() - Duration::from_secs(48 * 60 * 60);
+        filetime::set_file_mtime(&orphan_path, filetime::FileTime::from_system_time(old)).unwrap();
+
+        let gc = RemoteGc::new(
+            storage.clone(),
+            ref_store,
+            GcConfig {
+                grace_period: Duration::from_secs(3600),
+                dry_run: false,
+            },
+        );
+
+        // Pass one: tombstone only.
+        let report = gc.run().await.unwrap();
+        assert_eq!(report.objects_deleted, 0);
+        assert!(orphan_path.exists());
+
+        // Age the tombstone past the grace window.
+        let aged = unix_secs(std::time::SystemTime::now()) - 7200;
+        seed_ledger(&storage, &[(orphan_hash.as_str(), aged)]).await;
+
+        // Pass two: now collectible.
+        let report = gc.run().await.unwrap();
+        assert_eq!(report.objects_deleted, 1);
+        assert!(
+            !orphan_path.exists(),
+            "orphan should be deleted after grace"
+        );
+        assert!(
+            !read_ledger(&storage).await.contains_key(&orphan_hash),
+            "deleted orphan is dropped from the ledger"
+        );
+    }
+
+    /// A chunk that becomes referenced again before its grace expires has its
+    /// tombstone cleared and is never deleted.
+    #[tokio::test]
+    async fn gc_clears_tombstone_when_rereferenced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cas_root = tmp.path().join("cas");
+        let repo_root = tmp.path().join("repos");
+        std::fs::create_dir_all(&cas_root).unwrap();
+        std::fs::create_dir_all(&repo_root).unwrap();
+
+        let cas = Cas::new(&cas_root).unwrap();
+        let storage: StorageRef = Arc::new(TestRemoteStorage {
+            inner: local(&cas_root).unwrap(),
+        });
+        let ref_store: Arc<dyn RefStore> = Arc::new(FileRefStore::new(&repo_root));
+
+        let repo = RepoId::github("o/r");
+        let info = make_ref_info_with_manifest(&cas);
+        ref_store.save(&repo, &info).await.unwrap();
+
+        // An aged orphan, tombstoned long ago but still inside a long grace.
+        let chunk = cas.put(b"reusable-chunk").unwrap();
+        let chunk_path = cas.path(&chunk);
+        let old = std::time::SystemTime::now() - Duration::from_secs(48 * 60 * 60);
+        filetime::set_file_mtime(&chunk_path, filetime::FileTime::from_system_time(old)).unwrap();
+        let recent = unix_secs(std::time::SystemTime::now()) - 60;
+        seed_ledger(&storage, &[(chunk.as_str(), recent)]).await;
+
+        let gc = RemoteGc::new(
+            storage.clone(),
+            ref_store.clone(),
+            GcConfig {
+                grace_period: Duration::from_secs(3600),
+                dry_run: false,
+            },
+        );
+
+        // It becomes referenced again before grace expires.
+        let mut info_v2 = info.clone();
+        info_v2.head_blobs_chunks = vec![chunk.clone()];
+        ref_store.save(&repo, &info_v2).await.unwrap();
+
+        let report = gc.run().await.unwrap();
+        assert_eq!(report.objects_deleted, 0);
+        assert!(chunk_path.exists(), "re-referenced chunk must survive");
+        assert!(
+            !read_ledger(&storage).await.contains_key(&chunk),
+            "re-referenced chunk is dropped from the ledger"
+        );
+    }
+
+    #[test]
+    fn grace_floored_at_url_ttl() {
+        let mut below = GcConfig {
+            grace_period: Duration::from_secs(10),
+            dry_run: false,
+        };
+        below.floor_grace(Duration::from_secs(1200));
+        assert_eq!(below.grace_period, Duration::from_secs(1200));
+
+        let mut above = GcConfig {
+            grace_period: Duration::from_secs(86_400),
+            dry_run: false,
+        };
+        above.floor_grace(Duration::from_secs(1200));
+        assert_eq!(above.grace_period, Duration::from_secs(86_400));
     }
 
     /// S1: a sync that re-references an already-stored (reused, aged) object
@@ -627,6 +913,11 @@ mod tests {
         info_v2.head_blobs_chunks = vec![reused.clone()];
         durable_store.save(&repo, &info_v2).await.unwrap();
 
+        // Tombstone the reused object long ago so GC reaches the delete path (and
+        // thus the reference-time recheck) rather than a first-sighting tombstone.
+        let long_ago = unix_secs(std::time::SystemTime::now()) - 1_000_000;
+        seed_ledger(&storage, &[(reused.as_str(), long_ago)]).await;
+
         let gc = RemoteGc::new(
             storage.clone(),
             cached_store,
@@ -670,6 +961,10 @@ mod tests {
         let old = std::time::SystemTime::now() - Duration::from_secs(48 * 60 * 60);
         filetime::set_file_mtime(&orphan_path, filetime::FileTime::from_system_time(old)).unwrap();
 
+        // Past grace, so dry-run reports it as a would-delete candidate.
+        let long_ago = unix_secs(std::time::SystemTime::now()) - 1_000_000;
+        seed_ledger(&storage, &[(orphan_hash.as_str(), long_ago)]).await;
+
         let gc = RemoteGc::new(
             storage.clone(),
             ref_store,
@@ -685,6 +980,8 @@ mod tests {
             orphan_path.exists(),
             "orphan should NOT be deleted in dry-run"
         );
+        // The tombstone is kept so repeated dry-runs keep reporting it.
+        assert!(read_ledger(&storage).await.contains_key(&orphan_hash));
     }
 
     #[tokio::test]
@@ -704,13 +1001,18 @@ mod tests {
         let info = make_ref_info_with_manifest(&cas);
         ref_store.save(&RepoId::github("o/r"), &info).await.unwrap();
 
-        // Orphan is only one hour old.
+        // Orphan is only one hour old by mtime.
         let orphan_data = b"orphan";
         let orphan_hash = cas.put(orphan_data).unwrap();
         let orphan_path = cas.path(&orphan_hash);
         let recent = std::time::SystemTime::now() - Duration::from_secs(60 * 60);
         filetime::set_file_mtime(&orphan_path, filetime::FileTime::from_system_time(recent))
             .unwrap();
+
+        // Tombstone it long ago: the unreachable-since clock is past grace, so
+        // only the mtime second guard keeps a freshly-written chunk alive.
+        let long_ago = unix_secs(std::time::SystemTime::now()) - 1_000_000;
+        seed_ledger(&storage, &[(orphan_hash.as_str(), long_ago)]).await;
 
         let gc = RemoteGc::new(
             storage.clone(),
@@ -723,7 +1025,10 @@ mod tests {
         let report = gc.run().await.unwrap();
 
         assert_eq!(report.objects_deleted, 0);
-        assert!(orphan_path.exists(), "recent orphan should be kept");
+        assert!(
+            orphan_path.exists(),
+            "a recently-written chunk must survive even if tombstoned long ago"
+        );
     }
 
     #[tokio::test]
@@ -774,6 +1079,10 @@ mod tests {
         let orphan_path = cas.path(&orphan_hash);
         let old = std::time::SystemTime::now() - Duration::from_secs(48 * 60 * 60);
         filetime::set_file_mtime(&orphan_path, filetime::FileTime::from_system_time(old)).unwrap();
+
+        // Past grace, so the orphan is collectible this pass.
+        let long_ago = unix_secs(std::time::SystemTime::now()) - 1_000_000;
+        seed_ledger(&storage, &[(orphan_hash.as_str(), long_ago)]).await;
 
         let gc = RemoteGc::new(
             storage.clone(),
