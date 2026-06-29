@@ -170,7 +170,11 @@ impl StorageBackend for LocalStorage {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("create metadata dir for {key}"))?;
         }
-        let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+        // Unique per call (pid + a monotonic counter) so concurrent writers never
+        // collide on the same temp path before the atomic rename.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = path.with_extension(format!("tmp.{}.{}", std::process::id(), n));
         std::fs::write(&tmp, data).with_context(|| format!("write metadata tmp {key}"))?;
         std::fs::rename(&tmp, &path).with_context(|| format!("rename metadata {key}"))?;
         Ok(())
@@ -269,4 +273,49 @@ pub type StorageRef = Arc<dyn StorageBackend>;
 /// Convenience constructor for the default local backend.
 pub fn local<P: AsRef<Path>>(root: P) -> Result<StorageRef> {
     Ok(Arc::new(LocalStorage::new(root)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn meta_path_rejects_traversal_and_absolute() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = LocalStorage::new(tmp.path()).unwrap();
+        // Valid internal keys resolve under the root.
+        let ok = s.meta_path("gc/orphans.json").unwrap();
+        assert!(ok.starts_with(tmp.path()));
+        // Anything that could escape the root is rejected.
+        for bad in [
+            "",
+            "/etc/passwd",
+            "..",
+            "gc/../../etc/passwd",
+            "a//b",
+            "gc/",
+        ] {
+            assert!(s.meta_path(bad).is_err(), "key {bad:?} must be rejected");
+        }
+    }
+
+    #[tokio::test]
+    async fn meta_round_trips_and_is_absent_until_written() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = LocalStorage::new(tmp.path()).unwrap();
+        assert!(s.get_meta("gc/orphans.json").await.unwrap().is_none());
+        s.put_meta("gc/orphans.json", b"{}").await.unwrap();
+        assert_eq!(
+            s.get_meta("gc/orphans.json").await.unwrap().as_deref(),
+            Some(&b"{}"[..])
+        );
+        // Overwrite replaces the contents.
+        s.put_meta("gc/orphans.json", b"[1]").await.unwrap();
+        assert_eq!(
+            s.get_meta("gc/orphans.json").await.unwrap().as_deref(),
+            Some(&b"[1]"[..])
+        );
+        // The metadata object is not surfaced as a content-addressed hash.
+        assert!(s.list_hashes().unwrap().is_empty());
+    }
 }
