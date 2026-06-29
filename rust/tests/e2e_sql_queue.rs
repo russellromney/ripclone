@@ -54,6 +54,7 @@ async fn sql_queue_farm_out_sync_then_clone() {
                         branch: c.branch,
                         rev: None,
                         credential: None,
+                        recheck: 0,
                     };
                     let result = process_build_job(&state, &job).await;
                     worker_queue

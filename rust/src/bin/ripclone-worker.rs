@@ -119,6 +119,10 @@ async fn main() -> Result<()> {
                     branch: claimed.branch,
                     rev: None,
                     credential,
+                    // The SQL queue does not persist the re-check counter; a
+                    // cross-process worker starts each claimed job fresh and the
+                    // periodic poller is the freshness backstop here.
+                    recheck: 0,
                 };
                 // Isolate the build in its own task so a panic fails just this
                 // job (acked as failed) instead of killing the worker and

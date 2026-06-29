@@ -73,6 +73,7 @@ mod tests {
             branch: "b".into(),
             rev: None,
             credential: None,
+            recheck: 0,
         }
     }
 
