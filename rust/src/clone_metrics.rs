@@ -17,11 +17,10 @@ use serde::Serialize;
 /// Set `RIPCLONE_NO_METRICS=1` (or `true`) to suppress the post-clone metrics
 /// report even on a managed-cloud clone. The report is already implicitly
 /// opt-in (it only fires when the cloud minted a clone id), but this is an
-/// explicit kill switch for users who never want the network call.
+/// explicit kill switch for users who never want the network call. Presence-
+/// based to match the project's other opt-outs (e.g. `RIPCLONE_NO_CACHE`).
 pub fn opted_out() -> bool {
-    std::env::var("RIPCLONE_NO_METRICS")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    std::env::var_os("RIPCLONE_NO_METRICS").is_some()
 }
 
 /// Repo identity, matching the `usage_events` row the cloud joins against for

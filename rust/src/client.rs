@@ -431,8 +431,6 @@ pub struct CloneOutcome {
     pub clone_id: Option<String>,
     /// Total bytes downloaded (metadata + pack/archive chunks).
     pub bytes: u64,
-    /// Chunk-download time, only when cleanly measured (files mode). Else `None`.
-    pub download_ms: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -995,7 +993,7 @@ impl Client {
         // the archive-ready re-resolve below would otherwise overwrite the id we
         // want to report against.
         let clone_id = info.clone_id.clone();
-        let cold = info.cold;
+        let mut cold = info.cold;
         // `files` | `depth1` | `full`, derived from the mode and requested
         // clonepack variant (depth=1 ⇒ "shallow").
         let metric_mode: &'static str = if mode.needs_archive() {
@@ -1009,8 +1007,12 @@ impl Client {
 
         // Files mode needs the zstd archive. The server publishes an editable
         // clonepack first and adds the archive a moment later, so wait for it
-        // (editable clones don't need it and skip this).
+        // (editable clones don't need it and skip this). Waiting here means the
+        // archive is being built on demand — a cold build — which the
+        // ref-resolve 202 poll above doesn't capture for files mode, so record
+        // it for the metrics label.
         if mode.needs_archive() && !info.archive_ready {
+            cold = true;
             let max = std::env::var("RIPCLONE_CLONE_MAX_ATTEMPTS")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -1243,7 +1245,8 @@ impl Client {
                 stats.files, stats.raw_bytes
             );
         }
-        bench.add_bytes(0, archive_bytes + prebuilt_blob_pack_bytes);
+        // `mark_archive_download` sets (overwrites) `archive_bytes`, so no
+        // separate `add_bytes` for the archive total is needed.
         bench.mark_archive_download(archive_bytes + prebuilt_blob_pack_bytes);
 
         // 9. Origin config + finalization.
@@ -1305,15 +1308,6 @@ impl Client {
             target.display(),
             mode
         );
-        // `downloadMs` is only a cleanly separable phase in files mode (the
-        // archive-chunk download). In editable mode the pack download overlaps
-        // extraction and isn't isolated, so omit it rather than report a fuzzy
-        // number.
-        let download_ms = if mode.needs_archive() {
-            Some(report.archive_download_ms)
-        } else {
-            None
-        };
         let provider = if info.provider.is_empty() {
             self.provider.clone()
         } else {
@@ -1328,7 +1322,6 @@ impl Client {
             cold,
             clone_id,
             bytes: report.total_bytes(),
-            download_ms,
         })
     }
 
@@ -1361,17 +1354,27 @@ impl Client {
             cold: outcome.cold,
             total_ms,
             bytes: outcome.bytes,
-            download_ms: outcome.download_ms,
+            // v1 omits downloadMs: the client can't cleanly isolate pure
+            // chunk-download time from manifest fetch + extraction, and a biased
+            // number would skew the cloud's bytes/downloadMs throughput (the
+            // headline metric). Better no throughput than a wrong one — the cloud
+            // simply won't compute it. Reinstated when the phase is isolated (v2).
+            download_ms: None,
             client: ClientInfo::current(),
         };
         let url = format!("{}/v1/clones/{}/metrics", self.server, clone_id);
         // Swallow every outcome — transport error, timeout, or a non-2xx status.
         // The clone already succeeded; this is advertising-grade telemetry.
+        //
+        // The request is awaited inline (true detach is impossible: the CLI exits
+        // right after, killing any in-flight request), so the timeout is the hard
+        // ceiling on how long a hung/black-hole endpoint can delay exit. Keep it
+        // short — a clone we sell as sub-second must not gain ~seconds here.
         let _ = self
             .http
             .post(&url)
             .json(&payload)
-            .timeout(std::time::Duration::from_secs(2))
+            .timeout(std::time::Duration::from_millis(400))
             .send()
             .await;
     }

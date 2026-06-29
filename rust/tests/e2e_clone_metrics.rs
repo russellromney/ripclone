@@ -45,6 +45,9 @@ struct GwState {
     http: reqwest::Client,
     /// Bodies of every metrics POST the gateway received.
     captured: Arc<Mutex<Vec<serde_json::Value>>>,
+    /// `Authorization` header of every metrics POST (None if absent). The cloud
+    /// rejects an unauthenticated post with a silent 401, so this is load-bearing.
+    auth_headers: Arc<Mutex<Vec<Option<String>>>>,
     /// Count of metrics POSTs (even ones with an unparseable body).
     hits: Arc<Mutex<u32>>,
     /// Inject `X-Ripclone-Clone-Id` on ref-resolve responses (the cloud does;
@@ -57,12 +60,18 @@ struct GwState {
 
 /// Capture the CLI's metrics POST and return the configured status.
 async fn metrics_handler(State(st): State<GwState>, req: Request) -> Response {
+    let auth = req
+        .headers()
+        .get(reqwest::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
     let bytes = axum::body::to_bytes(req.into_body(), 1 << 20)
         .await
         .unwrap_or_default();
     if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
         st.captured.lock().unwrap().push(v);
     }
+    st.auth_headers.lock().unwrap().push(auth);
     *st.hits.lock().unwrap() += 1;
     Response::builder()
         .status(st.metrics_status)
@@ -122,6 +131,7 @@ async fn proxy(State(st): State<GwState>, req: Request) -> Response {
 struct Gateway {
     url: String,
     captured: Arc<Mutex<Vec<serde_json::Value>>>,
+    auth_headers: Arc<Mutex<Vec<Option<String>>>>,
     hits: Arc<Mutex<u32>>,
     clone_id: String,
 }
@@ -130,12 +140,14 @@ struct Gateway {
 /// capture buffers.
 async fn spawn_gateway(upstream: &str, inject_clone_id: bool, metrics_status: u16) -> Gateway {
     let captured = Arc::new(Mutex::new(Vec::new()));
+    let auth_headers = Arc::new(Mutex::new(Vec::new()));
     let hits = Arc::new(Mutex::new(0u32));
     let clone_id = "test-clone-id-0001".to_string();
     let state = GwState {
         upstream: upstream.to_string(),
         http: reqwest::Client::new(),
         captured: captured.clone(),
+        auth_headers: auth_headers.clone(),
         hits: hits.clone(),
         inject_clone_id,
         clone_id: clone_id.clone(),
@@ -153,6 +165,7 @@ async fn spawn_gateway(upstream: &str, inject_clone_id: bool, metrics_status: u1
     Gateway {
         url: format!("http://{addr}"),
         captured,
+        auth_headers,
         hits,
         clone_id,
     }
@@ -215,6 +228,17 @@ async fn clone_id_header_triggers_metrics_post_with_correct_body() {
     // Fire the report (the CLI does this after printing success).
     client.report_clone_metrics(&outcome, 4242).await;
 
+    // The POST must carry the ripclone auth token — the cloud rejects an
+    // unauthenticated metrics post with a silent 401, so a regression that drops
+    // auth (e.g. switching to the no-auth client) must fail this test.
+    let auth = gw.auth_headers.lock().unwrap();
+    assert_eq!(auth.len(), 1, "one captured auth header");
+    let header = auth[0].as_deref().expect("Authorization header present");
+    assert!(
+        header.starts_with("Ripclone "),
+        "metrics POST sends the Ripclone token, got {header:?}"
+    );
+
     let captured = gw.captured.lock().unwrap();
     assert_eq!(captured.len(), 1, "exactly one metrics POST");
     let body = &captured[0];
@@ -227,7 +251,7 @@ async fn clone_id_header_triggers_metrics_post_with_correct_body() {
     assert_eq!(body["cold"], false);
     assert_eq!(body["totalMs"], 4242);
     assert!(body["bytes"].as_u64().unwrap() > 0);
-    // Editable mode omits downloadMs (not a cleanly isolated phase).
+    // v1 always omits downloadMs (pure download time isn't cleanly isolated).
     assert!(body.get("downloadMs").is_none());
     assert!(body["client"]["os"].is_string());
     assert!(body["client"]["arch"].is_string());
