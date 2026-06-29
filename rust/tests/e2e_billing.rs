@@ -50,16 +50,25 @@ async fn status_reports_nonzero_bytes_after_sync() {
     origin.commit(&[("a.txt", "hello world\n")], "c1");
     origin.publish();
 
-    let client = server.client();
-    client.sync_repo("acme/billing", None).await.expect("sync");
+    // Wait for the full clonepack to publish (phase 2) so all artifacts are
+    // accounted for in the byte totals.
+    sync_until_manifest(&server, "acme", "billing").await;
 
     let status = get_status(&server, "acme", "billing", None).await;
-    assert_eq!(status["refs"].as_array().unwrap().len(), 1);
-    let branch = &status["refs"][0];
-    assert!(branch["branch"].is_string());
+    // The async build persists the ref under both the resolved branch (`main`)
+    // and the literal `HEAD` alias (so any process can resolve `/sync HEAD` from
+    // the shared metadata store), so two ref rows appear for the one commit.
+    let refs = status["refs"].as_array().unwrap();
+    assert_eq!(refs.len(), 2, "HEAD alias + resolved branch");
+    let branch = refs
+        .iter()
+        .find(|r| r["branch"] == "main")
+        .expect("resolved main ref present");
     assert!(branch["bytes"].as_u64().unwrap() > 0);
     assert_eq!(branch["bytes"], branch["unique_bytes"]);
     assert!(status["total_bytes"].as_u64().unwrap() > 0);
+    // The HEAD alias and `main` share the same artifacts, so the repo total
+    // dedups them.
     assert_eq!(status["total_bytes"], status["total_unique_bytes"]);
     assert!(status["regions"][0]["unique_bytes"].as_u64().unwrap() > 0);
 }

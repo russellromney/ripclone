@@ -23,7 +23,6 @@ async fn worker_farm_out_postgres() {
         std::env::set_var("RIPCLONE_QUEUE_DB_URL", &url);
         std::env::set_var("RIPCLONE_SYNC_MAX_ATTEMPTS", "8");
     }
-    enable_async_build();
     init(false);
 
     let server = start_server().await;

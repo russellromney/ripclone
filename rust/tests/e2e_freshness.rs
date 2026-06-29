@@ -71,7 +71,6 @@ async fn wait_until(server: &Server, repo: &str, want: &str, min_builds: u64) {
 #[tokio::test]
 async fn recheck_builds_tip_that_moved_during_build() {
     let _guard = SERIAL.lock().await;
-    enable_async_build();
     set_env("RIPCLONE_RECHECK_MAX", "3");
     set_env("RIPCLONE_TEST_RECHECK_DELAY_MS", "2500");
     init(false);
@@ -109,7 +108,6 @@ async fn recheck_builds_tip_that_moved_during_build() {
 #[tokio::test]
 async fn recheck_burst_collapses_to_latest() {
     let _guard = SERIAL.lock().await;
-    enable_async_build();
     set_env("RIPCLONE_RECHECK_MAX", "5");
     set_env("RIPCLONE_TEST_RECHECK_DELAY_MS", "2500");
     init(false);
@@ -149,7 +147,6 @@ async fn recheck_burst_collapses_to_latest() {
 #[tokio::test]
 async fn recheck_stops_at_cap() {
     let _guard = SERIAL.lock().await;
-    enable_async_build();
     set_env("RIPCLONE_RECHECK_MAX", "1");
     set_env("RIPCLONE_TEST_RECHECK_DELAY_MS", "2000");
     init(false);
@@ -200,7 +197,6 @@ async fn recheck_stops_at_cap() {
 #[tokio::test]
 async fn recheck_noop_when_tip_unchanged() {
     let _guard = SERIAL.lock().await;
-    enable_async_build();
     set_env("RIPCLONE_RECHECK_MAX", "3");
     set_env("RIPCLONE_TEST_RECHECK_DELAY_MS", "0");
     init(false);

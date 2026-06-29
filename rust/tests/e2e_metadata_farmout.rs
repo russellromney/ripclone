@@ -22,7 +22,6 @@ async fn metadata_and_queue_on_sqlite_with_real_worker() {
         std::env::set_var("RIPCLONE_METADATA_DB_URL", &meta_url);
         std::env::set_var("RIPCLONE_SYNC_MAX_ATTEMPTS", "10");
     }
-    enable_async_build();
     init(false);
 
     let server = start_server().await;

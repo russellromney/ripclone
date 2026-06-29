@@ -14,7 +14,7 @@ async fn generic_provider_sync_and_clone_through_http_origin() {
 
     // Stand up a local HTTP origin.
     let origin = make_http_origin("acme/http");
-    origin.commit(&[("README.md", "hello from http origin\n")], "c1");
+    let want = origin.commit(&[("README.md", "hello from http origin\n")], "c1");
     origin.publish();
 
     // Configure a generic provider pointing at the local HTTP server.
@@ -37,21 +37,39 @@ async fn generic_provider_sync_and_clone_through_http_origin() {
         .await
         .expect("sync generic provider repo");
 
-    // Clone the resulting artifacts.
-    let out = tempfile::tempdir().unwrap();
-    let target = out.path().join("clone");
-    client
-        .install_repo_with_mode_at(
-            "acme/http",
-            "HEAD",
-            None,
-            &target,
-            CloneMode::Editable,
-            Some("full"),
-            None,
-        )
-        .await
-        .expect("clone generic provider repo");
+    // Clone the resulting artifacts. The full clonepack builds in the background
+    // under two-phase publish, so poll until it reaches the published commit.
+    let mut last = String::from("<no successful clone>");
+    let mut found = None;
+    for _ in 0..160 {
+        let out = tempfile::tempdir().unwrap();
+        let target = out.path().join("clone");
+        match client
+            .install_repo_with_mode_at(
+                "acme/http",
+                "HEAD",
+                None,
+                &target,
+                CloneMode::Editable,
+                Some("full"),
+                None,
+            )
+            .await
+        {
+            Ok(())
+                if git_ok(&target, &["rev-parse", "--verify", "HEAD"])
+                    && git(&target, &["rev-parse", "HEAD"]) == want =>
+            {
+                found = Some((out, target));
+                break;
+            }
+            Ok(()) => last = "clone not yet current".to_string(),
+            Err(e) => last = format!("clone err: {e:#}"),
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    let (_out, target) =
+        found.unwrap_or_else(|| panic!("generic provider clone never current (last: {last})"));
 
     // Verify content and origin remote.
     let readme = std::fs::read_to_string(target.join("README.md")).unwrap();

@@ -18,13 +18,10 @@ done
 
 export RIPCLONE_SERVER_TOKEN="${RIPCLONE_SERVER_TOKEN:-${RIPCLONE_TOKEN:-e2e-local-token}}"
 export RIPCLONE_TOKEN="$RIPCLONE_SERVER_TOKEN"
-# This script does `sync` then immediately `clone`. Production defaults to
-# asynchronous, two-phase builds, where `sync` returns before the clonepack is
-# ready (the clone would then fail "ref is missing clonepack manifest"). Pin
-# synchronous single-phase builds so the sync->clone sequence is deterministic,
-# matching the in-process e2e harness.
-export RIPCLONE_ASYNC_BUILD=0
-export RIPCLONE_TWO_PHASE=0
+# This script does `sync` then immediately `clone`. Builds are always
+# asynchronous and two-phase, but the in-process `/sync` blocks until the build
+# publishes (up to RIPCLONE_SYNC_WAIT_SECS), so for these tiny fixtures the
+# clonepack is ready by the time `sync` returns.
 # Per-repo access enforcement (AU1) probes the provider over HTTP and can't
 # reach this file:// origin. This is a single-tenant local e2e, so use the
 # documented trust-mode escape hatch (the shared token is the only auth here).

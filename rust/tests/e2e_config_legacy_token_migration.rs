@@ -26,7 +26,7 @@ fn write_legacy_config(home: &std::path::Path, server_url: &str, token: &str) {
 
 #[tokio::test]
 async fn legacy_config_json_token_still_authenticates() {
-    setup(false, false, false);
+    setup(false);
 
     let origin = make_origin("acme", "migrate");
     origin.commit(&[("README.md", "legacy token migration\n")], "c1");
