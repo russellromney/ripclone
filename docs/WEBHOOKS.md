@@ -153,6 +153,63 @@ Per provider instance:
   re-gate access / retune signed-URL TTL, rename → re-key, delete → purge);
   tag/release pre-warm. These differ a lot per provider; keep them out of phase 1.
 
+## Explicit add — the watch-list
+
+The `RIPCLONE_WEBHOOK_ALLOWLIST` above is a *static* gate: it answers "is this
+pushed repo allowed to warm?" but it lives in config and needs a restart to
+change. For a server you keep running, you also want a **dynamic** way to say
+"keep these repos warm" — add and remove them at runtime. That is the
+**watch-list**.
+
+A watched repo is one the server keeps warm: its default branch (plus any
+branches that are already built) rebuilds on every push, and the set survives
+restarts.
+
+### API
+
+Authenticated with the server token (the same `RIPCLONE_SERVER_TOKEN` that gates
+`/build`):
+
+- `POST   /v1/repos/{provider}/{owner}/{repo}/track` — add to the watch-list (and warm it now)
+- `DELETE /v1/repos/{provider}/{owner}/{repo}/track` — remove it
+- `GET    /v1/tracked` — list the watched repos
+
+`track` is idempotent (re-adding a watched repo is a no-op) and enqueues an
+initial build so the first clone is already warm.
+
+### CLI
+
+The CLI wraps the API against the configured server:
+
+```
+ripclone track   owner/repo      # start keeping it warm
+ripclone untrack owner/repo      # stop
+ripclone tracked                 # list
+```
+
+Provider-prefixed forms — `gitlab/group/proj`, `gitea/owner/repo` — use the same
+natural-key convention as the allowlist.
+
+### Storage
+
+The watch-list is a small table in the **pluggable metadata store** (the same
+store that holds `RefInfo`), so it inherits whatever backend you configured
+(files or SQL). No new infrastructure.
+
+### How it combines with the allowlist and warm-all
+
+On a push, the receiver enqueues a sync when **any** of these holds:
+
+1. `RIPCLONE_WEBHOOK_WARM_ALL=1` (warm everything pushed), or
+2. the repo is on the static `RIPCLONE_WEBHOOK_ALLOWLIST`, or
+3. the repo is on the dynamic watch-list (it was `track`ed).
+
+So the allowlist is the "set it and forget it" gate, and the watch-list is the
+"manage it as you go" gate — use either, both, or neither. With no warm-all, an
+empty allowlist, and an empty watch-list, a push warms nothing: **explicit by
+default.** Branch policy is unchanged — a watched repo's default branch always
+warms; other branches warm only if already built, unless `WARM_ALL` is set.
+
 ## Relationship to the managed cloud
 
 The managed cloud does **not** route GitHub App webhooks through this receiver —
