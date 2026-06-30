@@ -18,10 +18,9 @@ done
 
 export RIPCLONE_SERVER_TOKEN="${RIPCLONE_SERVER_TOKEN:-${RIPCLONE_TOKEN:-e2e-local-token}}"
 export RIPCLONE_TOKEN="$RIPCLONE_SERVER_TOKEN"
-# This script does `sync` then immediately `clone`. Builds are always
-# asynchronous and two-phase, but the in-process `/sync` blocks until the build
-# publishes (up to RIPCLONE_SYNC_WAIT_SECS), so for these tiny fixtures the
-# clonepack is ready by the time `sync` returns.
+# This script does `sync` then `clone`. Builds are always asynchronous and
+# two-phase: depth=1 is ready when `sync` returns, but the full/files variants
+# finish in the background, so the clone helpers below retry until ready.
 # Per-repo access enforcement (AU1) probes the provider over HTTP and can't
 # reach this file:// origin. This is a single-tenant local e2e, so use the
 # documented trust-mode escape hatch (the shared token is the only auth here).
@@ -99,9 +98,35 @@ start_server() {
 }
 
 sync_repo() { "$CLI_BIN" --server "$SERVER_URL" sync "$1/$2" >/dev/null; }
+# Builds are two-phase: depth=1 is ready as soon as `sync` returns, but the full
+# and files variants finish in the background, and on a re-sync the full variant
+# briefly serves the previous commit. So retry the clone until it succeeds.
 clone_repo() { # owner repo dir [extra cli args...]
+  local i
+  for i in $(seq 1 80); do
+    rm -rf "$3"
+    if "$CLI_BIN" --server "$SERVER_URL" clone "$1/$2" --dir "$3" "${@:4}" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.5
+  done
+  # Final attempt without suppression so the real error surfaces under `set -e`.
   rm -rf "$3"
   "$CLI_BIN" --server "$SERVER_URL" clone "$1/$2" --dir "$3" "${@:4}" >/dev/null
+}
+# Like clone_repo but also waits out the background full build / brief stale
+# serving on a re-sync: retry until the clone reaches exactly `$4` commits.
+clone_until_count() { # owner repo dir count [extra cli args...]
+  local i
+  for i in $(seq 1 80); do
+    rm -rf "$3"
+    if "$CLI_BIN" --server "$SERVER_URL" clone "$1/$2" --dir "$3" "${@:5}" >/dev/null 2>&1 \
+      && [ "$(gitc "$3" rev-list --count HEAD 2>/dev/null)" = "$4" ]; then
+      return 0
+    fi
+    sleep 0.5
+  done
+  fail "clone of $1/$2 never reached $4 commits"
 }
 
 assert_clean() { [ -z "$(gitc "$1" status --porcelain)" ] || fail "$2: worktree not clean"; }
@@ -132,7 +157,7 @@ w=$(new_origin acme d0)
 commit "$w" a.txt "1" c1; commit "$w" a.txt "2" c2; commit "$w" a.txt "3" c3
 publish "$w" acme d0
 sync_repo acme d0
-clone_repo acme d0 "$BASE_DIR/c-d0" --depth 0
+clone_until_count acme d0 "$BASE_DIR/c-d0" 3 --depth 0
 assert_file "$BASE_DIR/c-d0" a.txt "3"
 [ ! -f "$BASE_DIR/c-d0/.git/shallow" ] || fail "full clone must not be shallow"
 assert_count "$BASE_DIR/c-d0" 3
@@ -172,11 +197,11 @@ echo "==> re-sync after new push"
 w=$(new_origin acme resync)
 commit "$w" a "1" c1; publish "$w" acme resync
 sync_repo acme resync
-clone_repo acme resync "$BASE_DIR/c-rs1" --depth 0
+clone_until_count acme resync "$BASE_DIR/c-rs1" 1 --depth 0
 assert_count "$BASE_DIR/c-rs1" 1
 commit "$w" a "2" c2; publish "$w" acme resync
 sync_repo acme resync
-clone_repo acme resync "$BASE_DIR/c-rs2" --depth 0
+clone_until_count acme resync "$BASE_DIR/c-rs2" 2 --depth 0
 assert_file "$BASE_DIR/c-rs2" a "2"
 assert_count "$BASE_DIR/c-rs2" 2
 pass "re-sync served the new commit"
@@ -191,7 +216,7 @@ commit "$w" a.txt "v1" c1; publish "$w" acme lsm
 sync_repo acme lsm                                  # seal level 0
 commit "$w" a.txt "v2" c2; commit "$w" b.txt "b" c3; publish "$w" acme lsm
 sync_repo acme lsm                                  # tail since seal -> seal level 1
-clone_repo acme lsm "$BASE_DIR/c-lsm" --depth 0
+clone_until_count acme lsm "$BASE_DIR/c-lsm" 3 --depth 0
 assert_file "$BASE_DIR/c-lsm" a.txt "v2"
 assert_file "$BASE_DIR/c-lsm" b.txt "b"
 assert_count "$BASE_DIR/c-lsm" 3
