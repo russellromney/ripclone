@@ -440,7 +440,11 @@ pub struct Client {
     http: reqwest::Client,
     /// Client with no default auth headers, used for presigned URLs.
     raw_http: reqwest::Client,
-    token: Option<String>,
+    /// Full `Authorization` header value sent on `http` ("Ripclone <hash>" or
+    /// "Bearer <jwt>"). Threaded into the streaming extractor so its separate
+    /// blocking client authenticates the gateway artifact-fetch fallback the same
+    /// way the main client does.
+    auth_header: Option<String>,
     cache: Option<Cas>,
     /// Upstream git provider instance id (e.g. "github", "gitlab").
     provider: String,
@@ -474,12 +478,29 @@ impl Client {
         token: Option<String>,
         cache_dir: Option<&Path>,
     ) -> Self {
+        let auth = token.as_ref().map(|t| format!("Ripclone {t}"));
+        Self::new_with_auth(server, auth, cache_dir)
+    }
+
+    /// Create a client that authenticates with a `Bearer <jwt>` session token
+    /// (from `ripclone auth login`) instead of the shared `Ripclone <hash>`
+    /// scheme.
+    pub fn new_with_bearer(server: String, jwt: String) -> Self {
+        let cache_dir = if std::env::var_os("RIPCLONE_NO_CACHE").is_some() {
+            None
+        } else {
+            std::env::var_os("RIPCLONE_CACHE_DIR").map(PathBuf::from)
+        };
+        let auth = Some(format!("Bearer {jwt}"));
+        Self::new_with_auth(server, auth, cache_dir.as_deref())
+    }
+
+    fn new_with_auth(server: String, auth_value: Option<String>, cache_dir: Option<&Path>) -> Self {
         let mut headers = reqwest::header::HeaderMap::new();
-        if let Some(token) = &token {
-            let value = format!("Ripclone {}", token);
-            if let Ok(header_value) = reqwest::header::HeaderValue::from_str(&value) {
-                headers.insert(reqwest::header::AUTHORIZATION, header_value);
-            }
+        if let Some(value) = &auth_value
+            && let Ok(header_value) = reqwest::header::HeaderValue::from_str(value)
+        {
+            headers.insert(reqwest::header::AUTHORIZATION, header_value);
         }
         // Advertise the wire protocol so the server can reject an incompatible
         // (too-new) client with an actionable error instead of a confusing 4xx.
@@ -493,7 +514,7 @@ impl Client {
             server,
             http,
             raw_http: build_http_client(reqwest::header::HeaderMap::new()),
-            token,
+            auth_header: auth_value,
             cache,
             provider: "github".to_string(),
             upstream_token: None,
@@ -1989,7 +2010,7 @@ impl Client {
             let archive_chunks = archive_chunks.to_vec();
             let work_tree2 = work_tree.clone();
             let server = self.server.clone();
-            let token = self.token.clone();
+            let auth_header = self.auth_header.clone();
             tokio::task::spawn_blocking(move || {
                 let mut manifest_tmp =
                     tempfile::NamedTempFile::new().context("create temp manifest")?;
@@ -2006,7 +2027,7 @@ impl Client {
                     None,
                     None,
                     &server,
-                    token.as_deref(),
+                    auth_header.as_deref(),
                 )
             })
             .await
@@ -2578,7 +2599,7 @@ impl Client {
             let archive_chunks = archive_chunks.to_vec();
             let work_tree2 = work_tree.clone();
             let server = self.server.clone();
-            let token = self.token.clone();
+            let auth_header = self.auth_header.clone();
             tokio::task::spawn_blocking(move || {
                 let mut manifest_tmp =
                     tempfile::NamedTempFile::new().context("create temp manifest")?;
@@ -2595,7 +2616,7 @@ impl Client {
                     None,
                     None,
                     &server,
-                    token.as_deref(),
+                    auth_header.as_deref(),
                 )
             })
             .await

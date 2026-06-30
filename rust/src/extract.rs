@@ -1956,7 +1956,11 @@ pub fn extract_clonepack_streaming(
     git_dir: Option<&Path>,
     dictionary: Option<&[u8]>,
     server: &str,
-    token: Option<&str>,
+    // Full `Authorization` header value (e.g. "Ripclone <hash>" or "Bearer
+    // <jwt>") for the gateway artifact-fetch fallback when chunks aren't served
+    // via presigned URLs. Passed verbatim so a session-token client authenticates
+    // the same way it does on the main HTTP client.
+    auth_header: Option<&str>,
 ) -> Result<ExtractStats> {
     use anyhow::Context;
     use reqwest::header::AUTHORIZATION;
@@ -1965,7 +1969,7 @@ pub fn extract_clonepack_streaming(
     let server = server.to_string();
     let hashes: Vec<String> = archive_chunk_hashes.to_vec();
     let signed: Vec<Option<String>> = signed_chunk_urls.unwrap_or_default();
-    let auth_header = token.map(|t| format!("Ripclone {}", t));
+    let auth_header = auth_header.map(|h| h.to_string());
 
     extract_archive_with_chunk_fetcher(
         manifest_path,
