@@ -1,8 +1,8 @@
 use crate::git;
 use crate::manifest::{FileEntry, FrameInfo, MetadataChunk as Manifest};
 use crate::worktree_writer::{
-    FileWriteContent, OwnedFileWrite, SchedulerConfig, WorktreeWriteScheduler, WorktreeWriter,
-    WriteOptions,
+    FileSlice, FileWriteContent, OwnedFileWrite, SchedulerConfig, WorktreeWriteScheduler,
+    WorktreeWriter, WriteOptions,
 };
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, bounded};
@@ -45,7 +45,7 @@ fn path_from_bytes(bytes: &[u8]) -> &std::path::Path {
 }
 
 struct PendingFile {
-    fragments: Vec<Option<Vec<u8>>>,
+    fragments: Vec<Option<FileSlice>>,
     remaining: usize,
 }
 
@@ -323,8 +323,8 @@ where
 
     let (job_tx, job_rx): (Sender<Chunk>, Receiver<Chunk>) = bounded(queue_depth);
     let (compressed_tx, compressed_rx): (
-        Sender<(usize, Result<Vec<u8>>)>,
-        Receiver<(usize, Result<Vec<u8>>)>,
+        Sender<(usize, Result<bytes::Bytes>)>,
+        Receiver<(usize, Result<bytes::Bytes>)>,
     ) = bounded(queue_depth);
     let (done_tx, done_rx): (
         Sender<Result<ArchiveFrameWriteResult>>,
@@ -339,7 +339,7 @@ where
     for _ in 0..fetch_threads {
         let fetcher = fetcher.clone();
         let job_rx: Receiver<Chunk> = job_rx.clone();
-        let compressed_tx: Sender<(usize, Result<Vec<u8>>)> = compressed_tx.clone();
+        let compressed_tx: Sender<(usize, Result<bytes::Bytes>)> = compressed_tx.clone();
         let manifest2 = manifest.clone();
         std::thread::spawn(move || {
             while let Ok(chunk) = job_rx.recv() {
@@ -348,6 +348,7 @@ where
                 });
                 match chunk_bytes {
                     Ok(bytes) => {
+                        let bytes = bytes::Bytes::from(bytes);
                         for idx in chunk.start_frame..chunk.end_frame {
                             let frame = &manifest2.frames[idx];
                             // A corrupted manifest can put chunk_offset below the
@@ -361,7 +362,7 @@ where
                                 }) {
                                 Some((off, end)) if end <= bytes.len() as u64 => {
                                     let off = off as usize;
-                                    Ok(bytes[off..off + frame.compressed_len as usize].to_vec())
+                                    Ok(bytes.slice(off..off + frame.compressed_len as usize))
                                 }
                                 _ => Err(anyhow::anyhow!(
                                     "frame {} (offset={} len={}) out of chunk bounds (start={} len={})",
@@ -398,7 +399,7 @@ where
 
     // Spawn writer threads: they decompress frames and write files.
     for _ in 0..write_threads {
-        let compressed_rx: Receiver<(usize, Result<Vec<u8>>)> = compressed_rx.clone();
+        let compressed_rx: Receiver<(usize, Result<bytes::Bytes>)> = compressed_rx.clone();
         let done_tx: Sender<Result<ArchiveFrameWriteResult>> = done_tx.clone();
         let manifest2 = manifest.clone();
         let fragments_by_frame2 = fragments_by_frame.clone();
@@ -422,36 +423,12 @@ where
                     };
                     let compressed = res?;
                     let frame = &manifest2.frames[idx];
-                    // Empty frames (produced by empty files) have no compressed
-                    // bytes and decompress to an empty buffer.
-                    let raw: Arc<Vec<u8>> =
-                        Arc::new(if frame.compressed_len == 0 && frame.raw_len == 0 {
-                            Vec::new()
-                        } else {
-                            match dictionary2.as_ref() {
-                                Some(dict) => {
-                                    let mut decompressor =
-                                        zstd::bulk::Decompressor::with_dictionary(dict.as_slice())
-                                            .context("create zstd decompressor with dictionary")?;
-                                    decompressor
-                                        .decompress(&compressed, frame.raw_len as usize)
-                                        .with_context(|| {
-                                            format!("decompress frame {} with dictionary", idx)
-                                        })?
-                                }
-                                None => {
-                                    // Cap the output at the frame's declared raw
-                                    // length, like the dictionary branch above.
-                                    // `decode_all` is unbounded, so a bad frame
-                                    // could expand without limit before the length
-                                    // check below.
-                                    zstd::bulk::Decompressor::new()
-                                        .context("create zstd decompressor")?
-                                        .decompress(&compressed, frame.raw_len as usize)
-                                        .with_context(|| format!("decompress frame {}", idx))?
-                                }
-                            }
-                        });
+                    let raw = Arc::new(decompress_frame_recorded(
+                        compressed.as_ref(),
+                        frame,
+                        dictionary2.as_deref().map(|d| d.as_slice()),
+                        idx,
+                    )?);
                     if raw.len() != frame.raw_len as usize {
                         anyhow::bail!(
                             "frame {} raw length mismatch: {} vs {}",
@@ -484,7 +461,7 @@ where
                         let content = &raw[off..off + len];
 
                         if entry.fragments.len() == 1 {
-                            let hash = <Sha1 as Sha1Digest>::digest(content);
+                            let hash = sha1_digest_recorded(content);
                             if hash.as_slice() != entry.blob_sha1 {
                                 anyhow::bail!(
                                     "sha1 mismatch for {}",
@@ -525,16 +502,21 @@ where
                                     String::from_utf8_lossy(&entry.path)
                                 )
                             })?;
-                            pending.fragments[*frag_idx] = Some(content.to_vec());
+                            pending.fragments[*frag_idx] = Some(FileSlice {
+                                data: Arc::clone(&raw),
+                                offset: off,
+                                len,
+                            });
                             pending.remaining -= 1;
                             if pending.remaining == 0 {
                                 let pending = guard.remove(file_idx).expect("pending file missing");
                                 drop(guard);
-                                let mut full = Vec::with_capacity(entry.total_len() as usize);
-                                for frag in pending.fragments {
-                                    full.extend_from_slice(&frag.expect("fragment missing"));
-                                }
-                                let hash = <Sha1 as Sha1Digest>::digest(&full);
+                                let fragments: Vec<FileSlice> = pending
+                                    .fragments
+                                    .into_iter()
+                                    .map(|frag| frag.expect("fragment missing"))
+                                    .collect();
+                                let hash = sha1_digest_fragments_recorded(&fragments);
                                 if hash.as_slice() != entry.blob_sha1 {
                                     anyhow::bail!(
                                         "sha1 mismatch for {}",
@@ -545,7 +527,7 @@ where
                                     if let Some(ref target_dir) = target_dir2 {
                                         pending_writes.push(OwnedFileWrite {
                                             entry: entry.clone(),
-                                            content: full.clone().into(),
+                                            content: FileWriteContent::Fragments(fragments.clone()),
                                         });
                                         if pending_writes.len() >= PACK_WRITE_BATCH_FILES {
                                             let outcome = flush_archive_writes(
@@ -559,15 +541,15 @@ where
                                         }
                                     }
                                     let sha1 = blob_sha1_to_array(&entry.blob_sha1)?;
-                                    tx.send(crate::blob_pack::BlobPackInput::Owned {
+                                    tx.send(crate::blob_pack::BlobPackInput::Fragments {
                                         sha1,
-                                        content: full,
+                                        fragments,
                                     })
                                     .context("blob pack builder closed")?;
                                 } else if let Some(ref target_dir) = target_dir2 {
                                     pending_writes.push(OwnedFileWrite {
                                         entry: entry.clone(),
-                                        content: full.into(),
+                                        content: FileWriteContent::Fragments(fragments),
                                     });
                                     if pending_writes.len() >= PACK_WRITE_BATCH_FILES {
                                         let outcome = flush_archive_writes(
@@ -674,12 +656,10 @@ where
         && let Some(ref target_dir) = target_dir
     {
         let clear_start = Instant::now();
-        let paths: Vec<String> = manifest
-            .files
-            .iter()
-            .map(|e| String::from_utf8_lossy(&e.path).into_owned())
-            .collect();
-        if let Err(e) = git::clear_skip_worktree_index_with_stats(target_dir, &paths, &stat_cache) {
+        let paths: Vec<Vec<u8>> = manifest.files.iter().map(|e| e.path.clone()).collect();
+        if let Err(e) =
+            git::clear_skip_worktree_index_with_stats_raw(target_dir, &paths, &stat_cache)
+        {
             error = Some(e);
         } else {
             info!(
@@ -893,6 +873,55 @@ fn archive_thread_counts() -> (usize, usize) {
     (fetch_threads, write_threads)
 }
 
+fn decompress_frame_recorded(
+    compressed: &[u8],
+    frame: &FrameInfo,
+    dictionary: Option<&[u8]>,
+    idx: usize,
+) -> Result<Vec<u8>> {
+    let start = Instant::now();
+    let raw = if frame.compressed_len == 0 && frame.raw_len == 0 {
+        Vec::new()
+    } else {
+        match dictionary {
+            Some(dict) => {
+                let mut decompressor = zstd::bulk::Decompressor::with_dictionary(dict)
+                    .context("create zstd decompressor with dictionary")?;
+                decompressor
+                    .decompress(compressed, frame.raw_len as usize)
+                    .with_context(|| format!("decompress frame {} with dictionary", idx))?
+            }
+            None => zstd::bulk::Decompressor::new()
+                .context("create zstd decompressor")?
+                .decompress(compressed, frame.raw_len as usize)
+                .with_context(|| format!("decompress frame {}", idx))?,
+        }
+    };
+    crate::perf::record_zstd_inflate(start.elapsed(), compressed.len(), raw.len());
+    Ok(raw)
+}
+
+fn sha1_digest_recorded(content: &[u8]) -> sha1::digest::Output<Sha1> {
+    let start = Instant::now();
+    let hash = <Sha1 as Sha1Digest>::digest(content);
+    crate::perf::record_sha1(start.elapsed(), content.len());
+    hash
+}
+
+fn sha1_digest_fragments_recorded(fragments: &[FileSlice]) -> sha1::digest::Output<Sha1> {
+    let start = Instant::now();
+    let mut hasher = Sha1::new();
+    let mut bytes = 0usize;
+    for fragment in fragments {
+        let data = &fragment.data[fragment.offset..fragment.offset + fragment.len];
+        bytes += data.len();
+        hasher.update(data);
+    }
+    let hash = hasher.finalize();
+    crate::perf::record_sha1(start.elapsed(), bytes);
+    hash
+}
+
 /// Extract a working-tree archive from a channel of pre-fetched archive chunks.
 ///
 /// This is the unified pipeline path: async download tasks fetch archive chunks
@@ -910,7 +939,7 @@ pub fn extract_archive_from_chunk_receiver(
     target_dir: Option<&Path>,
     git_dir: Option<&Path>,
     dictionary: Option<&[u8]>,
-    chunk_rx: Receiver<(usize, Result<Vec<u8>>)>,
+    chunk_rx: Receiver<(usize, Result<bytes::Bytes>)>,
 ) -> Result<ExtractStats> {
     let fetch_start = Instant::now();
 
@@ -1027,8 +1056,8 @@ pub fn extract_archive_from_chunk_receiver(
         chunks.into_iter().map(|c| (c.chunk_index, c)).collect();
 
     let (compressed_tx, compressed_rx): (
-        Sender<(usize, Result<Vec<u8>>)>,
-        Receiver<(usize, Result<Vec<u8>>)>,
+        Sender<(usize, Result<bytes::Bytes>)>,
+        Receiver<(usize, Result<bytes::Bytes>)>,
     ) = bounded(queue_depth);
     let (done_tx, done_rx): (
         Sender<Result<ArchiveFrameWriteResult>>,
@@ -1040,8 +1069,8 @@ pub fn extract_archive_from_chunk_receiver(
     // Fetcher threads read whole archive chunks from the channel, slice them into
     // per-frame compressed buffers, and push those to the writer pool.
     for _ in 0..fetch_threads {
-        let chunk_rx: Receiver<(usize, Result<Vec<u8>>)> = chunk_rx.clone();
-        let compressed_tx: Sender<(usize, Result<Vec<u8>>)> = compressed_tx.clone();
+        let chunk_rx: Receiver<(usize, Result<bytes::Bytes>)> = chunk_rx.clone();
+        let compressed_tx: Sender<(usize, Result<bytes::Bytes>)> = compressed_tx.clone();
         let chunks_by_index = chunks_by_index.clone();
         let manifest2 = manifest.clone();
         std::thread::spawn(move || {
@@ -1071,7 +1100,7 @@ pub fn extract_archive_from_chunk_receiver(
                                 }) {
                                 Some((off, end)) if end <= bytes.len() as u64 => {
                                     let off = off as usize;
-                                    Ok(bytes[off..off + frame.compressed_len as usize].to_vec())
+                                    Ok(bytes.slice(off..off + frame.compressed_len as usize))
                                 }
                                 _ => Err(anyhow::anyhow!(
                                     "frame {} (offset={} len={}) out of chunk {} bounds (start={} len={})",
@@ -1112,7 +1141,7 @@ pub fn extract_archive_from_chunk_receiver(
 
     // Spawn writer threads: they decompress frames and write files.
     for _ in 0..write_threads {
-        let compressed_rx: Receiver<(usize, Result<Vec<u8>>)> = compressed_rx.clone();
+        let compressed_rx: Receiver<(usize, Result<bytes::Bytes>)> = compressed_rx.clone();
         let done_tx: Sender<Result<ArchiveFrameWriteResult>> = done_tx.clone();
         let manifest2 = manifest.clone();
         let fragments_by_frame2 = fragments_by_frame.clone();
@@ -1136,34 +1165,12 @@ pub fn extract_archive_from_chunk_receiver(
                     };
                     let compressed = res?;
                     let frame = &manifest2.frames[idx];
-                    let raw: Arc<Vec<u8>> =
-                        Arc::new(if frame.compressed_len == 0 && frame.raw_len == 0 {
-                            Vec::new()
-                        } else {
-                            match dictionary2.as_ref() {
-                                Some(dict) => {
-                                    let mut decompressor =
-                                        zstd::bulk::Decompressor::with_dictionary(dict.as_slice())
-                                            .context("create zstd decompressor with dictionary")?;
-                                    decompressor
-                                        .decompress(&compressed, frame.raw_len as usize)
-                                        .with_context(|| {
-                                            format!("decompress frame {} with dictionary", idx)
-                                        })?
-                                }
-                                None => {
-                                    // Cap the output at the frame's declared raw
-                                    // length, like the dictionary branch above.
-                                    // `decode_all` is unbounded, so a bad frame
-                                    // could expand without limit before the length
-                                    // check below.
-                                    zstd::bulk::Decompressor::new()
-                                        .context("create zstd decompressor")?
-                                        .decompress(&compressed, frame.raw_len as usize)
-                                        .with_context(|| format!("decompress frame {}", idx))?
-                                }
-                            }
-                        });
+                    let raw = Arc::new(decompress_frame_recorded(
+                        compressed.as_ref(),
+                        frame,
+                        dictionary2.as_deref().map(|d| d.as_slice()),
+                        idx,
+                    )?);
                     if raw.len() != frame.raw_len as usize {
                         anyhow::bail!(
                             "frame {} raw length mismatch: {} vs {}",
@@ -1196,7 +1203,7 @@ pub fn extract_archive_from_chunk_receiver(
                         let content = &raw[off..off + len];
 
                         if entry.fragments.len() == 1 {
-                            let hash = <Sha1 as Sha1Digest>::digest(content);
+                            let hash = sha1_digest_recorded(content);
                             if hash.as_slice() != entry.blob_sha1 {
                                 anyhow::bail!(
                                     "sha1 mismatch for {}",
@@ -1237,16 +1244,21 @@ pub fn extract_archive_from_chunk_receiver(
                                     String::from_utf8_lossy(&entry.path)
                                 )
                             })?;
-                            pending.fragments[*frag_idx] = Some(content.to_vec());
+                            pending.fragments[*frag_idx] = Some(FileSlice {
+                                data: Arc::clone(&raw),
+                                offset: off,
+                                len,
+                            });
                             pending.remaining -= 1;
                             if pending.remaining == 0 {
                                 let pending = guard.remove(file_idx).expect("pending file missing");
                                 drop(guard);
-                                let mut full = Vec::with_capacity(entry.total_len() as usize);
-                                for frag in pending.fragments {
-                                    full.extend_from_slice(&frag.expect("fragment missing"));
-                                }
-                                let hash = <Sha1 as Sha1Digest>::digest(&full);
+                                let fragments: Vec<FileSlice> = pending
+                                    .fragments
+                                    .into_iter()
+                                    .map(|frag| frag.expect("fragment missing"))
+                                    .collect();
+                                let hash = sha1_digest_fragments_recorded(&fragments);
                                 if hash.as_slice() != entry.blob_sha1 {
                                     anyhow::bail!(
                                         "sha1 mismatch for {}",
@@ -1257,7 +1269,7 @@ pub fn extract_archive_from_chunk_receiver(
                                     if let Some(ref target_dir) = target_dir2 {
                                         pending_writes.push(OwnedFileWrite {
                                             entry: entry.clone(),
-                                            content: full.clone().into(),
+                                            content: FileWriteContent::Fragments(fragments.clone()),
                                         });
                                         if pending_writes.len() >= PACK_WRITE_BATCH_FILES {
                                             let outcome = flush_archive_writes(
@@ -1271,15 +1283,15 @@ pub fn extract_archive_from_chunk_receiver(
                                         }
                                     }
                                     let sha1 = blob_sha1_to_array(&entry.blob_sha1)?;
-                                    tx.send(crate::blob_pack::BlobPackInput::Owned {
+                                    tx.send(crate::blob_pack::BlobPackInput::Fragments {
                                         sha1,
-                                        content: full,
+                                        fragments,
                                     })
                                     .context("blob pack builder closed")?;
                                 } else if let Some(ref target_dir) = target_dir2 {
                                     pending_writes.push(OwnedFileWrite {
                                         entry: entry.clone(),
-                                        content: full.into(),
+                                        content: FileWriteContent::Fragments(fragments),
                                     });
                                     if pending_writes.len() >= PACK_WRITE_BATCH_FILES {
                                         let outcome = flush_archive_writes(
@@ -1376,12 +1388,10 @@ pub fn extract_archive_from_chunk_receiver(
         && let Some(ref target_dir) = target_dir
     {
         let clear_start = Instant::now();
-        let paths: Vec<String> = manifest
-            .files
-            .iter()
-            .map(|e| String::from_utf8_lossy(&e.path).into_owned())
-            .collect();
-        if let Err(e) = git::clear_skip_worktree_index_with_stats(target_dir, &paths, &stat_cache) {
+        let paths: Vec<Vec<u8>> = manifest.files.iter().map(|e| e.path.clone()).collect();
+        if let Err(e) =
+            git::clear_skip_worktree_index_with_stats_raw(target_dir, &paths, &stat_cache)
+        {
             error = Some(e);
         } else {
             info!(
@@ -1667,12 +1677,9 @@ pub fn materialize_worktree_from_pack(repo_root: &Path, commit: &str) -> Result<
 
     // The files now exist on disk; clear skip-worktree so git diffs/status see
     // them as ordinary tracked paths.
-    let paths: Vec<String> = items
-        .iter()
-        .map(|it| String::from_utf8_lossy(&it.path).into_owned())
-        .collect();
+    let paths: Vec<Vec<u8>> = items.iter().map(|it| it.path.clone()).collect();
     let stats = stat_cache.into_inner().unwrap();
-    git::clear_skip_worktree_index_with_stats(repo_root, &paths, &stats)
+    git::clear_skip_worktree_index_with_stats_raw(repo_root, &paths, &stats)
         .context("clear skip-worktree and refresh index stats after pack materialization")?;
 
     let raw_total = raw_bytes.load(Ordering::Relaxed) as u64;
@@ -1775,16 +1782,22 @@ pub fn extract_blobs_from_pack_bytes(
         if data_start > pack.len() {
             anyhow::bail!("pack object {} data starts past end of pack", i);
         }
+        let inflate_start = Instant::now();
         let mut dec = ZlibDecoder::new(&pack[data_start..]);
         let mut content = Vec::with_capacity(size as usize);
         dec.read_to_end(&mut content)
             .with_context(|| format!("inflate pack object {}", i))?;
+        crate::perf::record_zlib_inflate(
+            inflate_start.elapsed(),
+            dec.total_in() as usize,
+            content.len(),
+        );
         off = data_start + dec.total_in() as usize;
 
         // type 3 == OBJ_BLOB. The manifest keys blobs by the plain sha1 of the
         // raw content (no git "blob <len>\0" header), so match that.
         if obj_type == 3 {
-            let sha: [u8; 20] = Sha1::digest(&content).into();
+            let sha: [u8; 20] = sha1_digest_recorded(&content).into();
             if let Some(paths) = blob_paths.get(&sha) {
                 let path_count = paths.len();
                 for (idx, (path, mode)) in paths.iter().enumerate() {

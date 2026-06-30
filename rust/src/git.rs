@@ -172,6 +172,24 @@ pub fn clear_skip_worktree_index_with_stats<P: AsRef<Path>>(
     paths: &[String],
     stats: &[MaterializedPathStat],
 ) -> Result<()> {
+    let byte_paths: Vec<&[u8]> = paths.iter().map(|p| p.as_bytes()).collect();
+    clear_skip_worktree_index_with_stats_bytes(repo_dir, &byte_paths, stats)
+}
+
+pub fn clear_skip_worktree_index_with_stats_raw<P: AsRef<Path>>(
+    repo_dir: P,
+    paths: &[Vec<u8>],
+    stats: &[MaterializedPathStat],
+) -> Result<()> {
+    let byte_paths: Vec<&[u8]> = paths.iter().map(Vec::as_slice).collect();
+    clear_skip_worktree_index_with_stats_bytes(repo_dir, &byte_paths, stats)
+}
+
+pub fn clear_skip_worktree_index_with_stats_bytes<P: AsRef<Path>>(
+    repo_dir: P,
+    paths: &[&[u8]],
+    stats: &[MaterializedPathStat],
+) -> Result<()> {
     if paths.is_empty() {
         return Ok(());
     }
@@ -184,20 +202,20 @@ pub fn clear_skip_worktree_index_with_stats<P: AsRef<Path>>(
     }
     let mut index = open_index_file(&index_path)?;
 
-    let stats_by_path: HashMap<&str, &IndexStat> =
-        stats.iter().map(|s| (s.path.as_str(), &s.stat)).collect();
+    let stats_by_path: HashMap<&[u8], &IndexStat> =
+        stats.iter().map(|s| (s.path.as_slice(), &s.stat)).collect();
     let mut changed = false;
     for path in paths {
         let Some(entry) = index.entry_mut_by_path_and_stage(
-            gix::bstr::BStr::new(path.as_bytes()),
+            gix::bstr::BStr::new(*path),
             gix::index::entry::Stage::Unconflicted,
         ) else {
             continue;
         };
-        let stat = if let Some(stat) = stats_by_path.get(path.as_str()) {
+        let stat = if let Some(stat) = stats_by_path.get(*path) {
             **stat
         } else {
-            let full_path = repo_dir.join(index_path_from_bytes(path.as_bytes()));
+            let full_path = repo_dir.join(index_path_from_bytes(*path));
             let metadata = std::fs::symlink_metadata(&full_path)
                 .with_context(|| format!("stat materialized file {}", full_path.display()))?;
             index_stat_from_metadata(&metadata)
@@ -218,14 +236,14 @@ pub fn clear_skip_worktree_index_with_stats<P: AsRef<Path>>(
 
 #[derive(Debug)]
 pub struct MaterializedPathStat {
-    pub path: String,
+    pub path: Vec<u8>,
     stat: IndexStat,
 }
 
 type IndexStat = gix::index::entry::Stat;
 
 pub fn materialized_path_stat_from_metadata(
-    path: String,
+    path: Vec<u8>,
     metadata: &std::fs::Metadata,
 ) -> MaterializedPathStat {
     MaterializedPathStat {
@@ -236,7 +254,7 @@ pub fn materialized_path_stat_from_metadata(
 
 #[cfg(target_os = "linux")]
 pub fn materialized_path_stat_from_statx(
-    path: String,
+    path: Vec<u8>,
     statx: &libc::statx,
 ) -> MaterializedPathStat {
     MaterializedPathStat {
@@ -814,38 +832,33 @@ fn pack_objects_to_prefix_inner<P: AsRef<Path>, Q: AsRef<Path>>(
         bail!("no objects to pack");
     }
 
-    let mut input = String::new();
-    for sha in object_shas {
-        input.push_str(sha);
-        input.push('\n');
-    }
-
-    let input_file = tempfile::NamedTempFile::new()?;
-    std::fs::write(input_file.path(), input.as_bytes())?;
-
     if let Some(parent) = prefix.as_ref().parent() {
         std::fs::create_dir_all(parent).context("create pack prefix directory")?;
     }
 
-    let repo_str = repo.as_ref().to_str().context("repo path not UTF-8")?;
-    let prefix_str = prefix.as_ref().to_str().context("prefix path not UTF-8")?;
-    let extra = if extra_args.is_empty() {
-        String::new()
-    } else {
-        format!(" {}", extra_args.join(" "))
-    };
-    let cmd = format!(
-        "git -C '{}' pack-objects{} '{}' < '{}'",
-        shell_escape(repo_str),
-        extra,
-        shell_escape(prefix_str),
-        shell_escape(input_file.path().to_str().unwrap())
-    );
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(repo.as_ref())
+        .arg("pack-objects")
+        .args(extra_args)
+        .arg(prefix.as_ref())
+        .stdin(Stdio::piped())
+        .spawn()
+        .context("spawn git pack-objects")?;
 
-    let status = Command::new("sh")
-        .args(["-c", &cmd])
-        .status()
-        .context("git pack-objects shell")?;
+    {
+        let mut stdin = child.stdin.take().context("open git pack-objects stdin")?;
+        for sha in object_shas {
+            stdin
+                .write_all(sha.as_bytes())
+                .context("write object id to pack-objects stdin")?;
+            stdin
+                .write_all(b"\n")
+                .context("write newline to pack-objects stdin")?;
+        }
+    }
+
+    let status = child.wait().context("wait for git pack-objects")?;
 
     if !status.success() {
         bail!("pack-objects failed");
@@ -2496,7 +2509,7 @@ mod tests {
         set_skip_worktree_all(repo).unwrap();
 
         let stats = vec![materialized_path_stat_from_metadata(
-            "a.txt".to_string(),
+            b"a.txt".to_vec(),
             &std::fs::symlink_metadata(repo.join("a.txt")).unwrap(),
         )];
         clear_skip_worktree_index_with_stats(repo, &["a.txt".to_string()], &stats).unwrap();

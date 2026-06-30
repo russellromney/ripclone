@@ -95,6 +95,57 @@ impl Cas {
         Ok(())
     }
 
+    pub fn put_file<P: AsRef<Path>>(&self, source: P) -> Result<(String, u64)> {
+        let source = source.as_ref();
+        let meta = std::fs::metadata(source)
+            .with_context(|| format!("stat CAS source file {}", source.display()))?;
+        let len = meta.len();
+        std::fs::create_dir_all(&self.root)?;
+        let mut input = std::fs::File::open(source)
+            .with_context(|| format!("open CAS source file {}", source.display()))?;
+        let mut tmp = tempfile::Builder::new()
+            .prefix(".tmp.")
+            .tempfile_in(&self.root)
+            .with_context(|| format!("create CAS temp file in {}", self.root.display()))?;
+        let mut hasher = Sha256::new();
+        let mut buf = vec![0u8; 1024 * 1024];
+        loop {
+            let n = std::io::Read::read(&mut input, &mut buf)
+                .with_context(|| format!("read CAS source file {}", source.display()))?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+            tmp.as_file_mut()
+                .write_all(&buf[..n])
+                .context("write CAS temp file")?;
+        }
+        tmp.as_file_mut()
+            .sync_all()
+            .context("fsync CAS temp file")?;
+
+        let hash = format!("{:x}", hasher.finalize());
+        let path = self.object_path(&hash)?;
+        let tmp_path = tmp.into_temp_path();
+        if path.exists() {
+            return Ok((hash, len));
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::rename(&tmp_path, &path)
+            .or_else(|e| {
+                if path.exists() {
+                    let _ = std::fs::remove_file(&tmp_path);
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            })
+            .with_context(|| format!("rename CAS object {}", hash))?;
+        Ok((hash, len))
+    }
+
     pub fn get(&self, hash: &str) -> Result<Vec<u8>> {
         let path = self.object_path(hash)?;
         let data = std::fs::read(&path).with_context(|| format!("read CAS object {}", hash))?;

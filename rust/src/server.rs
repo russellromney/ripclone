@@ -3856,19 +3856,20 @@ fn assemble_variant(
     if tagged.is_empty() {
         return Ok((Vec::new(), None, String::new()));
     }
-    // Fetch every pack's idx concurrently — there can be 100+ of them (each a local
-    // read or an object-store GET), so a serial loop dominates the assemble. Results
-    // stay in order, so the concatenation + offsets below are deterministic.
-    use rayon::prelude::*;
-    let idxs: Vec<Vec<u8>> = tagged
-        .par_iter()
-        .map(|&(pack, _)| cas.get(&pack.2).or_else(|_| storage.get(&pack.2)))
-        .collect::<Result<Vec<_>>>()?;
-    let mut buf: Vec<u8> = Vec::with_capacity(idxs.iter().map(|b| b.len()).sum());
+    use std::io::Write;
+
+    let mut tmp = tempfile::Builder::new()
+        .suffix(".idx-bundle")
+        .tempfile_in(cas.root())
+        .context("create idx bundle temp file")?;
     let mut entries = Vec::with_capacity(tagged.len());
-    for (&(pack, history_only), idx_bytes) in tagged.iter().zip(&idxs) {
-        let offset = buf.len() as u64;
-        buf.extend_from_slice(idx_bytes);
+    let mut len = 0u64;
+    for &(pack, history_only) in tagged {
+        let idx_bytes = cas.get(&pack.2).or_else(|_| storage.get(&pack.2))?;
+        let offset = len;
+        tmp.write_all(&idx_bytes)
+            .context("write idx bytes to bundle")?;
+        len += idx_bytes.len() as u64;
         entries.push(crate::clonepack::PackEntry {
             pack: Some(ChunkRef {
                 hash: hash_from_hex(&pack.0)?,
@@ -3882,8 +3883,12 @@ fn assemble_variant(
             idx_bundle_offset: offset,
         });
     }
-    let len = buf.len() as u64;
-    let hash = cas.put(&buf)?;
+    tmp.flush().context("flush idx bundle temp file")?;
+    let (hash, stored_len) = cas.put_file(tmp.path())?;
+    anyhow::ensure!(
+        stored_len == len,
+        "idx bundle length changed while storing: expected {len}, got {stored_len}"
+    );
     Ok((
         entries,
         Some(ChunkRef {

@@ -34,6 +34,7 @@ pub mod mode;
 pub mod oidc;
 pub mod overlay;
 pub mod pack;
+pub mod perf;
 pub mod provider;
 pub mod provider_config;
 pub mod queue;
