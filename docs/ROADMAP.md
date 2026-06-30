@@ -43,22 +43,22 @@ Remaining work:
 - **Repo/branch-specific depth configuration** (see section below).
 - Support more than two hard-coded depths (e.g., depth=10, depth=50) without recompiling.
 
-### 2a. Repo/branch-specific configuration (planned)
+### 2a. Repo/branch-specific configuration (partly shipped)
 
 Right now the server hard-codes two clonepack variants (`shallow` = depth 1, `full` = unlimited). Users and orgs should be able to configure this per repo/branch without recompiling.
 
-Proposed design:
+**Shipped** (`rust/src/repo_config.rs`, admin endpoint + build wiring in `rust/src/server.rs`):
 
-- Add a `RepoConfig` store backed by the same storage as the ref store (file for local dev, S3 for production).
-- Key by `owner/repo[/branch]`, with branch-level entries overriding repo-level entries.
-- Config fields:
-  - `clonepack_depths: Vec<DepthSpec>` where `DepthSpec` is `{ name: "shallow", depth: 1 }`, `{ name: "full", depth: null }`, or arbitrary depths like `{ name: "recent", depth: 50 }`.
-  - `compression_level`, `dictionary_id`, `hot_files`, `archive_chunk_size`, `head_blobs_chunk_size`.
-  - `enabled_modes: ["full", "fast", "hybrid", "skeleton"]` if a repo wants to disable some paths.
-- On sync/build, the server reads the config for the repo/branch and builds exactly the requested set of clonepacks.
-- The ref endpoint accepts `?clonepack=<name>`; the name maps to one of the configured depths.
-- Default config (when none is stored) produces `shallow` and `full` exactly like today, so behavior is unchanged for unconfigured repos.
-- A simple admin CLI or API endpoint (`POST /v1/admin/config/{owner}/{repo}`) can write the config; eventually this is exposed in the ripclone-cloud UI.
+- A `RepoConfigStore` backed by the same storage as artifacts (file for local dev, S3 for production), keyed `owner/repo[/branch]` with branch-level entries overriding repo-level entries (field-level overlay). It is read at build time only — the build records what the resolve path needs into the `RefInfo`, so the clone hot path never reads config. A write is visible to the next build immediately, across processes.
+- The full config schema: `clonepack_depths: Vec<DepthSpec>` (`{ name, depth: Option<usize> }`), `compression_level`, `dictionary_id`, `hot_files`, `archive_chunk_size`, `head_blobs_chunk_size`, `enabled_modes`. Validated on write.
+- Admin read/write endpoint: `GET`/`POST /v1/admin/config/{owner}/{repo}` (with `?branch=` for a branch override).
+- The build reads the effective config and applies `compression_level` to the archive build (single-phase and two-phase paths).
+- Default config (none stored) produces `shallow` + `full` exactly like today — unconfigured repos are byte-for-byte unchanged.
+
+**Remaining** (needs the multi-variant build):
+
+- Producing arbitrary named depths (e.g. `recent = 50` alongside `shallow` + `full`) requires generalizing the two-phase build engine and the fixed two-slot `RefInfo` (`shallow_clonepack` + `full_clonepack`) to an arbitrary named-clonepack list. The config schema and `validate()` already model this (today `validate()` caps a config to the two structural variants the build can emit); lifting that cap is the follow-up. Until then `clonepack_depths` is accepted and validated but the build emits the default `shallow` + `full`.
+- Wire `dictionary_id`, `archive_chunk_size`, `head_blobs_chunk_size` (the build is already parameterized for these) and surface the config in a CLI / the ripclone-cloud UI. `enabled_modes` needs the resolve endpoint to learn the requested clone mode before it can be enforced server-side.
 
 ### 3. Unified async download/write pipeline ✅
 

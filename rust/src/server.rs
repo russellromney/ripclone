@@ -49,6 +49,9 @@ pub struct ServerState {
     pub storage: StorageRef,
     pub repo_root: PathBuf,
     pub ref_store: Arc<dyn RefStore>,
+    /// Per-repo / per-branch build configuration (ROADMAP §2a). Read at build
+    /// time; absent config means today's default (shallow + full).
+    pub repo_config: Arc<crate::repo_config::RepoConfigStore>,
     pub provider_registry: ProviderRegistry,
     pub broker: Arc<dyn CredentialBroker>,
     pub token_hash: Option<String>,
@@ -119,6 +122,7 @@ impl ServerState {
             Arc::new(StaticBroker::new(provider_registry.clone()));
         Ok(ServerState {
             cas: b.cas,
+            repo_config: Arc::new(crate::repo_config::RepoConfigStore::new(b.storage.clone())),
             storage: b.storage,
             repo_root: b.repo_root,
             ref_store: b.ref_store,
@@ -546,6 +550,12 @@ pub fn build_app(state: ServerState) -> Router {
         .route("/v1/artifacts/{hash}", get(get_artifact))
         .route("/v1/archives/{hash}", get(get_artifact))
         .route("/v1/manifests/{hash}", get(get_artifact))
+        // Per-repo build config (ROADMAP §2a): read/write the repo-level config,
+        // or a branch-level override via `?branch=`.
+        .route(
+            "/v1/admin/config/{owner}/{repo}",
+            get(admin_get_config).post(admin_put_config),
+        )
         // Single catch-all route for git smart-http endpoints.
         .route("/v1/git/{*path}", get(dispatch_git_get))
         .route("/v1/git/{*path}", post(dispatch_git_post))
@@ -2386,6 +2396,7 @@ async fn sync_repo_inner(
     // do_sync acquires this per-repo lock itself, holding it only across the
     // mirror-mutating prep and releasing it before the heavy read-only build.
     let lock = repo_lock(&state.sync_locks, &repo_id).await;
+    let repo_config = effective_repo_config(&state, &repo_id, &branch).await;
     match do_sync(
         &state.cas,
         &mirror_dir,
@@ -2400,6 +2411,7 @@ async fn sync_repo_inner(
         &state.retention,
         &provider,
         credential.as_ref(),
+        &repo_config,
         &lock,
     )
     .await
@@ -2506,6 +2518,97 @@ async fn trigger_build(state: &ServerState, repo_id: &RepoId, branch: &str) -> R
         Err(e) => format!("build queue unavailable: {e}"),
         _ => "build queue full".to_string(),
     })
+}
+
+/// Query for the admin config endpoints: an optional branch selects a
+/// branch-level override; absent means the repo-level config.
+#[derive(Deserialize)]
+struct AdminConfigQuery {
+    #[serde(default)]
+    branch: Option<String>,
+}
+
+/// `GET /v1/admin/config/{owner}/{repo}` — return the stored repo- or
+/// branch-level config (404 if none is stored).
+async fn admin_get_config(
+    Path((owner, repo)): Path<(String, String)>,
+    Query(query): Query<AdminConfigQuery>,
+    State(state): State<ServerState>,
+) -> Response {
+    if let Some(resp) = reject_invalid_repo_ids(&owner, &repo) {
+        return resp;
+    }
+    let repo_id = RepoId::github(format!("{owner}/{repo}"));
+    let loaded = match query.branch.as_deref().filter(|b| !b.is_empty()) {
+        Some(branch) => state.repo_config.get_branch(&repo_id, branch).await,
+        None => state.repo_config.get_repo(&repo_id).await,
+    };
+    match loaded {
+        Ok(Some(config)) => (StatusCode::OK, Json(config)).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "no config stored for this repo/branch".to_string(),
+            }),
+        )
+            .into_response(),
+        Err(e) => {
+            state.metrics.record_error();
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("load config: {e:#}"),
+                }),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// `POST /v1/admin/config/{owner}/{repo}` — store the repo- or branch-level
+/// config. The body is a `RepoConfig`; it is validated before being written.
+/// The next sync/build for the repo reads it.
+async fn admin_put_config(
+    Path((owner, repo)): Path<(String, String)>,
+    Query(query): Query<AdminConfigQuery>,
+    State(state): State<ServerState>,
+    Json(config): Json<crate::repo_config::RepoConfig>,
+) -> Response {
+    if let Some(resp) = reject_invalid_repo_ids(&owner, &repo) {
+        return resp;
+    }
+    if let Err(e) = config.validate() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!("invalid config: {e:#}"),
+            }),
+        )
+            .into_response();
+    }
+    let repo_id = RepoId::github(format!("{owner}/{repo}"));
+    let stored = match query.branch.as_deref().filter(|b| !b.is_empty()) {
+        Some(branch) => {
+            state
+                .repo_config
+                .put_branch(&repo_id, branch, &config)
+                .await
+        }
+        None => state.repo_config.put_repo(&repo_id, &config).await,
+    };
+    match stored {
+        Ok(()) => (StatusCode::OK, Json(config)).into_response(),
+        Err(e) => {
+            state.metrics.record_error();
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("store config: {e:#}"),
+                }),
+            )
+                .into_response()
+        }
+    }
 }
 
 async fn build_handler(
@@ -2958,6 +3061,7 @@ async fn create_snapshot_inner(
     let branch = query.branch.clone();
 
     let lock = repo_lock(&state.sync_locks, &repo_id).await;
+    let repo_config = effective_repo_config(&state, &repo_id, &branch).await;
     let info = match do_sync(
         &state.cas,
         &mirror_dir,
@@ -2972,6 +3076,7 @@ async fn create_snapshot_inner(
         &state.retention,
         &provider,
         credential.as_ref(),
+        &repo_config,
         &lock,
     )
     .await
@@ -3791,6 +3896,26 @@ async fn reuse_existing_build(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Load the effective per-repo/branch build config, falling back to the default
+/// (today's behavior) if the store read fails — a config-store hiccup must never
+/// block a build.
+async fn effective_repo_config(
+    state: &ServerState,
+    repo_id: &RepoId,
+    branch: &str,
+) -> crate::repo_config::RepoConfig {
+    match state.repo_config.effective(repo_id, branch).await {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            warn!(
+                "repo config load for {} failed ({e:#}); using defaults",
+                repo_id.storage_key()
+            );
+            crate::repo_config::RepoConfig::default()
+        }
+    }
+}
+
 async fn do_sync(
     cas: &Cas,
     mirror_dir: &std::path::Path,
@@ -3811,12 +3936,16 @@ async fn do_sync(
     retention: &Arc<Retention>,
     provider: &ProviderInstance,
     credential: Option<&secrecy::SecretString>,
+    // Effective per-repo/branch build config (ROADMAP §2a). Default config
+    // reproduces today's build exactly.
+    repo_config: &crate::repo_config::RepoConfig,
     // Per-repo lock. do_sync holds it only while mutating the mirror (fetch +
     // commit-graph, and the bitmap on the single-phase path), then drops it before
     // the heavy read-only build, so different repos build concurrently. Safe
     // because auto-gc is off, so the build only reads the mirror's packs.
     mirror_lock: &Arc<tokio::sync::Mutex<()>>,
 ) -> Result<RefInfo> {
+    let compression_level = repo_config.compression_level();
     info!("syncing {}@{}", repo_id.storage_key(), branch);
 
     // Per-phase timers so sync cost can be tuned with real numbers (RIPCLONE_LOG
@@ -3993,6 +4122,7 @@ async fn do_sync(
             inline_full_history,
             t_total,
             fetched_at,
+            compression_level,
         )
         .await;
     }
@@ -4100,7 +4230,7 @@ async fn do_sync(
     let archive_handle = tokio::task::spawn_blocking(move || {
         let s = Instant::now();
         let builder = ArchiveBuilder::new(&mirror_dir4);
-        let r = builder.build_into_cas(&commit4, &cas4, 6, None);
+        let r = builder.build_into_cas(&commit4, &cas4, compression_level, None);
         info!("build task: working-tree archive {:?}", s.elapsed());
         r
     });
@@ -4603,6 +4733,8 @@ async fn build_and_publish_two_phase(
     t_total: Instant,
     // Publish-ordering key, stamped at fetch time by the caller (see do_sync).
     fetched_at: Option<u64>,
+    // zstd level for archive frames, from the effective repo config.
+    compression_level: i32,
 ) -> Result<RefInfo> {
     let history_target = env_bytes("RIPCLONE_HISTORY_PACK_BYTES", 512 * 1024 * 1024);
     let upload_conc = upload_concurrency();
@@ -4951,6 +5083,7 @@ async fn build_and_publish_two_phase(
             prev_files_for_archive,
             prev_archive_commit,
             head_base_pack_count_for_p2,
+            compression_level,
         )
         .await;
         match &res {
@@ -5026,6 +5159,8 @@ async fn build_full_in_background(
     // phase rebases — rebuilds a fresh base at the current commit (off the depth=1
     // critical path) — so the delta never grows unbounded.
     head_base_pack_count: usize,
+    // zstd level for archive frames, from the effective repo config.
+    compression_level: i32,
 ) -> Result<()> {
     // Incremental history: build only the tail past the last sealed level; prior
     // levels are reused by hash from object storage (Tigris) — never rebuilt.
@@ -5068,14 +5203,14 @@ async fn build_full_in_background(
             b.build_into_cas_bounded(
                 &cma,
                 &ca,
-                6,
+                compression_level,
                 None,
                 &prev_archive_frames,
                 &prev_files,
                 prev_archive_commit.as_deref().unwrap_or_default(),
             )
         } else {
-            b.build_into_cas_incremental(&cma, &ca, 6, None, &prev_frame_map)
+            b.build_into_cas_incremental(&cma, &ca, compression_level, None, &prev_frame_map)
         }
     });
     let (md2, c2, cm2, st2, lsm2) = (
@@ -5382,6 +5517,7 @@ pub async fn process_build_job(state: &ServerState, job: &BuildJob) -> Result<()
     // or a worker that exits would lose the detached task. The in-process server
     // builds it in the background instead, for a fast response.
     let inline_full_history = !state.build_queue.inproc_wait();
+    let repo_config = effective_repo_config(state, repo_id, branch).await;
     let result = do_sync(
         &state.cas,
         &mirror_dir,
@@ -5395,6 +5531,7 @@ pub async fn process_build_job(state: &ServerState, job: &BuildJob) -> Result<()
         &state.retention,
         &provider,
         job.credential.as_ref(),
+        &repo_config,
         &lock,
     )
     .await;
@@ -5959,6 +6096,7 @@ pub async fn run_server(
 
     let state = ServerState {
         cas: b.cas,
+        repo_config: Arc::new(crate::repo_config::RepoConfigStore::new(b.storage.clone())),
         storage: b.storage,
         repo_root: repo_root.to_path_buf(),
         ref_store: b.ref_store,
@@ -6049,6 +6187,7 @@ mod tests {
             Arc::new(StaticBroker::new(provider_registry.clone()));
         ServerState {
             cas,
+            repo_config: Arc::new(crate::repo_config::RepoConfigStore::new(storage.clone())),
             storage,
             repo_root,
             ref_store,
