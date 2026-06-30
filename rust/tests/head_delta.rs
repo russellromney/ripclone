@@ -21,7 +21,6 @@ use std::time::Duration;
 /// base-rebuild path runs on every non-empty delta — exercising rebase
 /// continuously rather than only after a large cumulative delta.
 fn setup() {
-    enable_two_phase();
     static O: Once = Once::new();
     // SAFETY: set once via Once, before any server/sync reads it. Correctness
     // holds for any threshold; a 1-byte one just rebases every sync.
@@ -37,7 +36,7 @@ async fn sync_and_settle(server: &Server, origin: &Origin, want_count: &str) {
         .sync_repo(&format!("{}/{}", origin.owner, origin.repo), None)
         .await
         .expect("sync");
-    let _ = clone_full_at(server, &origin.owner, &origin.repo, want_count, true).await;
+    let _ = clone_full_at(server, &origin.owner, &origin.repo, want_count).await;
 }
 
 /// The re-add trap: a blob present at c1, deleted at c2, then re-added *identical*
@@ -84,7 +83,7 @@ async fn re_add_identical_blob_survives_in_depth1() {
     assert_eq!(git(&d, &["status", "--porcelain"]), "", "status clean");
 
     // Full clone after phase 2 is complete + fsck-clean.
-    let (_g0, d0) = clone_full_at(&server, "acme", "readd", "3", true).await;
+    let (_g0, d0) = clone_full_at(&server, "acme", "readd", "3").await;
     assert_eq!(read(&d0, "secret.txt"), "TOPSECRET\n");
     assert_repo_usable(&d0, "3");
 }
@@ -206,7 +205,7 @@ async fn head_compaction_keeps_clones_complete() {
         );
 
         // Wait for phase 2 (incl. any compaction) to land before the next sync.
-        let (_g0, d0) = clone_full_at(&server, "acme", "compact", &i.to_string(), true).await;
+        let (_g0, d0) = clone_full_at(&server, "acme", "compact", &i.to_string()).await;
         for j in 2..=i {
             assert!(
                 d0.join(format!("f{j}.txt")).exists(),
@@ -217,7 +216,7 @@ async fn head_compaction_keeps_clones_complete() {
     }
 
     // Final full clone is a complete, usable repo with every file.
-    let (_g, d) = clone_full_at(&server, "acme", "compact", "7", true).await;
+    let (_g, d) = clone_full_at(&server, "acme", "compact", "7").await;
     assert_repo_usable(&d, "7");
     tokio::time::sleep(Duration::from_millis(10)).await; // let any stray task settle
 }

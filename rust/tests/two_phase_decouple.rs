@@ -13,7 +13,6 @@ use std::time::{Duration, Instant};
 const ARCHIVE_DELAY_MS: u64 = 3000;
 
 fn setup() {
-    enable_two_phase();
     static O: Once = Once::new();
     // SAFETY: set once, before any server/sync reads it.
     O.call_once(|| unsafe {
@@ -63,6 +62,6 @@ async fn editable_full_ready_before_files() {
     );
 
     // Files mode is published a moment later; it waits for the archive, then works.
-    let (_g1, d1) = clone_files_when(&server, "acme", "decouple", "a.txt", "2\n", true).await;
+    let (_g1, d1) = clone_files_when(&server, "acme", "decouple", "a.txt", "2\n").await;
     assert_eq!(read(&d1, "dir/b.txt"), "B\n");
 }

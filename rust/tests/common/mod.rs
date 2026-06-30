@@ -46,16 +46,8 @@ pub fn init(lsm: bool) {
             // single-tenant local e2e tests, so use the documented trust-mode
             // escape hatch (the shared token is the only auth here).
             std::env::set_var("RIPCLONE_TRUST_GATEWAY", "1");
-            // Two-phase + async are on by default in production; legacy tests
-            // here expect synchronous single-phase builds (depth=0 ready as soon
-            // as sync returns). Pin them off unless a test opted in via
-            // enable_two_phase()/enable_async_build() (which run before init).
-            if std::env::var_os("RIPCLONE_TWO_PHASE").is_none() {
-                std::env::set_var("RIPCLONE_TWO_PHASE", "0");
-            }
-            if std::env::var_os("RIPCLONE_ASYNC_BUILD").is_none() {
-                std::env::set_var("RIPCLONE_ASYNC_BUILD", "0");
-            }
+            // Two-phase publish and async builds are always on (no env toggle);
+            // the helpers below poll for the background full/files variants.
             if lsm {
                 std::env::set_var("RIPCLONE_LSM", "1");
             }
@@ -411,18 +403,6 @@ pub fn make_http_origin(repo_path: &str) -> HttpOrigin {
     }
 }
 
-/// Enable two-phase publish for this test binary (set before `init`/server).
-pub fn enable_two_phase() {
-    static O: Once = Once::new();
-    O.call_once(|| unsafe { std::env::set_var("RIPCLONE_TWO_PHASE", "1") });
-}
-
-/// Route `/sync` through the bounded background build queue for this test binary.
-pub fn enable_async_build() {
-    static O: Once = Once::new();
-    O.call_once(|| unsafe { std::env::set_var("RIPCLONE_ASYNC_BUILD", "1") });
-}
-
 /// Install (clone) without syncing first — returns Result so callers can retry
 /// (e.g. waiting for two-phase phase 2 to publish the full clonepack).
 pub async fn clone_only(
@@ -469,11 +449,12 @@ pub fn read(dir: &Path, name: &str) -> String {
         .unwrap_or_else(|e| panic!("read {} in {}: {e}", name, dir.display()))
 }
 
-/// Unified per-binary configuration: base env plus an explicit server build
-/// config. Because the flags are read from process env, each test binary pins
-/// exactly one config; call this at the top of every test in the binary.
-/// The LSM build seals every advancing tail and compacts at `max_levels` (16).
-pub fn setup(two_phase: bool, lsm: bool, async_build: bool) {
+/// Unified per-binary configuration: base env plus the LSM build flag. Two-phase
+/// publish and async builds are always on. Because the flags are read from
+/// process env, each test binary pins exactly one config; call this at the top of
+/// every test in the binary. The LSM build seals every advancing tail and
+/// compacts at `max_levels` (16).
+pub fn setup(lsm: bool) {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| unsafe {
         std::env::set_var("RIPCLONE_TOKEN", TOKEN);
@@ -489,23 +470,20 @@ pub fn setup(two_phase: bool, lsm: bool, async_build: bool) {
         // Single-tenant local e2e: AU1 access enforcement can't probe file://
         // origins over HTTP, so use the documented trust-mode escape hatch.
         std::env::set_var("RIPCLONE_TRUST_GATEWAY", "1");
-        std::env::set_var("RIPCLONE_TWO_PHASE", if two_phase { "1" } else { "0" });
         std::env::set_var("RIPCLONE_LSM", if lsm { "1" } else { "0" });
-        std::env::set_var("RIPCLONE_ASYNC_BUILD", if async_build { "1" } else { "0" });
     });
 }
 
 /// Clone the full (depth=0) editable variant, waiting for it to reach
-/// `want_count` commits. Under two-phase the full variant is built in the
-/// background, so poll; otherwise it is ready as soon as sync returns.
+/// `want_count` commits. The full variant is built in the background (phase 2),
+/// so poll until it lands.
 pub async fn clone_full_at(
     server: &Server,
     owner: &str,
     repo: &str,
     want_count: &str,
-    two_phase: bool,
 ) -> (TempDir, PathBuf) {
-    let attempts = if two_phase { 160 } else { 1 };
+    let attempts = 160;
     let mut last = String::from("<no successful clone>");
     for _ in 0..attempts {
         match clone_only(server, owner, repo, 0, ripclone::mode::CloneMode::Editable).await {
@@ -524,16 +502,15 @@ pub async fn clone_full_at(
 }
 
 /// Clone files mode, waiting until `probe` exists with `want` contents (the
-/// full archive is built in phase 2 under two-phase).
+/// full archive is built in phase 2).
 pub async fn clone_files_when(
     server: &Server,
     owner: &str,
     repo: &str,
     probe: &str,
     want: &str,
-    two_phase: bool,
 ) -> (TempDir, PathBuf) {
-    let attempts = if two_phase { 160 } else { 1 };
+    let attempts = 160;
     for _ in 0..attempts {
         if let Ok((g, d)) =
             clone_only(server, owner, repo, 0, ripclone::mode::CloneMode::Files).await
@@ -615,9 +592,9 @@ pub fn assert_repo_usable(dir: &Path, want_count: &str) {
 
 /// The full correctness lifecycle for one server config: first sync, re-sync on
 /// a new commit, and multi-commit growth — each verified across depth=1,
-/// depth=0 (real usable repo), and files mode. `two_phase` controls whether the
-/// full/files variants are polled for (background) or expected immediately.
-pub async fn lifecycle_battery(server: &Server, origin: &Origin, two_phase: bool) {
+/// depth=0 (real usable repo), and files mode. The full/files variants build in
+/// the background (phase 2), so they are polled for.
+pub async fn lifecycle_battery(server: &Server, origin: &Origin) {
     let client = server.client();
     let (o, r) = (origin.owner.clone(), origin.repo.clone());
 
@@ -632,13 +609,13 @@ pub async fn lifecycle_battery(server: &Server, origin: &Origin, two_phase: bool
 
     assert_depth1(server, &o, &r, &[("a.txt", "2\n"), ("dir/b.txt", "B\n")]).await;
     {
-        let (_g, d) = clone_full_at(server, &o, &r, "2", two_phase).await;
+        let (_g, d) = clone_full_at(server, &o, &r, "2").await;
         assert_eq!(read(&d, "a.txt"), "2\n");
         assert_eq!(read(&d, "dir/b.txt"), "B\n");
         assert_repo_usable(&d, "2");
     }
     {
-        let (_g, d) = clone_files_when(server, &o, &r, "a.txt", "2\n", two_phase).await;
+        let (_g, d) = clone_files_when(server, &o, &r, "a.txt", "2\n").await;
         assert_eq!(read(&d, "dir/b.txt"), "B\n");
     }
 
@@ -652,13 +629,13 @@ pub async fn lifecycle_battery(server: &Server, origin: &Origin, two_phase: bool
 
     assert_depth1(server, &o, &r, &[("a.txt", "3\n"), ("c.txt", "C\n")]).await;
     {
-        let (_g, d) = clone_full_at(server, &o, &r, "3", two_phase).await;
+        let (_g, d) = clone_full_at(server, &o, &r, "3").await;
         assert_eq!(read(&d, "a.txt"), "3\n");
         assert_eq!(read(&d, "c.txt"), "C\n");
         assert_repo_usable(&d, "3");
     }
     {
-        let (_g, d) = clone_files_when(server, &o, &r, "a.txt", "3\n", two_phase).await;
+        let (_g, d) = clone_files_when(server, &o, &r, "a.txt", "3\n").await;
         assert_eq!(read(&d, "c.txt"), "C\n");
     }
 
@@ -674,15 +651,13 @@ pub async fn lifecycle_battery(server: &Server, origin: &Origin, two_phase: bool
             .sync_repo(&format!("{o}/{r}"), None)
             .await
             .expect("resync loop");
-        // Under two-phase the full builds in the background; wait for each step
-        // to land before advancing so successive phase-2 builds don't run
-        // concurrently on the same mirror (the async queue serializes this in
-        // production). Also verifies the full clone at every incremental step.
-        if two_phase {
-            let _ = clone_full_at(server, &o, &r, &i.to_string(), true).await;
-        }
+        // The full variant builds in the background; wait for each step to land
+        // before advancing so successive phase-2 builds don't run concurrently on
+        // the same mirror (the async queue serializes this in production). Also
+        // verifies the full clone at every incremental step.
+        let _ = clone_full_at(server, &o, &r, &i.to_string()).await;
     }
-    let (_g, d) = clone_full_at(server, &o, &r, "8", two_phase).await;
+    let (_g, d) = clone_full_at(server, &o, &r, "8").await;
     for i in 4..=8u32 {
         assert!(
             d.join(format!("f{i}.txt")).exists(),
@@ -692,7 +667,12 @@ pub async fn lifecycle_battery(server: &Server, origin: &Origin, two_phase: bool
     assert_repo_usable(&d, "8");
 }
 
-/// Clone helper: sync then install with the given depth, returning the dir.
+/// Clone helper: sync, then install with the given depth, returning the dir.
+///
+/// Builds are two-phase: depth=1 is ready as soon as `sync` returns, but the
+/// full (depth=0) and files variants build in the background (phase 2) and, on a
+/// resync, serve the previous commit until phase 2 lands. So poll the install
+/// until the clone's HEAD matches the just-published origin HEAD.
 pub async fn sync_and_clone(
     server: &Server,
     origin: &Origin,
@@ -704,22 +684,90 @@ pub async fn sync_and_clone(
         .sync_repo(&format!("{}/{}", origin.owner, origin.repo), None)
         .await
         .expect("sync");
-    let out = tempfile::tempdir().unwrap();
-    let target = out.path().join("clone");
+    let want = git(&origin.bare, &["rev-parse", "HEAD"]);
     let kind = ripclone::mode::clonepack_kind_for_depth(depth);
-    client
-        .install_repo_with_mode(
-            &origin.owner,
-            &origin.repo,
-            "HEAD",
-            &target,
-            mode,
-            Some(kind),
-            None,
-        )
-        .await
-        .expect("install");
-    (out, target)
+    // Files mode materializes a worktree only (intentionally not a git repo), so
+    // it has no HEAD to compare; the git modes resolve HEAD to the built commit.
+    let files_mode = matches!(mode, ripclone::mode::CloneMode::Files);
+    let mut last = String::from("<no successful install>");
+    for _ in 0..160 {
+        let out = tempfile::tempdir().unwrap();
+        let target = out.path().join("clone");
+        match client
+            .install_repo_with_mode(
+                &origin.owner,
+                &origin.repo,
+                "HEAD",
+                &target,
+                mode,
+                Some(kind),
+                None,
+            )
+            .await
+        {
+            Ok(_) => {
+                let ready = if files_mode {
+                    dir_has_file(&target)
+                } else {
+                    git_ok(&target, &["rev-parse", "--verify", "HEAD"])
+                        && git(&target, &["rev-parse", "HEAD"]) == want
+                };
+                if ready {
+                    return (out, target);
+                }
+                last = "clone not yet current".to_string();
+            }
+            Err(e) => last = format!("install err: {e:#}"),
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    panic!(
+        "sync_and_clone never reached HEAD {want} for {}/{} (last: {last})",
+        origin.owner, origin.repo
+    );
+}
+
+/// Poll `/sync` until the clonepack manifest for the current commit is published,
+/// returning the ref response. Builds are two-phase: depth=1 publishes first and
+/// the full clonepack (with its manifest + archive) builds in the background, so
+/// the first sync's `clonepack_manifest` can be empty.
+pub async fn sync_until_manifest(
+    server: &Server,
+    owner: &str,
+    repo: &str,
+) -> ripclone::client::RefResponse {
+    let client = server.client();
+    let mut last = String::from("<no successful sync>");
+    for _ in 0..160 {
+        match client.sync_repo(&format!("{owner}/{repo}"), None).await {
+            Ok(resp) if !resp.clonepack_manifest.is_empty() => return resp,
+            Ok(resp) => last = format!("manifest empty at commit {}", resp.commit),
+            Err(e) => last = format!("sync err: {e:#}"),
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    panic!("clonepack manifest never published for {owner}/{repo} (last: {last})");
+}
+
+/// True when `dir` contains at least one regular file (recursively) — used to
+/// tell a materialized files-mode worktree from an empty/not-yet-built one.
+fn dir_has_file(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        match std::fs::symlink_metadata(&path) {
+            Ok(m) if m.is_dir() => {
+                if dir_has_file(&path) {
+                    return true;
+                }
+            }
+            Ok(_) => return true,
+            Err(_) => {}
+        }
+    }
+    false
 }
 
 // ---- standalone worker process -------------------------------------------

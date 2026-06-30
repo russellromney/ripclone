@@ -1236,6 +1236,62 @@ pub fn ls_remote_commit(
     Ok(sha)
 }
 
+/// Cross-process advisory lock guarding a repo's bare mirror directory.
+///
+/// The in-process per-repo lock only serializes syncs within one process. When
+/// several `ripclone-worker` processes (or a server + worker) share a repo root,
+/// two of them can try to `git clone --mirror` / `git fetch` into the same bare
+/// dir at once — git's own lock files don't cover the initial clone, so the
+/// clones collide ("could not lock config file ...: File exists"). This flock
+/// serializes that mutation across processes. It is released when dropped, and by
+/// the OS if the holding process dies, so it can't wedge.
+#[cfg(unix)]
+struct MirrorLock {
+    _file: std::fs::File,
+}
+
+#[cfg(unix)]
+impl MirrorLock {
+    /// Acquire the exclusive lock, blocking until any other process syncing the
+    /// same mirror finishes (after which our fetch simply fast-forwards).
+    fn acquire(mirror_dir: &Path) -> Result<Self> {
+        use std::os::unix::io::AsRawFd;
+        // The lock file sits next to the mirror dir so it survives a fresh clone
+        // (which creates the mirror dir itself).
+        let lock_path = {
+            let mut p = mirror_dir.as_os_str().to_os_string();
+            p.push(".lock");
+            std::path::PathBuf::from(p)
+        };
+        if let Some(parent) = lock_path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create mirror lock dir {}", parent.display()))?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .with_context(|| format!("open mirror lock {}", lock_path.display()))?;
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if rc != 0 {
+            return Err(anyhow::Error::new(std::io::Error::last_os_error()))
+                .with_context(|| format!("flock mirror lock {}", lock_path.display()));
+        }
+        Ok(Self { _file: file })
+    }
+}
+
+#[cfg(not(unix))]
+struct MirrorLock;
+
+#[cfg(not(unix))]
+impl MirrorLock {
+    fn acquire(_mirror_dir: &Path) -> Result<Self> {
+        Ok(Self)
+    }
+}
+
 /// Sync a bare mirror of a repo. Creates if missing, fetches if exists.
 ///
 /// Phase 1: credentials are passed via git's `http.extraHeader` config, never
@@ -1256,6 +1312,12 @@ pub fn sync_bare_mirror<P: AsRef<Path>>(
         crate::validation::validate_git_rev(branch)
             .with_context(|| format!("invalid branch: {}", branch))?;
     }
+
+    // Serialize the mirror clone/fetch across processes: a pool of workers (or a
+    // worker plus the server) can otherwise run concurrent clones into the same
+    // bare dir and collide on git's config lock. Held only across the mutation
+    // below; released when this function returns.
+    let _mirror_lock = MirrorLock::acquire(mirror_dir.as_ref())?;
 
     let (url, git_args) = upstream_url_and_auth(provider, repo_id, credential);
     // The mirror is always a *complete* clone. The "full" (depth=0) clonepack is

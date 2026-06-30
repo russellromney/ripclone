@@ -6,7 +6,6 @@
 mod common;
 
 use common::*;
-use ripclone::mode::CloneMode;
 
 #[tokio::test]
 async fn compaction_keeps_full_clone_correct() {
@@ -34,15 +33,10 @@ async fn compaction_keeps_full_clone_correct() {
         origin.publish();
         client.sync_repo("acme/cmp", None).await.unwrap();
 
-        let (_g, c) = clone_only(&server, "acme", "cmp", 0, CloneMode::Editable)
-            .await
-            .expect("full clone after compaction");
+        // The full clone builds in the background under two-phase, so poll until
+        // it reaches the expected commit count (clone_full_at asserts the count).
         let want = (i + 1).to_string();
-        assert_eq!(
-            git(&c, &["rev-list", "--count", "HEAD"]),
-            want,
-            "all {want} commits present after sync {i}"
-        );
+        let (_g, c) = clone_full_at(&server, "acme", "cmp", &want).await;
         assert!(
             git_ok(&c, &["rev-list", "--objects", "HEAD"]),
             "full object traversal complete after sync {i}"

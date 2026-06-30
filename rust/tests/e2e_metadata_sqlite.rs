@@ -7,7 +7,6 @@
 mod common;
 
 use common::*;
-use ripclone::mode::CloneMode;
 use std::path::Path;
 
 #[tokio::test]
@@ -40,10 +39,9 @@ async fn metadata_sqlite_sync_then_clone() {
         "sqlite metadata db should exist"
     );
 
-    let (_g, c) = clone_only(&server, "acme", "meta", 0, CloneMode::Editable)
-        .await
-        .expect("clone reads ref back from the sqlite metadata store");
+    // The full clone builds in the background under two-phase, so poll for it
+    // (this also exercises reading the ref back from the sqlite metadata store).
+    let (_g, c) = clone_full_at(&server, "acme", "meta", "2").await;
     assert_eq!(std::fs::read_to_string(c.join("a.txt")).unwrap(), "2\n");
-    assert_eq!(git(&c, &["rev-list", "--count", "HEAD"]), "2");
     assert!(git_ok(&c, &["fsck", "--connectivity-only", "HEAD"]));
 }

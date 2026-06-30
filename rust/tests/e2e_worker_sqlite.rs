@@ -19,7 +19,6 @@ async fn worker_binary_farm_out_sqlite() {
         // Fail fast on the negative case instead of retrying for 80s.
         std::env::set_var("RIPCLONE_SYNC_MAX_ATTEMPTS", "8");
     }
-    enable_async_build();
     init(false);
 
     let server = start_server().await;

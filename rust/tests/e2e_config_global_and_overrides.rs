@@ -70,7 +70,7 @@ fn pack_entry_count(target: &std::path::Path) -> usize {
 
 #[tokio::test]
 async fn global_config_defaults_and_cli_overrides() {
-    setup(false, false, false);
+    setup(false);
 
     let origin = make_origin("acme", "config");
     origin.commit(&[("README.md", "global config test\n")], "c1");

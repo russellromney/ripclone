@@ -71,12 +71,6 @@ impl<'a> PackBuilder<'a> {
         self.build_skeleton_pack_with_depth(commit, Some(1))
     }
 
-    /// Build a packfile + idx containing all objects reachable from a commit.
-    pub fn build_full_pack(&self, commit: &str) -> Result<(String, String)> {
-        let shas = git::list_object_shas(&self.repo, commit)?;
-        self.pack_and_index(&shas)
-    }
-
     /// Build a delta skeleton pack: objects not present in parent commit's skeleton.
     pub fn build_delta_skeleton_pack(
         &self,

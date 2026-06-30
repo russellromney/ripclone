@@ -57,7 +57,7 @@ async fn run_ripclone(
 
 #[tokio::test]
 async fn project_config_drives_clone_mode_and_default_provider() {
-    setup(false, false, false);
+    setup(false);
 
     let origin = make_http_origin("acme/http");
     origin.commit(&[("README.md", "hello from config-driven clone\n")], "c1");
