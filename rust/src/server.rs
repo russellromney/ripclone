@@ -1,7 +1,7 @@
 use crate::RefInfo;
 use crate::archive::ArchiveBuilder;
 use crate::auth::access::{AccessDecision, AccessVerifier, HttpAccessVerifier};
-use crate::auth::broker::{CredentialBroker, StaticBroker};
+use crate::auth::broker::{CredentialBroker, broker_from_env};
 use crate::backends::{self, QueueBackend};
 use crate::cas::Cas;
 use crate::clonepack::{ChunkRef, ClonepackManifest, hash_from_hex, hash_to_hex};
@@ -115,8 +115,7 @@ impl ServerState {
         metrics: Arc<Metrics>,
     ) -> Result<Self> {
         let provider_registry = ProviderRegistry::load().context("load provider registry")?;
-        let broker: Arc<dyn CredentialBroker> =
-            Arc::new(StaticBroker::new(provider_registry.clone()));
+        let broker = broker_from_env(provider_registry.clone())?;
         Ok(ServerState {
             cas: b.cas,
             storage: b.storage,
@@ -5886,7 +5885,7 @@ pub async fn run_server(
         "provider registry loaded with {} instance(s)",
         provider_registry.iter().count()
     );
-    let broker: Arc<dyn CredentialBroker> = Arc::new(StaticBroker::new(provider_registry.clone()));
+    let broker = broker_from_env(provider_registry.clone())?;
 
     let rate_burst: u32 = env::var("RIPCLONE_RATE_LIMIT_BURST")
         .ok()
@@ -6045,8 +6044,9 @@ mod tests {
         let (local_queue, _build_rx, _depth) = crate::queue::LocalJobQueue::new(16);
         let build_queue: JobQueueRef = Arc::new(local_queue);
         let provider_registry = ProviderRegistry::new();
-        let broker: Arc<dyn CredentialBroker> =
-            Arc::new(StaticBroker::new(provider_registry.clone()));
+        let broker: Arc<dyn CredentialBroker> = Arc::new(crate::auth::broker::StaticBroker::new(
+            provider_registry.clone(),
+        ));
         ServerState {
             cas,
             storage,
