@@ -170,9 +170,9 @@ Notes:
 - **Credentials are never put in the queue.** A worker resolves its own upstream
   credentials from its provider config (`RIPCLONE_PROVIDERS` / `RIPCLONE_GITHUB_TOKEN`),
   so a per-request `X-Upstream-Token` is ignored on the cross-process path.
-- **Keep async builds on.** `/sync` only enqueues when async builds are enabled
-  (`RIPCLONE_ASYNC_BUILD`, on by default). With it off the server builds
-  synchronously in-process and the queue is unused.
+- **Async builds are always on.** `/sync` always enqueues onto the bounded build
+  queue, so a build survives client disconnect / HTTP timeout and is
+  rate-bounded under load.
 
 Worker tuning and queue housekeeping:
 

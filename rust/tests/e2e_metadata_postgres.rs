@@ -7,7 +7,6 @@
 mod common;
 
 use common::*;
-use ripclone::mode::CloneMode;
 
 #[tokio::test]
 async fn metadata_postgres_sync_then_clone() {
@@ -36,9 +35,8 @@ async fn metadata_postgres_sync_then_clone() {
         .expect("sync with postgres metadata store");
     assert!(!resp.commit.is_empty());
 
-    let (_g, c) = clone_only(&server, "acme", &repo, 0, CloneMode::Editable)
-        .await
-        .expect("clone reads ref back from postgres metadata store");
+    // The full clone builds in the background under two-phase, so poll for it
+    // (this also exercises reading the ref back from the postgres metadata store).
+    let (_g, c) = clone_full_at(&server, "acme", &repo, "2").await;
     assert_eq!(std::fs::read_to_string(c.join("a.txt")).unwrap(), "2\n");
-    assert_eq!(git(&c, &["rev-list", "--count", "HEAD"]), "2");
 }

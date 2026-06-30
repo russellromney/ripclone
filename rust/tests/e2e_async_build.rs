@@ -1,7 +1,6 @@
-//! End-to-end tests for the async build queue (RIPCLONE_ASYNC_BUILD=1): `/sync`
-//! enqueues onto the bounded background worker (survives disconnect, rate-bounded)
-//! and waits for completion; concurrent syncs for the same repo coalesce onto one
-//! build.
+//! End-to-end tests for the async build queue (always on): `/sync` enqueues onto
+//! the bounded background worker (survives disconnect, rate-bounded) and waits
+//! for completion; concurrent syncs for the same repo coalesce onto one build.
 
 mod common;
 
@@ -17,7 +16,6 @@ fn read(dir: &Path, name: &str) -> String {
 /// correctly.
 #[tokio::test]
 async fn async_sync_then_clone() {
-    enable_async_build();
     init(false);
     let server = start_server().await;
     let origin = make_origin("acme", "aq");
@@ -39,11 +37,9 @@ async fn async_sync_then_clone() {
     assert_eq!(git(&c1, &["rev-list", "--count", "HEAD"]), "1");
     assert_eq!(git(&c1, &["status", "--porcelain"]), "");
 
-    let (_g0, c0) = clone_only(&server, "acme", "aq", 0, CloneMode::Editable)
-        .await
-        .expect("depth=0");
+    // depth=0 (full) builds in the background under two-phase, so poll for it.
+    let (_g0, c0) = clone_full_at(&server, "acme", "aq", "2").await;
     assert_eq!(read(&c0, "a.txt"), "2\n");
-    assert_eq!(git(&c0, &["rev-list", "--count", "HEAD"]), "2");
     assert!(git_ok(&c0, &["fsck", "--connectivity-only", "HEAD"]));
 }
 
@@ -51,7 +47,6 @@ async fn async_sync_then_clone() {
 /// with the same resolved commit.
 #[tokio::test]
 async fn async_concurrent_syncs_coalesce() {
-    enable_async_build();
     init(false);
     let server = start_server().await;
     let origin = make_origin("acme", "aqc");
@@ -78,10 +73,8 @@ async fn async_concurrent_syncs_coalesce() {
         "all coalesced syncs return the same commit: {commits:?}"
     );
 
-    let (_g, c) = clone_only(&server, "acme", "aqc", 0, CloneMode::Editable)
-        .await
-        .expect("clone");
+    // depth=0 (full) builds in the background under two-phase, so poll for it.
+    let (_g, c) = clone_full_at(&server, "acme", "aqc", "2").await;
     assert_eq!(read(&c, "f"), "2\n");
-    assert_eq!(git(&c, &["rev-list", "--count", "HEAD"]), "2");
     assert!(git_ok(&c, &["fsck", "--connectivity-only", "HEAD"]));
 }

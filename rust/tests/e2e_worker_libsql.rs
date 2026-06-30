@@ -95,7 +95,6 @@ async fn worker_farm_out_libsql_against_real_sqld() {
         );
         std::env::set_var("RIPCLONE_METADATA_DB_TOKEN", "dev");
     }
-    enable_async_build();
     init(false);
 
     let server = start_server().await;

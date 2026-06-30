@@ -260,8 +260,8 @@ Three fixes to make it safe and on:
    pre-check in `do_sync`; `RefStore::load_build` + `MetaDb::get_by_commit`.)*
 2. ✅ **Disable mirror auto-gc** *(shipped: `git::disable_auto_gc`, persisted into
    the mirror)* **+ shrink the build lock** *(shipped: `do_sync` holds the
-   per-repo lock only across fetch + commit-graph [+ single-phase bitmap] and
-   drops it before the heavy read-only build — see below).*
+   per-repo lock only across fetch + commit-graph and drops it before the heavy
+   read-only build — see below).*
 3. ✅ **Monotonic publish guard** *(shipped: the publish-ordering key is stamped
    at fetch time — under the per-repo lock — so out-of-order build completion
    can't regress the branch and force-push wins; the existing `save_branch` guard
@@ -275,13 +275,12 @@ Three fixes to make it safe and on:
 ### The lock-shrink (shipped)
 
 `do_sync` now acquires the per-repo lock itself and holds it only across the
-mirror-mutating prep — fetch + commit-graph, plus the bitmap on the single-phase
-path — then drops it before the heavy read-only build. The two-phase path drops
-the lock before `build_and_publish_two_phase` (its depth=1 build is read-only and
-its phase-2 — including the bitmap — already ran detached, outside the lock,
-before this change). The ls-remote pre-check stays lock-free (read-only). Callers
-(`process_build_job`, the two `/sync` paths) now pass the lock handle instead of
-wrapping the whole build.
+mirror-mutating prep — fetch + commit-graph — then drops it before the heavy
+read-only build. The (always two-phase) build drops the lock before
+`build_and_publish_two_phase` (its depth=1 build is read-only and its phase-2
+runs detached, outside the lock). The ls-remote pre-check stays lock-free
+(read-only). Callers (`process_build_job`, the `/sync` and snapshot paths) now
+pass the lock handle instead of wrapping the whole build.
 
 Result: different repos build fully concurrently, and a same-repo build's heavy
 phase no longer pins a build-pool permit waiting on the mirror lock — which also

@@ -105,7 +105,7 @@ fn assert_branch_isolated(dir: &Path, branch: &str, depth: usize, all: &[(String
 async fn concurrent_distinct_branch_builds_for_one_repo_do_not_interleave() {
     // Make the in-process build pool actually parallelize same-repo builds.
     unsafe { std::env::set_var("RIPCLONE_BUILD_CONCURRENCY", "8") };
-    setup(true, true, true); // two-phase + LSM + async — production defaults
+    setup(true); // two-phase + LSM + async — production defaults
     let server = start_server().await;
     let origin = make_origin("acme", "conc");
     origin.commit(&[("base.txt", "base\n")], "c0"); // main, depth 1
@@ -145,7 +145,7 @@ async fn concurrent_distinct_branch_builds_for_one_repo_do_not_interleave() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_builds_during_tip_advancing_fetch_stay_correct() {
     unsafe { std::env::set_var("RIPCLONE_BUILD_CONCURRENCY", "8") };
-    setup(true, true, true);
+    setup(true);
     let server = start_server().await;
     let origin = make_origin("acme", "race");
     origin.commit(&[("base.txt", "base\n")], "c0");
@@ -213,7 +213,7 @@ async fn concurrent_builds_during_tip_advancing_fetch_stay_correct() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fast_moving_single_branch_converges_and_stays_correct() {
     unsafe { std::env::set_var("RIPCLONE_BUILD_CONCURRENCY", "8") };
-    setup(true, true, true);
+    setup(true);
     let server = start_server().await;
     let origin = make_origin("acme", "fast");
 

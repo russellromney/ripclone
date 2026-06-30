@@ -29,7 +29,6 @@ async fn sql_queue_farm_out_sync_then_clone() {
         std::env::set_var("RIPCLONE_QUEUE", "sqlite");
         std::env::set_var("RIPCLONE_QUEUE_DB_URL", &db_path);
     }
-    enable_async_build();
     init(false);
 
     // The server uses the SQL queue and spawns NO in-process worker.

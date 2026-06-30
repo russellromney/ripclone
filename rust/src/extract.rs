@@ -350,18 +350,27 @@ where
                     Ok(bytes) => {
                         for idx in chunk.start_frame..chunk.end_frame {
                             let frame = &manifest2.frames[idx];
-                            let off = (frame.chunk_offset - chunk.byte_start) as usize;
-                            let len = frame.compressed_len as usize;
-                            let res = if off + len > bytes.len() {
-                                Err(anyhow::anyhow!(
-                                    "frame {} (off={} len={}) out of chunk bounds (len={})",
+                            // A corrupted manifest can put chunk_offset below the
+                            // chunk's start or past its end; use checked math so we
+                            // return an error instead of panicking on underflow.
+                            let res = match frame
+                                .chunk_offset
+                                .checked_sub(chunk.byte_start)
+                                .and_then(|off| {
+                                    Some((off, off.checked_add(frame.compressed_len as u64)?))
+                                }) {
+                                Some((off, end)) if end <= bytes.len() as u64 => {
+                                    let off = off as usize;
+                                    Ok(bytes[off..off + frame.compressed_len as usize].to_vec())
+                                }
+                                _ => Err(anyhow::anyhow!(
+                                    "frame {} (offset={} len={}) out of chunk bounds (start={} len={})",
                                     idx,
-                                    off,
-                                    len,
+                                    frame.chunk_offset,
+                                    frame.compressed_len,
+                                    chunk.byte_start,
                                     bytes.len()
-                                ))
-                            } else {
-                                Ok(bytes[off..off + len].to_vec())
+                                )),
                             };
                             if compressed_tx.send((idx, res)).is_err() {
                                 break;
@@ -1051,19 +1060,28 @@ pub fn extract_archive_from_chunk_receiver(
                     Ok(bytes) => {
                         for frame_idx in chunk.start_frame..chunk.end_frame {
                             let frame = &manifest2.frames[frame_idx];
-                            let off = (frame.chunk_offset - chunk.byte_start) as usize;
-                            let len = frame.compressed_len as usize;
-                            let out = if off + len > bytes.len() {
-                                Err(anyhow::anyhow!(
-                                    "frame {} (off={} len={}) out of chunk {} bounds (len={})",
+                            // A corrupted manifest can put chunk_offset below the
+                            // chunk's start or past its end; use checked math so we
+                            // return an error instead of panicking on underflow.
+                            let out = match frame
+                                .chunk_offset
+                                .checked_sub(chunk.byte_start)
+                                .and_then(|off| {
+                                    Some((off, off.checked_add(frame.compressed_len as u64)?))
+                                }) {
+                                Some((off, end)) if end <= bytes.len() as u64 => {
+                                    let off = off as usize;
+                                    Ok(bytes[off..off + frame.compressed_len as usize].to_vec())
+                                }
+                                _ => Err(anyhow::anyhow!(
+                                    "frame {} (offset={} len={}) out of chunk {} bounds (start={} len={})",
                                     frame_idx,
-                                    off,
-                                    len,
+                                    frame.chunk_offset,
+                                    frame.compressed_len,
                                     idx,
+                                    chunk.byte_start,
                                     bytes.len()
-                                ))
-                            } else {
-                                Ok(bytes[off..off + len].to_vec())
+                                )),
                             };
                             if compressed_tx.send((frame_idx, out)).is_err() {
                                 break;

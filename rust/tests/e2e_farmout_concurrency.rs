@@ -23,7 +23,6 @@ async fn pool_of_worker_processes_drains_queue_and_coalesces() {
         std::env::set_var("RIPCLONE_QUEUE", "sqlite");
         std::env::set_var("RIPCLONE_QUEUE_DB_URL", &db_path);
     }
-    enable_async_build();
     init(false);
 
     let server = start_server().await;

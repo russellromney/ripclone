@@ -33,7 +33,6 @@ async fn diskless_worker_head_sync_returns_real_ref() {
         std::env::set_var("RIPCLONE_METADATA_DB_URL", &meta_path);
         std::env::set_var("RIPCLONE_SYNC_MAX_ATTEMPTS", "8");
     }
-    enable_async_build();
     init(false);
 
     let server = start_server().await;

@@ -73,6 +73,8 @@ walkdir = "2"
 zstd = { version = "0.13", features = ["zdict_builder"] }
 secrecy = "0.10.3"
 async-trait = "0.1.89"
+# `rust_crypto` selects the pure-Rust crypto provider so RS256 sign/verify work
+# (the GitHub App broker signs JWTs; OIDC verifies them).
 jsonwebtoken = { version = "10.4.0", features = ["rust_crypto"] }
 subtle = "2"
 # Pluggable SQL queue + metadata backends: sqlite (local), postgres/mysql
@@ -99,6 +101,8 @@ tokio = { version = "1", features = ["full"] }
 sha2 = "0.10"
 serde_json = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+proptest = "1"
+prost = "0.14"
 
 [build-dependencies]
 prost-build = "0.14"
