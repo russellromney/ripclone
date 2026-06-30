@@ -1,0 +1,541 @@
+===== sweep started at 2026-06-30T01:42:33+00:00 (SHAPED=1) =====
+
+--- repo=oven-sh/bun rate=250Mbps ---
+  warming server mirror for oven-sh/bun @ main ...
+  resolved main -> b2aa0d5d94e3a42d88d4c58e4488c07e67b0f037
+  waiting for full clonepack artifacts to be consistent ...
+  artifacts ready (full clone succeeded)
+=== repo=oven-sh/bun commit=b2aa0d5d94e3a42d88d4c58e4488c07e67b0f037 rate=250Mbps runs=3 shaped=1 host=2862176a914438 cpus=8 ===
+  shaped with nftables inet input/output @ 250 Mbps (31250 kbytes/s)
+--- rate=250Mbps ---
+  ripclone full (depth=0)    median=13296ms   runs=[13200,13296,13580]
+  ripclone depth=1           median= 2225ms   runs=[32808,1940,2225]
+  ripclone files             median= 1979ms   runs=[1337,1979,2011]
+  git clone full             median=42451ms   runs=[42451,44044,40827]
+  git clone --depth 1        median= 3362ms   runs=[3362,3212,6649]
+
+--- repo=oven-sh/bun rate=500Mbps ---
+  using pinned ref: b2aa0d5d94e3a42d88d4c58e4488c07e67b0f037 (skipping sync)
+=== repo=oven-sh/bun commit=b2aa0d5d94e3a42d88d4c58e4488c07e67b0f037 rate=500Mbps runs=3 shaped=1 host=2862176a914438 cpus=8 ===
+  shaped with nftables inet input/output @ 500 Mbps (62500 kbytes/s)
+--- rate=500Mbps ---
+  ripclone full (depth=0)    median= 7122ms   runs=[7568,6792,7122]
+  ripclone depth=1           median= 1044ms   runs=[1044,886,1071]
+  ripclone files             median=  724ms   runs=[703,724,859]
+  git clone full             median=38313ms   runs=[38585,38313,38172]
+  git clone --depth 1        median= 3394ms   runs=[6735,3319,3394]
+
+--- repo=oven-sh/bun rate=1000Mbps ---
+  using pinned ref: b2aa0d5d94e3a42d88d4c58e4488c07e67b0f037 (skipping sync)
+=== repo=oven-sh/bun commit=b2aa0d5d94e3a42d88d4c58e4488c07e67b0f037 rate=1000Mbps runs=3 shaped=1 host=2862176a914438 cpus=8 ===
+  shaped with nftables inet input/output @ 1000 Mbps (125000 kbytes/s)
+--- rate=1000Mbps ---
+  ripclone full (depth=0)    median= 4769ms   runs=[4769,4504,4970]
+  ripclone depth=1           median=  903ms   runs=[1207,903,890]
+  ripclone files             median=  726ms   runs=[824,695,726]
+  git clone full             median=39692ms   runs=[39692,40125,38605]
+  git clone --depth 1        median= 6646ms   runs=[6645,6646,6695]
+
+--- repo=oven-sh/bun rate=2000Mbps ---
+  using pinned ref: b2aa0d5d94e3a42d88d4c58e4488c07e67b0f037 (skipping sync)
+=== repo=oven-sh/bun commit=b2aa0d5d94e3a42d88d4c58e4488c07e67b0f037 rate=2000Mbps runs=3 shaped=1 host=2862176a914438 cpus=8 ===
+  shaped with nftables inet input/output @ 2000 Mbps (250000 kbytes/s)
+--- rate=2000Mbps ---
+  ripclone full (depth=0)    median= 2292ms   runs=[2626,2292,2026]
+  ripclone depth=1           median=  988ms   runs=[1104,988,846]
+  ripclone files             median=  664ms   runs=[664,655,708]
+  git clone full             median=38334ms   runs=[39633,38334,38112]
+  git clone --depth 1        median= 6705ms   runs=[6810,6597,6705]
+
+--- repo=oven-sh/bun rate=5000Mbps ---
+  using pinned ref: b2aa0d5d94e3a42d88d4c58e4488c07e67b0f037 (skipping sync)
+=== repo=oven-sh/bun commit=b2aa0d5d94e3a42d88d4c58e4488c07e67b0f037 rate=5000Mbps runs=3 shaped=1 host=2862176a914438 cpus=8 ===
+  shaped with nftables inet input/output @ 5000 Mbps (625000 kbytes/s)
+--- rate=5000Mbps ---
+  ripclone full (depth=0)    median= 2045ms   runs=[2495,2045,1941]
+  ripclone depth=1           median=  958ms   runs=[958,851,958]
+  ripclone files             median=  654ms   runs=[654,654,665]
+  git clone full             median=38794ms   runs=[38944,38794,38702]
+  git clone --depth 1        median= 6686ms   runs=[6686,6644,6787]
+
+--- repo=oven-sh/bun rate=10000Mbps ---
+  using pinned ref: b2aa0d5d94e3a42d88d4c58e4488c07e67b0f037 (skipping sync)
+=== repo=oven-sh/bun commit=b2aa0d5d94e3a42d88d4c58e4488c07e67b0f037 rate=10000Mbps runs=3 shaped=1 host=2862176a914438 cpus=8 ===
+  shaped with nftables inet input/output @ 10000 Mbps (1250000 kbytes/s)
+--- rate=10000Mbps ---
+  ripclone full (depth=0)    median= 2131ms   runs=[2453,2102,2131]
+  ripclone depth=1           median= 1044ms   runs=[1050,967,1044]
+  ripclone files             median=  697ms   runs=[831,697,650]
+  git clone full             median=38904ms   runs=[39361,38904,38408]
+  git clone --depth 1        median= 6760ms   runs=[6696,6760,6787]
+
+--- repo=pandas-dev/pandas rate=250Mbps ---
+  warming server mirror for pandas-dev/pandas @ main ...
+  resolved main -> f0beae656124f76e2860b3857cdd6c1854c4e33a
+  waiting for full clonepack artifacts to be consistent ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+    not ready yet, retrying in 10s ...
+error: artifacts not ready after 1200s
+ERROR: benchmark failed for pandas-dev/pandas @ 250Mbps
+
+--- repo=pandas-dev/pandas rate=500Mbps ---
+  using pinned ref: f0beae656124f76e2860b3857cdd6c1854c4e33a (skipping sync)
+=== repo=pandas-dev/pandas commit=f0beae656124f76e2860b3857cdd6c1854c4e33a rate=500Mbps runs=3 shaped=1 host=2862176a914438 cpus=8 ===
+  shaped with nftables inet input/output @ 500 Mbps (62500 kbytes/s)
+--- rate=500Mbps ---
+  ripclone full (depth=0): FAILED (run 1) — see /data/shaped_logs/pandas/500Mbps/ripclone full (depth=0)-run1.log
+ERROR: benchmark failed for pandas-dev/pandas @ 500Mbps
+
+--- repo=pandas-dev/pandas rate=1000Mbps ---
+  using pinned ref: f0beae656124f76e2860b3857cdd6c1854c4e33a (skipping sync)
+=== repo=pandas-dev/pandas commit=f0beae656124f76e2860b3857cdd6c1854c4e33a rate=1000Mbps runs=3 shaped=1 host=2862176a914438 cpus=8 ===
+  shaped with nftables inet input/output @ 1000 Mbps (125000 kbytes/s)
+--- rate=1000Mbps ---
+  ripclone full (depth=0): FAILED (run 1) — see /data/shaped_logs/pandas/1000Mbps/ripclone full (depth=0)-run1.log
+ERROR: benchmark failed for pandas-dev/pandas @ 1000Mbps
+
+--- repo=pandas-dev/pandas rate=2000Mbps ---
+  using pinned ref: f0beae656124f76e2860b3857cdd6c1854c4e33a (skipping sync)
+=== repo=pandas-dev/pandas commit=f0beae656124f76e2860b3857cdd6c1854c4e33a rate=2000Mbps runs=3 shaped=1 host=2862176a914438 cpus=8 ===
+  shaped with nftables inet input/output @ 2000 Mbps (250000 kbytes/s)
+--- rate=2000Mbps ---
+  ripclone full (depth=0): FAILED (run 1) — see /data/shaped_logs/pandas/2000Mbps/ripclone full (depth=0)-run1.log
+ERROR: benchmark failed for pandas-dev/pandas @ 2000Mbps
+
+--- repo=pandas-dev/pandas rate=5000Mbps ---
+  using pinned ref: f0beae656124f76e2860b3857cdd6c1854c4e33a (skipping sync)
+=== repo=pandas-dev/pandas commit=f0beae656124f76e2860b3857cdd6c1854c4e33a rate=5000Mbps runs=3 shaped=1 host=2862176a914438 cpus=8 ===
+  shaped with nftables inet input/output @ 5000 Mbps (625000 kbytes/s)
+--- rate=5000Mbps ---
+  ripclone full (depth=0): FAILED (run 1) — see /data/shaped_logs/pandas/5000Mbps/ripclone full (depth=0)-run1.log
+ERROR: benchmark failed for pandas-dev/pandas @ 5000Mbps
+
+--- repo=pandas-dev/pandas rate=10000Mbps ---
+  using pinned ref: f0beae656124f76e2860b3857cdd6c1854c4e33a (skipping sync)
+=== repo=pandas-dev/pandas commit=f0beae656124f76e2860b3857cdd6c1854c4e33a rate=10000Mbps runs=3 shaped=1 host=2862176a914438 cpus=8 ===
+  shaped with nftables inet input/output @ 10000 Mbps (1250000 kbytes/s)
+--- rate=10000Mbps ---
+  ripclone full (depth=0): FAILED (run 1) — see /data/shaped_logs/pandas/10000Mbps/ripclone full (depth=0)-run1.log
+ERROR: benchmark failed for pandas-dev/pandas @ 10000Mbps
+
+===== sweep finished at 2026-06-30T02:25:16+00:00 =====
+===== sweep started at 2026-06-30T04:23:27+00:00 (SHAPED=1) =====
+
+--- repo=pandas-dev/pandas rate=250Mbps ---
+  warming server mirror for pandas-dev/pandas @ main ...
+===== sweep started at 2026-06-30T04:31:20+00:00 (SHAPED=1) =====
+
+--- repo=pandas-dev/pandas rate=250Mbps ---
+  warming server mirror for pandas-dev/pandas @ main ...
+  resolved main ->   waiting for full clonepack artifacts to be consistent ...
+  artifacts ready for bbfe5b2768d13cb87d151f7bcfcc55d25bc9e49e
+bbfe5b2768d13cb87d151f7bcfcc55d25bc9e49e
+=== repo=pandas-dev/pandas commit=  waiting for full clonepack artifacts to be consistent ...
+  artifacts ready for bbfe5b2768d13cb87d151f7bcfcc55d25bc9e49e
+bbfe5b2768d13cb87d151f7bcfcc55d25bc9e49e rate=250Mbps runs=3 shaped=1 host=2862176a914438 cpus=8 ===
+  shaped with nftables inet input/output @ 250 Mbps (31250 kbytes/s)
+--- rate=250Mbps ---
+  ripclone full (depth=0): FAILED (run 1) — see /data/shaped_logs/pandas/250Mbps/ripclone full (depth=0)-run1.log
+ERROR: benchmark failed for pandas-dev/pandas @ 250Mbps
+
+--- repo=pandas-dev/pandas rate=500Mbps ---
+  using pinned ref:   waiting for full clonepack artifacts to be consistent ...
+  artifacts ready for bbfe5b2768d13cb87d151f7bcfcc55d25bc9e49e
+bbfe5b2768d13cb87d151f7bcfcc55d25bc9e49e (skipping sync)
+=== repo=pandas-dev/pandas commit=  waiting for full clonepack artifacts to be consistent ...
+  artifacts ready for bbfe5b2768d13cb87d151f7bcfcc55d25bc9e49e
+bbfe5b2768d13cb87d151f7bcfcc55d25bc9e49e rate=500Mbps runs=3 shaped=1 host=2862176a914438 cpus=8 ===
+  shaped with nftables inet input/output @ 500 Mbps (62500 kbytes/s)
+--- rate=500Mbps ---
+  ripclone full (depth=0): FAILED (run 1) — see /data/shaped_logs/pandas/500Mbps/ripclone full (depth=0)-run1.log
+ERROR: benchmark failed for pandas-dev/pandas @ 500Mbps
+
+--- repo=pandas-dev/pandas rate=1000Mbps ---
+  using pinned ref:   waiting for full clonepack artifacts to be consistent ...
+  artifacts ready for bbfe5b2768d13cb87d151f7bcfcc55d25bc9e49e
+bbfe5b2768d13cb87d151f7bcfcc55d25bc9e49e (skipping sync)
+=== repo=pandas-dev/pandas commit=  waiting for full clonepack artifacts to be consistent ...
+  artifacts ready for bbfe5b2768d13cb87d151f7bcfcc55d25bc9e49e
+bbfe5b2768d13cb87d151f7bcfcc55d25bc9e49e rate=1000Mbps runs=3 shaped=1 host=2862176a914438 cpus=8 ===
+  shaped with nftables inet input/output @ 1000 Mbps (125000 kbytes/s)
+--- rate=1000Mbps ---
+  ripclone full (depth=0): FAILED (run 1) — see /data/shaped_logs/pandas/1000Mbps/ripclone full (depth=0)-run1.log
+ERROR: benchmark failed for pandas-dev/pandas @ 1000Mbps
+
+--- repo=pandas-dev/pandas rate=2000Mbps ---
+  using pinned ref:   waiting for full clonepack artifacts to be consistent ...
+  artifacts ready for bbfe5b2768d13cb87d151f7bcfcc55d25bc9e49e
+bbfe5b2768d13cb87d151f7bcfcc55d25bc9e49e (skipping sync)
+=== repo=pandas-dev/pandas commit=  waiting for full clonepack artifacts to be consistent ...
+  artifacts ready for bbfe5b2768d13cb87d151f7bcfcc55d25bc9e49e
+bbfe5b2768d13cb87d151f7bcfcc55d25bc9e49e rate=2000Mbps runs=3 shaped=1 host=2862176a914438 cpus=8 ===
+  shaped with nftables inet input/output @ 2000 Mbps (250000 kbytes/s)
+--- rate=2000Mbps ---
+  ripclone full (depth=0): FAILED (run 1) — see /data/shaped_logs/pandas/2000Mbps/ripclone full (depth=0)-run1.log
+ERROR: benchmark failed for pandas-dev/pandas @ 2000Mbps
+
+--- repo=pandas-dev/pandas rate=5000Mbps ---
+  using pinned ref:   waiting for full clonepack artifacts to be consistent ...
+  artifacts ready for bbfe5b2768d13cb87d151f7bcfcc55d25bc9e49e
+bbfe5b2768d13cb87d151f7bcfcc55d25bc9e49e (skipping sync)
+=== repo=pandas-dev/pandas commit=  waiting for full clonepack artifacts to be consistent ...
+  artifacts ready for bbfe5b2768d13cb87d151f7bcfcc55d25bc9e49e
+bbfe5b2768d13cb87d151f7bcfcc55d25bc9e49e rate=5000Mbps runs=3 shaped=1 host=2862176a914438 cpus=8 ===
+  shaped with nftables inet input/output @ 5000 Mbps (625000 kbytes/s)
+--- rate=5000Mbps ---
+  ripclone full (depth=0): FAILED (run 1) — see /data/shaped_logs/pandas/5000Mbps/ripclone full (depth=0)-run1.log
+ERROR: benchmark failed for pandas-dev/pandas @ 5000Mbps
+
+--- repo=pandas-dev/pandas rate=10000Mbps ---
+  using pinned ref:   waiting for full clonepack artifacts to be consistent ...
+  artifacts ready for bbfe5b2768d13cb87d151f7bcfcc55d25bc9e49e
+bbfe5b2768d13cb87d151f7bcfcc55d25bc9e49e (skipping sync)
+=== repo=pandas-dev/pandas commit=  waiting for full clonepack artifacts to be consistent ...
+  artifacts ready for bbfe5b2768d13cb87d151f7bcfcc55d25bc9e49e
+bbfe5b2768d13cb87d151f7bcfcc55d25bc9e49e rate=10000Mbps runs=3 shaped=1 host=2862176a914438 cpus=8 ===
+  shaped with nftables inet input/output @ 10000 Mbps (1250000 kbytes/s)
+--- rate=10000Mbps ---
+  ripclone full (depth=0): FAILED (run 1) — see /data/shaped_logs/pandas/10000Mbps/ripclone full (depth=0)-run1.log
+ERROR: benchmark failed for pandas-dev/pandas @ 10000Mbps
+
+===== sweep finished at 2026-06-30T04:32:51+00:00 =====
+===== sweep started at 2026-06-30T04:33:13+00:00 (SHAPED=1) =====
+
+--- repo=pandas-dev/pandas rate=250Mbps ---
+  warming server mirror for pandas-dev/pandas @ main ...
+  waiting for full clonepack artifacts to be consistent ...
+  artifacts ready for bbfe5b2768d13cb87d151f7bcfcc55d25bc9e49e
+  resolved main -> bbfe5b2768d13cb87d151f7bcfcc55d25bc9e49e
+=== repo=pandas-dev/pandas commit=bbfe5b2768d13cb87d151f7bcfcc55d25bc9e49e rate=250Mbps runs=3 shaped=1 host=2862176a914438 cpus=8 ===
+  shaped with nftables inet input/output @ 250 Mbps (31250 kbytes/s)
+--- rate=250Mbps ---
+  ripclone full (depth=0): FAILED (run 1) — see /data/shaped_logs/pandas/250Mbps/ripclone full (depth=0)-run1.log
+ERROR: benchmark failed for pandas-dev/pandas @ 250Mbps
+
+--- repo=pandas-dev/pandas rate=500Mbps ---
+  using pinned ref: bbfe5b2768d13cb87d151f7bcfcc55d25bc9e49e (skipping sync)
+=== repo=pandas-dev/pandas commit=bbfe5b2768d13cb87d151f7bcfcc55d25bc9e49e rate=500Mbps runs=3 shaped=1 host=2862176a914438 cpus=8 ===
+  shaped with nftables inet input/output @ 500 Mbps (62500 kbytes/s)
+--- rate=500Mbps ---
+  ripclone full (depth=0): FAILED (run 1) — see /data/shaped_logs/pandas/500Mbps/ripclone full (depth=0)-run1.log
+ERROR: benchmark failed for pandas-dev/pandas @ 500Mbps
+
+--- repo=pandas-dev/pandas rate=1000Mbps ---
+  using pinned ref: bbfe5b2768d13cb87d151f7bcfcc55d25bc9e49e (skipping sync)
+=== repo=pandas-dev/pandas commit=bbfe5b2768d13cb87d151f7bcfcc55d25bc9e49e rate=1000Mbps runs=3 shaped=1 host=2862176a914438 cpus=8 ===
+  shaped with nftables inet input/output @ 1000 Mbps (125000 kbytes/s)
+--- rate=1000Mbps ---
+  ripclone full (depth=0): FAILED (run 1) — see /data/shaped_logs/pandas/1000Mbps/ripclone full (depth=0)-run1.log
+ERROR: benchmark failed for pandas-dev/pandas @ 1000Mbps
+
+--- repo=pandas-dev/pandas rate=2000Mbps ---
+  using pinned ref: bbfe5b2768d13cb87d151f7bcfcc55d25bc9e49e (skipping sync)
+=== repo=pandas-dev/pandas commit=bbfe5b2768d13cb87d151f7bcfcc55d25bc9e49e rate=2000Mbps runs=3 shaped=1 host=2862176a914438 cpus=8 ===
+  shaped with nftables inet input/output @ 2000 Mbps (250000 kbytes/s)
+--- rate=2000Mbps ---
+  ripclone full (depth=0): FAILED (run 1) — see /data/shaped_logs/pandas/2000Mbps/ripclone full (depth=0)-run1.log
+ERROR: benchmark failed for pandas-dev/pandas @ 2000Mbps
+
+--- repo=pandas-dev/pandas rate=5000Mbps ---
+  using pinned ref: bbfe5b2768d13cb87d151f7bcfcc55d25bc9e49e (skipping sync)
+=== repo=pandas-dev/pandas commit=bbfe5b2768d13cb87d151f7bcfcc55d25bc9e49e rate=5000Mbps runs=3 shaped=1 host=2862176a914438 cpus=8 ===
+  shaped with nftables inet input/output @ 5000 Mbps (625000 kbytes/s)
+--- rate=5000Mbps ---
+  ripclone full (depth=0): FAILED (run 1) — see /data/shaped_logs/pandas/5000Mbps/ripclone full (depth=0)-run1.log
+ERROR: benchmark failed for pandas-dev/pandas @ 5000Mbps
+
+--- repo=pandas-dev/pandas rate=10000Mbps ---
+  using pinned ref: bbfe5b2768d13cb87d151f7bcfcc55d25bc9e49e (skipping sync)
+=== repo=pandas-dev/pandas commit=bbfe5b2768d13cb87d151f7bcfcc55d25bc9e49e rate=10000Mbps runs=3 shaped=1 host=2862176a914438 cpus=8 ===
+  shaped with nftables inet input/output @ 10000 Mbps (1250000 kbytes/s)
+--- rate=10000Mbps ---
+  ripclone full (depth=0): FAILED (run 1) — see /data/shaped_logs/pandas/10000Mbps/ripclone full (depth=0)-run1.log
+ERROR: benchmark failed for pandas-dev/pandas @ 10000Mbps
+===== sweep started at 2026-06-30T04:39:11+00:00 (SHAPED=1) =====
+
+--- repo=pandas-dev/pandas rate=250Mbps ---
+  warming server mirror for pandas-dev/pandas @ refs/tags/v2.2.2 ...
+  waiting for full clonepack artifacts to be consistent ...
+  artifacts ready for bbfe5b2768d13cb87d151f7bcfcc55d25bc9e49e
+  resolved refs/tags/v2.2.2 -> bbfe5b2768d13cb87d151f7bcfcc55d25bc9e49e
+=== repo=pandas-dev/pandas commit=bbfe5b2768d13cb87d151f7bcfcc55d25bc9e49e rate=250Mbps runs=3 shaped=1 host=2862176a914438 cpus=8 ===
+  shaped with nftables inet input/output @ 250 Mbps (31250 kbytes/s)
+--- rate=250Mbps ---
+  ripclone full (depth=0): FAILED (run 1) — see /data/shaped_logs/pandas/250Mbps/ripclone full (depth=0)-run1.log
+ERROR: benchmark failed for pandas-dev/pandas @ 250Mbps
+
+--- repo=pandas-dev/pandas rate=500Mbps ---
+  using pinned ref: refs/tags/v2.2.2 (skipping sync)
+=== repo=pandas-dev/pandas commit=refs/tags/v2.2.2 rate=500Mbps runs=3 shaped=1 host=2862176a914438 cpus=8 ===
+  shaped with nftables inet input/output @ 500 Mbps (62500 kbytes/s)
+--- rate=500Mbps ---
+  ripclone full (depth=0): FAILED (run 1) — see /data/shaped_logs/pandas/500Mbps/ripclone full (depth=0)-run1.log
+ERROR: benchmark failed for pandas-dev/pandas @ 500Mbps
+
+--- repo=pandas-dev/pandas rate=1000Mbps ---
+  using pinned ref: refs/tags/v2.2.2 (skipping sync)
+=== repo=pandas-dev/pandas commit=refs/tags/v2.2.2 rate=1000Mbps runs=3 shaped=1 host=2862176a914438 cpus=8 ===
+  shaped with nftables inet input/output @ 1000 Mbps (125000 kbytes/s)
+--- rate=1000Mbps ---
+  ripclone full (depth=0): FAILED (run 1) — see /data/shaped_logs/pandas/1000Mbps/ripclone full (depth=0)-run1.log
+ERROR: benchmark failed for pandas-dev/pandas @ 1000Mbps
+
+--- repo=pandas-dev/pandas rate=2000Mbps ---
+  using pinned ref: refs/tags/v2.2.2 (skipping sync)
+=== repo=pandas-dev/pandas commit=refs/tags/v2.2.2 rate=2000Mbps runs=3 shaped=1 host=2862176a914438 cpus=8 ===
+  shaped with nftables inet input/output @ 2000 Mbps (250000 kbytes/s)
+--- rate=2000Mbps ---
+  ripclone full (depth=0): FAILED (run 1) — see /data/shaped_logs/pandas/2000Mbps/ripclone full (depth=0)-run1.log
+ERROR: benchmark failed for pandas-dev/pandas @ 2000Mbps
+
+--- repo=pandas-dev/pandas rate=5000Mbps ---
+  using pinned ref: refs/tags/v2.2.2 (skipping sync)
+=== repo=pandas-dev/pandas commit=refs/tags/v2.2.2 rate=5000Mbps runs=3 shaped=1 host=2862176a914438 cpus=8 ===
+  shaped with nftables inet input/output @ 5000 Mbps (625000 kbytes/s)
+--- rate=5000Mbps ---
+  ripclone full (depth=0): FAILED (run 1) — see /data/shaped_logs/pandas/5000Mbps/ripclone full (depth=0)-run1.log
+ERROR: benchmark failed for pandas-dev/pandas @ 5000Mbps
+
+--- repo=pandas-dev/pandas rate=10000Mbps ---
+  using pinned ref: refs/tags/v2.2.2 (skipping sync)
+=== repo=pandas-dev/pandas commit=refs/tags/v2.2.2 rate=10000Mbps runs=3 shaped=1 host=2862176a914438 cpus=8 ===
+  shaped with nftables inet input/output @ 10000 Mbps (1250000 kbytes/s)
+--- rate=10000Mbps ---
+  ripclone full (depth=0): FAILED (run 1) — see /data/shaped_logs/pandas/10000Mbps/ripclone full (depth=0)-run1.log
+ERROR: benchmark failed for pandas-dev/pandas @ 10000Mbps
+
+===== sweep finished at 2026-06-30T04:40:42+00:00 =====
+error: artifacts not ready after 1200s
+===== sweep started at 2026-06-30T04:49:40+00:00 (SHAPED=1) =====
+
+--- repo=pandas-dev/pandas rate=250Mbps ---
+  warming server mirror for pandas-dev/pandas @ main ...
+  waiting for full clonepack artifacts to be consistent ...
+  artifacts ready for bbfe5b2768d13cb87d151f7bcfcc55d25bc9e49e
+  resolved main -> bbfe5b2768d13cb87d151f7bcfcc55d25bc9e49e
+=== repo=pandas-dev/pandas commit=bbfe5b2768d13cb87d151f7bcfcc55d25bc9e49e rate=250Mbps runs=3 shaped=1 host=2862176a914438 cpus=8 ===
+  shaped with nftables inet input/output @ 250 Mbps (31250 kbytes/s)
+--- rate=250Mbps ---
+  ripclone full (depth=0)    median=15661ms   runs=[15661,15674,15102]
+  ripclone depth=1           median=  788ms   runs=[1023,680,788]
+  ripclone files             median=  674ms   runs=[674,654,682]
+  git clone full             median=26109ms   runs=[25730,26109,26237]
+  git clone --depth 1        median= 2300ms   runs=[2284,2300,2305]
+
+--- repo=pandas-dev/pandas rate=500Mbps ---
+  using pinned ref: bbfe5b2768d13cb87d151f7bcfcc55d25bc9e49e (skipping sync)
+=== repo=pandas-dev/pandas commit=bbfe5b2768d13cb87d151f7bcfcc55d25bc9e49e rate=500Mbps runs=3 shaped=1 host=2862176a914438 cpus=8 ===
+  shaped with nftables inet input/output @ 500 Mbps (62500 kbytes/s)
+--- rate=500Mbps ---
+  ripclone full (depth=0): FAILED (run 1) — see /data/shaped_logs/pandas/500Mbps/ripclone full (depth=0)-run1.log
+ERROR: benchmark failed for pandas-dev/pandas @ 500Mbps
+
+--- repo=pandas-dev/pandas rate=1000Mbps ---
+  using pinned ref: bbfe5b2768d13cb87d151f7bcfcc55d25bc9e49e (skipping sync)
+=== repo=pandas-dev/pandas commit=bbfe5b2768d13cb87d151f7bcfcc55d25bc9e49e rate=1000Mbps runs=3 shaped=1 host=2862176a914438 cpus=8 ===
+  shaped with nftables inet input/output @ 1000 Mbps (125000 kbytes/s)
+--- rate=1000Mbps ---
+  ripclone full (depth=0): FAILED (run 1) — see /data/shaped_logs/pandas/1000Mbps/ripclone full (depth=0)-run1.log
+ERROR: benchmark failed for pandas-dev/pandas @ 1000Mbps
+
+--- repo=pandas-dev/pandas rate=2000Mbps ---
+  using pinned ref: bbfe5b2768d13cb87d151f7bcfcc55d25bc9e49e (skipping sync)
+=== repo=pandas-dev/pandas commit=bbfe5b2768d13cb87d151f7bcfcc55d25bc9e49e rate=2000Mbps runs=3 shaped=1 host=2862176a914438 cpus=8 ===
+  shaped with nftables inet input/output @ 2000 Mbps (250000 kbytes/s)
+--- rate=2000Mbps ---
+  ripclone full (depth=0): FAILED (run 1) — see /data/shaped_logs/pandas/2000Mbps/ripclone full (depth=0)-run1.log
+ERROR: benchmark failed for pandas-dev/pandas @ 2000Mbps
+
+--- repo=pandas-dev/pandas rate=5000Mbps ---
+  using pinned ref: bbfe5b2768d13cb87d151f7bcfcc55d25bc9e49e (skipping sync)
+=== repo=pandas-dev/pandas commit=bbfe5b2768d13cb87d151f7bcfcc55d25bc9e49e rate=5000Mbps runs=3 shaped=1 host=2862176a914438 cpus=8 ===
+  shaped with nftables inet input/output @ 5000 Mbps (625000 kbytes/s)
+--- rate=5000Mbps ---
+  ripclone full (depth=0): FAILED (run 1) — see /data/shaped_logs/pandas/5000Mbps/ripclone full (depth=0)-run1.log
+ERROR: benchmark failed for pandas-dev/pandas @ 5000Mbps
+
+--- repo=pandas-dev/pandas rate=10000Mbps ---
+  using pinned ref: bbfe5b2768d13cb87d151f7bcfcc55d25bc9e49e (skipping sync)
+=== repo=pandas-dev/pandas commit=bbfe5b2768d13cb87d151f7bcfcc55d25bc9e49e rate=10000Mbps runs=3 shaped=1 host=2862176a914438 cpus=8 ===
+  shaped with nftables inet input/output @ 10000 Mbps (1250000 kbytes/s)
+--- rate=10000Mbps ---
+  ripclone full (depth=0): FAILED (run 1) — see /data/shaped_logs/pandas/10000Mbps/ripclone full (depth=0)-run1.log
+ERROR: benchmark failed for pandas-dev/pandas @ 10000Mbps
+
+===== sweep finished at 2026-06-30T04:53:26+00:00 =====
+===== sweep started at 2026-06-30T04:58:06+00:00 (SHAPED=1) =====
+
+--- repo=pandas-dev/pandas rate=250Mbps ---
+  using pinned commit d9cdd2ee5a58015ef6f4d15c7226110c9aab8140
+  waiting for full clonepack artifacts to be consistent ...
+  artifacts ready (full clone succeeded)
+=== repo=pandas-dev/pandas commit=d9cdd2ee5a58015ef6f4d15c7226110c9aab8140 rate=250Mbps runs=3 shaped=1 host=2862176a914438 cpus=8 ===
+  shaped with nftables inet input/output @ 250 Mbps (31250 kbytes/s)
+--- rate=250Mbps ---
+  ripclone full (depth=0)    median=14699ms   runs=[14653,14699,15124]
+  ripclone depth=1           median=  719ms   runs=[776,671,719]
+  ripclone files             median=  396ms   runs=[401,396,334]
+  git clone full             median=26091ms   runs=[25932,26091,26347]
+  git clone --depth 1        median= 1860ms   runs=[1903,1860,1859]
+
+--- repo=pandas-dev/pandas rate=500Mbps ---
+  using pinned ref: d9cdd2ee5a58015ef6f4d15c7226110c9aab8140 (skipping sync)
+=== repo=pandas-dev/pandas commit=d9cdd2ee5a58015ef6f4d15c7226110c9aab8140 rate=500Mbps runs=3 shaped=1 host=2862176a914438 cpus=8 ===
+  shaped with nftables inet input/output @ 500 Mbps (62500 kbytes/s)
+--- rate=500Mbps ---
+  ripclone full (depth=0)    median= 7349ms   runs=[7945,7180,7349]
+  ripclone depth=1           median=  465ms   runs=[577,465,435]
+  ripclone files             median=  328ms   runs=[294,328,708]
+  git clone full             median=21691ms   runs=[21691,21578,21787]
+  git clone --depth 1        median= 1854ms   runs=[1912,1833,1854]
+
+--- repo=pandas-dev/pandas rate=1000Mbps ---
+  using pinned ref: d9cdd2ee5a58015ef6f4d15c7226110c9aab8140 (skipping sync)
+=== repo=pandas-dev/pandas commit=d9cdd2ee5a58015ef6f4d15c7226110c9aab8140 rate=1000Mbps runs=3 shaped=1 host=2862176a914438 cpus=8 ===
+  shaped with nftables inet input/output @ 1000 Mbps (125000 kbytes/s)
+--- rate=1000Mbps ---
+  ripclone full (depth=0)    median= 4747ms   runs=[4745,4747,4946]
+  ripclone depth=1           median=  424ms   runs=[433,396,424]
+  ripclone files             median=  275ms   runs=[384,265,275]
+  git clone full             median=21820ms   runs=[22148,21820,21723]
+  git clone --depth 1        median= 1839ms   runs=[1946,1839,1835]
+
+--- repo=pandas-dev/pandas rate=2000Mbps ---
+  using pinned ref: d9cdd2ee5a58015ef6f4d15c7226110c9aab8140 (skipping sync)
+=== repo=pandas-dev/pandas commit=d9cdd2ee5a58015ef6f4d15c7226110c9aab8140 rate=2000Mbps runs=3 shaped=1 host=2862176a914438 cpus=8 ===
+  shaped with nftables inet input/output @ 2000 Mbps (250000 kbytes/s)
+--- rate=2000Mbps ---
+  ripclone full (depth=0)    median= 2761ms   runs=[12269,2187,2761]
+  ripclone depth=1           median=  483ms   runs=[483,662,434]
+  ripclone files             median=  265ms   runs=[341,265,250]
+  git clone full             median=21855ms   runs=[21855,22107,21693]
+  git clone --depth 1        median= 1845ms   runs=[1881,1835,1845]
+
+--- repo=pandas-dev/pandas rate=5000Mbps ---
+  using pinned ref: d9cdd2ee5a58015ef6f4d15c7226110c9aab8140 (skipping sync)
+=== repo=pandas-dev/pandas commit=d9cdd2ee5a58015ef6f4d15c7226110c9aab8140 rate=5000Mbps runs=3 shaped=1 host=2862176a914438 cpus=8 ===
+  shaped with nftables inet input/output @ 5000 Mbps (625000 kbytes/s)
+--- rate=5000Mbps ---
+  ripclone full (depth=0)    median= 2410ms   runs=[2085,3665,2410]
+  ripclone depth=1           median=  466ms   runs=[503,417,466]
+  ripclone files             median=  267ms   runs=[349,257,267]
+  git clone full             median=21413ms   runs=[21095,21447,21413]
+  git clone --depth 1        median= 1860ms   runs=[2005,1856,1860]
+
+--- repo=pandas-dev/pandas rate=10000Mbps ---
+  using pinned ref: d9cdd2ee5a58015ef6f4d15c7226110c9aab8140 (skipping sync)
+=== repo=pandas-dev/pandas commit=d9cdd2ee5a58015ef6f4d15c7226110c9aab8140 rate=10000Mbps runs=3 shaped=1 host=2862176a914438 cpus=8 ===
+  shaped with nftables inet input/output @ 10000 Mbps (1250000 kbytes/s)
+--- rate=10000Mbps ---
+  ripclone full (depth=0)    median= 1974ms   runs=[1974,1583,2081]
+  ripclone depth=1           median=  495ms   runs=[584,396,495]
+  ripclone files             median=  589ms   runs=[589,695,281]
+  git clone full             median=22401ms   runs=[21642,22401,22644]
+  git clone --depth 1        median= 1891ms   runs=[1891,1852,1924]
+
+===== sweep finished at 2026-06-30T05:08:54+00:00 =====
