@@ -1,106 +1,43 @@
 # Benchmarks
 
-Reproduce with [`benchmark/run_shaped_sweep.sh`](benchmark/run_shaped_sweep.sh)
-(run on a client machine pointed at a ripclone server). Use `SHAPED=0` for the
-unshaped warm-cache numbers below; omit it (or set `SHAPED=1`) for the shaped
-bandwidth sweep in `README.md`.
+Reproduce with [`benchmark/run_shaped_sweep.sh`](benchmark/run_shaped_sweep.sh) on a client machine pointed at a ripclone server.
 
-## Clone: ripclone vs native `git clone`
+## Shaped bandwidth sweep
 
-**Repo:** `oven-sh/bun` (15,771 commits, ~840 MB full `.git` from GitHub).
-**Client:** Fly `performance-8x` (8 dedicated vCPU, 16 GB RAM), region `ewr`.
-**Server:** Fly `ripclone-server-dev` (`iad`), artifacts in Tigris (`iad`/`sjc`).
-**Target:** durable NVMe volume (`/data`) unless noted. Client artifact cache
-disabled (`RIPCLONE_NO_CACHE=1`). Warm = server mirror already synced.
+The authoritative numbers live in the [Performance section of `README.md`](../README.md#performance). They are measured on a Fly.io `performance-8x` client in `ewr` talking to `ripclone-server-dev` in `iad`, with the client↔server link shaped to the listed bandwidth. Each cell is the median of 3 runs with a fresh client cache (`RIPCLONE_NO_CACHE=1`).
 
-| clone | ripclone (warm) | native `git clone` | speedup |
-|---|---|---|---|
-| **depth=1** | **~1.0 s** | 4.0 s | ~4× |
-| **full (depth=0)** | **~2.2 s** | 38.3 s | **~17×** |
+The sweep now covers **250 Mbps, 500 Mbps, 1 Gbps, 2 Gbps, 5 Gbps, and 10 Gbps**. The older 50 Mbps and 100 Mbps rows have been dropped — they are slower than most real user links and the sweep is focused on the range where ripclone is used. Warm-cache numbers are also omitted because they assume the server, object-storage edge, and client are all in the same warm state, which is not representative for real clones.
 
-Full ripclone clone (all 15,771 commits, durably written) is **faster than git's
-shallow `--depth 1` clone**.
+Key takeaways from the latest sweep:
 
-### Durable volume vs tmpfs (`--temp`), warm
+- **ripclone wins at every tested bandwidth** for full-history and files-mode clones, with the biggest margins at 1 Gbps and above (up to **8.3×** for `oven-sh/bun` full clone at 1 Gbps).
+- **The gap narrows as bandwidth drops.** At 250 Mbps the full-clone win is still **2.9×** for bun and **1.8×** for pandas, while depth-1 is roughly tied with or slightly faster than `git clone --depth 1`.
+- **Above 1 Gbps, returns diminish.** Once the link is fat enough, ripclone's fixed per-clone overhead dominates and times flatten out; the value shifts from raw speed to consistency and skipping git's server-side pack compute.
 
-| clone | volume `/data` (total) | tmpfs `--temp` (total) |
-|---|---|---|
-| depth=1 | 977 ms | 1029 ms |
-| full | 2192 ms | 2051 ms |
+## Running the sweep yourself
 
-`--temp` (tmpfs) is within noise on Fly NVMe (≤ ~6%). Pure-RAM staging doesn't
-speed up the write, so **the clone write floor is CPU/syscall-bound (creating
-~19k files + git index work), not disk-throughput-bound.** The lever for going
-faster is fewer/cheaper file operations, not faster storage or io_uring.
+```bash
+# Full 6-rate sweep, 3 runs per cell.
+RIPCLONE_URL=https://ripclone-server-dev.fly.dev \
+RIPCLONE_SERVER_TOKEN=... \
+./benchmark/run_shaped_sweep.sh "oven-sh/bun pandas-dev/pandas" "250 500 1000 2000 5000 10000" 3
 
-### Cold vs warm (depth=1)
+# Faster 3-rate sweep for pandas, pinned to the v2.2.2 commit.
+# GIT_REF tells the native-git baseline which tag to clone.
+BENCH_REF=d9cdd2ee5a58015ef6f4d15c7226110c9aab8140 GIT_REF=v2.2.2 \
+RIPCLONE_URL=https://ripclone-server-dev.fly.dev \
+RIPCLONE_SERVER_TOKEN=... \
+./benchmark/run_shaped_sweep.sh "pandas-dev/pandas" "250 500 1000" 1
+```
 
-| phase | cold | warm |
-|---|---|---|
-| resolve | 2203 ms | 33 ms |
-| write | 838 ms | 829 ms |
-| **total** | **3296 ms** | **991 ms** |
-
-The entire cold→warm delta is `resolve`: a stale mirror makes the server do a
-`git fetch` to GitHub. In production the server syncs on push, so the mirror is
-always fresh and `resolve` is ~30 ms. Even cold (3.3 s) beats `git clone
---depth 1` (4.0 s).
-
-## Laptop over home wifi (network-bound)
-
-Same repo, but cloned to a laptop (8-core Mac) over home wifi — i.e. the
-download link, not git's server compute, is the bottleneck. This is the *worst*
-case for ripclone and the fairest stress test.
-
-| clone | ripclone | native `git clone` |
-|---|---|---|
-| depth=1 | ~15.7 s | 17.1 s |
-| full | **90.9 s** | 148.4 s |
-
-- **depth=1 is now tied/slightly ahead.** Measured download is nearly identical —
-  ripclone 70.8 MB packs vs git 69.2 MB (~4% apart): at a single commit there's
-  almost nothing to delta-compress, so the undeltified HEAD closure is barely
-  larger. The gap was never bytes, it was **round-trips**: ripclone originally
-  made ~70 GETs (resolve + manifest + 34 pack + 34 idx). Two changes cut that to
-  ~23 — **4 MB frames** (34 packs → 18) and the **idx bundle** (34 idx GETs → 1).
-  That moved laptop depth=1 from ~18.1 s (behind git) to ~15.7 s (ahead). On a
-  fat low-latency pipe (Fly) the round-trips were always nearly free, so the win
-  shows mostly on slow/high-latency links. What's left is bandwidth (~70 MB over
-  wifi); the next lever there is *fewer bytes* (deltified/zstd head transport).
-- **full is ~1.6× faster** — here it *is* bytes: 628 vs 840 MB (deltified
-  history), plus no server pack-compute / client `index-pack`. That byte gap
-  dwarfs the round-trip overhead, so the win survives the slow link.
-
-**Takeaway:** ripclone's large wins are where git's *server-side* work dominates
-and round-trips are cheap (CI runners, cloud dev boxes, fast/colocated networks —
-see the Fly numbers above, 4×/17×). The round-trip cost that made depth=1 lose on
-slow links has been cut (4 MB frames + idx bundle: ~70 GETs → ~23), so depth=1 is
-now tied/ahead there too. The remaining slow-link lever is *bytes* — a
-deltified/zstd HEAD-closure transport (trade a little client CPU for fewer bytes),
-or the `files` zstd-archive mode.
+For fast-moving branches, pass a commit SHA (or a tag plus `GIT_REF`) to `BENCH_REF`. If you pass a branch name, the harness resolves it once and pins that commit for the rest of the sweep so `HEAD` movement can't invalidate later rates.
 
 ## Why ripclone is faster
 
-`git clone` makes GitHub **compute and stream a pack on demand** (delta
-negotiation + compression server-side), then the client runs `index-pack`. That
-dominates, especially for full clones (the 38 s). ripclone serves **pre-built,
-content-addressed packs from object storage**, downloaded in parallel; the
-worktree is hand-parsed from undeltified HEAD-closure packs and history is just
-installed (no negotiation, no on-the-fly delta compression, no `index-pack`).
-The expensive work happens once at sync time, not per clone.
+`git clone` makes the upstream host compute and stream a pack on demand (delta negotiation + server-side compression), then the client runs `index-pack`. ripclone serves pre-built, content-addressed packs from object storage, downloaded in parallel; the worktree is materialized from pre-built packs and history is installed without negotiation or on-the-fly delta compression. The expensive work happens once at sync time, not per clone.
 
 ## Honest caveats
 
-- **Sync pays the cost.** The fast clone is amortized against a full build per
-  sync (bun: ~1m40 first full build; the LSM incremental build makes *re*-syncs
-  cheap). First sync of a big repo is still the price.
-- **Tigris edge cache.** These runs had objects warm in the in-region Tigris
-  edge. A first clone from a cold region pays an edge-cache miss (region warmers
-  are on the roadmap). This is inherent to using object storage as the CDN; git
-  has no equivalent client-facing cache.
-- **Same-datacenter network.** Fly→Tigris is a fat pipe. A laptop on home wifi
-  is bounded by its own download speed — but still skips git's server-side pack
-  compute, so the win holds (smaller for depth=1, large for full).
-- **No client-local artifact cache.** Verified: `~/.cache/ripclone` absent and
-  `RIPCLONE_NO_CACHE=1` produces identical times — every clone fetches bytes
-  from object storage over the network.
+- **Sync pays the cost.** The fast clone is amortized against a full build per sync (bun: ~1m40 first full build; incremental re-syncs are cheaper). First sync of a big repo is still the price.
+- **Edge cache.** These runs had objects warm in the in-region object-storage edge. A first clone from a cold region pays an edge-cache miss. This is inherent to using object storage as the CDN.
+- **Same-datacenter network.** Fly→object-storage is a fat pipe. A laptop on home wifi is bounded by its own download speed, but still skips git's server-side pack compute.

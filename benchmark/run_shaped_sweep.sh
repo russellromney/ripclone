@@ -12,33 +12,33 @@ set -euo pipefail
 #   RIPCLONE_SERVER_TOKEN=... \
 #   ./benchmark/run_shaped_sweep.sh [repos] [rates] [runs]
 #
-#   SHAPED=0 RIPCLONE_URL=https://ripclone-server-dev.fly.dev \
+#   RIPCLONE_URL=https://ripclone-server-dev.fly.dev \
 #   RIPCLONE_SERVER_TOKEN=... \
-#   ./benchmark/run_shaped_sweep.sh "oven-sh/bun pandas-dev/pandas" "1000" 3
+#   ./benchmark/run_shaped_sweep.sh "oven-sh/bun pandas-dev/pandas" "250 500 1000 2000 5000 10000" 3
 #
 #   BENCH_REF=v2.2.2 RIPCLONE_URL=https://ripclone-server-dev.fly.dev \
 #   RIPCLONE_SERVER_TOKEN=... \
-#   ./benchmark/run_shaped_sweep.sh "pandas-dev/pandas" "1000" 1
+#   ./benchmark/run_shaped_sweep.sh "pandas-dev/pandas" "250 500 1000" 1
 #
 # Environment:
-#   SHAPED     - 1 (default) to shape bandwidth, 0 for unshaped warm-cache runs.
+#   SHAPED     - 1 (default) to shape bandwidth, 0 to disable shaping (debug only).
 #   BENCH_REF  - tag/commit/branch to sync and benchmark. Use a tag for very
 #                active repos where HEAD moves during the sweep.
 #
 # Defaults:
-#   repos = "oven-sh/bun torvalds/linux"
-#   rates = "1000 500 250 100 50"   (Mbps)
+#   repos = "oven-sh/bun pandas-dev/pandas"
+#   rates = "250 500 1000 2000 5000 10000"   (Mbps; 1000 = 1 Gbps, 10000 = 10 Gbps)
 #   runs  = 3
 #
 # Results are appended to /data/shaped_sweep.log and per-run stderr is kept in
 # /data/shaped_logs/<repo>/<rate>Mbps/.
 
-REPOS="${1:-"oven-sh/bun torvalds/linux"}"
-RATES="${2:-"1000 500 250 100 50"}"
+REPOS="${1:-"oven-sh/bun pandas-dev/pandas"}"
+RATES="${2:-"250 500 1000 2000 5000 10000"}"
 RUNS="${3:-3}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BENCH="$SCRIPT_DIR/fly_shaped_benchmark"
+BENCH="$SCRIPT_DIR/fly_shaped_benchmark.sh"
 
 LOG="/data/shaped_sweep.log"
 mkdir -p "$(dirname "$LOG")"

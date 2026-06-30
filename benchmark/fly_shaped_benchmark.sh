@@ -26,6 +26,7 @@ RIPCLONE="${RIPCLONE:-ripclone}"
 PROVIDER="${RIPCLONE_PROVIDER:-github}"
 
 REPO_NAME="$(basename "$REPO")"
+RESOLVED_REF_FILE="/tmp/ripclone_bench_ref_${REPO//\//_}"
 LOG_DIR="$TARGET/shaped_logs/${REPO_NAME}/${RATE_MBPS}Mbps"
 mkdir -p "$LOG_DIR"
 
@@ -77,6 +78,18 @@ get_default_branch() {
     | python3 -c 'import sys,json; print(json.load(sys.stdin).get("default_branch","HEAD"))'
 }
 
+head_ref_json() {
+  local branch="${1:-HEAD}"
+  # The server path already includes /refs/, so strip a leading "refs/" from
+  # the caller's branch name (e.g. "refs/tags/v2.2.2" -> "tags/v2.2.2").
+  branch="${branch#refs/}"
+  local owner name auth_hash
+  owner=$(echo "$REPO" | cut -d/ -f1)
+  name=$(echo "$REPO" | cut -d/ -f2)
+  auth_hash=$(printf '%s' "$RIPCLONE_SERVER_TOKEN" | shasum -a 256 | awk '{print $1}')
+  curl -fsS -H "Authorization: Ripclone $auth_hash" "${SERVER_URL%/}/v1/repos/$PROVIDER/$owner/$name/refs/$branch" 2>/dev/null
+}
+
 probe_full_clone() {
   local dir="$TARGET/probe.$$"
   rm -rf "$dir"
@@ -109,39 +122,92 @@ wait_for_artifacts() {
   done
 }
 
+# Poll /refs/HEAD until the server reports a non-empty full_pack for the current
+# tip.  This is more reliable than trusting the /sync response commit, which can
+# reflect a coalesced in-flight build for an older tip when the branch moves.
+wait_for_ref_ready() {
+  local branch="${1:-HEAD}"
+  local timeout="${2:-1200}"
+  local start end
+  start=$(now_ms)
+  echo "  waiting for full clonepack artifacts to be consistent ..." >&2
+  while true; do
+    local out commit ready
+    out=$(head_ref_json "$branch")
+    commit=$(echo "$out" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("commit",""))')
+    # A full editable clone is ready when the server has either a single full_pack
+    # (legacy) or pack_chunk_urls/idx_bundle_url (LSM-style full history).
+    ready=$(echo "$out" | python3 -c 'import sys,json; d=json.load(sys.stdin); print("1" if (d.get("full_pack") or d.get("pack_chunk_urls") or d.get("idx_bundle_url")) else "")')
+    if [ -n "$commit" ] && [ -n "$ready" ]; then
+      echo "  artifacts ready for $commit" >&2
+      echo "$commit"
+      return 0
+    fi
+    end=$(now_ms)
+    if [ $((end - start)) -ge $((timeout * 1000)) ]; then
+      echo "error: artifacts not ready after ${timeout}s" >&2
+      return 1
+    fi
+    echo "    not ready yet, retrying in 10s ..." >&2
+    sleep 10
+  done
+}
+
 warm_server() {
-  local owner name auth_hash branch_or_ref resp
+  local owner name auth_hash branch_or_ref
   owner=$(echo "$REPO" | cut -d/ -f1)
   name=$(echo "$REPO" | cut -d/ -f2)
   auth_hash=$(printf '%s' "$RIPCLONE_SERVER_TOKEN" | shasum -a 256 | awk '{print $1}')
   branch_or_ref="${BENCH_REF:-$(get_default_branch)}"
 
+  # CLONE_REF is the branch/tag name passed to `ripclone clone --branch`.
+  # AT_REF is an optional `--at <rev>` override; we only use it for explicit
+  # commit SHAs because branch/tag builds are keyed by the branch/tag name.
+  CLONE_REF="$branch_or_ref"
+  AT_REF=""
+
   if [ "${SKIP_SYNC:-0}" = "1" ]; then
-    REF="$branch_or_ref"
+    REF="${BENCH_REF:-$(cat "$RESOLVED_REF_FILE" 2>/dev/null || get_default_branch)}"
     echo "  using pinned ref: $REF (skipping sync)"
+    if [[ "$REF" =~ ^[0-9a-f]{40}$ ]]; then
+      CLONE_REF="HEAD"
+      AT_REF="$REF"
+    else
+      CLONE_REF="$REF"
+      AT_REF=""
+    fi
     return 0
   fi
 
   # If the caller passed a full commit SHA, pin it directly.  Otherwise treat the
-  # value as a branch name, sync it, and capture the exact commit the server built
-  # artifacts for.  That keeps the rest of the run stable even on fast-moving
-  # branches like pandas `main`.
+  # value as a branch/tag name, sync it, and capture the exact commit the server
+  # built artifacts for.
   if [[ "$branch_or_ref" =~ ^[0-9a-f]{40}$ ]]; then
     REF="$branch_or_ref"
+    # Use the repo's default branch as the ref key and pass the commit via --at.
+    # This lets the server serve the commit through the branch's history even when
+    # the commit is no longer the branch tip.
+    CLONE_REF="HEAD"
+    AT_REF="$REF"
     echo "  using pinned commit $REF"
     curl -fsS -X POST \
       -H "Authorization: Ripclone $auth_hash" \
       "${SERVER_URL%/}/v1/repos/$PROVIDER/$owner/$name/sync?rev=$REF" >/dev/null 2>&1
+    wait_for_artifacts
   else
     echo "  warming server mirror for $REPO @ $branch_or_ref ..."
-    resp=$(curl -fsS -X POST \
+    curl -fsS -X POST \
       -H "Authorization: Ripclone $auth_hash" \
-      "${SERVER_URL%/}/v1/repos/$PROVIDER/$owner/$name/sync?branch=$branch_or_ref")
-    REF=$(echo "$resp" | python3 -c 'import sys,json; print(json.load(sys.stdin)["commit"])')
+      "${SERVER_URL%/}/v1/repos/$PROVIDER/$owner/$name/sync?branch=$branch_or_ref" >/dev/null 2>&1
+    REF=$(wait_for_ref_ready "$branch_or_ref")
+    CLONE_REF="$branch_or_ref"
+    AT_REF=""
     echo "  resolved $branch_or_ref -> $REF"
   fi
 
-  wait_for_artifacts
+  # Persist the resolved commit so a multi-rate sweep stays on the same tip even
+  # if the upstream branch moves while later rates run.
+  printf '%s\n' "$REF" > "$RESOLVED_REF_FILE"
 }
 
 # ---------------------------------------------------------------------------
@@ -210,11 +276,46 @@ bench_cmd() {
   printf '  %-26s median=%5dms   runs=[%s]\n' "$label" "$med" "$(IFS=,; echo "${times[*]}")"
 }
 
-rc_full()  { "$RIPCLONE" --server "$SERVER_URL" clone "$REPO" --at "$REF" --depth 0 --dir "$1"; }
-rc_depth1(){ "$RIPCLONE" --server "$SERVER_URL" clone "$REPO" --at "$REF" --depth 1 --dir "$1"; }
-rc_files() { "$RIPCLONE" --server "$SERVER_URL" clone "$REPO" --at "$REF" --depth 1 --mode files --dir "$1"; }
-git_depth1(){ git clone --depth 1 "https://github.com/$REPO.git" "$1"; }
-git_full() { git clone "https://github.com/$REPO.git" "$1"; }
+rc_full()  {
+  if [ -n "$AT_REF" ]; then
+    "$RIPCLONE" --server "$SERVER_URL" clone "$REPO" --branch "$CLONE_REF" --at "$AT_REF" --depth 0 --dir "$1"
+  else
+    "$RIPCLONE" --server "$SERVER_URL" clone "$REPO" --branch "$CLONE_REF" --depth 0 --dir "$1"
+  fi
+}
+rc_depth1(){
+  if [ -n "$AT_REF" ]; then
+    "$RIPCLONE" --server "$SERVER_URL" clone "$REPO" --branch "$CLONE_REF" --at "$AT_REF" --depth 1 --dir "$1"
+  else
+    "$RIPCLONE" --server "$SERVER_URL" clone "$REPO" --branch "$CLONE_REF" --depth 1 --dir "$1"
+  fi
+}
+rc_files() {
+  if [ -n "$AT_REF" ]; then
+    "$RIPCLONE" --server "$SERVER_URL" clone "$REPO" --branch "$CLONE_REF" --at "$AT_REF" --depth 1 --mode files --dir "$1"
+  else
+    "$RIPCLONE" --server "$SERVER_URL" clone "$REPO" --branch "$CLONE_REF" --depth 1 --mode files --dir "$1"
+  fi
+}
+git_depth1(){
+  if [ -n "${GIT_REF:-}" ]; then
+    git clone --branch "$GIT_REF" --depth 1 "https://github.com/$REPO.git" "$1"
+  elif [ -n "$AT_REF" ]; then
+    # No equivalent fast path for an arbitrary non-tip commit; clone default branch.
+    git clone --depth 1 "https://github.com/$REPO.git" "$1"
+  else
+    git clone --branch "$CLONE_REF" --depth 1 "https://github.com/$REPO.git" "$1"
+  fi
+}
+git_full() {
+  if [ -n "${GIT_REF:-}" ]; then
+    git clone --branch "$GIT_REF" "https://github.com/$REPO.git" "$1"
+  elif [ -n "$AT_REF" ]; then
+    git clone "https://github.com/$REPO.git" "$1" && (cd "$1" && git checkout "$AT_REF")
+  else
+    git clone --branch "$CLONE_REF" "https://github.com/$REPO.git" "$1"
+  fi
+}
 
 # ---------------------------------------------------------------------------
 # Main
