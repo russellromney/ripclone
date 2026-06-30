@@ -8,8 +8,8 @@ use common::*;
 
 #[tokio::test]
 async fn matrix_two_phase_lsm() {
-    setup(true, true, false);
+    setup(true);
     let server = start_server().await;
     let origin = make_origin("acme", "m_tp_lsm");
-    lifecycle_battery(&server, &origin, true).await;
+    lifecycle_battery(&server, &origin).await;
 }

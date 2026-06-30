@@ -66,7 +66,7 @@ fn pack_entry_count(target: &std::path::Path) -> usize {
 
 #[tokio::test]
 async fn provider_add_then_config_driven_clone() {
-    setup(false, false, false);
+    setup(false);
 
     let origin = make_http_origin("acme/provider_add");
     origin.commit(&[("README.md", "provider add workflow\n")], "c1");

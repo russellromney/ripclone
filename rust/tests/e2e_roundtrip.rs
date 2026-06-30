@@ -88,7 +88,9 @@ async fn files_mode_materializes_worktree() {
     origin.commit(&[("only.txt", "hello\n"), ("nested/x", "y\n")], "c1");
     origin.publish();
 
-    let (_g, c) = sync_and_clone(&server, &origin, 1, CloneMode::Files).await;
+    // The archive (and thus files mode) is carried by the full clonepack under
+    // two-phase publish; the shallow snapshot has no archive.
+    let (_g, c) = sync_and_clone(&server, &origin, 0, CloneMode::Files).await;
     assert_eq!(read(&c, "only.txt"), "hello\n");
     assert_eq!(read(&c, "nested/x"), "y\n");
 }
@@ -127,7 +129,8 @@ async fn corrupt_artifact_fails_clone() {
     origin.publish();
 
     let client = server.client();
-    let resp = client.sync_repo("acme/corrupt", None).await.unwrap();
+    // The full clonepack (and its manifest) publishes in phase 2, so wait for it.
+    let resp = sync_until_manifest(&server, "acme", "corrupt").await;
 
     // Corrupt the clonepack manifest artifact in the server's CAS.
     let manifest_hash = resp.clonepack_manifest.clone();
@@ -163,7 +166,8 @@ async fn missing_artifact_fails_clone() {
     origin.publish();
 
     let client = server.client();
-    let resp = client.sync_repo("acme/missing", None).await.unwrap();
+    // The full clonepack (and its manifest) publishes in phase 2, so wait for it.
+    let resp = sync_until_manifest(&server, "acme", "missing").await;
     let p = server.cas_path(&resp.clonepack_manifest);
     std::fs::remove_file(&p).unwrap();
 
@@ -200,13 +204,14 @@ async fn transient_fetch_failure_is_retried() {
     origin.commit(&[("a.txt", "hi\n"), ("dir/b.txt", "x\n")], "c1");
     origin.publish();
 
-    // The default retry budget (3 attempts) recovers from the injected faults.
-    let (_g, c) = sync_and_clone(&server, &origin, 1, CloneMode::Files).await;
-    assert_eq!(
-        read(&c, "a.txt"),
-        "hi\n",
-        "retried fetches must still materialize the tree"
-    );
+    // Wait for the full clonepack (with archive) to publish without consuming the
+    // fault budget on not-yet-ready poll attempts, then do a single files clone:
+    // the default retry budget (3 attempts) recovers from the injected faults.
+    sync_until_manifest(&server, "acme", "retry").await;
+    let (_g, c) = clone_only(&server, "acme", "retry", 0, CloneMode::Files)
+        .await
+        .expect("retried fetches must still materialize the tree");
+    assert_eq!(read(&c, "a.txt"), "hi\n");
     assert_eq!(read(&c, "dir/b.txt"), "x\n");
 }
 
@@ -247,9 +252,10 @@ async fn persistent_fetch_failure_fails_clone() {
     let origin = make_origin("acme", "retryfail");
     origin.commit(&[("a", "1\n")], "c1");
     origin.publish();
+    // sync talks to the server directly (not artifact GETs), so it succeeds; wait
+    // for the full clonepack (with archive) to publish in phase 2.
+    sync_until_manifest(&server, "acme", "retryfail").await;
     let client = server.client();
-    // sync talks to the server directly (not artifact GETs), so it succeeds.
-    client.sync_repo("acme/retryfail", None).await.unwrap();
 
     let out = tempfile::tempdir().unwrap();
     let res = client
@@ -259,7 +265,7 @@ async fn persistent_fetch_failure_fails_clone() {
             "HEAD",
             out.path().join("clone"),
             CloneMode::Files,
-            Some("shallow"),
+            Some("full"),
             None,
         )
         .await;
@@ -279,7 +285,7 @@ async fn successful_clone_leaves_no_temp_dir() {
     let origin = make_origin("acme", "clean");
     origin.commit(&[("a.txt", "hi\n"), ("d/b.txt", "y\n")], "c1");
     origin.publish();
-    let (_g, c) = sync_and_clone(&server, &origin, 1, CloneMode::Files).await;
+    let (_g, c) = sync_and_clone(&server, &origin, 0, CloneMode::Files).await;
     assert_eq!(read(&c, "a.txt"), "hi\n");
     assert_eq!(read(&c, "d/b.txt"), "y\n");
     let parent = c.parent().unwrap();
@@ -303,19 +309,24 @@ async fn failed_clone_after_temp_dir_leaves_nothing() {
     origin.commit(&[("a.txt", "hello\n")], "c1");
     origin.publish();
     let client = server.client();
-    client.sync_repo("acme/notemp", None).await.unwrap();
-
-    // Corrupt the first archive chunk so extraction (which runs after the temp
-    // install dir is created and the skeleton is written) fails deterministically.
-    let info = client
-        .resolve_ref_with_clonepack("acme/notemp", "HEAD", Some("shallow"), None)
-        .await
-        .unwrap();
-    let (manifest, _meta) = client.fetch_clonepack(&info).await.unwrap();
-    assert!(
-        !manifest.archive_chunks.is_empty(),
-        "test needs an archive chunk to corrupt"
-    );
+    // The archive builds in phase 2; wait until the clonepack manifest is
+    // published, then resolve the shallow clonepack and poll until its archive
+    // chunk is available to corrupt.
+    sync_until_manifest(&server, "acme", "notemp").await;
+    let mut manifest = None;
+    for _ in 0..160 {
+        let info = client
+            .resolve_ref_with_clonepack("acme/notemp", "HEAD", Some("full"), None)
+            .await
+            .unwrap();
+        let (man, _meta) = client.fetch_clonepack(&info).await.unwrap();
+        if !man.archive_chunks.is_empty() {
+            manifest = Some(man);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    let manifest = manifest.expect("archive chunk never published for acme/notemp");
     let chunk_hex = ripclone::clonepack::hash_to_hex(&manifest.archive_chunks[0].hash);
     let p = server.cas_path(&chunk_hex);
     assert!(p.exists(), "archive chunk should be in CAS");
@@ -330,7 +341,7 @@ async fn failed_clone_after_temp_dir_leaves_nothing() {
             "HEAD",
             &target,
             CloneMode::Files,
-            Some("shallow"),
+            Some("full"),
             None,
         )
         .await;

@@ -1,6 +1,6 @@
-//! End-to-end tests for two-phase publish (RIPCLONE_TWO_PHASE=1): a sync
-//! publishes the depth=1 clonepack in the foreground and builds full history in
-//! the background, so depth=1 is clonable immediately and depth=0 shortly after.
+//! End-to-end tests for two-phase publish (always on): a sync publishes the
+//! depth=1 clonepack in the foreground and builds full history in the
+//! background, so depth=1 is clonable immediately and depth=0 shortly after.
 
 mod common;
 
@@ -17,7 +17,6 @@ fn read(dir: &Path, name: &str) -> String {
 /// depth=0 becomes a complete, fsck-clean full clone once phase 2 finishes.
 #[tokio::test]
 async fn two_phase_depth1_immediate_then_full() {
-    enable_two_phase();
     init(false);
     let server = start_server().await;
     let origin = make_origin("acme", "tp");
@@ -71,7 +70,6 @@ async fn two_phase_depth1_immediate_then_full() {
 /// frames built in the background.
 #[tokio::test]
 async fn two_phase_files_mode_after_phase2() {
-    enable_two_phase();
     init(false);
     let server = start_server().await;
     let origin = make_origin("acme", "tpf");
@@ -109,7 +107,6 @@ async fn two_phase_files_mode_after_phase2() {
 /// two-phase sync.
 #[tokio::test]
 async fn two_phase_resync_full_upgrades() {
-    enable_two_phase();
     init(false);
     let server = start_server().await;
     let origin = make_origin("acme", "tp2");

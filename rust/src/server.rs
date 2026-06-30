@@ -2093,63 +2093,203 @@ async fn sync_repo_inner(
     // it survives client disconnect / HTTP timeout (the key win for huge repos)
     // and is rate-bounded under load. Coalesce concurrent `/sync` for the same
     // key onto one build, wait up to RIPCLONE_SYNC_WAIT_SECS, then 202.
-    if async_build_enabled() {
-        // Keep this comfortably under edge/proxy request timeouts (e.g. Fly's
-        // ~60s): on a long build we return 202 and let the client retry, rather
-        // than holding the connection until it is reset mid-request.
-        let wait = Duration::from_secs(env_bytes("RIPCLONE_SYNC_WAIT_SECS", 25));
+    // Keep this comfortably under edge/proxy request timeouts (e.g. Fly's
+    // ~60s): on a long build we return 202 and let the client retry, rather
+    // than holding the connection until it is reset mid-request.
+    let wait = Duration::from_secs(env_bytes("RIPCLONE_SYNC_WAIT_SECS", 25));
 
-        if state.build_queue.inproc_wait() {
-            // In-process queue: coalesce via build_waiters; the same-process
-            // worker signals completion on a oneshot. Include the rev override in
-            // the coalescing key so syncs for different build commits don't share
-            // one build.
-            let key = inproc_build_key(&repo_id, &branch, at_rev.as_deref());
-            let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
-            let first = {
-                let mut w = state.build_waiters.lock().await;
-                // Presence-based: a key present — even an empty marker left by the
-                // /build webhook — means a build is already in flight, so coalesce
-                // onto it rather than enqueueing a duplicate.
-                let first = !w.contains_key(&key);
-                w.entry(key.clone()).or_default().push(tx);
-                first
+    if state.build_queue.inproc_wait() {
+        // In-process queue: coalesce via build_waiters; the same-process
+        // worker signals completion on a oneshot. Include the rev override in
+        // the coalescing key so syncs for different build commits don't share
+        // one build.
+        let key = inproc_build_key(&repo_id, &branch, at_rev.as_deref());
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+        let first = {
+            let mut w = state.build_waiters.lock().await;
+            // Presence-based: a key present — even an empty marker left by the
+            // /build webhook — means a build is already in flight, so coalesce
+            // onto it rather than enqueueing a duplicate.
+            let first = !w.contains_key(&key);
+            w.entry(key.clone()).or_default().push(tx);
+            first
+        };
+        if first {
+            // Mirror the /build handler: the worker decrements the metrics
+            // gauge for every job it drains, so every enqueue must increment
+            // it (else the gauge underflows). The local queue owns the
+            // build_queue_depth counter (enqueue +1, worker -1).
+            state.metrics.record_build_queued();
+            let job = BuildJob {
+                repo_id: repo_id.clone(),
+                branch: branch.clone(),
+                rev: at_rev.clone(),
+                credential,
+                recheck: 0,
             };
-            if first {
-                // Mirror the /build handler: the worker decrements the metrics
-                // gauge for every job it drains, so every enqueue must increment
-                // it (else the gauge underflows). The local queue owns the
-                // build_queue_depth counter (enqueue +1, worker -1).
-                state.metrics.record_build_queued();
-                let job = BuildJob {
-                    repo_id: repo_id.clone(),
-                    branch: branch.clone(),
-                    rev: at_rev.clone(),
-                    credential,
-                    recheck: 0,
+            let full = match state.build_queue.enqueue(job).await {
+                Ok(enq) => enq.outcome == EnqueueOutcome::Full,
+                Err(_) => true,
+            };
+            if full {
+                state.metrics.record_build_rejected();
+                state.build_waiters.lock().await.remove(&key);
+                state.metrics.record_error();
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(ErrorResponse {
+                        error: "build queue full; retry shortly".to_string(),
+                    }),
+                )
+                    .into_response();
+            }
+        }
+        match tokio::time::timeout(wait, rx).await {
+            Ok(Ok(Ok(()))) => {
+                // Resolve HEAD to the concrete default branch before loading
+                // the persisted ref; do_sync stores artifacts under the real
+                // branch.
+                let effective_branch = if branch == "HEAD" {
+                    git::default_branch(&mirror_dir)
+                        .ok()
+                        .filter(|b| !b.is_empty())
+                        .unwrap_or_else(|| branch.clone())
+                } else {
+                    branch.clone()
                 };
-                let full = match state.build_queue.enqueue(job).await {
-                    Ok(enq) => enq.outcome == EnqueueOutcome::Full,
-                    Err(_) => true,
+                let load_key = if let Some(rev) = at_rev.as_deref() {
+                    let commit = git::resolve_commit(&mirror_dir, rev).ok();
+                    ref_store_key(&effective_branch, Some(rev), commit.as_deref())
+                } else {
+                    effective_branch.clone()
                 };
-                if full {
-                    state.metrics.record_build_rejected();
-                    state.build_waiters.lock().await.remove(&key);
-                    state.metrics.record_error();
-                    return (
-                        StatusCode::SERVICE_UNAVAILABLE,
+                match state.ref_store.load_branch(&repo_id, &load_key).await {
+                    Ok(Some(info)) => {
+                        state.metrics.record_sync(start.elapsed());
+                        let resp = ref_response(
+                            &repo_id,
+                            &provider,
+                            effective_branch,
+                            &info,
+                            &state.storage,
+                            "full",
+                            private,
+                        );
+                        (StatusCode::OK, Json(resp)).into_response()
+                    }
+                    _ => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
                         Json(ErrorResponse {
-                            error: "build queue full; retry shortly".to_string(),
+                            error: "build finished but ref missing".to_string(),
                         }),
                     )
-                        .into_response();
+                        .into_response(),
                 }
             }
-            match tokio::time::timeout(wait, rx).await {
-                Ok(Ok(Ok(()))) => {
-                    // Resolve HEAD to the concrete default branch before loading
-                    // the persisted ref; do_sync stores artifacts under the real
-                    // branch.
+            Ok(Ok(Err(e))) => {
+                state.metrics.record_error();
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("sync failed: {e}"),
+                    }),
+                )
+                    .into_response()
+            }
+            Ok(Err(_)) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "build worker dropped".to_string(),
+                }),
+            )
+                .into_response(),
+            Err(_) => (
+                StatusCode::ACCEPTED,
+                Json(BuildResponse {
+                    status: "building".to_string(),
+                    queue_depth: state.build_queue.depth().await,
+                }),
+            )
+                .into_response(),
+        }
+    } else {
+        // Cross-process queue: enqueue (the queue coalesces by repo/branch)
+        // and poll the job's status, since the build runs in a separate
+        // ripclone-worker.
+        //
+        // The rev override is not carried across the queue (not persisted; the
+        // worker builds the branch tip), so honoring `?rev=` here would build
+        // the wrong commit and then fail to find the `branch#<rev>` ref.
+        // Reject it explicitly rather than mis-build. Use the local queue for
+        // rev-targeted builds.
+        if at_rev.is_some() {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                Json(ErrorResponse {
+                    error: "rev override (?rev=) is not supported on the cross-process \
+                                queue; use the local queue (RIPCLONE_QUEUE=local)"
+                        .to_string(),
+                }),
+            )
+                .into_response();
+        }
+        // The per-request upstream credential rides with the job: the queue
+        // persists it (base64) and the worker uses it for the mirror fetch,
+        // so a private repo the worker has no standing token for still builds.
+        let job = BuildJob {
+            repo_id: repo_id.clone(),
+            branch: branch.clone(),
+            rev: at_rev.clone(),
+            credential,
+            recheck: 0,
+        };
+        let enq = match state.build_queue.enqueue(job).await {
+            Ok(enq) => enq,
+            Err(e) => {
+                state.metrics.record_error();
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(ErrorResponse {
+                        error: format!("failed to enqueue build: {e}"),
+                    }),
+                )
+                    .into_response();
+            }
+        };
+        // Only count a genuinely new job (not a coalesced duplicate).
+        if enq.outcome == EnqueueOutcome::Enqueued {
+            state.metrics.record_build_queued();
+        }
+        if enq.outcome == EnqueueOutcome::Full {
+            state.metrics.record_build_rejected();
+            state.metrics.record_error();
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse {
+                    error: "build queue full; retry shortly".to_string(),
+                }),
+            )
+                .into_response();
+        }
+        // The SQL queue always returns a job id to poll; treat its absence as
+        // an internal error rather than spinning to the deadline.
+        let Some(job_id) = enq.job_id else {
+            state.metrics.record_error();
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "queue returned no job id".to_string(),
+                }),
+            )
+                .into_response();
+        };
+        let deadline = Instant::now() + wait;
+        let mut consecutive_errors = 0u32;
+        loop {
+            match state.build_queue.job_status(job_id).await {
+                Ok(JobState::Done) => {
+                    // The build ran in another process, so this server's ref
+                    // caches may be stale — drop them before reading.
                     let effective_branch = if branch == "HEAD" {
                         git::default_branch(&mirror_dir)
                             .ok()
@@ -2158,14 +2298,18 @@ async fn sync_repo_inner(
                     } else {
                         branch.clone()
                     };
-                    let load_key = if let Some(rev) = at_rev.as_deref() {
-                        let commit = git::resolve_commit(&mirror_dir, rev).ok();
-                        ref_store_key(&effective_branch, Some(rev), commit.as_deref())
-                    } else {
-                        effective_branch.clone()
-                    };
+                    state.ref_store.invalidate(&repo_id, &branch).await;
+                    state
+                        .ref_store
+                        .invalidate(&repo_id, &effective_branch)
+                        .await;
+                    invalidate_ref_response_cache(&state, &repo_id, &effective_branch);
+                    let load_key = ref_store_key(&effective_branch, at_rev.as_deref(), None);
                     match state.ref_store.load_branch(&repo_id, &load_key).await {
-                        Ok(Some(info)) => {
+                        // Guard on a non-empty commit: a HEAD row can exist as
+                        // a build_status placeholder (empty commit). Never
+                        // return that as a successful ref.
+                        Ok(Some(info)) if !info.commit.is_empty() => {
                             state.metrics.record_sync(start.elapsed());
                             let resp = ref_response(
                                 &repo_id,
@@ -2189,7 +2333,7 @@ async fn sync_repo_inner(
                         }
                     }
                 }
-                Ok(Ok(Err(e))) => {
+                Ok(JobState::Failed(e)) => {
                     state.metrics.record_error();
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
@@ -2199,250 +2343,34 @@ async fn sync_repo_inner(
                     )
                         .into_response();
                 }
-                Ok(Err(_)) => {
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(ErrorResponse {
-                            error: "build worker dropped".to_string(),
-                        }),
-                    )
-                        .into_response();
-                }
-                Err(_) => {
-                    return (
-                        StatusCode::ACCEPTED,
-                        Json(BuildResponse {
-                            status: "building".to_string(),
-                            queue_depth: state.build_queue.depth().await,
-                        }),
-                    )
-                        .into_response();
-                }
-            }
-        } else {
-            // Cross-process queue: enqueue (the queue coalesces by repo/branch)
-            // and poll the job's status, since the build runs in a separate
-            // ripclone-worker.
-            //
-            // The rev override is not carried across the queue (not persisted; the
-            // worker builds the branch tip), so honoring `?rev=` here would build
-            // the wrong commit and then fail to find the `branch#<rev>` ref.
-            // Reject it explicitly rather than mis-build. Use the local queue for
-            // rev-targeted builds.
-            if at_rev.is_some() {
-                return (
-                    StatusCode::NOT_IMPLEMENTED,
-                    Json(ErrorResponse {
-                        error: "rev override (?rev=) is not supported on the cross-process \
-                                queue; use the local queue (RIPCLONE_QUEUE=local)"
-                            .to_string(),
-                    }),
-                )
-                    .into_response();
-            }
-            // The per-request upstream credential rides with the job: the queue
-            // persists it (base64) and the worker uses it for the mirror fetch,
-            // so a private repo the worker has no standing token for still builds.
-            let job = BuildJob {
-                repo_id: repo_id.clone(),
-                branch: branch.clone(),
-                rev: at_rev.clone(),
-                credential,
-                recheck: 0,
-            };
-            let enq = match state.build_queue.enqueue(job).await {
-                Ok(enq) => enq,
+                Ok(_) => consecutive_errors = 0,
                 Err(e) => {
-                    state.metrics.record_error();
-                    return (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        Json(ErrorResponse {
-                            error: format!("failed to enqueue build: {e}"),
-                        }),
-                    )
-                        .into_response();
-                }
-            };
-            // Only count a genuinely new job (not a coalesced duplicate).
-            if enq.outcome == EnqueueOutcome::Enqueued {
-                state.metrics.record_build_queued();
-            }
-            if enq.outcome == EnqueueOutcome::Full {
-                state.metrics.record_build_rejected();
-                state.metrics.record_error();
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(ErrorResponse {
-                        error: "build queue full; retry shortly".to_string(),
-                    }),
-                )
-                    .into_response();
-            }
-            // The SQL queue always returns a job id to poll; treat its absence as
-            // an internal error rather than spinning to the deadline.
-            let Some(job_id) = enq.job_id else {
-                state.metrics.record_error();
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse {
-                        error: "queue returned no job id".to_string(),
-                    }),
-                )
-                    .into_response();
-            };
-            let deadline = Instant::now() + wait;
-            let mut consecutive_errors = 0u32;
-            loop {
-                match state.build_queue.job_status(job_id).await {
-                    Ok(JobState::Done) => {
-                        // The build ran in another process, so this server's ref
-                        // caches may be stale — drop them before reading.
-                        let effective_branch = if branch == "HEAD" {
-                            git::default_branch(&mirror_dir)
-                                .ok()
-                                .filter(|b| !b.is_empty())
-                                .unwrap_or_else(|| branch.clone())
-                        } else {
-                            branch.clone()
-                        };
-                        state.ref_store.invalidate(&repo_id, &branch).await;
-                        state
-                            .ref_store
-                            .invalidate(&repo_id, &effective_branch)
-                            .await;
-                        invalidate_ref_response_cache(&state, &repo_id, &effective_branch);
-                        let load_key = ref_store_key(&effective_branch, at_rev.as_deref(), None);
-                        match state.ref_store.load_branch(&repo_id, &load_key).await {
-                            // Guard on a non-empty commit: a HEAD row can exist as
-                            // a build_status placeholder (empty commit). Never
-                            // return that as a successful ref.
-                            Ok(Some(info)) if !info.commit.is_empty() => {
-                                state.metrics.record_sync(start.elapsed());
-                                let resp = ref_response(
-                                    &repo_id,
-                                    &provider,
-                                    effective_branch,
-                                    &info,
-                                    &state.storage,
-                                    "full",
-                                    private,
-                                );
-                                return (StatusCode::OK, Json(resp)).into_response();
-                            }
-                            _ => {
-                                return (
-                                    StatusCode::INTERNAL_SERVER_ERROR,
-                                    Json(ErrorResponse {
-                                        error: "build finished but ref missing".to_string(),
-                                    }),
-                                )
-                                    .into_response();
-                            }
-                        }
-                    }
-                    Ok(JobState::Failed(e)) => {
+                    // Don't mask a persistent queue outage as backpressure.
+                    consecutive_errors += 1;
+                    warn!("queue job_status poll failed ({consecutive_errors}): {e}");
+                    if consecutive_errors >= 5 {
                         state.metrics.record_error();
                         return (
-                            StatusCode::INTERNAL_SERVER_ERROR,
+                            StatusCode::SERVICE_UNAVAILABLE,
                             Json(ErrorResponse {
-                                error: format!("sync failed: {e}"),
+                                error: format!("build queue unavailable: {e}"),
                             }),
                         )
                             .into_response();
                     }
-                    Ok(_) => consecutive_errors = 0,
-                    Err(e) => {
-                        // Don't mask a persistent queue outage as backpressure.
-                        consecutive_errors += 1;
-                        warn!("queue job_status poll failed ({consecutive_errors}): {e}");
-                        if consecutive_errors >= 5 {
-                            state.metrics.record_error();
-                            return (
-                                StatusCode::SERVICE_UNAVAILABLE,
-                                Json(ErrorResponse {
-                                    error: format!("build queue unavailable: {e}"),
-                                }),
-                            )
-                                .into_response();
-                        }
-                    }
                 }
-                if Instant::now() >= deadline {
-                    return (
-                        StatusCode::ACCEPTED,
-                        Json(BuildResponse {
-                            status: "building".to_string(),
-                            queue_depth: state.build_queue.depth().await,
-                        }),
-                    )
-                        .into_response();
-                }
-                tokio::time::sleep(Duration::from_millis(400)).await;
             }
-        }
-    }
-
-    // do_sync acquires this per-repo lock itself, holding it only across the
-    // mirror-mutating prep and releasing it before the heavy read-only build.
-    let lock = repo_lock(&state.sync_locks, &repo_id).await;
-    match do_sync(
-        &state.cas,
-        &mirror_dir,
-        &repo_id,
-        &branch,
-        at_rev.as_deref(),
-        &state.ref_store,
-        false,
-        // In-process server: phase 2 runs in the background for a fast response.
-        false,
-        &state.storage,
-        &state.retention,
-        &provider,
-        credential.as_ref(),
-        &lock,
-    )
-    .await
-    {
-        Ok(info) => {
-            state.metrics.record_sync(start.elapsed());
-            // Resolve HEAD to the concrete default branch for caching/response.
-            let effective_branch = if branch == "HEAD" {
-                info.default_branch.clone()
-            } else {
-                branch.clone()
-            };
-            // The mirror was just fetched; let the immediately-following resolve
-            // skip its own fetch. Stamp both the concrete branch and the original
-            // requested branch (e.g. HEAD) so callers resolving either key avoid a
-            // redundant fetch.
-            stamp_mirror_fresh(
-                &state,
-                &format!("{}/{}", repo_id.storage_key(), effective_branch),
-            );
-            if branch != effective_branch {
-                stamp_mirror_fresh(&state, &format!("{}/{}", repo_id.storage_key(), branch));
+            if Instant::now() >= deadline {
+                return (
+                    StatusCode::ACCEPTED,
+                    Json(BuildResponse {
+                        status: "building".to_string(),
+                        queue_depth: state.build_queue.depth().await,
+                    }),
+                )
+                    .into_response();
             }
-            invalidate_ref_response_cache(&state, &repo_id, &effective_branch);
-            let resp = ref_response(
-                &repo_id,
-                &provider,
-                effective_branch,
-                &info,
-                &state.storage,
-                "full",
-                private,
-            );
-            (StatusCode::OK, Json(resp)).into_response()
-        }
-        Err(e) => {
-            state.metrics.record_error();
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("sync failed: {}", e),
-                }),
-            )
-                .into_response()
+            tokio::time::sleep(Duration::from_millis(400)).await;
         }
     }
 }
@@ -2964,7 +2892,6 @@ async fn create_snapshot_inner(
         &branch,
         None,
         &state.ref_store,
-        false,
         // In-process server: phase 2 runs in the background for a fast response.
         false,
         &state.storage,
@@ -3398,24 +3325,6 @@ fn sized_to_tuple(p: &crate::SizedPack) -> (String, u64, String, u64) {
     (p.pack.clone(), p.pack_len, p.idx.clone(), p.idx_len)
 }
 
-/// True when two-phase publish is enabled (publish depth=1 first, build full
-/// history in the background). On by default — the depth=1-first path is the
-/// largest lever for fast sync. Disable with `RIPCLONE_TWO_PHASE=0`.
-fn two_phase_enabled() -> bool {
-    std::env::var("RIPCLONE_TWO_PHASE")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(true)
-}
-
-/// True when `/sync` routes the build through the bounded background worker
-/// (survives client disconnect, rate-bounded). On by default — disable with
-/// `RIPCLONE_ASYNC_BUILD=0`.
-fn async_build_enabled() -> bool {
-    std::env::var("RIPCLONE_ASYNC_BUILD")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(true)
-}
-
 fn env_bytes(key: &str, default: u64) -> u64 {
     std::env::var(key)
         .ok()
@@ -3799,7 +3708,6 @@ async fn do_sync(
     // used. The branch is still the ref-store key and fetch target.
     at_rev: Option<&str>,
     ref_store: &Arc<dyn RefStore>,
-    build_full_pack: bool,
     // When true, the two-phase build finishes full history inline and only returns
     // once it is durable, instead of detaching it into a background task. An
     // ephemeral cross-process worker sets this so it never acks `done` while the
@@ -3811,9 +3719,9 @@ async fn do_sync(
     provider: &ProviderInstance,
     credential: Option<&secrecy::SecretString>,
     // Per-repo lock. do_sync holds it only while mutating the mirror (fetch +
-    // commit-graph, and the bitmap on the single-phase path), then drops it before
-    // the heavy read-only build, so different repos build concurrently. Safe
-    // because auto-gc is off, so the build only reads the mirror's packs.
+    // commit-graph), then drops it before the heavy read-only build, so different
+    // repos build concurrently. Safe because auto-gc is off, so the build only
+    // reads the mirror's packs.
     mirror_lock: &Arc<tokio::sync::Mutex<()>>,
 ) -> Result<RefInfo> {
     info!("syncing {}@{}", repo_id.storage_key(), branch);
@@ -3966,594 +3874,32 @@ async fn do_sync(
     let cg_dir = mirror_dir.clone();
     let _ = tokio::task::spawn_blocking(move || git::write_commit_graph(&cg_dir)).await;
     info!("sync phase: commit-graph {:?}", t.elapsed());
-    t = Instant::now();
 
     info!("building artifacts for {}", &commit[..7]);
 
     // Two-phase publish: build + publish the depth=1 clonepack now, build full
     // history in the background. Removes the dominant history-deltification cost
-    // from "time to clonable".
-    if two_phase_enabled() {
-        // Mirror prep (fetch + commit-graph) is done; the depth=1 build and the
-        // background phase-2 are read-only over the mirror, so release the lock so
-        // other repos' builds (and this repo's resolves) proceed concurrently.
-        drop(_guard);
-        return build_and_publish_two_phase(
-            cas,
-            &mirror_dir,
-            repo_id,
-            branch,
-            &commit,
-            parent,
-            &default_branch,
-            ref_store,
-            storage,
-            retention,
-            inline_full_history,
-            t_total,
-            fetched_at,
-        )
-        .await;
-    }
-
-    // Single-phase: write a reachability bitmap before the heavy full-history
-    // enumerations (skeleton + history). Best-effort; off the two-phase depth=1
-    // path (that branch returned above). This is the last mirror mutation.
-    let bm_dir = mirror_dir.clone();
-    let _ = tokio::task::spawn_blocking(move || git::write_bitmap(&bm_dir)).await;
-    info!("sync phase: reachability bitmap {:?}", t.elapsed());
-    t = Instant::now();
-
-    // Mirror prep complete; the skeleton/history/archive build below is read-only
-    // over the mirror, so release the per-repo lock and let it run concurrently.
+    // from "time to clonable". Mirror prep (fetch + commit-graph) is done; the
+    // depth=1 build and the background phase-2 are read-only over the mirror, so
+    // release the lock so other repos' builds (and this repo's resolves) proceed
+    // concurrently.
     drop(_guard);
-
-    // No full skeleton: the full variant reuses the shallow (HEAD) skeleton; the
-    // full history's commits+trees live in the history packs.
-
-    // Shallow depth=1 skeleton pack + idx.
-    let mirror_dir2s = mirror_dir.clone();
-    let cas2s = cas.clone();
-    let commit2s = commit.clone();
-    let shallow_skeleton_handle = tokio::task::spawn_blocking(move || {
-        let builder = PackBuilder::new(&mirror_dir2s, &cas2s);
-        builder.build_shallow_skeleton_pack(&commit2s)
-    });
-
-    // Depth-1 packs: the complete object closure for HEAD (commit + tree + every
-    // blob), split into self-contained packs the client installs + extracts in
-    // parallel. This is a RAW (uncompressed) target; the undeltified HEAD closure
-    // compresses ~3x, so 12 MiB raw lands ~4 MB download frames. Bigger frames =
-    // fewer packs = fewer round-trips (each pack costs a pack GET + an idx GET),
-    // which is a wash on a fast link but a real win on a slow/high-latency one;
-    // still many frames, so parallelism is preserved. Carried in the manifest's
-    // `packs` list.
-    let pack_target_raw: u64 = std::env::var("RIPCLONE_PACK_BYTES")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(12 * 1024 * 1024);
-    // History packs are install-only (git reads them; the client never
-    // hand-parses). They must be bigger than the small HEAD packs — the 6 MB
-    // HEAD target explodes a big repo into ~1k packs/spawns — but still many, so
-    // the client downloads them in parallel. This is a RAW (uncompressed) target;
-    // deltified history compresses ~18-20x, so 512 MiB raw lands ~28-32 MB
-    // download pieces (bun: ~12 history packs fetched concurrently).
-    let history_target_raw: u64 = std::env::var("RIPCLONE_HISTORY_PACK_BYTES")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(512 * 1024 * 1024);
-
-    // LSM incremental history build (default on; disable with RIPCLONE_LSM=0).
-    // When on, only the tail past the last sealed level is built; prior levels
-    // are reused by hash from object storage (Tigris). The level set is sealed
-    // every advancing sync and compacted back under a bound. See ROADMAP "LSM
-    // incremental history build".
-    let lsm_cfg = lsm_config();
-    let lsm = lsm_cfg.enabled;
-    let prev_levels: Vec<crate::HistoryLevel> = if lsm {
-        ref_store
-            .load_branch(repo_id, branch)
-            .await
-            .ok()
-            .flatten()
-            .map(|i| i.history_levels)
-            .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-    let sealed_tip: Option<String> = prev_levels.last().map(|l| l.tip_commit.clone());
-
-    let mirror_dir3 = mirror_dir.clone();
-    let cas3 = cas.clone();
-    let commit3 = commit.clone();
-    let sealed_tip3 = sealed_tip.clone();
-    let depth_packs_handle = tokio::task::spawn_blocking(move || -> Result<DepthBuild> {
-        let s = Instant::now();
-        let builder = PackBuilder::new(&mirror_dir3, &cas3);
-        let r = if lsm {
-            // LSM: build only the tail (HEAD closure + objects since last seal).
-            let inc = builder.build_incremental_packs(
-                &commit3,
-                sealed_tip3.as_deref(),
-                pack_target_raw,
-                history_target_raw,
-            )?;
-            DepthBuild::Lsm(inc)
-        } else {
-            // Default: small HEAD-closure packs + few large full-history packs.
-            let (head_packs, history_packs) =
-                builder.build_layered_packs(&commit3, pack_target_raw, history_target_raw)?;
-            DepthBuild::Full {
-                head_packs,
-                history_packs,
-            }
-        };
-        info!("build task: depth packs (head+history) {:?}", s.elapsed());
-        Ok(r)
-    });
-
-    // Working-tree archive + manifest.
-    let mirror_dir4 = mirror_dir.clone();
-    let cas4 = cas.clone();
-    let commit4 = commit.clone();
-    let archive_handle = tokio::task::spawn_blocking(move || {
-        let s = Instant::now();
-        let builder = ArchiveBuilder::new(&mirror_dir4);
-        let r = builder.build_into_cas(&commit4, &cas4, 6, None);
-        info!("build task: working-tree archive {:?}", s.elapsed());
-        r
-    });
-
-    let (shallow_skeleton_pack, shallow_skeleton_idx) = shallow_skeleton_handle
-        .await
-        .context("shallow skeleton pack task")??;
-    let depth_build = depth_packs_handle.await.context("depth packs task")??;
-    let (archive_chunk_hashes, mut metadata_chunk) =
-        archive_handle.await.context("archive task")??;
-    info!(
-        "sync phase: build skeletons+packs+archive {:?}",
-        t.elapsed()
-    );
-    t = Instant::now();
-
-    // Resolve the build into:
-    // - head_packs:        undeltified HEAD-closure packs (worktree source).
-    // - history_packs:     the history packs this manifest references (for LSM,
-    //                      prior sealed levels + the new tail; otherwise the
-    //                      full history). Used for manifest entries + signing.
-    // - new_pack_tuples:   packs actually built this sync (head + new history),
-    //                      i.e. what to upload + evict. Prior LSM levels are
-    //                      already durable in object storage.
-    // - new_levels:        the LSM levels to persist for the next sync.
-    // - server_full_midx:  whether to pre-build the full-variant MIDX (only when
-    //                      all its packs are local this sync — i.e. non-LSM).
-    let (head_packs, history_packs, new_pack_tuples, new_levels, server_full_midx) =
-        match depth_build {
-            DepthBuild::Full {
-                head_packs,
-                history_packs,
-            } => {
-                let mut new_tuples = head_packs.clone();
-                new_tuples.extend(history_packs.iter().cloned());
-                (head_packs, history_packs, new_tuples, Vec::new(), true)
-            }
-            DepthBuild::Lsm(inc) => {
-                // Seal the new tail + compact; prior levels are reused by hash
-                // from object storage (Tigris) — never rebuilt.
-                let (history_packs, tail_tuples, new_levels) = seal_and_compact(
-                    &mirror_dir,
-                    cas,
-                    &commit,
-                    prev_levels,
-                    sealed_tip.clone(),
-                    inc.tail_packs,
-                    history_target_raw,
-                    &lsm_cfg,
-                )
-                .await?;
-                // Newly built this sync = HEAD closure (always fresh) + tail +
-                // any compaction output. Prior levels are already durable.
-                let mut new_tuples = inc.head_packs.clone();
-                new_tuples.extend(tail_tuples);
-                (inc.head_packs, history_packs, new_tuples, new_levels, false)
-            }
-        };
-
-    // Prebuilt index from the shallow (HEAD) skeleton — the HEAD index is the
-    // same for both variants, so the full variant reuses it.
-    let mirror_dir5s = mirror_dir.clone();
-    let cas5s = cas.clone();
-    let commit5s = commit.clone();
-    let shallow_skeleton_pack_for_index = shallow_skeleton_pack.clone();
-    let shallow_prebuilt_index_handle = tokio::task::spawn_blocking(move || {
-        let builder = PackBuilder::new(&mirror_dir5s, &cas5s);
-        builder.build_prebuilt_index(&commit5s, &shallow_skeleton_pack_for_index)
-    });
-    let shallow_prebuilt_index = shallow_prebuilt_index_handle
-        .await
-        .context("shallow prebuilt index task")??;
-    info!("sync phase: prebuilt index {:?}", t.elapsed());
-    t = Instant::now();
-
-    // Assemble the full-history metadata chunk. The skeleton + prebuilt index are
-    // the shallow (HEAD) ones; the full history's commits+trees come from the
-    // history packs. The frame/file tables describe the working tree.
-    metadata_chunk.skeleton_pack = cas.get(&shallow_skeleton_pack)?;
-    metadata_chunk.skeleton_idx = cas.get(&shallow_skeleton_idx)?;
-    metadata_chunk.prebuilt_index = cas.get(&shallow_prebuilt_index)?;
-    let metadata_data = metadata_chunk.encode_to_vec();
-    let metadata_hash = cas.put(&metadata_data)?;
-
-    // Assemble the shallow depth=1 metadata chunk. The archive and head-blobs
-    // chunks are identical; only the skeleton/index differ.
-    let mut shallow_metadata_chunk = metadata_chunk.clone();
-    shallow_metadata_chunk.skeleton_pack = cas.get(&shallow_skeleton_pack)?;
-    shallow_metadata_chunk.skeleton_idx = cas.get(&shallow_skeleton_idx)?;
-    shallow_metadata_chunk.prebuilt_index = cas.get(&shallow_prebuilt_index)?;
-    let shallow_metadata_data = shallow_metadata_chunk.encode_to_vec();
-    let shallow_metadata_hash = cas.put(&shallow_metadata_data)?;
-
-    // Build manifest `packs` entries. Each is a self-contained git pack + idx,
-    // fetched and installed independently. The shallow (depth=1) clonepack lists
-    // only the HEAD-closure packs; the full clonepack lists HEAD + history. Order
-    // is HEAD-first so a shallow client's URL indices line up with the prefix of
-    // the (head+history) signed-URL list.
-    // Build a variant's PackEntry list AND its idx bundle in one pass: every
-    // pack's idx is concatenated into a single content-addressed blob, and each
-    // entry records its offset into it. The client fetches the bundle once and
-    // slices each idx locally, instead of one GET per pack idx. idx bytes come
-    // from the local CAS (kept after upload) with an object-storage fallback.
-    // Returns (entries, bundle ChunkRef, bundle CAS hash).
-    let build_variant = |tagged: &[(&(String, u64, String, u64), bool)]| -> Result<(
-        Vec<crate::clonepack::PackEntry>,
-        Option<ChunkRef>,
-        String,
-    )> {
-        if tagged.is_empty() {
-            return Ok((Vec::new(), None, String::new()));
-        }
-        let mut buf: Vec<u8> = Vec::new();
-        let mut entries = Vec::with_capacity(tagged.len());
-        for &(pack, history_only) in tagged {
-            let offset = buf.len() as u64;
-            let idx_bytes = cas.get(&pack.2).or_else(|_| storage.get(&pack.2))?;
-            buf.extend_from_slice(&idx_bytes);
-            entries.push(crate::clonepack::PackEntry {
-                pack: Some(ChunkRef {
-                    hash: hash_from_hex(&pack.0)?,
-                    len: pack.1,
-                }),
-                idx: Some(ChunkRef {
-                    hash: hash_from_hex(&pack.2)?,
-                    len: pack.3,
-                }),
-                history_only,
-                idx_bundle_offset: offset,
-            });
-        }
-        let len = buf.len() as u64;
-        let hash = cas.put(&buf)?;
-        Ok((
-            entries,
-            Some(ChunkRef {
-                hash: hash_from_hex(&hash)?,
-                len,
-            }),
-            hash,
-        ))
-    };
-    let head_tagged: Vec<(&(String, u64, String, u64), bool)> =
-        head_packs.iter().map(|p| (p, false)).collect();
-    let full_tagged: Vec<(&(String, u64, String, u64), bool)> = head_packs
-        .iter()
-        .map(|p| (p, false))
-        .chain(history_packs.iter().map(|p| (p, true)))
-        .collect();
-    let (head_entries, head_idx_bundle_ref, head_idx_bundle_hash) = build_variant(&head_tagged)?;
-    let (full_entries, full_idx_bundle_ref, full_idx_bundle_hash) = build_variant(&full_tagged)?;
-
-    // Pre-build a multi-pack-index per variant over exactly the packs that
-    // variant ships, using the client's `pack-<trailer>` filenames. The client
-    // drops it in directly instead of spending CPU on `git multi-pack-index
-    // write`. Returns (manifest ChunkRef, CAS hash) — the hash is also tracked
-    // for upload + retention.
-    let build_midx = |packs: &[(String, u64, String, u64)]| -> Result<(Option<ChunkRef>, String)> {
-        if packs.is_empty() {
-            return Ok((None, String::new()));
-        }
-        let mut pairs = Vec::with_capacity(packs.len());
-        for (ph, _, ih, _) in packs {
-            pairs.push((cas.get(ph)?, cas.get(ih)?));
-        }
-        let midx = crate::git::build_multi_pack_index_bytes(&pairs)?;
-        let len = midx.len() as u64;
-        let hash = cas.put(&midx)?;
-        Ok((
-            Some(ChunkRef {
-                hash: hash_from_hex(&hash)?,
-                len,
-            }),
-            hash,
-        ))
-    };
-    let (head_midx_ref, head_midx_hash) = build_midx(&head_packs)?;
-    // The full MIDX needs every full-variant pack present locally. Under LSM the
-    // prior levels were evicted, so only build it on the rebuild-all path; the
-    // LSM client builds its own full MIDX.
-    let (full_midx_ref, full_midx_hash) = if server_full_midx {
-        let full_pack_list: Vec<(String, u64, String, u64)> = head_packs
-            .iter()
-            .chain(history_packs.iter())
-            .cloned()
-            .collect();
-        build_midx(&full_pack_list)?
-    } else {
-        (None, String::new())
-    };
-
-    // pack_artifacts: every pack the manifest references (HEAD + history), so the
-    // ref endpoint can sign each URL — even prior LSM levels (signed by hash).
-    let manifest_packs: Vec<&(String, u64, String, u64)> =
-        head_packs.iter().chain(history_packs.iter()).collect();
-    let pack_artifacts: Vec<crate::PackArtifact> = manifest_packs
-        .iter()
-        .map(|(p, _, i, _)| crate::PackArtifact {
-            pack: p.clone(),
-            idx: i.clone(),
-        })
-        .collect();
-    // depth_pack_hashes: only packs built this sync (HEAD + new history) — these
-    // are uploaded and then evicted. Prior LSM levels are already durable.
-    let depth_pack_hashes: Vec<String> = new_pack_tuples
-        .iter()
-        .flat_map(|(p, _, i, _)| [p.clone(), i.clone()])
-        .collect();
-
-    let archive_chunk_lengths = crate::clonepack::archive_chunk_lengths(&metadata_chunk);
-    let archive_chunks: Vec<ChunkRef> = archive_chunk_hashes
-        .iter()
-        .zip(archive_chunk_lengths.iter())
-        .map(|(hash, len)| {
-            anyhow::Ok(ChunkRef {
-                hash: hash_from_hex(hash)?,
-                len: *len,
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    let make_clonepack = |metadata_hash: String,
-                          metadata_len: u64,
-                          packs: Vec<crate::clonepack::PackEntry>,
-                          midx: Option<ChunkRef>,
-                          idx_bundle: Option<ChunkRef>|
-     -> Result<ClonepackManifest> {
-        Ok(ClonepackManifest {
-            commit: commit.clone(),
-            parent_commit: parent.clone(),
-            default_branch: default_branch.clone(),
-            metadata_chunk: Some(ChunkRef {
-                hash: hash_from_hex(&metadata_hash)?,
-                len: metadata_len,
-            }),
-            archive_chunks: archive_chunks.clone(),
-            packs,
-            midx,
-            idx_bundle,
-            ..Default::default()
-        })
-    };
-
-    // Full clonepack: HEAD closure + all history. Shallow: HEAD closure only.
-    let full_clonepack_manifest = make_clonepack(
-        metadata_hash.clone(),
-        metadata_data.len() as u64,
-        full_entries,
-        full_midx_ref.clone(),
-        full_idx_bundle_ref.clone(),
-    )?;
-    let full_clonepack_data = full_clonepack_manifest.encode_to_vec();
-    let full_clonepack_hash = cas.put(&full_clonepack_data)?;
-
-    let shallow_clonepack_manifest = make_clonepack(
-        shallow_metadata_hash.clone(),
-        shallow_metadata_data.len() as u64,
-        head_entries,
-        head_midx_ref.clone(),
-        head_idx_bundle_ref.clone(),
-    )?;
-    let shallow_clonepack_data = shallow_clonepack_manifest.encode_to_vec();
-    let shallow_clonepack_hash = cas.put(&shallow_clonepack_data)?;
-
-    let full_pack = if build_full_pack {
-        let mirror_dir6 = mirror_dir.clone();
-        let cas6 = cas.clone();
-        let commit6 = commit.clone();
-        tokio::task::spawn_blocking(move || {
-            let builder = PackBuilder::new(&mirror_dir6, &cas6);
-            builder.build_full_pack(&commit6).map(|(pack, _idx)| pack)
-        })
-        .await
-        .context("full pack task")??
-    } else {
-        String::new()
-    };
-
-    let info = RefInfo {
-        commit: commit.clone(),
-        parent_commit: parent.clone(),
-        default_branch: default_branch.clone(),
-        skeleton_pack: shallow_skeleton_pack.clone(),
-        skeleton_idx: shallow_skeleton_idx.clone(),
-        head_blobs_pack: String::new(),
-        head_blobs_idx: String::new(),
-        head_blobs_chunks: Vec::new(),
-        packs: pack_artifacts.clone(),
-        prebuilt_index: shallow_prebuilt_index.clone(),
-        archive: archive_chunk_hashes.first().cloned().unwrap_or_default(),
-        manifest: metadata_hash.clone(),
-        full_pack,
-        clonepack_manifest: full_clonepack_hash.clone(),
-        metadata_chunk: metadata_hash.clone(),
-        archive_chunks: archive_chunk_hashes.clone(),
-        full_clonepack: crate::ClonepackArtifacts {
-            manifest: full_clonepack_hash.clone(),
-            metadata_chunk: metadata_hash.clone(),
-            skeleton_pack: shallow_skeleton_pack.clone(),
-            skeleton_idx: shallow_skeleton_idx.clone(),
-            prebuilt_index: shallow_prebuilt_index.clone(),
-            midx: full_midx_hash.clone(),
-            idx_bundle: full_idx_bundle_hash.clone(),
-            commit: commit.clone(),
-        },
-        shallow_clonepack: crate::ClonepackArtifacts {
-            manifest: shallow_clonepack_hash.clone(),
-            metadata_chunk: shallow_metadata_hash.clone(),
-            skeleton_pack: shallow_skeleton_pack.clone(),
-            skeleton_idx: shallow_skeleton_idx.clone(),
-            prebuilt_index: shallow_prebuilt_index.clone(),
-            midx: head_midx_hash.clone(),
-            idx_bundle: head_idx_bundle_hash.clone(),
-            commit: commit.clone(),
-        },
-        history_levels: new_levels,
-        // Incremental head-pack reuse is two-phase only; single-phase leaves these
-        // empty (a later two-phase sync starts its base fresh).
-        head_buckets: Vec::new(),
-        head_base_commit: String::new(),
-        head_base_packs: Vec::new(),
-        // Single-phase builds the full archive non-incrementally (build_into_cas);
-        // it does not populate the frame index (a later two-phase sync rebuilds).
-        archive_frames: Vec::new(),
-        build_status: None,
-        synced_at: fetched_at,
-        generation: git::commit_depth(&mirror_dir, &commit).ok(),
-    };
-
-    // Push every built artifact to the configured storage backend. For a local
-    // backend this is a no-op (CAS already holds it); for S3/R2/Tigris this
-    // makes the artifact durable and available via signed URL. Include both the
-    // full and the shallow clonepack artifacts.
-    let mut artifact_hashes: Vec<&str> = vec![
-        &info.skeleton_pack,
-        &info.skeleton_idx,
-        &info.head_blobs_idx,
-        &info.prebuilt_index,
-        &info.manifest,
-        &info.clonepack_manifest,
-        &info.shallow_clonepack.skeleton_pack,
-        &info.shallow_clonepack.skeleton_idx,
-        &info.shallow_clonepack.prebuilt_index,
-        &info.shallow_clonepack.metadata_chunk,
-        &info.shallow_clonepack.manifest,
-        &info.full_clonepack.midx,
-        &info.shallow_clonepack.midx,
-        &info.full_clonepack.idx_bundle,
-        &info.shallow_clonepack.idx_bundle,
-    ];
-    artifact_hashes.extend(info.head_blobs_chunks.iter().map(|s| s.as_str()));
-    artifact_hashes.extend(info.archive_chunks.iter().map(|s| s.as_str()));
-    // The editable depth packs + their idxs.
-    artifact_hashes.extend(depth_pack_hashes.iter().map(|s| s.as_str()));
-    info!(
-        "sync phase: assemble metadata/idx-bundles/midx/manifests {:?}",
-        t.elapsed()
-    );
-    t = Instant::now();
-    // Upload with bounded concurrency instead of one-at-a-time. Each put is a
-    // blocking S3 call, so run them on the blocking pool; ~400 MB of serial
-    // wall-clock collapses to roughly bandwidth-bound.
-    let upload_hashes: Vec<String> = artifact_hashes
-        .iter()
-        .filter(|h| !h.is_empty())
-        .map(|h| h.to_string())
-        .collect();
-    let upload_count = upload_hashes.len();
-    let upload_conc = upload_concurrency();
-    futures::stream::iter(upload_hashes.into_iter().map(|hash| {
-        let cas = cas.clone();
-        let storage = storage.clone();
-        async move {
-            let read_hash = hash.clone();
-            let data = tokio::task::spawn_blocking(move || cas.get(&read_hash))
-                .await
-                .context("read task")?
-                .with_context(|| format!("read artifact {} from CAS for upload", hash))?;
-            storage
-                .put_async(&hash, &data)
-                .await
-                .with_context(|| format!("upload artifact {} to storage", hash))
-        }
-    }))
-    .buffer_unordered(upload_conc)
-    .try_collect::<Vec<()>>()
-    .await?;
-    info!(
-        "sync phase: upload {} artifacts {:?}",
-        upload_count,
-        t.elapsed()
-    );
-
-    if storage.is_remote() {
-        // Object storage is now the source of truth and clients read straight
-        // from it via signed URLs. The local CAS copies were only build scratch
-        // (a full bun sync writes ~400 MB), so drop them to keep the volume
-        // small. They are re-fetched from storage on the rare gateway path.
-        //
-        // EXCEPT pack idx files: they are tiny and reused every sync to rebuild
-        // the idx bundle + MIDX (incl. for prior LSM levels), so keeping them
-        // local avoids re-downloading them from object storage on each build.
-        let keep_idx: std::collections::HashSet<&str> = new_pack_tuples
-            .iter()
-            .map(|(_, _, ih, _)| ih.as_str())
-            .collect();
-        let mut freed = 0u64;
-        for hash in artifact_hashes.iter().filter(|h| !h.is_empty()) {
-            if keep_idx.contains(*hash) {
-                continue;
-            }
-            if let Ok(sz) = cas.path(hash).metadata().map(|m| m.len()) {
-                freed += sz;
-            }
-            let _ = cas.remove(hash);
-        }
-        info!(
-            "evicted {} local CAS artifacts after upload (~{} MiB freed)",
-            artifact_hashes.iter().filter(|h| !h.is_empty()).count(),
-            freed / (1024 * 1024)
-        );
-    } else {
-        // Local backend: the CAS is the source of truth — protect the current
-        // HEAD's artifacts from retention eviction instead of dropping them.
-        // Include every manifest pack (so prior LSM levels, which aren't in the
-        // upload set, are also protected).
-        let protect_hashes: Vec<String> = artifact_hashes
-            .iter()
-            .filter(|h| !h.is_empty())
-            .map(|h| h.to_string())
-            .chain(
-                pack_artifacts
-                    .iter()
-                    .flat_map(|p| [p.pack.clone(), p.idx.clone()]),
-            )
-            .chain(std::iter::once(info.full_pack.clone()).filter(|h| !h.is_empty()))
-            .collect();
-        retention.protect(protect_hashes).await;
-    }
-
-    let mut info = info;
-    info.build_status = None;
-    ref_store
-        .save_branch(repo_id, branch, &info)
-        .await
-        .with_context(|| format!("persist ref store for {}@{branch}", repo_id.storage_key()))?;
-
-    info!(
-        "synced {} at {} (total build {:?})",
-        repo_id.storage_key(),
-        &commit[..7],
-        t_total.elapsed()
-    );
-    Ok(info)
+    build_and_publish_two_phase(
+        cas,
+        &mirror_dir,
+        repo_id,
+        branch,
+        &commit,
+        parent,
+        &default_branch,
+        ref_store,
+        storage,
+        retention,
+        inline_full_history,
+        t_total,
+        fetched_at,
+    )
+    .await
 }
 
 fn pack_artifacts_of(packs: &[(String, u64, String, u64)]) -> Vec<crate::PackArtifact> {
@@ -5388,7 +4734,6 @@ pub async fn process_build_job(state: &ServerState, job: &BuildJob) -> Result<()
         branch,
         at_rev.as_deref(),
         &state.ref_store,
-        false,
         inline_full_history,
         &state.storage,
         &state.retention,

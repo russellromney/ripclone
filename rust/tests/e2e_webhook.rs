@@ -61,7 +61,7 @@ async fn clone_branch_full(
 /// pushed commit — without any per-repo Actions workflow.
 #[tokio::test]
 async fn webhook_push_builds_before_clone() {
-    setup(true, true, true); // two-phase + LSM + async (production defaults)
+    setup(true); // two-phase + LSM + async (production defaults)
     let server = start_server_env(&[("RIPCLONE_WEBHOOK_SECRET", SECRET)]).await;
     let origin = make_origin("acme", "hook");
     origin.commit(&[("f.txt", "v1\n")], "c1");
@@ -107,7 +107,7 @@ fn parse_metric(text: &str, name: &str) -> u64 {
 /// unifies the two entry points — not just `/sync`-vs-`/sync`.
 #[tokio::test]
 async fn webhook_and_sync_same_branch_coalesce() {
-    setup(true, true, true);
+    setup(true);
     let server = start_server_env(&[("RIPCLONE_WEBHOOK_SECRET", SECRET)]).await;
     let origin = make_origin("acme", "coal");
     origin.commit(&[("f.txt", "v1\n")], "c1");
@@ -164,7 +164,7 @@ async fn webhook_and_sync_same_branch_coalesce() {
 /// loop, which builds the new tip — proving the missed-event fallback end to end.
 #[tokio::test]
 async fn poll_catches_a_missed_push() {
-    setup(true, true, true);
+    setup(true);
     let server = start_server_env(&[("RIPCLONE_POLL_INTERVAL_SECS", "1")]).await;
     let origin = make_origin("acme", "poll");
     origin.commit(&[("f.txt", "v1\n")], "c1");

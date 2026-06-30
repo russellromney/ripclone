@@ -33,7 +33,7 @@ async fn clone_full_rev(
 
 #[tokio::test]
 async fn sync_at_rev_builds_and_clones_older_then_newer() {
-    setup(true, true, true); // two-phase + LSM + async (production defaults)
+    setup(true); // two-phase + LSM + async (production defaults)
     let server = start_server().await;
     let origin = make_origin("acme", "atrev");
     origin.commit(&[("a.txt", "1\n")], "c1");
@@ -71,7 +71,7 @@ async fn sync_at_rev_builds_and_clones_older_then_newer() {
         .sync_repo_at("acme/atrev", None, None)
         .await
         .expect("sync at tip");
-    let (_g3, c3dir) = clone_full_at(&server, "acme", "atrev", "3", true).await;
+    let (_g3, c3dir) = clone_full_at(&server, "acme", "atrev", "3").await;
     assert_eq!(read(&c3dir, "a.txt"), "3\n");
     assert_eq!(read(&c3dir, "c.txt"), "C\n");
     assert_repo_usable(&c3dir, "3");
@@ -88,7 +88,7 @@ async fn sync_at_rev_builds_and_clones_older_then_newer() {
 /// branch entry.)
 #[tokio::test]
 async fn sync_at_rev_does_not_clobber_tip() {
-    setup(true, true, true);
+    setup(true);
     let server = start_server().await;
     let origin = make_origin("acme", "noclob");
     origin.commit(&[("a.txt", "1\n")], "c1");
@@ -99,7 +99,7 @@ async fn sync_at_rev_does_not_clobber_tip() {
 
     // Normal tip sync (builds the real branch entry at c3).
     client.sync_repo("acme/noclob", None).await.unwrap();
-    let (_g0, tip0) = clone_full_at(&server, "acme", "noclob", "3", true).await;
+    let (_g0, tip0) = clone_full_at(&server, "acme", "noclob", "3").await;
     assert_eq!(read(&tip0, "a.txt"), "3\n");
 
     // Now sync at an OLDER rev. Under the buggy (clobbering) behavior this would
@@ -110,7 +110,7 @@ async fn sync_at_rev_does_not_clobber_tip() {
         .unwrap();
 
     // A plain tip clone must STILL serve c3 correctly.
-    let (_g1, tip1) = clone_full_at(&server, "acme", "noclob", "3", true).await;
+    let (_g1, tip1) = clone_full_at(&server, "acme", "noclob", "3").await;
     assert_eq!(
         read(&tip1, "a.txt"),
         "3\n",

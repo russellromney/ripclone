@@ -10,7 +10,6 @@ use common::*;
 use std::sync::Once;
 
 fn setup() {
-    enable_two_phase();
     static O: Once = Once::new();
     // SAFETY: set once, before any server/sync reads it.
     O.call_once(|| unsafe { std::env::set_var("RIPCLONE_ARCHIVE_BOUNDED", "1") });
@@ -58,7 +57,7 @@ async fn files_mode_correct_with_bounded_archive() {
         .expect("sync c1");
 
     {
-        let (_g, dir) = clone_files_when(&server, "acme", "arch", "marker", "1", true).await;
+        let (_g, dir) = clone_files_when(&server, "acme", "arch", "marker", "1").await;
         assert_eq!(read(&dir, "a.bin"), a);
         assert_eq!(read(&dir, "c.bin"), c);
         assert_eq!(read(&dir, "e.bin"), e);
@@ -76,7 +75,7 @@ async fn files_mode_correct_with_bounded_archive() {
         .expect("sync c2");
 
     {
-        let (_g, dir) = clone_files_when(&server, "acme", "arch", "marker", "2", true).await;
+        let (_g, dir) = clone_files_when(&server, "acme", "arch", "marker", "2").await;
         assert_eq!(read(&dir, "a.bin"), a, "unchanged prefix file");
         assert_eq!(read(&dir, "c.bin"), c2, "changed file");
         assert_eq!(read(&dir, "e.bin"), e, "unchanged suffix file");
@@ -94,7 +93,7 @@ async fn files_mode_correct_with_bounded_archive() {
         .expect("sync c3");
 
     {
-        let (_g, dir) = clone_files_when(&server, "acme", "arch", "marker", "3", true).await;
+        let (_g, dir) = clone_files_when(&server, "acme", "arch", "marker", "3").await;
         assert_eq!(read(&dir, "a.bin"), a);
         assert_eq!(read(&dir, "b.bin"), b2, "grown file");
         assert_eq!(read(&dir, "c.bin"), c2);
