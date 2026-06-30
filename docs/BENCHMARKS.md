@@ -14,6 +14,20 @@ Key takeaways from the latest sweep:
 - **The gap narrows as bandwidth drops.** At 250 Mbps the full-clone win is still **2.9×** for bun and **1.8×** for pandas, while depth-1 is roughly tied with or slightly faster than `git clone --depth 1`.
 - **Above 1 Gbps, returns diminish.** Once the link is fat enough, ripclone's fixed per-clone overhead dominates and times flatten out; the value shifts from raw speed to consistency and skipping git's server-side pack compute.
 
+## High-bandwidth Linux on EC2
+
+To see how ripclone behaves when the client really has a fat pipe, we ran `torvalds/linux` from an AWS `c6i.8xlarge` (32 vCPU, up to 25 Gbps) in `us-east-1` against `ripclone-server-dev`. The client↔server link was shaped with `nftables`; ripclone modes got 3 runs, git baselines got 1 run.
+
+Pinned to `torvalds/linux` @ `ab9de95c9cf952332ab79453b4b5d1bfca8e514f`:
+
+| Mbps | ripclone full | ripclone depth-1 | ripclone files | git clone full | git clone --depth 1 |
+|------|---------------|------------------|----------------|----------------|---------------------|
+| 1000 | 83.2 s | 3.57 s | 2.33 s | 280.2 s | 18.2 s |
+| 2000 | 44.3 s | 2.97 s | 2.42 s | 279.1 s | 18.3 s |
+| 5000 | 28.4 s | 3.04 s | 2.75 s | 280.5 s | 18.2 s |
+
+That’s **~10× faster than `git clone`** for the full history at 5 Gbps, and **~6× faster** for depth-1. The unshaped/raw-pipe ceiling was similar for full (30.0 s) but noticeably lower for the small fast paths — depth-1 hit 2.84 s and files hit 2.23 s — confirming that `nftables` shaping adds a little overhead once the transfer itself is no longer the bottleneck.
+
 ## Running the sweep yourself
 
 ```bash

@@ -43,7 +43,7 @@ At 1 Gbps, measured speedups over native `git clone` are:
 
 - **`oven-sh/bun`**: full clone **8.3×**, depth-1 **7.4×**, files **9.2×**.
 - **`pandas-dev/pandas`**: full clone **4.6×**, depth-1 **4.3×**, files **6.7×**.
-- **`torvalds/linux`** (1 Gbps only, prior run): full clone **5.5×**, depth-1 **7.6×**, files **11.2×**.
+- **`torvalds/linux`** (high-bandwidth EC2 run): full clone up to **~10×**, depth-1 **~6×**, files **~8×**. See the full EC2 Linux table below and [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
 
 The full-clone win is smaller on pandas than on bun because pandas's full pack is large enough that transfer dominates; depth-1 and `files` mode avoid most of that transfer, so they stay ahead. The shaped sweep now covers **250/500 Mbps and 1/2/5/10 Gbps** to match modern links; the old 50 Mbps row and warm-cache baselines have been dropped because they are not representative for real clones.
 
@@ -77,11 +77,17 @@ The sweep covers **250/500 Mbps and 1/2/5/10 Gbps** to match modern links. The o
 | 500 | 7.3 s | 0.5 s | 0.3 s | 21.7 s | 1.9 s |
 | 250 | 14.7 s | 0.7 s | 0.4 s | 26.1 s | 1.9 s |
 
-**`torvalds/linux`** (1 Gbps only, prior run)
+**`torvalds/linux`** (high-bandwidth EC2 client — `c6i.8xlarge`, 32 vCPU, shaped link)
+
+The Fly `performance-8x` VM can’t realistically shape a 5 Gbps link, so Linux was measured from an AWS `c6i.8xlarge` in `us-east-1` talking to the same `ripclone-server-dev`. Each ripclone cell is the median of 3 runs; git baselines are 1 run.
 
 | Mbps | ripclone full | ripclone depth=1 | ripclone files | git clone full | git clone --depth 1 |
 |------|---------------|------------------|----------------|----------------|---------------------|
-| 1000 | 84.3 s | 4.4 s | 3.0 s | 462.9 s | 33.5 s |
+| 5000 | 28.4 s | 3.04 s | 2.75 s | 280.5 s | 18.2 s |
+| 2000 | 44.3 s | 2.97 s | 2.42 s | 279.1 s | 18.3 s |
+| 1000 | 83.2 s | 3.57 s | 2.33 s | 280.2 s | 18.2 s |
+
+At 5 Gbps that’s **~10× faster than `git clone`** for the full history and **~6× faster** for depth-1. See [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) for the unshaped ceiling and more details.
 
 The ratio graph shows **ripclone time / git time**; anything below the dashed `1.0` line means ripclone was faster.
 
