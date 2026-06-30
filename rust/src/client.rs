@@ -162,6 +162,17 @@ pub struct RefResponse {
     /// as ready.
     #[serde(default = "ref_archive_ready_default")]
     pub archive_ready: bool,
+    /// The managed cloud's per-clone id, captured from the `X-Ripclone-Clone-Id`
+    /// response header (not part of the JSON body). `None` for a self-hosted or
+    /// older server that doesn't mint one — in that case the post-clone metrics
+    /// report is skipped entirely.
+    #[serde(skip)]
+    pub clone_id: Option<String>,
+    /// True when resolving this ref required a 202/poll (a cold build) rather
+    /// than hitting an already-warm repo. Captured from the resolve loop, not the
+    /// JSON body.
+    #[serde(skip)]
+    pub cold: bool,
 }
 
 fn ref_archive_ready_default() -> bool {
@@ -401,6 +412,27 @@ pub struct HotfilesResponse {
     pub files: Vec<String>,
 }
 
+/// What a finished clone learned, for the best-effort post-clone metrics report.
+/// Carries the managed cloud's per-clone id (when one was minted), the resolved
+/// repo/commit, and the bytes/timing the client measured. The end-to-end wall
+/// clock is supplied by the caller (the CLI), which owns the outer timer.
+#[derive(Debug, Clone)]
+pub struct CloneOutcome {
+    pub provider: String,
+    pub owner: String,
+    pub name: String,
+    pub commit: String,
+    /// `files` | `depth1` | `full`.
+    pub mode: &'static str,
+    /// True when the resolve had to poll a cold build (202) before succeeding.
+    pub cold: bool,
+    /// The cloud's `X-Ripclone-Clone-Id`. `None` ⇒ self-hosted/older server ⇒
+    /// no metrics report.
+    pub clone_id: Option<String>,
+    /// Total bytes downloaded (metadata + pack/archive chunks).
+    pub bytes: u64,
+}
+
 #[derive(Clone)]
 pub struct Client {
     server: String,
@@ -551,15 +583,30 @@ impl Client {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(40usize);
+        // Track whether any attempt polled a cold build (202/503) before
+        // success, so the post-clone metrics report can label the clone cold.
+        let mut polled = false;
         for attempt in 0..max_attempts {
             let resp = self.request(reqwest::Method::GET, &url).send().await?;
             let status = resp.status();
             if status.is_success() {
-                return Ok(resp.json().await?);
+                // Capture the managed cloud's per-clone id from the response
+                // header before the body is consumed. Absent on a self-hosted or
+                // older server, which leaves `clone_id` None.
+                let clone_id = resp
+                    .headers()
+                    .get("x-ripclone-clone-id")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
+                let mut info: RefResponse = resp.json().await?;
+                info.clone_id = clone_id;
+                info.cold = polled;
+                return Ok(info);
             }
             if status == reqwest::StatusCode::ACCEPTED
                 || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
             {
+                polled = true;
                 if attempt == 0 {
                     eprintln!("ripclone: warming {repo_path} — this can take a moment…");
                 }
@@ -879,6 +926,7 @@ impl Client {
     ) -> Result<()> {
         self.install_repo_with_mode(owner, repo, branch, target, CloneMode::Editable, None, None)
             .await
+            .map(|_| ())
     }
 
     /// Install a repo with a specific clone mode and optional per-phase benchmark
@@ -893,7 +941,7 @@ impl Client {
         mode: CloneMode,
         clonepack: Option<&str>,
         bench: Option<&mut Benchmark>,
-    ) -> Result<()> {
+    ) -> Result<CloneOutcome> {
         self.install_repo_with_mode_at(
             &format!("{owner}/{repo}"),
             branch,
@@ -918,7 +966,7 @@ impl Client {
         mode: CloneMode,
         clonepack: Option<&str>,
         bench: Option<&mut Benchmark>,
-    ) -> Result<()> {
+    ) -> Result<CloneOutcome> {
         let target = target.as_ref().to_path_buf();
         info!(
             "installing {}#{} into {} with mode {:?}",
@@ -940,12 +988,31 @@ impl Client {
             .resolve_ref_with_clonepack(repo_path, branch, clonepack, rev)
             .await?;
         bench.mark_resolve();
+        // Capture the metrics-relevant facts from the FIRST successful resolve:
+        // the cloud mints a fresh clone id (and usage event) on each resolve, so
+        // the archive-ready re-resolve below would otherwise overwrite the id we
+        // want to report against.
+        let clone_id = info.clone_id.clone();
+        let mut cold = info.cold;
+        // `files` | `depth1` | `full`, derived from the mode and requested
+        // clonepack variant (depth=1 ⇒ "shallow").
+        let metric_mode: &'static str = if mode.needs_archive() {
+            "files"
+        } else if clonepack == Some("shallow") {
+            "depth1"
+        } else {
+            "full"
+        };
         info!("resolved to commit {}", &info.commit[..7]);
 
         // Files mode needs the zstd archive. The server publishes an editable
         // clonepack first and adds the archive a moment later, so wait for it
-        // (editable clones don't need it and skip this).
+        // (editable clones don't need it and skip this). Waiting here means the
+        // archive is being built on demand — a cold build — which the
+        // ref-resolve 202 poll above doesn't capture for files mode, so record
+        // it for the metrics label.
         if mode.needs_archive() && !info.archive_ready {
+            cold = true;
             let max = std::env::var("RIPCLONE_CLONE_MAX_ATTEMPTS")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -1178,7 +1245,8 @@ impl Client {
                 stats.files, stats.raw_bytes
             );
         }
-        bench.add_bytes(0, archive_bytes + prebuilt_blob_pack_bytes);
+        // `mark_archive_download` sets (overwrites) `archive_bytes`, so no
+        // separate `add_bytes` for the archive total is needed.
         bench.mark_archive_download(archive_bytes + prebuilt_blob_pack_bytes);
 
         // 9. Origin config + finalization.
@@ -1240,7 +1308,75 @@ impl Client {
             target.display(),
             mode
         );
-        Ok(())
+        let provider = if info.provider.is_empty() {
+            self.provider.clone()
+        } else {
+            info.provider.clone()
+        };
+        Ok(CloneOutcome {
+            provider,
+            owner: info.owner.clone(),
+            name: info.repo.clone(),
+            commit: info.commit.clone(),
+            mode: metric_mode,
+            cold,
+            clone_id,
+            bytes: report.total_bytes(),
+        })
+    }
+
+    /// Best-effort, fire-and-forget POST of clone metrics to the managed cloud,
+    /// sent AFTER the clone has printed success. Never returns an error and never
+    /// panics: a metrics failure must not change the clone's exit status.
+    ///
+    /// Skipped entirely when the cloud didn't mint a clone id (self-hosted/older
+    /// server) or when the user opted out via `RIPCLONE_NO_METRICS`. The request
+    /// carries the same `Authorization` header as every other call (the cloud
+    /// requires an authenticated caller to attribute the metric), and uses a
+    /// short timeout so a slow endpoint can't stall the CLI's exit.
+    pub async fn report_clone_metrics(&self, outcome: &CloneOutcome, total_ms: u64) {
+        use crate::clone_metrics::{ClientInfo, CloneMetric, RepoId, opted_out};
+        if opted_out() {
+            return;
+        }
+        let Some(clone_id) = outcome.clone_id.clone() else {
+            return;
+        };
+        let payload = CloneMetric {
+            clone_id: clone_id.clone(),
+            repo: RepoId {
+                provider: outcome.provider.clone(),
+                owner: outcome.owner.clone(),
+                name: outcome.name.clone(),
+            },
+            commit: outcome.commit.clone(),
+            mode: outcome.mode.to_string(),
+            cold: outcome.cold,
+            total_ms,
+            bytes: outcome.bytes,
+            // v1 omits downloadMs: the client can't cleanly isolate pure
+            // chunk-download time from manifest fetch + extraction, and a biased
+            // number would skew the cloud's bytes/downloadMs throughput (the
+            // headline metric). Better no throughput than a wrong one — the cloud
+            // simply won't compute it. Reinstated when the phase is isolated (v2).
+            download_ms: None,
+            client: ClientInfo::current(),
+        };
+        let url = format!("{}/v1/clones/{}/metrics", self.server, clone_id);
+        // Swallow every outcome — transport error, timeout, or a non-2xx status.
+        // The clone already succeeded; this is advertising-grade telemetry.
+        //
+        // The request is awaited inline (true detach is impossible: the CLI exits
+        // right after, killing any in-flight request), so the timeout is the hard
+        // ceiling on how long a hung/black-hole endpoint can delay exit. Keep it
+        // short — a clone we sell as sub-second must not gain ~seconds here.
+        let _ = self
+            .http
+            .post(&url)
+            .json(&payload)
+            .timeout(std::time::Duration::from_millis(400))
+            .send()
+            .await;
     }
 
     /// Download the pre-built head-blobs pack + index and install them into
