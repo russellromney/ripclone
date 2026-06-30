@@ -56,14 +56,14 @@ async fn generic_provider_sync_and_clone_through_http_origin() {
             )
             .await
         {
-            Ok(())
+            Ok(_)
                 if git_ok(&target, &["rev-parse", "--verify", "HEAD"])
                     && git(&target, &["rev-parse", "HEAD"]) == want =>
             {
                 found = Some((out, target));
                 break;
             }
-            Ok(()) => last = "clone not yet current".to_string(),
+            Ok(_) => last = "clone not yet current".to_string(),
             Err(e) => last = format!("clone err: {e:#}"),
         }
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;

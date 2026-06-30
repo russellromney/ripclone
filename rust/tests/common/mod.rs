@@ -705,7 +705,7 @@ pub async fn sync_and_clone(
             )
             .await
         {
-            Ok(()) => {
+            Ok(_) => {
                 let ready = if files_mode {
                     dir_has_file(&target)
                 } else {
