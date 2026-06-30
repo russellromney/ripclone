@@ -70,18 +70,51 @@ done
 
 threads=$(( CORES - 1 )); [ "$threads" -lt 1 ] && threads=1
 
-for mode in fast full hybrid; do
-  rm -rf "$BASE_DIR/install-$mode"
+wait_for_full() {
+  local timeout="${1:-300}"
+  local start end
+  start=$(now_ms)
   echo ""
-  echo "==> cloning $mode (cores=$CORES rtt=${RTT_MS}ms bw=${BANDWIDTH}Mbps)..."
-  clone_start=$(now_ms)
+  echo "==> waiting for full (depth=0) artifacts ..."
+  while true; do
+    if "$RIPCLONE" --server "$SERVER_URL" clone "$REPO" --depth 0 --dir "$BASE_DIR/probe-full" >/dev/null 2>&1; then
+      rm -rf "$BASE_DIR/probe-full"
+      end=$(now_ms)
+      echo "full artifacts ready in $((end - start)) ms"
+      return 0
+    fi
+    rm -rf "$BASE_DIR/probe-full" 2>/dev/null || true
+    end=$(now_ms)
+    if [ $((end - start)) -ge $((timeout * 1000)) ]; then
+      echo "error: full artifacts not ready after ${timeout}s" >&2
+      return 1
+    fi
+    sleep 2
+  done
+}
+
+run_clone() {
+  local label="$1" mode="$2" extra_args="$3" log="$4" outdir="$5"
+  rm -rf "$outdir"
+  echo ""
+  echo "==> cloning $label (mode=$mode cores=$CORES rtt=${RTT_MS}ms bw=${BANDWIDTH}Mbps)..."
+  local s e
+  s=$(now_ms)
+  # shellcheck disable=SC2086
   RUST_LOG=info RIPCLONE_FETCH_THREADS="$threads" RIPCLONE_WRITE_THREADS="$threads" \
-    "$RIPCLONE" --server "$PROXY_URL" clone "$REPO" --mode "$mode" --dir "$BASE_DIR/install-$mode" > "$BASE_DIR/clone-$mode.log" 2>&1
-  clone_end=$(now_ms)
-  echo "$mode=$((clone_end - clone_start)) ms"
+    "$RIPCLONE" --server "$PROXY_URL" clone "$REPO" --mode "$mode" $extra_args --dir "$outdir" > "$log" 2>&1
+  e=$(now_ms)
+  echo "$label=$((e - s)) ms"
   echo "--- top log lines ---"
-  tail -n 30 "$BASE_DIR/clone-$mode.log"
-done
+  tail -n 30 "$log"
+}
+
+run_clone "files" files "" "$BASE_DIR/clone-files.log" "$BASE_DIR/install-files"
+run_clone "editable-depth1" editable "--depth 1" "$BASE_DIR/clone-editable-depth1.log" "$BASE_DIR/install-editable-depth1"
+
+wait_for_full
+
+run_clone "editable-full" editable "--depth 0" "$BASE_DIR/clone-editable-full.log" "$BASE_DIR/install-editable-full"
 
 echo ""
 echo "==> full logs in $BASE_DIR"
