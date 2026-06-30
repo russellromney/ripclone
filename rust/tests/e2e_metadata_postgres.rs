@@ -7,7 +7,6 @@
 mod common;
 
 use common::*;
-use ripclone::mode::CloneMode;
 
 #[tokio::test]
 async fn metadata_postgres_sync_then_clone() {
