@@ -39,6 +39,7 @@ pub mod provider_config;
 pub mod queue;
 pub mod ref_store;
 pub mod remote_gc;
+pub mod repo_config;
 pub mod retention;
 pub mod server;
 pub mod sidecar;
