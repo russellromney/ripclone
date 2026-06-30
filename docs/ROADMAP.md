@@ -14,7 +14,10 @@ See `CHANGELOG.md` for the full list. The important baseline for current work:
 - **Async builds**: `/v1/build` accepts an OIDC token from GitHub Actions and enqueues the build.
 - **Security**: artifact-id validation, atomic CAS writes, hash verification, path safety, mode validation, and IP-keyed rate limiting are implemented.
 - **Client paths**: direct-install (`git checkout-index` using a head-blobs pack) and archive extraction (zstd frames written directly) are both implemented and A/B tested.
-- **Tests**: 27 unit tests, but no CI, no integration-test suite, and no fuzz/property tests yet.
+- **Multi-provider**: GitHub, GitLab, and Gitea/Forgejo, with push-webhook receivers (`/v1/webhooks/{provider}`), the GitHub Actions trigger, a polling fallback, and a post-build freshness re-check (build-before-clone).
+- **Incremental builds**: a re-sync packs only the depth-1 objects new since the prior commit into a small HEAD delta pack over an immutable base, with background base-rebuild/compaction (LSM-style).
+- **Remote storage hygiene**: local retention plus a safe (off-by-default) remote GC with an unreachable-since orphan ledger.
+- **Tests + CI**: ~250 unit tests and a large `rust/tests/e2e_*` integration suite, run by GitHub Actions (`cargo test`/`clippy`/`fmt`, Docker build, e2e, DB matrix) plus `cargo-deny`. No fuzz/property tests yet.
 
 ## Current plan
 
@@ -113,14 +116,11 @@ Implemented as `--bench` / `RIPCLONE_BENCH=1` with a JSON report covering all de
 
 - **Prometheus `/metrics`** ✅: served in Prometheus text exposition format.
 - **Real `/readyz`** ✅: probes storage + ref-store health (write probe for local backends; bucket reachability for S3); 503 when a dependency is down, cached briefly to damp flapping.
+- **CI + integration tests** ✅: GitHub Actions runs `cargo test`/`clippy -D warnings`/`fmt --check`, a Docker build, the `rust/tests/e2e_*` suite, and a DB matrix; `cargo-deny` guards advisories and licenses.
 
 Still missing:
 - **JWT auth flow**: `ripclone auth login` that exchanges a secret for a short-lived JWT, plus `/v1/auth/refresh`.
 - **GitHub App path**: support installation tokens in addition to the env-var PAT.
-- **CI and integration tests**: GitHub Actions workflow with `cargo test`, `cargo clippy -- -D warnings`, `cargo fmt --check`, Docker build, and an end-to-end clone test against a fixture repo.
-- **Extend existing e2e scripts**:
-  - `scripts/e2e_clonepack.sh` already tests default vs. archive extraction for a public fixture; extend it to test `--mode=full`, `--mode=fast`, and `--mode=hybrid` and verify `git diff`/`git show` per mode.
-  - `scripts/e2e_archive.sh` already verifies content, symlinks, executable bits, and edit detection for direct-install; reuse it for all modes.
 - **Fuzz/property tests**: random manifests should either produce the expected tree or return `Err`, never a silently short tree.
 - **Drop always-on config knobs** (done): two-phase publish and async builds are
   now hard defaults. The `RIPCLONE_TWO_PHASE` / `RIPCLONE_ASYNC_BUILD` env toggles
@@ -128,9 +128,11 @@ Still missing:
   Drop the redundant `RIPCLONE_ASYNC_BUILD` from the production Soup environment
   (a no-op now that the toggle is gone).
 
-### 8. Clonepack deltas / compaction (future)
+### 8. Clonepack deltas / compaction ✅ (HEAD path)
 
-Once warm full clones are fast and predictable, move from full clonepacks per commit to append-only delta chunks for recent commits, with background compaction. This is on the roadmap but not the current focus.
+The incremental HEAD path is implemented (`rust/tests/head_delta.rs`, `RIPCLONE_HEAD_REBASE_BYTES`): a re-sync packs only the depth-1 objects new since the prior commit into a small delta pack over the prior sync's immutable base, with a background base-rebuild and LSM-style compaction that bounds the chain. See `CHANGELOG.md`.
+
+Remaining (future): serving arbitrary deeper history as delta chains (history beyond `HEAD`), rather than only the moving `HEAD` closure.
 
 ### 9. Trim the editable-clone build further (future)
 
@@ -138,9 +140,10 @@ The editable full clone now publishes as soon as history is built (the archive i
 
 ### 10. Build-before-clone trigger follow-ups (future)
 
-The trigger surface that builds artifacts ahead of a clone is in place: a native GitHub push-webhook receiver (`/v1/webhooks/github`, HMAC-verified), the GitHub Actions trigger, and a polling fallback (`RIPCLONE_POLL_INTERVAL_SECS`). Two extensions are deferred until the product reaches that scale:
+The trigger surface that builds artifacts ahead of a clone is in place: per-provider push-webhook receivers (`/v1/webhooks/{provider}` for GitHub, GitLab, and Gitea/Forgejo, each with its own signature scheme), the GitHub Actions trigger, a polling fallback (`RIPCLONE_POLL_INTERVAL_SECS`), and a post-build freshness re-check that catches a push landing mid-build (`RIPCLONE_RECHECK_MAX`). Remaining extensions:
 
-- **Multi-provider webhooks.** The receiver is GitHub-only. GitLab (plaintext `X-Gitlab-Token`), Bitbucket (`X-Event-Key`, often unsigned), and Gitea (`X-Gitea-Signature`) each use different signature schemes, event headers, payload shapes, and repo-path semantics (GitLab subgroups). Add a per-kind `WebhookProvider` trait behind a `/v1/webhooks/{provider}` route, keyed off the existing provider registry, with per-provider webhook secrets (`RIPCLONE_PROVIDER_<ID>_WEBHOOK_SECRET`, mirroring per-provider tokens). Do this when onboarding a non-GitHub provider.
+- **Bitbucket webhooks.** The `WebhookProvider` surface now covers GitHub/GitLab/Gitea; Bitbucket (`X-Event-Key`, often unsigned) is the remaining adapter. Add it when onboarding Bitbucket.
+- **Per-repo re-check cap cross-process.** `RIPCLONE_RECHECK_MAX` bounds the post-build re-check chain in-process only; the SQL queue does not persist the counter, so a farmed-out worker pool is uncapped (bounded by push rate, spread across workers). Enforce cross-process — persist the counter or a per-repo windowed budget — only if a hot repo is measured starving the pool.
 - **Poll scaling: adaptive backoff + cross-replica coordination.** The poll loop currently sweeps every known repo on a fixed interval. At many repos, add per-repo poll state (last-seen tip, quiet-since) to poll active repos frequently and quiet ones rarely. Across multiple server replicas, each loop would multiply the `ls-remote` chatter (the SQL queue dedups the enqueues, not the probes); coordinate via a DB leader-lease (fits the queue's worker-lease idea in `DISPATCHER.md`), repo-set sharding, or a dedicated singleton poller. Both are farm-out-era work.
 
 ### 11. Empty-repository clones (future)
@@ -160,6 +163,7 @@ path and is a rare case (only freshly created, never-pushed repos).
 - **Local NVMe disk on the ripclone server is a hot cache** for recently built and recently accessed artifacts.
 - **Cache warmers in Fly regions pull objects into Tigris edge caches** after each build.
 - Retention evicts local-only objects only after confirming they exist in Tigris.
+- Remote GC reclaims unreferenced durable chunks via an unreachable-since orphan ledger, floored at the signed-URL TTL so an in-flight clone can't lose its chunks. Safe to enable but **off by default** (`RIPCLONE_REMOTE_GC_INTERVAL_SECS`); see `docs/GC.md`.
 
 ## Success metrics
 
