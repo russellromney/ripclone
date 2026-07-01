@@ -50,7 +50,7 @@ filetime = "0.2"
 flate2 = "1"
 futures = "0.3"
 hex = "0.4"
-hmac = "0.12"
+hmac = "0.13"
 libc = "0.2.186"
 prost = "0.14"
 rayon = "1"
@@ -58,8 +58,8 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 s3 = { version = "0.1.36", default-features = false, features = ["async", "rustls", "multipart"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha1 = "0.10"
-sha2 = "0.10"
+sha1 = "0.11"
+sha2 = "0.11"
 fastcdc = "4"
 tar = "0.4"
 tempfile = "3"
@@ -79,16 +79,16 @@ jsonwebtoken = { version = "10.4.0", features = ["rust_crypto"] }
 subtle = "2"
 # Pluggable SQL queue + metadata backends: sqlite (local), postgres/mysql
 # (network), libsql (remote Turso Cloud).
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "sqlite", "postgres", "mysql"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls", "sqlite", "postgres", "mysql"] }
 # remote-only: `remote` + `tls` (hyper + hyper-rustls) WITHOUT `core`, so libsql
 # does NOT bundle SQLite's C library (which would collide with sqlx's bundled
 # SQLite — "Once poisoned"). `tls` supplies the HTTP connector build() requires.
 libsql = { version = "0.9", default-features = false, features = ["remote", "tls"] }
 gix = "0.85.0"
 gix-pack = "0.72.0"
-keyring = "3"
+keyring = "4"
 rpassword = "7"
-toml = "0.8"
+toml = "1.1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7"
@@ -98,7 +98,7 @@ tower = { version = "0.5", features = ["util"] }
 tempfile = "3"
 hex = "0.4"
 tokio = { version = "1", features = ["full"] }
-sha2 = "0.10"
+sha2 = "0.11"
 serde_json = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 proptest = "1"
