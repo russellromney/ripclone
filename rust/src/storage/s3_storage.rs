@@ -7,6 +7,7 @@ use s3::{Auth, Client};
 use sha2::Digest;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
+use tokio_util::io::ReaderStream;
 
 const DELETE_BATCH_SIZE: usize = 1000;
 
@@ -334,16 +335,53 @@ impl StorageBackend for S3Storage {
         Ok(())
     }
 
+    async fn put_file_async(&self, hash: &str, path: &Path) -> Result<()> {
+        let expected_hash = hash.to_string();
+        let verify_path = path.to_path_buf();
+        let (actual_hash, len) = tokio::task::spawn_blocking(move || {
+            crate::cas::hash_file(&verify_path)
+                .with_context(|| format!("hash {} before S3 upload", verify_path.display()))
+        })
+        .await
+        .context("S3 put_file hash task")??;
+        if actual_hash != expected_hash {
+            anyhow::bail!(
+                "S3 upload source {} hash mismatch: expected {}, actual {}",
+                path.display(),
+                expected_hash,
+                actual_hash
+            );
+        }
+
+        let key = self.key(hash)?;
+        let file = tokio::fs::File::open(path)
+            .await
+            .with_context(|| format!("open {} for S3 upload", path.display()))?;
+        let stream = ReaderStream::new(file);
+        self.client
+            .objects()
+            .put(&self.bucket, &key)
+            .body_stream_sized(stream, len)
+            .send()
+            .await
+            .with_context(|| format!("S3 put_object {key}"))?;
+        if let Some(cache) = &self.cache {
+            let cache = cache.clone();
+            let hash = hash.to_string();
+            let path = path.to_path_buf();
+            tokio::task::spawn_blocking(move || cache.put_file_with_hash(&hash, &path))
+                .await
+                .context("S3 cache put_file task")??;
+        }
+        Ok(())
+    }
+
     async fn get_meta(&self, key: &str) -> Result<Option<Vec<u8>>> {
-        // Namespace the ledger under the storage prefix so multiple deployments
-        // sharing one bucket each keep their own.
-        let full = format!("{}{}", self.prefix, key);
-        Ok(self.get_object(&full).await?.map(|(_, data)| data))
+        Ok(self.get_object(key).await?.map(|(_, data)| data))
     }
 
     async fn put_meta(&self, key: &str, data: &[u8]) -> Result<()> {
-        let full = format!("{}{}", self.prefix, key);
-        self.put_object(&full, data, None).await
+        self.put_object(key, data, None).await
     }
 
     fn size(&self, hash: &str) -> Result<u64> {
@@ -528,37 +566,53 @@ fn parse_s3_time(s: &str) -> Option<SystemTime> {
         .map(|dt| dt.with_timezone(&chrono::Utc).into())
 }
 
+fn scoped_key(prefix: &str, key: &str) -> String {
+    format!("{prefix}{key}")
+}
+
+fn unscoped_key<'a>(prefix: &str, key: &'a str) -> Option<&'a str> {
+    key.strip_prefix(prefix)
+}
+
 impl S3Storage {
     /// Read an arbitrary object by key. Returns `Ok(None)` when the object does
     /// not exist, and `(etag, bytes)` when it does.
     pub async fn get_object(&self, key: &str) -> Result<Option<(String, Vec<u8>)>> {
-        let output = match self.client.objects().get(&self.bucket, key).send().await {
+        let scoped = scoped_key(&self.prefix, key);
+        let output = match self
+            .client
+            .objects()
+            .get(&self.bucket, &scoped)
+            .send()
+            .await
+        {
             Ok(out) => out,
             Err(e) if e.code() == Some("NoSuchKey") => return Ok(None),
-            Err(e) => return Err(anyhow::anyhow!("S3 get_object {key}: {e}")),
+            Err(e) => return Err(anyhow::anyhow!("S3 get_object {scoped}: {e}")),
         };
         let etag = output.etag.clone().unwrap_or_default();
         let data = Self::collect_stream(output.body)
             .await
-            .with_context(|| format!("read S3 object {key}"))?;
+            .with_context(|| format!("read S3 object {scoped}"))?;
         Ok(Some((etag, data)))
     }
 
     /// Write an arbitrary object by key, optionally requiring a matching ETag.
     pub async fn put_object(&self, key: &str, data: &[u8], if_match: Option<&str>) -> Result<()> {
+        let scoped = scoped_key(&self.prefix, key);
         let mut req = self
             .client
             .objects()
-            .put(&self.bucket, key)
+            .put(&self.bucket, &scoped)
             .body_bytes(data.to_vec());
         if let Some(etag) = if_match {
             req = req
                 .if_match(etag)
-                .with_context(|| format!("set If-Match for S3 put_object {key}"))?;
+                .with_context(|| format!("set If-Match for S3 put_object {scoped}"))?;
         }
         req.send()
             .await
-            .with_context(|| format!("S3 put_object {key}"))?;
+            .with_context(|| format!("S3 put_object {scoped}"))?;
         Ok(())
     }
 
@@ -573,37 +627,43 @@ impl S3Storage {
         data: &[u8],
         if_match: Option<&str>,
     ) -> Result<bool> {
+        let scoped = scoped_key(&self.prefix, key);
         let mut req = self
             .client
             .objects()
-            .put(&self.bucket, key)
+            .put(&self.bucket, &scoped)
             .body_bytes(data.to_vec());
-        if let Some(etag) = if_match {
-            req = req
+        req = match if_match {
+            Some(etag) => req
                 .if_match(etag)
-                .with_context(|| format!("set If-Match for S3 put_object_cas {key}"))?;
-        }
+                .with_context(|| format!("set If-Match for S3 put_object_cas {scoped}"))?,
+            None => req
+                .if_none_match("*")
+                .with_context(|| format!("set If-None-Match for S3 put_object_cas {scoped}"))?,
+        };
         match req.send().await {
             Ok(_) => Ok(true),
             Err(e) if e.code() == Some("PreconditionFailed") => Ok(false),
-            Err(e) => Err(anyhow::anyhow!("S3 put_object_cas {key}: {e}")),
+            Err(e) => Err(anyhow::anyhow!("S3 put_object_cas {scoped}: {e}")),
         }
     }
 
     /// Delete an arbitrary object by key. Deleting a missing key is not an
     /// error (S3 delete is idempotent), so this is safe to call blindly.
     pub async fn delete_object(&self, key: &str) -> Result<()> {
+        let scoped = scoped_key(&self.prefix, key);
         self.client
             .objects()
-            .delete(&self.bucket, key)
+            .delete(&self.bucket, &scoped)
             .send()
             .await
-            .with_context(|| format!("S3 delete_object {key}"))?;
+            .with_context(|| format!("S3 delete_object {scoped}"))?;
         Ok(())
     }
 
     /// List object keys under a prefix.
     pub async fn list_objects(&self, prefix: &str) -> Result<Vec<String>> {
+        let scoped_prefix = scoped_key(&self.prefix, prefix);
         let mut keys = Vec::new();
         let mut continuation = None::<String>;
         loop {
@@ -611,7 +671,7 @@ impl S3Storage {
                 .client
                 .objects()
                 .list_v2(&self.bucket)
-                .prefix(prefix)
+                .prefix(&scoped_prefix)
                 .context("set S3 list prefix")?;
             if let Some(token) = continuation.take() {
                 req = req
@@ -620,7 +680,9 @@ impl S3Storage {
             }
             let output = req.send().await.context("S3 list_objects_v2")?;
             for obj in output.contents {
-                keys.push(obj.key);
+                if let Some(key) = unscoped_key(&self.prefix, &obj.key) {
+                    keys.push(key.to_string());
+                }
             }
             if !output.is_truncated {
                 break;
@@ -631,5 +693,38 @@ impl S3Storage {
             }
         }
         Ok(keys)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{scoped_key, unscoped_key};
+
+    #[test]
+    fn arbitrary_object_keys_are_scoped_and_listed_as_logical_keys() {
+        assert_eq!(
+            scoped_key("deploy-a/", "refs/acme/widget.json"),
+            "deploy-a/refs/acme/widget.json"
+        );
+        assert_eq!(
+            unscoped_key("deploy-a/", "deploy-a/refs/acme/widget.json"),
+            Some("refs/acme/widget.json")
+        );
+        assert_eq!(
+            unscoped_key("deploy-a/", "deploy-b/refs/acme/widget.json"),
+            None
+        );
+    }
+
+    #[test]
+    fn empty_prefix_leaves_object_keys_unchanged() {
+        assert_eq!(
+            scoped_key("", "refs/acme/widget.json"),
+            "refs/acme/widget.json"
+        );
+        assert_eq!(
+            unscoped_key("", "refs/acme/widget.json"),
+            Some("refs/acme/widget.json")
+        );
     }
 }

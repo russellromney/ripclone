@@ -181,8 +181,7 @@ pub fn clear_skip_worktree_index_with_stats_raw<P: AsRef<Path>>(
     paths: &[Vec<u8>],
     stats: &[MaterializedPathStat],
 ) -> Result<()> {
-    let byte_paths: Vec<&[u8]> = paths.iter().map(Vec::as_slice).collect();
-    clear_skip_worktree_index_with_stats_bytes(repo_dir, &byte_paths, stats)
+    clear_skip_worktree_index_with_stats_byte_iter(repo_dir, paths.iter().map(Vec::as_slice), stats)
 }
 
 pub fn clear_skip_worktree_index_with_stats_bytes<P: AsRef<Path>>(
@@ -190,7 +189,20 @@ pub fn clear_skip_worktree_index_with_stats_bytes<P: AsRef<Path>>(
     paths: &[&[u8]],
     stats: &[MaterializedPathStat],
 ) -> Result<()> {
-    if paths.is_empty() {
+    clear_skip_worktree_index_with_stats_byte_iter(repo_dir, paths.iter().copied(), stats)
+}
+
+pub fn clear_skip_worktree_index_with_stats_byte_iter<'a, P, I>(
+    repo_dir: P,
+    paths: I,
+    stats: &[MaterializedPathStat],
+) -> Result<()>
+where
+    P: AsRef<Path>,
+    I: IntoIterator<Item = &'a [u8]>,
+{
+    let mut paths = paths.into_iter().peekable();
+    if paths.peek().is_none() {
         return Ok(());
     }
     let repo_dir = repo_dir.as_ref();
@@ -207,15 +219,15 @@ pub fn clear_skip_worktree_index_with_stats_bytes<P: AsRef<Path>>(
     let mut changed = false;
     for path in paths {
         let Some(entry) = index.entry_mut_by_path_and_stage(
-            gix::bstr::BStr::new(*path),
+            gix::bstr::BStr::new(path),
             gix::index::entry::Stage::Unconflicted,
         ) else {
             continue;
         };
-        let stat = if let Some(stat) = stats_by_path.get(*path) {
+        let stat = if let Some(stat) = stats_by_path.get(path) {
             **stat
         } else {
-            let full_path = repo_dir.join(index_path_from_bytes(*path));
+            let full_path = repo_dir.join(index_path_from_bytes(path));
             let metadata = std::fs::symlink_metadata(&full_path)
                 .with_context(|| format!("stat materialized file {}", full_path.display()))?;
             index_stat_from_metadata(&metadata)
@@ -696,7 +708,6 @@ pub fn classify_objects<P: AsRef<Path>>(
 }
 
 /// Build a packfile containing the given object SHAs.
-/// Uses a shell subprocess to avoid Rust pipe-buffer deadlocks.
 pub fn pack_objects<P: AsRef<Path>, Q: AsRef<Path>>(
     repo: P,
     object_shas: &[String],
@@ -706,34 +717,38 @@ pub fn pack_objects<P: AsRef<Path>, Q: AsRef<Path>>(
         bail!("no objects to pack");
     }
 
-    let mut input = String::new();
-    for sha in object_shas {
-        input.push_str(sha);
-        input.push('\n');
+    let output = std::fs::File::create(output_path.as_ref())
+        .with_context(|| format!("create pack output {}", output_path.as_ref().display()))?;
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(repo.as_ref())
+        .args(["pack-objects", "--stdout"])
+        .stdin(Stdio::piped())
+        .stdout(output)
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("spawn git pack-objects --stdout")?;
+
+    {
+        let mut stdin = child.stdin.take().context("open pack-objects stdin")?;
+        for sha in object_shas {
+            stdin
+                .write_all(sha.as_bytes())
+                .context("write object id to pack-objects stdin")?;
+            stdin
+                .write_all(b"\n")
+                .context("write newline to pack-objects stdin")?;
+        }
     }
 
-    let input_file = tempfile::NamedTempFile::new()?;
-    std::fs::write(input_file.path(), input.as_bytes())?;
-
-    let repo_str = repo.as_ref().to_str().context("repo path not UTF-8")?;
-    let output_str = output_path
-        .as_ref()
-        .to_str()
-        .context("output path not UTF-8")?;
-    let cmd = format!(
-        "git -C '{}' pack-objects --stdout < '{}' > '{}'",
-        shell_escape(repo_str),
-        shell_escape(input_file.path().to_str().unwrap()),
-        shell_escape(output_str)
-    );
-
-    let status = Command::new("sh")
-        .args(["-c", &cmd])
-        .status()
-        .context("git pack-objects shell")?;
-
-    if !status.success() {
-        bail!("pack-objects failed");
+    let output = child
+        .wait_with_output()
+        .context("wait for git pack-objects")?;
+    if !output.status.success() {
+        bail!(
+            "pack-objects failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
     }
 
     Ok(())
@@ -789,30 +804,44 @@ pub fn pack_objects_reachable_to_prefix<P: AsRef<Path>, Q: AsRef<Path>>(
     // matches the rest of git.rs and never trusts an unvalidated rev.
     crate::validation::validate_git_rev(commit)
         .with_context(|| format!("invalid commit: {commit}"))?;
-    let input_file = tempfile::NamedTempFile::new()?;
-    std::fs::write(input_file.path(), format!("{commit}\n").as_bytes())?;
 
     if let Some(parent) = prefix.as_ref().parent() {
         std::fs::create_dir_all(parent).context("create pack prefix directory")?;
     }
 
-    let repo_str = repo.as_ref().to_str().context("repo path not UTF-8")?;
-    let prefix_str = prefix.as_ref().to_str().context("prefix path not UTF-8")?;
-    let cmd = format!(
-        "git -C '{}' pack-objects --revs --use-bitmap-index --max-pack-size={} '{}' < '{}'",
-        shell_escape(repo_str),
-        max_pack_bytes.max(1),
-        shell_escape(prefix_str),
-        shell_escape(input_file.path().to_str().unwrap())
-    );
-
     // Capture rather than inherit: pack-objects prints each output pack's hash to
     // stdout (noise in the server log), and stderr carries the real diagnostic when
     // it fails. We write the packs by base-name, so stdout is not needed.
-    let output = Command::new("sh")
-        .args(["-c", &cmd])
-        .output()
-        .context("git pack-objects (reachable) shell")?;
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(repo.as_ref())
+        .arg("pack-objects")
+        .arg("--revs")
+        .arg("--use-bitmap-index")
+        .arg(format!("--max-pack-size={}", max_pack_bytes.max(1)))
+        .arg(prefix.as_ref())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("spawn git pack-objects (reachable)")?;
+
+    {
+        let mut stdin = child
+            .stdin
+            .take()
+            .context("open reachable pack-objects stdin")?;
+        stdin
+            .write_all(commit.as_bytes())
+            .context("write commit to pack-objects stdin")?;
+        stdin
+            .write_all(b"\n")
+            .context("write newline to pack-objects stdin")?;
+    }
+
+    let output = child
+        .wait_with_output()
+        .context("wait for git pack-objects (reachable)")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -865,11 +894,6 @@ fn pack_objects_to_prefix_inner<P: AsRef<Path>, Q: AsRef<Path>>(
     }
 
     Ok(())
-}
-
-fn shell_escape(s: &str) -> String {
-    // Minimal escaping for paths without quotes.
-    s.replace('\\', "\\\\").replace('\'', "'\\''")
 }
 
 /// Read and encode objects as pack base entries using scoped OS threads and

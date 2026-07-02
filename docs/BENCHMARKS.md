@@ -2,6 +2,11 @@
 
 Reproduce with [`benchmark/run_shaped_sweep.sh`](benchmark/run_shaped_sweep.sh) on a client machine pointed at a ripclone server.
 
+For launch comparisons, prefer a real Fly volume mounted at `/data`. That path
+matches the production write path closely enough to expose filesystem, fsync,
+and worktree materialization bottlenecks that local tmpdirs or memory-backed
+volumes can hide.
+
 ## Shaped bandwidth sweep
 
 The authoritative numbers live in the [Performance section of `README.md`](../README.md#performance). They are measured on a Fly.io `performance-8x` client in `ewr` talking to `ripclone-server-dev` in `iad`, with the client↔server link shaped to the listed bandwidth. Each cell is the median of 3 runs with a fresh client cache (`RIPCLONE_NO_CACHE=1`).

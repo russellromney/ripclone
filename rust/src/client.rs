@@ -16,6 +16,9 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::{info, warn};
 
+mod tuning;
+use tuning::ClientTuning;
+
 /// Sent on every request so the server can attribute usage and nudge upgrades.
 const USER_AGENT: &str = concat!("ripclone/", env!("CARGO_PKG_VERSION"));
 
@@ -873,11 +876,7 @@ impl Client {
         if chunks.is_empty() {
             return Ok(Vec::new());
         }
-        let concurrency: usize = std::env::var("RIPCLONE_FETCH_CONCURRENCY")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(6)
-            .max(1);
+        let concurrency = ClientTuning::load().fetch_concurrency;
         let jobs: Vec<(usize, crate::clonepack::ChunkRef, Option<String>)> = chunks
             .iter()
             .cloned()
@@ -1299,58 +1298,65 @@ impl Client {
             path
         };
         let git_dir = install_root.join(".git");
+        let files_only = matches!(mode, CloneMode::Files);
 
-        std::fs::create_dir_all(&git_dir)?;
-        std::fs::create_dir_all(git_dir.join("refs").join("heads"))?;
-        std::fs::create_dir_all(git_dir.join("refs").join("tags"))?;
-        std::fs::create_dir_all(git_dir.join("info"))?;
+        if !files_only {
+            std::fs::create_dir_all(&git_dir)?;
+            std::fs::create_dir_all(git_dir.join("refs").join("heads"))?;
+            std::fs::create_dir_all(git_dir.join("refs").join("tags"))?;
+            std::fs::create_dir_all(git_dir.join("info"))?;
 
-        let branch_name = if branch == "HEAD" {
-            if info.default_branch.is_empty() {
-                "main"
+            let branch_name = if branch == "HEAD" {
+                if info.default_branch.is_empty() {
+                    "main"
+                } else {
+                    &info.default_branch
+                }
             } else {
-                &info.default_branch
-            }
-        } else {
-            branch
-        };
+                branch
+            };
 
-        std::fs::write(
-            git_dir.join("HEAD"),
-            format!("ref: refs/heads/{branch_name}\n"),
-        )?;
-        let branch_ref = git_dir.join("refs").join("heads").join(branch_name);
-        if let Some(parent) = branch_ref.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(branch_ref, format!("{}\n", info.commit))?;
-        std::fs::write(git_dir.join("info").join("exclude"), b".ripclone/\n")?;
-        if info.shallow {
-            // Mark HEAD as a shallow boundary so git does not try to traverse
-            // missing parents.
-            std::fs::write(git_dir.join("shallow"), format!("{}\n", info.commit))?;
+            std::fs::write(
+                git_dir.join("HEAD"),
+                format!("ref: refs/heads/{branch_name}\n"),
+            )?;
+            let branch_ref = git_dir.join("refs").join("heads").join(branch_name);
+            if let Some(parent) = branch_ref.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(branch_ref, format!("{}\n", info.commit))?;
+            std::fs::write(git_dir.join("info").join("exclude"), b".ripclone/\n")?;
+            if info.shallow {
+                // Mark HEAD as a shallow boundary so git does not try to traverse
+                // missing parents.
+                std::fs::write(git_dir.join("shallow"), format!("{}\n", info.commit))?;
+            }
         }
 
         // 6. Write the small .git artifacts from the metadata chunk.
         let pack_dir = git_dir.join("objects").join("pack");
-        std::fs::create_dir_all(&pack_dir)?;
-        let skeleton_hash = cas_hash(&metadata.skeleton_pack);
-        std::fs::write(
-            pack_dir.join(format!("pack-{}.pack", skeleton_hash)),
-            &metadata.skeleton_pack,
-        )?;
-        std::fs::write(
-            pack_dir.join(format!("pack-{}.idx", skeleton_hash)),
-            &metadata.skeleton_idx,
-        )?;
-        std::fs::write(git_dir.join("index"), &metadata.prebuilt_index)?;
+        if !files_only {
+            std::fs::create_dir_all(&pack_dir)?;
+            let skeleton_hash = cas_hash(&metadata.skeleton_pack);
+            std::fs::write(
+                pack_dir.join(format!("pack-{}.pack", skeleton_hash)),
+                &metadata.skeleton_pack,
+            )?;
+            std::fs::write(
+                pack_dir.join(format!("pack-{}.idx", skeleton_hash)),
+                &metadata.skeleton_idx,
+            )?;
+            std::fs::write(git_dir.join("index"), &metadata.prebuilt_index)?;
+            info!(
+                "wrote skeleton pack + idx + prebuilt index ({} bytes)",
+                metadata.skeleton_pack.len()
+                    + metadata.skeleton_idx.len()
+                    + metadata.prebuilt_index.len()
+            );
+        } else {
+            info!("files mode: skipped .git skeleton pack, idx, and index install");
+        }
         bench.mark_metadata();
-        info!(
-            "wrote skeleton pack + idx + prebuilt index ({} bytes)",
-            metadata.skeleton_pack.len()
-                + metadata.skeleton_idx.len()
-                + metadata.prebuilt_index.len()
-        );
 
         // 7. Start the working-tree materialization workers.
         let mut manifest_tmp = tempfile::NamedTempFile::new().context("create temp manifest")?;
@@ -1427,16 +1433,18 @@ impl Client {
         bench.mark_archive_download(archive_bytes + prebuilt_blob_pack_bytes);
 
         // 9. Origin config + finalization.
-        let origin_url = if info.origin_url.is_empty() {
-            if let Some((owner, repo)) = repo_path.split_once('/') {
-                format!("https://github.com/{owner}/{repo}.git")
+        if !files_only {
+            let origin_url = if info.origin_url.is_empty() {
+                if let Some((owner, repo)) = repo_path.split_once('/') {
+                    format!("https://github.com/{owner}/{repo}.git")
+                } else {
+                    format!("https://github.com/{repo_path}.git")
+                }
             } else {
-                format!("https://github.com/{repo_path}.git")
-            }
-        } else {
-            info.origin_url.clone()
-        };
-        self.write_origin_config(&origin_url, &git_dir)?;
+                info.origin_url.clone()
+            };
+            self.write_origin_config(&origin_url, &git_dir)?;
+        }
 
         if let Some(dirs) = overlay_dirs {
             overlay::mount_dirs(&dirs).context("mount overlay at target")?;
@@ -1479,7 +1487,7 @@ impl Client {
                 report.total_ms,
             );
             info!(
-                "clone perf counters: archive_send_wait={}ms archive_download_inner={}ms/{}B zstd={}ms/{}->{}B zlib={}ms/{}->{}B sha1={}ms/{}B writer_prep={}ms writer_io={}ms writer_mtime={}ms writer_files={} writer_bytes={}",
+                "clone perf counters: archive_send_wait={}ms archive_download_inner={}ms/{}B zstd={}ms/{}->{}B zlib={}ms/{}->{}B sha1={}ms/{}B cas_read={}ms/{}B cas_write={}ms/{}B cas_fsync={}ms storage_upload={}ms/{}B archive_bundle_assembly={}ms/{}B editable_pack_fetch={}ms/{}B writer_prep={}ms writer_io={}ms writer_mtime={}ms writer_files={} writer_bytes={}",
                 perf.archive_send_wait_ns / 1_000_000,
                 perf.archive_download_ns / 1_000_000,
                 perf.archive_download_bytes,
@@ -1491,6 +1499,17 @@ impl Client {
                 perf.zlib_inflate_out_bytes,
                 perf.sha1_ns / 1_000_000,
                 perf.sha1_bytes,
+                perf.cas_read_ns / 1_000_000,
+                perf.cas_read_bytes,
+                perf.cas_write_ns / 1_000_000,
+                perf.cas_write_bytes,
+                perf.cas_fsync_ns / 1_000_000,
+                perf.storage_upload_ns / 1_000_000,
+                perf.storage_upload_bytes,
+                perf.archive_bundle_assembly_ns / 1_000_000,
+                perf.archive_bundle_assembly_bytes,
+                perf.editable_pack_fetch_ns / 1_000_000,
+                perf.editable_pack_fetch_bytes,
                 write_timing.prep_ns / 1_000_000,
                 write_timing.io_ns / 1_000_000,
                 write_timing.mtime_ns / 1_000_000,
@@ -1679,21 +1698,9 @@ impl Client {
         // count even when the writer backend can profit from deeper io_uring
         // submission; otherwise `2 * cores` write defaults turn into `2 * cores`
         // CPU parse tasks.
-        let cores = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4);
-        let default_download_conc = cores.max(1);
-        let default_parse_conc = cores.max(1);
-        let download_conc: usize = std::env::var("RIPCLONE_FETCH_CONCURRENCY")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(default_download_conc)
-            .max(1);
-        let parse_conc: usize = std::env::var("RIPCLONE_PACK_PARSE_THREADS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(default_parse_conc)
-            .max(1);
+        let tuning = ClientTuning::load();
+        let download_conc = tuning.editable_download_concurrency;
+        let parse_conc = tuning.pack_parse_threads;
 
         // Signed URLs (one per pack/idx, matching manifest.packs order). Empty
         // entries fall back to the gateway by hash; with an object-store backend
@@ -1772,19 +1779,24 @@ impl Client {
                         .await
                         .with_context(|| format!("fetch idx {}", i))?
                 };
+                let pack_fetch_start = std::time::Instant::now();
                 let pack_body = if history_only {
                     let (file, len) = client
                         .fetch_chunk_ref_to_temp(pack_ref, pack_url.as_deref(), &pack_dir)
                         .await
                         .with_context(|| format!("stream history pack {}", i))?;
+                    crate::perf::record_editable_pack_fetch(pack_fetch_start.elapsed(), len);
                     PackBody::TempFile { file, len }
                 } else {
-                    PackBody::Buffered(
-                        client
-                            .fetch_chunk_ref(pack_ref, pack_url.as_deref())
-                            .await
-                            .with_context(|| format!("fetch head pack {}", i))?,
-                    )
+                    let bytes = client
+                        .fetch_chunk_ref(pack_ref, pack_url.as_deref())
+                        .await
+                        .with_context(|| format!("fetch head pack {}", i))?;
+                    crate::perf::record_editable_pack_fetch(
+                        pack_fetch_start.elapsed(),
+                        bytes.len() as u64,
+                    );
+                    PackBody::Buffered(bytes)
                 };
                 Ok::<(usize, bool, PackBody, bytes::Bytes), anyhow::Error>((
                     i,
@@ -1893,10 +1905,14 @@ impl Client {
         }
 
         // Files are materialized; clear skip-worktree for every tracked path.
-        let paths: Vec<Vec<u8>> = metadata.files.iter().map(|e| e.path.clone()).collect();
+        let path_bytes: Vec<Vec<u8>> = metadata.files.iter().map(|e| e.path.clone()).collect();
         let work_tree2 = work_tree.to_path_buf();
         tokio::task::spawn_blocking(move || {
-            crate::git::clear_skip_worktree_index_with_stats_raw(&work_tree2, &paths, &stat_cache)
+            crate::git::clear_skip_worktree_index_with_stats_byte_iter(
+                &work_tree2,
+                path_bytes.iter().map(Vec::as_slice),
+                &stat_cache,
+            )
         })
         .await
         .context("spawn clear skip-worktree and refresh index stats")??;
@@ -1979,11 +1995,7 @@ impl Client {
             .with_context(|| format!("clone temp {} pack fd", label))?;
 
         let signed_urls = chunk_urls.unwrap_or(&[]);
-        let concurrency: usize = std::env::var("RIPCLONE_FETCH_CONCURRENCY")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(6)
-            .max(1);
+        let concurrency = ClientTuning::load().fetch_concurrency;
 
         // Compute final pack size and per-chunk byte offsets.
         let mut offsets = Vec::with_capacity(chunk_refs.len());
@@ -2144,11 +2156,7 @@ impl Client {
             // Bound concurrent chunk downloads. Backpressure is async: if the
             // downstream bridge/extractor falls behind, futures await `send()`
             // without blocking Tokio worker threads.
-            let conc = std::env::var("RIPCLONE_FETCH_CONCURRENCY")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(16usize)
-                .max(1);
+            let conc = ClientTuning::load().archive_fetch_concurrency;
             let jobs: Vec<(usize, ChunkRef, Option<String>)> = manifest
                 .archive_chunks
                 .iter()

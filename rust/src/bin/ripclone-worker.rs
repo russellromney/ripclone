@@ -133,7 +133,7 @@ async fn main() -> Result<()> {
                         Ok(r) => r,
                         Err(e) => Err(format!("build task panicked: {e}")),
                     };
-                match queue.ack(job_id, &worker_id, result).await {
+                match queue.ack(job_id, &worker_id, result.map(|_| ())).await {
                     Ok(true) => {}
                     Ok(false) => warn!(
                         "job {job_id} was reclaimed (or dead-lettered) before this worker \

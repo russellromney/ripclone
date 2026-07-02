@@ -650,21 +650,25 @@ where
 
     let raw_total: u64 = manifest.files.iter().map(|e| e.total_len()).sum();
 
-    // Clear skip-worktree for every materialized path, but only if extraction
-    // succeeded and we are materializing a working tree.
+    // Clear skip-worktree for every materialized path only when a real git
+    // repository is being updated. Files mode passes no git dir and is a pure
+    // working-tree materialization path.
     if error.is_none()
+        && git_dir.is_some()
         && let Some(ref target_dir) = target_dir
     {
         let clear_start = Instant::now();
-        let paths: Vec<Vec<u8>> = manifest.files.iter().map(|e| e.path.clone()).collect();
-        if let Err(e) =
-            git::clear_skip_worktree_index_with_stats_raw(target_dir, &paths, &stat_cache)
-        {
+        let path_count = manifest.files.len();
+        if let Err(e) = git::clear_skip_worktree_index_with_stats_byte_iter(
+            target_dir,
+            manifest.files.iter().map(|e| e.path.as_slice()),
+            &stat_cache,
+        ) {
             error = Some(e);
         } else {
             info!(
                 "cleared skip-worktree for {} paths in {:?}",
-                paths.len(),
+                path_count,
                 clear_start.elapsed()
             );
         }
@@ -1385,18 +1389,21 @@ pub fn extract_archive_from_chunk_receiver(
     let raw_total: u64 = manifest.files.iter().map(|e| e.total_len()).sum();
 
     if error.is_none()
+        && git_dir.is_some()
         && let Some(ref target_dir) = target_dir
     {
         let clear_start = Instant::now();
-        let paths: Vec<Vec<u8>> = manifest.files.iter().map(|e| e.path.clone()).collect();
-        if let Err(e) =
-            git::clear_skip_worktree_index_with_stats_raw(target_dir, &paths, &stat_cache)
-        {
+        let path_count = manifest.files.len();
+        if let Err(e) = git::clear_skip_worktree_index_with_stats_byte_iter(
+            target_dir,
+            manifest.files.iter().map(|e| e.path.as_slice()),
+            &stat_cache,
+        ) {
             error = Some(e);
         } else {
             info!(
                 "cleared skip-worktree for {} paths in {:?}",
-                paths.len(),
+                path_count,
                 clear_start.elapsed()
             );
         }
@@ -1677,10 +1684,13 @@ pub fn materialize_worktree_from_pack(repo_root: &Path, commit: &str) -> Result<
 
     // The files now exist on disk; clear skip-worktree so git diffs/status see
     // them as ordinary tracked paths.
-    let paths: Vec<Vec<u8>> = items.iter().map(|it| it.path.clone()).collect();
     let stats = stat_cache.into_inner().unwrap();
-    git::clear_skip_worktree_index_with_stats_raw(repo_root, &paths, &stats)
-        .context("clear skip-worktree and refresh index stats after pack materialization")?;
+    git::clear_skip_worktree_index_with_stats_byte_iter(
+        repo_root,
+        items.iter().map(|it| it.path.as_slice()),
+        &stats,
+    )
+    .context("clear skip-worktree and refresh index stats after pack materialization")?;
 
     let raw_total = raw_bytes.load(Ordering::Relaxed) as u64;
     info!(

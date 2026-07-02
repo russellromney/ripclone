@@ -23,6 +23,43 @@ See `CHANGELOG.md` for the full list. The important baseline for current work:
 
 The next batch of work is about making the client fast, predictable, and globally consistent, while keeping the default behavior identical to what users expect from `git clone`.
 
+### 0. Finish migrating Git subprocesses to `gix`
+
+Ripclone already uses `gix`/`gix-pack` for many read/index paths: object and
+tree reads, object sizing, object enumeration, skip-worktree index mutation,
+pack encoding experiments, and primary index-pack. The remaining subprocesses
+should be migrated in priority order, with parity tests and benchmarks before
+changing defaults.
+
+**Good first ports:**
+
+- Replace remaining metadata helpers (`rev-list --count`, `diff --name-only`,
+  `diff-tree`, hot-file listing) with `gix` traversal/diff APIs.
+- Replace `git init`, `read-tree`, and local index setup where `gix` can write
+  the same index shape.
+- Remove fallback subprocesses once `gix-pack` index-pack is proven on the large
+  repos that currently require fallback.
+
+**Pack/MIDX ports to benchmark behind a feature flag first:**
+
+- Use `gix-pack` for undeltified HEAD packs, where ripclone wants simple whole
+  objects and can control worker counts directly.
+- Evaluate `gix-pack` for full-history deltified packs only after parity with
+  Git's delta reuse, bitmap-assisted reachability, pack splitting, and index
+  output is proven.
+- Use `gix-pack` MIDX/bitmap support to replace server/client
+  `multi-pack-index write` subprocesses once generated files match Git's
+  compatibility expectations.
+
+**Likely last ports:**
+
+- Mirror network mutation (`clone --mirror`, `fetch`, `ls-remote`) because Git's
+  credential, protocol, and hosting-edge behavior is mature and correctness is
+  more important than subprocess overhead here.
+- Smart-HTTP compatibility (`upload-pack --advertise-refs`,
+  `upload-pack --stateless-rpc`) unless ripclone commits to an in-process
+  upload-pack implementation.
+
 ### 1. Archive chunks vs. head-blobs pack
 
 Both represent the **same** depth: the `HEAD` commit only. They are not different history depths.

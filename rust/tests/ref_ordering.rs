@@ -17,7 +17,10 @@ use ripclone::RefInfo;
 use ripclone::provider::RepoId;
 use ripclone::ref_store::{FileRefStore, RefStore};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+static REPO_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn ref_with(commit: &str, synced_at: u64) -> RefInfo {
     RefInfo {
@@ -59,11 +62,21 @@ async fn assert_newest_wins(store: Arc<dyn RefStore>, repo: RepoId, label: &str)
         h.await.expect("task panicked").expect("save_branch failed");
     }
 
-    let loaded = store
-        .load_branch(&repo, branch)
-        .await
-        .expect("load_branch failed")
-        .expect("branch must exist after the race");
+    let mut loaded = None;
+    for _ in 0..20 {
+        let current = store
+            .load_branch(&repo, branch)
+            .await
+            .expect("load_branch failed")
+            .expect("branch must exist after the race");
+        if current.synced_at == Some(n) {
+            loaded = Some(current);
+            break;
+        }
+        loaded = Some(current);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let loaded = loaded.expect("branch must exist after the race");
     assert_eq!(
         loaded.synced_at,
         Some(n),
@@ -82,7 +95,8 @@ fn unique_repo(stem: &str) -> RepoId {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    RepoId::github(format!("ripclone-test/{stem}-{ns}"))
+    let seq = REPO_COUNTER.fetch_add(1, Ordering::Relaxed);
+    RepoId::github(format!("ripclone-test/{stem}-{ns}-{seq}"))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -196,7 +210,7 @@ async fn s3_ref_store_newest_wins() {
         &endpoint,
         &region,
         &bucket,
-        Some("ref-ordering-test"),
+        Some("ref-ordering-test/"),
         s3::Auth::from_env().unwrap(),
         None,
     )

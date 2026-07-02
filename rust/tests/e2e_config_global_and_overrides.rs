@@ -57,7 +57,7 @@ async fn run_ripclone(
     .expect("subprocess panicked")
 }
 
-fn pack_entry_count(target: &std::path::Path) -> usize {
+fn editable_pack_entry_count(target: &std::path::Path) -> usize {
     target
         .join(".git")
         .join("objects")
@@ -120,10 +120,9 @@ async fn global_config_defaults_and_cli_overrides() {
         std::fs::read_to_string(files_target.join("README.md")).unwrap(),
         "global config test\n"
     );
-    assert_eq!(
-        pack_entry_count(&files_target),
-        2,
-        "files-mode clone should only have skeleton pack + idx"
+    assert!(
+        !files_target.join(".git").exists(),
+        "files-mode clone should materialize only files, not a git repository"
     );
 
     // 2. Override mode and depth via CLI flags → editable full clone.
@@ -156,7 +155,7 @@ async fn global_config_defaults_and_cli_overrides() {
         "global config test\n"
     );
     assert!(
-        pack_entry_count(&editable_target) > 2,
+        editable_pack_entry_count(&editable_target) > 2,
         "editable clone should install additional blob packs beyond the skeleton"
     );
 }

@@ -12,6 +12,56 @@ fn read(dir: &Path, name: &str) -> String {
     std::fs::read_to_string(dir.join(name)).unwrap()
 }
 
+async fn wait_archive_ref(server: &Server, owner: &str, repo: &str) -> ripclone::RefInfo {
+    let root = server.repo_root.join(".ripclone-refs");
+    let mut last = String::from("<not read>");
+    for _ in 0..160 {
+        let mut files = Vec::new();
+        collect_json_files(&root, &mut files);
+        for path in files {
+            match std::fs::read(&path) {
+                Ok(data) => match serde_json::from_slice::<ripclone::RefInfo>(&data) {
+                    Ok(info)
+                        if !info.archive_chunks.is_empty() && !info.archive_frames.is_empty() =>
+                    {
+                        return info;
+                    }
+                    Ok(info) => {
+                        last = format!(
+                            "{}: archive_chunks={} archive_frames={} commit={}",
+                            path.display(),
+                            info.archive_chunks.len(),
+                            info.archive_frames.len(),
+                            info.commit
+                        );
+                    }
+                    Err(e) => last = format!("{} parse: {e}", path.display()),
+                },
+                Err(e) => last = format!("{} read: {e}", path.display()),
+            }
+        }
+        if last == "<not read>" {
+            last = format!("no ref json under {}", root.display());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    panic!("archive ref never became ready for {owner}/{repo} (last: {last})");
+}
+
+fn collect_json_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_json_files(&path, out);
+        } else if path.extension().and_then(|s| s.to_str()) == Some("json") {
+            out.push(path);
+        }
+    }
+}
+
 /// editable --depth 1: shallow, worktree correct, `.git/shallow` present,
 /// `git log`/status clean, history bounded to HEAD.
 #[tokio::test]
@@ -93,6 +143,86 @@ async fn files_mode_materializes_worktree() {
     let (_g, c) = sync_and_clone(&server, &origin, 0, CloneMode::Files).await;
     assert_eq!(read(&c, "only.txt"), "hello\n");
     assert_eq!(read(&c, "nested/x"), "y\n");
+    assert!(
+        !c.join(".git").exists(),
+        "files mode should materialize only files, not a git repository"
+    );
+}
+
+#[tokio::test]
+async fn files_mode_resync_works_after_remote_storage_evicted_local_archive_artifacts() {
+    init(false);
+    let server = start_server_split_storage().await;
+    let origin = make_origin("acme", "remotecontract");
+    let big = vec![b'a'; 17 * 1024 * 1024];
+
+    origin.commit_bytes(&[("big.bin", &big), ("tail.txt", b"one\n")], "c1");
+    origin.publish();
+    server
+        .client()
+        .sync_repo("acme/remotecontract", None)
+        .await
+        .expect("initial sync");
+    let (_g1, c1) = clone_files_when(&server, "acme", "remotecontract", "tail.txt", "one\n").await;
+    assert_eq!(
+        std::fs::metadata(c1.join("big.bin")).unwrap().len(),
+        big.len() as u64
+    );
+    assert!(
+        !c1.join(".git").exists(),
+        "files mode should not create .git before remote artifact eviction"
+    );
+
+    let info1 = wait_archive_ref(&server, "acme", "remotecontract").await;
+    assert!(
+        !info1.archive_chunks.is_empty(),
+        "files archive bundles should be published"
+    );
+    assert!(
+        !info1.archive_frames.is_empty(),
+        "per-frame reuse metadata should be persisted"
+    );
+    for hash in info1
+        .archive_chunks
+        .iter()
+        .chain(info1.archive_frames.iter().map(|f| &f.chunk_hash))
+    {
+        assert!(
+            !server.cas_path(hash).exists(),
+            "remote storage settlement should evict local CAS artifact {hash}"
+        );
+        assert!(
+            server.storage_path(hash).exists(),
+            "durable storage should retain artifact {hash}"
+        );
+    }
+
+    origin.commit_bytes(&[("big.bin", &big), ("tail.txt", b"two\n")], "c2");
+    origin.publish();
+    server
+        .client()
+        .sync_repo("acme/remotecontract", None)
+        .await
+        .expect("resync");
+    let (_g2, c2) = clone_files_when(&server, "acme", "remotecontract", "tail.txt", "two\n").await;
+    assert_eq!(
+        std::fs::metadata(c2.join("big.bin")).unwrap().len(),
+        big.len() as u64
+    );
+    assert!(
+        !c2.join(".git").exists(),
+        "files mode should not create .git after rebuilding from durable storage"
+    );
+
+    let info2 = wait_archive_ref(&server, "acme", "remotecontract").await;
+    assert_eq!(info2.commit, git(&origin.bare, &["rev-parse", "HEAD"]));
+    assert!(
+        info2.archive_frames.iter().any(|f| info1
+            .archive_frames
+            .iter()
+            .any(|p| p.chunk_hash == f.chunk_hash)),
+        "resync should reuse at least one prior archive frame from durable storage"
+    );
 }
 
 /// Re-sync after a new push must serve the NEW commit (regression test for the

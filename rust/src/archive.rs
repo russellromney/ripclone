@@ -117,6 +117,13 @@ pub struct ArchiveStats {
     pub compressed_bytes: u64,
 }
 
+pub struct ArchiveBuildOutput {
+    pub download_bundle_hashes: Vec<String>,
+    pub metadata: MetadataChunk,
+    pub new_reuse_frame_hashes: Vec<String>,
+    pub archive_frames: Vec<crate::ArchiveFrame>,
+}
+
 pub struct ArchiveBuilder {
     mirror: PathBuf,
 }
@@ -502,15 +509,12 @@ impl ArchiveBuilder {
         &self,
         commit: &str,
         cas: &Cas,
+        storage: Option<&crate::storage::StorageRef>,
         level: i32,
         dictionary: Option<&[u8]>,
         prev: &std::collections::HashMap<String, (String, u64)>,
-    ) -> Result<(
-        Vec<String>,
-        MetadataChunk,
-        Vec<String>,
-        Vec<crate::ArchiveFrame>,
-    )> {
+        bundle_size: u64,
+    ) -> Result<ArchiveBuildOutput> {
         if !self.mirror.exists() {
             anyhow::bail!("mirror not found: {}", self.mirror.display());
         }
@@ -575,7 +579,201 @@ impl ArchiveBuilder {
                 raw_len,
             });
         }
-        Ok((all_chunks, manifest, new_chunks, frames))
+        // Bundle per-frame chunks into larger download objects so the client makes
+        // fewer HTTP requests, while keeping per-frame chunks in storage for
+        // incremental reuse on the next sync.
+        let (bundle_hashes, bundled_frames) =
+            Self::bundle_archive_frames(cas, storage, bundle_size, &frames, &manifest.frames)?;
+        manifest.frames = bundled_frames;
+        Ok(ArchiveBuildOutput {
+            download_bundle_hashes: bundle_hashes,
+            metadata: manifest,
+            new_reuse_frame_hashes: new_chunks,
+            archive_frames: frames,
+        })
+    }
+
+    /// Group consecutive archive frames into download bundles of roughly
+    /// `target_size` compressed bytes. The per-frame chunks are kept in storage
+    /// for incremental reuse; this function only creates coarser download objects
+    /// and rewrites `FrameInfo` to point into them.
+    fn bundle_archive_frames(
+        cas: &Cas,
+        storage: Option<&crate::storage::StorageRef>,
+        target_size: u64,
+        frames: &[crate::ArchiveFrame],
+        frame_infos: &[FrameInfo],
+    ) -> Result<(Vec<String>, Vec<FrameInfo>)> {
+        if frames.len() != frame_infos.len() {
+            anyhow::bail!(
+                "archive frame count mismatch: frames={} frame_infos={}",
+                frames.len(),
+                frame_infos.len()
+            );
+        }
+        let target_size = target_size.max(1);
+        let assembly_start = std::time::Instant::now();
+        let mut assembled_bytes = 0u64;
+        let mut bundle_hashes = Vec::new();
+        let mut current = tempfile::Builder::new()
+            .prefix(".archive-bundle.")
+            .tempfile_in(cas.root())
+            .with_context(|| format!("create archive bundle temp in {}", cas.root().display()))?;
+        let mut current_len = 0u64;
+        let mut current_hasher = sha2::Sha256::new();
+        let mut bundled: Vec<FrameInfo> = Vec::with_capacity(frame_infos.len());
+        for (i, info) in frame_infos.iter().enumerate() {
+            let frame = frames
+                .get(i)
+                .ok_or_else(|| anyhow::anyhow!("missing archive frame {}", i))?;
+            let frame_len = frame.compressed_len;
+            if frame_len != info.compressed_len as u64 {
+                anyhow::bail!(
+                    "archive frame {} compressed length mismatch: frame={} manifest={}",
+                    i,
+                    frame.compressed_len,
+                    info.compressed_len
+                );
+            }
+            if current_len > 0 && current_len + frame_len > target_size {
+                bundle_hashes.push(Self::finish_bundle(cas, current, current_hasher)?);
+                current = tempfile::Builder::new()
+                    .prefix(".archive-bundle.")
+                    .tempfile_in(cas.root())
+                    .with_context(|| {
+                        format!("create archive bundle temp in {}", cas.root().display())
+                    })?;
+                current_len = 0;
+                current_hasher = sha2::Sha256::new();
+            }
+            let chunk_index = bundle_hashes.len() as u32;
+            let chunk_offset = current_len;
+            let written = Self::write_frame_chunk_to_bundle(
+                cas,
+                storage,
+                frame,
+                info,
+                current.as_file_mut(),
+                &mut current_hasher,
+            )
+            .with_context(|| format!("write archive frame {} to bundle", i))?;
+            current_len += written;
+            assembled_bytes += written;
+            bundled.push(FrameInfo {
+                chunk_index,
+                chunk_offset,
+                compressed_len: info.compressed_len,
+                raw_len: info.raw_len,
+            });
+            if current_len >= target_size {
+                bundle_hashes.push(Self::finish_bundle(cas, current, current_hasher)?);
+                current = tempfile::Builder::new()
+                    .prefix(".archive-bundle.")
+                    .tempfile_in(cas.root())
+                    .with_context(|| {
+                        format!("create archive bundle temp in {}", cas.root().display())
+                    })?;
+                current_len = 0;
+                current_hasher = sha2::Sha256::new();
+            }
+        }
+        if current_len > 0 {
+            bundle_hashes.push(Self::finish_bundle(cas, current, current_hasher)?);
+        }
+        crate::perf::record_archive_bundle_assembly(assembly_start.elapsed(), assembled_bytes);
+
+        Ok((bundle_hashes, bundled))
+    }
+
+    fn write_frame_chunk_to_bundle(
+        cas: &Cas,
+        storage: Option<&crate::storage::StorageRef>,
+        frame: &crate::ArchiveFrame,
+        info: &FrameInfo,
+        out: &mut File,
+        bundle_hasher: &mut sha2::Sha256,
+    ) -> Result<u64> {
+        let expected_len = frame.compressed_len;
+        if expected_len != info.compressed_len as u64 {
+            anyhow::bail!(
+                "archive frame compressed length mismatch: frame={} manifest={}",
+                frame.compressed_len,
+                info.compressed_len
+            );
+        }
+
+        if cas.has(&frame.chunk_hash) {
+            let written = cas.copy_to_writer_verified_with(&frame.chunk_hash, out, |chunk| {
+                bundle_hasher.update(chunk);
+            })?;
+            if written != expected_len {
+                anyhow::bail!(
+                    "archive frame {} compressed length mismatch: data={} expected={}",
+                    frame.chunk_hash,
+                    written,
+                    expected_len
+                );
+            }
+            return Ok(written);
+        }
+
+        let data = Self::read_frame_chunk(cas, storage, &frame.chunk_hash)?;
+        if data.len() as u64 != expected_len {
+            anyhow::bail!(
+                "archive frame {} compressed length mismatch: data={} expected={}",
+                frame.chunk_hash,
+                data.len(),
+                expected_len
+            );
+        }
+        out.write_all(&data).context("write archive bundle temp")?;
+        bundle_hasher.update(&data);
+        Ok(data.len() as u64)
+    }
+
+    fn read_frame_chunk(
+        cas: &Cas,
+        storage: Option<&crate::storage::StorageRef>,
+        hash: &str,
+    ) -> Result<Vec<u8>> {
+        match cas.get(hash) {
+            Ok(data) => Ok(data),
+            Err(local_err) => {
+                let Some(storage) = storage else {
+                    return Err(local_err).with_context(|| format!("read archive frame {}", hash));
+                };
+                let data = storage
+                    .get(hash)
+                    .with_context(|| format!("read archive frame {} from storage", hash))?;
+                let actual = crate::cas::hash(&data);
+                if actual != hash {
+                    anyhow::bail!(
+                        "archive frame {} from storage has hash mismatch: actual {}",
+                        hash,
+                        actual
+                    );
+                }
+                cas.put_with_hash(hash, &data)
+                    .with_context(|| format!("cache archive frame {} in CAS", hash))?;
+                Ok(data)
+            }
+        }
+    }
+
+    fn finish_bundle(
+        cas: &Cas,
+        bundle: tempfile::NamedTempFile,
+        hasher: sha2::Sha256,
+    ) -> Result<String> {
+        bundle
+            .as_file()
+            .sync_all()
+            .context("fsync archive bundle temp")?;
+        let hash = format!("{:x}", hasher.finalize());
+        let path = bundle.into_temp_path();
+        cas.install_hashed_file(&hash, &path)
+            .with_context(|| format!("install archive bundle {}", hash))?;
+        Ok(hash)
     }
 
     /// Like [`build_into_cas_incremental`], but reads only the changed region of
@@ -595,22 +793,29 @@ impl ArchiveBuilder {
         &self,
         commit: &str,
         cas: &Cas,
+        storage: Option<&crate::storage::StorageRef>,
         level: i32,
         dictionary: Option<&[u8]>,
         prev_frames: &[crate::ArchiveFrame],
         prev_files: &[FileEntry],
         prev_commit: &str,
-    ) -> Result<(
-        Vec<String>,
-        MetadataChunk,
-        Vec<String>,
-        Vec<crate::ArchiveFrame>,
-    )> {
+        bundle_size: u64,
+    ) -> Result<ArchiveBuildOutput> {
         let prev_map: std::collections::HashMap<String, (String, u64)> = prev_frames
             .iter()
             .map(|f| (f.raw_hash.clone(), (f.chunk_hash.clone(), f.compressed_len)))
             .collect();
-        let full = || self.build_into_cas_incremental(commit, cas, level, dictionary, &prev_map);
+        let full = || {
+            self.build_into_cas_incremental(
+                commit,
+                cas,
+                storage,
+                level,
+                dictionary,
+                &prev_map,
+                bundle_size,
+            )
+        };
 
         // Largest changed middle we'll read into memory; above this the full build
         // is both simpler and not much slower.
@@ -898,7 +1103,17 @@ impl ArchiveBuilder {
                 raw_len: f.raw_len as u32,
             });
         }
-        Ok((all_chunks, manifest, new_chunks, frames))
+        // Bundle per-frame chunks into larger download objects while keeping the
+        // fine-grained chunks in storage for incremental reuse on the next sync.
+        let (bundle_hashes, bundled_frames) =
+            Self::bundle_archive_frames(cas, storage, bundle_size, &frames, &manifest.frames)?;
+        manifest.frames = bundled_frames;
+        Ok(ArchiveBuildOutput {
+            download_bundle_hashes: bundle_hashes,
+            metadata: manifest,
+            new_reuse_frame_hashes: new_chunks,
+            archive_frames: frames,
+        })
     }
 }
 
@@ -1219,35 +1434,247 @@ mod tests {
         let big = pr(20 * 1024 * 1024, 1);
         let c1 = commit_onto_bytes(&repo, &[(b"a.bin", &big), (b"z.txt", b"hello")]);
         let empty: HashMap<String, (String, u64)> = HashMap::new();
-        let (all1, _m1, new1, frames1) = builder
-            .build_into_cas_incremental(&c1, &cas, 6, None, &empty)
+        let out1 = builder
+            .build_into_cas_incremental(
+                &c1,
+                &cas,
+                None,
+                6,
+                None,
+                &empty,
+                DEFAULT_ARCHIVE_CHUNK_SIZE,
+            )
             .unwrap();
-        assert_eq!(new1.len(), all1.len(), "first build: every frame built");
-        assert!(frames1.len() >= 2, "20 MiB should span multiple CDC frames");
+        assert_eq!(
+            out1.new_reuse_frame_hashes.len(),
+            out1.archive_frames.len(),
+            "first build: every frame built"
+        );
+        assert!(
+            out1.archive_frames.len() >= 2,
+            "20 MiB should span multiple CDC frames"
+        );
 
-        let prev: HashMap<String, (String, u64)> = frames1
+        let prev: HashMap<String, (String, u64)> = out1
+            .archive_frames
             .iter()
             .map(|f| (f.raw_hash.clone(), (f.chunk_hash.clone(), f.compressed_len)))
             .collect();
 
         // Same commit → full reuse.
-        let (_a, _m, new1b, _f) = builder
-            .build_into_cas_incremental(&c1, &cas, 6, None, &prev)
+        let out1b = builder
+            .build_into_cas_incremental(&c1, &cas, None, 6, None, &prev, DEFAULT_ARCHIVE_CHUNK_SIZE)
             .unwrap();
-        assert_eq!(new1b.len(), 0, "identical commit reuses all frames");
+        assert_eq!(
+            out1b.new_reuse_frame_hashes.len(),
+            0,
+            "identical commit reuses all frames"
+        );
 
         // Change only the trailing small file → only the last frame changes.
         let c2 = commit_onto_bytes(&repo, &[(b"a.bin", &big), (b"z.txt", b"changed!")]);
-        let (all2, _m2, new2, _f2) = builder
-            .build_into_cas_incremental(&c2, &cas, 6, None, &prev)
+        let out2 = builder
+            .build_into_cas_incremental(&c2, &cas, None, 6, None, &prev, DEFAULT_ARCHIVE_CHUNK_SIZE)
             .unwrap();
         assert!(
-            new2.len() < all2.len(),
+            out2.new_reuse_frame_hashes.len() < out2.archive_frames.len(),
             "re-sync reuses unchanged frames (built {} of {})",
-            new2.len(),
-            all2.len()
+            out2.new_reuse_frame_hashes.len(),
+            out2.archive_frames.len()
         );
-        assert!(!new2.is_empty(), "the changed frame is rebuilt");
+        assert!(
+            !out2.new_reuse_frame_hashes.is_empty(),
+            "the changed frame is rebuilt"
+        );
+    }
+
+    #[test]
+    fn bundled_archive_reuse_can_read_frames_from_storage_when_local_cas_is_cold() {
+        use std::collections::HashMap;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = crate::test_fixture::init_bare(tmp.path());
+        let cas_dir = tempfile::tempdir().unwrap();
+        let cas = Cas::new(cas_dir.path()).unwrap();
+        let storage_dir = tempfile::tempdir().unwrap();
+        let storage = crate::storage::local(storage_dir.path()).unwrap();
+        let builder = ArchiveBuilder::new(tmp.path());
+
+        let commit = commit_onto_bytes(
+            &repo,
+            &[
+                (b"a.txt", b"alpha"),
+                (b"b.txt", b"bravo"),
+                (b"c.txt", b"charlie"),
+            ],
+        );
+        let empty: HashMap<String, (String, u64)> = HashMap::new();
+        let first = builder
+            .build_into_cas_incremental(&commit, &cas, None, 3, None, &empty, 16)
+            .unwrap();
+
+        for frame in &first.archive_frames {
+            let data = cas.get(&frame.chunk_hash).unwrap();
+            storage.put(&frame.chunk_hash, &data).unwrap();
+            cas.remove(&frame.chunk_hash).unwrap();
+            assert!(
+                !cas.has(&frame.chunk_hash),
+                "test setup should remove local frame {}",
+                frame.chunk_hash
+            );
+        }
+
+        let prev: HashMap<String, (String, u64)> = first
+            .archive_frames
+            .iter()
+            .map(|f| (f.raw_hash.clone(), (f.chunk_hash.clone(), f.compressed_len)))
+            .collect();
+        let second = builder
+            .build_into_cas_incremental(&commit, &cas, Some(&storage), 3, None, &prev, 16)
+            .unwrap();
+
+        assert_eq!(
+            second.new_reuse_frame_hashes.len(),
+            0,
+            "identical commit should reuse every per-frame chunk"
+        );
+        assert_eq!(second.archive_frames.len(), first.archive_frames.len());
+        assert!(!second.download_bundle_hashes.is_empty());
+        for frame in &second.archive_frames {
+            assert!(
+                cas.has(&frame.chunk_hash),
+                "storage fallback should refill local CAS for {}",
+                frame.chunk_hash
+            );
+        }
+    }
+
+    #[test]
+    fn bundled_archive_rejects_corrupt_storage_frame_with_matching_length() {
+        let cas_dir = tempfile::tempdir().unwrap();
+        let cas = Cas::new(cas_dir.path()).unwrap();
+        let raw = b"correct frame bytes";
+        let compressed = compress_frame(raw, 3, None).unwrap();
+        let hash = crate::cas::hash(&compressed);
+        let corrupt = vec![compressed[0].wrapping_add(1); compressed.len()];
+        let storage: crate::storage::StorageRef = std::sync::Arc::new(CorruptFrameStorage {
+            hash: hash.clone(),
+            data: corrupt,
+        });
+
+        let frames = vec![crate::ArchiveFrame {
+            raw_hash: crate::cas::hash(raw),
+            chunk_hash: hash.clone(),
+            compressed_len: compressed.len() as u64,
+            raw_len: raw.len() as u64,
+        }];
+        let frame_infos = vec![FrameInfo {
+            chunk_index: 0,
+            chunk_offset: 0,
+            compressed_len: compressed.len() as u32,
+            raw_len: raw.len() as u32,
+        }];
+
+        let err = ArchiveBuilder::bundle_archive_frames(
+            &cas,
+            Some(&storage),
+            DEFAULT_ARCHIVE_CHUNK_SIZE,
+            &frames,
+            &frame_infos,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("hash mismatch"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn bundled_archive_frame_table_slices_multiple_download_bundles() {
+        let cas_dir = tempfile::tempdir().unwrap();
+        let cas = Cas::new(cas_dir.path()).unwrap();
+        let raws = [
+            b"alpha alpha alpha".to_vec(),
+            b"bravo bravo bravo".to_vec(),
+            b"charlie charlie charlie".to_vec(),
+            b"delta delta delta".to_vec(),
+        ];
+        let mut frames = Vec::new();
+        let mut frame_infos = Vec::new();
+        for (idx, raw) in raws.iter().enumerate() {
+            let compressed = compress_frame(raw, 3, None).unwrap();
+            let hash = cas.put(&compressed).unwrap();
+            frames.push(crate::ArchiveFrame {
+                raw_hash: crate::cas::hash(raw),
+                chunk_hash: hash,
+                compressed_len: compressed.len() as u64,
+                raw_len: raw.len() as u64,
+            });
+            frame_infos.push(FrameInfo {
+                chunk_index: idx as u32,
+                chunk_offset: 0,
+                compressed_len: compressed.len() as u32,
+                raw_len: raw.len() as u32,
+            });
+        }
+
+        let target = frames[0].compressed_len + frames[1].compressed_len / 2;
+        let (bundle_hashes, bundled_frames) =
+            ArchiveBuilder::bundle_archive_frames(&cas, None, target, &frames, &frame_infos)
+                .unwrap();
+        let mut metadata = MetadataChunk::new();
+        metadata.frames = bundled_frames.clone();
+        let lengths = crate::clonepack::archive_chunk_lengths(&metadata);
+
+        assert!(
+            bundle_hashes.len() > 1,
+            "test must exercise multiple download bundles"
+        );
+        assert_eq!(lengths.len(), bundle_hashes.len());
+        for (idx, info) in bundled_frames.iter().enumerate() {
+            let bundle = cas.get(&bundle_hashes[info.chunk_index as usize]).unwrap();
+            let start = info.chunk_offset as usize;
+            let end = start + info.compressed_len as usize;
+            assert!(end <= bundle.len(), "frame {idx} outside bundle bounds");
+            let decoded = zstd::decode_all(&bundle[start..end]).unwrap();
+            assert_eq!(decoded, raws[idx], "frame {idx} decoded from bundle slice");
+        }
+    }
+
+    struct CorruptFrameStorage {
+        hash: String,
+        data: Vec<u8>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::storage::StorageBackend for CorruptFrameStorage {
+        fn get(&self, hash: &str) -> Result<Vec<u8>> {
+            if hash == self.hash {
+                Ok(self.data.clone())
+            } else {
+                anyhow::bail!("not found")
+            }
+        }
+
+        fn get_range(&self, _hash: &str, _start: u64, _len: u64) -> Result<Vec<u8>> {
+            anyhow::bail!("unsupported")
+        }
+
+        fn put(&self, _hash: &str, _data: &[u8]) -> Result<()> {
+            anyhow::bail!("unsupported")
+        }
+
+        fn size(&self, _hash: &str) -> Result<u64> {
+            anyhow::bail!("unsupported")
+        }
+
+        fn delete(&self, _hash: &str) -> Result<()> {
+            anyhow::bail!("unsupported")
+        }
+
+        fn list_hashes(&self) -> Result<Vec<crate::storage::HashEntry>> {
+            Ok(Vec::new())
+        }
     }
 
     fn commit_files(files: &[(&str, &[u8])]) -> (tempfile::TempDir, String) {
@@ -1341,9 +1768,19 @@ mod tests {
 
         let c1 = commit_onto(&repo, &as_refs(files1));
         let empty: HashMap<String, (String, u64)> = HashMap::new();
-        let (_c, c1_meta, _n, c1_frames) = builder
-            .build_into_cas_incremental(&c1, &cas, 3, None, &empty)
+        let c1_out = builder
+            .build_into_cas_incremental(
+                &c1,
+                &cas,
+                None,
+                3,
+                None,
+                &empty,
+                DEFAULT_ARCHIVE_CHUNK_SIZE,
+            )
             .unwrap();
+        let c1_meta = c1_out.metadata;
+        let c1_frames = c1_out.archive_frames;
         assert!(c1_frames.len() > 3, "need several frames to exercise reuse");
 
         let c2 = commit_onto(&repo, &as_refs(files2));
@@ -1351,14 +1788,35 @@ mod tests {
             .iter()
             .map(|f| (f.raw_hash.clone(), (f.chunk_hash.clone(), f.compressed_len)))
             .collect();
-        let (inc_chunks, inc_meta, _in, inc_frames) = builder
-            .build_into_cas_incremental(&c2, &cas, 3, None, &prev_map)
+        let inc = builder
+            .build_into_cas_incremental(
+                &c2,
+                &cas,
+                None,
+                3,
+                None,
+                &prev_map,
+                DEFAULT_ARCHIVE_CHUNK_SIZE,
+            )
             .unwrap();
-        let (bnd_chunks, bnd_meta, _bn, bnd_frames) = builder
-            .build_into_cas_bounded(&c2, &cas, 3, None, &c1_frames, &c1_meta.files, &c1)
+        let bnd = builder
+            .build_into_cas_bounded(
+                &c2,
+                &cas,
+                None,
+                3,
+                None,
+                &c1_frames,
+                &c1_meta.files,
+                &c1,
+                DEFAULT_ARCHIVE_CHUNK_SIZE,
+            )
             .unwrap();
 
-        assert_eq!(inc_chunks, bnd_chunks, "per-frame chunk hashes differ");
+        assert_eq!(
+            inc.download_bundle_hashes, bnd.download_bundle_hashes,
+            "download bundle hashes differ"
+        );
         let fr = |fs: &[crate::ArchiveFrame]| {
             fs.iter()
                 .map(|f| {
@@ -1371,7 +1829,11 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
         };
-        assert_eq!(fr(&inc_frames), fr(&bnd_frames), "frame tables differ");
+        assert_eq!(
+            fr(&inc.archive_frames),
+            fr(&bnd.archive_frames),
+            "frame tables differ"
+        );
         let fl = |m: &MetadataChunk| {
             m.files
                 .iter()
@@ -1388,7 +1850,7 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
         };
-        assert_eq!(fl(&inc_meta), fl(&bnd_meta), "files tables differ");
+        assert_eq!(fl(&inc.metadata), fl(&bnd.metadata), "files tables differ");
     }
 
     /// The bounded archive (read only the changed middle) must be byte-identical to
