@@ -11,12 +11,14 @@ mod common;
 
 use anyhow::{Context, Result};
 use common::*;
+use ripclone::provider::RepoId;
 use ripclone::ref_store::{CachingRefStore, RefStore, S3RefStore};
 use ripclone::remote_gc::{GcConfig, RemoteGc};
 use ripclone::server::run_server;
 use ripclone::storage::{S3Storage, StorageBackend};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::sleep;
 
@@ -29,6 +31,7 @@ struct S3Env {
 
 /// Serializes server startup and env-var mutation across tests in this binary.
 static SERVER_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static PREFIX_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn s3_env() -> Option<S3Env> {
     let endpoint = std::env::var("RIPCLONE_S3_ENDPOINT")
@@ -61,7 +64,8 @@ fn unique_prefix() -> String {
         .unwrap()
         .as_nanos();
     let pid = std::process::id();
-    format!("e2e-remote-gc/{ns}-{pid}/")
+    let seq = PREFIX_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("e2e-remote-gc/{ns}-{pid}-{seq}/")
 }
 
 fn repo_suffix(prefix: &str) -> String {
@@ -122,7 +126,8 @@ async fn start_s3_server(env: &S3Env, prefix: &str) -> Server {
 
     Server {
         url: format!("http://127.0.0.1:{port}"),
-        cas_dir,
+        cas_dir: cas_dir.clone(),
+        storage_dir: cas_dir,
         repo_root,
         _dir: dir,
     }
@@ -302,42 +307,13 @@ fn sha256_hex(data: &[u8]) -> String {
     format!("{:x}", Sha256::digest(data))
 }
 
-fn first_reachable_hash(info: &ripclone::RefInfo) -> Option<&str> {
-    for h in [
-        &info.clonepack_manifest,
-        &info.full_clonepack.manifest,
-        &info.shallow_clonepack.manifest,
-        &info.metadata_chunk,
-    ] {
-        if !h.is_empty() {
-            return Some(h.as_str());
-        }
-    }
-    for h in &info.archive_chunks {
-        if !h.is_empty() {
-            return Some(h.as_str());
-        }
-    }
-    for level in &info.history_levels {
-        for pack in &level.packs {
-            if !pack.pack.is_empty() {
-                return Some(&pack.pack);
-            }
-            if !pack.idx.is_empty() {
-                return Some(&pack.idx);
-            }
-        }
-    }
-    None
-}
-
 async fn get_status(
     server: &Server,
     owner: &str,
     repo: &str,
     query: Option<&str>,
 ) -> serde_json::Value {
-    let mut url = format!("{}/v1/repos/{owner}/{repo}/status", server.url);
+    let mut url = format!("{}/v1/repos/github/{owner}/{repo}/status", server.url);
     if let Some(q) = query {
         url.push('?');
         url.push_str(q);
@@ -385,10 +361,28 @@ async fn remote_gc_deletes_orphans_on_s3() {
         .await
         .expect("sync");
 
-    // Age the reachable objects relative to the orphan we are about to inject.
+    let storage = make_s3_storage(&env, &prefix).expect("storage");
+    let ref_store = make_s3_ref_store(storage.clone());
+    let reachable_data = b"i-am-reachable";
+    let reachable_hash = sha256_hex(reachable_data);
+    storage
+        .put(&reachable_hash, reachable_data)
+        .expect("put reachable");
+    let reachable_repo = RepoId::github(format!("acme/{repo}-gc-reachable"));
+    let reachable_info = ripclone::RefInfo {
+        commit: "reachable".to_string(),
+        default_branch: "HEAD".to_string(),
+        metadata_chunk: reachable_hash.clone(),
+        ..Default::default()
+    };
+    ref_store
+        .save(&reachable_repo, &reachable_info)
+        .await
+        .expect("save reachable ref");
+
+    // Age the reachable object relative to the orphan we are about to inject.
     sleep(Duration::from_secs(2)).await;
 
-    let storage = make_s3_storage(&env, &prefix).expect("storage");
     let orphan_data = b"i-am-an-orphan";
     let orphan_hash = sha256_hex(orphan_data);
     storage.put(&orphan_hash, orphan_data).expect("put orphan");
@@ -396,7 +390,6 @@ async fn remote_gc_deletes_orphans_on_s3() {
     // Make sure the orphan is older than the grace period we will use.
     sleep(Duration::from_secs(2)).await;
 
-    let ref_store = make_s3_ref_store(storage.clone());
     let gc = RemoteGc::new(
         storage.clone(),
         ref_store,
@@ -437,16 +430,8 @@ async fn remote_gc_deletes_orphans_on_s3() {
         "orphan should have been deleted"
     );
 
-    // At least one reachable object survived.
-    let info = storage
-        .get_object(&format!("refs/acme/{repo}.json"))
-        .await
-        .expect("load ref json")
-        .expect("ref json exists");
-    let info: ripclone::RefInfo = serde_json::from_slice(&info.1).expect("parse ref info");
-    let reachable_hash = first_reachable_hash(&info).expect("at least one reachable hash");
     assert!(
-        storage.size(reachable_hash).is_ok(),
+        storage.size(&reachable_hash).is_ok(),
         "reachable object should survive GC"
     );
 

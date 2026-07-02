@@ -53,17 +53,6 @@ async fn run_ripclone(
     .expect("subprocess panicked")
 }
 
-fn pack_entry_count(target: &std::path::Path) -> usize {
-    target
-        .join(".git")
-        .join("objects")
-        .join("pack")
-        .read_dir()
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .count()
-}
-
 #[tokio::test]
 async fn provider_add_then_config_driven_clone() {
     setup(false);
@@ -148,9 +137,8 @@ async fn provider_add_then_config_driven_clone() {
     let target = project.path().join("clone");
     let readme = std::fs::read_to_string(target.join("README.md")).unwrap();
     assert_eq!(readme, "provider add workflow\n");
-    assert_eq!(
-        pack_entry_count(&target),
-        2,
-        "files-mode clone should only have skeleton pack + idx"
+    assert!(
+        !target.join(".git").exists(),
+        "files-mode clone should materialize only files, not a git repository"
     );
 }

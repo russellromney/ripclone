@@ -2,9 +2,13 @@
 name = "ripclone"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 description = "CAS-based git clone helper: fast clones served by a content-addressed backend"
 repository = "https://github.com/russellromney/ripclone"
+readme = "README.md"
+keywords = ["git", "clone", "cas", "ci", "object-storage"]
+categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]
 name = "ripclone"

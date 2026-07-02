@@ -117,21 +117,8 @@ async fn project_config_drives_clone_mode_and_default_provider() {
     let readme = std::fs::read_to_string(target.join("README.md")).unwrap();
     assert_eq!(readme, "hello from config-driven clone\n");
 
-    // In files mode the client only downloads archive chunks, so the skeleton
-    // pack directory should contain exactly the skeleton pack + idx written by
-    // the installer. Editable mode would add additional blob packs here.
-    let pack_dir = target.join(".git").join("objects").join("pack");
-    let pack_entries: Vec<_> = std::fs::read_dir(&pack_dir)
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .collect();
-    assert_eq!(
-        pack_entries.len(),
-        2,
-        "files-mode clone should only have the skeleton pack + idx, got {:?}",
-        pack_entries
-            .iter()
-            .map(|e| e.file_name())
-            .collect::<Vec<_>>()
+    assert!(
+        !target.join(".git").exists(),
+        "files-mode clone should materialize only files, not a git repository"
     );
 }

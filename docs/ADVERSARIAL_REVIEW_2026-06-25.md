@@ -1,5 +1,9 @@
 # Adversarial Review — ripclone (origin/main, 2026-06-25)
 
+> Historical review artifact. Some findings may be resolved or superseded; use
+> current CI, docs, and issue tracking as the source of truth before treating a
+> finding as open.
+
 **Scope:** Rust source under `rust/src/`, reviewed at `origin/main` (`e6991f1`) in a fresh detached worktree (`/private/tmp/turbogit-adv-review`).
 **Method:** The adversarial-review playbook (`intent/.intent/review/adversarial-review-playbook.md`) plus the Rust addendum (`rust-addendum.md`). Eight parallel track-specific reviews, then a second-pass verification of the highest-severity convergent findings against the actual code.
 **Goal:** Real bugs at boundaries — lifecycle law, failure/crash paths, cross-process races, capacity semantics — not style.

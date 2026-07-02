@@ -1,4 +1,5 @@
 use crate::git;
+use crate::worktree_writer::FileSlice;
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, bounded};
 use flate2::Compression;
@@ -242,6 +243,11 @@ pub enum BlobPackInput {
     },
     /// An already-assembled blob owned by the caller.
     Owned { sha1: [u8; 20], content: Vec<u8> },
+    /// A blob split across decompressed archive frames.
+    Fragments {
+        sha1: [u8; 20],
+        fragments: Vec<FileSlice>,
+    },
 }
 
 impl BlobPackInput {
@@ -249,6 +255,7 @@ impl BlobPackInput {
         match self {
             BlobPackInput::FrameSlice { sha1, .. } => sha1,
             BlobPackInput::Owned { sha1, .. } => sha1,
+            BlobPackInput::Fragments { sha1, .. } => sha1,
         }
     }
 
@@ -258,11 +265,28 @@ impl BlobPackInput {
                 frame, offset, len, ..
             } => &frame[*offset..*offset + *len],
             BlobPackInput::Owned { content, .. } => content,
+            BlobPackInput::Fragments { .. } => {
+                panic!("fragmented blob content is not contiguous")
+            }
         }
     }
 
     fn content_len(&self) -> usize {
-        self.content().len()
+        match self {
+            BlobPackInput::FrameSlice { len, .. } => *len,
+            BlobPackInput::Owned { content, .. } => content.len(),
+            BlobPackInput::Fragments { fragments, .. } => fragments.iter().map(|f| f.len).sum(),
+        }
+    }
+
+    fn compress(&self) -> Result<Vec<u8>> {
+        match self {
+            BlobPackInput::FrameSlice {
+                frame, offset, len, ..
+            } => compress_blob(&frame[*offset..*offset + *len]),
+            BlobPackInput::Owned { content, .. } => compress_blob(content),
+            BlobPackInput::Fragments { fragments, .. } => compress_blob_fragments(fragments),
+        }
     }
 }
 
@@ -329,9 +353,9 @@ pub fn spawn_blob_pack_builder<P: AsRef<Path>>(
                 if !is_new {
                     continue;
                 }
-                let content = input.content();
-                let len = content.len();
-                let res = compress_blob(content)
+                let len = input.content_len();
+                let res = input
+                    .compress()
                     .with_context(|| format!("compress blob of {} bytes", len))
                     .map(|compressed| (len, compressed));
                 if compressed_tx.send(res).is_err() {
@@ -413,6 +437,20 @@ fn compress_blob(content: &[u8]) -> Result<Vec<u8>> {
     encoder
         .write_all(content)
         .context("compress blob content")?;
+    encoder.finish().context("finish blob compression")
+}
+
+fn compress_blob_fragments(fragments: &[FileSlice]) -> Result<Vec<u8>> {
+    let level = std::env::var("RIPCLONE_BLOB_PACK_COMPRESSION_LEVEL")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3);
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::new(level.min(9)));
+    for fragment in fragments {
+        encoder
+            .write_all(&fragment.data[fragment.offset..fragment.offset + fragment.len])
+            .context("compress blob fragment")?;
+    }
     encoder.finish().context("finish blob compression")
 }
 

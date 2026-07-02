@@ -33,6 +33,32 @@ pub trait StorageBackend: Send + Sync {
         self.put(hash, data)
     }
 
+    /// Store an existing file by hash. Backends that support file or stream
+    /// upload should override this; the default keeps compatibility for small
+    /// metadata-style callers and uncommon test backends.
+    async fn put_file_async(&self, hash: &str, path: &Path) -> Result<()> {
+        let expected_hash = hash.to_string();
+        let verify_path = path.to_path_buf();
+        let (actual_hash, _len) = tokio::task::spawn_blocking(move || {
+            crate::cas::hash_file(&verify_path)
+                .with_context(|| format!("hash {} before storage upload", verify_path.display()))
+        })
+        .await
+        .context("storage put_file hash task")??;
+        if actual_hash != expected_hash {
+            anyhow::bail!(
+                "storage upload source {} hash mismatch: expected {}, actual {}",
+                path.display(),
+                expected_hash,
+                actual_hash
+            );
+        }
+        let data = tokio::fs::read(path)
+            .await
+            .with_context(|| format!("read file {} for storage upload", path.display()))?;
+        self.put_async(hash, &data).await
+    }
+
     /// Read a named, non-content-addressed metadata blob — small durable
     /// bookkeeping such as the GC orphan ledger. Returns `None` when the key
     /// does not exist. Defaults to unsupported; durable backends override it.
@@ -153,6 +179,16 @@ impl StorageBackend for LocalStorage {
 
     fn put(&self, hash: &str, data: &[u8]) -> Result<()> {
         self.cas.put_with_hash(hash, data)
+    }
+
+    async fn put_file_async(&self, hash: &str, path: &Path) -> Result<()> {
+        let cas = self.cas.clone();
+        let hash = hash.to_string();
+        let path = path.to_path_buf();
+        tokio::task::spawn_blocking(move || cas.put_file_with_hash(&hash, &path))
+            .await
+            .context("local storage put_file task")??;
+        Ok(())
     }
 
     async fn get_meta(&self, key: &str) -> Result<Option<Vec<u8>>> {
@@ -278,6 +314,43 @@ pub fn local<P: AsRef<Path>>(root: P) -> Result<StorageRef> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct RecordingStorage {
+        puts: Mutex<Vec<(String, Vec<u8>)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl StorageBackend for RecordingStorage {
+        fn get(&self, _hash: &str) -> Result<Vec<u8>> {
+            anyhow::bail!("unsupported")
+        }
+
+        fn get_range(&self, _hash: &str, _start: u64, _len: u64) -> Result<Vec<u8>> {
+            anyhow::bail!("unsupported")
+        }
+
+        fn put(&self, hash: &str, data: &[u8]) -> Result<()> {
+            self.puts
+                .lock()
+                .unwrap()
+                .push((hash.to_string(), data.to_vec()));
+            Ok(())
+        }
+
+        fn size(&self, _hash: &str) -> Result<u64> {
+            anyhow::bail!("unsupported")
+        }
+
+        fn delete(&self, _hash: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn list_hashes(&self) -> Result<Vec<HashEntry>> {
+            Ok(Vec::new())
+        }
+    }
 
     #[test]
     fn meta_path_rejects_traversal_and_absolute() {
@@ -317,5 +390,71 @@ mod tests {
         );
         // The metadata object is not surfaced as a content-addressed hash.
         assert!(s.list_hashes().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn put_file_async_rejects_source_hash_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = LocalStorage::new(tmp.path()).unwrap();
+        let source = tmp.path().join("source.bin");
+        std::fs::write(&source, b"wrong bytes").unwrap();
+        let expected = crate::cas::hash(b"right bytes");
+
+        let err = s.put_file_async(&expected, &source).await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("hash mismatch"),
+            "unexpected error: {err:#}"
+        );
+        assert!(
+            !s.cas().path(&expected).exists(),
+            "mismatched file upload must not publish a final object"
+        );
+    }
+
+    #[tokio::test]
+    async fn put_file_async_repairs_existing_corrupt_object() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = LocalStorage::new(tmp.path()).unwrap();
+        let source = tmp.path().join("source.bin");
+        std::fs::write(&source, b"correct bytes").unwrap();
+        let expected = crate::cas::hash(b"correct bytes");
+        let object_path = s.cas().path(&expected);
+        std::fs::create_dir_all(object_path.parent().unwrap()).unwrap();
+        std::fs::write(&object_path, b"corrupt bytes").unwrap();
+
+        s.put_file_async(&expected, &source).await.unwrap();
+        assert_eq!(std::fs::read(&source).unwrap(), b"correct bytes");
+        assert_eq!(std::fs::read(&object_path).unwrap(), b"correct bytes");
+    }
+
+    #[tokio::test]
+    async fn default_put_file_async_rejects_source_hash_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source.bin");
+        std::fs::write(&source, b"wrong bytes").unwrap();
+        let s = RecordingStorage::default();
+        let expected = crate::cas::hash(b"right bytes");
+
+        let err = s.put_file_async(&expected, &source).await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("hash mismatch"),
+            "unexpected error: {err:#}"
+        );
+        assert!(s.puts.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn default_put_file_async_uploads_matching_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source.bin");
+        std::fs::write(&source, b"correct bytes").unwrap();
+        let s = RecordingStorage::default();
+        let expected = crate::cas::hash(b"correct bytes");
+
+        s.put_file_async(&expected, &source).await.unwrap();
+        assert_eq!(
+            *s.puts.lock().unwrap(),
+            vec![(expected, b"correct bytes".to_vec())]
+        );
     }
 }

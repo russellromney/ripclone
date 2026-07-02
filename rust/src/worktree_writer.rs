@@ -1,6 +1,7 @@
 use crate::manifest::FileEntry;
 use anyhow::{Context, Result};
 use filetime::{FileTime, set_file_mtime, set_symlink_file_times};
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
@@ -188,6 +189,13 @@ pub struct OwnedFileWrite {
     pub content: FileWriteContent,
 }
 
+#[derive(Clone)]
+pub struct FileSlice {
+    pub data: Arc<Vec<u8>>,
+    pub offset: usize,
+    pub len: usize,
+}
+
 pub enum FileWriteContent {
     Owned(Vec<u8>),
     Shared {
@@ -195,6 +203,7 @@ pub enum FileWriteContent {
         offset: usize,
         len: usize,
     },
+    Fragments(Vec<FileSlice>),
 }
 
 pub struct WriteOutcome {
@@ -211,6 +220,33 @@ impl FileWriteContent {
         match self {
             Self::Owned(content) => content.as_slice(),
             Self::Shared { data, offset, len } => &data[*offset..*offset + *len],
+            Self::Fragments(_) => {
+                panic!("fragmented file content is not contiguous")
+            }
+        }
+    }
+
+    fn as_contiguous_slice(&self) -> Option<&[u8]> {
+        match self {
+            Self::Owned(content) => Some(content.as_slice()),
+            Self::Shared { data, offset, len } => Some(&data[*offset..*offset + *len]),
+            Self::Fragments(_) => None,
+        }
+    }
+
+    fn bytes_cow(&self) -> Cow<'_, [u8]> {
+        match self {
+            Self::Owned(content) => Cow::Borrowed(content.as_slice()),
+            Self::Shared { data, offset, len } => Cow::Borrowed(&data[*offset..*offset + *len]),
+            Self::Fragments(fragments) => {
+                let mut bytes = Vec::with_capacity(fragments.iter().map(|f| f.len).sum());
+                for fragment in fragments {
+                    bytes.extend_from_slice(
+                        &fragment.data[fragment.offset..fragment.offset + fragment.len],
+                    );
+                }
+                Cow::Owned(bytes)
+            }
         }
     }
 
@@ -218,11 +254,33 @@ impl FileWriteContent {
         match self {
             Self::Owned(content) => content.len(),
             Self::Shared { len, .. } => *len,
+            Self::Fragments(fragments) => fragments.iter().map(|f| f.len).sum(),
         }
     }
 
     fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    fn is_fragmented(&self) -> bool {
+        matches!(self, Self::Fragments(_))
+    }
+
+    fn write_all_to(&self, file: &mut std::fs::File) -> Result<()> {
+        use std::io::Write;
+        match self {
+            Self::Owned(content) => file.write_all(content).context("write file content"),
+            Self::Shared { data, offset, len } => file
+                .write_all(&data[*offset..*offset + *len])
+                .context("write shared file content"),
+            Self::Fragments(fragments) => {
+                for fragment in fragments {
+                    file.write_all(&fragment.data[fragment.offset..fragment.offset + fragment.len])
+                        .context("write fragmented file content")?;
+                }
+                Ok(())
+            }
+        }
     }
 }
 
@@ -234,7 +292,7 @@ impl From<Vec<u8>> for FileWriteContent {
 
 struct PreparedRegularWrite {
     target: PathBuf,
-    index_path: String,
+    index_path: Vec<u8>,
     mode: u32,
     content: FileWriteContent,
 }
@@ -648,7 +706,7 @@ impl WorktreeWriter {
 
 #[cfg(target_os = "linux")]
 fn should_use_posix_for_io_uring_batch(writes: &[PreparedRegularWrite]) -> bool {
-    writes.len() < IO_URING_MIN_BATCH_FILES
+    writes.len() < IO_URING_MIN_BATCH_FILES || writes.iter().any(|w| w.content.is_fragmented())
 }
 
 fn prepare_owned_entries(
@@ -683,7 +741,8 @@ fn prepare_owned_entries(
 
         match write.entry.mode {
             0o120000 => {
-                write_symlink_entry(&target, write.content.as_slice())?;
+                let content = write.content.bytes_cow();
+                write_symlink_entry(&target, content.as_ref())?;
                 written += 1;
             }
             0o100755 | 0o100644 => {
@@ -697,7 +756,7 @@ fn prepare_owned_entries(
                 };
                 regulars.push(PreparedRegularWrite {
                     target,
-                    index_path: String::from_utf8_lossy(&write.entry.path).into_owned(),
+                    index_path: write.entry.path,
                     mode,
                     content: write.content,
                 });
@@ -735,7 +794,7 @@ fn write_regular_batch_posix(
 ) -> Result<Vec<crate::git::MaterializedPathStat>> {
     let mut stats = Vec::new();
     for write in writes {
-        let metadata = write_regular_posix(&write.target, write.mode, write.content.as_slice())?;
+        let metadata = write_regular_posix_content(&write.target, write.mode, &write.content)?;
         if collect_stats {
             stats.push(crate::git::materialized_path_stat_from_metadata(
                 write.index_path.clone(),
@@ -744,6 +803,41 @@ fn write_regular_batch_posix(
         }
     }
     Ok(stats)
+}
+
+fn write_regular_posix_content(
+    target: &Path,
+    mode: u32,
+    content: &FileWriteContent,
+) -> Result<std::fs::Metadata> {
+    if target.exists() {
+        std::fs::remove_file(target).ok();
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true)
+            .create(true)
+            .truncate(true)
+            .mode(mode)
+            .custom_flags(libc::O_NOFOLLOW);
+        let mut file = opts
+            .open(target)
+            .with_context(|| format!("open {}", target.display()))?;
+        content.write_all_to(&mut file)?;
+        file.metadata()
+            .with_context(|| format!("stat {}", target.display()))
+    }
+    #[cfg(not(unix))]
+    {
+        let mut file =
+            std::fs::File::create(target).with_context(|| format!("write {}", target.display()))?;
+        content.write_all_to(&mut file)?;
+        std::fs::metadata(target).with_context(|| format!("stat {}", target.display()))
+    }
 }
 
 fn write_symlink_entry(target: &Path, content: &[u8]) -> Result<()> {
@@ -879,7 +973,7 @@ mod linux_uring {
 
     struct InFlightWrite {
         target: PathBuf,
-        index_path: String,
+        index_path: Vec<u8>,
         path: CString,
         flags: i32,
         mode: libc::mode_t,
@@ -975,7 +1069,7 @@ mod linux_uring {
                     .write_regular_batch(
                         vec![PreparedRegularWrite {
                             target: target.to_path_buf(),
-                            index_path: target.to_string_lossy().into_owned(),
+                            index_path: target.to_string_lossy().as_bytes().to_vec(),
                             mode,
                             content: content.into(),
                         }],

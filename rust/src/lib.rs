@@ -7,6 +7,13 @@
     deprecated
 )]
 
+//! Library support for the `ripclone` binaries.
+//!
+//! The stable surface is intentionally small while the crate is pre-1.0:
+//! client configuration, manifest types, storage backends, and server entry
+//! points used by the bundled binaries. Modules marked `doc(hidden)` are public
+//! for in-repo binaries and integration tests, not a stability promise.
+
 /// Wire-protocol version negotiated between the CLI and the server. Bump this
 /// only on a breaking change to the client/server protocol — independent of the
 /// crate version, so the two binaries can be released on their own cadence as
@@ -15,41 +22,60 @@
 pub const PROTOCOL_VERSION: u32 = 1;
 
 pub mod archive;
+#[doc(hidden)]
 pub mod auth;
 pub mod backends;
+#[doc(hidden)]
 pub mod bench;
+#[doc(hidden)]
 pub mod blob_pack;
 pub mod cas;
 pub mod client;
+#[doc(hidden)]
 pub mod clone_metrics;
 pub mod clonepack;
 pub mod config;
+#[doc(hidden)]
 pub mod extract;
+#[doc(hidden)]
 pub mod git;
+#[doc(hidden)]
 pub mod gix_util;
 pub mod manifest;
+#[doc(hidden)]
 pub mod meta;
+#[doc(hidden)]
 pub mod metrics;
 pub mod mode;
+#[doc(hidden)]
 pub mod oidc;
+#[doc(hidden)]
 pub mod overlay;
 pub mod pack;
+pub mod perf;
 pub mod provider;
 pub mod provider_config;
+#[doc(hidden)]
 pub mod queue;
 pub mod ref_store;
 pub mod remote_gc;
 pub mod repo_config;
+#[doc(hidden)]
 pub mod retention;
 pub mod server;
+#[doc(hidden)]
 pub mod sidecar;
+#[doc(hidden)]
 pub mod snapshot;
 pub mod storage;
 
 #[cfg(test)]
 pub mod test_fixture;
+#[doc(hidden)]
 pub mod validation;
+#[doc(hidden)]
 pub mod webhook;
+#[doc(hidden)]
 pub mod worktree_writer;
 
 use anyhow::Result;
@@ -223,6 +249,10 @@ pub struct RefInfo {
     /// Optional build status used by the async /v1/build worker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_status: Option<String>,
+    /// Wall-clock milliseconds for the most recent full build, populated once
+    /// full-history/files artifacts finish and surfaced by `/status`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_ms: Option<u64>,
     /// Unix timestamp (seconds) when this ref was last synced. Legacy ordering
     /// signal, kept as a fallback for refs (or repos) without a `generation`.
     #[serde(default, skip_serializing_if = "Option::is_none")]

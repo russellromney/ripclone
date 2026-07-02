@@ -406,9 +406,11 @@ impl S3RefStore {
     /// "newer never loses" instead of last-writer-wins.
     async fn save_keyed(&self, key: &str, info: &RefInfo) -> Result<()> {
         let data = serde_json::to_vec_pretty(info).context("serialize RefInfo")?;
-        // Bounded so a pathological hot key can't spin forever; in practice one
-        // or two reads settle it.
-        for _ in 0..8 {
+        // Bounded so a pathological hot key can't spin forever. Real S3-backed
+        // metadata can see bursts of concurrent first writers, so allow enough
+        // conflicts for every contender in the adversarial ordering test to
+        // observe the winning ref and stand down.
+        for attempt in 0..64 {
             let if_match = match self.storage.get_object(key).await {
                 Ok(Some((etag, existing_bytes))) => {
                     let existing: RefInfo = serde_json::from_slice(&existing_bytes)
@@ -437,6 +439,7 @@ impl S3RefStore {
                 return Ok(());
             }
             // Lost the CAS race against a concurrent writer; re-read and retry.
+            tokio::time::sleep(Duration::from_millis((attempt.min(10) + 1) as u64)).await;
         }
         anyhow::bail!("S3 ref store {key}: gave up after repeated concurrent-write conflicts")
     }
@@ -770,6 +773,7 @@ mod tests {
             head_base_packs: Vec::new(),
             archive_frames: Vec::new(),
             build_status: None,
+            build_ms: None,
             synced_at: None,
             generation: None,
         }
