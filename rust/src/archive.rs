@@ -769,7 +769,7 @@ impl ArchiveBuilder {
             .as_file()
             .sync_all()
             .context("fsync archive bundle temp")?;
-        let hash = format!("{:x}", hasher.finalize());
+        let hash = hex::encode(hasher.finalize());
         let path = bundle.into_temp_path();
         cas.install_hashed_file(&hash, &path)
             .with_context(|| format!("install archive bundle {}", hash))?;

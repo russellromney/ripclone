@@ -241,7 +241,7 @@ impl StorageBackend for S3Storage {
                 data.len()
             );
         }
-        let actual_hash = format!("{:x}", sha2::Sha256::digest(&data));
+        let actual_hash = hex::encode(sha2::Sha256::digest(&data));
         if actual_hash != hash {
             anyhow::bail!("S3 object {} hash mismatch: actual {}", hash, actual_hash);
         }

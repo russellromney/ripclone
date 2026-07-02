@@ -28,8 +28,8 @@ impl ObjectHasher {
 
     fn finalize_hex(self) -> String {
         match self {
-            Self::Sha1(hasher) => format!("{:x}", hasher.finalize()),
-            Self::Sha256(hasher) => format!("{:x}", hasher.finalize()),
+            Self::Sha1(hasher) => hex::encode(hasher.finalize()),
+            Self::Sha256(hasher) => hex::encode(hasher.finalize()),
         }
     }
 }
@@ -79,7 +79,7 @@ impl Cas {
     }
 
     pub fn put(&self, data: &[u8]) -> Result<String> {
-        let hash = format!("{:x}", Sha256::digest(data));
+        let hash = hex::encode(Sha256::digest(data));
         self.put_with_hash(&hash, data)?;
         Ok(hash)
     }
@@ -151,7 +151,7 @@ impl Cas {
             .context("fsync CAS temp file")?;
         crate::perf::record_cas_fsync(fsync_start.elapsed());
 
-        let hash = format!("{:x}", hasher.finalize());
+        let hash = hex::encode(hasher.finalize());
         let path = self.object_path(&hash)?;
         let tmp_path = tmp.into_temp_path();
         if path.exists() {
@@ -424,7 +424,7 @@ impl Cas {
 }
 
 pub fn hash(data: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(data))
+    hex::encode(Sha256::digest(data))
 }
 
 fn hash_bytes_for_object_id(hash: &str, data: &[u8]) -> Result<String> {

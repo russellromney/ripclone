@@ -304,7 +304,7 @@ impl Drop for CleanupGuard {
 }
 
 fn sha256_hex(data: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(data))
+    hex::encode(Sha256::digest(data))
 }
 
 async fn get_status(
