@@ -6,11 +6,12 @@
 #![allow(dead_code)]
 
 use ripclone::client::Client;
-use ripclone::server::run_server;
+use ripclone::server::{RateLimiter, ServerState, build_app, run_server};
+use ripclone::storage::{HashEntry, StorageBackend, StorageRef};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Once;
+use std::sync::{Arc, Once};
 use std::time::Duration;
 use tempfile::TempDir;
 
@@ -71,6 +72,7 @@ fn free_port() -> u16 {
 pub struct Server {
     pub url: String,
     pub cas_dir: PathBuf,
+    pub storage_dir: PathBuf,
     pub repo_root: PathBuf,
     pub _dir: TempDir,
 }
@@ -92,6 +94,10 @@ impl Server {
     /// Path of a CAS object, for negative tests that tamper with storage.
     pub fn cas_path(&self, hash: &str) -> PathBuf {
         self.cas_dir.join(&hash[..2]).join(hash)
+    }
+
+    pub fn storage_path(&self, hash: &str) -> PathBuf {
+        self.storage_dir.join(&hash[..2]).join(hash)
     }
 }
 
@@ -129,6 +135,197 @@ pub async fn start_server_env(extra: &[(&str, &str)]) -> Server {
 /// suite correct under parallel `cargo test`.
 pub async fn start_server_faulting(fail_first: usize) -> Server {
     start_server_inner(fail_first, &[]).await
+}
+
+pub async fn start_server_split_storage() -> Server {
+    init_tracing();
+    let dir = tempfile::tempdir().expect("server dir");
+    let cas_dir = dir.path().join("cas");
+    let storage_dir = dir.path().join("storage");
+    let repo_root = dir.path().join("repos");
+    std::fs::create_dir_all(&repo_root).unwrap();
+    let port = free_port();
+
+    let cas = ripclone::cas::Cas::new(&cas_dir).unwrap();
+    let storage: StorageRef = Arc::new(RemoteLocalStorage {
+        inner: ripclone::storage::local(&storage_dir).unwrap(),
+    });
+    let ref_store: Arc<dyn ripclone::ref_store::RefStore> =
+        Arc::new(ripclone::ref_store::FileRefStore::new(&repo_root));
+    let metrics = ripclone::metrics::Metrics::new();
+    let retention = Arc::new(
+        ripclone::retention::Retention::with_config_and_storage(
+            cas.clone(),
+            metrics.clone(),
+            None,
+            None,
+            Some(storage.clone()),
+        )
+        .unwrap()
+        .with_ref_store(ref_store.clone(), storage.clone()),
+    );
+    let (local_queue, mut rx, depth) = ripclone::queue::LocalJobQueue::new(16);
+    let build_queue: ripclone::queue::JobQueueRef = Arc::new(local_queue);
+    let provider_registry = ripclone::provider::ProviderRegistry::new();
+    let broker: Arc<dyn ripclone::auth::broker::CredentialBroker> = Arc::new(
+        ripclone::auth::broker::StaticBroker::new(provider_registry.clone()),
+    );
+    let state = ServerState {
+        cas,
+        repo_config: Arc::new(ripclone::repo_config::RepoConfigStore::new(storage.clone())),
+        storage,
+        repo_root: repo_root.clone(),
+        ref_store,
+        provider_registry,
+        broker,
+        token_hash: Some(token_hash()),
+        jwt: None,
+        metrics,
+        rate_limiter: RateLimiter::new(1000000, 1000000.0),
+        retention,
+        build_queue,
+        build_queue_depth: depth,
+        build_waiters: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        oidc_verifier: None,
+        webhook_config: Arc::new(ripclone::webhook::WebhookConfig::empty()),
+        sync_locks: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        mirror_freshness: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        mirror_fresh_ttl: Duration::from_secs(60),
+        ref_response_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        artifact_fetch_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        fail_first_fetches: 0,
+        readyz_cache: Arc::new(std::sync::Mutex::new(None)),
+        access_verifier: Arc::new(ripclone::auth::access::HttpAccessVerifier::new()),
+        require_repo_auth: false,
+    };
+
+    let worker_state = state.clone();
+    tokio::spawn(async move {
+        while let Some(job) = rx.recv().await {
+            let state = worker_state.clone();
+            tokio::spawn(async move {
+                let key = format!(
+                    "{}/{}#{}",
+                    job.repo_id.storage_key(),
+                    job.branch,
+                    job.rev.as_deref().unwrap_or("")
+                );
+                let st = state.clone();
+                let result = match tokio::spawn(async move {
+                    ripclone::server::process_build_job(&st, &job).await
+                })
+                .await
+                {
+                    Ok(r) => r,
+                    Err(e) => Err(format!("build task panicked: {e}")),
+                };
+                state
+                    .build_queue_depth
+                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                if let Some(senders) = state.build_waiters.lock().await.remove(&key) {
+                    for sender in senders {
+                        let _ = sender.send(result.clone());
+                    }
+                }
+            });
+        }
+    });
+
+    let app = build_app(state);
+    tokio::spawn(async move {
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+        let _ = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await;
+    });
+    let mut ready = false;
+    for _ in 0..400 {
+        if tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_ok()
+        {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        ready,
+        "split-storage server on port {port} did not become ready"
+    );
+    Server {
+        url: format!("http://127.0.0.1:{port}"),
+        cas_dir,
+        storage_dir,
+        repo_root,
+        _dir: dir,
+    }
+}
+
+struct RemoteLocalStorage {
+    inner: StorageRef,
+}
+
+#[async_trait::async_trait]
+impl StorageBackend for RemoteLocalStorage {
+    fn get(&self, hash: &str) -> anyhow::Result<Vec<u8>> {
+        self.inner.get(hash)
+    }
+
+    fn get_range(&self, hash: &str, start: u64, len: u64) -> anyhow::Result<Vec<u8>> {
+        self.inner.get_range(hash, start, len)
+    }
+
+    fn put(&self, hash: &str, data: &[u8]) -> anyhow::Result<()> {
+        self.inner.put(hash, data)
+    }
+
+    async fn put_async(&self, hash: &str, data: &[u8]) -> anyhow::Result<()> {
+        self.inner.put_async(hash, data).await
+    }
+
+    async fn put_file_async(&self, hash: &str, path: &std::path::Path) -> anyhow::Result<()> {
+        self.inner.put_file_async(hash, path).await
+    }
+
+    async fn get_meta(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
+        self.inner.get_meta(key).await
+    }
+
+    async fn put_meta(&self, key: &str, data: &[u8]) -> anyhow::Result<()> {
+        self.inner.put_meta(key, data).await
+    }
+
+    fn size(&self, hash: &str) -> anyhow::Result<u64> {
+        self.inner.size(hash)
+    }
+
+    fn is_remote(&self) -> bool {
+        true
+    }
+
+    fn regions(&self) -> Vec<String> {
+        vec!["test-remote-local".to_string()]
+    }
+
+    fn delete(&self, hash: &str) -> anyhow::Result<()> {
+        self.inner.delete(hash)
+    }
+
+    fn delete_batch(&self, hashes: &[String]) -> anyhow::Result<u64> {
+        self.inner.delete_batch(hashes)
+    }
+
+    fn list_hashes(&self) -> anyhow::Result<Vec<HashEntry>> {
+        self.inner.list_hashes()
+    }
+
+    fn health(&self) -> anyhow::Result<()> {
+        self.inner.health()
+    }
 }
 
 /// Serializes server *construction* (the brief startup window only, not whole
@@ -189,6 +386,7 @@ async fn start_server_inner(fail_first: usize, extra_env: &[(&str, &str)]) -> Se
     assert!(ready, "server on port {port} did not become ready");
     Server {
         url: format!("http://127.0.0.1:{port}"),
+        storage_dir: cas_dir.clone(),
         cas_dir,
         repo_root,
         _dir: dir,
@@ -236,6 +434,31 @@ pub struct Origin {
 
 impl Origin {
     pub fn commit(&self, files: &[(&str, &str)], msg: &str) -> String {
+        for (name, content) in files {
+            let p = self.work.join(name);
+            if let Some(parent) = p.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(p, content).unwrap();
+        }
+        git(&self.work, &["add", "-A"]);
+        git(
+            &self.work,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-q",
+                "-m",
+                msg,
+            ],
+        );
+        git(&self.work, &["rev-parse", "HEAD"])
+    }
+
+    pub fn commit_bytes(&self, files: &[(&str, &[u8])], msg: &str) -> String {
         for (name, content) in files {
             let p = self.work.join(name);
             if let Some(parent) = p.parent() {

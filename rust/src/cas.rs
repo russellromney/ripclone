@@ -1,7 +1,38 @@
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
+
+enum ObjectHasher {
+    Sha1(sha1::Sha1),
+    Sha256(Sha256),
+}
+
+impl ObjectHasher {
+    fn for_object_id(hash: &str) -> Result<Self> {
+        Cas::validate_object_id(hash)?;
+        if hash.len() == 40 {
+            Ok(Self::Sha1(sha1::Sha1::new()))
+        } else {
+            Ok(Self::Sha256(Sha256::new()))
+        }
+    }
+
+    fn update(&mut self, data: &[u8]) {
+        match self {
+            Self::Sha1(hasher) => hasher.update(data),
+            Self::Sha256(hasher) => hasher.update(data),
+        }
+    }
+
+    fn finalize_hex(self) -> String {
+        match self {
+            Self::Sha1(hasher) => format!("{:x}", hasher.finalize()),
+            Self::Sha256(hasher) => format!("{:x}", hasher.finalize()),
+        }
+    }
+}
 
 /// A minimal filesystem-backed content-addressed store.
 #[derive(Clone)]
@@ -54,51 +85,203 @@ impl Cas {
     }
 
     pub fn put_with_hash(&self, hash: &str, data: &[u8]) -> Result<()> {
+        let actual = hash_bytes_for_object_id(hash, data)?;
+        if actual != hash {
+            anyhow::bail!("hash mismatch: expected {}, actual {}", hash, actual);
+        }
         let path = self.object_path(hash)?;
-        // Content-addressed storage: if the object already exists, it is
-        // guaranteed to be the same data. This also makes concurrent writers
-        // idempotent.
-        if path.exists() {
+        if path.exists() && self.verify_object(hash).is_ok() {
             return Ok(());
         }
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        // Use a unique temp file per writer so concurrent puts of the same hash
-        // do not collide on the same `.tmp` path.
-        let tmp_path = path.with_extension(format!("tmp.{}", std::process::id()));
-        let mut tmp_file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&tmp_path)
+        let parent = path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("CAS object path has no parent: {}", path.display()))?;
+        let mut tmp = tempfile::Builder::new()
+            .prefix(".tmp.")
+            .tempfile_in(parent)
             .with_context(|| format!("create CAS object tmp {}", hash))?;
-        tmp_file
+        let write_start = Instant::now();
+        tmp.as_file_mut()
             .write_all(data)
             .with_context(|| format!("write CAS object tmp {}", hash))?;
-        tmp_file
+        crate::perf::record_cas_write(write_start.elapsed(), data.len() as u64);
+        let fsync_start = Instant::now();
+        tmp.as_file_mut()
             .sync_all()
             .with_context(|| format!("fsync CAS object tmp {}", hash))?;
-        drop(tmp_file);
-        std::fs::rename(&tmp_path, &path)
-            .or_else(|e| {
-                // Another concurrent writer may have won the race. Since the CAS
-                // is content-addressed, the existing file is the correct data.
-                if path.exists() {
-                    let _ = std::fs::remove_file(&tmp_path);
-                    Ok(())
-                } else {
-                    Err(e)
-                }
-            })
-            .with_context(|| format!("rename CAS object {}", hash))?;
+        crate::perf::record_cas_fsync(fsync_start.elapsed());
+        self.install_verified_temp(hash, tmp.into_temp_path(), &path)?;
         Ok(())
+    }
+
+    pub fn put_file<P: AsRef<Path>>(&self, source: P) -> Result<(String, u64)> {
+        let source = source.as_ref();
+        let meta = std::fs::metadata(source)
+            .with_context(|| format!("stat CAS source file {}", source.display()))?;
+        let len = meta.len();
+        std::fs::create_dir_all(&self.root)?;
+        let mut input = std::fs::File::open(source)
+            .with_context(|| format!("open CAS source file {}", source.display()))?;
+        let mut tmp = tempfile::Builder::new()
+            .prefix(".tmp.")
+            .tempfile_in(&self.root)
+            .with_context(|| format!("create CAS temp file in {}", self.root.display()))?;
+        let mut hasher = Sha256::new();
+        let mut buf = vec![0u8; 1024 * 1024];
+        let write_start = Instant::now();
+        loop {
+            let n = input
+                .read(&mut buf)
+                .with_context(|| format!("read CAS source file {}", source.display()))?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+            tmp.as_file_mut()
+                .write_all(&buf[..n])
+                .context("write CAS temp file")?;
+        }
+        crate::perf::record_cas_write(write_start.elapsed(), len);
+        let fsync_start = Instant::now();
+        tmp.as_file_mut()
+            .sync_all()
+            .context("fsync CAS temp file")?;
+        crate::perf::record_cas_fsync(fsync_start.elapsed());
+
+        let hash = format!("{:x}", hasher.finalize());
+        let path = self.object_path(&hash)?;
+        let tmp_path = tmp.into_temp_path();
+        if path.exists() {
+            if let Ok(existing_len) = self.verify_object(&hash) {
+                return Ok((hash, existing_len));
+            }
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        self.install_verified_temp(&hash, tmp_path, &path)?;
+        Ok((hash, len))
+    }
+
+    pub fn put_file_with_hash<P: AsRef<Path>>(&self, hash: &str, source: P) -> Result<u64> {
+        let source = source.as_ref();
+        let meta = std::fs::metadata(source)
+            .with_context(|| format!("stat CAS source file {}", source.display()))?;
+        let len = meta.len();
+        let path = self.object_path(hash)?;
+        if path.exists() {
+            if let Ok(existing_len) = self.verify_object(hash) {
+                return Ok(existing_len);
+            }
+        }
+        std::fs::create_dir_all(&self.root)?;
+        let mut input = std::fs::File::open(source)
+            .with_context(|| format!("open CAS source file {}", source.display()))?;
+        let mut tmp = tempfile::Builder::new()
+            .prefix(".tmp.")
+            .tempfile_in(&self.root)
+            .with_context(|| format!("create CAS temp file in {}", self.root.display()))?;
+        let mut hasher = ObjectHasher::for_object_id(hash)?;
+        let mut buf = vec![0u8; 1024 * 1024];
+        let write_start = Instant::now();
+        loop {
+            let n = input
+                .read(&mut buf)
+                .with_context(|| format!("read CAS source file {}", source.display()))?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+            tmp.as_file_mut()
+                .write_all(&buf[..n])
+                .context("write CAS temp file")?;
+        }
+        crate::perf::record_cas_write(write_start.elapsed(), len);
+        let actual = hasher.finalize_hex();
+        if actual != hash {
+            anyhow::bail!(
+                "CAS source file {} hash mismatch: expected {}, actual {}",
+                source.display(),
+                hash,
+                actual
+            );
+        }
+        let fsync_start = Instant::now();
+        tmp.as_file_mut()
+            .sync_all()
+            .context("fsync CAS temp file")?;
+        crate::perf::record_cas_fsync(fsync_start.elapsed());
+
+        let tmp_path = tmp.into_temp_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        self.install_verified_temp(hash, tmp_path, &path)?;
+        Ok(len)
+    }
+
+    pub fn install_hashed_file<P: AsRef<Path>>(&self, hash: &str, source: P) -> Result<()> {
+        let source = source.as_ref();
+        let path = self.object_path(hash)?;
+        if path.exists() && self.verify_object(hash).is_ok() {
+            let _ = std::fs::remove_file(source);
+            return Ok(());
+        }
+        let (actual, _len) = hash_file_for_object_id(hash, source)
+            .with_context(|| format!("hash CAS source file {}", source.display()))?;
+        if actual != hash {
+            anyhow::bail!("hash mismatch: expected {}, actual {}", hash, actual);
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        match std::fs::rename(source, &path) {
+            Ok(()) => Ok(()),
+            Err(_first_err) if path.exists() => {
+                if self.verify_object(hash).is_ok() {
+                    let _ = std::fs::remove_file(source);
+                    return Ok(());
+                }
+                std::fs::remove_file(&path)
+                    .with_context(|| format!("remove corrupt CAS object {}", hash))?;
+                std::fs::rename(source, &path)
+                    .with_context(|| format!("replace corrupt CAS object {}", hash))
+            }
+            Err(e) => Err(e).with_context(|| format!("rename CAS object {}", hash)),
+        }
+    }
+
+    fn install_verified_temp(
+        &self,
+        hash: &str,
+        tmp_path: tempfile::TempPath,
+        path: &Path,
+    ) -> Result<()> {
+        match std::fs::rename(&tmp_path, path) {
+            Ok(()) => Ok(()),
+            Err(_first_err) if path.exists() => {
+                if self.verify_object(hash).is_ok() {
+                    let _ = tmp_path.close();
+                    return Ok(());
+                }
+                std::fs::remove_file(path)
+                    .with_context(|| format!("remove corrupt CAS object {}", hash))?;
+                std::fs::rename(&tmp_path, path)
+                    .with_context(|| format!("replace corrupt CAS object {}", hash))
+            }
+            Err(e) => Err(e).with_context(|| format!("rename CAS object {}", hash)),
+        }
     }
 
     pub fn get(&self, hash: &str) -> Result<Vec<u8>> {
         let path = self.object_path(hash)?;
+        let read_start = Instant::now();
         let data = std::fs::read(&path).with_context(|| format!("read CAS object {}", hash))?;
-        let actual = format!("{:x}", Sha256::digest(&data));
+        crate::perf::record_cas_read(read_start.elapsed(), data.len() as u64);
+        let actual = hash_bytes_for_object_id(hash, &data)?;
         if actual != hash {
             anyhow::bail!(
                 "CAS object {} is corrupt: hash mismatch (actual {})",
@@ -111,7 +294,7 @@ impl Cas {
 
     /// Read a byte range from a CAS object without loading the whole file.
     pub fn get_range(&self, hash: &str, start: u64, len: u64) -> Result<Vec<u8>> {
-        use std::io::{Read, Seek, SeekFrom};
+        use std::io::{Seek, SeekFrom};
         let path = self.object_path(hash)?;
         let mut file = std::fs::File::open(&path)
             .with_context(|| format!("open CAS object {} for range read", hash))?;
@@ -129,9 +312,88 @@ impl Cas {
         file.seek(SeekFrom::Start(start))
             .with_context(|| format!("seek CAS object {}", hash))?;
         let mut buf = vec![0u8; len as usize];
+        let read_start = Instant::now();
         file.read_exact(&mut buf)
             .with_context(|| format!("read range from CAS object {}", hash))?;
+        crate::perf::record_cas_read(read_start.elapsed(), len);
         Ok(buf)
+    }
+
+    pub fn verify_object(&self, hash: &str) -> Result<u64> {
+        let path = self.object_path(hash)?;
+        let mut file =
+            std::fs::File::open(&path).with_context(|| format!("open CAS object {}", hash))?;
+        let mut hasher = ObjectHasher::for_object_id(hash)?;
+        let mut buf = vec![0u8; 1024 * 1024];
+        let mut len = 0u64;
+        let read_start = Instant::now();
+        loop {
+            let n = file
+                .read(&mut buf)
+                .with_context(|| format!("read CAS object {}", hash))?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+            len += n as u64;
+        }
+        crate::perf::record_cas_read(read_start.elapsed(), len);
+        let actual = hasher.finalize_hex();
+        if actual != hash {
+            anyhow::bail!(
+                "CAS object {} is corrupt: hash mismatch (actual {})",
+                hash,
+                actual
+            );
+        }
+        Ok(len)
+    }
+
+    pub fn copy_to_writer_verified<W: Write>(&self, hash: &str, writer: &mut W) -> Result<u64> {
+        self.copy_to_writer_verified_with(hash, writer, |_| {})
+    }
+
+    pub fn copy_to_writer_verified_with<W, F>(
+        &self,
+        hash: &str,
+        writer: &mut W,
+        mut observe: F,
+    ) -> Result<u64>
+    where
+        W: Write,
+        F: FnMut(&[u8]),
+    {
+        let path = self.object_path(hash)?;
+        let mut file =
+            std::fs::File::open(&path).with_context(|| format!("open CAS object {}", hash))?;
+        let mut hasher = ObjectHasher::for_object_id(hash)?;
+        let mut buf = vec![0u8; 1024 * 1024];
+        let mut len = 0u64;
+        let read_start = Instant::now();
+        loop {
+            let n = file
+                .read(&mut buf)
+                .with_context(|| format!("read CAS object {}", hash))?;
+            if n == 0 {
+                break;
+            }
+            writer
+                .write_all(&buf[..n])
+                .with_context(|| format!("write streamed CAS object {}", hash))?;
+            hasher.update(&buf[..n]);
+            observe(&buf[..n]);
+            len += n as u64;
+        }
+        crate::perf::record_cas_read(read_start.elapsed(), len);
+        let actual = hasher.finalize_hex();
+        if actual != hash {
+            anyhow::bail!(
+                "CAS object {} is corrupt: hash mismatch (actual {})",
+                hash,
+                actual
+            );
+        }
+        Ok(len)
     }
 
     pub fn has(&self, hash: &str) -> bool {
@@ -163,6 +425,46 @@ impl Cas {
 
 pub fn hash(data: &[u8]) -> String {
     format!("{:x}", Sha256::digest(data))
+}
+
+fn hash_bytes_for_object_id(hash: &str, data: &[u8]) -> Result<String> {
+    let mut hasher = ObjectHasher::for_object_id(hash)?;
+    hasher.update(data);
+    Ok(hasher.finalize_hex())
+}
+
+pub fn hash_file<P: AsRef<Path>>(source: P) -> Result<(String, u64)> {
+    hash_file_sha256(source)
+}
+
+fn hash_file_for_object_id<P: AsRef<Path>>(hash: &str, source: P) -> Result<(String, u64)> {
+    hash_file_with_hasher(source, ObjectHasher::for_object_id(hash)?)
+}
+
+fn hash_file_sha256<P: AsRef<Path>>(source: P) -> Result<(String, u64)> {
+    hash_file_with_hasher(source, ObjectHasher::Sha256(Sha256::new()))
+}
+
+fn hash_file_with_hasher<P: AsRef<Path>>(
+    source: P,
+    mut hasher: ObjectHasher,
+) -> Result<(String, u64)> {
+    let source = source.as_ref();
+    let mut input = std::fs::File::open(source)
+        .with_context(|| format!("open file {} for hashing", source.display()))?;
+    let mut buf = vec![0u8; 1024 * 1024];
+    let mut len = 0u64;
+    loop {
+        let n = input
+            .read(&mut buf)
+            .with_context(|| format!("read file {} for hashing", source.display()))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        len += n as u64;
+    }
+    Ok((hasher.finalize_hex(), len))
 }
 
 #[cfg(test)]
@@ -200,6 +502,89 @@ mod tests {
         assert!(valid.starts_with(tmp.path()));
         let sha1 = cas.object_path(&"a".repeat(40)).unwrap();
         assert!(sha1.starts_with(tmp.path()));
+    }
+
+    #[test]
+    fn put_with_hash_repairs_existing_corrupt_object() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cas = Cas::new(tmp.path()).unwrap();
+        let hash = hash(b"correct");
+        let object_path = cas.path(&hash);
+        std::fs::create_dir_all(object_path.parent().unwrap()).unwrap();
+        std::fs::write(&object_path, b"wrong").unwrap();
+
+        cas.put_with_hash(&hash, b"correct").unwrap();
+        assert_eq!(std::fs::read(&object_path).unwrap(), b"correct");
+    }
+
+    #[test]
+    fn put_file_with_hash_repairs_existing_corrupt_object() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cas = Cas::new(tmp.path()).unwrap();
+        let source = tmp.path().join("source");
+        std::fs::write(&source, b"correct").unwrap();
+        let hash = hash(b"correct");
+        let object_path = cas.path(&hash);
+        std::fs::create_dir_all(object_path.parent().unwrap()).unwrap();
+        std::fs::write(&object_path, b"wrong").unwrap();
+
+        cas.put_file_with_hash(&hash, &source).unwrap();
+        assert_eq!(std::fs::read(&object_path).unwrap(), b"correct");
+        assert_eq!(std::fs::read(&source).unwrap(), b"correct");
+    }
+
+    #[test]
+    fn install_hashed_file_repairs_existing_corrupt_object_and_removes_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cas = Cas::new(tmp.path()).unwrap();
+        let source = tmp.path().join("bundle.tmp");
+        std::fs::write(&source, b"correct bundle").unwrap();
+        let hash = hash(b"correct bundle");
+        let object_path = cas.path(&hash);
+        std::fs::create_dir_all(object_path.parent().unwrap()).unwrap();
+        std::fs::write(&object_path, b"corrupt bundle").unwrap();
+
+        cas.install_hashed_file(&hash, &source).unwrap();
+        assert_eq!(std::fs::read(&object_path).unwrap(), b"correct bundle");
+        assert!(!source.exists(), "source temp file should be installed");
+    }
+
+    #[test]
+    fn install_hashed_file_rejects_mismatched_replacement_and_keeps_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cas = Cas::new(tmp.path()).unwrap();
+        let source = tmp.path().join("bundle.tmp");
+        std::fs::write(&source, b"wrong replacement").unwrap();
+        let hash = hash(b"correct bundle");
+        let object_path = cas.path(&hash);
+        std::fs::create_dir_all(object_path.parent().unwrap()).unwrap();
+        std::fs::write(&object_path, b"corrupt bundle").unwrap();
+
+        let err = cas.install_hashed_file(&hash, &source).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("hash mismatch"),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(std::fs::read(&source).unwrap(), b"wrong replacement");
+        assert_eq!(std::fs::read(&object_path).unwrap(), b"corrupt bundle");
+    }
+
+    #[test]
+    fn install_hashed_file_rejects_mismatched_new_object_and_keeps_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cas = Cas::new(tmp.path()).unwrap();
+        let source = tmp.path().join("bundle.tmp");
+        std::fs::write(&source, b"wrong bundle").unwrap();
+        let hash = hash(b"correct bundle");
+        let object_path = cas.path(&hash);
+
+        let err = cas.install_hashed_file(&hash, &source).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("hash mismatch"),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(std::fs::read(&source).unwrap(), b"wrong bundle");
+        assert!(!object_path.exists());
     }
 
     #[test]

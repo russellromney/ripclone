@@ -322,10 +322,44 @@ pub struct BuildResponse {
     pub queue_depth: usize,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SyncPhases {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mirror_fetch_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commit_graph_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub publish_p1_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub head_packs_ms: Option<u64>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct SyncResponse {
+    #[serde(flatten)]
+    pub ref_info: RefResponse,
+    pub status: String,
+    pub phases: SyncPhases,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unique_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SyncBuildResult {
+    pub info: RefInfo,
+    pub status: String,
+    pub phases: SyncPhases,
+}
+
 /// Waiters for in-flight background builds, keyed by `owner/repo/branch`.
 pub type BuildWaiters = Arc<
     tokio::sync::Mutex<
-        std::collections::HashMap<String, Vec<tokio::sync::oneshot::Sender<Result<(), String>>>>,
+        std::collections::HashMap<
+            String,
+            Vec<tokio::sync::oneshot::Sender<Result<SyncBuildResult, String>>>,
+        >,
     >,
 >;
 
@@ -437,7 +471,7 @@ fn reject_invalid_repo_ids(owner: &str, repo: &str) -> Option<Response> {
     None
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct RefResponse {
     pub owner: String,
     pub repo: String,
@@ -499,6 +533,10 @@ fn default_true() -> bool {
     true
 }
 
+fn duration_ms(duration: Duration) -> u64 {
+    duration.as_millis().try_into().unwrap_or(u64::MAX)
+}
+
 #[derive(Serialize)]
 pub struct ErrorResponse {
     pub error: String,
@@ -534,6 +572,8 @@ pub struct BranchStatusEntry {
     pub unique_bytes: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub built_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub build_ms: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1877,6 +1917,7 @@ async fn get_ref_inner(
                 head_base_packs: Vec::new(),
                 archive_frames: Vec::new(),
                 build_status: None,
+                build_ms: None,
                 synced_at: None,
                 generation: None,
             });
@@ -2073,6 +2114,52 @@ fn ref_response(
         idx_bundle_url,
         shallow: clonepack_kind == "shallow",
         archive_ready: !info.archive_chunks.is_empty(),
+    }
+}
+
+fn logical_manifest_bytes(
+    storage: &crate::storage::StorageRef,
+    manifest_hash: &str,
+) -> Option<u64> {
+    if manifest_hash.is_empty() {
+        return None;
+    }
+    let manifest_bytes = storage.get(manifest_hash).ok()?;
+    let mut total = manifest_bytes.len() as u64;
+    let manifest = ClonepackManifest::decode(manifest_bytes.as_slice()).ok()?;
+    for chunk in manifest_chunk_refs(&manifest) {
+        total = total.saturating_add(chunk.len);
+    }
+    Some(total)
+}
+
+fn sync_response(
+    repo_id: &RepoId,
+    provider: &ProviderInstance,
+    branch: String,
+    info: &RefInfo,
+    storage: &crate::storage::StorageRef,
+    clonepack_kind: &str,
+    private: bool,
+    status: impl Into<String>,
+    phases: SyncPhases,
+) -> SyncResponse {
+    let ref_info = ref_response(
+        repo_id,
+        provider,
+        branch,
+        info,
+        storage,
+        clonepack_kind,
+        private,
+    );
+    let bytes = logical_manifest_bytes(storage, &ref_info.clonepack_manifest);
+    SyncResponse {
+        ref_info,
+        status: status.into(),
+        phases,
+        bytes,
+        unique_bytes: bytes,
     }
 }
 
@@ -2304,6 +2391,7 @@ async fn build_repo_status(
             bytes: ref_bytes,
             unique_bytes: branch_unique_bytes,
             built_at,
+            build_ms: info.build_ms,
         });
     }
 
@@ -2404,7 +2492,7 @@ async fn sync_repo_inner(
         // the coalescing key so syncs for different build commits don't share
         // one build.
         let key = inproc_build_key(&repo_id, &branch, at_rev.as_deref());
-        let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<SyncBuildResult, String>>();
         let first = {
             let mut w = state.build_waiters.lock().await;
             // Presence-based: a key present — even an empty marker left by the
@@ -2445,7 +2533,7 @@ async fn sync_repo_inner(
             }
         }
         match tokio::time::timeout(wait, rx).await {
-            Ok(Ok(Ok(()))) => {
+            Ok(Ok(Ok(build))) => {
                 // Resolve HEAD to the concrete default branch before loading
                 // the persisted ref; do_sync stores artifacts under the real
                 // branch.
@@ -2466,7 +2554,7 @@ async fn sync_repo_inner(
                 match state.ref_store.load_branch(&repo_id, &load_key).await {
                     Ok(Some(info)) => {
                         state.metrics.record_sync(start.elapsed());
-                        let resp = ref_response(
+                        let resp = sync_response(
                             &repo_id,
                             &provider,
                             effective_branch,
@@ -2474,6 +2562,8 @@ async fn sync_repo_inner(
                             &state.storage,
                             "full",
                             private,
+                            build.status,
+                            build.phases,
                         );
                         (StatusCode::OK, Json(resp)).into_response()
                     }
@@ -2611,7 +2701,7 @@ async fn sync_repo_inner(
                         // return that as a successful ref.
                         Ok(Some(info)) if !info.commit.is_empty() => {
                             state.metrics.record_sync(start.elapsed());
-                            let resp = ref_response(
+                            let resp = sync_response(
                                 &repo_id,
                                 &provider,
                                 effective_branch,
@@ -2619,6 +2709,8 @@ async fn sync_repo_inner(
                                 &state.storage,
                                 "full",
                                 private,
+                                "built",
+                                SyncPhases::default(),
                             );
                             return (StatusCode::OK, Json(resp)).into_response();
                         }
@@ -3295,9 +3387,9 @@ async fn create_snapshot_inner(
     )
     .await
     {
-        Ok(info) => {
+        Ok(result) => {
             invalidate_ref_response_cache(&state, &repo_id, &branch);
-            info
+            result.info
         }
         Err(e) => {
             return (
@@ -3856,19 +3948,20 @@ fn assemble_variant(
     if tagged.is_empty() {
         return Ok((Vec::new(), None, String::new()));
     }
-    // Fetch every pack's idx concurrently — there can be 100+ of them (each a local
-    // read or an object-store GET), so a serial loop dominates the assemble. Results
-    // stay in order, so the concatenation + offsets below are deterministic.
-    use rayon::prelude::*;
-    let idxs: Vec<Vec<u8>> = tagged
-        .par_iter()
-        .map(|&(pack, _)| cas.get(&pack.2).or_else(|_| storage.get(&pack.2)))
-        .collect::<Result<Vec<_>>>()?;
-    let mut buf: Vec<u8> = Vec::with_capacity(idxs.iter().map(|b| b.len()).sum());
+    use std::io::Write;
+
+    let mut tmp = tempfile::Builder::new()
+        .suffix(".idx-bundle")
+        .tempfile_in(cas.root())
+        .context("create idx bundle temp file")?;
     let mut entries = Vec::with_capacity(tagged.len());
-    for (&(pack, history_only), idx_bytes) in tagged.iter().zip(&idxs) {
-        let offset = buf.len() as u64;
-        buf.extend_from_slice(idx_bytes);
+    let mut len = 0u64;
+    for &(pack, history_only) in tagged {
+        let idx_bytes = cas.get(&pack.2).or_else(|_| storage.get(&pack.2))?;
+        let offset = len;
+        tmp.write_all(&idx_bytes)
+            .context("write idx bytes to bundle")?;
+        len += idx_bytes.len() as u64;
         entries.push(crate::clonepack::PackEntry {
             pack: Some(ChunkRef {
                 hash: hash_from_hex(&pack.0)?,
@@ -3882,8 +3975,12 @@ fn assemble_variant(
             idx_bundle_offset: offset,
         });
     }
-    let len = buf.len() as u64;
-    let hash = cas.put(&buf)?;
+    tmp.flush().context("flush idx bundle temp file")?;
+    let (hash, stored_len) = cas.put_file(tmp.path())?;
+    anyhow::ensure!(
+        stored_len == len,
+        "idx bundle length changed while storing: expected {len}, got {stored_len}"
+    );
     Ok((
         entries,
         Some(ChunkRef {
@@ -3959,6 +4056,13 @@ fn archive_chunk_refs(
     metadata_chunk: &crate::clonepack::MetadataChunk,
 ) -> Result<Vec<ChunkRef>> {
     let lengths = crate::clonepack::archive_chunk_lengths(metadata_chunk);
+    if lengths.len() != archive_chunk_hashes.len() {
+        anyhow::bail!(
+            "archive chunk hash/length mismatch: hashes={} lengths={}",
+            archive_chunk_hashes.len(),
+            lengths.len()
+        );
+    }
     archive_chunk_hashes
         .iter()
         .zip(lengths.iter())
@@ -3998,25 +4102,43 @@ async fn upload_artifacts(
         let cas = cas.clone();
         let storage = storage.clone();
         async move {
-            // Read the chunk off the async worker (blocking disk I/O), then
-            // upload via the async path so the PUT runs on this runtime with the
-            // pooled client — connections stay warm across chunks instead of
-            // re-handshaking per upload.
             let read_hash = hash.clone();
-            let data = tokio::task::spawn_blocking(move || cas.get(&read_hash))
-                .await
-                .context("read task")?
-                .with_context(|| format!("read artifact {} for upload", hash))?;
+            let (path, len) = tokio::task::spawn_blocking(move || {
+                let len = cas
+                    .verify_object(&read_hash)
+                    .with_context(|| format!("verify artifact {} before upload", read_hash))?;
+                Ok::<_, anyhow::Error>((cas.path(&read_hash), len))
+            })
+            .await
+            .context("verify artifact task")??;
+            let upload_start = std::time::Instant::now();
             storage
-                .put_async(&hash, &data)
+                .put_file_async(&hash, &path)
                 .await
-                .with_context(|| format!("upload artifact {}", hash))
+                .with_context(|| format!("upload artifact {}", hash))?;
+            crate::perf::record_storage_upload(upload_start.elapsed(), len);
+            Ok(())
         }
     }))
     .buffer_unordered(conc.max(1))
     .try_collect::<Vec<()>>()
     .await
     .map(|_| ())
+}
+
+fn archive_publish_upload_hashes(
+    metadata_hash: &str,
+    clonepack_hash: &str,
+    download_bundle_hashes: &[String],
+    new_reuse_frame_hashes: &[String],
+) -> Vec<String> {
+    let mut uploads: Vec<String> = vec![metadata_hash.to_string(), clonepack_hash.to_string()];
+    uploads.extend(download_bundle_hashes.iter().cloned());
+    uploads.extend(new_reuse_frame_hashes.iter().cloned());
+    uploads.retain(|h| !h.is_empty());
+    uploads.sort();
+    uploads.dedup();
+    uploads
 }
 
 /// After upload: on a remote backend drop local pack copies (keeping the tiny
@@ -4139,7 +4261,7 @@ async fn do_sync(
     // repos build concurrently. Safe because auto-gc is off, so the build only
     // reads the mirror's packs.
     mirror_lock: &Arc<tokio::sync::Mutex<()>>,
-) -> Result<RefInfo> {
+) -> Result<SyncBuildResult> {
     let compression_level = repo_config.compression_level();
     info!("syncing {}@{}", repo_id.storage_key(), branch);
 
@@ -4148,6 +4270,7 @@ async fn do_sync(
     // phase boundary.
     let t_total = Instant::now();
     let mut t = t_total;
+    let mut phases = SyncPhases::default();
 
     // Best-effort: remove stale build temp dirs left by a previously killed
     // sync. `tempfile` cleans up on drop, but not on SIGKILL/OOM, so a crashed
@@ -4198,7 +4321,11 @@ async fn do_sync(
                 repo_id.storage_key(),
                 &tip[..7.min(tip.len())]
             );
-            return Ok(prev);
+            return Ok(SyncBuildResult {
+                info: prev,
+                status: "no-op".to_string(),
+                phases,
+            });
         }
     }
 
@@ -4242,6 +4369,7 @@ async fn do_sync(
         .duration_since(SystemTime::UNIX_EPOCH)
         .ok()
         .map(|d| d.as_secs());
+    phases.mirror_fetch_ms = Some(duration_ms(t.elapsed()));
     info!("sync phase: mirror fetch {:?}", t.elapsed());
     t = Instant::now();
 
@@ -4283,13 +4411,18 @@ async fn do_sync(
             repo_id.storage_key(),
             &commit[..7.min(commit.len())]
         );
-        return Ok(prev);
+        return Ok(SyncBuildResult {
+            info: prev,
+            status: "no-op".to_string(),
+            phases,
+        });
     }
 
     // Write a commit-graph so the rev-list walks in the skeleton + layered-pack
     // builds below are fast (a fresh --mirror clone has none). Best-effort.
     let cg_dir = mirror_dir.clone();
     let _ = tokio::task::spawn_blocking(move || git::write_commit_graph(&cg_dir)).await;
+    phases.commit_graph_ms = Some(duration_ms(t.elapsed()));
     info!("sync phase: commit-graph {:?}", t.elapsed());
 
     info!("building artifacts for {}", &commit[..7]);
@@ -4316,6 +4449,7 @@ async fn do_sync(
         t_total,
         fetched_at,
         compression_level,
+        phases,
     )
     .await
 }
@@ -4348,6 +4482,7 @@ struct HeadBuild {
     base_packs: Vec<crate::SizedPack>,
     /// True when every pack was built this sync (cold/rebase) → head MIDX buildable.
     all_local: bool,
+    elapsed_ms: u64,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4368,7 +4503,8 @@ async fn build_and_publish_two_phase(
     fetched_at: Option<u64>,
     // zstd level for archive frames, from the effective repo config.
     compression_level: i32,
-) -> Result<RefInfo> {
+    mut phases: SyncPhases,
+) -> Result<SyncBuildResult> {
     let history_target = env_bytes("RIPCLONE_HISTORY_PACK_BYTES", 512 * 1024 * 1024);
     let upload_conc = upload_concurrency();
 
@@ -4413,11 +4549,12 @@ async fn build_and_publish_two_phase(
                 let mut all_packs: Vec<(String, u64, String, u64)> =
                     prev_base_packs.iter().map(sized_to_tuple).collect();
                 all_packs.extend(delta.iter().cloned());
+                let elapsed = s.elapsed();
                 info!(
                     "p1 sub: head packs (delta vs base: {} new pack(s), {} total) {:?}",
                     delta.len(),
                     all_packs.len(),
-                    s.elapsed()
+                    elapsed
                 );
                 Ok(HeadBuild {
                     all_packs,
@@ -4425,16 +4562,18 @@ async fn build_and_publish_two_phase(
                     base_commit,
                     base_packs: prev_base_packs,
                     all_local: false,
+                    elapsed_ms: duration_ms(elapsed),
                 })
             }
             // Cold path: no base yet → pack the full closure as the base.
             _ => {
                 let base = b.build_head_packs(&cm2, head_target)?;
                 let base_packs = base.iter().map(tuple_to_sized).collect();
+                let elapsed = s.elapsed();
                 info!(
                     "p1 sub: head packs (full base, {} packs) {:?}",
                     base.len(),
-                    s.elapsed()
+                    elapsed
                 );
                 Ok(HeadBuild {
                     all_packs: base.clone(),
@@ -4442,6 +4581,7 @@ async fn build_and_publish_two_phase(
                     base_commit: cm2,
                     base_packs,
                     all_local: true,
+                    elapsed_ms: duration_ms(elapsed),
                 })
             }
         }
@@ -4514,6 +4654,7 @@ async fn build_and_publish_two_phase(
         .await
         .context("shallow skeleton")??;
     let head_built = head_handle.await.context("head packs")??;
+    phases.head_packs_ms = Some(head_built.elapsed_ms);
     let head_packs = head_built.all_packs.clone();
     let metadata_base = files_table_handle.await.context("files table")??;
     info!(
@@ -4634,6 +4775,7 @@ async fn build_and_publish_two_phase(
         head_base_packs: head_built.base_packs.clone(),
         archive_frames: carried_archive_frames,
         build_status: Some("full history building".to_string()),
+        build_ms: None,
         synced_at: fetched_at,
         generation: git::commit_depth(mirror_dir, commit).ok(),
     };
@@ -4669,6 +4811,7 @@ async fn build_and_publish_two_phase(
         &commit[..7.min(commit.len())],
         t_total.elapsed()
     );
+    phases.publish_p1_ms = Some(duration_ms(t_total.elapsed()));
     let _ = t; // p1 assemble/upload time folded into the total above
 
     // ---- PHASE 2: full history, in the background (survives the request) ----
@@ -4717,6 +4860,7 @@ async fn build_and_publish_two_phase(
             prev_archive_commit,
             head_base_pack_count_for_p2,
             compression_level,
+            t_total,
         )
         .await;
         match &res {
@@ -4747,7 +4891,11 @@ async fn build_and_publish_two_phase(
         tokio::spawn(phase2);
     }
 
-    Ok(info)
+    Ok(SyncBuildResult {
+        info,
+        status: "built".to_string(),
+        phases,
+    })
 }
 
 /// Phase 2 of two-phase publish: build the full-history artifacts and upgrade
@@ -4794,6 +4942,7 @@ async fn build_full_in_background(
     head_base_pack_count: usize,
     // zstd level for archive frames, from the effective repo config.
     compression_level: i32,
+    build_started_at: Instant,
 ) -> Result<()> {
     // Incremental history: build only the tail past the last sealed level; prior
     // levels are reused by hash from object storage (Tigris) — never rebuilt.
@@ -4802,6 +4951,19 @@ async fn build_full_in_background(
         prev_levels.last().map(|l| l.tip_commit.clone())
     } else {
         None
+    };
+    let archive_bundle_size = env_bytes(
+        "RIPCLONE_ARCHIVE_BUNDLE_BYTES",
+        crate::archive::DEFAULT_ARCHIVE_CHUNK_SIZE,
+    );
+    let archive_bundle_size = if archive_bundle_size == 0 {
+        warn!(
+            "RIPCLONE_ARCHIVE_BUNDLE_BYTES=0 is invalid; using default {}",
+            crate::archive::DEFAULT_ARCHIVE_CHUNK_SIZE
+        );
+        crate::archive::DEFAULT_ARCHIVE_CHUNK_SIZE
+    } else {
+        archive_bundle_size
     };
 
     // Write a reachability bitmap once, before the heavy full enumerations
@@ -4829,21 +4991,36 @@ async fn build_full_in_background(
         .iter()
         .map(|f| (f.raw_hash.clone(), (f.chunk_hash.clone(), f.compressed_len)))
         .collect();
-    let (mda, ca, cma) = (mirror_dir.to_path_buf(), cas.clone(), commit.to_string());
+    let (mda, ca, cma, archive_storage) = (
+        mirror_dir.to_path_buf(),
+        cas.clone(),
+        commit.to_string(),
+        storage.clone(),
+    );
     let archive_handle = tokio::task::spawn_blocking(move || {
         let b = ArchiveBuilder::new(&mda);
         if bounded {
             b.build_into_cas_bounded(
                 &cma,
                 &ca,
+                Some(&archive_storage),
                 compression_level,
                 None,
                 &prev_archive_frames,
                 &prev_files,
                 prev_archive_commit.as_deref().unwrap_or_default(),
+                archive_bundle_size,
             )
         } else {
-            b.build_into_cas_incremental(&cma, &ca, compression_level, None, &prev_frame_map)
+            b.build_into_cas_incremental(
+                &cma,
+                &ca,
+                Some(&archive_storage),
+                compression_level,
+                None,
+                &prev_frame_map,
+                archive_bundle_size,
+            )
         }
     });
     let (md2, c2, cm2, st2, lsm2) = (
@@ -5035,8 +5212,11 @@ async fn build_full_in_background(
 
     // Now the zstd archive, which files mode needs.
     let t_archive = Instant::now();
-    let (archive_chunk_hashes, archive_meta, new_archive_chunks, archive_frames) =
-        archive_handle.await.context("full archive")??;
+    let archive_output = archive_handle.await.context("full archive")??;
+    let archive_chunk_hashes = archive_output.download_bundle_hashes;
+    let archive_meta = archive_output.metadata;
+    let new_archive_chunks = archive_output.new_reuse_frame_hashes;
+    let archive_frames = archive_output.archive_frames;
     info!(
         "archive {} frames ({} rebuilt)",
         archive_frames.len(),
@@ -5064,9 +5244,12 @@ async fn build_full_in_background(
     )?;
     let files_clonepack_hash = cas.put(&files_manifest.encode_to_vec())?;
 
-    let mut uploads: Vec<String> = vec![files_metadata_hash.clone(), files_clonepack_hash.clone()];
-    uploads.extend(new_archive_chunks.iter().cloned());
-    uploads.retain(|h| !h.is_empty());
+    let uploads = archive_publish_upload_hashes(
+        &files_metadata_hash,
+        &files_clonepack_hash,
+        &archive_chunk_hashes,
+        &new_archive_chunks,
+    );
     upload_artifacts(cas, storage, uploads.clone(), upload_conc).await?;
 
     // Add the archive to the full clonepack, only if the ref still points at our
@@ -5086,6 +5269,7 @@ async fn build_full_in_background(
             info.full_clonepack.metadata_chunk = files_metadata_hash.clone();
             info.archive_frames = archive_frames;
             info.build_status = None;
+            info.build_ms = Some(duration_ms(build_started_at.elapsed()));
             ref_store
                 .save_branch(repo_id, branch, &info)
                 .await
@@ -5118,7 +5302,10 @@ async fn build_full_in_background(
 /// standalone `ripclone-worker`. It touches only the durable backends + provider
 /// registry, so it runs unchanged in any process that shares the same storage,
 /// metadata store, and provider config.
-pub async fn process_build_job(state: &ServerState, job: &BuildJob) -> Result<(), String> {
+pub async fn process_build_job(
+    state: &ServerState,
+    job: &BuildJob,
+) -> Result<SyncBuildResult, String> {
     let repo_id = &job.repo_id;
     let branch = &job.branch;
     let at_rev = job.rev.clone();
@@ -5170,11 +5357,12 @@ pub async fn process_build_job(state: &ServerState, job: &BuildJob) -> Result<()
 
     // Resolve HEAD to the concrete default branch for cache/log keys.
     let effective_branch = match &result {
-        Ok(info) if branch == "HEAD" => info.default_branch.clone(),
+        Ok(result) if branch == "HEAD" => result.info.default_branch.clone(),
         _ => branch.clone(),
     };
     match &result {
-        Ok(info) => {
+        Ok(result) => {
+            let info = &result.info;
             state.metrics.record_build_completed(start.elapsed());
             // Cross-process resolution: a server that didn't run this build has no
             // local mirror, so it cannot map a requested `HEAD` to the concrete
@@ -5230,7 +5418,7 @@ pub async fn process_build_job(state: &ServerState, job: &BuildJob) -> Result<()
                 )
                 .await;
             });
-            Ok(())
+            Ok(result.clone())
         }
         Err(e) => {
             state.metrics.record_build_failed();
@@ -5579,6 +5767,7 @@ async fn update_build_status(state: &ServerState, repo_id: &RepoId, status: &str
             head_base_packs: Vec::new(),
             archive_frames: Vec::new(),
             build_status: None,
+            build_ms: None,
             synced_at: None,
             generation: None,
         },
@@ -5873,6 +6062,50 @@ mod tests {
     }
 
     #[test]
+    fn archive_publish_uploads_download_bundles_and_reuse_frames() {
+        let uploads = archive_publish_upload_hashes(
+            "metadata",
+            "clonepack",
+            &["bundle-b".to_string(), "bundle-a".to_string()],
+            &["frame-a".to_string(), "bundle-a".to_string(), String::new()],
+        );
+        assert_eq!(
+            uploads,
+            vec![
+                "bundle-a".to_string(),
+                "bundle-b".to_string(),
+                "clonepack".to_string(),
+                "frame-a".to_string(),
+                "metadata".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn archive_chunk_refs_rejects_hash_length_mismatch() {
+        let mut metadata = crate::clonepack::MetadataChunk::new();
+        metadata.frames.push(crate::clonepack::FrameInfo {
+            chunk_index: 0,
+            chunk_offset: 0,
+            compressed_len: 4,
+            raw_len: 10,
+        });
+        metadata.frames.push(crate::clonepack::FrameInfo {
+            chunk_index: 1,
+            chunk_offset: 0,
+            compressed_len: 5,
+            raw_len: 11,
+        });
+
+        let err = archive_chunk_refs(&["a".repeat(64)], &metadata).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("archive chunk hash/length mismatch"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
     fn validate_repo_id_accepts_github_identifiers() {
         assert!(validate_repo_id("ripclone").is_ok());
         assert!(validate_repo_id("ripclone-rs").is_ok());
@@ -6010,6 +6243,7 @@ mod tests {
             head_base_packs: Vec::new(),
             archive_frames: Vec::new(),
             build_status: None,
+            build_ms: None,
             synced_at: None,
             generation: None,
         };
@@ -7537,6 +7771,7 @@ mod tests {
             head_base_packs: Vec::new(),
             archive_frames: Vec::new(),
             build_status: None,
+            build_ms: None,
             synced_at: Some(1_718_812_800),
             generation: None,
         };
@@ -7634,6 +7869,7 @@ mod tests {
             head_base_packs: Vec::new(),
             archive_frames: Vec::new(),
             build_status: None,
+            build_ms: None,
             synced_at: None,
             generation: None,
         };

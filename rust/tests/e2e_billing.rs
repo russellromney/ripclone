@@ -74,6 +74,53 @@ async fn status_reports_nonzero_bytes_after_sync() {
 }
 
 #[tokio::test]
+async fn sync_response_reports_phase_timings_and_status_reports_build_ms() {
+    init(false);
+    let server = start_server().await;
+    let origin = make_origin("acme", "synctiming");
+    origin.commit(&[("README.md", "sync timings\n")], "c1");
+    origin.publish();
+
+    let client = reqwest::Client::new();
+    let sync_url = format!("{}/v1/repos/github/acme/synctiming/sync", server.url);
+    let sync_resp = client
+        .post(&sync_url)
+        .header("Authorization", format!("Ripclone {}", token_hash()))
+        .send()
+        .await
+        .expect("sync request")
+        .error_for_status()
+        .expect("sync 2xx");
+    let sync: ripclone::server::SyncResponse = sync_resp.json().await.expect("sync response json");
+    assert_eq!(sync.status, "built");
+    assert!(!sync.ref_info.commit.is_empty(), "sync response commit");
+    assert!(
+        sync.phases.mirror_fetch_ms.is_some(),
+        "mirror fetch timing should be present"
+    );
+    assert!(
+        sync.phases.publish_p1_ms.is_some(),
+        "phase-1 publish timing should be present"
+    );
+
+    let mut build_ms = None;
+    for _ in 0..80 {
+        let status = get_status(&server, "acme", "synctiming", None).await;
+        build_ms = status["refs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["branch"] == "main")
+            .and_then(|entry| entry["build_ms"].as_u64());
+        if build_ms.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    assert!(build_ms.is_some(), "status should report build_ms");
+}
+
+#[tokio::test]
 async fn status_public_fork_is_free() {
     init(false);
     let server = start_server().await;

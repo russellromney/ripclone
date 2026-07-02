@@ -457,6 +457,9 @@ fn collect_ref_info_hashes(info: &RefInfo, reachable: &mut HashSet<String>) {
     for chunk in &info.archive_chunks {
         add_hash(reachable, chunk);
     }
+    for frame in &info.archive_frames {
+        add_hash(reachable, &frame.chunk_hash);
+    }
 
     collect_clonepack_artifacts(&info.full_clonepack, reachable);
     collect_clonepack_artifacts(&info.shallow_clonepack, reachable);
@@ -638,6 +641,7 @@ mod tests {
             shallow_clonepack: ClonepackArtifacts::default(),
             history_levels: Vec::new(),
             build_status: None,
+            build_ms: None,
             synced_at: None,
             ..Default::default()
         }
@@ -694,6 +698,55 @@ mod tests {
         assert!(cas.path(&info.clonepack_manifest).exists());
         assert!(cas.path(&info.metadata_chunk).exists());
         assert!(cas.path(&info.archive_chunks[0]).exists());
+    }
+
+    #[tokio::test]
+    async fn gc_keeps_archive_frame_reuse_chunks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cas_root = tmp.path().join("cas");
+        let repo_root = tmp.path().join("repos");
+        std::fs::create_dir_all(&cas_root).unwrap();
+        std::fs::create_dir_all(&repo_root).unwrap();
+
+        let cas = Cas::new(&cas_root).unwrap();
+        let storage: StorageRef = Arc::new(TestRemoteStorage {
+            inner: local(&cas_root).unwrap(),
+        });
+        let ref_store: Arc<dyn RefStore> = Arc::new(FileRefStore::new(&repo_root));
+
+        let reuse_hash = cas.put(b"reuse-frame").unwrap();
+        let mut info = make_ref_info_with_manifest(&cas);
+        info.archive_frames = vec![crate::ArchiveFrame {
+            raw_hash: "raw".to_string(),
+            chunk_hash: reuse_hash.clone(),
+            compressed_len: 11,
+            raw_len: 42,
+        }];
+        ref_store.save(&RepoId::github("o/r"), &info).await.unwrap();
+
+        let orphan_hash = cas.put(b"orphan").unwrap();
+        let orphan_path = cas.path(&orphan_hash);
+        let old = std::time::SystemTime::now() - Duration::from_secs(48 * 60 * 60);
+        filetime::set_file_mtime(&orphan_path, filetime::FileTime::from_system_time(old)).unwrap();
+        let long_ago = unix_secs(std::time::SystemTime::now()) - 1_000_000;
+        seed_ledger(&storage, &[(orphan_hash.as_str(), long_ago)]).await;
+
+        let gc = RemoteGc::new(
+            storage.clone(),
+            ref_store,
+            GcConfig {
+                grace_period: Duration::from_secs(60),
+                dry_run: false,
+            },
+        );
+        let report = gc.run().await.unwrap();
+
+        assert_eq!(report.objects_deleted, 1);
+        assert!(
+            cas.path(&reuse_hash).exists(),
+            "reuse frame must be retained"
+        );
+        assert!(!orphan_path.exists(), "orphan should be deleted");
     }
 
     /// The core fix: a chunk written long ago that has *only just* lost its last
@@ -1070,6 +1123,7 @@ mod tests {
                 packs: vec![pack],
             }],
             build_status: None,
+            build_ms: None,
             synced_at: None,
             ..Default::default()
         };

@@ -9,11 +9,15 @@ use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, bounded};
 use prost::Message;
 use serde::Deserialize;
+use sha2::Digest as Sha2Digest;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{info, warn};
+
+mod tuning;
+use tuning::ClientTuning;
 
 /// Sent on every request so the server can attribute usage and nudge upgrades.
 const USER_AGENT: &str = concat!("ripclone/", env!("CARGO_PKG_VERSION"));
@@ -315,6 +319,107 @@ async fn fetch_artifact_once(
         ));
     }
     Ok(data)
+}
+
+async fn fetch_artifact_to_temp_with_retry(
+    client: &reqwest::Client,
+    url: &str,
+    hash: &str,
+    dir: &Path,
+) -> Result<(tempfile::NamedTempFile, u64)> {
+    let (max_attempts, base_backoff_ms) = fetch_retry_config();
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        match fetch_artifact_to_temp_once(client, url, hash, dir).await {
+            Ok(tmp) => return Ok(tmp),
+            Err((retryable, err)) => {
+                if retryable && attempt < max_attempts {
+                    let backoff = fetch_backoff(base_backoff_ms, attempt);
+                    tracing::debug!(
+                        "artifact {hash} streaming fetch attempt {attempt}/{max_attempts} failed: {err:#}; retrying in {backoff:?}"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    continue;
+                }
+                return Err(err);
+            }
+        }
+    }
+}
+
+async fn fetch_artifact_to_temp_once(
+    client: &reqwest::Client,
+    fetch_url: &str,
+    hash: &str,
+    dir: &Path,
+) -> std::result::Result<(tempfile::NamedTempFile, u64), (bool, anyhow::Error)> {
+    use futures::StreamExt;
+    use tokio::io::AsyncWriteExt;
+
+    let resp = match client.get(fetch_url).send().await {
+        Ok(r) => r,
+        Err(e) => return Err((true, anyhow::anyhow!("artifact fetch transport error: {e}"))),
+    };
+    let status = resp.status();
+    if !status.is_success() {
+        let retryable = status.is_server_error()
+            || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+            || status == reqwest::StatusCode::REQUEST_TIMEOUT;
+        return Err((
+            retryable,
+            anyhow::anyhow!("artifact streaming fetch failed: {status}"),
+        ));
+    }
+
+    let tmp = tempfile::Builder::new()
+        .suffix(".ripclone-download")
+        .tempfile_in(dir)
+        .map_err(|e| {
+            (
+                false,
+                anyhow::Error::new(e).context("create artifact temp file"),
+            )
+        })?;
+    let std_file = tmp.as_file().try_clone().map_err(|e| {
+        (
+            false,
+            anyhow::Error::new(e).context("clone artifact temp file"),
+        )
+    })?;
+    let mut file = tokio::fs::File::from_std(std_file);
+    let mut stream = resp.bytes_stream();
+    let mut hasher = sha2::Sha256::new();
+    let mut len = 0u64;
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(e) => return Err((true, anyhow::anyhow!("artifact body read error: {e}"))),
+        };
+        hasher.update(&chunk);
+        len += chunk.len() as u64;
+        if let Err(e) = file.write_all(&chunk).await {
+            return Err((
+                false,
+                anyhow::Error::new(e).context("write artifact temp file"),
+            ));
+        }
+    }
+    if let Err(e) = file.flush().await {
+        return Err((
+            false,
+            anyhow::Error::new(e).context("flush artifact temp file"),
+        ));
+    }
+    drop(file);
+    let actual = hex::encode(hasher.finalize());
+    if actual != hash {
+        return Err((
+            false,
+            anyhow::anyhow!("artifact hash mismatch: expected {hash}, got {actual}"),
+        ));
+    }
+    Ok((tmp, len))
 }
 
 fn metadata_bytes(metadata: &MetadataChunk) -> u64 {
@@ -724,6 +829,38 @@ impl Client {
         Ok(data)
     }
 
+    async fn fetch_chunk_ref_to_temp(
+        &self,
+        chunk: &crate::clonepack::ChunkRef,
+        signed_url: Option<&str>,
+        dir: &Path,
+    ) -> Result<(tempfile::NamedTempFile, u64)> {
+        let hash = hash_to_hex(&chunk.hash);
+        let gateway_url = format!("{}/v1/artifacts/{}", self.server, hash);
+        let fetch_url = signed_url.unwrap_or(&gateway_url);
+        let use_signed_url = signed_url.is_some();
+        let result = if use_signed_url {
+            fetch_artifact_to_temp_with_retry(&self.raw_http, fetch_url, &hash, dir)
+                .await
+                .map_err(|signed_err| {
+                    anyhow::Error::new(StaleSignedUrl).context(format!(
+                        "signed-URL streaming fetch for {hash} failed: {signed_err:#}"
+                    ))
+                })?
+        } else {
+            fetch_artifact_to_temp_with_retry(&self.http, &gateway_url, &hash, dir).await?
+        };
+        if result.1 != chunk.len {
+            anyhow::bail!(
+                "chunk {} size mismatch: expected {}, got {}",
+                hash,
+                chunk.len,
+                result.1
+            );
+        }
+        Ok(result)
+    }
+
     /// Fetch many chunk refs in parallel, preserving order.
     ///
     /// `signed_urls` is indexed by chunk position; `None` entries fall back to
@@ -739,11 +876,7 @@ impl Client {
         if chunks.is_empty() {
             return Ok(Vec::new());
         }
-        let concurrency: usize = std::env::var("RIPCLONE_FETCH_CONCURRENCY")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(6)
-            .max(1);
+        let concurrency = ClientTuning::load().fetch_concurrency;
         let jobs: Vec<(usize, crate::clonepack::ChunkRef, Option<String>)> = chunks
             .iter()
             .cloned()
@@ -1003,6 +1136,8 @@ impl Client {
 
         let mut local_bench = Benchmark::new();
         let bench = bench.unwrap_or(&mut local_bench);
+        crate::perf::reset_perf_counters();
+        let _ = crate::worktree_writer::take_write_timing();
 
         // 1. Resolve ref (full-history by default; fast clones can request shallow).
         let mut info = self
@@ -1086,23 +1221,40 @@ impl Client {
                     .as_ref()
                     .map_or(2, |urls| urls.len().clamp(2, 64))
             });
+        let (archive_async_tx, mut archive_async_rx) =
+            tokio::sync::mpsc::channel::<(usize, Result<bytes::Bytes>)>(archive_channel_depth);
         let (archive_tx, archive_rx): (
-            Sender<(usize, Result<Vec<u8>>)>,
-            Receiver<(usize, Result<Vec<u8>>)>,
+            Sender<(usize, Result<bytes::Bytes>)>,
+            Receiver<(usize, Result<bytes::Bytes>)>,
         ) = bounded(archive_channel_depth);
+        let archive_bridge = if mode.needs_archive() {
+            let archive_tx = archive_tx.clone();
+            Some(tokio::task::spawn_blocking(move || {
+                while let Some(msg) = archive_async_rx.blocking_recv() {
+                    let send_start = Instant::now();
+                    if archive_tx.send(msg).is_err() {
+                        break;
+                    }
+                    crate::perf::record_archive_send_wait(send_start.elapsed());
+                }
+            }))
+        } else {
+            None
+        };
 
         let archive_urls = info.archive_chunk_urls.clone();
         let archive_downloads = if mode.needs_archive() {
             bench.start_archive_download();
             Some(
                 self.clone()
-                    .spawn_chunk_downloads(archive_urls, manifest_rx, archive_tx),
+                    .spawn_chunk_downloads(archive_urls, manifest_rx, archive_async_tx),
             )
         } else {
-            drop(archive_tx);
+            drop(archive_async_tx);
             drop(manifest_rx);
             None
         };
+        drop(archive_tx);
 
         // 4. Wait for manifest + metadata.
         let (manifest, metadata) =
@@ -1146,58 +1298,65 @@ impl Client {
             path
         };
         let git_dir = install_root.join(".git");
+        let files_only = matches!(mode, CloneMode::Files);
 
-        std::fs::create_dir_all(&git_dir)?;
-        std::fs::create_dir_all(git_dir.join("refs").join("heads"))?;
-        std::fs::create_dir_all(git_dir.join("refs").join("tags"))?;
-        std::fs::create_dir_all(git_dir.join("info"))?;
+        if !files_only {
+            std::fs::create_dir_all(&git_dir)?;
+            std::fs::create_dir_all(git_dir.join("refs").join("heads"))?;
+            std::fs::create_dir_all(git_dir.join("refs").join("tags"))?;
+            std::fs::create_dir_all(git_dir.join("info"))?;
 
-        let branch_name = if branch == "HEAD" {
-            if info.default_branch.is_empty() {
-                "main"
+            let branch_name = if branch == "HEAD" {
+                if info.default_branch.is_empty() {
+                    "main"
+                } else {
+                    &info.default_branch
+                }
             } else {
-                &info.default_branch
-            }
-        } else {
-            branch
-        };
+                branch
+            };
 
-        std::fs::write(
-            git_dir.join("HEAD"),
-            format!("ref: refs/heads/{branch_name}\n"),
-        )?;
-        let branch_ref = git_dir.join("refs").join("heads").join(branch_name);
-        if let Some(parent) = branch_ref.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(branch_ref, format!("{}\n", info.commit))?;
-        std::fs::write(git_dir.join("info").join("exclude"), b".ripclone/\n")?;
-        if info.shallow {
-            // Mark HEAD as a shallow boundary so git does not try to traverse
-            // missing parents.
-            std::fs::write(git_dir.join("shallow"), format!("{}\n", info.commit))?;
+            std::fs::write(
+                git_dir.join("HEAD"),
+                format!("ref: refs/heads/{branch_name}\n"),
+            )?;
+            let branch_ref = git_dir.join("refs").join("heads").join(branch_name);
+            if let Some(parent) = branch_ref.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(branch_ref, format!("{}\n", info.commit))?;
+            std::fs::write(git_dir.join("info").join("exclude"), b".ripclone/\n")?;
+            if info.shallow {
+                // Mark HEAD as a shallow boundary so git does not try to traverse
+                // missing parents.
+                std::fs::write(git_dir.join("shallow"), format!("{}\n", info.commit))?;
+            }
         }
 
         // 6. Write the small .git artifacts from the metadata chunk.
         let pack_dir = git_dir.join("objects").join("pack");
-        std::fs::create_dir_all(&pack_dir)?;
-        let skeleton_hash = cas_hash(&metadata.skeleton_pack);
-        std::fs::write(
-            pack_dir.join(format!("pack-{}.pack", skeleton_hash)),
-            &metadata.skeleton_pack,
-        )?;
-        std::fs::write(
-            pack_dir.join(format!("pack-{}.idx", skeleton_hash)),
-            &metadata.skeleton_idx,
-        )?;
-        std::fs::write(git_dir.join("index"), &metadata.prebuilt_index)?;
+        if !files_only {
+            std::fs::create_dir_all(&pack_dir)?;
+            let skeleton_hash = cas_hash(&metadata.skeleton_pack);
+            std::fs::write(
+                pack_dir.join(format!("pack-{}.pack", skeleton_hash)),
+                &metadata.skeleton_pack,
+            )?;
+            std::fs::write(
+                pack_dir.join(format!("pack-{}.idx", skeleton_hash)),
+                &metadata.skeleton_idx,
+            )?;
+            std::fs::write(git_dir.join("index"), &metadata.prebuilt_index)?;
+            info!(
+                "wrote skeleton pack + idx + prebuilt index ({} bytes)",
+                metadata.skeleton_pack.len()
+                    + metadata.skeleton_idx.len()
+                    + metadata.prebuilt_index.len()
+            );
+        } else {
+            info!("files mode: skipped .git skeleton pack, idx, and index install");
+        }
         bench.mark_metadata();
-        info!(
-            "wrote skeleton pack + idx + prebuilt index ({} bytes)",
-            metadata.skeleton_pack.len()
-                + metadata.skeleton_idx.len()
-                + metadata.prebuilt_index.len()
-        );
 
         // 7. Start the working-tree materialization workers.
         let mut manifest_tmp = tempfile::NamedTempFile::new().context("create temp manifest")?;
@@ -1239,6 +1398,9 @@ impl Client {
             let bytes = handle.await.context("archive download coordinator")??;
             archive_bytes = bytes;
         }
+        if let Some(handle) = archive_bridge {
+            handle.await.context("archive download bridge")?;
+        }
         // Editable single-download path: download the small depth packs in
         // parallel and, as each lands, install it and extract its blobs into the
         // working tree. Download and extraction overlap.
@@ -1271,16 +1433,18 @@ impl Client {
         bench.mark_archive_download(archive_bytes + prebuilt_blob_pack_bytes);
 
         // 9. Origin config + finalization.
-        let origin_url = if info.origin_url.is_empty() {
-            if let Some((owner, repo)) = repo_path.split_once('/') {
-                format!("https://github.com/{owner}/{repo}.git")
+        if !files_only {
+            let origin_url = if info.origin_url.is_empty() {
+                if let Some((owner, repo)) = repo_path.split_once('/') {
+                    format!("https://github.com/{owner}/{repo}.git")
+                } else {
+                    format!("https://github.com/{repo_path}.git")
+                }
             } else {
-                format!("https://github.com/{repo_path}.git")
-            }
-        } else {
-            info.origin_url.clone()
-        };
-        self.write_origin_config(&origin_url, &git_dir)?;
+                info.origin_url.clone()
+            };
+            self.write_origin_config(&origin_url, &git_dir)?;
+        }
 
         if let Some(dirs) = overlay_dirs {
             overlay::mount_dirs(&dirs).context("mount overlay at target")?;
@@ -1310,6 +1474,8 @@ impl Client {
         }
 
         let report = bench.finish();
+        let perf = crate::perf::take_perf_counters();
+        let write_timing = crate::worktree_writer::take_write_timing();
         if report.total_ms > 0 {
             info!(
                 "clone benchmark: resolve={}ms manifest={}ms metadata={}ms archive_download={}ms write={}ms total={}ms",
@@ -1319,6 +1485,36 @@ impl Client {
                 report.archive_download_ms,
                 report.write_ms,
                 report.total_ms,
+            );
+            info!(
+                "clone perf counters: archive_send_wait={}ms archive_download_inner={}ms/{}B zstd={}ms/{}->{}B zlib={}ms/{}->{}B sha1={}ms/{}B cas_read={}ms/{}B cas_write={}ms/{}B cas_fsync={}ms storage_upload={}ms/{}B archive_bundle_assembly={}ms/{}B editable_pack_fetch={}ms/{}B writer_prep={}ms writer_io={}ms writer_mtime={}ms writer_files={} writer_bytes={}",
+                perf.archive_send_wait_ns / 1_000_000,
+                perf.archive_download_ns / 1_000_000,
+                perf.archive_download_bytes,
+                perf.zstd_inflate_ns / 1_000_000,
+                perf.zstd_inflate_in_bytes,
+                perf.zstd_inflate_out_bytes,
+                perf.zlib_inflate_ns / 1_000_000,
+                perf.zlib_inflate_in_bytes,
+                perf.zlib_inflate_out_bytes,
+                perf.sha1_ns / 1_000_000,
+                perf.sha1_bytes,
+                perf.cas_read_ns / 1_000_000,
+                perf.cas_read_bytes,
+                perf.cas_write_ns / 1_000_000,
+                perf.cas_write_bytes,
+                perf.cas_fsync_ns / 1_000_000,
+                perf.storage_upload_ns / 1_000_000,
+                perf.storage_upload_bytes,
+                perf.archive_bundle_assembly_ns / 1_000_000,
+                perf.archive_bundle_assembly_bytes,
+                perf.editable_pack_fetch_ns / 1_000_000,
+                perf.editable_pack_fetch_bytes,
+                write_timing.prep_ns / 1_000_000,
+                write_timing.io_ns / 1_000_000,
+                write_timing.mtime_ns / 1_000_000,
+                write_timing.files,
+                write_timing.bytes,
             );
         }
 
@@ -1453,6 +1649,29 @@ impl Client {
         std::fs::create_dir_all(pack_dir)
             .with_context(|| format!("create pack dir {}", pack_dir.display()))?;
 
+        let idx_bundle_task = manifest.idx_bundle.as_ref().map(|bundle_ref| {
+            let client = self.clone();
+            let bundle_ref = bundle_ref.clone();
+            let idx_bundle_url = info.idx_bundle_url.clone();
+            tokio::spawn(async move {
+                client
+                    .fetch_chunk_ref(&bundle_ref, idx_bundle_url.as_deref())
+                    .await
+                    .context("fetch idx bundle")
+            })
+        });
+        let midx_task = manifest.midx.as_ref().map(|midx_ref| {
+            let client = self.clone();
+            let midx_ref = midx_ref.clone();
+            let midx_url = info.midx_url.clone();
+            tokio::spawn(async move {
+                client
+                    .fetch_chunk_ref(&midx_ref, midx_url.as_deref())
+                    .await
+                    .context("fetch pre-built multi-pack-index")
+            })
+        });
+
         // Validate every blob sha1 length up front so `build_blob_path_map`
         // indexes every file and the files-written guard below is exact (a
         // non-20-byte sha1 would otherwise be silently skipped and trip a
@@ -1474,29 +1693,14 @@ impl Client {
             .context("prepare worktree dirs")?;
         let worktree_writer = Arc::new(crate::worktree_writer::WorktreeWriter::new()?);
 
-        // Download and extraction are decoupled stages with independent
-        // concurrency. POSIX performed best at one fetch/write worker per core;
-        // io_uring benefits from one fetch worker and two write workers per
-        // core because each writer can submit larger batched windows.
-        let cores = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4);
-        let default_download_conc = cores.max(1);
-        let default_write_conc = if worktree_writer.is_io_uring() {
-            (cores * 2).max(1)
-        } else {
-            cores.max(1)
-        };
-        let download_conc: usize = std::env::var("RIPCLONE_FETCH_CONCURRENCY")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(default_download_conc)
-            .max(1);
-        let write_conc: usize = std::env::var("RIPCLONE_WRITE_THREADS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(default_write_conc)
-            .max(1);
+        // Download and pack parsing are decoupled stages with independent
+        // concurrency. Keep zlib inflate + SHA-1 parse workers capped at core
+        // count even when the writer backend can profit from deeper io_uring
+        // submission; otherwise `2 * cores` write defaults turn into `2 * cores`
+        // CPU parse tasks.
+        let tuning = ClientTuning::load();
+        let download_conc = tuning.editable_download_concurrency;
+        let parse_conc = tuning.pack_parse_threads;
 
         // Signed URLs (one per pack/idx, matching manifest.packs order). Empty
         // entries fall back to the gateway by hash; with an object-store backend
@@ -1508,16 +1712,29 @@ impl Client {
         // pack's idx out of it locally — instead of one GET per pack idx (cuts
         // per-pack round-trips from 2 to 1). Falls back to per-pack idx fetches
         // for older manifests without a bundle.
-        let idx_bundle: Option<Arc<bytes::Bytes>> = match manifest.idx_bundle.as_ref() {
-            Some(b) => Some(Arc::new(
-                self.fetch_chunk_ref(b, info.idx_bundle_url.as_deref())
-                    .await
-                    .context("fetch idx bundle")?,
-            )),
+        let idx_bundle: Option<Arc<bytes::Bytes>> = match idx_bundle_task {
+            Some(task) => Some(Arc::new(task.await.context("idx bundle fetch task")??)),
             None => None,
         };
 
         let jobs: Vec<(usize, PackEntry)> = manifest.packs.iter().cloned().enumerate().collect();
+
+        enum PackBody {
+            Buffered(bytes::Bytes),
+            TempFile {
+                file: tempfile::NamedTempFile,
+                len: u64,
+            },
+        }
+
+        impl PackBody {
+            fn len(&self) -> usize {
+                match self {
+                    PackBody::Buffered(bytes) => bytes.len(),
+                    PackBody::TempFile { len, .. } => *len as usize,
+                }
+            }
+        }
 
         // Stage 1: download packs (network concurrency `download_conc`).
         let downloads = stream::iter(jobs).map(|(i, entry)| {
@@ -1526,6 +1743,7 @@ impl Client {
             let idx_url = idx_urls.get(i).and_then(|o| o.clone());
             let idx_bundle = idx_bundle.clone();
             let history_only = entry.history_only;
+            let pack_dir = pack_dir.to_path_buf();
             async move {
                 let pack_ref = entry
                     .pack
@@ -1535,7 +1753,7 @@ impl Client {
                     .idx
                     .as_ref()
                     .with_context(|| format!("pack {} missing idx ref", i))?;
-                let (pack_bytes, idx_bytes) = if let Some(bundle) = idx_bundle.as_ref() {
+                let idx_bytes = if let Some(bundle) = idx_bundle.as_ref() {
                     // Slice this pack's idx from the bundle and verify its hash;
                     // only the pack itself needs a network fetch.
                     let off = entry.idx_bundle_offset as usize;
@@ -1554,22 +1772,36 @@ impl Client {
                             "idx {i} bundle slice hash mismatch: expected {want}, got {got}"
                         );
                     }
-                    let pack_bytes = client
+                    slice
+                } else {
+                    client
+                        .fetch_chunk_ref(idx_ref, idx_url.as_deref())
+                        .await
+                        .with_context(|| format!("fetch idx {}", i))?
+                };
+                let pack_fetch_start = std::time::Instant::now();
+                let pack_body = if history_only {
+                    let (file, len) = client
+                        .fetch_chunk_ref_to_temp(pack_ref, pack_url.as_deref(), &pack_dir)
+                        .await
+                        .with_context(|| format!("stream history pack {}", i))?;
+                    crate::perf::record_editable_pack_fetch(pack_fetch_start.elapsed(), len);
+                    PackBody::TempFile { file, len }
+                } else {
+                    let bytes = client
                         .fetch_chunk_ref(pack_ref, pack_url.as_deref())
                         .await
-                        .with_context(|| format!("fetch pack {}", i))?;
-                    (pack_bytes, slice)
-                } else {
-                    tokio::try_join!(
-                        client.fetch_chunk_ref(pack_ref, pack_url.as_deref()),
-                        client.fetch_chunk_ref(idx_ref, idx_url.as_deref()),
-                    )
-                    .with_context(|| format!("fetch pack {}", i))?
+                        .with_context(|| format!("fetch head pack {}", i))?;
+                    crate::perf::record_editable_pack_fetch(
+                        pack_fetch_start.elapsed(),
+                        bytes.len() as u64,
+                    );
+                    PackBody::Buffered(bytes)
                 };
-                Ok::<(usize, bool, bytes::Bytes, bytes::Bytes), anyhow::Error>((
+                Ok::<(usize, bool, PackBody, bytes::Bytes), anyhow::Error>((
                     i,
                     history_only,
-                    pack_bytes,
+                    pack_body,
                     idx_bytes,
                 ))
             }
@@ -1586,21 +1818,46 @@ impl Client {
                 let blob_map = Arc::clone(&blob_map);
                 let worktree_writer = Arc::clone(&worktree_writer);
                 async move {
-                    let (i, history_only, pack_bytes, idx_bytes) = res?;
-                    let bytes = (pack_bytes.len() + idx_bytes.len()) as u64;
+                    let (i, history_only, pack_body, idx_bytes) = res?;
+                    let bytes = (pack_body.len() + idx_bytes.len()) as u64;
                     let result = tokio::task::spawn_blocking(
                         move || -> Result<crate::extract::PackExtractResult> {
-                            if pack_bytes.len() < 20 {
-                                anyhow::bail!("pack {} too short ({} bytes)", i, pack_bytes.len());
+                            if pack_body.len() < 20 {
+                                anyhow::bail!("pack {} too short ({} bytes)", i, pack_body.len());
                             }
-                            // Git names packs by the 20-byte trailer sha; the idx
-                            // pairs to the pack by basename.
-                            let name = hex::encode(&pack_bytes[pack_bytes.len() - 20..]);
-                            std::fs::write(
-                                pack_dir.join(format!("pack-{}.pack", name)),
-                                &pack_bytes,
-                            )
-                            .with_context(|| format!("write pack {}", name))?;
+                            let (name, pack_bytes) = match pack_body {
+                                PackBody::Buffered(pack_bytes) => {
+                                    // Git names packs by the 20-byte trailer sha; the idx
+                                    // pairs to the pack by basename.
+                                    let name = hex::encode(&pack_bytes[pack_bytes.len() - 20..]);
+                                    std::fs::write(
+                                        pack_dir.join(format!("pack-{}.pack", name)),
+                                        &pack_bytes,
+                                    )
+                                    .with_context(|| format!("write pack {}", name))?;
+                                    (name, Some(pack_bytes))
+                                }
+                                PackBody::TempFile { file, len } => {
+                                    use std::io::{Read, Seek, SeekFrom};
+                                    let mut reader = file
+                                        .as_file()
+                                        .try_clone()
+                                        .context("clone streamed pack file")?;
+                                    reader
+                                        .seek(SeekFrom::Start(len - 20))
+                                        .context("seek streamed pack trailer")?;
+                                    let mut trailer = [0u8; 20];
+                                    reader
+                                        .read_exact(&mut trailer)
+                                        .context("read streamed pack trailer")?;
+                                    let name = hex::encode(trailer);
+                                    file.persist(pack_dir.join(format!("pack-{}.pack", name)))
+                                        .with_context(|| {
+                                            format!("install streamed pack {}", name)
+                                        })?;
+                                    (name, None)
+                                }
+                            };
                             std::fs::write(pack_dir.join(format!("pack-{}.idx", name)), &idx_bytes)
                                 .with_context(|| format!("write idx {}", name))?;
                             if history_only {
@@ -1609,6 +1866,9 @@ impl Client {
                                     stats: Vec::new(),
                                 });
                             }
+                            let Some(pack_bytes) = pack_bytes else {
+                                anyhow::bail!("head pack {} was not buffered for extraction", i);
+                            };
                             crate::extract::extract_blobs_from_pack_bytes(
                                 &pack_bytes,
                                 &blob_map,
@@ -1623,7 +1883,7 @@ impl Client {
                     Ok::<(u64, crate::extract::PackExtractResult), anyhow::Error>((bytes, result))
                 }
             })
-            .buffer_unordered(write_conc)
+            .buffer_unordered(parse_conc)
             .try_fold(
                 (0u64, 0usize, Vec::new()),
                 |(ab, aw, mut stats), (b, result)| async move {
@@ -1645,14 +1905,14 @@ impl Client {
         }
 
         // Files are materialized; clear skip-worktree for every tracked path.
-        let paths: Vec<String> = metadata
-            .files
-            .iter()
-            .map(|e| String::from_utf8_lossy(&e.path).into_owned())
-            .collect();
+        let path_bytes: Vec<Vec<u8>> = metadata.files.iter().map(|e| e.path.clone()).collect();
         let work_tree2 = work_tree.to_path_buf();
         tokio::task::spawn_blocking(move || {
-            crate::git::clear_skip_worktree_index_with_stats(&work_tree2, &paths, &stat_cache)
+            crate::git::clear_skip_worktree_index_with_stats_byte_iter(
+                &work_tree2,
+                path_bytes.iter().map(Vec::as_slice),
+                &stat_cache,
+            )
         })
         .await
         .context("spawn clear skip-worktree and refresh index stats")??;
@@ -1663,10 +1923,11 @@ impl Client {
         // fall back to building it locally for older manifests without one. Best
         // effort either way — without a MIDX the clone is still correct, just
         // with slower per-object lookups.
-        if let Some(midx_ref) = manifest.midx.as_ref() {
-            match self
-                .fetch_chunk_ref(midx_ref, info.midx_url.as_deref())
+        if let Some(midx_task) = midx_task {
+            match midx_task
                 .await
+                .context("pre-built MIDX fetch task")
+                .and_then(|r| r)
             {
                 Ok(midx_bytes) => {
                     tokio::fs::write(pack_dir.join("multi-pack-index"), &midx_bytes)
@@ -1734,11 +1995,7 @@ impl Client {
             .with_context(|| format!("clone temp {} pack fd", label))?;
 
         let signed_urls = chunk_urls.unwrap_or(&[]);
-        let concurrency: usize = std::env::var("RIPCLONE_FETCH_CONCURRENCY")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(6)
-            .max(1);
+        let concurrency = ClientTuning::load().fetch_concurrency;
 
         // Compute final pack size and per-chunk byte offsets.
         let mut offsets = Vec::with_capacity(chunk_refs.len());
@@ -1880,12 +2137,12 @@ impl Client {
         self,
         signed_urls: Option<Vec<Option<String>>>,
         manifest_rx: tokio::sync::oneshot::Receiver<Arc<ClonepackManifest>>,
-        tx: Sender<(usize, Result<Vec<u8>>)>,
+        tx: tokio::sync::mpsc::Sender<(usize, Result<bytes::Bytes>)>,
     ) -> tokio::task::JoinHandle<Result<u64>> {
         tokio::spawn(async move {
+            use futures::stream::{self, StreamExt, TryStreamExt};
+
             let signed_urls: Vec<Option<String>> = signed_urls.unwrap_or_default();
-            let mut total_bytes = 0u64;
-            let mut handles = Vec::new();
 
             // Wait for the manifest so the downloader follows its chunk table,
             // not a possibly-stale signed-URL list. A receive error means the
@@ -1896,50 +2153,44 @@ impl Client {
                 Ok(manifest) => manifest,
                 Err(_) => return Ok(0),
             };
-            // Bound concurrent chunk downloads. With CDC the archive can have
-            // hundreds-to-thousands of chunks (one per ~4 MiB frame); without a
-            // cap, spawning a request + buffering a frame for every chunk at once
-            // would exhaust the connection pool and spike memory.
-            let conc = std::env::var("RIPCLONE_FETCH_CONCURRENCY")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(16usize)
-                .max(1);
-            let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(conc));
-            for (index, chunk_ref) in manifest.archive_chunks.iter().cloned().enumerate() {
-                let client = self.clone();
-                let tx = tx.clone();
-                let signed_url = signed_urls.get(index).cloned().flatten();
-                let sem = std::sync::Arc::clone(&sem);
-                let handle = tokio::spawn(async move {
-                    let _permit = sem
-                        .acquire()
-                        .await
-                        .map_err(|_| anyhow::anyhow!("download semaphore closed"))?;
-                    // No by-hash gateway fallback: a failed signed URL surfaces as
-                    // StaleSignedUrl and the clone driver re-resolves for fresh URLs.
-                    let bytes = client
-                        .fetch_chunk_ref(&chunk_ref, signed_url.as_deref())
-                        .await
-                        .with_context(|| format!("fetch archive chunk {}", index))?;
-                    let len = bytes.len() as u64;
-                    // The archive streaming channel still carries Vec<u8>; this is
-                    // the same single copy the old code made at the fetch boundary
-                    // (no regression). Carrying Bytes through the archive pipeline
-                    // is the separate R4 change, deferred.
-                    tx.send((index, Ok(bytes.to_vec())))
-                        .map_err(|_| anyhow::anyhow!("archive chunk {} receiver dropped", index))?;
-                    Ok::<u64, anyhow::Error>(len)
-                });
-                handles.push(handle);
-            }
+            // Bound concurrent chunk downloads. Backpressure is async: if the
+            // downstream bridge/extractor falls behind, futures await `send()`
+            // without blocking Tokio worker threads.
+            let conc = ClientTuning::load().archive_fetch_concurrency;
+            let jobs: Vec<(usize, ChunkRef, Option<String>)> = manifest
+                .archive_chunks
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(|(index, chunk_ref)| {
+                    let signed_url = signed_urls.get(index).cloned().flatten();
+                    (index, chunk_ref, signed_url)
+                })
+                .collect();
 
-            drop(tx);
-
-            for handle in handles {
-                total_bytes += handle.await.context("chunk download task")??;
-            }
-            Ok(total_bytes)
+            stream::iter(jobs)
+                .map(|(index, chunk_ref, signed_url)| {
+                    let client = self.clone();
+                    let tx = tx.clone();
+                    async move {
+                        // No by-hash gateway fallback: a failed signed URL surfaces as
+                        // StaleSignedUrl and the clone driver re-resolves for fresh URLs.
+                        let fetch_start = Instant::now();
+                        let bytes = client
+                            .fetch_chunk_ref(&chunk_ref, signed_url.as_deref())
+                            .await
+                            .with_context(|| format!("fetch archive chunk {}", index))?;
+                        let len = bytes.len() as u64;
+                        crate::perf::record_archive_download(fetch_start.elapsed(), len);
+                        tx.send((index, Ok(bytes))).await.map_err(|_| {
+                            anyhow::anyhow!("archive chunk {} receiver dropped", index)
+                        })?;
+                        Ok::<u64, anyhow::Error>(len)
+                    }
+                })
+                .buffer_unordered(conc)
+                .try_fold(0u64, |acc, len| async move { Ok(acc + len) })
+                .await
         })
     }
 

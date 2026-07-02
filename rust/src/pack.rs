@@ -481,12 +481,8 @@ impl<'a> PackBuilder<'a> {
             let idx_path = idxs
                 .get(&name)
                 .with_context(|| format!("missing idx for {name}"))?;
-            let pack_data = std::fs::read(pack_path)?;
-            let idx_data = std::fs::read(idx_path)?;
-            let pack_len = pack_data.len() as u64;
-            let idx_len = idx_data.len() as u64;
-            let pack_hash = self.cas.put(&pack_data)?;
-            let idx_hash = self.cas.put(&idx_data)?;
+            let (pack_hash, pack_len) = self.cas.put_file(pack_path)?;
+            let (idx_hash, idx_len) = self.cas.put_file(idx_path)?;
             out.push((pack_hash, pack_len, idx_hash, idx_len));
         }
         if out.is_empty() {
@@ -661,12 +657,8 @@ impl<'a> PackBuilder<'a> {
         let pack_path = pack_path.context("missing generated pack file")?;
         let idx_path = idx_path.context("missing generated idx file")?;
 
-        let pack_data = std::fs::read(&pack_path)?;
-        let idx_data = std::fs::read(&idx_path)?;
-        let pack_len = pack_data.len() as u64;
-        let idx_len = idx_data.len() as u64;
-        let pack_hash = self.cas.put(&pack_data)?;
-        let idx_hash = self.cas.put(&idx_data)?;
+        let (pack_hash, pack_len) = self.cas.put_file(&pack_path)?;
+        let (idx_hash, idx_len) = self.cas.put_file(&idx_path)?;
 
         Ok((pack_hash, pack_len, idx_hash, idx_len))
     }

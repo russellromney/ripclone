@@ -76,6 +76,11 @@ typically built before any clone asks for it. Multi-provider webhooks (GitLab,
 Bitbucket — different signature schemes) and cross-replica poll coordination are
 future work; v1 is GitHub-only, single-server.
 
+`POST /v1/repos/{provider}/{repo-path}/sync` returns the normal ref payload plus
+`status`, `phases` (`mirror_fetch_ms`, `commit_graph_ms`, `publish_p1_ms`,
+`head_packs_ms`), and best-effort `bytes`/`unique_bytes`; `/status` includes
+`build_ms` on each ref once the full build finishes.
+
 ## Make syncs not wait
 
 ### 1. Cheap tip resolution (`ls-remote`)
