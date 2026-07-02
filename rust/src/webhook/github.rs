@@ -9,7 +9,7 @@
 
 use super::{CanonicalEvent, EventKind, WebhookProvider, is_zero_sha};
 use axum::http::HeaderMap;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
 
@@ -116,7 +116,7 @@ struct Owner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hmac::Mac;
+    use hmac::{KeyInit, Mac};
 
     /// Compute the header value a real GitHub delivery would send.
     fn sign(secret: &str, body: &[u8]) -> String {

@@ -719,20 +719,17 @@ async fn run_auth_login(server: &str) -> Result<()> {
     // A CSRF-style nonce echoed back through the callback. The ephemeral loopback
     // port + 3-minute window are the primary protection; this just binds the
     // browser round-trip to this CLI invocation, so no crypto-rng dep is needed.
-    let state = format!(
-        "{:x}",
-        Sha256::digest(
-            format!(
-                "{}-{}",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos())
-                    .unwrap_or(0),
-                std::process::id()
-            )
-            .as_bytes()
+    let state = hex::encode(Sha256::digest(
+        format!(
+            "{}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+            std::process::id()
         )
-    );
+        .as_bytes(),
+    ));
 
     // Loopback auto-capture: bind a localhost port, send the browser to /login
     // with that callback, and wait for the redirect to land the token here.
@@ -1165,7 +1162,7 @@ async fn main() -> Result<()> {
             env::var("RIPCLONE_SERVER_TOKEN")
                 .ok()
                 .filter(|t| !t.is_empty())
-                .map(|t| format!("{:x}", Sha256::digest(t.as_bytes())))
+                .map(|t| hex::encode(Sha256::digest(t.as_bytes())))
         })
         .or_else(|| {
             env::var("RIPCLONE_TOKEN_HASH")
@@ -1178,7 +1175,7 @@ async fn main() -> Result<()> {
                 .filter(|t| !t.is_empty())
                 .map(|t| {
                     eprintln!("warning: RIPCLONE_TOKEN is deprecated for server auth; use RIPCLONE_SERVER_TOKEN");
-                    format!("{:x}", Sha256::digest(t.as_bytes()))
+                    hex::encode(Sha256::digest(t.as_bytes()))
                 })
         })
         .or_else(|| {
@@ -1186,14 +1183,14 @@ async fn main() -> Result<()> {
                 .token
                 .as_deref()
                 .filter(|t| !t.is_empty())
-                .map(|t| format!("{:x}", Sha256::digest(t.as_bytes())))
+                .map(|t| hex::encode(Sha256::digest(t.as_bytes())))
         })
         .or_else(|| {
             token_store()
                 .ok()
                 .and_then(|store| store.get("server").ok().flatten())
                 .filter(|t| !t.is_empty())
-                .map(|t| format!("{:x}", Sha256::digest(t.as_bytes())))
+                .map(|t| hex::encode(Sha256::digest(t.as_bytes())))
         });
     // Prefer a session token from `ripclone auth login` over the saved login
     // token, unless an explicit env server token is configured (that still wins).

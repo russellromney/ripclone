@@ -899,7 +899,7 @@ async fn auth_login_handler(
             .into_response();
     };
 
-    let presented = format!("{:x}", Sha256::digest(form.secret.as_bytes()));
+    let presented = hex::encode(Sha256::digest(form.secret.as_bytes()));
     if !constant_time_eq_str(&presented, expected) {
         return (
             StatusCode::UNAUTHORIZED,
@@ -5781,7 +5781,7 @@ async fn update_build_status(state: &ServerState, repo_id: &RepoId, status: &str
 /// it is unit-testable without starting a server or touching global state.
 fn auth_token_hash(raw: Option<String>) -> Result<String> {
     raw.filter(|t| !t.is_empty())
-        .map(|t| format!("{:x}", Sha256::digest(t.as_bytes())))
+        .map(|t| hex::encode(Sha256::digest(t.as_bytes())))
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "RIPCLONE_SERVER_TOKEN is not set. Refusing to start an unauthenticated server."
@@ -5807,7 +5807,7 @@ fn read_server_auth_token() -> Result<String> {
         .ok()
         .filter(|t| !t.is_empty())
     {
-        return Ok(format!("{:x}", Sha256::digest(raw.as_bytes())));
+        return Ok(hex::encode(Sha256::digest(raw.as_bytes())));
     }
     if let Some(hash) = env::var("RIPCLONE_TOKEN_HASH")
         .ok()
@@ -5822,7 +5822,7 @@ fn read_server_auth_token() -> Result<String> {
         eprintln!(
             "warning: RIPCLONE_TOKEN is deprecated for server auth; use RIPCLONE_SERVER_TOKEN"
         );
-        return Ok(format!("{:x}", Sha256::digest(raw.as_bytes())));
+        return Ok(hex::encode(Sha256::digest(raw.as_bytes())));
     }
     auth_token_hash(None)
 }
@@ -6015,7 +6015,7 @@ mod tests {
         std::fs::create_dir_all(&repo_root).unwrap();
         let ref_store: Arc<dyn RefStore> =
             Arc::new(crate::ref_store::FileRefStore::new(&repo_root));
-        let token_hash = format!("{:x}", Sha256::digest("secret"));
+        let token_hash = hex::encode(Sha256::digest("secret"));
         let metrics = Metrics::new();
         let retention = Arc::new(Retention::new(cas.clone(), metrics.clone()).unwrap());
         let (local_queue, _build_rx, _depth) = crate::queue::LocalJobQueue::new(16);
@@ -6058,7 +6058,7 @@ mod tests {
     }
 
     fn auth_header() -> String {
-        format!("Ripclone {:x}", Sha256::digest("secret"))
+        format!("Ripclone {}", hex::encode(Sha256::digest("secret")))
     }
 
     #[test]
@@ -6134,7 +6134,7 @@ mod tests {
         }
         // ...and a real token hashes to the same digest the auth middleware checks.
         let hash = auth_token_hash(Some("secret".to_string())).unwrap();
-        assert_eq!(hash, format!("{:x}", Sha256::digest("secret")));
+        assert_eq!(hash, hex::encode(Sha256::digest("secret")));
     }
 
     #[test]
@@ -6149,7 +6149,7 @@ mod tests {
         unsafe { env::set_var("RIPCLONE_SERVER_TOKEN", "new-secret") };
         assert_eq!(
             read_server_auth_token().unwrap(),
-            format!("{:x}", Sha256::digest("new-secret"))
+            hex::encode(Sha256::digest("new-secret"))
         );
         unsafe { env::set_var("RIPCLONE_SERVER_TOKEN_HASH", "prefixed-hash") };
         assert_eq!(read_server_auth_token().unwrap(), "prefixed-hash");
@@ -6611,7 +6611,7 @@ mod tests {
     }
 
     fn gh_sign(secret: &str, body: &[u8]) -> String {
-        use hmac::{Hmac, Mac};
+        use hmac::{Hmac, KeyInit, Mac};
         use sha2::Sha256;
         let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
         mac.update(body);
@@ -7278,7 +7278,7 @@ mod tests {
         let body = br#"{"ref":"refs/heads/main","after":"1111111111111111111111111111111111111111","repository":{"full_name":"acme/widget","default_branch":"main","private":true}}"#.to_vec();
         // Gitea signs the raw body with HMAC-SHA256, bare hex in X-Gitea-Signature.
         let sig = {
-            use hmac::{Hmac, Mac};
+            use hmac::{Hmac, KeyInit, Mac};
             use sha2::Sha256;
             let mut mac = Hmac::<Sha256>::new_from_slice(WEBHOOK_SECRET.as_bytes()).unwrap();
             mac.update(&body);
@@ -7322,7 +7322,7 @@ mod tests {
         // Gitea's `delete` event uses a bare branch name + ref_type.
         let body = br#"{"ref":"feature","ref_type":"branch","repository":{"full_name":"acme/widget","default_branch":"main"}}"#.to_vec();
         let sig = {
-            use hmac::{Hmac, Mac};
+            use hmac::{Hmac, KeyInit, Mac};
             use sha2::Sha256;
             let mut mac = Hmac::<Sha256>::new_from_slice(WEBHOOK_SECRET.as_bytes()).unwrap();
             mac.update(&body);
@@ -7357,7 +7357,7 @@ mod tests {
         let body = br#"{"ref":"refs/heads/main","after":"1111111111111111111111111111111111111111","repository":{"full_name":"acme/widget","default_branch":"main"}}"#.to_vec();
         // Sign with the WRONG secret.
         let sig = {
-            use hmac::{Hmac, Mac};
+            use hmac::{Hmac, KeyInit, Mac};
             use sha2::Sha256;
             let mut mac = Hmac::<Sha256>::new_from_slice(b"wrong-secret").unwrap();
             mac.update(&body);

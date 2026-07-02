@@ -355,7 +355,7 @@ mod tests {
 
     fn hash_of(data: &[u8]) -> String {
         use sha2::{Digest, Sha256};
-        format!("{:x}", Sha256::digest(data))
+        hex::encode(Sha256::digest(data))
     }
 
     /// An artifact a live ref points at must survive retention even when it was
@@ -492,7 +492,7 @@ mod tests {
         // Store a 40-character SHA-1 object (the format used for git blobs).
         let data = b"sha1-blob-object";
         use sha1::{Digest, Sha1};
-        let sha1_hash = format!("{:x}", Sha1::digest(data));
+        let sha1_hash = hex::encode(Sha1::digest(data));
         assert_eq!(sha1_hash.len(), 40);
         cas.put_with_hash(&sha1_hash, data).unwrap();
         let path = cas.path(&sha1_hash);

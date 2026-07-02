@@ -283,7 +283,7 @@ fn resolve_server_token() -> Option<String> {
         .ok()
         .filter(|t| !t.is_empty())
     {
-        return Some(format!("{:x}", Sha256::digest(raw.as_bytes())));
+        return Some(hex::encode(Sha256::digest(raw.as_bytes())));
     }
     if let Some(hash) = env::var("RIPCLONE_TOKEN_HASH")
         .ok()
@@ -301,7 +301,7 @@ fn resolve_server_token() -> Option<String> {
             eprintln!(
                 "warning: RIPCLONE_TOKEN is deprecated for server auth; use RIPCLONE_SERVER_TOKEN"
             );
-            format!("{:x}", Sha256::digest(t.as_bytes()))
+            hex::encode(Sha256::digest(t.as_bytes()))
         })
 }
 
@@ -375,7 +375,7 @@ mod tests {
         unsafe { env::set_var("RIPCLONE_SERVER_TOKEN", "new-secret") };
         assert_eq!(
             resolve_server_token().unwrap(),
-            format!("{:x}", Sha256::digest("new-secret"))
+            hex::encode(Sha256::digest("new-secret"))
         );
         unsafe { env::set_var("RIPCLONE_SERVER_TOKEN_HASH", "prefixed-hash") };
         assert_eq!(resolve_server_token().unwrap(), "prefixed-hash");
