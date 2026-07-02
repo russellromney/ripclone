@@ -2426,8 +2426,9 @@ async fn build_repo_status(
 }
 
 /// Target size for each chunk of the head-blobs pack on the client fetch path.
-/// 8 MB matches the archive chunk target and keeps per-request overhead low.
-const HEAD_BLOBS_CHUNK_SIZE: usize = 8 * 1024 * 1024;
+/// 4 MB matches the archive chunk target and keeps enough requests in flight to
+/// benefit high-bandwidth links without making small-file clones too chatty.
+const HEAD_BLOBS_CHUNK_SIZE: usize = 4 * 1024 * 1024;
 
 /// Split a pack file into content-addressed chunks and store them in the CAS.
 /// Returns the `ChunkRef`s in the order needed to reconstruct the pack.
@@ -4529,7 +4530,7 @@ async fn build_and_publish_two_phase(
     // packs the full closure as the base. The cumulative delta grows as HEAD moves
     // from the base; phase 2 rebases (rebuilds the base at HEAD) once it exceeds
     // RIPCLONE_HEAD_REBASE_BYTES, off the depth=1 critical path.
-    let head_target = env_bytes("RIPCLONE_PACK_BYTES", 12 * 1024 * 1024);
+    let head_target = env_bytes("RIPCLONE_PACK_BYTES", 4 * 1024 * 1024);
     let prev_base_commit: Option<String> = prev
         .as_ref()
         .map(|p| p.head_base_commit.clone())
@@ -5060,7 +5061,7 @@ async fn build_full_in_background(
         Vec<(String, u64, String, u64)>,
         Option<Vec<crate::SizedPack>>,
     ) = if delta_bytes >= rebase_bytes {
-        let head_target = env_bytes("RIPCLONE_PACK_BYTES", 12 * 1024 * 1024);
+        let head_target = env_bytes("RIPCLONE_PACK_BYTES", 4 * 1024 * 1024);
         let (mdc, cc, cmc) = (mirror_dir.to_path_buf(), cas.clone(), commit.to_string());
         let base = tokio::task::spawn_blocking(move || {
             PackBuilder::new(&mdc, &cc).build_head_packs(&cmc, head_target)

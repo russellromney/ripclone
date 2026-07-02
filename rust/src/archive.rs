@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 /// Default compressed size cap for a single archive chunk.
-pub const DEFAULT_ARCHIVE_CHUNK_SIZE: u64 = 8 * 1024 * 1024;
+pub const DEFAULT_ARCHIVE_CHUNK_SIZE: u64 = 4 * 1024 * 1024;
 
 /// Content-defined chunking bounds for the worktree stream (fastcdc v2020).
 /// Boundaries depend on content, not cumulative position, so a localized edit

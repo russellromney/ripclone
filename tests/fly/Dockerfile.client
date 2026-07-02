@@ -47,7 +47,8 @@ RUN chmod +x /run-tests.sh
 
 COPY benchmark/fly_shaped_benchmark.sh /usr/local/bin/fly_shaped_benchmark
 COPY benchmark/run_shaped_sweep.sh /usr/local/bin/run_shaped_sweep
-RUN chmod +x /usr/local/bin/fly_shaped_benchmark /usr/local/bin/run_shaped_sweep
+RUN chmod +x /usr/local/bin/fly_shaped_benchmark /usr/local/bin/run_shaped_sweep \
+    && ln -s /usr/local/bin/fly_shaped_benchmark /usr/local/bin/fly_shaped_benchmark.sh
 
 ENV RUST_LOG=info
 ENV PATH="/usr/local/bin:${PATH}"

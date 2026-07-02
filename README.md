@@ -41,8 +41,8 @@ ripclone pre-builds git artifacts so clones are faster than `git clone` across t
 
 At 1 Gbps, measured speedups over native `git clone` are:
 
-- **`oven-sh/bun`**: full clone **8.3×**, depth-1 **7.4×**, files **9.2×**.
-- **`pandas-dev/pandas`**: full clone **4.6×**, depth-1 **4.3×**, files **6.7×**.
+- **`oven-sh/bun`**: full clone **11.7×**, depth-1 **3.3×**, files **5.4×**.
+- **`pandas-dev/pandas`**: full clone **7.6×**, depth-1 **6.0×**, files **7.4×**.
 - **`torvalds/linux`** (high-bandwidth EC2 run): full clone up to **~10×**, depth-1 **~6×**, files **~8×**. See the full EC2 Linux table below and [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
 
 The full-clone win is smaller on pandas than on bun because pandas's full pack is large enough that transfer dominates; depth-1 and `files` mode avoid most of that transfer, so they stay ahead. The shaped sweep now covers **250/500 Mbps and 1/2/5/10 Gbps** to match modern links; the old 50 Mbps row and warm-cache baselines have been dropped because they are not representative for real clones.
@@ -57,25 +57,25 @@ The sweep covers **250/500 Mbps and 1/2/5/10 Gbps** to match modern links. The o
 
 **`oven-sh/bun`**
 
-| Mbps | ripclone full | ripclone depth=1 | ripclone files | git clone full | git clone --depth 1 |
-|------|---------------|------------------|----------------|----------------|---------------------|
-| 10000 | 2.1 s | 1.0 s | 0.7 s | 38.9 s | 6.8 s |
-| 5000 | 2.0 s | 1.0 s | 0.7 s | 38.8 s | 6.7 s |
-| 2000 | 2.3 s | 1.0 s | 0.7 s | 38.3 s | 6.7 s |
-| 1000 | 4.8 s | 0.9 s | 0.7 s | 39.7 s | 6.6 s |
-| 500 | 7.1 s | 1.0 s | 0.7 s | 38.3 s | 3.4 s |
-| 250 | 13.3 s | 2.2 s | 2.0 s | 42.5 s | 3.4 s |
+| Mbps | ripclone full | ripclone depth=1 | ripclone files |
+|------|---------------|------------------|----------------|
+| 10000 | 1.422 s | 0.759 s | 0.871 s |
+| 5000 | 1.453 s | 0.779 s | 0.598 s |
+| 2000 | 1.408 s | 0.793 s | 0.602 s |
+| 1000 | 3.443 s | 1.023 s | 0.625 s |
+| 500 | 6.136 s | 0.785 s | 0.588 s |
+| 250 | 12.580 s | 2.006 s | 1.542 s |
 
 **`pandas-dev/pandas`**
 
-| Mbps | ripclone full | ripclone depth=1 | ripclone files | git clone full | git clone --depth 1 |
-|------|---------------|------------------|----------------|----------------|---------------------|
-| 10000 | 2.0 s | 0.5 s | 0.6 s | 22.4 s | 1.9 s |
-| 5000 | 2.4 s | 0.5 s | 0.3 s | 21.4 s | 1.9 s |
-| 2000 | 2.8 s | 0.5 s | 0.3 s | 21.9 s | 1.8 s |
-| 1000 | 4.7 s | 0.4 s | 0.3 s | 21.8 s | 1.8 s |
-| 500 | 7.3 s | 0.5 s | 0.3 s | 21.7 s | 1.9 s |
-| 250 | 14.7 s | 0.7 s | 0.4 s | 26.1 s | 1.9 s |
+| Mbps | ripclone full | ripclone depth=1 | ripclone files |
+|------|---------------|------------------|----------------|
+| 10000 | 1.112 s | 0.347 s | 0.239 s |
+| 5000 | 1.015 s | 0.554 s | 0.239 s |
+| 2000 | 1.333 s | 0.318 s | 0.268 s |
+| 1000 | 2.996 s | 0.316 s | 0.256 s |
+| 500 | 5.719 s | 0.346 s | 0.250 s |
+| 250 | 11.966 s | 0.315 s | 0.232 s |
 
 **`torvalds/linux`** (high-bandwidth EC2 client — `c6i.8xlarge`, 32 vCPU, shaped link)
 
