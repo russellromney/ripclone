@@ -37,7 +37,7 @@ See **[Design](docs/DESIGN.md)** for how a clonepack is built and synced.
 
 ### Performance
 
-ripclone pre-builds git artifacts so clones are faster than `git clone` across the bandwidths we tested, from 250 Mbps up to 10 Gbps. On a 1 Gbps link the wins are largest; as bandwidth drops the download itself dominates and the gap narrows.
+ripclone pre-builds git artifacts so clones are faster than `git clone` across the Fly bandwidths we tested, from 250 Mbps up to about 1 Gbps. On a 1 Gbps link the wins are largest; as bandwidth drops the download itself dominates and the gap narrows.
 
 At 1 Gbps, measured speedups over native `git clone` are:
 
@@ -45,7 +45,7 @@ At 1 Gbps, measured speedups over native `git clone` are:
 - **`pandas-dev/pandas`**: full clone **7.6×**, depth-1 **6.0×**, files **7.4×**.
 - **`torvalds/linux`** (high-bandwidth EC2 run): full clone up to **~10×**, depth-1 **~6×**, files **~8×**. See the full EC2 Linux table below and [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
 
-The full-clone win is smaller on pandas than on bun because pandas's full pack is large enough that transfer dominates; depth-1 and `files` mode avoid most of that transfer, so they stay ahead. The shaped sweep now covers **250/500 Mbps and 1/2/5/10 Gbps** to match modern links; the old 50 Mbps row and warm-cache baselines have been dropped because they are not representative for real clones.
+The full-clone win is smaller on pandas than on bun because pandas's full pack is large enough that transfer dominates; depth-1 and `files` mode avoid most of that transfer, so they stay ahead. The Fly sweep below covers **250/500 Mbps and 1 Gbps**. Higher-rate rows from Fly are omitted because they are traffic-shaper caps above the actual path capacity, not real 2/5/10 Gbps measurements.
 
 *Mode labels:* `ripclone full` and `ripclone depth=1` are the `editable` CLI mode with `--depth 0` and `--depth 1`, respectively. `ripclone files` is the `files` CLI mode (HEAD worktree only).
 
@@ -53,15 +53,12 @@ The full-clone win is smaller on pandas than on bun because pandas's full pack i
 
 We run `ripclone` against native `git clone` on a Fly.io `performance-8x` client talking to `ripclone-server-dev` over shaped links. Each cell is the median of 3 runs with a cold client cache (`RIPCLONE_NO_CACHE=1`). `oven-sh/bun` is pinned to commit `b2aa0d5d94e3a42d88d4c58e4488c07e67b0f037`; `pandas-dev/pandas` is pinned to tag `v2.2.2` (`d9cdd2ee5a58015ef6f4d15c7226110c9aab8140`).
 
-The sweep covers **250/500 Mbps and 1/2/5/10 Gbps** to match modern links. The old 50 Mbps row and warm-cache baselines have been dropped because they are not representative for real clones.
+The sweep covers **250/500 Mbps and 1 Gbps**. The old 50 Mbps row and warm-cache baselines have been dropped because they are not representative for real clones. The Fly client path is roughly 1 Gbps in practice; higher shaped caps are useful for internal trend checks, but are not launch-quality benchmark claims.
 
 **`oven-sh/bun`**
 
 | Mbps | ripclone full | ripclone depth=1 | ripclone files | git clone full | git clone --depth 1 |
 |------|---------------|------------------|----------------|----------------|---------------------|
-| 10000 | 1.422 s | 0.759 s | 0.871 s | 39.05 s | 3.25 s |
-| 5000 | 1.453 s | 0.779 s | 0.598 s | 39.28 s | 3.24 s |
-| 2000 | 1.408 s | 0.793 s | 0.602 s | 39.68 s | 3.19 s |
 | 1000 | 3.443 s | 1.023 s | 0.625 s | 40.26 s | 3.37 s |
 | 500 | 6.136 s | 0.785 s | 0.588 s | 39.72 s | 3.60 s |
 | 250 | 12.580 s | 2.006 s | 1.542 s | 41.07 s | 3.33 s |
@@ -70,9 +67,6 @@ The sweep covers **250/500 Mbps and 1/2/5/10 Gbps** to match modern links. The o
 
 | Mbps | ripclone full | ripclone depth=1 | ripclone files | git clone full | git clone --depth 1 |
 |------|---------------|------------------|----------------|----------------|---------------------|
-| 10000 | 1.112 s | 0.347 s | 0.239 s | 22.35 s | 1.91 s |
-| 5000 | 1.015 s | 0.554 s | 0.239 s | 22.88 s | 1.90 s |
-| 2000 | 1.333 s | 0.318 s | 0.268 s | 22.27 s | 1.90 s |
 | 1000 | 2.996 s | 0.316 s | 0.256 s | 22.75 s | 1.90 s |
 | 500 | 5.719 s | 0.346 s | 0.250 s | 22.81 s | 1.90 s |
 | 250 | 11.966 s | 0.315 s | 0.232 s | 26.20 s | 1.87 s |

@@ -11,13 +11,13 @@ volumes can hide.
 
 The authoritative numbers live in the [Performance section of `README.md`](../README.md#performance). They are measured on a Fly.io `performance-8x` client in `ewr` talking to `ripclone-server-dev` in `iad`, with the client↔server link shaped to the listed bandwidth. Each cell is the median of 3 runs with a fresh client cache (`RIPCLONE_NO_CACHE=1`).
 
-The sweep now covers **250 Mbps, 500 Mbps, 1 Gbps, 2 Gbps, 5 Gbps, and 10 Gbps**. The older 50 Mbps and 100 Mbps rows have been dropped — they are slower than most real user links and the sweep is focused on the range where ripclone is used. Warm-cache numbers are also omitted because they assume the server, object-storage edge, and client are all in the same warm state, which is not representative for real clones.
+The Fly launch table covers **250 Mbps, 500 Mbps, and 1 Gbps**. Higher Fly-shaped caps are omitted because that path is only about 1 Gbps in practice; 2/5/10 Gbps Fly rows are useful internal stress checks, not real link measurements. The older 50 Mbps and 100 Mbps rows have been dropped because they are slower than most real user links. Warm-cache numbers are also omitted because they assume the server, object-storage edge, and client are all in the same warm state, which is not representative for real clones.
 
 Key takeaways from the latest sweep:
 
-- **ripclone wins at every tested bandwidth** for full-history and files-mode clones, with the biggest margins at 1 Gbps and above (up to **11.7×** for `oven-sh/bun` full clone at 1 Gbps).
+- **ripclone wins at every launch-table bandwidth** for full-history and files-mode clones, with the biggest margins at 1 Gbps (up to **11.7×** for `oven-sh/bun` full clone).
 - **The gap narrows as bandwidth drops.** At 250 Mbps the full-clone win is still **3.3×** for bun and **2.2×** for pandas, while depth-1 remains faster than `git clone --depth 1`.
-- **Above 1 Gbps, returns diminish.** Once the link is fat enough, ripclone's fixed per-clone overhead dominates and times flatten out; the value shifts from raw speed to consistency and skipping git's server-side pack compute.
+- **Above 1 Gbps, use a real high-bandwidth client.** The Linux EC2 run below is the current high-bandwidth proof; Fly-shaped 2/5/10 Gbps rows should not be presented as real link measurements.
 
 ## High-bandwidth Linux on EC2
 
@@ -36,10 +36,10 @@ That’s **~10× faster than `git clone`** for the full history at 5 Gbps, and *
 ## Running the sweep yourself
 
 ```bash
-# Full 6-rate sweep, 3 runs per cell.
+# Full Fly launch sweep, 3 runs per cell.
 RIPCLONE_URL=https://ripclone-server-dev.fly.dev \
 RIPCLONE_SERVER_TOKEN=... \
-./benchmark/run_shaped_sweep.sh "oven-sh/bun pandas-dev/pandas" "250 500 1000 2000 5000 10000" 3
+./benchmark/run_shaped_sweep.sh "oven-sh/bun pandas-dev/pandas" "250 500 1000" 3
 
 # Faster 3-rate sweep for pandas, pinned to the v2.2.2 commit.
 # GIT_REF tells the native-git baseline which tag to clone.
