@@ -17,7 +17,7 @@ Key takeaways from the latest sweep:
 
 - **ripclone wins at every launch-table bandwidth** for full-history and files-mode clones, with the biggest margins at 1 Gbps (up to **11.7×** for `oven-sh/bun` full clone).
 - **The gap narrows as bandwidth drops.** At 250 Mbps the full-clone win is still **3.3×** for bun and **2.2×** for pandas, while depth-1 remains faster than `git clone --depth 1`.
-- **Above 1 Gbps, use a real high-bandwidth client.** The Linux EC2 run below is the current high-bandwidth proof; Fly-shaped 2/5/10 Gbps rows should not be presented as real link measurements.
+- **Above 1 Gbps, use a real high-bandwidth client.** The Linux EC2 run below is the current high-bandwidth proof at 1/2/5 Gbps; Fly-shaped 2/5/10 Gbps rows should not be presented as real link measurements.
 
 ## High-bandwidth Linux on EC2
 

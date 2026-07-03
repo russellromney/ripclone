@@ -37,7 +37,7 @@ See **[Design](docs/DESIGN.md)** for how a clonepack is built and synced.
 
 ### Performance
 
-ripclone pre-builds git artifacts so clones are faster than `git clone` across the Fly bandwidths we tested, from 250 Mbps up to about 1 Gbps. On a 1 Gbps link the wins are largest; as bandwidth drops the download itself dominates and the gap narrows.
+ripclone pre-builds git artifacts so clones are faster than `git clone` across the Fly bandwidths we tested, from 250 Mbps up to about 1 Gbps. We also have a real high-bandwidth EC2 run for `torvalds/linux` at 1/2/5 Gbps. On fast links the wins are largest; as bandwidth drops the download itself dominates and the gap narrows.
 
 At 1 Gbps, measured speedups over native `git clone` are:
 
@@ -45,7 +45,7 @@ At 1 Gbps, measured speedups over native `git clone` are:
 - **`pandas-dev/pandas`**: full clone **7.6×**, depth-1 **6.0×**, files **7.4×**.
 - **`torvalds/linux`** (high-bandwidth EC2 run): full clone up to **~10×**, depth-1 **~6×**, files **~8×**. See the full EC2 Linux table below and [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
 
-The full-clone win is smaller on pandas than on bun because pandas's full pack is large enough that transfer dominates; depth-1 and `files` mode avoid most of that transfer, so they stay ahead. The Fly sweep below covers **250/500 Mbps and 1 Gbps**. Higher-rate rows from Fly are omitted because they are traffic-shaper caps above the actual path capacity, not real 2/5/10 Gbps measurements.
+The full-clone win is smaller on pandas than on bun because pandas's full pack is large enough that transfer dominates; depth-1 and `files` mode avoid most of that transfer, so they stay ahead. The Fly sweep below covers **250/500 Mbps and 1 Gbps**. Higher-rate rows from Fly are omitted because they are traffic-shaper caps above the actual Fly path capacity; the real higher-bandwidth numbers are the EC2 Linux rows.
 
 *Mode labels:* `ripclone full` and `ripclone depth=1` are the `editable` CLI mode with `--depth 0` and `--depth 1`, respectively. `ripclone files` is the `files` CLI mode (HEAD worktree only).
 
