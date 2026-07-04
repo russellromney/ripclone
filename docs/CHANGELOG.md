@@ -23,6 +23,7 @@ This file tracks what has already landed in ripclone. For upcoming work see `ROA
 
 ## Sync / ref-store correctness
 
+- **Per-stage phase-1 sync timing** (`rust/src/server.rs`): `/sync` responses now include millisecond timings for mirror fetch, commit graph, HEAD packs, skeleton build, files table, prebuilt index, phase-1 upload, and ref publish. Set `RIPCLONE_BENCH=1` to emit a structured `sync-bench` log line with phase timings and per-artifact-class storage amplification for each build.
 - **Commit-keyed ref-store keys for rev-targeted builds** (`rust/src/server.rs`): `sync --at <rev>` and `sync?rev=<rev>` now store artifacts under `{branch}#{commit}` instead of `{branch}#{rev}`. This prevents stale/incomplete rev-keyed refs from blocking future syncs of the same tag and makes different revs that resolve to the same commit share a build.
 - **Commit-keyed reuse for file and S3 metadata stores** (`rust/src/ref_store.rs`): `RefStore::load_build` is now implemented for `FileRefStore` and `S3RefStore`, so a sync of branch `bar` can reuse a completed build of branch `foo` at the same commit instead of rebuilding.
 - **Don't reuse completed builds that lack a files archive** (`rust/src/server.rs`): `reuse_existing_build` no longer returns a full clonepack whose archive chunks are empty (unless archive generation is still in progress), which previously left files-mode clones polling forever.
