@@ -5,7 +5,7 @@
 //! current directory. Environment variables and CLI flags still take precedence.
 //!
 //! This file intentionally does **not** contain secrets. Server and provider
-//! tokens are stored separately via the token store (OS keyring → file fallback).
+//! tokens are stored separately via environment variables or the ripclone token file.
 
 use crate::provider::ProviderConfig;
 use anyhow::{Context, Result};
@@ -79,7 +79,7 @@ pub struct MetadataConfig {
     pub backend: Option<String>,
     /// Connection URL for the SQL backends.
     pub url: Option<String>,
-    /// Auth token for `libsql` (remote). No keyring yet — stored as written.
+    /// Auth token for `libsql` (remote), stored as written.
     pub token: Option<String>,
 }
 
@@ -91,7 +91,7 @@ pub struct QueueConfig {
     pub backend: Option<String>,
     /// Connection URL for the SQL backends.
     pub url: Option<String>,
-    /// Auth token for `libsql` (remote). No keyring yet — stored as written.
+    /// Auth token for `libsql` (remote), stored as written.
     pub token: Option<String>,
 }
 
@@ -213,8 +213,8 @@ fn save_to(path: &Path, config: &Config) -> Result<()> {
     to_save.token = None;
     let data = toml::to_string_pretty(&to_save).context("serialize config")?;
     std::fs::write(path, data).with_context(|| format!("write {}", path.display()))?;
-    // The backend sections can hold connection settings (and, until keyring
-    // support lands, DB tokens), so keep the file owner-only.
+    // The backend sections can hold connection settings and DB tokens, so keep
+    // the file owner-only.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

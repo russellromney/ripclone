@@ -41,7 +41,6 @@ async fn run_ripclone(
         cmd.args(&args)
             .current_dir(&cwd)
             .env("HOME", &home)
-            .env("RIPCLONE_TOKEN_STORE", "file")
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
         if let Some(url) = server_url {

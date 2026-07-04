@@ -320,11 +320,11 @@ impl ProviderRegistry {
     /// Reads `RIPCLONE_PROVIDERS` as JSON first, then merges a config file at
     /// `RIPCLONE_PROVIDERS_CONFIG` if present, then merges the default
     /// `~/.config/ripclone/providers.json`. Tokens are resolved from the
-    /// `RIPCLONE_PROVIDER_<ID>_TOKEN` env var, the OS keyring, or a fallback
-    /// token file. The built-in `github` default is always present and can be
+    /// `RIPCLONE_PROVIDER_<ID>_TOKEN` env var or the ripclone token file. The
+    /// built-in `github` default is always present and can be
     /// overridden by config (host, token, template).
     pub fn load() -> Result<Self> {
-        let token_store = crate::auth::token_store::FallbackTokenStore::new()
+        let token_store = crate::auth::token_store::FileBackedTokenStore::new()
             .context("initialize token store")?;
         crate::provider_config::load_registry_with_token_store(&token_store)
     }

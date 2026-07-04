@@ -53,8 +53,8 @@ fn provider_add_list_rm_lifecycle() {
         String::from_utf8_lossy(&add.stderr)
     );
 
-    // Resolve the token from the per-provider env var (the keyring may not be
-    // available in headless CI, so this exercises the documented fallback).
+    // Resolve the token from the per-provider env var, which takes precedence
+    // over the token file.
     let list = run_with_env(
         &["provider", "list"],
         home.path(),

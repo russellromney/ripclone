@@ -715,6 +715,19 @@ impl Client {
         for attempt in 0..max_attempts {
             let resp = self.request(reqwest::Method::GET, &url).send().await?;
             let status = resp.status();
+            if status == reqwest::StatusCode::ACCEPTED
+                || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+            {
+                polled = true;
+                if attempt == 0 {
+                    eprintln!("ripclone: warming {repo_path} — this can take a moment…");
+                }
+                if attempt + 1 < max_attempts {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    continue;
+                }
+                anyhow::bail!("{repo_path} is still building after {max_attempts} attempts");
+            }
             if status.is_success() {
                 // Capture the managed cloud's per-clone id from the response
                 // header before the body is consumed. Absent on a self-hosted or
@@ -728,19 +741,6 @@ impl Client {
                 info.clone_id = clone_id;
                 info.cold = polled;
                 return Ok(info);
-            }
-            if status == reqwest::StatusCode::ACCEPTED
-                || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
-            {
-                polled = true;
-                if attempt == 0 {
-                    eprintln!("ripclone: warming {repo_path} — this can take a moment…");
-                }
-                if attempt + 1 < max_attempts {
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    continue;
-                }
-                anyhow::bail!("{repo_path} is still building after {max_attempts} attempts");
             }
             return Err(server_error("ref lookup failed", resp).await);
         }

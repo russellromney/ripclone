@@ -90,7 +90,6 @@ sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio",
 libsql = { version = "0.9", default-features = false, features = ["remote", "tls"] }
 gix = "0.85.0"
 gix-pack = "0.72.0"
-keyring = "4"
 rpassword = "7"
 toml = "1.1"
 

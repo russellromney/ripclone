@@ -83,6 +83,18 @@ The Fly `performance-8x` VM can’t realistically shape a 5 Gbps link, so Linux 
 
 At 5 Gbps that’s **~10× faster than `git clone`** for the full history and **~6× faster** for depth-1. See [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) for the unshaped ceiling and more details.
 
+#### Files-only archive benchmark
+
+GitHub's source archive endpoint (`codeload.github.com/.../tar.gz/...`) is the closest built-in comparison for `ripclone --mode=files`: both produce a worktree without git history. We measured both from the Fly client, writing extracted files to the mounted `/data` volume.
+
+| Repo | ripclone files | GitHub tar.gz | Result |
+|------|----------------|---------------|--------|
+| `oven-sh/bun` | 0.640 s | 1.800 s | ripclone **2.8× faster** |
+| `pandas-dev/pandas` | 0.328 s | 0.210 s | GitHub tar.gz faster on this small, warm archive |
+| `torvalds/linux` | 4.053 s | 37.427 s | ripclone **9.2× faster** |
+
+The Linux run is the important stress case for files mode: 94,655 files and a 1.8 GB materialized worktree. `ripclone files` resolved to `ab9de95c9cf952332ab79453b4b5d1bfca8e514f` and used the existing archive artifacts in object storage; no re-sync was required.
+
 The ratio graph shows **ripclone time / git time**; anything below the dashed `1.0` line means ripclone was faster.
 
 ![shaped benchmark ratios](benchmark/shaped_ratios.png)

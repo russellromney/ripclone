@@ -1,14 +1,11 @@
-//! Secure-ish token storage for provider credentials.
+//! File-based token storage for provider credentials.
 //!
-//! Tries the OS keyring first, falls back to a file in the ripclone config
-//! directory, and also honors per-provider environment variables for CI and
-//! tests.
+//! Reads per-provider environment variables first, then a token file in the
+//! ripclone config directory. It never talks to the OS keychain/keyring.
 
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::path::PathBuf;
-
-const SERVICE: &str = "ripclone";
 
 /// Abstract storage for provider tokens.
 pub trait TokenStore: Send + Sync {
@@ -39,51 +36,6 @@ pub fn provider_env_var(id: &str) -> String {
         })
         .collect();
     format!("RIPCLONE_PROVIDER_{}_TOKEN", normalized)
-}
-
-/// Token store backed by the OS keyring.
-pub struct KeyringTokenStore;
-
-impl KeyringTokenStore {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-impl Default for KeyringTokenStore {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl KeyringTokenStore {
-    fn entry(id: &str) -> Result<keyring::Entry> {
-        keyring::Entry::new(SERVICE, &format!("provider/{}", id))
-            .with_context(|| format!("open keyring entry for provider '{}'", id))
-    }
-}
-
-impl TokenStore for KeyringTokenStore {
-    fn get(&self, id: &str) -> Result<Option<String>> {
-        match Self::entry(id)?.get_password() {
-            Ok(t) => Ok(Some(t)),
-            Err(keyring::Error::NoEntry) => Ok(None),
-            Err(e) => Err(anyhow::anyhow!("keyring get failed: {}", e)),
-        }
-    }
-
-    fn set(&self, id: &str, token: &str) -> Result<()> {
-        Self::entry(id)?.set_password(token)?;
-        Ok(())
-    }
-
-    fn delete(&self, id: &str) -> Result<()> {
-        match Self::entry(id)?.delete_credential() {
-            Ok(()) => Ok(()),
-            Err(keyring::Error::NoEntry) => Ok(()),
-            Err(e) => Err(anyhow::anyhow!("keyring delete failed: {}", e)),
-        }
-    }
 }
 
 /// Token store backed by a JSON file with restrictive permissions.
@@ -163,85 +115,38 @@ impl TokenStore for FileTokenStore {
     }
 }
 
-/// Token store that reads from env, then the keyring, then a file; writes to
-/// the keyring if available, otherwise the file.
-///
-/// Set `RIPCLONE_TOKEN_STORE=file` to force the file fallback and skip the
-/// OS keyring. This makes tests deterministic across environments.
-pub struct FallbackTokenStore {
-    keyring: KeyringTokenStore,
+/// Default token store: reads from env, then a file; writes to the file.
+pub struct FileBackedTokenStore {
     file: FileTokenStore,
-    force_file: bool,
 }
 
-impl FallbackTokenStore {
+impl FileBackedTokenStore {
     pub fn new() -> Result<Self> {
         let file =
             FileTokenStore::new(FileTokenStore::default_path().context("no HOME for token file")?);
-        Ok(Self {
-            keyring: KeyringTokenStore::new(),
-            file,
-            force_file: Self::force_file_from_env(),
-        })
+        Ok(Self { file })
     }
 
     pub fn with_path(path: impl Into<PathBuf>) -> Self {
         Self {
-            keyring: KeyringTokenStore::new(),
             file: FileTokenStore::new(path),
-            force_file: Self::force_file_from_env(),
         }
-    }
-
-    fn force_file_from_env() -> bool {
-        std::env::var("RIPCLONE_TOKEN_STORE")
-            .ok()
-            .map(|s| s.eq_ignore_ascii_case("file"))
-            .unwrap_or(false)
     }
 }
 
-impl TokenStore for FallbackTokenStore {
+impl TokenStore for FileBackedTokenStore {
     fn get(&self, id: &str) -> Result<Option<String>> {
         if let Some(t) = env_token(id) {
             return Ok(Some(t));
-        }
-        if !self.force_file {
-            match self.keyring.get(id) {
-                Ok(Some(t)) => return Ok(Some(t)),
-                Ok(None) => {}
-                Err(e) => {
-                    tracing::debug!("keyring read failed for {}: {}", id, e);
-                }
-            }
         }
         self.file.get(id)
     }
 
     fn set(&self, id: &str, token: &str) -> Result<()> {
-        if !self.force_file {
-            match self.keyring.set(id, token) {
-                Ok(()) => {
-                    // If a fallback file token exists, clean it up.
-                    let _ = self.file.delete(id);
-                    return Ok(());
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "keyring write failed for {}, falling back to file: {}",
-                        id,
-                        e
-                    );
-                }
-            }
-        }
         self.file.set(id, token)
     }
 
     fn delete(&self, id: &str) -> Result<()> {
-        if !self.force_file {
-            let _ = self.keyring.delete(id);
-        }
         self.file.delete(id)
     }
 }
@@ -284,9 +189,9 @@ mod tests {
     }
 
     #[test]
-    fn fallback_reads_env_over_file() {
+    fn env_reads_before_file() {
         let dir = tempfile::tempdir().unwrap();
-        let store = FallbackTokenStore::with_path(dir.path().join("tokens.json"));
+        let store = FileBackedTokenStore::with_path(dir.path().join("tokens.json"));
         store.set("gitlab", "from-file").unwrap();
         unsafe { std::env::set_var("RIPCLONE_PROVIDER_GITLAB_TOKEN", "from-env") };
         assert_eq!(store.get("gitlab").unwrap().as_deref(), Some("from-env"));

@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use ripclone::archive::ArchiveBuilder;
-use ripclone::auth::token_store::{FallbackTokenStore, TokenStore};
+use ripclone::auth::token_store::{FileBackedTokenStore, TokenStore};
 use ripclone::bench::Benchmark;
 use ripclone::client::Client;
 use ripclone::config::ProviderEntry;
@@ -617,7 +617,7 @@ async fn run_login(server: &str) -> Result<()> {
     cfg.server = Some(server.to_string());
     ripclone::config::save(&cfg)?;
     token_store()?.set("server", &token)?;
-    println!("\n  ✓ Logged in. Server token saved to secure token store.");
+    println!("\n  ✓ Logged in. Server token saved to the ripclone token file.");
     Ok(())
 }
 
@@ -638,8 +638,8 @@ fn open_browser(url: &str) {
     }
 }
 
-fn token_store() -> Result<FallbackTokenStore> {
-    FallbackTokenStore::new().context("initialize token store")
+fn token_store() -> Result<FileBackedTokenStore> {
+    FileBackedTokenStore::new().context("initialize token store")
 }
 
 /// Token-store key for a server's session token. Per-server so logging into one
@@ -913,7 +913,7 @@ async fn run_provider_add(
     }
     println!("added provider '{}'", id);
     if token.is_some() {
-        println!("  token stored in secure token store");
+        println!("  token stored in the ripclone token file");
     }
     Ok(())
 }

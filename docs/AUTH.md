@@ -19,7 +19,7 @@ identity stays in `ripclone-cloud`).
 3. With a loopback callback, the browser is redirected back to the CLI's
    localhost listener, which captures the token automatically. Headless? The page
    shows the token to paste into the CLI instead.
-4. The CLI saves the JWT (OS keyring → file fallback) keyed per server and sends
+4. The CLI saves the JWT in the ripclone token file keyed per server and sends
    it as `Authorization: Bearer <jwt>` on subsequent requests.
 5. `POST /v1/auth/refresh` (authenticated) mints a fresh token before expiry. The
    re-issued token keeps the **same absolute session deadline** as the original,

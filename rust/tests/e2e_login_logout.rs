@@ -2,8 +2,8 @@
 //!
 //! Spawns a minimal device-flow mock server, runs the CLI as a subprocess with
 //! an isolated $HOME, and verifies that the server URL lands in
-//! `~/.config/ripclone/config.toml` while the token lands in the secure token
-//! store (keyring → file fallback).
+//! `~/.config/ripclone/config.toml` while the token lands in the ripclone token
+//! file.
 
 use axum::{Json, Router, routing::post};
 use ripclone::auth::token_store::{FileTokenStore, TokenStore};
@@ -80,7 +80,6 @@ async fn login_saves_url_in_config_and_token_in_store() {
             .env("HOME", &home_path)
             .env("RIPCLONE_SERVER", &url_for_login)
             .env("RIPCLONE_NO_BROWSER", "1")
-            .env("RIPCLONE_TOKEN_STORE", "file")
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .output()
@@ -120,7 +119,6 @@ async fn login_saves_url_in_config_and_token_in_store() {
         Command::new(&bin)
             .arg("logout")
             .env("HOME", &home_path)
-            .env("RIPCLONE_TOKEN_STORE", "file")
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .output()

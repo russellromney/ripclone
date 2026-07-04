@@ -1790,6 +1790,100 @@ fn invalidate_ref_response_cache(state: &ServerState, repo_id: &RepoId, branch: 
     cache.retain(|key, _| !key.starts_with(&prefix));
 }
 
+fn selected_clonepack_artifacts<'a>(
+    info: &'a RefInfo,
+    clonepack_kind: &str,
+) -> &'a crate::ClonepackArtifacts {
+    if clonepack_kind == "shallow" && !info.shallow_clonepack.manifest.is_empty() {
+        &info.shallow_clonepack
+    } else {
+        &info.full_clonepack
+    }
+}
+
+fn selected_clonepack_manifest(info: &RefInfo, clonepack_kind: &str) -> String {
+    let artifacts = selected_clonepack_artifacts(info, clonepack_kind);
+    if artifacts.manifest.is_empty() {
+        info.clonepack_manifest.clone()
+    } else {
+        artifacts.manifest.clone()
+    }
+}
+
+fn selected_clonepack_commit(info: &RefInfo, clonepack_kind: &str) -> String {
+    let artifacts = selected_clonepack_artifacts(info, clonepack_kind);
+    if artifacts.commit.is_empty() {
+        info.commit.clone()
+    } else {
+        artifacts.commit.clone()
+    }
+}
+
+fn ref_info_serves_commit(info: &RefInfo, clonepack_kind: &str, commit: &str) -> bool {
+    !selected_clonepack_manifest(info, clonepack_kind).is_empty()
+        && selected_clonepack_commit(info, clonepack_kind) == commit
+}
+
+fn full_clonepack_pending_for_tip(info: &RefInfo, clonepack_kind: &str, commit: &str) -> bool {
+    clonepack_kind != "shallow"
+        && info.commit == commit
+        && info.build_status.as_deref() == Some("full history building")
+        && !ref_info_serves_commit(info, clonepack_kind, commit)
+}
+
+async fn load_ref_info_for_resolved_commit(
+    ref_store: &Arc<dyn RefStore>,
+    repo_id: &RepoId,
+    effective_branch: &str,
+    rev: Option<&str>,
+    commit: &str,
+    clonepack_kind: &str,
+) -> Option<RefInfo> {
+    if rev.is_none() {
+        return ref_store
+            .load_branch(repo_id, effective_branch)
+            .await
+            .ok()
+            .flatten()
+            .filter(|info| info.commit == commit);
+    }
+
+    let mut keys = Vec::new();
+    keys.push(ref_store_key(effective_branch, rev, Some(commit)));
+
+    if let Some(rev) = rev {
+        // Legacy rev-targeted builds were keyed by the raw rev string instead of
+        // the resolved commit. Keep this as an exact-commit compatibility lookup.
+        let legacy_rev_key = ref_store_key(effective_branch, Some(rev), None);
+        if !keys.iter().any(|k| k == &legacy_rev_key) {
+            keys.push(legacy_rev_key);
+        }
+        // Older tip builds (and some historic benchmark artifacts) live under
+        // the plain branch key. They are reusable only when the selected
+        // clonepack variant itself serves the requested commit.
+        if !keys.iter().any(|k| k == effective_branch) {
+            keys.push(effective_branch.to_string());
+        }
+    }
+
+    for key in keys {
+        if let Ok(Some(info)) = ref_store.load_branch(repo_id, &key).await
+            && ref_info_serves_commit(&info, clonepack_kind, commit)
+        {
+            return Some(info);
+        }
+    }
+
+    if rev.is_some()
+        && let Ok(Some(info)) = ref_store.load_build(repo_id, commit).await
+        && ref_info_serves_commit(&info, clonepack_kind, commit)
+    {
+        return Some(info);
+    }
+
+    None
+}
+
 async fn get_ref_inner(
     repo_id: RepoId,
     provider: ProviderInstance,
@@ -1880,18 +1974,19 @@ async fn get_ref_inner(
         .await
     {
         Ok(Ok(commit)) => {
-            // Load the stored info, if any. A rev request uses a commit-keyed
-            // rolling key so it never reuses a stale rev-keyed build.
-            let store_key = ref_store_key(&effective_branch, params.rev.as_deref(), Some(&commit));
-            let fallback = state
-                .ref_store
-                .load_branch(&repo_id, &store_key)
-                .await
-                .ok()
-                .flatten();
-            // Only reuse stored artifact hashes when they match the resolved
-            // commit; otherwise we would hand out signed URLs for stale chunks.
-            let fallback = fallback.filter(|info| info.commit == commit);
+            // Load stored artifacts, if any. Rev requests try the commit-keyed
+            // key first, then exact-commit compatibility fallbacks for old
+            // ref-store layouts. Never serve artifacts whose selected clonepack
+            // variant resolves to a different commit.
+            let fallback = load_ref_info_for_resolved_commit(
+                &state.ref_store,
+                &repo_id,
+                &effective_branch,
+                params.rev.as_deref(),
+                &commit,
+                &params.clonepack,
+            )
+            .await;
             let info = fallback.unwrap_or_else(|| RefInfo {
                 commit: commit.clone(),
                 parent_commit: None,
@@ -1921,6 +2016,21 @@ async fn get_ref_inner(
                 synced_at: None,
                 generation: None,
             });
+            if params.rev.is_none()
+                && full_clonepack_pending_for_tip(&info, &params.clonepack, &commit)
+            {
+                return (
+                    StatusCode::ACCEPTED,
+                    Json(BuildResponse {
+                        status: info
+                            .build_status
+                            .clone()
+                            .unwrap_or_else(|| "building".to_string()),
+                        queue_depth: state.build_queue.depth().await,
+                    }),
+                )
+                    .into_response();
+            }
             let resp = ref_response(
                 &repo_id,
                 &provider,
@@ -6103,6 +6213,170 @@ mod tests {
             err.to_string()
                 .contains("archive chunk hash/length mismatch"),
             "{err:#}"
+        );
+    }
+
+    fn complete_ref(commit: &str, manifest: &str) -> RefInfo {
+        RefInfo {
+            commit: commit.to_string(),
+            default_branch: "main".to_string(),
+            clonepack_manifest: manifest.to_string(),
+            metadata_chunk: "metadata".to_string(),
+            archive_chunks: vec!["archive".to_string()],
+            full_clonepack: crate::ClonepackArtifacts {
+                commit: commit.to_string(),
+                manifest: manifest.to_string(),
+                metadata_chunk: "metadata".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn rev_ref_lookup_reuses_legacy_plain_branch_only_on_exact_commit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store: Arc<dyn RefStore> = Arc::new(crate::ref_store::FileRefStore::new(tmp.path()));
+        let repo = RepoId::github("o/r");
+        let commit = "1111111111111111111111111111111111111111";
+
+        store
+            .save_branch(&repo, "main", &complete_ref(commit, "manifest-main"))
+            .await
+            .unwrap();
+
+        let info =
+            load_ref_info_for_resolved_commit(&store, &repo, "main", Some(commit), commit, "full")
+                .await
+                .expect("legacy plain branch exact-match fallback");
+        assert_eq!(selected_clonepack_manifest(&info, "full"), "manifest-main");
+        assert_eq!(selected_clonepack_commit(&info, "full"), commit);
+    }
+
+    #[tokio::test]
+    async fn rev_ref_lookup_scans_other_refs_but_still_requires_exact_commit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store: Arc<dyn RefStore> = Arc::new(crate::ref_store::FileRefStore::new(tmp.path()));
+        let repo = RepoId::github("o/r");
+        let commit = "2222222222222222222222222222222222222222";
+
+        store
+            .save_branch(&repo, "release", &complete_ref(commit, "manifest-release"))
+            .await
+            .unwrap();
+
+        let info =
+            load_ref_info_for_resolved_commit(&store, &repo, "main", Some(commit), commit, "full")
+                .await
+                .expect("cross-ref exact commit fallback");
+        assert_eq!(
+            selected_clonepack_manifest(&info, "full"),
+            "manifest-release"
+        );
+
+        let missing = load_ref_info_for_resolved_commit(
+            &store,
+            &repo,
+            "main",
+            Some("3333333333333333333333333333333333333333"),
+            "3333333333333333333333333333333333333333",
+            "full",
+        )
+        .await;
+        assert!(missing.is_none(), "must not serve a different commit");
+    }
+
+    #[tokio::test]
+    async fn rev_ref_lookup_rejects_carried_full_clonepack_for_new_commit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store: Arc<dyn RefStore> = Arc::new(crate::ref_store::FileRefStore::new(tmp.path()));
+        let repo = RepoId::github("o/r");
+        let new_commit = "4444444444444444444444444444444444444444";
+        let old_commit = "5555555555555555555555555555555555555555";
+        let info = RefInfo {
+            commit: new_commit.to_string(),
+            default_branch: "main".to_string(),
+            clonepack_manifest: "old-full".to_string(),
+            metadata_chunk: "old-metadata".to_string(),
+            archive_chunks: vec!["old-archive".to_string()],
+            full_clonepack: crate::ClonepackArtifacts {
+                commit: old_commit.to_string(),
+                manifest: "old-full".to_string(),
+                metadata_chunk: "old-metadata".to_string(),
+                ..Default::default()
+            },
+            shallow_clonepack: crate::ClonepackArtifacts {
+                commit: new_commit.to_string(),
+                manifest: "new-shallow".to_string(),
+                metadata_chunk: "new-metadata".to_string(),
+                ..Default::default()
+            },
+            build_status: Some("full history building".to_string()),
+            ..Default::default()
+        };
+        store.save_branch(&repo, "main", &info).await.unwrap();
+
+        let full = load_ref_info_for_resolved_commit(
+            &store,
+            &repo,
+            "main",
+            Some(new_commit),
+            new_commit,
+            "full",
+        )
+        .await;
+        assert!(
+            full.is_none(),
+            "rev full lookup must not serve the carried previous full clonepack"
+        );
+
+        let shallow = load_ref_info_for_resolved_commit(
+            &store,
+            &repo,
+            "main",
+            Some(new_commit),
+            new_commit,
+            "shallow",
+        )
+        .await
+        .expect("shallow variant is exact for the requested commit");
+        assert_eq!(
+            selected_clonepack_manifest(&shallow, "shallow"),
+            "new-shallow"
+        );
+    }
+
+    #[test]
+    fn branch_tip_full_clonepack_is_pending_when_carried_from_previous_commit() {
+        let new_commit = "6666666666666666666666666666666666666666";
+        let old_commit = "7777777777777777777777777777777777777777";
+        let info = RefInfo {
+            commit: new_commit.to_string(),
+            default_branch: "main".to_string(),
+            clonepack_manifest: "old-full".to_string(),
+            metadata_chunk: "old-metadata".to_string(),
+            full_clonepack: crate::ClonepackArtifacts {
+                commit: old_commit.to_string(),
+                manifest: "old-full".to_string(),
+                metadata_chunk: "old-metadata".to_string(),
+                ..Default::default()
+            },
+            shallow_clonepack: crate::ClonepackArtifacts {
+                commit: new_commit.to_string(),
+                manifest: "new-shallow".to_string(),
+                metadata_chunk: "new-metadata".to_string(),
+                ..Default::default()
+            },
+            build_status: Some("full history building".to_string()),
+            ..Default::default()
+        };
+        assert!(
+            full_clonepack_pending_for_tip(&info, "full", new_commit),
+            "normal branch-tip full lookup should poll while the selected full clonepack serves the previous commit"
+        );
+        assert!(
+            !full_clonepack_pending_for_tip(&info, "shallow", new_commit),
+            "shallow is already exact for the new commit"
         );
     }
 
