@@ -151,7 +151,7 @@ archive_chunks (files-mode clients then 202-poll forever). Add the same
 commit-ownership guard to the editable publish path — re-read the ref and skip the
 save if info.commit != this build's commit (match the existing guarded saves' style).
 Add an e2e in rust/tests/ that races two syncs and asserts the newer commit's ref
-survives a delayed older phase-2. Run: scripts/ci.sh test.
+survives a delayed older phase-2. Checks: the touched test files, debug (test economy; PR CI is the gate).
 ```
 Accept: guard present on all three phase-2 saves; new e2e passes; flake run clean.
 
@@ -163,7 +163,7 @@ get_hotfiles_inner (~3564, which also skips validate_git_rev), batch_files_inner
 (~3601). Any holder of the shared server token can read private repo bytes via
 /cat and /batch. Add the authorize_repo_read gate (and validate_git_rev where
 missing) to all five — they already receive the provider param. Extend
-rust/tests/e2e_auth.rs: unauthorized repo → 403 on each endpoint. Run: scripts/ci.sh test.
+rust/tests/e2e_auth.rs: unauthorized repo → 403 on each endpoint. Checks: the touched test files, debug (test economy; PR CI is the gate).
 ```
 Accept: all five gated + rev-validated; e2e proves 403; existing tests green.
 
@@ -179,7 +179,7 @@ Three files write secrets non-atomically:
 Write one shared helper: write to sibling tmp file created 0600, fsync, atomic rename;
 wrap read-modify-write cycles in an advisory flock on a .lock sibling. Use it in all
 three. Unit tests: concurrent set() from two threads loses nothing; kill-mid-write
-leaves the old file intact. Run: scripts/ci.sh test.
+leaves the old file intact. Checks: the touched test files, debug (test economy; PR CI is the gate).
 ```
 Accept: one helper, three call sites, tests prove atomicity + no plaintext-at-0644 window.
 
@@ -197,7 +197,7 @@ Two related bugs make clients 202-poll forever:
    commit. Also un-swallow the four `let _ = update_build_status` call sites (5425, 5433,
    5497, 5536) — log at error with repo+commit.
 Add an e2e: force a phase-2 failure, assert status becomes failed and a subsequent sync
-recovers. Run: scripts/ci.sh test && scripts/ci.sh flake.
+recovers. Checks: the touched test files, debug (test economy; PR CI is the gate).
 ```
 Accept: failed builds visibly fail + recover; ref never regresses in the race test.
 
@@ -224,7 +224,7 @@ Six independent small fixes:
 6. CSRF state in the auth login flow is SHA256(nanos+pid) — predictable. Use random
    bytes (rand is already a dep). One-line class fix + test that two states differ
    and are non-derivable.
-Run: scripts/ci.sh lint test.
+Checks: fmt + clippy + touched tests (test economy; PR CI is the gate).
 ```
 Accept: each has a test or is covered by existing e2e; error messages actionable.
 
@@ -287,7 +287,7 @@ rust/src/lib.rs:1-8 has crate-level #![allow(dead_code, deprecated)]. Remove it,
 and delete (or #[cfg(test)]-scope) everything the compiler now flags. Judgment rule:
 if it's referenced only by tests, keep only if the test covers live behavior; otherwise
 delete test + code. List anything you were unsure about in your summary instead of
-guessing. Run scripts/ci.sh lint test flake.
+guessing. Checks: fmt + clippy + a debug build (test economy; PR CI is the gate).
 ```
 
 **B3. Collapse the duplicate extraction pipeline** — deps: B1 — Kimi, review Codex+Fable — turbogit
@@ -298,7 +298,7 @@ extract_archive_with_chunk_fetcher (~196-712) and extract_archive_from_chunk_rec
 frame-bounds fix differs between copies). Keep the receiver variant (it's the one the
 main clone uses), and feed the legacy callers through a thin adapter (~30 lines) that
 wraps a fetcher into a receiver channel. Byte-identical behavior: the full e2e suite
-plus scripts/e2e_local.sh must pass unchanged. Run scripts/ci.sh test e2e flake.
+plus scripts/e2e_local.sh must pass unchanged (run it once — it uses real binaries). Other checks: touched tests, debug; PR CI is the gate.
 ```
 
 **B4. Profile phase-1 sync latency** — deps: none — Kimi executes, Fable analyzes — turbogit
@@ -432,8 +432,8 @@ enqueued, for non-added → ignored; added repo GC'd cold → clone triggers reb
 not error; `add --no-history` → depth-1+archive only, first `--depth 0` then 202s and
 builds; migration marks pre-existing built repos as added; entitled private repo
 survives GC while an idle un-exempt ref is evicted (per-ref); pushes to a non-default,
-never-built branch of an added repo do NOT build unless warm_all. Run scripts/ci.sh
-test e2e flake.
+never-built branch of an added repo do NOT build unless warm_all. Checks: the new/touched test files, debug (test economy; PR CI
+is the gate).
 Docs: quick start uses `add` to make a repo available and explains `sync` = update
 (push-driven); the GitHub Action keeps an added repo synced, it does not add it.
 ```
@@ -452,7 +452,7 @@ items 2–3 are data-independent and can run anytime — spec Fable, exec Kimi �
    (clonepack.rs or similar); both callers use it. Same for the path-validation helpers:
    path_from_bytes / validate_relative_path / safe_create_dir_all are pub in
    worktree_writer.rs (~72-155) and duplicated privately in extract.rs (~33-46, 713-782)
-   — single fsutil module, delete the copies. Run full CI.
+   — single fsutil module, delete the copies. Checks: touched tests, debug; PR CI is the gate.
 ```
 
 **B7. Env-knob cut** — deps: B1, B2 — Kimi — turbogit
@@ -463,7 +463,7 @@ cache/fsync/metrics/webhook/GC), demote the rest to private constants at their c
 defaults, and write docs/CONFIG.md as the single reference (user vs operator vs the
 handful of expert knobs that survive). Delete deprecated aliases RIPCLONE_TOKEN,
 RIPCLONE_TOKEN_HASH, RIPCLONE_URL entirely (pre-1.0, no install base).
-Run scripts/ci.sh lint test.
+Checks: fmt + clippy + touched tests (test economy; PR CI is the gate).
 ```
 
 **B8. Extract the build pipeline from server.rs** — deps: ALL other OSS code nodes merged — Kimi, review Codex+Fable — turbogit
@@ -471,7 +471,7 @@ Run scripts/ci.sh lint test.
 server.rs is 8,450 lines with ~10 responsibilities. Move ONLY the build pipeline
 (do_sync → two-phase build → publish, ~1,200 lines — it has no HTTP dependency) into
 rust/src/build/ (pipeline.rs, two_phase.rs). Pure code motion: no logic changes, no
-renames beyond module paths. The diff should be reviewable as moves. Run full CI.
+renames beyond module paths. The diff should be reviewable as moves. Checks: cargo check + a handful of e2es touching moved code paths, debug; PR CI is the gate.
 ```
 Run this LAST, after every other OSS node merges — everything touches server.rs and
 parallel runs mean merge hell. Safe to slip post-launch if needed: it's organization,
@@ -492,7 +492,7 @@ wiped). Grep for split_once('/') on storage keys across rust/src to catch stragg
 BOUNDARY: this is STORAGE-INTERNAL only — HTTP routes, the gateway contract, and CLI
 addressing are unchanged (routes are already provider-scoped). If you find yourself
 editing a route or anything in ripclone-cloud, stop — out of scope.
-Run full CI incl. e2e.
+Checks: the key-touching test files, debug (this node changes MANY tests — run the ones you edit); PR CI is the gate.
 ```
 
 **C2. Provider config/token source cut** — deps: C1 — Kimi — turbogit
@@ -503,7 +503,7 @@ Run full CI incl. e2e.
 2. Token chain: config-declared token or per-request X-Upstream-Token only. Delete
    RIPCLONE_PROVIDER_<ID>_TOKEN; fold RIPCLONE_GITHUB_TOKEN into the github default's
    token resolution rather than a special case in ProviderRegistry::new().
-Run full CI; update docs/BACKENDS.md provider section.
+Checks: touched tests, debug; PR CI is the gate. Update docs/BACKENDS.md provider section.
 ```
 STRETCH (only if C1-C4 land early): collapse ProviderKind's match arms into preset
 data rows. ~40 lines of design purity; skip without guilt.
@@ -523,7 +523,7 @@ data rows. ~40 lines of design purity; skip without guilt.
    remains the documented speed knob. Update the default-mode env/docs and any test
    that assumed the depth-1 default; the /start page and README examples then read
    `ripclone clone owner/repo` with no flags, honestly.
-Run scripts/ci.sh test; paste `ripclone --help` output in the summary.
+Checks: touched tests, debug (test economy); paste `ripclone --help` output in the summary.
 ```
 
 **C4. Bitbucket cut** — deps: D3 — Kimi — turbogit
@@ -633,7 +633,7 @@ rust/tests/e2e_freshness.rs:88-101 races real sleeps (800ms push inside a 2500ms
 injected delay, then asserts exactly 2 builds). Replace wall-clock races with an
 explicit hook (channel/barrier via the existing injected-delay test seam) and replace
 sleep-then-count with wait-for-completion-signal-then-count. Must survive
-scripts/ci.sh flake 10 times consecutively.
+20 consecutive debug runs of the file (for i in {1..20}: cargo test --test e2e_freshness); PR CI's standard flake guard is the real gate.
 ```
 
 **E6. Feature inventory → the G2 gate list** — deps: none, start now — Kimi scan, Fable+User classify
