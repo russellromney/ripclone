@@ -187,3 +187,100 @@ Repo: this worktree (ripclone-cloud). Checks per node: pnpm test.
 Session 1 → Session 5 → Session 3 → Session 4 → Session 2
 (1 and 5 are the correctness/revenue fixes; 3 is the long pole to start early;
 2 is small and can slot in anywhere.)
+
+
+---
+
+# Wave 2 — session prompts
+
+Same rules as wave 1 (preamble, one commit per node, test economy, micro-fix
+allowance). Cut worktrees from origin/main (current). Only B5/B6.1/G7 wait on the
+B4 measurement — everything below is unblocked.
+
+## Session 6 · Codex · ../wt-providers · branch wave2/provider-track
+The critical path (B5 needs C1). Sequential, one worktree.
+```
+[shared preamble]
+Your nodes, in order: Track C → "C1. Storage-key unification" → "C2. Provider
+config/token source cut" → "C3. CLI addressing + surface cut" (incl. item 4, the
+D8 full-clone default flip) → "C4. Bitbucket cut".
+Repo: this worktree (turbogit).
+```
+
+## Session 7 · Kimi · ../wt-simplify · branch wave2/simplify
+```
+[shared preamble]
+Your nodes, in order: Track B → "B3. Collapse the duplicate extraction pipeline"
+→ "B7. Env-knob cut".
+Repo: this worktree (turbogit).
+```
+
+## Session 8 · Kimi · ../wt-gc · branch wave2/gc-warmth
+GC/ref-store locality bundle: G1 + the two data-independent B6 items.
+```
+[shared preamble]
+Your nodes, in order: Track G → "G1. OSS TTL GC + pin flag" (incl. GC + recovery-
+poller defaults ON), then Track B → "B6. Sync-path efficiency + safety-critical
+dedup" ITEMS 2 AND 3 ONLY (the CachingRefStore lock and the GC/path-validation
+dedup — item 1 waits on the B4 measurement; skip it).
+Repo: this worktree (turbogit).
+```
+
+## Session 9 · Kimi · ../wt-tests2 · branch wave2/tests
+```
+[shared preamble]
+Your nodes, in order: Track E → "E2. GC race + MinIO in CI" → "E4. Expiry
+mid-clone" → "E3. Provider webhook e2es" (a launch gate — GitLab/Gitea).
+Repo: this worktree (turbogit).
+```
+
+## Session 10 · Kimi · ../wt-release · branch wave2/release
+```
+[shared preamble]
+Your nodes, in order: Track F → "F2. Static builds or preflight" → "F4.
+git-remote-ripclone decision" (recommendation in node: document it).
+Repo: this worktree (turbogit). Note: F2 legitimately builds release binaries —
+that IS the deliverable; the no-release rule is about test loops.
+```
+
+## Session 11 · Codex · ../rc-wave2 · branch wave2/cloud-ops (ripclone-cloud)
+```
+[shared preamble]
+Your nodes, in order (plan in the turbogit repo): Track G → "G3. Observability +
+alert" → "G4. Backups" (the restore DRILL needs Russell — script it, drill on a
+scratch DB, leave the prod drill flagged) → "G8. Account deletion + Resend
+transactional basics".
+Repo: this worktree (ripclone-cloud).
+```
+
+## Session 12 · Kimi · ../rc-screens · branch wave2/screens (ripclone-cloud)
+The long pole. SCREENS.md v4 + DESIGN.md are the complete spec.
+```
+[shared preamble]
+Your node: Track H → "H2. Implement the screens". Read SCREENS.md and DESIGN.md
+in ripclone-cloud FIRST — they are the spec; the plan node just points at them.
+HARD scope fence: src/app pages/components only.
+Repo: this worktree (ripclone-cloud).
+```
+
+## Session 13 · Codex · ../wt-trust · branch wave2/trust
+```
+[shared preamble]
+Your nodes, in order: Track D → "D-1. --verify-upstream" (the node contains the
+full spec incl. credential scoping) → "D-3. Telemetry disclosure". (D-2, the
+security page, is written after D-1 lands — it goes in Session 11's repo later.)
+Repo: this worktree (turbogit).
+```
+
+## Also runnable now (not sessions)
+- **B4 measurement** — prompt already delivered; worktree ../wt-b4m.
+- **A-R adversarial gate** — codex challenge, state-scoped, prompt from Fable.
+- **#91 micro-fixes** — on its existing branch.
+
+## Start order if capacity-limited
+S6 (critical path) → S12 (long pole) → B4-measurement → S8 → S9 → S11 → S7 → S10 → S13.
+
+## Merge notes
+S6 and S7 both touch provider/extract-adjacent code lightly — merge S6 first.
+S8 touches server.rs/remote_gc — merge before or after S6, either is clean.
+H2 (S12) conflicts with nothing (frozen plane).
