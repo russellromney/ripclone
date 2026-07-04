@@ -132,17 +132,23 @@ Build and run the server:
 cd rust
 cargo build --release
 
-# Start the server locally
-./target/release/ripclone-server \
-  --cas-dir ./data/cache \
-  --repo-root ./data/repos
+# The server requires a token; both the server and CLI read it from
+# RIPCLONE_SERVER_TOKEN. Generate one and start the server:
+export RIPCLONE_SERVER_TOKEN=$(openssl rand -hex 32)
+./target/release/ripclone-server
 ```
 
-`--cas-dir` is the local cache; `--repo-root` holds the mirrors. `--host` (default `0.0.0.0`) and `--port` (default `8000`) set the listen address. Object storage (S3/R2/Tigris/MinIO) and most tuning are set with environment variables — see [Build options](#build-options) and `docs/BACKENDS.md`.
+The server defaults to storing its local cache and bare mirrors under
+`~/.local/share/ripclone/` (`cache` and `repos`). Use `--cas-dir` and
+`--repo-root` to override. `--host` (default `0.0.0.0`) and `--port` (default
+`8000`) set the listen address. Object storage (S3/R2/Tigris/MinIO) and most
+other tuning are set with environment variables — see [Build options](#build-options)
+and `docs/BACKENDS.md`.
 
 Build artifacts for a commit (sync the repo on the server):
 
 ```bash
+# Uses the same RIPCLONE_SERVER_TOKEN for authentication
 cargo run --release --bin ripclone -- sync oven-sh/bun --server http://localhost:8000
 ```
 

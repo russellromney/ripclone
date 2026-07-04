@@ -38,6 +38,20 @@ export RIPCLONE_ORIGIN_BASE="file://$ORIGIN_ROOT"
 export TMPDIR="$REPO_ROOT"
 mkdir -p "$REPO_ROOT"
 
+# LFS pointer files are stored/served as-is by ripclone. Make sure every git
+# operation in this script (server mirror clones, reference clones, client
+# materialization) passes pointers through without invoking git-lfs, which may
+# not be installed and is not needed for these fixture tests.
+GITCONFIG="$BASE_DIR/gitconfig"
+cat > "$GITCONFIG" <<'EOF'
+[filter "lfs"]
+	clean = cat
+	smudge = cat
+	process = 
+	required = false
+EOF
+export GIT_CONFIG_GLOBAL="$GITCONFIG"
+
 PORT=$(( 20000 + RANDOM % 40000 ))
 SERVER_URL="http://127.0.0.1:$PORT"
 SERVER_PID=""
@@ -226,5 +240,122 @@ gitc "$BASE_DIR/c-lsm" fsck --connectivity-only HEAD >/dev/null || fail "lsm fsc
 v1=$(git -C "$w" rev-parse HEAD~2:a.txt)
 gitc "$BASE_DIR/c-lsm" cat-file -e "$v1" || fail "sealed-level blob missing"
 pass "LSM full clone complete across two seals"
+
+# === byte-for-byte equivalence oracle =========================================
+run_equivalence_oracle() {
+  local writer_label="$1" io_uring="$2"
+  echo "==> equivalence oracle ($writer_label)"
+
+  local w sub_w sub_bare sub_sha
+  w=$(new_origin equivalence fixture)
+
+  # Build a submodule repo and get its HEAD sha for a manual gitlink entry.
+  sub_w="$WORK/equivalence-sub"
+  rm -rf "$sub_w"; mkdir -p "$sub_w"
+  git -C "$sub_w" init -q -b main
+  echo "submodule readme" > "$sub_w/sub.txt"
+  git -C "$sub_w" add sub.txt
+  git -C "$sub_w" -c user.email=t@t -c user.name=t commit -q -m "init sub"
+  sub_sha=$(git -C "$sub_w" rev-parse HEAD)
+  sub_bare="$ORIGIN_ROOT/equivalence/submod.git"
+  mkdir -p "$(dirname "$sub_bare")"
+  git init --bare -q -b main "$sub_bare"
+  git -C "$sub_w" push -q "$sub_bare" main
+
+  # Disable LFS filters so pointer files are stored verbatim (matches this
+  # machine and the ripclone pass-through policy).
+  git -C "$w" config filter.lfs.clean cat
+  git -C "$w" config filter.lfs.smudge cat
+  git -C "$w" config filter.lfs.process ""
+  git -C "$w" config filter.lfs.required false
+
+  # Fixture contents.
+  echo "symlink target contents" > "$w/target.txt"
+  ln -s target.txt "$w/link.txt"
+  # Non-UTF-8 symlink target (raw bytes 0x80-0x83).
+  python3 -c "import os; os.symlink(b'\\x80\\x81\\x82\\x83', '$w/bad-link.txt')"
+  printf '#!/bin/sh\necho hello\n' > "$w/run.sh"; chmod +x "$w/run.sh"
+  : > "$w/empty.txt"
+  printf 'unicode file contents\n' > "$w/日本語.txt"
+  mkdir -p "$w/deeply/nested/dir/structure"
+  echo "deeply nested content" > "$w/deeply/nested/dir/structure/deep.txt"
+  mkdir -p "$w/empty-dir"; : > "$w/empty-dir/.gitkeep"
+  # 9 MiB binary blob to cross chunk boundaries.
+  python3 -c 'import sys; sys.stdout.buffer.write(bytes((i % 251) for i in range(9*1024*1024)))' > "$w/big.bin"
+  printf '*.lfs filter=lfs diff=lfs merge=lfs -text\n' > "$w/.gitattributes"
+  printf 'version https://git-lfs.github.com/spec/v1\noid sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\nsize 0\n' > "$w/asset.lfs"
+  printf '[submodule "sub"]\n\tpath = vendor/sub\n\turl = %s\n' "$sub_bare" > "$w/.gitmodules"
+  git -C "$w" update-index --add --cacheinfo "160000,$sub_sha,vendor/sub"
+
+  git -C "$w" add -A
+  git -C "$w" -c user.email=t@t -c user.name=t commit -q -m fixture
+  git -C "$w" tag v1.0.0
+  publish "$w" equivalence fixture
+  git -C "$w" push -q --force "$ORIGIN_ROOT/equivalence/fixture.git" main --tags
+
+  sync_repo equivalence fixture
+
+  local git_shallow git_full
+  git_shallow="$BASE_DIR/git-fixture-shallow-$writer_label"
+  git_full="$BASE_DIR/git-fixture-full-$writer_label"
+
+  rm -rf "$git_shallow" "$git_full"
+  git clone -q --depth 1 \
+      --config filter.lfs.process= \
+      --config filter.lfs.smudge=cat \
+      --config filter.lfs.clean=cat \
+      --config filter.lfs.required=false \
+      "file://$ORIGIN_ROOT/equivalence/fixture.git" "$git_shallow"
+  git clone -q \
+      --config filter.lfs.process= \
+      --config filter.lfs.smudge=cat \
+      --config filter.lfs.clean=cat \
+      --config filter.lfs.required=false \
+      "file://$ORIGIN_ROOT/equivalence/fixture.git" "$git_full"
+
+  local rip_shallow rip_full rip_files
+  rip_shallow="$BASE_DIR/rip-fixture-shallow-$writer_label"
+  rip_full="$BASE_DIR/rip-fixture-full-$writer_label"
+  rip_files="$BASE_DIR/rip-fixture-files-$writer_label"
+
+  # Run ripclone clones under the chosen writer backend.
+  (
+    [ "$io_uring" = "1" ] && export RIPCLONE_IO_URING=1 || export RIPCLONE_IO_URING=0
+    clone_repo equivalence fixture "$rip_shallow" --depth 1
+  )
+  (
+    [ "$io_uring" = "1" ] && export RIPCLONE_IO_URING=1 || export RIPCLONE_IO_URING=0
+    clone_until_count equivalence fixture "$rip_full" 1 --depth 0
+  )
+  (
+    [ "$io_uring" = "1" ] && export RIPCLONE_IO_URING=1 || export RIPCLONE_IO_URING=0
+    clone_repo equivalence fixture "$rip_files" --mode files
+  )
+
+  diff_worktree() {
+    diff -r --no-dereference --exclude=.git "$1" "$2" >/dev/null || fail "$3 worktree differs"
+  }
+
+  diff_worktree "$git_shallow" "$rip_shallow" "editable depth=1 ($writer_label)"
+  diff_worktree "$git_full" "$rip_full" "editable depth=0 ($writer_label)"
+  diff_worktree "$git_full" "$rip_files" "files mode ($writer_label)"
+
+  [ "$(gitc "$rip_shallow" rev-parse HEAD)" = "$(gitc "$git_shallow" rev-parse HEAD)" ] || fail "shallow HEAD mismatch ($writer_label)"
+  [ "$(gitc "$rip_shallow" rev-parse refs/heads/main)" = "$(gitc "$git_shallow" rev-parse refs/heads/main)" ] || fail "shallow branch ref mismatch ($writer_label)"
+  [ "$(gitc "$rip_full" rev-parse HEAD)" = "$(gitc "$git_full" rev-parse HEAD)" ] || fail "full HEAD mismatch ($writer_label)"
+  [ "$(gitc "$rip_full" rev-parse refs/heads/main)" = "$(gitc "$git_full" rev-parse refs/heads/main)" ] || fail "full branch ref mismatch ($writer_label)"
+
+  gitc "$rip_shallow" fsck --connectivity-only HEAD >/dev/null || fail "shallow fsck ($writer_label)"
+  gitc "$rip_full" fsck --connectivity-only HEAD >/dev/null || fail "full fsck ($writer_label)"
+  assert_clean "$rip_shallow" "shallow ($writer_label)"
+  assert_clean "$rip_full" "full ($writer_label)"
+
+  pass "equivalence oracle ($writer_label)"
+}
+
+run_equivalence_oracle posix 0
+if [ "$(uname -s)" = "Linux" ]; then
+  run_equivalence_oracle io_uring 1
+fi
 
 echo "ALL E2E PASSED"

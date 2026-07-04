@@ -120,7 +120,7 @@ async fn select_metadata(
     let kind =
         env_or("RIPCLONE_METADATA", config().metadata.backend.as_deref()).unwrap_or_default();
 
-    // Warn when a networked queue is paired with per-host file metadata. If the
+    // Warn when a SQL queue is paired with per-host file metadata. If the
     // workers run on other hosts, each reads and writes its own local ref files
     // and a worker's build is invisible to the server. It's valid when the server
     // and workers share one filesystem (same box), which we can't tell apart
@@ -128,12 +128,12 @@ async fn select_metadata(
     let resolves_to_file = kind == "file" || (kind.is_empty() && s3.is_none());
     if resolves_to_file {
         let queue = queue_kind();
-        if matches!(queue.as_str(), "postgres" | "mysql" | "libsql") {
+        if matches!(queue.as_str(), "sqlite" | "postgres" | "mysql" | "libsql") {
             warn!(
-                "RIPCLONE_QUEUE={queue} can run builds on other hosts, but the metadata store \
-                 resolves to per-host files. If workers don't share this filesystem, set a \
-                 shared metadata store (RIPCLONE_METADATA=s3|postgres|mysql|libsql) so the \
-                 server and workers share refs."
+                "RIPCLONE_QUEUE={queue} is SQL but the metadata store resolves to per-host \
+                 files. If workers don't share this filesystem, set a shared metadata store \
+                 (RIPCLONE_METADATA=s3|sqlite|postgres|mysql|libsql) so the server and workers \
+                 share refs."
             );
         }
     }

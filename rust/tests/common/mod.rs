@@ -18,7 +18,7 @@ use tempfile::TempDir;
 pub const TOKEN: &str = "ripclone-e2e-token";
 
 /// Process-global temp dir holding all `file://` origins for this test binary.
-fn origin_root() -> &'static Path {
+pub fn origin_root() -> &'static Path {
     use std::sync::OnceLock;
     static ROOT: OnceLock<TempDir> = OnceLock::new();
     ROOT.get_or_init(|| tempfile::tempdir().expect("origin root"))

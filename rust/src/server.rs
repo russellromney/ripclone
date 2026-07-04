@@ -5741,6 +5741,34 @@ fn recheck_max() -> u32 {
         .unwrap_or(3)
 }
 
+/// Test-only barrier for post-build freshness re-checks. When set, each re-check
+/// increments an "entered" counter and waits for a "proceed" counter to advance
+/// past the value it saw on entry. The test waits for the entered counter, does
+/// any setup (e.g. pushes a new commit), then advances proceed. This replaces
+/// the old `RIPCLONE_TEST_RECHECK_DELAY_MS` wall-clock sleep and makes the
+/// freshness tests deterministic. The e2e tests serialize on their own mutex, so
+/// only one barrier is active at a time.
+static RECHECK_BARRIER: StdMutex<
+    Option<(
+        tokio::sync::watch::Sender<usize>,
+        tokio::sync::watch::Receiver<usize>,
+    )>,
+> = StdMutex::new(None);
+
+/// Install a barrier. `entered_tx` is signaled when a re-check starts; the test
+/// advances `proceed_rx` to let that re-check continue.
+pub fn set_recheck_barrier(
+    entered_tx: tokio::sync::watch::Sender<usize>,
+    proceed_rx: tokio::sync::watch::Receiver<usize>,
+) {
+    *RECHECK_BARRIER.lock().unwrap() = Some((entered_tx, proceed_rx));
+}
+
+/// Remove the barrier. Safe to call even if no barrier is set.
+pub fn clear_recheck_barrier() {
+    *RECHECK_BARRIER.lock().unwrap() = None;
+}
+
 /// After a tip build completes, check whether the upstream tip moved during the
 /// build and, if so, build the current tip once. `trigger_build` coalesces and
 /// always builds the latest tip, so a burst of pushes collapses to one catch-up
@@ -5760,13 +5788,17 @@ async fn post_build_freshness_recheck(
     let repo_id = &job.repo_id;
     let branch = &job.branch;
 
-    // Test hook: hold the re-check briefly so a test can move the upstream tip
-    // after the build resolved its commit but before this re-check reads it. Kept
-    // ahead of the cap check so a test can exercise a capped re-check too.
-    if let Ok(ms) = std::env::var("RIPCLONE_TEST_RECHECK_DELAY_MS")
-        && let Ok(ms) = ms.parse::<u64>()
-    {
-        tokio::time::sleep(Duration::from_millis(ms)).await;
+    // Test hook: hold the re-check until the test signals via the barrier. This
+    // replaces the old RIPCLONE_TEST_RECHECK_DELAY_MS wall-clock sleep and makes
+    // the freshness tests deterministic. Clone the channels out of the static so
+    // the mutex guard is not held across the await.
+    let barrier = RECHECK_BARRIER.lock().unwrap().clone();
+    if let Some((entered_tx, mut proceed_rx)) = barrier {
+        let seen = *proceed_rx.borrow_and_update();
+        entered_tx.send_modify(|v| *v += 1);
+        // Wait for the test to advance the proceed counter past the value we saw
+        // on entry. A closed channel means the barrier was torn down; just continue.
+        let _ = proceed_rx.wait_for(|v| *v > seen).await;
     }
 
     // Stop once the re-check chain hits the cap; the poller picks up any remainder.
