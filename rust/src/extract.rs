@@ -4,7 +4,6 @@ use crate::worktree_writer::{
 };
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, bounded};
-use filetime::FileTime;
 use flate2::read::ZlibDecoder;
 use sha1::{Digest as Sha1Digest, Sha1};
 use sha2::{Digest as Sha256Digest, Sha256};
@@ -16,7 +15,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tracing::info;
 
-const INDEX_MTIME: FileTime = FileTime::from_unix_time(1, 0);
 const PACK_WRITE_BATCH_FILES: usize = 512;
 
 /// Convert a manifest blob_sha1 slice to a fixed 20-byte array.
@@ -651,28 +649,10 @@ fn flush_archive_writes(
     )
 }
 
-/// Default compressed chunk size for streaming extractions. A chunk contains
-/// one or more consecutive frames fetched with a single HTTP range request.
-/// 6 MiB is a middle ground: big enough to amortize per-request overhead on
-/// fast links, small enough to avoid a long latency tail on CPU/bandwidth
-/// constrained agents.
-const DEFAULT_STREAMING_CHUNK_SIZE: u64 = 6 * 1024 * 1024;
-
 /// Default chunk size when extracting from a local archive file. Smaller than
 /// the streaming default because the local path is CPU-bound and benefits from
 /// more parallel slicing/decompression.
 const DEFAULT_LOCAL_CHUNK_SIZE: u64 = 2 * 1024 * 1024;
-
-fn available_parallelism() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .max(1)
-}
-
-fn env_usize(name: &str) -> Option<usize> {
-    std::env::var(name).ok().and_then(|s| s.parse().ok())
-}
 
 fn archive_thread_counts() -> (usize, usize) {
     let fetch_threads = crate::gix_util::worker_threads(

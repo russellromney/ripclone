@@ -216,6 +216,8 @@ impl FileWriteContent {
         Self::Shared { data, offset, len }
     }
 
+    /// Used only by the Linux io_uring fast path.
+    #[cfg(target_os = "linux")]
     fn as_slice(&self) -> &[u8] {
         match self {
             Self::Owned(content) => content.as_slice(),
@@ -223,14 +225,6 @@ impl FileWriteContent {
             Self::Fragments(_) => {
                 panic!("fragmented file content is not contiguous")
             }
-        }
-    }
-
-    fn as_contiguous_slice(&self) -> Option<&[u8]> {
-        match self {
-            Self::Owned(content) => Some(content.as_slice()),
-            Self::Shared { data, offset, len } => Some(&data[*offset..*offset + *len]),
-            Self::Fragments(_) => None,
         }
     }
 
@@ -258,10 +252,12 @@ impl FileWriteContent {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
+    #[cfg(target_os = "linux")]
     fn is_fragmented(&self) -> bool {
         matches!(self, Self::Fragments(_))
     }

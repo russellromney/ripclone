@@ -668,15 +668,6 @@ impl Client {
     }
 }
 
-fn default_cache_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|home| {
-        let mut path = PathBuf::from(home);
-        path.push(".cache");
-        path.push("ripclone");
-        path
-    })
-}
-
 impl Client {
     pub async fn resolve_ref(&self, repo_path: &str, branch: &str) -> Result<RefResponse> {
         self.resolve_ref_with_clonepack(repo_path, branch, None, None)
