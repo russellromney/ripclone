@@ -24,7 +24,7 @@
    full-suite runs, ever — GitHub CI runs the full release suite + flake guard on
    every PR push; that is the gate. Fix what CI finds. A test that only passes in
    release is a test bug — report it, don't escalate the profile.
-2. `codex review` on the diff.
+2. `codex review` on CODE diffs. Docs/content-only diffs skip codex — Fable skims them at batch review (reviewing prose with an adversarial code reviewer is ceremony).
 3. Fable final review before merge (batch several nodes per Fable session to save tokens).
 4. Track-A (correctness) nodes additionally get `codex challenge` (adversarial).
 
@@ -974,7 +974,7 @@ include screenshots of each screen in the summary.
 
 **H3. Design + QA pass** — deps: H2 — Kimi (browse/QA), Fable review
 ```
-Run the site locally, walk flows 1-11 from UX.md, screenshot each, fix visual/copy
+Run the site locally, walk the flows in SCREENS.md (F1-F7 + error flows; UX.md is superseded), screenshot each, fix visual/copy
 issues, verify empty states point at the next action. Then the onboarding copy: the
 share-with-team block post-checkout, the seat explainer ("5 seats = 5 people cloned
 private repos in 30 days"), offboarding consequences note.
@@ -1032,7 +1032,7 @@ B4→B6; A4+C1→B5; A-nodes → A-R; B5+G2→G7; everything → B8 → wave-4 r
 - **Wave 2:** A-R gate · B2, B3, B5, B7 · C1-C4 · E2-E5 · F2, F4 · G1, G3 · H0, H1
 - **Wave 3:** B6 · D-1..D-3 · F3, F5 · G2, G4, G7, G8 · H2-H5
 - **Wave 4 (gate):** B8 (last code, after all merges) · feature-inventory closeout
-  (G2 gate) · fresh adversarial review (Codex, whole diff since 9a1e129) · benchmark
+  (G2 gate) · fresh adversarial review (Codex) — STATE-scoped, not diff-scoped: challenge the launch-critical invariants as they exist at wave 4 (publish/ordering, authz, GC-vs-liveness, entitlement, token handling). Re-reviewing 10k+ lines of already-per-PR-reviewed diff is waste; attacking the final state of the five critical subsystems is the point · benchmark
   refresh incl. p95/cold rows + amplification · G6 cutover.
 
 ## Launch gates (sign-off checklist)

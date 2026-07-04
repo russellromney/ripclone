@@ -1,6 +1,6 @@
 # Wave 1 — session prompts (bundled: 5 sessions)
 
-> One session = one worktree = one branch = SEVERAL plan nodes, executed in the
+> One session = one worktree = one branch = SEVERAL plan nodes. Exception: micro-fixes (~<20 lines, e.g. a review-requested change) ride the existing PR branch in any session — no new worktree, no ceremony, executed in the
 > listed order with ONE COMMIT PER NODE (commit message starts with the node id,
 > e.g. "A1: ..."). Nodes are bundled by file locality, so what used to be
 > cross-session merge rules is now just "do this one next." The plan
