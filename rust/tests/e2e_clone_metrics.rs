@@ -189,6 +189,7 @@ async fn seed_repo(server: &Server, owner: &str, repo: &str) -> String {
     commit
 }
 
+#[ignore = "slow: polls for background phase-2 builds"]
 #[tokio::test]
 async fn clone_id_header_triggers_metrics_post_with_correct_body() {
     init(false);
@@ -258,6 +259,7 @@ async fn clone_id_header_triggers_metrics_post_with_correct_body() {
     assert_eq!(body["client"]["ripcloneVersion"], env!("CARGO_PKG_VERSION"));
 }
 
+#[ignore = "slow: polls for background phase-2 builds"]
 #[tokio::test]
 async fn missing_clone_id_header_means_no_post() {
     init(false);
@@ -291,6 +293,7 @@ async fn missing_clone_id_header_means_no_post() {
     assert!(gw.captured.lock().unwrap().is_empty());
 }
 
+#[ignore = "slow: polls for background phase-2 builds"]
 #[tokio::test]
 async fn metrics_endpoint_failure_does_not_fail_the_clone() {
     init(false);

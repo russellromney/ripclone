@@ -8,6 +8,7 @@ mod common;
 
 use common::*;
 
+#[ignore = "slow: polls for background phase-2 builds"]
 #[tokio::test]
 async fn remote_helper_clones_through_ripclone_server() {
     init(false);

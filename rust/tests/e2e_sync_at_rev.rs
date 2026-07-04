@@ -31,6 +31,7 @@ async fn clone_full_rev(
     panic!("depth=0 clone at {rev} never reached {want_count} commits");
 }
 
+#[ignore = "slow: polls for background phase-2 builds"]
 #[tokio::test]
 async fn sync_at_rev_builds_and_clones_older_then_newer() {
     setup(true); // two-phase + LSM + async (production defaults)
@@ -86,6 +87,7 @@ async fn sync_at_rev_builds_and_clones_older_then_newer() {
 /// sync, an at-rev sync of an OLDER commit, then a plain tip clone must still
 /// serve the tip correctly. (Rev builds use a rolling key isolated from the
 /// branch entry.)
+#[ignore = "slow: polls for background phase-2 builds"]
 #[tokio::test]
 async fn sync_at_rev_does_not_clobber_tip() {
     setup(true);

@@ -7,6 +7,7 @@ mod common;
 
 use common::*;
 
+#[ignore = "slow: polls for background phase-2 builds"]
 #[tokio::test]
 async fn compaction_keeps_full_clone_correct() {
     // Bound the level count low so compaction fires after a few syncs.

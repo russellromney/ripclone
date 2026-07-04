@@ -28,6 +28,7 @@ async fn get_status(
     resp.json().await.expect("status json")
 }
 
+#[ignore = "slow: polls for background phase-2 builds"]
 #[tokio::test]
 async fn status_reports_zero_for_unsynced_repo() {
     init(false);
@@ -42,6 +43,7 @@ async fn status_reports_zero_for_unsynced_repo() {
     assert!(!status["regions"].as_array().unwrap().is_empty());
 }
 
+#[ignore = "slow: polls for background phase-2 builds"]
 #[tokio::test]
 async fn status_reports_nonzero_bytes_after_sync() {
     init(false);
@@ -73,6 +75,7 @@ async fn status_reports_nonzero_bytes_after_sync() {
     assert!(status["regions"][0]["unique_bytes"].as_u64().unwrap() > 0);
 }
 
+#[ignore = "slow: polls for background phase-2 builds"]
 #[tokio::test]
 async fn sync_response_reports_phase_timings_and_status_reports_build_ms() {
     init(false);
@@ -120,6 +123,7 @@ async fn sync_response_reports_phase_timings_and_status_reports_build_ms() {
     assert!(build_ms.is_some(), "status should report build_ms");
 }
 
+#[ignore = "slow: polls for background phase-2 builds"]
 #[tokio::test]
 async fn status_public_fork_is_free() {
     init(false);
@@ -147,6 +151,7 @@ async fn status_public_fork_is_free() {
     assert_eq!(status["regions"][0]["unique_bytes"], 0);
 }
 
+#[ignore = "slow: polls for background phase-2 builds"]
 #[tokio::test]
 async fn status_shape_is_backwards_compatible() {
     init(false);

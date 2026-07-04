@@ -24,6 +24,7 @@ fn setup() {
     init(true);
 }
 
+#[ignore = "slow: polls for background phase-2 builds"]
 #[tokio::test]
 async fn editable_full_ready_before_files() {
     setup();

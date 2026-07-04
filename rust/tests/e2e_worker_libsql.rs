@@ -67,6 +67,7 @@ fn start_sqld(port: u16, data: &Path) -> Proc {
 // The worker is spawned via `common::spawn_worker`; `Proc`/`start_sqld` above
 // manage the local sqld server this test needs.
 
+#[ignore = "slow: polls for background phase-2 builds"]
 #[tokio::test]
 async fn worker_farm_out_libsql_against_real_sqld() {
     if !sqld_available() {

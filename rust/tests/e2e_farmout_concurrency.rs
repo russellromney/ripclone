@@ -15,6 +15,7 @@ mod common;
 use common::*;
 use ripclone::mode::CloneMode;
 
+#[ignore = "slow: polls for background phase-2 builds"]
 #[tokio::test]
 async fn pool_of_worker_processes_drains_queue_and_coalesces() {
     let qdir = tempfile::tempdir().expect("queue dir");

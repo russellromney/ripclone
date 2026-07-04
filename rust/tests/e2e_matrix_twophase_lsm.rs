@@ -6,6 +6,7 @@
 mod common;
 use common::*;
 
+#[ignore = "slow: polls for background phase-2 builds"]
 #[tokio::test]
 async fn matrix_two_phase_lsm() {
     setup(true);

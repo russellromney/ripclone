@@ -8,6 +8,7 @@ use common::*;
 
 /// Positive: `/v1/version` is served by a real server with no credentials and
 /// reports this build's version + wire protocol.
+#[ignore = "slow: polls for background phase-2 builds"]
 #[tokio::test]
 async fn version_endpoint_is_served_without_auth() {
     init(false);
@@ -27,6 +28,7 @@ async fn version_endpoint_is_served_without_auth() {
 /// Positive: a real client sends `x-ripclone-protocol = PROTOCOL_VERSION`, so the
 /// server's protocol guard must let a normal sync through. Guards against the
 /// header accidentally breaking the authenticated path.
+#[ignore = "slow: polls for background phase-2 builds"]
 #[tokio::test]
 async fn current_protocol_client_can_sync() {
     init(false);
@@ -43,6 +45,7 @@ async fn current_protocol_client_can_sync() {
 
 /// Negative: a client advertising a protocol newer than the server understands
 /// is rejected with 426 Upgrade Required (the guard runs before auth).
+#[ignore = "slow: polls for background phase-2 builds"]
 #[tokio::test]
 async fn server_rejects_too_new_protocol_client() {
     init(false);
@@ -60,6 +63,7 @@ async fn server_rejects_too_new_protocol_client() {
 /// Negative edge: a missing or unparseable protocol header is treated as a legacy
 /// client and allowed through the guard (never 426), so the header can't lock out
 /// older or misconfigured clients.
+#[ignore = "slow: polls for background phase-2 builds"]
 #[tokio::test]
 async fn server_allows_missing_or_unparseable_protocol() {
     init(false);

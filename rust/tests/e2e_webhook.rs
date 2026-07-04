@@ -59,6 +59,7 @@ async fn clone_branch_full(
 
 /// A signed `push` webhook triggers a real build, and a clone then gets the
 /// pushed commit — without any per-repo Actions workflow.
+#[ignore = "slow: polls for background phase-2 builds"]
 #[tokio::test]
 async fn webhook_push_builds_before_clone() {
     setup(true); // two-phase + LSM + async (production defaults)
@@ -105,6 +106,7 @@ fn parse_metric(text: &str, name: &str) -> u64 {
 /// A webhook and a `/sync` for the SAME branch key, fired concurrently, coalesce
 /// into one build (no corruption, no double-build). Proves the coalescing gate
 /// unifies the two entry points — not just `/sync`-vs-`/sync`.
+#[ignore = "slow: polls for background phase-2 builds"]
 #[tokio::test]
 async fn webhook_and_sync_same_branch_coalesce() {
     setup(true);
@@ -162,6 +164,7 @@ async fn webhook_and_sync_same_branch_coalesce() {
 
 /// A push that arrives with NO webhook/sync trigger is still caught by the poll
 /// loop, which builds the new tip — proving the missed-event fallback end to end.
+#[ignore = "slow: polls for background phase-2 builds"]
 #[tokio::test]
 async fn poll_catches_a_missed_push() {
     setup(true);

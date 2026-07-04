@@ -18,6 +18,7 @@ mod common;
 use common::*;
 use ripclone::mode::CloneMode;
 
+#[ignore = "slow: polls for background phase-2 builds"]
 #[tokio::test]
 async fn diskless_worker_head_sync_returns_real_ref() {
     let qdir = tempfile::tempdir().expect("queue dir");

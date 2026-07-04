@@ -9,6 +9,7 @@ mod common;
 use common::*;
 use std::path::Path;
 
+#[ignore = "slow: polls for background phase-2 builds"]
 #[tokio::test]
 async fn metadata_sqlite_sync_then_clone() {
     let mdir = tempfile::tempdir().expect("metadata dir");

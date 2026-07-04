@@ -20,6 +20,7 @@ use ripclone::server::{ServerState, process_build_job};
 use std::sync::Arc;
 use std::time::Duration;
 
+#[ignore = "slow: polls for background phase-2 builds"]
 #[tokio::test]
 async fn sql_queue_farm_out_sync_then_clone() {
     // Select the SQLite queue before the server starts.

@@ -54,8 +54,9 @@ jobs:
       - name: Lint (fmt + clippy)
         run: bash scripts/ci.sh lint
 
-  # Unit + integration tests (release). PRs get a single run for fast signal;
-  # main gets the flake guard (two runs) to catch nondeterministic races.
+  # Unit + integration tests (release), including the ignored slow tests that
+  # poll for background phase-2 builds. PRs get a single run; main gets the
+  # flake guard (two runs) to catch nondeterministic races.
   test:
     runs-on: ubuntu-latest
     steps:
