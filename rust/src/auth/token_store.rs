@@ -63,37 +63,9 @@ impl FileTokenStore {
     }
 
     fn save(&self, map: &HashMap<String, String>) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("create token dir {}", parent.display()))?;
-        }
         let data = serde_json::to_string_pretty(map)?;
-        #[cfg(unix)]
-        {
-            use std::io::Write;
-            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-            // Create the file 0o600 from the start so the token is never world-
-            // readable, even briefly, and report a permission error instead of
-            // ignoring it. `mode()` only applies on create, so also set it
-            // explicitly for a file that already exists.
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&self.path)
-                .with_context(|| format!("open token file {}", self.path.display()))?;
-            f.set_permissions(std::fs::Permissions::from_mode(0o600))
-                .with_context(|| format!("chmod token file {}", self.path.display()))?;
-            f.write_all(data.as_bytes())
-                .with_context(|| format!("write token file {}", self.path.display()))?;
-        }
-        #[cfg(not(unix))]
-        {
-            std::fs::write(&self.path, data)
-                .with_context(|| format!("write token file {}", self.path.display()))?;
-        }
-        Ok(())
+        crate::secure_file::write_0600_atomic(&self.path, data.as_bytes())
+            .with_context(|| format!("write token file {}", self.path.display()))
     }
 }
 
@@ -103,15 +75,19 @@ impl TokenStore for FileTokenStore {
     }
 
     fn set(&self, id: &str, token: &str) -> Result<()> {
-        let mut map = self.load()?;
-        map.insert(id.to_string(), token.to_string());
-        self.save(&map)
+        crate::secure_file::with_file_lock(&self.path, || {
+            let mut map = self.load()?;
+            map.insert(id.to_string(), token.to_string());
+            self.save(&map)
+        })
     }
 
     fn delete(&self, id: &str) -> Result<()> {
-        let mut map = self.load()?;
-        map.remove(id);
-        self.save(&map)
+        crate::secure_file::with_file_lock(&self.path, || {
+            let mut map = self.load()?;
+            map.remove(id);
+            self.save(&map)
+        })
     }
 }
 
@@ -196,5 +172,33 @@ mod tests {
         unsafe { std::env::set_var("RIPCLONE_PROVIDER_GITLAB_TOKEN", "from-env") };
         assert_eq!(store.get("gitlab").unwrap().as_deref(), Some("from-env"));
         unsafe { std::env::remove_var("RIPCLONE_PROVIDER_GITLAB_TOKEN") };
+    }
+
+    #[test]
+    fn concurrent_file_store_set_loses_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokens.json");
+        let mut handles = Vec::new();
+        for i in 0..16 {
+            let path = path.clone();
+            handles.push(std::thread::spawn(move || {
+                let store = FileTokenStore::new(path);
+                store
+                    .set(&format!("provider-{i}"), &format!("token-{i}"))
+                    .unwrap();
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let store = FileTokenStore::new(path);
+        for i in 0..16 {
+            let token = format!("token-{i}");
+            assert_eq!(
+                store.get(&format!("provider-{i}")).unwrap().as_deref(),
+                Some(token.as_str())
+            );
+        }
     }
 }

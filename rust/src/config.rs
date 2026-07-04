@@ -212,15 +212,10 @@ fn save_to(path: &Path, config: &Config) -> Result<()> {
     let mut to_save = config.clone();
     to_save.token = None;
     let data = toml::to_string_pretty(&to_save).context("serialize config")?;
-    std::fs::write(path, data).with_context(|| format!("write {}", path.display()))?;
-    // The backend sections can hold connection settings and DB tokens, so keep
-    // the file owner-only.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-    }
-    Ok(())
+    crate::secure_file::with_file_lock(path, || {
+        crate::secure_file::write_0600_atomic(path, data.as_bytes())
+            .with_context(|| format!("write {}", path.display()))
+    })
 }
 
 /// Merge two configs: `overrides` wins over `base`.
