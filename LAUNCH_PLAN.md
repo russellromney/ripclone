@@ -421,7 +421,8 @@ Docs: quick start uses `add` to make a repo available and explains `sync` = upda
 (push-driven); the GitHub Action keeps an added repo synced, it does not add it.
 ```
 
-**B6. Sync-path efficiency + safety-critical dedup** — deps: B4 — spec Fable, exec Kimi — turbogit
+**B6. Sync-path efficiency + safety-critical dedup** — deps: B4 for item 1 ONLY;
+items 2–3 are data-independent and can run anytime — spec Fable, exec Kimi — turbogit
 ```
 1. Whatever B4's profile shows (bitmap write on the editable path is a known candidate,
    docs/ROADMAP.md §9).
@@ -623,6 +624,13 @@ gateway behaviors, emails, doc claims. (The G2 gate covers the product, not one 
 Columns: surface | repo | documented? | e2e-tested? | works? (best evidence).
 No judgments — just the inventory. Fable + Russell then mark each keep/flag/cut, which
 becomes the tracked launch checklist for gate G2.
+CLASSIFICATION RUBRIC (pre-agreed, so the keep/flag/cut session is fast — Fable
+applies it, Russell reviews only the contested rows):
+- documented + tested + works → KEEP.
+- works but untested → add the test if it's cheap (one e2e), else FLAG experimental.
+- half-built or broken → CUT + issue, unless it's on the launch path → fix-node.
+- internal/dev tooling → HIDE (not user surface, not cut).
+- when unsure → FLAG experimental. Flagged = works-as-is, labeled, no support promise.
 Two classifications are pre-flagged for the decision step (don't skip them):
 - `ripclone worktree` add: writes in place, no staging, no chunk-fetch retry — an
   interrupt leaves an unrecoverable half-repo (client.rs ~2313-2472). Fix (temp-dir
