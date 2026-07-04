@@ -76,6 +76,17 @@ pub trait MetaDb: Send + Sync {
         generation: Option<i64>,
     ) -> Result<()>;
 
+    /// Replace the JSON blob only if the row still has both the expected commit
+    /// and the expected current JSON blob.
+    async fn compare_and_swap_data(
+        &self,
+        repo_key: &str,
+        branch: &str,
+        expected_commit: &str,
+        expected_data: &str,
+        new_data: &str,
+    ) -> Result<bool>;
+
     /// Distinct `repo_key`s that have at least one stored ref.
     async fn list_repos(&self) -> Result<Vec<String>>;
 
@@ -168,6 +179,48 @@ impl RefStore for SqlRefStore {
                 new_generation,
             )
             .await
+    }
+
+    async fn update_build_status(
+        &self,
+        repo_id: &RepoId,
+        branch: &str,
+        expected_commit: &str,
+        status: &str,
+    ) -> Result<bool> {
+        let repo_key = repo_id.storage_key();
+        for attempt in 0..64 {
+            let Some(row) = self.db.get(&repo_key, branch).await? else {
+                return Ok(false);
+            };
+            if row.commit_id != expected_commit {
+                return Ok(false);
+            }
+            let mut info: RefInfo =
+                serde_json::from_str(&row.data).context("parse stored RefInfo")?;
+            if info.commit != expected_commit {
+                return Ok(false);
+            }
+            info.build_status = Some(status.to_string());
+            let data = serde_json::to_string(&info).context("serialize RefInfo")?;
+            if data == row.data {
+                return Ok(true);
+            }
+            if self
+                .db
+                .compare_and_swap_data(&repo_key, branch, expected_commit, &row.data, &data)
+                .await?
+            {
+                return Ok(true);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(
+                (attempt.min(10) + 1) as u64,
+            ))
+            .await;
+        }
+        anyhow::bail!(
+            "SQL ref store {repo_key}@{branch}: gave up after repeated status-write conflicts"
+        )
     }
 
     async fn list_branches(&self, repo_id: &RepoId) -> Result<Vec<String>> {

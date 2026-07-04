@@ -13,6 +13,21 @@ fn read(dir: &Path, name: &str) -> String {
     std::fs::read_to_string(dir.join(name)).unwrap()
 }
 
+async fn repo_status(server: &Server, owner: &str, repo: &str) -> serde_json::Value {
+    let url = format!("{}/v1/repos/github/{owner}/{repo}/status", server.url);
+    reqwest::Client::new()
+        .get(url)
+        .header("Authorization", format!("Ripclone {}", token_hash()))
+        .send()
+        .await
+        .expect("status request")
+        .error_for_status()
+        .expect("status 2xx")
+        .json()
+        .await
+        .expect("status json")
+}
+
 /// After a single two-phase sync: depth=1 is immediately clonable + correct, and
 /// depth=0 becomes a complete, fsck-clean full clone once phase 2 finishes.
 #[tokio::test]
@@ -202,4 +217,70 @@ async fn delayed_older_editable_publish_does_not_clear_newer_archive() {
 
     let (_guard, after) = clone_files_when(&server, "acme", "phase2guard", "f", "new\n").await;
     assert_eq!(read(&after, "g"), "new file\n");
+}
+
+#[tokio::test]
+async fn failed_phase2_status_recovers_on_resync() {
+    init(false);
+    let server = start_server().await;
+    let origin = make_origin("acme", "phase2fail");
+    let commit = origin.commit(&[("f", "v1\n")], "c1");
+    origin.publish();
+
+    unsafe {
+        std::env::set_var("RIPCLONE_TEST_PHASE2_FAIL_COMMIT", &commit);
+    }
+
+    server
+        .client()
+        .sync_repo("acme/phase2fail", None)
+        .await
+        .expect("sync with forced phase-2 failure");
+
+    let mut failed_status = None;
+    for _ in 0..120 {
+        let status = repo_status(&server, "acme", "phase2fail").await;
+        failed_status = status["refs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["branch"] == "main")
+            .and_then(|entry| entry["build_status"].as_str())
+            .map(str::to_string);
+        if failed_status
+            .as_deref()
+            .is_some_and(|s| s.starts_with("failed: "))
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    let failed_status = failed_status.expect("phase-2 failure status visible");
+    assert!(
+        failed_status.starts_with("failed: "),
+        "phase-2 status should fail, got {failed_status}"
+    );
+
+    unsafe {
+        std::env::remove_var("RIPCLONE_TEST_PHASE2_FAIL_COMMIT");
+    }
+
+    server
+        .client()
+        .sync_repo("acme/phase2fail", None)
+        .await
+        .expect("resync after clearing phase-2 failure");
+
+    let mut recovered = false;
+    for _ in 0..120 {
+        if let Ok((_g, d)) = clone_only(&server, "acme", "phase2fail", 0, CloneMode::Editable).await
+            && git(&d, &["rev-parse", "HEAD"]) == commit
+            && git_ok(&d, &["fsck", "--connectivity-only", "HEAD"])
+        {
+            recovered = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(recovered, "subsequent sync should recover the full clone");
 }

@@ -30,7 +30,7 @@ use axum::{
 };
 use futures::{StreamExt, TryStreamExt};
 use prost::Message;
-use secrecy::ExposeSecret;
+use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -574,6 +574,8 @@ pub struct BranchStatusEntry {
     pub built_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub build_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub build_status: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -2502,6 +2504,7 @@ async fn build_repo_status(
             unique_bytes: branch_unique_bytes,
             built_at,
             build_ms: info.build_ms,
+            build_status: info.build_status,
         });
     }
 
@@ -3520,6 +3523,11 @@ async fn create_snapshot_inner(
         credential.as_ref(),
         &repo_config,
         &lock,
+        Some(Phase2FailureAction {
+            state: state.clone(),
+            credential: credential.clone(),
+            retry_recheck: Some(1),
+        }),
     )
     .await
     {
@@ -4422,6 +4430,7 @@ async fn do_sync(
     // repos build concurrently. Safe because auto-gc is off, so the build only
     // reads the mirror's packs.
     mirror_lock: &Arc<tokio::sync::Mutex<()>>,
+    phase2_failure: Option<Phase2FailureAction>,
 ) -> Result<SyncBuildResult> {
     let compression_level = repo_config.compression_level();
     info!("syncing {}@{}", repo_id.storage_key(), branch);
@@ -4611,6 +4620,7 @@ async fn do_sync(
         fetched_at,
         compression_level,
         phases,
+        phase2_failure,
     )
     .await
 }
@@ -4646,6 +4656,13 @@ struct HeadBuild {
     elapsed_ms: u64,
 }
 
+#[derive(Clone)]
+struct Phase2FailureAction {
+    state: ServerState,
+    credential: Option<SecretString>,
+    retry_recheck: Option<u32>,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn build_and_publish_two_phase(
     cas: &Cas,
@@ -4665,6 +4682,7 @@ async fn build_and_publish_two_phase(
     // zstd level for archive frames, from the effective repo config.
     compression_level: i32,
     mut phases: SyncPhases,
+    phase2_failure: Option<Phase2FailureAction>,
 ) -> Result<SyncBuildResult> {
     let history_target = env_bytes("RIPCLONE_HISTORY_PACK_BYTES", 512 * 1024 * 1024);
     let upload_conc = upload_concurrency();
@@ -4992,6 +5010,7 @@ async fn build_and_publish_two_phase(
     let sk_meta = shallow_metadata_hash.clone();
     let sk_meta_len = shallow_meta_data.len() as u64;
     let head_base_pack_count_for_p2 = head_built.base_packs.len();
+    let phase2_failure2 = phase2_failure.clone();
     let phase2 = async move {
         let started = Instant::now();
         let res = build_full_in_background(
@@ -5030,10 +5049,16 @@ async fn build_and_publish_two_phase(
                 &commit2[..7.min(commit2.len())],
                 started.elapsed()
             ),
-            Err(e) => error!(
-                "full clone build failed for {}: {e:#}",
-                repo_id2.storage_key()
-            ),
+            Err(e) => {
+                error!(
+                    "full clone build failed for {}: {e:#}",
+                    repo_id2.storage_key()
+                );
+                if let Some(action) = phase2_failure2 {
+                    handle_phase2_failure(action, &repo_id2, &branch2, &commit2, &format!("{e:#}"))
+                        .await;
+                }
+            }
         }
         res
     };
@@ -5375,6 +5400,11 @@ async fn build_full_in_background(
     {
         tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
     }
+    if let Ok(fail_for) = std::env::var("RIPCLONE_TEST_PHASE2_FAIL_COMMIT")
+        && fail_for == commit
+    {
+        anyhow::bail!("forced phase-2 failure for {commit}");
+    }
 
     // Now the zstd archive, which files mode needs.
     let t_archive = Instant::now();
@@ -5477,7 +5507,12 @@ pub async fn process_build_job(
     let at_rev = job.rev.clone();
 
     // Mark as building in the shared metadata store.
-    let _ = update_build_status(state, repo_id, "building").await;
+    if let Err(e) = update_current_build_status(state, repo_id, branch, "building").await {
+        error!(
+            "build status update failed for {}@{branch}: {e:#}",
+            repo_id.storage_key()
+        );
+    }
     invalidate_ref_response_cache(state, repo_id, branch);
 
     let start = std::time::Instant::now();
@@ -5485,7 +5520,12 @@ pub async fn process_build_job(
     let provider = match state.provider_registry.get(repo_id.provider.as_str()) {
         Some(p) => p.clone(),
         None => {
-            let _ = update_build_status(state, repo_id, "error").await;
+            if let Err(e) = update_current_build_status(state, repo_id, branch, "error").await {
+                error!(
+                    "build status update failed for {}@{branch}: {e:#}",
+                    repo_id.storage_key()
+                );
+            }
             warn!(
                 "unknown provider {} for build job",
                 repo_id.provider.as_str()
@@ -5518,6 +5558,19 @@ pub async fn process_build_job(
         job.credential.as_ref(),
         &repo_config,
         &lock,
+        if job.recheck == 0 {
+            Some(Phase2FailureAction {
+                state: state.clone(),
+                credential: job.credential.clone(),
+                retry_recheck: Some(1),
+            })
+        } else {
+            Some(Phase2FailureAction {
+                state: state.clone(),
+                credential: job.credential.clone(),
+                retry_recheck: None,
+            })
+        },
     )
     .await;
 
@@ -5535,10 +5588,8 @@ pub async fn process_build_job(
             // default branch `do_sync` stored the ref under. Persist the real ref
             // under the literal `HEAD` key too (plain HEAD request, no rev
             // override) so any process can resolve `/sync HEAD` from the shared
-            // metadata store alone. The `HEAD` row already exists (build_status
-            // placeholder) and already shows in `list_branches`, so this only
-            // fills it with real data. `update_build_status` below then stamps
-            // `done` onto it.
+            // metadata store alone. The save below creates or updates the
+            // literal `HEAD` alias; the status update then stamps `done` onto it.
             if branch == "HEAD"
                 && at_rev.is_none()
                 && effective_branch != "HEAD"
@@ -5549,7 +5600,18 @@ pub async fn process_build_job(
                     repo_id.storage_key()
                 );
             }
-            let _ = update_build_status(state, repo_id, "done").await;
+            if inline_full_history {
+                if let Err(e) =
+                    update_build_status(state, repo_id, &effective_branch, &info.commit, "done")
+                        .await
+                {
+                    error!(
+                        "build status update failed for {}@{effective_branch} {}: {e:#}",
+                        repo_id.storage_key(),
+                        info.commit
+                    );
+                }
+            }
             // A successful sync marks the mirror fresh so a following resolve
             // doesn't re-fetch. Stamp both the concrete branch and the original
             // requested branch (e.g. HEAD).
@@ -5588,7 +5650,19 @@ pub async fn process_build_job(
         }
         Err(e) => {
             state.metrics.record_build_failed();
-            let _ = update_build_status(state, repo_id, &format!("failed: {e}")).await;
+            if let Err(status_err) = update_current_build_status(
+                state,
+                repo_id,
+                &effective_branch,
+                &format!("failed: {e}"),
+            )
+            .await
+            {
+                error!(
+                    "build status update failed for {}@{effective_branch}: {status_err:#}",
+                    repo_id.storage_key()
+                );
+            }
             invalidate_ref_response_cache(state, repo_id, &effective_branch);
             warn!(
                 "background build failed for {}@{effective_branch}: {e}",
@@ -5706,16 +5780,20 @@ async fn enqueue_recheck_build(
     recheck: u32,
 ) -> Result<(), String> {
     let credential = state.broker.fetch_credential(repo_id, None);
-    let job = BuildJob {
-        repo_id: repo_id.clone(),
-        branch: branch.to_string(),
-        rev: None,
-        credential,
-        recheck,
-    };
-    // Count metrics off the outcome so the queue-depth gauge stays balanced: only
-    // a genuinely new job bumps it (and its completion decrements it). A coalesced
-    // enqueue drains no job, so it must not touch the gauge.
+    enqueue_direct_build(
+        state,
+        BuildJob {
+            repo_id: repo_id.clone(),
+            branch: branch.to_string(),
+            rev: None,
+            credential,
+            recheck,
+        },
+    )
+    .await
+}
+
+async fn enqueue_direct_build(state: &ServerState, job: BuildJob) -> Result<(), String> {
     match state.build_queue.enqueue(job).await {
         Ok(enq) => match enq.outcome {
             EnqueueOutcome::Enqueued => {
@@ -5727,6 +5805,42 @@ async fn enqueue_recheck_build(
             EnqueueOutcome::Full => Err("build queue full".to_string()),
         },
         Err(e) => Err(format!("build queue unavailable: {e}")),
+    }
+}
+
+async fn handle_phase2_failure(
+    action: Phase2FailureAction,
+    repo_id: &RepoId,
+    branch: &str,
+    commit: &str,
+    reason: &str,
+) {
+    let status = format!("failed: {reason}");
+    match update_build_status(&action.state, repo_id, branch, commit, &status).await {
+        Ok(true) => {
+            invalidate_ref_response_cache(&action.state, repo_id, branch);
+        }
+        Ok(false) => {}
+        Err(e) => error!(
+            "build status update failed for {}@{branch} {commit}: {e:#}",
+            repo_id.storage_key()
+        ),
+    }
+
+    if let Some(recheck) = action.retry_recheck {
+        let job = BuildJob {
+            repo_id: repo_id.clone(),
+            branch: branch.to_string(),
+            rev: None,
+            credential: action.credential,
+            recheck,
+        };
+        if let Err(e) = enqueue_direct_build(&action.state, job).await {
+            warn!(
+                "phase-2 retry trigger failed for {}@{branch} {commit}: {e}",
+                repo_id.storage_key()
+            );
+        }
     }
 }
 
@@ -5905,42 +6019,49 @@ fn spawn_poll_loop(state: ServerState, interval: Duration) {
     });
 }
 
-async fn update_build_status(state: &ServerState, repo_id: &RepoId, status: &str) -> Result<()> {
-    let mut info = match state.ref_store.load(repo_id).await? {
-        Some(info) => info,
-        None => RefInfo {
-            commit: String::new(),
-            parent_commit: None,
-            default_branch: String::new(),
-            skeleton_pack: String::new(),
-            skeleton_idx: String::new(),
-            head_blobs_pack: String::new(),
-            head_blobs_idx: String::new(),
-            head_blobs_chunks: Vec::new(),
-            packs: Vec::new(),
-            prebuilt_index: String::new(),
-            archive: String::new(),
-            manifest: String::new(),
-            full_pack: String::new(),
-            clonepack_manifest: String::new(),
-            metadata_chunk: String::new(),
-            archive_chunks: Vec::new(),
-            full_clonepack: crate::ClonepackArtifacts::default(),
-            shallow_clonepack: crate::ClonepackArtifacts::default(),
-            history_levels: Vec::new(),
-            head_buckets: Vec::new(),
-            head_base_commit: String::new(),
-            head_base_packs: Vec::new(),
-            archive_frames: Vec::new(),
-            build_status: None,
-            build_ms: None,
-            synced_at: None,
-            generation: None,
-        },
+async fn update_build_status(
+    state: &ServerState,
+    repo_id: &RepoId,
+    branch: &str,
+    commit: &str,
+    status: &str,
+) -> Result<bool> {
+    state
+        .ref_store
+        .update_build_status(repo_id, branch, commit, status)
+        .await
+        .with_context(|| {
+            format!(
+                "update build status for {}@{branch} {commit}",
+                repo_id.storage_key()
+            )
+        })
+}
+
+async fn update_current_build_status(
+    state: &ServerState,
+    repo_id: &RepoId,
+    branch: &str,
+    status: &str,
+) -> Result<Option<String>> {
+    let Some(info) = state.ref_store.load_branch(repo_id, branch).await? else {
+        return Ok(None);
     };
-    info.build_status = Some(status.to_string());
-    state.ref_store.save(repo_id, &info).await?;
-    Ok(())
+    if info.commit.is_empty() {
+        return Ok(None);
+    }
+    let commit = info.commit.clone();
+    state
+        .ref_store
+        .update_build_status(repo_id, branch, &commit, status)
+        .await
+        .with_context(|| {
+            format!(
+                "update build status for {}@{branch} {commit}",
+                repo_id.storage_key()
+            )
+        })?;
+    Ok(Some(commit))
 }
 
 /// Hash the auth token, or fail if it is missing/empty. Pure (no env access) so

@@ -56,6 +56,9 @@ fn unbranch_slug(slug: &str) -> Option<String> {
 /// built and a later sync reuses it, or until the next forward push. That is the
 /// cost of ordering by history rather than by observation time.
 pub(crate) fn should_replace_ref(existing: Option<&RefInfo>, new: &RefInfo) -> bool {
+    if new.commit.is_empty() {
+        return false;
+    }
     let Some(existing) = existing else {
         return true;
     };
@@ -106,6 +109,16 @@ pub trait RefStore: Send + Sync {
 
     /// Save the `RefInfo` for a specific branch.
     async fn save_branch(&self, repo_id: &RepoId, branch: &str, info: &RefInfo) -> Result<()>;
+
+    /// Update only `build_status` when the stored ref still points at
+    /// `expected_commit`. Returns `false` when the row is absent or has moved.
+    async fn update_build_status(
+        &self,
+        repo_id: &RepoId,
+        branch: &str,
+        expected_commit: &str,
+        status: &str,
+    ) -> Result<bool>;
 
     /// Delete the stored `RefInfo` for a branch (e.g. on a webhook
     /// branch-delete). Idempotent: removing a branch that isn't stored is `Ok`.
@@ -193,6 +206,36 @@ impl FileRefStore {
             .await
             .with_context(|| format!("rename {} to {}", tmp_path.display(), path.display()))?;
         Ok(())
+    }
+
+    async fn update_status_checked(
+        &self,
+        path: &Path,
+        expected_commit: &str,
+        status: &str,
+    ) -> Result<bool> {
+        let _guard = self.write_lock.lock().await;
+
+        let mut info: RefInfo = match tokio::fs::read(path).await {
+            Ok(data) => serde_json::from_slice(&data)
+                .with_context(|| format!("parse ref store {}", path.display()))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(anyhow::anyhow!("read ref store {}: {}", path.display(), e)),
+        };
+        if info.commit != expected_commit {
+            return Ok(false);
+        }
+
+        info.build_status = Some(status.to_string());
+        let data = serde_json::to_vec_pretty(&info).context("serialize RefInfo")?;
+        let tmp_path = path.with_extension("json.tmp");
+        tokio::fs::write(&tmp_path, data)
+            .await
+            .with_context(|| format!("write temp ref store {}", tmp_path.display()))?;
+        tokio::fs::rename(&tmp_path, path)
+            .await
+            .with_context(|| format!("rename {} to {}", tmp_path.display(), path.display()))?;
+        Ok(true)
     }
 
     /// Path to the legacy HEAD ref file. Kept for backward compatibility with
@@ -285,6 +328,22 @@ impl RefStore for FileRefStore {
             return self.save(repo_id, info).await;
         }
         self.write_checked(&self.branch_path(repo_id, branch), info)
+            .await
+    }
+
+    async fn update_build_status(
+        &self,
+        repo_id: &RepoId,
+        branch: &str,
+        expected_commit: &str,
+        status: &str,
+    ) -> Result<bool> {
+        let path = if branch == "HEAD" {
+            self.path(repo_id)
+        } else {
+            self.branch_path(repo_id, branch)
+        };
+        self.update_status_checked(&path, expected_commit, status)
             .await
     }
 
@@ -443,6 +502,40 @@ impl S3RefStore {
         }
         anyhow::bail!("S3 ref store {key}: gave up after repeated concurrent-write conflicts")
     }
+
+    async fn update_status_keyed(
+        &self,
+        key: &str,
+        expected_commit: &str,
+        status: &str,
+    ) -> Result<bool> {
+        for attempt in 0..64 {
+            let (etag, mut info) = match self.storage.get_object(key).await {
+                Ok(Some((etag, existing_bytes))) => {
+                    let info: RefInfo = serde_json::from_slice(&existing_bytes)
+                        .with_context(|| format!("parse existing S3 ref store {key}"))?;
+                    (etag, info)
+                }
+                Ok(None) => return Ok(false),
+                Err(e) => return Err(e).with_context(|| format!("load S3 ref store {key}")),
+            };
+            if info.commit != expected_commit {
+                return Ok(false);
+            }
+            info.build_status = Some(status.to_string());
+            let data = serde_json::to_vec_pretty(&info).context("serialize RefInfo")?;
+            if self
+                .storage
+                .put_object_cas(key, &data, Some(&etag))
+                .await
+                .with_context(|| format!("write S3 ref store {key}"))?
+            {
+                return Ok(true);
+            }
+            tokio::time::sleep(Duration::from_millis((attempt.min(10) + 1) as u64)).await;
+        }
+        anyhow::bail!("S3 ref store {key}: gave up after repeated status-write conflicts")
+    }
 }
 
 #[async_trait]
@@ -517,6 +610,22 @@ impl RefStore for S3RefStore {
             return self.save(repo_id, info).await;
         }
         self.save_keyed(&self.branch_key(repo_id, branch), info)
+            .await
+    }
+
+    async fn update_build_status(
+        &self,
+        repo_id: &RepoId,
+        branch: &str,
+        expected_commit: &str,
+        status: &str,
+    ) -> Result<bool> {
+        let key = if branch == "HEAD" {
+            self.key(repo_id)
+        } else {
+            self.branch_key(repo_id, branch)
+        };
+        self.update_status_keyed(&key, expected_commit, status)
             .await
     }
 
@@ -672,6 +781,23 @@ impl<T: RefStore> RefStore for CachingRefStore<T> {
         // value through and refills the cache.
         cache.remove(&key);
         Ok(())
+    }
+
+    async fn update_build_status(
+        &self,
+        repo_id: &RepoId,
+        branch: &str,
+        expected_commit: &str,
+        status: &str,
+    ) -> Result<bool> {
+        let key = Self::cache_key(repo_id, branch);
+        let mut cache = self.cache.write().await;
+        let updated = self
+            .inner
+            .update_build_status(repo_id, branch, expected_commit, status)
+            .await?;
+        cache.remove(&key);
+        Ok(updated)
     }
 
     async fn delete_branch(&self, repo_id: &RepoId, branch: &str) -> Result<()> {
@@ -890,6 +1016,68 @@ mod tests {
                 .commit,
             "c-deeper"
         );
+    }
+
+    #[test]
+    fn should_replace_ref_rejects_empty_commit_candidate() {
+        let empty = dummy_ref_info("");
+        assert!(
+            !should_replace_ref(None, &empty),
+            "an empty commit must not create a stored ref"
+        );
+
+        let existing = dummy_ref_info("real");
+        assert!(
+            !should_replace_ref(Some(&existing), &empty),
+            "an empty commit must not replace a real ref"
+        );
+    }
+
+    #[tokio::test]
+    async fn file_ref_store_status_update_is_commit_guarded_and_targeted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileRefStore::new(tmp.path());
+        let repo = RepoId::github("o/r");
+
+        let mut info = dummy_ref_info("new");
+        info.archive_chunks = vec!["archive-a".to_string(), "archive-b".to_string()];
+        info.full_clonepack.manifest = "full-manifest".to_string();
+        info.full_clonepack.commit = "new".to_string();
+        info.build_status = Some("full history building".to_string());
+        info.generation = Some(42);
+        store.save_branch(&repo, "main", &info).await.unwrap();
+
+        assert!(
+            !store
+                .update_build_status(&repo, "main", "old", "failed: stale")
+                .await
+                .unwrap(),
+            "a stale status update must not touch the stored ref"
+        );
+        let loaded = store.load_branch(&repo, "main").await.unwrap().unwrap();
+        assert_eq!(loaded.commit, "new");
+        assert_eq!(
+            loaded.build_status.as_deref(),
+            Some("full history building")
+        );
+        assert_eq!(loaded.archive_chunks, vec!["archive-a", "archive-b"]);
+        assert_eq!(loaded.full_clonepack.manifest, "full-manifest");
+        assert_eq!(loaded.generation, Some(42));
+
+        assert!(
+            store
+                .update_build_status(&repo, "main", "new", "failed: boom")
+                .await
+                .unwrap(),
+            "the matching commit should accept the status update"
+        );
+        let loaded = store.load_branch(&repo, "main").await.unwrap().unwrap();
+        assert_eq!(loaded.commit, "new");
+        assert_eq!(loaded.build_status.as_deref(), Some("failed: boom"));
+        assert_eq!(loaded.archive_chunks, vec!["archive-a", "archive-b"]);
+        assert_eq!(loaded.full_clonepack.manifest, "full-manifest");
+        assert_eq!(loaded.full_clonepack.commit, "new");
+        assert_eq!(loaded.generation, Some(42));
     }
 
     #[tokio::test]

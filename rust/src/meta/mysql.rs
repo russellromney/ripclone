@@ -173,6 +173,32 @@ impl MetaDb for MysqlMeta {
         Ok(())
     }
 
+    async fn compare_and_swap_data(
+        &self,
+        repo_key: &str,
+        branch: &str,
+        expected_commit: &str,
+        expected_data: &str,
+        new_data: &str,
+    ) -> Result<bool> {
+        check_len("repo_key", repo_key, 512)?;
+        check_len("branch", branch, 255)?;
+        check_len("commit_id", expected_commit, 64)?;
+        let result = sqlx::query(
+            "UPDATE refs SET data = ?
+             WHERE repo_key = ? AND branch = ? AND commit_id = ? AND data = ?",
+        )
+        .bind(new_data)
+        .bind(repo_key)
+        .bind(branch)
+        .bind(expected_commit)
+        .bind(expected_data)
+        .execute(&self.pool)
+        .await
+        .context("compare-and-swap ref data")?;
+        Ok(result.rows_affected() > 0)
+    }
+
     async fn list_repos(&self) -> Result<Vec<String>> {
         let rows = sqlx::query("SELECT DISTINCT repo_key FROM refs")
             .fetch_all(&self.pool)
