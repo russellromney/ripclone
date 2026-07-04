@@ -153,7 +153,7 @@ save if info.commit != this build's commit (match the existing guarded saves' st
 Add an e2e in rust/tests/ that races two syncs and asserts the newer commit's ref
 survives a delayed older phase-2. Checks: the touched test files, debug (test economy; PR CI is the gate).
 ```
-Accept: guard present on all three phase-2 saves; new e2e passes; flake run clean.
+Accept: guard present on all three phase-2 saves; new e2e passes; PR CI clean.
 
 **A2. Per-repo authz on the five ungated content endpoints** — deps: none — turbogit
 ```
@@ -275,9 +275,9 @@ Delete dead weight (~2,500 lines). All items verified unreachable or test-only:
    knobs) — the code logs itself as "deprecated and slated for removal".
 4. The `ripclone backend` subcommand (cli.rs ~278-321, 960-1115) — server settings do
    not belong in the client; note removal in docs/CHANGELOG.md.
-Do NOT touch the second extraction pipeline yet (separate node). After deleting, run
-scripts/ci.sh lint test flake. Everything must stay green with zero test edits except
-deleting tests of deleted code.
+Do NOT touch the second extraction pipeline yet (separate node). Checks after
+deleting: fmt + clippy + a debug build; PR CI proves the suite stays green with zero
+test edits except deleting tests of deleted code.
 ```
 Accept: green CI, net-negative diff ≥2,000 lines, CHANGELOG note.
 
@@ -297,8 +297,9 @@ extract_archive_with_chunk_fetcher (~196-712) and extract_archive_from_chunk_rec
 (~941-1441). Fixes must land twice and have already diverged (the checked-math
 frame-bounds fix differs between copies). Keep the receiver variant (it's the one the
 main clone uses), and feed the legacy callers through a thin adapter (~30 lines) that
-wraps a fetcher into a receiver channel. Byte-identical behavior: the full e2e suite
-plus scripts/e2e_local.sh must pass unchanged (run it once — it uses real binaries). Other checks: touched tests, debug; PR CI is the gate.
+wraps a fetcher into a receiver channel. Byte-identical behavior is the bar: run
+scripts/e2e_local.sh once locally (real binaries) + the extract-related test files in
+debug; the full e2e suite passing unchanged is PR CI's job, not a local run.
 ```
 
 **B4. Profile phase-1 sync latency** — deps: none — Kimi executes, Fable analyzes — turbogit

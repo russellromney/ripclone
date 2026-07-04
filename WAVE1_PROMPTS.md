@@ -1,8 +1,9 @@
 # Wave 1 — session prompts (bundled: 5 sessions)
 
-> One session = one worktree = one branch = SEVERAL plan nodes. Exception: micro-fixes (~<20 lines, e.g. a review-requested change) ride the existing PR branch in any session — no new worktree, no ceremony, executed in the
+> One session = one worktree = one branch = SEVERAL plan nodes, executed in the
 > listed order with ONE COMMIT PER NODE (commit message starts with the node id,
-> e.g. "A1: ..."). Nodes are bundled by file locality, so what used to be
+> e.g. "A1: ..."). Exception: micro-fixes (~<20 lines, e.g. a review-requested
+> change) ride the existing PR branch in any session — no new worktree, no ceremony. Nodes are bundled by file locality, so what used to be
 > cross-session merge rules is now just "do this one next." The plan
 > (LAUNCH_PLAN.md) stays the source of truth for every node's spec.
 >
@@ -38,8 +39,7 @@ git -C ~/Documents/Github/turbogit log --oneline -2 main
 #   a033502 auth: store CLI tokens in the ripclone token file, drop the OS keyring
 ```
 
-(Once the lint+flake gate finishes and main is pushed, origin/main == local main
-and the distinction disappears. Until then, do NOT base anything on origin/main.)
+(origin/main is current — base on origin/main or local main interchangeably.)
 
 Worktrees are cut from a commit of the shared repo — it does not matter which
 existing checkout you run these from; the existing ~15 feature worktrees are
@@ -64,7 +64,8 @@ git worktree add ../rc-wave1 -b wave1/cloud-batch main
 2. **wave1/cloud-batch** merges anytime (separate repo).
 3. **wave1/tests-docs** merges next (mostly new files).
 4. **wave1/cleanup-profile** merges LAST — its session rebases onto latest main
-   and reruns full CI before finalizing (bulk deletion = the conflict magnet).
+   and reruns fmt + clippy before finalizing (bulk deletion = the conflict
+   magnet). PR CI runs the full suite.
 
 ## Shared preamble — paste at the TOP of every session
 
