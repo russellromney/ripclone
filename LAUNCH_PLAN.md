@@ -357,7 +357,13 @@ VOCABULARY (exact, don't drift):
      (docs/DESIGN.md). Reorder to archive-before-history — files mode gets ready
      sooner, and history may be deferred entirely (--no-history). Update DESIGN.md's
      two-phase section to match.
-   - `add` on an already-added repo is idempotent (behaves like a `sync`).
+   - `add` on an already-added repo is idempotent (no duplicate state; triggers a
+     sync). The CLI prints the friendly form: "already added — `ripclone clone
+     <repo>` works now."
+   - `DELETE …/add` (un-add): removes added state; the repo's refs become
+     GC-eligible (grace period still applies) and pushes stop building. Used by
+     the cloud for PRIVATE repo removal only — public repos are a commons and are
+     never removed (idle ones go cold via TTL and rebuild on next clone).
 
 3. `ripclone sync <repo>` → `POST …/sync`:
    - Requires the repo to be ADDED. CLI `sync` of a non-added repo → error "not added;
@@ -820,11 +826,35 @@ B5 defines the OSS half; this node is the cloud half — previously unowned:
    status endpoint.
 3. Update the sync path: webhook handler + any manual "sync now" action call
    `POST /sync` (never /add), filtered on cloud added_repos (A6b).
+3b. Private-repo REMOVE wiring: admin-only action → OSS `DELETE …/add` → remove
+   the cloud row. Public repos have no remove path anywhere (commons).
+3c. COMMONS FRESHNESS: public repos added by non-owners have NO webhook — the
+   backend deploy must enable the OSS polling fallback
+   (RIPCLONE_POLL_INTERVAL_SECS > 0) plus the resolve-time freshness re-check, or
+   the commons serves stale HEADs. Verify with a test: push to a webhook-less
+   added repo → poll picks it up within the interval.
 4. Deploy lockstep: B5 changes the backend API; deploy the backend and this cloud
    change together (all-dev, no compat shim needed — but do it as one cutover, and
    bump the protocol version so an old CLI gets a clear error, not a mystery 404).
 5. Tests: policy-rejected add never reaches OSS; successful add creates both records;
    OSS-failed add creates neither; 404/202 passthrough shapes; sync-not-add on push.
+```
+
+**G8. Account deletion + Resend transactional basics** — deps: H0 ✅ — Kimi — ripclone-cloud
+```
+1. Account deletion (avatar menu; the privacy policy promises it): delete the
+   user's identities, memberships, personal tokens, sessions, and their personal
+   org (incl. its Stripe customer/subscription). If they're the SOLE admin of a
+   team org: block with "transfer or delete the org first." Private repos of a
+   deleted org un-add via OSS DELETE /add. PUBLIC adds persist (commons) with
+   added_by anonymized. Type-your-login confirm + a Resend confirmation email.
+2. Resend transactional basics (Resend is already wired for magic-link): exactly
+   two emails at launch — payment-failed notice (on Stripe past_due webhook,
+   mirrors the console banner) and account-deletion confirmation. No marketing,
+   no digests.
+3. Tests: deletion removes the right rows and nothing else (esp. public
+   added_repos survive anonymized); sole-admin block; past_due email fires once
+   per event (dedupe).
 ```
 
 **G6. Prod cutover** — deps: everything above — **[USER]**, checklist in ROADMAP.md:421-461
@@ -985,7 +1015,7 @@ B4→B6; A4+C1→B5; A-nodes → A-R; B5+G2→G7; everything → B8 → wave-4 r
 - **Wave 1 (now):** D1-D6 decisions [USER] · A1-A5, A6a · B1, B4 · E1, E6 · F1 · G5
   (pull-ahead candidates if sessions are free: E2, E4, E5, A6b, G3, G4)
 - **Wave 2:** A-R gate · B2, B3, B5, B7 · C1-C4 · E2-E5 · F2, F4 · G1, G3 · H0, H1
-- **Wave 3:** B6 · D-1..D-3 · F3, F5 · G2, G4, G7 · H2-H5
+- **Wave 3:** B6 · D-1..D-3 · F3, F5 · G2, G4, G7, G8 · H2-H5
 - **Wave 4 (gate):** B8 (last code, after all merges) · feature-inventory closeout
   (G2 gate) · fresh adversarial review (Codex, whole diff since 9a1e129) · benchmark
   refresh incl. p95/cold rows + amplification · G6 cutover.
