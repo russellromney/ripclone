@@ -643,6 +643,13 @@ Produce a table of EVERY user-visible surface in BOTH repos. turbogit: CLI subco
 claims (README + docs/). ripclone-cloud: pages, server actions, API + webhook routes,
 gateway behaviors, emails, doc claims. (The G2 gate covers the product, not one repo.)
 Columns: surface | repo | documented? | e2e-tested? | works? (best evidence).
+FORM (anti-staleness): where enumeration is mechanical (env vars, routes, subcommands
+via --help, page files), write it as a small scripts/inventory.sh whose output IS those
+table sections; hand-curate only what needs judgment (doc claims, works-evidence).
+INVENTORY.md is a DATED SNAPSHOT with a banner: "generated <date> — work queue for the
+G2 gate; delete after wave-4 closeout." It is not documentation. Classifications never
+live here permanently: keep→test exists, flag→hidden/marked experimental in code,
+cut→deleted+issue. After the gate, the code is the inventory; the file gets deleted.
 No judgments — just the inventory. Fable + Russell then mark each keep/flag/cut, which
 becomes the tracked launch checklist for gate G2.
 CLASSIFICATION RUBRIC (pre-agreed, so the keep/flag/cut session is fast — Fable
