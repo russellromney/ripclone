@@ -81,9 +81,6 @@ enum Commands {
         dir: Option<PathBuf>,
         #[arg(short, long, default_value = "HEAD")]
         branch: String,
-        /// Number of hot files to include in the initial snapshot.
-        #[arg(long, default_value = "50")]
-        hot_files: usize,
         /// Clone mode: editable (default) or files.
         #[arg(long)]
         mode: Option<CloneMode>,
@@ -122,12 +119,6 @@ enum Commands {
     Provider {
         #[command(subcommand)]
         action: ProviderAction,
-    },
-    /// Configure server-side backends (storage, metadata store, build queue) in
-    /// the global config.toml. Matching RIPCLONE_* env vars always override these.
-    Backend {
-        #[command(subcommand)]
-        action: BackendAction,
     },
     /// Snapshot operations for agent-ready repo skeletons.
     Snapshot {
@@ -272,51 +263,6 @@ enum ProviderAction {
         repo: String,
         #[arg(short, long, default_value = "HEAD")]
         branch: String,
-    },
-}
-
-#[derive(Subcommand)]
-enum BackendAction {
-    /// Show the configured backends (and which RIPCLONE_* env vars override them).
-    Show,
-    /// Set the build queue backend. Only the flags you pass are changed.
-    Queue {
-        /// `local` | `sqlite` | `postgres` | `mysql` | `libsql`.
-        #[arg(short, long)]
-        backend: Option<String>,
-        /// Connection URL (sqlite path / postgres:// / mysql:// / libsql://).
-        #[arg(short, long)]
-        url: Option<String>,
-        /// Auth token for libsql (remote).
-        #[arg(short, long)]
-        token: Option<String>,
-    },
-    /// Set the metadata (ref) store backend. Only the flags you pass are changed.
-    Metadata {
-        /// `file` | `s3` | `sqlite` | `postgres` | `mysql` | `libsql`.
-        #[arg(short, long)]
-        backend: Option<String>,
-        #[arg(short, long)]
-        url: Option<String>,
-        #[arg(short, long)]
-        token: Option<String>,
-    },
-    /// Set the artifact storage backend. Only the flags you pass are changed.
-    /// Credentials (AWS_*) stay in the environment, never in config.
-    Storage {
-        /// `local` | `s3`.
-        #[arg(short, long)]
-        backend: Option<String>,
-        #[arg(short, long)]
-        endpoint: Option<String>,
-        #[arg(short, long)]
-        region: Option<String>,
-        #[arg(short = 'B', long)]
-        bucket: Option<String>,
-        #[arg(short, long)]
-        prefix: Option<String>,
-        #[arg(short, long)]
-        cache_dir: Option<String>,
     },
 }
 
@@ -948,163 +894,6 @@ async fn run_provider_rm(id: &str) -> Result<()> {
     Ok(())
 }
 
-fn run_backend(action: BackendAction) -> Result<()> {
-    use ripclone::config;
-    match action {
-        BackendAction::Show => print_backends(&config::load_global()),
-        BackendAction::Queue {
-            backend,
-            url,
-            token,
-        } => {
-            let mut cfg = config::load_global();
-            set_if(&mut cfg.queue.backend, backend);
-            set_if(&mut cfg.queue.url, url);
-            set_if(&mut cfg.queue.token, token);
-            config::save(&cfg)?;
-            println!("updated [queue]");
-            print_backends(&cfg);
-        }
-        BackendAction::Metadata {
-            backend,
-            url,
-            token,
-        } => {
-            let mut cfg = config::load_global();
-            set_if(&mut cfg.metadata.backend, backend);
-            set_if(&mut cfg.metadata.url, url);
-            set_if(&mut cfg.metadata.token, token);
-            config::save(&cfg)?;
-            println!("updated [metadata]");
-            print_backends(&cfg);
-        }
-        BackendAction::Storage {
-            backend,
-            endpoint,
-            region,
-            bucket,
-            prefix,
-            cache_dir,
-        } => {
-            let mut cfg = config::load_global();
-            set_if(&mut cfg.storage.backend, backend);
-            set_if(&mut cfg.storage.endpoint, endpoint);
-            set_if(&mut cfg.storage.region, region);
-            set_if(&mut cfg.storage.bucket, bucket);
-            set_if(&mut cfg.storage.prefix, prefix);
-            set_if(&mut cfg.storage.cache_dir, cache_dir);
-            config::save(&cfg)?;
-            println!("updated [storage]");
-            print_backends(&cfg);
-        }
-    }
-    Ok(())
-}
-
-/// Overwrite `slot` only when a new value was provided.
-fn set_if(slot: &mut Option<String>, new: Option<String>) {
-    if let Some(v) = new {
-        *slot = Some(v);
-    }
-}
-
-/// Print each backend field's effective value and source (a `RIPCLONE_*` env var
-/// always wins over the config file).
-fn print_backends(cfg: &ripclone::config::Config) {
-    match ripclone::config::global_config_path() {
-        Some(p) => println!("config file: {}\n", p.display()),
-        None => println!("config file: <none: set RIPCLONE_CONFIG or $HOME>\n"),
-    }
-    fn line(label: &str, env_key: &str, cfg_val: Option<&str>, secret: bool) {
-        let env = std::env::var(env_key).ok().filter(|v| !v.is_empty());
-        let mask = |v: &str| {
-            if secret {
-                "***set***".to_string()
-            } else {
-                v.to_string()
-            }
-        };
-        match (env, cfg_val) {
-            (Some(e), _) => println!("  {label:<10} {}   (env {env_key})", mask(&e)),
-            (None, Some(c)) => println!("  {label:<10} {}   (config)", mask(c)),
-            (None, None) => println!("  {label:<10} <unset>"),
-        }
-    }
-    println!("[storage]");
-    line("backend", "", cfg.storage.backend.as_deref(), false);
-    line(
-        "endpoint",
-        "RIPCLONE_S3_ENDPOINT",
-        cfg.storage.endpoint.as_deref(),
-        false,
-    );
-    line(
-        "region",
-        "RIPCLONE_S3_REGION",
-        cfg.storage.region.as_deref(),
-        false,
-    );
-    line(
-        "bucket",
-        "RIPCLONE_S3_BUCKET",
-        cfg.storage.bucket.as_deref(),
-        false,
-    );
-    line(
-        "prefix",
-        "RIPCLONE_S3_PREFIX",
-        cfg.storage.prefix.as_deref(),
-        false,
-    );
-    line(
-        "cache_dir",
-        "RIPCLONE_S3_CACHE_DIR",
-        cfg.storage.cache_dir.as_deref(),
-        false,
-    );
-    println!("[metadata]");
-    line(
-        "backend",
-        "RIPCLONE_METADATA",
-        cfg.metadata.backend.as_deref(),
-        false,
-    );
-    line(
-        "url",
-        "RIPCLONE_METADATA_DB_URL",
-        cfg.metadata.url.as_deref(),
-        false,
-    );
-    line(
-        "token",
-        "RIPCLONE_METADATA_DB_TOKEN",
-        cfg.metadata.token.as_deref(),
-        true,
-    );
-    println!("[queue]");
-    line(
-        "backend",
-        "RIPCLONE_QUEUE",
-        cfg.queue.backend.as_deref(),
-        false,
-    );
-    line(
-        "url",
-        "RIPCLONE_QUEUE_DB_URL",
-        cfg.queue.url.as_deref(),
-        false,
-    );
-    line(
-        "token",
-        "RIPCLONE_QUEUE_DB_TOKEN",
-        cfg.queue.token.as_deref(),
-        true,
-    );
-    println!(
-        "\nCredentials (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY) are read from the environment only."
-    );
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -1243,7 +1032,6 @@ async fn main() -> Result<()> {
                 );
             }
         },
-        Commands::Backend { action } => run_backend(action)?,
         Commands::Sync { repo, depth, at } => {
             let (provider, repo_path) = resolve_repo(&repo, &default_provider)?;
             let upstream_token =
@@ -1262,7 +1050,6 @@ async fn main() -> Result<()> {
             dir_pos,
             dir,
             branch,
-            hot_files: _hot_files,
             mode,
             depth,
             at,
@@ -1580,7 +1367,7 @@ async fn main() -> Result<()> {
             };
             let start = std::time::Instant::now();
             let stats = tokio::task::spawn_blocking(move || {
-                extract_archive(&archive, &manifest, &dir, None, dict_bytes.as_deref())
+                extract_archive(&archive, &manifest, &dir, dict_bytes.as_deref())
             })
             .await
             .context("archive extract task")??;

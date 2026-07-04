@@ -22,12 +22,6 @@ pub enum CloneMode {
 }
 
 impl CloneMode {
-    /// True for modes that build a local blob pack from extracted archive bytes.
-    /// Always false now: `Editable` installs a prebuilt depth pack instead.
-    pub fn needs_blob_pack(self) -> bool {
-        false
-    }
-
     /// True for modes that download and install the prebuilt depth pack.
     pub fn needs_prebuilt_blob_pack(self) -> bool {
         matches!(self, CloneMode::Editable)

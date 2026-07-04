@@ -23,10 +23,7 @@
 
 use anyhow::{Context, Result};
 use ripclone::manifest::FileEntry;
-use ripclone::worktree_writer::{
-    OwnedFileWrite, SchedulerConfig, WorktreeWriteScheduler, WorktreeWriter, WriteOptions,
-    take_write_timing,
-};
+use ripclone::worktree_writer::{OwnedFileWrite, WorktreeWriter, WriteOptions, take_write_timing};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -50,9 +47,6 @@ enum Backend {
     Posix,
     IoUring,
     Both,
-    /// The shared write scheduler (submitter pool). Tuning knobs come from the
-    /// `RIPCLONE_IO_URING_*` env vars, exactly as in a real clone.
-    Scheduler,
 }
 
 fn main() -> Result<()> {
@@ -107,9 +101,6 @@ fn main() -> Result<()> {
                 Ok(()) => {}
                 Err(e) => println!("io_uring backend unavailable, skipped: {e:#}"),
             }
-        }
-        Backend::Scheduler => {
-            run_scheduler_backend(&cfg, &workload)?;
         }
     }
 
@@ -225,88 +216,6 @@ fn run_backend(
         pct(mtime_ms, thread_total),
     );
     println!();
-    Ok(())
-}
-
-/// Drive the shared write scheduler the way the extractor does: one scheduler,
-/// `threads` producer threads each preparing work and calling `submit`, then a
-/// single `flush`. Tuning comes from `SchedulerConfig::from_env`.
-fn run_scheduler_backend(cfg: &Config, workload: &Workload) -> Result<()> {
-    let sched_cfg = SchedulerConfig::from_env();
-    let total_files = workload.len();
-    let total_bytes: u64 = workload.iter().map(|w| w.2.len() as u64).sum();
-
-    let mut wall_ms = Vec::with_capacity(cfg.runs);
-    let mut timings = Vec::with_capacity(cfg.runs);
-
-    for run in 0..cfg.runs {
-        let target = cfg
-            .parent
-            .join(format!("ripclone-writer-bench-scheduler-{run}"));
-        let _ = std::fs::remove_dir_all(&target);
-        std::fs::create_dir_all(&target)
-            .with_context(|| format!("create target {}", target.display()))?;
-        precreate_dirs(&target, workload)?;
-
-        let batches = prepare_batches(workload, cfg);
-        let options = WriteOptions {
-            parents_prepared: true,
-            stamp_mtime: cfg.stamp_mtime,
-            fresh_target: false,
-        };
-        let scheduler = WorktreeWriteScheduler::with_config(target.clone(), options, sched_cfg)?;
-        let _ = take_write_timing();
-
-        let start = Instant::now();
-        std::thread::scope(|scope| -> Result<()> {
-            let mut handles = Vec::new();
-            for thread_batches in batches {
-                let scheduler = &scheduler;
-                handles.push(scope.spawn(move || -> Result<()> {
-                    for writes in thread_batches {
-                        scheduler.submit(writes)?;
-                    }
-                    Ok(())
-                }));
-            }
-            for h in handles {
-                h.join().expect("producer thread panicked")?;
-            }
-            Ok(())
-        })?;
-        scheduler.flush()?;
-        let elapsed = start.elapsed();
-
-        wall_ms.push(elapsed.as_secs_f64() * 1000.0);
-        timings.push(take_write_timing());
-        let _ = std::fs::remove_dir_all(&target);
-    }
-
-    let median_idx = median_index(&wall_ms);
-    let wall = wall_ms.get(median_idx).copied().unwrap_or(0.0);
-    let secs = wall / 1000.0;
-    let mib = total_bytes as f64 / (1024.0 * 1024.0);
-    let t = timings.get(median_idx).copied().unwrap_or_default();
-
-    println!("=== scheduler ===");
-    println!(
-        "config:   submitters={}, inflight={}, batch_files={}, byte_cap={} B, flush={:?}",
-        sched_cfg.submitters,
-        sched_cfg.inflight,
-        sched_cfg.batch_files,
-        sched_cfg.byte_cap,
-        sched_cfg.flush_timeout,
-    );
-    println!(
-        "wall {:.1} ms  |  {:.0} files/s  |  {:.1} MiB/s",
-        wall,
-        total_files as f64 / secs,
-        mib / secs,
-    );
-    println!(
-        "io thread-time {:.1} ms across submitters (prep not separately tracked here)\n",
-        t.io_ns as f64 / 1e6,
-    );
     Ok(())
 }
 
@@ -447,7 +356,6 @@ fn parse_args() -> Result<Config> {
                     "posix" => Backend::Posix,
                     "iouring" | "io_uring" => Backend::IoUring,
                     "both" => Backend::Both,
-                    "scheduler" | "sched" => Backend::Scheduler,
                     other => anyhow::bail!("unknown backend {other}"),
                 }
             }

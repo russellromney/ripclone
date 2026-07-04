@@ -1372,21 +1372,10 @@ impl Client {
             let rx = archive_rx;
             let manifest_path = manifest_path.clone();
             let work_tree = install_root.clone();
-            let git_dir_for_blobs = if mode.needs_blob_pack() {
-                Some(git_dir.clone())
-            } else {
-                None
-            };
             Some(tokio::task::spawn_blocking(move || {
                 // Keep the temp manifest file alive for the duration of extraction.
                 let _guard = manifest_tmp;
-                extract_archive_from_chunk_receiver(
-                    &manifest_path,
-                    Some(&work_tree),
-                    git_dir_for_blobs.as_deref(),
-                    None,
-                    rx,
-                )
+                extract_archive_from_chunk_receiver(&manifest_path, Some(&work_tree), None, rx)
             }))
         } else {
             drop(archive_rx);
@@ -2279,7 +2268,6 @@ impl Client {
                     signed_chunk_urls,
                     &work_tree2,
                     None,
-                    None,
                     &server,
                     auth_header.as_deref(),
                 )
@@ -2867,7 +2855,6 @@ impl Client {
                     &archive_chunks,
                     signed_chunk_urls,
                     &work_tree2,
-                    None,
                     None,
                     &server,
                     auth_header.as_deref(),

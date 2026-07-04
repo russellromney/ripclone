@@ -2168,7 +2168,7 @@ mod tests {
 
         let dest = out.path().join("extracted");
         std::fs::create_dir_all(&dest).unwrap();
-        crate::extract::extract_archive(&arch, &man, &dest, None, None).unwrap();
+        crate::extract::extract_archive(&arch, &man, &dest, None).unwrap();
 
         for (name, content) in &files {
             let got = std::fs::read(dest.join(name)).unwrap_or_else(|e| panic!("read {name}: {e}"));

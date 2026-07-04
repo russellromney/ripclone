@@ -2021,7 +2021,6 @@ async fn get_ref_inner(
                 full_clonepack: crate::ClonepackArtifacts::default(),
                 shallow_clonepack: crate::ClonepackArtifacts::default(),
                 history_levels: Vec::new(),
-                head_buckets: Vec::new(),
                 head_base_commit: String::new(),
                 head_base_packs: Vec::new(),
                 archive_frames: Vec::new(),
@@ -2566,25 +2565,6 @@ async fn build_repo_status(
         total_unique_bytes,
         regions,
     })
-}
-
-/// Target size for each chunk of the head-blobs pack on the client fetch path.
-/// 4 MB matches the archive chunk target and keeps enough requests in flight to
-/// benefit high-bandwidth links without making small-file clones too chatty.
-const HEAD_BLOBS_CHUNK_SIZE: usize = 4 * 1024 * 1024;
-
-/// Split a pack file into content-addressed chunks and store them in the CAS.
-/// Returns the `ChunkRef`s in the order needed to reconstruct the pack.
-fn split_and_store_pack(cas: &crate::cas::Cas, pack: &[u8]) -> Result<Vec<ChunkRef>> {
-    let mut refs = Vec::new();
-    for chunk in pack.chunks(HEAD_BLOBS_CHUNK_SIZE) {
-        let hash = cas.put(chunk)?;
-        refs.push(ChunkRef {
-            hash: hash_from_hex(&hash)?,
-            len: chunk.len() as u64,
-        });
-    }
-    Ok(refs)
 }
 
 async fn sync_repo_inner(
@@ -3998,16 +3978,6 @@ fn sweep_stale_tempdirs(dir: &std::path::Path, max_age: Duration) {
     }
 }
 
-/// Outcome of the depth-pack build, which differs between the default
-/// rebuild-everything path and the LSM incremental path.
-enum DepthBuild {
-    Full {
-        head_packs: Vec<(String, u64, String, u64)>,
-        history_packs: Vec<(String, u64, String, u64)>,
-    },
-    Lsm(crate::pack::IncrementalPacks),
-}
-
 /// Ref-store key for a build. Rev-targeted builds (sync/clone `--at <rev>`) use
 /// a commit-keyed rolling key (`{branch}#{commit}`) so they never overwrite the
 /// real branch entry and never get stuck reusing a stale/incomplete rev-keyed
@@ -5006,7 +4976,6 @@ async fn build_and_publish_two_phase(
             commit: commit.to_string(),
         },
         history_levels: carried_levels,
-        head_buckets: Vec::new(),
         head_base_commit: head_built.base_commit.clone(),
         head_base_packs: head_built.base_packs.clone(),
         archive_frames: carried_archive_frames,
@@ -5427,7 +5396,6 @@ async fn build_full_in_background(
             };
             info.history_levels = new_levels;
             if let Some(sized) = rebased_base {
-                info.head_buckets = Vec::new();
                 info.head_base_commit = commit.to_string();
                 info.head_base_packs = sized;
             }
@@ -5441,6 +5409,7 @@ async fn build_full_in_background(
                         repo_id.storage_key()
                     )
                 })?;
+        }
         }
     }
     settle_storage(cas, storage, retention, uploads, idx_keep).await;
@@ -6806,7 +6775,6 @@ mod tests {
             full_clonepack: crate::ClonepackArtifacts::default(),
             shallow_clonepack: crate::ClonepackArtifacts::default(),
             history_levels: Vec::new(),
-            head_buckets: Vec::new(),
             head_base_commit: String::new(),
             head_base_packs: Vec::new(),
             archive_frames: Vec::new(),
@@ -8345,7 +8313,6 @@ mod tests {
             },
             shallow_clonepack: crate::ClonepackArtifacts::default(),
             history_levels: Vec::new(),
-            head_buckets: Vec::new(),
             head_base_commit: String::new(),
             head_base_packs: Vec::new(),
             archive_frames: Vec::new(),
@@ -8443,7 +8410,6 @@ mod tests {
             },
             shallow_clonepack: crate::ClonepackArtifacts::default(),
             history_levels: Vec::new(),
-            head_buckets: Vec::new(),
             head_base_commit: String::new(),
             head_base_packs: Vec::new(),
             archive_frames: Vec::new(),
