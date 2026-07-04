@@ -1,3 +1,5 @@
+Generated 2026-07-04 — work queue for the G2 gate; DELETE after wave-4 closeout. Not documentation.
+
 # Feature inventory — turbogit + ripclone-cloud
 
 This is the E6 read-only scan of every user-visible surface across both repos,
