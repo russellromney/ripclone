@@ -16,8 +16,13 @@
 - **User** — decisions, secrets, Stripe/GitHub App cutover, merges to main.
 
 **Standard review loop (every code node unless noted)**
-1. Executor runs `scripts/ci.sh lint test` in `turbogit/rust` (or `pnpm test` in
-   ripclone-cloud) before declaring done. Touched e2e files → also `scripts/ci.sh flake`.
+1. TEST ECONOMY — this overrides any per-node "Run: scripts/ci.sh …" line (those
+   predate this rule): per node, run fmt + clippy + ONLY the tests the node touches
+   (`cargo test --release --test <file>` / module tests; `pnpm vitest run <files>` in
+   ripclone-cloud). The FULL suite runs ONCE per session at the end (`scripts/ci.sh
+   test`, or `pnpm test`), and `flake` only where a node's spec explicitly demands
+   it. GitHub CI runs everything on the PR — that is the real gate. Local full-suite
+   runs on every commit are explicitly NOT wanted.
 2. `codex review` on the diff.
 3. Fable final review before merge (batch several nodes per Fable session to save tokens).
 4. Track-A (correctness) nodes additionally get `codex challenge` (adversarial).
