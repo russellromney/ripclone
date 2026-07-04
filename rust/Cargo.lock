@@ -3843,6 +3843,7 @@ dependencies = [
  "proptest",
  "prost 0.14.4",
  "prost-build",
+ "rand 0.9.4",
  "rayon",
  "reqwest",
  "rpassword",

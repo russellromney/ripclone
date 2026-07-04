@@ -11,6 +11,7 @@ use crate::provider::ProviderConfig;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 /// Top-level ripclone configuration.
@@ -171,13 +172,23 @@ pub fn load_global() -> Config {
 }
 
 fn load_from(path: &Path) -> Config {
-    match std::fs::read_to_string(path) {
-        Ok(data) => toml::from_str(&data).unwrap_or_else(|e| {
-            tracing::warn!("failed to parse config {}: {}", path.display(), e);
-            Config::default()
-        }),
-        Err(_) => Config::default(),
-    }
+    try_load_from(path).unwrap_or_else(|e| {
+        eprintln!("error: {e:#}");
+        eprintln!(
+            "fix the TOML in {}, or point RIPCLONE_CONFIG at a valid file",
+            path.display()
+        );
+        std::process::exit(2);
+    })
+}
+
+fn try_load_from(path: &Path) -> Result<Config> {
+    let data = match std::fs::read_to_string(path) {
+        Ok(data) => data,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Config::default()),
+        Err(e) => return Err(e).with_context(|| format!("read config {}", path.display())),
+    };
+    toml::from_str(&data).with_context(|| format!("parse config {}", path.display()))
 }
 
 fn load_legacy_json(path: &Path) -> Config {
@@ -398,6 +409,28 @@ mod tests {
         assert_eq!(loaded.storage.backend.as_deref(), Some("s3"));
         assert_eq!(loaded.storage.bucket.as_deref(), Some("my-bucket"));
         assert!(loaded.token.is_none());
+    }
+
+    #[test]
+    fn existing_toml_parse_error_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "server = [").unwrap();
+
+        let err = try_load_from(&path).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("parse config"));
+        assert!(msg.contains(path.to_str().unwrap()));
+    }
+
+    #[test]
+    fn missing_toml_loads_default_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        let cfg = try_load_from(&path).unwrap();
+        assert!(cfg.server.is_none());
+        assert!(cfg.default_provider.is_none());
     }
 
     #[test]
