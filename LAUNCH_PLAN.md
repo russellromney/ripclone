@@ -948,13 +948,15 @@ exists. Sponsorship wall stays as the support-the-commons surface.
 Russell approves before H2.
 ```
 
-**H2. Implement the five screens** — deps: H1 — Kimi — ripclone-cloud
+**H2. Implement the screens** — deps: H1 ✅ (SCREENS.md v4), DESIGN.md ✅ — Kimi — ripclone-cloud
 ```
-Rebuild src/app pages per the approved spec. HARD CONSTRAINT: do not modify src/lib,
+Rebuild src/app pages per SCREENS.md (v4) styled per DESIGN.md (Thermal, light-only —
+tokens, type, motion, and component specs are all defined there; delete every
+stone/warm-gray usage in the same PR). HARD CONSTRAINT: do not modify src/lib,
 src/app/api, src/app/v1, or drizzle/ — the control plane is frozen; if a screen needs
-data the lib doesn't expose, list it in the summary for a reviewed follow-up. Reuse the
-existing design system components where they exist. Delete pages the spec drops.
-pnpm test must stay green; include screenshots of each screen in the summary.
+data the lib doesn't expose, list it in the summary for a reviewed follow-up (the
+known list is in SCREENS.md). Delete pages the spec drops. pnpm test must stay green;
+include screenshots of each screen in the summary.
 ```
 
 **H3. Design + QA pass** — deps: H2 — Kimi (browse/QA), Fable review
