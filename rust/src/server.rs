@@ -1423,7 +1423,7 @@ async fn dispatch_repos_get(
                     .into_response();
             }
         };
-        return cat_file_inner(repo_id, provider.clone(), query, state).await;
+        return cat_file_inner(repo_id, provider.clone(), query, headers, state).await;
     }
 
     if path.ends_with("/sizes") {
@@ -1448,7 +1448,7 @@ async fn dispatch_repos_get(
                     .into_response();
             }
         };
-        return file_sizes_inner(repo_id, provider.clone(), query, state).await;
+        return file_sizes_inner(repo_id, provider.clone(), query, headers, state).await;
     }
 
     if path.ends_with("/hotfiles") {
@@ -1473,7 +1473,7 @@ async fn dispatch_repos_get(
                     .into_response();
             }
         };
-        return get_hotfiles_inner(repo_id, provider.clone(), query, state).await;
+        return get_hotfiles_inner(repo_id, provider.clone(), query, headers, state).await;
     }
 
     (
@@ -1576,7 +1576,7 @@ async fn dispatch_repos_post(
                     .into_response();
             }
         };
-        return batch_files_inner(repo_id, provider.clone(), body, state).await;
+        return batch_files_inner(repo_id, provider.clone(), body, headers, state).await;
     }
 
     (
@@ -3380,12 +3380,22 @@ async fn webhook_dispatch_delete(
 
 async fn cat_file_inner(
     repo_id: RepoId,
-    _provider: ProviderInstance,
+    provider: ProviderInstance,
     query: CatRequest,
+    headers: HeaderMap,
     state: ServerState,
 ) -> Response {
     if let Some(resp) =
         validation::reject_if_invalid(|| validation::validate_git_rev(&query.branch))
+    {
+        return resp;
+    }
+    let request_token = upstream_token_from_headers(&headers);
+    let credential = state
+        .broker
+        .fetch_credential(&repo_id, request_token.as_ref());
+    if let Err(resp) =
+        authorize_repo_read(&state, &provider, &repo_id, credential.as_ref(), &headers).await
     {
         return resp;
     }
@@ -3422,12 +3432,22 @@ async fn cat_file_inner(
 
 async fn file_sizes_inner(
     repo_id: RepoId,
-    _provider: ProviderInstance,
+    provider: ProviderInstance,
     query: SizesRequest,
+    headers: HeaderMap,
     state: ServerState,
 ) -> Response {
     if let Some(resp) =
         validation::reject_if_invalid(|| validation::validate_git_rev(&query.branch))
+    {
+        return resp;
+    }
+    let request_token = upstream_token_from_headers(&headers);
+    let credential = state
+        .broker
+        .fetch_credential(&repo_id, request_token.as_ref());
+    if let Err(resp) =
+        authorize_repo_read(&state, &provider, &repo_id, credential.as_ref(), &headers).await
     {
         return resp;
     }
@@ -3471,11 +3491,16 @@ async fn create_snapshot_inner(
     {
         return resp;
     }
-    let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
     let request_token = upstream_token_from_headers(&headers);
     let credential = state
         .broker
         .fetch_credential(&repo_id, request_token.as_ref());
+    if let Err(resp) =
+        authorize_repo_read(&state, &provider, &repo_id, credential.as_ref(), &headers).await
+    {
+        return resp;
+    }
+    let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
     let branch = query.branch.clone();
 
     let lock = repo_lock(&state.sync_locks, &repo_id).await;
@@ -3563,10 +3588,25 @@ async fn create_snapshot_inner(
 
 async fn get_hotfiles_inner(
     repo_id: RepoId,
-    _provider: ProviderInstance,
+    provider: ProviderInstance,
     query: HotfilesRequest,
+    headers: HeaderMap,
     state: ServerState,
 ) -> Response {
+    if let Some(resp) =
+        validation::reject_if_invalid(|| validation::validate_git_rev(&query.branch))
+    {
+        return resp;
+    }
+    let request_token = upstream_token_from_headers(&headers);
+    let credential = state
+        .broker
+        .fetch_credential(&repo_id, request_token.as_ref());
+    if let Err(resp) =
+        authorize_repo_read(&state, &provider, &repo_id, credential.as_ref(), &headers).await
+    {
+        return resp;
+    }
     let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
     let branch = query.branch;
     let count = query.count;
@@ -3600,8 +3640,9 @@ async fn get_hotfiles_inner(
 
 async fn batch_files_inner(
     repo_id: RepoId,
-    _provider: ProviderInstance,
+    provider: ProviderInstance,
     body: BatchRequest,
+    headers: HeaderMap,
     state: ServerState,
 ) -> Response {
     if let Some(resp) = validation::reject_if_invalid(|| validation::validate_git_rev(&body.branch))
@@ -3610,6 +3651,15 @@ async fn batch_files_inner(
     }
     if let Some(commit) = &body.commit
         && let Some(resp) = validation::reject_if_invalid(|| validation::validate_git_rev(commit))
+    {
+        return resp;
+    }
+    let request_token = upstream_token_from_headers(&headers);
+    let credential = state
+        .broker
+        .fetch_credential(&repo_id, request_token.as_ref());
+    if let Err(resp) =
+        authorize_repo_read(&state, &provider, &repo_id, credential.as_ref(), &headers).await
     {
         return resp;
     }
