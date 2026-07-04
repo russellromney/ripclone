@@ -132,6 +132,29 @@ impl MetaDb for PostgresMeta {
         Ok(())
     }
 
+    async fn compare_and_swap_data(
+        &self,
+        repo_key: &str,
+        branch: &str,
+        expected_commit: &str,
+        expected_data: &str,
+        new_data: &str,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE refs SET data = $1
+             WHERE repo_key = $2 AND branch = $3 AND commit_id = $4 AND data = $5",
+        )
+        .bind(new_data)
+        .bind(repo_key)
+        .bind(branch)
+        .bind(expected_commit)
+        .bind(expected_data)
+        .execute(&self.pool)
+        .await
+        .context("compare-and-swap ref data")?;
+        Ok(result.rows_affected() > 0)
+    }
+
     async fn list_repos(&self) -> Result<Vec<String>> {
         let rows = sqlx::query("SELECT DISTINCT repo_key FROM refs")
             .fetch_all(&self.pool)

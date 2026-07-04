@@ -138,6 +138,27 @@ impl MetaDb for LibsqlMeta {
         Ok(())
     }
 
+    async fn compare_and_swap_data(
+        &self,
+        repo_key: &str,
+        branch: &str,
+        expected_commit: &str,
+        expected_data: &str,
+        new_data: &str,
+    ) -> Result<bool> {
+        let changed = self
+            .conn()
+            .await?
+            .execute(
+                "UPDATE refs SET data = ?
+                 WHERE repo_key = ? AND branch = ? AND commit_id = ? AND data = ?",
+                libsql::params![new_data, repo_key, branch, expected_commit, expected_data],
+            )
+            .await
+            .context("compare-and-swap ref data")?;
+        Ok(changed > 0)
+    }
+
     async fn list_repos(&self) -> Result<Vec<String>> {
         let conn = self.conn().await?;
         let mut rows = conn
