@@ -15,8 +15,8 @@ use common::*;
 use ripclone::mode::CloneMode;
 use std::path::{Path, PathBuf};
 
-/// Build the fixture origin and return it. The origin is left at `HEAD` with a
-/// lightweight tag `v1.0.0` pointing at the tip.
+/// Build the fixture origin and return it. The origin is left at `HEAD` with an
+/// annotated tag `v1.0.0` pointing at the tip.
 fn build_fixture_origin() -> Origin {
     let origin = make_origin("equivalence", "fixture");
 
@@ -168,7 +168,20 @@ fn build_fixture_origin() -> Origin {
             "fixture",
         ],
     );
-    git(&origin.work, &["tag", "v1.0.0"]);
+    git(
+        &origin.work,
+        &[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "tag",
+            "-a",
+            "-m",
+            "v1.0.0",
+            "v1.0.0",
+        ],
+    );
     origin.publish();
 
     // Make sure the bare origin's HEAD is main and tags are pushed.
@@ -226,6 +239,7 @@ fn git_clone(origin: &Origin, target: &Path, depth: Option<usize>) {
         args.push("--depth");
         args.push(&depth_str);
     }
+    args.push("--tags");
     args.push(&origin_url);
     args.push(target.to_str().unwrap());
     git(&PathBuf::from("."), &args);
@@ -243,7 +257,9 @@ fn configure_lfs(dir: &Path) {
     git(dir, &["config", "lfs.fetchexclude", "*"]);
 }
 
-/// Assert that two editable clones have matching HEAD and branch refs.
+/// Assert that two editable clones have matching HEAD, branch refs, and that
+/// any annotated tag in the reference clone resolves to the same commit as the
+/// ripclone HEAD. (ripclone editable clones do not currently copy tag refs.)
 fn assert_refs_match(git_clone: &Path, rip_clone: &Path, _origin: &Origin) {
     assert_eq!(
         git(rip_clone, &["rev-parse", "HEAD"]),
@@ -254,6 +270,11 @@ fn assert_refs_match(git_clone: &Path, rip_clone: &Path, _origin: &Origin) {
         git(rip_clone, &["rev-parse", "refs/heads/main"]),
         git(git_clone, &["rev-parse", "refs/heads/main"]),
         "branch ref mismatch"
+    );
+    assert_eq!(
+        git(git_clone, &["rev-parse", "refs/tags/v1.0.0^{}"]),
+        git(rip_clone, &["rev-parse", "HEAD"]),
+        "annotated tag target mismatch"
     );
 }
 
