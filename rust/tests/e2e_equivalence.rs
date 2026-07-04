@@ -15,10 +15,16 @@ use common::*;
 use ripclone::mode::CloneMode;
 use std::path::{Path, PathBuf};
 
+/// The two writer-backend tests mutate `RIPCLONE_IO_URING` and cargo runs tests
+/// in parallel threads, so they serialize here. Fixture repos are ALSO named
+/// per-leg: the origin root is process-shared, and the submodule bare rejects a
+/// second (non-fast-forward) push even when runs are serial.
+static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Build the fixture origin and return it. The origin is left at `HEAD` with an
 /// annotated tag `v1.0.0` pointing at the tip.
-fn build_fixture_origin() -> Origin {
-    let origin = make_origin("equivalence", "fixture");
+fn build_fixture_origin(leg: &str) -> Origin {
+    let origin = make_origin("equivalence", &format!("fixture-{leg}"));
 
     // Symlink target file.
     std::fs::write(origin.work.join("target.txt"), b"symlink target contents\n").unwrap();
@@ -95,7 +101,9 @@ fn build_fixture_origin() -> Origin {
     .unwrap();
 
     // Submodule / gitlink.
-    let sub_bare = origin_root().join("equivalence").join("submod.git");
+    let sub_bare = origin_root()
+        .join("equivalence")
+        .join(format!("submod-{leg}.git"));
     std::fs::create_dir_all(sub_bare.parent().unwrap()).unwrap();
     git(
         &PathBuf::from("."),
@@ -280,8 +288,10 @@ fn assert_refs_match(git_clone: &Path, rip_clone: &Path, _origin: &Origin) {
 
 /// Run the oracle for a single writer backend.
 async fn run_oracle(io_uring: bool) {
+    let _serial = SERIAL.lock().await;
+    let leg = if io_uring { "uring" } else { "posix" };
     // Set the writer backend before init() so WorktreeWriter::new() observes it.
-    // SAFETY: tests in this binary run serially and each test owns this var.
+    // SAFETY: the SERIAL guard makes this test the only mutator of the var.
     unsafe {
         if io_uring {
             std::env::set_var("RIPCLONE_IO_URING", "1");
@@ -292,7 +302,8 @@ async fn run_oracle(io_uring: bool) {
     init(false);
 
     let server = start_server().await;
-    let origin = build_fixture_origin();
+    let origin = build_fixture_origin(leg);
+    let repo = format!("fixture-{leg}");
 
     // Reference git clones: depth=1 and full.
     let git_shallow_dir = tempfile::tempdir().unwrap().path().join("git-shallow");
@@ -307,12 +318,12 @@ async fn run_oracle(io_uring: bool) {
     // available shortly after.
     server
         .client()
-        .sync_repo("equivalence/fixture", None)
+        .sync_repo(&format!("equivalence/{repo}"), None)
         .await
         .expect("sync fixture");
 
     // ---- editable depth=1 ----
-    let (_g, rip_shallow) = clone_only(&server, "equivalence", "fixture", 1, CloneMode::Editable)
+    let (_g, rip_shallow) = clone_only(&server, "equivalence", &repo, 1, CloneMode::Editable)
         .await
         .expect("ripclone depth=1 editable");
     configure_lfs(&rip_shallow);
@@ -342,7 +353,7 @@ async fn run_oracle(io_uring: bool) {
     );
 
     // ---- editable depth=0 ----
-    let (_g, rip_full) = clone_full_at(&server, "equivalence", "fixture", "1").await;
+    let (_g, rip_full) = clone_full_at(&server, "equivalence", &repo, "1").await;
     configure_lfs(&rip_full);
     assert!(
         !rip_full.join(".git/shallow").exists(),
@@ -368,7 +379,7 @@ async fn run_oracle(io_uring: bool) {
     let (_g, rip_files) = clone_files_when(
         &server,
         "equivalence",
-        "fixture",
+        &repo,
         "日本語.txt",
         "unicode file contents\n",
     )

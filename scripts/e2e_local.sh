@@ -258,6 +258,7 @@ run_equivalence_oracle() {
   git -C "$sub_w" -c user.email=t@t -c user.name=t commit -q -m "init sub"
   sub_sha=$(git -C "$sub_w" rev-parse HEAD)
   sub_bare="$ORIGIN_ROOT/equivalence/submod.git"
+  rm -rf "$sub_bare"
   mkdir -p "$(dirname "$sub_bare")"
   git init --bare -q -b main "$sub_bare"
   git -C "$sub_w" push -q "$sub_bare" main
