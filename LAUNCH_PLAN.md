@@ -799,6 +799,10 @@ Cloud: expose queue depth, build failure rate, sync-task age, and worker livenes
 state). One alert path that actually reaches Russell (email or webhook) on: queue depth
 > N for 10m, build-failure rate spike, /readyz failing. A wedged worker must be visible
 within minutes, not via user complaints.
+Also (from the RIPCLONE_BENCH review): un-gate the per-stage sync timings — they are
+clock reads + a log line, they belong always-on feeding /metrics; keep RIPCLONE_BENCH
+gating ONLY the storage-amplification walk (it does one storage.size() per artifact —
+hundreds of S3 HEADs per sync on object storage, correctly opt-in).
 Also: instrument AGENT-TOKEN usage separately (clones + builds per agent token per
 install, rolled up monthly). Agent tokens are free today; this is the data that decides
 whether/how to price them later. Metrics only — no billing change.
