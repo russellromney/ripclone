@@ -30,7 +30,6 @@ fn varied(seed: u64, n: usize) -> String {
         .collect()
 }
 
-#[ignore = "slow: polls for background phase-2 builds"]
 #[tokio::test]
 async fn files_mode_correct_with_bounded_archive() {
     setup();

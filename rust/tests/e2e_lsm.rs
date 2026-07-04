@@ -19,7 +19,6 @@ async fn full_clone(server: &Server, origin: &Origin) -> (tempfile::TempDir, std
 /// Across three seal cycles (each sync adds commits and seals a new level), the
 /// full clone stays complete, fsck-clean, and materializes the latest worktree.
 /// This exercises seal -> reuse-by-hash -> seal -> reuse end to end.
-#[ignore = "slow: polls for background phase-2 builds"]
 #[tokio::test]
 async fn lsm_multi_seal_full_clone_stays_complete() {
     init(true);
@@ -73,7 +72,6 @@ async fn lsm_multi_seal_full_clone_stays_complete() {
 /// A history rewrite (force-push that makes HEAD not a descendant of the sealed
 /// tip) still yields a complete, connectivity-clean clone — the sealed level's
 /// now-unreachable objects are harmless dangling, never a missing object.
-#[ignore = "slow: polls for background phase-2 builds"]
 #[tokio::test]
 async fn lsm_force_push_full_clone_stays_complete() {
     init(true);
@@ -120,7 +118,6 @@ async fn lsm_force_push_full_clone_stays_complete() {
 
 /// Re-syncing at the same HEAD under LSM (empty tail) reuses the sealed level and
 /// still clones a complete repo.
-#[ignore = "slow: polls for background phase-2 builds"]
 #[tokio::test]
 async fn lsm_resync_same_head_reuses_level() {
     init(true);

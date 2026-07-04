@@ -50,7 +50,6 @@ async fn admin_get(
         .expect("admin get request")
 }
 
-#[ignore = "slow: polls for background phase-2 builds"]
 #[tokio::test]
 async fn admin_config_round_trips_with_branch_override() {
     init(false);
@@ -112,7 +111,6 @@ async fn admin_config_round_trips_with_branch_override() {
     assert_eq!(repo_cfg["compression_level"], 9);
 }
 
-#[ignore = "slow: polls for background phase-2 builds"]
 #[tokio::test]
 async fn admin_rejects_invalid_config() {
     init(false);
@@ -153,7 +151,6 @@ async fn admin_rejects_invalid_config() {
     );
 }
 
-#[ignore = "slow: polls for background phase-2 builds"]
 #[tokio::test]
 async fn configured_compression_still_clones_correctly() {
     init(false);
@@ -186,7 +183,6 @@ async fn configured_compression_still_clones_correctly() {
     assert_eq!(read(&f, "a.txt"), "two\n");
 }
 
-#[ignore = "slow: polls for background phase-2 builds"]
 #[tokio::test]
 async fn unconfigured_repo_clones_like_today() {
     init(false);

@@ -64,7 +64,6 @@ fn collect_json_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
 
 /// editable --depth 1: shallow, worktree correct, `.git/shallow` present,
 /// `git log`/status clean, history bounded to HEAD.
-#[ignore = "slow: polls for background phase-2 builds"]
 #[tokio::test]
 async fn editable_depth1_is_shallow_and_clean() {
     init(false);
@@ -91,7 +90,6 @@ async fn editable_depth1_is_shallow_and_clean() {
 
 /// editable --depth 0: complete clone, full history to root, fsck-clean, no
 /// shallow marker, MIDX installed and valid.
-#[ignore = "slow: polls for background phase-2 builds"]
 #[tokio::test]
 async fn editable_depth0_is_complete() {
     init(false);
@@ -132,7 +130,6 @@ async fn editable_depth0_is_complete() {
 }
 
 /// files mode: worktree materializes; it is intentionally NOT a git repo.
-#[ignore = "slow: polls for background phase-2 builds"]
 #[tokio::test]
 async fn files_mode_materializes_worktree() {
     init(false);
@@ -152,7 +149,6 @@ async fn files_mode_materializes_worktree() {
     );
 }
 
-#[ignore = "slow: polls for background phase-2 builds"]
 #[tokio::test]
 async fn files_mode_resync_works_after_remote_storage_evicted_local_archive_artifacts() {
     init(false);
@@ -231,7 +227,6 @@ async fn files_mode_resync_works_after_remote_storage_evicted_local_archive_arti
 
 /// Re-sync after a new push must serve the NEW commit (regression test for the
 /// `git fetch origin HEAD` stale-ref bug — that path never advanced the mirror).
-#[ignore = "slow: polls for background phase-2 builds"]
 #[tokio::test]
 async fn resync_picks_up_new_commits() {
     init(false);
@@ -255,7 +250,6 @@ async fn resync_picks_up_new_commits() {
 
 /// Negative: a corrupted artifact in the server's CAS must fail the clone with a
 /// hash-verification error, never produce a silently-wrong tree.
-#[ignore = "slow: polls for background phase-2 builds"]
 #[tokio::test]
 async fn corrupt_artifact_fails_clone() {
     init(false);
@@ -293,7 +287,6 @@ async fn corrupt_artifact_fails_clone() {
 }
 
 /// Negative: a missing artifact (evicted/deleted) must fail the clone.
-#[ignore = "slow: polls for background phase-2 builds"]
 #[tokio::test]
 async fn missing_artifact_fails_clone() {
     init(false);
@@ -328,7 +321,6 @@ async fn missing_artifact_fails_clone() {
 /// backoff and the clone must still succeed with a correct worktree. The server
 /// fails its first few artifact GETs (per-server fault, no global env), so this
 /// is safe under parallel test execution.
-#[ignore = "slow: polls for background phase-2 builds"]
 #[tokio::test]
 async fn transient_fetch_failure_is_retried() {
     init(false);
@@ -356,7 +348,6 @@ async fn transient_fetch_failure_is_retried() {
 /// Negative: a client presenting the wrong auth token must be rejected by the
 /// server (the protected routes sit behind the auth middleware), so a
 /// misconfigured token can never silently sync or clone.
-#[ignore = "slow: polls for background phase-2 builds"]
 #[tokio::test]
 async fn wrong_token_is_rejected() {
     init(false);
@@ -383,7 +374,6 @@ async fn wrong_token_is_rejected() {
 
 /// Negative: when failures persist beyond the retry budget, the clone must fail
 /// cleanly — not hang, not produce a partial tree.
-#[ignore = "slow: polls for background phase-2 builds"]
 #[tokio::test]
 async fn persistent_fetch_failure_fails_clone() {
     init(false);
@@ -418,7 +408,6 @@ async fn persistent_fetch_failure_fails_clone() {
 /// Positive: a successful clone renames the temp install dir onto the target and
 /// leaves no `.tmp` leftovers in the parent. (Overlay is off by default in
 /// tests — `RIPCLONE_TEMP` is unset — so the temp-dir path is exercised.)
-#[ignore = "slow: polls for background phase-2 builds"]
 #[tokio::test]
 async fn successful_clone_leaves_no_temp_dir() {
     init(false);
@@ -442,7 +431,6 @@ async fn successful_clone_leaves_no_temp_dir() {
 /// Negative: a clone that fails *after* the temp install dir is created (here a
 /// corrupt archive chunk fails extraction) must remove the partial dir and leave
 /// no target behind.
-#[ignore = "slow: polls for background phase-2 builds"]
 #[tokio::test]
 async fn failed_clone_after_temp_dir_leaves_nothing() {
     init(false);
@@ -505,7 +493,6 @@ async fn failed_clone_after_temp_dir_leaves_nothing() {
 
 /// RefInfo with LSM levels round-trips through serde, and old records (no
 /// `history_levels`) deserialize to an empty vec (back-compat).
-#[ignore = "slow: polls for background phase-2 builds"]
 #[test]
 fn ref_info_history_levels_serde() {
     use ripclone::{HistoryLevel, RefInfo, SizedPack};

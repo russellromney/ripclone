@@ -3,10 +3,7 @@
 # pushing and you run exactly what CI runs (same commands, same flags) — no more
 # "passed locally, failed in CI". CI invokes individual stages in parallel jobs.
 #
-# Usage: scripts/ci.sh [fast|lint|test|e2e|flake|databases|all]   (default: all)
-#
-# `fast` is the recommended local command: lint + unit tests, no slow e2e polls.
-# `test` and `flake` run the full suite including ignored slow tests (used by CI).
+# Usage: scripts/ci.sh [lint|test|e2e|flake|all]   (default: all)
 #
 # All cargo commands use --locked so a stale/drifting Cargo.lock fails fast
 # instead of silently resolving new dependencies.
@@ -22,21 +19,12 @@ lint() {
     cargo clippy --all-targets --locked -- -D warnings )
 }
 
-# Fast local path: lint + all non-ignored unit/integration tests. Skips only
-# the slow e2e tests that poll for background phase-2 builds; use
-# `scripts/ci.sh test` for the full suite (including ignored tests).
-fast() {
-  lint
-  ( cd "$ROOT/rust" && cargo test --all-targets --locked )
-}
-
 # Unit + integration tests, parallel (the default) so cross-test races surface.
-# Includes ignored slow tests because CI is where the full suite must pass.
 # (cargo test runs the test binaries sequentially, which keeps concurrent
 # io_uring queue allocation bounded — nextest's all-binaries-at-once parallelism
 # exhausts the runner's locked-memory limit while io_uring is the default writer.)
 run_tests() {
-  ( cd "$ROOT/rust" && cargo test --release --all-targets --locked -- --include-ignored )
+  ( cd "$ROOT/rust" && cargo test --release --all-targets --locked )
 }
 
 e2e() {
@@ -47,12 +35,12 @@ e2e() {
 # Tests + flake guard in one pass: compile once (release), then run the suite a
 # couple of times to catch nondeterministic races/ordering bugs a single run can
 # miss. Two parallel runs already exercise distinct interleavings; reusing the
-# release profile means no separate debug compile. Includes ignored slow tests.
+# release profile means no separate debug compile.
 flake() {
   ( cd "$ROOT/rust"
     for i in 1 2; do
       echo "== test run $i/2 =="
-      cargo test --release --all-targets --locked -- --include-ignored
+      cargo test --release --all-targets --locked
     done )
 }
 
@@ -66,14 +54,13 @@ databases() {
 }
 
 case "$STAGE" in
-  fast) fast ;;
   lint) lint ;;
   test) run_tests ;;
   e2e) e2e ;;
   flake) flake ;;
   databases) databases ;;
   all) lint; run_tests; e2e ;;
-  *) echo "usage: scripts/ci.sh [fast|lint|test|e2e|flake|databases|all]" >&2; exit 2 ;;
+  *) echo "usage: scripts/ci.sh [lint|test|e2e|flake|databases|all]" >&2; exit 2 ;;
 esac
 
 echo "ci.sh: stage '$STAGE' OK"

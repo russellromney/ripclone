@@ -44,7 +44,6 @@ async fn sync_and_settle(server: &Server, origin: &Origin, want_count: &str) {
 /// but absent from the prior commit's *tip tree* — so a `rev-list HEAD ^prev`
 /// delta would wrongly exclude it, corrupting the depth=1 worktree. The set
 /// difference of the two depth-1 closures keeps it. depth=1 at c3 must contain it.
-#[ignore = "slow: polls for background phase-2 builds"]
 #[tokio::test]
 async fn re_add_identical_blob_survives_in_depth1() {
     setup();
@@ -93,7 +92,6 @@ async fn re_add_identical_blob_survives_in_depth1() {
 /// fresh tip c3' whose parent is c1 (so the prior synced commit c2 is NOT an
 /// ancestor) and which restores a blob that c2 had deleted. The delta vs c2 must
 /// still cover c3's whole tip closure. depth=1 and the full clone must be correct.
-#[ignore = "slow: polls for background phase-2 builds"]
 #[tokio::test]
 async fn force_push_to_non_ancestor_stays_correct() {
     setup();
@@ -168,7 +166,6 @@ async fn force_push_to_non_ancestor_stays_correct() {
 /// Many single-commit re-syncs with a 1-byte rebase threshold: the background
 /// phase rebuilds a fresh HEAD base on every sync. Every increment's depth=1 and
 /// full clone must stay complete across the repeated rebases.
-#[ignore = "slow: polls for background phase-2 builds"]
 #[tokio::test]
 async fn head_compaction_keeps_clones_complete() {
     setup(); // RIPCLONE_HEAD_REBASE_BYTES=1 → rebase every sync

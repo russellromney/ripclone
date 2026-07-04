@@ -132,7 +132,6 @@ async fn mint_token(server: &Server) -> String {
     token
 }
 
-#[ignore = "slow: polls for background phase-2 builds"]
 #[tokio::test]
 async fn login_page_is_served_unauthenticated() {
     init(false);
@@ -145,7 +144,6 @@ async fn login_page_is_served_unauthenticated() {
     assert!(body.contains("Server token"), "renders the login form");
 }
 
-#[ignore = "slow: polls for background phase-2 builds"]
 #[tokio::test]
 async fn bearer_token_authorizes_a_protected_route() {
     init(false);
@@ -198,7 +196,6 @@ async fn bearer_token_authorizes_a_protected_route() {
     assert_eq!(legacy.status(), StatusCode::OK);
 }
 
-#[ignore = "slow: polls for background phase-2 builds"]
 #[tokio::test]
 async fn content_endpoints_forbid_unauthorized_repo() {
     let http_origin = make_http_origin("acme/public");
@@ -269,7 +266,6 @@ async fn wrong_secret_is_rejected() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
-#[ignore = "slow: polls for background phase-2 builds"]
 #[tokio::test]
 async fn refresh_issues_a_fresh_token() {
     init(false);
@@ -297,7 +293,6 @@ async fn refresh_issues_a_fresh_token() {
     assert_eq!(anon.status(), StatusCode::UNAUTHORIZED);
 }
 
-#[ignore = "slow: polls for background phase-2 builds"]
 #[tokio::test]
 async fn non_loopback_callback_is_refused() {
     init(false);
@@ -336,7 +331,6 @@ async fn non_loopback_callback_is_refused() {
 /// A bearer (session-token) client can complete an archive clone whose chunks
 /// are fetched through the authenticated gateway path (no presigned URLs) — the
 /// streaming extractor must send the session token, not re-derive a hash header.
-#[ignore = "slow: polls for background phase-2 builds"]
 #[tokio::test]
 async fn bearer_client_clones_through_the_gateway() {
     init(false);
@@ -377,7 +371,6 @@ async fn bearer_client_clones_through_the_gateway() {
     unsafe { std::env::remove_var("RIPCLONE_EXTRACT_ARCHIVE") };
 }
 
-#[ignore = "slow: polls for background phase-2 builds"]
 #[tokio::test]
 async fn paste_mode_shows_the_token() {
     init(false);

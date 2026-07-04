@@ -54,9 +54,9 @@ jobs:
       - name: Lint (fmt + clippy)
         run: bash scripts/ci.sh lint
 
-  # Unit + integration tests (release), including the ignored slow tests that
-  # poll for background phase-2 builds. PRs get a single run; main gets the
-  # flake guard (two runs) to catch nondeterministic races.
+  # Unit + integration tests (release), run a couple of times as a flake guard.
+  # One compile, multiple runs — catches nondeterministic races a single run
+  # misses.
   test:
     runs-on: ubuntu-latest
     steps:
@@ -66,17 +66,10 @@ jobs:
           cache-workspaces: rust
       - name: Install build deps
         run: bash scripts/install-build-deps.sh
-      - name: Tests (PR, single run)
-        if: github.ref != 'refs/heads/main'
-        run: bash scripts/ci.sh test
-      - name: Tests + flake guard (main, repeated)
-        if: github.ref == 'refs/heads/main'
+      - name: Tests + flake guard (release, repeated)
         run: bash scripts/ci.sh flake
 
-  # End-to-end against real binaries + a local server. Gated on main or the
-  # `ci:full` PR label so the default PR path does not spin up local infra.
   e2e:
-    if: github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci:full'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -91,11 +84,11 @@ jobs:
   # Queue + metadata adapters against REAL network databases — Postgres + MySQL
   # (throwaway docker containers brought up by scripts/test-queue-sql.sh) and
   # libsql (a local `sqld`). The default `test` job only compile-checks these
-  # engines; this job exercises their dialect-specific SQL. Runs on main or when
-  # a PR has the `ci:full` label, and only when Rust files changed.
+  # engines; this job exercises their dialect-specific SQL. Gated on the same
+  # rust-changes filter as docker so docs-only PRs skip it.
   databases:
     needs: changes
-    if: ${{ (github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci:full'))) && needs.changes.outputs.docker == 'true' }}
+    if: ${{ needs.changes.outputs.docker == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

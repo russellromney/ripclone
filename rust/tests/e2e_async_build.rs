@@ -14,7 +14,6 @@ fn read(dir: &Path, name: &str) -> String {
 
 /// A sync via the queue returns the ref, and both depth=1 and depth=0 clone
 /// correctly.
-#[ignore = "slow: polls for background phase-2 builds"]
 #[tokio::test]
 async fn async_sync_then_clone() {
     init(false);
@@ -46,7 +45,6 @@ async fn async_sync_then_clone() {
 
 /// Concurrent syncs for the same repo coalesce onto one build and all succeed
 /// with the same resolved commit.
-#[ignore = "slow: polls for background phase-2 builds"]
 #[tokio::test]
 async fn async_concurrent_syncs_coalesce() {
     init(false);

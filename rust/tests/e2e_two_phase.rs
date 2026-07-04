@@ -30,7 +30,6 @@ async fn repo_status(server: &Server, owner: &str, repo: &str) -> serde_json::Va
 
 /// After a single two-phase sync: depth=1 is immediately clonable + correct, and
 /// depth=0 becomes a complete, fsck-clean full clone once phase 2 finishes.
-#[ignore = "slow: polls for background phase-2 builds"]
 #[tokio::test]
 async fn two_phase_depth1_immediate_then_full() {
     init(false);
@@ -84,7 +83,6 @@ async fn two_phase_depth1_immediate_then_full() {
 /// Files mode works under two-phase: the zstd archive is deferred to phase 2,
 /// so a files-mode clone of the full variant materializes the worktree from the
 /// frames built in the background.
-#[ignore = "slow: polls for background phase-2 builds"]
 #[tokio::test]
 async fn two_phase_files_mode_after_phase2() {
     init(false);
@@ -122,7 +120,6 @@ async fn two_phase_files_mode_after_phase2() {
 /// during the gap (never fails), then upgrades to the new commit. We assert the
 /// end state — depth=0 reaches the new commit and is complete — across a second
 /// two-phase sync.
-#[ignore = "slow: polls for background phase-2 builds"]
 #[tokio::test]
 async fn two_phase_resync_full_upgrades() {
     init(false);

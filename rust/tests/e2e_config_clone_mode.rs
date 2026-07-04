@@ -55,7 +55,6 @@ async fn run_ripclone(
     .expect("subprocess panicked")
 }
 
-#[ignore = "slow: polls for background phase-2 builds"]
 #[tokio::test]
 async fn project_config_drives_clone_mode_and_default_provider() {
     setup(false);

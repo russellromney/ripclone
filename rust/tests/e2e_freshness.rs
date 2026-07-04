@@ -119,7 +119,6 @@ async fn wait_until(server: &Server, repo: &str, want: &str, min_builds: u64) {
 
 /// A push that lands during a build is built by the post-build re-check, with no
 /// external poke.
-#[ignore = "slow: polls for background phase-2 builds"]
 #[tokio::test]
 async fn recheck_builds_tip_that_moved_during_build() {
     let _guard = SERIAL.lock().await;
@@ -162,7 +161,6 @@ async fn recheck_builds_tip_that_moved_during_build() {
 
 /// A burst of pushes during a build collapses to one catch-up build of the latest
 /// commit; the intermediate commits are skipped.
-#[ignore = "slow: polls for background phase-2 builds"]
 #[tokio::test]
 async fn recheck_burst_collapses_to_latest() {
     let _guard = SERIAL.lock().await;
@@ -203,7 +201,6 @@ async fn recheck_burst_collapses_to_latest() {
 /// does not livelock. The key: a moved tip is present during the *capped*
 /// re-check's window, so only the cap (not "the tip didn't move") prevents the
 /// extra build — the catch-up test shows an uncapped re-check would build it.
-#[ignore = "slow: polls for background phase-2 builds"]
 #[tokio::test]
 async fn recheck_stops_at_cap() {
     let _guard = SERIAL.lock().await;
@@ -266,7 +263,6 @@ async fn recheck_stops_at_cap() {
 }
 
 /// A re-check that finds the tip unchanged does nothing — no extra build.
-#[ignore = "slow: polls for background phase-2 builds"]
 #[tokio::test]
 async fn recheck_noop_when_tip_unchanged() {
     let _guard = SERIAL.lock().await;

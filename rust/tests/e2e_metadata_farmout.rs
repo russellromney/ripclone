@@ -9,7 +9,6 @@ mod common;
 use common::*;
 use ripclone::mode::CloneMode;
 
-#[ignore = "slow: polls for background phase-2 builds"]
 #[tokio::test]
 async fn metadata_and_queue_on_sqlite_with_real_worker() {
     let qdir = tempfile::tempdir().expect("queue dir");
