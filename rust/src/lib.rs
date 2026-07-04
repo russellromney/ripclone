@@ -2,9 +2,7 @@
     clippy::too_many_arguments,
     clippy::type_complexity,
     clippy::manual_checked_ops,
-    clippy::suspicious_open_options,
-    dead_code,
-    deprecated
+    clippy::suspicious_open_options
 )]
 
 //! Library support for the `ripclone` binaries.
@@ -27,8 +25,6 @@ pub mod auth;
 pub mod backends;
 #[doc(hidden)]
 pub mod bench;
-#[doc(hidden)]
-pub mod blob_pack;
 pub mod cas;
 pub mod client;
 #[doc(hidden)]
@@ -133,19 +129,6 @@ pub struct ArchiveFrame {
     pub raw_len: u64,
 }
 
-/// One bucket of the HEAD-closure (depth=1) packs. Objects are partitioned into
-/// fixed buckets by oid prefix, so a re-sync only rebuilds the buckets whose
-/// object set changed and reuses the rest by hash (`git pack-objects` is
-/// deterministic for a fixed oid list, so an unchanged bucket reproduces the
-/// exact same pack). `oidset_hash` is the hash of the bucket's sorted oid list —
-/// the reuse key. Undeltified packs compress each object independently, so this
-/// bucketing has no compression cost.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-pub struct HeadBucket {
-    pub oidset_hash: String,
-    pub pack: SizedPack,
-}
-
 /// Artifact hashes for one clonepack variant (e.g. shallow depth=1 or full).
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ClonepackArtifacts {
@@ -222,11 +205,6 @@ pub struct RefInfo {
     /// the tail past the last level's tip. See ROADMAP "LSM incremental history".
     #[serde(default)]
     pub history_levels: Vec<HistoryLevel>,
-    /// Deprecated: HEAD-closure oid-prefix buckets from the old reuse scheme.
-    /// Retained so refs written by older servers still deserialize; no longer
-    /// populated (replaced by `head_base_commit` + `head_base_packs`).
-    #[serde(default)]
-    pub head_buckets: Vec<HeadBucket>,
     /// The commit whose depth-1 closure the HEAD *base* packs cover. A re-sync
     /// packs only the objects new since this commit (`closure(HEAD) −
     /// closure(head_base_commit)`) into a fresh delta pack, so the base and the

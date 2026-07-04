@@ -383,13 +383,6 @@ impl ProviderRegistry {
         Ok(())
     }
 
-    fn merge_configs(&mut self, configs: Vec<ProviderConfig>) -> Result<()> {
-        for cfg in configs {
-            self.merge_one(cfg)?;
-        }
-        Ok(())
-    }
-
     /// The default `github` instance. Always present.
     pub fn default_provider(&self) -> &ProviderInstance {
         self.providers

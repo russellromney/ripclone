@@ -1,12 +1,9 @@
-use crate::git;
 use crate::manifest::{FileEntry, FrameInfo, MetadataChunk as Manifest};
 use crate::worktree_writer::{
-    FileSlice, FileWriteContent, OwnedFileWrite, SchedulerConfig, WorktreeWriteScheduler,
-    WorktreeWriter, WriteOptions,
+    FileSlice, FileWriteContent, OwnedFileWrite, WorktreeWriter, WriteOptions,
 };
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, bounded};
-use filetime::FileTime;
 use flate2::read::ZlibDecoder;
 use sha1::{Digest as Sha1Digest, Sha1};
 use sha2::{Digest as Sha256Digest, Sha256};
@@ -14,12 +11,10 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tracing::{info, warn};
+use tracing::info;
 
-const INDEX_MTIME: FileTime = FileTime::from_unix_time(1, 0);
 const PACK_WRITE_BATCH_FILES: usize = 512;
 
 /// Convert a manifest blob_sha1 slice to a fixed 20-byte array.
@@ -138,17 +133,10 @@ fn compute_chunks(frames: &[FrameInfo], chunk_size: u64) -> Vec<Chunk> {
 
 /// Extract a working-tree archive into `target_dir` using the supplied manifest
 /// and a local archive file.
-///
-/// `target_dir` must already contain a skeleton `.git` with skip-worktree set
-/// on all tracked paths. After extraction those paths are cleared.
-///
-/// If `git_dir` is `Some`, every verified blob is also written into
-/// `.git/objects/pack` as a locally-built packfile.
 pub fn extract_archive(
     archive_path: &Path,
     manifest_path: &Path,
     target_dir: &Path,
-    git_dir: Option<&Path>,
     dictionary: Option<&[u8]>,
 ) -> Result<ExtractStats> {
     let mut archive_file = File::open(archive_path)
@@ -164,7 +152,6 @@ pub fn extract_archive(
     extract_archive_with_chunk_fetcher(
         manifest_path,
         Some(target_dir),
-        git_dir,
         dictionary,
         DEFAULT_LOCAL_CHUNK_SIZE,
         move |chunk: &Chunk| {
@@ -189,14 +176,9 @@ pub fn extract_archive(
 /// Frames are grouped into chunks of at most `chunk_size` compressed bytes so
 /// that a single range request can satisfy several frames. On high-latency
 /// links this dramatically reduces the number of round-trips.
-///
-/// If `git_dir` is `Some`, every verified blob is also collected and written
-/// into `.git/objects/pack` as a locally-built packfile. This lets a single
-/// archive download satisfy both the working tree and the git object store.
 pub fn extract_archive_with_chunk_fetcher<F>(
     manifest_path: &Path,
     target_dir: Option<&Path>,
-    git_dir: Option<&Path>,
     dictionary: Option<&[u8]>,
     chunk_size: u64,
     fetch_chunk: F,
@@ -258,33 +240,6 @@ where
 
     let target_dir = target_dir.map(Path::to_path_buf);
     let manifest = Arc::new(manifest);
-
-    // If the caller wants a local blob pack, spawn a background builder thread.
-    // It receives (sha1, content) pairs over a bounded channel and writes them
-    // to a temp pack file, so peak memory stays bounded.
-    let expected_blob_count = git_dir.map(|_| {
-        let mut unique: HashSet<[u8; 20]> = HashSet::new();
-        for entry in manifest.files.iter() {
-            let sha1: [u8; 20] = entry
-                .blob_sha1
-                .as_slice()
-                .try_into()
-                .expect("manifest blob_sha1 must be 20 bytes");
-            unique.insert(sha1);
-        }
-        unique.len()
-    });
-    let (blob_pack_tx, blob_pack_handle): (
-        Option<crossbeam_channel::Sender<crate::blob_pack::BlobPackInput>>,
-        Option<std::thread::JoinHandle<Result<PathBuf>>>,
-    ) = if let Some(git_dir) = git_dir {
-        let expected = expected_blob_count.expect("expected count present with git_dir");
-        let (tx, handle) = crate::blob_pack::spawn_blob_pack_builder(git_dir, expected)
-            .context("spawn blob pack builder")?;
-        (Some(tx), Some(handle))
-    } else {
-        (None, None)
-    };
 
     // Group fragments by frame so each writer thread can write every file
     // slice that belongs to a given decompressed frame.
@@ -395,8 +350,6 @@ where
     drop(job_rx);
     drop(compressed_tx);
 
-    let scheduler = build_archive_scheduler(target_dir.as_ref())?;
-
     // Spawn writer threads: they decompress frames and write files.
     for _ in 0..write_threads {
         let compressed_rx: Receiver<(usize, Result<bytes::Bytes>)> = compressed_rx.clone();
@@ -406,14 +359,8 @@ where
         let pending_files2 = pending_files.clone();
         let target_dir2 = target_dir.clone();
         let dictionary2 = dictionary.clone();
-        let blob_pack_tx2 = blob_pack_tx.clone();
-        let scheduler2 = scheduler.clone();
         std::thread::spawn(move || {
-            let writer = if scheduler2.is_some() {
-                None
-            } else {
-                target_dir2.as_ref().map(|_| WorktreeWriter::new())
-            };
+            let writer = target_dir2.as_ref().map(|_| WorktreeWriter::new());
             while let Ok((idx, res)) = compressed_rx.recv() {
                 let result: Result<ArchiveFrameWriteResult> = (|| {
                     let writer = match writer.as_ref() {
@@ -468,26 +415,15 @@ where
                                     String::from_utf8_lossy(&entry.path)
                                 );
                             }
-                            if let Some(ref tx) = blob_pack_tx2 {
-                                let sha1 = blob_sha1_to_array(&entry.blob_sha1)?;
-                                tx.send(crate::blob_pack::BlobPackInput::FrameSlice {
-                                    sha1,
-                                    frame: Arc::clone(&raw),
-                                    offset: off,
-                                    len,
-                                })
-                                .context("blob pack builder closed")?;
-                            }
-                            if let Some(ref target_dir) = target_dir2 {
+                            if let Some((target_dir, writer)) = target_dir2.as_ref().zip(writer) {
                                 pending_writes.push(OwnedFileWrite {
                                     entry: entry.clone(),
                                     content: FileWriteContent::shared(Arc::clone(&raw), off, len),
                                 });
                                 if pending_writes.len() >= PACK_WRITE_BATCH_FILES {
                                     let outcome = flush_archive_writes(
-                                        scheduler2.as_deref(),
                                         writer,
-                                        Some(target_dir),
+                                        target_dir,
                                         &mut pending_writes,
                                     )?;
                                     written += outcome.written;
@@ -523,39 +459,16 @@ where
                                         String::from_utf8_lossy(&entry.path)
                                     );
                                 }
-                                if let Some(ref tx) = blob_pack_tx2 {
-                                    if let Some(ref target_dir) = target_dir2 {
-                                        pending_writes.push(OwnedFileWrite {
-                                            entry: entry.clone(),
-                                            content: FileWriteContent::Fragments(fragments.clone()),
-                                        });
-                                        if pending_writes.len() >= PACK_WRITE_BATCH_FILES {
-                                            let outcome = flush_archive_writes(
-                                                scheduler2.as_deref(),
-                                                writer,
-                                                Some(target_dir),
-                                                &mut pending_writes,
-                                            )?;
-                                            written += outcome.written;
-                                            stats.extend(outcome.stats);
-                                        }
-                                    }
-                                    let sha1 = blob_sha1_to_array(&entry.blob_sha1)?;
-                                    tx.send(crate::blob_pack::BlobPackInput::Fragments {
-                                        sha1,
-                                        fragments,
-                                    })
-                                    .context("blob pack builder closed")?;
-                                } else if let Some(ref target_dir) = target_dir2 {
+                                if let Some((target_dir, writer)) = target_dir2.as_ref().zip(writer)
+                                {
                                     pending_writes.push(OwnedFileWrite {
                                         entry: entry.clone(),
                                         content: FileWriteContent::Fragments(fragments),
                                     });
                                     if pending_writes.len() >= PACK_WRITE_BATCH_FILES {
                                         let outcome = flush_archive_writes(
-                                            scheduler2.as_deref(),
                                             writer,
-                                            Some(target_dir),
+                                            target_dir,
                                             &mut pending_writes,
                                         )?;
                                         written += outcome.written;
@@ -565,14 +478,12 @@ where
                             }
                         }
                     }
-                    let outcome = flush_archive_writes(
-                        scheduler2.as_deref(),
-                        writer,
-                        target_dir2.as_ref(),
-                        &mut pending_writes,
-                    )?;
-                    written += outcome.written;
-                    stats.extend(outcome.stats);
+                    if let Some((target_dir, writer)) = target_dir2.as_ref().zip(writer) {
+                        let outcome =
+                            flush_archive_writes(writer, target_dir, &mut pending_writes)?;
+                        written += outcome.written;
+                        stats.extend(outcome.stats);
+                    }
                     Ok(ArchiveFrameWriteResult { written, stats })
                 })();
                 if done_tx.send(result).is_err() {
@@ -607,20 +518,6 @@ where
             }
         }
     }
-    // The scheduler writes in the background. Now that every writer thread is
-    // done submitting, drain it to finish any buffered writes and collect their
-    // stats. Write errors show up here.
-    if let Some(scheduler) = scheduler.as_ref() {
-        match scheduler.flush() {
-            Ok(outcome) => stat_cache.extend(outcome.stats),
-            Err(e) => {
-                if error.is_none() {
-                    error = Some(e);
-                }
-            }
-        }
-    }
-
     let expected_files = if target_dir.is_some() {
         manifest.files.len()
     } else {
@@ -650,53 +547,7 @@ where
 
     let raw_total: u64 = manifest.files.iter().map(|e| e.total_len()).sum();
 
-    // Clear skip-worktree for every materialized path only when a real git
-    // repository is being updated. Files mode passes no git dir and is a pure
-    // working-tree materialization path.
-    if error.is_none()
-        && git_dir.is_some()
-        && let Some(ref target_dir) = target_dir
-    {
-        let clear_start = Instant::now();
-        let path_count = manifest.files.len();
-        if let Err(e) = git::clear_skip_worktree_index_with_stats_byte_iter(
-            target_dir,
-            manifest.files.iter().map(|e| e.path.as_slice()),
-            &stat_cache,
-        ) {
-            error = Some(e);
-        } else {
-            info!(
-                "cleared skip-worktree for {} paths in {:?}",
-                path_count,
-                clear_start.elapsed()
-            );
-        }
-    }
-
-    // Always shut down the pack builder so the thread does not leak, even
-    // when extraction failed.
-    drop(blob_pack_tx);
-    let pack_result: Option<Result<PathBuf>> = blob_pack_handle.map(|handle| {
-        let pack_start = Instant::now();
-        match handle.join() {
-            Ok(Ok(path)) => {
-                info!(
-                    "built and installed local blob pack at {} in {:?}",
-                    path.display(),
-                    pack_start.elapsed()
-                );
-                Ok(path)
-            }
-            Ok(Err(e)) => Err(e).context("build and install local blob pack"),
-            Err(_) => Err(anyhow::anyhow!("blob pack builder thread panicked")),
-        }
-    });
-
     if let Some(e) = error {
-        return Err(e);
-    }
-    if let Some(Err(e)) = pack_result {
         return Err(e);
     }
 
@@ -773,8 +624,7 @@ fn safe_create_dir_all(root: &Path, rel: &Path) -> Result<()> {
     Ok(())
 }
 
-/// `WriteOptions` shared by every archive regular-file write, whether it goes
-/// through a per-thread writer or the shared scheduler.
+/// `WriteOptions` shared by every archive regular-file write.
 const ARCHIVE_WRITE_OPTIONS: WriteOptions = WriteOptions {
     parents_prepared: true,
     stamp_mtime: false,
@@ -782,9 +632,8 @@ const ARCHIVE_WRITE_OPTIONS: WriteOptions = WriteOptions {
 };
 
 fn flush_archive_writes(
-    scheduler: Option<&WorktreeWriteScheduler>,
-    writer: Option<&WorktreeWriter>,
-    target_dir: Option<&PathBuf>,
+    writer: &WorktreeWriter,
+    target_dir: &Path,
     pending_writes: &mut Vec<OwnedFileWrite>,
 ) -> Result<crate::worktree_writer::WriteOutcome> {
     if pending_writes.is_empty() {
@@ -793,18 +642,6 @@ fn flush_archive_writes(
             stats: Vec::new(),
         });
     }
-    // When the scheduler is enabled, hand the writes to the submitter pool. The
-    // stats come back later from `scheduler.flush()`, so report only the count
-    // here.
-    if let Some(scheduler) = scheduler {
-        let written = scheduler.submit(std::mem::take(pending_writes))?;
-        return Ok(crate::worktree_writer::WriteOutcome {
-            written,
-            stats: Vec::new(),
-        });
-    }
-    let writer = writer.expect("archive writes only queued when target_dir is present");
-    let target_dir = target_dir.expect("archive writes only queued when target_dir is present");
     writer.write_owned_entries_with_options(
         target_dir,
         std::mem::take(pending_writes),
@@ -812,58 +649,10 @@ fn flush_archive_writes(
     )
 }
 
-/// Build the shared write scheduler for an archive extraction, if turned on via
-/// `RIPCLONE_IO_URING_SCHEDULER` and we are actually writing a worktree.
-///
-/// DEPRECATED: the scheduler is superseded by `RIPCLONE_IO_URING_DEPTH` and
-/// slated for removal. See `docs/WRITER_SCHEDULER_EXPERIMENT.md`.
-fn build_archive_scheduler(
-    target_dir: Option<&PathBuf>,
-) -> Result<Option<Arc<WorktreeWriteScheduler>>> {
-    if !SchedulerConfig::enabled() {
-        return Ok(None);
-    }
-    let Some(target_dir) = target_dir else {
-        return Ok(None);
-    };
-    let scheduler = WorktreeWriteScheduler::new(target_dir.clone(), ARCHIVE_WRITE_OPTIONS)
-        .context("create io_uring write scheduler")?;
-    let cfg = SchedulerConfig::from_env();
-    warn!(
-        "RIPCLONE_IO_URING_SCHEDULER is deprecated and slated for removal; it is \
-         superseded by RIPCLONE_IO_URING_DEPTH (see docs/WRITER_SCHEDULER_EXPERIMENT.md). \
-         enabled (submitters={}, inflight={}, batch_files={}, byte_cap={} B, flush={:?})",
-        scheduler.submitter_count(),
-        cfg.inflight,
-        cfg.batch_files,
-        cfg.byte_cap,
-        cfg.flush_timeout,
-    );
-    Ok(Some(Arc::new(scheduler)))
-}
-
-/// Default compressed chunk size for streaming extractions. A chunk contains
-/// one or more consecutive frames fetched with a single HTTP range request.
-/// 6 MiB is a middle ground: big enough to amortize per-request overhead on
-/// fast links, small enough to avoid a long latency tail on CPU/bandwidth
-/// constrained agents.
-const DEFAULT_STREAMING_CHUNK_SIZE: u64 = 6 * 1024 * 1024;
-
 /// Default chunk size when extracting from a local archive file. Smaller than
 /// the streaming default because the local path is CPU-bound and benefits from
 /// more parallel slicing/decompression.
 const DEFAULT_LOCAL_CHUNK_SIZE: u64 = 2 * 1024 * 1024;
-
-fn available_parallelism() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .max(1)
-}
-
-fn env_usize(name: &str) -> Option<usize> {
-    std::env::var(name).ok().and_then(|s| s.parse().ok())
-}
 
 fn archive_thread_counts() -> (usize, usize) {
     let fetch_threads = crate::gix_util::worker_threads(
@@ -935,13 +724,9 @@ fn sha1_digest_fragments_recorded(fragments: &[FileSlice]) -> sha1::digest::Outp
 /// `manifest_path` must point to a protobuf `MetadataChunk`. The chunk index in
 /// each received message must match `FrameInfo.chunk_index` for the frames in
 /// that chunk.
-///
-/// If `git_dir` is `Some`, every verified blob is also collected and written
-/// into `.git/objects/pack` as a locally-built packfile.
 pub fn extract_archive_from_chunk_receiver(
     manifest_path: &Path,
     target_dir: Option<&Path>,
-    git_dir: Option<&Path>,
     dictionary: Option<&[u8]>,
     chunk_rx: Receiver<(usize, Result<bytes::Bytes>)>,
 ) -> Result<ExtractStats> {
@@ -1000,30 +785,6 @@ pub fn extract_archive_from_chunk_receiver(
 
     let target_dir = target_dir.map(Path::to_path_buf);
     let manifest = Arc::new(manifest);
-
-    let expected_blob_count = git_dir.map(|_| {
-        let mut unique: HashSet<[u8; 20]> = HashSet::new();
-        for entry in manifest.files.iter() {
-            let sha1: [u8; 20] = entry
-                .blob_sha1
-                .as_slice()
-                .try_into()
-                .expect("manifest blob_sha1 must be 20 bytes");
-            unique.insert(sha1);
-        }
-        unique.len()
-    });
-    let (blob_pack_tx, blob_pack_handle): (
-        Option<crossbeam_channel::Sender<crate::blob_pack::BlobPackInput>>,
-        Option<std::thread::JoinHandle<Result<PathBuf>>>,
-    ) = if let Some(git_dir) = git_dir {
-        let expected = expected_blob_count.expect("expected count present with git_dir");
-        let (tx, handle) = crate::blob_pack::spawn_blob_pack_builder(git_dir, expected)
-            .context("spawn blob pack builder")?;
-        (Some(tx), Some(handle))
-    } else {
-        (None, None)
-    };
 
     let fragments_by_frame = Arc::new(manifest.fragments_by_frame());
 
@@ -1141,8 +902,6 @@ pub fn extract_archive_from_chunk_receiver(
     drop(chunk_rx);
     drop(compressed_tx);
 
-    let scheduler = build_archive_scheduler(target_dir.as_ref())?;
-
     // Spawn writer threads: they decompress frames and write files.
     for _ in 0..write_threads {
         let compressed_rx: Receiver<(usize, Result<bytes::Bytes>)> = compressed_rx.clone();
@@ -1152,14 +911,8 @@ pub fn extract_archive_from_chunk_receiver(
         let pending_files2 = pending_files.clone();
         let target_dir2 = target_dir.clone();
         let dictionary2 = dictionary.clone();
-        let blob_pack_tx2 = blob_pack_tx.clone();
-        let scheduler2 = scheduler.clone();
         std::thread::spawn(move || {
-            let writer = if scheduler2.is_some() {
-                None
-            } else {
-                target_dir2.as_ref().map(|_| WorktreeWriter::new())
-            };
+            let writer = target_dir2.as_ref().map(|_| WorktreeWriter::new());
             while let Ok((idx, res)) = compressed_rx.recv() {
                 let result: Result<ArchiveFrameWriteResult> = (|| {
                     let writer = match writer.as_ref() {
@@ -1214,26 +967,15 @@ pub fn extract_archive_from_chunk_receiver(
                                     String::from_utf8_lossy(&entry.path)
                                 );
                             }
-                            if let Some(ref tx) = blob_pack_tx2 {
-                                let sha1 = blob_sha1_to_array(&entry.blob_sha1)?;
-                                tx.send(crate::blob_pack::BlobPackInput::FrameSlice {
-                                    sha1,
-                                    frame: Arc::clone(&raw),
-                                    offset: off,
-                                    len,
-                                })
-                                .context("blob pack builder closed")?;
-                            }
-                            if let Some(ref target_dir) = target_dir2 {
+                            if let Some((target_dir, writer)) = target_dir2.as_ref().zip(writer) {
                                 pending_writes.push(OwnedFileWrite {
                                     entry: entry.clone(),
                                     content: FileWriteContent::shared(Arc::clone(&raw), off, len),
                                 });
                                 if pending_writes.len() >= PACK_WRITE_BATCH_FILES {
                                     let outcome = flush_archive_writes(
-                                        scheduler2.as_deref(),
                                         writer,
-                                        Some(target_dir),
+                                        target_dir,
                                         &mut pending_writes,
                                     )?;
                                     written += outcome.written;
@@ -1269,39 +1011,16 @@ pub fn extract_archive_from_chunk_receiver(
                                         String::from_utf8_lossy(&entry.path)
                                     );
                                 }
-                                if let Some(ref tx) = blob_pack_tx2 {
-                                    if let Some(ref target_dir) = target_dir2 {
-                                        pending_writes.push(OwnedFileWrite {
-                                            entry: entry.clone(),
-                                            content: FileWriteContent::Fragments(fragments.clone()),
-                                        });
-                                        if pending_writes.len() >= PACK_WRITE_BATCH_FILES {
-                                            let outcome = flush_archive_writes(
-                                                scheduler2.as_deref(),
-                                                writer,
-                                                Some(target_dir),
-                                                &mut pending_writes,
-                                            )?;
-                                            written += outcome.written;
-                                            stats.extend(outcome.stats);
-                                        }
-                                    }
-                                    let sha1 = blob_sha1_to_array(&entry.blob_sha1)?;
-                                    tx.send(crate::blob_pack::BlobPackInput::Fragments {
-                                        sha1,
-                                        fragments,
-                                    })
-                                    .context("blob pack builder closed")?;
-                                } else if let Some(ref target_dir) = target_dir2 {
+                                if let Some((target_dir, writer)) = target_dir2.as_ref().zip(writer)
+                                {
                                     pending_writes.push(OwnedFileWrite {
                                         entry: entry.clone(),
                                         content: FileWriteContent::Fragments(fragments),
                                     });
                                     if pending_writes.len() >= PACK_WRITE_BATCH_FILES {
                                         let outcome = flush_archive_writes(
-                                            scheduler2.as_deref(),
                                             writer,
-                                            Some(target_dir),
+                                            target_dir,
                                             &mut pending_writes,
                                         )?;
                                         written += outcome.written;
@@ -1311,14 +1030,12 @@ pub fn extract_archive_from_chunk_receiver(
                             }
                         }
                     }
-                    let outcome = flush_archive_writes(
-                        scheduler2.as_deref(),
-                        writer,
-                        target_dir2.as_ref(),
-                        &mut pending_writes,
-                    )?;
-                    written += outcome.written;
-                    stats.extend(outcome.stats);
+                    if let Some((target_dir, writer)) = target_dir2.as_ref().zip(writer) {
+                        let outcome =
+                            flush_archive_writes(writer, target_dir, &mut pending_writes)?;
+                        written += outcome.written;
+                        stats.extend(outcome.stats);
+                    }
                     Ok(ArchiveFrameWriteResult { written, stats })
                 })();
                 if done_tx.send(result).is_err() {
@@ -1347,20 +1064,6 @@ pub fn extract_archive_from_chunk_receiver(
             }
         }
     }
-    // The scheduler writes in the background. Now that every writer thread is
-    // done submitting, drain it to finish any buffered writes and collect their
-    // stats. Write errors show up here.
-    if let Some(scheduler) = scheduler.as_ref() {
-        match scheduler.flush() {
-            Ok(outcome) => stat_cache.extend(outcome.stats),
-            Err(e) => {
-                if error.is_none() {
-                    error = Some(e);
-                }
-            }
-        }
-    }
-
     let expected_files = if target_dir.is_some() {
         manifest.files.len()
     } else {
@@ -1388,48 +1091,7 @@ pub fn extract_archive_from_chunk_receiver(
 
     let raw_total: u64 = manifest.files.iter().map(|e| e.total_len()).sum();
 
-    if error.is_none()
-        && git_dir.is_some()
-        && let Some(ref target_dir) = target_dir
-    {
-        let clear_start = Instant::now();
-        let path_count = manifest.files.len();
-        if let Err(e) = git::clear_skip_worktree_index_with_stats_byte_iter(
-            target_dir,
-            manifest.files.iter().map(|e| e.path.as_slice()),
-            &stat_cache,
-        ) {
-            error = Some(e);
-        } else {
-            info!(
-                "cleared skip-worktree for {} paths in {:?}",
-                path_count,
-                clear_start.elapsed()
-            );
-        }
-    }
-
-    drop(blob_pack_tx);
-    let pack_result: Option<Result<PathBuf>> = blob_pack_handle.map(|handle| {
-        let pack_start = Instant::now();
-        match handle.join() {
-            Ok(Ok(path)) => {
-                info!(
-                    "built and installed local blob pack at {} in {:?}",
-                    path.display(),
-                    pack_start.elapsed()
-                );
-                Ok(path)
-            }
-            Ok(Err(e)) => Err(e).context("build and install local blob pack"),
-            Err(_) => Err(anyhow::anyhow!("blob pack builder thread panicked")),
-        }
-    });
-
     if let Some(e) = error {
-        return Err(e);
-    }
-    if let Some(Err(e)) = pack_result {
         return Err(e);
     }
 
@@ -1437,273 +1099,6 @@ pub fn extract_archive_from_chunk_receiver(
         files: files_written,
         raw_bytes: raw_total,
         stats: stat_cache,
-    })
-}
-
-/// Materialize the working tree directly from an installed git packfile.
-///
-/// `repo_root` is the install root containing `.git`, with the depth pack + idx
-/// already written into `.git/objects/pack`. `commit` is the HEAD commit hex sha.
-///
-/// The HEAD tree is walked to enumerate every working-tree path, its mode, and
-/// its blob oid; each blob is then read out of the object database (gix
-/// resolves pack deltas + zlib) and written to disk in parallel. After
-/// materialization the skip-worktree bit is cleared for every path so git treats
-/// the tree normally.
-///
-/// This is the single-download clone path: the depth pack is both the object
-/// database and the working-tree source, so no archive is fetched and no
-/// separate file table is needed.
-pub fn materialize_worktree_from_pack(repo_root: &Path, commit: &str) -> Result<ExtractStats> {
-    let start = Instant::now();
-
-    // Enumerate working-tree entries by walking the HEAD tree from the pack.
-    struct WorkItem {
-        path: Vec<u8>,
-        mode: u32,
-        oid: gix::hash::ObjectId,
-    }
-
-    let sync_repo = crate::gix_util::open_sync_repo(repo_root)
-        .with_context(|| format!("open repo {}", repo_root.display()))?;
-    let items: Vec<WorkItem> = {
-        let repo = sync_repo.to_thread_local();
-        let id = repo
-            .rev_parse_single(commit)
-            .with_context(|| format!("resolve commit {}", commit))?;
-        let tree_id = repo
-            .find_commit(id)
-            .with_context(|| format!("find HEAD commit {}", commit))?
-            .tree_id()
-            .with_context(|| format!("read tree for commit {}", commit))?
-            .detach();
-
-        let mut recorder = gix::traverse::tree::Recorder::default();
-        gix::traverse::tree::depthfirst(
-            tree_id,
-            gix::traverse::tree::depthfirst::State::default(),
-            &repo.objects,
-            &mut recorder,
-        )
-        .context("walk HEAD tree")?;
-
-        let mut items: Vec<WorkItem> = Vec::new();
-        for entry in recorder.records {
-            // Only blobs/symlinks become files; trees are recursed into and
-            // gitlinks (submodule commit entries) are skipped.
-            if entry.mode.is_tree() || entry.mode.is_commit() {
-                continue;
-            }
-            let path = entry.filepath.to_vec();
-            validate_relative_path(path_from_bytes(&path))
-                .with_context(|| format!("invalid path {}", String::from_utf8_lossy(&path)))?;
-            items.push(WorkItem {
-                path,
-                mode: entry.mode.value() as u32,
-                oid: entry.oid,
-            });
-        }
-        items
-    };
-
-    if items.is_empty() {
-        return Ok(ExtractStats {
-            files: 0,
-            raw_bytes: 0,
-            stats: Vec::new(),
-        });
-    }
-
-    // Pre-create parent directories single-threaded so the per-file writers race
-    // neither on mkdir nor on directory existence checks.
-    let dirs: HashSet<PathBuf> = items
-        .iter()
-        .filter_map(|it| {
-            let p = path_from_bytes(&it.path);
-            let parent = p.parent()?;
-            if parent.as_os_str().is_empty() {
-                return None;
-            }
-            Some(parent.to_path_buf())
-        })
-        .collect();
-    let mut dirs: Vec<_> = dirs.into_iter().collect();
-    dirs.sort();
-    for dir in &dirs {
-        safe_create_dir_all(repo_root, dir)
-            .with_context(|| format!("create dir {}", dir.display()))?;
-    }
-
-    let write_threads = crate::gix_util::worker_threads(
-        "RIPCLONE_WRITE_THREADS",
-        crate::gix_util::default_worker_threads(),
-    )
-    .min(items.len());
-
-    info!(
-        "materializing {} files from pack with {} threads",
-        items.len(),
-        write_threads
-    );
-
-    let cursor = AtomicUsize::new(0);
-    let written = AtomicUsize::new(0);
-    let raw_bytes = AtomicUsize::new(0);
-    let stat_cache: Mutex<Vec<crate::git::MaterializedPathStat>> = Mutex::new(Vec::new());
-    // R3: the per-file "has any thread failed?" poll runs once per file on the
-    // hot path; make it a cheap atomic load instead of taking a Mutex. The Mutex
-    // is kept only to hold the actual error value, written once on the rare
-    // failure path (guarded by `failed`).
-    let failed = AtomicBool::new(false);
-    let error: Mutex<Option<anyhow::Error>> = Mutex::new(None);
-    let writer = WorktreeWriter::new().context("create worktree writer")?;
-    let sync_repo_ref = &sync_repo;
-
-    std::thread::scope(|scope| {
-        for _ in 0..write_threads {
-            let writer = writer.clone();
-            let cursor = &cursor;
-            let written = &written;
-            let raw_bytes = &raw_bytes;
-            let stat_cache = &stat_cache;
-            let failed = &failed;
-            let error = &error;
-            let items = &items;
-            scope.spawn(move || {
-                // Each thread gets its own local Repository handle from the
-                // shared ThreadSafeRepository. gix ODB readers are not Sync, but
-                // per-thread handles share the mmap'd pack through the OS page
-                // cache with no cross-thread locking.
-                let repo = sync_repo_ref.to_thread_local();
-                let mut pending_writes: Vec<OwnedFileWrite> =
-                    Vec::with_capacity(PACK_WRITE_BATCH_FILES);
-
-                loop {
-                    // Stop pulling new work as soon as any thread has failed.
-                    if failed.load(Ordering::Relaxed) {
-                        let _ = writer.flush_deferred_writes();
-                        return;
-                    }
-                    let idx = cursor.fetch_add(1, Ordering::Relaxed);
-                    if idx >= items.len() {
-                        if !pending_writes.is_empty() {
-                            match writer.write_owned_entries_for_fresh_indexed_checkout_deferred(
-                                repo_root,
-                                std::mem::take(&mut pending_writes),
-                            ) {
-                                Ok(outcome) => {
-                                    written.fetch_add(outcome.written, Ordering::Relaxed);
-                                    stat_cache.lock().unwrap().extend(outcome.stats);
-                                }
-                                Err(e) => {
-                                    *error.lock().unwrap() = Some(e);
-                                    failed.store(true, Ordering::Relaxed);
-                                }
-                            }
-                        }
-                        match writer.flush_deferred_writes() {
-                            Ok(outcome) => {
-                                written.fetch_add(outcome.written, Ordering::Relaxed);
-                                stat_cache.lock().unwrap().extend(outcome.stats);
-                            }
-                            Err(e) => {
-                                *error.lock().unwrap() = Some(e);
-                                failed.store(true, Ordering::Relaxed);
-                            }
-                        }
-                        return;
-                    }
-                    let item = &items[idx];
-                    let res: Result<usize> = (|| {
-                        let content = repo.find_blob(item.oid).with_context(|| {
-                            format!(
-                                "read blob {} for {}",
-                                item.oid,
-                                String::from_utf8_lossy(&item.path)
-                            )
-                        })?;
-                        let content = content.data.clone();
-                        // The owned-write path only reads `path` and `mode`;
-                        // blob_sha1 and fragments are unused here.
-                        let entry = FileEntry {
-                            path: item.path.clone(),
-                            mode: item.mode,
-                            blob_sha1: Vec::new(),
-                            fragments: Vec::new(),
-                        };
-                        let len = content.len();
-                        pending_writes.push(OwnedFileWrite {
-                            entry,
-                            content: content.into(),
-                        });
-                        Ok(len)
-                    })();
-                    match res {
-                        Ok(len) => {
-                            raw_bytes.fetch_add(len, Ordering::Relaxed);
-                            if pending_writes.len() >= PACK_WRITE_BATCH_FILES {
-                                match writer
-                                    .write_owned_entries_for_fresh_indexed_checkout_deferred(
-                                        repo_root,
-                                        std::mem::take(&mut pending_writes),
-                                    ) {
-                                    Ok(outcome) => {
-                                        written.fetch_add(outcome.written, Ordering::Relaxed);
-                                        stat_cache.lock().unwrap().extend(outcome.stats);
-                                    }
-                                    Err(e) => {
-                                        *error.lock().unwrap() = Some(e);
-                                        failed.store(true, Ordering::Relaxed);
-                                        return;
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            *error.lock().unwrap() = Some(e);
-                            failed.store(true, Ordering::Relaxed);
-                            return;
-                        }
-                    }
-                }
-            });
-        }
-    });
-
-    if let Some(e) = error.into_inner().unwrap() {
-        return Err(e);
-    }
-    let files_written = written.load(Ordering::Relaxed);
-    if files_written != items.len() {
-        anyhow::bail!(
-            "pack extractor wrote {} files but expected {}",
-            files_written,
-            items.len()
-        );
-    }
-
-    // The files now exist on disk; clear skip-worktree so git diffs/status see
-    // them as ordinary tracked paths.
-    let stats = stat_cache.into_inner().unwrap();
-    git::clear_skip_worktree_index_with_stats_byte_iter(
-        repo_root,
-        items.iter().map(|it| it.path.as_slice()),
-        &stats,
-    )
-    .context("clear skip-worktree and refresh index stats after pack materialization")?;
-
-    let raw_total = raw_bytes.load(Ordering::Relaxed) as u64;
-    info!(
-        "materialized {} files ({} raw bytes) from pack in {:?}",
-        files_written,
-        raw_total,
-        start.elapsed()
-    );
-
-    Ok(ExtractStats {
-        files: files_written,
-        raw_bytes: raw_total,
-        stats,
     })
 }
 
@@ -1878,87 +1273,6 @@ fn parse_pack_obj_header(buf: &[u8]) -> Result<(u8, u64, usize)> {
     Ok((obj_type, size, i))
 }
 
-/// Fetch and extract a working-tree archive using parallel HTTP range requests.
-/// This is the streaming/parallel client path: the archive is never loaded into
-/// memory as a single object. Consecutive frames are coalesced into chunks to
-/// reduce the number of round-trips.
-///
-/// If `git_dir` is `Some`, every verified blob is also written into
-/// `.git/objects/pack` as a locally-built packfile.
-pub fn extract_archive_streaming(
-    manifest_path: &Path,
-    target_dir: &Path,
-    git_dir: Option<&Path>,
-    dictionary: Option<&[u8]>,
-    archive_hash: &str,
-    server: &str,
-    token: Option<&str>,
-) -> Result<ExtractStats> {
-    use anyhow::Context;
-    use reqwest::header::{AUTHORIZATION, RANGE};
-
-    let chunk_size = std::env::var("RIPCLONE_CHUNK_SIZE")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_STREAMING_CHUNK_SIZE);
-
-    let client = reqwest::blocking::Client::new();
-    let server = server.to_string();
-    let archive_hash = archive_hash.to_string();
-    let auth_header = token.map(|t| format!("Ripclone {}", t));
-
-    extract_archive_with_chunk_fetcher(
-        manifest_path,
-        Some(target_dir),
-        git_dir,
-        dictionary,
-        chunk_size,
-        move |chunk: &Chunk| {
-            let start = chunk.byte_start;
-            let end = chunk.byte_end.saturating_sub(1);
-            let expected_len = chunk.compressed_len();
-            let url = format!("{}/v1/artifacts/{}", server, archive_hash);
-            let mut req = client
-                .get(&url)
-                .header(RANGE, format!("bytes={}-{}", start, end));
-            if let Some(auth) = &auth_header {
-                req = req.header(AUTHORIZATION, auth);
-            }
-            let resp = req
-                .send()
-                .with_context(|| format!("range request bytes={}-{} from {}", start, end, url))?;
-            if resp.status() == reqwest::StatusCode::PARTIAL_CONTENT {
-                let data = resp
-                    .bytes()
-                    .with_context(|| format!("read bytes={}-{} response", start, end))?;
-                if data.len() as u64 != expected_len {
-                    anyhow::bail!(
-                        "range request bytes={}-{} length mismatch: expected {}, got {}",
-                        start,
-                        end,
-                        expected_len,
-                        data.len()
-                    );
-                }
-                Ok(data.to_vec())
-            } else if resp.status().is_success() {
-                anyhow::bail!(
-                    "range request bytes={}-{} returned 200 instead of 206",
-                    start,
-                    end
-                );
-            } else {
-                anyhow::bail!(
-                    "range request bytes={}-{} failed: {}",
-                    start,
-                    end,
-                    resp.status()
-                );
-            }
-        },
-    )
-}
-
 /// Extract a working tree by fetching each archive chunk whole.
 ///
 /// `manifest_path` must point to a protobuf `MetadataChunk` whose frame table
@@ -1968,15 +1282,11 @@ pub fn extract_archive_streaming(
 /// `signed_chunk_urls` may be omitted or may contain one entry per archive
 /// chunk hash. A `Some(url)` entry is fetched directly; `None` falls back to
 /// the gateway's `/v1/artifacts/{hash}` endpoint.
-///
-/// If `git_dir` is `Some`, every verified blob is also written into
-/// `.git/objects/pack` as a locally-built packfile.
 pub fn extract_clonepack_streaming(
     manifest_path: &Path,
     archive_chunk_hashes: &[String],
     signed_chunk_urls: Option<Vec<Option<String>>>,
     target_dir: &Path,
-    git_dir: Option<&Path>,
     dictionary: Option<&[u8]>,
     server: &str,
     // Full `Authorization` header value (e.g. "Ripclone <hash>" or "Bearer
@@ -1997,7 +1307,6 @@ pub fn extract_clonepack_streaming(
     extract_archive_with_chunk_fetcher(
         manifest_path,
         Some(target_dir),
-        git_dir,
         dictionary,
         u64::MAX,
         move |chunk: &Chunk| {
@@ -2061,26 +1370,8 @@ mod tests {
         Sha1::digest(data).into()
     }
 
-    fn git_blob_hash(content: &[u8]) -> [u8; 20] {
-        let header = format!("blob {}\0", content.len());
-        let mut data = Vec::with_capacity(header.len() + content.len());
-        data.extend_from_slice(header.as_bytes());
-        data.extend_from_slice(content);
-        sha1_bytes(&data)
-    }
-
     fn empty_manifest() -> MetadataChunk {
         MetadataChunk::new()
-    }
-
-    fn init_git_dir(target: &Path) {
-        let status = std::process::Command::new("git")
-            .arg("-C")
-            .arg(target)
-            .args(["init", "-q"])
-            .status()
-            .expect("git init failed");
-        assert!(status.success());
     }
 
     fn extract_manifest(
@@ -2088,7 +1379,6 @@ mod tests {
         target: &Path,
         archive_chunks: Vec<Vec<u8>>,
     ) -> Result<ExtractStats> {
-        init_git_dir(target);
         let manifest_path = target.join("manifest.pb");
         {
             let mut f = File::create(&manifest_path)?;
@@ -2097,7 +1387,6 @@ mod tests {
         extract_archive_with_chunk_fetcher(
             &manifest_path,
             Some(target),
-            None,
             None,
             u64::MAX,
             move |chunk| {
@@ -2351,153 +1640,5 @@ mod tests {
         });
 
         assert!(extract_manifest(&manifest, &target, vec![vec![b'y'; 3]]).is_err());
-    }
-
-    /// Negative: materializing from an invalid commit SHA must fail cleanly.
-    #[test]
-    fn materialize_from_invalid_commit_errors() {
-        let tmp = TempDir::new().unwrap();
-        let target = tmp.path().join("out");
-        std::fs::create_dir(&target).unwrap();
-        init_git_dir(&target);
-        assert!(materialize_worktree_from_pack(&target, "not-a-sha").is_err());
-    }
-
-    #[test]
-    fn archive_extract_builds_blob_pack() {
-        let tmp = TempDir::new().unwrap();
-        let target = tmp.path().join("out");
-        std::fs::create_dir(&target).unwrap();
-        init_git_dir(&target);
-
-        let data_a = b"hello blob pack";
-        let data_b = b"second file";
-        let mut manifest = empty_manifest();
-        manifest.files.push(FileEntry {
-            path: b"a.txt".to_vec(),
-            mode: 0o100644,
-            blob_sha1: sha1_bytes(data_a).to_vec(),
-            fragments: vec![Fragment {
-                frame_index: 0,
-                frame_offset: 0,
-                raw_len: data_a.len() as u32,
-            }],
-        });
-        manifest.files.push(FileEntry {
-            path: b"b.txt".to_vec(),
-            mode: 0o100644,
-            blob_sha1: sha1_bytes(data_b).to_vec(),
-            fragments: vec![Fragment {
-                frame_index: 0,
-                frame_offset: data_a.len() as u32,
-                raw_len: data_b.len() as u32,
-            }],
-        });
-
-        let mut raw_frame = Vec::new();
-        raw_frame.extend_from_slice(data_a);
-        raw_frame.extend_from_slice(data_b);
-        let compressed = zstd::encode_all(raw_frame.as_slice(), 1).unwrap();
-        manifest.frames.push(FrameInfo {
-            chunk_index: 0,
-            chunk_offset: 0,
-            compressed_len: compressed.len() as u32,
-            raw_len: raw_frame.len() as u32,
-        });
-
-        let manifest_path = target.join("manifest.pb");
-        {
-            let mut f = File::create(&manifest_path).unwrap();
-            manifest.write(&mut f).unwrap();
-        }
-
-        extract_archive_with_chunk_fetcher(
-            &manifest_path,
-            Some(&target),
-            Some(&target.join(".git")),
-            None,
-            u64::MAX,
-            move |_chunk| Ok(compressed.clone()),
-        )
-        .unwrap();
-
-        let pack_dir = target.join(".git").join("objects").join("pack");
-        let packs: Vec<_> = std::fs::read_dir(&pack_dir)
-            .unwrap()
-            .filter_map(|e| {
-                let p = e.ok()?.path();
-                if p.extension()? == "pack" {
-                    Some(p)
-                } else {
-                    None
-                }
-            })
-            .collect();
-        assert_eq!(packs.len(), 1, "expected one blob pack");
-
-        // Verify git can read both blobs.
-        for data in [data_a.as_slice(), data_b.as_slice()] {
-            let output = std::process::Command::new("git")
-                .arg("-C")
-                .arg(&target)
-                .args(["cat-file", "blob", &hex::encode(git_blob_hash(data))])
-                .output()
-                .unwrap();
-            assert!(output.status.success(), "git cat-file failed: {:?}", output);
-            assert_eq!(output.stdout, data);
-        }
-    }
-
-    #[test]
-    fn pack_materialize_roundtrip() {
-        // Exercises the single-download path: a HEAD commit/tree + blobs live in
-        // the object database and the working tree is materialized by walking
-        // that tree.
-        let tmp = TempDir::new().unwrap();
-        let target = tmp.path().join("out");
-        std::fs::create_dir(&target).unwrap();
-        let repo = gix::init(&target).unwrap();
-
-        let data_a = b"hello from the pack\n";
-        let data_x = b"#!/bin/sh\necho hi\n";
-        let link_target = b"a.txt";
-
-        let commit = crate::test_fixture::commit_with_modes(
-            &repo,
-            &[
-                ("a.txt", 0o100644, &data_a[..]),
-                ("link", 0o120000, &link_target[..]),
-                ("dir/run.sh", 0o100755, &data_x[..]),
-            ],
-        );
-
-        let stats = materialize_worktree_from_pack(&target, &commit).unwrap();
-        assert_eq!(stats.files, 3);
-
-        // Content lands on disk, including nested directories.
-        assert_eq!(std::fs::read(target.join("a.txt")).unwrap(), data_a);
-        assert_eq!(std::fs::read(target.join("dir/run.sh")).unwrap(), data_x);
-
-        // Symlink is created as a real symlink pointing at its target.
-        let link = target.join("link");
-        let meta = std::fs::symlink_metadata(&link).unwrap();
-        assert!(meta.file_type().is_symlink(), "link should be a symlink");
-        assert_eq!(std::fs::read_link(&link).unwrap(), Path::new("a.txt"));
-
-        // Executable bit is preserved for 0o100755 entries.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perm = std::fs::metadata(target.join("dir/run.sh"))
-                .unwrap()
-                .permissions()
-                .mode();
-            assert_eq!(perm & 0o111, 0o111, "exec bit should be set");
-            let perm_a = std::fs::metadata(target.join("a.txt"))
-                .unwrap()
-                .permissions()
-                .mode();
-            assert_eq!(perm_a & 0o111, 0, "plain file should not be executable");
-        }
     }
 }

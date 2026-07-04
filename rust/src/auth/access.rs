@@ -194,8 +194,6 @@ impl AccessVerifier for HttpAccessVerifier {
 mod tests {
     use super::*;
     use crate::provider::{ProviderInstance, ProviderInstanceId, ProviderKind};
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn gh() -> ProviderInstance {
         ProviderInstance {
@@ -204,26 +202,6 @@ mod tests {
             host: "github.com".to_string(),
             auth_template: None,
             auth_header_name: None,
-        }
-    }
-
-    /// A scripted verifier for wiring tests elsewhere: returns a fixed decision
-    /// and counts calls so a test can assert the gate ran (incl. on cache hits).
-    pub struct FakeVerifier {
-        pub decision: AccessDecision,
-        pub calls: Arc<AtomicUsize>,
-    }
-
-    #[async_trait::async_trait]
-    impl AccessVerifier for FakeVerifier {
-        async fn verify(
-            &self,
-            _p: &ProviderInstance,
-            _path: &str,
-            _c: Option<&SecretString>,
-        ) -> AccessDecision {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            self.decision
         }
     }
 

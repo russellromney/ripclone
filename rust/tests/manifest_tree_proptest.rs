@@ -225,7 +225,6 @@ fn extract_plan(
         &manifest_path,
         Some(&target),
         None,
-        None,
         u64::MAX,
         move |chunk| {
             chunks

@@ -329,9 +329,19 @@ pub struct SyncPhases {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub commit_graph_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub publish_p1_ms: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub head_packs_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skeleton_build_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub files_table_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prebuilt_index_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upload_p1_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ref_publish_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub publish_p1_ms: Option<u64>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -2021,7 +2031,6 @@ async fn get_ref_inner(
                 full_clonepack: crate::ClonepackArtifacts::default(),
                 shallow_clonepack: crate::ClonepackArtifacts::default(),
                 history_levels: Vec::new(),
-                head_buckets: Vec::new(),
                 head_base_commit: String::new(),
                 head_base_packs: Vec::new(),
                 archive_frames: Vec::new(),
@@ -2566,25 +2575,6 @@ async fn build_repo_status(
         total_unique_bytes,
         regions,
     })
-}
-
-/// Target size for each chunk of the head-blobs pack on the client fetch path.
-/// 4 MB matches the archive chunk target and keeps enough requests in flight to
-/// benefit high-bandwidth links without making small-file clones too chatty.
-const HEAD_BLOBS_CHUNK_SIZE: usize = 4 * 1024 * 1024;
-
-/// Split a pack file into content-addressed chunks and store them in the CAS.
-/// Returns the `ChunkRef`s in the order needed to reconstruct the pack.
-fn split_and_store_pack(cas: &crate::cas::Cas, pack: &[u8]) -> Result<Vec<ChunkRef>> {
-    let mut refs = Vec::new();
-    for chunk in pack.chunks(HEAD_BLOBS_CHUNK_SIZE) {
-        let hash = cas.put(chunk)?;
-        refs.push(ChunkRef {
-            hash: hash_from_hex(&hash)?,
-            len: chunk.len() as u64,
-        });
-    }
-    Ok(refs)
 }
 
 async fn sync_repo_inner(
@@ -3998,16 +3988,6 @@ fn sweep_stale_tempdirs(dir: &std::path::Path, max_age: Duration) {
     }
 }
 
-/// Outcome of the depth-pack build, which differs between the default
-/// rebuild-everything path and the LSM incremental path.
-enum DepthBuild {
-    Full {
-        head_packs: Vec<(String, u64, String, u64)>,
-        history_packs: Vec<(String, u64, String, u64)>,
-    },
-    Lsm(crate::pack::IncrementalPacks),
-}
-
 /// Ref-store key for a build. Rev-targeted builds (sync/clone `--at <rev>`) use
 /// a commit-keyed rolling key (`{branch}#{commit}`) so they never overwrite the
 /// real branch entry and never get stuck reusing a stale/incomplete rev-keyed
@@ -4750,6 +4730,7 @@ async fn build_and_publish_two_phase(
 
     // ---- PHASE 1: HEAD closure + archive + shallow skeleton -> publish depth=1 ----
     let mut t = Instant::now();
+    let sk_start = Instant::now();
     let (md1, c1, cm1) = (mirror_dir.to_path_buf(), cas.clone(), commit.to_string());
     let shallow_skeleton_handle = tokio::task::spawn_blocking(move || {
         let s = Instant::now();
@@ -4848,6 +4829,7 @@ async fn build_and_publish_two_phase(
         .map(|p| p.commit.clone())
         .filter(|c| !c.is_empty());
     let (md3, cm3) = (mirror_dir.to_path_buf(), commit.to_string());
+    let ft_start = Instant::now();
     let files_table_handle = match (prev_files, prev_commit_for_diff) {
         (Some(pf), Some(from)) if !from.is_empty() => {
             let (md, cm, frm) = (md3.clone(), cm3.clone(), from);
@@ -4889,10 +4871,12 @@ async fn build_and_publish_two_phase(
     let (shallow_skeleton_pack, shallow_skeleton_idx) = shallow_skeleton_handle
         .await
         .context("shallow skeleton")??;
+    phases.skeleton_build_ms = Some(duration_ms(sk_start.elapsed()));
     let head_built = head_handle.await.context("head packs")??;
     phases.head_packs_ms = Some(head_built.elapsed_ms);
     let head_packs = head_built.all_packs.clone();
     let metadata_base = files_table_handle.await.context("files table")??;
+    phases.files_table_ms = Some(duration_ms(ft_start.elapsed()));
     info!(
         "two-phase p1: head+shallow-skeleton+files-table {:?}",
         t.elapsed()
@@ -4905,11 +4889,13 @@ async fn build_and_publish_two_phase(
         commit.to_string(),
         shallow_skeleton_pack.clone(),
     );
+    let idx_start = Instant::now();
     let shallow_prebuilt_index = tokio::task::spawn_blocking(move || {
         PackBuilder::new(&md4, &c4).build_prebuilt_index(&cm4, &skp)
     })
     .await
     .context("shallow prebuilt index")??;
+    phases.prebuilt_index_ms = Some(duration_ms(idx_start.elapsed()));
 
     let mut shallow_meta = metadata_base.clone();
     shallow_meta.skeleton_pack = cas.get(&shallow_skeleton_pack)?;
@@ -5006,7 +4992,6 @@ async fn build_and_publish_two_phase(
             commit: commit.to_string(),
         },
         history_levels: carried_levels,
-        head_buckets: Vec::new(),
         head_base_commit: head_built.base_commit.clone(),
         head_base_packs: head_built.base_packs.clone(),
         archive_frames: carried_archive_frames,
@@ -5035,15 +5020,19 @@ async fn build_and_publish_two_phase(
     p1.retain(|h| !h.is_empty());
     let head_idx_keep: std::collections::HashSet<String> =
         head_packs.iter().map(|(_, _, ih, _)| ih.clone()).collect();
+    let upload_start = Instant::now();
     upload_artifacts(cas, storage, p1.clone(), upload_conc).await?;
     settle_storage(cas, storage, retention, p1, head_idx_keep).await;
+    phases.upload_p1_ms = Some(duration_ms(upload_start.elapsed()));
 
+    let publish_start = Instant::now();
     ref_store
         .save_branch(repo_id, branch, &info)
         .await
         .with_context(|| format!("persist depth=1 ref for {}@{branch}", repo_id.storage_key()))?;
+    phases.ref_publish_ms = Some(duration_ms(publish_start.elapsed()));
     info!(
-        "two-phase p1: published depth=1 for {} in {:?} (full history building in background)",
+        "two-phase p1: published depth-1 for {} in {:?} (full history building in background)",
         &commit[..7.min(commit.len())],
         t_total.elapsed()
     );
@@ -5134,11 +5123,152 @@ async fn build_and_publish_two_phase(
         tokio::spawn(phase2);
     }
 
+    if std::env::var_os("RIPCLONE_BENCH").is_some() {
+        report_sync_bench(repo_id, branch, commit, &phases, storage, &info, mirror_dir);
+    }
+
     Ok(SyncBuildResult {
         info,
         status: "built".to_string(),
         phases,
     })
+}
+
+/// Storage amplification for one ref: durable bytes in object storage divided by
+/// the upstream bare-mirror size, split by artifact class. Content-addressed
+/// storage may be shared across refs, so this attributes every hash reachable
+/// from the given ref to that ref.
+#[derive(Debug, Clone, serde::Serialize)]
+struct StorageAmplification {
+    repo_size_bytes: u64,
+    head_pack_bytes: u64,
+    history_pack_bytes: u64,
+    archive_chunk_bytes: u64,
+    metadata_bytes: u64,
+    total_storage_bytes: u64,
+    amplification: f64,
+}
+
+/// Recursively sum file sizes under `dir`.
+fn dir_size(dir: &std::path::Path) -> u64 {
+    let mut total = 0u64;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Ok(meta) = entry.metadata() {
+                if meta.is_file() {
+                    total += meta.len();
+                } else if meta.is_dir() {
+                    total += dir_size(&path);
+                }
+            }
+        }
+    }
+    total
+}
+
+/// Classify every hash reachable from `info` by artifact class and sum its
+/// bytes in `storage`.
+fn measure_storage_amplification(
+    storage: &crate::storage::StorageRef,
+    info: &crate::RefInfo,
+    mirror_dir: &std::path::Path,
+) -> Option<StorageAmplification> {
+    let repo_size = dir_size(mirror_dir);
+    let mut head_pack_bytes = 0u64;
+    let mut history_pack_bytes = 0u64;
+    let mut archive_chunk_bytes = 0u64;
+    let mut metadata_bytes = 0u64;
+
+    let add = |hash: &str, bucket: &mut u64| {
+        if hash.is_empty() {
+            return;
+        }
+        if let Ok(size) = storage.size(hash) {
+            *bucket += size;
+        }
+    };
+
+    // Head closure packs (base + delta) and their idx files.
+    for p in &info.packs {
+        add(&p.pack, &mut head_pack_bytes);
+        add(&p.idx, &mut head_pack_bytes);
+    }
+
+    // Full-history / LSM sealed levels.
+    for level in &info.history_levels {
+        for p in &level.packs {
+            add(&p.pack, &mut history_pack_bytes);
+            add(&p.idx, &mut history_pack_bytes);
+        }
+    }
+
+    // Archive chunks referenced directly from the ref.
+    for h in &info.archive_chunks {
+        add(h, &mut archive_chunk_bytes);
+    }
+
+    // Metadata: manifests, metadata chunks, skeleton/index, prebuilt index,
+    // idx bundle, and MIDX.
+    for hash in [
+        &info.manifest,
+        &info.metadata_chunk,
+        &info.shallow_clonepack.manifest,
+        &info.shallow_clonepack.metadata_chunk,
+        &info.shallow_clonepack.skeleton_pack,
+        &info.shallow_clonepack.skeleton_idx,
+        &info.shallow_clonepack.prebuilt_index,
+        &info.shallow_clonepack.idx_bundle,
+        &info.shallow_clonepack.midx,
+        &info.full_clonepack.manifest,
+        &info.full_clonepack.metadata_chunk,
+    ] {
+        add(hash, &mut metadata_bytes);
+    }
+
+    let total_storage_bytes = head_pack_bytes
+        .saturating_add(history_pack_bytes)
+        .saturating_add(archive_chunk_bytes)
+        .saturating_add(metadata_bytes);
+    let amplification = if repo_size == 0 {
+        0.0
+    } else {
+        total_storage_bytes as f64 / repo_size as f64
+    };
+
+    Some(StorageAmplification {
+        repo_size_bytes: repo_size,
+        head_pack_bytes,
+        history_pack_bytes,
+        archive_chunk_bytes,
+        metadata_bytes,
+        total_storage_bytes,
+        amplification,
+    })
+}
+
+/// Print a JSON benchmark report when `RIPCLONE_BENCH` is set. Mirrors the
+/// client-side `--bench` report style: one structured object per sync, emitted
+/// at INFO so it can be scraped from logs.
+fn report_sync_bench(
+    repo_id: &RepoId,
+    branch: &str,
+    commit: &str,
+    phases: &SyncPhases,
+    storage: &crate::storage::StorageRef,
+    info: &crate::RefInfo,
+    mirror_dir: &std::path::Path,
+) {
+    let amplification = measure_storage_amplification(storage, info, mirror_dir);
+    let report = serde_json::json!({
+        "kind": "sync-bench",
+        "repo": repo_id.storage_key(),
+        "branch": branch,
+        "commit": &commit[..7.min(commit.len())],
+        "phases": phases,
+        "storage_amplification": amplification,
+    });
+    info!("{}", report.to_string());
 }
 
 /// Phase 2 of two-phase publish: build the full-history artifacts and upgrade
@@ -5427,7 +5557,6 @@ async fn build_full_in_background(
             };
             info.history_levels = new_levels;
             if let Some(sized) = rebased_base {
-                info.head_buckets = Vec::new();
                 info.head_base_commit = commit.to_string();
                 info.head_base_packs = sized;
             }
@@ -6806,7 +6935,6 @@ mod tests {
             full_clonepack: crate::ClonepackArtifacts::default(),
             shallow_clonepack: crate::ClonepackArtifacts::default(),
             history_levels: Vec::new(),
-            head_buckets: Vec::new(),
             head_base_commit: String::new(),
             head_base_packs: Vec::new(),
             archive_frames: Vec::new(),
@@ -8345,7 +8473,6 @@ mod tests {
             },
             shallow_clonepack: crate::ClonepackArtifacts::default(),
             history_levels: Vec::new(),
-            head_buckets: Vec::new(),
             head_base_commit: String::new(),
             head_base_packs: Vec::new(),
             archive_frames: Vec::new(),
@@ -8443,7 +8570,6 @@ mod tests {
             },
             shallow_clonepack: crate::ClonepackArtifacts::default(),
             history_levels: Vec::new(),
-            head_buckets: Vec::new(),
             head_base_commit: String::new(),
             head_base_packs: Vec::new(),
             archive_frames: Vec::new(),

@@ -23,6 +23,7 @@ This file tracks what has already landed in ripclone. For upcoming work see `ROA
 
 ## Sync / ref-store correctness
 
+- **Per-stage phase-1 sync timing** (`rust/src/server.rs`): `/sync` responses now include millisecond timings for mirror fetch, commit graph, HEAD packs, skeleton build, files table, prebuilt index, phase-1 upload, and ref publish. Set `RIPCLONE_BENCH=1` to emit a structured `sync-bench` log line with phase timings and per-artifact-class storage amplification for each build.
 - **Commit-keyed ref-store keys for rev-targeted builds** (`rust/src/server.rs`): `sync --at <rev>` and `sync?rev=<rev>` now store artifacts under `{branch}#{commit}` instead of `{branch}#{rev}`. This prevents stale/incomplete rev-keyed refs from blocking future syncs of the same tag and makes different revs that resolve to the same commit share a build.
 - **Commit-keyed reuse for file and S3 metadata stores** (`rust/src/ref_store.rs`): `RefStore::load_build` is now implemented for `FileRefStore` and `S3RefStore`, so a sync of branch `bar` can reuse a completed build of branch `foo` at the same commit instead of rebuilding.
 - **Don't reuse completed builds that lack a files archive** (`rust/src/server.rs`): `reuse_existing_build` no longer returns a full clonepack whose archive chunks are empty (unless archive generation is still in progress), which previously left files-mode clones polling forever.
@@ -46,7 +47,7 @@ This file tracks what has already landed in ripclone. For upcoming work see `ROA
 ## Backend config in config.toml + `ripclone backend` CLI
 
 - **Server-side backends are now configurable from `config.toml`**, not just env vars (`rust/src/config.rs`, `rust/src/backends.rs`). New `[storage]`, `[metadata]`, and `[queue]` sections feed the same selection logic. The matching `RIPCLONE_*` env vars **always override** the file (consistent with the existing `--flag > env > config` precedence). The config is loaded once and consulted as a fallback by `queue_kind`/`queue_db_url`/metadata selection and `S3Storage::from_env_or_config`.
-- **`ripclone backend` CLI** (`rust/src/bin/cli.rs`): `show` prints each backend field's effective value and source (marking env overrides); `queue` / `metadata` / `storage` set the corresponding section in the global `config.toml` (only the flags you pass change). The config file is written `0600` since these sections can hold connection settings.
+- **`ripclone backend` CLI removed**. Backend selection is now env-only from the CLI's perspective; use `RIPCLONE_*` environment variables or edit `config.toml` directly. The server and worker still read `[storage]`, `[metadata]`, and `[queue]` from the global config file.
 - **Credentials stay in the environment.** `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` are never read from config. DB tokens (`[queue].token` / `[metadata].token`) are supported in-file and masked by `backend show`.
 - **Server reads the global config only, with an explicit path override.** Backend selection now uses `load_global` (not the cwd-walked `load`), so a stray project `ripclone.toml` in the server's working directory can no longer silently change its backends. `RIPCLONE_CONFIG` points the global config at an explicit file (e.g. `/etc/ripclone/config.toml`) — useful for a daemon/container without a `$HOME` — and `backend show` prints which file is in effect.
 
