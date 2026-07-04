@@ -984,7 +984,6 @@ mod linux_uring {
 
     struct PendingDirectWindow {
         window_id: u32,
-        slot_base: usize,
         in_flight: Vec<InFlightWrite>,
         statx_buffers: Vec<libc::statx>,
         collect_stats: bool,
@@ -1019,12 +1018,6 @@ mod linux_uring {
         // thread. Callers tune it via `RIPCLONE_IO_URING_DEPTH`; the default (2)
         // preserves the established double-buffered behavior.
         static DESIRED_INFLIGHT: std::cell::Cell<usize> = const { std::cell::Cell::new(2) };
-    }
-
-    /// Set the overlap depth for the io_uring ring on the current thread. Must
-    /// be called before the thread's first write (the ring is created lazily).
-    pub(super) fn set_thread_inflight(depth: usize) {
-        DESIRED_INFLIGHT.with(|c| c.set(depth.clamp(1, MAX_INFLIGHT_WINDOWS)));
     }
 
     impl UringWriter {
@@ -1209,8 +1202,7 @@ mod linux_uring {
             // CQ than requested, this keeps us from ever overflowing it.
             let cq_window_capacity =
                 (ring.params().cq_entries() as usize / (MAX_BATCH_FILES * 4)).max(1);
-            // `set_thread_inflight` sets the depth via the thread-local;
-            // `RIPCLONE_IO_URING_DEPTH` provides a per-process default.
+            // `RIPCLONE_IO_URING_DEPTH` overrides the thread-local default depth.
             let desired = std::env::var("RIPCLONE_IO_URING_DEPTH")
                 .ok()
                 .and_then(|v| v.trim().parse::<usize>().ok())
@@ -1736,7 +1728,6 @@ mod linux_uring {
             .map_err(DirectWriteError::Other)?;
             Ok(PendingDirectWindow {
                 window_id,
-                slot_base,
                 in_flight,
                 statx_buffers,
                 collect_stats,
