@@ -303,6 +303,10 @@ debug; the full e2e suite passing unchanged is PR CI's job, not a local run.
 ```
 
 **B4. Profile phase-1 sync latency** — deps: none — Kimi executes, Fable analyzes — turbogit
+STATUS: instrumentation MERGED (#90); the measurement run is STILL OPEN — bun + pandas,
+cold + incremental, benchmark host, live origins, results appended to
+docs/SYNC_LATENCY_PROFILE.md. Blocks: the hybrid-top-up tripwire decision, B6 item 1,
+and B5's spec finalization. ~1 machine-hour, no code.
 ```
 Goal: know where push→clonable time goes. Instrument the phase-1 build path
 (do_sync through the phase-1 publish in rust/src/server.rs) with per-stage timing
@@ -322,7 +326,7 @@ optimism.
 Accept: stage-level table for cold + incremental sync + amplification table; Fable turns
 it into B6 targets.
 
-**B5. Added-repos model: `add` (make available) vs `sync` (update)** — deps: D4 ✅, A4, C1, E1 — exec Kimi, review Codex `challenge` + Fable — turbogit
+**B5. Added-repos model: `add` (make available) vs `sync` (update)** — deps: D4 ✅, A4 ✅, C1, E1, **B4-measurement** — exec Kimi, review Codex `challenge` + Fable — turbogit
 
 RISK NOTE: this is the highest-blast-radius node in the plan — it changes the semantic
 every existing e2e assumes (today an unknown repo builds on demand; after B5 it 404s).
