@@ -5256,6 +5256,14 @@ async fn build_full_in_background(
         .collect();
     upload_artifacts(cas, storage, uploads.clone(), upload_conc).await?;
 
+    if let Ok(delay_for) = std::env::var("RIPCLONE_TEST_EDITABLE_PUBLISH_DELAY_COMMIT")
+        && delay_for == commit
+        && let Ok(ms) = std::env::var("RIPCLONE_TEST_EDITABLE_PUBLISH_DELAY_MS")
+        && let Ok(ms) = ms.parse::<u64>()
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+    }
+
     // Publish the editable full clonepack. archive_chunks stays empty until the
     // archive is built below; a files clone waits for it.
     {
@@ -5263,48 +5271,45 @@ async fn build_full_in_background(
             .load_branch(repo_id, branch)
             .await?
             .ok_or_else(|| anyhow::anyhow!("ref vanished before editable publish"))?;
-        let mut all_packs = head_packs.clone();
-        all_packs.extend(history_packs.iter().cloned());
-        info.packs = pack_artifacts_of(&all_packs);
-        info.skeleton_pack = shallow_skeleton_pack.clone();
-        info.skeleton_idx = shallow_skeleton_idx.clone();
-        info.prebuilt_index = shallow_prebuilt_index.clone();
-        info.metadata_chunk = shallow_metadata_hash.clone();
-        info.manifest = shallow_metadata_hash.clone();
-        info.archive = String::new();
-        info.archive_chunks = Vec::new();
-        info.clonepack_manifest = editable_clonepack_hash.clone();
-        info.full_clonepack = crate::ClonepackArtifacts {
-            manifest: editable_clonepack_hash.clone(),
-            metadata_chunk: shallow_metadata_hash.clone(),
-            skeleton_pack: shallow_skeleton_pack.clone(),
-            skeleton_idx: shallow_skeleton_idx.clone(),
-            prebuilt_index: shallow_prebuilt_index.clone(),
-            midx: String::new(),
-            idx_bundle: full_idx_bundle_hash.clone(),
-            commit: commit.to_string(),
-        };
-        info.history_levels = new_levels;
-        // The head base is owned by the depth=1 build, which writes it consistently
-        // with the commit. Only adopt a rebase here if the ref still points at our
-        // commit; otherwise a newer sync owns it.
-        if let Some(sized) = rebased_base
-            && info.commit == commit
-        {
-            info.head_buckets = Vec::new();
-            info.head_base_commit = commit.to_string();
-            info.head_base_packs = sized;
+        if info.commit == commit {
+            let mut all_packs = head_packs.clone();
+            all_packs.extend(history_packs.iter().cloned());
+            info.packs = pack_artifacts_of(&all_packs);
+            info.skeleton_pack = shallow_skeleton_pack.clone();
+            info.skeleton_idx = shallow_skeleton_idx.clone();
+            info.prebuilt_index = shallow_prebuilt_index.clone();
+            info.metadata_chunk = shallow_metadata_hash.clone();
+            info.manifest = shallow_metadata_hash.clone();
+            info.archive = String::new();
+            info.archive_chunks = Vec::new();
+            info.clonepack_manifest = editable_clonepack_hash.clone();
+            info.full_clonepack = crate::ClonepackArtifacts {
+                manifest: editable_clonepack_hash.clone(),
+                metadata_chunk: shallow_metadata_hash.clone(),
+                skeleton_pack: shallow_skeleton_pack.clone(),
+                skeleton_idx: shallow_skeleton_idx.clone(),
+                prebuilt_index: shallow_prebuilt_index.clone(),
+                midx: String::new(),
+                idx_bundle: full_idx_bundle_hash.clone(),
+                commit: commit.to_string(),
+            };
+            info.history_levels = new_levels;
+            if let Some(sized) = rebased_base {
+                info.head_buckets = Vec::new();
+                info.head_base_commit = commit.to_string();
+                info.head_base_packs = sized;
+            }
+            info.build_status = Some("archive building".to_string());
+            ref_store
+                .save_branch(repo_id, branch, &info)
+                .await
+                .with_context(|| {
+                    format!(
+                        "persist editable ref for {}@{branch}",
+                        repo_id.storage_key()
+                    )
+                })?;
         }
-        info.build_status = Some("archive building".to_string());
-        ref_store
-            .save_branch(repo_id, branch, &info)
-            .await
-            .with_context(|| {
-                format!(
-                    "persist editable ref for {}@{branch}",
-                    repo_id.storage_key()
-                )
-            })?;
     }
     settle_storage(cas, storage, retention, uploads, idx_keep).await;
     info!(

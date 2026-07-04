@@ -154,3 +154,52 @@ async fn two_phase_resync_full_upgrades() {
     }
     assert!(upgraded, "depth=0 upgrades to the new full commit");
 }
+
+#[tokio::test]
+async fn delayed_older_editable_publish_does_not_clear_newer_archive() {
+    init(false);
+    let server = start_server().await;
+    let origin = make_origin("acme", "phase2guard");
+    let old = origin.commit(&[("f", "old\n")], "old");
+    origin.publish();
+
+    // SAFETY: this test hook targets only this exact commit.
+    unsafe {
+        std::env::set_var("RIPCLONE_TEST_EDITABLE_PUBLISH_DELAY_COMMIT", &old);
+        std::env::set_var("RIPCLONE_TEST_EDITABLE_PUBLISH_DELAY_MS", "3000");
+    }
+
+    server
+        .client()
+        .sync_repo("acme/phase2guard", None)
+        .await
+        .expect("sync old");
+
+    let new = origin.commit(&[("f", "new\n"), ("g", "new file\n")], "new");
+    origin.publish();
+    server
+        .client()
+        .sync_repo("acme/phase2guard", None)
+        .await
+        .expect("sync new");
+
+    let (_ready_guard, ready) =
+        clone_files_when(&server, "acme", "phase2guard", "f", "new\n").await;
+    assert_eq!(read(&ready, "g"), "new file\n");
+
+    tokio::time::sleep(Duration::from_millis(3600)).await;
+
+    let info = server
+        .client()
+        .resolve_ref_with_clonepack("acme/phase2guard", "HEAD", Some("full"), None)
+        .await
+        .expect("resolve full ref");
+    assert_eq!(info.commit, new);
+    assert!(
+        info.archive_ready,
+        "older phase-2 publish must not clear the newer archive"
+    );
+
+    let (_guard, after) = clone_files_when(&server, "acme", "phase2guard", "f", "new\n").await;
+    assert_eq!(read(&after, "g"), "new file\n");
+}
