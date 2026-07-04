@@ -8,6 +8,13 @@
 >
 > Session discipline (applies to all):
 > - Finish a node completely (checks green) → commit → then start the next.
+> - TEST ECONOMY (OSS sessions): per node, run fmt + clippy + only the test files
+>   your node touches. Run the FULL `scripts/ci.sh test` once, at session end,
+>   before the final summary (+ `flake` only where a node's spec demands it).
+>   GitHub CI runs the full suite on the PR regardless — that's the real gate.
+> - BUILD CACHE: `export RUSTC_WRAPPER=sccache` at session start (worktrees keep
+>   their own target dirs; sccache shares the compiled artifacts). If the machine
+>   is saturated, also `export CARGO_BUILD_JOBS=4`.
 > - If a node goes sideways, commit NOTHING for it, note it in your summary, and
 >   move on only if the next node doesn't depend on it.
 > - End with a per-node summary: done/committed, skipped(+why), things noticed
