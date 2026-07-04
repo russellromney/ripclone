@@ -17,10 +17,13 @@
 
 **Standard review loop (every code node unless noted)**
 1. TEST ECONOMY — this overrides any per-node "Run: scripts/ci.sh …" line (those
-   predate this rule): per node, run fmt + clippy + ONLY the tests the node touches
-   (`cargo test --release --test <file>` / module tests; `pnpm vitest run <files>` in
-   ripclone-cloud). NO local full-suite runs, ever — GitHub CI runs the full suite +
-   flake guard on every PR push; that is the gate. Fix what CI finds.
+   predate this rule): per node, run fmt + clippy + ONLY the tests the node touches,
+   in DEBUG (`cargo test --test <file>` — never --release locally; the dev profile
+   compiles deps at opt-level 3 so heavy paths run near release speed while your
+   changes compile in seconds; `pnpm vitest run <files>` in ripclone-cloud). NO local
+   full-suite runs, ever — GitHub CI runs the full release suite + flake guard on
+   every PR push; that is the gate. Fix what CI finds. A test that only passes in
+   release is a test bug — report it, don't escalate the profile.
 2. `codex review` on the diff.
 3. Fable final review before merge (batch several nodes per Fable session to save tokens).
 4. Track-A (correctness) nodes additionally get `codex challenge` (adversarial).

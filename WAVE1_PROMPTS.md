@@ -9,9 +9,12 @@
 > Session discipline (applies to all):
 > - Finish a node completely (checks green) → commit → then start the next.
 > - TEST ECONOMY (OSS sessions): per node, run fmt + clippy + only the test files
->   your node touches. NO local full-suite or flake runs at all — GitHub CI runs
->   the full suite + flake guard on every PR push; that's the gate. Fix what CI
->   finds.
+>   your node touches, in DEBUG: `cargo test --test <file>` — never --release
+>   locally (the dev profile optimizes deps, so heavy paths run near release
+>   speed while your changes compile in seconds). NO local full-suite or flake
+>   runs at all — GitHub CI runs the full release suite + flake guard on every PR
+>   push; that's the gate. A test that only passes in release is a test bug:
+>   report it, don't escalate the profile.
 > - BUILD CACHE: `export RUSTC_WRAPPER=sccache` at session start (worktrees keep
 >   their own target dirs; sccache shares the compiled artifacts). If the machine
 >   is saturated, also `export CARGO_BUILD_JOBS=4`.
