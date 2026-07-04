@@ -62,6 +62,8 @@ pub mod remote_gc;
 pub mod repo_config;
 #[doc(hidden)]
 pub mod retention;
+#[doc(hidden)]
+pub mod secure_file;
 pub mod server;
 #[doc(hidden)]
 pub mod sidecar;

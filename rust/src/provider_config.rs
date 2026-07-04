@@ -58,19 +58,17 @@ fn parse_providers_json(data: &str) -> Result<ProvidersFile> {
 
 /// Save the providers file (without tokens).
 pub fn save_providers_file(path: &Path, file: &ProvidersFile) -> Result<()> {
+    crate::secure_file::with_file_lock(path, || save_providers_file_unlocked(path, file))
+}
+
+fn save_providers_file_unlocked(path: &Path, file: &ProvidersFile) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create providers dir {}", parent.display()))?;
     }
     let data = serde_json::to_string_pretty(file)?;
-    std::fs::write(path, data)
-        .with_context(|| format!("write providers config {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-    }
-    Ok(())
+    crate::secure_file::write_0600_atomic(path, data.as_bytes())
+        .with_context(|| format!("write providers config {}", path.display()))
 }
 
 /// Add or update a provider in the config file and persist its token via the
@@ -81,25 +79,30 @@ pub fn add_provider(
     mut cfg: ProviderConfig,
     token: Option<&str>,
 ) -> Result<()> {
-    let mut file = load_providers_file(path)?;
-    // Strip any plaintext token from the config; we store it separately.
-    cfg.token = None;
+    let provider_id = cfg.id.clone();
+    crate::secure_file::with_file_lock(path, || {
+        let mut file = load_providers_file(path)?;
+        // Strip any plaintext token from the config; we store it separately.
+        cfg.token = None;
 
-    file.providers.retain(|p| p.id != cfg.id);
-    file.providers.push(cfg);
-    save_providers_file(path, &file)?;
+        file.providers.retain(|p| p.id != provider_id);
+        file.providers.push(cfg);
+        save_providers_file_unlocked(path, &file)
+    })?;
 
     if let Some(token) = token {
-        token_store.set(&file.providers.last().unwrap().id, token)?;
+        token_store.set(&provider_id, token)?;
     }
     Ok(())
 }
 
 /// Remove a provider and delete its stored token.
 pub fn remove_provider(path: &Path, token_store: &dyn TokenStore, id: &str) -> Result<()> {
-    let mut file = load_providers_file(path)?;
-    file.providers.retain(|p| p.id != id);
-    save_providers_file(path, &file)?;
+    crate::secure_file::with_file_lock(path, || {
+        let mut file = load_providers_file(path)?;
+        file.providers.retain(|p| p.id != id);
+        save_providers_file_unlocked(path, &file)
+    })?;
     token_store.delete(id)?;
     Ok(())
 }

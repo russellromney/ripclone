@@ -31,7 +31,7 @@
 //! - **Metrics are per-process.** Build metrics recorded here live on this
 //!   worker, not the server; scrape workers too for full visibility.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use ripclone::backends::{self, Backends};
 use ripclone::metrics::Metrics;
@@ -113,7 +113,10 @@ async fn main() -> Result<()> {
                 // broker's configured token for this provider.
                 let credential = state
                     .broker
-                    .fetch_credential(&repo_id, claimed.credential.as_ref());
+                    .fetch_credential(&repo_id, claimed.credential.as_ref())
+                    .with_context(|| {
+                        format!("fetch credential for queued job {}", repo_id.storage_key())
+                    })?;
                 let job = BuildJob {
                     repo_id,
                     branch: claimed.branch,

@@ -19,7 +19,7 @@ use anyhow::{Context, Result};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tracing::info;
 
 /// Abstraction over how ripclone obtains an upstream git credential.
 ///
@@ -36,7 +36,7 @@ pub trait CredentialBroker: Send + Sync {
         &self,
         repo_id: &RepoId,
         request_token: Option<&SecretString>,
-    ) -> Option<SecretString>;
+    ) -> Result<Option<SecretString>>;
 }
 
 /// Tier-B passthrough broker: request token → configured instance token → none.
@@ -56,11 +56,11 @@ impl CredentialBroker for StaticBroker {
         &self,
         repo_id: &RepoId,
         request_token: Option<&SecretString>,
-    ) -> Option<SecretString> {
+    ) -> Result<Option<SecretString>> {
         if let Some(token) = request_token {
-            return Some(token.clone());
+            return Ok(Some(token.clone()));
         }
-        self.registry.token(repo_id.provider.as_str()).cloned()
+        Ok(self.registry.token(repo_id.provider.as_str()).cloned())
     }
 }
 
@@ -282,23 +282,17 @@ impl CredentialBroker for GitHubAppBroker {
         &self,
         repo_id: &RepoId,
         request_token: Option<&SecretString>,
-    ) -> Option<SecretString> {
+    ) -> Result<Option<SecretString>> {
         // A per-request override still wins, matching the static broker.
         if let Some(token) = request_token {
-            return Some(token.clone());
+            return Ok(Some(token.clone()));
         }
         // This broker only authenticates against the github default instance;
         // other providers fall through to anonymous mirroring.
         if !repo_id.is_github_default() {
-            return None;
+            return Ok(None);
         }
-        match self.installation_token() {
-            Ok(token) => Some(token),
-            Err(e) => {
-                warn!("GitHub App installation token mint failed: {e:#}");
-                None
-            }
-        }
+        self.installation_token().map(Some)
     }
 }
 
@@ -379,6 +373,7 @@ mod tests {
         let request = SecretString::new("request".into());
         let token = broker
             .fetch_credential(&RepoId::github("o/r"), Some(&request))
+            .unwrap()
             .unwrap();
         assert_eq!(token.expose_secret(), "request");
     }
@@ -390,6 +385,7 @@ mod tests {
         assert!(
             broker
                 .fetch_credential(&RepoId::github("o/r"), None)
+                .unwrap()
                 .is_none()
         );
     }
@@ -449,6 +445,7 @@ RwIDAQAB
         let request = SecretString::new("request".into());
         let token = broker
             .fetch_credential(&RepoId::github("o/r"), Some(&request))
+            .unwrap()
             .unwrap();
         // The request token wins without any network call.
         assert_eq!(token.expose_secret(), "request");
@@ -463,7 +460,7 @@ RwIDAQAB
             path: "group/proj".to_string(),
         };
         // No request token + non-github provider → anonymous (no network call).
-        assert!(broker.fetch_credential(&repo, None).is_none());
+        assert!(broker.fetch_credential(&repo, None).unwrap().is_none());
     }
 
     #[test]
@@ -480,8 +477,25 @@ RwIDAQAB
         );
         let token = broker
             .fetch_credential(&RepoId::github("o/r"), None)
+            .unwrap()
             .expect("cached token");
         assert_eq!(token.expose_secret(), "ghs_cached");
+    }
+
+    #[test]
+    fn github_app_broker_returns_mint_errors() {
+        let broker = GitHubAppBroker::new(GitHubAppConfig {
+            app_id: "12345".to_string(),
+            installation_id: 67890,
+            private_key_pem: SecretString::from(TEST_PRIVATE_KEY),
+            api_base: "https://127.0.0.1:9".to_string(),
+        })
+        .expect("build test broker from test key");
+
+        let err = broker
+            .fetch_credential(&RepoId::github("o/r"), None)
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("GitHub App installation token"));
     }
 
     #[test]
@@ -635,6 +649,7 @@ RwIDAQAB
         let broker = GitHubAppBroker::new(config).expect("broker");
         let token = broker
             .fetch_credential(&RepoId::github("o/r"), None)
+            .unwrap()
             .expect("mint a live installation token");
         assert!(
             token.expose_secret().starts_with("ghs_") || !token.expose_secret().is_empty(),

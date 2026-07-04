@@ -1174,13 +1174,16 @@ impl Client {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(40usize);
             for _ in 0..max {
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 info = self
                     .resolve_ref_with_clonepack(repo_path, branch, clonepack, rev)
                     .await?;
                 if info.archive_ready {
                     break;
                 }
+            }
+            if !info.archive_ready {
+                anyhow::bail!("archive still building for {repo_path}");
             }
         }
 

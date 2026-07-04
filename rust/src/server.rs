@@ -1193,9 +1193,13 @@ async fn git_info_refs_inner(
 
     let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
     let request_token = upstream_token_from_headers(&headers);
-    let credential = state
+    let credential = match state
         .broker
-        .fetch_credential(&repo_id, request_token.as_ref());
+        .fetch_credential(&repo_id, request_token.as_ref())
+    {
+        Ok(c) => c,
+        Err(e) => return credential_error_response(e),
+    };
     // AU1: gate the vanilla-git read surface too (it serves the private repo's
     // refs/objects directly from the mirror).
     if let Err(resp) =
@@ -1286,9 +1290,13 @@ async fn git_upload_pack_inner(
 ) -> Response {
     let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
     let request_token = upstream_token_from_headers(&headers);
-    let credential = state
+    let credential = match state
         .broker
-        .fetch_credential(&repo_id, request_token.as_ref());
+        .fetch_credential(&repo_id, request_token.as_ref())
+    {
+        Ok(c) => c,
+        Err(e) => return credential_error_response(e),
+    };
     // AU1: gate the vanilla-git upload-pack read surface.
     if let Err(resp) =
         authorize_repo_read(&state, &provider, &repo_id, credential.as_ref(), &headers).await
@@ -1911,9 +1919,13 @@ async fn get_ref_inner(
 
     let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
     let request_token = upstream_token_from_headers(&headers);
-    let credential = state
+    let credential = match state
         .broker
-        .fetch_credential(&repo_id, request_token.as_ref());
+        .fetch_credential(&repo_id, request_token.as_ref())
+    {
+        Ok(c) => c,
+        Err(e) => return credential_error_response(e),
+    };
 
     // AU1: authorize the caller for this repo BEFORE the cache-hit return below,
     // so a cached private repo is never served to a caller without access.
@@ -2072,7 +2084,8 @@ async fn get_ref_inner(
 /// GitHub access — only works briefly; this is the revocation window for the
 /// direct-to-storage path that bypasses the gateway. The cloud gateway tags the
 /// request with `X-Ripclone-Visibility`; absent (e.g. a self-hosted client
-/// talking to the backend directly) means the public TTL. Both are env-tunable.
+/// talking to the backend directly) means the public TTL, but an unrecognized
+/// value fails closed to the private TTL. Both are env-tunable.
 const REF_SIGNED_URL_TTL_PUBLIC_SECS: u64 = 1200;
 const REF_SIGNED_URL_TTL_PRIVATE_SECS: u64 = 300;
 
@@ -2283,15 +2296,28 @@ fn signed_url(storage: &crate::storage::StorageRef, ttl: Duration, hash: &str) -
 }
 
 /// Single-tenant trust mode only: the client tags a request with the visibility
-/// it resolved. Absent → treat as public. This is advisory and trusted ONLY when
+/// it resolved. Absent means public for direct self-host clients; malformed
+/// values fail closed to private. This is advisory and trusted ONLY when
 /// `require_repo_auth` is off; the enforced path derives visibility from the
 /// provider via [`authorize_repo_read`] instead.
 fn visibility_is_private(headers: &HeaderMap) -> bool {
-    headers
-        .get("x-ripclone-visibility")
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.eq_ignore_ascii_case("private"))
-        .unwrap_or(false)
+    match headers.get("x-ripclone-visibility") {
+        None => false,
+        Some(value) => value
+            .to_str()
+            .map(|v| !v.eq_ignore_ascii_case("public"))
+            .unwrap_or(true),
+    }
+}
+
+fn credential_error_response(e: anyhow::Error) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ErrorResponse {
+            error: format!("credential fetch failed: {e}"),
+        }),
+    )
+        .into_response()
 }
 
 /// 403 for a caller that may not read this repo.
@@ -2354,9 +2380,13 @@ async fn repo_status_inner(
 ) -> Response {
     // AU1: status reveals a private repo's existence, commit, and byte sizes.
     let request_token = upstream_token_from_headers(&headers);
-    let credential = state
+    let credential = match state
         .broker
-        .fetch_credential(&repo_id, request_token.as_ref());
+        .fetch_credential(&repo_id, request_token.as_ref())
+    {
+        Ok(c) => c,
+        Err(e) => return credential_error_response(e),
+    };
     if let Err(resp) =
         authorize_repo_read(&state, &provider, &repo_id, credential.as_ref(), &headers).await
     {
@@ -2580,9 +2610,13 @@ async fn sync_repo_inner(
     let at_rev = params.rev;
 
     let request_token = upstream_token_from_headers(&headers);
-    let credential = state
+    let credential = match state
         .broker
-        .fetch_credential(&repo_id, request_token.as_ref());
+        .fetch_credential(&repo_id, request_token.as_ref())
+    {
+        Ok(c) => c,
+        Err(e) => return credential_error_response(e),
+    };
     // AU1: a sync both builds and returns the ref (with signed URLs), so gate it.
     let private =
         match authorize_repo_read(&state, &provider, &repo_id, credential.as_ref(), &headers).await
@@ -2898,7 +2932,10 @@ fn inproc_build_key(repo_id: &RepoId, branch: &str, rev: Option<&str>) -> String
 /// build is queued or folded into one already running; `Err(msg)` if the queue is
 /// full or unavailable.
 async fn trigger_build(state: &ServerState, repo_id: &RepoId, branch: &str) -> Result<(), String> {
-    let credential = state.broker.fetch_credential(repo_id, None);
+    let credential = state
+        .broker
+        .fetch_credential(repo_id, None)
+        .map_err(|e| e.to_string())?;
     let job = BuildJob {
         repo_id: repo_id.clone(),
         branch: branch.to_string(),
@@ -3394,9 +3431,13 @@ async fn cat_file_inner(
         return resp;
     }
     let request_token = upstream_token_from_headers(&headers);
-    let credential = state
+    let credential = match state
         .broker
-        .fetch_credential(&repo_id, request_token.as_ref());
+        .fetch_credential(&repo_id, request_token.as_ref())
+    {
+        Ok(c) => c,
+        Err(e) => return credential_error_response(e),
+    };
     if let Err(resp) =
         authorize_repo_read(&state, &provider, &repo_id, credential.as_ref(), &headers).await
     {
@@ -3446,9 +3487,13 @@ async fn file_sizes_inner(
         return resp;
     }
     let request_token = upstream_token_from_headers(&headers);
-    let credential = state
+    let credential = match state
         .broker
-        .fetch_credential(&repo_id, request_token.as_ref());
+        .fetch_credential(&repo_id, request_token.as_ref())
+    {
+        Ok(c) => c,
+        Err(e) => return credential_error_response(e),
+    };
     if let Err(resp) =
         authorize_repo_read(&state, &provider, &repo_id, credential.as_ref(), &headers).await
     {
@@ -3495,9 +3540,13 @@ async fn create_snapshot_inner(
         return resp;
     }
     let request_token = upstream_token_from_headers(&headers);
-    let credential = state
+    let credential = match state
         .broker
-        .fetch_credential(&repo_id, request_token.as_ref());
+        .fetch_credential(&repo_id, request_token.as_ref())
+    {
+        Ok(c) => c,
+        Err(e) => return credential_error_response(e),
+    };
     if let Err(resp) =
         authorize_repo_read(&state, &provider, &repo_id, credential.as_ref(), &headers).await
     {
@@ -3607,9 +3656,13 @@ async fn get_hotfiles_inner(
         return resp;
     }
     let request_token = upstream_token_from_headers(&headers);
-    let credential = state
+    let credential = match state
         .broker
-        .fetch_credential(&repo_id, request_token.as_ref());
+        .fetch_credential(&repo_id, request_token.as_ref())
+    {
+        Ok(c) => c,
+        Err(e) => return credential_error_response(e),
+    };
     if let Err(resp) =
         authorize_repo_read(&state, &provider, &repo_id, credential.as_ref(), &headers).await
     {
@@ -3663,9 +3716,13 @@ async fn batch_files_inner(
         return resp;
     }
     let request_token = upstream_token_from_headers(&headers);
-    let credential = state
+    let credential = match state
         .broker
-        .fetch_credential(&repo_id, request_token.as_ref());
+        .fetch_credential(&repo_id, request_token.as_ref())
+    {
+        Ok(c) => c,
+        Err(e) => return credential_error_response(e),
+    };
     if let Err(resp) =
         authorize_repo_read(&state, &provider, &repo_id, credential.as_ref(), &headers).await
     {
@@ -4341,7 +4398,7 @@ async fn reuse_existing_build(
     repo_id: &RepoId,
     branch: &str,
     commit: &str,
-) -> Option<RefInfo> {
+) -> Result<Option<RefInfo>> {
     if let Ok(Some(prev)) = ref_store.load_branch(repo_id, branch).await
         && prev.full_clonepack.commit == commit
         && !prev.full_clonepack.manifest.is_empty()
@@ -4357,7 +4414,7 @@ async fn reuse_existing_build(
                 .as_ref()
                 .is_some_and(|s| s == "full history building" || s == "archive building");
         if !prev.archive_chunks.is_empty() || archive_in_progress {
-            return Some(prev);
+            return Ok(Some(prev));
         }
     }
     if let Ok(Some(mut built)) = ref_store.load_build(repo_id, commit).await {
@@ -4376,10 +4433,10 @@ async fn reuse_existing_build(
             .ok()
             .map(|d| d.as_secs());
         built.generation = None;
-        let _ = ref_store.save_branch(repo_id, branch, &built).await;
-        return Some(built);
+        ref_store.save_branch(repo_id, branch, &built).await?;
+        return Ok(Some(built));
     }
-    None
+    Ok(None)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4484,7 +4541,7 @@ async fn do_sync(
             .unwrap_or(Ok(None))
         };
         if let Ok(Some(tip)) = tip
-            && let Some(prev) = reuse_existing_build(ref_store, repo_id, branch, &tip).await
+            && let Some(prev) = reuse_existing_build(ref_store, repo_id, branch, &tip).await?
         {
             info!(
                 "sync no-op (ls-remote): {} already current at {} (no fetch)",
@@ -4575,7 +4632,7 @@ async fn do_sync(
     // the async worker's transient "building" status. (It does *not* require the
     // archive sub-phase to be done — a files-mode client re-resolves until the
     // archive is ready, so reusing an archive-pending build is safe.)
-    if let Some(prev) = reuse_existing_build(ref_store, repo_id, branch, &commit).await {
+    if let Some(prev) = reuse_existing_build(ref_store, repo_id, branch, &commit).await? {
         info!(
             "sync no-op: {} already current at {} (reusing prior clonepack)",
             repo_id.storage_key(),
@@ -5717,7 +5774,16 @@ async fn post_build_freshness_recheck(
         return;
     }
 
-    let credential = state.broker.fetch_credential(repo_id, None);
+    let credential = match state.broker.fetch_credential(repo_id, None) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(
+                "recheck: credential fetch for {} failed: {e:#}",
+                repo_id.storage_key()
+            );
+            return;
+        }
+    };
 
     // One ls-remote round-trip, under the same cap as a real fetch. Bounded by a
     // timeout: a hung upstream must not pin a fetch permit on this background path.
@@ -5747,11 +5813,13 @@ async fn post_build_freshness_recheck(
     // The tip moved during the build. If a concurrent build already produced it,
     // reuse_existing_build re-points the branch and we're caught up; otherwise
     // enqueue one build of the current tip (coalesced if one already started).
-    if reuse_existing_build(&state.ref_store, repo_id, branch, &tip)
-        .await
-        .is_some()
-    {
-        return;
+    match reuse_existing_build(&state.ref_store, repo_id, branch, &tip).await {
+        Ok(Some(_)) => return,
+        Ok(None) => {}
+        Err(e) => warn!(
+            "post-build re-check: reuse lookup for {} failed: {e:#}",
+            repo_id.storage_key()
+        ),
     }
     info!(
         "post-build re-check: {} tip moved to {}; building latest",
@@ -5779,7 +5847,10 @@ async fn enqueue_recheck_build(
     branch: &str,
     recheck: u32,
 ) -> Result<(), String> {
-    let credential = state.broker.fetch_credential(repo_id, None);
+    let credential = state
+        .broker
+        .fetch_credential(repo_id, None)
+        .map_err(|e| e.to_string())?;
     enqueue_direct_build(
         state,
         BuildJob {
@@ -5794,6 +5865,9 @@ async fn enqueue_recheck_build(
 }
 
 async fn enqueue_direct_build(state: &ServerState, job: BuildJob) -> Result<(), String> {
+    // Count metrics off the outcome so the queue-depth gauge stays balanced: only
+    // a genuinely new job bumps it (and its completion decrements it). A coalesced
+    // enqueue drains no job, so it must not touch the gauge.
     match state.build_queue.enqueue(job).await {
         Ok(enq) => match enq.outcome {
             EnqueueOutcome::Enqueued => {
@@ -5955,7 +6029,16 @@ pub async fn poll_once(state: &ServerState) -> usize {
             let provider_ls = provider.clone();
             let repo_ls = repo_id.clone();
             let branch_ls = branch.clone();
-            let credential = state.broker.fetch_credential(&repo_id, None);
+            let credential = match state.broker.fetch_credential(&repo_id, None) {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!(
+                        "poll: credential fetch for {} failed: {e:#}",
+                        repo_id.storage_key()
+                    );
+                    continue;
+                }
+            };
             let tip = {
                 let _permit = fetch_semaphore()
                     .acquire()
@@ -5971,11 +6054,13 @@ pub async fn poll_once(state: &ServerState) -> usize {
                 continue; // unknown ref / probe failed
             };
             // Already built at this tip (branch-scoped, then commit-keyed)? Skip.
-            if reuse_existing_build(&state.ref_store, &repo_id, &branch, &tip)
-                .await
-                .is_some()
-            {
-                continue;
+            match reuse_existing_build(&state.ref_store, &repo_id, &branch, &tip).await {
+                Ok(Some(_)) => continue,
+                Ok(None) => {}
+                Err(e) => warn!(
+                    "poll: reuse lookup for {} failed: {e:#}",
+                    repo_id.storage_key()
+                ),
             }
             // Tip moved and isn't built — trigger a build (coalesces if one is
             // already in flight for this key).
@@ -6735,6 +6820,13 @@ mod tests {
         assert!(visibility_is_private(&h));
         h.insert("x-ripclone-visibility", HeaderValue::from_static("public"));
         assert!(!visibility_is_private(&h));
+        h.insert("x-ripclone-visibility", HeaderValue::from_static("wat"));
+        assert!(visibility_is_private(&h));
+        h.insert(
+            "x-ripclone-visibility",
+            HeaderValue::from_bytes(&[0xff]).unwrap(),
+        );
+        assert!(visibility_is_private(&h));
     }
 
     /// A canned [`AccessVerifier`] for the authz wiring tests.
@@ -7012,7 +7104,9 @@ mod tests {
             .unwrap();
 
         // A fresh branch bar at X reuses foo's build and is re-pointed at it.
-        let reused = reuse_existing_build(&store, &rid, "bar", "X").await;
+        let reused = reuse_existing_build(&store, &rid, "bar", "X")
+            .await
+            .unwrap();
         assert_eq!(reused.expect("reuse").commit, "X");
         assert_eq!(
             store
@@ -7034,7 +7128,9 @@ mod tests {
             .save_branch(&rid, "main", &complete("Y", 5_000, 100))
             .await
             .unwrap();
-        let reused = reuse_existing_build(&store, &rid, "main", "X").await;
+        let reused = reuse_existing_build(&store, &rid, "main", "X")
+            .await
+            .unwrap();
         assert_eq!(reused.expect("reuse").commit, "X");
         assert_eq!(
             store
