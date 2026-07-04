@@ -36,6 +36,14 @@ ignore = [
   { id = "RUSTSEC-2026-0098", reason = "webpki URI name-constraint accept; name-constrained CAs not in our trust path; via libsql rustls 0.22" },
   { id = "RUSTSEC-2026-0099", reason = "webpki wildcard name-constraint accept; name-constrained CAs not in our trust path; via libsql rustls 0.22" },
   { id = "RUSTSEC-2026-0104", reason = "webpki CRL-parse panic (DoS); reachable only when parsing attacker CRLs, which we don't; via libsql rustls 0.22" },
+
+  # quick-xml 0.40.1 via s3 0.1.36. No patched s3 release exists; quick-xml 0.41
+  # is out but s3's version requirement does not accept it. The crate is only
+  # used to parse S3 ListBuckets/ListObjectsV2 responses from operator-configured
+  # endpoints (not untrusted internet XML). Triaged 2026-07-04; revisit when s3
+  # updates its quick-xml bound.
+  { id = "RUSTSEC-2026-0194", reason = "quick-xml duplicate-attribute quadratic check via s3; no upstream s3 fix; S3 XML from configured endpoints" },
+  { id = "RUSTSEC-2026-0195", reason = "quick-xml NsReader namespace allocation DoS via s3; no upstream s3 fix; S3 XML from configured endpoints" },
 ]
 
 [bans]
