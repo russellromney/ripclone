@@ -75,6 +75,11 @@ All decided 2026-07-03.
   is the trial. Sponsorship (already built) is how people support the commons.
   Self-host free forever. One breath: "Public repos: free. Your repos and your
   agents: $3. Run it yourself: free."
+- **D8 Clone default (decided 2026-07-03, H1 discussion).** `ripclone clone` =
+  **full editable clone — git-parity semantics** (today's default is --depth 1).
+  Made viable by D4: eager-on-add prebuilds full history, so the default path is the
+  warm 10× path. `--depth 1` stays as the explicit speed knob for CI/agents.
+  Implementation rides C3 (item 4); docs/benchmark copy follow (F5, S0/S1).
 
 ### Provider readiness matrix (per D3)
 
@@ -502,6 +507,10 @@ data rows. ~40 lines of design purity; skip without guilt.
    self-host auth flow (or error with the exact right next command); make the 401 hint
    say `ripclone login` for the cloud, and drop cloud-specific plan/token hints
    (client.rs:68-104) when the server != the cloud default.
+4. D8: flip the `clone` default from --depth 1 to full history (git-parity). --depth 1
+   remains the documented speed knob. Update the default-mode env/docs and any test
+   that assumed the depth-1 default; the /start page and README examples then read
+   `ripclone clone owner/repo` with no flags, honestly.
 Run scripts/ci.sh test; paste `ripclone --help` output in the summary.
 ```
 
