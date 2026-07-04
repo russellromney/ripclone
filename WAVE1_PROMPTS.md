@@ -9,9 +9,9 @@
 > Session discipline (applies to all):
 > - Finish a node completely (checks green) → commit → then start the next.
 > - TEST ECONOMY (OSS sessions): per node, run fmt + clippy + only the test files
->   your node touches. Run the FULL `scripts/ci.sh test` once, at session end,
->   before the final summary (+ `flake` only where a node's spec demands it).
->   GitHub CI runs the full suite on the PR regardless — that's the real gate.
+>   your node touches. NO local full-suite or flake runs at all — GitHub CI runs
+>   the full suite + flake guard on every PR push; that's the gate. Fix what CI
+>   finds.
 > - BUILD CACHE: `export RUSTC_WRAPPER=sccache` at session start (worktrees keep
 >   their own target dirs; sccache shares the compiled artifacts). If the machine
 >   is saturated, also `export CARGO_BUILD_JOBS=4`.
@@ -126,7 +126,7 @@ Your nodes, in this order (LAUNCH_PLAN.md → Track B):
 Repo: this worktree (turbogit).
 FINAL STEP regardless of how far you got: rebase onto latest origin/main, resolve
 (your diff is mostly deletions — keep their changes, keep your deletions), rerun
-scripts/ci.sh lint test flake.
+fmt + clippy. PR CI runs the full suite + flake guard.
 ```
 
 ## Session 4 · Kimi · ../wt-tests · branch wave1/tests-docs
