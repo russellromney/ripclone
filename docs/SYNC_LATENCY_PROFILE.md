@@ -61,3 +61,78 @@ hybrid top-up clone idea gets promoted into launch scope.
 - `oven-sh/bun` and `pandas-dev/pandas`: not measured in this local run. The
   fixture validates the instrumentation; the tripwire decision requires the
   same measurement on a benchmark host against live GitHub origins.
+
+## 2026-07-04 Fly-to-Fly real-repo incremental verdict
+
+Measured with `CLIENT_APP=ripclone-client-dev` issuing `/sync` POSTs and
+readiness probes to `ripclone-server-dev` (`https://ripclone-server-dev.fly.dev`).
+Local orchestration still handled GitHub fork setup, server log collection, and
+dev-bucket metadata cleanup.
+
+The verdict runs used real GitHub forks. Each fork was reset to the pinned
+commit, warmed to a full build, then advanced by one synthetic commit per
+measured run. Stage values below are medians of three measured incremental
+pushes.
+
+Cold full-mirror samples were intentionally kept out of the verdict table after
+they proved dominated by the server's live GitHub mirror clone/index-pack path:
+the bun fork warm-up spent 419,759 ms in mirror fetch, and the pandas fork
+warm-up spent 229,858 ms. That behavior is useful evidence about cold ingest,
+but it is not the B4 tripwire, which is incremental push-to-clonable latency.
+
+Cold fresh runs are made "fresh" by deleting the dev server's local bare mirror
+and S3 ref metadata before the run. CAS objects from prior benchmarking remain,
+so upload timings are lower bounds, not first-time object-storage uploads.
+
+### `oven-sh/bun` at `b2aa0d5d94e3a42d88d4c58e4488c07e67b0f037`
+
+| Stage | Incremental ms |
+|-------|---------------:|
+| mirror fetch | 680 |
+| commit graph | 82 |
+| HEAD packs | 61 |
+| skeleton build | 217 |
+| files table | 161 |
+| prebuilt index | 329 |
+| upload p1 | 366 |
+| ref publish | 116 |
+| **push->clonable** | **1,795** |
+
+| Artifact class | Bytes |
+|----------------|------:|
+| head packs | 65,256,171 |
+| history packs | 0 |
+| archive chunks | 0 |
+| metadata | 17,841,490 |
+| **total** | **83,097,661** |
+| upstream repo size | 642,237,657 |
+| **amplification** | **0.13x** |
+
+### `pandas-dev/pandas` at `v2.2.2` (`d9cdd2ee5a58015ef6f4d15c7226110c9aab8140`)
+
+| Stage | Incremental ms |
+|-------|---------------:|
+| mirror fetch | 912 |
+| commit graph | 62 |
+| HEAD packs | 24 |
+| skeleton build | 70 |
+| files table | 45 |
+| prebuilt index | 95 |
+| upload p1 | 146 |
+| ref publish | 150 |
+| **push->clonable** | **1,415** |
+
+| Artifact class | Bytes |
+|----------------|------:|
+| head packs | 15,485,371 |
+| history packs | 0 |
+| archive chunks | 0 |
+| metadata | 2,265,065 |
+| **total** | **17,750,436** |
+| upstream repo size | 441,294,303 |
+| **amplification** | **0.04x** |
+
+TRIPWIRE: incremental push->clonable p50 = 1,795 ms for bun / 1,415 ms for
+pandas -- UNDER 5 s.
+
+AMPLIFICATION: 0.13x repo size (bun) / 0.04x repo size (pandas).

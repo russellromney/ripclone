@@ -35,6 +35,13 @@ This directory contains standalone benchmarks and verification scripts. They ass
   fast-moving branch from invalidating later rates.
 
 - **`fly_shaped_benchmark.sh`** — single-rate helper used by `run_shaped_sweep.sh`.
+- **`sync_latency.sh`** — B4 sync-latency and storage-amplification harness.
+  By default it starts a local release server; set `RIPCLONE_URL` for the Fly
+  server and `CLIENT_APP=ripclone-client-dev` to run `/sync` POSTs and
+  readiness probes from the Fly client app. Remote incremental runs reset a
+  real GitHub fork to `BENCH_REF`, push one synthetic commit per run, and read
+  phase timings plus amplification from the server's `sync-bench` log lines.
+  `COLD_RUNS` and `INCREMENTAL_RUNS` can override `RUNS` for the two phases.
 - **`plot_ratios.py`** — generates the `shaped_ratios.png` graph from the sweep data.
 
 ## Local / micro benchmarks
@@ -57,6 +64,8 @@ Most scripts read:
 - `REPO` — target repo in `owner/name` form (default `oven-sh/bun`).
 - `RIPCLONE_SERVER_TOKEN` — bearer token for the server. Falls back to the deprecated `RIPCLONE_TOKEN`.
 - `RIPCLONE_URL` — server URL for remote/Fly benchmarks.
+- `CLIENT_APP` — optional Fly client app used by `sync_latency.sh` for
+  Fly-to-Fly `/sync` POSTs and readiness probes.
 - `BENCH_REF` — tag/commit/branch to sync and benchmark (default: repo default branch).
 - `GIT_REF` — branch/tag that the native `git clone` baseline should check out, used when `BENCH_REF` is a commit SHA.
 - `SHAPED` — set to `0` to disable traffic shaping.
