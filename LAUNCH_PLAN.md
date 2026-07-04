@@ -303,6 +303,9 @@ debug; the full e2e suite passing unchanged is PR CI's job, not a local run.
 ```
 
 **B4. Profile phase-1 sync latency** — deps: none — Kimi executes, Fable analyzes — turbogit
+MEASUREMENT PROCEDURE RULE: fork pushes go to a dedicated branch
+(ripclone-bench-<date>) with [skip ci] in the message — NEVER the fork's main
+(push-triggered workflows run on forks; don't light up bun's CI).
 STATUS: instrumentation MERGED (#90); the measurement run is STILL OPEN — bun + pandas,
 cold + incremental, benchmark host, live origins, results appended to
 docs/SYNC_LATENCY_PROFILE.md. Blocks: the hybrid-top-up tripwire decision, B6 item 1,
@@ -1126,6 +1129,14 @@ best-effort, files mode not upstream-verifiable. All parked as issues, none bloc
   "as performant as possible" stays true after B6's work is done.
 - Cross-process re-check cap + adaptive polling (existing deferred memory items).
 - Bitbucket provider; Postgres/MySQL back to "supported" with a real support story.
+- **Fork overlay (audited 2026-07-04):** today a fork gets its own full `--mirror`
+  clone + full build (git.rs:1411); only STORAGE dedupes (global CAS + all-repo GC
+  reachable set — already safe). The feature: fetch a fork's target ref into the
+  upstream's mirror (`+refs/heads/X:refs/ripclone/forks/<fork>/X`), skip builds for
+  commits that already have artifacts, delta-build when N-ahead. Not launch scope —
+  the tiered add policy bounds the duplicate-build cost. NOTE: the "internal
+  main#<sha> keys reach git" claim was checked and is FALSE (only log strings);
+  no typed-ref refactor needed.
 - **Cloud GitLab.com support — the named #1 fast-follow** (huge OSS/GitLab-native
   crowd; the obvious next market after GitHub). Because H0 built the additive seam, this
   is: implement `GitProvider` for GitLab (group access token for the connection, GitLab
