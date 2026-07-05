@@ -1366,7 +1366,7 @@ pub fn sync_bare_mirror<P: AsRef<Path>>(
     // therefore never pass `--depth`: a depth-limited fetch would re-shallow an
     // already-complete mirror. depth=1 ("head") clones are still cheap — they're
     // a content-addressed subset built at pack time, not a shallower mirror.
-    if let Some(rev) = rev {
+    if let Some(rev) = rev.filter(|rev| is_full_hex_object_id(rev)) {
         sync_bare_mirror_rev(mirror_dir.as_ref(), &url, &git_args, branch, rev)?;
     } else if mirror_dir.as_ref().exists() {
         // A `--mirror` clone is configured with `+refs/*:refs/*` (and prunes), so
@@ -1512,6 +1512,10 @@ fn rev_internal_ref_name(rev: &str) -> String {
             }
         })
         .collect()
+}
+
+fn is_full_hex_object_id(rev: &str) -> bool {
+    (rev.len() == 40 || rev.len() == 64) && rev.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 fn branch_fetch_refspec(branch: &str) -> Option<String> {
@@ -1844,6 +1848,43 @@ mod tests {
         assert!(
             resolve_commit(&mirror, "other").is_err(),
             "rev sync must not fetch unrelated branches"
+        );
+    }
+
+    #[test]
+    fn sync_bare_mirror_non_sha_rev_keeps_full_mirror_fetch() {
+        use crate::provider::{ProviderRegistry, RepoId};
+        let base = tempfile::tempdir().unwrap();
+        let origin = base.path().join("acme").join("widget.git");
+        std::fs::create_dir_all(origin.parent().unwrap()).unwrap();
+        let src = crate::test_fixture::init_bare(&origin);
+        let commit = crate::test_fixture::commit(&src, &[("README.md", b"hi")]);
+
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&origin)
+                .args(["update-ref", "refs/heads/other", &commit])
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let registry = ProviderRegistry::new();
+        let provider = registry.default_provider();
+        let repo_id = RepoId::github("acme/widget");
+        let mirror = base.path().join("mirror-non-sha-rev.git");
+
+        let _env = ORIGIN_BASE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("RIPCLONE_ORIGIN_BASE", base.path()) };
+        sync_bare_mirror(&mirror, provider, &repo_id, "main", Some("HEAD~0"), None).unwrap();
+        unsafe { std::env::remove_var("RIPCLONE_ORIGIN_BASE") };
+
+        assert_eq!(resolve_commit(&mirror, "main").unwrap(), commit);
+        assert_eq!(
+            resolve_commit(&mirror, "other").unwrap(),
+            commit,
+            "non-SHA revs must keep the full mirror fetch path"
         );
     }
 

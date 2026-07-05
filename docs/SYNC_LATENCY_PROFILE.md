@@ -76,6 +76,11 @@ metadata were cleared before each repo sequence. CAS objects from prior
 benchmarking can still remain in object storage, so upload timings remain lower
 bounds rather than first-time object-storage upload costs.
 
+Amplification below is the target ref's phase-1 artifact bytes reported by the
+`sync-bench` line divided by the server's targeted bare-mirror size for that
+target commit. It is not the full warm-family bucket total across parent and
+target refs.
+
 ### `oven-sh/bun`
 
 Parent `86d32c8bb66d503ccbcc1d2e40d25b11679eeede`; target

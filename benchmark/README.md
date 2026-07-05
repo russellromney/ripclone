@@ -119,6 +119,9 @@ fly machine stop d8d50e0f5e1358 -a ripclone-server-dev
 fly machine stop 2862176a914438 -a ripclone-client-dev
 ```
 
+The `performance-8x` / 16 GiB VM sizing is only for the dev benchmark app. Do
+not leave it running after a measurement session.
+
 ## Local / micro benchmarks
 
 - **`latency.sh`** — benchmark through the local latency/bandwidth shaping proxy.
