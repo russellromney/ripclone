@@ -1129,14 +1129,30 @@ best-effort, files mode not upstream-verifiable. All parked as issues, none bloc
   "as performant as possible" stays true after B6's work is done.
 - Cross-process re-check cap + adaptive polling (existing deferred memory items).
 - Bitbucket provider; Postgres/MySQL back to "supported" with a real support story.
-- **Fork overlay (audited 2026-07-04):** today a fork gets its own full `--mirror`
-  clone + full build (git.rs:1411); only STORAGE dedupes (global CAS + all-repo GC
-  reachable set — already safe). The feature: fetch a fork's target ref into the
-  upstream's mirror (`+refs/heads/X:refs/ripclone/forks/<fork>/X`), skip builds for
-  commits that already have artifacts, delta-build when N-ahead. Not launch scope —
-  the tiered add policy bounds the duplicate-build cost. NOTE: the "internal
-  main#<sha> keys reach git" claim was checked and is FALSE (only log strings);
-  no typed-ref refactor needed.
+- **Fork overlay — design sketched 2026-07-04 (code-audited; post-launch).**
+  Today a fork gets its own full `--mirror` + full build (git.rs:1411); storage
+  already dedupes (global CAS + all-repo GC reachability — proven safe). Design:
+  1. IDENTITY IS DECLARED: cloud add-preflight already gets fork+parent from the
+     GitHub call; self-host uses `add --fork-of upstream/repo`; no hint → today's
+     behavior. added_repos gains `mirror_family`.
+  2. ONE MIRROR PER FAMILY: fork refs fetch into the UPSTREAM's mirror as
+     `+refs/heads/<b>:refs/ripclone/forks/<fork-key>/<b>` — git's fetch negotiation
+     is the dedupe engine (transfers only unique objects). Fork-before-upstream →
+     clone the upstream mirror first. Shares the upstream MirrorLock. Un-add =
+     delete the namespaced refs.
+  3. REF/SERVING UNCHANGED: fork stays a first-class added repo (own RefInfo,
+     authz, TTL, cloud row) — only mirror residence + build sourcing change.
+  4. BUILD REUSE: tip-equals a family-built commit → RefInfo pointer-copies the
+     artifact hashes, zero build (GC-safe: union reachability). N-ahead → existing
+     incremental machinery with the parent lookup generalized to the family (v1:
+     upstream default branch; later: commit→clonepack index in the metadata store).
+  5. RIDERS: private forks already safe (per-repo ref authz + presigned content;
+     ahead-commit artifacts referenced only by the fork's RefInfo). Tiered add
+     policy prices family forks at DELTA cost, not repo size.
+  Phasing: P1 detect + overlay fetch + tip-equals copy · P2 family delta builds ·
+  P3 family-mirror repack maintenance + policy tweak.
+  (Checked and rejected: "internal main#<sha> keys reach git" — log strings only;
+  no typed-ref refactor.)
 - **Cloud GitLab.com support — the named #1 fast-follow** (huge OSS/GitLab-native
   crowd; the obvious next market after GitHub). Because H0 built the additive seam, this
   is: implement `GitProvider` for GitLab (group access token for the connection, GitLab
