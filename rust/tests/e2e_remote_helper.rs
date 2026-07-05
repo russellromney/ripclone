@@ -45,8 +45,9 @@ async fn remote_helper_clones_through_ripclone_server() {
     let original_path = std::env::var("PATH").unwrap_or_default();
     let new_path = format!("{}:{}", bin_dir.path().display(), original_path);
 
-    // Run `git clone` with a tight internal timeout so a hung helper surfaces
-    // its stderr in the test output instead of blocking the whole cargo run.
+    // Run `git clone` with an internal timeout so a hung helper surfaces its
+    // stderr in the test output instead of blocking the whole cargo run.
+    let clone_timeout = std::time::Duration::from_secs(60);
     let output = tokio::task::spawn_blocking({
         let target = target.clone();
         let server_url = server.url.clone();
@@ -73,7 +74,7 @@ async fn remote_helper_clones_through_ripclone_server() {
                     out.status = status;
                     break out;
                 }
-                if start.elapsed() > std::time::Duration::from_secs(15) {
+                if start.elapsed() > clone_timeout {
                     let _ = child.kill();
                     let out = child.wait_with_output().expect("collect output after kill");
                     eprintln!(

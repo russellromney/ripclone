@@ -41,4 +41,4 @@ ENV RUST_LOG=info
 
 EXPOSE 8000
 
-CMD ["ripclone-server"]
+CMD ["ripclone-server", "--cas-dir", "/data/cache", "--repo-root", "/data/repos"]
