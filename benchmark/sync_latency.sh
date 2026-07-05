@@ -242,10 +242,11 @@ if '$bench_file' and os.path.exists('$bench_file') and os.path.getsize('$bench_f
     with open('$bench_file') as f:
         bench = json.load(f)
     report['storage_amplification'] = bench.get('storage_amplification')
-    # If the response is missing a phase key, fall back to the bench line.
+    # The HTTP response can come from a retry that observes/reuses a just-finished
+    # build. Prefer the build's sync-bench line for timings when it is available.
     bench_phases = bench.get('phases', {})
     for k, v in bench_phases.items():
-        if report['phases'].get(k) is None and v is not None:
+        if v is not None:
             report['phases'][k] = v
 else:
     report['storage_amplification'] = None
@@ -312,7 +313,7 @@ run_incremental_local() {
 
     printf 'B4 synthetic commit run %d\n' "$run" > "$w/b4-measure-$run.txt"
     git -C "$w" add "b4-measure-$run.txt"
-    git -C "$w" commit -q -m "B4 synthetic commit run $run"
+    git -C "$w" commit -q -m "B4 synthetic commit run $run [skip ci]"
     git -C "$w" push -q origin "$FORK_BRANCH"
     new_commit=$(git -C "$w" rev-parse HEAD)
     echo "  new commit: $new_commit" >&2
@@ -536,7 +537,7 @@ run_incremental_remote() {
     echo "--- incremental run $run ---" >&2
     printf 'B4 synthetic commit run %d\n' "$run" > "$w/b4-measure-$run.txt"
     git -C "$w" add "b4-measure-$run.txt"
-    git -C "$w" commit -q -m "B4 synthetic commit run $run"
+    git -C "$w" commit -q -m "B4 synthetic commit run $run [skip ci]"
     git -C "$w" push -q origin "$FORK_BRANCH"
     new_commit=$(git -C "$w" rev-parse HEAD)
     echo "  new commit: $new_commit" >&2

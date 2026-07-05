@@ -44,6 +44,81 @@ This directory contains standalone benchmarks and verification scripts. They ass
   `COLD_RUNS` and `INCREMENTAL_RUNS` can override `RUNS` for the two phases.
 - **`plot_ratios.py`** — generates the `shaped_ratios.png` graph from the sweep data.
 
+## B4 sync-latency guide
+
+Use the `--at` path for B4 parent-to-target measurements. Sync the parent commit
+first, wait for the background full-history build to finish, then sync the
+target commit. This measures the one-commit-later phase-1 path without creating
+GitHub forks or triggering fork CI.
+
+Before running against Fly:
+
+```bash
+source ~/.zshrc
+export RIPCLONE_URL=https://ripclone-server-dev.fly.dev
+export RIPCLONE_SERVER_TOKEN=...
+export AWS_ACCESS_KEY_ID="$(soup secrets get --project ripclone --env production AWS_ACCESS_KEY_ID)"
+export AWS_SECRET_ACCESS_KEY="$(soup secrets get --project ripclone --env production AWS_SECRET_ACCESS_KEY)"
+export AWS_ENDPOINT_URL_S3=https://t3.storage.dev
+export AWS_REGION=auto
+export BUCKET_NAME=ripclone-cas-iad-sjc
+export TOKEN_HASH="$(printf '%s' "$RIPCLONE_SERVER_TOKEN" | shasum -a 256 | awk '{print $1}')"
+fly machine start d8d50e0f5e1358 -a ripclone-server-dev
+```
+
+For each repo, clear local server state and S3 ref metadata, then call `/sync`
+with `rev=`:
+
+```bash
+repo=oven-sh/bun
+parent=86d32c8bb66d503ccbcc1d2e40d25b11679eeede
+target=b2aa0d5d94e3a42d88d4c58e4488c07e67b0f037
+owner="${repo%%/*}"
+name="${repo##*/}"
+
+fly ssh console -a ripclone-server-dev -C \
+  "/bin/bash -lc 'rm -rf /data/repos /data/cache /data/benchclones /data/bench-origins; mkdir -p /data/repos /data/cache'"
+
+for key in \
+  "s3://$BUCKET_NAME/refs/$owner/$name.json" \
+  "s3://$BUCKET_NAME/refs/$owner/$name/" \
+  "s3://$BUCKET_NAME/repo-config/$owner/$name.json" \
+  "s3://$BUCKET_NAME/repo-config/$owner/$name/"; do
+  aws s3 rm "$key" --recursive >/dev/null 2>&1 || true
+done
+
+fly logs -a ripclone-server-dev > /tmp/b4-sync.log 2>&1 &
+logs_pid=$!
+
+curl -sS -X POST \
+  -H "Authorization: Ripclone $TOKEN_HASH" \
+  "$RIPCLONE_URL/v1/repos/github/$repo/sync?rev=$parent"
+
+# Wait until /tmp/b4-sync.log contains "full clone ready for ${parent:0:7}".
+
+curl -sS -X POST \
+  -H "Authorization: Ripclone $TOKEN_HASH" \
+  "$RIPCLONE_URL/v1/repos/github/$repo/sync?rev=$target"
+
+kill "$logs_pid" 2>/dev/null || true
+```
+
+Read the `{"kind":"sync-bench",...}` JSON lines from the log. The target
+commit's `phases.publish_p1_ms` is the B4 tripwire value; `storage_amplification`
+contains the amplification split.
+
+For fork-based incremental testing, use `sync_latency.sh` with `CLIENT_APP`.
+That path intentionally creates a real fork push, so use a dedicated bench
+branch and include `[skip ci]` in synthetic commit messages if the fork has CI
+enabled. The fork path is not needed for the B4 parent-to-target `--at` verdict.
+
+Always stop oversized Fly machines after the run:
+
+```bash
+fly machine stop d8d50e0f5e1358 -a ripclone-server-dev
+fly machine stop 2862176a914438 -a ripclone-client-dev
+```
+
 ## Local / micro benchmarks
 
 - **`latency.sh`** — benchmark through the local latency/bandwidth shaping proxy.

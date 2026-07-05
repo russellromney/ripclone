@@ -1224,6 +1224,7 @@ async fn git_info_refs_inner(
         &provider,
         &repo_id,
         "HEAD",
+        None,
         credential.as_ref(),
     )
     .await
@@ -1320,6 +1321,7 @@ async fn git_upload_pack_inner(
         &provider,
         &repo_id,
         "HEAD",
+        None,
         credential.as_ref(),
     )
     .await
@@ -1700,12 +1702,14 @@ async fn ensure_mirror(
     provider: &ProviderInstance,
     repo_id: &RepoId,
     branch: &str,
+    rev: Option<&str>,
     credential: Option<&secrecy::SecretString>,
 ) -> Result<()> {
     let mirror_dir = mirror_dir.to_path_buf();
     let provider = provider.clone();
     let repo_id = repo_id.clone();
     let branch = branch.to_string();
+    let rev = rev.map(str::to_string);
     let credential = credential.cloned();
     // Same process-global fetch cap as the build path.
     let _fetch_permit = fetch_semaphore()
@@ -1718,6 +1722,7 @@ async fn ensure_mirror(
             &provider,
             &repo_id,
             &branch,
+            rev.as_deref(),
             credential.as_ref(),
         )
     })
@@ -1965,6 +1970,7 @@ async fn get_ref_inner(
             &provider,
             &repo_id,
             &branch,
+            params.rev.as_deref(),
             credential.as_ref(),
         )
         .await
@@ -4548,6 +4554,7 @@ async fn do_sync(
     let provider_sync = provider.clone();
     let repo_id_sync = repo_id.clone();
     let branch_sync = branch.to_string();
+    let rev_sync = at_rev.map(str::to_string);
     let credential_sync = credential.cloned();
     // Cap concurrent upstream fetches across the process (bandwidth + upstream
     // abuse limits). Held only across the fetch, not the build.
@@ -4561,6 +4568,7 @@ async fn do_sync(
             &provider_sync,
             &repo_id_sync,
             &branch_sync,
+            rev_sync.as_deref(),
             credential_sync.as_ref(),
         )
     })
@@ -5744,7 +5752,7 @@ pub async fn process_build_job(
         job.credential.as_ref(),
         &repo_config,
         &lock,
-        if job.recheck == 0 {
+        if job.recheck == 0 && at_rev.is_none() {
             Some(Phase2FailureAction {
                 state: state.clone(),
                 credential: job.credential.clone(),

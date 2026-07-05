@@ -62,77 +62,79 @@ hybrid top-up clone idea gets promoted into launch scope.
   fixture validates the instrumentation; the tripwire decision requires the
   same measurement on a benchmark host against live GitHub origins.
 
-## 2026-07-04 Fly-to-Fly real-repo incremental verdict
+## 2026-07-04 Fly real-repo `--at` parent-to-target verdict
 
-Measured with `CLIENT_APP=ripclone-client-dev` issuing `/sync` POSTs and
-readiness probes to `ripclone-server-dev` (`https://ripclone-server-dev.fly.dev`).
-Local orchestration still handled GitHub fork setup, server log collection, and
-dev-bucket metadata cleanup.
+Measured on `ripclone-server-dev` (`performance-8x`, 16 GiB) against live
+GitHub upstream repos. The benchmark warmed the server by syncing the parent
+commit with `?rev=<parent>`, waited for the background full-history build to
+settle, then synced the target commit with `?rev=<target>`. This exercises the
+same one-commit-later shape as an incremental push without creating GitHub
+forks or triggering fork CI.
 
-The verdict runs used real GitHub forks. Each fork was reset to the pinned
-commit, warmed to a full build, then advanced by one synthetic commit per
-measured run. Stage values below are medians of three measured incremental
-pushes.
+The server's local `/data/repos` and `/data/cache` directories plus S3 ref
+metadata were cleared before each repo sequence. CAS objects from prior
+benchmarking can still remain in object storage, so upload timings remain lower
+bounds rather than first-time object-storage upload costs.
 
-Cold full-mirror samples were intentionally kept out of the verdict table after
-they proved dominated by the server's live GitHub mirror clone/index-pack path:
-the bun fork warm-up spent 419,759 ms in mirror fetch, and the pandas fork
-warm-up spent 229,858 ms. That behavior is useful evidence about cold ingest,
-but it is not the B4 tripwire, which is incremental push-to-clonable latency.
+### `oven-sh/bun`
 
-Cold fresh runs are made "fresh" by deleting the dev server's local bare mirror
-and S3 ref metadata before the run. CAS objects from prior benchmarking remain,
-so upload timings are lower bounds, not first-time object-storage uploads.
+Parent `86d32c8bb66d503ccbcc1d2e40d25b11679eeede`; target
+`b2aa0d5d94e3a42d88d4c58e4488c07e67b0f037`.
 
-### `oven-sh/bun` at `b2aa0d5d94e3a42d88d4c58e4488c07e67b0f037`
+| Stage | Parent ms | Target ms |
+|-------|----------:|----------:|
+| mirror fetch | 25,238 | 689 |
+| commit graph | 309 | 117 |
+| HEAD packs | 1,367 | 1,042 |
+| skeleton build | 387 | 304 |
+| files table | 1,368 | 1,042 |
+| prebuilt index | 279 | 263 |
+| upload p1 | 1,057 | 1,005 |
+| ref publish | 171 | 141 |
+| **push->clonable (publish_p1_ms)** | **28,707** | **3,582** |
 
-| Stage | Incremental ms |
-|-------|---------------:|
-| mirror fetch | 680 |
-| commit graph | 82 |
-| HEAD packs | 61 |
-| skeleton build | 217 |
-| files table | 161 |
-| prebuilt index | 329 |
-| upload p1 | 366 |
-| ref publish | 116 |
-| **push->clonable** | **1,795** |
+Target storage amplification:
 
 | Artifact class | Bytes |
 |----------------|------:|
-| head packs | 65,256,171 |
+| head packs | 65,255,440 |
 | history packs | 0 |
 | archive chunks | 0 |
-| metadata | 17,841,490 |
-| **total** | **83,097,661** |
-| upstream repo size | 642,237,657 |
-| **amplification** | **0.13x** |
+| metadata | 17,841,398 |
+| **total** | **83,096,838** |
+| upstream repo size | 345,937,287 |
+| **amplification** | **0.24x** |
 
-### `pandas-dev/pandas` at `v2.2.2` (`d9cdd2ee5a58015ef6f4d15c7226110c9aab8140`)
+### `pandas-dev/pandas`
 
-| Stage | Incremental ms |
-|-------|---------------:|
-| mirror fetch | 912 |
-| commit graph | 62 |
-| HEAD packs | 24 |
-| skeleton build | 70 |
-| files table | 45 |
-| prebuilt index | 95 |
-| upload p1 | 146 |
-| ref publish | 150 |
-| **push->clonable** | **1,415** |
+Parent `98aeac9b1b559178ef4f6a0a112a09b1741d11d1`; target
+`d9cdd2ee5a58015ef6f4d15c7226110c9aab8140` (`v2.2.2`).
+
+| Stage | Parent ms | Target ms |
+|-------|----------:|----------:|
+| mirror fetch | 24,162 | 278 |
+| commit graph | 448 | 152 |
+| HEAD packs | 288 | 331 |
+| skeleton build | 108 | 117 |
+| files table | 289 | 332 |
+| prebuilt index | 92 | 101 |
+| upload p1 | 651 | 364 |
+| ref publish | 144 | 195 |
+| **push->clonable (publish_p1_ms)** | **25,950** | **1,598** |
+
+Target storage amplification:
 
 | Artifact class | Bytes |
 |----------------|------:|
-| head packs | 15,485,371 |
+| head packs | 15,484,742 |
 | history packs | 0 |
 | archive chunks | 0 |
-| metadata | 2,265,065 |
-| **total** | **17,750,436** |
-| upstream repo size | 441,294,303 |
-| **amplification** | **0.04x** |
+| metadata | 2,265,126 |
+| **total** | **17,749,868** |
+| upstream repo size | 364,536,119 |
+| **amplification** | **0.05x** |
 
-TRIPWIRE: incremental push->clonable p50 = 1,795 ms for bun / 1,415 ms for
+TRIPWIRE: incremental push->clonable p50 = 3,582 ms for bun / 1,598 ms for
 pandas -- UNDER 5 s.
 
-AMPLIFICATION: 0.13x repo size (bun) / 0.04x repo size (pandas).
+AMPLIFICATION: 0.24x repo size (bun) / 0.05x repo size (pandas).
