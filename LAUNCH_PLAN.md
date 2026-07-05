@@ -303,13 +303,12 @@ debug; the full e2e suite passing unchanged is PR CI's job, not a local run.
 ```
 
 **B4. Profile phase-1 sync latency** — deps: none — Kimi executes, Fable analyzes — turbogit
-MEASUREMENT PROCEDURE RULE: fork pushes go to a dedicated branch
-(ripclone-bench-<date>) with [skip ci] in the message — NEVER the fork's main
-(push-triggered workflows run on forks; don't light up bun's CI).
-STATUS: instrumentation MERGED (#90); the measurement run is STILL OPEN — bun + pandas,
-cold + incremental, benchmark host, live origins, results appended to
-docs/SYNC_LATENCY_PROFILE.md. Blocks: the hybrid-top-up tripwire decision, B6 item 1,
-and B5's spec finalization. ~1 machine-hour, no code.
+STATUS: ✅ DONE (#92, 2026-07-05). Results in docs/SYNC_LATENCY_PROFILE.md.
+RESOLVED — incremental push→clonable p50 = 3.58s (bun) / 1.60s (pandas), UNDER 5s →
+**hybrid top-up clone stays POST-LAUNCH** (not promoted). Storage amplification sub-1×
+(0.24× bun / 0.05× pandas) → **storage is not a COGS constraint** ($3/seat margin
+holds). Side effect: #92 built the SHA-guarded targeted-rev fetch — the fork-overlay
+fetch primitive now exists. B6 item 1 and B5 spec can proceed.
 ```
 Goal: know where push→clonable time goes. Instrument the phase-1 build path
 (do_sync through the phase-1 publish in rust/src/server.rs) with per-stage timing
