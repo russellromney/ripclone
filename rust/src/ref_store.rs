@@ -6,7 +6,8 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
@@ -118,6 +119,17 @@ pub trait RefStore: Send + Sync {
         branch: &str,
         expected_commit: &str,
         status: &str,
+    ) -> Result<bool>;
+
+    /// Update only `last_accessed_at` to the current time when the stored ref
+    /// still points at `expected_commit`. Returns `false` when the row is absent
+    /// or has moved. Implementations must be atomic (read-modify-write with a
+    /// commit check) so a concurrent sync does not lose its newer metadata.
+    async fn touch_last_accessed_at(
+        &self,
+        repo_id: &RepoId,
+        branch: &str,
+        expected_commit: &str,
     ) -> Result<bool>;
 
     /// Delete the stored `RefInfo` for a branch (e.g. on a webhook
@@ -238,6 +250,38 @@ impl FileRefStore {
         Ok(true)
     }
 
+    async fn update_last_accessed_checked(
+        &self,
+        path: &Path,
+        expected_commit: &str,
+    ) -> Result<bool> {
+        let _guard = self.write_lock.lock().await;
+
+        let mut info: RefInfo = match tokio::fs::read(path).await {
+            Ok(data) => serde_json::from_slice(&data)
+                .with_context(|| format!("parse ref store {}", path.display()))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(anyhow::anyhow!("read ref store {}: {}", path.display(), e)),
+        };
+        if info.commit != expected_commit {
+            return Ok(false);
+        }
+
+        info.last_accessed_at = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_secs());
+        let data = serde_json::to_vec_pretty(&info).context("serialize RefInfo")?;
+        let tmp_path = path.with_extension("json.tmp");
+        tokio::fs::write(&tmp_path, data)
+            .await
+            .with_context(|| format!("write temp ref store {}", tmp_path.display()))?;
+        tokio::fs::rename(&tmp_path, path)
+            .await
+            .with_context(|| format!("rename {} to {}", tmp_path.display(), path.display()))?;
+        Ok(true)
+    }
+
     /// Path to the legacy HEAD ref file. Kept for backward compatibility with
     /// refs created before branch-specific storage.
     fn path(&self, repo_id: &RepoId) -> PathBuf {
@@ -344,6 +388,21 @@ impl RefStore for FileRefStore {
             self.branch_path(repo_id, branch)
         };
         self.update_status_checked(&path, expected_commit, status)
+            .await
+    }
+
+    async fn touch_last_accessed_at(
+        &self,
+        repo_id: &RepoId,
+        branch: &str,
+        expected_commit: &str,
+    ) -> Result<bool> {
+        let path = if branch == "HEAD" {
+            self.path(repo_id)
+        } else {
+            self.branch_path(repo_id, branch)
+        };
+        self.update_last_accessed_checked(&path, expected_commit)
             .await
     }
 
@@ -536,6 +595,38 @@ impl S3RefStore {
         }
         anyhow::bail!("S3 ref store {key}: gave up after repeated status-write conflicts")
     }
+
+    async fn update_last_accessed_keyed(&self, key: &str, expected_commit: &str) -> Result<bool> {
+        for attempt in 0..64 {
+            let (etag, mut info) = match self.storage.get_object(key).await {
+                Ok(Some((etag, existing_bytes))) => {
+                    let info: RefInfo = serde_json::from_slice(&existing_bytes)
+                        .with_context(|| format!("parse existing S3 ref store {key}"))?;
+                    (etag, info)
+                }
+                Ok(None) => return Ok(false),
+                Err(e) => return Err(e).with_context(|| format!("load S3 ref store {key}")),
+            };
+            if info.commit != expected_commit {
+                return Ok(false);
+            }
+            info.last_accessed_at = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .ok()
+                .map(|d| d.as_secs());
+            let data = serde_json::to_vec_pretty(&info).context("serialize RefInfo")?;
+            if self
+                .storage
+                .put_object_cas(key, &data, Some(&etag))
+                .await
+                .with_context(|| format!("write S3 ref store {key}"))?
+            {
+                return Ok(true);
+            }
+            tokio::time::sleep(Duration::from_millis((attempt.min(10) + 1) as u64)).await;
+        }
+        anyhow::bail!("S3 ref store {key}: gave up after repeated last-accessed-write conflicts")
+    }
 }
 
 #[async_trait]
@@ -629,6 +720,20 @@ impl RefStore for S3RefStore {
             .await
     }
 
+    async fn touch_last_accessed_at(
+        &self,
+        repo_id: &RepoId,
+        branch: &str,
+        expected_commit: &str,
+    ) -> Result<bool> {
+        let key = if branch == "HEAD" {
+            self.key(repo_id)
+        } else {
+            self.branch_key(repo_id, branch)
+        };
+        self.update_last_accessed_keyed(&key, expected_commit).await
+    }
+
     async fn delete_branch(&self, repo_id: &RepoId, branch: &str) -> Result<()> {
         // Never delete the HEAD ref (see FileRefStore::delete_branch).
         if branch == "HEAD" {
@@ -714,6 +819,10 @@ pub struct CachingRefStore<T: RefStore> {
     inner: T,
     ttl: Duration,
     cache: RwLock<HashMap<(String, String), (Instant, RefInfo)>>,
+    /// Monotonic generation counter. Incremented before every write so a read
+    /// that overlaps with a write can detect the overlap and avoid caching a
+    /// value that may be stale by the time it acquires the write lock.
+    write_gen: AtomicU64,
 }
 
 impl<T: RefStore> CachingRefStore<T> {
@@ -727,6 +836,7 @@ impl<T: RefStore> CachingRefStore<T> {
             inner,
             ttl,
             cache: RwLock::new(HashMap::new()),
+            write_gen: AtomicU64::new(0),
         }
     }
 
@@ -751,16 +861,39 @@ impl<T: RefStore> RefStore for CachingRefStore<T> {
 
     async fn load_branch(&self, repo_id: &RepoId, branch: &str) -> Result<Option<RefInfo>> {
         let key = Self::cache_key(repo_id, branch);
-        let mut cache = self.cache.write().await;
-        if let Some((ts, info)) = cache.get(&key)
-            && ts.elapsed() < self.ttl
+
+        // Fast read-locked path: hot ref lookups are the common case and must
+        // not serialize behind writers.
         {
-            return Ok(Some(info.clone()));
+            let cache = self.cache.read().await;
+            if let Some((ts, info)) = cache.get(&key)
+                && ts.elapsed() < self.ttl
+            {
+                return Ok(Some(info.clone()));
+            }
         }
 
+        // Snapshot the generation before doing I/O. If any write starts or
+        // completes while we are reading, the generation will advance and we
+        // must not cache what we loaded — it may be stale by the time we insert.
+        let write_gen_before = self.write_gen.load(Ordering::SeqCst);
         let info = self.inner.load_branch(repo_id, branch).await?;
         if let Some(info) = &info {
-            cache.insert(key, (Instant::now(), info.clone()));
+            let mut cache = self.cache.write().await;
+            // Double-checked insert: another writer may have filled the cache
+            // while we were reading through to the inner store.
+            if let Some((ts, existing)) = cache.get(&key)
+                && ts.elapsed() < self.ttl
+            {
+                return Ok(Some(existing.clone()));
+            }
+            // Only cache if no write happened between our read and this lock.
+            // This prevents a slow reader that loaded an old value from
+            // overwriting the cache with it after a concurrent writer committed
+            // a newer ref (and removed the cache entry).
+            if self.write_gen.load(Ordering::SeqCst) == write_gen_before {
+                cache.insert(key, (Instant::now(), info.clone()));
+            }
         }
         Ok(info)
     }
@@ -773,8 +906,14 @@ impl<T: RefStore> RefStore for CachingRefStore<T> {
 
     async fn save_branch(&self, repo_id: &RepoId, branch: &str, info: &RefInfo) -> Result<()> {
         let key = Self::cache_key(repo_id, branch);
-        let mut cache = self.cache.write().await;
+        // Do not hold the cache write lock across the inner store's I/O (e.g.
+        // S3 CAS retries); one contended ref write must not stall every /refs
+        // lookup on the node. The cache eviction happens after the durable
+        // write returns. Advance the generation first so any read already in
+        // flight knows not to cache its result.
+        self.write_gen.fetch_add(1, Ordering::SeqCst);
         self.inner.save_branch(repo_id, branch, info).await?;
+        let mut cache = self.cache.write().await;
         // The inner store may skip this write when it already holds a newer ref.
         // Caching `info` here would then serve the older one until the entry
         // expires. Drop the cache entry instead; the next load reads the kept
@@ -791,19 +930,50 @@ impl<T: RefStore> RefStore for CachingRefStore<T> {
         status: &str,
     ) -> Result<bool> {
         let key = Self::cache_key(repo_id, branch);
-        let mut cache = self.cache.write().await;
+        self.write_gen.fetch_add(1, Ordering::SeqCst);
         let updated = self
             .inner
             .update_build_status(repo_id, branch, expected_commit, status)
             .await?;
+        let mut cache = self.cache.write().await;
         cache.remove(&key);
         Ok(updated)
     }
 
+    async fn touch_last_accessed_at(
+        &self,
+        repo_id: &RepoId,
+        branch: &str,
+        expected_commit: &str,
+    ) -> Result<bool> {
+        let key = Self::cache_key(repo_id, branch);
+        let touched = self
+            .inner
+            .touch_last_accessed_at(repo_id, branch, expected_commit)
+            .await?;
+        if touched {
+            // Best-effort: keep the cached timestamp consistent with the durable
+            // store without invalidating the hot entry.
+            let mut cache = self.cache.write().await;
+            if let Some((ts, info)) = cache.get_mut(&key) {
+                if info.commit == expected_commit {
+                    info.last_accessed_at = SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .ok()
+                        .map(|d| d.as_secs());
+                    *ts = Instant::now();
+                }
+            }
+        }
+        Ok(touched)
+    }
+
     async fn delete_branch(&self, repo_id: &RepoId, branch: &str) -> Result<()> {
         let key = Self::cache_key(repo_id, branch);
-        let mut cache = self.cache.write().await;
+        // Do not hold the cache write lock across the inner store's I/O.
+        self.write_gen.fetch_add(1, Ordering::SeqCst);
         self.inner.delete_branch(repo_id, branch).await?;
+        let mut cache = self.cache.write().await;
         cache.remove(&key);
         Ok(())
     }
@@ -813,8 +983,11 @@ impl<T: RefStore> RefStore for CachingRefStore<T> {
     }
 
     async fn invalidate(&self, repo_id: &RepoId, branch: &str) {
-        let mut cache = self.cache.write().await;
-        cache.remove(&Self::cache_key(repo_id, branch));
+        self.write_gen.fetch_add(1, Ordering::SeqCst);
+        {
+            let mut cache = self.cache.write().await;
+            cache.remove(&Self::cache_key(repo_id, branch));
+        }
         self.inner.invalidate(repo_id, branch).await;
     }
 
@@ -901,6 +1074,7 @@ mod tests {
             build_ms: None,
             synced_at: None,
             generation: None,
+            ..Default::default()
         }
     }
 
@@ -923,6 +1097,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn file_ref_store_touch_last_accessed_at_bumps_timestamp_and_checks_commit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileRefStore::new(tmp.path());
+        let repo_id = RepoId::github("o/r");
+
+        let mut info = dummy_ref_info("abc123");
+        info.last_accessed_at = Some(1);
+        store.save_branch(&repo_id, "main", &info).await.unwrap();
+
+        assert!(
+            store
+                .touch_last_accessed_at(&repo_id, "main", "abc123")
+                .await
+                .unwrap(),
+            "touch must succeed when the commit matches"
+        );
+        let touched = store.load_branch(&repo_id, "main").await.unwrap().unwrap();
+        assert!(touched.last_accessed_at.unwrap() > 1);
+
+        assert!(
+            !store
+                .touch_last_accessed_at(&repo_id, "main", "mismatch")
+                .await
+                .unwrap(),
+            "touch must refuse to update when the commit has moved"
+        );
+        let after_mismatch = store.load_branch(&repo_id, "main").await.unwrap().unwrap();
+        assert_eq!(after_mismatch.commit, "abc123");
+        assert_eq!(after_mismatch.last_accessed_at, touched.last_accessed_at);
+    }
+
+    #[tokio::test]
     async fn caching_ref_store_uses_ttl() {
         let tmp = tempfile::tempdir().unwrap();
         let file_store = FileRefStore::new(tmp.path());
@@ -930,6 +1136,7 @@ mod tests {
             inner: file_store,
             ttl: Duration::from_secs(60),
             cache: RwLock::new(HashMap::new()),
+            write_gen: AtomicU64::new(0),
         };
 
         let repo_id = RepoId::github("o/r");
@@ -949,6 +1156,7 @@ mod tests {
             inner: FileRefStore::new(tmp.path()),
             ttl: Duration::from_secs(60),
             cache: RwLock::new(HashMap::new()),
+            write_gen: AtomicU64::new(0),
         };
         let repo_id = RepoId::github("o/r");
 
@@ -1242,6 +1450,138 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "delete must evict the cache, not serve a stale ref"
+        );
+    }
+
+    /// Test double that lets the test pause `load_branch` mid-call so a concurrent
+    /// write can advance the cache generation. Cloning is shallow (Arc) so the
+    /// test can keep a handle to the channels while the cache owns one copy.
+    #[derive(Clone)]
+    struct PauseRefStore {
+        inner: Arc<FileRefStore>,
+        pause: Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+        resume: Arc<tokio::sync::Notify>,
+    }
+
+    impl PauseRefStore {
+        fn new(inner: Arc<FileRefStore>) -> (Self, tokio::sync::oneshot::Receiver<()>) {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            (
+                Self {
+                    inner,
+                    pause: Arc::new(tokio::sync::Mutex::new(Some(tx))),
+                    resume: Arc::new(tokio::sync::Notify::new()),
+                },
+                rx,
+            )
+        }
+    }
+
+    #[async_trait]
+    impl RefStore for PauseRefStore {
+        async fn load(&self, repo_id: &RepoId) -> Result<Option<RefInfo>> {
+            self.load_branch(repo_id, "HEAD").await
+        }
+
+        async fn save(&self, repo_id: &RepoId, info: &RefInfo) -> Result<()> {
+            self.inner.save(repo_id, info).await
+        }
+
+        async fn list(&self) -> Result<Vec<RepoId>> {
+            self.inner.list().await
+        }
+
+        async fn load_branch(&self, repo_id: &RepoId, branch: &str) -> Result<Option<RefInfo>> {
+            // Read from the durable store first, then pause so the test can inject
+            // a concurrent write before the caching layer decides whether to cache.
+            let info = self.inner.load_branch(repo_id, branch).await?;
+            if let Some(tx) = self.pause.lock().await.take() {
+                let _ = tx.send(());
+                self.resume.notified().await;
+            }
+            Ok(info)
+        }
+
+        async fn save_branch(&self, repo_id: &RepoId, branch: &str, info: &RefInfo) -> Result<()> {
+            self.inner.save_branch(repo_id, branch, info).await
+        }
+
+        async fn update_build_status(
+            &self,
+            repo_id: &RepoId,
+            branch: &str,
+            expected_commit: &str,
+            status: &str,
+        ) -> Result<bool> {
+            self.inner
+                .update_build_status(repo_id, branch, expected_commit, status)
+                .await
+        }
+
+        async fn touch_last_accessed_at(
+            &self,
+            repo_id: &RepoId,
+            branch: &str,
+            expected_commit: &str,
+        ) -> Result<bool> {
+            self.inner
+                .touch_last_accessed_at(repo_id, branch, expected_commit)
+                .await
+        }
+
+        async fn delete_branch(&self, repo_id: &RepoId, branch: &str) -> Result<()> {
+            self.inner.delete_branch(repo_id, branch).await
+        }
+
+        async fn list_branches(&self, repo_id: &RepoId) -> Result<Vec<String>> {
+            self.inner.list_branches(repo_id).await
+        }
+    }
+
+    /// A read that overlaps with a write must not insert a stale value into the
+    /// cache after the writer has committed a newer ref.
+    #[tokio::test]
+    async fn caching_ref_store_does_not_cache_stale_value_during_concurrent_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inner = Arc::new(FileRefStore::new(tmp.path()));
+        let (pause_store, paused) = PauseRefStore::new(inner);
+        let store = Arc::new(CachingRefStore::new(pause_store.clone()));
+        let repo_id = RepoId::github("o/r");
+
+        let mut older = dummy_ref_info("c1");
+        older.synced_at = Some(1);
+        let mut newer = dummy_ref_info("c2");
+        newer.synced_at = Some(2);
+
+        // Seed the durable store with the older ref.
+        store.save_branch(&repo_id, "main", &older).await.unwrap();
+
+        // Start a load that will read the older value, then pause before caching.
+        let store2 = store.clone();
+        let repo_id2 = repo_id.clone();
+        let load = tokio::spawn(async move { store2.load_branch(&repo_id2, "main").await });
+
+        // Wait for the load to finish the durable read and reach the pause point.
+        paused.await.unwrap();
+
+        // While the load is paused before caching, commit a newer ref. This
+        // advances the cache generation and removes any cache entry.
+        store.save_branch(&repo_id, "main", &newer).await.unwrap();
+
+        // Let the paused load finish. It loaded the old value, but because a
+        // write happened during the read it must not cache that stale value.
+        pause_store.resume.notify_one();
+        let loaded = load.await.unwrap().unwrap().unwrap();
+        assert_eq!(
+            loaded.commit, "c1",
+            "the in-flight read returns the value it loaded"
+        );
+
+        // The next read must see the newer ref, not a stale cached copy.
+        let loaded = store.load_branch(&repo_id, "main").await.unwrap().unwrap();
+        assert_eq!(
+            loaded.commit, "c2",
+            "concurrent write must prevent stale cache insert"
         );
     }
 }

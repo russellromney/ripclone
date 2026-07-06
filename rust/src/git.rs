@@ -1698,14 +1698,15 @@ pub fn materialize_file<P: AsRef<Path>, Q: AsRef<Path>>(
     Ok(content.len())
 }
 
+/// Serializes tests that mutate the process-global `RIPCLONE_ORIGIN_BASE`, so
+/// parallel test threads don't clobber each other's origin redirection.
+#[cfg(test)]
+pub(crate) static ORIGIN_BASE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use rayon::scope;
-
-    /// Serializes tests that mutate the process-global `RIPCLONE_ORIGIN_BASE`, so
-    /// parallel test threads don't clobber each other's origin redirection.
-    static ORIGIN_BASE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Auto-gc must be persisted off on the mirror, or a fetch could repack
     /// packs out from under a concurrent read.

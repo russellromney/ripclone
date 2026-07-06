@@ -14,6 +14,7 @@ use crate::provider::RepoId;
 use crate::ref_store::RefStore;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use std::time::SystemTime;
 
 pub mod libsql;
 pub mod mysql;
@@ -220,6 +221,50 @@ impl RefStore for SqlRefStore {
         }
         anyhow::bail!(
             "SQL ref store {repo_key}@{branch}: gave up after repeated status-write conflicts"
+        )
+    }
+
+    async fn touch_last_accessed_at(
+        &self,
+        repo_id: &RepoId,
+        branch: &str,
+        expected_commit: &str,
+    ) -> Result<bool> {
+        let repo_key = repo_id.storage_key();
+        for attempt in 0..64 {
+            let Some(row) = self.db.get(&repo_key, branch).await? else {
+                return Ok(false);
+            };
+            if row.commit_id != expected_commit {
+                return Ok(false);
+            }
+            let mut info: RefInfo =
+                serde_json::from_str(&row.data).context("parse stored RefInfo")?;
+            if info.commit != expected_commit {
+                return Ok(false);
+            }
+            info.last_accessed_at = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .ok()
+                .map(|d| d.as_secs());
+            let data = serde_json::to_string(&info).context("serialize RefInfo")?;
+            if data == row.data {
+                return Ok(true);
+            }
+            if self
+                .db
+                .compare_and_swap_data(&repo_key, branch, expected_commit, &row.data, &data)
+                .await?
+            {
+                return Ok(true);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(
+                (attempt.min(10) + 1) as u64,
+            ))
+            .await;
+        }
+        anyhow::bail!(
+            "SQL ref store {repo_key}@{branch}: gave up after repeated last-accessed-write conflicts"
         )
     }
 

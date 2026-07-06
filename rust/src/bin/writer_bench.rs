@@ -226,8 +226,8 @@ fn precreate_dirs(target: &Path, workload: &Workload) -> Result<()> {
         if let Some(slash) = path.iter().rposition(|&b| b == b'/') {
             let dir = &path[..slash];
             if seen.insert(dir) {
-                let rel = ripclone::worktree_writer::path_from_bytes(dir);
-                ripclone::worktree_writer::safe_create_dir_all(target, rel)?;
+                let rel = ripclone::fsutil::path_from_bytes(dir);
+                ripclone::fsutil::safe_create_dir_all(target, rel)?;
             }
         }
     }
