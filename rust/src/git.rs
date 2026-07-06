@@ -1247,10 +1247,12 @@ pub fn ls_remote_commit(
         }
     }
     let (url, git_args) = upstream_url_and_auth(provider, repo_id, credential);
-    // A branch maps to refs/heads/<name>; HEAD is queried directly. Anything else
-    // (e.g. a tag) simply won't match and the caller falls through to a fetch.
+    // A bare branch name maps to refs/heads/<name>; a full ref (refs/heads/... or
+    // refs/tags/...) is passed through unchanged; HEAD is queried directly.
     let query = if ref_name == "HEAD" {
         "HEAD".to_string()
+    } else if ref_name.starts_with("refs/") {
+        ref_name.to_string()
     } else {
         format!("refs/heads/{ref_name}")
     };

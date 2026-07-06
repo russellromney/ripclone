@@ -7,15 +7,35 @@ use ripclone::client::Client;
 use ripclone::config::ProviderEntry;
 use ripclone::extract::extract_archive;
 use ripclone::mode::{CloneMode, resolve_mode};
-use ripclone::provider::ProviderKind;
+use ripclone::provider::{
+    ProviderInstance, ProviderInstanceId, ProviderKind, ProviderRegistry, RepoId,
+};
 use ripclone::snapshot::extract_snapshot;
 use secrecy::ExposeSecret;
+use secrecy::SecretString;
 use sha2::{Digest, Sha256};
 use std::env;
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 
 const DEFAULT_SERVER: &str = "https://ripclone.com";
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum VerifyUpstream {
+    #[default]
+    Auto,
+    Always,
+    Never,
+}
+
+fn parse_verify_upstream(s: &str) -> Result<VerifyUpstream, String> {
+    match s.to_ascii_lowercase().as_str() {
+        "auto" => Ok(VerifyUpstream::Auto),
+        "always" | "true" | "1" | "yes" | "on" => Ok(VerifyUpstream::Always),
+        "never" | "false" | "0" | "no" | "off" => Ok(VerifyUpstream::Never),
+        _ => Err(format!("expected 'auto', 'always', or 'never', got {s:?}")),
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "ripclone")]
@@ -102,6 +122,12 @@ enum Commands {
         /// Print a per-phase benchmark report after the clone.
         #[arg(long)]
         bench: bool,
+        /// Cross-check the installed tip against the upstream git host.
+        /// `auto` (default) enables verification for public repos and whenever an
+        /// upstream credential is available; `always` requires verification;
+        /// `never` disables it. See also `RIPCLONE_VERIFY_UPSTREAM`.
+        #[arg(long, env = "RIPCLONE_VERIFY_UPSTREAM", default_value = "auto", default_missing_value = "always", value_parser = parse_verify_upstream, num_args = 0..=1)]
+        verify_upstream: VerifyUpstream,
     },
     /// Background sidecar: finish materializing a snapshot clone.
     #[command(hide = true)]
@@ -1075,12 +1101,13 @@ async fn main() -> Result<()> {
             at,
             temp,
             bench,
+            verify_upstream,
         } => {
             let (provider, repo_path) = resolve_repo(&repo, &default_provider, &provider_registry)?;
             let upstream_token = resolve_upstream_token(&provider, args.token.as_deref()).await?;
             let client = client
                 .with_provider(&provider)
-                .with_upstream_token_opt(upstream_token);
+                .with_upstream_token_opt(upstream_token.clone());
             let target_name = repo_path
                 .rsplit('/')
                 .next()
@@ -1160,6 +1187,18 @@ async fn main() -> Result<()> {
             };
             let total_ms = clone_started.elapsed().as_millis() as u64;
             println!("installed {} into {}", repo_path, target.display());
+            maybe_verify_upstream(
+                &provider,
+                &repo_path,
+                &branch,
+                at.as_deref(),
+                mode,
+                &target,
+                upstream_token.as_deref(),
+                &outcome.commit,
+                verify_upstream,
+            )
+            .await?;
             if enable_bench {
                 let report = benchmark.finish();
                 println!("{}", serde_json::to_string_pretty(&report)?);
@@ -1492,6 +1531,269 @@ async fn resolve_upstream_token(
         .token(provider_id)
         .map(|token| token.expose_secret().to_string()))
 }
+
+fn provider_host(
+    provider_id: &str,
+    registry: &ripclone::provider::ProviderRegistry,
+) -> Option<String> {
+    // Preset providers have well-known hosts.
+    let preset = match provider_id {
+        "github" => Some("github.com"),
+        "gitlab" => Some("gitlab.com"),
+        "bitbucket" => Some("bitbucket.org"),
+        _ => None,
+    };
+    if let Some(host) = preset {
+        return Some(host.to_string());
+    }
+    registry.get(provider_id).map(|p| {
+        let h = p.host.trim_end_matches('/');
+        h.strip_prefix("https://")
+            .or_else(|| h.strip_prefix("http://"))
+            .unwrap_or(h)
+            .to_string()
+    })
+}
+
+/// Ask the local git credential helper for a password/token for an HTTPS URL.
+async fn git_credential_token(host: &str, path: &str) -> Result<Option<String>> {
+    let input = format!(
+        "protocol=https\nhost={}\npath={}\n\n",
+        host,
+        path.trim_start_matches('/')
+    );
+    let mut child = tokio::process::Command::new("git")
+        .arg("credential")
+        .arg("fill")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("spawn git credential fill")?;
+
+    let mut stdin = child.stdin.take().context("take git credential stdin")?;
+    tokio::io::AsyncWriteExt::write_all(&mut stdin, input.as_bytes()).await?;
+    tokio::io::AsyncWriteExt::shutdown(&mut stdin).await.ok();
+    drop(stdin);
+
+    let output = child
+        .wait_with_output()
+        .await
+        .context("read git credential fill output")?;
+
+    if !output.status.success() {
+        tracing::debug!(
+            "git credential fill failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return Ok(None);
+    }
+
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        if let Some(password) = line.strip_prefix("password=")
+            && !password.is_empty()
+        {
+            return Ok(Some(password.to_string()));
+        }
+    }
+    Ok(None)
+}
+
+/// Build a `ProviderInstance` for `provider_id`, falling back to built-in
+/// presets when the registry has no custom config.
+fn provider_instance(provider_id: &str, registry: &ProviderRegistry) -> ProviderInstance {
+    if let Some(inst) = registry.get(provider_id) {
+        return inst.clone();
+    }
+    let (kind, host) = match provider_id {
+        "github" => (ProviderKind::GitHub, "github.com"),
+        "gitlab" => (ProviderKind::GitLab, "gitlab.com"),
+        "bitbucket" => (ProviderKind::Bitbucket, "bitbucket.org"),
+        _ => (ProviderKind::Generic, provider_id),
+    };
+    ProviderInstance {
+        id: ProviderInstanceId::new(provider_id),
+        kind,
+        host: host.to_string(),
+        auth_template: None,
+        auth_header_name: None,
+    }
+}
+
+/// Cross-check the installed tip for an editable clone against the upstream git
+/// host. `request` controls whether verification runs:
+///   * `Always` — require verification; any failure fails the clone.
+///   * `Auto` (default) — verify when an upstream credential is available, or
+///     when an anonymous `ls-remote` probe shows the repo is public. Otherwise
+///     warn and skip (the ripclone server stays in the trust base).
+///   * `Never` — skip.
+///
+/// Files-mode clones are not verifiable this way and are skipped (with a warning
+/// when explicitly requested).
+#[allow(clippy::too_many_arguments)]
+async fn maybe_verify_upstream(
+    provider_id: &str,
+    repo_path: &str,
+    branch: &str,
+    at: Option<&str>,
+    mode: CloneMode,
+    target: &std::path::Path,
+    upstream_token: Option<&str>,
+    installed_commit: &str,
+    requested: VerifyUpstream,
+) -> Result<()> {
+    if requested == VerifyUpstream::Never {
+        return Ok(());
+    }
+    if let Some(rev) = at {
+        match requested {
+            VerifyUpstream::Always => {
+                anyhow::bail!(
+                    "upstream verification cannot verify a non-tip rev ({rev}); \
+                     omit --at or use --verify-upstream=auto"
+                );
+            }
+            VerifyUpstream::Auto => {
+                eprintln!(
+                    "warning: --verify-upstream skipped for --at {rev}; \
+                     the ripclone server remains in the trust base for this clone"
+                );
+                return Ok(());
+            }
+            VerifyUpstream::Never => unreachable!(),
+        }
+    }
+    if !mode.needs_prebuilt_blob_pack() {
+        if requested == VerifyUpstream::Always {
+            eprintln!(
+                "warning: --verify-upstream is not supported for files-mode clones; skipping"
+            );
+        }
+        return Ok(());
+    }
+
+    let store = token_store().context("initialize token store")?;
+    let registry = ripclone::provider_config::load_registry_with_token_store(&store)
+        .context("load provider registry for upstream verification")?;
+    let provider = provider_instance(provider_id, &registry);
+
+    let mut upstream_tip: Option<String> = None;
+    match requested {
+        VerifyUpstream::Always => {}
+        VerifyUpstream::Auto if upstream_token.is_some() => {}
+        VerifyUpstream::Auto => {
+            // Anonymous probe. If the repo is public, the returned tip is reused
+            // for verification so we only issue one ls-remote to the upstream host.
+            let repo_id = RepoId {
+                provider: provider.id.clone(),
+                path: repo_path.to_string(),
+            };
+            let provider = provider.clone();
+            let branch = branch.to_string();
+            upstream_tip = match tokio::task::spawn_blocking(move || {
+                ripclone::git::ls_remote_commit(&provider, &repo_id, &branch, None)
+            })
+            .await
+            {
+                Ok(Ok(Some(sha))) => Some(sha),
+                Ok(Ok(None)) => {
+                    eprintln!(
+                        "warning: --verify-upstream skipped (private upstream without credential); the ripclone server remains in the trust base for this clone"
+                    );
+                    return Ok(());
+                }
+                Ok(Err(e)) => {
+                    eprintln!(
+                        "warning: --verify-upstream skipped (upstream probe failed: {e:#}); the ripclone server remains in the trust base for this clone"
+                    );
+                    return Ok(());
+                }
+                Err(e) => {
+                    eprintln!(
+                        "warning: --verify-upstream skipped (upstream probe task failed: {e}); the ripclone server remains in the trust base for this clone"
+                    );
+                    return Ok(());
+                }
+            };
+        }
+        VerifyUpstream::Never => return Ok(()),
+    }
+
+    let upstream_tip = match upstream_tip {
+        Some(tip) => tip,
+        None => {
+            let repo_id = RepoId {
+                provider: provider.id.clone(),
+                path: repo_path.to_string(),
+            };
+            let credential = upstream_token.map(|t| SecretString::new(t.to_owned().into()));
+            let provider = provider.clone();
+            let branch_owned = branch.to_string();
+            match tokio::task::spawn_blocking(move || {
+                ripclone::git::ls_remote_commit(
+                    &provider,
+                    &repo_id,
+                    &branch_owned,
+                    credential.as_ref(),
+                )
+            })
+            .await
+            {
+                Ok(Ok(Some(sha))) => sha,
+                Ok(Ok(None)) => {
+                    anyhow::bail!(
+                        "upstream verification failed: ref '{branch}' not found on upstream host"
+                    );
+                }
+                Ok(Err(e)) => {
+                    if requested == VerifyUpstream::Auto {
+                        eprintln!(
+                            "warning: --verify-upstream skipped (upstream unreachable: {e:#}); \
+                             the ripclone server remains in the trust base for this clone"
+                        );
+                        return Ok(());
+                    }
+                    anyhow::bail!(
+                        "upstream verification failed: could not reach upstream host: {e:#}"
+                    );
+                }
+                Err(e) => {
+                    anyhow::bail!("upstream verification failed: ls-remote task failed: {e}");
+                }
+            }
+        }
+    };
+
+    if upstream_tip != installed_commit {
+        anyhow::bail!(
+            "upstream verification failed: installed commit {installed_commit} does not match upstream tip {upstream_tip}"
+        );
+    }
+
+    let target = target.to_path_buf();
+    let commit = installed_commit.to_string();
+    tokio::task::spawn_blocking(move || {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&target)
+            .args(["fsck", "--connectivity-only", "--no-progress"])
+            .arg(&commit)
+            .status()
+            .context("spawn git fsck")?;
+        if !status.success() {
+            anyhow::bail!(
+                "upstream verification failed: installed objects do not chain to commit {commit}"
+            );
+        }
+        Ok(())
+    })
+    .await
+    .context("git fsck task")??;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

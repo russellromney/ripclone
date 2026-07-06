@@ -257,6 +257,12 @@ ripclone --token ghp_xxx clone my-org/private-repo
 
 Pushes go to your git host directly, not through ripclone.
 
+For editable clones you can have the client cross-check the installed tip against
+your git host with `--verify-upstream`. In `auto` mode (the default) this runs
+whenever an upstream credential is available or the repo is public; for
+credential-less private/agent flows it warns and skips, leaving the ripclone
+server in the trust base. `files`-mode clones are not verifiable this way.
+
 ## Providers
 
 By default ripclone knows one host: the built-in `github` instance. To mirror from GitLab, Gitea/Forgejo/Codeberg, or a self-hosted host, register provider instances on the server with the `RIPCLONE_PROVIDERS` environment variable or `config.toml`:
