@@ -836,6 +836,28 @@ install, rolled up monthly). Agent tokens are free today; this is the data that 
 whether/how to price them later. Metrics only — no billing change.
 ```
 
+**G9. Worker-pool launch bridge (two static lanes + size bit)** — deps: C-track (consolidated queue adapter) — Kimi (OSS) + User (deploy) — turbogit + cloud
+```
+The launch answer to "many concurrent commits from big projects." NOT the dispatcher
+— that's post-launch (docs/DISPATCHER.md). Four cheap pieces:
+1. OSS: `size_class` on the jobs table, BINARY `small|large` at launch. Classify at
+   enqueue from data already in hand — first build → repo.size (cloud passes it from
+   the tiered-add preflight; self-host uses a size env default); repeat → prior
+   clonepack byte total in RefInfo. Land it in the CONSOLIDATED queue adapter (blessed
+   backends libsql/sqlite only, per D3), not the four current ones.
+2. OSS: `--max-size-class` claim filter on the worker (`WHERE size_class <= ceiling`).
+   A worker with NO flag claims everything — single-worker self-host is unchanged.
+3. Deploy (cloud): two static lanes — a small warm pool (`--max-size-class small`,
+   ~2 boxes, never idle) + one large box (no filter, big RAM). Small syncs never queue
+   behind a linux build; a small worker can't OOM on a big repo.
+4. Ops: the G3 queue-depth alert + a one-line runbook ("depth > N for 5min →
+   fly scale count worker=+2"). Bursts absorbed by hand.
+This is the minimal form of the dispatcher's right-sizing — extensible to the full
+enum + serverless dispatch later with no rework (same column, same claim filter).
+Tests: small worker won't claim a large job; large drains both; no-flag worker
+claims all (self-host parity).
+```
+
 **G4. Backups** — deps: none — User + Kimi
 ```
 Define the Turso backup story (Turso has PITR on paid plans — confirm tier; else
@@ -1178,6 +1200,15 @@ best-effort, files mode not upstream-verifiable. All parked as issues, none bloc
   P3 family-mirror repack maintenance + policy tweak.
   (Checked and rejected: "internal main#<sha> keys reach git" — log strings only;
   no typed-ref refactor.)
+- **Serverless dispatcher (docs/DISPATCHER.md, rewritten 2026-07-05).** Scale-to-zero
+  + right-sized compute on push, dispatched by the CLOUD webhook processor (not the OSS
+  server — no Dispatcher trait in OSS). Three new pieces: OSS `--idle-exit-secs`, cloud
+  dispatch-on-enqueue (Fly START-STOPPED machine ~1s, the load-bearing choice that keeps
+  scale-to-zero under the 5s freshness SLA), cloud reconcile cron. Keystone
+  (seed-mirror-from-storage) shared with fork-overlay. ApiRefStore (workers off direct
+  DB creds) is a later hardening. Launch runs the G9 static two-lane bridge instead;
+  build this when manual `fly scale count` hurts or a big-repo OOM/head-of-line incident
+  occurs. Shares the G9 size_class column (extends binary → enum).
 - **Cloud GitLab.com support — the named #1 fast-follow** (huge OSS/GitLab-native
   crowd; the obvious next market after GitHub). Because H0 built the additive seam, this
   is: implement `GitProvider` for GitLab (group access token for the connection, GitLab

@@ -1,303 +1,251 @@
-# Dispatcher: on-demand build workers
+# Dispatcher: serverless build workers
 
-Status: **design, parked.** The seam is designed; nothing is built. We are
-launching simple first and will pick this up when the numbers ask for it. The
-design below is the target and the punch-list for that day — see "Decision".
+Status: **design, parked — launch on a static worker pool, build this when the
+numbers ask.** The seam is designed; the launch bridge is cheap. This doc is the
+target and the punch-list for the day we automate scale.
 
-## Decision (2026-06): launch simple, build this later
+## The model (decided 2026-07-05)
 
-The dispatcher only buys two things on top of what already works today:
-**scale-to-zero** (no idle worker cost) and **right-sizing** (a big box only for
-big repos). Both are cost optimizations, not capabilities. The product serves
-real traffic without either.
+The dispatcher gives the cloud two things: **scale to zero** (no idle worker cost)
+and **instant, right-sized compute on push**. The key architectural decision that
+makes it simple: **the dispatcher lives in the cloud webhook processor, not the OSS
+server.** The cloud already receives the push, already enqueues, already holds the
+Fly credentials — it is the natural place to say "start a machine." So the OSS
+backend stays a pure queue + worker + build system with no dispatch abstraction at
+all.
 
-So we launch on the **SQL queue with a single always-on worker** — not the
-`local` in-process queue. Same operational cost as one box, but it puts the
-pull/claim seam in place, so adding the dispatcher later is *additive* (flip
-`RIPCLONE_DISPATCH` from `none` to `exec`/`fly`) instead of a queue-backend
-switch under load.
+```
+push → cloud webhook route
+  → enqueue to the libsql queue          [claim system — ALREADY EXISTS]
+  → Fly API: start a stopped machine     [instant launch, scale-to-zero]
+  ↓
+ripclone-worker (ephemeral Fly machine, the OSS binary)
+  → claim from the queue → seed mirror from storage → build → upload chunks
+  → write the ref (direct today; via API later — see "Ref reporting")
+  → queue empty for N seconds → exit → machine stops     [scale to zero]
+  ↓
+cloud reconcile cron (every ~minute)
+  → queue depth > 0 and no machine running → start one    [lost-dispatch backstop]
+```
 
-Build the dispatcher when a measured signal says so:
+### Why this is the simplest thing that meets the requirements
 
-- idle build-box cost becomes a real line item on the bill, **or**
-- a big repo OOMs the one-size worker and we need right-sizing.
+Requirements: scale to zero · instant launch (dispatched by the webhook processor) ·
+updates shared state (via API eventually) · a claim system · needn't be OSS.
 
-When that day comes, build it in two cuts, not the one big Phase 1 below — the
-split and the gaps it has to close are in "Phasing".
+Almost everything already exists — the libsql queue, claim/ack, coalescing,
+`attempts`/dead-letter, `reclaim_stale`, and the deployed `ripclone-server` +
+`ripclone-worker` pool. The claim system is the queue we already run. So the launch
+gap is only **three small pieces**:
 
-## Why
+1. **OSS: `--idle-exit-secs`** on the worker — build until the queue is empty for N
+   seconds, then exit. (See "Worker flags".)
+2. **Cloud: dispatch-on-enqueue** — after the webhook enqueues, call Fly's Machines
+   API to start a stopped worker machine. Idempotent (already starting → no-op).
+3. **Cloud: reconcile cron** — depth > 0 and nothing running → start one. Backstop
+   for a lost or throttled dispatch.
 
-Sync/build is the heavy part of ripclone: git deltification + zstd over a repo's
-history. We want a powerful machine while a build runs, and nothing at idle.
+## The load-bearing decision: pooled *stopped* machines, never fresh create
 
-Most of the pieces exist:
+Scale-to-zero is compatible with the freshness SLA **only** via a pool of
+pre-provisioned *stopped* machines that you *start* on demand:
 
-- The build runs as a separate, stateless `ripclone-worker` process behind the
-  pluggable `JobQueue` (`local | sqlite | postgres | mysql | libsql`).
-- The queue hands each job to one worker (claim/ack) and reclaims jobs from
-  crashed workers.
-- `/sync` polls the job's status, so it doesn't care which machine built it.
+- **Start a stopped Fly machine: ~1s.** Create a fresh one: ~5–15s.
+- B4 measured incremental build at **1.6–3.6s**. Start-stopped (~1s) + build lands
+  **under the 5s tripwire**; fresh-create would blow it.
+- Stopped machines cost ~nothing (rootfs, not CPU), so a warm *pool of stopped
+  machines* IS scale-to-zero. Bursts = start more of them.
 
-Three things are missing:
-
-1. Make compute appear when work lands (scale up) — the **Dispatcher**.
-2. A worker that drains the queue then exits (scale to zero) — a worker flag.
-3. A loop that recovers stranded work when spawning fails or races — the
-   **reconcile loop** (see "Failure handling").
-
-One prerequisite, tracked separately (see "Keystone"): workers must not assume
-the bare mirror is on disk.
+This is the whole reason the freshness SLA and scale-to-zero coexist. Do not build
+the cloud path on fresh machine creation.
 
 ## Self-host parity
 
-The same binary serves the managed service and a self-hoster. Only config
-changes. The dispatcher is the only moving part:
+Same OSS binary; only the trigger differs. The dispatcher is a cloud concern; a
+self-hoster never runs it.
 
-| Setup | Queue | Dispatcher | Who |
+| Setup | Queue | Compute trigger | Who |
 |---|---|---|---|
-| Single binary, no infra | `local` | `none` (in-process worker) | first run / small self-host |
-| Static worker pool | `sqlite`/`postgres`/… | `none` (you run N workers) | typical self-host |
-| Scale to zero, your platform | `postgres`/`libsql` | `exec` (your spawn command) | advanced self-host |
-| Scale to zero, managed | `postgres`/`libsql` | `fly` + right-sizing | ripclone-cloud |
+| Single binary, no infra | `local` | in-process worker | first run / small self-host |
+| Static worker pool | `sqlite`/`libsql`/… | you run N workers | typical self-host |
+| Serverless, managed | `libsql` | cloud webhook → Fly start-machine | ripclone-cloud |
 
-No code change to move between rows. Self-hosters point `exec` at their own k8s
-Job, Nomad, systemd, or script.
-
-## The seam
-
-The dispatcher only wakes compute. The woken worker still claims from the shared
-queue. One model (pull/claim) means coalescing, status polling, and reclaim work
-the same everywhere. The dispatcher carries no job payload, just "there is work."
-
-```rust
-#[async_trait]
-pub trait Dispatcher: Send + Sync {
-    /// Ensure a worker of at least this size exists to drain pending work.
-    /// Idempotent: spawning when a worker is already up must be a safe no-op.
-    /// Must not block the caller (see below).
-    async fn dispatch(&self, hint: DispatchHint) -> Result<()>;
-}
-
-pub struct DispatchHint {
-    pub repo: RepoRef,      // owner/repo (RepoId after the multi-provider rebase)
-    pub branch: String,
-    pub size: SizeClass,    // worker size to spawn (see Right-sizing)
-}
-
-pub enum SizeClass { Small, Medium, Large, XLarge }
-```
-
-- Lives on `ServerState` as `Arc<dyn Dispatcher>`.
-- Called from `/sync` and `/build` after a successful enqueue on a SQL queue.
-  The `local` queue needs no dispatch — the in-process worker already runs.
-- Non-blocking: dispatch runs as a detached task with a timeout and never delays
-  the enqueue response. Failures are logged, not returned to the client; the job
-  is already queued and the reconcile loop picks it up.
-
-### Backends
-
-- **`none`** (default) — no-op. Use a static pool or the in-process worker.
-- **`exec`** — run a configured program. argv only, never `sh -c`: hint values
-  (size, repo, branch) are passed as separate arguments, never built into a shell
-  string. Repo and branch are attacker-influenced, so this keeps shell
-  metacharacters out. Runs detached with a timeout. No SDK in ripclone — this is
-  what makes self-host easy.
-- **`fly`** — Fly Machines API. Start a stopped pooled machine, or create one
-  sized by `SizeClass`, capped by max concurrency. ripclone-cloud's target, on
-  shared-CPU presets.
-- Future: `modal`, `http` (POST a webhook) — same trait.
-
-### Secret injection
-
-The worker needs config to reach shared state: queue URL, storage creds,
-metadata URL/creds, upstream token, ripclone token. Delivery is per-backend:
-
-- `exec` — inherits the server's environment (so the server holds the secrets),
-  or an operator wrapper injects them.
-- `fly` — machine env + Fly secrets at create/start.
-- `modal`/`http` — platform env / secret store.
-
-Secrets are never stored in the queue. The worker reads its own config, exactly
-like a manually-run `ripclone-worker` today.
-
-## Right-sizing
-
-Two goals conflict: right-size per repo (big repo, big box) but let one worker
-drain many jobs. Fix it by making size a claim filter, not just a spawn size:
-
-- The `jobs` table gets a `size_class` column. A worker claims only jobs at or
-  below its ceiling (`--max-size-class`). A Large worker drains Large and smaller;
-  a Small worker never claims a Large job, so it can't OOM on it.
-- `dispatch` spawns a worker sized to the pending job.
-
-Where `size_class` comes from:
-
-- Repeat sync: prior `RefInfo` / clonepack size → class.
-- First sync (the heaviest: full clone + full build, no prior signal): seed from a
-  cheap upstream signal like GitHub `repo.size`; if unavailable default to
-  **Large, not Medium**. Under-sizing the first build is the costly mistake.
-  Escalation (below) is the safety net.
-
-Config: `RIPCLONE_DISPATCH_SIZE_LARGE="shared-cpu-8x:16384"`, etc. Operators tune
-presets without code. ripclone-cloud uses shared-CPU presets (cheap, fast enough)
-and only scales up for big repos.
+Self-hosters who want scale-to-zero on their own platform run their own trigger
+(k8s Job, Nomad, systemd, a script) against the same queue — the worker doesn't
+care what started it. No `Dispatcher` trait in OSS is needed to enable that.
 
 ## Worker flags
 
 Added to the existing claim→build→ack loop:
 
-- `--idle-exit-secs N` — exit after the queue is empty for N seconds (default
-  off = today's forever loop).
-- `--max-jobs N` — exit after N builds (for one-shot platforms).
-- `--max-size-class C` — largest job this worker will claim.
+- **`--idle-exit-secs N`** — exit after the queue is empty for N seconds (default
+  off = today's forever loop). Idle-exit must be atomic with claiming: exit only on
+  a claim attempt that comes back empty. A job landing in the exit window is covered
+  by the reconcile cron.
+- `--max-jobs N` — exit after N builds (one-shot platforms). Optional.
 
-Idle-exit must be atomic with claiming: the worker exits only on a claim attempt
-that comes back empty. If a job lands in the exit window and is missed, the
-reconcile loop covers it.
+Crash safety is unchanged: a dead worker's job is reclaimed by the existing stale
+timeout inside `claim()`, and (the gap at zero scale) the reconcile cron re-dispatches
+so a reclaimed job actually gets a worker.
 
-Crash safety is unchanged: a dead worker's job is reclaimed by the stale timeout.
+## Ref reporting: direct today, via API later (optional upgrade)
 
-## Keystone: mirror-from-clonepack
+The "update shared state via API" requirement is a security upgrade, not a launch
+blocker.
 
-A dispatched worker usually has no bare mirror on disk (fresh machine, or built
-elsewhere). So treat "no local mirror" as the normal case:
+- **Launch:** the ephemeral worker writes the ref directly (it already holds the
+  metadata + storage creds, exactly like the deployed pool today). Ship this.
+- **Upgrade — `ApiRefStore`:** a `RefStore` impl that POSTs ref-writes to a cloud
+  control endpoint instead of writing the DB. The worker then holds only a scoped
+  one-time job token + storage-write creds; the authoritative ref-write (with the
+  ordering guard) stays in the control plane. Because it sits behind the existing
+  `RefStore` trait, the worker doesn't change — it's config
+  (`RIPCLONE_METADATA=api` + a report URL). Add when ephemeral compute holding
+  direct DB creds becomes a posture you want to close.
+
+Chunks always upload directly to storage (bulk data can't proxy through an API);
+they're content-addressed and useless without the ref, so storage-write creds are
+lower-risk than ref-write creds — which is why reporting the ref (not the chunks)
+via API is the meaningful hardening.
+
+## Keystone: seed the mirror from storage (shared with fork-overlay)
+
+An ephemeral worker often has no bare mirror on disk. Treat "no local mirror" as
+normal:
 
 1. No local mirror → seed a bare mirror from the clonepack in storage (reuse the
    client's clonepack→repo reconstruction).
 2. `git fetch` only the delta from upstream.
-3. Build → upload → write the ref.
-4. Optionally keep the mirror as a local cache for the next job.
+3. Build → upload → report the ref.
 
-Use an ephemeral per-job mirror (temp dir, discarded) so workers are
-interchangeable. This also removes the old "one repo_root per worker" corruption
-risk. The only unavoidable full clone is a repo's first sync. This is its own
-work item; the dispatcher assumes it.
+This is the **same primitive as the fork-overlay "seed the upstream mirror from
+storage" work** (see the fork-overlay design in the post-launch section of
+LAUNCH_PLAN.md) — build it once, serve both. It's load-bearing for economical
+scale-out (without it every cold-started machine full-clones a big repo) but not a
+launch blocker: the launch bridge (below) keeps mirrors on warm static workers.
+Pooled stopped machines also retain their rootfs, so a restarted machine may still
+have last job's mirror — the keystone makes the miss cheap, it isn't required for
+correctness.
 
-## Failure handling
+## The launch bridge (do this instead, for launch)
 
-With no static pool, the happy path is `enqueue → dispatch → worker`. Every other
-recovery path needs a worker that's already polling, which may not exist. So:
+The parking decision holds: launch on the **static worker pool already deployed**,
+scaled by hand, and the concurrency worry ("many concurrent commits from big
+projects on one machine") is absorbed reactively. B5 explicit-add already bounds
+the load — only added repos build — and B4 shows incremental syncs are ~3s, so one
+worker does ~1000/hr. The real spikes are big-repo OOM, head-of-line blocking, and
+synchronized bursts. Cover them with four cheap things, no dispatcher:
 
-- **Reconcile loop (required, server-side).** Periodically: if there is queued
-  work, or a `claimed` job older than the stale window, ensure a worker is being
-  dispatched (capped by concurrency). This one backstop covers dispatch failures
-  (Fly throttle/quota), a worker that dies before claiming, and a missed
-  idle-exit. This is the same machinery as a depth-based autoscaler — not
-  optional polish. Two things the current queue does **not** give it yet, and
-  both must be built with it:
-  - **It needs a primitive on the `JobQueue` trait.** The server holds only
-    `Arc<dyn JobQueue>`; `claim`/`reclaim_stale`/`count_queued` are inherent on
-    the concrete `SqlJobQueue`, unreachable through the trait. And `reclaim_stale`
-    runs only inside `claim()` today, so at zero scale a worker that OOMs mid-build
-    leaves its row `claimed` with no process ever reclaiming it. So the primitive
-    must itself run the reclaim, then report actionable work — a new trait method,
-    not `depth()` (which sees `queued` only).
-  - **It must return the max `size_class` over `queued OR stale-claimed`, not a
-    count.** Escalation (below) bumps a stale job's `size_class`; if reconcile
-    dispatches a default/fixed-size worker, the `--max-size-class` filter stops it
-    claiming the escalated job, and reconcile re-dispatches too-small workers
-    forever — a livelock that also burns money. Size the box to the largest
-    waiting job.
-- **Escalate on resource failure.** Two failure modes, handled differently:
-  - ack-failed (`do_sync` returned an error: bad repo, auth) → terminal `failed`.
-    A bigger box won't help; don't retry.
-  - stale-reclaim (worker vanished with no ack: almost always OOM or a time-limit
-    kill) → bump `attempts` and `size_class` one step, then re-queue. A bigger
-    worker takes it next. Cap at `RIPCLONE_QUEUE_MAX_ATTEMPTS` (default ~3); past
-    the cap mark `failed` with "exceeded resource limits".
-- **Spot/preemption.** On preemptible compute, preemption → reclaim → rebuild is
-  normal. The diskless seed keeps restarts cheap. The attempt cap stops a repo
-  that always exceeds the limit from looping forever.
+- **Two static lanes:** a small warm pool (drains fast incremental syncs, never idle)
+  + one large box (big RAM, drains anything). A small worker can't OOM on a big repo;
+  a linux build can't stall bun's syncs. (Needs `--max-size-class` + a `size_class`
+  bit on the job — the minimal form of right-sizing; see below.)
+- **G3 queue-depth alert** so you know to scale.
+- **A one-line runbook:** depth > N for 5 min → `fly scale count worker=+2`.
+- **The tiered add cap** (G2) already bounds the worst single repo (10 GB).
 
-## Capacity
+The trigger to build the real dispatcher is not idle cost (~$10/mo, noise) — it's
+"manual `fly scale count` is happening often enough to hurt," or a big-repo
+OOM / head-of-line incident.
 
-- Cap concurrent dispatches (`RIPCLONE_DISPATCH_MAX_CONCURRENCY`). This cap is per
-  server process — with multiple replicas, each dispatches on its own, so a burst
-  can over-spawn. It self-heals via idle-exit, but it's a cost spike.
-- Coalescing means one active job per `owner/repo/branch`, and a woken worker
-  drains everything it can claim, so bursts need few workers.
-- A worker heartbeat/lease row in the queue DB is the real fix: it gives a global
-  cap and dedups dispatch across replicas. Add it once the basic path works.
+## Right-sizing (the minimal form is the launch bridge; the full form is later)
+
+Two goals conflict: right-size per repo (big repo, big box) but let one worker drain
+many jobs. Make size a **claim filter**, not just a spawn size:
+
+- The `jobs` table gets a `size_class` column. A worker claims only jobs at or below
+  its ceiling (`--max-size-class`). A Large worker drains Large and smaller; a Small
+  worker never claims a Large job, so it can't OOM.
+- **Launch (bridge):** binary `small | large`. Classify at enqueue from data already
+  in hand — first build → `repo.size` from the tiered-add GitHub preflight call;
+  repeat → the prior clonepack byte total in `RefInfo`. No new API calls.
+- **Later (dispatcher):** widen to `Small|Medium|Large|XLarge`; the cloud dispatch
+  call sizes the started machine to the pending job's class.
+- **Schema on the blessed backends only** (libsql/sqlite per D3); Postgres/MySQL lag.
+  Land the column in the **consolidated queue adapter** (post C-track / RepoId
+  rebase), not bolted onto the four current ones.
+
+A worker with no `--max-size-class` claims everything — so single-worker self-host is
+byte-for-byte unchanged, and the lanes are purely a cloud deployment choice.
+
+## Escalation on resource failure (dispatcher-era; the cap already exists)
+
+The `attempts` column + dead-letter already ships (`reclaim_stale` → terminal
+`failed` past `RIPCLONE_QUEUE_MAX_ATTEMPTS`). When right-sizing lands, add one thing:
+a stale-reclaim (worker vanished with no ack: almost always OOM / time-limit kill)
+bumps `size_class` one step and re-queues, so a bigger box takes it next; past the
+cap → terminal `failed` "exceeded resource limits". An ack-failed job (`do_sync`
+returned an error: bad repo, auth) is terminal immediately — a bigger box won't help.
+
+## Capacity & dedup
+
+- Coalescing means one active job per `owner/repo/branch`, and a woken worker drains
+  everything it can claim, so bursts need few machines.
+- Double-dispatch is **harmless**: builds are idempotent (content-addressed) and ref
+  writes are ordering-guarded, so a redundant machine wastes compute, never
+  corrupts. This is why the claim can stay loose (queue + cron) instead of a
+  distributed worker-lease.
+- A worker heartbeat/lease row is the eventual precision fix (global cap,
+  cross-replica dispatch dedup, live-worker visibility). Add it once the basic path
+  works — not before.
 
 ## Observability
 
-Dispatch is cost-sensitive and mostly invisible. Emit metrics from day one:
-dispatches attempted/succeeded/failed (by backend and size), workers seen via
-heartbeat, time-to-first-claim (a cold-start proxy), and escalation counts.
-Without these, a stuck `exec` or a quota wall is silent.
+Dispatch is cost-sensitive and mostly invisible. Emit from day one (feeds G3):
+dispatches attempted/succeeded/failed, machines started, time-to-first-claim (a
+cold-start proxy), queue depth, and (later) escalation counts. Without these, a
+throttled Fly quota or a wedged machine is silent.
 
-## Providers
+## Platforms
 
-Cold start is mostly noise next to build time (seed + index-pack + deltify
-dominate), so the bar is "not tens of seconds" (rules out AWS Batch / Fargate).
-Optimize for CPU/RAM, fast ephemeral scratch, and $/CPU-sec. Persistent volumes
-only help the warm-mirror cache.
+Cold start is noise next to build time for big jobs, but NOT for a 1.6–3.6s
+incremental sync — which is exactly why start-stopped (~1s), not fresh-create, is
+mandatory. Optimize for start latency, CPU/RAM, fast ephemeral scratch, $/CPU-sec.
 
-- **Fly Machines** — cloud target. Fast NVMe, per-second; premium list price but
-  cheap on shared CPUs, fast enough for builds.
-- **Modal** — powerful, per-second, big CPU lineup; gVisor is fine for our own
-  trusted code.
-- **Northflank** — cheapest per-second, volumes + built-in S3.
-- **Blaxel** — fastest scale-to-zero (~25ms); verify CPU/RAM ceiling.
-- Alternatives: Morph, E2B, Daytona, Together Code Sandbox, Vercel Sandbox
-  (verify it runs an arbitrary binary + `git`).
-- Avoid: Unikraft/KraftCloud (unikernel, bad fit for `git`'s subprocesses) and
-  Cloudflare edge containers (resource-capped) for heavy builds.
+- **Fly Machines** — the cloud target. Start a stopped pooled machine (~1s), fast
+  NVMe, per-second billing, cloud already runs here.
+- **Modal** — warm-pool container starts ~1s, big CPU lineup, per-second; clean API.
+- **Blaxel** — ~25ms scale-to-zero; verify the CPU/RAM ceiling for big builds.
+- Avoid for the hot path: anything with tens-of-seconds cold start (AWS
+  Batch/Fargate), unikernels (bad fit for git subprocesses), resource-capped edge
+  containers.
 
-All sit behind the same trait. Wire two (cheap for small, big for large) and
-route by `SizeClass`.
+## Testing (dispatcher-era)
 
-## Testing
-
-Wake-on-dispatch is new surface — the existing `e2e_worker_*` tests pre-spawn the
-worker. Cover:
-
-- **Unit** — a recording `Dispatcher`: `dispatch` is called once per enqueue with
-  the right size/repo; `none` is a no-op; `exec` builds the right argv (with an
-  injection test: a branch like `;rm -rf /` stays a literal arg); dispatch is
-  non-blocking (a slow backend doesn't delay enqueue).
-- **e2e spawn-on-dispatch** — an `exec` dispatcher that spawns the real
-  `ripclone-worker --idle-exit-secs`. With no worker pre-running: `/sync` →
-  dispatch → worker appears → builds → clone succeeds → worker exits.
-- **e2e orphan recovery** — dispatch fails (command exits non-zero) → reconcile
-  re-dispatches → job completes. And: kill a worker mid-build → reclaim +
-  reconcile → another worker finishes it.
-- **escalation** — a job that always dies without ack gets `size_class` bumped per
-  reclaim and fails after the cap (no infinite loop). An ack-failed job is
-  terminal, not escalated.
-- **claim filter** — a Small worker won't claim a Large job; a Large worker
+- **Worker `--idle-exit-secs`** — builds until the queue drains, then exits; a job in
+  the exit window is picked up by the reconcile cron.
+- **Cloud dispatch** — webhook enqueues → a stopped machine is started (mock the Fly
+  API); already-starting → no-op; dispatch failure is logged, not returned to the
+  client (the job is queued; the cron covers it).
+- **Reconcile cron** — depth > 0 with no machine running → starts one; a machine
+  already draining → no-op.
+- **Idempotent double-dispatch** — two machines claim/build the same repo → one clean
+  ref, no corruption (ordering guard holds).
+- **Claim filter** (right-sizing) — a Small worker won't claim a Large job; a Large
   drains both.
+- **ApiRefStore** (when added) — a worker with `RIPCLONE_METADATA=api` reports the ref
+  to the control endpoint; a job token with the wrong scope is rejected.
 
 ## Phasing
 
-Phase 1 splits in two. Ship 1a (safe scale-to-zero) before 1b (right-sizing) —
-right-sizing is an optimization, safety is not. Bundling them is what drags in
-the four-adapter schema surgery and the reconcile-sizing livelock.
+The launch bridge (two static lanes + `size_class` bit + G3 alert + runbook) is
+tracked as launch nodes. The dispatcher itself is post-launch, built when the trigger
+fires, in this order:
 
-1a. **Safe scale-to-zero.** `--idle-exit-secs` + the `Dispatcher` trait (`none`,
-   `exec`) wired into `/sync` (fire detached on `Enqueued` *and* `Coalesced`) +
-   the reconcile loop (with the new trait primitive above) + an `attempts` column
-   with a cap: past the cap a stale-reclaim goes terminal `failed`, so a repo that
-   always OOMs can't reclaim-loop forever. **No `size_class` yet** — one size for
-   everything, so the claim filter is a no-op and the reconcile-sizing livelock
-   cannot occur. Result: serverless on any platform via a script, self-host
-   included, and safe.
-1b. **Right-sizing.** Add the `size_class` column (touches all four SQL adapters'
-   DDL + `next_queued_id` filter + the enqueue/`BuildJob` path that carries it) +
-   `--max-size-class` + `size_class` escalation in `reclaim_stale` (rewrites
-   today's blanket UPDATE into a dialect-sensitive `CASE`; `MIN` on sqlite/mysql,
-   `LEAST` on postgres). Now the reconcile primitive must return max-size-class,
-   not a bare count (see "Failure handling").
-2. Native `fly` dispatcher with right-sizing presets.
-3. mirror-from-clonepack (the keystone) so big repos are fast on diskless
-   workers. Can land in parallel; serverless is slow on big repos without it.
-4. Heartbeat/lease → global cap, cross-replica dispatch dedup, precise
-   autoscaling, and visibility into live workers.
+1. **`--idle-exit-secs`** (OSS) + **cloud dispatch-on-enqueue** (Fly start-stopped) +
+   **reconcile cron** (cloud). Serverless scale-to-zero on the deployed queue. Direct
+   ref writes. This is the whole minimum viable dispatcher.
+2. **Keystone** — seed-mirror-from-storage (OSS), shared with fork-overlay. Makes cold
+   machines cheap on big repos.
+3. **Full right-sizing** — widen `size_class`, size the started machine per job,
+   escalation-on-reclaim.
+4. **`ApiRefStore`** (OSS) + the control-plane build-result endpoint (cloud) — take
+   ephemeral workers off direct DB creds.
+5. **Heartbeat/lease** — global cap, cross-replica dedup, live-worker visibility.
 
 ## Reconciliation with the multi-provider rebase
 
-This stacks on the pluggable-queue branch and will absorb the `RepoId` rebase:
-`DispatchHint.repo` becomes a `RepoId`, and the worker uses the credential broker
-for upstream creds — exactly what diskless workers need. Design the new `jobs`
-columns (`size_class`, `attempts`) into the consolidated adapter, not bolted onto
-the four current ones.
+Stacks on the consolidated queue adapter (post C-track). `size_class`/`attempts` are
+designed into that single adapter, not bolted onto the four current ones. The worker
+uses the credential broker for upstream creds — exactly what diskless dispatched
+workers need.
