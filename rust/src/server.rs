@@ -2011,6 +2011,19 @@ async fn get_ref_inner(
     if params.rev.is_none()
         && let Some(resp) = cached_ref_response(&state, &repo_id, &branch, &params.clonepack)
     {
+        // A cached hit is still a real access for warm-TTL accounting; bump
+        // last_accessed_at on the branch row this response came from.
+        if let Err(e) = state
+            .ref_store
+            .touch_last_accessed_at(&repo_id, &resp.branch, &resp.commit)
+            .await
+        {
+            warn!(
+                "failed to touch last_accessed_at for cached {}@{}: {e:#}",
+                repo_id.storage_key(),
+                resp.branch
+            );
+        }
         return (StatusCode::OK, Json(resp)).into_response();
     }
     // Skip the `git fetch` when the mirror was refreshed within the TTL — by a
@@ -9228,6 +9241,74 @@ mod tests {
         assert!(
             updated.last_accessed_at.unwrap() > old_ts,
             "last_accessed_at must advance on a successful ref read"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn ref_read_cache_hit_bumps_last_accessed_at() {
+        let _lock = crate::git::ORIGIN_BASE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let base = tempfile::tempdir().unwrap();
+        let origin = base.path().join("acme").join("widget.git");
+        std::fs::create_dir_all(origin.parent().unwrap()).unwrap();
+        let repo = crate::test_fixture::init_bare(&origin);
+        let tip = crate::test_fixture::commit(&repo, &[("f.txt", b"v1")]);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(&tmp);
+        let ref_store = state.ref_store.clone();
+        let rid = RepoId::github("acme/widget");
+
+        let old_ts = 1_000_000u64;
+        let info = RefInfo {
+            commit: tip.clone(),
+            synced_at: Some(old_ts),
+            last_accessed_at: Some(old_ts),
+            full_clonepack: crate::ClonepackArtifacts {
+                commit: tip.clone(),
+                manifest: "0000000000000000000000000000000000000000".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        ref_store.save_branch(&rid, "main", &info).await.unwrap();
+
+        unsafe { std::env::set_var("RIPCLONE_ORIGIN_BASE", base.path()) };
+        let app = build_app(state);
+        let first = app
+            .clone()
+            .oneshot(request_with_auth(
+                "GET",
+                "/v1/repos/github/acme/widget/refs/main",
+                Some(&auth_header()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let after_first = ref_store.load_branch(&rid, "main").await.unwrap().unwrap();
+        let first_ts = after_first.last_accessed_at.unwrap();
+        assert!(first_ts > old_ts);
+
+        // The second request should be a cache hit and still bump
+        // last_accessed_at for warm-TTL accounting.
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let second = app
+            .oneshot(request_with_auth(
+                "GET",
+                "/v1/repos/github/acme/widget/refs/main",
+                Some(&auth_header()),
+            ))
+            .await
+            .unwrap();
+        unsafe { std::env::remove_var("RIPCLONE_ORIGIN_BASE") };
+
+        assert_eq!(second.status(), StatusCode::OK);
+        let after_second = ref_store.load_branch(&rid, "main").await.unwrap().unwrap();
+        assert!(
+            after_second.last_accessed_at.unwrap() > first_ts,
+            "last_accessed_at must advance on a cached ref read"
         );
     }
 

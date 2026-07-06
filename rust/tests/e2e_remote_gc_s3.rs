@@ -753,8 +753,17 @@ async fn clone_after_eviction_rebuilds_cleanly() {
     let status = get_status(&server, "acme", &repo, None).await;
     assert!(!status["refs"][0]["warm"].as_bool().unwrap());
 
-    let (_dir, target) =
-        sync_and_clone(&server, &origin, 0, ripclone::mode::CloneMode::Editable).await;
+    // Plain clone after eviction: no pre-sync. The first ref resolve returns
+    // 202, enqueues a rebuild, and the client polls until the rebuild is warm.
+    let (_dir, target) = clone_only(
+        &server,
+        "acme",
+        &repo,
+        0,
+        ripclone::mode::CloneMode::Editable,
+    )
+    .await
+    .expect("clone after eviction");
     assert_eq!(read(&target, "a.txt"), "rebuild me\n");
 
     let status = get_status(&server, "acme", &repo, None).await;
