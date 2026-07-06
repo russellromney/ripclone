@@ -12,6 +12,15 @@ pub struct Metrics {
     ref_lookups: AtomicU64,
     syncs: AtomicU64,
     sync_duration_ms_total: AtomicU64,
+    sync_mirror_fetch_ms_total: AtomicU64,
+    sync_commit_graph_ms_total: AtomicU64,
+    sync_head_packs_ms_total: AtomicU64,
+    sync_skeleton_build_ms_total: AtomicU64,
+    sync_files_table_ms_total: AtomicU64,
+    sync_prebuilt_index_ms_total: AtomicU64,
+    sync_upload_p1_ms_total: AtomicU64,
+    sync_ref_publish_ms_total: AtomicU64,
+    sync_publish_p1_ms_total: AtomicU64,
     artifact_requests: AtomicU64,
     artifact_bytes_served: AtomicU64,
     errors: AtomicU64,
@@ -39,6 +48,18 @@ impl Metrics {
         self.syncs.fetch_add(1, Ordering::Relaxed);
         self.sync_duration_ms_total
             .fetch_add(duration.as_millis() as u64, Ordering::Relaxed);
+    }
+
+    pub fn record_sync_phases(&self, phases: SyncPhaseMetrics) {
+        Self::add_optional(&self.sync_mirror_fetch_ms_total, phases.mirror_fetch_ms);
+        Self::add_optional(&self.sync_commit_graph_ms_total, phases.commit_graph_ms);
+        Self::add_optional(&self.sync_head_packs_ms_total, phases.head_packs_ms);
+        Self::add_optional(&self.sync_skeleton_build_ms_total, phases.skeleton_build_ms);
+        Self::add_optional(&self.sync_files_table_ms_total, phases.files_table_ms);
+        Self::add_optional(&self.sync_prebuilt_index_ms_total, phases.prebuilt_index_ms);
+        Self::add_optional(&self.sync_upload_p1_ms_total, phases.upload_p1_ms);
+        Self::add_optional(&self.sync_ref_publish_ms_total, phases.ref_publish_ms);
+        Self::add_optional(&self.sync_publish_p1_ms_total, phases.publish_p1_ms);
     }
 
     pub fn record_artifact_request(&self, bytes: u64) {
@@ -100,6 +121,12 @@ impl Metrics {
         });
     }
 
+    fn add_optional(counter: &AtomicU64, value: Option<u64>) {
+        if let Some(value) = value {
+            counter.fetch_add(value, Ordering::Relaxed);
+        }
+    }
+
     /// Render metrics in the Prometheus text exposition format (v0.0.4).
     /// Counters use the `_total` suffix; `build_queue_depth` is a gauge.
     pub fn prometheus(&self) -> String {
@@ -107,7 +134,7 @@ impl Metrics {
         let s = self.snapshot();
         let mut out = String::with_capacity(2048);
 
-        let counters: [(&str, &str, u64); 14] = [
+        let counters: [(&str, &str, u64); 23] = [
             (
                 "ripclone_ref_lookups_total",
                 "Ref lookups served",
@@ -118,6 +145,51 @@ impl Metrics {
                 "ripclone_sync_duration_ms_total",
                 "Total sync wall time in milliseconds",
                 s.sync_duration_ms_total,
+            ),
+            (
+                "ripclone_sync_mirror_fetch_ms_total",
+                "Total mirror-fetch phase time in milliseconds",
+                s.sync_mirror_fetch_ms_total,
+            ),
+            (
+                "ripclone_sync_commit_graph_ms_total",
+                "Total commit-graph phase time in milliseconds",
+                s.sync_commit_graph_ms_total,
+            ),
+            (
+                "ripclone_sync_head_packs_ms_total",
+                "Total head-pack phase time in milliseconds",
+                s.sync_head_packs_ms_total,
+            ),
+            (
+                "ripclone_sync_skeleton_build_ms_total",
+                "Total skeleton-build phase time in milliseconds",
+                s.sync_skeleton_build_ms_total,
+            ),
+            (
+                "ripclone_sync_files_table_ms_total",
+                "Total files-table phase time in milliseconds",
+                s.sync_files_table_ms_total,
+            ),
+            (
+                "ripclone_sync_prebuilt_index_ms_total",
+                "Total prebuilt-index phase time in milliseconds",
+                s.sync_prebuilt_index_ms_total,
+            ),
+            (
+                "ripclone_sync_upload_p1_ms_total",
+                "Total phase-1 upload time in milliseconds",
+                s.sync_upload_p1_ms_total,
+            ),
+            (
+                "ripclone_sync_ref_publish_ms_total",
+                "Total ref-publish phase time in milliseconds",
+                s.sync_ref_publish_ms_total,
+            ),
+            (
+                "ripclone_sync_publish_p1_ms_total",
+                "Total phase-1 publish wall time in milliseconds",
+                s.sync_publish_p1_ms_total,
             ),
             (
                 "ripclone_artifact_requests_total",
@@ -198,6 +270,15 @@ impl Metrics {
             syncs,
             sync_avg_ms: if syncs == 0 { 0 } else { sync_ms / syncs },
             sync_duration_ms_total: sync_ms,
+            sync_mirror_fetch_ms_total: self.sync_mirror_fetch_ms_total.load(Ordering::Relaxed),
+            sync_commit_graph_ms_total: self.sync_commit_graph_ms_total.load(Ordering::Relaxed),
+            sync_head_packs_ms_total: self.sync_head_packs_ms_total.load(Ordering::Relaxed),
+            sync_skeleton_build_ms_total: self.sync_skeleton_build_ms_total.load(Ordering::Relaxed),
+            sync_files_table_ms_total: self.sync_files_table_ms_total.load(Ordering::Relaxed),
+            sync_prebuilt_index_ms_total: self.sync_prebuilt_index_ms_total.load(Ordering::Relaxed),
+            sync_upload_p1_ms_total: self.sync_upload_p1_ms_total.load(Ordering::Relaxed),
+            sync_ref_publish_ms_total: self.sync_ref_publish_ms_total.load(Ordering::Relaxed),
+            sync_publish_p1_ms_total: self.sync_publish_p1_ms_total.load(Ordering::Relaxed),
             artifact_requests: self.artifact_requests.load(Ordering::Relaxed),
             artifact_bytes_served: self.artifact_bytes_served.load(Ordering::Relaxed),
             errors: self.errors.load(Ordering::Relaxed),
@@ -226,12 +307,34 @@ fn escape_help(s: &str) -> String {
     s.replace('\\', "\\\\").replace('\n', "\\n")
 }
 
+#[derive(Default)]
+pub struct SyncPhaseMetrics {
+    pub mirror_fetch_ms: Option<u64>,
+    pub commit_graph_ms: Option<u64>,
+    pub head_packs_ms: Option<u64>,
+    pub skeleton_build_ms: Option<u64>,
+    pub files_table_ms: Option<u64>,
+    pub prebuilt_index_ms: Option<u64>,
+    pub upload_p1_ms: Option<u64>,
+    pub ref_publish_ms: Option<u64>,
+    pub publish_p1_ms: Option<u64>,
+}
+
 #[derive(Serialize)]
 pub struct MetricsSnapshot {
     pub ref_lookups: u64,
     pub syncs: u64,
     pub sync_avg_ms: u64,
     pub sync_duration_ms_total: u64,
+    pub sync_mirror_fetch_ms_total: u64,
+    pub sync_commit_graph_ms_total: u64,
+    pub sync_head_packs_ms_total: u64,
+    pub sync_skeleton_build_ms_total: u64,
+    pub sync_files_table_ms_total: u64,
+    pub sync_prebuilt_index_ms_total: u64,
+    pub sync_upload_p1_ms_total: u64,
+    pub sync_ref_publish_ms_total: u64,
+    pub sync_publish_p1_ms_total: u64,
     pub artifact_requests: u64,
     pub artifact_bytes_served: u64,
     pub errors: u64,
@@ -257,6 +360,11 @@ mod tests {
         m.record_ref_lookup();
         m.record_ref_lookup();
         m.record_sync(std::time::Duration::from_millis(10));
+        m.record_sync_phases(SyncPhaseMetrics {
+            mirror_fetch_ms: Some(3),
+            publish_p1_ms: Some(7),
+            ..SyncPhaseMetrics::default()
+        });
         m.record_artifact_request(1234);
         m.record_build_queued();
 
@@ -266,14 +374,16 @@ mod tests {
         assert!(out.contains("# HELP ripclone_ref_lookups_total Ref lookups served"));
         assert!(out.contains("# TYPE ripclone_ref_lookups_total counter"));
         assert!(out.contains("\nripclone_ref_lookups_total 2\n"));
+        assert!(out.contains("\nripclone_sync_mirror_fetch_ms_total 3\n"));
+        assert!(out.contains("\nripclone_sync_publish_p1_ms_total 7\n"));
         assert!(out.contains("\nripclone_artifact_bytes_served_total 1234\n"));
 
         // Gauge.
         assert!(out.contains("# TYPE ripclone_build_queue_depth gauge"));
         assert!(out.contains("\nripclone_build_queue_depth 1\n"));
 
-        // Every metric (14 counters + 1 gauge) carries a TYPE line.
-        assert_eq!(out.matches("# TYPE ").count(), 15);
+        // Every metric (23 counters + 1 gauge) carries a TYPE line.
+        assert_eq!(out.matches("# TYPE ").count(), 24);
         // Output is a complete set of lines (no dangling partial line).
         assert!(out.ends_with('\n'));
     }

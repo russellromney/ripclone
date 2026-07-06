@@ -6,7 +6,7 @@ use crate::backends::{self, QueueBackend};
 use crate::cas::Cas;
 use crate::clonepack::{ChunkRef, ClonepackManifest, hash_from_hex, hash_to_hex};
 use crate::git;
-use crate::metrics::Metrics;
+use crate::metrics::{Metrics, SyncPhaseMetrics};
 use crate::oidc::OidcVerifier;
 use crate::pack::PackBuilder;
 use crate::provider::{ProviderInstance, ProviderRegistry, RepoId};
@@ -342,6 +342,22 @@ pub struct SyncPhases {
     pub ref_publish_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub publish_p1_ms: Option<u64>,
+}
+
+impl From<&SyncPhases> for SyncPhaseMetrics {
+    fn from(phases: &SyncPhases) -> Self {
+        Self {
+            mirror_fetch_ms: phases.mirror_fetch_ms,
+            commit_graph_ms: phases.commit_graph_ms,
+            head_packs_ms: phases.head_packs_ms,
+            skeleton_build_ms: phases.skeleton_build_ms,
+            files_table_ms: phases.files_table_ms,
+            prebuilt_index_ms: phases.prebuilt_index_ms,
+            upload_p1_ms: phases.upload_p1_ms,
+            ref_publish_ms: phases.ref_publish_ms,
+            publish_p1_ms: phases.publish_p1_ms,
+        }
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -3577,6 +3593,7 @@ async fn create_snapshot_inner(
     .await
     {
         Ok(result) => {
+            state.metrics.record_sync_phases((&result.phases).into());
             invalidate_ref_response_cache(&state, &repo_id, &branch);
             result.info
         }
@@ -5131,6 +5148,7 @@ async fn build_and_publish_two_phase(
         tokio::spawn(phase2);
     }
 
+    report_sync_phases(repo_id, branch, commit, &phases);
     if std::env::var_os("RIPCLONE_BENCH").is_some() {
         report_sync_bench(repo_id, branch, commit, &phases, storage, &info, mirror_dir);
     }
@@ -5253,6 +5271,17 @@ fn measure_storage_amplification(
         total_storage_bytes,
         amplification,
     })
+}
+
+fn report_sync_phases(repo_id: &RepoId, branch: &str, commit: &str, phases: &SyncPhases) {
+    let report = serde_json::json!({
+        "kind": "sync-phases",
+        "repo": repo_id.storage_key(),
+        "branch": branch,
+        "commit": &commit[..7.min(commit.len())],
+        "phases": phases,
+    });
+    info!("{}", report.to_string());
 }
 
 /// Print a JSON benchmark report when `RIPCLONE_BENCH` is set. Mirrors the
@@ -5777,6 +5806,7 @@ pub async fn process_build_job(
         Ok(result) => {
             let info = &result.info;
             state.metrics.record_build_completed(start.elapsed());
+            state.metrics.record_sync_phases((&result.phases).into());
             // Cross-process resolution: a server that didn't run this build has no
             // local mirror, so it cannot map a requested `HEAD` to the concrete
             // default branch `do_sync` stored the ref under. Persist the real ref
