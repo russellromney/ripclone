@@ -28,6 +28,13 @@ async fn get_status(
     resp.json().await.expect("status json")
 }
 
+fn prometheus_value(text: &str, name: &str) -> Option<u64> {
+    text.lines().find_map(|line| {
+        let (metric, value) = line.split_once(' ')?;
+        (metric == name).then(|| value.parse().ok()).flatten()
+    })
+}
+
 #[tokio::test]
 async fn status_reports_zero_for_unsynced_repo() {
     init(false);
@@ -101,6 +108,21 @@ async fn sync_response_reports_phase_timings_and_status_reports_build_ms() {
     assert!(
         sync.phases.publish_p1_ms.is_some(),
         "phase-1 publish timing should be present"
+    );
+    let metrics = client
+        .get(format!("{}/metrics", server.url))
+        .send()
+        .await
+        .expect("metrics request")
+        .error_for_status()
+        .expect("metrics 2xx")
+        .text()
+        .await
+        .expect("metrics text");
+    assert_eq!(
+        prometheus_value(&metrics, "ripclone_sync_publish_p1_ms_total"),
+        sync.phases.publish_p1_ms,
+        "phase timings should feed /metrics without RIPCLONE_BENCH"
     );
 
     let mut build_ms = None;
