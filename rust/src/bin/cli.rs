@@ -1540,74 +1540,6 @@ async fn resolve_upstream_token(
         .map(|token| token.expose_secret().to_string()))
 }
 
-fn provider_host(
-    provider_id: &str,
-    registry: &ripclone::provider::ProviderRegistry,
-) -> Option<String> {
-    // Preset providers have well-known hosts.
-    let preset = match provider_id {
-        "github" => Some("github.com"),
-        "gitlab" => Some("gitlab.com"),
-        "bitbucket" => Some("bitbucket.org"),
-        _ => None,
-    };
-    if let Some(host) = preset {
-        return Some(host.to_string());
-    }
-    registry.get(provider_id).map(|p| {
-        let h = p.host.trim_end_matches('/');
-        h.strip_prefix("https://")
-            .or_else(|| h.strip_prefix("http://"))
-            .unwrap_or(h)
-            .to_string()
-    })
-}
-
-/// Ask the local git credential helper for a password/token for an HTTPS URL.
-async fn git_credential_token(host: &str, path: &str) -> Result<Option<String>> {
-    let input = format!(
-        "protocol=https\nhost={}\npath={}\n\n",
-        host,
-        path.trim_start_matches('/')
-    );
-    let mut child = tokio::process::Command::new("git")
-        .arg("credential")
-        .arg("fill")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .context("spawn git credential fill")?;
-
-    let mut stdin = child.stdin.take().context("take git credential stdin")?;
-    tokio::io::AsyncWriteExt::write_all(&mut stdin, input.as_bytes()).await?;
-    tokio::io::AsyncWriteExt::shutdown(&mut stdin).await.ok();
-    drop(stdin);
-
-    let output = child
-        .wait_with_output()
-        .await
-        .context("read git credential fill output")?;
-
-    if !output.status.success() {
-        tracing::debug!(
-            "git credential fill failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        return Ok(None);
-    }
-
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        if let Some(password) = line.strip_prefix("password=")
-            && !password.is_empty()
-        {
-            return Ok(Some(password.to_string()));
-        }
-    }
-    Ok(None)
-}
-
 /// Build a `ProviderInstance` for `provider_id`, falling back to built-in
 /// presets when the registry has no custom config.
 fn provider_instance(provider_id: &str, registry: &ProviderRegistry) -> ProviderInstance {
@@ -1617,7 +1549,6 @@ fn provider_instance(provider_id: &str, registry: &ProviderRegistry) -> Provider
     let (kind, host) = match provider_id {
         "github" => (ProviderKind::GitHub, "github.com"),
         "gitlab" => (ProviderKind::GitLab, "gitlab.com"),
-        "bitbucket" => (ProviderKind::Bitbucket, "bitbucket.org"),
         _ => (ProviderKind::Generic, provider_id),
     };
     ProviderInstance {
@@ -1681,8 +1612,7 @@ async fn maybe_verify_upstream(
         return Ok(());
     }
 
-    let store = token_store().context("initialize token store")?;
-    let registry = ripclone::provider_config::load_registry_with_token_store(&store)
+    let registry = ripclone::provider_config::load_registry()
         .context("load provider registry for upstream verification")?;
     let provider = provider_instance(provider_id, &registry);
 
