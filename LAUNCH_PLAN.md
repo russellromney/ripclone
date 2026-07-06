@@ -328,14 +328,40 @@ optimism.
 Accept: stage-level table for cold + incremental sync + amplification table; Fable turns
 it into B6 targets.
 
-**B5. Added-repos model: `add` (make available) vs `sync` (update)** — deps: D4 ✅, A4 ✅, C1, E1, **B4-measurement** — exec Kimi, review Codex `challenge` + Fable — turbogit
+**B5. Added-repos model: `add` (make available) vs `sync` (update)** — deps: D4 ✅, A4 ✅, E1 ✅, **C1 (in flight, Session 6)** — exec Kimi, review Codex `challenge` + Fable — turbogit
 
 RISK NOTE: this is the highest-blast-radius node in the plan — it changes the semantic
 every existing e2e assumes (today an unknown repo builds on demand; after B5 it 404s).
-Budget real time for updating the existing test suite (harness setup gains an
-`add` step; tests that deliberately clone un-added repos flip to asserting the 404).
-Land AFTER E1 so the equivalence oracle guards the change, and give it the Track-A
-adversarial treatment (codex challenge) at merge, not just standard review.
+Land on top of merged C1 (unified keys); give it the Track-A adversarial treatment
+(codex challenge) at merge, not just standard review.
+
+B4-INFORMED SIMPLIFICATION (resolved 2026-07-05): the build policy needs NO fast-path /
+hybrid / top-up special-casing. B4 measured incremental push→clonable at 1.6–3.6s
+(<5s) — so the plain "202 + client poll while building" IS the entire freshness story
+at launch. Build the simple decision tree; do not add a stale-serve-then-fetch path.
+
+IMPLEMENTATION SEQUENCE (do it in THIS order — each step is one commit that keeps CI
+green; the semantic flip is isolated to step 4 and is mechanical, not a debugging
+minefield):
+  1. ADD THE STORE + ENDPOINTS, NO BEHAVIOR CHANGE. Introduce the added_repos store,
+     `POST/DELETE …/add`, and the CLI `add` verb. `add` = register + build (today's
+     sync work + a store write). Clone of an unknown repo STILL builds-on-demand (old
+     behavior untouched). New tests for the store/endpoints; nothing existing breaks.
+  2. MIGRATION + STATUS. Seed added_repos from existing refs + the webhook allowlist;
+     wire the per-class status readiness (shares A4's model). Still no clone-behavior
+     change. Green.
+  3. HARNESS ADD-FIRST. Change the shared test harness setup (the sync_repo/start_server
+     helpers in rust/tests/common/mod.rs) so fixtures are ADDED before clone. This makes
+     the whole existing suite compatible with the new semantic BEFORE the flip. Behavior
+     is still old; tests now add-first. Green.
+  4. FLIP THE SEMANTIC (the scary commit, now safe): clone of non-added → 404
+     repo_not_added; push of non-added → ignored; CLI `sync` of non-added → error.
+     Because step 3 made the suite add-first, most e2e still pass; only the handful that
+     deliberately exercise unknown-repo behavior flip to asserting the 404. Green.
+  5. SYNC-AS-UPDATE + the rest: sync is update-only over the existing base; `--no-history`
+     / size-threshold deferral; the archive-before-history reorder (update DESIGN.md);
+     un-add (`DELETE …/add`, private-only). Green.
+The cloud half of the contract is G7, a separate node — do not build it here.
 ```
 Introduce the concept the backend is missing today: an ADDED REPO. Today a repo is only
 "built" or "not built"; there is no persistent state meaning "this repo is available to
