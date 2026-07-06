@@ -330,6 +330,24 @@ Environment variables for tuning clone performance:
 
 Server-side backends are configured through environment variables: storage and retention (`RIPCLONE_S3_*`, `RIPCLONE_RETENTION_*`, `RIPCLONE_REMOTE_GC_*`), the metadata store (`RIPCLONE_METADATA*`), and the build queue / farm-out workers (`RIPCLONE_QUEUE*`). See `docs/BACKENDS.md` and `docs/CHANGELOG.md` for the full list.
 
+## Telemetry
+
+After a successful clone, the CLI sends a single fire-and-forget metrics POST to the configured server. It is advertising-grade telemetry, never billing-grade, and never on the clone's critical path: a failure to send cannot change the clone's exit status. The report is skipped entirely when the server does not mint a clone id (self-host / older server), when `--no-metrics` is passed, or when `RIPCLONE_NO_METRICS` is set to any non-empty value.
+
+The payload contains:
+
+- `cloneId` — the server-minted clone id from the ref-resolve response.
+- `repo` — `{ provider, owner, name }` of the cloned repo.
+- `commit` — the resolved commit SHA.
+- `mode` — `depth1`, `full`, or `files`.
+- `cold` — whether the clone waited for a fresh build.
+- `totalMs` — end-to-end clone wall time in milliseconds.
+- `bytes` — total bytes downloaded.
+- `downloadMs` — currently omitted in v1.
+- `client` — `{ os, arch, ripcloneVersion }`.
+
+Self-hosted servers accept and drop this POST at `POST /v1/clones/{cloneId}/metrics` so the CLI never spams its own server with 404s.
+
 ## License
 
 Licensed under either of

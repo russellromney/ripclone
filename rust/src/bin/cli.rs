@@ -122,6 +122,9 @@ enum Commands {
         /// Print a per-phase benchmark report after the clone.
         #[arg(long)]
         bench: bool,
+        /// Suppress the fire-and-forget clone metrics report.
+        #[arg(long)]
+        no_metrics: bool,
         /// Cross-check the installed tip against the upstream git host.
         /// `auto` (default) enables verification for public repos and whenever an
         /// upstream credential is available; `always` requires verification;
@@ -1101,13 +1104,17 @@ async fn main() -> Result<()> {
             at,
             temp,
             bench,
+            no_metrics,
             verify_upstream,
         } => {
             let (provider, repo_path) = resolve_repo(&repo, &default_provider, &provider_registry)?;
             let upstream_token = resolve_upstream_token(&provider, args.token.as_deref()).await?;
-            let client = client
+            let mut client = client
                 .with_provider(&provider)
                 .with_upstream_token_opt(upstream_token.clone());
+            if no_metrics {
+                client = client.with_metrics_disabled();
+            }
             let target_name = repo_path
                 .rsplit('/')
                 .next()
@@ -1205,7 +1212,8 @@ async fn main() -> Result<()> {
             }
             // Fire-and-forget: report metrics to the managed cloud AFTER printing
             // success. Best-effort — skipped if the server didn't mint a clone id
-            // (self-host) and never able to affect the clone's exit status.
+            // (self-host), the user passed --no-metrics, or the RIPCLONE_NO_METRICS
+            // env var is set. Never able to affect the clone's exit status.
             client.report_clone_metrics(&outcome, total_ms).await;
         }
         Commands::Sidecar { dir } => {
