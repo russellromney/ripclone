@@ -87,6 +87,27 @@ All decided 2026-07-03.
   warm 10× path. `--depth 1` stays as the explicit speed knob for CI/agents.
   Implementation rides C3 (item 4); docs/benchmark copy follow (F5, S0/S1).
 
+### Core-ICP decisions (proposed 2026-07-06 — confirm) — agents on huge repos
+
+The two best-customer segments are agents on massive PRIVATE monorepos and agents on
+huge PUBLIC OSS repos. Both are "agents + giants"; the plan's guardrails were sized
+for medium repos. Three decisions close the gap:
+
+- **D9 Uncap paid orgs.** The tiered-add hard cap (D-level, ~10 GB) is a FREE-TIER abuse
+  control only. Paid orgs get a high/no ceiling — a 20 GB internal monorepo is the
+  customer, not the threat. (G2 splits the gate.) Recommend: yes.
+- **D10 Agent-fleet is first-class.** Make agents a real path, not just a token type:
+  an explicit agent mode/env (`RIPCLONE_AGENT=1` or a config default) that sets
+  fleet-sane defaults (depth-1 or files, no prompts, cache reuse, `--temp` friendly),
+  plus a copy-paste fleet quickstart. D8's full-history default stays for humans; agent
+  mode flips to depth-1/files. (New node F6.) Recommend: yes.
+- **D11 Segment-2 is a cheap loss-leader.** Huge PUBLIC repos build phase-1 + archive
+  only; full history builds solely on an explicit `--depth 0` request (B5's size-
+  threshold history-deferral, made a real default). Keeps the commons cheap so it funnels
+  to segment 1 (they pay when agents hit their own private code). Per-repo warm
+  sponsorship stays deferred as the later monetize-the-giants option. Recommend: yes,
+  loss-leader.
+
 ### Provider readiness matrix (per D3)
 
 Rows = what "supported" requires; cells = ✅ done · node = where it lands · ⛔ deferred.
@@ -771,6 +792,27 @@ document — the code is careful and it's a real differentiator. Add its e2e to 
 if not already run.
 ```
 
+**F6. Agent-fleet ergonomics (core ICP, D10)** — deps: C3 (CLI surface), B5 (add/sync) — Codex — turbogit + docs
+```
+Make "agents on huge repos" a first-class path, not a scattered set of flags. The
+primitives exist (--temp tmpfs clone, --depth 1, --mode files, token-in-env,
+device-less auth) — surface them coherently.
+1. Agent mode: `RIPCLONE_AGENT=1` (or config default) sets fleet-sane defaults —
+   depth-1 default (NOT D8's full-history human default; agents on giants don't want
+   1.3M commits), no interactive prompts ever, cache reuse on, --temp-friendly. Explicit
+   and documented, not a silent size-based switch (that surprises humans).
+2. Fleet quickstart: a copy-paste block for CI/agent VMs — install + token-in-env +
+   `ripclone clone owner/repo` (or --mode files for pure worktree agents). Headless,
+   no login round-trip (agent token pasted into the VM's env/secret).
+3. Verify the headless path end-to-end: token in env, no TTY, no prompt, works; the
+   402/403 paywall errors are machine-parseable (already carry the subscribe URL).
+4. Docs: an "Agents & CI" page — depth-1 vs files vs full guidance (full is for humans;
+   agents want depth-1/files), --temp for ephemeral fleet VMs, the fleet quickstart.
+Tests: RIPCLONE_AGENT clone defaults to depth-1; no prompt in a non-TTY context; a
+files-mode fleet clone of a large fixture is fast + correct.
+Checks: touched CLI + e2e tests, debug; PR CI is the gate.
+```
+
 **F5. OSS docs cleanup** — deps: B7, C-track, D6 — Kimi — turbogit
 ```
 1. README restructure: pitch + ONE benchmark table + quick start + links. Move full
@@ -825,7 +867,10 @@ rebuilds cleanly.
    - size > SIZE_FREE → allowed only if stars ≥ STAR_MIN (default 500) OR the adder
      has push access to the repo (permission check we already have) OR the add is by
      a paid org. Clear rejection message naming the rule.
-   - size > SIZE_HARD_CAP (default 10 GB) → rejected for everyone ("contact us").
+   - size > SIZE_HARD_CAP (default 10 GB) → rejected on the FREE tier only. **D9: a
+     paid org has a high/no ceiling** (RIPCLONE_PAID_HARD_CAP, default very high /
+     unlimited) — a big private monorepo is the ICP, not the threat. The hard cap is a
+     free-tier abuse control, not a paid limit.
    All thresholds env-configurable. Plus: per-account add rate limit, global
    concurrent-build ceiling. Log every rejection. (OSS side keeps only a dumb
    RIPCLONE_MAX_REPO_SIZE env — the tiered policy is cloud product logic.)
@@ -1111,7 +1156,11 @@ B4→B6; A4+C1→B5; A-nodes → A-R; B5+G2→G7; everything → B8 → wave-4 r
 - **Wave 3:** B6 · D-1..D-3 · F3, F5 · G2, G4, G7, G8 · H2-H5
 - **Wave 4 (gate):** B8 (last code, after all merges) · feature-inventory closeout
   (G2 gate) · fresh adversarial review (Codex) — STATE-scoped, not diff-scoped: challenge the launch-critical invariants as they exist at wave 4 (publish/ordering, authz, GC-vs-liveness, entitlement, token handling). Re-reviewing 10k+ lines of already-per-PR-reviewed diff is waste; attacking the final state of the five critical subsystems is the point · benchmark
-  refresh incl. p95/cold rows + amplification · G6 cutover.
+  refresh incl. p95/cold rows + amplification — **run it on linux + a big-monorepo
+  fixture, not just bun/pandas (core-ICP validation): cold build, incremental sync
+  (the 5s tripwire), and amplification at giant scale. Every ICP-facing SLA number
+  currently comes from medium repos; gate the claims on the giant-repo numbers** ·
+  G6 cutover.
 
 ## Launch gates (sign-off checklist)
 
