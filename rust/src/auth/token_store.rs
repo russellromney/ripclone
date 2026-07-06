@@ -1,7 +1,6 @@
-//! File-based token storage for provider credentials.
+//! File-based token storage for CLI session credentials.
 //!
-//! Reads per-provider environment variables first, then a token file in the
-//! ripclone config directory. It never talks to the OS keychain/keyring.
+//! It never talks to the OS keychain/keyring.
 
 use anyhow::{Context, Result};
 use std::collections::HashMap;
@@ -15,27 +14,6 @@ pub trait TokenStore: Send + Sync {
     fn set(&self, id: &str, token: &str) -> Result<()>;
     /// Delete the stored token for `id`.
     fn delete(&self, id: &str) -> Result<()>;
-}
-
-/// Read a token from the environment: `RIPCLONE_PROVIDER_<ID>_TOKEN`.
-pub fn env_token(id: &str) -> Option<String> {
-    let var = provider_env_var(id);
-    std::env::var(&var).ok().filter(|t| !t.is_empty())
-}
-
-/// The env-var name for provider `id`.
-pub fn provider_env_var(id: &str) -> String {
-    let normalized: String = id
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() {
-                c.to_ascii_uppercase()
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    format!("RIPCLONE_PROVIDER_{}_TOKEN", normalized)
 }
 
 /// Token store backed by a JSON file with restrictive permissions.
@@ -91,7 +69,7 @@ impl TokenStore for FileTokenStore {
     }
 }
 
-/// Default token store: reads from env, then a file; writes to the file.
+/// Default token store backed by the ripclone config directory.
 pub struct FileBackedTokenStore {
     file: FileTokenStore,
 }
@@ -112,9 +90,6 @@ impl FileBackedTokenStore {
 
 impl TokenStore for FileBackedTokenStore {
     fn get(&self, id: &str) -> Result<Option<String>> {
-        if let Some(t) = env_token(id) {
-            return Ok(Some(t));
-        }
         self.file.get(id)
     }
 
@@ -141,19 +116,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn env_var_normalization() {
-        assert_eq!(provider_env_var("gitlab"), "RIPCLONE_PROVIDER_GITLAB_TOKEN");
-        assert_eq!(
-            provider_env_var("my-gitea"),
-            "RIPCLONE_PROVIDER_MY_GITEA_TOKEN"
-        );
-        assert_eq!(
-            provider_env_var("company.gitea"),
-            "RIPCLONE_PROVIDER_COMPANY_GITEA_TOKEN"
-        );
-    }
-
-    #[test]
     fn file_store_round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let store = FileTokenStore::new(dir.path().join("tokens.json"));
@@ -162,16 +124,6 @@ mod tests {
         assert_eq!(store.get("gitlab").unwrap().as_deref(), Some("glpat-xyz"));
         store.delete("gitlab").unwrap();
         assert!(store.get("gitlab").unwrap().is_none());
-    }
-
-    #[test]
-    fn env_reads_before_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = FileBackedTokenStore::with_path(dir.path().join("tokens.json"));
-        store.set("gitlab", "from-file").unwrap();
-        unsafe { std::env::set_var("RIPCLONE_PROVIDER_GITLAB_TOKEN", "from-env") };
-        assert_eq!(store.get("gitlab").unwrap().as_deref(), Some("from-env"));
-        unsafe { std::env::remove_var("RIPCLONE_PROVIDER_GITLAB_TOKEN") };
     }
 
     #[test]

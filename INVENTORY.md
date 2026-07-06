@@ -17,7 +17,7 @@ keep/flag/cut decisions are left to Fable + Russell.
 ## turbogit — CLI / binaries
 
 | `ripclone` global flags (`--server`, `--provider`, `--token`) | turbogit | README.md, docs/BACKENDS.md, docs/AUTH.md | yes (`e2e_login_logout.rs`, `e2e_auth.rs`, `e2e_provider_cli.rs`, `e2e_config_*.rs`) | Works for self-host; `--server` defaults to managed cloud. |
-| `ripclone login` (device flow) | turbogit | README.md | yes (`e2e_login_logout.rs`) | **Cloud-only**: calls `/cli/device` + `/cli/device/token`, which are not implemented in the OSS server. |
+| `ripclone login` | turbogit | README.md | yes (`e2e_login_logout.rs`) | Routes to cloud device flow for ripclone.com and self-host session login for non-cloud servers. |
 | `ripclone logout` | turbogit | README.md | yes (`e2e_login_logout.rs`) | Removes saved server token. |
 | `ripclone version` | turbogit | README.md | yes (`e2e_version.rs`) | Calls `/v1/version`. |
 | `ripclone update` | turbogit | README.md | no | Checks latest GitHub release. |
@@ -25,7 +25,7 @@ keep/flag/cut decisions are left to Fable + Russell.
 | `ripclone auth logout` | turbogit | docs/AUTH.md | yes (`e2e_auth.rs`) | Removes saved JWT. |
 | `ripclone auth status` | turbogit | docs/AUTH.md | yes (`e2e_auth.rs`) | Shows saved JWT expiry. |
 | `ripclone sync <repo>` (`--depth`, `--at`) | turbogit | README.md | yes (`e2e_roundtrip.rs`, `e2e_sync_at_rev.rs`, `e2e_two_phase.rs`) | Posts to `/v1/repos/{provider}/{repo}/sync`. |
-| `ripclone clone <repo>` (`--dir`, `--branch`, `--mode`, `--depth`, `--at`, `--temp`, `--bench`) | turbogit | README.md | yes (`e2e_roundtrip.rs`, `e2e_config_clone_mode.rs`, `e2e_equivalence.rs`) | Default mode `editable`, default depth 1. |
+| `ripclone clone <repo>` (`--dir`, `--branch`, `--mode`, `--depth`, `--at`, `--temp`, `--bench`) | turbogit | README.md | yes (`e2e_roundtrip.rs`, `e2e_config_clone_mode.rs`, `e2e_equivalence.rs`) | Default mode `editable`, default depth 0/full history. |
 | `ripclone sidecar` | turbogit | README quick start (implicit) | no | Finishes snapshot clone in background. |
 | `ripclone cat <repo> <path>` | turbogit | not in README | no | Reads file from skeleton clone via `/cat`. |
 | `ripclone provider add/list/rm/test` | turbogit | README.md, docs/BACKENDS.md | yes (`e2e_provider_cli.rs`) | Writes/reads provider config and tests connectivity. |
@@ -46,7 +46,6 @@ keep/flag/cut decisions are left to Fable + Russell.
 
 | `RIPCLONE_CONFIG` | turbogit | docs/BACKENDS.md | yes (`e2e_config_global_and_overrides.rs`) | Explicit global config path; default `~/.config/ripclone/config.toml`. |
 | `RIPCLONE_SERVER` | turbogit | README.md | yes (many) | Server URL precedence for CLI / git-remote. |
-| `RIPCLONE_PROVIDER` | turbogit | README.md | yes (`e2e_multi_provider.rs`) | Default provider instance. |
 | `RIPCLONE_UPSTREAM_TOKEN` | turbogit | README.md | yes (`e2e_auth.rs`) | Sent as `X-Upstream-Token`. |
 | `RIPCLONE_MODE` | turbogit | README.md | yes (`e2e_config_clone_mode.rs`) | Default clone mode (`editable`). |
 | `RIPCLONE_BENCH` | turbogit | README.md | yes (many) | Enables `--bench` output. |
@@ -94,8 +93,8 @@ keep/flag/cut decisions are left to Fable + Russell.
 | `RIPCLONE_TRUST_FORWARDED_FOR` | turbogit | not documented | no | Trust `X-Forwarded-For`. |
 | `RIPCLONE_ORIGIN_BASE` | turbogit | not documented | unit tests | Test override for upstream base URL. |
 | `RIPCLONE_TEST_FAIL_FIRST_FETCHES` / `RIPCLONE_TEST_ARCHIVE_DELAY_MS` / `RIPCLONE_TEST_PG_URL` / `RIPCLONE_TEST_MYSQL_URL` | turbogit | not documented | yes (`e2e_freshness.rs`, metadata tests) | Test-only hooks. |
-| `RIPCLONE_PROVIDERS` / `RIPCLONE_PROVIDERS_CONFIG` | turbogit | README.md, docs/BACKENDS.md | yes (`e2e_multi_provider.rs`, `e2e_provider_cli.rs`) | JSON provider config. |
-| `RIPCLONE_PROVIDER_<ID>_TOKEN` / `RIPCLONE_GITHUB_TOKEN` | turbogit | README.md (implicit), docs/BACKENDS.md | yes (`e2e_provider_cli.rs`, many) | Per-provider static token / legacy GitHub PAT. |
+| `RIPCLONE_PROVIDERS` | turbogit | README.md, docs/BACKENDS.md | yes (`e2e_multi_provider.rs`, `e2e_provider_cli.rs`) | Object-form JSON provider config. |
+| `RIPCLONE_GITHUB_TOKEN` | turbogit | docs/BACKENDS.md | yes (`provider_config::tests`) | Legacy GitHub-default shortcut when no configured GitHub token exists. |
 | GitHub App env vars (`RIPCLONE_GITHUB_APP_ID`, `INSTALLATION_ID`, `PRIVATE_KEY`, `PRIVATE_KEY_PATH`, `API_BASE`) | turbogit | docs/GITHUB_INTEGRATION.md | no (marked `#[ignore]`) | GitHub App token minting. |
 
 ## turbogit — HTTP API endpoints
@@ -125,7 +124,6 @@ keep/flag/cut decisions are left to Fable + Russell.
 | GitHub webhook (`/webhooks/github`, `/v1/webhooks/github`) | turbogit | README.md, docs/WEBHOOKS.md | yes (`e2e_webhook.rs`) | HMAC-SHA256 verified. |
 | GitLab webhook (`/webhooks/gitlab`) | turbogit | docs/WEBHOOKS.md | yes (`e2e_webhook.rs`) | Shared-token verified. |
 | Gitea/Forgejo/Codeberg webhook (`/webhooks/gitea`) | turbogit | docs/WEBHOOKS.md | yes (`e2e_webhook.rs`) | HMAC-SHA256 verified. |
-| Bitbucket webhook | turbogit | docs/WEBHOOKS.md says "would follow same trait" | no | **Not implemented**: `webhook::provider_for` returns `None`. |
 | Shell installer (`curl …/install.sh \| sh`) | turbogit | README.md, CHANGELOG.md | no | Release workflow exists; unverified without published release. |
 | Cargo / crates.io (`cargo install ripclone`) | turbogit | README.md, CHANGELOG.md | no | Cargo.toml configured; not yet published. |
 | pip / PyPI (`pip install ripclone`) | turbogit | README.md, CHANGELOG.md | no | **Stale doc claim**: `pyproject.toml` and Python package were removed. |
@@ -222,7 +220,7 @@ keep/flag/cut decisions are left to Fable + Russell.
 ## Cross-repo doc/implementation gaps
 
 | pip install channel | turbogit | README.md | no | Stale: Python package and `pyproject.toml` were removed. |
-| `ripclone login` against OSS | turbogit | README.md | no | Cloud-only endpoints absent in OSS server. |
+| `ripclone login` against OSS | turbogit | README.md | yes (`e2e_login_logout.rs`) | Routes to self-host session-token auth instead of the cloud device endpoints. |
 | `ripclone track/untrack/tracked` commands and API | turbogit | docs/WEBHOOKS.md | no | Not implemented. |
 | `/start`, `/security`, `/terms`, `/privacy` pages | ripclone-cloud | SCREENS.md | no | Not implemented. |
 | Public repo removal from `/public` | ripclone-cloud | SCREENS.md §4 | yes (in action) | Contradicts spec: Remove button exists. |

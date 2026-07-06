@@ -38,16 +38,16 @@ pub struct BuildJob {
     /// the in-process [`LocalJobQueue`]; the cross-process [`SqlJobQueue`] builds
     /// the branch tip (rev is not persisted).
     pub rev: Option<String>,
-    /// Upstream credential (Tier-B passthrough) for the mirror fetch. Only
-    /// carried in-process via [`LocalJobQueue`]; the cross-process
-    /// [`SqlJobQueue`] never persists credentials — its worker resolves its own
-    /// via the credential broker.
+    /// Upstream credential (Tier-B passthrough) for the mirror fetch. The
+    /// in-process [`LocalJobQueue`] carries it directly; [`SqlJobQueue`] stores
+    /// an obfuscated copy long enough for a cross-process worker to claim the
+    /// job, then clears it on claim or finish.
     pub credential: Option<secrecy::SecretString>,
     /// How many consecutive post-build freshness re-checks led to this job. The
     /// post-build re-check stops once this reaches `RIPCLONE_RECHECK_MAX`, so on a
     /// single box one repo pushing faster than it builds can't pin the worker.
     /// Only carried in-process; the cross-process [`SqlJobQueue`] does not persist
-    /// it (like `rev`/`credential`), so there the chain is not capped — but it is
+    /// it (like `rev`), so there the chain is not capped — but it is
     /// bounded by the real push rate (each re-trigger builds a genuinely newer tip,
     /// not a spin) and spread across the worker pool, with the poller as backstop.
     pub recheck: u32,
@@ -55,9 +55,9 @@ pub struct BuildJob {
 
 impl BuildJob {
     /// Coalescing key: concurrent syncs for the same key collapse to one build.
-    /// Uses the repo's storage key (back-compat `owner/repo` for GitHub) plus the
-    /// branch, so it is stable across processes. Slash-joined (not NUL-joined):
-    /// some SQL engines (Postgres) reject `\0` in TEXT columns.
+    /// Uses the repo's storage key plus the branch, so it is stable across
+    /// processes. Slash-joined (not NUL-joined): some SQL engines (Postgres)
+    /// reject `\0` in TEXT columns.
     pub fn key(&self) -> String {
         format!("{}/{}", self.repo_id.storage_key(), self.branch)
     }

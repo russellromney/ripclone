@@ -12,7 +12,8 @@
 //! - `RIPCLONE_QUEUE_DB_URL` (required): a local path for sqlite; a
 //!   `postgres://` / `mysql://` url for those; a `libsql://` url for libsql
 //!   (with `RIPCLONE_QUEUE_DB_TOKEN`).
-//! - storage env (`RIPCLONE_S3_*` or local) and `RIPCLONE_GITHUB_TOKEN`.
+//! - storage env (`RIPCLONE_S3_*` or local) and provider config
+//!   (`RIPCLONE_PROVIDERS` or `config.toml`).
 //! - `RIPCLONE_QUEUE_STALE_SECS` (default 1800) bounds how long a crashed
 //!   worker's claimed job is held before another worker reclaims it — set it
 //!   above your longest build.

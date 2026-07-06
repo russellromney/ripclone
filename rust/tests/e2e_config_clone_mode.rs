@@ -63,12 +63,14 @@ async fn project_config_drives_clone_mode_and_default_provider() {
     origin.commit(&[("README.md", "hello from config-driven clone\n")], "c1");
     origin.publish();
 
-    let providers = serde_json::json!([{
+    let providers = serde_json::json!({
+        "providers": [{
         "id": "localgit",
         "kind": "generic",
         "host": &origin.url,
         "auth_template": "token {token}",
-    }]);
+    }]
+    });
     unsafe {
         std::env::set_var("RIPCLONE_PROVIDERS", providers.to_string());
     }

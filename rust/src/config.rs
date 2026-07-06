@@ -4,8 +4,8 @@
 //! optional project-level `ripclone.toml` discovered by walking up from the
 //! current directory. Environment variables and CLI flags still take precedence.
 //!
-//! This file intentionally does **not** contain secrets. Server and provider
-//! tokens are stored separately via environment variables or the ripclone token file.
+//! Provider tokens may be declared here for self-host/server-side syncs. CLI
+//! session tokens are stored separately in the ripclone token file.
 
 use crate::provider::ProviderConfig;
 use anyhow::{Context, Result};
@@ -24,8 +24,8 @@ pub struct Config {
     pub default_provider: Option<String>,
     /// Default clone options.
     pub clone: CloneConfig,
-    /// Custom/self-hosted provider declarations. Built-in presets (github,
-    /// gitlab, bitbucket) are implicit and do not need to be declared.
+    /// Custom/self-hosted provider declarations. Built-in presets (github and
+    /// gitlab) are implicit and do not need to be declared.
     pub providers: HashMap<String, ProviderEntry>,
     /// Server-side artifact storage backend (`[storage]`).
     pub storage: StorageConfig,
@@ -49,6 +49,7 @@ pub struct CloneConfig {
 pub struct ProviderEntry {
     pub kind: String,
     pub host: Option<String>,
+    pub token: Option<String>,
     pub auth_template: Option<String>,
     /// Optional header name for the credential. Defaults to `Authorization`.
     pub auth_header_name: Option<String>,
@@ -208,8 +209,8 @@ fn load_legacy_json(path: &Path) -> Config {
         .unwrap_or_default()
 }
 
-/// Save the global configuration. Secrets are not written; use the token store
-/// for server/provider tokens.
+/// Save the global configuration. CLI session tokens are not written; use the
+/// token store for those.
 pub fn save(config: &Config) -> Result<()> {
     let path = global_config_path().context("no HOME for config path")?;
     save_to(&path, config)
@@ -239,7 +240,7 @@ impl Config {
                 id: id.clone(),
                 kind: Some(entry.kind.clone()),
                 host: entry.host.clone(),
-                token: None,
+                token: entry.token.clone(),
                 auth_template: entry.auth_template.clone(),
                 auth_header_name: entry.auth_header_name.clone(),
             })
@@ -350,7 +351,7 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_toml_no_secrets() {
+    fn round_trip_toml_provider_token() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         let mut providers = HashMap::new();
@@ -359,6 +360,7 @@ mod tests {
             ProviderEntry {
                 kind: "gitea".into(),
                 host: Some("https://gitea.example.com".into()),
+                token: Some("provider-token".into()),
                 auth_template: None,
                 auth_header_name: None,
             },
@@ -403,6 +405,13 @@ mod tests {
         );
         assert_eq!(loaded.default_provider.as_deref(), Some("my-gitea"));
         assert!(loaded.providers.contains_key("my-gitea"));
+        assert_eq!(
+            loaded
+                .providers
+                .get("my-gitea")
+                .and_then(|entry| entry.token.as_deref()),
+            Some("provider-token")
+        );
         assert_eq!(loaded.queue.backend.as_deref(), Some("postgres"));
         assert_eq!(loaded.queue.url.as_deref(), Some("postgres://db/ripclone"));
         assert_eq!(loaded.metadata.backend.as_deref(), Some("postgres"));
@@ -484,6 +493,7 @@ default_provider = "my-gitea"
             ProviderEntry {
                 kind: "gitea".into(),
                 host: Some("https://gitea.example.com".into()),
+                token: Some("secret".into()),
                 auth_template: Some("token {{token}}".into()),
                 auth_header_name: None,
             },
@@ -500,7 +510,7 @@ default_provider = "my-gitea"
         assert_eq!(p.kind.as_deref(), Some("gitea"));
         assert_eq!(p.host.as_deref(), Some("https://gitea.example.com"));
         assert_eq!(p.auth_template.as_deref(), Some("token {{token}}"));
-        assert!(p.token.is_none(), "token must not leak into ProviderConfig");
+        assert_eq!(p.token.as_deref(), Some("secret"));
     }
 
     #[test]

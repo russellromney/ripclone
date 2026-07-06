@@ -74,8 +74,7 @@ Per-provider specifics:
 | Gitea / Forgejo | `X-Gitea-Signature` = HMAC-SHA256(secret, body) hex | `X-Gitea-Event` | `repository.{owner.login, name, default_branch, private}`; `ref`, `after` |
 
 Adding a provider = implement `WebhookProvider`. **GitHub, GitLab, and
-Gitea/Forgejo are implemented** (`rust/src/webhook/{github,gitlab,gitea}.rs`);
-Bitbucket would follow the same trait.
+Gitea/Forgejo are implemented** (`rust/src/webhook/{github,gitlab,gitea}.rs`).
 
 Two adapter notes worth knowing:
 - **GitLab** authenticates with a shared *token* echoed in `X-Gitlab-Token`, not
@@ -265,9 +264,8 @@ Phase 1 (GitHub) is implemented:
       tracked/untracked non-default branch.
 - [x] Docs: README "Webhooks" section; cross-links below.
 
-**Follow-ups:** a Bitbucket adapter (another `WebhookProvider` impl + a match arm
-in `webhook::provider_for`). Repo-lifecycle events (visibility/rename/delete) and
-tag/release pre-warm (see [Events](#events--phase-1-vs-later)).
+**Follow-ups:** Repo-lifecycle events (visibility/rename/delete) and tag/release
+pre-warm (see [Events](#events--phase-1-vs-later)).
 
 ## Open questions — resolved
 

@@ -1,8 +1,7 @@
 //! Credential broker seam.
 //!
 //! `StaticBroker` is Tier-B passthrough: a request-scoped token from the
-//! `X-Upstream-Token` header wins, then a per-instance configured token, then
-//! (for the github default) the legacy `RIPCLONE_GITHUB_TOKEN`.
+//! `X-Upstream-Token` header wins, then a per-instance configured token.
 //!
 //! `GitHubAppBroker` is a Tier-A broker that mints short-lived scoped tokens: it
 //! signs an app JWT (RS256) with the app's private key and exchanges it for an

@@ -67,6 +67,8 @@ pub fn should_retry_stale(attempt: u32, max_retries: u32, err: &anyhow::Error) -
 /// keyed on status/code. Surfaces an upgrade nudge from `X-Ripclone-Upgrade`.
 async fn server_error(context: &str, resp: reqwest::Response) -> anyhow::Error {
     let status = resp.status();
+    let origin = resp.url().origin().unicode_serialization();
+    let is_cloud = origin == "https://ripclone.com";
     let upgrade = resp
         .headers()
         .get("x-ripclone-upgrade")
@@ -86,15 +88,19 @@ async fn server_error(context: &str, resp: reqwest::Response) -> anyhow::Error {
                 text.clone()
             }
         });
-    let hint = match (status.as_u16(), code) {
-        (401, _) => "\n  → set RIPCLONE_SERVER_TOKEN (create one at https://ripclone.com/tokens)",
-        (403, Some("no_plan")) => {
+    let hint = match (status.as_u16(), code, is_cloud) {
+        (401, _, true) => "\n  → run `ripclone login`",
+        (401, _, false) => {
+            "\n  → run `ripclone login --server <server>` or set RIPCLONE_SERVER_TOKEN"
+        }
+        (403, Some("no_plan"), true) => {
             "\n  → this org needs a plan; the owner can subscribe at https://ripclone.com"
         }
-        (403, Some("no_access")) => "\n  → you don't have GitHub access to this repo",
-        (403, _) => "\n  → the org may need a plan, or you lack GitHub access",
-        (429, _) => "\n  → rate limited; wait a moment and retry",
-        (502 | 503, _) => "\n  → ripclone is briefly unavailable; retry shortly",
+        (403, Some("no_access"), true) => "\n  → you don't have GitHub access to this repo",
+        (403, _, true) => "\n  → the org may need a plan, or you lack GitHub access",
+        (403, _, false) => "\n  → access denied by the configured server",
+        (429, _, _) => "\n  → rate limited; wait a moment and retry",
+        (502 | 503, _, _) => "\n  → ripclone is briefly unavailable; retry shortly",
         _ => "",
     };
     if let Some(u) = upgrade {

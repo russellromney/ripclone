@@ -65,8 +65,8 @@ This file tracks what has already landed in ripclone. For upcoming work see `ROA
   - Legacy `/v1/repos/{owner}/{repo}/...` routes are removed. All repos are now addressed as `/v1/repos/{provider}/{repo-path}/...`, including GitHub (`/v1/repos/github/owner/repo/...`).
   - The CLI and git remote helper accept provider-qualified paths (`github/owner/repo`, `gitlab/group/sub/project`).
 - **Provider registry + presets** (`rust/src/provider.rs`)
-  - New `ProviderKind` enum: `github`, `gitlab`, `bitbucket`, `gitea`, `generic`.
-  - `ProviderRegistry::load()` reads instances from `RIPCLONE_PROVIDERS` JSON or `RIPCLONE_PROVIDERS_CONFIG`, merged with the built-in `github` default.
+  - New `ProviderKind` enum: `github`, `gitlab`, `gitea`, `generic`.
+  - `ProviderRegistry::load()` reads instances from `RIPCLONE_PROVIDERS` JSON or `config.toml`, merged with the built-in `github` default.
   - Each instance defines `clone_url(path)` and `auth_header(token)` so the server can speak the right auth dialect to each host.
 - **Credential-header injection** (`rust/src/git.rs`, `rust/src/auth/broker.rs`)
   - `sync_bare_mirror` builds a clean clone URL and injects credentials via `git -c http.extraHeader="Authorization: ..."`. Secrets no longer appear in URLs.
@@ -125,7 +125,7 @@ This file tracks what has already landed in ripclone. For upcoming work see `ROA
 
 - **User-facing clone modes** (`rust/src/mode.rs`, `rust/src/bin/cli.rs`, `rust/src/client.rs`)
   - Replaced the hidden `RIPCLONE_EXTRACT_ARCHIVE=1` flag with `--mode full|fast|hybrid|skeleton`.
-  - `full` is the default and behaves like `git clone --depth=1`: complete `.git`, head-blobs pack, and `git checkout-index`.
+  - `editable` is the default and behaves like a full `git clone`: complete `.git`, full-history clonepack, and working tree checkout.
   - `fast` materializes the working tree directly from archive chunks; no head-blobs pack.
   - `hybrid` downloads archive chunks and head-blobs chunks concurrently; the working tree is extracted while the pack is written.
   - `skeleton` installs only `.git` (commit + tree objects, prebuilt index) with no working tree.
