@@ -5,7 +5,9 @@
 
 mod common;
 
+use base64::Engine;
 use common::*;
+use ripclone::client::Client;
 use ripclone::mode::CloneMode;
 
 #[tokio::test]
@@ -24,13 +26,9 @@ async fn generic_provider_sync_and_clone_through_http_origin() {
         "kind": "generic",
         "host": &origin.url,
         "auth_template": "token {token}",
-    }]
-    });
-    unsafe {
-        std::env::set_var("RIPCLONE_PROVIDERS", providers.to_string());
-    }
-
-    let server = start_server().await;
+    }]);
+    let providers_str = providers.to_string();
+    let server = start_server_env(&[("RIPCLONE_PROVIDERS", &providers_str)]).await;
 
     // Sync through the explicit-provider route.
     let client = server.client_with_provider("localgit", Some("test-token"));
@@ -39,8 +37,24 @@ async fn generic_provider_sync_and_clone_through_http_origin() {
         .await
         .expect("sync generic provider repo");
 
-    // Clone the resulting artifacts. The full clonepack builds in the background
-    // under two-phase publish, so poll until it reaches the published commit.
+    let (_out, target) = clone_full_with_provider(&client, "acme/http", &want).await;
+
+    // Verify content and origin remote.
+    let readme = std::fs::read_to_string(target.join("README.md")).unwrap();
+    assert_eq!(readme, "hello from http origin\n");
+
+    let origin_url = git(&target, &["remote", "get-url", "origin"]);
+    assert_eq!(origin_url, format!("{}/acme/http.git", origin.url));
+}
+
+/// Poll a full clone through an explicit-provider client until it reaches the
+/// expected upstream commit. The full clonepack builds in the background, so
+/// this retries until phase 2 lands.
+async fn clone_full_with_provider(
+    client: &Client,
+    repo_path: &str,
+    want: &str,
+) -> (tempfile::TempDir, std::path::PathBuf) {
     let mut last = String::from("<no successful clone>");
     let mut found = None;
     for _ in 0..160 {
@@ -48,7 +62,7 @@ async fn generic_provider_sync_and_clone_through_http_origin() {
         let target = out.path().join("clone");
         match client
             .install_repo_with_mode_at(
-                "acme/http",
+                repo_path,
                 "HEAD",
                 None,
                 &target,
@@ -70,13 +84,74 @@ async fn generic_provider_sync_and_clone_through_http_origin() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
-    let (_out, target) =
-        found.unwrap_or_else(|| panic!("generic provider clone never current (last: {last})"));
+    found.unwrap_or_else(|| panic!("provider clone of {repo_path} never current (last: {last})"))
+}
 
-    // Verify content and origin remote.
+/// GitLab-shaped provider injects `Authorization: Basic base64(oauth2:token)`.
+#[tokio::test]
+async fn gitlab_provider_injects_basic_oauth2_auth_header() {
+    init(false);
+
+    let token = "gitlab-e2e-token";
+    let expected_auth = format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(format!("oauth2:{token}"))
+    );
+    let origin = make_http_origin_with_auth("acme/http", &expected_auth);
+    let want = origin.commit(&[("README.md", "hello from gitlab origin\n")], "c1");
+    origin.publish();
+
+    let providers = serde_json::json!([{
+        "id": "gitlab",
+        "kind": "gitlab",
+        "host": &origin.url,
+    }]);
+    let providers_str = providers.to_string();
+    let server = start_server_env(&[
+        ("RIPCLONE_PROVIDERS", &providers_str),
+        ("RIPCLONE_PROVIDER_GITLAB_TOKEN", token),
+    ])
+    .await;
+    let client = server.client_with_provider("gitlab", None);
+    client
+        .sync_repo("acme/http", None)
+        .await
+        .expect("sync gitlab provider repo");
+
+    let (_out, target) = clone_full_with_provider(&client, "acme/http", &want).await;
     let readme = std::fs::read_to_string(target.join("README.md")).unwrap();
-    assert_eq!(readme, "hello from http origin\n");
+    assert_eq!(readme, "hello from gitlab origin\n");
+}
 
-    let origin_url = git(&target, &["remote", "get-url", "origin"]);
-    assert_eq!(origin_url, format!("{}/acme/http.git", origin.url));
+/// Gitea-shaped provider injects `Authorization: token <token>`.
+#[tokio::test]
+async fn gitea_provider_injects_token_auth_header() {
+    init(false);
+
+    let token = "gitea-e2e-token";
+    let expected_auth = format!("token {token}");
+    let origin = make_http_origin_with_auth("acme/http", &expected_auth);
+    let want = origin.commit(&[("README.md", "hello from gitea origin\n")], "c1");
+    origin.publish();
+
+    let providers = serde_json::json!([{
+        "id": "gitea",
+        "kind": "gitea",
+        "host": &origin.url,
+    }]);
+    let providers_str = providers.to_string();
+    let server = start_server_env(&[
+        ("RIPCLONE_PROVIDERS", &providers_str),
+        ("RIPCLONE_PROVIDER_GITEA_TOKEN", token),
+    ])
+    .await;
+    let client = server.client_with_provider("gitea", None);
+    client
+        .sync_repo("acme/http", None)
+        .await
+        .expect("sync gitea provider repo");
+
+    let (_out, target) = clone_full_with_provider(&client, "acme/http", &want).await;
+    let readme = std::fs::read_to_string(target.join("README.md")).unwrap();
+    assert_eq!(readme, "hello from gitea origin\n");
 }

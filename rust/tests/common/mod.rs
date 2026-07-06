@@ -499,7 +499,7 @@ impl Origin {
         git(&self.bare, &["symbolic-ref", "HEAD", "refs/heads/main"]);
     }
 
-    fn bare_str(&self) -> &str {
+    pub fn bare_str(&self) -> &str {
         self.bare.to_str().unwrap()
     }
 }
@@ -576,7 +576,7 @@ impl HttpOrigin {
         git(&self.bare, &["update-server-info"]);
     }
 
-    fn bare_str(&self) -> &str {
+    pub fn bare_str(&self) -> &str {
         self.bare.to_str().unwrap()
     }
 }
@@ -586,6 +586,17 @@ impl HttpOrigin {
 /// `http://127.0.0.1:<port>/<repo_path>.git`, matching the generic provider's
 /// `clone_url(path)` shape.
 pub fn make_http_origin(repo_path: &str) -> HttpOrigin {
+    make_http_origin_inner(repo_path, None)
+}
+
+/// Like [`make_http_origin`], but the server rejects any request whose
+/// `Authorization` header is not exactly `expected_auth`. Used to prove that
+/// ripclone injects the provider-specific auth header on the upstream fetch.
+pub fn make_http_origin_with_auth(repo_path: &str, expected_auth: &str) -> HttpOrigin {
+    make_http_origin_inner(repo_path, Some(expected_auth))
+}
+
+fn make_http_origin_inner(repo_path: &str, expected_auth: Option<&str>) -> HttpOrigin {
     let dir = tempfile::tempdir().expect("http origin dir");
     let work = dir.path().join("work");
     std::fs::create_dir_all(&work).unwrap();
@@ -603,15 +614,67 @@ pub fn make_http_origin(repo_path: &str) -> HttpOrigin {
     git(&bare, &["update-server-info"]);
 
     let port = free_port();
-    let server = Command::new("python3")
-        .arg("-m")
-        .arg("http.server")
-        .arg(port.to_string())
-        .current_dir(dir.path())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("start python http.server");
+    let server = if let Some(auth) = expected_auth {
+        // A tiny real HTTP server that gates every request on the exact
+        // Authorization header ripclone is expected to inject.
+        let script = dir.path().join("auth_server.py");
+        let script_body = r#"import http.server
+import socketserver
+import sys
+
+EXPECTED_AUTH = sys.argv[1]
+PORT = int(sys.argv[2])
+ROOT = sys.argv[3]
+
+class AuthHandler(http.server.SimpleHTTPRequestHandler):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, directory=ROOT, **kwargs)
+
+    def check_auth(self):
+        return self.headers.get('Authorization') == EXPECTED_AUTH
+
+    def do_GET(self):
+        if not self.check_auth():
+            self.send_error(403, 'Forbidden')
+            return
+        super().do_GET()
+
+    def do_HEAD(self):
+        if not self.check_auth():
+            self.send_error(403, 'Forbidden')
+            return
+        super().do_HEAD()
+
+    def log_message(self, format, *args):
+        pass
+
+class ReusableTCPServer(socketserver.TCPServer):
+    allow_reuse_address = True
+
+with ReusableTCPServer(('', PORT), AuthHandler) as httpd:
+    httpd.serve_forever()
+"#;
+        std::fs::write(&script, script_body).unwrap();
+        Command::new("python3")
+            .arg(script.to_str().unwrap())
+            .arg(auth)
+            .arg(port.to_string())
+            .arg(dir.path().to_str().unwrap())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("start python auth http.server")
+    } else {
+        Command::new("python3")
+            .arg("-m")
+            .arg("http.server")
+            .arg(port.to_string())
+            .current_dir(dir.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("start python http.server")
+    };
 
     // Wait for the server to accept connections.
     for _ in 0..100 {
