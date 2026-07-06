@@ -1105,6 +1105,14 @@ impl Drop for WorkerProc {
     }
 }
 
+impl WorkerProc {
+    /// Hard-kill the worker now and wait for the OS process to exit.
+    pub fn kill_now(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 /// Spawn the real `ripclone-worker` binary sharing `cas_dir` + `repo_root` with
 /// the in-process server. It inherits the test process env (RIPCLONE_QUEUE,
 /// RIPCLONE_QUEUE_DB_URL, RIPCLONE_ORIGIN_BASE, RIPCLONE_TOKEN, …).
@@ -1121,4 +1129,43 @@ pub fn spawn_worker(cas_dir: &Path, repo_root: &Path) -> WorkerProc {
         .spawn()
         .expect("spawn ripclone-worker binary");
     WorkerProc(child)
+}
+
+/// Shared B5 seam for "make this repo warm/cloneable".
+///
+/// Today that means `sync`, then polling the requested clonepack kind until it
+/// resolves. When add/sync split lands, this is the helper future tests should
+/// change instead of duplicating setup in every e2e.
+pub async fn warm_repo_until_cloneable(
+    server: &Server,
+    repo: &str,
+    clonepack_kind: Option<&str>,
+) -> ripclone::client::RefResponse {
+    server
+        .client()
+        .sync_repo(repo, None)
+        .await
+        .expect("warm repo");
+    wait_repo_cloneable(server, repo, clonepack_kind).await
+}
+
+pub async fn wait_repo_cloneable(
+    server: &Server,
+    repo: &str,
+    clonepack_kind: Option<&str>,
+) -> ripclone::client::RefResponse {
+    let mut last = String::from("<not attempted>");
+    for _ in 0..160 {
+        match server
+            .client()
+            .resolve_ref_with_clonepack(repo, "HEAD", clonepack_kind, None)
+            .await
+        {
+            Ok(info) if !info.commit.is_empty() => return info,
+            Ok(info) => last = format!("empty commit in ref: {info:?}"),
+            Err(e) => last = format!("{e:#}"),
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    panic!("{repo} never became cloneable (last: {last})");
 }
