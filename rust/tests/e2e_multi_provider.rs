@@ -22,11 +22,12 @@ async fn generic_provider_sync_and_clone_through_http_origin() {
     // Configure a generic provider pointing at the local HTTP server.
     let providers = serde_json::json!({
         "providers": [{
-        "id": "localgit",
-        "kind": "generic",
-        "host": &origin.url,
-        "auth_template": "token {token}",
-    }]);
+            "id": "localgit",
+            "kind": "generic",
+            "host": &origin.url,
+            "auth_template": "token {token}",
+        }]
+    });
     let providers_str = providers.to_string();
     let server = start_server_env(&[("RIPCLONE_PROVIDERS", &providers_str)]).await;
 
@@ -101,17 +102,16 @@ async fn gitlab_provider_injects_basic_oauth2_auth_header() {
     let want = origin.commit(&[("README.md", "hello from gitlab origin\n")], "c1");
     origin.publish();
 
-    let providers = serde_json::json!([{
-        "id": "gitlab",
-        "kind": "gitlab",
-        "host": &origin.url,
-    }]);
+    let providers = serde_json::json!({
+        "providers": [{
+            "id": "gitlab",
+            "kind": "gitlab",
+            "host": &origin.url,
+            "token": token,
+        }]
+    });
     let providers_str = providers.to_string();
-    let server = start_server_env(&[
-        ("RIPCLONE_PROVIDERS", &providers_str),
-        ("RIPCLONE_PROVIDER_GITLAB_TOKEN", token),
-    ])
-    .await;
+    let server = start_server_env(&[("RIPCLONE_PROVIDERS", &providers_str)]).await;
     let client = server.client_with_provider("gitlab", None);
     client
         .sync_repo("acme/http", None)
@@ -134,17 +134,16 @@ async fn gitea_provider_injects_token_auth_header() {
     let want = origin.commit(&[("README.md", "hello from gitea origin\n")], "c1");
     origin.publish();
 
-    let providers = serde_json::json!([{
-        "id": "gitea",
-        "kind": "gitea",
-        "host": &origin.url,
-    }]);
+    let providers = serde_json::json!({
+        "providers": [{
+            "id": "gitea",
+            "kind": "gitea",
+            "host": &origin.url,
+            "token": token,
+        }]
+    });
     let providers_str = providers.to_string();
-    let server = start_server_env(&[
-        ("RIPCLONE_PROVIDERS", &providers_str),
-        ("RIPCLONE_PROVIDER_GITEA_TOKEN", token),
-    ])
-    .await;
+    let server = start_server_env(&[("RIPCLONE_PROVIDERS", &providers_str)]).await;
     let client = server.client_with_provider("gitea", None);
     client
         .sync_repo("acme/http", None)

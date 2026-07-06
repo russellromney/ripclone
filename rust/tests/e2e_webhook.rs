@@ -229,11 +229,13 @@ async fn poll_catches_a_missed_push() {
 /// The provider `host` points at the local dumb-HTTP origin so the sync can
 /// fetch without network.
 fn webhook_providers_json(origin_url: &str, kind: &str) -> String {
-    serde_json::json!([{
-        "id": kind,
-        "kind": kind,
-        "host": origin_url,
-    }])
+    serde_json::json!({
+        "providers": [{
+            "id": kind,
+            "kind": kind,
+            "host": origin_url,
+        }]
+    })
     .to_string()
 }
 
