@@ -33,9 +33,17 @@ ripclone backend storage  --backend s3 --bucket my-bucket --endpoint https://s3.
 ripclone backend show     # effective values; flags which env var overrides each
 ```
 
-Credentials are **never** read from `config.toml`: S3 keys come from
-`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`, and `libsql` DB tokens may be set
-in-file for now (`[queue].token` / `[metadata].token`) or via env.
+S3 credentials are **never** read from `config.toml`: S3 keys come from
+`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`. Provider tokens can be declared
+under `[providers.<id>]` for self-hosted server-side syncs; `libsql` DB tokens
+may be set in-file (`[queue].token` / `[metadata].token`) or via env.
+
+```toml
+[providers.my-gitea]
+kind = "gitea"
+host = "https://git.example.com"
+token = "gitea-token"
+```
 
 ## Storage
 
@@ -167,9 +175,12 @@ Notes:
 - **One `repo_root` per worker.** The bare mirror under `--repo-root` is per-repo
   scratch guarded by an in-process lock; give each worker its own. All durable
   state is in storage + the metadata store.
-- **Credentials are never put in the queue.** A worker resolves its own upstream
-  credentials from its provider config (`RIPCLONE_PROVIDERS` / `RIPCLONE_GITHUB_TOKEN`),
-  so a per-request `X-Upstream-Token` is ignored on the cross-process path.
+- **Credentials for private builds.** A per-request `X-Upstream-Token` rides
+  with the queued job so a cross-process worker can fetch a repo it has no
+  standing token for. SQL queues store that token only as an obfuscated value
+  and clear it when the job is claimed or finished; otherwise the worker falls
+  back to provider config (`RIPCLONE_PROVIDERS` or `config.toml`;
+  `RIPCLONE_GITHUB_TOKEN` remains a GitHub-default shortcut).
 - **Async builds are always on.** `/sync` always enqueues onto the bounded build
   queue, so a build survives client disconnect / HTTP timeout and is
   rate-bounded under load.

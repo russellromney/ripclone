@@ -34,7 +34,7 @@ struct Args {
     provider: Option<String>,
 
     /// Explicit upstream credential token sent as the X-Upstream-Token header.
-    /// Overrides git credentials and any configured provider token.
+    /// Overrides any configured provider token.
     #[arg(short, long, env = "RIPCLONE_UPSTREAM_TOKEN")]
     token: Option<String>,
 
@@ -837,6 +837,7 @@ async fn run_provider_add(
     let entry = ProviderEntry {
         kind: kind_str.to_string(),
         host,
+        token,
         auth_template,
         auth_header_name,
     };
@@ -844,20 +845,13 @@ async fn run_provider_add(
     let mut cfg = ripclone::config::load_global();
     cfg.providers.insert(id.to_string(), entry);
     ripclone::config::save(&cfg)?;
-    let store = token_store()?;
-    if let Some(token) = token.as_deref() {
-        store.set(id, token)?;
-    }
     println!("added provider '{}'", id);
-    if token.is_some() {
-        println!("  token stored in the ripclone token file");
-    }
     Ok(())
 }
 
 fn run_provider_list() -> Result<()> {
     let cfg = ripclone::config::load_global();
-    let registry = ripclone::provider_config::load_registry_with_config(&token_store()?, &cfg)?;
+    let registry = ripclone::provider_config::load_registry_with_config(&cfg)?;
 
     if cfg.providers.is_empty() {
         println!("No providers configured.");
@@ -889,7 +883,6 @@ async fn run_provider_rm(id: &str) -> Result<()> {
         anyhow::bail!("provider '{}' not found", id);
     }
     ripclone::config::save(&cfg)?;
-    token_store()?.delete(id)?;
     println!("removed provider '{}'", id);
     Ok(())
 }
@@ -1033,9 +1026,8 @@ async fn main() -> Result<()> {
             }
         },
         Commands::Sync { repo, depth, at } => {
-            let (provider, repo_path) = resolve_repo(&repo, &default_provider)?;
-            let upstream_token =
-                resolve_upstream_token(&provider, &repo_path, args.token.as_deref()).await?;
+            let (provider, repo_path) = resolve_repo(&repo, &default_provider, &provider_registry)?;
+            let upstream_token = resolve_upstream_token(&provider, args.token.as_deref()).await?;
             let client = client
                 .with_provider(&provider)
                 .with_upstream_token_opt(upstream_token);
@@ -1056,9 +1048,8 @@ async fn main() -> Result<()> {
             temp,
             bench,
         } => {
-            let (provider, repo_path) = resolve_repo(&repo, &default_provider)?;
-            let upstream_token =
-                resolve_upstream_token(&provider, &repo_path, args.token.as_deref()).await?;
+            let (provider, repo_path) = resolve_repo(&repo, &default_provider, &provider_registry)?;
+            let upstream_token = resolve_upstream_token(&provider, args.token.as_deref()).await?;
             let client = client
                 .with_provider(&provider)
                 .with_upstream_token_opt(upstream_token);
@@ -1456,98 +1447,21 @@ async fn main() -> Result<()> {
 ///
 /// Precedence:
 ///   1. Explicit `--token` / `RIPCLONE_UPSTREAM_TOKEN` override.
-///   2. Live `git credential fill` for the provider's HTTPS clone URL.
-///   3. Any configured provider token from env/config/token store.
-///   4. Anonymous (public repos).
+///   2. Any configured provider token.
+///   3. Anonymous (public repos).
 async fn resolve_upstream_token(
     provider_id: &str,
-    repo_path: &str,
     override_token: Option<&str>,
 ) -> Result<Option<String>> {
     if let Some(token) = override_token {
         return Ok(Some(token.to_string()));
     }
 
-    let store = token_store().context("initialize token store")?;
-    let registry = ripclone::provider_config::load_registry_with_token_store(&store)
+    let registry = ripclone::provider_config::load_registry()
         .context("load provider registry for upstream auth")?;
-    if let Some(host) = provider_host(provider_id, &registry)
-        && let Some(token) = git_credential_token(&host, repo_path).await?
-    {
-        return Ok(Some(token));
-    }
-
     Ok(registry
         .token(provider_id)
         .map(|token| token.expose_secret().to_string()))
-}
-
-fn provider_host(
-    provider_id: &str,
-    registry: &ripclone::provider::ProviderRegistry,
-) -> Option<String> {
-    // Preset providers have well-known hosts.
-    let preset = match provider_id {
-        "github" => Some("github.com"),
-        "gitlab" => Some("gitlab.com"),
-        "bitbucket" => Some("bitbucket.org"),
-        _ => None,
-    };
-    if let Some(host) = preset {
-        return Some(host.to_string());
-    }
-    registry.get(provider_id).map(|p| {
-        let h = p.host.trim_end_matches('/');
-        h.strip_prefix("https://")
-            .or_else(|| h.strip_prefix("http://"))
-            .unwrap_or(h)
-            .to_string()
-    })
-}
-
-/// Ask the local git credential helper for a password/token for an HTTPS URL.
-async fn git_credential_token(host: &str, path: &str) -> Result<Option<String>> {
-    let input = format!(
-        "protocol=https\nhost={}\npath={}\n\n",
-        host,
-        path.trim_start_matches('/')
-    );
-    let mut child = tokio::process::Command::new("git")
-        .arg("credential")
-        .arg("fill")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .context("spawn git credential fill")?;
-
-    let mut stdin = child.stdin.take().context("take git credential stdin")?;
-    tokio::io::AsyncWriteExt::write_all(&mut stdin, input.as_bytes()).await?;
-    tokio::io::AsyncWriteExt::shutdown(&mut stdin).await.ok();
-    drop(stdin);
-
-    let output = child
-        .wait_with_output()
-        .await
-        .context("read git credential fill output")?;
-
-    if !output.status.success() {
-        tracing::debug!(
-            "git credential fill failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        return Ok(None);
-    }
-
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        if let Some(password) = line.strip_prefix("password=")
-            && !password.is_empty()
-        {
-            return Ok(Some(password.to_string()));
-        }
-    }
-    Ok(None)
 }
 #[cfg(test)]
 mod tests {
@@ -1731,136 +1645,51 @@ mod tests {
     }
 
     #[test]
-    fn provider_host_uses_preset_defaults() {
-        let registry = ripclone::provider::ProviderRegistry::new();
-        assert_eq!(
-            provider_host("github", &registry),
-            Some("github.com".to_string())
-        );
-        assert_eq!(
-            provider_host("gitlab", &registry),
-            Some("gitlab.com".to_string())
-        );
-        assert_eq!(
-            provider_host("bitbucket", &registry),
-            Some("bitbucket.org".to_string())
-        );
-    }
-
-    #[test]
-    fn git_credential_token_uses_local_credential_helper() {
+    fn resolve_upstream_token_prefers_explicit_override() {
         let _guard = ENV_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let home = tempfile::tempdir().unwrap();
-        let git_config = dir.path().join("gitconfig");
-        let credential_file = dir.path().join("credentials");
-        store_git_credential(
-            &credential_file,
-            "github.com",
-            "owner/repo",
-            "ghp-test-token",
-        );
-        write_git_config_for_store(&git_config, &credential_file);
-
-        let old_home = std::env::var_os("HOME");
-        let old_git_config_global = std::env::var_os("GIT_CONFIG_GLOBAL");
-        let old_git_config_nosystem = std::env::var_os("GIT_CONFIG_NOSYSTEM");
-        unsafe {
-            std::env::set_var("HOME", home.path());
-            std::env::set_var("GIT_CONFIG_GLOBAL", &git_config);
-            std::env::set_var("GIT_CONFIG_NOSYSTEM", "1");
-        }
-
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let token = rt
-            .block_on(git_credential_token("github.com", "owner/repo"))
-            .unwrap();
-
-        unsafe {
-            restore_env("HOME", old_home);
-            restore_env("GIT_CONFIG_GLOBAL", old_git_config_global);
-            restore_env("GIT_CONFIG_NOSYSTEM", old_git_config_nosystem);
-        }
-        assert_eq!(token, Some("ghp-test-token".to_string()));
-    }
-
-    #[test]
-    fn resolve_upstream_token_prefers_git_credential_over_registry_token() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let home = tempfile::tempdir().unwrap();
-        let git_config = dir.path().join("gitconfig");
-        let credential_file = dir.path().join("credentials");
-        store_git_credential(
-            &credential_file,
-            "github.com",
-            "owner/repo",
-            "from-git-helper",
-        );
-        write_git_config_for_store(&git_config, &credential_file);
-
-        let old_home = std::env::var_os("HOME");
-        let old_git_config_global = std::env::var_os("GIT_CONFIG_GLOBAL");
-        let old_git_config_nosystem = std::env::var_os("GIT_CONFIG_NOSYSTEM");
         let old_config = std::env::var_os("RIPCLONE_CONFIG");
-        let old_provider_token = std::env::var_os("RIPCLONE_PROVIDER_GITHUB_TOKEN");
-        unsafe {
-            std::env::set_var("HOME", home.path());
-            std::env::set_var("GIT_CONFIG_GLOBAL", &git_config);
-            std::env::set_var("GIT_CONFIG_NOSYSTEM", "1");
-            std::env::set_var("RIPCLONE_CONFIG", dir.path().join("config.toml"));
-            std::env::set_var("RIPCLONE_PROVIDER_GITHUB_TOKEN", "from-registry");
-        }
-
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let token = rt
-            .block_on(resolve_upstream_token("github", "owner/repo", None))
-            .unwrap();
-
-        unsafe {
-            restore_env("HOME", old_home);
-            restore_env("GIT_CONFIG_GLOBAL", old_git_config_global);
-            restore_env("GIT_CONFIG_NOSYSTEM", old_git_config_nosystem);
-            restore_env("RIPCLONE_CONFIG", old_config);
-            restore_env("RIPCLONE_PROVIDER_GITHUB_TOKEN", old_provider_token);
-        }
-        assert_eq!(token, Some("from-git-helper".to_string()));
-    }
-
-    fn store_git_credential(file: &std::path::Path, host: &str, path: &str, password: &str) {
-        use std::io::Write;
-        let mut child = std::process::Command::new("git")
-            .arg("credential-store")
-            .arg("--file")
-            .arg(file)
-            .arg("store")
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-            .expect("spawn git credential-store");
-        let mut stdin = child.stdin.take().expect("git credential-store stdin");
-        write!(
-            stdin,
-            "protocol=https\nhost={host}\npath={path}\nusername=x-access-token\npassword={password}\n\n"
-        )
-        .expect("write credential-store input");
-        drop(stdin);
-        assert!(
-            child
-                .wait()
-                .expect("wait for git credential-store")
-                .success()
-        );
-    }
-
-    fn write_git_config_for_store(config: &std::path::Path, credential_file: &std::path::Path) {
+        let config_path = dir.path().join("config.toml");
         std::fs::write(
-            config,
-            format!(
-                "[credential]\n\thelper = store --file {}\n\tuseHttpPath = true\n",
-                credential_file.display()
-            ),
+            &config_path,
+            r#"[providers.github]
+kind = "github"
+token = "from-config"
+"#,
         )
         .unwrap();
+        unsafe { std::env::set_var("RIPCLONE_CONFIG", &config_path) };
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let token = rt
+            .block_on(resolve_upstream_token("github", Some("from-explicit")))
+            .unwrap();
+
+        unsafe { restore_env("RIPCLONE_CONFIG", old_config) };
+        assert_eq!(token, Some("from-explicit".to_string()));
+    }
+
+    #[test]
+    fn resolve_upstream_token_uses_configured_provider_token() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let old_config = std::env::var_os("RIPCLONE_CONFIG");
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"[providers.github]
+kind = "github"
+token = "from-config"
+"#,
+        )
+        .unwrap();
+        unsafe { std::env::set_var("RIPCLONE_CONFIG", &config_path) };
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let token = rt.block_on(resolve_upstream_token("github", None)).unwrap();
+
+        unsafe { restore_env("RIPCLONE_CONFIG", old_config) };
+        assert_eq!(token, Some("from-config".to_string()));
     }
 
     unsafe fn restore_env(key: &str, value: Option<std::ffi::OsString>) {

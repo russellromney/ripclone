@@ -19,11 +19,11 @@
 //!   `/`, `~`, `+`, etc. (currently `validation::validate_repo_id` is still the
 //!   GitHub-only check).
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::collections::HashMap;
 use std::net::IpAddr;
 
-pub use crate::provider_config::load_registry_with_token_store;
+pub use crate::provider_config::load_registry;
 
 /// Built-in default instance id. All legacy `{owner}/{repo}` routes resolve to
 /// this instance.
@@ -290,7 +290,6 @@ impl ProviderRegistry {
     /// Build a registry containing only the built-in GitHub default instance.
     pub fn new() -> Self {
         let mut providers = HashMap::new();
-        let mut tokens = HashMap::new();
         providers.insert(
             DEFAULT_PROVIDER_ID.to_string(),
             ProviderInstance {
@@ -301,30 +300,19 @@ impl ProviderRegistry {
                 auth_header_name: None,
             },
         );
-        if let Some(token) = std::env::var("RIPCLONE_GITHUB_TOKEN")
-            .ok()
-            .filter(|t| !t.is_empty())
-        {
-            tokens.insert(
-                DEFAULT_PROVIDER_ID.to_string(),
-                secrecy::SecretString::new(token.into()),
-            );
+        Self {
+            providers,
+            tokens: HashMap::new(),
         }
-        Self { providers, tokens }
     }
 
     /// Load from configuration.
     ///
-    /// Reads `RIPCLONE_PROVIDERS` as JSON first, then merges a config file at
-    /// `RIPCLONE_PROVIDERS_CONFIG` if present, then merges the default
-    /// `~/.config/ripclone/providers.json`. Tokens are resolved from the
-    /// `RIPCLONE_PROVIDER_<ID>_TOKEN` env var or the ripclone token file. The
-    /// built-in `github` default is always present and can be
+    /// Reads `RIPCLONE_PROVIDERS` as JSON first, then merges the unified TOML
+    /// config. The built-in `github` default is always present and can be
     /// overridden by config (host, token, template).
     pub fn load() -> Result<Self> {
-        let token_store = crate::auth::token_store::FileBackedTokenStore::new()
-            .context("initialize token store")?;
-        crate::provider_config::load_registry_with_token_store(&token_store)
+        crate::provider_config::load_registry()
     }
 
     /// Merge a single provider config into the registry.
@@ -396,6 +384,12 @@ impl ProviderRegistry {
     /// Configured passthrough token for an instance, if any.
     pub fn token(&self, id: &str) -> Option<&secrecy::SecretString> {
         self.tokens.get(id)
+    }
+
+    pub(crate) fn set_token(&mut self, id: &str, token: impl Into<String>) {
+        let token: String = token.into();
+        self.tokens
+            .insert(id.to_string(), secrecy::SecretString::new(token.into()));
     }
 
     /// Iterate over all configured instances.
@@ -864,14 +858,12 @@ mod tests {
     }
 
     #[test]
-    fn registry_loads_github_token_from_env() {
-        // Ensure RIPCLONE_GITHUB_TOKEN is not leaking from the environment.
-        // We can't assert the token is present because tests may run without it,
-        // but we can assert the registry structure is valid.
+    fn registry_default_has_github_provider() {
         let registry = ProviderRegistry::new();
         let github = registry.default_provider();
         assert_eq!(github.id.as_str(), "github");
         assert_eq!(github.kind, ProviderKind::GitHub);
         assert_eq!(github.host, "github.com");
+        assert!(registry.token("github").is_none());
     }
 }

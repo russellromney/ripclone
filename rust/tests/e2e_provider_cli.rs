@@ -53,13 +53,7 @@ fn provider_add_list_rm_lifecycle() {
         String::from_utf8_lossy(&add.stderr)
     );
 
-    // Resolve the token from the per-provider env var, which takes precedence
-    // over the token file.
-    let list = run_with_env(
-        &["provider", "list"],
-        home.path(),
-        [("RIPCLONE_PROVIDER_GITLAB_TOKEN", "glpat-test")],
-    );
+    let list = run(&["provider", "list"], home.path());
     let list_out = String::from_utf8_lossy(&list.stdout);
     assert!(list.status.success(), "provider list failed: {list_out}");
     assert!(
@@ -71,7 +65,7 @@ fn provider_add_list_rm_lifecycle() {
         "provider list should show token configured: {list_out}"
     );
 
-    // The config file should declare the provider but never contain the token.
+    // The config file should declare both the provider and its configured token.
     let config = home
         .path()
         .join(".config")
@@ -83,8 +77,8 @@ fn provider_add_list_rm_lifecycle() {
         "config.toml should declare gitlab: {config_text}"
     );
     assert!(
-        !config_text.contains("glpat-test"),
-        "config.toml must not contain the token: {config_text}"
+        config_text.contains("glpat-test"),
+        "config.toml should contain the provider token: {config_text}"
     );
 
     let rm = run(&["provider", "rm", "gitlab"], home.path());
