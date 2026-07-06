@@ -125,6 +125,10 @@ jobs:
     services:
       minio:
         image: minio/minio:latest
+        # The latest image no longer defaults to `server /data`; without an
+        # explicit command it prints help and exits, so the service must run
+        # the server subcommand directly.
+        command: server /data
         env:
           MINIO_ROOT_USER: minioadmin
           MINIO_ROOT_PASSWORD: minioadmin
