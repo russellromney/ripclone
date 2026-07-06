@@ -200,6 +200,8 @@ async fn cleanup_prefix(env: &S3Env, prefix: &str) -> Result<()> {
 }
 
 async fn cleanup_repo_refs(env: &S3Env, owner: &str, repo: &str) -> Result<()> {
+    let repo_id = ripclone::provider::RepoId::github(format!("{owner}/{repo}"));
+    let storage_key = repo_id.storage_key();
     let client = s3::Client::builder(&env.endpoint)
         .context("create S3 cleanup builder")?
         .region(&env.region)
@@ -207,8 +209,8 @@ async fn cleanup_repo_refs(env: &S3Env, owner: &str, repo: &str) -> Result<()> {
         .build()
         .context("build cleanup S3 client")?;
 
-    let head_key = format!("refs/{owner}/{repo}.json");
-    let branch_prefix = format!("refs/{owner}/{repo}/");
+    let head_key = format!("refs/{storage_key}.json");
+    let branch_prefix = format!("refs/{storage_key}/");
     let mut keys = vec![head_key];
     let mut continuation = None::<String>;
     loop {

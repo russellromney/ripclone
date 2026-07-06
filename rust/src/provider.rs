@@ -7,9 +7,7 @@
 //!
 //! Phase 0 is intentionally minimal: only the built-in `github` default
 //! instance exists, and all routes still parse `{owner}/{repo}` into a GitHub
-//! `RepoId`. The back-compat invariant is that a GitHub `RepoId` renders to the
-//! *exact* legacy storage keys and mirror directory names, so existing ref-store
-//! data and on-disk mirrors need no migration.
+//! `RepoId`.
 //!
 //! Phase 3+ handoff notes:
 //! - Add OIDC / `Principal` / `authorize()` integration; `CredentialBroker` is
@@ -441,16 +439,9 @@ impl RepoId {
 
     /// Storage key used by `RefStore` implementations.
     ///
-    /// Back-compat invariant: the `github` default instance renders to the bare
-    /// `owner/repo` key used before this refactor, so existing ref-store data
-    /// needs no migration. Non-default providers are prefixed with the provider
-    /// id and the opaque path is slash-escaped.
+    /// All providers use `{provider}/{escaped_path}`.
     pub fn storage_key(&self) -> String {
-        if self.is_github_default() {
-            self.path.clone()
-        } else {
-            format!("{}/{}", self.provider.as_str(), escape_path(&self.path))
-        }
+        format!("{}/{}", self.provider.as_str(), escape_path(&self.path))
     }
 
     /// Human-readable key for operator-facing config (the webhook allowlist).
@@ -469,20 +460,9 @@ impl RepoId {
 
     /// Directory name for the local bare mirror.
     ///
-    /// Back-compat invariant: the `github` default instance renders to
-    /// `{owner}_{repo}.git`, matching `server.rs` before this refactor.
-    /// Non-default providers use `{provider}_{escaped_path}.git`.
+    /// All providers use `{provider}_{escaped_path}.git`.
     pub fn mirror_dir_name(&self) -> String {
-        if self.is_github_default() {
-            // The legacy route guarantees exactly one slash for GitHub in Phase
-            // 0. Fall back to a safe escaped form if that ever changes.
-            match self.path.split_once('/') {
-                Some((owner, repo)) => format!("{}_{}.git", owner, repo),
-                None => format!("{}_.git", self.path),
-            }
-        } else {
-            format!("{}_{}.git", self.provider.as_str(), escape_path(&self.path))
-        }
+        format!("{}_{}.git", self.provider.as_str(), escape_path(&self.path))
     }
 
     /// Convenience accessor for callers that still need the legacy owner/repo
@@ -555,33 +535,16 @@ fn decode_hex_byte(a: char, b: char) -> Option<u8> {
 
 /// Parse a storage key back into a `RepoId`.
 ///
-/// Used by tools that list the ref store; not required by the hot path. A bare
-/// `owner/repo` key is ambiguous with a `{provider}/{path}` key, so the
-/// registry is required to decide whether the first segment is a known provider
-/// id.
-///
-/// Storage-key ambiguity resolution: we never infer a provider id from a bare
-/// key on the hot path. In listing/GC contexts the registry disambiguates: if
-/// the first segment matches a configured provider id, it is treated as
-/// `{provider}/{path}`; otherwise the whole key is a GitHub `owner/repo` path.
-/// Because GitHub is the default, a GitHub org literally named "gitlab" would
-/// be parsed as a GitLab provider path when a `gitlab` instance is registered.
-/// That collision is accepted and documented: operators who create provider
-/// ids that shadow GitHub org names must avoid legacy addressing for those
-/// orgs (use explicit `github/...` routes once they exist) or pick a different
-/// instance id.
-pub fn parse_storage_key(key: &str, registry: &ProviderRegistry) -> Option<RepoId> {
-    if let Some((provider, rest)) = key.split_once('/')
-        && registry.get(provider).is_some()
-    {
-        Some(RepoId {
-            provider: ProviderInstanceId::new(provider),
-            path: unescape_path(rest),
-        })
-    } else {
-        // Bare key -> github default.
-        Some(RepoId::github(key))
+/// Used by tools that list the ref store; not required by the hot path.
+pub fn parse_storage_key(key: &str) -> Option<RepoId> {
+    let (provider, rest) = key.split_once('/')?;
+    if provider.is_empty() || rest.is_empty() {
+        return None;
     }
+    Some(RepoId {
+        provider: ProviderInstanceId::new(provider),
+        path: unescape_path(rest),
+    })
 }
 
 #[cfg(test)]
@@ -653,15 +616,15 @@ mod tests {
     }
 
     #[test]
-    fn github_default_storage_key_is_legacy_owner_repo() {
+    fn github_default_storage_key_is_provider_prefixed() {
         let repo = RepoId::github("ripclone/test");
-        assert_eq!(repo.storage_key(), "ripclone/test");
-        assert_eq!(repo.mirror_dir_name(), "ripclone_test.git");
+        assert_eq!(repo.storage_key(), "github/ripclone%2Ftest");
+        assert_eq!(repo.mirror_dir_name(), "github_ripclone%2Ftest.git");
     }
 
     #[test]
     fn natural_key_is_unescaped_and_provider_prefixed() {
-        // github default: bare owner/repo (same as storage_key).
+        // github default: bare owner/repo.
         assert_eq!(RepoId::github("acme/widget").natural_key(), "acme/widget");
         // non-github: provider-prefixed, NOT slash-escaped (unlike storage_key).
         let gl = RepoId {
@@ -727,38 +690,6 @@ mod tests {
 
     #[test]
     fn storage_key_round_trips() {
-        let mut registry = ProviderRegistry::new();
-        registry.providers.insert(
-            "gitlab".to_string(),
-            ProviderInstance {
-                id: ProviderInstanceId::new("gitlab"),
-                kind: ProviderKind::GitLab,
-                host: "gitlab.com".to_string(),
-                auth_template: None,
-                auth_header_name: None,
-            },
-        );
-        registry.providers.insert(
-            "sourcehut".to_string(),
-            ProviderInstance {
-                id: ProviderInstanceId::new("sourcehut"),
-                kind: ProviderKind::Generic,
-                host: "git.sr.ht".to_string(),
-                auth_template: Some("token {token}".to_string()),
-                auth_header_name: None,
-            },
-        );
-        registry.providers.insert(
-            "gitea".to_string(),
-            ProviderInstance {
-                id: ProviderInstanceId::new("gitea"),
-                kind: ProviderKind::Gitea,
-                host: "gitea.example.com".to_string(),
-                auth_template: None,
-                auth_header_name: None,
-            },
-        );
-
         let cases = vec![
             RepoId::github("owner/repo"),
             RepoId {
@@ -776,9 +707,17 @@ mod tests {
         ];
         for repo in cases {
             let key = repo.storage_key();
-            let parsed = parse_storage_key(&key, &registry).expect("round-trippable key");
+            let parsed = parse_storage_key(&key).expect("round-trippable key");
             assert_eq!(parsed, repo, "round-trip failed for {key}");
         }
+        assert_eq!(
+            parse_storage_key("owner/repo").unwrap(),
+            RepoId {
+                provider: ProviderInstanceId::new("owner"),
+                path: "repo".to_string(),
+            }
+        );
+        assert!(parse_storage_key("bare-key").is_none());
     }
 
     #[test]

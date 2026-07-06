@@ -1,5 +1,5 @@
 use crate::RefInfo;
-use crate::provider::RepoId;
+use crate::provider::{RepoId, parse_storage_key};
 use crate::storage::S3Storage;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -293,14 +293,18 @@ impl RefStore for FileRefStore {
             while let Some(repo_entry) = repos.next_entry().await? {
                 let ft = repo_entry.file_type().await?;
                 let name = repo_entry.file_name().to_string_lossy().to_string();
-                if ft.is_file() {
-                    // Legacy HEAD ref: {owner}/{repo}.json
-                    if let Some(repo) = name.strip_suffix(".json") {
-                        out.push(RepoId::github(format!("{owner}/{repo}")));
-                    }
+                let key = if ft.is_file() {
+                    let Some(repo) = name.strip_suffix(".json") else {
+                        continue;
+                    };
+                    format!("{owner}/{repo}")
                 } else if ft.is_dir() {
-                    // Branch-specific refs: {owner}/{repo}/{branch_slug}.json
-                    out.push(RepoId::github(format!("{owner}/{name}")));
+                    format!("{owner}/{name}")
+                } else {
+                    continue;
+                };
+                if let Some(repo_id) = parse_storage_key(&key) {
+                    out.push(repo_id);
                 }
             }
         }
@@ -431,7 +435,7 @@ impl RefStore for FileRefStore {
 }
 
 /// S3-compatible ref store. Stores one object per repo under
-/// `{prefix}refs/{owner}/{repo}.json`.
+/// `{prefix}refs/{provider}/{escaped_path}.json`.
 pub struct S3RefStore {
     storage: Arc<S3Storage>,
 }
@@ -570,20 +574,20 @@ impl RefStore for S3RefStore {
             let Some(rest) = key.strip_prefix(prefix) else {
                 continue;
             };
-            let Some((owner, tail)) = rest.split_once('/') else {
+            let Some((provider, tail)) = rest.split_once('/') else {
                 continue;
             };
-            let repo = if let Some(repo_file) = tail.strip_suffix(".json") {
-                // Legacy HEAD key: refs/{owner}/{repo}.json
-                repo_file.to_string()
+            let repo_key = if let Some(repo_file) = tail.strip_suffix(".json") {
+                format!("{provider}/{repo_file}")
             } else if let Some((repo, _branch_file)) = tail.split_once('/') {
-                // Branch key: refs/{owner}/{repo}/{branch_slug}.json
-                repo.to_string()
+                format!("{provider}/{repo}")
             } else {
                 continue;
             };
-            if seen.insert((owner.to_string(), repo.clone())) {
-                out.push(RepoId::github(format!("{owner}/{repo}")));
+            if seen.insert(repo_key.clone())
+                && let Some(repo_id) = parse_storage_key(&repo_key)
+            {
+                out.push(repo_id);
             }
         }
         Ok(out)

@@ -55,9 +55,9 @@ pub struct BuildJob {
 
 impl BuildJob {
     /// Coalescing key: concurrent syncs for the same key collapse to one build.
-    /// Uses the repo's storage key (back-compat `owner/repo` for GitHub) plus the
-    /// branch, so it is stable across processes. Slash-joined (not NUL-joined):
-    /// some SQL engines (Postgres) reject `\0` in TEXT columns.
+    /// Uses the repo's storage key plus the branch, so it is stable across
+    /// processes. Slash-joined (not NUL-joined): some SQL engines (Postgres)
+    /// reject `\0` in TEXT columns.
     pub fn key(&self) -> String {
         format!("{}/{}", self.repo_id.storage_key(), self.branch)
     }

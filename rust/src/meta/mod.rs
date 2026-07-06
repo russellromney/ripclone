@@ -10,7 +10,7 @@
 //! row per repo/branch), so this mirrors the file/S3 stores closely.
 
 use crate::RefInfo;
-use crate::provider::RepoId;
+use crate::provider::{RepoId, parse_storage_key};
 use crate::ref_store::RefStore;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -37,9 +37,8 @@ pub struct RefRow {
 }
 
 /// Per-engine adapter over a `refs(repo_key, branch, commit_id, synced_at,
-/// data)` table. `repo_key` is the repo's [`RepoId::storage_key`] (the
-/// back-compat `owner/repo` for GitHub). Implemented by `SqliteMeta`,
-/// `PostgresMeta`, `MysqlMeta`, `LibsqlMeta`.
+/// data)` table. `repo_key` is the repo's [`RepoId::storage_key`]. Implemented
+/// by `SqliteMeta`, `PostgresMeta`, `MysqlMeta`, `LibsqlMeta`.
 #[async_trait]
 pub trait MetaDb: Send + Sync {
     /// Create the `refs` table if absent.
@@ -123,14 +122,12 @@ impl RefStore for SqlRefStore {
     }
 
     async fn list(&self) -> Result<Vec<RepoId>> {
-        // Phase 0 (mirrors the file/S3 stores): every stored key is a GitHub
-        // repo, so the back-compat `owner/repo` key reconstructs a GitHub RepoId.
         Ok(self
             .db
             .list_repos()
             .await?
             .into_iter()
-            .map(RepoId::github)
+            .filter_map(|key| parse_storage_key(&key))
             .collect())
     }
 
