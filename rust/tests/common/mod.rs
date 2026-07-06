@@ -134,7 +134,13 @@ pub async fn start_server_env(extra: &[(&str, &str)]) -> Server {
 /// lock drops, so no other server is constructed while it is set — keeping the
 /// suite correct under parallel `cargo test`.
 pub async fn start_server_faulting(fail_first: usize) -> Server {
-    start_server_inner(fail_first, &[]).await
+    start_server_faulting_env(fail_first, &[]).await
+}
+
+/// Combine fault injection with extra server-construction env vars (e.g.
+/// `RIPCLONE_JWT_TTL_SECS`) set under `SERVER_START_LOCK`.
+pub async fn start_server_faulting_env(fail_first: usize, extra: &[(&str, &str)]) -> Server {
+    start_server_inner(fail_first, extra).await
 }
 
 pub async fn start_server_split_storage() -> Server {

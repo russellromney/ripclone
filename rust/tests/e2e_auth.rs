@@ -371,6 +371,72 @@ async fn bearer_client_clones_through_the_gateway() {
     unsafe { std::env::remove_var("RIPCLONE_EXTRACT_ARCHIVE") };
 }
 
+/// A bearer token that expires mid-clone must not leave a partial tree: the
+/// client either refreshes the session (not implemented — the server exposes
+/// `/v1/auth/refresh`, the client currently returns 401) or fails cleanly.
+#[tokio::test]
+async fn expired_bearer_token_fails_clone_cleanly() {
+    init(false);
+    // Short-lived session tokens and a generous retry budget so the clone stays
+    // in flight long enough for the token to expire before the artifact fetch
+    // retry cap is reached.
+    let server = start_server_faulting(100).await;
+    let origin = make_origin("acme", "jwtexp");
+    origin.commit(&[("a.txt", "x\n"), ("b.txt", "y\n")], "c1");
+    origin.publish();
+    server
+        .client()
+        .sync_repo("acme/jwtexp", None)
+        .await
+        .expect("sync");
+
+    // Short-lived session tokens: the TTL is read at issuance, so it must be set
+    // before minting the token and kept until the clone has finished.
+    unsafe { std::env::set_var("RIPCLONE_JWT_TTL_SECS", "2") };
+    let token = mint_token(&server).await;
+    let client = ripclone::client::Client::new_with_bearer(server.url.clone(), token)
+        .with_provider("github");
+
+    let out = tempfile::tempdir().unwrap();
+    let target = out.path().join("clone");
+    // Give the clone a generous retry budget so it stays in flight until the
+    // 2-second JWT expires.
+    unsafe { std::env::set_var("RIPCLONE_FETCH_MAX_ATTEMPTS", "20") };
+    let res = client
+        .install_repo_with_mode_at(
+            "acme/jwtexp",
+            "HEAD",
+            None,
+            &target,
+            ripclone::mode::CloneMode::Files,
+            Some("full"),
+            None,
+        )
+        .await;
+    unsafe { std::env::remove_var("RIPCLONE_FETCH_MAX_ATTEMPTS") };
+    unsafe { std::env::remove_var("RIPCLONE_JWT_TTL_SECS") };
+
+    assert!(
+        res.is_err(),
+        "clone with an expired bearer token must fail, got {res:?}"
+    );
+    let err = res.unwrap_err();
+    let err_text = err.to_string();
+    assert!(
+        err_text.contains("401")
+            || err_text.to_lowercase().contains("unauthorized")
+            || err.chain().any(|e| {
+                let s = e.to_string();
+                s.contains("401") || s.to_lowercase().contains("unauthorized")
+            }),
+        "expected 401/unauthorized in error chain, got: {err:#}"
+    );
+    assert!(
+        !target.exists(),
+        "failed clone must not leave a partial tree at target"
+    );
+}
+
 #[tokio::test]
 async fn paste_mode_shows_the_token() {
     init(false);

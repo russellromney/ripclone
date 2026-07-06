@@ -412,7 +412,18 @@ impl StorageBackend for S3Storage {
             .ok()?
             .build()
             .ok()?;
-        Some(presigned.url.to_string())
+        let mut url = presigned.url;
+        // Test-only: redirect signed-URL fetches through a local delay proxy so
+        // tests can force expiry mid-clone without slowing the server's direct S3
+        // API traffic. The proxy sees the same Host the URL was signed for.
+        if let Ok(proxy) = std::env::var("RIPCLONE_TEST_SIGNED_URL_PROXY") {
+            if let Ok(proxy_url) = url::Url::parse(&proxy) {
+                let _ = url.set_scheme(proxy_url.scheme());
+                let _ = url.set_host(proxy_url.host_str());
+                let _ = url.set_port(proxy_url.port());
+            }
+        }
+        Some(url.to_string())
     }
 
     fn is_remote(&self) -> bool {

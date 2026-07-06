@@ -21,6 +21,7 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::sleep;
 
 #[derive(Clone)]
@@ -95,6 +96,195 @@ async fn wait_for_server(port: u16) {
         sleep(Duration::from_millis(25)).await;
     }
     panic!("server on port {port} did not become ready");
+}
+
+/// A selective TCP delay proxy for forcing S3 signed-URL expiry in tests.
+///
+/// Listens on a local port and forwards requests to `target_endpoint`. Regular
+/// S3 API traffic is tunneled with keep-alive. Every GET/HEAD whose path/query
+/// looks like a presigned S3 URL is delayed for `delay` and forced to close
+/// after the response, so each signed-URL fetch is held long enough for a short
+/// TTL to expire. The raw-byte forwarding preserves the Host header, so MinIO
+/// validates the signature minted for the proxy endpoint.
+pub struct DelayProxy {
+    pub url: String,
+    _handle: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for DelayProxy {
+    fn drop(&mut self) {
+        self._handle.abort();
+    }
+}
+
+fn target_host_port(endpoint: &str) -> String {
+    let url = url::Url::parse(endpoint).expect("valid S3 endpoint URL");
+    let host = url.host_str().expect("endpoint host");
+    let port = url
+        .port_or_known_default()
+        .expect("endpoint port or known scheme default");
+    format!("{host}:{port}")
+}
+
+/// True when the request bytes look like a presigned S3 GET/HEAD.
+fn is_signed_get(head: &[u8]) -> bool {
+    let s = std::str::from_utf8(head).unwrap_or("");
+    let Some(line) = s.lines().next() else {
+        return false;
+    };
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    if parts.len() < 2 {
+        return false;
+    }
+    let method = parts[0];
+    let path_query = parts[1];
+    (method == "GET" || method == "HEAD")
+        && (path_query.contains("X-Amz-Signature=") || path_query.contains("Signature="))
+}
+
+/// Rewrite the request so the backend closes the connection after the response.
+fn force_connection_close(buf: &mut Vec<u8>) {
+    let s = match std::str::from_utf8(buf) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let Some(end_headers) = s.find("\r\n\r\n") else {
+        return;
+    };
+    let before = &s[..end_headers];
+    let after = &s[end_headers + 4..];
+    let new_headers: Vec<&str> = before
+        .lines()
+        .filter(|l| !l.to_lowercase().starts_with("connection:"))
+        .collect();
+    let new = format!(
+        "{}\r\nConnection: close\r\n\r\n{}",
+        new_headers.join("\r\n"),
+        after
+    );
+    *buf = new.into_bytes();
+}
+
+/// Replace the Host header so the S3 backend validates the signature minted for
+/// the direct endpoint, while the client still sends requests to the proxy.
+fn replace_host_header(buf: &mut Vec<u8>, new_host: &str) {
+    let s = match std::str::from_utf8(buf) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let Some(end_headers) = s.find("\r\n\r\n") else {
+        return;
+    };
+    let before = &s[..end_headers];
+    let after = &s[end_headers + 4..];
+    let new_headers: Vec<String> = before
+        .lines()
+        .map(|l| {
+            if l.to_lowercase().starts_with("host:") {
+                format!("Host: {new_host}")
+            } else {
+                l.to_string()
+            }
+        })
+        .collect();
+    let new = format!("{}\r\n\r\n{}", new_headers.join("\r\n"), after);
+    *buf = new.into_bytes();
+}
+
+/// Read until the HTTP header block is complete.
+async fn read_request_header(client: &mut tokio::net::TcpStream) -> Option<Vec<u8>> {
+    let mut buf = Vec::with_capacity(1024);
+    let mut tmp = [0u8; 1024];
+    loop {
+        let n = client.read(&mut tmp).await.ok()?;
+        if n == 0 {
+            return None;
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+            return Some(buf);
+        }
+        if buf.len() > 64 * 1024 {
+            return None;
+        }
+    }
+}
+
+/// Handle a signed GET by delaying it, forcing a close, and copying the response
+/// until the backend closes. GETs have no body, so we only need the header.
+async fn proxy_signed_get(
+    client: &mut tokio::net::TcpStream,
+    target: &str,
+    mut header: Vec<u8>,
+    delay: Duration,
+) {
+    sleep(delay).await;
+    let Ok(mut backend) = tokio::net::TcpStream::connect(target).await else {
+        return;
+    };
+    force_connection_close(&mut header);
+    replace_host_header(&mut header, target);
+    if backend.write_all(&header).await.is_err() {
+        return;
+    }
+    let mut buf = [0u8; 4096];
+    loop {
+        match backend.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if client.write_all(&buf[..n]).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+async fn proxy_one_connection(mut client: tokio::net::TcpStream, target: String, delay: Duration) {
+    let Some(header) = read_request_header(&mut client).await else {
+        return;
+    };
+
+    if is_signed_get(&header) {
+        proxy_signed_get(&mut client, &target, header, delay).await;
+        return;
+    }
+
+    // Not a signed GET: open a backend connection and tunnel the rest. The
+    // already-read header bytes are forwarded, then we full-duplex copy.
+    let Ok(mut backend) = tokio::net::TcpStream::connect(&target).await else {
+        return;
+    };
+    if backend.write_all(&header).await.is_err() {
+        return;
+    }
+    let _ = tokio::io::copy_bidirectional(&mut client, &mut backend).await;
+}
+
+pub async fn start_delay_proxy(target_endpoint: &str, delay: Duration) -> DelayProxy {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind delay proxy");
+    let port = listener.local_addr().expect("proxy local addr").port();
+    let target = target_host_port(target_endpoint);
+
+    let handle = tokio::spawn(async move {
+        loop {
+            let (client, _) = match listener.accept().await {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let target = target.clone();
+            tokio::spawn(async move {
+                proxy_one_connection(client, target, delay).await;
+            });
+        }
+    });
+
+    DelayProxy {
+        url: format!("http://127.0.0.1:{port}"),
+        _handle: handle,
+    }
 }
 
 async fn start_s3_server(env: &S3Env, prefix: &str) -> Server {
@@ -646,6 +836,96 @@ async fn remote_gc_during_faulting_clone_is_safe() {
 
     cleanup_prefix(&env, &prefix).await.expect("cleanup prefix");
     cleanup_repo_refs(&env, "acme", &repo)
+        .await
+        .expect("cleanup refs");
+    guard.disable();
+}
+
+/// Signed URLs with a TTL shorter than the request latency must fail cleanly
+/// with an actionable stale-URL error, never a partial tree. A local MinIO is
+/// too fast for a 10 MiB download to outlive a 1-second TTL, so we insert a
+/// delay proxy that holds every GET for longer than the TTL before forwarding
+/// it to storage.
+#[ignore = "requires S3 credentials"]
+#[tokio::test]
+async fn expired_signed_url_fails_clone_cleanly() {
+    let direct_env = match s3_env() {
+        Some(e) => e,
+        None => {
+            eprintln!("SKIP: RIPCLONE_S3_ENDPOINT/BUCKET not set");
+            return;
+        }
+    };
+
+    // All direct S3 cleanup must talk to MinIO, not the proxy.
+    let prefix = unique_prefix();
+    let suffix = repo_suffix(&prefix);
+    let repo = format!("sigurl-{suffix}");
+    let mut guard = CleanupGuard::new(direct_env.clone(), prefix.clone());
+
+    // Hold signed-URL GETs for longer than the TTL so they expire mid-request.
+    // The server uses MinIO directly for storage API traffic; only the presigned
+    // URLs are rewritten to point at this proxy.
+    let proxy = start_delay_proxy(&direct_env.endpoint, Duration::from_millis(1500)).await;
+    let server = start_s3_server(&direct_env, &prefix).await;
+
+    let origin = make_origin("acme", &repo);
+    guard.track_repo("acme", &repo);
+    origin.commit(&[("a.txt", "signed-url race\n")], "c1");
+    origin.publish();
+
+    server
+        .client()
+        .sync_repo(&format!("acme/{repo}"), None)
+        .await
+        .expect("sync");
+
+    // Short signed-URL TTL plus serial editable fetches. The TTL is read when
+    // the ref response is built, so it must be set before the clone resolves.
+    // Redirect only the presigned URLs through the delay proxy.
+    unsafe {
+        std::env::set_var("RIPCLONE_SIGNED_URL_TTL_SECS", "1");
+        std::env::set_var("RIPCLONE_EDITABLE_DOWNLOAD_CONCURRENCY", "1");
+        std::env::set_var("RIPCLONE_TEST_SIGNED_URL_PROXY", &proxy.url);
+    }
+
+    let client = server.client();
+    let out = tempfile::tempdir().unwrap();
+    let target = out.path().join("clone");
+    let res = client
+        .install_repo_with_mode_at(
+            &format!("acme/{repo}"),
+            "HEAD",
+            None,
+            &target,
+            CloneMode::Editable,
+            None,
+            None,
+        )
+        .await;
+    unsafe {
+        std::env::remove_var("RIPCLONE_SIGNED_URL_TTL_SECS");
+        std::env::remove_var("RIPCLONE_EDITABLE_DOWNLOAD_CONCURRENCY");
+        std::env::remove_var("RIPCLONE_TEST_SIGNED_URL_PROXY");
+    }
+
+    assert!(
+        res.is_err(),
+        "clone with expired signed URLs must fail, got {res:?}"
+    );
+    assert!(
+        ripclone::client::is_stale_signed_url(&res.unwrap_err()),
+        "expected StaleSignedUrl in error chain"
+    );
+    assert!(
+        !target.exists(),
+        "failed clone must not leave a partial tree at target"
+    );
+
+    cleanup_prefix(&direct_env, &prefix)
+        .await
+        .expect("cleanup prefix");
+    cleanup_repo_refs(&direct_env, "acme", &repo)
         .await
         .expect("cleanup refs");
     guard.disable();
