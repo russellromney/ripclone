@@ -1,4 +1,6 @@
-use crate::clonepack::{ClonepackManifest, hash_to_hex};
+use crate::clonepack::{
+    ClonepackManifest, collect_manifest_hashes, hash_to_hex, manifest_chunk_refs,
+};
 use crate::ref_store::RefStore;
 use crate::storage::{HashEntry, StorageRef};
 use crate::{ClonepackArtifacts, HistoryLevel, PackArtifact, RefInfo, SizedPack};
@@ -182,9 +184,11 @@ impl RemoteGc {
         }
 
         let now = unix_secs(SystemTime::now());
-        let evicted = self.evict_idle_warm_refs(now).await?;
-        if evicted > 0 {
-            info!("warm TTL sweep evicted {evicted} idle ref(s)");
+        if !self.config.dry_run {
+            let evicted = self.evict_idle_warm_refs(now).await?;
+            if evicted > 0 {
+                info!("warm TTL sweep evicted {evicted} idle ref(s)");
+            }
         }
 
         let reachable = reachable_hashes(&self.ref_store, &self.storage, false).await?;
@@ -548,48 +552,6 @@ fn collect_ref_info_hashes(info: &RefInfo, reachable: &mut HashSet<String>) {
     collect_clonepack_artifacts(&info.full_clonepack, reachable);
     collect_clonepack_artifacts(&info.shallow_clonepack, reachable);
     collect_history_levels(&info.history_levels, reachable);
-}
-
-fn collect_manifest_hashes(info: &RefInfo) -> Vec<String> {
-    let mut seen = HashSet::new();
-    let mut out = Vec::new();
-    for hash in [
-        &info.full_clonepack.manifest,
-        &info.shallow_clonepack.manifest,
-        &info.clonepack_manifest,
-    ] {
-        if !hash.is_empty() && seen.insert(hash.to_string()) {
-            out.push(hash.to_string());
-        }
-    }
-    out
-}
-
-fn manifest_chunk_refs(manifest: &ClonepackManifest) -> Vec<&crate::clonepack::ChunkRef> {
-    let mut refs = Vec::new();
-    if let Some(ref meta) = manifest.metadata_chunk {
-        refs.push(meta);
-    }
-    refs.extend(&manifest.archive_chunks);
-    refs.extend(&manifest.head_blobs_chunks);
-    if let Some(ref idx) = manifest.head_blobs_idx {
-        refs.push(idx);
-    }
-    for pack in &manifest.packs {
-        if let Some(ref pack_chunk) = pack.pack {
-            refs.push(pack_chunk);
-        }
-        if let Some(ref idx_chunk) = pack.idx {
-            refs.push(idx_chunk);
-        }
-    }
-    if let Some(ref midx) = manifest.midx {
-        refs.push(midx);
-    }
-    if let Some(ref idx_bundle) = manifest.idx_bundle {
-        refs.push(idx_bundle);
-    }
-    refs
 }
 
 #[cfg(test)]
@@ -1376,6 +1338,51 @@ mod tests {
                 grace_period: Duration::from_secs(0),
                 warm_ttl: Duration::from_secs(1),
                 dry_run: false,
+            },
+        );
+        let report = gc.run().await.unwrap();
+
+        assert_eq!(report.objects_deleted, 0);
+        assert!(manifest_path.exists());
+
+        let info = ref_store
+            .load_branch(&RepoId::github("o/r"), "HEAD")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(info.build_status.as_deref(), Some(EVICTED_BUILD_STATUS));
+    }
+
+    #[tokio::test]
+    async fn warm_ttl_dry_run_does_not_evict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cas_root = tmp.path().join("cas");
+        let repo_root = tmp.path().join("repos");
+        std::fs::create_dir_all(&cas_root).unwrap();
+        std::fs::create_dir_all(&repo_root).unwrap();
+
+        let cas = Cas::new(&cas_root).unwrap();
+        let storage: StorageRef = Arc::new(TestRemoteStorage {
+            inner: local(&cas_root).unwrap(),
+        });
+        let ref_store: Arc<dyn RefStore> = Arc::new(FileRefStore::new(&repo_root));
+
+        let mut info = make_ref_info_with_manifest(&cas);
+        let now = unix_secs(SystemTime::now());
+        info.last_accessed_at = Some(now.saturating_sub(10));
+        info.synced_at = Some(now.saturating_sub(10));
+        ref_store.save(&RepoId::github("o/r"), &info).await.unwrap();
+
+        let manifest_path = cas.path(&info.full_clonepack.manifest);
+        assert!(manifest_path.exists());
+
+        let gc = RemoteGc::new(
+            storage.clone(),
+            ref_store.clone(),
+            GcConfig {
+                grace_period: Duration::from_secs(0),
+                warm_ttl: Duration::from_secs(1),
+                dry_run: true,
             },
         );
         let report = gc.run().await.unwrap();

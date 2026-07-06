@@ -1,3 +1,4 @@
+use crate::fsutil::{path_from_bytes, safe_create_dir_all, validate_relative_path};
 use crate::manifest::FileEntry;
 use anyhow::{Context, Result};
 use filetime::{FileTime, set_file_mtime, set_symlink_file_times};
@@ -65,90 +66,6 @@ fn record_io(d: Duration, files: u64, bytes: u64) {
 
 fn record_mtime(d: Duration) {
     MTIME_NS.fetch_add(d.as_nanos() as u64, Ordering::Relaxed);
-}
-
-/// Convert a raw path byte slice to a `Path`. On Unix this preserves arbitrary
-/// git path bytes; on other platforms we fall back to UTF-8.
-pub fn path_from_bytes(bytes: &[u8]) -> &Path {
-    #[cfg(unix)]
-    {
-        use std::ffi::OsStr;
-        use std::os::unix::ffi::OsStrExt;
-        Path::new(OsStr::from_bytes(bytes))
-    }
-    #[cfg(not(unix))]
-    {
-        let s = std::str::from_utf8(bytes).unwrap_or("<invalid utf8 path>");
-        Path::new(s)
-    }
-}
-
-/// Validate that `path` is a non-empty relative path with no `..` components
-/// and no NUL bytes. This must be applied to every manifest path before any
-/// filesystem operation.
-pub fn validate_relative_path(path: &Path) -> Result<()> {
-    if path.as_os_str().is_empty() {
-        anyhow::bail!("path is empty");
-    }
-    if path.is_absolute() {
-        anyhow::bail!("path is absolute: {}", path.display());
-    }
-    for comp in path.components() {
-        match comp {
-            std::path::Component::ParentDir => {
-                anyhow::bail!("path contains parent-dir component: {}", path.display());
-            }
-            std::path::Component::Normal(_) => {}
-            _ => {
-                anyhow::bail!("path contains invalid component: {}", path.display());
-            }
-        }
-    }
-    if path.as_os_str().as_encoded_bytes().contains(&0) {
-        anyhow::bail!("path contains NUL byte: {}", path.display());
-    }
-    Ok(())
-}
-
-/// Create a directory tree under `root` following only real directory
-/// components. Any symlink encountered along the way is rejected.
-pub fn safe_create_dir_all(root: &Path, rel: &Path) -> Result<()> {
-    validate_relative_path(rel)?;
-    let mut current = root.to_path_buf();
-    for comp in rel.components() {
-        if let std::path::Component::Normal(name) = comp {
-            current.push(name);
-            if current.is_symlink() {
-                anyhow::bail!(
-                    "refusing to follow symlinked directory: {}",
-                    current.display()
-                );
-            }
-            // Create unconditionally and tolerate a concurrent creator. Probing
-            // with `exists()` first would race when several producer threads
-            // create the same parent directory at once (one would win, the
-            // others would hit EEXIST). `create_dir` + `AlreadyExists` is the
-            // atomic form.
-            match std::fs::create_dir(&current) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if current.is_symlink() {
-                        anyhow::bail!(
-                            "refusing to follow symlinked directory: {}",
-                            current.display()
-                        );
-                    }
-                    if !current.is_dir() {
-                        anyhow::bail!("path is not a directory: {}", current.display());
-                    }
-                }
-                Err(e) => {
-                    return Err(e).with_context(|| format!("create dir {}", current.display()));
-                }
-            }
-        }
-    }
-    Ok(())
 }
 
 #[derive(Clone, Copy, Debug)]

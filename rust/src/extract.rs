@@ -1,3 +1,4 @@
+use crate::fsutil::{path_from_bytes, safe_create_dir_all, validate_relative_path};
 use crate::manifest::{FileEntry, FrameInfo, MetadataChunk as Manifest};
 use crate::worktree_writer::{
     FileSlice, FileWriteContent, OwnedFileWrite, WorktreeWriter, WriteOptions,
@@ -21,22 +22,6 @@ const PACK_WRITE_BATCH_FILES: usize = 512;
 fn blob_sha1_to_array(sha1: &[u8]) -> Result<[u8; 20]> {
     sha1.try_into()
         .map_err(|_| anyhow::anyhow!("manifest blob_sha1 must be 20 bytes, got {}", sha1.len()))
-}
-
-/// Convert a raw path byte slice to a `Path`. On Unix this preserves arbitrary
-/// git path bytes; on other platforms we fall back to UTF-8.
-fn path_from_bytes(bytes: &[u8]) -> &std::path::Path {
-    #[cfg(unix)]
-    {
-        use std::ffi::OsStr;
-        use std::os::unix::ffi::OsStrExt;
-        std::path::Path::new(OsStr::from_bytes(bytes))
-    }
-    #[cfg(not(unix))]
-    {
-        let s = std::str::from_utf8(bytes).unwrap_or("<invalid utf8 path>");
-        std::path::Path::new(s)
-    }
 }
 
 struct PendingFile {
@@ -556,72 +541,6 @@ where
         raw_bytes: raw_total,
         stats: stat_cache,
     })
-}
-
-/// Validate that `path` is a non-empty relative path with no `..` components
-/// and no NUL bytes. This must be applied to every manifest path before any
-/// filesystem operation.
-pub fn validate_relative_path(path: &Path) -> Result<()> {
-    if path.as_os_str().is_empty() {
-        anyhow::bail!("path is empty");
-    }
-    if path.is_absolute() {
-        anyhow::bail!("path is absolute: {}", path.display());
-    }
-    for comp in path.components() {
-        match comp {
-            std::path::Component::ParentDir => {
-                anyhow::bail!("path contains parent-dir component: {}", path.display());
-            }
-            std::path::Component::Normal(_) => {}
-            _ => {
-                anyhow::bail!("path contains invalid component: {}", path.display());
-            }
-        }
-    }
-    if path.as_os_str().as_encoded_bytes().contains(&0) {
-        anyhow::bail!("path contains NUL byte: {}", path.display());
-    }
-    Ok(())
-}
-
-/// Create a directory tree under `root` following only real directory
-/// components. Any symlink encountered along the way is rejected.
-fn safe_create_dir_all(root: &Path, rel: &Path) -> Result<()> {
-    validate_relative_path(rel)?;
-    let mut current = root.to_path_buf();
-    for comp in rel.components() {
-        if let std::path::Component::Normal(name) = comp {
-            current.push(name);
-            if current.is_symlink() {
-                anyhow::bail!(
-                    "refusing to follow symlinked directory: {}",
-                    current.display()
-                );
-            }
-            // Create unconditionally and tolerate a concurrent creator. Probing
-            // with `exists()` first races when several producer threads create
-            // the same parent at once (one wins, the rest hit EEXIST and error).
-            match std::fs::create_dir(&current) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if current.is_symlink() {
-                        anyhow::bail!(
-                            "refusing to follow symlinked directory: {}",
-                            current.display()
-                        );
-                    }
-                    if !current.is_dir() {
-                        anyhow::bail!("path is not a directory: {}", current.display());
-                    }
-                }
-                Err(e) => {
-                    return Err(e).with_context(|| format!("create dir {}", current.display()));
-                }
-            }
-        }
-    }
-    Ok(())
 }
 
 /// `WriteOptions` shared by every archive regular-file write.

@@ -34,6 +34,8 @@ pub mod config;
 #[doc(hidden)]
 pub mod extract;
 #[doc(hidden)]
+pub mod fsutil;
+#[doc(hidden)]
 pub mod git;
 #[doc(hidden)]
 pub mod gix_util;

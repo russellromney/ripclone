@@ -120,7 +120,7 @@ fn bench_path_validation(count: usize) {
         .collect();
     let start = now();
     for p in &paths {
-        ripclone::extract::validate_relative_path(p).unwrap();
+        ripclone::fsutil::validate_relative_path(p).unwrap();
     }
     let elapsed = start.elapsed();
     println!(
