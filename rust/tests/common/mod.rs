@@ -6,7 +6,9 @@
 #![allow(dead_code)]
 
 use ripclone::client::Client;
-use ripclone::server::{RateLimiter, ServerState, build_app, run_server};
+use ripclone::server::{
+    ArtifactBarrier, RateLimiter, ServerState, build_app, run_server_with_barrier,
+};
 use ripclone::storage::{HashEntry, StorageBackend, StorageRef};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -117,14 +119,14 @@ fn init_tracing() {
 }
 
 pub async fn start_server() -> Server {
-    start_server_inner(0, &[]).await
+    start_server_inner(0, &[], None).await
 }
 
 /// Start a server with extra env vars (e.g. `RIPCLONE_WEBHOOK_SECRET`,
 /// `RIPCLONE_POLL_INTERVAL_SECS`) set only during construction, under
 /// `SERVER_START_LOCK`, so they can't leak into a concurrently-starting server.
 pub async fn start_server_env(extra: &[(&str, &str)]) -> Server {
-    start_server_inner(0, extra).await
+    start_server_inner(0, extra, None).await
 }
 
 /// Like `start_server`, but the server fails its first `fail_first` artifact
@@ -140,10 +142,26 @@ pub async fn start_server_faulting(fail_first: usize) -> Server {
 /// Combine fault injection with extra server-construction env vars (e.g.
 /// `RIPCLONE_JWT_TTL_SECS`) set under `SERVER_START_LOCK`.
 pub async fn start_server_faulting_env(fail_first: usize, extra: &[(&str, &str)]) -> Server {
-    start_server_inner(fail_first, extra).await
+    start_server_inner(fail_first, extra, None).await
+}
+
+/// Start a server with a deterministic artifact download barrier installed.
+/// See [`ripclone::server::ArtifactBarrier`].
+pub async fn start_server_with_barrier(barrier: ArtifactBarrier) -> Server {
+    start_server_inner(0, &[], Some(barrier)).await
 }
 
 pub async fn start_server_split_storage() -> Server {
+    start_server_split_storage_inner(None).await
+}
+
+/// Start a split-storage server with a deterministic artifact download barrier.
+/// See [`ripclone::server::ArtifactBarrier`].
+pub async fn start_server_split_storage_barrier(barrier: ArtifactBarrier) -> Server {
+    start_server_split_storage_inner(Some(barrier)).await
+}
+
+async fn start_server_split_storage_inner(barrier: Option<ArtifactBarrier>) -> Server {
     init_tracing();
     let dir = tempfile::tempdir().expect("server dir");
     let cas_dir = dir.path().join("cas");
@@ -200,6 +218,7 @@ pub async fn start_server_split_storage() -> Server {
         ref_response_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         artifact_fetch_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         fail_first_fetches: 0,
+        artifact_barrier: barrier,
         readyz_cache: Arc::new(std::sync::Mutex::new(None)),
         access_verifier: Arc::new(ripclone::auth::access::HttpAccessVerifier::new()),
         require_repo_auth: false,
@@ -271,8 +290,16 @@ pub async fn start_server_split_storage() -> Server {
     }
 }
 
-struct RemoteLocalStorage {
+/// A local filesystem storage backend that reports `is_remote() = true` so
+/// `RemoteGc` can be exercised in tests without an S3-compatible store.
+pub struct RemoteLocalStorage {
     inner: StorageRef,
+}
+
+impl RemoteLocalStorage {
+    pub fn new(inner: StorageRef) -> Self {
+        Self { inner }
+    }
 }
 
 #[async_trait::async_trait]
@@ -339,7 +366,11 @@ impl StorageBackend for RemoteLocalStorage {
 /// once at construction, can't leak into a concurrently-starting server.
 static SERVER_START_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-async fn start_server_inner(fail_first: usize, extra_env: &[(&str, &str)]) -> Server {
+async fn start_server_inner(
+    fail_first: usize,
+    extra_env: &[(&str, &str)],
+    artifact_barrier: Option<ArtifactBarrier>,
+) -> Server {
     init_tracing();
     let dir = tempfile::tempdir().expect("server dir");
     let cas_dir = dir.path().join("cas");
@@ -362,7 +393,7 @@ async fn start_server_inner(fail_first: usize, extra_env: &[(&str, &str)]) -> Se
         }
     }
     tokio::spawn(async move {
-        let _ = run_server(&cas2, &repos2, "127.0.0.1", port).await;
+        let _ = run_server_with_barrier(&cas2, &repos2, "127.0.0.1", port, artifact_barrier).await;
     });
     // Wait until the port accepts connections. The server state (including the
     // fault threshold read) is constructed before the listener binds, so by the

@@ -31,7 +31,7 @@ use axum::{
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
 };
-use futures::{StreamExt, TryStreamExt};
+use futures::{SinkExt, StreamExt, TryStreamExt};
 use prost::Message;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
@@ -42,9 +42,47 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 use tracing::{error, info, warn};
+
+/// Test-only deterministic barrier for artifact downloads. The first artifact
+/// response whose body is larger than `after_bytes` splits its body into a
+/// stream: it sends the prefix, signals `entered`, waits on `proceed`, and then
+/// either sends the remainder or closes the connection (when `close_on_proceed`).
+/// This lets tests pause a download mid-body without relying on wall-clock
+/// timing or first-request fault injection.
+#[derive(Clone)]
+pub struct ArtifactBarrier {
+    pub after_bytes: usize,
+    pub entered: Arc<StdMutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+    pub proceed: Arc<StdMutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
+    pub close_on_proceed: bool,
+    pub consumed: Arc<AtomicBool>,
+}
+
+static TEST_ARTIFACT_BARRIER: StdMutex<Option<ArtifactBarrier>> = StdMutex::new(None);
+
+/// Install a barrier for the next server constructed in this process. Returns a
+/// guard that clears the slot when dropped, so a panicked test cannot leak the
+/// barrier into the next test in the same binary.
+pub fn set_test_artifact_barrier(barrier: ArtifactBarrier) -> TestArtifactBarrierGuard {
+    *TEST_ARTIFACT_BARRIER.lock().unwrap() = Some(barrier);
+    TestArtifactBarrierGuard
+}
+
+/// RAII guard for [`set_test_artifact_barrier`].
+pub struct TestArtifactBarrierGuard;
+
+impl Drop for TestArtifactBarrierGuard {
+    fn drop(&mut self) {
+        *TEST_ARTIFACT_BARRIER.lock().unwrap() = None;
+    }
+}
+
+fn take_test_artifact_barrier() -> Option<ArtifactBarrier> {
+    TEST_ARTIFACT_BARRIER.lock().unwrap().take()
+}
 
 #[derive(Clone)]
 pub struct ServerState {
@@ -98,6 +136,9 @@ pub struct ServerState {
     /// Read once from `RIPCLONE_TEST_FAIL_FIRST_FETCHES` at construction (0 =
     /// off), so the hot path never touches the environment in production.
     pub fail_first_fetches: usize,
+    /// Test-only deterministic barrier for the first artifact download that is
+    /// larger than `after_bytes`. See [`ArtifactBarrier`].
+    pub artifact_barrier: Option<ArtifactBarrier>,
     /// Cached `/readyz` result `(checked_at, ready)`. Bounds backend probe cost
     /// (S3 round-trips) and damps load-balancer flapping on a transient blip.
     pub readyz_cache: Arc<std::sync::Mutex<Option<(Instant, bool)>>>,
@@ -151,6 +192,7 @@ impl ServerState {
             ref_response_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             artifact_fetch_count: Arc::new(AtomicUsize::new(0)),
             fail_first_fetches: 0,
+            artifact_barrier: None,
             readyz_cache: Arc::new(std::sync::Mutex::new(None)),
             // The worker never serves reads; a verifier is required by the type
             // but unused, and auth enforcement is irrelevant here.
@@ -3945,6 +3987,42 @@ async fn get_artifact(
         .into_response()
 }
 
+/// Return a response body that streams `data` but pauses after `barrier.after_bytes`
+/// bytes, signals the test, waits for the test to release it, and then either
+/// sends the rest of the bytes or errors out so the client sees a retryable
+/// transport failure.
+fn barrier_body(data: Vec<u8>, barrier: ArtifactBarrier) -> Body {
+    let (mut tx, rx) = futures::channel::mpsc::channel::<Result<Bytes, std::io::Error>>(2);
+    tokio::spawn(async move {
+        let after = barrier.after_bytes.min(data.len());
+        let _ = tx.send(Ok(Bytes::from(data[..after].to_vec()))).await;
+        let entered = barrier.entered.lock().unwrap().take();
+        if let Some(entered) = entered {
+            let _ = entered.send(());
+        }
+        let proceed = barrier.proceed.lock().unwrap().take();
+        let should_continue = if let Some(proceed) = proceed {
+            proceed.await.is_ok() && !barrier.close_on_proceed
+        } else {
+            false
+        };
+        if should_continue && after < data.len() {
+            let _ = tx.send(Ok(Bytes::from(data[after..].to_vec()))).await;
+        } else {
+            // Error out so reqwest surfaces a body-read failure rather than a
+            // clean short body. That makes the client's retry path run again with
+            // the now-expired credential.
+            let _ = tx
+                .send(Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "injected test barrier close",
+                )))
+                .await;
+        }
+    });
+    Body::from_stream(rx)
+}
+
 async fn serve_artifact(
     hash: String,
     state: ServerState,
@@ -4031,6 +4109,14 @@ async fn serve_artifact(
             match tokio::task::spawn_blocking(move || state.storage.get(&hash_clone)).await {
                 Ok(Ok(data)) => {
                     state.metrics.record_artifact_request(data.len() as u64);
+                    if let Some(barrier) = state.artifact_barrier.clone() {
+                        if !barrier.consumed.load(Ordering::SeqCst)
+                            && data.len() > barrier.after_bytes
+                        {
+                            barrier.consumed.store(true, Ordering::SeqCst);
+                            return (StatusCode::OK, barrier_body(data, barrier)).into_response();
+                        }
+                    }
                     (StatusCode::OK, data).into_response()
                 }
                 _ => {
@@ -6499,11 +6585,12 @@ fn read_server_auth_token() -> Result<String> {
     auth_token_hash(None)
 }
 
-pub async fn run_server(
+pub async fn run_server_with_barrier(
     cas_dir: &std::path::Path,
     repo_root: &std::path::Path,
     host: &str,
     port: u16,
+    artifact_barrier: Option<ArtifactBarrier>,
 ) -> Result<()> {
     std::fs::create_dir_all(cas_dir)?;
     std::fs::create_dir_all(repo_root)?;
@@ -6633,6 +6720,7 @@ pub async fn run_server(
         ref_response_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
         artifact_fetch_count: Arc::new(AtomicUsize::new(0)),
         fail_first_fetches: fail_first_fetches_from_env(),
+        artifact_barrier,
         readyz_cache: Arc::new(std::sync::Mutex::new(None)),
         access_verifier: Arc::new(HttpAccessVerifier::new()),
         require_repo_auth: require_repo_auth_from_env(),
@@ -6675,6 +6763,17 @@ pub async fn run_server(
     )
     .await?;
     Ok(())
+}
+
+/// Backward-compatible wrapper: read any test barrier installed via
+/// [`set_test_artifact_barrier`] and run the server with it.
+pub async fn run_server(
+    cas_dir: &std::path::Path,
+    repo_root: &std::path::Path,
+    host: &str,
+    port: u16,
+) -> Result<()> {
+    run_server_with_barrier(cas_dir, repo_root, host, port, take_test_artifact_barrier()).await
 }
 
 #[cfg(test)]
@@ -6724,6 +6823,7 @@ mod tests {
             ref_response_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             artifact_fetch_count: Arc::new(AtomicUsize::new(0)),
             fail_first_fetches: fail_first_fetches_from_env(),
+            artifact_barrier: take_test_artifact_barrier(),
             readyz_cache: Arc::new(std::sync::Mutex::new(None)),
             // Default tests to single-tenant trust (no network access checks);
             // the authz-specific tests override these two fields with a fake.

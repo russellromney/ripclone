@@ -4,21 +4,30 @@
 
 mod common;
 
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use common::*;
 use reqwest::StatusCode;
 use reqwest::redirect::Policy;
-use ripclone::server::{RateLimiter, ServerState, build_app};
+use ripclone::server::{ArtifactBarrier, RateLimiter, ServerState, build_app};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn no_redirect_client() -> reqwest::Client {
     reqwest::Client::builder()
         .redirect(Policy::none())
         .build()
         .unwrap()
+}
+
+/// Read the `exp` claim from a JWT minted by the server.
+fn token_exp(token: &str) -> u64 {
+    let payload = token.split('.').nth(1).expect("JWT payload");
+    let decoded = URL_SAFE_NO_PAD.decode(payload).expect("base64url payload");
+    let claims: serde_json::Value = serde_json::from_slice(&decoded).expect("JWT JSON");
+    claims["exp"].as_u64().expect("exp claim")
 }
 
 async fn start_repo_auth_server(provider_url: &str) -> Server {
@@ -74,6 +83,7 @@ async fn start_repo_auth_server(provider_url: &str) -> Server {
         ref_response_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
         artifact_fetch_count: Arc::new(AtomicUsize::new(0)),
         fail_first_fetches: 0,
+        artifact_barrier: None,
         readyz_cache: Arc::new(std::sync::Mutex::new(None)),
         access_verifier: Arc::new(ripclone::auth::access::HttpAccessVerifier::new()),
         require_repo_auth: true,
@@ -371,16 +381,25 @@ async fn bearer_client_clones_through_the_gateway() {
     unsafe { std::env::remove_var("RIPCLONE_EXTRACT_ARCHIVE") };
 }
 
-/// A bearer token that expires mid-clone must not leave a partial tree: the
-/// client either refreshes the session (not implemented — the server exposes
-/// `/v1/auth/refresh`, the client currently returns 401) or fails cleanly.
+/// A bearer token that expires mid-clone must not leave a partial tree. We
+/// deterministically stall the first gateway artifact response mid-body, sleep
+/// past the JWT TTL, then close the connection. The client's retry re-issues
+/// the request with the now-expired token and gets 401, so the clone fails
+/// cleanly without materializing a partial tree.
 #[tokio::test]
 async fn expired_bearer_token_fails_clone_cleanly() {
     init(false);
-    // Short-lived session tokens and a generous retry budget so the clone stays
-    // in flight long enough for the token to expire before the artifact fetch
-    // retry cap is reached.
-    let server = start_server_faulting(100).await;
+
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (proceed_tx, proceed_rx) = tokio::sync::oneshot::channel();
+    let barrier = ArtifactBarrier {
+        after_bytes: 16,
+        entered: Arc::new(std::sync::Mutex::new(Some(entered_tx))),
+        proceed: Arc::new(std::sync::Mutex::new(Some(proceed_rx))),
+        close_on_proceed: true,
+        consumed: Arc::new(AtomicBool::new(false)),
+    };
+    let server = start_server_with_barrier(barrier).await;
     let origin = make_origin("acme", "jwtexp");
     origin.commit(&[("a.txt", "x\n"), ("b.txt", "y\n")], "c1");
     origin.publish();
@@ -392,28 +411,43 @@ async fn expired_bearer_token_fails_clone_cleanly() {
 
     // Short-lived session tokens: the TTL is read at issuance, so it must be set
     // before minting the token and kept until the clone has finished.
-    unsafe { std::env::set_var("RIPCLONE_JWT_TTL_SECS", "2") };
+    unsafe { std::env::set_var("RIPCLONE_JWT_TTL_SECS", "4") };
     let token = mint_token(&server).await;
+    let token_expires_at = token_exp(&token);
     let client = ripclone::client::Client::new_with_bearer(server.url.clone(), token)
         .with_provider("github");
 
     let out = tempfile::tempdir().unwrap();
     let target = out.path().join("clone");
-    // Give the clone a generous retry budget so it stays in flight until the
-    // 2-second JWT expires.
-    unsafe { std::env::set_var("RIPCLONE_FETCH_MAX_ATTEMPTS", "20") };
-    let res = client
-        .install_repo_with_mode_at(
-            "acme/jwtexp",
-            "HEAD",
-            None,
-            &target,
-            ripclone::mode::CloneMode::Files,
-            Some("full"),
-            None,
-        )
-        .await;
-    unsafe { std::env::remove_var("RIPCLONE_FETCH_MAX_ATTEMPTS") };
+    let clone_target = target.clone();
+    let repo_path = "acme/jwtexp".to_string();
+    let clone_task = tokio::spawn(async move {
+        client
+            .install_repo_with_mode_at(
+                &repo_path,
+                "HEAD",
+                None,
+                &clone_target,
+                ripclone::mode::CloneMode::Files,
+                Some("full"),
+                None,
+            )
+            .await
+    });
+
+    // Wait until the server has sent the first bytes and is stalled mid-body,
+    // then wait until the JWT has definitely expired before releasing the barrier.
+    entered_rx.await.expect("barrier entered");
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time")
+        .as_secs();
+    if token_expires_at > now {
+        tokio::time::sleep(Duration::from_secs(token_expires_at - now + 1)).await;
+    }
+    proceed_tx.send(()).expect("release barrier");
+
+    let res = clone_task.await.expect("clone task joined");
     unsafe { std::env::remove_var("RIPCLONE_JWT_TTL_SECS") };
 
     assert!(
