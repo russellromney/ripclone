@@ -7918,6 +7918,7 @@ mod tests {
                 id: id.to_string(),
                 kind: Some(kind.to_string()),
                 host: Some(host.to_string()),
+                auth_template: (kind == "generic").then(|| "token {token}".to_string()),
                 ..Default::default()
             })
             .unwrap();
@@ -7929,12 +7930,11 @@ mod tests {
     #[tokio::test]
     async fn webhook_provider_without_adapter_returns_501() {
         let tmp = tempfile::tempdir().unwrap();
-        // Bitbucket has no webhook adapter yet → 501 (before any verify).
-        let (state, _rx) = provider_webhook_state(&tmp, "bb", "bitbucket", "bitbucket.org");
+        let (state, _rx) = provider_webhook_state(&tmp, "generic", "generic", "git.example.com");
         let app = build_app(state);
         let resp = app
             .oneshot(webhook_request(
-                "bb",
+                "generic",
                 "push",
                 Some("whatever"),
                 br#"{}"#.to_vec(),

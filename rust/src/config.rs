@@ -24,8 +24,8 @@ pub struct Config {
     pub default_provider: Option<String>,
     /// Default clone options.
     pub clone: CloneConfig,
-    /// Custom/self-hosted provider declarations. Built-in presets (github,
-    /// gitlab, bitbucket) are implicit and do not need to be declared.
+    /// Custom/self-hosted provider declarations. Built-in presets (github and
+    /// gitlab) are implicit and do not need to be declared.
     pub providers: HashMap<String, ProviderEntry>,
     /// Server-side artifact storage backend (`[storage]`).
     pub storage: StorageConfig,

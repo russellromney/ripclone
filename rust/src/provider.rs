@@ -35,7 +35,6 @@ const DEFAULT_PROVIDER_ID: &str = "github";
 pub enum ProviderKind {
     GitHub,
     GitLab,
-    Bitbucket,
     Gitea,
     Generic,
 }
@@ -45,7 +44,6 @@ impl ProviderKind {
         match self {
             ProviderKind::GitHub => "github",
             ProviderKind::GitLab => "gitlab",
-            ProviderKind::Bitbucket => "bitbucket",
             ProviderKind::Gitea => "gitea",
             ProviderKind::Generic => "generic",
         }
@@ -59,7 +57,6 @@ impl std::str::FromStr for ProviderKind {
         match s.to_ascii_lowercase().as_str() {
             "github" => Ok(ProviderKind::GitHub),
             "gitlab" => Ok(ProviderKind::GitLab),
-            "bitbucket" => Ok(ProviderKind::Bitbucket),
             "gitea" | "forgejo" | "codeberg" => Ok(ProviderKind::Gitea),
             "generic" => Ok(ProviderKind::Generic),
             _ => anyhow::bail!("unknown provider kind: {}", s),
@@ -97,9 +94,9 @@ impl std::fmt::Display for ProviderInstanceId {
 
 /// A configured git provider instance.
 ///
-/// `auth_template` is optional for preset kinds (GitHub/GitLab/Bitbucket/Gitea)
-/// and required for `Generic`. When present it must contain exactly one
-/// `{token}` placeholder; it overrides the preset's default header.
+/// `auth_template` is optional for preset kinds (GitHub/GitLab/Gitea) and
+/// required for `Generic`. When present it must contain exactly one `{token}`
+/// placeholder; it overrides the preset's default header.
 #[derive(Debug, Clone)]
 pub struct ProviderInstance {
     pub id: ProviderInstanceId,
@@ -170,7 +167,6 @@ impl ProviderInstance {
                     );
                     format!("Basic {}", encoded)
                 }
-                ProviderKind::Bitbucket => format!("Bearer {}", token),
                 ProviderKind::Gitea => format!("token {}", token),
                 ProviderKind::Generic => return None,
             },
@@ -330,7 +326,6 @@ impl ProviderRegistry {
             None => match kind {
                 ProviderKind::GitHub => "github.com".to_string(),
                 ProviderKind::GitLab => "gitlab.com".to_string(),
-                ProviderKind::Bitbucket => "bitbucket.org".to_string(),
                 ProviderKind::Gitea => {
                     anyhow::bail!("gitea provider '{}' requires a host", id)
                 }
@@ -743,20 +738,6 @@ mod tests {
             base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"oauth2:gltok",)
         );
         assert_eq!(value, expected);
-    }
-
-    #[test]
-    fn bitbucket_auth_header_is_bearer() {
-        let bb = ProviderInstance {
-            id: ProviderInstanceId::new("bb"),
-            kind: ProviderKind::Bitbucket,
-            host: "bitbucket.org".to_string(),
-            auth_template: None,
-            auth_header_name: None,
-        };
-        let (name, value) = bb.auth_header("bbtok").unwrap();
-        assert_eq!(name, "Authorization");
-        assert_eq!(value, "Bearer bbtok");
     }
 
     #[test]

@@ -10,7 +10,7 @@ ripclone pre-builds git artifacts for every pushed commit so that agents, CI sys
 
 It works as two operations: you **sync** a repo so the server pre-builds its artifacts (automatic on every push), then you **clone** it — the client downloads those artifacts and writes the working tree in seconds.
 
-It is self-hostable and host-agnostic — point it at GitHub, GitLab, Gitea, Bitbucket, or any git host — and works for private or public repos. For the easiest experience, sign up for free (for public repos) at [Ripclone Cloud](https://ripclone.com).
+It is self-hostable and host-agnostic — point it at GitHub, GitLab, Gitea, or any git host — and works for private or public repos. For the easiest experience, sign up for free (for public repos) at [Ripclone Cloud](https://ripclone.com).
 
 ripclone started from a simple question asked by [Jarred Sumner](https://x.com/jarredsumner/status/2066420871753838913): 
 
@@ -259,7 +259,7 @@ Pushes go to your git host directly, not through ripclone.
 
 ## Providers
 
-By default ripclone knows one host: the built-in `github` instance. To mirror from GitLab, Gitea/Forgejo/Codeberg, Bitbucket, or a self-hosted host, register provider instances on the server with the `RIPCLONE_PROVIDERS` environment variable or `config.toml`:
+By default ripclone knows one host: the built-in `github` instance. To mirror from GitLab, Gitea/Forgejo/Codeberg, or a self-hosted host, register provider instances on the server with the `RIPCLONE_PROVIDERS` environment variable or `config.toml`:
 
 ```bash
 export RIPCLONE_PROVIDERS='{"providers":[
@@ -268,7 +268,7 @@ export RIPCLONE_PROVIDERS='{"providers":[
 ]}'
 ```
 
-Supported `kind` values: `github`, `gitlab`, `bitbucket`, `gitea`, `generic`. A `generic` host needs an `auth_template` (e.g. `"token {token}"`) so ripclone knows how to build the auth header. Then address a repo by instance id — `gitlab:mygroup/project` on the CLI, or `/v1/repos/gitlab/mygroup/project/...` on the API.
+Supported `kind` values: `github`, `gitlab`, `gitea`, `generic`. A `generic` host needs an `auth_template` (e.g. `"token {token}"`) so ripclone knows how to build the auth header. Then address a repo by instance id — `gitlab:mygroup/project` on the CLI, or `/v1/repos/gitlab/mygroup/project/...` on the API.
 
 ## Architecture
 

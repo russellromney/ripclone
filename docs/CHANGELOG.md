@@ -65,8 +65,8 @@ This file tracks what has already landed in ripclone. For upcoming work see `ROA
   - Legacy `/v1/repos/{owner}/{repo}/...` routes are removed. All repos are now addressed as `/v1/repos/{provider}/{repo-path}/...`, including GitHub (`/v1/repos/github/owner/repo/...`).
   - The CLI and git remote helper accept provider-qualified paths (`github/owner/repo`, `gitlab/group/sub/project`).
 - **Provider registry + presets** (`rust/src/provider.rs`)
-  - New `ProviderKind` enum: `github`, `gitlab`, `bitbucket`, `gitea`, `generic`.
-  - `ProviderRegistry::load()` reads instances from `RIPCLONE_PROVIDERS` JSON or `RIPCLONE_PROVIDERS_CONFIG`, merged with the built-in `github` default.
+  - New `ProviderKind` enum: `github`, `gitlab`, `gitea`, `generic`.
+  - `ProviderRegistry::load()` reads instances from `RIPCLONE_PROVIDERS` JSON or `config.toml`, merged with the built-in `github` default.
   - Each instance defines `clone_url(path)` and `auth_header(token)` so the server can speak the right auth dialect to each host.
 - **Credential-header injection** (`rust/src/git.rs`, `rust/src/auth/broker.rs`)
   - `sync_bare_mirror` builds a clean clone URL and injects credentials via `git -c http.extraHeader="Authorization: ..."`. Secrets no longer appear in URLs.

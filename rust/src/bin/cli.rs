@@ -244,7 +244,7 @@ enum ProviderAction {
     Add {
         /// Provider instance id (e.g. "gitlab", "company-gitea").
         id: String,
-        /// Provider kind: github, gitlab, bitbucket, gitea, generic.
+        /// Provider kind: github, gitlab, gitea, generic.
         #[arg(short, long)]
         kind: Option<String>,
         /// Hostname or base URL used in clone URLs.
@@ -830,7 +830,6 @@ async fn run_provider_add(
         None => match kind_parsed {
             ProviderKind::GitHub => Some("github.com".to_string()),
             ProviderKind::GitLab => Some("gitlab.com".to_string()),
-            ProviderKind::Bitbucket => Some("bitbucket.org".to_string()),
             ProviderKind::Gitea | ProviderKind::Generic => None,
         },
     };

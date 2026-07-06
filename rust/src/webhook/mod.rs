@@ -82,8 +82,8 @@ pub fn provider_for(kind: ProviderKind) -> Option<Box<dyn WebhookProvider + Send
         ProviderKind::GitLab => Some(Box::new(gitlab::GitLab)),
         // `Gitea` covers Forgejo/Codeberg (same payload + signature scheme).
         ProviderKind::Gitea => Some(Box::new(gitea::Gitea)),
-        // Bitbucket and config-only `Generic` hosts have no adapter yet.
-        ProviderKind::Bitbucket | ProviderKind::Generic => None,
+        // Config-only `Generic` hosts have no adapter.
+        ProviderKind::Generic => None,
     }
 }
 

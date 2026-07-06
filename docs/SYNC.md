@@ -72,9 +72,9 @@ already exist. Three trigger paths, all converging on the same fire-and-forget
 
 The build is prompt: the in-process worker picks up an enqueue immediately; the
 SQL worker within `idle_poll_ms` (≤1s). So with a webhook wired, the new HEAD is
-typically built before any clone asks for it. Multi-provider webhooks (GitLab,
-Bitbucket — different signature schemes) and cross-replica poll coordination are
-future work; v1 is GitHub-only, single-server.
+typically built before any clone asks for it. GitHub, GitLab, and Gitea each
+have provider-specific webhook adapters; cross-replica poll coordination remains
+future work.
 
 `POST /v1/repos/{provider}/{repo-path}/sync` returns the normal ref payload plus
 `status`, `phases` (`mirror_fetch_ms`, `commit_graph_ms`, `publish_p1_ms`,
