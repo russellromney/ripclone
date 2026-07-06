@@ -1018,6 +1018,7 @@ async fn remote_gc_during_faulting_clone_is_safe() {
         GcConfig {
             grace_period: Duration::ZERO,
             dry_run: false,
+            ..Default::default()
         },
     );
     let report = gc.run().await.expect("remote gc run during clone");
