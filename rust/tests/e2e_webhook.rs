@@ -9,19 +9,26 @@
 mod common;
 
 use common::*;
+use hmac::{Hmac, KeyInit, Mac};
+use ripclone::client::Client;
 use ripclone::mode::{CloneMode, clonepack_kind_for_depth};
+use sha2::Sha256;
 use std::path::PathBuf;
 use std::time::Duration;
 use tempfile::TempDir;
 
 const SECRET: &str = "whsecret-e2e";
 
-fn sign(body: &[u8]) -> String {
-    use hmac::{Hmac, KeyInit, Mac};
-    use sha2::Sha256;
+fn sign_github(body: &[u8]) -> String {
     let mut mac = Hmac::<Sha256>::new_from_slice(SECRET.as_bytes()).unwrap();
     mac.update(body);
     format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
+}
+
+fn sign_gitea(body: &[u8]) -> String {
+    let mut mac = Hmac::<Sha256>::new_from_slice(SECRET.as_bytes()).unwrap();
+    mac.update(body);
+    hex::encode(mac.finalize().into_bytes())
 }
 
 /// Clone one branch's full (depth=0) artifacts, polling until phase 2 has
@@ -33,13 +40,40 @@ async fn clone_branch_full(
     branch: &str,
     want_count: &str,
 ) -> (TempDir, PathBuf) {
+    clone_branch_full_with_client(server.client(), &format!("acme/{repo}"), branch, want_count)
+        .await
+}
+
+/// Like [`clone_branch_full`], but clones through an explicit provider instance
+/// (e.g. gitlab or gitea) instead of the default github instance.
+async fn clone_branch_full_for_provider(
+    server: &Server,
+    provider: &str,
+    repo: &str,
+    branch: &str,
+    want_count: &str,
+) -> (TempDir, PathBuf) {
+    clone_branch_full_with_client(
+        server.client_with_provider(provider, None),
+        repo,
+        branch,
+        want_count,
+    )
+    .await
+}
+
+async fn clone_branch_full_with_client(
+    client: Client,
+    repo: &str,
+    branch: &str,
+    want_count: &str,
+) -> (TempDir, PathBuf) {
     for _ in 0..200 {
         let out = tempfile::tempdir().unwrap();
         let target = out.path().join("clone");
-        let ok = server
-            .client()
+        let ok = client
             .install_repo_with_mode_at(
-                &format!("acme/{repo}"),
+                repo,
                 branch,
                 None,
                 &target,
@@ -75,7 +109,7 @@ async fn webhook_push_builds_before_clone() {
     let resp = http
         .post(format!("{}/v1/webhooks/github", server.url))
         .header("X-GitHub-Event", "push")
-        .header("X-Hub-Signature-256", sign(&body))
+        .header("X-Hub-Signature-256", sign_github(&body))
         .header("content-type", "application/json")
         .body(body)
         .send()
@@ -118,7 +152,7 @@ async fn webhook_and_sync_same_branch_coalesce() {
 
     // Fire a webhook and a branch-targeted sync for the same key at once.
     let webhook = {
-        let (url, body, sig) = (url.clone(), body.clone(), sign(&body));
+        let (url, body, sig) = (url.clone(), body.clone(), sign_github(&body));
         tokio::spawn(async move {
             reqwest::Client::new()
                 .post(format!("{url}/v1/webhooks/github"))
@@ -187,4 +221,159 @@ async fn poll_catches_a_missed_push() {
     assert_eq!(read(&c, "f.txt"), "v2\n", "poll caught the missed push");
     assert!(c.join("new.txt").exists(), "poll built the new commit");
     assert_repo_usable(&c, "2");
+}
+
+// ---- GitLab + Gitea provider webhook e2es ---------------------------------
+
+/// Build the JSON provider registry used by the non-github webhook tests.
+/// The provider `host` points at the local dumb-HTTP origin so the sync can
+/// fetch without network.
+fn webhook_providers_json(origin_url: &str, kind: &str) -> String {
+    serde_json::json!({
+        "providers": [{
+            "id": kind,
+            "kind": kind,
+            "host": origin_url,
+        }]
+    })
+    .to_string()
+}
+
+/// A GitLab `Push Hook` with the shared `X-Gitlab-Token` secret triggers a real
+/// build, and a clone through the `gitlab` provider instance reads it.
+#[tokio::test]
+async fn gitlab_webhook_push_builds_before_clone() {
+    setup(true);
+    let origin = make_http_origin("acme/hook");
+    origin.commit(&[("f.txt", "v1\n")], "c1");
+    origin.publish();
+
+    let providers = webhook_providers_json(&origin.url, "gitlab");
+    let server = start_server_env(&[
+        ("RIPCLONE_PROVIDERS", &providers),
+        ("RIPCLONE_WEBHOOK_SECRET_GITLAB", SECRET),
+    ])
+    .await;
+
+    // GitLab authenticates with the secret echoed verbatim; no body HMAC.
+    let body = br#"{"object_kind":"push","ref":"refs/heads/main","after":"1111111111111111111111111111111111111111","project":{"path_with_namespace":"acme/hook","default_branch":"main","visibility_level":0}}"#.to_vec();
+    let resp = reqwest::Client::new()
+        .post(format!("{}/webhooks/gitlab", server.url))
+        .header("X-Gitlab-Event", "Push Hook")
+        .header("X-Gitlab-Token", SECRET)
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("webhook POST");
+    assert_eq!(resp.status().as_u16(), 200, "valid GitLab push accepted");
+
+    let (_g, c) = clone_branch_full_for_provider(&server, "gitlab", "acme/hook", "main", "1").await;
+    assert_eq!(
+        read(&c, "f.txt"),
+        "v1\n",
+        "gitlab clone has the pushed commit"
+    );
+    assert_repo_usable(&c, "1");
+}
+
+/// A Gitea `push` webhook with a valid HMAC signature triggers a real build, and
+/// a clone through the `gitea` provider instance reads it.
+#[tokio::test]
+async fn gitea_webhook_push_builds_before_clone() {
+    setup(true);
+    let origin = make_http_origin("acme/hook");
+    origin.commit(&[("f.txt", "v1\n")], "c1");
+    origin.publish();
+
+    let providers = webhook_providers_json(&origin.url, "gitea");
+    let server = start_server_env(&[
+        ("RIPCLONE_PROVIDERS", &providers),
+        ("RIPCLONE_WEBHOOK_SECRET_GITEA", SECRET),
+    ])
+    .await;
+
+    // Gitea sends the bare hex HMAC-SHA256 digest (no `sha256=` prefix).
+    let body = br#"{"ref":"refs/heads/main","after":"1111111111111111111111111111111111111111","repository":{"full_name":"acme/hook","default_branch":"main","private":false}}"#.to_vec();
+    let resp = reqwest::Client::new()
+        .post(format!("{}/webhooks/gitea", server.url))
+        .header("X-Gitea-Event", "push")
+        .header("X-Gitea-Signature", sign_gitea(&body))
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("webhook POST");
+    assert_eq!(resp.status().as_u16(), 200, "valid Gitea push accepted");
+
+    let (_g, c) = clone_branch_full_for_provider(&server, "gitea", "acme/hook", "main", "1").await;
+    assert_eq!(
+        read(&c, "f.txt"),
+        "v1\n",
+        "gitea clone has the pushed commit"
+    );
+    assert_repo_usable(&c, "1");
+}
+
+/// A Gitea `delete` webhook removes the stored ref for a deleted branch.
+#[tokio::test]
+async fn gitea_webhook_branch_delete_cleans_up_ref() {
+    setup(true);
+    let origin = make_http_origin("acme/hook");
+    origin.commit(&[("main.txt", "m\n")], "main commit");
+    origin.publish();
+    // Push a feature branch to the bare origin and refresh dumb HTTP info.
+    git(&origin.work, &["checkout", "-b", "feature"]);
+    origin.commit(&[("feat.txt", "f\n")], "feature commit");
+    git(
+        &origin.work,
+        &["push", "-q", "--force", origin.bare_str(), "feature"],
+    );
+    git(&origin.bare, &["update-server-info"]);
+
+    let providers = webhook_providers_json(&origin.url, "gitea");
+    let server = start_server_env(&[
+        ("RIPCLONE_PROVIDERS", &providers),
+        ("RIPCLONE_WEBHOOK_SECRET_GITEA", SECRET),
+    ])
+    .await;
+    let client = server.client_with_provider("gitea", None);
+
+    // Build the feature branch via explicit sync, then prove it clones.
+    client
+        .sync_branch("acme/hook", "feature")
+        .await
+        .expect("sync feature branch");
+    let (_g, c) =
+        clone_branch_full_for_provider(&server, "gitea", "acme/hook", "feature", "2").await;
+    assert_eq!(read(&c, "feat.txt"), "f\n", "feature branch was built");
+
+    // Gitea delete event carries the short branch name + ref_type.
+    let body = br#"{"ref":"feature","ref_type":"branch","repository":{"full_name":"acme/hook","default_branch":"main"}}"#.to_vec();
+    let resp = reqwest::Client::new()
+        .post(format!("{}/webhooks/gitea", server.url))
+        .header("X-Gitea-Event", "delete")
+        .header("X-Gitea-Signature", sign_gitea(&body))
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("delete webhook POST");
+    assert_eq!(resp.status().as_u16(), 200, "valid Gitea delete accepted");
+
+    // After the delete webhook, cloning the deleted branch must fail.
+    let out = tempfile::tempdir().unwrap();
+    let target = out.path().join("clone");
+    let result = client
+        .install_repo_with_mode_at(
+            "acme/hook",
+            "feature",
+            None,
+            &target,
+            CloneMode::Editable,
+            Some(clonepack_kind_for_depth(0)),
+            None,
+        )
+        .await;
+    assert!(result.is_err(), "clone of deleted feature branch fails");
 }

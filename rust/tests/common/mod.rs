@@ -6,7 +6,9 @@
 #![allow(dead_code)]
 
 use ripclone::client::Client;
-use ripclone::server::{RateLimiter, ServerState, build_app, run_server};
+use ripclone::server::{
+    ArtifactBarrier, RateLimiter, ServerState, build_app, run_server_with_barrier,
+};
 use ripclone::storage::{HashEntry, StorageBackend, StorageRef};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -117,14 +119,14 @@ fn init_tracing() {
 }
 
 pub async fn start_server() -> Server {
-    start_server_inner(0, &[]).await
+    start_server_inner(0, &[], None).await
 }
 
 /// Start a server with extra env vars (e.g. `RIPCLONE_WEBHOOK_SECRET`,
 /// `RIPCLONE_POLL_INTERVAL_SECS`) set only during construction, under
 /// `SERVER_START_LOCK`, so they can't leak into a concurrently-starting server.
 pub async fn start_server_env(extra: &[(&str, &str)]) -> Server {
-    start_server_inner(0, extra).await
+    start_server_inner(0, extra, None).await
 }
 
 /// Like `start_server`, but the server fails its first `fail_first` artifact
@@ -134,10 +136,32 @@ pub async fn start_server_env(extra: &[(&str, &str)]) -> Server {
 /// lock drops, so no other server is constructed while it is set — keeping the
 /// suite correct under parallel `cargo test`.
 pub async fn start_server_faulting(fail_first: usize) -> Server {
-    start_server_inner(fail_first, &[]).await
+    start_server_faulting_env(fail_first, &[]).await
+}
+
+/// Combine fault injection with extra server-construction env vars (e.g.
+/// `RIPCLONE_JWT_TTL_SECS`) set under `SERVER_START_LOCK`.
+pub async fn start_server_faulting_env(fail_first: usize, extra: &[(&str, &str)]) -> Server {
+    start_server_inner(fail_first, extra, None).await
+}
+
+/// Start a server with a deterministic artifact download barrier installed.
+/// See [`ripclone::server::ArtifactBarrier`].
+pub async fn start_server_with_barrier(barrier: ArtifactBarrier) -> Server {
+    start_server_inner(0, &[], Some(barrier)).await
 }
 
 pub async fn start_server_split_storage() -> Server {
+    start_server_split_storage_inner(None).await
+}
+
+/// Start a split-storage server with a deterministic artifact download barrier.
+/// See [`ripclone::server::ArtifactBarrier`].
+pub async fn start_server_split_storage_barrier(barrier: ArtifactBarrier) -> Server {
+    start_server_split_storage_inner(Some(barrier)).await
+}
+
+async fn start_server_split_storage_inner(barrier: Option<ArtifactBarrier>) -> Server {
     init_tracing();
     let dir = tempfile::tempdir().expect("server dir");
     let cas_dir = dir.path().join("cas");
@@ -194,6 +218,7 @@ pub async fn start_server_split_storage() -> Server {
         ref_response_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         artifact_fetch_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         fail_first_fetches: 0,
+        artifact_barrier: barrier,
         readyz_cache: Arc::new(std::sync::Mutex::new(None)),
         access_verifier: Arc::new(ripclone::auth::access::HttpAccessVerifier::new()),
         require_repo_auth: false,
@@ -265,8 +290,16 @@ pub async fn start_server_split_storage() -> Server {
     }
 }
 
-struct RemoteLocalStorage {
+/// A local filesystem storage backend that reports `is_remote() = true` so
+/// `RemoteGc` can be exercised in tests without an S3-compatible store.
+pub struct RemoteLocalStorage {
     inner: StorageRef,
+}
+
+impl RemoteLocalStorage {
+    pub fn new(inner: StorageRef) -> Self {
+        Self { inner }
+    }
 }
 
 #[async_trait::async_trait]
@@ -333,7 +366,11 @@ impl StorageBackend for RemoteLocalStorage {
 /// once at construction, can't leak into a concurrently-starting server.
 static SERVER_START_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-async fn start_server_inner(fail_first: usize, extra_env: &[(&str, &str)]) -> Server {
+async fn start_server_inner(
+    fail_first: usize,
+    extra_env: &[(&str, &str)],
+    artifact_barrier: Option<ArtifactBarrier>,
+) -> Server {
     init_tracing();
     let dir = tempfile::tempdir().expect("server dir");
     let cas_dir = dir.path().join("cas");
@@ -356,7 +393,7 @@ async fn start_server_inner(fail_first: usize, extra_env: &[(&str, &str)]) -> Se
         }
     }
     tokio::spawn(async move {
-        let _ = run_server(&cas2, &repos2, "127.0.0.1", port).await;
+        let _ = run_server_with_barrier(&cas2, &repos2, "127.0.0.1", port, artifact_barrier).await;
     });
     // Wait until the port accepts connections. The server state (including the
     // fault threshold read) is constructed before the listener binds, so by the
@@ -493,7 +530,7 @@ impl Origin {
         git(&self.bare, &["symbolic-ref", "HEAD", "refs/heads/main"]);
     }
 
-    fn bare_str(&self) -> &str {
+    pub fn bare_str(&self) -> &str {
         self.bare.to_str().unwrap()
     }
 }
@@ -570,7 +607,7 @@ impl HttpOrigin {
         git(&self.bare, &["update-server-info"]);
     }
 
-    fn bare_str(&self) -> &str {
+    pub fn bare_str(&self) -> &str {
         self.bare.to_str().unwrap()
     }
 }
@@ -580,6 +617,17 @@ impl HttpOrigin {
 /// `http://127.0.0.1:<port>/<repo_path>.git`, matching the generic provider's
 /// `clone_url(path)` shape.
 pub fn make_http_origin(repo_path: &str) -> HttpOrigin {
+    make_http_origin_inner(repo_path, None)
+}
+
+/// Like [`make_http_origin`], but the server rejects any request whose
+/// `Authorization` header is not exactly `expected_auth`. Used to prove that
+/// ripclone injects the provider-specific auth header on the upstream fetch.
+pub fn make_http_origin_with_auth(repo_path: &str, expected_auth: &str) -> HttpOrigin {
+    make_http_origin_inner(repo_path, Some(expected_auth))
+}
+
+fn make_http_origin_inner(repo_path: &str, expected_auth: Option<&str>) -> HttpOrigin {
     let dir = tempfile::tempdir().expect("http origin dir");
     let work = dir.path().join("work");
     std::fs::create_dir_all(&work).unwrap();
@@ -597,15 +645,67 @@ pub fn make_http_origin(repo_path: &str) -> HttpOrigin {
     git(&bare, &["update-server-info"]);
 
     let port = free_port();
-    let server = Command::new("python3")
-        .arg("-m")
-        .arg("http.server")
-        .arg(port.to_string())
-        .current_dir(dir.path())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("start python http.server");
+    let server = if let Some(auth) = expected_auth {
+        // A tiny real HTTP server that gates every request on the exact
+        // Authorization header ripclone is expected to inject.
+        let script = dir.path().join("auth_server.py");
+        let script_body = r#"import http.server
+import socketserver
+import sys
+
+EXPECTED_AUTH = sys.argv[1]
+PORT = int(sys.argv[2])
+ROOT = sys.argv[3]
+
+class AuthHandler(http.server.SimpleHTTPRequestHandler):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, directory=ROOT, **kwargs)
+
+    def check_auth(self):
+        return self.headers.get('Authorization') == EXPECTED_AUTH
+
+    def do_GET(self):
+        if not self.check_auth():
+            self.send_error(403, 'Forbidden')
+            return
+        super().do_GET()
+
+    def do_HEAD(self):
+        if not self.check_auth():
+            self.send_error(403, 'Forbidden')
+            return
+        super().do_HEAD()
+
+    def log_message(self, format, *args):
+        pass
+
+class ReusableTCPServer(socketserver.TCPServer):
+    allow_reuse_address = True
+
+with ReusableTCPServer(('', PORT), AuthHandler) as httpd:
+    httpd.serve_forever()
+"#;
+        std::fs::write(&script, script_body).unwrap();
+        Command::new("python3")
+            .arg(script.to_str().unwrap())
+            .arg(auth)
+            .arg(port.to_string())
+            .arg(dir.path().to_str().unwrap())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("start python auth http.server")
+    } else {
+        Command::new("python3")
+            .arg("-m")
+            .arg("http.server")
+            .arg(port.to_string())
+            .current_dir(dir.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("start python http.server")
+    };
 
     // Wait for the server to accept connections.
     for _ in 0..100 {

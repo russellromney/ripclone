@@ -53,14 +53,27 @@ databases() {
   ( cd "$ROOT/rust" && cargo test --release --locked --test e2e_worker_libsql -- --nocapture )
 }
 
+# Run the S3-backed remote GC end-to-end suite against a local MinIO container
+# (or any S3-compatible store pointed at by RIPCLONE_S3_ENDPOINT). This is the
+# only place these #[ignored] tests are executed in CI.
+s3gc() {
+  export RIPCLONE_S3_ENDPOINT="${RIPCLONE_S3_ENDPOINT:-http://127.0.0.1:9000}"
+  export RIPCLONE_S3_BUCKET="${RIPCLONE_S3_BUCKET:-ripclone-test}"
+  export RIPCLONE_S3_REGION="${RIPCLONE_S3_REGION:-us-east-1}"
+  export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-minioadmin}"
+  export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-minioadmin}"
+  ( cd "$ROOT/rust" && cargo test --release --locked --test e2e_remote_gc_s3 -- --ignored )
+}
+
 case "$STAGE" in
   lint) lint ;;
   test) run_tests ;;
   e2e) e2e ;;
   flake) flake ;;
   databases) databases ;;
+  s3gc) s3gc ;;
   all) lint; run_tests; e2e ;;
-  *) echo "usage: scripts/ci.sh [lint|test|e2e|flake|databases|all]" >&2; exit 2 ;;
+  *) echo "usage: scripts/ci.sh [lint|test|e2e|flake|databases|s3gc|all]" >&2; exit 2 ;;
 esac
 
 echo "ci.sh: stage '$STAGE' OK"
