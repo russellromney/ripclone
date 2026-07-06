@@ -228,6 +228,25 @@ Checks: fmt + clippy + touched tests (test economy; PR CI is the gate).
 ```
 Accept: each has a test or is covered by existing e2e; error messages actionable.
 
+**A7. Transient build-error classification (queue retry)** — deps: none — Codex — turbogit
+```
+Today the queue treats ANY build error as terminal: `ack(Err)` → status `failed`
+(rust/src/queue/sql.rs ~269), so a worker CRASH gets retried (reclaim_stale + attempts)
+but an ERROR does not — backwards for transient failures. A Tigris 5xx / network blip
+during do_sync fails the sync permanently; it won't rebuild until the next push (the
+stale-until-repushed mode the agent story can't tolerate).
+Fix: the build error carries a `retryable` bit (transient: storage 5xx, network,
+timeout, upstream 429 → retryable; permanent: bad repo, auth, malformed, not-found →
+terminal). `ack` requeues retryable errors with backoff, bounded by the EXISTING
+attempts cap (past it → dead-letter `failed`); terminals the rest immediately. Reuse
+the attempts/dead-letter/reclaim machinery — no new columns. Classify at the do_sync
+error boundary (map the concrete error sources), not by string-matching messages.
+Tests: a retryable ack requeues and a later attempt succeeds; a permanent ack is
+terminal with no retry; retryable past the cap → dead-letter (no infinite loop).
+Checks: touched queue + worker tests, debug; PR CI is the gate.
+```
+Accept: transient errors retry (bounded), permanent errors stay terminal, cap holds.
+
 **A6a. Cloud: `unpaid` entitlement fix** — deps: none — ripclone-cloud — SHIP FIRST, it's tiny
 ```
 src/lib/stripe.ts:28 maps Stripe status 'unpaid' → 'past_due', and pricing.ts:22

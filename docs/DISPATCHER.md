@@ -168,14 +168,44 @@ many jobs. Make size a **claim filter**, not just a spawn size:
 A worker with no `--max-size-class` claims everything — so single-worker self-host is
 byte-for-byte unchanged, and the lanes are purely a cloud deployment choice.
 
-## Escalation on resource failure (dispatcher-era; the cap already exists)
+## Failure handling (the three questions)
 
-The `attempts` column + dead-letter already ships (`reclaim_stale` → terminal
-`failed` past `RIPCLONE_QUEUE_MAX_ATTEMPTS`). When right-sizing lands, add one thing:
-a stale-reclaim (worker vanished with no ack: almost always OOM / time-limit kill)
-bumps `size_class` one step and re-queues, so a bigger box takes it next; past the
-cap → terminal `failed` "exceeded resource limits". An ack-failed job (`do_sync`
-returned an error: bad repo, auth) is terminal immediately — a bigger box won't help.
+**1. Dispatch fails (no capacity / quota / provider down).** Safe by ordering:
+enqueue is durable and happens FIRST; dispatch is best-effort and SECOND. A failed
+wake never loses the job — it stays `queued`, and the reconcile cron retries. Degrades
+to "clones are slow / warming" (CLI polls the 202), never to loss or corruption.
+REQUIRED with the dispatcher: exponential backoff on the cron's `ensureWorker` (respect
+platform retry-after) and a G3 alert on sustained queue depth, or a capacity outage is
+silent. The static-pool launch bridge has NO capacity-to-wake problem — nothing to wake.
+
+**2. Does the pool stay alive until the queue drains?** Yes — idle-exit fires only
+after N seconds of an EMPTY queue, so one worker drains a whole burst before exiting.
+But the reconcile must be a DEPTH-BASED AUTOSCALER (target ≈ f(depth) workers, capped),
+not "start one if none" — one worker falling behind must trigger more. Correct scale-up
+needs a worker HEARTBEAT/registry (so the cron knows how many are up and multiple cloud
+replicas don't each over-spawn). That heartbeat is load-bearing for the dispatcher, and
+is why the launch answer is the static pool (fixed workers, zero autoscale surface,
+scaled by hand on the G3 alert).
+
+**3. Task failures — classify, don't lump.** The mechanics already ship (`attempts`
+column, dead-letter past `RIPCLONE_QUEUE_MAX_ATTEMPTS`, `reclaim_stale`, and the
+ordering guard that makes a double-build from a reclaimed slow-but-alive worker land as
+one clean ref — the second `ack` returns `false` and is discarded). What each failure
+does:
+- Worker crash / OOM / preempt (no ack) → `reclaim_stale` requeues, bumps `attempts` →
+  dead-letter at the cap. With right-sizing, a stale-reclaim also bumps `size_class` so
+  a bigger box takes it next; past the cap → terminal `failed` "exceeded resource limits".
+- Permanent error (bad repo, auth, malformed) → terminal `failed` immediately. A retry
+  or a bigger box won't help.
+- **Transient error (storage 5xx, network blip during `do_sync`) → MUST requeue with
+  backoff, bounded by the same `attempts` cap — NOT terminal.** GAP TODAY: `ack` maps
+  any `Err` to terminal `failed` (`queue/sql.rs`), so crashes get retried but errors
+  don't — backwards for transient failures, which then stay failed until the next push
+  (the stale-until-repushed mode the agent story can't tolerate). Fix: the build error
+  carries a `retryable` bit; `ack` requeues retryable errors (bounded) and terminals the
+  rest. See the "transient-error classification" node in LAUNCH_PLAN.md — a launch
+  should-fix, cheap, reuses the existing retry/dead-letter machinery.
+- Poison job (always OOMs, even on the biggest box) → attempts cap → dead-letter.
 
 ## Capacity & dedup
 
