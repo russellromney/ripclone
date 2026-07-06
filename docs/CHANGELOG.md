@@ -125,7 +125,7 @@ This file tracks what has already landed in ripclone. For upcoming work see `ROA
 
 - **User-facing clone modes** (`rust/src/mode.rs`, `rust/src/bin/cli.rs`, `rust/src/client.rs`)
   - Replaced the hidden `RIPCLONE_EXTRACT_ARCHIVE=1` flag with `--mode full|fast|hybrid|skeleton`.
-  - `full` is the default and behaves like `git clone --depth=1`: complete `.git`, head-blobs pack, and `git checkout-index`.
+  - `editable` is the default and behaves like a full `git clone`: complete `.git`, full-history clonepack, and working tree checkout.
   - `fast` materializes the working tree directly from archive chunks; no head-blobs pack.
   - `hybrid` downloads archive chunks and head-blobs chunks concurrently; the working tree is extracted while the pack is written.
   - `skeleton` installs only `.git` (commit + tree objects, prebuilt index) with no working tree.

@@ -29,7 +29,7 @@ ripclone is one answer. The goal: get a `git clone` as close as possible to down
 
 On every push, ripclone prebuilds a **clonepack** for `HEAD` — a set of files in object storage laid out so a clone has almost nothing left to do but download and write. Pick how much you pull with `--mode`:
 
-`--mode=editable` (the default) installs a git pack of `HEAD`'s objects — a real repo, the same as `git clone --depth=1`, where `git diff`/`show`/`log` and commits all work. `--depth N` or `--depth 0` pull more history.
+`--mode=editable` (the default) installs a full editable git repo by default, matching `git clone` history semantics while downloading prebuilt packs in parallel. Use `--depth 1` when you want the smaller HEAD-only clonepack for CI or agent work.
 
 `--mode=files` writes the working tree straight from a zstd archive — the fastest path when you only need the files (agents, CI). No git object database, so `git diff`/`show` don't work.
 
@@ -228,8 +228,8 @@ ripclone --provider my-gitea clone owner/repo
 # Working tree only (no git object database), fastest for files-only jobs
 ripclone clone owner/repo --mode files
 
-# History depth: 1 = HEAD only (default), N = last N commits, 0 = full history
-ripclone clone owner/repo --depth 0
+# Speed knob: HEAD-only shallow history for CI/agents
+ripclone clone owner/repo --depth 1
 
 # Clone the artifacts built for a specific rev (pairs with `sync --at`)
 ripclone clone owner/repo --at HEAD~5
@@ -262,10 +262,10 @@ Pushes go to your git host directly, not through ripclone.
 By default ripclone knows one host: the built-in `github` instance. To mirror from GitLab, Gitea/Forgejo/Codeberg, Bitbucket, or a self-hosted host, register provider instances on the server with the `RIPCLONE_PROVIDERS` environment variable or `config.toml`:
 
 ```bash
-export RIPCLONE_PROVIDERS='[
+export RIPCLONE_PROVIDERS='{"providers":[
   {"id":"gitlab","kind":"gitlab","host":"gitlab.com"},
   {"id":"company-gitea","kind":"gitea","host":"git.example.com","token":"gitea-token"}
-]'
+]}'
 ```
 
 Supported `kind` values: `github`, `gitlab`, `bitbucket`, `gitea`, `generic`. A `generic` host needs an `auth_template` (e.g. `"token {token}"`) so ripclone knows how to build the auth header. Then address a repo by instance id — `gitlab:mygroup/project` on the CLI, or `/v1/repos/gitlab/mygroup/project/...` on the API.

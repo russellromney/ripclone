@@ -1,7 +1,7 @@
 //! End-to-end test for the full provider-management workflow.
 //!
-//! 1. `ripclone provider add localgit ...` writes the provider into the global
-//!    `config.toml` and stores its token.
+//! 1. `ripclone provider add localgit ...` writes the provider and token into
+//!    the global `config.toml`.
 //! 2. A project `ripclone.toml` selects that provider as the default.
 //! 3. `ripclone sync` + `ripclone clone` run through the real server using the
 //!    configured provider, without any provider env vars.

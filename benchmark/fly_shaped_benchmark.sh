@@ -8,6 +8,8 @@ set -euo pipefail
 #   RIPCLONE_SERVER_TOKEN=... \
 #   ./benchmark/fly_shaped_benchmark.sh <owner/repo> <rate_mbps> [runs] [target_dir]
 #
+# Set RIPCLONE_BENCH_PROVIDER for non-GitHub provider routes.
+#
 # Compared modes (each run uses a fresh dir with the client cache disabled):
 #   * ripclone full (depth=0)
 #   * ripclone depth=1
@@ -23,7 +25,7 @@ TARGET="${4:-/data}"
 SERVER_URL="${RIPCLONE_URL:-https://ripclone-server-dev.fly.dev}"
 TOKEN="${RIPCLONE_SERVER_TOKEN:-${RIPCLONE_TOKEN:-}}"
 RIPCLONE="${RIPCLONE:-ripclone}"
-PROVIDER="${RIPCLONE_PROVIDER:-github}"
+PROVIDER="${RIPCLONE_BENCH_PROVIDER:-github}"
 
 REPO_NAME="$(basename "$REPO")"
 RESOLVED_REF_FILE="/tmp/ripclone_bench_ref_${REPO//\//_}"
@@ -278,23 +280,23 @@ bench_cmd() {
 
 rc_full()  {
   if [ -n "$AT_REF" ]; then
-    "$RIPCLONE" --server "$SERVER_URL" clone "$REPO" --branch "$CLONE_REF" --at "$AT_REF" --depth 0 --dir "$1"
+    "$RIPCLONE" --server "$SERVER_URL" --provider "$PROVIDER" clone "$REPO" --branch "$CLONE_REF" --at "$AT_REF" --depth 0 --dir "$1"
   else
-    "$RIPCLONE" --server "$SERVER_URL" clone "$REPO" --branch "$CLONE_REF" --depth 0 --dir "$1"
+    "$RIPCLONE" --server "$SERVER_URL" --provider "$PROVIDER" clone "$REPO" --branch "$CLONE_REF" --depth 0 --dir "$1"
   fi
 }
 rc_depth1(){
   if [ -n "$AT_REF" ]; then
-    "$RIPCLONE" --server "$SERVER_URL" clone "$REPO" --branch "$CLONE_REF" --at "$AT_REF" --depth 1 --dir "$1"
+    "$RIPCLONE" --server "$SERVER_URL" --provider "$PROVIDER" clone "$REPO" --branch "$CLONE_REF" --at "$AT_REF" --depth 1 --dir "$1"
   else
-    "$RIPCLONE" --server "$SERVER_URL" clone "$REPO" --branch "$CLONE_REF" --depth 1 --dir "$1"
+    "$RIPCLONE" --server "$SERVER_URL" --provider "$PROVIDER" clone "$REPO" --branch "$CLONE_REF" --depth 1 --dir "$1"
   fi
 }
 rc_files() {
   if [ -n "$AT_REF" ]; then
-    "$RIPCLONE" --server "$SERVER_URL" clone "$REPO" --branch "$CLONE_REF" --at "$AT_REF" --depth 1 --mode files --dir "$1"
+    "$RIPCLONE" --server "$SERVER_URL" --provider "$PROVIDER" clone "$REPO" --branch "$CLONE_REF" --at "$AT_REF" --depth 1 --mode files --dir "$1"
   else
-    "$RIPCLONE" --server "$SERVER_URL" clone "$REPO" --branch "$CLONE_REF" --depth 1 --mode files --dir "$1"
+    "$RIPCLONE" --server "$SERVER_URL" --provider "$PROVIDER" clone "$REPO" --branch "$CLONE_REF" --depth 1 --mode files --dir "$1"
   fi
 }
 git_depth1(){

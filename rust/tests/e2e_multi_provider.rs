@@ -18,12 +18,14 @@ async fn generic_provider_sync_and_clone_through_http_origin() {
     origin.publish();
 
     // Configure a generic provider pointing at the local HTTP server.
-    let providers = serde_json::json!([{
+    let providers = serde_json::json!({
+        "providers": [{
         "id": "localgit",
         "kind": "generic",
         "host": &origin.url,
         "auth_template": "token {token}",
-    }]);
+    }]
+    });
     unsafe {
         std::env::set_var("RIPCLONE_PROVIDERS", providers.to_string());
     }

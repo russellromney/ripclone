@@ -15,6 +15,8 @@ use std::env;
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 
+const DEFAULT_SERVER: &str = "https://ripclone.com";
+
 #[derive(Parser)]
 #[command(name = "ripclone")]
 #[command(about = "CAS-based git clone helper")]
@@ -30,7 +32,7 @@ struct Args {
     /// Upstream git provider instance id (e.g. "github", "gitlab", "my-gitea").
     /// Defaults to the built-in "github" instance unless overridden by config
     /// or a provider prefix in the repo argument (`gitlab:owner/repo`).
-    #[arg(short, long, env = "RIPCLONE_PROVIDER")]
+    #[arg(short, long)]
     provider: Option<String>,
 
     /// Explicit upstream credential token sent as the X-Upstream-Token header.
@@ -44,7 +46,7 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Authorize this machine against the ripclone cloud (saves a token).
+    /// Authorize this machine against the configured server (saves a token).
     Login,
     /// Remove the saved token.
     Logout,
@@ -84,8 +86,8 @@ enum Commands {
         /// Clone mode: editable (default) or files.
         #[arg(long)]
         mode: Option<CloneMode>,
-        /// History depth: 1 = HEAD only (default), N = last N commits, 0 = full
-        /// history. Defaults to the value in `ripclone.toml` or 1.
+        /// History depth: 0 = full history (default), 1 = HEAD only. Defaults
+        /// to the value in `ripclone.toml` or 0.
         #[arg(long)]
         depth: Option<usize>,
         /// Clone the artifacts built for this git rev (e.g. "HEAD~5") instead of
@@ -102,11 +104,13 @@ enum Commands {
         bench: bool,
     },
     /// Background sidecar: finish materializing a snapshot clone.
+    #[command(hide = true)]
     Sidecar {
         #[arg(short, long, default_value = ".")]
         dir: PathBuf,
     },
     /// Read a file from a skeleton clone.
+    #[command(hide = true)]
     Cat {
         repo: String,
         path: String,
@@ -121,11 +125,13 @@ enum Commands {
         action: ProviderAction,
     },
     /// Snapshot operations for agent-ready repo skeletons.
+    #[command(hide = true)]
     Snapshot {
         #[command(subcommand)]
         action: SnapshotAction,
     },
     /// Prefetch likely files into an existing skeleton clone.
+    #[command(hide = true)]
     Prefetch {
         repo: String,
         #[arg(short, long, default_value = ".")]
@@ -136,6 +142,7 @@ enum Commands {
         count: usize,
     },
     /// Build a working-tree archive + manifest for a commit.
+    #[command(hide = true)]
     BuildArchive {
         repo: String,
         #[arg(short, long, default_value = "HEAD")]
@@ -153,6 +160,7 @@ enum Commands {
         dictionary: Option<PathBuf>,
     },
     /// Extract a working-tree archive + manifest into a directory.
+    #[command(hide = true)]
     ExtractArchive {
         #[arg(short, long)]
         archive: PathBuf,
@@ -180,6 +188,7 @@ enum Commands {
         repo: Option<String>,
     },
     /// Train a zstd dictionary from a repo's HEAD blobs.
+    #[command(hide = true)]
     TrainDictionary {
         repo: String,
         #[arg(short, long, default_value = "HEAD")]
@@ -253,7 +262,7 @@ enum ProviderAction {
     },
     /// List configured providers.
     List,
-    /// Remove a provider and its stored token.
+    /// Remove a provider.
     Rm { id: String },
     /// Test provider connectivity by resolving a repo ref.
     Test {
@@ -278,9 +287,18 @@ fn parse_repo(repo: &str) -> Result<(&str, &str)> {
 ///
 /// Honors an optional `provider:` prefix, falls back to `default_provider`,
 /// and normalizes GitHub repos to `owner/name`.
-fn resolve_repo(repo: &str, default_provider: &str) -> Result<(String, String)> {
+fn resolve_repo(
+    repo: &str,
+    default_provider: &str,
+    registry: &ripclone::provider::ProviderRegistry,
+) -> Result<(String, String)> {
     let (provider_override, path) = parse_repo_arg(repo);
     let provider = provider_override.unwrap_or_else(|| default_provider.to_string());
+    if registry.get(&provider).is_none() {
+        anyhow::bail!(
+            "unknown provider '{provider}'; register it with `ripclone provider add {provider} ...`"
+        );
+    }
     let repo_path = if provider == "github" {
         let (owner, name) = parse_repo(&path)?;
         format!("{owner}/{name}")
@@ -295,7 +313,6 @@ fn resolve_repo(repo: &str, default_provider: &str) -> Result<(String, String)> 
 /// Supported forms:
 /// - `owner/name` → (None, "owner/name")
 /// - `gitlab:owner/name` → (Some("gitlab"), "owner/name")
-/// - `gitea.example.com:owner/repo` → (Some("gitea.example.com"), "owner/repo")
 ///
 /// Returns `(optional_provider_override, repo_path)`.
 fn parse_repo_arg(repo: &str) -> (Option<String>, String) {
@@ -506,6 +523,10 @@ async fn run_update() -> Result<()> {
         Err(e) => println!("could not read the latest release ({e})"),
     }
     Ok(())
+}
+
+fn is_cloud_default(server: &str) -> bool {
+    server.trim_end_matches('/') == DEFAULT_SERVER
 }
 
 async fn run_login(server: &str) -> Result<()> {
@@ -903,7 +924,7 @@ async fn main() -> Result<()> {
         .server
         .clone()
         .or_else(|| config.server.clone())
-        .unwrap_or_else(|| "https://ripclone.com".to_string());
+        .unwrap_or_else(|| DEFAULT_SERVER.to_string());
     let default_provider = args
         .provider
         .clone()
@@ -912,7 +933,12 @@ async fn main() -> Result<()> {
 
     // login/logout/version don't need an authenticated client.
     match &args.command {
-        Commands::Login => return run_login(&server).await,
+        Commands::Login => {
+            if is_cloud_default(&server) {
+                return run_login(&server).await;
+            }
+            return run_auth_login(&server).await;
+        }
         Commands::Logout => {
             token_store()?.delete("server")?;
             println!("Logged out — server token removed.");
@@ -923,6 +949,9 @@ async fn main() -> Result<()> {
         Commands::Update => return run_update().await,
         _ => {}
     }
+
+    let provider_registry =
+        ripclone::provider_config::load_registry().context("load provider registry")?;
 
     // Server-token precedence:
     //   RIPCLONE_SERVER_TOKEN_HASH > RIPCLONE_SERVER_TOKEN >
@@ -1061,7 +1090,7 @@ async fn main() -> Result<()> {
             let target = dir_pos
                 .or(dir)
                 .unwrap_or_else(|| PathBuf::from(target_name));
-            let depth = depth.or(config.clone.depth).unwrap_or(1);
+            let depth = depth.or(config.clone.depth).unwrap_or(0);
             // Only depth 1 (shallow) and depth 0 (full history) are implemented.
             // Reject an arbitrary depth-N request instead of silently serving
             // full history that git would record as a complete, non-shallow clone
@@ -1149,7 +1178,7 @@ async fn main() -> Result<()> {
         Commands::Cat {
             repo, path, branch, ..
         } => {
-            let (provider, repo_path) = resolve_repo(&repo, &default_provider)?;
+            let (provider, repo_path) = resolve_repo(&repo, &default_provider, &provider_registry)?;
             let client = client.with_provider(&provider);
             let content = client.cat_file(&repo_path, &branch, &path).await?;
             std::io::stdout().write_all(&content)?;
@@ -1161,7 +1190,8 @@ async fn main() -> Result<()> {
                 hot_files,
                 output,
             } => {
-                let (provider, repo_path) = resolve_repo(&repo, &default_provider)?;
+                let (provider, repo_path) =
+                    resolve_repo(&repo, &default_provider, &provider_registry)?;
                 let client = client.with_provider(&provider);
                 let info = client
                     .create_snapshot(&repo_path, &branch, hot_files)
@@ -1209,7 +1239,7 @@ async fn main() -> Result<()> {
             branch,
             count,
         } => {
-            let (provider, repo_path) = resolve_repo(&repo, &default_provider)?;
+            let (provider, repo_path) = resolve_repo(&repo, &default_provider, &provider_registry)?;
             let client = client.with_provider(&provider);
             let files = client.hot_files(&repo_path, &branch, count).await?;
             println!("prefetching {} files into {}", files.len(), dir.display());
@@ -1299,7 +1329,7 @@ async fn main() -> Result<()> {
             repo_root,
             dictionary,
         } => {
-            let (provider, repo_path) = resolve_repo(&repo, &default_provider)?;
+            let (provider, repo_path) = resolve_repo(&repo, &default_provider, &provider_registry)?;
             let client = client.with_provider(&provider);
             let (owner, repo_name) = repo_path
                 .split_once('/')
@@ -1376,7 +1406,7 @@ async fn main() -> Result<()> {
         } => {
             let main_repo = std::env::current_dir()?.join(dir);
             let repo_path = match repo {
-                Some(r) => resolve_repo(&r, &default_provider)?.1,
+                Some(r) => resolve_repo(&r, &default_provider, &provider_registry)?.1,
                 None => {
                     if default_provider == "github" {
                         let (o, r) = owner_repo_from_origin(&main_repo)?;
@@ -1400,7 +1430,7 @@ async fn main() -> Result<()> {
             sample_bytes,
             repo_root,
         } => {
-            let (provider, repo_path) = resolve_repo(&repo, &default_provider)?;
+            let (provider, repo_path) = resolve_repo(&repo, &default_provider, &provider_registry)?;
             let client = client.with_provider(&provider);
             let (owner, repo_name) = repo_path
                 .split_once('/')
@@ -1587,34 +1617,49 @@ mod tests {
         );
     }
 
-    #[test]
-    fn parse_repo_arg_with_host_prefix() {
-        assert_eq!(
-            parse_repo_arg("gitea.example.com:oven-sh/bun"),
-            (
-                Some("gitea.example.com".to_string()),
-                "oven-sh/bun".to_string()
-            )
-        );
+    fn test_registry() -> ripclone::provider::ProviderRegistry {
+        let mut registry = ripclone::provider::ProviderRegistry::new();
+        registry
+            .merge_one(ripclone::provider::ProviderConfig {
+                id: "gitlab".to_string(),
+                kind: Some("gitlab".to_string()),
+                host: Some("gitlab.com".to_string()),
+                token: None,
+                auth_template: None,
+                auth_header_name: None,
+            })
+            .unwrap();
+        registry
     }
 
     #[test]
     fn resolve_repo_defaults_to_github() {
-        let (provider, repo_path) = resolve_repo("oven-sh/bun", "github").unwrap();
+        let registry = test_registry();
+        let (provider, repo_path) = resolve_repo("oven-sh/bun", "github", &registry).unwrap();
         assert_eq!(provider, "github");
         assert_eq!(repo_path, "oven-sh/bun");
     }
 
     #[test]
     fn resolve_repo_overrides_provider_from_prefix() {
-        let (provider, repo_path) = resolve_repo("gitlab:oven-sh/bun", "github").unwrap();
+        let registry = test_registry();
+        let (provider, repo_path) =
+            resolve_repo("gitlab:oven-sh/bun", "github", &registry).unwrap();
         assert_eq!(provider, "gitlab");
         assert_eq!(repo_path, "oven-sh/bun");
     }
 
     #[test]
+    fn resolve_repo_rejects_unregistered_prefix() {
+        let registry = test_registry();
+        let err = resolve_repo("gitea.example.com:oven-sh/bun", "github", &registry).unwrap_err();
+        assert!(err.to_string().contains("unknown provider"));
+    }
+
+    #[test]
     fn resolve_repo_preserves_non_github_path() {
-        let (provider, repo_path) = resolve_repo("group/sub/repo", "gitlab").unwrap();
+        let registry = test_registry();
+        let (provider, repo_path) = resolve_repo("group/sub/repo", "gitlab", &registry).unwrap();
         assert_eq!(provider, "gitlab");
         assert_eq!(repo_path, "group/sub/repo");
     }

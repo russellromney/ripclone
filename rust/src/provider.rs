@@ -5,9 +5,8 @@
 //! subgroups, sourcehut `~user/repo`, Launchpad `+git` paths, self-hosted
 //! Gitea/Forgejo, etc.).
 //!
-//! Phase 0 is intentionally minimal: only the built-in `github` default
-//! instance exists, and all routes still parse `{owner}/{repo}` into a GitHub
-//! `RepoId`.
+//! Provider-qualified routes and CLI prefixes identify a configured provider
+//! instance; the bare `owner/repo` shape remains the GitHub default.
 //!
 //! Phase 3+ handoff notes:
 //! - Add OIDC / `Principal` / `authorize()` integration; `CredentialBroker` is
@@ -124,8 +123,7 @@ fn is_header_name_byte(b: u8) -> bool {
 impl ProviderInstance {
     /// Build a clean HTTPS clone URL for an opaque repo path.
     ///
-    /// Phase 0 back-compat: the github default instance renders
-    /// `https://github.com/{owner}/{repo}.git`.
+    /// The GitHub default instance renders `https://github.com/{owner}/{repo}.git`.
     pub fn clone_url(&self, path: &str) -> String {
         let host = self.host.trim_end_matches('/');
         let path = path.trim_start_matches('/');

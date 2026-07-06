@@ -89,8 +89,7 @@ pub trait RefStore: Send + Sync {
 
     /// List all repos that have a stored `RefInfo`.
     ///
-    /// Phase 0: every returned repo is a GitHub `RepoId`. Later phases will need
-    /// a provider registry to disambiguate `{provider}/{escaped_path}` keys.
+    /// Stored keys are provider-qualified as `{provider}/{escaped_path}`.
     async fn list(&self) -> Result<Vec<RepoId>>;
 
     /// Load the `RefInfo` for a specific branch.

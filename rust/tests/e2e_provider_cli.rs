@@ -1,6 +1,6 @@
 //! End-to-end test for the `ripclone provider` CLI.
 //!
-//! Uses a temporary $HOME so the provider config and token files are isolated.
+//! Uses a temporary $HOME so the provider config is isolated.
 
 use std::process::Command;
 
