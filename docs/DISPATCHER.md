@@ -196,6 +196,63 @@ dispatches attempted/succeeded/failed, machines started, time-to-first-claim (a
 cold-start proxy), queue depth, and (later) escalation counts. Without these, a
 throttled Fly quota or a wedged machine is silent.
 
+## Extending to other compute providers (Modal, Blaxel, e2b, Lambda, k8s, …)
+
+This is easy by construction: **the worker is platform-agnostic.** It claims from the
+shared queue, builds, uploads chunks, and writes the ref — with no knowledge of what
+started it. So a compute provider does exactly ONE thing: **make a worker process
+exist, given a standard config bag.** It never touches claim / build / report. Adding
+a provider is one function, not a subsystem.
+
+Three levels of integration — the first two need ZERO ripclone code:
+
+1. **`exec` — run any command (covers everything, today).** The dispatcher runs a
+   configured command with the config as env and size as an argument. Point it at
+   anything with a CLI/API:
+   `RIPCLONE_DISPATCH=exec`, `RIPCLONE_DISPATCH_CMD=./spawn-modal-worker.sh`
+   (or `modal run …`, `kubectl create job …`, a Blaxel/e2b deploy call, your own
+   script). SAFETY: size/repo/branch pass as separate argv, NEVER interpolated into a
+   shell string (repo names are attacker-influenced). This is the escape hatch that
+   means nobody is ever blocked on us shipping their platform.
+2. **`http` — POST the spec to your endpoint (covers anything callable).** A built-in
+   backend POSTs the WorkerSpec to a configured URL; your receiver (a Lambda, Cloud
+   Function, Modal webhook) starts the compute. Zero ripclone code — stand up an
+   endpoint. `exec` for people who prefer HTTP over a local command.
+3. **Typed `ComputeProvider` — ~50 lines for a first-class in-tree provider.** For
+   native control (pooling, precise sizing, sub-second start). In the cloud dispatcher:
+   ```ts
+   interface ComputeProvider {
+     name: string;
+     // Idempotent, non-blocking, best-effort: ensure a worker of >= size is
+     // starting with this env. The reconcile cron is the backstop.
+     ensureWorker(spec: WorkerSpec): Promise<void>;
+   }
+   type WorkerSpec = { sizeClass: SizeClass; env: Record<string, string> };
+   ```
+   Add Modal = write `class ModalProvider implements ComputeProvider`, register it in
+   the `providers` map, set `RIPCLONE_DISPATCH=modal`. Everything else is unchanged.
+
+**The stable contract is the `env` bag** — the fixed config every worker needs on any
+platform: queue URL+creds (claim), storage creds (upload), the metadata target
+(direct creds OR the ApiRefStore report URL + job token), the upstream-credential
+source, the ripclone token, `--max-size-class`, and the lifecycle flags. Document this
+bag as THE interface; a provider is then purely "deliver this bag to a fresh process."
+
+Two choices keep the provider surface tiny:
+
+- **Lifecycle is a flag, not a provider concern.** Drain-many (`--idle-exit-secs 30`,
+  Fly/Modal/k8s) vs one-shot (`--max-jobs 1`, Lambda-style) are just values in the env
+  bag — the provider doesn't know which. So even Lambda's 15-min / one-invoke model
+  fits with no special interface.
+- **Best-effort, because builds are idempotent.** Double-dispatch is harmless
+  (content-addressed + ordering-guarded), so `ensureWorker` is fire-and-forget — no
+  lease, no exactly-once. A new provider can't corrupt anything by over-spawning; the
+  worst case is wasted compute the idle-exit reclaims.
+
+Self-host note: the typed interface lives in the cloud dispatcher, but a self-hoster
+needs none of it — they run their own trigger (cron/webhook/`exec`) against the shared
+queue. Same worker, same env bag; only the caller differs.
+
 ## Platforms
 
 Cold start is noise next to build time for big jobs, but NOT for a 1.6–3.6s
