@@ -2192,9 +2192,17 @@ async fn get_ref_inner(
                 // is simply still building already has a worker on it, so do not
                 // enqueue a duplicate.
                 if is_evicted || evicted_for_rev {
+                    // Rebuild under the *originally requested* branch, not the
+                    // concrete branch it resolved to. For a plain `HEAD` clone this
+                    // keeps the job as `HEAD`, so the completed build refreshes the
+                    // literal `HEAD` alias ref too (see do_build_job). Enqueuing the
+                    // concrete branch instead leaves the alias frozen at its evicted
+                    // state, so /status keeps reporting a phantom cold `HEAD` ref
+                    // after the repo has been re-warmed by the rebuild. For a
+                    // concrete-branch request this is identical to `effective_branch`.
                     let job = BuildJob {
                         repo_id: repo_id.clone(),
-                        branch: effective_branch.clone(),
+                        branch: branch.clone(),
                         rev: None,
                         credential: credential.clone(),
                         recheck: 0,
@@ -4935,7 +4943,20 @@ async fn build_and_publish_two_phase(
 
     // Load the previous synced ref once: used both for the files-table by-diff
     // below and for Option-A full-clonepack carry later in this phase.
-    let prev = ref_store.load_branch(repo_id, branch).await.ok().flatten();
+    //
+    // Ignore an *evicted* prev. Warm-TTL eviction marks the ref `evicted` and the
+    // remote-GC pass then deletes its clonepack/pack/archive objects, but leaves
+    // the ref's artifact-pointer fields (head_base_packs, full_clonepack, history
+    // levels, archive frames) intact. Carrying any of those into this rebuild
+    // would reference objects storage no longer has, so the published manifest
+    // would point at deleted packs and the next clone 404s. Treat an evicted prev
+    // as absent so the rebuild is cold and re-uploads everything it references.
+    let prev = ref_store
+        .load_branch(repo_id, branch)
+        .await
+        .ok()
+        .flatten()
+        .filter(|p| p.build_status.as_deref() != Some(crate::remote_gc::EVICTED_BUILD_STATUS));
     let prev_warm_pinned = prev.as_ref().map(|p| p.warm_pinned).unwrap_or(false);
 
     // ---- PHASE 1: HEAD closure + archive + shallow skeleton -> publish depth=1 ----

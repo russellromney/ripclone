@@ -374,18 +374,34 @@ impl RemoteGc {
                 .list_branches(&repo_id)
                 .await
                 .with_context(|| format!("list branches for warm TTL {key}"))?;
+
+            // Load every ref of the repo once, so eviction can reason about the
+            // whole repo rather than each ref in isolation.
+            let mut infos = Vec::with_capacity(branches.len());
             for branch in branches {
-                let Some(info) = self
+                if let Some(info) = self
                     .ref_store
                     .load_branch(&repo_id, &branch)
                     .await
                     .with_context(|| format!("load ref for warm TTL {key}/{branch}"))?
-                else {
-                    continue;
-                };
-                if info.warm_pinned {
-                    continue;
+                {
+                    infos.push((branch, info));
                 }
+            }
+
+            // Repo-scoped pin protection. `warm_pinned` marks an entitled repo
+            // (e.g. a private repo the cloud has pinned); the guarantee is that its
+            // artifacts survive TTL eviction. A repo keeps more than one ref object
+            // for the same commit — notably the literal `HEAD` alias alongside the
+            // concrete default branch that actually holds the full-history build —
+            // and the pin may only be set on one of them. Evicting a *sibling* ref
+            // of a pinned repo deletes chunks the pinned commit still needs, so the
+            // pin must cover the whole repo, not just the ref that carries the flag.
+            if infos.iter().any(|(_, info)| info.warm_pinned) {
+                continue;
+            }
+
+            for (branch, info) in infos {
                 if info.build_status.as_deref() == Some(EVICTED_BUILD_STATUS) {
                     continue;
                 }

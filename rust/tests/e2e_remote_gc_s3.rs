@@ -501,6 +501,13 @@ async fn start_s3_server_faulting(env: &S3Env, prefix: &str, fail_first: usize) 
         std::env::set_var("RIPCLONE_S3_PREFIX", prefix);
         std::env::set_var("RIPCLONE_REMOTE_GC_INTERVAL_SECS", "0");
         std::env::set_var("RIPCLONE_RETENTION_INTERVAL_SECS", "999999");
+        // Disable the server's in-memory ref cache. These tests drive GC and ref
+        // eviction/pinning out-of-band through a separate ref-store handle, so a
+        // cached ref on the server would otherwise serve a stale (pre-eviction /
+        // pre-pin) view and its now-deleted artifacts. TTL=0 makes every server
+        // read go through to the durable store, keeping /status and /ref resolve
+        // coherent with the out-of-band writes.
+        std::env::set_var("RIPCLONE_REF_CACHE_TTL_SECS", "0");
         if fail_first > 0 {
             std::env::set_var("RIPCLONE_TEST_FAIL_FIRST_FETCHES", fail_first.to_string());
         }
@@ -753,6 +760,46 @@ async fn get_status(
     }
     assert!(status.is_success(), "status 2xx");
     serde_json::from_str(&body).expect("status json")
+}
+
+/// Block until the background full-history build has settled.
+///
+/// `sync_repo` returns as soon as the depth=1 clonepack is published; phase 2
+/// (the full clonepack + archive) finishes on a detached task and keeps writing
+/// the concrete default-branch ref. A test that ages/pins/GCs the ref before
+/// that lands races the build and observes a half-built repo. Wait until the
+/// concrete default branch reports a completed build (`build_status` cleared,
+/// full clonepack present) so the artifact set is stable before we touch it.
+///
+/// This polls the durable S3 ref store directly rather than the server's
+/// `/status` endpoint on purpose: `/status` reads through the server's
+/// `CachingRefStore`, and polling it for the length of the build would keep the
+/// ref hot in that cache. A test that then writes the ref out-of-band (to age or
+/// pin it) would be invisible to a subsequent `/status` read until the cache
+/// entry expired. Reading the store directly lets the server's cache lapse on
+/// its own TTL, so the later `/status` assertions observe the out-of-band write.
+async fn wait_for_full_build(env: &S3Env, prefix: &str, owner: &str, repo: &str) {
+    let storage = make_s3_storage(env, prefix).expect("storage");
+    let ref_store = make_s3_ref_store(storage);
+    let repo_id = RepoId::github(format!("{owner}/{repo}"));
+    for _ in 0..1500 {
+        if let Ok(branches) = ref_store.list_branches(&repo_id).await {
+            for branch in &branches {
+                if branch == "HEAD" {
+                    continue;
+                }
+                ref_store.invalidate(&repo_id, branch).await;
+                if let Ok(Some(info)) = ref_store.load_branch(&repo_id, branch).await
+                    && info.build_status.is_none()
+                    && !info.full_clonepack.manifest.is_empty()
+                {
+                    return;
+                }
+            }
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
+    panic!("full build never settled for {owner}/{repo}");
 }
 
 #[ignore = "requires S3 credentials"]
@@ -1324,6 +1371,11 @@ async fn warm_ttl_keeps_pinned_ref() {
         .await
         .expect("sync");
 
+    // Let phase 2 finish before pinning, so the concrete default-branch ref that
+    // actually holds the full-history artifacts is stable (and not still being
+    // rewritten by the detached build) when GC runs.
+    wait_for_full_build(&env, &prefix, "acme", &repo).await;
+
     let mut info = load_head_ref(&env, &prefix, "acme", &repo).await;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1334,16 +1386,37 @@ async fn warm_ttl_keeps_pinned_ref() {
     info.warm_pinned = true;
     save_head_ref(&env, &prefix, "acme", &repo, &info).await;
 
-    let report = run_gc(&env, &prefix, Duration::from_secs(1), false).await;
-    assert_eq!(
-        report.objects_deleted, 0,
-        "pinned ref must not lose artifacts"
-    );
+    // grace_period=0: any genuinely-orphaned object is deleted this pass. The pin
+    // is set only on the HEAD alias, but a repo keeps a second ref (the concrete
+    // default branch) for the same commit that holds the full-history artifacts.
+    // The pin must protect the whole repo, so *no* ref may be evicted. A two-phase
+    // build also leaves one unreferenced byproduct (the editable clonepack
+    // manifest, superseded by the files manifest); reclaiming that is correct GC
+    // and unrelated to the pin, so we assert the repo's refs survive rather than a
+    // literal zero-delete count.
+    run_gc(&env, &prefix, Duration::from_secs(1), false).await;
 
     let status = get_status(&server, "acme", &repo, None).await;
-    assert!(status["refs"][0]["warm"].as_bool().unwrap());
-    assert!(status["refs"][0]["pinned"].as_bool().unwrap());
-    assert!(status["refs"][0]["bytes"].as_u64().unwrap() > 0);
+    let refs = status["refs"].as_array().expect("status refs");
+    assert!(!refs.is_empty(), "pinned repo still has refs");
+    for r in refs {
+        assert!(
+            r["warm"].as_bool().unwrap(),
+            "pinned repo ref {} must not be evicted: {r}",
+            r["branch"]
+        );
+        assert!(
+            r["bytes"].as_u64().unwrap() > 0,
+            "pinned repo ref {} must keep its artifacts: {r}",
+            r["branch"]
+        );
+    }
+    let pinned_ref = refs
+        .iter()
+        .find(|r| r["pinned"].as_bool().unwrap_or(false))
+        .expect("a ref reports the pin");
+    assert!(pinned_ref["warm"].as_bool().unwrap());
+    assert!(pinned_ref["bytes"].as_u64().unwrap() > 0);
 
     cleanup_prefix(&env, &prefix).await.expect("cleanup prefix");
     cleanup_repo_refs(&env, "acme", &repo)
@@ -1377,6 +1450,10 @@ async fn clone_after_eviction_rebuilds_cleanly() {
         .sync_repo(&format!("acme/{repo}"), None)
         .await
         .expect("sync");
+
+    // Settle phase 2 before evicting so the rebuild below starts from a fully
+    // built repo, not one the detached build is still writing.
+    wait_for_full_build(&env, &prefix, "acme", &repo).await;
 
     let mut info = load_head_ref(&env, &prefix, "acme", &repo).await;
     let now = std::time::SystemTime::now()
