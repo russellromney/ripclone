@@ -901,6 +901,7 @@ mod tests {
             build_ms: None,
             synced_at: None,
             generation: None,
+            ..Default::default()
         }
     }
 

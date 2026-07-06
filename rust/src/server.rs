@@ -586,6 +586,14 @@ pub struct BranchStatusEntry {
     pub build_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub build_status: Option<String>,
+    /// RFC3339 timestamp of the ref's most recent access (build/reuse). `None`
+    /// for refs written before `last_accessed_at` existed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_accessed_at: Option<String>,
+    /// True when the ref currently has non-evicted clonepack artifacts.
+    pub warm: bool,
+    /// True when the warm-TTL sweep is forbidden from evicting this ref.
+    pub pinned: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1852,8 +1860,17 @@ fn ref_info_serves_commit(info: &RefInfo, clonepack_kind: &str, commit: &str) ->
 fn full_clonepack_pending_for_tip(info: &RefInfo, clonepack_kind: &str, commit: &str) -> bool {
     clonepack_kind != "shallow"
         && info.commit == commit
-        && info.build_status.as_deref() == Some("full history building")
+        && pending_build_status(info)
         && !ref_info_serves_commit(info, clonepack_kind, commit)
+}
+
+/// Statuses that tell the ref endpoint to return 202 and let the client/sync
+/// path trigger a fresh build.
+fn pending_build_status(info: &RefInfo) -> bool {
+    matches!(
+        info.build_status.as_deref(),
+        Some("full history building") | Some(crate::remote_gc::EVICTED_BUILD_STATUS)
+    )
 }
 
 async fn load_ref_info_for_resolved_commit(
@@ -2043,7 +2060,9 @@ async fn get_ref_inner(
                 build_status: None,
                 build_ms: None,
                 synced_at: None,
+                last_accessed_at: None,
                 generation: None,
+                warm_pinned: false,
             });
             if params.rev.is_none()
                 && full_clonepack_pending_for_tip(&info, &params.clonepack, &commit)
@@ -2484,7 +2503,9 @@ async fn build_repo_status(
         };
 
         let manifest_hashes = collect_manifest_hashes(&info);
-        if manifest_hashes.is_empty() && info.history_levels.is_empty() {
+        let is_evicted =
+            info.build_status.as_deref() == Some(crate::remote_gc::EVICTED_BUILD_STATUS);
+        if manifest_hashes.is_empty() && info.history_levels.is_empty() && !is_evicted {
             continue;
         }
 
@@ -2526,6 +2547,9 @@ async fn build_repo_status(
         let built_at = info.synced_at.and_then(|secs| {
             chrono::DateTime::from_timestamp(secs as i64, 0).map(|dt| dt.to_rfc3339())
         });
+        let last_accessed_at = info.last_accessed_at.or(info.synced_at).and_then(|secs| {
+            chrono::DateTime::from_timestamp(secs as i64, 0).map(|dt| dt.to_rfc3339())
+        });
 
         // Report the primary manifest: prefer full, then shallow, then legacy.
         let primary_manifest = if !info.full_clonepack.manifest.is_empty() {
@@ -2535,6 +2559,8 @@ async fn build_repo_status(
         } else {
             info.clonepack_manifest.clone()
         };
+
+        let warm = !is_evicted && ref_bytes > 0;
 
         // Public forks of public projects are free; everything else pays its
         // own logical bytes for now.
@@ -2549,7 +2575,10 @@ async fn build_repo_status(
             unique_bytes: branch_unique_bytes,
             built_at,
             build_ms: info.build_ms,
-            build_status: info.build_status,
+            build_status: info.build_status.clone(),
+            last_accessed_at,
+            warm,
+            pinned: info.warm_pinned,
         });
     }
 
@@ -4418,6 +4447,7 @@ async fn reuse_existing_build(
             .duration_since(SystemTime::UNIX_EPOCH)
             .ok()
             .map(|d| d.as_secs());
+        built.last_accessed_at = built.synced_at;
         built.generation = None;
         ref_store.save_branch(repo_id, branch, &built).await?;
         return Ok(Some(built));
@@ -5006,7 +5036,9 @@ async fn build_and_publish_two_phase(
         build_status: Some("full history building".to_string()),
         build_ms: None,
         synced_at: fetched_at,
+        last_accessed_at: fetched_at,
         generation: git::commit_depth(mirror_dir, commit).ok(),
+        warm_pinned: false,
     };
 
     // Upload phase-1 artifacts (shallow skeleton/index/metadata, head idx-bundle
@@ -6427,11 +6459,12 @@ pub async fn run_server(
         .unwrap_or(Duration::from_secs(300));
     Retention::clone(&b.retention).spawn(retention_interval);
 
+    const DEFAULT_REMOTE_GC_INTERVAL_SECS: u64 = 3600;
     let remote_gc_interval: Duration = env::var("RIPCLONE_REMOTE_GC_INTERVAL_SECS")
         .ok()
         .and_then(|s| s.parse().ok())
         .map(Duration::from_secs)
-        .unwrap_or(Duration::from_secs(0));
+        .unwrap_or(Duration::from_secs(DEFAULT_REMOTE_GC_INTERVAL_SECS));
     let mut gc_config = GcConfig::from_env();
     // Floor the grace at the longest signed-URL lifetime, read from the same
     // place ref responses sign URLs, so a client still holding a valid URL can
@@ -6512,12 +6545,14 @@ pub async fn run_server(
     }
 
     // Polling fallback: catches pushes that arrived without a webhook/Actions
-    // trigger so build-before-clone still holds. Off by default.
+    // trigger so build-before-clone still holds. Defaults to 5 minutes so
+    // webhook-less self-hosts still self-heal missed or stuck builds.
+    const DEFAULT_POLL_INTERVAL_SECS: u64 = 300;
     let poll_interval = Duration::from_secs(
         env::var("RIPCLONE_POLL_INTERVAL_SECS")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(0),
+            .unwrap_or(DEFAULT_POLL_INTERVAL_SECS),
     );
     spawn_poll_loop(state.clone(), poll_interval);
 
@@ -6950,6 +6985,7 @@ mod tests {
             build_ms: None,
             synced_at: None,
             generation: None,
+            ..Default::default()
         };
         let provider = ProviderRegistry::new().default_provider().clone();
         let repo_id = RepoId::github("o/r");
@@ -8488,6 +8524,7 @@ mod tests {
             build_ms: None,
             synced_at: Some(1_718_812_800),
             generation: None,
+            ..Default::default()
         };
         state
             .ref_store
@@ -8585,6 +8622,7 @@ mod tests {
             build_ms: None,
             synced_at: None,
             generation: None,
+            ..Default::default()
         };
         state
             .ref_store
@@ -8869,6 +8907,65 @@ mod tests {
         let expected = manifest_data.len() as u64 + 400 + 40;
         assert_eq!(status.refs[0].bytes, expected);
         assert_eq!(status.total_bytes, expected);
+    }
+
+    #[tokio::test]
+    async fn repo_status_reports_evicted_ref_as_not_warm() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(&tmp);
+
+        let info = RefInfo {
+            commit: "commit1".to_string(),
+            parent_commit: None,
+            default_branch: "main".to_string(),
+            skeleton_pack: String::new(),
+            skeleton_idx: String::new(),
+            head_blobs_pack: String::new(),
+            head_blobs_idx: String::new(),
+            head_blobs_chunks: vec![],
+            packs: vec![],
+            prebuilt_index: String::new(),
+            archive: String::new(),
+            manifest: String::new(),
+            full_pack: String::new(),
+            clonepack_manifest: String::new(),
+            metadata_chunk: String::new(),
+            archive_chunks: vec![],
+            full_clonepack: crate::ClonepackArtifacts::default(),
+            shallow_clonepack: crate::ClonepackArtifacts::default(),
+            history_levels: Vec::new(),
+            build_status: Some(crate::remote_gc::EVICTED_BUILD_STATUS.to_string()),
+            build_ms: None,
+            synced_at: Some(1_718_812_800),
+            last_accessed_at: Some(1_718_812_700),
+            generation: None,
+            warm_pinned: false,
+            ..Default::default()
+        };
+        state
+            .ref_store
+            .save_branch(&RepoId::github("acme/secret"), "main", &info)
+            .await
+            .unwrap();
+
+        let app = build_app(state);
+        let response = app
+            .oneshot(test_request("GET", "/v1/repos/github/acme/secret/status"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let status: RepoStatusResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(status.refs.len(), 1);
+        let branch = &status.refs[0];
+        assert_eq!(branch.branch, "main");
+        assert_eq!(branch.commit, "commit1");
+        assert!(!branch.warm);
+        assert!(!branch.pinned);
+        assert_eq!(branch.bytes, 0);
+        assert!(branch.last_accessed_at.is_some());
     }
 
     #[tokio::test]

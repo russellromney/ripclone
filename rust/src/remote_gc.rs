@@ -17,6 +17,14 @@ const ORPHAN_LEDGER_KEY: &str = "gc/orphans.json";
 /// `hash -> first epoch-second it was seen unreferenced`.
 type OrphanLedger = HashMap<String, u64>;
 
+/// Build status written by the warm-TTL sweep to mark a ref whose artifacts have
+/// been evicted. `get_ref_inner` treats this like a pending build so the next
+/// clone re-triggers sync via the existing 202 path.
+pub(crate) const EVICTED_BUILD_STATUS: &str = "evicted";
+
+/// Default idle time after which a ref's clonepack artifacts may be evicted.
+const DEFAULT_WARM_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+
 fn unix_secs(t: SystemTime) -> u64 {
     t.duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -28,6 +36,8 @@ fn unix_secs(t: SystemTime) -> u64 {
 pub struct GcConfig {
     /// Objects newer than this are never deleted, to protect in-flight uploads.
     pub grace_period: Duration,
+    /// Refs idle longer than this have their clonepack artifacts evicted.
+    pub warm_ttl: Duration,
     /// If true, only log what would be deleted without actually deleting.
     pub dry_run: bool,
 }
@@ -36,6 +46,7 @@ impl Default for GcConfig {
     fn default() -> Self {
         Self {
             grace_period: Duration::from_secs(24 * 60 * 60),
+            warm_ttl: Duration::from_secs(DEFAULT_WARM_TTL_SECS),
             dry_run: false,
         }
     }
@@ -44,18 +55,24 @@ impl Default for GcConfig {
 impl GcConfig {
     /// Build a config from environment variables:
     /// - `RIPCLONE_REMOTE_GC_GRACE_SECS` (default 86400 = 24h)
+    /// - `RIPCLONE_WARM_TTL_SECS` (default 604800 = 7d)
     /// - `RIPCLONE_REMOTE_GC_DRY_RUN` (default false)
     pub fn from_env() -> Self {
         let grace_secs = std::env::var("RIPCLONE_REMOTE_GC_GRACE_SECS")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(24 * 60 * 60);
+        let warm_ttl_secs = std::env::var("RIPCLONE_WARM_TTL_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_WARM_TTL_SECS);
         let dry_run = std::env::var("RIPCLONE_REMOTE_GC_DRY_RUN")
             .ok()
             .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
         Self {
             grace_period: Duration::from_secs(grace_secs),
+            warm_ttl: Duration::from_secs(warm_ttl_secs),
             dry_run,
         }
     }
@@ -162,6 +179,12 @@ impl RemoteGc {
         if !self.storage.is_remote() {
             info!("remote GC skipped: storage backend is not remote");
             return Ok(GcReport::default());
+        }
+
+        let now = unix_secs(SystemTime::now());
+        let evicted = self.evict_idle_warm_refs(now).await?;
+        if evicted > 0 {
+            info!("warm TTL sweep evicted {evicted} idle ref(s)");
         }
 
         let reachable = reachable_hashes(&self.ref_store, &self.storage, false).await?;
@@ -323,6 +346,64 @@ impl RemoteGc {
             report.errors.push(format!("write orphan ledger: {e}"));
         }
     }
+
+    /// Evict clonepack artifacts for refs that have been idle longer than
+    /// `warm_ttl` and are not pinned. The eviction is a metadata-only update
+    /// (`build_status = "evicted"`); the subsequent reachable-hash walk and
+    /// remote-GC phase delete the now-unreferenced storage objects. Returns the
+    /// number of refs evicted this pass.
+    async fn evict_idle_warm_refs(&self, now: u64) -> Result<u64> {
+        let ttl_secs = self.config.warm_ttl.as_secs();
+        if ttl_secs == 0 {
+            return Ok(0);
+        }
+        let mut evicted = 0u64;
+        let repos = self
+            .ref_store
+            .list()
+            .await
+            .context("list repos for warm TTL")?;
+        for repo_id in repos {
+            let key = repo_id.storage_key();
+            let branches = self
+                .ref_store
+                .list_branches(&repo_id)
+                .await
+                .with_context(|| format!("list branches for warm TTL {key}"))?;
+            for branch in branches {
+                let Some(info) = self
+                    .ref_store
+                    .load_branch(&repo_id, &branch)
+                    .await
+                    .with_context(|| format!("load ref for warm TTL {key}/{branch}"))?
+                else {
+                    continue;
+                };
+                if info.warm_pinned {
+                    continue;
+                }
+                if info.build_status.as_deref() == Some(EVICTED_BUILD_STATUS) {
+                    continue;
+                }
+                let last_touch = info.last_accessed_at.or(info.synced_at);
+                let Some(last_touch) = last_touch else {
+                    continue;
+                };
+                if now.saturating_sub(last_touch) < ttl_secs {
+                    continue;
+                }
+                if self
+                    .ref_store
+                    .update_build_status(&repo_id, &branch, &info.commit, EVICTED_BUILD_STATUS)
+                    .await
+                    .with_context(|| format!("evict warm ref {key}/{branch}"))?
+                {
+                    evicted += 1;
+                }
+            }
+        }
+        Ok(evicted)
+    }
 }
 
 /// Walk every live ref and collect the set of hashes that must be kept. Shared
@@ -358,6 +439,9 @@ pub(crate) async fn reachable_hashes(
             else {
                 continue;
             };
+            if info.build_status.as_deref() == Some(EVICTED_BUILD_STATUS) {
+                continue;
+            }
             collect_ref_info_hashes(&info, &mut reachable);
 
             for manifest_hash in collect_manifest_hashes(&info) {
@@ -682,6 +766,7 @@ mod tests {
             GcConfig {
                 grace_period: Duration::from_secs(60),
                 dry_run: false,
+                ..Default::default()
             },
         );
         let report = gc.run().await.unwrap();
@@ -737,6 +822,7 @@ mod tests {
             GcConfig {
                 grace_period: Duration::from_secs(60),
                 dry_run: false,
+                ..Default::default()
             },
         );
         let report = gc.run().await.unwrap();
@@ -782,6 +868,7 @@ mod tests {
             GcConfig {
                 grace_period: Duration::from_secs(3600),
                 dry_run: false,
+                ..Default::default()
             },
         );
         let report = gc.run().await.unwrap();
@@ -825,6 +912,7 @@ mod tests {
             GcConfig {
                 grace_period: Duration::from_secs(3600),
                 dry_run: false,
+                ..Default::default()
             },
         );
 
@@ -884,6 +972,7 @@ mod tests {
             GcConfig {
                 grace_period: Duration::from_secs(3600),
                 dry_run: false,
+                ..Default::default()
             },
         );
 
@@ -906,6 +995,7 @@ mod tests {
         let mut below = GcConfig {
             grace_period: Duration::from_secs(10),
             dry_run: false,
+            ..Default::default()
         };
         below.floor_grace(Duration::from_secs(1200));
         assert_eq!(below.grace_period, Duration::from_secs(1200));
@@ -913,6 +1003,7 @@ mod tests {
         let mut above = GcConfig {
             grace_period: Duration::from_secs(86_400),
             dry_run: false,
+            ..Default::default()
         };
         above.floor_grace(Duration::from_secs(1200));
         assert_eq!(above.grace_period, Duration::from_secs(86_400));
@@ -977,6 +1068,7 @@ mod tests {
             GcConfig {
                 grace_period: Duration::from_secs(60),
                 dry_run: false,
+                ..Default::default()
             },
         );
         let report = gc.run().await.unwrap();
@@ -1024,6 +1116,7 @@ mod tests {
             GcConfig {
                 grace_period: Duration::from_secs(60),
                 dry_run: true,
+                ..Default::default()
             },
         );
         let report = gc.run().await.unwrap();
@@ -1073,6 +1166,7 @@ mod tests {
             GcConfig {
                 grace_period: Duration::from_secs(24 * 60 * 60),
                 dry_run: false,
+                ..Default::default()
             },
         );
         let report = gc.run().await.unwrap();
@@ -1144,6 +1238,7 @@ mod tests {
             GcConfig {
                 grace_period: Duration::from_secs(60),
                 dry_run: false,
+                ..Default::default()
             },
         );
         let report = gc.run().await.unwrap();
@@ -1154,5 +1249,145 @@ mod tests {
         assert!(!orphan_path.exists());
         assert!(cas.path(&info.history_levels[0].packs[0].pack).exists());
         assert!(cas.path(&info.history_levels[0].packs[0].idx).exists());
+    }
+
+    #[tokio::test]
+    async fn warm_ttl_evicts_idle_ref_and_deletes_artifacts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cas_root = tmp.path().join("cas");
+        let repo_root = tmp.path().join("repos");
+        std::fs::create_dir_all(&cas_root).unwrap();
+        std::fs::create_dir_all(&repo_root).unwrap();
+
+        let cas = Cas::new(&cas_root).unwrap();
+        let storage: StorageRef = Arc::new(TestRemoteStorage {
+            inner: local(&cas_root).unwrap(),
+        });
+        let ref_store: Arc<dyn RefStore> = Arc::new(FileRefStore::new(&repo_root));
+
+        let mut info = make_ref_info_with_manifest(&cas);
+        let now = unix_secs(SystemTime::now());
+        info.last_accessed_at = Some(now.saturating_sub(10));
+        info.synced_at = Some(now.saturating_sub(10));
+        ref_store.save(&RepoId::github("o/r"), &info).await.unwrap();
+
+        let manifest_path = cas.path(&info.full_clonepack.manifest);
+        let metadata_path = cas.path(&info.metadata_chunk);
+        let archive_path = cas.path(&info.archive_chunks[0]);
+        assert!(manifest_path.exists());
+        assert!(metadata_path.exists());
+        assert!(archive_path.exists());
+
+        let gc = RemoteGc::new(
+            storage.clone(),
+            ref_store.clone(),
+            GcConfig {
+                grace_period: Duration::from_secs(0),
+                warm_ttl: Duration::from_secs(1),
+                dry_run: false,
+            },
+        );
+        let report = gc.run().await.unwrap();
+
+        assert_eq!(report.objects_deleted, 3);
+        assert!(!manifest_path.exists());
+        assert!(!metadata_path.exists());
+        assert!(!archive_path.exists());
+
+        let info = ref_store
+            .load_branch(&RepoId::github("o/r"), "HEAD")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(info.build_status.as_deref(), Some(EVICTED_BUILD_STATUS));
+    }
+
+    #[tokio::test]
+    async fn warm_ttl_keeps_pinned_ref() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cas_root = tmp.path().join("cas");
+        let repo_root = tmp.path().join("repos");
+        std::fs::create_dir_all(&cas_root).unwrap();
+        std::fs::create_dir_all(&repo_root).unwrap();
+
+        let cas = Cas::new(&cas_root).unwrap();
+        let storage: StorageRef = Arc::new(TestRemoteStorage {
+            inner: local(&cas_root).unwrap(),
+        });
+        let ref_store: Arc<dyn RefStore> = Arc::new(FileRefStore::new(&repo_root));
+
+        let mut info = make_ref_info_with_manifest(&cas);
+        let now = unix_secs(SystemTime::now());
+        info.last_accessed_at = Some(now.saturating_sub(10));
+        info.warm_pinned = true;
+        ref_store.save(&RepoId::github("o/r"), &info).await.unwrap();
+
+        let manifest_path = cas.path(&info.full_clonepack.manifest);
+        assert!(manifest_path.exists());
+
+        let gc = RemoteGc::new(
+            storage.clone(),
+            ref_store.clone(),
+            GcConfig {
+                grace_period: Duration::from_secs(0),
+                warm_ttl: Duration::from_secs(1),
+                dry_run: false,
+            },
+        );
+        let report = gc.run().await.unwrap();
+
+        assert_eq!(report.objects_deleted, 0);
+        assert!(manifest_path.exists());
+
+        let info = ref_store
+            .load_branch(&RepoId::github("o/r"), "HEAD")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(info.build_status.as_deref(), Some(EVICTED_BUILD_STATUS));
+    }
+
+    #[tokio::test]
+    async fn warm_ttl_keeps_recent_ref() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cas_root = tmp.path().join("cas");
+        let repo_root = tmp.path().join("repos");
+        std::fs::create_dir_all(&cas_root).unwrap();
+        std::fs::create_dir_all(&repo_root).unwrap();
+
+        let cas = Cas::new(&cas_root).unwrap();
+        let storage: StorageRef = Arc::new(TestRemoteStorage {
+            inner: local(&cas_root).unwrap(),
+        });
+        let ref_store: Arc<dyn RefStore> = Arc::new(FileRefStore::new(&repo_root));
+
+        let mut info = make_ref_info_with_manifest(&cas);
+        let now = unix_secs(SystemTime::now());
+        info.last_accessed_at = Some(now);
+        ref_store.save(&RepoId::github("o/r"), &info).await.unwrap();
+
+        let manifest_path = cas.path(&info.full_clonepack.manifest);
+        assert!(manifest_path.exists());
+
+        let gc = RemoteGc::new(
+            storage.clone(),
+            ref_store.clone(),
+            GcConfig {
+                grace_period: Duration::from_secs(0),
+                warm_ttl: Duration::from_secs(1),
+                dry_run: false,
+            },
+        );
+        let report = gc.run().await.unwrap();
+
+        assert_eq!(report.objects_deleted, 0);
+        assert!(manifest_path.exists());
+
+        let info = ref_store
+            .load_branch(&RepoId::github("o/r"), "HEAD")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(info.build_status.as_deref(), Some(EVICTED_BUILD_STATUS));
     }
 }

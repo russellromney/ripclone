@@ -237,6 +237,16 @@ pub struct RefInfo {
     /// signal, kept as a fallback for refs (or repos) without a `generation`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub synced_at: Option<u64>,
+    /// Unix timestamp (seconds) when this ref was last considered "warm".
+    /// The periodic warm-TTL sweep uses this (falling back to `synced_at`) to
+    /// decide when a ref's clonepack artifacts have gone idle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_accessed_at: Option<u64>,
+    /// When true, the warm-TTL sweep never evicts this ref's artifacts. The
+    /// cloud backend reconciles this for entitled private repos; the OSS server
+    /// simply honors the flag.
+    #[serde(default)]
+    pub warm_pinned: bool,
     /// The commit's depth in git history (`git rev-list --count`). This is the
     /// primary ordering signal for "a newer sync never loses": recency follows
     /// the commit's place in history, not the builder's clock, so two builders

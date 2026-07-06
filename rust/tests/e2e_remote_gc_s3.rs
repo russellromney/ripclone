@@ -396,6 +396,7 @@ async fn remote_gc_deletes_orphans_on_s3() {
         GcConfig {
             grace_period: Duration::from_secs(1),
             dry_run: false,
+            ..Default::default()
         },
     );
     // First pass tombstones the orphan in the ledger; it is never deleted on the
@@ -485,6 +486,7 @@ async fn remote_gc_dry_run_does_not_delete_on_s3() {
         GcConfig {
             grace_period: Duration::from_secs(1),
             dry_run: true,
+            ..Default::default()
         },
     );
     // First dry-run pass tombstones (would_delete=0); after grace a second pass
@@ -549,6 +551,214 @@ async fn status_reports_bytes_from_s3() {
     assert_eq!(status["total_bytes"], status["total_unique_bytes"]);
     assert!(!status["regions"].as_array().unwrap().is_empty());
     assert!(status["regions"][0]["unique_bytes"].as_u64().unwrap() > 0);
+
+    cleanup_prefix(&env, &prefix).await.expect("cleanup prefix");
+    cleanup_repo_refs(&env, "acme", &repo)
+        .await
+        .expect("cleanup refs");
+    guard.disable();
+}
+
+async fn load_head_ref(env: &S3Env, prefix: &str, owner: &str, repo: &str) -> ripclone::RefInfo {
+    let storage = make_s3_storage(env, prefix).expect("storage");
+    let ref_store = make_s3_ref_store(storage);
+    ref_store
+        .load_branch(&RepoId::github(format!("{owner}/{repo}")), "HEAD")
+        .await
+        .expect("load ref")
+        .expect("ref exists")
+}
+
+async fn save_head_ref(
+    env: &S3Env,
+    prefix: &str,
+    owner: &str,
+    repo: &str,
+    info: &ripclone::RefInfo,
+) {
+    let storage = make_s3_storage(env, prefix).expect("storage");
+    let ref_store = make_s3_ref_store(storage);
+    ref_store
+        .save_branch(&RepoId::github(format!("{owner}/{repo}")), "HEAD", info)
+        .await
+        .expect("save ref");
+}
+
+async fn run_gc(
+    env: &S3Env,
+    prefix: &str,
+    warm_ttl: Duration,
+    dry_run: bool,
+) -> ripclone::remote_gc::GcReport {
+    let storage = make_s3_storage(env, prefix).expect("storage");
+    let ref_store = make_s3_ref_store(storage.clone());
+    let gc = RemoteGc::new(
+        storage,
+        ref_store,
+        GcConfig {
+            grace_period: Duration::from_secs(0),
+            warm_ttl,
+            dry_run,
+        },
+    );
+    gc.run().await.expect("gc run")
+}
+
+#[ignore = "requires S3 credentials"]
+#[tokio::test]
+async fn warm_ttl_evicts_idle_ref_and_status_reports_cold() {
+    let env = match s3_env() {
+        Some(e) => e,
+        None => {
+            eprintln!("SKIP: RIPCLONE_S3_ENDPOINT/BUCKET not set");
+            return;
+        }
+    };
+    let prefix = unique_prefix();
+    let suffix = repo_suffix(&prefix);
+    let repo = format!("gcwarm-{suffix}");
+    let mut guard = CleanupGuard::new(env.clone(), prefix.clone());
+    let server = start_s3_server(&env, &prefix).await;
+
+    let origin = make_origin("acme", &repo);
+    guard.track_repo("acme", &repo);
+    origin.commit(&[("a.txt", "warm me\n")], "c1");
+    origin.publish();
+    server
+        .client()
+        .sync_repo(&format!("acme/{repo}"), None)
+        .await
+        .expect("sync");
+
+    let status = get_status(&server, "acme", &repo, None).await;
+    assert!(status["refs"][0]["warm"].as_bool().unwrap());
+
+    let mut info = load_head_ref(&env, &prefix, "acme", &repo).await;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    info.last_accessed_at = Some(now.saturating_sub(86400));
+    info.synced_at = Some(now.saturating_sub(86400));
+    save_head_ref(&env, &prefix, "acme", &repo, &info).await;
+
+    let report = run_gc(&env, &prefix, Duration::from_secs(1), false).await;
+    assert!(
+        report.objects_deleted > 0,
+        "GC should delete idle artifacts"
+    );
+
+    let status = get_status(&server, "acme", &repo, None).await;
+    assert!(!status["refs"][0]["warm"].as_bool().unwrap());
+    assert_eq!(status["refs"][0]["bytes"], 0);
+
+    cleanup_prefix(&env, &prefix).await.expect("cleanup prefix");
+    cleanup_repo_refs(&env, "acme", &repo)
+        .await
+        .expect("cleanup refs");
+    guard.disable();
+}
+
+#[ignore = "requires S3 credentials"]
+#[tokio::test]
+async fn warm_ttl_keeps_pinned_ref() {
+    let env = match s3_env() {
+        Some(e) => e,
+        None => {
+            eprintln!("SKIP: RIPCLONE_S3_ENDPOINT/BUCKET not set");
+            return;
+        }
+    };
+    let prefix = unique_prefix();
+    let suffix = repo_suffix(&prefix);
+    let repo = format!("gcpin-{suffix}");
+    let mut guard = CleanupGuard::new(env.clone(), prefix.clone());
+    let server = start_s3_server(&env, &prefix).await;
+
+    let origin = make_origin("acme", &repo);
+    guard.track_repo("acme", &repo);
+    origin.commit(&[("a.txt", "pin me\n")], "c1");
+    origin.publish();
+    server
+        .client()
+        .sync_repo(&format!("acme/{repo}"), None)
+        .await
+        .expect("sync");
+
+    let mut info = load_head_ref(&env, &prefix, "acme", &repo).await;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    info.last_accessed_at = Some(now.saturating_sub(86400));
+    info.synced_at = Some(now.saturating_sub(86400));
+    info.warm_pinned = true;
+    save_head_ref(&env, &prefix, "acme", &repo, &info).await;
+
+    let report = run_gc(&env, &prefix, Duration::from_secs(1), false).await;
+    assert_eq!(
+        report.objects_deleted, 0,
+        "pinned ref must not lose artifacts"
+    );
+
+    let status = get_status(&server, "acme", &repo, None).await;
+    assert!(status["refs"][0]["warm"].as_bool().unwrap());
+    assert!(status["refs"][0]["pinned"].as_bool().unwrap());
+    assert!(status["refs"][0]["bytes"].as_u64().unwrap() > 0);
+
+    cleanup_prefix(&env, &prefix).await.expect("cleanup prefix");
+    cleanup_repo_refs(&env, "acme", &repo)
+        .await
+        .expect("cleanup refs");
+    guard.disable();
+}
+
+#[ignore = "requires S3 credentials"]
+#[tokio::test]
+async fn clone_after_eviction_rebuilds_cleanly() {
+    let env = match s3_env() {
+        Some(e) => e,
+        None => {
+            eprintln!("SKIP: RIPCLONE_S3_ENDPOINT/BUCKET not set");
+            return;
+        }
+    };
+    let prefix = unique_prefix();
+    let suffix = repo_suffix(&prefix);
+    let repo = format!("gcrebuild-{suffix}");
+    let mut guard = CleanupGuard::new(env.clone(), prefix.clone());
+    let server = start_s3_server(&env, &prefix).await;
+
+    let origin = make_origin("acme", &repo);
+    guard.track_repo("acme", &repo);
+    origin.commit(&[("a.txt", "rebuild me\n")], "c1");
+    origin.publish();
+    server
+        .client()
+        .sync_repo(&format!("acme/{repo}"), None)
+        .await
+        .expect("sync");
+
+    let mut info = load_head_ref(&env, &prefix, "acme", &repo).await;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    info.last_accessed_at = Some(now.saturating_sub(86400));
+    info.synced_at = Some(now.saturating_sub(86400));
+    save_head_ref(&env, &prefix, "acme", &repo, &info).await;
+
+    run_gc(&env, &prefix, Duration::from_secs(1), false).await;
+
+    let status = get_status(&server, "acme", &repo, None).await;
+    assert!(!status["refs"][0]["warm"].as_bool().unwrap());
+
+    let (_dir, target) =
+        sync_and_clone(&server, &origin, 0, ripclone::mode::CloneMode::Editable).await;
+    assert_eq!(read(&target, "a.txt"), "rebuild me\n");
+
+    let status = get_status(&server, "acme", &repo, None).await;
+    assert!(status["refs"][0]["warm"].as_bool().unwrap());
 
     cleanup_prefix(&env, &prefix).await.expect("cleanup prefix");
     cleanup_repo_refs(&env, "acme", &repo)
