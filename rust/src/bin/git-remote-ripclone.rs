@@ -173,22 +173,23 @@ async fn main() -> Result<()> {
                     Result::<(), std::io::Error>::Ok(())
                 });
 
-                // Drive both copies concurrently, but cancel the stdin copy as
-                // soon as the child exits so a server-side early close does not
-                // hang on our own stdin.
-                let status = tokio::select! {
-                    res = child.wait() => res,
-                    res = stdin_handle => {
-                        let _ = res;
-                        child.wait().await
-                    }
-                    res = stdout_handle => {
-                        let _ = res;
-                        child.wait().await
-                    }
-                };
-                let _ = status;
-                break;
+                // git is waiting on upload-pack's output: the ref advertisement,
+                // then the pack. Copy it to completion before we leave — tokio's
+                // copy flushes the writer at EOF, and upload-pack closes its stdout
+                // when it exits, so this resolves as soon as the transfer is done.
+                // Returning early (as a select! on child.wait() could) would drop
+                // the copy mid-flush and git would see a truncated stream as
+                // "fatal: early EOF".
+                let _ = stdout_handle.await;
+                let _ = child.wait().await;
+                // The stdin copy reads through tokio's stdin, whose blocking read
+                // cannot be cancelled. If git has not closed its end yet, that read
+                // is still parked on a blocking thread; a normal return would drop
+                // the runtime and wait on it forever, hanging the helper until git
+                // clone itself times out. The transfer is finished, so exit the
+                // process directly instead of unwinding through runtime shutdown.
+                stdin_handle.abort();
+                std::process::exit(0);
             }
             "connect git-receive-pack" => {
                 // Push is intentionally not handled through ripclone; users should

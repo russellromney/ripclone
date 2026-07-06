@@ -17,6 +17,8 @@ mod common;
 
 use common::*;
 
+use std::path::Path;
+use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
 
 use axum::{
@@ -328,4 +330,175 @@ async fn metrics_endpoint_failure_does_not_fail_the_clone() {
 
     // It did try (and got a 500), but nothing propagated.
     assert_eq!(*gw.hits.lock().unwrap(), 1, "report attempted exactly once");
+}
+
+/// Run the CLI `clone` subcommand against `server` (or a gateway) with optional
+/// extra args. stdout/stderr go to temp files so long-lived git credential
+/// grandchildren don't keep capture pipes open, and the blocking wait runs on
+/// the blocking pool so the single-threaded tokio test runtime keeps driving the
+/// in-process server.
+async fn run_cli_clone(
+    server_url: &str,
+    repo: &str,
+    target: &Path,
+    args: &[&str],
+    extra_env: &[(&str, &str)],
+) -> Output {
+    let server_url = server_url.to_string();
+    let repo = repo.to_string();
+    let target = target.to_path_buf();
+    let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    let extra_env: Vec<(String, String)> = extra_env
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    tokio::task::spawn_blocking(move || {
+        let dir = target.parent().unwrap().to_path_buf();
+        let stdout_tmp = tempfile::NamedTempFile::new_in(&dir).expect("stdout temp file");
+        let stderr_tmp = tempfile::NamedTempFile::new_in(&dir).expect("stderr temp file");
+
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_ripclone"));
+        cmd.arg("--server")
+            .arg(&server_url)
+            .arg("clone")
+            .arg(&repo)
+            .arg(&target)
+            .env("RIPCLONE_SERVER_TOKEN_HASH", token_hash())
+            .env("HOME", &dir)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdin(Stdio::null())
+            .stdout(stdout_tmp.reopen().expect("reopen stdout temp"))
+            .stderr(stderr_tmp.reopen().expect("reopen stderr temp"));
+        for (k, v) in &extra_env {
+            cmd.env(k, v);
+        }
+        for a in &args {
+            cmd.arg(a);
+        }
+        let mut child = cmd.spawn().expect("spawn ripclone clone");
+        let status = child.wait().expect("wait for ripclone clone");
+        let stdout = std::fs::read(stdout_tmp.path()).expect("read stdout temp");
+        let stderr = std::fs::read(stderr_tmp.path()).expect("read stderr temp");
+        Output {
+            status,
+            stdout,
+            stderr,
+        }
+    })
+    .await
+    .expect("spawn_blocking run_cli_clone")
+}
+
+/// Poll the gateway (proxying to the OSS server) until the requested clonepack
+/// is warm, so the CLI doesn't spend the test waiting on 202s.
+async fn warm_through_gateway(gw_url: &str, repo: &str, clonepack_kind: Option<&str>) {
+    gateway_client(gw_url)
+        .resolve_ref_with_clonepack(repo, "HEAD", clonepack_kind, None)
+        .await
+        .expect("warm repo through gateway");
+}
+
+#[tokio::test]
+async fn no_metrics_flag_suppresses_post() {
+    init(false);
+    let server = start_server().await;
+    seed_repo(&server, "acme", "metrics-no-flag").await;
+
+    let gw = spawn_gateway(&server.url, true, 202).await;
+    warm_through_gateway(&gw.url, "acme/metrics-no-flag", Some("shallow")).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("clone");
+    let out = run_cli_clone(
+        &gw.url,
+        "acme/metrics-no-flag",
+        &target,
+        &["--no-metrics"],
+        &[],
+    )
+    .await;
+
+    assert!(
+        out.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(target.join("a.txt")).unwrap(),
+        "hello\n"
+    );
+    assert_eq!(
+        *gw.hits.lock().unwrap(),
+        0,
+        "--no-metrics must suppress the metrics POST"
+    );
+}
+
+#[tokio::test]
+async fn no_metrics_env_var_suppresses_post() {
+    init(false);
+    let server = start_server().await;
+    seed_repo(&server, "acme", "metrics-no-env").await;
+
+    let gw = spawn_gateway(&server.url, true, 202).await;
+    warm_through_gateway(&gw.url, "acme/metrics-no-env", Some("shallow")).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("clone");
+    let out = run_cli_clone(
+        &gw.url,
+        "acme/metrics-no-env",
+        &target,
+        &[],
+        &[("RIPCLONE_NO_METRICS", "1")],
+    )
+    .await;
+
+    assert!(
+        out.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(target.join("a.txt")).unwrap(),
+        "hello\n"
+    );
+    assert_eq!(
+        *gw.hits.lock().unwrap(),
+        0,
+        "RIPCLONE_NO_METRICS must suppress the metrics POST"
+    );
+}
+
+#[tokio::test]
+async fn oss_server_accepts_metrics_post() {
+    init(false);
+    let server = start_server().await;
+
+    // The OSS server exposes an accept-and-drop metrics sink so self-hosted
+    // clients don't get 404s.
+    let url = format!("{}/v1/clones/test-id/metrics", server.url);
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(&url)
+        .header(
+            reqwest::header::AUTHORIZATION,
+            format!("Ripclone {}", token_hash()),
+        )
+        .header(
+            "x-ripclone-protocol",
+            ripclone::PROTOCOL_VERSION.to_string(),
+        )
+        .json(&serde_json::json!({"cloneId": "test-id"}))
+        .send()
+        .await
+        .expect("POST metrics");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::ACCEPTED,
+        "OSS metrics sink should accept and drop"
+    );
 }

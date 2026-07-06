@@ -645,6 +645,12 @@ pub fn build_app(state: ServerState) -> Router {
         // Single catch-all route for git smart-http endpoints.
         .route("/v1/git/{*path}", get(dispatch_git_get))
         .route("/v1/git/{*path}", post(dispatch_git_post))
+        // Clone metrics sink. The cloud consumes these for analytics; the OSS
+        // server accepts and drops them so a self-hosted CLI never spams 404s.
+        .route(
+            "/v1/clones/{clone_id}/metrics",
+            post(clone_metrics_drop_handler),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -1139,6 +1145,13 @@ async fn version_handler() -> impl IntoResponse {
         "version": env!("CARGO_PKG_VERSION"),
         "protocol": crate::PROTOCOL_VERSION,
     }))
+}
+
+/// Accept-and-drop sink for the CLI's post-clone metrics report. The payload is
+/// advertising-grade telemetry, not operator metrics, so the OSS server has no
+/// use for it; rejecting it would only make self-hosted clients see 404s.
+async fn clone_metrics_drop_handler() -> impl IntoResponse {
+    StatusCode::ACCEPTED
 }
 
 /// Readiness probe: 200 only when storage and the ref store are both reachable,

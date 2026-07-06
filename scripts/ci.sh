@@ -24,7 +24,7 @@ lint() {
 # io_uring queue allocation bounded — nextest's all-binaries-at-once parallelism
 # exhausts the runner's locked-memory limit while io_uring is the default writer.)
 run_tests() {
-  ( cd "$ROOT/rust" && cargo test --release --all-targets --locked )
+  ( cd "$ROOT/rust" && cargo test --profile ci --all-targets --locked )
 }
 
 e2e() {
@@ -32,15 +32,15 @@ e2e() {
   bash "$ROOT/scripts/e2e_local.sh"
 }
 
-# Tests + flake guard in one pass: compile once (release), then run the suite a
-# couple of times to catch nondeterministic races/ordering bugs a single run can
-# miss. Two parallel runs already exercise distinct interleavings; reusing the
-# release profile means no separate debug compile.
+# Tests + flake guard in one pass: compile once (ci profile), then run the suite
+# a couple of times to catch nondeterministic races/ordering bugs a single run
+# can miss. The ci profile is release-like but with more codegen units, so the
+# compile is faster while tests still run optimized enough for the gate.
 flake() {
   ( cd "$ROOT/rust"
     for i in 1 2; do
       echo "== test run $i/2 =="
-      cargo test --release --all-targets --locked
+      cargo test --profile ci --all-targets --locked
     done )
 }
 

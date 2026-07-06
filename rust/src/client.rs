@@ -561,6 +561,8 @@ pub struct Client {
     provider: String,
     /// Upstream credential token sent as `X-Upstream-Token`.
     upstream_token: Option<String>,
+    /// When true, suppress the post-clone metrics report regardless of env.
+    skip_metrics: bool,
 }
 
 impl Client {
@@ -629,6 +631,7 @@ impl Client {
             cache,
             provider: "github".to_string(),
             upstream_token: None,
+            skip_metrics: false,
         }
     }
 
@@ -644,6 +647,14 @@ impl Client {
 
     pub fn with_upstream_token_opt(mut self, token: Option<String>) -> Self {
         self.upstream_token = token;
+        self
+    }
+
+    /// Suppress the fire-and-forget metrics report for clones made through this
+    /// client. This is the `--no-metrics` path; `RIPCLONE_NO_METRICS` is still
+    /// honored via `clone_metrics::opted_out`.
+    pub fn with_metrics_disabled(mut self) -> Self {
+        self.skip_metrics = true;
         self
     }
 
@@ -1542,7 +1553,7 @@ impl Client {
     /// short timeout so a slow endpoint can't stall the CLI's exit.
     pub async fn report_clone_metrics(&self, outcome: &CloneOutcome, total_ms: u64) {
         use crate::clone_metrics::{ClientInfo, CloneMetric, RepoId, opted_out};
-        if opted_out() {
+        if self.skip_metrics || opted_out() {
             return;
         }
         let Some(clone_id) = outcome.clone_id.clone() else {

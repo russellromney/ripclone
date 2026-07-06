@@ -66,7 +66,7 @@ jobs:
           cache-workspaces: rust
       - name: Install build deps
         run: bash scripts/install-build-deps.sh
-      - name: Tests + flake guard (release, repeated)
+      - name: Tests + flake guard (ci profile, repeated)
         run: bash scripts/ci.sh flake
 
   e2e:
