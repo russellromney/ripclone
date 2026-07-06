@@ -11,6 +11,7 @@ mod common;
 
 use anyhow::{Context, Result};
 use common::*;
+use ripclone::mode::CloneMode;
 use ripclone::provider::RepoId;
 use ripclone::ref_store::{CachingRefStore, RefStore, S3RefStore};
 use ripclone::remote_gc::{GcConfig, RemoteGc};
@@ -19,7 +20,7 @@ use ripclone::storage::{S3Storage, StorageBackend};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::time::sleep;
 
 #[derive(Clone)]
@@ -97,6 +98,14 @@ async fn wait_for_server(port: u16) {
 }
 
 async fn start_s3_server(env: &S3Env, prefix: &str) -> Server {
+    start_s3_server_faulting(env, prefix, 0).await
+}
+
+/// Start the in-process server backed by the real S3-compatible store, failing
+/// the first `fail_first` artifact GETs via `RIPCLONE_TEST_FAIL_FIRST_FETCHES`.
+/// The fault threshold is set under `SERVER_LOCK` and removed once the server
+/// has consumed it, so parallel test binaries cannot observe the same env var.
+async fn start_s3_server_faulting(env: &S3Env, prefix: &str, fail_first: usize) -> Server {
     let _lock = SERVER_LOCK.lock().await;
     unsafe {
         std::env::set_var("RIPCLONE_S3_ENDPOINT", &env.endpoint);
@@ -105,6 +114,9 @@ async fn start_s3_server(env: &S3Env, prefix: &str) -> Server {
         std::env::set_var("RIPCLONE_S3_PREFIX", prefix);
         std::env::set_var("RIPCLONE_REMOTE_GC_INTERVAL_SECS", "0");
         std::env::set_var("RIPCLONE_RETENTION_INTERVAL_SECS", "999999");
+        if fail_first > 0 {
+            std::env::set_var("RIPCLONE_TEST_FAIL_FIRST_FETCHES", fail_first.to_string());
+        }
     }
     common::init(false);
 
@@ -123,6 +135,12 @@ async fn start_s3_server(env: &S3Env, prefix: &str) -> Server {
         let _ = run_server(&cas_dir2, &repo_root2, "127.0.0.1", port).await;
     });
     wait_for_server(port).await;
+
+    if fail_first > 0 {
+        unsafe {
+            std::env::remove_var("RIPCLONE_TEST_FAIL_FIRST_FETCHES");
+        }
+    }
 
     Server {
         url: format!("http://127.0.0.1:{port}"),
@@ -309,6 +327,20 @@ fn sha256_hex(data: &[u8]) -> String {
     hex::encode(Sha256::digest(data))
 }
 
+/// Poll until `grace` has elapsed since `start`, timing out at 10 s past the
+/// grace window. This replaces fixed sleeps with a bounded poll so tests don't
+/// wait longer than necessary on fast backends.
+async fn wait_for_grace_since(start: Instant, grace: Duration) {
+    let deadline = start + grace + Duration::from_secs(10);
+    while Instant::now() < start + grace && Instant::now() < deadline {
+        sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        Instant::now() >= start + grace,
+        "grace {grace:?} never elapsed since {start:?}"
+    );
+}
+
 async fn get_status(
     server: &Server,
     owner: &str,
@@ -383,14 +415,16 @@ async fn remote_gc_deletes_orphans_on_s3() {
         .expect("save reachable ref");
 
     // Age the reachable object relative to the orphan we are about to inject.
-    sleep(Duration::from_secs(2)).await;
+    let reachable_at = Instant::now();
+    wait_for_grace_since(reachable_at, Duration::from_secs(1)).await;
 
     let orphan_data = b"i-am-an-orphan";
     let orphan_hash = sha256_hex(orphan_data);
     storage.put(&orphan_hash, orphan_data).expect("put orphan");
+    let orphan_at = Instant::now();
 
     // Make sure the orphan is older than the grace period we will use.
-    sleep(Duration::from_secs(2)).await;
+    wait_for_grace_since(orphan_at, Duration::from_secs(1)).await;
 
     let gc = RemoteGc::new(
         storage.clone(),
@@ -404,6 +438,7 @@ async fn remote_gc_deletes_orphans_on_s3() {
     // First pass tombstones the orphan in the ledger; it is never deleted on the
     // pass that first sees it unreferenced.
     let first = gc.run().await.expect("remote gc first run");
+    let tombstoned_at = Instant::now();
     assert_eq!(
         first.objects_deleted, 0,
         "first pass must only tombstone, got {first:?}"
@@ -414,7 +449,7 @@ async fn remote_gc_deletes_orphans_on_s3() {
     );
 
     // After the (1s) grace elapses, a second pass collects it.
-    sleep(Duration::from_secs(2)).await;
+    wait_for_grace_since(tombstoned_at, Duration::from_secs(1)).await;
     let report = gc.run().await.expect("remote gc second run");
 
     // The orphan plus every reachable CAS object were scanned.
@@ -472,14 +507,14 @@ async fn remote_gc_dry_run_does_not_delete_on_s3() {
         .await
         .expect("sync");
 
-    sleep(Duration::from_secs(2)).await;
-
     let storage = make_s3_storage(&env, &prefix).expect("storage");
     let orphan_data = b"dry-run-orphan";
     let orphan_hash = sha256_hex(orphan_data);
     storage.put(&orphan_hash, orphan_data).expect("put orphan");
+    let orphan_at = Instant::now();
 
-    sleep(Duration::from_secs(2)).await;
+    // Make sure the orphan is older than the grace period we will use.
+    wait_for_grace_since(orphan_at, Duration::from_secs(1)).await;
 
     let ref_store = make_s3_ref_store(storage.clone());
     let gc = RemoteGc::new(
@@ -494,7 +529,8 @@ async fn remote_gc_dry_run_does_not_delete_on_s3() {
     // First dry-run pass tombstones (would_delete=0); after grace a second pass
     // reports it as a would-delete candidate without removing it.
     let _ = gc.run().await.expect("remote gc dry run first");
-    sleep(Duration::from_secs(2)).await;
+    let tombstoned_at = Instant::now();
+    wait_for_grace_since(tombstoned_at, Duration::from_secs(1)).await;
     let report = gc.run().await.expect("remote gc dry run second");
     assert!(
         report.objects_deleted >= 1,
@@ -506,6 +542,107 @@ async fn remote_gc_dry_run_does_not_delete_on_s3() {
         storage.size(&orphan_hash).is_ok(),
         "dry-run must not delete objects"
     );
+
+    cleanup_prefix(&env, &prefix).await.expect("cleanup prefix");
+    cleanup_repo_refs(&env, "acme", &repo)
+        .await
+        .expect("cleanup refs");
+    guard.disable();
+}
+
+/// Race: RemoteGc with grace=0 must not corrupt a clone that is stalled
+/// mid-chunk by the fault hook. The clone either completes with a correct tree
+/// or fails cleanly without leaving a partial target directory.
+#[ignore = "requires S3 credentials"]
+#[tokio::test]
+async fn remote_gc_during_faulting_clone_is_safe() {
+    let env = match s3_env() {
+        Some(e) => e,
+        None => {
+            eprintln!("SKIP: RIPCLONE_S3_ENDPOINT/BUCKET not set");
+            return;
+        }
+    };
+    let prefix = unique_prefix();
+    let suffix = repo_suffix(&prefix);
+    let repo = format!("gcrace-{suffix}");
+    let mut guard = CleanupGuard::new(env.clone(), prefix.clone());
+    // Fail the first 2 artifact GETs; the clone retries within its default
+    // budget and should recover. GC runs while the clone is stalled on those
+    // retries.
+    let server = start_s3_server_faulting(&env, &prefix, 2).await;
+
+    let origin = make_origin("acme", &repo);
+    guard.track_repo("acme", &repo);
+    origin.commit(&[("a.txt", "gc race\n"), ("b.txt", "x\n")], "c1");
+    origin.publish();
+
+    server
+        .client()
+        .sync_repo(&format!("acme/{repo}"), None)
+        .await
+        .expect("sync");
+
+    // Start the clone on a faulting server and let it begin resolving/downloading.
+    let client = server.client();
+    let repo_path = format!("acme/{repo}");
+    let clone_task = tokio::spawn(async move {
+        let out = tempfile::tempdir().expect("clone temp dir");
+        let target = out.path().join("clone");
+        let result = client
+            .install_repo_with_mode_at(
+                &repo_path,
+                "HEAD",
+                None,
+                &target,
+                CloneMode::Files,
+                Some("full"),
+                None,
+            )
+            .await;
+        (result, out, target)
+    });
+
+    // Yield briefly so the clone task is scheduled and begins hitting faults,
+    // then run GC with the most aggressive grace possible while the clone is
+    // mid-flight.
+    sleep(Duration::from_millis(200)).await;
+
+    let storage = make_s3_storage(&env, &prefix).expect("storage");
+    let ref_store = make_s3_ref_store(storage.clone());
+    let gc = RemoteGc::new(
+        storage.clone(),
+        ref_store,
+        GcConfig {
+            grace_period: Duration::ZERO,
+            dry_run: false,
+        },
+    );
+    let report = gc.run().await.expect("remote gc run during clone");
+    eprintln!("GC during clone: {report:?}");
+
+    let (result, _out, target) = clone_task.await.expect("clone task joined");
+    match result {
+        Ok(_) => {
+            assert!(target.exists(), "successful clone must materialize target");
+            assert_eq!(
+                std::fs::read_to_string(target.join("a.txt")).unwrap_or_default(),
+                "gc race\n",
+                "clone content must be intact"
+            );
+            assert_eq!(
+                std::fs::read_to_string(target.join("b.txt")).unwrap_or_default(),
+                "x\n",
+                "clone content must be intact"
+            );
+        }
+        Err(_) => {
+            assert!(
+                !target.exists(),
+                "failed clone must not leave a partial tree at target"
+            );
+        }
+    }
 
     cleanup_prefix(&env, &prefix).await.expect("cleanup prefix");
     cleanup_repo_refs(&env, "acme", &repo)

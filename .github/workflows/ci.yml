@@ -114,6 +114,45 @@ jobs:
       - name: Postgres + MySQL + libsql (queue + metadata) on real servers
         run: bash scripts/ci.sh databases
 
+  # S3-backed remote GC end-to-end suite against a real MinIO container. These
+  # tests are #[ignored] in the default cargo suite because they need an S3
+  # backend; this job provides one locally and runs them on every PR touching
+  # rust/.
+  s3gc:
+    needs: changes
+    if: ${{ needs.changes.outputs.docker == 'true' }}
+    runs-on: ubuntu-latest
+    services:
+      minio:
+        image: minio/minio:latest
+        env:
+          MINIO_ROOT_USER: minioadmin
+          MINIO_ROOT_PASSWORD: minioadmin
+        ports:
+          - 9000:9000
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache-workspaces: rust
+      - name: Install build deps
+        run: bash scripts/install-build-deps.sh
+      - name: Wait for MinIO and create bucket
+        env:
+          AWS_ACCESS_KEY_ID: minioadmin
+          AWS_SECRET_ACCESS_KEY: minioadmin
+        run: |
+          for i in {1..30}; do
+            if curl -sf http://127.0.0.1:9000/minio/health/live >/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:9000/minio/health/live >/dev/null
+          aws --endpoint-url http://127.0.0.1:9000 --region us-east-1 s3 mb s3://ripclone-test
+      - name: S3 GC e2e against MinIO
+        run: bash scripts/ci.sh s3gc
+
   # Validate the images assemble and the binaries run. The real Dockerfiles use
   # buildkit cargo cache mounts that persist on the Fly/Depot deploy builder but
   # NOT on GitHub-hosted runners, so building them here would recompile ~400
