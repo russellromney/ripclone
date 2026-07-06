@@ -287,6 +287,203 @@ pub async fn start_delay_proxy(target_endpoint: &str, delay: Duration) -> DelayP
     }
 }
 
+/// Deterministic mid-download barrier for signed-URL GETs.
+///
+/// The first presigned GET whose response body is larger than `after_bytes` is
+/// forwarded until exactly `after_bytes` have been sent, then the proxy signals
+/// `entered` and waits on `proceed`. After the test releases the barrier the
+/// proxy either closes the connection (`close_on_proceed = true`) or copies the
+/// remainder (`false`).
+struct BarrierState {
+    after_bytes: usize,
+    close_on_proceed: bool,
+    entered: Option<tokio::sync::oneshot::Sender<()>>,
+    proceed: Option<tokio::sync::oneshot::Receiver<()>>,
+    consumed: std::sync::atomic::AtomicBool,
+}
+
+pub struct BarrierProxy {
+    pub url: String,
+    _handle: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for BarrierProxy {
+    fn drop(&mut self) {
+        self._handle.abort();
+    }
+}
+
+/// Read until the HTTP response header block is complete.
+async fn read_response_header(backend: &mut tokio::net::TcpStream) -> Option<Vec<u8>> {
+    let mut buf = Vec::with_capacity(1024);
+    let mut tmp = [0u8; 1024];
+    loop {
+        let n = backend.read(&mut tmp).await.ok()?;
+        if n == 0 {
+            return None;
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+            return Some(buf);
+        }
+        if buf.len() > 64 * 1024 {
+            return None;
+        }
+    }
+}
+
+async fn proxy_signed_get_barrier(
+    client: &mut tokio::net::TcpStream,
+    target: &str,
+    mut header: Vec<u8>,
+    barrier: Arc<std::sync::Mutex<BarrierState>>,
+) {
+    eprintln!("BARRIER PROXY: signed GET received");
+    let Ok(mut backend) = tokio::net::TcpStream::connect(target).await else {
+        return;
+    };
+    replace_host_header(&mut header, target);
+    force_connection_close(&mut header);
+    if backend.write_all(&header).await.is_err() {
+        return;
+    }
+    let Some(resp_header) = read_response_header(&mut backend).await else {
+        return;
+    };
+    eprintln!("BARRIER PROXY: response header received, forwarding");
+    if client.write_all(&resp_header).await.is_err() {
+        return;
+    }
+
+    let (after_bytes, close_on_proceed, entered, proceed) = {
+        let mut b = barrier.lock().unwrap();
+        if !b.consumed.load(std::sync::atomic::Ordering::SeqCst) {
+            b.consumed.store(true, std::sync::atomic::Ordering::SeqCst);
+            (
+                b.after_bytes,
+                b.close_on_proceed,
+                b.entered.take(),
+                b.proceed.take(),
+            )
+        } else {
+            (usize::MAX, false, None, None)
+        }
+    };
+
+    if entered.is_none() {
+        // Barrier already consumed; just copy the rest.
+        let _ = tokio::io::copy(&mut backend, client).await;
+        return;
+    }
+
+    let mut buf = [0u8; 4096];
+    let mut copied = 0usize;
+    loop {
+        if copied >= after_bytes {
+            break;
+        }
+        let need = after_bytes - copied;
+        let to_read = buf.len().min(need);
+        let n = match backend.read(&mut buf[..to_read]).await {
+            Ok(0) => break,
+            Err(_) => return,
+            Ok(n) => n,
+        };
+        if client.write_all(&buf[..n]).await.is_err() {
+            return;
+        }
+        copied += n;
+    }
+
+    if let Some(entered) = entered {
+        eprintln!("BARRIER PROXY: entered barrier after {copied} bytes");
+        let _ = entered.send(());
+    }
+    let should_continue = if let Some(proceed) = proceed {
+        proceed.await.is_ok() && !close_on_proceed
+    } else {
+        false
+    };
+    if !should_continue {
+        return;
+    }
+
+    loop {
+        match backend.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if client.write_all(&buf[..n]).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+async fn proxy_one_connection_barrier(
+    mut client: tokio::net::TcpStream,
+    target: String,
+    barrier: Arc<std::sync::Mutex<BarrierState>>,
+) {
+    let Some(header) = read_request_header(&mut client).await else {
+        return;
+    };
+
+    if is_signed_get(&header) {
+        proxy_signed_get_barrier(&mut client, &target, header, barrier).await;
+        return;
+    }
+
+    let Ok(mut backend) = tokio::net::TcpStream::connect(&target).await else {
+        return;
+    };
+    if backend.write_all(&header).await.is_err() {
+        return;
+    }
+    let _ = tokio::io::copy_bidirectional(&mut client, &mut backend).await;
+}
+
+pub async fn start_barrier_proxy(
+    target_endpoint: &str,
+    after_bytes: usize,
+    close_on_proceed: bool,
+    entered: tokio::sync::oneshot::Sender<()>,
+    proceed: tokio::sync::oneshot::Receiver<()>,
+) -> BarrierProxy {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind barrier proxy");
+    let port = listener.local_addr().expect("proxy local addr").port();
+    let target = target_host_port(target_endpoint);
+
+    let state = Arc::new(std::sync::Mutex::new(BarrierState {
+        after_bytes,
+        close_on_proceed,
+        entered: Some(entered),
+        proceed: Some(proceed),
+        consumed: std::sync::atomic::AtomicBool::new(false),
+    }));
+
+    let handle = tokio::spawn(async move {
+        loop {
+            let (client, _) = match listener.accept().await {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let state = state.clone();
+            let target = target.clone();
+            tokio::spawn(async move {
+                proxy_one_connection_barrier(client, target, state).await;
+            });
+        }
+    });
+
+    BarrierProxy {
+        url: format!("http://127.0.0.1:{port}"),
+        _handle: handle,
+    }
+}
+
 async fn start_s3_server(env: &S3Env, prefix: &str) -> Server {
     start_s3_server_faulting(env, prefix, 0).await
 }
@@ -741,8 +938,10 @@ async fn remote_gc_dry_run_does_not_delete_on_s3() {
 }
 
 /// Race: RemoteGc with grace=0 must not corrupt a clone that is stalled
-/// mid-chunk by the fault hook. The clone either completes with a correct tree
-/// or fails cleanly without leaving a partial target directory.
+/// mid-chunk. We deterministically stall the first signed-URL GET in a proxy
+/// after it has sent a few bytes, run GC while the download is blocked, then
+/// release the barrier. The clone either completes with a correct tree or fails
+/// cleanly without leaving a partial target directory.
 #[ignore = "requires S3 credentials"]
 #[tokio::test]
 async fn remote_gc_during_faulting_clone_is_safe() {
@@ -757,10 +956,13 @@ async fn remote_gc_during_faulting_clone_is_safe() {
     let suffix = repo_suffix(&prefix);
     let repo = format!("gcrace-{suffix}");
     let mut guard = CleanupGuard::new(env.clone(), prefix.clone());
-    // Fail the first 2 artifact GETs; the clone retries within its default
-    // budget and should recover. GC runs while the clone is stalled on those
-    // retries.
-    let server = start_s3_server_faulting(&env, &prefix, 2).await;
+
+    // Stall the first signed-URL GET mid-body; GC will run while the proxy is
+    // blocked. close_on_proceed=false so the clone can finish after release.
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (proceed_tx, proceed_rx) = tokio::sync::oneshot::channel();
+    let proxy = start_barrier_proxy(&env.endpoint, 16, false, entered_tx, proceed_rx).await;
+    let server = start_s3_server(&env, &prefix).await;
 
     let origin = make_origin("acme", &repo);
     guard.track_repo("acme", &repo);
@@ -773,6 +975,14 @@ async fn remote_gc_during_faulting_clone_is_safe() {
         .await
         .expect("sync");
 
+    // Redirect only the presigned artifact URLs through the barrier proxy.
+    // Serialize editable downloads so the first large signed-URL GET deterministically
+    // hits the barrier rather than racing with other concurrent fetches.
+    unsafe {
+        std::env::set_var("RIPCLONE_TEST_SIGNED_URL_PROXY", &proxy.url);
+        std::env::set_var("RIPCLONE_EDITABLE_DOWNLOAD_CONCURRENCY", "1");
+    }
+
     // Start the clone on a faulting server and let it begin resolving/downloading.
     let client = server.client();
     let repo_path = format!("acme/{repo}");
@@ -783,20 +993,22 @@ async fn remote_gc_during_faulting_clone_is_safe() {
             .install_repo_with_mode_at(
                 &repo_path,
                 "HEAD",
-                None,
+                Some("HEAD"),
                 &target,
-                CloneMode::Files,
-                Some("full"),
+                CloneMode::Editable,
+                Some("shallow"),
                 None,
             )
             .await;
         (result, out, target)
     });
 
-    // Yield briefly so the clone task is scheduled and begins hitting faults,
-    // then run GC with the most aggressive grace possible while the clone is
-    // mid-flight.
-    sleep(Duration::from_millis(200)).await;
+    // Wait until the proxy has forwarded the response headers and a few body
+    // bytes, so we know the clone is truly mid-download before running GC.
+    tokio::time::timeout(Duration::from_secs(30), entered_rx)
+        .await
+        .expect("proxy barrier entered within 30s")
+        .expect("proxy barrier entered");
 
     let storage = make_s3_storage(&env, &prefix).expect("storage");
     let ref_store = make_s3_ref_store(storage.clone());
@@ -811,7 +1023,14 @@ async fn remote_gc_during_faulting_clone_is_safe() {
     let report = gc.run().await.expect("remote gc run during clone");
     eprintln!("GC during clone: {report:?}");
 
+    // Release the barrier and let the clone finish (or fail cleanly).
+    proceed_tx.send(()).expect("release barrier");
+
     let (result, _out, target) = clone_task.await.expect("clone task joined");
+    unsafe {
+        std::env::remove_var("RIPCLONE_TEST_SIGNED_URL_PROXY");
+        std::env::remove_var("RIPCLONE_EDITABLE_DOWNLOAD_CONCURRENCY");
+    }
     match result {
         Ok(_) => {
             assert!(target.exists(), "successful clone must materialize target");
