@@ -18,7 +18,7 @@ This file tracks what has already landed in ripclone. For upcoming work see `ROA
 
 ## Benchmark harness
 
-- **`benchmark/fly_shaped_benchmark.sh`** now prints the resolved commit in its header instead of `commit=latest`, and prefers `RIPCLONE_SERVER_TOKEN` (falling back to the deprecated `RIPCLONE_TOKEN`).
+- **`benchmark/fly_shaped_benchmark.sh`** now prints the resolved commit in its header instead of `commit=latest`, and prefers `RIPCLONE_SERVER_TOKEN`.
 - Documentation and example workflow updated to use `RIPCLONE_SERVER_TOKEN` consistently.
 
 ## Sync / ref-store correctness
@@ -90,7 +90,7 @@ This file tracks what has already landed in ripclone. For upcoming work see `ROA
 - **io_uring is now the default worktree writer on Linux** (`rust/src/worktree_writer.rs`)
   - With `RIPCLONE_IO_URING` unset, the writer uses io_uring on Linux (auto mode: falls back to POSIX if the kernel lacks support); other platforms stay POSIX. Set `RIPCLONE_IO_URING=0` to force POSIX. Real-clone A/B on Fly `/data` showed io_uring faster-or-equal vs POSIX on dedicated cores.
 - **Graceful fallback when a ring can't be allocated** (`rust/src/worktree_writer.rs`): auto mode previously fell back to POSIX only when the *kernel* lacked io_uring support. Per-thread rings are created lazily at write time, so under heavy parallelism (many concurrent clones, or the test suite) ring creation could fail with `ENOMEM`/the locked-memory rlimit *after* startup and hard-fail the clone. Now any ring-creation failure disables io_uring for the rest of the run and the writer degrades to POSIX instead of failing; threads that already hold a working ring keep using it so deferred writes still flush.
-- **Tunable per-thread ring overlap depth** via `RIPCLONE_IO_URING_DEPTH` (default 2). Throttled/shared CPUs can set `=3` for ~10% on the write phase; dedicated cores are best at 2.
+- **Tunable per-thread ring overlap depth** via `the fixed io_uring overlap depth` (default 2). Throttled/shared CPUs can set `=3` for ~10% on the write phase; dedicated cores are best at 2.
 - An opt-in submitter-pool scheduler (`RIPCLONE_IO_URING_SCHEDULER`) was prototyped and rejected — see `docs/WRITER_SCHEDULER_EXPERIMENT.md`. Superseded by the depth knob and slated for removal.
 
 ## Shallow/full clonepacks, archive chunk sizing, and sync depth
@@ -257,9 +257,9 @@ This file tracks what has already landed in ripclone. For upcoming work see `ROA
 ## Client auth and cache cleanup
 
 - **Pre-hashed token support** (`rust/src/bin/cli.rs`, `rust/src/bin/git-remote-ripclone.rs`)
-  - Added `RIPCLONE_TOKEN_HASH` env var so CI and 1Password users can provide the
+  - Added `RIPCLONE_SERVER_TOKEN_HASH` env var so CI and 1Password users can provide the
     SHA-256 hash directly instead of the raw secret.
-  - `RIPCLONE_TOKEN` is still hashed before sending.
+  - `RIPCLONE_SERVER_TOKEN` is still hashed before sending.
 
 - **Opt-in local cache** (`rust/src/client.rs`, `docs/BACKENDS.md`)
   - Removed the default `~/.cache/ripclone` artifact cache.
@@ -318,7 +318,7 @@ This file tracks what has already landed in ripclone. For upcoming work see `ROA
 ## Server hardening (auth, metrics, rate limiting)
 
 - **Token auth** (`rust/src/server.rs`)
-  - Optional `RIPCLONE_TOKEN` env var on the server. If set, all non-health
+  - Optional `RIPCLONE_SERVER_TOKEN` env var on the server. If set, all non-health
     endpoints require `Authorization: Ripclone <sha256(token)>`.
   - Both server and client hash the raw token with SHA-256 once at startup/login
     so the hash, not the raw secret, travels on the wire.
@@ -348,7 +348,7 @@ This file tracks what has already landed in ripclone. For upcoming work see `ROA
     local object database so `git clone` can finish with its normal checkout.
   - Runs a local `git upload-pack` against the seeded repo so the rest of the
     clone is a normal git transport.
-  - Reads `RIPCLONE_URL` and hashes `RIPCLONE_TOKEN` with SHA-256 before
+  - Reads `RIPCLONE_SERVER` and hashes `RIPCLONE_SERVER_TOKEN` with SHA-256 before
     sending it in the `Authorization` header.
 
 - **`Client` additions** (`rust/src/client.rs`)

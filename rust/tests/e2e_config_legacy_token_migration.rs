@@ -43,7 +43,7 @@ async fn legacy_config_json_token_still_authenticates() {
             .arg("acme/migrate")
             .current_dir(cwd.path())
             .env("HOME", home.path())
-            // Intentionally do NOT set RIPCLONE_SERVER or RIPCLONE_TOKEN.
+            // Intentionally do NOT set RIPCLONE_SERVER or RIPCLONE_SERVER_TOKEN.
             // The CLI must read both from the legacy+new config files.
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())

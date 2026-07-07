@@ -30,8 +30,7 @@ identity stays in `ripclone-cloud`).
 `ripclone auth logout` removes the saved token; `ripclone auth status` shows
 whether one is saved and when it expires.
 
-Precedence: an explicit env server token (`RIPCLONE_SERVER_TOKEN[_HASH]`,
-`RIPCLONE_TOKEN[_HASH]`) always wins; otherwise a valid saved session token is
+Precedence: an explicit env server token (`RIPCLONE_SERVER_TOKEN[_HASH]`) always wins; otherwise a valid saved session token is
 preferred over the saved login token.
 
 ## Signing key

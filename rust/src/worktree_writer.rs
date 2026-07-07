@@ -932,7 +932,7 @@ mod linux_uring {
     thread_local! {
         static THREAD_WRITER: RefCell<Option<RawUringWriter>> = const { RefCell::new(None) };
         // Desired per-ring overlap depth for the *next* ring created on this
-        // thread. Callers tune it via `RIPCLONE_IO_URING_DEPTH`; the default (2)
+        // thread. The default overlap depth is 2.
         // preserves the established double-buffered behavior.
         static DESIRED_INFLIGHT: std::cell::Cell<usize> = const { std::cell::Cell::new(2) };
     }
@@ -1119,11 +1119,7 @@ mod linux_uring {
             // CQ than requested, this keeps us from ever overflowing it.
             let cq_window_capacity =
                 (ring.params().cq_entries() as usize / (MAX_BATCH_FILES * 4)).max(1);
-            // `RIPCLONE_IO_URING_DEPTH` overrides the thread-local default depth.
-            let desired = std::env::var("RIPCLONE_IO_URING_DEPTH")
-                .ok()
-                .and_then(|v| v.trim().parse::<usize>().ok())
-                .unwrap_or_else(|| DESIRED_INFLIGHT.with(|c| c.get()));
+            let desired = DESIRED_INFLIGHT.with(|c| c.get());
             let max_inflight = desired
                 .clamp(1, MAX_INFLIGHT_WINDOWS)
                 .min(cq_window_capacity);
@@ -1140,11 +1136,7 @@ mod linux_uring {
         }
 
         fn new_ring() -> io::Result<IoUring> {
-            let use_sqpoll = std::env::var("RIPCLONE_IO_URING_SQPOLL")
-                .ok()
-                .is_some_and(|value| {
-                    matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES")
-                });
+            let use_sqpoll = false;
             if use_sqpoll {
                 let mut builder = IoUring::builder();
                 builder.setup_sqpoll(1_000).setup_cqsize(CQ_ENTRIES);

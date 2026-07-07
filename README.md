@@ -167,7 +167,7 @@ cargo run --release --bin ripclone -- worktree ../bun-wt -b HEAD
 
 ## GitHub Actions trigger
 
-Add a workflow to a repo so ripclone builds artifacts on every push. Set `RIPCLONE_URL` as a repository variable and `RIPCLONE_SERVER_TOKEN` as a repository secret. (A ready-to-copy version lives in [`docs/examples/github-actions-trigger.yml`](docs/examples/github-actions-trigger.yml).)
+Add a workflow to a repo so ripclone builds artifacts on every push. Set `RIPCLONE_SERVER` as a repository variable and `RIPCLONE_SERVER_TOKEN` as a repository secret. (A ready-to-copy version lives in [`docs/examples/github-actions-trigger.yml`](docs/examples/github-actions-trigger.yml).)
 
 ```yaml
 name: ripclone cache
@@ -180,7 +180,7 @@ jobs:
         run: |
           curl -fsSL -X POST \
             -H "Authorization: Ripclone ${{ secrets.RIPCLONE_SERVER_TOKEN }}" \
-            "${{ vars.RIPCLONE_URL }}/v1/repos/github/${{ github.repository_owner }}/${{ github.event.repository.name }}/sync"
+            "${{ vars.RIPCLONE_SERVER }}/v1/repos/github/${{ github.repository_owner }}/${{ github.event.repository.name }}/sync"
 ```
 
 The `github` in the path is the provider instance (see [Providers](#providers)). For private repos the server needs read access to the upstream — configure a token for the provider, or pass one per request in the `X-Upstream-Token` header.
@@ -321,10 +321,8 @@ cargo build --release --no-default-features
 
 Environment variables for tuning clone performance:
 
-- `RIPCLONE_FETCH_CONCURRENCY` — max concurrent chunk downloads (default 6).
-- `RIPCLONE_FETCH_THREADS` / `RIPCLONE_WRITE_THREADS` — thread counts for archive extraction.
 - `RIPCLONE_FETCH_MAX_ATTEMPTS` / `RIPCLONE_FETCH_BACKOFF_MS` — retry budget and base backoff for transient download failures (defaults 3 and 100).
-- `RIPCLONE_IO_URING` — the worktree writer uses io_uring by default on Linux; set `=0` to force the POSIX writer. `RIPCLONE_IO_URING_DEPTH` (default 2) tunes per-thread ring overlap.
+- `RIPCLONE_IO_URING` — the worktree writer uses io_uring by default on Linux; set `=0` to force the POSIX writer.
 - `RIPCLONE_MODE` — default clone mode (`editable` or `files`) when `--mode` is omitted.
 - `RIPCLONE_CACHE_DIR` / `RIPCLONE_NO_CACHE` — opt in to (or force off) a local artifact cache; off by default.
 

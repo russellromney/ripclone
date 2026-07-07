@@ -2,7 +2,7 @@
 # artifacts on every push.
 #
 # Set these in the *consumer* repo:
-#   - Repository variable: RIPCLONE_URL (e.g. https://ripclone.example.com)
+#   - Repository variable: RIPCLONE_SERVER (e.g. https://ripclone.example.com)
 #   - Repository secret:   RIPCLONE_SERVER_TOKEN (the SHA-256 hash of the token
 #                          configured on the ripclone server)
 #
@@ -24,4 +24,4 @@ jobs:
         run: |
           curl -fsSL -X POST \
             -H "Authorization: Ripclone ${{ secrets.RIPCLONE_SERVER_TOKEN }}" \
-            "${{ vars.RIPCLONE_URL }}/v1/repos/${{ github.repository_owner }}/${{ github.event.repository.name }}/sync"
+            "${{ vars.RIPCLONE_SERVER }}/v1/repos/${{ github.repository_owner }}/${{ github.event.repository.name }}/sync"

@@ -1,7 +1,7 @@
 #!/bin/bash
 set -uo pipefail
 
-SERVER="${RIPCLONE_URL:-https://ripclone.fly.dev}"
+SERVER="${RIPCLONE_SERVER:-https://ripclone.fly.dev}"
 REPO="${REPO:-oven-sh/bun}"
 
 # Self-heal: install any runtime libs that are not baked into the image.
@@ -9,10 +9,10 @@ apt-get update -qq >/dev/null 2>&1 || true
 apt-get install -y -qq libfuse2 libssl3t64 libgit2-1.7 time git ca-certificates coreutils >/dev/null 2>&1 || true
 
 export PATH="/usr/local/bin:$PATH"
-export RIPCLONE_URL="$SERVER"
+export RIPCLONE_SERVER="$SERVER"
 export RUST_LOG="${RUST_LOG:-info}"
 
-TOKEN_HASH=$(printf '%s' "${RIPCLONE_SERVER_TOKEN:-${RIPCLONE_TOKEN:-}}" | sha256sum | awk '{print $1}')
+TOKEN_HASH=$(printf '%s' "${RIPCLONE_SERVER_TOKEN:-}" | sha256sum | awk '{print $1}')
 
 # Clean up any leftover overlay mounts from previous runs so rm -rf does not
 # fail with EBUSY, and free tmpfs staging directories so each run starts with

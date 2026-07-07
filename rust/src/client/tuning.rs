@@ -12,22 +12,17 @@ impl ClientTuning {
             .map(|n| n.get())
             .unwrap_or(4)
             .max(1);
-        let fetch_concurrency = env_usize("RIPCLONE_FETCH_CONCURRENCY", 6);
-        let archive_fetch_concurrency = env_usize_any(
-            &[
-                "RIPCLONE_ARCHIVE_FETCH_CONCURRENCY",
-                "RIPCLONE_FETCH_CONCURRENCY",
-            ],
-            16,
-        );
-        let editable_download_concurrency = env_usize_any(
-            &[
-                "RIPCLONE_EDITABLE_DOWNLOAD_CONCURRENCY",
-                "RIPCLONE_FETCH_CONCURRENCY",
-            ],
-            cores,
-        );
-        let pack_parse_threads = env_usize("RIPCLONE_PACK_PARSE_THREADS", cores);
+        let fetch_concurrency = 6;
+        let archive_fetch_concurrency = 16;
+        // Test hook: force serial downloads so a barrier-based test can pin the
+        // race window deterministically. Never set in production (the default is
+        // one download per core).
+        let editable_download_concurrency = std::env::var("RIPCLONE_TEST_DOWNLOAD_CONCURRENCY")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(cores);
+        let pack_parse_threads = cores;
         tracing::debug!(
             fetch_concurrency,
             archive_fetch_concurrency,
@@ -42,20 +37,4 @@ impl ClientTuning {
             pack_parse_threads,
         }
     }
-}
-
-fn env_usize(key: &str, default: usize) -> usize {
-    env_usize_any(&[key], default)
-}
-
-fn env_usize_any(keys: &[&str], default: usize) -> usize {
-    keys.iter()
-        .find_map(|key| {
-            std::env::var(key)
-                .ok()
-                .and_then(|s| s.parse::<usize>().ok())
-                .filter(|&n| n > 0)
-        })
-        .unwrap_or(default)
-        .max(1)
 }

@@ -1027,7 +1027,7 @@ async fn remote_gc_during_faulting_clone_is_safe() {
     // hits the barrier rather than racing with other concurrent fetches.
     unsafe {
         std::env::set_var("RIPCLONE_TEST_SIGNED_URL_PROXY", &proxy.url);
-        std::env::set_var("RIPCLONE_EDITABLE_DOWNLOAD_CONCURRENCY", "1");
+        std::env::set_var("RIPCLONE_TEST_DOWNLOAD_CONCURRENCY", "1");
     }
 
     // Start the clone on a faulting server and let it begin resolving/downloading.
@@ -1077,7 +1077,7 @@ async fn remote_gc_during_faulting_clone_is_safe() {
     let (result, _out, target) = clone_task.await.expect("clone task joined");
     unsafe {
         std::env::remove_var("RIPCLONE_TEST_SIGNED_URL_PROXY");
-        std::env::remove_var("RIPCLONE_EDITABLE_DOWNLOAD_CONCURRENCY");
+        std::env::remove_var("RIPCLONE_TEST_DOWNLOAD_CONCURRENCY");
     }
     match result {
         Ok(_) => {
@@ -1152,7 +1152,7 @@ async fn expired_signed_url_fails_clone_cleanly() {
     // Redirect only the presigned URLs through the delay proxy.
     unsafe {
         std::env::set_var("RIPCLONE_SIGNED_URL_TTL_SECS", "1");
-        std::env::set_var("RIPCLONE_EDITABLE_DOWNLOAD_CONCURRENCY", "1");
+        std::env::set_var("RIPCLONE_TEST_DOWNLOAD_CONCURRENCY", "1");
         std::env::set_var("RIPCLONE_TEST_SIGNED_URL_PROXY", &proxy.url);
     }
 
@@ -1172,7 +1172,7 @@ async fn expired_signed_url_fails_clone_cleanly() {
         .await;
     unsafe {
         std::env::remove_var("RIPCLONE_SIGNED_URL_TTL_SECS");
-        std::env::remove_var("RIPCLONE_EDITABLE_DOWNLOAD_CONCURRENCY");
+        std::env::remove_var("RIPCLONE_TEST_DOWNLOAD_CONCURRENCY");
         std::env::remove_var("RIPCLONE_TEST_SIGNED_URL_PROXY");
     }
 

@@ -123,7 +123,7 @@ pub struct ServerState {
     /// redundant `git fetch` on the resolve hot path when the mirror is fresh.
     pub mirror_freshness: Arc<std::sync::Mutex<HashMap<String, Instant>>>,
     /// How long a mirror fetch stays "fresh". Resolves within this window skip
-    /// the fetch (`RIPCLONE_MIRROR_FRESH_TTL_SECS`, default 60s).
+    /// the fetch (default 60s).
     pub mirror_fresh_ttl: Duration,
     /// Short-lived cache of complete ref responses, including signed URLs.
     /// This smooths repeated clone startup latency when signing or ref-store
@@ -2292,18 +2292,25 @@ async fn get_ref_inner(
 /// direct-to-storage path that bypasses the gateway. The cloud gateway tags the
 /// request with `X-Ripclone-Visibility`; absent (e.g. a self-hosted client
 /// talking to the backend directly) means the public TTL, but an unrecognized
-/// value fails closed to the private TTL. Both are env-tunable.
+/// value fails closed to the private TTL.
 const REF_SIGNED_URL_TTL_PUBLIC_SECS: u64 = 1200;
 const REF_SIGNED_URL_TTL_PRIVATE_SECS: u64 = 300;
 
+fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+}
+
 fn ref_signed_url_ttl(private: bool) -> Duration {
     if private {
-        Duration::from_secs(env_bytes(
+        Duration::from_secs(env_u64(
             "RIPCLONE_SIGNED_URL_TTL_PRIVATE_SECS",
             REF_SIGNED_URL_TTL_PRIVATE_SECS,
         ))
     } else {
-        Duration::from_secs(env_bytes(
+        Duration::from_secs(env_u64(
             "RIPCLONE_SIGNED_URL_TTL_SECS",
             REF_SIGNED_URL_TTL_PUBLIC_SECS,
         ))
@@ -2794,11 +2801,11 @@ async fn sync_repo_inner(
     // Async build queue: enqueue the build onto the bounded background worker so
     // it survives client disconnect / HTTP timeout (the key win for huge repos)
     // and is rate-bounded under load. Coalesce concurrent `/sync` for the same
-    // key onto one build, wait up to RIPCLONE_SYNC_WAIT_SECS, then 202.
+    // key onto one build, wait briefly, then 202.
     // Keep this comfortably under edge/proxy request timeouts (e.g. Fly's
     // ~60s): on a long build we return 202 and let the client retry, rather
     // than holding the connection until it is reset mid-request.
-    let wait = Duration::from_secs(env_bytes("RIPCLONE_SYNC_WAIT_SECS", 25));
+    let wait = Duration::from_secs(25);
 
     if state.build_queue.inproc_wait() {
         // In-process queue: coalesce via build_waiters; the same-process
@@ -4237,13 +4244,6 @@ fn sized_to_tuple(p: &crate::SizedPack) -> (String, u64, String, u64) {
     (p.pack.clone(), p.pack_len, p.idx.clone(), p.idx_len)
 }
 
-fn env_bytes(key: &str, default: u64) -> u64 {
-    std::env::var(key)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
-
 /// LSM incremental-history configuration.
 struct LsmConfig {
     /// When on, only the tail past the last sealed level is built each sync;
@@ -4502,19 +4502,11 @@ fn archive_chunk_refs(
         .collect()
 }
 
-/// Concurrency for artifact uploads. Defaults to 2x CPU cores — connection
-/// reuse makes high concurrency cheap, so scale it to the machine — overridable
-/// with `RIPCLONE_UPLOAD_CONCURRENCY`.
+/// Concurrency for artifact uploads. Defaults to 2x CPU cores.
 fn upload_concurrency() -> usize {
-    std::env::var("RIPCLONE_UPLOAD_CONCURRENCY")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map(|n| n.get() * 2)
-                .unwrap_or(8)
-        })
+    std::thread::available_parallelism()
+        .map(|n| n.get() * 2)
+        .unwrap_or(8)
         .max(1)
 }
 
@@ -4951,7 +4943,7 @@ async fn build_and_publish_two_phase(
     mut phases: SyncPhases,
     phase2_failure: Option<Phase2FailureAction>,
 ) -> Result<SyncBuildResult> {
-    let history_target = env_bytes("RIPCLONE_HISTORY_PACK_BYTES", 512 * 1024 * 1024);
+    let history_target = 512 * 1024 * 1024;
     let upload_conc = upload_concurrency();
 
     // Load the previous synced ref once: used both for the files-table by-diff
@@ -4990,7 +4982,7 @@ async fn build_and_publish_two_phase(
     // packs the full closure as the base. The cumulative delta grows as HEAD moves
     // from the base; phase 2 rebases (rebuilds the base at HEAD) once it exceeds
     // RIPCLONE_HEAD_REBASE_BYTES, off the depth=1 critical path.
-    let head_target = env_bytes("RIPCLONE_PACK_BYTES", 4 * 1024 * 1024);
+    let head_target = 4 * 1024 * 1024;
     let prev_base_commit: Option<String> = prev
         .as_ref()
         .map(|p| p.head_base_commit.clone())
@@ -5583,19 +5575,7 @@ async fn build_full_in_background(
     } else {
         None
     };
-    let archive_bundle_size = env_bytes(
-        "RIPCLONE_ARCHIVE_BUNDLE_BYTES",
-        crate::archive::DEFAULT_ARCHIVE_CHUNK_SIZE,
-    );
-    let archive_bundle_size = if archive_bundle_size == 0 {
-        warn!(
-            "RIPCLONE_ARCHIVE_BUNDLE_BYTES=0 is invalid; using default {}",
-            crate::archive::DEFAULT_ARCHIVE_CHUNK_SIZE
-        );
-        crate::archive::DEFAULT_ARCHIVE_CHUNK_SIZE
-    } else {
-        archive_bundle_size
-    };
+    let archive_bundle_size = crate::archive::DEFAULT_ARCHIVE_CHUNK_SIZE;
 
     // Write a reachability bitmap once, before the heavy full enumerations
     // (skeleton + history). This is in the background phase, so it never delays
@@ -5680,7 +5660,7 @@ async fn build_full_in_background(
     // Once the cumulative delta grows past the threshold, rebuild a fresh base at
     // the current commit. depth=1 is already live, so this never blocks a clone.
     // The fresh base is kept only if the ref still points at our commit.
-    let rebase_bytes = env_bytes("RIPCLONE_HEAD_REBASE_BYTES", 128 * 1024 * 1024);
+    let rebase_bytes = env_u64("RIPCLONE_HEAD_REBASE_BYTES", 128 * 1024 * 1024);
     let delta_bytes: u64 = head_packs
         .iter()
         .skip(head_base_pack_count)
@@ -5691,7 +5671,7 @@ async fn build_full_in_background(
         Vec<(String, u64, String, u64)>,
         Option<Vec<crate::SizedPack>>,
     ) = if delta_bytes >= rebase_bytes {
-        let head_target = env_bytes("RIPCLONE_PACK_BYTES", 4 * 1024 * 1024);
+        let head_target = 4 * 1024 * 1024;
         let (mdc, cc, cmc) = (mirror_dir.to_path_buf(), cas.clone(), commit.to_string());
         let base = tokio::task::spawn_blocking(move || {
             PackBuilder::new(&mdc, &cc).build_head_packs(&cmc, head_target)
@@ -6352,19 +6332,10 @@ fn build_concurrency() -> usize {
 
 /// Process-global cap on concurrent upstream fetches/clones. Separate from — and
 /// usually a touch larger than — the build cap: a fetch is network/upstream
-/// bound, a build is CPU bound, so they throttle independently. Bounding fetches
-/// keeps us from saturating bandwidth or tripping upstream (GitHub) abuse limits
-/// when many repos sync at once. Override with `RIPCLONE_FETCH_CONCURRENCY`.
+/// bound, a build is CPU bound, so they throttle independently.
 fn fetch_semaphore() -> &'static tokio::sync::Semaphore {
     static SEM: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
-    SEM.get_or_init(|| {
-        let n = std::env::var("RIPCLONE_FETCH_CONCURRENCY")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or(4);
-        tokio::sync::Semaphore::new(n)
-    })
+    SEM.get_or_init(|| tokio::sync::Semaphore::new(4))
 }
 
 /// Spawn the in-process worker loop for the local queue. Up to
@@ -6586,8 +6557,6 @@ fn auth_token_hash(raw: Option<String>) -> Result<String> {
 /// Precedence:
 ///   1. RIPCLONE_SERVER_TOKEN_HASH (already hashed)
 ///   2. RIPCLONE_SERVER_TOKEN (raw)
-///   3. RIPCLONE_TOKEN_HASH (deprecated, already hashed)
-///   4. RIPCLONE_TOKEN (deprecated, raw)
 fn read_server_auth_token() -> Result<String> {
     if let Some(hash) = env::var("RIPCLONE_SERVER_TOKEN_HASH")
         .ok()
@@ -6599,21 +6568,6 @@ fn read_server_auth_token() -> Result<String> {
         .ok()
         .filter(|t| !t.is_empty())
     {
-        return Ok(hex::encode(Sha256::digest(raw.as_bytes())));
-    }
-    if let Some(hash) = env::var("RIPCLONE_TOKEN_HASH")
-        .ok()
-        .filter(|t| !t.is_empty())
-    {
-        eprintln!(
-            "warning: RIPCLONE_TOKEN_HASH is deprecated for server auth; use RIPCLONE_SERVER_TOKEN_HASH"
-        );
-        return Ok(hash);
-    }
-    if let Some(raw) = env::var("RIPCLONE_TOKEN").ok().filter(|t| !t.is_empty()) {
-        eprintln!(
-            "warning: RIPCLONE_TOKEN is deprecated for server auth; use RIPCLONE_SERVER_TOKEN"
-        );
         return Ok(hex::encode(Sha256::digest(raw.as_bytes())));
     }
     auth_token_hash(None)
@@ -6637,8 +6591,7 @@ pub async fn run_server_with_barrier(
     // when only the hash is configured, so we never sign with client-known material.
     let raw_server_token = env::var("RIPCLONE_SERVER_TOKEN")
         .ok()
-        .filter(|t| !t.is_empty())
-        .or_else(|| env::var("RIPCLONE_TOKEN").ok().filter(|t| !t.is_empty()));
+        .filter(|t| !t.is_empty());
     let jwt = crate::auth::jwt::JwtKeys::from_env(raw_server_token.as_deref()).map(Arc::new);
     if jwt.is_some() {
         info!("session tokens enabled: `ripclone auth login` issues short-lived JWTs");
@@ -6745,12 +6698,7 @@ pub async fn run_server_with_barrier(
         webhook_config,
         sync_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         mirror_freshness: Arc::new(std::sync::Mutex::new(HashMap::new())),
-        mirror_fresh_ttl: Duration::from_secs(
-            env::var("RIPCLONE_MIRROR_FRESH_TTL_SECS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(60),
-        ),
+        mirror_fresh_ttl: Duration::from_secs(60),
         ref_response_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
         artifact_fetch_count: Arc::new(AtomicUsize::new(0)),
         fail_first_fetches: fail_first_fetches_from_env(),
@@ -7114,8 +7062,6 @@ mod tests {
     fn read_server_auth_token_prefers_new_env_vars() {
         // Clean deprecated vars.
         unsafe {
-            env::remove_var("RIPCLONE_TOKEN");
-            env::remove_var("RIPCLONE_TOKEN_HASH");
             env::remove_var("RIPCLONE_SERVER_TOKEN");
             env::remove_var("RIPCLONE_SERVER_TOKEN_HASH");
         }

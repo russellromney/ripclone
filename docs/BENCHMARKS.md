@@ -37,14 +37,14 @@ That’s **~10× faster than `git clone`** for the full history at 5 Gbps, and *
 
 ```bash
 # Full Fly launch sweep, 3 runs per cell.
-RIPCLONE_URL=https://ripclone-server-dev.fly.dev \
+RIPCLONE_SERVER=https://ripclone-server-dev.fly.dev \
 RIPCLONE_SERVER_TOKEN=... \
 ./benchmark/run_shaped_sweep.sh "oven-sh/bun pandas-dev/pandas" "250 500 1000" 3
 
 # Faster 3-rate sweep for pandas, pinned to the v2.2.2 commit.
 # GIT_REF tells the native-git baseline which tag to clone.
 BENCH_REF=d9cdd2ee5a58015ef6f4d15c7226110c9aab8140 GIT_REF=v2.2.2 \
-RIPCLONE_URL=https://ripclone-server-dev.fly.dev \
+RIPCLONE_SERVER=https://ripclone-server-dev.fly.dev \
 RIPCLONE_SERVER_TOKEN=... \
 ./benchmark/run_shaped_sweep.sh "pandas-dev/pandas" "250 500 1000" 1
 ```

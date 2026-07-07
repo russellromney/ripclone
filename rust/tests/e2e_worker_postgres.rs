@@ -21,7 +21,7 @@ async fn worker_farm_out_postgres() {
     unsafe {
         std::env::set_var("RIPCLONE_QUEUE", "postgres");
         std::env::set_var("RIPCLONE_QUEUE_DB_URL", &url);
-        std::env::set_var("RIPCLONE_SYNC_MAX_ATTEMPTS", "8");
+        std::env::set_var("RIPCLONE_TEST_SYNC_MAX_ATTEMPTS", "8");
     }
     init(false);
 

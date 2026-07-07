@@ -69,11 +69,7 @@ pub struct HttpAccessVerifier {
 
 impl HttpAccessVerifier {
     pub fn new() -> Self {
-        let ttl = std::env::var("RIPCLONE_REPO_AUTH_TTL_SECS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .map(Duration::from_secs)
-            .unwrap_or(Duration::from_secs(60));
+        let ttl = Duration::from_secs(60);
         let client = reqwest::ClientBuilder::new()
             .timeout(Duration::from_secs(10))
             .build()

@@ -57,7 +57,7 @@ if ! curl -fsS "$SERVER_URL/healthz" >/dev/null 2>&1; then
   exit 1
 fi
 
-export RIPCLONE_URL="$SERVER_URL"
+export RIPCLONE_SERVER="$SERVER_URL"
 export PATH="$ROOT_DIR/rust/target/release:$PATH"
 
 echo "==> Syncing mirror and building artifacts (one-time)..."
