@@ -12,7 +12,7 @@ keep/flag/cut decisions are left to Fable + Russell.
 ## Pre-flagged decisions
 
 | `ripclone worktree` add | turbogit | README.md | no | **Flagged**: writes in place with no temp-dir staging and no chunk-fetch retry; an interrupt leaves an unrecoverable half-repo.  See `client.rs` worktree path. |
-| Empty-repo clone | turbogit | docs/ROADMAP.md §11 notes unsupported | no | **Flagged**: returns a bare 404 at resolve.  If kept unsupported, the error must say "repository has no commits" instead of a generic 404. |
+| Empty-repo clone | turbogit | docs/internal/ROADMAP.md §11 notes unsupported | no | **Flagged**: returns a bare 404 at resolve.  If kept unsupported, the error must say "repository has no commits" instead of a generic 404. |
 
 ## turbogit — CLI / binaries
 
@@ -40,7 +40,7 @@ keep/flag/cut decisions are left to Fable + Russell.
 | `ripclone-worker` (`--cas-dir`, `--repo-root`, `--idle-poll-ms`) | turbogit | docs/BACKENDS.md, ripclone-worker.rs doc comments | yes (`e2e_worker_*.rs`, `e2e_farmout_concurrency.rs`) | Claims jobs from SQL queue. |
 | `git-remote-ripclone` | turbogit | README.md | yes (`e2e_remote_helper.rs`) | Supports `capabilities`, `list`, `option`, `connect git-upload-pack`; push rejected. |
 | `ripclone-proxy` (`listen`, `upstream`, `latency`, `bandwidth_mbps`, `--forward-auth`) | turbogit | not in README | no (`benchmark/latency_proxy.py`) | Latency/bandwidth shaping proxy for tests. |
-| `writer_bench` | turbogit | docs/WRITER_SCHEDULER_EXPERIMENT.md | no | Internal writer benchmark binary. |
+| `writer_bench` | turbogit | docs/internal/WRITER_SCHEDULER_EXPERIMENT.md | no | Internal writer benchmark binary. |
 
 ## turbogit — environment variables
 
@@ -73,7 +73,7 @@ keep/flag/cut decisions are left to Fable + Russell.
 | `RIPCLONE_POLL_INTERVAL_SECS` | turbogit | README.md | yes (`e2e_freshness.rs`) | Polling fallback interval. |
 | `RIPCLONE_MIRROR_FRESH_TTL_SECS` | turbogit | docs/BACKENDS.md | yes (`e2e_freshness.rs`) | Mirror freshness TTL. |
 | `RIPCLONE_IO_URING` / `RIPCLONE_IO_URING_DEPTH` / `RIPCLONE_IO_URING_SQPOLL` | turbogit | README.md / not documented / not documented | no | Linux io_uring writer controls. |
-| `RIPCLONE_IO_URING_SCHEDULER` and related knobs | turbogit | docs/WRITER_SCHEDULER_EXPERIMENT.md | no | Deprecated scheduler flags. |
+| `RIPCLONE_IO_URING_SCHEDULER` and related knobs | turbogit | docs/internal/WRITER_SCHEDULER_EXPERIMENT.md | no | Deprecated scheduler flags. |
 | `RIPCLONE_PACK_BYTES` / `RIPCLONE_HEAD_REBASE_BYTES` / `RIPCLONE_HISTORY_PACK_BYTES` / `RIPCLONE_HISTORY_MAX_PACK_BYTES` | turbogit | not documented | no | Pack sizing thresholds. |
 | `RIPCLONE_ARCHIVE_BUNDLE_BYTES` / `RIPCLONE_ARCHIVE_BOUNDED` / `RIPCLONE_ARCHIVE_BOUNDED_MAX_BYTES` | turbogit | not documented | yes (`archive_bounded.rs`) | Archive build controls. |
 | `RIPCLONE_LSM` / `RIPCLONE_LSM_MAX_LEVELS` | turbogit | not documented | yes (`e2e_lsm.rs`) | LSM-style history packs. |
@@ -95,7 +95,7 @@ keep/flag/cut decisions are left to Fable + Russell.
 | `RIPCLONE_TEST_FAIL_FIRST_FETCHES` / `RIPCLONE_TEST_ARCHIVE_DELAY_MS` / `RIPCLONE_TEST_PG_URL` / `RIPCLONE_TEST_MYSQL_URL` | turbogit | not documented | yes (`e2e_freshness.rs`, metadata tests) | Test-only hooks. |
 | `RIPCLONE_PROVIDERS` | turbogit | README.md, docs/BACKENDS.md | yes (`e2e_multi_provider.rs`, `e2e_provider_cli.rs`) | Object-form JSON provider config. |
 | `RIPCLONE_GITHUB_TOKEN` | turbogit | docs/BACKENDS.md | yes (`provider_config::tests`) | Legacy GitHub-default shortcut when no configured GitHub token exists. |
-| GitHub App env vars (`RIPCLONE_GITHUB_APP_ID`, `INSTALLATION_ID`, `PRIVATE_KEY`, `PRIVATE_KEY_PATH`, `API_BASE`) | turbogit | docs/GITHUB_INTEGRATION.md | no (marked `#[ignore]`) | GitHub App token minting. |
+| GitHub App env vars (`RIPCLONE_GITHUB_APP_ID`, `INSTALLATION_ID`, `PRIVATE_KEY`, `PRIVATE_KEY_PATH`, `API_BASE`) | turbogit | docs/internal/GITHUB_INTEGRATION.md | no (marked `#[ignore]`) | GitHub App token minting. |
 
 ## turbogit — HTTP API endpoints
 

@@ -115,12 +115,12 @@ by the fetch-concurrency semaphore plus the bounded channel — not the chunk co
 Writer overlap depth is tunable via `the fixed io_uring overlap depth` (default 2; set 3
 on throttled/shared CPUs for ~10%). We are **not** pursuing a work-stealing
 writer or the dedicated submitter-pool scheduler — see
-[docs/WRITER_SCHEDULER_EXPERIMENT.md](docs/WRITER_SCHEDULER_EXPERIMENT.md) for
+[WRITER_SCHEDULER_EXPERIMENT.md](WRITER_SCHEDULER_EXPERIMENT.md) for
 the A/B data and reasoning.
 
 ### 4. User-facing clone modes ✅
 
-Implemented as `--mode full|fast|hybrid|skeleton` and `RIPCLONE_MODE`. See `CHANGELOG.md` for details.
+Implemented as `--mode editable|files` and `RIPCLONE_MODE`. See `CHANGELOG.md` for details.
 
 (A `lazy` mode — metadata + archive chunks first, head-blobs fetched by a
 background daemon — was considered and dropped: people want a clone to be fast
@@ -209,7 +209,7 @@ path and is a rare case (only freshly created, never-pushed repos).
 | Warm full clone of `oven-sh/bun` from a laptop after regional cache is warm | < 5 s |
 | Client setup + disk write time (after chunks land) | < 500 ms |
 | `git status` after clone | clean |
-| `git diff <file>` after editing | works immediately in `full`/`hybrid` modes |
+| `git diff <file>` after editing | works immediately in `editable` mode |
 | Per-phase benchmark | downloadable for every clone |
 
 ## Notes
