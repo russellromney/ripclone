@@ -17,7 +17,7 @@ async fn worker_binary_farm_out_sqlite() {
         std::env::set_var("RIPCLONE_QUEUE", "sqlite");
         std::env::set_var("RIPCLONE_QUEUE_DB_URL", &db_path);
         // Fail fast on the negative case instead of retrying for 80s.
-        std::env::set_var("RIPCLONE_SYNC_MAX_ATTEMPTS", "8");
+        std::env::set_var("RIPCLONE_TEST_SYNC_MAX_ATTEMPTS", "8");
     }
     init(false);
 

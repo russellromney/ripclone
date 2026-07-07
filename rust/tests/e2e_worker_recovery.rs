@@ -60,7 +60,7 @@ fn recovery_env_keys() -> Vec<&'static str> {
         "RIPCLONE_QUEUE_DB_TOKEN",
         "RIPCLONE_QUEUE_STALE_SECS",
         "RIPCLONE_QUEUE_MAX_ATTEMPTS",
-        "RIPCLONE_SYNC_MAX_ATTEMPTS",
+        "RIPCLONE_TEST_SYNC_MAX_ATTEMPTS",
         "RIPCLONE_SYNC_WAIT_SECS",
         "RIPCLONE_METADATA",
         "RIPCLONE_METADATA_DB_URL",
@@ -246,7 +246,7 @@ async fn worker_kill_mid_build_reclaims_sqlite_queue_sqlite_metadata() {
     env.set("RIPCLONE_QUEUE_DB_URL", &queue_db);
     env.set("RIPCLONE_QUEUE_STALE_SECS", "1");
     env.set("RIPCLONE_QUEUE_MAX_ATTEMPTS", "4");
-    env.set("RIPCLONE_SYNC_MAX_ATTEMPTS", "40");
+    env.set("RIPCLONE_TEST_SYNC_MAX_ATTEMPTS", "40");
     env.set("RIPCLONE_SYNC_WAIT_SECS", "120");
     env.set("RIPCLONE_METADATA", "sqlite");
     env.set("RIPCLONE_METADATA_DB_URL", &meta_db);
@@ -379,7 +379,7 @@ async fn worker_kill_mid_build_reclaims_libsql_queue_and_metadata() {
     env.set("RIPCLONE_QUEUE_DB_TOKEN", "dev");
     env.set("RIPCLONE_QUEUE_STALE_SECS", "1");
     env.set("RIPCLONE_QUEUE_MAX_ATTEMPTS", "4");
-    env.set("RIPCLONE_SYNC_MAX_ATTEMPTS", "40");
+    env.set("RIPCLONE_TEST_SYNC_MAX_ATTEMPTS", "40");
     env.set("RIPCLONE_SYNC_WAIT_SECS", "120");
     env.set("RIPCLONE_METADATA", "libsql");
     env.set("RIPCLONE_METADATA_DB_URL", &url);
@@ -629,7 +629,7 @@ async fn worker_kill_mid_build_reclaims_s3_storage_and_metadata() {
     env.set("RIPCLONE_QUEUE_DB_URL", &queue_db);
     env.set("RIPCLONE_QUEUE_STALE_SECS", "1");
     env.set("RIPCLONE_QUEUE_MAX_ATTEMPTS", "4");
-    env.set("RIPCLONE_SYNC_MAX_ATTEMPTS", "40");
+    env.set("RIPCLONE_TEST_SYNC_MAX_ATTEMPTS", "40");
     env.set("RIPCLONE_SYNC_WAIT_SECS", "120");
     env.set("RIPCLONE_METADATA", "s3");
     env.set("RIPCLONE_S3_ENDPOINT", &s3.endpoint);

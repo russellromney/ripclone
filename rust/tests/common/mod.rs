@@ -35,7 +35,7 @@ pub fn init(lsm: bool) {
     ONCE.call_once(|| {
         // SAFETY: set once, before any server/client/sync reads them.
         unsafe {
-            std::env::set_var("RIPCLONE_TOKEN", TOKEN);
+            std::env::set_var("RIPCLONE_SERVER_TOKEN", TOKEN);
             std::env::set_var("RIPCLONE_NO_CACHE", "1");
             // Tests poll clones aggressively; don't let the default rate limiter
             // (burst 60) throttle them. Test-only — production keeps its limits.
@@ -288,7 +288,9 @@ async fn start_server_split_storage_inner(
                 .await
                 {
                     Ok(r) => r,
-                    Err(e) => Err(format!("build task panicked: {e}")),
+                    Err(e) => Err(ripclone::queue::BuildError::retryable(format!(
+                        "build task panicked: {e}"
+                    ))),
                 };
                 state
                     .build_queue_depth
@@ -1099,7 +1101,7 @@ pub fn read(dir: &Path, name: &str) -> String {
 pub fn setup(lsm: bool) {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| unsafe {
-        std::env::set_var("RIPCLONE_TOKEN", TOKEN);
+        std::env::set_var("RIPCLONE_SERVER_TOKEN", TOKEN);
         std::env::set_var("RIPCLONE_NO_CACHE", "1");
         // Tests poll clones aggressively; don't let the default rate limiter
         // throttle them. Test-only — production keeps its configured limits.
@@ -1468,7 +1470,7 @@ impl WorkerProc {
 
 /// Spawn the real `ripclone-worker` binary sharing `cas_dir` + `repo_root` with
 /// the in-process server. It inherits the test process env (RIPCLONE_QUEUE,
-/// RIPCLONE_QUEUE_DB_URL, RIPCLONE_ORIGIN_BASE, RIPCLONE_TOKEN, …).
+/// RIPCLONE_QUEUE_DB_URL, RIPCLONE_ORIGIN_BASE, RIPCLONE_SERVER_TOKEN, …).
 pub fn spawn_worker(cas_dir: &Path, repo_root: &Path) -> WorkerProc {
     let child = Command::new(env!("CARGO_BIN_EXE_ripclone-worker"))
         .arg("--cas-dir")

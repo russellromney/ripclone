@@ -982,8 +982,7 @@ async fn main() -> Result<()> {
         ripclone::provider_config::load_registry().context("load provider registry")?;
 
     // Server-token precedence:
-    //   RIPCLONE_SERVER_TOKEN_HASH > RIPCLONE_SERVER_TOKEN >
-    //   RIPCLONE_TOKEN_HASH > RIPCLONE_TOKEN (deprecated) > saved login token.
+    //   RIPCLONE_SERVER_TOKEN_HASH > RIPCLONE_SERVER_TOKEN > saved login token.
     // Raw tokens are hashed before being sent.
     let server_token_hash = env::var("RIPCLONE_SERVER_TOKEN_HASH")
         .ok()
@@ -993,20 +992,6 @@ async fn main() -> Result<()> {
                 .ok()
                 .filter(|t| !t.is_empty())
                 .map(|t| hex::encode(Sha256::digest(t.as_bytes())))
-        })
-        .or_else(|| {
-            env::var("RIPCLONE_TOKEN_HASH")
-                .ok()
-                .filter(|t| !t.is_empty())
-        })
-        .or_else(|| {
-            env::var("RIPCLONE_TOKEN")
-                .ok()
-                .filter(|t| !t.is_empty())
-                .map(|t| {
-                    eprintln!("warning: RIPCLONE_TOKEN is deprecated for server auth; use RIPCLONE_SERVER_TOKEN");
-                    hex::encode(Sha256::digest(t.as_bytes()))
-                })
         })
         .or_else(|| {
             config
@@ -1024,14 +1009,9 @@ async fn main() -> Result<()> {
         });
     // Prefer a session token from `ripclone auth login` over the saved login
     // token, unless an explicit env server token is configured (that still wins).
-    let env_server_token = [
-        "RIPCLONE_SERVER_TOKEN_HASH",
-        "RIPCLONE_SERVER_TOKEN",
-        "RIPCLONE_TOKEN_HASH",
-        "RIPCLONE_TOKEN",
-    ]
-    .iter()
-    .any(|k| env::var(k).ok().filter(|t| !t.is_empty()).is_some());
+    let env_server_token = ["RIPCLONE_SERVER_TOKEN_HASH", "RIPCLONE_SERVER_TOKEN"]
+        .iter()
+        .any(|k| env::var(k).ok().filter(|t| !t.is_empty()).is_some());
     let session_jwt = if env_server_token {
         None
     } else {

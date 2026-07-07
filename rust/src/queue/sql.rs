@@ -22,7 +22,7 @@
 //!   backstop. A rare duplicate job is wasted compute, not a wrong result — the
 //!   poller watches its own job id and builds are idempotent into the CAS.
 
-use super::{BuildJob, EnqueueOutcome, Enqueued, JobId, JobQueue, JobState};
+use super::{BuildError, BuildJob, EnqueueOutcome, Enqueued, JobId, JobQueue, JobState};
 use crate::provider::{ProviderInstanceId, RepoId};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -161,6 +161,13 @@ pub trait QueueDb: Send + Sync {
         error: Option<&str>,
     ) -> Result<bool>;
 
+    /// Current attempt count for a claim owned by `worker_id`.
+    async fn claimed_attempts(&self, id: i64, worker_id: &str) -> Result<Option<i64>>;
+
+    /// Requeue a retryable build failure while the caller still owns the claim.
+    /// Returns false if the claim was reclaimed or otherwise settled first.
+    async fn requeue_claim(&self, id: i64, worker_id: &str, error: &str) -> Result<bool>;
+
     /// `(status, error)` for a job id.
     async fn status(&self, id: i64) -> Result<Option<(String, Option<String>)>>;
 
@@ -265,15 +272,52 @@ impl SqlJobQueue {
     /// `Ok(false)` if the claim had been reclaimed/dead-lettered out from under
     /// this worker (its result is stale and must be discarded — see
     /// [`QueueDb::finish`]).
-    pub async fn ack(&self, id: i64, worker_id: &str, result: Result<(), String>) -> Result<bool> {
+    pub async fn ack(
+        &self,
+        id: i64,
+        worker_id: &str,
+        result: Result<(), BuildError>,
+    ) -> Result<bool> {
         let (status, error) = match result {
             Ok(()) => ("done", None),
-            Err(e) => ("failed", Some(e)),
+            Err(e) if e.is_retryable() => {
+                let message = e.message().to_string();
+                let attempts = self.db.claimed_attempts(id, worker_id).await?;
+                let Some(attempts) = attempts else {
+                    return Ok(false);
+                };
+                if attempts >= self.max_build_attempts {
+                    let error = self.dead_letter_error(&message);
+                    return self
+                        .db
+                        .finish(id, worker_id, "failed", now_secs(), Some(&error))
+                        .await;
+                }
+                tokio::time::sleep(retry_backoff(attempts)).await;
+                return self.db.requeue_claim(id, worker_id, &message).await;
+            }
+            Err(e) => ("failed", Some(e.message().to_string())),
         };
         self.db
             .finish(id, worker_id, status, now_secs(), error.as_deref())
             .await
     }
+
+    fn dead_letter_error(&self, error: &str) -> String {
+        format!(
+            "dead-lettered after {} build attempts: {error}",
+            self.max_build_attempts
+        )
+    }
+}
+
+fn retry_backoff(attempts: i64) -> std::time::Duration {
+    let base_ms = std::env::var("RIPCLONE_QUEUE_RETRY_BACKOFF_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(250);
+    let shift = attempts.saturating_sub(1).min(5) as u32;
+    std::time::Duration::from_millis(base_ms * 2_u64.saturating_pow(shift))
 }
 
 #[async_trait]
@@ -554,13 +598,97 @@ mod tests {
         for (engine, q, _dir) in queues().await {
             let enq = q.enqueue(job("o", "r", "main")).await.unwrap();
             let claimed = q.claim("w").await.unwrap().unwrap();
-            q.ack(claimed.id, "w", Err("boom".to_string()))
+            q.ack(claimed.id, "w", Err(BuildError::permanent("boom")))
                 .await
                 .unwrap();
             match q.job_status(enq.job_id.unwrap()).await.unwrap() {
                 JobState::Failed(e) => assert_eq!(e, "boom", "{engine}"),
                 other => panic!("{engine}: expected Failed, got {other:?}"),
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn retryable_ack_requeues_and_later_attempt_succeeds() {
+        for (engine, q, _dir) in queues().await {
+            let enq = q.enqueue(job("o", "r", "main")).await.unwrap();
+            let id = enq.job_id.unwrap();
+            let first = q.claim("w1").await.unwrap().unwrap();
+            assert_eq!(first.id, id, "{engine}");
+
+            assert!(
+                q.ack(first.id, "w1", Err(BuildError::retryable("storage 503")))
+                    .await
+                    .unwrap(),
+                "{engine}: retryable ack should requeue the owned claim"
+            );
+            assert!(matches!(q.job_status(id).await.unwrap(), JobState::Pending));
+
+            let second = q.claim("w2").await.unwrap().unwrap();
+            assert_eq!(second.id, id, "{engine}");
+            assert!(q.ack(second.id, "w2", Ok(())).await.unwrap(), "{engine}");
+            assert!(matches!(q.job_status(id).await.unwrap(), JobState::Done));
+        }
+    }
+
+    #[tokio::test]
+    async fn permanent_ack_is_terminal_with_no_retry() {
+        for (engine, q, _dir) in queues().await {
+            let enq = q.enqueue(job("o", "r", "main")).await.unwrap();
+            let id = enq.job_id.unwrap();
+            let claimed = q.claim("w").await.unwrap().unwrap();
+
+            assert!(
+                q.ack(claimed.id, "w", Err(BuildError::permanent("bad repo")))
+                    .await
+                    .unwrap(),
+                "{engine}: permanent ack should terminally fail"
+            );
+            match q.job_status(id).await.unwrap() {
+                JobState::Failed(e) => assert_eq!(e, "bad repo", "{engine}"),
+                other => panic!("{engine}: expected Failed, got {other:?}"),
+            }
+            assert!(
+                q.claim("w2").await.unwrap().is_none(),
+                "{engine}: permanent failure must not be retried"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn retryable_ack_dead_letters_at_attempt_cap() {
+        for engine in ["sqlite"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("q.db").to_string_lossy().to_string();
+            let db = make_db(engine, &path).await;
+            db.init().await.unwrap();
+            let q = SqlJobQueue {
+                db,
+                stale_claim_secs: DEFAULT_STALE_CLAIM_SECS,
+                failed_retention_secs: DEFAULT_FAILED_RETENTION_SECS,
+                max_build_attempts: 1,
+            };
+            let enq = q.enqueue(job("o", "r", "main")).await.unwrap();
+            let id = enq.job_id.unwrap();
+            let claimed = q.claim("w").await.unwrap().unwrap();
+
+            assert!(
+                q.ack(claimed.id, "w", Err(BuildError::retryable("storage 503")))
+                    .await
+                    .unwrap(),
+                "{engine}: over-cap retryable ack should dead-letter"
+            );
+            match q.job_status(id).await.unwrap() {
+                JobState::Failed(e) => assert!(
+                    e.contains("dead-lettered"),
+                    "{engine}: expected dead-letter error, got {e:?}"
+                ),
+                other => panic!("{engine}: expected Failed, got {other:?}"),
+            }
+            assert!(
+                q.claim("w2").await.unwrap().is_none(),
+                "{engine}: dead-lettered retryable failure must not loop"
+            );
         }
     }
 
@@ -771,7 +899,9 @@ mod tests {
 
         let failed = q.enqueue(job("o", "r", "fail")).await.unwrap();
         let c = q.claim("w").await.unwrap().unwrap();
-        q.ack(c.id, "w", Err("boom".to_string())).await.unwrap();
+        q.ack(c.id, "w", Err(BuildError::permanent("boom")))
+            .await
+            .unwrap();
 
         let done = q.enqueue(job("o", "r", "ok")).await.unwrap();
         let c = q.claim("w").await.unwrap().unwrap();
@@ -897,7 +1027,7 @@ mod tests {
 
         let second = q.claim("w1").await.unwrap().unwrap();
         assert_eq!(second.branch, "dev");
-        q.ack(second.id, "w1", Err("boom".to_string()))
+        q.ack(second.id, "w1", Err(BuildError::permanent("boom")))
             .await
             .unwrap();
         match q.job_status(second.id).await.unwrap() {

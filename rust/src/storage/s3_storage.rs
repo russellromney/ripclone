@@ -41,12 +41,7 @@ impl S3Storage {
         // timeout + retry policy almost never trips, while still failing fast on a
         // genuinely stuck request. Steady-state re-syncs only upload the delta, so
         // this barely ever matters.
-        let request_timeout = Duration::from_secs(
-            std::env::var("RIPCLONE_S3_REQUEST_TIMEOUT_SECS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(30),
-        );
+        let request_timeout = Duration::from_secs(30);
         let client = Client::builder(endpoint)
             .context("build S3 client")?
             .region(region)
@@ -140,7 +135,11 @@ impl S3Storage {
         let mut out = Vec::new();
         let mut stream = stream;
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| anyhow::anyhow!("S3 body stream error: {}", e))?;
+            // Preserve the concrete `s3::Error` as the anyhow source (do not
+            // stringify): the build-error classifier downcasts to `s3::Error` to
+            // decide retryable, so a mid-body network drop (a Transport error)
+            // must keep its type or it falls through to a permanent failure.
+            let chunk = chunk.context("S3 body stream error")?;
             out.extend_from_slice(&chunk);
         }
         Ok(out)
@@ -431,15 +430,7 @@ impl StorageBackend for S3Storage {
     }
 
     fn regions(&self) -> Vec<String> {
-        std::env::var("RIPCLONE_STORAGE_REGIONS")
-            .ok()
-            .map(|s| {
-                s.split(',')
-                    .map(|r| r.trim().to_string())
-                    .filter(|r| !r.is_empty())
-                    .collect()
-            })
-            .unwrap_or_else(|| vec![self.region.clone()])
+        vec![self.region.clone()]
     }
 
     fn delete(&self, hash: &str) -> Result<()> {

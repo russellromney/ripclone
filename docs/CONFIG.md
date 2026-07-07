@@ -1,43 +1,64 @@
-# Configuration and environment variables
+# Configuration
 
-This page covers the user-facing flags and environment variables that control
-`ripclone` behavior. For operator/server configuration, see [`BACKENDS.md`](BACKENDS.md).
+This is the authoritative list of supported `RIPCLONE_*` environment variables.
+Internal tuning knobs use code constants at their current defaults.
 
-## Clone flags
+## User
 
-- `--server` / `RIPCLONE_SERVER` — ripclone server URL.
-- `--provider` / `RIPCLONE_PROVIDER` — git provider instance id.
-- `--token` / `RIPCLONE_UPSTREAM_TOKEN` — upstream credential sent as
-  `X-Upstream-Token`.
-- `--mode` / `RIPCLONE_MODE` — `editable` (default) or `files`.
-- `--depth` — `1` (shallow, default) or `0` (full history).
-- `--verify-upstream` / `RIPCLONE_VERIFY_UPSTREAM` — `auto` (default),
-  `always`, or `never`. Cross-checks the installed tip against the upstream git
-  host for editable clones. See the README for details.
-- `--no-metrics` / `RIPCLONE_NO_METRICS` — suppress the post-clone metrics
-  report.
+- `RIPCLONE_SERVER` - server URL. Equivalent to `--server`.
+- `RIPCLONE_SERVER_TOKEN` - raw shared server token. The client hashes it before
+  sending `Authorization: Ripclone <sha256>`.
+- `RIPCLONE_SERVER_TOKEN_HASH` - pre-hashed shared server token for CI or secret
+  stores.
+- `RIPCLONE_UPSTREAM_TOKEN` - upstream provider credential sent as
+  `X-Upstream-Token`. Equivalent to `--token`.
+- `RIPCLONE_MODE` - default clone mode when `--mode` is omitted: `editable` or
+  `files`.
+- `RIPCLONE_VERIFY_UPSTREAM` - `auto`, `always`, or `never`.
+- `RIPCLONE_CACHE_DIR` - opt in to the local artifact cache.
+- `RIPCLONE_NO_CACHE` - disable the local artifact cache even if configured.
+- `RIPCLONE_NO_METRICS` - skip the fire-and-forget clone metrics POST.
 
-## Telemetry
+## Operator
 
-After a successful clone, the CLI sends a single fire-and-forget POST to the
-configured server. The report is skipped when:
+- `RIPCLONE_CONFIG` - path to the global `config.toml`.
+- `RIPCLONE_PROVIDERS` - JSON provider registry override.
+- `RIPCLONE_GITHUB_TOKEN` - token shortcut for the built-in GitHub provider.
+- `RIPCLONE_SERVER_TOKEN` / `RIPCLONE_SERVER_TOKEN_HASH` - server auth for
+  clients and self-hosted servers.
+- `RIPCLONE_S3_ENDPOINT`, `RIPCLONE_S3_REGION`, `RIPCLONE_S3_BUCKET`,
+  `RIPCLONE_S3_PREFIX`, `RIPCLONE_S3_CACHE_DIR` - object storage backend.
+- `RIPCLONE_METADATA`, `RIPCLONE_METADATA_DB_URL`,
+  `RIPCLONE_METADATA_DB_TOKEN` - metadata/ref-store backend.
+- `RIPCLONE_QUEUE`, `RIPCLONE_QUEUE_DB_URL`, `RIPCLONE_QUEUE_DB_TOKEN` - build
+  queue backend.
+- `RIPCLONE_WEBHOOK_SECRET_<PROVIDER>`, `RIPCLONE_WEBHOOK_ALLOWLIST`,
+  `RIPCLONE_WEBHOOK_WARM_ALL` - webhook authentication and warming policy.
+- `RIPCLONE_POLL_INTERVAL_SECS` - fallback polling interval; `0` disables it.
+- `RIPCLONE_REMOTE_GC_INTERVAL_SECS`, `RIPCLONE_REMOTE_GC_GRACE_SECS`,
+  `RIPCLONE_REMOTE_GC_DRY_RUN` - remote object garbage collection.
 
-- the server does not return an `X-Ripclone-Clone-Id` header (self-host / older
-  server),
-- `--no-metrics` is passed, or
-- `RIPCLONE_NO_METRICS` is set to any non-empty value.
+## Expert
 
-The payload is advertising-grade telemetry only. It contains:
+These remain because tests or deployment safety need them, but they should not
+be tuned casually.
 
-- `cloneId` — server-minted clone id.
-- `repo` — `{ provider, owner, name }`.
-- `commit` — resolved commit SHA.
-- `mode` — `depth1`, `full`, or `files`.
-- `cold` — whether the clone waited for a fresh build.
-- `totalMs` — end-to-end clone wall time.
-- `bytes` — total bytes downloaded.
-- `downloadMs` — currently omitted in v1.
-- `client` — `{ os, arch, ripcloneVersion }`.
+- `RIPCLONE_FETCH_MAX_ATTEMPTS`, `RIPCLONE_FETCH_BACKOFF_MS` - client download
+  retry budget.
+- `RIPCLONE_IO_URING` - Linux worktree writer selection: unset/`auto`, `0`, or
+  `1`.
+- `RIPCLONE_FSYNC` - force durable local writes where supported.
+- `RIPCLONE_JWT_SECRET`, `RIPCLONE_JWT_TTL_SECS`,
+  `RIPCLONE_JWT_SESSION_MAX_SECS` - session-token signing and lifetime.
+- `RIPCLONE_HEAD_REBASE_BYTES` - test/expert threshold for HEAD delta rebasing.
+- `RIPCLONE_SIGNED_URL_TTL_SECS`, `RIPCLONE_SIGNED_URL_TTL_PRIVATE_SECS` -
+  signed artifact URL lifetimes.
+- `RIPCLONE_REF_CACHE_TTL_SECS` - in-process ref cache TTL.
+- `RIPCLONE_RECHECK_MAX` - post-build freshness re-check cap.
+- `RIPCLONE_LSM`, `RIPCLONE_LSM_MAX_LEVELS` - incremental history compaction.
+- `RIPCLONE_TRUST_GATEWAY`, `RIPCLONE_TRUST_FORWARDED_FOR` - trust-boundary
+  controls for self-hosted gateways/proxies.
+- `RIPCLONE_BENCH` - emit structured sync benchmark logs.
 
-Self-hosted servers accept and drop this POST at
-`POST /v1/clones/{cloneId}/metrics`; the cloud route is the analytics sink.
+The old short token and server-url aliases were removed before 1.0. Use the
+explicit server names above.

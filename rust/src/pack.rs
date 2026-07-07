@@ -4,6 +4,8 @@ use anyhow::{Context, Result, bail};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+const HISTORY_REUSE_MAX_PACK_BYTES: u64 = 64 * 1024 * 1024;
+
 pub struct PackBuilder<'a> {
     repo: PathBuf,
     cas: &'a Cas,
@@ -398,6 +400,37 @@ impl<'a> PackBuilder<'a> {
         sealed_tip: Option<&str>,
         history_target_raw_bytes: u64,
     ) -> Result<Vec<(String, u64, String, u64)>> {
+        self.build_history_tail_inner(
+            commit,
+            sealed_tip,
+            history_target_raw_bytes,
+            HISTORY_REUSE_MAX_PACK_BYTES,
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn build_history_tail_with_reuse_max_pack_bytes_for_tests(
+        &self,
+        commit: &str,
+        sealed_tip: Option<&str>,
+        history_target_raw_bytes: u64,
+        reuse_max_pack_bytes: u64,
+    ) -> Result<Vec<(String, u64, String, u64)>> {
+        self.build_history_tail_inner(
+            commit,
+            sealed_tip,
+            history_target_raw_bytes,
+            reuse_max_pack_bytes,
+        )
+    }
+
+    fn build_history_tail_inner(
+        &self,
+        commit: &str,
+        sealed_tip: Option<&str>,
+        history_target_raw_bytes: u64,
+        reuse_max_pack_bytes: u64,
+    ) -> Result<Vec<(String, u64, String, u64)>> {
         // Cold base build (no sealed level yet): reuse the deltas git already has
         // via the mirror's reachability bitmap instead of enumerating ~all
         // objects and re-deltifying them in size-partitioned batches (which also
@@ -408,7 +441,7 @@ impl<'a> PackBuilder<'a> {
             // proven enumerate-and-pack path so a cold build never hard-fails on a
             // missing bitmap, an old git, or a pack-objects hiccup. Reuse is an
             // optimization, never the only path to a complete base.
-            return match self.build_history_pack_reuse(commit) {
+            return match self.build_history_pack_reuse(commit, reuse_max_pack_bytes) {
                 Ok(packs) => Ok(packs),
                 Err(e) => {
                     tracing::warn!(
@@ -438,12 +471,11 @@ impl<'a> PackBuilder<'a> {
     /// split into download-friendly packs and stored in the CAS. The reachable
     /// closure includes HEAD's objects (a small duplicate with the depth pack) —
     /// a deliberate space-for-time trade to avoid an exclusion enumeration.
-    fn build_history_pack_reuse(&self, commit: &str) -> Result<Vec<(String, u64, String, u64)>> {
-        let max_pack_bytes = std::env::var("RIPCLONE_HISTORY_MAX_PACK_BYTES")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or(64 * 1024 * 1024);
+    fn build_history_pack_reuse(
+        &self,
+        commit: &str,
+        max_pack_bytes: u64,
+    ) -> Result<Vec<(String, u64, String, u64)>> {
         let tmp = tempfile::TempDir::new()?;
         let prefix = tmp.path().join("pack");
         git::pack_objects_reachable_to_prefix(&self.repo, commit, &prefix, max_pack_bytes)?;
@@ -631,7 +663,7 @@ impl<'a> PackBuilder<'a> {
         // The gix encoder is currently undeltified (deterministic, sorted OIDs).
         // Use it for HEAD-closure packs when requested; keep C-git for deltified
         // history packs so their size stays compact.
-        let use_gix = std::env::var("RIPCLONE_GIX_PACK").ok() == Some("1".to_string());
+        let use_gix = false;
         if use_gix && undeltified {
             git::pack_objects_to_prefix_gix(&self.repo, object_shas, &prefix)?;
         } else if undeltified {

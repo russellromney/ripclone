@@ -50,7 +50,7 @@ producers are descheduled by the throttle.
 
 The throttled benefit comes from *more I/O in flight while a worker is stalled*.
 The per-thread path already has that — it just defaulted to 2 windows. Exposing
-the depth as `RIPCLONE_IO_URING_DEPTH` and bumping it captures the same benefit
+the depth as `the fixed io_uring overlap depth` and bumping it captures the same benefit
 without a separate thread pool and without the cross-core copy:
 
 Real clone, write phase, median ms:
@@ -70,7 +70,7 @@ CPUs, it's the io_uring-idiomatic shape (thread-per-core), and it's one number.
 
 ## Decisions
 
-- **Default `RIPCLONE_IO_URING_DEPTH=2`.** Best for dedicated cores, which is the
+- **Default `the fixed io_uring overlap depth=2`.** Best for dedicated cores, which is the
   common dev-box / agent case. Throttled/shared-CPU hosts can set `=3` for ~10%.
 - **The scheduler is superseded.** Kept opt-in for now but slated for removal;
   the depth knob does its job better.
@@ -93,9 +93,9 @@ On branch `perf/io-uring-scheduler`:
 
 - `b65467f` — scheduler implementation (submitter pool, multi-window deque).
 - `84be137` — batch routing change.
-- `20bd51e` — the keeper: tunable per-thread overlap depth (`RIPCLONE_IO_URING_DEPTH`).
+- `20bd51e` — the keeper: tunable per-thread overlap depth (`the fixed io_uring overlap depth`).
 
 The scheduler is marked deprecated and slated for removal. If it is ever
 removed, the implementation can be recovered from `b65467f`. The depth machinery
 it introduced (the multi-window deque in `RawUringWriter`) stays — that is what
-`RIPCLONE_IO_URING_DEPTH` drives.
+`the fixed io_uring overlap depth` drives.

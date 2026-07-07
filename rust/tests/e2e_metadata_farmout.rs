@@ -20,7 +20,7 @@ async fn metadata_and_queue_on_sqlite_with_real_worker() {
         std::env::set_var("RIPCLONE_QUEUE_DB_URL", &queue_url);
         std::env::set_var("RIPCLONE_METADATA", "sqlite");
         std::env::set_var("RIPCLONE_METADATA_DB_URL", &meta_url);
-        std::env::set_var("RIPCLONE_SYNC_MAX_ATTEMPTS", "10");
+        std::env::set_var("RIPCLONE_TEST_SYNC_MAX_ATTEMPTS", "10");
     }
     init(false);
 

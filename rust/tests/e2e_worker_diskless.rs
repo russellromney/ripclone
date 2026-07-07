@@ -31,7 +31,7 @@ async fn diskless_worker_head_sync_returns_real_ref() {
         // file metadata store would NOT be shared between server and worker.
         std::env::set_var("RIPCLONE_METADATA", "sqlite");
         std::env::set_var("RIPCLONE_METADATA_DB_URL", &meta_path);
-        std::env::set_var("RIPCLONE_SYNC_MAX_ATTEMPTS", "8");
+        std::env::set_var("RIPCLONE_TEST_SYNC_MAX_ATTEMPTS", "8");
     }
     init(false);
 

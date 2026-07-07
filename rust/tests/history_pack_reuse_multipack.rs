@@ -1,6 +1,6 @@
 //! The cold full-history build reuses git's existing pack deltas via
-//! `pack-objects --revs` and splits the output with `--max-pack-size`
-//! (RIPCLONE_HISTORY_MAX_PACK_BYTES). That split path — collecting an arbitrary
+//! `pack-objects --revs` and splits the output with `--max-pack-size`.
+//! That split path — collecting an arbitrary
 //! number of `pack-<sha>.{pack,idx}` pairs in `store_packs_from_dir`, ordering
 //! them, and assembling them into one history level — is new code the existing
 //! single-pack fixtures never exercised. This test forces the split and asserts
@@ -14,8 +14,8 @@
 //! across packs. The full `git fsck` below still inflates and sha-verifies every
 //! object, so it catches any object the split dropped or corrupted.
 //!
-//! It runs in its own test binary so setting the process-global
-//! RIPCLONE_HISTORY_MAX_PACK_BYTES can't race other tests.
+//! It runs in its own test binary so it can force a tiny split threshold without
+//! making the main suite slower.
 
 use ripclone::cas::Cas;
 use ripclone::pack::PackBuilder;
@@ -119,11 +119,9 @@ fn cold_reuse_multipack_full_clone_is_complete() {
     // The cold path (sealed_tip = None) of build_history_tail is what routes to
     // build_history_pack_reuse. Force it to split into multiple packs (git clamps
     // the limit up to its 1 MiB minimum, well below our ~4 MiB of content).
-    unsafe { std::env::set_var("RIPCLONE_HISTORY_MAX_PACK_BYTES", "1") };
     let packs = builder
-        .build_history_tail(&head, None, 512 * 1024 * 1024)
+        .build_history_tail_with_reuse_max_pack_bytes_for_tests(&head, None, 512 * 1024 * 1024, 1)
         .unwrap();
-    unsafe { std::env::remove_var("RIPCLONE_HISTORY_MAX_PACK_BYTES") };
 
     assert!(
         packs.len() >= 2,

@@ -46,7 +46,7 @@ async fn remote_gc_during_local_clone_is_safe() {
     // Serialize downloads so the first large artifact GET deterministically
     // hits the barrier rather than racing with concurrent fetches.
     unsafe {
-        std::env::set_var("RIPCLONE_EDITABLE_DOWNLOAD_CONCURRENCY", "1");
+        std::env::set_var("RIPCLONE_TEST_DOWNLOAD_CONCURRENCY", "1");
     }
 
     let client = server.client();
@@ -96,7 +96,7 @@ async fn remote_gc_during_local_clone_is_safe() {
 
     let (result, _out, target) = clone_task.await.expect("clone task joined");
     unsafe {
-        std::env::remove_var("RIPCLONE_EDITABLE_DOWNLOAD_CONCURRENCY");
+        std::env::remove_var("RIPCLONE_TEST_DOWNLOAD_CONCURRENCY");
     }
 
     match result {

@@ -204,6 +204,34 @@ impl QueueDb for LibsqlDb {
         Ok(n == 1)
     }
 
+    async fn claimed_attempts(&self, id: i64, worker_id: &str) -> Result<Option<i64>> {
+        let conn = self.conn().await?;
+        let mut rows = conn
+            .query(
+                "SELECT attempts FROM jobs WHERE id = ? AND worker_id = ? AND status = 'claimed'",
+                libsql::params![id, worker_id],
+            )
+            .await
+            .context("fetch claimed attempts")?;
+        match rows.next().await? {
+            Some(row) => Ok(Some(row.get::<i64>(0)?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn requeue_claim(&self, id: i64, worker_id: &str, error: &str) -> Result<bool> {
+        let conn = self.conn().await?;
+        let n = conn
+            .execute(
+                "UPDATE jobs SET status = 'queued', worker_id = NULL, error = ?
+                 WHERE id = ? AND worker_id = ? AND status = 'claimed'",
+                libsql::params![error, id, worker_id],
+            )
+            .await
+            .context("requeue retryable job")?;
+        Ok(n == 1)
+    }
+
     async fn status(&self, id: i64) -> Result<Option<(String, Option<String>)>> {
         let conn = self.conn().await?;
         let mut rows = conn
