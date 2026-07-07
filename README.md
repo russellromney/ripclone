@@ -234,6 +234,16 @@ whenever an upstream credential is available or the repo is public; for
 credential-less private/agent flows it warns and skips, leaving the ripclone
 server in the trust base. `files`-mode clones are not verifiable this way.
 
+### Plain `git clone` through the helper
+
+The `git-remote-ripclone` binary lets stock `git` clone and fetch through a ripclone server with no wrapper — handy for CI steps and tools that shell out to `git`:
+
+```sh
+git clone ripclone://github/oven-sh/bun.git bun
+```
+
+It supports `--depth 1` (shallow) or a full clone; push goes to your git host via `pushInsteadOf`. See [`docs/REMOTE_HELPER.md`](docs/REMOTE_HELPER.md) for URL syntax, server resolution, and the push workaround.
+
 ## Providers
 
 ripclone is host-agnostic: point it at GitHub (built in), GitLab, Gitea/Forgejo/Codeberg, or a self-hosted host by registering provider instances with `RIPCLONE_PROVIDERS` or `config.toml`. See [`docs/PROVIDERS.md`](docs/PROVIDERS.md).
