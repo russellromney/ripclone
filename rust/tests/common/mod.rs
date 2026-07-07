@@ -242,7 +242,9 @@ async fn start_server_split_storage_inner(barrier: Option<ArtifactBarrier>) -> S
                 .await
                 {
                     Ok(r) => r,
-                    Err(e) => Err(format!("build task panicked: {e}")),
+                    Err(e) => Err(ripclone::queue::BuildError::retryable(format!(
+                        "build task panicked: {e}"
+                    ))),
                 };
                 state
                     .build_queue_depth

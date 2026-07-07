@@ -6,6 +6,7 @@ use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::AtomicBool;
+use std::time::Duration;
 
 const SKIP_WORKTREE_FLAG: gix::index::entry::Flags = gix::index::entry::Flags::SKIP_WORKTREE;
 
@@ -432,6 +433,26 @@ pub fn run_git<P: AsRef<Path>>(repo: P, args: &[&str]) -> Result<String> {
 
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
+
+#[derive(Debug)]
+pub struct UpstreamGitError {
+    op: &'static str,
+    retryable: bool,
+}
+
+impl UpstreamGitError {
+    pub fn is_retryable(&self) -> bool {
+        self.retryable
+    }
+}
+
+impl std::fmt::Display for UpstreamGitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} failed", self.op)
+    }
+}
+
+impl std::error::Error for UpstreamGitError {}
 
 pub fn resolve_commit<P: AsRef<Path>>(repo: P, rev: &str) -> Result<String> {
     crate::validation::validate_git_rev(rev).with_context(|| format!("invalid rev: {}", rev))?;
@@ -1220,6 +1241,64 @@ fn upstream_url_and_auth(
     (url, git_args)
 }
 
+fn upstream_auth_header(
+    provider: &ProviderInstance,
+    credential: Option<&secrecy::SecretString>,
+) -> Option<(String, String)> {
+    credential.and_then(|token| provider.auth_header(token.expose_secret()))
+}
+
+fn upstream_git_error(
+    op: &'static str,
+    url: &str,
+    auth_header: Option<(String, String)>,
+) -> anyhow::Error {
+    anyhow::Error::new(UpstreamGitError {
+        op,
+        retryable: upstream_failure_is_retryable(url, auth_header),
+    })
+}
+
+fn upstream_failure_is_retryable(url: &str, auth_header: Option<(String, String)>) -> bool {
+    let Ok(parsed) = url::Url::parse(url) else {
+        return false;
+    };
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return false;
+    }
+
+    let Ok(client) = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+    else {
+        return true;
+    };
+    let mut req = client
+        .get(url)
+        .header(reqwest::header::USER_AGENT, "ripclone");
+    if let Some((name, value)) = auth_header
+        && let (Ok(name), Ok(value)) = (
+            reqwest::header::HeaderName::from_bytes(name.as_bytes()),
+            reqwest::header::HeaderValue::from_str(&value),
+        )
+    {
+        req = req.header(name, value);
+    }
+
+    match req.send() {
+        Ok(resp) => {
+            let status = resp.status();
+            status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                || status == reqwest::StatusCode::REQUEST_TIMEOUT
+                || status.is_server_error()
+                || status.is_success()
+                || status.is_redirection()
+        }
+        Err(e) => e.is_timeout() || e.is_connect(),
+    }
+}
+
 /// Resolve the upstream tip of `ref_name` via `git ls-remote` — one
 /// reference-advertisement round-trip with **no object transfer**. Returns the
 /// hex commit SHA, or `None` if the ref is absent upstream. Used as a cheap
@@ -1247,6 +1326,7 @@ pub fn ls_remote_commit(
         }
     }
     let (url, git_args) = upstream_url_and_auth(provider, repo_id, credential);
+    let auth_header = upstream_auth_header(provider, credential);
     // A bare branch name maps to refs/heads/<name>; a full ref (refs/heads/... or
     // refs/tags/...) is passed through unchanged; HEAD is queried directly.
     let query = if ref_name == "HEAD" {
@@ -1262,7 +1342,7 @@ pub fn ls_remote_commit(
         .output()
         .context("git ls-remote")?;
     if !output.status.success() {
-        bail!("ls-remote failed");
+        return Err(upstream_git_error("ls-remote", &url, auth_header));
     }
     // Output is lines of "<sha>\t<ref>"; take the first ref's SHA.
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1362,6 +1442,7 @@ pub fn sync_bare_mirror<P: AsRef<Path>>(
     let _mirror_lock = MirrorLock::acquire(mirror_dir.as_ref())?;
 
     let (url, git_args) = upstream_url_and_auth(provider, repo_id, credential);
+    let auth_header = upstream_auth_header(provider, credential);
     // The mirror is always a *complete* clone. The "full" (depth=0) clonepack is
     // built from `rev-list HEAD` over this mirror, so any shallow boundary would
     // silently truncate it and break `git rev-list`/`fsck` on the client. We
@@ -1369,7 +1450,14 @@ pub fn sync_bare_mirror<P: AsRef<Path>>(
     // already-complete mirror. depth=1 ("head") clones are still cheap — they're
     // a content-addressed subset built at pack time, not a shallower mirror.
     if let Some(rev) = rev.filter(|rev| is_full_hex_object_id(rev)) {
-        sync_bare_mirror_rev(mirror_dir.as_ref(), &url, &git_args, branch, rev)?;
+        sync_bare_mirror_rev(
+            mirror_dir.as_ref(),
+            &url,
+            &git_args,
+            auth_header.clone(),
+            branch,
+            rev,
+        )?;
     } else if mirror_dir.as_ref().exists() {
         // A `--mirror` clone is configured with `+refs/*:refs/*` (and prunes), so
         // a plain `git fetch origin` advances every branch + HEAD to the latest.
@@ -1397,7 +1485,7 @@ pub fn sync_bare_mirror<P: AsRef<Path>>(
             .status()
             .context("git fetch")?;
         if !status.success() {
-            bail!("fetch failed");
+            return Err(upstream_git_error("fetch", &url, auth_header));
         }
     } else {
         // A fresh `--mirror` clone copies every ref (branches, tags, HEAD), so no
@@ -1422,7 +1510,7 @@ pub fn sync_bare_mirror<P: AsRef<Path>>(
             .status()
             .context("git clone mirror")?;
         if !status.success() {
-            bail!("clone mirror failed");
+            return Err(upstream_git_error("clone mirror", &url, auth_header));
         }
         // Belt and suspenders: confirm the keys are persisted regardless of how a
         // given git version applied `clone --config`.
@@ -1477,6 +1565,7 @@ fn sync_bare_mirror_rev(
     mirror_dir: &Path,
     url: &str,
     git_args: &[String],
+    auth_header: Option<(String, String)>,
     branch: &str,
     rev: &str,
 ) -> Result<()> {
@@ -1499,7 +1588,7 @@ fn sync_bare_mirror_rev(
         .status()
         .context("git fetch rev")?;
     if !status.success() {
-        bail!("fetch rev failed");
+        return Err(upstream_git_error("fetch rev", url, auth_header));
     }
     Ok(())
 }

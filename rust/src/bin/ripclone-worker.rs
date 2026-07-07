@@ -36,7 +36,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use ripclone::backends::{self, Backends};
 use ripclone::metrics::Metrics;
-use ripclone::queue::{BuildJob, JobQueueRef};
+use ripclone::queue::{BuildError, BuildJob, JobQueueRef};
 use ripclone::server::{ServerState, process_build_job};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -135,7 +135,7 @@ async fn main() -> Result<()> {
                 let result =
                     match tokio::spawn(async move { process_build_job(&st, &job).await }).await {
                         Ok(r) => r,
-                        Err(e) => Err(format!("build task panicked: {e}")),
+                        Err(e) => Err(BuildError::retryable(format!("build task panicked: {e}"))),
                     };
                 match queue.ack(job_id, &worker_id, result.map(|_| ())).await {
                     Ok(true) => {}
