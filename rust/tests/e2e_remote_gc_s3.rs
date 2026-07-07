@@ -541,10 +541,12 @@ async fn start_s3_server(env: &S3Env, prefix: &str) -> Server {
 
 /// Start the in-process server backed by the real S3-compatible store, failing
 /// the first `fail_first` artifact GETs via `RIPCLONE_TEST_FAIL_FIRST_FETCHES`.
-/// The fault threshold is set under `SERVER_LOCK` and removed once the server
-/// has consumed it, so parallel test binaries cannot observe the same env var.
+///
+/// This helper does NOT take `SERVER_LOCK`; every caller already holds it for the
+/// whole test body. It reads and mutates process-global request-time env vars, so
+/// callers must be serialized on `SERVER_LOCK` to keep those vars race-free. The
+/// tokio Mutex is not reentrant, so re-locking here would deadlock.
 async fn start_s3_server_faulting(env: &S3Env, prefix: &str, fail_first: usize) -> Server {
-    let _lock = SERVER_LOCK.lock().await;
     unsafe {
         std::env::set_var("RIPCLONE_S3_ENDPOINT", &env.endpoint);
         std::env::set_var("RIPCLONE_S3_BUCKET", &env.bucket);
@@ -863,6 +865,7 @@ async fn remote_gc_deletes_orphans_on_s3() {
             return;
         }
     };
+    let _server_lock = SERVER_LOCK.lock().await;
     let prefix = unique_prefix();
     let suffix = repo_suffix(&prefix);
     let repo = format!("gcorphan-{suffix}");
@@ -975,6 +978,7 @@ async fn remote_gc_dry_run_does_not_delete_on_s3() {
             return;
         }
     };
+    let _server_lock = SERVER_LOCK.lock().await;
     let prefix = unique_prefix();
     let suffix = repo_suffix(&prefix);
     let repo = format!("gcdryrun-{suffix}");
@@ -1050,6 +1054,7 @@ async fn remote_gc_during_faulting_clone_is_safe() {
             return;
         }
     };
+    let _server_lock = SERVER_LOCK.lock().await;
     let prefix = unique_prefix();
     let suffix = repo_suffix(&prefix);
     let repo = format!("gcrace-{suffix}");
@@ -1174,6 +1179,7 @@ async fn expired_signed_url_fails_clone_cleanly() {
             return;
         }
     };
+    let _server_lock = SERVER_LOCK.lock().await;
 
     // All direct S3 cleanup must talk to MinIO, not the proxy.
     let prefix = unique_prefix();
@@ -1262,6 +1268,7 @@ async fn expired_bearer_and_signed_url_mid_cli_clone_fail_cleanly() {
             return;
         }
     };
+    let _server_lock = SERVER_LOCK.lock().await;
 
     let prefix = unique_prefix();
     let suffix = repo_suffix(&prefix);
@@ -1394,6 +1401,7 @@ async fn status_reports_bytes_from_s3() {
             return;
         }
     };
+    let _server_lock = SERVER_LOCK.lock().await;
     let prefix = unique_prefix();
     let suffix = repo_suffix(&prefix);
     let repo = format!("billings3-{suffix}");
@@ -1525,6 +1533,7 @@ async fn warm_ttl_evicts_idle_ref_and_status_reports_cold() {
             return;
         }
     };
+    let _server_lock = SERVER_LOCK.lock().await;
     let prefix = unique_prefix();
     let suffix = repo_suffix(&prefix);
     let repo = format!("gcwarm-{suffix}");
@@ -1581,6 +1590,7 @@ async fn warm_ttl_keeps_pinned_ref() {
             return;
         }
     };
+    let _server_lock = SERVER_LOCK.lock().await;
     let prefix = unique_prefix();
     let suffix = repo_suffix(&prefix);
     let repo = format!("gcpin-{suffix}");
@@ -1661,6 +1671,7 @@ async fn clone_after_eviction_rebuilds_cleanly() {
             return;
         }
     };
+    let _server_lock = SERVER_LOCK.lock().await;
     let prefix = unique_prefix();
     let suffix = repo_suffix(&prefix);
     let repo = format!("gcrebuild-{suffix}");
@@ -1723,6 +1734,7 @@ async fn public_fork_status_is_free_on_s3() {
             return;
         }
     };
+    let _server_lock = SERVER_LOCK.lock().await;
     let prefix = unique_prefix();
     let suffix = repo_suffix(&prefix);
     let repo = format!("forks3-{suffix}");
