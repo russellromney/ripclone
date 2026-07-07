@@ -14,7 +14,14 @@ impl ClientTuning {
             .max(1);
         let fetch_concurrency = 6;
         let archive_fetch_concurrency = 16;
-        let editable_download_concurrency = cores;
+        // Test hook: force serial downloads so a barrier-based test can pin the
+        // race window deterministically. Never set in production (the default is
+        // one download per core).
+        let editable_download_concurrency = std::env::var("RIPCLONE_TEST_DOWNLOAD_CONCURRENCY")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(cores);
         let pack_parse_threads = cores;
         tracing::debug!(
             fetch_concurrency,

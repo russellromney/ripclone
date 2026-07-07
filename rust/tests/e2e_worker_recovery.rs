@@ -50,7 +50,7 @@ async fn killed_worker_claim_is_reclaimed_and_rebuilds_cleanly() {
         std::env::set_var("RIPCLONE_QUEUE", "sqlite");
         std::env::set_var("RIPCLONE_QUEUE_DB_URL", &db_url);
         std::env::set_var("RIPCLONE_QUEUE_STALE_SECS", "1");
-        std::env::set_var("RIPCLONE_SYNC_MAX_ATTEMPTS", "120");
+        std::env::set_var("RIPCLONE_TEST_SYNC_MAX_ATTEMPTS", "120");
         // Keep worker #1 inside the full-history phase long enough to kill it
         // after it owns the queue claim. Worker #2 is spawned after this env is
         // removed, so recovery is fast.

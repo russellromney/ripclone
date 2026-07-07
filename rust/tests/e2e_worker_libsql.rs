@@ -83,7 +83,7 @@ async fn worker_farm_out_libsql_against_real_sqld() {
         std::env::set_var("RIPCLONE_QUEUE_DB_URL", format!("http://127.0.0.1:{port}"));
         // sqld runs without auth here; the backend requires a non-empty token.
         std::env::set_var("RIPCLONE_QUEUE_DB_TOKEN", "dev");
-        std::env::set_var("RIPCLONE_SYNC_MAX_ATTEMPTS", "10");
+        std::env::set_var("RIPCLONE_TEST_SYNC_MAX_ATTEMPTS", "10");
         // Also drive the METADATA store over the same libsql server — this is the
         // only runtime coverage of the libsql metadata adapter (it's otherwise
         // remote-only and compile-checked), and exercises queue + metadata on

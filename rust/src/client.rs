@@ -1047,7 +1047,13 @@ impl Client {
         // running) or 503 (queue full). Each POST blocks server-side until its
         // wait window elapses, so we just retry — coalescing means a retry
         // re-attaches to the same in-flight build rather than starting a new one.
-        let max_attempts = 40usize;
+        // Test hook: bound the poll so a negative-case test can fail fast instead
+        // of waiting out the full ceiling. Never set in production.
+        let max_attempts = std::env::var("RIPCLONE_TEST_SYNC_MAX_ATTEMPTS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(40);
         for attempt in 0..max_attempts {
             let resp = self.request(reqwest::Method::POST, &url).send().await?;
             let status = resp.status();
