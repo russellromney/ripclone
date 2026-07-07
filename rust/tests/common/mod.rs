@@ -1121,10 +1121,34 @@ pub async fn ensure_added(server: &Server, repo: &str) -> anyhow::Result<()> {
 
 pub async fn register_added_without_build(server: &Server, repo: &str) -> anyhow::Result<()> {
     use ripclone::provider::RepoId;
+    register_added_without_build_repo_id(server, RepoId::github(repo)).await
+}
+
+/// Same as [`register_added_without_build`] but for a repo that belongs to a
+/// non-default provider instance (e.g. `github-bad`, `gitlab-auth`). The gate's
+/// added-repo lookup keys on the full `RepoId` (provider + path), so a repo
+/// synced through a provider client must be registered under that same provider.
+pub async fn register_added_without_build_for_provider(
+    server: &Server,
+    provider: &str,
+    path: &str,
+) -> anyhow::Result<()> {
+    use ripclone::provider::{ProviderInstanceId, RepoId};
+    let repo_id = RepoId {
+        provider: ProviderInstanceId::new(provider),
+        path: path.to_string(),
+    };
+    register_added_without_build_repo_id(server, repo_id).await
+}
+
+async fn register_added_without_build_repo_id(
+    server: &Server,
+    repo_id: ripclone::provider::RepoId,
+) -> anyhow::Result<()> {
     use ripclone::ref_store::{AddedRepo, AddedRepoSource, FileRefStore, RefStore};
 
     let added = AddedRepo {
-        repo_id: RepoId::github(repo),
+        repo_id,
         added_at: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()

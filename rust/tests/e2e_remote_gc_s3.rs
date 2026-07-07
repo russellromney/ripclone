@@ -1298,6 +1298,7 @@ async fn expired_bearer_and_signed_url_mid_cli_clone_fail_cleanly() {
     origin.commit(&[("a.txt", &body), ("b.txt", "stable\n")], "c1");
     origin.publish();
 
+    add_acme_repo(&server, &repo).await;
     server
         .client()
         .sync_repo(&format!("acme/{repo}"), None)

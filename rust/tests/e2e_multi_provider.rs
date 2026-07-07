@@ -129,6 +129,7 @@ async fn github_provider_injects_basic_x_access_token_auth_header() {
     let providers_str = providers.to_string();
     let server = start_server_env(&[("RIPCLONE_PROVIDERS", &providers_str)]).await;
     let client = server.client_with_provider("github-http", None);
+    client.add_repo("acme/http").await.expect("add repo");
     client
         .sync_repo("acme/http", None)
         .await
@@ -258,6 +259,13 @@ async fn provider_upstream_rejects_wrong_or_absent_auth_headers() {
         let providers_str = providers.to_string();
         let server = start_server_env(&[("RIPCLONE_PROVIDERS", &providers_str)]).await;
         let client = server.client_with_provider(provider_id, None);
+        register_added_without_build_for_provider(
+            &server,
+            provider_id,
+            &format!("acme/{provider_id}"),
+        )
+        .await
+        .expect("mark provider repo added");
         let res = client.sync_repo(&format!("acme/{provider_id}"), None).await;
         assert!(
             res.is_err(),

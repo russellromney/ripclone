@@ -295,6 +295,11 @@ async fn concurrent_same_repo_syncs_and_clones_under_load_get_current_bytes() {
     origin.publish();
     server
         .client()
+        .add_repo("acme/loadsame")
+        .await
+        .expect("add loadsame");
+    server
+        .client()
         .sync_repo("acme/loadsame", None)
         .await
         .expect("initial warm");

@@ -402,6 +402,9 @@ async fn provider_webhook_builds_use_provider_auth_headers() {
         let server =
             start_server_env(&[("RIPCLONE_PROVIDERS", &providers), (&secret_env, SECRET)]).await;
 
+        register_added_without_build_for_provider(&server, provider_id, &repo)
+            .await
+            .expect("mark webhook repo added");
         post_provider_push(&server, provider_id, kind, push_body(kind, &repo)).await;
 
         let (_g, c) =

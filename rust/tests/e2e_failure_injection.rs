@@ -53,6 +53,9 @@ async fn storage_upload_failure_mid_build_does_not_publish_partial_ref_and_retry
     );
     origin.publish();
 
+    register_added_without_build(&server, "acme/writefail")
+        .await
+        .expect("mark writefail added");
     let first = server.client().sync_repo("acme/writefail", None).await;
     assert!(
         first.is_err(),
@@ -114,6 +117,9 @@ async fn ref_store_write_failure_does_not_publish_partial_ref_and_retry_recovers
     );
     origin.publish();
 
+    register_added_without_build(&server, "acme/reffail")
+        .await
+        .expect("mark reffail added");
     let first = server.client().sync_repo("acme/reffail", None).await;
     assert!(
         first.is_err(),
