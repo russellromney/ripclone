@@ -1072,6 +1072,30 @@ pub async fn sync_until_manifest(
     panic!("clonepack manifest never published for {owner}/{repo} (last: {last})");
 }
 
+/// Shared B5 seam: make a repo warm enough that a subsequent clone can fetch
+/// real bytes, not just observe that `/sync` returned. Today this means polling
+/// until the full clonepack manifest exists; B5 can change add/sync semantics in
+/// one place.
+pub async fn warm_repo_until_cloneable(
+    server: &Server,
+    owner: &str,
+    repo: &str,
+) -> ripclone::client::RefResponse {
+    sync_until_manifest(server, owner, repo).await
+}
+
+/// Wait until an already-triggered build has published cloneable artifacts.
+/// This deliberately clones bytes as the probe, so a stale/ref-only success
+/// cannot pass.
+pub async fn wait_repo_cloneable(
+    server: &Server,
+    owner: &str,
+    repo: &str,
+    want_count: &str,
+) -> (TempDir, PathBuf) {
+    clone_full_at(server, owner, repo, want_count).await
+}
+
 /// True when `dir` contains at least one regular file (recursively) — used to
 /// tell a materialized files-mode worktree from an empty/not-yet-built one.
 fn dir_has_file(dir: &Path) -> bool {
@@ -1097,6 +1121,16 @@ fn dir_has_file(dir: &Path) -> bool {
 
 /// A spawned `ripclone-worker` binary, killed when dropped.
 pub struct WorkerProc(Child);
+
+impl WorkerProc {
+    /// Kill the worker process and wait for it to exit. Tests use this to model
+    /// SIGKILL-style loss of the build owner while the SQL queue row remains
+    /// claimed.
+    pub fn kill_and_wait(mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
 
 impl Drop for WorkerProc {
     fn drop(&mut self) {
