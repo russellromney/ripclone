@@ -135,7 +135,11 @@ impl S3Storage {
         let mut out = Vec::new();
         let mut stream = stream;
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| anyhow::anyhow!("S3 body stream error: {}", e))?;
+            // Preserve the concrete `s3::Error` as the anyhow source (do not
+            // stringify): the build-error classifier downcasts to `s3::Error` to
+            // decide retryable, so a mid-body network drop (a Transport error)
+            // must keep its type or it falls through to a permanent failure.
+            let chunk = chunk.context("S3 body stream error")?;
             out.extend_from_slice(&chunk);
         }
         Ok(out)

@@ -13,6 +13,7 @@
 use crate::provider::RepoId;
 use anyhow::Result;
 use async_trait::async_trait;
+use std::fmt;
 use std::sync::Arc;
 
 pub mod libsql_db;
@@ -52,6 +53,45 @@ pub struct BuildJob {
     /// not a spin) and spread across the worker pool, with the poller as backstop.
     pub recheck: u32,
 }
+
+/// Error returned by a build worker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildError {
+    message: String,
+    retryable: bool,
+}
+
+impl BuildError {
+    pub fn permanent(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retryable: false,
+        }
+    }
+
+    pub fn retryable(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retryable: true,
+        }
+    }
+
+    pub fn is_retryable(&self) -> bool {
+        self.retryable
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl fmt::Display for BuildError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.message.fmt(f)
+    }
+}
+
+impl std::error::Error for BuildError {}
 
 impl BuildJob {
     /// Coalescing key: concurrent syncs for the same key collapse to one build.

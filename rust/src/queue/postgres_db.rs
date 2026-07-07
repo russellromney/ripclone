@@ -232,6 +232,31 @@ impl QueueDb for PostgresDb {
         Ok(res.rows_affected() == 1)
     }
 
+    async fn claimed_attempts(&self, id: i64, worker_id: &str) -> Result<Option<i64>> {
+        sqlx::query_scalar(
+            "SELECT attempts FROM jobs WHERE id = $1 AND worker_id = $2 AND status = 'claimed'",
+        )
+        .bind(id)
+        .bind(worker_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("fetch claimed attempts")
+    }
+
+    async fn requeue_claim(&self, id: i64, worker_id: &str, error: &str) -> Result<bool> {
+        let res = sqlx::query(
+            "UPDATE jobs SET status = 'queued', worker_id = NULL, error = $1
+             WHERE id = $2 AND worker_id = $3 AND status = 'claimed'",
+        )
+        .bind(error)
+        .bind(id)
+        .bind(worker_id)
+        .execute(&self.pool)
+        .await
+        .context("requeue retryable job")?;
+        Ok(res.rows_affected() == 1)
+    }
+
     async fn status(&self, id: i64) -> Result<Option<(String, Option<String>)>> {
         let row = sqlx::query("SELECT status, error FROM jobs WHERE id = $1")
             .bind(id)

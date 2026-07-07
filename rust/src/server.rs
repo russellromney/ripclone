@@ -13,7 +13,7 @@ use crate::metrics::{Metrics, SyncPhaseMetrics};
 use crate::oidc::OidcVerifier;
 use crate::pack::PackBuilder;
 use crate::provider::{ProviderInstance, ProviderRegistry, RepoId};
-use crate::queue::{BuildJob, EnqueueOutcome, JobQueueRef, JobState};
+use crate::queue::{BuildError, BuildJob, EnqueueOutcome, JobQueueRef, JobState};
 use crate::ref_store::{RefStore, migrate_legacy_refs};
 use crate::remote_gc::{GcConfig, RemoteGc};
 use crate::retention::Retention;
@@ -429,7 +429,7 @@ pub type BuildWaiters = Arc<
     tokio::sync::Mutex<
         std::collections::HashMap<
             String,
-            Vec<tokio::sync::oneshot::Sender<Result<SyncBuildResult, String>>>,
+            Vec<tokio::sync::oneshot::Sender<Result<SyncBuildResult, BuildError>>>,
         >,
     >,
 >;
@@ -2813,7 +2813,7 @@ async fn sync_repo_inner(
         // the coalescing key so syncs for different build commits don't share
         // one build.
         let key = inproc_build_key(&repo_id, &branch, at_rev.as_deref());
-        let (tx, rx) = tokio::sync::oneshot::channel::<Result<SyncBuildResult, String>>();
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<SyncBuildResult, BuildError>>();
         let first = {
             let mut w = state.build_waiters.lock().await;
             // Presence-based: a key present — even an empty marker left by the
@@ -5925,7 +5925,7 @@ async fn build_full_in_background(
 pub async fn process_build_job(
     state: &ServerState,
     job: &BuildJob,
-) -> Result<SyncBuildResult, String> {
+) -> Result<SyncBuildResult, BuildError> {
     let repo_id = &job.repo_id;
     let branch = &job.branch;
     let at_rev = job.rev.clone();
@@ -5954,7 +5954,10 @@ pub async fn process_build_job(
                 "unknown provider {} for build job",
                 repo_id.provider.as_str()
             );
-            return Err(format!("unknown provider {}", repo_id.provider.as_str()));
+            return Err(BuildError::permanent(format!(
+                "unknown provider {}",
+                repo_id.provider.as_str()
+            )));
         }
     };
     // do_sync holds this per-repo lock only across the mirror-mutating prep and
@@ -6093,9 +6096,67 @@ pub async fn process_build_job(
                 "background build failed for {}@{effective_branch}: {e}",
                 repo_id.storage_key()
             );
-            Err(format!("{e}"))
+            Err(classify_build_error(e))
         }
     }
+}
+
+fn classify_build_error(error: &anyhow::Error) -> BuildError {
+    for cause in error.chain() {
+        if let Some(s3_error) = cause.downcast_ref::<s3::Error>() {
+            let message = format!("{error:#}");
+            return if s3_error.is_retryable() {
+                BuildError::retryable(message)
+            } else {
+                BuildError::permanent(message)
+            };
+        }
+        if let Some(reqwest_error) = cause.downcast_ref::<reqwest::Error>() {
+            let message = format!("{error:#}");
+            return if reqwest_error.is_timeout()
+                || reqwest_error.is_connect()
+                || reqwest_error
+                    .status()
+                    .is_some_and(|s| s == StatusCode::TOO_MANY_REQUESTS || s.is_server_error())
+            {
+                BuildError::retryable(message)
+            } else {
+                BuildError::permanent(message)
+            };
+        }
+        if let Some(io_error) = cause.downcast_ref::<std::io::Error>()
+            && is_retryable_io_error(io_error)
+        {
+            return BuildError::retryable(format!("{error:#}"));
+        }
+        if let Some(git_error) = cause.downcast_ref::<git::UpstreamGitError>() {
+            let message = format!("{error:#}");
+            return if git_error.is_retryable() {
+                BuildError::retryable(message)
+            } else {
+                BuildError::permanent(message)
+            };
+        }
+        if cause.is::<tokio::time::error::Elapsed>() {
+            return BuildError::retryable(format!("{error:#}"));
+        }
+    }
+    BuildError::permanent(format!("{error:#}"))
+}
+
+fn is_retryable_io_error(error: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    matches!(
+        error.kind(),
+        ErrorKind::TimedOut
+            | ErrorKind::Interrupted
+            | ErrorKind::ConnectionRefused
+            | ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::NotConnected
+            | ErrorKind::BrokenPipe
+            | ErrorKind::UnexpectedEof
+    )
 }
 
 /// Max consecutive post-build freshness re-triggers before deferring to the
@@ -6372,7 +6433,7 @@ fn spawn_build_worker(state: ServerState, mut rx: tokio::sync::mpsc::Receiver<Bu
                 let result =
                     match tokio::spawn(async move { process_build_job(&st, &job).await }).await {
                         Ok(r) => r,
-                        Err(e) => Err(format!("build task panicked: {e}")),
+                        Err(e) => Err(BuildError::retryable(format!("build task panicked: {e}"))),
                     };
                 state.build_queue_depth.fetch_sub(1, Ordering::Relaxed);
                 if let Some(senders) = state.build_waiters.lock().await.remove(&key) {
@@ -6763,6 +6824,72 @@ mod tests {
     use super::*;
     use tower::util::ServiceExt;
 
+    // Classification must be TYPE-based (downcast at the do_sync error boundary),
+    // not string-matching. These pin the concrete-source → retryable mapping; a
+    // regression to message-matching or a mis-mapped source flips a case.
+
+    #[test]
+    fn classify_s3_transport_error_is_retryable() {
+        // A Tigris network blip surfaces as `s3::Error::Transport`. If the type
+        // is lost (e.g. stringified in collect_stream) this falls through to
+        // permanent — the stale-until-repush bug.
+        let e = anyhow::Error::new(s3::Error::Transport {
+            message: "connection reset".into(),
+            source: None,
+        })
+        .context("S3 get_object");
+        assert!(classify_build_error(&e).is_retryable());
+    }
+
+    #[test]
+    fn classify_s3_5xx_is_retryable_and_config_is_permanent() {
+        let five_xx = anyhow::Error::new(s3::Error::Api {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: None,
+            message: None,
+            request_id: None,
+            host_id: None,
+            body_snippet: None,
+        });
+        assert!(classify_build_error(&five_xx).is_retryable());
+
+        let bad_config = anyhow::Error::new(s3::Error::InvalidConfig {
+            message: "bad bucket".into(),
+        });
+        assert!(!classify_build_error(&bad_config).is_retryable());
+    }
+
+    #[test]
+    fn classify_s3_404_is_permanent() {
+        let not_found = anyhow::Error::new(s3::Error::Api {
+            status: StatusCode::NOT_FOUND,
+            code: None,
+            message: None,
+            request_id: None,
+            host_id: None,
+            body_snippet: None,
+        });
+        assert!(!classify_build_error(&not_found).is_retryable());
+    }
+
+    #[test]
+    fn classify_retryable_io_error_is_retryable() {
+        let e = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::ConnectionReset))
+            .context("upload chunk");
+        assert!(classify_build_error(&e).is_retryable());
+    }
+
+    #[test]
+    fn classify_unknown_error_is_permanent() {
+        // No recognized transient source in the chain → permanent, so a genuine
+        // bad-repo/malformed failure fails fast instead of burning the cap.
+        let e = anyhow::anyhow!("malformed pack index");
+        assert!(!classify_build_error(&e).is_retryable());
+
+        let not_found_io = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::NotFound));
+        assert!(!classify_build_error(&not_found_io).is_retryable());
+    }
+
     fn test_state(tmp: &tempfile::TempDir) -> ServerState {
         let cas_root = tmp.path().join("cas");
         let cas = Cas::new(&cas_root).unwrap();
@@ -6816,6 +6943,58 @@ mod tests {
 
     fn auth_header() -> String {
         format!("Ripclone {}", hex::encode(Sha256::digest("secret")))
+    }
+
+    #[test]
+    fn build_error_classification_maps_storage_sources() {
+        let retryable = classify_build_error(&anyhow::Error::new(s3::Error::Api {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: None,
+            message: None,
+            request_id: None,
+            host_id: None,
+            body_snippet: None,
+        }));
+        assert!(retryable.is_retryable());
+
+        let retryable =
+            classify_build_error(&anyhow::Error::new(s3::Error::transport("network", None)));
+        assert!(retryable.is_retryable());
+
+        let permanent = classify_build_error(&anyhow::Error::new(s3::Error::Api {
+            status: StatusCode::NOT_FOUND,
+            code: None,
+            message: None,
+            request_id: None,
+            host_id: None,
+            body_snippet: None,
+        }));
+        assert!(!permanent.is_retryable());
+    }
+
+    #[test]
+    fn build_error_classification_maps_io_timeout_and_upstream_sources() {
+        let timeout = classify_build_error(&anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "timeout",
+        )));
+        assert!(timeout.is_retryable());
+
+        let malformed = classify_build_error(&anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "bad input",
+        )));
+        assert!(!malformed.is_retryable());
+
+        let upstream_429 = classify_build_error(&anyhow::Error::new(git::UpstreamGitError::new(
+            "fetch", true,
+        )));
+        assert!(upstream_429.is_retryable());
+
+        let upstream_not_found = classify_build_error(&anyhow::Error::new(
+            git::UpstreamGitError::new("fetch", false),
+        ));
+        assert!(!upstream_not_found.is_retryable());
     }
 
     #[test]
