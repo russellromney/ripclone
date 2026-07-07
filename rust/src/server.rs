@@ -5236,13 +5236,16 @@ async fn build_and_publish_two_phase(
     // would reference objects storage no longer has, so the published manifest
     // would point at deleted packs and the next clone 404s. Treat an evicted prev
     // as absent so the rebuild is cold and re-uploads everything it references.
-    let prev = ref_store
-        .load_branch(repo_id, branch)
-        .await
-        .ok()
-        .flatten()
+    let prev_loaded = ref_store.load_branch(repo_id, branch).await.ok().flatten();
+    // Preserve the repo's warm pin across a cold rebuild. The pin is an
+    // out-of-band entitlement flag the cloud writes; an evicted `prev` (whose
+    // artifacts GC already reclaimed) is treated as absent for artifact carry
+    // below, but dropping its pin would let the freshly rebuilt ref come back
+    // un-pinned and be re-evicted every idle cycle. Read the pin from the raw
+    // prev, before the evicted filter.
+    let prev_warm_pinned = prev_loaded.as_ref().map(|p| p.warm_pinned).unwrap_or(false);
+    let prev = prev_loaded
         .filter(|p| p.build_status.as_deref() != Some(crate::remote_gc::EVICTED_BUILD_STATUS));
-    let prev_warm_pinned = prev.as_ref().map(|p| p.warm_pinned).unwrap_or(false);
 
     // ---- PHASE 1: HEAD closure + archive + shallow skeleton -> publish depth=1 ----
     let mut t = Instant::now();
