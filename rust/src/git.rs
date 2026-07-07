@@ -1216,6 +1216,17 @@ pub fn disable_auto_gc(mirror_dir: &Path) -> Result<()> {
 /// out of argv, `.git/config`, and logs. The `RIPCLONE_ORIGIN_BASE` override is
 /// honored for the github default instance so offline e2e tests can use local
 /// `file://` origins.
+///
+/// Whenever the credential header is attached, redirect following is turned off
+/// (`http.followRedirects=false`). git's default follows the smart-HTTP
+/// ref-advertisement redirect, and curl resends a custom-named credential header
+/// to the redirect target host. A trusted provider with an open redirect on its
+/// smart-HTTP path could 302 an authenticated fetch to an attacker host and
+/// deliver the provider token (or the cloud install token). curl only strips the
+/// `Authorization` header cross-origin, not a configured custom header name, so
+/// refusing the redirect is the only reliable stop: a redirect fails loudly
+/// instead of leaking the credential. Unauthenticated requests keep following
+/// redirects normally.
 fn upstream_url_and_auth(
     provider: &ProviderInstance,
     repo_id: &RepoId,
@@ -1237,6 +1248,8 @@ fn upstream_url_and_auth(
     {
         git_args.push("-c".to_string());
         git_args.push(format!("http.extraHeader={}: {}", name, value));
+        git_args.push("-c".to_string());
+        git_args.push("http.followRedirects=false".to_string());
     }
     (url, git_args)
 }
@@ -1840,6 +1853,126 @@ mod tests {
                 !upstream_failure_is_retryable(&one_response_url(status), None),
                 "{status} should be terminal"
             );
+        }
+    }
+
+    /// A provider instance that attaches a custom-named credential header. curl
+    /// strips a cross-origin `Authorization` header on its own, but not a custom
+    /// name like `PRIVATE-TOKEN`, so this is the shape that can leak on redirect.
+    fn leaky_provider(host: &str) -> ProviderInstance {
+        ProviderInstance {
+            id: crate::provider::ProviderInstanceId::new("selfhost"),
+            kind: crate::provider::ProviderKind::Generic,
+            host: host.to_string(),
+            auth_template: Some("{token}".to_string()),
+            auth_header_name: Some("PRIVATE-TOKEN".to_string()),
+        }
+    }
+
+    /// The credential-injection args must also refuse redirects. Without this,
+    /// git follows the smart-HTTP ref-advertisement redirect and curl resends the
+    /// custom credential header to the redirect target host.
+    #[test]
+    fn authenticated_git_args_refuse_redirects() {
+        let provider = leaky_provider("http://127.0.0.1:1/");
+        let repo_id = RepoId {
+            provider: crate::provider::ProviderInstanceId::new("selfhost"),
+            path: "repo".to_string(),
+        };
+        let token = secrecy::SecretString::new("SECRETTOKEN".to_string().into());
+
+        let (_url, git_args) = upstream_url_and_auth(&provider, &repo_id, Some(&token));
+        assert!(
+            git_args.iter().any(|a| a == "http.followRedirects=false"),
+            "authenticated git args must disable redirect following, got {git_args:?}"
+        );
+        assert!(
+            git_args
+                .iter()
+                .any(|a| a.starts_with("http.extraHeader=PRIVATE-TOKEN: ")),
+            "credential still rides in extraHeader, got {git_args:?}"
+        );
+
+        // No credential -> no header and no redirect override; public clones may
+        // still legitimately follow redirects.
+        let (_url, no_auth) = upstream_url_and_auth(&provider, &repo_id, None);
+        assert!(
+            no_auth.is_empty(),
+            "unauthenticated args stay empty, got {no_auth:?}"
+        );
+    }
+
+    /// End-to-end guard: an authenticated ls-remote whose upstream 302-redirects
+    /// to a different host must not deliver the credential header to that host.
+    /// The redirect must fail loudly instead.
+    #[test]
+    fn authenticated_ls_remote_does_not_leak_credential_on_redirect() {
+        use std::sync::mpsc;
+
+        // Attacker: captures the raw request line + headers of anything it gets.
+        let attacker = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let attacker_addr = attacker.local_addr().unwrap();
+        let (tx, rx) = mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = attacker.accept() {
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let _ = tx.send(String::from_utf8_lossy(&buf[..n]).to_string());
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+            }
+        });
+
+        // Provider: 302-redirects the info/refs request to the attacker host.
+        let provider_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let provider_addr = provider_listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = provider_listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 302 Found\r\nLocation: http://{attacker_addr}/repo.git/info/refs?service=git-upload-pack\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+            }
+        });
+
+        let provider = leaky_provider(&format!("http://{provider_addr}"));
+        let repo_id = RepoId {
+            provider: crate::provider::ProviderInstanceId::new("selfhost"),
+            path: "repo".to_string(),
+        };
+        let token = secrecy::SecretString::new("SECRETTOKEN".to_string().into());
+        let (url, git_args) = upstream_url_and_auth(&provider, &repo_id, Some(&token));
+
+        // Mirror the real ls-remote invocation shape.
+        let status = Command::new("git")
+            .args(&git_args)
+            .args(["ls-remote", &url])
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(
+            !status.success(),
+            "a cross-host redirect on an authenticated fetch must fail, not succeed"
+        );
+
+        // The attacker must never have received the credential. It either got no
+        // request at all (redirect refused) or, defensively, a request without
+        // the credential header.
+        match rx.recv_timeout(Duration::from_secs(3)) {
+            Ok(request) => {
+                let lower = request.to_ascii_lowercase();
+                assert!(
+                    !lower.contains("private-token") && !request.contains("SECRETTOKEN"),
+                    "credential leaked to redirect target:\n{request}"
+                );
+            }
+            Err(_) => { /* redirect refused; attacker never reached */ }
         }
     }
 
