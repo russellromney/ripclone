@@ -88,11 +88,25 @@ async fn server_error(context: &str, resp: reqwest::Response) -> anyhow::Error {
                 text.clone()
             }
         });
-    let hint = match (status.as_u16(), code, is_cloud) {
+    let hint = error_hint(status.as_u16(), code, is_cloud);
+    if let Some(u) = upgrade {
+        eprintln!("ripclone: {u}");
+    }
+    anyhow::anyhow!("{context}: {msg}{hint}")
+}
+
+/// Next-step hint for a failed server response, keyed on HTTP status, the
+/// gateway's `code`, and whether we are talking to the managed cloud. Pure so
+/// the paywall path stays testable: a paid-plan block (403 `no_plan`) must
+/// carry the machine-parseable `code` plus the subscribe URL so an agent fleet
+/// can detect and route it without scraping prose.
+fn error_hint(status: u16, code: Option<&str>, is_cloud: bool) -> &'static str {
+    match (status, code, is_cloud) {
         (401, _, true) => "\n  → run `ripclone login`",
         (401, _, false) => {
             "\n  → run `ripclone login --server <server>` or set RIPCLONE_SERVER_TOKEN"
         }
+        (402, _, _) => "\n  → this repo needs a paid plan; subscribe at https://ripclone.com",
         (403, Some("no_plan"), true) => {
             "\n  → this org needs a plan; the owner can subscribe at https://ripclone.com"
         }
@@ -103,11 +117,7 @@ async fn server_error(context: &str, resp: reqwest::Response) -> anyhow::Error {
         (404, Some("repo_not_added"), _) => "\n  → run `ripclone add <repo>`",
         (502 | 503, _, _) => "\n  → ripclone is briefly unavailable; retry shortly",
         _ => "",
-    };
-    if let Some(u) = upgrade {
-        eprintln!("ripclone: {u}");
     }
-    anyhow::anyhow!("{context}: {msg}{hint}")
 }
 
 /// Build a reqwest client that always sends our User-Agent (and any default
@@ -2951,6 +2961,22 @@ fn local_rev_parse(main_repo: &Path, branch: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paywall_hint_is_machine_parseable_with_subscribe_url() {
+        // A paid-plan block on the managed cloud must point at the subscribe
+        // URL so an agent fleet can detect and route it.
+        let hint = error_hint(403, Some("no_plan"), true);
+        assert!(
+            hint.contains("https://ripclone.com"),
+            "no_plan hint: {hint}"
+        );
+        // A bare 402 (payment required) also carries the subscribe URL.
+        let hint = error_hint(402, None, true);
+        assert!(hint.contains("https://ripclone.com"), "402 hint: {hint}");
+        // A generic self-host 403 does not fabricate a subscribe URL.
+        assert!(!error_hint(403, None, false).contains("ripclone.com"));
+    }
 
     #[test]
     fn fsync_tree_walks_files_dirs_and_symlinks() {

@@ -208,6 +208,10 @@ ripclone clone owner/repo --at HEAD~5
 # Ephemeral, in-memory (tmpfs) clone for throwaway agent/CI machines (Linux)
 ripclone clone owner/repo --temp
 
+# Agent-fleet mode: fleet-sane defaults (depth-1 history, never prompts).
+# See docs/AGENTS.md for the fleet quickstart.
+RIPCLONE_AGENT=1 ripclone clone owner/repo
+
 # Print a per-phase benchmark report after the clone
 ripclone clone owner/repo --bench
 
@@ -227,6 +231,10 @@ ripclone --token ghp_xxx clone my-org/private-repo
 ```
 
 Pushes go to your git host directly, not through ripclone.
+
+Running an **agent fleet or CI** at scale? Set `RIPCLONE_AGENT=1` for fleet-sane
+defaults (depth-1 history, no prompts, headless token-in-env) and see the fleet
+quickstart in **[Agents & CI](docs/AGENTS.md)**.
 
 For editable clones you can have the client cross-check the installed tip against
 your git host with `--verify-upstream`. In `auto` mode (the default) this runs
