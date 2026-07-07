@@ -6067,6 +6067,18 @@ pub async fn process_build_job(
                     );
                 }
             }
+            if inline_full_history {
+                if let Err(e) =
+                    update_build_status(state, repo_id, &effective_branch, &info.commit, "done")
+                        .await
+                {
+                    error!(
+                        "build status update failed for {}@{effective_branch} {}: {e:#}",
+                        repo_id.storage_key(),
+                        info.commit
+                    );
+                }
+            }
             // A successful sync marks the mirror fresh so a following resolve
             // doesn't re-fetch. Stamp both the concrete branch and the original
             // requested branch (e.g. HEAD).
@@ -6613,6 +6625,18 @@ async fn update_current_build_status(
     };
     if info.commit.is_empty() {
         return Ok(None);
+    }
+    // An evicted ref's artifacts were deleted, but its artifact-pointer fields
+    // (full_clonepack, archive_chunks) are left intact. The plain "building"
+    // marker set at the start of a rebuild produces no fresh artifacts yet, so
+    // overwriting the eviction sentinel with it would make the stale pointers
+    // look like a complete, reusable build — reuse_existing_build would then
+    // no-op the rebuild and the ref would never be rebuilt. Keep it evicted
+    // until phase 1 replaces the ref with freshly built artifacts.
+    if status == "building"
+        && info.build_status.as_deref() == Some(crate::remote_gc::EVICTED_BUILD_STATUS)
+    {
+        return Ok(Some(info.commit));
     }
     let commit = info.commit.clone();
     state
