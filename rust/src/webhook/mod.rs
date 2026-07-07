@@ -219,6 +219,14 @@ impl WebhookConfig {
             None => true,
         }
     }
+
+    /// The configured allowlist entries as operator-facing natural repo keys.
+    pub fn allowlist_repos(&self) -> Vec<String> {
+        self.allowlist
+            .as_ref()
+            .map(|set| set.iter().cloned().collect())
+            .unwrap_or_default()
+    }
 }
 
 /// Turn a raw env value into a secret. An absent, empty, **or all-whitespace**
