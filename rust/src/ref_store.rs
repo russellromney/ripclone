@@ -994,6 +994,13 @@ impl RefStore for S3RefStore {
     }
 }
 
+/// How long a branch-delete tombstone suppresses a stale build's publish. Must
+/// exceed the longest realistic build so an in-flight build that fetched before
+/// the delete cannot outlive its tombstone and resurrect the branch. A genuine
+/// re-create (a new push fetched *after* the delete) is admitted regardless of
+/// this window because its `synced_at` beats the tombstone.
+const DELETE_TOMBSTONE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
+
 /// In-memory caching wrapper around a `RefStore`.
 pub struct CachingRefStore<T: RefStore> {
     inner: T,
@@ -1003,6 +1010,14 @@ pub struct CachingRefStore<T: RefStore> {
     /// that overlaps with a write can detect the overlap and avoid caching a
     /// value that may be stale by the time it acquires the write lock.
     write_gen: AtomicU64,
+    /// Branch-delete tombstones: `(repo, branch) -> (deleted-at unix secs,
+    /// recorded Instant)`. A webhook branch-delete records one here so a build
+    /// that was already in flight when the delete landed cannot re-create the
+    /// ref by publishing after it. `save_branch` drops any write whose ordering
+    /// timestamp is at-or-before the delete; a later legitimate re-create clears
+    /// the tombstone. The `Instant` bounds the map so tombstones for branches
+    /// that never come back are pruned after [`DELETE_TOMBSTONE_TTL`].
+    tombstones: RwLock<HashMap<(String, String), (u64, Instant)>>,
 }
 
 impl<T: RefStore> CachingRefStore<T> {
@@ -1017,11 +1032,27 @@ impl<T: RefStore> CachingRefStore<T> {
             ttl,
             cache: RwLock::new(HashMap::new()),
             write_gen: AtomicU64::new(0),
+            tombstones: RwLock::new(HashMap::new()),
         }
     }
 
     fn cache_key(repo_id: &RepoId, branch: &str) -> (String, String) {
         (repo_id.storage_key(), branch.to_string())
+    }
+
+    /// Whether a stale build's write for `key` must be dropped to avoid
+    /// resurrecting a just-deleted branch. True when a live tombstone exists and
+    /// the write's ordering timestamp (`synced_at`, stamped at fetch time) is
+    /// at-or-before the delete — i.e. this build fetched before the branch was
+    /// removed. A re-create fetched after the delete has a newer `synced_at` and
+    /// is admitted. Expired tombstones are pruned here.
+    async fn write_blocked_by_tombstone(&self, key: &(String, String), info: &RefInfo) -> bool {
+        let mut tombstones = self.tombstones.write().await;
+        tombstones.retain(|_, (_, seen)| seen.elapsed() < DELETE_TOMBSTONE_TTL);
+        match tombstones.get(key) {
+            Some((deleted_at, _)) => info.synced_at.unwrap_or(0) <= *deleted_at,
+            None => false,
+        }
     }
 }
 
@@ -1086,6 +1117,17 @@ impl<T: RefStore> RefStore for CachingRefStore<T> {
 
     async fn save_branch(&self, repo_id: &RepoId, branch: &str, info: &RefInfo) -> Result<()> {
         let key = Self::cache_key(repo_id, branch);
+        // A build that was already in flight when this branch was deleted must
+        // not resurrect it by publishing afterward. Drop the write when a live
+        // delete tombstone shadows it; a genuine re-create (fetched after the
+        // delete) clears the tombstone and lands.
+        if self.write_blocked_by_tombstone(&key, info).await {
+            warn!(
+                "ref store {}/{branch}: dropping stale build write; branch was deleted after this build fetched",
+                repo_id.storage_key()
+            );
+            return Ok(());
+        }
         // Do not hold the cache write lock across the inner store's I/O (e.g.
         // S3 CAS retries); one contended ref write must not stall every /refs
         // lookup on the node. The cache eviction happens after the durable
@@ -1150,6 +1192,19 @@ impl<T: RefStore> RefStore for CachingRefStore<T> {
 
     async fn delete_branch(&self, repo_id: &RepoId, branch: &str) -> Result<()> {
         let key = Self::cache_key(repo_id, branch);
+        // Record a tombstone before deleting so a build that fetched before this
+        // point cannot re-create the branch by publishing after the delete. Use
+        // the same clock (`synced_at` = fetch time, epoch secs) the publish path
+        // stamps, so ordering is comparable.
+        let deleted_at = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        {
+            let mut tombstones = self.tombstones.write().await;
+            tombstones.retain(|_, (_, seen)| seen.elapsed() < DELETE_TOMBSTONE_TTL);
+            tombstones.insert(key.clone(), (deleted_at, Instant::now()));
+        }
         // Do not hold the cache write lock across the inner store's I/O.
         self.write_gen.fetch_add(1, Ordering::SeqCst);
         self.inner.delete_branch(repo_id, branch).await?;
@@ -1333,6 +1388,7 @@ mod tests {
             ttl: Duration::from_secs(60),
             cache: RwLock::new(HashMap::new()),
             write_gen: AtomicU64::new(0),
+            tombstones: RwLock::new(HashMap::new()),
         };
 
         let repo_id = RepoId::github("o/r");
@@ -1353,6 +1409,7 @@ mod tests {
             ttl: Duration::from_secs(60),
             cache: RwLock::new(HashMap::new()),
             write_gen: AtomicU64::new(0),
+            tombstones: RwLock::new(HashMap::new()),
         };
         let repo_id = RepoId::github("o/r");
 
@@ -1670,6 +1727,62 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "delete must evict the cache, not serve a stale ref"
+        );
+    }
+
+    /// A build that was already in flight when a branch was deleted must not
+    /// resurrect it by publishing afterward, but a genuine re-create (a new push
+    /// fetched after the delete) must still land.
+    #[tokio::test]
+    async fn caching_ref_store_delete_tombstone_blocks_stale_build_not_recreate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = CachingRefStore::new(FileRefStore::new(tmp.path()));
+        let repo_id = RepoId::github("o/r");
+
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // The branch existed and was then deleted (webhook branch-delete).
+        let mut original = dummy_ref_info("c1");
+        original.synced_at = Some(now.saturating_sub(100));
+        store
+            .save_branch(&repo_id, "feature", &original)
+            .await
+            .unwrap();
+        store.delete_branch(&repo_id, "feature").await.unwrap();
+
+        // A build that fetched BEFORE the delete publishes afterward. Its
+        // ordering timestamp predates the delete, so it must not re-create.
+        let mut stale = dummy_ref_info("c1");
+        stale.synced_at = Some(now.saturating_sub(50));
+        store
+            .save_branch(&repo_id, "feature", &stale)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .load_branch(&repo_id, "feature")
+                .await
+                .unwrap()
+                .is_none(),
+            "a stale in-flight build must not resurrect a deleted branch"
+        );
+
+        // A genuine re-create pushed AFTER the delete (newer ordering timestamp)
+        // must land.
+        let mut recreate = dummy_ref_info("c2");
+        recreate.synced_at = Some(now + 100);
+        store
+            .save_branch(&repo_id, "feature", &recreate)
+            .await
+            .unwrap();
+        let loaded = store.load_branch(&repo_id, "feature").await.unwrap();
+        assert_eq!(
+            loaded.map(|r| r.commit),
+            Some("c2".to_string()),
+            "a legitimate re-create after delete must land"
         );
     }
 

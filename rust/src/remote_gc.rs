@@ -448,18 +448,33 @@ pub(crate) async fn reachable_hashes(
             .list_branches(&repo_id)
             .await
             .with_context(|| format!("list branches for {key}"))?;
+
+        // Load the repo's refs once so reachability can reason about the whole
+        // repo. The warm pin is repo-scoped: an entitled repo the cloud has
+        // pinned keeps its artifacts even past TTL eviction. A pin can land
+        // *after* a ref was already marked `evicted` (reconciliation lag or a
+        // failed pin write), so a pinned repo's evicted refs are not orphans —
+        // their chunks must be retained, not walked past. Mirrors the per-repo
+        // pin scope the warm-TTL eviction pass applies.
+        let mut infos = Vec::with_capacity(branches.len());
         for branch in branches {
             if fresh {
                 ref_store.invalidate(&repo_id, &branch).await;
             }
-            let Some(info) = ref_store
+            if let Some(info) = ref_store
                 .load_branch(&repo_id, &branch)
                 .await
                 .with_context(|| format!("load ref {key}/{branch}"))?
-            else {
-                continue;
-            };
-            if info.build_status.as_deref() == Some(EVICTED_BUILD_STATUS) {
+            {
+                infos.push((branch, info));
+            }
+        }
+        let warm_pinned = infos.iter().any(|(_, info)| info.warm_pinned);
+
+        for (branch, info) in infos {
+            // Skip an evicted ref only when the repo is not pinned; a pinned
+            // repo retains even its evicted refs.
+            if !warm_pinned && info.build_status.as_deref() == Some(EVICTED_BUILD_STATUS) {
                 continue;
             }
             collect_ref_info_hashes(&info, &mut reachable);
@@ -1323,6 +1338,60 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_ne!(info.build_status.as_deref(), Some(EVICTED_BUILD_STATUS));
+    }
+
+    /// Liveness guarantee for entitled repos: a warm-pinned repo whose ref was
+    /// *already* marked evicted (a pin that landed after the eviction, e.g.
+    /// reconciliation lag) must still have its artifacts retained by the
+    /// reachability walk. The pin is repo-scoped, so an evicted ref of a pinned
+    /// repo is not an orphan and its chunks must not be collected.
+    #[tokio::test]
+    async fn reachable_retains_evicted_ref_of_pinned_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cas_root = tmp.path().join("cas");
+        let repo_root = tmp.path().join("repos");
+        std::fs::create_dir_all(&cas_root).unwrap();
+        std::fs::create_dir_all(&repo_root).unwrap();
+
+        let cas = Cas::new(&cas_root).unwrap();
+        let storage: StorageRef = Arc::new(TestRemoteStorage {
+            inner: local(&cas_root).unwrap(),
+        });
+        let ref_store: Arc<dyn RefStore> = Arc::new(FileRefStore::new(&repo_root));
+
+        // The ref is already evicted, but the cloud has since pinned the repo.
+        let mut info = make_ref_info_with_manifest(&cas);
+        info.build_status = Some(EVICTED_BUILD_STATUS.to_string());
+        info.warm_pinned = true;
+        ref_store.save(&RepoId::github("o/r"), &info).await.unwrap();
+
+        let manifest_path = cas.path(&info.full_clonepack.manifest);
+        let metadata_path = cas.path(&info.metadata_chunk);
+        let archive_path = cas.path(&info.archive_chunks[0]);
+        assert!(manifest_path.exists());
+        assert!(metadata_path.exists());
+        assert!(archive_path.exists());
+
+        // warm_ttl = 0 disables the eviction pass so this isolates the reachability
+        // walk; grace = 0 deletes any genuine orphan this pass.
+        let gc = RemoteGc::new(
+            storage.clone(),
+            ref_store.clone(),
+            GcConfig {
+                grace_period: Duration::from_secs(0),
+                warm_ttl: Duration::from_secs(0),
+                dry_run: false,
+            },
+        );
+        let report = gc.run().await.unwrap();
+
+        assert_eq!(
+            report.objects_deleted, 0,
+            "pinned repo's evicted-ref artifacts must be retained"
+        );
+        assert!(manifest_path.exists(), "manifest retained");
+        assert!(metadata_path.exists(), "metadata retained");
+        assert!(archive_path.exists(), "archive retained");
     }
 
     #[tokio::test]
