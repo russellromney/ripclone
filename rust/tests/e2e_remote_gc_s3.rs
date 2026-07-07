@@ -1270,6 +1270,45 @@ async fn save_head_ref(
         .expect("save ref");
 }
 
+/// Age *every* ref of a repo — the literal `HEAD` alias and the concrete default
+/// branch — so the whole repo is uniformly idle. Warm-TTL eviction is
+/// repo-scoped: a repo is only evicted when all of its refs are idle past the
+/// TTL, so aging only the `HEAD` alias leaves the sibling default-branch ref
+/// (written by the detached phase-2 build, and holding the full-history
+/// artifacts) up to build timing. Enumerate the refs and age them all, reading
+/// through the cache (invalidate first) so the durable ref is what we mutate.
+async fn age_all_refs(env: &S3Env, prefix: &str, owner: &str, repo: &str) {
+    let storage = make_s3_storage(env, prefix).expect("storage");
+    let ref_store = make_s3_ref_store(storage);
+    let repo_id = RepoId::github(format!("{owner}/{repo}"));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let aged = now.saturating_sub(86400);
+    let branches = ref_store
+        .list_branches(&repo_id)
+        .await
+        .expect("list branches to age");
+    assert!(!branches.is_empty(), "repo has at least one ref to age");
+    for branch in branches {
+        ref_store.invalidate(&repo_id, &branch).await;
+        let Some(mut info) = ref_store
+            .load_branch(&repo_id, &branch)
+            .await
+            .expect("load ref to age")
+        else {
+            continue;
+        };
+        info.last_accessed_at = Some(aged);
+        info.synced_at = Some(aged);
+        ref_store
+            .save_branch(&repo_id, &branch, &info)
+            .await
+            .expect("save aged ref");
+    }
+}
+
 async fn run_gc(
     env: &S3Env,
     prefix: &str,
@@ -1319,14 +1358,15 @@ async fn warm_ttl_evicts_idle_ref_and_status_reports_cold() {
     let status = get_status(&server, "acme", &repo, None).await;
     assert!(status["refs"][0]["warm"].as_bool().unwrap());
 
-    let mut info = load_head_ref(&env, &prefix, "acme", &repo).await;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    info.last_accessed_at = Some(now.saturating_sub(86400));
-    info.synced_at = Some(now.saturating_sub(86400));
-    save_head_ref(&env, &prefix, "acme", &repo, &info).await;
+    // Settle phase 2 before aging. The detached full-history build writes a
+    // second ref (the concrete default branch) that holds the full artifacts and,
+    // while it is mid-flight ("archive building"), shares the very chunks the
+    // `HEAD` alias points at. Warm-TTL eviction is repo-scoped, so if that sibling
+    // ref is still fresh, evicting the aged `HEAD` alone deletes nothing. Wait for
+    // the build to finish, then age *every* ref so the whole repo is uniformly
+    // idle and the eviction is deterministic.
+    wait_for_full_build(&env, &prefix, "acme", &repo).await;
+    age_all_refs(&env, &prefix, "acme", &repo).await;
 
     let report = run_gc(&env, &prefix, Duration::from_secs(1), false).await;
     assert!(
@@ -1452,17 +1492,12 @@ async fn clone_after_eviction_rebuilds_cleanly() {
         .expect("sync");
 
     // Settle phase 2 before evicting so the rebuild below starts from a fully
-    // built repo, not one the detached build is still writing.
+    // built repo, not one the detached build is still writing. Then age *every*
+    // ref (the `HEAD` alias and the concrete default branch) so the whole repo is
+    // uniformly idle: eviction is repo-scoped, so a single fresh sibling ref would
+    // keep the repo warm and leave `refs[0]` reporting warm below.
     wait_for_full_build(&env, &prefix, "acme", &repo).await;
-
-    let mut info = load_head_ref(&env, &prefix, "acme", &repo).await;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    info.last_accessed_at = Some(now.saturating_sub(86400));
-    info.synced_at = Some(now.saturating_sub(86400));
-    save_head_ref(&env, &prefix, "acme", &repo, &info).await;
+    age_all_refs(&env, &prefix, "acme", &repo).await;
 
     run_gc(&env, &prefix, Duration::from_secs(1), false).await;
 
