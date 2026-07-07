@@ -33,71 +33,22 @@ On every push, ripclone prebuilds a **clonepack** for `HEAD` — a set of files 
 
 `--mode=files` writes the working tree straight from a zstd archive — the fastest path when you only need the files (agents, CI). No git object database, so `git diff`/`show` don't work.
 
+**Git LFS:** LFS objects come from your git host, not ripclone — run `git lfs pull` after cloning to fetch them. ripclone stores the LFS pointer files (it never stores the blobs); resolving them is a pass-through to your host by design.
+
 See **[Design](docs/DESIGN.md)** for how a clonepack is built and synced.
 
-### Performance
+## Performance
 
-ripclone pre-builds git artifacts so clones are faster than `git clone` across the Fly bandwidths we tested, from 250 Mbps up to about 1 Gbps. We also have a real high-bandwidth EC2 run for `torvalds/linux` at 1/2/5 Gbps. On fast links the wins are largest; as bandwidth drops the download itself dominates and the gap narrows.
+ripclone pre-builds git artifacts so clones are faster than `git clone`. On fast links the wins are largest; as bandwidth drops the download itself dominates and the gap narrows. At 1 Gbps, on a Fly.io `performance-8x` client against `ripclone-server-dev` (median of 3 runs, cold client cache):
 
-At 1 Gbps, measured speedups over native `git clone` are:
+| Repo (1 Gbps) | ripclone full | ripclone depth=1 | ripclone files | `git clone` full |
+|---|---|---|---|---|
+| `oven-sh/bun` | 3.4 s · **11.7×** | 1.0 s · **3.3×** | 0.63 s · **5.4×** | 40.3 s |
+| `pandas-dev/pandas` | 3.0 s · **7.6×** | 0.32 s · **6.0×** | 0.26 s · **7.4×** | 22.8 s |
 
-- **`oven-sh/bun`**: full clone **11.7×**, depth-1 **3.3×**, files **5.4×**.
-- **`pandas-dev/pandas`**: full clone **7.6×**, depth-1 **6.0×**, files **7.4×**.
-- **`torvalds/linux`** (high-bandwidth EC2 run): full clone up to **~10×**, depth-1 **~6×**, files **~8×**. See the full EC2 Linux table below and [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
+*Mode labels:* `ripclone full` / `ripclone depth=1` are the `editable` mode with `--depth 0` / `--depth 1`; `ripclone files` is `files` mode (HEAD worktree only).
 
-The full-clone win is smaller on pandas than on bun because pandas's full pack is large enough that transfer dominates; depth-1 and `files` mode avoid most of that transfer, so they stay ahead. The Fly sweep below covers **250/500 Mbps and 1 Gbps**. Higher-rate rows from Fly are omitted because they are traffic-shaper caps above the actual Fly path capacity; the real higher-bandwidth numbers are the EC2 Linux rows.
-
-*Mode labels:* `ripclone full` and `ripclone depth=1` are the `editable` CLI mode with `--depth 0` and `--depth 1`, respectively. `ripclone files` is the `files` CLI mode (HEAD worktree only).
-
-#### Shaped bandwidth benchmark
-
-We run `ripclone` against native `git clone` on a Fly.io `performance-8x` client talking to `ripclone-server-dev` over shaped links. Each cell is the median of 3 runs with a cold client cache (`RIPCLONE_NO_CACHE=1`). `oven-sh/bun` is pinned to commit `b2aa0d5d94e3a42d88d4c58e4488c07e67b0f037`; `pandas-dev/pandas` is pinned to tag `v2.2.2` (`d9cdd2ee5a58015ef6f4d15c7226110c9aab8140`).
-
-The sweep covers **250/500 Mbps and 1 Gbps**. The old 50 Mbps row and warm-cache baselines have been dropped because they are not representative for real clones. The Fly client path is roughly 1 Gbps in practice; higher shaped caps are useful for internal trend checks, but are not launch-quality benchmark claims.
-
-**`oven-sh/bun`**
-
-| Mbps | ripclone full | ripclone depth=1 | ripclone files | git clone full | git clone --depth 1 |
-|------|---------------|------------------|----------------|----------------|---------------------|
-| 1000 | 3.443 s | 1.023 s | 0.625 s | 40.26 s | 3.37 s |
-| 500 | 6.136 s | 0.785 s | 0.588 s | 39.72 s | 3.60 s |
-| 250 | 12.580 s | 2.006 s | 1.542 s | 41.07 s | 3.33 s |
-
-**`pandas-dev/pandas`**
-
-| Mbps | ripclone full | ripclone depth=1 | ripclone files | git clone full | git clone --depth 1 |
-|------|---------------|------------------|----------------|----------------|---------------------|
-| 1000 | 2.996 s | 0.316 s | 0.256 s | 22.75 s | 1.90 s |
-| 500 | 5.719 s | 0.346 s | 0.250 s | 22.81 s | 1.90 s |
-| 250 | 11.966 s | 0.315 s | 0.232 s | 26.20 s | 1.87 s |
-
-**`torvalds/linux`** (high-bandwidth EC2 client — `c6i.8xlarge`, 32 vCPU, shaped link)
-
-The Fly `performance-8x` VM can’t realistically shape a 5 Gbps link, so Linux was measured from an AWS `c6i.8xlarge` in `us-east-1` talking to the same `ripclone-server-dev`. Each ripclone cell is the median of 3 runs; git baselines are 1 run.
-
-| Mbps | ripclone full | ripclone depth=1 | ripclone files | git clone full | git clone --depth 1 |
-|------|---------------|------------------|----------------|----------------|---------------------|
-| 5000 | 28.4 s | 3.04 s | 2.75 s | 280.5 s | 18.2 s |
-| 2000 | 44.3 s | 2.97 s | 2.42 s | 279.1 s | 18.3 s |
-| 1000 | 83.2 s | 3.57 s | 2.33 s | 280.2 s | 18.2 s |
-
-At 5 Gbps that’s **~10× faster than `git clone`** for the full history and **~6× faster** for depth-1. See [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) for the unshaped ceiling and more details.
-
-#### Files-only archive benchmark
-
-GitHub's source archive endpoint (`codeload.github.com/.../tar.gz/...`) is the closest built-in comparison for `ripclone --mode=files`: both produce a worktree without git history. We measured both from the Fly client, writing extracted files to the mounted `/data` volume.
-
-| Repo | ripclone files | GitHub tar.gz | Result |
-|------|----------------|---------------|--------|
-| `oven-sh/bun` | 0.640 s | 1.800 s | ripclone **2.8× faster** |
-| `pandas-dev/pandas` | 0.328 s | 0.210 s | GitHub tar.gz faster on this small, warm archive |
-| `torvalds/linux` | 4.053 s | 37.427 s | ripclone **9.2× faster** |
-
-The Linux run is the important stress case for files mode: 94,655 files and a 1.8 GB materialized worktree. `ripclone files` resolved to `ab9de95c9cf952332ab79453b4b5d1bfca8e514f` and used the existing archive artifacts in object storage; no re-sync was required.
-
-The ratio graph shows **ripclone time / git time**; anything below the dashed `1.0` line means ripclone was faster.
-
-![shaped benchmark ratios](benchmark/shaped_ratios.png)
+A real high-bandwidth `torvalds/linux` run on EC2 hits **~10×** at 5 Gbps for the full history and **~6×** for depth-1. Full sweep (250/500 Mbps + 1 Gbps, the EC2 high-bandwidth rows, the files-vs-tar.gz comparison, and honest caveats) is in **[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md)**.
 
 ## Install
 
@@ -124,23 +75,25 @@ ripclone version            # CLI + server versions, with a compatibility verdic
 ripclone update             # check for a newer release
 ```
 
+Hitting a snag? See **[Troubleshooting](docs/TROUBLESHOOTING.md)** (missing libgit2, `202` warming, `401` vs `403`, config drift).
+
 ### Uninstall
 
-The shell installer just copies binaries into `~/.local/bin` (or `RIPCLONE_BIN_DIR`); there is no uninstall command. Remove the binaries, and optionally the client config and any self-hosted server data:
+Remove whichever way you installed:
 
 ```sh
-# binaries (adjust the dir if you set RIPCLONE_BIN_DIR)
-rm -f ~/.local/bin/ripclone ~/.local/bin/ripclone-server \
-      ~/.local/bin/ripclone-worker ~/.local/bin/git-remote-ripclone
+# Shell installer / prebuilt binaries — delete the installed binaries
+rm -f "$(command -v ripclone)" "$(command -v ripclone-server)" \
+      "$(command -v ripclone-worker)" "$(command -v git-remote-ripclone)"
 
-# client config + saved login token
-rm -rf ~/.config/ripclone
+# Cargo
+cargo uninstall ripclone
 
-# self-hosted server cache + bare mirrors (only if you ran a server)
-rm -rf ~/.local/share/ripclone
+# pip
+pip uninstall ripclone
 ```
 
-`cargo install` users run `cargo uninstall ripclone`; `pip` users run `pip uninstall ripclone`.
+To wipe local state as well: the CLI's saved login lives at `~/.config/ripclone/` and a server's cache and bare mirrors default to `~/.local/share/ripclone/` (`cache` and `repos`). Removing ripclone touches nothing on your git host.
 
 ## Quick start
 
@@ -160,8 +113,8 @@ The server defaults to storing its local cache and bare mirrors under
 `~/.local/share/ripclone/` (`cache` and `repos`). Use `--cas-dir` and
 `--repo-root` to override. `--host` (default `0.0.0.0`) and `--port` (default
 `8000`) set the listen address. Object storage (S3/R2/Tigris/MinIO) and most
-other tuning are set with environment variables — see [Build options](#build-options)
-and `docs/BACKENDS.md`.
+other tuning are set with environment variables — see [`docs/BUILD_OPTIONS.md`](docs/BUILD_OPTIONS.md)
+and [`docs/BACKENDS.md`](docs/BACKENDS.md).
 
 Build artifacts for a commit (sync the repo on the server):
 
@@ -201,7 +154,7 @@ jobs:
             "${{ vars.RIPCLONE_SERVER }}/v1/repos/github/${{ github.repository_owner }}/${{ github.event.repository.name }}/sync"
 ```
 
-The `github` in the path is the provider instance (see [Providers](#providers)). For private repos the server needs read access to the upstream — configure a token for the provider, or pass one per request in the `X-Upstream-Token` header.
+The `github` in the path is the provider instance (see [`docs/PROVIDERS.md`](docs/PROVIDERS.md)). For private repos the server needs read access to the upstream — configure a token for the provider, or pass one per request in the `X-Upstream-Token` header.
 
 ripclone validates the `RIPCLONE_SERVER_TOKEN`, syncs the mirror, builds artifacts for the new `HEAD`, and returns the artifact hashes.
 
@@ -293,16 +246,7 @@ It supports `--depth 1` (shallow) or a full clone; push goes to your git host vi
 
 ## Providers
 
-By default ripclone knows one host: the built-in `github` instance. To mirror from GitLab, Gitea/Forgejo/Codeberg, or a self-hosted host, register provider instances on the server with the `RIPCLONE_PROVIDERS` environment variable or `config.toml`:
-
-```bash
-export RIPCLONE_PROVIDERS='{"providers":[
-  {"id":"gitlab","kind":"gitlab","host":"gitlab.com"},
-  {"id":"company-gitea","kind":"gitea","host":"git.example.com","token":"gitea-token"}
-]}'
-```
-
-Supported `kind` values: `github`, `gitlab`, `gitea`, `generic`. A `generic` host needs an `auth_template` (e.g. `"token {token}"`) so ripclone knows how to build the auth header. Then address a repo by instance id — `gitlab:mygroup/project` on the CLI, or `/v1/repos/gitlab/mygroup/project/...` on the API.
+ripclone is host-agnostic: point it at GitHub (built in), GitLab, Gitea/Forgejo/Codeberg, or a self-hosted host by registering provider instances with `RIPCLONE_PROVIDERS` or `config.toml`. See [`docs/PROVIDERS.md`](docs/PROVIDERS.md).
 
 ## Architecture
 
@@ -340,21 +284,7 @@ Ops endpoints: `GET /healthz` (alive?), `GET /readyz` (ready? — `503` if stora
 
 ## Build options
 
-By default the Rust crate uses `zlib-ng` for faster pack compression. On platforms without cmake you can build with the stock zlib instead:
-
-```bash
-cd rust
-cargo build --release --no-default-features
-```
-
-Environment variables for tuning clone performance:
-
-- `RIPCLONE_FETCH_MAX_ATTEMPTS` / `RIPCLONE_FETCH_BACKOFF_MS` — retry budget and base backoff for transient download failures (defaults 3 and 100).
-- `RIPCLONE_IO_URING` — the worktree writer uses io_uring by default on Linux; set `=0` to force the POSIX writer.
-- `RIPCLONE_MODE` — default clone mode (`editable` or `files`) when `--mode` is omitted.
-- `RIPCLONE_CACHE_DIR` / `RIPCLONE_NO_CACHE` — opt in to (or force off) a local artifact cache; off by default.
-
-Server-side backends are configured through environment variables: storage and retention (`RIPCLONE_S3_*`, `RIPCLONE_RETENTION_*`, `RIPCLONE_REMOTE_GC_*`), the metadata store (`RIPCLONE_METADATA*`), and the build queue / farm-out workers (`RIPCLONE_QUEUE*`). See `docs/BACKENDS.md` and `docs/CHANGELOG.md` for the full list.
+Compile flags (e.g. building without `zlib-ng`), client tuning knobs (`RIPCLONE_FETCH_*`, `RIPCLONE_IO_URING`, `RIPCLONE_MODE`, cache and `RIPCLONE_FSYNC` durability), and the server-side backend environment variables all live in [`docs/BUILD_OPTIONS.md`](docs/BUILD_OPTIONS.md). Backend details are in [`docs/BACKENDS.md`](docs/BACKENDS.md).
 
 ## Telemetry
 

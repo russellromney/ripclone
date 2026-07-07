@@ -310,7 +310,7 @@ drop it before the read-only pack/archive build), not a safety question.
 
 All policy (coalesce, debounce, fairness, rate-limit, publish guard) lives at the
 enqueue/queue seam, so it is identical for the in-process queue, the SQL queue +
-static worker (the "launch simple" target in `DISPATCHER.md`), and the parked
+static worker (the "launch simple" target in `internal/DISPATCHER.md`), and the parked
 dispatcher. The worker stays dumb: claim → build → ack.
 
 ## Open questions

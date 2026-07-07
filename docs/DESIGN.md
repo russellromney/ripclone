@@ -49,7 +49,7 @@ This makes re-syncs cheap. When a new commit lands, frames that didn't change ha
 
 ## Performance
 
-The headline clone numbers are in the [README](../README.md#performance). For `--depth 1` ripclone is **4–6× faster** than native `git clone`; for a full clone it is **15–32× faster**, because git makes the host compute and stream the whole history pack on demand while ripclone just downloads pre-built, content-addressed packs in parallel. `files` mode (working tree only, from the zstd archive) is the fastest of all.
+The headline clone numbers are in the [README](../README.md#performance), with the full sweep in [`BENCHMARKS.md`](BENCHMARKS.md). For `--depth 1` ripclone is roughly **3–6× faster** than native `git clone`; for a full clone it is up to **~10–12× faster** (repo-dependent — bigger on `oven-sh/bun` than on `pandas-dev/pandas`), because git makes the host compute and stream the whole history pack on demand while ripclone just downloads pre-built, content-addressed packs in parallel. `files` mode (working tree only, from the zstd archive) is the fastest of all.
 
 Measured on a Fly `performance-8x` client (Newark) against a ripclone server in Ashburn with artifacts in Tigris; warm server cache, client artifact cache disabled, written to an NVMe volume. git clones are from GitHub over the same link. Median of 3 runs.
 
