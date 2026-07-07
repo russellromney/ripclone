@@ -1000,6 +1000,33 @@ impl Client {
         self.sync_repo_at(repo_path, None, depth).await
     }
 
+    pub async fn add_repo(&self, repo_path: &str) -> Result<RefResponse> {
+        let mut url = self.repo_url(repo_path, "/add");
+        url.push_str("?source=cli");
+        let max_attempts = std::env::var("RIPCLONE_SYNC_MAX_ATTEMPTS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(40usize);
+        for attempt in 0..max_attempts {
+            let resp = self.request(reqwest::Method::POST, &url).send().await?;
+            let status = resp.status();
+            if status == reqwest::StatusCode::OK {
+                return Ok(resp.json().await?);
+            }
+            if status == reqwest::StatusCode::ACCEPTED
+                || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+            {
+                if attempt + 1 < max_attempts {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    continue;
+                }
+                anyhow::bail!("add still building after {max_attempts} attempts");
+            }
+            return Err(server_error("add failed", resp).await);
+        }
+        anyhow::bail!("add did not complete")
+    }
+
     /// Like [`sync_repo`] but builds at `rev` (e.g. "HEAD~5" or a SHA) instead of
     /// the branch tip. The resolved commit is used as the ref-store key, so
     /// different revs that resolve to the same commit share a build. Useful for

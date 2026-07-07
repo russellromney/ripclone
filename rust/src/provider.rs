@@ -404,7 +404,7 @@ impl Default for ProviderRegistry {
 /// (subgroups, `~user/repo`, `+git/repo`, etc.). Callers must NOT split `path`
 /// into owner/repo segments except when they know they are dealing with the
 /// legacy GitHub shape.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct RepoId {
     pub provider: ProviderInstanceId,
     pub path: String,

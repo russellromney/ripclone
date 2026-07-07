@@ -14,7 +14,7 @@ use crate::oidc::OidcVerifier;
 use crate::pack::PackBuilder;
 use crate::provider::{ProviderInstance, ProviderRegistry, RepoId};
 use crate::queue::{BuildError, BuildJob, EnqueueOutcome, JobQueueRef, JobState};
-use crate::ref_store::{RefStore, migrate_legacy_refs};
+use crate::ref_store::{AddedRepo, AddedRepoSource, RefStore, migrate_legacy_refs};
 use crate::remote_gc::{GcConfig, RemoteGc};
 use crate::retention::Retention;
 use crate::snapshot::SnapshotBuilder;
@@ -29,7 +29,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{Html, IntoResponse, Redirect, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use futures::{SinkExt, StreamExt, TryStreamExt};
 use prost::Message;
@@ -300,6 +300,14 @@ pub struct SyncRequest {
 }
 
 #[derive(Deserialize)]
+pub struct AddRequest {
+    #[serde(default = "default_branch_value")]
+    pub branch: String,
+    #[serde(default = "default_added_repo_source")]
+    pub source: AddedRepoSource,
+}
+
+#[derive(Deserialize)]
 pub struct RefQuery {
     /// Clonepack variant to return: "full" (all reachable history) or
     /// "shallow" (depth=1). Defaults to "full" for backward compatibility.
@@ -313,6 +321,10 @@ pub struct RefQuery {
 
 fn default_clonepack_kind() -> String {
     "full".to_string()
+}
+
+fn default_added_repo_source() -> AddedRepoSource {
+    AddedRepoSource::Api
 }
 
 #[derive(Deserialize)]
@@ -670,6 +682,7 @@ pub fn build_app(state: ServerState) -> Router {
         // multi-provider form ("gitlab/group/sub/proj/sync") from the path.
         .route("/v1/repos/{*path}", get(dispatch_repos_get))
         .route("/v1/repos/{*path}", post(dispatch_repos_post))
+        .route("/v1/repos/{*path}", delete(dispatch_repos_delete))
         // Refresh requires a still-valid session token (the auth layer verifies
         // the Bearer); it mints a fresh one before the current expires.
         .route("/v1/auth/refresh", post(auth_refresh_handler))
@@ -1596,6 +1609,31 @@ async fn dispatch_repos_post(
     OriginalUri(uri): OriginalUri,
     body: Body,
 ) -> impl IntoResponse {
+    if path.ends_with("/add") {
+        let repo_path = path.strip_suffix("/add").unwrap();
+        let Some((repo_id, provider)) = resolve_repo_id(&state.provider_registry, repo_path) else {
+            return unknown_provider_response();
+        };
+        if let Some(resp) =
+            validation::reject_if_invalid(|| validation::validate_repo_path(provider, &repo_id))
+        {
+            return resp;
+        }
+        let query = match Query::<AddRequest>::try_from_uri(&uri) {
+            Ok(q) => q.0,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: format!("invalid add request: {}", e),
+                    }),
+                )
+                    .into_response();
+            }
+        };
+        return add_repo_inner(repo_id, provider.clone(), query, headers, state).await;
+    }
+
     if path.ends_with("/sync") {
         let repo_path = path.strip_suffix("/sync").unwrap();
         let Some((repo_id, provider)) = resolve_repo_id(&state.provider_registry, repo_path) else {
@@ -1681,6 +1719,32 @@ async fn dispatch_repos_post(
             }
         };
         return batch_files_inner(repo_id, provider.clone(), body, headers, state).await;
+    }
+
+    (
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse {
+            error: "not found".to_string(),
+        }),
+    )
+        .into_response()
+}
+
+async fn dispatch_repos_delete(
+    Path(path): Path<String>,
+    State(state): State<ServerState>,
+) -> impl IntoResponse {
+    if path.ends_with("/add") {
+        let repo_path = path.strip_suffix("/add").unwrap();
+        let Some((repo_id, provider)) = resolve_repo_id(&state.provider_registry, repo_path) else {
+            return unknown_provider_response();
+        };
+        if let Some(resp) =
+            validation::reject_if_invalid(|| validation::validate_repo_path(provider, &repo_id))
+        {
+            return resp;
+        }
+        return remove_added_repo_inner(repo_id, state).await;
     }
 
     (
@@ -3086,6 +3150,80 @@ async fn sync_repo_inner(
             tokio::time::sleep(Duration::from_millis(400)).await;
         }
     }
+}
+
+async fn add_repo_inner(
+    repo_id: RepoId,
+    provider: ProviderInstance,
+    params: AddRequest,
+    headers: HeaderMap,
+    state: ServerState,
+) -> Response {
+    if let Some(resp) =
+        validation::reject_if_invalid(|| validation::validate_git_rev(&params.branch))
+    {
+        return resp;
+    }
+
+    let request_token = upstream_token_from_headers(&headers);
+    let credential = match state
+        .broker
+        .fetch_credential(&repo_id, request_token.as_ref())
+    {
+        Ok(c) => c,
+        Err(e) => return credential_error_response(e),
+    };
+    if let Err(resp) =
+        authorize_repo_read(&state, &provider, &repo_id, credential.as_ref(), &headers).await
+    {
+        return resp;
+    }
+
+    let added = AddedRepo {
+        repo_id: repo_id.clone(),
+        added_at: SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+        history_enabled: true,
+        source: params.source,
+    };
+    if let Err(e) = state.ref_store.add_repo(&added).await {
+        state.metrics.record_error();
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("add failed: {e}"),
+            }),
+        )
+            .into_response();
+    }
+
+    sync_repo_inner(
+        repo_id,
+        provider,
+        SyncRequest {
+            branch: params.branch,
+            rev: None,
+        },
+        headers,
+        state,
+    )
+    .await
+}
+
+async fn remove_added_repo_inner(repo_id: RepoId, state: ServerState) -> Response {
+    if let Err(e) = state.ref_store.remove_added_repo(&repo_id).await {
+        state.metrics.record_error();
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("remove added repo failed: {e}"),
+            }),
+        )
+            .into_response();
+    }
+    (StatusCode::NO_CONTENT, Body::empty()).into_response()
 }
 
 /// Coalescing key for the in-process queue: concurrent builds for the same

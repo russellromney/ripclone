@@ -79,6 +79,16 @@ impl MetaDb for MysqlMeta {
         let _ = sqlx::raw_sql("ALTER TABLE refs ADD COLUMN generation BIGINT")
             .execute(&self.pool)
             .await;
+        sqlx::raw_sql(
+            "CREATE TABLE IF NOT EXISTS added_repos (
+                repo_key VARCHAR(512) NOT NULL,
+                data LONGTEXT NOT NULL,
+                PRIMARY KEY (repo_key)
+            )",
+        )
+        .execute(&self.pool)
+        .await
+        .context("create added_repos table")?;
         Ok(())
     }
 
@@ -214,6 +224,46 @@ impl MetaDb for MysqlMeta {
             .await
             .context("list branches")?;
         rows.iter().map(|r| Ok(r.try_get(0)?)).collect()
+    }
+
+    async fn add_repo(&self, repo_key: &str, data: &str) -> Result<()> {
+        check_len("repo_key", repo_key, 512)?;
+        sqlx::query(
+            "INSERT INTO added_repos (repo_key, data) VALUES (?, ?)
+             ON DUPLICATE KEY UPDATE data = VALUES(data)",
+        )
+        .bind(repo_key)
+        .bind(data)
+        .execute(&self.pool)
+        .await
+        .context("add repo")?;
+        Ok(())
+    }
+
+    async fn get_added_repo(&self, repo_key: &str) -> Result<Option<String>> {
+        check_len("repo_key", repo_key, 512)?;
+        sqlx::query_scalar("SELECT data FROM added_repos WHERE repo_key = ?")
+            .bind(repo_key)
+            .fetch_optional(&self.pool)
+            .await
+            .context("get added repo")
+    }
+
+    async fn remove_added_repo(&self, repo_key: &str) -> Result<()> {
+        check_len("repo_key", repo_key, 512)?;
+        sqlx::query("DELETE FROM added_repos WHERE repo_key = ?")
+            .bind(repo_key)
+            .execute(&self.pool)
+            .await
+            .context("remove added repo")?;
+        Ok(())
+    }
+
+    async fn list_added_repos(&self) -> Result<Vec<String>> {
+        sqlx::query_scalar("SELECT data FROM added_repos ORDER BY repo_key")
+            .fetch_all(&self.pool)
+            .await
+            .context("list added repos")
     }
 
     async fn health(&self) -> Result<()> {
