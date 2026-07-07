@@ -256,14 +256,10 @@ fn flush_archive_writes(
 const DEFAULT_LOCAL_CHUNK_SIZE: u64 = 2 * 1024 * 1024;
 
 fn archive_thread_counts() -> (usize, usize) {
-    let fetch_threads = crate::gix_util::worker_threads(
-        "RIPCLONE_FETCH_THREADS",
-        crate::gix_util::default_worker_threads(),
-    );
-    let write_threads = crate::gix_util::worker_threads(
-        "RIPCLONE_WRITE_THREADS",
-        crate::gix_util::default_worker_threads(),
-    );
+    let fetch_threads =
+        crate::gix_util::worker_threads("archive-fetch", crate::gix_util::default_worker_threads());
+    let write_threads =
+        crate::gix_util::worker_threads("archive-write", crate::gix_util::default_worker_threads());
     (fetch_threads, write_threads)
 }
 

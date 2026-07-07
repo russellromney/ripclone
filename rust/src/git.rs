@@ -921,10 +921,8 @@ fn encode_objects_parallel(
             .collect::<Result<Vec<_>>>();
     }
 
-    let num_workers = crate::gix_util::worker_threads(
-        "RIPCLONE_PACK_ENCODE_THREADS",
-        crate::gix_util::default_worker_threads(),
-    );
+    let num_workers =
+        crate::gix_util::worker_threads("pack-encode", crate::gix_util::default_worker_threads());
     let repo_path = repo.path().to_path_buf();
     let mut entries: Vec<gix_pack::data::output::Entry> =
         crate::gix_util::parallel_map_repo(repo_path, ids, num_workers, |local_repo, id| {
@@ -1042,10 +1040,8 @@ pub fn index_pack<P: AsRef<Path>, Q: AsRef<Path>>(_git_dir: P, pack_path: Q) -> 
             .with_context(|| format!("open pack {}", pack_path.display()))?,
     );
     let mut progress = gix::features::progress::Discard;
-    let thread_limit = crate::gix_util::worker_threads(
-        "RIPCLONE_GIX_INDEX_THREADS",
-        crate::gix_util::default_worker_threads(),
-    );
+    let thread_limit =
+        crate::gix_util::worker_threads("gix-index", crate::gix_util::default_worker_threads());
     let gix_result = gix_pack::Bundle::write_to_directory(
         &mut reader,
         Some(directory),

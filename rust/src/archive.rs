@@ -819,10 +819,7 @@ impl ArchiveBuilder {
 
         // Largest changed middle we'll read into memory; above this the full build
         // is both simpler and not much slower.
-        let max_middle = std::env::var("RIPCLONE_ARCHIVE_BOUNDED_MAX_BYTES")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(256 * 1024 * 1024usize);
+        let max_middle = 256 * 1024 * 1024usize;
 
         if prev_frames.is_empty() || !self.mirror.exists() {
             return full();
@@ -1297,10 +1294,8 @@ fn hash_blobs_parallel(
             .collect::<anyhow::Result<Vec<_>>>();
     }
 
-    let num_workers = crate::gix_util::worker_threads(
-        "RIPCLONE_HASH_THREADS",
-        crate::gix_util::default_worker_threads(),
-    );
+    let num_workers =
+        crate::gix_util::worker_threads("hash", crate::gix_util::default_worker_threads());
     crate::gix_util::parallel_map_repo(mirror, blobs, num_workers, |repo, (path, oid, mode)| {
         let blob = repo
             .find_blob(*oid)

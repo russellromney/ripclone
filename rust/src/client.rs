@@ -713,10 +713,7 @@ impl Client {
         // The cloud returns 202 while it warms a cold repo (the webhook-sync
         // queue builds it on demand), or 503 if its queue is briefly full. Poll
         // the same request until it's built, then read the ref.
-        let max_attempts = std::env::var("RIPCLONE_CLONE_MAX_ATTEMPTS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(40usize);
+        let max_attempts = 40usize;
         // Track whether any attempt polled a cold build (202/503) before
         // success, so the post-clone metrics report can label the clone cold.
         let mut polled = false;
@@ -873,7 +870,7 @@ impl Client {
     ///
     /// `signed_urls` is indexed by chunk position; `None` entries fall back to
     /// the gateway. Concurrency defaults to 6 but can be overridden with
-    /// `RIPCLONE_FETCH_CONCURRENCY`.
+    /// the fixed fetch concurrency.
     pub async fn fetch_chunk_refs(
         &self,
         chunks: &[crate::clonepack::ChunkRef],
@@ -1050,10 +1047,7 @@ impl Client {
         // running) or 503 (queue full). Each POST blocks server-side until its
         // wait window elapses, so we just retry — coalescing means a retry
         // re-attaches to the same in-flight build rather than starting a new one.
-        let max_attempts = std::env::var("RIPCLONE_SYNC_MAX_ATTEMPTS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(40usize);
+        let max_attempts = 40usize;
         for attempt in 0..max_attempts {
             let resp = self.request(reqwest::Method::POST, &url).send().await?;
             let status = resp.status();
@@ -1177,10 +1171,7 @@ impl Client {
         // it for the metrics label.
         if mode.needs_archive() && !info.archive_ready {
             cold = true;
-            let max = std::env::var("RIPCLONE_CLONE_MAX_ATTEMPTS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(40usize);
+            let max = 40usize;
             for _ in 0..max {
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 info = self
@@ -1224,14 +1215,10 @@ impl Client {
         // a bounded concurrency semaphore and forwards them over this bounded
         // channel. Peak memory is therefore bounded by the fetch concurrency
         // plus the channel depth, not the chunk count.
-        let archive_channel_depth = std::env::var("RIPCLONE_ARCHIVE_CHANNEL_DEPTH")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or_else(|| {
-                info.archive_chunk_urls
-                    .as_ref()
-                    .map_or(2, |urls| urls.len().clamp(2, 64))
-            });
+        let archive_channel_depth = info
+            .archive_chunk_urls
+            .as_ref()
+            .map_or(2, |urls| urls.len().clamp(2, 64));
         let (archive_async_tx, mut archive_async_rx) =
             tokio::sync::mpsc::channel::<(usize, Result<bytes::Bytes>)>(archive_channel_depth);
         let (archive_tx, archive_rx): (
@@ -2486,10 +2473,7 @@ impl Client {
         // No size threshold: overlay is opt-in (see overlay::is_available), so if
         // the operator asked for it we honor it for any repo, falling back only
         // when there isn't enough tmpfs space or the kernel disallows the mount.
-        let margin_mb: u64 = std::env::var("RIPCLONE_OVERLAY_MARGIN_MB")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(128);
+        let margin_mb: u64 = 128;
         let required = raw_bytes + compressed_bytes + margin_mb * 1024 * 1024;
         let available = overlay::available_space(staging_dir).unwrap_or(0);
         if available < required {

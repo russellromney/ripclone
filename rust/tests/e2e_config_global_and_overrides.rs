@@ -47,7 +47,7 @@ async fn run_ripclone(
             .current_dir(&cwd)
             .env("HOME", &home)
             .env("RIPCLONE_SERVER", &server_url)
-            .env("RIPCLONE_TOKEN", TOKEN)
+            .env("RIPCLONE_SERVER_TOKEN", TOKEN)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .output()

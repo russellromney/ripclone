@@ -236,17 +236,9 @@ fn parse_url(url: &str) -> Result<(String, String, String)> {
 ///
 /// Precedence:
 ///   1. RIPCLONE_SERVER environment variable
-///   2. RIPCLONE_URL environment variable (deprecated)
-///   3. git config remote.<name>.ripcloneServer
+///   2. git config remote.<name>.ripcloneServer
 fn resolve_server_url(remote_name: &str) -> Result<String> {
     if let Some(url) = env::var("RIPCLONE_SERVER").ok().filter(|t| !t.is_empty()) {
-        return Ok(url);
-    }
-    if let Some(url) = env::var("RIPCLONE_URL").ok().filter(|t| !t.is_empty()) {
-        eprintln!(
-            "warning: RIPCLONE_URL is deprecated; use RIPCLONE_SERVER or git config remote.{}.ripcloneServer",
-            remote_name
-        );
         return Ok(url);
     }
     let key = format!("remote.{}.ripcloneServer", remote_name);
@@ -271,8 +263,6 @@ fn resolve_server_url(remote_name: &str) -> Result<String> {
 /// Precedence:
 ///   1. RIPCLONE_SERVER_TOKEN_HASH (already hashed)
 ///   2. RIPCLONE_SERVER_TOKEN (raw)
-///   3. RIPCLONE_TOKEN_HASH (deprecated)
-///   4. RIPCLONE_TOKEN (deprecated)
 fn resolve_server_token() -> Option<String> {
     if let Some(hash) = env::var("RIPCLONE_SERVER_TOKEN_HASH")
         .ok()
@@ -286,24 +276,7 @@ fn resolve_server_token() -> Option<String> {
     {
         return Some(hex::encode(Sha256::digest(raw.as_bytes())));
     }
-    if let Some(hash) = env::var("RIPCLONE_TOKEN_HASH")
-        .ok()
-        .filter(|t| !t.is_empty())
-    {
-        eprintln!(
-            "warning: RIPCLONE_TOKEN_HASH is deprecated for server auth; use RIPCLONE_SERVER_TOKEN_HASH"
-        );
-        return Some(hash);
-    }
-    env::var("RIPCLONE_TOKEN")
-        .ok()
-        .filter(|t| !t.is_empty())
-        .map(|t| {
-            eprintln!(
-                "warning: RIPCLONE_TOKEN is deprecated for server auth; use RIPCLONE_SERVER_TOKEN"
-            );
-            hex::encode(Sha256::digest(t.as_bytes()))
-        })
+    None
 }
 
 fn git_dirs() -> Result<(PathBuf, PathBuf)> {
@@ -353,7 +326,6 @@ mod tests {
     fn resolve_server_url_prefers_ripclone_server() {
         unsafe {
             env::set_var("RIPCLONE_SERVER", "https://new.example.com");
-            env::set_var("RIPCLONE_URL", "https://old.example.com");
         }
         assert_eq!(
             resolve_server_url("origin").unwrap(),
@@ -361,7 +333,6 @@ mod tests {
         );
         unsafe {
             env::remove_var("RIPCLONE_SERVER");
-            env::remove_var("RIPCLONE_URL");
         }
     }
 
@@ -370,8 +341,6 @@ mod tests {
         unsafe {
             env::remove_var("RIPCLONE_SERVER_TOKEN");
             env::remove_var("RIPCLONE_SERVER_TOKEN_HASH");
-            env::remove_var("RIPCLONE_TOKEN");
-            env::remove_var("RIPCLONE_TOKEN_HASH");
         }
         unsafe { env::set_var("RIPCLONE_SERVER_TOKEN", "new-secret") };
         assert_eq!(

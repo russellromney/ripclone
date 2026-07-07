@@ -6,38 +6,19 @@ use std::path::Path;
 use std::sync::Arc;
 
 /// Global ceiling on the number of worker threads spawned by any gix parallel
-/// helper. Individual operations can be tuned with their own env vars, but they
-/// are always clamped to this value to avoid saturating the host.
+/// helper. Internal callers use fixed defaults clamped to this value.
 pub const DEFAULT_THREAD_CAP: usize = 64;
 
-/// Threading environment variables:
-///
-/// * `RIPCLONE_MAX_THREADS`        - global ceiling for all gix worker pools (default: host cores).
-/// * `RIPCLONE_HASH_THREADS`       - blob hashing in archive files-table builds.
-/// * `RIPCLONE_PACK_ENCODE_THREADS`- object read/encode in gix pack encoding.
-/// * `RIPCLONE_GIX_INDEX_THREADS`  - gix pack index verification/writing.
-/// * `RIPCLONE_LOOKUP_THREADS`     - bulk object size/type lookups.
-/// * `RIPCLONE_WRITE_THREADS`      - worktree materialization writers (in extract.rs).
-/// * `RIPCLONE_FETCH_THREADS`      - archive chunk fetchers (in extract.rs).
-/// * `RAYON_NUM_THREADS`           - zstd frame compression pool (in archive.rs).
-///
-/// All values are clamped to `[1, DEFAULT_THREAD_CAP].`
-///
-/// Read a parallelism setting from `env_var`. If missing or unparseable, use
-/// `fallback`. The result is clamped to at least 1 and at most the global cap.
-pub fn worker_threads(env_var: &str, fallback: usize) -> usize {
-    let fallback = fallback.clamp(1, DEFAULT_THREAD_CAP);
-    std::env::var(env_var)
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .map(|n| n.clamp(1, DEFAULT_THREAD_CAP))
-        .unwrap_or(fallback)
+/// Clamp a parallelism setting to the internal thread cap. The first argument is
+/// retained for call-site clarity while the old env-knobs are intentionally gone.
+pub fn worker_threads(_label: &str, fallback: usize) -> usize {
+    fallback.clamp(1, DEFAULT_THREAD_CAP)
 }
 
 /// Number of threads to use when no operation-specific override is set.
 pub fn default_worker_threads() -> usize {
     worker_threads(
-        "RIPCLONE_MAX_THREADS",
+        "default",
         std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4),
@@ -314,7 +295,7 @@ pub fn object_sizes<P: AsRef<Path>>(repo_path: P, oids: &[String]) -> Result<Has
         return Ok(map);
     }
 
-    let num_workers = worker_threads("RIPCLONE_LOOKUP_THREADS", default_worker_threads());
+    let num_workers = worker_threads("lookup", default_worker_threads());
     let pairs = parallel_map_repo(repo_path, oids.to_vec(), num_workers, |repo, oid_str| {
         let id = parse_oid(oid_str)?;
         let header = repo
@@ -347,7 +328,7 @@ pub fn classify_objects<P: AsRef<Path>>(
         return Ok(map);
     }
 
-    let num_workers = worker_threads("RIPCLONE_LOOKUP_THREADS", default_worker_threads());
+    let num_workers = worker_threads("lookup", default_worker_threads());
     let pairs = parallel_map_repo(repo_path, shas, num_workers, |repo, sha| {
         let id = parse_oid(sha)?;
         let header = repo

@@ -41,12 +41,7 @@ impl S3Storage {
         // timeout + retry policy almost never trips, while still failing fast on a
         // genuinely stuck request. Steady-state re-syncs only upload the delta, so
         // this barely ever matters.
-        let request_timeout = Duration::from_secs(
-            std::env::var("RIPCLONE_S3_REQUEST_TIMEOUT_SECS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(30),
-        );
+        let request_timeout = Duration::from_secs(30);
         let client = Client::builder(endpoint)
             .context("build S3 client")?
             .region(region)
@@ -431,15 +426,7 @@ impl StorageBackend for S3Storage {
     }
 
     fn regions(&self) -> Vec<String> {
-        std::env::var("RIPCLONE_STORAGE_REGIONS")
-            .ok()
-            .map(|s| {
-                s.split(',')
-                    .map(|r| r.trim().to_string())
-                    .filter(|r| !r.is_empty())
-                    .collect()
-            })
-            .unwrap_or_else(|| vec![self.region.clone()])
+        vec![self.region.clone()]
     }
 
     fn delete(&self, hash: &str) -> Result<()> {

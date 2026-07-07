@@ -215,8 +215,7 @@ RIPCLONE_SERVER_TOKEN=your-secret ripclone clone owner/repo
 RIPCLONE_SERVER_TOKEN_HASH=sha256-of-your-secret ripclone clone owner/repo
 ```
 
-The deprecated `RIPCLONE_TOKEN` / `RIPCLONE_TOKEN_HASH` names are still accepted
-for backward compatibility. `git-remote-ripclone` reads the same variables.
+`git-remote-ripclone` reads the same variables.
 
 ## Client-side cache
 

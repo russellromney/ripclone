@@ -16,8 +16,7 @@ for bin in "$SERVER_BIN" "$CLI_BIN"; do
   [ -x "$bin" ] || { echo "error: missing binary $bin (cargo build --release)"; exit 1; }
 done
 
-export RIPCLONE_SERVER_TOKEN="${RIPCLONE_SERVER_TOKEN:-${RIPCLONE_TOKEN:-e2e-local-token}}"
-export RIPCLONE_TOKEN="$RIPCLONE_SERVER_TOKEN"
+export RIPCLONE_SERVER_TOKEN="${RIPCLONE_SERVER_TOKEN:-e2e-local-token}"
 # This script does `sync` then `clone`. Builds are always asynchronous and
 # two-phase: depth=1 is ready when `sync` returns, but the full/files variants
 # finish in the background, so the clone helpers below retry until ready.
