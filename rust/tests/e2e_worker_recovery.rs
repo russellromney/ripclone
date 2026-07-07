@@ -289,18 +289,20 @@ fn free_port() -> u16 {
 }
 
 fn start_sqld(port: u16, data: &Path) -> Proc {
-    let child = Command::new("sqld")
-        .arg("--http-listen-addr")
-        .arg(format!("127.0.0.1:{port}"))
-        .arg("--db-path")
-        .arg(data)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn sqld");
+    let proc = Proc(
+        Command::new("sqld")
+            .arg("--http-listen-addr")
+            .arg(format!("127.0.0.1:{port}"))
+            .arg("--db-path")
+            .arg(data)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sqld"),
+    );
     for _ in 0..200 {
         if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return Proc(child);
+            return proc;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -503,7 +505,7 @@ async fn cleanup_s3_prefix(env: &S3Env, prefix: &str) -> Result<()> {
         client
             .objects()
             .delete_objects(&env.bucket)
-            .objects(&chunk.to_vec())
+            .objects(chunk.to_vec())
             .context("build cleanup delete batch")?
             .quiet(true)
             .send()
@@ -553,7 +555,7 @@ async fn cleanup_s3_repo_refs(env: &S3Env, owner: &str, repo: &str) -> Result<()
         client
             .objects()
             .delete_objects(&env.bucket)
-            .objects(&chunk.to_vec())
+            .objects(chunk.to_vec())
             .context("build cleanup ref delete batch")?
             .quiet(true)
             .send()
