@@ -3,6 +3,7 @@ use gix::objs::tree::EntryMode;
 use gix::traverse::tree::{Visit, visit::Action};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::process::Command;
 use std::sync::Arc;
 
 /// Global ceiling on the number of worker threads spawned by any gix parallel
@@ -223,18 +224,18 @@ pub fn list_object_shas_in_range<P: AsRef<Path>>(
     from: Option<&str>,
     to: &str,
 ) -> Result<Vec<String>> {
+    if let Some(from) = from {
+        return list_object_shas_in_range_git(repo_path, from, to);
+    }
+
     let repo = open_repo(repo_path)?;
     let to_id = repo
         .rev_parse_single(to)
         .with_context(|| format!("resolving to '{}'", to))?;
-    let mut walk = repo.rev_walk([to_id]);
-    if let Some(f) = from {
-        let from_id = repo
-            .rev_parse_single(f)
-            .with_context(|| format!("resolving from '{}'", f))?;
-        walk = walk.with_hidden([from_id]);
-    }
-    let infos: Vec<_> = walk.all()?.collect::<Result<Vec<_>, _>>()?;
+    let infos: Vec<_> = repo
+        .rev_walk([to_id])
+        .all()?
+        .collect::<Result<Vec<_>, _>>()?;
 
     let mut oids = HashSet::with_capacity(infos.len() * 4);
     for info in &infos {
@@ -251,6 +252,44 @@ pub fn list_object_shas_in_range<P: AsRef<Path>>(
     let mut out: Vec<String> = oids.into_iter().map(|oid| oid.to_string()).collect();
     out.sort();
     Ok(out)
+}
+
+fn list_object_shas_in_range_git<P: AsRef<Path>>(
+    repo_path: P,
+    from: &str,
+    to: &str,
+) -> Result<Vec<String>> {
+    crate::validation::validate_git_rev(to).with_context(|| format!("invalid commit: {to}"))?;
+    crate::validation::validate_git_rev(from).with_context(|| format!("invalid commit: {from}"))?;
+    let exclude = format!("^{from}");
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo_path.as_ref())
+        .args([
+            "rev-list",
+            "--objects",
+            "--no-object-names",
+            "--end-of-options",
+        ])
+        .arg(to)
+        .arg(exclude)
+        .output()
+        .context("run git rev-list --objects range")?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "git rev-list --objects range failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let mut oids: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .filter(|oid| !oid.is_empty())
+        .map(str::to_string)
+        .collect();
+    oids.sort();
+    oids.dedup();
+    Ok(oids)
 }
 
 /// List every tree entry reachable from `commit`.

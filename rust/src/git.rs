@@ -2873,8 +2873,11 @@ mod tests {
         let mut shas = Vec::new();
         for i in 0..3 {
             std::fs::write(repo.join("f.txt"), format!("{i}\n")).unwrap();
+            if i == 0 {
+                std::fs::write(repo.join("stable.txt"), b"unchanged\n").unwrap();
+            }
             let _ = Command::new("git")
-                .args(["-C", repo.to_str().unwrap(), "add", "f.txt"])
+                .args(["-C", repo.to_str().unwrap(), "add", "-A"])
                 .output()
                 .unwrap();
             let out = Command::new("git")
@@ -2908,6 +2911,30 @@ mod tests {
         let range = list_object_shas_in_range(repo, Some(shas[1].as_str()), &shas[2]).unwrap();
         assert!(!range.is_empty());
         assert!(range.contains(&shas[2]));
+        let stable_blob = String::from_utf8(
+            Command::new("git")
+                .args([
+                    "-C",
+                    repo.to_str().unwrap(),
+                    "rev-parse",
+                    &format!("{}:stable.txt", shas[1]),
+                ])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        assert!(
+            !range.contains(&stable_blob),
+            "range must exclude blobs already reachable from the base commit"
+        );
+        assert_eq!(
+            range.len(),
+            3,
+            "one changed root file should introduce only commit + root tree + changed blob"
+        );
     }
 
     /// Regression: object lookups for ≥PARALLEL_LOOKUP_THRESHOLD objects must not
