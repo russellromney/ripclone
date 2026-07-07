@@ -14,6 +14,11 @@ Internal tuning knobs use code constants at their current defaults.
   `X-Upstream-Token`. Equivalent to `--token`.
 - `RIPCLONE_MODE` - default clone mode when `--mode` is omitted: `editable` or
   `files`.
+- `RIPCLONE_AGENT` - agent-fleet mode. Truthy (`1`/`true`/`yes`/`on`) sets
+  fleet-sane clone defaults: **depth-1** history and no interactive prompts. An
+  explicit falsey value overrides an `agent = true` config default. Explicit
+  `--depth`/`[clone] depth` still win. See [Agents & CI](AGENTS.md). Config key:
+  top-level `agent = true`.
 - `RIPCLONE_VERIFY_UPSTREAM` - `auto`, `always`, or `never`.
 - `RIPCLONE_CACHE_DIR` - opt in to the local artifact cache.
 - `RIPCLONE_NO_CACHE` - disable the local artifact cache even if configured.

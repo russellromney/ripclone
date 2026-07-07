@@ -875,8 +875,10 @@ async fn run_provider_add(
     let token = match token {
         Some(t) => Some(t),
         None => {
-            // Prompt for token unless running non-interactively.
-            if std::io::stdin().is_terminal() {
+            // Prompt for the token only on a real TTY and never in agent-fleet
+            // mode. A fleet VM must never block on an interactive prompt, even
+            // if it somehow has a TTY attached.
+            if std::io::stdin().is_terminal() && !ripclone::config::agent_mode(None) {
                 let prompt = format!("Token for provider '{}': ", id);
                 Some(rpassword::prompt_password(prompt)?)
             } else {
@@ -1114,7 +1116,19 @@ async fn main() -> Result<()> {
             let target = dir_pos
                 .or(dir)
                 .unwrap_or_else(|| PathBuf::from(target_name));
-            let depth = depth.or(config.clone.depth).unwrap_or(0);
+            // Agent-fleet mode (RIPCLONE_AGENT or the config default) flips the
+            // history default to depth-1: agents on giant repos don't want the
+            // full 1.3M-commit history that the human default (D8) ships. An
+            // explicit --depth or a `[clone] depth` config value still wins over
+            // this. Never a silent size-based switch — see `config::agent_mode`.
+            let agent = ripclone::config::agent_mode(config.agent);
+            let default_depth = if agent { 1 } else { 0 };
+            if agent {
+                eprintln!(
+                    "ripclone: agent-fleet mode — fleet defaults on (depth-1 unless overridden, no prompts)"
+                );
+            }
+            let depth = depth.or(config.clone.depth).unwrap_or(default_depth);
             // Only depth 1 (shallow) and depth 0 (full history) are implemented.
             // Reject an arbitrary depth-N request instead of silently serving
             // full history that git would record as a complete, non-shallow clone

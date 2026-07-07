@@ -22,6 +22,11 @@ pub struct Config {
     pub server: Option<String>,
     /// Default provider instance id (e.g. "github", "my-gitea").
     pub default_provider: Option<String>,
+    /// Agent-fleet mode default. When true (or `RIPCLONE_AGENT` is set in the
+    /// environment), clones use fleet-sane defaults: depth-1 history and no
+    /// interactive prompts. The env var wins over this. Deliberately explicit —
+    /// never a silent size-based switch, which would surprise humans.
+    pub agent: Option<bool>,
     /// Default clone options.
     pub clone: CloneConfig,
     /// Custom/self-hosted provider declarations. Built-in presets (github and
@@ -141,6 +146,30 @@ pub fn project_config_path(start: &Path) -> Option<PathBuf> {
     None
 }
 
+/// Resolve whether agent-fleet mode is active.
+///
+/// `RIPCLONE_AGENT` in the environment wins: a truthy value turns it on, and an
+/// explicit falsey value (`0`/`false`/`no`/`off`) turns it off even when the
+/// config default is on. An empty or unset var falls back to `config_default`,
+/// then to off. This is intentionally an explicit opt-in, never inferred from
+/// repo size — a silent switch would surprise humans on giant repos.
+pub fn agent_mode(config_default: Option<bool>) -> bool {
+    match std::env::var("RIPCLONE_AGENT")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+    {
+        Some(v) => is_truthy(&v),
+        None => config_default.unwrap_or(false),
+    }
+}
+
+fn is_truthy(v: &str) -> bool {
+    matches!(
+        v.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
 /// Load the merged configuration: project `ripclone.toml` overrides global
 /// `config.toml`, which overrides built-in defaults.
 pub fn load() -> Config {
@@ -252,6 +281,7 @@ fn merge(overrides: Config, base: Config) -> Config {
     Config {
         server: overrides.server.or(base.server),
         default_provider: overrides.default_provider.or(base.default_provider),
+        agent: overrides.agent.or(base.agent),
         clone: CloneConfig {
             depth: overrides.clone.depth.or(base.clone.depth),
             mode: overrides.clone.mode.or(base.clone.mode),
@@ -368,6 +398,7 @@ mod tests {
         let cfg = Config {
             server: Some("https://ripclone.example.com".into()),
             default_provider: Some("my-gitea".into()),
+            agent: None,
             clone: CloneConfig {
                 depth: Some(1),
                 mode: Some("editable".into()),
@@ -511,6 +542,36 @@ default_provider = "my-gitea"
         assert_eq!(p.host.as_deref(), Some("https://gitea.example.com"));
         assert_eq!(p.auth_template.as_deref(), Some("token {{token}}"));
         assert_eq!(p.token.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn agent_mode_env_wins_over_config() {
+        let _guard = HOME_LOCK.lock().unwrap();
+        let old = std::env::var_os("RIPCLONE_AGENT");
+
+        // Truthy env turns it on regardless of config.
+        unsafe { std::env::set_var("RIPCLONE_AGENT", "1") };
+        assert!(agent_mode(None));
+        assert!(agent_mode(Some(false)));
+
+        // Explicit falsey env turns it off even when config default is on.
+        unsafe { std::env::set_var("RIPCLONE_AGENT", "0") };
+        assert!(!agent_mode(Some(true)));
+
+        // Empty/unset env falls back to the config default.
+        unsafe { std::env::set_var("RIPCLONE_AGENT", "") };
+        assert!(agent_mode(Some(true)));
+        assert!(!agent_mode(Some(false)));
+        assert!(!agent_mode(None));
+
+        unsafe { std::env::remove_var("RIPCLONE_AGENT") };
+        assert!(agent_mode(Some(true)));
+        assert!(!agent_mode(None));
+
+        match old {
+            Some(v) => unsafe { std::env::set_var("RIPCLONE_AGENT", v) },
+            None => unsafe { std::env::remove_var("RIPCLONE_AGENT") },
+        }
     }
 
     #[test]
