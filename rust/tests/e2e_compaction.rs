@@ -20,6 +20,7 @@ async fn compaction_keeps_full_clone_correct() {
     origin.publish();
 
     let client = server.client();
+    client.add_repo("acme/cmp").await.unwrap();
     client.sync_repo("acme/cmp", None).await.unwrap();
 
     // Each sync adds a commit -> seals a new level -> eventually triggers

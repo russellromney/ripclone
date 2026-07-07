@@ -52,6 +52,11 @@ async fn files_mode_correct_with_bounded_archive() {
     origin.publish();
     server
         .client()
+        .add_repo("acme/arch")
+        .await
+        .expect("add arch");
+    server
+        .client()
         .sync_repo("acme/arch", None)
         .await
         .expect("sync c1");

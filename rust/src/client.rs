@@ -100,6 +100,7 @@ async fn server_error(context: &str, resp: reqwest::Response) -> anyhow::Error {
         (403, _, true) => "\n  → the org may need a plan, or you lack GitHub access",
         (403, _, false) => "\n  → access denied by the configured server",
         (429, _, _) => "\n  → rate limited; wait a moment and retry",
+        (404, Some("repo_not_added"), _) => "\n  → run `ripclone add <repo>`",
         (502 | 503, _, _) => "\n  → ripclone is briefly unavailable; retry shortly",
         _ => "",
     };

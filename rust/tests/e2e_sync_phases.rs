@@ -60,6 +60,9 @@ async fn cold_sync_reports_all_phase_timings() {
     let origin = make_origin("acme", "phasescold");
     origin.commit(&[("README.md", "cold\n")], "c1");
     origin.publish();
+    register_added_without_build(&server, "acme/phasescold")
+        .await
+        .expect("add repo");
 
     let client = reqwest::Client::new();
     let sync_url = format!("{}/v1/repos/github/acme/phasescold/sync", server.url);
@@ -114,6 +117,9 @@ async fn incremental_sync_reports_all_phase_timings() {
     let origin = make_origin("acme", "phasesinc");
     origin.commit(&[("README.md", "v1\n")], "c1");
     origin.publish();
+    register_added_without_build(&server, "acme/phasesinc")
+        .await
+        .expect("add repo");
 
     let client = reqwest::Client::new();
     let sync_url = format!("{}/v1/repos/github/acme/phasesinc/sync", server.url);

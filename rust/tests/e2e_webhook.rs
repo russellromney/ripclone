@@ -100,6 +100,11 @@ async fn webhook_push_builds_before_clone() {
     let origin = make_origin("acme", "hook");
     origin.commit(&[("f.txt", "v1\n")], "c1");
     origin.publish();
+    server
+        .client()
+        .add_repo("acme/hook")
+        .await
+        .expect("add repo");
 
     // GitHub-shaped push payload. `after` only needs to be non-zero (not a
     // delete); the build resolves the real upstream tip itself. `main` is the
@@ -146,6 +151,11 @@ async fn webhook_and_sync_same_branch_coalesce() {
     let origin = make_origin("acme", "coal");
     origin.commit(&[("f.txt", "v1\n")], "c1");
     origin.publish();
+    server
+        .client()
+        .add_repo("acme/coal")
+        .await
+        .expect("add repo");
 
     let body = br#"{"ref":"refs/heads/main","after":"1111111111111111111111111111111111111111","deleted":false,"repository":{"name":"coal","owner":{"login":"acme"},"default_branch":"main","private":false}}"#.to_vec();
     let url = server.url.clone();
@@ -204,13 +214,12 @@ async fn poll_catches_a_missed_push() {
     origin.commit(&[("f.txt", "v1\n")], "c1");
     origin.publish();
 
-    // First sync makes the repo known to the ref store (poll only sweeps known
-    // repos) and builds c1.
+    // First add makes the repo available; the poll loop only acts on added repos.
     server
         .client()
-        .sync_repo("acme/poll", None)
+        .add_repo("acme/poll")
         .await
-        .expect("initial sync");
+        .expect("initial add");
 
     // Advance upstream with NO webhook and NO sync — only the 1s poll loop can
     // notice and build c2.
@@ -254,6 +263,11 @@ async fn gitlab_webhook_push_builds_before_clone() {
         ("RIPCLONE_WEBHOOK_SECRET_GITLAB", SECRET),
     ])
     .await;
+    server
+        .client_with_provider("gitlab", None)
+        .add_repo("acme/hook")
+        .await
+        .expect("add gitlab repo");
 
     // GitLab authenticates with the secret echoed verbatim; no body HMAC.
     let body = br#"{"object_kind":"push","ref":"refs/heads/main","after":"1111111111111111111111111111111111111111","project":{"path_with_namespace":"acme/hook","default_branch":"main","visibility_level":0}}"#.to_vec();
@@ -292,6 +306,11 @@ async fn gitea_webhook_push_builds_before_clone() {
         ("RIPCLONE_WEBHOOK_SECRET_GITEA", SECRET),
     ])
     .await;
+    server
+        .client_with_provider("gitea", None)
+        .add_repo("acme/hook")
+        .await
+        .expect("add gitea repo");
 
     // Gitea sends the bare hex HMAC-SHA256 digest (no `sha256=` prefix).
     let body = br#"{"ref":"refs/heads/main","after":"1111111111111111111111111111111111111111","repository":{"full_name":"acme/hook","default_branch":"main","private":false}}"#.to_vec();
@@ -338,6 +357,7 @@ async fn gitea_webhook_branch_delete_cleans_up_ref() {
     ])
     .await;
     let client = server.client_with_provider("gitea", None);
+    client.add_repo("acme/hook").await.expect("add gitea repo");
 
     // Build the feature branch via explicit sync, then prove it clones.
     client

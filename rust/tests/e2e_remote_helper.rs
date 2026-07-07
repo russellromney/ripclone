@@ -24,6 +24,11 @@ async fn remote_helper_clones_through_ripclone_server() {
     // Sync so the server has artifacts to serve.
     server
         .client()
+        .add_repo("acme/helper")
+        .await
+        .expect("add repo");
+    server
+        .client()
         .sync_repo("acme/helper", None)
         .await
         .expect("sync helper repo");

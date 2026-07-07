@@ -103,6 +103,21 @@ async fn provider_add_then_config_driven_clone() {
 
     let server = start_server().await;
 
+    let repo_add_out = run_ripclone(
+        &bin,
+        home.path(),
+        project.path(),
+        Some(&server.url),
+        &["add", "acme/provider_add"],
+    )
+    .await;
+    assert!(
+        repo_add_out.status.success(),
+        "repo add failed: stdout={}\nstderr={}",
+        String::from_utf8_lossy(&repo_add_out.stdout),
+        String::from_utf8_lossy(&repo_add_out.stderr)
+    );
+
     let sync_out = run_ripclone(
         &bin,
         home.path(),

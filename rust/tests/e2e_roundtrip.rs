@@ -158,6 +158,9 @@ async fn files_mode_resync_works_after_remote_storage_evicted_local_archive_arti
 
     origin.commit_bytes(&[("big.bin", &big), ("tail.txt", b"one\n")], "c1");
     origin.publish();
+    register_added_without_build(&server, "acme/remotecontract")
+        .await
+        .expect("add repo");
     server
         .client()
         .sync_repo("acme/remotecontract", None)
@@ -357,6 +360,9 @@ async fn wrong_token_is_rejected() {
     origin.publish();
 
     // A correctly-tokened client can sync (control).
+    register_added_without_build(&server, "acme/authz")
+        .await
+        .expect("add repo");
     server
         .client()
         .sync_repo("acme/authz", None)

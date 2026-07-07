@@ -60,3 +60,35 @@ async fn add_registers_builds_and_makes_repo_cloneable() {
     .expect("clone after add");
     assert_eq!(read(&clone, "a.txt"), "1\n");
 }
+
+#[tokio::test]
+async fn non_added_repo_ref_and_sync_are_rejected() {
+    setup(false);
+    let origin = make_origin("b5_missing", "repo");
+    origin.commit(&[("a.txt", "1\n")], "c1");
+    origin.publish();
+
+    let server = start_server().await;
+    let resp = reqwest::Client::new()
+        .get(format!(
+            "{}/v1/repos/github/{}/{}/refs/HEAD",
+            server.url, origin.owner, origin.repo
+        ))
+        .header("Authorization", format!("Ripclone {}", token_hash()))
+        .send()
+        .await
+        .expect("ref request");
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+    let body: serde_json::Value = resp.json().await.expect("error json");
+    assert_eq!(body["code"], "repo_not_added");
+
+    let err = server
+        .client()
+        .sync_repo(&format!("{}/{}", origin.owner, origin.repo), None)
+        .await
+        .expect_err("sync non-added");
+    assert!(
+        err.to_string().contains("ripclone add"),
+        "unexpected sync error: {err:#}"
+    );
+}

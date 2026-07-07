@@ -28,6 +28,11 @@ async fn metadata_postgres_sync_then_clone() {
     origin.commit(&[("a.txt", "2\n")], "c2");
     origin.publish();
 
+    server
+        .client()
+        .add_repo(&format!("acme/{repo}"))
+        .await
+        .expect("add with postgres metadata store");
     let resp = server
         .client()
         .sync_repo(&format!("acme/{repo}"), None)

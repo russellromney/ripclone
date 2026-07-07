@@ -66,6 +66,9 @@ async fn killed_worker_claim_is_reclaimed_and_rebuilds_cleanly() {
     origin.commit(&[("a.txt", "two\n"), ("nested/b.txt", "bee\n")], "c2");
     origin.publish();
 
+    register_added_without_build(&server, "acme/worker-crash")
+        .await
+        .expect("add repo");
     let client = server.client();
     let sync_task = tokio::spawn(async move { client.sync_repo("acme/worker-crash", None).await });
 

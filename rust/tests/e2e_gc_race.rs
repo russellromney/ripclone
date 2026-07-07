@@ -37,6 +37,9 @@ async fn remote_gc_during_local_clone_is_safe() {
     origin.commit(&[("a.txt", "gc race\n"), ("b.txt", "x\n")], "c1");
     origin.publish();
 
+    register_added_without_build(&server, "acme/gcrace-local")
+        .await
+        .expect("add repo");
     server
         .client()
         .sync_repo("acme/gcrace-local", None)

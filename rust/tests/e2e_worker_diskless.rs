@@ -50,6 +50,9 @@ async fn diskless_worker_head_sync_returns_real_ref() {
     // which has no mirror — must still return the real ref, not an empty
     // placeholder. This is the regression: it asserts a non-empty commit equal to
     // the published tip.
+    register_added_without_build(&server, "acme/diskless")
+        .await
+        .expect("add repo");
     let resp = server
         .client()
         .sync_repo("acme/diskless", None)

@@ -31,6 +31,9 @@ fn setup() {
 /// Sync, then wait until depth=0 reaches `want_count` so phase 2 (full history,
 /// archive, and any HEAD compaction) has fully landed before the next sync.
 async fn sync_and_settle(server: &Server, origin: &Origin, want_count: &str) {
+    register_added_without_build(server, &format!("{}/{}", origin.owner, origin.repo))
+        .await
+        .expect("add repo");
     server
         .client()
         .sync_repo(&format!("{}/{}", origin.owner, origin.repo), None)

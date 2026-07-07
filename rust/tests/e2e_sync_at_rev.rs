@@ -42,6 +42,9 @@ async fn sync_at_rev_builds_and_clones_older_then_newer() {
     origin.publish();
 
     let client = server.client();
+    register_added_without_build(&server, "acme/atrev")
+        .await
+        .expect("add repo");
 
     // Build at HEAD~2 (= c1); clone at that rev must be exactly c1.
     client
@@ -96,6 +99,9 @@ async fn sync_at_rev_does_not_clobber_tip() {
     origin.commit(&[("a.txt", "3\n")], "c3");
     origin.publish();
     let client = server.client();
+    register_added_without_build(&server, "acme/noclob")
+        .await
+        .expect("add repo");
 
     // Normal tip sync (builds the real branch entry at c3).
     client.sync_repo("acme/noclob", None).await.unwrap();

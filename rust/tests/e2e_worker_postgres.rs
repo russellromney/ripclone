@@ -37,6 +37,11 @@ async fn worker_farm_out_postgres() {
     let origin = make_origin("acme", &good);
     origin.commit(&[("a.txt", "via-postgres\n")], "c1");
     origin.publish();
+    server
+        .client()
+        .add_repo(&format!("acme/{good}"))
+        .await
+        .expect("add postgres farm-out repo");
     let resp = server
         .client()
         .sync_repo(&format!("acme/{good}"), None)
@@ -54,12 +59,9 @@ async fn worker_farm_out_postgres() {
     assert!(git_ok(&c, &["fsck", "--connectivity-only", "HEAD"]));
 
     // Negative: missing upstream → build fails → /sync errors.
-    let result = server
-        .client()
-        .sync_repo(&format!("acme/{missing}"), None)
-        .await;
+    let result = server.client().add_repo(&format!("acme/{missing}")).await;
     assert!(
         result.is_err(),
-        "sync of a missing upstream over postgres must fail, got {result:?}"
+        "add of a missing upstream over postgres must fail, got {result:?}"
     );
 }

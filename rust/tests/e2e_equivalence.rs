@@ -318,6 +318,11 @@ async fn run_oracle(io_uring: bool) {
     // available shortly after.
     server
         .client()
+        .add_repo(&format!("equivalence/{repo}"))
+        .await
+        .expect("add fixture");
+    server
+        .client()
         .sync_repo(&format!("equivalence/{repo}"), None)
         .await
         .expect("sync fixture");

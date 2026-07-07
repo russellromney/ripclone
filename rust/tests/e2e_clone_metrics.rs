@@ -185,6 +185,11 @@ async fn seed_repo(server: &Server, owner: &str, repo: &str) -> String {
     origin.publish();
     server
         .client()
+        .add_repo(&format!("{owner}/{repo}"))
+        .await
+        .expect("add repo");
+    server
+        .client()
         .sync_repo(&format!("{owner}/{repo}"), None)
         .await
         .expect("sync");

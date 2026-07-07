@@ -33,6 +33,7 @@ async fn generic_provider_sync_and_clone_through_http_origin() {
 
     // Sync through the explicit-provider route.
     let client = server.client_with_provider("localgit", Some("test-token"));
+    client.add_repo("acme/http").await.expect("add repo");
     client
         .sync_repo("acme/http", None)
         .await
@@ -113,6 +114,7 @@ async fn gitlab_provider_injects_basic_oauth2_auth_header() {
     let providers_str = providers.to_string();
     let server = start_server_env(&[("RIPCLONE_PROVIDERS", &providers_str)]).await;
     let client = server.client_with_provider("gitlab", None);
+    client.add_repo("acme/http").await.expect("add repo");
     client
         .sync_repo("acme/http", None)
         .await
@@ -145,6 +147,7 @@ async fn gitea_provider_injects_token_auth_header() {
     let providers_str = providers.to_string();
     let server = start_server_env(&[("RIPCLONE_PROVIDERS", &providers_str)]).await;
     let client = server.client_with_provider("gitea", None);
+    client.add_repo("acme/http").await.expect("add repo");
     client
         .sync_repo("acme/http", None)
         .await

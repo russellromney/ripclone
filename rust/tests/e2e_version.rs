@@ -34,6 +34,9 @@ async fn current_protocol_client_can_sync() {
     let origin = make_origin("acme", "compat");
     origin.commit(&[("a.txt", "hi\n")], "c1");
     origin.publish();
+    register_added_without_build(&server, "acme/compat")
+        .await
+        .expect("add repo");
     server
         .client()
         .sync_repo("acme/compat", None)

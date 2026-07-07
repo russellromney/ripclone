@@ -37,12 +37,44 @@ async fn legacy_config_json_token_still_authenticates() {
     let cwd = tempfile::tempdir().unwrap();
     write_legacy_config(home.path(), &server.url, TOKEN);
 
+    let bin = ripclone_bin();
+    let home_path = home.path().to_path_buf();
+    let cwd_path = cwd.path().to_path_buf();
+
+    let add_output = tokio::task::spawn_blocking({
+        let bin = bin.clone();
+        let home_path = home_path.clone();
+        let cwd_path = cwd_path.clone();
+        move || {
+            Command::new(&bin)
+                .arg("add")
+                .arg("acme/migrate")
+                .current_dir(&cwd_path)
+                .env("HOME", &home_path)
+                // Intentionally do NOT set RIPCLONE_SERVER or RIPCLONE_SERVER_TOKEN.
+                // The CLI must read both from the legacy+new config files.
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .output()
+                .expect("spawn ripclone add")
+        }
+    })
+    .await
+    .expect("subprocess panicked");
+
+    assert!(
+        add_output.status.success(),
+        "add with legacy token failed: stdout={}\nstderr={}",
+        String::from_utf8_lossy(&add_output.stdout),
+        String::from_utf8_lossy(&add_output.stderr)
+    );
+
     let output = tokio::task::spawn_blocking(move || {
         Command::new(ripclone_bin())
             .arg("sync")
             .arg("acme/migrate")
-            .current_dir(cwd.path())
-            .env("HOME", home.path())
+            .current_dir(&cwd_path)
+            .env("HOME", &home_path)
             // Intentionally do NOT set RIPCLONE_SERVER or RIPCLONE_SERVER_TOKEN.
             // The CLI must read both from the legacy+new config files.
             .stdout(std::process::Stdio::piped())

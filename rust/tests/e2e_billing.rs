@@ -88,7 +88,26 @@ async fn sync_response_reports_phase_timings_and_status_reports_build_ms() {
     origin.commit(&[("README.md", "sync timings\n")], "c1");
     origin.publish();
 
+    server
+        .client()
+        .add_repo("acme/synctiming")
+        .await
+        .expect("add synctiming");
+    origin.commit(&[("README.md", "sync timings\nupdated\n")], "c2");
+    origin.publish();
     let client = reqwest::Client::new();
+    let before_metrics = client
+        .get(format!("{}/metrics", server.url))
+        .send()
+        .await
+        .expect("metrics request")
+        .error_for_status()
+        .expect("metrics 2xx")
+        .text()
+        .await
+        .expect("metrics text");
+    let before_publish_p1 =
+        prometheus_value(&before_metrics, "ripclone_sync_publish_p1_ms_total").unwrap_or(0);
     let sync_url = format!("{}/v1/repos/github/acme/synctiming/sync", server.url);
     let sync_resp = client
         .post(&sync_url)
@@ -119,9 +138,11 @@ async fn sync_response_reports_phase_timings_and_status_reports_build_ms() {
         .text()
         .await
         .expect("metrics text");
+    let after_publish_p1 = prometheus_value(&metrics, "ripclone_sync_publish_p1_ms_total")
+        .expect("publish p1 metric present");
     assert_eq!(
-        prometheus_value(&metrics, "ripclone_sync_publish_p1_ms_total"),
-        sync.phases.publish_p1_ms,
+        after_publish_p1 - before_publish_p1,
+        sync.phases.publish_p1_ms.unwrap_or(0),
         "phase timings should feed /metrics without RIPCLONE_BENCH"
     );
 
@@ -152,6 +173,10 @@ async fn status_public_fork_is_free() {
 
     let client = server.client();
     client
+        .add_repo("acme/forkbilling")
+        .await
+        .expect("add forkbilling");
+    client
         .sync_repo("acme/forkbilling", None)
         .await
         .expect("sync");
@@ -178,6 +203,7 @@ async fn status_shape_is_backwards_compatible() {
     origin.publish();
 
     let client = server.client();
+    client.add_repo("acme/compat").await.expect("add compat");
     client.sync_repo("acme/compat", None).await.expect("sync");
 
     let status = get_status(&server, "acme", "compat", None).await;

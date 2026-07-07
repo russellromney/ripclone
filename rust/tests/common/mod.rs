@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Once};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
 
 pub const TOKEN: &str = "ripclone-e2e-token";
@@ -783,6 +783,32 @@ pub async fn ensure_added(server: &Server, repo: &str) -> anyhow::Result<()> {
         .unwrap()
         .insert(key);
     Ok(())
+}
+
+pub async fn register_added_without_build(server: &Server, repo: &str) -> anyhow::Result<()> {
+    use ripclone::provider::RepoId;
+    use ripclone::ref_store::{AddedRepo, AddedRepoSource, FileRefStore, RefStore};
+
+    let added = AddedRepo {
+        repo_id: RepoId::github(repo),
+        added_at: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+        history_enabled: true,
+        source: AddedRepoSource::Api,
+    };
+    if std::env::var("RIPCLONE_METADATA").ok().as_deref() == Some("sqlite") {
+        use ripclone::meta::{SqlRefStore, SqliteMeta};
+
+        let url = std::env::var("RIPCLONE_METADATA_DB_URL")?;
+        return SqlRefStore::new(Box::new(SqliteMeta::connect(&url).await?))
+            .await?
+            .add_repo(&added)
+            .await;
+    }
+
+    FileRefStore::new(&server.repo_root).add_repo(&added).await
 }
 
 /// Read a file from a clone (panics if missing).

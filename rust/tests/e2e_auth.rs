@@ -163,6 +163,11 @@ async fn bearer_token_authorizes_a_protected_route() {
     origin.publish();
     server
         .client()
+        .add_repo("acme/authrepo")
+        .await
+        .expect("add authrepo");
+    server
+        .client()
         .sync_repo("acme/authrepo", None)
         .await
         .expect("sync");
@@ -353,6 +358,11 @@ async fn bearer_client_clones_through_the_gateway() {
     origin.publish();
     server
         .client()
+        .add_repo("acme/bearergw")
+        .await
+        .expect("add bearergw");
+    server
+        .client()
         .sync_repo("acme/bearergw", None)
         .await
         .expect("sync");
@@ -403,6 +413,11 @@ async fn expired_bearer_token_fails_clone_cleanly() {
     let origin = make_origin("acme", "jwtexp");
     origin.commit(&[("a.txt", "x\n"), ("b.txt", "y\n")], "c1");
     origin.publish();
+    server
+        .client()
+        .add_repo("acme/jwtexp")
+        .await
+        .expect("add jwtexp");
     server
         .client()
         .sync_repo("acme/jwtexp", None)

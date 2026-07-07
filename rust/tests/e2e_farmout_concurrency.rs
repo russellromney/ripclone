@@ -37,6 +37,9 @@ async fn pool_of_worker_processes_drains_queue_and_coalesces() {
         let o = make_origin("acme", name);
         o.commit(&[("v", &format!("{i}\n"))], "c1");
         o.publish();
+        register_added_without_build(&server, &format!("acme/{name}"))
+            .await
+            .expect("add repo");
     }
     let mut handles = Vec::new();
     for name in names {
@@ -68,6 +71,9 @@ async fn pool_of_worker_processes_drains_queue_and_coalesces() {
     o.commit(&[("f", "1\n")], "c1");
     o.commit(&[("f", "2\n")], "c2");
     o.publish();
+    register_added_without_build(&server, "acme/coalesce")
+        .await
+        .expect("add coalesce");
     let mut handles = Vec::new();
     for _ in 0..6 {
         let client = server.client();
