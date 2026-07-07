@@ -8,6 +8,7 @@
 
 mod common;
 
+use base64::Engine;
 use common::*;
 use hmac::{Hmac, KeyInit, Mac};
 use ripclone::client::Client;
@@ -229,14 +230,99 @@ async fn poll_catches_a_missed_push() {
 /// The provider `host` points at the local dumb-HTTP origin so the sync can
 /// fetch without network.
 fn webhook_providers_json(origin_url: &str, kind: &str) -> String {
+    webhook_provider_with_token_json(kind, kind, origin_url, None)
+}
+
+fn webhook_provider_with_token_json(
+    id: &str,
+    kind: &str,
+    origin_url: &str,
+    token: Option<&str>,
+) -> String {
     serde_json::json!({
         "providers": [{
-            "id": kind,
+            "id": id,
             "kind": kind,
             "host": origin_url,
+            "token": token,
         }]
     })
     .to_string()
+}
+
+fn provider_auth(kind: &str, token: &str) -> String {
+    match kind {
+        "github" => format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{token}"))
+        ),
+        "gitlab" => format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(format!("oauth2:{token}"))
+        ),
+        "gitea" => format!("token {token}"),
+        other => panic!("unknown provider kind {other}"),
+    }
+}
+
+fn webhook_secret_env(provider_id: &str) -> String {
+    format!(
+        "RIPCLONE_WEBHOOK_SECRET_{}",
+        provider_id
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() {
+                    c.to_ascii_uppercase()
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>()
+    )
+}
+
+fn push_body(kind: &str, repo: &str) -> Vec<u8> {
+    match kind {
+        "github" => format!(
+            r#"{{"ref":"refs/heads/main","after":"1111111111111111111111111111111111111111","deleted":false,"repository":{{"name":"{}","owner":{{"login":"acme"}},"default_branch":"main","private":true}}}}"#,
+            repo.rsplit('/').next().unwrap()
+        )
+        .into_bytes(),
+        "gitlab" => format!(
+            r#"{{"object_kind":"push","ref":"refs/heads/main","after":"1111111111111111111111111111111111111111","project":{{"path_with_namespace":"{repo}","default_branch":"main","visibility_level":0}}}}"#
+        )
+        .into_bytes(),
+        "gitea" => format!(
+            r#"{{"ref":"refs/heads/main","after":"1111111111111111111111111111111111111111","repository":{{"full_name":"{repo}","default_branch":"main","private":true}}}}"#
+        )
+        .into_bytes(),
+        other => panic!("unknown provider kind {other}"),
+    }
+}
+
+async fn post_provider_push(server: &Server, provider_id: &str, kind: &str, body: Vec<u8>) {
+    let mut req = reqwest::Client::new()
+        .post(format!("{}/webhooks/{provider_id}", server.url))
+        .header("content-type", "application/json")
+        .body(body.clone());
+    req = match kind {
+        "github" => req
+            .header("X-GitHub-Event", "push")
+            .header("X-Hub-Signature-256", sign_github(&body)),
+        "gitlab" => req
+            .header("X-Gitlab-Event", "Push Hook")
+            .header("X-Gitlab-Token", SECRET),
+        "gitea" => req
+            .header("X-Gitea-Event", "push")
+            .header("X-Gitea-Signature", sign_gitea(&body)),
+        other => panic!("unknown provider kind {other}"),
+    };
+    let resp = req.send().await.expect("webhook POST");
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "valid signed {kind} push accepted"
+    );
 }
 
 /// A GitLab `Push Hook` with the shared `X-Gitlab-Token` secret triggers a real
@@ -275,6 +361,44 @@ async fn gitlab_webhook_push_builds_before_clone() {
         "gitlab clone has the pushed commit"
     );
     assert_repo_usable(&c, "1");
+}
+
+/// Provider-matrix regression: for each provider kind, a signed push webhook
+/// must warm the repo by fetching through that provider's exact auth-header
+/// format. If the webhook path forgets provider credentials or uses another
+/// scheme, the upstream origin returns 403 and this clone never reaches the
+/// pushed commit.
+#[tokio::test]
+async fn provider_webhook_builds_use_provider_auth_headers() {
+    setup(true);
+
+    for (provider_id, kind, token) in [
+        ("github-http", "github", "github-e2e-token"),
+        ("gitlab-auth", "gitlab", "gitlab-e2e-token"),
+        ("gitea-auth", "gitea", "gitea-e2e-token"),
+    ] {
+        let repo = format!("acme/{kind}-authhook");
+        let origin = make_http_origin_with_auth(&repo, &provider_auth(kind, token));
+        origin.commit(&[("f.txt", &format!("from {kind} webhook auth\n"))], "c1");
+        origin.publish();
+
+        let providers =
+            webhook_provider_with_token_json(provider_id, kind, &origin.url, Some(token));
+        let secret_env = webhook_secret_env(provider_id);
+        let server =
+            start_server_env(&[("RIPCLONE_PROVIDERS", &providers), (&secret_env, SECRET)]).await;
+
+        post_provider_push(&server, provider_id, kind, push_body(kind, &repo)).await;
+
+        let (_g, c) =
+            clone_branch_full_for_provider(&server, provider_id, &repo, "main", "1").await;
+        assert_eq!(
+            read(&c, "f.txt"),
+            format!("from {kind} webhook auth\n"),
+            "{kind} webhook build fetched through the provider auth header"
+        );
+        assert_repo_usable(&c, "1");
+    }
 }
 
 /// A Gitea `push` webhook with a valid HMAC signature triggers a real build, and

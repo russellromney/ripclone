@@ -13,6 +13,7 @@ use ripclone::storage::{HashEntry, StorageBackend, StorageRef};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Mutex;
 use std::sync::{Arc, Once};
 use std::time::Duration;
 use tempfile::TempDir;
@@ -152,16 +153,42 @@ pub async fn start_server_with_barrier(barrier: ArtifactBarrier) -> Server {
 }
 
 pub async fn start_server_split_storage() -> Server {
-    start_server_split_storage_inner(None).await
+    start_server_split_storage_inner(None, None, None).await
 }
 
 /// Start a split-storage server with a deterministic artifact download barrier.
 /// See [`ripclone::server::ArtifactBarrier`].
 pub async fn start_server_split_storage_barrier(barrier: ArtifactBarrier) -> Server {
-    start_server_split_storage_inner(Some(barrier)).await
+    start_server_split_storage_inner(Some(barrier), None, None).await
 }
 
-async fn start_server_split_storage_inner(barrier: Option<ArtifactBarrier>) -> Server {
+/// Start a split-storage server whose durable-storage uploads fail after a
+/// configurable number of successful writes. Used by failure-injection e2e
+/// tests to prove failed builds do not publish refs that point at missing
+/// artifacts.
+pub async fn start_server_split_storage_failing_put(
+    fail_after_successes: usize,
+    failures: usize,
+) -> Server {
+    start_server_split_storage_inner(None, Some((fail_after_successes, failures)), None).await
+}
+
+/// Start a split-storage server whose ref-store writes fail after a configurable
+/// number of successful writes. This gives failure-injection tests deterministic
+/// coverage of metadata/DB publish failures without relying on filesystem
+/// permissions or process-global environment.
+pub async fn start_server_split_storage_failing_ref_save(
+    fail_after_successes: usize,
+    failures: usize,
+) -> Server {
+    start_server_split_storage_inner(None, None, Some((fail_after_successes, failures))).await
+}
+
+async fn start_server_split_storage_inner(
+    barrier: Option<ArtifactBarrier>,
+    fail_put: Option<(usize, usize)>,
+    fail_ref: Option<(usize, usize)>,
+) -> Server {
     init_tracing();
     let dir = tempfile::tempdir().expect("server dir");
     let cas_dir = dir.path().join("cas");
@@ -171,11 +198,30 @@ async fn start_server_split_storage_inner(barrier: Option<ArtifactBarrier>) -> S
     let port = free_port();
 
     let cas = ripclone::cas::Cas::new(&cas_dir).unwrap();
-    let storage: StorageRef = Arc::new(RemoteLocalStorage {
+    let base_storage: StorageRef = Arc::new(RemoteLocalStorage {
         inner: ripclone::storage::local(&storage_dir).unwrap(),
     });
-    let ref_store: Arc<dyn ripclone::ref_store::RefStore> =
+    let storage: StorageRef = if let Some((fail_after_successes, failures)) = fail_put {
+        Arc::new(FailingPutStorage::new(
+            base_storage,
+            fail_after_successes,
+            failures,
+        ))
+    } else {
+        base_storage
+    };
+    let base_ref_store: Arc<dyn ripclone::ref_store::RefStore> =
         Arc::new(ripclone::ref_store::FileRefStore::new(&repo_root));
+    let ref_store: Arc<dyn ripclone::ref_store::RefStore> =
+        if let Some((fail_after_successes, failures)) = fail_ref {
+            Arc::new(FailingRefStore::new(
+                base_ref_store,
+                fail_after_successes,
+                failures,
+            ))
+        } else {
+            base_ref_store
+        };
     let metrics = ripclone::metrics::Metrics::new();
     let retention = Arc::new(
         ripclone::retention::Retention::with_config_and_storage(
@@ -344,6 +390,247 @@ impl StorageBackend for RemoteLocalStorage {
 
     fn regions(&self) -> Vec<String> {
         vec!["test-remote-local".to_string()]
+    }
+
+    fn delete(&self, hash: &str) -> anyhow::Result<()> {
+        self.inner.delete(hash)
+    }
+
+    fn delete_batch(&self, hashes: &[String]) -> anyhow::Result<u64> {
+        self.inner.delete_batch(hashes)
+    }
+
+    fn list_hashes(&self) -> anyhow::Result<Vec<HashEntry>> {
+        self.inner.list_hashes()
+    }
+
+    fn health(&self) -> anyhow::Result<()> {
+        self.inner.health()
+    }
+}
+
+pub struct FailingPutStorage {
+    inner: StorageRef,
+    fail_after_successes: Mutex<usize>,
+    failures_remaining: Mutex<usize>,
+}
+
+impl FailingPutStorage {
+    pub fn new(inner: StorageRef, fail_after_successes: usize, failures: usize) -> Self {
+        Self {
+            inner,
+            fail_after_successes: Mutex::new(fail_after_successes),
+            failures_remaining: Mutex::new(failures),
+        }
+    }
+
+    fn should_fail_put(&self) -> bool {
+        let mut successes = self.fail_after_successes.lock().unwrap();
+        if *successes > 0 {
+            *successes -= 1;
+            return false;
+        }
+        drop(successes);
+
+        let mut failures = self.failures_remaining.lock().unwrap();
+        if *failures > 0 {
+            *failures -= 1;
+            return true;
+        }
+        false
+    }
+}
+
+pub struct FailingRefStore {
+    inner: Arc<dyn ripclone::ref_store::RefStore>,
+    fail_after_successes: Mutex<usize>,
+    failures_remaining: Mutex<usize>,
+}
+
+impl FailingRefStore {
+    pub fn new(
+        inner: Arc<dyn ripclone::ref_store::RefStore>,
+        fail_after_successes: usize,
+        failures: usize,
+    ) -> Self {
+        Self {
+            inner,
+            fail_after_successes: Mutex::new(fail_after_successes),
+            failures_remaining: Mutex::new(failures),
+        }
+    }
+
+    fn should_fail_write(&self) -> bool {
+        let mut successes = self.fail_after_successes.lock().unwrap();
+        if *successes > 0 {
+            *successes -= 1;
+            return false;
+        }
+        drop(successes);
+
+        let mut failures = self.failures_remaining.lock().unwrap();
+        if *failures > 0 {
+            *failures -= 1;
+            return true;
+        }
+        false
+    }
+}
+
+#[async_trait::async_trait]
+impl ripclone::ref_store::RefStore for FailingRefStore {
+    async fn load(
+        &self,
+        repo_id: &ripclone::provider::RepoId,
+    ) -> anyhow::Result<Option<ripclone::RefInfo>> {
+        self.inner.load(repo_id).await
+    }
+
+    async fn save(
+        &self,
+        repo_id: &ripclone::provider::RepoId,
+        info: &ripclone::RefInfo,
+    ) -> anyhow::Result<()> {
+        if self.should_fail_write() {
+            anyhow::bail!(
+                "injected ref-store save failure for {}",
+                repo_id.storage_key()
+            );
+        }
+        self.inner.save(repo_id, info).await
+    }
+
+    async fn list(&self) -> anyhow::Result<Vec<ripclone::provider::RepoId>> {
+        self.inner.list().await
+    }
+
+    async fn load_branch(
+        &self,
+        repo_id: &ripclone::provider::RepoId,
+        branch: &str,
+    ) -> anyhow::Result<Option<ripclone::RefInfo>> {
+        self.inner.load_branch(repo_id, branch).await
+    }
+
+    async fn load_build(
+        &self,
+        repo_id: &ripclone::provider::RepoId,
+        commit: &str,
+    ) -> anyhow::Result<Option<ripclone::RefInfo>> {
+        self.inner.load_build(repo_id, commit).await
+    }
+
+    async fn save_branch(
+        &self,
+        repo_id: &ripclone::provider::RepoId,
+        branch: &str,
+        info: &ripclone::RefInfo,
+    ) -> anyhow::Result<()> {
+        if self.should_fail_write() {
+            anyhow::bail!(
+                "injected ref-store save_branch failure for {}@{branch}",
+                repo_id.storage_key()
+            );
+        }
+        self.inner.save_branch(repo_id, branch, info).await
+    }
+
+    async fn update_build_status(
+        &self,
+        repo_id: &ripclone::provider::RepoId,
+        branch: &str,
+        expected_commit: &str,
+        status: &str,
+    ) -> anyhow::Result<bool> {
+        self.inner
+            .update_build_status(repo_id, branch, expected_commit, status)
+            .await
+    }
+
+    async fn touch_last_accessed_at(
+        &self,
+        repo_id: &ripclone::provider::RepoId,
+        branch: &str,
+        expected_commit: &str,
+    ) -> anyhow::Result<bool> {
+        self.inner
+            .touch_last_accessed_at(repo_id, branch, expected_commit)
+            .await
+    }
+
+    async fn delete_branch(
+        &self,
+        repo_id: &ripclone::provider::RepoId,
+        branch: &str,
+    ) -> anyhow::Result<()> {
+        self.inner.delete_branch(repo_id, branch).await
+    }
+
+    async fn list_branches(
+        &self,
+        repo_id: &ripclone::provider::RepoId,
+    ) -> anyhow::Result<Vec<String>> {
+        self.inner.list_branches(repo_id).await
+    }
+
+    async fn invalidate(&self, repo_id: &ripclone::provider::RepoId, branch: &str) {
+        self.inner.invalidate(repo_id, branch).await
+    }
+
+    async fn health(&self) -> anyhow::Result<()> {
+        self.inner.health().await
+    }
+}
+
+#[async_trait::async_trait]
+impl StorageBackend for FailingPutStorage {
+    fn get(&self, hash: &str) -> anyhow::Result<Vec<u8>> {
+        self.inner.get(hash)
+    }
+
+    fn get_range(&self, hash: &str, start: u64, len: u64) -> anyhow::Result<Vec<u8>> {
+        self.inner.get_range(hash, start, len)
+    }
+
+    fn put(&self, hash: &str, data: &[u8]) -> anyhow::Result<()> {
+        if self.should_fail_put() {
+            anyhow::bail!("injected durable-storage put failure for {hash}");
+        }
+        self.inner.put(hash, data)
+    }
+
+    async fn put_async(&self, hash: &str, data: &[u8]) -> anyhow::Result<()> {
+        if self.should_fail_put() {
+            anyhow::bail!("injected durable-storage put_async failure for {hash}");
+        }
+        self.inner.put_async(hash, data).await
+    }
+
+    async fn put_file_async(&self, hash: &str, path: &std::path::Path) -> anyhow::Result<()> {
+        if self.should_fail_put() {
+            anyhow::bail!("injected durable-storage put_file_async failure for {hash}");
+        }
+        self.inner.put_file_async(hash, path).await
+    }
+
+    async fn get_meta(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
+        self.inner.get_meta(key).await
+    }
+
+    async fn put_meta(&self, key: &str, data: &[u8]) -> anyhow::Result<()> {
+        self.inner.put_meta(key, data).await
+    }
+
+    fn size(&self, hash: &str) -> anyhow::Result<u64> {
+        self.inner.size(hash)
+    }
+
+    fn is_remote(&self) -> bool {
+        self.inner.is_remote()
+    }
+
+    fn regions(&self) -> Vec<String> {
+        self.inner.regions()
     }
 
     fn delete(&self, hash: &str) -> anyhow::Result<()> {
@@ -570,6 +857,7 @@ pub struct HttpOrigin {
     pub bare: PathBuf,
     pub url: String,
     pub port: u16,
+    auth_log: Option<PathBuf>,
     _dir: TempDir,
     _server: std::process::Child,
 }
@@ -612,6 +900,22 @@ impl HttpOrigin {
     pub fn bare_str(&self) -> &str {
         self.bare.to_str().unwrap()
     }
+
+    pub fn auth_reject_count(&self) -> usize {
+        self.auth_status_count("403")
+    }
+
+    fn auth_status_count(&self, status: &str) -> usize {
+        let Some(path) = &self.auth_log else {
+            return 0;
+        };
+        let Ok(log) = std::fs::read_to_string(path) else {
+            return 0;
+        };
+        log.lines()
+            .filter(|line| line.split('\t').next() == Some(status))
+            .count()
+    }
 }
 
 /// Create a bare repo under `<repo_path>.git`, enable dumb HTTP, and serve the
@@ -647,17 +951,20 @@ fn make_http_origin_inner(repo_path: &str, expected_auth: Option<&str>) -> HttpO
     git(&bare, &["update-server-info"]);
 
     let port = free_port();
+    let auth_log = expected_auth.map(|_| dir.path().join("auth.log"));
     let server = if let Some(auth) = expected_auth {
         // A tiny real HTTP server that gates every request on the exact
         // Authorization header ripclone is expected to inject.
         let script = dir.path().join("auth_server.py");
         let script_body = r#"import http.server
+import os
 import socketserver
 import sys
 
 EXPECTED_AUTH = sys.argv[1]
 PORT = int(sys.argv[2])
 ROOT = sys.argv[3]
+LOG = sys.argv[4]
 
 class AuthHandler(http.server.SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
@@ -666,16 +973,24 @@ class AuthHandler(http.server.SimpleHTTPRequestHandler):
     def check_auth(self):
         return self.headers.get('Authorization') == EXPECTED_AUTH
 
+    def record(self, status):
+        with open(LOG, 'a', encoding='utf-8') as f:
+            f.write(f"{status}\t{self.command}\t{self.path}\t{self.headers.get('Authorization', '')}\n")
+
     def do_GET(self):
         if not self.check_auth():
+            self.record(403)
             self.send_error(403, 'Forbidden')
             return
+        self.record(200)
         super().do_GET()
 
     def do_HEAD(self):
         if not self.check_auth():
+            self.record(403)
             self.send_error(403, 'Forbidden')
             return
+        self.record(200)
         super().do_HEAD()
 
     def log_message(self, format, *args):
@@ -688,11 +1003,14 @@ with ReusableTCPServer(('', PORT), AuthHandler) as httpd:
     httpd.serve_forever()
 "#;
         std::fs::write(&script, script_body).unwrap();
+        let log = auth_log.as_ref().expect("auth log path");
+        std::fs::write(log, "").unwrap();
         Command::new("python3")
             .arg(script.to_str().unwrap())
             .arg(auth)
             .arg(port.to_string())
             .arg(dir.path().to_str().unwrap())
+            .arg(log.to_str().unwrap())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
@@ -723,6 +1041,7 @@ with ReusableTCPServer(('', PORT), AuthHandler) as httpd:
         bare,
         url: format!("http://127.0.0.1:{port}"),
         port,
+        auth_log,
         _dir: dir,
         _server: server,
     }
@@ -1074,6 +1393,30 @@ pub async fn sync_until_manifest(
     panic!("clonepack manifest never published for {owner}/{repo} (last: {last})");
 }
 
+/// Shared B5 seam: make a repo warm enough that a subsequent clone can fetch
+/// real bytes, not just observe that `/sync` returned. Today this means polling
+/// until the full clonepack manifest exists; B5 can change add/sync semantics in
+/// one place.
+pub async fn warm_repo_until_cloneable(
+    server: &Server,
+    owner: &str,
+    repo: &str,
+) -> ripclone::client::RefResponse {
+    sync_until_manifest(server, owner, repo).await
+}
+
+/// Wait until an already-triggered build has published cloneable artifacts.
+/// This deliberately clones bytes as the probe, so a stale/ref-only success
+/// cannot pass.
+pub async fn wait_repo_cloneable(
+    server: &Server,
+    owner: &str,
+    repo: &str,
+    want_count: &str,
+) -> (TempDir, PathBuf) {
+    clone_full_at(server, owner, repo, want_count).await
+}
+
 /// True when `dir` contains at least one regular file (recursively) — used to
 /// tell a materialized files-mode worktree from an empty/not-yet-built one.
 fn dir_has_file(dir: &Path) -> bool {
@@ -1099,6 +1442,16 @@ fn dir_has_file(dir: &Path) -> bool {
 
 /// A spawned `ripclone-worker` binary, killed when dropped.
 pub struct WorkerProc(Child);
+
+impl WorkerProc {
+    /// Kill the worker process and wait for it to exit. Tests use this to model
+    /// SIGKILL-style loss of the build owner while the SQL queue row remains
+    /// claimed.
+    pub fn kill_and_wait(mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
 
 impl Drop for WorkerProc {
     fn drop(&mut self) {
@@ -1131,43 +1484,4 @@ pub fn spawn_worker(cas_dir: &Path, repo_root: &Path) -> WorkerProc {
         .spawn()
         .expect("spawn ripclone-worker binary");
     WorkerProc(child)
-}
-
-/// Shared B5 seam for "make this repo warm/cloneable".
-///
-/// Today that means `sync`, then polling the requested clonepack kind until it
-/// resolves. When add/sync split lands, this is the helper future tests should
-/// change instead of duplicating setup in every e2e.
-pub async fn warm_repo_until_cloneable(
-    server: &Server,
-    repo: &str,
-    clonepack_kind: Option<&str>,
-) -> ripclone::client::RefResponse {
-    server
-        .client()
-        .sync_repo(repo, None)
-        .await
-        .expect("warm repo");
-    wait_repo_cloneable(server, repo, clonepack_kind).await
-}
-
-pub async fn wait_repo_cloneable(
-    server: &Server,
-    repo: &str,
-    clonepack_kind: Option<&str>,
-) -> ripclone::client::RefResponse {
-    let mut last = String::from("<not attempted>");
-    for _ in 0..160 {
-        match server
-            .client()
-            .resolve_ref_with_clonepack(repo, "HEAD", clonepack_kind, None)
-            .await
-        {
-            Ok(info) if !info.commit.is_empty() => return info,
-            Ok(info) => last = format!("empty commit in ref: {info:?}"),
-            Err(e) => last = format!("{e:#}"),
-        }
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    }
-    panic!("{repo} never became cloneable (last: {last})");
 }
