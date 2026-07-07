@@ -65,7 +65,7 @@ cargo install ripclone --locked
 pip install ripclone
 ```
 
-The prebuilt binaries link their C libraries (libgit2, openssl, zstd) dynamically; on Linux install the runtime packages (`libgit2`, `libssl3`), on macOS `brew install libgit2 openssl@3`. `cargo install` builds them from source instead.
+The prebuilt binaries need no extra runtime packages: git and TLS are pure Rust (`gix` + `rustls`), and the remaining C libraries (`zstd`, `zlib-ng`) are statically linked. They depend only on the system libc, so the one-liner works on a clean machine. `cargo install` builds from source instead.
 
 Check your version and whether the configured server is compatible:
 

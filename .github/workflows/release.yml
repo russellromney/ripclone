@@ -1,10 +1,11 @@
 name: release
 
 # Cut a release by pushing a tag: `git tag v0.1.0 && git push origin v0.1.0`.
-# Each platform builds natively (no cross-compile) so the C dependencies
-# (libgit2, openssl, fuse, zstd) build with the system toolchain. The binaries
-# link those libraries dynamically, so the install instructions list the runtime
-# packages; fully-static binaries are a future refinement.
+# Each platform builds natively (no cross-compile). The git and TLS stacks are
+# pure Rust (gix + rustls), and the remaining C libraries (zstd, zlib-ng) are
+# vendored and statically linked by their -sys crates. So the shipped binaries
+# have no libgit2/openssl/zstd runtime dependency; they link only the system
+# libc. `protobuf-compiler` and `cmake` are build-time only (prost + zlib-ng).
 #
 # Required repo secrets:
 #   CARGO_REGISTRY_TOKEN  crates.io API token (for the crates-io job)
@@ -42,12 +43,12 @@ jobs:
         run: brew install protobuf cmake pkg-config libgit2 openssl@3
       - name: Build binaries
         working-directory: rust
-        run: cargo build --release --locked --bin ripclone --bin ripclone-server --bin git-remote-ripclone
+        run: cargo build --release --locked --bin ripclone --bin ripclone-server --bin ripclone-worker --bin git-remote-ripclone
       - name: Package
         run: |
           dir="ripclone-${{ matrix.platform }}"
           mkdir -p "$dir"
-          cp rust/target/release/ripclone rust/target/release/ripclone-server rust/target/release/git-remote-ripclone "$dir/"
+          cp rust/target/release/ripclone rust/target/release/ripclone-server rust/target/release/ripclone-worker rust/target/release/git-remote-ripclone "$dir/"
           cp LICENSE-MIT LICENSE-APACHE "$dir/"
           tar -czf "$dir.tar.gz" "$dir"
           shasum -a 256 "$dir.tar.gz" > "$dir.tar.gz.sha256"
