@@ -26,6 +26,9 @@ async fn metadata_sqlite_sync_then_clone() {
     origin.commit(&[("a.txt", "2\n")], "c2");
     origin.publish();
 
+    register_added_without_build(&server, "acme/meta")
+        .await
+        .expect("add repo");
     let resp = server
         .client()
         .sync_repo("acme/meta", None)

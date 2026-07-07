@@ -110,6 +110,11 @@ async fn concurrent_distinct_branch_builds_for_one_repo_do_not_interleave() {
     let origin = make_origin("acme", "conc");
     origin.commit(&[("base.txt", "base\n")], "c0"); // main, depth 1
     origin.publish();
+    server
+        .client()
+        .add_repo("acme/conc")
+        .await
+        .expect("add conc");
 
     const N: usize = 5;
     let branches = build_branches(&origin, N, 1); // bK has depth 1+K
@@ -150,6 +155,11 @@ async fn concurrent_builds_during_tip_advancing_fetch_stay_correct() {
     let origin = make_origin("acme", "race");
     origin.commit(&[("base.txt", "base\n")], "c0");
     origin.publish();
+    server
+        .client()
+        .add_repo("acme/race")
+        .await
+        .expect("add race");
 
     const N: usize = 4;
     let branches = build_branches(&origin, N, 1);
@@ -227,6 +237,13 @@ async fn fast_moving_single_branch_converges_and_stays_correct() {
             &format!("c{i}"),
         );
         origin.publish();
+        if i == 1 {
+            server
+                .client()
+                .add_repo("acme/fast")
+                .await
+                .expect("add fast");
+        }
         // Fire a sync without waiting, so it overlaps later commits/fetches.
         let client = server.client();
         handles.push(tokio::spawn(async move {
@@ -276,6 +293,11 @@ async fn concurrent_same_repo_syncs_and_clones_under_load_get_current_bytes() {
     let origin = make_origin("acme", "loadsame");
     origin.commit(&[("f.txt", "v1\n")], "c1");
     origin.publish();
+    server
+        .client()
+        .add_repo("acme/loadsame")
+        .await
+        .expect("add loadsame");
     server
         .client()
         .sync_repo("acme/loadsame", None)

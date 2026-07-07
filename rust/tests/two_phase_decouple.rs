@@ -32,6 +32,9 @@ async fn editable_full_ready_before_files() {
     origin.commit(&[("a.txt", "1\n"), ("dir/b.txt", "B\n")], "c1");
     origin.commit(&[("a.txt", "2\n")], "c2");
     origin.publish();
+    register_added_without_build(&server, "acme/decouple")
+        .await
+        .expect("add repo");
     server
         .client()
         .sync_repo("acme/decouple", None)

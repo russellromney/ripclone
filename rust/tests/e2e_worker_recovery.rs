@@ -258,6 +258,9 @@ async fn worker_kill_mid_build_reclaims_sqlite_queue_sqlite_metadata() {
     let want = origin.commit(&[("a.txt", "recovered\n")], "c1");
     origin.publish();
 
+    register_added_without_build(&server, "acme/recover-sqlite")
+        .await
+        .expect("add repo");
     recover_after_killed_worker_with_sqlite_queue(&queue_db, &server, "recover-sqlite", &want)
         .await;
 }

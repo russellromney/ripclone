@@ -83,6 +83,22 @@ async fn project_config_drives_clone_mode_and_default_provider() {
     let bin = ripclone_bin();
     let providers_json = providers.to_string();
 
+    let add_out = run_ripclone(
+        &bin,
+        home.path(),
+        project.path(),
+        &server.url,
+        &providers_json,
+        &["add", "acme/http"],
+    )
+    .await;
+    assert!(
+        add_out.status.success(),
+        "add failed: stdout={}\nstderr={}",
+        String::from_utf8_lossy(&add_out.stdout),
+        String::from_utf8_lossy(&add_out.stderr)
+    );
+
     let sync_out = run_ripclone(
         &bin,
         home.path(),

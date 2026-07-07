@@ -98,6 +98,11 @@ async fn verify_upstream_default_succeeds_for_public() {
     origin.publish();
     server
         .client()
+        .add_repo("acme/verify-default")
+        .await
+        .expect("add repo");
+    server
+        .client()
         .sync_repo("acme/verify-default", None)
         .await
         .expect("sync");
@@ -135,6 +140,11 @@ async fn verify_upstream_succeeds_for_shallow_clone_with_history() {
     origin.commit(&[("a.txt", "1\n")], "c1");
     origin.commit(&[("a.txt", "2\n")], "c2");
     origin.publish();
+    server
+        .client()
+        .add_repo("acme/verify-shallow-history")
+        .await
+        .expect("add repo");
     server
         .client()
         .sync_repo("acme/verify-shallow-history", None)
@@ -176,6 +186,11 @@ async fn verify_upstream_auto_detects_stale_tip_on_public_repo() {
     origin.publish();
     server
         .client()
+        .add_repo("acme/verify-auto-stale")
+        .await
+        .expect("add repo");
+    server
+        .client()
         .sync_repo("acme/verify-auto-stale", None)
         .await
         .expect("sync");
@@ -214,6 +229,11 @@ async fn verify_upstream_always_detects_stale_tip() {
     let origin = make_origin("acme", "verify-stale");
     origin.commit(&[("a.txt", "a\n")], "a");
     origin.publish();
+    server
+        .client()
+        .add_repo("acme/verify-stale")
+        .await
+        .expect("add repo");
     server
         .client()
         .sync_repo("acme/verify-stale", None)
@@ -257,6 +277,11 @@ async fn verify_upstream_always_fails_when_unreachable() {
     origin.publish();
     server
         .client()
+        .add_repo("acme/verify-unreachable")
+        .await
+        .expect("add repo");
+    server
+        .client()
         .sync_repo("acme/verify-unreachable", None)
         .await
         .expect("sync");
@@ -296,6 +321,11 @@ async fn verify_upstream_never_silently_skips() {
     let origin = make_origin("acme", "verify-never");
     origin.commit(&[("a.txt", "hello\n")], "c1");
     origin.publish();
+    server
+        .client()
+        .add_repo("acme/verify-never")
+        .await
+        .expect("add repo");
     server
         .client()
         .sync_repo("acme/verify-never", None)
@@ -343,6 +373,11 @@ async fn verify_upstream_auto_warns_and_skips_unreachable() {
     origin.publish();
     server
         .client()
+        .add_repo("acme/verify-auto-unreachable")
+        .await
+        .expect("add repo");
+    server
+        .client()
         .sync_repo("acme/verify-auto-unreachable", None)
         .await
         .expect("sync");
@@ -380,6 +415,11 @@ async fn verify_upstream_auto_with_token_warns_and_skips_unreachable() {
     let origin = make_origin("acme", "verify-auto-token-unreachable");
     origin.commit(&[("a.txt", "hello\n")], "c1");
     origin.publish();
+    server
+        .client()
+        .add_repo("acme/verify-auto-token-unreachable")
+        .await
+        .expect("add repo");
     server
         .client()
         .sync_repo("acme/verify-auto-token-unreachable", None)
@@ -433,6 +473,11 @@ async fn verify_upstream_files_mode_warns_and_skips() {
     origin.publish();
     server
         .client()
+        .add_repo("acme/verify-files")
+        .await
+        .expect("add repo");
+    server
+        .client()
         .sync_repo("acme/verify-files", None)
         .await
         .expect("sync");
@@ -475,6 +520,11 @@ async fn verify_upstream_auto_skips_non_tip_rev() {
     origin.commit(&[("a.txt", "1\n")], "c1");
     origin.commit(&[("a.txt", "2\n")], "c2");
     origin.publish();
+    server
+        .client()
+        .add_repo("acme/verify-at-auto")
+        .await
+        .expect("add repo");
     server
         .client()
         .sync_repo_at("acme/verify-at-auto", Some("HEAD~1"), None)
@@ -521,6 +571,11 @@ async fn verify_upstream_always_fails_non_tip_rev() {
     origin.commit(&[("a.txt", "1\n")], "c1");
     origin.commit(&[("a.txt", "2\n")], "c2");
     origin.publish();
+    server
+        .client()
+        .add_repo("acme/verify-at-always")
+        .await
+        .expect("add repo");
     server
         .client()
         .sync_repo_at("acme/verify-at-always", Some("HEAD~1"), None)

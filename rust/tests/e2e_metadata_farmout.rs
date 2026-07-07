@@ -35,6 +35,9 @@ async fn metadata_and_queue_on_sqlite_with_real_worker() {
 
     // The worker builds and writes the ref into the shared sqlite metadata DB;
     // the server reads it back across the process boundary.
+    register_added_without_build(&server, "acme/mfarm")
+        .await
+        .expect("add repo");
     let resp = server
         .client()
         .sync_repo("acme/mfarm", None)

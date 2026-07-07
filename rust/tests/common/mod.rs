@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::sync::{Arc, Once};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
 
 pub const TOKEN: &str = "ripclone-e2e-token";
@@ -502,6 +502,21 @@ impl ripclone::ref_store::RefStore for FailingRefStore {
 
     async fn list(&self) -> anyhow::Result<Vec<ripclone::provider::RepoId>> {
         self.inner.list().await
+    }
+
+    async fn add_repo(&self, repo: &ripclone::ref_store::AddedRepo) -> anyhow::Result<()> {
+        self.inner.add_repo(repo).await
+    }
+
+    async fn load_added_repo(
+        &self,
+        repo_id: &ripclone::provider::RepoId,
+    ) -> anyhow::Result<Option<ripclone::ref_store::AddedRepo>> {
+        self.inner.load_added_repo(repo_id).await
+    }
+
+    async fn list_added_repos(&self) -> anyhow::Result<Vec<ripclone::ref_store::AddedRepo>> {
+        self.inner.list_added_repos().await
     }
 
     async fn load_branch(
@@ -1070,21 +1085,88 @@ pub async fn clone_only_at(
     mode: ripclone::mode::CloneMode,
 ) -> anyhow::Result<(TempDir, std::path::PathBuf)> {
     let client = server.client();
+    let repo_path = format!("{owner}/{repo}");
+    ensure_added(server, &repo_path).await?;
     let out = tempfile::tempdir().unwrap();
     let target = out.path().join("clone");
     let kind = ripclone::mode::clonepack_kind_for_depth(depth);
     client
-        .install_repo_with_mode_at(
-            &format!("{owner}/{repo}"),
-            "HEAD",
-            rev,
-            &target,
-            mode,
-            Some(kind),
-            None,
-        )
+        .install_repo_with_mode_at(&repo_path, "HEAD", rev, &target, mode, Some(kind), None)
         .await?;
     Ok((out, target))
+}
+
+pub async fn ensure_added(server: &Server, repo: &str) -> anyhow::Result<()> {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+
+    static ADDED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let key = format!("{} {repo}", server.url);
+    if ADDED
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap()
+        .contains(&key)
+    {
+        return Ok(());
+    }
+    server.client().add_repo(repo).await?;
+    ADDED
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap()
+        .insert(key);
+    Ok(())
+}
+
+pub async fn register_added_without_build(server: &Server, repo: &str) -> anyhow::Result<()> {
+    use ripclone::provider::RepoId;
+    register_added_without_build_repo_id(server, RepoId::github(repo)).await
+}
+
+/// Same as [`register_added_without_build`] but for a repo that belongs to a
+/// non-default provider instance (e.g. `github-bad`, `gitlab-auth`). The gate's
+/// added-repo lookup keys on the full `RepoId` (provider + path), so a repo
+/// synced through a provider client must be registered under that same provider.
+pub async fn register_added_without_build_for_provider(
+    server: &Server,
+    provider: &str,
+    path: &str,
+) -> anyhow::Result<()> {
+    use ripclone::provider::{ProviderInstanceId, RepoId};
+    let repo_id = RepoId {
+        provider: ProviderInstanceId::new(provider),
+        path: path.to_string(),
+    };
+    register_added_without_build_repo_id(server, repo_id).await
+}
+
+async fn register_added_without_build_repo_id(
+    server: &Server,
+    repo_id: ripclone::provider::RepoId,
+) -> anyhow::Result<()> {
+    use ripclone::ref_store::{AddedRepo, AddedRepoSource, FileRefStore, RefStore};
+
+    let added = AddedRepo {
+        repo_id,
+        added_at: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+        history_enabled: true,
+        source: AddedRepoSource::Api,
+    };
+    if std::env::var("RIPCLONE_METADATA").ok().as_deref() == Some("sqlite") {
+        use ripclone::meta::{SqlRefStore, SqliteMeta};
+
+        let url = std::env::var("RIPCLONE_METADATA_DB_URL")?;
+        return SqlRefStore::new(Box::new(SqliteMeta::connect(&url).await?))
+            .await?
+            .add_repo(&added)
+            .await;
+    }
+
+    FileRefStore::new(&server.repo_root).add_repo(&added).await
 }
 
 /// Read a file from a clone (panics if missing).
@@ -1246,6 +1328,9 @@ pub async fn lifecycle_battery(server: &Server, origin: &Origin) {
     origin.commit(&[("a.txt", "1\n")], "c1");
     origin.commit(&[("a.txt", "2\n"), ("dir/b.txt", "B\n")], "c2");
     origin.publish();
+    ensure_added(server, &format!("{o}/{r}"))
+        .await
+        .expect("add lifecycle repo");
     client
         .sync_repo(&format!("{o}/{r}"), None)
         .await
@@ -1324,6 +1409,9 @@ pub async fn sync_and_clone(
     mode: ripclone::mode::CloneMode,
 ) -> (TempDir, PathBuf) {
     let client = server.client();
+    ensure_added(server, &format!("{}/{}", origin.owner, origin.repo))
+        .await
+        .expect("add before sync_and_clone");
     client
         .sync_repo(&format!("{}/{}", origin.owner, origin.repo), None)
         .await
@@ -1381,6 +1469,9 @@ pub async fn sync_until_manifest(
     repo: &str,
 ) -> ripclone::client::RefResponse {
     let client = server.client();
+    ensure_added(server, &format!("{owner}/{repo}"))
+        .await
+        .expect("add before sync_until_manifest");
     let mut last = String::from("<no successful sync>");
     for _ in 0..160 {
         match client.sync_repo(&format!("{owner}/{repo}"), None).await {

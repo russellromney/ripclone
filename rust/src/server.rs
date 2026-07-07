@@ -14,7 +14,7 @@ use crate::oidc::OidcVerifier;
 use crate::pack::PackBuilder;
 use crate::provider::{ProviderInstance, ProviderRegistry, RepoId};
 use crate::queue::{BuildError, BuildJob, EnqueueOutcome, JobQueueRef, JobState};
-use crate::ref_store::{RefStore, migrate_legacy_refs};
+use crate::ref_store::{AddedRepo, AddedRepoSource, RefStore, migrate_legacy_refs};
 use crate::remote_gc::{GcConfig, RemoteGc};
 use crate::retention::Retention;
 use crate::snapshot::SnapshotBuilder;
@@ -29,7 +29,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{Html, IntoResponse, Redirect, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use futures::{SinkExt, StreamExt, TryStreamExt};
 use prost::Message;
@@ -300,6 +300,14 @@ pub struct SyncRequest {
 }
 
 #[derive(Deserialize)]
+pub struct AddRequest {
+    #[serde(default = "default_branch_value")]
+    pub branch: String,
+    #[serde(default = "default_added_repo_source")]
+    pub source: AddedRepoSource,
+}
+
+#[derive(Deserialize)]
 pub struct RefQuery {
     /// Clonepack variant to return: "full" (all reachable history) or
     /// "shallow" (depth=1). Defaults to "full" for backward compatibility.
@@ -313,6 +321,10 @@ pub struct RefQuery {
 
 fn default_clonepack_kind() -> String {
     "full".to_string()
+}
+
+fn default_added_repo_source() -> AddedRepoSource {
+    AddedRepoSource::Api
 }
 
 #[derive(Deserialize)]
@@ -465,6 +477,61 @@ fn resolve_repo_id<'a>(
     ))
 }
 
+fn repo_id_from_natural_key(registry: &ProviderRegistry, key: &str) -> Option<RepoId> {
+    let mut segments = key.split('/');
+    let first = segments.next()?;
+    let rest: Vec<&str> = segments.collect();
+    if rest.is_empty() {
+        return None;
+    }
+    if let Some(provider) = registry.get(first) {
+        return Some(RepoId {
+            provider: provider.id.clone(),
+            path: rest.join("/"),
+        });
+    }
+    let provider = registry.default_provider();
+    Some(RepoId {
+        provider: provider.id.clone(),
+        path: key.to_string(),
+    })
+}
+
+async fn seed_added_repos(
+    ref_store: &Arc<dyn RefStore>,
+    registry: &ProviderRegistry,
+    webhook_config: &WebhookConfig,
+) -> Result<()> {
+    let mut repo_ids = ref_store.list().await?;
+    repo_ids.extend(
+        webhook_config
+            .allowlist_repos()
+            .into_iter()
+            .filter_map(|key| repo_id_from_natural_key(registry, &key)),
+    );
+    repo_ids.sort_by_key(|repo| repo.storage_key());
+    repo_ids.dedup_by_key(|repo| repo.storage_key());
+
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    for repo_id in repo_ids {
+        if ref_store.load_added_repo(&repo_id).await?.is_some() {
+            continue;
+        }
+        ref_store
+            .add_repo(&AddedRepo {
+                repo_id,
+                added_at: now,
+                history_enabled: true,
+                source: AddedRepoSource::Migration,
+            })
+            .await?;
+    }
+    Ok(())
+}
+
 /// Extract an upstream credential token from request headers.
 ///
 /// `X-Upstream-Token` is the canonical header; `X-GitHub-Token` is accepted as a
@@ -477,6 +544,34 @@ fn unknown_provider_response() -> Response {
         }),
     )
         .into_response()
+}
+
+fn repo_not_added_response() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({
+            "error": "repo not added; run `ripclone add <repo>`",
+            "code": "repo_not_added",
+        })),
+    )
+        .into_response()
+}
+
+async fn repo_is_added(state: &ServerState, repo_id: &RepoId) -> Result<bool, Response> {
+    state
+        .ref_store
+        .load_added_repo(repo_id)
+        .await
+        .map(|repo| repo.is_some())
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("added repo lookup failed: {e}"),
+                }),
+            )
+                .into_response()
+        })
 }
 
 fn upstream_token_from_headers(headers: &HeaderMap) -> Option<secrecy::SecretString> {
@@ -628,6 +723,7 @@ pub struct SnapshotResponse {
 pub struct RepoStatusResponse {
     pub owner: String,
     pub repo: String,
+    pub added: bool,
     pub refs: Vec<BranchStatusEntry>,
     pub total_bytes: u64,
     pub total_unique_bytes: u64,
@@ -655,6 +751,9 @@ pub struct BranchStatusEntry {
     pub warm: bool,
     /// True when the warm-TTL sweep is forbidden from evicting this ref.
     pub pinned: bool,
+    pub depth1_ready: bool,
+    pub archive_ready: bool,
+    pub history: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -670,6 +769,7 @@ pub fn build_app(state: ServerState) -> Router {
         // multi-provider form ("gitlab/group/sub/proj/sync") from the path.
         .route("/v1/repos/{*path}", get(dispatch_repos_get))
         .route("/v1/repos/{*path}", post(dispatch_repos_post))
+        .route("/v1/repos/{*path}", delete(dispatch_repos_delete))
         // Refresh requires a still-valid session token (the auth layer verifies
         // the Bearer); it mints a fresh one before the current expires.
         .route("/v1/auth/refresh", post(auth_refresh_handler))
@@ -1596,6 +1696,31 @@ async fn dispatch_repos_post(
     OriginalUri(uri): OriginalUri,
     body: Body,
 ) -> impl IntoResponse {
+    if path.ends_with("/add") {
+        let repo_path = path.strip_suffix("/add").unwrap();
+        let Some((repo_id, provider)) = resolve_repo_id(&state.provider_registry, repo_path) else {
+            return unknown_provider_response();
+        };
+        if let Some(resp) =
+            validation::reject_if_invalid(|| validation::validate_repo_path(provider, &repo_id))
+        {
+            return resp;
+        }
+        let query = match Query::<AddRequest>::try_from_uri(&uri) {
+            Ok(q) => q.0,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: format!("invalid add request: {}", e),
+                    }),
+                )
+                    .into_response();
+            }
+        };
+        return add_repo_inner(repo_id, provider.clone(), query, headers, state).await;
+    }
+
     if path.ends_with("/sync") {
         let repo_path = path.strip_suffix("/sync").unwrap();
         let Some((repo_id, provider)) = resolve_repo_id(&state.provider_registry, repo_path) else {
@@ -1681,6 +1806,32 @@ async fn dispatch_repos_post(
             }
         };
         return batch_files_inner(repo_id, provider.clone(), body, headers, state).await;
+    }
+
+    (
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse {
+            error: "not found".to_string(),
+        }),
+    )
+        .into_response()
+}
+
+async fn dispatch_repos_delete(
+    Path(path): Path<String>,
+    State(state): State<ServerState>,
+) -> impl IntoResponse {
+    if path.ends_with("/add") {
+        let repo_path = path.strip_suffix("/add").unwrap();
+        let Some((repo_id, provider)) = resolve_repo_id(&state.provider_registry, repo_path) else {
+            return unknown_provider_response();
+        };
+        if let Some(resp) =
+            validation::reject_if_invalid(|| validation::validate_repo_path(provider, &repo_id))
+        {
+            return resp;
+        }
+        return remove_added_repo_inner(repo_id, state).await;
     }
 
     (
@@ -2046,6 +2197,11 @@ async fn get_ref_inner(
         && let Some(resp) = validation::reject_if_invalid(|| validation::validate_git_rev(rev))
     {
         return resp;
+    }
+    match repo_is_added(&state, &repo_id).await {
+        Ok(true) => {}
+        Ok(false) => return repo_not_added_response(),
+        Err(resp) => return resp,
     }
     state.metrics.record_ref_lookup();
     let key = format!("{}/{}", repo_id.storage_key(), branch);
@@ -2709,6 +2865,23 @@ async fn build_repo_status(
         };
 
         let warm = !is_evicted && ref_bytes > 0;
+        let depth1_ready = !is_evicted
+            && (!info.shallow_clonepack.manifest.is_empty() || !info.clonepack_manifest.is_empty());
+        let archive_ready = !is_evicted && !info.archive_chunks.is_empty();
+        let history = if is_evicted {
+            "cold"
+        } else if info
+            .build_status
+            .as_deref()
+            .is_some_and(|s| s.starts_with("failed: "))
+        {
+            "failed"
+        } else if !info.full_clonepack.manifest.is_empty() {
+            "ready"
+        } else {
+            "building"
+        }
+        .to_string();
 
         // Public forks of public projects are free; everything else pays its
         // own logical bytes for now.
@@ -2727,6 +2900,9 @@ async fn build_repo_status(
             last_accessed_at,
             warm,
             pinned: info.warm_pinned,
+            depth1_ready,
+            archive_ready,
+            history,
         });
     }
 
@@ -2753,6 +2929,7 @@ async fn build_repo_status(
     Ok(RepoStatusResponse {
         owner,
         repo,
+        added: state.ref_store.load_added_repo(repo_id).await?.is_some(),
         refs,
         total_bytes,
         total_unique_bytes,
@@ -2776,6 +2953,11 @@ async fn sync_repo_inner(
         && let Some(resp) = validation::reject_if_invalid(|| validation::validate_git_rev(rev))
     {
         return resp;
+    }
+    match repo_is_added(&state, &repo_id).await {
+        Ok(true) => {}
+        Ok(false) => return repo_not_added_response(),
+        Err(resp) => return resp,
     }
     let start = Instant::now();
     let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
@@ -3090,6 +3272,80 @@ async fn sync_repo_inner(
     }
 }
 
+async fn add_repo_inner(
+    repo_id: RepoId,
+    provider: ProviderInstance,
+    params: AddRequest,
+    headers: HeaderMap,
+    state: ServerState,
+) -> Response {
+    if let Some(resp) =
+        validation::reject_if_invalid(|| validation::validate_git_rev(&params.branch))
+    {
+        return resp;
+    }
+
+    let request_token = upstream_token_from_headers(&headers);
+    let credential = match state
+        .broker
+        .fetch_credential(&repo_id, request_token.as_ref())
+    {
+        Ok(c) => c,
+        Err(e) => return credential_error_response(e),
+    };
+    if let Err(resp) =
+        authorize_repo_read(&state, &provider, &repo_id, credential.as_ref(), &headers).await
+    {
+        return resp;
+    }
+
+    let added = AddedRepo {
+        repo_id: repo_id.clone(),
+        added_at: SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+        history_enabled: true,
+        source: params.source,
+    };
+    if let Err(e) = state.ref_store.add_repo(&added).await {
+        state.metrics.record_error();
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("add failed: {e}"),
+            }),
+        )
+            .into_response();
+    }
+
+    sync_repo_inner(
+        repo_id,
+        provider,
+        SyncRequest {
+            branch: params.branch,
+            rev: None,
+        },
+        headers,
+        state,
+    )
+    .await
+}
+
+async fn remove_added_repo_inner(repo_id: RepoId, state: ServerState) -> Response {
+    if let Err(e) = state.ref_store.remove_added_repo(&repo_id).await {
+        state.metrics.record_error();
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("remove added repo failed: {e}"),
+            }),
+        )
+            .into_response();
+    }
+    (StatusCode::NO_CONTENT, Body::empty()).into_response()
+}
+
 /// Coalescing key for the in-process queue: concurrent builds for the same
 /// `repo/branch#rev` collapse onto one. `/sync` and the `/build` webhook MUST
 /// produce the identical key for the same target, or they double-build.
@@ -3107,6 +3363,11 @@ fn inproc_build_key(repo_id: &RepoId, branch: &str, rev: Option<&str>) -> String
 /// build is queued or folded into one already running; `Err(msg)` if the queue is
 /// full or unavailable.
 async fn trigger_build(state: &ServerState, repo_id: &RepoId, branch: &str) -> Result<(), String> {
+    match state.ref_store.load_added_repo(repo_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return Ok(()),
+        Err(e) => return Err(format!("added repo lookup failed: {e}")),
+    }
     let credential = state
         .broker
         .fetch_credential(repo_id, None)
@@ -3490,6 +3751,11 @@ async fn webhook_dispatch_push(
     // Allowlist gate (allow-all when unconfigured).
     if !webhook_repo_allowed(state, &repo_id) {
         return webhook_ignored("repo not in webhook allowlist");
+    }
+    match repo_is_added(state, &repo_id).await {
+        Ok(true) => {}
+        Ok(false) => return webhook_ignored("repo not added"),
+        Err(resp) => return resp,
     }
     // Phase 1 warms branches only; tags and other refs are ignored.
     let Some(branch) = event
@@ -6781,6 +7047,9 @@ pub async fn run_server_with_barrier(
     // before the registry is moved into the state). A push to a configured
     // webhook triggers a build before any clone — no per-repo Actions workflow.
     let webhook_config = Arc::new(WebhookConfig::from_env(&provider_registry));
+    seed_added_repos(&b.ref_store, &provider_registry, &webhook_config)
+        .await
+        .context("seed added repos")?;
 
     // Select the queue backend. The local queue drives an in-process worker; the
     // SQL queues' builds run in separate ripclone-worker processes, so the server
@@ -6994,6 +7263,49 @@ mod tests {
 
     fn auth_header() -> String {
         format!("Ripclone {}", hex::encode(Sha256::digest("secret")))
+    }
+
+    #[tokio::test]
+    async fn seed_added_repos_migrates_refs_and_webhook_allowlist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(&tmp);
+        let built_repo = RepoId::github("acme/built");
+        state
+            .ref_store
+            .save(
+                &built_repo,
+                &RefInfo {
+                    commit: "c1".to_string(),
+                    default_branch: "main".to_string(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let registry = ProviderRegistry::new();
+        let webhook_config = WebhookConfig::with_secret("github", "secret")
+            .with_allowlist(vec!["acme/allowed".to_string()]);
+
+        seed_added_repos(&state.ref_store, &registry, &webhook_config)
+            .await
+            .unwrap();
+
+        assert!(
+            state
+                .ref_store
+                .load_added_repo(&built_repo)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            state
+                .ref_store
+                .load_added_repo(&RepoId::github("acme/allowed"))
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -7509,6 +7821,7 @@ mod tests {
         let mut state = test_state(&tmp);
         state.require_repo_auth = true;
         state.access_verifier = Arc::new(StubVerifier(AccessDecision::Denied));
+        mark_added(&state, RepoId::github("o/r")).await;
         let app = build_app(state);
 
         let resp = app
@@ -7862,6 +8175,22 @@ mod tests {
         (state, rx)
     }
 
+    async fn mark_added(state: &ServerState, repo_id: RepoId) {
+        state
+            .ref_store
+            .add_repo(&AddedRepo {
+                repo_id,
+                added_at: SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                history_enabled: true,
+                source: AddedRepoSource::Api,
+            })
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn webhook_without_secret_returns_503() {
         let tmp = tempfile::tempdir().unwrap();
@@ -7887,6 +8216,7 @@ mod tests {
     async fn webhook_push_enqueues_build() {
         let tmp = tempfile::tempdir().unwrap();
         let (state, mut rx) = webhook_state(&tmp);
+        mark_added(&state, RepoId::github("acme/widget")).await;
         let app = build_app(state);
         let body = gh_push_body(
             "acme",
@@ -7912,6 +8242,7 @@ mod tests {
     async fn webhook_v1_github_alias_still_works() {
         let tmp = tempfile::tempdir().unwrap();
         let (state, mut rx) = webhook_state(&tmp);
+        mark_added(&state, RepoId::github("acme/widget")).await;
         let app = build_app(state);
         // The legacy /v1/webhooks/github alias routes into the same receiver.
         let body = gh_push_body(
@@ -8056,6 +8387,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (state, mut rx) = webhook_state(&tmp);
         let repo = RepoId::github("acme/widget");
+        mark_added(&state, repo.clone()).await;
         let info = RefInfo {
             commit: "deadbeef".to_string(),
             default_branch: "main".to_string(),
@@ -8094,6 +8426,7 @@ mod tests {
         state.build_queue_depth = depth;
         state.webhook_config =
             Arc::new(WebhookConfig::with_secret("github", WEBHOOK_SECRET).with_warm_all(true));
+        mark_added(&state, RepoId::github("acme/widget")).await;
         let app = build_app(state);
         // An untracked, non-default branch is warmed when warm-all is on.
         let body = gh_push_body(
@@ -8156,6 +8489,7 @@ mod tests {
             WebhookConfig::with_secret("github", WEBHOOK_SECRET)
                 .with_allowlist(["acme/widget".to_string()]),
         );
+        mark_added(&state, RepoId::github("acme/widget")).await;
         let app = build_app(state);
         let body = gh_push_body(
             "acme",
@@ -8192,6 +8526,7 @@ mod tests {
                 WebhookConfig::with_secret("github", WEBHOOK_SECRET)
                     .with_allowlist([entry.to_string()]),
             );
+            mark_added(&state, RepoId::github("acme/widget")).await;
             let app = build_app(state);
             let body = gh_push_body(
                 "acme",
@@ -8408,6 +8743,14 @@ mod tests {
     async fn webhook_gitlab_push_enqueues() {
         let tmp = tempfile::tempdir().unwrap();
         let (state, mut rx) = provider_webhook_state(&tmp, "gitlab", "gitlab", "gitlab.com");
+        mark_added(
+            &state,
+            RepoId {
+                provider: crate::provider::ProviderInstanceId::new("gitlab"),
+                path: "group/sub/proj".to_string(),
+            },
+        )
+        .await;
         let app = build_app(state);
         let body = br#"{"object_kind":"push","ref":"refs/heads/main","after":"1111111111111111111111111111111111111111","project":{"path_with_namespace":"group/sub/proj","default_branch":"main","visibility_level":0}}"#.to_vec();
         // GitLab authenticates with the shared token in X-Gitlab-Token.
@@ -8449,6 +8792,14 @@ mod tests {
     async fn webhook_gitea_push_enqueues() {
         let tmp = tempfile::tempdir().unwrap();
         let (state, mut rx) = provider_webhook_state(&tmp, "gitea", "gitea", "gitea.example.com");
+        mark_added(
+            &state,
+            RepoId {
+                provider: crate::provider::ProviderInstanceId::new("gitea"),
+                path: "acme/widget".to_string(),
+            },
+        )
+        .await;
         let app = build_app(state);
         let body = br#"{"ref":"refs/heads/main","after":"1111111111111111111111111111111111111111","repository":{"full_name":"acme/widget","default_branch":"main","private":true}}"#.to_vec();
         // Gitea signs the raw body with HMAC-SHA256, bare hex in X-Gitea-Signature.
@@ -8607,6 +8958,14 @@ mod tests {
             WebhookConfig::with_secret("gitlab", WEBHOOK_SECRET)
                 .with_allowlist(["gitlab/group/sub/proj".to_string()]),
         );
+        mark_added(
+            &state,
+            RepoId {
+                provider: crate::provider::ProviderInstanceId::new("gitlab"),
+                path: "group/sub/proj".to_string(),
+            },
+        )
+        .await;
         let app = build_app(state);
         let body = br#"{"ref":"refs/heads/main","after":"1111111111111111111111111111111111111111","project":{"path_with_namespace":"group/sub/proj","default_branch":"main"}}"#.to_vec();
         let req = axum::http::Request::builder()
@@ -8632,6 +8991,7 @@ mod tests {
     async fn webhook_default_branch_resolved_from_mirror_when_payload_omits_it() {
         let tmp = tempfile::tempdir().unwrap();
         let (state, mut rx) = webhook_state(&tmp);
+        mark_added(&state, RepoId::github("acme/widget")).await;
         let mirror = state
             .repo_root
             .join(RepoId::github("acme/widget").mirror_dir_name());
@@ -9553,6 +9913,7 @@ mod tests {
         let state = test_state(&tmp);
         let ref_store = state.ref_store.clone();
         let rid = RepoId::github("acme/widget");
+        mark_added(&state, rid.clone()).await;
 
         let old_ts = 1_000_000u64;
         let info = RefInfo {
@@ -9604,6 +9965,7 @@ mod tests {
         let state = test_state(&tmp);
         let ref_store = state.ref_store.clone();
         let rid = RepoId::github("acme/widget");
+        mark_added(&state, rid.clone()).await;
 
         let old_ts = 1_000_000u64;
         let info = RefInfo {
@@ -9671,6 +10033,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (state, mut rx) = test_state_with_queue(&tmp);
         let rid = RepoId::github("acme/widget");
+        mark_added(&state, rid.clone()).await;
 
         let evicted = RefInfo {
             commit: tip.clone(),

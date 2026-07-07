@@ -60,6 +60,17 @@ impl MetaDb for LibsqlMeta {
             .await?
             .execute("ALTER TABLE refs ADD COLUMN generation BIGINT", ())
             .await;
+        self.conn()
+            .await?
+            .execute(
+                "CREATE TABLE IF NOT EXISTS added_repos (
+                    repo_key TEXT PRIMARY KEY NOT NULL,
+                    data TEXT NOT NULL
+                )",
+                (),
+            )
+            .await
+            .context("create added_repos table")?;
         Ok(())
     }
 
@@ -181,6 +192,59 @@ impl MetaDb for LibsqlMeta {
             )
             .await
             .context("list branches")?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(row.get::<String>(0)?);
+        }
+        Ok(out)
+    }
+
+    async fn add_repo(&self, repo_key: &str, data: &str) -> Result<()> {
+        self.conn()
+            .await?
+            .execute(
+                "INSERT INTO added_repos (repo_key, data) VALUES (?, ?)
+                 ON CONFLICT (repo_key) DO UPDATE SET data = excluded.data",
+                libsql::params![repo_key, data],
+            )
+            .await
+            .context("add repo")?;
+        Ok(())
+    }
+
+    async fn get_added_repo(&self, repo_key: &str) -> Result<Option<String>> {
+        let conn = self.conn().await?;
+        let mut rows = conn
+            .query(
+                "SELECT data FROM added_repos WHERE repo_key = ?",
+                libsql::params![repo_key],
+            )
+            .await
+            .context("get added repo")?;
+        match rows.next().await? {
+            Some(row) => Ok(Some(row.get::<String>(0)?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn remove_added_repo(&self, repo_key: &str) -> Result<()> {
+        self.conn()
+            .await?
+            .execute(
+                "DELETE FROM added_repos WHERE repo_key = ?",
+                libsql::params![repo_key],
+            )
+            .await
+            .context("remove added repo")?;
+        Ok(())
+    }
+
+    async fn list_added_repos(&self) -> Result<Vec<String>> {
+        let conn = self.conn().await?;
+        let mut rows = conn
+            .query("SELECT data FROM added_repos ORDER BY repo_key", ())
+            .await
+            .context("list added repos")?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().await? {
             out.push(row.get::<String>(0)?);

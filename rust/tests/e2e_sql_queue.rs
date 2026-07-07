@@ -73,6 +73,9 @@ async fn sql_queue_farm_out_sync_then_clone() {
 
     // `/sync` enqueues into SQLite; the separate worker builds; `/sync` polls the
     // job status and returns the ref once it is done.
+    register_added_without_build(&server, "acme/sq")
+        .await
+        .expect("add repo");
     let resp1 = server
         .client()
         .sync_repo("acme/sq", None)

@@ -100,6 +100,7 @@ async fn server_error(context: &str, resp: reqwest::Response) -> anyhow::Error {
         (403, _, true) => "\n  → the org may need a plan, or you lack GitHub access",
         (403, _, false) => "\n  → access denied by the configured server",
         (429, _, _) => "\n  → rate limited; wait a moment and retry",
+        (404, Some("repo_not_added"), _) => "\n  → run `ripclone add <repo>`",
         (502 | 503, _, _) => "\n  → ripclone is briefly unavailable; retry shortly",
         _ => "",
     };
@@ -998,6 +999,33 @@ impl Client {
 
     pub async fn sync_repo(&self, repo_path: &str, depth: Option<usize>) -> Result<RefResponse> {
         self.sync_repo_at(repo_path, None, depth).await
+    }
+
+    pub async fn add_repo(&self, repo_path: &str) -> Result<RefResponse> {
+        let mut url = self.repo_url(repo_path, "/add");
+        url.push_str("?source=cli");
+        let max_attempts = std::env::var("RIPCLONE_SYNC_MAX_ATTEMPTS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(40usize);
+        for attempt in 0..max_attempts {
+            let resp = self.request(reqwest::Method::POST, &url).send().await?;
+            let status = resp.status();
+            if status == reqwest::StatusCode::OK {
+                return Ok(resp.json().await?);
+            }
+            if status == reqwest::StatusCode::ACCEPTED
+                || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+            {
+                if attempt + 1 < max_attempts {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    continue;
+                }
+                anyhow::bail!("add still building after {max_attempts} attempts");
+            }
+            return Err(server_error("add failed", resp).await);
+        }
+        anyhow::bail!("add did not complete")
     }
 
     /// Like [`sync_repo`] but builds at `rev` (e.g. "HEAD~5" or a SHA) instead of

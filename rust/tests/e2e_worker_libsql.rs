@@ -105,6 +105,11 @@ async fn worker_farm_out_libsql_against_real_sqld() {
     origin.commit(&[("a.txt", "via-libsql\n")], "c1");
     origin.publish();
 
+    server
+        .client()
+        .add_repo("acme/lq")
+        .await
+        .expect("add libsql farm-out repo");
     let resp = server
         .client()
         .sync_repo("acme/lq", None)
@@ -121,10 +126,10 @@ async fn worker_farm_out_libsql_against_real_sqld() {
     );
     assert!(git_ok(&c, &["fsck", "--connectivity-only", "HEAD"]));
 
-    // Negative: a missing upstream → the worker's build fails → /sync errors.
-    let result = server.client().sync_repo("acme/missing-libsql", None).await;
+    // Negative: a missing upstream → the worker's build fails → /add errors.
+    let result = server.client().add_repo("acme/missing-libsql").await;
     assert!(
         result.is_err(),
-        "sync of a missing upstream over libsql must fail, got {result:?}"
+        "add of a missing upstream over libsql must fail, got {result:?}"
     );
 }

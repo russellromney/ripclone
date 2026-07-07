@@ -11,7 +11,7 @@
 
 use crate::RefInfo;
 use crate::provider::{RepoId, parse_storage_key};
-use crate::ref_store::RefStore;
+use crate::ref_store::{AddedRepo, RefStore};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use std::time::SystemTime;
@@ -92,6 +92,18 @@ pub trait MetaDb: Send + Sync {
 
     /// Branches with a stored ref for this repo.
     async fn list_branches(&self, repo_key: &str) -> Result<Vec<String>>;
+
+    /// Insert or update added-repo state, keyed by the unified storage key.
+    async fn add_repo(&self, repo_key: &str, data: &str) -> Result<()>;
+
+    /// Fetch added-repo state for one repo.
+    async fn get_added_repo(&self, repo_key: &str) -> Result<Option<String>>;
+
+    /// Remove added-repo state for one repo.
+    async fn remove_added_repo(&self, repo_key: &str) -> Result<()>;
+
+    /// List every added-repo record.
+    async fn list_added_repos(&self) -> Result<Vec<String>>;
 
     /// Cheap reachability probe for `/readyz`.
     async fn health(&self) -> Result<()>;
@@ -269,6 +281,33 @@ impl RefStore for SqlRefStore {
         self.db.list_branches(&repo_id.storage_key()).await
     }
 
+    async fn add_repo(&self, repo: &AddedRepo) -> Result<()> {
+        let data = serde_json::to_string(repo).context("serialize added repo")?;
+        self.db.add_repo(&repo.repo_id.storage_key(), &data).await
+    }
+
+    async fn load_added_repo(&self, repo_id: &RepoId) -> Result<Option<AddedRepo>> {
+        match self.db.get_added_repo(&repo_id.storage_key()).await? {
+            Some(data) => Ok(Some(
+                serde_json::from_str(&data).context("parse stored added repo")?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    async fn remove_added_repo(&self, repo_id: &RepoId) -> Result<()> {
+        self.db.remove_added_repo(&repo_id.storage_key()).await
+    }
+
+    async fn list_added_repos(&self) -> Result<Vec<AddedRepo>> {
+        self.db
+            .list_added_repos()
+            .await?
+            .into_iter()
+            .map(|data| serde_json::from_str(&data).context("parse stored added repo"))
+            .collect()
+    }
+
     async fn health(&self) -> Result<()> {
         self.db.health().await
     }
@@ -327,6 +366,21 @@ mod tests {
         let mut branches = store.list_branches(&rid).await.unwrap();
         branches.sort();
         assert_eq!(branches, vec!["HEAD", "dev"]);
+
+        let added = AddedRepo {
+            repo_id: rid.clone(),
+            added_at: 123,
+            history_enabled: true,
+            source: crate::ref_store::AddedRepoSource::Api,
+        };
+        store.add_repo(&added).await.unwrap();
+        assert_eq!(
+            store.load_added_repo(&rid).await.unwrap(),
+            Some(added.clone())
+        );
+        assert_eq!(store.list_added_repos().await.unwrap(), vec![added]);
+        store.remove_added_repo(&rid).await.unwrap();
+        assert!(store.load_added_repo(&rid).await.unwrap().is_none());
 
         // Ordering guard: an older sync for a *different* commit is skipped.
         store.save(&rid, &ref_at("c0", Some(50))).await.unwrap();

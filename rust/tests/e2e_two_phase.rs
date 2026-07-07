@@ -41,6 +41,9 @@ async fn two_phase_depth1_immediate_then_full() {
     origin.publish();
 
     // Sync returns after phase 1 (depth=1 published; full builds in background).
+    register_added_without_build(&server, "acme/tp")
+        .await
+        .expect("add repo");
     server
         .client()
         .sync_repo("acme/tp", None)
@@ -91,6 +94,9 @@ async fn two_phase_files_mode_after_phase2() {
     origin.commit(&[("a.txt", "hello\n"), ("nested/b.txt", "world\n")], "c1");
     origin.commit(&[("a.txt", "hello2\n")], "c2");
     origin.publish();
+    register_added_without_build(&server, "acme/tpf")
+        .await
+        .expect("add repo");
     server
         .client()
         .sync_repo("acme/tpf", None)
@@ -127,6 +133,9 @@ async fn two_phase_resync_full_upgrades() {
     let origin = make_origin("acme", "tp2");
     origin.commit(&[("a", "1\n")], "c1");
     origin.publish();
+    register_added_without_build(&server, "acme/tp2")
+        .await
+        .expect("add repo");
     server.client().sync_repo("acme/tp2", None).await.unwrap();
 
     // Wait for the first full to land.
@@ -184,6 +193,9 @@ async fn delayed_older_editable_publish_does_not_clear_newer_archive() {
         std::env::set_var("RIPCLONE_TEST_EDITABLE_PUBLISH_DELAY_MS", "3000");
     }
 
+    register_added_without_build(&server, "acme/phase2guard")
+        .await
+        .expect("add repo");
     server
         .client()
         .sync_repo("acme/phase2guard", None)
@@ -231,6 +243,9 @@ async fn failed_phase2_status_recovers_on_resync() {
         std::env::set_var("RIPCLONE_TEST_PHASE2_FAIL_COMMIT", &commit);
     }
 
+    register_added_without_build(&server, "acme/phase2fail")
+        .await
+        .expect("add repo");
     server
         .client()
         .sync_repo("acme/phase2fail", None)

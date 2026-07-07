@@ -83,6 +83,21 @@ async fn global_config_defaults_and_cli_overrides() {
 
     let bin = ripclone_bin();
 
+    let add_out = run_ripclone(
+        &bin,
+        home.path(),
+        cwd.path(),
+        &server.url,
+        &["add", "acme/config"],
+    )
+    .await;
+    assert!(
+        add_out.status.success(),
+        "add failed: stdout={}\nstderr={}",
+        String::from_utf8_lossy(&add_out.stdout),
+        String::from_utf8_lossy(&add_out.stderr)
+    );
+
     // Sync first so artifacts exist for the clone.
     let sync_out = run_ripclone(
         &bin,

@@ -49,6 +49,15 @@ impl MetaDb for PostgresMeta {
             .execute(&self.pool)
             .await
             .context("add generation column")?;
+        sqlx::raw_sql(
+            "CREATE TABLE IF NOT EXISTS added_repos (
+                repo_key TEXT PRIMARY KEY NOT NULL,
+                data TEXT NOT NULL
+            )",
+        )
+        .execute(&self.pool)
+        .await
+        .context("create added_repos table")?;
         Ok(())
     }
 
@@ -170,6 +179,43 @@ impl MetaDb for PostgresMeta {
             .await
             .context("list branches")?;
         rows.iter().map(|r| Ok(r.try_get(0)?)).collect()
+    }
+
+    async fn add_repo(&self, repo_key: &str, data: &str) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO added_repos (repo_key, data) VALUES ($1, $2)
+             ON CONFLICT (repo_key) DO UPDATE SET data = excluded.data",
+        )
+        .bind(repo_key)
+        .bind(data)
+        .execute(&self.pool)
+        .await
+        .context("add repo")?;
+        Ok(())
+    }
+
+    async fn get_added_repo(&self, repo_key: &str) -> Result<Option<String>> {
+        sqlx::query_scalar("SELECT data FROM added_repos WHERE repo_key = $1")
+            .bind(repo_key)
+            .fetch_optional(&self.pool)
+            .await
+            .context("get added repo")
+    }
+
+    async fn remove_added_repo(&self, repo_key: &str) -> Result<()> {
+        sqlx::query("DELETE FROM added_repos WHERE repo_key = $1")
+            .bind(repo_key)
+            .execute(&self.pool)
+            .await
+            .context("remove added repo")?;
+        Ok(())
+    }
+
+    async fn list_added_repos(&self) -> Result<Vec<String>> {
+        sqlx::query_scalar("SELECT data FROM added_repos ORDER BY repo_key")
+            .fetch_all(&self.pool)
+            .await
+            .context("list added repos")
     }
 
     async fn health(&self) -> Result<()> {

@@ -30,6 +30,9 @@ async fn worker_binary_farm_out_sqlite() {
     origin.commit(&[("a.txt", "hello\n")], "c1");
     origin.publish();
 
+    register_added_without_build(&server, "acme/wp")
+        .await
+        .expect("add repo");
     let resp = server
         .client()
         .sync_repo("acme/wp", None)

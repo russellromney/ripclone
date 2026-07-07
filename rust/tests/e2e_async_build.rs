@@ -23,6 +23,7 @@ async fn async_sync_then_clone() {
     origin.commit(&[("a.txt", "2\n"), ("b.txt", "x\n")], "c2");
     origin.publish();
 
+    server.client().add_repo("acme/aq").await.expect("add aq");
     // Sync goes through the background worker; the client waits for completion.
     server
         .client()
@@ -54,6 +55,7 @@ async fn async_concurrent_syncs_coalesce() {
     origin.commit(&[("f", "2\n")], "c2");
     origin.publish();
 
+    server.client().add_repo("acme/aqc").await.expect("add aqc");
     // Fire several concurrent syncs for the same repo.
     let mut handles = Vec::new();
     for _ in 0..6 {

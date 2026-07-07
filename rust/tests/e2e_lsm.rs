@@ -128,6 +128,9 @@ async fn lsm_resync_same_head_reuses_level() {
     origin.publish();
 
     let client = server.client();
+    register_added_without_build(&server, "acme/lsm-noop")
+        .await
+        .unwrap();
     client.sync_repo("acme/lsm-noop", None).await.unwrap(); // seal
     client.sync_repo("acme/lsm-noop", None).await.unwrap(); // empty tail, reuse
 

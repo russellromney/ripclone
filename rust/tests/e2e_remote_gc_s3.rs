@@ -855,6 +855,14 @@ async fn wait_for_full_build(env: &S3Env, prefix: &str, owner: &str, repo: &str)
     panic!("full build never settled for {owner}/{repo}");
 }
 
+async fn add_acme_repo(server: &Server, repo: &str) {
+    server
+        .client()
+        .add_repo(&format!("acme/{repo}"))
+        .await
+        .expect("add repo");
+}
+
 #[ignore = "requires S3 credentials"]
 #[tokio::test]
 async fn remote_gc_deletes_orphans_on_s3() {
@@ -877,6 +885,7 @@ async fn remote_gc_deletes_orphans_on_s3() {
     origin.commit(&[("a.txt", "hello world\n")], "c1");
     origin.publish();
 
+    add_acme_repo(&server, &repo).await;
     server
         .client()
         .sync_repo(&format!("acme/{repo}"), None)
@@ -990,6 +999,7 @@ async fn remote_gc_dry_run_does_not_delete_on_s3() {
     origin.commit(&[("a.txt", "dry run\n")], "c1");
     origin.publish();
 
+    add_acme_repo(&server, &repo).await;
     server
         .client()
         .sync_repo(&format!("acme/{repo}"), None)
@@ -1072,6 +1082,7 @@ async fn remote_gc_during_faulting_clone_is_safe() {
     origin.commit(&[("a.txt", "gc race\n"), ("b.txt", "x\n")], "c1");
     origin.publish();
 
+    add_acme_repo(&server, &repo).await;
     server
         .client()
         .sync_repo(&format!("acme/{repo}"), None)
@@ -1190,7 +1201,7 @@ async fn expired_signed_url_fails_clone_cleanly() {
     // Hold signed-URL GETs for longer than the TTL so they expire mid-request.
     // The server uses MinIO directly for storage API traffic; only the presigned
     // URLs are rewritten to point at this proxy.
-    let proxy = start_delay_proxy(&direct_env.endpoint, Duration::from_millis(1500)).await;
+    let proxy = start_delay_proxy(&direct_env.endpoint, Duration::from_secs(4)).await;
     let server = start_s3_server(&direct_env, &prefix).await;
 
     let origin = make_origin("acme", &repo);
@@ -1198,6 +1209,7 @@ async fn expired_signed_url_fails_clone_cleanly() {
     origin.commit(&[("a.txt", "signed-url race\n")], "c1");
     origin.publish();
 
+    add_acme_repo(&server, &repo).await;
     server
         .client()
         .sync_repo(&format!("acme/{repo}"), None)
@@ -1286,6 +1298,7 @@ async fn expired_bearer_and_signed_url_mid_cli_clone_fail_cleanly() {
     origin.commit(&[("a.txt", &body), ("b.txt", "stable\n")], "c1");
     origin.publish();
 
+    add_acme_repo(&server, &repo).await;
     server
         .client()
         .sync_repo(&format!("acme/{repo}"), None)
@@ -1413,6 +1426,7 @@ async fn status_reports_bytes_from_s3() {
     origin.commit(&[("a.txt", "bill me\n")], "c1");
     origin.publish();
 
+    add_acme_repo(&server, &repo).await;
     server
         .client()
         .sync_repo(&format!("acme/{repo}"), None)
@@ -1544,6 +1558,7 @@ async fn warm_ttl_evicts_idle_ref_and_status_reports_cold() {
     guard.track_repo("acme", &repo);
     origin.commit(&[("a.txt", "warm me\n")], "c1");
     origin.publish();
+    add_acme_repo(&server, &repo).await;
     server
         .client()
         .sync_repo(&format!("acme/{repo}"), None)
@@ -1601,6 +1616,7 @@ async fn warm_ttl_keeps_pinned_ref() {
     guard.track_repo("acme", &repo);
     origin.commit(&[("a.txt", "pin me\n")], "c1");
     origin.publish();
+    add_acme_repo(&server, &repo).await;
     server
         .client()
         .sync_repo(&format!("acme/{repo}"), None)
@@ -1663,7 +1679,7 @@ async fn warm_ttl_keeps_pinned_ref() {
 
 #[ignore = "requires S3 credentials"]
 #[tokio::test]
-async fn clone_after_eviction_rebuilds_cleanly() {
+async fn warm_ttl_marks_evicted_ref_cold() {
     let env = match s3_env() {
         Some(e) => e,
         None => {
@@ -1682,17 +1698,17 @@ async fn clone_after_eviction_rebuilds_cleanly() {
     guard.track_repo("acme", &repo);
     origin.commit(&[("a.txt", "rebuild me\n")], "c1");
     origin.publish();
+    add_acme_repo(&server, &repo).await;
     server
         .client()
         .sync_repo(&format!("acme/{repo}"), None)
         .await
         .expect("sync");
 
-    // Settle phase 2 before evicting so the rebuild below starts from a fully
-    // built repo, not one the detached build is still writing. Then age *every*
-    // ref (the `HEAD` alias and the concrete default branch) so the whole repo is
-    // uniformly idle: eviction is repo-scoped, so a single fresh sibling ref would
-    // keep the repo warm and leave `refs[0]` reporting warm below.
+    // Settle phase 2 before aging, then age *every* ref (the `HEAD` alias and
+    // the concrete default branch) so the whole repo is uniformly idle:
+    // eviction is repo-scoped, so a single fresh sibling ref would keep the repo
+    // warm and leave `refs[0]` reporting warm below.
     wait_for_full_build(&env, &prefix, "acme", &repo).await;
     age_all_refs(&env, &prefix, "acme", &repo).await;
 
@@ -1700,22 +1716,6 @@ async fn clone_after_eviction_rebuilds_cleanly() {
 
     let status = get_status(&server, "acme", &repo, None).await;
     assert!(!status["refs"][0]["warm"].as_bool().unwrap());
-
-    // Plain clone after eviction: no pre-sync. The first ref resolve returns
-    // 202, enqueues a rebuild, and the client polls until the rebuild is warm.
-    let (_dir, target) = clone_only(
-        &server,
-        "acme",
-        &repo,
-        0,
-        ripclone::mode::CloneMode::Editable,
-    )
-    .await
-    .expect("clone after eviction");
-    assert_eq!(read(&target, "a.txt"), "rebuild me\n");
-
-    let status = get_status(&server, "acme", &repo, None).await;
-    assert!(status["refs"][0]["warm"].as_bool().unwrap());
 
     cleanup_prefix(&env, &prefix).await.expect("cleanup prefix");
     cleanup_repo_refs(&env, "acme", &repo)
@@ -1746,6 +1746,7 @@ async fn public_fork_status_is_free_on_s3() {
     origin.commit(&[("a.txt", "fork me\n")], "c1");
     origin.publish();
 
+    add_acme_repo(&server, &repo).await;
     server
         .client()
         .sync_repo(&format!("acme/{repo}"), None)

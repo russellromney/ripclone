@@ -110,7 +110,11 @@ start_server() {
   cat "$BASE_DIR/server.log"; fail "server not ready"
 }
 
-sync_repo() { "$CLI_BIN" --server "$SERVER_URL" sync "$1/$2" >/dev/null; }
+add_repo() { "$CLI_BIN" --server "$SERVER_URL" add "$1/$2" >/dev/null; }
+sync_repo() {
+  add_repo "$1" "$2"
+  "$CLI_BIN" --server "$SERVER_URL" sync "$1/$2" >/dev/null
+}
 # Builds are two-phase: depth=1 is ready as soon as `sync` returns, but the full
 # and files variants finish in the background, and on a re-sync the full variant
 # briefly serves the previous commit. So retry the clone until it succeeds.

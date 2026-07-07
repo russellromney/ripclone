@@ -11,6 +11,23 @@ use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AddedRepo {
+    pub repo_id: RepoId,
+    pub added_at: u64,
+    pub history_enabled: bool,
+    pub source: AddedRepoSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AddedRepoSource {
+    Cli,
+    Cloud,
+    Api,
+    Migration,
+}
+
 /// Encode a branch name so it is safe to use in a filesystem path or S3 key.
 fn branch_slug(branch: &str) -> String {
     base64::Engine::encode(
@@ -141,6 +158,21 @@ pub trait RefStore: Send + Sync {
     /// List all branches that have a stored `RefInfo` for this repo.
     async fn list_branches(&self, repo_id: &RepoId) -> Result<Vec<String>>;
 
+    /// Persist that this repo is explicitly available to clone. This state is
+    /// separate from refs/artifacts: an added repo may be cold or still building.
+    async fn add_repo(&self, repo: &AddedRepo) -> Result<()>;
+
+    /// Load added-repo state, if this repo was explicitly made available.
+    async fn load_added_repo(&self, repo_id: &RepoId) -> Result<Option<AddedRepo>>;
+
+    /// Remove added-repo state. Idempotent.
+    async fn remove_added_repo(&self, _repo_id: &RepoId) -> Result<()> {
+        Ok(())
+    }
+
+    /// List every repo explicitly made available.
+    async fn list_added_repos(&self) -> Result<Vec<AddedRepo>>;
+
     /// Drop any cached entry for this branch so the next load reads through to
     /// the backing store. Needed after a build completes in *another* process
     /// (the SQL queue / standalone worker path): this process's cache would
@@ -160,6 +192,7 @@ pub trait RefStore: Send + Sync {
 /// Local filesystem-backed ref store. One JSON file per repo.
 pub struct FileRefStore {
     root: PathBuf,
+    added_root: PathBuf,
     /// Serializes the read-compare-then-rename below so concurrent in-process
     /// writers can't both read the old ref and then race their renames (which
     /// would let an older sync clobber a newer one, and made two writers fight
@@ -172,11 +205,14 @@ pub struct FileRefStore {
 impl FileRefStore {
     pub fn new(repo_root: &Path) -> Self {
         let root = repo_root.join(".ripclone-refs");
+        let added_root = repo_root.join(".ripclone-added");
         // Best-effort creation of the root directory up front so `list()` works
         // on a fresh deployment.
         let _ = std::fs::create_dir_all(&root);
+        let _ = std::fs::create_dir_all(&added_root);
         Self {
             root,
+            added_root,
             write_lock: tokio::sync::Mutex::new(()),
         }
     }
@@ -302,6 +338,14 @@ impl FileRefStore {
     fn branch_path(&self, repo_id: &RepoId, branch: &str) -> PathBuf {
         self.branch_dir(repo_id)
             .join(format!("{}.json", branch_slug(branch)))
+    }
+
+    fn added_path(&self, repo_id: &RepoId) -> PathBuf {
+        let key = repo_id.storage_key();
+        let (provider, repo) = key
+            .split_once('/')
+            .expect("RepoId storage_key always contains a slash");
+        self.added_root.join(provider).join(format!("{repo}.json"))
     }
 }
 
@@ -453,6 +497,78 @@ impl RefStore for FileRefStore {
         Ok(out)
     }
 
+    async fn add_repo(&self, repo: &AddedRepo) -> Result<()> {
+        let path = self.added_path(&repo.repo_id);
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .with_context(|| format!("create added repo dir {}", parent.display()))?;
+        }
+        let data = serde_json::to_vec_pretty(repo).context("serialize added repo")?;
+        let tmp_path = path.with_extension("json.tmp");
+        tokio::fs::write(&tmp_path, data)
+            .await
+            .with_context(|| format!("write temp added repo {}", tmp_path.display()))?;
+        tokio::fs::rename(&tmp_path, &path)
+            .await
+            .with_context(|| format!("rename {} to {}", tmp_path.display(), path.display()))?;
+        Ok(())
+    }
+
+    async fn load_added_repo(&self, repo_id: &RepoId) -> Result<Option<AddedRepo>> {
+        let path = self.added_path(repo_id);
+        match tokio::fs::read(&path).await {
+            Ok(data) => {
+                let repo = serde_json::from_slice(&data)
+                    .with_context(|| format!("parse added repo {}", path.display()))?;
+                Ok(Some(repo))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(anyhow::anyhow!("read added repo {}: {}", path.display(), e)),
+        }
+    }
+
+    async fn remove_added_repo(&self, repo_id: &RepoId) -> Result<()> {
+        let path = self.added_path(repo_id);
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(anyhow::anyhow!(
+                "delete added repo {}: {}",
+                path.display(),
+                e
+            )),
+        }
+    }
+
+    async fn list_added_repos(&self) -> Result<Vec<AddedRepo>> {
+        let mut out = Vec::new();
+        if !self.added_root.exists() {
+            return Ok(out);
+        }
+        let mut providers = tokio::fs::read_dir(&self.added_root).await?;
+        while let Some(provider) = providers.next_entry().await? {
+            if !provider.file_type().await?.is_dir() {
+                continue;
+            }
+            let mut repos = tokio::fs::read_dir(provider.path()).await?;
+            while let Some(repo) = repos.next_entry().await? {
+                if !repo.file_type().await?.is_file() {
+                    continue;
+                }
+                let name = repo.file_name().to_string_lossy().to_string();
+                if !name.ends_with(".json") {
+                    continue;
+                }
+                let data = tokio::fs::read(repo.path()).await?;
+                let added: AddedRepo = serde_json::from_slice(&data)
+                    .with_context(|| format!("parse added repo {}", repo.path().display()))?;
+                out.push(added);
+            }
+        }
+        Ok(out)
+    }
+
     async fn load_build(&self, repo_id: &RepoId, commit: &str) -> Result<Option<RefInfo>> {
         // Commit-keyed reuse: scan branch refs for any completed full build at this
         // commit. This is a cold fallback (only invoked when the requesting branch
@@ -517,6 +633,10 @@ impl S3RefStore {
 
     fn branch_prefix(&self, repo_id: &RepoId) -> String {
         format!("refs/{}/", repo_id.storage_key())
+    }
+
+    fn added_key(&self, repo_id: &RepoId) -> String {
+        format!("added_repos/{}.json", repo_id.storage_key())
     }
 
     /// Read-compare-CAS write shared by HEAD (`save`) and branch
@@ -776,6 +896,57 @@ impl RefStore for S3RefStore {
         Ok(out)
     }
 
+    async fn add_repo(&self, repo: &AddedRepo) -> Result<()> {
+        let data = serde_json::to_vec_pretty(repo).context("serialize added repo")?;
+        self.storage
+            .put_object(&self.added_key(&repo.repo_id), &data, None)
+            .await
+            .with_context(|| format!("write S3 added repo {}", repo.repo_id.storage_key()))?;
+        Ok(())
+    }
+
+    async fn load_added_repo(&self, repo_id: &RepoId) -> Result<Option<AddedRepo>> {
+        let key = self.added_key(repo_id);
+        match self.storage.get_object(&key).await {
+            Ok(Some((_, data))) => {
+                let repo = serde_json::from_slice(&data)
+                    .with_context(|| format!("parse S3 added repo {key}"))?;
+                Ok(Some(repo))
+            }
+            Ok(None) => Ok(None),
+            Err(e) => Err(e).with_context(|| format!("load S3 added repo {key}")),
+        }
+    }
+
+    async fn remove_added_repo(&self, repo_id: &RepoId) -> Result<()> {
+        let key = self.added_key(repo_id);
+        self.storage
+            .delete_object(&key)
+            .await
+            .with_context(|| format!("delete S3 added repo {key}"))
+    }
+
+    async fn list_added_repos(&self) -> Result<Vec<AddedRepo>> {
+        let keys = self
+            .storage
+            .list_objects("added_repos/")
+            .await
+            .context("list S3 added repos")?;
+        let mut out = Vec::new();
+        for key in keys {
+            if !key.ends_with(".json") {
+                continue;
+            }
+            if let Ok(Some((_, data))) = self.storage.get_object(&key).await {
+                out.push(
+                    serde_json::from_slice(&data)
+                        .with_context(|| format!("parse S3 added repo {key}"))?,
+                );
+            }
+        }
+        Ok(out)
+    }
+
     async fn load_build(&self, repo_id: &RepoId, commit: &str) -> Result<Option<RefInfo>> {
         // Commit-keyed reuse: scan branch refs for any completed full build at this
         // commit. This is a cold fallback (only invoked when the requesting branch
@@ -983,6 +1154,22 @@ impl<T: RefStore> RefStore for CachingRefStore<T> {
 
     async fn list_branches(&self, repo_id: &RepoId) -> Result<Vec<String>> {
         self.inner.list_branches(repo_id).await
+    }
+
+    async fn add_repo(&self, repo: &AddedRepo) -> Result<()> {
+        self.inner.add_repo(repo).await
+    }
+
+    async fn load_added_repo(&self, repo_id: &RepoId) -> Result<Option<AddedRepo>> {
+        self.inner.load_added_repo(repo_id).await
+    }
+
+    async fn remove_added_repo(&self, repo_id: &RepoId) -> Result<()> {
+        self.inner.remove_added_repo(repo_id).await
+    }
+
+    async fn list_added_repos(&self) -> Result<Vec<AddedRepo>> {
+        self.inner.list_added_repos().await
     }
 
     async fn invalidate(&self, repo_id: &RepoId, branch: &str) {
@@ -1380,6 +1567,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn file_ref_store_added_repos_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileRefStore::new(tmp.path());
+        let repo_id = RepoId::github("o/r");
+        let added = AddedRepo {
+            repo_id: repo_id.clone(),
+            added_at: 123,
+            history_enabled: true,
+            source: AddedRepoSource::Cli,
+        };
+
+        store.add_repo(&added).await.unwrap();
+        assert_eq!(
+            store.load_added_repo(&repo_id).await.unwrap(),
+            Some(added.clone())
+        );
+        assert_eq!(store.list_added_repos().await.unwrap(), vec![added]);
+
+        store.remove_added_repo(&repo_id).await.unwrap();
+        assert!(store.load_added_repo(&repo_id).await.unwrap().is_none());
+        assert!(store.list_added_repos().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn file_ref_store_delete_branch_removes_and_is_idempotent() {
         let tmp = tempfile::tempdir().unwrap();
         let store = FileRefStore::new(tmp.path());
@@ -1538,6 +1749,22 @@ mod tests {
 
         async fn list_branches(&self, repo_id: &RepoId) -> Result<Vec<String>> {
             self.inner.list_branches(repo_id).await
+        }
+
+        async fn add_repo(&self, repo: &AddedRepo) -> Result<()> {
+            self.inner.add_repo(repo).await
+        }
+
+        async fn load_added_repo(&self, repo_id: &RepoId) -> Result<Option<AddedRepo>> {
+            self.inner.load_added_repo(repo_id).await
+        }
+
+        async fn remove_added_repo(&self, repo_id: &RepoId) -> Result<()> {
+            self.inner.remove_added_repo(repo_id).await
+        }
+
+        async fn list_added_repos(&self) -> Result<Vec<AddedRepo>> {
+            self.inner.list_added_repos().await
         }
     }
 

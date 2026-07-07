@@ -10,7 +10,9 @@
 mod common;
 
 use common::*;
-use std::time::Duration;
+use ripclone::provider::RepoId;
+use ripclone::ref_store::{AddedRepo, AddedRepoSource, FileRefStore, RefStore};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Serializes these tests: they set a process-global re-check barrier that the
 /// in-process server reads, so only one may run at a time.
@@ -117,17 +119,36 @@ async fn wait_until(server: &Server, repo: &str, want: &str, min_builds: u64) {
     panic!("never reached {want} with >= {min_builds} builds; last seen {got:?}, builds {n}");
 }
 
+async fn register_added_repo(server: &Server, repo: &str) -> u64 {
+    let repo_id = RepoId::github(repo);
+    let store = FileRefStore::new(&server.repo_root);
+    store
+        .add_repo(&AddedRepo {
+            repo_id,
+            added_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time")
+                .as_secs(),
+            history_enabled: true,
+            source: AddedRepoSource::Api,
+        })
+        .await
+        .expect("mark repo added");
+    builds_completed(server).await
+}
+
 /// A push that lands during a build is built by the post-build re-check, with no
 /// external poke.
 #[tokio::test]
 async fn recheck_builds_tip_that_moved_during_build() {
     let _guard = SERIAL.lock().await;
     set_env("RIPCLONE_RECHECK_MAX", "3");
-    let mut barrier = RecheckBarrier::new();
     init(false);
     let server = start_server().await;
 
     let origin = make_origin("acme", "fresh1");
+    let baseline = register_added_repo(&server, "acme/fresh1").await;
+    let mut barrier = RecheckBarrier::new();
     let a = origin.commit(&[("f", "a\n")], "A");
     origin.publish();
 
@@ -146,7 +167,7 @@ async fn recheck_builds_tip_that_moved_during_build() {
     assert_eq!(resp.commit, a, "the synced build is A");
 
     // No webhook, no poll: the post-build re-check alone catches up to B.
-    wait_until(&server, "acme/fresh1", &b, 2).await;
+    wait_until(&server, "acme/fresh1", &b, baseline + 2).await;
 
     // B's own re-check enters the barrier next. Let it proceed (it will see no
     // tip change and do nothing) and assert exactly two builds ran.
@@ -154,7 +175,7 @@ async fn recheck_builds_tip_that_moved_during_build() {
     barrier.release();
     assert_eq!(
         builds_completed(&server).await,
-        2,
+        baseline + 2,
         "only A and B were built"
     );
 }
@@ -165,11 +186,12 @@ async fn recheck_builds_tip_that_moved_during_build() {
 async fn recheck_burst_collapses_to_latest() {
     let _guard = SERIAL.lock().await;
     set_env("RIPCLONE_RECHECK_MAX", "5");
-    let mut barrier = RecheckBarrier::new();
     init(false);
     let server = start_server().await;
 
     let origin = make_origin("acme", "fresh2");
+    let baseline = register_added_repo(&server, "acme/fresh2").await;
+    let mut barrier = RecheckBarrier::new();
     let a = origin.commit(&[("f", "a\n")], "A");
     origin.publish();
 
@@ -187,12 +209,12 @@ async fn recheck_burst_collapses_to_latest() {
     assert_eq!(resp.commit, a);
 
     // The re-check builds the latest tip (D) directly, skipping B and C.
-    wait_until(&server, "acme/fresh2", &d, 2).await;
+    wait_until(&server, "acme/fresh2", &d, baseline + 2).await;
     barrier.wait_entered().await;
     barrier.release();
     assert_eq!(
         builds_completed(&server).await,
-        2,
+        baseline + 2,
         "only A and the latest (D) were built; B and C were skipped"
     );
 }
@@ -205,11 +227,12 @@ async fn recheck_burst_collapses_to_latest() {
 async fn recheck_stops_at_cap() {
     let _guard = SERIAL.lock().await;
     set_env("RIPCLONE_RECHECK_MAX", "1");
-    let mut barrier = RecheckBarrier::new();
     init(false);
     let server = start_server().await;
 
     let origin = make_origin("acme", "fresh3");
+    let baseline = register_added_repo(&server, "acme/fresh3").await;
+    let mut barrier = RecheckBarrier::new();
     let a = origin.commit(&[("f", "a\n")], "A");
     origin.publish();
 
@@ -226,7 +249,7 @@ async fn recheck_stops_at_cap() {
 
     // B builds and catches up. B's own re-check (recheck=1) is now blocked on
     // the barrier, about to hit the cap.
-    wait_until(&server, "acme/fresh3", &b, 2).await;
+    wait_until(&server, "acme/fresh3", &b, baseline + 2).await;
 
     // Move the tip to C while B's capped re-check is held. An uncapped re-check
     // would wake, see C, and build it; the cap must stop it instead.
@@ -257,7 +280,7 @@ async fn recheck_stops_at_cap() {
     );
     assert_eq!(
         builds_completed(&server).await,
-        2,
+        baseline + 2,
         "only A and B were built; the cap prevented building C"
     );
 }
@@ -267,11 +290,12 @@ async fn recheck_stops_at_cap() {
 async fn recheck_noop_when_tip_unchanged() {
     let _guard = SERIAL.lock().await;
     set_env("RIPCLONE_RECHECK_MAX", "3");
-    let mut barrier = RecheckBarrier::new();
     init(false);
     let server = start_server().await;
 
     let origin = make_origin("acme", "fresh4");
+    let baseline = register_added_repo(&server, "acme/fresh4").await;
+    let mut barrier = RecheckBarrier::new();
     let a = origin.commit(&[("f", "a\n")], "A");
     origin.publish();
 
@@ -287,14 +311,14 @@ async fn recheck_noop_when_tip_unchanged() {
 
     sync.await.expect("join").expect("sync A");
 
-    wait_until(&server, "acme/fresh4", &a, 1).await;
+    wait_until(&server, "acme/fresh4", &a, baseline + 1).await;
     assert_eq!(
         served_commit(&server, "acme/fresh4").await.as_deref(),
         Some(a.as_str())
     );
     assert_eq!(
         builds_completed(&server).await,
-        1,
+        baseline + 1,
         "no extra build on a no-op re-check"
     );
 }

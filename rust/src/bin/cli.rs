@@ -79,6 +79,8 @@ enum Commands {
     Version,
     /// Check for a newer ripclone release and show how to update.
     Update,
+    /// Make a repo available to clone on the server.
+    Add { repo: String },
     /// Sync a repo on the server.
     Sync {
         repo: String,
@@ -1062,6 +1064,15 @@ async fn main() -> Result<()> {
                 );
             }
         },
+        Commands::Add { repo } => {
+            let (provider, repo_path) = resolve_repo(&repo, &default_provider, &provider_registry)?;
+            let upstream_token = resolve_upstream_token(&provider, args.token.as_deref()).await?;
+            let client = client
+                .with_provider(&provider)
+                .with_upstream_token_opt(upstream_token);
+            let info = client.add_repo(&repo_path).await?;
+            println!("added {} at {}", repo_path, info.commit);
+        }
         Commands::Sync { repo, depth, at } => {
             let (provider, repo_path) = resolve_repo(&repo, &default_provider, &provider_registry)?;
             let upstream_token = resolve_upstream_token(&provider, args.token.as_deref()).await?;
