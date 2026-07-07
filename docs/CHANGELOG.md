@@ -1,6 +1,6 @@
 # Changelog
 
-This file tracks what has already landed in ripclone. For upcoming work see `ROADMAP.md`.
+This file tracks what has already landed in ripclone. For upcoming work see `internal/ROADMAP.md`.
 
 ## Distribution
 
