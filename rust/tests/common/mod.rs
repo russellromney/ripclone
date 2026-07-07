@@ -13,6 +13,7 @@ use ripclone::storage::{HashEntry, StorageBackend, StorageRef};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Mutex;
 use std::sync::{Arc, Once};
 use std::time::Duration;
 use tempfile::TempDir;
@@ -152,16 +153,30 @@ pub async fn start_server_with_barrier(barrier: ArtifactBarrier) -> Server {
 }
 
 pub async fn start_server_split_storage() -> Server {
-    start_server_split_storage_inner(None).await
+    start_server_split_storage_inner(None, None).await
 }
 
 /// Start a split-storage server with a deterministic artifact download barrier.
 /// See [`ripclone::server::ArtifactBarrier`].
 pub async fn start_server_split_storage_barrier(barrier: ArtifactBarrier) -> Server {
-    start_server_split_storage_inner(Some(barrier)).await
+    start_server_split_storage_inner(Some(barrier), None).await
 }
 
-async fn start_server_split_storage_inner(barrier: Option<ArtifactBarrier>) -> Server {
+/// Start a split-storage server whose durable-storage uploads fail after a
+/// configurable number of successful writes. Used by failure-injection e2e
+/// tests to prove failed builds do not publish refs that point at missing
+/// artifacts.
+pub async fn start_server_split_storage_failing_put(
+    fail_after_successes: usize,
+    failures: usize,
+) -> Server {
+    start_server_split_storage_inner(None, Some((fail_after_successes, failures))).await
+}
+
+async fn start_server_split_storage_inner(
+    barrier: Option<ArtifactBarrier>,
+    fail_put: Option<(usize, usize)>,
+) -> Server {
     init_tracing();
     let dir = tempfile::tempdir().expect("server dir");
     let cas_dir = dir.path().join("cas");
@@ -171,9 +186,18 @@ async fn start_server_split_storage_inner(barrier: Option<ArtifactBarrier>) -> S
     let port = free_port();
 
     let cas = ripclone::cas::Cas::new(&cas_dir).unwrap();
-    let storage: StorageRef = Arc::new(RemoteLocalStorage {
+    let base_storage: StorageRef = Arc::new(RemoteLocalStorage {
         inner: ripclone::storage::local(&storage_dir).unwrap(),
     });
+    let storage: StorageRef = if let Some((fail_after_successes, failures)) = fail_put {
+        Arc::new(FailingPutStorage::new(
+            base_storage,
+            fail_after_successes,
+            failures,
+        ))
+    } else {
+        base_storage
+    };
     let ref_store: Arc<dyn ripclone::ref_store::RefStore> =
         Arc::new(ripclone::ref_store::FileRefStore::new(&repo_root));
     let metrics = ripclone::metrics::Metrics::new();
@@ -342,6 +366,106 @@ impl StorageBackend for RemoteLocalStorage {
 
     fn regions(&self) -> Vec<String> {
         vec!["test-remote-local".to_string()]
+    }
+
+    fn delete(&self, hash: &str) -> anyhow::Result<()> {
+        self.inner.delete(hash)
+    }
+
+    fn delete_batch(&self, hashes: &[String]) -> anyhow::Result<u64> {
+        self.inner.delete_batch(hashes)
+    }
+
+    fn list_hashes(&self) -> anyhow::Result<Vec<HashEntry>> {
+        self.inner.list_hashes()
+    }
+
+    fn health(&self) -> anyhow::Result<()> {
+        self.inner.health()
+    }
+}
+
+pub struct FailingPutStorage {
+    inner: StorageRef,
+    fail_after_successes: Mutex<usize>,
+    failures_remaining: Mutex<usize>,
+}
+
+impl FailingPutStorage {
+    pub fn new(inner: StorageRef, fail_after_successes: usize, failures: usize) -> Self {
+        Self {
+            inner,
+            fail_after_successes: Mutex::new(fail_after_successes),
+            failures_remaining: Mutex::new(failures),
+        }
+    }
+
+    fn should_fail_put(&self) -> bool {
+        let mut successes = self.fail_after_successes.lock().unwrap();
+        if *successes > 0 {
+            *successes -= 1;
+            return false;
+        }
+        drop(successes);
+
+        let mut failures = self.failures_remaining.lock().unwrap();
+        if *failures > 0 {
+            *failures -= 1;
+            return true;
+        }
+        false
+    }
+}
+
+#[async_trait::async_trait]
+impl StorageBackend for FailingPutStorage {
+    fn get(&self, hash: &str) -> anyhow::Result<Vec<u8>> {
+        self.inner.get(hash)
+    }
+
+    fn get_range(&self, hash: &str, start: u64, len: u64) -> anyhow::Result<Vec<u8>> {
+        self.inner.get_range(hash, start, len)
+    }
+
+    fn put(&self, hash: &str, data: &[u8]) -> anyhow::Result<()> {
+        if self.should_fail_put() {
+            anyhow::bail!("injected durable-storage put failure for {hash}");
+        }
+        self.inner.put(hash, data)
+    }
+
+    async fn put_async(&self, hash: &str, data: &[u8]) -> anyhow::Result<()> {
+        if self.should_fail_put() {
+            anyhow::bail!("injected durable-storage put_async failure for {hash}");
+        }
+        self.inner.put_async(hash, data).await
+    }
+
+    async fn put_file_async(&self, hash: &str, path: &std::path::Path) -> anyhow::Result<()> {
+        if self.should_fail_put() {
+            anyhow::bail!("injected durable-storage put_file_async failure for {hash}");
+        }
+        self.inner.put_file_async(hash, path).await
+    }
+
+    async fn get_meta(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
+        self.inner.get_meta(key).await
+    }
+
+    async fn put_meta(&self, key: &str, data: &[u8]) -> anyhow::Result<()> {
+        self.inner.put_meta(key, data).await
+    }
+
+    fn size(&self, hash: &str) -> anyhow::Result<u64> {
+        self.inner.size(hash)
+    }
+
+    fn is_remote(&self) -> bool {
+        self.inner.is_remote()
+    }
+
+    fn regions(&self) -> Vec<String> {
+        self.inner.regions()
     }
 
     fn delete(&self, hash: &str) -> anyhow::Result<()> {
@@ -568,6 +692,7 @@ pub struct HttpOrigin {
     pub bare: PathBuf,
     pub url: String,
     pub port: u16,
+    auth_log: Option<PathBuf>,
     _dir: TempDir,
     _server: std::process::Child,
 }
@@ -610,6 +735,22 @@ impl HttpOrigin {
     pub fn bare_str(&self) -> &str {
         self.bare.to_str().unwrap()
     }
+
+    pub fn auth_reject_count(&self) -> usize {
+        self.auth_status_count("403")
+    }
+
+    fn auth_status_count(&self, status: &str) -> usize {
+        let Some(path) = &self.auth_log else {
+            return 0;
+        };
+        let Ok(log) = std::fs::read_to_string(path) else {
+            return 0;
+        };
+        log.lines()
+            .filter(|line| line.split('\t').next() == Some(status))
+            .count()
+    }
 }
 
 /// Create a bare repo under `<repo_path>.git`, enable dumb HTTP, and serve the
@@ -645,17 +786,20 @@ fn make_http_origin_inner(repo_path: &str, expected_auth: Option<&str>) -> HttpO
     git(&bare, &["update-server-info"]);
 
     let port = free_port();
+    let auth_log = expected_auth.map(|_| dir.path().join("auth.log"));
     let server = if let Some(auth) = expected_auth {
         // A tiny real HTTP server that gates every request on the exact
         // Authorization header ripclone is expected to inject.
         let script = dir.path().join("auth_server.py");
         let script_body = r#"import http.server
+import os
 import socketserver
 import sys
 
 EXPECTED_AUTH = sys.argv[1]
 PORT = int(sys.argv[2])
 ROOT = sys.argv[3]
+LOG = sys.argv[4]
 
 class AuthHandler(http.server.SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
@@ -664,16 +808,24 @@ class AuthHandler(http.server.SimpleHTTPRequestHandler):
     def check_auth(self):
         return self.headers.get('Authorization') == EXPECTED_AUTH
 
+    def record(self, status):
+        with open(LOG, 'a', encoding='utf-8') as f:
+            f.write(f"{status}\t{self.command}\t{self.path}\t{self.headers.get('Authorization', '')}\n")
+
     def do_GET(self):
         if not self.check_auth():
+            self.record(403)
             self.send_error(403, 'Forbidden')
             return
+        self.record(200)
         super().do_GET()
 
     def do_HEAD(self):
         if not self.check_auth():
+            self.record(403)
             self.send_error(403, 'Forbidden')
             return
+        self.record(200)
         super().do_HEAD()
 
     def log_message(self, format, *args):
@@ -686,11 +838,14 @@ with ReusableTCPServer(('', PORT), AuthHandler) as httpd:
     httpd.serve_forever()
 "#;
         std::fs::write(&script, script_body).unwrap();
+        let log = auth_log.as_ref().expect("auth log path");
+        std::fs::write(log, "").unwrap();
         Command::new("python3")
             .arg(script.to_str().unwrap())
             .arg(auth)
             .arg(port.to_string())
             .arg(dir.path().to_str().unwrap())
+            .arg(log.to_str().unwrap())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
@@ -721,6 +876,7 @@ with ReusableTCPServer(('', PORT), AuthHandler) as httpd:
         bare,
         url: format!("http://127.0.0.1:{port}"),
         port,
+        auth_log,
         _dir: dir,
         _server: server,
     }

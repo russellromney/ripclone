@@ -103,7 +103,10 @@ fn preset_provider_auth(kind: &str, token: &str) -> String {
     }
 }
 
-/// GitHub-shaped provider injects `Authorization: Basic base64(x-access-token:token)`.
+/// Fails if the GitHub provider preset stops injecting
+/// `Authorization: Basic base64(x-access-token:token)` into real upstream git
+/// fetches; the origin rejects every other header and the clone byte-checks the
+/// fetched commit.
 #[tokio::test]
 async fn github_provider_injects_basic_x_access_token_auth_header() {
     init(false);
@@ -135,7 +138,10 @@ async fn github_provider_injects_basic_x_access_token_auth_header() {
     assert_eq!(readme, "hello from github origin\n");
 }
 
-/// GitLab-shaped provider injects `Authorization: Basic base64(oauth2:token)`.
+/// Fails if the GitLab provider preset stops injecting
+/// `Authorization: Basic base64(oauth2:token)` into real upstream git fetches;
+/// the protected origin must accept the fetch before the byte-checked clone can
+/// succeed.
 #[tokio::test]
 async fn gitlab_provider_injects_basic_oauth2_auth_header() {
     init(false);
@@ -167,7 +173,9 @@ async fn gitlab_provider_injects_basic_oauth2_auth_header() {
     assert_eq!(readme, "hello from gitlab origin\n");
 }
 
-/// Gitea-shaped provider injects `Authorization: token <token>`.
+/// Fails if the Gitea provider preset stops injecting
+/// `Authorization: token <token>` into real upstream git fetches; the protected
+/// origin must accept the fetch before the byte-checked clone can succeed.
 #[tokio::test]
 async fn gitea_provider_injects_token_auth_header() {
     init(false);
@@ -251,6 +259,10 @@ async fn provider_upstream_rejects_wrong_or_absent_auth_headers() {
         assert!(
             res.is_err(),
             "{provider_id} with wrong/absent auth must fail upstream, got {res:?}"
+        );
+        assert!(
+            origin.auth_reject_count() > 0,
+            "{provider_id} must reach the protected origin and receive a real 403"
         );
 
         let out = tempfile::tempdir().unwrap();

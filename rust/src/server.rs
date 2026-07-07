@@ -3007,7 +3007,9 @@ async fn sync_repo_inner(
                         .ref_store
                         .invalidate(&repo_id, &effective_branch)
                         .await;
+                    state.ref_store.invalidate(&repo_id, "HEAD").await;
                     invalidate_ref_response_cache(&state, &repo_id, &effective_branch);
+                    invalidate_ref_response_cache(&state, &repo_id, "HEAD");
                     let load_key = ref_store_key(&effective_branch, at_rev.as_deref(), None);
                     match state.ref_store.load_branch(&repo_id, &load_key).await {
                         // Guard on a non-empty commit: a HEAD row can exist as
@@ -4599,6 +4601,7 @@ async fn reuse_existing_build(
     repo_id: &RepoId,
     branch: &str,
     commit: &str,
+    allow_archive_in_progress: bool,
 ) -> Result<Option<RefInfo>> {
     if let Ok(Some(prev)) = ref_store.load_branch(repo_id, branch).await
         && prev.full_clonepack.commit == commit
@@ -4615,7 +4618,7 @@ async fn reuse_existing_build(
                 .build_status
                 .as_ref()
                 .is_some_and(|s| s == "full history building" || s == "archive building");
-        if !prev.archive_chunks.is_empty() || archive_in_progress {
+        if !prev.archive_chunks.is_empty() || (allow_archive_in_progress && archive_in_progress) {
             return Ok(Some(prev));
         }
     }
@@ -4623,6 +4626,14 @@ async fn reuse_existing_build(
         // Do not reuse an evicted commit-keyed build: its artifacts were deleted
         // by the warm-TTL sweep and the branch needs a real rebuild.
         if built.build_status.as_deref() == Some(crate::remote_gc::EVICTED_BUILD_STATUS) {
+            return Ok(None);
+        }
+        let archive_in_progress = built.archive_chunks.is_empty()
+            && built
+                .build_status
+                .as_ref()
+                .is_some_and(|s| s == "full history building" || s == "archive building");
+        if built.archive_chunks.is_empty() && !(allow_archive_in_progress && archive_in_progress) {
             return Ok(None);
         }
         // Re-point the branch at this build. Reuse only fires when `commit` is the
@@ -4749,7 +4760,8 @@ async fn do_sync(
             .unwrap_or(Ok(None))
         };
         if let Ok(Some(tip)) = tip
-            && let Some(prev) = reuse_existing_build(ref_store, repo_id, branch, &tip).await?
+            && let Some(prev) =
+                reuse_existing_build(ref_store, repo_id, branch, &tip, !inline_full_history).await?
         {
             info!(
                 "sync no-op (ls-remote): {} already current at {} (no fetch)",
@@ -4842,7 +4854,9 @@ async fn do_sync(
     // the async worker's transient "building" status. (It does *not* require the
     // archive sub-phase to be done — a files-mode client re-resolves until the
     // archive is ready, so reusing an archive-pending build is safe.)
-    if let Some(prev) = reuse_existing_build(ref_store, repo_id, branch, &commit).await? {
+    if let Some(prev) =
+        reuse_existing_build(ref_store, repo_id, branch, &commit, !inline_full_history).await?
+    {
         info!(
             "sync no-op: {} already current at {} (reusing prior clonepack)",
             repo_id.storage_key(),
@@ -5207,7 +5221,7 @@ async fn build_and_publish_two_phase(
         .unwrap_or_default();
     let prev_archive_frames_for_p2 = carried_archive_frames.clone();
 
-    let info = RefInfo {
+    let mut info = RefInfo {
         commit: commit.to_string(),
         parent_commit: parent.clone(),
         default_branch: default_branch.to_string(),
@@ -5362,6 +5376,12 @@ async fn build_and_publish_two_phase(
         // safe with auto-gc off). A crash mid-build leaves the claim stale → the
         // queue reclaims and retries it (and dead-letters after the cap).
         phase2.await.context("phase 2 (full history) build")?;
+        ref_store.invalidate(repo_id, branch).await;
+        if let Some(updated) = ref_store.load_branch(repo_id, branch).await?
+            && updated.commit == commit
+        {
+            info = updated;
+        }
     } else {
         // Long-lived in-process server: detach so `/sync` returns as soon as the
         // depth=1 clonepack is live. The task outlives the request because the
@@ -5916,6 +5936,14 @@ async fn build_full_in_background(
                 .with_context(|| {
                     format!("persist files ref for {}@{branch}", repo_id.storage_key())
                 })?;
+            if branch == default_branch {
+                ref_store
+                    .save_branch(repo_id, "HEAD", &info)
+                    .await
+                    .with_context(|| {
+                        format!("persist files HEAD alias for {}", repo_id.storage_key())
+                    })?;
+            }
         }
     }
     settle_storage(
@@ -6034,26 +6062,25 @@ pub async fn process_build_job(
             // under the literal `HEAD` key too (plain HEAD request, no rev
             // override) so any process can resolve `/sync HEAD` from the shared
             // metadata store alone. The save below creates or updates the
-            // literal `HEAD` alias; the status update then stamps `done` onto it.
-            if branch == "HEAD"
-                && at_rev.is_none()
-                && effective_branch != "HEAD"
-                && let Err(e) = state.ref_store.save_branch(repo_id, "HEAD", info).await
-            {
-                warn!(
-                    "failed to write HEAD ref alias for {}: {e}",
-                    repo_id.storage_key()
-                );
-            }
-            if inline_full_history {
-                if let Err(e) =
-                    update_build_status(state, repo_id, &effective_branch, &info.commit, "done")
-                        .await
+            // literal `HEAD` alias from the final concrete ref.
+            if branch == "HEAD" && at_rev.is_none() && effective_branch != "HEAD" {
+                state.ref_store.invalidate(repo_id, &effective_branch).await;
+                let head_info = match state
+                    .ref_store
+                    .load_branch(repo_id, &effective_branch)
+                    .await
                 {
-                    error!(
-                        "build status update failed for {}@{effective_branch} {}: {e:#}",
-                        repo_id.storage_key(),
-                        info.commit
+                    Ok(Some(latest)) if latest.commit == info.commit => latest,
+                    _ => info.clone(),
+                };
+                if let Err(e) = state
+                    .ref_store
+                    .save_branch(repo_id, "HEAD", &head_info)
+                    .await
+                {
+                    warn!(
+                        "failed to write HEAD ref alias for {}: {e}",
+                        repo_id.storage_key()
                     );
                 }
             }
@@ -6233,7 +6260,7 @@ async fn post_build_freshness_recheck(
     // The tip moved during the build. If a concurrent build already produced it,
     // reuse_existing_build re-points the branch and we're caught up; otherwise
     // enqueue one build of the current tip (coalesced if one already started).
-    match reuse_existing_build(&state.ref_store, repo_id, branch, &tip).await {
+    match reuse_existing_build(&state.ref_store, repo_id, branch, &tip, true).await {
         Ok(Some(_)) => return,
         Ok(None) => {}
         Err(e) => warn!(
@@ -6474,7 +6501,7 @@ pub async fn poll_once(state: &ServerState) -> usize {
                 continue; // unknown ref / probe failed
             };
             // Already built at this tip (branch-scoped, then commit-keyed)? Skip.
-            match reuse_existing_build(&state.ref_store, &repo_id, &branch, &tip).await {
+            match reuse_existing_build(&state.ref_store, &repo_id, &branch, &tip, true).await {
                 Ok(Some(_)) => continue,
                 Ok(None) => {}
                 Err(e) => warn!(
@@ -7541,7 +7568,7 @@ mod tests {
             .unwrap();
 
         // A fresh branch bar at X reuses foo's build and is re-pointed at it.
-        let reused = reuse_existing_build(&store, &rid, "bar", "X")
+        let reused = reuse_existing_build(&store, &rid, "bar", "X", true)
             .await
             .unwrap();
         assert_eq!(reused.expect("reuse").commit, "X");
@@ -7565,7 +7592,7 @@ mod tests {
             .save_branch(&rid, "main", &complete("Y", 5_000, 100))
             .await
             .unwrap();
-        let reused = reuse_existing_build(&store, &rid, "main", "X")
+        let reused = reuse_existing_build(&store, &rid, "main", "X", true)
             .await
             .unwrap();
         assert_eq!(reused.expect("reuse").commit, "X");
@@ -9264,6 +9291,7 @@ mod tests {
             &RepoId::github("acme/secret"),
             "main",
             "commit1",
+            true,
         )
         .await
         .unwrap();
@@ -9296,7 +9324,7 @@ mod tests {
         store.save_branch(&rid, "foo", &evicted).await.unwrap();
 
         // Cross-branch commit-keyed reuse must not republish an evicted build.
-        let reused = reuse_existing_build(&store, &rid, "bar", "X")
+        let reused = reuse_existing_build(&store, &rid, "bar", "X", true)
             .await
             .unwrap();
         assert!(
