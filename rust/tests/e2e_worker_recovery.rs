@@ -413,6 +413,18 @@ async fn worker_kill_mid_build_reclaims_libsql_queue_and_metadata() {
     let (_g, c) = wait_repo_cloneable(&server, "acme", "recover-libsql", "1").await;
     assert_eq!(read(&c, "a.txt"), "recovered\n");
     assert!(git_ok(&c, &["fsck", "--connectivity-only", "HEAD"]));
+
+    wait_archive_settled(&server, "recover-libsql", &want).await;
+    let (_fg, files) = clone_only(
+        &server,
+        "acme",
+        "recover-libsql",
+        0,
+        ripclone::mode::CloneMode::Files,
+    )
+    .await
+    .expect("files clone after recovered libsql archive build");
+    assert_eq!(read(&files, "a.txt"), "recovered\n");
 }
 
 #[derive(Clone)]

@@ -153,13 +153,13 @@ pub async fn start_server_with_barrier(barrier: ArtifactBarrier) -> Server {
 }
 
 pub async fn start_server_split_storage() -> Server {
-    start_server_split_storage_inner(None, None).await
+    start_server_split_storage_inner(None, None, None).await
 }
 
 /// Start a split-storage server with a deterministic artifact download barrier.
 /// See [`ripclone::server::ArtifactBarrier`].
 pub async fn start_server_split_storage_barrier(barrier: ArtifactBarrier) -> Server {
-    start_server_split_storage_inner(Some(barrier), None).await
+    start_server_split_storage_inner(Some(barrier), None, None).await
 }
 
 /// Start a split-storage server whose durable-storage uploads fail after a
@@ -170,12 +170,24 @@ pub async fn start_server_split_storage_failing_put(
     fail_after_successes: usize,
     failures: usize,
 ) -> Server {
-    start_server_split_storage_inner(None, Some((fail_after_successes, failures))).await
+    start_server_split_storage_inner(None, Some((fail_after_successes, failures)), None).await
+}
+
+/// Start a split-storage server whose ref-store writes fail after a configurable
+/// number of successful writes. This gives failure-injection tests deterministic
+/// coverage of metadata/DB publish failures without relying on filesystem
+/// permissions or process-global environment.
+pub async fn start_server_split_storage_failing_ref_save(
+    fail_after_successes: usize,
+    failures: usize,
+) -> Server {
+    start_server_split_storage_inner(None, None, Some((fail_after_successes, failures))).await
 }
 
 async fn start_server_split_storage_inner(
     barrier: Option<ArtifactBarrier>,
     fail_put: Option<(usize, usize)>,
+    fail_ref: Option<(usize, usize)>,
 ) -> Server {
     init_tracing();
     let dir = tempfile::tempdir().expect("server dir");
@@ -198,8 +210,18 @@ async fn start_server_split_storage_inner(
     } else {
         base_storage
     };
-    let ref_store: Arc<dyn ripclone::ref_store::RefStore> =
+    let base_ref_store: Arc<dyn ripclone::ref_store::RefStore> =
         Arc::new(ripclone::ref_store::FileRefStore::new(&repo_root));
+    let ref_store: Arc<dyn ripclone::ref_store::RefStore> =
+        if let Some((fail_after_successes, failures)) = fail_ref {
+            Arc::new(FailingRefStore::new(
+                base_ref_store,
+                fail_after_successes,
+                failures,
+            ))
+        } else {
+            base_ref_store
+        };
     let metrics = ripclone::metrics::Metrics::new();
     let retention = Arc::new(
         ripclone::retention::Retention::with_config_and_storage(
@@ -414,6 +436,147 @@ impl FailingPutStorage {
             return true;
         }
         false
+    }
+}
+
+pub struct FailingRefStore {
+    inner: Arc<dyn ripclone::ref_store::RefStore>,
+    fail_after_successes: Mutex<usize>,
+    failures_remaining: Mutex<usize>,
+}
+
+impl FailingRefStore {
+    pub fn new(
+        inner: Arc<dyn ripclone::ref_store::RefStore>,
+        fail_after_successes: usize,
+        failures: usize,
+    ) -> Self {
+        Self {
+            inner,
+            fail_after_successes: Mutex::new(fail_after_successes),
+            failures_remaining: Mutex::new(failures),
+        }
+    }
+
+    fn should_fail_write(&self) -> bool {
+        let mut successes = self.fail_after_successes.lock().unwrap();
+        if *successes > 0 {
+            *successes -= 1;
+            return false;
+        }
+        drop(successes);
+
+        let mut failures = self.failures_remaining.lock().unwrap();
+        if *failures > 0 {
+            *failures -= 1;
+            return true;
+        }
+        false
+    }
+}
+
+#[async_trait::async_trait]
+impl ripclone::ref_store::RefStore for FailingRefStore {
+    async fn load(
+        &self,
+        repo_id: &ripclone::provider::RepoId,
+    ) -> anyhow::Result<Option<ripclone::RefInfo>> {
+        self.inner.load(repo_id).await
+    }
+
+    async fn save(
+        &self,
+        repo_id: &ripclone::provider::RepoId,
+        info: &ripclone::RefInfo,
+    ) -> anyhow::Result<()> {
+        if self.should_fail_write() {
+            anyhow::bail!(
+                "injected ref-store save failure for {}",
+                repo_id.storage_key()
+            );
+        }
+        self.inner.save(repo_id, info).await
+    }
+
+    async fn list(&self) -> anyhow::Result<Vec<ripclone::provider::RepoId>> {
+        self.inner.list().await
+    }
+
+    async fn load_branch(
+        &self,
+        repo_id: &ripclone::provider::RepoId,
+        branch: &str,
+    ) -> anyhow::Result<Option<ripclone::RefInfo>> {
+        self.inner.load_branch(repo_id, branch).await
+    }
+
+    async fn load_build(
+        &self,
+        repo_id: &ripclone::provider::RepoId,
+        commit: &str,
+    ) -> anyhow::Result<Option<ripclone::RefInfo>> {
+        self.inner.load_build(repo_id, commit).await
+    }
+
+    async fn save_branch(
+        &self,
+        repo_id: &ripclone::provider::RepoId,
+        branch: &str,
+        info: &ripclone::RefInfo,
+    ) -> anyhow::Result<()> {
+        if self.should_fail_write() {
+            anyhow::bail!(
+                "injected ref-store save_branch failure for {}@{branch}",
+                repo_id.storage_key()
+            );
+        }
+        self.inner.save_branch(repo_id, branch, info).await
+    }
+
+    async fn update_build_status(
+        &self,
+        repo_id: &ripclone::provider::RepoId,
+        branch: &str,
+        expected_commit: &str,
+        status: &str,
+    ) -> anyhow::Result<bool> {
+        self.inner
+            .update_build_status(repo_id, branch, expected_commit, status)
+            .await
+    }
+
+    async fn touch_last_accessed_at(
+        &self,
+        repo_id: &ripclone::provider::RepoId,
+        branch: &str,
+        expected_commit: &str,
+    ) -> anyhow::Result<bool> {
+        self.inner
+            .touch_last_accessed_at(repo_id, branch, expected_commit)
+            .await
+    }
+
+    async fn delete_branch(
+        &self,
+        repo_id: &ripclone::provider::RepoId,
+        branch: &str,
+    ) -> anyhow::Result<()> {
+        self.inner.delete_branch(repo_id, branch).await
+    }
+
+    async fn list_branches(
+        &self,
+        repo_id: &ripclone::provider::RepoId,
+    ) -> anyhow::Result<Vec<String>> {
+        self.inner.list_branches(repo_id).await
+    }
+
+    async fn invalidate(&self, repo_id: &ripclone::provider::RepoId, branch: &str) {
+        self.inner.invalidate(repo_id, branch).await
+    }
+
+    async fn health(&self) -> anyhow::Result<()> {
+        self.inner.health().await
     }
 }
 

@@ -10,6 +10,7 @@
 mod common;
 
 use anyhow::{Context, Result};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use common::*;
 use ripclone::mode::CloneMode;
 use ripclone::provider::RepoId;
@@ -75,6 +76,56 @@ fn repo_suffix(prefix: &str) -> String {
         .trim_start_matches("e2e-remote-gc/")
         .trim_end_matches('/')
         .to_string()
+}
+
+fn token_exp(token: &str) -> u64 {
+    let payload = token.split('.').nth(1).expect("JWT payload");
+    let decoded = URL_SAFE_NO_PAD.decode(payload).expect("base64url payload");
+    let claims: serde_json::Value = serde_json::from_slice(&decoded).expect("JWT JSON");
+    claims["exp"].as_u64().expect("exp claim")
+}
+
+async fn mint_session_token(server: &Server) -> String {
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let resp = client
+        .post(format!("{}/v1/auth/login", server.url))
+        .form(&[
+            ("secret", TOKEN),
+            ("callback", "http://127.0.0.1:0/"),
+            ("state", "combined-expiry"),
+        ])
+        .send()
+        .await
+        .expect("login request");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::SEE_OTHER,
+        "login redirects to callback"
+    );
+    let loc = resp
+        .headers()
+        .get("location")
+        .and_then(|v| v.to_str().ok())
+        .expect("location header");
+    loc.split_once("token=")
+        .and_then(|(_, rest)| rest.split('&').next())
+        .expect("token in redirect")
+        .to_string()
+}
+
+fn write_cli_session_token(home: &std::path::Path, server: &str, token: &str) {
+    let config_dir = home.join(".config").join("ripclone");
+    std::fs::create_dir_all(&config_dir).expect("create ripclone config dir");
+    let key = format!("session:{}", server.trim_end_matches('/'));
+    let body = serde_json::json!({ key: token });
+    std::fs::write(
+        config_dir.join("tokens.json"),
+        serde_json::to_vec_pretty(&body).expect("token json"),
+    )
+    .expect("write token store");
 }
 
 fn free_port() -> u16 {
@@ -1187,6 +1238,141 @@ async fn expired_signed_url_fails_clone_cleanly() {
     assert!(
         !target.exists(),
         "failed clone must not leave a partial tree at target"
+    );
+
+    cleanup_prefix(&direct_env, &prefix)
+        .await
+        .expect("cleanup prefix");
+    cleanup_repo_refs(&direct_env, "acme", &repo)
+        .await
+        .expect("cleanup refs");
+    guard.disable();
+}
+
+#[ignore = "requires S3 credentials"]
+#[tokio::test]
+async fn expired_bearer_and_signed_url_mid_cli_clone_fail_cleanly() {
+    // Fails if the CLI falls back to an unauthenticated artifact path after a
+    // stale signed URL, if re-resolving a ref with an expired bearer token still
+    // exposes private bytes, or if the failed clone leaves a partial checkout.
+    let direct_env = match s3_env() {
+        Some(e) => e,
+        None => {
+            eprintln!("SKIP: RIPCLONE_S3_ENDPOINT/BUCKET not set");
+            return;
+        }
+    };
+
+    let prefix = unique_prefix();
+    let suffix = repo_suffix(&prefix);
+    let repo = format!("comboexp-{suffix}");
+    let mut guard = CleanupGuard::new(direct_env.clone(), prefix.clone());
+
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (proceed_tx, proceed_rx) = tokio::sync::oneshot::channel();
+    let proxy = start_barrier_proxy(&direct_env.endpoint, 16, true, entered_tx, proceed_rx).await;
+    let server = start_s3_server(&direct_env, &prefix).await;
+
+    let origin = make_origin("acme", &repo);
+    guard.track_repo("acme", &repo);
+    let body = "combined expiry must not leak bytes\n".repeat(128);
+    origin.commit(&[("a.txt", &body), ("b.txt", "stable\n")], "c1");
+    origin.publish();
+
+    server
+        .client()
+        .sync_repo(&format!("acme/{repo}"), None)
+        .await
+        .expect("sync");
+
+    unsafe {
+        std::env::set_var("RIPCLONE_JWT_TTL_SECS", "12");
+    }
+    let token = mint_session_token(&server).await;
+    let token_expires_at = token_exp(&token);
+    unsafe {
+        std::env::remove_var("RIPCLONE_JWT_TTL_SECS");
+        std::env::set_var("RIPCLONE_SIGNED_URL_TTL_SECS", "1");
+        std::env::set_var("RIPCLONE_EDITABLE_DOWNLOAD_CONCURRENCY", "1");
+        std::env::set_var("RIPCLONE_TEST_SIGNED_URL_PROXY", &proxy.url);
+    }
+
+    let home = tempfile::tempdir().expect("cli home");
+    write_cli_session_token(home.path(), &server.url, &token);
+    let out = tempfile::tempdir().expect("clone out");
+    let target = out.path().join("clone");
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_ripclone"))
+        .arg("--server")
+        .arg(&server.url)
+        .arg("clone")
+        .arg(format!("acme/{repo}"))
+        .arg(&target)
+        .arg("--depth")
+        .arg("1")
+        .arg("--no-metrics")
+        .arg("--verify-upstream=never")
+        .env("HOME", home.path())
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("RIPCLONE_NO_METRICS", "1")
+        .env_remove("RIPCLONE_SERVER_TOKEN")
+        .env_remove("RIPCLONE_SERVER_TOKEN_HASH")
+        .env_remove("RIPCLONE_TOKEN")
+        .env_remove("RIPCLONE_TOKEN_HASH")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn ripclone clone");
+
+    if !matches!(
+        tokio::time::timeout(Duration::from_secs(30), entered_rx).await,
+        Ok(Ok(()))
+    ) {
+        let _ = child.kill();
+        let output = child.wait_with_output().expect("wait failed clone");
+        panic!(
+            "CLI clone never reached the signed-URL barrier\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time")
+        .as_secs();
+    if token_expires_at > now {
+        sleep(Duration::from_secs(token_expires_at - now + 1)).await;
+    }
+    proceed_tx.send(()).expect("release signed-URL barrier");
+
+    let output = tokio::task::spawn_blocking(move || child.wait_with_output())
+        .await
+        .expect("join CLI wait")
+        .expect("wait CLI clone");
+    unsafe {
+        std::env::remove_var("RIPCLONE_SIGNED_URL_TTL_SECS");
+        std::env::remove_var("RIPCLONE_EDITABLE_DOWNLOAD_CONCURRENCY");
+        std::env::remove_var("RIPCLONE_TEST_SIGNED_URL_PROXY");
+    }
+
+    assert!(
+        !output.status.success(),
+        "combined bearer/signed-URL expiry must fail, stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("401") || combined.to_lowercase().contains("unauthorized"),
+        "retry after stale signed URL must fail at the expired bearer boundary, got:\n{combined}"
+    );
+    assert!(
+        !target.exists(),
+        "failed combined-expiry clone must not leave a partial checkout"
     );
 
     cleanup_prefix(&direct_env, &prefix)
