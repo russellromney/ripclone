@@ -89,16 +89,66 @@ async fn clone_full_with_provider(
     found.unwrap_or_else(|| panic!("provider clone of {repo_path} never current (last: {last})"))
 }
 
-/// GitLab-shaped provider injects `Authorization: Basic base64(oauth2:token)`.
+fn preset_provider_auth(kind: &str, token: &str) -> String {
+    match kind {
+        "github" => format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{token}"))
+        ),
+        "gitlab" => format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(format!("oauth2:{token}"))
+        ),
+        "gitea" => format!("token {token}"),
+        other => panic!("unknown provider kind {other}"),
+    }
+}
+
+/// Fails if the GitHub provider preset stops injecting
+/// `Authorization: Basic base64(x-access-token:token)` into real upstream git
+/// fetches; the origin rejects every other header and the clone byte-checks the
+/// fetched commit.
+#[tokio::test]
+async fn github_provider_injects_basic_x_access_token_auth_header() {
+    init(false);
+
+    let token = "github-e2e-token";
+    let expected_auth = preset_provider_auth("github", token);
+    let origin = make_http_origin_with_auth("acme/http", &expected_auth);
+    let want = origin.commit(&[("README.md", "hello from github origin\n")], "c1");
+    origin.publish();
+
+    let providers = serde_json::json!({
+        "providers": [{
+            "id": "github-http",
+            "kind": "github",
+            "host": &origin.url,
+            "token": token,
+        }]
+    });
+    let providers_str = providers.to_string();
+    let server = start_server_env(&[("RIPCLONE_PROVIDERS", &providers_str)]).await;
+    let client = server.client_with_provider("github-http", None);
+    client
+        .sync_repo("acme/http", None)
+        .await
+        .expect("sync github-shaped provider repo");
+
+    let (_out, target) = clone_full_with_provider(&client, "acme/http", &want).await;
+    let readme = std::fs::read_to_string(target.join("README.md")).unwrap();
+    assert_eq!(readme, "hello from github origin\n");
+}
+
+/// Fails if the GitLab provider preset stops injecting
+/// `Authorization: Basic base64(oauth2:token)` into real upstream git fetches;
+/// the protected origin must accept the fetch before the byte-checked clone can
+/// succeed.
 #[tokio::test]
 async fn gitlab_provider_injects_basic_oauth2_auth_header() {
     init(false);
 
     let token = "gitlab-e2e-token";
-    let expected_auth = format!(
-        "Basic {}",
-        base64::engine::general_purpose::STANDARD.encode(format!("oauth2:{token}"))
-    );
+    let expected_auth = preset_provider_auth("gitlab", token);
     let origin = make_http_origin_with_auth("acme/http", &expected_auth);
     let want = origin.commit(&[("README.md", "hello from gitlab origin\n")], "c1");
     origin.publish();
@@ -125,13 +175,15 @@ async fn gitlab_provider_injects_basic_oauth2_auth_header() {
     assert_eq!(readme, "hello from gitlab origin\n");
 }
 
-/// Gitea-shaped provider injects `Authorization: token <token>`.
+/// Fails if the Gitea provider preset stops injecting
+/// `Authorization: token <token>` into real upstream git fetches; the protected
+/// origin must accept the fetch before the byte-checked clone can succeed.
 #[tokio::test]
 async fn gitea_provider_injects_token_auth_header() {
     init(false);
 
     let token = "gitea-e2e-token";
-    let expected_auth = format!("token {token}");
+    let expected_auth = preset_provider_auth("gitea", token);
     let origin = make_http_origin_with_auth("acme/http", &expected_auth);
     let want = origin.commit(&[("README.md", "hello from gitea origin\n")], "c1");
     origin.publish();
@@ -156,4 +208,82 @@ async fn gitea_provider_injects_token_auth_header() {
     let (_out, target) = clone_full_with_provider(&client, "acme/http", &want).await;
     let readme = std::fs::read_to_string(target.join("README.md")).unwrap();
     assert_eq!(readme, "hello from gitea origin\n");
+}
+
+/// Wrong or absent provider credentials must fail at the upstream boundary. This
+/// test would pass vacuously if it only checked route status: it asserts the
+/// protected origin rejects the fetch, so no cloneable bytes are published.
+#[tokio::test]
+async fn provider_upstream_rejects_wrong_or_absent_auth_headers() {
+    init(false);
+
+    for (provider_id, kind, good_token, configured_token) in [
+        (
+            "github-bad",
+            "github",
+            "github-good-token",
+            Some("github-wrong-token"),
+        ),
+        (
+            "gitlab-bad",
+            "gitlab",
+            "gitlab-good-token",
+            Some("gitlab-wrong-token"),
+        ),
+        (
+            "gitea-bad",
+            "gitea",
+            "gitea-good-token",
+            Some("gitea-wrong-token"),
+        ),
+        ("github-none", "github", "github-good-token", None),
+        ("gitlab-none", "gitlab", "gitlab-good-token", None),
+        ("gitea-none", "gitea", "gitea-good-token", None),
+    ] {
+        let origin = make_http_origin_with_auth(
+            &format!("acme/{provider_id}"),
+            &preset_provider_auth(kind, good_token),
+        );
+        origin.commit(&[("README.md", "should stay private\n")], "c1");
+        origin.publish();
+
+        let providers = serde_json::json!({
+            "providers": [{
+                "id": provider_id,
+                "kind": kind,
+                "host": &origin.url,
+                "token": configured_token,
+            }]
+        });
+        let providers_str = providers.to_string();
+        let server = start_server_env(&[("RIPCLONE_PROVIDERS", &providers_str)]).await;
+        let client = server.client_with_provider(provider_id, None);
+        let res = client.sync_repo(&format!("acme/{provider_id}"), None).await;
+        assert!(
+            res.is_err(),
+            "{provider_id} with wrong/absent auth must fail upstream, got {res:?}"
+        );
+        assert!(
+            origin.auth_reject_count() > 0,
+            "{provider_id} must reach the protected origin and receive a real 403"
+        );
+
+        let out = tempfile::tempdir().unwrap();
+        let target = out.path().join("clone");
+        let clone = client
+            .install_repo_with_mode_at(
+                &format!("acme/{provider_id}"),
+                "HEAD",
+                None,
+                &target,
+                CloneMode::Editable,
+                Some("full"),
+                None,
+            )
+            .await;
+        assert!(
+            clone.is_err(),
+            "{provider_id} must not publish cloneable bytes after upstream auth rejection"
+        );
+    }
 }

@@ -277,3 +277,81 @@ async fn fast_moving_single_branch_converges_and_stays_correct() {
     }
     assert_repo_usable(&c, &N.to_string());
 }
+
+/// Many callers sync and clone the same repo at once. All callers should
+/// coalesce onto one current build and materialize the same byte-correct commit,
+/// never a mixed old/new tree, corrupt object graph, or deadlock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn concurrent_same_repo_syncs_and_clones_under_load_get_current_bytes() {
+    // Fails if same-key sync coalescing drops waiters under load, if a clone sees
+    // a half-published ref while sync is still building, or if concurrent clones
+    // corrupt shared artifacts.
+    unsafe { std::env::set_var("RIPCLONE_BUILD_CONCURRENCY", "8") };
+    unsafe { std::env::set_var("RIPCLONE_MIRROR_FRESH_TTL_SECS", "0") };
+    setup(true);
+    let server = start_server().await;
+    let origin = make_origin("acme", "loadsame");
+    origin.commit(&[("f.txt", "v1\n")], "c1");
+    origin.publish();
+    server
+        .client()
+        .sync_repo("acme/loadsame", None)
+        .await
+        .expect("initial warm");
+
+    let want = origin.commit(
+        &[
+            ("f.txt", "v2\n"),
+            ("new.txt", "all callers should see this\n"),
+        ],
+        "c2",
+    );
+    origin.publish();
+
+    let mut handles = Vec::new();
+    for _ in 0..24 {
+        let client = server.client();
+        let want = want.clone();
+        handles.push(tokio::spawn(async move {
+            let mut last = String::new();
+            for _ in 0..80 {
+                let _ = client.sync_repo("acme/loadsame", None).await?;
+                let out = tempfile::tempdir().unwrap();
+                let target = out.path().join("clone");
+                client
+                    .install_repo_with_mode_at(
+                        "acme/loadsame",
+                        "HEAD",
+                        None,
+                        &target,
+                        CloneMode::Editable,
+                        Some("full"),
+                        None,
+                    )
+                    .await?;
+                if git_ok(&target, &["rev-parse", "--verify", "HEAD"]) {
+                    let commit = git(&target, &["rev-parse", "HEAD"]);
+                    last = commit.clone();
+                    if commit == want {
+                        return Ok::<_, anyhow::Error>((
+                            commit,
+                            read(&target, "f.txt"),
+                            read(&target, "new.txt"),
+                            git_ok(&target, &["fsck", "--connectivity-only", "HEAD"]),
+                        ));
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            anyhow::bail!("clone never reached current commit {want}; last={last}")
+        }));
+    }
+
+    for h in handles {
+        let (clone_commit, f, new, fsck) = h.await.expect("join").expect("worker");
+        assert_eq!(clone_commit, want, "clone resolves the current commit");
+        assert_eq!(f, "v2\n");
+        assert_eq!(new, "all callers should see this\n");
+        assert!(fsck, "clone object graph is complete");
+    }
+}
