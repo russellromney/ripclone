@@ -124,6 +124,24 @@ ripclone version            # CLI + server versions, with a compatibility verdic
 ripclone update             # check for a newer release
 ```
 
+### Uninstall
+
+The shell installer just copies binaries into `~/.local/bin` (or `RIPCLONE_BIN_DIR`); there is no uninstall command. Remove the binaries, and optionally the client config and any self-hosted server data:
+
+```sh
+# binaries (adjust the dir if you set RIPCLONE_BIN_DIR)
+rm -f ~/.local/bin/ripclone ~/.local/bin/ripclone-server \
+      ~/.local/bin/ripclone-worker ~/.local/bin/git-remote-ripclone
+
+# client config + saved login token
+rm -rf ~/.config/ripclone
+
+# self-hosted server cache + bare mirrors (only if you ran a server)
+rm -rf ~/.local/share/ripclone
+```
+
+`cargo install` users run `cargo uninstall ripclone`; `pip` users run `pip uninstall ripclone`.
+
 ## Quick start
 
 Build and run the server:
@@ -262,6 +280,16 @@ your git host with `--verify-upstream`. In `auto` mode (the default) this runs
 whenever an upstream credential is available or the repo is public; for
 credential-less private/agent flows it warns and skips, leaving the ripclone
 server in the trust base. `files`-mode clones are not verifiable this way.
+
+### Plain `git clone` through the helper
+
+The `git-remote-ripclone` binary lets stock `git` clone and fetch through a ripclone server with no wrapper — handy for CI steps and tools that shell out to `git`:
+
+```sh
+git clone ripclone://github/oven-sh/bun.git bun
+```
+
+It supports `--depth 1` (shallow) or a full clone; push goes to your git host via `pushInsteadOf`. See [`docs/REMOTE_HELPER.md`](docs/REMOTE_HELPER.md) for URL syntax, server resolution, and the push workaround.
 
 ## Providers
 
