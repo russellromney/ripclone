@@ -6998,6 +6998,58 @@ mod tests {
     }
 
     #[test]
+    fn build_error_classification_maps_storage_sources() {
+        let retryable = classify_build_error(&anyhow::Error::new(s3::Error::Api {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: None,
+            message: None,
+            request_id: None,
+            host_id: None,
+            body_snippet: None,
+        }));
+        assert!(retryable.is_retryable());
+
+        let retryable =
+            classify_build_error(&anyhow::Error::new(s3::Error::transport("network", None)));
+        assert!(retryable.is_retryable());
+
+        let permanent = classify_build_error(&anyhow::Error::new(s3::Error::Api {
+            status: StatusCode::NOT_FOUND,
+            code: None,
+            message: None,
+            request_id: None,
+            host_id: None,
+            body_snippet: None,
+        }));
+        assert!(!permanent.is_retryable());
+    }
+
+    #[test]
+    fn build_error_classification_maps_io_timeout_and_upstream_sources() {
+        let timeout = classify_build_error(&anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "timeout",
+        )));
+        assert!(timeout.is_retryable());
+
+        let malformed = classify_build_error(&anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "bad input",
+        )));
+        assert!(!malformed.is_retryable());
+
+        let upstream_429 = classify_build_error(&anyhow::Error::new(git::UpstreamGitError::new(
+            "fetch", true,
+        )));
+        assert!(upstream_429.is_retryable());
+
+        let upstream_not_found = classify_build_error(&anyhow::Error::new(
+            git::UpstreamGitError::new("fetch", false),
+        ));
+        assert!(!upstream_not_found.is_retryable());
+    }
+
+    #[test]
     fn archive_publish_uploads_download_bundles_and_reuse_frames() {
         let uploads = archive_publish_upload_hashes(
             "metadata",

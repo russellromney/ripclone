@@ -441,6 +441,10 @@ pub struct UpstreamGitError {
 }
 
 impl UpstreamGitError {
+    pub(crate) fn new(op: &'static str, retryable: bool) -> Self {
+        Self { op, retryable }
+    }
+
     pub fn is_retryable(&self) -> bool {
         self.retryable
     }
@@ -1253,10 +1257,10 @@ fn upstream_git_error(
     url: &str,
     auth_header: Option<(String, String)>,
 ) -> anyhow::Error {
-    anyhow::Error::new(UpstreamGitError {
+    anyhow::Error::new(UpstreamGitError::new(
         op,
-        retryable: upstream_failure_is_retryable(url, auth_header),
-    })
+        upstream_failure_is_retryable(url, auth_header),
+    ))
 }
 
 fn upstream_failure_is_retryable(url: &str, auth_header: Option<(String, String)>) -> bool {
@@ -1292,8 +1296,6 @@ fn upstream_failure_is_retryable(url: &str, auth_header: Option<(String, String)
             status == reqwest::StatusCode::TOO_MANY_REQUESTS
                 || status == reqwest::StatusCode::REQUEST_TIMEOUT
                 || status.is_server_error()
-                || status.is_success()
-                || status.is_redirection()
         }
         Err(e) => e.is_timeout() || e.is_connect(),
     }
@@ -1798,6 +1800,52 @@ pub(crate) static ORIGIN_BASE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new
 mod tests {
     use super::*;
     use rayon::scope;
+    use std::io::Read;
+
+    fn one_response_url(status: &str) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let status = status.to_string();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0; 1024];
+            let _ = stream.read(&mut buf);
+            write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+        });
+        format!("http://{addr}/repo.git")
+    }
+
+    #[test]
+    fn upstream_probe_retries_only_transient_http_statuses() {
+        for status in [
+            "408 Request Timeout",
+            "429 Too Many Requests",
+            "503 Service Unavailable",
+        ] {
+            assert!(
+                upstream_failure_is_retryable(&one_response_url(status), None),
+                "{status} should be retryable"
+            );
+        }
+
+        for status in [
+            "200 OK",
+            "302 Found",
+            "400 Bad Request",
+            "401 Unauthorized",
+            "403 Forbidden",
+            "404 Not Found",
+        ] {
+            assert!(
+                !upstream_failure_is_retryable(&one_response_url(status), None),
+                "{status} should be terminal"
+            );
+        }
+    }
 
     /// Auto-gc must be persisted off on the mirror, or a fetch could repack
     /// packs out from under a concurrent read.
