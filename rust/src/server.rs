@@ -7543,6 +7543,9 @@ mod tests {
                 commit: commit.to_string(),
                 synced_at: Some(synced_at),
                 generation: Some(generation),
+                // A genuinely complete build carries archive chunks; a build with
+                // an empty archive is treated as incomplete and is not reused.
+                archive_chunks: vec!["a".to_string()],
                 full_clonepack: crate::ClonepackArtifacts {
                     commit: commit.to_string(),
                     manifest: "m".to_string(),
