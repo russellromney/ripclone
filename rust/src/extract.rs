@@ -116,6 +116,16 @@ fn compute_chunks(frames: &[FrameInfo], chunk_size: u64) -> Vec<Chunk> {
     chunks
 }
 
+fn read_archive_manifest(manifest_path: &Path) -> Result<Manifest> {
+    let mut manifest_file = File::open(manifest_path)
+        .with_context(|| format!("open manifest {}", manifest_path.display()))?;
+    let mut manifest_bytes = Vec::new();
+    manifest_file
+        .read_to_end(&mut manifest_bytes)
+        .context("read manifest")?;
+    Manifest::read(&mut manifest_bytes.as_slice())
+}
+
 /// Extract a working-tree archive into `target_dir` using the supplied manifest
 /// and a local archive file.
 pub fn extract_archive(
@@ -171,376 +181,48 @@ pub fn extract_archive_with_chunk_fetcher<F>(
 where
     F: Fn(&Chunk) -> Result<Vec<u8>> + Send + Sync + 'static,
 {
-    let fetch_start = Instant::now();
-    let mut manifest_file = File::open(manifest_path)
-        .with_context(|| format!("open manifest {}", manifest_path.display()))?;
-    let mut manifest_bytes = Vec::new();
-    manifest_file
-        .read_to_end(&mut manifest_bytes)
-        .context("read manifest")?;
-    let manifest = Manifest::read(&mut manifest_bytes.as_slice())?;
-
-    // Validate every blob_sha1 length up front so downstream code can rely on
-    // a fixed 20-byte representation.
-    for entry in manifest.files.iter() {
-        blob_sha1_to_array(&entry.blob_sha1).with_context(|| {
-            format!(
-                "invalid blob_sha1 for {}",
-                String::from_utf8_lossy(&entry.path)
-            )
-        })?;
-    }
-
-    // Validate every path and create parent directories only when we are
-    // materializing the working tree. Lazy callers pass no target dir to build
-    // only a local blob pack.
-    if let Some(target_dir) = target_dir {
-        for entry in manifest.files.iter() {
-            validate_relative_path(path_from_bytes(&entry.path)).with_context(|| {
-                format!(
-                    "invalid manifest path: {}",
-                    String::from_utf8_lossy(&entry.path)
-                )
-            })?;
-        }
-        let dirs: HashSet<PathBuf> = manifest
-            .files
-            .iter()
-            .filter_map(|e| {
-                let p = path_from_bytes(&e.path);
-                let parent = p.parent()?;
-                if parent.as_os_str().is_empty() {
-                    return None;
-                }
-                Some(parent.to_path_buf())
-            })
-            .collect();
-        let mut dirs: Vec<_> = dirs.into_iter().collect();
-        dirs.sort();
-        for dir in dirs {
-            safe_create_dir_all(target_dir, &dir)
-                .with_context(|| format!("create dir {}", dir.display()))?;
-        }
-    }
-
-    let target_dir = target_dir.map(Path::to_path_buf);
-    let manifest = Arc::new(manifest);
-
-    // Group fragments by frame so each writer thread can write every file
-    // slice that belongs to a given decompressed frame.
-    let fragments_by_frame = Arc::new(manifest.fragments_by_frame());
-
-    // Files split across multiple frames need all fragments assembled before
-    // writing. Most files are single-fragment, so this map is small.
-    let mut pending_files: HashMap<usize, PendingFile> = HashMap::new();
-    for (file_idx, entry) in manifest.files.iter().enumerate() {
-        if entry.fragments.len() > 1 {
-            pending_files.insert(
-                file_idx,
-                PendingFile {
-                    fragments: vec![None; entry.fragments.len()],
-                    remaining: entry.fragments.len(),
-                },
-            );
-        }
-    }
-    let pending_files = Arc::new(Mutex::new(pending_files));
-
+    let manifest = read_archive_manifest(manifest_path)?;
     let chunks = compute_chunks(&manifest.frames, chunk_size);
-
+    let chunk_map: HashMap<usize, Chunk> = chunks.iter().cloned().enumerate().collect();
     let (fetch_threads, write_threads) = archive_thread_counts();
-    // Use a small bounded queue so we don't buffer the whole archive in memory.
     let queue_depth = (fetch_threads * 2).max(write_threads * 2);
-    info!(
-        "extracting {} files across {} frames in {} chunks (fetch_threads={}, write_threads={}, queue_depth={})",
-        manifest.files.len(),
-        manifest.frames.len(),
-        chunks.len(),
-        fetch_threads,
-        write_threads,
-        queue_depth
-    );
-
-    let (job_tx, job_rx): (Sender<Chunk>, Receiver<Chunk>) = bounded(queue_depth);
-    let (compressed_tx, compressed_rx): (
-        Sender<(usize, Result<bytes::Bytes>)>,
-        Receiver<(usize, Result<bytes::Bytes>)>,
-    ) = bounded(queue_depth);
-    let (done_tx, done_rx): (
-        Sender<Result<ArchiveFrameWriteResult>>,
-        Receiver<Result<ArchiveFrameWriteResult>>,
-    ) = bounded(manifest.frames.len());
-
+    let (job_tx, job_rx): (Sender<(usize, Chunk)>, Receiver<(usize, Chunk)>) = bounded(queue_depth);
+    let (chunk_tx, chunk_rx) = bounded(queue_depth);
     let fetcher = Arc::new(fetch_chunk);
-    let dictionary = dictionary.map(|d| Arc::new(d.to_vec()));
 
-    // Spawn fetcher threads: they pull chunk jobs, fetch the byte range, slice
-    // it into per-frame compressed buffers, and push those to the writer pool.
     for _ in 0..fetch_threads {
         let fetcher = fetcher.clone();
-        let job_rx: Receiver<Chunk> = job_rx.clone();
-        let compressed_tx: Sender<(usize, Result<bytes::Bytes>)> = compressed_tx.clone();
-        let manifest2 = manifest.clone();
+        let job_rx = job_rx.clone();
+        let chunk_tx = chunk_tx.clone();
         std::thread::spawn(move || {
-            while let Ok(chunk) = job_rx.recv() {
-                let chunk_bytes: Result<Vec<u8>> = fetcher(&chunk).with_context(|| {
+            while let Ok((idx, chunk)) = job_rx.recv() {
+                let res = fetcher(&chunk).map(bytes::Bytes::from).with_context(|| {
                     format!("fetch chunk bytes={}-{}", chunk.byte_start, chunk.byte_end)
                 });
-                match chunk_bytes {
-                    Ok(bytes) => {
-                        let bytes = bytes::Bytes::from(bytes);
-                        for idx in chunk.start_frame..chunk.end_frame {
-                            let frame = &manifest2.frames[idx];
-                            // A corrupted manifest can put chunk_offset below the
-                            // chunk's start or past its end; use checked math so we
-                            // return an error instead of panicking on underflow.
-                            let res = match frame
-                                .chunk_offset
-                                .checked_sub(chunk.byte_start)
-                                .and_then(|off| {
-                                    Some((off, off.checked_add(frame.compressed_len as u64)?))
-                                }) {
-                                Some((off, end)) if end <= bytes.len() as u64 => {
-                                    let off = off as usize;
-                                    Ok(bytes.slice(off..off + frame.compressed_len as usize))
-                                }
-                                _ => Err(anyhow::anyhow!(
-                                    "frame {} (offset={} len={}) out of chunk bounds (start={} len={})",
-                                    idx,
-                                    frame.chunk_offset,
-                                    frame.compressed_len,
-                                    chunk.byte_start,
-                                    bytes.len()
-                                )),
-                            };
-                            if compressed_tx.send((idx, res)).is_err() {
-                                break;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        for idx in chunk.start_frame..chunk.end_frame {
-                            if compressed_tx
-                                .send((idx, Err(anyhow::anyhow!("chunk fetch failed: {}", e))))
-                                .is_err()
-                            {
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        });
-    }
-    drop(job_rx);
-    drop(compressed_tx);
-
-    // Spawn writer threads: they decompress frames and write files.
-    for _ in 0..write_threads {
-        let compressed_rx: Receiver<(usize, Result<bytes::Bytes>)> = compressed_rx.clone();
-        let done_tx: Sender<Result<ArchiveFrameWriteResult>> = done_tx.clone();
-        let manifest2 = manifest.clone();
-        let fragments_by_frame2 = fragments_by_frame.clone();
-        let pending_files2 = pending_files.clone();
-        let target_dir2 = target_dir.clone();
-        let dictionary2 = dictionary.clone();
-        std::thread::spawn(move || {
-            let writer = target_dir2.as_ref().map(|_| WorktreeWriter::new());
-            while let Ok((idx, res)) = compressed_rx.recv() {
-                let result: Result<ArchiveFrameWriteResult> = (|| {
-                    let writer = match writer.as_ref() {
-                        Some(Ok(writer)) => Some(writer),
-                        Some(Err(e)) => anyhow::bail!("create worktree writer: {e:#}"),
-                        None => None,
-                    };
-                    let compressed = res?;
-                    let frame = &manifest2.frames[idx];
-                    let raw = Arc::new(decompress_frame_recorded(
-                        compressed.as_ref(),
-                        frame,
-                        dictionary2.as_deref().map(|d| d.as_slice()),
-                        idx,
-                    )?);
-                    if raw.len() != frame.raw_len as usize {
-                        anyhow::bail!(
-                            "frame {} raw length mismatch: {} vs {}",
-                            idx,
-                            raw.len(),
-                            frame.raw_len
-                        );
-                    }
-
-                    // R2: borrow the frame's fragment-pair list from the shared
-                    // map instead of cloning it per frame (the loop only reads it).
-                    let empty = Vec::new();
-                    let pairs = fragments_by_frame2.get(&(idx as u32)).unwrap_or(&empty);
-                    let mut written = 0usize;
-                    let mut stats = Vec::new();
-                    let mut pending_writes: Vec<OwnedFileWrite> =
-                        Vec::with_capacity(PACK_WRITE_BATCH_FILES);
-                    for (file_idx, frag_idx) in pairs {
-                        let entry = &manifest2.files[*file_idx];
-                        let fragment = &entry.fragments[*frag_idx];
-                        let off = fragment.frame_offset as usize;
-                        let len = fragment.raw_len as usize;
-                        if off + len > raw.len() {
-                            anyhow::bail!(
-                                "fragment for {} extends past frame {}",
-                                String::from_utf8_lossy(&entry.path),
-                                idx
-                            );
-                        }
-                        let content = &raw[off..off + len];
-
-                        if entry.fragments.len() == 1 {
-                            let hash = sha1_digest_recorded(content);
-                            if hash.as_slice() != entry.blob_sha1 {
-                                anyhow::bail!(
-                                    "sha1 mismatch for {}",
-                                    String::from_utf8_lossy(&entry.path)
-                                );
-                            }
-                            if let Some((target_dir, writer)) = target_dir2.as_ref().zip(writer) {
-                                pending_writes.push(OwnedFileWrite {
-                                    entry: entry.clone(),
-                                    content: FileWriteContent::shared(Arc::clone(&raw), off, len),
-                                });
-                                if pending_writes.len() >= PACK_WRITE_BATCH_FILES {
-                                    let outcome = flush_archive_writes(
-                                        writer,
-                                        target_dir,
-                                        &mut pending_writes,
-                                    )?;
-                                    written += outcome.written;
-                                    stats.extend(outcome.stats);
-                                }
-                            }
-                        } else {
-                            let mut guard = pending_files2.lock().unwrap();
-                            let pending = guard.get_mut(file_idx).ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "missing pending state for {}",
-                                    String::from_utf8_lossy(&entry.path)
-                                )
-                            })?;
-                            pending.fragments[*frag_idx] = Some(FileSlice {
-                                data: Arc::clone(&raw),
-                                offset: off,
-                                len,
-                            });
-                            pending.remaining -= 1;
-                            if pending.remaining == 0 {
-                                let pending = guard.remove(file_idx).expect("pending file missing");
-                                drop(guard);
-                                let fragments: Vec<FileSlice> = pending
-                                    .fragments
-                                    .into_iter()
-                                    .map(|frag| frag.expect("fragment missing"))
-                                    .collect();
-                                let hash = sha1_digest_fragments_recorded(&fragments);
-                                if hash.as_slice() != entry.blob_sha1 {
-                                    anyhow::bail!(
-                                        "sha1 mismatch for {}",
-                                        String::from_utf8_lossy(&entry.path)
-                                    );
-                                }
-                                if let Some((target_dir, writer)) = target_dir2.as_ref().zip(writer)
-                                {
-                                    pending_writes.push(OwnedFileWrite {
-                                        entry: entry.clone(),
-                                        content: FileWriteContent::Fragments(fragments),
-                                    });
-                                    if pending_writes.len() >= PACK_WRITE_BATCH_FILES {
-                                        let outcome = flush_archive_writes(
-                                            writer,
-                                            target_dir,
-                                            &mut pending_writes,
-                                        )?;
-                                        written += outcome.written;
-                                        stats.extend(outcome.stats);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    if let Some((target_dir, writer)) = target_dir2.as_ref().zip(writer) {
-                        let outcome =
-                            flush_archive_writes(writer, target_dir, &mut pending_writes)?;
-                        written += outcome.written;
-                        stats.extend(outcome.stats);
-                    }
-                    Ok(ArchiveFrameWriteResult { written, stats })
-                })();
-                if done_tx.send(result).is_err() {
+                if chunk_tx.send((idx, res)).is_err() {
                     break;
                 }
             }
         });
     }
-    drop(compressed_rx);
-    drop(done_tx);
+    drop(job_rx);
+    drop(chunk_tx);
 
-    // Enqueue all chunk jobs.
-    for chunk in &chunks {
-        job_tx.send(chunk.clone()).context("send chunk fetch job")?;
-    }
-    drop(job_tx);
-
-    // Collect results from all writers.
-    let mut files_written = 0usize;
-    let mut stat_cache = Vec::new();
-    let mut error: Option<anyhow::Error> = None;
-    for _ in 0..manifest.frames.len() {
-        match done_rx.recv() {
-            Ok(Ok(result)) => {
-                files_written += result.written;
-                stat_cache.extend(result.stats);
-            }
-            Ok(Err(e)) => error = Some(e),
-            Err(_) => {
-                error = Some(anyhow::anyhow!("writer thread disappeared"));
+    std::thread::spawn(move || {
+        for (idx, chunk) in chunks.into_iter().enumerate() {
+            if job_tx.send((idx, chunk)).is_err() {
                 break;
             }
         }
-    }
-    let expected_files = if target_dir.is_some() {
-        manifest.files.len()
-    } else {
-        0
-    };
-    if files_written != expected_files && error.is_none() {
-        error = Some(anyhow::anyhow!(
-            "extractor wrote {} files but expected {}; frames={}",
-            files_written,
-            expected_files,
-            manifest.frames.len()
-        ));
-    }
+    });
 
-    if error.is_none() {
-        info!(
-            "fetched/decompressed/wrote {} frames ({} chunks) and {} files in {:?} ({} fetchers, {} writers, chunk_size={})",
-            manifest.frames.len(),
-            chunks.len(),
-            files_written,
-            fetch_start.elapsed(),
-            fetch_threads,
-            write_threads,
-            chunk_size,
-        );
-    }
-
-    let raw_total: u64 = manifest.files.iter().map(|e| e.total_len()).sum();
-
-    if let Some(e) = error {
-        return Err(e);
-    }
-
-    Ok(ExtractStats {
-        files: files_written,
-        raw_bytes: raw_total,
-        stats: stat_cache,
-    })
+    extract_archive_from_chunk_receiver_with_chunks(
+        manifest_path,
+        target_dir,
+        dictionary,
+        chunk_rx,
+        chunk_map,
+    )
 }
 
 /// `WriteOptions` shared by every archive regular-file write.
@@ -649,6 +331,27 @@ pub fn extract_archive_from_chunk_receiver(
     dictionary: Option<&[u8]>,
     chunk_rx: Receiver<(usize, Result<bytes::Bytes>)>,
 ) -> Result<ExtractStats> {
+    let manifest = read_archive_manifest(manifest_path)?;
+    let chunks_by_index: HashMap<usize, Chunk> = compute_chunks(&manifest.frames, u64::MAX)
+        .into_iter()
+        .map(|chunk| (chunk.chunk_index, chunk))
+        .collect();
+    extract_archive_from_chunk_receiver_with_chunks(
+        manifest_path,
+        target_dir,
+        dictionary,
+        chunk_rx,
+        chunks_by_index,
+    )
+}
+
+fn extract_archive_from_chunk_receiver_with_chunks(
+    manifest_path: &Path,
+    target_dir: Option<&Path>,
+    dictionary: Option<&[u8]>,
+    chunk_rx: Receiver<(usize, Result<bytes::Bytes>)>,
+    chunks_by_index: HashMap<usize, Chunk>,
+) -> Result<ExtractStats> {
     let fetch_start = Instant::now();
 
     let mut manifest_file = File::open(manifest_path)
@@ -721,23 +424,19 @@ pub fn extract_archive_from_chunk_receiver(
     }
     let pending_files = Arc::new(Mutex::new(pending_files));
 
-    let chunks = compute_chunks(&manifest.frames, u64::MAX);
-
     let (fetch_threads, write_threads) = archive_thread_counts();
     let queue_depth = (fetch_threads * 2).max(write_threads * 2);
+    let chunk_count = chunks_by_index.len();
 
     info!(
         "extracting {} files across {} frames in {} archive chunks (fetch_threads={}, write_threads={}, queue_depth={})",
         manifest.files.len(),
         manifest.frames.len(),
-        chunks.len(),
+        chunk_count,
         fetch_threads,
         write_threads,
         queue_depth
     );
-
-    let chunks_by_index: HashMap<usize, Chunk> =
-        chunks.into_iter().map(|c| (c.chunk_index, c)).collect();
 
     let (compressed_tx, compressed_rx): (
         Sender<(usize, Result<bytes::Bytes>)>,
