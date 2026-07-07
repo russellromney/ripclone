@@ -751,21 +751,38 @@ pub async fn clone_only_at(
     mode: ripclone::mode::CloneMode,
 ) -> anyhow::Result<(TempDir, std::path::PathBuf)> {
     let client = server.client();
+    let repo_path = format!("{owner}/{repo}");
+    ensure_added(server, &repo_path).await?;
     let out = tempfile::tempdir().unwrap();
     let target = out.path().join("clone");
     let kind = ripclone::mode::clonepack_kind_for_depth(depth);
     client
-        .install_repo_with_mode_at(
-            &format!("{owner}/{repo}"),
-            "HEAD",
-            rev,
-            &target,
-            mode,
-            Some(kind),
-            None,
-        )
+        .install_repo_with_mode_at(&repo_path, "HEAD", rev, &target, mode, Some(kind), None)
         .await?;
     Ok((out, target))
+}
+
+pub async fn ensure_added(server: &Server, repo: &str) -> anyhow::Result<()> {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+
+    static ADDED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let key = format!("{} {repo}", server.url);
+    if ADDED
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap()
+        .contains(&key)
+    {
+        return Ok(());
+    }
+    server.client().add_repo(repo).await?;
+    ADDED
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap()
+        .insert(key);
+    Ok(())
 }
 
 /// Read a file from a clone (panics if missing).
@@ -927,6 +944,9 @@ pub async fn lifecycle_battery(server: &Server, origin: &Origin) {
     origin.commit(&[("a.txt", "1\n")], "c1");
     origin.commit(&[("a.txt", "2\n"), ("dir/b.txt", "B\n")], "c2");
     origin.publish();
+    ensure_added(server, &format!("{o}/{r}"))
+        .await
+        .expect("add lifecycle repo");
     client
         .sync_repo(&format!("{o}/{r}"), None)
         .await
@@ -1005,6 +1025,9 @@ pub async fn sync_and_clone(
     mode: ripclone::mode::CloneMode,
 ) -> (TempDir, PathBuf) {
     let client = server.client();
+    ensure_added(server, &format!("{}/{}", origin.owner, origin.repo))
+        .await
+        .expect("add before sync_and_clone");
     client
         .sync_repo(&format!("{}/{}", origin.owner, origin.repo), None)
         .await
@@ -1062,6 +1085,9 @@ pub async fn sync_until_manifest(
     repo: &str,
 ) -> ripclone::client::RefResponse {
     let client = server.client();
+    ensure_added(server, &format!("{owner}/{repo}"))
+        .await
+        .expect("add before sync_until_manifest");
     let mut last = String::from("<no successful sync>");
     for _ in 0..160 {
         match client.sync_repo(&format!("{owner}/{repo}"), None).await {
@@ -1133,21 +1159,13 @@ pub fn spawn_worker(cas_dir: &Path, repo_root: &Path) -> WorkerProc {
     WorkerProc(child)
 }
 
-/// Shared B5 seam for "make this repo warm/cloneable".
-///
-/// Today that means `sync`, then polling the requested clonepack kind until it
-/// resolves. When add/sync split lands, this is the helper future tests should
-/// change instead of duplicating setup in every e2e.
+/// Shared setup seam for "make this repo warm/cloneable".
 pub async fn warm_repo_until_cloneable(
     server: &Server,
     repo: &str,
     clonepack_kind: Option<&str>,
 ) -> ripclone::client::RefResponse {
-    server
-        .client()
-        .sync_repo(repo, None)
-        .await
-        .expect("warm repo");
+    ensure_added(server, repo).await.expect("warm repo");
     wait_repo_cloneable(server, repo, clonepack_kind).await
 }
 
