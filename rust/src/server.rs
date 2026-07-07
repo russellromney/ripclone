@@ -6876,6 +6876,72 @@ mod tests {
     use super::*;
     use tower::util::ServiceExt;
 
+    // Classification must be TYPE-based (downcast at the do_sync error boundary),
+    // not string-matching. These pin the concrete-source → retryable mapping; a
+    // regression to message-matching or a mis-mapped source flips a case.
+
+    #[test]
+    fn classify_s3_transport_error_is_retryable() {
+        // A Tigris network blip surfaces as `s3::Error::Transport`. If the type
+        // is lost (e.g. stringified in collect_stream) this falls through to
+        // permanent — the stale-until-repush bug.
+        let e = anyhow::Error::new(s3::Error::Transport {
+            message: "connection reset".into(),
+            source: None,
+        })
+        .context("S3 get_object");
+        assert!(classify_build_error(&e).is_retryable());
+    }
+
+    #[test]
+    fn classify_s3_5xx_is_retryable_and_config_is_permanent() {
+        let five_xx = anyhow::Error::new(s3::Error::Api {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: None,
+            message: None,
+            request_id: None,
+            host_id: None,
+            body_snippet: None,
+        });
+        assert!(classify_build_error(&five_xx).is_retryable());
+
+        let bad_config = anyhow::Error::new(s3::Error::InvalidConfig {
+            message: "bad bucket".into(),
+        });
+        assert!(!classify_build_error(&bad_config).is_retryable());
+    }
+
+    #[test]
+    fn classify_s3_404_is_permanent() {
+        let not_found = anyhow::Error::new(s3::Error::Api {
+            status: StatusCode::NOT_FOUND,
+            code: None,
+            message: None,
+            request_id: None,
+            host_id: None,
+            body_snippet: None,
+        });
+        assert!(!classify_build_error(&not_found).is_retryable());
+    }
+
+    #[test]
+    fn classify_retryable_io_error_is_retryable() {
+        let e = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::ConnectionReset))
+            .context("upload chunk");
+        assert!(classify_build_error(&e).is_retryable());
+    }
+
+    #[test]
+    fn classify_unknown_error_is_permanent() {
+        // No recognized transient source in the chain → permanent, so a genuine
+        // bad-repo/malformed failure fails fast instead of burning the cap.
+        let e = anyhow::anyhow!("malformed pack index");
+        assert!(!classify_build_error(&e).is_retryable());
+
+        let not_found_io = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::NotFound));
+        assert!(!classify_build_error(&not_found_io).is_retryable());
+    }
+
     fn test_state(tmp: &tempfile::TempDir) -> ServerState {
         let cas_root = tmp.path().join("cas");
         let cas = Cas::new(&cas_root).unwrap();
