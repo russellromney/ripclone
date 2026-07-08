@@ -130,6 +130,18 @@ stop_server_local() {
   [ -n "$SERVER_PID" ] && { kill "$SERVER_PID" 2>/dev/null || true; wait "$SERVER_PID" 2>/dev/null || true; SERVER_PID=""; }
 }
 
+# The server refuses to sync, serve refs for, or clone a repo that was never
+# added: it answers 404 with {"code":"repo_not_added"}. `add` is idempotent, so
+# re-adding is harmless.
+#
+# On a fresh local server `add` also performs the initial build, which is the
+# build the cold run scrapes its sync-bench line from; the `sync` that follows
+# lands on the mirror it left behind.
+add_repo_local() {
+  local server_url="$1" repo="$2"
+  "$RIPCLONE" --server "$server_url" add "$repo" >/dev/null
+}
+
 wait_for_full_build() {
   local server_url="$1" repo="$2" rev="${3:-}" branch="${4:-}" timeout="${5:-$WAIT_TIMEOUT}"
   local start end probe_dir
@@ -286,11 +298,18 @@ run_cold_local() {
     mkdir -p "$cas_dir" "$repo_root"
     port=$(( 20000 + RANDOM % 40000 ))
     url=$(start_server_local "$cas_dir" "$repo_root" "$port")
+    # `add` is what performs the initial cold fetch+build under the added-repos
+    # model. setup_local_origin points the origin's `main` at BENCH_REF, so this
+    # first build IS the cold build of BENCH_REF and emits the cold sync-bench
+    # line. The `sync --at BENCH_REF` that follows lands on the warm mirror; its
+    # line is discarded below (head -n 1 keeps only the cold one, and keeps
+    # cold-$run.json a single JSON object for stage_values' json.load).
+    add_repo_local "$url" "$REPO"
     echo "  syncing $REPO at $BENCH_REF ..." >&2
     "$RIPCLONE" --server "$url" sync "$REPO" --at "$BENCH_REF" >/dev/null
     wait_for_full_build "$url" "$REPO" "$BENCH_REF"
     stop_server_local
-    parse_sync_bench "$cas_dir/server.log" > "$BASE_DIR/cold-$run.json"
+    parse_sync_bench "$cas_dir/server.log" | head -n 1 > "$BASE_DIR/cold-$run.json"
   done
 }
 
@@ -307,6 +326,7 @@ run_incremental_local() {
     url=$(RIPCLONE_ORIGIN_BASE="file://$ORIGIN_ROOT" RIPCLONE_TRUST_GATEWAY=1 \
       start_server_local "$cas_dir" "$repo_root" "$port")
 
+    add_repo_local "$url" "$REPO"
     echo "  warm-up sync ..." >&2
     "$RIPCLONE" --server "$url" sync "$REPO" >/dev/null
     wait_for_full_build "$url" "$REPO"
@@ -351,6 +371,47 @@ sync_url() {
     url="${url}${sep}rev=${rev}"
   fi
   printf '%s\n' "$url"
+}
+
+# Add a repo exactly once, before its state is wiped. The added-repos record
+# lives under a different S3 prefix than the keys wipe_remote_repo_state clears,
+# so it survives the wipe and the cold sync that follows is still cold. Calling
+# add after the wipe would let add's own initial build do the cold work and turn
+# the measured sync into a warm one.
+#
+# Waits for 200 so add's build cannot race the wipe. Servers predating the
+# added-repos model have no /add route and answer a plain 404; that is not an
+# error, they need no add.
+REMOTE_ADDED=""
+ensure_remote_added() {
+  local repo="$1"
+  case " $REMOTE_ADDED " in *" $repo "*) return 0 ;; esac
+  local url out status attempt max_attempts=240
+  url="${RIPCLONE_URL%/}/v1/repos/github/${repo}/add?source=api"
+  out="$BASE_DIR/add-${repo//\//_}.response.json"
+  for attempt in $(seq 1 "$max_attempts"); do
+    status=$(post_sync_once "$url" "$out")
+    case "$status" in
+      200|201|204)
+        echo "  repo $repo is added" >&2
+        REMOTE_ADDED="$REMOTE_ADDED $repo"; return 0 ;;
+      202|503)
+        echo "  add attempt $attempt returned $status, retrying ..." >&2
+        sleep 2 ;;
+      404|405)
+        if grep -q 'unknown provider' "$out" 2>/dev/null; then
+          echo "error: add returned HTTP $status" >&2; cat "$out" >&2; return 1
+        fi
+        echo "  server has no /add route (pre-added-repos build); continuing" >&2
+        REMOTE_ADDED="$REMOTE_ADDED $repo"; return 0 ;;
+      *)
+        echo "error: add returned HTTP $status" >&2
+        cat "$out" >&2
+        return 1 ;;
+    esac
+  done
+  echo "error: add did not complete" >&2
+  return 1
 }
 
 post_sync() {
@@ -498,6 +559,7 @@ setup_fork_origin() {
 
 run_cold_remote() {
   local run response bench
+  ensure_remote_added "$REPO"
   for ((run = 1; run <= COLD_RUNS; run++)); do
     echo "--- cold run $run ---" >&2
     wipe_remote_repo_state "$REPO"
@@ -518,6 +580,7 @@ run_cold_remote() {
 run_incremental_remote() {
   local fork_repo run response bench w new_commit
   fork_repo=$(setup_fork_origin)
+  ensure_remote_added "$fork_repo"
   wipe_remote_repo_state "$fork_repo"
 
   w="$WORK/$NAME"

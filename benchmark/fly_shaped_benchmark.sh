@@ -44,6 +44,19 @@ median() {
   sort -n | awk '{a[NR]=$1} END{print (NR%2)?a[(NR+1)/2]:int((a[NR/2]+a[NR/2+1])/2)}'
 }
 
+sha256_hex() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum | awk '{print $1}'
+  else shasum -a 256 | awk '{print $1}'; fi
+}
+
+auth_header() {
+  printf 'Authorization: Ripclone %s' \
+    "$(printf '%s' "$RIPCLONE_SERVER_TOKEN" | sha256_hex)"
+}
+
+repo_owner() { echo "$REPO" | cut -d/ -f1; }
+repo_name()  { echo "$REPO" | cut -d/ -f2; }
+
 # ---------------------------------------------------------------------------
 # Server warm-up / keep-alive
 # ---------------------------------------------------------------------------
@@ -71,12 +84,57 @@ keepalive_server() {
   done
 }
 
+# A repo must be `add`ed before the server will serve `/refs`, `/sync` or a
+# clone for it; otherwise every request answers 404 with {"code":"repo_not_added"}.
+# `add` is idempotent (it overwrites the added-repos record), so re-running the
+# benchmark against an already-added repo is fine. Servers predating the
+# added-repos model have no `/add` route and answer a plain 404 "not found" —
+# treat that as "nothing to add" so the harness keeps working against them.
+#
+# Memoized: `add` triggers an initial build, so it must not be re-POSTed from
+# inside a poll loop. All progress goes to stderr because the callers downstream
+# of this run inside command substitutions that capture stdout.
+REPO_ADDED=0
+ensure_repo_added() {
+  if [ "$REPO_ADDED" = "1" ]; then return 0; fi
+  local url status body tmp attempt
+  url="${SERVER_URL%/}/v1/repos/$PROVIDER/$(repo_owner)/$(repo_name)/add?source=api"
+  tmp="$(mktemp)"
+  for attempt in $(seq 1 5); do
+    status=$(curl -s -o "$tmp" -w '%{http_code}' -X POST -H "$(auth_header)" "$url" || echo 000)
+    case "$status" in
+      200|201|204)
+        echo "  repo $REPO is added" >&2
+        REPO_ADDED=1; rm -f "$tmp"; return 0 ;;
+      202|503)
+        # The added-repos record is written before the initial build is queued,
+        # so the gate is already satisfied; warm_server waits for artifacts.
+        echo "  repo $REPO added; initial build in progress (HTTP $status)" >&2
+        REPO_ADDED=1; rm -f "$tmp"; return 0 ;;
+      404|405)
+        body="$(cat "$tmp")"
+        if printf '%s' "$body" | grep -q 'unknown provider'; then
+          echo "error: unknown provider '$PROVIDER' for $REPO" >&2
+          rm -f "$tmp"; return 1
+        fi
+        echo "  server has no /add route (pre-added-repos build); continuing" >&2
+        REPO_ADDED=1; rm -f "$tmp"; return 0 ;;
+      000)
+        echo "  add attempt $attempt: no response from $SERVER_URL, retrying ..." >&2
+        sleep 2 ;;
+      *)
+        echo "error: add returned HTTP $status" >&2
+        cat "$tmp" >&2
+        rm -f "$tmp"; return 1 ;;
+    esac
+  done
+  echo "error: add did not complete after 5 attempts" >&2
+  rm -f "$tmp"
+  return 1
+}
+
 get_default_branch() {
-  local owner name auth_hash
-  owner=$(echo "$REPO" | cut -d/ -f1)
-  name=$(echo "$REPO" | cut -d/ -f2)
-  auth_hash=$(printf '%s' "$RIPCLONE_SERVER_TOKEN" | shasum -a 256 | awk '{print $1}')
-  curl -fsS -H "Authorization: Ripclone $auth_hash" "${SERVER_URL%/}/v1/repos/$PROVIDER/$owner/$name/refs/HEAD" 2>/dev/null \
+  curl -fsS -H "$(auth_header)" "${SERVER_URL%/}/v1/repos/$PROVIDER/$(repo_owner)/$(repo_name)/refs/HEAD" 2>/dev/null \
     | python3 -c 'import sys,json; print(json.load(sys.stdin).get("default_branch","HEAD"))'
 }
 
@@ -85,11 +143,7 @@ head_ref_json() {
   # The server path already includes /refs/, so strip a leading "refs/" from
   # the caller's branch name (e.g. "refs/tags/v2.2.2" -> "tags/v2.2.2").
   branch="${branch#refs/}"
-  local owner name auth_hash
-  owner=$(echo "$REPO" | cut -d/ -f1)
-  name=$(echo "$REPO" | cut -d/ -f2)
-  auth_hash=$(printf '%s' "$RIPCLONE_SERVER_TOKEN" | shasum -a 256 | awk '{print $1}')
-  curl -fsS -H "Authorization: Ripclone $auth_hash" "${SERVER_URL%/}/v1/repos/$PROVIDER/$owner/$name/refs/$branch" 2>/dev/null
+  curl -fsS -H "$(auth_header)" "${SERVER_URL%/}/v1/repos/$PROVIDER/$(repo_owner)/$(repo_name)/refs/$branch" 2>/dev/null
 }
 
 probe_full_clone() {
@@ -137,9 +191,12 @@ wait_for_ref_ready() {
     local out commit ready
     out=$(head_ref_json "$branch")
     commit=$(echo "$out" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("commit",""))')
-    # A full editable clone is ready when the server has either a single full_pack
-    # (legacy) or pack_chunk_urls/idx_bundle_url (LSM-style full history).
-    ready=$(echo "$out" | python3 -c 'import sys,json; d=json.load(sys.stdin); print("1" if (d.get("full_pack") or d.get("pack_chunk_urls") or d.get("idx_bundle_url")) else "")')
+    # A full editable clone is ready when the server advertises full-history
+    # artifacts for the tip. Field names have drifted across server versions, so
+    # accept any of them: full_pack (legacy single pack), pack_chunk_urls /
+    # idx_bundle_url (older LSM full history), or clonepack_manifest with
+    # archive_ready (current). Empty strings count as absent.
+    ready=$(echo "$out" | python3 -c 'import sys,json; d=json.load(sys.stdin); print("1" if (d.get("full_pack") or d.get("pack_chunk_urls") or d.get("idx_bundle_url") or (d.get("clonepack_manifest") and d.get("archive_ready"))) else "")')
     if [ -n "$commit" ] && [ -n "$ready" ]; then
       echo "  artifacts ready for $commit" >&2
       echo "$commit"
@@ -156,10 +213,10 @@ wait_for_ref_ready() {
 }
 
 warm_server() {
-  local owner name auth_hash branch_or_ref
-  owner=$(echo "$REPO" | cut -d/ -f1)
-  name=$(echo "$REPO" | cut -d/ -f2)
-  auth_hash=$(printf '%s' "$RIPCLONE_SERVER_TOKEN" | shasum -a 256 | awk '{print $1}')
+  local owner name branch_or_ref
+  ensure_repo_added
+  owner=$(repo_owner)
+  name=$(repo_name)
   branch_or_ref="${BENCH_REF:-$(get_default_branch)}"
 
   # CLONE_REF is the branch/tag name passed to `ripclone clone --branch`.
@@ -193,13 +250,13 @@ warm_server() {
     AT_REF="$REF"
     echo "  using pinned commit $REF"
     curl -fsS -X POST \
-      -H "Authorization: Ripclone $auth_hash" \
+      -H "$(auth_header)" \
       "${SERVER_URL%/}/v1/repos/$PROVIDER/$owner/$name/sync?rev=$REF" >/dev/null 2>&1
     wait_for_artifacts
   else
     echo "  warming server mirror for $REPO @ $branch_or_ref ..."
     curl -fsS -X POST \
-      -H "Authorization: Ripclone $auth_hash" \
+      -H "$(auth_header)" \
       "${SERVER_URL%/}/v1/repos/$PROVIDER/$owner/$name/sync?branch=$branch_or_ref" >/dev/null 2>&1
     REF=$(wait_for_ref_ready "$branch_or_ref")
     CLONE_REF="$branch_or_ref"
@@ -335,6 +392,10 @@ cleanup() {
   wait "$KEEPALIVE_PID" 2>/dev/null || true
 }
 trap cleanup EXIT
+
+# The repo has to be added before the server will answer /refs, /sync or a clone
+# for it. Do it up front, before the first ref lookup below.
+ensure_repo_added
 
 # Ensure REF is always set (needed when SKIP_SYNC=1 skips warm_server).
 REF="${REF:-$(get_default_branch)}"

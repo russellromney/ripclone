@@ -68,6 +68,18 @@ databases() {
 # Run the S3-backed remote GC end-to-end suite against a local MinIO container
 # (or any S3-compatible store pointed at by RIPCLONE_S3_ENDPOINT). This is the
 # only place these #[ignored] tests are executed in CI.
+# Benchmark-harness smoke test. The benchmark scripts talk to the server over
+# raw HTTP, so a change to the server's contract (like the B5 added-repos gate)
+# does not recompile them — it silently breaks the harness against the next
+# deploy. This runs the real benchmark/fly_shaped_benchmark.sh end-to-end against
+# a local debug server and fails if the harness cannot add/warm/benchmark a
+# fixture repo (e.g. is rejected with repo_not_added). Fast tier: debug binaries,
+# file:// origin, unshaped, one run. Needs the debug ripclone + ripclone-server.
+benchmark() {
+  ( cd "$ROOT/rust" && cargo build --locked --bin ripclone --bin ripclone-server )
+  bash "$ROOT/scripts/benchmark_smoke.sh"
+}
+
 s3gc() {
   export RIPCLONE_S3_ENDPOINT="${RIPCLONE_S3_ENDPOINT:-http://127.0.0.1:9000}"
   export RIPCLONE_S3_BUCKET="${RIPCLONE_S3_BUCKET:-ripclone-test}"
@@ -85,8 +97,9 @@ case "$STAGE" in
   databases) databases ;;
   s3gc) s3gc ;;
   gitea) gitea ;;
+  benchmark) benchmark ;;
   all) lint; run_tests; e2e ;;
-  *) echo "usage: scripts/ci.sh [lint|test|e2e|flake|databases|s3gc|gitea|all]" >&2; exit 2 ;;
+  *) echo "usage: scripts/ci.sh [lint|test|e2e|flake|databases|s3gc|gitea|benchmark|all]" >&2; exit 2 ;;
 esac
 
 echo "ci.sh: stage '$STAGE' OK"
