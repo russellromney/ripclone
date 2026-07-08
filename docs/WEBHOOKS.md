@@ -152,62 +152,62 @@ Per provider instance:
   re-gate access / retune signed-URL TTL, rename → re-key, delete → purge);
   tag/release pre-warm. These differ a lot per provider; keep them out of phase 1.
 
-## Explicit add — the watch-list
+## Explicit add — the added-repo set
 
 The `RIPCLONE_WEBHOOK_ALLOWLIST` above is a *static* gate: it answers "is this
 pushed repo allowed to warm?" but it lives in config and needs a restart to
-change. For a server you keep running, you also want a **dynamic** way to say
-"keep these repos warm" — add and remove them at runtime. That is the
-**watch-list**.
+change. For a server you keep running, you manage which repos warm **at runtime**
+by *adding* them. A push warms a repo only if that repo has been added — the
+added-repo set is the dynamic watch-list.
 
-A watched repo is one the server keeps warm: its default branch (plus any
-branches that are already built) rebuilds on every push, and the set survives
-restarts.
+An added repo is one the server keeps warm: its default branch (plus any branches
+that are already built) rebuilds on every push, and the set survives restarts.
 
 ### API
 
 Authenticated with the server token (the same `RIPCLONE_SERVER_TOKEN` that gates
 `/build`):
 
-- `POST   /v1/repos/{provider}/{owner}/{repo}/track` — add to the watch-list (and warm it now)
-- `DELETE /v1/repos/{provider}/{owner}/{repo}/track` — remove it
-- `GET    /v1/tracked` — list the watched repos
+- `POST   /v1/repos/{provider}/{owner}/{repo}/add` — add the repo (and build it now)
+- `DELETE /v1/repos/{provider}/{owner}/{repo}/add` — remove it
 
-`track` is idempotent (re-adding a watched repo is a no-op) and enqueues an
-initial build so the first clone is already warm.
+`add` is idempotent (re-adding is a no-op) and enqueues an initial build so the
+first clone is already warm. There is no separate `track`/`untrack`/`tracked`
+verb — adding a repo is what makes it both cloneable and warm-on-push.
 
 ### CLI
 
 The CLI wraps the API against the configured server:
 
 ```
-ripclone track   owner/repo      # start keeping it warm
-ripclone untrack owner/repo      # stop
-ripclone tracked                 # list
+ripclone add owner/repo          # make it cloneable and keep it warm
 ```
 
-Provider-prefixed forms — `gitlab/group/proj`, `gitea/owner/repo` — use the same
-natural-key convention as the allowlist.
+Provider-prefixed forms — `gitlab:group/proj`, `gitea:owner/repo` — use the same
+natural-key convention as the allowlist. Removal is server-token-gated via the
+`DELETE …/add` endpoint.
 
 ### Storage
 
-The watch-list is a small table in the **pluggable metadata store** (the same
+The added-repo set is a small table in the **pluggable metadata store** (the same
 store that holds `RefInfo`), so it inherits whatever backend you configured
 (files or SQL). No new infrastructure.
 
 ### How it combines with the allowlist and warm-all
 
-On a push, the receiver enqueues a sync when **any** of these holds:
+On a push, the receiver enqueues a sync only when **both** hold:
 
-1. `RIPCLONE_WEBHOOK_WARM_ALL=1` (warm everything pushed), or
-2. the repo is on the static `RIPCLONE_WEBHOOK_ALLOWLIST`, or
-3. the repo is on the dynamic watch-list (it was `track`ed).
+1. the repo has been **added** (`ripclone add`), and
+2. the repo passes the allowlist — `RIPCLONE_WEBHOOK_ALLOWLIST` is unset
+   (allow-all) or the repo is on it.
 
-So the allowlist is the "set it and forget it" gate, and the watch-list is the
-"manage it as you go" gate — use either, both, or neither. With no warm-all, an
-empty allowlist, and an empty watch-list, a push warms nothing: **explicit by
-default.** Branch policy is unchanged — a watched repo's default branch always
-warms; other branches warm only if already built, unless `WARM_ALL` is set.
+So the allowlist is the optional "set it and forget it" restriction, and the
+added-repo set is the "manage it as you go" gate. With no repos added, a push
+warms nothing: **explicit by default.** On startup the server seeds the
+added-repo set from repos it has already built and from the webhook allowlist, so
+existing deployments keep warming without a manual re-add. Branch policy is
+unchanged — an added repo's default branch always warms; other branches warm only
+if already built, unless `RIPCLONE_WEBHOOK_WARM_ALL=1`.
 
 ## Relationship to the managed cloud
 

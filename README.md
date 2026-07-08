@@ -128,18 +128,33 @@ The server defaults to storing its local cache and bare mirrors under
 other tuning are set with environment variables — see [`docs/BUILD_OPTIONS.md`](docs/BUILD_OPTIONS.md)
 and [`docs/BACKENDS.md`](docs/BACKENDS.md).
 
-Build artifacts for a commit (sync the repo on the server):
+Point the CLI at your server. `--server` is a **global** flag, so it goes
+*before* the subcommand — but the cleanest way is the `RIPCLONE_SERVER` env var,
+which the rest of this quick start uses:
 
 ```bash
-# Uses the same RIPCLONE_SERVER_TOKEN for authentication
-cargo run --release --bin ripclone -- sync oven-sh/bun --server http://localhost:8000
+# Both the CLI and server authenticate with the same RIPCLONE_SERVER_TOKEN.
+export RIPCLONE_SERVER=http://localhost:8000
+```
+
+Make a repo available and build its artifacts with `add`. This registers the
+repo on the server and builds the first clonepack so the first clone is warm:
+
+```bash
+cargo run --release --bin ripclone -- add oven-sh/bun
 ```
 
 Clone it:
 
 ```bash
-cargo run --release --bin ripclone -- clone oven-sh/bun --dir bun --server http://localhost:8000
+cargo run --release --bin ripclone -- clone oven-sh/bun --dir bun
 ```
+
+(`add` is the first-run verb — a repo must be added before it can be cloned or
+re-synced. Later re-builds use `ripclone sync <repo>`, which push webhooks and
+CI hooks call automatically. If you prefer to pass the server per command
+instead of the env var, put the global flag first:
+`ripclone --server http://localhost:8000 add oven-sh/bun`.)
 
 Add a fast worktree — an additional linked checkout of a repo you already have, reusing its local objects and overlay staging (Linux). Experimental (alpha); see [Which one do I use?](#which-one-do-i-use):
 
