@@ -5801,7 +5801,34 @@ async fn build_and_publish_two_phase(
         // Long-lived in-process server: detach so `/sync` returns as soon as the
         // depth=1 clonepack is live. The task outlives the request because the
         // server process keeps running.
-        tokio::spawn(phase2);
+        //
+        // `phase2` handles its own `Err` (mark failed + retry). But a *panic* in
+        // its async body would unwind to the task boundary and, with the handle
+        // dropped, be swallowed silently — leaving the ref stranded at "full
+        // history building" forever (no depth-0 manifest, no archive), which is
+        // exactly the giant-repo stall. Await the inner handle in an outer task so
+        // a panic is surfaced loudly and routed through the same failure/retry
+        // path as a returned error, instead of vanishing.
+        let panic_failure = phase2_failure.clone();
+        let (rid, br, cm) = (repo_id.clone(), branch.to_string(), commit.to_string());
+        tokio::spawn(async move {
+            if let Err(join_err) = tokio::spawn(phase2).await {
+                error!(
+                    "phase 2 (full history) task aborted for {}@{br} {cm}: {join_err}",
+                    rid.storage_key()
+                );
+                if let Some(action) = panic_failure {
+                    handle_phase2_failure(
+                        action,
+                        &rid,
+                        &br,
+                        &cm,
+                        &format!("phase 2 task aborted: {join_err}"),
+                    )
+                    .await;
+                }
+            }
+        });
     }
 
     report_sync_phases(repo_id, branch, commit, &phases);
@@ -6271,6 +6298,14 @@ async fn build_full_in_background(
         && fail_for == commit
     {
         anyhow::bail!("forced phase-2 failure for {commit}");
+    }
+    // Test hook: panic (rather than return Err) inside the detached phase-2 task,
+    // to exercise that a panicking background build is surfaced + marked failed
+    // instead of silently stranding the ref at "full history building".
+    if let Ok(panic_for) = std::env::var("RIPCLONE_TEST_PHASE2_PANIC_COMMIT")
+        && panic_for == commit
+    {
+        panic!("forced phase-2 panic for {commit}");
     }
 
     // Now the zstd archive, which files mode needs.

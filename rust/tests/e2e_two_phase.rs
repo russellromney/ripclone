@@ -299,3 +299,82 @@ async fn failed_phase2_status_recovers_on_resync() {
     }
     assert!(recovered, "subsequent sync should recover the full clone");
 }
+
+/// A *panic* in the detached phase-2 task (not a returned error) must not
+/// silently strand the ref at "full history building" forever — the giant-repo
+/// stall. The panic must be caught, surfaced, and the build marked `failed:` so
+/// a following sync rebuilds and recovers the full clone.
+#[tokio::test]
+async fn panicking_phase2_status_recovers_on_resync() {
+    init(false);
+    let server = start_server().await;
+    let origin = make_origin("acme", "phase2panic");
+    let commit = origin.commit(&[("f", "v1\n")], "c1");
+    origin.publish();
+
+    unsafe {
+        std::env::set_var("RIPCLONE_TEST_PHASE2_PANIC_COMMIT", &commit);
+    }
+
+    register_added_without_build(&server, "acme/phase2panic")
+        .await
+        .expect("add repo");
+    server
+        .client()
+        .sync_repo("acme/phase2panic", None)
+        .await
+        .expect("sync with forced phase-2 panic");
+
+    // The detached phase-2 task panics; the outer guard must catch it and mark
+    // the build failed instead of leaving it stuck at "full history building".
+    let mut failed_status = None;
+    for _ in 0..120 {
+        let status = repo_status(&server, "acme", "phase2panic").await;
+        failed_status = status["refs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["branch"] == "main")
+            .and_then(|entry| entry["build_status"].as_str())
+            .map(str::to_string);
+        if failed_status
+            .as_deref()
+            .is_some_and(|s| s.starts_with("failed: "))
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    let failed_status = failed_status.expect("phase-2 panic status visible");
+    assert!(
+        failed_status.starts_with("failed: "),
+        "a panicking phase-2 should be marked failed, got {failed_status}"
+    );
+
+    unsafe {
+        std::env::remove_var("RIPCLONE_TEST_PHASE2_PANIC_COMMIT");
+    }
+
+    server
+        .client()
+        .sync_repo("acme/phase2panic", None)
+        .await
+        .expect("resync after clearing phase-2 panic");
+
+    let mut recovered = false;
+    for _ in 0..120 {
+        if let Ok((_g, d)) =
+            clone_only(&server, "acme", "phase2panic", 0, CloneMode::Editable).await
+            && git(&d, &["rev-parse", "HEAD"]) == commit
+            && git_ok(&d, &["fsck", "--connectivity-only", "HEAD"])
+        {
+            recovered = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(
+        recovered,
+        "subsequent sync should recover the full clone after a phase-2 panic"
+    );
+}
