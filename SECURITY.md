@@ -32,7 +32,7 @@ before publishing or materializing them.
 
 After a successful clone, the CLI sends a single fire-and-forget metrics POST to
 the configured server. The report is advertising-grade telemetry only: it is
-never on the clone's critical path, never billing-grade, and a send failure does
+never on the clone's critical path, never authoritative, and a send failure does
 not change the clone's exit status.
 
 The POST is skipped when:

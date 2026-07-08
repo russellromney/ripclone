@@ -1,4 +1,5 @@
-//! End-to-end tests for the `/v1/repos/{provider}/{owner}/{repo}/status` billing endpoint.
+//! End-to-end tests for the `/v1/repos/{provider}/{owner}/{repo}/status` endpoint
+//! (repo sync status + byte-usage accounting).
 
 mod common;
 
@@ -207,7 +208,7 @@ async fn status_shape_is_backwards_compatible() {
     client.sync_repo("acme/compat", None).await.expect("sync");
 
     let status = get_status(&server, "acme", "compat", None).await;
-    // Fields ripclone-cloud already parses must exist.
+    // Fields downstream consumers of the status endpoint parse must exist.
     assert!(status["refs"].is_array());
     assert!(status["refs"][0]["branch"].is_string());
     assert!(status["refs"][0]["commit"].is_string());

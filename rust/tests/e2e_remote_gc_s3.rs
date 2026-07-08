@@ -1,4 +1,4 @@
-//! Real S3/Tigris end-to-end tests for remote GC and storage billing.
+//! Real S3/Tigris end-to-end tests for remote GC and storage usage accounting.
 //!
 //! These tests are ignored by default because they need credentials for an
 //! S3-compatible store. Run them explicitly with:

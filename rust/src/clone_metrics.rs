@@ -1,22 +1,22 @@
 //! CLI-side clone metrics: the fire-and-forget report the CLI POSTs to the
-//! managed cloud *after* a clone has finished and printed success.
+//! configured server *after* a clone has finished and printed success.
 //!
-//! This is best-effort, advertising-grade telemetry — never billing-grade and
-//! never on the clone's critical path. It only ever fires when the cloud
-//! returned an `X-Ripclone-Clone-Id` header on the ref-resolve response (i.e. a
-//! managed-cloud clone); a self-hosted/older server omits that header and the
+//! This is best-effort, advertising-grade telemetry — coarse, never
+//! authoritative, and never on the clone's critical path. It only ever fires
+//! when the server returned an `X-Ripclone-Clone-Id` header on the ref-resolve
+//! response; a server that omits that header (self-hosted / older) means the
 //! report is skipped entirely. A failure to send must never change the clone's
 //! exit status or output — see `Client::report_clone_metrics`.
 //!
-//! The cloud recomputes throughput from `bytes`/`downloadMs` itself, so the CLI
+//! The server recomputes throughput from `bytes`/`downloadMs` itself, so the CLI
 //! only reports what it can measure cleanly. Phase breakdown and round-trip time
 //! are v2.
 
 use serde::Serialize;
 
 /// Set `RIPCLONE_NO_METRICS=1` (or any non-empty value) to suppress the
-/// post-clone metrics report even on a managed-cloud clone. The report is
-/// already implicitly opt-in (it only fires when the cloud minted a clone id),
+/// post-clone metrics report even when the server minted a clone id. The report
+/// is already implicitly opt-in (it only fires when the server minted a clone id),
 /// but this is an explicit kill switch for users who never want the network
 /// call.
 pub fn opted_out() -> bool {

@@ -106,8 +106,8 @@ tombstoned) — a built-in safety pass.
 
 The ledger is read-modify-write of one object. With a single GC runner (the norm)
 this is fine. Multiple server replicas each running GC would race on the ledger
-and on deletes; gate GC to one runner (a leader lease) when that day comes — same
-machinery as the dispatcher's worker lease. Out of scope here.
+and on deletes; gate GC to one runner (a leader lease) when that day comes. Out of
+scope here.
 
 ## Config
 

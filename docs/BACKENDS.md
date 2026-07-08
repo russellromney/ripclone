@@ -207,9 +207,10 @@ RIPCLONE_QUEUE_FAILED_RETENTION_SECS=604800 # prune failed jobs older than N s (
 `done` jobs are kept as build history; only `failed` jobs are pruned.
 
 > Truly diskless workers (no bare mirror on disk, seeded from the clonepack
-> instead of a fresh fetch) are future work — see the dispatcher design. Today a
-> worker fetches the bare mirror it needs, and a server answering a clone fetches
-> it on demand if it lacks one.
+> instead of a fresh fetch) are future work. Today a worker fetches the bare
+> mirror it needs, and a server answering a clone fetches it on demand if it
+> lacks one. For running a worker pool at scale, see
+> [`SCALING_WORKERS.md`](SCALING_WORKERS.md).
 
 ## Client authentication
 

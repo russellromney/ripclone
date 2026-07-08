@@ -2,7 +2,7 @@
 
 > Goal: the fastest practical way to clone a GitHub repo and be ready to work on it (`git status`, `git diff`, `git edit`, `git commit`) without rebuilding git or leaving GitHub.
 >
-> This repo is the **headless open-source backend**: the Rust server, the CLI, the archive format, and the GitHub Actions trigger. Billing, workspaces, and the web UI live in the separate `ripclone-cloud` project.
+> This repo is the **headless open-source backend**: the Rust server, the CLI, the archive format, and the GitHub Actions trigger — self-hostable and fully usable on its own.
 
 ## What already works
 
@@ -98,7 +98,7 @@ Right now the server hard-codes two clonepack variants (`shallow` = depth 1, `fu
 **Remaining** (needs the multi-variant build):
 
 - Producing arbitrary named depths (e.g. `recent = 50` alongside `shallow` + `full`) requires generalizing the two-phase build engine and the fixed two-slot `RefInfo` (`shallow_clonepack` + `full_clonepack`) to an arbitrary named-clonepack list. The config schema and `validate()` already model this (today `validate()` caps a config to the two structural variants the build can emit); lifting that cap is the follow-up. Until then `clonepack_depths` is accepted and validated but the build emits the default `shallow` + `full`.
-- Wire `dictionary_id`, `archive_chunk_size`, `head_blobs_chunk_size` (the build is already parameterized for these) and surface the config in a CLI / the ripclone-cloud UI. `enabled_modes` needs the resolve endpoint to learn the requested clone mode before it can be enforced server-side.
+- Wire `dictionary_id`, `archive_chunk_size`, `head_blobs_chunk_size` (the build is already parameterized for these) and surface the config in the CLI. `enabled_modes` needs the resolve endpoint to learn the requested clone mode before it can be enforced server-side.
 
 ### 3. Unified async download/write pipeline ✅
 
@@ -143,7 +143,7 @@ Tigris Global buckets already cache objects near the requester, but the first re
 2. **Tigris multi-region bucket for tip commits**
    - For the latest commit of each branch, use a Tigris Multi-region bucket so data is already in every region.
    - Older commits stay in the cheaper Global bucket.
-   - This is a paid-feature tier, not the immediately important path.
+   - This is a later optimization, not the immediately important path.
 
 ### 6. Per-phase benchmark breakdown ✅
 
@@ -180,7 +180,7 @@ The editable full clone now publishes as soon as history is built (the archive i
 The trigger surface that builds artifacts ahead of a clone is in place: per-provider push-webhook receivers (`/v1/webhooks/{provider}` for GitHub, GitLab, and Gitea/Forgejo, each with its own signature scheme), the GitHub Actions trigger, a polling fallback (`RIPCLONE_POLL_INTERVAL_SECS`), and a post-build freshness re-check that catches a push landing mid-build (`RIPCLONE_RECHECK_MAX`). Remaining extensions:
 
 - **Per-repo re-check cap cross-process.** `RIPCLONE_RECHECK_MAX` bounds the post-build re-check chain in-process only; the SQL queue does not persist the counter, so a farmed-out worker pool is uncapped (bounded by push rate, spread across workers). Enforce cross-process — persist the counter or a per-repo windowed budget — only if a hot repo is measured starving the pool.
-- **Poll scaling: adaptive backoff + cross-replica coordination.** The poll loop currently sweeps every known repo on a fixed interval. At many repos, add per-repo poll state (last-seen tip, quiet-since) to poll active repos frequently and quiet ones rarely. Across multiple server replicas, each loop would multiply the `ls-remote` chatter (the SQL queue dedups the enqueues, not the probes); coordinate via a DB leader-lease (fits the queue's worker-lease idea in `DISPATCHER.md`), repo-set sharding, or a dedicated singleton poller. Both are farm-out-era work.
+- **Poll scaling: adaptive backoff + cross-replica coordination.** The poll loop currently sweeps every known repo on a fixed interval. At many repos, add per-repo poll state (last-seen tip, quiet-since) to poll active repos frequently and quiet ones rarely. Across multiple server replicas, each loop would multiply the `ls-remote` chatter (the SQL queue dedups the enqueues, not the probes); coordinate via a DB leader-lease, repo-set sharding, or a dedicated singleton poller. Both are farm-out-era work.
 
 ### 11. Empty-repository clones (future)
 

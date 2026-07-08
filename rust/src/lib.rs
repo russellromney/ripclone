@@ -291,9 +291,9 @@ pub struct RefInfo {
     /// decide when a ref's clonepack artifacts have gone idle.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_accessed_at: Option<u64>,
-    /// When true, the warm-TTL sweep never evicts this ref's artifacts. The
-    /// cloud backend reconciles this for entitled private repos; the OSS server
-    /// simply honors the flag.
+    /// When true, the warm-TTL sweep never evicts this ref's artifacts. An
+    /// operator or external control plane may set this flag for repos that should
+    /// stay warm; the server simply honors it.
     #[serde(default)]
     pub warm_pinned: bool,
     /// The commit's depth in git history (`git rev-list --count`). This is the

@@ -89,8 +89,9 @@ pub trait StorageBackend: Send + Sync {
         false
     }
 
-    /// Regions where this backend stores durable bytes. Used for storage-status
-    /// billing breakdown. Defaults to "local" for filesystem-backed storage.
+    /// Regions where this backend stores durable bytes. Used for the
+    /// storage-status usage breakdown. Defaults to "local" for filesystem-backed
+    /// storage.
     fn regions(&self) -> Vec<String> {
         vec!["local".to_string()]
     }

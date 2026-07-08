@@ -10,7 +10,7 @@ ripclone pre-builds git artifacts for every pushed commit so that agents, CI sys
 
 It works as two operations: you **sync** a repo so the server pre-builds its artifacts (automatic on every push), then you **clone** it — the client downloads those artifacts and writes the working tree in seconds.
 
-It is self-hostable and host-agnostic — point it at GitHub, GitLab, Gitea, or any git host — and works for private or public repos. For the easiest experience, sign up for free (for public repos) at [Ripclone Cloud](https://ripclone.com).
+It is self-hostable and host-agnostic — point it at GitHub, GitLab, Gitea, or any git host — and works for private or public repos.
 
 ripclone started from a simple question asked by [Jarred Sumner](https://x.com/jarredsumner/status/2066420871753838913): 
 
@@ -213,10 +213,10 @@ For repos without a webhook, or to catch a missed delivery, the server periodica
 
 ## CLI usage
 
-By default the CLI talks to the managed [Ripclone Cloud](https://ripclone.com). Point it at a self-hosted server with `--server`, the `RIPCLONE_SERVER` env var, or `ripclone login`. (Resolution order: `--server` > `RIPCLONE_SERVER` > saved login config > cloud.)
+Point the CLI at your server with `--server`, the `RIPCLONE_SERVER` env var, or a saved `ripclone login`. (Resolution order: `--server` > `RIPCLONE_SERVER` > saved login config > the built-in default server.)
 
 ```bash
-# Authorize this machine against the cloud (saves a token), or sign out
+# Authorize this machine against the configured server (saves a token), or sign out
 ripclone login
 ripclone logout
 
@@ -316,7 +316,7 @@ ripclone is host-agnostic: point it at GitHub (built in), GitLab, Gitea/Forgejo/
                        └────────────────────────────┘
 ```
 
-ripclone splits into a **server** — it resolves refs, serves artifacts, and enqueues a sync job on every push — and one or more **workers** (`ripclone-worker`) that claim jobs from the queue, `git fetch` the upstream, and build the clonepack. On a single box the worker runs inside the server; with a SQL queue you run a farm of workers across machines. Three backends are pluggable, each set with environment variables (see [`docs/BACKENDS.md`](docs/BACKENDS.md)):
+ripclone splits into a **server** — it resolves refs, serves artifacts, and enqueues a sync job on every push — and one or more **workers** (`ripclone-worker`) that claim jobs from the queue, `git fetch` the upstream, and build the clonepack. On a single box the worker runs inside the server; with a SQL queue you run a farm of workers across machines (see [Running workers at scale](docs/SCALING_WORKERS.md)). Three backends are pluggable, each set with environment variables (see [`docs/BACKENDS.md`](docs/BACKENDS.md)):
 
 - **Artifact store.** Where clonepacks live: object storage (S3 / R2 / Tigris / MinIO), with signed URLs so clients read straight from it, or local disk. Local disk also caches hot artifacts in front of object storage. A background GC drops artifacts nothing references (after a grace period, so an in-flight upload is never deleted).
 - **Metadata store.** The ref → clonepack mapping and build status. Any database SQLx supports (Postgres, MySQL, SQLite, libsql/Turso), or a file / object-storage store. Writes are ordered so a newer sync never loses to an older one.
@@ -332,7 +332,7 @@ Compile flags (e.g. building without `zlib-ng`), client tuning knobs (`RIPCLONE_
 
 ## Telemetry
 
-After a successful clone, the CLI sends a single fire-and-forget metrics POST to the configured server. It is advertising-grade telemetry, never billing-grade, and never on the clone's critical path: a failure to send cannot change the clone's exit status. The report is skipped entirely when the server does not mint a clone id (self-host / older server), when `--no-metrics` is passed, or when `RIPCLONE_NO_METRICS` is set to any non-empty value.
+After a successful clone, the CLI sends a single fire-and-forget metrics POST to the configured server. It is advertising-grade telemetry, never authoritative, and never on the clone's critical path: a failure to send cannot change the clone's exit status. The report is skipped entirely when the server does not mint a clone id (self-host / older server), when `--no-metrics` is passed, or when `RIPCLONE_NO_METRICS` is set to any non-empty value.
 
 The payload contains:
 

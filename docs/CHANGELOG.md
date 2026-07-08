@@ -27,7 +27,7 @@ Every command in the README and `docs/` was run verbatim against a real server. 
 
 - **`RIPCLONE_AGENT=1` (or `agent = true` in config) turns on fleet-sane clone defaults** (`rust/src/config.rs`, `rust/src/bin/cli.rs`): history defaults to **depth-1** (agents on giant repos don't want full history), and the CLI never prompts. It's a deliberate, explicit opt-in — never a silent size-based switch that would surprise humans. The env var wins over the config default; an explicit `--depth`/`[clone] depth` still wins over agent mode. The human default (`ripclone clone` → full editable history) is unchanged.
 - **New [Agents & CI](AGENTS.md) doc page**: depth-1 vs files vs full guidance (full is for humans; agents want depth-1/files), `--temp` for ephemeral fleet VMs, a copy-paste fleet quickstart (install + token-in-env + headless clone, no login round-trip), and the table of machine-parseable access errors.
-- **Machine-parseable paywall hint factored out and unit-tested** (`rust/src/client.rs`): the status→next-step mapping is now a pure `error_hint`; the paid-plan cases (402, `403 no_plan`) carry the subscribe URL so an agent fleet can route billing errors without scraping prose.
+- **Machine-parseable access-error hint factored out and unit-tested** (`rust/src/client.rs`): the status→next-step mapping is now a pure `error_hint`, so an agent fleet can detect and route access failures on the machine-parseable `code` without scraping prose.
 
 ## Distribution
 

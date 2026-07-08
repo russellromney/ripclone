@@ -1,7 +1,7 @@
 # Giant-repo benchmark gate — 2026-07-08
 
-Wave-4 launch gate: validate the ICP-facing SLA claims on **giant** repos, not just
-`bun`/`pandas`. The core ICP is coding agents cloning huge repos, usually at depth-1.
+Validate ripclone's performance claims on **giant** repos, not just
+`bun`/`pandas`. The primary target is coding agents cloning huge repos, usually at depth-1.
 
 ## Setup
 
@@ -16,7 +16,7 @@ Wave-4 launch gate: validate the ICP-facing SLA claims on **giant** repos, not j
   (mimalloc only helps). The *existing* published bun/pandas/EC2 numbers were also measured
   with this glibc build class, so this run is apples-to-apples with the claims it validates.
 
-## Depth-1 clone — the ICP mode (RUNS=10, shaped)
+## Depth-1 clone — the primary agent mode (RUNS=10, shaped)
 
 | repo | rate | ripclone p50 | ripclone p95 | `git clone --depth 1` p50 | speedup |
 |------|-----:|-------------:|-------------:|--------------------------:|--------:|
@@ -55,16 +55,16 @@ bottleneck is the reachability-**bitmap / multi-pack-index write** (the B6 "leve
   (from the earlier EC2 run); this independent fly-shaped measurement is **5.9×** —
   confirmed accurate. And the depth-1 win **grows with repo size** (bun 3.3× → linux 5.9×),
   because `git clone --depth 1` cost scales with the repo (20.3 s for linux) while
-  ripclone stays flat (3.4 s). The giant-repo ICP is where ripclone wins *most*.
+  ripclone stays flat (3.4 s). Giant repos at depth-1 are where ripclone wins *most*.
 - **PASS — cold-build cost is honest and quantified** (upstream-fetch bound, not ripclone).
 - **PASS — storage amplification is low** (4–6% of source).
 
-## Open gaps (not blockers for the depth-1 ICP claim)
+## Open gaps (not blockers for the depth-1 claim)
 
 - **Full-history (`--depth 0`) and `files` mode on giants were NOT measured.** In the run
   window the server never finished publishing the full clonepack manifest / zstd archive for
   linux (`missing clonepack manifest` / `archive still building`) even after going idle.
-  This is the *secondary* path (humans, not the agent ICP), but the stall is worth a
+  This is the *secondary* path (humans, not the agent path), but the stall is worth a
   server-side look — it may indicate the async full/archive build isn't completing or being
   triggered on this deployment.
 - **glibc, not the shipped musl+mimalloc binary** (Docker was unavailable to cross-build

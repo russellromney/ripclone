@@ -389,9 +389,10 @@ impl RemoteGc {
                 }
             }
 
-            // Repo-scoped pin protection. `warm_pinned` marks an entitled repo
-            // (e.g. a private repo the cloud has pinned); the guarantee is that its
-            // artifacts survive TTL eviction. A repo keeps more than one ref object
+            // Repo-scoped pin protection. `warm_pinned` marks a repo that should
+            // stay warm (an operator or external control plane sets the flag); the
+            // guarantee is that its artifacts survive TTL eviction. A repo keeps
+            // more than one ref object
             // for the same commit — notably the literal `HEAD` alias alongside the
             // concrete default branch that actually holds the full-history build —
             // and the pin may only be set on one of them. Evicting a *sibling* ref
@@ -450,8 +451,8 @@ pub(crate) async fn reachable_hashes(
             .with_context(|| format!("list branches for {key}"))?;
 
         // Load the repo's refs once so reachability can reason about the whole
-        // repo. The warm pin is repo-scoped: an entitled repo the cloud has
-        // pinned keeps its artifacts even past TTL eviction. A pin can land
+        // repo. The warm pin is repo-scoped: a pinned repo keeps its artifacts
+        // even past TTL eviction. A pin can land
         // *after* a ref was already marked `evicted` (reconciliation lag or a
         // failed pin write), so a pinned repo's evicted refs are not orphans —
         // their chunks must be retained, not walked past. Mirrors the per-repo
@@ -1340,7 +1341,7 @@ mod tests {
         assert_ne!(info.build_status.as_deref(), Some(EVICTED_BUILD_STATUS));
     }
 
-    /// Liveness guarantee for entitled repos: a warm-pinned repo whose ref was
+    /// Liveness guarantee for pinned repos: a warm-pinned repo whose ref was
     /// *already* marked evicted (a pin that landed after the eviction, e.g.
     /// reconciliation lag) must still have its artifacts retained by the
     /// reachability walk. The pin is repo-scoped, so an evicted ref of a pinned

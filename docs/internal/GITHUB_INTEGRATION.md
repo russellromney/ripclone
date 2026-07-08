@@ -265,8 +265,8 @@ Authorization: Bearer <github-token-or-service-token>
   "ref": "refs/heads/main",
   "commit": "df55ab7...",
   "tree": "abc1234...",
-  "tarball_url": "https://cdn.fastgit.dev/.../main.tar.gz?sig=...",
-  "metadata_pack_url": "https://api.fastgit.dev/.../metadata.pack",
+  "tarball_url": "https://cdn.example.com/.../main.tar.gz?sig=...",
+  "metadata_pack_url": "https://api.example.com/.../metadata.pack",
   "expires_at": "2026-06-15T21:00:00Z"
 }
 ```
@@ -442,10 +442,10 @@ and rarely need to poll.
 
 ## 11. Deployment options
 
-### 11.1 Managed SaaS
+### 11.1 Central hosted deployment
 
-`fastgit.dev` or similar. Users install a GitHub App. The service handles
-auth, caching, and CDN.
+One operator runs the service for many users. Users install a GitHub App, and
+the operator handles auth, caching, and CDN.
 
 ### 11.2 Self-hosted proxy
 
