@@ -481,6 +481,18 @@ fn fsync_requested() -> bool {
         .unwrap_or(false)
 }
 
+/// Resolve the directory to fsync after the atomic rename publishes `target`,
+/// so the rename entry itself is durable. A bare relative `--dir` (the README
+/// quickstart uses `--dir bun`) has an empty parent; fall back to the current
+/// directory — the actual container — exactly as `temp_install_dir` does, so
+/// the post-rename fsync is never silently skipped.
+fn post_rename_fsync_dir(target: &Path) -> &Path {
+    target
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
 /// fsync one directory so its newly created entries survive a crash. On Unix
 /// this opens the directory and syncs it; elsewhere it is a best-effort no-op.
 #[cfg(unix)]
@@ -1513,10 +1525,9 @@ impl Client {
             std::fs::rename(&install_root, &target).with_context(|| {
                 format!("rename {} to {}", install_root.display(), target.display())
             })?;
-            if fsync_requested()
-                && let Some(parent) = target.parent().filter(|p| !p.as_os_str().is_empty())
-            {
-                fsync_dir(parent).context("fsync parent directory after publish")?;
+            if fsync_requested() {
+                fsync_dir(post_rename_fsync_dir(&target))
+                    .context("fsync parent directory after publish")?;
             }
         }
 
@@ -3043,6 +3054,31 @@ mod tests {
         // (POSIX path here; the io_uring path is exercised on Linux CI).
         crate::worktree_writer::fsync_paths_durable(&files, &dirs)
             .expect("durable fsync over collected tree");
+    }
+
+    #[test]
+    fn post_rename_fsync_dir_resolves_relative_target_to_cwd() {
+        // The post-rename durability fsync makes the atomic rename itself
+        // durable (BUILD_OPTIONS: "the target's parent directory after the
+        // atomic rename"). A bare relative `--dir` — the common case, the
+        // README quickstart uses `--dir bun` — has an empty parent. The
+        // resolver must fall back to the containing directory (cwd `.`) so the
+        // fsync runs, not be dropped/skipped (D6).
+        assert_eq!(
+            post_rename_fsync_dir(Path::new("bun")),
+            Path::new("."),
+            "bare relative target must fsync its container (cwd), not be skipped"
+        );
+        // Nested relative and absolute targets already resolve to their real
+        // parent — the fallback must not disturb those.
+        assert_eq!(
+            post_rename_fsync_dir(Path::new("out/bun")),
+            Path::new("out")
+        );
+        assert_eq!(
+            post_rename_fsync_dir(Path::new("/work/bun")),
+            Path::new("/work")
+        );
     }
 
     #[test]
