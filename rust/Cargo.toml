@@ -97,6 +97,12 @@ toml = "1.1"
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7"
 
+# mimalloc is the global allocator ONLY on the static-musl Linux release builds
+# (see the #[global_allocator] in src/lib.rs) to offset musl's slower default
+# allocator. Target-gated so glibc/macOS builds neither pull nor compile it.
+[target.'cfg(target_env = "musl")'.dependencies]
+mimalloc = "0.1"
+
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 tempfile = "3"

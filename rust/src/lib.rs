@@ -12,6 +12,21 @@
 //! points used by the bundled binaries. Modules marked `doc(hidden)` are public
 //! for in-repo binaries and integration tests, not a stability promise.
 
+// mimalloc as the global allocator on musl targets. The Linux release binaries
+// are statically linked against musl (so one binary runs on any Linux, Alpine
+// included), but musl's default allocator is markedly slower than glibc's under
+// the concurrent, allocation-heavy pack build / archive extract paths — and
+// performance is the product. mimalloc closes that gap so a static musl binary
+// keeps glibc-class throughput. Scoped to musl only: glibc and macOS already
+// ship capable allocators, so those builds are left untouched. Defined here in
+// the library crate so every binary that links it (ripclone, ripclone-server,
+// ripclone-worker, git-remote-ripclone) picks it up. NOTE: this cfg path only
+// compiles on a musl build — it is exercised by the Docker musl build + CI, not
+// the host `cargo check`.
+#[cfg(target_env = "musl")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 /// Wire-protocol version negotiated between the CLI and the server. Bump this
 /// only on a breaking change to the client/server protocol — independent of the
 /// crate version, so the two binaries can be released on their own cadence as
@@ -67,6 +82,9 @@ pub mod server;
 pub mod sidecar;
 #[doc(hidden)]
 pub mod snapshot;
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
+pub mod statx_compat;
 pub mod storage;
 
 #[cfg(test)]
