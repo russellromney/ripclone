@@ -344,7 +344,13 @@ impl ProviderRegistry {
             );
         }
 
-        if let Some(token) = cfg.token {
+        // Treat an empty/blank token as absent. A provider config entry that
+        // re-declares kind/host but carries a blank token (e.g. a client
+        // `provider add <id> --token ""` writing the shared config, or a
+        // later merge layer) must not clobber a real token set by an earlier
+        // layer, and a blank token must never be sent as an empty credential
+        // (which surfaces as `Basic oauth2:` and is rejected by GitLab).
+        if let Some(token) = cfg.token.filter(|t| !t.trim().is_empty()) {
             self.tokens
                 .insert(id.clone(), secrecy::SecretString::new(token.into()));
         }
@@ -630,6 +636,48 @@ mod tests {
         };
         assert_eq!(repo.storage_key(), "gitlab/g%2Fsub%2Fproj");
         assert_eq!(repo.mirror_dir_name(), "gitlab_g%2Fsub%2Fproj.git");
+    }
+
+    fn gitlab_cfg(token: Option<&str>) -> ProviderConfig {
+        ProviderConfig {
+            id: "gitlab".to_string(),
+            kind: Some("gitlab".to_string()),
+            host: Some("gitlab.com".to_string()),
+            token: token.map(str::to_string),
+            auth_template: None,
+            auth_header_name: None,
+        }
+    }
+
+    #[test]
+    fn blank_token_does_not_clobber_a_real_one() {
+        use secrecy::ExposeSecret;
+        let mut registry = ProviderRegistry::new();
+        // A real token from an earlier layer (e.g. RIPCLONE_PROVIDERS).
+        registry.merge_one(gitlab_cfg(Some("real-token"))).unwrap();
+        // A later layer re-declares the provider with a blank token (e.g. a
+        // client `provider add gitlab --token ""` writing the shared config).
+        registry.merge_one(gitlab_cfg(Some("   "))).unwrap();
+        registry.merge_one(gitlab_cfg(Some(""))).unwrap();
+        assert_eq!(
+            registry
+                .token("gitlab")
+                .map(|t| t.expose_secret().to_string()),
+            Some("real-token".to_string()),
+            "a blank token must not overwrite a real one"
+        );
+    }
+
+    #[test]
+    fn blank_token_is_never_stored_as_empty_credential() {
+        let mut registry = ProviderRegistry::new();
+        registry.merge_one(gitlab_cfg(Some(""))).unwrap();
+        // Must be None, not Some("") — an empty token would surface as
+        // `Basic oauth2:` and be rejected by GitLab.
+        assert!(
+            registry.token("gitlab").is_none(),
+            "a blank-only token config must leave the credential absent"
+        );
     }
 
     #[test]
