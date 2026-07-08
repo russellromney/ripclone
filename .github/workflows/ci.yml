@@ -157,6 +157,75 @@ jobs:
       - name: S3 GC e2e against MinIO
         run: bash scripts/ci.sh s3gc
 
+  # Real multi-provider + server-side-token path against a live Gitea. This is
+  # the seam a production dogfood found broken but every file:// e2e missed: a
+  # self-hosted `gitea` provider whose upstream token lives ONLY on the server
+  # (via RIPCLONE_PROVIDERS), the client passing none — the exact config the
+  # provider-token clobber (#114) broke. Gated on the same changes/docker filter
+  # as s3gc so docs-only PRs skip it.
+  gitea:
+    needs: changes
+    if: ${{ needs.changes.outputs.docker == 'true' }}
+    runs-on: ubuntu-latest
+    services:
+      gitea:
+        image: gitea/gitea:latest
+        # Skip the web installer and run headless on sqlite: INSTALL_LOCK plus a
+        # sqlite3 DB means the DB migrates on first boot with no interactive
+        # setup, so the CLI can create the admin user the moment the API is up.
+        env:
+          GITEA__security__INSTALL_LOCK: "true"
+          GITEA__database__DB_TYPE: sqlite3
+          GITEA__server__ROOT_URL: http://127.0.0.1:3000/
+          GITEA__server__HTTP_PORT: "3000"
+          GITEA__service__DISABLE_REGISTRATION: "true"
+        ports:
+          - 3000:3000
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache-workspaces: rust
+      - name: Install build deps
+        run: bash scripts/install-build-deps.sh
+      - name: Wait for Gitea, create admin + access token
+        run: |
+          set -euo pipefail
+          # Wait until the migrated API answers (the server runs migrations on
+          # first boot, so a 200 here means the DB is ready for the admin CLI).
+          for i in {1..60}; do
+            if curl -sf http://127.0.0.1:3000/api/v1/version >/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:3000/api/v1/version >/dev/null
+          # The service container is not addressable by its compose alias for
+          # `docker exec`, so resolve the id by image.
+          cid="$(docker ps --filter ancestor=gitea/gitea:latest --format '{{.ID}}' | head -n1)"
+          test -n "$cid"
+          # First admin user (no web installer means it must be created via CLI).
+          docker exec -u git "$cid" gitea admin user create \
+            --admin --username ci --password ci-password-123 \
+            --email ci@example.com --must-change-password=false
+          # Mint a scoped access token via the API (Basic-auth with the admin
+          # creds). This token authenticates both the Gitea API and git-over-http.
+          token="$(curl -sf -X POST \
+            -H 'Content-Type: application/json' \
+            -u ci:ci-password-123 \
+            -d '{"name":"ripclone-ci","scopes":["write:repository","write:user","read:repository","read:user"]}' \
+            http://127.0.0.1:3000/api/v1/users/ci/tokens | jq -r .sha1)"
+          test -n "$token" && test "$token" != "null"
+          # Prove the token works before the test runs (seed check).
+          curl -sf -H "Authorization: token $token" \
+            http://127.0.0.1:3000/api/v1/user >/dev/null
+          echo "RIPCLONE_GITEA_URL=http://127.0.0.1:3000" >> "$GITHUB_ENV"
+          echo "RIPCLONE_GITEA_USER=ci" >> "$GITHUB_ENV"
+          echo "::add-mask::$token"
+          echo "RIPCLONE_GITEA_TOKEN=$token" >> "$GITHUB_ENV"
+      - name: Gitea provider + server-side-token e2e
+        run: bash scripts/ci.sh gitea
+
   # Validate the images assemble and the binaries run. The real Dockerfiles use
   # buildkit cargo cache mounts that persist on the Fly/Depot deploy builder but
   # NOT on GitHub-hosted runners, so building them here would recompile ~400

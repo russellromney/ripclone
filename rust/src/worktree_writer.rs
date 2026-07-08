@@ -902,7 +902,7 @@ mod linux_uring {
     struct PendingDirectWindow {
         window_id: u32,
         in_flight: Vec<InFlightWrite>,
-        statx_buffers: Vec<libc::statx>,
+        statx_buffers: Vec<crate::statx_compat::statx>,
         collect_stats: bool,
         expected_completions: usize,
         expected_closes: usize,
@@ -1538,7 +1538,7 @@ mod linux_uring {
             record_io_on_harvest: bool,
             slot_base: usize,
         ) -> std::result::Result<PendingDirectWindow, DirectWriteError> {
-            let mut statx_buffers: Vec<libc::statx> = (0..in_flight.len())
+            let mut statx_buffers: Vec<crate::statx_compat::statx> = (0..in_flight.len())
                 .map(|_| unsafe { std::mem::zeroed() })
                 .collect();
             let mut entries = Vec::with_capacity(in_flight.len() * 4);
@@ -1601,10 +1601,11 @@ mod linux_uring {
                         opcode::Statx::new(
                             types::Fd(libc::AT_FDCWD),
                             path_ptr,
-                            &mut statx_buffers[idx] as *mut libc::statx as *mut types::statx,
+                            &mut statx_buffers[idx] as *mut crate::statx_compat::statx
+                                as *mut types::statx,
                         )
                         .flags(libc::AT_SYMLINK_NOFOLLOW)
-                        .mask(libc::STATX_BASIC_STATS)
+                        .mask(crate::statx_compat::STATX_BASIC_STATS)
                         .build()
                         .flags(squeue::Flags::IO_HARDLINK)
                         .user_data(user_data(
@@ -2059,7 +2060,7 @@ mod linux_uring {
         Ok(())
     }
 
-    fn check_statx_result(write: &InFlightWrite, statx: &libc::statx) -> Result<()> {
+    fn check_statx_result(write: &InFlightWrite, statx: &crate::statx_compat::statx) -> Result<()> {
         if write.open_res.is_some_and(|res| res < 0) {
             return Ok(());
         }

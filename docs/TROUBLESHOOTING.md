@@ -2,15 +2,11 @@
 
 Common failures and what they mean.
 
-## `error while loading shared libraries: libgit2` (or `libssl`, `libzstd`)
+## `error while loading shared libraries` on Linux
 
-The prebuilt binaries link their C libraries dynamically, so the runtime packages have to be present on the machine:
+You should never see this. The Linux prebuilt binaries are statically linked against musl — fully self-contained, with no libc or C-library runtime dependency — so they run on any Linux, Alpine (musl) and glibc distros alike, with nothing to `apt-get` or `apk add`. The git and TLS stacks are pure Rust (gix + rustls) and the remaining C libraries (zstd, zlib-ng) are vendored into the binary.
 
-- **Debian/Ubuntu:** `apt-get install libgit2-1.5 libssl3` (package names vary by release; `libgit2` and `libssl3` are the ones to look for).
-- **Alpine:** `apk add libgit2 openssl`.
-- **macOS:** `brew install libgit2 openssl@3`.
-
-On macOS the error reads `dyld: Library not loaded: .../libgit2.dylib`. If you can't install the runtime packages, `cargo install ripclone --locked` builds the C libraries from source instead of linking them dynamically.
+If a Linux binary still fails to load a shared library, the download is corrupt or truncated — re-run the installer, or build from source with `cargo install ripclone --locked`.
 
 ## Clone prints "warming" / hangs, or the server returns `202`
 
