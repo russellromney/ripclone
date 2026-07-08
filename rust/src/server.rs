@@ -9107,7 +9107,14 @@ mod tests {
     /// The polling fallback triggers a build when the upstream tip isn't built,
     /// and is a no-op once it is. This is the missed-webhook catch-up path.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn poll_triggers_on_unbuilt_tip_and_skips_when_built() {
+        // Serialize with every other test that mutates the process-global
+        // RIPCLONE_ORIGIN_BASE (git.rs env tests, ref_read_bumps_last_accessed_at),
+        // so a sibling's set/remove can't race this test's origin-base window.
+        let _lock = crate::git::ORIGIN_BASE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let base = tempfile::tempdir().unwrap();
         let origin = base.path().join("acme").join("widget.git");
         std::fs::create_dir_all(origin.parent().unwrap()).unwrap();
