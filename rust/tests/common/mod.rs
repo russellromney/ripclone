@@ -63,12 +63,35 @@ pub fn token_hash() -> String {
     hex::encode(Sha256::digest(TOKEN.as_bytes()))
 }
 
+/// Hand out a distinct loopback port per call, process-wide.
+///
+/// Binding `:0`, reading the port, then dropping the listener leaves a window
+/// where the OS can re-hand the same freed port to a *concurrent* test's
+/// `free_port()` before the first test's server binds it. Two servers then
+/// target one port: the loser's bind fails silently, but its readiness probe
+/// connects to the winner's listener and passes — so the loser runs against the
+/// winner and, once the winner's `#[tokio::test]` runtime drops (killing its
+/// listener), the loser's next request hits a dead port ("Connection refused").
+/// CI runs the test binaries sequentially, so a monotonically-growing issued set
+/// (ports stay reserved by live servers for the whole run) makes collisions
+/// within a binary impossible.
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static ISSUED: Mutex<Option<HashSet<u16>>> = Mutex::new(None);
+    let mut guard = ISSUED.lock().unwrap_or_else(|e| e.into_inner());
+    let issued = guard.get_or_insert_with(HashSet::new);
+    for _ in 0..1000 {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        if issued.insert(port) {
+            return port;
+        }
+    }
+    panic!("free_port: no unused loopback port after 1000 attempts");
 }
 
 /// A running in-process server. Keeps its storage dir alive for the test.
@@ -1482,6 +1505,45 @@ pub async fn sync_until_manifest(
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
     panic!("clonepack manifest never published for {owner}/{repo} (last: {last})");
+}
+
+/// Poll `/sync` until the build has fully settled: the archive is published, so
+/// `clonepack_manifest` has reached its final, stable hash for this commit.
+///
+/// Phase 2 publishes the full clonepack manifest *twice* — first an editable
+/// manifest (`build_status = "archive building"`), then, once the zstd archive
+/// finishes, a distinct files manifest with `archive_ready = true`. A test that
+/// captures the manifest hash before the archive lands would tamper with the
+/// transient editable hash while the clone goes on to fetch the final files
+/// hash. Waiting for `archive_ready` pins the returned `clonepack_manifest` to
+/// the exact artifact the subsequent clone resolves, so negative tests that
+/// corrupt/remove that hash are deterministic under parallel load.
+pub async fn sync_until_archive_ready(
+    server: &Server,
+    owner: &str,
+    repo: &str,
+) -> ripclone::client::RefResponse {
+    let client = server.client();
+    ensure_added(server, &format!("{owner}/{repo}"))
+        .await
+        .expect("add before sync_until_archive_ready");
+    let mut last = String::from("<no successful sync>");
+    for _ in 0..160 {
+        match client.sync_repo(&format!("{owner}/{repo}"), None).await {
+            Ok(resp) if resp.archive_ready && !resp.clonepack_manifest.is_empty() => return resp,
+            Ok(resp) => {
+                last = format!(
+                    "archive_ready={} manifest_empty={} at commit {}",
+                    resp.archive_ready,
+                    resp.clonepack_manifest.is_empty(),
+                    resp.commit
+                )
+            }
+            Err(e) => last = format!("sync err: {e:#}"),
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    panic!("archive never became ready for {owner}/{repo} (last: {last})");
 }
 
 /// Shared B5 seam: make a repo warm enough that a subsequent clone can fetch

@@ -44,6 +44,18 @@ flake() {
     done )
 }
 
+# Real multi-provider + server-side-token path against a live Gitea (the seam a
+# production dogfood found broken but every file:// e2e missed — the #114
+# provider-token clobber). Needs a running Gitea; the CI job brings one up and
+# exports RIPCLONE_GITEA_URL / _TOKEN / _USER. The test auto-skips if they're
+# unset, so a bare `scripts/ci.sh gitea` on a laptop without Gitea is a no-op.
+gitea() {
+  export RIPCLONE_GITEA_URL="${RIPCLONE_GITEA_URL:-http://127.0.0.1:3000}"
+  export RIPCLONE_GITEA_USER="${RIPCLONE_GITEA_USER:-ci}"
+  : "${RIPCLONE_GITEA_TOKEN:?set RIPCLONE_GITEA_TOKEN to a Gitea admin access token}"
+  ( cd "$ROOT/rust" && cargo test --locked --test e2e_gitea_provider -- --ignored --nocapture )
+}
+
 # Real network databases for the queue + metadata adapters the default suite can
 # only compile-check: Postgres + MySQL via throwaway docker containers, and
 # libsql against a local `sqld`. Needs docker; the libsql leg also needs `sqld`
@@ -72,8 +84,9 @@ case "$STAGE" in
   flake) flake ;;
   databases) databases ;;
   s3gc) s3gc ;;
+  gitea) gitea ;;
   all) lint; run_tests; e2e ;;
-  *) echo "usage: scripts/ci.sh [lint|test|e2e|flake|databases|s3gc|all]" >&2; exit 2 ;;
+  *) echo "usage: scripts/ci.sh [lint|test|e2e|flake|databases|s3gc|gitea|all]" >&2; exit 2 ;;
 esac
 
 echo "ci.sh: stage '$STAGE' OK"
