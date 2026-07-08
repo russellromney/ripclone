@@ -33,6 +33,18 @@ On every push, ripclone prebuilds a **clonepack** for `HEAD` — a set of files 
 
 `--mode=files` writes the working tree straight from a zstd archive — the fastest path when you only need the files (agents, CI). No git object database, so `git diff`/`show` don't work.
 
+### Which one do I use?
+
+ripclone has three ways to materialize a tree. They are not redundant — they mirror git's own clone-vs-worktree split.
+
+| Surface | What it produces | Source | Use this when… |
+|---|---|---|---|
+| `clone --mode editable` | A full git repo: `.git` (objects + packs) **and** a working tree | Prebuilt clonepack from the **server** | You want a normal repo to commit, branch, `git diff`, and push — the drop-in `git clone`. |
+| `clone --mode files` | **Just the source files** — no `.git`, no history | Prebuilt archive from the **server** | You only need the file contents (agents, CI, build inputs) and never run git in the tree. Fastest path. |
+| `worktree` | An **additional linked git worktree** attached to a repo you already have | The **local repo's** objects (no server fetch) | You already cloned once and want a second checkout (another branch/rev) that shares the existing object store — like `git worktree add`, accelerated. **Experimental (alpha).** |
+
+Rule of thumb: `clone` brings a repo (or its files) down from the server; `worktree` spins up an extra checkout of a repo you already have. `--mode files` and `worktree` are **not** the same thing — one gives you bare files with no git, the other gives you a fully git-aware linked worktree.
+
 **Git LFS:** LFS objects come from your git host, not ripclone — run `git lfs pull` after cloning to fetch them. ripclone stores the LFS pointer files (it never stores the blobs); resolving them is a pass-through to your host by design.
 
 See **[Design](docs/DESIGN.md)** for how a clonepack is built and synced.
@@ -129,7 +141,7 @@ Clone it:
 cargo run --release --bin ripclone -- clone oven-sh/bun --dir bun --server http://localhost:8000
 ```
 
-Add a fast worktree (Linux, reuses local objects and overlay staging):
+Add a fast worktree — an additional linked checkout of a repo you already have, reusing its local objects and overlay staging (Linux). Experimental (alpha); see [Which one do I use?](#which-one-do-i-use):
 
 ```bash
 cd bun
@@ -220,7 +232,7 @@ ripclone sync owner/repo
 ripclone sync owner/repo --depth 1             # shallow mirror
 ripclone sync owner/repo --at HEAD~5           # build at a past rev
 
-# Add a fast worktree inside an existing clone
+# Add a fast worktree inside an existing clone (experimental, alpha)
 ripclone worktree ../wt -b HEAD
 ```
 

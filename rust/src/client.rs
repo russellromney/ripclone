@@ -481,6 +481,18 @@ fn fsync_requested() -> bool {
         .unwrap_or(false)
 }
 
+/// Resolve the directory to fsync after the atomic rename publishes `target`,
+/// so the rename entry itself is durable. A bare relative `--dir` (the README
+/// quickstart uses `--dir bun`) has an empty parent; fall back to the current
+/// directory — the actual container — exactly as `temp_install_dir` does, so
+/// the post-rename fsync is never silently skipped.
+fn post_rename_fsync_dir(target: &Path) -> &Path {
+    target
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
 /// fsync one directory so its newly created entries survive a crash. On Unix
 /// this opens the directory and syncs it; elsewhere it is a best-effort no-op.
 #[cfg(unix)]
@@ -496,26 +508,42 @@ fn fsync_dir(_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Recursively fsync every regular file and directory under `root`, so the whole
-/// materialized tree is durable before the clone reports success. A symlink is
-/// persisted by syncing its parent directory, not by following the link.
-fn fsync_tree(root: &Path) -> Result<()> {
+/// Walk `root` and collect every regular file into `files` and every directory
+/// into `dirs`. A symlink is persisted by syncing its parent directory, not by
+/// following the link, so it needs no entry of its own. The `.git/index` written
+/// during extraction is a regular file under `root`, so this picks it up — the
+/// index stat cache is flushed alongside the working-tree files it describes.
+fn collect_fsync_targets(
+    root: &Path,
+    files: &mut Vec<PathBuf>,
+    dirs: &mut Vec<PathBuf>,
+) -> Result<()> {
     let meta = std::fs::symlink_metadata(root)
         .with_context(|| format!("stat for fsync {}", root.display()))?;
     if meta.is_dir() {
         for entry in
             std::fs::read_dir(root).with_context(|| format!("read dir {}", root.display()))?
         {
-            fsync_tree(&entry?.path())?;
+            collect_fsync_targets(&entry?.path(), files, dirs)?;
         }
-        fsync_dir(root)?;
+        dirs.push(root.to_path_buf());
     } else if meta.is_file() {
-        let f = std::fs::File::open(root)
-            .with_context(|| format!("open file for fsync {}", root.display()))?;
-        f.sync_all()
-            .with_context(|| format!("fsync file {}", root.display()))?;
+        files.push(root.to_path_buf());
     }
     Ok(())
+}
+
+/// Flush the whole materialized tree under `root` — every file (including the
+/// `.git/index` stat cache), every directory that holds one — before the clone
+/// reports success, so a crash cannot leave a torn tree that `git status` would
+/// call clean. Batches `IORING_OP_FSYNC` on the io_uring writer path and falls
+/// back to sequential `fsync` on the POSIX path; both are gated on
+/// `RIPCLONE_FSYNC` (off by default, D6).
+fn fsync_tree(root: &Path) -> Result<()> {
+    let mut files = Vec::new();
+    let mut dirs = Vec::new();
+    collect_fsync_targets(root, &mut files, &mut dirs)?;
+    crate::worktree_writer::fsync_paths_durable(&files, &dirs)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1497,10 +1525,9 @@ impl Client {
             std::fs::rename(&install_root, &target).with_context(|| {
                 format!("rename {} to {}", install_root.display(), target.display())
             })?;
-            if fsync_requested()
-                && let Some(parent) = target.parent().filter(|p| !p.as_os_str().is_empty())
-            {
-                fsync_dir(parent).context("fsync parent directory after publish")?;
+            if fsync_requested() {
+                fsync_dir(post_rename_fsync_dir(&target))
+                    .context("fsync parent directory after publish")?;
             }
         }
 
@@ -2989,6 +3016,89 @@ mod tests {
         std::os::unix::fs::symlink("top.txt", root.join("link")).unwrap();
         // A full tree with a dangling-capable symlink must fsync cleanly.
         fsync_tree(root).expect("fsync whole tree");
+    }
+
+    #[test]
+    fn collect_fsync_targets_covers_files_dirs_and_index() {
+        // The durability barrier must flush the working-tree files, every
+        // directory that holds one, AND the `.git/index` stat cache that git
+        // consults to decide clean vs dirty. Missing the index is the exact way
+        // a crash leaves a torn tree that `git status` calls clean (D6 / U3).
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join(".git/index"), b"INDEX").unwrap();
+        std::fs::write(root.join("src/main.rs"), b"fn main() {}").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("src/main.rs", root.join("link")).unwrap();
+
+        let mut files = Vec::new();
+        let mut dirs = Vec::new();
+        collect_fsync_targets(root, &mut files, &mut dirs).expect("collect targets");
+
+        assert!(
+            files.iter().any(|p| p.ends_with(".git/index")),
+            "index stat cache must be in the fsync set: {files:?}"
+        );
+        assert!(files.iter().any(|p| p.ends_with("src/main.rs")));
+        // The symlink is persisted via its parent dir, so it is not fsynced
+        // directly.
+        assert!(!files.iter().any(|p| p.ends_with("link")));
+        // Every directory that holds a materialized entry is flushed.
+        assert!(dirs.iter().any(|p| p.ends_with(".git")));
+        assert!(dirs.iter().any(|p| p.ends_with("src")));
+        assert!(dirs.iter().any(|p| p == root));
+
+        // The batched barrier itself must run cleanly over the collected set
+        // (POSIX path here; the io_uring path is exercised on Linux CI).
+        crate::worktree_writer::fsync_paths_durable(&files, &dirs)
+            .expect("durable fsync over collected tree");
+    }
+
+    #[test]
+    fn post_rename_fsync_dir_resolves_relative_target_to_cwd() {
+        // The post-rename durability fsync makes the atomic rename itself
+        // durable (BUILD_OPTIONS: "the target's parent directory after the
+        // atomic rename"). A bare relative `--dir` — the common case, the
+        // README quickstart uses `--dir bun` — has an empty parent. The
+        // resolver must fall back to the containing directory (cwd `.`) so the
+        // fsync runs, not be dropped/skipped (D6).
+        assert_eq!(
+            post_rename_fsync_dir(Path::new("bun")),
+            Path::new("."),
+            "bare relative target must fsync its container (cwd), not be skipped"
+        );
+        // Nested relative and absolute targets already resolve to their real
+        // parent — the fallback must not disturb those.
+        assert_eq!(
+            post_rename_fsync_dir(Path::new("out/bun")),
+            Path::new("out")
+        );
+        assert_eq!(
+            post_rename_fsync_dir(Path::new("/work/bun")),
+            Path::new("/work")
+        );
+        // A trailing slash and a multi-component relative path must still map to
+        // the real container, not the empty/skipped path.
+        assert_eq!(post_rename_fsync_dir(Path::new("bun/")), Path::new("."));
+        assert_eq!(post_rename_fsync_dir(Path::new("a/b/c")), Path::new("a/b"));
+    }
+
+    #[test]
+    fn post_rename_fsync_dir_result_is_syncable() {
+        // Behavior, not just path strings: the resolver's output must be a real
+        // directory that the post-rename `fsync_dir` can actually open and
+        // flush. Pre-fix the bare-relative branch was skipped outright — no
+        // fsync ran at all — so exercise the real syscall for both the relative
+        // (cwd) and nested cases to prove the barrier is not silently dropped.
+        fsync_dir(post_rename_fsync_dir(Path::new("bun")))
+            .expect("bare relative target's container (cwd) must be fsync-able");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let nested = tmp.path().join("bun");
+        assert_eq!(post_rename_fsync_dir(&nested), tmp.path());
+        fsync_dir(post_rename_fsync_dir(&nested))
+            .expect("nested target's real parent must be fsync-able");
     }
 
     #[test]

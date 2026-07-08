@@ -20,9 +20,18 @@ Environment variables for tuning clone performance:
 
 ## fsync durability
 
-A clone is crash-consistent by default: files are written to a temp directory and atomically renamed into place, so a crash mid-clone never leaves a half-written tree at the target path. It does **not** force an fsync durability barrier before reporting success — the same durability model as `git checkout`, and the extra fsyncs add latency on the clone's critical path.
+A clone is crash-consistent by default: files are written to a temp directory and atomically renamed into place, so a crash mid-clone never leaves a half-written tree at the target path. It does **not** force an fsync durability barrier before reporting success — the same durability model as `git checkout` (**design constraint D6**: this default is intentional; a crash can leave a torn tree, and forcing fsync would cost the clone latency that is the product). The default stays off.
 
-If a crash immediately after the clone must not leave a torn tree that `git status` would call clean, set `RIPCLONE_FSYNC=1` (or `true`). The client then recursively fsyncs every file and directory in the materialized tree before it reports success. Off by default.
+If a crash immediately *after* the clone must not leave a torn tree that `git status` would call clean, set `RIPCLONE_FSYNC=1` (or `true`). When enabled, before the clone reports success the client flushes the whole materialized tree:
+
+- every written working-tree **file**,
+- every **directory** that holds one,
+- the **`.git/index` stat cache** (the file git consults to decide clean vs dirty — a torn tree is exactly the case where the index says clean but the file contents were never flushed), and
+- the target's parent directory after the atomic rename, so the rename itself is durable.
+
+This is done efficiently on both writer paths: the Linux io_uring writer batches `IORING_OP_FSYNC` (one submit per queue-depth chunk, not one blocking `fsync` per file); the POSIX fallback fsyncs sequentially. Off by default.
+
+> The `worktree` subcommand is **experimental (alpha)** and does not yet run this durability barrier; an interrupt during a worktree materialize may leave a partial tree. Full hardening is tracked separately. See the [three materialize surfaces](../README.md#which-one-do-i-use) for how `clone --mode editable`, `clone --mode files`, and `worktree` differ.
 
 ## Server-side backends
 

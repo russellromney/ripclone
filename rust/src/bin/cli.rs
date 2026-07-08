@@ -204,7 +204,24 @@ enum Commands {
         dictionary: Option<PathBuf>,
     },
     /// Add a git worktree, materializing the files through overlay staging.
-    /// Run inside an existing ripclone clone.
+    ///
+    /// Run inside an existing ripclone clone: this adds an ADDITIONAL linked
+    /// worktree to a repo you already have locally, reusing its objects (like
+    /// `git worktree add`, accelerated). It does not fetch a repo from the
+    /// server — for that use `clone`.
+    ///
+    /// EXPERIMENTAL (alpha): an interrupt during a worktree materialize may leave
+    /// a partial tree; its interrupt-safety is not yet as hardened as the clone
+    /// path. Full hardening is tracked separately.
+    #[command(
+        long_about = "Add a git worktree, materializing the files through overlay staging.\n\n\
+        Run inside an existing ripclone clone: this adds an ADDITIONAL linked worktree to a repo \
+        you already have locally, reusing its objects (like `git worktree add`, accelerated). \
+        It does not fetch a repo from the server — for that use `clone`.\n\n\
+        EXPERIMENTAL (alpha): an interrupt during a worktree materialize may leave a partial \
+        tree; its interrupt-safety is not yet as hardened as the clone path. Full hardening is \
+        tracked separately."
+    )]
     Worktree {
         /// Path where the new worktree should be created.
         path: PathBuf,
@@ -1455,6 +1472,10 @@ async fn main() -> Result<()> {
             dir,
             repo,
         } => {
+            eprintln!(
+                "note: `worktree` is experimental (alpha); an interrupt during a materialize \
+                 may leave a partial tree"
+            );
             let main_repo = std::env::current_dir()?.join(dir);
             let repo_path = match repo {
                 Some(r) => resolve_repo(&r, &default_provider, &provider_registry)?.1,
