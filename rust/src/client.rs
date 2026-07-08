@@ -3079,6 +3079,26 @@ mod tests {
             post_rename_fsync_dir(Path::new("/work/bun")),
             Path::new("/work")
         );
+        // A trailing slash and a multi-component relative path must still map to
+        // the real container, not the empty/skipped path.
+        assert_eq!(post_rename_fsync_dir(Path::new("bun/")), Path::new("."));
+        assert_eq!(post_rename_fsync_dir(Path::new("a/b/c")), Path::new("a/b"));
+    }
+
+    #[test]
+    fn post_rename_fsync_dir_result_is_syncable() {
+        // Behavior, not just path strings: the resolver's output must be a real
+        // directory that the post-rename `fsync_dir` can actually open and
+        // flush. Pre-fix the bare-relative branch was skipped outright — no
+        // fsync ran at all — so exercise the real syscall for both the relative
+        // (cwd) and nested cases to prove the barrier is not silently dropped.
+        fsync_dir(post_rename_fsync_dir(Path::new("bun")))
+            .expect("bare relative target's container (cwd) must be fsync-able");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let nested = tmp.path().join("bun");
+        assert_eq!(post_rename_fsync_dir(&nested), tmp.path());
+        fsync_dir(post_rename_fsync_dir(&nested))
+            .expect("nested target's real parent must be fsync-able");
     }
 
     #[test]
