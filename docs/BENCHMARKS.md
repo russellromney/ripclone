@@ -13,7 +13,9 @@ volumes can hide.
 
 ripclone pre-builds git artifacts so clones are faster than `git clone` across the Fly bandwidths we tested, from 250 Mbps up to about 1 Gbps. We also have a real high-bandwidth EC2 run for `torvalds/linux` at 1/2/5 Gbps. On fast links the wins are largest; as bandwidth drops the download itself dominates and the gap narrows.
 
-At 1 Gbps, measured speedups over native `git clone` are:
+Every speedup below compares like with like: a full clone against `git clone`, and depth-1 and `files` against `git clone --depth 1` (the closest git equivalent — both fetch only the tip). Comparing `files` against a full `git clone` would inflate the number several-fold, so we don't.
+
+At 1 Gbps, measured speedups are:
 
 - **`oven-sh/bun`**: full clone **11.7×**, depth-1 **3.3×**, files **5.4×**.
 - **`pandas-dev/pandas`**: full clone **7.6×**, depth-1 **6.0×**, files **7.4×**.

@@ -41,9 +41,11 @@ ripclone has three ways to materialize a tree. They are not redundant — they m
 |---|---|---|---|
 | `clone --mode editable` | A full git repo: `.git` (objects + packs) **and** a working tree | Prebuilt clonepack from the **server** | You want a normal repo to commit, branch, `git diff`, and push — the drop-in `git clone`. |
 | `clone --mode files` | **Just the source files** — no `.git`, no history | Prebuilt archive from the **server** | You only need the file contents (agents, CI, build inputs) and never run git in the tree. Fastest path. |
-| `worktree` | An **additional linked git worktree** attached to a repo you already have | The **local repo's** objects (no server fetch) | You already cloned once and want a second checkout (another branch/rev) that shares the existing object store — like `git worktree add`, accelerated. **Experimental (alpha).** |
+| `worktree` | An **additional linked git worktree** attached to a repo you already have | The **local repo's** objects when it already has the rev; otherwise the server's prebuilt archive | You already cloned once and want a second checkout (another branch/rev) that shares the existing object store — like `git worktree add`, accelerated. **Experimental (alpha).** |
 
 Rule of thumb: `clone` brings a repo (or its files) down from the server; `worktree` spins up an extra checkout of a repo you already have. `--mode files` and `worktree` are **not** the same thing — one gives you bare files with no git, the other gives you a fully git-aware linked worktree.
+
+`worktree` always resolves the requested rev against the ripclone server, so it needs the server reachable; it only skips the file download when the local repo is already at that rev.
 
 **Git LFS:** LFS objects come from your git host, not ripclone — run `git lfs pull` after cloning to fetch them. ripclone stores the LFS pointer files (it never stores the blobs); resolving them is a pass-through to your host by design.
 
@@ -53,12 +55,14 @@ See **[Design](docs/DESIGN.md)** for how a clonepack is built and synced.
 
 ripclone pre-builds git artifacts so clones are faster than `git clone`. On fast links the wins are largest; as bandwidth drops the download itself dominates and the gap narrows. At 1 Gbps, on a Fly.io `performance-8x` client against `ripclone-server-dev` (median of 3 runs, cold client cache):
 
-| Repo (1 Gbps) | ripclone full | ripclone depth=1 | ripclone files | `git clone` full |
-|---|---|---|---|---|
-| `oven-sh/bun` | 3.4 s · **11.7×** | 1.0 s · **3.3×** | 0.63 s · **5.4×** | 40.3 s |
-| `pandas-dev/pandas` | 3.0 s · **7.6×** | 0.32 s · **6.0×** | 0.26 s · **7.4×** | 22.8 s |
+| Repo (1 Gbps) | ripclone full | ripclone depth=1 | ripclone files | `git clone` full | `git clone --depth 1` |
+|---|---|---|---|---|---|
+| `oven-sh/bun` | 3.4 s · **11.7×** | 1.0 s · **3.3×** | 0.63 s · **5.4×** | 40.3 s | 3.37 s |
+| `pandas-dev/pandas` | 3.0 s · **7.6×** | 0.32 s · **6.0×** | 0.26 s · **7.4×** | 22.8 s | 1.90 s |
 
 *Mode labels:* `ripclone full` / `ripclone depth=1` are the `editable` mode with `--depth 0` / `--depth 1`; `ripclone files` is `files` mode (HEAD worktree only).
+
+*Baselines:* each speedup compares like with like. `ripclone full` is measured against `git clone` full; `ripclone depth=1` and `ripclone files` are measured against `git clone --depth 1`, the closest git equivalent (both fetch only the tip).
 
 A real high-bandwidth `torvalds/linux` run on EC2 hits **~10×** at 5 Gbps for the full history and **~6×** for depth-1. Full sweep (250/500 Mbps + 1 Gbps, the EC2 high-bandwidth rows, the files-vs-tar.gz comparison, and honest caveats) is in **[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md)**.
 
@@ -87,7 +91,7 @@ ripclone version            # CLI + server versions, with a compatibility verdic
 ripclone update             # check for a newer release
 ```
 
-Hitting a snag? See **[Troubleshooting](docs/TROUBLESHOOTING.md)** (missing libgit2, `202` warming, `401` vs `403`, config drift).
+Hitting a snag? See **[Troubleshooting](docs/TROUBLESHOOTING.md)** (missing shared libraries, `202` warming, `401` vs `403`, config drift).
 
 ### Uninstall
 
@@ -176,14 +180,19 @@ jobs:
     steps:
       - name: Trigger ripclone sync
         run: |
+          # The API expects the SHA-256 hash of the server token, not the token
+          # itself (the CLI hashes it for you; a raw curl must do it here).
+          token_hash=$(printf %s "$RIPCLONE_SERVER_TOKEN" | sha256sum | cut -d' ' -f1)
           curl -fsSL -X POST \
-            -H "Authorization: Ripclone ${{ secrets.RIPCLONE_SERVER_TOKEN }}" \
+            -H "Authorization: Ripclone $token_hash" \
             "${{ vars.RIPCLONE_SERVER }}/v1/repos/github/${{ github.repository_owner }}/${{ github.event.repository.name }}/sync"
+        env:
+          RIPCLONE_SERVER_TOKEN: ${{ secrets.RIPCLONE_SERVER_TOKEN }}
 ```
 
 The `github` in the path is the provider instance (see [`docs/PROVIDERS.md`](docs/PROVIDERS.md)). For private repos the server needs read access to the upstream — configure a token for the provider, or pass one per request in the `X-Upstream-Token` header.
 
-ripclone validates the `RIPCLONE_SERVER_TOKEN`, syncs the mirror, builds artifacts for the new `HEAD`, and returns the artifact hashes.
+ripclone validates the hashed `RIPCLONE_SERVER_TOKEN`, syncs the mirror, builds artifacts for the new `HEAD`, and returns the artifact hashes. (If your secret store already holds the hash, set it as `RIPCLONE_SERVER_TOKEN_HASH` and send it directly.)
 
 ### Native push webhook (no per-repo workflow)
 
@@ -200,7 +209,7 @@ By default the **default branch** is always warmed and other branches only if al
 
 ### Polling fallback
 
-For repos without a webhook, or to catch a missed delivery, set `RIPCLONE_POLL_INTERVAL_SECS` (default `0` = off). The server periodically `ls-remote`s known repos and builds any whose tip moved. This is a backstop; webhooks/Actions are the prompt path.
+For repos without a webhook, or to catch a missed delivery, the server periodically `ls-remote`s known repos and builds any whose tip moved. This is on by default every 5 minutes; `RIPCLONE_POLL_INTERVAL_SECS` tunes it and `0` turns it off. This is a backstop; webhooks/Actions are the prompt path.
 
 ## CLI usage
 

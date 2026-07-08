@@ -2,6 +2,19 @@
 
 This file tracks what has already landed in ripclone. For upcoming work see `internal/ROADMAP.md`.
 
+## Docs that don't lie (adversarial backfill of F5/F6)
+
+Every command in the README and `docs/` was run verbatim against a real server. The ones that didn't work are fixed:
+
+- **`clone --at REV` no longer races `sync --at REV`** (`rust/src/server.rs`): the ref endpoint returned `202 building` only for branch-tip requests, so the documented pairing `ripclone sync <repo> --at REV` → `ripclone clone <repo> --at REV` failed on the first try with "ref is missing clonepack manifest; run sync first" — the full-history phase was still building in the background. Rev-targeted requests now wait the same way tip requests do.
+- **`agent = true` in config now suppresses the token prompt** (`rust/src/bin/cli.rs`): only `RIPCLONE_AGENT=1` did. `provider add` on a TTY would block a fleet VM that opted in via config, contradicting the "never prompts" contract in `AGENTS.md` and `CONFIG.md`.
+- **GitHub Actions trigger sends the right credential** (`README.md`, `docs/examples/github-actions-trigger.yml`): the documented `curl` sent the raw `RIPCLONE_SERVER_TOKEN` and got `401` — the API authenticates with its SHA-256 hash (the CLI hashes it for you). The example workflow also POSTed to `/v1/repos/{owner}/{repo}/sync`, missing the provider segment, and 404'd.
+- **`docs/BACKENDS.md` no longer documents a `ripclone backend` CLI** that was removed: the `config.toml` values are shown directly.
+- **README benchmark table shows its baselines** (`README.md`, `docs/BENCHMARKS.md`): the depth-1 and files speedups are measured against `git clone --depth 1`, not the full `git clone` in the adjacent column, which made the arithmetic look wrong.
+- **`worktree` is honest about needing the server** (`README.md`): it always resolves the rev against the ripclone server; it skips only the file download when the local repo already has that rev.
+- **Polling fallback default corrected** (`README.md`, `docs/CONFIG.md`, `docs/TROUBLESHOOTING.md`): `RIPCLONE_POLL_INTERVAL_SECS` defaults to `300` (on), not `0` (off).
+- **CI now enforces it** (`rust/tests/docs_cli_surface.rs`): every `ripclone <verb>` in the docs must exist on the binary, the removed `track`/`untrack` verbs must stay out, and `clone --mode editable` / `clone --mode files` / `worktree` must remain three real, distinct surfaces (`rust/tests/e2e_agent_fleet.rs`).
+
 ## First-run & error clarity
 
 - **README quick start rewritten to the real first-run flow** (`README.md`): a repo must be **added** before it can be cloned, so the build step is now `ripclone add owner/repo` → `ripclone clone owner/repo` (the old `sync` step errored with `repo not added` post-B5). `--server` is a global flag and is shown correctly — via the `RIPCLONE_SERVER` env var, or before the subcommand — instead of after the repo, where clap rejects it. The previously-undocumented `add` verb is now documented.

@@ -14,7 +14,7 @@ A `202 Accepted` means the artifacts for that commit are still being built. On e
 
 - A depth-1 or `files` clone is ready as soon as phase 1 finishes.
 - A full editable clone (`--depth 0`) waits for the history build.
-- If it never clears, the build is stuck or failing — check the server logs and `GET /readyz`. For webhook-less deploys, set `RIPCLONE_POLL_INTERVAL_SECS` so a missed or stuck build self-heals.
+- If it never clears, the build is stuck or failing — check the server logs and `GET /readyz`. The 5-minute polling fallback (`RIPCLONE_POLL_INTERVAL_SECS`, on by default) re-checks known repos so a missed or stuck build self-heals.
 
 ## `401 Unauthorized` vs `403 Forbidden`
 

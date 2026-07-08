@@ -859,6 +859,14 @@ fn parse_callback(target: &str, expected_state: &str) -> Option<String> {
     token.filter(|t| !t.is_empty())
 }
 
+/// Prompt for a provider token only on a real TTY and never in agent-fleet mode.
+/// A fleet VM must never block on an interactive prompt, even if it somehow has
+/// a TTY attached — and agent mode is agent mode however it was turned on, env
+/// var or `agent = true` in config.
+fn should_prompt_for_token(is_tty: bool, agent: bool) -> bool {
+    is_tty && !agent
+}
+
 async fn run_provider_add(
     id: &str,
     kind: Option<String>,
@@ -866,6 +874,7 @@ async fn run_provider_add(
     auth_template: Option<String>,
     auth_header_name: Option<String>,
     token: Option<String>,
+    agent: bool,
 ) -> Result<()> {
     if id.is_empty() {
         anyhow::bail!("provider id cannot be empty");
@@ -892,10 +901,7 @@ async fn run_provider_add(
     let token = match token {
         Some(t) => Some(t),
         None => {
-            // Prompt for the token only on a real TTY and never in agent-fleet
-            // mode. A fleet VM must never block on an interactive prompt, even
-            // if it somehow has a TTY attached.
-            if std::io::stdin().is_terminal() && !ripclone::config::agent_mode(None) {
+            if should_prompt_for_token(std::io::stdin().is_terminal(), agent) {
                 let prompt = format!("Token for provider '{}': ", id);
                 Some(rpassword::prompt_password(prompt)?)
             } else {
@@ -1066,7 +1072,16 @@ async fn main() -> Result<()> {
                 auth_header_name,
                 token,
             } => {
-                run_provider_add(&id, kind, host, auth_template, auth_header_name, token).await?;
+                run_provider_add(
+                    &id,
+                    kind,
+                    host,
+                    auth_template,
+                    auth_header_name,
+                    token,
+                    ripclone::config::agent_mode(config.agent),
+                )
+                .await?;
             }
             ProviderAction::List => {
                 run_provider_list()?;
@@ -2007,5 +2022,16 @@ token = "from-config"
             Some(v) => unsafe { std::env::set_var(key, v) },
             None => unsafe { std::env::remove_var(key) },
         }
+    }
+
+    #[test]
+    fn provider_add_prompts_only_on_a_tty_outside_agent_mode() {
+        assert!(should_prompt_for_token(true, false));
+        // Agent mode never prompts, however it was turned on — RIPCLONE_AGENT=1
+        // or `agent = true` in config both resolve to `agent == true` here.
+        assert!(!should_prompt_for_token(true, true));
+        // No TTY: never prompt, agent or not.
+        assert!(!should_prompt_for_token(false, false));
+        assert!(!should_prompt_for_token(false, true));
     }
 }

@@ -124,3 +124,50 @@ async fn sync_at_rev_does_not_clobber_tip() {
     );
     assert_repo_usable(&tip1, "3");
 }
+
+/// Regression: the documented pairing `ripclone sync <repo> --at REV` then
+/// `ripclone clone <repo> --at REV` must work on the FIRST try.
+///
+/// A two-phase sync publishes the depth-1 clonepack immediately and the full
+/// history in the background. The ref endpoint used to answer `202 building`
+/// only for branch-tip requests, so a rev-targeted clone raced that background
+/// phase and failed outright with "ref is missing clonepack manifest; run sync
+/// first" — right after the user had run sync. The clone must poll like the tip
+/// path does, so no retry loop here on purpose: a single call has to succeed.
+#[tokio::test]
+async fn clone_at_rev_waits_for_the_background_full_build() {
+    setup(true);
+    let server = start_server().await;
+    let origin = make_origin("acme", "atwait");
+    origin.commit(&[("a.txt", "1\n")], "c1");
+    origin.commit(&[("a.txt", "2\n")], "c2");
+    origin.commit(&[("a.txt", "3\n")], "c3");
+    origin.publish();
+
+    // Register + build the tip first, so the rev build below is the only thing
+    // still in flight when the clone lands.
+    ensure_added(&server, "acme/atwait")
+        .await
+        .expect("add repo");
+
+    let client = server.client();
+    client
+        .sync_repo_at("acme/atwait", Some("HEAD~2"), None)
+        .await
+        .expect("sync at HEAD~2");
+
+    // Immediately clone the full (depth=0) artifacts for that rev. No retries.
+    let (_g, dir) = clone_only_at(
+        &server,
+        "acme",
+        "atwait",
+        Some("HEAD~2"),
+        0,
+        CloneMode::Editable,
+    )
+    .await
+    .expect("clone --at HEAD~2 straight after sync --at HEAD~2");
+    assert_eq!(git(&dir, &["rev-list", "--count", "HEAD"]), "1");
+    assert_eq!(read(&dir, "a.txt"), "1\n");
+    assert_repo_usable(&dir, "1");
+}
