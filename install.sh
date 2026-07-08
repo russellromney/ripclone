@@ -69,14 +69,15 @@ case ":$PATH:" in
   *) echo "ripclone: add $BIN_DIR to your PATH, e.g.  export PATH=\"$BIN_DIR:\$PATH\"" ;;
 esac
 
-# Smoke test: the binaries are statically linked against their C deps (zstd,
-# zlib-ng) and use pure-Rust git + TLS, so they should run on a minimal image
-# with only libc present. If this fails it is a real problem — surface it
-# instead of hiding it (no `|| true`). The most likely cause on an old distro is
-# a host glibc older than the one the release was built against.
+# Smoke test: on Linux the binaries are statically linked against musl (fully
+# self-contained — no libc or C-library runtime dependency at all), so they run
+# on any Linux including Alpine and old glibc distros; on macOS the git + TLS
+# stacks are pure Rust and the C deps (zstd, zlib-ng) are vendored. So the binary
+# should just run. If this fails it is a real problem — surface it instead of
+# hiding it (no `|| true`).
 if ! "$BIN_DIR/ripclone" --version; then
   echo "ripclone: the installed binary failed to run." >&2
-  echo "ripclone: this usually means the host C library is too old for this build." >&2
-  echo "ripclone: 'ldd --version' to check your glibc, or build from source with 'cargo install ripclone --locked'." >&2
+  echo "ripclone: this is unexpected for a static build — please report it at" >&2
+  echo "ripclone: https://github.com/$REPO/issues (or build from source with 'cargo install ripclone --locked')." >&2
   exit 1
 fi
