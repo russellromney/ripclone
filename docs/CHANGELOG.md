@@ -2,6 +2,13 @@
 
 This file tracks what has already landed in ripclone. For upcoming work see `internal/ROADMAP.md`.
 
+## First-run & error clarity
+
+- **README quick start rewritten to the real first-run flow** (`README.md`): a repo must be **added** before it can be cloned, so the build step is now `ripclone add owner/repo` → `ripclone clone owner/repo` (the old `sync` step errored with `repo not added` post-B5). `--server` is a global flag and is shown correctly — via the `RIPCLONE_SERVER` env var, or before the subcommand — instead of after the repo, where clap rejects it. The previously-undocumented `add` verb is now documented.
+- **`docs/WEBHOOKS.md` no longer documents a `track`/`untrack`/`tracked` CLI or `/track` API** that don't exist: the watch-list is the **added-repo set** (`ripclone add` / `DELETE …/add`), and a push warms a repo only when it has been added and passes the allowlist.
+- **Empty-repo clone now names the cause** (`rust/src/server.rs`, `rust/src/git.rs`, `rust/src/gix_util.rs`): cloning or adding a repo with no commits returns `repository has no commits (nothing to clone)` instead of a bare `ref not found` 404.
+- **Upstream git failures surface the real reason** (`rust/src/git.rs`): a failed mirror clone/fetch/ls-remote now threads a sanitized snippet of git's own stderr (e.g. "could not read Username", an HTTP status) into the error instead of a terse `clone mirror failed`. Any credential value is redacted before it lands in the message.
+
 ## Agent-fleet ergonomics
 
 - **`RIPCLONE_AGENT=1` (or `agent = true` in config) turns on fleet-sane clone defaults** (`rust/src/config.rs`, `rust/src/bin/cli.rs`): history defaults to **depth-1** (agents on giant repos don't want full history), and the CLI never prompts. It's a deliberate, explicit opt-in — never a silent size-based switch that would surprise humans. The env var wins over the config default; an explicit `--depth`/`[clone] depth` still wins over agent mode. The human default (`ripclone clone` → full editable history) is unchanged.
