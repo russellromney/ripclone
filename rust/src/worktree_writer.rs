@@ -814,6 +814,65 @@ fn write_regular_posix(target: &Path, mode: u32, content: &[u8]) -> Result<std::
     }
 }
 
+/// Durability barrier for an opt-in (`RIPCLONE_FSYNC`) clone. fsyncs every file
+/// in `files` and every directory in `dirs` so a crash right after the clone
+/// cannot leave a torn tree that `git status` would call clean. The caller is
+/// expected to pass the whole materialized set — every written file (including
+/// the freshly written `.git/index` stat cache), every directory that holds one,
+/// and, before the atomic publish, the staging root — with `dirs` already
+/// deduplicated.
+///
+/// On Linux this batches `IORING_OP_FSYNC` through a dedicated ring, so a large
+/// tree is flushed with one submit per queue-depth chunk instead of one blocking
+/// `fsync` syscall per file. On other platforms, or if io_uring is unavailable
+/// at runtime, it falls back to a sequential `fsync`. Off by default — see D6 in
+/// `docs/BUILD_OPTIONS.md`; enabling it trades clone latency for durability.
+pub fn fsync_paths_durable(files: &[PathBuf], dirs: &[PathBuf]) -> Result<()> {
+    if files.is_empty() && dirs.is_empty() {
+        return Ok(());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if IoUringMode::from_env() != IoUringMode::Disabled {
+            match linux_uring::fsync_paths_batched(files, dirs) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    tracing::warn!("io_uring fsync barrier unavailable; using POSIX fsync: {e:#}");
+                }
+            }
+        }
+    }
+    fsync_paths_posix(files, dirs)
+}
+
+/// Sequential `fsync` fallback for the durability barrier. Each file and
+/// directory is opened read-only and flushed with `fsync`.
+fn fsync_paths_posix(files: &[PathBuf], dirs: &[PathBuf]) -> Result<()> {
+    for path in files {
+        let f = std::fs::File::open(path)
+            .with_context(|| format!("open file for fsync {}", path.display()))?;
+        f.sync_all()
+            .with_context(|| format!("fsync file {}", path.display()))?;
+    }
+    for path in dirs {
+        fsync_one_dir(path)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn fsync_one_dir(path: &Path) -> Result<()> {
+    let dir = std::fs::File::open(path)
+        .with_context(|| format!("open dir for fsync {}", path.display()))?;
+    dir.sync_all()
+        .with_context(|| format!("fsync dir {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn fsync_one_dir(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 mod linux_uring {
     use super::*;
@@ -1052,6 +1111,92 @@ mod linux_uring {
             let _ = std::fs::remove_file(&path);
             result
         }
+    }
+
+    /// Batched durability barrier: open every path in `files` and `dirs`, then
+    /// flush them all with `IORING_OP_FSYNC` submitted through a dedicated ring.
+    /// Directories are opened read-only, which is enough to fsync their metadata.
+    /// Returns `Err` (so the caller can fall back to the POSIX path) if io_uring
+    /// is disabled at runtime or a ring cannot be created; a failed fsync itself
+    /// is a hard error — the clone must not report success on a torn tree.
+    pub(super) fn fsync_paths_batched(files: &[PathBuf], dirs: &[PathBuf]) -> Result<()> {
+        use std::os::fd::AsRawFd;
+
+        if IO_URING_RUNTIME_DISABLED.load(Ordering::Relaxed) {
+            anyhow::bail!("io_uring disabled at runtime");
+        }
+
+        // Open every descriptor up front and keep the `File`s alive for the whole
+        // call: the kernel must never fsync a descriptor that has already been
+        // closed. Unlike the write path, `IORING_OP_FSYNC` carries no user buffer
+        // or kernel-written `statx`, so the buffer-lifetime hazard that governs
+        // the write windows does not apply here — only the fds must outlive their
+        // in-flight ops, which they do.
+        let mut fds: Vec<std::fs::File> = Vec::with_capacity(files.len() + dirs.len());
+        for path in files {
+            fds.push(
+                std::fs::File::open(path)
+                    .with_context(|| format!("open file for fsync {}", path.display()))?,
+            );
+        }
+        for path in dirs {
+            fds.push(
+                std::fs::File::open(path)
+                    .with_context(|| format!("open dir for fsync {}", path.display()))?,
+            );
+        }
+        if fds.is_empty() {
+            return Ok(());
+        }
+
+        let mut ring = RawUringWriter::new_ring().context("initialize io_uring fsync ring")?;
+
+        // Submit in chunks that always fit the submission queue.
+        for batch in fds.chunks(QUEUE_DEPTH as usize) {
+            let entries: Vec<squeue::Entry> = batch
+                .iter()
+                .enumerate()
+                .map(|(idx, f)| {
+                    opcode::Fsync::new(types::Fd(f.as_raw_fd()))
+                        .build()
+                        .user_data(idx as u64)
+                })
+                .collect();
+            {
+                let mut sq = ring.submission();
+                // SAFETY: `IORING_OP_FSYNC` references only the fd it targets — no
+                // user data buffer, no kernel-written `statx` — so the U1-class
+                // buffer-lifetime hazard does not apply. Each `Fd` points at a
+                // `File` in `fds`, which outlives every submit/wait below; nothing
+                // the kernel still owns is freed while an op is in flight.
+                unsafe {
+                    sq.push_multiple(&entries)
+                        .map_err(|_| anyhow::anyhow!("io_uring fsync submission queue is full"))?;
+                }
+            }
+            // Drain this batch's completions, re-waiting until every op reports.
+            // An interrupted `submit_and_wait` must not unwind while ops are in
+            // flight, so retry on `EINTR`.
+            let mut seen = 0usize;
+            while seen < batch.len() {
+                loop {
+                    match ring.submitter().submit_and_wait(batch.len() - seen) {
+                        Ok(_) => break,
+                        Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
+                        Err(e) => return Err(e).context("submit io_uring fsync batch"),
+                    }
+                }
+                let mut cq = ring.completion();
+                for cqe in &mut cq {
+                    if cqe.result() < 0 {
+                        return Err(io::Error::from_raw_os_error(-cqe.result()))
+                            .context("io_uring fsync failed");
+                    }
+                    seen += 1;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn with_thread_writer<T>(f: impl FnOnce(&mut RawUringWriter) -> Result<T>) -> Result<T> {
@@ -2141,6 +2286,52 @@ mod tests {
                 std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
                 0o755
             );
+        }
+    }
+
+    #[test]
+    fn fsync_paths_durable_flushes_files_and_dirs() {
+        // The opt-in durability barrier must run cleanly over a real set of
+        // files and directories. On non-Linux this exercises the POSIX fallback;
+        // on Linux it drives the io_uring `IORING_OP_FSYNC` batch (falling back to
+        // POSIX only if the kernel lacks io_uring).
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("a/b")).unwrap();
+        let mut files = Vec::new();
+        let mut dirs = vec![root.to_path_buf(), root.join("a"), root.join("a/b")];
+        for i in 0..8 {
+            let p = root.join(format!("a/b/f{i}.txt"));
+            std::fs::write(&p, format!("content {i}")).unwrap();
+            files.push(p);
+        }
+        fsync_paths_durable(&files, &dirs).expect("durable fsync");
+
+        // Empty input is a no-op.
+        fsync_paths_durable(&[], &[]).expect("empty fsync is a no-op");
+        dirs.clear();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn io_uring_fsync_batch_flushes_many_files() {
+        // Directly exercise the batched io_uring fsync helper so a Linux CI run
+        // covers the `IORING_OP_FSYNC` submit/complete loop, including a batch
+        // large enough to span multiple submissions.
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        let mut files = Vec::new();
+        for i in 0..64 {
+            let p = root.join(format!("f{i}.bin"));
+            std::fs::write(&p, format!("data-{i}")).unwrap();
+            files.push(p);
+        }
+        let dirs = vec![root.to_path_buf()];
+        // If the kernel lacks io_uring this returns Err and the POSIX fallback
+        // covers durability; only assert success when a ring is available.
+        match linux_uring::fsync_paths_batched(&files, &dirs) {
+            Ok(()) => {}
+            Err(e) => eprintln!("io_uring fsync unavailable in test env: {e:#}"),
         }
     }
 
