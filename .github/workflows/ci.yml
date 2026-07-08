@@ -266,3 +266,27 @@ jobs:
         run: |
           docker run --rm ripclone-server:ci ripclone-server --help
           docker run --rm ripclone-server:ci ripclone-worker --help
+
+  # The static-musl release target. This is the ONLY job that compiles under
+  # `target_env = "musl"`, so it is the only one that exercises the mimalloc
+  # `#[global_allocator]` and the hand-written kernel `struct statx` in
+  # src/statx_compat.rs. It builds the release binaries + the lib test binary for
+  # musl and runs them on a stock Alpine container: a wrong statx offset, a symbol
+  # musl lacks, or a stray dynamic link would first appear at release-tag time
+  # otherwise. Same changes filter as the docker job.
+  musl:
+    needs: changes
+    if: ${{ needs.changes.outputs.docker == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache-workspaces: rust
+          target: x86_64-unknown-linux-musl
+      - name: Install build deps
+        run: bash scripts/install-build-deps.sh
+      - name: Install cargo-zigbuild (musl C cross-toolchain)
+        run: pipx install cargo-zigbuild && pipx inject cargo-zigbuild ziglang
+      - name: Build + run the static musl binaries on Alpine
+        run: bash scripts/musl-smoke.sh

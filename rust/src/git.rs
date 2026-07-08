@@ -247,7 +247,7 @@ where
     Ok(())
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct MaterializedPathStat {
     pub path: Vec<u8>,
     stat: IndexStat,

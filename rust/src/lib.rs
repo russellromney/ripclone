@@ -21,11 +21,40 @@
 // ship capable allocators, so those builds are left untouched. Defined here in
 // the library crate so every binary that links it (ripclone, ripclone-server,
 // ripclone-worker, git-remote-ripclone) picks it up. NOTE: this cfg path only
-// compiles on a musl build — it is exercised by the Docker musl build + CI, not
-// the host `cargo check`.
+// compiles on a musl build — the host `cargo check` never sees it. It is built
+// and run by the `musl` CI job (scripts/musl-smoke.sh).
 #[cfg(target_env = "musl")]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+// `#[global_allocator]` compiles fine even if mimalloc never actually serves an
+// allocation (a stale attribute, a second allocator winning, a link-order
+// surprise). Ask mimalloc itself whether the pointer Rust just handed us came
+// out of its heap. Runs under the `musl` CI job.
+#[cfg(all(test, target_env = "musl"))]
+mod musl_global_allocator {
+    unsafe extern "C" {
+        /// mimalloc's own predicate: true iff `p` lies in a region mimalloc owns.
+        fn mi_is_in_heap_region(p: *const core::ffi::c_void) -> bool;
+    }
+
+    #[test]
+    fn rust_allocations_are_served_by_mimalloc() {
+        let boxed = Box::new(42_u64);
+        assert!(
+            unsafe { mi_is_in_heap_region(std::ptr::from_ref(&*boxed).cast()) },
+            "small Box allocation did not come from mimalloc's heap"
+        );
+
+        // Large allocation: a different mimalloc path (and the one the pack /
+        // archive hot loops hit), still mimalloc-owned.
+        let big = vec![0_u8; 8 << 20];
+        assert!(
+            unsafe { mi_is_in_heap_region(big.as_ptr().cast()) },
+            "8 MiB Vec allocation did not come from mimalloc's heap"
+        );
+    }
+}
 
 /// Wire-protocol version negotiated between the CLI and the server. Bump this
 /// only on a breaking change to the client/server protocol — independent of the
