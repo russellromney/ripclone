@@ -3,10 +3,11 @@ name: release
 # Cut a release by pushing a tag: `git tag v0.1.0 && git push origin v0.1.0`.
 # The git and TLS stacks are pure Rust (gix + rustls), and the remaining C
 # libraries (zstd, zlib-ng, mimalloc) are vendored and statically linked by
-# their -sys crates. The Linux binaries target x86_64-unknown-linux-musl and are
-# FULLY static — no libc dependency at all — so one binary runs on any Linux,
-# Alpine (musl) and glibc distros alike; the core ICP is agents/CI, often in
-# Alpine containers. mimalloc is linked as the global allocator on musl to
+# their -sys crates. The Linux binaries target {x86_64,aarch64}-unknown-linux-musl
+# and are FULLY static — no libc dependency at all — so one binary per arch runs
+# on any Linux, Alpine (musl) and glibc distros alike; the core ICP is agents/CI,
+# often in Alpine containers (increasingly on arm64). cargo-zigbuild cross-builds
+# the aarch64 binary on the x86_64 runner. mimalloc is the global allocator on musl to
 # offset musl's slower default allocator (see src/lib.rs). macOS builds natively.
 # `protobuf-compiler` and `cmake` are build-time only (prost + zlib-ng);
 # cargo-zigbuild supplies the musl C cross-toolchain on the glibc runner.
@@ -31,6 +32,7 @@ jobs:
       matrix:
         include:
           - { os: ubuntu-latest, platform: linux-x86_64, target: x86_64-unknown-linux-musl }
+          - { os: ubuntu-latest, platform: linux-arm64, target: aarch64-unknown-linux-musl }
           - { os: macos-14, platform: macos-arm64, target: "" }
           - { os: macos-13, platform: macos-x86_64, target: "" }
     runs-on: ${{ matrix.os }}
@@ -45,7 +47,13 @@ jobs:
         run: bash scripts/install-build-deps.sh
       - name: Install cargo-zigbuild (Linux musl cross-toolchain)
         if: runner.os == 'Linux'
-        run: pipx install cargo-zigbuild && pipx inject cargo-zigbuild ziglang
+        # cargo-zigbuild finds zig via the `python-zig` app from the `ziglang`
+        # wheel. `pipx inject` does not expose that app on PATH, so cargo-zigbuild
+        # fails with "cannot find binary path". Install both into one venv on PATH.
+        run: |
+          python3 -m venv "$HOME/.zigbuild"
+          "$HOME/.zigbuild/bin/pip" install --quiet cargo-zigbuild "ziglang==0.15.2"
+          echo "$HOME/.zigbuild/bin" >> "$GITHUB_PATH"
       - name: Install build deps (macOS)
         if: runner.os == 'macOS'
         run: brew install protobuf cmake pkg-config libgit2 openssl@3

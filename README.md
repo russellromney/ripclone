@@ -77,7 +77,7 @@ cargo install ripclone --locked
 pip install ripclone
 ```
 
-The prebuilt binaries need no extra runtime packages: git and TLS are pure Rust (`gix` + `rustls`), and the remaining C libraries (`zstd`, `zlib-ng`) are statically linked. They depend only on the system libc, so the one-liner works on a clean machine. `cargo install` builds from source instead.
+The prebuilt binaries need no extra runtime packages: git and TLS are pure Rust (`gix` + `rustls`), and the remaining C libraries (`zstd`, `zlib-ng`) are statically linked. The Linux binaries (x86_64 and arm64) are fully static musl builds with no libc dependency at all, so the one-liner works on any Linux including Alpine and old-glibc containers; the macOS binaries link only the system libraries every Mac ships. `cargo install` builds from source instead.
 
 Check your version and whether the configured server is compatible:
 

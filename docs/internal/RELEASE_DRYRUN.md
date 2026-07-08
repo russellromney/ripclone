@@ -6,14 +6,13 @@ it cuts real tags, spins up clean OS containers, and audits published wheels.
 The automatable repo-hygiene and identity checks are already done in the F3 PR;
 what's left is the release-machinery verification below.
 
-Depends on **F2** (static/vendored-C binaries or an install-time preflight, and
-adding `ripclone-worker` to the release tarball). See the open items at the
-bottom before trusting a green run.
+F2 (static/vendored-C binaries, `ripclone-worker` in the tarball) has merged;
+see the status note at the bottom.
 
 ## 0. Preconditions
 
-- [ ] F2 merged: release binaries either link C deps statically/vendored or
-      `install.sh` runs a preflight that prints the exact `apt`/`brew` line.
+- [ ] Release binaries link their C deps statically/vendored (F2). The Linux
+      binaries are fully static musl (`x86_64` + `aarch64`); no preflight needed.
 - [ ] Release identity confirmed: GitHub remote is `russellromney/ripclone`
       (verified in F3 — `install.sh`/README URLs already match). No repo rename
       needed.
@@ -27,7 +26,7 @@ git push origin v0.1.0-rc.1
 ```
 
 - [ ] `.github/workflows/release.yml` runs to completion for the tag.
-- [ ] GitHub Release has, per platform (`linux-x86_64`, `macos-arm64`,
+- [ ] GitHub Release has, per platform (`linux-x86_64`, `linux-arm64`, `macos-arm64`,
       `macos-x86_64`): `ripclone-<platform>.tar.gz` + `.sha256`.
 - [ ] `install.sh` is attached to the release.
 - [ ] `crates-io` job published (or was intentionally skipped for an rc).
@@ -103,14 +102,21 @@ Fix whatever breaks, re-tag (`-rc.2`, …), rerun sections 2–6. Only cut the r
 
 ---
 
-### Known open items (as of F3)
+### Status (F2 merged)
 
-- **F2 not yet reflected in release machinery.** `release.yml` (build + package
-  steps) and `install.sh` copy only `ripclone`, `ripclone-server`,
-  `git-remote-ripclone` — **`ripclone-worker` is missing from the tarball**, but
-  the README Install line claims all four binaries. F2 owns adding the worker and
-  the static/preflight work. Sections 2–4 will surface the dynamic-linking
-  failures until F2 lands.
-- The release binaries currently link libgit2/openssl/zstd **dynamically**
-  (`release.yml` header). Until F2 changes that, the manylinux audit in section 4
-  is expected to fail — do not treat that as a release blocker before F2.
+F2 landed, so the earlier open items are closed:
+
+- **`ripclone-worker` ships in the tarball.** `release.yml` and `install.sh` copy
+  all four binaries (`ripclone`, `ripclone-server`, `ripclone-worker`,
+  `git-remote-ripclone`), matching the README Install line.
+- **Linux binaries are fully static musl** (`x86_64` and `aarch64`, via
+  cargo-zigbuild), with the C deps (`zstd`, `zlib-ng`, `mimalloc`) vendored and
+  statically linked — no libgit2/openssl/libc dependency at all. Sections 2–4
+  run clean on a bare Alpine container; the manylinux audit in section 4 no
+  longer has external shared libraries to flag.
+
+Verified out-of-band (see the F2/F3 backfill review): both Linux binaries build
+static and run `--version` + a live `ripclone-server` on a stock `alpine:latest`
+container for their arch, and the musl-only paths (the `statx` struct layout and
+the mimalloc global allocator) pass a mutation-checked test suite there. CI runs
+this continuously via `scripts/musl-smoke.sh`.
