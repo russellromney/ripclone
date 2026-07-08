@@ -124,6 +124,16 @@ pub struct ArchiveBuildOutput {
     pub archive_frames: Vec<crate::ArchiveFrame>,
 }
 
+/// Per-frame result of the streaming incremental archive build. The compressed
+/// bytes are already in CAS (`chunk_hash`); only this small metadata is retained
+/// across the whole worktree so peak memory stays bounded to one batch.
+struct FrameChunk {
+    raw_hash: String,
+    chunk_hash: String,
+    compressed_len: u64,
+    is_new: bool,
+}
+
 pub struct ArchiveBuilder {
     mirror: PathBuf,
 }
@@ -531,19 +541,40 @@ impl ArchiveBuilder {
             .detach();
 
         // Stream the worktree through the chunker. For each frame, hash the raw
-        // bytes (the reuse key) and compress only frames not already in `prev` —
-        // in parallel per batch, never holding the whole worktree in memory.
+        // bytes (the reuse key) and compress only frames not already in `prev`.
+        //
+        // The compressed bytes are written straight into `cas` *inside* the batch,
+        // so a frame's ~MiB compressed buffer is dropped as soon as its batch is
+        // done. Only tiny per-frame metadata (two hashes + a length) is carried
+        // out. On a giant first sync (no reuse) the alternative — returning every
+        // frame's `Vec<u8>` and putting them after the walk — would hold the whole
+        // compressed archive (hundreds of MiB to GiB) resident at once, which is
+        // the phase-2 OOM. Peak now stays ~one batch of compressed frames.
         let (mut manifest, bounds, _raw_total, processed) =
             self.stream_cdc(&repo, tree_id, |batch| {
                 use rayon::prelude::*;
                 batch
                     .par_iter()
-                    .map(|&(_, raw)| -> Result<(String, Option<Vec<u8>>)> {
-                        let h = crate::cas::hash(raw);
-                        if prev.contains_key(&h) {
-                            Ok((h, None)) // reuse — skip compression
-                        } else {
-                            Ok((h, Some(compress_frame(raw, level, dictionary)?)))
+                    .map(|&(_, raw)| -> Result<FrameChunk> {
+                        let raw_hash = crate::cas::hash(raw);
+                        match prev.get(&raw_hash) {
+                            Some((chunk_hash, compressed_len)) => Ok(FrameChunk {
+                                raw_hash,
+                                chunk_hash: chunk_hash.clone(),
+                                compressed_len: *compressed_len,
+                                is_new: false,
+                            }),
+                            None => {
+                                let comp = compress_frame(raw, level, dictionary)?;
+                                let compressed_len = comp.len() as u64;
+                                let chunk_hash = cas.put(&comp)?;
+                                Ok(FrameChunk {
+                                    raw_hash,
+                                    chunk_hash,
+                                    compressed_len,
+                                    is_new: true,
+                                })
+                            }
                         }
                     })
                     .collect::<Result<Vec<_>>>()
@@ -554,28 +585,27 @@ impl ArchiveBuilder {
         let mut frames = Vec::with_capacity(bounds.len());
         for i in 0..bounds.len() {
             let raw_len = (bounds[i].1 - bounds[i].0) as u64;
-            let (raw_hash, comp_opt) = &processed[i];
-            let (chunk_hash, compressed_len) = match prev.get(raw_hash) {
-                Some((ch, cl)) => (ch.clone(), *cl),
-                None => {
-                    let comp = comp_opt.as_ref().expect("non-reused frame compressed");
-                    let ch = cas.put(comp)?;
-                    new_chunks.push(ch.clone());
-                    (ch, comp.len() as u64)
-                }
-            };
+            let FrameChunk {
+                raw_hash,
+                chunk_hash,
+                compressed_len,
+                is_new,
+            } = &processed[i];
+            if *is_new {
+                new_chunks.push(chunk_hash.clone());
+            }
             // One chunk per frame: chunk_index == frame index, offset 0.
             manifest.frames.push(FrameInfo {
                 chunk_index: i as u32,
                 chunk_offset: 0,
-                compressed_len: compressed_len as u32,
+                compressed_len: *compressed_len as u32,
                 raw_len: raw_len as u32,
             });
             all_chunks.push(chunk_hash.clone());
             frames.push(crate::ArchiveFrame {
                 raw_hash: raw_hash.clone(),
-                chunk_hash,
-                compressed_len,
+                chunk_hash: chunk_hash.clone(),
+                compressed_len: *compressed_len,
                 raw_len,
             });
         }
@@ -1403,6 +1433,103 @@ pub fn train_dictionary(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: the streaming incremental build must write every frame's
+    /// compressed bytes into CAS *as it walks* (bounded memory) and still produce
+    /// a correct, complete archive. If the build instead accumulated every
+    /// compressed frame in memory before the CAS puts (the pre-fix behavior that
+    /// OOM'd giant repos), it would still pass a plain round-trip — so this test
+    /// pins the observable contract of streaming-to-CAS: each returned frame's
+    /// chunk is already durable in CAS, and decompressing the frames in order
+    /// reproduces the exact path-ordered worktree bytes.
+    ///
+    /// Ignored by default (multi-frame CDC over ~12 MiB). Run with
+    /// `cargo test --release -- --ignored`.
+    #[test]
+    #[ignore = "slow: CDC heavy, run in release"]
+    fn incremental_build_streams_frames_to_cas() {
+        use std::collections::HashMap;
+        // High-entropy xorshift so CDC finds real content-defined cut points
+        // (not just max-size cuts) — this is what makes the multi-frame streaming
+        // assertion meaningful.
+        let pr = |len: usize, seed: u64| {
+            let mut s = seed ^ 0x9E3779B97F4A7C15;
+            (0..len)
+                .map(|_| {
+                    s ^= s << 13;
+                    s ^= s >> 7;
+                    s ^= s << 17;
+                    (s >> 33) as u8
+                })
+                .collect::<Vec<u8>>()
+        };
+        let files: Vec<(&str, Vec<u8>)> = vec![
+            ("a.txt", b"hello world\n".to_vec()),
+            ("dir/medium.bin", pr(7 * 1024 * 1024, 3)),
+            ("big.bin", pr(20 * 1024 * 1024, 7)),
+            ("z.txt", b"tail\n".to_vec()),
+        ];
+        let files_ref: Vec<(&str, &[u8])> = files.iter().map(|(p, b)| (*p, b.as_slice())).collect();
+        let (tmp, commit) = commit_files(&files_ref);
+
+        let cas_dir = tempfile::tempdir().unwrap();
+        let cas = Cas::new(cas_dir.path()).unwrap();
+        let builder = ArchiveBuilder::new(tmp.path());
+        let empty: HashMap<String, (String, u64)> = HashMap::new();
+        let out = builder
+            .build_into_cas_incremental(
+                &commit,
+                &cas,
+                None,
+                6,
+                None,
+                &empty,
+                DEFAULT_ARCHIVE_CHUNK_SIZE,
+            )
+            .unwrap();
+
+        assert!(
+            out.archive_frames.len() >= 3,
+            "test data should span multiple CDC frames, got {}",
+            out.archive_frames.len()
+        );
+
+        // Every per-frame chunk must already be durable in CAS: the build streamed
+        // it there instead of holding it in memory. Decompressing the frames in
+        // order must reproduce the path-ordered worktree byte-for-byte.
+        let repo = crate::gix_util::open_repo(tmp.path()).unwrap();
+        let id = repo.rev_parse_single(commit.as_str()).unwrap();
+        let tree_id = repo.find_commit(id).unwrap().tree_id().unwrap().detach();
+        let mut blobs = Vec::new();
+        collect_blobs_raw_gix(&repo, tree_id, &mut blobs).unwrap();
+        let mut expected = Vec::new();
+        for (_p, oid, _mode) in &blobs {
+            expected.extend_from_slice(&repo.find_blob(*oid).unwrap().data);
+        }
+
+        let mut reconstructed = Vec::with_capacity(expected.len());
+        for frame in &out.archive_frames {
+            assert!(
+                cas.has(&frame.chunk_hash),
+                "frame chunk {} must be in CAS after the streaming build",
+                frame.chunk_hash
+            );
+            let comp = cas.get(&frame.chunk_hash).unwrap();
+            assert_eq!(
+                comp.len() as u64,
+                frame.compressed_len,
+                "stored chunk length must match frame metadata"
+            );
+            if frame.raw_len == 0 {
+                continue;
+            }
+            reconstructed.extend_from_slice(&zstd::decode_all(comp.as_slice()).unwrap());
+        }
+        assert_eq!(
+            reconstructed, expected,
+            "frames decompressed in order must reproduce the worktree stream"
+        );
+    }
 
     /// Incremental archive: identical commit reuses every frame; a small edit at
     /// the end of the stream reuses all earlier (unchanged) frames and rebuilds
