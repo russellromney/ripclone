@@ -65,9 +65,6 @@ databases() {
   ( cd "$ROOT/rust" && cargo test --release --locked --test e2e_worker_libsql -- --nocapture )
 }
 
-# Run the S3-backed remote GC end-to-end suite against a local MinIO container
-# (or any S3-compatible store pointed at by RIPCLONE_S3_ENDPOINT). This is the
-# only place these #[ignored] tests are executed in CI.
 # Benchmark-harness smoke test. The benchmark scripts talk to the server over
 # raw HTTP, so a change to the server's contract (like the B5 added-repos gate)
 # does not recompile them — it silently breaks the harness against the next
@@ -80,13 +77,25 @@ benchmark() {
   bash "$ROOT/scripts/benchmark_smoke.sh"
 }
 
+# Run the S3-backed remote GC end-to-end suite against a local MinIO container
+# (or any S3-compatible store pointed at by RIPCLONE_S3_ENDPOINT). This is the
+# only place these #[ignored] tests are executed in CI.
+#
+# Optional $1: a single test name to run (CI shards one test per runner —
+# see the s3gc-tests/s3gc jobs in ci.yml). Omit it to run the whole suite
+# locally, same as before.
 s3gc() {
+  local test_name="${1:-}"
   export RIPCLONE_S3_ENDPOINT="${RIPCLONE_S3_ENDPOINT:-http://127.0.0.1:9000}"
   export RIPCLONE_S3_BUCKET="${RIPCLONE_S3_BUCKET:-ripclone-test}"
   export RIPCLONE_S3_REGION="${RIPCLONE_S3_REGION:-us-east-1}"
   export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-minioadmin}"
   export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-minioadmin}"
-  ( cd "$ROOT/rust" && cargo test --release --locked --test e2e_remote_gc_s3 -- --ignored )
+  if [ -n "$test_name" ]; then
+    ( cd "$ROOT/rust" && cargo test --release --locked --test e2e_remote_gc_s3 -- --ignored --exact "$test_name" )
+  else
+    ( cd "$ROOT/rust" && cargo test --release --locked --test e2e_remote_gc_s3 -- --ignored )
+  fi
 }
 
 case "$STAGE" in

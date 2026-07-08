@@ -121,14 +121,49 @@ jobs:
       - name: Postgres + MySQL + libsql (queue + metadata) on real servers
         run: bash scripts/ci.sh databases
 
+  # Discover the individual #[ignore = "requires S3 credentials"] test names in
+  # e2e_remote_gc_s3.rs so the s3gc job below can shard one-test-per-runner.
+  # Reading the list at CI time (instead of hand-listing it in the matrix)
+  # means a test added/renamed/removed in that file is picked up automatically
+  # — no separate PR to rebalance a hardcoded shard list.
+  s3gc-tests:
+    needs: changes
+    if: ${{ needs.changes.outputs.docker == 'true' }}
+    runs-on: ubuntu-latest
+    outputs:
+      tests: ${{ steps.list.outputs.tests }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: List ignored S3 test names
+        id: list
+        run: |
+          set -euo pipefail
+          names=$(grep -A2 '#\[ignore = "requires S3 credentials"\]' rust/tests/e2e_remote_gc_s3.rs \
+            | grep -oP 'async fn \K[a-zA-Z0-9_]+(?=\()')
+          json=$(printf '%s\n' "$names" | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          echo "found: $json"
+          echo "tests=$json" >> "$GITHUB_OUTPUT"
+
   # S3-backed remote GC end-to-end suite against a real MinIO container. These
   # tests are #[ignored] in the default cargo suite because they need an S3
   # backend; this job provides one locally and runs them on every PR touching
   # rust/.
+  #
+  # Sharded one test per matrix job (fail-fast: false) so the many minutes of
+  # test bodies (dominated by real S3/build-settling latency, not artificial
+  # sleeps) run in parallel instead of serially. Each job gets its own MinIO
+  # service + S3 bucket, so shards never share S3 state; within a shard the
+  # existing SERVER_LOCK still serializes (there's only ever one test per
+  # shard, so it's a no-op) — no change to the single-binary in-process
+  # serialization that keeps these tests race-free.
   s3gc:
-    needs: changes
+    needs: [changes, s3gc-tests]
     if: ${{ needs.changes.outputs.docker == 'true' }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        test: ${{ fromJSON(needs.s3gc-tests.outputs.tests) }}
     services:
       minio:
         image: minio/minio:latest
@@ -161,8 +196,8 @@ jobs:
           done
           curl -sf http://127.0.0.1:9000/minio/health/live >/dev/null
           aws --endpoint-url http://127.0.0.1:9000 --region us-east-1 s3 mb s3://ripclone-test
-      - name: S3 GC e2e against MinIO
-        run: bash scripts/ci.sh s3gc
+      - name: S3 GC e2e against MinIO (${{ matrix.test }})
+        run: bash scripts/ci.sh s3gc "${{ matrix.test }}"
 
   # Real multi-provider + server-side-token path against a live Gitea. This is
   # the seam a production dogfood found broken but every file:// e2e missed: a
