@@ -2430,6 +2430,19 @@ async fn get_ref_inner(
         }
         _ => {
             state.metrics.record_error();
+            // Distinguish an empty upstream (no commits at all) from a genuinely
+            // missing branch/ref: the former resolves to nothing because there is
+            // nothing to clone, and deserves an actionable message rather than a
+            // bare "ref not found".
+            if git::is_empty_repo(&mirror_dir).unwrap_or(false) {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(ErrorResponse {
+                        error: "repository has no commits (nothing to clone)".to_string(),
+                    }),
+                )
+                    .into_response();
+            }
             (
                 StatusCode::NOT_FOUND,
                 Json(ErrorResponse {
@@ -5079,6 +5092,13 @@ async fn do_sync(
     phases.mirror_fetch_ms = Some(duration_ms(t.elapsed()));
     info!("sync phase: mirror fetch {:?}", t.elapsed());
     t = Instant::now();
+
+    // An empty upstream (no commits) mirrors fine but has nothing to build. Name
+    // the cause instead of letting the rev-parse below fail with an opaque
+    // "resolving rev 'HEAD'" error.
+    if git::is_empty_repo(&mirror_dir).unwrap_or(false) {
+        anyhow::bail!("repository has no commits (nothing to clone)");
+    }
 
     // Resolve the build commit: the rev override (e.g. "HEAD~5") when given,
     // else the branch tip. The override is relative to the just-fetched mirror.

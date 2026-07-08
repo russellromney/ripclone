@@ -438,11 +438,30 @@ pub fn run_git<P: AsRef<Path>>(repo: P, args: &[&str]) -> Result<String> {
 pub struct UpstreamGitError {
     op: &'static str,
     retryable: bool,
+    /// A sanitized snippet of git's own stderr, so the surfaced error names the
+    /// real cause (auth failure, missing repo, HTTP status) instead of a terse
+    /// "clone mirror failed". Any credential is redacted before it lands here.
+    detail: Option<String>,
 }
 
 impl UpstreamGitError {
+    /// Test-only constructor for the detail-free case (the classify_build_error
+    /// unit tests only care about the retryable flag, not git's stderr).
+    #[cfg(test)]
     pub(crate) fn new(op: &'static str, retryable: bool) -> Self {
-        Self { op, retryable }
+        Self {
+            op,
+            retryable,
+            detail: None,
+        }
+    }
+
+    pub(crate) fn with_detail(op: &'static str, retryable: bool, detail: Option<String>) -> Self {
+        Self {
+            op,
+            retryable,
+            detail,
+        }
     }
 
     pub fn is_retryable(&self) -> bool {
@@ -452,7 +471,10 @@ impl UpstreamGitError {
 
 impl std::fmt::Display for UpstreamGitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} failed", self.op)
+        match &self.detail {
+            Some(detail) => write!(f, "{} failed: {}", self.op, detail),
+            None => write!(f, "{} failed", self.op),
+        }
     }
 }
 
@@ -465,6 +487,11 @@ pub fn resolve_commit<P: AsRef<Path>>(repo: P, rev: &str) -> Result<String> {
 
 pub fn default_branch<P: AsRef<Path>>(repo: P) -> Result<String> {
     crate::gix_util::default_branch(repo)
+}
+
+/// True when the mirror holds no references — an empty upstream with no commits.
+pub fn is_empty_repo<P: AsRef<Path>>(repo: P) -> Result<bool> {
+    crate::gix_util::is_empty_repo(repo)
 }
 
 /// The commit's depth in history — the number of commits reachable from it
@@ -1265,11 +1292,46 @@ fn upstream_git_error(
     op: &'static str,
     url: &str,
     auth_header: Option<(String, String)>,
+    stderr: &[u8],
 ) -> anyhow::Error {
-    anyhow::Error::new(UpstreamGitError::new(
-        op,
-        upstream_failure_is_retryable(url, auth_header),
-    ))
+    let detail = sanitize_git_stderr(stderr, auth_header.as_ref());
+    let retryable = upstream_failure_is_retryable(url, auth_header);
+    anyhow::Error::new(UpstreamGitError::with_detail(op, retryable, detail))
+}
+
+/// Distil git's stderr into a short, secret-free snippet for the surfaced error.
+/// Redacts any credential value that might echo back, keeps only the last few
+/// non-empty lines (git's real diagnostic is at the end), and caps the length so
+/// a huge progress dump can't bloat the message.
+fn sanitize_git_stderr(stderr: &[u8], auth_header: Option<&(String, String)>) -> Option<String> {
+    let mut text = String::from_utf8_lossy(stderr).into_owned();
+    if let Some((_, value)) = auth_header
+        && !value.is_empty()
+    {
+        text = text.replace(value.as_str(), "***");
+    }
+    let tail: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    let joined = tail
+        .iter()
+        .rev()
+        .take(3)
+        .rev()
+        .copied()
+        .collect::<Vec<_>>()
+        .join("; ");
+    if joined.is_empty() {
+        return None;
+    }
+    const MAX: usize = 400;
+    if joined.len() > MAX {
+        Some(joined.chars().take(MAX).collect::<String>() + "…")
+    } else {
+        Some(joined)
+    }
 }
 
 fn upstream_failure_is_retryable(url: &str, auth_header: Option<(String, String)>) -> bool {
@@ -1353,7 +1415,12 @@ pub fn ls_remote_commit(
         .output()
         .context("git ls-remote")?;
     if !output.status.success() {
-        return Err(upstream_git_error("ls-remote", &url, auth_header));
+        return Err(upstream_git_error(
+            "ls-remote",
+            &url,
+            auth_header,
+            &output.stderr,
+        ));
     }
     // Output is lines of "<sha>\t<ref>"; take the first ref's SHA.
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1488,21 +1555,26 @@ pub fn sync_bare_mirror<P: AsRef<Path>>(
             args.push("--unshallow");
         }
         args.push("origin");
-        let status = Command::new("git")
+        let output = Command::new("git")
             .args(&git_args)
             .arg("-C")
             .arg(mirror_dir.as_ref().as_os_str())
             .args(&args)
-            .status()
+            .output()
             .context("git fetch")?;
-        if !status.success() {
-            return Err(upstream_git_error("fetch", &url, auth_header));
+        if !output.status.success() {
+            return Err(upstream_git_error(
+                "fetch",
+                &url,
+                auth_header,
+                &output.stderr,
+            ));
         }
     } else {
         // A fresh `--mirror` clone copies every ref (branches, tags, HEAD), so no
         // follow-up branch fetch is needed.
         std::fs::create_dir_all(mirror_dir.as_ref().parent().unwrap_or(Path::new("")))?;
-        let status = Command::new("git")
+        let output = Command::new("git")
             .args(&git_args)
             .args([
                 "clone",
@@ -1518,10 +1590,15 @@ pub fn sync_bare_mirror<P: AsRef<Path>>(
                 &url,
                 &mirror_dir.as_ref().to_string_lossy(),
             ])
-            .status()
+            .output()
             .context("git clone mirror")?;
-        if !status.success() {
-            return Err(upstream_git_error("clone mirror", &url, auth_header));
+        if !output.status.success() {
+            return Err(upstream_git_error(
+                "clone mirror",
+                &url,
+                auth_header,
+                &output.stderr,
+            ));
         }
         // Belt and suspenders: confirm the keys are persisted regardless of how a
         // given git version applied `clone --config`.
@@ -1590,16 +1667,21 @@ fn sync_bare_mirror_rev(
         refspecs.push(branch_refspec);
     }
 
-    let status = Command::new("git")
+    let output = Command::new("git")
         .args(git_args)
         .arg("-C")
         .arg(mirror_dir.as_os_str())
         .args(["fetch", "--no-tags", "origin"])
         .args(&refspecs)
-        .status()
+        .output()
         .context("git fetch rev")?;
-    if !status.success() {
-        return Err(upstream_git_error("fetch rev", url, auth_header));
+    if !output.status.success() {
+        return Err(upstream_git_error(
+            "fetch rev",
+            url,
+            auth_header,
+            &output.stderr,
+        ));
     }
     Ok(())
 }
@@ -2046,6 +2128,45 @@ mod tests {
             globbed.unwrap(),
             None,
             "glob ref name is rejected, not matched"
+        );
+    }
+
+    #[test]
+    fn is_empty_repo_true_until_first_commit() {
+        let base = tempfile::tempdir().unwrap();
+        let repo_dir = base.path().join("empty.git");
+        let repo = crate::test_fixture::init_bare(&repo_dir);
+        assert!(
+            is_empty_repo(&repo_dir).unwrap(),
+            "a fresh bare repo has no refs and is empty"
+        );
+        crate::test_fixture::commit(&repo, &[("README.md", b"hi")]);
+        assert!(
+            !is_empty_repo(&repo_dir).unwrap(),
+            "a repo with a commit is not empty"
+        );
+    }
+
+    #[test]
+    fn sanitize_git_stderr_redacts_credential_and_keeps_tail() {
+        let auth = Some((
+            "Authorization".to_string(),
+            "Bearer ghp_supersecret".to_string(),
+        ));
+        let stderr = b"Cloning into bare repository...\nremote: token Bearer ghp_supersecret rejected\nfatal: could not read Username for 'https://github.com': terminal prompts disabled\n";
+        let out = sanitize_git_stderr(stderr, auth.as_ref()).unwrap();
+        assert!(
+            !out.contains("ghp_supersecret"),
+            "credential value must be redacted, got: {out}"
+        );
+        assert!(out.contains("***"), "redaction marker present");
+        assert!(
+            out.contains("could not read Username"),
+            "the real diagnostic (tail line) is surfaced: {out}"
+        );
+        assert!(
+            sanitize_git_stderr(b"   \n\n", None).is_none(),
+            "blank stderr yields no detail"
         );
     }
 

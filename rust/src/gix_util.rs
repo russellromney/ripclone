@@ -120,6 +120,17 @@ pub fn resolve_commit<P: AsRef<Path>>(repo_path: P, rev: &str) -> Result<String>
     Ok(commit.id.to_string())
 }
 
+/// True when the repository holds no references at all — i.e. an empty upstream
+/// with no commits. A fresh `git clone --mirror` of an empty repo succeeds and
+/// leaves a bare repo with zero refs, so this cleanly distinguishes "nothing to
+/// clone" from "a specific branch/rev is missing".
+pub fn is_empty_repo<P: AsRef<Path>>(repo_path: P) -> Result<bool> {
+    let repo = open_repo(repo_path)?;
+    let platform = repo.references().context("open references")?;
+    let mut iter = platform.all().context("iterate references")?;
+    Ok(iter.next().is_none())
+}
+
 /// Return the name of the current branch (e.g. `main`).
 pub fn default_branch<P: AsRef<Path>>(repo_path: P) -> Result<String> {
     let repo = open_repo(repo_path)?;
