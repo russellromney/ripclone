@@ -28,6 +28,7 @@ jobs:
       pull-requests: read
     outputs:
       docker: ${{ steps.filter.outputs.docker }}
+      bench: ${{ steps.filter.outputs.bench }}
     steps:
       - uses: actions/checkout@v7
       - uses: dorny/paths-filter@v4
@@ -38,6 +39,12 @@ jobs:
               - 'rust/**'
               - 'tests/fly/Dockerfile*'
               - 'scripts/fly_client_test.sh'
+              - '.github/workflows/ci.yml'
+            bench:
+              - 'rust/**'
+              - 'benchmark/**'
+              - 'scripts/benchmark_smoke.sh'
+              - 'scripts/ci.sh'
               - '.github/workflows/ci.yml'
 
   lint:
@@ -225,6 +232,30 @@ jobs:
           echo "RIPCLONE_GITEA_TOKEN=$token" >> "$GITHUB_ENV"
       - name: Gitea provider + server-side-token e2e
         run: bash scripts/ci.sh gitea
+
+  # Benchmark-harness smoke test. The benchmark scripts drive the server over
+  # raw HTTP, so a change to the server's request/response contract does NOT
+  # break them at compile time — it silently rots the harness against the next
+  # deploy (exactly how the B5 added-repos gate broke it unnoticed: the harness
+  # never `add`ed a repo, so a current server would reject every sync with
+  # repo_not_added). This job runs benchmark/fly_shaped_benchmark.sh end-to-end
+  # against a real local ripclone-server and fails if the harness cannot
+  # add/warm/benchmark a fixture repo. Fast tier: debug binaries, file:// origin,
+  # unshaped, one run — a couple of minutes. Gated on a bench-specific path
+  # filter so harness- or server-only PRs run it and docs-only PRs skip it.
+  benchmark:
+    needs: changes
+    if: ${{ needs.changes.outputs.bench == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache-workspaces: rust
+      - name: Install build deps
+        run: bash scripts/install-build-deps.sh
+      - name: Benchmark-harness smoke test (local origin, real server)
+        run: bash scripts/ci.sh benchmark
 
   # Validate the images assemble and the binaries run. The real Dockerfiles use
   # buildkit cargo cache mounts that persist on the Fly/Depot deploy builder but
