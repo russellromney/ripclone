@@ -62,6 +62,17 @@ pub fn should_retry_stale(attempt: u32, max_retries: u32, err: &anyhow::Error) -
     attempt < max_retries && is_stale_signed_url(err)
 }
 
+/// The innermost cause of a reqwest transport error — e.g. "Connection refused
+/// (os error 61)" — without the noisy "error sending request for url (...)"
+/// wrapper that hides the real reason a first-run user can't reach the server.
+fn transport_cause(e: &reqwest::Error) -> String {
+    let mut src: &dyn std::error::Error = e;
+    while let Some(next) = src.source() {
+        src = next;
+    }
+    src.to_string()
+}
+
 /// Turn a non-success HTTP response into a clear, actionable error. Parses the
 /// `{ "error", "code" }` body the gateway returns and appends a next-step hint
 /// keyed on status/code. Surfaces an upgrade nudge from `X-Ripclone-Upgrade`.
@@ -694,6 +705,25 @@ impl Client {
         }
         req
     }
+
+    /// Send a request, turning a transport-level failure — server unreachable,
+    /// connection refused, DNS failure, timeout — into an actionable message that
+    /// names the server. The most common first-run mistake is pointing at a
+    /// server that isn't running (or a wrong `--server` / `RIPCLONE_SERVER`), and
+    /// the bare reqwest chain ("connection refused (os error 61)") hides that.
+    async fn send(&self, req: reqwest::RequestBuilder) -> Result<reqwest::Response> {
+        req.send().await.map_err(|e| {
+            if e.is_connect() || e.is_timeout() {
+                anyhow::anyhow!(
+                    "could not reach ripclone server at {}: {}\n  → is the server running? check --server / RIPCLONE_SERVER",
+                    self.server,
+                    transport_cause(&e),
+                )
+            } else {
+                anyhow::Error::new(e).context("request to ripclone server failed")
+            }
+        })
+    }
 }
 
 impl Client {
@@ -729,7 +759,7 @@ impl Client {
         // success, so the post-clone metrics report can label the clone cold.
         let mut polled = false;
         for attempt in 0..max_attempts {
-            let resp = self.request(reqwest::Method::GET, &url).send().await?;
+            let resp = self.send(self.request(reqwest::Method::GET, &url)).await?;
             let status = resp.status();
             if status == reqwest::StatusCode::ACCEPTED
                 || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
@@ -765,7 +795,7 @@ impl Client {
 
     pub async fn fetch_object(&self, sha: &str) -> Result<Vec<u8>> {
         let url = format!("{}/v1/objects/{}", self.server, sha);
-        let resp = self.http.get(&url).send().await?;
+        let resp = self.send(self.http.get(&url)).await?;
         if !resp.status().is_success() {
             anyhow::bail!("object fetch failed: {}", resp.status());
         }
@@ -956,7 +986,7 @@ impl Client {
             repo_path,
             &format!("/snapshot?branch={branch}&hot_files={hot_files}"),
         );
-        let resp = self.request(reqwest::Method::POST, &url).send().await?;
+        let resp = self.send(self.request(reqwest::Method::POST, &url)).await?;
         if !resp.status().is_success() {
             return Err(server_error("snapshot create failed", resp).await);
         }
@@ -977,7 +1007,7 @@ impl Client {
             repo_path,
             &format!("/hotfiles?branch={branch}&count={count}"),
         );
-        let resp = self.request(reqwest::Method::GET, &url).send().await?;
+        let resp = self.send(self.request(reqwest::Method::GET, &url)).await?;
         if !resp.status().is_success() {
             return Err(server_error("hotfiles failed", resp).await);
         }
@@ -1000,7 +1030,7 @@ impl Client {
             "branch": branch,
             "commit": commit,
         });
-        let resp = self.http.post(&url).json(&body).send().await?;
+        let resp = self.send(self.http.post(&url).json(&body)).await?;
         if !resp.status().is_success() {
             return Err(server_error("batch fetch failed", resp).await);
         }
@@ -1019,7 +1049,7 @@ impl Client {
             .and_then(|s| s.parse().ok())
             .unwrap_or(40usize);
         for attempt in 0..max_attempts {
-            let resp = self.request(reqwest::Method::POST, &url).send().await?;
+            let resp = self.send(self.request(reqwest::Method::POST, &url)).await?;
             let status = resp.status();
             if status == reqwest::StatusCode::OK {
                 return Ok(resp.json().await?);
@@ -1093,7 +1123,7 @@ impl Client {
             .filter(|&n| n > 0)
             .unwrap_or(40);
         for attempt in 0..max_attempts {
-            let resp = self.request(reqwest::Method::POST, &url).send().await?;
+            let resp = self.send(self.request(reqwest::Method::POST, &url)).await?;
             let status = resp.status();
             if status == reqwest::StatusCode::OK {
                 return Ok(resp.json().await?);
@@ -2936,7 +2966,7 @@ impl Client {
             repo_path,
             &format!("/cat?path={}&branch={}", urlencoding::encode(path), branch),
         );
-        let resp = self.request(reqwest::Method::GET, &url).send().await?;
+        let resp = self.send(self.request(reqwest::Method::GET, &url)).await?;
         if !resp.status().is_success() {
             return Err(server_error("cat failed", resp).await);
         }
@@ -3045,5 +3075,33 @@ mod tests {
     fn retry_decision_never_retries_a_non_stale_error() {
         let other = anyhow::anyhow!("repo not found");
         assert!(!should_retry_stale(0, 2, &other));
+    }
+
+    /// A first-run user who points at a server that isn't running (or a wrong
+    /// `--server` / `RIPCLONE_SERVER`) must get a message that names the server
+    /// and says what to check — not the bare reqwest "error sending request"
+    /// chain that hides the real cause.
+    #[tokio::test]
+    async fn unreachable_server_names_the_server_and_hints() {
+        // Bind then immediately drop to claim a port nothing is listening on, so
+        // the connect is refused deterministically.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let client = Client::new(format!("http://127.0.0.1:{port}"));
+        let err = client.add_repo("acme/widget").await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("could not reach ripclone server"),
+            "message names the unreachable server: {msg}"
+        );
+        assert!(
+            msg.contains("RIPCLONE_SERVER") || msg.contains("--server"),
+            "message says what to check: {msg}"
+        );
+        assert!(
+            !msg.contains("error sending request for url"),
+            "the noisy reqwest wrapper is replaced, not surfaced: {msg}"
+        );
     }
 }
