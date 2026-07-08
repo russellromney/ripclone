@@ -47,7 +47,13 @@ jobs:
         run: bash scripts/install-build-deps.sh
       - name: Install cargo-zigbuild (Linux musl cross-toolchain)
         if: runner.os == 'Linux'
-        run: pipx install cargo-zigbuild && pipx inject cargo-zigbuild ziglang
+        # cargo-zigbuild finds zig via the `python-zig` app from the `ziglang`
+        # wheel. `pipx inject` does not expose that app on PATH, so cargo-zigbuild
+        # fails with "cannot find binary path". Install both into one venv on PATH.
+        run: |
+          python3 -m venv "$HOME/.zigbuild"
+          "$HOME/.zigbuild/bin/pip" install --quiet cargo-zigbuild "ziglang==0.15.2"
+          echo "$HOME/.zigbuild/bin" >> "$GITHUB_PATH"
       - name: Install build deps (macOS)
         if: runner.os == 'macOS'
         run: brew install protobuf cmake pkg-config libgit2 openssl@3

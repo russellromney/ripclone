@@ -286,7 +286,14 @@ jobs:
           target: x86_64-unknown-linux-musl
       - name: Install build deps
         run: bash scripts/install-build-deps.sh
-      - name: Install cargo-zigbuild (musl C cross-toolchain)
-        run: pipx install cargo-zigbuild && pipx inject cargo-zigbuild ziglang
+      - name: Install cargo-zigbuild + zig (musl C cross-toolchain)
+        # cargo-zigbuild locates zig via the `python-zig` app that the `ziglang`
+        # wheel installs. `pipx inject` does NOT put that app on PATH (even with
+        # --include-apps), so cargo-zigbuild fails with "cannot find binary
+        # path". A plain venv on PATH exposes both cargo-zigbuild and python-zig.
+        run: |
+          python3 -m venv "$HOME/.zigbuild"
+          "$HOME/.zigbuild/bin/pip" install --quiet cargo-zigbuild "ziglang==0.15.2"
+          echo "$HOME/.zigbuild/bin" >> "$GITHUB_PATH"
       - name: Build + run the static musl binaries on Alpine
         run: bash scripts/musl-smoke.sh
