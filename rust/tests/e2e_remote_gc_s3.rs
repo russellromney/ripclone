@@ -402,9 +402,24 @@ async fn proxy_signed_get_barrier(
         return;
     };
     eprintln!("BARRIER PROXY: response header received, forwarding");
-    if client.write_all(&resp_header).await.is_err() {
+    // `read_response_header` stops at the end of the header block, but its
+    // buffered reads may have already pulled body bytes past the CRLFCRLF
+    // boundary. Forward ONLY the header now, and carry any trailing bytes as the
+    // first body bytes the barrier accounts for. Forwarding the whole buffer
+    // would deliver a small artifact's entire body in one shot (header + body
+    // arriving in the same TCP read), so the "barrier" would hold an
+    // already-drained connection and the clone would complete — the exact
+    // TCP-segmentation nondeterminism that made this test flaky.
+    let header_end = resp_header
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|i| i + 4)
+        .unwrap_or(resp_header.len());
+    let (head, leftover) = resp_header.split_at(header_end);
+    if client.write_all(head).await.is_err() {
         return;
     }
+    let mut pending_body: Vec<u8> = leftover.to_vec();
 
     let (after_bytes, close_on_proceed, entered, proceed) = {
         let mut b = barrier.lock().unwrap();
@@ -422,28 +437,38 @@ async fn proxy_signed_get_barrier(
     };
 
     if entered.is_none() {
-        // Barrier already consumed; just copy the rest.
+        // Barrier already consumed; just copy the rest (buffered body first).
+        if !pending_body.is_empty() && client.write_all(&pending_body).await.is_err() {
+            return;
+        }
         let _ = tokio::io::copy(&mut backend, client).await;
         return;
     }
 
+    // Forward at most `after_bytes` body bytes — from the already-buffered
+    // leftover first, then the backend — then HOLD, keeping the rest of the
+    // artifact undelivered. This stalls the clone deterministically regardless of
+    // how the response was segmented, so the credentials can expire before the
+    // client is forced to retry.
     let mut buf = [0u8; 4096];
     let mut copied = 0usize;
-    loop {
-        if copied >= after_bytes {
-            break;
+    while copied < after_bytes {
+        if pending_body.is_empty() {
+            let need = after_bytes - copied;
+            let to_read = buf.len().min(need);
+            let n = match backend.read(&mut buf[..to_read]).await {
+                Ok(0) => break,
+                Err(_) => return,
+                Ok(n) => n,
+            };
+            pending_body.extend_from_slice(&buf[..n]);
         }
-        let need = after_bytes - copied;
-        let to_read = buf.len().min(need);
-        let n = match backend.read(&mut buf[..to_read]).await {
-            Ok(0) => break,
-            Err(_) => return,
-            Ok(n) => n,
-        };
-        if client.write_all(&buf[..n]).await.is_err() {
+        let take = pending_body.len().min(after_bytes - copied);
+        if client.write_all(&pending_body[..take]).await.is_err() {
             return;
         }
-        copied += n;
+        pending_body.drain(..take);
+        copied += take;
     }
 
     if let Some(entered) = entered {
@@ -459,6 +484,10 @@ async fn proxy_signed_get_barrier(
         return;
     }
 
+    // Released without closing: deliver the held body, then the remainder.
+    if !pending_body.is_empty() && client.write_all(&pending_body).await.is_err() {
+        return;
+    }
     loop {
         match backend.read(&mut buf).await {
             Ok(0) | Err(_) => break,

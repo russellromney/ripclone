@@ -22,7 +22,7 @@ mod common;
 use common::*;
 use ripclone::mode::{CloneMode, clonepack_kind_for_depth};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 /// Build `n` branches on `origin`, each off `main`: branch `bK` adds `K` commits,
@@ -286,8 +286,8 @@ async fn concurrent_same_repo_syncs_and_clones_under_load_get_current_bytes() {
     // Fails if same-key sync coalescing drops waiters under load, if a clone sees
     // a half-published ref while sync is still building, or if concurrent clones
     // corrupt shared artifacts.
+    // Read per-build (not at construction), so it stays set for the whole test.
     unsafe { std::env::set_var("RIPCLONE_BUILD_CONCURRENCY", "8") };
-    unsafe { std::env::set_var("RIPCLONE_MIRROR_FRESH_TTL_SECS", "0") };
     setup(true);
     let server = start_server().await;
     let origin = make_origin("acme", "loadsame");
@@ -319,7 +319,15 @@ async fn concurrent_same_repo_syncs_and_clones_under_load_get_current_bytes() {
         let want = want.clone();
         handles.push(tokio::spawn(async move {
             let mut last = String::new();
-            for _ in 0..80 {
+            // Bound the retry loop by a generous wall-clock deadline rather than a
+            // fixed iteration count: 24 workers each doing a full sync+clone under
+            // load make per-iteration latency unpredictable, so a tight count could
+            // cut off before the server settles c2 on a slow/loaded runner. The
+            // success condition (every worker eventually observes c2) is guaranteed
+            // once the server builds it, so a generous deadline only fails on a real
+            // hang/regression, never on scheduling jitter.
+            let deadline = Instant::now() + Duration::from_secs(90);
+            while Instant::now() < deadline {
                 let _ = client.sync_repo("acme/loadsame", None).await?;
                 let out = tempfile::tempdir().unwrap();
                 let target = out.path().join("clone");

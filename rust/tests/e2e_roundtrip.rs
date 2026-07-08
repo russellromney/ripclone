@@ -262,8 +262,11 @@ async fn corrupt_artifact_fails_clone() {
     origin.publish();
 
     let client = server.client();
-    // The full clonepack (and its manifest) publishes in phase 2, so wait for it.
-    let resp = sync_until_manifest(&server, "acme", "corrupt").await;
+    // Wait until the build fully settles (archive published) so `clonepack_manifest`
+    // is the final, stable full-clone hash. Stopping at the first non-empty manifest
+    // would capture the transient editable hash, which phase-2b then replaces with a
+    // distinct files hash — the clone would fetch the uncorrupted replacement.
+    let resp = sync_until_archive_ready(&server, "acme", "corrupt").await;
 
     // Corrupt the clonepack manifest artifact in the server's CAS.
     let manifest_hash = resp.clonepack_manifest.clone();
@@ -299,8 +302,9 @@ async fn missing_artifact_fails_clone() {
     origin.publish();
 
     let client = server.client();
-    // The full clonepack (and its manifest) publishes in phase 2, so wait for it.
-    let resp = sync_until_manifest(&server, "acme", "missing").await;
+    // Wait for the settled (archive-published) manifest so we remove the exact hash
+    // the clone will resolve, not the transient editable hash phase-2b supersedes.
+    let resp = sync_until_archive_ready(&server, "acme", "missing").await;
     let p = server.cas_path(&resp.clonepack_manifest);
     std::fs::remove_file(&p).unwrap();
 
