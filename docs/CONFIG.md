@@ -39,7 +39,8 @@ Internal tuning knobs use code constants at their current defaults.
   queue backend.
 - `RIPCLONE_WEBHOOK_SECRET_<PROVIDER>`, `RIPCLONE_WEBHOOK_ALLOWLIST`,
   `RIPCLONE_WEBHOOK_WARM_ALL` - webhook authentication and warming policy.
-- `RIPCLONE_POLL_INTERVAL_SECS` - fallback polling interval; `0` disables it.
+- `RIPCLONE_POLL_INTERVAL_SECS` - fallback polling interval, default `300`
+  (on); `0` disables it.
 - `RIPCLONE_REMOTE_GC_INTERVAL_SECS`, `RIPCLONE_REMOTE_GC_GRACE_SECS`,
   `RIPCLONE_REMOTE_GC_DRY_RUN` - remote object garbage collection.
 

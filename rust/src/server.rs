@@ -2113,12 +2113,16 @@ fn full_clonepack_pending_for_tip(info: &RefInfo, clonepack_kind: &str, commit: 
         && !ref_info_serves_commit(info, clonepack_kind, commit)
 }
 
+/// `build_status` set on a phase-1 row while the full history + archive build
+/// runs in the background.
+pub(crate) const BUILDING_FULL_HISTORY: &str = "full history building";
+
 /// Statuses that tell the ref endpoint to return 202 and let the client/sync
 /// path trigger a fresh build.
 fn pending_build_status(info: &RefInfo) -> bool {
     matches!(
         info.build_status.as_deref(),
-        Some("full history building") | Some(crate::remote_gc::EVICTED_BUILD_STATUS)
+        Some(BUILDING_FULL_HISTORY) | Some(crate::remote_gc::EVICTED_BUILD_STATUS)
     )
 }
 
@@ -2180,6 +2184,49 @@ async fn load_ref_info_for_resolved_commit(
     }
 
     None
+}
+
+/// True when a rev-targeted request has a build in flight for `commit` whose
+/// selected clonepack variant is not published yet.
+///
+/// The two-phase sync publishes the depth-1 clonepack first and the full
+/// history + archive a moment later. For a branch-tip request the ref endpoint
+/// answers `202` during that window so the client's poll loop waits. Rev
+/// requests (`sync --at REV` / `clone --at REV`) used to skip that check and
+/// fall through to a `200` carrying an empty full-clonepack manifest, so a
+/// `clone --at REV` issued right after `sync --at REV` failed with "run sync
+/// first" — the exact pairing the CLI docs recommend. Answer `202` instead and
+/// let the client wait, same as the tip path. No enqueue: the sync that created
+/// this row already has a worker on it.
+async fn rev_build_pending_for_commit(
+    ref_store: &Arc<dyn RefStore>,
+    repo_id: &RepoId,
+    effective_branch: &str,
+    rev: &str,
+    commit: &str,
+    clonepack_kind: &str,
+) -> bool {
+    // Only the "still building" status, never EVICTED: an evicted rev has no
+    // worker on it and is handled by the enqueue-a-rebuild path, so answering
+    // 202 here would leave the client polling forever.
+    let building = |info: &RefInfo| {
+        info.commit == commit
+            && info.build_status.as_deref() == Some(BUILDING_FULL_HISTORY)
+            && !ref_info_serves_commit(info, clonepack_kind, commit)
+    };
+    let keys = [
+        ref_store_key(effective_branch, Some(rev), Some(commit)),
+        ref_store_key(effective_branch, Some(rev), None),
+        effective_branch.to_string(),
+    ];
+    for key in keys {
+        if let Ok(Some(info)) = ref_store.load_branch(repo_id, &key).await
+            && building(&info)
+        {
+            return true;
+        }
+    }
+    matches!(ref_store.load_build(repo_id, commit).await, Ok(Some(info)) if building(&info))
 }
 
 async fn get_ref_inner(
@@ -2352,8 +2399,26 @@ async fn get_ref_inner(
                 .await;
             let is_evicted =
                 info.build_status.as_deref() == Some(crate::remote_gc::EVICTED_BUILD_STATUS);
+            // A rev request whose selected clonepack is still building must wait
+            // too, otherwise the documented `sync --at REV` → `clone --at REV`
+            // pairing races the background full-history phase.
+            let pending_for_rev = match params.rev.as_deref() {
+                Some(rev) if !evicted_for_rev => {
+                    rev_build_pending_for_commit(
+                        &state.ref_store,
+                        &repo_id,
+                        &effective_branch,
+                        rev,
+                        &commit,
+                        &params.clonepack,
+                    )
+                    .await
+                }
+                _ => false,
+            };
             if (params.rev.is_none()
                 && full_clonepack_pending_for_tip(&info, &params.clonepack, &commit))
+                || pending_for_rev
                 || evicted_for_rev
             {
                 // Evicted refs have no artifacts to serve; enqueue a rebuild so a

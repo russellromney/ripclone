@@ -24,13 +24,21 @@ file (a project `ripclone.toml` in the working directory does not affect server
 backends). The sections below list the env vars; the same values live under
 `[storage]`, `[metadata]`, and `[queue]` in the file.
 
-Set the file values with the CLI (writes the global `config.toml`, `0600`):
+Write the file values yourself (keep it `0600` — it can hold DB tokens):
 
-```bash
-ripclone backend queue    --backend postgres --url postgres://user:pass@host:5432/ripclone
-ripclone backend metadata --backend postgres --url postgres://user:pass@host:5432/ripclone
-ripclone backend storage  --backend s3 --bucket my-bucket --endpoint https://s3.example.com
-ripclone backend show     # effective values; flags which env var overrides each
+```toml
+[storage]
+backend = "s3"
+bucket = "my-bucket"
+endpoint = "https://s3.example.com"
+
+[metadata]
+backend = "postgres"
+url = "postgres://user:pass@host:5432/ripclone"
+
+[queue]
+backend = "postgres"
+url = "postgres://user:pass@host:5432/ripclone"
 ```
 
 S3 credentials are **never** read from `config.toml`: S3 keys come from

@@ -3,8 +3,12 @@
 #
 # Set these in the *consumer* repo:
 #   - Repository variable: RIPCLONE_SERVER (e.g. https://ripclone.example.com)
-#   - Repository secret:   RIPCLONE_SERVER_TOKEN (the SHA-256 hash of the token
-#                          configured on the ripclone server)
+#   - Repository secret:   RIPCLONE_SERVER_TOKEN (the same raw token the ripclone
+#                          server was started with)
+#
+# The API authenticates with the SHA-256 hash of that token, so the step below
+# hashes it before sending. If your secret store already holds the hash, drop the
+# hashing line and send the secret directly.
 #
 # For private repos, the ripclone server itself must be configured with
 # RIPCLONE_GITHUB_TOKEN that has read access to the consumer repo.
@@ -21,7 +25,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Trigger ripclone sync
+        env:
+          RIPCLONE_SERVER_TOKEN: ${{ secrets.RIPCLONE_SERVER_TOKEN }}
         run: |
+          token_hash=$(printf %s "$RIPCLONE_SERVER_TOKEN" | sha256sum | cut -d' ' -f1)
           curl -fsSL -X POST \
-            -H "Authorization: Ripclone ${{ secrets.RIPCLONE_SERVER_TOKEN }}" \
-            "${{ vars.RIPCLONE_SERVER }}/v1/repos/${{ github.repository_owner }}/${{ github.event.repository.name }}/sync"
+            -H "Authorization: Ripclone $token_hash" \
+            "${{ vars.RIPCLONE_SERVER }}/v1/repos/github/${{ github.repository_owner }}/${{ github.event.repository.name }}/sync"
