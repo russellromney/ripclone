@@ -1,11 +1,15 @@
 name: release
 
 # Cut a release by pushing a tag: `git tag v0.1.0 && git push origin v0.1.0`.
-# Each platform builds natively (no cross-compile). The git and TLS stacks are
-# pure Rust (gix + rustls), and the remaining C libraries (zstd, zlib-ng) are
-# vendored and statically linked by their -sys crates. So the shipped binaries
-# have no libgit2/openssl/zstd runtime dependency; they link only the system
-# libc. `protobuf-compiler` and `cmake` are build-time only (prost + zlib-ng).
+# The git and TLS stacks are pure Rust (gix + rustls), and the remaining C
+# libraries (zstd, zlib-ng, mimalloc) are vendored and statically linked by
+# their -sys crates. The Linux binaries target x86_64-unknown-linux-musl and are
+# FULLY static — no libc dependency at all — so one binary runs on any Linux,
+# Alpine (musl) and glibc distros alike; the core ICP is agents/CI, often in
+# Alpine containers. mimalloc is linked as the global allocator on musl to
+# offset musl's slower default allocator (see src/lib.rs). macOS builds natively.
+# `protobuf-compiler` and `cmake` are build-time only (prost + zlib-ng);
+# cargo-zigbuild supplies the musl C cross-toolchain on the glibc runner.
 #
 # Required repo secrets:
 #   CARGO_REGISTRY_TOKEN  crates.io API token (for the crates-io job)
@@ -26,29 +30,45 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest, platform: linux-x86_64 }
-          - { os: macos-14, platform: macos-arm64 }
-          - { os: macos-13, platform: macos-x86_64 }
+          - { os: ubuntu-latest, platform: linux-x86_64, target: x86_64-unknown-linux-musl }
+          - { os: macos-14, platform: macos-arm64, target: "" }
+          - { os: macos-13, platform: macos-x86_64, target: "" }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           cache-workspaces: rust
+          target: ${{ matrix.target }}
       - name: Install build deps (Linux)
         if: runner.os == 'Linux'
         run: bash scripts/install-build-deps.sh
+      - name: Install cargo-zigbuild (Linux musl cross-toolchain)
+        if: runner.os == 'Linux'
+        run: pipx install cargo-zigbuild && pipx inject cargo-zigbuild ziglang
       - name: Install build deps (macOS)
         if: runner.os == 'macOS'
         run: brew install protobuf cmake pkg-config libgit2 openssl@3
-      - name: Build binaries
+      # Linux: static musl via cargo-zigbuild (zig cc supplies the musl C
+      # cross-toolchain for the vendored -sys crates). macOS: native.
+      - name: Build binaries (Linux musl)
+        if: runner.os == 'Linux'
+        working-directory: rust
+        run: cargo zigbuild --release --locked --target ${{ matrix.target }} --bin ripclone --bin ripclone-server --bin ripclone-worker --bin git-remote-ripclone
+      - name: Build binaries (macOS)
+        if: runner.os == 'macOS'
         working-directory: rust
         run: cargo build --release --locked --bin ripclone --bin ripclone-server --bin ripclone-worker --bin git-remote-ripclone
       - name: Package
         run: |
+          if [ -n "${{ matrix.target }}" ]; then
+            bindir="rust/target/${{ matrix.target }}/release"
+          else
+            bindir="rust/target/release"
+          fi
           dir="ripclone-${{ matrix.platform }}"
           mkdir -p "$dir"
-          cp rust/target/release/ripclone rust/target/release/ripclone-server rust/target/release/ripclone-worker rust/target/release/git-remote-ripclone "$dir/"
+          cp "$bindir/ripclone" "$bindir/ripclone-server" "$bindir/ripclone-worker" "$bindir/git-remote-ripclone" "$dir/"
           cp LICENSE-MIT LICENSE-APACHE "$dir/"
           tar -czf "$dir.tar.gz" "$dir"
           shasum -a 256 "$dir.tar.gz" > "$dir.tar.gz.sha256"

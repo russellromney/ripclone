@@ -268,7 +268,7 @@ pub fn materialized_path_stat_from_metadata(
 #[cfg(target_os = "linux")]
 pub fn materialized_path_stat_from_statx(
     path: Vec<u8>,
-    statx: &libc::statx,
+    statx: &crate::statx_compat::statx,
 ) -> MaterializedPathStat {
     MaterializedPathStat {
         path,
@@ -322,7 +322,7 @@ fn index_stat_from_metadata(metadata: &std::fs::Metadata) -> IndexStat {
 }
 
 #[cfg(target_os = "linux")]
-fn index_stat_from_statx(statx: &libc::statx) -> IndexStat {
+fn index_stat_from_statx(statx: &crate::statx_compat::statx) -> IndexStat {
     IndexStat {
         ctime: gix::index::entry::stat::Time {
             secs: clamp_i64_to_u32(statx.stx_ctime.tv_sec),
