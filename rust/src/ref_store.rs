@@ -67,12 +67,18 @@ fn unbranch_slug(slug: &str) -> Option<String> {
 /// upsert, the S3 ETag CAS); the file store serializes writes in-process.
 ///
 /// Force-push rewinds: an *older* commit has a lower generation, so this guard
-/// would reject it. The sync path handles the common case — when the rewound-to
-/// commit was already built, `reuse_existing_build` re-points authoritatively
-/// (clearing generation so the fresh `synced_at` wins). The residual is a rewind
-/// to a commit that was *never* built as a tip: it lags here until that commit is
-/// built and a later sync reuses it, or until the next forward push. That is the
-/// cost of ordering by history rather than by observation time.
+/// would reject it. Both flavors are handled upstream in the sync path by
+/// clearing generation so the fresh `synced_at` wins:
+/// - a rewind to an *already-built* commit — `reuse_existing_build` re-points
+///   authoritatively;
+/// - a rewind to a commit *never built as a tip* — it is built fresh, and
+///   `build_and_publish_two_phase` re-confirms via `ls-remote` that the freshly
+///   built commit is still the branch tip before clearing generation, so the
+///   confirmed-tip build wins regardless of history depth.
+///
+/// A build that is genuinely stale (upstream moved on during the build, so the
+/// re-check no longer sees it as the tip) keeps its generation and correctly
+/// loses here — recency by observation is only granted to a *confirmed* tip.
 pub(crate) fn should_replace_ref(existing: Option<&RefInfo>, new: &RefInfo) -> bool {
     if new.commit.is_empty() {
         return false;

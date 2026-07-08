@@ -5160,6 +5160,12 @@ async fn do_sync(
         compression_level,
         phases,
         phase2_failure,
+        // A tip build's commit is the just-fetched branch tip; a rev override
+        // (at_rev) targets a specific historical commit, so only the former can
+        // be an authoritative confirmed-tip publish.
+        at_rev.is_none(),
+        provider,
+        credential,
     )
     .await
 }
@@ -5222,6 +5228,13 @@ async fn build_and_publish_two_phase(
     compression_level: i32,
     mut phases: SyncPhases,
     phase2_failure: Option<Phase2FailureAction>,
+    // True when `commit` is the just-fetched branch tip (not a rev override). Only
+    // a tip build can be an authoritative confirmed-tip publish (see the
+    // rewind-to-shallower handling before the phase-1 save_branch below).
+    is_tip_build: bool,
+    // Upstream handle + credential for the confirmed-tip re-check (one ls-remote).
+    provider: &ProviderInstance,
+    credential: Option<&secrecy::SecretString>,
 ) -> Result<SyncBuildResult> {
     let history_target = 512 * 1024 * 1024;
     let upload_conc = upload_concurrency();
@@ -5482,6 +5495,62 @@ async fn build_and_publish_two_phase(
         .unwrap_or_default();
     let prev_archive_frames_for_p2 = carried_archive_frames.clone();
 
+    // History depth (`generation`) is the primary ordering signal in
+    // `should_replace_ref`: a deeper commit wins. That is correct for forward
+    // motion but wrong for a force-push that *rewinds* the branch to a commit with
+    // a shallower history — the fresh, correct tip build would have a lower
+    // generation than the stranded deep ref and be silently rejected, so the ref
+    // keeps serving the abandoned commit and clones get the wrong tree.
+    //
+    // `reuse_existing_build` already handles the rewind-to-an-already-built commit
+    // by clearing generation so the fresh `synced_at` wins. The residual is a
+    // rewind to a commit that was *never* built as a tip: it is built fresh here.
+    // Detect that case (a tip build whose generation is *shallower* than the
+    // existing ref's) and, only then, re-confirm against upstream that this commit
+    // is still the branch tip. If it is, clear generation so this authoritative
+    // confirmed-tip build wins on `synced_at`. If upstream has already moved on
+    // (a concurrent force-push during our build), this build is genuinely stale of
+    // an old commit — keep generation so it correctly loses to the newer ref.
+    let mut generation = git::commit_depth(mirror_dir, commit).ok();
+    let rewound_to_shallower = is_tip_build
+        && matches!(
+            (prev.as_ref().map(|p| (p.commit.as_str(), p.generation)), generation),
+            (Some((prev_commit, Some(prev_gen))), Some(new_gen))
+                if prev_commit != commit && new_gen < prev_gen
+        );
+    if rewound_to_shallower {
+        let provider_rc = provider.clone();
+        let repo_id_rc = repo_id.clone();
+        let branch_rc = branch.to_string();
+        let credential_rc = credential.cloned();
+        let upstream_tip = {
+            let _probe_permit = fetch_semaphore()
+                .acquire()
+                .await
+                .expect("fetch semaphore never closed");
+            tokio::task::spawn_blocking(move || {
+                git::ls_remote_commit(
+                    &provider_rc,
+                    &repo_id_rc,
+                    &branch_rc,
+                    credential_rc.as_ref(),
+                )
+            })
+            .await
+            .unwrap_or(Ok(None))
+        };
+        if let Ok(Some(tip)) = upstream_tip
+            && tip == commit
+        {
+            info!(
+                "confirmed-tip rewind: {} is the upstream tip of {}@{branch}; publishing authoritatively over deeper stranded ref",
+                &commit[..7.min(commit.len())],
+                repo_id.storage_key()
+            );
+            generation = None;
+        }
+    }
+
     let mut info = RefInfo {
         commit: commit.to_string(),
         parent_commit: parent.clone(),
@@ -5518,7 +5587,7 @@ async fn build_and_publish_two_phase(
         build_ms: None,
         synced_at: fetched_at,
         last_accessed_at: fetched_at,
-        generation: git::commit_depth(mirror_dir, commit).ok(),
+        generation,
         warm_pinned: prev_warm_pinned,
     };
 
