@@ -76,16 +76,13 @@ care what started it. No `Dispatcher` trait in OSS is needed to enable that.
 
 ## Worker flags
 
-Added to the existing claim→build→ack loop. Both are **flag or env** (same env bag
-a compute provider delivers to a fresh process — the provider does not know which
-mode it is in):
+Added to the existing claim→build→ack loop:
 
-- **`--idle-exit-secs N`** / `RIPCLONE_IDLE_EXIT_SECS` — exit after the queue is
-  empty for N seconds (default off = today's forever loop). Idle-exit must be
-  atomic with claiming: exit only on a claim attempt that comes back empty. A job
-  landing in the exit window is covered by the reconcile cron.
-- **`--max-jobs N`** / `RIPCLONE_MAX_JOBS` — exit after N builds (one-shot
-  platforms). Optional.
+- **`--idle-exit-secs N`** — exit after the queue is empty for N seconds (default
+  off = today's forever loop). Idle-exit must be atomic with claiming: exit only on
+  a claim attempt that comes back empty. A job landing in the exit window is covered
+  by the reconcile cron.
+- `--max-jobs N` — exit after N builds (one-shot platforms). Optional.
 
 Crash safety is unchanged: a dead worker's job is reclaimed by the existing stale
 timeout inside `claim()`, and (the gap at zero scale) the reconcile cron re-dispatches

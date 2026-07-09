@@ -1,7 +1,7 @@
 //! Worker lifecycle: `--idle-exit-secs` (scale-to-zero drain) and `--max-jobs`
 //! (one-shot). Real `ripclone-worker` binary against the sqlite queue.
 //!
-//! Specs: docs/internal/DISPATCHER.md — exit only on empty claim after N seconds;
+//! Specs: docs/SCALING_WORKERS.md — exit only on empty claim after N seconds;
 //! drain the full queue before idle-exit; a job during the idle wait is claimed
 //! by the same worker; a job in the exit window (after exit) is picked up on
 //! next start; max-jobs exits after N builds; both flags readable from env bag.
