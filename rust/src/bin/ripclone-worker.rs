@@ -25,6 +25,15 @@
 //!   empty claim attempts (scale-to-zero). Off by default.
 //! - `RIPCLONE_MAX_JOBS` / `--max-jobs`: exit after N builds (one-shot
 //!   platforms). Off by default.
+//! - `RIPCLONE_WORKER_HEARTBEAT` (default off): when set to `queue` (or the
+//!   queue DSN / a truthy `1`/`true`), the worker writes a row into the queue
+//!   DB's `workers` registry so a dispatcher autoscaler can count live
+//!   workers. Self-hosters without a dispatcher leave this unset — the worker
+//!   is byte-for-byte unchanged.
+//! - `RIPCLONE_WORKER_HEARTBEAT_TIMEOUT_SECS` (default 60): soft age-out for
+//!   live-count (must exceed the interval so a healthy worker never looks dead).
+//! - `RIPCLONE_WORKER_HEARTBEAT_INTERVAL_SECS` (default timeout/3): how often
+//!   the worker refreshes its registry row (including mid-build).
 //!
 //! ## Topology constraints
 //!
@@ -40,18 +49,49 @@
 //! - **Lifecycle is opt-in.** Without the flags the loop runs forever (today's
 //!   behavior). With them a compute provider can drain-and-exit without knowing
 //!   which mode it is in — both flags live in the same env bag.
+//! - **Heartbeat is opt-in.** Off by default so single-worker self-host never
+//!   touches the registry. Enable only when a dispatcher (or anything else)
+//!   needs live-worker visibility.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 use ripclone::backends::{self, Backends};
 use ripclone::metrics::Metrics;
-use ripclone::queue::{BuildError, BuildJob, JobQueue, JobQueueRef, JobState};
+use ripclone::queue::{
+    BuildError, BuildJob, JobQueue, JobQueueRef, JobState, SqlJobQueue, make_worker_id,
+    validate_heartbeat_timing, worker_heartbeat_enabled_from_env, worker_heartbeat_interval_secs,
+};
 use ripclone::server::{ServerState, mark_branch_build_failed, process_build_job};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
+
+/// Spawn a background task that periodically upserts this worker's registry
+/// row. `current_job` is `-1` when idle, else the claimed job id.
+fn spawn_heartbeat_loop(
+    queue: Arc<SqlJobQueue>,
+    worker_id: String,
+    current_job: Arc<AtomicI64>,
+    interval: Duration,
+) {
+    tokio::spawn(async move {
+        loop {
+            let job = match current_job.load(Ordering::Relaxed) {
+                n if n < 0 => None,
+                id => Some(id),
+            };
+            if let Err(e) = queue.heartbeat(&worker_id, job).await {
+                // Fail loudly in logs; keep trying so a transient DB blip does
+                // not permanently hide a live worker from the autoscaler.
+                error!("worker heartbeat failed: {e:#}");
+            }
+            tokio::time::sleep(interval).await;
+        }
+    });
+}
 
 #[derive(Parser)]
 #[command(name = "ripclone-worker")]
@@ -110,16 +150,46 @@ async fn main() -> Result<()> {
     let b = Backends::from_env(&args.cas_dir, &args.repo_root, &metrics).await?;
     let state = ServerState::for_worker(b, queue.clone() as JobQueueRef, metrics)?;
 
-    let worker_id = format!("worker-{}", std::process::id());
+    // Fleet-unique id (host/machine + pid + start nanos). PID-only collides
+    // across machines and under-counts the live fleet in the registry.
+    let worker_id = make_worker_id();
+    let heartbeat_on = worker_heartbeat_enabled_from_env()?;
+    // -1 = idle; non-negative = claimed job id. Background heartbeat task reads it.
+    // Only allocated when heartbeat is on so the disabled path stays lean.
+    let current_job = heartbeat_on.then(|| Arc::new(AtomicI64::new(-1)));
+    if heartbeat_on {
+        if !queue.supports_worker_registry() {
+            bail!(
+                "RIPCLONE_WORKER_HEARTBEAT is set but RIPCLONE_QUEUE={} does not \
+                 support the workers registry (need sqlite or libsql; postgres/mysql lag)",
+                backends::queue_kind()
+            );
+        }
+        let interval_secs = worker_heartbeat_interval_secs();
+        let timeout_secs = queue.heartbeat_timeout_secs();
+        validate_heartbeat_timing(interval_secs, timeout_secs)?;
+        let interval = Duration::from_secs(interval_secs);
+        info!(
+            "worker heartbeat enabled (interval={}s, timeout={}s)",
+            interval.as_secs(),
+            timeout_secs
+        );
+        spawn_heartbeat_loop(
+            queue.clone(),
+            worker_id.clone(),
+            current_job.clone().expect("heartbeat current_job"),
+            interval,
+        );
+    }
     match args.max_size_class.as_deref() {
         Some(ceiling) => info!(
-            "ripclone-worker {worker_id} polling {} queue (max-size-class={ceiling}, idle_exit_secs={:?}, max_jobs={:?})",
+            "ripclone-worker {worker_id} polling {} queue (max-size-class={ceiling}, idle_exit_secs={:?}, max_jobs={:?}, heartbeat={heartbeat_on})",
             backends::queue_kind(),
             args.idle_exit_secs,
             args.max_jobs,
         ),
         None => info!(
-            "ripclone-worker {worker_id} polling {} queue (idle_exit_secs={:?}, max_jobs={:?})",
+            "ripclone-worker {worker_id} polling {} queue (idle_exit_secs={:?}, max_jobs={:?}, heartbeat={heartbeat_on})",
             backends::queue_kind(),
             args.idle_exit_secs,
             args.max_jobs,
@@ -151,6 +221,10 @@ async fn main() -> Result<()> {
             Ok(Some(claimed)) => {
                 idle_since = None;
                 let job_id = claimed.id;
+                // Surface the active claim to the heartbeat task (if any).
+                if let Some(ref cur) = current_job {
+                    cur.store(job_id, Ordering::Relaxed);
+                }
                 let repo_id = claimed.repo_id();
                 info!(
                     "claimed job {} for {}@{}",
@@ -220,6 +294,9 @@ async fn main() -> Result<()> {
                          finished; discarding its build result"
                     ),
                     Err(e) => error!("failed to ack job {job_id}: {e}"),
+                }
+                if let Some(ref cur) = current_job {
+                    cur.store(-1, Ordering::Relaxed);
                 }
                 jobs_done += 1;
                 if let Some(max) = args.max_jobs

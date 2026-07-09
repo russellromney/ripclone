@@ -6,8 +6,8 @@
 use super::sql::{
     ADD_ATTEMPTS_COLUMN_SQL, ADD_CREDENTIAL_COLUMN_SQL, ADD_SIZE_CLASS_COLUMN_SQL,
     CREATE_ACTIVE_KEY_INDEX_SQL, CREATE_HISTORY_INDEX_SQL, CREATE_STATUS_INDEX_SQL,
-    CREATE_TABLE_SQL, DROP_LEGACY_ACTIVE_KEY_INDEX_SQL, QueueDb, SUPERSEDED_BY_NEWER_QUEUED,
-    now_secs,
+    CREATE_TABLE_SQL, CREATE_WORKERS_HEARTBEAT_INDEX_SQL, CREATE_WORKERS_TABLE_SQL,
+    DROP_LEGACY_ACTIVE_KEY_INDEX_SQL, QueueDb, SUPERSEDED_BY_NEWER_QUEUED, now_secs,
 };
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -65,6 +65,13 @@ impl QueueDb for LibsqlDb {
         conn.execute(CREATE_HISTORY_INDEX_SQL, ())
             .await
             .context("create history index")?;
+        // Worker heartbeat/registry for dispatcher live-count (D3).
+        conn.execute(CREATE_WORKERS_TABLE_SQL, ())
+            .await
+            .context("create workers table")?;
+        conn.execute(CREATE_WORKERS_HEARTBEAT_INDEX_SQL, ())
+            .await
+            .context("create workers heartbeat index")?;
         Ok(())
     }
 
@@ -340,5 +347,66 @@ impl QueueDb for LibsqlDb {
             )
             .await
             .context("prune failed jobs")
+    }
+
+    fn supports_worker_registry(&self) -> bool {
+        true
+    }
+
+    async fn upsert_heartbeat(
+        &self,
+        worker_id: &str,
+        max_size_class: Option<i64>,
+        current_job: Option<i64>,
+        now: i64,
+    ) -> Result<()> {
+        let max_sc = match max_size_class {
+            Some(n) => libsql::Value::Integer(n),
+            None => libsql::Value::Null,
+        };
+        let cur = match current_job {
+            Some(n) => libsql::Value::Integer(n),
+            None => libsql::Value::Null,
+        };
+        self.conn()
+            .await?
+            .execute(
+                "INSERT INTO workers (worker_id, max_size_class, current_job, last_heartbeat)
+                 VALUES (?, ?, ?, ?)
+                 ON CONFLICT(worker_id) DO UPDATE SET
+                     max_size_class = excluded.max_size_class,
+                     current_job = excluded.current_job,
+                     last_heartbeat = excluded.last_heartbeat",
+                libsql::params![worker_id, max_sc, cur, now],
+            )
+            .await
+            .context("upsert worker heartbeat")?;
+        Ok(())
+    }
+
+    async fn count_live_workers(&self, cutoff: i64) -> Result<i64> {
+        let conn = self.conn().await?;
+        let mut rows = conn
+            .query(
+                "SELECT count(*) FROM workers WHERE last_heartbeat >= ?",
+                [cutoff],
+            )
+            .await
+            .context("count live workers")?;
+        match rows.next().await? {
+            Some(row) => Ok(row.get::<i64>(0)?),
+            None => Ok(0),
+        }
+    }
+
+    async fn prune_stale_workers(&self, cutoff: i64) -> Result<u64> {
+        self.conn()
+            .await?
+            .execute(
+                "DELETE FROM workers WHERE last_heartbeat < ?",
+                libsql::params![cutoff],
+            )
+            .await
+            .context("prune stale workers")
     }
 }

@@ -203,11 +203,181 @@ pub trait QueueDb: Send + Sync {
     /// number removed. `done` jobs are intentionally kept (they are the build /
     /// version-live-at-time-T history and stay small at real commit rates).
     async fn prune_failed(&self, cutoff: i64) -> Result<u64>;
+
+    /// Whether this engine owns a `workers` registry table (sqlite/libsql).
+    /// Lagging backends return false — heartbeat and live-count must fail
+    /// loudly rather than silently report a zero fleet.
+    fn supports_worker_registry(&self) -> bool {
+        false
+    }
+
+    /// Upsert a worker heartbeat row (`workers` registry). Blessed backends
+    /// only (sqlite/libsql). Lagging backends error — never silently no-op.
+    async fn upsert_heartbeat(
+        &self,
+        _worker_id: &str,
+        _max_size_class: Option<i64>,
+        _current_job: Option<i64>,
+        _now: i64,
+    ) -> Result<()> {
+        anyhow::bail!(
+            "worker registry requires RIPCLONE_QUEUE=sqlite|libsql \
+             (postgres/mysql lag the workers table)"
+        )
+    }
+
+    /// Count workers with `last_heartbeat >= cutoff`. Blessed backends only.
+    async fn count_live_workers(&self, _cutoff: i64) -> Result<i64> {
+        anyhow::bail!(
+            "worker registry requires RIPCLONE_QUEUE=sqlite|libsql \
+             (postgres/mysql lag the workers table)"
+        )
+    }
+
+    /// Delete workers with `last_heartbeat < cutoff` (hard age-out). Blessed
+    /// backends only.
+    async fn prune_stale_workers(&self, _cutoff: i64) -> Result<u64> {
+        anyhow::bail!(
+            "worker registry requires RIPCLONE_QUEUE=sqlite|libsql \
+             (postgres/mysql lag the workers table)"
+        )
+    }
 }
 
 /// Default retention for `failed` jobs (seconds) before they are pruned. `done`
 /// jobs are never pruned. Override with `RIPCLONE_QUEUE_FAILED_RETENTION_SECS`.
 const DEFAULT_FAILED_RETENTION_SECS: i64 = 7 * 24 * 3600;
+
+/// Soft age-out for worker heartbeats (seconds). A worker is "live" when its
+/// last heartbeat is newer than `now - this`. Override with
+/// `RIPCLONE_WORKER_HEARTBEAT_TIMEOUT_SECS`. Must be longer than the worker's
+/// heartbeat interval so a healthy worker is never counted dead between beats.
+pub const DEFAULT_HEARTBEAT_TIMEOUT_SECS: i64 = 60;
+
+/// Whether the worker should write heartbeat rows into the queue registry.
+///
+/// `RIPCLONE_WORKER_HEARTBEAT`:
+/// - unset / empty → disabled (self-host default)
+/// - `queue` / `1` / `true` / `yes` / `on` → write to the connected queue DB
+/// - the same value as `RIPCLONE_QUEUE_DB_URL` → same (target is the queue itself)
+/// - anything else → hard error (fail loudly; do not silently ignore)
+pub fn worker_heartbeat_enabled_from_env() -> Result<bool> {
+    worker_heartbeat_enabled(std::env::var("RIPCLONE_WORKER_HEARTBEAT").ok(), || {
+        std::env::var("RIPCLONE_QUEUE_DB_URL").ok()
+    })
+}
+
+/// Pure form of [`worker_heartbeat_enabled_from_env`] for tests.
+pub fn worker_heartbeat_enabled(
+    heartbeat_env: Option<String>,
+    queue_url: impl FnOnce() -> Option<String>,
+) -> Result<bool> {
+    let Some(raw) = heartbeat_env else {
+        return Ok(false);
+    };
+    let s = raw.trim();
+    if s.is_empty() {
+        return Ok(false);
+    }
+    let lower = s.to_ascii_lowercase();
+    if matches!(lower.as_str(), "queue" | "1" | "true" | "yes" | "on") {
+        return Ok(true);
+    }
+    if let Some(url) = queue_url()
+        && s == url
+    {
+        return Ok(true);
+    }
+    anyhow::bail!(
+        "RIPCLONE_WORKER_HEARTBEAT={s:?}: expected 'queue' (or the queue DSN / \
+         truthy 1|true) to write the workers registry, or leave unset to disable"
+    )
+}
+
+/// How often the worker refreshes its registry row (seconds).
+/// Default = timeout/3 (at least 1s). Override with
+/// `RIPCLONE_WORKER_HEARTBEAT_INTERVAL_SECS`.
+pub fn worker_heartbeat_interval_secs() -> u64 {
+    worker_heartbeat_interval_secs_from(
+        std::env::var("RIPCLONE_WORKER_HEARTBEAT_INTERVAL_SECS").ok(),
+        std::env::var("RIPCLONE_WORKER_HEARTBEAT_TIMEOUT_SECS").ok(),
+    )
+}
+
+/// Pure form of [`worker_heartbeat_interval_secs`] for tests.
+pub fn worker_heartbeat_interval_secs_from(
+    interval_env: Option<String>,
+    timeout_env: Option<String>,
+) -> u64 {
+    if let Some(n) = interval_env
+        .and_then(|s| s.parse().ok())
+        .filter(|&n: &u64| n >= 1)
+    {
+        return n;
+    }
+    let timeout = timeout_env
+        .and_then(|s| s.parse().ok())
+        .filter(|&n: &u64| n >= 1)
+        .unwrap_or(DEFAULT_HEARTBEAT_TIMEOUT_SECS as u64);
+    (timeout / 3).max(1)
+}
+
+/// Build a fleet-unique worker id. PID alone collides across machines (two
+/// containers with the same pid would overwrite one registry row and under-
+/// count the live fleet). Prefer `FLY_MACHINE_ID` / `HOSTNAME`, then pid +
+/// a start-time nanos suffix.
+pub fn make_worker_id() -> String {
+    make_worker_id_parts(
+        std::env::var("FLY_MACHINE_ID")
+            .ok()
+            .or_else(|| std::env::var("HOSTNAME").ok()),
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+    )
+}
+
+/// Pure form of [`make_worker_id`] for tests.
+pub fn make_worker_id_parts(host: Option<String>, pid: u32, nanos: u128) -> String {
+    let host = host
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "local".into());
+    // Sanitize host so it stays a single token in logs / SQL keys.
+    let host: String = host
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    format!("{host}-{pid}-{nanos}")
+}
+
+/// Fail loudly when heartbeat is enabled but the interval is not strictly
+/// less than the soft age-out timeout (otherwise a healthy worker looks dead
+/// between beats and the autoscaler over-spawns).
+pub fn validate_heartbeat_timing(interval_secs: u64, timeout_secs: i64) -> Result<()> {
+    if timeout_secs < 1 {
+        anyhow::bail!("RIPCLONE_WORKER_HEARTBEAT_TIMEOUT_SECS must be >= 1, got {timeout_secs}");
+    }
+    if interval_secs < 1 {
+        anyhow::bail!("RIPCLONE_WORKER_HEARTBEAT_INTERVAL_SECS must be >= 1, got {interval_secs}");
+    }
+    if interval_secs as i64 >= timeout_secs {
+        anyhow::bail!(
+            "RIPCLONE_WORKER_HEARTBEAT_INTERVAL_SECS ({interval_secs}) must be < \
+             RIPCLONE_WORKER_HEARTBEAT_TIMEOUT_SECS ({timeout_secs}) so a healthy \
+             worker is never counted dead between beats"
+        );
+    }
+    Ok(())
+}
 
 /// Cross-process queue over a [`QueueDb`].
 pub struct SqlJobQueue {
@@ -220,6 +390,9 @@ pub struct SqlJobQueue {
     /// Inclusive rank ceiling for this process (`--max-size-class`). `None` =
     /// no ceiling, claim everything (single-worker self-host unchanged).
     max_size_class: Option<i64>,
+    /// How long a heartbeat stays "live" before aging out of
+    /// [`Self::live_worker_count`].
+    heartbeat_timeout_secs: i64,
 }
 
 impl SqlJobQueue {
@@ -250,6 +423,11 @@ impl SqlJobQueue {
             .and_then(|s| s.parse().ok())
             .filter(|&n| n >= 1)
             .unwrap_or(DEFAULT_MAX_BUILD_ATTEMPTS);
+        let heartbeat_timeout_secs = std::env::var("RIPCLONE_WORKER_HEARTBEAT_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(DEFAULT_HEARTBEAT_TIMEOUT_SECS);
         Ok(Self {
             db,
             stale_claim_secs,
@@ -257,6 +435,7 @@ impl SqlJobQueue {
             max_build_attempts,
             size_classes,
             max_size_class: None,
+            heartbeat_timeout_secs,
         })
     }
 
@@ -270,9 +449,87 @@ impl SqlJobQueue {
         Ok(self)
     }
 
+    /// Override the live-heartbeat timeout (seconds). Used by tests and by
+    /// callers that want a tighter age-out than the env default.
+    pub fn with_heartbeat_timeout_secs(mut self, secs: i64) -> Self {
+        self.heartbeat_timeout_secs = secs.max(1);
+        self
+    }
+
     /// Configured size classes (ordered, smallest first).
     pub fn size_classes(&self) -> &[SizeClass] {
         &self.size_classes
+    }
+
+    /// Soft age-out window for [`live_worker_count`](Self::live_worker_count).
+    pub fn heartbeat_timeout_secs(&self) -> i64 {
+        self.heartbeat_timeout_secs
+    }
+
+    /// True when this queue engine has a `workers` registry (sqlite/libsql).
+    /// Postgres/MySQL lag — callers must not treat a zero live-count as "no
+    /// workers" on those backends.
+    pub fn supports_worker_registry(&self) -> bool {
+        self.db.supports_worker_registry()
+    }
+
+    /// Write/update this worker's registry row (id, size ceiling, current job).
+    /// Always writes when called — the worker process is opt-in via
+    /// `RIPCLONE_WORKER_HEARTBEAT` (default off; self-host unchanged).
+    /// Fails loudly on lagging backends that lack the registry table.
+    pub async fn heartbeat(&self, worker_id: &str, current_job: Option<i64>) -> Result<()> {
+        self.heartbeat_at(worker_id, current_job, now_secs()).await
+    }
+
+    /// Heartbeat with an explicit timestamp (epoch secs). Production uses
+    /// [`heartbeat`](Self::heartbeat); tests pass a frozen clock.
+    pub async fn heartbeat_at(
+        &self,
+        worker_id: &str,
+        current_job: Option<i64>,
+        now: i64,
+    ) -> Result<()> {
+        if !self.db.supports_worker_registry() {
+            anyhow::bail!(
+                "worker heartbeat requires RIPCLONE_QUEUE=sqlite|libsql \
+                 (postgres/mysql lag the workers registry)"
+            );
+        }
+        if worker_id.is_empty() {
+            anyhow::bail!("worker_id must not be empty");
+        }
+        self.db
+            .upsert_heartbeat(worker_id, self.max_size_class, current_job, now)
+            .await
+    }
+
+    /// How many workers have a fresh heartbeat within the timeout. The
+    /// dispatcher (D2) uses this so multiple replicas see the same live fleet
+    /// size and do not each over-spawn. Also hard-prunes aged-out rows.
+    /// Fails loudly on lagging backends (never returns a silent 0 that would
+    /// cause over-spawn).
+    pub async fn live_worker_count(&self) -> Result<usize> {
+        self.live_worker_count_at(now_secs()).await
+    }
+
+    /// Live-worker count as of `now` (epoch secs). Soft age-out: only rows with
+    /// `last_heartbeat >= now - timeout` count; older rows are deleted then
+    /// excluded.
+    pub async fn live_worker_count_at(&self, now: i64) -> Result<usize> {
+        if !self.db.supports_worker_registry() {
+            anyhow::bail!(
+                "live_worker_count requires RIPCLONE_QUEUE=sqlite|libsql \
+                 (postgres/mysql lag the workers registry)"
+            );
+        }
+        let cutoff = now - self.heartbeat_timeout_secs;
+        // Hard age-out so the table does not grow with dead workers forever.
+        // Fail loudly on prune errors — a partial view under-counts the fleet.
+        self.db.prune_stale_workers(cutoff).await.map_err(|e| {
+            tracing::error!("prune stale workers: {e:#}");
+            e
+        })?;
+        Ok(self.db.count_live_workers(cutoff).await? as usize)
     }
 
     /// Prune `failed` jobs older than the configured retention. Idempotent and
@@ -521,6 +778,21 @@ pub(crate) const ADD_ATTEMPTS_COLUMN_SQL: &str =
 pub(crate) const ADD_SIZE_CLASS_COLUMN_SQL: &str =
     "ALTER TABLE jobs ADD COLUMN size_class INTEGER NOT NULL DEFAULT 0";
 
+/// Worker heartbeat/registry table (dispatcher autoscaler live-count). Blessed
+/// backends only (sqlite/libsql). One row per worker: id, size ceiling, optional
+/// current job, last heartbeat. Stale rows age out of
+/// [`SqlJobQueue::live_worker_count`] after the configured timeout.
+pub(crate) const CREATE_WORKERS_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS workers (
+    worker_id TEXT PRIMARY KEY,
+    max_size_class INTEGER,
+    current_job INTEGER,
+    last_heartbeat INTEGER NOT NULL
+)";
+
+/// Index for live-count / prune by heartbeat freshness.
+pub(crate) const CREATE_WORKERS_HEARTBEAT_INDEX_SQL: &str =
+    "CREATE INDEX IF NOT EXISTS idx_workers_last_heartbeat ON workers(last_heartbeat)";
+
 /// Terminal error when a claimed job cannot requeue because a newer job for the
 /// same key is already `queued` (push-during-build). The older claim is
 /// redundant — the newer job builds the tip — so we settle it instead of
@@ -750,6 +1022,7 @@ mod tests {
                 max_build_attempts: DEFAULT_MAX_BUILD_ATTEMPTS,
                 size_classes: default_size_classes(),
                 max_size_class: None,
+                heartbeat_timeout_secs: DEFAULT_HEARTBEAT_TIMEOUT_SECS,
             };
             let reader = make_db(engine, &path).await;
 
@@ -833,6 +1106,7 @@ mod tests {
                 max_build_attempts: DEFAULT_MAX_BUILD_ATTEMPTS,
                 size_classes: default_size_classes(),
                 max_size_class: None,
+                heartbeat_timeout_secs: DEFAULT_HEARTBEAT_TIMEOUT_SECS,
             };
 
             let first = q.enqueue(job("o", "r", "main")).await.unwrap();
@@ -893,6 +1167,7 @@ mod tests {
                 max_build_attempts: 1,
                 size_classes: default_size_classes(),
                 max_size_class: None,
+                heartbeat_timeout_secs: DEFAULT_HEARTBEAT_TIMEOUT_SECS,
             };
             let enq = q.enqueue(job("o", "r", "main")).await.unwrap();
             let id = enq.job_id.unwrap();
@@ -987,6 +1262,7 @@ mod tests {
                 max_build_attempts: DEFAULT_MAX_BUILD_ATTEMPTS,
                 size_classes: default_size_classes(),
                 max_size_class: None,
+                heartbeat_timeout_secs: DEFAULT_HEARTBEAT_TIMEOUT_SECS,
             };
             q.enqueue(job("o", "r", "main")).await.unwrap();
             let first = q.claim("w1").await.unwrap().unwrap();
@@ -1010,6 +1286,7 @@ mod tests {
                 max_build_attempts: DEFAULT_MAX_BUILD_ATTEMPTS,
                 size_classes: default_size_classes(),
                 max_size_class: None,
+                heartbeat_timeout_secs: DEFAULT_HEARTBEAT_TIMEOUT_SECS,
             };
             q.enqueue(job("o", "r", "main")).await.unwrap();
             let _first = q.claim("w1").await.unwrap().unwrap();
@@ -1037,6 +1314,7 @@ mod tests {
                 max_build_attempts: DEFAULT_MAX_BUILD_ATTEMPTS,
                 size_classes: default_size_classes(),
                 max_size_class: None,
+                heartbeat_timeout_secs: DEFAULT_HEARTBEAT_TIMEOUT_SECS,
             };
             q.enqueue(job("o", "r", "main")).await.unwrap();
             let slow = q.claim("w1").await.unwrap().unwrap();
@@ -1085,6 +1363,7 @@ mod tests {
                 max_build_attempts: max,
                 size_classes: default_size_classes(),
                 max_size_class: None,
+                heartbeat_timeout_secs: DEFAULT_HEARTBEAT_TIMEOUT_SECS,
             };
             let enq = q.enqueue(job("o", "r", "main")).await.unwrap();
             let id = enq.job_id.unwrap();
@@ -1134,6 +1413,7 @@ mod tests {
                 max_build_attempts: DEFAULT_MAX_BUILD_ATTEMPTS,
                 size_classes: default_size_classes(),
                 max_size_class: None,
+                heartbeat_timeout_secs: DEFAULT_HEARTBEAT_TIMEOUT_SECS,
             };
             // Second adapter on the same file for size_class reads.
             let reader = make_db(engine, &path).await;
@@ -1186,6 +1466,7 @@ mod tests {
             max_build_attempts: DEFAULT_MAX_BUILD_ATTEMPTS,
             size_classes: default_size_classes(),
             max_size_class: None,
+            heartbeat_timeout_secs: DEFAULT_HEARTBEAT_TIMEOUT_SECS,
         };
 
         let failed = q.enqueue(job("o", "r", "fail")).await.unwrap();
@@ -1728,5 +2009,365 @@ mod tests {
             "o/r",
             "large worker drains the raised job"
         );
+    }
+
+    // --- Worker heartbeat / registry (D3) ---------------------------------
+
+    async fn queue_with_timeout(timeout_secs: i64) -> (SqlJobQueue, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q.db").to_string_lossy().to_string();
+        let q = SqlJobQueue::new(make_db("sqlite", &path).await)
+            .await
+            .unwrap()
+            .with_heartbeat_timeout_secs(timeout_secs);
+        (q, dir)
+    }
+
+    #[tokio::test]
+    async fn heartbeat_insert_and_update_marks_worker_live() {
+        let (q, _dir) = queue_with_timeout(60).await;
+        assert_eq!(
+            q.live_worker_count_at(1_000).await.unwrap(),
+            0,
+            "empty registry"
+        );
+
+        q.heartbeat_at("w1", None, 1_000).await.unwrap();
+        assert_eq!(
+            q.live_worker_count_at(1_000).await.unwrap(),
+            1,
+            "insert marks live"
+        );
+
+        // Update same worker (current job set) — still one live row.
+        q.heartbeat_at("w1", Some(42), 1_010).await.unwrap();
+        assert_eq!(
+            q.live_worker_count_at(1_010).await.unwrap(),
+            1,
+            "update does not double-count"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_heartbeat_ages_out_of_live_count() {
+        // timeout = 60s: live if last_heartbeat >= now - 60
+        let (q, _dir) = queue_with_timeout(60).await;
+        q.heartbeat_at("w1", None, 1_000).await.unwrap();
+
+        assert_eq!(
+            q.live_worker_count_at(1_050).await.unwrap(),
+            1,
+            "within timeout still live"
+        );
+        assert_eq!(
+            q.live_worker_count_at(1_061).await.unwrap(),
+            0,
+            "past timeout ages out (excluded + pruned)"
+        );
+        // A later fresh heartbeat can re-enter.
+        q.heartbeat_at("w1", None, 1_100).await.unwrap();
+        assert_eq!(q.live_worker_count_at(1_100).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn live_worker_count_returns_n() {
+        let (q, _dir) = queue_with_timeout(60).await;
+        for i in 0..5 {
+            q.heartbeat_at(&format!("w{i}"), None, 1_000).await.unwrap();
+        }
+        // One stale among them.
+        q.heartbeat_at("stale", None, 900).await.unwrap();
+
+        assert_eq!(
+            q.live_worker_count_at(1_000).await.unwrap(),
+            5,
+            "N live workers → count N (stale excluded)"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_live_count_readers_agree() {
+        // Two dispatcher-style readers must see the same live fleet size so
+        // they do not each over-spawn.
+        let (q, _dir) = queue_with_timeout(60).await;
+        let q = Arc::new(q);
+        for i in 0..3 {
+            q.heartbeat_at(&format!("w{i}"), Some(i as i64), 1_000)
+                .await
+                .unwrap();
+        }
+
+        let q1 = q.clone();
+        let q2 = q.clone();
+        let (a, b) = tokio::join!(
+            q1.live_worker_count_at(1_000),
+            q2.live_worker_count_at(1_000)
+        );
+        assert_eq!(a.unwrap(), 3);
+        assert_eq!(b.unwrap(), 3);
+        // Repeat: still stable (no double-count from concurrent prune).
+        let (c, d) = tokio::join!(q.live_worker_count_at(1_000), q.live_worker_count_at(1_000));
+        assert_eq!(c.unwrap(), 3);
+        assert_eq!(d.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn claim_without_heartbeat_leaves_registry_empty() {
+        // Worker with heartbeat disabled never writes the registry — default
+        // path is claim/ack only, so live_worker_count stays 0.
+        let (q, _dir) = queue_with_timeout(60).await;
+        q.enqueue(job("o", "r", "main")).await.unwrap();
+        let claimed = q.claim("w1").await.unwrap().unwrap();
+        assert!(q.ack(claimed.id, "w1", Ok(())).await.unwrap());
+        assert_eq!(
+            q.live_worker_count_at(now_secs()).await.unwrap(),
+            0,
+            "no heartbeat → empty registry (self-host unchanged)"
+        );
+    }
+
+    #[tokio::test]
+    async fn heartbeat_records_max_size_class_ceiling() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q.db").to_string_lossy().to_string();
+        let q = SqlJobQueue::new_with_classes(make_db("sqlite", &path).await, two_classes())
+            .await
+            .unwrap()
+            .with_max_size_class(Some("small"))
+            .unwrap()
+            .with_heartbeat_timeout_secs(60);
+        q.heartbeat_at("small-w", None, 1_000).await.unwrap();
+
+        // Read back via a second adapter on the same file.
+        use sqlx::sqlite::SqlitePoolOptions;
+        let url = format!("sqlite://{}?mode=rwc", dir.path().join("q.db").display());
+        let pool = SqlitePoolOptions::new().connect(&url).await.unwrap();
+        let rank: Option<i64> =
+            sqlx::query_scalar("SELECT max_size_class FROM workers WHERE worker_id = ?")
+                .bind("small-w")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(rank, Some(0), "small is rank 0 in two_classes()");
+    }
+
+    #[tokio::test]
+    async fn init_creates_workers_registry_table() {
+        use sqlx::sqlite::SqlitePoolOptions;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q.db").to_string_lossy().to_string();
+        // SqlJobQueue::new runs init → workers table.
+        let _q = SqlJobQueue::new(make_db("sqlite", &path).await)
+            .await
+            .unwrap();
+
+        let url = format!("sqlite://{}?mode=rwc", path);
+        let pool = SqlitePoolOptions::new().connect(&url).await.unwrap();
+        let name: String = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'workers'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("workers table must exist after init");
+        assert_eq!(name, "workers");
+    }
+
+    #[tokio::test]
+    async fn sqlite_supports_worker_registry() {
+        let (q, _dir) = queue_with_timeout(60).await;
+        assert!(
+            q.supports_worker_registry(),
+            "sqlite is a blessed backend for the workers registry"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_row_is_hard_deleted_not_only_soft_excluded() {
+        use sqlx::sqlite::SqlitePoolOptions;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q.db").to_string_lossy().to_string();
+        let q = SqlJobQueue::new(make_db("sqlite", &path).await)
+            .await
+            .unwrap()
+            .with_heartbeat_timeout_secs(60);
+        q.heartbeat_at("w1", None, 1_000).await.unwrap();
+
+        // Age out: live-count prunes rows older than cutoff.
+        assert_eq!(q.live_worker_count_at(1_100).await.unwrap(), 0);
+
+        let url = format!("sqlite://{}?mode=rwc", path);
+        let pool = SqlitePoolOptions::new().connect(&url).await.unwrap();
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM workers")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            n, 0,
+            "stale row must be hard-deleted, not left as a soft ghost"
+        );
+    }
+
+    #[tokio::test]
+    async fn heartbeat_persists_current_job_and_clears_on_idle() {
+        use sqlx::sqlite::SqlitePoolOptions;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q.db").to_string_lossy().to_string();
+        let q = SqlJobQueue::new(make_db("sqlite", &path).await)
+            .await
+            .unwrap()
+            .with_heartbeat_timeout_secs(60);
+
+        q.heartbeat_at("w1", Some(99), 1_000).await.unwrap();
+        let url = format!("sqlite://{}?mode=rwc", path);
+        let pool = SqlitePoolOptions::new().connect(&url).await.unwrap();
+        let job: Option<i64> =
+            sqlx::query_scalar("SELECT current_job FROM workers WHERE worker_id = ?")
+                .bind("w1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(job, Some(99));
+
+        q.heartbeat_at("w1", None, 1_010).await.unwrap();
+        let job: Option<i64> =
+            sqlx::query_scalar("SELECT current_job FROM workers WHERE worker_id = ?")
+                .bind("w1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(job.is_none(), "idle heartbeat clears current_job");
+    }
+
+    #[tokio::test]
+    async fn empty_worker_id_fails_loudly() {
+        let (q, _dir) = queue_with_timeout(60).await;
+        let err = q.heartbeat_at("", None, 1_000).await.unwrap_err();
+        assert!(
+            err.to_string().contains("worker_id must not be empty"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn heartbeat_env_default_disabled() {
+        assert!(!worker_heartbeat_enabled(None, || None).unwrap());
+        assert!(!worker_heartbeat_enabled(Some("".into()), || None).unwrap());
+        assert!(!worker_heartbeat_enabled(Some("  ".into()), || None).unwrap());
+    }
+
+    #[test]
+    fn heartbeat_env_truthy_and_queue_enable() {
+        assert!(worker_heartbeat_enabled(Some("queue".into()), || None).unwrap());
+        assert!(worker_heartbeat_enabled(Some("1".into()), || None).unwrap());
+        assert!(worker_heartbeat_enabled(Some("TRUE".into()), || None).unwrap());
+        assert!(worker_heartbeat_enabled(Some("yes".into()), || None).unwrap());
+        assert!(
+            worker_heartbeat_enabled(Some("sqlite:///tmp/q.db".into()), || Some(
+                "sqlite:///tmp/q.db".into()
+            ))
+            .unwrap(),
+            "matching queue DSN is a valid target"
+        );
+    }
+
+    #[test]
+    fn heartbeat_env_unknown_target_fails_loudly() {
+        let err = worker_heartbeat_enabled(Some("redis://elsewhere".into()), || {
+            Some("sqlite:///tmp/q.db".into())
+        })
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("RIPCLONE_WORKER_HEARTBEAT"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn heartbeat_interval_defaults_to_third_of_timeout() {
+        assert_eq!(
+            worker_heartbeat_interval_secs_from(None, Some("90".into())),
+            30
+        );
+        assert_eq!(
+            worker_heartbeat_interval_secs_from(None, None),
+            (DEFAULT_HEARTBEAT_TIMEOUT_SECS as u64) / 3
+        );
+        assert_eq!(
+            worker_heartbeat_interval_secs_from(Some("7".into()), Some("90".into())),
+            7
+        );
+    }
+
+    #[test]
+    fn heartbeat_timing_rejects_interval_ge_timeout() {
+        validate_heartbeat_timing(10, 60).unwrap();
+        let err = validate_heartbeat_timing(60, 60).unwrap_err();
+        assert!(err.to_string().contains("must be <"), "got: {err}");
+        let err = validate_heartbeat_timing(90, 60).unwrap_err();
+        assert!(err.to_string().contains("must be <"), "got: {err}");
+    }
+
+    #[test]
+    fn worker_id_is_unique_across_hosts_and_pids() {
+        let a = make_worker_id_parts(Some("host-a".into()), 1, 100);
+        let b = make_worker_id_parts(Some("host-b".into()), 1, 100);
+        let c = make_worker_id_parts(Some("host-a".into()), 2, 100);
+        let d = make_worker_id_parts(Some("host-a".into()), 1, 101);
+        assert_ne!(a, b, "same pid on different hosts must not collide");
+        assert_ne!(a, c, "different pids must not collide");
+        assert_ne!(a, d, "same host+pid different start times must not collide");
+        assert_eq!(
+            make_worker_id_parts(None, 7, 1),
+            "local-7-1",
+            "missing host falls back to local"
+        );
+        assert_eq!(
+            make_worker_id_parts(Some("fly/abc".into()), 1, 2),
+            "fly-abc-1-2",
+            "non-alphanumeric host chars sanitized"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_distinct_worker_ids_both_count_as_live() {
+        // Regression for the pid-collision failure mode: two workers with
+        // different ids must never collapse to one live row.
+        let (q, _dir) = queue_with_timeout(60).await;
+        let w1 = make_worker_id_parts(Some("m1".into()), 42, 1);
+        let w2 = make_worker_id_parts(Some("m2".into()), 42, 1); // same pid, different host
+        q.heartbeat_at(&w1, None, 1_000).await.unwrap();
+        q.heartbeat_at(&w2, None, 1_000).await.unwrap();
+        assert_eq!(q.live_worker_count_at(1_000).await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn concurrent_heartbeats_and_live_counts_stay_consistent() {
+        // Stress the "two dispatcher replicas + workers writing" case: many
+        // concurrent upserts + concurrent live-count readers must agree.
+        let (q, _dir) = queue_with_timeout(60).await;
+        let q = Arc::new(q);
+        let mut writers = Vec::new();
+        for i in 0..8 {
+            let q = q.clone();
+            writers.push(tokio::spawn(async move {
+                let id = format!("w{i}");
+                for t in 0..5 {
+                    q.heartbeat_at(&id, Some(i as i64), 1_000 + t)
+                        .await
+                        .unwrap();
+                }
+            }));
+        }
+        for h in writers {
+            h.await.unwrap();
+        }
+        let q1 = q.clone();
+        let q2 = q.clone();
+        let (a, b) = tokio::join!(
+            q1.live_worker_count_at(1_004),
+            q2.live_worker_count_at(1_004)
+        );
+        assert_eq!(a.unwrap(), 8);
+        assert_eq!(b.unwrap(), 8);
     }
 }
