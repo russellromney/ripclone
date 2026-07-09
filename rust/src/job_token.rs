@@ -1,8 +1,8 @@
-//! Per-job metadata-report tokens for farmed-out workers.
+//! Repo-scoped metadata-report tokens for farmed-out workers.
 //!
 //! Cloud/farm-out workers hold no database credentials. They authenticate to
 //! `POST /v1/refs` with a short-lived bearer token that is:
-//! - scoped to one repo (and optionally one job id),
+//! - scoped to one repo,
 //! - HMAC-signed with a server-only secret,
 //! - expiring.
 //!
@@ -10,7 +10,10 @@
 //! ```text
 //! rcjt1.<base64url(payload)>.<base64url(hmac-sha256)>
 //! ```
-//! Payload is JSON: `{"r":"<repo_key>","j":null|"<job_id>","e":<exp_unix>}`.
+//! Payload is JSON: `{"r":"<repo_key>","e":<exp_unix>}`.
+//!
+//! Minting and injecting this token per job at dispatch time is not wired up
+//! yet — see the module doc on `mint_job_token` below.
 
 use anyhow::{Context, Result, bail};
 use hmac::{Hmac, KeyInit, Mac};
@@ -32,9 +35,6 @@ type HmacSha256 = Hmac<Sha256>;
 struct Payload {
     /// Repo storage key (`github/owner/repo`, …).
     r: String,
-    /// Optional job id binding. `None` = any job for this repo.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    j: Option<i64>,
     /// Expiry as Unix epoch seconds.
     e: u64,
 }
@@ -69,13 +69,14 @@ fn derive_key(raw: &[u8]) -> Vec<u8> {
     mac.finalize().into_bytes().to_vec()
 }
 
-/// Mint a bearer token scoped to `repo_key` (and optionally `job_id`).
-pub fn mint_job_token(
-    secret: &[u8],
-    repo_key: &str,
-    job_id: Option<i64>,
-    ttl: Duration,
-) -> Result<String> {
+/// Mint a bearer token scoped to `repo_key`.
+///
+/// Nothing in this codebase calls this yet outside tests: producing and
+/// injecting a per-job token at dispatch time (e.g. as
+/// `RIPCLONE_METADATA_JOB_TOKEN` on a farmed-out worker) is not wired up.
+/// `RIPCLONE_METADATA=api` is therefore not yet deployable for real farm-out —
+/// see `ENV_BAG.md` and `docs/BACKENDS.md`.
+pub fn mint_job_token(secret: &[u8], repo_key: &str, ttl: Duration) -> Result<String> {
     if repo_key.is_empty() {
         bail!("job report token requires a non-empty repo_key");
     }
@@ -83,7 +84,6 @@ pub fn mint_job_token(
     let exp = now.saturating_add(ttl.as_secs().max(1));
     let payload = Payload {
         r: repo_key.to_string(),
-        j: job_id,
         e: exp,
     };
     let payload_bytes = serde_json::to_vec(&payload).context("serialize job token payload")?;
@@ -91,15 +91,10 @@ pub fn mint_job_token(
     Ok(format!("{VERSION}.{}.{}", b64(&payload_bytes), b64(&sig)))
 }
 
-/// Verify a bearer token for a report of `repo_key` (and optional `job_id`).
+/// Verify a bearer token for a report of `repo_key`.
 ///
-/// Fails on bad format, bad signature, expiry, repo mismatch, or job mismatch.
-pub fn verify_job_token(
-    secret: &[u8],
-    token: &str,
-    repo_key: &str,
-    job_id: Option<i64>,
-) -> Result<()> {
+/// Fails on bad format, bad signature, expiry, or repo mismatch.
+pub fn verify_job_token(secret: &[u8], token: &str, repo_key: &str) -> Result<()> {
     let token = token.trim();
     let mut parts = token.split('.');
     let ver = parts.next().unwrap_or("");
@@ -126,13 +121,6 @@ pub fn verify_job_token(
             payload.r,
             repo_key
         );
-    }
-    if let Some(bound) = payload.j {
-        match job_id {
-            Some(j) if j == bound => {}
-            Some(j) => bail!("job report token job_id mismatch (token={bound}, body={j})"),
-            None => bail!("job report token requires job_id {bound}"),
-        }
     }
     Ok(())
 }
@@ -169,50 +157,26 @@ mod tests {
 
     #[test]
     fn mint_and_verify_round_trip() {
-        let tok = mint_job_token(
-            &secret(),
-            "github/acme/r",
-            Some(42),
-            Duration::from_secs(60),
-        )
-        .unwrap();
-        verify_job_token(&secret(), &tok, "github/acme/r", Some(42)).unwrap();
+        let tok = mint_job_token(&secret(), "github/acme/r", Duration::from_secs(60)).unwrap();
+        verify_job_token(&secret(), &tok, "github/acme/r").unwrap();
     }
 
     #[test]
     fn wrong_repo_rejected() {
-        let tok =
-            mint_job_token(&secret(), "github/acme/r", None, Duration::from_secs(60)).unwrap();
-        let err = verify_job_token(&secret(), &tok, "github/other/r", None).unwrap_err();
+        let tok = mint_job_token(&secret(), "github/acme/r", Duration::from_secs(60)).unwrap();
+        let err = verify_job_token(&secret(), &tok, "github/other/r").unwrap_err();
         assert!(err.to_string().contains("repo mismatch"), "got: {err}");
     }
 
     #[test]
-    fn wrong_job_id_rejected() {
-        let tok =
-            mint_job_token(&secret(), "github/acme/r", Some(1), Duration::from_secs(60)).unwrap();
-        let err = verify_job_token(&secret(), &tok, "github/acme/r", Some(2)).unwrap_err();
-        assert!(err.to_string().contains("job_id mismatch"), "got: {err}");
-    }
-
-    #[test]
-    fn unbound_job_accepts_any_job_id() {
-        let tok =
-            mint_job_token(&secret(), "github/acme/r", None, Duration::from_secs(60)).unwrap();
-        verify_job_token(&secret(), &tok, "github/acme/r", Some(99)).unwrap();
-        verify_job_token(&secret(), &tok, "github/acme/r", None).unwrap();
-    }
-
-    #[test]
     fn bad_signature_rejected() {
-        let tok =
-            mint_job_token(&secret(), "github/acme/r", None, Duration::from_secs(60)).unwrap();
+        let tok = mint_job_token(&secret(), "github/acme/r", Duration::from_secs(60)).unwrap();
         let mut chars: Vec<char> = tok.chars().collect();
         // Flip last character of the signature.
         let last = chars.len() - 1;
         chars[last] = if chars[last] == 'A' { 'B' } else { 'A' };
         let bad: String = chars.into_iter().collect();
-        let err = verify_job_token(&secret(), &bad, "github/acme/r", None).unwrap_err();
+        let err = verify_job_token(&secret(), &bad, "github/acme/r").unwrap_err();
         assert!(
             err.to_string().contains("signature") || err.to_string().contains("malformed"),
             "got: {err}"
@@ -225,21 +189,19 @@ mod tests {
         let now = now_secs();
         let payload = Payload {
             r: "github/acme/r".into(),
-            j: None,
             e: now.saturating_sub(10),
         };
         let payload_bytes = serde_json::to_vec(&payload).unwrap();
         let sig = sign(&secret, &payload_bytes);
         let tok = format!("{VERSION}.{}.{}", b64(&payload_bytes), b64(&sig));
-        let err = verify_job_token(&secret, &tok, "github/acme/r", None).unwrap_err();
+        let err = verify_job_token(&secret, &tok, "github/acme/r").unwrap_err();
         assert!(err.to_string().contains("expired"), "got: {err}");
     }
 
     #[test]
     fn different_secret_rejected() {
-        let tok =
-            mint_job_token(&secret(), "github/acme/r", None, Duration::from_secs(60)).unwrap();
+        let tok = mint_job_token(&secret(), "github/acme/r", Duration::from_secs(60)).unwrap();
         let other = derive_key(b"other-secret");
-        assert!(verify_job_token(&other, &tok, "github/acme/r", None).is_err());
+        assert!(verify_job_token(&other, &tok, "github/acme/r").is_err());
     }
 }

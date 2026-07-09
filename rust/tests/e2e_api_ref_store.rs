@@ -90,8 +90,7 @@ fn mint_token_for(repo_path: &str) -> String {
     let secret = report_token_secret_from_env()
         .expect("job token secret (RIPCLONE_SERVER_TOKEN is set by common::init)");
     let repo_key = RepoId::github(repo_path).storage_key();
-    mint_job_token(&secret, &repo_key, None, Duration::from_secs(3600))
-        .expect("mint job report token")
+    mint_job_token(&secret, &repo_key, Duration::from_secs(3600)).expect("mint job report token")
 }
 
 async fn open_meta_store(meta_url: &str) -> Arc<dyn RefStore> {

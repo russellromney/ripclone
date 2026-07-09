@@ -1,13 +1,17 @@
 //! `RefStore` that reports writes to a ripclone server over HTTP.
 //!
 //! Selected with `RIPCLONE_METADATA=api`. The worker holds only a report URL
-//! and a per-job bearer token — never database credentials. The server that
-//! holds the real metadata store performs the durable write after checking the
-//! token (`POST /v1/refs`).
+//! and a repo-scoped bearer token — never database credentials. The server
+//! that holds the real metadata store performs the durable write after
+//! checking the token (`POST /v1/refs`).
 //!
 //! Reads return empty: a farmed-out worker builds cold and only needs the write
 //! path for publish. A failed report is never swallowed — network/5xx map to
 //! retryable errors so the job requeues.
+//!
+//! Mechanism only: producing and injecting `RIPCLONE_METADATA_JOB_TOKEN` per
+//! job at dispatch time is not wired up yet (see `job_token.rs`), so `api`
+//! mode is not yet deployable for real farm-out.
 
 use crate::RefInfo;
 use crate::provider::RepoId;
@@ -68,29 +72,21 @@ pub enum RefReport {
         repo_key: String,
         branch: String,
         info: Box<RefInfo>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        job_id: Option<i64>,
     },
     UpdateBuildStatus {
         repo_key: String,
         branch: String,
         expected_commit: String,
         status: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        job_id: Option<i64>,
     },
     DeleteBranch {
         repo_key: String,
         branch: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        job_id: Option<i64>,
     },
     TouchLastAccessed {
         repo_key: String,
         branch: String,
         expected_commit: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        job_id: Option<i64>,
     },
 }
 
@@ -101,15 +97,6 @@ impl RefReport {
             | Self::UpdateBuildStatus { repo_key, .. }
             | Self::DeleteBranch { repo_key, .. }
             | Self::TouchLastAccessed { repo_key, .. } => repo_key,
-        }
-    }
-
-    pub fn job_id(&self) -> Option<i64> {
-        match self {
-            Self::SaveBranch { job_id, .. }
-            | Self::UpdateBuildStatus { job_id, .. }
-            | Self::DeleteBranch { job_id, .. }
-            | Self::TouchLastAccessed { job_id, .. } => *job_id,
         }
     }
 }
@@ -149,7 +136,8 @@ impl ApiRefStore {
             .filter(|s| !s.trim().is_empty())
             .context(
                 "RIPCLONE_METADATA=api requires RIPCLONE_METADATA_JOB_TOKEN \
-                 (per-job bearer token minted by the server at enqueue)",
+                 (repo-scoped bearer token from job_token::mint_job_token; \
+                 the server does not mint or inject this automatically yet)",
             )?;
         Self::new(report_url, job_token)
     }
@@ -257,7 +245,6 @@ impl RefStore for ApiRefStore {
             repo_key: repo_id.storage_key(),
             branch: branch.to_string(),
             info: Box::new(info.clone()),
-            job_id: None,
         })
         .await?;
         // Write-through: phase 2 reloads the phase-1 ref from this map.
@@ -279,7 +266,6 @@ impl RefStore for ApiRefStore {
                 branch: branch.to_string(),
                 expected_commit: expected_commit.to_string(),
                 status: status.to_string(),
-                job_id: None,
             })
             .await?;
         if r.updated {
@@ -304,7 +290,6 @@ impl RefStore for ApiRefStore {
                 repo_key: repo_id.storage_key(),
                 branch: branch.to_string(),
                 expected_commit: expected_commit.to_string(),
-                job_id: None,
             })
             .await?;
         Ok(r.updated)
@@ -314,7 +299,6 @@ impl RefStore for ApiRefStore {
         self.post_report(&RefReport::DeleteBranch {
             repo_key: repo_id.storage_key(),
             branch: branch.to_string(),
-            job_id: None,
         })
         .await?;
         let mut map = self.local.write().await;

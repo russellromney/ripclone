@@ -1304,7 +1304,7 @@ async fn clone_metrics_drop_handler() -> impl IntoResponse {
 
 /// `POST /v1/refs` — farmed-out worker reports a ref write.
 ///
-/// Auth is a per-job HMAC bearer token (`Authorization: Bearer …`), not the
+/// Auth is a repo-scoped HMAC bearer token (`Authorization: Bearer …`), not the
 /// shared server token. Missing / wrong / expired / wrong-scope tokens return
 /// 401 and do **not** write. On success the server's real `RefStore` (the one
 /// holding DB credentials) performs the durable write.
@@ -1348,8 +1348,7 @@ async fn ref_report_handler(
     };
 
     let repo_key = body.repo_key().to_string();
-    let job_id = body.job_id();
-    if let Err(e) = verify_job_token(&secret, token, &repo_key, job_id) {
+    if let Err(e) = verify_job_token(&secret, token, &repo_key) {
         warn!("POST /v1/refs: auth rejected for {repo_key}: {e:#}");
         return (
             StatusCode::UNAUTHORIZED,
@@ -11206,7 +11205,6 @@ mod tests {
         let tok = crate::job_token::mint_job_token(
             &secret,
             repo_key,
-            None,
             std::time::Duration::from_secs(300),
         )
         .unwrap();
@@ -11254,7 +11252,6 @@ mod tests {
         let good = crate::job_token::mint_job_token(
             &secret,
             repo_key,
-            None,
             std::time::Duration::from_secs(300),
         )
         .unwrap();
@@ -11262,7 +11259,6 @@ mod tests {
         let wrong_repo = crate::job_token::mint_job_token(
             &secret,
             "github/acme%2Fother",
-            None,
             std::time::Duration::from_secs(300),
         )
         .unwrap();
