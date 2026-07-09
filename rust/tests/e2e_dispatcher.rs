@@ -28,6 +28,7 @@ use ripclone::queue::{BuildJob, JobQueue, JobState, SqlJobQueue};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 /// Queue URL + worker env is process-global; cargo runs tests in parallel.
@@ -174,6 +175,30 @@ fn exec_provider(wrapper: PathBuf) -> ExecProvider {
     .expect("ExecProvider")
 }
 
+/// Poll job statuses until every id is Done (or timeout). Used when an external
+/// process (e.g. `ripclone-dispatcher`) owns the reconcile loop.
+async fn wait_all_done(queue: &SqlJobQueue, job_ids: &[i64], timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let mut all_done = true;
+        for &id in job_ids {
+            match queue.job_status(id).await.expect("status") {
+                JobState::Done => {}
+                JobState::Failed(e) => panic!("job {id} failed: {e}"),
+                JobState::Pending | JobState::Unknown => all_done = false,
+            }
+        }
+        if all_done {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "jobs {job_ids:?} did not finish within {timeout:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
 /// Drive `reconcile_once` until every job is Done (or timeout).
 async fn reconcile_until_done(
     queue: &SqlJobQueue,
@@ -222,6 +247,43 @@ async fn reconcile_until_done(
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
     }
+}
+
+/// Real `ripclone-dispatcher` binary (infinite poll loop). Kill on drop.
+struct DispatcherProc(std::process::Child);
+
+impl Drop for DispatcherProc {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Spawn the product binary with exec dispatch → launch-script workers.
+/// Worker bag keys are set on the child so `collect_worker_env` inside the
+/// binary forwards them (same path as production).
+fn spawn_dispatcher_binary(wrapper: &Path, max_workers: usize, interval_secs: u64) -> DispatcherProc {
+    let mut cmd = Command::new(cargo_bin("ripclone-dispatcher"));
+    cmd.env("RIPCLONE_DISPATCH", "exec")
+        .env("RIPCLONE_DISPATCH_CMD", wrapper)
+        .env(
+            "RIPCLONE_DISPATCH_INTERVAL_SECS",
+            interval_secs.to_string(),
+        )
+        .env(
+            "RIPCLONE_DISPATCH_MAX_WORKERS",
+            max_workers.to_string(),
+        )
+        // Forwarded into WorkerSpec.env by the binary's collect_worker_env().
+        .env("RIPCLONE_IDLE_EXIT_SECS", "2")
+        .env("RIPCLONE_WORKER_HEARTBEAT", "queue")
+        .env("RIPCLONE_WORKER_HEARTBEAT_INTERVAL_SECS", "1")
+        .env("RIPCLONE_WORKER_HEARTBEAT_TIMEOUT_SECS", "30")
+        // Inherit queue URL / origin base / trust from the test process env.
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit());
+    let child = cmd.spawn().expect("spawn ripclone-dispatcher binary");
+    DispatcherProc(child)
 }
 
 // ---------------------------------------------------------------------------
@@ -300,6 +362,146 @@ async fn dispatcher_reconcile_drains_real_workers() {
             JobState::Done => {}
             other => panic!("job {id} expected Done, got {other:?}"),
         }
+    }
+}
+
+/// Same drain proof under `max_workers=1`: first pass starts only one worker,
+/// then the queue still fully drains (serial / cap-bound path). Complements the
+/// parallel path above — does not replace it.
+#[tokio::test]
+async fn dispatcher_reconcile_max_workers_one_serial_drain() {
+    let _guard = SERIAL.lock().await;
+    let _qdir = setup_sqlite_queue();
+    let server = start_server().await;
+    let wrapper_dir = tempfile::tempdir().expect("wrapper dir");
+    let wrapper = write_worker_wrapper(
+        wrapper_dir.path(),
+        &cargo_bin("ripclone-worker"),
+        &server.cas_dir,
+        &server.repo_root,
+    );
+    let provider = exec_provider(wrapper);
+    let worker_env = local_worker_env();
+
+    let _o1 = publish_origin("acme", "disp-serial-a", "a.txt", "a\n");
+    let _o2 = publish_origin("acme", "disp-serial-b", "b.txt", "b\n");
+    let _o3 = publish_origin("acme", "disp-serial-c", "c.txt", "c\n");
+
+    let queue = backends::connect_sql_queue().await.expect("queue");
+    let id_a = enqueue_sized(&queue, "acme/disp-serial-a", Some(SMALL_BYTES)).await;
+    let id_b = enqueue_sized(&queue, "acme/disp-serial-b", Some(SMALL_BYTES)).await;
+    let id_c = enqueue_sized(&queue, "acme/disp-serial-c", Some(SMALL_BYTES)).await;
+    assert_eq!(queue.depth().await, 3);
+
+    let mut backoff = BackoffState::new();
+    let first = reconcile_once(ReconcileInputs {
+        queue: &queue,
+        provider: &provider,
+        max_workers: 1,
+        worker_env: &worker_env,
+        backoff: &mut backoff,
+        now: Instant::now(),
+    })
+    .await
+    .expect("first reconcile under cap");
+    assert_eq!(first.plan.total_pending, 3, "{first:?}");
+    assert_eq!(
+        first.plan.desired, 1,
+        "cap must bind desired to max_workers=1: {first:?}"
+    );
+    assert_eq!(first.plan.to_start, 1, "start exactly one under cap: {first:?}");
+    assert_eq!(
+        first.started, 1,
+        "must not spawn past the cap: {first:?}"
+    );
+    assert_eq!(first.failed, 0, "{first:?}");
+
+    // One live worker (or successive one-at-a-time starts) must still drain N jobs.
+    reconcile_until_done(
+        &queue,
+        &provider,
+        &worker_env,
+        1,
+        &[id_a, id_b, id_c],
+        Duration::from_secs(180),
+        &mut backoff,
+    )
+    .await;
+    assert_eq!(queue.depth().await, 0);
+    for id in [id_a, id_b, id_c] {
+        match queue.job_status(id).await.expect("status") {
+            JobState::Done => {}
+            other => panic!("job {id} expected Done under max_workers=1, got {other:?}"),
+        }
+    }
+}
+
+/// Product binary wiring: real `ripclone-dispatcher` with `RIPCLONE_DISPATCH=exec`
+/// polls, starts workers via the launch script, and drains the queue.
+#[tokio::test]
+async fn dispatcher_binary_exec_drains_queue() {
+    let _guard = SERIAL.lock().await;
+    let _qdir = setup_sqlite_queue();
+    let server = start_server().await;
+    let wrapper_dir = tempfile::tempdir().expect("wrapper dir");
+    let wrapper = write_worker_wrapper(
+        wrapper_dir.path(),
+        &cargo_bin("ripclone-worker"),
+        &server.cas_dir,
+        &server.repo_root,
+    );
+
+    let _o1 = publish_origin("acme", "disp-bin-a", "a.txt", "a\n");
+    let _o2 = publish_origin("acme", "disp-bin-b", "b.txt", "b\n");
+
+    let queue = backends::connect_sql_queue().await.expect("queue");
+    let id_a = enqueue_sized(&queue, "acme/disp-bin-a", Some(SMALL_BYTES)).await;
+    let id_b = enqueue_sized(&queue, "acme/disp-bin-b", Some(SMALL_BYTES)).await;
+    assert_eq!(queue.depth().await, 2);
+
+    // Binary owns the poll loop (interval=1s). Kill on drop after drain.
+    let _dispatcher = spawn_dispatcher_binary(&wrapper, /*max_workers=*/ 5, /*interval_secs=*/ 1);
+
+    wait_all_done(&queue, &[id_a, id_b], Duration::from_secs(120)).await;
+    assert_eq!(
+        queue.depth().await,
+        0,
+        "binary dispatcher must drain the real queue"
+    );
+}
+
+/// Binary no-op path: `RIPCLONE_DISPATCH=none` exits cleanly without starting
+/// workers (static-pool self-host). Jobs stay queued — proves the binary
+/// honors the documented off switch.
+#[tokio::test]
+async fn dispatcher_binary_none_is_noop() {
+    let _guard = SERIAL.lock().await;
+    let _qdir = setup_sqlite_queue();
+    let _server = start_server().await;
+
+    let _origin = publish_origin("acme", "disp-none", "a.txt", "a\n");
+    let queue = backends::connect_sql_queue().await.expect("queue");
+    let id = enqueue_sized(&queue, "acme/disp-none", Some(SMALL_BYTES)).await;
+    assert_eq!(queue.depth().await, 1);
+
+    let out = Command::new(cargo_bin("ripclone-dispatcher"))
+        .env("RIPCLONE_DISPATCH", "none")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .expect("run ripclone-dispatcher none");
+    assert!(
+        out.status.success(),
+        "RIPCLONE_DISPATCH=none must exit 0, got {:?}",
+        out.status
+    );
+
+    // Still queued — no workers started by the no-op binary.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(queue.depth().await, 1, "none must not dequeue work");
+    match queue.job_status(id).await.expect("status") {
+        JobState::Pending => {}
+        other => panic!("job must stay pending under none, got {other:?}"),
     }
 }
 
