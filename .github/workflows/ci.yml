@@ -12,6 +12,9 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RIPCLONE_ORIGIN_BASE_DEFAULT: ""
+  # Incremental artifacts bloat target/ and don't help cold CI runners (see
+  # rust-ci-performance). rust-cache restores a full target tree instead.
+  CARGO_INCREMENTAL: "0"
 
 # Caching: setup-rust-toolchain (Swatinem/rust-cache) restores each job's cargo
 # registry + target/ dir across runs, keyed by Cargo.lock — so a job recompiles
@@ -331,7 +334,7 @@ jobs:
             if curl -sf http://127.0.0.1:3000/api/v1/version >/dev/null; then
               break
             fi
-            sleep 1
+            sleep 0.5
           done
           curl -sf http://127.0.0.1:3000/api/v1/version >/dev/null
           # The service container is not addressable by its compose alias for

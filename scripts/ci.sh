@@ -28,7 +28,15 @@ run_tests() {
 }
 
 e2e() {
-  ( cd "$ROOT/rust" && cargo build --release --bins )
+  # ci profile: release-like speed, shares the unit-test graph. Full --release
+  # recompiled a third graph for this one job alone.
+  local profile="${CARGO_PROFILE:-ci}"
+  ( cd "$ROOT/rust" && cargo build --profile "$profile" --locked --bins )
+  # e2e_local.sh looks for target/release/* by default; point it at the
+  # profile dir when not building release.
+  if [ "$profile" != "release" ]; then
+    export RIPCLONE_BIN_DIR="${RIPCLONE_BIN_DIR:-$ROOT/rust/target/$profile}"
+  fi
   bash "$ROOT/scripts/e2e_local.sh"
 }
 
@@ -48,7 +56,10 @@ gitea() {
   export RIPCLONE_GITEA_URL="${RIPCLONE_GITEA_URL:-http://127.0.0.1:3000}"
   export RIPCLONE_GITEA_USER="${RIPCLONE_GITEA_USER:-ci}"
   : "${RIPCLONE_GITEA_TOKEN:?set RIPCLONE_GITEA_TOKEN to a Gitea admin access token}"
-  ( cd "$ROOT/rust" && cargo test --locked --test e2e_gitea_provider -- --ignored --nocapture )
+  # ci profile (same as the unit-test gate). Default/dev recompiles the whole
+  # graph for this one job and dominated wall time on cold runners (~6 min).
+  local profile="${CARGO_PROFILE:-ci}"
+  ( cd "$ROOT/rust" && cargo test --profile "$profile" --locked --test e2e_gitea_provider -- --ignored --nocapture )
 }
 
 # Real network databases for the queue + metadata adapters the default suite can

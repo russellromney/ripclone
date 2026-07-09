@@ -9,11 +9,14 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
-SERVER_BIN="$ROOT_DIR/rust/target/release/ripclone-server"
-CLI_BIN="$ROOT_DIR/rust/target/release/ripclone"
+# Prefer RIPCLONE_BIN_DIR (set by scripts/ci.sh e2e when using the ci profile);
+# fall back to the historical release path for a bare local `cargo build --release`.
+BIN_DIR="${RIPCLONE_BIN_DIR:-$ROOT_DIR/rust/target/release}"
+SERVER_BIN="$BIN_DIR/ripclone-server"
+CLI_BIN="$BIN_DIR/ripclone"
 
 for bin in "$SERVER_BIN" "$CLI_BIN"; do
-  [ -x "$bin" ] || { echo "error: missing binary $bin (cargo build --release)"; exit 1; }
+  [ -x "$bin" ] || { echo "error: missing binary $bin (cargo build --profile ci|release)"; exit 1; }
 done
 
 export RIPCLONE_SERVER_TOKEN="${RIPCLONE_SERVER_TOKEN:-e2e-local-token}"
