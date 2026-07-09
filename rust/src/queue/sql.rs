@@ -125,7 +125,9 @@ pub trait QueueDb: Send + Sync {
     /// timed-out worker). A job that has already been claimed `max_attempts` or
     /// more times is dead-lettered to terminal `failed` (with `dead_letter_error`
     /// and `now` as its finished time) so a hard-killed build can't crash-loop;
-    /// anything under the cap is returned to `queued` for another attempt.
+    /// anything under the cap is returned to `queued` for another attempt, with
+    /// `size_class` bumped one rung so a larger worker can claim it next
+    /// (right-sizing / O2). Dead-letter does not bump.
     async fn reclaim_stale(
         &self,
         cutoff: i64,
@@ -133,6 +135,9 @@ pub trait QueueDb: Send + Sync {
         now: i64,
         dead_letter_error: &str,
     ) -> Result<()>;
+
+    /// Current `size_class` for a job id (`None` if the row is missing).
+    async fn job_size_class(&self, id: i64) -> Result<Option<i64>>;
 
     /// Id of the oldest queued job, if any.
     async fn next_queued_id(&self) -> Result<Option<i64>>;
@@ -267,11 +272,17 @@ impl SqlJobQueue {
         Ok(None)
     }
 
-    /// Settle a claimed job. `Ok` → `done`; `Err(msg)` → `failed`. Conditional
-    /// on `worker_id` still owning the claim; returns `Ok(true)` if it settled,
-    /// `Ok(false)` if the claim had been reclaimed/dead-lettered out from under
-    /// this worker (its result is stale and must be discarded — see
-    /// [`QueueDb::finish`]).
+    /// Settle a claimed job.
+    ///
+    /// - `Ok(())` → terminal `done`
+    /// - `Err(permanent)` → terminal `failed` immediately
+    /// - `Err(retryable)` under the attempts cap → requeue with capped backoff
+    /// - `Err(retryable)` at/over the attempts cap → terminal `failed` (dead-letter)
+    ///
+    /// Conditional on `worker_id` still owning the claim; returns `Ok(true)` if
+    /// it settled (or requeued), `Ok(false)` if the claim had been
+    /// reclaimed/dead-lettered out from under this worker (its result is stale
+    /// and must be discarded — see [`QueueDb::finish`]).
     pub async fn ack(
         &self,
         id: i64,
@@ -401,7 +412,8 @@ pub(crate) const CREATE_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS jobs (
     finished_at INTEGER,
     error TEXT,
     credential TEXT,
-    attempts INTEGER NOT NULL DEFAULT 0
+    attempts INTEGER NOT NULL DEFAULT 0,
+    size_class INTEGER NOT NULL DEFAULT 0
 )";
 
 pub(crate) const CREATE_STATUS_INDEX_SQL: &str =
@@ -438,6 +450,12 @@ pub(crate) const ADD_CREDENTIAL_COLUMN_SQL: &str = "ALTER TABLE jobs ADD COLUMN 
 /// a fresh/up-to-date table, which is ignored.
 pub(crate) const ADD_ATTEMPTS_COLUMN_SQL: &str =
     "ALTER TABLE jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0";
+
+/// Migration for a `jobs` table created before the `size_class` column existed.
+/// Best-effort like [`ADD_ATTEMPTS_COLUMN_SQL`]. Stale-reclaim bumps this rung so
+/// a larger worker can pick the job up next (claim filter lands in O2).
+pub(crate) const ADD_SIZE_CLASS_COLUMN_SQL: &str =
+    "ALTER TABLE jobs ADD COLUMN size_class INTEGER NOT NULL DEFAULT 0";
 
 #[cfg(test)]
 mod tests {
@@ -879,6 +897,55 @@ mod tests {
                 ),
                 other => panic!("{engine}: expected Failed (dead-letter), got {other:?}"),
             }
+        }
+    }
+
+    /// P1: a crash/OOM (no ack) is reclaimed by `reclaim_stale`, and each
+    /// under-cap stale-reclaim bumps `size_class` one rung so a larger worker
+    /// can take the job next (claim filter lands in O2).
+    #[tokio::test]
+    async fn reclaim_stale_bumps_size_class() {
+        for engine in ["sqlite"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("q.db").to_string_lossy().to_string();
+            let db = make_db(engine, &path).await;
+            db.init().await.unwrap();
+            // Zero tolerance: a claim is immediately reclaimable.
+            let q = SqlJobQueue {
+                db,
+                stale_claim_secs: 0,
+                failed_retention_secs: DEFAULT_FAILED_RETENTION_SECS,
+                max_build_attempts: DEFAULT_MAX_BUILD_ATTEMPTS,
+            };
+            // Second adapter on the same file for size_class reads.
+            let reader = make_db(engine, &path).await;
+
+            let enq = q.enqueue(job("o", "r", "main")).await.unwrap();
+            let id = enq.job_id.unwrap();
+            assert_eq!(
+                reader.job_size_class(id).await.unwrap(),
+                Some(0),
+                "{engine}: fresh job starts at size_class 0"
+            );
+
+            // Claim, then abandon (no ack). Next claim reclaims and bumps.
+            let _first = q.claim("w1").await.unwrap().unwrap();
+            let second = q.claim("w2").await.unwrap().unwrap();
+            assert_eq!(second.id, id, "{engine}");
+            assert_eq!(
+                reader.job_size_class(id).await.unwrap(),
+                Some(1),
+                "{engine}: first stale-reclaim bumps size_class to 1"
+            );
+
+            // Second abandon → another bump.
+            let third = q.claim("w3").await.unwrap().unwrap();
+            assert_eq!(third.id, id, "{engine}");
+            assert_eq!(
+                reader.job_size_class(id).await.unwrap(),
+                Some(2),
+                "{engine}: second stale-reclaim bumps size_class to 2"
+            );
         }
     }
 

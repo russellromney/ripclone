@@ -51,7 +51,8 @@ impl QueueDb for PostgresDb {
                 finished_at BIGINT,
                 error TEXT,
                 credential TEXT,
-                attempts BIGINT NOT NULL DEFAULT 0
+                attempts BIGINT NOT NULL DEFAULT 0,
+                size_class BIGINT NOT NULL DEFAULT 0
             )",
         )
         .execute(&self.pool)
@@ -69,6 +70,13 @@ impl QueueDb for PostgresDb {
         .execute(&self.pool)
         .await
         .context("add attempts column")?;
+        // Stale-reclaim escalation rung (right-sizing / O2 claim filter).
+        sqlx::raw_sql(
+            "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS size_class BIGINT NOT NULL DEFAULT 0",
+        )
+        .execute(&self.pool)
+        .await
+        .context("add size_class column")?;
         sqlx::raw_sql(
             "CREATE INDEX IF NOT EXISTS idx_jobs_status_created ON jobs(status, created_at)",
         )
@@ -151,8 +159,10 @@ impl QueueDb for PostgresDb {
         .execute(&self.pool)
         .await
         .context("dead-letter stale jobs")?;
+        // Under-cap: requeue and bump size_class so a larger worker can claim next.
         sqlx::query(
-            "UPDATE jobs SET status = 'queued', worker_id = NULL
+            "UPDATE jobs SET status = 'queued', worker_id = NULL,
+                 size_class = size_class + 1
              WHERE status = 'claimed' AND claimed_at <= $1 AND attempts < $2",
         )
         .bind(cutoff)
@@ -161,6 +171,14 @@ impl QueueDb for PostgresDb {
         .await
         .context("reclaim stale jobs")?;
         Ok(())
+    }
+
+    async fn job_size_class(&self, id: i64) -> Result<Option<i64>> {
+        sqlx::query_scalar("SELECT size_class FROM jobs WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .context("fetch job size_class")
     }
 
     async fn next_queued_id(&self) -> Result<Option<i64>> {

@@ -4,9 +4,9 @@
 //! it doesn't bundle SQLite's C core and collide with sqlx.)
 
 use super::sql::{
-    ADD_ATTEMPTS_COLUMN_SQL, ADD_CREDENTIAL_COLUMN_SQL, CREATE_ACTIVE_KEY_INDEX_SQL,
-    CREATE_HISTORY_INDEX_SQL, CREATE_STATUS_INDEX_SQL, CREATE_TABLE_SQL,
-    DROP_LEGACY_ACTIVE_KEY_INDEX_SQL, QueueDb,
+    ADD_ATTEMPTS_COLUMN_SQL, ADD_CREDENTIAL_COLUMN_SQL, ADD_SIZE_CLASS_COLUMN_SQL,
+    CREATE_ACTIVE_KEY_INDEX_SQL, CREATE_HISTORY_INDEX_SQL, CREATE_STATUS_INDEX_SQL,
+    CREATE_TABLE_SQL, DROP_LEGACY_ACTIVE_KEY_INDEX_SQL, QueueDb,
 };
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -49,6 +49,8 @@ impl QueueDb for LibsqlDb {
         let _ = conn.execute(ADD_CREDENTIAL_COLUMN_SQL, ()).await;
         // Same best-effort migration for the attempts column (dead-letter bound).
         let _ = conn.execute(ADD_ATTEMPTS_COLUMN_SQL, ()).await;
+        // Best-effort migration for size_class (stale-reclaim escalation rung).
+        let _ = conn.execute(ADD_SIZE_CLASS_COLUMN_SQL, ()).await;
         conn.execute(CREATE_STATUS_INDEX_SQL, ())
             .await
             .context("create status index")?;
@@ -120,14 +122,28 @@ impl QueueDb for LibsqlDb {
         )
         .await
         .context("dead-letter stale jobs")?;
+        // Under-cap: requeue and bump size_class so a larger worker can claim next.
         conn.execute(
-            "UPDATE jobs SET status = 'queued', worker_id = NULL
+            "UPDATE jobs SET status = 'queued', worker_id = NULL,
+                 size_class = size_class + 1
              WHERE status = 'claimed' AND claimed_at <= ? AND attempts < ?",
             libsql::params![cutoff, max_attempts],
         )
         .await
         .context("reclaim stale jobs")?;
         Ok(())
+    }
+
+    async fn job_size_class(&self, id: i64) -> Result<Option<i64>> {
+        let conn = self.conn().await?;
+        let mut rows = conn
+            .query("SELECT size_class FROM jobs WHERE id = ?", [id])
+            .await
+            .context("fetch job size_class")?;
+        match rows.next().await? {
+            Some(row) => Ok(Some(row.get::<i64>(0)?)),
+            None => Ok(None),
+        }
     }
 
     async fn next_queued_id(&self) -> Result<Option<i64>> {

@@ -67,6 +67,7 @@ impl QueueDb for MysqlDb {
                 error TEXT,
                 credential TEXT,
                 attempts BIGINT NOT NULL DEFAULT 0,
+                size_class BIGINT NOT NULL DEFAULT 0,
                 INDEX idx_jobs_status_created (status, created_at),
                 INDEX idx_jobs_provider_path_finished (provider, path, finished_at)
             )",
@@ -82,6 +83,10 @@ impl QueueDb for MysqlDb {
             .await;
         // Same best-effort migration for the attempts column (dead-letter bound).
         let _ = sqlx::raw_sql("ALTER TABLE jobs ADD COLUMN attempts BIGINT NOT NULL DEFAULT 0")
+            .execute(&self.pool)
+            .await;
+        // Best-effort migration for size_class (stale-reclaim escalation rung).
+        let _ = sqlx::raw_sql("ALTER TABLE jobs ADD COLUMN size_class BIGINT NOT NULL DEFAULT 0")
             .execute(&self.pool)
             .await;
         Ok(())
@@ -146,8 +151,10 @@ impl QueueDb for MysqlDb {
         .execute(&self.pool)
         .await
         .context("dead-letter stale jobs")?;
+        // Under-cap: requeue and bump size_class so a larger worker can claim next.
         sqlx::query(
-            "UPDATE jobs SET status = 'queued', worker_id = NULL
+            "UPDATE jobs SET status = 'queued', worker_id = NULL,
+                 size_class = size_class + 1
              WHERE status = 'claimed' AND claimed_at <= ? AND attempts < ?",
         )
         .bind(cutoff)
@@ -156,6 +163,14 @@ impl QueueDb for MysqlDb {
         .await
         .context("reclaim stale jobs")?;
         Ok(())
+    }
+
+    async fn job_size_class(&self, id: i64) -> Result<Option<i64>> {
+        sqlx::query_scalar("SELECT size_class FROM jobs WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .context("fetch job size_class")
     }
 
     async fn next_queued_id(&self) -> Result<Option<i64>> {
