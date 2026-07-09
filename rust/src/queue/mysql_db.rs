@@ -8,7 +8,7 @@
 //! coalescing backstop is omitted — coalescing is best-effort only (a rare
 //! duplicate is wasted compute, not a wrong result). Orchestration is reused.
 
-use super::sql::QueueDb;
+use super::sql::{QueueDb, SUPERSEDED_BY_NEWER_QUEUED, now_secs};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use sqlx::Row;
@@ -138,7 +138,7 @@ impl QueueDb for MysqlDb {
         now: i64,
         dead_letter_error: &str,
     ) -> Result<()> {
-        // Dead-letter stale claims over the attempt cap; requeue the rest.
+        // Dead-letter stale claims over the attempt cap.
         sqlx::query(
             "UPDATE jobs SET status = 'failed', finished_at = ?, error = ?,
                  worker_id = NULL, credential = NULL
@@ -151,7 +151,33 @@ impl QueueDb for MysqlDb {
         .execute(&self.pool)
         .await
         .context("dead-letter stale jobs")?;
-        // Under-cap: requeue and bump size_class so a larger worker can claim next.
+        // Under-cap with a newer queued sibling → superseded. MySQL has no
+        // partial unique index, but the semantic still holds: a newer queued
+        // job will build the tip, so don't requeue the older claim.
+        // Nested derived table: MySQL forbids updating a table while selecting
+        // from it in the same statement without the double-wrap.
+        sqlx::query(
+            "UPDATE jobs SET status = 'failed', finished_at = ?, error = ?,
+                 worker_id = NULL, credential = NULL
+             WHERE id IN (
+                 SELECT id FROM (
+                     SELECT j1.id AS id FROM jobs j1
+                     WHERE j1.status = 'claimed' AND j1.claimed_at <= ? AND j1.attempts < ?
+                       AND EXISTS (
+                           SELECT 1 FROM jobs j2
+                           WHERE j2.`key` = j1.`key` AND j2.status = 'queued' AND j2.id != j1.id
+                       )
+                 ) AS superseded
+             )",
+        )
+        .bind(now)
+        .bind(SUPERSEDED_BY_NEWER_QUEUED)
+        .bind(cutoff)
+        .bind(max_attempts)
+        .execute(&self.pool)
+        .await
+        .context("supersede stale jobs with a newer queued sibling")?;
+        // Under-cap with no sibling: requeue and bump size_class.
         sqlx::query(
             "UPDATE jobs SET status = 'queued', worker_id = NULL,
                  size_class = size_class + 1
@@ -256,14 +282,37 @@ impl QueueDb for MysqlDb {
     async fn requeue_claim(&self, id: i64, worker_id: &str, error: &str) -> Result<bool> {
         let res = sqlx::query(
             "UPDATE jobs SET status = 'queued', worker_id = NULL, error = ?
-             WHERE id = ? AND worker_id = ? AND status = 'claimed'",
+             WHERE id = ? AND worker_id = ? AND status = 'claimed'
+               AND NOT EXISTS (
+                   SELECT 1 FROM (
+                       SELECT j2.id FROM jobs j2
+                       WHERE j2.`key` = (SELECT `key` FROM jobs WHERE id = ?)
+                         AND j2.status = 'queued' AND j2.id != ?
+                   ) AS siblings
+               )",
         )
         .bind(error)
         .bind(id)
         .bind(worker_id)
+        .bind(id)
+        .bind(id)
         .execute(&self.pool)
         .await
         .context("requeue retryable job")?;
+        if res.rows_affected() == 1 {
+            return Ok(true);
+        }
+        let res = sqlx::query(
+            "UPDATE jobs SET status = 'failed', finished_at = ?, error = ?, credential = NULL
+             WHERE id = ? AND worker_id = ? AND status = 'claimed'",
+        )
+        .bind(now_secs())
+        .bind(SUPERSEDED_BY_NEWER_QUEUED)
+        .bind(id)
+        .bind(worker_id)
+        .execute(&self.pool)
+        .await
+        .context("supersede claim blocked by newer queued job")?;
         Ok(res.rows_affected() == 1)
     }
 

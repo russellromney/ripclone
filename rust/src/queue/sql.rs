@@ -171,6 +171,11 @@ pub trait QueueDb: Send + Sync {
 
     /// Requeue a retryable build failure while the caller still owns the claim.
     /// Returns false if the claim was reclaimed or otherwise settled first.
+    ///
+    /// If a newer job for the same key is already `queued` (push-during-build),
+    /// requeue would violate the unique queued-key index — instead the claim is
+    /// settled terminal `failed` with [`SUPERSEDED_BY_NEWER_QUEUED`] and this
+    /// returns true (the worker's result is acknowledged, not lost as an error).
     async fn requeue_claim(&self, id: i64, worker_id: &str, error: &str) -> Result<bool>;
 
     /// `(status, error)` for a job id.
@@ -457,6 +462,13 @@ pub(crate) const ADD_ATTEMPTS_COLUMN_SQL: &str =
 pub(crate) const ADD_SIZE_CLASS_COLUMN_SQL: &str =
     "ALTER TABLE jobs ADD COLUMN size_class INTEGER NOT NULL DEFAULT 0";
 
+/// Terminal error when a claimed job cannot requeue because a newer job for the
+/// same key is already `queued` (push-during-build). The older claim is
+/// redundant — the newer job builds the tip — so we settle it instead of
+/// tripping the unique `idx_jobs_queued_key` and leaving the row stuck.
+pub(crate) const SUPERSEDED_BY_NEWER_QUEUED: &str =
+    "superseded by newer queued job for the same repo/branch";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -688,6 +700,84 @@ mod tests {
             );
             // Still claimable (requeued), not terminal.
             assert!(q.claim("w2").await.unwrap().is_some(), "{engine}");
+        }
+    }
+
+    /// Push-during-build leaves a newer `queued` job for the same key. A
+    /// retryable requeue of the older claim must NOT trip the unique index and
+    /// stuck-claimed forever — it settles terminal "superseded" so the newer
+    /// job alone builds the tip.
+    #[tokio::test]
+    async fn retryable_ack_supersedes_when_newer_job_already_queued() {
+        for (engine, q, _dir) in queues().await {
+            let first = q.enqueue(job("o", "r", "main")).await.unwrap();
+            let old_id = first.job_id.unwrap();
+            let claimed = q.claim("w1").await.unwrap().unwrap();
+            assert_eq!(claimed.id, old_id, "{engine}");
+
+            // Push while build is in flight → fresh queued job for same key.
+            let second = q.enqueue(job("o", "r", "main")).await.unwrap();
+            assert_eq!(second.outcome, EnqueueOutcome::Enqueued, "{engine}");
+            let new_id = second.job_id.unwrap();
+            assert_ne!(old_id, new_id, "{engine}");
+
+            // Transient failure on the old claim: cannot requeue (unique key).
+            assert!(
+                q.ack(claimed.id, "w1", Err(BuildError::retryable("storage 503")))
+                    .await
+                    .unwrap(),
+                "{engine}: ack must settle (supersede), not error"
+            );
+            match q.job_status(old_id).await.unwrap() {
+                JobState::Failed(e) => assert!(
+                    e.contains("superseded"),
+                    "{engine}: expected superseded, got {e:?}"
+                ),
+                other => panic!("{engine}: expected Failed(superseded), got {other:?}"),
+            }
+            // Newer job is still queued and claimable.
+            assert!(matches!(
+                q.job_status(new_id).await.unwrap(),
+                JobState::Pending
+            ));
+            let next = q.claim("w2").await.unwrap().unwrap();
+            assert_eq!(next.id, new_id, "{engine}: only the newer job is claimed");
+        }
+    }
+
+    /// Same push-during-build setup: a hard-killed older claim must supersede
+    /// on stale-reclaim (not fail the whole reclaim batch on unique conflict).
+    #[tokio::test]
+    async fn stale_reclaim_supersedes_when_newer_job_already_queued() {
+        for engine in ["sqlite"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("q.db").to_string_lossy().to_string();
+            let db = make_db(engine, &path).await;
+            db.init().await.unwrap();
+            let q = SqlJobQueue {
+                db,
+                stale_claim_secs: 0,
+                failed_retention_secs: DEFAULT_FAILED_RETENTION_SECS,
+                max_build_attempts: DEFAULT_MAX_BUILD_ATTEMPTS,
+            };
+
+            let first = q.enqueue(job("o", "r", "main")).await.unwrap();
+            let old_id = first.job_id.unwrap();
+            let _claimed = q.claim("w1").await.unwrap().unwrap();
+            let second = q.enqueue(job("o", "r", "main")).await.unwrap();
+            let new_id = second.job_id.unwrap();
+
+            // Next claim reclaims the stale older row: must supersede it and
+            // hand out the newer queued job (not error, not stuck).
+            let next = q.claim("w2").await.unwrap().unwrap();
+            assert_eq!(next.id, new_id, "{engine}");
+            match q.job_status(old_id).await.unwrap() {
+                JobState::Failed(e) => assert!(
+                    e.contains("superseded"),
+                    "{engine}: expected superseded, got {e:?}"
+                ),
+                other => panic!("{engine}: expected Failed(superseded), got {other:?}"),
+            }
         }
     }
 
