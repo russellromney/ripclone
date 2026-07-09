@@ -6,8 +6,8 @@ hash). That works, but it means the long-lived secret is stored on the client an
 sent on every request.
 
 Session tokens add a second, short-lived credential on top of the same model —
-they don't replace it, and they don't introduce user accounts (multi-tenant
-identity stays in `ripclone-cloud`).
+they don't replace it, and they don't introduce user accounts (the OSS server is
+single-tenant; multi-tenant identity is out of scope for this repo).
 
 ## Flow
 

@@ -10,10 +10,6 @@ This adds a built-in **webhook receiver**: a provider push hits the server, we
 verify it, normalize it, and enqueue a sync — so the next clone is already warm.
 No CI Action, no glue.
 
-It is the same warm-on-push the managed cloud gives you. The cloud just layers
-zero-config + multi-tenant on top (see [Relationship to the managed
-cloud](#relationship-to-the-managed-cloud)).
-
 ## Where it sits
 
 A webhook is a thin **front door**. Everything heavy already exists — the build
@@ -208,32 +204,6 @@ added-repo set from repos it has already built and from the webhook allowlist, s
 existing deployments keep warming without a manual re-add. Branch policy is
 unchanged — an added repo's default branch always warms; other branches warm only
 if already built, unless `RIPCLONE_WEBHOOK_WARM_ALL=1`.
-
-## Relationship to the managed cloud
-
-The managed cloud does **not** route GitHub App webhooks through this receiver —
-it can't, because its front door must resolve which installation fired, check the
-org's entitlement/billing, and mint a **per-install** token. None of that belongs
-in OSS. Instead, both paths converge one layer down:
-
-- **Cloud:** GitHub App webhook → cloud gateway → tenant auth + entitlement + mint
-  per-install token → enqueue into the backend build queue.
-- **Self-host:** provider webhook → this receiver → enqueue with the static
-  `StaticBroker` credential.
-
-Both feed the **same build queue + per-job credential (#55)**, so warm behavior is
-identical. The only differences are the front door and the amount of setup:
-
-| | Self-host | Managed cloud |
-|---|---|---|
-| Endpoint | you point the provider at `/webhooks/{provider}` | set for you |
-| Secret | `RIPCLONE_WEBHOOK_SECRET_<provider>` | managed |
-| Private credential | static PAT / deploy token (`StaticBroker`) | per-install minted token |
-| Repo scope | optional allowlist | App installation |
-| Pre-warm on add | first push (or a config warm-list) | `installation_repositories.added` |
-
-Same engine, same features. The cloud just removes the setup. That is the point:
-self-host is not a second-class citizen — it runs the identical warm-on-push path.
 
 ## Implementation checklist
 

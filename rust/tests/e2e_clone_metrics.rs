@@ -2,7 +2,7 @@
 //!
 //! These are real round-trips, not mocks. A real in-process `ripclone` server
 //! builds real artifacts; a thin local gateway sits in front of it and — exactly
-//! like the managed cloud's gateway — injects the `X-Ripclone-Clone-Id` header on
+//! like a hosted gateway — injects the `X-Ripclone-Clone-Id` header on
 //! the ref-resolve response and accepts the CLI's fire-and-forget metrics POST.
 //! The real `Client` clones through the gateway and then reports, so we exercise
 //! the actual capture-header → build-payload → POST path.

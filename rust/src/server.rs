@@ -765,7 +765,7 @@ pub struct RegionStorageEntry {
 
 pub fn build_app(state: ServerState) -> Router {
     let protected = Router::new()
-        // Single catch-all route for all repo endpoints. The dispatcher parses
+        // Single catch-all route for all repo endpoints. The route handler parses
         // the legacy 2-segment GitHub form ("owner/repo/refs/main") and the
         // multi-provider form ("gitlab/group/sub/proj/sync") from the path.
         .route("/v1/repos/{*path}", get(dispatch_repos_get))
@@ -5640,7 +5640,8 @@ async fn build_and_publish_two_phase(
     // as absent so the rebuild is cold and re-uploads everything it references.
     let prev_loaded = ref_store.load_branch(repo_id, branch).await.ok().flatten();
     // Preserve the repo's warm pin across a cold rebuild. The pin is an
-    // out-of-band entitlement flag the cloud writes; an evicted `prev` (whose
+    // out-of-band flag an operator or external control plane may set; an evicted
+    // `prev` (whose
     // artifacts GC already reclaimed) is treated as absent for artifact carry
     // below, but dropping its pin would let the freshly rebuilt ref come back
     // un-pinned and be re-evicted every idle cycle. Read the pin from the raw

@@ -34,7 +34,7 @@ struct ServerError {
 }
 
 /// A presigned artifact URL failed (most likely expired mid-clone). The bytes
-/// are served ONLY by the signed URLs in the ref response — the managed cloud no
+/// are served ONLY by the signed URLs in the ref response — the hosted server no
 /// longer serves content by bare hash — so the right recovery is to re-resolve
 /// the ref for fresh URLs and retry, which also re-runs the server's access
 /// check. Surfaced as a typed error so the clone driver can detect it.
@@ -110,23 +110,19 @@ async fn server_error(context: &str, resp: reqwest::Response) -> anyhow::Error {
 }
 
 /// Next-step hint for a failed server response, keyed on HTTP status, the
-/// gateway's `code`, and whether we are talking to the managed cloud. Pure so
-/// the paywall path stays testable: a paid-plan block (403 `no_plan`) must
-/// carry the machine-parseable `code` plus the subscribe URL so an agent fleet
-/// can detect and route it without scraping prose.
+/// server's `code`, and whether we are talking to the default hosted server.
+/// Pure so the access-error paths stay unit-testable: a failure carries the
+/// machine-parseable `code` so an agent fleet can detect and route it without
+/// scraping prose.
 fn error_hint(status: u16, code: Option<&str>, is_cloud: bool) -> &'static str {
     match (status, code, is_cloud) {
         (401, _, true) => "\n  → run `ripclone login`",
         (401, _, false) => {
             "\n  → run `ripclone login --server <server>` or set RIPCLONE_SERVER_TOKEN"
         }
-        (402, _, _) => "\n  → this repo needs a paid plan; subscribe at https://ripclone.com",
-        (403, Some("no_plan"), true) => {
-            "\n  → this org needs a plan; the owner can subscribe at https://ripclone.com"
-        }
-        (403, Some("no_access"), true) => "\n  → you don't have GitHub access to this repo",
-        (403, _, true) => "\n  → the org may need a plan, or you lack GitHub access",
-        (403, _, false) => "\n  → access denied by the configured server",
+        (402, _, _) => "\n  → the server returned 402 (payment required) for this repo",
+        (403, Some("no_access"), _) => "\n  → you don't have access to this repo",
+        (403, _, _) => "\n  → access denied by the configured server",
         (429, _, _) => "\n  → rate limited; wait a moment and retry",
         (404, Some("repo_not_added"), _) => "\n  → run `ripclone add <repo>`",
         (502 | 503, _, _) => "\n  → ripclone is briefly unavailable; retry shortly",
@@ -197,7 +193,7 @@ pub struct RefResponse {
     /// as ready.
     #[serde(default = "ref_archive_ready_default")]
     pub archive_ready: bool,
-    /// The managed cloud's per-clone id, captured from the `X-Ripclone-Clone-Id`
+    /// The hosted server's per-clone id, captured from the `X-Ripclone-Clone-Id`
     /// response header (not part of the JSON body). `None` for a self-hosted or
     /// older server that doesn't mint one — in that case the post-clone metrics
     /// report is skipped entirely.
@@ -577,7 +573,7 @@ pub struct HotfilesResponse {
 }
 
 /// What a finished clone learned, for the best-effort post-clone metrics report.
-/// Carries the managed cloud's per-clone id (when one was minted), the resolved
+/// Carries the hosted server's per-clone id (when one was minted), the resolved
 /// repo/commit, and the bytes/timing the client measured. The end-to-end wall
 /// clock is supplied by the caller (the CLI), which owns the outer timer.
 #[derive(Debug, Clone)]
@@ -806,7 +802,7 @@ impl Client {
                 anyhow::bail!("{repo_path} is still building after {max_attempts} attempts");
             }
             if status.is_success() {
-                // Capture the managed cloud's per-clone id from the response
+                // Capture the hosted server's per-clone id from the response
                 // header before the body is consumed. Absent on a self-hosted or
                 // older server, which leaves `clone_id` None.
                 let clone_id = resp
@@ -1633,7 +1629,7 @@ impl Client {
         })
     }
 
-    /// Best-effort, fire-and-forget POST of clone metrics to the managed cloud,
+    /// Best-effort, fire-and-forget POST of clone metrics to the hosted server,
     /// sent AFTER the clone has printed success. Never returns an error and never
     /// panics: a metrics failure must not change the clone's exit status.
     ///
@@ -2998,18 +2994,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn paywall_hint_is_machine_parseable_with_subscribe_url() {
-        // A paid-plan block on the managed cloud must point at the subscribe
-        // URL so an agent fleet can detect and route it.
-        let hint = error_hint(403, Some("no_plan"), true);
-        assert!(
-            hint.contains("https://ripclone.com"),
-            "no_plan hint: {hint}"
-        );
-        // A bare 402 (payment required) also carries the subscribe URL.
-        let hint = error_hint(402, None, true);
-        assert!(hint.contains("https://ripclone.com"), "402 hint: {hint}");
-        // A generic self-host 403 does not fabricate a subscribe URL.
+    fn access_error_hints_are_actionable() {
+        // A 403 access denial is terminal and says so, without fabricating any
+        // upgrade/subscribe prose an agent fleet would have to scrape.
+        let hint = error_hint(403, Some("no_access"), true);
+        assert!(hint.contains("access"), "no_access hint: {hint}");
+        assert!(!hint.contains("ripclone.com"), "no_access hint: {hint}");
+        // A 401 routes to the right login path depending on the server.
+        assert!(error_hint(401, None, true).contains("login"));
+        assert!(error_hint(401, None, false).contains("RIPCLONE_SERVER_TOKEN"));
+        // Transient statuses hint at retry, not a terminal action.
+        assert!(error_hint(429, None, false).contains("retry"));
+        // No hint fabricates a subscribe/upgrade URL.
+        assert!(!error_hint(402, None, true).contains("ripclone.com"));
         assert!(!error_hint(403, None, false).contains("ripclone.com"));
     }
 

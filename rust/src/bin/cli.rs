@@ -40,10 +40,11 @@ fn parse_verify_upstream(s: &str) -> Result<VerifyUpstream, String> {
 #[command(about = "CAS-based git clone helper")]
 #[command(version)]
 struct Args {
-    /// ripclone server. Defaults to the managed cloud; set RIPCLONE_SERVER or
-    /// pass --server http://localhost:8000 to point at a self-hosted backend.
-    /// When unset, falls back to the server saved by `ripclone login`, then the
-    /// managed cloud. (Resolution: --server > RIPCLONE_SERVER > config > cloud.)
+    /// ripclone server. Defaults to the built-in default server; set
+    /// RIPCLONE_SERVER or pass --server http://localhost:8000 to point at your
+    /// own backend. When unset, falls back to the server saved by
+    /// `ripclone login`, then the built-in default. (Resolution: --server >
+    /// RIPCLONE_SERVER > config > default.)
     #[arg(short, long, env = "RIPCLONE_SERVER")]
     server: Option<String>,
 
@@ -973,7 +974,7 @@ async fn main() -> Result<()> {
     let config = ripclone::config::load();
 
     // Server precedence: --server / RIPCLONE_SERVER (both land in args.server) >
-    // the server saved by `ripclone login` > the managed cloud default. This is
+    // the server saved by `ripclone login` > the built-in default server. This is
     // what makes a self-host `login` then bare `clone` talk to the right server.
     let server = args
         .server
@@ -1254,7 +1255,7 @@ async fn main() -> Result<()> {
                 let report = benchmark.finish();
                 println!("{}", serde_json::to_string_pretty(&report)?);
             }
-            // Fire-and-forget: report metrics to the managed cloud AFTER printing
+            // Fire-and-forget: report metrics to the configured server AFTER printing
             // success. Best-effort — skipped if the server didn't mint a clone id
             // (self-host), the user passed --no-metrics, or the RIPCLONE_NO_METRICS
             // env var is set. Never able to affect the clone's exit status.

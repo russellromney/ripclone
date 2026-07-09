@@ -5,7 +5,7 @@ name: release
 # libraries (zstd, zlib-ng, mimalloc) are vendored and statically linked by
 # their -sys crates. The Linux binaries target {x86_64,aarch64}-unknown-linux-musl
 # and are FULLY static — no libc dependency at all — so one binary per arch runs
-# on any Linux, Alpine (musl) and glibc distros alike; the core ICP is agents/CI,
+# on any Linux, Alpine (musl) and glibc distros alike; the primary target is agents/CI,
 # often in Alpine containers (increasingly on arm64). cargo-zigbuild cross-builds
 # the aarch64 binary on the x86_64 runner. mimalloc is the global allocator on musl to
 # offset musl's slower default allocator (see src/lib.rs). macOS builds natively.

@@ -211,7 +211,7 @@ Why fetch time is the right key (and generation number is not):
   out-of-order window is small. The genuine residual is **cross-process
   stale-reclaim** (two worker processes), where wall-clock stamps can disagree
   under clock skew. The correct fix there is a **DB-monotonic sequence** (e.g. the
-  SQL job id) — a farm-out/dispatcher-era addition, not needed for single-server.
+  SQL job id) — a multi-worker farm-out addition, not needed for single-server.
 
 ### Why not a real compare-and-set
 
@@ -309,9 +309,9 @@ drop it before the read-only pack/archive build), not a safety question.
 ## Where it runs
 
 All policy (coalesce, debounce, fairness, rate-limit, publish guard) lives at the
-enqueue/queue seam, so it is identical for the in-process queue, the SQL queue +
-static worker (the "launch simple" target in `internal/DISPATCHER.md`), and the parked
-dispatcher. The worker stays dumb: claim → build → ack.
+enqueue/queue seam, so it is identical for the in-process queue and the SQL queue
+with a pool of workers (see [`SCALING_WORKERS.md`](SCALING_WORKERS.md)). The worker
+stays dumb: claim → build → ack.
 
 ## Open questions
 

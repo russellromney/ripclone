@@ -23,7 +23,7 @@ E4 (`expired_bearer_token_fails_clone_cleanly`) already uses a server-side `Arti
 
 ## Scope
 - Add one new test file; reuse existing `ArtifactBarrier`, `start_server_with_barrier`, and local storage harness.
-- Do not modify the S3 GC-race test; it remains the MinIO CI gate required by the launch-plan node.
+- Do not modify the S3 GC-race test; it remains the MinIO CI gate.
 - Do not change production code.
 
 ## Success criteria

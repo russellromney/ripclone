@@ -113,22 +113,19 @@ ripclone clone my-org/private-repo
 
 ## Machine-parseable access errors
 
-An agent fleet needs to tell "wait and retry" apart from "this needs a paid
-plan." ripclone's non-2xx responses carry a JSON body `{ "error", "code" }` and
-the CLI exits non-zero with an actionable hint. The paid-plan / paywall cases
-carry the subscribe URL so a fleet can detect and route them without scraping
-prose:
+An agent fleet needs to tell "wait and retry" apart from "this won't succeed
+without action." ripclone's non-2xx responses carry a JSON body
+`{ "error", "code" }` and the CLI exits non-zero with an actionable hint, so a
+fleet can detect and route them without scraping prose:
 
 | Status | `code`           | Meaning / next step                         |
 | ------ | ---------------- | ------------------------------------------- |
 | 401    | —                | not authenticated → `ripclone login` / token |
-| 402    | —                | paid plan required → subscribe at ripclone.com |
-| 403    | `no_plan`        | org needs a plan → owner subscribes at ripclone.com |
 | 403    | `no_access`      | you lack host access to this repo           |
 | 404    | `repo_not_added` | repo not built yet → `ripclone add <repo>`  |
 | 429    | —                | rate limited → back off and retry           |
 | 502/503| —                | briefly unavailable → retry shortly         |
 
-The managed cloud also sets an `X-Ripclone-Upgrade` header with an upgrade nudge
-when relevant. Parse the exit code and the `code` field; treat 402/403-with-a-
-subscribe-URL as "needs billing," not a transient failure.
+Parse the exit code and the `code` field: treat `429` and `502/503` as transient
+(back off and retry) and the `4xx` access codes as terminal until you take the
+listed action.

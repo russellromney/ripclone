@@ -35,5 +35,5 @@ ripclone version    # prints CLI + server versions with a compatibility verdict
 
 A mismatch (old server, new CLI, or vice versa) is the usual cause of missing modes or unexpected `202`/`404` responses — upgrade the lagging side.
 
-Also confirm the CLI is talking to the server you think it is. Resolution order is: `--server` > `RIPCLONE_SERVER` env var > saved login config (`~/.config/ripclone/`) > the managed cloud default. A stale `RIPCLONE_SERVER` in your environment or an old saved login will silently override the server you meant to use. `ripclone logout` clears the saved login.
+Also confirm the CLI is talking to the server you think it is. Resolution order is: `--server` > `RIPCLONE_SERVER` env var > saved login config (`~/.config/ripclone/`) > the built-in default server. A stale `RIPCLONE_SERVER` in your environment or an old saved login will silently override the server you meant to use. `ripclone logout` clears the saved login.
 </content>
