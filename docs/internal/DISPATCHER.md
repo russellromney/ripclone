@@ -274,13 +274,15 @@ Backends selected by `RIPCLONE_DISPATCH=fly|exec|http|mock|none`:
    `ripclone-worker` as the CMD itself would be wrong — wrap it).
 3. **`http`** — self-host escape hatch. POSTs the `WorkerSpec` JSON to
    `RIPCLONE_DISPATCH_URL` (JSON fields: `size_class`, `env` — snake_case).
+   URL must be absolute `http`/`https`; link-local and unspecified hosts are
+   rejected (metadata SSRF guard; loopback/LAN allowed for self-host).
 4. **`mock`** — records calls (tests).
 5. **`none`** / unset — dispatch off (enqueue only).
 
 **Fly and the env bag:** pooled machines carry the bag via Fly secrets / machine
 config at provision time. `WorkerSpec.env` is accepted for interface parity;
 per-job injection (ApiRefStore tokens) is a later step. `exec`/`http` deliver
-the bag on every call.
+the bag on every call. `FLY_API_HOSTNAME` (when set) uses the same URL guard.
 
 Add Modal (or any platform) = implement `ComputeProvider`, register it in
 `get_compute_provider`, set `RIPCLONE_DISPATCH=modal`. Everything else is unchanged.

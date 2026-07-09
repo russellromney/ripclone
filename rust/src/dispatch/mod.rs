@@ -43,6 +43,68 @@ use anyhow::{Result, bail};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::net::IpAddr;
+
+/// Validate an operator-configured dispatch HTTP(S) URL.
+///
+/// Same policy as the git-provider host SSRF guard (AU4): reject the classic
+/// metadata / unspecified targets. Loopback and private LAN stay allowed
+/// (same-box self-host and on-prem receivers are legitimate). Fails loudly on
+/// relative URLs, non-http schemes, or empty host.
+pub(crate) fn validate_dispatch_url(raw: &str) -> Result<()> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        bail!("dispatch URL must not be empty");
+    }
+    let parsed = url::Url::parse(raw).map_err(|e| anyhow::anyhow!("invalid dispatch URL: {e}"))?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        other => bail!("dispatch URL scheme must be http or https, got '{other}'"),
+    }
+    let host = parsed
+        .host_str()
+        .filter(|h| !h.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("dispatch URL must include a host"))?;
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if ip.is_unspecified() {
+            bail!("dispatch URL host '{host}' is the unspecified address (SSRF risk)");
+        }
+        let link_local = match ip {
+            IpAddr::V4(v4) => v4.is_link_local(),
+            IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) == 0xfe80,
+        };
+        if link_local {
+            bail!("dispatch URL host '{host}' is link-local (SSRF / metadata risk)");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod url_guard_tests {
+    use super::validate_dispatch_url;
+
+    #[test]
+    fn accepts_loopback_and_https() {
+        validate_dispatch_url("http://127.0.0.1:9/wake").unwrap();
+        validate_dispatch_url("https://example.com/dispatch").unwrap();
+    }
+
+    #[test]
+    fn rejects_metadata_and_bad_scheme() {
+        let err = validate_dispatch_url("http://169.254.169.254/latest").unwrap_err();
+        assert!(err.to_string().contains("link-local"), "got: {err}");
+        let err = validate_dispatch_url("http://0.0.0.0/wake").unwrap_err();
+        assert!(err.to_string().contains("unspecified"), "got: {err}");
+        let err = validate_dispatch_url("ftp://example.com/x").unwrap_err();
+        assert!(err.to_string().contains("http or https"), "got: {err}");
+        let err = validate_dispatch_url("/relative").unwrap_err();
+        assert!(
+            err.to_string().contains("invalid dispatch URL"),
+            "got: {err}"
+        );
+    }
+}
 
 /// Stable contract every worker needs on any platform.
 ///

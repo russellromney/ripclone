@@ -208,14 +208,17 @@ mod tests {
             }
         }
 
-        let fly = Arc::new(FlyProvider::new(FlyProviderConfig {
-            app: "workers".into(),
-            token: "t".into(),
-            api_base: None,
-            client: Some(Arc::new(EmptyClient)),
-            size_class_metadata_key: None,
-            process_group: None,
-        }));
+        let fly = Arc::new(
+            FlyProvider::new(FlyProviderConfig {
+                app: "workers".into(),
+                token: "t".into(),
+                api_base: None,
+                client: Some(Arc::new(EmptyClient)),
+                size_class_metadata_key: None,
+                process_group: None,
+            })
+            .unwrap(),
+        );
         let p = get_compute_provider(SelectProviderOptions {
             dispatch: Some("fly".into()),
             fly: Some(fly),
@@ -232,10 +235,13 @@ mod tests {
         use crate::dispatch::http::HttpProviderConfig;
         use std::path::PathBuf;
 
-        let exec = Arc::new(ExecProvider::new(ExecProviderConfig {
-            program: PathBuf::from("/bin/true"),
-            fixed_args: vec![],
-        }));
+        let exec = Arc::new(
+            ExecProvider::new(ExecProviderConfig {
+                program: PathBuf::from("/usr/bin/true"),
+                fixed_args: vec![],
+            })
+            .unwrap(),
+        );
         let p = get_compute_provider(SelectProviderOptions {
             dispatch: Some("exec".into()),
             exec: Some(exec),
@@ -245,11 +251,14 @@ mod tests {
         .expect("provider");
         assert_eq!(p.name(), "exec");
 
-        let http = Arc::new(HttpProvider::new(HttpProviderConfig {
-            url: "http://127.0.0.1:9/wake".into(),
-            token: None,
-            client: None,
-        }));
+        let http = Arc::new(
+            HttpProvider::new(HttpProviderConfig {
+                url: "http://127.0.0.1:9/wake".into(),
+                token: None,
+                client: None,
+            })
+            .unwrap(),
+        );
         let p = get_compute_provider(SelectProviderOptions {
             dispatch: Some("http".into()),
             http: Some(http),

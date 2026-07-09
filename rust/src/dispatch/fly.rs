@@ -7,12 +7,12 @@
 //! `WorkerSpec.env` is accepted for interface parity; per-job env injection is
 //! a later concern (ApiRefStore tokens).
 
-use super::{ComputeProvider, WorkerSpec};
+use super::{ComputeProvider, WorkerSpec, validate_dispatch_url};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tracing::{error, info};
 
 const DEFAULT_API_BASE: &str = "https://api.machines.dev";
@@ -20,13 +20,15 @@ const SIZE_CLASS_KEY: &str = "ripclone_size_class";
 const PROCESS_GROUP_KEY: &str = "fly_process_group";
 
 /// Machine is already up or coming up — `ensure_worker` is a no-op.
-fn live_states() -> HashSet<&'static str> {
-    HashSet::from(["started", "starting", "created", "replacing"])
+fn live_states() -> &'static HashSet<&'static str> {
+    static S: OnceLock<HashSet<&'static str>> = OnceLock::new();
+    S.get_or_init(|| HashSet::from(["started", "starting", "created", "replacing"]))
 }
 
 /// Machine can be woken with `POST …/start`.
-fn startable_states() -> HashSet<&'static str> {
-    HashSet::from(["stopped", "suspended"])
+fn startable_states() -> &'static HashSet<&'static str> {
+    static S: OnceLock<HashSet<&'static str>> = OnceLock::new();
+    S.get_or_init(|| HashSet::from(["stopped", "suspended"]))
 }
 
 /// Subset of the Fly Machines list response we care about.
@@ -63,19 +65,23 @@ pub struct HttpFlyMachinesClient {
 }
 
 impl HttpFlyMachinesClient {
-    pub fn new(token: impl Into<String>, api_base: Option<String>) -> Self {
+    /// Build a client. `api_base` defaults to the Fly Machines API; when set it
+    /// must pass the same http(s) / SSRF URL guard as the http dispatch backend.
+    pub fn new(token: impl Into<String>, api_base: Option<String>) -> Result<Self> {
         let api_base = api_base
             .unwrap_or_else(|| DEFAULT_API_BASE.to_string())
             .trim_end_matches('/')
             .to_string();
-        Self {
+        validate_dispatch_url(&api_base)
+            .with_context(|| format!("invalid Fly API base '{api_base}'"))?;
+        Ok(Self {
             token: token.into(),
             api_base,
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(15))
                 .build()
                 .expect("reqwest client"),
-        }
+        })
     }
 }
 
@@ -167,24 +173,28 @@ pub struct FlyProvider {
 }
 
 impl FlyProvider {
-    pub fn new(cfg: FlyProviderConfig) -> Self {
-        let client = cfg.client.unwrap_or_else(|| {
-            Arc::new(HttpFlyMachinesClient::new(cfg.token, cfg.api_base))
-                as Arc<dyn FlyMachinesClient>
-        });
+    pub fn new(cfg: FlyProviderConfig) -> Result<Self> {
+        let client = match cfg.client {
+            Some(c) => c,
+            None => Arc::new(HttpFlyMachinesClient::new(cfg.token, cfg.api_base)?)
+                as Arc<dyn FlyMachinesClient>,
+        };
         let process_group = match cfg.process_group {
             Some(s) if s.is_empty() => None,
             Some(s) => Some(s),
             None => Some("worker".to_string()),
         };
-        Self {
+        if cfg.app.trim().is_empty() {
+            bail!("Fly worker app name must not be empty");
+        }
+        Ok(Self {
             app: cfg.app,
             client,
             size_class_key: cfg
                 .size_class_metadata_key
                 .unwrap_or_else(|| SIZE_CLASS_KEY.to_string()),
             process_group,
-        }
+        })
     }
 
     /// Build from env: `FLY_WORKER_APP`, `FLY_API_TOKEN`, optional `FLY_API_HOSTNAME`.
@@ -196,14 +206,14 @@ impl FlyProvider {
         let api_base = std::env::var("FLY_API_HOSTNAME")
             .ok()
             .filter(|s| !s.is_empty());
-        Ok(Self::new(FlyProviderConfig {
+        Self::new(FlyProviderConfig {
             app,
             token,
             api_base,
             client: None,
             size_class_metadata_key: None,
             process_group: None,
-        }))
+        })
     }
 
     fn is_pool_candidate(&self, m: &FlyMachine, size_class: &str) -> bool {
@@ -385,6 +395,7 @@ mod tests {
             size_class_metadata_key: None,
             process_group: None,
         })
+        .expect("fly provider")
     }
 
     fn spec() -> WorkerSpec {
@@ -548,8 +559,9 @@ mod tests {
         });
 
         let api_base = format!("http://{addr}");
-        let client: Arc<dyn FlyMachinesClient> =
-            Arc::new(HttpFlyMachinesClient::new("fly_token_xyz", Some(api_base)));
+        let client: Arc<dyn FlyMachinesClient> = Arc::new(
+            HttpFlyMachinesClient::new("fly_token_xyz", Some(api_base)).expect("fly http client"),
+        );
         let fly = FlyProvider::new(FlyProviderConfig {
             app: "my-workers".into(),
             token: "fly_token_xyz".into(),
@@ -557,7 +569,8 @@ mod tests {
             client: Some(client),
             size_class_metadata_key: None,
             process_group: None,
-        });
+        })
+        .expect("fly provider");
         fly.ensure_worker(&spec()).await.unwrap();
 
         assert_eq!(list_hits.load(Ordering::SeqCst), 1);
