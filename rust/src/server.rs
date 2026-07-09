@@ -526,6 +526,7 @@ async fn seed_added_repos(
                 added_at: now,
                 history_enabled: true,
                 source: AddedRepoSource::Migration,
+                repo_size_bytes: None,
             })
             .await?;
     }
@@ -3383,6 +3384,10 @@ async fn add_repo_inner(
         return resp;
     }
 
+    // Tiered-add preflight: capture repo size now so the first build can be
+    // size-classified without a new API call at enqueue.
+    let repo_size_bytes =
+        preflight_repo_size_bytes(&provider, &repo_id, credential.as_ref()).await;
     let added = AddedRepo {
         repo_id: repo_id.clone(),
         added_at: SystemTime::now()
@@ -3391,6 +3396,7 @@ async fn add_repo_inner(
             .as_secs(),
         history_enabled: true,
         source: params.source,
+        repo_size_bytes,
     };
     if let Err(e) = state.ref_store.add_repo(&added).await {
         state.metrics.record_error();
@@ -3437,15 +3443,76 @@ fn inproc_build_key(repo_id: &RepoId, branch: &str, rev: Option<&str>) -> String
     format!("{}/{branch}#{}", repo_id.storage_key(), rev.unwrap_or(""))
 }
 
-/// Byte size for size-class classification at enqueue. Re-sync → prior clonepack
-/// byte total from lengths already on the ref (no new API call). First build
-/// (no sized prior artifacts) → `None`, which the queue maps to the largest
-/// class so the first build is never under-sized. Callers with a tiered-add
-/// preflight repo size should pass it via [`BuildJob::size_bytes`] directly.
+/// Byte size for size-class classification at enqueue. Prefers re-sync data
+/// (prior clonepack byte total already on the ref) over the tiered-add preflight
+/// repo size stored on [`AddedRepo`]. Unknown → `None` → largest class. No new
+/// API calls here — both signals are data already in hand.
 async fn enqueue_size_bytes(state: &ServerState, repo_id: &RepoId, branch: &str) -> Option<u64> {
-    let info = state.ref_store.load_branch(repo_id, branch).await.ok().flatten()?;
-    let n = crate::queue::prior_clonepack_bytes(&info);
-    if n == 0 { None } else { Some(n) }
+    let prior = match state.ref_store.load_branch(repo_id, branch).await {
+        Ok(Some(info)) => {
+            let n = crate::queue::prior_clonepack_bytes(&info);
+            if n > 0 { Some(n) } else { None }
+        }
+        _ => None,
+    };
+    let preflight = match state.ref_store.load_added_repo(repo_id).await {
+        Ok(Some(added)) => added.repo_size_bytes,
+        _ => None,
+    };
+    crate::queue::resolve_job_size_bytes(prior, preflight)
+}
+
+/// Tiered-add preflight: best-effort GitHub `repo.size` (KB → bytes). Used to
+/// classify the first build without a prior clonepack. Failures return `None`
+/// (first build maps to largest class) — never fail the add.
+async fn preflight_repo_size_bytes(
+    provider: &ProviderInstance,
+    repo_id: &RepoId,
+    credential: Option<&secrecy::SecretString>,
+) -> Option<u64> {
+    use crate::provider::ProviderKind;
+    if provider.kind != ProviderKind::GitHub {
+        return None;
+    }
+    let (owner, repo) = repo_id.github_owner_repo()?;
+    // github.com → api.github.com; GitHub Enterprise → https://{host}/api/v3.
+    let api_base = if provider.host == "github.com" || provider.host.is_empty() {
+        "https://api.github.com".to_string()
+    } else {
+        format!("https://{}/api/v3", provider.host.trim_end_matches('/'))
+    };
+    let url = format!("{api_base}/repos/{owner}/{repo}");
+    let client = reqwest::ClientBuilder::new()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .ok()?;
+    let mut req = client
+        .get(&url)
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "ripclone");
+    // REST API wants Bearer / token, not the git-HTTPS Basic x-access-token form.
+    if let Some(cred) = credential {
+        req = req.header(
+            "Authorization",
+            format!("Bearer {}", cred.expose_secret()),
+        );
+    }
+    let resp = req.send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    #[derive(serde::Deserialize)]
+    struct GhRepo {
+        /// GitHub reports size in kilobytes.
+        size: u64,
+    }
+    let body: GhRepo = resp.json().await.ok()?;
+    Some(github_repo_size_kb_to_bytes(body.size))
+}
+
+/// GitHub's `repo.size` field is kilobytes; convert to bytes for classification.
+fn github_repo_size_kb_to_bytes(size_kb: u64) -> u64 {
+    size_kb.saturating_mul(1024)
 }
 
 /// Fire-and-forget: enqueue a build for `(repo_id, branch)` at the branch tip and
@@ -8401,6 +8468,7 @@ mod tests {
                     .as_secs(),
                 history_enabled: true,
                 source: AddedRepoSource::Api,
+                repo_size_bytes: None,
             })
             .await
             .unwrap();

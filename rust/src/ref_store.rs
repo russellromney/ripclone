@@ -17,6 +17,12 @@ pub struct AddedRepo {
     pub added_at: u64,
     pub history_enabled: bool,
     pub source: AddedRepoSource,
+    /// Upstream repo size from the tiered-add preflight (GitHub `repo.size` in
+    /// bytes, etc.). Used to classify the first build into a size class when no
+    /// prior clonepack exists yet. `None` on legacy rows / providers with no
+    /// size signal → first build maps to the largest class.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_size_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1639,6 +1645,7 @@ mod tests {
             added_at: 123,
             history_enabled: true,
             source: AddedRepoSource::Cli,
+            repo_size_bytes: Some(42_000),
         };
 
         store.add_repo(&added).await.unwrap();
@@ -1651,6 +1658,20 @@ mod tests {
         store.remove_added_repo(&repo_id).await.unwrap();
         assert!(store.load_added_repo(&repo_id).await.unwrap().is_none());
         assert!(store.list_added_repos().await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn added_repo_legacy_json_defaults_repo_size_bytes() {
+        // Rows written before the size-class preflight field must still parse.
+        let legacy = r#"{
+            "repo_id": {"provider": "github", "path": "o/r"},
+            "added_at": 1,
+            "history_enabled": true,
+            "source": "cli"
+        }"#;
+        let added: AddedRepo = serde_json::from_str(legacy).unwrap();
+        assert_eq!(added.repo_size_bytes, None);
+        assert_eq!(added.repo_id.path, "o/r");
     }
 
     #[tokio::test]

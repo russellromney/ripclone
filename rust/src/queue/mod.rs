@@ -30,6 +30,7 @@ pub use mysql_db::MysqlDb;
 pub use postgres_db::PostgresDb;
 pub use size_class::{
     SizeClass, classify_rank, default_size_classes, load_size_classes, prior_clonepack_bytes,
+    resolve_job_size_bytes,
 };
 pub use sql::SqlJobQueue;
 pub use sqlite_db::SqliteDb;

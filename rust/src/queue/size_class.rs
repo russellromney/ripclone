@@ -118,6 +118,10 @@ pub fn rank_ceiling(name: &str, classes: &[SizeClass]) -> Result<i64> {
 /// [`crate::RefInfo`]. Used at re-sync enqueue so classification needs no new
 /// API call. Returns 0 when no sized artifacts are present (caller treats as
 /// unknown → largest class).
+///
+/// Sums every length field the ref carries offline: HEAD base packs, LSM history
+/// packs, and archive frames. (Manifest-only hashes without lengths do not
+/// contribute — those need a storage round-trip the enqueue path avoids.)
 pub fn prior_clonepack_bytes(info: &crate::RefInfo) -> u64 {
     let mut total = 0u64;
     for p in &info.head_base_packs {
@@ -132,6 +136,22 @@ pub fn prior_clonepack_bytes(info: &crate::RefInfo) -> u64 {
         total = total.saturating_add(f.compressed_len);
     }
     total
+}
+
+/// Pick the enqueue size signal, preferring re-sync data over first-build
+/// preflight. Both sides are optional; `None`/`0` means "unknown".
+///
+/// 1. Prior clonepack byte total (re-sync) when > 0
+/// 2. Else tiered-add preflight repo size when > 0
+/// 3. Else `None` → classifier maps to the largest class
+pub fn resolve_job_size_bytes(
+    prior_clonepack: Option<u64>,
+    preflight_repo_size: Option<u64>,
+) -> Option<u64> {
+    if let Some(n) = prior_clonepack.filter(|&n| n > 0) {
+        return Some(n);
+    }
+    preflight_repo_size.filter(|&n| n > 0)
 }
 
 /// Load size classes: config list if non-empty, else launch defaults.
@@ -263,5 +283,59 @@ mod tests {
             },
         ];
         assert!(validate_size_classes(&dup).is_err());
+    }
+
+    #[test]
+    fn resolve_prefers_prior_clonepack_over_preflight() {
+        assert_eq!(
+            resolve_job_size_bytes(Some(9_000), Some(100)),
+            Some(9_000),
+            "re-sync signal wins"
+        );
+        assert_eq!(
+            resolve_job_size_bytes(Some(0), Some(100)),
+            Some(100),
+            "zero prior falls through to preflight"
+        );
+        assert_eq!(
+            resolve_job_size_bytes(None, Some(100)),
+            Some(100),
+            "first build uses preflight"
+        );
+        assert_eq!(
+            resolve_job_size_bytes(None, None),
+            None,
+            "unknown → largest class at classify"
+        );
+    }
+
+    #[test]
+    fn prior_clonepack_bytes_sums_sized_fields() {
+        let info = crate::RefInfo {
+            head_base_packs: vec![crate::SizedPack {
+                pack: "p".into(),
+                pack_len: 1000,
+                idx: "i".into(),
+                idx_len: 10,
+            }],
+            history_levels: vec![crate::HistoryLevel {
+                tip_commit: "c".into(),
+                packs: vec![crate::SizedPack {
+                    pack: "hp".into(),
+                    pack_len: 500,
+                    idx: "hi".into(),
+                    idx_len: 5,
+                }],
+            }],
+            archive_frames: vec![crate::ArchiveFrame {
+                raw_hash: "r".into(),
+                chunk_hash: "ch".into(),
+                compressed_len: 200,
+                raw_len: 400,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(prior_clonepack_bytes(&info), 1000 + 10 + 500 + 5 + 200);
+        assert_eq!(prior_clonepack_bytes(&crate::RefInfo::default()), 0);
     }
 }

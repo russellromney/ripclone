@@ -4,7 +4,7 @@ This file tracks what has already landed in ripclone. For upcoming work see `int
 
 ## Config-driven size classes + claim filter (O2)
 
-- **`size_class` on the blessed SQL queues** (`sqlite` / `libsql`, column landed in the shared `SqlJobQueue` adapter): each job is classified at enqueue from a byte size already in hand (first build → unknown maps to largest class; re-sync → prior clonepack byte total). Size classes are an ordered config list (`[[queue.size_classes]]` or `RIPCLONE_SIZE_CLASSES` JSON) — name, `max_bytes` threshold, machine-spec label. Launch default is `small | large` (1 GiB cut). Adding a lane or retuning a threshold is config-only.
+- **`size_class` on the blessed SQL queues** (`sqlite` / `libsql`, column landed in the shared `SqlJobQueue` adapter): each job is classified at enqueue from a byte size already in hand. **First build** → `AddedRepo.repo_size_bytes` from the tiered-add GitHub preflight (`repo.size` KB→bytes, best-effort at `add`); **re-sync** → prior clonepack byte total from lengths on `RefInfo`. Unknown size → largest class (never under-size a first build). Size classes are an ordered config list (`[[queue.size_classes]]` or `RIPCLONE_SIZE_CLASSES` JSON) — name, `max_bytes` threshold, machine-spec label. Launch default is `small | large` (1 GiB cut). Adding a lane or retuning a threshold is config-only.
 - **`ripclone-worker --max-size-class <name>`**: worker claims only jobs at or below its ceiling. No flag → claims everything (single-worker self-host unchanged). Postgres/MySQL lag the column and still claim all.
 
 ## Docs that don't lie (adversarial backfill of F5/F6)

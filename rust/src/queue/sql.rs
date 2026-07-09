@@ -1371,4 +1371,111 @@ mod tests {
             "got: {err}"
         );
     }
+
+    #[tokio::test]
+    async fn init_migrates_size_class_column() {
+        use sqlx::sqlite::SqlitePoolOptions;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q.db");
+        // Pre-size_class jobs table (has attempts + credential, no size_class).
+        let url = format!("sqlite://{}?mode=rwc", path.display());
+        let pool = SqlitePoolOptions::new().connect(&url).await.unwrap();
+        sqlx::raw_sql(
+            "CREATE TABLE jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT NOT NULL,
+                provider TEXT NOT NULL, path TEXT NOT NULL, branch TEXT NOT NULL,
+                status TEXT NOT NULL, worker_id TEXT, created_at INTEGER NOT NULL,
+                claimed_at INTEGER, finished_at INTEGER, error TEXT,
+                credential TEXT, attempts INTEGER NOT NULL DEFAULT 0
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        let path_s = path.to_string_lossy().to_string();
+        let db = SqliteDb::connect(&path_s).await.unwrap();
+        db.init().await.unwrap();
+        db.init().await.unwrap(); // idempotent ALTER
+        // Insert via QueueDb — requires the size_class column (rank 1 = large).
+        let _id = db
+            .insert_job("k", "github", "o/r", "main", None, 1, 1)
+            .await
+            .expect("insert after size_class migration");
+        drop(db);
+
+        let small = SqlJobQueue::new_with_classes(make_db("sqlite", &path_s).await, two_classes())
+            .await
+            .unwrap()
+            .with_max_size_class(Some("small"))
+            .unwrap();
+        assert!(
+            small.claim("w").await.unwrap().is_none(),
+            "migrated large-ranked job must be filtered from small workers"
+        );
+        drop(small);
+
+        let large = SqlJobQueue::new_with_classes(make_db("sqlite", &path_s).await, two_classes())
+            .await
+            .unwrap()
+            .with_max_size_class(Some("large"))
+            .unwrap();
+        assert_eq!(
+            large.claim("w").await.unwrap().unwrap().path,
+            "o/r",
+            "large worker drains the migrated job"
+        );
+    }
+
+    #[tokio::test]
+    async fn preflight_size_classifies_first_build_as_small() {
+        // Plan: first build uses tiered-add preflight size (no prior clonepack).
+        let (small_q, _dir) = queue_classes(two_classes(), Some("small")).await;
+        // 50 bytes → small under the test 100-byte threshold.
+        small_q
+            .enqueue(job_sized("o", "tiny", "main", 50))
+            .await
+            .unwrap();
+        let claimed = small_q.claim("s").await.unwrap().unwrap();
+        assert_eq!(claimed.path, "o/tiny");
+    }
+
+    #[tokio::test]
+    async fn unknown_size_first_build_is_large_only() {
+        // Plan: no preflight / no prior → largest class (never under-size).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q.db").to_string_lossy().to_string();
+        let small = SqlJobQueue::new_with_classes(make_db("sqlite", &path).await, two_classes())
+            .await
+            .unwrap()
+            .with_max_size_class(Some("small"))
+            .unwrap();
+        small.enqueue(job("o", "unknown", "main")).await.unwrap();
+        assert!(
+            small.claim("s").await.unwrap().is_none(),
+            "unknown-size first build must not land on a small worker"
+        );
+        drop(small);
+
+        let large = SqlJobQueue::new_with_classes(make_db("sqlite", &path).await, two_classes())
+            .await
+            .unwrap()
+            .with_max_size_class(Some("large"))
+            .unwrap();
+        assert_eq!(large.claim("l").await.unwrap().unwrap().path, "o/unknown");
+    }
+
+    #[test]
+    fn config_driven_n_classes_not_hardcoded() {
+        // Code must accept N classes from config — 2 and 3 both validate and classify.
+        assert_eq!(two_classes().len(), 2);
+        assert_eq!(three_classes().len(), 3);
+        crate::queue::size_class::validate_size_classes(&two_classes()).unwrap();
+        crate::queue::size_class::validate_size_classes(&three_classes()).unwrap();
+        let defaults = default_size_classes();
+        assert_eq!(defaults[0].name, "small");
+        assert_eq!(defaults[1].name, "large");
+        assert_eq!(defaults[0].max_bytes, 1 << 30);
+    }
 }

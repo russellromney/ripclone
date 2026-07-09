@@ -131,6 +131,7 @@ async fn register_added_repo(server: &Server, repo: &str) -> u64 {
                 .as_secs(),
             history_enabled: true,
             source: AddedRepoSource::Api,
+            repo_size_bytes: None,
         })
         .await
         .expect("mark repo added");
