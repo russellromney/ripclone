@@ -128,6 +128,11 @@ impl QueueDb for MysqlDb {
         Ok(res.last_insert_id() as i64)
     }
 
+    async fn raise_size_class(&self, _id: i64, _rank: i64) -> Result<()> {
+        // size_class column lags on mysql.
+        Ok(())
+    }
+
     async fn reclaim_stale(
         &self,
         cutoff: i64,

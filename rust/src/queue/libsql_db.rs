@@ -106,6 +106,18 @@ impl QueueDb for LibsqlDb {
         Ok(conn.last_insert_rowid())
     }
 
+    async fn raise_size_class(&self, id: i64, rank: i64) -> Result<()> {
+        let conn = self.conn().await?;
+        conn.execute(
+            "UPDATE jobs SET size_class = MAX(size_class, ?)
+             WHERE id = ? AND status = 'queued'",
+            libsql::params![rank, id],
+        )
+        .await
+        .context("raise size_class")?;
+        Ok(())
+    }
+
     async fn reclaim_stale(
         &self,
         cutoff: i64,

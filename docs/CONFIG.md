@@ -37,6 +37,12 @@ Internal tuning knobs use code constants at their current defaults.
   `RIPCLONE_METADATA_DB_TOKEN` - metadata/ref-store backend.
 - `RIPCLONE_QUEUE`, `RIPCLONE_QUEUE_DB_URL`, `RIPCLONE_QUEUE_DB_TOKEN` - build
   queue backend.
+- `RIPCLONE_SIZE_CLASSES` - JSON array of size classes for the SQL queue claim
+  filter (overrides `[[queue.size_classes]]` in config.toml). Each entry:
+  `{ "name", "max_bytes", "machine"? }`. Ordered small→large; launch default is
+  `small` (≤1 GiB) | `large` (catch-all). Worker flag:
+  `ripclone-worker --max-size-class <name>` claims only jobs at or below that
+  class; omit the flag to claim everything (single-worker self-host unchanged).
 - `RIPCLONE_WEBHOOK_SECRET_<PROVIDER>`, `RIPCLONE_WEBHOOK_ALLOWLIST`,
   `RIPCLONE_WEBHOOK_WARM_ALL` - webhook authentication and warming policy.
 - `RIPCLONE_POLL_INTERVAL_SECS` - fallback polling interval, default `300`

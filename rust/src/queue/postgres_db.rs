@@ -133,6 +133,11 @@ impl QueueDb for PostgresDb {
         .context("insert job")
     }
 
+    async fn raise_size_class(&self, _id: i64, _rank: i64) -> Result<()> {
+        // size_class column lags on postgres.
+        Ok(())
+    }
+
     async fn reclaim_stale(
         &self,
         cutoff: i64,

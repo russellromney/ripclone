@@ -3474,12 +3474,24 @@ async fn preflight_repo_size_bytes(
     if provider.kind != ProviderKind::GitHub {
         return None;
     }
-    let (owner, repo) = repo_id.github_owner_repo()?;
+    // GitHub paths are always `owner/repo` (including Enterprise / non-default
+    // instance ids). Do not use `github_owner_repo()` — that only matches the
+    // built-in `github` instance id and would skip every GHE / renamed instance.
+    let (owner, repo) = repo_id.path.split_once('/')?;
+    if owner.is_empty() || repo.is_empty() || repo.contains('/') {
+        return None;
+    }
     // github.com → api.github.com; GitHub Enterprise → https://{host}/api/v3.
-    let api_base = if provider.host == "github.com" || provider.host.is_empty() {
+    let host = provider
+        .host
+        .trim()
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_end_matches('/');
+    let api_base = if host == "github.com" || host.is_empty() {
         "https://api.github.com".to_string()
     } else {
-        format!("https://{}/api/v3", provider.host.trim_end_matches('/'))
+        format!("https://{host}/api/v3")
     };
     let url = format!("{api_base}/repos/{owner}/{repo}");
     let client = reqwest::ClientBuilder::new()

@@ -127,6 +127,12 @@ pub trait QueueDb: Send + Sync {
         created_at: i64,
     ) -> Result<i64>;
 
+    /// Raise a *queued* job's size_class to at least `rank` (no-op if already
+    /// higher). Used when a later enqueue coalesces onto an active job so a
+    /// bigger repo can't stay classified as small. Blessed backends only;
+    /// lagging backends no-op.
+    async fn raise_size_class(&self, id: i64, rank: i64) -> Result<()>;
+
     /// Resolve `claimed` jobs whose `claimed_at <= cutoff` (a crashed or
     /// timed-out worker). A job that has already been claimed `max_attempts` or
     /// more times is dead-lettered to terminal `failed` (with `dead_letter_error`
@@ -368,15 +374,18 @@ fn retry_backoff(attempts: i64) -> std::time::Duration {
 impl JobQueue for SqlJobQueue {
     async fn enqueue(&self, job: BuildJob) -> Result<Enqueued> {
         let key = job.key();
+        let size_class = classify_rank(job.size_bytes, &self.size_classes);
         // Best-effort coalesce: fold into an already-active job for this key.
+        // Raise size_class if this enqueue needs a bigger box — otherwise a
+        // large push coalescing onto a small queued job under-sizes the lane.
         if let Some(id) = self.db.active_job_id(&key).await? {
+            self.db.raise_size_class(id, size_class).await?;
             return Ok(Enqueued {
                 outcome: EnqueueOutcome::Coalesced,
                 job_id: Some(id),
             });
         }
         let credential = encode_credential(job.credential.as_ref());
-        let size_class = classify_rank(job.size_bytes, &self.size_classes);
         match self
             .db
             .insert_job(
@@ -396,8 +405,10 @@ impl JobQueue for SqlJobQueue {
             }),
             Err(e) => {
                 // A concurrent enqueue may have inserted first and tripped the
-                // unique backstop; if an active job now exists, treat as coalesced.
+                // unique backstop; if an active job now exists, treat as coalesced
+                // and still raise size_class for the bigger of the two.
                 if let Some(id) = self.db.active_job_id(&key).await? {
+                    self.db.raise_size_class(id, size_class).await?;
                     Ok(Enqueued {
                         outcome: EnqueueOutcome::Coalesced,
                         job_id: Some(id),
@@ -1477,5 +1488,40 @@ mod tests {
         assert_eq!(defaults[0].name, "small");
         assert_eq!(defaults[1].name, "large");
         assert_eq!(defaults[0].max_bytes, 1 << 30);
+    }
+
+    #[tokio::test]
+    async fn coalesce_raises_size_class_so_small_worker_cannot_claim() {
+        // Dangerous case: small job queued first, large enqueue coalesces onto
+        // it. Without raise_size_class the row stays small and a small worker
+        // claims a large build.
+        let (small_q, dir) = queue_classes(two_classes(), Some("small")).await;
+        small_q
+            .enqueue(job_sized("o", "r", "main", 50))
+            .await
+            .unwrap();
+        // Coalesce a large size onto the same key.
+        let coalesced = small_q
+            .enqueue(job_sized("o", "r", "main", 10_000))
+            .await
+            .unwrap();
+        assert_eq!(coalesced.outcome, EnqueueOutcome::Coalesced);
+        assert!(
+            small_q.claim("s").await.unwrap().is_none(),
+            "after coalesce raise, small worker must not claim the upgraded job"
+        );
+        drop(small_q);
+
+        let path = dir.path().join("q.db").to_string_lossy().to_string();
+        let large = SqlJobQueue::new_with_classes(make_db("sqlite", &path).await, two_classes())
+            .await
+            .unwrap()
+            .with_max_size_class(Some("large"))
+            .unwrap();
+        assert_eq!(
+            large.claim("l").await.unwrap().unwrap().path,
+            "o/r",
+            "large worker drains the raised job"
+        );
     }
 }

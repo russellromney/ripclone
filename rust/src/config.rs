@@ -390,6 +390,46 @@ mod tests {
     }
 
     #[test]
+    fn size_classes_parse_from_toml_array() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[queue]
+backend = "sqlite"
+url = "/tmp/q.db"
+
+[[queue.size_classes]]
+name = "small"
+max_bytes = 1000
+machine = "s"
+
+[[queue.size_classes]]
+name = "medium"
+max_bytes = 5000
+machine = "m"
+
+[[queue.size_classes]]
+name = "large"
+max_bytes = 18446744073709551615
+machine = "l"
+"#,
+        )
+        .unwrap();
+        let cfg = try_load_from(&path).unwrap();
+        assert_eq!(cfg.queue.size_classes.len(), 3);
+        assert_eq!(cfg.queue.size_classes[0].name, "small");
+        assert_eq!(cfg.queue.size_classes[0].max_bytes, 1000);
+        assert_eq!(cfg.queue.size_classes[1].name, "medium");
+        assert_eq!(cfg.queue.size_classes[2].name, "large");
+        assert_eq!(cfg.queue.size_classes[2].max_bytes, u64::MAX);
+        crate::queue::size_class::validate_size_classes(&cfg.queue.size_classes).unwrap();
+        let loaded = crate::queue::load_size_classes(&cfg.queue.size_classes).unwrap();
+        assert_eq!(loaded.len(), 3);
+    }
+
+    #[test]
     fn round_trip_toml_provider_token() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");

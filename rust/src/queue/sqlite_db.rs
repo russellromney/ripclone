@@ -113,6 +113,19 @@ impl QueueDb for SqliteDb {
         Ok(res.last_insert_rowid())
     }
 
+    async fn raise_size_class(&self, id: i64, rank: i64) -> Result<()> {
+        sqlx::query(
+            "UPDATE jobs SET size_class = MAX(size_class, ?)
+             WHERE id = ? AND status = 'queued'",
+        )
+        .bind(rank)
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .context("raise size_class")?;
+        Ok(())
+    }
+
     async fn reclaim_stale(
         &self,
         cutoff: i64,

@@ -138,20 +138,26 @@ pub fn prior_clonepack_bytes(info: &crate::RefInfo) -> u64 {
     total
 }
 
-/// Pick the enqueue size signal, preferring re-sync data over first-build
-/// preflight. Both sides are optional; `None`/`0` means "unknown".
+/// Pick the enqueue size signal from data already in hand. Both sides optional;
+/// `None`/`0` means "unknown".
 ///
-/// 1. Prior clonepack byte total (re-sync) when > 0
-/// 2. Else tiered-add preflight repo size when > 0
-/// 3. Else `None` → classifier maps to the largest class
+/// Uses the **max** of prior clonepack total and tiered-add preflight size when
+/// both exist. Preferring only the prior under-sizes a giant repo whose HEAD
+/// packs look small while preflight (or full history) said large. Max never
+/// under-sizes relative to either signal; unknown both → `None` → largest class.
 pub fn resolve_job_size_bytes(
     prior_clonepack: Option<u64>,
     preflight_repo_size: Option<u64>,
 ) -> Option<u64> {
-    if let Some(n) = prior_clonepack.filter(|&n| n > 0) {
-        return Some(n);
+    match (
+        prior_clonepack.filter(|&n| n > 0),
+        preflight_repo_size.filter(|&n| n > 0),
+    ) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
     }
-    preflight_repo_size.filter(|&n| n > 0)
 }
 
 /// Load size classes: config list if non-empty, else launch defaults.
@@ -286,11 +292,16 @@ mod tests {
     }
 
     #[test]
-    fn resolve_prefers_prior_clonepack_over_preflight() {
+    fn resolve_takes_max_of_prior_and_preflight() {
         assert_eq!(
             resolve_job_size_bytes(Some(9_000), Some(100)),
             Some(9_000),
-            "re-sync signal wins"
+            "larger prior wins"
+        );
+        assert_eq!(
+            resolve_job_size_bytes(Some(100), Some(9_000)),
+            Some(9_000),
+            "larger preflight wins — never under-size a giant"
         );
         assert_eq!(
             resolve_job_size_bytes(Some(0), Some(100)),
