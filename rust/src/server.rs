@@ -7882,6 +7882,82 @@ mod tests {
         }
     }
 
+    /// Storage wrapper that returns byte-corrupted (but same-length) data for one
+    /// target hash, simulating clonepack bit-rot / a partially corrupt seed object.
+    struct CorruptingGetStorage {
+        inner: StorageRef,
+        target_hash: String,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::storage::StorageBackend for CorruptingGetStorage {
+        fn get(&self, hash: &str) -> Result<Vec<u8>> {
+            let mut data = self.inner.get(hash)?;
+            if hash == self.target_hash && !data.is_empty() {
+                // Flip a byte: keeps the length (so the size check passes) but
+                // makes the content hash mismatch what the manifest recorded.
+                data[0] ^= 0xff;
+            }
+            Ok(data)
+        }
+
+        fn get_range(&self, hash: &str, start: u64, len: u64) -> Result<Vec<u8>> {
+            self.inner.get_range(hash, start, len)
+        }
+
+        fn put(&self, hash: &str, data: &[u8]) -> Result<()> {
+            self.inner.put(hash, data)
+        }
+
+        async fn put_async(&self, hash: &str, data: &[u8]) -> Result<()> {
+            self.inner.put_async(hash, data).await
+        }
+
+        async fn put_file_async(&self, hash: &str, path: &std::path::Path) -> Result<()> {
+            self.inner.put_file_async(hash, path).await
+        }
+
+        async fn get_meta(&self, key: &str) -> Result<Option<Vec<u8>>> {
+            self.inner.get_meta(key).await
+        }
+
+        async fn put_meta(&self, key: &str, data: &[u8]) -> Result<()> {
+            self.inner.put_meta(key, data).await
+        }
+
+        fn size(&self, hash: &str) -> Result<u64> {
+            self.inner.size(hash)
+        }
+
+        fn signed_url(&self, hash: &str, expires_in: Duration) -> Option<String> {
+            self.inner.signed_url(hash, expires_in)
+        }
+
+        fn is_remote(&self) -> bool {
+            self.inner.is_remote()
+        }
+
+        fn regions(&self) -> Vec<String> {
+            self.inner.regions()
+        }
+
+        fn delete(&self, hash: &str) -> Result<()> {
+            self.inner.delete(hash)
+        }
+
+        fn delete_batch(&self, hashes: &[String]) -> Result<u64> {
+            self.inner.delete_batch(hashes)
+        }
+
+        fn list_hashes(&self) -> Result<Vec<crate::storage::HashEntry>> {
+            self.inner.list_hashes()
+        }
+
+        fn health(&self) -> Result<()> {
+            self.inner.health()
+        }
+    }
+
     fn git_stdout(repo: &std::path::Path, args: &[&str]) -> String {
         let output = std::process::Command::new("git")
             .arg("-C")
@@ -7952,6 +8028,27 @@ mod tests {
             "first build published full clonepack"
         );
 
+        // The exact pack filenames the seed will install, derived from the stored
+        // full clonepack. Used below to prove the delta fetch reused the seeded
+        // objects rather than silently doing a full re-clone.
+        let seed_pack_names: std::collections::HashSet<String> = {
+            let manifest_bytes = state.storage.get(&seed_manifest).unwrap();
+            let manifest = ClonepackManifest::decode(manifest_bytes.as_slice()).unwrap();
+            manifest
+                .packs
+                .iter()
+                .map(|entry| {
+                    let ph = hash_to_hex(&entry.pack.as_ref().unwrap().hash);
+                    let pack_bytes = state.storage.get(&ph).unwrap();
+                    format!(
+                        "pack-{}.pack",
+                        hex::encode(&pack_bytes[pack_bytes.len() - 20..])
+                    )
+                })
+                .collect()
+        };
+        assert!(!seed_pack_names.is_empty());
+
         std::fs::remove_dir_all(state.repo_root.join(repo_id.mirror_dir_name())).unwrap();
         let c2 =
             crate::test_fixture::commit(&origin, &[("a.txt", b"2\n"), ("dir/b.txt", b"delta\n")]);
@@ -7978,6 +8075,84 @@ mod tests {
             git_stdout(&full_mirror, &["rev-parse", "main^{tree}"]),
             "seeded-fetch mirror tree must match full-clone mirror tree"
         );
+        // Byte-identical guarantee also requires the resolved branch commit to
+        // match, not just its tree (two distinct commits can share a tree).
+        assert_eq!(
+            git_stdout(&seeded_mirror, &["rev-parse", "main"]),
+            git_stdout(&full_mirror, &["rev-parse", "main"]),
+            "seeded-fetch mirror commit must match full-clone mirror commit"
+        );
+        // Delta efficiency: the seeded pack must survive the fetch, proving the
+        // fetch only negotiated the delta on top of the reused seed objects rather
+        // than re-downloading the full history.
+        let after_pack_names: std::collections::HashSet<String> =
+            std::fs::read_dir(seeded_mirror.join("objects").join("pack"))
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.ends_with(".pack"))
+                .collect();
+        assert!(
+            seed_pack_names.iter().any(|n| after_pack_names.contains(n)),
+            "seeded pack must survive the delta fetch (proves reuse, not full re-clone): \
+             seeded={seed_pack_names:?} after={after_pack_names:?}"
+        );
+        unsafe { std::env::remove_var("RIPCLONE_ORIGIN_BASE") };
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn cold_sync_corrupt_seed_pack_falls_back_to_full_clone() {
+        let _env = crate::git::ORIGIN_BASE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let origin_base = tempfile::tempdir().unwrap();
+        let origin_path = origin_base.path().join("acme").join("corruptseed.git");
+        std::fs::create_dir_all(origin_path.parent().unwrap()).unwrap();
+        let origin = crate::test_fixture::init_bare(&origin_path);
+        crate::test_fixture::commit(&origin, &[("a.txt", b"1\n")]);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = test_state(&tmp);
+        let repo_id = RepoId::github("acme/corruptseed");
+        let provider = state.provider_registry.get("github").unwrap().clone();
+        unsafe { std::env::set_var("RIPCLONE_ORIGIN_BASE", origin_base.path()) };
+
+        let first = do_sync_for_test(&state, &repo_id, "main", &provider).await;
+        let seed_manifest = first.info.full_clonepack.manifest.clone();
+
+        // Pick the first seed pack hash and arrange for storage to return a
+        // corrupt (same-length) copy of it: a partially corrupt clonepack.
+        let manifest_bytes = state.storage.get(&seed_manifest).unwrap();
+        let manifest = ClonepackManifest::decode(manifest_bytes.as_slice()).unwrap();
+        let corrupt_pack_hash = hash_to_hex(&manifest.packs[0].pack.as_ref().unwrap().hash);
+
+        std::fs::remove_dir_all(state.repo_root.join(repo_id.mirror_dir_name())).unwrap();
+        let c2 = crate::test_fixture::commit(
+            &origin,
+            &[("a.txt", b"2\n"), ("corrupt.txt", b"detect me\n")],
+        );
+
+        state.storage = Arc::new(CorruptingGetStorage {
+            inner: state.storage.clone(),
+            target_hash: corrupt_pack_hash,
+        });
+
+        // The seed must DETECT the corruption and fall back to a clean full clone,
+        // never silently promote a corrupt mirror.
+        let second = do_sync_for_test(&state, &repo_id, "main", &provider).await;
+        assert_eq!(second.info.commit, c2);
+
+        let recovered_mirror = state.repo_root.join(repo_id.mirror_dir_name());
+        let full_mirror = tmp.path().join("full-clone-corruptseed.git");
+        git::sync_bare_mirror(&full_mirror, &provider, &repo_id, "main", None, None).unwrap();
+        assert_eq!(
+            git_stdout(&recovered_mirror, &["rev-parse", "main^{tree}"]),
+            git_stdout(&full_mirror, &["rev-parse", "main^{tree}"]),
+            "corrupt-seed fallback tree must match full-clone mirror tree"
+        );
+        // The recovered mirror must be connectivity-clean (no corrupt objects).
+        git::fsck_connectivity(&recovered_mirror).unwrap();
         unsafe { std::env::remove_var("RIPCLONE_ORIGIN_BASE") };
     }
 
