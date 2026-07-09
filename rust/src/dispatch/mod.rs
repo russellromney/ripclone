@@ -1,0 +1,92 @@
+//! Provider-agnostic compute dispatch seam.
+//!
+//! Callers wake a worker with one verb — [`ComputeProvider::ensure_worker`] —
+//! and never talk to a platform API. Pooling / cold-start strategy is
+//! provider-internal (e.g. Fly starts a pre-provisioned stopped machine).
+//!
+//! `ensure_worker` is **idempotent, non-blocking, best-effort**. The dispatcher's
+//! reconcile loop is the backstop. Builds are content-addressed and ref writes
+//! are ordering-guarded, so double-dispatch wastes compute but never corrupts.
+//!
+//! ## Selecting a provider
+//!
+//! ```text
+//! RIPCLONE_DISPATCH=fly|exec|http|mock|none
+//! ```
+//!
+//! - **fly** — start a stopped pooled Fly machine (Machines API).
+//! - **exec** — self-host escape hatch: run a configured command with the env
+//!   bag as process env and `size_class` as a separate argv element.
+//! - **http** — self-host escape hatch: POST the [`WorkerSpec`] JSON to a URL.
+//! - **mock** — records calls (tests).
+//! - **none** / unset — dispatch disabled (enqueue only).
+//!
+//! Nothing outside this module knows the platform. See `docs/DISPATCHER.md`.
+
+pub mod exec;
+pub mod fly;
+pub mod http;
+pub mod mock;
+pub mod select;
+
+pub use exec::{ExecProvider, ExecProviderConfig};
+pub use fly::{
+    FlyMachine, FlyMachinesClient, FlyProvider, FlyProviderConfig, HttpFlyMachinesClient,
+};
+pub use http::{HttpProvider, HttpProviderConfig};
+pub use mock::MockProvider;
+pub use select::{
+    DispatchBackend, SelectProviderOptions, get_compute_provider, parse_dispatch_backend,
+};
+
+use anyhow::Result;
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+/// Stable contract every worker needs on any platform.
+///
+/// A provider does one thing: deliver this bag to a fresh process. Keys include
+/// (see `docs/DISPATCHER.md`):
+/// - queue URL + creds (claim)
+/// - storage creds (upload)
+/// - metadata target (ApiRefStore report URL + per-job token, or direct creds)
+/// - upstream-credential source
+/// - ripclone token
+/// - `--max-size-class`
+/// - lifecycle flags (`--idle-exit-secs` / `--max-jobs`)
+///
+/// `size_class` is a **config-driven lane name** (launch: `"small"` | `"large"`),
+/// not a hardcoded enum.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerSpec {
+    pub size_class: String,
+    pub env: BTreeMap<String, String>,
+}
+
+impl WorkerSpec {
+    pub fn new(size_class: impl Into<String>, env: BTreeMap<String, String>) -> Self {
+        Self {
+            size_class: size_class.into(),
+            env,
+        }
+    }
+}
+
+/// Provider-agnostic compute wake.
+///
+/// Pooling / cold-start strategy is provider-internal. Callers must not know
+/// whether the platform starts a stopped machine, spawns a container, or runs
+/// a script.
+#[async_trait]
+pub trait ComputeProvider: Send + Sync {
+    /// Short name for logs / selection (`"fly"`, `"exec"`, …).
+    fn name(&self) -> &str;
+
+    /// Ensure a worker of at least `spec.size_class` is starting with `spec.env`.
+    ///
+    /// Idempotent: already-starting / already-live → no-op.
+    /// Non-blocking / best-effort: failures surface as `Err` for the caller to
+    /// log; the reconcile loop retries. Never required for enqueue durability.
+    async fn ensure_worker(&self, spec: &WorkerSpec) -> Result<()>;
+}

@@ -29,6 +29,24 @@ Every command in the README and `docs/` was run verbatim against a real server. 
 - **New [Agents & CI](AGENTS.md) doc page**: depth-1 vs files vs full guidance (full is for humans; agents want depth-1/files), `--temp` for ephemeral fleet VMs, a copy-paste fleet quickstart (install + token-in-env + headless clone, no login round-trip), and the table of machine-parseable access errors.
 - **Machine-parseable paywall hint factored out and unit-tested** (`rust/src/client.rs`): the status→next-step mapping is now a pure `error_hint`; the paid-plan cases (402, `403 no_plan`) carry the subscribe URL so an agent fleet can route billing errors without scraping prose.
 
+## Compute dispatch seam
+
+- **`ComputeProvider` trait** (`rust/src/dispatch/`): one verb —
+  `ensure_worker(&WorkerSpec) -> Result<()>` — idempotent, non-blocking,
+  best-effort. `WorkerSpec { size_class, env }` is the stable contract (queue /
+  storage / metadata / upstream-cred / token / size-class / lifecycle flags).
+  `size_class` is a config-driven lane name, not a hardcoded enum.
+- **Four backends** behind `RIPCLONE_DISPATCH=fly|exec|http|mock|none`:
+  - **fly** — start a pre-provisioned stopped Fly machine via the Machines API
+    (pooling internal; already-starting → no-op).
+  - **exec** — self-host escape hatch: run `RIPCLONE_DISPATCH_CMD` with the env
+    bag as process env and `size_class` as a separate argv (never shell-interpolated).
+  - **http** — self-host escape hatch: POST the `WorkerSpec` JSON to
+    `RIPCLONE_DISPATCH_URL`.
+  - **mock** — records calls for tests.
+- Callers outside the module never know the platform. Cloud webhook/cron wiring
+  and the reconcile loop remain separate (see `docs/DISPATCHER.md`).
+
 ## Distribution
 
 - **Three install channels**, all driven by a `v*` tag (`.github/workflows/release.yml`):

@@ -1,18 +1,20 @@
 # Dispatcher: serverless build workers
 
-Status: **design, parked — launch on a static worker pool, build this when the
-numbers ask.** The seam is designed; the launch bridge is cheap. This doc is the
-target and the punch-list for the day we automate scale.
+Status: **seam shipped in OSS (`rust/src/dispatch/`); cloud webhook/cron wiring
+and the reconcile loop are still parked** — launch on a static worker pool, wire
+dispatch when the numbers ask. The launch bridge is cheap.
 
 ## The model (decided 2026-07-05)
 
 The dispatcher gives the cloud two things: **scale to zero** (no idle worker cost)
 and **instant, right-sized compute on push**. The key architectural decision that
-makes it simple: **the dispatcher lives in the cloud webhook processor, not the OSS
-server.** The cloud already receives the push, already enqueues, already holds the
-Fly credentials — it is the natural place to say "start a machine." So the OSS
-backend stays a pure queue + worker + build system with no dispatch abstraction at
-all.
+makes it simple: **the *caller* lives in the cloud webhook processor (or a
+self-host trigger), not inside the OSS server loop.** The cloud already receives
+the push, already enqueues, already holds platform credentials — it is the natural
+place to say "start a machine." The **provider seam itself is OSS**: a
+`ComputeProvider` trait and four backends under `rust/src/dispatch/`, selected by
+`RIPCLONE_DISPATCH`. The OSS server stays a pure queue + worker + build system;
+dispatch is an optional side call after enqueue.
 
 ```
 push → cloud webhook route
@@ -61,18 +63,29 @@ the cloud path on fresh machine creation.
 
 ## Self-host parity
 
-Same OSS binary; only the trigger differs. The dispatcher is a cloud concern; a
-self-hoster never runs it.
+Same OSS binary and the same `ComputeProvider` seam; only which backend you pick
+differs.
 
 | Setup | Queue | Compute trigger | Who |
 |---|---|---|---|
 | Single binary, no infra | `local` | in-process worker | first run / small self-host |
 | Static worker pool | `sqlite`/`libsql`/… | you run N workers | typical self-host |
-| Serverless, managed | `libsql` | cloud webhook → Fly start-machine | ripclone-cloud |
+| Self-host scale-to-zero | `libsql`/… | `RIPCLONE_DISPATCH=exec` or `http` | your script / endpoint |
+| Serverless, managed | `libsql` | cloud webhook → `RIPCLONE_DISPATCH=fly` | ripclone-cloud |
 
-Self-hosters who want scale-to-zero on their own platform run their own trigger
-(k8s Job, Nomad, systemd, a script) against the same queue — the worker doesn't
-care what started it. No `Dispatcher` trait in OSS is needed to enable that.
+**Self-host escape hatches** (built in OSS, zero cloud code):
+
+1. **`exec`** — `RIPCLONE_DISPATCH=exec`, `RIPCLONE_DISPATCH_CMD=./spawn-worker.sh`
+   (optional fixed args via `RIPCLONE_DISPATCH_CMD_ARGS`). The command receives
+   `size_class` as a **separate argv** element and the env bag as process env.
+   SAFETY: never interpolate size/repo/branch into a shell string — names are
+   attacker-influenced.
+2. **`http`** — `RIPCLONE_DISPATCH=http`, `RIPCLONE_DISPATCH_URL=https://…`
+   (optional `RIPCLONE_DISPATCH_TOKEN`). POSTs the `WorkerSpec` JSON; your
+   receiver starts the compute.
+
+The worker still doesn't care what started it — claim / build / report are
+unchanged.
 
 ## Worker flags
 
@@ -234,33 +247,35 @@ started it. So a compute provider does exactly ONE thing: **make a worker proces
 exist, given a standard config bag.** It never touches claim / build / report. Adding
 a provider is one function, not a subsystem.
 
-Three levels of integration — the first two need ZERO ripclone code:
+The OSS seam (`rust/src/dispatch/`):
 
-1. **`exec` — run any command (covers everything, today).** The dispatcher runs a
-   configured command with the config as env and size as an argument. Point it at
-   anything with a CLI/API:
-   `RIPCLONE_DISPATCH=exec`, `RIPCLONE_DISPATCH_CMD=./spawn-modal-worker.sh`
-   (or `modal run …`, `kubectl create job …`, a Blaxel/e2b deploy call, your own
-   script). SAFETY: size/repo/branch pass as separate argv, NEVER interpolated into a
-   shell string (repo names are attacker-influenced). This is the escape hatch that
-   means nobody is ever blocked on us shipping their platform.
-2. **`http` — POST the spec to your endpoint (covers anything callable).** A built-in
-   backend POSTs the WorkerSpec to a configured URL; your receiver (a Lambda, Cloud
-   Function, Modal webhook) starts the compute. Zero ripclone code — stand up an
-   endpoint. `exec` for people who prefer HTTP over a local command.
-3. **Typed `ComputeProvider` — ~50 lines for a first-class in-tree provider.** For
-   native control (pooling, precise sizing, sub-second start). In the cloud dispatcher:
-   ```ts
-   interface ComputeProvider {
-     name: string;
-     // Idempotent, non-blocking, best-effort: ensure a worker of >= size is
-     // starting with this env. The reconcile cron is the backstop.
-     ensureWorker(spec: WorkerSpec): Promise<void>;
-   }
-   type WorkerSpec = { sizeClass: SizeClass; env: Record<string, string> };
-   ```
-   Add Modal = write `class ModalProvider implements ComputeProvider`, register it in
-   the `providers` map, set `RIPCLONE_DISPATCH=modal`. Everything else is unchanged.
+```rust
+#[async_trait]
+pub trait ComputeProvider: Send + Sync {
+    fn name(&self) -> &str;
+    // Idempotent, non-blocking, best-effort. Reconcile loop is the backstop.
+    async fn ensure_worker(&self, spec: &WorkerSpec) -> Result<()>;
+}
+// size_class is a config-driven lane name ("small"|"large"), not an enum.
+pub struct WorkerSpec {
+    pub size_class: String,
+    pub env: BTreeMap<String, String>,
+}
+```
+
+Backends selected by `RIPCLONE_DISPATCH=fly|exec|http|mock|none`:
+
+1. **`fly`** — start a pre-provisioned stopped Fly machine (Machines API). Pooling
+   is provider-internal; already-starting → no-op.
+2. **`exec`** — self-host escape hatch. Runs `RIPCLONE_DISPATCH_CMD` with the env
+   bag as process env and `size_class` as a separate argv (never shell-interpolated).
+3. **`http`** — self-host escape hatch. POSTs the `WorkerSpec` JSON to
+   `RIPCLONE_DISPATCH_URL`.
+4. **`mock`** — records calls (tests).
+5. **`none`** / unset — dispatch off (enqueue only).
+
+Add Modal (or any platform) = implement `ComputeProvider`, register it in
+`get_compute_provider`, set `RIPCLONE_DISPATCH=modal`. Everything else is unchanged.
 
 **The stable contract is the `env` bag** — the fixed config every worker needs on any
 platform: queue URL+creds (claim), storage creds (upload), the metadata target
@@ -279,9 +294,9 @@ Two choices keep the provider surface tiny:
   lease, no exactly-once. A new provider can't corrupt anything by over-spawning; the
   worst case is wasted compute the idle-exit reclaims.
 
-Self-host note: the typed interface lives in the cloud dispatcher, but a self-hoster
-needs none of it — they run their own trigger (cron/webhook/`exec`) against the shared
-queue. Same worker, same env bag; only the caller differs.
+Self-host note: pick `exec` or `http` and run your own trigger against the shared
+queue, or keep a static worker pool and leave `RIPCLONE_DISPATCH` unset. Same
+worker, same env bag; only the caller differs.
 
 ## Platforms
 
@@ -299,11 +314,14 @@ mandatory. Optimize for start latency, CPU/RAM, fast ephemeral scratch, $/CPU-se
 
 ## Testing (dispatcher-era)
 
+- **ComputeProvider unit tests** (`rust/src/dispatch/`) — FlyProvider issues a
+  start-stopped call (mock Fly Machines HTTP API); already-starting → no-op;
+  provider chosen by `RIPCLONE_DISPATCH`; ExecProvider passes size as separate
+  argv (no shell interpolation); MockProvider records the spec.
 - **Worker `--idle-exit-secs`** — builds until the queue drains, then exits; a job in
   the exit window is picked up by the reconcile cron.
-- **Cloud dispatch** — webhook enqueues → a stopped machine is started (mock the Fly
-  API); already-starting → no-op; dispatch failure is logged, not returned to the
-  client (the job is queued; the cron covers it).
+- **Cloud dispatch** — webhook enqueues → `ensure_worker` (best-effort); dispatch
+  failure is logged, not returned to the client (the job is queued; the cron covers it).
 - **Reconcile cron** — depth > 0 with no machine running → starts one; a machine
   already draining → no-op.
 - **Idempotent double-dispatch** — two machines claim/build the same repo → one clean
