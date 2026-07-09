@@ -19,7 +19,7 @@ mkdir -p "$STAGE_DIR" "$TARGET_ROOT/$PROFILE"
 cd "$ROOT/rust"
 
 # Product bins fan-out needs (not writer_bench — internal microbench only).
-BINS=(ripclone ripclone-server ripclone-worker git-remote-ripclone)
+BINS=(ripclone ripclone-server ripclone-worker ripclone-dispatcher git-remote-ripclone)
 
 echo "==> building all bins + test binaries (profile=$PROFILE, one cargo inv)"
 # --bins is covered by --all-targets; listing both keeps intent clear.

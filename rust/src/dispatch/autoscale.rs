@@ -20,12 +20,17 @@
 //! (large-capable workers may also drain small jobs; a small worker must never
 //! be started when a large job is waiting — it can OOM).
 //!
+//! Live count is **capability-filtered**: only workers that can claim the max
+//! pending rank count toward `desired - live`. A small-only live worker does
+//! not block starting a large worker for large pending work (the classic
+//! size-class livelock).
+//!
 //! ## Invariants
 //!
 //! - Never start below 0; never exceed `max_workers`.
 //! - `ensure_worker` is best-effort + idempotent: failures are logged, exponential
 //!   backoff advances, the job stays queued, the next reconcile retries.
-//! - Live count always comes from the queue registry (`live_worker_count`), not
+//! - Live count always comes from the queue registry (capability-filtered), not
 //!   a local guess — two reconciles with the same state converge without
 //!   double-counting.
 
@@ -59,16 +64,28 @@ pub struct ReconcilePlan {
     pub to_start: usize,
     /// Total pending jobs across all size classes.
     pub total_pending: usize,
-    /// Live workers reported by the registry at plan time.
+    /// Live workers **capable of the max pending rank** at plan time.
+    /// (Small-only workers do not count when a large job is waiting.)
     pub live_workers: usize,
     /// Size-class name for every slot to start (length == `to_start`).
     pub size_classes: Vec<String>,
 }
 
+/// Max size-class rank among pending jobs with depth > 0.
+pub fn max_pending_rank(pending_by_class: &[(i64, usize)]) -> Option<i64> {
+    pending_by_class
+        .iter()
+        .filter(|(_, c)| *c > 0)
+        .map(|(r, _)| *r)
+        .max()
+}
+
 /// Pure depth-based plan.
 ///
 /// `pending_by_class` is `(rank, count)` from [`SqlJobQueue::pending_by_class`].
-/// Ranks outside `size_classes` clamp to the last class via [`class_name`].
+/// `live_workers` must be the count of live workers **capable of covering the
+/// max pending rank** (see [`SqlJobQueue::live_worker_count_capable`]) — not
+/// the raw fleet size. Ranks outside `size_classes` clamp via [`class_name`].
 pub fn plan_reconcile(
     pending_by_class: &[(i64, usize)],
     live_workers: usize,
@@ -81,12 +98,7 @@ pub fn plan_reconcile(
 
     // Size every new worker to the largest pending rank so a large job never
     // lands on a too-small box. Large-capable workers also drain smaller jobs.
-    let max_rank = pending_by_class
-        .iter()
-        .filter(|(_, c)| *c > 0)
-        .map(|(r, _)| *r)
-        .max()
-        .unwrap_or(0);
+    let max_rank = max_pending_rank(pending_by_class).unwrap_or(0);
     let name = if total_pending == 0 || size_classes.is_empty() {
         String::new()
     } else {
@@ -296,13 +308,19 @@ pub struct ReconcileOutcome {
     pub skipped_backoff: bool,
 }
 
-/// One reconcile step: read depth + live count, plan, start workers.
+/// One reconcile step: read depth + capable live count, plan, start workers.
 ///
 /// Failures from `ensure_worker` never panic and never lose work — they log,
 /// advance backoff, and leave jobs queued for the next pass.
 pub async fn reconcile_once(input: ReconcileInputs<'_>) -> Result<ReconcileOutcome> {
     let pending = input.queue.pending_by_class().await?;
-    let live = input.queue.live_worker_count().await?;
+    // Capability-filtered live count: for large pending, only large-capable
+    // (or uncapped) workers count. Raw live_worker_count would livelock when a
+    // small-only worker is already up and a large job waits.
+    let live = match max_pending_rank(&pending) {
+        Some(rank) => input.queue.live_worker_count_capable(rank).await?,
+        None => 0,
+    };
     let plan = plan_reconcile(
         &pending,
         live,
@@ -739,6 +757,67 @@ mod tests {
                 .map(String::as_str),
             Some("large")
         );
+    }
+
+    #[tokio::test]
+    async fn small_live_worker_does_not_block_large_pending() {
+        // Livelock regression: one small-only worker is live, one large job
+        // waits. Raw live_count would give desired=1, live=1, to_start=0 and
+        // the large job never gets a capable worker.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q.db").to_string_lossy().to_string();
+        let q = SqlJobQueue::new(Box::new(SqliteDb::connect(&path).await.unwrap()))
+            .await
+            .unwrap()
+            .with_heartbeat_timeout_secs(60);
+        q.enqueue(job("o/huge", Some((1 << 30) + 1))).await.unwrap();
+
+        // Separate handle with small ceiling — what a small worker heartbeats.
+        let small_worker = SqlJobQueue::new(Box::new(SqliteDb::connect(&path).await.unwrap()))
+            .await
+            .unwrap()
+            .with_max_size_class(Some("small"))
+            .unwrap()
+            .with_heartbeat_timeout_secs(60);
+        let now = {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64
+        };
+        small_worker
+            .heartbeat_at("small-only", None, now)
+            .await
+            .unwrap();
+        assert_eq!(
+            q.live_worker_count_at(now).await.unwrap(),
+            1,
+            "raw live count sees the small worker"
+        );
+        assert_eq!(
+            q.live_worker_count_capable_at(1, now).await.unwrap(),
+            0,
+            "small-only worker is not large-capable"
+        );
+
+        let mock = MockProvider::new();
+        let env = BTreeMap::new();
+        let mut backoff = BackoffState::new();
+        let out = reconcile_once(ReconcileInputs {
+            queue: &q,
+            provider: &mock,
+            max_workers: 5,
+            worker_env: &env,
+            backoff: &mut backoff,
+            now: Instant::now(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(out.plan.live_workers, 0, "plan uses capable live, not raw");
+        assert_eq!(out.plan.to_start, 1);
+        assert_eq!(out.started, 1);
+        assert_eq!(mock.calls()[0].size_class, "large");
     }
 
     #[tokio::test]

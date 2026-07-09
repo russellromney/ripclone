@@ -422,6 +422,23 @@ impl QueueDb for LibsqlDb {
         }
     }
 
+    async fn count_live_workers_capable(&self, cutoff: i64, min_rank: i64) -> Result<i64> {
+        let conn = self.conn().await?;
+        let mut rows = conn
+            .query(
+                "SELECT count(*) FROM workers
+                 WHERE last_heartbeat >= ?
+                   AND (max_size_class IS NULL OR max_size_class >= ?)",
+                libsql::params![cutoff, min_rank],
+            )
+            .await
+            .context("count live workers capable of rank")?;
+        match rows.next().await? {
+            Some(row) => Ok(row.get::<i64>(0)?),
+            None => Ok(0),
+        }
+    }
+
     async fn prune_stale_workers(&self, cutoff: i64) -> Result<u64> {
         self.conn()
             .await?

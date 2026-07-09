@@ -421,6 +421,20 @@ impl QueueDb for SqliteDb {
             .context("count live workers")
     }
 
+    async fn count_live_workers_capable(&self, cutoff: i64, min_rank: i64) -> Result<i64> {
+        // NULL ceiling = claim everything (capable of any rank).
+        sqlx::query_scalar(
+            "SELECT count(*) FROM workers
+             WHERE last_heartbeat >= ?
+               AND (max_size_class IS NULL OR max_size_class >= ?)",
+        )
+        .bind(cutoff)
+        .bind(min_rank)
+        .fetch_one(&self.pool)
+        .await
+        .context("count live workers capable of rank")
+    }
+
     async fn prune_stale_workers(&self, cutoff: i64) -> Result<u64> {
         let res = sqlx::query("DELETE FROM workers WHERE last_heartbeat < ?")
             .bind(cutoff)

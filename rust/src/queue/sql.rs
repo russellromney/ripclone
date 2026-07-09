@@ -247,6 +247,19 @@ pub trait QueueDb: Send + Sync {
         )
     }
 
+    /// Count live workers that can claim jobs of rank `min_rank` (inclusive).
+    ///
+    /// A worker counts when its heartbeat is fresh and either it has no claim
+    /// ceiling (`max_size_class IS NULL`) or `max_size_class >= min_rank`.
+    /// Used by the dispatcher so a small-only live worker does not block
+    /// starting a large-capable worker for a large pending job.
+    async fn count_live_workers_capable(&self, _cutoff: i64, _min_rank: i64) -> Result<i64> {
+        anyhow::bail!(
+            "worker registry requires RIPCLONE_QUEUE=sqlite|libsql \
+             (postgres/mysql lag the workers table)"
+        )
+    }
+
     /// Delete workers with `last_heartbeat < cutoff` (hard age-out). Blessed
     /// backends only.
     async fn prune_stale_workers(&self, _cutoff: i64) -> Result<u64> {
@@ -543,6 +556,32 @@ impl SqlJobQueue {
             e
         })?;
         Ok(self.db.count_live_workers(cutoff).await? as usize)
+    }
+
+    /// Live workers that can claim jobs of at least `min_rank`.
+    ///
+    /// Soft age-out + prune, same as [`live_worker_count`]. A worker counts when
+    /// `max_size_class` is NULL (no ceiling) or `>= min_rank`. The dispatcher
+    /// uses this so a small-only fleet does not look "full" for large pending.
+    pub async fn live_worker_count_capable(&self, min_rank: i64) -> Result<usize> {
+        self.live_worker_count_capable_at(min_rank, now_secs())
+            .await
+    }
+
+    /// [`live_worker_count_capable`] with an explicit clock (tests).
+    pub async fn live_worker_count_capable_at(&self, min_rank: i64, now: i64) -> Result<usize> {
+        if !self.db.supports_worker_registry() {
+            anyhow::bail!(
+                "live_worker_count_capable requires RIPCLONE_QUEUE=sqlite|libsql \
+                 (postgres/mysql lag the workers registry)"
+            );
+        }
+        let cutoff = now - self.heartbeat_timeout_secs;
+        self.db.prune_stale_workers(cutoff).await.map_err(|e| {
+            tracing::error!("prune stale workers: {e:#}");
+            e
+        })?;
+        Ok(self.db.count_live_workers_capable(cutoff, min_rank).await? as usize)
     }
 
     /// Pending (`queued`) job counts by size-class rank.
@@ -2138,6 +2177,55 @@ mod tests {
         // A later fresh heartbeat can re-enter.
         q.heartbeat_at("w1", None, 1_100).await.unwrap();
         assert_eq!(q.live_worker_count_at(1_100).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn live_worker_count_capable_filters_by_max_size_class() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q.db").to_string_lossy().to_string();
+        let uncapped = SqlJobQueue::new(make_db("sqlite", &path).await)
+            .await
+            .unwrap()
+            .with_heartbeat_timeout_secs(60);
+        let small = SqlJobQueue::new(make_db("sqlite", &path).await)
+            .await
+            .unwrap()
+            .with_max_size_class(Some("small"))
+            .unwrap()
+            .with_heartbeat_timeout_secs(60);
+        let large = SqlJobQueue::new(make_db("sqlite", &path).await)
+            .await
+            .unwrap()
+            .with_max_size_class(Some("large"))
+            .unwrap()
+            .with_heartbeat_timeout_secs(60);
+
+        uncapped.heartbeat_at("u", None, 1_000).await.unwrap();
+        small.heartbeat_at("s", None, 1_000).await.unwrap();
+        large.heartbeat_at("l", None, 1_000).await.unwrap();
+
+        assert_eq!(
+            uncapped.live_worker_count_at(1_000).await.unwrap(),
+            3,
+            "raw count is everyone"
+        );
+        // Rank 0 (small): every worker is capable (NULL / 0 / 1 all >= 0).
+        assert_eq!(
+            uncapped
+                .live_worker_count_capable_at(0, 1_000)
+                .await
+                .unwrap(),
+            3
+        );
+        // Rank 1 (large): small-only (max_size_class=0) excluded.
+        assert_eq!(
+            uncapped
+                .live_worker_count_capable_at(1, 1_000)
+                .await
+                .unwrap(),
+            2,
+            "uncapped + large; not small-only"
+        );
     }
 
     #[tokio::test]
