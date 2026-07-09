@@ -1238,6 +1238,82 @@ pub fn disable_auto_gc(mirror_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Initialize an empty bare mirror that can be seeded with packfiles before the
+/// normal `git fetch origin` delta step runs.
+///
+/// This mirrors the durable config shape of `git clone --mirror`: all upstream
+/// refs are fetched directly into the bare repo (`+refs/*:refs/*`), and auto-gc
+/// is disabled before any later fetch mutates the object database.
+pub fn init_bare_mirror_origin<P: AsRef<Path>>(
+    mirror_dir: P,
+    provider: &ProviderInstance,
+    repo_id: &RepoId,
+    credential: Option<&secrecy::SecretString>,
+) -> Result<()> {
+    crate::validation::validate_repo_path(provider, repo_id)
+        .with_context(|| format!("invalid repo path: {}", repo_id.storage_key()))?;
+
+    let (url, _git_args) = upstream_url_and_auth(provider, repo_id, credential);
+    std::fs::create_dir_all(mirror_dir.as_ref().parent().unwrap_or(Path::new("")))?;
+
+    let output = Command::new("git")
+        .args(["init", "--bare"])
+        .arg(mirror_dir.as_ref().as_os_str())
+        .output()
+        .context("git init bare mirror")?;
+    if !output.status.success() {
+        bail!(
+            "init bare mirror failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    disable_auto_gc(mirror_dir.as_ref())?;
+
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(mirror_dir.as_ref().as_os_str())
+        .args(["remote", "add", "origin", &url])
+        .status()
+        .context("git remote add origin")?;
+    if !status.success() {
+        bail!("remote add origin failed");
+    }
+
+    for (key, value) in [
+        ("remote.origin.fetch", "+refs/*:refs/*"),
+        ("remote.origin.mirror", "true"),
+    ] {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(mirror_dir.as_ref().as_os_str())
+            .args(["config", key, value])
+            .status()
+            .with_context(|| format!("git config {key}"))?;
+        if !status.success() {
+            bail!("config {key} failed");
+        }
+    }
+
+    Ok(())
+}
+
+pub fn fsck_connectivity<P: AsRef<Path>>(repo: P) -> Result<()> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo.as_ref().as_os_str())
+        .args(["fsck", "--connectivity-only"])
+        .output()
+        .context("git fsck connectivity")?;
+    if !output.status.success() {
+        bail!(
+            "git fsck connectivity failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(())
+}
+
 /// Build the upstream URL and the credential-injection git config args for a
 /// repo. The secret rides in `http.extraHeader`, never in the URL, so it stays
 /// out of argv, `.git/config`, and logs. The `RIPCLONE_ORIGIN_BASE` override is
@@ -1487,6 +1563,19 @@ impl MirrorLock {
     fn acquire(_mirror_dir: &Path) -> Result<Self> {
         Ok(Self)
     }
+}
+
+/// Run `f` while holding the same cross-process mirror lock used by
+/// [`sync_bare_mirror`]. Callers that mutate or create a mirror outside
+/// `sync_bare_mirror` must use this so multi-process workers cannot race the
+/// initial clone/seed step.
+pub fn with_mirror_lock<P, F, T>(mirror_dir: P, f: F) -> Result<T>
+where
+    P: AsRef<Path>,
+    F: FnOnce() -> Result<T>,
+{
+    let _mirror_lock = MirrorLock::acquire(mirror_dir.as_ref())?;
+    f()
 }
 
 /// Sync a bare mirror of a repo. Creates if missing, fetches if exists.

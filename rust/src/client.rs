@@ -1,6 +1,9 @@
 use crate::bench::Benchmark;
 use crate::cas::{Cas, hash as cas_hash};
-use crate::clonepack::{ChunkRef, ClonepackManifest, MetadataChunk, PackEntry, hash_to_hex};
+use crate::clonepack::{
+    ChunkRef, ClonepackManifest, MetadataChunk, PackEntry, hash_to_hex,
+    install_manifest_pack_bytes, manifest_pack_idx_bytes,
+};
 use crate::extract::{extract_archive_from_chunk_receiver, extract_clonepack_streaming};
 use crate::git;
 use crate::mode::CloneMode;
@@ -2644,57 +2647,32 @@ impl Client {
                     .pack
                     .as_ref()
                     .with_context(|| format!("pack {} missing pack ref", i))?;
-                let idx_ref = entry
-                    .idx
-                    .as_ref()
-                    .with_context(|| format!("pack {} missing idx ref", i))?;
                 let (pack_bytes, idx_bytes) = if let Some(bundle) = idx_bundle.as_ref() {
-                    let off = entry.idx_bundle_offset as usize;
-                    let end = off
-                        .checked_add(idx_ref.len as usize)
-                        .context("idx bundle offset overflow")?;
-                    // Zero-copy view into the shared bundle (refcounted Bytes).
-                    if bundle.get(off..end).is_none() {
-                        anyhow::bail!("idx {} slice out of bundle range", i);
-                    }
-                    let slice = bundle.slice(off..end);
-                    let want = hash_to_hex(&idx_ref.hash);
-                    let got = crate::cas::hash(&slice);
-                    if got != want {
-                        anyhow::bail!(
-                            "idx {i} bundle slice hash mismatch: expected {want}, got {got}"
-                        );
-                    }
                     let pack_bytes = client
                         .fetch_chunk_ref(pack_ref, pack_url.as_deref())
                         .await
                         .with_context(|| format!("fetch pack {}", i))?;
-                    (pack_bytes, slice)
+                    let idx_bytes = manifest_pack_idx_bytes(&entry, i, Some(bundle), None)?;
+                    (pack_bytes, idx_bytes)
                 } else {
-                    tokio::try_join!(
+                    let idx_ref = entry
+                        .idx
+                        .as_ref()
+                        .with_context(|| format!("pack {} missing idx ref", i))?;
+                    let (pack_bytes, idx_bytes) = tokio::try_join!(
                         client.fetch_chunk_ref(pack_ref, pack_url.as_deref()),
                         client.fetch_chunk_ref(idx_ref, idx_url.as_deref()),
                     )
-                    .with_context(|| format!("fetch pack {}", i))?
+                    .with_context(|| format!("fetch pack {}", i))?;
+                    let idx_bytes = manifest_pack_idx_bytes(&entry, i, None, Some(idx_bytes))?;
+                    (pack_bytes, idx_bytes)
                 };
                 Ok::<(bytes::Bytes, bytes::Bytes), anyhow::Error>((pack_bytes, idx_bytes))
             }
         });
 
         let results: Vec<_> = downloads.buffer_unordered(4).try_collect().await?;
-        let mut total = 0u64;
-        for (pack_bytes, idx_bytes) in results {
-            if pack_bytes.len() < 20 {
-                anyhow::bail!("pack too short ({} bytes)", pack_bytes.len());
-            }
-            let name = hex::encode(&pack_bytes[pack_bytes.len() - 20..]);
-            std::fs::write(pack_dir.join(format!("pack-{}.pack", name)), &pack_bytes)
-                .with_context(|| format!("write pack {}", name))?;
-            std::fs::write(pack_dir.join(format!("pack-{}.idx", name)), &idx_bytes)
-                .with_context(|| format!("write idx {}", name))?;
-            total += (pack_bytes.len() + idx_bytes.len()) as u64;
-        }
-        Ok(total)
+        install_manifest_pack_bytes(pack_dir, results)
     }
 
     pub async fn install_git_dir<P: AsRef<Path>>(
