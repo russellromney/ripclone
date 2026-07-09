@@ -108,10 +108,13 @@ mod url_guard_tests {
 
 /// Stable contract every worker needs on any platform.
 ///
-/// A provider does one thing: deliver this bag to a fresh process. Keys include:
+/// A provider does one thing: deliver this bag to a fresh process. See
+/// `ENV_BAG.md` in this directory for the authoritative table.
+///
+/// Keys include:
 /// - queue URL + creds (claim)
 /// - storage creds (upload)
-/// - metadata target (ApiRefStore report URL + per-job token, or direct creds)
+/// - metadata target (ApiRefStore report URL + per-job token — no DB creds)
 /// - upstream-credential source
 /// - ripclone token
 /// - `--max-size-class`
