@@ -590,6 +590,9 @@ async fn start_s3_server_faulting(env: &S3Env, prefix: &str, fail_first: usize) 
         // read go through to the durable store, keeping /status and /ref resolve
         // coherent with the out-of-band writes.
         std::env::set_var("RIPCLONE_REF_CACHE_TTL_SECS", "0");
+        // Fast re-attach when a build outlives the server's ~25s wait window.
+        // Production clients keep the 2s default (this var unset).
+        std::env::set_var("RIPCLONE_TEST_SYNC_POLL_MS", "100");
         if fail_first > 0 {
             std::env::set_var("RIPCLONE_TEST_FAIL_FIRST_FETCHES", fail_first.to_string());
         }
@@ -864,7 +867,11 @@ async fn wait_for_full_build(env: &S3Env, prefix: &str, owner: &str, repo: &str)
     let storage = make_s3_storage(env, prefix).expect("storage");
     let ref_store = make_s3_ref_store(storage);
     let repo_id = RepoId::github(format!("{owner}/{repo}"));
-    for _ in 0..1500 {
+    // 50ms poll (was 200ms): phase-2 settlement is the multi-minute sink on
+    // these tests; tighter polling only shaves seconds but costs almost nothing
+    // against local MinIO and keeps the suite responsive once the build lands.
+    // 300s ceiling unchanged (6000 * 50ms).
+    for _ in 0..6000 {
         if let Ok(branches) = ref_store.list_branches(&repo_id).await {
             for branch in &branches {
                 if branch == "HEAD" {
@@ -879,7 +886,7 @@ async fn wait_for_full_build(env: &S3Env, prefix: &str, owner: &str, repo: &str)
                 }
             }
         }
-        sleep(Duration::from_millis(200)).await;
+        sleep(Duration::from_millis(50)).await;
     }
     panic!("full build never settled for {owner}/{repo}");
 }

@@ -241,6 +241,18 @@ fn fetch_retry_config() -> (u32, u64) {
     (attempts, backoff_ms)
 }
 
+/// Sleep between 202/503 sync polls. Production default is 2s. E2e suites may
+/// set `RIPCLONE_TEST_SYNC_POLL_MS` (e.g. 100) so a build that outlives the
+/// server's wait window is re-attached quickly without changing prod traffic.
+fn test_sync_poll_interval() -> std::time::Duration {
+    let ms = std::env::var("RIPCLONE_TEST_SYNC_POLL_MS")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(2_000u64)
+        .max(1);
+    std::time::Duration::from_millis(ms)
+}
+
 /// Exponential backoff with jitter for retry `attempt` (1-based), capped at 5 s.
 /// Jitter (in `[capped/2, capped]`) decorrelates the retries of concurrent
 /// fetches so they don't hammer a recovering server in lockstep.
@@ -1076,6 +1088,7 @@ impl Client {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(40usize);
+        let poll = test_sync_poll_interval();
         for attempt in 0..max_attempts {
             let resp = self.send(self.request(reqwest::Method::POST, &url)).await?;
             let status = resp.status();
@@ -1086,7 +1099,7 @@ impl Client {
                 || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
             {
                 if attempt + 1 < max_attempts {
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    tokio::time::sleep(poll).await;
                     continue;
                 }
                 anyhow::bail!("add still building after {max_attempts} attempts");
@@ -1143,13 +1156,15 @@ impl Client {
         // running) or 503 (queue full). Each POST blocks server-side until its
         // wait window elapses, so we just retry — coalescing means a retry
         // re-attaches to the same in-flight build rather than starting a new one.
-        // Test hook: bound the poll so a negative-case test can fail fast instead
-        // of waiting out the full ceiling. Never set in production.
+        // Test hooks (never set in production):
+        //   RIPCLONE_TEST_SYNC_MAX_ATTEMPTS — bound the poll for negative-case tests
+        //   RIPCLONE_TEST_SYNC_POLL_MS — shorter sleep between 202s (e2e speed)
         let max_attempts = std::env::var("RIPCLONE_TEST_SYNC_MAX_ATTEMPTS")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .filter(|&n| n > 0)
             .unwrap_or(40);
+        let poll = test_sync_poll_interval();
         for attempt in 0..max_attempts {
             let resp = self.send(self.request(reqwest::Method::POST, &url)).await?;
             let status = resp.status();
@@ -1160,7 +1175,7 @@ impl Client {
                 || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
             {
                 if attempt + 1 < max_attempts {
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    tokio::time::sleep(poll).await;
                     continue;
                 }
                 anyhow::bail!("sync still building after {max_attempts} attempts");
