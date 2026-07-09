@@ -83,7 +83,12 @@ databases() {
 # fixture repo (e.g. is rejected with repo_not_added). Fast tier: debug binaries,
 # file:// origin, unshaped, one run. Needs the debug ripclone + ripclone-server.
 benchmark() {
-  ( cd "$ROOT/rust" && cargo build --locked --bin ripclone --bin ripclone-server )
+  # ci profile (not default debug): shares the unit-test graph. Debug was a
+  # third full compile for a harness smoke that only needs "binaries run".
+  local profile="${CARGO_PROFILE:-ci}"
+  ( cd "$ROOT/rust" && cargo build --profile "$profile" --locked --bin ripclone --bin ripclone-server )
+  export SERVER_BIN="${SERVER_BIN:-$ROOT/rust/target/$profile/ripclone-server}"
+  export CLI_BIN="${CLI_BIN:-$ROOT/rust/target/$profile/ripclone}"
   bash "$ROOT/scripts/benchmark_smoke.sh"
 }
 

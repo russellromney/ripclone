@@ -407,17 +407,20 @@ jobs:
           cache-workspaces: rust
       - name: Install build deps
         run: bash scripts/install-build-deps.sh
-      - name: Build release binaries (cached toolchain)
+      # ci profile (not --release): this job only smoke-tests image assembly +
+      # --help. Sharing the unit-test graph avoids a third full compile (~5 min
+      # of pure release when every other job is already on ci).
+      - name: Build binaries (ci profile, cached toolchain)
         working-directory: rust
-        run: cargo build --release --locked --bins
+        run: cargo build --profile ci --locked --bins
       - name: Stage binaries (rust/target is .dockerignored)
         run: |
           mkdir -p ci-bins
-          cp rust/target/release/ripclone \
-             rust/target/release/ripclone-server \
-             rust/target/release/ripclone-worker \
-             rust/target/release/git-remote-ripclone \
-             rust/target/release/writer_bench \
+          cp rust/target/ci/ripclone \
+             rust/target/ci/ripclone-server \
+             rust/target/ci/ripclone-worker \
+             rust/target/ci/git-remote-ripclone \
+             rust/target/ci/writer_bench \
              ci-bins/
       - name: Assemble runtime images from the compiled binaries
         run: |
