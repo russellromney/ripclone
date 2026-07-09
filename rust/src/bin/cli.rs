@@ -1100,7 +1100,9 @@ async fn main() -> Result<()> {
         },
         Commands::Add { repo } => {
             let (provider, repo_path) = resolve_repo(&repo, &default_provider, &provider_registry)?;
-            let upstream_token = resolve_upstream_token(&provider, args.token.as_deref()).await?;
+            let upstream_token =
+                resolve_upstream_token(&provider, args.token.as_deref(), &provider_registry)
+                    .await?;
             let client = client
                 .with_provider(&provider)
                 .with_upstream_token_opt(upstream_token);
@@ -1109,7 +1111,9 @@ async fn main() -> Result<()> {
         }
         Commands::Sync { repo, depth, at } => {
             let (provider, repo_path) = resolve_repo(&repo, &default_provider, &provider_registry)?;
-            let upstream_token = resolve_upstream_token(&provider, args.token.as_deref()).await?;
+            let upstream_token =
+                resolve_upstream_token(&provider, args.token.as_deref(), &provider_registry)
+                    .await?;
             let client = client
                 .with_provider(&provider)
                 .with_upstream_token_opt(upstream_token);
@@ -1133,7 +1137,9 @@ async fn main() -> Result<()> {
             verify_upstream,
         } => {
             let (provider, repo_path) = resolve_repo(&repo, &default_provider, &provider_registry)?;
-            let upstream_token = resolve_upstream_token(&provider, args.token.as_deref()).await?;
+            let upstream_token =
+                resolve_upstream_token(&provider, args.token.as_deref(), &provider_registry)
+                    .await?;
             let mut client = client
                 .with_provider(&provider)
                 .with_upstream_token_opt(upstream_token.clone());
@@ -1573,13 +1579,12 @@ async fn main() -> Result<()> {
 async fn resolve_upstream_token(
     provider_id: &str,
     override_token: Option<&str>,
+    registry: &ProviderRegistry,
 ) -> Result<Option<String>> {
     if let Some(token) = override_token {
         return Ok(Some(token.to_string()));
     }
 
-    let registry = ripclone::provider_config::load_registry()
-        .context("load provider registry for upstream auth")?;
     Ok(registry
         .token(provider_id)
         .map(|token| token.expose_secret().to_string()))
@@ -2028,26 +2033,15 @@ mod tests {
 
     #[test]
     fn resolve_upstream_token_prefers_explicit_override() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let old_config = std::env::var_os("RIPCLONE_CONFIG");
-        let config_path = dir.path().join("config.toml");
-        std::fs::write(
-            &config_path,
-            r#"[providers.github]
-kind = "github"
-token = "from-config"
-"#,
-        )
-        .unwrap();
-        unsafe { std::env::set_var("RIPCLONE_CONFIG", &config_path) };
-
+        let registry = ripclone::provider::ProviderRegistry::new();
         let rt = tokio::runtime::Runtime::new().unwrap();
         let token = rt
-            .block_on(resolve_upstream_token("github", Some("from-explicit")))
+            .block_on(resolve_upstream_token(
+                "github",
+                Some("from-explicit"),
+                &registry,
+            ))
             .unwrap();
-
-        unsafe { restore_env("RIPCLONE_CONFIG", old_config) };
         assert_eq!(token, Some("from-explicit".to_string()));
     }
 
@@ -2067,8 +2061,12 @@ token = "from-config"
         .unwrap();
         unsafe { std::env::set_var("RIPCLONE_CONFIG", &config_path) };
 
+        let config = ripclone::config::load();
+        let registry = ripclone::provider_config::load_registry_with_config(&config).unwrap();
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let token = rt.block_on(resolve_upstream_token("github", None)).unwrap();
+        let token = rt
+            .block_on(resolve_upstream_token("github", None, &registry))
+            .unwrap();
 
         unsafe { restore_env("RIPCLONE_CONFIG", old_config) };
         assert_eq!(token, Some("from-config".to_string()));
