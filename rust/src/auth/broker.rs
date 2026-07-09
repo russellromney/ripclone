@@ -413,6 +413,7 @@ pub fn broker_from_env(registry: ProviderRegistry) -> Result<Arc<dyn CredentialB
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::ProviderInstanceId;
     use secrecy::ExposeSecret;
 
     #[test]
@@ -502,7 +503,6 @@ RwIDAQAB
 
     #[test]
     fn github_app_broker_ignores_non_github_providers() {
-        use crate::provider::ProviderInstanceId;
         let broker = test_broker();
         let repo = RepoId {
             provider: ProviderInstanceId::new("gitlab"),
@@ -612,6 +612,84 @@ RwIDAQAB
         assert!(parse_rfc3339("2024-01-01T00:00:00Z").is_some());
         assert!(parse_rfc3339("2024-01-01T00:00:00+00:00").is_some());
         assert!(parse_rfc3339("not a timestamp").is_none());
+    }
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct RecordingBroker {
+        calls: AtomicUsize,
+        token: SecretString,
+    }
+
+    impl RecordingBroker {
+        fn new(token: &str) -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                token: SecretString::from(token),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl CredentialBroker for RecordingBroker {
+        fn fetch_credential(
+            &self,
+            _repo_id: &RepoId,
+            _request_token: Option<&SecretString>,
+        ) -> Result<Option<SecretString>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(self.token.clone()))
+        }
+    }
+
+    #[test]
+    fn provider_aware_dispatches_to_registered_broker() {
+        let registry = ProviderRegistry::new();
+        let custom = Arc::new(RecordingBroker::new("custom-token"));
+        let broker = ProviderAwareBroker::new(registry).register("my-gitea", custom.clone());
+
+        let repo = RepoId {
+            provider: ProviderInstanceId::new("my-gitea"),
+            path: "org/repo".to_string(),
+        };
+        let token = broker
+            .fetch_credential(&repo, None)
+            .unwrap()
+            .expect("token from registered broker");
+        assert_eq!(token.expose_secret(), "custom-token");
+        assert_eq!(custom.call_count(), 1);
+    }
+
+    #[test]
+    fn provider_aware_falls_back_to_static_broker() {
+        let registry = ProviderRegistry::new();
+        let custom = Arc::new(RecordingBroker::new("custom-token"));
+        let broker = ProviderAwareBroker::new(registry).register("my-gitea", custom.clone());
+
+        // A provider with no registered dynamic broker → StaticBroker → None.
+        let repo = RepoId {
+            provider: ProviderInstanceId::new("gitlab"),
+            path: "group/proj".to_string(),
+        };
+        assert!(broker.fetch_credential(&repo, None).unwrap().is_none());
+        assert_eq!(custom.call_count(), 0);
+    }
+
+    #[test]
+    fn provider_aware_uses_github_app_for_github_instance() {
+        let registry = ProviderRegistry::new();
+        let gh_broker = Arc::new(RecordingBroker::new("gh-app-token"));
+        let broker = ProviderAwareBroker::new(registry).register("github", gh_broker.clone());
+
+        let token = broker
+            .fetch_credential(&RepoId::github("o/r"), None)
+            .unwrap()
+            .expect("github app token");
+        assert_eq!(token.expose_secret(), "gh-app-token");
+        assert_eq!(gh_broker.call_count(), 1);
     }
 
     /// All `from_env` scenarios in one test: these `RIPCLONE_GITHUB_APP_*` vars
