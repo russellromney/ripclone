@@ -21,7 +21,7 @@
 //! - **mock** — records calls (tests).
 //! - **none** / unset — dispatch disabled (enqueue only).
 //!
-//! Nothing outside this module knows the platform. See `docs/internal/DISPATCHER.md`.
+//! Nothing outside this module knows the platform.
 
 pub mod exec;
 pub mod fly;
@@ -108,8 +108,7 @@ mod url_guard_tests {
 
 /// Stable contract every worker needs on any platform.
 ///
-/// A provider does one thing: deliver this bag to a fresh process. Keys include
-/// (see `docs/internal/DISPATCHER.md`):
+/// A provider does one thing: deliver this bag to a fresh process. Keys include:
 /// - queue URL + creds (claim)
 /// - storage creds (upload)
 /// - metadata target (ApiRefStore report URL + per-job token, or direct creds)

@@ -46,7 +46,7 @@ Every command in the README and `docs/` was run verbatim against a real server. 
     `RIPCLONE_DISPATCH_URL`.
   - **mock** — records calls for tests.
 - Callers outside the module never know the platform. Cloud webhook/cron wiring
-  and the reconcile loop remain separate (see `docs/internal/DISPATCHER.md`).
+  and the reconcile loop remain separate.
 
 ## Distribution
 
