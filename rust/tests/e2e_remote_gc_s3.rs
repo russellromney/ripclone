@@ -1350,7 +1350,14 @@ async fn expired_bearer_and_signed_url_mid_cli_clone_fail_cleanly() {
     write_cli_session_token(home.path(), &server.url, &token);
     let out = tempfile::tempdir().expect("clone out");
     let target = out.path().join("clone");
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_ripclone"))
+    // Prefer the runtime env (set by cargo test, or by CI when running a
+    // prebuilt binary against a separately-downloaded CLI) over the compile-time
+    // path baked into env!("CARGO_BIN_EXE_ripclone"), which points at the build
+    // machine and breaks after artifact download.
+    let ripclone_bin = std::env::var_os("CARGO_BIN_EXE_ripclone")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(env!("CARGO_BIN_EXE_ripclone")));
+    let mut child = std::process::Command::new(&ripclone_bin)
         .arg("--server")
         .arg(&server.url)
         .arg("clone")
@@ -1482,31 +1489,6 @@ async fn status_reports_bytes_from_s3() {
     guard.disable();
 }
 
-async fn load_head_ref(env: &S3Env, prefix: &str, owner: &str, repo: &str) -> ripclone::RefInfo {
-    let storage = make_s3_storage(env, prefix).expect("storage");
-    let ref_store = make_s3_ref_store(storage);
-    ref_store
-        .load_branch(&RepoId::github(format!("{owner}/{repo}")), "HEAD")
-        .await
-        .expect("load ref")
-        .expect("ref exists")
-}
-
-async fn save_head_ref(
-    env: &S3Env,
-    prefix: &str,
-    owner: &str,
-    repo: &str,
-    info: &ripclone::RefInfo,
-) {
-    let storage = make_s3_storage(env, prefix).expect("storage");
-    let ref_store = make_s3_ref_store(storage);
-    ref_store
-        .save_branch(&RepoId::github(format!("{owner}/{repo}")), "HEAD", info)
-        .await
-        .expect("save ref");
-}
-
 /// Age *every* ref of a repo — the literal `HEAD` alias and the concrete default
 /// branch — so the whole repo is uniformly idle. Warm-TTL eviction is
 /// repo-scoped: a repo is only evicted when all of its refs are idle past the
@@ -1514,7 +1496,21 @@ async fn save_head_ref(
 /// (written by the detached phase-2 build, and holding the full-history
 /// artifacts) up to build timing. Enumerate the refs and age them all, reading
 /// through the cache (invalidate first) so the durable ref is what we mutate.
+///
+/// When `pin` is true, also set `warm_pinned` on every ref. The pin is
+/// repo-scoped for GC, but `/status` only surfaces refs that carry clonepack
+/// manifests — a pin written only on a thin `HEAD` alias (no manifests) is
+/// invisible in the status response even though GC honors it. Pinning every
+/// ref makes the status assertion deterministic.
 async fn age_all_refs(env: &S3Env, prefix: &str, owner: &str, repo: &str) {
+    mutate_all_refs(env, prefix, owner, repo, false).await;
+}
+
+async fn age_and_pin_all_refs(env: &S3Env, prefix: &str, owner: &str, repo: &str) {
+    mutate_all_refs(env, prefix, owner, repo, true).await;
+}
+
+async fn mutate_all_refs(env: &S3Env, prefix: &str, owner: &str, repo: &str, pin: bool) {
     let storage = make_s3_storage(env, prefix).expect("storage");
     let ref_store = make_s3_ref_store(storage);
     let repo_id = RepoId::github(format!("{owner}/{repo}"));
@@ -1526,23 +1522,26 @@ async fn age_all_refs(env: &S3Env, prefix: &str, owner: &str, repo: &str) {
     let branches = ref_store
         .list_branches(&repo_id)
         .await
-        .expect("list branches to age");
-    assert!(!branches.is_empty(), "repo has at least one ref to age");
+        .expect("list branches to mutate");
+    assert!(!branches.is_empty(), "repo has at least one ref to mutate");
     for branch in branches {
         ref_store.invalidate(&repo_id, &branch).await;
         let Some(mut info) = ref_store
             .load_branch(&repo_id, &branch)
             .await
-            .expect("load ref to age")
+            .expect("load ref to mutate")
         else {
             continue;
         };
         info.last_accessed_at = Some(aged);
         info.synced_at = Some(aged);
+        if pin {
+            info.warm_pinned = true;
+        }
         ref_store
             .save_branch(&repo_id, &branch, &info)
             .await
-            .expect("save aged ref");
+            .expect("save mutated ref");
     }
 }
 
@@ -1652,29 +1651,24 @@ async fn warm_ttl_keeps_pinned_ref() {
         .await
         .expect("sync");
 
-    // Let phase 2 finish before pinning, so the concrete default-branch ref that
-    // actually holds the full-history artifacts is stable (and not still being
+    // Let phase 2 finish before aging/pinning, so the concrete default-branch
+    // ref that holds the full-history artifacts is stable (and not still being
     // rewritten by the detached build) when GC runs.
+    //
+    // Age *and pin* every ref. Pinning only HEAD used to flake: `/status` skips
+    // refs with empty clonepack manifests (a thin HEAD alias often has none), so
+    // the status response could list only the concrete default branch — which
+    // was never pinned — and `a ref reports the pin` failed even though GC
+    // correctly honored the repo-scoped pin on HEAD.
     wait_for_full_build(&env, &prefix, "acme", &repo).await;
-
-    let mut info = load_head_ref(&env, &prefix, "acme", &repo).await;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    info.last_accessed_at = Some(now.saturating_sub(86400));
-    info.synced_at = Some(now.saturating_sub(86400));
-    info.warm_pinned = true;
-    save_head_ref(&env, &prefix, "acme", &repo, &info).await;
+    age_and_pin_all_refs(&env, &prefix, "acme", &repo).await;
 
     // grace_period=0: any genuinely-orphaned object is deleted this pass. The pin
-    // is set only on the HEAD alias, but a repo keeps a second ref (the concrete
-    // default branch) for the same commit that holds the full-history artifacts.
-    // The pin must protect the whole repo, so *no* ref may be evicted. A two-phase
-    // build also leaves one unreferenced byproduct (the editable clonepack
-    // manifest, superseded by the files manifest); reclaiming that is correct GC
-    // and unrelated to the pin, so we assert the repo's refs survive rather than a
-    // literal zero-delete count.
+    // is repo-scoped, so *no* ref may be evicted. A two-phase build also leaves
+    // one unreferenced byproduct (the editable clonepack manifest, superseded by
+    // the files manifest); reclaiming that is correct GC and unrelated to the
+    // pin, so we assert the repo's refs survive rather than a literal zero-delete
+    // count.
     run_gc(&env, &prefix, Duration::from_secs(1), false).await;
 
     let status = get_status(&server, "acme", &repo, None).await;
