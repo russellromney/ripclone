@@ -1247,6 +1247,7 @@ async fn main() -> Result<()> {
                 upstream_token.as_deref(),
                 &outcome.commit,
                 verify_upstream,
+                &provider_registry,
             )
             .await?;
             if enable_bench {
@@ -1629,6 +1630,7 @@ async fn maybe_verify_upstream(
     upstream_token: Option<&str>,
     installed_commit: &str,
     requested: VerifyUpstream,
+    registry: &ProviderRegistry,
 ) -> Result<()> {
     if requested == VerifyUpstream::Never {
         return Ok(());
@@ -1660,9 +1662,7 @@ async fn maybe_verify_upstream(
         return Ok(());
     }
 
-    let registry = ripclone::provider_config::load_registry()
-        .context("load provider registry for upstream verification")?;
-    let provider = match provider_instance(provider_id, &registry) {
+    let provider = match provider_instance(provider_id, registry) {
         Some(p) => p,
         None => {
             if requested == VerifyUpstream::Always {
