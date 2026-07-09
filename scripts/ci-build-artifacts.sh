@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 # Compile once (ci profile) everything the PR gate fans out to separate jobs:
-# product bins (docker/e2e/benchmark) plus the integration test binaries those
-# jobs run. Stages stable names under rust/target/ci-artifacts/ for upload.
+# product bins (docker/e2e/benchmark) plus the integration/lib test binaries
+# those jobs run. Stages stable names under rust/target/ci-artifacts/ for upload.
 #
-# Intentionally NOT building the full unit/integration suite here — that is
-# ~50 separate linked test binaries and made ci-build ~30m cold. The `test` job
-# compiles that suite itself (with sccache / rust-cache).
+# Not the full unit/integration suite (~50 linked binaries) — that is the
+# `test` job's job. Keep this list to what fan-out actually executes.
 #
 # Usage: scripts/ci-build-artifacts.sh
 set -euo pipefail
@@ -29,10 +28,19 @@ pick_test_exe() {
     | tail -n1
 }
 
-# Product bins fan-out needs (not writer_bench — internal microbench only).
-BINS=(ripclone ripclone-server ripclone-worker git-remote-ripclone)
+pick_lib_test_exe() {
+  jq -r \
+    'select(.reason == "compiler-artifact"
+            and .profile.test == true
+            and .executable != null
+            and (.executable | length) > 0
+            and (.target.kind | index("lib"))) | .executable' \
+    | tail -n1
+}
 
-# Integration tests that other CI jobs run as prebuilt binaries.
+# writer_bench: Dockerfile.client.ci COPY only (not product runtime).
+BINS=(ripclone ripclone-server ripclone-worker git-remote-ripclone writer_bench)
+
 TESTS=(
   e2e_gitea_provider
   e2e_worker_postgres
@@ -43,38 +51,27 @@ TESTS=(
   e2e_remote_gc_s3
 )
 
-echo "==> building bins + fan-out tests (profile=$PROFILE, one cargo inv)"
-test_args=()
-for t in "${TESTS[@]}"; do
-  test_args+=(--test "$t")
-done
-
-# One invocation: builds the named integration tests and, as a dependency for
-# CARGO_BIN_EXE_*, the product bins. message-format=json to locate executables.
-# shellcheck disable=SC2068
-json="$(cargo test --profile "$PROFILE" --locked --no-run --message-format=json \
-  ${test_args[@]})"
-
+echo "==> building bins (profile=$PROFILE)"
+cargo build --profile "$PROFILE" --locked --bins
 for b in "${BINS[@]}"; do
   src="$TARGET_ROOT/$PROFILE/$b"
   if [ ! -x "$src" ]; then
-    src="$(printf '%s\n' "$json" | jq -r --arg name "$b" '
-      select(.reason == "compiler-artifact"
-             and .executable != null
-             and (.executable | length) > 0
-             and .profile.test != true
-             and .target.name == $name
-             and (.target.kind | index("bin")))
-      | .executable' | tail -n1)"
-  fi
-  if [ -z "$src" ] || [ ! -x "$src" ]; then
-    echo "error: missing bin $b" >&2
+    echo "error: missing bin $src" >&2
     exit 1
   fi
   cp -f "$src" "$STAGE_DIR/$b"
   chmod +x "$STAGE_DIR/$b"
   echo "    staged bin $b"
 done
+
+echo "==> building fan-out integration + lib test binaries (no-run)"
+test_args=()
+for t in "${TESTS[@]}"; do
+  test_args+=(--test "$t")
+done
+# shellcheck disable=SC2068
+json="$(cargo test --profile "$PROFILE" --locked --no-run --message-format=json \
+  ${test_args[@]} --lib)"
 
 for t in "${TESTS[@]}"; do
   exe="$(printf '%s\n' "$json" | pick_test_exe "$t")"
@@ -86,6 +83,15 @@ for t in "${TESTS[@]}"; do
   chmod +x "$STAGE_DIR/$t"
   echo "    staged test $t"
 done
+
+lib_exe="$(printf '%s\n' "$json" | pick_lib_test_exe)"
+if [ -z "$lib_exe" ] || [ ! -x "$lib_exe" ]; then
+  echo "error: missing lib test binary (exe=${lib_exe:-empty})" >&2
+  exit 1
+fi
+cp -f "$lib_exe" "$STAGE_DIR/ripclone-lib-tests"
+chmod +x "$STAGE_DIR/ripclone-lib-tests"
+echo "    staged test ripclone-lib-tests"
 
 echo "==> ci-build-artifacts ready in $STAGE_DIR"
 ls -la "$STAGE_DIR"
