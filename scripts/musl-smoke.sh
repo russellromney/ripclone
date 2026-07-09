@@ -27,11 +27,11 @@ cd "$repo_root/rust"
 
 BINS=(ripclone ripclone-server ripclone-worker git-remote-ripclone)
 
-echo "==> building ${BINS[*]} for $TARGET (profile: $PROFILE)"
-cargo zigbuild --profile "$PROFILE" --locked --target "$TARGET" \
-  "${BINS[@]/#/--bin=}"
-
-echo "==> building the library test binary for $TARGET"
+# One zigbuild of the lib *test* binary first — it pulls the whole graph with
+# cfg(test) and is what we need for the musl-only unit tests. Then build the
+# four release bins against the same target/profile so object reuse is maximal
+# (two cargo invocations still share target/$TARGET/$PROFILE).
+echo "==> building the library test binary for $TARGET (profile: $PROFILE)"
 test_bin="$(cargo-zigbuild test --no-run --profile "$PROFILE" --locked \
   --target "$TARGET" --lib --message-format=json |
   python3 -c '
@@ -45,6 +45,11 @@ for line in sys.stdin:
         print(msg["executable"])
 ' | tail -n1)"
 [ -n "$test_bin" ] || { echo "could not locate the musl test binary" >&2; exit 1; }
+
+echo "==> building ${BINS[*]} for $TARGET (profile: $PROFILE)"
+cargo zigbuild --profile "$PROFILE" --locked --target "$TARGET" \
+  "${BINS[@]/#/--bin=}"
+
 
 bindir="$repo_root/rust/target/$TARGET/$PROFILE"
 

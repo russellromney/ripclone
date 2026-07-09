@@ -41,7 +41,26 @@ impl S3Storage {
         // timeout + retry policy almost never trips, while still failing fast on a
         // genuinely stuck request. Steady-state re-syncs only upload the delta, so
         // this barely ever matters.
-        let request_timeout = Duration::from_secs(30);
+        //
+        // Override with RIPCLONE_S3_REQUEST_TIMEOUT_SECS (e.g. tighter on
+        // localhost MinIO in tests). Must stay >0.
+        let request_timeout = env_duration_secs("RIPCLONE_S3_REQUEST_TIMEOUT_SECS", 30);
+
+        // Retry budget. Transient 5xx / throttling / brief blips still retry;
+        // a dead endpoint must not pin a worker for minutes. Defaults:
+        //   5 attempts, 200ms base, 2s cap  →  worst-case sleep budget ≈ 3.8s
+        // plus per-attempt request_timeout. Override with:
+        //   RIPCLONE_S3_MAX_ATTEMPTS, RIPCLONE_S3_MAX_RETRY_DELAY_MS
+        //
+        // Connect-phase fast-fail: the underlying s3/reqx transport applies a
+        // 5s connect timeout by default (reqx::DEFAULT_CONNECT_TIMEOUT). That
+        // is independent of the per-request timeout above — a stalled TCP
+        // handshake fails in ~5s, not after the full request timeout. The s3
+        // crate (0.1.36) does not yet expose a connect_timeout builder knob;
+        // if that lands upstream we should set it explicitly here.
+        let max_attempts = env_u32("RIPCLONE_S3_MAX_ATTEMPTS", 5).max(1);
+        let max_retry_delay = env_duration_ms("RIPCLONE_S3_MAX_RETRY_DELAY_MS", 2_000);
+
         let client = Client::builder(endpoint)
             .context("build S3 client")?
             .region(region)
@@ -49,9 +68,9 @@ impl S3Storage {
             .addressing_style(s3::AddressingStyle::Path)
             .tls_root_store(s3::AsyncTlsRootStore::System)
             .timeout(request_timeout)
-            .max_attempts(5)
+            .max_attempts(max_attempts)
             .base_retry_delay(Duration::from_millis(200))
-            .max_retry_delay(Duration::from_secs(5))
+            .max_retry_delay(max_retry_delay)
             .build()
             .context("create S3 client")?;
         let cache = cache_dir.map(Cas::new).transpose()?;
@@ -568,6 +587,31 @@ fn parse_s3_time(s: &str) -> Option<SystemTime> {
         .map(|dt| dt.with_timezone(&chrono::Utc).into())
 }
 
+fn env_u32(key: &str, default: u32) -> u32 {
+    std::env::var(key)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+}
+
+fn env_duration_secs(key: &str, default_secs: u64) -> Duration {
+    let secs = std::env::var(key)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default_secs)
+        .max(1);
+    Duration::from_secs(secs)
+}
+
+fn env_duration_ms(key: &str, default_ms: u64) -> Duration {
+    let ms = std::env::var(key)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default_ms)
+        .max(1);
+    Duration::from_millis(ms)
+}
+
 fn scoped_key(prefix: &str, key: &str) -> String {
     format!("{prefix}{key}")
 }
@@ -700,7 +744,8 @@ impl S3Storage {
 
 #[cfg(test)]
 mod tests {
-    use super::{scoped_key, unscoped_key};
+    use super::{env_duration_ms, env_duration_secs, env_u32, scoped_key, unscoped_key};
+    use std::time::Duration;
 
     #[test]
     fn arbitrary_object_keys_are_scoped_and_listed_as_logical_keys() {
@@ -728,5 +773,42 @@ mod tests {
             unscoped_key("", "refs/acme/widget.json"),
             Some("refs/acme/widget.json")
         );
+    }
+
+    #[test]
+    fn timeout_env_helpers_default_and_clamp_zero() {
+        // Defaults when unset.
+        assert_eq!(env_u32("RIPCLONE_S3_TEST_UNSET_U32", 5), 5);
+        assert_eq!(
+            env_duration_secs("RIPCLONE_S3_TEST_UNSET_SECS", 30),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            env_duration_ms("RIPCLONE_S3_TEST_UNSET_MS", 2_000),
+            Duration::from_millis(2_000)
+        );
+
+        // Zero / invalid values clamp to 1 so the s3 client never sees a
+        // zero timeout (it rejects that as invalid config).
+        // SAFETY: single-threaded test; we restore after.
+        unsafe {
+            std::env::set_var("RIPCLONE_S3_TEST_ZERO_SECS", "0");
+            std::env::set_var("RIPCLONE_S3_TEST_ZERO_MS", "0");
+            std::env::set_var("RIPCLONE_S3_TEST_BAD_U32", "not-a-number");
+        }
+        assert_eq!(
+            env_duration_secs("RIPCLONE_S3_TEST_ZERO_SECS", 30),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            env_duration_ms("RIPCLONE_S3_TEST_ZERO_MS", 2_000),
+            Duration::from_millis(1)
+        );
+        assert_eq!(env_u32("RIPCLONE_S3_TEST_BAD_U32", 5), 5);
+        unsafe {
+            std::env::remove_var("RIPCLONE_S3_TEST_ZERO_SECS");
+            std::env::remove_var("RIPCLONE_S3_TEST_ZERO_MS");
+            std::env::remove_var("RIPCLONE_S3_TEST_BAD_U32");
+        }
     }
 }

@@ -590,6 +590,9 @@ async fn start_s3_server_faulting(env: &S3Env, prefix: &str, fail_first: usize) 
         // read go through to the durable store, keeping /status and /ref resolve
         // coherent with the out-of-band writes.
         std::env::set_var("RIPCLONE_REF_CACHE_TTL_SECS", "0");
+        // Fast re-attach when a build outlives the server's ~25s wait window.
+        // Production clients keep the 2s default (this var unset).
+        std::env::set_var("RIPCLONE_TEST_SYNC_POLL_MS", "100");
         if fail_first > 0 {
             std::env::set_var("RIPCLONE_TEST_FAIL_FIRST_FETCHES", fail_first.to_string());
         }
@@ -644,13 +647,45 @@ fn make_s3_ref_store(storage: Arc<S3Storage>) -> Arc<dyn RefStore> {
     Arc::new(CachingRefStore::new(S3RefStore::new(storage)))
 }
 
-async fn cleanup_prefix(env: &S3Env, prefix: &str) -> Result<()> {
-    let client = s3::Client::builder(&env.endpoint)
+/// Cleanup client with the same timeout/retry posture as production S3Storage.
+/// The s3 crate default (~10s, few retries) flakes on MinIO `delete_objects`
+/// batches under CI load — not a credentials failure (would be 403, not timeout).
+fn cleanup_s3_client(env: &S3Env) -> Result<s3::Client> {
+    s3::Client::builder(&env.endpoint)
         .context("create S3 cleanup builder")?
         .region(&env.region)
         .auth(s3::Auth::from_env().context("S3 auth for cleanup")?)
+        .timeout(Duration::from_secs(30))
+        .max_attempts(5)
+        .base_retry_delay(Duration::from_millis(200))
+        .max_retry_delay(Duration::from_secs(2))
         .build()
-        .context("build cleanup S3 client")?;
+        .context("build cleanup S3 client")
+}
+
+async fn delete_key_batches(env: &S3Env, client: &s3::Client, keys: Vec<String>) -> Result<()> {
+    // Smaller batches: a single DeleteObjects of 1000 under a slow MinIO can
+    // exceed a tight transport timeout and fail the whole cleanup.
+    for chunk in keys.chunks(100) {
+        let chunk: Vec<String> = chunk.to_vec();
+        if chunk.is_empty() {
+            continue;
+        }
+        client
+            .objects()
+            .delete_objects(&env.bucket)
+            .objects(&chunk)
+            .context("build cleanup delete batch")?
+            .quiet(true)
+            .send()
+            .await
+            .context("S3 cleanup delete_objects")?;
+    }
+    Ok(())
+}
+
+async fn cleanup_prefix(env: &S3Env, prefix: &str) -> Result<()> {
+    let client = cleanup_s3_client(env)?;
 
     let mut keys = Vec::new();
     let mut continuation = None::<String>;
@@ -678,33 +713,19 @@ async fn cleanup_prefix(env: &S3Env, prefix: &str) -> Result<()> {
         }
     }
 
-    for chunk in keys.chunks(1000) {
-        let chunk: Vec<String> = chunk.to_vec();
-        client
-            .objects()
-            .delete_objects(&env.bucket)
-            .objects(&chunk)
-            .context("build cleanup delete batch")?
-            .quiet(true)
-            .send()
-            .await
-            .context("S3 cleanup delete_objects")?;
-    }
-    Ok(())
+    delete_key_batches(env, &client, keys).await
 }
 
 async fn cleanup_repo_refs(env: &S3Env, owner: &str, repo: &str) -> Result<()> {
     let repo_id = ripclone::provider::RepoId::github(format!("{owner}/{repo}"));
     let storage_key = repo_id.storage_key();
-    let client = s3::Client::builder(&env.endpoint)
-        .context("create S3 cleanup builder")?
-        .region(&env.region)
-        .auth(s3::Auth::from_env().context("S3 auth for cleanup")?)
-        .build()
-        .context("build cleanup S3 client")?;
+    let client = cleanup_s3_client(env)?;
 
-    let head_key = format!("refs/{storage_key}.json");
-    let branch_prefix = format!("refs/{storage_key}/");
+    // Refs live under the per-test RIPCLONE_S3_PREFIX when the server is S3-backed.
+    // Prefer listing via the env prefix if set; also try unscoped keys for safety.
+    let prefix = std::env::var("RIPCLONE_S3_PREFIX").unwrap_or_default();
+    let head_key = format!("{prefix}refs/{storage_key}.json");
+    let branch_prefix = format!("{prefix}refs/{storage_key}/");
     let mut keys = vec![head_key];
     let mut continuation = None::<String>;
     loop {
@@ -731,19 +752,7 @@ async fn cleanup_repo_refs(env: &S3Env, owner: &str, repo: &str) -> Result<()> {
         }
     }
 
-    for chunk in keys.chunks(1000) {
-        let chunk: Vec<String> = chunk.to_vec();
-        client
-            .objects()
-            .delete_objects(&env.bucket)
-            .objects(&chunk)
-            .context("build cleanup ref delete batch")?
-            .quiet(true)
-            .send()
-            .await
-            .context("S3 cleanup ref delete_objects")?;
-    }
-    Ok(())
+    delete_key_batches(env, &client, keys).await
 }
 
 /// Ensures the S3 prefix (and optional ref JSON) are deleted even if a test
@@ -864,7 +873,11 @@ async fn wait_for_full_build(env: &S3Env, prefix: &str, owner: &str, repo: &str)
     let storage = make_s3_storage(env, prefix).expect("storage");
     let ref_store = make_s3_ref_store(storage);
     let repo_id = RepoId::github(format!("{owner}/{repo}"));
-    for _ in 0..1500 {
+    // 50ms poll (was 200ms): phase-2 settlement is the multi-minute sink on
+    // these tests; tighter polling only shaves seconds but costs almost nothing
+    // against local MinIO and keeps the suite responsive once the build lands.
+    // 300s ceiling unchanged (6000 * 50ms).
+    for _ in 0..6000 {
         if let Ok(branches) = ref_store.list_branches(&repo_id).await {
             for branch in &branches {
                 if branch == "HEAD" {
@@ -879,7 +892,7 @@ async fn wait_for_full_build(env: &S3Env, prefix: &str, owner: &str, repo: &str)
                 }
             }
         }
-        sleep(Duration::from_millis(200)).await;
+        sleep(Duration::from_millis(50)).await;
     }
     panic!("full build never settled for {owner}/{repo}");
 }
@@ -1350,7 +1363,14 @@ async fn expired_bearer_and_signed_url_mid_cli_clone_fail_cleanly() {
     write_cli_session_token(home.path(), &server.url, &token);
     let out = tempfile::tempdir().expect("clone out");
     let target = out.path().join("clone");
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_ripclone"))
+    // Prefer the runtime env (set by cargo test, or by CI when running a
+    // prebuilt binary against a separately-downloaded CLI) over the compile-time
+    // path baked into env!("CARGO_BIN_EXE_ripclone"), which points at the build
+    // machine and breaks after artifact download.
+    let ripclone_bin = std::env::var_os("CARGO_BIN_EXE_ripclone")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(env!("CARGO_BIN_EXE_ripclone")));
+    let mut child = std::process::Command::new(&ripclone_bin)
         .arg("--server")
         .arg(&server.url)
         .arg("clone")
@@ -1482,31 +1502,6 @@ async fn status_reports_bytes_from_s3() {
     guard.disable();
 }
 
-async fn load_head_ref(env: &S3Env, prefix: &str, owner: &str, repo: &str) -> ripclone::RefInfo {
-    let storage = make_s3_storage(env, prefix).expect("storage");
-    let ref_store = make_s3_ref_store(storage);
-    ref_store
-        .load_branch(&RepoId::github(format!("{owner}/{repo}")), "HEAD")
-        .await
-        .expect("load ref")
-        .expect("ref exists")
-}
-
-async fn save_head_ref(
-    env: &S3Env,
-    prefix: &str,
-    owner: &str,
-    repo: &str,
-    info: &ripclone::RefInfo,
-) {
-    let storage = make_s3_storage(env, prefix).expect("storage");
-    let ref_store = make_s3_ref_store(storage);
-    ref_store
-        .save_branch(&RepoId::github(format!("{owner}/{repo}")), "HEAD", info)
-        .await
-        .expect("save ref");
-}
-
 /// Age *every* ref of a repo — the literal `HEAD` alias and the concrete default
 /// branch — so the whole repo is uniformly idle. Warm-TTL eviction is
 /// repo-scoped: a repo is only evicted when all of its refs are idle past the
@@ -1514,7 +1509,21 @@ async fn save_head_ref(
 /// (written by the detached phase-2 build, and holding the full-history
 /// artifacts) up to build timing. Enumerate the refs and age them all, reading
 /// through the cache (invalidate first) so the durable ref is what we mutate.
+///
+/// When `pin` is true, also set `warm_pinned` on every ref. The pin is
+/// repo-scoped for GC, but `/status` only surfaces refs that carry clonepack
+/// manifests — a pin written only on a thin `HEAD` alias (no manifests) is
+/// invisible in the status response even though GC honors it. Pinning every
+/// ref makes the status assertion deterministic.
 async fn age_all_refs(env: &S3Env, prefix: &str, owner: &str, repo: &str) {
+    mutate_all_refs(env, prefix, owner, repo, false).await;
+}
+
+async fn age_and_pin_all_refs(env: &S3Env, prefix: &str, owner: &str, repo: &str) {
+    mutate_all_refs(env, prefix, owner, repo, true).await;
+}
+
+async fn mutate_all_refs(env: &S3Env, prefix: &str, owner: &str, repo: &str, pin: bool) {
     let storage = make_s3_storage(env, prefix).expect("storage");
     let ref_store = make_s3_ref_store(storage);
     let repo_id = RepoId::github(format!("{owner}/{repo}"));
@@ -1526,23 +1535,26 @@ async fn age_all_refs(env: &S3Env, prefix: &str, owner: &str, repo: &str) {
     let branches = ref_store
         .list_branches(&repo_id)
         .await
-        .expect("list branches to age");
-    assert!(!branches.is_empty(), "repo has at least one ref to age");
+        .expect("list branches to mutate");
+    assert!(!branches.is_empty(), "repo has at least one ref to mutate");
     for branch in branches {
         ref_store.invalidate(&repo_id, &branch).await;
         let Some(mut info) = ref_store
             .load_branch(&repo_id, &branch)
             .await
-            .expect("load ref to age")
+            .expect("load ref to mutate")
         else {
             continue;
         };
         info.last_accessed_at = Some(aged);
         info.synced_at = Some(aged);
+        if pin {
+            info.warm_pinned = true;
+        }
         ref_store
             .save_branch(&repo_id, &branch, &info)
             .await
-            .expect("save aged ref");
+            .expect("save mutated ref");
     }
 }
 
@@ -1652,29 +1664,24 @@ async fn warm_ttl_keeps_pinned_ref() {
         .await
         .expect("sync");
 
-    // Let phase 2 finish before pinning, so the concrete default-branch ref that
-    // actually holds the full-history artifacts is stable (and not still being
+    // Let phase 2 finish before aging/pinning, so the concrete default-branch
+    // ref that holds the full-history artifacts is stable (and not still being
     // rewritten by the detached build) when GC runs.
+    //
+    // Age *and pin* every ref. Pinning only HEAD used to flake: `/status` skips
+    // refs with empty clonepack manifests (a thin HEAD alias often has none), so
+    // the status response could list only the concrete default branch — which
+    // was never pinned — and `a ref reports the pin` failed even though GC
+    // correctly honored the repo-scoped pin on HEAD.
     wait_for_full_build(&env, &prefix, "acme", &repo).await;
-
-    let mut info = load_head_ref(&env, &prefix, "acme", &repo).await;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    info.last_accessed_at = Some(now.saturating_sub(86400));
-    info.synced_at = Some(now.saturating_sub(86400));
-    info.warm_pinned = true;
-    save_head_ref(&env, &prefix, "acme", &repo, &info).await;
+    age_and_pin_all_refs(&env, &prefix, "acme", &repo).await;
 
     // grace_period=0: any genuinely-orphaned object is deleted this pass. The pin
-    // is set only on the HEAD alias, but a repo keeps a second ref (the concrete
-    // default branch) for the same commit that holds the full-history artifacts.
-    // The pin must protect the whole repo, so *no* ref may be evicted. A two-phase
-    // build also leaves one unreferenced byproduct (the editable clonepack
-    // manifest, superseded by the files manifest); reclaiming that is correct GC
-    // and unrelated to the pin, so we assert the repo's refs survive rather than a
-    // literal zero-delete count.
+    // is repo-scoped, so *no* ref may be evicted. A two-phase build also leaves
+    // one unreferenced byproduct (the editable clonepack manifest, superseded by
+    // the files manifest); reclaiming that is correct GC and unrelated to the
+    // pin, so we assert the repo's refs survive rather than a literal zero-delete
+    // count.
     run_gc(&env, &prefix, Duration::from_secs(1), false).await;
 
     let status = get_status(&server, "acme", &repo, None).await;

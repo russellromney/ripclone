@@ -124,10 +124,12 @@ opt-level = 3
 opt-level = 0
 debug = "line-tables-only"
 
-# CI test gate profile: release-like optimizations for the local crate, but with
-# more codegen units so the compile finishes faster. Test runtime is still fast
-# enough for the gate; release builds are used for actual shipped binaries.
+# CI test gate profile: faster to compile than full release (opt-level 2, no LTO,
+# many codegen units). Test runtime stays fine for the gate; release builds are
+# used for actual shipped binaries (and musl smoke).
 [profile.ci]
 inherits = "release"
+opt-level = 2
 codegen-units = 256
 lto = false
+debug = "line-tables-only"

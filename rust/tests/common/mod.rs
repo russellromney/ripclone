@@ -1658,13 +1658,32 @@ pub fn spawn_worker_args(cas_dir: &Path, repo_root: &Path, extra: &[&str]) -> Wo
 /// compute providers set lifecycle via env without flags). Lifecycle env from
 /// the parent process is cleared first, then `extra_env` is applied, so tests
 /// don't leak `RIPCLONE_MAX_JOBS` into forever workers.
+/// Path to a cargo-built binary. Prefers the runtime env var (set by `cargo
+/// test`, or by CI when running a prebuilt test binary against downloaded
+/// bins) over the compile-time `env!("CARGO_BIN_EXE_*")` path, which is baked
+/// to the *build* machine and breaks after artifact download.
+pub fn cargo_bin(name: &str) -> std::path::PathBuf {
+    let key = format!("CARGO_BIN_EXE_{name}");
+    if let Ok(p) = std::env::var(&key) {
+        return std::path::PathBuf::from(p);
+    }
+    // Only the names we actually spawn from this helper are listed; expand if
+    // a new binary is needed at runtime from prebuilt e2e.
+    match name {
+        "ripclone-worker" => std::path::PathBuf::from(env!("CARGO_BIN_EXE_ripclone-worker")),
+        "ripclone" => std::path::PathBuf::from(env!("CARGO_BIN_EXE_ripclone")),
+        "ripclone-server" => std::path::PathBuf::from(env!("CARGO_BIN_EXE_ripclone-server")),
+        other => panic!("unknown cargo bin {other}; set CARGO_BIN_EXE_{other}"),
+    }
+}
+
 pub fn spawn_worker_with(
     cas_dir: &Path,
     repo_root: &Path,
     extra_args: &[&str],
     extra_env: &[(&str, &str)],
 ) -> WorkerProc {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_ripclone-worker"));
+    let mut cmd = Command::new(cargo_bin("ripclone-worker"));
     cmd.arg("--cas-dir")
         .arg(cas_dir)
         .arg("--repo-root")
