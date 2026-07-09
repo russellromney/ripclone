@@ -5,8 +5,8 @@
 use super::sql::{
     ADD_ATTEMPTS_COLUMN_SQL, ADD_CREDENTIAL_COLUMN_SQL, ADD_SIZE_CLASS_COLUMN_SQL,
     CREATE_ACTIVE_KEY_INDEX_SQL, CREATE_HISTORY_INDEX_SQL, CREATE_STATUS_INDEX_SQL,
-    CREATE_TABLE_SQL, DROP_LEGACY_ACTIVE_KEY_INDEX_SQL, QueueDb, SUPERSEDED_BY_NEWER_QUEUED,
-    now_secs,
+    CREATE_TABLE_SQL, CREATE_WORKERS_HEARTBEAT_INDEX_SQL, CREATE_WORKERS_TABLE_SQL,
+    DROP_LEGACY_ACTIVE_KEY_INDEX_SQL, QueueDb, SUPERSEDED_BY_NEWER_QUEUED, now_secs,
 };
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -77,6 +77,15 @@ impl QueueDb for SqliteDb {
             .execute(&self.pool)
             .await
             .context("create history index")?;
+        // Worker heartbeat/registry for dispatcher live-count (D3).
+        sqlx::raw_sql(CREATE_WORKERS_TABLE_SQL)
+            .execute(&self.pool)
+            .await
+            .context("create workers table")?;
+        sqlx::raw_sql(CREATE_WORKERS_HEARTBEAT_INDEX_SQL)
+            .execute(&self.pool)
+            .await
+            .context("create workers heartbeat index")?;
         Ok(())
     }
 
@@ -351,6 +360,48 @@ impl QueueDb for SqliteDb {
             .execute(&self.pool)
             .await
             .context("prune failed jobs")?;
+        Ok(res.rows_affected())
+    }
+
+    async fn upsert_heartbeat(
+        &self,
+        worker_id: &str,
+        max_size_class: Option<i64>,
+        current_job: Option<i64>,
+        now: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO workers (worker_id, max_size_class, current_job, last_heartbeat)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT(worker_id) DO UPDATE SET
+                 max_size_class = excluded.max_size_class,
+                 current_job = excluded.current_job,
+                 last_heartbeat = excluded.last_heartbeat",
+        )
+        .bind(worker_id)
+        .bind(max_size_class)
+        .bind(current_job)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .context("upsert worker heartbeat")?;
+        Ok(())
+    }
+
+    async fn count_live_workers(&self, cutoff: i64) -> Result<i64> {
+        sqlx::query_scalar("SELECT count(*) FROM workers WHERE last_heartbeat >= ?")
+            .bind(cutoff)
+            .fetch_one(&self.pool)
+            .await
+            .context("count live workers")
+    }
+
+    async fn prune_stale_workers(&self, cutoff: i64) -> Result<u64> {
+        let res = sqlx::query("DELETE FROM workers WHERE last_heartbeat < ?")
+            .bind(cutoff)
+            .execute(&self.pool)
+            .await
+            .context("prune stale workers")?;
         Ok(res.rows_affected())
     }
 }

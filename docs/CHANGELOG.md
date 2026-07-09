@@ -2,6 +2,12 @@
 
 This file tracks what has already landed in ripclone. For upcoming work see `internal/ROADMAP.md`.
 
+## Worker heartbeat / registry (D3)
+
+- **`workers` registry table** on the blessed SQL queues (`sqlite` / `libsql`, DDL in the shared `SqlJobQueue` adapter — Postgres/MySQL lag with no-op trait defaults). Each row is `worker_id`, optional `max_size_class` ceiling, optional `current_job`, and `last_heartbeat`.
+- **`SqlJobQueue::heartbeat` / `live_worker_count`**: workers upsert their row; the dispatcher (D2) queries how many heartbeats are fresh within `RIPCLONE_WORKER_HEARTBEAT_TIMEOUT_SECS` (default 60s). Stale rows age out of the live-count and are pruned. Two concurrent readers see the same count so replicas do not double-spawn.
+- **`ripclone-worker` opt-in**: `RIPCLONE_WORKER_HEARTBEAT=queue` (or the queue DSN / truthy `1`/`true`) enables a background heartbeat loop. Default off — self-host without a dispatcher is byte-for-byte unchanged.
+
 ## Config-driven size classes + claim filter (O2)
 
 - **`size_class` on the blessed SQL queues** (`sqlite` / `libsql`, column landed in the shared `SqlJobQueue` adapter): each job is classified at enqueue from a byte size already in hand. **First build** → `AddedRepo.repo_size_bytes` from the tiered-add GitHub preflight (`repo.size` KB→bytes, best-effort at `add`); **re-sync** → `max(prior clonepack total, preflight)`. Unknown size → largest class (never under-size a first build). Coalesce raises `size_class` if a later enqueue needs a bigger box. Size classes are an ordered config list (`[[queue.size_classes]]` or `RIPCLONE_SIZE_CLASSES` JSON) — name, `max_bytes` threshold, machine-spec label. Launch default is `small | large` (1 GiB cut). Adding a lane or retuning a threshold is config-only.
