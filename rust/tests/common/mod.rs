@@ -1640,13 +1640,29 @@ impl Drop for WorkerProc {
 
 /// Spawn the real `ripclone-worker` binary sharing `cas_dir` + `repo_root` with
 /// the in-process server. It inherits the test process env (RIPCLONE_QUEUE,
-/// RIPCLONE_QUEUE_DB_URL, RIPCLONE_ORIGIN_BASE, RIPCLONE_SERVER_TOKEN, …).
+/// RIPCLONE_QUEUE_DB_URL, RIPCLONE_ORIGIN_BASE, RIPCLONE_SERVER_TOKEN, …) but
+/// **clears** lifecycle vars (`RIPCLONE_IDLE_EXIT_SECS`, `RIPCLONE_MAX_JOBS`) so
+/// a developer shell or a prior test cannot force scale-to-zero on a forever
+/// worker under test.
 pub fn spawn_worker(cas_dir: &Path, repo_root: &Path) -> WorkerProc {
-    spawn_worker_args(cas_dir, repo_root, &[])
+    spawn_worker_with(cas_dir, repo_root, &[], &[])
 }
 
 /// Like [`spawn_worker`], with extra CLI args (e.g. `--idle-exit-secs`, `--max-jobs`).
 pub fn spawn_worker_args(cas_dir: &Path, repo_root: &Path, extra: &[&str]) -> WorkerProc {
+    spawn_worker_with(cas_dir, repo_root, extra, &[])
+}
+
+/// Spawn the worker with CLI args and/or child-only env (for the env-bag path:
+/// compute providers set lifecycle via env without flags). Lifecycle env from
+/// the parent process is cleared first, then `extra_env` is applied, so tests
+/// don't leak `RIPCLONE_MAX_JOBS` into forever workers.
+pub fn spawn_worker_with(
+    cas_dir: &Path,
+    repo_root: &Path,
+    extra_args: &[&str],
+    extra_env: &[(&str, &str)],
+) -> WorkerProc {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_ripclone-worker"));
     cmd.arg("--cas-dir")
         .arg(cas_dir)
@@ -1654,9 +1670,16 @@ pub fn spawn_worker_args(cas_dir: &Path, repo_root: &Path, extra: &[&str]) -> Wo
         .arg(repo_root)
         .arg("--idle-poll-ms")
         .arg("100")
-        .args(extra)
+        .args(extra_args)
+        // Lifecycle is flag-or-env; pin the child to an explicit bag so parent
+        // process pollution can't change forever vs one-shot vs idle-exit.
+        .env_remove("RIPCLONE_IDLE_EXIT_SECS")
+        .env_remove("RIPCLONE_MAX_JOBS")
         .stdout(Stdio::null())
         .stderr(Stdio::inherit());
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
     let child = cmd.spawn().expect("spawn ripclone-worker binary");
     WorkerProc(child)
 }
