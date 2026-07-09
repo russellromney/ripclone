@@ -87,9 +87,10 @@ jobs:
         if: always()
         run: sccache --show-stats || true
 
-  # One compile (ci profile + mold + sccache) for every job that needs runnable
-  # binaries or test executables. Fan-out jobs DOWNLOAD these and never invoke
-  # cargo — including the unit/integration `test` job.
+  # One compile (ci profile + mold + sccache) for fan-out jobs that only need
+  # runnable bins or a handful of integration tests. Those jobs DOWNLOAD these
+  # and never invoke cargo. The unit/integration `test` job self-compiles —
+  # staging the full suite here was ~30m cold (50+ linked test binaries).
   ci-build:
     runs-on: ubuntu-latest
     env:
@@ -104,7 +105,7 @@ jobs:
           cache-workspaces: rust
       - name: Install build deps
         run: bash scripts/install-build-deps.sh
-      - name: Build bins + all test binaries (ci profile)
+      - name: Build bins + fan-out test binaries (ci profile)
         run: bash scripts/ci.sh ci-build
       - name: sccache stats
         if: always()
@@ -116,32 +117,29 @@ jobs:
           path: rust/target/ci-artifacts/*
           if-no-files-found: error
           retention-days: 1
-          # Many integration-test executables; compression pays for itself on
-          # upload/download wall time.
           compression-level: 6
 
-  # Unit + integration tests — prebuilt executables from ci-build, no cargo.
+  # Unit + integration tests (ci profile). Self-compiles in parallel with
+  # ci-build so wall clock is max(ci-build, test), not sum.
   test:
-    needs: ci-build
     runs-on: ubuntu-latest
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/checkout@v7
-      - name: Download ci artifacts
-        uses: actions/download-artifact@v8
+      - name: sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          name: ci-artifacts
-          path: bin
-      - name: Tests (prebuilt, ci profile artifacts)
-        env:
-          CI_ARTIFACTS: ${{ github.workspace }}/bin
-          CARGO_BIN_EXE_ripclone: ${{ github.workspace }}/bin/ripclone
-          CARGO_BIN_EXE_ripclone-server: ${{ github.workspace }}/bin/ripclone-server
-          CARGO_BIN_EXE_ripclone-worker: ${{ github.workspace }}/bin/ripclone-worker
-          CARGO_BIN_EXE_git-remote-ripclone: ${{ github.workspace }}/bin/git-remote-ripclone
-        run: |
-          set -euo pipefail
-          chmod +x bin/*
-          bash scripts/ci.sh test
+          cache-workspaces: rust
+      - name: Install build deps
+        run: bash scripts/install-build-deps.sh
+      - name: Tests (ci profile)
+        run: bash scripts/ci.sh test
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats || true
 
   e2e:
     needs: ci-build
