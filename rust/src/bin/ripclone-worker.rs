@@ -19,6 +19,8 @@
 //!   above your longest build.
 //! - `RIPCLONE_QUEUE_FAILED_RETENTION_SECS` (default 7d): the worker periodically
 //!   prunes `failed` jobs older than this. `done` jobs are kept as build history.
+//! - `RIPCLONE_MAX_SIZE_CLASS` / `--max-size-class`: largest configured size
+//!   class this worker will claim. Omit to claim everything.
 //! - `RIPCLONE_IDLE_EXIT_SECS` / `--idle-exit-secs`: exit after N seconds of
 //!   empty claim attempts (scale-to-zero). Off by default.
 //! - `RIPCLONE_MAX_JOBS` / `--max-jobs`: exit after N builds (one-shot
@@ -69,7 +71,7 @@ struct Args {
     /// ceiling stay queued for a bigger worker. Omit to claim everything —
     /// single-worker self-host is unchanged. Names come from the configured
     /// size classes (launch default: `small` | `large`).
-    #[arg(long)]
+    #[arg(long, env = "RIPCLONE_MAX_SIZE_CLASS")]
     max_size_class: Option<String>,
 
     /// Exit after the queue has been empty for N seconds (scale-to-zero).
@@ -249,4 +251,46 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Args;
+    use clap::Parser;
+
+    /// Set `key=value` for the duration of `f`, restoring the previous value
+    /// (or removing the var) afterwards. Env mutation is `unsafe` in Rust 2024.
+    fn with_env<T>(key: &str, value: &str, f: impl FnOnce() -> T) -> T {
+        let previous = std::env::var(key).ok();
+        unsafe { std::env::set_var(key, value) };
+        let result = f();
+        match previous {
+            Some(previous) => unsafe { std::env::set_var(key, previous) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+        result
+    }
+
+    /// Parse with no CLI args at all; every value must come from env.
+    fn parse_env_only() -> Args {
+        Args::try_parse_from(["ripclone-worker"]).expect("parse from env only")
+    }
+
+    #[test]
+    fn max_size_class_from_env() {
+        let args = with_env("RIPCLONE_MAX_SIZE_CLASS", "large", parse_env_only);
+        assert_eq!(args.max_size_class.as_deref(), Some("large"));
+    }
+
+    #[test]
+    fn idle_exit_secs_from_env() {
+        let args = with_env("RIPCLONE_IDLE_EXIT_SECS", "42", parse_env_only);
+        assert_eq!(args.idle_exit_secs, Some(42));
+    }
+
+    #[test]
+    fn max_jobs_from_env() {
+        let args = with_env("RIPCLONE_MAX_JOBS", "7", parse_env_only);
+        assert_eq!(args.max_jobs, Some(7));
+    }
 }
