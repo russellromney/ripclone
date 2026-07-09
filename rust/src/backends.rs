@@ -6,6 +6,7 @@
 //! `ref_store` (metadata) — plus the local CAS cache and a scratch mirror root.
 //! That is why the worker can run anywhere: it owns no durable state.
 
+use crate::api_ref_store::ApiRefStore;
 use crate::cas::Cas;
 use crate::config::Config;
 use crate::metrics::Metrics;
@@ -106,10 +107,13 @@ impl Backends {
 }
 
 /// Select the metadata store from `RIPCLONE_METADATA`:
-/// `file` | `s3` | `sqlite` | `postgres` | `mysql` | `libsql`. Unset preserves
-/// the historical default: S3 when S3 storage is configured, else file. SQL
-/// backends read `RIPCLONE_METADATA_DB_URL` (+ `RIPCLONE_METADATA_DB_TOKEN` for
-/// libsql). The result is always wrapped in `CachingRefStore`.
+/// `file` | `s3` | `sqlite` | `postgres` | `mysql` | `libsql` | `api`. Unset
+/// preserves the historical default: S3 when S3 storage is configured, else
+/// file. SQL backends read `RIPCLONE_METADATA_DB_URL` (+
+/// `RIPCLONE_METADATA_DB_TOKEN` for libsql). `api` is worker-only: it POSTs
+/// ref-writes to `RIPCLONE_METADATA_REPORT_URL` with
+/// `RIPCLONE_METADATA_JOB_TOKEN` and holds no DB credentials. The result is
+/// always wrapped in `CachingRefStore`.
 async fn select_metadata(
     repo_root: &Path,
     s3: Option<&Arc<S3Storage>>,
@@ -132,8 +136,8 @@ async fn select_metadata(
             warn!(
                 "RIPCLONE_QUEUE={queue} is SQL but the metadata store resolves to per-host \
                  files. If workers don't share this filesystem, set a shared metadata store \
-                 (RIPCLONE_METADATA=s3|sqlite|postgres|mysql|libsql) so the server and workers \
-                 share refs."
+                 (RIPCLONE_METADATA=s3|sqlite|postgres|mysql|libsql|api) so the server and \
+                 workers share refs."
             );
         }
     }
@@ -184,9 +188,16 @@ async fn select_metadata(
             info!("metadata store: {kind}");
             Arc::new(CachingRefStore::new(SqlRefStore::new(db).await?))
         }
+        "api" => {
+            // Worker-only: POSTs ref-writes to the server. No DB URL, no DB token.
+            // Fail loudly if the report URL or job token is missing (same style as
+            // the libsql arm without its token).
+            let store = ApiRefStore::from_env()?;
+            Arc::new(CachingRefStore::new(store))
+        }
         other => anyhow::bail!(
             "unknown RIPCLONE_METADATA backend: {other:?} \
-             (expected 'file', 's3', 'sqlite', 'postgres', 'mysql', or 'libsql')"
+             (expected 'file', 's3', 'sqlite', 'postgres', 'mysql', 'libsql', or 'api')"
         ),
     };
     Ok(store)

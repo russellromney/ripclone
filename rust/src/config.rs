@@ -81,8 +81,9 @@ pub struct StorageConfig {
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MetadataConfig {
-    /// `file` | `s3` | `sqlite` | `postgres` | `mysql` | `libsql`. Unset follows
-    /// storage (s3 if configured, else file).
+    /// `file` | `s3` | `sqlite` | `postgres` | `mysql` | `libsql` | `api`.
+    /// Unset follows storage (s3 if configured, else file). `api` is worker-only
+    /// (report URL + job token; no DB credentials).
     pub backend: Option<String>,
     /// Connection URL for the SQL backends.
     pub url: Option<String>,

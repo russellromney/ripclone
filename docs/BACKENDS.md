@@ -129,6 +129,7 @@ Choose it with `RIPCLONE_METADATA`, independently of storage:
 | `postgres` | a Postgres database | shared across machines |
 | `mysql` | a MySQL database | shared across machines |
 | `libsql` | a remote Turso Cloud database | shared across machines |
+| `api` | server via `POST /v1/refs` | **Worker-only.** Requires `RIPCLONE_METADATA_REPORT_URL` + `RIPCLONE_METADATA_JOB_TOKEN`. No DB credentials on the worker; the server holds them and performs the durable write. |
 
 The SQL backends read a connection URL (and a token for `libsql`):
 

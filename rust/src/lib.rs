@@ -63,6 +63,8 @@ mod musl_global_allocator {
 /// `ripclone version`.
 pub const PROTOCOL_VERSION: u32 = 1;
 
+#[doc(hidden)]
+pub mod api_ref_store;
 pub mod archive;
 #[doc(hidden)]
 pub mod auth;
@@ -89,6 +91,8 @@ pub mod fsutil;
 pub mod git;
 #[doc(hidden)]
 pub mod gix_util;
+#[doc(hidden)]
+pub mod job_token;
 pub mod manifest;
 #[doc(hidden)]
 pub mod meta;
