@@ -1598,6 +1598,12 @@ fn dir_has_file(dir: &Path) -> bool {
 pub struct WorkerProc(Child);
 
 impl WorkerProc {
+    /// Wrap an already-spawned child (for tests that need custom env bags the
+    /// shared helpers don't cover, e.g. clearing metadata DB creds).
+    pub fn from_child(child: Child) -> Self {
+        Self(child)
+    }
+
     /// Kill the worker process and wait for it to exit. Tests use this to model
     /// SIGKILL-style loss of the build owner while the SQL queue row remains
     /// claimed.

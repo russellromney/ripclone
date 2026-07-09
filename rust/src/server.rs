@@ -809,6 +809,11 @@ pub fn build_app(state: ServerState) -> Router {
         .route("/login", get(login_page_handler))
         .route("/v1/auth/login", post(auth_login_handler))
         .route("/v1/build", post(build_handler))
+        // Worker metadata report: authenticated by a signed, expiring HMAC
+        // bearer token (not the shared server token). Farmed-out workers with
+        // RIPCLONE_METADATA=api POST ref-writes here; the server holds the DB
+        // creds and performs the durable write. Lives outside `protected`.
+        .route("/v1/refs", post(ref_report_handler))
         // Provider-agnostic push-webhook receiver: authenticated by the provider
         // HMAC over the raw body (not the ripclone bearer token), so it lives
         // outside the `protected` layer. `/v1/webhooks/github` is the legacy
@@ -1295,6 +1300,125 @@ async fn version_handler() -> impl IntoResponse {
 /// use for it; rejecting it would only make self-hosted clients see 404s.
 async fn clone_metrics_drop_handler() -> impl IntoResponse {
     StatusCode::ACCEPTED
+}
+
+/// `POST /v1/refs` — farmed-out worker reports a ref write.
+///
+/// Auth is a signed, expiring HMAC bearer token (`Authorization: Bearer …`), not
+/// the shared server token. There is no repo/job scope: the worker pool claims
+/// any repo, so a scoped token cannot work. Missing / malformed / expired /
+/// wrong-secret tokens return 401 and do **not** write. The write target comes
+/// from the request body. On success the server's real `RefStore` (the one
+/// holding DB credentials) performs the durable write.
+async fn ref_report_handler(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(body): Json<crate::api_ref_store::RefReport>,
+) -> Response {
+    use crate::api_ref_store::{RefReport, RefReportResponse};
+    use crate::job_token::{report_token_secret_from_env, verify_job_token};
+    use crate::provider::parse_storage_key;
+
+    let Some(secret) = report_token_secret_from_env() else {
+        error!(
+            "POST /v1/refs: no job-token secret configured \
+             (set RIPCLONE_JOB_TOKEN_SECRET or RIPCLONE_SERVER_TOKEN)"
+        );
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "job report tokens not configured on this server".to_string(),
+            }),
+        )
+            .into_response();
+    };
+
+    let presented = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let Some(token) = presented else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                error: "missing Authorization: Bearer <job token>".to_string(),
+            }),
+        )
+            .into_response();
+    };
+
+    // Auth is signature + expiry only (no repo scope): the report token is
+    // injected into a pooled worker that may claim any repo's job.
+    if let Err(e) = verify_job_token(&secret, token) {
+        warn!("POST /v1/refs: auth rejected: {e:#}");
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                error: "invalid or expired job report token".to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    // The write target comes from the request body, not the token.
+    let repo_key = body.repo_key().to_string();
+    let Some(repo_id) = parse_storage_key(&repo_key) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!("invalid repo_key: {repo_key}"),
+            }),
+        )
+            .into_response();
+    };
+
+    let result: Result<RefReportResponse, anyhow::Error> = match body {
+        RefReport::SaveBranch { branch, info, .. } => state
+            .ref_store
+            .save_branch(&repo_id, &branch, &info)
+            .await
+            .map(|_| RefReportResponse { updated: true }),
+        RefReport::UpdateBuildStatus {
+            branch,
+            expected_commit,
+            status,
+            ..
+        } => state
+            .ref_store
+            .update_build_status(&repo_id, &branch, &expected_commit, &status)
+            .await
+            .map(|updated| RefReportResponse { updated }),
+        RefReport::DeleteBranch { branch, .. } => state
+            .ref_store
+            .delete_branch(&repo_id, &branch)
+            .await
+            .map(|_| RefReportResponse { updated: true }),
+        RefReport::TouchLastAccessed {
+            branch,
+            expected_commit,
+            ..
+        } => state
+            .ref_store
+            .touch_last_accessed_at(&repo_id, &branch, &expected_commit)
+            .await
+            .map(|updated| RefReportResponse { updated }),
+    };
+
+    match result {
+        Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
+        Err(e) => {
+            error!("POST /v1/refs write failed for {repo_key}: {e:#}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("ref write failed: {e:#}"),
+                }),
+            )
+                .into_response()
+        }
+    }
 }
 
 /// Readiness probe: 200 only when storage and the ref store are both reachable,
@@ -6948,6 +7072,16 @@ fn classify_build_error(error: &anyhow::Error) -> BuildError {
                 BuildError::permanent(message)
             };
         }
+        // ApiRefStore report failures (network / 5xx / 401). Must not be
+        // swallowed: a silent success would drop the build result.
+        if let Some(api_err) = cause.downcast_ref::<crate::api_ref_store::ApiReportError>() {
+            let message = format!("{error:#}");
+            return if api_err.is_retryable() {
+                BuildError::retryable(message)
+            } else {
+                BuildError::permanent(message)
+            };
+        }
         if let Some(reqwest_error) = cause.downcast_ref::<reqwest::Error>() {
             let message = format!("{error:#}");
             return if reqwest_error.is_timeout()
@@ -7758,6 +7892,19 @@ mod tests {
 
         let not_found_io = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::NotFound));
         assert!(!classify_build_error(&not_found_io).is_retryable());
+    }
+
+    #[test]
+    fn classify_api_report_error_retryable_and_permanent() {
+        let retry = anyhow::Error::new(crate::api_ref_store::ApiReportError::retryable(
+            "metadata report to http://x: network unreachable",
+        ));
+        assert!(classify_build_error(&retry).is_retryable());
+
+        let permanent = anyhow::Error::new(crate::api_ref_store::ApiReportError::permanent(
+            "metadata report unauthorized (401)",
+        ));
+        assert!(!classify_build_error(&permanent).is_retryable());
     }
 
     fn test_state(tmp: &tempfile::TempDir) -> ServerState {
@@ -11031,5 +11178,140 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    fn ref_report_request(
+        token: Option<&str>,
+        body: &serde_json::Value,
+    ) -> axum::http::Request<Body> {
+        let mut b = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/refs")
+            .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))))
+            .header("Content-Type", "application/json");
+        if let Some(t) = token {
+            b = b.header("Authorization", format!("Bearer {t}"));
+        }
+        b.body(Body::from(serde_json::to_vec(body).unwrap()))
+            .unwrap()
+    }
+
+    /// Happy path: valid job token → durable write through the server's RefStore.
+    #[tokio::test]
+    async fn ref_report_valid_token_writes_ref() {
+        let secret = crate::job_token::report_token_secret_from_env()
+            .or_else(|| {
+                // test_state does not set RIPCLONE_SERVER_TOKEN; plant one for the mint.
+                unsafe { std::env::set_var("RIPCLONE_SERVER_TOKEN", "secret") };
+                crate::job_token::report_token_secret_from_env()
+            })
+            .expect("job token secret");
+        let repo_key = "github/acme%2Fwidget";
+        let tok =
+            crate::job_token::mint_job_token(&secret, std::time::Duration::from_secs(300)).unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(&tmp);
+        let ref_store = state.ref_store.clone();
+        let app = build_app(state);
+
+        let info = RefInfo {
+            commit: "abc123".into(),
+            default_branch: "main".into(),
+            manifest: "m1".into(),
+            ..Default::default()
+        };
+        let body = serde_json::json!({
+            "op": "save_branch",
+            "repo_key": repo_key,
+            "branch": "main",
+            "info": info,
+        });
+        let resp = app
+            .oneshot(ref_report_request(Some(&tok), &body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "valid token must write");
+
+        let rid = RepoId::github("acme/widget");
+        let stored = ref_store
+            .load_branch(&rid, "main")
+            .await
+            .unwrap()
+            .expect("ref must land in store");
+        assert_eq!(stored.commit, "abc123");
+    }
+
+    /// Auth gate: wrong / missing token → 401 and no write.
+    #[tokio::test]
+    async fn ref_report_bad_token_rejects_and_does_not_write() {
+        let secret = {
+            unsafe { std::env::set_var("RIPCLONE_SERVER_TOKEN", "secret") };
+            crate::job_token::report_token_secret_from_env().expect("secret")
+        };
+        let repo_key = "github/acme%2Fnope";
+        let good =
+            crate::job_token::mint_job_token(&secret, std::time::Duration::from_secs(300)).unwrap();
+        // Token signed with the wrong secret must not authorize this write.
+        let wrong_secret = crate::job_token::mint_job_token(
+            b"a-different-secret",
+            std::time::Duration::from_secs(300),
+        )
+        .unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(&tmp);
+        let ref_store = state.ref_store.clone();
+        let app = build_app(state);
+
+        let info = RefInfo {
+            commit: "should-not-land".into(),
+            default_branch: "main".into(),
+            ..Default::default()
+        };
+        let body = serde_json::json!({
+            "op": "save_branch",
+            "repo_key": repo_key,
+            "branch": "main",
+            "info": info,
+        });
+
+        // Missing Authorization.
+        let resp = app
+            .clone()
+            .oneshot(ref_report_request(None, &body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Garbage bearer.
+        let resp = app
+            .clone()
+            .oneshot(ref_report_request(Some("not-a-real-token"), &body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Well-formed token signed with the wrong secret → bad signature.
+        let resp = app
+            .clone()
+            .oneshot(ref_report_request(Some(&wrong_secret), &body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        let rid = RepoId::github("acme/nope");
+        assert!(
+            ref_store.load_branch(&rid, "main").await.unwrap().is_none(),
+            "rejected reports must not write"
+        );
+
+        // Sanity: the good token still works (proves the store itself is fine).
+        let resp = app
+            .oneshot(ref_report_request(Some(&good), &body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(ref_store.load_branch(&rid, "main").await.unwrap().is_some());
     }
 }
