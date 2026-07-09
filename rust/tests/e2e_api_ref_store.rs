@@ -85,12 +85,11 @@ fn setup_sqlite_queue_and_meta() -> (tempfile::TempDir, tempfile::TempDir, Strin
     (qdir, mdir, queue_url, meta_url)
 }
 
-fn mint_token_for(repo_path: &str) -> String {
+fn mint_report_token() -> String {
     // Server e2e init sets RIPCLONE_SERVER_TOKEN = TOKEN; secret derives from it.
     let secret = report_token_secret_from_env()
         .expect("job token secret (RIPCLONE_SERVER_TOKEN is set by common::init)");
-    let repo_key = RepoId::github(repo_path).storage_key();
-    mint_job_token(&secret, &repo_key, Duration::from_secs(3600)).expect("mint job report token")
+    mint_job_token(&secret, Duration::from_secs(3600)).expect("mint job report token")
 }
 
 async fn open_meta_store(meta_url: &str) -> Arc<dyn RefStore> {
@@ -140,7 +139,7 @@ async fn api_worker_reports_ref_without_db_creds() {
 
     let server = start_server().await;
     let report_url = format!("{}/v1/refs", server.url);
-    let token = mint_token_for("acme/api-ref");
+    let token = mint_report_token();
 
     // Real worker: METADATA=api, no DB URL/token in its env.
     let _worker = spawn_api_worker(&server.cas_dir, &server.repo_root, &report_url, &token);
@@ -221,11 +220,12 @@ async fn bad_job_token_rejected_and_no_db_write() {
         "bad token must not write a ref row"
     );
 
-    // Token for a different repo.
-    let other = mint_token_for("acme/other-repo");
+    // Well-formed token signed with the wrong secret → bad signature, no write.
+    let wrong_secret =
+        mint_job_token(b"not-the-server-secret", Duration::from_secs(3600)).expect("mint");
     let resp = client
         .post(&report_url)
-        .header("Authorization", format!("Bearer {other}"))
+        .header("Authorization", format!("Bearer {wrong_secret}"))
         .json(&body)
         .send()
         .await
@@ -234,7 +234,7 @@ async fn bad_job_token_rejected_and_no_db_write() {
     assert!(store.load_branch(&rid, "main").await.unwrap().is_none());
 
     // Correct token does write (proves the guard, not a broken endpoint).
-    let good = mint_token_for("acme/bad-tok");
+    let good = mint_report_token();
     let resp = client
         .post(&report_url)
         .header("Authorization", format!("Bearer {good}"))
@@ -264,7 +264,7 @@ async fn dead_report_url_job_requeues_not_done() {
     let server = start_server().await;
     // Port 1 is unroutable/refused on loopback — network error → retryable.
     let dead_url = "http://127.0.0.1:1/v1/refs";
-    let token = mint_token_for("acme/dead-url");
+    let token = mint_report_token();
 
     let origin = make_origin("acme", "dead-url");
     origin.commit(&[("a.txt", "x\n")], "c1");

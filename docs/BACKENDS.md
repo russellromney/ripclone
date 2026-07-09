@@ -129,7 +129,7 @@ Choose it with `RIPCLONE_METADATA`, independently of storage:
 | `postgres` | a Postgres database | shared across machines |
 | `mysql` | a MySQL database | shared across machines |
 | `libsql` | a remote Turso Cloud database | shared across machines |
-| `api` | server via `POST /v1/refs` | **Worker-only, not yet deployable.** Requires `RIPCLONE_METADATA_REPORT_URL` + `RIPCLONE_METADATA_JOB_TOKEN`. No DB credentials on the worker; the server holds them and performs the durable write. The endpoint, client, and token primitive exist, but nothing mints/injects the per-job token at dispatch time yet — an operator would have to produce and distribute tokens by hand. Farm-out deploys today should use a direct SQL metadata backend instead. |
+| `api` | server via `POST /v1/refs` | **Worker-only, not yet deployable.** Requires `RIPCLONE_METADATA_REPORT_URL` + `RIPCLONE_METADATA_JOB_TOKEN` (a signed, expiring token with no repo/job scope; the write target is the `repo_key` in each report body). No DB credentials on the worker; the server holds them and performs the durable write. The endpoint, client, and token primitive exist, but nothing mints/injects the token at dispatch time yet — an operator would have to produce and distribute tokens by hand. Farm-out deploys today should use a direct SQL metadata backend instead. |
 
 The SQL backends read a connection URL (and a token for `libsql`):
 

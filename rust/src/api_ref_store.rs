@@ -1,17 +1,19 @@
 //! `RefStore` that reports writes to a ripclone server over HTTP.
 //!
 //! Selected with `RIPCLONE_METADATA=api`. The worker holds only a report URL
-//! and a repo-scoped bearer token — never database credentials. The server
-//! that holds the real metadata store performs the durable write after
-//! checking the token (`POST /v1/refs`).
+//! and a signed, expiring bearer token — never database credentials. The token
+//! carries no repo/job scope (the worker pool claims any repo); the write
+//! target is the `repo_key` in each report body. The server that holds the real
+//! metadata store performs the durable write after checking the token
+//! (`POST /v1/refs`).
 //!
 //! Reads return empty: a farmed-out worker builds cold and only needs the write
 //! path for publish. A failed report is never swallowed — network/5xx map to
 //! retryable errors so the job requeues.
 //!
-//! Mechanism only: producing and injecting `RIPCLONE_METADATA_JOB_TOKEN` per
-//! job at dispatch time is not wired up yet (see `job_token.rs`), so `api`
-//! mode is not yet deployable for real farm-out.
+//! Mechanism only: producing and injecting `RIPCLONE_METADATA_JOB_TOKEN` at
+//! dispatch time is not wired up yet (see `job_token.rs`), so `api` mode is not
+//! yet deployable for real farm-out.
 
 use crate::RefInfo;
 use crate::provider::RepoId;
@@ -136,7 +138,7 @@ impl ApiRefStore {
             .filter(|s| !s.trim().is_empty())
             .context(
                 "RIPCLONE_METADATA=api requires RIPCLONE_METADATA_JOB_TOKEN \
-                 (repo-scoped bearer token from job_token::mint_job_token; \
+                 (signed, expiring bearer token from job_token::mint_job_token; \
                  the server does not mint or inject this automatically yet)",
             )?;
         Self::new(report_url, job_token)

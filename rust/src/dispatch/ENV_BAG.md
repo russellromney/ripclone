@@ -10,16 +10,18 @@ deliver this bag to a fresh process.
 **Decision D-A (mechanism shipped, not yet wired up end to end):** farmed-out
 workers should hold **no database credentials**. `RIPCLONE_METADATA=api` +
 `RIPCLONE_METADATA_REPORT_URL` (the server's `POST /v1/refs`) +
-`RIPCLONE_METADATA_JOB_TOKEN` (HMAC bearer, scoped to the job's repo) is the
-mechanism for that: the worker POSTs each ref-write and the **server** (which
-holds the DB creds) performs the durable write. The endpoint, the client, and
-the token primitive (`job_token::mint_job_token` / `verify_job_token`) all
-exist and are tested. What is missing: nothing in the codebase calls
-`mint_job_token` outside tests, so no process actually mints and injects
-`RIPCLONE_METADATA_JOB_TOKEN` per job at dispatch time. Until that follow-up
-lands, `RIPCLONE_METADATA=api` is not deployable for real farm-out — an
-operator would have to mint and distribute tokens by hand. Self-host
-single-box should keep using direct SQL metadata
+`RIPCLONE_METADATA_JOB_TOKEN` (a signed, expiring HMAC bearer token, with no
+repo or job scope) is the mechanism for that: the worker POSTs each ref-write
+and the **server** (which holds the DB creds) performs the durable write. The
+token has exactly one shape — signature + expiry, nothing else — because it is
+injected into a pooled worker that may claim any repo's job, so a repo- or
+job-scoped token cannot work. The endpoint, the client, and the token primitive
+(`job_token::mint_job_token` / `verify_job_token`) all exist and are tested.
+What is missing: nothing in the codebase calls `mint_job_token` outside tests,
+so no process actually mints and injects `RIPCLONE_METADATA_JOB_TOKEN` at
+dispatch time. Until that follow-up lands, `RIPCLONE_METADATA=api` is not
+deployable for real farm-out — an operator would have to mint and distribute
+tokens by hand. Self-host single-box should keep using direct SQL metadata
 (`RIPCLONE_METADATA=sqlite|postgres|mysql|libsql` + `RIPCLONE_METADATA_DB_URL`)
 — that path is unchanged and is today's default for farm-out too.
 
@@ -41,11 +43,11 @@ lane name such as `small` or `large`), not an env var.
 | | `AWS_ACCESS_KEY_ID` | Yes, for S3 | — | S3 access key. |
 | | `AWS_SECRET_ACCESS_KEY` | Yes, for S3 | — | S3 secret key. |
 | | `AWS_SESSION_TOKEN` | No | — | Optional temporary S3 session token. |
-| **Metadata target** (direct DB — self-host / today's default for farm-out) | `RIPCLONE_METADATA` | No | `file` (follows storage) | Metadata backend: `file` \| `s3` \| `sqlite` \| `postgres` \| `mysql` \| `libsql` \| `api`. Direct SQL is what farm-out uses today; workers hold DB creds. `api` is a no-DB-creds mechanism that exists but is not yet wired for automatic per-job token issuance (see D-A above) — not yet deployable. |
+| **Metadata target** (direct DB — self-host / today's default for farm-out) | `RIPCLONE_METADATA` | No | `file` (follows storage) | Metadata backend: `file` \| `s3` \| `sqlite` \| `postgres` \| `mysql` \| `libsql` \| `api`. Direct SQL is what farm-out uses today; workers hold DB creds. `api` is a no-DB-creds mechanism that exists but is not yet wired for automatic token issuance at dispatch (see D-A above) — not yet deployable. |
 | | `RIPCLONE_METADATA_DB_URL` | Yes, when `RIPCLONE_METADATA` is SQL | — | DB path/URL for SQL metadata. **Do not set on farm-out workers using `api`.** |
 | | `RIPCLONE_METADATA_DB_TOKEN` | Yes, when `RIPCLONE_METADATA=libsql` | — | Auth token for remote libsql metadata. **Do not set on farm-out workers using `api`.** |
 | **Metadata target** (`api` — not yet deployable, see D-A) | `RIPCLONE_METADATA_REPORT_URL` | Yes, when `RIPCLONE_METADATA=api` | — | Absolute `http(s)` URL of the server's `POST /v1/refs` report endpoint. Missing → worker fails at startup. |
-| | `RIPCLONE_METADATA_JOB_TOKEN` | Yes, when `RIPCLONE_METADATA=api` | — | Repo-scoped HMAC bearer token (`rcjt1.…`) from `job_token::mint_job_token`. No caller mints or injects this per job yet — an operator must produce it out of band. Sent as `Authorization: Bearer …`. Missing → worker fails at startup. Bad/expired/wrong-scope → 401, no write. |
+| | `RIPCLONE_METADATA_JOB_TOKEN` | Yes, when `RIPCLONE_METADATA=api` | — | Signed, expiring HMAC bearer token (`rcjt1.…`) from `job_token::mint_job_token`; no repo or job scope. No caller mints or injects it yet — an operator must produce it out of band. Sent as `Authorization: Bearer …`. Missing → worker fails at startup. Malformed/expired/wrong-secret → 401, no write. |
 | **Upstream-credential source** | `RIPCLONE_PROVIDERS` | One source required | — | JSON provider registry; supplies instance tokens and auth templates. |
 | | `RIPCLONE_GITHUB_TOKEN` | alt | — | Static GitHub personal/token for the static broker. |
 | | `RIPCLONE_GITHUB_APP_ID` | alt | — | GitHub App broker: app ID. |
@@ -82,7 +84,7 @@ Before starting a worker, a provider must set:
    - **`api` (mechanism exists, not yet deployable):** `RIPCLONE_METADATA=api`
      + `RIPCLONE_METADATA_REPORT_URL` + `RIPCLONE_METADATA_JOB_TOKEN`. No
      `RIPCLONE_METADATA_DB_URL` / `RIPCLONE_METADATA_DB_TOKEN` — but nothing
-     mints/injects the token per job yet, so this requires a manual token
+     mints/injects the token at dispatch yet, so this requires a manual token
      today. See D-A.
 4. One upstream-credential source (`RIPCLONE_PROVIDERS`, `RIPCLONE_GITHUB_TOKEN`,
    or GitHub App vars).
@@ -94,7 +96,7 @@ files, no platform-specific API knowledge.
 ## Farm-out worker env (no DB creds) — not yet deployable
 
 The `api` mechanism below exists (endpoint + client + token primitive) but
-nothing mints and injects `RIPCLONE_METADATA_JOB_TOKEN` per job yet, so this
+nothing mints and injects `RIPCLONE_METADATA_JOB_TOKEN` at dispatch yet, so this
 bag is not usable end to end without an operator manually minting a token.
 Treat it as a shape for the follow-up dispatch integration, not a working
 recipe today:
@@ -106,7 +108,7 @@ RIPCLONE_QUEUE_DB_URL=…          # claim only — not the metadata DB
 
 RIPCLONE_METADATA=api
 RIPCLONE_METADATA_REPORT_URL=https://ripclone.example/v1/refs
-RIPCLONE_METADATA_JOB_TOKEN=rcjt1.…   # repo-scoped; no automatic mint/inject yet
+RIPCLONE_METADATA_JOB_TOKEN=rcjt1.…   # signed + expiring, no scope; no automatic mint/inject yet
 
 # storage (S3 or local) …
 # upstream credential source …

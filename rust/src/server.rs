@@ -809,8 +809,8 @@ pub fn build_app(state: ServerState) -> Router {
         .route("/login", get(login_page_handler))
         .route("/v1/auth/login", post(auth_login_handler))
         .route("/v1/build", post(build_handler))
-        // Worker metadata report: authenticated by a per-job HMAC bearer token
-        // (not the shared server token). Farmed-out workers with
+        // Worker metadata report: authenticated by a signed, expiring HMAC
+        // bearer token (not the shared server token). Farmed-out workers with
         // RIPCLONE_METADATA=api POST ref-writes here; the server holds the DB
         // creds and performs the durable write. Lives outside `protected`.
         .route("/v1/refs", post(ref_report_handler))
@@ -1304,9 +1304,11 @@ async fn clone_metrics_drop_handler() -> impl IntoResponse {
 
 /// `POST /v1/refs` — farmed-out worker reports a ref write.
 ///
-/// Auth is a repo-scoped HMAC bearer token (`Authorization: Bearer …`), not the
-/// shared server token. Missing / wrong / expired / wrong-scope tokens return
-/// 401 and do **not** write. On success the server's real `RefStore` (the one
+/// Auth is a signed, expiring HMAC bearer token (`Authorization: Bearer …`), not
+/// the shared server token. There is no repo/job scope: the worker pool claims
+/// any repo, so a scoped token cannot work. Missing / malformed / expired /
+/// wrong-secret tokens return 401 and do **not** write. The write target comes
+/// from the request body. On success the server's real `RefStore` (the one
 /// holding DB credentials) performs the durable write.
 async fn ref_report_handler(
     State(state): State<ServerState>,
@@ -1347,9 +1349,10 @@ async fn ref_report_handler(
             .into_response();
     };
 
-    let repo_key = body.repo_key().to_string();
-    if let Err(e) = verify_job_token(&secret, token, &repo_key) {
-        warn!("POST /v1/refs: auth rejected for {repo_key}: {e:#}");
+    // Auth is signature + expiry only (no repo scope): the report token is
+    // injected into a pooled worker that may claim any repo's job.
+    if let Err(e) = verify_job_token(&secret, token) {
+        warn!("POST /v1/refs: auth rejected: {e:#}");
         return (
             StatusCode::UNAUTHORIZED,
             Json(ErrorResponse {
@@ -1359,6 +1362,8 @@ async fn ref_report_handler(
             .into_response();
     }
 
+    // The write target comes from the request body, not the token.
+    let repo_key = body.repo_key().to_string();
     let Some(repo_id) = parse_storage_key(&repo_key) else {
         return (
             StatusCode::BAD_REQUEST,
@@ -11202,12 +11207,8 @@ mod tests {
             })
             .expect("job token secret");
         let repo_key = "github/acme%2Fwidget";
-        let tok = crate::job_token::mint_job_token(
-            &secret,
-            repo_key,
-            std::time::Duration::from_secs(300),
-        )
-        .unwrap();
+        let tok =
+            crate::job_token::mint_job_token(&secret, std::time::Duration::from_secs(300)).unwrap();
 
         let tmp = tempfile::tempdir().unwrap();
         let state = test_state(&tmp);
@@ -11249,16 +11250,11 @@ mod tests {
             crate::job_token::report_token_secret_from_env().expect("secret")
         };
         let repo_key = "github/acme%2Fnope";
-        let good = crate::job_token::mint_job_token(
-            &secret,
-            repo_key,
-            std::time::Duration::from_secs(300),
-        )
-        .unwrap();
-        // Token for a different repo must not authorize this write.
-        let wrong_repo = crate::job_token::mint_job_token(
-            &secret,
-            "github/acme%2Fother",
+        let good =
+            crate::job_token::mint_job_token(&secret, std::time::Duration::from_secs(300)).unwrap();
+        // Token signed with the wrong secret must not authorize this write.
+        let wrong_secret = crate::job_token::mint_job_token(
+            b"a-different-secret",
             std::time::Duration::from_secs(300),
         )
         .unwrap();
@@ -11296,10 +11292,10 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
-        // Valid signature but wrong repo scope.
+        // Well-formed token signed with the wrong secret → bad signature.
         let resp = app
             .clone()
-            .oneshot(ref_report_request(Some(&wrong_repo), &body))
+            .oneshot(ref_report_request(Some(&wrong_secret), &body))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
