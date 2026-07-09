@@ -121,14 +121,73 @@ jobs:
       - name: Postgres + MySQL + libsql (queue + metadata) on real servers
         run: bash scripts/ci.sh databases
 
+  # Discover the individual #[ignore = "requires S3 credentials"] test names in
+  # e2e_remote_gc_s3.rs so the s3gc job below can shard one-test-per-runner.
+  # Reading the list at CI time (instead of hand-listing it in the matrix)
+  # means a test added/renamed/removed in that file is picked up automatically.
+  s3gc-tests:
+    needs: changes
+    if: ${{ needs.changes.outputs.docker == 'true' }}
+    runs-on: ubuntu-latest
+    outputs:
+      tests: ${{ steps.list.outputs.tests }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: List ignored S3 test names
+        id: list
+        run: |
+          set -euo pipefail
+          names=$(grep -A2 '#\[ignore = "requires S3 credentials"\]' rust/tests/e2e_remote_gc_s3.rs \
+            | grep -oP 'async fn \K[a-zA-Z0-9_]+(?=\()')
+          json=$(printf '%s\n' "$names" | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          echo "found: $json"
+          test "$(echo "$json" | jq 'length')" -ge 1
+          echo "tests=$json" >> "$GITHUB_OUTPUT"
+
+  # Compile the s3gc test binary once. Matrix shards below download it and run
+  # a single test each — no recompile per shard. That is the real wall-time
+  # win: ~7 min compile paid once, then N cheap isolated test runs in parallel.
+  s3gc-build:
+    needs: changes
+    if: ${{ needs.changes.outputs.docker == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache-workspaces: rust
+      - name: Install build deps
+        run: bash scripts/install-build-deps.sh
+      - name: Build e2e_remote_gc_s3 (release, no run)
+        run: bash scripts/ci.sh s3gc-build
+      - name: Upload s3gc test binary + CLI
+        uses: actions/upload-artifact@v7
+        with:
+          name: s3gc-test-bin
+          path: |
+            rust/target/release/e2e_remote_gc_s3
+            rust/target/release/ripclone
+          if-no-files-found: error
+          retention-days: 1
+
   # S3-backed remote GC end-to-end suite against a real MinIO container. These
   # tests are #[ignored] in the default cargo suite because they need an S3
   # backend; this job provides one locally and runs them on every PR touching
   # rust/.
+  #
+  # Sharded one test per matrix job (fail-fast: false). Each job downloads the
+  # prebuilt binary from s3gc-build (no cargo), gets its own MinIO service +
+  # unique bucket, and runs exactly one test. Within a shard SERVER_LOCK is a
+  # no-op (one test per process). Isolation: unique bucket name, unique
+  # on-disk temp dirs via tempfile/UUID inside the tests, free_port per server.
   s3gc:
-    needs: changes
+    needs: [changes, s3gc-tests, s3gc-build]
     if: ${{ needs.changes.outputs.docker == 'true' }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        test: ${{ fromJSON(needs.s3gc-tests.outputs.tests) }}
     services:
       minio:
         image: minio/minio:latest
@@ -143,16 +202,22 @@ jobs:
           - 9000:9000
     steps:
       - uses: actions/checkout@v7
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: Download s3gc test binary
+        uses: actions/download-artifact@v8
         with:
-          cache-workspaces: rust
-      - name: Install build deps
-        run: bash scripts/install-build-deps.sh
-      - name: Wait for MinIO and create bucket
+          name: s3gc-test-bin
+          path: bin
+      - name: Wait for MinIO and create per-shard bucket
         env:
           AWS_ACCESS_KEY_ID: minioadmin
           AWS_SECRET_ACCESS_KEY: minioadmin
+          STRATEGY_JOB_INDEX: ${{ strategy.job-index }}
         run: |
+          set -euo pipefail
+          # Unique bucket per matrix shard so parallel jobs never share S3 state.
+          # S3 bucket names: lowercase, digits, hyphens; keep under 63 chars.
+          # strategy.job-index is 0-based across the matrix expansion.
+          SHARD_BUCKET="ripclone-${GITHUB_RUN_ID}-${STRATEGY_JOB_INDEX:-0}"
           for i in {1..30}; do
             if curl -sf http://127.0.0.1:9000/minio/health/live >/dev/null; then
               break
@@ -160,9 +225,24 @@ jobs:
             sleep 1
           done
           curl -sf http://127.0.0.1:9000/minio/health/live >/dev/null
-          aws --endpoint-url http://127.0.0.1:9000 --region us-east-1 s3 mb s3://ripclone-test
-      - name: S3 GC e2e against MinIO
-        run: bash scripts/ci.sh s3gc
+          aws --endpoint-url http://127.0.0.1:9000 --region us-east-1 s3 mb "s3://${SHARD_BUCKET}"
+          echo "RIPCLONE_S3_BUCKET=${SHARD_BUCKET}" >> "$GITHUB_ENV"
+      - name: S3 GC e2e against MinIO (${{ matrix.test }})
+        env:
+          S3GC_TEST_BIN: ${{ github.workspace }}/bin/e2e_remote_gc_s3
+          # Runtime override: env!("CARGO_BIN_EXE_ripclone") is baked to the
+          # *build* job's absolute path; point the CLI test at the downloaded
+          # binary instead. (Cargo itself also sets this env when it runs tests.)
+          CARGO_BIN_EXE_ripclone: ${{ github.workspace }}/bin/ripclone
+          # Use production S3 client defaults (30s request / 5 attempts / 2s
+          # max retry delay). A shorter request timeout was tried and caused
+          # upload/cleanup retry storms that *lengthened* test bodies. Connect
+          # fast-fail is already ~5s via the reqx transport default.
+        run: |
+          set -euo pipefail
+          chmod +x "$S3GC_TEST_BIN" "$CARGO_BIN_EXE_ripclone"
+          # Prove the filter is wired: cargo-style output must report 1 test.
+          bash scripts/ci.sh s3gc "${{ matrix.test }}"
 
   # Real multi-provider + server-side-token path against a live Gitea. This is
   # the seam a production dogfood found broken but every file:// e2e missed: a
