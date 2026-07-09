@@ -16,14 +16,12 @@ env:
   # rust-ci-performance). rust-cache restores a full target tree instead.
   CARGO_INCREMENTAL: "0"
 
-# Caching: setup-rust-toolchain (Swatinem/rust-cache) restores each job's cargo
-# registry + target/ dir across runs, keyed by Cargo.lock — so a job recompiles
-# only what changed, not the whole dep tree every run. (sccache's GHA backend was
-# tried but its server hits GitHub's retired v1 cache API and fails to start,
-# killing every cargo invocation; the per-job target cache is the robust choice.)
+# Caching: sccache for rustc objects (shared across jobs) + Swatinem/rust-cache
+# for registry/git (keyed by Cargo.lock). Fan-out jobs that only run prebuilt
+# binaries skip both.
 jobs:
-  # Detect whether anything that affects the Docker images changed, so docs- or
-  # CI-only PRs skip the (slow) image build.
+  # Detect whether anything that affects Docker / musl smoke changed, so docs-
+  # or CI-only PRs skip the slow image build / static-musl cross-compile.
   changes:
     runs-on: ubuntu-latest
     permissions:
@@ -32,6 +30,7 @@ jobs:
     outputs:
       docker: ${{ steps.filter.outputs.docker }}
       bench: ${{ steps.filter.outputs.bench }}
+      musl: ${{ steps.filter.outputs.musl }}
     steps:
       - uses: actions/checkout@v7
       - uses: dorny/paths-filter@v4
@@ -49,11 +48,32 @@ jobs:
               - 'scripts/benchmark_smoke.sh'
               - 'scripts/ci.sh'
               - '.github/workflows/ci.yml'
+            # musl is a separate target_env (mimalloc global allocator, hand-
+            # written statx, fully-static link). Skip pure-test / docs PRs; still
+            # always run on main so main never drifts silently.
+            musl:
+              - 'rust/src/**'
+              - 'rust/Cargo.toml'
+              - 'rust/Cargo.lock'
+              - 'rust/build.rs'
+              - 'rust/.cargo/**'
+              - 'scripts/musl-smoke.sh'
+              - 'scripts/install-build-deps.sh'
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/release.yml'
 
   lint:
     runs-on: ubuntu-latest
+    env:
+      # sccache shares rustc objects across jobs via GHA cache API v2 (older
+      # attempts used a retired v1 API; mozilla-actions/sccache-action + modern
+      # sccache talk to the current service).
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/checkout@v7
+      - name: sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
       # Reads the pinned channel + components from rust-toolchain.toml; caches the
       # cargo registry + target/ (keyed by Cargo.lock). cache-workspaces -> rust/.
       - uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -63,37 +83,32 @@ jobs:
         run: bash scripts/install-build-deps.sh
       - name: Lint (fmt + clippy)
         run: bash scripts/ci.sh lint
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats || true
 
-  # Unit + integration tests (ci profile: release-like opts, more codegen units).
-  # Single run — a second flake pass used to dominate overall PR wall (~27 min)
-  # without enough flake yield to justify it.
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          cache-workspaces: rust
-      - name: Install build deps
-        run: bash scripts/install-build-deps.sh
-      - name: Tests (ci profile)
-        run: bash scripts/ci.sh test
-
-  # One compile (ci profile + mold) for every job that only needs runnable
-  # binaries or a few integration tests. Fan-out jobs DOWNLOAD these and never
-  # invoke cargo — same profile was not enough while each job had its own
-  # runner and cold-compiled in parallel.
+  # One compile (ci profile + mold + sccache) for every job that needs runnable
+  # binaries or test executables. Fan-out jobs DOWNLOAD these and never invoke
+  # cargo — including the unit/integration `test` job.
   ci-build:
     runs-on: ubuntu-latest
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/checkout@v7
+      - name: sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           cache-workspaces: rust
       - name: Install build deps
         run: bash scripts/install-build-deps.sh
-      - name: Build bins + fan-out test binaries (ci profile)
+      - name: Build bins + all test binaries (ci profile)
         run: bash scripts/ci.sh ci-build
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats || true
       - name: Upload ci artifacts
         uses: actions/upload-artifact@v7
         with:
@@ -101,6 +116,32 @@ jobs:
           path: rust/target/ci-artifacts/*
           if-no-files-found: error
           retention-days: 1
+          # Many integration-test executables; compression pays for itself on
+          # upload/download wall time.
+          compression-level: 6
+
+  # Unit + integration tests — prebuilt executables from ci-build, no cargo.
+  test:
+    needs: ci-build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Download ci artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: ci-artifacts
+          path: bin
+      - name: Tests (prebuilt, ci profile artifacts)
+        env:
+          CI_ARTIFACTS: ${{ github.workspace }}/bin
+          CARGO_BIN_EXE_ripclone: ${{ github.workspace }}/bin/ripclone
+          CARGO_BIN_EXE_ripclone-server: ${{ github.workspace }}/bin/ripclone-server
+          CARGO_BIN_EXE_ripclone-worker: ${{ github.workspace }}/bin/ripclone-worker
+          CARGO_BIN_EXE_git-remote-ripclone: ${{ github.workspace }}/bin/git-remote-ripclone
+        run: |
+          set -euo pipefail
+          chmod +x bin/*
+          bash scripts/ci.sh test
 
   e2e:
     needs: ci-build
@@ -374,19 +415,20 @@ jobs:
           docker run --rm ripclone-server:ci ripclone-server --help
           docker run --rm ripclone-server:ci ripclone-worker --help
 
-  # The static-musl release target. This is the ONLY job that compiles under
-  # `target_env = "musl"`, so it is the only one that exercises the mimalloc
-  # `#[global_allocator]` and the hand-written kernel `struct statx` in
-  # src/statx_compat.rs. It builds the release binaries + the lib test binary for
-  # musl and runs them on a stock Alpine container: a wrong statx offset, a symbol
-  # musl lacks, or a stray dynamic link would first appear at release-tag time
-  # otherwise. Same changes filter as the docker job.
+  # The static-musl release target. ONLY job that compiles under
+  # `target_env = "musl"` (mimalloc global allocator + hand-written statx).
+  # Path-gated on PRs; always runs on main so release-shape never drifts silent.
   musl:
     needs: changes
-    if: ${{ needs.changes.outputs.docker == 'true' }}
+    if: ${{ github.ref == 'refs/heads/main' || needs.changes.outputs.musl == 'true' }}
     runs-on: ubuntu-latest
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/checkout@v7
+      - name: sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           cache-workspaces: rust
@@ -414,3 +456,6 @@ jobs:
           docker pull --quiet alpine:latest &
       - name: Build + run the static musl binaries on Alpine
         run: bash scripts/musl-smoke.sh
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats || true

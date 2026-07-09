@@ -19,11 +19,53 @@ lint() {
     cargo clippy --all-targets --locked -- -D warnings )
 }
 
-# Unit + integration tests, parallel (the default) so cross-test races surface.
-# (cargo test runs the test binaries sequentially, which keeps concurrent
-# io_uring queue allocation bounded — nextest's all-binaries-at-once parallelism
-# exhausts the runner's locked-memory limit while io_uring is the default writer.)
+# Unit + integration tests. cargo test runs the test binaries sequentially,
+# which keeps concurrent io_uring queue allocation bounded — nextest's
+# all-binaries-at-once parallelism exhausts the runner's locked-memory limit
+# while io_uring is the default writer.
+#
+# When CI_ARTIFACTS is set (compile-once fan-out), run the prebuilt test
+# executables from that dir — no cargo on this runner. Bin paths for tests that
+# spawn CLI/worker processes must be exported as CARGO_BIN_EXE_*.
 run_tests() {
+  if [ -n "${CI_ARTIFACTS:-}" ]; then
+    local manifest="$CI_ARTIFACTS/test-executables.txt"
+    [ -f "$manifest" ] || {
+      echo "error: missing $manifest (ci-build did not stage test binaries)" >&2
+      exit 1
+    }
+    export CARGO_BIN_EXE_ripclone="${CARGO_BIN_EXE_ripclone:-$CI_ARTIFACTS/ripclone}"
+    export CARGO_BIN_EXE_ripclone-server="${CARGO_BIN_EXE_ripclone-server:-$CI_ARTIFACTS/ripclone-server}"
+    export CARGO_BIN_EXE_ripclone-worker="${CARGO_BIN_EXE_ripclone-worker:-$CI_ARTIFACTS/ripclone-worker}"
+    export CARGO_BIN_EXE_git-remote-ripclone="${CARGO_BIN_EXE_git-remote-ripclone:-$CI_ARTIFACTS/git-remote-ripclone}"
+    for b in \
+      "$CARGO_BIN_EXE_ripclone" \
+      "$CARGO_BIN_EXE_ripclone-server" \
+      "$CARGO_BIN_EXE_ripclone-worker" \
+      "$CARGO_BIN_EXE_git-remote-ripclone"; do
+      [ -x "$b" ] || {
+        echo "error: missing product bin $b" >&2
+        exit 1
+      }
+    done
+    local status=0
+    local name
+    while IFS= read -r name; do
+      [ -n "$name" ] || continue
+      local bin="$CI_ARTIFACTS/$name"
+      [ -x "$bin" ] || {
+        echo "error: missing test binary $bin" >&2
+        exit 1
+      }
+      echo "==> prebuilt test: $name"
+      # Match cargo test: run from the crate root so CARGO_MANIFEST_DIR-relative
+      # fixtures and relative paths behave the same.
+      if ! ( cd "$ROOT/rust" && "$bin" ); then
+        status=1
+      fi
+    done <"$manifest"
+    return "$status"
+  fi
   ( cd "$ROOT/rust" && cargo test --profile ci --all-targets --locked )
 }
 
@@ -102,8 +144,8 @@ benchmark() {
   bash "$ROOT/scripts/benchmark_smoke.sh"
 }
 
-# Compile-once fan-out: bins + integration test binaries for gitea/databases/
-# docker/e2e/benchmark/s3gc. See scripts/ci-build-artifacts.sh.
+# Compile-once fan-out: product bins + every test binary (`--all-targets`) for
+# test/gitea/databases/docker/e2e/benchmark/s3gc. See scripts/ci-build-artifacts.sh.
 ci_build() {
   bash "$ROOT/scripts/ci-build-artifacts.sh"
 }

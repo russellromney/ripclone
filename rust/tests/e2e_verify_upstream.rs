@@ -45,7 +45,11 @@ async fn run_clone_with_token(
         let stdout_tmp = tempfile::NamedTempFile::new_in(&dir).expect("stdout temp file");
         let stderr_tmp = tempfile::NamedTempFile::new_in(&dir).expect("stderr temp file");
 
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_ripclone"));
+        // Prefer runtime CARGO_BIN_EXE_* (set by CI when running prebuilt tests).
+        let ripclone_bin = std::env::var_os("CARGO_BIN_EXE_ripclone")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(env!("CARGO_BIN_EXE_ripclone")));
+        let mut cmd = Command::new(ripclone_bin);
         cmd.arg("--server").arg(&server_url);
         if let Some(token) = &token {
             cmd.arg("--token").arg(token);
