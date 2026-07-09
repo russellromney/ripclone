@@ -4,9 +4,8 @@ This document freezes the environment-variable contract every compute provider
 (`fly`, `exec`, `http`, k8s, custom, …) must deliver to a fresh
 `ripclone-worker` process.
 
-**Core rule:** the worker is platform-blind. A provider never needs to know
-worker internals; its only job is to deliver this bag to a fresh process and let
-the worker exit when its lifecycle flags say so.
+**Core rule:** the worker is platform-blind. A provider's only job is to
+deliver this bag to a fresh process.
 
 **Decision D-A:** workers hold **NO database credentials**. The metadata target
 is an ApiRefStore report URL plus a per-job token, never a direct DB URL or
