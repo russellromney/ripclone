@@ -199,6 +199,19 @@ pub trait QueueDb: Send + Sync {
     /// Count of `queued` jobs.
     async fn count_queued(&self) -> Result<i64>;
 
+    /// Count of `queued` jobs grouped by `size_class` rank.
+    ///
+    /// Returns `(rank, count)` pairs for ranks that have at least one pending
+    /// job, ordered by rank ascending.
+    ///
+    /// Blessed backends (sqlite/libsql) implement a real `GROUP BY size_class`.
+    /// Lagging backends (postgres/mysql) approximate: they do not persist the
+    /// enqueue rank reliably, so they report the entire pending depth under a
+    /// single sentinel rank of [`i64::MAX`]. [`SqlJobQueue::pending_by_class`]
+    /// clamps that to the largest configured class so the dispatcher never
+    /// under-sizes a worker on a lagging engine.
+    async fn count_queued_by_size_class(&self) -> Result<Vec<(i64, i64)>>;
+
     /// Delete `failed` jobs finished before `cutoff` (epoch secs). Returns the
     /// number removed. `done` jobs are intentionally kept (they are the build /
     /// version-live-at-time-T history and stay small at real commit rates).
@@ -530,6 +543,36 @@ impl SqlJobQueue {
             e
         })?;
         Ok(self.db.count_live_workers(cutoff).await? as usize)
+    }
+
+    /// Pending (`queued`) job counts by size-class rank.
+    ///
+    /// Returns `(rank, count)` for ranks with depth > 0, ordered by rank.
+    /// Ranks from the DB are clamped into the configured class range so a
+    /// lagging-backend sentinel (`i64::MAX`) becomes the largest class.
+    /// Used by the dispatcher autoscale loop to size workers to pending work.
+    pub async fn pending_by_class(&self) -> Result<Vec<(i64, usize)>> {
+        let last = (self.size_classes.len().saturating_sub(1)) as i64;
+        let rows = self.db.count_queued_by_size_class().await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for (rank, count) in rows {
+            if count <= 0 {
+                continue;
+            }
+            let rank = rank.clamp(0, last);
+            out.push((rank, count as usize));
+        }
+        // Merge rows that collapsed onto the same clamped rank (e.g. lagging
+        // sentinel + real ranks, or over-range escalation rungs).
+        out.sort_by_key(|(r, _)| *r);
+        let mut merged: Vec<(i64, usize)> = Vec::with_capacity(out.len());
+        for (rank, count) in out {
+            match merged.last_mut() {
+                Some((r, c)) if *r == rank => *c = c.saturating_add(count),
+                _ => merged.push((rank, count)),
+            }
+        }
+        Ok(merged)
     }
 
     /// Prune `failed` jobs older than the configured retention. Idempotent and
@@ -1974,6 +2017,34 @@ mod tests {
         assert_eq!(defaults[0].name, "small");
         assert_eq!(defaults[1].name, "large");
         assert_eq!(defaults[0].max_bytes, 1 << 30);
+    }
+
+    #[tokio::test]
+    async fn pending_by_class_groups_mixed_size_bytes() {
+        // Per-class pending read for the dispatcher autoscaler: mixed
+        // size_bytes → correct ranks, empty when nothing queued.
+        let (q, _dir) = queue_classes(two_classes(), None).await;
+        assert!(
+            q.pending_by_class().await.unwrap().is_empty(),
+            "empty queue → no pending classes"
+        );
+
+        // two_classes: small max_bytes=100, large = u64::MAX
+        q.enqueue(job_sized("o", "s1", "main", 50)).await.unwrap();
+        q.enqueue(job_sized("o", "s2", "main", 10)).await.unwrap();
+        q.enqueue(job_sized("o", "big", "main", 10_000))
+            .await
+            .unwrap();
+        // Unknown size → largest class (rank 1).
+        q.enqueue(job("o", "unknown", "main")).await.unwrap();
+
+        let pending = q.pending_by_class().await.unwrap();
+        assert_eq!(
+            pending,
+            vec![(0, 2), (1, 2)],
+            "two small (rank 0) + one large + one unknown→large (rank 1)"
+        );
+        assert_eq!(q.depth().await, 4, "total depth still sums all classes");
     }
 
     #[tokio::test]

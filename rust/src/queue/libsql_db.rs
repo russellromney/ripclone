@@ -338,6 +338,29 @@ impl QueueDb for LibsqlDb {
         }
     }
 
+    async fn count_queued_by_size_class(&self) -> Result<Vec<(i64, i64)>> {
+        let conn = self.conn().await?;
+        let mut rows = conn
+            .query(
+                "SELECT size_class, count(*) FROM jobs
+                 WHERE status = 'queued'
+                 GROUP BY size_class
+                 ORDER BY size_class",
+                (),
+            )
+            .await
+            .context("count queued by size_class")?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let rank = row.get::<i64>(0)?;
+            let count = row.get::<i64>(1)?;
+            if count > 0 {
+                out.push((rank, count));
+            }
+        }
+        Ok(out)
+    }
+
     async fn prune_failed(&self, cutoff: i64) -> Result<u64> {
         self.conn()
             .await?

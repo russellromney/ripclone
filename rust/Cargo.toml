@@ -34,6 +34,10 @@ path = "src/bin/writer_bench.rs"
 name = "ripclone-worker"
 path = "src/bin/ripclone-worker.rs"
 
+[[bin]]
+name = "ripclone-dispatcher"
+path = "src/bin/ripclone-dispatcher.rs"
+
 [features]
 default = ["zlib-ng"]
 # Use zlib-ng for faster pack compression/decompression. Disable this feature

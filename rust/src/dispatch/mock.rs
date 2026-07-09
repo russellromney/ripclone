@@ -1,19 +1,28 @@
 //! In-memory [`ComputeProvider`] for tests. Records every `ensure_worker` call.
 
 use super::{ComputeProvider, WorkerSpec};
-use anyhow::Result;
+use anyhow::{Result, bail};
 use async_trait::async_trait;
 use std::sync::Mutex;
 
 /// Records calls; never talks to a real platform.
+///
+/// Optional fail-N mode: the next N `ensure_worker` calls return `Err` after
+/// recording (or not) so autoscale backoff tests stay deterministic.
 pub struct MockProvider {
     calls: Mutex<Vec<WorkerSpec>>,
+    /// Remaining forced failures. Each failed call decrements by one.
+    fail_remaining: Mutex<u32>,
+    /// When true, failed calls are still appended to `calls` (observability).
+    record_failures: Mutex<bool>,
 }
 
 impl MockProvider {
     pub fn new() -> Self {
         Self {
             calls: Mutex::new(Vec::new()),
+            fail_remaining: Mutex::new(0),
+            record_failures: Mutex::new(true),
         }
     }
 
@@ -22,9 +31,19 @@ impl MockProvider {
         self.calls.lock().expect("mock calls lock").clone()
     }
 
-    /// Drop recorded history.
+    /// Drop recorded history (does not clear fail-N state).
     pub fn reset(&self) {
         self.calls.lock().expect("mock calls lock").clear();
+    }
+
+    /// Force the next `n` `ensure_worker` calls to return `Err`.
+    pub fn fail_next(&self, n: u32) {
+        *self.fail_remaining.lock().expect("mock fail lock") = n;
+    }
+
+    /// Whether failed calls are still appended to [`Self::calls`] (default true).
+    pub fn set_record_failures(&self, record: bool) {
+        *self.record_failures.lock().expect("mock record lock") = record;
     }
 }
 
@@ -42,12 +61,31 @@ impl ComputeProvider for MockProvider {
 
     async fn ensure_worker(&self, spec: &WorkerSpec) -> Result<()> {
         spec.validate()?;
-        // Snapshot isolation: clone so later mutation of the caller's env does
-        // not rewrite history.
-        self.calls
-            .lock()
-            .expect("mock calls lock")
-            .push(spec.clone());
+        let should_fail = {
+            let mut n = self.fail_remaining.lock().expect("mock fail lock");
+            if *n > 0 {
+                *n -= 1;
+                true
+            } else {
+                false
+            }
+        };
+        let record = if should_fail {
+            *self.record_failures.lock().expect("mock record lock")
+        } else {
+            true
+        };
+        if record {
+            // Snapshot isolation: clone so later mutation of the caller's env does
+            // not rewrite history.
+            self.calls
+                .lock()
+                .expect("mock calls lock")
+                .push(spec.clone());
+        }
+        if should_fail {
+            bail!("MockProvider: forced ensure_worker failure");
+        }
         Ok(())
     }
 }

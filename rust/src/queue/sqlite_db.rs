@@ -354,6 +354,27 @@ impl QueueDb for SqliteDb {
             .context("count queued")
     }
 
+    async fn count_queued_by_size_class(&self) -> Result<Vec<(i64, i64)>> {
+        let rows = sqlx::query(
+            "SELECT size_class, count(*) FROM jobs
+             WHERE status = 'queued'
+             GROUP BY size_class
+             ORDER BY size_class",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("count queued by size_class")?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let rank: i64 = row.try_get(0)?;
+            let count: i64 = row.try_get(1)?;
+            if count > 0 {
+                out.push((rank, count));
+            }
+        }
+        Ok(out)
+    }
+
     async fn prune_failed(&self, cutoff: i64) -> Result<u64> {
         let res = sqlx::query("DELETE FROM jobs WHERE status = 'failed' AND finished_at < ?")
             .bind(cutoff)

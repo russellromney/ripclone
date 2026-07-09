@@ -23,12 +23,17 @@
 //!
 //! Nothing outside this module knows the platform.
 
+pub mod autoscale;
 pub mod exec;
 pub mod fly;
 pub mod http;
 pub mod mock;
 pub mod select;
 
+pub use autoscale::{
+    AutoscaleConfig, BackoffState, ReconcileOutcome, ReconcilePlan, WORKER_ENV_KEYS,
+    collect_worker_env, plan_reconcile, reconcile_once, run_loop,
+};
 pub use exec::{ExecProvider, ExecProviderConfig};
 pub use fly::{
     FlyMachine, FlyMachinesClient, FlyProvider, FlyProviderConfig, HttpFlyMachinesClient,
