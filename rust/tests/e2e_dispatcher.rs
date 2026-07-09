@@ -18,10 +18,11 @@ mod common;
 
 use common::*;
 use ripclone::backends;
-use ripclone::dispatch::autoscale::{
-    BackoffState, ReconcileInputs, collect_worker_env, reconcile_once,
+use ripclone::dispatch::autoscale::ReconcileInputs;
+use ripclone::dispatch::{
+    BackoffState, ComputeProvider, ExecProvider, ExecProviderConfig, WorkerSpec,
+    collect_worker_env, reconcile_once,
 };
-use ripclone::dispatch::{ComputeProvider, ExecProvider, ExecProviderConfig, WorkerSpec};
 use ripclone::provider::RepoId;
 use ripclone::queue::{BuildJob, JobQueue, JobState, SqlJobQueue};
 use std::collections::BTreeMap;
@@ -36,6 +37,8 @@ static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 const LARGE_BYTES: u64 = (1 << 30) + 1;
 /// Well under 1 GiB → small.
 const SMALL_BYTES: u64 = 100;
+/// Rank of `large` under launch defaults (small=0, large=1).
+const LARGE_RANK: i64 = 1;
 
 fn setup_sqlite_queue() -> tempfile::TempDir {
     let qdir = tempfile::tempdir().expect("queue dir");
@@ -70,27 +73,36 @@ async fn enqueue_sized(queue: &SqlJobQueue, path: &str, size_bytes: Option<u64>)
     enq.job_id.expect("job id")
 }
 
-async fn wait_done(queue: &SqlJobQueue, id: i64, timeout: Duration) {
-    let deadline = Instant::now() + timeout;
-    loop {
-        match queue.job_status(id).await.expect("status") {
-            JobState::Done => return,
-            JobState::Failed(e) => panic!("job {id} failed: {e}"),
-            JobState::Pending | JobState::Unknown => {
-                assert!(
-                    Instant::now() < deadline,
-                    "job {id} did not finish within {timeout:?}"
-                );
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        }
-    }
-}
-
 async fn assert_still_pending(queue: &SqlJobQueue, id: i64) {
     match queue.job_status(id).await.expect("status") {
         JobState::Pending => {}
         other => panic!("expected job {id} still pending, got {other:?}"),
+    }
+}
+
+/// Wait until the workers registry shows a live small-only worker (heartbeat).
+///
+/// Without this, a size-class negative can pass for the wrong reason: no worker
+/// ever started, so the large job stays queued, then a later large reconcile
+/// drains it. The claim-filter proof requires a live small-capped process.
+async fn wait_small_only_live(queue: &SqlJobQueue, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let live = queue.live_worker_count().await.expect("live count");
+        let capable_large = queue
+            .live_worker_count_capable(LARGE_RANK)
+            .await
+            .expect("capable count");
+        if live >= 1 && capable_large == 0 {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for a small-only live worker \
+             (live={live}, large_capable={capable_large}); \
+             worker may have failed to start or heartbeat"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -136,11 +148,21 @@ exec "{worker}" --cas-dir "{cas}" --repo-root "{repos}" --idle-poll-ms 100
 /// `collect_worker_env` + lifecycle flags look like for a self-host exec deploy).
 fn local_worker_env() -> BTreeMap<String, String> {
     let mut env = collect_worker_env();
+    assert!(
+        env.contains_key("RIPCLONE_QUEUE"),
+        "worker_env must forward RIPCLONE_QUEUE from dispatcher process"
+    );
+    assert!(
+        env.contains_key("RIPCLONE_QUEUE_DB_URL"),
+        "worker_env must forward RIPCLONE_QUEUE_DB_URL from dispatcher process"
+    );
     // Drain cleanly so the test does not leave forever-workers around.
     env.insert("RIPCLONE_IDLE_EXIT_SECS".into(), "2".into());
-    // Live registry so multi-pass reconcile sees started workers (optional for
-    // drain correctness, but matches production autoscale).
+    // Live registry so multi-pass reconcile (and size-class proofs) see started workers.
     env.insert("RIPCLONE_WORKER_HEARTBEAT".into(), "queue".into());
+    // First heartbeat is immediate; short interval keeps the registry fresh in tests.
+    env.insert("RIPCLONE_WORKER_HEARTBEAT_INTERVAL_SECS".into(), "1".into());
+    env.insert("RIPCLONE_WORKER_HEARTBEAT_TIMEOUT_SECS".into(), "30".into());
     env
 }
 
@@ -160,8 +182,8 @@ async fn reconcile_until_done(
     max_workers: usize,
     job_ids: &[i64],
     timeout: Duration,
+    backoff: &mut BackoffState,
 ) {
-    let mut backoff = BackoffState::new();
     let deadline = Instant::now() + timeout;
     loop {
         let mut all_done = true;
@@ -186,13 +208,13 @@ async fn reconcile_until_done(
             provider,
             max_workers,
             worker_env,
-            backoff: &mut backoff,
+            backoff,
             now,
         })
         .await
         .expect("reconcile_once");
 
-        // Respect backoff so a transient provider blip is not hammered.
+        // Respect real wall-clock backoff (do not clear it in the test harness).
         if out.skipped_backoff || out.failed > 0 {
             let wait = backoff.remaining(Instant::now()).max(Duration::from_millis(200));
             tokio::time::sleep(wait).await;
@@ -235,7 +257,7 @@ async fn dispatcher_reconcile_drains_real_workers() {
     let id_c = enqueue_sized(&queue, "acme/disp-c", Some(SMALL_BYTES)).await;
     assert_eq!(queue.depth().await, 3, "three jobs queued before reconcile");
 
-    // One reconcile pass should plan to_start > 0 against a real provider.
+    // One reconcile pass should plan desired=3 and spawn that many workers.
     let mut backoff = BackoffState::new();
     let first = reconcile_once(ReconcileInputs {
         queue: &queue,
@@ -247,15 +269,19 @@ async fn dispatcher_reconcile_drains_real_workers() {
     })
     .await
     .expect("first reconcile");
-    assert!(
-        first.plan.to_start >= 1,
-        "pending work must plan starts: {first:?}"
-    );
-    assert!(
-        first.started >= 1,
-        "ExecProvider must successfully spawn at least one worker: {first:?}"
+    assert_eq!(first.plan.total_pending, 3, "plan sees all pending: {first:?}");
+    assert_eq!(first.plan.desired, 3, "desired tracks pending: {first:?}");
+    assert_eq!(first.plan.to_start, 3, "no live workers yet → start 3: {first:?}");
+    assert_eq!(
+        first.started, 3,
+        "ExecProvider must spawn all planned workers: {first:?}"
     );
     assert_eq!(first.failed, 0, "first ensure_worker batch must not fail: {first:?}");
+    assert!(
+        first.plan.size_classes.iter().all(|s| s == "small"),
+        "small pending must start small-class slots: {:?}",
+        first.plan.size_classes
+    );
 
     reconcile_until_done(
         &queue,
@@ -264,12 +290,16 @@ async fn dispatcher_reconcile_drains_real_workers() {
         10,
         &[id_a, id_b, id_c],
         Duration::from_secs(120),
+        &mut backoff,
     )
     .await;
 
     assert_eq!(queue.depth().await, 0, "queue empty after dispatcher drain");
     for id in [id_a, id_b, id_c] {
-        wait_done(&queue, id, Duration::from_secs(1)).await;
+        match queue.job_status(id).await.expect("status") {
+            JobState::Done => {}
+            other => panic!("job {id} expected Done, got {other:?}"),
+        }
     }
 }
 
@@ -278,7 +308,7 @@ async fn dispatcher_reconcile_drains_real_workers() {
 // ---------------------------------------------------------------------------
 
 /// Provider outage: `ensure_worker` fails, jobs stay queued (not Failed), backoff
-/// blocks starts. Swap to a working provider and the queue drains.
+/// blocks starts. Wait out real backoff, swap to a working provider, drain.
 #[tokio::test]
 async fn dispatcher_provider_down_no_job_loss_then_recovers() {
     let _guard = SERIAL.lock().await;
@@ -326,14 +356,33 @@ async fn dispatcher_provider_down_no_job_loss_then_recovers() {
 
     assert_eq!(out.failed, 1, "ensure_worker must report failure: {out:?}");
     assert_eq!(out.started, 0, "no workers started while provider is down");
-    assert!(
-        backoff.consecutive_failures() >= 1,
+    assert_eq!(
+        backoff.consecutive_failures(),
+        1,
         "backoff must record the failure"
     );
     assert!(
         backoff.is_blocked(now),
         "backoff must block further starts immediately after failure"
     );
+
+    // While blocked, a second reconcile must skip starts (not hammer the provider).
+    let out_blocked = reconcile_once(ReconcileInputs {
+        queue: &queue,
+        provider: &bad,
+        max_workers: 10,
+        worker_env: &worker_env,
+        backoff: &mut backoff,
+        now: Instant::now(),
+    })
+    .await
+    .expect("blocked reconcile");
+    assert!(
+        out_blocked.skipped_backoff,
+        "second pass during backoff must skip starts: {out_blocked:?}"
+    );
+    assert_eq!(out_blocked.started, 0);
+    assert_eq!(out_blocked.failed, 0);
 
     // Jobs are NOT lost and NOT marked failed.
     assert_eq!(
@@ -350,9 +399,16 @@ async fn dispatcher_provider_down_no_job_loss_then_recovers() {
         }
     }
 
-    // Recovery: working ExecProvider + backoff cleared (or wall-clock past block).
+    // Recovery: wait out the real backoff window (no artificial on_success clear),
+    // then swap to a working ExecProvider and drain.
+    let wait = backoff.remaining(Instant::now()) + Duration::from_millis(50);
+    tokio::time::sleep(wait).await;
+    assert!(
+        !backoff.is_blocked(Instant::now()),
+        "backoff window must have expired before recovery reconcile"
+    );
+
     let good = exec_provider(good_wrapper);
-    backoff.on_success(); // operator recovery / next healthy window
     reconcile_until_done(
         &queue,
         &good,
@@ -360,6 +416,7 @@ async fn dispatcher_provider_down_no_job_loss_then_recovers() {
         10,
         &[id_a, id_b],
         Duration::from_secs(120),
+        &mut backoff,
     )
     .await;
     assert_eq!(queue.depth().await, 0, "queue drains after provider recovery");
@@ -370,7 +427,9 @@ async fn dispatcher_provider_down_no_job_loss_then_recovers() {
 // ---------------------------------------------------------------------------
 
 /// A large job must not be claimed by a small-capped worker; it stays queued
-/// until a large-capable worker is started (via reconcile / ensure_worker).
+/// until reconcile starts a large-capable worker *while the small worker is still
+/// live* (livelock would set to_start=0 until the small idle-exits — that is not
+/// an acceptable proof).
 #[tokio::test]
 async fn dispatcher_size_class_large_not_claimed_by_small() {
     let _guard = SERIAL.lock().await;
@@ -391,20 +450,47 @@ async fn dispatcher_size_class_large_not_claimed_by_small() {
     let id = enqueue_sized(&queue, "acme/disp-huge", Some(LARGE_BYTES)).await;
     assert_eq!(queue.depth().await, 1);
 
-    // Start only a SMALL-capped worker (env ceiling). This is the mis-sized /
-    // leftover-pool case: a small machine is live while large work waits.
-    // reconcile would correctly plan large — we force small here on purpose.
+    // Confirm classification: one large pending rank.
+    let pending = queue.pending_by_class().await.expect("pending_by_class");
+    assert_eq!(
+        pending,
+        vec![(LARGE_RANK, 1)],
+        "large size_bytes must classify as rank {LARGE_RANK}: {pending:?}"
+    );
+
+    // Start only a SMALL-capped worker (env ceiling). reconcile would correctly
+    // plan large for this queue — we force small here on purpose (leftover pool /
+    // mis-sized machine still live while large work waits).
     let mut small_env = base_env.clone();
     small_env.insert("RIPCLONE_MAX_SIZE_CLASS".into(), "small".into());
-    // Stay up long enough for the "does not claim" window; still idle-exit later.
-    small_env.insert("RIPCLONE_IDLE_EXIT_SECS".into(), "15".into());
+    // Stay up through the refusal window + large-start assertion (must outlive
+    // that path so we cannot "prove" drain only after small idle-exits).
+    small_env.insert("RIPCLONE_IDLE_EXIT_SECS".into(), "60".into());
 
     provider
         .ensure_worker(&WorkerSpec::new("small", small_env))
         .await
         .expect("spawn small-capped worker");
 
-    // Window where a wrongly-claiming small worker would flip the job to Done.
+    // Proof the small worker is actually up and registered as not large-capable.
+    // Without this, "still pending" is also true when no worker started at all.
+    wait_small_only_live(&queue, Duration::from_secs(30)).await;
+    assert_eq!(
+        queue.live_worker_count().await.expect("live"),
+        1,
+        "exactly one small worker should be live"
+    );
+    assert_eq!(
+        queue
+            .live_worker_count_capable(LARGE_RANK)
+            .await
+            .expect("capable"),
+        0,
+        "small-only worker must not count as large-capable"
+    );
+
+    // Window where a wrongly-claiming small worker would flip the job (depth
+    // drops on claim even while status is still Pending).
     let window = Duration::from_secs(5);
     let start = Instant::now();
     while start.elapsed() < window {
@@ -412,14 +498,55 @@ async fn dispatcher_size_class_large_not_claimed_by_small() {
         assert_eq!(
             queue.depth().await,
             1,
-            "large job must remain queued under a small-only worker"
+            "large job must remain queued (not claimed) under a small-only worker"
+        );
+        // Small must still be live for the whole refusal window.
+        assert!(
+            queue.live_worker_count().await.expect("live") >= 1,
+            "small worker died during refusal window — proof is void"
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     assert_still_pending(&queue, id).await;
 
-    // Large-capable path: reconcile plans large (max pending rank) and starts
-    // workers with RIPCLONE_MAX_SIZE_CLASS=large → drain.
+    // Large-capable path via reconcile *while small is still live*:
+    // capability-filtered live must be 0 → to_start=1 with size_class=large.
+    // (Raw live_count=1 would livelock: desired=1, live=1, to_start=0.)
+    let mut backoff = BackoffState::new();
+    let large_start = reconcile_once(ReconcileInputs {
+        queue: &queue,
+        provider: &provider,
+        max_workers: 10,
+        worker_env: &base_env,
+        backoff: &mut backoff,
+        now: Instant::now(),
+    })
+    .await
+    .expect("large reconcile");
+    assert_eq!(
+        large_start.plan.live_workers, 0,
+        "plan must use capable live (0), not raw fleet size: {large_start:?}"
+    );
+    assert_eq!(
+        large_start.plan.to_start, 1,
+        "must start a large worker while small is still live (livelock if 0): {large_start:?}"
+    );
+    assert_eq!(
+        large_start.started, 1,
+        "large ensure_worker must succeed: {large_start:?}"
+    );
+    assert_eq!(
+        large_start.plan.size_classes,
+        vec!["large".to_string()],
+        "max pending rank must select large: {large_start:?}"
+    );
+    // Small still live at the moment we started large — otherwise livelock
+    // "fixed itself" by idle-exit and the assertion above is weak.
+    assert!(
+        queue.live_worker_count().await.expect("live") >= 1,
+        "small worker must still be live when large was started"
+    );
+
     reconcile_until_done(
         &queue,
         &provider,
@@ -427,7 +554,12 @@ async fn dispatcher_size_class_large_not_claimed_by_small() {
         10,
         &[id],
         Duration::from_secs(120),
+        &mut backoff,
     )
     .await;
     assert_eq!(queue.depth().await, 0, "large job drains on large-capable worker");
+    match queue.job_status(id).await.expect("status") {
+        JobState::Done => {}
+        other => panic!("large job expected Done, got {other:?}"),
+    }
 }
