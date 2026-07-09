@@ -20,6 +20,7 @@ pub mod libsql_db;
 pub mod local;
 pub mod mysql_db;
 pub mod postgres_db;
+pub mod size_class;
 pub mod sql;
 pub mod sqlite_db;
 
@@ -27,6 +28,9 @@ pub use libsql_db::LibsqlDb;
 pub use local::LocalJobQueue;
 pub use mysql_db::MysqlDb;
 pub use postgres_db::PostgresDb;
+pub use size_class::{
+    SizeClass, classify_rank, default_size_classes, load_size_classes, prior_clonepack_bytes,
+};
 pub use sql::SqlJobQueue;
 pub use sqlite_db::SqliteDb;
 
@@ -52,6 +56,12 @@ pub struct BuildJob {
     /// bounded by the real push rate (each re-trigger builds a genuinely newer tip,
     /// not a spin) and spread across the worker pool, with the poller as backstop.
     pub recheck: u32,
+    /// Byte size used to classify into a [`size_class`](size_class) rank at
+    /// enqueue on the SQL queue. First build → repo size from the tiered-add
+    /// preflight; re-sync → prior clonepack byte total. `None` maps to the
+    /// largest configured class so a first build is never under-sized.
+    /// The in-process queue ignores this (single-worker, no claim filter).
+    pub size_bytes: Option<u64>,
 }
 
 /// Error returned by a build worker.

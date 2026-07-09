@@ -3,9 +3,9 @@
 //! atomic conditional claim). For multi-machine use the remote `libsql` backend.
 
 use super::sql::{
-    ADD_ATTEMPTS_COLUMN_SQL, ADD_CREDENTIAL_COLUMN_SQL, CREATE_ACTIVE_KEY_INDEX_SQL,
-    CREATE_HISTORY_INDEX_SQL, CREATE_STATUS_INDEX_SQL, CREATE_TABLE_SQL,
-    DROP_LEGACY_ACTIVE_KEY_INDEX_SQL, QueueDb,
+    ADD_ATTEMPTS_COLUMN_SQL, ADD_CREDENTIAL_COLUMN_SQL, ADD_SIZE_CLASS_COLUMN_SQL,
+    CREATE_ACTIVE_KEY_INDEX_SQL, CREATE_HISTORY_INDEX_SQL, CREATE_STATUS_INDEX_SQL,
+    CREATE_TABLE_SQL, DROP_LEGACY_ACTIVE_KEY_INDEX_SQL, QueueDb,
 };
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -54,6 +54,10 @@ impl QueueDb for SqliteDb {
         let _ = sqlx::raw_sql(ADD_ATTEMPTS_COLUMN_SQL)
             .execute(&self.pool)
             .await;
+        // size_class rank for the claim filter (right-sizing).
+        let _ = sqlx::raw_sql(ADD_SIZE_CLASS_COLUMN_SQL)
+            .execute(&self.pool)
+            .await;
         sqlx::raw_sql(CREATE_STATUS_INDEX_SQL)
             .execute(&self.pool)
             .await
@@ -89,17 +93,19 @@ impl QueueDb for SqliteDb {
         path: &str,
         branch: &str,
         credential: Option<&str>,
+        size_class: i64,
         created_at: i64,
     ) -> Result<i64> {
         let res = sqlx::query(
-            "INSERT INTO jobs (key, provider, path, branch, status, credential, created_at)
-             VALUES (?, ?, ?, ?, 'queued', ?, ?)",
+            "INSERT INTO jobs (key, provider, path, branch, status, credential, size_class, created_at)
+             VALUES (?, ?, ?, ?, 'queued', ?, ?, ?)",
         )
         .bind(key)
         .bind(provider)
         .bind(path)
         .bind(branch)
         .bind(credential)
+        .bind(size_class)
         .bind(created_at)
         .execute(&self.pool)
         .await
@@ -140,13 +146,23 @@ impl QueueDb for SqliteDb {
         Ok(())
     }
 
-    async fn next_queued_id(&self) -> Result<Option<i64>> {
-        sqlx::query_scalar(
-            "SELECT id FROM jobs WHERE status = 'queued' ORDER BY created_at, id LIMIT 1",
-        )
-        .fetch_optional(&self.pool)
-        .await
-        .context("select next queued")
+    async fn next_queued_id(&self, max_size_class: Option<i64>) -> Result<Option<i64>> {
+        match max_size_class {
+            None => sqlx::query_scalar(
+                "SELECT id FROM jobs WHERE status = 'queued' ORDER BY created_at, id LIMIT 1",
+            )
+            .fetch_optional(&self.pool)
+            .await
+            .context("select next queued"),
+            Some(ceiling) => sqlx::query_scalar(
+                "SELECT id FROM jobs WHERE status = 'queued' AND size_class <= ?
+                 ORDER BY created_at, id LIMIT 1",
+            )
+            .bind(ceiling)
+            .fetch_optional(&self.pool)
+            .await
+            .context("select next queued under size-class ceiling"),
+        }
     }
 
     async fn try_claim(&self, id: i64, worker_id: &str, now: i64) -> Result<bool> {

@@ -4,9 +4,9 @@
 //! it doesn't bundle SQLite's C core and collide with sqlx.)
 
 use super::sql::{
-    ADD_ATTEMPTS_COLUMN_SQL, ADD_CREDENTIAL_COLUMN_SQL, CREATE_ACTIVE_KEY_INDEX_SQL,
-    CREATE_HISTORY_INDEX_SQL, CREATE_STATUS_INDEX_SQL, CREATE_TABLE_SQL,
-    DROP_LEGACY_ACTIVE_KEY_INDEX_SQL, QueueDb,
+    ADD_ATTEMPTS_COLUMN_SQL, ADD_CREDENTIAL_COLUMN_SQL, ADD_SIZE_CLASS_COLUMN_SQL,
+    CREATE_ACTIVE_KEY_INDEX_SQL, CREATE_HISTORY_INDEX_SQL, CREATE_STATUS_INDEX_SQL,
+    CREATE_TABLE_SQL, DROP_LEGACY_ACTIVE_KEY_INDEX_SQL, QueueDb,
 };
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -49,6 +49,8 @@ impl QueueDb for LibsqlDb {
         let _ = conn.execute(ADD_CREDENTIAL_COLUMN_SQL, ()).await;
         // Same best-effort migration for the attempts column (dead-letter bound).
         let _ = conn.execute(ADD_ATTEMPTS_COLUMN_SQL, ()).await;
+        // size_class rank for the claim filter (right-sizing).
+        let _ = conn.execute(ADD_SIZE_CLASS_COLUMN_SQL, ()).await;
         conn.execute(CREATE_STATUS_INDEX_SQL, ())
             .await
             .context("create status index")?;
@@ -86,6 +88,7 @@ impl QueueDb for LibsqlDb {
         path: &str,
         branch: &str,
         credential: Option<&str>,
+        size_class: i64,
         created_at: i64,
     ) -> Result<i64> {
         let conn = self.conn().await?;
@@ -94,9 +97,9 @@ impl QueueDb for LibsqlDb {
             None => libsql::Value::Null,
         };
         conn.execute(
-            "INSERT INTO jobs (key, provider, path, branch, status, credential, created_at)
-             VALUES (?, ?, ?, ?, 'queued', ?, ?)",
-            libsql::params![key, provider, path, branch, cred_val, created_at],
+            "INSERT INTO jobs (key, provider, path, branch, status, credential, size_class, created_at)
+             VALUES (?, ?, ?, ?, 'queued', ?, ?, ?)",
+            libsql::params![key, provider, path, branch, cred_val, size_class, created_at],
         )
         .await
         .context("insert job")?;
@@ -130,15 +133,26 @@ impl QueueDb for LibsqlDb {
         Ok(())
     }
 
-    async fn next_queued_id(&self) -> Result<Option<i64>> {
+    async fn next_queued_id(&self, max_size_class: Option<i64>) -> Result<Option<i64>> {
         let conn = self.conn().await?;
-        let mut rows = conn
-            .query(
-                "SELECT id FROM jobs WHERE status = 'queued' ORDER BY created_at, id LIMIT 1",
-                (),
-            )
-            .await
-            .context("select next queued")?;
+        let mut rows = match max_size_class {
+            None => {
+                conn.query(
+                    "SELECT id FROM jobs WHERE status = 'queued' ORDER BY created_at, id LIMIT 1",
+                    (),
+                )
+                .await
+                .context("select next queued")?
+            }
+            Some(ceiling) => conn
+                .query(
+                    "SELECT id FROM jobs WHERE status = 'queued' AND size_class <= ?
+                     ORDER BY created_at, id LIMIT 1",
+                    libsql::params![ceiling],
+                )
+                .await
+                .context("select next queued under size-class ceiling")?,
+        };
         match rows.next().await? {
             Some(row) => Ok(Some(row.get::<i64>(0)?)),
             None => Ok(None),

@@ -22,6 +22,9 @@
 //!   backstop. A rare duplicate job is wasted compute, not a wrong result — the
 //!   poller watches its own job id and builds are idempotent into the CAS.
 
+use super::size_class::{SizeClass, classify_rank, load_size_classes, rank_ceiling};
+#[cfg(test)]
+use super::size_class::default_size_classes;
 use super::{BuildError, BuildJob, EnqueueOutcome, Enqueued, JobId, JobQueue, JobState};
 use crate::provider::{ProviderInstanceId, RepoId};
 use anyhow::Result;
@@ -111,6 +114,8 @@ pub trait QueueDb: Send + Sync {
 
     /// Insert a new queued job and return its id. Errors if a unique constraint
     /// rejects a duplicate active key (the caller treats that as coalesced).
+    /// `size_class` is the 0-based rank from the ordered size-class config
+    /// (blessed backends persist it; lagging backends may ignore it).
     async fn insert_job(
         &self,
         key: &str,
@@ -118,6 +123,7 @@ pub trait QueueDb: Send + Sync {
         path: &str,
         branch: &str,
         credential: Option<&str>,
+        size_class: i64,
         created_at: i64,
     ) -> Result<i64>;
 
@@ -134,8 +140,11 @@ pub trait QueueDb: Send + Sync {
         dead_letter_error: &str,
     ) -> Result<()>;
 
-    /// Id of the oldest queued job, if any.
-    async fn next_queued_id(&self) -> Result<Option<i64>>;
+    /// Id of the oldest queued job eligible for this worker. When
+    /// `max_size_class` is `Some(rank)`, only jobs with `size_class <= rank`
+    /// are considered (claim filter). `None` means no ceiling — claim anything.
+    /// Lagging backends that do not store `size_class` ignore the filter.
+    async fn next_queued_id(&self, max_size_class: Option<i64>) -> Result<Option<i64>>;
 
     /// Atomically claim `id` if it is still `queued`, incrementing its
     /// `attempts` counter. Returns true iff this call won the row.
@@ -190,11 +199,27 @@ pub struct SqlJobQueue {
     stale_claim_secs: i64,
     failed_retention_secs: i64,
     max_build_attempts: i64,
+    /// Ordered size classes from config. Classification + claim filter use ranks.
+    size_classes: Vec<SizeClass>,
+    /// Inclusive rank ceiling for this process (`--max-size-class`). `None` =
+    /// no ceiling, claim everything (single-worker self-host unchanged).
+    max_size_class: Option<i64>,
 }
 
 impl SqlJobQueue {
-    /// Wrap an engine adapter and run schema setup.
+    /// Wrap an engine adapter and run schema setup. Size classes load from
+    /// config / `RIPCLONE_SIZE_CLASSES` / launch defaults. No claim ceiling
+    /// (worker calls [`with_max_size_class`] to set one).
     pub async fn new(db: Box<dyn QueueDb>) -> Result<Self> {
+        Self::new_with_classes(db, load_size_classes(&[])?).await
+    }
+
+    /// Like [`new`] but with an explicit size-class list (tests, custom wiring).
+    pub async fn new_with_classes(
+        db: Box<dyn QueueDb>,
+        size_classes: Vec<SizeClass>,
+    ) -> Result<Self> {
+        super::size_class::validate_size_classes(&size_classes)?;
         db.init().await?;
         let stale_claim_secs = std::env::var("RIPCLONE_QUEUE_STALE_SECS")
             .ok()
@@ -214,7 +239,24 @@ impl SqlJobQueue {
             stale_claim_secs,
             failed_retention_secs,
             max_build_attempts,
+            size_classes,
+            max_size_class: None,
         })
+    }
+
+    /// Set this worker's claim ceiling by class name. `None` clears the ceiling
+    /// (claim everything). Unknown names fail loudly.
+    pub fn with_max_size_class(mut self, name: Option<&str>) -> Result<Self> {
+        self.max_size_class = match name {
+            None => None,
+            Some(n) => Some(rank_ceiling(n, &self.size_classes)?),
+        };
+        Ok(self)
+    }
+
+    /// Configured size classes (ordered, smallest first).
+    pub fn size_classes(&self) -> &[SizeClass] {
+        &self.size_classes
     }
 
     /// Prune `failed` jobs older than the configured retention. Idempotent and
@@ -226,8 +268,10 @@ impl SqlJobQueue {
     }
 
     /// Claim the oldest queued job for this worker, reclaiming abandoned claims
-    /// first. Returns `None` when the queue is empty (or contention exhausted
-    /// the retry budget — the caller polls again).
+    /// first. Respects `--max-size-class` when set: only jobs at or below the
+    /// ceiling are claimed. Returns `None` when the queue is empty (or no
+    /// eligible job under the ceiling / contention exhausted the retry budget —
+    /// the caller polls again).
     pub async fn claim(&self, worker_id: &str) -> Result<Option<ClaimedJob>> {
         let now = now_secs();
         self.db
@@ -242,7 +286,7 @@ impl SqlJobQueue {
             )
             .await?;
         for attempt in 0..MAX_CLAIM_ATTEMPTS {
-            let Some(id) = self.db.next_queued_id().await? else {
+            let Some(id) = self.db.next_queued_id(self.max_size_class).await? else {
                 return Ok(None);
             };
             if self.db.try_claim(id, worker_id, now_secs()).await? {
@@ -332,6 +376,7 @@ impl JobQueue for SqlJobQueue {
             });
         }
         let credential = encode_credential(job.credential.as_ref());
+        let size_class = classify_rank(job.size_bytes, &self.size_classes);
         match self
             .db
             .insert_job(
@@ -340,6 +385,7 @@ impl JobQueue for SqlJobQueue {
                 &job.repo_id.path,
                 &job.branch,
                 credential.as_deref(),
+                size_class,
                 now_secs(),
             )
             .await
@@ -387,7 +433,7 @@ impl JobQueue for SqlJobQueue {
     }
 }
 
-/// Shared DDL for both engines.
+/// Shared DDL for both engines (blessed: sqlite + libsql).
 pub(crate) const CREATE_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS jobs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     key TEXT NOT NULL,
@@ -401,7 +447,8 @@ pub(crate) const CREATE_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS jobs (
     finished_at INTEGER,
     error TEXT,
     credential TEXT,
-    attempts INTEGER NOT NULL DEFAULT 0
+    attempts INTEGER NOT NULL DEFAULT 0,
+    size_class INTEGER NOT NULL DEFAULT 0
 )";
 
 pub(crate) const CREATE_STATUS_INDEX_SQL: &str =
@@ -439,6 +486,12 @@ pub(crate) const ADD_CREDENTIAL_COLUMN_SQL: &str = "ALTER TABLE jobs ADD COLUMN 
 pub(crate) const ADD_ATTEMPTS_COLUMN_SQL: &str =
     "ALTER TABLE jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0";
 
+/// Migration for a `jobs` table created before the `size_class` column existed.
+/// Blessed backends only (sqlite/libsql). Best-effort like the other ALTERs.
+/// Default 0 = smallest class so legacy rows stay claimable by every worker.
+pub(crate) const ADD_SIZE_CLASS_COLUMN_SQL: &str =
+    "ALTER TABLE jobs ADD COLUMN size_class INTEGER NOT NULL DEFAULT 0";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -453,7 +506,14 @@ mod tests {
             rev: None,
             credential: None,
             recheck: 0,
+            size_bytes: None,
         }
+    }
+
+    fn job_sized(owner: &str, repo: &str, branch: &str, size_bytes: u64) -> BuildJob {
+        let mut j = job(owner, repo, branch);
+        j.size_bytes = Some(size_bytes);
+        j
     }
 
     /// Build a fresh queue on each supported local engine, backed by a temp file
@@ -550,7 +610,7 @@ mod tests {
             .unwrap();
         db.init().await.unwrap();
         let id = db
-            .insert_job("k", "github", "o/r", "main", Some("dG9rZW4="), 1)
+            .insert_job("k", "github", "o/r", "main", Some("dG9rZW4="), 0, 1)
             .await
             .unwrap();
         let (_, _, _, before) = db.job_fields(id).await.unwrap().unwrap();
@@ -586,7 +646,7 @@ mod tests {
         db.init().await.unwrap(); // idempotent: best-effort ALTER ignores duplicate
         // Inserting a credential now works because the column exists.
         let id = db
-            .insert_job("k", "github", "o/r", "main", Some("Y3JlZA=="), 1)
+            .insert_job("k", "github", "o/r", "main", Some("Y3JlZA=="), 0, 1)
             .await
             .unwrap();
         let (_, _, _, cred) = db.job_fields(id).await.unwrap().unwrap();
@@ -667,6 +727,8 @@ mod tests {
                 stale_claim_secs: DEFAULT_STALE_CLAIM_SECS,
                 failed_retention_secs: DEFAULT_FAILED_RETENTION_SECS,
                 max_build_attempts: 1,
+                size_classes: default_size_classes(),
+                max_size_class: None,
             };
             let enq = q.enqueue(job("o", "r", "main")).await.unwrap();
             let id = enq.job_id.unwrap();
@@ -759,6 +821,8 @@ mod tests {
                 stale_claim_secs: 0,
                 failed_retention_secs: DEFAULT_FAILED_RETENTION_SECS,
                 max_build_attempts: DEFAULT_MAX_BUILD_ATTEMPTS,
+                size_classes: default_size_classes(),
+                max_size_class: None,
             };
             q.enqueue(job("o", "r", "main")).await.unwrap();
             let first = q.claim("w1").await.unwrap().unwrap();
@@ -780,6 +844,8 @@ mod tests {
                 stale_claim_secs: 3600,
                 failed_retention_secs: DEFAULT_FAILED_RETENTION_SECS,
                 max_build_attempts: DEFAULT_MAX_BUILD_ATTEMPTS,
+                size_classes: default_size_classes(),
+                max_size_class: None,
             };
             q.enqueue(job("o", "r", "main")).await.unwrap();
             let _first = q.claim("w1").await.unwrap().unwrap();
@@ -805,6 +871,8 @@ mod tests {
                 stale_claim_secs: 0,
                 failed_retention_secs: DEFAULT_FAILED_RETENTION_SECS,
                 max_build_attempts: DEFAULT_MAX_BUILD_ATTEMPTS,
+                size_classes: default_size_classes(),
+                max_size_class: None,
             };
             q.enqueue(job("o", "r", "main")).await.unwrap();
             let slow = q.claim("w1").await.unwrap().unwrap();
@@ -851,6 +919,8 @@ mod tests {
                 stale_claim_secs: 0,
                 failed_retention_secs: DEFAULT_FAILED_RETENTION_SECS,
                 max_build_attempts: max,
+                size_classes: default_size_classes(),
+                max_size_class: None,
             };
             let enq = q.enqueue(job("o", "r", "main")).await.unwrap();
             let id = enq.job_id.unwrap();
@@ -895,6 +965,8 @@ mod tests {
             stale_claim_secs: DEFAULT_STALE_CLAIM_SECS,
             failed_retention_secs: -1,
             max_build_attempts: DEFAULT_MAX_BUILD_ATTEMPTS,
+            size_classes: default_size_classes(),
+            max_size_class: None,
         };
 
         let failed = q.enqueue(job("o", "r", "fail")).await.unwrap();
@@ -1090,5 +1162,213 @@ mod tests {
         .await
         .unwrap();
         exercise_core(&q).await;
+    }
+
+    /// Two-class launch config: small ≤ 100 bytes, large catch-all.
+    fn two_classes() -> Vec<SizeClass> {
+        vec![
+            SizeClass {
+                name: "small".into(),
+                max_bytes: 100,
+                machine: "s".into(),
+            },
+            SizeClass {
+                name: "large".into(),
+                max_bytes: u64::MAX,
+                machine: "l".into(),
+            },
+        ]
+    }
+
+    /// Three-class config: small ≤ 100, medium ≤ 1000, large catch-all.
+    fn three_classes() -> Vec<SizeClass> {
+        vec![
+            SizeClass {
+                name: "small".into(),
+                max_bytes: 100,
+                machine: "s".into(),
+            },
+            SizeClass {
+                name: "medium".into(),
+                max_bytes: 1_000,
+                machine: "m".into(),
+            },
+            SizeClass {
+                name: "large".into(),
+                max_bytes: u64::MAX,
+                machine: "l".into(),
+            },
+        ]
+    }
+
+    async fn queue_classes(
+        classes: Vec<SizeClass>,
+        max_size_class: Option<&str>,
+    ) -> (SqlJobQueue, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q.db").to_string_lossy().to_string();
+        let db = make_db("sqlite", &path).await;
+        let q = SqlJobQueue::new_with_classes(db, classes)
+            .await
+            .unwrap()
+            .with_max_size_class(max_size_class)
+            .unwrap();
+        (q, dir)
+    }
+
+    #[tokio::test]
+    async fn two_class_config_classifies_and_filters() {
+        let (small_q, _dir) = queue_classes(two_classes(), Some("small")).await;
+        small_q
+            .enqueue(job_sized("o", "small-repo", "main", 50))
+            .await
+            .unwrap();
+        small_q
+            .enqueue(job_sized("o", "large-repo", "main", 10_000))
+            .await
+            .unwrap();
+        // Small worker claims only the small job.
+        let claimed = small_q.claim("small-w").await.unwrap().unwrap();
+        assert_eq!(claimed.path, "o/small-repo");
+        assert!(
+            small_q.claim("small-w").await.unwrap().is_none(),
+            "small worker must not claim a large job"
+        );
+        assert_eq!(small_q.depth().await, 1, "large job still queued");
+    }
+
+    #[tokio::test]
+    async fn three_class_config_classifies_and_filters() {
+        let (med_q, _dir) = queue_classes(three_classes(), Some("medium")).await;
+        med_q
+            .enqueue(job_sized("o", "s", "main", 50))
+            .await
+            .unwrap();
+        med_q
+            .enqueue(job_sized("o", "m", "main", 500))
+            .await
+            .unwrap();
+        med_q
+            .enqueue(job_sized("o", "l", "main", 50_000))
+            .await
+            .unwrap();
+        // Medium ceiling drains small + medium, never large.
+        let a = med_q.claim("m-w").await.unwrap().unwrap();
+        let b = med_q.claim("m-w").await.unwrap().unwrap();
+        let mut paths: Vec<_> = [a.path, b.path].into_iter().collect();
+        paths.sort();
+        assert_eq!(paths, vec!["o/m".to_string(), "o/s".to_string()]);
+        assert!(
+            med_q.claim("m-w").await.unwrap().is_none(),
+            "medium worker must not claim a large job"
+        );
+        assert_eq!(med_q.depth().await, 1);
+    }
+
+    #[tokio::test]
+    async fn large_worker_drains_both_classes() {
+        let (large_q, _dir) = queue_classes(two_classes(), Some("large")).await;
+        large_q
+            .enqueue(job_sized("o", "small-repo", "main", 50))
+            .await
+            .unwrap();
+        large_q
+            .enqueue(job_sized("o", "large-repo", "main", 10_000))
+            .await
+            .unwrap();
+        let a = large_q.claim("large-w").await.unwrap().unwrap();
+        let b = large_q.claim("large-w").await.unwrap().unwrap();
+        let mut paths: Vec<_> = [a.path, b.path].into_iter().collect();
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec!["o/large-repo".to_string(), "o/small-repo".to_string()]
+        );
+        assert!(large_q.claim("large-w").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn no_ceiling_drains_all() {
+        // No --max-size-class: single-worker self-host claims everything.
+        let (q, _dir) = queue_classes(two_classes(), None).await;
+        q.enqueue(job_sized("o", "small-repo", "main", 50))
+            .await
+            .unwrap();
+        q.enqueue(job_sized("o", "large-repo", "main", 10_000))
+            .await
+            .unwrap();
+        assert!(q.claim("w").await.unwrap().is_some());
+        assert!(q.claim("w").await.unwrap().is_some());
+        assert!(q.claim("w").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn threshold_change_reclassifies_at_enqueue() {
+        // Same byte size, different thresholds → different claim eligibility.
+        let bytes = 500u64;
+        let tight = three_classes(); // 500 → medium
+        let (med_q, dir) = queue_classes(tight, Some("small")).await;
+        med_q
+            .enqueue(job_sized("o", "r", "main", bytes))
+            .await
+            .unwrap();
+        assert!(
+            med_q.claim("small-w").await.unwrap().is_none(),
+            "500 bytes is medium under the tight config; small worker skips it"
+        );
+        drop(med_q);
+
+        // Retune: raise small threshold so 500 fits small.
+        let retuned = vec![
+            SizeClass {
+                name: "small".into(),
+                max_bytes: 600,
+                machine: "s".into(),
+            },
+            SizeClass {
+                name: "medium".into(),
+                max_bytes: 1_000,
+                machine: "m".into(),
+            },
+            SizeClass {
+                name: "large".into(),
+                max_bytes: u64::MAX,
+                machine: "l".into(),
+            },
+        ];
+        let path = dir.path().join("q2.db").to_string_lossy().to_string();
+        let db = make_db("sqlite", &path).await;
+        let retuned_q = SqlJobQueue::new_with_classes(db, retuned)
+            .await
+            .unwrap()
+            .with_max_size_class(Some("small"))
+            .unwrap();
+        retuned_q
+            .enqueue(job_sized("o", "r", "main", bytes))
+            .await
+            .unwrap();
+        let claimed = retuned_q.claim("small-w").await.unwrap().unwrap();
+        assert_eq!(
+            claimed.path, "o/r",
+            "after threshold retune, 500 bytes is small and claimable"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_max_size_class_fails_loudly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q.db").to_string_lossy().to_string();
+        let db = make_db("sqlite", &path).await;
+        let q = SqlJobQueue::new_with_classes(db, two_classes())
+            .await
+            .unwrap();
+        let err = match q.with_max_size_class(Some("xlarge")) {
+            Ok(_) => panic!("expected unknown size class to fail"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("unknown size class"),
+            "got: {err}"
+        );
     }
 }

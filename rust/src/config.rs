@@ -100,6 +100,10 @@ pub struct QueueConfig {
     pub url: Option<String>,
     /// Auth token for `libsql` (remote), stored as written.
     pub token: Option<String>,
+    /// Ordered size classes for the SQL queue claim filter (see
+    /// [`crate::queue::size_class`]). Empty → launch default `small | large`.
+    /// Also overridable via `RIPCLONE_SIZE_CLASSES` JSON.
+    pub size_classes: Vec<crate::queue::SizeClass>,
 }
 
 /// Path to the global config file (`~/.config/ripclone/config.toml`).
@@ -308,6 +312,11 @@ fn merge(overrides: Config, base: Config) -> Config {
             backend: overrides.queue.backend.or(base.queue.backend),
             url: overrides.queue.url.or(base.queue.url),
             token: overrides.queue.token.or(base.queue.token),
+            size_classes: if overrides.queue.size_classes.is_empty() {
+                base.queue.size_classes
+            } else {
+                overrides.queue.size_classes
+            },
         },
         token: overrides.token.or(base.token),
     }
@@ -408,6 +417,7 @@ mod tests {
                 backend: Some("postgres".into()),
                 url: Some("postgres://db/ripclone".into()),
                 token: None,
+                size_classes: vec![],
             },
             metadata: MetadataConfig {
                 backend: Some("postgres".into()),

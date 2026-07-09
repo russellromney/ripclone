@@ -2434,12 +2434,14 @@ async fn get_ref_inner(
                     // state, so /status keeps reporting a phantom cold `HEAD` ref
                     // after the repo has been re-warmed by the rebuild. For a
                     // concrete-branch request this is identical to `effective_branch`.
+                    let size_bytes = enqueue_size_bytes(&state, &repo_id, &branch).await;
                     let job = BuildJob {
                         repo_id: repo_id.clone(),
                         branch: branch.clone(),
                         rev: None,
                         credential: credential.clone(),
                         recheck: 0,
+                        size_bytes,
                     };
                     if let Err(e) = enqueue_direct_build(&state, job).await {
                         warn!(
@@ -3089,12 +3091,14 @@ async fn sync_repo_inner(
             // it (else the gauge underflows). The local queue owns the
             // build_queue_depth counter (enqueue +1, worker -1).
             state.metrics.record_build_queued();
+            let size_bytes = enqueue_size_bytes(&state, &repo_id, &branch).await;
             let job = BuildJob {
                 repo_id: repo_id.clone(),
                 branch: branch.clone(),
                 rev: at_rev.clone(),
                 credential,
                 recheck: 0,
+                size_bytes,
             };
             let full = match state.build_queue.enqueue(job).await {
                 Ok(enq) => enq.outcome == EnqueueOutcome::Full,
@@ -3207,12 +3211,14 @@ async fn sync_repo_inner(
         // The per-request upstream credential rides with the job: the queue
         // persists it (base64) and the worker uses it for the mirror fetch,
         // so a private repo the worker has no standing token for still builds.
+        let size_bytes = enqueue_size_bytes(&state, &repo_id, &branch).await;
         let job = BuildJob {
             repo_id: repo_id.clone(),
             branch: branch.clone(),
             rev: at_rev.clone(),
             credential,
             recheck: 0,
+            size_bytes,
         };
         let enq = match state.build_queue.enqueue(job).await {
             Ok(enq) => enq,
@@ -3431,6 +3437,17 @@ fn inproc_build_key(repo_id: &RepoId, branch: &str, rev: Option<&str>) -> String
     format!("{}/{branch}#{}", repo_id.storage_key(), rev.unwrap_or(""))
 }
 
+/// Byte size for size-class classification at enqueue. Re-sync → prior clonepack
+/// byte total from lengths already on the ref (no new API call). First build
+/// (no sized prior artifacts) → `None`, which the queue maps to the largest
+/// class so the first build is never under-sized. Callers with a tiered-add
+/// preflight repo size should pass it via [`BuildJob::size_bytes`] directly.
+async fn enqueue_size_bytes(state: &ServerState, repo_id: &RepoId, branch: &str) -> Option<u64> {
+    let info = state.ref_store.load_branch(repo_id, branch).await.ok().flatten()?;
+    let n = crate::queue::prior_clonepack_bytes(&info);
+    if n == 0 { None } else { Some(n) }
+}
+
 /// Fire-and-forget: enqueue a build for `(repo_id, branch)` at the branch tip and
 /// return immediately — the build runs ahead of any clone (build-before-clone).
 /// Used by the `/build` OIDC endpoint, the push-webhook receiver, and the poll
@@ -3450,12 +3467,14 @@ async fn trigger_build(state: &ServerState, repo_id: &RepoId, branch: &str) -> R
         .broker
         .fetch_credential(repo_id, None)
         .map_err(|e| e.to_string())?;
+    let size_bytes = enqueue_size_bytes(state, repo_id, branch).await;
     let job = BuildJob {
         repo_id: repo_id.clone(),
         branch: branch.to_string(),
         rev: None,
         credential,
         recheck: 0,
+        size_bytes,
     };
 
     if state.build_queue.inproc_wait() {
@@ -6809,6 +6828,7 @@ async fn enqueue_recheck_build(
         .broker
         .fetch_credential(repo_id, None)
         .map_err(|e| e.to_string())?;
+    let size_bytes = enqueue_size_bytes(state, repo_id, branch).await;
     enqueue_direct_build(
         state,
         BuildJob {
@@ -6817,6 +6837,7 @@ async fn enqueue_recheck_build(
             rev: None,
             credential,
             recheck,
+            size_bytes,
         },
     )
     .await
@@ -6860,12 +6881,14 @@ async fn handle_phase2_failure(
     }
 
     if let Some(recheck) = action.retry_recheck {
+        let size_bytes = enqueue_size_bytes(&action.state, repo_id, branch).await;
         let job = BuildJob {
             repo_id: repo_id.clone(),
             branch: branch.to_string(),
             rev: None,
             credential: action.credential,
             recheck,
+            size_bytes,
         };
         if let Err(e) = enqueue_direct_build(&action.state, job).await {
             warn!(

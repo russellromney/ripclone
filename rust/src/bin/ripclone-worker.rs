@@ -57,6 +57,13 @@ struct Args {
     /// How long to wait before polling again when the queue is empty (ms).
     #[arg(long, default_value = "1000")]
     idle_poll_ms: u64,
+
+    /// Largest size class this worker will claim (inclusive). Jobs above this
+    /// ceiling stay queued for a bigger worker. Omit to claim everything —
+    /// single-worker self-host is unchanged. Names come from the configured
+    /// size classes (launch default: `small` | `large`).
+    #[arg(long)]
+    max_size_class: Option<String>,
 }
 
 #[tokio::main]
@@ -69,17 +76,28 @@ async fn main() -> Result<()> {
     std::fs::create_dir_all(&args.cas_dir)?;
     std::fs::create_dir_all(&args.repo_root)?;
 
-    let queue = Arc::new(backends::connect_sql_queue().await?);
+    let queue = backends::connect_sql_queue().await?;
+    let queue = Arc::new(
+        queue
+            .with_max_size_class(args.max_size_class.as_deref())
+            .context("resolve --max-size-class")?,
+    );
 
     let metrics = Metrics::new();
     let b = Backends::from_env(&args.cas_dir, &args.repo_root, &metrics).await?;
     let state = ServerState::for_worker(b, queue.clone() as JobQueueRef, metrics)?;
 
     let worker_id = format!("worker-{}", std::process::id());
-    info!(
-        "ripclone-worker {worker_id} polling {} queue",
-        backends::queue_kind()
-    );
+    match args.max_size_class.as_deref() {
+        Some(ceiling) => info!(
+            "ripclone-worker {worker_id} polling {} queue (max-size-class={ceiling})",
+            backends::queue_kind()
+        ),
+        None => info!(
+            "ripclone-worker {worker_id} polling {} queue",
+            backends::queue_kind()
+        ),
+    }
 
     let idle = Duration::from_millis(args.idle_poll_ms);
     // Periodically prune expired `failed` jobs (done jobs are kept as history).
@@ -127,6 +145,7 @@ async fn main() -> Result<()> {
                     // cross-process worker starts each claimed job fresh and the
                     // periodic poller is the freshness backstop here.
                     recheck: 0,
+                    size_bytes: None,
                 };
                 // Isolate the build in its own task so a panic fails just this
                 // job (acked as failed) instead of killing the worker and
