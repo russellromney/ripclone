@@ -1416,12 +1416,18 @@ mod tests {
         let manifest_path = cas.path(&info.full_clonepack.manifest);
         assert!(manifest_path.exists());
 
+        // warm_ttl must comfortably exceed the test's own wall-clock slack. With a
+        // 1s TTL and last_accessed = now, a whole-second boundary crossing between
+        // the save above and the GC's own `now` (both truncated to whole seconds by
+        // unix_secs) makes age == 1, which is NOT < 1, and the "recent" ref gets
+        // wrongly evicted. A generous TTL isolates the intent (a just-touched ref is
+        // kept) without the boundary race.
         let gc = RemoteGc::new(
             storage.clone(),
             ref_store.clone(),
             GcConfig {
                 grace_period: Duration::from_secs(0),
-                warm_ttl: Duration::from_secs(1),
+                warm_ttl: Duration::from_secs(3600),
                 dry_run: false,
             },
         );
