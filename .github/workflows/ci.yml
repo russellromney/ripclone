@@ -61,9 +61,9 @@ jobs:
       - name: Lint (fmt + clippy)
         run: bash scripts/ci.sh lint
 
-  # Unit + integration tests (release), run a couple of times as a flake guard.
-  # One compile, multiple runs — catches nondeterministic races a single run
-  # misses.
+  # Unit + integration tests (ci profile: release-like opts, more codegen units).
+  # Single run — a second flake pass used to dominate overall PR wall (~27 min)
+  # without enough flake yield to justify it.
   test:
     runs-on: ubuntu-latest
     steps:
@@ -73,8 +73,8 @@ jobs:
           cache-workspaces: rust
       - name: Install build deps
         run: bash scripts/install-build-deps.sh
-      - name: Tests + flake guard (ci profile, repeated)
-        run: bash scripts/ci.sh flake
+      - name: Tests (ci profile)
+        run: bash scripts/ci.sh test
 
   e2e:
     runs-on: ubuntu-latest
@@ -144,9 +144,8 @@ jobs:
           test "$(echo "$json" | jq 'length')" -ge 1
           echo "tests=$json" >> "$GITHUB_OUTPUT"
 
-  # Compile the s3gc test binary once. Matrix shards below download it and run
-  # a single test each — no recompile per shard. That is the real wall-time
-  # win: ~7 min compile paid once, then N cheap isolated test runs in parallel.
+  # Compile the s3gc test binary once (ci profile + mold). Matrix shards below
+  # download it and run a single test each — no recompile per shard.
   s3gc-build:
     needs: changes
     if: ${{ needs.changes.outputs.docker == 'true' }}
@@ -158,15 +157,15 @@ jobs:
           cache-workspaces: rust
       - name: Install build deps
         run: bash scripts/install-build-deps.sh
-      - name: Build e2e_remote_gc_s3 (release, no run)
+      - name: Build e2e_remote_gc_s3 (ci profile, no run)
         run: bash scripts/ci.sh s3gc-build
       - name: Upload s3gc test binary + CLI
         uses: actions/upload-artifact@v7
         with:
           name: s3gc-test-bin
           path: |
-            rust/target/release/e2e_remote_gc_s3
-            rust/target/release/ripclone
+            rust/target/ci/e2e_remote_gc_s3
+            rust/target/ci/ripclone
           if-no-files-found: error
           retention-days: 1
 

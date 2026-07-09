@@ -32,16 +32,11 @@ e2e() {
   bash "$ROOT/scripts/e2e_local.sh"
 }
 
-# Tests + flake guard in one pass: compile once (ci profile), then run the suite
-# a couple of times to catch nondeterministic races/ordering bugs a single run
-# can miss. The ci profile is release-like but with more codegen units, so the
-# compile is faster while tests still run optimized enough for the gate.
+# Historical flake-guard (ran the suite twice). Kept as an alias of `test` so
+# local muscle memory (`scripts/ci.sh flake`) still works; CI no longer doubles
+# the gate — one run is enough and the second run was ~half of overall wall.
 flake() {
-  ( cd "$ROOT/rust"
-    for i in 1 2; do
-      echo "== test run $i/2 =="
-      cargo test --profile ci --all-targets --locked
-    done )
+  run_tests
 }
 
 # Real multi-provider + server-side-token path against a live Gitea (the seam a
@@ -78,15 +73,16 @@ benchmark() {
 }
 
 # Compile the S3 GC e2e test binary (and the ripclone CLI it shells out to)
-# once, no run. Stages both under rust/target/release/ with stable names so CI
-# can upload them as artifacts for the per-test matrix jobs.
+# once, no run. Uses the `ci` profile (release opts, many codegen units, no LTO)
+# so compile finishes faster than full --release while still running optimized.
+# Stages both under rust/target/ci/ with stable names for artifact upload.
 s3gc_build() {
   ( cd "$ROOT/rust"
     # --message-format=json so we can pick the exact test binary path without
     # grepping the human log (which is unstable across cargo versions).
     local bin
     bin="$(
-      cargo test --release --locked --test e2e_remote_gc_s3 --no-run --message-format=json \
+      cargo test --profile ci --locked --test e2e_remote_gc_s3 --no-run --message-format=json \
         | jq -r 'select(.reason == "compiler-artifact"
                         and .target.kind == ["test"]
                         and .target.name == "e2e_remote_gc_s3"
@@ -100,20 +96,21 @@ s3gc_build() {
     fi
     # One test spawns the CLI (expired_bearer_…); build it in the same job so
     # shards can download both and set CARGO_BIN_EXE_ripclone at runtime.
-    cargo build --release --locked --bin ripclone
+    cargo build --profile ci --locked --bin ripclone
 
     # Prefer CARGO_TARGET_DIR when set (worktrees share the main checkout's
     # target/); otherwise fall back to the package-local target/.
+    # --profile ci writes under target/ci/ (not target/release/).
     local target_root="${CARGO_TARGET_DIR:-$ROOT/rust/target}"
-    mkdir -p "$target_root/release" "$ROOT/rust/target/release"
-    cp -f "$bin" "$target_root/release/e2e_remote_gc_s3"
-    chmod +x "$target_root/release/e2e_remote_gc_s3"
+    mkdir -p "$target_root/ci" "$ROOT/rust/target/ci"
+    cp -f "$bin" "$target_root/ci/e2e_remote_gc_s3"
+    chmod +x "$target_root/ci/e2e_remote_gc_s3"
     # Stage package-local copies for CI artifact upload paths.
     if [ "$target_root" != "$ROOT/rust/target" ]; then
-      cp -f "$target_root/release/e2e_remote_gc_s3" "$ROOT/rust/target/release/e2e_remote_gc_s3"
-      cp -f "$target_root/release/ripclone" "$ROOT/rust/target/release/ripclone"
+      cp -f "$target_root/ci/e2e_remote_gc_s3" "$ROOT/rust/target/ci/e2e_remote_gc_s3"
+      cp -f "$target_root/ci/ripclone" "$ROOT/rust/target/ci/ripclone"
     fi
-    echo "s3gc-build: wrote $target_root/release/e2e_remote_gc_s3 + ripclone" >&2
+    echo "s3gc-build: wrote $target_root/ci/e2e_remote_gc_s3 + ripclone" >&2
   )
 }
 
@@ -148,7 +145,7 @@ s3gc() {
     # Liberate from cargo so the binary's cwd/tmp behavior matches a direct run.
     ( cd "$ROOT/rust" && "$S3GC_TEST_BIN" "${filter[@]}" )
   else
-    ( cd "$ROOT/rust" && cargo test --release --locked --test e2e_remote_gc_s3 -- "${filter[@]}" )
+    ( cd "$ROOT/rust" && cargo test --profile ci --locked --test e2e_remote_gc_s3 -- "${filter[@]}" )
   fi
 }
 
