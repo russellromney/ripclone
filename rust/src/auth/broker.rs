@@ -339,25 +339,75 @@ fn parse_rfc3339(s: &str) -> Option<SystemTime> {
         .map(SystemTime::from)
 }
 
-/// Select the credential broker from the environment: a [`GitHubAppBroker`] when
-/// `RIPCLONE_GITHUB_APP_ID` is configured, otherwise the [`StaticBroker`].
+/// Provider-driven broker dispatch.
+///
+/// Holds a provider-agnostic `StaticBroker` fallback and a map of provider
+/// instance ids to dynamic brokers (e.g. `GitHubAppBroker`). Selection is
+/// resolved per `RepoId`, so adding a new provider-specific broker is only a
+/// registration change, not a change to the dispatch logic.
+pub struct ProviderAwareBroker {
+    dynamic: HashMap<String, Arc<dyn CredentialBroker>>,
+    static_broker: StaticBroker,
+}
+
+impl ProviderAwareBroker {
+    pub fn new(registry: ProviderRegistry) -> Self {
+        Self {
+            dynamic: HashMap::new(),
+            static_broker: StaticBroker::new(registry),
+        }
+    }
+
+    /// Register a dynamic broker for a specific provider instance id.
+    pub fn register(
+        mut self,
+        provider_id: impl Into<String>,
+        broker: Arc<dyn CredentialBroker>,
+    ) -> Self {
+        self.dynamic.insert(provider_id.into(), broker);
+        self
+    }
+
+    fn broker_for(&self, repo_id: &RepoId) -> &dyn CredentialBroker {
+        self.dynamic
+            .get(repo_id.provider.as_str())
+            .map(|b| b.as_ref())
+            .unwrap_or(&self.static_broker)
+    }
+}
+
+impl CredentialBroker for ProviderAwareBroker {
+    fn fetch_credential(
+        &self,
+        repo_id: &RepoId,
+        request_token: Option<&SecretString>,
+    ) -> Result<Option<SecretString>> {
+        self.broker_for(repo_id)
+            .fetch_credential(repo_id, request_token)
+    }
+}
+
+/// Select the credential broker from the environment.
+///
+/// Builds a [`ProviderAwareBroker`] with a `StaticBroker` fallback and registers
+/// a `GitHubAppBroker` for the built-in `"github"` instance when
+/// `RIPCLONE_GITHUB_APP_ID` is configured.
 ///
 /// Returns `Err` if a GitHub App is configured but its settings are invalid, so
 /// a misconfigured deployment fails fast rather than silently mirroring
 /// anonymously.
 pub fn broker_from_env(registry: ProviderRegistry) -> Result<Arc<dyn CredentialBroker>> {
-    match GitHubAppConfig::from_env()? {
-        Some(config) => {
-            let app_id = config.app_id.clone();
-            let installation_id = config.installation_id;
-            let broker = GitHubAppBroker::new(config)?;
-            info!(
-                "using GitHub App credential broker (app_id={app_id}, installation_id={installation_id})"
-            );
-            Ok(Arc::new(broker))
-        }
-        None => Ok(Arc::new(StaticBroker::new(registry))),
+    let mut broker = ProviderAwareBroker::new(registry);
+    if let Some(config) = GitHubAppConfig::from_env()? {
+        let app_id = config.app_id.clone();
+        let installation_id = config.installation_id;
+        let gh_broker = Arc::new(GitHubAppBroker::new(config)?);
+        broker = broker.register("github", gh_broker);
+        info!(
+            "using GitHub App credential broker (app_id={app_id}, installation_id={installation_id})"
+        );
     }
+    Ok(Arc::new(broker))
 }
 
 #[cfg(test)]
