@@ -89,14 +89,41 @@ jobs:
         run: bash scripts/ci.sh e2e
 
   # Queue + metadata adapters against REAL network databases — Postgres + MySQL
-  # (throwaway docker containers brought up by scripts/test-queue-sql.sh) and
-  # libsql (a local `sqld`). The default `test` job only compile-checks these
-  # engines; this job exercises their dialect-specific SQL. Gated on the same
-  # rust-changes filter as docker so docs-only PRs skip it.
+  # (GHA service containers, ready in parallel with rustc install) and libsql
+  # (local `sqld`). The default `test` job only compile-checks these engines;
+  # this job exercises dialect-specific SQL. Gated on the same rust-changes
+  # filter as docker so docs-only PRs skip it.
   databases:
     needs: changes
     if: ${{ needs.changes.outputs.docker == 'true' }}
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: ripclone
+          POSTGRES_DB: ripclone
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 20
+      mysql:
+        image: mysql:8
+        env:
+          MYSQL_ROOT_PASSWORD: ripclone
+          MYSQL_DATABASE: ripclone
+        ports:
+          - 3306:3306
+        # Real SELECT (not ping) — mysql:8's entrypoint temporary server answers
+        # ping before the real mysqld is up.
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -pripclone --silent"
+          --health-interval 3s
+          --health-timeout 5s
+          --health-retries 40
     steps:
       - uses: actions/checkout@v7
       - uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -118,7 +145,28 @@ jobs:
           sudo install -m 0755 ./sqld /usr/local/bin/sqld
           rm -f ./sqld
           sqld --version
+      # mysql:8's entrypoint temporary server answers mysqladmin ping before the
+      # real mysqld is up — GHA health can go green too early. Confirm with a
+      # real query before cargo runs.
+      - name: Wait for MySQL to accept real queries
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 60); do
+            if docker run --rm --network host mysql:8 \
+              mysql -h127.0.0.1 -uroot -pripclone -e 'SELECT 1' >/dev/null 2>&1; then
+              echo "mysql ready after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "mysql never became ready" >&2
+          exit 1
       - name: Postgres + MySQL + libsql (queue + metadata) on real servers
+        env:
+          # Service containers are already up (overlapped with toolchain install).
+          RIPCLONE_TEST_PG_URL: postgres://postgres:ripclone@127.0.0.1:5432/ripclone
+          RIPCLONE_TEST_MYSQL_URL: mysql://root:ripclone@127.0.0.1:3306/ripclone
+          CARGO_PROFILE: ci
         run: bash scripts/ci.sh databases
 
   # Discover the individual #[ignore = "requires S3 credentials"] test names in
@@ -396,14 +444,24 @@ jobs:
           target: x86_64-unknown-linux-musl
       - name: Install build deps
         run: bash scripts/install-build-deps.sh
+      # Zig is ~100MB; cache the venv so we do not re-download every run.
+      - name: Cache cargo-zigbuild + zig
+        uses: actions/cache@v4
+        with:
+          path: ~/.zigbuild
+          key: zigbuild-0.15.2-${{ runner.os }}
       - name: Install cargo-zigbuild + zig (musl C cross-toolchain)
         # cargo-zigbuild locates zig via the `python-zig` app that the `ziglang`
         # wheel installs. `pipx inject` does NOT put that app on PATH (even with
         # --include-apps), so cargo-zigbuild fails with "cannot find binary
         # path". A plain venv on PATH exposes both cargo-zigbuild and python-zig.
         run: |
-          python3 -m venv "$HOME/.zigbuild"
-          "$HOME/.zigbuild/bin/pip" install --quiet cargo-zigbuild "ziglang==0.15.2"
+          if [ ! -x "$HOME/.zigbuild/bin/cargo-zigbuild" ]; then
+            python3 -m venv "$HOME/.zigbuild"
+            "$HOME/.zigbuild/bin/pip" install --quiet cargo-zigbuild "ziglang==0.15.2"
+          fi
           echo "$HOME/.zigbuild/bin" >> "$GITHUB_PATH"
+          # Pre-pull Alpine while the rustc graph builds (next step).
+          docker pull --quiet alpine:latest &
       - name: Build + run the static musl binaries on Alpine
         run: bash scripts/musl-smoke.sh

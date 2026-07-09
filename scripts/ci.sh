@@ -56,8 +56,12 @@ gitea() {
 # libsql against a local `sqld`. Needs docker; the libsql leg also needs `sqld`
 # on PATH (the test auto-skips without it).
 databases() {
+  # One profile for the whole job: previously test-queue-sql compiled the
+  # default (dev) graph and libsql recompiled --release, paying two full
+  # builds. `ci` matches the unit-test gate.
+  export CARGO_PROFILE="${CARGO_PROFILE:-ci}"
   bash "$ROOT/scripts/test-queue-sql.sh"
-  ( cd "$ROOT/rust" && cargo test --release --locked --test e2e_worker_libsql -- --nocapture )
+  ( cd "$ROOT/rust" && cargo test --profile "$CARGO_PROFILE" --locked --test e2e_worker_libsql -- --nocapture )
 }
 
 # Benchmark-harness smoke test. The benchmark scripts talk to the server over
