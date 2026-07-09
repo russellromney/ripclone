@@ -6,6 +6,10 @@ pub use pb::{
     ChunkRef, ClonepackManifest, FileEntry, Fragment, FrameInfo, MetadataChunk, PackEntry,
 };
 
+use anyhow::{Context, Result};
+use bytes::Bytes;
+use std::path::Path;
+
 impl FileEntry {
     /// Total uncompressed size of the file across all fragments.
     pub fn total_len(&self) -> u64 {
@@ -52,6 +56,85 @@ pub fn manifest_chunk_refs(manifest: &ClonepackManifest) -> Vec<&ChunkRef> {
         refs.push(idx_bundle);
     }
     refs
+}
+
+/// Return the idx bytes for one manifest pack, either from the shared idx bundle
+/// or from the caller's separately fetched idx object. This is shared by the
+/// client git-dir reconstruction and server-side mirror seeding so both validate
+/// bundle slices identically.
+pub fn manifest_pack_idx_bytes(
+    entry: &PackEntry,
+    index: usize,
+    idx_bundle: Option<&Bytes>,
+    fetched_idx: Option<Bytes>,
+) -> Result<Bytes> {
+    if let Some(bundle) = idx_bundle {
+        let idx_ref = entry
+            .idx
+            .as_ref()
+            .with_context(|| format!("pack {index} missing idx ref"))?;
+        let off = entry.idx_bundle_offset as usize;
+        let end = off
+            .checked_add(idx_ref.len as usize)
+            .context("idx bundle offset overflow")?;
+        if bundle.get(off..end).is_none() {
+            anyhow::bail!("idx {index} slice out of bundle range");
+        }
+        let slice = bundle.slice(off..end);
+        let want = hash_to_hex(&idx_ref.hash);
+        let got = crate::cas::hash(&slice);
+        if got != want {
+            anyhow::bail!("idx {index} bundle slice hash mismatch: expected {want}, got {got}");
+        }
+        Ok(slice)
+    } else {
+        let idx_ref = entry
+            .idx
+            .as_ref()
+            .with_context(|| format!("pack {index} missing idx ref"))?;
+        let idx_bytes =
+            fetched_idx.with_context(|| format!("pack {index} missing fetched idx bytes"))?;
+        let want = hash_to_hex(&idx_ref.hash);
+        if idx_bytes.len() as u64 != idx_ref.len {
+            anyhow::bail!(
+                "idx {index} size mismatch: expected {}, got {}",
+                idx_ref.len,
+                idx_bytes.len()
+            );
+        }
+        let got = crate::cas::hash(&idx_bytes);
+        if got != want {
+            anyhow::bail!("idx {index} hash mismatch: expected {want}, got {got}");
+        }
+        Ok(idx_bytes)
+    }
+}
+
+/// Install manifest pack/idx bytes into a git objects/pack directory.
+///
+/// Git pack file names are derived from the pack trailer hash, matching the
+/// existing client reconstruction path and letting a later `git fetch` negotiate
+/// against the seeded object database as an ordinary local mirror.
+pub fn install_manifest_pack_bytes<I>(pack_dir: &Path, packs: I) -> Result<u64>
+where
+    I: IntoIterator<Item = (Bytes, Bytes)>,
+{
+    std::fs::create_dir_all(pack_dir)
+        .with_context(|| format!("create pack dir {}", pack_dir.display()))?;
+
+    let mut total = 0u64;
+    for (pack_bytes, idx_bytes) in packs {
+        if pack_bytes.len() < 20 {
+            anyhow::bail!("pack too short ({} bytes)", pack_bytes.len());
+        }
+        let name = hex::encode(&pack_bytes[pack_bytes.len() - 20..]);
+        std::fs::write(pack_dir.join(format!("pack-{}.pack", name)), &pack_bytes)
+            .with_context(|| format!("write pack {}", name))?;
+        std::fs::write(pack_dir.join(format!("pack-{}.idx", name)), &idx_bytes)
+            .with_context(|| format!("write idx {}", name))?;
+        total += (pack_bytes.len() + idx_bytes.len()) as u64;
+    }
+    Ok(total)
 }
 
 /// Collect the distinct clonepack manifest hashes referenced by a `RefInfo`.

@@ -6,7 +6,7 @@ use crate::backends::{self, QueueBackend};
 use crate::cas::Cas;
 use crate::clonepack::{
     ChunkRef, ClonepackManifest, collect_manifest_hashes, hash_from_hex, hash_to_hex,
-    manifest_chunk_refs,
+    install_manifest_pack_bytes, manifest_chunk_refs, manifest_pack_idx_bytes,
 };
 use crate::git;
 use crate::metrics::{Metrics, SyncPhaseMetrics};
@@ -5088,6 +5088,179 @@ async fn reuse_existing_build(
     Ok(None)
 }
 
+async fn clonepack_seed_info(
+    ref_store: &Arc<dyn RefStore>,
+    repo_id: &RepoId,
+    branch: &str,
+) -> Option<RefInfo> {
+    let info = ref_store
+        .load_branch(repo_id, branch)
+        .await
+        .ok()
+        .flatten()?;
+    if info.build_status.as_deref() == Some(crate::remote_gc::EVICTED_BUILD_STATUS) {
+        return None;
+    }
+    let manifest = if !info.full_clonepack.manifest.is_empty() {
+        &info.full_clonepack.manifest
+    } else {
+        &info.clonepack_manifest
+    };
+    if manifest.is_empty() {
+        None
+    } else {
+        Some(info)
+    }
+}
+
+fn seed_bare_mirror_from_clonepack(
+    mirror_dir: &std::path::Path,
+    storage: &StorageRef,
+    provider: &ProviderInstance,
+    repo_id: &RepoId,
+    branch: &str,
+    credential: Option<&secrecy::SecretString>,
+    info: &RefInfo,
+) -> Result<u64> {
+    let manifest_hash = if !info.full_clonepack.manifest.is_empty() {
+        &info.full_clonepack.manifest
+    } else {
+        &info.clonepack_manifest
+    };
+    if manifest_hash.is_empty() {
+        anyhow::bail!("previous ref has no full clonepack manifest");
+    }
+    if mirror_dir.exists() {
+        anyhow::bail!("mirror already exists");
+    }
+
+    let manifest_bytes = storage
+        .get(manifest_hash)
+        .with_context(|| format!("fetch seed clonepack manifest {manifest_hash}"))?;
+    let manifest =
+        ClonepackManifest::decode(manifest_bytes.as_slice()).context("decode seed clonepack")?;
+    if manifest.packs.is_empty() {
+        anyhow::bail!("seed clonepack has no manifest packs");
+    }
+
+    let parent = mirror_dir
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("create mirror parent {}", parent.display()))?;
+    let tmp = tempfile::Builder::new()
+        .prefix(".seed-mirror-")
+        .tempdir_in(parent)
+        .with_context(|| format!("create seed tempdir in {}", parent.display()))?;
+
+    git::init_bare_mirror_origin(tmp.path(), provider, repo_id, credential)?;
+
+    let idx_bundle = match manifest.idx_bundle.as_ref() {
+        Some(idx_bundle_ref) => {
+            let hash = hash_to_hex(&idx_bundle_ref.hash);
+            Some(Bytes::from(
+                storage
+                    .get(&hash)
+                    .with_context(|| format!("fetch seed idx bundle {hash}"))?,
+            ))
+        }
+        None => None,
+    };
+
+    let mut pack_pairs = Vec::with_capacity(manifest.packs.len());
+    for (i, entry) in manifest.packs.iter().enumerate() {
+        let pack_ref = entry
+            .pack
+            .as_ref()
+            .with_context(|| format!("pack {i} missing pack ref"))?;
+        let pack_hash = hash_to_hex(&pack_ref.hash);
+        let pack_bytes = Bytes::from(
+            storage
+                .get(&pack_hash)
+                .with_context(|| format!("fetch seed pack {i} ({pack_hash})"))?,
+        );
+        if pack_bytes.len() as u64 != pack_ref.len {
+            anyhow::bail!(
+                "seed pack {i} size mismatch: expected {}, got {}",
+                pack_ref.len,
+                pack_bytes.len()
+            );
+        }
+        let actual_pack_hash = crate::cas::hash(&pack_bytes);
+        if actual_pack_hash != pack_hash {
+            anyhow::bail!(
+                "seed pack {i} hash mismatch: expected {pack_hash}, got {actual_pack_hash}"
+            );
+        }
+        let idx_bytes = if let Some(bundle) = idx_bundle.as_ref() {
+            manifest_pack_idx_bytes(entry, i, Some(bundle), None)?
+        } else {
+            let idx_ref = entry
+                .idx
+                .as_ref()
+                .with_context(|| format!("pack {i} missing idx ref"))?;
+            let idx_hash = hash_to_hex(&idx_ref.hash);
+            manifest_pack_idx_bytes(
+                entry,
+                i,
+                None,
+                Some(Bytes::from(storage.get(&idx_hash).with_context(|| {
+                    format!("fetch seed idx {i} ({idx_hash})")
+                })?)),
+            )?
+        };
+        pack_pairs.push((pack_bytes, idx_bytes));
+    }
+
+    let bytes = install_manifest_pack_bytes(&tmp.path().join("objects").join("pack"), pack_pairs)?;
+    let seed_commit = if !info.full_clonepack.commit.is_empty() {
+        &info.full_clonepack.commit
+    } else {
+        &info.commit
+    };
+    validation::validate_object_id(seed_commit).context("invalid seed commit")?;
+    let seed_branch = if branch == "HEAD" {
+        if info.default_branch.is_empty() {
+            "main"
+        } else {
+            &info.default_branch
+        }
+    } else {
+        branch
+    };
+    validation::validate_git_rev(seed_branch).context("invalid seed branch")?;
+    let seed_ref = format!("refs/heads/{seed_branch}");
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(tmp.path())
+        .args(["update-ref", &seed_ref, seed_commit])
+        .status()
+        .context("seed mirror ref")?;
+    if !status.success() {
+        anyhow::bail!("seed mirror ref failed");
+    }
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(tmp.path())
+        .args(["symbolic-ref", "HEAD", &seed_ref])
+        .status()
+        .context("seed mirror HEAD")?;
+    if !status.success() {
+        anyhow::bail!("seed mirror HEAD failed");
+    }
+    git::fsck_connectivity(tmp.path()).context("validate seeded mirror")?;
+
+    let tmp_path = tmp.path().to_path_buf();
+    std::fs::rename(&tmp_path, mirror_dir).with_context(|| {
+        format!(
+            "promote seeded mirror {} -> {}",
+            tmp_path.display(),
+            mirror_dir.display()
+        )
+    })?;
+    Ok(bytes)
+}
+
 #[allow(clippy::too_many_arguments)]
 /// Load the effective per-repo/branch build config, falling back to the default
 /// (today's behavior) if the store read fails — a config-store hiccup must never
@@ -5211,6 +5384,43 @@ async fn do_sync(
     // stayed lock-free. We hold this only through fetch + commit-graph [+ bitmap]
     // and drop it before the heavy read-only build (see the drop points below).
     let _guard = mirror_lock.lock().await;
+
+    if !mirror_dir.exists()
+        && let Some(seed_info) = clonepack_seed_info(ref_store, repo_id, branch).await
+    {
+        let mirror_dir_seed = mirror_dir.to_path_buf();
+        let storage_seed = storage.clone();
+        let provider_seed = provider.clone();
+        let repo_id_seed = repo_id.clone();
+        let branch_seed = branch.to_string();
+        let credential_seed = credential.cloned();
+        let seed_result = tokio::task::spawn_blocking(move || {
+            git::with_mirror_lock(&mirror_dir_seed, || {
+                seed_bare_mirror_from_clonepack(
+                    &mirror_dir_seed,
+                    &storage_seed,
+                    &provider_seed,
+                    &repo_id_seed,
+                    &branch_seed,
+                    credential_seed.as_ref(),
+                    &seed_info,
+                )
+            })
+        })
+        .await
+        .context("seed mirror task")?;
+        match seed_result {
+            Ok(bytes) => info!(
+                "seeded cold mirror for {} from storage clonepack ({} bytes)",
+                repo_id.storage_key(),
+                bytes
+            ),
+            Err(e) => warn!(
+                "cold mirror seed unavailable for {}; falling back to full upstream clone: {e:#}",
+                repo_id.storage_key()
+            ),
+        }
+    }
 
     // Sync the bare mirror synchronously (blocking git call).
     let mirror_dir_sync = mirror_dir.to_path_buf();
@@ -7598,6 +7808,218 @@ mod tests {
             access_verifier: Arc::new(HttpAccessVerifier::new()),
             require_repo_auth: false,
         }
+    }
+
+    struct CountingGetStorage {
+        inner: StorageRef,
+        target_hash: String,
+        hits: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::storage::StorageBackend for CountingGetStorage {
+        fn get(&self, hash: &str) -> Result<Vec<u8>> {
+            if hash == self.target_hash {
+                self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            self.inner.get(hash)
+        }
+
+        fn get_range(&self, hash: &str, start: u64, len: u64) -> Result<Vec<u8>> {
+            self.inner.get_range(hash, start, len)
+        }
+
+        fn put(&self, hash: &str, data: &[u8]) -> Result<()> {
+            self.inner.put(hash, data)
+        }
+
+        async fn put_async(&self, hash: &str, data: &[u8]) -> Result<()> {
+            self.inner.put_async(hash, data).await
+        }
+
+        async fn put_file_async(&self, hash: &str, path: &std::path::Path) -> Result<()> {
+            self.inner.put_file_async(hash, path).await
+        }
+
+        async fn get_meta(&self, key: &str) -> Result<Option<Vec<u8>>> {
+            self.inner.get_meta(key).await
+        }
+
+        async fn put_meta(&self, key: &str, data: &[u8]) -> Result<()> {
+            self.inner.put_meta(key, data).await
+        }
+
+        fn size(&self, hash: &str) -> Result<u64> {
+            self.inner.size(hash)
+        }
+
+        fn signed_url(&self, hash: &str, expires_in: Duration) -> Option<String> {
+            self.inner.signed_url(hash, expires_in)
+        }
+
+        fn is_remote(&self) -> bool {
+            self.inner.is_remote()
+        }
+
+        fn regions(&self) -> Vec<String> {
+            self.inner.regions()
+        }
+
+        fn delete(&self, hash: &str) -> Result<()> {
+            self.inner.delete(hash)
+        }
+
+        fn delete_batch(&self, hashes: &[String]) -> Result<u64> {
+            self.inner.delete_batch(hashes)
+        }
+
+        fn list_hashes(&self) -> Result<Vec<crate::storage::HashEntry>> {
+            self.inner.list_hashes()
+        }
+
+        fn health(&self) -> Result<()> {
+            self.inner.health()
+        }
+    }
+
+    fn git_stdout(repo: &std::path::Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    async fn do_sync_for_test(
+        state: &ServerState,
+        repo_id: &RepoId,
+        branch: &str,
+        provider: &ProviderInstance,
+    ) -> SyncBuildResult {
+        let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
+        let lock = repo_lock(&state.sync_locks, repo_id).await;
+        do_sync(
+            &state.cas,
+            &mirror_dir,
+            repo_id,
+            branch,
+            None,
+            &state.ref_store,
+            true,
+            &state.storage,
+            &state.retention,
+            provider,
+            None,
+            &crate::repo_config::RepoConfig::default(),
+            &lock,
+            None,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn cold_sync_seeds_missing_mirror_from_storage_clonepack_then_fetches_delta() {
+        let _env = crate::git::ORIGIN_BASE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let origin_base = tempfile::tempdir().unwrap();
+        let origin_path = origin_base.path().join("acme").join("seed.git");
+        std::fs::create_dir_all(origin_path.parent().unwrap()).unwrap();
+        let origin = crate::test_fixture::init_bare(&origin_path);
+        let c1 = crate::test_fixture::commit(&origin, &[("a.txt", b"1\n")]);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = test_state(&tmp);
+        let repo_id = RepoId::github("acme/seed");
+        let provider = state.provider_registry.get("github").unwrap().clone();
+        unsafe { std::env::set_var("RIPCLONE_ORIGIN_BASE", origin_base.path()) };
+
+        let first = do_sync_for_test(&state, &repo_id, "main", &provider).await;
+        assert_eq!(first.info.commit, c1);
+        let seed_manifest = first.info.full_clonepack.manifest.clone();
+        assert!(
+            !seed_manifest.is_empty(),
+            "first build published full clonepack"
+        );
+
+        std::fs::remove_dir_all(state.repo_root.join(repo_id.mirror_dir_name())).unwrap();
+        let c2 =
+            crate::test_fixture::commit(&origin, &[("a.txt", b"2\n"), ("dir/b.txt", b"delta\n")]);
+
+        let seed_hits = Arc::new(AtomicUsize::new(0));
+        state.storage = Arc::new(CountingGetStorage {
+            inner: state.storage.clone(),
+            target_hash: seed_manifest,
+            hits: seed_hits.clone(),
+        });
+
+        let second = do_sync_for_test(&state, &repo_id, "main", &provider).await;
+        assert_eq!(second.info.commit, c2);
+        assert!(
+            seed_hits.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "cold sync should read the prior full clonepack manifest from storage"
+        );
+
+        let seeded_mirror = state.repo_root.join(repo_id.mirror_dir_name());
+        let full_mirror = tmp.path().join("full-clone-baseline.git");
+        git::sync_bare_mirror(&full_mirror, &provider, &repo_id, "main", None, None).unwrap();
+        assert_eq!(
+            git_stdout(&seeded_mirror, &["rev-parse", "main^{tree}"]),
+            git_stdout(&full_mirror, &["rev-parse", "main^{tree}"]),
+            "seeded-fetch mirror tree must match full-clone mirror tree"
+        );
+        unsafe { std::env::remove_var("RIPCLONE_ORIGIN_BASE") };
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn cold_sync_seed_miss_falls_back_to_full_clone() {
+        let _env = crate::git::ORIGIN_BASE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let origin_base = tempfile::tempdir().unwrap();
+        let origin_path = origin_base.path().join("acme").join("seedmiss.git");
+        std::fs::create_dir_all(origin_path.parent().unwrap()).unwrap();
+        let origin = crate::test_fixture::init_bare(&origin_path);
+        crate::test_fixture::commit(&origin, &[("a.txt", b"1\n")]);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(&tmp);
+        let repo_id = RepoId::github("acme/seedmiss");
+        let provider = state.provider_registry.get("github").unwrap().clone();
+        unsafe { std::env::set_var("RIPCLONE_ORIGIN_BASE", origin_base.path()) };
+
+        let first = do_sync_for_test(&state, &repo_id, "main", &provider).await;
+        let seed_manifest = first.info.full_clonepack.manifest.clone();
+        state.storage.delete(&seed_manifest).unwrap();
+        std::fs::remove_dir_all(state.repo_root.join(repo_id.mirror_dir_name())).unwrap();
+        let c2 = crate::test_fixture::commit(
+            &origin,
+            &[("a.txt", b"2\n"), ("fallback.txt", b"full clone\n")],
+        );
+
+        let second = do_sync_for_test(&state, &repo_id, "main", &provider).await;
+        assert_eq!(second.info.commit, c2);
+
+        let fallback_mirror = state.repo_root.join(repo_id.mirror_dir_name());
+        let full_mirror = tmp.path().join("full-clone-seedmiss.git");
+        git::sync_bare_mirror(&full_mirror, &provider, &repo_id, "main", None, None).unwrap();
+        assert_eq!(
+            git_stdout(&fallback_mirror, &["rev-parse", "main^{tree}"]),
+            git_stdout(&full_mirror, &["rev-parse", "main^{tree}"]),
+            "seed-miss fallback tree must match full-clone mirror tree"
+        );
+        unsafe { std::env::remove_var("RIPCLONE_ORIGIN_BASE") };
     }
 
     fn auth_header() -> String {
