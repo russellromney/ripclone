@@ -273,7 +273,8 @@ pub async fn connect_sql_queue() -> Result<SqlJobQueue> {
              (expected 'sqlite', 'postgres', 'mysql', or 'libsql')"
         ),
     };
-    SqlJobQueue::new(db).await
+    let classes = crate::queue::load_size_classes(&config().queue.size_classes)?;
+    SqlJobQueue::new_with_classes(db, classes).await
 }
 
 fn is_remote_url(url: &str) -> bool {

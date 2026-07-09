@@ -74,6 +74,7 @@ mod tests {
             rev: None,
             credential: None,
             recheck: 0,
+            size_bytes: None,
         }
     }
 

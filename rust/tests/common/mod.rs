@@ -1178,6 +1178,7 @@ async fn register_added_without_build_repo_id(
             .as_secs(),
         history_enabled: true,
         source: AddedRepoSource::Api,
+        repo_size_bytes: None,
     };
     if std::env::var("RIPCLONE_METADATA").ok().as_deref() == Some("sqlite") {
         use ripclone::meta::{SqlRefStore, SqliteMeta};

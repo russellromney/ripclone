@@ -107,8 +107,10 @@ impl QueueDb for MysqlDb {
         path: &str,
         branch: &str,
         credential: Option<&str>,
+        _size_class: i64,
         created_at: i64,
     ) -> Result<i64> {
+        // size_class is blessed-backend only (sqlite/libsql); mysql lags.
         // VARCHAR key columns: reject an over-long value instead of letting MySQL
         // silently truncate it (which would collide two jobs onto one key).
         check_len("key", key, 512)?;
@@ -129,6 +131,11 @@ impl QueueDb for MysqlDb {
         .await
         .context("insert job")?;
         Ok(res.last_insert_id() as i64)
+    }
+
+    async fn raise_size_class(&self, _id: i64, _rank: i64) -> Result<()> {
+        // size_class column lags on mysql.
+        Ok(())
     }
 
     async fn reclaim_stale(
@@ -199,7 +206,8 @@ impl QueueDb for MysqlDb {
             .context("fetch job size_class")
     }
 
-    async fn next_queued_id(&self) -> Result<Option<i64>> {
+    async fn next_queued_id(&self, _max_size_class: Option<i64>) -> Result<Option<i64>> {
+        // Claim filter lags with the size_class column; claim everything.
         sqlx::query_scalar(
             "SELECT id FROM jobs WHERE status = 'queued' ORDER BY created_at, id LIMIT 1",
         )

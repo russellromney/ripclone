@@ -50,7 +50,8 @@ impl QueueDb for LibsqlDb {
         let _ = conn.execute(ADD_CREDENTIAL_COLUMN_SQL, ()).await;
         // Same best-effort migration for the attempts column (dead-letter bound).
         let _ = conn.execute(ADD_ATTEMPTS_COLUMN_SQL, ()).await;
-        // Best-effort migration for size_class (stale-reclaim escalation rung).
+        // size_class rank: the claim filter (right-sizing) reads it, and
+        // stale-reclaim bumps it as an escalation rung. Best-effort migration.
         let _ = conn.execute(ADD_SIZE_CLASS_COLUMN_SQL, ()).await;
         conn.execute(CREATE_STATUS_INDEX_SQL, ())
             .await
@@ -89,6 +90,7 @@ impl QueueDb for LibsqlDb {
         path: &str,
         branch: &str,
         credential: Option<&str>,
+        size_class: i64,
         created_at: i64,
     ) -> Result<i64> {
         let conn = self.conn().await?;
@@ -97,13 +99,25 @@ impl QueueDb for LibsqlDb {
             None => libsql::Value::Null,
         };
         conn.execute(
-            "INSERT INTO jobs (key, provider, path, branch, status, credential, created_at)
-             VALUES (?, ?, ?, ?, 'queued', ?, ?)",
-            libsql::params![key, provider, path, branch, cred_val, created_at],
+            "INSERT INTO jobs (key, provider, path, branch, status, credential, size_class, created_at)
+             VALUES (?, ?, ?, ?, 'queued', ?, ?, ?)",
+            libsql::params![key, provider, path, branch, cred_val, size_class, created_at],
         )
         .await
         .context("insert job")?;
         Ok(conn.last_insert_rowid())
+    }
+
+    async fn raise_size_class(&self, id: i64, rank: i64) -> Result<()> {
+        let conn = self.conn().await?;
+        conn.execute(
+            "UPDATE jobs SET size_class = MAX(size_class, ?)
+             WHERE id = ? AND status = 'queued'",
+            libsql::params![rank, id],
+        )
+        .await
+        .context("raise size_class")?;
+        Ok(())
     }
 
     async fn reclaim_stale(
@@ -165,15 +179,25 @@ impl QueueDb for LibsqlDb {
         }
     }
 
-    async fn next_queued_id(&self) -> Result<Option<i64>> {
+    async fn next_queued_id(&self, max_size_class: Option<i64>) -> Result<Option<i64>> {
         let conn = self.conn().await?;
-        let mut rows = conn
-            .query(
-                "SELECT id FROM jobs WHERE status = 'queued' ORDER BY created_at, id LIMIT 1",
-                (),
-            )
-            .await
-            .context("select next queued")?;
+        let mut rows = match max_size_class {
+            None => conn
+                .query(
+                    "SELECT id FROM jobs WHERE status = 'queued' ORDER BY created_at, id LIMIT 1",
+                    (),
+                )
+                .await
+                .context("select next queued")?,
+            Some(ceiling) => conn
+                .query(
+                    "SELECT id FROM jobs WHERE status = 'queued' AND size_class <= ?
+                     ORDER BY created_at, id LIMIT 1",
+                    libsql::params![ceiling],
+                )
+                .await
+                .context("select next queued under size-class ceiling")?,
+        };
         match rows.next().await? {
             Some(row) => Ok(Some(row.get::<i64>(0)?)),
             None => Ok(None),

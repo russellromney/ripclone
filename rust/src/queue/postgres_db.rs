@@ -122,8 +122,10 @@ impl QueueDb for PostgresDb {
         path: &str,
         branch: &str,
         credential: Option<&str>,
+        _size_class: i64,
         created_at: i64,
     ) -> Result<i64> {
+        // size_class is blessed-backend only (sqlite/libsql); postgres lags.
         sqlx::query_scalar(
             "INSERT INTO jobs (key, provider, path, branch, status, credential, created_at)
              VALUES ($1, $2, $3, $4, 'queued', $5, $6) RETURNING id",
@@ -137,6 +139,11 @@ impl QueueDb for PostgresDb {
         .fetch_one(&self.pool)
         .await
         .context("insert job")
+    }
+
+    async fn raise_size_class(&self, _id: i64, _rank: i64) -> Result<()> {
+        // size_class column lags on postgres.
+        Ok(())
     }
 
     async fn reclaim_stale(
@@ -198,7 +205,8 @@ impl QueueDb for PostgresDb {
             .context("fetch job size_class")
     }
 
-    async fn next_queued_id(&self) -> Result<Option<i64>> {
+    async fn next_queued_id(&self, _max_size_class: Option<i64>) -> Result<Option<i64>> {
+        // Claim filter lags with the size_class column; claim everything.
         sqlx::query_scalar(
             "SELECT id FROM jobs WHERE status = 'queued' ORDER BY created_at, id LIMIT 1",
         )
