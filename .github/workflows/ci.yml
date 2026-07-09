@@ -188,6 +188,11 @@ jobs:
           RIPCLONE_TEST_PG_URL: postgres://postgres:ripclone@127.0.0.1:5432/ripclone
           RIPCLONE_TEST_MYSQL_URL: mysql://root:ripclone@127.0.0.1:3306/ripclone
           CI_ARTIFACTS: ${{ github.workspace }}/bin
+          # Worker e2e spawns the worker process; point it at the downloaded bin
+          # (compile-time env! path is the ci-build runner and does not exist here).
+          CARGO_BIN_EXE_ripclone-worker: ${{ github.workspace }}/bin/ripclone-worker
+          CARGO_BIN_EXE_ripclone: ${{ github.workspace }}/bin/ripclone
+          CARGO_BIN_EXE_ripclone-server: ${{ github.workspace }}/bin/ripclone-server
         run: |
           set -euo pipefail
           chmod +x bin/*
@@ -319,6 +324,8 @@ jobs:
       - name: Gitea provider + server-side-token e2e
         env:
           CI_ARTIFACTS: ${{ github.workspace }}/bin
+          CARGO_BIN_EXE_ripclone: ${{ github.workspace }}/bin/ripclone
+          CARGO_BIN_EXE_ripclone-server: ${{ github.workspace }}/bin/ripclone-server
         run: |
           set -euo pipefail
           chmod +x bin/*
