@@ -19,6 +19,10 @@
 //!   above your longest build.
 //! - `RIPCLONE_QUEUE_FAILED_RETENTION_SECS` (default 7d): the worker periodically
 //!   prunes `failed` jobs older than this. `done` jobs are kept as build history.
+//! - `RIPCLONE_IDLE_EXIT_SECS` / `--idle-exit-secs`: exit after N seconds of
+//!   empty claim attempts (scale-to-zero). Off by default.
+//! - `RIPCLONE_MAX_JOBS` / `--max-jobs`: exit after N builds (one-shot
+//!   platforms). Off by default.
 //!
 //! ## Topology constraints
 //!
@@ -31,6 +35,9 @@
 //!   the durable `StorageBackend` and `RefStore` — that is where real state lives.
 //! - **Metrics are per-process.** Build metrics recorded here live on this
 //!   worker, not the server; scrape workers too for full visibility.
+//! - **Lifecycle is opt-in.** Without the flags the loop runs forever (today's
+//!   behavior). With them a compute provider can drain-and-exit without knowing
+//!   which mode it is in — both flags live in the same env bag.
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -57,6 +64,20 @@ struct Args {
     /// How long to wait before polling again when the queue is empty (ms).
     #[arg(long, default_value = "1000")]
     idle_poll_ms: u64,
+
+    /// Exit after the queue has been empty for N seconds (scale-to-zero).
+    ///
+    /// Idle-exit is atomic with claiming: the worker exits only on a claim that
+    /// comes back empty after N seconds of continuous empty claims. A job that
+    /// lands in the exit window is not re-checked here — the cloud reconcile
+    /// cron (or the next worker start) covers it. Off by default.
+    #[arg(long, env = "RIPCLONE_IDLE_EXIT_SECS")]
+    idle_exit_secs: Option<u64>,
+
+    /// Exit after N builds (one-shot platforms, e.g. Lambda). Counts each
+    /// claimed job that finishes the build+ack cycle. Off by default.
+    #[arg(long, env = "RIPCLONE_MAX_JOBS")]
+    max_jobs: Option<u64>,
 }
 
 #[tokio::main]
@@ -77,8 +98,10 @@ async fn main() -> Result<()> {
 
     let worker_id = format!("worker-{}", std::process::id());
     info!(
-        "ripclone-worker {worker_id} polling {} queue",
-        backends::queue_kind()
+        "ripclone-worker {worker_id} polling {} queue (idle_exit_secs={:?}, max_jobs={:?})",
+        backends::queue_kind(),
+        args.idle_exit_secs,
+        args.max_jobs,
     );
 
     let idle = Duration::from_millis(args.idle_poll_ms);
@@ -86,6 +109,10 @@ async fn main() -> Result<()> {
     // Runs on the first iteration too, so an ephemeral worker still prunes.
     let prune_interval = Duration::from_secs(3600);
     let mut pruned_at: Option<Instant> = None;
+    // Wall-clock of the first empty claim in the current idle streak. Reset on
+    // every successful claim so a burst drains fully before idle-exit can fire.
+    let mut idle_since: Option<Instant> = None;
+    let mut jobs_done: u64 = 0;
     loop {
         let prune_due = pruned_at
             .map(|t| t.elapsed() >= prune_interval)
@@ -100,6 +127,7 @@ async fn main() -> Result<()> {
         }
         match queue.claim(&worker_id).await {
             Ok(Some(claimed)) => {
+                idle_since = None;
                 let job_id = claimed.id;
                 let repo_id = claimed.repo_id();
                 info!(
@@ -170,12 +198,34 @@ async fn main() -> Result<()> {
                     ),
                     Err(e) => error!("failed to ack job {job_id}: {e}"),
                 }
+                jobs_done += 1;
+                if let Some(max) = args.max_jobs
+                    && jobs_done >= max
+                {
+                    info!("reached max-jobs {max}, exiting");
+                    break;
+                }
             }
-            Ok(None) => tokio::time::sleep(idle).await,
+            Ok(None) => {
+                // Exit only on an empty claim after N seconds of continuous
+                // emptiness. Do not exit after sleeping without re-claiming —
+                // that would race a job landing in the sleep window.
+                if let Some(secs) = args.idle_exit_secs {
+                    let since = idle_since.get_or_insert_with(Instant::now);
+                    if since.elapsed() >= Duration::from_secs(secs) {
+                        info!("queue empty for {secs}s, exiting");
+                        break;
+                    }
+                }
+                tokio::time::sleep(idle).await;
+            }
             Err(e) => {
+                // Claim errors are not empty claims — don't start/advance idle
+                // exit, and don't count toward max-jobs. Fail loudly, poll again.
                 error!("claim failed: {e}");
                 tokio::time::sleep(idle).await;
             }
         }
     }
+    Ok(())
 }
