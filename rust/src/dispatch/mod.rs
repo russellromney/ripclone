@@ -114,9 +114,11 @@ mod url_guard_tests {
 /// Keys include:
 /// - queue URL + creds (claim)
 /// - storage creds (upload)
-/// - metadata target (ApiRefStore report URL + per-job token — no DB creds)
+/// - metadata target (today: direct DB creds; target design is an
+///   ApiRefStore report URL + per-job token with no DB creds — not yet
+///   implemented, see `ENV_BAG.md` Decision D-A)
 /// - upstream-credential source
-/// - ripclone token
+/// - ripclone token (reserved, not read by `ripclone-worker` yet)
 /// - `--max-size-class`
 /// - lifecycle flags (`--idle-exit-secs` / `--max-jobs`)
 ///

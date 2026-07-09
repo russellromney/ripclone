@@ -41,6 +41,7 @@ async fn enqueue(path: &str) -> (SqlJobQueue, i64) {
             rev: None,
             credential: None,
             recheck: 0,
+            size_bytes: None,
         })
         .await
         .expect("enqueue");
@@ -55,6 +56,7 @@ async fn enqueue_on(queue: &SqlJobQueue, path: &str) -> i64 {
             rev: None,
             credential: None,
             recheck: 0,
+            size_bytes: None,
         })
         .await
         .expect("enqueue");
