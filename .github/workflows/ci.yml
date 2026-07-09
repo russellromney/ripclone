@@ -79,7 +79,11 @@ jobs:
       - name: Tests (ci profile)
         run: bash scripts/ci.sh test
 
-  e2e:
+  # One compile (ci profile + mold) for every job that only needs runnable
+  # binaries or a few integration tests. Fan-out jobs DOWNLOAD these and never
+  # invoke cargo — same profile was not enough while each job had its own
+  # runner and cold-compiled in parallel.
+  ci-build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -88,16 +92,39 @@ jobs:
           cache-workspaces: rust
       - name: Install build deps
         run: bash scripts/install-build-deps.sh
-      - name: End-to-end (local origin, real binaries)
-        run: bash scripts/ci.sh e2e
+      - name: Build bins + fan-out test binaries (ci profile)
+        run: bash scripts/ci.sh ci-build
+      - name: Upload ci artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-artifacts
+          path: rust/target/ci-artifacts/*
+          if-no-files-found: error
+          retention-days: 1
+
+  e2e:
+    needs: ci-build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Download ci artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: ci-artifacts
+          path: bin
+      - name: End-to-end (local origin, prebuilt binaries)
+        env:
+          CI_ARTIFACTS: ${{ github.workspace }}/bin
+        run: |
+          set -euo pipefail
+          chmod +x bin/*
+          bash scripts/ci.sh e2e
 
   # Queue + metadata adapters against REAL network databases — Postgres + MySQL
-  # (GHA service containers, ready in parallel with rustc install) and libsql
-  # (local `sqld`). The default `test` job only compile-checks these engines;
-  # this job exercises dialect-specific SQL. Gated on the same rust-changes
-  # filter as docker so docs-only PRs skip it.
+  # (GHA service containers) and libsql (local `sqld`). Runs prebuilt test
+  # binaries from ci-build — no cargo on this runner.
   databases:
-    needs: changes
+    needs: [changes, ci-build]
     if: ${{ needs.changes.outputs.docker == 'true' }}
     runs-on: ubuntu-latest
     services:
@@ -120,8 +147,6 @@ jobs:
           MYSQL_DATABASE: ripclone
         ports:
           - 3306:3306
-        # Real SELECT (not ping) — mysql:8's entrypoint temporary server answers
-        # ping before the real mysqld is up.
         options: >-
           --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -pripclone --silent"
           --health-interval 3s
@@ -129,14 +154,11 @@ jobs:
           --health-retries 40
     steps:
       - uses: actions/checkout@v7
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: Download ci artifacts
+        uses: actions/download-artifact@v8
         with:
-          cache-workspaces: rust
-      - name: Install build deps
-        run: bash scripts/install-build-deps.sh
-      # Put the `sqld` binary on PATH so the libsql e2e runs (it auto-skips
-      # without it). Best-effort: if the image layout changes, libsql is skipped
-      # but the Postgres + MySQL legs still run.
+          name: ci-artifacts
+          path: bin
       - name: Install sqld (libsql server)
         continue-on-error: true
         run: |
@@ -148,9 +170,6 @@ jobs:
           sudo install -m 0755 ./sqld /usr/local/bin/sqld
           rm -f ./sqld
           sqld --version
-      # mysql:8's entrypoint temporary server answers mysqladmin ping before the
-      # real mysqld is up — GHA health can go green too early. Confirm with a
-      # real query before cargo runs.
       - name: Wait for MySQL to accept real queries
         run: |
           set -euo pipefail
@@ -164,18 +183,18 @@ jobs:
           done
           echo "mysql never became ready" >&2
           exit 1
-      - name: Postgres + MySQL + libsql (queue + metadata) on real servers
+      - name: Postgres + MySQL + libsql (prebuilt tests)
         env:
-          # Service containers are already up (overlapped with toolchain install).
           RIPCLONE_TEST_PG_URL: postgres://postgres:ripclone@127.0.0.1:5432/ripclone
           RIPCLONE_TEST_MYSQL_URL: mysql://root:ripclone@127.0.0.1:3306/ripclone
-          CARGO_PROFILE: ci
-        run: bash scripts/ci.sh databases
+          CI_ARTIFACTS: ${{ github.workspace }}/bin
+        run: |
+          set -euo pipefail
+          chmod +x bin/*
+          bash scripts/ci.sh databases
 
   # Discover the individual #[ignore = "requires S3 credentials"] test names in
   # e2e_remote_gc_s3.rs so the s3gc job below can shard one-test-per-runner.
-  # Reading the list at CI time (instead of hand-listing it in the matrix)
-  # means a test added/renamed/removed in that file is picked up automatically.
   s3gc-tests:
     needs: changes
     if: ${{ needs.changes.outputs.docker == 'true' }}
@@ -195,43 +214,9 @@ jobs:
           test "$(echo "$json" | jq 'length')" -ge 1
           echo "tests=$json" >> "$GITHUB_OUTPUT"
 
-  # Compile the s3gc test binary once (ci profile + mold). Matrix shards below
-  # download it and run a single test each — no recompile per shard.
-  s3gc-build:
-    needs: changes
-    if: ${{ needs.changes.outputs.docker == 'true' }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          cache-workspaces: rust
-      - name: Install build deps
-        run: bash scripts/install-build-deps.sh
-      - name: Build e2e_remote_gc_s3 (ci profile, no run)
-        run: bash scripts/ci.sh s3gc-build
-      - name: Upload s3gc test binary + CLI
-        uses: actions/upload-artifact@v7
-        with:
-          name: s3gc-test-bin
-          path: |
-            rust/target/ci/e2e_remote_gc_s3
-            rust/target/ci/ripclone
-          if-no-files-found: error
-          retention-days: 1
-
-  # S3-backed remote GC end-to-end suite against a real MinIO container. These
-  # tests are #[ignored] in the default cargo suite because they need an S3
-  # backend; this job provides one locally and runs them on every PR touching
-  # rust/.
-  #
-  # Sharded one test per matrix job (fail-fast: false). Each job downloads the
-  # prebuilt binary from s3gc-build (no cargo), gets its own MinIO service +
-  # unique bucket, and runs exactly one test. Within a shard SERVER_LOCK is a
-  # no-op (one test per process). Isolation: unique bucket name, unique
-  # on-disk temp dirs via tempfile/UUID inside the tests, free_port per server.
+  # S3-backed remote GC e2e — prebuilt binary from ci-build, one test per shard.
   s3gc:
-    needs: [changes, s3gc-tests, s3gc-build]
+    needs: [changes, s3gc-tests, ci-build]
     if: ${{ needs.changes.outputs.docker == 'true' }}
     runs-on: ubuntu-latest
     strategy:
@@ -241,9 +226,6 @@ jobs:
     services:
       minio:
         image: minio/minio:latest
-        # The latest image no longer defaults to `server /data`; without an
-        # explicit command it prints help and exits, so the service must run
-        # the server subcommand directly.
         command: server /data
         env:
           MINIO_ROOT_USER: minioadmin
@@ -252,10 +234,10 @@ jobs:
           - 9000:9000
     steps:
       - uses: actions/checkout@v7
-      - name: Download s3gc test binary
+      - name: Download ci artifacts
         uses: actions/download-artifact@v8
         with:
-          name: s3gc-test-bin
+          name: ci-artifacts
           path: bin
       - name: Wait for MinIO and create per-shard bucket
         env:
@@ -264,9 +246,6 @@ jobs:
           STRATEGY_JOB_INDEX: ${{ strategy.job-index }}
         run: |
           set -euo pipefail
-          # Unique bucket per matrix shard so parallel jobs never share S3 state.
-          # S3 bucket names: lowercase, digits, hyphens; keep under 63 chars.
-          # strategy.job-index is 0-based across the matrix expansion.
           SHARD_BUCKET="ripclone-${GITHUB_RUN_ID}-${STRATEGY_JOB_INDEX:-0}"
           for i in {1..30}; do
             if curl -sf http://127.0.0.1:9000/minio/health/live >/dev/null; then
@@ -280,36 +259,21 @@ jobs:
       - name: S3 GC e2e against MinIO (${{ matrix.test }})
         env:
           S3GC_TEST_BIN: ${{ github.workspace }}/bin/e2e_remote_gc_s3
-          # Runtime override: env!("CARGO_BIN_EXE_ripclone") is baked to the
-          # *build* job's absolute path; point the CLI test at the downloaded
-          # binary instead. (Cargo itself also sets this env when it runs tests.)
           CARGO_BIN_EXE_ripclone: ${{ github.workspace }}/bin/ripclone
-          # Use production S3 client defaults (30s request / 5 attempts / 2s
-          # max retry delay). A shorter request timeout was tried and caused
-          # upload/cleanup retry storms that *lengthened* test bodies. Connect
-          # fast-fail is already ~5s via the reqx transport default.
         run: |
           set -euo pipefail
           chmod +x "$S3GC_TEST_BIN" "$CARGO_BIN_EXE_ripclone"
-          # Prove the filter is wired: cargo-style output must report 1 test.
           bash scripts/ci.sh s3gc "${{ matrix.test }}"
 
-  # Real multi-provider + server-side-token path against a live Gitea. This is
-  # the seam a production dogfood found broken but every file:// e2e missed: a
-  # self-hosted `gitea` provider whose upstream token lives ONLY on the server
-  # (via RIPCLONE_PROVIDERS), the client passing none — the exact config the
-  # provider-token clobber (#114) broke. Gated on the same changes/docker filter
-  # as s3gc so docs-only PRs skip it.
+  # Real multi-provider + server-side-token path against a live Gitea.
+  # Prebuilt e2e_gitea_provider from ci-build — no cargo on this runner.
   gitea:
-    needs: changes
+    needs: [changes, ci-build]
     if: ${{ needs.changes.outputs.docker == 'true' }}
     runs-on: ubuntu-latest
     services:
       gitea:
         image: gitea/gitea:latest
-        # Skip the web installer and run headless on sqlite: INSTALL_LOCK plus a
-        # sqlite3 DB means the DB migrates on first boot with no interactive
-        # setup, so the CLI can create the admin user the moment the API is up.
         env:
           GITEA__security__INSTALL_LOCK: "true"
           GITEA__database__DB_TYPE: sqlite3
@@ -320,16 +284,14 @@ jobs:
           - 3000:3000
     steps:
       - uses: actions/checkout@v7
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: Download ci artifacts
+        uses: actions/download-artifact@v8
         with:
-          cache-workspaces: rust
-      - name: Install build deps
-        run: bash scripts/install-build-deps.sh
+          name: ci-artifacts
+          path: bin
       - name: Wait for Gitea, create admin + access token
         run: |
           set -euo pipefail
-          # Wait until the migrated API answers (the server runs migrations on
-          # first boot, so a 200 here means the DB is ready for the admin CLI).
           for i in {1..60}; do
             if curl -sf http://127.0.0.1:3000/api/v1/version >/dev/null; then
               break
@@ -337,23 +299,17 @@ jobs:
             sleep 0.5
           done
           curl -sf http://127.0.0.1:3000/api/v1/version >/dev/null
-          # The service container is not addressable by its compose alias for
-          # `docker exec`, so resolve the id by image.
           cid="$(docker ps --filter ancestor=gitea/gitea:latest --format '{{.ID}}' | head -n1)"
           test -n "$cid"
-          # First admin user (no web installer means it must be created via CLI).
           docker exec -u git "$cid" gitea admin user create \
             --admin --username ci --password ci-password-123 \
             --email ci@example.com --must-change-password=false
-          # Mint a scoped access token via the API (Basic-auth with the admin
-          # creds). This token authenticates both the Gitea API and git-over-http.
           token="$(curl -sf -X POST \
             -H 'Content-Type: application/json' \
             -u ci:ci-password-123 \
             -d '{"name":"ripclone-ci","scopes":["write:repository","write:user","read:repository","read:user"]}' \
             http://127.0.0.1:3000/api/v1/users/ci/tokens | jq -r .sha1)"
           test -n "$token" && test "$token" != "null"
-          # Prove the token works before the test runs (seed check).
           curl -sf -H "Authorization: token $token" \
             http://127.0.0.1:3000/api/v1/user >/dev/null
           echo "RIPCLONE_GITEA_URL=http://127.0.0.1:3000" >> "$GITHUB_ENV"
@@ -361,67 +317,47 @@ jobs:
           echo "::add-mask::$token"
           echo "RIPCLONE_GITEA_TOKEN=$token" >> "$GITHUB_ENV"
       - name: Gitea provider + server-side-token e2e
-        run: bash scripts/ci.sh gitea
+        env:
+          CI_ARTIFACTS: ${{ github.workspace }}/bin
+        run: |
+          set -euo pipefail
+          chmod +x bin/*
+          bash scripts/ci.sh gitea
 
-  # Benchmark-harness smoke test. The benchmark scripts drive the server over
-  # raw HTTP, so a change to the server's request/response contract does NOT
-  # break them at compile time — it silently rots the harness against the next
-  # deploy (exactly how the B5 added-repos gate broke it unnoticed: the harness
-  # never `add`ed a repo, so a current server would reject every sync with
-  # repo_not_added). This job runs benchmark/fly_shaped_benchmark.sh end-to-end
-  # against a real local ripclone-server and fails if the harness cannot
-  # add/warm/benchmark a fixture repo. Fast tier: debug binaries, file:// origin,
-  # unshaped, one run — a couple of minutes. Gated on a bench-specific path
-  # filter so harness- or server-only PRs run it and docs-only PRs skip it.
+  # Benchmark-harness smoke — prebuilt bins from ci-build.
   benchmark:
-    needs: changes
+    needs: [changes, ci-build]
     if: ${{ needs.changes.outputs.bench == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: Download ci artifacts
+        uses: actions/download-artifact@v8
         with:
-          cache-workspaces: rust
-      - name: Install build deps
-        run: bash scripts/install-build-deps.sh
-      - name: Benchmark-harness smoke test (local origin, real server)
-        run: bash scripts/ci.sh benchmark
+          name: ci-artifacts
+          path: bin
+      - name: Benchmark-harness smoke test (local origin, prebuilt server)
+        env:
+          CI_ARTIFACTS: ${{ github.workspace }}/bin
+        run: |
+          set -euo pipefail
+          chmod +x bin/*
+          bash scripts/ci.sh benchmark
 
-  # Validate the images assemble and the binaries run. The real Dockerfiles use
-  # buildkit cargo cache mounts that persist on the Fly/Depot deploy builder but
-  # NOT on GitHub-hosted runners, so building them here would recompile ~400
-  # crates cold every run. Instead, compile the binaries once with the cached
-  # toolchain (same as every other job) and assemble runtime-only images
-  # (Dockerfile.ci / Dockerfile.client.ci) from them — the runtime stage (apt
-  # deps, COPY paths, the binaries running) is what this catches. The real
-  # multi-stage Dockerfiles' builder stage is validated on the deploy builder.
-  # Gated by the changes filter; runs in parallel with the other jobs.
+  # Image assembly smoke from prebuilt bins — no cargo on this runner.
   docker:
-    needs: changes
+    needs: [changes, ci-build]
     if: ${{ needs.changes.outputs.docker == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: Download ci artifacts
+        uses: actions/download-artifact@v8
         with:
-          cache-workspaces: rust
-      - name: Install build deps
-        run: bash scripts/install-build-deps.sh
-      # ci profile (not --release): this job only smoke-tests image assembly +
-      # --help. Sharing the unit-test graph avoids a third full compile (~5 min
-      # of pure release when every other job is already on ci).
-      - name: Build binaries (ci profile, cached toolchain)
-        working-directory: rust
-        run: cargo build --profile ci --locked --bins
-      - name: Stage binaries (rust/target is .dockerignored)
-        run: |
-          mkdir -p ci-bins
-          cp rust/target/ci/ripclone \
-             rust/target/ci/ripclone-server \
-             rust/target/ci/ripclone-worker \
-             rust/target/ci/git-remote-ripclone \
-             rust/target/ci/writer_bench \
-             ci-bins/
+          name: ci-artifacts
+          path: ci-bins
+      - name: Stage binaries for Dockerfiles
+        run: chmod +x ci-bins/*
       - name: Assemble runtime images from the compiled binaries
         run: |
           docker build -f tests/fly/Dockerfile.ci -t ripclone-server:ci .

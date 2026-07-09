@@ -28,14 +28,13 @@ run_tests() {
 }
 
 e2e() {
-  # ci profile: release-like speed, shares the unit-test graph. Full --release
-  # recompiled a third graph for this one job alone.
-  local profile="${CARGO_PROFILE:-ci}"
-  ( cd "$ROOT/rust" && cargo build --profile "$profile" --locked --bins )
-  # e2e_local.sh looks for target/release/* by default; point it at the
-  # profile dir when not building release.
-  if [ "$profile" != "release" ]; then
-    export RIPCLONE_BIN_DIR="${RIPCLONE_BIN_DIR:-$ROOT/rust/target/$profile}"
+  # Prefer prebuilt bins from ci-build (CI_ARTIFACTS / RIPCLONE_BIN_DIR).
+  if [ -n "${CI_ARTIFACTS:-}" ]; then
+    export RIPCLONE_BIN_DIR="${RIPCLONE_BIN_DIR:-$CI_ARTIFACTS}"
+  elif [ -z "${RIPCLONE_BIN_DIR:-}" ]; then
+    local profile="${CARGO_PROFILE:-ci}"
+    ( cd "$ROOT/rust" && cargo build --profile "$profile" --locked --bins )
+    export RIPCLONE_BIN_DIR="$ROOT/rust/target/$profile"
   fi
   bash "$ROOT/scripts/e2e_local.sh"
 }
@@ -56,10 +55,15 @@ gitea() {
   export RIPCLONE_GITEA_URL="${RIPCLONE_GITEA_URL:-http://127.0.0.1:3000}"
   export RIPCLONE_GITEA_USER="${RIPCLONE_GITEA_USER:-ci}"
   : "${RIPCLONE_GITEA_TOKEN:?set RIPCLONE_GITEA_TOKEN to a Gitea admin access token}"
-  # ci profile (same as the unit-test gate). Default/dev recompiles the whole
-  # graph for this one job and dominated wall time on cold runners (~6 min).
-  local profile="${CARGO_PROFILE:-ci}"
-  ( cd "$ROOT/rust" && cargo test --profile "$profile" --locked --test e2e_gitea_provider -- --ignored --nocapture )
+  if [ -n "${CI_ARTIFACTS:-}" ]; then
+    local bin="$CI_ARTIFACTS/e2e_gitea_provider"
+    [ -x "$bin" ] || { echo "error: missing $bin" >&2; exit 1; }
+    echo "gitea: running prebuilt $bin"
+    ( cd "$ROOT/rust" && "$bin" --ignored --nocapture )
+  else
+    local profile="${CARGO_PROFILE:-ci}"
+    ( cd "$ROOT/rust" && cargo test --profile "$profile" --locked --test e2e_gitea_provider -- --ignored --nocapture )
+  fi
 }
 
 # Real network databases for the queue + metadata adapters the default suite can
@@ -67,71 +71,46 @@ gitea() {
 # libsql against a local `sqld`. Needs docker; the libsql leg also needs `sqld`
 # on PATH (the test auto-skips without it).
 databases() {
-  # One profile for the whole job: previously test-queue-sql compiled the
-  # default (dev) graph and libsql recompiled --release, paying two full
-  # builds. `ci` matches the unit-test gate.
   export CARGO_PROFILE="${CARGO_PROFILE:-ci}"
   bash "$ROOT/scripts/test-queue-sql.sh"
-  ( cd "$ROOT/rust" && cargo test --profile "$CARGO_PROFILE" --locked --test e2e_worker_libsql -- --nocapture )
+  if [ -n "${CI_ARTIFACTS:-}" ]; then
+    local bin="$CI_ARTIFACTS/e2e_worker_libsql"
+    [ -x "$bin" ] || { echo "error: missing $bin" >&2; exit 1; }
+    echo "databases: running prebuilt $bin"
+    ( cd "$ROOT/rust" && "$bin" --nocapture )
+  else
+    ( cd "$ROOT/rust" && cargo test --profile "$CARGO_PROFILE" --locked --test e2e_worker_libsql -- --nocapture )
+  fi
 }
 
 # Benchmark-harness smoke test. The benchmark scripts talk to the server over
 # raw HTTP, so a change to the server's contract (like the B5 added-repos gate)
 # does not recompile them — it silently breaks the harness against the next
 # deploy. This runs the real benchmark/fly_shaped_benchmark.sh end-to-end against
-# a local debug server and fails if the harness cannot add/warm/benchmark a
-# fixture repo (e.g. is rejected with repo_not_added). Fast tier: debug binaries,
-# file:// origin, unshaped, one run. Needs the debug ripclone + ripclone-server.
+# a local server and fails if the harness cannot add/warm/benchmark a fixture
+# repo. Fast tier: file:// origin, unshaped, one run.
 benchmark() {
-  # ci profile (not default debug): shares the unit-test graph. Debug was a
-  # third full compile for a harness smoke that only needs "binaries run".
-  local profile="${CARGO_PROFILE:-ci}"
-  ( cd "$ROOT/rust" && cargo build --profile "$profile" --locked --bin ripclone --bin ripclone-server )
-  export SERVER_BIN="${SERVER_BIN:-$ROOT/rust/target/$profile/ripclone-server}"
-  export CLI_BIN="${CLI_BIN:-$ROOT/rust/target/$profile/ripclone}"
+  if [ -n "${CI_ARTIFACTS:-}" ]; then
+    export SERVER_BIN="${SERVER_BIN:-$CI_ARTIFACTS/ripclone-server}"
+    export CLI_BIN="${CLI_BIN:-$CI_ARTIFACTS/ripclone}"
+  elif [ -z "${SERVER_BIN:-}" ] || [ -z "${CLI_BIN:-}" ]; then
+    local profile="${CARGO_PROFILE:-ci}"
+    ( cd "$ROOT/rust" && cargo build --profile "$profile" --locked --bin ripclone --bin ripclone-server )
+    export SERVER_BIN="${SERVER_BIN:-$ROOT/rust/target/$profile/ripclone-server}"
+    export CLI_BIN="${CLI_BIN:-$ROOT/rust/target/$profile/ripclone}"
+  fi
   bash "$ROOT/scripts/benchmark_smoke.sh"
 }
 
-# Compile the S3 GC e2e test binary (and the ripclone CLI it shells out to)
-# once, no run. Uses the `ci` profile (release opts, many codegen units, no LTO)
-# so compile finishes faster than full --release while still running optimized.
-# Stages both under rust/target/ci/ with stable names for artifact upload.
-s3gc_build() {
-  ( cd "$ROOT/rust"
-    # --message-format=json so we can pick the exact test binary path without
-    # grepping the human log (which is unstable across cargo versions).
-    local bin
-    bin="$(
-      cargo test --profile ci --locked --test e2e_remote_gc_s3 --no-run --message-format=json \
-        | jq -r 'select(.reason == "compiler-artifact"
-                        and .target.kind == ["test"]
-                        and .target.name == "e2e_remote_gc_s3"
-                        and .executable != null)
-                 | .executable' \
-        | tail -n1
-    )"
-    if [ -z "$bin" ] || [ ! -x "$bin" ]; then
-      echo "error: could not locate e2e_remote_gc_s3 test binary after build" >&2
-      exit 1
-    fi
-    # One test spawns the CLI (expired_bearer_…); build it in the same job so
-    # shards can download both and set CARGO_BIN_EXE_ripclone at runtime.
-    cargo build --profile ci --locked --bin ripclone
+# Compile-once fan-out: bins + integration test binaries for gitea/databases/
+# docker/e2e/benchmark/s3gc. See scripts/ci-build-artifacts.sh.
+ci_build() {
+  bash "$ROOT/scripts/ci-build-artifacts.sh"
+}
 
-    # Prefer CARGO_TARGET_DIR when set (worktrees share the main checkout's
-    # target/); otherwise fall back to the package-local target/.
-    # --profile ci writes under target/ci/ (not target/release/).
-    local target_root="${CARGO_TARGET_DIR:-$ROOT/rust/target}"
-    mkdir -p "$target_root/ci" "$ROOT/rust/target/ci"
-    cp -f "$bin" "$target_root/ci/e2e_remote_gc_s3"
-    chmod +x "$target_root/ci/e2e_remote_gc_s3"
-    # Stage package-local copies for CI artifact upload paths.
-    if [ "$target_root" != "$ROOT/rust/target" ]; then
-      cp -f "$target_root/ci/e2e_remote_gc_s3" "$ROOT/rust/target/ci/e2e_remote_gc_s3"
-      cp -f "$target_root/ci/ripclone" "$ROOT/rust/target/ci/ripclone"
-    fi
-    echo "s3gc-build: wrote $target_root/ci/e2e_remote_gc_s3 + ripclone" >&2
-  )
+# Back-compat alias used by older workflow snippets / local muscle memory.
+s3gc_build() {
+  ci_build
 }
 
 # Run the S3-backed remote GC end-to-end suite against a local MinIO container
@@ -175,7 +154,7 @@ case "$STAGE" in
   e2e) e2e ;;
   flake) flake ;;
   databases) databases ;;
-  s3gc-build) s3gc_build ;;
+  ci-build|s3gc-build) ci_build ;;
   # Pass through any remaining args (e.g. a single test name for sharding).
   # Without this, `scripts/ci.sh s3gc some_test` ignored the name and every
   # "shard" re-ran the full suite (PR #126).
@@ -183,7 +162,7 @@ case "$STAGE" in
   gitea) gitea ;;
   benchmark) benchmark ;;
   all) lint; run_tests; e2e ;;
-  *) echo "usage: scripts/ci.sh [lint|test|e2e|flake|databases|s3gc-build|s3gc|gitea|benchmark|all]" >&2; exit 2 ;;
+  *) echo "usage: scripts/ci.sh [lint|test|e2e|flake|databases|ci-build|s3gc|gitea|benchmark|all]" >&2; exit 2 ;;
 esac
 
 echo "ci.sh: stage '$STAGE' OK"

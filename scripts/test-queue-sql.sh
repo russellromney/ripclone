@@ -1,18 +1,16 @@
 #!/usr/bin/env bash
 # Run the env-gated Postgres + MySQL queue tests against throwaway docker
-# databases (real-DB correctness baseline). Brings the containers up on random
-# host ports, waits for readiness, runs the unit + e2e tests with the
-# RIPCLONE_TEST_*_URL env vars set, then tears the containers down.
+# databases (real-DB correctness baseline), or against pre-set URLs (CI service
+# containers).
 #
-# Skip container management when URLs are already set (CI service containers):
-#   RIPCLONE_TEST_PG_URL=postgres://… RIPCLONE_TEST_MYSQL_URL=mysql://… \
-#     scripts/test-queue-sql.sh
+# When CI_ARTIFACTS is set to a directory of prebuilt test binaries (from
+# scripts/ci-build-artifacts.sh), no cargo compile runs — just execute them.
 #
-# Profile: CARGO_PROFILE (default: ci) — same compile as the unit-test gate so
-# we do not pay a second full graph for debug or release.
+# Profile (compile path only): CARGO_PROFILE (default: ci).
 set -euo pipefail
 
-cd "$(dirname "$0")/../rust"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR/../rust"
 
 PROFILE="${CARGO_PROFILE:-ci}"
 PG_NAME="ripclone-test-pg-$$"
@@ -33,12 +31,9 @@ if [ -n "${RIPCLONE_TEST_PG_URL:-}" ] && [ -n "${RIPCLONE_TEST_MYSQL_URL:-}" ]; 
 else
   OWNED_CONTAINERS=1
   echo "== starting postgres + mysql containers =="
-  # Start both at once so their pull/init overlap.
   docker run -d --rm --name "$PG_NAME" \
     -e POSTGRES_PASSWORD=ripclone -e POSTGRES_DB=ripclone \
     -p 127.0.0.1::5432 postgres:16 >/dev/null
-  # Fast-ish MySQL init: skip binary log + doublewrite (test-only, durability
-  # not required). Still real mysql:8 wire protocol for the dialect tests.
   docker run -d --rm --name "$MY_NAME" \
     -e MYSQL_ROOT_PASSWORD=ripclone -e MYSQL_DATABASE=ripclone \
     -p 127.0.0.1::3306 mysql:8 \
@@ -59,9 +54,6 @@ else
   done
 
   echo "== waiting for mysql ($MY_PORT) =="
-  # Use a real authenticated query (not `ping`): mysql:8's entrypoint runs a
-  # temporary init server that answers ping before the real server restarts, so
-  # ping passes too early and the first real connection hits EOF.
   for _ in $(seq 1 120); do
     docker exec "$MY_NAME" mysql -uroot -pripclone ripclone -e 'SELECT 1' >/dev/null 2>&1 && break
     sleep 0.5
@@ -71,15 +63,35 @@ else
   echo "== RIPCLONE_TEST_MYSQL_URL=$RIPCLONE_TEST_MYSQL_URL =="
 fi
 
-echo "== unit: queue + metadata lifecycle on pg + mysql (profile=$PROFILE) =="
-# "lifecycle" matches {postgres,mysql}_queue_lifecycle (jobs table) and
-# {postgres,mysql}_refstore_lifecycle (refs table) — independent tables.
-cargo test --profile "$PROFILE" --locked --lib lifecycle -- --nocapture
+run_lib_lifecycle() {
+  if [ -n "${CI_ARTIFACTS:-}" ]; then
+    local bin="$CI_ARTIFACTS/ripclone-lib-tests"
+    [ -x "$bin" ] || { echo "error: missing $bin" >&2; exit 1; }
+    echo "== unit: lifecycle via prebuilt $bin =="
+    "$bin" lifecycle --nocapture
+  else
+    echo "== unit: lifecycle via cargo (profile=$PROFILE) =="
+    cargo test --profile "$PROFILE" --locked --lib lifecycle -- --nocapture
+  fi
+}
 
-echo "== e2e: real worker process on pg + mysql =="
-cargo test --profile "$PROFILE" --locked --test e2e_worker_postgres --test e2e_worker_mysql -- --nocapture
+run_test_bin() {
+  local name="$1"
+  if [ -n "${CI_ARTIFACTS:-}" ]; then
+    local bin="$CI_ARTIFACTS/$name"
+    [ -x "$bin" ] || { echo "error: missing $bin" >&2; exit 1; }
+    echo "== e2e: $name (prebuilt) =="
+    "$bin" --nocapture
+  else
+    echo "== e2e: $name (cargo profile=$PROFILE) =="
+    cargo test --profile "$PROFILE" --locked --test "$name" -- --nocapture
+  fi
+}
 
-echo "== e2e: metadata store on pg + mysql (full server) =="
-cargo test --profile "$PROFILE" --locked --test e2e_metadata_postgres --test e2e_metadata_mysql -- --nocapture
+run_lib_lifecycle
+run_test_bin e2e_worker_postgres
+run_test_bin e2e_worker_mysql
+run_test_bin e2e_metadata_postgres
+run_test_bin e2e_metadata_mysql
 
 echo "== OK =="
