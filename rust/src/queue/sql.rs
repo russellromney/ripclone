@@ -600,7 +600,7 @@ mod tests {
         pool.close().await;
 
         let db = SqliteDb::connect(&path.to_string_lossy()).await.unwrap();
-        db.init().await.unwrap(); // adds the credential column to the legacy table
+        db.init().await.unwrap(); // adds credential / attempts / size_class columns
         db.init().await.unwrap(); // idempotent: best-effort ALTER ignores duplicate
         // Inserting a credential now works because the column exists.
         let id = db
@@ -609,6 +609,12 @@ mod tests {
             .unwrap();
         let (_, _, _, cred) = db.job_fields(id).await.unwrap().unwrap();
         assert_eq!(cred.as_deref(), Some("Y3JlZA=="));
+        // size_class migration is load-bearing for stale-reclaim escalation.
+        assert_eq!(
+            db.job_size_class(id).await.unwrap(),
+            Some(0),
+            "legacy table must gain size_class DEFAULT 0"
+        );
     }
 
     #[tokio::test]
@@ -646,6 +652,42 @@ mod tests {
             assert_eq!(second.id, id, "{engine}");
             assert!(q.ack(second.id, "w2", Ok(())).await.unwrap(), "{engine}");
             assert!(matches!(q.job_status(id).await.unwrap(), JobState::Done));
+        }
+    }
+
+    /// Transient requeue (error with retryable bit) must NOT escalate size_class
+    /// — only crash/OOM stale-reclaim does. A storage 5xx is not fixed by a
+    /// bigger box; bumping on every retry would starve small workers.
+    #[tokio::test]
+    async fn retryable_ack_does_not_bump_size_class() {
+        for engine in ["sqlite"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("q.db").to_string_lossy().to_string();
+            let db = make_db(engine, &path).await;
+            db.init().await.unwrap();
+            let q = SqlJobQueue {
+                db,
+                stale_claim_secs: DEFAULT_STALE_CLAIM_SECS,
+                failed_retention_secs: DEFAULT_FAILED_RETENTION_SECS,
+                max_build_attempts: DEFAULT_MAX_BUILD_ATTEMPTS,
+            };
+            let reader = make_db(engine, &path).await;
+
+            let enq = q.enqueue(job("o", "r", "main")).await.unwrap();
+            let id = enq.job_id.unwrap();
+            let claimed = q.claim("w1").await.unwrap().unwrap();
+            assert!(
+                q.ack(claimed.id, "w1", Err(BuildError::retryable("storage 503")))
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(
+                reader.job_size_class(id).await.unwrap(),
+                Some(0),
+                "{engine}: retryable error requeue must leave size_class at 0"
+            );
+            // Still claimable (requeued), not terminal.
+            assert!(q.claim("w2").await.unwrap().is_some(), "{engine}");
         }
     }
 

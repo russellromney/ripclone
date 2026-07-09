@@ -36,8 +36,8 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use ripclone::backends::{self, Backends};
 use ripclone::metrics::Metrics;
-use ripclone::queue::{BuildError, BuildJob, JobQueueRef};
-use ripclone::server::{ServerState, process_build_job};
+use ripclone::queue::{BuildError, BuildJob, JobQueue, JobQueueRef, JobState};
+use ripclone::server::{ServerState, mark_branch_build_failed, process_build_job};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -118,9 +118,10 @@ async fn main() -> Result<()> {
                     .with_context(|| {
                         format!("fetch credential for queued job {}", repo_id.storage_key())
                     })?;
+                let branch = claimed.branch.clone();
                 let job = BuildJob {
-                    repo_id,
-                    branch: claimed.branch,
+                    repo_id: repo_id.clone(),
+                    branch: branch.clone(),
                     rev: None,
                     credential,
                     // The SQL queue does not persist the re-check counter; a
@@ -137,8 +138,32 @@ async fn main() -> Result<()> {
                         Ok(r) => r,
                         Err(e) => Err(BuildError::retryable(format!("build task panicked: {e}"))),
                     };
+                // Retryable errors leave metadata non-terminal (so intermediate
+                // retries don't look permanent). If ack dead-letters at the
+                // attempts cap, surface that as a terminal failed status.
+                let maybe_retryable_msg = result
+                    .as_ref()
+                    .err()
+                    .filter(|e| e.is_retryable())
+                    .map(|e| e.message().to_string());
                 match queue.ack(job_id, &worker_id, result.map(|_| ())).await {
-                    Ok(true) => {}
+                    Ok(true) => {
+                        // Only when the build error was retryable: permanent
+                        // failures already wrote terminal metadata in
+                        // process_build_job. Dead-letter at the attempts cap
+                        // is the case that still needs a terminal write.
+                        if maybe_retryable_msg.is_some()
+                            && let Ok(JobState::Failed(err)) = queue.job_status(job_id).await
+                            && let Err(e) =
+                                mark_branch_build_failed(&state, &repo_id, &branch, &err).await
+                        {
+                            error!(
+                                "failed to mark {}@{} terminal after dead-letter: {e:#}",
+                                repo_id.storage_key(),
+                                branch
+                            );
+                        }
+                    }
                     Ok(false) => warn!(
                         "job {job_id} was reclaimed (or dead-lettered) before this worker \
                          finished; discarding its build result"
