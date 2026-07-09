@@ -65,9 +65,6 @@ databases() {
   ( cd "$ROOT/rust" && cargo test --release --locked --test e2e_worker_libsql -- --nocapture )
 }
 
-# Run the S3-backed remote GC end-to-end suite against a local MinIO container
-# (or any S3-compatible store pointed at by RIPCLONE_S3_ENDPOINT). This is the
-# only place these #[ignored] tests are executed in CI.
 # Benchmark-harness smoke test. The benchmark scripts talk to the server over
 # raw HTTP, so a change to the server's contract (like the B5 added-repos gate)
 # does not recompile them — it silently breaks the harness against the next
@@ -80,13 +77,79 @@ benchmark() {
   bash "$ROOT/scripts/benchmark_smoke.sh"
 }
 
+# Compile the S3 GC e2e test binary (and the ripclone CLI it shells out to)
+# once, no run. Stages both under rust/target/release/ with stable names so CI
+# can upload them as artifacts for the per-test matrix jobs.
+s3gc_build() {
+  ( cd "$ROOT/rust"
+    # --message-format=json so we can pick the exact test binary path without
+    # grepping the human log (which is unstable across cargo versions).
+    local bin
+    bin="$(
+      cargo test --release --locked --test e2e_remote_gc_s3 --no-run --message-format=json \
+        | jq -r 'select(.reason == "compiler-artifact"
+                        and .target.kind == ["test"]
+                        and .target.name == "e2e_remote_gc_s3"
+                        and .executable != null)
+                 | .executable' \
+        | tail -n1
+    )"
+    if [ -z "$bin" ] || [ ! -x "$bin" ]; then
+      echo "error: could not locate e2e_remote_gc_s3 test binary after build" >&2
+      exit 1
+    fi
+    # One test spawns the CLI (expired_bearer_…); build it in the same job so
+    # shards can download both and set CARGO_BIN_EXE_ripclone at runtime.
+    cargo build --release --locked --bin ripclone
+
+    # Prefer CARGO_TARGET_DIR when set (worktrees share the main checkout's
+    # target/); otherwise fall back to the package-local target/.
+    local target_root="${CARGO_TARGET_DIR:-$ROOT/rust/target}"
+    mkdir -p "$target_root/release" "$ROOT/rust/target/release"
+    cp -f "$bin" "$target_root/release/e2e_remote_gc_s3"
+    chmod +x "$target_root/release/e2e_remote_gc_s3"
+    # Stage package-local copies for CI artifact upload paths.
+    if [ "$target_root" != "$ROOT/rust/target" ]; then
+      cp -f "$target_root/release/e2e_remote_gc_s3" "$ROOT/rust/target/release/e2e_remote_gc_s3"
+      cp -f "$target_root/release/ripclone" "$ROOT/rust/target/release/ripclone"
+    fi
+    echo "s3gc-build: wrote $target_root/release/e2e_remote_gc_s3 + ripclone" >&2
+  )
+}
+
+# Run the S3-backed remote GC end-to-end suite against a local MinIO container
+# (or any S3-compatible store pointed at by RIPCLONE_S3_ENDPOINT). This is the
+# only place these #[ignored] tests are executed in CI.
+#
+# Optional $1: a single test name to run (CI shards one test per runner).
+# Omit it to run the whole suite locally, same as before.
+#
+# When S3GC_TEST_BIN is set, runs that prebuilt binary directly (compile-once
+# fan-out). Otherwise compiles + runs via cargo test.
 s3gc() {
+  local test_name="${1:-}"
   export RIPCLONE_S3_ENDPOINT="${RIPCLONE_S3_ENDPOINT:-http://127.0.0.1:9000}"
   export RIPCLONE_S3_BUCKET="${RIPCLONE_S3_BUCKET:-ripclone-test}"
   export RIPCLONE_S3_REGION="${RIPCLONE_S3_REGION:-us-east-1}"
   export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-minioadmin}"
   export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-minioadmin}"
-  ( cd "$ROOT/rust" && cargo test --release --locked --test e2e_remote_gc_s3 -- --ignored )
+
+  local -a filter=(--ignored)
+  if [ -n "$test_name" ]; then
+    filter+=(--exact "$test_name")
+  fi
+
+  if [ -n "${S3GC_TEST_BIN:-}" ]; then
+    if [ ! -x "$S3GC_TEST_BIN" ]; then
+      echo "error: S3GC_TEST_BIN=$S3GC_TEST_BIN is not executable" >&2
+      exit 1
+    fi
+    echo "s3gc: running prebuilt $S3GC_TEST_BIN ${filter[*]}"
+    # Liberate from cargo so the binary's cwd/tmp behavior matches a direct run.
+    ( cd "$ROOT/rust" && "$S3GC_TEST_BIN" "${filter[@]}" )
+  else
+    ( cd "$ROOT/rust" && cargo test --release --locked --test e2e_remote_gc_s3 -- "${filter[@]}" )
+  fi
 }
 
 case "$STAGE" in
@@ -95,11 +158,15 @@ case "$STAGE" in
   e2e) e2e ;;
   flake) flake ;;
   databases) databases ;;
-  s3gc) s3gc ;;
+  s3gc-build) s3gc_build ;;
+  # Pass through any remaining args (e.g. a single test name for sharding).
+  # Without this, `scripts/ci.sh s3gc some_test` ignored the name and every
+  # "shard" re-ran the full suite (PR #126).
+  s3gc) s3gc "${2:-}" ;;
   gitea) gitea ;;
   benchmark) benchmark ;;
   all) lint; run_tests; e2e ;;
-  *) echo "usage: scripts/ci.sh [lint|test|e2e|flake|databases|s3gc|gitea|benchmark|all]" >&2; exit 2 ;;
+  *) echo "usage: scripts/ci.sh [lint|test|e2e|flake|databases|s3gc-build|s3gc|gitea|benchmark|all]" >&2; exit 2 ;;
 esac
 
 echo "ci.sh: stage '$STAGE' OK"
