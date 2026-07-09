@@ -3,6 +3,12 @@
 //! SAFETY: `size_class` (and any attacker-influenced name) is passed as a
 //! **separate argv element** via [`std::process::Command::arg`]. Never
 //! interpolated into a shell string — repo/branch/size names are untrusted.
+//!
+//! Semantics match the trait: **non-blocking**. We `spawn` the helper and return
+//! as soon as the OS accepted the process. Waiting on `.output()` would hang
+//! dispatch if the command is (or wraps) a long-lived worker, and can deadlock
+//! on full stdout pipes. Exit status is the helper's problem; the reconcile
+//! loop is the backstop if the wake never produces a claimant.
 
 use super::{ComputeProvider, WorkerSpec};
 use anyhow::{Context, Result, bail};
@@ -73,13 +79,14 @@ impl ComputeProvider for ExecProvider {
     }
 
     async fn ensure_worker(&self, spec: &WorkerSpec) -> Result<()> {
+        spec.validate()?;
         let program = self.program.clone();
         let fixed_args = self.fixed_args.clone();
         let size_class = spec.size_class.clone();
         let env = spec.env.clone();
 
-        // Spawn off the async runtime: std::process::Command is sync.
-        tokio::task::spawn_blocking(move || {
+        // Spawn only (sync OS call). Do not wait for the child to exit.
+        let child = tokio::task::spawn_blocking(move || {
             let mut cmd = std::process::Command::new(&program);
             // Separate argv — never `sh -c` with interpolated size_class.
             for a in &fixed_args {
@@ -91,9 +98,11 @@ impl ComputeProvider for ExecProvider {
             for (k, v) in &env {
                 cmd.env(k, v);
             }
+            // Null stdio: a long-lived child must not fill a pipe and block, and
+            // we are not collecting exit diagnostics here (best-effort wake).
             cmd.stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
 
             info!(
                 program = %program.display(),
@@ -101,21 +110,23 @@ impl ComputeProvider for ExecProvider {
                 "exec.ensure_worker spawning"
             );
 
-            let output = cmd
-                .output()
-                .with_context(|| format!("spawn {}", program.display()))?;
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                bail!(
-                    "exec provider command failed (status={}): stderr={stderr} stdout={stdout}",
-                    output.status
-                );
-            }
-            Ok(())
+            cmd.spawn()
+                .with_context(|| format!("spawn {}", program.display()))
         })
         .await
-        .context("exec provider join")?
+        .context("exec provider join")??;
+
+        // Reap in the background so we don't leave zombies, but don't block
+        // the caller on the child's lifetime.
+        tokio::spawn(async move {
+            let _ = tokio::task::spawn_blocking(move || {
+                let mut child = child;
+                let _ = child.wait();
+            })
+            .await;
+        });
+
+        Ok(())
     }
 }
 
@@ -124,15 +135,16 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
     use std::io::Write;
+    use std::time::{Duration, Instant};
 
     fn write_recorder(dir: &std::path::Path) -> PathBuf {
-        // Records argv as JSON lines of each arg, so we can assert no shell split.
+        // Records argv as one line per element, so we can assert no shell split.
         let path = dir.join("record_argv.sh");
         let mut f = std::fs::File::create(&path).unwrap();
         writeln!(
             f,
             r#"#!/bin/sh
-# Recorder: write each argv element on its own line (length-prefixed safe-ish).
+# Recorder: write each argv element on its own line.
 out="$1"
 shift
 : > "$out"
@@ -151,7 +163,6 @@ done
 "#
         )
         .unwrap();
-        // Make executable.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -160,6 +171,17 @@ done
             std::fs::set_permissions(&path, perms).unwrap();
         }
         path
+    }
+
+    fn chmod_x(path: &std::path::Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(path, perms).unwrap();
+        }
+        let _ = path;
     }
 
     #[test]
@@ -175,13 +197,6 @@ done
         assert_eq!(argv[0], OsString::from("/usr/bin/true"));
         assert_eq!(argv[1], OsString::from("--lane"));
         assert_eq!(argv[2], OsString::from(nasty));
-        // Must not be a single shell string.
-        let joined = argv
-            .iter()
-            .map(|a| a.to_string_lossy())
-            .collect::<Vec<_>>()
-            .join(" ");
-        assert!(joined.contains(nasty));
     }
 
     #[tokio::test]
@@ -206,6 +221,18 @@ done
             .await
             .unwrap();
 
+        // Fire-and-forget: give the short-lived recorder a moment to flush.
+        for _ in 0..50 {
+            if out.exists()
+                && std::fs::metadata(&out)
+                    .map(|m| m.len() > 0)
+                    .unwrap_or(false)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
         let recorded = std::fs::read_to_string(&out).unwrap();
         let lines: Vec<&str> = recorded.lines().collect();
         // Script argv after the out path: only size_class (one element).
@@ -215,34 +242,80 @@ done
             "size_class must be a single argv element, not shell-split; got {lines:?}"
         );
 
-        let env_recorded = std::fs::read_to_string(out.with_extension("txt.env")).unwrap();
+        let env_recorded = std::fs::read_to_string(format!("{}.env", out.display())).unwrap();
         assert!(env_recorded.contains("RIPCLONE_QUEUE=libsql"));
         assert!(env_recorded.contains("RIPCLONE_TOKEN=secret-token"));
     }
 
     #[tokio::test]
-    async fn command_failure_surfaces_as_error() {
+    async fn is_non_blocking_when_child_runs_long() {
         let dir = tempfile::tempdir().unwrap();
-        let fail = dir.path().join("fail.sh");
-        std::fs::write(&fail, "#!/bin/sh\nexit 1\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&fail).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&fail, perms).unwrap();
-        }
+        let sleeper = dir.path().join("sleep_long.sh");
+        std::fs::write(&sleeper, "#!/bin/sh\nsleep 30\n").unwrap();
+        chmod_x(&sleeper);
+
         let provider = ExecProvider::new(ExecProviderConfig {
-            program: fail,
+            program: sleeper,
+            fixed_args: vec![],
+        });
+
+        let start = Instant::now();
+        provider
+            .ensure_worker(&WorkerSpec::new("small", BTreeMap::new()))
+            .await
+            .unwrap();
+        let elapsed = start.elapsed();
+        // Must return as soon as spawn succeeds — not after the 30s sleep.
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "ensure_worker blocked for {elapsed:?}; expected fire-and-forget spawn"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_failure_surfaces_as_error() {
+        let provider = ExecProvider::new(ExecProviderConfig {
+            program: PathBuf::from("/nonexistent/ripclone-dispatch-helper-xyz"),
             fixed_args: vec![],
         });
         let err = provider
             .ensure_worker(&WorkerSpec::new("small", BTreeMap::new()))
             .await
             .unwrap_err();
+        assert!(err.to_string().contains("spawn"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn empty_size_class_rejected() {
+        let provider = ExecProvider::new(ExecProviderConfig {
+            program: PathBuf::from("/usr/bin/true"),
+            fixed_args: vec![],
+        });
+        let err = provider
+            .ensure_worker(&WorkerSpec::new("", BTreeMap::new()))
+            .await
+            .unwrap_err();
         assert!(
-            err.to_string().contains("exec provider command failed"),
+            err.to_string().contains("size_class must not be empty"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn from_env_requires_cmd() {
+        let saved = std::env::var("RIPCLONE_DISPATCH_CMD").ok();
+        unsafe { std::env::remove_var("RIPCLONE_DISPATCH_CMD") };
+        let err = match ExecProvider::from_env() {
+            Err(e) => e,
+            Ok(_) => panic!("expected missing RIPCLONE_DISPATCH_CMD to fail"),
+        };
+        assert!(
+            err.to_string().contains("RIPCLONE_DISPATCH_CMD"),
+            "got: {err}"
+        );
+        match saved {
+            Some(v) => unsafe { std::env::set_var("RIPCLONE_DISPATCH_CMD", v) },
+            None => unsafe { std::env::remove_var("RIPCLONE_DISPATCH_CMD") },
+        }
     }
 }

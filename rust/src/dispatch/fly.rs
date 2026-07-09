@@ -242,6 +242,7 @@ impl ComputeProvider for FlyProvider {
     }
 
     async fn ensure_worker(&self, spec: &WorkerSpec) -> Result<()> {
+        spec.validate()?;
         let machines = self.client.list_machines(&self.app).await?;
         let pool: Vec<&FlyMachine> = machines
             .iter()
@@ -478,6 +479,7 @@ mod tests {
     #[tokio::test]
     async fn http_client_posts_start_on_selected_machine() {
         use axum::extract::Path;
+        use axum::http::HeaderMap;
         use axum::routing::{get, post};
         use axum::{Json, Router};
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -486,14 +488,24 @@ mod tests {
         let starts_h = starts.clone();
         let list_hits = Arc::new(AtomicUsize::new(0));
         let list_hits_h = list_hits.clone();
+        let auth_seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let auth_list = auth_seen.clone();
+        let auth_start = auth_seen.clone();
 
         let app = Router::new()
             .route(
                 "/v1/apps/{app}/machines",
-                get(move |Path(app): Path<String>| {
+                get(move |Path(app): Path<String>, headers: HeaderMap| {
                     let list_hits_h = list_hits_h.clone();
+                    let auth_list = auth_list.clone();
                     async move {
                         assert_eq!(app, "my-workers");
+                        if let Some(a) = headers
+                            .get(axum::http::header::AUTHORIZATION)
+                            .and_then(|v| v.to_str().ok())
+                        {
+                            auth_list.lock().unwrap().push(a.to_string());
+                        }
                         list_hits_h.fetch_add(1, Ordering::SeqCst);
                         Json(vec![serde_json::json!({
                             "id": "e21781960b2896",
@@ -510,14 +522,23 @@ mod tests {
             )
             .route(
                 "/v1/apps/{app}/machines/{id}/start",
-                post(move |Path((app, id)): Path<(String, String)>| {
-                    let starts_h = starts_h.clone();
-                    async move {
-                        assert_eq!(app, "my-workers");
-                        starts_h.lock().unwrap().push(id);
-                        Json(serde_json::json!({ "ok": true }))
-                    }
-                }),
+                post(
+                    move |Path((app, id)): Path<(String, String)>, headers: HeaderMap| {
+                        let starts_h = starts_h.clone();
+                        let auth_start = auth_start.clone();
+                        async move {
+                            assert_eq!(app, "my-workers");
+                            if let Some(a) = headers
+                                .get(axum::http::header::AUTHORIZATION)
+                                .and_then(|v| v.to_str().ok())
+                            {
+                                auth_start.lock().unwrap().push(a.to_string());
+                            }
+                            starts_h.lock().unwrap().push(id);
+                            Json(serde_json::json!({ "ok": true }))
+                        }
+                    },
+                ),
             );
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -541,5 +562,70 @@ mod tests {
 
         assert_eq!(list_hits.load(Ordering::SeqCst), 1);
         assert_eq!(*starts.lock().unwrap(), vec!["e21781960b2896".to_string()]);
+        let auths = auth_seen.lock().unwrap().clone();
+        assert_eq!(
+            auths,
+            vec![
+                "Bearer fly_token_xyz".to_string(),
+                "Bearer fly_token_xyz".to_string()
+            ],
+            "list + start must both send the Fly API token"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_size_class_rejected_before_api() {
+        let client = Arc::new(MockFlyClient::new(vec![machine(
+            "m",
+            "stopped",
+            Some("small"),
+            Some("worker"),
+        )]));
+        let fly = provider(client.clone());
+        let err = fly
+            .ensure_worker(&WorkerSpec::new("", BTreeMap::new()))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("size_class must not be empty"),
+            "got: {err}"
+        );
+        assert_eq!(
+            client.list_calls(),
+            0,
+            "must not call Fly with empty size_class"
+        );
+    }
+
+    #[test]
+    fn from_env_requires_app_and_token() {
+        let saved_app = std::env::var("FLY_WORKER_APP").ok();
+        let saved_tok = std::env::var("FLY_API_TOKEN").ok();
+        unsafe {
+            std::env::remove_var("FLY_WORKER_APP");
+            std::env::remove_var("FLY_API_TOKEN");
+        }
+        let err = match FlyProvider::from_env() {
+            Err(e) => e,
+            Ok(_) => panic!("expected missing FLY_WORKER_APP to fail"),
+        };
+        assert!(err.to_string().contains("FLY_WORKER_APP"), "got: {err}");
+        unsafe {
+            std::env::set_var("FLY_WORKER_APP", "workers");
+            std::env::remove_var("FLY_API_TOKEN");
+        }
+        let err = match FlyProvider::from_env() {
+            Err(e) => e,
+            Ok(_) => panic!("expected missing FLY_API_TOKEN to fail"),
+        };
+        assert!(err.to_string().contains("FLY_API_TOKEN"), "got: {err}");
+        match saved_app {
+            Some(v) => unsafe { std::env::set_var("FLY_WORKER_APP", v) },
+            None => unsafe { std::env::remove_var("FLY_WORKER_APP") },
+        }
+        match saved_tok {
+            Some(v) => unsafe { std::env::set_var("FLY_API_TOKEN", v) },
+            None => unsafe { std::env::remove_var("FLY_API_TOKEN") },
+        }
     }
 }

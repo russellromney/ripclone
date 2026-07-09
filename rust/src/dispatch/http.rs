@@ -65,6 +65,7 @@ impl ComputeProvider for HttpProvider {
     }
 
     async fn ensure_worker(&self, spec: &WorkerSpec) -> Result<()> {
+        spec.validate()?;
         info!(url = %self.url, size_class = %spec.size_class, "http.ensure_worker POST");
         let mut req = self
             .client

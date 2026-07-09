@@ -40,12 +40,13 @@ Every command in the README and `docs/` was run verbatim against a real server. 
   - **fly** — start a pre-provisioned stopped Fly machine via the Machines API
     (pooling internal; already-starting → no-op).
   - **exec** — self-host escape hatch: run `RIPCLONE_DISPATCH_CMD` with the env
-    bag as process env and `size_class` as a separate argv (never shell-interpolated).
+    bag as process env and `size_class` as a separate argv (never shell-interpolated);
+    fire-and-forget spawn (does not wait for the child to exit).
   - **http** — self-host escape hatch: POST the `WorkerSpec` JSON to
     `RIPCLONE_DISPATCH_URL`.
   - **mock** — records calls for tests.
 - Callers outside the module never know the platform. Cloud webhook/cron wiring
-  and the reconcile loop remain separate (see `docs/DISPATCHER.md`).
+  and the reconcile loop remain separate (see `docs/internal/DISPATCHER.md`).
 
 ## Distribution
 

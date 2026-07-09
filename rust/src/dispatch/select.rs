@@ -274,4 +274,82 @@ mod tests {
             None => unsafe { std::env::remove_var("RIPCLONE_DISPATCH") },
         }
     }
+
+    #[test]
+    fn fly_from_env_fails_loudly_without_creds() {
+        let _g = env_lock().lock().unwrap();
+        let saved_dispatch = std::env::var("RIPCLONE_DISPATCH").ok();
+        let saved_app = std::env::var("FLY_WORKER_APP").ok();
+        let saved_tok = std::env::var("FLY_API_TOKEN").ok();
+        unsafe {
+            std::env::set_var("RIPCLONE_DISPATCH", "fly");
+            std::env::remove_var("FLY_WORKER_APP");
+            std::env::remove_var("FLY_API_TOKEN");
+        }
+        // Avoid unwrap_err: Ok type is Option<Arc<dyn ComputeProvider>> (not Debug).
+        let err = match get_compute_provider(SelectProviderOptions::default()) {
+            Err(e) => e,
+            Ok(_) => panic!("expected missing FLY_WORKER_APP to fail"),
+        };
+        assert!(err.to_string().contains("FLY_WORKER_APP"), "got: {err}");
+        match saved_dispatch {
+            Some(v) => unsafe { std::env::set_var("RIPCLONE_DISPATCH", v) },
+            None => unsafe { std::env::remove_var("RIPCLONE_DISPATCH") },
+        }
+        match saved_app {
+            Some(v) => unsafe { std::env::set_var("FLY_WORKER_APP", v) },
+            None => unsafe { std::env::remove_var("FLY_WORKER_APP") },
+        }
+        match saved_tok {
+            Some(v) => unsafe { std::env::set_var("FLY_API_TOKEN", v) },
+            None => unsafe { std::env::remove_var("FLY_API_TOKEN") },
+        }
+    }
+
+    #[test]
+    fn exec_and_http_from_env_fail_loudly_without_config() {
+        let _g = env_lock().lock().unwrap();
+        let saved_dispatch = std::env::var("RIPCLONE_DISPATCH").ok();
+        let saved_cmd = std::env::var("RIPCLONE_DISPATCH_CMD").ok();
+        let saved_url = std::env::var("RIPCLONE_DISPATCH_URL").ok();
+
+        unsafe {
+            std::env::set_var("RIPCLONE_DISPATCH", "exec");
+            std::env::remove_var("RIPCLONE_DISPATCH_CMD");
+        }
+        let err = match get_compute_provider(SelectProviderOptions::default()) {
+            Err(e) => e,
+            Ok(_) => panic!("expected missing RIPCLONE_DISPATCH_CMD to fail"),
+        };
+        assert!(
+            err.to_string().contains("RIPCLONE_DISPATCH_CMD"),
+            "got: {err}"
+        );
+
+        unsafe {
+            std::env::set_var("RIPCLONE_DISPATCH", "http");
+            std::env::remove_var("RIPCLONE_DISPATCH_URL");
+        }
+        let err = match get_compute_provider(SelectProviderOptions::default()) {
+            Err(e) => e,
+            Ok(_) => panic!("expected missing RIPCLONE_DISPATCH_URL to fail"),
+        };
+        assert!(
+            err.to_string().contains("RIPCLONE_DISPATCH_URL"),
+            "got: {err}"
+        );
+
+        match saved_dispatch {
+            Some(v) => unsafe { std::env::set_var("RIPCLONE_DISPATCH", v) },
+            None => unsafe { std::env::remove_var("RIPCLONE_DISPATCH") },
+        }
+        match saved_cmd {
+            Some(v) => unsafe { std::env::set_var("RIPCLONE_DISPATCH_CMD", v) },
+            None => unsafe { std::env::remove_var("RIPCLONE_DISPATCH_CMD") },
+        }
+        match saved_url {
+            Some(v) => unsafe { std::env::set_var("RIPCLONE_DISPATCH_URL", v) },
+            None => unsafe { std::env::remove_var("RIPCLONE_DISPATCH_URL") },
+        }
+    }
 }

@@ -21,7 +21,7 @@
 //! - **mock** — records calls (tests).
 //! - **none** / unset — dispatch disabled (enqueue only).
 //!
-//! Nothing outside this module knows the platform. See `docs/DISPATCHER.md`.
+//! Nothing outside this module knows the platform. See `docs/internal/DISPATCHER.md`.
 
 pub mod exec;
 pub mod fly;
@@ -39,7 +39,7 @@ pub use select::{
     DispatchBackend, SelectProviderOptions, get_compute_provider, parse_dispatch_backend,
 };
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -47,7 +47,7 @@ use std::collections::BTreeMap;
 /// Stable contract every worker needs on any platform.
 ///
 /// A provider does one thing: deliver this bag to a fresh process. Keys include
-/// (see `docs/DISPATCHER.md`):
+/// (see `docs/internal/DISPATCHER.md`):
 /// - queue URL + creds (claim)
 /// - storage creds (upload)
 /// - metadata target (ApiRefStore report URL + per-job token, or direct creds)
@@ -57,7 +57,7 @@ use std::collections::BTreeMap;
 /// - lifecycle flags (`--idle-exit-secs` / `--max-jobs`)
 ///
 /// `size_class` is a **config-driven lane name** (launch: `"small"` | `"large"`),
-/// not a hardcoded enum.
+/// not a hardcoded enum. Empty is rejected — no silent default lane.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerSpec {
     pub size_class: String,
@@ -70,6 +70,16 @@ impl WorkerSpec {
             size_class: size_class.into(),
             env,
         }
+    }
+
+    /// Reject empty `size_class`. Providers call this at the top of
+    /// `ensure_worker` so a bad caller fails loudly instead of matching the
+    /// wrong pool lane (or every unlabeled machine).
+    pub fn validate(&self) -> Result<()> {
+        if self.size_class.is_empty() {
+            bail!("WorkerSpec.size_class must not be empty");
+        }
+        Ok(())
     }
 }
 

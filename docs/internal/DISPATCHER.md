@@ -269,10 +269,18 @@ Backends selected by `RIPCLONE_DISPATCH=fly|exec|http|mock|none`:
    is provider-internal; already-starting → no-op.
 2. **`exec`** — self-host escape hatch. Runs `RIPCLONE_DISPATCH_CMD` with the env
    bag as process env and `size_class` as a separate argv (never shell-interpolated).
+   Fire-and-forget: `spawn` only — does **not** wait for the child to exit
+   (helpers must kick off work and return, or be short-lived; a long-lived
+   `ripclone-worker` as the CMD itself would be wrong — wrap it).
 3. **`http`** — self-host escape hatch. POSTs the `WorkerSpec` JSON to
-   `RIPCLONE_DISPATCH_URL`.
+   `RIPCLONE_DISPATCH_URL` (JSON fields: `size_class`, `env` — snake_case).
 4. **`mock`** — records calls (tests).
 5. **`none`** / unset — dispatch off (enqueue only).
+
+**Fly and the env bag:** pooled machines carry the bag via Fly secrets / machine
+config at provision time. `WorkerSpec.env` is accepted for interface parity;
+per-job injection (ApiRefStore tokens) is a later step. `exec`/`http` deliver
+the bag on every call.
 
 Add Modal (or any platform) = implement `ComputeProvider`, register it in
 `get_compute_provider`, set `RIPCLONE_DISPATCH=modal`. Everything else is unchanged.

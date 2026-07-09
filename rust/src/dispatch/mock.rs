@@ -41,6 +41,7 @@ impl ComputeProvider for MockProvider {
     }
 
     async fn ensure_worker(&self, spec: &WorkerSpec) -> Result<()> {
+        spec.validate()?;
         // Snapshot isolation: clone so later mutation of the caller's env does
         // not rewrite history.
         self.calls
