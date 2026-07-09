@@ -7,9 +7,7 @@ use ripclone::client::Client;
 use ripclone::config::ProviderEntry;
 use ripclone::extract::extract_archive;
 use ripclone::mode::{CloneMode, resolve_mode};
-use ripclone::provider::{
-    ProviderInstance, ProviderInstanceId, ProviderKind, ProviderRegistry, RepoId,
-};
+use ripclone::provider::{ProviderInstance, ProviderKind, ProviderRegistry, RepoId};
 use ripclone::snapshot::extract_snapshot;
 use secrecy::ExposeSecret;
 use secrecy::SecretString;
@@ -347,7 +345,11 @@ fn resolve_repo(
             "unknown provider '{provider}'; register it with `ripclone provider add {provider} ...`"
         );
     }
-    let repo_path = if provider == "github" {
+    let is_github = registry
+        .get(&provider)
+        .map(|p| p.kind == ProviderKind::GitHub)
+        .unwrap_or(false);
+    let repo_path = if is_github {
         let (owner, name) = parse_repo(&path)?;
         format!("{owner}/{name}")
     } else {
@@ -882,14 +884,9 @@ async fn run_provider_add(
     let kind_str = kind.as_deref().unwrap_or("generic");
     let kind_parsed: ProviderKind = kind_str.parse()?;
 
-    let host = match host {
-        Some(h) => Some(h),
-        None => match kind_parsed {
-            ProviderKind::GitHub => Some("github.com".to_string()),
-            ProviderKind::GitLab => Some("gitlab.com".to_string()),
-            ProviderKind::Gitea | ProviderKind::Generic => None,
-        },
-    };
+    // Preset kinds (GitHub/GitLab/Bitbucket) get their default host from
+    // ProviderRegistry::merge_one when the registry is loaded. Custom hosts are
+    // still honored if supplied, but never hardcoded here.
 
     if kind_parsed == ProviderKind::Generic && auth_template.is_none() {
         anyhow::bail!(
@@ -937,7 +934,10 @@ fn run_provider_list() -> Result<()> {
 
     println!("{:<16} {:<10} {:<24} TOKEN", "ID", "KIND", "HOST");
     for (id, entry) in &cfg.providers {
-        let host = entry.host.as_deref().unwrap_or("-");
+        let host = registry
+            .get(id)
+            .map(|p| clean_host(&p.host))
+            .unwrap_or_else(|| entry.host.clone().unwrap_or_else(|| "-".to_string()));
         let has_token = registry.token(id).is_some();
         println!(
             "{:<16} {:<10} {:<24} {}",
@@ -1495,7 +1495,11 @@ async fn main() -> Result<()> {
             let repo_path = match repo {
                 Some(r) => resolve_repo(&r, &default_provider, &provider_registry)?.1,
                 None => {
-                    if default_provider == "github" {
+                    let is_github = provider_registry
+                        .get(&default_provider)
+                        .map(|p| p.kind == ProviderKind::GitHub)
+                        .unwrap_or(false);
+                    if is_github {
                         let (o, r) = owner_repo_from_origin(&main_repo)?;
                         format!("{o}/{r}")
                     } else {
@@ -1581,24 +1585,22 @@ async fn resolve_upstream_token(
         .map(|token| token.expose_secret().to_string()))
 }
 
-/// Build a `ProviderInstance` for `provider_id`, falling back to built-in
-/// presets when the registry has no custom config.
-fn provider_instance(provider_id: &str, registry: &ProviderRegistry) -> ProviderInstance {
-    if let Some(inst) = registry.get(provider_id) {
-        return inst.clone();
-    }
-    let (kind, host) = match provider_id {
-        "github" => (ProviderKind::GitHub, "github.com"),
-        "gitlab" => (ProviderKind::GitLab, "gitlab.com"),
-        _ => (ProviderKind::Generic, provider_id),
-    };
-    ProviderInstance {
-        id: ProviderInstanceId::new(provider_id),
-        kind,
-        host: host.to_string(),
-        auth_template: None,
-        auth_header_name: None,
-    }
+/// Strip scheme and trailing slashes from a provider host so it can be used
+/// with git credential helpers or printed cleanly.
+fn clean_host(host: &str) -> String {
+    let h = host.trim_end_matches('/');
+    h.strip_prefix("https://")
+        .or_else(|| h.strip_prefix("http://"))
+        .unwrap_or(h)
+        .to_string()
+}
+
+/// Build a `ProviderInstance` for `provider_id` from the registry.
+///
+/// Returns `None` when the provider is not configured, so callers can decide
+/// whether to skip or error instead of guessing a host.
+fn provider_instance(provider_id: &str, registry: &ProviderRegistry) -> Option<ProviderInstance> {
+    registry.get(provider_id).cloned()
 }
 
 /// Cross-check the installed tip for an editable clone against the upstream git
@@ -1655,7 +1657,22 @@ async fn maybe_verify_upstream(
 
     let registry = ripclone::provider_config::load_registry()
         .context("load provider registry for upstream verification")?;
-    let provider = provider_instance(provider_id, &registry);
+    let provider = match provider_instance(provider_id, &registry) {
+        Some(p) => p,
+        None => {
+            if requested == VerifyUpstream::Always {
+                anyhow::bail!(
+                    "unknown provider '{provider_id}'; \
+                     register it with `ripclone provider add` to use --verify-upstream=always"
+                );
+            }
+            eprintln!(
+                "warning: --verify-upstream skipped (unknown provider '{provider_id}'); \
+                 the ripclone server remains in the trust base for this clone"
+            );
+            return Ok(());
+        }
+    };
 
     let mut upstream_tip: Option<String> = None;
     match requested {
@@ -1942,6 +1959,46 @@ mod tests {
         let (provider, repo_path) = resolve_repo("group/sub/repo", "gitlab", &registry).unwrap();
         assert_eq!(provider, "gitlab");
         assert_eq!(repo_path, "group/sub/repo");
+    }
+
+    #[test]
+    fn resolve_repo_normalizes_github_enterprise_path() {
+        let mut registry = ripclone::provider::ProviderRegistry::new();
+        registry
+            .merge_one(ripclone::provider::ProviderConfig {
+                id: "company-github".to_string(),
+                kind: Some("github".to_string()),
+                host: Some("github.example.com".to_string()),
+                token: None,
+                auth_template: None,
+                auth_header_name: None,
+            })
+            .unwrap();
+        let (provider, repo_path) =
+            resolve_repo("group/sub/repo", "company-github", &registry).unwrap();
+        assert_eq!(provider, "company-github");
+        // A GitHub-kind instance normalizes to owner/name even with a custom id/host.
+        assert_eq!(repo_path, "group/sub/repo");
+    }
+
+    #[test]
+    fn clean_host_strips_scheme_and_trailing_slash() {
+        assert_eq!(clean_host("https://gitea.example.com"), "gitea.example.com");
+        assert_eq!(clean_host("http://gitea.example.com/"), "gitea.example.com");
+        assert_eq!(
+            clean_host("gitea.example.com:3000/"),
+            "gitea.example.com:3000"
+        );
+        assert_eq!(clean_host("github.com"), "github.com");
+    }
+
+    #[test]
+    fn provider_instance_resolves_from_registry_and_returns_none_for_unknown() {
+        let registry = test_registry();
+        let inst = provider_instance("gitlab", &registry).expect("gitlab instance");
+        assert_eq!(inst.kind, ProviderKind::GitLab);
+        assert_eq!(inst.host, "gitlab.com");
+        assert!(provider_instance("unknown", &registry).is_none());
     }
 
     #[test]
