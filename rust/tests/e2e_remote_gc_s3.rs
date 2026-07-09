@@ -647,13 +647,45 @@ fn make_s3_ref_store(storage: Arc<S3Storage>) -> Arc<dyn RefStore> {
     Arc::new(CachingRefStore::new(S3RefStore::new(storage)))
 }
 
-async fn cleanup_prefix(env: &S3Env, prefix: &str) -> Result<()> {
-    let client = s3::Client::builder(&env.endpoint)
+/// Cleanup client with the same timeout/retry posture as production S3Storage.
+/// The s3 crate default (~10s, few retries) flakes on MinIO `delete_objects`
+/// batches under CI load — not a credentials failure (would be 403, not timeout).
+fn cleanup_s3_client(env: &S3Env) -> Result<s3::Client> {
+    s3::Client::builder(&env.endpoint)
         .context("create S3 cleanup builder")?
         .region(&env.region)
         .auth(s3::Auth::from_env().context("S3 auth for cleanup")?)
+        .timeout(Duration::from_secs(30))
+        .max_attempts(5)
+        .base_retry_delay(Duration::from_millis(200))
+        .max_retry_delay(Duration::from_secs(2))
         .build()
-        .context("build cleanup S3 client")?;
+        .context("build cleanup S3 client")
+}
+
+async fn delete_key_batches(env: &S3Env, client: &s3::Client, keys: Vec<String>) -> Result<()> {
+    // Smaller batches: a single DeleteObjects of 1000 under a slow MinIO can
+    // exceed a tight transport timeout and fail the whole cleanup.
+    for chunk in keys.chunks(100) {
+        let chunk: Vec<String> = chunk.to_vec();
+        if chunk.is_empty() {
+            continue;
+        }
+        client
+            .objects()
+            .delete_objects(&env.bucket)
+            .objects(&chunk)
+            .context("build cleanup delete batch")?
+            .quiet(true)
+            .send()
+            .await
+            .context("S3 cleanup delete_objects")?;
+    }
+    Ok(())
+}
+
+async fn cleanup_prefix(env: &S3Env, prefix: &str) -> Result<()> {
+    let client = cleanup_s3_client(env)?;
 
     let mut keys = Vec::new();
     let mut continuation = None::<String>;
@@ -681,33 +713,19 @@ async fn cleanup_prefix(env: &S3Env, prefix: &str) -> Result<()> {
         }
     }
 
-    for chunk in keys.chunks(1000) {
-        let chunk: Vec<String> = chunk.to_vec();
-        client
-            .objects()
-            .delete_objects(&env.bucket)
-            .objects(&chunk)
-            .context("build cleanup delete batch")?
-            .quiet(true)
-            .send()
-            .await
-            .context("S3 cleanup delete_objects")?;
-    }
-    Ok(())
+    delete_key_batches(env, &client, keys).await
 }
 
 async fn cleanup_repo_refs(env: &S3Env, owner: &str, repo: &str) -> Result<()> {
     let repo_id = ripclone::provider::RepoId::github(format!("{owner}/{repo}"));
     let storage_key = repo_id.storage_key();
-    let client = s3::Client::builder(&env.endpoint)
-        .context("create S3 cleanup builder")?
-        .region(&env.region)
-        .auth(s3::Auth::from_env().context("S3 auth for cleanup")?)
-        .build()
-        .context("build cleanup S3 client")?;
+    let client = cleanup_s3_client(env)?;
 
-    let head_key = format!("refs/{storage_key}.json");
-    let branch_prefix = format!("refs/{storage_key}/");
+    // Refs live under the per-test RIPCLONE_S3_PREFIX when the server is S3-backed.
+    // Prefer listing via the env prefix if set; also try unscoped keys for safety.
+    let prefix = std::env::var("RIPCLONE_S3_PREFIX").unwrap_or_default();
+    let head_key = format!("{prefix}refs/{storage_key}.json");
+    let branch_prefix = format!("{prefix}refs/{storage_key}/");
     let mut keys = vec![head_key];
     let mut continuation = None::<String>;
     loop {
@@ -734,19 +752,7 @@ async fn cleanup_repo_refs(env: &S3Env, owner: &str, repo: &str) -> Result<()> {
         }
     }
 
-    for chunk in keys.chunks(1000) {
-        let chunk: Vec<String> = chunk.to_vec();
-        client
-            .objects()
-            .delete_objects(&env.bucket)
-            .objects(&chunk)
-            .context("build cleanup ref delete batch")?
-            .quiet(true)
-            .send()
-            .await
-            .context("S3 cleanup ref delete_objects")?;
-    }
-    Ok(())
+    delete_key_batches(env, &client, keys).await
 }
 
 /// Ensures the S3 prefix (and optional ref JSON) are deleted even if a test
