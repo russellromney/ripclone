@@ -32,7 +32,11 @@ pub use size_class::{
     SizeClass, classify_rank, default_size_classes, load_size_classes, prior_clonepack_bytes,
     resolve_job_size_bytes,
 };
-pub use sql::SqlJobQueue;
+pub use sql::{
+    DEFAULT_HEARTBEAT_TIMEOUT_SECS, SqlJobQueue, make_worker_id, make_worker_id_parts,
+    validate_heartbeat_timing, worker_heartbeat_enabled, worker_heartbeat_enabled_from_env,
+    worker_heartbeat_interval_secs, worker_heartbeat_interval_secs_from,
+};
 pub use sqlite_db::SqliteDb;
 
 /// A request to build (sync) one repo's branch.

@@ -4,9 +4,9 @@ This file tracks what has already landed in ripclone. For upcoming work see `int
 
 ## Worker heartbeat / registry (D3)
 
-- **`workers` registry table** on the blessed SQL queues (`sqlite` / `libsql`, DDL in the shared `SqlJobQueue` adapter — Postgres/MySQL lag with no-op trait defaults). Each row is `worker_id`, optional `max_size_class` ceiling, optional `current_job`, and `last_heartbeat`.
-- **`SqlJobQueue::heartbeat` / `live_worker_count`**: workers upsert their row; the dispatcher (D2) queries how many heartbeats are fresh within `RIPCLONE_WORKER_HEARTBEAT_TIMEOUT_SECS` (default 60s). Stale rows age out of the live-count and are pruned. Two concurrent readers see the same count so replicas do not double-spawn.
-- **`ripclone-worker` opt-in**: `RIPCLONE_WORKER_HEARTBEAT=queue` (or the queue DSN / truthy `1`/`true`) enables a background heartbeat loop. Default off — self-host without a dispatcher is byte-for-byte unchanged.
+- **`workers` registry table** on the blessed SQL queues (`sqlite` / `libsql`, DDL in the shared `SqlJobQueue` adapter). Each row is `worker_id`, optional `max_size_class` ceiling, optional `current_job`, and `last_heartbeat`. Postgres/MySQL lag: heartbeat/live-count **fail loudly** (never silently report a zero fleet).
+- **`SqlJobQueue::heartbeat` / `live_worker_count`**: workers upsert their row; the dispatcher (D2) queries how many heartbeats are fresh within `RIPCLONE_WORKER_HEARTBEAT_TIMEOUT_SECS` (default 60s). Stale rows age out of the live-count and are hard-pruned. Two concurrent readers see the same count so replicas do not double-spawn.
+- **`ripclone-worker` opt-in**: `RIPCLONE_WORKER_HEARTBEAT=queue` (or the queue DSN / truthy `1`/`true`) enables a background heartbeat loop. Default off — self-host without a dispatcher is unchanged. Worker ids are fleet-unique (`FLY_MACHINE_ID`/`HOSTNAME` + pid + start nanos) so two machines with the same pid cannot under-count. Interval must be `<` timeout or startup fails.
 
 ## Config-driven size classes + claim filter (O2)
 

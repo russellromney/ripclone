@@ -349,6 +349,10 @@ impl QueueDb for LibsqlDb {
             .context("prune failed jobs")
     }
 
+    fn supports_worker_registry(&self) -> bool {
+        true
+    }
+
     async fn upsert_heartbeat(
         &self,
         worker_id: &str,

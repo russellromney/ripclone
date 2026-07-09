@@ -363,6 +363,10 @@ impl QueueDb for SqliteDb {
         Ok(res.rows_affected())
     }
 
+    fn supports_worker_registry(&self) -> bool {
+        true
+    }
+
     async fn upsert_heartbeat(
         &self,
         worker_id: &str,

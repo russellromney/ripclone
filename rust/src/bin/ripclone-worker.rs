@@ -51,11 +51,14 @@
 //!   touches the registry. Enable only when a dispatcher (or anything else)
 //!   needs live-worker visibility.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 use ripclone::backends::{self, Backends};
 use ripclone::metrics::Metrics;
-use ripclone::queue::{BuildError, BuildJob, JobQueue, JobQueueRef, JobState, SqlJobQueue};
+use ripclone::queue::{
+    BuildError, BuildJob, JobQueue, JobQueueRef, JobState, SqlJobQueue, make_worker_id,
+    validate_heartbeat_timing, worker_heartbeat_enabled_from_env, worker_heartbeat_interval_secs,
+};
 use ripclone::server::{ServerState, mark_branch_build_failed, process_build_job};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -63,54 +66,6 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
-
-/// Whether the worker should write heartbeat rows into the queue registry.
-///
-/// `RIPCLONE_WORKER_HEARTBEAT`:
-/// - unset / empty → disabled (self-host default)
-/// - `queue` / `1` / `true` / `yes` / `on` → write to the connected queue DB
-/// - the same value as `RIPCLONE_QUEUE_DB_URL` → same (target is the queue itself)
-/// - anything else → hard error (fail loudly; do not silently ignore)
-fn heartbeat_enabled_from_env() -> Result<bool> {
-    let raw = match std::env::var("RIPCLONE_WORKER_HEARTBEAT") {
-        Err(_) => return Ok(false),
-        Ok(s) => s,
-    };
-    let s = raw.trim();
-    if s.is_empty() {
-        return Ok(false);
-    }
-    let lower = s.to_ascii_lowercase();
-    if matches!(lower.as_str(), "queue" | "1" | "true" | "yes" | "on") {
-        return Ok(true);
-    }
-    if let Ok(url) = std::env::var("RIPCLONE_QUEUE_DB_URL")
-        && s == url
-    {
-        return Ok(true);
-    }
-    anyhow::bail!(
-        "RIPCLONE_WORKER_HEARTBEAT={s:?}: expected 'queue' (or the queue DSN / \
-         truthy 1|true) to write the workers registry, or leave unset to disable"
-    );
-}
-
-/// How often to refresh the registry row. Default = timeout/3 (at least 1s).
-fn heartbeat_interval_secs() -> u64 {
-    if let Some(n) = std::env::var("RIPCLONE_WORKER_HEARTBEAT_INTERVAL_SECS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .filter(|&n: &u64| n >= 1)
-    {
-        return n;
-    }
-    let timeout = std::env::var("RIPCLONE_WORKER_HEARTBEAT_TIMEOUT_SECS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .filter(|&n: &u64| n >= 1)
-        .unwrap_or(60);
-    (timeout / 3).max(1)
-}
 
 /// Spawn a background task that periodically upserts this worker's registry
 /// row. `current_job` is `-1` when idle, else the claimed job id.
@@ -193,21 +148,34 @@ async fn main() -> Result<()> {
     let b = Backends::from_env(&args.cas_dir, &args.repo_root, &metrics).await?;
     let state = ServerState::for_worker(b, queue.clone() as JobQueueRef, metrics)?;
 
-    let worker_id = format!("worker-{}", std::process::id());
-    let heartbeat_on = heartbeat_enabled_from_env()?;
+    // Fleet-unique id (host/machine + pid + start nanos). PID-only collides
+    // across machines and under-counts the live fleet in the registry.
+    let worker_id = make_worker_id();
+    let heartbeat_on = worker_heartbeat_enabled_from_env()?;
     // -1 = idle; non-negative = claimed job id. Background heartbeat task reads it.
-    let current_job = Arc::new(AtomicI64::new(-1));
+    // Only allocated when heartbeat is on so the disabled path stays lean.
+    let current_job = heartbeat_on.then(|| Arc::new(AtomicI64::new(-1)));
     if heartbeat_on {
-        let interval = Duration::from_secs(heartbeat_interval_secs());
+        if !queue.supports_worker_registry() {
+            bail!(
+                "RIPCLONE_WORKER_HEARTBEAT is set but RIPCLONE_QUEUE={} does not \
+                 support the workers registry (need sqlite or libsql; postgres/mysql lag)",
+                backends::queue_kind()
+            );
+        }
+        let interval_secs = worker_heartbeat_interval_secs();
+        let timeout_secs = queue.heartbeat_timeout_secs();
+        validate_heartbeat_timing(interval_secs, timeout_secs)?;
+        let interval = Duration::from_secs(interval_secs);
         info!(
             "worker heartbeat enabled (interval={}s, timeout={}s)",
             interval.as_secs(),
-            queue.heartbeat_timeout_secs()
+            timeout_secs
         );
         spawn_heartbeat_loop(
             queue.clone(),
             worker_id.clone(),
-            current_job.clone(),
+            current_job.clone().expect("heartbeat current_job"),
             interval,
         );
     }
@@ -252,7 +220,9 @@ async fn main() -> Result<()> {
                 idle_since = None;
                 let job_id = claimed.id;
                 // Surface the active claim to the heartbeat task (if any).
-                current_job.store(job_id, Ordering::Relaxed);
+                if let Some(ref cur) = current_job {
+                    cur.store(job_id, Ordering::Relaxed);
+                }
                 let repo_id = claimed.repo_id();
                 info!(
                     "claimed job {} for {}@{}",
@@ -323,7 +293,9 @@ async fn main() -> Result<()> {
                     ),
                     Err(e) => error!("failed to ack job {job_id}: {e}"),
                 }
-                current_job.store(-1, Ordering::Relaxed);
+                if let Some(ref cur) = current_job {
+                    cur.store(-1, Ordering::Relaxed);
+                }
                 jobs_done += 1;
                 if let Some(max) = args.max_jobs
                     && jobs_done >= max
