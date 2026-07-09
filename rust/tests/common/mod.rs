@@ -1605,6 +1605,31 @@ impl WorkerProc {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
+
+    /// Hard-kill the worker now and wait for the OS process to exit.
+    pub fn kill_now(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+
+    /// Poll until the worker exits on its own (idle-exit / max-jobs) or `timeout`
+    /// elapses. Returns `true` if the process exited.
+    pub fn wait_exit(&mut self, timeout: Duration) -> bool {
+        let start = std::time::Instant::now();
+        loop {
+            match self.0.try_wait() {
+                Ok(Some(_)) => return true,
+                Ok(None) if start.elapsed() >= timeout => return false,
+                Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+                Err(_) => return false,
+            }
+        }
+    }
+
+    /// Whether the OS process has already exited (non-blocking).
+    pub fn has_exited(&mut self) -> bool {
+        matches!(self.0.try_wait(), Ok(Some(_)))
+    }
 }
 
 impl Drop for WorkerProc {
@@ -1614,28 +1639,48 @@ impl Drop for WorkerProc {
     }
 }
 
-impl WorkerProc {
-    /// Hard-kill the worker now and wait for the OS process to exit.
-    pub fn kill_now(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
 /// Spawn the real `ripclone-worker` binary sharing `cas_dir` + `repo_root` with
 /// the in-process server. It inherits the test process env (RIPCLONE_QUEUE,
-/// RIPCLONE_QUEUE_DB_URL, RIPCLONE_ORIGIN_BASE, RIPCLONE_SERVER_TOKEN, …).
+/// RIPCLONE_QUEUE_DB_URL, RIPCLONE_ORIGIN_BASE, RIPCLONE_SERVER_TOKEN, …) but
+/// **clears** lifecycle vars (`RIPCLONE_IDLE_EXIT_SECS`, `RIPCLONE_MAX_JOBS`) so
+/// a developer shell or a prior test cannot force scale-to-zero on a forever
+/// worker under test.
 pub fn spawn_worker(cas_dir: &Path, repo_root: &Path) -> WorkerProc {
-    let child = Command::new(env!("CARGO_BIN_EXE_ripclone-worker"))
-        .arg("--cas-dir")
+    spawn_worker_with(cas_dir, repo_root, &[], &[])
+}
+
+/// Like [`spawn_worker`], with extra CLI args (e.g. `--idle-exit-secs`, `--max-jobs`).
+pub fn spawn_worker_args(cas_dir: &Path, repo_root: &Path, extra: &[&str]) -> WorkerProc {
+    spawn_worker_with(cas_dir, repo_root, extra, &[])
+}
+
+/// Spawn the worker with CLI args and/or child-only env (for the env-bag path:
+/// compute providers set lifecycle via env without flags). Lifecycle env from
+/// the parent process is cleared first, then `extra_env` is applied, so tests
+/// don't leak `RIPCLONE_MAX_JOBS` into forever workers.
+pub fn spawn_worker_with(
+    cas_dir: &Path,
+    repo_root: &Path,
+    extra_args: &[&str],
+    extra_env: &[(&str, &str)],
+) -> WorkerProc {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_ripclone-worker"));
+    cmd.arg("--cas-dir")
         .arg(cas_dir)
         .arg("--repo-root")
         .arg(repo_root)
         .arg("--idle-poll-ms")
         .arg("100")
+        .args(extra_args)
+        // Lifecycle is flag-or-env; pin the child to an explicit bag so parent
+        // process pollution can't change forever vs one-shot vs idle-exit.
+        .env_remove("RIPCLONE_IDLE_EXIT_SECS")
+        .env_remove("RIPCLONE_MAX_JOBS")
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .expect("spawn ripclone-worker binary");
+        .stderr(Stdio::inherit());
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let child = cmd.spawn().expect("spawn ripclone-worker binary");
     WorkerProc(child)
 }

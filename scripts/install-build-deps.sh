@@ -20,4 +20,10 @@ $SUDO apt-get install -y --no-install-recommends \
   libfuse-dev \
   libgit2-dev \
   git \
-  curl
+  curl \
+  mold
+
+# rust/.cargo/config.toml points x86_64-unknown-linux-gnu builds at mold (see
+# that file for why). ~50 integration test binaries link on every Linux job;
+# mold cuts that 3-5x and rust-cache can't touch linking. This has no effect on
+# macOS or the musl release target (different target triples).

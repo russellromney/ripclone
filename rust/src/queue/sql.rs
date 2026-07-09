@@ -137,7 +137,9 @@ pub trait QueueDb: Send + Sync {
     /// timed-out worker). A job that has already been claimed `max_attempts` or
     /// more times is dead-lettered to terminal `failed` (with `dead_letter_error`
     /// and `now` as its finished time) so a hard-killed build can't crash-loop;
-    /// anything under the cap is returned to `queued` for another attempt.
+    /// anything under the cap is returned to `queued` for another attempt, with
+    /// `size_class` bumped one rung so a larger worker can claim it next
+    /// (right-sizing / O2). Dead-letter does not bump.
     async fn reclaim_stale(
         &self,
         cutoff: i64,
@@ -145,6 +147,9 @@ pub trait QueueDb: Send + Sync {
         now: i64,
         dead_letter_error: &str,
     ) -> Result<()>;
+
+    /// Current `size_class` for a job id (`None` if the row is missing).
+    async fn job_size_class(&self, id: i64) -> Result<Option<i64>>;
 
     /// Id of the oldest queued job eligible for this worker. When
     /// `max_size_class` is `Some(rank)`, only jobs with `size_class <= rank`
@@ -181,6 +186,11 @@ pub trait QueueDb: Send + Sync {
 
     /// Requeue a retryable build failure while the caller still owns the claim.
     /// Returns false if the claim was reclaimed or otherwise settled first.
+    ///
+    /// If a newer job for the same key is already `queued` (push-during-build),
+    /// requeue would violate the unique queued-key index — instead the claim is
+    /// settled terminal `failed` with [`SUPERSEDED_BY_NEWER_QUEUED`] and this
+    /// returns true (the worker's result is acknowledged, not lost as an error).
     async fn requeue_claim(&self, id: i64, worker_id: &str, error: &str) -> Result<bool>;
 
     /// `(status, error)` for a job id.
@@ -317,11 +327,17 @@ impl SqlJobQueue {
         Ok(None)
     }
 
-    /// Settle a claimed job. `Ok` → `done`; `Err(msg)` → `failed`. Conditional
-    /// on `worker_id` still owning the claim; returns `Ok(true)` if it settled,
-    /// `Ok(false)` if the claim had been reclaimed/dead-lettered out from under
-    /// this worker (its result is stale and must be discarded — see
-    /// [`QueueDb::finish`]).
+    /// Settle a claimed job.
+    ///
+    /// - `Ok(())` → terminal `done`
+    /// - `Err(permanent)` → terminal `failed` immediately
+    /// - `Err(retryable)` under the attempts cap → requeue with capped backoff
+    /// - `Err(retryable)` at/over the attempts cap → terminal `failed` (dead-letter)
+    ///
+    /// Conditional on `worker_id` still owning the claim; returns `Ok(true)` if
+    /// it settled (or requeued), `Ok(false)` if the claim had been
+    /// reclaimed/dead-lettered out from under this worker (its result is stale
+    /// and must be discarded — see [`QueueDb::finish`]).
     pub async fn ack(
         &self,
         id: i64,
@@ -500,8 +516,17 @@ pub(crate) const ADD_ATTEMPTS_COLUMN_SQL: &str =
 /// Migration for a `jobs` table created before the `size_class` column existed.
 /// Blessed backends only (sqlite/libsql). Best-effort like the other ALTERs.
 /// Default 0 = smallest class so legacy rows stay claimable by every worker.
+/// Stale-reclaim bumps this rung so a larger worker can pick the job up next
+/// (claim filter lands in O2).
 pub(crate) const ADD_SIZE_CLASS_COLUMN_SQL: &str =
     "ALTER TABLE jobs ADD COLUMN size_class INTEGER NOT NULL DEFAULT 0";
+
+/// Terminal error when a claimed job cannot requeue because a newer job for the
+/// same key is already `queued` (push-during-build). The older claim is
+/// redundant — the newer job builds the tip — so we settle it instead of
+/// tripping the unique `idx_jobs_queued_key` and leaving the row stuck.
+pub(crate) const SUPERSEDED_BY_NEWER_QUEUED: &str =
+    "superseded by newer queued job for the same repo/branch";
 
 #[cfg(test)]
 mod tests {
@@ -653,7 +678,7 @@ mod tests {
         pool.close().await;
 
         let db = SqliteDb::connect(&path.to_string_lossy()).await.unwrap();
-        db.init().await.unwrap(); // adds the credential column to the legacy table
+        db.init().await.unwrap(); // adds credential / attempts / size_class columns
         db.init().await.unwrap(); // idempotent: best-effort ALTER ignores duplicate
         // Inserting a credential now works because the column exists.
         let id = db
@@ -662,6 +687,12 @@ mod tests {
             .unwrap();
         let (_, _, _, cred) = db.job_fields(id).await.unwrap().unwrap();
         assert_eq!(cred.as_deref(), Some("Y3JlZA=="));
+        // size_class migration is load-bearing for stale-reclaim escalation.
+        assert_eq!(
+            db.job_size_class(id).await.unwrap(),
+            Some(0),
+            "legacy table must gain size_class DEFAULT 0"
+        );
     }
 
     #[tokio::test]
@@ -699,6 +730,128 @@ mod tests {
             assert_eq!(second.id, id, "{engine}");
             assert!(q.ack(second.id, "w2", Ok(())).await.unwrap(), "{engine}");
             assert!(matches!(q.job_status(id).await.unwrap(), JobState::Done));
+        }
+    }
+
+    /// Transient requeue (error with retryable bit) must NOT escalate size_class
+    /// — only crash/OOM stale-reclaim does. A storage 5xx is not fixed by a
+    /// bigger box; bumping on every retry would starve small workers.
+    #[tokio::test]
+    async fn retryable_ack_does_not_bump_size_class() {
+        for engine in ["sqlite"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("q.db").to_string_lossy().to_string();
+            let db = make_db(engine, &path).await;
+            db.init().await.unwrap();
+            let q = SqlJobQueue {
+                db,
+                stale_claim_secs: DEFAULT_STALE_CLAIM_SECS,
+                failed_retention_secs: DEFAULT_FAILED_RETENTION_SECS,
+                max_build_attempts: DEFAULT_MAX_BUILD_ATTEMPTS,
+                size_classes: default_size_classes(),
+                max_size_class: None,
+            };
+            let reader = make_db(engine, &path).await;
+
+            // A known-small size classifies deterministically to rank 0; unknown
+            // size would classify to the largest class instead (O2), which is
+            // beside the point of this test (the ack path must not touch
+            // size_class either way).
+            let enq = q.enqueue(job_sized("o", "r", "main", 1024)).await.unwrap();
+            let id = enq.job_id.unwrap();
+            let claimed = q.claim("w1").await.unwrap().unwrap();
+            assert!(
+                q.ack(claimed.id, "w1", Err(BuildError::retryable("storage 503")))
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(
+                reader.job_size_class(id).await.unwrap(),
+                Some(0),
+                "{engine}: retryable error requeue must leave size_class at 0"
+            );
+            // Still claimable (requeued), not terminal.
+            assert!(q.claim("w2").await.unwrap().is_some(), "{engine}");
+        }
+    }
+
+    /// Push-during-build leaves a newer `queued` job for the same key. A
+    /// retryable requeue of the older claim must NOT trip the unique index and
+    /// stuck-claimed forever — it settles terminal "superseded" so the newer
+    /// job alone builds the tip.
+    #[tokio::test]
+    async fn retryable_ack_supersedes_when_newer_job_already_queued() {
+        for (engine, q, _dir) in queues().await {
+            let first = q.enqueue(job("o", "r", "main")).await.unwrap();
+            let old_id = first.job_id.unwrap();
+            let claimed = q.claim("w1").await.unwrap().unwrap();
+            assert_eq!(claimed.id, old_id, "{engine}");
+
+            // Push while build is in flight → fresh queued job for same key.
+            let second = q.enqueue(job("o", "r", "main")).await.unwrap();
+            assert_eq!(second.outcome, EnqueueOutcome::Enqueued, "{engine}");
+            let new_id = second.job_id.unwrap();
+            assert_ne!(old_id, new_id, "{engine}");
+
+            // Transient failure on the old claim: cannot requeue (unique key).
+            assert!(
+                q.ack(claimed.id, "w1", Err(BuildError::retryable("storage 503")))
+                    .await
+                    .unwrap(),
+                "{engine}: ack must settle (supersede), not error"
+            );
+            match q.job_status(old_id).await.unwrap() {
+                JobState::Failed(e) => assert!(
+                    e.contains("superseded"),
+                    "{engine}: expected superseded, got {e:?}"
+                ),
+                other => panic!("{engine}: expected Failed(superseded), got {other:?}"),
+            }
+            // Newer job is still queued and claimable.
+            assert!(matches!(
+                q.job_status(new_id).await.unwrap(),
+                JobState::Pending
+            ));
+            let next = q.claim("w2").await.unwrap().unwrap();
+            assert_eq!(next.id, new_id, "{engine}: only the newer job is claimed");
+        }
+    }
+
+    /// Same push-during-build setup: a hard-killed older claim must supersede
+    /// on stale-reclaim (not fail the whole reclaim batch on unique conflict).
+    #[tokio::test]
+    async fn stale_reclaim_supersedes_when_newer_job_already_queued() {
+        for engine in ["sqlite"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("q.db").to_string_lossy().to_string();
+            let db = make_db(engine, &path).await;
+            db.init().await.unwrap();
+            let q = SqlJobQueue {
+                db,
+                stale_claim_secs: 0,
+                failed_retention_secs: DEFAULT_FAILED_RETENTION_SECS,
+                max_build_attempts: DEFAULT_MAX_BUILD_ATTEMPTS,
+                size_classes: default_size_classes(),
+                max_size_class: None,
+            };
+
+            let first = q.enqueue(job("o", "r", "main")).await.unwrap();
+            let old_id = first.job_id.unwrap();
+            let _claimed = q.claim("w1").await.unwrap().unwrap();
+            let second = q.enqueue(job("o", "r", "main")).await.unwrap();
+            let new_id = second.job_id.unwrap();
+
+            // Next claim reclaims the stale older row: must supersede it and
+            // hand out the newer queued job (not error, not stuck).
+            let next = q.claim("w2").await.unwrap().unwrap();
+            assert_eq!(next.id, new_id, "{engine}");
+            match q.job_status(old_id).await.unwrap() {
+                JobState::Failed(e) => assert!(
+                    e.contains("superseded"),
+                    "{engine}: expected superseded, got {e:?}"
+                ),
+                other => panic!("{engine}: expected Failed(superseded), got {other:?}"),
+            }
         }
     }
 
@@ -960,6 +1113,61 @@ mod tests {
                 ),
                 other => panic!("{engine}: expected Failed (dead-letter), got {other:?}"),
             }
+        }
+    }
+
+    /// P1: a crash/OOM (no ack) is reclaimed by `reclaim_stale`, and each
+    /// under-cap stale-reclaim bumps `size_class` one rung so a larger worker
+    /// can take the job next (claim filter lands in O2).
+    #[tokio::test]
+    async fn reclaim_stale_bumps_size_class() {
+        for engine in ["sqlite"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("q.db").to_string_lossy().to_string();
+            let db = make_db(engine, &path).await;
+            db.init().await.unwrap();
+            // Zero tolerance: a claim is immediately reclaimable.
+            let q = SqlJobQueue {
+                db,
+                stale_claim_secs: 0,
+                failed_retention_secs: DEFAULT_FAILED_RETENTION_SECS,
+                max_build_attempts: DEFAULT_MAX_BUILD_ATTEMPTS,
+                size_classes: default_size_classes(),
+                max_size_class: None,
+            };
+            // Second adapter on the same file for size_class reads.
+            let reader = make_db(engine, &path).await;
+
+            // A known-small size classifies deterministically to rank 0, so the
+            // bumps below land on 1, then 2 (unknown size would start at the
+            // largest class instead — O2's classify_rank — which is beside the
+            // point of this test).
+            let enq = q.enqueue(job_sized("o", "r", "main", 1024)).await.unwrap();
+            let id = enq.job_id.unwrap();
+            assert_eq!(
+                reader.job_size_class(id).await.unwrap(),
+                Some(0),
+                "{engine}: fresh small job starts at size_class 0"
+            );
+
+            // Claim, then abandon (no ack). Next claim reclaims and bumps.
+            let _first = q.claim("w1").await.unwrap().unwrap();
+            let second = q.claim("w2").await.unwrap().unwrap();
+            assert_eq!(second.id, id, "{engine}");
+            assert_eq!(
+                reader.job_size_class(id).await.unwrap(),
+                Some(1),
+                "{engine}: first stale-reclaim bumps size_class to 1"
+            );
+
+            // Second abandon → another bump.
+            let third = q.claim("w3").await.unwrap().unwrap();
+            assert_eq!(third.id, id, "{engine}");
+            assert_eq!(
+                reader.job_size_class(id).await.unwrap(),
+                Some(2),
+                "{engine}: second stale-reclaim bumps size_class to 2"
+            );
         }
     }
 

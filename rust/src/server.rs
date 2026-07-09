@@ -6668,28 +6668,63 @@ pub async fn process_build_job(
             Ok(result.clone())
         }
         Err(e) => {
-            state.metrics.record_build_failed();
-            if let Err(status_err) = update_current_build_status(
-                state,
-                repo_id,
-                &effective_branch,
-                &format!("failed: {e}"),
-            )
-            .await
-            {
-                error!(
-                    "build status update failed for {}@{effective_branch}: {status_err:#}",
+            // Classify first: only *permanent* failures are terminal in the
+            // metadata store. A retryable error is requeued by `SqlJobQueue::ack`
+            // (bounded by attempts); writing `failed: …` here would make
+            // `/status` look terminal while the queue still has the job — the
+            // stale-until-repushed mode A7 was meant to kill.
+            let classified = classify_build_error(e);
+            if let Some(status) = terminal_metadata_status(&classified) {
+                state.metrics.record_build_failed();
+                if let Err(status_err) =
+                    update_current_build_status(state, repo_id, &effective_branch, &status).await
+                {
+                    error!(
+                        "build status update failed for {}@{effective_branch}: {status_err:#}",
+                        repo_id.storage_key()
+                    );
+                }
+                warn!(
+                    "background build failed for {}@{effective_branch}: {e}",
+                    repo_id.storage_key()
+                );
+            } else {
+                warn!(
+                    "background build transient failure for {}@{effective_branch} \
+                     (queue will requeue if under attempt cap): {e}",
                     repo_id.storage_key()
                 );
             }
             invalidate_ref_response_cache(state, repo_id, &effective_branch);
-            warn!(
-                "background build failed for {}@{effective_branch}: {e}",
-                repo_id.storage_key()
-            );
-            Err(classify_build_error(e))
+            Err(classified)
         }
     }
+}
+
+/// Metadata status string for a terminal build failure, or `None` when the
+/// queue may still requeue the job (retryable). Callers must not write a
+/// terminal `failed: …` for retryable errors.
+fn terminal_metadata_status(err: &BuildError) -> Option<String> {
+    if err.is_retryable() {
+        None
+    } else {
+        Some(format!("failed: {}", err.message()))
+    }
+}
+
+/// Write a terminal `failed: …` build status on the branch tip. Used by the
+/// cross-process worker after `ack` dead-letters a retryable error at the
+/// attempts cap — `process_build_job` intentionally leaves metadata non-terminal
+/// for retryable failures so intermediate retries don't look permanent.
+pub async fn mark_branch_build_failed(
+    state: &ServerState,
+    repo_id: &RepoId,
+    branch: &str,
+    message: &str,
+) -> Result<()> {
+    let _ =
+        update_current_build_status(state, repo_id, branch, &format!("failed: {message}")).await?;
+    Ok(())
 }
 
 fn classify_build_error(error: &anyhow::Error) -> BuildError {
@@ -7449,6 +7484,20 @@ mod tests {
         })
         .context("S3 get_object");
         assert!(classify_build_error(&e).is_retryable());
+    }
+
+    #[test]
+    fn terminal_metadata_only_for_permanent_build_errors() {
+        // Retryable must not write a terminal metadata status — /status would
+        // look failed while SqlJobQueue::ack still requeues under the cap.
+        assert_eq!(
+            terminal_metadata_status(&BuildError::retryable("storage 503")),
+            None
+        );
+        assert_eq!(
+            terminal_metadata_status(&BuildError::permanent("bad repo")),
+            Some("failed: bad repo".to_string())
+        );
     }
 
     #[test]

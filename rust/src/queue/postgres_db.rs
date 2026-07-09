@@ -7,7 +7,7 @@
 //! partial unique index. The claim/coalesce orchestration in `SqlJobQueue` is
 //! reused unchanged.
 
-use super::sql::QueueDb;
+use super::sql::{QueueDb, SUPERSEDED_BY_NEWER_QUEUED, now_secs};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use sqlx::Row;
@@ -51,7 +51,8 @@ impl QueueDb for PostgresDb {
                 finished_at BIGINT,
                 error TEXT,
                 credential TEXT,
-                attempts BIGINT NOT NULL DEFAULT 0
+                attempts BIGINT NOT NULL DEFAULT 0,
+                size_class BIGINT NOT NULL DEFAULT 0
             )",
         )
         .execute(&self.pool)
@@ -69,6 +70,13 @@ impl QueueDb for PostgresDb {
         .execute(&self.pool)
         .await
         .context("add attempts column")?;
+        // Stale-reclaim escalation rung (right-sizing / O2 claim filter).
+        sqlx::raw_sql(
+            "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS size_class BIGINT NOT NULL DEFAULT 0",
+        )
+        .execute(&self.pool)
+        .await
+        .context("add size_class column")?;
         sqlx::raw_sql(
             "CREATE INDEX IF NOT EXISTS idx_jobs_status_created ON jobs(status, created_at)",
         )
@@ -145,7 +153,7 @@ impl QueueDb for PostgresDb {
         now: i64,
         dead_letter_error: &str,
     ) -> Result<()> {
-        // Dead-letter stale claims over the attempt cap; requeue the rest.
+        // Dead-letter stale claims over the attempt cap.
         sqlx::query(
             "UPDATE jobs SET status = 'failed', finished_at = $1, error = $2,
                  worker_id = NULL, credential = NULL
@@ -158,8 +166,27 @@ impl QueueDb for PostgresDb {
         .execute(&self.pool)
         .await
         .context("dead-letter stale jobs")?;
+        // Under-cap with a newer queued sibling → superseded (unique key).
         sqlx::query(
-            "UPDATE jobs SET status = 'queued', worker_id = NULL
+            "UPDATE jobs SET status = 'failed', finished_at = $1, error = $2,
+                 worker_id = NULL, credential = NULL
+             WHERE status = 'claimed' AND claimed_at <= $3 AND attempts < $4
+               AND EXISTS (
+                   SELECT 1 FROM jobs j2
+                   WHERE j2.key = jobs.key AND j2.status = 'queued' AND j2.id != jobs.id
+               )",
+        )
+        .bind(now)
+        .bind(SUPERSEDED_BY_NEWER_QUEUED)
+        .bind(cutoff)
+        .bind(max_attempts)
+        .execute(&self.pool)
+        .await
+        .context("supersede stale jobs with a newer queued sibling")?;
+        // Under-cap with no sibling: requeue and bump size_class.
+        sqlx::query(
+            "UPDATE jobs SET status = 'queued', worker_id = NULL,
+                 size_class = size_class + 1
              WHERE status = 'claimed' AND claimed_at <= $1 AND attempts < $2",
         )
         .bind(cutoff)
@@ -168,6 +195,14 @@ impl QueueDb for PostgresDb {
         .await
         .context("reclaim stale jobs")?;
         Ok(())
+    }
+
+    async fn job_size_class(&self, id: i64) -> Result<Option<i64>> {
+        sqlx::query_scalar("SELECT size_class FROM jobs WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .context("fetch job size_class")
     }
 
     async fn next_queued_id(&self, _max_size_class: Option<i64>) -> Result<Option<i64>> {
@@ -254,7 +289,11 @@ impl QueueDb for PostgresDb {
     async fn requeue_claim(&self, id: i64, worker_id: &str, error: &str) -> Result<bool> {
         let res = sqlx::query(
             "UPDATE jobs SET status = 'queued', worker_id = NULL, error = $1
-             WHERE id = $2 AND worker_id = $3 AND status = 'claimed'",
+             WHERE id = $2 AND worker_id = $3 AND status = 'claimed'
+               AND NOT EXISTS (
+                   SELECT 1 FROM jobs AS j2
+                   WHERE j2.key = jobs.key AND j2.status = 'queued' AND j2.id != jobs.id
+               )",
         )
         .bind(error)
         .bind(id)
@@ -262,6 +301,20 @@ impl QueueDb for PostgresDb {
         .execute(&self.pool)
         .await
         .context("requeue retryable job")?;
+        if res.rows_affected() == 1 {
+            return Ok(true);
+        }
+        let res = sqlx::query(
+            "UPDATE jobs SET status = 'failed', finished_at = $1, error = $2, credential = NULL
+             WHERE id = $3 AND worker_id = $4 AND status = 'claimed'",
+        )
+        .bind(now_secs())
+        .bind(SUPERSEDED_BY_NEWER_QUEUED)
+        .bind(id)
+        .bind(worker_id)
+        .execute(&self.pool)
+        .await
+        .context("supersede claim blocked by newer queued job")?;
         Ok(res.rows_affected() == 1)
     }
 

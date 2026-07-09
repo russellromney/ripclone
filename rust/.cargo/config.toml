@@ -1,0 +1,15 @@
+# Use the mold linker on Linux x86_64-gnu builds. CI builds ~50 integration
+# test binaries per Linux job (rust/tests/*.rs) and rust-cache cannot speed up
+# linking — mold cuts link time 3-5x, which compounds across every Linux job
+# that builds those binaries (test, e2e, databases, docker, s3gc, gitea).
+#
+# Target-scoped so this never touches macOS (different target triple) or the
+# musl release target (a separate `x86_64-unknown-linux-musl` triple, built via
+# cargo-zigbuild — not covered by this rule, and mold is not installed there).
+#
+# mold must be present on PATH; scripts/install-build-deps.sh installs it on
+# every Linux job/dev machine that builds this target. If a future dependency
+# makes mold fail to link, switch to `-fuse-ld=lld` here instead (lld ships
+# with the toolchain and is still ~2-3x faster than the default bfd linker).
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]

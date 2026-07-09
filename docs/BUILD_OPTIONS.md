@@ -9,6 +9,20 @@ cd rust
 cargo build --release --no-default-features
 ```
 
+### Linux: mold linker
+
+On Linux (`x86_64-unknown-linux-gnu`), `rust/.cargo/config.toml` points builds
+at the [mold](https://github.com/rui314/mold) linker instead of the default
+`bfd`. This repo has ~50 integration test binaries (`rust/tests/*.rs`); mold
+cuts link time roughly 3-5x over the default linker, which matters far more
+than compile caching once dependencies are warm. `scripts/install-build-deps.sh`
+installs mold — run it once on a Linux dev machine (CI already does). macOS and
+the musl release target are unaffected (different target triples).
+
+If mold ever fails to link a new C dependency, switch the `rustflags` line in
+`rust/.cargo/config.toml` to `-fuse-ld=lld` (ships with the Rust toolchain,
+still ~2-3x faster than the default).
+
 ## Client tuning
 
 Environment variables for tuning clone performance:
