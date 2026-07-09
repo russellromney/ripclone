@@ -3,9 +3,10 @@
 //! atomic conditional claim). For multi-machine use the remote `libsql` backend.
 
 use super::sql::{
-    ADD_ATTEMPTS_COLUMN_SQL, ADD_CREDENTIAL_COLUMN_SQL, CREATE_ACTIVE_KEY_INDEX_SQL,
-    CREATE_HISTORY_INDEX_SQL, CREATE_STATUS_INDEX_SQL, CREATE_TABLE_SQL,
-    DROP_LEGACY_ACTIVE_KEY_INDEX_SQL, QueueDb,
+    ADD_ATTEMPTS_COLUMN_SQL, ADD_CREDENTIAL_COLUMN_SQL, ADD_SIZE_CLASS_COLUMN_SQL,
+    CREATE_ACTIVE_KEY_INDEX_SQL, CREATE_HISTORY_INDEX_SQL, CREATE_STATUS_INDEX_SQL,
+    CREATE_TABLE_SQL, DROP_LEGACY_ACTIVE_KEY_INDEX_SQL, QueueDb, SUPERSEDED_BY_NEWER_QUEUED,
+    now_secs,
 };
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -52,6 +53,10 @@ impl QueueDb for SqliteDb {
             .await;
         // Same best-effort migration for the attempts column (dead-letter bound).
         let _ = sqlx::raw_sql(ADD_ATTEMPTS_COLUMN_SQL)
+            .execute(&self.pool)
+            .await;
+        // Best-effort migration for size_class (stale-reclaim escalation rung).
+        let _ = sqlx::raw_sql(ADD_SIZE_CLASS_COLUMN_SQL)
             .execute(&self.pool)
             .await;
         sqlx::raw_sql(CREATE_STATUS_INDEX_SQL)
@@ -115,7 +120,7 @@ impl QueueDb for SqliteDb {
         dead_letter_error: &str,
     ) -> Result<()> {
         // Dead-letter first: any stale claim already at/over the attempt cap is
-        // terminally failed so it can't crash-loop. Then requeue the rest.
+        // terminally failed so it can't crash-loop.
         sqlx::query(
             "UPDATE jobs SET status = 'failed', finished_at = ?, error = ?,
                  worker_id = NULL, credential = NULL
@@ -128,8 +133,35 @@ impl QueueDb for SqliteDb {
         .execute(&self.pool)
         .await
         .context("dead-letter stale jobs")?;
+        // Under-cap but a newer job is already queued for the same key: the
+        // unique queued-key index forbids requeue. Terminalise as superseded
+        // (the newer job builds the tip). Nested FROM avoids SQLite's
+        // "table is locked" when updating from a same-table subquery.
         sqlx::query(
-            "UPDATE jobs SET status = 'queued', worker_id = NULL
+            "UPDATE jobs SET status = 'failed', finished_at = ?, error = ?,
+                 worker_id = NULL, credential = NULL
+             WHERE id IN (
+                 SELECT id FROM (
+                     SELECT j1.id AS id FROM jobs j1
+                     WHERE j1.status = 'claimed' AND j1.claimed_at <= ? AND j1.attempts < ?
+                       AND EXISTS (
+                           SELECT 1 FROM jobs j2
+                           WHERE j2.key = j1.key AND j2.status = 'queued' AND j2.id != j1.id
+                       )
+                 )
+             )",
+        )
+        .bind(now)
+        .bind(SUPERSEDED_BY_NEWER_QUEUED)
+        .bind(cutoff)
+        .bind(max_attempts)
+        .execute(&self.pool)
+        .await
+        .context("supersede stale jobs with a newer queued sibling")?;
+        // Under-cap with no sibling: requeue and bump size_class.
+        sqlx::query(
+            "UPDATE jobs SET status = 'queued', worker_id = NULL,
+                 size_class = size_class + 1
              WHERE status = 'claimed' AND claimed_at <= ? AND attempts < ?",
         )
         .bind(cutoff)
@@ -138,6 +170,14 @@ impl QueueDb for SqliteDb {
         .await
         .context("reclaim stale jobs")?;
         Ok(())
+    }
+
+    async fn job_size_class(&self, id: i64) -> Result<Option<i64>> {
+        sqlx::query_scalar("SELECT size_class FROM jobs WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .context("fetch job size_class")
     }
 
     async fn next_queued_id(&self) -> Result<Option<i64>> {
@@ -222,16 +262,41 @@ impl QueueDb for SqliteDb {
     }
 
     async fn requeue_claim(&self, id: i64, worker_id: &str, error: &str) -> Result<bool> {
+        // Requeue only when no sibling is already queued for this key (the
+        // unique idx_jobs_queued_key would reject a second queued row).
         let res = sqlx::query(
             "UPDATE jobs SET status = 'queued', worker_id = NULL, error = ?
-             WHERE id = ? AND worker_id = ? AND status = 'claimed'",
+             WHERE id = ? AND worker_id = ? AND status = 'claimed'
+               AND NOT EXISTS (
+                   SELECT 1 FROM jobs AS j2
+                   WHERE j2.key = (SELECT key FROM jobs WHERE id = ?)
+                     AND j2.status = 'queued' AND j2.id != ?
+               )",
         )
         .bind(error)
         .bind(id)
         .bind(worker_id)
+        .bind(id)
+        .bind(id)
         .execute(&self.pool)
         .await
         .context("requeue retryable job")?;
+        if res.rows_affected() == 1 {
+            return Ok(true);
+        }
+        // Still owning the claim ⇒ a newer queued job blocked requeue. Settle
+        // terminal so the row is not stuck claimed forever.
+        let res = sqlx::query(
+            "UPDATE jobs SET status = 'failed', finished_at = ?, error = ?, credential = NULL
+             WHERE id = ? AND worker_id = ? AND status = 'claimed'",
+        )
+        .bind(now_secs())
+        .bind(SUPERSEDED_BY_NEWER_QUEUED)
+        .bind(id)
+        .bind(worker_id)
+        .execute(&self.pool)
+        .await
+        .context("supersede claim blocked by newer queued job")?;
         Ok(res.rows_affected() == 1)
     }
 

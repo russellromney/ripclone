@@ -4,9 +4,10 @@
 //! it doesn't bundle SQLite's C core and collide with sqlx.)
 
 use super::sql::{
-    ADD_ATTEMPTS_COLUMN_SQL, ADD_CREDENTIAL_COLUMN_SQL, CREATE_ACTIVE_KEY_INDEX_SQL,
-    CREATE_HISTORY_INDEX_SQL, CREATE_STATUS_INDEX_SQL, CREATE_TABLE_SQL,
-    DROP_LEGACY_ACTIVE_KEY_INDEX_SQL, QueueDb,
+    ADD_ATTEMPTS_COLUMN_SQL, ADD_CREDENTIAL_COLUMN_SQL, ADD_SIZE_CLASS_COLUMN_SQL,
+    CREATE_ACTIVE_KEY_INDEX_SQL, CREATE_HISTORY_INDEX_SQL, CREATE_STATUS_INDEX_SQL,
+    CREATE_TABLE_SQL, DROP_LEGACY_ACTIVE_KEY_INDEX_SQL, QueueDb, SUPERSEDED_BY_NEWER_QUEUED,
+    now_secs,
 };
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -49,6 +50,8 @@ impl QueueDb for LibsqlDb {
         let _ = conn.execute(ADD_CREDENTIAL_COLUMN_SQL, ()).await;
         // Same best-effort migration for the attempts column (dead-letter bound).
         let _ = conn.execute(ADD_ATTEMPTS_COLUMN_SQL, ()).await;
+        // Best-effort migration for size_class (stale-reclaim escalation rung).
+        let _ = conn.execute(ADD_SIZE_CLASS_COLUMN_SQL, ()).await;
         conn.execute(CREATE_STATUS_INDEX_SQL, ())
             .await
             .context("create status index")?;
@@ -111,7 +114,7 @@ impl QueueDb for LibsqlDb {
         dead_letter_error: &str,
     ) -> Result<()> {
         let conn = self.conn().await?;
-        // Dead-letter stale claims over the attempt cap; requeue the rest.
+        // Dead-letter stale claims over the attempt cap.
         conn.execute(
             "UPDATE jobs SET status = 'failed', finished_at = ?, error = ?,
                  worker_id = NULL, credential = NULL
@@ -120,14 +123,46 @@ impl QueueDb for LibsqlDb {
         )
         .await
         .context("dead-letter stale jobs")?;
+        // Under-cap with a newer queued sibling → superseded (unique key).
         conn.execute(
-            "UPDATE jobs SET status = 'queued', worker_id = NULL
+            "UPDATE jobs SET status = 'failed', finished_at = ?, error = ?,
+                 worker_id = NULL, credential = NULL
+             WHERE id IN (
+                 SELECT id FROM (
+                     SELECT j1.id AS id FROM jobs j1
+                     WHERE j1.status = 'claimed' AND j1.claimed_at <= ? AND j1.attempts < ?
+                       AND EXISTS (
+                           SELECT 1 FROM jobs j2
+                           WHERE j2.key = j1.key AND j2.status = 'queued' AND j2.id != j1.id
+                       )
+                 )
+             )",
+            libsql::params![now, SUPERSEDED_BY_NEWER_QUEUED, cutoff, max_attempts],
+        )
+        .await
+        .context("supersede stale jobs with a newer queued sibling")?;
+        // Under-cap with no sibling: requeue and bump size_class.
+        conn.execute(
+            "UPDATE jobs SET status = 'queued', worker_id = NULL,
+                 size_class = size_class + 1
              WHERE status = 'claimed' AND claimed_at <= ? AND attempts < ?",
             libsql::params![cutoff, max_attempts],
         )
         .await
         .context("reclaim stale jobs")?;
         Ok(())
+    }
+
+    async fn job_size_class(&self, id: i64) -> Result<Option<i64>> {
+        let conn = self.conn().await?;
+        let mut rows = conn
+            .query("SELECT size_class FROM jobs WHERE id = ?", [id])
+            .await
+            .context("fetch job size_class")?;
+        match rows.next().await? {
+            Some(row) => Ok(Some(row.get::<i64>(0)?)),
+            None => Ok(None),
+        }
     }
 
     async fn next_queued_id(&self) -> Result<Option<i64>> {
@@ -224,11 +259,27 @@ impl QueueDb for LibsqlDb {
         let n = conn
             .execute(
                 "UPDATE jobs SET status = 'queued', worker_id = NULL, error = ?
-                 WHERE id = ? AND worker_id = ? AND status = 'claimed'",
-                libsql::params![error, id, worker_id],
+                 WHERE id = ? AND worker_id = ? AND status = 'claimed'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM jobs AS j2
+                       WHERE j2.key = (SELECT key FROM jobs WHERE id = ?)
+                         AND j2.status = 'queued' AND j2.id != ?
+                   )",
+                libsql::params![error, id, worker_id, id, id],
             )
             .await
             .context("requeue retryable job")?;
+        if n == 1 {
+            return Ok(true);
+        }
+        let n = conn
+            .execute(
+                "UPDATE jobs SET status = 'failed', finished_at = ?, error = ?, credential = NULL
+                 WHERE id = ? AND worker_id = ? AND status = 'claimed'",
+                libsql::params![now_secs(), SUPERSEDED_BY_NEWER_QUEUED, id, worker_id],
+            )
+            .await
+            .context("supersede claim blocked by newer queued job")?;
         Ok(n == 1)
     }
 
