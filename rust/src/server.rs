@@ -3386,8 +3386,7 @@ async fn add_repo_inner(
 
     // Tiered-add preflight: capture repo size now so the first build can be
     // size-classified without a new API call at enqueue.
-    let repo_size_bytes =
-        preflight_repo_size_bytes(&provider, &repo_id, credential.as_ref()).await;
+    let repo_size_bytes = preflight_repo_size_bytes(&provider, &repo_id, credential.as_ref()).await;
     let added = AddedRepo {
         repo_id: repo_id.clone(),
         added_at: SystemTime::now()
@@ -3504,10 +3503,7 @@ async fn preflight_repo_size_bytes(
         .header("User-Agent", "ripclone");
     // REST API wants Bearer / token, not the git-HTTPS Basic x-access-token form.
     if let Some(cred) = credential {
-        req = req.header(
-            "Authorization",
-            format!("Bearer {}", cred.expose_secret()),
-        );
+        req = req.header("Authorization", format!("Bearer {}", cred.expose_secret()));
     }
     let resp = req.send().await.ok()?;
     if !resp.status().is_success() {

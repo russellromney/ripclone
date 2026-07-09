@@ -239,7 +239,10 @@ mod tests {
     fn threshold_change_reclassifies() {
         let bytes = 500u64;
         let tight = three();
-        assert_eq!(class_name(classify_rank(Some(bytes), &tight), &tight), "medium");
+        assert_eq!(
+            class_name(classify_rank(Some(bytes), &tight), &tight),
+            "medium"
+        );
         // Raise medium threshold so 500 now fits small — pure config change.
         let retuned = vec![
             SizeClass {

@@ -22,9 +22,9 @@
 //!   backstop. A rare duplicate job is wasted compute, not a wrong result — the
 //!   poller watches its own job id and builds are idempotent into the CAS.
 
-use super::size_class::{SizeClass, classify_rank, load_size_classes, rank_ceiling};
 #[cfg(test)]
 use super::size_class::default_size_classes;
+use super::size_class::{SizeClass, classify_rank, load_size_classes, rank_ceiling};
 use super::{BuildError, BuildJob, EnqueueOutcome, Enqueued, JobId, JobQueue, JobState};
 use crate::provider::{ProviderInstanceId, RepoId};
 use anyhow::Result;
@@ -1377,10 +1377,7 @@ mod tests {
             Ok(_) => panic!("expected unknown size class to fail"),
             Err(e) => e,
         };
-        assert!(
-            err.to_string().contains("unknown size class"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("unknown size class"), "got: {err}");
     }
 
     #[tokio::test]

@@ -148,14 +148,13 @@ impl QueueDb for LibsqlDb {
     async fn next_queued_id(&self, max_size_class: Option<i64>) -> Result<Option<i64>> {
         let conn = self.conn().await?;
         let mut rows = match max_size_class {
-            None => {
-                conn.query(
+            None => conn
+                .query(
                     "SELECT id FROM jobs WHERE status = 'queued' ORDER BY created_at, id LIMIT 1",
                     (),
                 )
                 .await
-                .context("select next queued")?
-            }
+                .context("select next queued")?,
             Some(ceiling) => conn
                 .query(
                     "SELECT id FROM jobs WHERE status = 'queued' AND size_class <= ?
