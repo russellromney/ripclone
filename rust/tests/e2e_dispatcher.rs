@@ -853,12 +853,14 @@ async fn dispatcher_reconcile_drains_workers_over_api_queue() {
     let id_b = enqueue_sized(&queue, "acme/api-disp-b", Some(SMALL_BYTES)).await;
     assert_eq!(queue.depth().await, 2);
 
+    // One worker drains both jobs serially — proves the API path without piling
+    // pollers on the server's rate limiter.
     let mut backoff = BackoffState::new();
     reconcile_until_done(
         &queue,
         &provider,
         &worker_env,
-        /*max_workers=*/ 2,
+        /*max_workers=*/ 1,
         &[id_a, id_b],
         Duration::from_secs(120),
         &mut backoff,
@@ -867,6 +869,6 @@ async fn dispatcher_reconcile_drains_workers_over_api_queue() {
     assert_eq!(
         queue.depth().await,
         0,
-        "real workers must drain the queue over the HTTP API (RIPCLONE_QUEUE=api)"
+        "a real worker must drain the queue over the HTTP API (RIPCLONE_QUEUE=api)"
     );
 }
