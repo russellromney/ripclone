@@ -25,7 +25,7 @@ PROFILE="${MUSL_PROFILE:-ci}"
 repo_root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 cd "$repo_root/rust"
 
-BINS=(ripclone ripclone-server ripclone-worker git-remote-ripclone)
+BINS=(ripclone ripclone-server ripclone-worker ripclone-dispatcher git-remote-ripclone)
 
 # One zigbuild of the lib *test* binary first — it pulls the whole graph with
 # cfg(test) and is what we need for the musl-only unit tests. Then build the
@@ -96,6 +96,8 @@ docker run --rm --platform "$PLATFORM" \
     /b/ripclone --version
     /b/ripclone-server --version
     /b/ripclone-worker --help >/dev/null && echo "ripclone-worker: ok"
+    # none → clean no-op exit (no queue/provider required).
+    RIPCLONE_DISPATCH=none /b/ripclone-dispatcher && echo "ripclone-dispatcher: ok"
     /b/git-remote-ripclone 2>&1 | head -1 >/dev/null && echo "git-remote-ripclone: ok"
 
     # ...and one of them must do real work: boot the server (tokio, rustls,

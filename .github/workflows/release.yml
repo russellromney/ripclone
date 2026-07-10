@@ -62,11 +62,11 @@ jobs:
       - name: Build binaries (Linux musl)
         if: runner.os == 'Linux'
         working-directory: rust
-        run: cargo zigbuild --release --locked --target ${{ matrix.target }} --bin ripclone --bin ripclone-server --bin ripclone-worker --bin git-remote-ripclone
+        run: cargo zigbuild --release --locked --target ${{ matrix.target }} --bin ripclone --bin ripclone-server --bin ripclone-worker --bin ripclone-dispatcher --bin git-remote-ripclone
       - name: Build binaries (macOS)
         if: runner.os == 'macOS'
         working-directory: rust
-        run: cargo build --release --locked --bin ripclone --bin ripclone-server --bin ripclone-worker --bin git-remote-ripclone
+        run: cargo build --release --locked --bin ripclone --bin ripclone-server --bin ripclone-worker --bin ripclone-dispatcher --bin git-remote-ripclone
       - name: Package
         run: |
           if [ -n "${{ matrix.target }}" ]; then
@@ -76,7 +76,7 @@ jobs:
           fi
           dir="ripclone-${{ matrix.platform }}"
           mkdir -p "$dir"
-          cp "$bindir/ripclone" "$bindir/ripclone-server" "$bindir/ripclone-worker" "$bindir/git-remote-ripclone" "$dir/"
+          cp "$bindir/ripclone" "$bindir/ripclone-server" "$bindir/ripclone-worker" "$bindir/ripclone-dispatcher" "$bindir/git-remote-ripclone" "$dir/"
           cp LICENSE-MIT LICENSE-APACHE "$dir/"
           tar -czf "$dir.tar.gz" "$dir"
           shasum -a 256 "$dir.tar.gz" > "$dir.tar.gz.sha256"

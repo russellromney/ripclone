@@ -39,7 +39,8 @@ pick_lib_test_exe() {
 }
 
 # writer_bench: Dockerfile.client.ci COPY only (not product runtime).
-BINS=(ripclone ripclone-server ripclone-worker git-remote-ripclone writer_bench)
+# ripclone-dispatcher: product bin (release/musl/e2e); stage with the others.
+BINS=(ripclone ripclone-server ripclone-worker ripclone-dispatcher git-remote-ripclone writer_bench)
 
 TESTS=(
   e2e_gitea_provider

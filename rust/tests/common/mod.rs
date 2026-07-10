@@ -1679,6 +1679,9 @@ pub fn cargo_bin(name: &str) -> std::path::PathBuf {
         "ripclone-worker" => std::path::PathBuf::from(env!("CARGO_BIN_EXE_ripclone-worker")),
         "ripclone" => std::path::PathBuf::from(env!("CARGO_BIN_EXE_ripclone")),
         "ripclone-server" => std::path::PathBuf::from(env!("CARGO_BIN_EXE_ripclone-server")),
+        "ripclone-dispatcher" => {
+            std::path::PathBuf::from(env!("CARGO_BIN_EXE_ripclone-dispatcher"))
+        }
         other => panic!("unknown cargo bin {other}; set CARGO_BIN_EXE_{other}"),
     }
 }

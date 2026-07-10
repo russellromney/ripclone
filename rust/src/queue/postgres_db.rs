@@ -337,6 +337,19 @@ impl QueueDb for PostgresDb {
             .context("count queued")
     }
 
+    async fn count_queued_by_size_class(&self) -> Result<Vec<(i64, i64)>> {
+        // Lagging backend: enqueue does not persist size_class ranks reliably.
+        // Approximate by treating the entire pending depth as the top class
+        // (sentinel i64::MAX; SqlJobQueue::pending_by_class clamps to last).
+        // Prefer over-sizing over under-sizing (a small worker OOMs on large).
+        let n = self.count_queued().await?;
+        if n > 0 {
+            Ok(vec![(i64::MAX, n)])
+        } else {
+            Ok(vec![])
+        }
+    }
+
     async fn prune_failed(&self, cutoff: i64) -> Result<u64> {
         let res = sqlx::query("DELETE FROM jobs WHERE status = 'failed' AND finished_at < $1")
             .bind(cutoff)

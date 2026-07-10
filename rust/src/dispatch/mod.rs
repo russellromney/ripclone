@@ -23,12 +23,17 @@
 //!
 //! Nothing outside this module knows the platform.
 
+pub mod autoscale;
 pub mod exec;
 pub mod fly;
 pub mod http;
 pub mod mock;
 pub mod select;
 
+pub use autoscale::{
+    AutoscaleConfig, BackoffState, ReconcileOutcome, ReconcilePlan, WORKER_ENV_KEYS,
+    collect_worker_env, plan_reconcile, reconcile_once, run_loop,
+};
 pub use exec::{ExecProvider, ExecProviderConfig};
 pub use fly::{
     FlyMachine, FlyMachinesClient, FlyProvider, FlyProviderConfig, HttpFlyMachinesClient,
@@ -159,10 +164,15 @@ pub trait ComputeProvider: Send + Sync {
     /// Short name for logs / selection (`"fly"`, `"exec"`, …).
     fn name(&self) -> &str;
 
-    /// Ensure a worker of at least `spec.size_class` is starting with `spec.env`.
+    /// Ensure one more unit of worker capacity of at least `spec.size_class`
+    /// is starting with `spec.env`.
     ///
-    /// Idempotent: already-starting / already-live → no-op.
-    /// Non-blocking / best-effort: failures surface as `Err` for the caller to
-    /// log; the reconcile loop retries. Never required for enqueue durability.
+    /// The depth-based reconciler may call this N times when it needs N
+    /// workers. Each call may start additional capacity when the platform has
+    /// it (e.g. another stopped Fly machine). When nothing more can be started
+    /// and a peer is already live/starting, return `Ok` (idempotent no-op) —
+    /// never an error. Non-blocking / best-effort: other failures surface as
+    /// `Err` for the caller to log; the reconcile loop retries. Never required
+    /// for enqueue durability.
     async fn ensure_worker(&self, spec: &WorkerSpec) -> Result<()>;
 }

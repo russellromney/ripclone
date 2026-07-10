@@ -1,7 +1,10 @@
 //! Fly Machines impl of [`ComputeProvider`].
 //!
-//! Pooling is internal: list machines, no-op if one of the right size is already
-//! live, else `POST …/start` on a stopped (or suspended) one.
+//! Pooling is internal: list machines of the right size class, `POST …/start`
+//! on a stopped (or suspended) one when any remain. Each call may start one
+//! additional machine so depth-based autoscale can grow past a single live
+//! peer. When the pool has no startable machine left, an already-live peer is
+//! an idempotent `Ok` no-op (not an error).
 //!
 //! Pre-provisioned machines carry the env bag via Fly secrets / machine config.
 //! `WorkerSpec.env` is accepted for interface parity; per-job env injection is
@@ -259,45 +262,52 @@ impl ComputeProvider for FlyProvider {
             .filter(|m| self.is_pool_candidate(m, &spec.size_class))
             .collect();
 
+        // Prefer scale-out: start one stopped machine when the pool has one.
+        // Depth-based autoscale calls ensure_worker N times for N slots; if we
+        // no-op whenever *any* peer is live, the fleet can never grow past 1.
+        let startable: Vec<&&FlyMachine> = pool
+            .iter()
+            .filter(|m| startable_states().contains(m.state.as_str()))
+            .collect();
+        if let Some(target) = startable.first() {
+            info!(
+                size_class = %spec.size_class,
+                machine_id = %target.id,
+                state = %target.state,
+                live_peers = pool
+                    .iter()
+                    .filter(|m| live_states().contains(m.state.as_str()))
+                    .count(),
+                "fly.ensure_worker starting stopped machine"
+            );
+            return self.client.start_machine(&self.app, &target.id).await;
+        }
+
         let live: Vec<&&FlyMachine> = pool
             .iter()
             .filter(|m| live_states().contains(m.state.as_str()))
             .collect();
         if !live.is_empty() {
+            // Pool exhausted but something is already up — idempotent success.
             info!(
                 size_class = %spec.size_class,
                 live = ?live.iter().map(|m| (&m.id, &m.state)).collect::<Vec<_>>(),
-                "fly.ensure_worker no-op: already live"
+                "fly.ensure_worker no-op: no startable capacity, peers live"
             );
             return Ok(());
         }
 
-        let startable: Vec<&&FlyMachine> = pool
-            .iter()
-            .filter(|m| startable_states().contains(m.state.as_str()))
-            .collect();
-        if startable.is_empty() {
-            // Loud fail: no capacity to wake. Job stays queued; reconcile retries.
-            error!(
-                size_class = %spec.size_class,
-                pool_size = pool.len(),
-                states = ?pool.iter().map(|m| m.state.as_str()).collect::<Vec<_>>(),
-                "fly.ensure_worker: no startable machine in pool"
-            );
-            bail!(
-                "FlyProvider: no stopped/suspended machine for size_class={}",
-                spec.size_class
-            );
-        }
-
-        let target = startable[0];
-        info!(
+        // Loud fail: no capacity to wake. Job stays queued; reconcile retries.
+        error!(
             size_class = %spec.size_class,
-            machine_id = %target.id,
-            state = %target.state,
-            "fly.ensure_worker starting stopped machine"
+            pool_size = pool.len(),
+            states = ?pool.iter().map(|m| m.state.as_str()).collect::<Vec<_>>(),
+            "fly.ensure_worker: no startable machine in pool"
         );
-        self.client.start_machine(&self.app, &target.id).await
+        bail!(
+            "FlyProvider: no stopped/suspended machine for size_class={}",
+            spec.size_class
+        )
     }
 }
 
@@ -417,7 +427,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn already_starting_or_started_is_noop() {
+    async fn scale_out_starts_stopped_even_when_peer_live() {
+        // Depth-based autoscale needs N starts; a live peer must not block
+        // waking another stopped machine in the pool.
         for state in ["starting", "started", "created", "replacing"] {
             let client = Arc::new(MockFlyClient::new(vec![
                 machine("m-live", state, Some("small"), Some("worker")),
@@ -425,12 +437,55 @@ mod tests {
             ]));
             let fly = provider(client.clone());
             fly.ensure_worker(&spec()).await.unwrap();
-            assert!(
-                client.starts().is_empty(),
-                "expected no-op for state={state}, got starts={:?}",
-                client.starts()
+            assert_eq!(
+                client.starts(),
+                vec!["m-stopped".to_string()],
+                "expected scale-out start while peer state={state}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn pool_exhausted_with_live_peer_is_idempotent_ok() {
+        let client = Arc::new(MockFlyClient::new(vec![machine(
+            "m-live",
+            "started",
+            Some("small"),
+            Some("worker"),
+        )]));
+        let fly = provider(client.clone());
+        fly.ensure_worker(&spec()).await.unwrap();
+        assert!(
+            client.starts().is_empty(),
+            "no startable capacity → no-op Ok, not Err"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_ensure_starts_multiple_stopped_machines() {
+        let client = Arc::new(MockFlyClient::new(vec![
+            machine("m1", "stopped", Some("small"), Some("worker")),
+            machine("m2", "stopped", Some("small"), Some("worker")),
+            machine("m3", "stopped", Some("small"), Some("worker")),
+        ]));
+        // Mock does not flip state on start — each call re-picks the first
+        // stopped machine. Simulate sequential starts by updating state.
+        let fly = provider(client.clone());
+        for _ in 0..3 {
+            let machines = client.machines.lock().unwrap().clone();
+            let next = machines
+                .iter()
+                .find(|m| m.state == "stopped")
+                .map(|m| m.id.clone());
+            fly.ensure_worker(&spec()).await.unwrap();
+            if let Some(id) = next {
+                let mut machines = client.machines.lock().unwrap();
+                if let Some(m) = machines.iter_mut().find(|m| m.id == id) {
+                    m.state = "starting".into();
+                }
+            }
+        }
+        assert_eq!(client.starts().len(), 3, "three ensure → three starts");
     }
 
     #[tokio::test]
