@@ -129,7 +129,7 @@ Choose it with `RIPCLONE_METADATA`, independently of storage:
 | `postgres` | a Postgres database | shared across machines |
 | `mysql` | a MySQL database | shared across machines |
 | `libsql` | a remote Turso Cloud database | shared across machines |
-| `api` | server via `POST /v1/refs` | **Worker-only, token-only farm-out.** Requires `RIPCLONE_METADATA_REPORT_URL` + `RIPCLONE_METADATA_JOB_TOKEN` (a signed, expiring token with no repo/job scope; the write target is the `repo_key` in each report body). No DB credentials on the worker; the server holds them and performs the durable write. Pair with `RIPCLONE_QUEUE=api` (below): one token authenticates both. The dispatcher mints and injects the token per worker. |
+| `api` | server via `POST /v1/refs` | **Worker-only, token-only farm-out.** Requires `RIPCLONE_METADATA_REPORT_URL` + `RIPCLONE_METADATA_JOB_TOKEN` (a signed, expiring token with no repo/job scope; the write target is the `repo_key` in each report body). No DB credentials on the worker; the server holds them and performs the durable write. Pair with `RIPCLONE_QUEUE=api` (below): one token authenticates both. The token is operator-provisioned (`ripclone mint-worker-token`), not minted per dispatch. |
 
 The SQL backends read a connection URL (and a token for `libsql`):
 
@@ -188,8 +188,12 @@ Notes:
   (`RIPCLONE_METADATA_JOB_TOKEN`) against the server's `RIPCLONE_QUEUE_API_URL` /
   `RIPCLONE_METADATA_REPORT_URL`. The server holds the one queue+metadata DB. A
   401 (expired token) exits the worker cleanly for respawn. It still shares
-  **storage** (that is where durable artifacts live). The dispatcher configures
-  and mints the token automatically.
+  **storage** (that is where durable artifacts live). The token is
+  operator-provisioned once with `ripclone mint-worker-token` (default 90d) and
+  provisioned per provider: a **Fly machine secret** on each pooled machine, or
+  **forwarded by the dispatcher** for the exec/http escape hatch. Rotate by
+  re-minting. On Fly the "no DB creds" guarantee is the provisioning — the machine
+  physically carries only the token + storage creds.
 - **One `repo_root` per worker.** The bare mirror under `--repo-root` is per-repo
   scratch guarded by an in-process lock; give each worker its own. All durable
   state is in storage + the metadata store.

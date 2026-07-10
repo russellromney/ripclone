@@ -16,19 +16,30 @@ farmed-out worker reaches them entirely over HTTP with a single bearer token:
 - **Metadata:** `RIPCLONE_METADATA=api` + `RIPCLONE_METADATA_REPORT_URL` (the
   server's `POST /v1/refs`). The worker POSTs each ref-write.
 - **One token:** `RIPCLONE_METADATA_JOB_TOKEN` — a signed, expiring HMAC bearer
-  (`rcjt1.…`, `job_token::mint_job_token`) with no repo or job scope, because it
-  is injected into a pooled worker that may claim any repo's job. It
-  authenticates **all four** endpoints. It is the worker's whole credential.
+  (`rcjt1.…`) with no repo or job scope, because it is injected into a pooled
+  worker that may claim any repo's job. It authenticates **all four** endpoints.
+  It is the worker's whole credential.
 
-The **dispatcher** mints a fresh token per started worker (`DEFAULT_TTL`, 6h) and
-sets `RIPCLONE_QUEUE=api` / `RIPCLONE_METADATA=api` when the bag points at the
-server's HTTP endpoints; it never forwards a DB credential (the four
-`_DB_URL`/`_DB_TOKEN` keys are absent from `WORKER_ENV_KEYS`). A 401 on any
-endpoint → the worker exits cleanly and the dispatcher respawns it with a fresh
-token. **Single-box self-host** keeps the direct SQL path
+**Token delivery is by provisioning, not per-dispatch minting.** An operator mints
+one durable token (`ripclone mint-worker-token`, default 90d) and provisions it:
+
+- **Fly (launch):** each pre-provisioned pooled machine carries the api env + the
+  token as a **Fly machine secret** + storage creds, and **no** `*_DB_URL` /
+  `*_DB_TOKEN`. `FlyProvider` just starts the machine (it does not inject env). The
+  "no DB creds" guarantee on Fly is the provisioning — the machine physically has
+  none.
+- **exec / http (self-host escape hatch, typically local/trusted):** the
+  dispatcher **forwards** the token + api config from its own env into each
+  `WorkerSpec.env` (it does not mint). It sets `RIPCLONE_QUEUE=api` /
+  `RIPCLONE_METADATA=api` and fails loudly at startup if api mode is configured
+  but no `RIPCLONE_METADATA_JOB_TOKEN` is available to forward.
+
+The four `_DB_URL`/`_DB_TOKEN` keys are absent from `WORKER_ENV_KEYS`. A 401 on any
+endpoint → the worker exits cleanly and is respawned with a fresh token. Rotate by
+re-minting. **Single-box self-host** keeps the direct SQL path
 (`RIPCLONE_QUEUE=sqlite|…` + `RIPCLONE_QUEUE_DB_URL`, `RIPCLONE_METADATA=sqlite|…`)
-— it is trusted and unchanged. Only the dispatcher-started farm-out path is
-token-only.
+— it is trusted and unchanged. Only the dispatcher-started / pooled farm-out path
+is token-only.
 
 `size_class` is part of the provider-facing [`WorkerSpec`](mod.rs) (a config-driven
 lane name such as `small` or `large`), not an env var.
@@ -53,7 +64,7 @@ lane name such as `small` or `large`), not an env var.
 | | `RIPCLONE_METADATA_DB_URL` | Yes, when `RIPCLONE_METADATA` is SQL (direct) | — | DB path/URL for SQL metadata. **Never set on a farm-out worker.** |
 | | `RIPCLONE_METADATA_DB_TOKEN` | Yes, when `RIPCLONE_METADATA=libsql` (direct) | — | Auth token for remote libsql metadata. **Never set on a farm-out worker.** |
 | **Metadata target** (`api` — token-only farm-out) | `RIPCLONE_METADATA_REPORT_URL` | Yes, when `RIPCLONE_METADATA=api` | — | Absolute `http(s)` URL of the server's `POST /v1/refs` report endpoint. Missing → worker fails at startup. |
-| | `RIPCLONE_METADATA_JOB_TOKEN` | Yes, when `RIPCLONE_QUEUE=api` or `RIPCLONE_METADATA=api` | — | The **one** signed, expiring HMAC bearer (`rcjt1.…`) for all four endpoints (claim/ack/heartbeat/refs); no repo or job scope. The dispatcher mints it fresh per worker (`mint_job_token`, 6h). Sent as `Authorization: Bearer …`. Missing → worker fails at startup. Malformed/expired/wrong-secret → 401, no state change; the worker exits cleanly for respawn. |
+| | `RIPCLONE_METADATA_JOB_TOKEN` | Yes, when `RIPCLONE_QUEUE=api` or `RIPCLONE_METADATA=api` | — | The **one** signed, expiring HMAC bearer (`rcjt1.…`) for all four endpoints (claim/ack/heartbeat/refs); no repo or job scope. Operator-provisioned (`ripclone mint-worker-token`, default 90d) — a Fly machine secret, or forwarded by the dispatcher for exec/http. Sent as `Authorization: Bearer …`. Missing → worker fails at startup. Malformed/expired/wrong-secret → 401, no state change; the worker exits cleanly for respawn. |
 | **Upstream-credential source** | `RIPCLONE_PROVIDERS` | One source required | — | JSON provider registry; supplies instance tokens and auth templates. |
 | | `RIPCLONE_GITHUB_TOKEN` | alt | — | Static GitHub personal/token for the static broker. |
 | | `RIPCLONE_GITHUB_APP_ID` | alt | — | GitHub App broker: app ID. |
@@ -83,15 +94,14 @@ Before starting a worker, a provider must set:
 
 1. Queue backend + claim credentials.
 2. Storage credentials (or confirm local-disk operation is intended).
-3. Metadata target:
-   - **Farm-out (today's only working path):** `RIPCLONE_METADATA` +
-     `RIPCLONE_METADATA_DB_URL` (+ `RIPCLONE_METADATA_DB_TOKEN` for libsql).
-     Workers hold DB creds.
-   - **`api` (mechanism exists, not yet deployable):** `RIPCLONE_METADATA=api`
-     + `RIPCLONE_METADATA_REPORT_URL` + `RIPCLONE_METADATA_JOB_TOKEN`. No
-     `RIPCLONE_METADATA_DB_URL` / `RIPCLONE_METADATA_DB_TOKEN` — but nothing
-     mints/injects the token at dispatch yet, so this requires a manual token
-     today. See D-A.
+3. Queue + metadata target:
+   - **Token-only farm-out (`api`):** `RIPCLONE_QUEUE=api` +
+     `RIPCLONE_QUEUE_API_URL` + `RIPCLONE_METADATA=api` +
+     `RIPCLONE_METADATA_REPORT_URL` + `RIPCLONE_METADATA_JOB_TOKEN`. No
+     `*_DB_URL` / `*_DB_TOKEN` — workers hold zero DB creds.
+   - **Single-box direct SQL (trusted):** `RIPCLONE_QUEUE=sqlite|…` +
+     `RIPCLONE_QUEUE_DB_URL` + `RIPCLONE_METADATA=sqlite|…` +
+     `RIPCLONE_METADATA_DB_URL` (+ `*_DB_TOKEN` for libsql).
 4. One upstream-credential source (`RIPCLONE_PROVIDERS`, `RIPCLONE_GITHUB_TOKEN`,
    or GitHub App vars).
 5. Optional: `RIPCLONE_MAX_SIZE_CLASS` and lifecycle flags.
@@ -99,27 +109,24 @@ Before starting a worker, a provider must set:
 That is the entire provider-facing surface today. No CLI flags, no config
 files, no platform-specific API knowledge.
 
-## Farm-out worker env (no DB creds) — not yet deployable
+## Token-only farm-out worker env (no DB creds)
 
-The `api` mechanism below exists (endpoint + client + token primitive) but
-nothing mints and injects `RIPCLONE_METADATA_JOB_TOKEN` at dispatch yet, so this
-bag is not usable end to end without an operator manually minting a token.
-Treat it as a shape for the follow-up dispatch integration, not a working
-recipe today:
+Mint one durable token first: `ripclone mint-worker-token` (default 90d). Then
+each farm-out worker carries:
 
 ```bash
-RIPCLONE_QUEUE=sqlite|postgres|mysql|libsql
-RIPCLONE_QUEUE_DB_URL=…          # claim only — not the metadata DB
-# RIPCLONE_QUEUE_DB_TOKEN=…      # when queue is libsql
+RIPCLONE_QUEUE=api
+RIPCLONE_QUEUE_API_URL=https://ripclone.example      # serves POST /v1/jobs/*
 
 RIPCLONE_METADATA=api
 RIPCLONE_METADATA_REPORT_URL=https://ripclone.example/v1/refs
-RIPCLONE_METADATA_JOB_TOKEN=rcjt1.…   # signed + expiring, no scope; no automatic mint/inject yet
+RIPCLONE_METADATA_JOB_TOKEN=rcjt1.…   # the one bearer for all four endpoints
 
 # storage (S3 or local) …
 # upstream credential source …
 # optional: RIPCLONE_MAX_SIZE_CLASS, RIPCLONE_IDLE_EXIT_SECS, RIPCLONE_MAX_JOBS
 ```
 
-**Do not set** `RIPCLONE_METADATA_DB_URL` or `RIPCLONE_METADATA_DB_TOKEN` on
-that worker. The server that serves `POST /v1/refs` holds those.
+**No `*_DB_URL` / `*_DB_TOKEN` on that worker** — the server that serves the
+endpoints holds the one queue + metadata DB. On Fly this bag is a machine
+secret set on each pooled machine; for exec/http the dispatcher forwards it.

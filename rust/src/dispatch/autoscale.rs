@@ -35,7 +35,6 @@
 //!   double-counting.
 
 use super::{ComputeProvider, WorkerSpec};
-use crate::job_token::{DEFAULT_TTL, mint_job_token};
 use crate::queue::SqlJobQueue;
 use crate::queue::size_class::{SizeClass, class_name};
 use anyhow::Result;
@@ -46,8 +45,8 @@ use tracing::{error, info, warn};
 
 /// True when the worker env bag targets the token-only farm-out path: the
 /// worker claims over HTTP (`RIPCLONE_QUEUE_API_URL`) and reports metadata over
-/// HTTP (`RIPCLONE_METADATA_REPORT_URL`). When set, the dispatcher mints a fresh
-/// bearer token per worker instead of forwarding one.
+/// HTTP (`RIPCLONE_METADATA_REPORT_URL`). When set, the dispatcher forwards a
+/// durable, operator-provisioned bearer token to each worker (it does not mint).
 pub fn api_mode_configured(env: &BTreeMap<String, String>) -> bool {
     env.contains_key("RIPCLONE_QUEUE_API_URL") && env.contains_key("RIPCLONE_METADATA_REPORT_URL")
 }
@@ -249,11 +248,14 @@ pub const WORKER_ENV_KEYS: &[&str] = &[
     "AWS_ENDPOINT_URL_S3",
     "AWS_REGION",
     "BUCKET_NAME",
-    // Metadata: `api` reports over HTTP, no DB creds. The bearer token
-    // (`RIPCLONE_METADATA_JOB_TOKEN`) is **not** forwarded from the dispatcher's
-    // env — it is freshly minted per started worker (see `reconcile_once`).
+    // Metadata: `api` reports over HTTP, no DB creds. The one bearer token
+    // (`RIPCLONE_METADATA_JOB_TOKEN`) is a durable, operator-provisioned value
+    // the dispatcher **forwards** to each worker (mint it once with
+    // `ripclone mint-worker-token`). On Fly it is a machine secret provisioned
+    // out of band, not forwarded through this bag.
     "RIPCLONE_METADATA",
     "RIPCLONE_METADATA_REPORT_URL",
+    "RIPCLONE_METADATA_JOB_TOKEN",
     // Upstream-credential source
     "RIPCLONE_PROVIDERS",
     "RIPCLONE_GITHUB_TOKEN",
@@ -302,11 +304,6 @@ pub struct ReconcileInputs<'a> {
     pub max_workers: usize,
     pub worker_env: &'a BTreeMap<String, String>,
     pub backoff: &'a mut BackoffState,
-    /// Job-token signing secret. `Some` on the token-only farm-out path: each
-    /// started worker gets a freshly minted `RIPCLONE_METADATA_JOB_TOKEN`
-    /// (`DEFAULT_TTL`) so no long-lived key is forwarded. `None` on the direct
-    /// SQL path (workers use DB creds; nothing to mint).
-    pub job_token_secret: Option<&'a [u8]>,
     /// Clock for backoff (inject in tests).
     pub now: Instant,
 }
@@ -373,27 +370,11 @@ pub async fn reconcile_once(input: ReconcileInputs<'_>) -> Result<ReconcileOutco
     let mut started = 0usize;
     let mut failed = 0usize;
     for size_class in &plan.size_classes {
-        // Per-slot ceiling: worker claims jobs at or below this class.
+        // Per-slot ceiling: worker claims jobs at or below this class. The
+        // token-only farm-out env (RIPCLONE_QUEUE=api + the bearer token) is
+        // already in `worker_env`, forwarded whole — the dispatcher does not mint.
         let mut env = input.worker_env.clone();
         env.insert("RIPCLONE_MAX_SIZE_CLASS".into(), size_class.clone());
-        // Token-only farm-out: mint a fresh, short-TTL bearer for this worker.
-        // It authenticates claim/ack/heartbeat and the metadata reports — the
-        // worker's whole credential. Never forwarded from the dispatcher's env.
-        if let Some(secret) = input.job_token_secret {
-            match mint_job_token(secret, DEFAULT_TTL) {
-                Ok(token) => {
-                    env.insert("RIPCLONE_METADATA_JOB_TOKEN".into(), token);
-                }
-                Err(e) => {
-                    // Minting is local + should never fail; if it does, do not
-                    // start a worker that would 401 on every call.
-                    failed += 1;
-                    error!(err = %e, "autoscale: mint job token failed; skipping start");
-                    input.backoff.on_failure(input.now, None);
-                    break;
-                }
-            }
-        }
         let spec = WorkerSpec::new(size_class.clone(), env);
         match input.provider.ensure_worker(&spec).await {
             Ok(()) => {
@@ -481,13 +462,12 @@ pub async fn run_loop(
     provider: Arc<dyn ComputeProvider>,
     config: AutoscaleConfig,
     worker_env: BTreeMap<String, String>,
-    job_token_secret: Option<Vec<u8>>,
 ) -> Result<()> {
     info!(
         interval_secs = config.interval.as_secs(),
         max_workers = config.max_workers,
         provider = provider.name(),
-        api_mode = job_token_secret.is_some(),
+        api_mode = api_mode_configured(&worker_env),
         "dispatcher autoscale loop starting (poll-only)"
     );
     let mut backoff = BackoffState::new();
@@ -499,7 +479,6 @@ pub async fn run_loop(
             max_workers: config.max_workers,
             worker_env: &worker_env,
             backoff: &mut backoff,
-            job_token_secret: job_token_secret.as_deref(),
             now,
         })
         .await
@@ -667,6 +646,8 @@ mod tests {
             "RIPCLONE_QUEUE" => Some("api".into()),
             "RIPCLONE_QUEUE_API_URL" => Some("https://srv".into()),
             "RIPCLONE_METADATA_REPORT_URL" => Some("https://srv/v1/refs".into()),
+            // The durable worker token IS forwarded (operator-provisioned).
+            "RIPCLONE_METADATA_JOB_TOKEN" => Some("rcjt1.tok".into()),
             "AWS_SECRET_ACCESS_KEY" => Some("secret".into()),
             "UNRELATED" => Some("nope".into()),
             // DB creds are no longer in the bag: a farm-out worker is token-only.
@@ -684,6 +665,10 @@ mod tests {
         assert_eq!(
             env.get("RIPCLONE_METADATA_REPORT_URL").map(String::as_str),
             Some("https://srv/v1/refs")
+        );
+        assert_eq!(
+            env.get("RIPCLONE_METADATA_JOB_TOKEN").map(String::as_str),
+            Some("rcjt1.tok")
         );
         assert!(!env.contains_key("UNRELATED"));
         // TRAP — no DB fallback in a farm-out worker: none of the four DB-cred
@@ -727,17 +712,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconcile_mints_fresh_token_per_worker_in_api_mode() {
+    async fn reconcile_forwards_provisioned_token_per_worker() {
+        // Model B: the dispatcher does NOT mint. A durable, operator-provisioned
+        // `RIPCLONE_METADATA_JOB_TOKEN` lives in the worker_env bag and is
+        // forwarded whole into every started worker's spec.
         let (q, _dir) = test_queue().await;
         q.enqueue(job("o/r", Some(100))).await.unwrap();
         let mock = MockProvider::new();
-        let secret = crate::job_token::report_token_secret_from_env()
-            .unwrap_or_else(|| b"test-secret-material".to_vec());
         let env = BTreeMap::from([
             ("RIPCLONE_QUEUE".to_string(), "api".to_string()),
             (
                 "RIPCLONE_QUEUE_API_URL".to_string(),
                 "https://srv".to_string(),
+            ),
+            (
+                "RIPCLONE_METADATA_JOB_TOKEN".to_string(),
+                "rcjt1.provisioned.token".to_string(),
             ),
         ]);
         let mut backoff = BackoffState::new();
@@ -747,18 +737,19 @@ mod tests {
             max_workers: 5,
             worker_env: &env,
             backoff: &mut backoff,
-            job_token_secret: Some(&secret),
             now: Instant::now(),
         })
         .await
         .unwrap();
         assert_eq!(out.started, 1);
-        let token = mock.calls()[0]
-            .env
-            .get("RIPCLONE_METADATA_JOB_TOKEN")
-            .expect("api-mode worker must get a minted token");
-        crate::job_token::verify_job_token(&secret, token)
-            .expect("minted token must verify against the secret");
+        assert_eq!(
+            mock.calls()[0]
+                .env
+                .get("RIPCLONE_METADATA_JOB_TOKEN")
+                .map(String::as_str),
+            Some("rcjt1.provisioned.token"),
+            "the provisioned worker token must be forwarded verbatim"
+        );
     }
 
     fn job(path: &str, size_bytes: Option<u64>) -> BuildJob {
@@ -797,7 +788,6 @@ mod tests {
             max_workers: 10,
             worker_env: &env,
             backoff: &mut backoff,
-            job_token_secret: None,
             now: Instant::now(),
         })
         .await
@@ -823,7 +813,6 @@ mod tests {
             max_workers: 2,
             worker_env: &env,
             backoff: &mut backoff,
-            job_token_secret: None,
             now: Instant::now(),
         })
         .await
@@ -861,7 +850,6 @@ mod tests {
             max_workers: 5,
             worker_env: &env,
             backoff: &mut backoff,
-            job_token_secret: None,
             now: Instant::now(),
         })
         .await
@@ -928,7 +916,6 @@ mod tests {
             max_workers: 5,
             worker_env: &env,
             backoff: &mut backoff,
-            job_token_secret: None,
             now: Instant::now(),
         })
         .await
@@ -954,7 +941,6 @@ mod tests {
             max_workers: 5,
             worker_env: &env,
             backoff: &mut backoff,
-            job_token_secret: None,
             now,
         })
         .await
@@ -975,7 +961,6 @@ mod tests {
             max_workers: 5,
             worker_env: &env,
             backoff: &mut backoff,
-            job_token_secret: None,
             now, // still inside backoff window
         })
         .await
@@ -1036,7 +1021,6 @@ mod tests {
             max_workers: 10,
             worker_env: &env,
             backoff: &mut backoff,
-            job_token_secret: None,
             now: Instant::now(),
         })
         .await
@@ -1055,7 +1039,6 @@ mod tests {
             max_workers: 10,
             worker_env: &env,
             backoff: &mut backoff,
-            job_token_secret: None,
             now: Instant::now(),
         })
         .await
@@ -1081,7 +1064,6 @@ mod tests {
             max_workers: 10,
             worker_env: &env,
             backoff: &mut backoff,
-            job_token_secret: None,
             now: Instant::now(),
         })
         .await

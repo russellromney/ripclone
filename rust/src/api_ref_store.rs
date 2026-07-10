@@ -12,9 +12,9 @@
 //! retryable errors so the job requeues, and 401/403 to an unauthorized error so
 //! the worker exits cleanly for respawn with a fresh token.
 //!
-//! The token is minted and injected at dispatch time (the dispatcher's autoscale
-//! loop), so `api` mode is deployable for real farm-out. The queue-side twin is
-//! [`ApiJobQueue`](crate::api_job_queue) (`RIPCLONE_QUEUE=api`).
+//! The token is a durable, operator-provisioned value (`ripclone
+//! mint-worker-token`), so `api` mode is deployable for real farm-out. The
+//! queue-side twin is [`ApiJobQueue`](crate::api_job_queue) (`RIPCLONE_QUEUE=api`).
 
 use crate::RefInfo;
 use crate::provider::RepoId;

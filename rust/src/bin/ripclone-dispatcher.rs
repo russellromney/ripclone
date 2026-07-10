@@ -24,8 +24,9 @@
 //!   workers are **token-only**: the bag carries no DB credentials. When the bag
 //!   points at the server's HTTP endpoints (`RIPCLONE_QUEUE_API_URL` +
 //!   `RIPCLONE_METADATA_REPORT_URL`), the dispatcher sets `RIPCLONE_QUEUE=api` /
-//!   `RIPCLONE_METADATA=api` and mints a fresh `RIPCLONE_METADATA_JOB_TOKEN` per
-//!   worker (failing loudly at startup if no token secret is resolvable).
+//!   `RIPCLONE_METADATA=api` and **forwards** the operator-provisioned durable
+//!   `RIPCLONE_METADATA_JOB_TOKEN` (mint once with `ripclone mint-worker-token`),
+//!   failing loudly at startup if that token is not set.
 //! - Size classes: `RIPCLONE_SIZE_CLASSES` / launch defaults (`small`|`large`).
 //! - Provider-specific env: `FLY_WORKER_APP` / `FLY_API_TOKEN` for `fly`,
 //!   `RIPCLONE_DISPATCH_CMD` for `exec`, `RIPCLONE_DISPATCH_URL` for `http`.
@@ -45,7 +46,6 @@ use ripclone::dispatch::{
     AutoscaleConfig, SelectProviderOptions, api_mode_configured, collect_worker_env,
     get_compute_provider, parse_dispatch_backend, run_loop,
 };
-use ripclone::job_token::report_token_secret_from_env;
 use std::sync::Arc;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -83,35 +83,40 @@ async fn main() -> Result<()> {
 
     let mut worker_env = collect_worker_env();
 
-    // Token-only farm-out: when the worker bag points at the server's HTTP
-    // endpoints (queue + metadata), workers hold NO DB credentials. Force the
+    // Token-only farm-out (Model B): when the worker bag points at the server's
+    // HTTP endpoints (queue + metadata), workers hold NO DB credentials. The
+    // dispatcher does NOT mint — it FORWARDS a durable, operator-provisioned
+    // `RIPCLONE_METADATA_JOB_TOKEN` (see `ripclone mint-worker-token`). Force the
     // `api` backends into the bag (the dispatcher's own RIPCLONE_QUEUE is the SQL
-    // queue it polls; workers must not inherit that) and resolve the signing
-    // secret up front. Fail loudly if api mode is configured but no secret is
-    // resolvable — a worker with no token would 401 on every call.
-    let job_token_secret = if api_mode_configured(&worker_env) {
-        let secret = report_token_secret_from_env().context(
-            "api-mode farm-out is configured (RIPCLONE_QUEUE_API_URL + \
-             RIPCLONE_METADATA_REPORT_URL) but no job-token secret is resolvable; \
-             set RIPCLONE_JOB_TOKEN_SECRET or RIPCLONE_SERVER_TOKEN (the same secret \
-             the server verifies with)",
-        )?;
+    // queue it polls; workers must not inherit that), and fail loudly if api mode
+    // is configured but no worker token is available to forward — a worker with
+    // no token would 401 on every call.
+    let api_mode = api_mode_configured(&worker_env);
+    if api_mode {
+        if !worker_env.contains_key("RIPCLONE_METADATA_JOB_TOKEN") {
+            bail!(
+                "api-mode farm-out is configured (RIPCLONE_QUEUE_API_URL + \
+                 RIPCLONE_METADATA_REPORT_URL) but no RIPCLONE_METADATA_JOB_TOKEN is set to \
+                 forward to workers. Provision a durable worker token once with \
+                 `ripclone mint-worker-token` and set it in the dispatcher's environment."
+            );
+        }
         worker_env.insert("RIPCLONE_QUEUE".into(), "api".into());
         worker_env.insert("RIPCLONE_METADATA".into(), "api".into());
-        info!("dispatcher: token-only farm-out (RIPCLONE_QUEUE=api, no DB creds on workers)");
-        Some(secret)
-    } else {
-        None
-    };
+        info!(
+            "dispatcher: token-only farm-out (RIPCLONE_QUEUE=api, forwarding worker token, \
+             no DB creds on workers)"
+        );
+    }
 
     info!(
         provider = provider.name(),
         interval_secs = config.interval.as_secs(),
         max_workers = config.max_workers,
         env_keys = worker_env.len(),
-        api_mode = job_token_secret.is_some(),
+        api_mode,
         "ripclone-dispatcher starting"
     );
 
-    run_loop(queue, provider, config, worker_env, job_token_secret).await
+    run_loop(queue, provider, config, worker_env).await
 }
