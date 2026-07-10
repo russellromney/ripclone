@@ -1322,6 +1322,9 @@ async fn clone_metrics_drop_handler() -> impl IntoResponse {
 /// signed with the wrong secret. Auth is signature + expiry only — no repo/job
 /// scope, because one token is injected into a pooled worker that may claim any
 /// repo's job. `Err(Response)` short-circuits the handler; `Ok(())` proceeds.
+// The `Err` is an axum `Response` (large by clippy's measure) but each handler
+// returns it at most once per request — not a hot path.
+#[allow(clippy::result_large_err)]
 fn authorize_worker_token(route: &str, headers: &HeaderMap) -> Result<(), Response> {
     use crate::job_token::{report_token_secret_from_env, verify_job_token};
 
@@ -1371,6 +1374,7 @@ fn authorize_worker_token(route: &str, headers: &HeaderMap) -> Result<(), Respon
 /// Resolve the server's concrete SQL queue for a `/v1/jobs/*` handler, or a 503
 /// response when this server has no SQL queue (in-process `local` backend — no
 /// farm-out). Called only *after* [`authorize_worker_token`].
+#[allow(clippy::result_large_err)]
 fn worker_queue_or_503(
     route: &str,
     state: &ServerState,
