@@ -116,14 +116,14 @@ impl ComputeProvider for ExecProvider {
         .await
         .context("exec provider join")??;
 
-        // Reap in the background so we don't leave zombies, but don't block
-        // the caller on the child's lifetime.
-        tokio::spawn(async move {
-            let _ = tokio::task::spawn_blocking(move || {
-                let mut child = child;
-                let _ = child.wait();
-            })
-            .await;
+        // Reap on a detached OS thread — never a tokio blocking-pool task.
+        // tokio's runtime drop waits for blocking-pool tasks to finish, so a
+        // child that outlives the caller (e.g. a worker whose control plane went
+        // away and therefore can't idle-exit) would block runtime shutdown
+        // forever. A std thread is fully detached from the runtime.
+        std::thread::spawn(move || {
+            let mut child = child;
+            let _ = child.wait();
         });
 
         Ok(())
