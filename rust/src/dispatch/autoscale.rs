@@ -43,6 +43,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 
+/// True when the worker env bag targets the token-only farm-out path: the
+/// worker claims over HTTP (`RIPCLONE_QUEUE_API_URL`) and reports metadata over
+/// HTTP (`RIPCLONE_METADATA_REPORT_URL`). When set, the dispatcher forwards a
+/// durable, operator-provisioned bearer token to each worker (it does not mint).
+pub fn api_mode_configured(env: &BTreeMap<String, String>) -> bool {
+    env.contains_key("RIPCLONE_QUEUE_API_URL") && env.contains_key("RIPCLONE_METADATA_REPORT_URL")
+}
+
 /// Default poll interval when `RIPCLONE_DISPATCH_INTERVAL_SECS` is unset.
 pub const DEFAULT_INTERVAL_SECS: u64 = 5;
 
@@ -222,10 +230,12 @@ pub fn parse_retry_after_secs(err: &str) -> Option<Duration> {
 /// Lifecycle / max-size-class flags are included when present so a helper
 /// script does not need a second injection path.
 pub const WORKER_ENV_KEYS: &[&str] = &[
-    // Queue (claim)
+    // Queue (claim). Farm-out workers are token-only: they claim over HTTP
+    // (`RIPCLONE_QUEUE=api` + `RIPCLONE_QUEUE_API_URL`) and hold **no** DB
+    // credentials — the four `_DB_URL`/`_DB_TOKEN` keys are deliberately absent
+    // so a dispatcher-started worker cannot express a DB connection at all.
     "RIPCLONE_QUEUE",
-    "RIPCLONE_QUEUE_DB_URL",
-    "RIPCLONE_QUEUE_DB_TOKEN",
+    "RIPCLONE_QUEUE_API_URL",
     // Storage
     "RIPCLONE_S3_ENDPOINT",
     "RIPCLONE_S3_REGION",
@@ -238,10 +248,12 @@ pub const WORKER_ENV_KEYS: &[&str] = &[
     "AWS_ENDPOINT_URL_S3",
     "AWS_REGION",
     "BUCKET_NAME",
-    // Metadata (today includes direct DB creds — D4 removes that later)
+    // Metadata: `api` reports over HTTP, no DB creds. The one bearer token
+    // (`RIPCLONE_METADATA_JOB_TOKEN`) is a durable, operator-provisioned value
+    // the dispatcher **forwards** to each worker (mint it once with
+    // `ripclone mint-worker-token`). On Fly it is a machine secret provisioned
+    // out of band, not forwarded through this bag.
     "RIPCLONE_METADATA",
-    "RIPCLONE_METADATA_DB_URL",
-    "RIPCLONE_METADATA_DB_TOKEN",
     "RIPCLONE_METADATA_REPORT_URL",
     "RIPCLONE_METADATA_JOB_TOKEN",
     // Upstream-credential source
@@ -358,7 +370,9 @@ pub async fn reconcile_once(input: ReconcileInputs<'_>) -> Result<ReconcileOutco
     let mut started = 0usize;
     let mut failed = 0usize;
     for size_class in &plan.size_classes {
-        // Per-slot ceiling: worker claims jobs at or below this class.
+        // Per-slot ceiling: worker claims jobs at or below this class. The
+        // token-only farm-out env (RIPCLONE_QUEUE=api + the bearer token) is
+        // already in `worker_env`, forwarded whole — the dispatcher does not mint.
         let mut env = input.worker_env.clone();
         env.insert("RIPCLONE_MAX_SIZE_CLASS".into(), size_class.clone());
         let spec = WorkerSpec::new(size_class.clone(), env);
@@ -453,6 +467,7 @@ pub async fn run_loop(
         interval_secs = config.interval.as_secs(),
         max_workers = config.max_workers,
         provider = provider.name(),
+        api_mode = api_mode_configured(&worker_env),
         "dispatcher autoscale loop starting (poll-only)"
     );
     let mut backoff = BackoffState::new();
@@ -628,22 +643,113 @@ mod tests {
     #[test]
     fn collect_worker_env_forwards_bag_keys_only() {
         let env = collect_worker_env_from(|k| match k {
-            "RIPCLONE_QUEUE" => Some("libsql".into()),
-            "RIPCLONE_QUEUE_DB_URL" => Some("libsql://x".into()),
+            "RIPCLONE_QUEUE" => Some("api".into()),
+            "RIPCLONE_QUEUE_API_URL" => Some("https://srv".into()),
+            "RIPCLONE_METADATA_REPORT_URL" => Some("https://srv/v1/refs".into()),
+            // The durable worker token IS forwarded (operator-provisioned).
+            "RIPCLONE_METADATA_JOB_TOKEN" => Some("rcjt1.tok".into()),
             "AWS_SECRET_ACCESS_KEY" => Some("secret".into()),
             "UNRELATED" => Some("nope".into()),
+            // DB creds are no longer in the bag: a farm-out worker is token-only.
+            "RIPCLONE_QUEUE_DB_URL" => Some("libsql://x".into()),
             "RIPCLONE_METADATA_DB_URL" => Some("postgres://m".into()),
+            "RIPCLONE_QUEUE_DB_TOKEN" => Some("qtok".into()),
+            "RIPCLONE_METADATA_DB_TOKEN" => Some("mtok".into()),
             _ => None,
         });
+        assert_eq!(env.get("RIPCLONE_QUEUE").map(String::as_str), Some("api"));
         assert_eq!(
-            env.get("RIPCLONE_QUEUE").map(String::as_str),
-            Some("libsql")
+            env.get("RIPCLONE_QUEUE_API_URL").map(String::as_str),
+            Some("https://srv")
         );
         assert_eq!(
-            env.get("RIPCLONE_METADATA_DB_URL").map(String::as_str),
-            Some("postgres://m")
+            env.get("RIPCLONE_METADATA_REPORT_URL").map(String::as_str),
+            Some("https://srv/v1/refs")
+        );
+        assert_eq!(
+            env.get("RIPCLONE_METADATA_JOB_TOKEN").map(String::as_str),
+            Some("rcjt1.tok")
         );
         assert!(!env.contains_key("UNRELATED"));
+        // TRAP — no DB fallback in a farm-out worker: none of the four DB-cred
+        // keys may ever be forwarded.
+        for k in [
+            "RIPCLONE_QUEUE_DB_URL",
+            "RIPCLONE_QUEUE_DB_TOKEN",
+            "RIPCLONE_METADATA_DB_URL",
+            "RIPCLONE_METADATA_DB_TOKEN",
+        ] {
+            assert!(!env.contains_key(k), "DB cred {k} must not be in the bag");
+        }
+    }
+
+    #[test]
+    fn worker_env_keys_have_no_db_creds() {
+        for k in [
+            "RIPCLONE_QUEUE_DB_URL",
+            "RIPCLONE_QUEUE_DB_TOKEN",
+            "RIPCLONE_METADATA_DB_URL",
+            "RIPCLONE_METADATA_DB_TOKEN",
+        ] {
+            assert!(
+                !WORKER_ENV_KEYS.contains(&k),
+                "WORKER_ENV_KEYS must not carry DB cred {k}"
+            );
+        }
+    }
+
+    #[test]
+    fn api_mode_detected_from_urls() {
+        let mut env = BTreeMap::new();
+        assert!(!api_mode_configured(&env));
+        env.insert("RIPCLONE_QUEUE_API_URL".into(), "https://s".into());
+        assert!(!api_mode_configured(&env), "needs both URLs");
+        env.insert(
+            "RIPCLONE_METADATA_REPORT_URL".into(),
+            "https://s/v1/refs".into(),
+        );
+        assert!(api_mode_configured(&env));
+    }
+
+    #[tokio::test]
+    async fn reconcile_forwards_provisioned_token_per_worker() {
+        // Model B: the dispatcher does NOT mint. A durable, operator-provisioned
+        // `RIPCLONE_METADATA_JOB_TOKEN` lives in the worker_env bag and is
+        // forwarded whole into every started worker's spec.
+        let (q, _dir) = test_queue().await;
+        q.enqueue(job("o/r", Some(100))).await.unwrap();
+        let mock = MockProvider::new();
+        let env = BTreeMap::from([
+            ("RIPCLONE_QUEUE".to_string(), "api".to_string()),
+            (
+                "RIPCLONE_QUEUE_API_URL".to_string(),
+                "https://srv".to_string(),
+            ),
+            (
+                "RIPCLONE_METADATA_JOB_TOKEN".to_string(),
+                "rcjt1.provisioned.token".to_string(),
+            ),
+        ]);
+        let mut backoff = BackoffState::new();
+        let out = reconcile_once(ReconcileInputs {
+            queue: &q,
+            provider: &mock,
+            max_workers: 5,
+            worker_env: &env,
+            backoff: &mut backoff,
+            now: Instant::now(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(out.started, 1);
+        assert_eq!(
+            mock.calls()[0]
+                .env
+                .get("RIPCLONE_METADATA_JOB_TOKEN")
+                .map(String::as_str),
+            Some("rcjt1.provisioned.token"),
+            "the provisioned worker token must be forwarded verbatim"
+        );
     }
 
     fn job(path: &str, size_bytes: Option<u64>) -> BuildJob {

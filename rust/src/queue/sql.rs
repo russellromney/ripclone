@@ -25,7 +25,9 @@
 #[cfg(test)]
 use super::size_class::default_size_classes;
 use super::size_class::{SizeClass, classify_rank, load_size_classes, rank_ceiling};
-use super::{BuildError, BuildJob, EnqueueOutcome, Enqueued, JobId, JobQueue, JobState};
+use super::{
+    BuildError, BuildJob, EnqueueOutcome, Enqueued, JobId, JobQueue, JobState, WorkerQueue,
+};
 use crate::provider::{ProviderInstanceId, RepoId};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -628,6 +630,29 @@ impl SqlJobQueue {
     /// eligible job under the ceiling / contention exhausted the retry budget —
     /// the caller polls again).
     pub async fn claim(&self, worker_id: &str) -> Result<Option<ClaimedJob>> {
+        self.claim_capped(worker_id, self.max_size_class).await
+    }
+
+    /// Resolve a size-class *name* to a rank ceiling using this queue's
+    /// configured classes. `None` clears the ceiling (claim anything). Unknown
+    /// names fail loudly. Used by the API claim endpoint to apply a farm-out
+    /// worker's `--max-size-class` server-side, since the server's queue holds
+    /// no per-worker ceiling of its own.
+    pub fn resolve_ceiling(&self, name: Option<&str>) -> Result<Option<i64>> {
+        match name {
+            None => Ok(None),
+            Some(n) => Ok(Some(rank_ceiling(n, &self.size_classes)?)),
+        }
+    }
+
+    /// Claim honoring an explicit rank `ceiling`, overriding this queue's
+    /// configured `max_size_class`. The inherent [`claim`](Self::claim) passes
+    /// the configured ceiling; the API claim endpoint passes the caller's.
+    pub async fn claim_capped(
+        &self,
+        worker_id: &str,
+        ceiling: Option<i64>,
+    ) -> Result<Option<ClaimedJob>> {
         let now = now_secs();
         self.db
             .reclaim_stale(
@@ -641,7 +666,7 @@ impl SqlJobQueue {
             )
             .await?;
         for attempt in 0..MAX_CLAIM_ATTEMPTS {
-            let Some(id) = self.db.next_queued_id(self.max_size_class).await? else {
+            let Some(id) = self.db.next_queued_id(ceiling).await? else {
                 return Ok(None);
             };
             if self.db.try_claim(id, worker_id, now_secs()).await? {
@@ -796,6 +821,43 @@ impl JobQueue for SqlJobQueue {
 
     fn inproc_wait(&self) -> bool {
         false
+    }
+}
+
+/// Direct SQL is the trusted single-box worker path: each method forwards to the
+/// inherent implementation above. The farm-out path uses
+/// [`ApiJobQueue`](crate::api_job_queue::ApiJobQueue) instead.
+#[async_trait]
+impl WorkerQueue for SqlJobQueue {
+    async fn claim(&self, worker_id: &str) -> Result<Option<ClaimedJob>> {
+        SqlJobQueue::claim(self, worker_id).await
+    }
+
+    async fn ack(
+        &self,
+        id: JobId,
+        worker_id: &str,
+        result: Result<(), BuildError>,
+    ) -> Result<bool> {
+        SqlJobQueue::ack(self, id, worker_id, result).await
+    }
+
+    async fn heartbeat(&self, worker_id: &str, current_job: Option<JobId>) -> Result<()> {
+        SqlJobQueue::heartbeat(self, worker_id, current_job).await
+    }
+
+    async fn prune_failed(&self) -> Result<u64> {
+        SqlJobQueue::prune_failed(self).await
+    }
+
+    // `job_status` comes from the `JobQueue` supertrait (the real impl above).
+
+    fn supports_worker_registry(&self) -> bool {
+        SqlJobQueue::supports_worker_registry(self)
+    }
+
+    fn heartbeat_timeout_secs(&self) -> i64 {
+        SqlJobQueue::heartbeat_timeout_secs(self)
     }
 }
 

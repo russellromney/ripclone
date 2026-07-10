@@ -9,11 +9,12 @@
 //!
 //! Reads return empty: a farmed-out worker builds cold and only needs the write
 //! path for publish. A failed report is never swallowed — network/5xx map to
-//! retryable errors so the job requeues.
+//! retryable errors so the job requeues, and 401/403 to an unauthorized error so
+//! the worker exits cleanly for respawn with a fresh token.
 //!
-//! Mechanism only: producing and injecting `RIPCLONE_METADATA_JOB_TOKEN` at
-//! dispatch time is not wired up yet (see `job_token.rs`), so `api` mode is not
-//! yet deployable for real farm-out.
+//! The token is a durable, operator-provisioned value (`ripclone
+//! mint-worker-token`), so `api` mode is deployable for real farm-out. The
+//! queue-side twin is [`ApiJobQueue`](crate::api_job_queue) (`RIPCLONE_QUEUE=api`).
 
 use crate::RefInfo;
 use crate::provider::RepoId;
@@ -32,6 +33,10 @@ use tracing::info;
 pub struct ApiReportError {
     message: String,
     retryable: bool,
+    /// The server rejected our bearer token (401/403). Not retryable, and a
+    /// distinct signal so a farmed-out worker can exit cleanly on an expired
+    /// token (the dispatcher respawns it with a fresh one) instead of spinning.
+    unauthorized: bool,
 }
 
 impl ApiReportError {
@@ -39,6 +44,7 @@ impl ApiReportError {
         Self {
             message: message.into(),
             retryable: true,
+            unauthorized: false,
         }
     }
 
@@ -46,11 +52,26 @@ impl ApiReportError {
         Self {
             message: message.into(),
             retryable: false,
+            unauthorized: false,
+        }
+    }
+
+    /// Auth was rejected (401/403). Permanent, and flagged so the worker knows
+    /// its token expired.
+    pub fn unauthorized(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retryable: false,
+            unauthorized: true,
         }
     }
 
     pub fn is_retryable(&self) -> bool {
         self.retryable
+    }
+
+    pub fn is_unauthorized(&self) -> bool {
+        self.unauthorized
     }
 
     pub fn message(&self) -> &str {
@@ -202,7 +223,7 @@ impl ApiRefStore {
             }
         } else if status.as_u16() == 401 || status.as_u16() == 403 {
             let body = resp.text().await.unwrap_or_default();
-            Err(ApiReportError::permanent(format!(
+            Err(ApiReportError::unauthorized(format!(
                 "metadata report unauthorized ({status}): {body}"
             ))
             .into())

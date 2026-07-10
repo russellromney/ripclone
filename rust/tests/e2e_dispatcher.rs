@@ -153,10 +153,14 @@ fn local_worker_env() -> BTreeMap<String, String> {
         env.contains_key("RIPCLONE_QUEUE"),
         "worker_env must forward RIPCLONE_QUEUE from dispatcher process"
     );
-    assert!(
-        env.contains_key("RIPCLONE_QUEUE_DB_URL"),
-        "worker_env must forward RIPCLONE_QUEUE_DB_URL from dispatcher process"
-    );
+    // The dispatcher no longer auto-forwards DB creds — farm-out workers are
+    // token-only (see WORKER_ENV_KEYS). These tests exercise the dispatcher's
+    // reconcile/size-class mechanics with real DIRECT-SQL workers, so they inject
+    // the queue DB URL explicitly. Production farm-out uses the api queue instead
+    // (covered by e2e_token_only_worker).
+    let db_url =
+        std::env::var("RIPCLONE_QUEUE_DB_URL").expect("test sets RIPCLONE_QUEUE_DB_URL in setup");
+    env.insert("RIPCLONE_QUEUE_DB_URL".into(), db_url);
     // Drain cleanly so the test does not leave forever-workers around.
     env.insert("RIPCLONE_IDLE_EXIT_SECS".into(), "2".into());
     // Live registry so multi-pass reconcile (and size-class proofs) see started workers.
@@ -782,4 +786,113 @@ async fn dispatcher_size_class_large_not_claimed_by_small() {
         JobState::Done => {}
         other => panic!("large job expected Done, got {other:?}"),
     }
+}
+
+/// INTEGRATED provider e2e (Model B): the assembled path — `reconcile_once`
+/// drives a REAL `ExecProvider` that starts a REAL `ripclone-worker`, which
+/// claims + builds + acks entirely over the server's HTTP API
+/// (`RIPCLONE_QUEUE=api`), and the refs land via `POST /v1/refs`. This is the
+/// seam the worker-level e2e can't cover: a real provider forwarding the api env
+/// + provisioned token to a real worker.
+///
+/// The drain PROVES the server's `/v1/jobs/*` endpoints were hit — with
+/// `RIPCLONE_QUEUE=api` there is no SQL fallback, so a Done job means claim+ack
+/// went over HTTP. Reaching Done also proves the metadata API path: an
+/// `ApiRefStore` report failure is non-swallowed, so a failed `POST /v1/refs`
+/// would fail the build (job Failed), not Done.
+///
+/// (exec inherits the parent env, which here still holds the sqlite DB URL — that
+/// is fine for the trusted local escape hatch; `RIPCLONE_QUEUE=api` ignores it.
+/// The Fly no-DB guarantee is provisioning, covered by the WORKER_ENV_KEYS unit
+/// test.)
+#[tokio::test]
+async fn dispatcher_reconcile_drains_workers_over_api_queue() {
+    let _guard = SERIAL.lock().await;
+    let _qdir = setup_sqlite_queue();
+    let server = start_server().await;
+    let wrapper_dir = tempfile::tempdir().expect("wrapper dir");
+    let wrapper = write_worker_wrapper(
+        wrapper_dir.path(),
+        &cargo_bin("ripclone-worker"),
+        &server.cas_dir,
+        &server.repo_root,
+    );
+    let provider = exec_provider(wrapper);
+
+    // Operator-provisioned durable worker token (Model B): mint once, forward it.
+    let token = {
+        let secret = ripclone::job_token::report_token_secret_from_env()
+            .expect("job token secret (RIPCLONE_SERVER_TOKEN set by init)");
+        ripclone::job_token::mint_job_token(&secret, Duration::from_secs(3600))
+            .expect("mint worker token")
+    };
+
+    // Token-only farm-out env: claim + report over the server's HTTP API, no DB.
+    let mut worker_env: BTreeMap<String, String> = BTreeMap::new();
+    worker_env.insert("RIPCLONE_QUEUE".into(), "api".into());
+    worker_env.insert("RIPCLONE_QUEUE_API_URL".into(), server.url.clone());
+    worker_env.insert("RIPCLONE_METADATA".into(), "api".into());
+    worker_env.insert(
+        "RIPCLONE_METADATA_REPORT_URL".into(),
+        format!("{}/v1/refs", server.url),
+    );
+    worker_env.insert("RIPCLONE_METADATA_JOB_TOKEN".into(), token);
+    worker_env.insert("RIPCLONE_IDLE_EXIT_SECS".into(), "3".into());
+    // Heartbeat over the API so the dispatcher's live count sees these workers
+    // (the api worker POSTs /v1/jobs/heartbeat; the server writes its registry,
+    // which the dispatcher reads) and reconcile converges instead of over-spawning.
+    worker_env.insert("RIPCLONE_WORKER_HEARTBEAT".into(), "queue".into());
+    worker_env.insert("RIPCLONE_WORKER_HEARTBEAT_INTERVAL_SECS".into(), "1".into());
+    worker_env.insert("RIPCLONE_WORKER_HEARTBEAT_TIMEOUT_SECS".into(), "30".into());
+    // Hermetic proof of the API path: the worker inherits the test's real
+    // `RIPCLONE_QUEUE_DB_URL` (process-global from `setup_sqlite_queue`). Overlay a
+    // fresh, EMPTY decoy DB so that IF `RIPCLONE_QUEUE=api` ever failed to apply,
+    // the worker would fall back to the empty decoy and drain NOTHING (test fails)
+    // rather than silently draining the real queue via SQL (false positive). In
+    // the normal case `RIPCLONE_QUEUE=api` never reads a DB URL, so the decoy is
+    // inert and the drain goes over `/v1/jobs/*`. Metadata decoy for symmetry.
+    let decoy_dir = tempfile::tempdir().expect("decoy dir");
+    worker_env.insert(
+        "RIPCLONE_QUEUE_DB_URL".into(),
+        decoy_dir
+            .path()
+            .join("decoy-queue.db")
+            .to_string_lossy()
+            .into_owned(),
+    );
+    worker_env.insert(
+        "RIPCLONE_METADATA_DB_URL".into(),
+        decoy_dir
+            .path()
+            .join("decoy-meta.db")
+            .to_string_lossy()
+            .into_owned(),
+    );
+
+    let _o1 = publish_origin("acme", "api-disp-a", "a.txt", "a\n");
+    let _o2 = publish_origin("acme", "api-disp-b", "b.txt", "b\n");
+
+    let queue = backends::connect_sql_queue().await.expect("queue");
+    let id_a = enqueue_sized(&queue, "acme/api-disp-a", Some(SMALL_BYTES)).await;
+    let id_b = enqueue_sized(&queue, "acme/api-disp-b", Some(SMALL_BYTES)).await;
+    assert_eq!(queue.depth().await, 2);
+
+    // One worker drains both jobs serially — proves the API path without piling
+    // pollers on the server's rate limiter.
+    let mut backoff = BackoffState::new();
+    reconcile_until_done(
+        &queue,
+        &provider,
+        &worker_env,
+        /*max_workers=*/ 1,
+        &[id_a, id_b],
+        Duration::from_secs(120),
+        &mut backoff,
+    )
+    .await;
+    assert_eq!(
+        queue.depth().await,
+        0,
+        "a real worker must drain the queue over the HTTP API (RIPCLONE_QUEUE=api)"
+    );
 }

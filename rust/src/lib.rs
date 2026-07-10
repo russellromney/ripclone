@@ -64,6 +64,7 @@ mod musl_global_allocator {
 pub const PROTOCOL_VERSION: u32 = 1;
 
 #[doc(hidden)]
+pub mod api_job_queue;
 pub mod api_ref_store;
 pub mod archive;
 #[doc(hidden)]

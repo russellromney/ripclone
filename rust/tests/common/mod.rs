@@ -277,6 +277,7 @@ async fn start_server_split_storage_inner(
         rate_limiter: RateLimiter::new(1000000, 1000000.0),
         retention,
         build_queue,
+        worker_queue: None,
         build_queue_depth: depth,
         build_waiters: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         oidc_verifier: None,
@@ -1635,6 +1636,20 @@ impl WorkerProc {
     /// Whether the OS process has already exited (non-blocking).
     pub fn has_exited(&mut self) -> bool {
         matches!(self.0.try_wait(), Ok(Some(_)))
+    }
+
+    /// Poll until the worker exits and return its exit status, or `None` on
+    /// timeout. Used to prove a clean (code 0) exit vs a crash vs a spin.
+    pub fn wait_for_exit(&mut self, timeout: Duration) -> Option<std::process::ExitStatus> {
+        let start = std::time::Instant::now();
+        loop {
+            match self.0.try_wait() {
+                Ok(Some(status)) => return Some(status),
+                Ok(None) if start.elapsed() >= timeout => return None,
+                Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+                Err(_) => return None,
+            }
+        }
     }
 }
 

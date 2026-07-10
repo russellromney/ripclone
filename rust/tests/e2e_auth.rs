@@ -73,6 +73,7 @@ async fn start_repo_auth_server(provider_url: &str) -> Server {
         rate_limiter: RateLimiter::new(1000000, 1000000.0),
         retention,
         build_queue,
+        worker_queue: None,
         build_queue_depth: depth,
         build_waiters: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         oidc_verifier: None,

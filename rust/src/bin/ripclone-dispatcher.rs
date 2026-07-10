@@ -14,13 +14,19 @@
 //!   This alone is the correctness floor — converges within one interval.
 //! - `RIPCLONE_DISPATCH_MAX_WORKERS` (default 10): global cap on desired
 //!   workers. Never exceeded.
-//! - Queue env (`RIPCLONE_QUEUE`, `RIPCLONE_QUEUE_DB_URL`, …): same as
-//!   `ripclone-worker`. Must be a SQL queue with a workers registry
-//!   (`sqlite` or `libsql`) so live counts work.
+//! - Queue env (`RIPCLONE_QUEUE`, `RIPCLONE_QUEUE_DB_URL`, …) for the
+//!   **dispatcher's own** connection: it polls a SQL queue with a workers
+//!   registry (`sqlite` or `libsql`) so live counts work. These DB creds are
+//!   **not** forwarded to workers.
 //! - Worker env bag keys present in **this** process are forwarded into each
 //!   `WorkerSpec.env` (queue, storage, metadata, upstream-cred — see
-//!   `dispatch/ENV_BAG.md`). `size_class` is set per started slot, not from a
-//!   fixed env value. Today that bag still includes `RIPCLONE_METADATA_DB_URL`.
+//!   `dispatch/ENV_BAG.md`). `size_class` is set per started slot. Farm-out
+//!   workers are **token-only**: the bag carries no DB credentials. When the bag
+//!   points at the server's HTTP endpoints (`RIPCLONE_QUEUE_API_URL` +
+//!   `RIPCLONE_METADATA_REPORT_URL`), the dispatcher sets `RIPCLONE_QUEUE=api` /
+//!   `RIPCLONE_METADATA=api` and **forwards** the operator-provisioned durable
+//!   `RIPCLONE_METADATA_JOB_TOKEN` (mint once with `ripclone mint-worker-token`),
+//!   failing loudly at startup if that token is not set.
 //! - Size classes: `RIPCLONE_SIZE_CLASSES` / launch defaults (`small`|`large`).
 //! - Provider-specific env: `FLY_WORKER_APP` / `FLY_API_TOKEN` for `fly`,
 //!   `RIPCLONE_DISPATCH_CMD` for `exec`, `RIPCLONE_DISPATCH_URL` for `http`.
@@ -37,8 +43,8 @@
 use anyhow::{Context, Result, bail};
 use ripclone::backends;
 use ripclone::dispatch::{
-    AutoscaleConfig, SelectProviderOptions, collect_worker_env, get_compute_provider,
-    parse_dispatch_backend, run_loop,
+    AutoscaleConfig, SelectProviderOptions, api_mode_configured, collect_worker_env,
+    get_compute_provider, parse_dispatch_backend, run_loop,
 };
 use std::sync::Arc;
 use tracing::info;
@@ -75,12 +81,40 @@ async fn main() -> Result<()> {
     }
     let queue = Arc::new(queue);
 
-    let worker_env = collect_worker_env();
+    let mut worker_env = collect_worker_env();
+
+    // Token-only farm-out (Model B): when the worker bag points at the server's
+    // HTTP endpoints (queue + metadata), workers hold NO DB credentials. The
+    // dispatcher does NOT mint — it FORWARDS a durable, operator-provisioned
+    // `RIPCLONE_METADATA_JOB_TOKEN` (see `ripclone mint-worker-token`). Force the
+    // `api` backends into the bag (the dispatcher's own RIPCLONE_QUEUE is the SQL
+    // queue it polls; workers must not inherit that), and fail loudly if api mode
+    // is configured but no worker token is available to forward — a worker with
+    // no token would 401 on every call.
+    let api_mode = api_mode_configured(&worker_env);
+    if api_mode {
+        if !worker_env.contains_key("RIPCLONE_METADATA_JOB_TOKEN") {
+            bail!(
+                "api-mode farm-out is configured (RIPCLONE_QUEUE_API_URL + \
+                 RIPCLONE_METADATA_REPORT_URL) but no RIPCLONE_METADATA_JOB_TOKEN is set to \
+                 forward to workers. Provision a durable worker token once with \
+                 `ripclone mint-worker-token` and set it in the dispatcher's environment."
+            );
+        }
+        worker_env.insert("RIPCLONE_QUEUE".into(), "api".into());
+        worker_env.insert("RIPCLONE_METADATA".into(), "api".into());
+        info!(
+            "dispatcher: token-only farm-out (RIPCLONE_QUEUE=api, forwarding worker token, \
+             no DB creds on workers)"
+        );
+    }
+
     info!(
         provider = provider.name(),
         interval_secs = config.interval.as_secs(),
         max_workers = config.max_workers,
         env_keys = worker_env.len(),
+        api_mode,
         "ripclone-dispatcher starting"
     );
 
