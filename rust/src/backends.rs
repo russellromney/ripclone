@@ -6,6 +6,7 @@
 //! `ref_store` (metadata) — plus the local CAS cache and a scratch mirror root.
 //! That is why the worker can run anywhere: it owns no durable state.
 
+use crate::api_job_queue::ApiJobQueue;
 use crate::api_ref_store::ApiRefStore;
 use crate::cas::Cas;
 use crate::config::Config;
@@ -213,8 +214,10 @@ pub enum QueueBackend {
         depth: Arc<AtomicUsize>,
     },
     /// SQL-backed queue. Builds run in separate `ripclone-worker` processes, so
-    /// the server spawns no in-process worker.
-    Sql { queue: JobQueueRef },
+    /// the server spawns no in-process worker. The concrete `Arc<SqlJobQueue>`
+    /// is kept (not just `JobQueueRef`) so the server can also serve the
+    /// worker-facing `/v1/jobs/*` endpoints (claim/ack/heartbeat) from it.
+    Sql { queue: Arc<SqlJobQueue> },
 }
 
 /// Read `RIPCLONE_QUEUE` (default `local`).
@@ -247,9 +250,51 @@ pub async fn select_queue() -> Result<QueueBackend> {
                 queue: Arc::new(queue),
             })
         }
+        "api" => anyhow::bail!(
+            "RIPCLONE_QUEUE=api is worker-only (a farm-out worker claims over HTTP). \
+             The server holds the real queue — set RIPCLONE_QUEUE=sqlite|postgres|mysql|libsql \
+             on the server."
+        ),
         other => anyhow::bail!(
             "unknown RIPCLONE_QUEUE backend: {other:?} \
              (expected 'local', 'sqlite', 'postgres', 'mysql', or 'libsql')"
+        ),
+    }
+}
+
+/// The queue a `ripclone-worker` claims from. Either a direct SQL connection
+/// (trusted single-box) or the HTTP [`ApiJobQueue`] (farm-out, token-only).
+pub enum WorkerQueueBackend {
+    Sql(Arc<SqlJobQueue>),
+    Api(Arc<ApiJobQueue>),
+}
+
+/// Select the worker's queue from `RIPCLONE_QUEUE`. `api` builds an
+/// [`ApiJobQueue`] (base URL + bearer token, no DB creds); the SQL kinds build a
+/// direct [`SqlJobQueue`] with `max_size_class` applied. Unlike [`select_queue`]
+/// (the server side), `api` is valid here — this is the farm-out path.
+pub async fn connect_worker_queue(max_size_class: Option<&str>) -> Result<WorkerQueueBackend> {
+    let kind = queue_kind();
+    match kind.as_str() {
+        "api" => {
+            let queue = ApiJobQueue::from_env()?;
+            info!("using API build queue (RIPCLONE_QUEUE=api); no DB credentials on this worker");
+            Ok(WorkerQueueBackend::Api(Arc::new(queue)))
+        }
+        "sqlite" | "postgres" | "mysql" | "libsql" => {
+            let queue = connect_sql_queue()
+                .await?
+                .with_max_size_class(max_size_class)
+                .context("resolve --max-size-class")?;
+            Ok(WorkerQueueBackend::Sql(Arc::new(queue)))
+        }
+        "local" => anyhow::bail!(
+            "RIPCLONE_QUEUE=local is the in-process server queue; a standalone worker \
+             needs RIPCLONE_QUEUE=api (farm-out) or sqlite|postgres|mysql|libsql (direct)"
+        ),
+        other => anyhow::bail!(
+            "unknown RIPCLONE_QUEUE backend: {other:?} \
+             (expected 'api', 'sqlite', 'postgres', 'mysql', or 'libsql')"
         ),
     }
 }

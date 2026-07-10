@@ -32,7 +32,7 @@ pub mod select;
 
 pub use autoscale::{
     AutoscaleConfig, BackoffState, ReconcileOutcome, ReconcilePlan, WORKER_ENV_KEYS,
-    collect_worker_env, plan_reconcile, reconcile_once, run_loop,
+    api_mode_configured, collect_worker_env, plan_reconcile, reconcile_once, run_loop,
 };
 pub use exec::{ExecProvider, ExecProviderConfig};
 pub use fly::{

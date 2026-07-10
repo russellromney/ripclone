@@ -129,7 +129,7 @@ Choose it with `RIPCLONE_METADATA`, independently of storage:
 | `postgres` | a Postgres database | shared across machines |
 | `mysql` | a MySQL database | shared across machines |
 | `libsql` | a remote Turso Cloud database | shared across machines |
-| `api` | server via `POST /v1/refs` | **Worker-only, not yet deployable.** Requires `RIPCLONE_METADATA_REPORT_URL` + `RIPCLONE_METADATA_JOB_TOKEN` (a signed, expiring token with no repo/job scope; the write target is the `repo_key` in each report body). No DB credentials on the worker; the server holds them and performs the durable write. The endpoint, client, and token primitive exist, but nothing mints/injects the token at dispatch time yet — an operator would have to produce and distribute tokens by hand. Farm-out deploys today should use a direct SQL metadata backend instead. |
+| `api` | server via `POST /v1/refs` | **Worker-only, token-only farm-out.** Requires `RIPCLONE_METADATA_REPORT_URL` + `RIPCLONE_METADATA_JOB_TOKEN` (a signed, expiring token with no repo/job scope; the write target is the `repo_key` in each report body). No DB credentials on the worker; the server holds them and performs the durable write. Pair with `RIPCLONE_QUEUE=api` (below): one token authenticates both. The dispatcher mints and injects the token per worker. |
 
 The SQL backends read a connection URL (and a token for `libsql`):
 
@@ -160,9 +160,10 @@ Choose the queue with `RIPCLONE_QUEUE`:
 |---|---|---|
 | `local` *(default)* | in-process channel | single binary, no farm-out |
 | `sqlite` | a local SQLite file | single-box farm-out (server + workers share the file) |
-| `postgres` | a Postgres database | multi-machine farm-out |
-| `mysql` | a MySQL database | multi-machine farm-out |
-| `libsql` | a remote Turso Cloud database | multi-machine farm-out |
+| `postgres` | a Postgres database | multi-machine farm-out (direct DB) |
+| `mysql` | a MySQL database | multi-machine farm-out (direct DB) |
+| `libsql` | a remote Turso Cloud database | multi-machine farm-out (direct DB) |
+| `api` | server via `POST /v1/jobs/*` | **token-only farm-out** — worker claims/acks/heartbeats over HTTP with a bearer token and **no** DB credentials. Requires `RIPCLONE_QUEUE_API_URL` (server base URL) + `RIPCLONE_METADATA_JOB_TOKEN`. Pair with `RIPCLONE_METADATA=api`. This is the path for workers on untrusted infra; the server holds the one queue+metadata DB. |
 
 ```bash
 # Server: enqueue onto Postgres (builds run in workers, not here)
@@ -176,11 +177,19 @@ ripclone-worker --cas-dir /data/cache --repo-root /data/repos
 
 Notes:
 
-- **Same config on both sides.** A worker must see the same storage
-  (`RIPCLONE_S3_*` or the shared `--cas-dir`), the same metadata store
-  (`RIPCLONE_METADATA*`), and the same queue (`RIPCLONE_QUEUE*`) as the server.
-  With a SQL queue, use a SQL metadata store too — a `file` store under a
+- **Same config on both sides (direct SQL path).** A direct worker must see the
+  same storage (`RIPCLONE_S3_*` or the shared `--cas-dir`), the same metadata
+  store (`RIPCLONE_METADATA*`), and the same queue (`RIPCLONE_QUEUE*`) as the
+  server. With a SQL queue, use a SQL metadata store too — a `file` store under a
   per-machine `--repo-root` would not be shared.
+- **Token-only farm-out (`RIPCLONE_QUEUE=api` + `RIPCLONE_METADATA=api`).** A
+  worker on untrusted infra holds **no** DB credentials: it claims/acks/
+  heartbeats and reports refs over HTTP with a single bearer token
+  (`RIPCLONE_METADATA_JOB_TOKEN`) against the server's `RIPCLONE_QUEUE_API_URL` /
+  `RIPCLONE_METADATA_REPORT_URL`. The server holds the one queue+metadata DB. A
+  401 (expired token) exits the worker cleanly for respawn. It still shares
+  **storage** (that is where durable artifacts live). The dispatcher configures
+  and mints the token automatically.
 - **One `repo_root` per worker.** The bare mirror under `--repo-root` is per-repo
   scratch guarded by an in-process lock; give each worker its own. All durable
   state is in storage + the metadata store.

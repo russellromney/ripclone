@@ -104,6 +104,12 @@ pub struct ServerState {
     pub rate_limiter: RateLimiter,
     pub retention: Arc<Retention>,
     pub build_queue: JobQueueRef,
+    /// The concrete SQL queue, present only when `RIPCLONE_QUEUE` is a SQL
+    /// backend. Backs the worker-facing `/v1/jobs/*` endpoints (claim/ack/
+    /// heartbeat) so a token-only farm-out worker never touches the DB directly.
+    /// `None` for the in-process `local` queue (nothing to farm out) and on a
+    /// worker's own `ServerState`.
+    pub worker_queue: Option<Arc<crate::queue::SqlJobQueue>>,
     pub build_queue_depth: Arc<AtomicUsize>,
     /// Waiters for in-flight background builds, keyed by `owner/repo/branch`. A
     /// `/sync` registers a oneshot here and enqueues a job only if it is the
@@ -181,6 +187,8 @@ impl ServerState {
             rate_limiter: RateLimiter::new(60, 10.0),
             retention: b.retention,
             build_queue: queue,
+            // A worker never serves the farm-out endpoints itself.
+            worker_queue: None,
             build_queue_depth: Arc::new(AtomicUsize::new(0)),
             build_waiters: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             oidc_verifier: None,
@@ -814,6 +822,12 @@ pub fn build_app(state: ServerState) -> Router {
         // RIPCLONE_METADATA=api POST ref-writes here; the server holds the DB
         // creds and performs the durable write. Lives outside `protected`.
         .route("/v1/refs", post(ref_report_handler))
+        // Worker queue endpoints: a token-only farm-out worker claims, acks, and
+        // heartbeats here (RIPCLONE_QUEUE=api) instead of touching the DB. Same
+        // signed-bearer gate as /v1/refs; the server holds the one queue DB.
+        .route("/v1/jobs/claim", post(job_claim_handler))
+        .route("/v1/jobs/{id}/ack", post(job_ack_handler))
+        .route("/v1/jobs/heartbeat", post(job_heartbeat_handler))
         // Provider-agnostic push-webhook receiver: authenticated by the provider
         // HMAC over the raw body (not the ripclone bearer token), so it lives
         // outside the `protected` layer. `/v1/webhooks/github` is the legacy
@@ -1302,6 +1316,259 @@ async fn clone_metrics_drop_handler() -> impl IntoResponse {
     StatusCode::ACCEPTED
 }
 
+/// Shared bearer-token gate for every farmed-out-worker endpoint (`/v1/refs`,
+/// `/v1/jobs/*`). Fails **closed**: 503 when no signing secret is configured,
+/// 401 before any state change when the token is missing / malformed / expired /
+/// signed with the wrong secret. Auth is signature + expiry only — no repo/job
+/// scope, because one token is injected into a pooled worker that may claim any
+/// repo's job. `Err(Response)` short-circuits the handler; `Ok(())` proceeds.
+fn authorize_worker_token(route: &str, headers: &HeaderMap) -> Result<(), Response> {
+    use crate::job_token::{report_token_secret_from_env, verify_job_token};
+
+    let Some(secret) = report_token_secret_from_env() else {
+        error!(
+            "{route}: no job-token secret configured \
+             (set RIPCLONE_JOB_TOKEN_SECRET or RIPCLONE_SERVER_TOKEN)"
+        );
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "job tokens not configured on this server".to_string(),
+            }),
+        )
+            .into_response());
+    };
+
+    let presented = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let Some(token) = presented else {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                error: "missing Authorization: Bearer <job token>".to_string(),
+            }),
+        )
+            .into_response());
+    };
+
+    if let Err(e) = verify_job_token(&secret, token) {
+        warn!("{route}: auth rejected: {e:#}");
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                error: "invalid or expired job token".to_string(),
+            }),
+        )
+            .into_response());
+    }
+    Ok(())
+}
+
+/// Resolve the server's concrete SQL queue for a `/v1/jobs/*` handler, or a 503
+/// response when this server has no SQL queue (in-process `local` backend — no
+/// farm-out). Called only *after* [`authorize_worker_token`].
+fn worker_queue_or_503(
+    route: &str,
+    state: &ServerState,
+) -> Result<Arc<crate::queue::SqlJobQueue>, Response> {
+    match &state.worker_queue {
+        Some(q) => Ok(q.clone()),
+        None => {
+            error!("{route}: no SQL queue on this server (RIPCLONE_QUEUE is not a SQL backend)");
+            Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse {
+                    error: "server has no farm-out queue (RIPCLONE_QUEUE is local)".to_string(),
+                }),
+            )
+                .into_response())
+        }
+    }
+}
+
+/// `POST /v1/jobs/claim` — a farm-out worker claims exactly one queued job.
+///
+/// Same bearer gate as `/v1/refs`. Returns the one claimed job (or `null`),
+/// including its per-job upstream `credential` so the worker can fetch a private
+/// repo — never a list, never another job's data. Delegates to the server's SQL
+/// queue, applying the worker's `max_size_class` ceiling per claim.
+async fn job_claim_handler(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(req): Json<crate::api_job_queue::ClaimRequest>,
+) -> Response {
+    use crate::api_job_queue::{ClaimResponse, ClaimedJobWire};
+    use secrecy::ExposeSecret;
+
+    if let Err(resp) = authorize_worker_token("POST /v1/jobs/claim", &headers) {
+        return resp;
+    }
+    let queue = match worker_queue_or_503("POST /v1/jobs/claim", &state) {
+        Ok(q) => q,
+        Err(resp) => return resp,
+    };
+    if req.worker_id.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "worker_id must not be empty".to_string(),
+            }),
+        )
+            .into_response();
+    }
+    let ceiling = match queue.resolve_ceiling(req.max_size_class.as_deref()) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: format!("invalid max_size_class: {e}"),
+                }),
+            )
+                .into_response();
+        }
+    };
+    match queue.claim_capped(&req.worker_id, ceiling).await {
+        Ok(claimed) => {
+            let job = claimed.map(|c| ClaimedJobWire {
+                id: c.id,
+                provider: c.provider,
+                path: c.path,
+                branch: c.branch,
+                credential: c.credential.map(|s| s.expose_secret().to_string()),
+            });
+            (StatusCode::OK, Json(ClaimResponse { job })).into_response()
+        }
+        Err(e) => {
+            error!("POST /v1/jobs/claim failed: {e:#}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("claim failed: {e:#}"),
+                }),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// `POST /v1/jobs/{id}/ack` — a worker settles its claimed job. Same bearer gate
+/// as `/v1/refs`. Delegates to the SQL queue and returns the post-ack lifecycle.
+async fn job_ack_handler(
+    State(state): State<ServerState>,
+    Path(id): Path<i64>,
+    headers: HeaderMap,
+    Json(req): Json<crate::api_job_queue::AckRequest>,
+) -> Response {
+    use crate::api_job_queue::{AckResponse, job_state_tag};
+    use crate::queue::{BuildError, JobQueue, JobState};
+
+    if let Err(resp) = authorize_worker_token("POST /v1/jobs/ack", &headers) {
+        return resp;
+    }
+    let queue = match worker_queue_or_503("POST /v1/jobs/ack", &state) {
+        Ok(q) => q,
+        Err(resp) => return resp,
+    };
+    if req.worker_id.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "worker_id must not be empty".to_string(),
+            }),
+        )
+            .into_response();
+    }
+    let result: Result<(), BuildError> = if req.result.ok {
+        Ok(())
+    } else {
+        let msg = req
+            .result
+            .error
+            .unwrap_or_else(|| "build failed".to_string());
+        Err(if req.result.retryable {
+            BuildError::retryable(msg)
+        } else {
+            BuildError::permanent(msg)
+        })
+    };
+    match queue.ack(id, &req.worker_id, result).await {
+        Ok(settled) => {
+            // Report the resulting lifecycle so the worker can detect a
+            // dead-letter without a second round-trip.
+            let (state_tag, error) =
+                match <crate::queue::SqlJobQueue as JobQueue>::job_status(queue.as_ref(), id).await
+                {
+                    Ok(JobState::Failed(err)) => ("failed", Some(err)),
+                    Ok(s) => (job_state_tag(&s), None),
+                    Err(_) => ("unknown", None),
+                };
+            (
+                StatusCode::OK,
+                Json(AckResponse {
+                    settled,
+                    state: state_tag.to_string(),
+                    error,
+                }),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            error!("POST /v1/jobs/{id}/ack failed: {e:#}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("ack failed: {e:#}"),
+                }),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// `POST /v1/jobs/heartbeat` — a worker refreshes its registry row so the
+/// autoscaler can count it. Worker-scoped (fires while idle, `current_job` may
+/// be `None`), so no job id in the path. Same bearer gate as `/v1/refs`.
+async fn job_heartbeat_handler(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(req): Json<crate::api_job_queue::HeartbeatRequest>,
+) -> Response {
+    if let Err(resp) = authorize_worker_token("POST /v1/jobs/heartbeat", &headers) {
+        return resp;
+    }
+    let queue = match worker_queue_or_503("POST /v1/jobs/heartbeat", &state) {
+        Ok(q) => q,
+        Err(resp) => return resp,
+    };
+    if req.worker_id.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "worker_id must not be empty".to_string(),
+            }),
+        )
+            .into_response();
+    }
+    match queue.heartbeat(&req.worker_id, req.current_job).await {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(e) => {
+            error!("POST /v1/jobs/heartbeat failed: {e:#}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("heartbeat failed: {e:#}"),
+                }),
+            )
+                .into_response()
+        }
+    }
+}
+
 /// `POST /v1/refs` — farmed-out worker reports a ref write.
 ///
 /// Auth is a signed, expiring HMAC bearer token (`Authorization: Bearer …`), not
@@ -1316,50 +1583,13 @@ async fn ref_report_handler(
     Json(body): Json<crate::api_ref_store::RefReport>,
 ) -> Response {
     use crate::api_ref_store::{RefReport, RefReportResponse};
-    use crate::job_token::{report_token_secret_from_env, verify_job_token};
     use crate::provider::parse_storage_key;
 
-    let Some(secret) = report_token_secret_from_env() else {
-        error!(
-            "POST /v1/refs: no job-token secret configured \
-             (set RIPCLONE_JOB_TOKEN_SECRET or RIPCLONE_SERVER_TOKEN)"
-        );
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse {
-                error: "job report tokens not configured on this server".to_string(),
-            }),
-        )
-            .into_response();
-    };
-
-    let presented = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    let Some(token) = presented else {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(ErrorResponse {
-                error: "missing Authorization: Bearer <job token>".to_string(),
-            }),
-        )
-            .into_response();
-    };
-
-    // Auth is signature + expiry only (no repo scope): the report token is
-    // injected into a pooled worker that may claim any repo's job.
-    if let Err(e) = verify_job_token(&secret, token) {
-        warn!("POST /v1/refs: auth rejected: {e:#}");
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(ErrorResponse {
-                error: "invalid or expired job report token".to_string(),
-            }),
-        )
-            .into_response();
+    // Same fail-closed (503 no secret), 401-before-any-effect gate as the
+    // worker queue endpoints. Auth is signature + expiry only (no repo scope):
+    // the token is injected into a pooled worker that may claim any repo's job.
+    if let Err(resp) = authorize_worker_token("POST /v1/refs", &headers) {
+        return resp;
     }
 
     // The write target comes from the request body, not the token.
@@ -7724,10 +7954,16 @@ pub async fn run_server_with_barrier(
     // Select the queue backend. The local queue drives an in-process worker; the
     // SQL queues' builds run in separate ripclone-worker processes, so the server
     // only enqueues.
-    let (build_queue, build_queue_depth, local_rx) = match backends::select_queue().await? {
-        QueueBackend::Local { queue, rx, depth } => (queue, depth, Some(rx)),
-        QueueBackend::Sql { queue } => (queue, Arc::new(AtomicUsize::new(0)), None),
-    };
+    let (build_queue, build_queue_depth, local_rx, worker_queue) =
+        match backends::select_queue().await? {
+            QueueBackend::Local { queue, rx, depth } => (queue, depth, Some(rx), None),
+            QueueBackend::Sql { queue } => (
+                queue.clone() as JobQueueRef,
+                Arc::new(AtomicUsize::new(0)),
+                None,
+                Some(queue),
+            ),
+        };
 
     let state = ServerState {
         cas: b.cas,
@@ -7743,6 +7979,7 @@ pub async fn run_server_with_barrier(
         rate_limiter,
         retention: b.retention,
         build_queue,
+        worker_queue,
         build_queue_depth,
         build_waiters: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         oidc_verifier,
@@ -7938,6 +8175,7 @@ mod tests {
             rate_limiter: RateLimiter::new(100, 100.0),
             retention,
             build_queue,
+            worker_queue: None,
             build_queue_depth: Arc::new(AtomicUsize::new(0)),
             build_waiters: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             oidc_verifier: None,

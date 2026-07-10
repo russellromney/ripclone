@@ -153,10 +153,14 @@ fn local_worker_env() -> BTreeMap<String, String> {
         env.contains_key("RIPCLONE_QUEUE"),
         "worker_env must forward RIPCLONE_QUEUE from dispatcher process"
     );
-    assert!(
-        env.contains_key("RIPCLONE_QUEUE_DB_URL"),
-        "worker_env must forward RIPCLONE_QUEUE_DB_URL from dispatcher process"
-    );
+    // The dispatcher no longer auto-forwards DB creds — farm-out workers are
+    // token-only (see WORKER_ENV_KEYS). These tests exercise the dispatcher's
+    // reconcile/size-class mechanics with real DIRECT-SQL workers, so they inject
+    // the queue DB URL explicitly. Production farm-out uses the api queue instead
+    // (covered by e2e_token_only_worker).
+    let db_url =
+        std::env::var("RIPCLONE_QUEUE_DB_URL").expect("test sets RIPCLONE_QUEUE_DB_URL in setup");
+    env.insert("RIPCLONE_QUEUE_DB_URL".into(), db_url);
     // Drain cleanly so the test does not leave forever-workers around.
     env.insert("RIPCLONE_IDLE_EXIT_SECS".into(), "2".into());
     // Live registry so multi-pass reconcile (and size-class proofs) see started workers.
@@ -234,6 +238,7 @@ async fn reconcile_until_done(
             max_workers,
             worker_env,
             backoff,
+            job_token_secret: None,
             now,
         })
         .await
@@ -327,6 +332,7 @@ async fn dispatcher_reconcile_drains_real_workers() {
         max_workers: 10,
         worker_env: &worker_env,
         backoff: &mut backoff,
+        job_token_secret: None,
         now: Instant::now(),
     })
     .await
@@ -409,6 +415,7 @@ async fn dispatcher_reconcile_max_workers_one_serial_drain() {
         max_workers: 1,
         worker_env: &worker_env,
         backoff: &mut backoff,
+        job_token_secret: None,
         now: Instant::now(),
     })
     .await
@@ -561,6 +568,7 @@ async fn dispatcher_provider_down_no_job_loss_then_recovers() {
         max_workers: 10,
         worker_env: &worker_env,
         backoff: &mut backoff,
+        job_token_secret: None,
         now,
     })
     .await
@@ -585,6 +593,7 @@ async fn dispatcher_provider_down_no_job_loss_then_recovers() {
         max_workers: 10,
         worker_env: &worker_env,
         backoff: &mut backoff,
+        job_token_secret: None,
         now: Instant::now(),
     })
     .await
@@ -735,6 +744,7 @@ async fn dispatcher_size_class_large_not_claimed_by_small() {
         max_workers: 10,
         worker_env: &base_env,
         backoff: &mut backoff,
+        job_token_secret: None,
         now: Instant::now(),
     })
     .await

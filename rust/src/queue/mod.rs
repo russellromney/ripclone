@@ -33,7 +33,7 @@ pub use size_class::{
     resolve_job_size_bytes,
 };
 pub use sql::{
-    DEFAULT_HEARTBEAT_TIMEOUT_SECS, SqlJobQueue, make_worker_id, make_worker_id_parts,
+    ClaimedJob, DEFAULT_HEARTBEAT_TIMEOUT_SECS, SqlJobQueue, make_worker_id, make_worker_id_parts,
     validate_heartbeat_timing, worker_heartbeat_enabled, worker_heartbeat_enabled_from_env,
     worker_heartbeat_interval_secs, worker_heartbeat_interval_secs_from,
 };
@@ -182,3 +182,48 @@ pub trait JobQueue: Send + Sync {
 }
 
 pub type JobQueueRef = Arc<dyn JobQueue>;
+
+/// The worker-facing side of the queue: claim a job, settle it, heartbeat.
+///
+/// A `ripclone-worker` drives its loop through this trait so it is generic over
+/// *how* it reaches the queue. Two impls exist:
+/// - [`SqlJobQueue`] — a direct SQL connection. The trusted single-box server
+///   and its co-located workers use this (no HTTP hop forced).
+/// - [`ApiJobQueue`](crate::api_job_queue::ApiJobQueue) — HTTP to the server's
+///   `/v1/jobs/*` endpoints with a bearer token and **no** DB credentials. This
+///   is the farm-out path: workers run on untrusted infra holding only a token.
+///
+/// A failed `claim`/`ack`/`heartbeat` returns an error the worker must not
+/// swallow (a silent success would drop the build result). For the API impl an
+/// expired-token (401) error is flagged via
+/// [`ApiReportError`](crate::api_ref_store::ApiReportError) so the worker exits
+/// cleanly and the dispatcher respawns it with a fresh token.
+#[async_trait]
+pub trait WorkerQueue: Send + Sync {
+    /// Claim the oldest eligible queued job for this worker, or `None` when the
+    /// queue is empty. Returns **exactly one** job, scoped to this caller.
+    async fn claim(&self, worker_id: &str) -> Result<Option<ClaimedJob>>;
+
+    /// Settle a claimed job. `Ok(true)` when it settled/requeued, `Ok(false)`
+    /// when the claim was reclaimed out from under this worker.
+    async fn ack(&self, id: JobId, worker_id: &str, result: Result<(), BuildError>)
+    -> Result<bool>;
+
+    /// Refresh this worker's registry row. `current_job` is the claimed job id
+    /// (or `None` when idle) so an autoscaler can count live workers.
+    async fn heartbeat(&self, worker_id: &str, current_job: Option<JobId>) -> Result<()>;
+
+    /// Prune expired `failed` jobs. Returns rows removed.
+    async fn prune_failed(&self) -> Result<u64>;
+
+    /// Lifecycle state of a job id (used after `ack` to detect a dead-letter).
+    async fn job_status(&self, id: JobId) -> Result<JobState>;
+
+    /// Whether the backing queue has a workers registry (heartbeat support).
+    fn supports_worker_registry(&self) -> bool;
+
+    /// Soft age-out window for the live-worker count.
+    fn heartbeat_timeout_secs(&self) -> i64;
+}
+
+pub type WorkerQueueRef = Arc<dyn WorkerQueue>;

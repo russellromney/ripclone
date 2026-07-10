@@ -16,8 +16,9 @@
 //! ```
 //! Payload is JSON: `{"e":<exp_unix>}`.
 //!
-//! Minting and injecting this token at dispatch time is not wired up yet — see
-//! the module doc on `mint_job_token` below.
+//! The dispatcher mints one of these per farm-out worker
+//! (`RIPCLONE_METADATA_JOB_TOKEN`) and the server verifies it on every
+//! `/v1/refs` and `/v1/jobs/*` request. It is the worker's whole credential.
 
 use anyhow::{Context, Result, bail};
 use hmac::{Hmac, KeyInit, Mac};
@@ -73,10 +74,10 @@ fn derive_key(raw: &[u8]) -> Vec<u8> {
 
 /// Mint a signed, expiring bearer token (no repo/job scope).
 ///
-/// Nothing in this codebase calls this yet outside tests: producing and
-/// injecting the token at dispatch time (e.g. as `RIPCLONE_METADATA_JOB_TOKEN`
-/// on a farmed-out worker) is not wired up. `RIPCLONE_METADATA=api` is therefore
-/// not yet deployable for real farm-out — see `ENV_BAG.md` and `docs/BACKENDS.md`.
+/// The dispatcher calls this per started farm-out worker (see
+/// `dispatch::autoscale::reconcile_once`), injecting the result as
+/// `RIPCLONE_METADATA_JOB_TOKEN`. It authenticates the worker's claim/ack/
+/// heartbeat and its metadata reports — see `ENV_BAG.md` and `docs/BACKENDS.md`.
 pub fn mint_job_token(secret: &[u8], ttl: Duration) -> Result<String> {
     let now = now_secs();
     let exp = now.saturating_add(ttl.as_secs().max(1));

@@ -1,17 +1,23 @@
 //! Standalone build worker.
 //!
-//! Pulls sync jobs from the SQL queue and runs them through the same
+//! Pulls sync jobs from the queue and runs them through the same
 //! `process_build_job` the in-process worker uses. Because all durable state
-//! lives in shared storage + the metadata store, this can run anywhere that
-//! shares the same `RIPCLONE_QUEUE_DB_URL`, storage, and repo root — another
-//! machine, a Fly Machine, a container, etc.
+//! lives in shared storage + the metadata store, this can run anywhere — another
+//! machine, a Fly Machine, a container, etc. Two claim paths: a direct SQL
+//! connection (trusted single-box) or, for farm-out on untrusted infra, the
+//! token-only `api` queue (claim/ack/heartbeat over HTTP, **no** DB credentials).
 //!
 //! Env:
-//! - `RIPCLONE_QUEUE` = `sqlite` (local file) | `postgres` | `mysql` (network db)
-//!   | `libsql` (remote Turso Cloud). Must match the server.
-//! - `RIPCLONE_QUEUE_DB_URL` (required): a local path for sqlite; a
-//!   `postgres://` / `mysql://` url for those; a `libsql://` url for libsql
-//!   (with `RIPCLONE_QUEUE_DB_TOKEN`).
+//! - `RIPCLONE_QUEUE` = `api` (token-only farm-out, no DB creds) | `sqlite`
+//!   (local file) | `postgres` | `mysql` (network db) | `libsql` (remote Turso
+//!   Cloud). The SQL kinds hold a direct DB connection (trusted single-box); the
+//!   SQL kinds' url comes from `RIPCLONE_QUEUE_DB_URL` (+ `RIPCLONE_QUEUE_DB_TOKEN`
+//!   for libsql). `api` holds **no** database credentials.
+//! - For `RIPCLONE_QUEUE=api`: `RIPCLONE_QUEUE_API_URL` (the server base URL that
+//!   serves `POST /v1/jobs/*`) + `RIPCLONE_METADATA_JOB_TOKEN` (the one signed,
+//!   expiring bearer token that authenticates claim/ack/heartbeat **and** the
+//!   `api` metadata reports). Pair with `RIPCLONE_METADATA=api`. A 401 → the
+//!   worker exits cleanly so the dispatcher respawns it with a fresh token.
 //! - storage env (`RIPCLONE_S3_*` or local) and provider config
 //!   (`RIPCLONE_PROVIDERS` or `config.toml`).
 //! - `RIPCLONE_QUEUE_STALE_SECS` (default 1800) bounds how long a crashed
@@ -55,10 +61,11 @@
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use ripclone::backends::{self, Backends};
+use ripclone::api_ref_store::ApiReportError;
+use ripclone::backends::{self, Backends, WorkerQueueBackend};
 use ripclone::metrics::Metrics;
 use ripclone::queue::{
-    BuildError, BuildJob, JobQueue, JobQueueRef, JobState, SqlJobQueue, make_worker_id,
+    BuildError, BuildJob, JobQueueRef, JobState, WorkerQueueRef, make_worker_id,
     validate_heartbeat_timing, worker_heartbeat_enabled_from_env, worker_heartbeat_interval_secs,
 };
 use ripclone::server::{ServerState, mark_branch_build_failed, process_build_job};
@@ -69,10 +76,20 @@ use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
+/// True when an error means the worker's bearer token was rejected (401/403) on
+/// the `api` queue path. The worker then exits cleanly so the dispatcher can
+/// respawn it with a fresh token — no worker-side re-mint, no spin.
+fn is_queue_auth_expired(err: &anyhow::Error) -> bool {
+    err.chain().any(|c| {
+        c.downcast_ref::<ApiReportError>()
+            .is_some_and(|e| e.is_unauthorized())
+    })
+}
+
 /// Spawn a background task that periodically upserts this worker's registry
 /// row. `current_job` is `-1` when idle, else the claimed job id.
 fn spawn_heartbeat_loop(
-    queue: Arc<SqlJobQueue>,
+    queue: WorkerQueueRef,
     worker_id: String,
     current_job: Arc<AtomicI64>,
     interval: Duration,
@@ -139,16 +156,19 @@ async fn main() -> Result<()> {
     std::fs::create_dir_all(&args.cas_dir)?;
     std::fs::create_dir_all(&args.repo_root)?;
 
-    let queue = backends::connect_sql_queue().await?;
-    let queue = Arc::new(
-        queue
-            .with_max_size_class(args.max_size_class.as_deref())
-            .context("resolve --max-size-class")?,
-    );
+    // The worker claims through either a direct SQL connection (trusted
+    // single-box) or the token-only HTTP `ApiJobQueue` (farm-out). Both back the
+    // same worker loop via the `WorkerQueue` trait; the api queue also serves as
+    // the `build_queue` (JobQueueRef) for the ServerState.
+    let (queue, build_queue): (WorkerQueueRef, JobQueueRef) =
+        match backends::connect_worker_queue(args.max_size_class.as_deref()).await? {
+            WorkerQueueBackend::Sql(q) => (q.clone() as WorkerQueueRef, q as JobQueueRef),
+            WorkerQueueBackend::Api(q) => (q.clone() as WorkerQueueRef, q as JobQueueRef),
+        };
 
     let metrics = Metrics::new();
     let b = Backends::from_env(&args.cas_dir, &args.repo_root, &metrics).await?;
-    let state = ServerState::for_worker(b, queue.clone() as JobQueueRef, metrics)?;
+    let state = ServerState::for_worker(b, build_queue, metrics)?;
 
     // Fleet-unique id (host/machine + pid + start nanos). PID-only collides
     // across machines and under-counts the live fleet in the registry.
@@ -293,6 +313,14 @@ async fn main() -> Result<()> {
                         "job {job_id} was reclaimed (or dead-lettered) before this worker \
                          finished; discarding its build result"
                     ),
+                    Err(e) if is_queue_auth_expired(&e) => {
+                        // Token expired mid-job: exit cleanly for respawn. The
+                        // claim was not settled, so the server reclaims it after
+                        // the stale window and a fresh worker rebuilds — no
+                        // result is silently dropped.
+                        info!("queue token expired (401) on ack; exiting cleanly for respawn");
+                        break;
+                    }
                     Err(e) => error!("failed to ack job {job_id}: {e}"),
                 }
                 if let Some(ref cur) = current_job {
@@ -318,6 +346,13 @@ async fn main() -> Result<()> {
                     }
                 }
                 tokio::time::sleep(idle).await;
+            }
+            Err(e) if is_queue_auth_expired(&e) => {
+                // On the api queue path a 401 means the bearer token expired.
+                // Exit cleanly (code 0) so the dispatcher respawns this worker
+                // with a fresh token; no worker-side re-mint, no spin.
+                info!("queue token expired (401) on claim; exiting cleanly for respawn");
+                break;
             }
             Err(e) => {
                 // Claim errors are not empty claims — don't start/advance idle
