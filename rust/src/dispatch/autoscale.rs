@@ -320,11 +320,24 @@ pub struct ReconcileOutcome {
     pub skipped_backoff: bool,
 }
 
-/// One reconcile step: read depth + capable live count, plan, start workers.
+/// One reconcile step: reap stale claims, read depth + capable live count,
+/// plan, start workers.
 ///
 /// Failures from `ensure_worker` never panic and never lose work — they log,
 /// advance backoff, and leave jobs queued for the next pass.
 pub async fn reconcile_once(input: ReconcileInputs<'_>) -> Result<ReconcileOutcome> {
+    // Reap claims abandoned by dead/stuck workers BEFORE reading pending depth.
+    // `queue::sql::claim_capped` already reclaims on every claim, so a queue
+    // with live claim traffic self-heals on its own — but a job stuck `claimed`
+    // on an otherwise-idle queue has no claimer to trigger that path: nothing
+    // is `queued`, this reconcile would see 0 pending, start no worker, and
+    // nobody would ever claim (and thus reclaim) it again. Calling it here,
+    // every pass, closes that gap: a dead worker's job flips back to `queued`
+    // and is counted in *this* pass, pulling a fresh worker immediately. Reuses
+    // the queue's configured stale window / max-attempts / dead-letter — same
+    // semantics as the claim-time reclaim, just called on a different trigger.
+    input.queue.reclaim_stale().await?;
+
     let pending = input.queue.pending_by_class().await?;
     // Capability-filtered live count: for large pending, only large-capable
     // (or uncapped) workers count. Raw live_worker_count would livelock when a
@@ -463,11 +476,13 @@ pub async fn run_loop(
     config: AutoscaleConfig,
     worker_env: BTreeMap<String, String>,
 ) -> Result<()> {
+    let mut heartbeat = super::heartbeat::DeadMansSwitch::from_env();
     info!(
         interval_secs = config.interval.as_secs(),
         max_workers = config.max_workers,
         provider = provider.name(),
         api_mode = api_mode_configured(&worker_env),
+        heartbeat_configured = heartbeat.is_configured(),
         "dispatcher autoscale loop starting (poll-only)"
     );
     let mut backoff = BackoffState::new();
@@ -496,6 +511,11 @@ pub async fn run_loop(
                         "autoscale reconcile"
                     );
                 }
+                // Dead-man's switch: unset RIPCLONE_HEARTBEAT_URL makes this a
+                // no-op. Best-effort — never breaks this loop.
+                heartbeat
+                    .on_reconcile(out.plan.total_pending, out.started, out.failed)
+                    .await;
             }
             Err(e) => {
                 // Queue read failure: log and keep looping — do not exit and
@@ -774,6 +794,72 @@ mod tests {
             .unwrap()
             .with_heartbeat_timeout_secs(60);
         (q, dir)
+    }
+
+    /// Zero-tolerance stale window: any currently `claimed` row is immediately
+    /// reclaim-eligible. Used to make the reaper deterministic in tests.
+    async fn test_queue_zero_stale() -> (SqlJobQueue, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q.db").to_string_lossy().to_string();
+        let q = SqlJobQueue::new(Box::new(SqliteDb::connect(&path).await.unwrap()))
+            .await
+            .unwrap()
+            .with_heartbeat_timeout_secs(60)
+            .with_stale_claim_secs(0);
+        (q, dir)
+    }
+
+    /// Reaper-on-reconcile (O11a): a job stuck `claimed` by a dead worker on an
+    /// otherwise-idle queue (nothing `queued`) must still be reclaimed and
+    /// counted THIS pass, not left stranded because `pending_by_class` alone
+    /// sees zero depth.
+    ///
+    /// Prove-it: remove the `input.queue.reclaim_stale().await?` call from
+    /// `reconcile_once` and this test fails — `total_pending` and `started`
+    /// both go to 0 because the claimed-but-abandoned row is never reclaimed.
+    #[tokio::test]
+    async fn reconcile_reaps_stale_claim_before_reading_pending_depth() {
+        let (q, _dir) = test_queue_zero_stale().await;
+        q.enqueue(job("o/r", Some(100))).await.unwrap();
+
+        // Simulate a dead worker: claim the job directly (a real SIGKILLed
+        // worker leaves exactly this state — row `claimed`, no ack, ever), then
+        // never ack. No new job is enqueued after this.
+        let claimed = q.claim("dead-worker").await.unwrap();
+        assert!(claimed.is_some(), "setup: job must be claimed");
+
+        // Otherwise-idle queue: nothing `queued`, so a plain pending_by_class
+        // read reports zero pending — the stranded-claim bug this fix closes.
+        assert_eq!(q.depth().await, 0, "claimed job is not counted as queued");
+        assert!(
+            q.pending_by_class().await.unwrap().is_empty(),
+            "pending_by_class alone sees no depth for a claimed-but-abandoned job"
+        );
+
+        let mock = MockProvider::new();
+        let env = BTreeMap::new();
+        let mut backoff = BackoffState::new();
+        let out = reconcile_once(ReconcileInputs {
+            queue: &q,
+            provider: &mock,
+            max_workers: 5,
+            worker_env: &env,
+            backoff: &mut backoff,
+            now: Instant::now(),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            out.plan.total_pending, 1,
+            "reclaim must run before pending is read, so this pass counts the \
+             reclaimed job: {out:?}"
+        );
+        assert_eq!(
+            out.started, 1,
+            "reconcile must start a fresh worker for the reclaimed job: {out:?}"
+        );
+        assert_eq!(mock.calls().len(), 1);
     }
 
     #[tokio::test]
