@@ -135,6 +135,19 @@ pub struct ApiJobQueue {
     last_status: Mutex<HashMap<JobId, JobState>>,
 }
 
+/// Manual `Debug` that REDACTS the bearer token — it is the worker's whole
+/// credential and must never land in logs. Do not `#[derive(Debug)]` (it would
+/// print the token).
+impl std::fmt::Debug for ApiJobQueue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ApiJobQueue")
+            .field("base_url", &self.base_url)
+            .field("job_token", &"<redacted>")
+            .field("heartbeat_timeout_secs", &self.heartbeat_timeout_secs)
+            .finish_non_exhaustive()
+    }
+}
+
 impl ApiJobQueue {
     /// Build from env: requires `RIPCLONE_QUEUE_API_URL` (the server base URL)
     /// and `RIPCLONE_METADATA_JOB_TOKEN` (the one worker bearer token, shared
@@ -319,15 +332,8 @@ impl WorkerQueue for ApiJobQueue {
         Ok(0)
     }
 
-    async fn job_status(&self, id: JobId) -> Result<JobState> {
-        Ok(self
-            .last_status
-            .lock()
-            .await
-            .get(&id)
-            .cloned()
-            .unwrap_or(JobState::Unknown))
-    }
+    // `job_status` is provided by the `JobQueue` supertrait impl below (reads the
+    // post-ack cache), so it is not redeclared here.
 
     fn supports_worker_registry(&self) -> bool {
         // The server decides whether its queue backend has a registry; the api
@@ -354,7 +360,15 @@ impl JobQueue for ApiJobQueue {
     }
 
     async fn job_status(&self, id: JobId) -> Result<JobState> {
-        <Self as WorkerQueue>::job_status(self, id).await
+        // The post-ack cache (populated by `WorkerQueue::ack`) is the worker's
+        // dead-letter check; there is no job-status endpoint.
+        Ok(self
+            .last_status
+            .lock()
+            .await
+            .get(&id)
+            .cloned()
+            .unwrap_or(JobState::Unknown))
     }
 
     async fn depth(&self) -> usize {
@@ -431,12 +445,12 @@ mod tests {
     async fn job_status_defaults_unknown_then_reads_cache() {
         let q = ApiJobQueue::new("http://127.0.0.1:9", "tok", 60).unwrap();
         assert!(matches!(
-            WorkerQueue::job_status(&q, 1).await.unwrap(),
+            JobQueue::job_status(&q, 1).await.unwrap(),
             JobState::Unknown
         ));
         q.last_status.lock().await.insert(1, JobState::Done);
         assert!(matches!(
-            WorkerQueue::job_status(&q, 1).await.unwrap(),
+            JobQueue::job_status(&q, 1).await.unwrap(),
             JobState::Done
         ));
     }

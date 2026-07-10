@@ -850,9 +850,7 @@ impl WorkerQueue for SqlJobQueue {
         SqlJobQueue::prune_failed(self).await
     }
 
-    async fn job_status(&self, id: JobId) -> Result<JobState> {
-        <Self as JobQueue>::job_status(self, id).await
-    }
+    // `job_status` comes from the `JobQueue` supertrait (the real impl above).
 
     fn supports_worker_registry(&self) -> bool {
         SqlJobQueue::supports_worker_registry(self)

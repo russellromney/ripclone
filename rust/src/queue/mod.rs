@@ -198,8 +198,12 @@ pub type JobQueueRef = Arc<dyn JobQueue>;
 /// expired-token (401) error is flagged via
 /// [`ApiReportError`](crate::api_ref_store::ApiReportError) so the worker exits
 /// cleanly and the dispatcher respawns it with a fresh token.
+///
+/// [`JobQueue`] is a supertrait, so `job_status` (used after `ack` to detect a
+/// dead-letter) is inherited from it — not redeclared here. Declaring it on both
+/// traits would make `q.job_status(..)` ambiguous once both are in scope.
 #[async_trait]
-pub trait WorkerQueue: Send + Sync {
+pub trait WorkerQueue: JobQueue {
     /// Claim the oldest eligible queued job for this worker, or `None` when the
     /// queue is empty. Returns **exactly one** job, scoped to this caller.
     async fn claim(&self, worker_id: &str) -> Result<Option<ClaimedJob>>;
@@ -215,9 +219,6 @@ pub trait WorkerQueue: Send + Sync {
 
     /// Prune expired `failed` jobs. Returns rows removed.
     async fn prune_failed(&self) -> Result<u64>;
-
-    /// Lifecycle state of a job id (used after `ack` to detect a dead-letter).
-    async fn job_status(&self, id: JobId) -> Result<JobState>;
 
     /// Whether the backing queue has a workers registry (heartbeat support).
     fn supports_worker_registry(&self) -> bool;
