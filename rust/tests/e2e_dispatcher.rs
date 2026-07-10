@@ -241,7 +241,9 @@ async fn reconcile_until_done(
 
         // Respect real wall-clock backoff (do not clear it in the test harness).
         if out.skipped_backoff || out.failed > 0 {
-            let wait = backoff.remaining(Instant::now()).max(Duration::from_millis(200));
+            let wait = backoff
+                .remaining(Instant::now())
+                .max(Duration::from_millis(200));
             tokio::time::sleep(wait).await;
         } else {
             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -262,18 +264,16 @@ impl Drop for DispatcherProc {
 /// Spawn the product binary with exec dispatch → launch-script workers.
 /// Worker bag keys are set on the child so `collect_worker_env` inside the
 /// binary forwards them (same path as production).
-fn spawn_dispatcher_binary(wrapper: &Path, max_workers: usize, interval_secs: u64) -> DispatcherProc {
+fn spawn_dispatcher_binary(
+    wrapper: &Path,
+    max_workers: usize,
+    interval_secs: u64,
+) -> DispatcherProc {
     let mut cmd = Command::new(cargo_bin("ripclone-dispatcher"));
     cmd.env("RIPCLONE_DISPATCH", "exec")
         .env("RIPCLONE_DISPATCH_CMD", wrapper)
-        .env(
-            "RIPCLONE_DISPATCH_INTERVAL_SECS",
-            interval_secs.to_string(),
-        )
-        .env(
-            "RIPCLONE_DISPATCH_MAX_WORKERS",
-            max_workers.to_string(),
-        )
+        .env("RIPCLONE_DISPATCH_INTERVAL_SECS", interval_secs.to_string())
+        .env("RIPCLONE_DISPATCH_MAX_WORKERS", max_workers.to_string())
         // Forwarded into WorkerSpec.env by the binary's collect_worker_env().
         .env("RIPCLONE_IDLE_EXIT_SECS", "2")
         .env("RIPCLONE_WORKER_HEARTBEAT", "queue")
@@ -331,14 +331,23 @@ async fn dispatcher_reconcile_drains_real_workers() {
     })
     .await
     .expect("first reconcile");
-    assert_eq!(first.plan.total_pending, 3, "plan sees all pending: {first:?}");
+    assert_eq!(
+        first.plan.total_pending, 3,
+        "plan sees all pending: {first:?}"
+    );
     assert_eq!(first.plan.desired, 3, "desired tracks pending: {first:?}");
-    assert_eq!(first.plan.to_start, 3, "no live workers yet → start 3: {first:?}");
+    assert_eq!(
+        first.plan.to_start, 3,
+        "no live workers yet → start 3: {first:?}"
+    );
     assert_eq!(
         first.started, 3,
         "ExecProvider must spawn all planned workers: {first:?}"
     );
-    assert_eq!(first.failed, 0, "first ensure_worker batch must not fail: {first:?}");
+    assert_eq!(
+        first.failed, 0,
+        "first ensure_worker batch must not fail: {first:?}"
+    );
     assert!(
         first.plan.size_classes.iter().all(|s| s == "small"),
         "small pending must start small-class slots: {:?}",
@@ -409,11 +418,11 @@ async fn dispatcher_reconcile_max_workers_one_serial_drain() {
         first.plan.desired, 1,
         "cap must bind desired to max_workers=1: {first:?}"
     );
-    assert_eq!(first.plan.to_start, 1, "start exactly one under cap: {first:?}");
     assert_eq!(
-        first.started, 1,
-        "must not spawn past the cap: {first:?}"
+        first.plan.to_start, 1,
+        "start exactly one under cap: {first:?}"
     );
+    assert_eq!(first.started, 1, "must not spawn past the cap: {first:?}");
     assert_eq!(first.failed, 0, "{first:?}");
 
     // One live worker (or successive one-at-a-time starts) must still drain N jobs.
@@ -460,7 +469,8 @@ async fn dispatcher_binary_exec_drains_queue() {
     assert_eq!(queue.depth().await, 2);
 
     // Binary owns the poll loop (interval=1s). Kill on drop after drain.
-    let _dispatcher = spawn_dispatcher_binary(&wrapper, /*max_workers=*/ 5, /*interval_secs=*/ 1);
+    let _dispatcher =
+        spawn_dispatcher_binary(&wrapper, /*max_workers=*/ 5, /*interval_secs=*/ 1);
 
     wait_all_done(&queue, &[id_a, id_b], Duration::from_secs(120)).await;
     assert_eq!(
@@ -621,7 +631,11 @@ async fn dispatcher_provider_down_no_job_loss_then_recovers() {
         &mut backoff,
     )
     .await;
-    assert_eq!(queue.depth().await, 0, "queue drains after provider recovery");
+    assert_eq!(
+        queue.depth().await,
+        0,
+        "queue drains after provider recovery"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -759,7 +773,11 @@ async fn dispatcher_size_class_large_not_claimed_by_small() {
         &mut backoff,
     )
     .await;
-    assert_eq!(queue.depth().await, 0, "large job drains on large-capable worker");
+    assert_eq!(
+        queue.depth().await,
+        0,
+        "large job drains on large-capable worker"
+    );
     match queue.job_status(id).await.expect("status") {
         JobState::Done => {}
         other => panic!("large job expected Done, got {other:?}"),
