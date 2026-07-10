@@ -297,7 +297,11 @@ async fn worker_endpoints_reject_bad_tokens_no_state_change() {
 /// NEGATIVE: a worker whose token has expired → its next claim 401s → it exits
 /// cleanly (code 0, not a crash, not a spin), and the job stays claimable by a
 /// fresh worker.
-#[tokio::test]
+// Multi-threaded runtime: this test blocks on `wait_for_exit` while the
+// in-process server must keep answering the worker's `/v1/jobs/claim` (so the
+// worker sees the 401 and exits). On a single-threaded runtime the blocking
+// wait starves the server task and the claim never gets a response.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn expired_token_worker_exits_clean_job_survives() {
     let _guard = SERIAL.lock().await;
     let (_q, _m, _queue_url, meta_url) = setup_sqlite_queue_and_meta();
