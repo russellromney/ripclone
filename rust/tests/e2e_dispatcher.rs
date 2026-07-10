@@ -844,6 +844,30 @@ async fn dispatcher_reconcile_drains_workers_over_api_queue() {
     worker_env.insert("RIPCLONE_WORKER_HEARTBEAT".into(), "queue".into());
     worker_env.insert("RIPCLONE_WORKER_HEARTBEAT_INTERVAL_SECS".into(), "1".into());
     worker_env.insert("RIPCLONE_WORKER_HEARTBEAT_TIMEOUT_SECS".into(), "30".into());
+    // Hermetic proof of the API path: the worker inherits the test's real
+    // `RIPCLONE_QUEUE_DB_URL` (process-global from `setup_sqlite_queue`). Overlay a
+    // fresh, EMPTY decoy DB so that IF `RIPCLONE_QUEUE=api` ever failed to apply,
+    // the worker would fall back to the empty decoy and drain NOTHING (test fails)
+    // rather than silently draining the real queue via SQL (false positive). In
+    // the normal case `RIPCLONE_QUEUE=api` never reads a DB URL, so the decoy is
+    // inert and the drain goes over `/v1/jobs/*`. Metadata decoy for symmetry.
+    let decoy_dir = tempfile::tempdir().expect("decoy dir");
+    worker_env.insert(
+        "RIPCLONE_QUEUE_DB_URL".into(),
+        decoy_dir
+            .path()
+            .join("decoy-queue.db")
+            .to_string_lossy()
+            .into_owned(),
+    );
+    worker_env.insert(
+        "RIPCLONE_METADATA_DB_URL".into(),
+        decoy_dir
+            .path()
+            .join("decoy-meta.db")
+            .to_string_lossy()
+            .into_owned(),
+    );
 
     let _o1 = publish_origin("acme", "api-disp-a", "a.txt", "a\n");
     let _o2 = publish_origin("acme", "api-disp-b", "b.txt", "b\n");
