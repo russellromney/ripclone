@@ -30,6 +30,13 @@
 //! - Size classes: `RIPCLONE_SIZE_CLASSES` / launch defaults (`small`|`large`).
 //! - Provider-specific env: `FLY_WORKER_APP` / `FLY_API_TOKEN` for `fly`,
 //!   `RIPCLONE_DISPATCH_CMD` for `exec`, `RIPCLONE_DISPATCH_URL` for `http`.
+//! - `RIPCLONE_HEARTBEAT_URL` (optional): dead-man's switch. A best-effort GET
+//!   on every healthy reconcile cycle, for an external monitor
+//!   (healthchecks.io / Cronitor) to alert on silence. Pinging stops after a
+//!   few consecutive cycles where dispatch is failing while work piles up (a
+//!   capacity/provider/DB outage retries alone can't fix) — see
+//!   `dispatch::heartbeat::DeadMansSwitch`. Unset -> no pinging, no behavior
+//!   change.
 //!
 //! ## Topology
 //!

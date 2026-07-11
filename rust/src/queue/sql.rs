@@ -484,6 +484,15 @@ impl SqlJobQueue {
         self
     }
 
+    /// Override the stale-claim window (seconds) used by
+    /// [`reclaim_stale`](Self::reclaim_stale) / [`claim_capped`](Self::claim_capped).
+    /// Used by tests that need a deterministic (short) window instead of the
+    /// `RIPCLONE_QUEUE_STALE_SECS` env default.
+    pub fn with_stale_claim_secs(mut self, secs: i64) -> Self {
+        self.stale_claim_secs = secs.max(0);
+        self
+    }
+
     /// Configured size classes (ordered, smallest first).
     pub fn size_classes(&self) -> &[SizeClass] {
         &self.size_classes
@@ -633,6 +642,35 @@ impl SqlJobQueue {
         self.claim_capped(worker_id, self.max_size_class).await
     }
 
+    /// Reclaim claims abandoned by dead/stuck workers, independent of a claim.
+    ///
+    /// [`claim_capped`](Self::claim_capped) already reclaims before claiming, so
+    /// a queue with active claim traffic self-heals on its own. But a job stuck
+    /// `claimed` on an otherwise-idle queue has no claimer to trigger that path:
+    /// nothing is `queued`, so a depth-based dispatcher starts no worker, so
+    /// nobody claims, so nobody reclaims — the job is stranded forever. The
+    /// dispatcher's reconcile loop calls this directly every pass, before
+    /// reading pending depth, so a dead worker's job flips back to `queued` and
+    /// is counted in that same pass.
+    ///
+    /// Same reclaim semantics as `claim_capped` — same stale window, same
+    /// max-attempts cap, same dead-letter behavior. Only *when* this runs
+    /// changes, never *what* it does.
+    pub async fn reclaim_stale(&self) -> Result<()> {
+        let now = now_secs();
+        self.db
+            .reclaim_stale(
+                now - self.stale_claim_secs,
+                self.max_build_attempts,
+                now,
+                &format!(
+                    "dead-lettered after {} build attempts (worker crashed or timed out)",
+                    self.max_build_attempts
+                ),
+            )
+            .await
+    }
+
     /// Resolve a size-class *name* to a rank ceiling using this queue's
     /// configured classes. `None` clears the ceiling (claim anything). Unknown
     /// names fail loudly. Used by the API claim endpoint to apply a farm-out
@@ -653,18 +691,7 @@ impl SqlJobQueue {
         worker_id: &str,
         ceiling: Option<i64>,
     ) -> Result<Option<ClaimedJob>> {
-        let now = now_secs();
-        self.db
-            .reclaim_stale(
-                now - self.stale_claim_secs,
-                self.max_build_attempts,
-                now,
-                &format!(
-                    "dead-lettered after {} build attempts (worker crashed or timed out)",
-                    self.max_build_attempts
-                ),
-            )
-            .await?;
+        self.reclaim_stale().await?;
         for attempt in 0..MAX_CLAIM_ATTEMPTS {
             let Some(id) = self.db.next_queued_id(ceiling).await? else {
                 return Ok(None);

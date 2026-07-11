@@ -171,6 +171,36 @@ fn local_worker_env() -> BTreeMap<String, String> {
     env
 }
 
+/// Like [`write_worker_wrapper`], but first records its own pid to `pidfile`
+/// before exec'ing the real worker. `exec` replaces the process image without
+/// forking, so the pid recorded here IS the real worker's pid for its whole
+/// life — the reaper test uses it to SIGKILL the exact worker that claimed
+/// the job (a hard crash mid-build, no ack, ever).
+fn write_worker_wrapper_with_pidfile(
+    dir: &Path,
+    worker_bin: &Path,
+    cas_dir: &Path,
+    repo_root: &Path,
+    pidfile: &Path,
+) -> PathBuf {
+    let path = dir.join("launch-worker-doomed.sh");
+    let script = format!(
+        r#"#!/bin/sh
+# Reaper e2e helper: record this process's pid, then exec into the real
+# worker (same pid, new image) so the test can hard-kill it mid-build.
+echo $$ > "{pidfile}"
+exec "{worker}" --cas-dir "{cas}" --repo-root "{repos}" --idle-poll-ms 100
+"#,
+        pidfile = pidfile.display(),
+        worker = worker_bin.display(),
+        cas = cas_dir.display(),
+        repos = repo_root.display(),
+    );
+    std::fs::write(&path, &script).expect("write doomed wrapper");
+    chmod_x(&path);
+    path
+}
+
 fn exec_provider(wrapper: PathBuf) -> ExecProvider {
     ExecProvider::new(ExecProviderConfig {
         program: wrapper,
@@ -895,4 +925,135 @@ async fn dispatcher_reconcile_drains_workers_over_api_queue() {
         0,
         "a real worker must drain the queue over the HTTP API (RIPCLONE_QUEUE=api)"
     );
+}
+
+// ---------------------------------------------------------------------------
+// REAPER: stale-claim self-heal on reconcile
+// ---------------------------------------------------------------------------
+
+/// Reaper on reconcile: a job stuck `claimed` by a dead worker on an
+/// otherwise-idle queue must be reclaimed by the dispatcher's OWN reconcile
+/// loop — no new enqueue, no human action. Before this fix, `reclaim_stale`
+/// only ran when a worker claimed (`queue::sql::claim_capped`); an idle queue
+/// (nothing `queued`) never triggers a claim, so a SIGKILLed worker's job was
+/// stranded forever: 0 queued depth -> dispatcher starts no worker -> nobody
+/// claims -> nobody reclaims.
+///
+/// Real seam, both halves: a REAL `ripclone-worker` process (via
+/// `ExecProvider`) claims the job and is then SIGKILLed mid-build (no ack,
+/// ever); recovery then runs ONLY through `reconcile_once` calls against a
+/// healthy provider — the same call the real dispatcher poll loop makes.
+///
+/// Prove-it: remove `input.queue.reclaim_stale().await?` from
+/// `reconcile_once` (`src/dispatch/autoscale.rs`) and this test times out —
+/// the claimed row never flips back to `queued`, `pending_by_class` stays
+/// empty forever, and no replacement worker is ever started.
+#[tokio::test]
+async fn dispatcher_reaper_reclaims_dead_worker_on_reconcile() {
+    let _guard = SERIAL.lock().await;
+    let _qdir = setup_sqlite_queue();
+    // Short stale window: the killed worker's claim must become
+    // reclaim-eligible quickly (test timeout), while staying long enough that
+    // the REAL healthy worker's own claim->build->ack cycle for a trivial
+    // repo (well under a second) is never caught by it.
+    unsafe {
+        std::env::set_var("RIPCLONE_QUEUE_STALE_SECS", "1");
+    }
+    let server = start_server().await;
+    let wrapper_dir = tempfile::tempdir().expect("wrapper dir");
+    let pidfile = wrapper_dir.path().join("worker.pid");
+    let doomed_wrapper = write_worker_wrapper_with_pidfile(
+        wrapper_dir.path(),
+        &cargo_bin("ripclone-worker"),
+        &server.cas_dir,
+        &server.repo_root,
+        &pidfile,
+    );
+    let good_wrapper = write_worker_wrapper(
+        wrapper_dir.path(),
+        &cargo_bin("ripclone-worker"),
+        &server.cas_dir,
+        &server.repo_root,
+    );
+    let worker_env = local_worker_env();
+
+    let _origin = publish_origin("acme", "reaper-a", "a.txt", "a\n");
+    let queue = backends::connect_sql_queue().await.expect("queue");
+    let id = enqueue_sized(&queue, "acme/reaper-a", Some(SMALL_BYTES)).await;
+    assert_eq!(queue.depth().await, 1, "one job queued before reconcile");
+
+    // Reconcile pass #1: real seam via ExecProvider starts the doomed worker.
+    let doomed_provider = exec_provider(doomed_wrapper);
+    let mut backoff = BackoffState::new();
+    let first = reconcile_once(ReconcileInputs {
+        queue: &queue,
+        provider: &doomed_provider,
+        max_workers: 1,
+        worker_env: &worker_env,
+        backoff: &mut backoff,
+        now: Instant::now(),
+    })
+    .await
+    .expect("first reconcile starts the doomed worker");
+    assert_eq!(first.started, 1, "doomed worker must start: {first:?}");
+
+    // Wait for the REAL claim: `depth()` drops to 0 only via the atomic claim
+    // UPDATE in `try_claim`, so this is not a timing guess. Then hard-kill
+    // that exact worker pid — a crash mid-build, no ack, ever.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if queue.depth().await == 0 && pidfile.exists() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "doomed worker never claimed the job within 30s"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_still_pending(&queue, id).await;
+    let pid: i32 = std::fs::read_to_string(&pidfile)
+        .expect("read pidfile")
+        .trim()
+        .parse()
+        .expect("pidfile must contain a pid");
+    let rc = unsafe { libc::kill(pid, libc::SIGKILL) };
+    assert_eq!(
+        rc,
+        0,
+        "SIGKILL the doomed worker (pid {pid}): {}",
+        std::io::Error::last_os_error()
+    );
+
+    // Confirm the crash landed: row stuck `claimed`, no ack, queue LOOKS idle
+    // (nothing `queued`) — exactly the stranded-claim scenario this fix
+    // closes. Give the killed process a moment to actually exit.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        queue.depth().await,
+        0,
+        "queue looks idle: the stuck claim is not counted as queued"
+    );
+    assert_still_pending(&queue, id).await;
+
+    // NO new enqueue, no human action from here: only the dispatcher's own
+    // reconcile loop (real `reconcile_once`, called repeatedly exactly like
+    // the production poll loop) against a WORKING provider drives recovery.
+    let good_provider = exec_provider(good_wrapper);
+    reconcile_until_done(
+        &queue,
+        &good_provider,
+        &worker_env,
+        1,
+        &[id],
+        Duration::from_secs(60),
+        &mut backoff,
+    )
+    .await;
+
+    assert_eq!(queue.depth().await, 0, "queue drains after self-heal");
+    match queue.job_status(id).await.expect("status") {
+        JobState::Done => {}
+        other => panic!("reaped job expected Done, got {other:?}"),
+    }
 }

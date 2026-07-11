@@ -26,6 +26,7 @@
 pub mod autoscale;
 pub mod exec;
 pub mod fly;
+pub mod heartbeat;
 pub mod http;
 pub mod mock;
 pub mod select;
@@ -38,6 +39,7 @@ pub use exec::{ExecProvider, ExecProviderConfig};
 pub use fly::{
     FlyMachine, FlyMachinesClient, FlyProvider, FlyProviderConfig, HttpFlyMachinesClient,
 };
+pub use heartbeat::{DeadMansSwitch, WEDGED_CYCLES_TO_STOP};
 pub use http::{HttpProvider, HttpProviderConfig};
 pub use mock::MockProvider;
 pub use select::{
