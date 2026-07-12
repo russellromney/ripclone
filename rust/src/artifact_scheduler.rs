@@ -736,7 +736,7 @@ impl ArtifactScheduler {
         let prior_version: i64 = sqlx::query_scalar("PRAGMA user_version")
             .fetch_one(&mut *migration)
             .await?;
-        if prior_version > 6 {
+        if prior_version > 7 {
             bail!("artifact scheduler database is newer than this binary")
         }
         preflight_sqlite_schema(&mut migration, prior_version).await?;
@@ -1051,6 +1051,14 @@ impl ArtifactScheduler {
           PRAGMA user_version=6")
             .execute(&mut *migration)
             .await?;
+            if prior_version < 7 {
+                crate::git_source_registry::migrate_sqlite_v7_in(&mut migration).await?;
+            } else {
+                crate::git_source_registry::validate_sqlite_v7_in(&mut migration).await?;
+            }
+            sqlx::query("PRAGMA user_version=7")
+                .execute(&mut *migration)
+                .await?;
             sqlx::query("COMMIT").execute(&mut *migration).await?;
             Ok(())
         }
@@ -1083,7 +1091,7 @@ impl ArtifactScheduler {
         )
         .fetch_one(&pool)
         .await?;
-        if version != 6
+        if version != 7
             || required != 4
             || fence_tables != 3
             || fence_columns != 16
@@ -1104,7 +1112,7 @@ impl ArtifactScheduler {
             .filter(|c| !c.is_whitespace())
             .flat_map(char::to_lowercase)
             .collect::<String>();
-        if version != 6
+        if version != 7
             || required != 4
             || base_columns != 6
             || invalid_base != 0
@@ -1380,6 +1388,29 @@ impl ArtifactScheduler {
                             .context("scheduler GC root format")?,
                     },
                     manifest: row.try_get("manifest")?,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn live_source_objects_page(
+        &self,
+        after: Option<(&str, &str)>,
+        limit: u32,
+    ) -> Result<Vec<crate::git_source_registry::SourceGcObject>> {
+        if limit == 0 || limit > crate::git_source_registry::SOURCE_ROOT_PAGE_MAX {
+            bail!("source GC page limit is invalid")
+        }
+        let (after_hash, after_owner) = after.unwrap_or(("", ""));
+        let rows=sqlx::query("WITH objects(hash,len,owner) AS (SELECT root_hash,root_len,'r:'||root_hash FROM git_source_roots UNION ALL SELECT child_hash,child_len,'r:'||root_hash||':'||printf('%020d',ordinal) FROM git_source_members UNION ALL SELECT root_hash,root_len,'a:'||token FROM git_source_acquisitions WHERE state='activation_unknown' OR (state='graph_published' AND expires_at>unixepoch()) UNION ALL SELECT m.child_hash,m.child_len,'a:'||m.token||':'||printf('%020d',m.ordinal) FROM git_source_acquisition_members m JOIN git_source_acquisitions a ON a.token=m.token WHERE a.state='activation_unknown' OR (a.state='graph_published' AND a.expires_at>unixepoch())) SELECT hash,len,owner FROM objects WHERE hash>? OR (hash=? AND owner>?) ORDER BY hash,owner LIMIT ?")
+            .bind(after_hash).bind(after_hash).bind(after_owner).bind(limit as i64).fetch_all(&self.pool).await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(crate::git_source_registry::SourceGcObject {
+                    hash: row.try_get("hash")?,
+                    len: u64::try_from(row.try_get::<i64, _>("len")?)
+                        .context("source GC object length")?,
+                    owner: row.try_get("owner")?,
                 })
             })
             .collect()
@@ -2487,11 +2518,14 @@ async fn preflight_sqlite_schema(
                 && ((fence_tables == 0 && fence_indexes == 0)
                     || (fence_tables == 3 && fence_indexes == 1))
         }
-        5 | 6 => tables == 8 && indexes == 5 && fence_tables == 3 && fence_indexes == 1,
+        5..=7 => tables == 8 && indexes == 5 && fence_tables == 3 && fence_indexes == 1,
         _ => false,
     };
     if !inventory_ok {
         bail!("sqlite artifact scheduler schema marker does not match an approved lineage")
+    }
+    if version == 7 {
+        crate::git_source_registry::validate_sqlite_v7_in(connection).await?;
     }
     if version == 2 && fence_tables == 3 {
         let fence_ddl: Vec<(String, String)> = sqlx::query_as(
@@ -2794,6 +2828,9 @@ mod tests {
         .await
         .unwrap();
         pool
+    }
+    async fn drop_source_v7(pool: &SqlitePool) {
+        sqlx::raw_sql("DROP TABLE artifact_intents; DROP TABLE branch_source_current; DROP TABLE branch_source_generations; DROP TABLE git_source_consumers; DROP TABLE git_source_desires; DROP TABLE git_source_acquisition_members; DROP TABLE git_source_acquisitions; DROP TABLE git_source_acquisition_sequence; DROP TABLE git_source_maintenance; DROP TABLE git_source_members; DROP TABLE git_source_roots;").execute(pool).await.unwrap();
     }
 
     #[tokio::test]
@@ -4729,6 +4766,7 @@ mod tests {
     #[tokio::test]
     async fn divergent_lineages_migrate_to_v5_while_partial_shapes_fail_closed() {
         let (transport_v4, _dir, transport_v4_path) = scheduler(Default::default()).await;
+        drop_source_v7(&transport_v4.pool).await;
         sqlx::raw_sql("DROP TABLE ready_publication_fence_members; DROP TABLE ready_publication_fences; DROP TABLE ready_publication_fence_sequence; PRAGMA user_version=4")
             .execute(&transport_v4.pool).await.unwrap();
         drop(transport_v4);
@@ -4740,7 +4778,7 @@ mod tests {
                 .fetch_one(&migrated.pool)
                 .await
                 .unwrap(),
-            6
+            7
         );
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
@@ -4753,6 +4791,7 @@ mod tests {
         );
 
         let (combined_v4, _dir, combined_v4_path) = scheduler(Default::default()).await;
+        drop_source_v7(&combined_v4.pool).await;
         sqlx::query("PRAGMA user_version=4")
             .execute(&combined_v4.pool)
             .await
@@ -4766,10 +4805,11 @@ mod tests {
                 .fetch_one(&migrated_combined.pool)
                 .await
                 .unwrap(),
-            6
+            7
         );
 
         let (admission_v3, _dir, admission_v3_path) = scheduler(Default::default()).await;
+        drop_source_v7(&admission_v3.pool).await;
         sqlx::raw_sql("DROP TABLE artifact_base_retention; DROP TABLE artifact_gc_sweep; DROP TABLE artifact_transport_leases; PRAGMA user_version=3")
             .execute(&admission_v3.pool).await.unwrap();
         drop(admission_v3);
@@ -4781,10 +4821,11 @@ mod tests {
                 .fetch_one(&migrated_admission.pool)
                 .await
                 .unwrap(),
-            6
+            7
         );
 
         let (v2, _dir, v2_path) = scheduler(Default::default()).await;
+        drop_source_v7(&v2.pool).await;
         sqlx::raw_sql("DROP TABLE ready_publication_fence_members; DROP TABLE ready_publication_fences; DROP TABLE ready_publication_fence_sequence; DROP TABLE artifact_base_retention; DROP TABLE artifact_gc_sweep; PRAGMA user_version=2")
             .execute(&v2.pool).await.unwrap();
         drop(v2);
@@ -4796,7 +4837,7 @@ mod tests {
                 .fetch_one(&migrated_v2.pool)
                 .await
                 .unwrap(),
-            6
+            7
         );
         assert_eq!(sqlx::query_scalar::<_,i64>("SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN('artifact_base_retention','artifact_gc_sweep')").fetch_one(&migrated_v2.pool).await.unwrap(),2);
 
@@ -4846,7 +4887,7 @@ mod tests {
         );
 
         let (future, _dir, future_path) = scheduler(Default::default()).await;
-        sqlx::query("PRAGMA user_version=7")
+        sqlx::query("PRAGMA user_version=8")
             .execute(&future.pool)
             .await
             .unwrap();
@@ -4858,7 +4899,11 @@ mod tests {
         );
 
         let (concurrent, _dir, concurrent_path) = scheduler(Default::default()).await;
-        sqlx::raw_sql("DROP TABLE ready_publication_fence_members; DROP TABLE ready_publication_fences; DROP TABLE ready_publication_fence_sequence; PRAGMA user_version=4").execute(&concurrent.pool).await.unwrap();
+        drop_source_v7(&concurrent.pool).await;
+        sqlx::query("PRAGMA user_version=6")
+            .execute(&concurrent.pool)
+            .await
+            .unwrap();
         drop(concurrent);
         let (first, second) = tokio::join!(
             ArtifactScheduler::open(&concurrent_path, Default::default()),

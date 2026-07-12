@@ -464,8 +464,8 @@ impl ScratchScope {
 /// Storage-neutral sink. Implementations must verify the declared SHA-256 and
 /// length before returning success.
 pub trait GitSourceUploader: Send + Sync {
-    fn put_file(&self, blob: &CasBlob, source: &Path) -> Result<()>;
-    fn put_bytes(&self, blob: &CasBlob, bytes: &[u8]) -> Result<()>;
+    fn put_file(&self, blob: &CasBlob, source: &Path, cancelled: &CancellationToken) -> Result<()>;
+    fn put_bytes(&self, blob: &CasBlob, bytes: &[u8], cancelled: &CancellationToken) -> Result<()>;
 }
 
 /// Storage-neutral loader. Implementations must create `destination` and must
@@ -544,17 +544,22 @@ impl CasGitSourceStore {
 }
 
 impl GitSourceUploader for CasGitSourceStore {
-    fn put_file(&self, blob: &CasBlob, source: &Path) -> Result<()> {
+    fn put_file(&self, blob: &CasBlob, source: &Path, cancelled: &CancellationToken) -> Result<()> {
         let source = File::open(source).context("open Git source upload capability")?;
         let source = duplicate_cloexec(source.as_raw_fd())?;
         let source_path = capability_file_path(source.as_raw_fd());
-        let len = self.with_cas(|cas| cas.put_file_with_hash(&blob.hash, &source_path))?;
+        let len = self.with_cas(|cas| {
+            cas.put_file_with_hash_cooperative(&blob.hash, &source_path, || {
+                cancelled.is_cancelled()
+            })
+        })?;
         if len != blob.len {
             bail!("uploaded Git source child length mismatch")
         }
         Ok(())
     }
-    fn put_bytes(&self, blob: &CasBlob, bytes: &[u8]) -> Result<()> {
+    fn put_bytes(&self, blob: &CasBlob, bytes: &[u8], cancelled: &CancellationToken) -> Result<()> {
+        check_cancelled(cancelled)?;
         if bytes.len() as u64 != blob.len {
             bail!("uploaded Git source root length mismatch")
         }
@@ -668,6 +673,48 @@ pub struct PreparedGitSource {
     root: CasBlob,
     manifest: GitSourceManifest,
 }
+
+#[cfg(test)]
+pub(crate) fn prepared_source_for_registry_test(
+    workspace: &str,
+    repo: &str,
+    commit: &str,
+    pack: CasBlob,
+    index: CasBlob,
+) -> Result<PreparedGitSource> {
+    let object_format = if commit.len() == 40 {
+        GitObjectFormat::Sha1
+    } else {
+        GitObjectFormat::Sha256
+    };
+    let aggregate_pack_bytes = pack
+        .len
+        .checked_add(index.len)
+        .context("test source aggregate overflow")?;
+    let mut manifest = GitSourceManifest {
+        schema_version: GIT_SOURCE_SCHEMA,
+        source_format_version: GIT_SOURCE_FORMAT,
+        layout: GitSourceLayout::ColdComplete,
+        workspace: workspace.into(),
+        repo: repo.into(),
+        commit: commit.into(),
+        object_format,
+        packs: vec![GitPackPair { pack, index }],
+        object_count: 1,
+        object_set_digest: "1".repeat(64),
+        aggregate_pack_bytes,
+        semantic_digest: String::new(),
+    };
+    manifest.semantic_digest = manifest.compute_semantic_digest()?;
+    let bytes = manifest.canonical_bytes()?;
+    Ok(PreparedGitSource {
+        root: CasBlob {
+            hash: hex::encode(Sha256::digest(&bytes)),
+            len: bytes.len() as u64,
+        },
+        manifest,
+    })
+}
 impl PreparedGitSource {
     pub fn root(&self) -> &CasBlob {
         &self.root
@@ -675,6 +722,79 @@ impl PreparedGitSource {
     pub fn manifest(&self) -> &GitSourceManifest {
         &self.manifest
     }
+
+    pub(crate) fn registry_view(&self, limits: &GitSourceLimits) -> Result<GitSourceRegistryView> {
+        self.manifest.validate(limits)?;
+        let root_bytes = self.manifest.canonical_bytes()?;
+        let expected = CasBlob {
+            hash: hex::encode(Sha256::digest(&root_bytes)),
+            len: root_bytes.len() as u64,
+        };
+        if expected != self.root {
+            bail!("prepared Git source root is not the canonical manifest")
+        }
+        let mut members = Vec::with_capacity(self.manifest.packs.len() * 2);
+        for pair in &self.manifest.packs {
+            members.push(GitSourceRegistryMember {
+                ordinal: members.len() as u32,
+                kind: "pack",
+                blob: pair.pack.clone(),
+            });
+            members.push(GitSourceRegistryMember {
+                ordinal: members.len() as u32,
+                kind: "index",
+                blob: pair.index.clone(),
+            });
+        }
+        Ok(GitSourceRegistryView {
+            root: self.root.clone(),
+            root_bytes,
+            workspace: self.manifest.workspace.clone(),
+            repo: self.manifest.repo.clone(),
+            commit: self.manifest.commit.clone(),
+            source_format_version: self.manifest.source_format_version,
+            object_format: self.manifest.object_format.git_name(),
+            semantic_digest: self.manifest.semantic_digest.clone(),
+            object_set_digest: self.manifest.object_set_digest.clone(),
+            object_count: self.manifest.object_count,
+            total_bytes: self.manifest.aggregate_pack_bytes,
+            members,
+        })
+    }
+
+    pub(crate) fn matches_publication(
+        &self,
+        workspace: &str,
+        repo: &str,
+        commit: &str,
+        root: &CasBlob,
+    ) -> bool {
+        self.root == *root
+            && self.manifest.workspace == workspace
+            && self.manifest.repo == repo
+            && self.manifest.commit == commit
+    }
+}
+
+pub(crate) struct GitSourceRegistryMember {
+    pub(crate) ordinal: u32,
+    pub(crate) kind: &'static str,
+    pub(crate) blob: CasBlob,
+}
+
+pub(crate) struct GitSourceRegistryView {
+    pub(crate) root: CasBlob,
+    pub(crate) root_bytes: Vec<u8>,
+    pub(crate) workspace: String,
+    pub(crate) repo: String,
+    pub(crate) commit: String,
+    pub(crate) source_format_version: u32,
+    pub(crate) object_format: &'static str,
+    pub(crate) semantic_digest: String,
+    pub(crate) object_set_digest: String,
+    pub(crate) object_count: u64,
+    pub(crate) total_bytes: u64,
+    pub(crate) members: Vec<GitSourceRegistryMember>,
 }
 
 /// Exact authority minted only after a future registry transaction establishes
@@ -686,6 +806,7 @@ pub struct AuthenticatedGitSource {
     repo: String,
     commit: String,
     object_format: GitObjectFormat,
+    _registry_evidence_mac: Option<[u8; 32]>,
 }
 
 impl AuthenticatedGitSource {
@@ -693,6 +814,29 @@ impl AuthenticatedGitSource {
     /// registry row. This function does not perform or pretend to perform that
     /// transaction; the future registry adapter owns that responsibility.
     pub(crate) fn from_registry_record(
+        record: crate::git_source_registry::GitSourceRegistryRecord,
+    ) -> Result<Self> {
+        let root = record.root().clone();
+        let workspace = record.workspace().to_owned();
+        let repo = record.repo().to_owned();
+        let commit = record.commit().to_owned();
+        let object_format = record.object_format();
+        let registry_evidence_mac = Some(*record.evidence_mac());
+        validate_blob(&root, u64::MAX)?;
+        validate_identity(&workspace, "workspace")?;
+        validate_identity(&repo, "repo")?;
+        validate_oid(&commit, object_format)?;
+        Ok(Self {
+            root,
+            workspace,
+            repo,
+            commit,
+            object_format,
+            _registry_evidence_mac: registry_evidence_mac,
+        })
+    }
+
+    fn from_local_verification(
         root: CasBlob,
         workspace: String,
         repo: String,
@@ -709,6 +853,7 @@ impl AuthenticatedGitSource {
             repo,
             commit,
             object_format,
+            _registry_evidence_mac: None,
         })
     }
 }
@@ -735,7 +880,21 @@ impl<'a, U: GitSourceUploader> GitSourcePackager<'a, U> {
         }
     }
 
+    #[cfg(test)]
     pub fn prepare(
+        &self,
+        source: TrustedProviderFetch,
+        cancelled: &CancellationToken,
+    ) -> Result<PreparedGitSource> {
+        let prepared = self.prepare_local(source, cancelled)?;
+        self.publish_unchecked(&prepared, cancelled)?;
+        Ok(prepared)
+    }
+
+    /// Build and fully verify the immutable source graph in local CAS. No
+    /// durable object is written: callers must first register the returned
+    /// graph as a provisional GC root, then call [`Self::publish_prepared`].
+    pub fn prepare_local(
         &self,
         source: TrustedProviderFetch,
         cancelled: &CancellationToken,
@@ -824,18 +983,52 @@ impl<'a, U: GitSourceUploader> GitSourcePackager<'a, U> {
             hash: hex::encode(Sha256::digest(&root_bytes)),
             len: root_bytes.len() as u64,
         };
-        // Publication order is a safety property: every child, then the sole root.
-        for pair in &manifest.packs {
-            check_cancelled(cancelled)?;
-            self.uploader
-                .put_file(&pair.pack, &local_cas.path(&pair.pack.hash))?;
-            self.uploader
-                .put_file(&pair.index, &local_cas.path(&pair.index.hash))?;
-        }
-        check_cancelled(cancelled)?;
-        self.uploader.put_bytes(&root, &root_bytes)?;
         scope.finish()?;
         Ok(PreparedGitSource { root, manifest })
+    }
+
+    /// Publish an already-protected provisional graph. Publication order is a
+    /// safety property: every child is durable before the sole root.
+    pub(crate) fn publish_prepared(
+        &self,
+        prepared: &PreparedGitSource,
+        permit: &crate::git_source_registry::GitSourcePublicationPermit,
+        cancelled: &CancellationToken,
+    ) -> Result<()> {
+        permit.validate(prepared)?;
+        self.publish_unchecked(prepared, cancelled)
+    }
+
+    fn publish_unchecked(
+        &self,
+        prepared: &PreparedGitSource,
+        cancelled: &CancellationToken,
+    ) -> Result<()> {
+        let local_cas = Cas::new(
+            self.local_cas
+                .root()
+                .canonicalize()
+                .context("canonicalize local Git source CAS")?,
+        )?;
+        let root_bytes = prepared.manifest.canonical_bytes()?;
+        let expected_root = CasBlob {
+            hash: hex::encode(Sha256::digest(&root_bytes)),
+            len: root_bytes.len() as u64,
+        };
+        if expected_root != prepared.root {
+            bail!("prepared Git source root is not canonical")
+        }
+        for pair in &prepared.manifest.packs {
+            check_cancelled(cancelled)?;
+            self.uploader
+                .put_file(&pair.pack, &local_cas.path(&pair.pack.hash), cancelled)?;
+            self.uploader
+                .put_file(&pair.index, &local_cas.path(&pair.index.hash), cancelled)?;
+        }
+        check_cancelled(cancelled)?;
+        self.uploader
+            .put_bytes(&prepared.root, &root_bytes, cancelled)?;
+        Ok(())
     }
 }
 
@@ -984,7 +1177,7 @@ fn verify_local_manifest(
     // only a CAS write: without `AuthenticatedGitSource` from the registry it
     // conveys no authority, and all pack/index children already exist locally.
     cas.put_with_hash(&prepared.root.hash, &root_bytes)?;
-    let auth = AuthenticatedGitSource::from_registry_record(
+    let auth = AuthenticatedGitSource::from_local_verification(
         prepared.root.clone(),
         manifest.workspace.clone(),
         manifest.repo.clone(),
@@ -1790,7 +1983,13 @@ mod tests {
     }
 
     impl GitSourceUploader for MemoryStore {
-        fn put_file(&self, blob: &CasBlob, source: &Path) -> Result<()> {
+        fn put_file(
+            &self,
+            blob: &CasBlob,
+            source: &Path,
+            cancelled: &CancellationToken,
+        ) -> Result<()> {
+            check_cancelled(cancelled)?;
             let mut remaining = self.fail_file_after.lock().unwrap();
             if let Some(value) = remaining.as_mut() {
                 if *value == 0 {
@@ -1812,7 +2011,13 @@ mod tests {
             Ok(())
         }
 
-        fn put_bytes(&self, blob: &CasBlob, bytes: &[u8]) -> Result<()> {
+        fn put_bytes(
+            &self,
+            blob: &CasBlob,
+            bytes: &[u8],
+            cancelled: &CancellationToken,
+        ) -> Result<()> {
+            check_cancelled(cancelled)?;
             verify_bytes(blob, bytes)?;
             self.objects
                 .lock()
@@ -2018,7 +2223,7 @@ mod tests {
             GitSourcePackager::new(&cas, &store, scratch.path(), GitSourceLimits::default())
                 .prepare(fetch, &CancellationToken::new())
                 .unwrap();
-        let auth = AuthenticatedGitSource::from_registry_record(
+        let auth = AuthenticatedGitSource::from_local_verification(
             prepared.root.clone(),
             prepared.manifest.workspace.clone(),
             prepared.manifest.repo.clone(),
@@ -2212,7 +2417,9 @@ mod tests {
             hash: hex::encode(Sha256::digest(first_bytes)),
             len: first_bytes.len() as u64,
         };
-        store.put_bytes(&first, first_bytes).unwrap();
+        store
+            .put_bytes(&first, first_bytes, &CancellationToken::new())
+            .unwrap();
 
         let physical = parent.path().join("physical");
         std::fs::rename(&configured, &physical).unwrap();
@@ -2226,7 +2433,9 @@ mod tests {
         };
         let clone = store.clone();
         drop(store);
-        clone.put_bytes(&second, second_bytes).unwrap();
+        clone
+            .put_bytes(&second, second_bytes, &CancellationToken::new())
+            .unwrap();
         let token = CancellationToken::new();
         assert_eq!(clone.load_bytes(&first, 1024, &token).unwrap(), first_bytes);
         let worker_blob = second.clone();
@@ -2528,7 +2737,7 @@ mod tests {
         );
         drop(local);
         drop(local_dir);
-        let authority = AuthenticatedGitSource::from_registry_record(
+        let authority = AuthenticatedGitSource::from_local_verification(
             prepared.root.clone(),
             prepared.manifest.workspace.clone(),
             prepared.manifest.repo.clone(),
@@ -2604,7 +2813,7 @@ mod tests {
             GitSourcePackager::new(&local, &remote, scratch.path(), GitSourceLimits::default())
                 .prepare(fetch, &CancellationToken::new())
                 .unwrap();
-        let authority = AuthenticatedGitSource::from_registry_record(
+        let authority = AuthenticatedGitSource::from_local_verification(
             prepared.root.clone(),
             prepared.manifest.workspace.clone(),
             prepared.manifest.repo.clone(),
@@ -2649,7 +2858,7 @@ mod tests {
             GitSourcePackager::new(&local, &remote, scratch.path(), GitSourceLimits::default())
                 .prepare(fetch, &CancellationToken::new())
                 .unwrap();
-        let wrong_identity = AuthenticatedGitSource::from_registry_record(
+        let wrong_identity = AuthenticatedGitSource::from_local_verification(
             prepared.root.clone(),
             "another-workspace".into(),
             prepared.manifest.repo.clone(),
@@ -2672,8 +2881,10 @@ mod tests {
             hash: hex::encode(Sha256::digest(&bytes)),
             len: bytes.len() as u64,
         };
-        remote.put_bytes(&root, &bytes).unwrap();
-        let swapped_authority = AuthenticatedGitSource::from_registry_record(
+        remote
+            .put_bytes(&root, &bytes, &CancellationToken::new())
+            .unwrap();
+        let swapped_authority = AuthenticatedGitSource::from_local_verification(
             root,
             swapped.workspace.clone(),
             swapped.repo.clone(),
@@ -2719,8 +2930,10 @@ mod tests {
             hash: hex::encode(Sha256::digest(&bytes)),
             len: bytes.len() as u64,
         };
-        remote.put_bytes(&root, &bytes).unwrap();
-        let authority = AuthenticatedGitSource::from_registry_record(
+        remote
+            .put_bytes(&root, &bytes, &CancellationToken::new())
+            .unwrap();
+        let authority = AuthenticatedGitSource::from_local_verification(
             root,
             incomplete.workspace.clone(),
             incomplete.repo.clone(),
@@ -2760,7 +2973,7 @@ mod tests {
             GitSourcePackager::new(&local, &remote, scratch.path(), GitSourceLimits::default())
                 .prepare(canonical_fetch, &CancellationToken::new())
                 .unwrap();
-        let canonical_authority = AuthenticatedGitSource::from_registry_record(
+        let canonical_authority = AuthenticatedGitSource::from_local_verification(
             canonical.root.clone(),
             "workspace".into(),
             "repository".into(),
@@ -2844,9 +3057,15 @@ mod tests {
                 len: thin_index_bytes.len() as u64,
             },
         };
-        remote.put_bytes(&thin_pair.pack, &thin_pack_bytes).unwrap();
         remote
-            .put_bytes(&thin_pair.index, &thin_index_bytes)
+            .put_bytes(&thin_pair.pack, &thin_pack_bytes, &CancellationToken::new())
+            .unwrap();
+        remote
+            .put_bytes(
+                &thin_pair.index,
+                &thin_index_bytes,
+                &CancellationToken::new(),
+            )
             .unwrap();
         let inventory_scratch = tempfile::tempdir().unwrap();
         let inventory = enumerate_closure(
@@ -2884,8 +3103,10 @@ mod tests {
             hash: hex::encode(Sha256::digest(&root_bytes)),
             len: root_bytes.len() as u64,
         };
-        remote.put_bytes(&root, &root_bytes).unwrap();
-        let authority = AuthenticatedGitSource::from_registry_record(
+        remote
+            .put_bytes(&root, &root_bytes, &CancellationToken::new())
+            .unwrap();
+        let authority = AuthenticatedGitSource::from_local_verification(
             root,
             "workspace".into(),
             "repository".into(),
@@ -2919,7 +3140,7 @@ mod tests {
             GitSourcePackager::new(&local, &remote, scratch.path(), GitSourceLimits::default())
                 .prepare(fetch, &CancellationToken::new())
                 .unwrap();
-        let authority = AuthenticatedGitSource::from_registry_record(
+        let authority = AuthenticatedGitSource::from_local_verification(
             prepared.root.clone(),
             prepared.manifest.workspace.clone(),
             prepared.manifest.repo.clone(),

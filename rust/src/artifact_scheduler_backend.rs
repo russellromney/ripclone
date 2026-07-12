@@ -68,6 +68,14 @@ impl OwnedArtifactBuild {
     }
 }
 
+#[cfg(test)]
+mod source_gc_default_tests {
+    #[test]
+    fn unsupported_backend_source_page_fails_closed() {
+        assert!(super::unsupported_source_gc_page::<super::SchedulerGcRoot>().is_err());
+    }
+}
+
 /// Durable request-scoped capability root. The canonical root manifest owns
 /// the delegated child list; persistence stores only identity and expiry so
 /// GC and authorization never diverge from authenticated manifest semantics.
@@ -86,6 +94,10 @@ pub struct SchedulerGcRoot {
     pub manifest: String,
 }
 pub const TRANSPORT_ROOT_PAGE_MAX: u32 = 512;
+
+pub(crate) fn unsupported_source_gc_page<T>() -> Result<Vec<T>> {
+    bail!("Git source GC roots are not implemented by this scheduler backend")
+}
 
 #[async_trait]
 pub trait GcDeleteFence: Send {
@@ -209,6 +221,14 @@ pub trait ArtifactSchedulerPersistence: Send + Sync {
     ) -> Result<Vec<SchedulerGcRoot>> {
         let _ = (after_artifact_id, limit);
         bail!("scheduler GC roots are not implemented by this scheduler backend")
+    }
+    async fn live_source_objects_page(
+        &self,
+        after: Option<(&str, &str)>,
+        limit: u32,
+    ) -> Result<Vec<crate::git_source_registry::SourceGcObject>> {
+        let _ = (after, limit);
+        unsupported_source_gc_page()
     }
     async fn schedule(&self, key: &ArtifactKey) -> Result<ScheduleOutcome>;
     async fn subscribe_consumer(
@@ -818,6 +838,13 @@ impl ArtifactSchedulerPersistence for crate::artifact_scheduler::ArtifactSchedul
         limit: u32,
     ) -> Result<Vec<SchedulerGcRoot>> {
         self.live_scheduler_roots_page(after, limit).await
+    }
+    async fn live_source_objects_page(
+        &self,
+        after: Option<(&str, &str)>,
+        limit: u32,
+    ) -> Result<Vec<crate::git_source_registry::SourceGcObject>> {
+        self.live_source_objects_page(after, limit).await
     }
     async fn schedule(&self, key: &ArtifactKey) -> Result<ScheduleOutcome> {
         self.schedule(key).await

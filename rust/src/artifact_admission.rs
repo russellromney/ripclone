@@ -2422,7 +2422,18 @@ CREATE TABLE ready_publication_fence_members(
             .unwrap();
         let pool = sqlx::SqlitePool::connect(&f.db_url).await.unwrap();
         sqlx::raw_sql(
-            "DROP TABLE ready_publication_fence_members;
+            "DROP TABLE artifact_intents;
+             DROP TABLE branch_source_current;
+             DROP TABLE branch_source_generations;
+             DROP TABLE git_source_consumers;
+             DROP TABLE git_source_desires;
+             DROP TABLE git_source_acquisition_members;
+             DROP TABLE git_source_acquisitions;
+             DROP TABLE git_source_acquisition_sequence;
+             DROP TABLE git_source_maintenance;
+             DROP TABLE git_source_members;
+             DROP TABLE git_source_roots;
+             DROP TABLE ready_publication_fence_members;
              DROP TABLE ready_publication_fences;
              DROP TABLE ready_publication_fence_sequence;
              DROP TABLE artifact_base_retention;
@@ -2448,7 +2459,7 @@ CREATE TABLE ready_publication_fence_members(
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
                 "SELECT generation FROM ready_publication_fence_sequence WHERE id=1",

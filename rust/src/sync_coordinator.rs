@@ -70,11 +70,57 @@ pub struct BranchSyncRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DurableSourceSnapshot {
-    pub workspace: String,
-    pub repo: String,
-    pub commit: String,
+    workspace: String,
+    repo: String,
+    commit: String,
     /// CAS identity of the authenticated immutable source root.
-    pub manifest: String,
+    manifest: String,
+    registration_token: String,
+    registration_generation: u64,
+}
+
+impl DurableSourceSnapshot {
+    pub(crate) fn registered(
+        workspace: String,
+        repo: String,
+        commit: String,
+        manifest: String,
+        registration_token: String,
+        registration_generation: u64,
+    ) -> Result<Self> {
+        crate::artifact_scheduler::validate_canonical_commit_oid(&commit)?;
+        crate::cas::Cas::validate_artifact_id(&manifest)?;
+        crate::cas::Cas::validate_artifact_id(&registration_token)?;
+        if workspace.trim().is_empty() || repo.trim().is_empty() || registration_generation == 0 {
+            bail!("registered source capability identity is invalid")
+        }
+        Ok(Self {
+            workspace,
+            repo,
+            commit,
+            manifest,
+            registration_token,
+            registration_generation,
+        })
+    }
+    pub fn workspace(&self) -> &str {
+        &self.workspace
+    }
+    pub fn repo(&self) -> &str {
+        &self.repo
+    }
+    pub fn commit(&self) -> &str {
+        &self.commit
+    }
+    pub fn manifest(&self) -> &str {
+        &self.manifest
+    }
+    pub(crate) fn registration_token(&self) -> &str {
+        &self.registration_token
+    }
+    pub(crate) fn registration_generation(&self) -> u64 {
+        self.registration_generation
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,6 +134,24 @@ pub enum BranchSyncOutcome {
         generation: u64,
         artifacts: Vec<(ArtifactKind, ArtifactIntentOutcome)>,
     },
+    SourceDeferred {
+        commit: String,
+    },
+    SourceActivationUnknown {
+        commit: String,
+    },
+    SourceFailed {
+        commit: String,
+        class: FailureClass,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DurableSourceAcquireOutcome {
+    Ready(DurableSourceSnapshot),
+    Deferred,
+    ActivationUnknown,
+    Failed(FailureClass),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,7 +200,8 @@ pub trait DurableSourceAcquirer: Send + Sync {
         workspace: &str,
         repo: &str,
         commit: &str,
-    ) -> Result<DurableSourceSnapshot>;
+        intent: SyncIntent,
+    ) -> Result<DurableSourceAcquireOutcome>;
 }
 
 #[async_trait]
@@ -212,11 +277,23 @@ where
                 return Ok(BranchSyncOutcome::Unchanged { commit, generation });
             }
 
-            let source = self
+            let source = match self
                 .sources
-                .acquire_exact(&request.workspace, &request.repo, &commit)
+                .acquire_exact(&request.workspace, &request.repo, &commit, request.intent)
                 .await
-                .context("publish durable source snapshot")?;
+                .context("publish durable source snapshot")?
+            {
+                DurableSourceAcquireOutcome::Ready(source) => source,
+                DurableSourceAcquireOutcome::Deferred => {
+                    return Ok(BranchSyncOutcome::SourceDeferred { commit });
+                }
+                DurableSourceAcquireOutcome::ActivationUnknown => {
+                    return Ok(BranchSyncOutcome::SourceActivationUnknown { commit });
+                }
+                DurableSourceAcquireOutcome::Failed(class) => {
+                    return Ok(BranchSyncOutcome::SourceFailed { commit, class });
+                }
+            };
             validate_source_identity(request, &commit, &source)?;
             match self
                 .observations
@@ -269,10 +346,10 @@ fn validate_source_identity(
     commit: &str,
     source: &DurableSourceSnapshot,
 ) -> Result<()> {
-    if source.workspace != request.workspace
-        || source.repo != request.repo
-        || source.commit != commit
-        || source.manifest.trim().is_empty()
+    if source.workspace() != request.workspace
+        || source.repo() != request.repo
+        || source.commit() != commit
+        || source.manifest().trim().is_empty()
     {
         bail!("durable source snapshot identity does not match resolved target")
     }
@@ -320,18 +397,23 @@ mod tests {
             workspace: &str,
             repo: &str,
             commit: &str,
-        ) -> Result<DurableSourceSnapshot> {
+            _intent: SyncIntent,
+        ) -> Result<DurableSourceAcquireOutcome> {
             self.calls.lock().unwrap().push(commit.to_owned());
             if *self.fail.lock().unwrap() {
                 bail!("source unavailable")
             }
             let wrong = *self.wrong_identity.lock().unwrap();
-            Ok(DurableSourceSnapshot {
-                workspace: if wrong { "other" } else { workspace }.to_owned(),
-                repo: repo.to_owned(),
-                commit: commit.to_owned(),
-                manifest: format!("source-{commit}"),
-            })
+            Ok(DurableSourceAcquireOutcome::Ready(
+                DurableSourceSnapshot::registered(
+                    if wrong { "other" } else { workspace }.to_owned(),
+                    repo.to_owned(),
+                    commit.to_owned(),
+                    "a".repeat(64),
+                    "b".repeat(64),
+                    1,
+                )?,
+            ))
         }
     }
 

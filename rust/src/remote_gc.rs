@@ -693,6 +693,26 @@ pub(crate) async fn collect_live_normalized_hashes(
     let Some(scheduler) = scheduler else {
         return Ok(());
     };
+    let mut source_cursor: Option<(String, String)> = None;
+    loop {
+        let page = scheduler
+            .live_source_objects_page(
+                source_cursor
+                    .as_ref()
+                    .map(|(hash, owner)| (hash.as_str(), owner.as_str())),
+                crate::git_source_registry::SOURCE_ROOT_PAGE_MAX,
+            )
+            .await?;
+        if page.is_empty() {
+            break;
+        }
+        reachable.extend(page.iter().map(|object| object.hash.clone()));
+        let last = page.last().expect("nonempty source GC page");
+        source_cursor = Some((last.hash.clone(), last.owner.clone()));
+        if page.len() < crate::git_source_registry::SOURCE_ROOT_PAGE_MAX as usize {
+            break;
+        }
+    }
     collect_live_scheduler_hashes(scheduler, storage, reachable).await?;
     let mut cursor: Option<(String, String)> = None;
     let mut parsed_roots = HashSet::new();

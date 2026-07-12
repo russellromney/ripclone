@@ -177,6 +177,15 @@ impl Cas {
     }
 
     pub fn put_file_with_hash<P: AsRef<Path>>(&self, hash: &str, source: P) -> Result<u64> {
+        self.put_file_with_hash_cooperative(hash, source, || false)
+    }
+
+    pub fn put_file_with_hash_cooperative<P: AsRef<Path>>(
+        &self,
+        hash: &str,
+        source: P,
+        mut cancelled: impl FnMut() -> bool,
+    ) -> Result<u64> {
         let source = source.as_ref();
         let meta = std::fs::metadata(source)
             .with_context(|| format!("stat CAS source file {}", source.display()))?;
@@ -198,6 +207,9 @@ impl Cas {
         let mut buf = vec![0u8; 1024 * 1024];
         let write_start = Instant::now();
         loop {
+            if cancelled() {
+                anyhow::bail!("CAS source publication cancelled");
+            }
             let n = input
                 .read(&mut buf)
                 .with_context(|| format!("read CAS source file {}", source.display()))?;
@@ -208,6 +220,9 @@ impl Cas {
             tmp.as_file_mut()
                 .write_all(&buf[..n])
                 .context("write CAS temp file")?;
+        }
+        if cancelled() {
+            anyhow::bail!("CAS source publication cancelled");
         }
         crate::perf::record_cas_write(write_start.elapsed(), len);
         let actual = hasher.finalize_hex();
