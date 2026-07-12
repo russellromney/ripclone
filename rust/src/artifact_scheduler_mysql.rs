@@ -143,10 +143,23 @@ async fn preflight_mysql_schema(connection: &mut MySqlConnection, version: i64) 
     Ok(())
 }
 
-async fn preflight_mysql_transition(connection: &mut MySqlConnection) -> Result<()> {
-    let core:i64=sqlx::query_scalar("SELECT count(*) FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name IN('artifact_scheduler_schema','artifact_jobs','branch_observations','artifact_observations','artifact_consumers','artifact_transport_leases','scheduler_state')").fetch_one(&mut *connection).await?;
-    if core != 7 {
-        bail!("mysql transitional migration is missing core v2 tables")
+async fn preflight_mysql_transition(connection: &mut MySqlConnection, version: i64) -> Result<()> {
+    let core:i64=sqlx::query_scalar("SELECT count(*) FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name IN('artifact_scheduler_schema','artifact_jobs','branch_observations','artifact_observations','artifact_consumers','scheduler_state')").fetch_one(&mut *connection).await?;
+    if core != 6 {
+        bail!("mysql transitional migration is missing core v1 tables")
+    }
+    let transport_exists:i64=sqlx::query_scalar("SELECT count(*) FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name='artifact_transport_leases'").fetch_one(&mut *connection).await?;
+    if version == V2_TO_V4_TRANSITION && transport_exists != 1 {
+        bail!("mysql v2 transition is missing transport leases")
+    }
+    if transport_exists == 1 {
+        let columns:i64=sqlx::query_scalar("SELECT count(*) FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name='artifact_transport_leases'").fetch_one(&mut *connection).await?;
+        let indexes:i64=sqlx::query_scalar("SELECT count(DISTINCT index_name) FROM information_schema.statistics WHERE table_schema=DATABASE() AND table_name='artifact_transport_leases'").fetch_one(&mut *connection).await?;
+        let constraints:i64=sqlx::query_scalar("SELECT count(*) FROM information_schema.table_constraints WHERE constraint_schema=DATABASE() AND table_name='artifact_transport_leases' AND constraint_type='PRIMARY KEY'").fetch_one(&mut *connection).await?;
+        let expiry:i64=sqlx::query_scalar("SELECT count(*) FROM information_schema.statistics WHERE table_schema=DATABASE() AND table_name='artifact_transport_leases' AND index_name='artifact_transport_leases_expiry' AND column_name='expires_at' AND seq_in_index=1").fetch_one(&mut *connection).await?;
+        if columns != 5 || indexes != 2 || constraints != 1 || expiry != 1 {
+            bail!("mysql transitional transport table is malformed")
+        }
     }
     let base_exists:i64=sqlx::query_scalar("SELECT count(*) FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name='artifact_base_retention'").fetch_one(&mut *connection).await?;
     if base_exists == 1 {
@@ -207,7 +220,7 @@ impl MysqlArtifactScheduler {
                 if version > SCHEMA_VERSION && ![V1_TO_V4_TRANSITION,V2_TO_V4_TRANSITION].contains(&version) { bail!("artifact scheduler database is newer than this binary") }
                 if ![1,2,3,SCHEMA_VERSION,V1_TO_V4_TRANSITION,V2_TO_V4_TRANSITION].contains(&version) { bail!("unsupported mysql artifact scheduler schema {version}") }
                 if [V1_TO_V4_TRANSITION,V2_TO_V4_TRANSITION].contains(&version) {
-                    preflight_mysql_transition(&mut connection).await?;
+                    preflight_mysql_transition(&mut connection, version).await?;
                 } else {
                     preflight_mysql_schema(&mut connection,version).await?;
                 }
@@ -3361,6 +3374,110 @@ mod tests {
                     ("head".into(), Some(1), Some(1))
                 ],
                 "full backfill mismatch after {stage}"
+            );
+        }
+
+        for stage in [
+            "marker_only",
+            "transport_only",
+            "base_only",
+            "both_empty",
+            "partial",
+            "full",
+        ] {
+            reset(&control).await;
+            for (index, statement) in SCHEMA.iter().enumerate() {
+                if ![5, 6, 7].contains(&index) {
+                    sqlx::raw_sql(*statement).execute(&control).await.unwrap();
+                }
+            }
+            sqlx::query("INSERT INTO artifact_scheduler_schema(id,version) VALUES(1,?)")
+                .bind(V1_TO_V4_TRANSITION)
+                .execute(&control)
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO scheduler_state(id,fairness_cursor,config_fingerprint) VALUES(1,0,?)",
+            )
+            .bind(scheduler_fingerprint(
+                &Default::default(),
+                "mysql-live-conformance-v1",
+            ))
+            .execute(&control)
+            .await
+            .unwrap();
+            for (kind, manifest) in [("head", "c".repeat(64)), ("full_history", "d".repeat(64))] {
+                sqlx::query("INSERT INTO artifact_jobs(workspace,repo,commit_oid,kind,format_version,state,lease_generation,claim_attempts,retry_count,manifest,created_at,updated_at) VALUES('ws','owner/repo','v1-crash-base',?,1,'ready',0,0,0,?,1,1)").bind(kind).bind(manifest).execute(&control).await.unwrap();
+            }
+            if stage != "marker_only" {
+                sqlx::raw_sql(SCHEMA[5]).execute(&control).await.unwrap();
+            }
+            if !["marker_only", "transport_only"].contains(&stage) {
+                sqlx::raw_sql(SCHEMA[6]).execute(&control).await.unwrap();
+            }
+            if !["marker_only", "transport_only", "base_only"].contains(&stage) {
+                sqlx::raw_sql(SCHEMA[7]).execute(&control).await.unwrap();
+            }
+            if stage == "partial" || stage == "full" {
+                let head_id: i64 =
+                    sqlx::query_scalar("SELECT id FROM artifact_jobs WHERE kind='head'")
+                        .fetch_one(&control)
+                        .await
+                        .unwrap();
+                sqlx::query("INSERT INTO artifact_base_retention(artifact_id,workspace,repo,format_version,head_rank,pair_rank) VALUES(?,'ws','owner/repo',1,8,NULL)").bind(head_id).execute(&control).await.unwrap();
+                if stage == "full" {
+                    let history_id: i64 = sqlx::query_scalar(
+                        "SELECT id FROM artifact_jobs WHERE kind='full_history'",
+                    )
+                    .fetch_one(&control)
+                    .await
+                    .unwrap();
+                    sqlx::query("UPDATE artifact_base_retention SET head_rank=1,pair_rank=1 WHERE artifact_id=?").bind(head_id).execute(&control).await.unwrap();
+                    sqlx::query("INSERT INTO artifact_base_retention(artifact_id,workspace,repo,format_version,head_rank,pair_rank) VALUES(?,'ws','owner/repo',1,NULL,1)").bind(history_id).execute(&control).await.unwrap();
+                }
+            }
+            let first_pool = MySqlPoolOptions::new()
+                .max_connections(8)
+                .connect(&url)
+                .await
+                .unwrap();
+            let second_pool = MySqlPoolOptions::new()
+                .max_connections(8)
+                .connect(&url)
+                .await
+                .unwrap();
+            let (first, second) = tokio::join!(
+                MysqlArtifactScheduler::from_pool(first_pool, Default::default(), Arc::new(Accept)),
+                MysqlArtifactScheduler::from_pool(
+                    second_pool,
+                    Default::default(),
+                    Arc::new(Accept)
+                )
+            );
+            assert!(
+                first.is_ok() && second.is_ok(),
+                "concurrent v1 transition resume failed at {stage}: {:?} / {:?}",
+                first.err(),
+                second.err()
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT version FROM artifact_scheduler_schema WHERE id=1"
+                )
+                .fetch_one(&control)
+                .await
+                .unwrap(),
+                4
+            );
+            assert_eq!(sqlx::query_scalar::<_,i64>("SELECT count(*) FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name='artifact_transport_leases'").fetch_one(&control).await.unwrap(),1);
+            let rows:Vec<(String,Option<i16>,Option<i16>)>=sqlx::query_as("SELECT j.kind,r.head_rank,r.pair_rank FROM artifact_base_retention r JOIN artifact_jobs j ON j.id=r.artifact_id ORDER BY j.kind").fetch_all(&control).await.unwrap();
+            assert_eq!(
+                rows,
+                vec![
+                    ("full_history".into(), None, Some(1)),
+                    ("head".into(), Some(1), Some(1))
+                ],
+                "v1 full backfill mismatch after {stage}"
             );
         }
 
