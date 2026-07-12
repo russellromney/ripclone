@@ -7,7 +7,8 @@
 use crate::artifact_scheduler::{
     ArtifactKey, ArtifactKind, ArtifactRecord, ArtifactState, ClaimedArtifact, CompletionEvidence,
     CompletionVerifier, FailureClass, ObservationOutcome, RetryOutcome, ScheduleOutcome,
-    SchedulerLimits, scheduler_fingerprint, validate_evidence, validate_lease, validate_limits,
+    SchedulerLimits, scheduler_fingerprint, validate_evidence, validate_format_version,
+    validate_lease, validate_limits,
 };
 use crate::artifact_scheduler_backend::ArtifactSchedulerPersistence;
 use anyhow::{Context, Result, bail};
@@ -152,6 +153,59 @@ impl PostgresArtifactScheduler {
         if missing_columns != 0 {
             bail!("postgres artifact scheduler schema is missing required columns")
         }
+        let invalid_column_shape: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM information_schema.columns c
+             WHERE c.table_schema=current_schema() AND c.table_name IN(
+               'artifact_scheduler_schema','artifact_jobs','branch_observations',
+               'artifact_observations','artifact_consumers','scheduler_state') AND (
+               c.data_type <> CASE
+                 WHEN c.table_name IN('artifact_scheduler_schema','scheduler_state')
+                      AND c.column_name='id' THEN 'smallint'
+                 WHEN (c.table_name='artifact_scheduler_schema' AND c.column_name='version')
+                   OR (c.table_name='artifact_jobs' AND c.column_name IN(
+                     'id','format_version','heartbeat_at','lease_expires_at','lease_generation',
+                     'claim_attempts','retry_count','created_at','updated_at'))
+                   OR (c.table_name='branch_observations' AND c.column_name IN('generation','updated_at'))
+                   OR (c.table_name='artifact_observations' AND c.column_name IN(
+                     'desired_artifact_id','desired_generation','published_artifact_id',
+                     'format_version','observed_at'))
+                   OR (c.table_name='artifact_consumers' AND c.column_name IN('artifact_id','expires_at'))
+                   OR (c.table_name='scheduler_state' AND c.column_name='fairness_cursor')
+                   THEN 'bigint' ELSE 'text' END
+               OR c.is_nullable <> CASE
+                 WHEN c.table_name='artifact_jobs' AND c.column_name IN(
+                   'owner','heartbeat_at','lease_expires_at','manifest','error','failure_class')
+                   THEN 'YES'
+                 WHEN c.table_name='artifact_observations' AND c.column_name='published_artifact_id'
+                   THEN 'YES' ELSE 'NO' END
+               OR (c.table_name='artifact_jobs' AND c.column_name='id'
+                   AND c.column_default <> $d$nextval('artifact_jobs_id_seq'::regclass)$d$)
+               OR (c.table_name='artifact_jobs' AND c.column_name IN(
+                     'lease_generation','claim_attempts','retry_count')
+                   AND c.column_default <> '0')
+               OR (c.table_name='scheduler_state' AND c.column_name IN(
+                     'workspace_cursor','config_fingerprint')
+                   AND c.column_default <> $d$''::text$d$)
+               OR (NOT (
+                     (c.table_name='artifact_jobs' AND c.column_name IN(
+                       'id','lease_generation','claim_attempts','retry_count'))
+                     OR (c.table_name='scheduler_state' AND c.column_name IN(
+                       'workspace_cursor','config_fingerprint')))
+                   AND c.column_default IS NOT NULL))",
+        )
+        .fetch_one(&mut *migration)
+        .await?;
+        let scheduler_column_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM information_schema.columns
+             WHERE table_schema=current_schema() AND table_name IN(
+               'artifact_scheduler_schema','artifact_jobs','branch_observations',
+               'artifact_observations','artifact_consumers','scheduler_state')",
+        )
+        .fetch_one(&mut *migration)
+        .await?;
+        if invalid_column_shape != 0 || scheduler_column_count != 43 {
+            bail!("postgres artifact scheduler column shape differs from schema version")
+        }
         let required_constraints: i64 = sqlx::query_scalar(
             "WITH expected(table_name,constraint_name,constraint_type) AS (VALUES
               ('artifact_scheduler_schema','artifact_scheduler_schema_pkey','p'),
@@ -185,6 +239,69 @@ impl PostgresArtifactScheduler {
         if required_constraints != 20 {
             bail!("postgres artifact scheduler schema is missing required constraints")
         }
+        let invalid_constraint_definitions: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_constraint c JOIN pg_class r ON r.oid=c.conrelid
+             JOIN pg_namespace n ON n.oid=r.relnamespace
+             WHERE n.nspname=current_schema() AND (
+               (c.conname='artifact_scheduler_schema_pkey' AND pg_get_constraintdef(c.oid)<>'PRIMARY KEY (id)')
+               OR (c.conname='artifact_scheduler_schema_singleton' AND pg_get_constraintdef(c.oid) NOT ILIKE '%id%1%')
+               OR (c.conname='artifact_jobs_pkey' AND pg_get_constraintdef(c.oid)<>'PRIMARY KEY (id)')
+               OR (c.conname='artifact_jobs_identity' AND pg_get_constraintdef(c.oid)<>'UNIQUE (workspace, repo, commit_oid, kind, format_version)')
+               OR (c.conname='artifact_jobs_format' AND NOT (pg_get_constraintdef(c.oid) ILIKE '%format_version%' AND pg_get_constraintdef(c.oid) LIKE '%4294967295%'))
+               OR (c.conname='artifact_jobs_state' AND NOT (pg_get_constraintdef(c.oid) ILIKE '%state%' AND pg_get_constraintdef(c.oid) ILIKE '%queued%' AND pg_get_constraintdef(c.oid) ILIKE '%running%' AND pg_get_constraintdef(c.oid) ILIKE '%ready%' AND pg_get_constraintdef(c.oid) ILIKE '%failed%'))
+               OR (c.conname='artifact_jobs_kind' AND NOT (pg_get_constraintdef(c.oid) ILIKE '%kind%' AND pg_get_constraintdef(c.oid) ILIKE '%head%' AND pg_get_constraintdef(c.oid) ILIKE '%full_history%' AND pg_get_constraintdef(c.oid) ILIKE '%files%'))
+               OR (c.conname='artifact_jobs_lease_generation' AND pg_get_constraintdef(c.oid) NOT ILIKE '%lease_generation%')
+               OR (c.conname='artifact_jobs_claim_attempts' AND NOT (pg_get_constraintdef(c.oid) ILIKE '%claim_attempts%' AND pg_get_constraintdef(c.oid) LIKE '%4294967295%'))
+               OR (c.conname='artifact_jobs_retry_count' AND NOT (pg_get_constraintdef(c.oid) ILIKE '%retry_count%' AND pg_get_constraintdef(c.oid) LIKE '%4294967295%'))
+               OR (c.conname='artifact_jobs_failure_class' AND NOT (pg_get_constraintdef(c.oid) ILIKE '%failure_class%' AND pg_get_constraintdef(c.oid) ILIKE '%retryable%' AND pg_get_constraintdef(c.oid) ILIKE '%permanent%' AND pg_get_constraintdef(c.oid) ILIKE '%dead_letter%'))
+               OR (c.conname='branch_observations_pkey' AND pg_get_constraintdef(c.oid)<>'PRIMARY KEY (workspace, repo, branch)')
+               OR (c.conname='branch_observations_generation' AND pg_get_constraintdef(c.oid) NOT ILIKE '%generation%')
+               OR (c.conname='artifact_observations_pkey' AND pg_get_constraintdef(c.oid)<>'PRIMARY KEY (workspace, repo, branch, kind)')
+               OR (c.conname='artifact_observations_generation' AND pg_get_constraintdef(c.oid) NOT ILIKE '%desired_generation%')
+               OR (c.conname='artifact_observations_format' AND NOT (pg_get_constraintdef(c.oid) ILIKE '%format_version%' AND pg_get_constraintdef(c.oid) LIKE '%4294967295%'))
+               OR (c.conname='artifact_consumers_pkey' AND pg_get_constraintdef(c.oid)<>'PRIMARY KEY (artifact_id, consumer_id)')
+               OR (c.conname='scheduler_state_pkey' AND pg_get_constraintdef(c.oid)<>'PRIMARY KEY (id)')
+               OR (c.conname='scheduler_state_singleton' AND pg_get_constraintdef(c.oid) NOT ILIKE '%id%1%')
+               OR (c.conname='scheduler_state_fairness' AND NOT (pg_get_constraintdef(c.oid) ILIKE '%fairness_cursor%' AND pg_get_constraintdef(c.oid) LIKE '%3%')))",
+        )
+        .fetch_one(&mut *migration)
+        .await?;
+        if invalid_constraint_definitions != 0 {
+            bail!("postgres artifact scheduler constraint definitions differ from schema version")
+        }
+        let exact_constraint_definitions: i64 = sqlx::query_scalar(
+            "WITH expected(constraint_name,definition) AS (VALUES
+              ('artifact_scheduler_schema_pkey',$d$PRIMARY KEY (id)$d$),
+              ('artifact_scheduler_schema_singleton',$d$CHECK ((id = 1))$d$),
+              ('artifact_jobs_pkey',$d$PRIMARY KEY (id)$d$),
+              ('artifact_jobs_identity',$d$UNIQUE (workspace, repo, commit_oid, kind, format_version)$d$),
+              ('artifact_jobs_format',$d$CHECK (((format_version >= 1) AND (format_version <= '4294967295'::bigint)))$d$),
+              ('artifact_jobs_state',$d$CHECK ((state = ANY (ARRAY['queued'::text, 'running'::text, 'ready'::text, 'failed'::text])))$d$),
+              ('artifact_jobs_kind',$d$CHECK ((kind = ANY (ARRAY['head'::text, 'full_history'::text, 'files'::text])))$d$),
+              ('artifact_jobs_lease_generation',$d$CHECK (((lease_generation >= 0) AND (lease_generation <= '9223372036854775807'::bigint)))$d$),
+              ('artifact_jobs_claim_attempts',$d$CHECK (((claim_attempts >= 0) AND (claim_attempts <= '4294967295'::bigint)))$d$),
+              ('artifact_jobs_retry_count',$d$CHECK (((retry_count >= 0) AND (retry_count <= '4294967295'::bigint)))$d$),
+              ('artifact_jobs_failure_class',$d$CHECK (((failure_class IS NULL) OR (failure_class = ANY (ARRAY['retryable'::text, 'permanent'::text, 'dead_letter'::text]))))$d$),
+              ('branch_observations_pkey',$d$PRIMARY KEY (workspace, repo, branch)$d$),
+              ('branch_observations_generation',$d$CHECK ((generation >= 1))$d$),
+              ('artifact_observations_pkey',$d$PRIMARY KEY (workspace, repo, branch, kind)$d$),
+              ('artifact_observations_generation',$d$CHECK ((desired_generation >= 1))$d$),
+              ('artifact_observations_format',$d$CHECK (((format_version >= 1) AND (format_version <= '4294967295'::bigint)))$d$),
+              ('artifact_consumers_pkey',$d$PRIMARY KEY (artifact_id, consumer_id)$d$),
+              ('scheduler_state_pkey',$d$PRIMARY KEY (id)$d$),
+              ('scheduler_state_singleton',$d$CHECK ((id = 1))$d$),
+              ('scheduler_state_fairness',$d$CHECK (((fairness_cursor >= 0) AND (fairness_cursor <= 3)))$d$))
+             SELECT count(*) FROM expected e JOIN pg_constraint c
+               ON c.conname=e.constraint_name AND pg_get_constraintdef(c.oid)=e.definition
+             JOIN pg_namespace n ON n.oid=c.connamespace AND n.nspname=current_schema()",
+        )
+        .fetch_one(&mut *migration)
+        .await?;
+        if exact_constraint_definitions != 20 {
+            bail!(
+                "postgres artifact scheduler exact constraint definitions differ from schema version ({exact_constraint_definitions}/20 matched)"
+            )
+        }
         let required_indexes: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM pg_indexes WHERE schemaname=current_schema() AND indexname IN(
               'artifact_jobs_claim','artifact_jobs_lease','artifact_observations_desired',
@@ -195,9 +312,43 @@ impl PostgresArtifactScheduler {
         if required_indexes != 5 {
             bail!("postgres artifact scheduler schema is missing required indexes")
         }
+        let invalid_index_definitions: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_indexes WHERE schemaname=current_schema() AND (
+               (indexname='artifact_jobs_claim' AND indexdef NOT LIKE '%(state, kind, created_at, id)%')
+               OR (indexname='artifact_jobs_lease' AND indexdef NOT LIKE '%(state, lease_expires_at)%')
+               OR (indexname='artifact_observations_desired' AND indexdef NOT LIKE '%(desired_artifact_id)%')
+               OR (indexname='artifact_observations_published' AND indexdef NOT LIKE '%(published_artifact_id)%')
+               OR (indexname='artifact_consumers_expiry' AND indexdef NOT LIKE '%(expires_at)%'))",
+        )
+        .fetch_one(&mut *migration)
+        .await?;
+        if invalid_index_definitions != 0 {
+            bail!("postgres artifact scheduler index definitions differ from schema version")
+        }
+        let exact_index_definitions: i64 = sqlx::query_scalar(
+            "WITH expected(index_name,keys) AS (VALUES
+              ('artifact_jobs_claim',ARRAY['state','kind','created_at','id']::text[]),
+              ('artifact_jobs_lease',ARRAY['state','lease_expires_at']::text[]),
+              ('artifact_observations_desired',ARRAY['desired_artifact_id']::text[]),
+              ('artifact_observations_published',ARRAY['published_artifact_id']::text[]),
+              ('artifact_consumers_expiry',ARRAY['expires_at']::text[]))
+             SELECT count(*) FROM expected e JOIN pg_class i ON i.relname=e.index_name
+             JOIN pg_namespace n ON n.oid=i.relnamespace AND n.nspname=current_schema()
+             JOIN pg_index x ON x.indexrelid=i.oid
+             WHERE x.indisvalid AND NOT x.indisunique AND x.indpred IS NULL
+               AND x.indexprs IS NULL AND x.indnkeyatts=array_length(e.keys,1)
+               AND ARRAY(SELECT pg_get_indexdef(i.oid,s,true)
+                         FROM generate_series(1,x.indnkeyatts) s ORDER BY s)=e.keys",
+        )
+        .fetch_one(&mut *migration)
+        .await?;
+        if exact_index_definitions != 5 {
+            bail!("postgres artifact scheduler exact index definitions differ from schema version")
+        }
         let invalid_jobs: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM artifact_jobs WHERE
                state NOT IN('queued','running','ready','failed')
+               OR state IS NULL OR kind IS NULL OR format_version IS NULL
                OR kind NOT IN('head','full_history','files')
                OR format_version NOT BETWEEN 1 AND 4294967295
                OR lease_generation<0 OR claim_attempts NOT BETWEEN 0 AND 4294967295
@@ -222,7 +373,8 @@ impl PostgresArtifactScheduler {
                AND p.workspace=a.workspace AND p.repo=a.repo AND p.kind=a.kind
                AND p.format_version=a.format_version AND p.state='ready'
                AND p.manifest IS NOT NULL AND length(trim(p.manifest))>0
-             WHERE a.desired_generation<1 OR a.format_version NOT BETWEEN 1 AND 4294967295
+             WHERE a.desired_generation IS NULL OR a.format_version IS NULL
+                OR a.desired_generation<1 OR a.format_version NOT BETWEEN 1 AND 4294967295
                 OR d.id IS NULL OR (a.published_artifact_id IS NOT NULL AND p.id IS NULL)",
         )
         .fetch_one(&mut *migration)
@@ -230,10 +382,11 @@ impl PostgresArtifactScheduler {
         if invalid_observations != 0 {
             bail!("postgres artifact scheduler contains invalid artifact observations")
         }
-        let invalid_branches: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM branch_observations WHERE generation<1")
-                .fetch_one(&mut *migration)
-                .await?;
+        let invalid_branches: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM branch_observations WHERE generation IS NULL OR generation<1",
+        )
+        .fetch_one(&mut *migration)
+        .await?;
         if invalid_branches != 0 {
             bail!("postgres artifact scheduler contains invalid branch observations")
         }
@@ -521,6 +674,7 @@ fn existing_outcome(record: ArtifactRecord) -> ScheduleOutcome {
 #[async_trait]
 impl ArtifactSchedulerPersistence for PostgresArtifactScheduler {
     async fn schedule(&self, key: &ArtifactKey) -> Result<ScheduleOutcome> {
+        validate_format_version(key.format_version)?;
         let (mut tx, now) = self.controlled().await?;
         self.preflight_batch(
             &mut tx,
@@ -542,6 +696,7 @@ impl ArtifactSchedulerPersistence for PostgresArtifactScheduler {
         consumer_id: &str,
         ttl_secs: i64,
     ) -> Result<ScheduleOutcome> {
+        validate_format_version(key.format_version)?;
         if consumer_id.trim().is_empty() {
             bail!("artifact consumer id is empty")
         }
@@ -606,9 +761,7 @@ impl ArtifactSchedulerPersistence for PostgresArtifactScheduler {
         if kinds.is_empty() {
             bail!("observation requests no artifact kinds")
         }
-        if format_version == 0 {
-            bail!("artifact format version must be positive")
-        }
+        validate_format_version(format_version)?;
         let mut unique = Vec::new();
         for &kind in kinds {
             if !unique.contains(&kind) {
@@ -1231,6 +1384,23 @@ mod tests {
         let a = a.unwrap();
         let b = b.unwrap();
 
+        let mut zero = key("zero", ArtifactKind::Head);
+        zero.format_version = 0;
+        assert!(a.schedule(&zero).await.is_err());
+        assert!(
+            a.observe(
+                "ws",
+                "owner/repo",
+                "zero",
+                "zero",
+                &[ArtifactKind::Head],
+                0,
+                None
+            )
+            .await
+            .is_err()
+        );
+
         let duplicate = key("dedup", ArtifactKind::Head);
         let (scheduled_a, scheduled_b) =
             tokio::join!(a.schedule(&duplicate), b.schedule(&duplicate));
@@ -1759,6 +1929,86 @@ mod tests {
         assert_eq!(
             reserve.counts().await.unwrap(),
             vec![(ArtifactKind::FullHistory, ArtifactState::Queued, 1)]
+        );
+
+        reset(&control).await;
+        let shape_pool = PgPoolOptions::new().connect(&url).await.unwrap();
+        PostgresArtifactScheduler::from_pool(
+            shape_pool.clone(),
+            Default::default(),
+            Arc::new(Accept),
+        )
+        .await
+        .unwrap();
+        sqlx::query("ALTER TABLE artifact_jobs ALTER COLUMN format_version DROP NOT NULL")
+            .execute(&shape_pool)
+            .await
+            .unwrap();
+        assert!(
+            PostgresArtifactScheduler::from_pool(
+                PgPoolOptions::new().connect(&url).await.unwrap(),
+                Default::default(),
+                Arc::new(Accept)
+            )
+            .await
+            .is_err(),
+            "schema with nullable format_version was accepted"
+        );
+
+        reset(&control).await;
+        let check_pool = PgPoolOptions::new().connect(&url).await.unwrap();
+        PostgresArtifactScheduler::from_pool(
+            check_pool.clone(),
+            Default::default(),
+            Arc::new(Accept),
+        )
+        .await
+        .unwrap();
+        sqlx::raw_sql(
+            "ALTER TABLE artifact_jobs DROP CONSTRAINT artifact_jobs_format;
+             ALTER TABLE artifact_jobs ADD CONSTRAINT artifact_jobs_format
+               CHECK(true OR (format_version BETWEEN 1 AND 4294967295));",
+        )
+        .execute(&check_pool)
+        .await
+        .unwrap();
+        assert!(
+            PostgresArtifactScheduler::from_pool(
+                PgPoolOptions::new().connect(&url).await.unwrap(),
+                Default::default(),
+                Arc::new(Accept)
+            )
+            .await
+            .is_err(),
+            "schema with a named but ineffective format check was accepted"
+        );
+
+        reset(&control).await;
+        let index_pool = PgPoolOptions::new().connect(&url).await.unwrap();
+        PostgresArtifactScheduler::from_pool(
+            index_pool.clone(),
+            Default::default(),
+            Arc::new(Accept),
+        )
+        .await
+        .unwrap();
+        sqlx::raw_sql(
+            "DROP INDEX artifact_jobs_claim;
+             CREATE INDEX artifact_jobs_claim
+               ON artifact_jobs(kind,state,created_at,id) WHERE state='queued';",
+        )
+        .execute(&index_pool)
+        .await
+        .unwrap();
+        assert!(
+            PostgresArtifactScheduler::from_pool(
+                PgPoolOptions::new().connect(&url).await.unwrap(),
+                Default::default(),
+                Arc::new(Accept)
+            )
+            .await
+            .is_err(),
+            "schema with reordered/predicate claim index was accepted"
         );
 
         reset(&control).await;

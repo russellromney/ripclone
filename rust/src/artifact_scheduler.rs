@@ -261,7 +261,8 @@ pub enum ExecutionOutcome {
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS artifact_jobs(
  id INTEGER PRIMARY KEY AUTOINCREMENT, workspace TEXT NOT NULL, repo TEXT NOT NULL,
- commit_oid TEXT NOT NULL, kind TEXT NOT NULL, format_version INTEGER NOT NULL,
+ commit_oid TEXT NOT NULL, kind TEXT NOT NULL,
+ format_version INTEGER NOT NULL CHECK(format_version BETWEEN 1 AND 4294967295),
  state TEXT NOT NULL CHECK(state IN('queued','running','ready','failed')), owner TEXT,
  heartbeat_at INTEGER, lease_expires_at INTEGER, lease_generation INTEGER NOT NULL DEFAULT 0,
  claim_attempts INTEGER NOT NULL DEFAULT 0, retry_count INTEGER NOT NULL DEFAULT 0,
@@ -295,6 +296,7 @@ impl ArtifactScheduler {
         if verifier_id.is_empty() {
             bail!("completion verifier identity is empty")
         }
+        let fingerprint = scheduler_fingerprint(&limits, verifier_id);
         let opts = SqliteConnectOptions::from_str(path)?
             .create_if_missing(true)
             .busy_timeout(Duration::from_secs(10))
@@ -416,13 +418,32 @@ impl ArtifactScheduler {
         .await?;
         sqlx::raw_sql("UPDATE artifact_observations SET format_version=(SELECT format_version FROM artifact_jobs WHERE id=desired_artifact_id); UPDATE artifact_observations SET published_artifact_id=NULL WHERE published_artifact_id IS NOT NULL AND (SELECT count(*) FROM artifact_jobs j WHERE j.id=published_artifact_id AND j.workspace=artifact_observations.workspace AND j.repo=artifact_observations.repo AND j.kind=artifact_observations.kind AND j.format_version=artifact_observations.format_version AND j.state='ready' AND j.manifest IS NOT NULL AND length(trim(j.manifest))>0)=0").execute(&mut *migration).await?;
         if prior_version < 2 {
-            sqlx::raw_sql("UPDATE artifact_observations SET published_artifact_id=NULL")
-                .execute(&mut *migration)
-                .await?;
+            // Legacy completion evidence predates the mandatory verifier. Keep
+            // queued intent, but force any running/ready work back through the
+            // new fenced verifier before it can publish.
+            sqlx::raw_sql(
+                "UPDATE artifact_observations SET published_artifact_id=NULL;
+                 UPDATE artifact_jobs SET state='queued',owner=NULL,heartbeat_at=NULL,
+                   lease_expires_at=NULL,manifest=NULL,error=NULL,failure_class=NULL
+                 WHERE state IN('running','ready');
+                 UPDATE scheduler_state SET config_fingerprint='__legacy_migration_pending__'
+                 WHERE id=1 AND config_fingerprint='';",
+            )
+            .execute(&mut *migration)
+            .await?;
         }
         let invalid_after:i64=sqlx::query_scalar("SELECT count(*) FROM artifact_observations a LEFT JOIN artifact_jobs d ON d.id=a.desired_artifact_id AND d.workspace=a.workspace AND d.repo=a.repo AND d.kind=a.kind AND d.commit_oid=a.desired_commit AND d.format_version=a.format_version AND d.format_version BETWEEN 1 AND 4294967295 LEFT JOIN artifact_jobs p ON p.id=a.published_artifact_id AND p.workspace=a.workspace AND p.repo=a.repo AND p.kind=a.kind AND p.format_version=a.format_version WHERE d.id IS NULL OR (a.published_artifact_id IS NOT NULL AND p.id IS NULL)").fetch_one(&mut *migration).await?;
         if invalid_after > 0 {
             bail!("artifact observation migration validation failed")
+        }
+        let invalid_job_formats: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM artifact_jobs
+             WHERE format_version IS NULL OR format_version NOT BETWEEN 1 AND 4294967295",
+        )
+        .fetch_one(&mut *migration)
+        .await?;
+        if invalid_job_formats != 0 {
+            bail!("artifact scheduler contains invalid job format versions")
         }
         sqlx::raw_sql("PRAGMA user_version=2")
             .execute(&mut *migration)
@@ -435,10 +456,25 @@ impl ArtifactScheduler {
         if version != 2 || required != 4 {
             bail!("artifact scheduler migration post-validation failed")
         }
-        let fingerprint = scheduler_fingerprint(&limits, verifier_id);
         let mut config = pool.acquire().await?;
         sqlx::query("BEGIN IMMEDIATE").execute(&mut *config).await?;
-        let accepted=sqlx::query("UPDATE scheduler_state SET config_fingerprint=? WHERE id=1 AND (config_fingerprint='' OR config_fingerprint=?)").bind(&fingerprint).bind(&fingerprint).execute(&mut *config).await?.rows_affected()==1;
+        let stored: String =
+            sqlx::query_scalar("SELECT config_fingerprint FROM scheduler_state WHERE id=1")
+                .fetch_one(&mut *config)
+                .await?;
+        let accepted = if stored == "__legacy_migration_pending__" {
+            let unsafe_legacy_state:i64=sqlx::query_scalar("SELECT (SELECT count(*) FROM artifact_jobs WHERE state IN('running','ready') OR (manifest IS NOT NULL AND length(trim(manifest))>0))+(SELECT count(*) FROM artifact_observations WHERE published_artifact_id IS NOT NULL)").fetch_one(&mut *config).await?;
+            unsafe_legacy_state==0 && sqlx::query("UPDATE scheduler_state SET config_fingerprint=? WHERE id=1 AND config_fingerprint='__legacy_migration_pending__'")
+                    .bind(&fingerprint)
+                    .execute(&mut *config)
+                    .await?
+                    .rows_affected()==1
+        } else if stored.is_empty() {
+            let existing:i64=sqlx::query_scalar("SELECT (SELECT count(*) FROM artifact_jobs)+(SELECT count(*) FROM branch_observations)+(SELECT count(*) FROM artifact_observations)+(SELECT count(*) FROM artifact_consumers)").fetch_one(&mut *config).await?;
+            existing==0 && sqlx::query("UPDATE scheduler_state SET config_fingerprint=? WHERE id=1 AND config_fingerprint=''").bind(&fingerprint).execute(&mut *config).await?.rows_affected()==1
+        } else {
+            stored == fingerprint
+        };
         if !accepted {
             let _ = sqlx::query("ROLLBACK").execute(&mut *config).await;
             bail!("scheduler running-limit configuration differs from existing fleet")
@@ -460,6 +496,7 @@ impl ArtifactScheduler {
     }
 
     pub async fn schedule(&self, key: &ArtifactKey) -> Result<ScheduleOutcome> {
+        validate_format_version(key.format_version)?;
         let mut c = self.immediate().await?;
         let result = self.schedule_in(&mut c, key).await;
         finish(c, result).await
@@ -471,6 +508,7 @@ impl ArtifactScheduler {
         consumer_id: &str,
         ttl_secs: i64,
     ) -> Result<ScheduleOutcome> {
+        validate_format_version(key.format_version)?;
         if consumer_id.trim().is_empty() {
             bail!("artifact consumer id is empty")
         }
@@ -516,6 +554,7 @@ impl ArtifactScheduler {
         format_version: u32,
         expected_generation: Option<u64>,
     ) -> Result<ObservationOutcome> {
+        validate_format_version(format_version)?;
         if kinds.is_empty() {
             bail!("observation requests no artifact kinds")
         }
@@ -988,6 +1027,12 @@ pub(crate) fn validate_lease(owner: &str, secs: i64) -> Result<()> {
     if !(2..=86400).contains(&secs) {
         bail!("lease duration must be between 2 and 86400 seconds")
     };
+    Ok(())
+}
+pub(crate) fn validate_format_version(version: u32) -> Result<()> {
+    if version == 0 {
+        bail!("artifact format version must be positive")
+    }
     Ok(())
 }
 pub(crate) fn validate_limits(l: &SchedulerLimits) -> Result<()> {
@@ -1763,7 +1808,7 @@ mod tests {
         let p = d.path().join("legacy.db").to_string_lossy().to_string();
         let pool = legacy_pool(&p).await;
         sqlx::raw_sql(
-            "INSERT INTO artifact_jobs(workspace,repo,commit_oid,kind,format_version,state,created_at,updated_at) VALUES('ws','o/r','legacy','head',7,'queued',1,1);
+            "INSERT INTO artifact_jobs(workspace,repo,commit_oid,kind,format_version,state,manifest,created_at,updated_at) VALUES('ws','o/r','legacy','head',7,'ready','unverified-legacy-manifest',1,1);
              INSERT INTO artifact_observations(workspace,repo,branch,kind,desired_commit,desired_artifact_id,published_artifact_id,observed_at) VALUES('ws','o/r','main','head','legacy',1,1,1);",
         )
         .execute(&pool)
@@ -1782,6 +1827,8 @@ mod tests {
         };
         let legacy = s.get_by_key(&legacy_key).await.unwrap().unwrap();
         assert_eq!(legacy.lease_generation, 0);
+        assert_eq!(legacy.state, ArtifactState::Queued);
+        assert_eq!(legacy.manifest, None);
         let (migrated_format, published): (i64, Option<i64>) = sqlx::query_as(
             "SELECT format_version,published_artifact_id FROM artifact_observations WHERE workspace='ws' AND repo='o/r' AND branch='main' AND kind='head'",
         )
@@ -1965,6 +2012,55 @@ mod tests {
             ArtifactScheduler::open(&p, Default::default())
                 .await
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_format_and_blank_fingerprint_over_state_fail_closed() {
+        let (s, _d, path) = scheduler(Default::default()).await;
+        let mut invalid = key("ws", "zero", ArtifactKind::Head);
+        invalid.format_version = 0;
+        assert!(s.schedule(&invalid).await.is_err());
+        assert!(
+            s.observe("ws", "o/r", "zero", "zero", &[ArtifactKind::Head], 0, None)
+                .await
+                .is_err()
+        );
+        s.schedule(&key("ws", "existing", ArtifactKind::Head))
+            .await
+            .unwrap();
+        sqlx::query("UPDATE scheduler_state SET config_fingerprint='' WHERE id=1")
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        assert!(
+            ArtifactScheduler::open(&path, Default::default())
+                .await
+                .is_err(),
+            "sqlite adopted an empty fleet fingerprint over existing state"
+        );
+
+        let (ready, _ready_dir, ready_path) = scheduler(Default::default()).await;
+        ready
+            .observe("ws", "o/r", "main", "ready", &[ArtifactKind::Head], 1, None)
+            .await
+            .unwrap();
+        let claim = ready.claim("worker", 5).await.unwrap().unwrap();
+        ready
+            .complete(&claim, "worker", &evidence(&claim))
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE scheduler_state SET config_fingerprint='__legacy_migration_pending__' WHERE id=1",
+        )
+        .execute(&ready.pool)
+        .await
+        .unwrap();
+        assert!(
+            ArtifactScheduler::open(&ready_path, Default::default())
+                .await
+                .is_err(),
+            "sqlite adopted a planted migration marker over ready/published state"
         );
     }
 }

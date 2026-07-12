@@ -63,15 +63,16 @@ else
   echo "== RIPCLONE_TEST_MYSQL_URL=$RIPCLONE_TEST_MYSQL_URL =="
 fi
 
-run_lib_lifecycle() {
+run_lib_filter() {
+  local filter="$1"
   if [ -n "${CI_ARTIFACTS:-}" ]; then
     local bin="$CI_ARTIFACTS/ripclone-lib-tests"
     [ -x "$bin" ] || { echo "error: missing $bin" >&2; exit 1; }
-    echo "== unit: lifecycle via prebuilt $bin =="
-    "$bin" lifecycle --nocapture
+    echo "== unit: $filter via prebuilt $bin =="
+    "$bin" "$filter" --nocapture
   else
-    echo "== unit: lifecycle via cargo (profile=$PROFILE) =="
-    cargo test --profile "$PROFILE" --locked --lib lifecycle -- --nocapture
+    echo "== unit: $filter via cargo (profile=$PROFILE) =="
+    cargo test --profile "$PROFILE" --locked --lib "$filter" -- --nocapture
   fi
 }
 
@@ -88,7 +89,8 @@ run_test_bin() {
   fi
 }
 
-run_lib_lifecycle
+run_lib_filter lifecycle
+run_lib_filter artifact_scheduler_postgres::tests::live_postgres_adversarial_conformance
 run_test_bin e2e_worker_postgres
 run_test_bin e2e_worker_mysql
 run_test_bin e2e_metadata_postgres
