@@ -108,6 +108,7 @@ pub mod oidc;
 pub mod overlay;
 pub mod pack;
 pub mod perf;
+pub mod pinned_bundle;
 pub mod provider;
 pub mod provider_config;
 #[doc(hidden)]

@@ -29,6 +29,23 @@ pub struct CompactResult {
 }
 
 impl<'a> PackBuilder<'a> {
+    /// Build deterministic-order, self-contained non-thin packs for an exact
+    /// caller-supplied object set. Used by pinned bundle generation after it
+    /// computes target closure minus a verified base closure.
+    pub fn build_object_set_packs(
+        &self,
+        object_shas: &[String],
+        target_raw_bytes: u64,
+        undeltified: bool,
+    ) -> Result<Vec<(String, u64, String, u64)>> {
+        let mut object_shas = object_shas.to_vec();
+        object_shas.sort();
+        object_shas.dedup();
+        Ok(self
+            .build_packs_from_oids(&object_shas, target_raw_bytes, undeltified)?
+            .0)
+    }
+
     pub fn new<P: AsRef<Path>>(repo: P, cas: &'a Cas) -> Self {
         Self {
             repo: repo.as_ref().to_path_buf(),

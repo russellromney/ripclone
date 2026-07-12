@@ -22,7 +22,7 @@ use std::ffi::CString;
 use std::path::Path;
 use std::process::{Command, Output};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TopUpMode {
     Head,
     Full,
@@ -30,9 +30,12 @@ pub enum TopUpMode {
 
 /// Authenticated server plan. `manifest_hash` is the CAS hash of the signed
 /// manifest whose artifacts the installer verifies.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PinnedTopUpBundle {
     pub format_version: u32,
+    pub workspace_id: String,
+    pub repo_path: String,
     pub base_commit: String,
     pub target_commit: String,
     pub branch: String,
@@ -42,28 +45,33 @@ pub struct PinnedTopUpBundle {
     pub canonical_origin: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PinnedBundleRequest {
     pub manifest_hash: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PinnedArtifactKind {
     BasePack,
+    BasePackIndex,
     OverlayPack,
-    Index,
+    OverlayPackIndex,
+    PrebuiltIndex,
     CheckoutMetadata,
     WorktreeArchive,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PinnedArtifactDescriptor {
     pub kind: PinnedArtifactKind,
     pub hash: String,
     pub len: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VerifiedPinnedBundle {
     pub manifest_hash: String,
     pub semantic_digest: String,
@@ -163,6 +171,18 @@ fn validate_bundle(bundle: &PinnedTopUpBundle, approved_origin: &str) -> Result<
     if bundle.format_version != 1 {
         bail!("unsupported pinned-bundle format version");
     }
+    let repo_components = bundle.repo_path.split('/').collect::<Vec<_>>();
+    if bundle.workspace_id.is_empty()
+        || bundle.workspace_id.bytes().any(|b| b.is_ascii_control())
+        || repo_components.len() < 2
+        || repo_components
+            .iter()
+            .any(|component| component.is_empty() || matches!(*component, "." | ".."))
+        || bundle.repo_path.contains('\\')
+        || bundle.repo_path.bytes().any(|b| b.is_ascii_control())
+    {
+        bail!("pinned bundle workspace/repository identity is invalid");
+    }
     validate_oid("base_commit", &bundle.base_commit)?;
     validate_oid("target_commit", &bundle.target_commit)?;
     if bundle.base_commit.len() != bundle.target_commit.len() {
@@ -234,6 +254,8 @@ pub fn pinned_bundle_semantic_digest(
     let mut hasher = Sha256::new();
     hasher.update(b"ripclone-pinned-bundle-semantics-v1\0");
     hasher.update(bundle.format_version.to_be_bytes());
+    field(&mut hasher, bundle.workspace_id.as_bytes());
+    field(&mut hasher, bundle.repo_path.as_bytes());
     field(&mut hasher, bundle.base_commit.as_bytes());
     field(&mut hasher, bundle.target_commit.as_bytes());
     field(&mut hasher, bundle.branch.as_bytes());
@@ -246,10 +268,12 @@ pub fn pinned_bundle_semantic_digest(
     for artifact in artifacts {
         hasher.update([match artifact.kind {
             PinnedArtifactKind::BasePack => 1,
-            PinnedArtifactKind::OverlayPack => 2,
-            PinnedArtifactKind::Index => 3,
-            PinnedArtifactKind::CheckoutMetadata => 4,
-            PinnedArtifactKind::WorktreeArchive => 5,
+            PinnedArtifactKind::BasePackIndex => 2,
+            PinnedArtifactKind::OverlayPack => 3,
+            PinnedArtifactKind::OverlayPackIndex => 4,
+            PinnedArtifactKind::PrebuiltIndex => 5,
+            PinnedArtifactKind::CheckoutMetadata => 6,
+            PinnedArtifactKind::WorktreeArchive => 7,
         }]);
         field(&mut hasher, artifact.hash.as_bytes());
         hasher.update(artifact.len.to_be_bytes());

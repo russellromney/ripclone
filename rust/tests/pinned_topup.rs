@@ -118,6 +118,8 @@ impl PinnedBundleInstaller for BoundInstaller<'_> {
 fn bundle(base: &str, target: &str, mode: TopUpMode) -> PinnedTopUpBundle {
     PinnedTopUpBundle {
         format_version: 1,
+        workspace_id: "workspace-test".into(),
+        repo_path: "acme/repo".into(),
         base_commit: base.into(),
         target_commit: target.into(),
         branch: "main".into(),
