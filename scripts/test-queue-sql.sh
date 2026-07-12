@@ -91,6 +91,7 @@ run_test_bin() {
 
 run_lib_filter lifecycle
 run_lib_filter artifact_scheduler_postgres::tests::live_postgres_adversarial_conformance
+run_lib_filter artifact_scheduler_mysql::tests::mysql_artifact_scheduler_live_conformance
 run_test_bin e2e_worker_postgres
 run_test_bin e2e_worker_mysql
 run_test_bin e2e_metadata_postgres

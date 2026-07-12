@@ -132,6 +132,9 @@ impl MysqlArtifactScheduler {
             Self::validate_schema(&mut migration).await?;
 
             let fingerprint = scheduler_fingerprint(&limits, verifier_id);
+            if fingerprint.chars().count() > 512 {
+                bail!("scheduler verifier/config fingerprint exceeds mysql storage limit")
+            }
             let stored: String = sqlx::query_scalar(
                 "SELECT config_fingerprint FROM scheduler_state WHERE id=1 FOR UPDATE",
             )
@@ -330,7 +333,8 @@ impl MysqlArtifactScheduler {
              WHERE table_schema=DATABASE() AND table_name IN
              ('artifact_scheduler_schema','artifact_jobs','branch_observations',
               'artifact_observations','artifact_consumers','scheduler_state')
-               AND (engine<>'InnoDB' OR table_collation<>'utf8mb4_bin')",
+               AND (engine IS NULL OR engine<>'InnoDB' OR table_collation IS NULL
+                    OR table_collation<>'utf8mb4_bin')",
         )
         .fetch_one(&mut **tx)
         .await?;
@@ -343,7 +347,7 @@ impl MysqlArtifactScheduler {
              ('artifact_scheduler_schema','artifact_jobs','branch_observations',
               'artifact_observations','artifact_consumers','scheduler_state')
                AND data_type IN('varchar','text','longtext')
-               AND collation_name<>'utf8mb4_bin'",
+               AND (collation_name IS NULL OR collation_name<>'utf8mb4_bin')",
         )
         .fetch_one(&mut **tx)
         .await?;
@@ -358,6 +362,19 @@ impl MysqlArtifactScheduler {
         .await?;
         if id_extra != "auto_increment" {
             bail!("mysql artifact scheduler id is not auto_increment")
+        }
+        let invalid_extra: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM information_schema.columns
+             WHERE table_schema=DATABASE() AND table_name IN
+             ('artifact_scheduler_schema','artifact_jobs','branch_observations',
+              'artifact_observations','artifact_consumers','scheduler_state')
+               AND NOT(table_name='artifact_jobs' AND column_name='id')
+               AND (extra IS NULL OR extra<>'')",
+        )
+        .fetch_one(&mut **tx)
+        .await?;
+        if invalid_extra != 0 {
+            bail!("mysql artifact scheduler has unexpected generated column behavior")
         }
         for (table, column, column_type, nullable, default) in COLUMNS {
             let found: Option<(String, String, Option<String>)> = sqlx::query_as(
@@ -454,7 +471,7 @@ impl MysqlArtifactScheduler {
              WHERE table_schema=DATABASE() AND table_name IN
              ('artifact_scheduler_schema','artifact_jobs','branch_observations',
               'artifact_observations','artifact_consumers','scheduler_state')
-               AND (sub_part IS NOT NULL OR index_type<>'BTREE')",
+               AND (sub_part IS NOT NULL OR index_type IS NULL OR index_type<>'BTREE')",
         )
         .fetch_one(&mut **tx)
         .await?;
