@@ -46,6 +46,13 @@ impl BoundedClonePlanDecoder {
     pub fn finish(self, expected: CloneRequestIdentity<'_>) -> Result<ClonePlan> {
         ClonePlanResponse::decode_for(&self.bytes, expected)
     }
+
+    /// Finish a first-contact resolve where the exact target is selected by the
+    /// authenticated server response. All caller-known identity fields remain
+    /// pinned; only the target is learned from the validated envelope.
+    pub fn finish_resolved(self, expected: CloneRequestIdentity<'_>) -> Result<ClonePlan> {
+        ClonePlanResponse::decode_resolved_for(&self.bytes, expected)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -114,6 +121,23 @@ impl ClonePlanResponse {
         }
         let response: Self = serde_json::from_slice(bytes)?;
         response.validate_for(expected)
+    }
+
+    /// Decode a response when the caller deliberately asked the server to
+    /// resolve the branch tip. `expected.target_commit` must be `None`; the
+    /// returned target is still syntax-checked and bound to every payload.
+    pub fn decode_resolved_for(
+        bytes: &[u8],
+        expected: CloneRequestIdentity<'_>,
+    ) -> Result<ClonePlan> {
+        if expected.target_commit.is_some() {
+            bail!("resolved clone-plan decode received a preselected target");
+        }
+        if bytes.len() > MAX_CLONE_PLAN_RESPONSE_BYTES {
+            bail!("clone-plan response exceeds protocol size limit");
+        }
+        let response: Self = serde_json::from_slice(bytes)?;
+        response.validate_resolved_for(expected)
     }
 
     /// Construct the only response shape the server is allowed to publish.
@@ -227,6 +251,24 @@ impl ClonePlanResponse {
                 ClonePlan::RepositoryFailed
             }
         })
+    }
+
+    fn validate_resolved_for(&self, expected: CloneRequestIdentity<'_>) -> Result<ClonePlan> {
+        validate_identity(expected)?;
+        if self.protocol_version != CLONE_PLAN_PROTOCOL_VERSION
+            || self.workspace != expected.workspace
+            || self.repo != expected.repo
+            || self.branch != expected.branch
+            || self.mode != expected.mode
+            || self.artifact_format_version != expected.artifact_format_version
+        {
+            bail!("clone-plan response identity does not match request");
+        }
+        let learned = CloneRequestIdentity {
+            target_commit: self.target_commit.as_deref(),
+            ..expected
+        };
+        self.validate_for(learned)
     }
 }
 
@@ -773,5 +815,77 @@ mod tests {
             .push(&vec![b' '; MAX_CLONE_PLAN_RESPONSE_BYTES])
             .unwrap();
         assert!(streamed.push(b"x").is_err());
+    }
+
+    #[test]
+    fn first_contact_decode_learns_only_a_valid_server_target() {
+        let valid = response(
+            SyncMode::Head,
+            ClonePlanState::Ready {
+                payload: ClonePlanPayload::HeadArtifact {
+                    manifest: HEAD.into(),
+                    discard_git: false,
+                },
+            },
+        );
+        let expected = CloneRequestIdentity {
+            target_commit: None,
+            ..identity(SyncMode::Head)
+        };
+        let bytes = serde_json::to_vec(&valid).unwrap();
+        assert!(matches!(
+            ClonePlanResponse::decode_resolved_for(&bytes, expected).unwrap(),
+            ClonePlan::Ready { target_commit, .. } if target_commit == TARGET
+        ));
+
+        let mut foreign = valid.clone();
+        foreign.workspace = "foreign".into();
+        assert!(
+            ClonePlanResponse::decode_resolved_for(
+                &serde_json::to_vec(&foreign).unwrap(),
+                expected,
+            )
+            .is_err()
+        );
+
+        let mut malformed = valid;
+        malformed.target_commit = Some("A".repeat(40));
+        assert!(
+            ClonePlanResponse::decode_resolved_for(
+                &serde_json::to_vec(&malformed).unwrap(),
+                expected,
+            )
+            .is_err()
+        );
+        assert!(
+            ClonePlanResponse::decode_resolved_for(
+                &bytes,
+                CloneRequestIdentity {
+                    target_commit: Some(TARGET),
+                    ..expected
+                },
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn resolved_lifecycle_never_learns_a_target() {
+        let expected = CloneRequestIdentity {
+            target_commit: None,
+            ..identity(SyncMode::Full)
+        };
+        for state in [
+            ClonePlanState::RepositoryInitializing,
+            ClonePlanState::RepositoryFailed,
+        ] {
+            let mut wire = response(SyncMode::Full, state);
+            wire.target_commit = None;
+            let bytes = serde_json::to_vec(&wire).unwrap();
+            assert!(matches!(
+                ClonePlanResponse::decode_resolved_for(&bytes, expected).unwrap(),
+                ClonePlan::RepositoryInitializing | ClonePlan::RepositoryFailed
+            ));
+        }
     }
 }

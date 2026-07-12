@@ -1,5 +1,7 @@
 use crate::bench::Benchmark;
 use crate::cas::{Cas, hash as cas_hash};
+use crate::clone_plan::{ClonePayload, ClonePlan, SyncMode};
+use crate::clone_transport::{BoundedClonePlanDecoder, CloneRequestIdentity};
 use crate::clonepack::{
     ChunkRef, ClonepackManifest, MetadataChunk, PackEntry, hash_to_hex,
     install_manifest_pack_bytes, manifest_pack_idx_bytes,
@@ -10,6 +12,7 @@ use crate::mode::CloneMode;
 use crate::overlay;
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, bounded};
+use futures::StreamExt;
 use prost::Message;
 use serde::Deserialize;
 use sha2::Digest as Sha2Digest;
@@ -51,6 +54,59 @@ impl std::fmt::Display for StaleSignedUrl {
 }
 
 impl std::error::Error for StaleSignedUrl {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TypedCloneUnavailable {
+    Pending(Vec<crate::artifact_scheduler::ArtifactKind>),
+    RepositoryInitializing,
+    RepositoryFailed,
+    ExactInstallerUnavailable,
+    FilesTopUpInstallerUnavailable,
+}
+
+impl std::fmt::Display for TypedCloneUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pending(required) => write!(f, "typed clone artifacts are pending: {required:?}"),
+            Self::RepositoryInitializing => f.write_str("repository base is still initializing"),
+            Self::RepositoryFailed => f.write_str("repository initialization failed"),
+            Self::ExactInstallerUnavailable => {
+                f.write_str("this client does not yet install exact typed artifact manifests")
+            }
+            Self::FilesTopUpInstallerUnavailable => {
+                f.write_str("this client cannot atomically discard Git after a Files top-up")
+            }
+        }
+    }
+}
+
+impl std::error::Error for TypedCloneUnavailable {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TypedCloneOutcome {
+    Pinned(crate::topup::TopUpOutcome),
+}
+
+struct ClientPinnedInstaller<'a> {
+    cas: &'a Cas,
+    approved_origin: &'a str,
+}
+
+impl crate::topup::PinnedBundleInstaller for ClientPinnedInstaller<'_> {
+    fn approved_canonical_origin(&self) -> &str {
+        self.approved_origin
+    }
+
+    fn install_verified(
+        &self,
+        destination: &Path,
+        request: &crate::topup::PinnedBundleRequest,
+    ) -> std::result::Result<crate::topup::VerifiedPinnedBundle, crate::topup::BundleInstallFailure>
+    {
+        crate::pinned_bundle::verify_and_materialize_pinned_bundle(self.cas, request, destination)
+            .map_err(|_| crate::topup::BundleInstallFailure::Integrity)
+    }
+}
 
 /// True if `err` (or any cause in its chain) is a [`StaleSignedUrl`].
 pub fn is_stale_signed_url(err: &anyhow::Error) -> bool {
@@ -367,12 +423,13 @@ async fn fetch_artifact_to_temp_with_retry(
     url: &str,
     hash: &str,
     dir: &Path,
+    maximum: Option<u64>,
 ) -> Result<(tempfile::NamedTempFile, u64)> {
     let (max_attempts, base_backoff_ms) = fetch_retry_config();
     let mut attempt = 0u32;
     loop {
         attempt += 1;
-        match fetch_artifact_to_temp_once(client, url, hash, dir).await {
+        match fetch_artifact_to_temp_once(client, url, hash, dir, maximum).await {
             Ok(tmp) => return Ok(tmp),
             Err((retryable, err)) => {
                 if retryable && attempt < max_attempts {
@@ -394,6 +451,7 @@ async fn fetch_artifact_to_temp_once(
     fetch_url: &str,
     hash: &str,
     dir: &Path,
+    maximum: Option<u64>,
 ) -> std::result::Result<(tempfile::NamedTempFile, u64), (bool, anyhow::Error)> {
     use futures::StreamExt;
     use tokio::io::AsyncWriteExt;
@@ -437,8 +495,19 @@ async fn fetch_artifact_to_temp_once(
             Ok(chunk) => chunk,
             Err(e) => return Err((true, anyhow::anyhow!("artifact body read error: {e}"))),
         };
+        len = len.checked_add(chunk.len() as u64).ok_or_else(|| {
+            (
+                false,
+                anyhow::anyhow!("artifact streaming response length overflow"),
+            )
+        })?;
+        if maximum.is_some_and(|maximum| len > maximum) {
+            return Err((
+                false,
+                anyhow::anyhow!("artifact streaming response exceeds declared size limit"),
+            ));
+        }
         hasher.update(&chunk);
-        len += chunk.len() as u64;
         if let Err(e) = file.write_all(&chunk).await {
             return Err((
                 false,
@@ -772,6 +841,189 @@ impl Client {
 }
 
 impl Client {
+    /// Resolve one immutable typed clone plan. The body is streamed through the
+    /// protocol limit before JSON decoding, and the server-selected target is
+    /// learned only after workspace/repository/branch/mode validation.
+    pub async fn fetch_typed_clone_plan(
+        &self,
+        repo_path: &str,
+        branch: &str,
+        mode: SyncMode,
+    ) -> Result<ClonePlan> {
+        let mode_name = match mode {
+            SyncMode::Files => "files",
+            SyncMode::Head => "head",
+            SyncMode::Full => "full",
+        };
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("branch", branch)
+            .append_pair("mode", mode_name)
+            .finish();
+        let url = self.repo_url(repo_path, &format!("/clone-plan?{query}"));
+        let response = self.send(self.request(reqwest::Method::GET, &url)).await?;
+        if !matches!(
+            response.status(),
+            reqwest::StatusCode::OK | reqwest::StatusCode::ACCEPTED | reqwest::StatusCode::CONFLICT
+        ) {
+            return Err(server_error("fetch typed clone plan", response).await);
+        }
+        let mut decoder = BoundedClonePlanDecoder::new();
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            decoder.push(&chunk.context("read typed clone-plan response")?)?;
+        }
+        decoder.finish_resolved(CloneRequestIdentity {
+            workspace: &self.workspace,
+            repo: repo_path,
+            branch,
+            mode,
+            target_commit: None,
+            artifact_format_version: 1,
+        })
+    }
+
+    /// Execute the installer support that is safe today. Pinned Head/Full
+    /// bundles are downloaded into a private CAS, fully verified, materialized
+    /// in staging, and atomically published. Exact typed manifests and the
+    /// Files discard-Git transaction return typed capability errors instead of
+    /// falling back to an unverified legacy path.
+    pub async fn execute_typed_clone_plan<P: AsRef<Path>>(
+        &self,
+        plan: ClonePlan,
+        target: P,
+        approved_canonical_origin: &str,
+    ) -> Result<TypedCloneOutcome> {
+        match plan {
+            ClonePlan::Pending { required, .. } => {
+                Err(TypedCloneUnavailable::Pending(required).into())
+            }
+            ClonePlan::RepositoryInitializing => {
+                Err(TypedCloneUnavailable::RepositoryInitializing.into())
+            }
+            ClonePlan::RepositoryFailed => Err(TypedCloneUnavailable::RepositoryFailed.into()),
+            ClonePlan::Ready { payload, .. } => match payload {
+                ClonePayload::PinnedBundle {
+                    request,
+                    discard_git: false,
+                    ..
+                } => {
+                    let temporary = if self.cache.is_none() {
+                        Some(tempfile::tempdir().context("create typed clone CAS")?)
+                    } else {
+                        None
+                    };
+                    let cas = match &self.cache {
+                        Some(cas) => cas.clone(),
+                        None => Cas::new(temporary.as_ref().unwrap().path())?,
+                    };
+                    self.prefetch_pinned_bundle(&cas, &request).await?;
+                    let installer = ClientPinnedInstaller {
+                        cas: &cas,
+                        approved_origin: approved_canonical_origin,
+                    };
+                    let outcome =
+                        crate::topup::install_pinned_bundle(target, &request, &installer)?;
+                    Ok(TypedCloneOutcome::Pinned(outcome))
+                }
+                ClonePayload::PinnedBundle {
+                    discard_git: true, ..
+                } => Err(TypedCloneUnavailable::FilesTopUpInstallerUnavailable.into()),
+                ClonePayload::FilesArchive { .. }
+                | ClonePayload::HeadArtifact { .. }
+                | ClonePayload::FullArtifacts { .. } => {
+                    Err(TypedCloneUnavailable::ExactInstallerUnavailable.into())
+                }
+            },
+        }
+    }
+
+    async fn prefetch_pinned_bundle(
+        &self,
+        cas: &Cas,
+        request: &crate::topup::PinnedBundleRequest,
+    ) -> Result<()> {
+        const MAX_PINNED_MANIFEST_BYTES: usize = 16 * 1024 * 1024;
+        const MAX_PINNED_ARTIFACTS: usize = 32_768;
+        const MAX_PINNED_ARTIFACT_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+        const MAX_PINNED_TOTAL_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
+
+        let manifest = self
+            .fetch_small_artifact_bounded(&request.manifest_hash, MAX_PINNED_MANIFEST_BYTES)
+            .await?;
+        cas.put_with_hash(&request.manifest_hash, &manifest)?;
+        let decoded = crate::pinned_bundle::decode_pinned_bundle_manifest(cas, request)
+            .context("decode bounded pinned bundle manifest")?;
+        if decoded.verified.artifacts.len() > MAX_PINNED_ARTIFACTS {
+            anyhow::bail!("pinned bundle artifact count exceeds client limit");
+        }
+        let mut unique = std::collections::HashSet::new();
+        let mut total = 0u64;
+        for artifact in &decoded.verified.artifacts {
+            crate::cas::Cas::validate_artifact_id(&artifact.hash)?;
+            if !unique.insert(artifact.hash.as_str()) {
+                anyhow::bail!("pinned bundle repeats an artifact hash");
+            }
+            if artifact.len > MAX_PINNED_ARTIFACT_BYTES {
+                anyhow::bail!("pinned bundle artifact exceeds client per-object limit");
+            }
+            total = total
+                .checked_add(artifact.len)
+                .context("pinned bundle aggregate length overflow")?;
+            if total > MAX_PINNED_TOTAL_BYTES {
+                anyhow::bail!("pinned bundle aggregate exceeds client limit");
+            }
+        }
+        for artifact in &decoded.verified.artifacts {
+            if cas.verify_object(&artifact.hash).ok() == Some(artifact.len) {
+                continue;
+            }
+            let gateway = format!("{}/v1/artifacts/{}", self.server, artifact.hash);
+            let (temp, len) = fetch_artifact_to_temp_with_retry(
+                &self.http,
+                &gateway,
+                &artifact.hash,
+                cas.root(),
+                Some(artifact.len),
+            )
+            .await?;
+            if len != artifact.len {
+                anyhow::bail!("pinned artifact transport length mismatch");
+            }
+            cas.install_hashed_file(&artifact.hash, temp.into_temp_path())?;
+        }
+        // Re-verification happens once here and again inside the installer. The
+        // first pass prevents any unverified materialization attempt.
+        crate::pinned_bundle::verify_pinned_bundle_ready(cas, request)?;
+        Ok(())
+    }
+
+    async fn fetch_small_artifact_bounded(&self, hash: &str, maximum: usize) -> Result<Vec<u8>> {
+        crate::cas::Cas::validate_artifact_id(hash)?;
+        let url = format!("{}/v1/artifacts/{hash}", self.server);
+        let response = self.send(self.request(reqwest::Method::GET, &url)).await?;
+        if !response.status().is_success() {
+            return Err(server_error("fetch typed manifest", response).await);
+        }
+        let mut bytes = Vec::with_capacity(maximum.min(4096));
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.context("read typed manifest body")?;
+            let next = bytes
+                .len()
+                .checked_add(chunk.len())
+                .context("typed manifest size overflow")?;
+            if next > maximum {
+                anyhow::bail!("typed manifest exceeds client size limit");
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let actual = crate::cas::hash(&bytes);
+        if actual != hash {
+            anyhow::bail!("typed manifest hash mismatch: expected {hash}, got {actual}");
+        }
+        Ok(bytes)
+    }
+
     pub async fn resolve_ref(&self, repo_path: &str, branch: &str) -> Result<RefResponse> {
         self.resolve_ref_with_clonepack(repo_path, branch, None, None)
             .await
@@ -931,7 +1183,7 @@ impl Client {
         let fetch_url = signed_url.unwrap_or(&gateway_url);
         let use_signed_url = signed_url.is_some();
         let result = if use_signed_url {
-            fetch_artifact_to_temp_with_retry(&self.raw_http, fetch_url, &hash, dir)
+            fetch_artifact_to_temp_with_retry(&self.raw_http, fetch_url, &hash, dir, None)
                 .await
                 .map_err(|signed_err| {
                     anyhow::Error::new(StaleSignedUrl).context(format!(
@@ -939,7 +1191,7 @@ impl Client {
                     ))
                 })?
         } else {
-            fetch_artifact_to_temp_with_retry(&self.http, &gateway_url, &hash, dir).await?
+            fetch_artifact_to_temp_with_retry(&self.http, &gateway_url, &hash, dir, None).await?
         };
         if result.1 != chunk.len {
             anyhow::bail!(
@@ -3046,6 +3298,99 @@ fn local_rev_parse(main_repo: &Path, branch: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn typed_transport_preserves_bearer_and_upstream_auth() {
+        use axum::{Router, body::Bytes, http::HeaderMap, routing::get};
+        let body = Bytes::from_static(b"private typed manifest");
+        let hash = crate::cas::hash(&body);
+        let served = body.clone();
+        let app = Router::new()
+            .route(
+                "/v1/repos/github/acme/widget/clone-plan",
+                get(|headers: HeaderMap| async move {
+                    assert_eq!(
+                        headers.get("authorization").and_then(|v| v.to_str().ok()),
+                        Some("Bearer session-secret")
+                    );
+                    assert_eq!(
+                        headers
+                            .get("x-upstream-token")
+                            .and_then(|v| v.to_str().ok()),
+                        Some("provider-secret")
+                    );
+                    axum::Json(crate::clone_transport::ClonePlanResponse {
+                        protocol_version: crate::clone_transport::CLONE_PLAN_PROTOCOL_VERSION,
+                        workspace: "github".into(),
+                        repo: "acme/widget".into(),
+                        branch: "main".into(),
+                        mode: SyncMode::Head,
+                        target_commit: None,
+                        artifact_format_version: 1,
+                        state: crate::clone_transport::ClonePlanState::RepositoryInitializing,
+                    })
+                }),
+            )
+            .route(
+                "/v1/artifacts/{hash}",
+                get(move |headers: HeaderMap| {
+                    let served = served.clone();
+                    async move {
+                        assert_eq!(
+                            headers.get("authorization").and_then(|v| v.to_str().ok()),
+                            Some("Bearer session-secret")
+                        );
+                        // Artifact GETs intentionally need only gateway auth. Repo
+                        // access and upstream-origin authorization already happened
+                        // before the server issued the plan.
+                        served
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client =
+            Client::new_with_bearer(format!("http://{address}"), "session-secret".to_string())
+                .with_upstream_token("provider-secret");
+        assert!(matches!(
+            client
+                .fetch_typed_clone_plan("acme/widget", "main", SyncMode::Head)
+                .await
+                .unwrap(),
+            ClonePlan::RepositoryInitializing
+        ));
+        let fetched = client
+            .fetch_small_artifact_bounded(&hash, 1024)
+            .await
+            .unwrap();
+        assert_eq!(fetched, body);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn streamed_artifact_aborts_at_declared_length_and_removes_temp() {
+        use axum::{Router, body::Bytes, routing::get};
+        let body = Bytes::from_static(b"0123456789");
+        let hash = crate::cas::hash(&body);
+        let app = Router::new().route("/artifact", get(move || async move { body }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let directory = tempfile::tempdir().unwrap();
+        let error = fetch_artifact_to_temp_with_retry(
+            &reqwest::Client::new(),
+            &format!("http://{address}/artifact"),
+            &hash,
+            directory.path(),
+            Some(3),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("declared size limit"));
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+        server.abort();
+    }
 
     #[test]
     fn access_error_hints_are_actionable() {

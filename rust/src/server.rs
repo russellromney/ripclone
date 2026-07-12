@@ -4,6 +4,11 @@ use crate::auth::access::{AccessDecision, AccessVerifier, HttpAccessVerifier};
 use crate::auth::broker::{CredentialBroker, broker_from_env};
 use crate::backends::{self, QueueBackend};
 use crate::cas::Cas;
+use crate::clone_plan::{
+    ClonePlanningInput, ExactArtifacts, RepositoryAvailability, SyncMode, VerifiedArtifactReceipt,
+    VerifiedTopUpReceipt, plan_clone,
+};
+use crate::clone_transport::{ClonePlanResponse, CloneRequestIdentity};
 use crate::clonepack::{
     ChunkRef, ClonepackManifest, collect_manifest_hashes, hash_from_hex, hash_to_hex,
     install_manifest_pack_bytes, manifest_chunk_refs, manifest_pack_idx_bytes,
@@ -387,6 +392,17 @@ pub struct RefQuery {
     #[serde(default)]
     pub rev: Option<String>,
 }
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClonePlanQuery {
+    #[serde(default = "default_branch_value")]
+    branch: String,
+    mode: SyncMode,
+}
+
+const TYPED_ARTIFACT_FORMAT_VERSION: u32 = 1;
+const CLONE_CONSUMER_TTL_SECS: i64 = 5 * 60;
 
 fn default_clonepack_kind() -> String {
     "full".to_string()
@@ -2120,6 +2136,31 @@ async fn dispatch_repos_get(
     State(state): State<ServerState>,
     OriginalUri(uri): OriginalUri,
 ) -> impl IntoResponse {
+    if path.ends_with("/clone-plan") {
+        let repo_path = path.strip_suffix("/clone-plan").unwrap();
+        let Some((repo_id, provider)) = resolve_repo_id(&state.provider_registry, repo_path) else {
+            return unknown_provider_response();
+        };
+        if let Some(resp) =
+            validation::reject_if_invalid(|| validation::validate_repo_path(provider, &repo_id))
+        {
+            return resp;
+        }
+        let query = match Query::<ClonePlanQuery>::try_from_uri(&uri) {
+            Ok(query) => query.0,
+            Err(error) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: format!("invalid clone-plan request: {error}"),
+                    }),
+                )
+                    .into_response();
+            }
+        };
+        return typed_clone_plan_inner(repo_id, provider.clone(), query, headers, state).await;
+    }
+
     if let Some((repo_path, branch)) = path.rsplit_once("/refs/") {
         let Some((repo_id, provider)) = resolve_repo_id(&state.provider_registry, repo_path) else {
             return unknown_provider_response();
@@ -2128,6 +2169,16 @@ async fn dispatch_repos_get(
             validation::reject_if_invalid(|| validation::validate_repo_path(provider, &repo_id))
         {
             return resp;
+        }
+        if state.artifact_scheduler.is_some() {
+            return (
+                StatusCode::GONE,
+                Json(ErrorResponse {
+                    error: "legacy clone endpoint is disabled in normalized scheduler mode; use /clone-plan"
+                        .to_string(),
+                }),
+            )
+                .into_response();
         }
         return get_ref_inner(
             repo_id,
@@ -2952,6 +3003,704 @@ async fn rev_build_pending_for_commit(
         }
     }
     matches!(ref_store.load_build(repo_id, commit).await, Ok(Some(info)) if building(&info))
+}
+
+fn clone_plan_http_response(response: ClonePlanResponse) -> Response {
+    let status = match response.state {
+        crate::clone_transport::ClonePlanState::Ready { .. } => StatusCode::OK,
+        crate::clone_transport::ClonePlanState::Pending { .. }
+        | crate::clone_transport::ClonePlanState::RepositoryInitializing => StatusCode::ACCEPTED,
+        crate::clone_transport::ClonePlanState::RepositoryFailed => StatusCode::CONFLICT,
+    };
+    (status, Json(response)).into_response()
+}
+
+fn lifecycle_clone_response(
+    repo_id: &RepoId,
+    branch: &str,
+    mode: SyncMode,
+    availability: RepositoryAvailability,
+) -> Result<ClonePlanResponse> {
+    let plan = plan_clone(ClonePlanningInput {
+        availability,
+        workspace: repo_id.workspace.as_str(),
+        repo: &repo_id.path,
+        branch,
+        artifact_format_version: TYPED_ARTIFACT_FORMAT_VERSION,
+        mode,
+        // The planner deliberately returns on lifecycle before inspecting this.
+        target_commit: "",
+        exact: &ExactArtifacts::default(),
+        top_up: None,
+    })?;
+    ClonePlanResponse::from_verified_plan(
+        CloneRequestIdentity {
+            workspace: repo_id.workspace.as_str(),
+            repo: &repo_id.path,
+            branch,
+            mode,
+            target_commit: None,
+            artifact_format_version: TYPED_ARTIFACT_FORMAT_VERSION,
+        },
+        plan,
+    )
+}
+
+fn artifact_key(
+    repo_id: &RepoId,
+    commit: &str,
+    kind: crate::artifact_scheduler::ArtifactKind,
+) -> crate::artifact_scheduler::ArtifactKey {
+    crate::artifact_scheduler::ArtifactKey {
+        workspace: repo_id.workspace.as_str().to_owned(),
+        repo: repo_id.path.clone(),
+        commit: commit.to_owned(),
+        kind,
+        format_version: TYPED_ARTIFACT_FORMAT_VERSION,
+    }
+}
+
+fn clone_consumer_id(repo_id: &RepoId, target: &str, mode: SyncMode) -> String {
+    use sha2::Digest as _;
+    format!(
+        "clone-{}",
+        hex::encode(Sha256::digest(format!(
+            "{}\0{}\0{}\0{:?}",
+            repo_id.workspace.as_str(),
+            repo_id.path,
+            target,
+            mode,
+        )))
+    )
+}
+
+fn convergence_failure_is_fatal(plan: &crate::clone_plan::ClonePlan) -> bool {
+    matches!(plan, crate::clone_plan::ClonePlan::Pending { .. })
+}
+
+fn base_pack(pair: &crate::artifact_manifest::GitPackPair) -> crate::pinned_bundle::StoredPack {
+    crate::pinned_bundle::StoredPack {
+        pack: crate::topup::PinnedArtifactDescriptor {
+            kind: crate::topup::PinnedArtifactKind::BasePack,
+            hash: pair.pack.hash.clone(),
+            len: pair.pack.len,
+        },
+        index: crate::topup::PinnedArtifactDescriptor {
+            kind: crate::topup::PinnedArtifactKind::BasePackIndex,
+            hash: pair.index.hash.clone(),
+            len: pair.index.len,
+        },
+    }
+}
+
+// Keep the typed-history schema adaptation at this one boundary. The builder
+// wave may represent verified history as bounded LSM levels; clone planning
+// still consumes one immutable flattened base pack set after verification.
+fn full_history_base_packs(
+    history: &crate::artifact_manifest::FullHistoryArtifact,
+) -> Vec<crate::pinned_bundle::StoredPack> {
+    history.history_packs.iter().map(base_pack).collect()
+}
+
+async fn verified_artifact(
+    scheduler: &dyn crate::artifact_scheduler_backend::ArtifactSchedulerPersistence,
+    verifier: &crate::artifact_manifest::CasCompletionVerifier,
+    key: &crate::artifact_scheduler::ArtifactKey,
+) -> Result<
+    Option<(
+        VerifiedArtifactReceipt,
+        crate::artifact_manifest::ArtifactManifest,
+    )>,
+> {
+    let Some(record) = scheduler.get_by_key(key).await? else {
+        return Ok(None);
+    };
+    if record.state != crate::artifact_scheduler::ArtifactState::Ready {
+        return Ok(None);
+    }
+    let manifest_hash = record
+        .manifest
+        .as_deref()
+        .context("ready typed artifact has no manifest")?;
+    static VERIFY_LIMIT: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    let _permit = VERIFY_LIMIT
+        .get_or_init(|| tokio::sync::Semaphore::new(8))
+        .acquire()
+        .await
+        .expect("typed artifact verification semaphore never closes");
+    let verifier = verifier.clone();
+    let verify_key = key.clone();
+    let verify_hash = manifest_hash.to_owned();
+    let manifest =
+        tokio::task::spawn_blocking(move || verifier.verify_publication(&verify_key, &verify_hash))
+            .await
+            .context("typed artifact verification task failed")??;
+    let receipt = VerifiedArtifactReceipt::from_published(&record)?;
+    Ok(Some((receipt, manifest)))
+}
+
+async fn load_exact_clone_artifacts(
+    scheduler: &dyn crate::artifact_scheduler_backend::ArtifactSchedulerPersistence,
+    verifier: &crate::artifact_manifest::CasCompletionVerifier,
+    repo_id: &RepoId,
+    target: &str,
+    mode: SyncMode,
+) -> Result<ExactArtifacts> {
+    use crate::artifact_scheduler::ArtifactKind;
+    async fn receipt(
+        scheduler: &dyn crate::artifact_scheduler_backend::ArtifactSchedulerPersistence,
+        verifier: &crate::artifact_manifest::CasCompletionVerifier,
+        repo_id: &RepoId,
+        target: &str,
+        kind: ArtifactKind,
+    ) -> Result<Option<VerifiedArtifactReceipt>> {
+        let key = artifact_key(repo_id, target, kind);
+        Ok(verified_artifact(scheduler, verifier, &key)
+            .await?
+            .map(|(receipt, _)| receipt))
+    }
+
+    let mut exact = ExactArtifacts::default();
+    match mode {
+        SyncMode::Files => {
+            exact.files =
+                receipt(scheduler, verifier, repo_id, target, ArtifactKind::Files).await?;
+            if exact.files.is_none() {
+                exact.head =
+                    receipt(scheduler, verifier, repo_id, target, ArtifactKind::Head).await?;
+            }
+        }
+        SyncMode::Head => {
+            exact.head = receipt(scheduler, verifier, repo_id, target, ArtifactKind::Head).await?;
+        }
+        SyncMode::Full => {
+            exact.head = receipt(scheduler, verifier, repo_id, target, ArtifactKind::Head).await?;
+            exact.history = receipt(
+                scheduler,
+                verifier,
+                repo_id,
+                target,
+                ArtifactKind::FullHistory,
+            )
+            .await?;
+        }
+    }
+    Ok(exact)
+}
+
+async fn published_candidate_commit(
+    scheduler: &dyn crate::artifact_scheduler_backend::ArtifactSchedulerPersistence,
+    repo_id: &RepoId,
+    branch: &str,
+    kind: crate::artifact_scheduler::ArtifactKind,
+) -> Result<Option<String>> {
+    Ok(scheduler
+        .published(
+            repo_id.workspace.as_str(),
+            &repo_id.path,
+            branch,
+            kind,
+            TYPED_ARTIFACT_FORMAT_VERSION,
+        )
+        .await?
+        .map(|record| record.key.commit))
+}
+
+type PinnedGenerationCell =
+    tokio::sync::OnceCell<std::result::Result<crate::topup::PinnedBundleRequest, String>>;
+
+fn pinned_generation_cells()
+-> &'static StdMutex<HashMap<String, std::sync::Weak<PinnedGenerationCell>>> {
+    static CELLS: std::sync::OnceLock<
+        StdMutex<HashMap<String, std::sync::Weak<PinnedGenerationCell>>>,
+    > = std::sync::OnceLock::new();
+    CELLS.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+fn pinned_generation_limit() -> &'static tokio::sync::Semaphore {
+    static LIMIT: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    LIMIT.get_or_init(|| tokio::sync::Semaphore::new(2))
+}
+
+fn pinned_generation_cell(key: String) -> Arc<PinnedGenerationCell> {
+    let mut cells = pinned_generation_cells().lock().unwrap();
+    if let Some(cell) = cells.get(&key).and_then(std::sync::Weak::upgrade) {
+        cell
+    } else {
+        let cell = Arc::new(PinnedGenerationCell::new());
+        cells.insert(key, Arc::downgrade(&cell));
+        cell
+    }
+}
+
+async fn generate_pinned_bundle_singleflight(
+    state: &ServerState,
+    repo_id: &RepoId,
+    provider: &ProviderInstance,
+    mirror: &std::path::Path,
+    branch: &str,
+    target: &str,
+    base: crate::pinned_bundle::VerifiedBaseArtifact,
+) -> Result<crate::topup::PinnedBundleRequest> {
+    let mode = base.mode;
+    let key = format!(
+        "{}\0{}\0{}\0{}\0{}\0{}\0{}\0{:?}",
+        state.cas.root().display(),
+        repo_id.workspace.as_str(),
+        repo_id.path,
+        branch,
+        base.commit,
+        target,
+        TYPED_ARTIFACT_FORMAT_VERSION,
+        mode,
+    );
+    let cell = pinned_generation_cell(key);
+    let workspace = repo_id.workspace.as_str().to_owned();
+    let repo = repo_id.path.clone();
+    let mirror = mirror.to_path_buf();
+    let cas = state.cas.clone();
+    let base_commit = base.commit.clone();
+    let target = target.to_owned();
+    let branch = branch.to_owned();
+    let origin = provider.clone_url(&repo_id.path);
+    let result = cell
+        .get_or_init(|| async move {
+            let _permit = pinned_generation_limit()
+                .acquire()
+                .await
+                .map_err(|_| "pinned generation limit closed".to_string())?;
+            tokio::task::spawn_blocking(move || {
+                crate::pinned_bundle::generate_pinned_bundle(
+                    crate::pinned_bundle::PinnedBundleBuild {
+                        workspace_id: &workspace,
+                        repo_path: &repo,
+                        mirror: &mirror,
+                        cas: &cas,
+                        base_commit: &base_commit,
+                        base_artifact: &base,
+                        target_commit: &target,
+                        mode,
+                        branch: &branch,
+                        canonical_origin: &origin,
+                    },
+                )
+                .map_err(|error| format!("{error:#}"))
+            })
+            .await
+            .map_err(|error| format!("pinned generation task failed: {error}"))?
+        })
+        .await;
+    result.clone().map_err(anyhow::Error::msg)
+}
+
+async fn build_top_up_receipt(
+    state: &ServerState,
+    scheduler: &dyn crate::artifact_scheduler_backend::ArtifactSchedulerPersistence,
+    verifier: &crate::artifact_manifest::CasCompletionVerifier,
+    repo_id: &RepoId,
+    provider: &ProviderInstance,
+    mirror: &std::path::Path,
+    branch: &str,
+    target: &str,
+    mode: SyncMode,
+) -> Result<Option<VerifiedTopUpReceipt>> {
+    use crate::artifact_manifest::ArtifactPayload;
+    use crate::artifact_scheduler::ArtifactKind;
+    use crate::topup::TopUpMode;
+
+    let top_up_mode = match mode {
+        SyncMode::Files | SyncMode::Head => TopUpMode::Head,
+        SyncMode::Full => TopUpMode::Full,
+    };
+    let mut candidates = Vec::new();
+    if let Some(commit) =
+        published_candidate_commit(scheduler, repo_id, branch, ArtifactKind::Head).await?
+    {
+        candidates.push(commit);
+    }
+    if top_up_mode == TopUpMode::Full {
+        candidates.clear();
+        if let Some(commit) =
+            published_candidate_commit(scheduler, repo_id, branch, ArtifactKind::FullHistory)
+                .await?
+        {
+            candidates.push(commit);
+        }
+    }
+    for base_commit in candidates {
+        let head_key = artifact_key(repo_id, &base_commit, ArtifactKind::Head);
+        let Some((_, head_manifest)) = verified_artifact(scheduler, verifier, &head_key).await?
+        else {
+            continue;
+        };
+        let ArtifactPayload::Head(head) = head_manifest.payload else {
+            anyhow::bail!("verified Head publication decoded as another artifact kind");
+        };
+        let mut packs = head.packs.iter().map(base_pack).collect::<Vec<_>>();
+        if top_up_mode == TopUpMode::Full {
+            let history_key = artifact_key(repo_id, &base_commit, ArtifactKind::FullHistory);
+            let Some((_, history_manifest)) =
+                verified_artifact(scheduler, verifier, &history_key).await?
+            else {
+                continue;
+            };
+            let ArtifactPayload::FullHistory(history) = history_manifest.payload else {
+                anyhow::bail!("verified History publication decoded as another artifact kind");
+            };
+            packs.extend(full_history_base_packs(&history));
+        }
+        let base = crate::pinned_bundle::VerifiedBaseArtifact {
+            commit: base_commit.clone(),
+            mode: top_up_mode,
+            packs,
+        };
+        let request = match generate_pinned_bundle_singleflight(
+            state, repo_id, provider, mirror, branch, target, base,
+        )
+        .await
+        {
+            Ok(request) => request,
+            Err(error) => {
+                warn!("compatible pinned base could not produce a bundle: {error:#}");
+                continue;
+            }
+        };
+        let verify_cas = state.cas.clone();
+        let verify_request = request.clone();
+        let _permit = pinned_generation_limit()
+            .acquire()
+            .await
+            .expect("pinned generation limit never closes");
+        let verified = tokio::task::spawn_blocking(move || {
+            crate::pinned_bundle::verify_pinned_bundle_ready(&verify_cas, &verify_request)
+        })
+        .await
+        .context("pinned bundle verification task failed")??;
+        // Bundle generation writes immutable local CAS objects. Publish every
+        // verified object through the configured durable storage before issuing
+        // a plan, otherwise an S3-backed server would hand clients hashes that
+        // exist only on the generating host.
+        let mut hashes = verified
+            .artifacts
+            .iter()
+            .map(|artifact| artifact.hash.clone())
+            .collect::<Vec<_>>();
+        hashes.push(request.manifest_hash.clone());
+        let storage = state.storage.clone();
+        let cas = state.cas.clone();
+        futures::stream::iter(hashes.into_iter().map(|hash| {
+            let storage = storage.clone();
+            let path = cas.path(&hash);
+            async move {
+                storage
+                    .put_file_async(&hash, &path)
+                    .await
+                    .with_context(|| format!("publish pinned bundle object {hash}"))
+            }
+        }))
+        .buffer_unordered(8)
+        .try_collect::<Vec<_>>()
+        .await?;
+        return Ok(Some(VerifiedTopUpReceipt::from_verified(&verified)?));
+    }
+    Ok(None)
+}
+
+async fn typed_clone_plan_inner(
+    repo_id: RepoId,
+    provider: ProviderInstance,
+    query: ClonePlanQuery,
+    headers: HeaderMap,
+    state: ServerState,
+) -> Response {
+    if let Some(response) =
+        validation::reject_if_invalid(|| validation::validate_git_rev(&query.branch))
+    {
+        return response;
+    }
+    let Some(scheduler) = state.artifact_scheduler.clone() else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "typed clone-plan endpoint requires RIPCLONE_ARTIFACT_SCHEDULER=normalized"
+                    .to_string(),
+            }),
+        )
+            .into_response();
+    };
+    let added = match state.ref_store.load_added_repo(&repo_id).await {
+        Ok(Some(added)) => added,
+        Ok(None) => return repo_not_added_response(),
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("repo lifecycle lookup failed: {error}"),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    let request_token = upstream_token_from_headers(&headers);
+    let credential = match state
+        .broker
+        .fetch_credential(&repo_id, request_token.as_ref())
+    {
+        Ok(credential) => credential,
+        Err(error) => return credential_error_response(error),
+    };
+    if let Err(response) =
+        authorize_repo_read(&state, &provider, &repo_id, credential.as_ref(), &headers).await
+    {
+        return response;
+    }
+
+    let availability = match added.state {
+        RepoLifecycleState::Initializing => RepositoryAvailability::Initializing,
+        RepoLifecycleState::Active => RepositoryAvailability::Active,
+        RepoLifecycleState::Failed => RepositoryAvailability::Failed,
+    };
+    if availability != RepositoryAvailability::Active {
+        return match lifecycle_clone_response(&repo_id, &query.branch, query.mode, availability) {
+            Ok(response) => clone_plan_http_response(response),
+            Err(error) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("construct lifecycle clone plan: {error:#}"),
+                }),
+            )
+                .into_response(),
+        };
+    }
+
+    // Keep the mirror lock through bundle construction. The exact SHA is
+    // resolved once after a forced fetch, and a concurrent force-push cannot
+    // prune or replace its object graph midway through generation.
+    let mirror = state.repo_root.join(repo_id.mirror_dir_name());
+    let lock = repo_lock(&state.sync_locks, &repo_id).await;
+    let _guard = lock.lock().await;
+    if let Err(error) = ensure_mirror(
+        &mirror,
+        &provider,
+        &repo_id,
+        &query.branch,
+        None,
+        credential.as_ref(),
+    )
+    .await
+    {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(ErrorResponse {
+                error: format!("resolve clone target: {error:#}"),
+            }),
+        )
+            .into_response();
+    }
+    let resolve_mirror = mirror.clone();
+    let resolve_branch = query.branch.clone();
+    let target = match tokio::task::spawn_blocking(move || {
+        git::resolve_commit(&resolve_mirror, &resolve_branch)
+    })
+    .await
+    {
+        Ok(Ok(target)) => target,
+        Ok(Err(error)) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("clone target not found: {error:#}"),
+                }),
+            )
+                .into_response();
+        }
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("clone target resolve task failed: {error}"),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    let verifier = crate::artifact_manifest::CasCompletionVerifier::new(state.cas.clone());
+    let exact = match load_exact_clone_artifacts(
+        scheduler.as_ref(),
+        &verifier,
+        &repo_id,
+        &target,
+        query.mode,
+    )
+    .await
+    {
+        Ok(exact) => exact,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("typed artifact integrity failure: {error:#}"),
+                }),
+            )
+                .into_response();
+        }
+    };
+    let needs_top_up = match query.mode {
+        SyncMode::Files | SyncMode::Head => exact.head.is_none() && exact.files.is_none(),
+        SyncMode::Full => exact.head.is_none() || exact.history.is_none(),
+    };
+    let top_up = if needs_top_up {
+        match build_top_up_receipt(
+            &state,
+            scheduler.as_ref(),
+            &verifier,
+            &repo_id,
+            &provider,
+            &mirror,
+            &query.branch,
+            &target,
+            query.mode,
+        )
+        .await
+        {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("pinned top-up verification failed: {error:#}"),
+                    }),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        None
+    };
+    let plan = match plan_clone(ClonePlanningInput {
+        availability,
+        workspace: repo_id.workspace.as_str(),
+        repo: &repo_id.path,
+        branch: &query.branch,
+        artifact_format_version: TYPED_ARTIFACT_FORMAT_VERSION,
+        mode: query.mode,
+        target_commit: &target,
+        exact: &exact,
+        top_up: top_up.as_ref(),
+    }) {
+        Ok(plan) => plan,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("construct clone plan: {error:#}"),
+                }),
+            )
+                .into_response();
+        }
+    };
+    let convergence_required = convergence_failure_is_fatal(&plan);
+    let required_for_convergence: Vec<_> = match query.mode {
+        SyncMode::Files if exact.files.is_some() => Vec::new(),
+        SyncMode::Files | SyncMode::Head => exact
+            .head
+            .is_none()
+            .then_some(crate::artifact_scheduler::ArtifactKind::Head)
+            .into_iter()
+            .collect(),
+        SyncMode::Full => {
+            let mut required = Vec::with_capacity(2);
+            if exact.head.is_none() {
+                required.push(crate::artifact_scheduler::ArtifactKind::Head);
+            }
+            if exact.history.is_none() {
+                required.push(crate::artifact_scheduler::ArtifactKind::FullHistory);
+            }
+            required
+        }
+    };
+    if !required_for_convergence.is_empty() {
+        let consumer = clone_consumer_id(&repo_id, &target, query.mode);
+        for kind in &required_for_convergence {
+            let key = artifact_key(&repo_id, &target, *kind);
+            let subscribed = match scheduler
+                .subscribe_consumer(&key, &consumer, CLONE_CONSUMER_TTL_SECS)
+                .await
+            {
+                Ok(outcome) => outcome,
+                Err(error) if convergence_required => {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(ErrorResponse {
+                            error: format!("subscribe clone artifact: {error:#}"),
+                        }),
+                    )
+                        .into_response();
+                }
+                Err(error) => {
+                    warn!("ready clone plan could not refresh exact-artifact consumer: {error:#}");
+                    continue;
+                }
+            };
+            if matches!(
+                subscribed,
+                crate::artifact_scheduler::ScheduleOutcome::Failed(_, _)
+            ) {
+                match scheduler.retry_failed(&key).await {
+                    Ok(crate::artifact_scheduler::RetryOutcome::Requeued(_))
+                    | Ok(crate::artifact_scheduler::RetryOutcome::NotFailed) => {}
+                    Ok(outcome) => {
+                        if convergence_required {
+                            return (
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                Json(ErrorResponse {
+                                    error: format!(
+                                        "required typed artifact cannot be retried: {outcome:?}"
+                                    ),
+                                }),
+                            )
+                                .into_response();
+                        }
+                        warn!("ready clone plan exact-artifact retry was unavailable: {outcome:?}");
+                    }
+                    Err(error) => {
+                        if convergence_required {
+                            return (
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                Json(ErrorResponse {
+                                    error: format!("retry required typed artifact: {error:#}"),
+                                }),
+                            )
+                                .into_response();
+                        }
+                        warn!(
+                            "ready clone plan exact-artifact retry failed best-effort: {error:#}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    let identity = CloneRequestIdentity {
+        workspace: repo_id.workspace.as_str(),
+        repo: &repo_id.path,
+        branch: &query.branch,
+        mode: query.mode,
+        target_commit: Some(&target),
+        artifact_format_version: TYPED_ARTIFACT_FORMAT_VERSION,
+    };
+    match ClonePlanResponse::from_verified_plan(identity, plan) {
+        Ok(response) => clone_plan_http_response(response),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("encode clone plan: {error:#}"),
+            }),
+        )
+            .into_response(),
+    }
 }
 
 async fn get_ref_inner(
@@ -9136,6 +9885,442 @@ mod tests {
             access_verifier: Arc::new(HttpAccessVerifier::new()),
             require_repo_auth: false,
         }
+    }
+
+    #[test]
+    fn typed_clone_lifecycle_hides_target_and_consumer_refresh_is_stable() {
+        let repo = RepoId::github("acme/widget");
+        for availability in [
+            RepositoryAvailability::Initializing,
+            RepositoryAvailability::Failed,
+        ] {
+            let response =
+                lifecycle_clone_response(&repo, "main", SyncMode::Full, availability).unwrap();
+            assert!(response.target_commit.is_none());
+            assert!(matches!(
+                response.state,
+                crate::clone_transport::ClonePlanState::RepositoryInitializing
+                    | crate::clone_transport::ClonePlanState::RepositoryFailed
+            ));
+            let serialized = serde_json::to_string(&response).unwrap();
+            assert!(!serialized.contains("2222222222222222222222222222222222222222"));
+        }
+
+        let target = "2222222222222222222222222222222222222222";
+        let first = clone_consumer_id(&repo, target, SyncMode::Full);
+        assert_eq!(first, clone_consumer_id(&repo, target, SyncMode::Full));
+        assert_ne!(first, clone_consumer_id(&repo, target, SyncMode::Head));
+        assert_ne!(
+            first,
+            clone_consumer_id(&RepoId::github("other/widget"), target, SyncMode::Full)
+        );
+        assert!(first.len() <= 255);
+    }
+
+    #[tokio::test]
+    async fn pinned_generation_cell_coalesces_concurrent_exact_keys() {
+        let key = format!("test-singleflight-{}", rand::random::<u64>());
+        let first = pinned_generation_cell(key.clone());
+        let second = pinned_generation_cell(key);
+        assert!(Arc::ptr_eq(&first, &second));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut tasks = Vec::new();
+        for cell in [first, second] {
+            let calls = calls.clone();
+            tasks.push(tokio::spawn(async move {
+                cell.get_or_init(|| async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    tokio::task::yield_now().await;
+                    Ok(crate::topup::PinnedBundleRequest {
+                        manifest_hash: "a".repeat(64),
+                        format_version: 1,
+                        workspace_id: "workspace".into(),
+                        repo_path: "owner/repo".into(),
+                        base_commit: "1".repeat(40),
+                        target_commit: "2".repeat(40),
+                        branch: "main".into(),
+                        mode: crate::topup::TopUpMode::Head,
+                    })
+                })
+                .await
+                .clone()
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap().unwrap();
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn saturated_scheduler_does_not_invalidate_an_already_ready_plan() {
+        use crate::artifact_scheduler::{ArtifactKey, ArtifactKind, SchedulerLimits};
+        let root = tempfile::tempdir().unwrap();
+        let limits = SchedulerLimits {
+            total_backlog: 1,
+            workspace_backlog: 1,
+            head_reserved: 1,
+            head_backlog: 1,
+            full_history_backlog: 1,
+            files_backlog: 1,
+            ..SchedulerLimits::default()
+        };
+        let scheduler = crate::artifact_scheduler::ArtifactScheduler::open(
+            root.path().join("scheduler.db").to_str().unwrap(),
+            limits,
+        )
+        .await
+        .unwrap();
+        let key = |repo: &str| ArtifactKey {
+            workspace: "workspace".into(),
+            repo: repo.into(),
+            commit: "1".repeat(40),
+            kind: ArtifactKind::Head,
+            format_version: 1,
+        };
+        scheduler.schedule(&key("owner/saturated")).await.unwrap();
+        assert!(
+            scheduler
+                .subscribe_consumer(&key("owner/clone"), "clone-stable", 60)
+                .await
+                .is_err(),
+            "the fixture must actually saturate the normalized backlog"
+        );
+        let ready = crate::clone_plan::ClonePlan::Ready {
+            target_commit: "2".repeat(40),
+            payload: crate::clone_plan::ClonePayload::FilesArchive {
+                manifest: "a".repeat(64),
+            },
+        };
+        let pending = crate::clone_plan::ClonePlan::Pending {
+            target_commit: "2".repeat(40),
+            required: vec![ArtifactKind::Head],
+        };
+        assert!(!convergence_failure_is_fatal(&ready));
+        assert!(convergence_failure_is_fatal(&pending));
+    }
+
+    #[tokio::test]
+    async fn normalized_http_serves_verified_exact_head_full_and_files_plans() {
+        use crate::artifact_manifest::{
+            ArtifactManifest, ArtifactPayload, CasBlob, FilesArtifact, FullHistoryArtifact,
+            GitPackPair, HeadArtifact,
+        };
+        use crate::artifact_scheduler::{ArtifactKind, SchedulerLimits};
+        use crate::artifact_scheduler_backend::ArtifactSchedulerPersistence as _;
+        use crate::clone_plan::{ClonePayload, ClonePlan};
+        use crate::provider::ProviderConfig;
+
+        fn run(repo: &std::path::Path, args: &[&str]) -> String {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        }
+        fn pairs(
+            repo: &std::path::Path,
+            cas: &Cas,
+            commit: &str,
+            depth: Option<usize>,
+        ) -> Vec<GitPackPair> {
+            PackBuilder::new(repo, cas)
+                .build_depth_packs(commit, depth, 1024 * 1024)
+                .unwrap()
+                .into_iter()
+                .map(|(pack, pack_len, index, index_len)| GitPackPair {
+                    pack: CasBlob {
+                        hash: pack,
+                        len: pack_len,
+                    },
+                    index: CasBlob {
+                        hash: index,
+                        len: index_len,
+                    },
+                })
+                .collect()
+        }
+
+        let fixture = tempfile::tempdir().unwrap();
+        let source = fixture.path().join("source");
+        crate::git::init(&source).unwrap();
+        run(&source, &["config", "user.name", "test"]);
+        run(&source, &["config", "user.email", "test@example.invalid"]);
+        std::fs::write(source.join("file.txt"), b"base\n").unwrap();
+        run(&source, &["add", "."]);
+        run(&source, &["commit", "-m", "base"]);
+        let first = run(&source, &["rev-parse", "HEAD"]);
+        std::fs::write(source.join("file.txt"), b"target\n").unwrap();
+        run(&source, &["commit", "-am", "target"]);
+        let target = run(&source, &["rev-parse", "HEAD"]);
+
+        // A tiny dumb-HTTP Git origin is enough to exercise the real forced
+        // fetch/resolve path without inheriting credentials or shell state.
+        let origin_root = fixture.path().join("origin");
+        std::fs::create_dir_all(origin_root.join("acme")).unwrap();
+        let origin_repo = origin_root.join("acme/widget.git");
+        let output = std::process::Command::new("git")
+            .args(["clone", "--bare"])
+            .arg(&source)
+            .arg(&origin_repo)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        run(&origin_repo, &["update-server-info"]);
+        let origin_files = origin_root.clone();
+        let origin_app = Router::new().route(
+            "/{*path}",
+            get(move |Path(path): Path<String>| {
+                let root = origin_files.clone();
+                async move {
+                    if path.split('/').any(|part| matches!(part, "" | "." | "..")) {
+                        return StatusCode::NOT_FOUND.into_response();
+                    }
+                    match tokio::fs::read(root.join(path)).await {
+                        Ok(bytes) => (StatusCode::OK, bytes).into_response(),
+                        Err(_) => StatusCode::NOT_FOUND.into_response(),
+                    }
+                }
+            }),
+        );
+        let origin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_address = origin_listener.local_addr().unwrap();
+        let origin_task =
+            tokio::spawn(async move { axum::serve(origin_listener, origin_app).await.unwrap() });
+
+        let state_root = tempfile::tempdir().unwrap();
+        let mut state = test_state(&state_root);
+        let mut registry = ProviderRegistry::new();
+        registry
+            .merge_one(ProviderConfig {
+                id: "github".into(),
+                kind: Some("github".into()),
+                host: Some(format!("http://{origin_address}")),
+                token: None,
+                auth_template: None,
+                auth_header_name: None,
+            })
+            .unwrap();
+        state.provider_registry = registry.clone();
+        state.broker = Arc::new(crate::auth::broker::StaticBroker::new(registry));
+
+        let verifier = Arc::new(crate::artifact_manifest::CasCompletionVerifier::new(
+            state.cas.clone(),
+        ));
+        let scheduler = Arc::new(
+            crate::artifact_scheduler::ArtifactScheduler::open_with_verifier(
+                state_root.path().join("scheduler.db").to_str().unwrap(),
+                SchedulerLimits::default(),
+                verifier,
+            )
+            .await
+            .unwrap(),
+        );
+        let repo_id = RepoId::github("acme/widget");
+        state
+            .ref_store
+            .add_repo(&AddedRepo {
+                repo_id: repo_id.clone(),
+                added_at: 1,
+                history_enabled: true,
+                source: AddedRepoSource::Api,
+                repo_size_bytes: None,
+                state: RepoLifecycleState::Active,
+                initialization_branch: Some("main".into()),
+                initialization_target: Some(target.clone()),
+                activated_at: Some(1),
+                failure: None,
+                initialization_attempt_id: Some("attempt".into()),
+            })
+            .await
+            .unwrap();
+
+        let head_builder = PackBuilder::new(&source, &state.cas);
+        let (skeleton, _) = head_builder.build_shallow_skeleton_pack(&target).unwrap();
+        let index = head_builder
+            .build_prebuilt_index(&target, &skeleton)
+            .unwrap();
+        let head = ArtifactManifest::new(
+            &artifact_key(&repo_id, &target, ArtifactKind::Head),
+            ArtifactPayload::Head(HeadArtifact {
+                packs: pairs(&source, &state.cas, &target, Some(1)),
+                prebuilt_index: CasBlob {
+                    len: state.cas.verify_object(&index).unwrap(),
+                    hash: index,
+                },
+            }),
+        )
+        .unwrap();
+        let commit_bytes = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&source)
+            .args(["cat-file", "commit", &target])
+            .output()
+            .unwrap()
+            .stdout;
+        let commit_blob = CasBlob {
+            hash: state.cas.put(&commit_bytes).unwrap(),
+            len: commit_bytes.len() as u64,
+        };
+        let history = ArtifactManifest::new(
+            &artifact_key(&repo_id, &target, ArtifactKind::FullHistory),
+            ArtifactPayload::FullHistory(FullHistoryArtifact {
+                target_commit_object: commit_blob.clone(),
+                history_packs: pairs(&source, &state.cas, &first, None),
+            }),
+        )
+        .unwrap();
+        let content = b"target\n";
+        let compressed = zstd::encode_all(content.as_slice(), 1).unwrap();
+        let mut blob_hasher = sha1::Sha1::new();
+        use sha1::Digest as _;
+        blob_hasher.update(format!("blob {}\0", content.len()).as_bytes());
+        blob_hasher.update(content);
+        let mut metadata = crate::manifest::MetadataChunk::new();
+        metadata.frames.push(crate::manifest::FrameInfo {
+            chunk_index: 0,
+            chunk_offset: 0,
+            compressed_len: compressed.len() as u32,
+            raw_len: content.len() as u32,
+        });
+        metadata.files.push(crate::manifest::FileEntry {
+            path: b"file.txt".to_vec(),
+            mode: 0o100644,
+            blob_sha1: blob_hasher.finalize().to_vec(),
+            fragments: vec![crate::manifest::Fragment {
+                frame_index: 0,
+                frame_offset: 0,
+                raw_len: content.len() as u32,
+            }],
+        });
+        let chunks = vec![state.cas.put(&compressed).unwrap()];
+        let mut metadata_bytes = Vec::new();
+        metadata.write(&mut metadata_bytes).unwrap();
+        let files = ArtifactManifest::new(
+            &artifact_key(&repo_id, &target, ArtifactKind::Files),
+            ArtifactPayload::Files(FilesArtifact {
+                target_commit_object: commit_blob,
+                metadata: CasBlob {
+                    hash: state.cas.put(&metadata_bytes).unwrap(),
+                    len: metadata_bytes.len() as u64,
+                },
+                archive_chunks: chunks
+                    .into_iter()
+                    .map(|hash| CasBlob {
+                        len: state.cas.verify_object(&hash).unwrap(),
+                        hash,
+                    })
+                    .collect(),
+                zstd_dictionary: None,
+                gitlinks: vec![],
+            }),
+        )
+        .unwrap();
+        let snapshot = scheduler
+            .observation_snapshot("github", "acme/widget", "main")
+            .await
+            .unwrap();
+        scheduler
+            .observe_if_changed(
+                &snapshot,
+                &target,
+                &[
+                    ArtifactKind::Head,
+                    ArtifactKind::FullHistory,
+                    ArtifactKind::Files,
+                ],
+                1,
+            )
+            .await
+            .unwrap();
+        let mut evidence = std::collections::HashMap::new();
+        for manifest in [head, history, files] {
+            let stored = manifest.store(&state.cas).unwrap();
+            evidence.insert(stored.key.kind, stored);
+        }
+        let head_manifest_hash = evidence[&ArtifactKind::Head].manifest.clone();
+        let server_cas = state.cas.clone();
+        for _ in 0..3 {
+            let claim = scheduler.claim("publisher", 60).await.unwrap().unwrap();
+            let stored = evidence.remove(&claim.record.key.kind).unwrap();
+            assert!(
+                scheduler
+                    .complete(&claim, "publisher", &stored)
+                    .await
+                    .unwrap()
+            );
+        }
+        state.artifact_scheduler = Some(scheduler);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = build_app(state);
+        let server_task = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap()
+        });
+        let client = crate::client::Client::new_with_token(
+            format!("http://{address}"),
+            Some(hex::encode(Sha256::digest("secret"))),
+        );
+        for (mode, expected) in [
+            (SyncMode::Files, "files"),
+            (SyncMode::Head, "head"),
+            (SyncMode::Full, "full"),
+        ] {
+            let plan = client
+                .fetch_typed_clone_plan("acme/widget", "main", mode)
+                .await
+                .unwrap();
+            assert!(matches!(
+                (&plan, expected),
+                (
+                    ClonePlan::Ready {
+                        payload: ClonePayload::FilesArchive { .. },
+                        ..
+                    },
+                    "files"
+                ) | (
+                    ClonePlan::Ready {
+                        payload: ClonePayload::HeadArtifact { .. },
+                        ..
+                    },
+                    "head"
+                ) | (
+                    ClonePlan::Ready {
+                        payload: ClonePayload::FullArtifacts { .. },
+                        ..
+                    },
+                    "full"
+                )
+            ));
+        }
+        std::fs::write(
+            server_cas.path(&head_manifest_hash),
+            b"corrupt foreign bytes",
+        )
+        .unwrap();
+        let error = client
+            .fetch_typed_clone_plan("acme/widget", "main", SyncMode::Head)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("typed artifact integrity failure"),
+            "corrupt ready publication must fail closed: {error:#}"
+        );
+        server_task.abort();
+        origin_task.abort();
     }
 
     struct CountingGetStorage {

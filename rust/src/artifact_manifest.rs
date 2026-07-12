@@ -1993,6 +1993,27 @@ impl CasCompletionVerifier {
         .await
         .context("join durable root verification")??;
         Ok(())
+     }
+
+    /// Re-verify a scheduler publication at read time. The artifact count is
+    /// derived from the authenticated manifest instead of trusting a database
+    /// field that is not part of the normalized publication record.
+    pub fn verify_publication(
+        &self,
+        key: &ArtifactKey,
+        manifest_hash: &str,
+    ) -> Result<ArtifactManifest> {
+        Cas::validate_artifact_id(manifest_hash).context("invalid artifact manifest CAS id")?;
+        let bytes = self.read_hash_bounded(
+            manifest_hash,
+            self.limits.manifest_bytes,
+            "artifact manifest",
+        )?;
+        let manifest: ArtifactManifest =
+            serde_json::from_slice(&bytes).context("decode typed artifact manifest")?;
+        let artifact_count = manifest.payload.artifact_count();
+        drop(bytes);
+        self.verify_manifest(key, manifest_hash, artifact_count)
     }
 
     fn read_hash_bounded(&self, hash: &str, maximum: u64, role: &str) -> Result<Vec<u8>> {
@@ -3794,6 +3815,27 @@ mod tests {
         for manifest in manifests {
             f.verify(&manifest).unwrap();
         }
+    }
+
+    #[test]
+    fn publication_reverification_derives_count_and_rejects_foreign_identity() {
+        let f = Fixture::new();
+        let manifest = f.head();
+        let evidence = manifest.store(&f.cas).unwrap();
+        let verifier = CasCompletionVerifier::new(f.cas.clone());
+        assert_eq!(
+            verifier
+                .verify_publication(&evidence.key, &evidence.manifest)
+                .unwrap(),
+            manifest
+        );
+        let mut foreign = evidence.key;
+        foreign.workspace = "foreign-workspace".into();
+        assert!(
+            verifier
+                .verify_publication(&foreign, &evidence.manifest)
+                .is_err()
+        );
     }
 
     #[test]
