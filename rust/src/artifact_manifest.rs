@@ -645,6 +645,7 @@ fn packed_object_ids(repo: &Path) -> Result<HashSet<String>> {
 
 fn reachable_objects(repo: &Path, revisions: &[&str]) -> Result<HashSet<String>> {
     let mut command = Command::new("git");
+    configure_git_command(&mut command);
     command
         .arg("-C")
         .arg(repo)
@@ -654,9 +655,7 @@ fn reachable_objects(repo: &Path, revisions: &[&str]) -> Result<HashSet<String>>
             "--no-object-names",
             "--end-of-options",
         ])
-        .args(revisions)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("HOME", "/nonexistent");
+        .args(revisions);
     let output = command.output().context("enumerate verified Git closure")?;
     if !output.status.success() {
         bail!(
@@ -673,12 +672,12 @@ fn reachable_objects(repo: &Path, revisions: &[&str]) -> Result<HashSet<String>>
 }
 
 fn git(repo: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    configure_git_command(&mut command);
+    let output = command
         .arg("-C")
         .arg(repo)
         .args(args)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("HOME", "/nonexistent")
         .output()
         .with_context(|| format!("run git {}", args.join(" ")))?;
     if !output.status.success() {
@@ -688,6 +687,21 @@ fn git(repo: &Path, args: &[&str]) -> Result<String> {
         );
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+fn configure_git_command(command: &mut Command) {
+    // Verification must not inherit alternates, replacement refs, injected
+    // config, or a caller-selected repository/index from the worker process.
+    // Keep only executable discovery; all verified state lives in fresh temp
+    // directories populated from the typed CAS descriptors above.
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    command
+        .env_clear()
+        .env("PATH", path)
+        .env("HOME", "/nonexistent")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_ATTR_NOSYSTEM", "1")
+        .env("LC_ALL", "C");
 }
 
 #[cfg(test)]
