@@ -22,8 +22,10 @@ use async_trait::async_trait;
 use libsql::{Connection, Database, Row, Transaction, TransactionBehavior, Value};
 use std::sync::Arc;
 
-const VERSION: i64 = 3;
-const PROVENANCE: &str = "ripclone-artifact-scheduler-libsql-v3";
+const VERSION: i64 = 4;
+const PROVENANCE: &str = "ripclone-artifact-scheduler-libsql-v4";
+const V3_PROVENANCE: &str = "ripclone-artifact-scheduler-libsql-v3";
+const GC_SWEEP_SCHEMA: &str = "CREATE TABLE artifact_gc_sweep(id INTEGER PRIMARY KEY CHECK(id=1),owner TEXT NOT NULL,expires_at INTEGER NOT NULL)";
 const SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS artifact_scheduler_schema(id INTEGER PRIMARY KEY CHECK(id=1),version INTEGER NOT NULL,provenance TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS artifact_jobs(id INTEGER PRIMARY KEY AUTOINCREMENT,workspace TEXT NOT NULL,repo TEXT NOT NULL,commit_oid TEXT NOT NULL,kind TEXT NOT NULL CHECK(kind IN('head','full_history','files')),format_version INTEGER NOT NULL CHECK(format_version BETWEEN 1 AND 4294967295),state TEXT NOT NULL CHECK(state IN('queued','running','ready','failed')),owner TEXT,heartbeat_at INTEGER,lease_expires_at INTEGER,lease_generation INTEGER NOT NULL DEFAULT 0 CHECK(lease_generation>=0),claim_attempts INTEGER NOT NULL DEFAULT 0 CHECK(claim_attempts BETWEEN 0 AND 4294967295),retry_count INTEGER NOT NULL DEFAULT 0 CHECK(retry_count BETWEEN 0 AND 4294967295),manifest TEXT,error TEXT,failure_class TEXT CHECK(failure_class IS NULL OR failure_class IN('retryable','permanent','dead_letter')),created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,UNIQUE(workspace,repo,commit_oid,kind,format_version))",
@@ -39,7 +41,6 @@ const SCHEMA: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS artifact_transport_leases_expiry ON artifact_transport_leases(expires_at)",
     "CREATE TABLE IF NOT EXISTS artifact_base_retention(artifact_id INTEGER PRIMARY KEY,workspace TEXT NOT NULL,repo TEXT NOT NULL,format_version INTEGER NOT NULL,head_rank INTEGER,pair_rank INTEGER,FOREIGN KEY(artifact_id) REFERENCES artifact_jobs(id) ON DELETE CASCADE,CHECK((head_rank IS NULL OR head_rank BETWEEN 1 AND 8) AND (pair_rank IS NULL OR pair_rank BETWEEN 1 AND 8) AND (head_rank IS NOT NULL OR pair_rank IS NOT NULL)))",
     "CREATE INDEX IF NOT EXISTS artifact_base_retention_scope ON artifact_base_retention(workspace,repo,format_version)",
-    "CREATE TABLE IF NOT EXISTS artifact_gc_sweep(id INTEGER PRIMARY KEY CHECK(id=1),owner TEXT NOT NULL,expires_at INTEGER NOT NULL)",
     "CREATE TABLE IF NOT EXISTS scheduler_state(id INTEGER PRIMARY KEY CHECK(id=1),fairness_cursor INTEGER NOT NULL CHECK(fairness_cursor BETWEEN 0 AND 3),workspace_cursor TEXT NOT NULL DEFAULT '',config_fingerprint TEXT NOT NULL DEFAULT '')",
 ];
 
@@ -101,6 +102,7 @@ impl LibsqlArtifactScheduler {
             for ddl in SCHEMA {
                 tx.execute(ddl, ()).await?;
             }
+            tx.execute(GC_SWEEP_SCHEMA, ()).await?;
             tx.execute(
                 "INSERT INTO artifact_scheduler_schema(id,version,provenance) VALUES(1,?,?)",
                 libsql::params![VERSION, PROVENANCE],
@@ -128,6 +130,7 @@ impl LibsqlArtifactScheduler {
             tx.execute(SCHEMA[11], ()).await?;
             tx.execute(SCHEMA[12], ()).await?;
             tx.execute(SCHEMA[13], ()).await?;
+            tx.execute(GC_SWEEP_SCHEMA, ()).await?;
             backfill_all_retention(&tx).await?;
             tx.execute(
                 "UPDATE artifact_scheduler_schema SET version=?,provenance=? WHERE id=1 AND version=1",
@@ -147,10 +150,31 @@ impl LibsqlArtifactScheduler {
             {
                 tx.execute(SCHEMA[12], ()).await?;
                 tx.execute(SCHEMA[13], ()).await?;
+                tx.execute(GC_SWEEP_SCHEMA, ()).await?;
                 backfill_all_retention(&tx).await?;
                 tx.execute("UPDATE artifact_scheduler_schema SET version=?,provenance=? WHERE id=1 AND version=2",libsql::params![VERSION,PROVENANCE]).await?;
             }
-        } else if existing != 8 {
+        } else if existing == 8 {
+            let marker = query_one(
+                &tx,
+                "SELECT version,provenance FROM artifact_scheduler_schema WHERE id=1",
+                vec![],
+            )
+            .await?
+            .context("artifact scheduler schema marker missing")?;
+            let version = marker.get::<i64>(0)?;
+            let provenance = marker.get::<String>(1)?;
+            if version == 3 && provenance == V3_PROVENANCE {
+                let preexisting_gc = one_i64(&tx,"SELECT count(*) FROM sqlite_master WHERE type='table' AND name='artifact_gc_sweep'",vec![]).await?;
+                if preexisting_gc != 0 {
+                    bail!("libsql v3 scheduler has an unversioned v4 GC table")
+                }
+                tx.execute(GC_SWEEP_SCHEMA, ()).await?;
+                tx.execute("UPDATE artifact_scheduler_schema SET version=?,provenance=? WHERE id=1 AND version=3 AND provenance=?",libsql::params![VERSION,PROVENANCE,V3_PROVENANCE]).await?;
+            } else if version != VERSION || provenance != PROVENANCE {
+                bail!("unsupported or foreign libsql artifact scheduler schema")
+            }
+        } else {
             bail!("partial or unprovenanced libsql artifact scheduler schema")
         }
         validate_schema(&tx).await?;
@@ -1023,10 +1047,15 @@ async fn validate_schema(c: &Connection) -> Result<()> {
         if required.iter().any(|fragment| !compact.contains(fragment)) {
             bail!("libsql artifact scheduler table {table} is missing required constraints")
         }
-        let expected_sql = SCHEMA
-            .iter()
-            .find(|ddl| ddl.starts_with(&format!("CREATE TABLE IF NOT EXISTS {table}")))
-            .context("internal libsql scheduler schema definition missing")?;
+        let expected_sql = if table == "artifact_gc_sweep" {
+            GC_SWEEP_SCHEMA
+        } else {
+            SCHEMA
+                .iter()
+                .copied()
+                .find(|ddl| ddl.starts_with(&format!("CREATE TABLE IF NOT EXISTS {table}")))
+                .context("internal libsql scheduler schema definition missing")?
+        };
         if canonical_ddl(&sql) != canonical_ddl(expected_sql) {
             bail!("libsql artifact scheduler table {table} differs from schema version")
         }
@@ -1428,6 +1457,90 @@ mod tests {
             Ok(_) => panic!("expected scheduler startup rejection"),
             Err(error) => error.to_string(),
         }
+    }
+    async fn install_version_fixture(url: &str, version: i64, provenance: &str, gc: bool) {
+        let database = db(url).await;
+        let connection = database.connect().unwrap();
+        let tx = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .await
+            .unwrap();
+        for ddl in SCHEMA {
+            tx.execute(ddl, ()).await.unwrap();
+        }
+        if gc {
+            tx.execute(GC_SWEEP_SCHEMA, ()).await.unwrap();
+        }
+        tx.execute(
+            "INSERT INTO artifact_scheduler_schema(id,version,provenance) VALUES(1,?,?)",
+            libsql::params![version, provenance],
+        )
+        .await
+        .unwrap();
+        tx.execute(
+            "INSERT INTO scheduler_state(id,fairness_cursor) VALUES(1,0)",
+            (),
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn released_v3_migrates_to_v4_and_mixed_partial_future_fail_closed() {
+        let Some(v3) = server().await else { return };
+        install_version_fixture(&v3.url, 3, V3_PROVENANCE, false).await;
+        let migrated = scheduler(&v3.url, Default::default()).await;
+        let connection = migrated.conn().await.unwrap();
+        assert_eq!(
+            one_i64(
+                &connection,
+                "SELECT version FROM artifact_scheduler_schema WHERE id=1",
+                vec![]
+            )
+            .await
+            .unwrap(),
+            4
+        );
+        assert_eq!(
+            one_string(
+                &connection,
+                "SELECT provenance FROM artifact_scheduler_schema WHERE id=1",
+                vec![]
+            )
+            .await
+            .unwrap(),
+            PROVENANCE
+        );
+        assert_eq!(one_i64(&connection,"SELECT count(*) FROM sqlite_master WHERE type='table' AND name='artifact_gc_sweep'",vec![]).await.unwrap(), 1);
+        drop(migrated);
+        drop(v3);
+
+        let Some(mixed) = server().await else { return };
+        install_version_fixture(&mixed.url, 3, V3_PROVENANCE, true).await;
+        assert!(
+            startup_error(&mixed.url)
+                .await
+                .contains("unversioned v4 GC table")
+        );
+        drop(mixed);
+
+        let Some(partial) = server().await else {
+            return;
+        };
+        install_version_fixture(&partial.url, 4, PROVENANCE, false).await;
+        assert!(!startup_error(&partial.url).await.is_empty());
+        drop(partial);
+
+        let Some(future) = server().await else { return };
+        install_version_fixture(
+            &future.url,
+            5,
+            "ripclone-artifact-scheduler-libsql-v5",
+            true,
+        )
+        .await;
+        assert!(!startup_error(&future.url).await.is_empty());
     }
 
     #[tokio::test]

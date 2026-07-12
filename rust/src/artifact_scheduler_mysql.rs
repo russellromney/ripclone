@@ -23,7 +23,10 @@ use sqlx::mysql::MySqlPool;
 use sqlx::{Acquire, MySql, Row, Transaction};
 use std::sync::Arc;
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
+const GC_SWEEP_SCHEMA: &str = r#"CREATE TABLE artifact_gc_sweep(
+ id SMALLINT NOT NULL PRIMARY KEY,owner VARCHAR(200) NOT NULL,expires_at BIGINT NOT NULL,
+ CONSTRAINT artifact_gc_sweep_singleton CHECK(id=1)) ENGINE=InnoDB DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin"#;
 const SCHEMA: &[&str] = &[
     r#"CREATE TABLE IF NOT EXISTS artifact_scheduler_schema(
  id SMALLINT NOT NULL PRIMARY KEY,
@@ -79,9 +82,6 @@ const SCHEMA: &[&str] = &[
  CONSTRAINT artifact_base_retention_artifact FOREIGN KEY(artifact_id) REFERENCES artifact_jobs(id) ON DELETE CASCADE,
  CONSTRAINT artifact_base_retention_ranks CHECK((head_rank IS NULL OR head_rank BETWEEN 1 AND 8) AND (pair_rank IS NULL OR pair_rank BETWEEN 1 AND 8) AND (head_rank IS NOT NULL OR pair_rank IS NOT NULL)),
  INDEX artifact_base_retention_scope(workspace,repo,format_version)) ENGINE=InnoDB DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin"#,
-    r#"CREATE TABLE IF NOT EXISTS artifact_gc_sweep(
- id SMALLINT NOT NULL PRIMARY KEY,owner VARCHAR(200) NOT NULL,expires_at BIGINT NOT NULL,
- CONSTRAINT artifact_gc_sweep_singleton CHECK(id=1)) ENGINE=InnoDB DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin"#,
     r#"CREATE TABLE IF NOT EXISTS scheduler_state(
  id SMALLINT NOT NULL PRIMARY KEY, fairness_cursor BIGINT NOT NULL,
  workspace_cursor VARCHAR(128) NOT NULL DEFAULT '',config_fingerprint VARCHAR(512) NOT NULL DEFAULT '',
@@ -144,7 +144,7 @@ impl MysqlArtifactScheduler {
                 "INSERT INTO artifact_scheduler_schema(id,version) VALUES(1,?)
                  ON DUPLICATE KEY UPDATE id=VALUES(id)",
             )
-            .bind(SCHEMA_VERSION)
+            .bind(3_i64)
             .execute(&mut connection)
             .await?;
 
@@ -157,13 +157,21 @@ impl MysqlArtifactScheduler {
             if version > SCHEMA_VERSION {
                 bail!("artifact scheduler database is newer than this binary")
             }
-            if ![1, 2, SCHEMA_VERSION].contains(&version) {
+            if ![1, 2, 3, SCHEMA_VERSION].contains(&version) {
                 bail!("unsupported mysql artifact scheduler schema {version}")
             }
-            Self::validate_schema(&mut migration).await?;
             if version < SCHEMA_VERSION {
-                let scopes: Vec<(String,String,i64)> = sqlx::query_as("SELECT DISTINCT workspace,repo,format_version FROM artifact_jobs WHERE state='ready' AND kind IN('head','full_history')").fetch_all(&mut *migration).await?;
-                for (w,r,v) in scopes { refresh_base_retention(&mut migration,&w,&r,v).await?; }
+                let preexisting_gc: i64 = sqlx::query_scalar("SELECT count(*) FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name='artifact_gc_sweep'")
+                    .fetch_one(&mut *migration).await?;
+                if preexisting_gc != 0 {
+                    bail!("mysql v3 scheduler has an unversioned v4 GC table")
+                }
+                if version < 3 {
+                    let scopes: Vec<(String,String,i64)> = sqlx::query_as("SELECT DISTINCT workspace,repo,format_version FROM artifact_jobs WHERE state='ready' AND kind IN('head','full_history')").fetch_all(&mut *migration).await?;
+                    for (w,r,v) in scopes { refresh_base_retention(&mut migration,&w,&r,v).await?; }
+                }
+                // MySQL DDL implicitly commits. Publish the future marker first
+                // so an old v3 binary fails closed throughout the DDL window.
                 sqlx::query(
                     "UPDATE artifact_scheduler_schema SET version=? WHERE id=1 AND version=?",
                 )
@@ -171,7 +179,14 @@ impl MysqlArtifactScheduler {
                 .bind(version)
                 .execute(&mut *migration)
                 .await?;
+                migration.commit().await?;
+                sqlx::raw_sql(GC_SWEEP_SCHEMA)
+                    .execute(&mut connection)
+                    .await
+                    .context("migrate mysql artifact scheduler v3 to v4")?;
+                migration = connection.begin().await?;
             }
+            Self::validate_schema(&mut migration).await?;
 
             let fingerprint = scheduler_fingerprint(&limits, verifier_id);
             if fingerprint.chars().count() > 512 {
@@ -2383,6 +2398,17 @@ mod tests {
             .unwrap();
         assert_eq!(lock, 1, "test database lock unavailable");
         reset(&control).await;
+        for statement in SCHEMA {
+            sqlx::raw_sql(*statement).execute(&control).await.unwrap();
+        }
+        sqlx::query("INSERT INTO artifact_scheduler_schema(id,version) VALUES(1,3)")
+            .execute(&control)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO scheduler_state(id,fairness_cursor) VALUES(1,0)")
+            .execute(&control)
+            .await
+            .unwrap();
         let a_pool = MySqlPoolOptions::new()
             .max_connections(8)
             .connect(&url)
@@ -2398,6 +2424,16 @@ mod tests {
             MysqlArtifactScheduler::from_pool(b_pool, Default::default(), Arc::new(Accept))
         );
         let (a, b) = (a.unwrap(), b.unwrap());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT version FROM artifact_scheduler_schema WHERE id=1"
+            )
+            .fetch_one(&control)
+            .await
+            .unwrap(),
+            4
+        );
+        assert_eq!(sqlx::query_scalar::<_,i64>("SELECT count(*) FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name='artifact_gc_sweep'").fetch_one(&control).await.unwrap(), 1);
 
         assert!(a.acquire_gc_sweep("collector", 60).await.unwrap());
         assert!(!b.acquire_gc_sweep("other", 60).await.unwrap());
@@ -3007,6 +3043,79 @@ mod tests {
             )
             .await
             .is_err()
+        );
+
+        reset(&control).await;
+        for statement in SCHEMA {
+            sqlx::raw_sql(*statement).execute(&control).await.unwrap();
+        }
+        sqlx::raw_sql(GC_SWEEP_SCHEMA)
+            .execute(&control)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO artifact_scheduler_schema(id,version) VALUES(1,3)")
+            .execute(&control)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO scheduler_state(id,fairness_cursor) VALUES(1,0)")
+            .execute(&control)
+            .await
+            .unwrap();
+        assert!(
+            MysqlArtifactScheduler::from_pool(
+                MySqlPoolOptions::new().connect(&url).await.unwrap(),
+                Default::default(),
+                Arc::new(Accept)
+            )
+            .await
+            .is_err(),
+            "mixed mysql v3 marker with v4 table was accepted"
+        );
+
+        reset(&control).await;
+        for statement in SCHEMA {
+            sqlx::raw_sql(*statement).execute(&control).await.unwrap();
+        }
+        sqlx::query("INSERT INTO artifact_scheduler_schema(id,version) VALUES(1,4)")
+            .execute(&control)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO scheduler_state(id,fairness_cursor) VALUES(1,0)")
+            .execute(&control)
+            .await
+            .unwrap();
+        assert!(
+            MysqlArtifactScheduler::from_pool(
+                MySqlPoolOptions::new().connect(&url).await.unwrap(),
+                Default::default(),
+                Arc::new(Accept)
+            )
+            .await
+            .is_err(),
+            "partial mysql v4 without GC table was accepted"
+        );
+
+        reset(&control).await;
+        for statement in SCHEMA {
+            sqlx::raw_sql(*statement).execute(&control).await.unwrap();
+        }
+        sqlx::query("INSERT INTO artifact_scheduler_schema(id,version) VALUES(1,5)")
+            .execute(&control)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO scheduler_state(id,fairness_cursor) VALUES(1,0)")
+            .execute(&control)
+            .await
+            .unwrap();
+        assert!(
+            MysqlArtifactScheduler::from_pool(
+                MySqlPoolOptions::new().connect(&url).await.unwrap(),
+                Default::default(),
+                Arc::new(Accept)
+            )
+            .await
+            .is_err(),
+            "future mysql schema was accepted"
         );
 
         reset(&control).await;

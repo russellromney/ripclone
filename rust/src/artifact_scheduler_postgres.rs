@@ -23,7 +23,10 @@ use sqlx::postgres::PgPool;
 use sqlx::{Postgres, Row, Transaction};
 use std::sync::Arc;
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
+const GC_SWEEP_SCHEMA: &str = "CREATE TABLE artifact_gc_sweep(
+ id SMALLINT CONSTRAINT artifact_gc_sweep_pkey PRIMARY KEY,owner TEXT NOT NULL,expires_at BIGINT NOT NULL,
+ CONSTRAINT artifact_gc_sweep_singleton CHECK(id=1));";
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS artifact_scheduler_schema(
  id SMALLINT CONSTRAINT artifact_scheduler_schema_pkey PRIMARY KEY,
@@ -80,9 +83,6 @@ CREATE TABLE IF NOT EXISTS artifact_transport_leases(
  CONSTRAINT artifact_transport_leases_pkey PRIMARY KEY(root_hash,session_id));
 CREATE INDEX IF NOT EXISTS artifact_transport_leases_expiry
  ON artifact_transport_leases(expires_at);
-CREATE TABLE IF NOT EXISTS artifact_gc_sweep(
- id SMALLINT CONSTRAINT artifact_gc_sweep_pkey PRIMARY KEY,owner TEXT NOT NULL,expires_at BIGINT NOT NULL,
- CONSTRAINT artifact_gc_sweep_singleton CHECK(id=1));
 CREATE TABLE IF NOT EXISTS artifact_base_retention(
  artifact_id BIGINT CONSTRAINT artifact_base_retention_pkey PRIMARY KEY,
  workspace TEXT NOT NULL,repo TEXT NOT NULL,format_version BIGINT NOT NULL,
@@ -140,7 +140,10 @@ impl PostgresArtifactScheduler {
             "INSERT INTO artifact_scheduler_schema(id,version) VALUES(1,$1)
              ON CONFLICT(id) DO NOTHING",
         )
-        .bind(SCHEMA_VERSION)
+        // Fresh databases are first established as the exact released v3
+        // shape, then upgraded transactionally below. This keeps one migration
+        // path authoritative for both fresh and rolling upgrades.
+        .bind(3_i64)
         .execute(&mut *migration)
         .await?;
         let version: i64 = sqlx::query_scalar(
@@ -151,8 +154,14 @@ impl PostgresArtifactScheduler {
         if version > SCHEMA_VERSION {
             bail!("artifact scheduler database is newer than this binary")
         }
-        if ![1, 2, SCHEMA_VERSION].contains(&version) {
+        if ![1, 2, 3, SCHEMA_VERSION].contains(&version) {
             bail!("unsupported postgres artifact scheduler schema {version}")
+        }
+        if version < 4 {
+            sqlx::raw_sql(GC_SWEEP_SCHEMA)
+                .execute(&mut *migration)
+                .await
+                .context("migrate postgres artifact scheduler v3 to v4")?;
         }
         let missing_columns: i64 = sqlx::query_scalar(
             "WITH expected(table_name,column_name) AS (VALUES
@@ -528,11 +537,13 @@ impl PostgresArtifactScheduler {
         if invalid_control != 0 {
             bail!("postgres artifact scheduler contains invalid control state")
         }
-        if version < SCHEMA_VERSION {
+        if version < 3 {
             let scopes: Vec<(String,String,i64)> = sqlx::query_as("SELECT DISTINCT workspace,repo,format_version FROM artifact_jobs WHERE state='ready' AND kind IN('head','full_history')").fetch_all(&mut *migration).await?;
             for (w, r, v) in scopes {
                 refresh_base_retention(&mut migration, &w, &r, v).await?;
             }
+        }
+        if version < SCHEMA_VERSION {
             sqlx::query(
                 "UPDATE artifact_scheduler_schema SET version=$1 WHERE id=1 AND version=$2",
             )
@@ -1953,6 +1964,13 @@ mod tests {
             .await
             .unwrap();
         reset(&control).await;
+        // Exact released-v3 fixture: no v4 GC table and marker 3. Two v4
+        // starters race the same transactional migration below.
+        sqlx::raw_sql(SCHEMA).execute(&control).await.unwrap();
+        sqlx::query("INSERT INTO artifact_scheduler_schema(id,version) VALUES(1,3)")
+            .execute(&control)
+            .await
+            .unwrap();
 
         let a_pool = PgPoolOptions::new()
             .max_connections(8)
@@ -1970,6 +1988,16 @@ mod tests {
         );
         let a = a.unwrap();
         let b = b.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT version FROM artifact_scheduler_schema WHERE id=1"
+            )
+            .fetch_one(&control)
+            .await
+            .unwrap(),
+            4
+        );
+        assert_eq!(sqlx::query_scalar::<_,i64>("SELECT count(*) FROM information_schema.tables WHERE table_schema=current_schema() AND table_name='artifact_gc_sweep'").fetch_one(&control).await.unwrap(), 1);
 
         assert!(a.acquire_gc_sweep("collector", 60).await.unwrap());
         assert!(!b.acquire_gc_sweep("other", 60).await.unwrap());
@@ -2874,6 +2902,43 @@ mod tests {
             )
             .await
             .is_err()
+        );
+        reset(&control).await;
+        sqlx::raw_sql(SCHEMA).execute(&control).await.unwrap();
+        sqlx::raw_sql(GC_SWEEP_SCHEMA)
+            .execute(&control)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO artifact_scheduler_schema(id,version) VALUES(1,3)")
+            .execute(&control)
+            .await
+            .unwrap();
+        assert!(
+            PostgresArtifactScheduler::from_pool(
+                PgPoolOptions::new().connect(&url).await.unwrap(),
+                Default::default(),
+                Arc::new(Accept)
+            )
+            .await
+            .is_err(),
+            "mixed postgres v3 marker with v4 table was accepted"
+        );
+
+        reset(&control).await;
+        sqlx::raw_sql(SCHEMA).execute(&control).await.unwrap();
+        sqlx::query("INSERT INTO artifact_scheduler_schema(id,version) VALUES(1,4)")
+            .execute(&control)
+            .await
+            .unwrap();
+        assert!(
+            PostgresArtifactScheduler::from_pool(
+                PgPoolOptions::new().connect(&url).await.unwrap(),
+                Default::default(),
+                Arc::new(Accept)
+            )
+            .await
+            .is_err(),
+            "partial postgres v4 without GC table was accepted"
         );
         reset(&control).await;
         sqlx::query("SELECT pg_advisory_unlock(731904218)")
