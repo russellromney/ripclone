@@ -70,6 +70,8 @@ pub mod archive;
 #[doc(hidden)]
 pub mod artifact_builder;
 #[doc(hidden)]
+pub mod artifact_admission;
+#[doc(hidden)]
 pub mod artifact_manifest;
 #[doc(hidden)]
 pub mod artifact_scheduler;
