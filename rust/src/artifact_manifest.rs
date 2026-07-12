@@ -62,8 +62,11 @@ impl Default for ArtifactVerificationLimits {
             fragments: 1_000_000,
             archive_chunks: 65_536,
             archive_chunk_bytes: 16 * 1024 * 1024 * 1024,
-            frame_compressed_bytes: 512 * 1024 * 1024,
-            frame_raw_bytes: 1024 * 1024 * 1024,
+            // Production CDC frames top out at 16 MiB. Keep headroom for zstd
+            // overhead without permitting each of the eight concurrent Files
+            // verifiers to reserve hundreds of MiB for one hostile frame.
+            frame_compressed_bytes: 32 * 1024 * 1024,
+            frame_raw_bytes: 32 * 1024 * 1024,
             file_raw_bytes: 1024 * 1024 * 1024 * 1024,
             total_archive_compressed_bytes: 1024 * 1024 * 1024 * 1024,
             total_archive_raw_bytes: 4 * 1024 * 1024 * 1024 * 1024,
@@ -417,6 +420,7 @@ impl CasCompletionVerifier {
         if serde_json::to_vec(&manifest)? != bytes {
             bail!("artifact manifest JSON is not canonical");
         }
+        drop(bytes);
         manifest.validate_envelope()?;
         if !manifest.key.matches(key) {
             bail!("artifact manifest does not match scheduler key");
@@ -594,6 +598,7 @@ impl CasCompletionVerifier {
             "history commit anchor",
         )?;
         let parsed = parse_exact_commit(commit, &commit_bytes)?;
+        drop(commit_bytes);
         if parsed.parents.is_empty() {
             if !history.history_packs.is_empty() {
                 bail!("root commit history must be empty");
@@ -635,16 +640,22 @@ impl CasCompletionVerifier {
             "files commit anchor",
         )?;
         let parsed = parse_exact_commit(commit, &commit_bytes)?;
+        drop(commit_bytes);
         let metadata_bytes = self.read_small_blob(
             &files.metadata,
             self.limits.metadata_bytes,
             "files metadata",
         )?;
-        let mut input = metadata_bytes.as_slice();
-        let metadata = MetadataChunk::read(&mut input).context("decode files metadata")?;
+        preflight_metadata_counts(&metadata_bytes, &self.limits)?;
+        let metadata =
+            MetadataChunk::decode(metadata_bytes.as_slice()).context("decode files metadata")?;
+        metadata
+            .validate_geometry()
+            .context("validate files metadata geometry")?;
         if metadata.encode_to_vec() != metadata_bytes {
             bail!("Files metadata is non-canonical or contains unknown fields");
         }
+        drop(metadata_bytes);
         if !metadata.skeleton_pack.is_empty()
             || !metadata.skeleton_idx.is_empty()
             || !metadata.prebuilt_index.is_empty()
@@ -667,12 +678,14 @@ impl CasCompletionVerifier {
         {
             bail!("Files metadata count exceeds verifier limit");
         }
-        let expected_chunks = metadata
-            .frames
-            .iter()
-            .map(|frame| frame.chunk_index as usize + 1)
-            .max()
-            .unwrap_or(0);
+        let expected_chunks = metadata.frames.iter().try_fold(0usize, |maximum, frame| {
+            let index = usize::try_from(frame.chunk_index)
+                .context("archive chunk index is not addressable")?;
+            let count = index
+                .checked_add(1)
+                .context("archive chunk index overflow")?;
+            Ok::<_, anyhow::Error>(maximum.max(count))
+        })?;
         if files.archive_chunks.len() != expected_chunks {
             bail!("Files archive chunk table is not exact");
         }
@@ -792,6 +805,115 @@ fn validate_dictionary_policy(metadata: &MetadataChunk, dictionary: Option<&[u8]
     Ok(())
 }
 
+/// Count repeated protobuf messages before prost allocates their backing
+/// vectors. A tiny encoding such as repeated zero-length `FileEntry` messages
+/// otherwise amplifies a bounded metadata blob into an unbounded heap
+/// allocation before the post-decode limits can run.
+fn preflight_metadata_counts(bytes: &[u8], limits: &ArtifactVerificationLimits) -> Result<()> {
+    let mut input = bytes;
+    let mut frames = 0usize;
+    let mut files = 0usize;
+    let mut fragments = 0usize;
+    while !input.is_empty() {
+        let (field, value) = take_protobuf_field(&mut input)?;
+        match (field, value) {
+            (1..=3, ProtobufValue::Bytes(_)) => {}
+            (4, ProtobufValue::Bytes(_)) => {
+                frames = frames
+                    .checked_add(1)
+                    .context("Files frame count overflow")?;
+                if frames > limits.frames {
+                    bail!("Files frame count exceeds verifier limit");
+                }
+            }
+            (5, ProtobufValue::Bytes(file)) => {
+                files = files.checked_add(1).context("Files file count overflow")?;
+                if files > limits.files {
+                    bail!("Files file count exceeds verifier limit");
+                }
+                let mut file = file;
+                while !file.is_empty() {
+                    let (file_field, file_value) = take_protobuf_field(&mut file)?;
+                    if file_field == 4 && matches!(file_value, ProtobufValue::Bytes(_)) {
+                        fragments = fragments
+                            .checked_add(1)
+                            .context("Files fragment count overflow")?;
+                        if fragments > limits.fragments {
+                            bail!("Files fragment count exceeds verifier limit");
+                        }
+                    }
+                }
+            }
+            // These are the only canonical top-level MetadataChunk fields.
+            // Rejecting anything else here is consistent with the later
+            // encode-byte equality check, which also rejects unknown fields.
+            _ => bail!("Files metadata contains an unknown field or wire type"),
+        }
+    }
+    Ok(())
+}
+
+enum ProtobufValue<'a> {
+    Varint,
+    Fixed64,
+    Bytes(&'a [u8]),
+    Fixed32,
+}
+
+fn take_protobuf_field<'a>(input: &mut &'a [u8]) -> Result<(u64, ProtobufValue<'a>)> {
+    let key = take_protobuf_varint(input)?;
+    let field = key >> 3;
+    if field == 0 {
+        bail!("protobuf field number zero is invalid");
+    }
+    let value = match key & 7 {
+        0 => {
+            take_protobuf_varint(input)?;
+            ProtobufValue::Varint
+        }
+        1 => {
+            take_protobuf_bytes(input, 8)?;
+            ProtobufValue::Fixed64
+        }
+        2 => {
+            let len = take_protobuf_varint(input)?;
+            let len = usize::try_from(len).context("protobuf field length is not addressable")?;
+            ProtobufValue::Bytes(take_protobuf_bytes(input, len)?)
+        }
+        5 => {
+            take_protobuf_bytes(input, 4)?;
+            ProtobufValue::Fixed32
+        }
+        _ => bail!("unsupported protobuf wire type"),
+    };
+    Ok((field, value))
+}
+
+fn take_protobuf_varint(input: &mut &[u8]) -> Result<u64> {
+    let mut value = 0u64;
+    for shift in (0..70).step_by(7) {
+        let (&byte, rest) = input.split_first().context("truncated protobuf varint")?;
+        *input = rest;
+        if shift == 63 && byte > 1 {
+            bail!("protobuf varint overflow");
+        }
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(value);
+        }
+    }
+    bail!("protobuf varint overflow")
+}
+
+fn take_protobuf_bytes<'a>(input: &mut &'a [u8], len: usize) -> Result<&'a [u8]> {
+    if len > input.len() {
+        bail!("protobuf field extends past metadata");
+    }
+    let (value, rest) = input.split_at(len);
+    *input = rest;
+    Ok(value)
+}
+
 fn reconstruct_files_to_index(
     metadata: &MetadataChunk,
     chunk_dir: &Path,
@@ -813,12 +935,14 @@ fn reconstruct_files_to_index(
 
     let mut chunk_ranges = vec![
         Vec::new();
-        metadata
-            .frames
-            .iter()
-            .map(|frame| frame.chunk_index as usize + 1)
-            .max()
-            .unwrap_or(0)
+        metadata.frames.iter().try_fold(0usize, |maximum, frame| {
+            let index = usize::try_from(frame.chunk_index)
+                .context("archive chunk index is not addressable")?;
+            let count = index
+                .checked_add(1)
+                .context("archive chunk index overflow")?;
+            Ok::<_, anyhow::Error>(maximum.max(count))
+        })?
     ];
     let mut fragment_ranges = vec![Vec::new(); metadata.frames.len()];
     let mut total_raw = 0u64;
@@ -833,6 +957,9 @@ fn reconstruct_files_to_index(
         }
         if file_len == 0 && (file.fragments.len() != 1 || file.fragments[0].raw_len != 0) {
             bail!("empty file must have exactly one empty fragment");
+        }
+        if file_len > 0 && file.fragments.iter().any(|fragment| fragment.raw_len == 0) {
+            bail!("non-empty file contains a redundant empty fragment");
         }
         for fragment in &file.fragments {
             let frame_index = fragment.frame_index as usize;
@@ -862,14 +989,29 @@ fn reconstruct_files_to_index(
         let end = start
             .checked_add(frame.compressed_len as u64)
             .context("compressed frame bounds overflow")?;
-        chunk_ranges[frame.chunk_index as usize].push((start, end));
+        let chunk_index =
+            usize::try_from(frame.chunk_index).context("archive chunk index is not addressable")?;
+        chunk_ranges
+            .get_mut(chunk_index)
+            .context("archive frame references missing chunk")?
+            .push((start, end));
 
-        let compressed = read_file_range(
-            &chunk_dir.join(frame.chunk_index.to_string()),
+        let compressed = open_file_range(
+            &chunk_dir.join(chunk_index.to_string()),
             start,
             frame.compressed_len as u64,
         )?;
-        let frame_dict_id = zstd::zstd_safe::get_dict_id_from_frame(&compressed);
+        const ZSTD_FRAME_HEADER_MAX: usize = 18;
+        let mut header_reader = open_file_range(
+            &chunk_dir.join(chunk_index.to_string()),
+            start,
+            frame.compressed_len as u64,
+        )?;
+        let mut header = [0u8; ZSTD_FRAME_HEADER_MAX];
+        let header_len =
+            usize::try_from(u64::from(frame.compressed_len).min(ZSTD_FRAME_HEADER_MAX as u64))?;
+        header_reader.read_exact(&mut header[..header_len])?;
+        let frame_dict_id = zstd::zstd_safe::get_dict_id_from_frame(&header[..header_len]);
         let expected_dict_id = dictionary.and_then(zstd::zstd_safe::get_dict_id_from_dict);
         if frame_dict_id != expected_dict_id {
             bail!("archive frame dictionary policy mismatch");
@@ -878,11 +1020,14 @@ fn reconstruct_files_to_index(
         let mut output = std::fs::File::create(&output_path)?;
         let written = match dictionary {
             Some(dict) => {
-                let decoder = zstd::stream::Decoder::with_dictionary(compressed.as_slice(), dict)?;
+                let mut decoder =
+                    zstd::stream::Decoder::with_dictionary(BufReader::new(compressed), dict)?;
+                decoder.window_log_max(25)?;
                 copy_bounded(decoder, &mut output, frame.raw_len as u64)?
             }
             None => {
-                let decoder = zstd::stream::Decoder::new(compressed.as_slice())?;
+                let mut decoder = zstd::stream::Decoder::new(compressed)?;
+                decoder.window_log_max(25)?;
                 copy_bounded(decoder, &mut output, frame.raw_len as u64)?
             }
         };
@@ -915,6 +1060,12 @@ fn reconstruct_files_to_index(
         }
         let mut cursor = 0u32;
         for &(start, end) in ranges.iter() {
+            // Empty files may point at a boundary inside a non-empty CDC
+            // frame. They consume no bytes and therefore do not participate
+            // in the frame's exact positive-byte partition.
+            if start == end {
+                continue;
+            }
             if start != cursor || end <= start {
                 bail!("frame {frame_index} raw bytes have gaps or overlap");
             }
@@ -984,17 +1135,14 @@ fn validate_artifact_path(bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn read_file_range(path: &Path, start: u64, len: u64) -> Result<Vec<u8>> {
+fn open_file_range(path: &Path, start: u64, len: u64) -> Result<std::io::Take<std::fs::File>> {
     let mut file = std::fs::File::open(path)?;
     let file_len = file.metadata()?.len();
     if start > file_len || len > file_len - start {
         bail!("archive frame extends past chunk");
     }
     file.seek(SeekFrom::Start(start))?;
-    let size = usize::try_from(len).context("archive frame is not addressable")?;
-    let mut bytes = vec![0u8; size];
-    file.read_exact(&mut bytes)?;
-    Ok(bytes)
+    Ok(file.take(len))
 }
 
 fn copy_bounded<R: Read, W: Write>(reader: R, writer: &mut W, expected: u64) -> Result<u64> {
@@ -1059,20 +1207,28 @@ fn compare_exact_object_sets(repo: &Path, revisions: &[&str], maximum: u64) -> R
             .stdout
             .take()
             .context("capture git verify-pack output")?;
-        for line in BufReader::new(stdout).lines() {
-            let line = line?;
-            let Some(oid) = line.split_ascii_whitespace().next() else {
-                continue;
-            };
-            if is_oid(oid) {
-                count = count.checked_add(1).context("Git object count overflow")?;
-                if count > maximum {
-                    bail!("Git object count exceeds verifier limit");
+        let enumeration = (|| -> Result<()> {
+            for line in BufReader::new(stdout).lines() {
+                let line = line?;
+                let Some(oid) = line.split_ascii_whitespace().next() else {
+                    continue;
+                };
+                if is_oid(oid) {
+                    count = count.checked_add(1).context("Git object count overflow")?;
+                    if count > maximum {
+                        bail!("Git object count exceeds verifier limit");
+                    }
+                    writeln!(packed_output, "{oid}")?;
                 }
-                writeln!(packed_output, "{oid}")?;
             }
+            Ok(())
+        })();
+        if enumeration.is_err() {
+            let _ = child.kill();
         }
-        if !child.wait()?.success() {
+        let status = child.wait()?;
+        enumeration?;
+        if !status.success() {
             bail!("Git pack object enumeration failed");
         }
     }
@@ -1096,18 +1252,26 @@ fn compare_exact_object_sets(repo: &Path, revisions: &[&str], maximum: u64) -> R
     let stdout = child.stdout.take().context("capture git rev-list output")?;
     let mut reachable_output = std::io::BufWriter::new(std::fs::File::create(&reachable)?);
     let mut reachable_count = 0u64;
-    for line in BufReader::new(stdout).lines() {
-        let oid = line?;
-        validate_commit_oid(&oid).context("Git closure emitted invalid object id")?;
-        reachable_count = reachable_count
-            .checked_add(1)
-            .context("Git reachable object count overflow")?;
-        if reachable_count > maximum {
-            bail!("Git reachable object count exceeds verifier limit");
+    let enumeration = (|| -> Result<()> {
+        for line in BufReader::new(stdout).lines() {
+            let oid = line?;
+            validate_commit_oid(&oid).context("Git closure emitted invalid object id")?;
+            reachable_count = reachable_count
+                .checked_add(1)
+                .context("Git reachable object count overflow")?;
+            if reachable_count > maximum {
+                bail!("Git reachable object count exceeds verifier limit");
+            }
+            writeln!(reachable_output, "{oid}")?;
         }
-        writeln!(reachable_output, "{oid}")?;
+        Ok(())
+    })();
+    if enumeration.is_err() {
+        let _ = child.kill();
     }
-    if !child.wait()?.success() {
+    let status = child.wait()?;
+    enumeration?;
+    if !status.success() {
         bail!("Git closure enumeration failed");
     }
     reachable_output.flush()?;
@@ -1544,6 +1708,41 @@ mod tests {
     }
 
     #[test]
+    fn empty_file_may_share_a_nonempty_cdc_frame_boundary() {
+        let f = Fixture::new();
+        fs::write(f.repo.join("empty"), b"").unwrap();
+        git(&f.repo, &["add", "empty"]).unwrap();
+        git(&f.repo, &["commit", "--quiet", "-m", "add empty"]).unwrap();
+        let target = git(&f.repo, &["rev-parse", "HEAD"]).unwrap();
+
+        let ArtifactPayload::Files(mut payload) = f.files().payload else {
+            unreachable!()
+        };
+        payload.target_commit_object = f.commit_blob(&target);
+        let metadata_bytes = f.cas.get(&payload.metadata.hash).unwrap();
+        let mut metadata = MetadataChunk::read(&mut metadata_bytes.as_slice()).unwrap();
+        metadata.files.push(FileEntry {
+            path: b"empty".to_vec(),
+            mode: 0o100644,
+            blob_sha1: hex::decode(git_object_oid("blob", b"")).unwrap(),
+            fragments: vec![Fragment {
+                frame_index: 0,
+                frame_offset: 0,
+                raw_len: 0,
+            }],
+        });
+        let mut bytes = Vec::new();
+        metadata.write(&mut bytes).unwrap();
+        payload.metadata = f.blob(&bytes);
+        let key = ArtifactKey {
+            commit: target,
+            ..f.key(ArtifactKind::Files)
+        };
+        let manifest = ArtifactManifest::new(&key, ArtifactPayload::Files(payload)).unwrap();
+        f.verify(&manifest).unwrap();
+    }
+
+    #[test]
     fn unknown_fields_and_unknown_schema_are_rejected() {
         let f = Fixture::new();
         let manifest = f.head();
@@ -1975,6 +2174,59 @@ mod tests {
             verifier
                 .verify_manifest(&evidence.key, &evidence.manifest, evidence.artifact_count,)
                 .is_err()
+        );
+
+        let evidence = f.head().store(&f.cas).unwrap();
+        let limits = ArtifactVerificationLimits {
+            git_objects: 1,
+            ..ArtifactVerificationLimits::default()
+        };
+        let verifier = CasCompletionVerifier::with_limits(f.cas.clone(), limits).unwrap();
+        assert!(
+            verifier
+                .verify_manifest(&evidence.key, &evidence.manifest, evidence.artifact_count,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn metadata_repeated_counts_are_rejected_before_prost_allocation() {
+        let limits = ArtifactVerificationLimits {
+            files: 4,
+            frames: 3,
+            fragments: 2,
+            ..ArtifactVerificationLimits::default()
+        };
+
+        // Five zero-length FileEntry messages occupy only ten bytes but would
+        // force prost to allocate five FileEntry values before a post-decode
+        // limit could observe them.
+        let mut too_many_files = Vec::new();
+        for _ in 0..5 {
+            too_many_files.extend_from_slice(&[0x2a, 0x00]);
+        }
+        assert!(
+            preflight_metadata_counts(&too_many_files, &limits)
+                .unwrap_err()
+                .to_string()
+                .contains("file count exceeds")
+        );
+
+        let too_many_frames = [0x22, 0x00, 0x22, 0x00, 0x22, 0x00, 0x22, 0x00];
+        assert!(preflight_metadata_counts(&too_many_frames, &limits).is_err());
+
+        // One FileEntry containing three zero-length Fragment messages.
+        let too_many_fragments = [0x2a, 0x06, 0x22, 0x00, 0x22, 0x00, 0x22, 0x00];
+        assert!(preflight_metadata_counts(&too_many_fragments, &limits).is_err());
+        assert!(preflight_metadata_counts(&[0x2a, 0x80], &limits).is_err());
+        assert!(
+            preflight_metadata_counts(
+                &[
+                    0x2a, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02
+                ],
+                &limits,
+            )
+            .is_err()
         );
     }
 
