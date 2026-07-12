@@ -43,6 +43,7 @@ impl VerifiedArtifactReceipt {
     pub(crate) fn from_published(record: &ArtifactRecord) -> Result<Self> {
         if record.state != ArtifactState::Ready
             || record.owner.is_some()
+            || record.lease_expires_at.is_some()
             || record.error.is_some()
             || record.failure_class.is_some()
         {
@@ -292,6 +293,9 @@ pub fn admission_base_ready(
     exact: &ExactArtifacts,
 ) -> Result<bool> {
     validate_oid(target_commit, "admission target")?;
+    if format_version == 0 {
+        bail!("admission artifact format version is zero")
+    }
     let Some(head) = &exact.head else {
         return Ok(false);
     };
@@ -505,6 +509,7 @@ mod tests {
             ..exact.clone()
         };
         assert!(admission_base_ready(W, R, T, 1, &wrong_commit).is_err());
+        assert!(admission_base_ready(W, R, T, 0, &exact).is_err());
         let missing = ExactArtifacts {
             history: None,
             ..exact
@@ -622,11 +627,12 @@ mod tests {
         };
         assert!(plan(SyncMode::Head, &wrong_format, None).is_err());
 
-        for mutate in ["running", "owner", "error", "failure"] {
+        for mutate in ["running", "owner", "lease", "error", "failure"] {
             let mut record = published(ArtifactKind::Head, T, HEAD);
             match mutate {
                 "running" => record.state = ArtifactState::Running,
                 "owner" => record.owner = Some("worker".into()),
+                "lease" => record.lease_expires_at = Some(123),
                 "error" => record.error = Some("bad".into()),
                 "failure" => record.failure_class = Some(FailureClass::Permanent),
                 _ => unreachable!(),
