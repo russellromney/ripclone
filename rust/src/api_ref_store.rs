@@ -111,6 +111,22 @@ pub enum RefReport {
         branch: String,
         expected_commit: String,
     },
+    PinRepoInitialization {
+        repo_key: String,
+        branch: String,
+        commit: String,
+    },
+    ActivateRepo {
+        repo_key: String,
+        branch: String,
+        commit: String,
+    },
+    FailRepoInitialization {
+        repo_key: String,
+        branch: String,
+        commit: Option<String>,
+        failure: String,
+    },
 }
 
 impl RefReport {
@@ -119,7 +135,10 @@ impl RefReport {
             Self::SaveBranch { repo_key, .. }
             | Self::UpdateBuildStatus { repo_key, .. }
             | Self::DeleteBranch { repo_key, .. }
-            | Self::TouchLastAccessed { repo_key, .. } => repo_key,
+            | Self::TouchLastAccessed { repo_key, .. }
+            | Self::PinRepoInitialization { repo_key, .. }
+            | Self::ActivateRepo { repo_key, .. }
+            | Self::FailRepoInitialization { repo_key, .. } => repo_key,
         }
     }
 }
@@ -350,6 +369,51 @@ impl RefStore for ApiRefStore {
 
     async fn list_added_repos(&self) -> Result<Vec<AddedRepo>> {
         Ok(Vec::new())
+    }
+
+    async fn pin_repo_initialization(
+        &self,
+        repo_id: &RepoId,
+        branch: &str,
+        commit: &str,
+    ) -> Result<bool> {
+        Ok(self
+            .post_report(&RefReport::PinRepoInitialization {
+                repo_key: repo_id.storage_key(),
+                branch: branch.to_string(),
+                commit: commit.to_string(),
+            })
+            .await?
+            .updated)
+    }
+
+    async fn activate_repo(&self, repo_id: &RepoId, branch: &str, commit: &str) -> Result<bool> {
+        Ok(self
+            .post_report(&RefReport::ActivateRepo {
+                repo_key: repo_id.storage_key(),
+                branch: branch.to_string(),
+                commit: commit.to_string(),
+            })
+            .await?
+            .updated)
+    }
+
+    async fn fail_repo_initialization(
+        &self,
+        repo_id: &RepoId,
+        branch: &str,
+        commit: Option<&str>,
+        failure: &str,
+    ) -> Result<bool> {
+        Ok(self
+            .post_report(&RefReport::FailRepoInitialization {
+                repo_key: repo_id.storage_key(),
+                branch: branch.to_string(),
+                commit: commit.map(str::to_string),
+                failure: failure.to_string(),
+            })
+            .await?
+            .updated)
     }
 
     async fn health(&self) -> Result<()> {

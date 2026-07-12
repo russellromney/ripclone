@@ -132,6 +132,11 @@ async fn register_added_repo(server: &Server, repo: &str) -> u64 {
             history_enabled: true,
             source: AddedRepoSource::Api,
             repo_size_bytes: None,
+            state: ripclone::ref_store::RepoLifecycleState::Active,
+            initialization_branch: None,
+            initialization_target: None,
+            activated_at: None,
+            failure: None,
         })
         .await
         .expect("mark repo added");

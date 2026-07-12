@@ -23,6 +23,36 @@ pub struct AddedRepo {
     /// size signal → first build maps to the largest class.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo_size_bytes: Option<u64>,
+    /// Admission lifecycle. Legacy rows predate admission gating and deserialize
+    /// as active so upgrades do not make already-serving repositories vanish.
+    #[serde(default)]
+    pub state: RepoLifecycleState,
+    /// Branch whose first durable HEAD + full-history artifacts admit the repo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initialization_branch: Option<String>,
+    /// Commit pinned by the first successful mirror/build preparation. A stale
+    /// or concurrent build for another commit may never activate the repo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initialization_target: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activated_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<String>,
+}
+
+impl AddedRepo {
+    pub fn is_active(&self) -> bool {
+        self.state == RepoLifecycleState::Active
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum RepoLifecycleState {
+    Initializing,
+    #[default]
+    Active,
+    Failed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -185,6 +215,81 @@ pub trait RefStore: Send + Sync {
     /// List every repo explicitly made available.
     async fn list_added_repos(&self) -> Result<Vec<AddedRepo>>;
 
+    /// Pin the initialization target exactly once. Returns false for a missing,
+    /// active/failed, different-branch, or already-pinned-to-another-commit row.
+    async fn pin_repo_initialization(
+        &self,
+        repo_id: &RepoId,
+        branch: &str,
+        commit: &str,
+    ) -> Result<bool> {
+        let Some(mut repo) = self.load_added_repo(repo_id).await? else {
+            return Ok(false);
+        };
+        let branch_matches = repo.initialization_branch.as_deref() == Some(branch)
+            || (repo.initialization_branch.as_deref() == Some("HEAD")
+                && repo.initialization_target.is_none());
+        if repo.state != RepoLifecycleState::Initializing
+            || !branch_matches
+            || repo
+                .initialization_target
+                .as_deref()
+                .is_some_and(|target| target != commit)
+        {
+            return Ok(false);
+        }
+        repo.initialization_branch = Some(branch.to_string());
+        repo.initialization_target
+            .get_or_insert_with(|| commit.to_string());
+        self.add_repo(&repo).await?;
+        Ok(true)
+    }
+
+    /// Admit an initializing repo only when branch and pinned commit match.
+    async fn activate_repo(&self, repo_id: &RepoId, branch: &str, commit: &str) -> Result<bool> {
+        let Some(mut repo) = self.load_added_repo(repo_id).await? else {
+            return Ok(false);
+        };
+        if repo.state != RepoLifecycleState::Initializing
+            || repo.initialization_branch.as_deref() != Some(branch)
+            || repo.initialization_target.as_deref() != Some(commit)
+        {
+            return Ok(false);
+        }
+        repo.state = RepoLifecycleState::Active;
+        repo.activated_at = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_secs());
+        repo.failure = None;
+        self.add_repo(&repo).await?;
+        Ok(true)
+    }
+
+    /// Mark only the matching initialization attempt failed. Stale failures
+    /// cannot demote an active repo or poison a newer attempt.
+    async fn fail_repo_initialization(
+        &self,
+        repo_id: &RepoId,
+        branch: &str,
+        commit: Option<&str>,
+        failure: &str,
+    ) -> Result<bool> {
+        let Some(mut repo) = self.load_added_repo(repo_id).await? else {
+            return Ok(false);
+        };
+        if repo.state != RepoLifecycleState::Initializing
+            || repo.initialization_branch.as_deref() != Some(branch)
+            || commit.is_some_and(|commit| repo.initialization_target.as_deref() != Some(commit))
+        {
+            return Ok(false);
+        }
+        repo.state = RepoLifecycleState::Failed;
+        repo.failure = Some(failure.to_string());
+        self.add_repo(&repo).await?;
+        Ok(true)
+    }
+
     /// Drop any cached entry for this branch so the next load reads through to
     /// the backing store. Needed after a build completes in *another* process
     /// (the SQL queue / standalone worker path): this process's cache would
@@ -227,6 +332,29 @@ impl FileRefStore {
             added_root,
             write_lock: tokio::sync::Mutex::new(()),
         }
+    }
+
+    async fn mutate_added_repo(
+        &self,
+        repo_id: &RepoId,
+        mutate: impl FnOnce(&mut AddedRepo) -> bool,
+    ) -> Result<bool> {
+        let _guard = self.write_lock.lock().await;
+        let path = self.added_path(repo_id);
+        let mut repo: AddedRepo = match tokio::fs::read(&path).await {
+            Ok(data) => serde_json::from_slice(&data)
+                .with_context(|| format!("parse added repo {}", path.display()))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(anyhow::anyhow!("read added repo {}: {}", path.display(), e)),
+        };
+        if !mutate(&mut repo) {
+            return Ok(false);
+        }
+        let data = serde_json::to_vec_pretty(&repo).context("serialize added repo")?;
+        let tmp_path = path.with_extension("json.tmp");
+        tokio::fs::write(&tmp_path, data).await?;
+        tokio::fs::rename(&tmp_path, &path).await?;
+        Ok(true)
     }
 
     /// Read-compare-then-rename: apply [`should_replace_ref`] against whatever
@@ -510,6 +638,7 @@ impl RefStore for FileRefStore {
     }
 
     async fn add_repo(&self, repo: &AddedRepo) -> Result<()> {
+        let _guard = self.write_lock.lock().await;
         let path = self.added_path(&repo.repo_id);
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent)
@@ -579,6 +708,74 @@ impl RefStore for FileRefStore {
             }
         }
         Ok(out)
+    }
+
+    async fn pin_repo_initialization(
+        &self,
+        repo_id: &RepoId,
+        branch: &str,
+        commit: &str,
+    ) -> Result<bool> {
+        self.mutate_added_repo(repo_id, |repo| {
+            let branch_matches = repo.initialization_branch.as_deref() == Some(branch)
+                || (repo.initialization_branch.as_deref() == Some("HEAD")
+                    && repo.initialization_target.is_none());
+            if repo.state != RepoLifecycleState::Initializing
+                || !branch_matches
+                || repo
+                    .initialization_target
+                    .as_deref()
+                    .is_some_and(|target| target != commit)
+            {
+                return false;
+            }
+            repo.initialization_branch = Some(branch.to_string());
+            repo.initialization_target
+                .get_or_insert_with(|| commit.to_string());
+            true
+        })
+        .await
+    }
+
+    async fn activate_repo(&self, repo_id: &RepoId, branch: &str, commit: &str) -> Result<bool> {
+        self.mutate_added_repo(repo_id, |repo| {
+            if repo.state != RepoLifecycleState::Initializing
+                || repo.initialization_branch.as_deref() != Some(branch)
+                || repo.initialization_target.as_deref() != Some(commit)
+            {
+                return false;
+            }
+            repo.state = RepoLifecycleState::Active;
+            repo.activated_at = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .ok()
+                .map(|d| d.as_secs());
+            repo.failure = None;
+            true
+        })
+        .await
+    }
+
+    async fn fail_repo_initialization(
+        &self,
+        repo_id: &RepoId,
+        branch: &str,
+        commit: Option<&str>,
+        failure: &str,
+    ) -> Result<bool> {
+        self.mutate_added_repo(repo_id, |repo| {
+            if repo.state != RepoLifecycleState::Initializing
+                || repo.initialization_branch.as_deref() != Some(branch)
+                || commit
+                    .is_some_and(|commit| repo.initialization_target.as_deref() != Some(commit))
+            {
+                return false;
+            }
+            repo.state = RepoLifecycleState::Failed;
+            repo.failure = Some(failure.to_string());
+            true
+        })
+        .await
     }
 
     async fn load_build(&self, repo_id: &RepoId, commit: &str) -> Result<Option<RefInfo>> {
@@ -1646,6 +1843,11 @@ mod tests {
             history_enabled: true,
             source: AddedRepoSource::Cli,
             repo_size_bytes: Some(42_000),
+            state: RepoLifecycleState::Active,
+            initialization_branch: None,
+            initialization_target: None,
+            activated_at: Some(123),
+            failure: None,
         };
 
         store.add_repo(&added).await.unwrap();
@@ -1672,6 +1874,208 @@ mod tests {
         let added: AddedRepo = serde_json::from_str(legacy).unwrap();
         assert_eq!(added.repo_size_bytes, None);
         assert_eq!(added.repo_id.path, "o/r");
+        assert_eq!(added.state, RepoLifecycleState::Active);
+    }
+
+    fn initializing_repo(repo_id: RepoId) -> AddedRepo {
+        AddedRepo {
+            repo_id,
+            added_at: 1,
+            history_enabled: true,
+            source: AddedRepoSource::Api,
+            repo_size_bytes: None,
+            state: RepoLifecycleState::Initializing,
+            initialization_branch: Some("main".into()),
+            initialization_target: None,
+            activated_at: None,
+            failure: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn repo_admission_requires_pinned_matching_target_and_is_monotonic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileRefStore::new(tmp.path());
+        let repo_id = RepoId::github("o/admit");
+        store
+            .add_repo(&initializing_repo(repo_id.clone()))
+            .await
+            .unwrap();
+
+        assert!(!store.activate_repo(&repo_id, "main", "c1").await.unwrap());
+        assert!(
+            !store
+                .pin_repo_initialization(&repo_id, "other", "c1")
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .pin_repo_initialization(&repo_id, "main", "c1")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .pin_repo_initialization(&repo_id, "main", "c2")
+                .await
+                .unwrap()
+        );
+        assert!(!store.activate_repo(&repo_id, "main", "c2").await.unwrap());
+        assert!(store.activate_repo(&repo_id, "main", "c1").await.unwrap());
+
+        let active = store.load_added_repo(&repo_id).await.unwrap().unwrap();
+        assert!(active.is_active());
+        assert_eq!(active.initialization_target.as_deref(), Some("c1"));
+        assert!(active.activated_at.is_some());
+        assert!(
+            !store
+                .fail_repo_initialization(&repo_id, "main", Some("c1"), "late")
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .load_added_repo(&repo_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_active()
+        );
+    }
+
+    #[tokio::test]
+    async fn head_initialization_canonicalizes_to_resolved_default_branch_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileRefStore::new(tmp.path());
+        let repo_id = RepoId::github("o/head");
+        let mut repo = initializing_repo(repo_id.clone());
+        repo.initialization_branch = Some("HEAD".into());
+        store.add_repo(&repo).await.unwrap();
+
+        assert!(
+            store
+                .pin_repo_initialization(&repo_id, "main", "c1")
+                .await
+                .unwrap()
+        );
+        let pinned = store.load_added_repo(&repo_id).await.unwrap().unwrap();
+        assert_eq!(pinned.initialization_branch.as_deref(), Some("main"));
+        assert_eq!(pinned.initialization_target.as_deref(), Some("c1"));
+        assert!(
+            !store
+                .pin_repo_initialization(&repo_id, "trunk", "c1")
+                .await
+                .unwrap()
+        );
+        assert!(store.activate_repo(&repo_id, "main", "c1").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn stale_failure_cannot_poison_initialization_and_matching_failure_is_retryable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileRefStore::new(tmp.path());
+        let repo_id = RepoId::github("o/fail");
+        store
+            .add_repo(&initializing_repo(repo_id.clone()))
+            .await
+            .unwrap();
+        store
+            .pin_repo_initialization(&repo_id, "main", "new")
+            .await
+            .unwrap();
+
+        assert!(
+            !store
+                .fail_repo_initialization(&repo_id, "main", Some("old"), "stale")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .load_added_repo(&repo_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            RepoLifecycleState::Initializing
+        );
+        assert!(
+            store
+                .fail_repo_initialization(&repo_id, "main", Some("new"), "boom")
+                .await
+                .unwrap()
+        );
+        let failed = store.load_added_repo(&repo_id).await.unwrap().unwrap();
+        assert_eq!(failed.state, RepoLifecycleState::Failed);
+        assert_eq!(failed.failure.as_deref(), Some("boom"));
+
+        store
+            .add_repo(&initializing_repo(repo_id.clone()))
+            .await
+            .unwrap();
+        assert!(
+            store
+                .pin_repo_initialization(&repo_id, "main", "retry")
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .activate_repo(&repo_id, "main", "retry")
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_activation_and_failure_has_no_active_to_failed_transition() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(FileRefStore::new(tmp.path()));
+        let repo_id = RepoId::github("o/race");
+        store
+            .add_repo(&initializing_repo(repo_id.clone()))
+            .await
+            .unwrap();
+        store
+            .pin_repo_initialization(&repo_id, "main", "c1")
+            .await
+            .unwrap();
+
+        let activate = {
+            let store = store.clone();
+            let repo_id = repo_id.clone();
+            tokio::spawn(async move { store.activate_repo(&repo_id, "main", "c1").await.unwrap() })
+        };
+        let fail = {
+            let store = store.clone();
+            let repo_id = repo_id.clone();
+            tokio::spawn(async move {
+                store
+                    .fail_repo_initialization(&repo_id, "main", Some("c1"), "race")
+                    .await
+                    .unwrap()
+            })
+        };
+        let _ = tokio::join!(activate, fail);
+        let state = store
+            .load_added_repo(&repo_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state;
+        assert!(matches!(
+            state,
+            RepoLifecycleState::Active | RepoLifecycleState::Failed
+        ));
+        if state == RepoLifecycleState::Active {
+            assert!(
+                !store
+                    .fail_repo_initialization(&repo_id, "main", Some("c1"), "late")
+                    .await
+                    .unwrap()
+            );
+        }
     }
 
     #[tokio::test]

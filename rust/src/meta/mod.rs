@@ -373,6 +373,11 @@ mod tests {
             history_enabled: true,
             source: crate::ref_store::AddedRepoSource::Api,
             repo_size_bytes: None,
+            state: crate::ref_store::RepoLifecycleState::Active,
+            initialization_branch: None,
+            initialization_target: None,
+            activated_at: Some(123),
+            failure: None,
         };
         store.add_repo(&added).await.unwrap();
         assert_eq!(

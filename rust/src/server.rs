@@ -14,7 +14,9 @@ use crate::oidc::OidcVerifier;
 use crate::pack::PackBuilder;
 use crate::provider::{ProviderInstance, ProviderRegistry, RepoId};
 use crate::queue::{BuildError, BuildJob, EnqueueOutcome, JobQueueRef, JobState};
-use crate::ref_store::{AddedRepo, AddedRepoSource, RefStore, migrate_legacy_refs};
+use crate::ref_store::{
+    AddedRepo, AddedRepoSource, RefStore, RepoLifecycleState, migrate_legacy_refs,
+};
 use crate::remote_gc::{GcConfig, RemoteGc};
 use crate::retention::Retention;
 use crate::snapshot::SnapshotBuilder;
@@ -529,6 +531,10 @@ async fn seed_added_repos(
         if ref_store.load_added_repo(&repo_id).await?.is_some() {
             continue;
         }
+        let legacy_info = ref_store.load_branch(&repo_id, "HEAD").await?;
+        let legacy_ready = legacy_info
+            .as_ref()
+            .is_some_and(|info| repo_activation_artifacts_ready(info, &info.commit));
         ref_store
             .add_repo(&AddedRepo {
                 repo_id,
@@ -536,6 +542,15 @@ async fn seed_added_repos(
                 history_enabled: true,
                 source: AddedRepoSource::Migration,
                 repo_size_bytes: None,
+                state: if legacy_ready {
+                    RepoLifecycleState::Active
+                } else {
+                    RepoLifecycleState::Initializing
+                },
+                initialization_branch: (!legacy_ready).then(|| "HEAD".to_string()),
+                initialization_target: legacy_info.as_ref().map(|info| info.commit.clone()),
+                activated_at: legacy_ready.then_some(now),
+                failure: None,
             })
             .await?;
     }
@@ -572,12 +587,29 @@ async fn repo_is_added(state: &ServerState, repo_id: &RepoId) -> Result<bool, Re
         .ref_store
         .load_added_repo(repo_id)
         .await
-        .map(|repo| repo.is_some())
+        .map(|repo| repo.is_some_and(|repo| repo.is_active()))
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
                     error: format!("added repo lookup failed: {e}"),
+                }),
+            )
+                .into_response()
+        })
+}
+
+async fn repo_is_registered(state: &ServerState, repo_id: &RepoId) -> Result<bool, Response> {
+    state
+        .ref_store
+        .load_added_repo(repo_id)
+        .await
+        .map(|repo| repo.is_some())
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("repo lifecycle lookup failed: {e}"),
                 }),
             )
                 .into_response()
@@ -736,6 +768,12 @@ pub struct RepoStatusResponse {
     pub owner: String,
     pub repo: String,
     pub added: bool,
+    #[serde(default)]
+    pub lifecycle: Option<RepoLifecycleState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub initialization_target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub initialization_failure: Option<String>,
     pub refs: Vec<BranchStatusEntry>,
     pub total_bytes: u64,
     pub total_unique_bytes: u64,
@@ -1641,6 +1679,26 @@ async fn ref_report_handler(
             .touch_last_accessed_at(&repo_id, &branch, &expected_commit)
             .await
             .map(|updated| RefReportResponse { updated }),
+        RefReport::PinRepoInitialization { branch, commit, .. } => state
+            .ref_store
+            .pin_repo_initialization(&repo_id, &branch, &commit)
+            .await
+            .map(|updated| RefReportResponse { updated }),
+        RefReport::ActivateRepo { branch, commit, .. } => state
+            .ref_store
+            .activate_repo(&repo_id, &branch, &commit)
+            .await
+            .map(|updated| RefReportResponse { updated }),
+        RefReport::FailRepoInitialization {
+            branch,
+            commit,
+            failure,
+            ..
+        } => state
+            .ref_store
+            .fail_repo_initialization(&repo_id, &branch, commit.as_deref(), &failure)
+            .await
+            .map(|updated| RefReportResponse { updated }),
     };
 
     match result {
@@ -2437,6 +2495,34 @@ fn selected_clonepack_commit(info: &RefInfo, clonepack_kind: &str) -> String {
     } else {
         artifacts.commit.clone()
     }
+}
+
+/// Admission predicate: exact shallow/HEAD and full-history manifests must be
+/// durable and commit-consistent. Archive chunks are intentionally irrelevant.
+fn repo_activation_artifacts_ready(info: &RefInfo, commit: &str) -> bool {
+    info.commit == commit
+        && info.shallow_clonepack.commit == commit
+        && !info.shallow_clonepack.manifest.is_empty()
+        && !info.shallow_clonepack.idx_bundle.is_empty()
+        && !info.shallow_clonepack.prebuilt_index.is_empty()
+        && info.full_clonepack.commit == commit
+        && !info.full_clonepack.manifest.is_empty()
+        && !info.full_clonepack.idx_bundle.is_empty()
+}
+
+async fn admit_repo_from_artifacts(
+    ref_store: &Arc<dyn RefStore>,
+    repo_id: &RepoId,
+    branch: &str,
+    info: &RefInfo,
+) -> Result<bool> {
+    if !repo_activation_artifacts_ready(info, &info.commit) {
+        return Ok(false);
+    }
+    ref_store
+        .pin_repo_initialization(repo_id, branch, &info.commit)
+        .await?;
+    ref_store.activate_repo(repo_id, branch, &info.commit).await
 }
 
 fn ref_info_serves_commit(info: &RefInfo, clonepack_kind: &str, commit: &str) -> bool {
@@ -3374,10 +3460,16 @@ async fn build_repo_status(
         .github_owner_repo()
         .map(|(o, r)| (o.to_string(), r.to_string()))
         .unwrap_or_default();
+    let admission = state.ref_store.load_added_repo(repo_id).await?;
     Ok(RepoStatusResponse {
         owner,
         repo,
-        added: state.ref_store.load_added_repo(repo_id).await?.is_some(),
+        added: admission.as_ref().is_some_and(AddedRepo::is_active),
+        lifecycle: admission.as_ref().map(|repo| repo.state),
+        initialization_target: admission
+            .as_ref()
+            .and_then(|repo| repo.initialization_target.clone()),
+        initialization_failure: admission.and_then(|repo| repo.failure),
         refs,
         total_bytes,
         total_unique_bytes,
@@ -3402,7 +3494,7 @@ async fn sync_repo_inner(
     {
         return resp;
     }
-    match repo_is_added(&state, &repo_id).await {
+    match repo_is_registered(&state, &repo_id).await {
         Ok(true) => {}
         Ok(false) => return repo_not_added_response(),
         Err(resp) => return resp,
@@ -3751,20 +3843,51 @@ async fn add_repo_inner(
         return resp;
     }
 
-    // Tiered-add preflight: capture repo size now so the first build can be
-    // size-classified without a new API call at enqueue.
-    let repo_size_bytes = preflight_repo_size_bytes(&provider, &repo_id, credential.as_ref()).await;
-    let added = AddedRepo {
-        repo_id: repo_id.clone(),
-        added_at: SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs(),
-        history_enabled: true,
-        source: params.source,
-        repo_size_bytes,
+    let existing = match state.ref_store.load_added_repo(&repo_id).await {
+        Ok(existing) => existing,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("add lookup failed: {e}"),
+                }),
+            )
+                .into_response();
+        }
     };
-    if let Err(e) = state.ref_store.add_repo(&added).await {
+    let needs_new_attempt = existing
+        .as_ref()
+        .is_none_or(|repo| repo.state == RepoLifecycleState::Failed);
+    // Preflight only once per attempt. `add` clients poll with repeated POSTs;
+    // probing the provider on every poll would turn onboarding into API spam.
+    let added = if needs_new_attempt {
+        let repo_size_bytes =
+            preflight_repo_size_bytes(&provider, &repo_id, credential.as_ref()).await;
+        Some(AddedRepo {
+            repo_id: repo_id.clone(),
+            added_at: SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            history_enabled: true,
+            source: params.source,
+            repo_size_bytes,
+            state: RepoLifecycleState::Initializing,
+            initialization_branch: Some(params.branch.clone()),
+            initialization_target: None,
+            activated_at: None,
+            failure: None,
+        })
+    } else {
+        None
+    };
+    // Repeated POSTs are status/retry pokes, not new initialization attempts.
+    // Preserve the pinned target while initializing; only a failed row starts a
+    // fresh attempt. Active rows remain active and the sync below is a cheap
+    // commit-keyed reuse/freshness check.
+    if let Some(added) = added.as_ref()
+        && let Err(e) = state.ref_store.add_repo(added).await
+    {
         state.metrics.record_error();
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -3775,17 +3898,39 @@ async fn add_repo_inner(
             .into_response();
     }
 
-    sync_repo_inner(
-        repo_id,
+    let response = sync_repo_inner(
+        repo_id.clone(),
         provider,
         SyncRequest {
             branch: params.branch,
             rev: None,
         },
         headers,
-        state,
+        state.clone(),
     )
-    .await
+    .await;
+    if response.status() == StatusCode::OK {
+        match state.ref_store.load_added_repo(&repo_id).await {
+            Ok(Some(repo)) if repo.is_active() => response,
+            Ok(_) => (
+                StatusCode::ACCEPTED,
+                Json(BuildResponse {
+                    status: "initializing".to_string(),
+                    queue_depth: state.build_queue.depth().await,
+                }),
+            )
+                .into_response(),
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("add status failed: {e}"),
+                }),
+            )
+                .into_response(),
+        }
+    } else {
+        response
+    }
 }
 
 async fn remove_added_repo_inner(repo_id: RepoId, state: ServerState) -> Response {
@@ -5785,6 +5930,7 @@ async fn do_sync(
             && let Some(prev) =
                 reuse_existing_build(ref_store, repo_id, branch, &tip, !inline_full_history).await?
         {
+            admit_repo_from_artifacts(ref_store, repo_id, branch, &prev).await?;
             info!(
                 "sync no-op (ls-remote): {} already current at {} (no fetch)",
                 repo_id.storage_key(),
@@ -5923,6 +6069,7 @@ async fn do_sync(
     if let Some(prev) =
         reuse_existing_build(ref_store, repo_id, branch, &commit, !inline_full_history).await?
     {
+        admit_repo_from_artifacts(ref_store, repo_id, branch, &prev).await?;
         info!(
             "sync no-op: {} already current at {} (reusing prior clonepack)",
             repo_id.storage_key(),
@@ -6429,6 +6576,18 @@ async fn build_and_publish_two_phase(
         .save_branch(repo_id, branch, &info)
         .await
         .with_context(|| format!("persist depth=1 ref for {}@{branch}", repo_id.storage_key()))?;
+    // Pin admission to the commit whose exact HEAD artifact is now durable.
+    // This is intentionally after upload + ref publication: a failed shallow
+    // build must leave the target unpinned so a retry can establish it.
+    ref_store
+        .pin_repo_initialization(repo_id, branch, commit)
+        .await
+        .with_context(|| {
+            format!(
+                "pin repo initialization for {}@{branch} {commit}",
+                repo_id.storage_key()
+            )
+        })?;
     phases.ref_publish_ms = Some(duration_ms(publish_start.elapsed()));
     info!(
         "two-phase p1: published depth-1 for {} in {:?} (full history building in background)",
@@ -7012,6 +7171,20 @@ async fn build_full_in_background(
                         repo_id.storage_key()
                     )
                 })?;
+            // Admission requires both exact HEAD and complete history at the
+            // same pinned target. The files archive is deliberately absent at
+            // this boundary and therefore cannot gate activation.
+            anyhow::ensure!(
+                repo_activation_artifacts_ready(&info, commit),
+                "refusing to activate {}@{branch} {commit}: incomplete HEAD/full artifacts",
+                repo_id.storage_key()
+            );
+            ref_store
+                .activate_repo(repo_id, branch, commit)
+                .await
+                .with_context(|| {
+                    format!("activate repo {}@{branch} {commit}", repo_id.storage_key())
+                })?;
         }
     }
     settle_storage(cas, storage, retention, uploads, idx_keep).await;
@@ -7353,6 +7526,21 @@ pub async fn process_build_job(
                         repo_id.storage_key()
                     );
                 }
+                if let Err(state_err) = state
+                    .ref_store
+                    .fail_repo_initialization(
+                        repo_id,
+                        &effective_branch,
+                        None,
+                        classified.message(),
+                    )
+                    .await
+                {
+                    error!(
+                        "repo initialization failure update failed for {}@{effective_branch}: {state_err:#}",
+                        repo_id.storage_key()
+                    );
+                }
                 warn!(
                     "background build failed for {}@{effective_branch}: {e}",
                     repo_id.storage_key()
@@ -7391,8 +7579,12 @@ pub async fn mark_branch_build_failed(
     branch: &str,
     message: &str,
 ) -> Result<()> {
-    let _ =
+    let commit =
         update_current_build_status(state, repo_id, branch, &format!("failed: {message}")).await?;
+    state
+        .ref_store
+        .fail_repo_initialization(repo_id, branch, commit.as_deref(), message)
+        .await?;
     Ok(())
 }
 
@@ -7685,6 +7877,16 @@ async fn handle_phase2_failure(
                 repo_id.storage_key()
             );
         }
+    } else if let Err(e) = action
+        .state
+        .ref_store
+        .fail_repo_initialization(repo_id, branch, Some(commit), reason)
+        .await
+    {
+        error!(
+            "repo initialization failure update failed for {}@{branch} {commit}: {e:#}",
+            repo_id.storage_key()
+        );
     }
 }
 
@@ -8995,6 +9197,36 @@ mod tests {
     }
 
     #[test]
+    fn repo_activation_requires_exact_head_and_full_but_not_files_archive() {
+        let mut info = RefInfo {
+            commit: "target".into(),
+            shallow_clonepack: crate::ClonepackArtifacts {
+                commit: "target".into(),
+                manifest: "head-manifest".into(),
+                idx_bundle: "head-idx".into(),
+                prebuilt_index: "index".into(),
+                ..Default::default()
+            },
+            full_clonepack: crate::ClonepackArtifacts {
+                commit: "target".into(),
+                manifest: "full-manifest".into(),
+                idx_bundle: "full-idx".into(),
+                ..Default::default()
+            },
+            archive_chunks: Vec::new(),
+            build_status: Some("archive building".into()),
+            ..Default::default()
+        };
+        assert!(repo_activation_artifacts_ready(&info, "target"));
+
+        info.full_clonepack.commit = "other".into();
+        assert!(!repo_activation_artifacts_ready(&info, "target"));
+        info.full_clonepack.commit = "target".into();
+        info.shallow_clonepack.prebuilt_index.clear();
+        assert!(!repo_activation_artifacts_ready(&info, "target"));
+    }
+
+    #[test]
     fn validate_repo_id_accepts_github_identifiers() {
         assert!(validate_repo_id("ripclone").is_ok());
         assert!(validate_repo_id("ripclone-rs").is_ok());
@@ -9614,6 +9846,11 @@ mod tests {
                 history_enabled: true,
                 source: AddedRepoSource::Api,
                 repo_size_bytes: None,
+                state: RepoLifecycleState::Active,
+                initialization_branch: None,
+                initialization_target: None,
+                activated_at: None,
+                failure: None,
             })
             .await
             .unwrap();

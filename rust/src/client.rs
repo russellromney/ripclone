@@ -1092,24 +1092,55 @@ impl Client {
         let max_attempts = std::env::var("RIPCLONE_SYNC_MAX_ATTEMPTS")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(40usize);
+            .unwrap_or(1200usize);
         let poll = test_sync_poll_interval();
+        let mut started = false;
         for attempt in 0..max_attempts {
             let resp = self.send(self.request(reqwest::Method::POST, &url)).await?;
-            let status = resp.status();
-            if status == reqwest::StatusCode::OK {
-                return Ok(resp.json().await?);
-            }
-            if status == reqwest::StatusCode::ACCEPTED
-                || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
-            {
-                if attempt + 1 < max_attempts {
-                    tokio::time::sleep(poll).await;
-                    continue;
+            match resp.status() {
+                reqwest::StatusCode::OK => return Ok(resp.json().await?),
+                reqwest::StatusCode::ACCEPTED => {
+                    started = true;
+                    break;
                 }
-                anyhow::bail!("add still building after {max_attempts} attempts");
+                reqwest::StatusCode::SERVICE_UNAVAILABLE if attempt + 1 < max_attempts => {
+                    tokio::time::sleep(poll).await;
+                }
+                _ => return Err(server_error("add failed", resp).await),
             }
-            return Err(server_error("add failed", resp).await);
+        }
+        if !started {
+            anyhow::bail!("add queue remained unavailable after {max_attempts} attempts");
+        }
+
+        // Poll the read-only lifecycle endpoint. Re-POSTing /add used to reset
+        // failed attempts and repeat provider preflights, making a terminal
+        // failure indistinguishable from a slow build.
+        let status_url = self.repo_url(repo_path, "/status");
+        for attempt in 0..max_attempts {
+            let status_resp = self
+                .send(self.request(reqwest::Method::GET, &status_url))
+                .await?;
+            if !status_resp.status().is_success() {
+                return Err(server_error("add status failed", status_resp).await);
+            }
+            let status: crate::server::RepoStatusResponse = status_resp.json().await?;
+            match status.lifecycle {
+                Some(crate::ref_store::RepoLifecycleState::Active) => {
+                    return self.resolve_ref(repo_path, "HEAD").await;
+                }
+                Some(crate::ref_store::RepoLifecycleState::Failed) => {
+                    anyhow::bail!(
+                        "add failed: {}",
+                        status
+                            .initialization_failure
+                            .as_deref()
+                            .unwrap_or("initialization failed")
+                    );
+                }
+                _ if attempt + 1 < max_attempts => tokio::time::sleep(poll).await,
+                _ => anyhow::bail!("add still initializing after {max_attempts} status checks"),
+            }
         }
         anyhow::bail!("add did not complete")
     }
