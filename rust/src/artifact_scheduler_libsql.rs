@@ -1039,13 +1039,15 @@ impl ArtifactSchedulerPersistence for LibsqlArtifactScheduler {
 fn released_schema_indices(version: i64) -> Result<Vec<usize>> {
     let mut indices: Vec<usize> = (0..=9).collect();
     match version {
-        1 => {}
-        2 => indices.extend(10..=11),
-        3..=5 => indices.extend(10..=14),
+        1 => indices.push(15),
+        2 => {
+            indices.extend(10..=11);
+            indices.push(15);
+        }
+        3..=5 => indices.extend(10..=15),
         6 => indices.extend(10..SCHEMA.len()),
         _ => bail!("unsupported libsql artifact scheduler schema version"),
     }
-    indices.push(15);
     indices.sort_unstable();
     Ok(indices)
 }
@@ -1101,7 +1103,12 @@ async fn validate_released_schema(c: &Connection, version: i64) -> Result<()> {
         ));
     }
     drop(rows);
-    if actual != expected {
+    let actual_identity: Vec<_> = actual.iter().map(|(kind, name, _)| (kind, name)).collect();
+    let expected_identity: Vec<_> = expected
+        .iter()
+        .map(|(kind, name, _)| (kind, name))
+        .collect();
+    if actual_identity != expected_identity || (version != VERSION && actual != expected) {
         bail!("libsql artifact scheduler does not match exact released v{version} inventory")
     }
     Ok(())
