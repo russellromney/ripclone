@@ -1209,7 +1209,7 @@ impl Client {
                     let target = target.as_ref();
                     let publication = crate::topup::BoundInstall::new(target, "files")?;
                     let staging_scope = publication.enter_staging()?;
-                    let staging = publication.staging_root().join("repo");
+                    let staging = publication.staging_root();
                     crate::artifact_manifest::CasCompletionVerifier::new(cas)
                         .materialize_transport_files_cancelled(capability, &staging, cancelled)?;
                     staging_scope.finish()?;
@@ -1507,6 +1507,7 @@ impl Client {
         cancelled: &tokio_util::sync::CancellationToken,
     ) -> Result<crate::artifact_manifest::VerifiedTransportArtifact> {
         const MAX_ROOT_BYTES: usize = 16 * 1024 * 1024;
+        const MAX_NESTED_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
         let request = Self::exact_transport_request(binding, root, transport_session);
         let root_bytes = self
             .fetch_small_artifact_bounded_cancelled(&request, root, MAX_ROOT_BYTES, cancelled)
@@ -1532,6 +1533,15 @@ impl Client {
         {
             anyhow::bail!("typed artifact root identity does not match clone request");
         }
+        if let crate::artifact_manifest::ArtifactPayload::FullHistory(history) = &manifest.payload {
+            for level in &history.levels {
+                if level.level_manifest.len == 0
+                    || level.level_manifest.len > MAX_NESTED_MANIFEST_BYTES
+                {
+                    anyhow::bail!("nested typed manifest exceeds client control-object limit");
+                }
+            }
+        }
         // Fetch direct descriptors first. For FullHistory these are the commit
         // anchor and nested level manifests; only hash-verified nested bytes are
         // allowed to delegate the pack/index set in the next step.
@@ -1544,10 +1554,18 @@ impl Client {
             if cancelled.is_cancelled() {
                 anyhow::bail!("typed clone artifact prefetch cancelled");
             }
-            if cas.verify_object_cancelled_bounded(&blob.hash, blob.len, cancelled)? != blob.len {
+            if blob.len == 0 || blob.len > MAX_NESTED_MANIFEST_BYTES {
+                anyhow::bail!("nested typed manifest exceeds client control-object limit");
+            }
+            if cas.verify_object_cancelled_bounded(
+                &blob.hash,
+                MAX_NESTED_MANIFEST_BYTES,
+                cancelled,
+            )? != blob.len
+            {
                 anyhow::bail!("nested typed descriptor is absent or has wrong length");
             }
-            cas.get_cancelled_bounded(&blob.hash, blob.len, cancelled)
+            cas.get_cancelled_bounded(&blob.hash, MAX_NESTED_MANIFEST_BYTES, cancelled)
         })?;
         for blob in &graph {
             self.fetch_exact_descriptor(cas, &request, blob, cancelled)

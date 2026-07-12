@@ -4533,6 +4533,32 @@ mod tests {
     }
 
     #[test]
+    fn hostile_sparse_sized_nested_manifest_is_rejected_before_loader_runs() {
+        let f = Fixture::new();
+        let verifier = CasCompletionVerifier::new(f.cas.clone());
+        let mut manifest = f.history();
+        let ArtifactPayload::FullHistory(history) = &mut manifest.payload else {
+            unreachable!()
+        };
+        history.levels[0].level_manifest.hash = "f".repeat(64);
+        history.levels[0].level_manifest.len = 16 * 1024 * 1024 * 1024;
+        manifest.semantic_digest =
+            semantic_digest(manifest.schema_version, &manifest.key, &manifest.payload).unwrap();
+        let loader_called = std::cell::Cell::new(false);
+        let error = verifier
+            .transport_referenced_blobs(&manifest, &mut |_blob| {
+                loader_called.set(true);
+                unreachable!("oversized nested control object must not be loaded")
+            })
+            .unwrap_err();
+        assert!(!loader_called.get());
+        assert!(
+            format!("{error:#}").contains("level manifest descriptor is invalid"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
     fn cancellation_during_large_files_stream_leaves_no_published_destination() {
         let mut f = Fixture::new();
         let mut content = vec![0u8; 32 * 1024 * 1024];

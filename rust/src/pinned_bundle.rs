@@ -1,14 +1,12 @@
 //! Server-side generation and readiness verification for pinned top-up bundles.
 
 use crate::cas::Cas;
-use crate::clonepack::install_manifest_pack_bytes;
 use crate::pack::PackBuilder;
 use crate::topup::{
     PinnedArtifactDescriptor, PinnedArtifactKind, PinnedBundleRequest, PinnedTopUpBundle,
     TopUpMode, VerifiedPinnedBundle, pinned_bundle_semantic_digest,
 };
 use anyhow::{Context, Result, bail};
-use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::Path;
@@ -20,6 +18,7 @@ const HEAD_PACK_TARGET: u64 = 6 * 1024 * 1024;
 const FULL_PACK_TARGET: u64 = 64 * 1024 * 1024;
 pub(crate) const MAX_PINNED_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
 pub(crate) const MAX_PINNED_ARTIFACT_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+const MAX_PINNED_CHECKOUT_METADATA_BYTES: u64 = 1024 * 1024;
 
 #[cfg(test)]
 static COMBINED_VERIFY_ENTRIES: std::sync::atomic::AtomicUsize =
@@ -313,6 +312,11 @@ fn verify_pinned_bundle_ready_inner(
     {
         bail!("pinned manifest checkout artifact kind mismatch");
     }
+    if stored.checkout_metadata.len == 0
+        || stored.checkout_metadata.len > MAX_PINNED_CHECKOUT_METADATA_BYTES
+    {
+        bail!("pinned checkout metadata descriptor exceeds control-object limit");
+    }
     for artifact in &flattened {
         if artifact.len > MAX_PINNED_ARTIFACT_BYTES {
             bail!("pinned artifact exceeds verification limit");
@@ -338,7 +342,7 @@ fn verify_pinned_bundle_ready_inner(
     )?;
     let metadata: PinnedCheckoutMetadata = serde_json::from_slice(&cas.get_cancelled_bounded(
         &stored.checkout_metadata.hash,
-        stored.checkout_metadata.len.min(MAX_PINNED_ARTIFACT_BYTES),
+        MAX_PINNED_CHECKOUT_METADATA_BYTES,
         cancelled,
     )?)?;
     if metadata.format_version != PINNED_BUNDLE_FORMAT_VERSION
@@ -524,14 +528,9 @@ fn verify_combined_repository_cancelled(
         cancelled,
     )
     .context("combined bundle target closure is incomplete")?;
-    std::fs::write(
-        repo.path().join(".git/index"),
-        cas.get_cancelled_bounded(
-            &stored.prebuilt_index.hash,
-            stored.prebuilt_index.len.min(MAX_PINNED_ARTIFACT_BYTES),
-            cancelled,
-        )?,
-    )?;
+    // Materialization above already streamed and hash-verified the prebuilt
+    // index directly into this repository. Never read an index-sized
+    // descriptor into a control-object Vec merely to overwrite the same file.
     let index_tree = git_stdout_cancelled(repo.path(), &["write-tree"], cancelled)?;
     let target_tree = git_stdout_cancelled(
         repo.path(),
@@ -572,17 +571,12 @@ fn materialize_pack_repo(
 ) -> Result<tempfile::TempDir> {
     let repo = tempfile::tempdir()?;
     crate::git::init(repo.path())?;
-    let packs = base
-        .iter()
-        .chain(overlay)
-        .map(|p| {
-            Ok((
-                Bytes::from(cas.get(&p.pack.hash)?),
-                Bytes::from(cas.get(&p.index.hash)?),
-            ))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    install_manifest_pack_bytes(&repo.path().join(".git/objects/pack"), packs)?;
+    let pack_dir = repo.path().join(".git/objects/pack");
+    std::fs::create_dir_all(&pack_dir)?;
+    let cancelled = tokio_util::sync::CancellationToken::new();
+    for pack in base.iter().chain(overlay) {
+        install_stored_pack_streaming_cancelled(cas, pack, &pack_dir, &cancelled)?;
+    }
     Ok(repo)
 }
 
@@ -748,24 +742,12 @@ fn materialize_pinned_bundle_artifacts(
     manifest: &PinnedBundleManifest,
     destination: &Path,
 ) -> Result<()> {
-    crate::git::init(destination)?;
-    let packs = manifest
-        .base_packs
-        .iter()
-        .chain(&manifest.overlay_packs)
-        .map(|p| {
-            Ok((
-                Bytes::from(cas.get(&p.pack.hash)?),
-                Bytes::from(cas.get(&p.index.hash)?),
-            ))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    install_manifest_pack_bytes(&destination.join(".git/objects/pack"), packs)?;
-    std::fs::write(
-        destination.join(".git/index"),
-        cas.get(&manifest.prebuilt_index.hash)?,
-    )?;
-    Ok(())
+    materialize_pinned_bundle_artifacts_cancelled(
+        cas,
+        manifest,
+        destination,
+        &tokio_util::sync::CancellationToken::new(),
+    )
 }
 
 fn materialize_pinned_bundle_artifacts_cancelled(
@@ -1343,7 +1325,7 @@ mod tests {
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
             let scope = publication.enter_staging().unwrap();
-            let staging = publication.staging_root().join("repo");
+            let staging = publication.staging_root();
             let _ = started_tx.send(());
             let result = materialize_verified_pinned_capability_cancelled(
                 &cas,
@@ -1389,10 +1371,13 @@ mod tests {
         let worker_token = token.clone();
         let cas = f.cas.clone();
         let worker_request = request.clone();
+        let hash_barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let worker_hash_barrier = hash_barrier.clone();
         let worker = std::thread::spawn(move || {
+            crate::cas::install_cancel_aware_hash_barrier(worker_hash_barrier);
             verify_pinned_bundle_capability_cancelled(&cas, &worker_request, &worker_token)
         });
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        hash_barrier.wait();
         token.cancel();
         let error = worker.join().unwrap().err().expect("cached hash cancelled");
         assert!(format!("{error:#}").contains("cancel"));
@@ -1529,6 +1514,39 @@ mod tests {
             ..request.clone()
         };
         assert!(verify_pinned_bundle_ready(&f.cas, &mutated).is_err());
+    }
+
+    #[test]
+    fn hostile_checkout_metadata_descriptor_is_rejected_before_cas_read_or_cancel() {
+        let f = Fixture::new();
+        let commit = f.commit("base", "base");
+        let base = f.base(&commit, TopUpMode::Head);
+        let request = f.generate(&base, &commit, TopUpMode::Head).unwrap();
+        let bytes = f.cas.get(&request.manifest_hash).unwrap();
+        let mut stored: PinnedBundleManifest = serde_json::from_slice(&bytes).unwrap();
+        stored.checkout_metadata.hash = "f".repeat(64);
+        stored.checkout_metadata.len = 16 * 1024 * 1024 * 1024;
+        let checkout_position = stored
+            .verified
+            .artifacts
+            .iter()
+            .position(|artifact| artifact.kind == PinnedArtifactKind::CheckoutMetadata)
+            .unwrap();
+        stored.verified.artifacts[checkout_position] = stored.checkout_metadata.clone();
+        stored.verified.semantic_digest =
+            pinned_bundle_semantic_digest(&stored.verified.bundle, &stored.verified.artifacts);
+        let mutated = PinnedBundleRequest {
+            manifest_hash: f.cas.put(&serde_json::to_vec(&stored).unwrap()).unwrap(),
+            ..request
+        };
+        // The deliberately absent hash proves the descriptor gate runs before
+        // CAS I/O; cancellation remains reserved for work that actually starts.
+        let active = tokio_util::sync::CancellationToken::new();
+        let error = verify_pinned_bundle_ready_cancelled(&f.cas, &mutated, &active).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("control-object limit"),
+            "unexpected error: {error:#}"
+        );
     }
 
     fn git(repo: &Path, args: &[&str]) {

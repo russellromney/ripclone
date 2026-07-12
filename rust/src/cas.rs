@@ -4,6 +4,16 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+#[cfg(test)]
+thread_local! {
+    static CANCEL_AWARE_HASH_BARRIER: std::cell::RefCell<Option<std::sync::Arc<std::sync::Barrier>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn install_cancel_aware_hash_barrier(barrier: std::sync::Arc<std::sync::Barrier>) {
+    CANCEL_AWARE_HASH_BARRIER.with(|slot| *slot.borrow_mut() = Some(barrier));
+}
+
 enum ObjectHasher {
     Sha1(sha1::Sha1),
     Sha256(Sha256),
@@ -374,9 +384,13 @@ impl Cas {
         if expected > maximum {
             anyhow::bail!("CAS object exceeds bounded read limit");
         }
-        let capacity: usize = expected.try_into().context("CAS object is too large")?;
         let read_start = Instant::now();
-        let mut data = Vec::with_capacity(capacity);
+        // This helper is reserved for small control objects. Do not turn an
+        // authenticated-but-hostile descriptor into an eager allocation: grow
+        // from one small read chunk while enforcing `maximum` on every read.
+        let initial_capacity = usize::try_from(expected.min(64 * 1024))
+            .context("CAS control object size does not fit this platform")?;
+        let mut data = Vec::with_capacity(initial_capacity);
         let mut hasher = ObjectHasher::for_object_id(hash)?;
         let mut chunk = vec![0u8; 1024 * 1024];
         loop {
@@ -505,6 +519,13 @@ impl Cas {
                 anyhow::bail!("CAS object exceeds bounded verification limit");
             }
             hasher.update(&buf[..n]);
+            #[cfg(test)]
+            if let Some(barrier) = CANCEL_AWARE_HASH_BARRIER.with(|slot| slot.borrow_mut().take()) {
+                // A one-shot, thread-local hook makes cancellation tests wait
+                // for this exact verifier to hash its first chunk. It cannot be
+                // released by unrelated tests or block subsequent chunks.
+                barrier.wait();
+            }
         }
         if hasher.finalize_hex() != hash {
             anyhow::bail!("CAS object {hash} is corrupt");
@@ -811,5 +832,29 @@ mod tests {
         std::fs::write(&path, b"trunc").unwrap();
 
         assert!(cas.get(&hash).is_err());
+    }
+
+    #[test]
+    fn bounded_control_read_rejects_sparse_hostile_object_before_read_or_cancel() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cas = Cas::new(tmp.path()).unwrap();
+        let hash = "a".repeat(64);
+        let path = cas.path(&hash);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(16 * 1024 * 1024 * 1024).unwrap();
+
+        // A cancelled token deliberately distinguishes the metadata gate from
+        // entering the read loop. The hostile sparse length must win without a
+        // descriptor-sized allocation or any content I/O.
+        let cancelled = tokio_util::sync::CancellationToken::new();
+        cancelled.cancel();
+        let error = cas
+            .get_cancelled_bounded(&hash, 1024 * 1024, &cancelled)
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("bounded read limit"),
+            "unexpected error: {error:#}"
+        );
     }
 }
