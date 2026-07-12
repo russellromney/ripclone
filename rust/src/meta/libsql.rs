@@ -212,6 +212,32 @@ impl MetaDb for LibsqlMeta {
         Ok(())
     }
 
+    async fn insert_added_repo(&self, repo_key: &str, data: &str) -> Result<bool> {
+        let changed = self.conn().await?.execute(
+            "INSERT INTO added_repos (repo_key, data) VALUES (?, ?) ON CONFLICT (repo_key) DO NOTHING",
+            libsql::params![repo_key, data],
+        ).await.context("insert added repo")?;
+        Ok(changed == 1)
+    }
+
+    async fn compare_and_swap_added_repo(
+        &self,
+        repo_key: &str,
+        expected_data: &str,
+        new_data: &str,
+    ) -> Result<bool> {
+        let changed = self
+            .conn()
+            .await?
+            .execute(
+                "UPDATE added_repos SET data = ? WHERE repo_key = ? AND data = ?",
+                libsql::params![new_data, repo_key, expected_data],
+            )
+            .await
+            .context("CAS added repo")?;
+        Ok(changed == 1)
+    }
+
     async fn get_added_repo(&self, repo_key: &str) -> Result<Option<String>> {
         let conn = self.conn().await?;
         let mut rows = conn

@@ -96,6 +96,17 @@ pub trait MetaDb: Send + Sync {
     /// Insert or update added-repo state, keyed by the unified storage key.
     async fn add_repo(&self, repo_key: &str, data: &str) -> Result<()>;
 
+    /// Insert only when absent. Used for first admission without a read/write race.
+    async fn insert_added_repo(&self, repo_key: &str, data: &str) -> Result<bool>;
+
+    /// Replace only the exact JSON value previously observed.
+    async fn compare_and_swap_added_repo(
+        &self,
+        repo_key: &str,
+        expected_data: &str,
+        new_data: &str,
+    ) -> Result<bool>;
+
     /// Fetch added-repo state for one repo.
     async fn get_added_repo(&self, repo_key: &str) -> Result<Option<String>>;
 
@@ -121,6 +132,32 @@ impl SqlRefStore {
     pub async fn new(db: Box<dyn MetaDb>) -> Result<Self> {
         db.init().await?;
         Ok(Self { db })
+    }
+
+    async fn mutate_admission(
+        &self,
+        repo_id: &RepoId,
+        mutate: impl Fn(&mut AddedRepo) -> bool,
+    ) -> Result<bool> {
+        let key = repo_id.storage_key();
+        loop {
+            let Some(old_data) = self.db.get_added_repo(&key).await? else {
+                return Ok(false);
+            };
+            let mut repo: AddedRepo =
+                serde_json::from_str(&old_data).context("parse stored added repo")?;
+            if !mutate(&mut repo) {
+                return Ok(false);
+            }
+            let new_data = serde_json::to_string(&repo).context("serialize added repo")?;
+            if self
+                .db
+                .compare_and_swap_added_repo(&key, &old_data, &new_data)
+                .await?
+            {
+                return Ok(true);
+            }
+        }
     }
 }
 
@@ -286,6 +323,118 @@ impl RefStore for SqlRefStore {
         self.db.add_repo(&repo.repo_id.storage_key(), &data).await
     }
 
+    async fn begin_repo_initialization(&self, repo: &AddedRepo) -> Result<bool> {
+        anyhow::ensure!(
+            repo.state == crate::ref_store::RepoLifecycleState::Initializing
+                && repo.initialization_attempt_id.is_some(),
+            "new repo admission requires an initializing row with an attempt id"
+        );
+        let key = repo.repo_id.storage_key();
+        let new_data = serde_json::to_string(repo).context("serialize added repo")?;
+        loop {
+            let Some(old_data) = self.db.get_added_repo(&key).await? else {
+                if self.db.insert_added_repo(&key, &new_data).await? {
+                    return Ok(true);
+                }
+                continue;
+            };
+            let old: AddedRepo =
+                serde_json::from_str(&old_data).context("parse stored added repo")?;
+            if old.state != crate::ref_store::RepoLifecycleState::Failed
+                || old.initialization_attempt_id == repo.initialization_attempt_id
+            {
+                return Ok(false);
+            }
+            if self
+                .db
+                .compare_and_swap_added_repo(&key, &old_data, &new_data)
+                .await?
+            {
+                return Ok(true);
+            }
+        }
+    }
+
+    async fn pin_repo_initialization(
+        &self,
+        repo_id: &RepoId,
+        branch: &str,
+        commit: &str,
+        attempt_id: Option<&str>,
+    ) -> Result<bool> {
+        self.mutate_admission(repo_id, |repo| {
+            let branch_matches = repo.initialization_branch.as_deref() == Some(branch)
+                || (repo.initialization_branch.as_deref() == Some("HEAD")
+                    && repo.initialization_target.is_none());
+            if repo.state != crate::ref_store::RepoLifecycleState::Initializing
+                || !crate::ref_store::admission_attempt_matches(repo, attempt_id)
+                || !branch_matches
+                || repo
+                    .initialization_target
+                    .as_deref()
+                    .is_some_and(|target| target != commit)
+            {
+                return false;
+            }
+            repo.initialization_branch = Some(branch.to_string());
+            repo.initialization_target
+                .get_or_insert_with(|| commit.to_string());
+            true
+        })
+        .await
+    }
+
+    async fn activate_repo(
+        &self,
+        repo_id: &RepoId,
+        _branch: &str,
+        commit: &str,
+        attempt_id: Option<&str>,
+    ) -> Result<bool> {
+        self.mutate_admission(repo_id, |repo| {
+            if !matches!(
+                repo.state,
+                crate::ref_store::RepoLifecycleState::Initializing
+                    | crate::ref_store::RepoLifecycleState::Failed
+            ) || !crate::ref_store::admission_attempt_matches(repo, attempt_id)
+                || repo.initialization_target.as_deref() != Some(commit)
+            {
+                return false;
+            }
+            repo.state = crate::ref_store::RepoLifecycleState::Active;
+            repo.activated_at = std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .ok()
+                .map(|d| d.as_secs());
+            repo.failure = None;
+            true
+        })
+        .await
+    }
+
+    async fn fail_repo_initialization(
+        &self,
+        repo_id: &RepoId,
+        _branch: &str,
+        commit: Option<&str>,
+        failure: &str,
+        attempt_id: Option<&str>,
+    ) -> Result<bool> {
+        self.mutate_admission(repo_id, |repo| {
+            if repo.state != crate::ref_store::RepoLifecycleState::Initializing
+                || !crate::ref_store::admission_attempt_matches(repo, attempt_id)
+                || commit
+                    .is_some_and(|commit| repo.initialization_target.as_deref() != Some(commit))
+            {
+                return false;
+            }
+            repo.state = crate::ref_store::RepoLifecycleState::Failed;
+            repo.failure = Some(failure.to_string());
+            true
+        })
+        .await
+    }
+
     async fn load_added_repo(&self, repo_id: &RepoId) -> Result<Option<AddedRepo>> {
         match self.db.get_added_repo(&repo_id.storage_key()).await? {
             Some(data) => Ok(Some(
@@ -378,6 +527,7 @@ mod tests {
             initialization_target: None,
             activated_at: Some(123),
             failure: None,
+            initialization_attempt_id: None,
         };
         store.add_repo(&added).await.unwrap();
         assert_eq!(

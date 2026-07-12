@@ -194,6 +194,29 @@ impl MetaDb for PostgresMeta {
         Ok(())
     }
 
+    async fn insert_added_repo(&self, repo_key: &str, data: &str) -> Result<bool> {
+        let result = sqlx::query("INSERT INTO added_repos (repo_key, data) VALUES ($1, $2) ON CONFLICT (repo_key) DO NOTHING")
+            .bind(repo_key).bind(data).execute(&self.pool).await.context("insert added repo")?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn compare_and_swap_added_repo(
+        &self,
+        repo_key: &str,
+        expected_data: &str,
+        new_data: &str,
+    ) -> Result<bool> {
+        let result =
+            sqlx::query("UPDATE added_repos SET data = $1 WHERE repo_key = $2 AND data = $3")
+                .bind(new_data)
+                .bind(repo_key)
+                .bind(expected_data)
+                .execute(&self.pool)
+                .await
+                .context("CAS added repo")?;
+        Ok(result.rows_affected() == 1)
+    }
+
     async fn get_added_repo(&self, repo_key: &str) -> Result<Option<String>> {
         sqlx::query_scalar("SELECT data FROM added_repos WHERE repo_key = $1")
             .bind(repo_key)

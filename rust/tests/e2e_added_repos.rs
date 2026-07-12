@@ -97,6 +97,7 @@ async fn initializing_repo_is_visible_in_status_but_not_cloneable() {
             initialization_target: Some(git(&origin.bare, &["rev-parse", "HEAD"])),
             activated_at: None,
             failure: None,
+            initialization_attempt_id: None,
         })
         .await
         .unwrap();

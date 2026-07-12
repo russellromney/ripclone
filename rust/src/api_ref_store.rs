@@ -91,6 +91,9 @@ impl std::error::Error for ApiReportError {}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum RefReport {
+    LoadAddedRepo {
+        repo_key: String,
+    },
     SaveBranch {
         repo_key: String,
         branch: String,
@@ -115,24 +118,31 @@ pub enum RefReport {
         repo_key: String,
         branch: String,
         commit: String,
+        #[serde(default)]
+        attempt_id: Option<String>,
     },
     ActivateRepo {
         repo_key: String,
         branch: String,
         commit: String,
+        #[serde(default)]
+        attempt_id: Option<String>,
     },
     FailRepoInitialization {
         repo_key: String,
         branch: String,
         commit: Option<String>,
         failure: String,
+        #[serde(default)]
+        attempt_id: Option<String>,
     },
 }
 
 impl RefReport {
     pub fn repo_key(&self) -> &str {
         match self {
-            Self::SaveBranch { repo_key, .. }
+            Self::LoadAddedRepo { repo_key }
+            | Self::SaveBranch { repo_key, .. }
             | Self::UpdateBuildStatus { repo_key, .. }
             | Self::DeleteBranch { repo_key, .. }
             | Self::TouchLastAccessed { repo_key, .. }
@@ -148,6 +158,8 @@ impl RefReport {
 pub struct RefReportResponse {
     #[serde(default)]
     pub updated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub added_repo: Option<AddedRepo>,
 }
 
 /// Worker-side `RefStore`: every write is a POST to the report URL.
@@ -234,11 +246,17 @@ impl ApiRefStore {
             // Body may be empty on pure-ack ops; default updated=true.
             let text = resp.text().await.unwrap_or_default();
             if text.trim().is_empty() {
-                return Ok(RefReportResponse { updated: true });
+                return Ok(RefReportResponse {
+                    updated: true,
+                    added_repo: None,
+                });
             }
             match serde_json::from_str::<RefReportResponse>(&text) {
                 Ok(r) => Ok(r),
-                Err(_) => Ok(RefReportResponse { updated: true }),
+                Err(_) => Ok(RefReportResponse {
+                    updated: true,
+                    added_repo: None,
+                }),
             }
         } else if status.as_u16() == 401 || status.as_u16() == 403 {
             let body = resp.text().await.unwrap_or_default();
@@ -363,8 +381,13 @@ impl RefStore for ApiRefStore {
         bail!("ApiRefStore does not support add_repo (server-only operation)")
     }
 
-    async fn load_added_repo(&self, _repo_id: &RepoId) -> Result<Option<AddedRepo>> {
-        Ok(None)
+    async fn load_added_repo(&self, repo_id: &RepoId) -> Result<Option<AddedRepo>> {
+        Ok(self
+            .post_report(&RefReport::LoadAddedRepo {
+                repo_key: repo_id.storage_key(),
+            })
+            .await?
+            .added_repo)
     }
 
     async fn list_added_repos(&self) -> Result<Vec<AddedRepo>> {
@@ -376,23 +399,32 @@ impl RefStore for ApiRefStore {
         repo_id: &RepoId,
         branch: &str,
         commit: &str,
+        attempt_id: Option<&str>,
     ) -> Result<bool> {
         Ok(self
             .post_report(&RefReport::PinRepoInitialization {
                 repo_key: repo_id.storage_key(),
                 branch: branch.to_string(),
                 commit: commit.to_string(),
+                attempt_id: attempt_id.map(str::to_string),
             })
             .await?
             .updated)
     }
 
-    async fn activate_repo(&self, repo_id: &RepoId, branch: &str, commit: &str) -> Result<bool> {
+    async fn activate_repo(
+        &self,
+        repo_id: &RepoId,
+        branch: &str,
+        commit: &str,
+        attempt_id: Option<&str>,
+    ) -> Result<bool> {
         Ok(self
             .post_report(&RefReport::ActivateRepo {
                 repo_key: repo_id.storage_key(),
                 branch: branch.to_string(),
                 commit: commit.to_string(),
+                attempt_id: attempt_id.map(str::to_string),
             })
             .await?
             .updated)
@@ -404,6 +436,7 @@ impl RefStore for ApiRefStore {
         branch: &str,
         commit: Option<&str>,
         failure: &str,
+        attempt_id: Option<&str>,
     ) -> Result<bool> {
         Ok(self
             .post_report(&RefReport::FailRepoInitialization {
@@ -411,6 +444,7 @@ impl RefStore for ApiRefStore {
                 branch: branch.to_string(),
                 commit: commit.map(str::to_string),
                 failure: failure.to_string(),
+                attempt_id: attempt_id.map(str::to_string),
             })
             .await?
             .updated)

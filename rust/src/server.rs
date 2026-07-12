@@ -551,6 +551,7 @@ async fn seed_added_repos(
                 initialization_target: legacy_info.as_ref().map(|info| info.commit.clone()),
                 activated_at: legacy_ready.then_some(now),
                 failure: None,
+                initialization_attempt_id: None,
             })
             .await?;
     }
@@ -1650,11 +1651,24 @@ async fn ref_report_handler(
     };
 
     let result: Result<RefReportResponse, anyhow::Error> = match body {
+        RefReport::LoadAddedRepo { .. } => {
+            state
+                .ref_store
+                .load_added_repo(&repo_id)
+                .await
+                .map(|added_repo| RefReportResponse {
+                    updated: false,
+                    added_repo,
+                })
+        }
         RefReport::SaveBranch { branch, info, .. } => state
             .ref_store
             .save_branch(&repo_id, &branch, &info)
             .await
-            .map(|_| RefReportResponse { updated: true }),
+            .map(|_| RefReportResponse {
+                updated: true,
+                added_repo: None,
+            }),
         RefReport::UpdateBuildStatus {
             branch,
             expected_commit,
@@ -1664,12 +1678,18 @@ async fn ref_report_handler(
             .ref_store
             .update_build_status(&repo_id, &branch, &expected_commit, &status)
             .await
-            .map(|updated| RefReportResponse { updated }),
+            .map(|updated| RefReportResponse {
+                updated,
+                added_repo: None,
+            }),
         RefReport::DeleteBranch { branch, .. } => state
             .ref_store
             .delete_branch(&repo_id, &branch)
             .await
-            .map(|_| RefReportResponse { updated: true }),
+            .map(|_| RefReportResponse {
+                updated: true,
+                added_repo: None,
+            }),
         RefReport::TouchLastAccessed {
             branch,
             expected_commit,
@@ -1678,27 +1698,56 @@ async fn ref_report_handler(
             .ref_store
             .touch_last_accessed_at(&repo_id, &branch, &expected_commit)
             .await
-            .map(|updated| RefReportResponse { updated }),
-        RefReport::PinRepoInitialization { branch, commit, .. } => state
+            .map(|updated| RefReportResponse {
+                updated,
+                added_repo: None,
+            }),
+        RefReport::PinRepoInitialization {
+            branch,
+            commit,
+            attempt_id,
+            ..
+        } => state
             .ref_store
-            .pin_repo_initialization(&repo_id, &branch, &commit)
+            .pin_repo_initialization(&repo_id, &branch, &commit, attempt_id.as_deref())
             .await
-            .map(|updated| RefReportResponse { updated }),
-        RefReport::ActivateRepo { branch, commit, .. } => state
+            .map(|updated| RefReportResponse {
+                updated,
+                added_repo: None,
+            }),
+        RefReport::ActivateRepo {
+            branch,
+            commit,
+            attempt_id,
+            ..
+        } => state
             .ref_store
-            .activate_repo(&repo_id, &branch, &commit)
+            .activate_repo(&repo_id, &branch, &commit, attempt_id.as_deref())
             .await
-            .map(|updated| RefReportResponse { updated }),
+            .map(|updated| RefReportResponse {
+                updated,
+                added_repo: None,
+            }),
         RefReport::FailRepoInitialization {
             branch,
             commit,
             failure,
+            attempt_id,
             ..
         } => state
             .ref_store
-            .fail_repo_initialization(&repo_id, &branch, commit.as_deref(), &failure)
+            .fail_repo_initialization(
+                &repo_id,
+                &branch,
+                commit.as_deref(),
+                &failure,
+                attempt_id.as_deref(),
+            )
             .await
-            .map(|updated| RefReportResponse { updated }),
+            .map(|updated| RefReportResponse {
+                updated,
+                added_repo: None,
+            }),
     };
 
     match result {
@@ -2515,14 +2564,17 @@ async fn admit_repo_from_artifacts(
     repo_id: &RepoId,
     branch: &str,
     info: &RefInfo,
+    attempt_id: Option<&str>,
 ) -> Result<bool> {
     if !repo_activation_artifacts_ready(info, &info.commit) {
         return Ok(false);
     }
     ref_store
-        .pin_repo_initialization(repo_id, branch, &info.commit)
+        .pin_repo_initialization(repo_id, branch, &info.commit, attempt_id)
         .await?;
-    ref_store.activate_repo(repo_id, branch, &info.commit).await
+    ref_store
+        .activate_repo(repo_id, branch, &info.commit, attempt_id)
+        .await
 }
 
 fn ref_info_serves_commit(info: &RefInfo, clonepack_kind: &str, commit: &str) -> bool {
@@ -3877,6 +3929,7 @@ async fn add_repo_inner(
             initialization_target: None,
             activated_at: None,
             failure: None,
+            initialization_attempt_id: Some(hex::encode(rand::random::<[u8; 16]>())),
         })
     } else {
         None
@@ -3885,24 +3938,43 @@ async fn add_repo_inner(
     // Preserve the pinned target while initializing; only a failed row starts a
     // fresh attempt. Active rows remain active and the sync below is a cheap
     // commit-keyed reuse/freshness check.
-    if let Some(added) = added.as_ref()
-        && let Err(e) = state.ref_store.add_repo(added).await
-    {
-        state.metrics.record_error();
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: format!("add failed: {e}"),
-            }),
-        )
-            .into_response();
+    if let Some(added) = added.as_ref() {
+        if let Err(e) = state.ref_store.begin_repo_initialization(added).await {
+            state.metrics.record_error();
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("add failed: {e}"),
+                }),
+            )
+                .into_response();
+        }
     }
+
+    // Another /add may have won while this request was preflighting. Always
+    // build the branch owned by the durable winning attempt; a delayed loser
+    // must not pin the winner to its stale request parameters.
+    let sync_branch = match state.ref_store.load_added_repo(&repo_id).await {
+        Ok(Some(repo)) if !repo.is_active() => repo
+            .initialization_branch
+            .unwrap_or_else(|| params.branch.clone()),
+        Ok(_) => params.branch.clone(),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("add winner lookup failed: {e}"),
+                }),
+            )
+                .into_response();
+        }
+    };
 
     let response = sync_repo_inner(
         repo_id.clone(),
         provider,
         SyncRequest {
-            branch: params.branch,
+            branch: sync_branch,
             rev: None,
         },
         headers,
@@ -4701,6 +4773,7 @@ async fn create_snapshot_inner(
             state: state.clone(),
             credential: credential.clone(),
             retry_recheck: Some(1),
+            initialization_attempt_id: None,
         }),
     )
     .await
@@ -5873,8 +5946,17 @@ async fn do_sync(
     // repos build concurrently. Safe because auto-gc is off, so the build only
     // reads the mirror's packs.
     mirror_lock: &Arc<tokio::sync::Mutex<()>>,
-    phase2_failure: Option<Phase2FailureAction>,
+    mut phase2_failure: Option<Phase2FailureAction>,
 ) -> Result<SyncBuildResult> {
+    // Capture the immutable attempt once. Any detached completion or delayed
+    // error from this sync must keep reporting the attempt it began under.
+    let initialization_attempt_id = ref_store
+        .load_added_repo(repo_id)
+        .await?
+        .and_then(|repo| repo.initialization_attempt_id);
+    if let Some(action) = phase2_failure.as_mut() {
+        action.initialization_attempt_id = initialization_attempt_id.clone();
+    }
     let compression_level = repo_config.compression_level();
     info!("syncing {}@{}", repo_id.storage_key(), branch);
 
@@ -5930,7 +6012,14 @@ async fn do_sync(
             && let Some(prev) =
                 reuse_existing_build(ref_store, repo_id, branch, &tip, !inline_full_history).await?
         {
-            admit_repo_from_artifacts(ref_store, repo_id, branch, &prev).await?;
+            admit_repo_from_artifacts(
+                ref_store,
+                repo_id,
+                branch,
+                &prev,
+                initialization_attempt_id.as_deref(),
+            )
+            .await?;
             info!(
                 "sync no-op (ls-remote): {} already current at {} (no fetch)",
                 repo_id.storage_key(),
@@ -6069,7 +6158,14 @@ async fn do_sync(
     if let Some(prev) =
         reuse_existing_build(ref_store, repo_id, branch, &commit, !inline_full_history).await?
     {
-        admit_repo_from_artifacts(ref_store, repo_id, branch, &prev).await?;
+        admit_repo_from_artifacts(
+            ref_store,
+            repo_id,
+            branch,
+            &prev,
+            initialization_attempt_id.as_deref(),
+        )
+        .await?;
         info!(
             "sync no-op: {} already current at {} (reusing prior clonepack)",
             repo_id.storage_key(),
@@ -6114,6 +6210,7 @@ async fn do_sync(
         fetched_at,
         compression_level,
         phases,
+        initialization_attempt_id,
         phase2_failure,
         // A tip build's commit is the just-fetched branch tip; a rev override
         // (at_rev) targets a specific historical commit, so only the former can
@@ -6161,6 +6258,7 @@ struct Phase2FailureAction {
     state: ServerState,
     credential: Option<SecretString>,
     retry_recheck: Option<u32>,
+    initialization_attempt_id: Option<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6182,6 +6280,7 @@ async fn build_and_publish_two_phase(
     // zstd level for archive frames, from the effective repo config.
     compression_level: i32,
     mut phases: SyncPhases,
+    initialization_attempt_id: Option<String>,
     phase2_failure: Option<Phase2FailureAction>,
     // True when `commit` is the just-fetched branch tip (not a rev override). Only
     // a tip build can be an authoritative confirmed-tip publish (see the
@@ -6580,7 +6679,12 @@ async fn build_and_publish_two_phase(
     // This is intentionally after upload + ref publication: a failed shallow
     // build must leave the target unpinned so a retry can establish it.
     ref_store
-        .pin_repo_initialization(repo_id, branch, commit)
+        .pin_repo_initialization(
+            repo_id,
+            branch,
+            commit,
+            initialization_attempt_id.as_deref(),
+        )
         .await
         .with_context(|| {
             format!(
@@ -6645,6 +6749,7 @@ async fn build_and_publish_two_phase(
             head_base_pack_count_for_p2,
             compression_level,
             t_total,
+            initialization_attempt_id,
         )
         .await;
         match &res {
@@ -6919,6 +7024,7 @@ async fn build_full_in_background(
     // zstd level for archive frames, from the effective repo config.
     compression_level: i32,
     build_started_at: Instant,
+    initialization_attempt_id: Option<String>,
 ) -> Result<()> {
     // Incremental history: build only the tail past the last sealed level; prior
     // levels are reused by hash from object storage (Tigris) — never rebuilt.
@@ -7180,7 +7286,12 @@ async fn build_full_in_background(
                 repo_id.storage_key()
             );
             ref_store
-                .activate_repo(repo_id, branch, commit)
+                .activate_repo(
+                    repo_id,
+                    branch,
+                    commit,
+                    initialization_attempt_id.as_deref(),
+                )
                 .await
                 .with_context(|| {
                     format!("activate repo {}@{branch} {commit}", repo_id.storage_key())
@@ -7351,6 +7462,13 @@ pub async fn process_build_job(
     let repo_id = &job.repo_id;
     let branch = &job.branch;
     let at_rev = job.rev.clone();
+    let initialization_attempt_id = state
+        .ref_store
+        .load_added_repo(repo_id)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|repo| repo.initialization_attempt_id);
 
     // Mark as building in the shared metadata store.
     if let Err(e) = update_current_build_status(state, repo_id, branch, "building").await {
@@ -7412,12 +7530,14 @@ pub async fn process_build_job(
                 state: state.clone(),
                 credential: job.credential.clone(),
                 retry_recheck: Some(1),
+                initialization_attempt_id: None,
             })
         } else {
             Some(Phase2FailureAction {
                 state: state.clone(),
                 credential: job.credential.clone(),
                 retry_recheck: None,
+                initialization_attempt_id: None,
             })
         },
     )
@@ -7533,6 +7653,7 @@ pub async fn process_build_job(
                         &effective_branch,
                         None,
                         classified.message(),
+                        initialization_attempt_id.as_deref(),
                     )
                     .await
                 {
@@ -7579,11 +7700,22 @@ pub async fn mark_branch_build_failed(
     branch: &str,
     message: &str,
 ) -> Result<()> {
+    let initialization_attempt_id = state
+        .ref_store
+        .load_added_repo(repo_id)
+        .await?
+        .and_then(|repo| repo.initialization_attempt_id);
     let commit =
         update_current_build_status(state, repo_id, branch, &format!("failed: {message}")).await?;
     state
         .ref_store
-        .fail_repo_initialization(repo_id, branch, commit.as_deref(), message)
+        .fail_repo_initialization(
+            repo_id,
+            branch,
+            commit.as_deref(),
+            message,
+            initialization_attempt_id.as_deref(),
+        )
         .await?;
     Ok(())
 }
@@ -7880,7 +8012,13 @@ async fn handle_phase2_failure(
     } else if let Err(e) = action
         .state
         .ref_store
-        .fail_repo_initialization(repo_id, branch, Some(commit), reason)
+        .fail_repo_initialization(
+            repo_id,
+            branch,
+            Some(commit),
+            reason,
+            action.initialization_attempt_id.as_deref(),
+        )
         .await
     {
         error!(
@@ -9851,6 +9989,7 @@ mod tests {
                 initialization_target: None,
                 activated_at: None,
                 failure: None,
+                initialization_attempt_id: None,
             })
             .await
             .unwrap();

@@ -137,6 +137,7 @@ async fn register_added_repo(server: &Server, repo: &str) -> u64 {
             initialization_target: None,
             activated_at: None,
             failure: None,
+            initialization_attempt_id: None,
         })
         .await
         .expect("mark repo added");

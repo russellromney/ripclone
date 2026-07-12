@@ -39,6 +39,11 @@ pub struct AddedRepo {
     pub activated_at: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure: Option<String>,
+    /// Immutable identity of this initialization attempt.  It changes only
+    /// when a failed admission is explicitly retried. Legacy rows have no
+    /// token and are reconciled using the old branch/commit guard.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initialization_attempt_id: Option<String>,
 }
 
 impl AddedRepo {
@@ -63,6 +68,15 @@ pub enum AddedRepoSource {
     Cloud,
     Api,
     Migration,
+}
+
+pub(crate) fn admission_attempt_matches(repo: &AddedRepo, attempt_id: Option<&str>) -> bool {
+    match (repo.initialization_attempt_id.as_deref(), attempt_id) {
+        (Some(stored), Some(reported)) => stored == reported,
+        // Rolling-upgrade compatibility for rows created before attempt IDs.
+        (None, None) => true,
+        _ => false,
+    }
 }
 
 /// Encode a branch name so it is safe to use in a filesystem path or S3 key.
@@ -205,6 +219,20 @@ pub trait RefStore: Send + Sync {
     /// separate from refs/artifacts: an added repo may be cold or still building.
     async fn add_repo(&self, repo: &AddedRepo) -> Result<()>;
 
+    /// Atomically create a new admission, or replace a failed admission with a
+    /// different attempt. Never overwrites initializing or active state.
+    async fn begin_repo_initialization(&self, repo: &AddedRepo) -> Result<bool> {
+        let existing = self.load_added_repo(&repo.repo_id).await?;
+        if existing
+            .as_ref()
+            .is_some_and(|r| r.state != RepoLifecycleState::Failed)
+        {
+            return Ok(false);
+        }
+        self.add_repo(repo).await?;
+        Ok(true)
+    }
+
     /// Load added-repo state, if this repo was explicitly made available.
     async fn load_added_repo(&self, repo_id: &RepoId) -> Result<Option<AddedRepo>>;
 
@@ -223,6 +251,7 @@ pub trait RefStore: Send + Sync {
         repo_id: &RepoId,
         branch: &str,
         commit: &str,
+        attempt_id: Option<&str>,
     ) -> Result<bool> {
         let Some(mut repo) = self.load_added_repo(repo_id).await? else {
             return Ok(false);
@@ -231,6 +260,7 @@ pub trait RefStore: Send + Sync {
             || (repo.initialization_branch.as_deref() == Some("HEAD")
                 && repo.initialization_target.is_none());
         if repo.state != RepoLifecycleState::Initializing
+            || !admission_attempt_matches(&repo, attempt_id)
             || !branch_matches
             || repo
                 .initialization_target
@@ -246,13 +276,22 @@ pub trait RefStore: Send + Sync {
         Ok(true)
     }
 
-    /// Admit an initializing repo only when branch and pinned commit match.
-    async fn activate_repo(&self, repo_id: &RepoId, branch: &str, commit: &str) -> Result<bool> {
+    /// Admit when attempt and pinned commit match. Verified readiness dominates
+    /// a same-attempt failure (`Failed -> Active`); Active remains monotonic.
+    async fn activate_repo(
+        &self,
+        repo_id: &RepoId,
+        _branch: &str,
+        commit: &str,
+        attempt_id: Option<&str>,
+    ) -> Result<bool> {
         let Some(mut repo) = self.load_added_repo(repo_id).await? else {
             return Ok(false);
         };
-        if repo.state != RepoLifecycleState::Initializing
-            || repo.initialization_branch.as_deref() != Some(branch)
+        if !matches!(
+            repo.state,
+            RepoLifecycleState::Initializing | RepoLifecycleState::Failed
+        ) || !admission_attempt_matches(&repo, attempt_id)
             || repo.initialization_target.as_deref() != Some(commit)
         {
             return Ok(false);
@@ -272,15 +311,16 @@ pub trait RefStore: Send + Sync {
     async fn fail_repo_initialization(
         &self,
         repo_id: &RepoId,
-        branch: &str,
+        _branch: &str,
         commit: Option<&str>,
         failure: &str,
+        attempt_id: Option<&str>,
     ) -> Result<bool> {
         let Some(mut repo) = self.load_added_repo(repo_id).await? else {
             return Ok(false);
         };
         if repo.state != RepoLifecycleState::Initializing
-            || repo.initialization_branch.as_deref() != Some(branch)
+            || !admission_attempt_matches(&repo, attempt_id)
             || commit.is_some_and(|commit| repo.initialization_target.as_deref() != Some(commit))
         {
             return Ok(false);
@@ -335,12 +375,37 @@ impl FileRefStore {
         }
     }
 
+    async fn lock_added_repos(&self) -> Result<std::fs::File> {
+        let path = self.added_root.join(".lifecycle.lock");
+        tokio::task::spawn_blocking(move || {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .open(&path)
+                .with_context(|| format!("open added-repo lock {}", path.display()))?;
+            #[cfg(unix)]
+            {
+                use std::os::fd::AsRawFd;
+                let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+                if rc != 0 {
+                    return Err(std::io::Error::last_os_error())
+                        .with_context(|| format!("lock added-repo store {}", path.display()));
+                }
+            }
+            Ok(file)
+        })
+        .await
+        .context("join added-repo lock task")?
+    }
+
     async fn mutate_added_repo(
         &self,
         repo_id: &RepoId,
         mutate: impl FnOnce(&mut AddedRepo) -> bool,
     ) -> Result<bool> {
         let _guard = self.write_lock.lock().await;
+        let _file_guard = self.lock_added_repos().await?;
         let path = self.added_path(repo_id);
         let mut repo: AddedRepo = match tokio::fs::read(&path).await {
             Ok(data) => serde_json::from_slice(&data)
@@ -640,6 +705,7 @@ impl RefStore for FileRefStore {
 
     async fn add_repo(&self, repo: &AddedRepo) -> Result<()> {
         let _guard = self.write_lock.lock().await;
+        let _file_guard = self.lock_added_repos().await?;
         let path = self.added_path(&repo.repo_id);
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent)
@@ -657,6 +723,41 @@ impl RefStore for FileRefStore {
         Ok(())
     }
 
+    async fn begin_repo_initialization(&self, repo: &AddedRepo) -> Result<bool> {
+        anyhow::ensure!(
+            repo.state == RepoLifecycleState::Initializing
+                && repo.initialization_attempt_id.is_some(),
+            "new repo admission requires an initializing row with an attempt id"
+        );
+        let _guard = self.write_lock.lock().await;
+        let _file_guard = self.lock_added_repos().await?;
+        let path = self.added_path(&repo.repo_id);
+        match tokio::fs::read(&path).await {
+            Ok(data) => {
+                let existing: AddedRepo = serde_json::from_slice(&data)
+                    .with_context(|| format!("parse added repo {}", path.display()))?;
+                if existing.state != RepoLifecycleState::Failed
+                    || existing.initialization_attempt_id == repo.initialization_attempt_id
+                {
+                    return Ok(false);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("read added repo {}", path.display())),
+        }
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let data = serde_json::to_vec_pretty(repo).context("serialize added repo")?;
+        let tmp_path = path.with_extension(format!(
+            "{}.tmp",
+            repo.initialization_attempt_id.as_deref().unwrap()
+        ));
+        tokio::fs::write(&tmp_path, data).await?;
+        tokio::fs::rename(&tmp_path, &path).await?;
+        Ok(true)
+    }
+
     async fn load_added_repo(&self, repo_id: &RepoId) -> Result<Option<AddedRepo>> {
         let path = self.added_path(repo_id);
         match tokio::fs::read(&path).await {
@@ -671,6 +772,8 @@ impl RefStore for FileRefStore {
     }
 
     async fn remove_added_repo(&self, repo_id: &RepoId) -> Result<()> {
+        let _guard = self.write_lock.lock().await;
+        let _file_guard = self.lock_added_repos().await?;
         let path = self.added_path(repo_id);
         match tokio::fs::remove_file(&path).await {
             Ok(()) => Ok(()),
@@ -716,12 +819,14 @@ impl RefStore for FileRefStore {
         repo_id: &RepoId,
         branch: &str,
         commit: &str,
+        attempt_id: Option<&str>,
     ) -> Result<bool> {
         self.mutate_added_repo(repo_id, |repo| {
             let branch_matches = repo.initialization_branch.as_deref() == Some(branch)
                 || (repo.initialization_branch.as_deref() == Some("HEAD")
                     && repo.initialization_target.is_none());
             if repo.state != RepoLifecycleState::Initializing
+                || !admission_attempt_matches(repo, attempt_id)
                 || !branch_matches
                 || repo
                     .initialization_target
@@ -738,10 +843,18 @@ impl RefStore for FileRefStore {
         .await
     }
 
-    async fn activate_repo(&self, repo_id: &RepoId, branch: &str, commit: &str) -> Result<bool> {
+    async fn activate_repo(
+        &self,
+        repo_id: &RepoId,
+        _branch: &str,
+        commit: &str,
+        attempt_id: Option<&str>,
+    ) -> Result<bool> {
         self.mutate_added_repo(repo_id, |repo| {
-            if repo.state != RepoLifecycleState::Initializing
-                || repo.initialization_branch.as_deref() != Some(branch)
+            if !matches!(
+                repo.state,
+                RepoLifecycleState::Initializing | RepoLifecycleState::Failed
+            ) || !admission_attempt_matches(repo, attempt_id)
                 || repo.initialization_target.as_deref() != Some(commit)
             {
                 return false;
@@ -760,13 +873,16 @@ impl RefStore for FileRefStore {
     async fn fail_repo_initialization(
         &self,
         repo_id: &RepoId,
-        branch: &str,
+        _branch: &str,
         commit: Option<&str>,
         failure: &str,
+        attempt_id: Option<&str>,
     ) -> Result<bool> {
         self.mutate_added_repo(repo_id, |repo| {
-            if repo.state != RepoLifecycleState::Initializing
-                || repo.initialization_branch.as_deref() != Some(branch)
+            if !matches!(
+                repo.state,
+                RepoLifecycleState::Initializing | RepoLifecycleState::Failed
+            ) || !admission_attempt_matches(repo, attempt_id)
                 || commit
                     .is_some_and(|commit| repo.initialization_target.as_deref() != Some(commit))
             {
@@ -847,6 +963,33 @@ impl S3RefStore {
 
     fn added_key(&self, repo_id: &RepoId) -> String {
         format!("added_repos/{}.json", repo_id.storage_key())
+    }
+
+    async fn mutate_added_repo_cas(
+        &self,
+        repo_id: &RepoId,
+        mutate: impl Fn(&mut AddedRepo) -> bool,
+    ) -> Result<bool> {
+        let key = self.added_key(repo_id);
+        for _ in 0..32 {
+            let Some((etag, data)) = self.storage.get_object(&key).await? else {
+                return Ok(false);
+            };
+            let mut repo: AddedRepo = serde_json::from_slice(&data)
+                .with_context(|| format!("parse S3 added repo {key}"))?;
+            if !mutate(&mut repo) {
+                return Ok(false);
+            }
+            let next = serde_json::to_vec_pretty(&repo).context("serialize added repo")?;
+            if self
+                .storage
+                .put_object_cas(&key, &next, Some(&etag))
+                .await?
+            {
+                return Ok(true);
+            }
+        }
+        anyhow::bail!("S3 added repo CAS contention exceeded retry limit for {key}")
     }
 
     /// Read-compare-CAS write shared by HEAD (`save`) and branch
@@ -1113,6 +1256,121 @@ impl RefStore for S3RefStore {
             .await
             .with_context(|| format!("write S3 added repo {}", repo.repo_id.storage_key()))?;
         Ok(())
+    }
+
+    async fn begin_repo_initialization(&self, repo: &AddedRepo) -> Result<bool> {
+        anyhow::ensure!(
+            repo.state == RepoLifecycleState::Initializing
+                && repo.initialization_attempt_id.is_some(),
+            "new repo admission requires an initializing row with an attempt id"
+        );
+        let key = self.added_key(&repo.repo_id);
+        let next = serde_json::to_vec_pretty(repo).context("serialize added repo")?;
+        for _ in 0..32 {
+            match self.storage.get_object(&key).await? {
+                None => {
+                    if self.storage.put_object_cas(&key, &next, None).await? {
+                        return Ok(true);
+                    }
+                }
+                Some((etag, data)) => {
+                    let existing: AddedRepo =
+                        serde_json::from_slice(&data).context("parse S3 added repo")?;
+                    if existing.state != RepoLifecycleState::Failed
+                        || existing.initialization_attempt_id == repo.initialization_attempt_id
+                    {
+                        return Ok(false);
+                    }
+                    if self
+                        .storage
+                        .put_object_cas(&key, &next, Some(&etag))
+                        .await?
+                    {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+        anyhow::bail!("S3 admission contention exceeded retry limit for {key}")
+    }
+
+    async fn pin_repo_initialization(
+        &self,
+        repo_id: &RepoId,
+        branch: &str,
+        commit: &str,
+        attempt_id: Option<&str>,
+    ) -> Result<bool> {
+        self.mutate_added_repo_cas(repo_id, |repo| {
+            let branch_matches = repo.initialization_branch.as_deref() == Some(branch)
+                || (repo.initialization_branch.as_deref() == Some("HEAD")
+                    && repo.initialization_target.is_none());
+            if repo.state != RepoLifecycleState::Initializing
+                || !admission_attempt_matches(repo, attempt_id)
+                || !branch_matches
+                || repo
+                    .initialization_target
+                    .as_deref()
+                    .is_some_and(|target| target != commit)
+            {
+                return false;
+            }
+            repo.initialization_branch = Some(branch.to_string());
+            repo.initialization_target
+                .get_or_insert_with(|| commit.to_string());
+            true
+        })
+        .await
+    }
+
+    async fn activate_repo(
+        &self,
+        repo_id: &RepoId,
+        _branch: &str,
+        commit: &str,
+        attempt_id: Option<&str>,
+    ) -> Result<bool> {
+        self.mutate_added_repo_cas(repo_id, |repo| {
+            if !matches!(
+                repo.state,
+                RepoLifecycleState::Initializing | RepoLifecycleState::Failed
+            ) || !admission_attempt_matches(repo, attempt_id)
+                || repo.initialization_target.as_deref() != Some(commit)
+            {
+                return false;
+            }
+            repo.state = RepoLifecycleState::Active;
+            repo.activated_at = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .ok()
+                .map(|d| d.as_secs());
+            repo.failure = None;
+            true
+        })
+        .await
+    }
+
+    async fn fail_repo_initialization(
+        &self,
+        repo_id: &RepoId,
+        _branch: &str,
+        commit: Option<&str>,
+        failure: &str,
+        attempt_id: Option<&str>,
+    ) -> Result<bool> {
+        self.mutate_added_repo_cas(repo_id, |repo| {
+            if repo.state != RepoLifecycleState::Initializing
+                || !admission_attempt_matches(repo, attempt_id)
+                || commit
+                    .is_some_and(|commit| repo.initialization_target.as_deref() != Some(commit))
+            {
+                return false;
+            }
+            repo.state = RepoLifecycleState::Failed;
+            repo.failure = Some(failure.to_string());
+            true
+        })
+        .await
     }
 
     async fn load_added_repo(&self, repo_id: &RepoId) -> Result<Option<AddedRepo>> {
@@ -1423,6 +1681,47 @@ impl<T: RefStore> RefStore for CachingRefStore<T> {
 
     async fn add_repo(&self, repo: &AddedRepo) -> Result<()> {
         self.inner.add_repo(repo).await
+    }
+
+    async fn begin_repo_initialization(&self, repo: &AddedRepo) -> Result<bool> {
+        self.inner.begin_repo_initialization(repo).await
+    }
+
+    async fn pin_repo_initialization(
+        &self,
+        repo_id: &RepoId,
+        branch: &str,
+        commit: &str,
+        attempt_id: Option<&str>,
+    ) -> Result<bool> {
+        self.inner
+            .pin_repo_initialization(repo_id, branch, commit, attempt_id)
+            .await
+    }
+
+    async fn activate_repo(
+        &self,
+        repo_id: &RepoId,
+        branch: &str,
+        commit: &str,
+        attempt_id: Option<&str>,
+    ) -> Result<bool> {
+        self.inner
+            .activate_repo(repo_id, branch, commit, attempt_id)
+            .await
+    }
+
+    async fn fail_repo_initialization(
+        &self,
+        repo_id: &RepoId,
+        branch: &str,
+        commit: Option<&str>,
+        failure: &str,
+        attempt_id: Option<&str>,
+    ) -> Result<bool> {
+        self.inner
+            .fail_repo_initialization(repo_id, branch, commit, failure, attempt_id)
+            .await
     }
 
     async fn load_added_repo(&self, repo_id: &RepoId) -> Result<Option<AddedRepo>> {
@@ -1849,6 +2148,7 @@ mod tests {
             initialization_target: None,
             activated_at: Some(123),
             failure: None,
+            initialization_attempt_id: Some("attempt-1".into()),
         };
 
         store.add_repo(&added).await.unwrap();
@@ -1875,6 +2175,7 @@ mod tests {
         }"#;
         let added: AddedRepo = serde_json::from_str(legacy).unwrap();
         assert_eq!(added.repo_size_bytes, None);
+        assert_eq!(added.initialization_attempt_id, None);
         assert_eq!(added.repo_id.path, "o/r");
         assert_eq!(added.state, RepoLifecycleState::Initializing);
     }
@@ -1891,6 +2192,7 @@ mod tests {
             initialization_target: None,
             activated_at: None,
             failure: None,
+            initialization_attempt_id: Some("attempt-1".into()),
         }
     }
 
@@ -1904,27 +2206,42 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(!store.activate_repo(&repo_id, "main", "c1").await.unwrap());
         assert!(
             !store
-                .pin_repo_initialization(&repo_id, "other", "c1")
+                .activate_repo(&repo_id, "main", "c1", Some("attempt-1"))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .pin_repo_initialization(&repo_id, "other", "c1", Some("attempt-1"))
                 .await
                 .unwrap()
         );
         assert!(
             store
-                .pin_repo_initialization(&repo_id, "main", "c1")
+                .pin_repo_initialization(&repo_id, "main", "c1", Some("attempt-1"))
                 .await
                 .unwrap()
         );
         assert!(
             !store
-                .pin_repo_initialization(&repo_id, "main", "c2")
+                .pin_repo_initialization(&repo_id, "main", "c2", Some("attempt-1"))
                 .await
                 .unwrap()
         );
-        assert!(!store.activate_repo(&repo_id, "main", "c2").await.unwrap());
-        assert!(store.activate_repo(&repo_id, "main", "c1").await.unwrap());
+        assert!(
+            !store
+                .activate_repo(&repo_id, "main", "c2", Some("attempt-1"))
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .activate_repo(&repo_id, "main", "c1", Some("attempt-1"))
+                .await
+                .unwrap()
+        );
 
         let active = store.load_added_repo(&repo_id).await.unwrap().unwrap();
         assert!(active.is_active());
@@ -1932,7 +2249,7 @@ mod tests {
         assert!(active.activated_at.is_some());
         assert!(
             !store
-                .fail_repo_initialization(&repo_id, "main", Some("c1"), "late")
+                .fail_repo_initialization(&repo_id, "main", Some("c1"), "late", Some("attempt-1"))
                 .await
                 .unwrap()
         );
@@ -1957,7 +2274,7 @@ mod tests {
 
         assert!(
             store
-                .pin_repo_initialization(&repo_id, "main", "c1")
+                .pin_repo_initialization(&repo_id, "main", "c1", Some("attempt-1"))
                 .await
                 .unwrap()
         );
@@ -1966,11 +2283,16 @@ mod tests {
         assert_eq!(pinned.initialization_target.as_deref(), Some("c1"));
         assert!(
             !store
-                .pin_repo_initialization(&repo_id, "trunk", "c1")
+                .pin_repo_initialization(&repo_id, "trunk", "c1", Some("attempt-1"))
                 .await
                 .unwrap()
         );
-        assert!(store.activate_repo(&repo_id, "main", "c1").await.unwrap());
+        assert!(
+            store
+                .activate_repo(&repo_id, "main", "c1", Some("attempt-1"))
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -1983,13 +2305,13 @@ mod tests {
             .await
             .unwrap();
         store
-            .pin_repo_initialization(&repo_id, "main", "new")
+            .pin_repo_initialization(&repo_id, "main", "new", Some("attempt-1"))
             .await
             .unwrap();
 
         assert!(
             !store
-                .fail_repo_initialization(&repo_id, "main", Some("old"), "stale")
+                .fail_repo_initialization(&repo_id, "main", Some("old"), "stale", Some("attempt-1"))
                 .await
                 .unwrap()
         );
@@ -2004,7 +2326,7 @@ mod tests {
         );
         assert!(
             store
-                .fail_repo_initialization(&repo_id, "main", Some("new"), "boom")
+                .fail_repo_initialization(&repo_id, "main", Some("new"), "boom", Some("attempt-1"))
                 .await
                 .unwrap()
         );
@@ -2013,18 +2335,21 @@ mod tests {
         assert_eq!(failed.failure.as_deref(), Some("boom"));
 
         store
-            .add_repo(&initializing_repo(repo_id.clone()))
+            .begin_repo_initialization(&AddedRepo {
+                initialization_attempt_id: Some("attempt-2".into()),
+                ..initializing_repo(repo_id.clone())
+            })
             .await
             .unwrap();
         assert!(
             store
-                .pin_repo_initialization(&repo_id, "main", "retry")
+                .pin_repo_initialization(&repo_id, "main", "retry", Some("attempt-2"))
                 .await
                 .unwrap()
         );
         assert!(
             store
-                .activate_repo(&repo_id, "main", "retry")
+                .activate_repo(&repo_id, "main", "retry", Some("attempt-2"))
                 .await
                 .unwrap()
         );
@@ -2040,21 +2365,32 @@ mod tests {
             .await
             .unwrap();
         store
-            .pin_repo_initialization(&repo_id, "main", "c1")
+            .pin_repo_initialization(&repo_id, "main", "c1", Some("attempt-1"))
             .await
             .unwrap();
 
         let activate = {
             let store = store.clone();
             let repo_id = repo_id.clone();
-            tokio::spawn(async move { store.activate_repo(&repo_id, "main", "c1").await.unwrap() })
+            tokio::spawn(async move {
+                store
+                    .activate_repo(&repo_id, "main", "c1", Some("attempt-1"))
+                    .await
+                    .unwrap()
+            })
         };
         let fail = {
             let store = store.clone();
             let repo_id = repo_id.clone();
             tokio::spawn(async move {
                 store
-                    .fail_repo_initialization(&repo_id, "main", Some("c1"), "race")
+                    .fail_repo_initialization(
+                        &repo_id,
+                        "main",
+                        Some("c1"),
+                        "race",
+                        Some("attempt-1"),
+                    )
                     .await
                     .unwrap()
             })
@@ -2066,18 +2402,13 @@ mod tests {
             .unwrap()
             .unwrap()
             .state;
-        assert!(matches!(
-            state,
-            RepoLifecycleState::Active | RepoLifecycleState::Failed
-        ));
-        if state == RepoLifecycleState::Active {
-            assert!(
-                !store
-                    .fail_repo_initialization(&repo_id, "main", Some("c1"), "late")
-                    .await
-                    .unwrap()
-            );
-        }
+        assert_eq!(state, RepoLifecycleState::Active);
+        assert!(
+            !store
+                .fail_repo_initialization(&repo_id, "main", Some("c1"), "late", Some("attempt-1"))
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]

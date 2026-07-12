@@ -203,6 +203,28 @@ impl MetaDb for SqliteMeta {
         Ok(())
     }
 
+    async fn insert_added_repo(&self, repo_key: &str, data: &str) -> Result<bool> {
+        let result = sqlx::query("INSERT INTO added_repos (repo_key, data) VALUES (?, ?) ON CONFLICT (repo_key) DO NOTHING")
+            .bind(repo_key).bind(data).execute(&self.pool).await.context("insert added repo")?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn compare_and_swap_added_repo(
+        &self,
+        repo_key: &str,
+        expected_data: &str,
+        new_data: &str,
+    ) -> Result<bool> {
+        let result = sqlx::query("UPDATE added_repos SET data = ? WHERE repo_key = ? AND data = ?")
+            .bind(new_data)
+            .bind(repo_key)
+            .bind(expected_data)
+            .execute(&self.pool)
+            .await
+            .context("CAS added repo")?;
+        Ok(result.rows_affected() == 1)
+    }
+
     async fn get_added_repo(&self, repo_key: &str) -> Result<Option<String>> {
         sqlx::query_scalar("SELECT data FROM added_repos WHERE repo_key = ?")
             .bind(repo_key)
