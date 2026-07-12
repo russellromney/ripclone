@@ -13,14 +13,17 @@ use crate::artifact_scheduler::{
     VerifiedCompletionEvidence, scheduler_fingerprint, validate_format_version, validate_lease,
     validate_limits, validate_observation_identity, validate_resolved_commit,
 };
-use crate::artifact_scheduler_backend::ArtifactSchedulerPersistence;
+use crate::artifact_scheduler_backend::{
+    ArtifactSchedulerPersistence, TRANSPORT_ROOT_PAGE_MAX, TransportRootLease,
+    validate_transport_lease_identity,
+};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use libsql::{Connection, Database, Row, Transaction, TransactionBehavior, Value};
 use std::sync::Arc;
 
-const VERSION: i64 = 1;
-const PROVENANCE: &str = "ripclone-artifact-scheduler-libsql-v1";
+const VERSION: i64 = 2;
+const PROVENANCE: &str = "ripclone-artifact-scheduler-libsql-v2";
 const SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS artifact_scheduler_schema(id INTEGER PRIMARY KEY CHECK(id=1),version INTEGER NOT NULL,provenance TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS artifact_jobs(id INTEGER PRIMARY KEY AUTOINCREMENT,workspace TEXT NOT NULL,repo TEXT NOT NULL,commit_oid TEXT NOT NULL,kind TEXT NOT NULL CHECK(kind IN('head','full_history','files')),format_version INTEGER NOT NULL CHECK(format_version BETWEEN 1 AND 4294967295),state TEXT NOT NULL CHECK(state IN('queued','running','ready','failed')),owner TEXT,heartbeat_at INTEGER,lease_expires_at INTEGER,lease_generation INTEGER NOT NULL DEFAULT 0 CHECK(lease_generation>=0),claim_attempts INTEGER NOT NULL DEFAULT 0 CHECK(claim_attempts BETWEEN 0 AND 4294967295),retry_count INTEGER NOT NULL DEFAULT 0 CHECK(retry_count BETWEEN 0 AND 4294967295),manifest TEXT,error TEXT,failure_class TEXT CHECK(failure_class IS NULL OR failure_class IN('retryable','permanent','dead_letter')),created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,UNIQUE(workspace,repo,commit_oid,kind,format_version))",
@@ -32,6 +35,8 @@ const SCHEMA: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS artifact_observations_published ON artifact_observations(published_artifact_id)",
     "CREATE TABLE IF NOT EXISTS artifact_consumers(artifact_id INTEGER NOT NULL,consumer_id TEXT NOT NULL,expires_at INTEGER NOT NULL,PRIMARY KEY(artifact_id,consumer_id))",
     "CREATE INDEX IF NOT EXISTS artifact_consumers_expiry ON artifact_consumers(expires_at)",
+    "CREATE TABLE IF NOT EXISTS artifact_transport_leases(root_hash TEXT NOT NULL,session_id TEXT NOT NULL,workspace TEXT NOT NULL,repo TEXT NOT NULL,expires_at INTEGER NOT NULL,PRIMARY KEY(root_hash,session_id))",
+    "CREATE INDEX IF NOT EXISTS artifact_transport_leases_expiry ON artifact_transport_leases(expires_at)",
     "CREATE TABLE IF NOT EXISTS scheduler_state(id INTEGER PRIMARY KEY CHECK(id=1),fairness_cursor INTEGER NOT NULL CHECK(fairness_cursor BETWEEN 0 AND 3),workspace_cursor TEXT NOT NULL DEFAULT '',config_fingerprint TEXT NOT NULL DEFAULT '')",
 ];
 
@@ -78,7 +83,7 @@ impl LibsqlArtifactScheduler {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .await?;
-        let existing=one_i64(&tx,"SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN('artifact_scheduler_schema','artifact_jobs','branch_observations','artifact_observations','artifact_consumers','scheduler_state')",vec![]).await?;
+        let existing=one_i64(&tx,"SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN('artifact_scheduler_schema','artifact_jobs','branch_observations','artifact_observations','artifact_consumers','artifact_transport_leases','scheduler_state')",vec![]).await?;
         if existing == 0 {
             for ddl in SCHEMA {
                 tx.execute(ddl, ()).await?;
@@ -93,7 +98,27 @@ impl LibsqlArtifactScheduler {
                 (),
             )
             .await?;
-        } else if existing != 6 {
+        } else if existing == 6 {
+            let marker = query_one(
+                &tx,
+                "SELECT version,provenance FROM artifact_scheduler_schema WHERE id=1",
+                vec![],
+            )
+            .await?
+            .context("artifact scheduler schema marker missing")?;
+            if marker.get::<i64>(0)? != 1
+                || marker.get::<String>(1)? != "ripclone-artifact-scheduler-libsql-v1"
+            {
+                bail!("partial or unprovenanced libsql artifact scheduler schema")
+            }
+            tx.execute(SCHEMA[10], ()).await?;
+            tx.execute(SCHEMA[11], ()).await?;
+            tx.execute(
+                "UPDATE artifact_scheduler_schema SET version=?,provenance=? WHERE id=1 AND version=1",
+                libsql::params![VERSION, PROVENANCE],
+            )
+            .await?;
+        } else if existing != 7 {
             bail!("partial or unprovenanced libsql artifact scheduler schema")
         }
         validate_schema(&tx).await?;
@@ -105,7 +130,7 @@ impl LibsqlArtifactScheduler {
         )
         .await?;
         if stored.is_empty() {
-            let existing=one_i64(&tx,"SELECT (SELECT count(*) FROM artifact_jobs)+(SELECT count(*) FROM branch_observations)+(SELECT count(*) FROM artifact_observations)+(SELECT count(*) FROM artifact_consumers)",vec![]).await?;
+            let existing=one_i64(&tx,"SELECT (SELECT count(*) FROM artifact_jobs)+(SELECT count(*) FROM branch_observations)+(SELECT count(*) FROM artifact_observations)+(SELECT count(*) FROM artifact_consumers)+(SELECT count(*) FROM artifact_transport_leases)",vec![]).await?;
             if existing != 0 {
                 bail!("unprovenanced libsql scheduler state is not empty")
             }
@@ -228,6 +253,94 @@ impl ArtifactSchedulerPersistence for LibsqlArtifactScheduler {
     }
     fn completion_sealer(&self) -> Arc<CompletionSealAuthority> {
         self.completion_sealer.clone()
+    }
+    async fn register_transport_root(
+        &self,
+        root: &str,
+        session: &str,
+        workspace: &str,
+        repo: &str,
+        ttl: i64,
+    ) -> Result<()> {
+        validate_transport_lease_identity(root, session, workspace, repo, ttl)?;
+        let tx = self.tx().await?;
+        let r: Result<()> = async {
+            if one_i64(&tx, "SELECT count(*) FROM artifact_transport_leases WHERE session_id=? AND (workspace<>? OR repo<>?)", vec![session.into(), workspace.into(), repo.into()]).await? != 0 {
+                bail!("transport session is already bound to another repository")
+            }
+            let t = now(&tx).await?;
+            let changed = exec(&tx, "INSERT INTO artifact_transport_leases(root_hash,session_id,workspace,repo,expires_at) VALUES(?,?,?,?,?) ON CONFLICT(root_hash,session_id) DO UPDATE SET expires_at=excluded.expires_at WHERE artifact_transport_leases.workspace=excluded.workspace AND artifact_transport_leases.repo=excluded.repo", vec![root.into(), session.into(), workspace.into(), repo.into(), (t + ttl).into()]).await?;
+            if changed != 1 { bail!("transport root identity conflict") }
+            Ok(())
+        }.await;
+        finish(tx, r).await
+    }
+
+    async fn renew_transport_root(
+        &self,
+        root: &str,
+        session: &str,
+        workspace: &str,
+        repo: &str,
+        ttl: i64,
+    ) -> Result<bool> {
+        validate_transport_lease_identity(root, session, workspace, repo, ttl)?;
+        let tx = self.tx().await?;
+        let r: Result<bool> = async { let t=now(&tx).await?; Ok(exec(&tx, "UPDATE artifact_transport_leases SET expires_at=? WHERE root_hash=? AND session_id=? AND workspace=? AND repo=? AND expires_at>?", vec![(t+ttl).into(),root.into(),session.into(),workspace.into(),repo.into(),t.into()]).await? == 1) }.await;
+        finish(tx, r).await
+    }
+
+    async fn release_transport_root(
+        &self,
+        root: &str,
+        session: &str,
+        workspace: &str,
+        repo: &str,
+    ) -> Result<bool> {
+        validate_transport_lease_identity(root, session, workspace, repo, 1)?;
+        Ok(exec(&self.conn().await?, "DELETE FROM artifact_transport_leases WHERE root_hash=? AND session_id=? AND workspace=? AND repo=?", vec![root.into(),session.into(),workspace.into(),repo.into()]).await? == 1)
+    }
+
+    async fn live_transport_roots_page(
+        &self,
+        after: Option<(&str, &str)>,
+        limit: u32,
+    ) -> Result<Vec<TransportRootLease>> {
+        if limit == 0 || limit > TRANSPORT_ROOT_PAGE_MAX {
+            bail!("transport root page limit is invalid")
+        }
+        let c = self.conn().await?;
+        let t = now(&c).await?;
+        let (sql, args): (&str, Vec<Value>) = if let Some((root, session)) = after {
+            validate_transport_lease_identity(root, session, "cursor", "cursor", 1)?;
+            (
+                "SELECT root_hash,session_id,workspace,repo,expires_at FROM artifact_transport_leases WHERE expires_at>? AND (root_hash>? OR (root_hash=? AND session_id>?)) ORDER BY root_hash,session_id LIMIT ?",
+                vec![
+                    t.into(),
+                    root.into(),
+                    root.into(),
+                    session.into(),
+                    (limit as i64).into(),
+                ],
+            )
+        } else {
+            (
+                "SELECT root_hash,session_id,workspace,repo,expires_at FROM artifact_transport_leases WHERE expires_at>? ORDER BY root_hash,session_id LIMIT ?",
+                vec![t.into(), (limit as i64).into()],
+            )
+        };
+        let mut rows = c.query(sql, args).await?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next().await? {
+            out.push(TransportRootLease {
+                root_hash: r.get(0)?,
+                session_id: r.get(1)?,
+                workspace: r.get(2)?,
+                repo: r.get(3)?,
+                expires_at: r.get(4)?,
+            });
+        }
+        Ok(out)
     }
     async fn schedule(&self, key: &ArtifactKey) -> Result<ScheduleOutcome> {
         validate_format_version(key.format_version)?;
@@ -395,7 +508,7 @@ impl ArtifactSchedulerPersistence for LibsqlArtifactScheduler {
     }
     async fn reconcile_expired(&self) -> Result<(u64, u64)> {
         let tx = self.tx().await?;
-        let r=async{let t=now(&tx).await?;exec(&tx,"DELETE FROM artifact_consumers WHERE expires_at<=?",vec![t.into()]).await?;exec(&tx,"DELETE FROM artifact_jobs WHERE state='queued' AND id NOT IN(SELECT desired_artifact_id FROM artifact_observations) AND id NOT IN(SELECT artifact_id FROM artifact_consumers)",vec![]).await?;let f=exec(&tx,"UPDATE artifact_jobs SET state='failed',owner=NULL,heartbeat_at=NULL,lease_expires_at=NULL,error='lease expired after attempt limit',failure_class='dead_letter',updated_at=? WHERE state='running' AND lease_expires_at<=? AND claim_attempts>=?",vec![t.into(),t.into(),(self.limits.max_claim_attempts as i64).into()]).await?;let q=exec(&tx,"UPDATE artifact_jobs SET state='queued',owner=NULL,heartbeat_at=NULL,lease_expires_at=NULL,error='lease expired; reclaimed',updated_at=? WHERE state='running' AND lease_expires_at<=? AND claim_attempts<?",vec![t.into(),t.into(),(self.limits.max_claim_attempts as i64).into()]).await?;Ok((q,f))}.await;
+        let r=async{let t=now(&tx).await?;exec(&tx,"DELETE FROM artifact_consumers WHERE expires_at<=?",vec![t.into()]).await?;exec(&tx,"DELETE FROM artifact_transport_leases WHERE rowid IN (SELECT rowid FROM artifact_transport_leases WHERE expires_at<=? ORDER BY expires_at,root_hash,session_id LIMIT 512)",vec![t.into()]).await?;exec(&tx,"DELETE FROM artifact_jobs WHERE state='queued' AND id NOT IN(SELECT desired_artifact_id FROM artifact_observations) AND id NOT IN(SELECT artifact_id FROM artifact_consumers)",vec![]).await?;let f=exec(&tx,"UPDATE artifact_jobs SET state='failed',owner=NULL,heartbeat_at=NULL,lease_expires_at=NULL,error='lease expired after attempt limit',failure_class='dead_letter',updated_at=? WHERE state='running' AND lease_expires_at<=? AND claim_attempts>=?",vec![t.into(),t.into(),(self.limits.max_claim_attempts as i64).into()]).await?;let q=exec(&tx,"UPDATE artifact_jobs SET state='queued',owner=NULL,heartbeat_at=NULL,lease_expires_at=NULL,error='lease expired; reclaimed',updated_at=? WHERE state='running' AND lease_expires_at<=? AND claim_attempts<?",vec![t.into(),t.into(),(self.limits.max_claim_attempts as i64).into()]).await?;Ok((q,f))}.await;
         finish(tx, r).await
     }
     async fn get(&self, id: i64) -> Result<Option<ArtifactRecord>> {
@@ -646,6 +759,10 @@ async fn validate_schema(c: &Connection) -> Result<()> {
             &["artifact_id", "consumer_id", "expires_at"],
         ),
         (
+            "artifact_transport_leases",
+            &["root_hash", "session_id", "workspace", "repo", "expires_at"],
+        ),
+        (
             "scheduler_state",
             &[
                 "id",
@@ -717,6 +834,10 @@ async fn validate_schema(c: &Connection) -> Result<()> {
             &["primarykey(artifact_id,consumer_id)"],
         ),
         (
+            "artifact_transport_leases",
+            &["primarykey(root_hash,session_id)"],
+        ),
+        (
             "scheduler_state",
             &["check(id=1)", "check(fairness_cursorbetween0and3)"],
         ),
@@ -746,6 +867,7 @@ async fn validate_schema(c: &Connection) -> Result<()> {
         "artifact_observations_desired",
         "artifact_observations_published",
         "artifact_consumers_expiry",
+        "artifact_transport_leases_expiry",
     ] {
         let actual = one_string(
             c,
@@ -761,6 +883,21 @@ async fn validate_schema(c: &Connection) -> Result<()> {
         if canonical_ddl(&actual) != canonical_ddl(expected) {
             bail!("libsql scheduler index {index} differs from schema version")
         }
+    }
+    let transport_indexes = one_i64(
+        c,
+        "SELECT count(*) FROM sqlite_master WHERE type='index' AND tbl_name='artifact_transport_leases'",
+        vec![],
+    )
+    .await?;
+    let transport_foreign_keys = one_i64(
+        c,
+        "SELECT count(*) FROM pragma_foreign_key_list('artifact_transport_leases')",
+        vec![],
+    )
+    .await?;
+    if transport_indexes != 2 || transport_foreign_keys != 0 {
+        bail!("libsql artifact transport schema has unexpected indexes or foreign keys")
     }
     let invalid_jobs=one_i64(c,"SELECT count(*) FROM artifact_jobs WHERE state IS NULL OR typeof(state)<>'text' OR state NOT IN('queued','running','ready','failed') OR kind IS NULL OR typeof(kind)<>'text' OR kind NOT IN('head','full_history','files') OR format_version IS NULL OR typeof(format_version)<>'integer' OR format_version NOT BETWEEN 1 AND 4294967295 OR typeof(id)<>'integer' OR typeof(workspace)<>'text' OR typeof(repo)<>'text' OR typeof(commit_oid)<>'text' OR typeof(lease_generation)<>'integer' OR lease_generation<0 OR typeof(claim_attempts)<>'integer' OR claim_attempts NOT BETWEEN 0 AND 4294967295 OR typeof(retry_count)<>'integer' OR retry_count NOT BETWEEN 0 AND 4294967295 OR typeof(created_at)<>'integer' OR typeof(updated_at)<>'integer' OR (owner IS NOT NULL AND typeof(owner)<>'text') OR (heartbeat_at IS NOT NULL AND typeof(heartbeat_at)<>'integer') OR (lease_expires_at IS NOT NULL AND typeof(lease_expires_at)<>'integer') OR (manifest IS NOT NULL AND typeof(manifest)<>'text') OR (error IS NOT NULL AND typeof(error)<>'text') OR (failure_class IS NOT NULL AND (typeof(failure_class)<>'text' OR failure_class NOT IN('retryable','permanent','dead_letter'))) OR (state='running' AND (owner IS NULL OR length(trim(owner))=0 OR lease_expires_at IS NULL)) OR (state='ready' AND (manifest IS NULL OR length(trim(manifest))=0))",vec![]).await?;
     if invalid_jobs != 0 {
@@ -785,6 +922,26 @@ async fn validate_schema(c: &Connection) -> Result<()> {
     let invalid_branches=one_i64(c,"SELECT count(*) FROM branch_observations WHERE typeof(workspace)<>'text' OR typeof(repo)<>'text' OR typeof(branch)<>'text' OR typeof(generation)<>'integer' OR generation<1 OR typeof(desired_commit)<>'text' OR typeof(updated_at)<>'integer'",vec![]).await?;
     if invalid_branches != 0 {
         bail!("libsql artifact scheduler contains invalid branch observations")
+    }
+    let invalid_transport=one_i64(c,"SELECT count(*) FROM artifact_transport_leases WHERE typeof(root_hash)<>'text' OR length(root_hash)<>64 OR root_hash GLOB '*[^0-9a-f]*' OR typeof(session_id)<>'text' OR length(session_id)<>64 OR session_id GLOB '*[^0-9a-f]*' OR typeof(workspace)<>'text' OR length(workspace)=0 OR typeof(repo)<>'text' OR length(repo)=0 OR typeof(expires_at)<>'integer'",vec![]).await?;
+    if invalid_transport != 0 {
+        bail!("libsql artifact scheduler contains invalid transport leases")
+    }
+    reject_rust_blank(
+        c,
+        "SELECT workspace FROM artifact_transport_leases",
+        "transport workspace",
+    )
+    .await?;
+    reject_rust_blank(
+        c,
+        "SELECT repo FROM artifact_transport_leases",
+        "transport repository",
+    )
+    .await?;
+    let conflicting_sessions=one_i64(c,"SELECT count(*) FROM (SELECT session_id FROM artifact_transport_leases GROUP BY session_id HAVING count(DISTINCT workspace || char(0) || repo)>1)",vec![]).await?;
+    if conflicting_sessions != 0 {
+        bail!("libsql artifact scheduler contains cross-repository transport sessions")
     }
     let invalid_consumers=one_i64(c,"SELECT count(*) FROM artifact_consumers WHERE typeof(artifact_id)<>'integer' OR typeof(consumer_id)<>'text' OR length(trim(consumer_id))=0 OR typeof(expires_at)<>'integer'",vec![]).await?;
     if invalid_consumers != 0 {
@@ -1077,6 +1234,71 @@ mod tests {
         let Some(s) = server().await else { return };
         let a = scheduler(&s.url, Default::default()).await;
         let b = scheduler(&s.url, Default::default()).await;
+        let root0 = format!("{:064x}", 1);
+        let root1 = format!("{:064x}", 2);
+        let session0 = format!("{:064x}", 10_001);
+        let session1 = format!("{:064x}", 10_002);
+        a.register_transport_root(&root0, &session0, "ws", "owner/repo", 60)
+            .await
+            .unwrap();
+        a.register_transport_root(&root1, &session0, "ws", "owner/repo", 60)
+            .await
+            .unwrap();
+        a.register_transport_root(&root0, &session1, "ws", "owner/repo", 60)
+            .await
+            .unwrap();
+        assert!(
+            b.register_transport_root(&format!("{:064x}", 3), &session0, "ws", "other/repo", 60)
+                .await
+                .is_err()
+        );
+        assert!(
+            !a.renew_transport_root(&root0, &session0, "ws", "other/repo", 60)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !a.release_transport_root(&root0, &session0, "ws", "other/repo")
+                .await
+                .unwrap()
+        );
+        for i in 100..613 {
+            a.register_transport_root(
+                &format!("{i:064x}"),
+                &format!("{:064x}", i + 20_000),
+                "ws",
+                "owner/repo",
+                60,
+            )
+            .await
+            .unwrap();
+        }
+        let page = a.live_transport_roots_page(None, 512).await.unwrap();
+        assert_eq!(page.len(), 512);
+        let cursor = page.last().unwrap();
+        assert!(
+            !a.live_transport_roots_page(Some((&cursor.root_hash, &cursor.session_id)), 512)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(a.live_transport_roots_page(None, 513).await.is_err());
+        let race_root = format!("{:064x}", 900_001);
+        let race_session = format!("{:064x}", 900_002);
+        a.register_transport_root(&race_root, &race_session, "ws", "owner/repo", 60)
+            .await
+            .unwrap();
+        let (renewed, released) = tokio::join!(
+            a.renew_transport_root(&race_root, &race_session, "ws", "owner/repo", 60),
+            b.release_transport_root(&race_root, &race_session, "ws", "owner/repo")
+        );
+        assert!(released.unwrap());
+        let _ = renewed.unwrap();
+        assert!(
+            !a.renew_transport_root(&race_root, &race_session, "ws", "owner/repo", 60)
+                .await
+                .unwrap()
+        );
         let k = key("c1", ArtifactKind::Head);
         let (x, y) = tokio::join!(a.schedule(&k), b.schedule(&k));
         let ids = [outcome_id(&x.unwrap()), outcome_id(&y.unwrap())];

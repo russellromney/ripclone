@@ -13,14 +13,17 @@ use crate::artifact_scheduler::{
 };
 #[cfg(test)]
 use crate::artifact_scheduler::{CompletionEvidence, validate_evidence};
-use crate::artifact_scheduler_backend::ArtifactSchedulerPersistence;
+use crate::artifact_scheduler_backend::{
+    ArtifactSchedulerPersistence, TRANSPORT_ROOT_PAGE_MAX, TransportRootLease,
+    validate_transport_lease_identity,
+};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use sqlx::mysql::MySqlPool;
 use sqlx::{Acquire, MySql, Row, Transaction};
 use std::sync::Arc;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const SCHEMA: &[&str] = &[
     r#"CREATE TABLE IF NOT EXISTS artifact_scheduler_schema(
  id SMALLINT NOT NULL PRIMARY KEY,
@@ -66,6 +69,10 @@ const SCHEMA: &[&str] = &[
     r#"CREATE TABLE IF NOT EXISTS artifact_consumers(
  artifact_id BIGINT NOT NULL,consumer_id VARCHAR(255) NOT NULL,expires_at BIGINT NOT NULL,
  PRIMARY KEY(artifact_id,consumer_id), INDEX artifact_consumers_expiry(expires_at)) ENGINE=InnoDB DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin"#,
+    r#"CREATE TABLE IF NOT EXISTS artifact_transport_leases(
+ root_hash VARCHAR(64) NOT NULL,session_id VARCHAR(64) NOT NULL,
+ workspace VARCHAR(128) NOT NULL,repo VARCHAR(320) NOT NULL,expires_at BIGINT NOT NULL,
+ PRIMARY KEY(root_hash,session_id), INDEX artifact_transport_leases_expiry(expires_at)) ENGINE=InnoDB DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin"#,
     r#"CREATE TABLE IF NOT EXISTS scheduler_state(
  id SMALLINT NOT NULL PRIMARY KEY, fairness_cursor BIGINT NOT NULL,
  workspace_cursor VARCHAR(128) NOT NULL DEFAULT '',config_fingerprint VARCHAR(512) NOT NULL DEFAULT '',
@@ -131,10 +138,18 @@ impl MysqlArtifactScheduler {
             if version > SCHEMA_VERSION {
                 bail!("artifact scheduler database is newer than this binary")
             }
-            if version != SCHEMA_VERSION {
+            if version != 1 && version != SCHEMA_VERSION {
                 bail!("unsupported mysql artifact scheduler schema {version}")
             }
             Self::validate_schema(&mut migration).await?;
+            if version == 1 {
+                sqlx::query(
+                    "UPDATE artifact_scheduler_schema SET version=? WHERE id=1 AND version=1",
+                )
+                .bind(SCHEMA_VERSION)
+                .execute(&mut *migration)
+                .await?;
+            }
 
             let fingerprint = scheduler_fingerprint(&limits, verifier_id);
             if fingerprint.chars().count() > 512 {
@@ -150,7 +165,8 @@ impl MysqlArtifactScheduler {
                     "SELECT (SELECT count(*) FROM artifact_jobs)
                           + (SELECT count(*) FROM branch_observations)
                           + (SELECT count(*) FROM artifact_observations)
-                          + (SELECT count(*) FROM artifact_consumers)",
+                          + (SELECT count(*) FROM artifact_consumers)
+                          + (SELECT count(*) FROM artifact_transport_leases)",
                 )
                 .fetch_one(&mut *migration)
                 .await?;
@@ -307,6 +323,41 @@ impl MysqlArtifactScheduler {
                 None,
             ),
             ("artifact_consumers", "expires_at", "bigint", "NO", None),
+            (
+                "artifact_transport_leases",
+                "root_hash",
+                "varchar(64)",
+                "NO",
+                None,
+            ),
+            (
+                "artifact_transport_leases",
+                "session_id",
+                "varchar(64)",
+                "NO",
+                None,
+            ),
+            (
+                "artifact_transport_leases",
+                "workspace",
+                "varchar(128)",
+                "NO",
+                None,
+            ),
+            (
+                "artifact_transport_leases",
+                "repo",
+                "varchar(320)",
+                "NO",
+                None,
+            ),
+            (
+                "artifact_transport_leases",
+                "expires_at",
+                "bigint",
+                "NO",
+                None,
+            ),
             ("scheduler_state", "id", "smallint", "NO", None),
             ("scheduler_state", "fairness_cursor", "bigint", "NO", None),
             (
@@ -328,7 +379,7 @@ impl MysqlArtifactScheduler {
             "SELECT count(*) FROM information_schema.columns
              WHERE table_schema=DATABASE() AND table_name IN
              ('artifact_scheduler_schema','artifact_jobs','branch_observations',
-              'artifact_observations','artifact_consumers','scheduler_state')",
+              'artifact_observations','artifact_consumers','artifact_transport_leases','scheduler_state')",
         )
         .fetch_one(&mut **tx)
         .await?;
@@ -339,7 +390,7 @@ impl MysqlArtifactScheduler {
             "SELECT count(*) FROM information_schema.tables
              WHERE table_schema=DATABASE() AND table_name IN
              ('artifact_scheduler_schema','artifact_jobs','branch_observations',
-              'artifact_observations','artifact_consumers','scheduler_state')
+              'artifact_observations','artifact_consumers','artifact_transport_leases','scheduler_state')
                AND (engine IS NULL OR engine<>'InnoDB' OR table_collation IS NULL
                     OR table_collation<>'utf8mb4_bin')",
         )
@@ -352,7 +403,7 @@ impl MysqlArtifactScheduler {
             "SELECT count(*) FROM information_schema.columns
              WHERE table_schema=DATABASE() AND table_name IN
              ('artifact_scheduler_schema','artifact_jobs','branch_observations',
-              'artifact_observations','artifact_consumers','scheduler_state')
+              'artifact_observations','artifact_consumers','artifact_transport_leases','scheduler_state')
                AND data_type IN('varchar','text','longtext')
                AND (collation_name IS NULL OR collation_name<>'utf8mb4_bin')",
         )
@@ -374,7 +425,7 @@ impl MysqlArtifactScheduler {
             "SELECT count(*) FROM information_schema.columns
              WHERE table_schema=DATABASE() AND table_name IN
              ('artifact_scheduler_schema','artifact_jobs','branch_observations',
-              'artifact_observations','artifact_consumers','scheduler_state')
+              'artifact_observations','artifact_consumers','artifact_transport_leases','scheduler_state')
                AND NOT(table_name='artifact_jobs' AND column_name='id')
                AND (extra IS NULL OR extra<>'')",
         )
@@ -460,13 +511,25 @@ impl MysqlArtifactScheduler {
                 "expires_at",
                 false,
             ),
+            (
+                "artifact_transport_leases",
+                "PRIMARY",
+                "root_hash,session_id",
+                true,
+            ),
+            (
+                "artifact_transport_leases",
+                "artifact_transport_leases_expiry",
+                "expires_at",
+                false,
+            ),
             ("scheduler_state", "PRIMARY", "id", true),
         ];
         let index_count: i64 = sqlx::query_scalar(
             "SELECT count(DISTINCT table_name,index_name) FROM information_schema.statistics
              WHERE table_schema=DATABASE() AND table_name IN
-             ('artifact_scheduler_schema','artifact_jobs','branch_observations',
-              'artifact_observations','artifact_consumers','scheduler_state')",
+              ('artifact_scheduler_schema','artifact_jobs','branch_observations',
+              'artifact_observations','artifact_consumers','artifact_transport_leases','scheduler_state')",
         )
         .fetch_one(&mut **tx)
         .await?;
@@ -588,6 +651,7 @@ impl MysqlArtifactScheduler {
                 "CHECK",
             ),
             ("artifact_consumers", "PRIMARY", "PRIMARY KEY"),
+            ("artifact_transport_leases", "PRIMARY", "PRIMARY KEY"),
             ("scheduler_state", "PRIMARY", "PRIMARY KEY"),
             ("scheduler_state", "scheduler_state_singleton", "CHECK"),
             ("scheduler_state", "scheduler_state_fairness", "CHECK"),
@@ -596,7 +660,7 @@ impl MysqlArtifactScheduler {
             "SELECT table_name,constraint_name,constraint_type,enforced
              FROM information_schema.table_constraints WHERE constraint_schema=DATABASE()
                AND table_name IN ('artifact_scheduler_schema','artifact_jobs','branch_observations',
-                 'artifact_observations','artifact_consumers','scheduler_state')",
+                 'artifact_observations','artifact_consumers','artifact_transport_leases','scheduler_state')",
         )
         .fetch_all(&mut **tx)
         .await?;
@@ -629,8 +693,8 @@ impl MysqlArtifactScheduler {
               AND r.table_name=k.table_name AND r.constraint_name=k.constraint_name
              WHERE k.referenced_table_schema=DATABASE()
                AND k.referenced_table_name IN
-                 ('artifact_scheduler_schema','artifact_jobs','branch_observations',
-                  'artifact_observations','artifact_consumers','scheduler_state')",
+                  ('artifact_scheduler_schema','artifact_jobs','branch_observations',
+                  'artifact_observations','artifact_consumers','artifact_transport_leases','scheduler_state')",
         )
         .fetch_one(&mut **tx)
         .await?;
@@ -698,6 +762,23 @@ impl MysqlArtifactScheduler {
         .await?;
         if invalid_branches != 0 {
             bail!("mysql artifact scheduler contains invalid branch observations")
+        }
+        let invalid_transport: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM artifact_transport_leases
+             WHERE root_hash NOT REGEXP '^[0-9a-f]{64}$'
+                OR session_id NOT REGEXP '^[0-9a-f]{64}$'
+                OR length(trim(workspace))=0 OR length(trim(repo))=0",
+        )
+        .fetch_one(&mut **tx)
+        .await?;
+        let conflicting_sessions: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM (SELECT session_id FROM artifact_transport_leases
+             GROUP BY session_id HAVING count(DISTINCT concat(workspace,char(0),repo))>1) conflicts",
+        )
+        .fetch_one(&mut **tx)
+        .await?;
+        if invalid_transport != 0 || conflicting_sessions != 0 {
+            bail!("mysql artifact scheduler contains invalid transport leases")
         }
         let invalid_control: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM scheduler_state WHERE id IS NULL OR id<>1
@@ -992,6 +1073,99 @@ impl ArtifactSchedulerPersistence for MysqlArtifactScheduler {
     }
     fn completion_sealer(&self) -> Arc<CompletionSealAuthority> {
         self.completion_sealer.clone()
+    }
+    async fn register_transport_root(
+        &self,
+        root: &str,
+        session: &str,
+        workspace: &str,
+        repo: &str,
+        ttl: i64,
+    ) -> Result<()> {
+        validate_transport_lease_identity(root, session, workspace, repo, ttl)?;
+        let (mut tx, now) = self.controlled().await?;
+        let foreign: i64 = sqlx::query_scalar("SELECT count(*) FROM artifact_transport_leases WHERE session_id=? AND (workspace<>? OR repo<>?)")
+            .bind(session).bind(workspace).bind(repo).fetch_one(&mut *tx).await?;
+        if foreign != 0 {
+            bail!("transport session is already bound to another repository")
+        }
+        let changed = sqlx::query("INSERT INTO artifact_transport_leases(root_hash,session_id,workspace,repo,expires_at) VALUES(?,?,?,?,?) ON DUPLICATE KEY UPDATE expires_at=IF(workspace=VALUES(workspace) AND repo=VALUES(repo),VALUES(expires_at),expires_at)")
+            .bind(root).bind(session).bind(workspace).bind(repo).bind(now + ttl).execute(&mut *tx).await?.rows_affected();
+        // MySQL reports 1 for insert, 2 for a changed update, and 0 for a no-op.
+        // Re-read identity because a no-op may be either an identical expiry or a conflict.
+        let identity: Option<(String, String)> = sqlx::query_as("SELECT workspace,repo FROM artifact_transport_leases WHERE root_hash=? AND session_id=?")
+            .bind(root).bind(session).fetch_optional(&mut *tx).await?;
+        if identity.as_ref().map(|(w, r)| (w.as_str(), r.as_str())) != Some((workspace, repo)) {
+            bail!("transport root identity conflict")
+        }
+        let _ = changed;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn renew_transport_root(
+        &self,
+        root: &str,
+        session: &str,
+        workspace: &str,
+        repo: &str,
+        ttl: i64,
+    ) -> Result<bool> {
+        validate_transport_lease_identity(root, session, workspace, repo, ttl)?;
+        let mut tx = self.pool.begin().await?;
+        let now: i64 = sqlx::query_scalar("SELECT UNIX_TIMESTAMP()")
+            .fetch_one(&mut *tx)
+            .await?;
+        let won = sqlx::query("UPDATE artifact_transport_leases SET expires_at=? WHERE root_hash=? AND session_id=? AND workspace=? AND repo=? AND expires_at>?")
+            .bind(now + ttl).bind(root).bind(session).bind(workspace).bind(repo).bind(now).execute(&mut *tx).await?.rows_affected() == 1;
+        tx.commit().await?;
+        Ok(won)
+    }
+
+    async fn release_transport_root(
+        &self,
+        root: &str,
+        session: &str,
+        workspace: &str,
+        repo: &str,
+    ) -> Result<bool> {
+        validate_transport_lease_identity(root, session, workspace, repo, 1)?;
+        Ok(sqlx::query("DELETE FROM artifact_transport_leases WHERE root_hash=? AND session_id=? AND workspace=? AND repo=?")
+            .bind(root).bind(session).bind(workspace).bind(repo).execute(&self.pool).await?.rows_affected() == 1)
+    }
+
+    async fn live_transport_roots_page(
+        &self,
+        after: Option<(&str, &str)>,
+        limit: u32,
+    ) -> Result<Vec<TransportRootLease>> {
+        if limit == 0 || limit > TRANSPORT_ROOT_PAGE_MAX {
+            bail!("transport root page limit is invalid")
+        }
+        let mut tx = self.pool.begin().await?;
+        let now: i64 = sqlx::query_scalar("SELECT UNIX_TIMESTAMP()")
+            .fetch_one(&mut *tx)
+            .await?;
+        let rows = if let Some((root, session)) = after {
+            validate_transport_lease_identity(root, session, "cursor", "cursor", 1)?;
+            sqlx::query("SELECT root_hash,session_id,workspace,repo,expires_at FROM artifact_transport_leases WHERE expires_at>? AND (root_hash>? OR (root_hash=? AND session_id>?)) ORDER BY root_hash,session_id LIMIT ?")
+                .bind(now).bind(root).bind(root).bind(session).bind(limit as i64).fetch_all(&mut *tx).await?
+        } else {
+            sqlx::query("SELECT root_hash,session_id,workspace,repo,expires_at FROM artifact_transport_leases WHERE expires_at>? ORDER BY root_hash,session_id LIMIT ?")
+                .bind(now).bind(limit as i64).fetch_all(&mut *tx).await?
+        };
+        tx.commit().await?;
+        rows.into_iter()
+            .map(|r| {
+                Ok(TransportRootLease {
+                    root_hash: r.try_get("root_hash")?,
+                    session_id: r.try_get("session_id")?,
+                    workspace: r.try_get("workspace")?,
+                    repo: r.try_get("repo")?,
+                    expires_at: r.try_get("expires_at")?,
+                })
+            })
+            .collect()
     }
     async fn schedule(&self, key: &ArtifactKey) -> Result<ScheduleOutcome> {
         validate_mysql_key(key)?;
@@ -1563,6 +1737,13 @@ impl ArtifactSchedulerPersistence for MysqlArtifactScheduler {
             .execute(&mut *tx)
             .await?;
         sqlx::query(
+            "DELETE FROM artifact_transport_leases WHERE expires_at<=?
+             ORDER BY expires_at,root_hash,session_id LIMIT 512",
+        )
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
             "DELETE FROM artifact_jobs WHERE state='queued'
              AND id NOT IN(SELECT desired_artifact_id FROM artifact_observations)
              AND id NOT IN(SELECT artifact_id FROM artifact_consumers)",
@@ -1896,6 +2077,7 @@ mod tests {
     async fn reset(pool: &MySqlPool) {
         for statement in [
             "DROP TABLE IF EXISTS external_scheduler_child",
+            "DROP TABLE IF EXISTS artifact_transport_leases",
             "DROP TABLE IF EXISTS artifact_consumers",
             "DROP TABLE IF EXISTS artifact_observations",
             "DROP TABLE IF EXISTS branch_observations",
@@ -1945,6 +2127,72 @@ mod tests {
             MysqlArtifactScheduler::from_pool(b_pool, Default::default(), Arc::new(Accept))
         );
         let (a, b) = (a.unwrap(), b.unwrap());
+
+        let root0 = format!("{:064x}", 1);
+        let root1 = format!("{:064x}", 2);
+        let session0 = format!("{:064x}", 10_001);
+        let session1 = format!("{:064x}", 10_002);
+        a.register_transport_root(&root0, &session0, "ws", "owner/repo", 60)
+            .await
+            .unwrap();
+        a.register_transport_root(&root1, &session0, "ws", "owner/repo", 60)
+            .await
+            .unwrap();
+        a.register_transport_root(&root0, &session1, "ws", "owner/repo", 60)
+            .await
+            .unwrap();
+        assert!(
+            b.register_transport_root(&format!("{:064x}", 3), &session0, "ws", "other/repo", 60)
+                .await
+                .is_err()
+        );
+        assert!(
+            !a.renew_transport_root(&root0, &session0, "ws", "other/repo", 60)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !a.release_transport_root(&root0, &session0, "ws", "other/repo")
+                .await
+                .unwrap()
+        );
+        for i in 100..613 {
+            a.register_transport_root(
+                &format!("{i:064x}"),
+                &format!("{:064x}", i + 20_000),
+                "ws",
+                "owner/repo",
+                60,
+            )
+            .await
+            .unwrap();
+        }
+        let page = a.live_transport_roots_page(None, 512).await.unwrap();
+        assert_eq!(page.len(), 512);
+        let cursor = page.last().unwrap();
+        assert!(
+            !a.live_transport_roots_page(Some((&cursor.root_hash, &cursor.session_id)), 512)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(a.live_transport_roots_page(None, 513).await.is_err());
+        let race_root = format!("{:064x}", 900_001);
+        let race_session = format!("{:064x}", 900_002);
+        a.register_transport_root(&race_root, &race_session, "ws", "owner/repo", 60)
+            .await
+            .unwrap();
+        let (renewed, released) = tokio::join!(
+            a.renew_transport_root(&race_root, &race_session, "ws", "owner/repo", 60),
+            b.release_transport_root(&race_root, &race_session, "ws", "owner/repo")
+        );
+        assert!(released.unwrap());
+        let _ = renewed.unwrap();
+        assert!(
+            !a.renew_transport_root(&race_root, &race_session, "ws", "owner/repo", 60)
+                .await
+                .unwrap()
+        );
 
         // Exact identity and atomic dedup across independent pools.
         let duplicate = key("dedup", ArtifactKind::Head);

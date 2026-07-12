@@ -13,14 +13,17 @@ use crate::artifact_scheduler::{
 };
 #[cfg(test)]
 use crate::artifact_scheduler::{CompletionEvidence, validate_evidence};
-use crate::artifact_scheduler_backend::ArtifactSchedulerPersistence;
+use crate::artifact_scheduler_backend::{
+    ArtifactSchedulerPersistence, TRANSPORT_ROOT_PAGE_MAX, TransportRootLease,
+    validate_transport_lease_identity,
+};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use sqlx::postgres::PgPool;
 use sqlx::{Postgres, Row, Transaction};
 use std::sync::Arc;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS artifact_scheduler_schema(
  id SMALLINT CONSTRAINT artifact_scheduler_schema_pkey PRIMARY KEY,
@@ -71,6 +74,12 @@ CREATE TABLE IF NOT EXISTS artifact_consumers(
  artifact_id BIGINT NOT NULL,consumer_id TEXT NOT NULL,expires_at BIGINT NOT NULL,
  CONSTRAINT artifact_consumers_pkey PRIMARY KEY(artifact_id,consumer_id));
 CREATE INDEX IF NOT EXISTS artifact_consumers_expiry ON artifact_consumers(expires_at);
+CREATE TABLE IF NOT EXISTS artifact_transport_leases(
+ root_hash TEXT NOT NULL,session_id TEXT NOT NULL,workspace TEXT NOT NULL,repo TEXT NOT NULL,
+ expires_at BIGINT NOT NULL,
+ CONSTRAINT artifact_transport_leases_pkey PRIMARY KEY(root_hash,session_id));
+CREATE INDEX IF NOT EXISTS artifact_transport_leases_expiry
+ ON artifact_transport_leases(expires_at);
 CREATE TABLE IF NOT EXISTS scheduler_state(
  id SMALLINT CONSTRAINT scheduler_state_pkey PRIMARY KEY,
  fairness_cursor BIGINT NOT NULL,
@@ -122,7 +131,7 @@ impl PostgresArtifactScheduler {
         if version > SCHEMA_VERSION {
             bail!("artifact scheduler database is newer than this binary")
         }
-        if version != SCHEMA_VERSION {
+        if version != 1 && version != SCHEMA_VERSION {
             bail!("unsupported postgres artifact scheduler schema {version}")
         }
         let missing_columns: i64 = sqlx::query_scalar(
@@ -145,7 +154,10 @@ impl PostgresArtifactScheduler {
               ('artifact_observations','published_artifact_id'),
               ('artifact_observations','format_version'),('artifact_observations','observed_at'),
               ('artifact_consumers','artifact_id'),('artifact_consumers','consumer_id'),
-              ('artifact_consumers','expires_at'),('scheduler_state','id'),
+              ('artifact_consumers','expires_at'),
+              ('artifact_transport_leases','root_hash'),('artifact_transport_leases','session_id'),
+              ('artifact_transport_leases','workspace'),('artifact_transport_leases','repo'),
+              ('artifact_transport_leases','expires_at'),('scheduler_state','id'),
               ('scheduler_state','fairness_cursor'),('scheduler_state','workspace_cursor'),
               ('scheduler_state','config_fingerprint'))
              SELECT count(*) FROM expected e LEFT JOIN information_schema.columns c
@@ -161,7 +173,7 @@ impl PostgresArtifactScheduler {
             "SELECT count(*) FROM information_schema.columns c
              WHERE c.table_schema=current_schema() AND c.table_name IN(
                'artifact_scheduler_schema','artifact_jobs','branch_observations',
-               'artifact_observations','artifact_consumers','scheduler_state') AND (
+               'artifact_observations','artifact_consumers','artifact_transport_leases','scheduler_state') AND (
                c.data_type <> CASE
                  WHEN c.table_name IN('artifact_scheduler_schema','scheduler_state')
                       AND c.column_name='id' THEN 'smallint'
@@ -174,6 +186,7 @@ impl PostgresArtifactScheduler {
                      'desired_artifact_id','desired_generation','published_artifact_id',
                      'format_version','observed_at'))
                    OR (c.table_name='artifact_consumers' AND c.column_name IN('artifact_id','expires_at'))
+                   OR (c.table_name='artifact_transport_leases' AND c.column_name='expires_at')
                    OR (c.table_name='scheduler_state' AND c.column_name='fairness_cursor')
                    THEN 'bigint' ELSE 'text' END
                OR c.is_nullable <> CASE
@@ -203,11 +216,11 @@ impl PostgresArtifactScheduler {
             "SELECT count(*) FROM information_schema.columns
              WHERE table_schema=current_schema() AND table_name IN(
                'artifact_scheduler_schema','artifact_jobs','branch_observations',
-               'artifact_observations','artifact_consumers','scheduler_state')",
+               'artifact_observations','artifact_consumers','artifact_transport_leases','scheduler_state')",
         )
         .fetch_one(&mut *migration)
         .await?;
-        if invalid_column_shape != 0 || scheduler_column_count != 43 {
+        if invalid_column_shape != 0 || scheduler_column_count != 48 {
             bail!("postgres artifact scheduler column shape differs from schema version")
         }
         let required_constraints: i64 = sqlx::query_scalar(
@@ -229,6 +242,7 @@ impl PostgresArtifactScheduler {
               ('artifact_observations','artifact_observations_generation','c'),
               ('artifact_observations','artifact_observations_format','c'),
               ('artifact_consumers','artifact_consumers_pkey','p'),
+              ('artifact_transport_leases','artifact_transport_leases_pkey','p'),
               ('scheduler_state','scheduler_state_pkey','p'),
               ('scheduler_state','scheduler_state_singleton','c'),
               ('scheduler_state','scheduler_state_fairness','c'))
@@ -240,7 +254,7 @@ impl PostgresArtifactScheduler {
         )
         .fetch_one(&mut *migration)
         .await?;
-        if required_constraints != 20 {
+        if required_constraints != 21 {
             bail!("postgres artifact scheduler schema is missing required constraints")
         }
         let invalid_constraint_definitions: i64 = sqlx::query_scalar(
@@ -264,6 +278,7 @@ impl PostgresArtifactScheduler {
                OR (c.conname='artifact_observations_generation' AND pg_get_constraintdef(c.oid) NOT ILIKE '%desired_generation%')
                OR (c.conname='artifact_observations_format' AND NOT (pg_get_constraintdef(c.oid) ILIKE '%format_version%' AND pg_get_constraintdef(c.oid) LIKE '%4294967295%'))
                OR (c.conname='artifact_consumers_pkey' AND pg_get_constraintdef(c.oid)<>'PRIMARY KEY (artifact_id, consumer_id)')
+               OR (c.conname='artifact_transport_leases_pkey' AND pg_get_constraintdef(c.oid)<>'PRIMARY KEY (root_hash, session_id)')
                OR (c.conname='scheduler_state_pkey' AND pg_get_constraintdef(c.oid)<>'PRIMARY KEY (id)')
                OR (c.conname='scheduler_state_singleton' AND pg_get_constraintdef(c.oid) NOT ILIKE '%id%1%')
                OR (c.conname='scheduler_state_fairness' AND NOT (pg_get_constraintdef(c.oid) ILIKE '%fairness_cursor%' AND pg_get_constraintdef(c.oid) LIKE '%3%')))",
@@ -292,6 +307,7 @@ impl PostgresArtifactScheduler {
               ('artifact_observations_generation',$d$CHECK ((desired_generation >= 1))$d$),
               ('artifact_observations_format',$d$CHECK (((format_version >= 1) AND (format_version <= '4294967295'::bigint)))$d$),
               ('artifact_consumers_pkey',$d$PRIMARY KEY (artifact_id, consumer_id)$d$),
+              ('artifact_transport_leases_pkey',$d$PRIMARY KEY (root_hash, session_id)$d$),
               ('scheduler_state_pkey',$d$PRIMARY KEY (id)$d$),
               ('scheduler_state_singleton',$d$CHECK ((id = 1))$d$),
               ('scheduler_state_fairness',$d$CHECK (((fairness_cursor >= 0) AND (fairness_cursor <= 3)))$d$))
@@ -301,19 +317,20 @@ impl PostgresArtifactScheduler {
         )
         .fetch_one(&mut *migration)
         .await?;
-        if exact_constraint_definitions != 20 {
+        if exact_constraint_definitions != 21 {
             bail!(
-                "postgres artifact scheduler exact constraint definitions differ from schema version ({exact_constraint_definitions}/20 matched)"
+                "postgres artifact scheduler exact constraint definitions differ from schema version ({exact_constraint_definitions}/21 matched)"
             )
         }
         let required_indexes: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM pg_indexes WHERE schemaname=current_schema() AND indexname IN(
               'artifact_jobs_claim','artifact_jobs_lease','artifact_observations_desired',
-              'artifact_observations_published','artifact_consumers_expiry')",
+              'artifact_observations_published','artifact_consumers_expiry',
+              'artifact_transport_leases_expiry')",
         )
         .fetch_one(&mut *migration)
         .await?;
-        if required_indexes != 5 {
+        if required_indexes != 6 {
             bail!("postgres artifact scheduler schema is missing required indexes")
         }
         let invalid_index_definitions: i64 = sqlx::query_scalar(
@@ -322,7 +339,8 @@ impl PostgresArtifactScheduler {
                OR (indexname='artifact_jobs_lease' AND indexdef NOT LIKE '%(state, lease_expires_at)%')
                OR (indexname='artifact_observations_desired' AND indexdef NOT LIKE '%(desired_artifact_id)%')
                OR (indexname='artifact_observations_published' AND indexdef NOT LIKE '%(published_artifact_id)%')
-               OR (indexname='artifact_consumers_expiry' AND indexdef NOT LIKE '%(expires_at)%'))",
+               OR (indexname='artifact_consumers_expiry' AND indexdef NOT LIKE '%(expires_at)%')
+               OR (indexname='artifact_transport_leases_expiry' AND indexdef NOT LIKE '%(expires_at)%'))",
         )
         .fetch_one(&mut *migration)
         .await?;
@@ -335,7 +353,8 @@ impl PostgresArtifactScheduler {
               ('artifact_jobs_lease',ARRAY['state','lease_expires_at']::text[]),
               ('artifact_observations_desired',ARRAY['desired_artifact_id']::text[]),
               ('artifact_observations_published',ARRAY['published_artifact_id']::text[]),
-              ('artifact_consumers_expiry',ARRAY['expires_at']::text[]))
+              ('artifact_consumers_expiry',ARRAY['expires_at']::text[]),
+              ('artifact_transport_leases_expiry',ARRAY['expires_at']::text[]))
              SELECT count(*) FROM expected e JOIN pg_class i ON i.relname=e.index_name
              JOIN pg_namespace n ON n.oid=i.relnamespace AND n.nspname=current_schema()
              JOIN pg_index x ON x.indexrelid=i.oid
@@ -346,8 +365,28 @@ impl PostgresArtifactScheduler {
         )
         .fetch_one(&mut *migration)
         .await?;
-        if exact_index_definitions != 5 {
+        if exact_index_definitions != 6 {
             bail!("postgres artifact scheduler exact index definitions differ from schema version")
+        }
+        let transport_index_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_index x JOIN pg_class r ON r.oid=x.indrelid
+             JOIN pg_namespace n ON n.oid=r.relnamespace
+             WHERE n.nspname=current_schema() AND r.relname='artifact_transport_leases'",
+        )
+        .fetch_one(&mut *migration)
+        .await?;
+        let transport_foreign_keys: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_constraint c
+             JOIN pg_class owned ON owned.oid=c.conrelid
+             JOIN pg_namespace n ON n.oid=owned.relnamespace
+             WHERE n.nspname=current_schema() AND c.contype='f'
+               AND (owned.relname='artifact_transport_leases'
+                    OR c.confrelid='artifact_transport_leases'::regclass)",
+        )
+        .fetch_one(&mut *migration)
+        .await?;
+        if transport_index_count != 2 || transport_foreign_keys != 0 {
+            bail!("postgres artifact transport schema has unexpected indexes or foreign keys")
         }
         let invalid_jobs: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM artifact_jobs WHERE
@@ -394,6 +433,22 @@ impl PostgresArtifactScheduler {
         if invalid_branches != 0 {
             bail!("postgres artifact scheduler contains invalid branch observations")
         }
+        let invalid_transport: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM artifact_transport_leases
+             WHERE root_hash !~ '^[0-9a-f]{64}$' OR session_id !~ '^[0-9a-f]{64}$'
+                OR length(trim(workspace))=0 OR length(trim(repo))=0",
+        )
+        .fetch_one(&mut *migration)
+        .await?;
+        let conflicting_sessions: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM (SELECT session_id FROM artifact_transport_leases
+             GROUP BY session_id HAVING count(DISTINCT (workspace,repo))>1) conflicts",
+        )
+        .fetch_one(&mut *migration)
+        .await?;
+        if invalid_transport != 0 || conflicting_sessions != 0 {
+            bail!("postgres artifact scheduler contains invalid transport leases")
+        }
         let invalid_control: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM scheduler_state
              WHERE id<>1 OR fairness_cursor NOT BETWEEN 0 AND 3",
@@ -402,6 +457,12 @@ impl PostgresArtifactScheduler {
         .await?;
         if invalid_control != 0 {
             bail!("postgres artifact scheduler contains invalid control state")
+        }
+        if version == 1 {
+            sqlx::query("UPDATE artifact_scheduler_schema SET version=$1 WHERE id=1 AND version=1")
+                .bind(SCHEMA_VERSION)
+                .execute(&mut *migration)
+                .await?;
         }
         let fingerprint = scheduler_fingerprint(&limits, verifier_id);
         let stored: String = sqlx::query_scalar(
@@ -415,7 +476,8 @@ impl PostgresArtifactScheduler {
                    (SELECT count(*) FROM artifact_jobs)
                  + (SELECT count(*) FROM branch_observations)
                  + (SELECT count(*) FROM artifact_observations)
-                 + (SELECT count(*) FROM artifact_consumers)",
+                 + (SELECT count(*) FROM artifact_consumers)
+                 + (SELECT count(*) FROM artifact_transport_leases)",
             )
             .fetch_one(&mut *migration)
             .await?;
@@ -684,6 +746,94 @@ impl ArtifactSchedulerPersistence for PostgresArtifactScheduler {
     }
     fn completion_sealer(&self) -> Arc<CompletionSealAuthority> {
         self.completion_sealer.clone()
+    }
+    async fn register_transport_root(
+        &self,
+        root: &str,
+        session: &str,
+        workspace: &str,
+        repo: &str,
+        ttl: i64,
+    ) -> Result<()> {
+        validate_transport_lease_identity(root, session, workspace, repo, ttl)?;
+        let (mut tx, now) = self.controlled().await?;
+        let foreign: i64 = sqlx::query_scalar("SELECT count(*) FROM artifact_transport_leases WHERE session_id=$1 AND (workspace<>$2 OR repo<>$3)")
+            .bind(session).bind(workspace).bind(repo).fetch_one(&mut *tx).await?;
+        if foreign != 0 {
+            bail!("transport session is already bound to another repository")
+        }
+        let changed = sqlx::query("INSERT INTO artifact_transport_leases(root_hash,session_id,workspace,repo,expires_at) VALUES($1,$2,$3,$4,$5) ON CONFLICT(root_hash,session_id) DO UPDATE SET expires_at=EXCLUDED.expires_at WHERE artifact_transport_leases.workspace=EXCLUDED.workspace AND artifact_transport_leases.repo=EXCLUDED.repo")
+            .bind(root).bind(session).bind(workspace).bind(repo).bind(now + ttl).execute(&mut *tx).await?.rows_affected();
+        if changed != 1 {
+            bail!("transport root identity conflict")
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn renew_transport_root(
+        &self,
+        root: &str,
+        session: &str,
+        workspace: &str,
+        repo: &str,
+        ttl: i64,
+    ) -> Result<bool> {
+        validate_transport_lease_identity(root, session, workspace, repo, ttl)?;
+        let mut tx = self.pool.begin().await?;
+        let now: i64 = sqlx::query_scalar("SELECT EXTRACT(EPOCH FROM clock_timestamp())::BIGINT")
+            .fetch_one(&mut *tx)
+            .await?;
+        let won = sqlx::query("UPDATE artifact_transport_leases SET expires_at=$1 WHERE root_hash=$2 AND session_id=$3 AND workspace=$4 AND repo=$5 AND expires_at>$6")
+            .bind(now + ttl).bind(root).bind(session).bind(workspace).bind(repo).bind(now).execute(&mut *tx).await?.rows_affected() == 1;
+        tx.commit().await?;
+        Ok(won)
+    }
+
+    async fn release_transport_root(
+        &self,
+        root: &str,
+        session: &str,
+        workspace: &str,
+        repo: &str,
+    ) -> Result<bool> {
+        validate_transport_lease_identity(root, session, workspace, repo, 1)?;
+        Ok(sqlx::query("DELETE FROM artifact_transport_leases WHERE root_hash=$1 AND session_id=$2 AND workspace=$3 AND repo=$4")
+            .bind(root).bind(session).bind(workspace).bind(repo).execute(&self.pool).await?.rows_affected() == 1)
+    }
+
+    async fn live_transport_roots_page(
+        &self,
+        after: Option<(&str, &str)>,
+        limit: u32,
+    ) -> Result<Vec<TransportRootLease>> {
+        if limit == 0 || limit > TRANSPORT_ROOT_PAGE_MAX {
+            bail!("transport root page limit is invalid")
+        }
+        let mut tx = self.pool.begin().await?;
+        let now: i64 = sqlx::query_scalar("SELECT EXTRACT(EPOCH FROM clock_timestamp())::BIGINT")
+            .fetch_one(&mut *tx)
+            .await?;
+        let rows = if let Some((root, session)) = after {
+            validate_transport_lease_identity(root, session, "cursor", "cursor", 1)?;
+            sqlx::query("SELECT root_hash,session_id,workspace,repo,expires_at FROM artifact_transport_leases WHERE expires_at>$1 AND (root_hash>$2 OR (root_hash=$2 AND session_id>$3)) ORDER BY root_hash,session_id LIMIT $4")
+                .bind(now).bind(root).bind(session).bind(limit as i64).fetch_all(&mut *tx).await?
+        } else {
+            sqlx::query("SELECT root_hash,session_id,workspace,repo,expires_at FROM artifact_transport_leases WHERE expires_at>$1 ORDER BY root_hash,session_id LIMIT $2")
+                .bind(now).bind(limit as i64).fetch_all(&mut *tx).await?
+        };
+        tx.commit().await?;
+        rows.into_iter()
+            .map(|r| {
+                Ok(TransportRootLease {
+                    root_hash: r.try_get("root_hash")?,
+                    session_id: r.try_get("session_id")?,
+                    workspace: r.try_get("workspace")?,
+                    repo: r.try_get("repo")?,
+                    expires_at: r.try_get("expires_at")?,
+                })
+            })
+            .collect()
     }
     async fn schedule(&self, key: &ArtifactKey) -> Result<ScheduleOutcome> {
         validate_format_version(key.format_version)?;
@@ -1223,6 +1373,14 @@ impl ArtifactSchedulerPersistence for PostgresArtifactScheduler {
             .execute(&mut *tx)
             .await?;
         sqlx::query(
+            "DELETE FROM artifact_transport_leases WHERE ctid IN
+             (SELECT ctid FROM artifact_transport_leases WHERE expires_at<=$1
+              ORDER BY expires_at,root_hash,session_id LIMIT 512)",
+        )
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
             "DELETE FROM artifact_jobs WHERE state='queued'
              AND id NOT IN(SELECT desired_artifact_id FROM artifact_observations)
              AND id NOT IN(SELECT artifact_id FROM artifact_consumers)",
@@ -1502,6 +1660,7 @@ mod tests {
     use super::*;
     use crate::artifact_scheduler_backend::ArtifactSchedulerPersistence;
     use sqlx::postgres::PgPoolOptions;
+    use std::time::Duration;
 
     struct Accept;
     impl CompletionVerifier for Accept {
@@ -1525,7 +1684,8 @@ mod tests {
 
     async fn reset(pool: &PgPool) {
         sqlx::raw_sql(
-            "DROP TABLE IF EXISTS artifact_consumers;
+            "DROP TABLE IF EXISTS artifact_transport_leases;
+             DROP TABLE IF EXISTS artifact_consumers;
              DROP TABLE IF EXISTS artifact_observations;
              DROP TABLE IF EXISTS branch_observations;
              DROP TABLE IF EXISTS artifact_jobs;
@@ -1571,6 +1731,104 @@ mod tests {
         );
         let a = a.unwrap();
         let b = b.unwrap();
+
+        let root0 = format!("{:064x}", 1);
+        let root1 = format!("{:064x}", 2);
+        let session0 = format!("{:064x}", 10_001);
+        let session1 = format!("{:064x}", 10_002);
+        a.register_transport_root(&root0, &session0, "ws", "owner/repo", 60)
+            .await
+            .unwrap();
+        a.register_transport_root(&root1, &session0, "ws", "owner/repo", 60)
+            .await
+            .unwrap();
+        a.register_transport_root(&root0, &session1, "ws", "owner/repo", 60)
+            .await
+            .unwrap();
+        assert!(
+            b.register_transport_root(&format!("{:064x}", 3), &session0, "ws", "other/repo", 60)
+                .await
+                .is_err()
+        );
+        assert!(
+            !a.renew_transport_root(&root0, &session0, "ws", "other/repo", 60)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !a.release_transport_root(&root0, &session0, "ws", "other/repo")
+                .await
+                .unwrap()
+        );
+        for i in 100..613 {
+            a.register_transport_root(
+                &format!("{i:064x}"),
+                &format!("{:064x}", i + 20_000),
+                "ws",
+                "owner/repo",
+                60,
+            )
+            .await
+            .unwrap();
+        }
+        let page = a.live_transport_roots_page(None, 512).await.unwrap();
+        assert_eq!(page.len(), 512);
+        let cursor = page.last().unwrap();
+        assert!(
+            !a.live_transport_roots_page(Some((&cursor.root_hash, &cursor.session_id)), 512)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(a.live_transport_roots_page(None, 513).await.is_err());
+        sqlx::query(
+            "UPDATE artifact_transport_leases SET expires_at=0 WHERE root_hash BETWEEN $1 AND $2",
+        )
+        .bind(format!("{:064x}", 100))
+        .bind(format!("{:064x}", 612))
+        .execute(a.pool())
+        .await
+        .unwrap();
+        a.reconcile_expired().await.unwrap();
+        let bounded_left: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM artifact_transport_leases WHERE root_hash BETWEEN $1 AND $2",
+        )
+        .bind(format!("{:064x}", 100))
+        .bind(format!("{:064x}", 612))
+        .fetch_one(a.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            bounded_left, 1,
+            "reconcile must prune at most 512 transport roots"
+        );
+        let race_root = format!("{:064x}", 900_001);
+        let race_session = format!("{:064x}", 900_002);
+        a.register_transport_root(&race_root, &race_session, "ws", "owner/repo", 60)
+            .await
+            .unwrap();
+        let (renewed, released) = tokio::join!(
+            a.renew_transport_root(&race_root, &race_session, "ws", "owner/repo", 60),
+            b.release_transport_root(&race_root, &race_session, "ws", "owner/repo")
+        );
+        assert!(released.unwrap());
+        let _ = renewed.unwrap();
+        assert!(
+            !a.renew_transport_root(&race_root, &race_session, "ws", "owner/repo", 60)
+                .await
+                .unwrap()
+        );
+        let expired_root = format!("{:064x}", 900_003);
+        let expired_session = format!("{:064x}", 900_004);
+        a.register_transport_root(&expired_root, &expired_session, "ws", "owner/repo", 1)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert!(
+            !a.renew_transport_root(&expired_root, &expired_session, "ws", "owner/repo", 60)
+                .await
+                .unwrap()
+        );
 
         let mut zero = key("zero", ArtifactKind::Head);
         zero.format_version = 0;
