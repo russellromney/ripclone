@@ -286,11 +286,12 @@ impl CredentialBroker for GitHubAppBroker {
         if let Some(token) = request_token {
             return Ok(Some(token.clone()));
         }
-        // This broker only authenticates against the github default instance;
-        // other providers fall through to anonymous mirroring.
-        if !repo_id.is_github_default() {
-            return Ok(None);
-        }
+        // ProviderAwareBroker registers this broker under the workspace that
+        // owns the GitHub App connection.  Workspace ids are user-defined, so
+        // they must not be interpreted as provider kinds here (for example a
+        // GitHub workspace named `acme` is every bit as GitHub-backed as the
+        // legacy workspace named `github`).
+        let _ = repo_id;
         self.installation_token().map(Some)
     }
 }
@@ -511,14 +512,24 @@ RwIDAQAB
     }
 
     #[test]
-    fn github_app_broker_ignores_non_github_providers() {
+    fn github_app_broker_does_not_assume_the_workspace_is_named_github() {
         let broker = test_broker();
+        broker.cache.lock().unwrap().insert(
+            broker.installation_id,
+            CachedToken {
+                token: SecretString::from("ghs_workspace"),
+                expires_at: SystemTime::now() + Duration::from_secs(3600),
+            },
+        );
         let repo = RepoId {
-            workspace: ProviderInstanceId::new("gitlab"),
-            path: "group/proj".to_string(),
+            workspace: ProviderInstanceId::new("acme"),
+            path: "group/project".to_string(),
         };
-        // No request token + non-github provider → anonymous (no network call).
-        assert!(broker.fetch_credential(&repo, None).unwrap().is_none());
+        let token = broker
+            .fetch_credential(&repo, None)
+            .unwrap()
+            .expect("selected GitHub workspace receives its app credential");
+        assert_eq!(token.expose_secret(), "ghs_workspace");
     }
 
     #[test]

@@ -24,7 +24,8 @@ pub struct AddedRepo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo_size_bytes: Option<u64>,
     /// Admission lifecycle. Legacy rows predate admission gating and deserialize
-    /// as active so upgrades do not make already-serving repositories vanish.
+    /// as initializing: startup reconciliation must verify their exact HEAD and
+    /// full base before they become clone-visible under the new invariant.
     #[serde(default)]
     pub state: RepoLifecycleState,
     /// Branch whose first durable HEAD + full-history artifacts admit the repo.
@@ -49,8 +50,8 @@ impl AddedRepo {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum RepoLifecycleState {
-    Initializing,
     #[default]
+    Initializing,
     Active,
     Failed,
 }
@@ -1863,8 +1864,9 @@ mod tests {
     }
 
     #[test]
-    fn added_repo_legacy_json_defaults_repo_size_bytes() {
-        // Rows written before the size-class preflight field must still parse.
+    fn added_repo_legacy_json_requires_admission_reconciliation() {
+        // Rows written before size classes and admission gating must still
+        // parse, but may not silently bypass the usable-full-base invariant.
         let legacy = r#"{
             "repo_id": {"provider": "github", "path": "o/r"},
             "added_at": 1,
@@ -1874,7 +1876,7 @@ mod tests {
         let added: AddedRepo = serde_json::from_str(legacy).unwrap();
         assert_eq!(added.repo_size_bytes, None);
         assert_eq!(added.repo_id.path, "o/r");
-        assert_eq!(added.state, RepoLifecycleState::Active);
+        assert_eq!(added.state, RepoLifecycleState::Initializing);
     }
 
     fn initializing_repo(repo_id: RepoId) -> AddedRepo {
