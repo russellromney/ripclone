@@ -10,6 +10,7 @@ pub struct PackBuilder<'a> {
     repo: PathBuf,
     cas: &'a Cas,
     scratch: Option<PathBuf>,
+    cancelled: Option<tokio_util::sync::CancellationToken>,
 }
 
 /// Result of an LSM incremental build. Each pack is `(pack_hash, pack_len,
@@ -52,6 +53,7 @@ impl<'a> PackBuilder<'a> {
             repo: repo.as_ref().to_path_buf(),
             cas,
             scratch: None,
+            cancelled: None,
         }
     }
 
@@ -65,7 +67,33 @@ impl<'a> PackBuilder<'a> {
             repo: repo.as_ref().to_path_buf(),
             cas,
             scratch: Some(scratch.as_ref().to_path_buf()),
+            cancelled: None,
         }
+    }
+
+    pub fn new_cancellable_in_scratch<P: AsRef<Path>, Q: AsRef<Path>>(
+        repo: P,
+        cas: &'a Cas,
+        scratch: Q,
+        cancelled: tokio_util::sync::CancellationToken,
+    ) -> Self {
+        Self {
+            repo: repo.as_ref().to_path_buf(),
+            cas,
+            scratch: Some(scratch.as_ref().to_path_buf()),
+            cancelled: Some(cancelled),
+        }
+    }
+
+    fn check_cancelled(&self) -> Result<()> {
+        if self
+            .cancelled
+            .as_ref()
+            .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+        {
+            bail!("pack build cancelled");
+        }
+        Ok(())
     }
 
     fn tempdir(&self) -> Result<tempfile::TempDir> {
@@ -186,12 +214,12 @@ impl<'a> PackBuilder<'a> {
         std::fs::create_dir_all(&pack_dir)?;
 
         for (index, pack_hash) in pack_hashes.iter().enumerate() {
-            let pack_data = self
-                .cas
-                .get(pack_hash)
-                .context("fetch HEAD pack for index build")?;
             let pack_path = pack_dir.join(format!("head-{index}.pack"));
-            std::fs::write(&pack_path, &pack_data)?;
+            let mut pack_file = std::fs::File::create(&pack_path)?;
+            self.cas
+                .copy_to_writer_verified(pack_hash, &mut pack_file)
+                .context("stream HEAD pack for index build")?;
+            pack_file.sync_all()?;
             git::index_pack(&git_dir, &pack_path)?;
         }
 
@@ -652,6 +680,7 @@ impl<'a> PackBuilder<'a> {
         if oids.is_empty() {
             return Ok((Vec::new(), 0));
         }
+        self.check_cancelled()?;
         let sizes = git::object_sizes(&self.repo, oids)?;
         let total_raw: u64 = oids
             .iter()
@@ -716,6 +745,7 @@ impl<'a> PackBuilder<'a> {
         if object_shas.is_empty() {
             bail!("no objects to pack");
         }
+        self.check_cancelled()?;
 
         let tmp = self.tempdir()?;
         let prefix = tmp.path().join("pack");
@@ -726,10 +756,27 @@ impl<'a> PackBuilder<'a> {
         if use_gix && undeltified {
             git::pack_objects_to_prefix_gix(&self.repo, object_shas, &prefix)?;
         } else if undeltified {
-            git::pack_objects_undeltified_to_prefix(&self.repo, object_shas, &prefix)?;
+            match &self.cancelled {
+                Some(cancelled) => git::pack_objects_undeltified_to_prefix_cancelled(
+                    &self.repo,
+                    object_shas,
+                    &prefix,
+                    cancelled,
+                )?,
+                None => git::pack_objects_undeltified_to_prefix(&self.repo, object_shas, &prefix)?,
+            }
         } else {
-            git::pack_objects_to_prefix(&self.repo, object_shas, &prefix)?;
+            match &self.cancelled {
+                Some(cancelled) => git::pack_objects_to_prefix_cancelled(
+                    &self.repo,
+                    object_shas,
+                    &prefix,
+                    cancelled,
+                )?,
+                None => git::pack_objects_to_prefix(&self.repo, object_shas, &prefix)?,
+            }
         }
+        self.check_cancelled()?;
 
         let mut pack_path: Option<PathBuf> = None;
         let mut idx_path: Option<PathBuf> = None;

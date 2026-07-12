@@ -525,6 +525,63 @@ impl ArchiveBuilder {
         prev: &std::collections::HashMap<String, (String, u64)>,
         bundle_size: u64,
     ) -> Result<ArchiveBuildOutput> {
+        self.build_into_cas_incremental_inner(
+            commit,
+            cas,
+            storage,
+            level,
+            dictionary,
+            prev,
+            bundle_size,
+            cas.root(),
+            None,
+        )
+    }
+
+    /// Scheduler-owned variant: all archive assembly scratch is attempt-local
+    /// and long traversal/assembly loops cooperatively observe lease loss.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_into_cas_incremental_in_scratch(
+        &self,
+        commit: &str,
+        cas: &Cas,
+        storage: Option<&crate::storage::StorageRef>,
+        level: i32,
+        dictionary: Option<&[u8]>,
+        prev: &std::collections::HashMap<String, (String, u64)>,
+        bundle_size: u64,
+        scratch: &Path,
+        cancelled: &tokio_util::sync::CancellationToken,
+    ) -> Result<ArchiveBuildOutput> {
+        self.build_into_cas_incremental_inner(
+            commit,
+            cas,
+            storage,
+            level,
+            dictionary,
+            prev,
+            bundle_size,
+            scratch,
+            Some(cancelled),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_into_cas_incremental_inner(
+        &self,
+        commit: &str,
+        cas: &Cas,
+        storage: Option<&crate::storage::StorageRef>,
+        level: i32,
+        dictionary: Option<&[u8]>,
+        prev: &std::collections::HashMap<String, (String, u64)>,
+        bundle_size: u64,
+        scratch: &Path,
+        cancelled: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Result<ArchiveBuildOutput> {
+        if cancelled.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+            anyhow::bail!("archive build cancelled");
+        }
         if !self.mirror.exists() {
             anyhow::bail!("mirror not found: {}", self.mirror.display());
         }
@@ -552,6 +609,9 @@ impl ArchiveBuilder {
         // the phase-2 OOM. Peak now stays ~one batch of compressed frames.
         let (mut manifest, bounds, _raw_total, processed) =
             self.stream_cdc(&repo, tree_id, |batch| {
+                if cancelled.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+                    anyhow::bail!("archive build cancelled");
+                }
                 use rayon::prelude::*;
                 batch
                     .par_iter()
@@ -584,6 +644,9 @@ impl ArchiveBuilder {
         let mut new_chunks = Vec::new();
         let mut frames = Vec::with_capacity(bounds.len());
         for i in 0..bounds.len() {
+            if cancelled.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+                anyhow::bail!("archive build cancelled");
+            }
             let raw_len = (bounds[i].1 - bounds[i].0) as u64;
             let FrameChunk {
                 raw_hash,
@@ -612,8 +675,15 @@ impl ArchiveBuilder {
         // Bundle per-frame chunks into larger download objects so the client makes
         // fewer HTTP requests, while keeping per-frame chunks in storage for
         // incremental reuse on the next sync.
-        let (bundle_hashes, bundled_frames) =
-            Self::bundle_archive_frames(cas, storage, bundle_size, &frames, &manifest.frames)?;
+        let (bundle_hashes, bundled_frames) = Self::bundle_archive_frames_inner(
+            cas,
+            storage,
+            bundle_size,
+            &frames,
+            &manifest.frames,
+            scratch,
+            cancelled,
+        )?;
         manifest.frames = bundled_frames;
         Ok(ArchiveBuildOutput {
             download_bundle_hashes: bundle_hashes,
@@ -634,6 +704,27 @@ impl ArchiveBuilder {
         frames: &[crate::ArchiveFrame],
         frame_infos: &[FrameInfo],
     ) -> Result<(Vec<String>, Vec<FrameInfo>)> {
+        Self::bundle_archive_frames_inner(
+            cas,
+            storage,
+            target_size,
+            frames,
+            frame_infos,
+            cas.root(),
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn bundle_archive_frames_inner(
+        cas: &Cas,
+        storage: Option<&crate::storage::StorageRef>,
+        target_size: u64,
+        frames: &[crate::ArchiveFrame],
+        frame_infos: &[FrameInfo],
+        scratch: &Path,
+        cancelled: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Result<(Vec<String>, Vec<FrameInfo>)> {
         if frames.len() != frame_infos.len() {
             anyhow::bail!(
                 "archive frame count mismatch: frames={} frame_infos={}",
@@ -645,14 +736,18 @@ impl ArchiveBuilder {
         let assembly_start = std::time::Instant::now();
         let mut assembled_bytes = 0u64;
         let mut bundle_hashes = Vec::new();
+        std::fs::create_dir_all(scratch).context("create archive attempt scratch")?;
         let mut current = tempfile::Builder::new()
             .prefix(".archive-bundle.")
-            .tempfile_in(cas.root())
-            .with_context(|| format!("create archive bundle temp in {}", cas.root().display()))?;
+            .tempfile_in(scratch)
+            .with_context(|| format!("create archive bundle temp in {}", scratch.display()))?;
         let mut current_len = 0u64;
         let mut current_hasher = sha2::Sha256::new();
         let mut bundled: Vec<FrameInfo> = Vec::with_capacity(frame_infos.len());
         for (i, info) in frame_infos.iter().enumerate() {
+            if cancelled.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+                anyhow::bail!("archive bundle assembly cancelled");
+            }
             let frame = frames
                 .get(i)
                 .ok_or_else(|| anyhow::anyhow!("missing archive frame {}", i))?;
@@ -669,9 +764,9 @@ impl ArchiveBuilder {
                 bundle_hashes.push(Self::finish_bundle(cas, current, current_hasher)?);
                 current = tempfile::Builder::new()
                     .prefix(".archive-bundle.")
-                    .tempfile_in(cas.root())
+                    .tempfile_in(scratch)
                     .with_context(|| {
-                        format!("create archive bundle temp in {}", cas.root().display())
+                        format!("create archive bundle temp in {}", scratch.display())
                     })?;
                 current_len = 0;
                 current_hasher = sha2::Sha256::new();
@@ -699,9 +794,9 @@ impl ArchiveBuilder {
                 bundle_hashes.push(Self::finish_bundle(cas, current, current_hasher)?);
                 current = tempfile::Builder::new()
                     .prefix(".archive-bundle.")
-                    .tempfile_in(cas.root())
+                    .tempfile_in(scratch)
                     .with_context(|| {
-                        format!("create archive bundle temp in {}", cas.root().display())
+                        format!("create archive bundle temp in {}", scratch.display())
                     })?;
                 current_len = 0;
                 current_hasher = sha2::Sha256::new();
@@ -800,9 +895,12 @@ impl ArchiveBuilder {
             .sync_all()
             .context("fsync archive bundle temp")?;
         let hash = hex::encode(hasher.finalize());
-        let path = bundle.into_temp_path();
-        cas.install_hashed_file(&hash, &path)
-            .with_context(|| format!("install archive bundle {}", hash))?;
+        let (stored, _) = cas
+            .put_file(bundle.path())
+            .with_context(|| format!("import archive bundle {}", hash))?;
+        if stored != hash {
+            anyhow::bail!("archive bundle hash changed during CAS import");
+        }
         Ok(hash)
     }
 

@@ -530,6 +530,93 @@ pub fn list_object_shas<P: AsRef<Path>>(repo: P, commit: &str) -> Result<Vec<Str
     crate::gix_util::list_object_shas_with_depth(repo, commit, None)
 }
 
+/// Stream an exact reachable object set with hard pre-allocation count/size
+/// limits and cooperative cancellation. Unlike the legacy gix enumeration,
+/// this never collects an unbounded rev-walk before applying policy.
+#[allow(clippy::too_many_arguments)]
+pub fn list_object_shas_bounded<P: AsRef<Path>>(
+    repo: P,
+    tips: &[String],
+    max_depth: Option<usize>,
+    max_objects: usize,
+    max_object_bytes: u64,
+    max_total_bytes: u64,
+    cancelled: &tokio_util::sync::CancellationToken,
+) -> Result<Vec<String>> {
+    if tips.is_empty() || max_objects == 0 || max_object_bytes == 0 || max_total_bytes == 0 {
+        bail!("bounded object enumeration requires nonempty tips and limits");
+    }
+    for tip in tips {
+        crate::validation::validate_object_id(tip)
+            .with_context(|| format!("invalid pinned object tip: {tip}"))?;
+    }
+    let mut command = Command::new("git");
+    command
+        .arg("-C")
+        .arg(repo.as_ref())
+        .args(["rev-list", "--objects", "--no-object-names"]);
+    if let Some(depth) = max_depth {
+        command.arg(format!("--max-count={}", depth.max(1)));
+    }
+    command
+        .args(tips)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().context("spawn bounded git rev-list")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("capture bounded rev-list stdout")?;
+    let source = crate::gix_util::open_repo(repo.as_ref())?;
+    let mut seen = HashSet::new();
+    let mut total = 0u64;
+    for line in std::io::BufRead::lines(std::io::BufReader::new(stdout)) {
+        if cancelled.is_cancelled() {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("bounded object enumeration cancelled");
+        }
+        let oid = line.context("read bounded rev-list output")?;
+        crate::validation::validate_object_id(&oid)
+            .context("rev-list emitted invalid object id")?;
+        if !seen.insert(oid.clone()) {
+            continue;
+        }
+        if seen.len() > max_objects {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("Git object count exceeds builder limit");
+        }
+        let id = gix::hash::ObjectId::from_hex(oid.as_bytes())?;
+        let size = source.find_header(id)?.size();
+        if size > max_object_bytes {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("Git object exceeds per-object builder limit");
+        }
+        total = total
+            .checked_add(size)
+            .context("Git object size overflow")?;
+        if total > max_total_bytes {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("Git object aggregate exceeds builder limit");
+        }
+    }
+    let output = child
+        .wait_with_output()
+        .context("wait bounded git rev-list")?;
+    if !output.status.success() {
+        bail!(
+            "bounded git rev-list failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let mut objects = seen.into_iter().collect::<Vec<_>>();
+    objects.sort();
+    Ok(objects)
+}
+
 /// List objects reachable from `to` but not from `from` — i.e. the objects
 /// introduced in the commit range `(from, to]`. `from = None` means "everything
 /// reachable from `to`". Used by the LSM build to pack a single history range.
@@ -814,7 +901,16 @@ pub fn pack_objects_to_prefix<P: AsRef<Path>, Q: AsRef<Path>>(
     object_shas: &[String],
     prefix: Q,
 ) -> Result<()> {
-    pack_objects_to_prefix_inner(repo, object_shas, prefix, &[])
+    pack_objects_to_prefix_inner(repo, object_shas, prefix, &[], None)
+}
+
+pub fn pack_objects_to_prefix_cancelled<P: AsRef<Path>, Q: AsRef<Path>>(
+    repo: P,
+    object_shas: &[String],
+    prefix: Q,
+    cancelled: &tokio_util::sync::CancellationToken,
+) -> Result<()> {
+    pack_objects_to_prefix_inner(repo, object_shas, prefix, &[], Some(cancelled))
 }
 
 /// Like `pack_objects_to_prefix` but stores every object whole — no new delta
@@ -831,6 +927,22 @@ pub fn pack_objects_undeltified_to_prefix<P: AsRef<Path>, Q: AsRef<Path>>(
         object_shas,
         prefix,
         &["--window=0", "--no-reuse-delta"],
+        None,
+    )
+}
+
+pub fn pack_objects_undeltified_to_prefix_cancelled<P: AsRef<Path>, Q: AsRef<Path>>(
+    repo: P,
+    object_shas: &[String],
+    prefix: Q,
+    cancelled: &tokio_util::sync::CancellationToken,
+) -> Result<()> {
+    pack_objects_to_prefix_inner(
+        repo,
+        object_shas,
+        prefix,
+        &["--window=0", "--no-reuse-delta"],
+        Some(cancelled),
     )
 }
 
@@ -908,6 +1020,7 @@ fn pack_objects_to_prefix_inner<P: AsRef<Path>, Q: AsRef<Path>>(
     object_shas: &[String],
     prefix: Q,
     extra_args: &[&str],
+    cancelled: Option<&tokio_util::sync::CancellationToken>,
 ) -> Result<()> {
     if object_shas.is_empty() {
         bail!("no objects to pack");
@@ -927,9 +1040,14 @@ fn pack_objects_to_prefix_inner<P: AsRef<Path>, Q: AsRef<Path>>(
         .spawn()
         .context("spawn git pack-objects")?;
 
+    let mut cancelled_during_input = false;
     {
         let mut stdin = child.stdin.take().context("open git pack-objects stdin")?;
         for sha in object_shas {
+            if cancelled.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+                cancelled_during_input = true;
+                break;
+            }
             stdin
                 .write_all(sha.as_bytes())
                 .context("write object id to pack-objects stdin")?;
@@ -938,8 +1056,23 @@ fn pack_objects_to_prefix_inner<P: AsRef<Path>, Q: AsRef<Path>>(
                 .context("write newline to pack-objects stdin")?;
         }
     }
+    if cancelled_during_input {
+        let _ = child.kill();
+        let _ = child.wait();
+        bail!("git pack-objects cancelled");
+    }
 
-    let status = child.wait().context("wait for git pack-objects")?;
+    let status = loop {
+        if cancelled.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+            child.kill().context("kill cancelled git pack-objects")?;
+            let _ = child.wait();
+            bail!("git pack-objects cancelled");
+        }
+        if let Some(status) = child.try_wait().context("poll git pack-objects")? {
+            break status;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    };
 
     if !status.success() {
         bail!("pack-objects failed");

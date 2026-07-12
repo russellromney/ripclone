@@ -19,6 +19,26 @@ use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::{cell::RefCell, time::Duration};
+
+thread_local! {
+    static VERIFICATION_CANCEL: RefCell<Option<tokio_util::sync::CancellationToken>> = const { RefCell::new(None) };
+}
+
+struct VerificationCancelGuard(Option<tokio_util::sync::CancellationToken>);
+impl Drop for VerificationCancelGuard {
+    fn drop(&mut self) {
+        VERIFICATION_CANCEL.with(|slot| *slot.borrow_mut() = self.0.take());
+    }
+}
+
+fn verification_cancelled() -> bool {
+    VERIFICATION_CANCEL.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+    })
+}
 
 pub const ARTIFACT_MANIFEST_SCHEMA: u32 = 1;
 pub const PRODUCTION_VERIFIER_IDENTITY: &str = "ripclone-typed-cas-artifact-v1";
@@ -356,6 +376,9 @@ impl<W> BoundedWriter<W> {
 
 impl<W: Write> Write for BoundedWriter<W> {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if verification_cancelled() {
+            return Err(std::io::Error::other("artifact verification cancelled"));
+        }
         let next = self
             .written
             .checked_add(bytes.len() as u64)
@@ -436,6 +459,29 @@ impl CasCompletionVerifier {
             ArtifactPayload::Files(files) => self.verify_files(&key.commit, files)?,
         }
         Ok(manifest)
+    }
+
+    /// Cancellation-aware verifier entrypoint for lease-owned builders. The
+    /// token is scoped to this thread and observed by streamed CAS writes and
+    /// every verifier Git child, which is killed and reaped on lease loss.
+    pub fn verify_manifest_cancelled(
+        &self,
+        key: &ArtifactKey,
+        manifest_hash: &str,
+        artifact_count: u64,
+        cancelled: &tokio_util::sync::CancellationToken,
+    ) -> Result<ArtifactManifest> {
+        if cancelled.is_cancelled() {
+            bail!("artifact verification cancelled");
+        }
+        let previous =
+            VERIFICATION_CANCEL.with(|slot| slot.borrow_mut().replace(cancelled.clone()));
+        let _guard = VerificationCancelGuard(previous);
+        let result = self.verify_manifest(key, manifest_hash, artifact_count);
+        if cancelled.is_cancelled() {
+            bail!("artifact verification cancelled");
+        }
+        result
     }
 
     fn read_hash_bounded(&self, hash: &str, maximum: u64, role: &str) -> Result<Vec<u8>> {
@@ -1209,6 +1255,9 @@ fn compare_exact_object_sets(repo: &Path, revisions: &[&str], maximum: u64) -> R
             .context("capture git verify-pack output")?;
         let enumeration = (|| -> Result<()> {
             for line in BufReader::new(stdout).lines() {
+                if verification_cancelled() {
+                    bail!("artifact verification cancelled");
+                }
                 let line = line?;
                 let Some(oid) = line.split_ascii_whitespace().next() else {
                     continue;
@@ -1254,6 +1303,9 @@ fn compare_exact_object_sets(repo: &Path, revisions: &[&str], maximum: u64) -> R
     let mut reachable_count = 0u64;
     let enumeration = (|| -> Result<()> {
         for line in BufReader::new(stdout).lines() {
+            if verification_cancelled() {
+                bail!("artifact verification cancelled");
+            }
             let oid = line?;
             validate_commit_oid(&oid).context("Git closure emitted invalid object id")?;
             reachable_count = reachable_count
@@ -1282,6 +1334,9 @@ fn compare_exact_object_sets(repo: &Path, revisions: &[&str], maximum: u64) -> R
     let mut reachable_lines = BufReader::new(std::fs::File::open(&reachable)?).lines();
     let mut previous = None;
     loop {
+        if verification_cancelled() {
+            bail!("artifact verification cancelled");
+        }
         let packed_oid = packed_lines.next().transpose()?;
         if packed_oid.is_some() && packed_oid == previous {
             bail!("duplicate Git object appears across artifact packs");
@@ -1299,14 +1354,25 @@ fn compare_exact_object_sets(repo: &Path, revisions: &[&str], maximum: u64) -> R
 
 fn external_sort(path: &Path) -> Result<()> {
     let path_value = std::env::var_os("PATH").unwrap_or_default();
-    let status = Command::new("sort")
+    let mut child = Command::new("sort")
         .env_clear()
         .env("PATH", path_value)
         .env("LC_ALL", "C")
         .arg("-o")
         .arg(path)
         .arg(path)
-        .status()?;
+        .spawn()?;
+    let status = loop {
+        if verification_cancelled() {
+            child.kill()?;
+            let _ = child.wait();
+            bail!("artifact verification cancelled");
+        }
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
     if !status.success() {
         bail!("external object-id sort failed");
     }
@@ -1345,7 +1411,18 @@ fn git_update_index(repo: &Path, mode: u32, oid: &str, path: &[u8]) -> Result<()
     stdin.write_all(path)?;
     stdin.write_all(&[0])?;
     drop(stdin);
-    if !child.wait()?.success() {
+    let status = loop {
+        if verification_cancelled() {
+            child.kill()?;
+            let _ = child.wait();
+            bail!("artifact verification cancelled");
+        }
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    if !status.success() {
         bail!("Git index entry construction failed");
     }
     Ok(())
@@ -1360,14 +1437,25 @@ fn git(repo: &Path, args: &[&str]) -> Result<String> {
     let stderr = std::fs::File::create(&stderr_path)?;
     let mut command = Command::new("git");
     configure_git_command(&mut command);
-    let status = command
+    let mut child = command
         .arg("-C")
         .arg(repo)
         .args(args)
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr))
-        .status()
-        .with_context(|| format!("run git {}", args.join(" ")))?;
+        .spawn()
+        .with_context(|| format!("spawn git {}", args.join(" ")))?;
+    let status = loop {
+        if verification_cancelled() {
+            child.kill().context("kill cancelled verifier Git child")?;
+            let _ = child.wait();
+            bail!("artifact verification cancelled");
+        }
+        if let Some(status) = child.try_wait().context("poll verifier Git child")? {
+            break status;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
     let stdout_len = std::fs::metadata(&stdout_path)?.len();
     let stderr_len = std::fs::metadata(&stderr_path)?.len();
     if stdout_len > MAX_GIT_DIAGNOSTIC_BYTES || stderr_len > MAX_GIT_DIAGNOSTIC_BYTES {
