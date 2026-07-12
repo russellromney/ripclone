@@ -945,6 +945,19 @@ mod tests {
     use tokio::sync::{Mutex, Notify};
 
     const TARGET: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const RELEASED_FENCE_SCHEMA_V2: &str = r#"
+CREATE TABLE ready_publication_fence_sequence(id INTEGER PRIMARY KEY CHECK(id=1),generation INTEGER NOT NULL CHECK(generation>=0));
+INSERT INTO ready_publication_fence_sequence(id,generation) VALUES(1,42);
+CREATE TABLE ready_publication_fences(
+ token TEXT PRIMARY KEY,generation INTEGER NOT NULL UNIQUE CHECK(generation>0),operation_id TEXT NOT NULL UNIQUE,
+ expires_at INTEGER NOT NULL,state TEXT NOT NULL CHECK(state IN('held','activation_unknown')),
+ UNIQUE(token,generation));
+CREATE TABLE ready_publication_fence_members(
+ token TEXT NOT NULL,generation INTEGER NOT NULL CHECK(generation>0),artifact_id INTEGER NOT NULL,manifest TEXT,
+ PRIMARY KEY(token,artifact_id),
+ FOREIGN KEY(token,generation) REFERENCES ready_publication_fences(token,generation) ON DELETE CASCADE,
+ FOREIGN KEY(artifact_id) REFERENCES artifact_jobs(id) ON DELETE CASCADE);
+"#;
 
     #[derive(Default)]
     struct TestVerifier {
@@ -2358,6 +2371,10 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        sqlx::raw_sql(RELEASED_FENCE_SCHEMA_V2)
+            .execute(&pool)
+            .await
+            .unwrap();
         let jobs_before: i64 = sqlx::query_scalar("SELECT count(*) FROM artifact_jobs")
             .fetch_one(&pool)
             .await
@@ -2371,6 +2388,15 @@ mod tests {
             .unwrap();
         assert_eq!(version, 3);
         assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT generation FROM ready_publication_fence_sequence WHERE id=1",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            42
+        );
+        assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT count(*) FROM artifact_jobs")
                 .fetch_one(&pool)
                 .await
@@ -2379,6 +2405,17 @@ mod tests {
         );
         assert!(
             reopened
+                .unknown_activation_fences_page(None, 1)
+                .await
+                .unwrap()
+                .fences
+                .is_empty()
+        );
+        let rolling_peer = ArtifactScheduler::open(&f.db_url, SchedulerLimits::default())
+            .await
+            .unwrap();
+        assert!(
+            rolling_peer
                 .unknown_activation_fences_page(None, 1)
                 .await
                 .unwrap()
@@ -2419,6 +2456,90 @@ mod tests {
         assert_eq!(sqlx::query_scalar::<_, i64>(
             "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='ready_publication_fence_sequence'"
         ).fetch_one(&pool).await.unwrap(), 0, "failed v3 migration leaked an earlier DDL statement");
+    }
+
+    #[tokio::test]
+    async fn live_released_v2_unknown_fence_fails_closed_and_rolls_back_unchanged() {
+        let f = Fixture::new().await;
+        f.add("attempt-1").await;
+        f.make_required_ready("head", "history").await;
+        let head = f
+            .scheduler
+            .get_by_key(&f.key(ArtifactKind::Head))
+            .await
+            .unwrap()
+            .unwrap();
+        let history = f
+            .scheduler
+            .get_by_key(&f.key(ArtifactKind::FullHistory))
+            .await
+            .unwrap()
+            .unwrap();
+        let pool = sqlx::SqlitePool::connect(&f.db_url).await.unwrap();
+        sqlx::raw_sql(
+            "DROP TABLE ready_publication_fence_members;
+             DROP TABLE ready_publication_fences;
+             DROP TABLE ready_publication_fence_sequence;
+             PRAGMA user_version=2;",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(RELEASED_FENCE_SCHEMA_V2)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO ready_publication_fences(token,generation,operation_id,expires_at,state)
+             VALUES('legacy-live',42,'legacy-operation',9999999999,'activation_unknown')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        for record in [&head, &history] {
+            sqlx::query(
+                "INSERT INTO ready_publication_fence_members(token,generation,artifact_id,manifest)
+                 VALUES('legacy-live',42,?,?)",
+            )
+            .bind(record.id)
+            .bind(&record.manifest)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let error = match ArtifactScheduler::open(&f.db_url, SchedulerLimits::default()).await {
+            Ok(_) => panic!("live provenance-free v2 fence was unsafely migrated"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("drain them with the v2 binary"));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("PRAGMA user_version")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM ready_publication_fences")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM ready_publication_fence_members")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT generation FROM ready_publication_fence_sequence")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            42
+        );
     }
 
     #[tokio::test]

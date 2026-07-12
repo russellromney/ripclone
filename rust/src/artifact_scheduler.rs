@@ -820,10 +820,85 @@ impl ArtifactScheduler {
             bail!("artifact scheduler contains invalid job format versions")
         }
         if prior_version < 3 {
+            let legacy_tables: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN(
+                   'ready_publication_fence_sequence','ready_publication_fences','ready_publication_fence_members')",
+            ).fetch_one(&mut *migration).await?;
+            let preserved_generation = if legacy_tables == 0 {
+                0
+            } else if legacy_tables == 3 && prior_version == 2 {
+                let legacy_columns: i64 = sqlx::query_scalar(
+                    "SELECT (SELECT count(*) FROM pragma_table_info('ready_publication_fence_sequence'))
+                          +(SELECT count(*) FROM pragma_table_info('ready_publication_fences'))
+                          +(SELECT count(*) FROM pragma_table_info('ready_publication_fence_members'))",
+                ).fetch_one(&mut *migration).await?;
+                let exact_columns: i64 = sqlx::query_scalar(
+                    "SELECT (SELECT count(*) FROM pragma_table_info('ready_publication_fence_sequence') WHERE name IN('id','generation'))
+                          +(SELECT count(*) FROM pragma_table_info('ready_publication_fences') WHERE name IN('token','generation','operation_id','expires_at','state'))
+                          +(SELECT count(*) FROM pragma_table_info('ready_publication_fence_members') WHERE name IN('token','generation','artifact_id','manifest'))",
+                ).fetch_one(&mut *migration).await?;
+                if legacy_columns != 11 || exact_columns != 11 {
+                    bail!(
+                        "v2 Ready fence schema shape is not the released schema; manual repair required"
+                    )
+                }
+                let legacy_sql: String = sqlx::query_scalar(
+                    "SELECT group_concat(lower(sql),' ') FROM sqlite_master
+                     WHERE type='table' AND name IN('ready_publication_fence_sequence','ready_publication_fences','ready_publication_fence_members')",
+                ).fetch_one(&mut *migration).await?;
+                let normalized = legacy_sql.split_whitespace().collect::<String>();
+                for required in [
+                    "operation_id text not null unique",
+                    "check(state in('held','activation_unknown'))",
+                    "foreign key(token,generation) references ready_publication_fences(token,generation) on delete cascade",
+                    "foreign key(artifact_id) references artifact_jobs(id) on delete cascade",
+                ] {
+                    if !normalized.contains(&required.split_whitespace().collect::<String>()) {
+                        bail!(
+                            "v2 Ready fence schema provenance is not the released schema; manual repair required"
+                        )
+                    }
+                }
+                let live_fences: i64 =
+                    sqlx::query_scalar("SELECT count(*) FROM ready_publication_fences")
+                        .fetch_one(&mut *migration)
+                        .await?;
+                if live_fences != 0 {
+                    bail!(
+                        "v2 Ready fences contain live operations without branch/attempt provenance; drain them with the v2 binary before upgrading"
+                    )
+                }
+                let generation: i64 = sqlx::query_scalar(
+                    "SELECT generation FROM ready_publication_fence_sequence WHERE id=1",
+                )
+                .fetch_one(&mut *migration)
+                .await?;
+                if generation < 0 {
+                    bail!("v2 Ready fence sequence is invalid")
+                }
+                sqlx::raw_sql(
+                    "DROP TABLE ready_publication_fence_members;
+                     DROP TABLE ready_publication_fences;
+                     DROP TABLE ready_publication_fence_sequence;",
+                )
+                .execute(&mut *migration)
+                .await?;
+                generation
+            } else {
+                bail!(
+                    "mixed-version Ready fence schema detected; migration refused without mutation"
+                )
+            };
             sqlx::raw_sql(FENCE_SCHEMA_V3)
                 .execute(&mut *migration)
                 .await
                 .context("migrate artifact scheduler v2 to v3 Ready fences")?;
+            if preserved_generation != 0 {
+                sqlx::query("UPDATE ready_publication_fence_sequence SET generation=? WHERE id=1")
+                    .bind(preserved_generation)
+                    .execute(&mut *migration)
+                    .await?;
+            }
         }
         let fence_schema: String = sqlx::query_scalar(
             "SELECT lower(sql) FROM sqlite_master WHERE type='table' AND name='ready_publication_fence_members'",
