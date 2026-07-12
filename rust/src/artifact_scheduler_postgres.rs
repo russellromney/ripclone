@@ -22,6 +22,7 @@ use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use sqlx::postgres::PgPool;
 use sqlx::{Postgres, Row, Transaction};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 const SCHEMA_VERSION: i64 = 6;
@@ -302,6 +303,103 @@ async fn preflight_postgres_schema(tx: &mut Transaction<'_, Postgres>, version: 
     Ok(())
 }
 
+async fn validate_postgres_v6_fences(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
+    let tables:i64=sqlx::query_scalar("SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=current_schema() AND c.relkind='r' AND c.relname LIKE 'ready_publication_fence%'").fetch_one(&mut **tx).await?;
+    if tables != 3 {
+        bail!("postgres v6 Ready fence table inventory is not exact")
+    }
+    let columns:i64=sqlx::query_scalar("WITH expected(table_name,column_name,data_type,is_nullable) AS (VALUES ('ready_publication_fence_sequence','id','smallint','NO'),('ready_publication_fence_sequence','generation','bigint','NO'),('ready_publication_fences','token','text','NO'),('ready_publication_fences','generation','bigint','NO'),('ready_publication_fences','operation_id','text','NO'),('ready_publication_fences','workspace','text','NO'),('ready_publication_fences','repo','text','NO'),('ready_publication_fences','branch','text','NO'),('ready_publication_fences','target','text','NO'),('ready_publication_fences','attempt_id','text','NO'),('ready_publication_fences','expires_at','bigint','NO'),('ready_publication_fences','state','text','NO'),('ready_publication_fence_members','token','text','NO'),('ready_publication_fence_members','generation','bigint','NO'),('ready_publication_fence_members','artifact_id','bigint','NO'),('ready_publication_fence_members','manifest','text','NO')) SELECT count(*) FROM expected e JOIN information_schema.columns c USING(table_name,column_name) WHERE c.table_schema=current_schema() AND c.data_type=e.data_type AND c.is_nullable=e.is_nullable AND c.column_default IS NULL").fetch_one(&mut **tx).await?;
+    let actual:i64=sqlx::query_scalar("SELECT count(*) FROM information_schema.columns WHERE table_schema=current_schema() AND table_name IN('ready_publication_fence_sequence','ready_publication_fences','ready_publication_fence_members')").fetch_one(&mut **tx).await?;
+    if columns != 16 || actual != 16 {
+        bail!("postgres v6 Ready fence columns differ")
+    }
+    let constraints:i64=sqlx::query_scalar("SELECT count(*) FROM pg_constraint WHERE conrelid IN('ready_publication_fence_sequence'::regclass,'ready_publication_fences'::regclass,'ready_publication_fence_members'::regclass)").fetch_one(&mut **tx).await?;
+    let indexes:i64=sqlx::query_scalar("SELECT count(*) FROM pg_index WHERE indrelid IN('ready_publication_fence_sequence'::regclass,'ready_publication_fences'::regclass,'ready_publication_fence_members'::regclass)").fetch_one(&mut **tx).await?;
+    let recovery:i64=sqlx::query_scalar("SELECT count(*) FROM pg_index i JOIN pg_class x ON x.oid=i.indexrelid WHERE x.relname='ready_publication_fences_recovery' AND NOT i.indisunique AND i.indpred IS NULL AND i.indexprs IS NULL AND ARRAY(SELECT pg_get_indexdef(x.oid,s,true) FROM generate_series(1,i.indnkeyatts) s ORDER BY s)=ARRAY['state','generation','token']::text[]").fetch_one(&mut **tx).await?;
+    let keys:i64=sqlx::query_scalar("SELECT count(*) FROM pg_constraint c WHERE (c.conrelid='ready_publication_fence_sequence'::regclass AND c.contype='p' AND pg_get_constraintdef(c.oid)='PRIMARY KEY (id)') OR (c.conrelid='ready_publication_fences'::regclass AND ((c.contype='p' AND pg_get_constraintdef(c.oid)='PRIMARY KEY (token)') OR (c.contype='u' AND pg_get_constraintdef(c.oid) IN('UNIQUE (generation)','UNIQUE (operation_id)','UNIQUE (token, generation)')))) OR (c.conrelid='ready_publication_fence_members'::regclass AND c.contype='p' AND pg_get_constraintdef(c.oid)='PRIMARY KEY (token, artifact_id)')").fetch_one(&mut **tx).await?;
+    if constraints != 14 || indexes != 7 || recovery != 1 || keys != 6 {
+        bail!("postgres v6 Ready fence constraints/indexes differ")
+    }
+    let fks:i64=sqlx::query_scalar("SELECT count(*) FROM pg_constraint c WHERE c.conrelid='ready_publication_fence_members'::regclass AND c.contype='f' AND c.confdeltype='c' AND ((pg_get_constraintdef(c.oid)='FOREIGN KEY (token, generation) REFERENCES ready_publication_fences(token, generation) ON DELETE CASCADE') OR (pg_get_constraintdef(c.oid)='FOREIGN KEY (artifact_id) REFERENCES artifact_jobs(id) ON DELETE CASCADE'))").fetch_one(&mut **tx).await?;
+    let checks:i64=sqlx::query_scalar("SELECT count(*) FROM pg_constraint c WHERE (c.conrelid='ready_publication_fence_sequence'::regclass AND c.contype='c' AND (pg_get_constraintdef(c.oid)='CHECK ((id = 1))' OR pg_get_constraintdef(c.oid)='CHECK ((generation >= 0))')) OR (c.conrelid='ready_publication_fences'::regclass AND c.contype='c' AND (pg_get_constraintdef(c.oid)='CHECK ((generation > 0))' OR pg_get_constraintdef(c.oid) LIKE '%held%activation_unknown%')) OR (c.conrelid='ready_publication_fence_members'::regclass AND c.contype='c' AND pg_get_constraintdef(c.oid)='CHECK ((generation > 0))')").fetch_one(&mut **tx).await?;
+    let manifest_check:i64=sqlx::query_scalar("SELECT count(*) FROM pg_constraint c WHERE c.conrelid='ready_publication_fence_members'::regclass AND c.contype='c' AND pg_get_constraintdef(c.oid) ILIKE '%length%manifest%> 0%'").fetch_one(&mut **tx).await?;
+    if fks != 2 || checks != 5 || manifest_check != 1 {
+        bail!("postgres v6 Ready fence FK/check definitions differ")
+    }
+    let sequence: Vec<(i16, i64)> =
+        sqlx::query_as("SELECT id,generation FROM ready_publication_fence_sequence")
+            .fetch_all(&mut **tx)
+            .await?;
+    if sequence.len() != 1 || sequence[0].0 != 1 || sequence[0].1 < 0 {
+        bail!("postgres v6 Ready fence sequence is invalid")
+    }
+    let fences:Vec<(String,i64,String,String,String,String,String,String,i64,String)>=sqlx::query_as("SELECT token,generation,operation_id,workspace,repo,branch,target,attempt_id,expires_at,state FROM ready_publication_fences").fetch_all(&mut **tx).await?;
+    let members:Vec<(String,i64,i64,String,Option<String>,Option<String>,Option<String>,Option<String>,Option<i64>,Option<String>,Option<String>)>=sqlx::query_as("SELECT m.token,m.generation,m.artifact_id,m.manifest,j.workspace,j.repo,j.commit_oid,j.kind,j.format_version,j.state,j.manifest FROM ready_publication_fence_members m LEFT JOIN artifact_jobs j ON j.id=m.artifact_id ORDER BY m.token,m.artifact_id").fetch_all(&mut **tx).await?;
+    let mut grouped: HashMap<
+        &str,
+        Vec<&(
+            String,
+            i64,
+            i64,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+        )>,
+    > = HashMap::new();
+    for row in &members {
+        grouped.entry(&row.0).or_default().push(row)
+    }
+    for (token, generation, operation, workspace, repo, branch, target, attempt, expires, state) in
+        fences
+    {
+        let p = ActivationFenceProvenance {
+            workspace: workspace.clone(),
+            repo: repo.clone(),
+            branch: branch.clone(),
+            target: target.clone(),
+            attempt_id: attempt,
+        };
+        let rows = grouped.remove(token.as_str()).unwrap_or_default();
+        let mut kinds = rows
+            .iter()
+            .filter_map(|r| r.7.as_deref())
+            .collect::<Vec<_>>();
+        kinds.sort();
+        if token.len() != 64
+            || !token
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            || generation <= 0
+            || operation != p.operation_id()
+            || expires <= 0
+            || !matches!(state.as_str(), "held" | "activation_unknown")
+            || rows.len() != 2
+            || rows.iter().any(|r| {
+                r.1 != generation
+                    || r.4.as_deref() != Some(workspace.as_str())
+                    || r.5.as_deref() != Some(repo.as_str())
+                    || r.6.as_deref() != Some(target.as_str())
+                    || r.9.as_deref() != Some("ready")
+                    || r.10.as_deref() != Some(r.3.as_str())
+                    || r.3.trim().is_empty()
+            })
+            || rows[0].8 != rows[1].8
+            || kinds != ["full_history", "head"]
+        {
+            bail!("postgres v6 Ready fence persisted state is invalid")
+        }
+    }
+    if !grouped.is_empty() {
+        bail!("postgres v6 Ready fence contains orphan members")
+    }
+    Ok(())
+}
+
 impl PostgresArtifactScheduler {
     pub async fn from_pool(
         pool: PgPool,
@@ -338,7 +436,13 @@ impl PostgresArtifactScheduler {
                 bail!("unsupported postgres artifact scheduler schema {version}")
             }
             preflight_postgres_schema(&mut migration, version).await?;
-            sqlx::raw_sql(SCHEMA).execute(&mut *migration).await?;
+            if version == SCHEMA_VERSION {
+                // A released v6 marker must already describe the exact schema;
+                // CREATE IF NOT EXISTS must not repair a forged production DB.
+                validate_postgres_v6_fences(&mut migration).await?;
+            } else {
+                sqlx::raw_sql(SCHEMA).execute(&mut *migration).await?;
+            }
             version
         } else {
             let partial:i64=sqlx::query_scalar("SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=current_schema() AND c.relkind='r' AND c.relname IN('artifact_jobs','branch_observations','artifact_observations','artifact_consumers','artifact_transport_leases','artifact_gc_sweep','artifact_base_retention','scheduler_state')").fetch_one(&mut *migration).await?;
@@ -737,6 +841,7 @@ impl PostgresArtifactScheduler {
                 refresh_base_retention(&mut migration, &w, &r, v).await?;
             }
         }
+        validate_postgres_v6_fences(&mut migration).await?;
         if version < SCHEMA_VERSION {
             sqlx::query(
                 "UPDATE artifact_scheduler_schema SET version=$1 WHERE id=1 AND version=$2",
@@ -2362,6 +2467,34 @@ mod tests {
                 .is_some(),
             "activation_unknown must not expire"
         );
+        PostgresArtifactScheduler::from_pool(
+            PgPoolOptions::new().connect(&url).await.unwrap(),
+            Default::default(),
+            Arc::new(Accept),
+        )
+        .await
+        .expect("exact persisted Ready fence was rejected at startup");
+        sqlx::query(
+            "UPDATE ready_publication_fences SET operation_id='admission-operation-forged'",
+        )
+        .execute(&control)
+        .await
+        .unwrap();
+        assert!(
+            PostgresArtifactScheduler::from_pool(
+                PgPoolOptions::new().connect(&url).await.unwrap(),
+                Default::default(),
+                Arc::new(Accept)
+            )
+            .await
+            .is_err(),
+            "forged Ready fence operation provenance was accepted"
+        );
+        sqlx::query("UPDATE ready_publication_fences SET operation_id=$1")
+            .bind(provenance.operation_id())
+            .execute(&control)
+            .await
+            .unwrap();
         let roots = a.live_scheduler_roots_page(None, 512).await.unwrap();
         assert!(roots.iter().any(|r| r.artifact_id == head_id));
         a.release_ready_publication_fence(fence).await.unwrap();

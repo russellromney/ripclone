@@ -21,6 +21,7 @@ use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use sqlx::mysql::MySqlPool;
 use sqlx::{Acquire, MySql, MySqlConnection, Row, Transaction};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 const SCHEMA_VERSION: i64 = 6;
@@ -169,6 +170,10 @@ impl GcDeleteFence for MysqlGcDeleteFence {
 }
 
 async fn preflight_mysql_schema(connection: &mut MySqlConnection, version: i64) -> Result<()> {
+    let fence_namespace:i64=sqlx::query_scalar("SELECT count(*) FROM information_schema.tables WHERE table_schema=DATABASE() AND LEFT(table_name,23)='ready_publication_fence'").fetch_one(&mut *connection).await?;
+    if version < 6 && fence_namespace != 0 {
+        bail!("mysql pre-v6 marker contains Ready fence DDL")
+    }
     if version < 2 {
         return Ok(());
     }
@@ -213,6 +218,10 @@ async fn preflight_mysql_schema(connection: &mut MySqlConnection, version: i64) 
 }
 
 async fn preflight_mysql_transition(connection: &mut MySqlConnection, version: i64) -> Result<()> {
+    let fences:i64=sqlx::query_scalar("SELECT count(*) FROM information_schema.tables WHERE table_schema=DATABASE() AND LEFT(table_name,23)='ready_publication_fence'").fetch_one(&mut *connection).await?;
+    if fences != 0 {
+        bail!("mysql historical transition contains premature Ready fence DDL")
+    }
     let core:i64=sqlx::query_scalar("SELECT count(*) FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name IN('artifact_scheduler_schema','artifact_jobs','branch_observations','artifact_observations','artifact_consumers','scheduler_state')").fetch_one(&mut *connection).await?;
     if core != 6 {
         bail!("mysql transitional migration is missing core v1 tables")
@@ -311,6 +320,278 @@ async fn preflight_mysql_v6_transition(c: &mut MySqlConnection, marker: i64) -> 
     Ok(())
 }
 
+async fn validate_mysql_v6_fences(tx: &mut Transaction<'_, MySql>) -> Result<()> {
+    let tables: i64 = sqlx::query_scalar("SELECT count(*) FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name IN('ready_publication_fence_sequence','ready_publication_fences','ready_publication_fence_members') AND engine='InnoDB' AND table_collation='utf8mb4_bin'").fetch_one(&mut **tx).await?;
+    let namespace: i64 = sqlx::query_scalar("SELECT count(*) FROM information_schema.tables WHERE table_schema=DATABASE() AND LEFT(table_name,23)='ready_publication_fence'").fetch_one(&mut **tx).await?;
+    if tables != 3 || namespace != 3 {
+        bail!("mysql v6 Ready fence table inventory is not exact")
+    }
+
+    const COLUMNS: &[(&str, &str, &str, &str, Option<&str>)] = &[
+        (
+            "ready_publication_fence_sequence",
+            "id",
+            "smallint",
+            "NO",
+            None,
+        ),
+        (
+            "ready_publication_fence_sequence",
+            "generation",
+            "bigint",
+            "NO",
+            None,
+        ),
+        (
+            "ready_publication_fences",
+            "token",
+            "varchar(64)",
+            "NO",
+            None,
+        ),
+        (
+            "ready_publication_fences",
+            "generation",
+            "bigint",
+            "NO",
+            None,
+        ),
+        (
+            "ready_publication_fences",
+            "operation_id",
+            "varchar(96)",
+            "NO",
+            None,
+        ),
+        (
+            "ready_publication_fences",
+            "workspace",
+            "varchar(128)",
+            "NO",
+            None,
+        ),
+        (
+            "ready_publication_fences",
+            "repo",
+            "varchar(320)",
+            "NO",
+            None,
+        ),
+        (
+            "ready_publication_fences",
+            "branch",
+            "varchar(191)",
+            "NO",
+            None,
+        ),
+        (
+            "ready_publication_fences",
+            "target",
+            "varchar(64)",
+            "NO",
+            None,
+        ),
+        (
+            "ready_publication_fences",
+            "attempt_id",
+            "varchar(255)",
+            "NO",
+            None,
+        ),
+        (
+            "ready_publication_fences",
+            "expires_at",
+            "bigint",
+            "NO",
+            None,
+        ),
+        (
+            "ready_publication_fences",
+            "state",
+            "varchar(24)",
+            "NO",
+            None,
+        ),
+        (
+            "ready_publication_fence_members",
+            "token",
+            "varchar(64)",
+            "NO",
+            None,
+        ),
+        (
+            "ready_publication_fence_members",
+            "generation",
+            "bigint",
+            "NO",
+            None,
+        ),
+        (
+            "ready_publication_fence_members",
+            "artifact_id",
+            "bigint",
+            "NO",
+            None,
+        ),
+        (
+            "ready_publication_fence_members",
+            "manifest",
+            "longtext",
+            "NO",
+            None,
+        ),
+    ];
+    let count:i64=sqlx::query_scalar("SELECT count(*) FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name IN('ready_publication_fence_sequence','ready_publication_fences','ready_publication_fence_members')").fetch_one(&mut **tx).await?;
+    if count != COLUMNS.len() as i64 {
+        bail!("mysql v6 Ready fence columns are not exact")
+    }
+    for (table, column, kind, nullable, default) in COLUMNS {
+        let row:Option<(String,String,Option<String>,String,Option<String>)>=sqlx::query_as("SELECT lower(column_type),is_nullable,column_default,extra,collation_name FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name=? AND column_name=?").bind(table).bind(column).fetch_optional(&mut **tx).await?;
+        let Some((actual_kind, actual_nullable, actual_default, extra, collation)) = row else {
+            bail!("mysql v6 Ready fence column is missing")
+        };
+        if actual_kind != *kind
+            || actual_nullable != *nullable
+            || actual_default.as_deref() != *default
+            || !extra.is_empty()
+            || ((kind.contains("char") || kind.contains("text"))
+                && collation.as_deref() != Some("utf8mb4_bin"))
+        {
+            bail!("mysql v6 Ready fence column definition differs: {table}.{column}")
+        }
+    }
+    let indexes:Vec<(String,String,i64,String)>=sqlx::query_as("SELECT table_name,index_name,non_unique,GROUP_CONCAT(column_name ORDER BY seq_in_index) FROM information_schema.statistics WHERE table_schema=DATABASE() AND table_name IN('ready_publication_fence_sequence','ready_publication_fences','ready_publication_fence_members') GROUP BY table_name,index_name,non_unique ORDER BY table_name,index_name").fetch_all(&mut **tx).await?;
+    if indexes.len() != 9
+        || !indexes.iter().any(|x| {
+            x.0 == "ready_publication_fence_sequence" && x.1 == "PRIMARY" && x.2 == 0 && x.3 == "id"
+        })
+        || !indexes.iter().any(|x| {
+            x.0 == "ready_publication_fences"
+                && x.1 == "ready_publication_fences_recovery"
+                && x.2 == 1
+                && x.3 == "state,generation,token"
+        })
+        || indexes
+            .iter()
+            .filter(|x| {
+                x.0 == "ready_publication_fences"
+                    && x.2 == 0
+                    && matches!(
+                        x.3.as_str(),
+                        "token" | "generation" | "operation_id" | "token,generation"
+                    )
+            })
+            .count()
+            != 4
+        || indexes
+            .iter()
+            .filter(|x| {
+                x.0 == "ready_publication_fence_members"
+                    && ((x.2 == 0 && x.3 == "token,artifact_id")
+                        || (x.2 == 1 && matches!(x.3.as_str(), "token,generation" | "artifact_id")))
+            })
+            .count()
+            != 3
+    {
+        bail!("mysql v6 Ready fence index inventory differs")
+    }
+    let constraints:i64=sqlx::query_scalar("SELECT count(*) FROM information_schema.table_constraints WHERE constraint_schema=DATABASE() AND table_name IN('ready_publication_fence_sequence','ready_publication_fences','ready_publication_fence_members')").fetch_one(&mut **tx).await?;
+    if constraints != 13 {
+        bail!("mysql v6 Ready fence constraint inventory differs")
+    }
+    let parent_fk:i64=sqlx::query_scalar("SELECT count(DISTINCT r.constraint_name) FROM information_schema.referential_constraints r JOIN information_schema.key_column_usage k ON k.constraint_schema=r.constraint_schema AND k.table_name=r.table_name AND k.constraint_name=r.constraint_name WHERE r.constraint_schema=DATABASE() AND r.table_name='ready_publication_fence_members' AND r.constraint_name='ready_fence_members_parent' AND r.referenced_table_name='ready_publication_fences' AND r.delete_rule='CASCADE' AND ((k.ordinal_position=1 AND k.column_name='token' AND k.referenced_column_name='token') OR (k.ordinal_position=2 AND k.column_name='generation' AND k.referenced_column_name='generation')) GROUP BY r.constraint_name HAVING count(*)=2").fetch_optional(&mut **tx).await?.unwrap_or(0);
+    let artifact_fk:i64=sqlx::query_scalar("SELECT count(*) FROM information_schema.referential_constraints r JOIN information_schema.key_column_usage k ON k.constraint_schema=r.constraint_schema AND k.table_name=r.table_name AND k.constraint_name=r.constraint_name WHERE r.constraint_schema=DATABASE() AND r.table_name='ready_publication_fence_members' AND r.constraint_name='ready_fence_members_artifact' AND r.referenced_table_name='artifact_jobs' AND r.delete_rule='CASCADE' AND k.column_name='artifact_id' AND k.referenced_column_name='id'").fetch_one(&mut **tx).await?;
+    if parent_fk != 1 || artifact_fk != 1 {
+        bail!("mysql v6 Ready fence foreign keys differ")
+    }
+    for (name, clause) in [
+        ("ready_fence_sequence_singleton", "`id` = 1"),
+        ("ready_fence_sequence_generation", "`generation` >= 0"),
+        ("ready_fences_generation", "`generation` > 0"),
+        (
+            "ready_fences_state",
+            "`state` in ('held','activation_unknown')",
+        ),
+        ("ready_fence_members_generation", "`generation` > 0"),
+    ] {
+        let actual:Option<String>=sqlx::query_scalar("SELECT lower(check_clause) FROM information_schema.check_constraints WHERE constraint_schema=DATABASE() AND constraint_name=?").bind(name).fetch_optional(&mut **tx).await?;
+        if actual.as_deref().map(normalize_check).as_deref()
+            != Some(normalize_check(clause).as_str())
+        {
+            bail!("mysql v6 Ready fence check differs: {name}")
+        }
+    }
+    let sequence: Vec<(i64, i64)> =
+        sqlx::query_as("SELECT id,generation FROM ready_publication_fence_sequence")
+            .fetch_all(&mut **tx)
+            .await?;
+    if sequence.len() != 1 || sequence[0].0 != 1 || sequence[0].1 < 0 {
+        bail!("mysql v6 Ready fence sequence is not the singleton")
+    }
+    let fences:Vec<(String,i64,String,String,String,String,String,String,i64,String)>=sqlx::query_as("SELECT token,generation,operation_id,workspace,repo,branch,target,attempt_id,expires_at,state FROM ready_publication_fences").fetch_all(&mut **tx).await?;
+    let members:Vec<(String,i64,i64,String,String,String,String,String,i64,String,Option<String>)>=sqlx::query_as("SELECT m.token,m.generation,m.artifact_id,m.manifest,j.workspace,j.repo,j.commit_oid,j.kind,j.format_version,j.state,j.manifest FROM ready_publication_fence_members m LEFT JOIN artifact_jobs j ON j.id=m.artifact_id ORDER BY m.token,m.artifact_id").fetch_all(&mut **tx).await?;
+    let mut by_token: HashMap<
+        &str,
+        Vec<&(
+            String,
+            i64,
+            i64,
+            String,
+            String,
+            String,
+            String,
+            String,
+            i64,
+            String,
+            Option<String>,
+        )>,
+    > = HashMap::new();
+    for member in &members {
+        by_token.entry(&member.0).or_default().push(member);
+    }
+    for (token, generation, operation, workspace, repo, branch, target, attempt, expires, state) in
+        fences
+    {
+        let provenance = ActivationFenceProvenance {
+            workspace: workspace.clone(),
+            repo: repo.clone(),
+            branch: branch.clone(),
+            target: target.clone(),
+            attempt_id: attempt.clone(),
+        };
+        let rows = by_token.remove(token.as_str()).unwrap_or_default();
+        let mut kinds = rows.iter().map(|row| row.7.as_str()).collect::<Vec<_>>();
+        kinds.sort();
+        if token.len() != 64
+            || !token
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            || generation <= 0
+            || operation != provenance.operation_id()
+            || expires <= 0
+            || !matches!(state.as_str(), "held" | "activation_unknown")
+            || rows.len() != 2
+            || rows.iter().any(|row| {
+                row.1 != generation
+                    || row.4 != workspace
+                    || row.5 != repo
+                    || row.6 != target
+                    || row.9 != "ready"
+                    || row.10.as_deref() != Some(row.3.as_str())
+                    || row.3.trim().is_empty()
+            })
+            || rows[0].8 != rows[1].8
+            || kinds != ["full_history", "head"]
+        {
+            bail!("mysql v6 Ready fence persisted state is invalid")
+        }
+    }
+    if !by_token.is_empty() {
+        bail!("mysql v6 Ready fence contains orphan members")
+    }
+    Ok(())
+}
+
 impl MysqlArtifactScheduler {
     pub async fn from_pool(
         pool: MySqlPool,
@@ -339,10 +620,12 @@ impl MysqlArtifactScheduler {
             let mut version: i64 = if marker_exists == 0 {
                 let partial:i64=sqlx::query_scalar("SELECT count(*) FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name IN('artifact_jobs','branch_observations','artifact_observations','artifact_consumers','artifact_transport_leases','artifact_base_retention','artifact_gc_sweep','scheduler_state')").fetch_one(&mut connection).await?;
                 if partial != 0 { bail!("unmarked partial mysql artifact scheduler schema") }
-                for statement in SCHEMA { sqlx::raw_sql(*statement).execute(&mut connection).await?; }
+                // Fresh databases first publish the exact transport-only v5
+                // shape. Fence DDL is forbidden until marker 501 is durable.
+                for statement in &SCHEMA[..9] { sqlx::raw_sql(*statement).execute(&mut connection).await?; }
                 sqlx::query("INSERT INTO scheduler_state(id,fairness_cursor) VALUES(1,0)").execute(&mut connection).await?;
-                sqlx::query("INSERT INTO artifact_scheduler_schema(id,version) VALUES(1,3)").execute(&mut connection).await?;
-                3
+                sqlx::query("INSERT INTO artifact_scheduler_schema(id,version) VALUES(1,5)").execute(&mut connection).await?;
+                5
             } else {
                 let version:i64=sqlx::query_scalar("SELECT version FROM artifact_scheduler_schema WHERE id=1").fetch_one(&mut connection).await?;
                 if version > SCHEMA_VERSION && ![V1_TO_V4_TRANSITION,V2_TO_V4_TRANSITION,V5_TO_V6_DDL,V5_TO_V6_VALIDATED].contains(&version) { bail!("artifact scheduler database is newer than this binary") }
@@ -354,14 +637,52 @@ impl MysqlArtifactScheduler {
                 } else {
                     preflight_mysql_schema(&mut connection,version).await?;
                 }
-                if version == 3 || version == 4 || version == SCHEMA_VERSION {
-                    for statement in SCHEMA { sqlx::raw_sql(*statement).execute(&mut connection).await?; }
+                if version == 3 || version == 4 || version == 5 {
+                    for statement in &SCHEMA[..9] { sqlx::raw_sql(*statement).execute(&mut connection).await?; }
                     sqlx::query("INSERT INTO scheduler_state(id,fairness_cursor) VALUES(1,0) ON DUPLICATE KEY UPDATE id=VALUES(id)").execute(&mut connection).await?;
-                    sqlx::query("INSERT INTO ready_publication_fence_sequence(id,generation) VALUES(1,0) ON DUPLICATE KEY UPDATE id=VALUES(id)").execute(&mut connection).await?;
                 }
                 version
             };
 
+            // Released v1-v4 lineages, including the durable 401/402 crash
+            // markers, converge to the exact released v5 shape first. No fence
+            // table is mentioned by this phase.
+            if version == 1 || version == 2 {
+                let transition = if version == 1 { V1_TO_V4_TRANSITION } else { V2_TO_V4_TRANSITION };
+                let mut marker = connection.begin().await?;
+                sqlx::query(
+                    "UPDATE artifact_scheduler_schema SET version=? WHERE id=1 AND version=?",
+                )
+                .bind(transition)
+                .bind(version)
+                .execute(&mut *marker)
+                .await?;
+                marker.commit().await?;
+                version = transition;
+            }
+            if version == V1_TO_V4_TRANSITION || version == V2_TO_V4_TRANSITION {
+                for statement in &SCHEMA[..9] { sqlx::raw_sql(*statement).execute(&mut connection).await?; }
+                sqlx::query("INSERT INTO scheduler_state(id,fairness_cursor) VALUES(1,0) ON DUPLICATE KEY UPDATE id=VALUES(id)").execute(&mut connection).await?;
+                let mut migration = connection.begin().await?;
+                Self::validate_schema(&mut migration).await?;
+                sqlx::query("DELETE FROM artifact_base_retention").execute(&mut *migration).await?;
+                let scopes: Vec<(String,String,i64)> = sqlx::query_as("SELECT DISTINCT workspace,repo,format_version FROM artifact_jobs WHERE state='ready' AND kind IN('head','full_history')").fetch_all(&mut *migration).await?;
+                for (w,r,v) in scopes { refresh_base_retention(&mut migration,&w,&r,v).await?; }
+                let changed=sqlx::query("UPDATE artifact_scheduler_schema SET version=5 WHERE id=1 AND version=?").bind(version).execute(&mut *migration).await?.rows_affected();
+                if changed != 1 { bail!("mysql transition marker changed during resumed v5 publication") }
+                migration.commit().await?;
+                version = 5;
+            } else if version == 3 || version == 4 {
+                let mut migration = connection.begin().await?;
+                Self::validate_schema(&mut migration).await?;
+                let changed=sqlx::query("UPDATE artifact_scheduler_schema SET version=5 WHERE id=1 AND version=?").bind(version).execute(&mut *migration).await?.rows_affected();
+                if changed != 1 { bail!("mysql v3/v4 marker changed during v5 publication") }
+                migration.commit().await?;
+                version = 5;
+            }
+
+            // A crash here leaves exact v5, which old v5 understands. Persist
+            // 501 before the first fence DDL, then resume 501 -> 502 -> 6.
             if version == 5 {
                 let mut marker=connection.begin().await?;
                 if sqlx::query("UPDATE artifact_scheduler_schema SET version=? WHERE id=1 AND version=5").bind(V5_TO_V6_DDL).execute(&mut *marker).await?.rows_affected()!=1{bail!("mysql v5 to v6 transition marker CAS failed")}
@@ -384,59 +705,9 @@ impl MysqlArtifactScheduler {
 
             let mut migration = connection.begin().await?;
             let locked_version: i64 = sqlx::query_scalar("SELECT version FROM artifact_scheduler_schema WHERE id=1 FOR UPDATE").fetch_one(&mut *migration).await?;
-            sqlx::query("INSERT INTO ready_publication_fence_sequence(id,generation) VALUES(1,0) ON DUPLICATE KEY UPDATE id=VALUES(id)").execute(&mut *migration).await?;
-            if locked_version != version { bail!("mysql artifact scheduler version changed under migration lock") }
-            if version > SCHEMA_VERSION && ![V1_TO_V4_TRANSITION,V2_TO_V4_TRANSITION].contains(&version) {
-                bail!("artifact scheduler database is newer than this binary")
-            }
-            if ![1, 2, 3, 4, 5, SCHEMA_VERSION, V1_TO_V4_TRANSITION, V2_TO_V4_TRANSITION].contains(&version) {
-                bail!("unsupported mysql artifact scheduler schema {version}")
-            }
-            if version == 1 || version == 2 {
-                let transition = if version == 1 { V1_TO_V4_TRANSITION } else { V2_TO_V4_TRANSITION };
-                sqlx::query(
-                    "UPDATE artifact_scheduler_schema SET version=? WHERE id=1 AND version=?",
-                )
-                .bind(transition)
-                .bind(version)
-                .execute(&mut *migration)
-                .await?;
-                migration.commit().await?;
-                if version == 1 {
-                    for statement in SCHEMA { sqlx::raw_sql(*statement).execute(&mut connection).await?; }
-                } else {
-                    sqlx::raw_sql(SCHEMA[6]).execute(&mut connection).await?;
-                    sqlx::raw_sql(SCHEMA[7]).execute(&mut connection).await?;
-                }
-                sqlx::query("INSERT INTO scheduler_state(id,fairness_cursor) VALUES(1,0) ON DUPLICATE KEY UPDATE id=VALUES(id)").execute(&mut connection).await?;
-                migration = connection.begin().await?;
-                Self::validate_schema(&mut migration).await?;
-                sqlx::query("DELETE FROM artifact_base_retention").execute(&mut *migration).await?;
-                let scopes: Vec<(String,String,i64)> = sqlx::query_as("SELECT DISTINCT workspace,repo,format_version FROM artifact_jobs WHERE state='ready' AND kind IN('head','full_history')").fetch_all(&mut *migration).await?;
-                for (w,r,v) in scopes { refresh_base_retention(&mut migration,&w,&r,v).await?; }
-                let changed=sqlx::query("UPDATE artifact_scheduler_schema SET version=? WHERE id=1 AND version=?").bind(SCHEMA_VERSION).bind(transition).execute(&mut *migration).await?.rows_affected();
-                if changed != 1 { bail!("mysql transition marker changed during v5 publication") }
-            } else if version == V1_TO_V4_TRANSITION || version == V2_TO_V4_TRANSITION {
-                migration.commit().await?;
-                if version == V1_TO_V4_TRANSITION {
-                    for statement in SCHEMA { sqlx::raw_sql(*statement).execute(&mut connection).await?; }
-                } else {
-                    sqlx::raw_sql(SCHEMA[6]).execute(&mut connection).await?;
-                    sqlx::raw_sql(SCHEMA[7]).execute(&mut connection).await?;
-                }
-                sqlx::query("INSERT INTO scheduler_state(id,fairness_cursor) VALUES(1,0) ON DUPLICATE KEY UPDATE id=VALUES(id)").execute(&mut connection).await?;
-                migration = connection.begin().await?;
-                Self::validate_schema(&mut migration).await?;
-                sqlx::query("DELETE FROM artifact_base_retention").execute(&mut *migration).await?;
-                let scopes: Vec<(String,String,i64)> = sqlx::query_as("SELECT DISTINCT workspace,repo,format_version FROM artifact_jobs WHERE state='ready' AND kind IN('head','full_history')").fetch_all(&mut *migration).await?;
-                for (w,r,v) in scopes { refresh_base_retention(&mut migration,&w,&r,v).await?; }
-                let changed=sqlx::query("UPDATE artifact_scheduler_schema SET version=? WHERE id=1 AND version=?").bind(SCHEMA_VERSION).bind(version).execute(&mut *migration).await?.rows_affected();
-                if changed != 1 { bail!("mysql transition marker changed during resumed v5 publication") }
-            } else if version == 3 || version == 4 || version == 5 {
-                let changed=sqlx::query("UPDATE artifact_scheduler_schema SET version=? WHERE id=1 AND version=?").bind(SCHEMA_VERSION).bind(version).execute(&mut *migration).await?.rows_affected();
-                if changed != 1 { bail!("mysql v3/v4 marker changed during v5 publication") }
-            }
+            if locked_version != version || version != SCHEMA_VERSION { bail!("mysql artifact scheduler version changed under migration lock") }
             Self::validate_schema(&mut migration).await?;
+            validate_mysql_v6_fences(&mut migration).await?;
 
             let fingerprint = scheduler_fingerprint(&limits, verifier_id);
             if fingerprint.chars().count() > 512 {
@@ -2831,7 +3102,7 @@ mod tests {
             .unwrap();
         assert_eq!(lock, 1, "test database lock unavailable");
         reset(&control).await;
-        for statement in SCHEMA {
+        for statement in &SCHEMA[..9] {
             sqlx::raw_sql(*statement).execute(&control).await.unwrap();
         }
         sqlx::query("INSERT INTO artifact_scheduler_schema(id,version) VALUES(1,3)")
@@ -2901,6 +3172,34 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+        MysqlArtifactScheduler::from_pool(
+            MySqlPoolOptions::new().connect(&url).await.unwrap(),
+            Default::default(),
+            Arc::new(Accept),
+        )
+        .await
+        .expect("exact persisted Ready fence was rejected at startup");
+        sqlx::query(
+            "UPDATE ready_publication_fences SET operation_id='admission-operation-forged'",
+        )
+        .execute(&control)
+        .await
+        .unwrap();
+        assert!(
+            MysqlArtifactScheduler::from_pool(
+                MySqlPoolOptions::new().connect(&url).await.unwrap(),
+                Default::default(),
+                Arc::new(Accept)
+            )
+            .await
+            .is_err(),
+            "forged Ready fence operation provenance was accepted"
+        );
+        sqlx::query("UPDATE ready_publication_fences SET operation_id=?")
+            .bind(provenance.operation_id())
+            .execute(&control)
+            .await
+            .unwrap();
         assert!(
             a.live_scheduler_roots_page(None, 512)
                 .await
@@ -3639,7 +3938,7 @@ mod tests {
 
         reset(&control).await;
         for (index, statement) in SCHEMA.iter().enumerate() {
-            if index != 6 && index != 7 {
+            if index < 6 || index == 8 {
                 sqlx::raw_sql(*statement).execute(&control).await.unwrap();
             }
         }
@@ -3669,7 +3968,7 @@ mod tests {
         );
 
         reset(&control).await;
-        for statement in SCHEMA {
+        for statement in &SCHEMA[..9] {
             sqlx::raw_sql(*statement).execute(&control).await.unwrap();
         }
         sqlx::query("INSERT INTO artifact_scheduler_schema(id,version) VALUES(1,4)")
@@ -3700,7 +3999,7 @@ mod tests {
         for stage in ["marker_only", "base_only", "both_empty", "partial", "full"] {
             reset(&control).await;
             for (index, statement) in SCHEMA.iter().enumerate() {
-                if index != 6 && index != 7 {
+                if index < 6 || index == 8 {
                     sqlx::raw_sql(*statement).execute(&control).await.unwrap();
                 }
             }
@@ -3802,7 +4101,7 @@ mod tests {
         ] {
             reset(&control).await;
             for (index, statement) in SCHEMA.iter().enumerate() {
-                if ![5, 6, 7].contains(&index) {
+                if index < 5 || index == 8 {
                     sqlx::raw_sql(*statement).execute(&control).await.unwrap();
                 }
             }
