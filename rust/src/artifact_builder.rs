@@ -2,8 +2,8 @@
 //!
 //! A builder receives an already-pinned SHA. It never resolves a branch and it
 //! never publishes: every output is first stored in CAS, described by a typed
-//! manifest, and round-tripped through the production verifier. The returned
-//! evidence is therefore safe to hand to a scheduler's fenced `complete` call.
+//! manifest. Only the scheduler-owned pipeline may verify it, durably publish
+//! children/root, and perform the fenced Ready transition.
 
 use crate::archive::ArchiveBuilder;
 use crate::artifact_manifest::{
@@ -299,6 +299,7 @@ impl TypedArtifactBuilder {
                 Vec::new(),
                 parents.clone(),
                 desired,
+                &key.commit,
                 context,
                 scratch,
             )?);
@@ -317,10 +318,11 @@ impl TypedArtifactBuilder {
                 base_exclusive,
                 parents.clone(),
                 delta,
+                &key.commit,
                 context,
                 scratch,
             )?);
-            self.compact_history_levels(&mut levels, context, scratch)?;
+            self.compact_history_levels(&mut levels, &key.commit, context, scratch)?;
         }
 
         let mut pack_count = history_pack_count(&levels)?;
@@ -337,6 +339,7 @@ impl TypedArtifactBuilder {
                 Vec::new(),
                 parents.clone(),
                 self.bounded_history_range(&parents, &[], &context.cancelled)?,
+                &key.commit,
                 context,
                 scratch,
             )?];
@@ -362,6 +365,7 @@ impl TypedArtifactBuilder {
     fn compact_history_levels(
         &self,
         levels: &mut Vec<FullHistoryLevel>,
+        origin_commit: &str,
         context: &ExecutionContext,
         scratch: &Path,
     ) -> Result<()> {
@@ -389,6 +393,7 @@ impl TypedArtifactBuilder {
                     base_exclusive,
                     tips,
                     objects,
+                    origin_commit,
                     context,
                     scratch,
                 )?],
@@ -404,6 +409,7 @@ impl TypedArtifactBuilder {
         base_exclusive: Vec<String>,
         tips: Vec<String>,
         mut objects: Vec<String>,
+        origin_commit: &str,
         context: &ExecutionContext,
         scratch: &Path,
     ) -> Result<FullHistoryLevel> {
@@ -417,16 +423,20 @@ impl TypedArtifactBuilder {
         )
         .build_object_set_packs(&objects, self.history_pack_raw_bytes, false)
         .context("build exact sealed history level")?;
+        let packs = pack_pairs(packs);
+        let level_manifest = self.verifier.store_history_level_manifest(packs.clone())?;
         let mut level = FullHistoryLevel {
             tier,
             base_exclusive,
             tips,
-            packs: pack_pairs(packs),
+            level_manifest,
             proof: crate::artifact_manifest::FullHistoryLevelProof::unsealed(),
         };
         self.verifier.verify_and_seal_history_level(
             &mut level,
+            &packs,
             &objects,
+            origin_commit,
             &context.cancelled,
             scratch,
         )?;
@@ -684,19 +694,10 @@ fn pack_pairs(packs: Vec<(String, u64, String, u64)>) -> Vec<GitPackPair> {
         .collect()
 }
 
-fn pack_pair_bytes(packs: &[GitPackPair]) -> Result<u64> {
-    packs.iter().try_fold(0u64, |total, pair| {
-        total
-            .checked_add(pair.pack.len)
-            .and_then(|value| value.checked_add(pair.index.len))
-            .context("history descriptor byte overflow")
-    })
-}
-
 fn history_pack_count(levels: &[FullHistoryLevel]) -> Result<usize> {
     levels.iter().try_fold(0usize, |count, level| {
         count
-            .checked_add(level.packs.len())
+            .checked_add(usize::try_from(level.proof.pack_count)?)
             .context("history descriptor count overflow")
     })
 }
@@ -704,7 +705,7 @@ fn history_pack_count(levels: &[FullHistoryLevel]) -> Result<usize> {
 fn history_level_bytes(levels: &[FullHistoryLevel]) -> Result<u64> {
     levels.iter().try_fold(0u64, |total, level| {
         total
-            .checked_add(pack_pair_bytes(&level.packs)?)
+            .checked_add(level.proof.pack_bytes)
             .context("history descriptor byte overflow")
     })
 }
@@ -822,6 +823,7 @@ fn collect_tree_identities_bounded(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::artifact_manifest::{ReadyScrubCursor, scrub_ready_artifacts};
     use crate::artifact_scheduler::{
         ArtifactRecord, ArtifactScheduler, ArtifactState, CompletionVerifier, ExecutionOutcome,
     };
@@ -1019,6 +1021,301 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn ready_scrub_quarantines_alias_and_requeues_confirmed_corruption() {
+        let f = Fixture::new();
+        fs::create_dir_all(&f.scratch).unwrap();
+        let durable_root = f._root.path().join("scrub-durable");
+        let storage = crate::storage::local(&durable_root).unwrap();
+        let verifier = CasCompletionVerifier::with_limits_and_storage(
+            f.cas.clone(),
+            storage,
+            Default::default(),
+        )
+        .unwrap()
+        .with_proof_key(&[b's'; 32])
+        .unwrap();
+        let builder = TypedArtifactBuilder::with_verifier(&f.repo, f.cas.clone(), verifier.clone());
+        let database = f._root.path().join("scrub-scheduler.db");
+        let scheduler = ArtifactScheduler::open_with_verifier(
+            &database.to_string_lossy(),
+            Default::default(),
+            std::sync::Arc::new(verifier.clone()),
+        )
+        .await
+        .unwrap();
+        scheduler
+            .observe(
+                "ws",
+                "owner/repo",
+                "main",
+                &f.second,
+                &[ArtifactKind::FullHistory],
+                ARTIFACT_FORMAT_VERSION,
+                None,
+            )
+            .await
+            .unwrap();
+        let claim = scheduler.claim("worker", 5).await.unwrap().unwrap();
+        assert_eq!(
+            ArtifactSchedulerPersistence::run_owned_build(
+                &scheduler,
+                &claim,
+                "worker",
+                builder.clone().owned_build(claim.clone(), None),
+                5,
+                &f.scratch,
+            )
+            .await
+            .unwrap(),
+            ExecutionOutcome::Ready
+        );
+        let ready = scheduler.get(claim.record.id).await.unwrap().unwrap();
+        let manifest_hash = ready.manifest.clone().unwrap();
+        assert!(
+            scheduler
+                .published(
+                    "ws",
+                    "owner/repo",
+                    "main",
+                    ArtifactKind::FullHistory,
+                    ARTIFACT_FORMAT_VERSION,
+                )
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let durable_cas = Cas::new(&durable_root).unwrap();
+        let manifest: ArtifactManifest =
+            serde_json::from_slice(&durable_cas.get(&manifest_hash).unwrap()).unwrap();
+        let ArtifactPayload::FullHistory(history) = manifest.payload else {
+            panic!("wrong payload")
+        };
+        let corrupt_hash = verifier
+            .read_history_level_manifest(&history.levels[0])
+            .unwrap()
+            .packs[0]
+            .pack
+            .hash
+            .clone();
+        let corrupt_path = durable_cas.path(&corrupt_hash);
+        let mut corrupt = fs::read(&corrupt_path).unwrap();
+        corrupt[0] ^= 0xff;
+        fs::write(&corrupt_path, corrupt).unwrap();
+
+        let mut cursor = ReadyScrubCursor::default();
+        let budget_error = scrub_ready_artifacts(
+            &scheduler,
+            &verifier,
+            &mut cursor,
+            10,
+            100,
+            1,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{budget_error:#}").contains("exceeds per-run byte budget"));
+        assert_eq!(cursor.object_offset, 0);
+        let report = scrub_ready_artifacts(
+            &scheduler,
+            &verifier,
+            &mut cursor,
+            10,
+            100,
+            1024 * 1024 * 1024,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.jobs_quarantined, 1);
+        let quarantined = scheduler.get(claim.record.id).await.unwrap().unwrap();
+        assert_eq!(quarantined.state, ArtifactState::Queued);
+        assert!(quarantined.manifest.is_none());
+        assert!(
+            scheduler
+                .published(
+                    "ws",
+                    "owner/repo",
+                    "main",
+                    ArtifactKind::FullHistory,
+                    ARTIFACT_FORMAT_VERSION,
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(!durable_cas.path(&corrupt_hash).exists());
+
+        // Rebuild the same durable job id, then begin a partial scrub.
+        let retry = scheduler.claim("worker-2", 5).await.unwrap().unwrap();
+        assert_eq!(retry.record.id, claim.record.id);
+        assert_eq!(
+            ArtifactSchedulerPersistence::run_owned_build(
+                &scheduler,
+                &retry,
+                "worker-2",
+                builder.clone().owned_build(retry.clone(), None),
+                5,
+                &f.scratch,
+            )
+            .await
+            .unwrap(),
+            ExecutionOutcome::Ready
+        );
+        let rebuilt = scheduler.get(retry.record.id).await.unwrap().unwrap();
+        let rebuilt_manifest = rebuilt.manifest.clone().unwrap();
+        let cycle = scrub_ready_artifacts(
+            &scheduler,
+            &verifier,
+            &mut cursor,
+            10,
+            1,
+            1024 * 1024 * 1024,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(cycle.cycle_completed);
+        let partial = scrub_ready_artifacts(
+            &scheduler,
+            &verifier,
+            &mut cursor,
+            10,
+            1,
+            1024 * 1024 * 1024,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(partial.objects_verified, 1);
+        assert_eq!(cursor.object_offset, 1);
+        assert_eq!(
+            cursor.active_manifest.as_deref(),
+            Some(rebuilt_manifest.as_str())
+        );
+
+        // Change the immutable root while retaining the same scheduler id. A
+        // stale partial offset must reset instead of skipping the new graph.
+        assert!(
+            ArtifactSchedulerPersistence::quarantine_ready(
+                &scheduler,
+                retry.record.id,
+                &rebuilt_manifest,
+                "test rebuild with different physical level layout",
+            )
+            .await
+            .unwrap()
+        );
+        let replacement = scheduler.claim("worker-3", 5).await.unwrap().unwrap();
+        let different_builder = builder.clone().with_pack_targets(u64::MAX, 1);
+        assert_eq!(
+            ArtifactSchedulerPersistence::run_owned_build(
+                &scheduler,
+                &replacement,
+                "worker-3",
+                different_builder.owned_build(replacement.clone(), None),
+                5,
+                &f.scratch,
+            )
+            .await
+            .unwrap(),
+            ExecutionOutcome::Ready
+        );
+        let replacement_ready = scheduler.get(replacement.record.id).await.unwrap().unwrap();
+        let replacement_manifest = replacement_ready.manifest.clone().unwrap();
+        assert_ne!(replacement_manifest, rebuilt_manifest);
+        let resumed = scrub_ready_artifacts(
+            &scheduler,
+            &verifier,
+            &mut cursor,
+            10,
+            1,
+            1024 * 1024 * 1024,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resumed.objects_verified, 1);
+        assert_eq!(
+            cursor.object_offset, 1,
+            "changed manifest did not reset offset"
+        );
+        assert_eq!(
+            cursor.active_manifest.as_deref(),
+            Some(replacement_manifest.as_str())
+        );
+
+        // Complete this cycle, corrupt the replacement, cycle back to zero,
+        // and prove the same job id is inspected and quarantined again.
+        while cursor.after_id == 0 {
+            let report = scrub_ready_artifacts(
+                &scheduler,
+                &verifier,
+                &mut cursor,
+                10,
+                100,
+                1024 * 1024 * 1024,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            if report.cycle_completed {
+                break;
+            }
+        }
+        let replacement_root: ArtifactManifest =
+            serde_json::from_slice(&durable_cas.get(&replacement_manifest).unwrap()).unwrap();
+        let ArtifactPayload::FullHistory(replacement_history) = replacement_root.payload else {
+            panic!("wrong payload")
+        };
+        let replacement_level: crate::artifact_manifest::HistoryLevelManifest =
+            serde_json::from_slice(
+                &durable_cas
+                    .get(&replacement_history.levels[0].level_manifest.hash)
+                    .unwrap(),
+            )
+            .unwrap();
+        let corrupt_again = replacement_level.packs[0].pack.hash.clone();
+        let corrupt_again_path = durable_cas.path(&corrupt_again);
+        let mut bytes = fs::read(&corrupt_again_path).unwrap();
+        bytes[0] ^= 0xff;
+        fs::write(&corrupt_again_path, bytes).unwrap();
+        let reset = scrub_ready_artifacts(
+            &scheduler,
+            &verifier,
+            &mut cursor,
+            10,
+            100,
+            1024 * 1024 * 1024,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(reset.cycle_completed);
+        let second_quarantine = scrub_ready_artifacts(
+            &scheduler,
+            &verifier,
+            &mut cursor,
+            10,
+            100,
+            1024 * 1024 * 1024,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(second_quarantine.jobs_quarantined, 1);
+        assert_eq!(
+            scheduler
+                .get(replacement.record.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            ArtifactState::Queued
+        );
+    }
+
     #[test]
     fn root_history_is_anchor_only() {
         let f = Fixture::new();
@@ -1040,8 +1337,10 @@ mod tests {
     #[test]
     fn preallocation_limits_reject_object_count_and_blob_size() {
         let f = Fixture::new();
-        let mut count_limits = ArtifactBuildLimits::default();
-        count_limits.git_objects = 1;
+        let count_limits = ArtifactBuildLimits {
+            git_objects: 1,
+            ..Default::default()
+        };
         let head = f.claim(&f.second, ArtifactKind::Head);
         assert!(
             f.builder()
@@ -1053,8 +1352,10 @@ mod tests {
                 .contains("object count")
         );
 
-        let mut size_limits = ArtifactBuildLimits::default();
-        size_limits.object_bytes = 1024;
+        let size_limits = ArtifactBuildLimits {
+            object_bytes: 1024,
+            ..Default::default()
+        };
         let files = f.claim(&f.second, ArtifactKind::Files);
         assert!(
             f.builder()
@@ -1070,8 +1371,10 @@ mod tests {
     #[test]
     fn history_threshold_compacts_to_bounded_exact_pack_set() {
         let f = Fixture::new();
-        let mut limits = ArtifactBuildLimits::default();
-        limits.history_packs = 1;
+        let limits = ArtifactBuildLimits {
+            history_packs: 1,
+            ..Default::default()
+        };
         let builder = TypedArtifactBuilder::new(&f.repo, f.cas.clone())
             .with_pack_targets(u64::MAX, u64::MAX)
             .with_limits(limits)
@@ -1091,7 +1394,7 @@ mod tests {
             panic!("wrong payload")
         };
         assert_eq!(base_payload.levels.len(), 1);
-        assert_eq!(base_payload.levels[0].packs.len(), 1);
+        assert_eq!(base_payload.levels[0].proof.pack_count, 1);
 
         fs::write(f.repo.join("third"), b"third\n").unwrap();
         run(&f.repo, &["add", "third"]);
@@ -1119,8 +1422,11 @@ mod tests {
             panic!("wrong payload")
         };
         assert_eq!(payload.levels.len(), 1);
-        assert_eq!(payload.levels[0].packs.len(), 1);
-        assert_ne!(payload.levels[0].packs, base_payload.levels[0].packs);
+        assert_eq!(payload.levels[0].proof.pack_count, 1);
+        assert_ne!(
+            payload.levels[0].level_manifest,
+            base_payload.levels[0].level_manifest
+        );
     }
 
     #[test]
@@ -1166,8 +1472,162 @@ mod tests {
         let ArtifactPayload::FullHistory(payload) = manifest.payload else {
             panic!("wrong payload")
         };
-        for old in &base_payload.levels[0].packs {
-            assert!(payload.levels[0].packs.contains(old));
+        assert_eq!(
+            payload.levels[0].level_manifest,
+            base_payload.levels[0].level_manifest
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_worker_reuses_durable_history_without_hydrating_untouched_levels() {
+        let f = Fixture::new();
+        let durable = crate::storage::local(f._root.path().join("durable")).unwrap();
+        let proof_key = [b'd'; 32];
+        let verifier = CasCompletionVerifier::with_limits_and_storage(
+            f.cas.clone(),
+            durable.clone(),
+            Default::default(),
+        )
+        .unwrap()
+        .with_proof_key(&proof_key)
+        .unwrap();
+        let builder = TypedArtifactBuilder::with_verifier(&f.repo, f.cas.clone(), verifier.clone())
+            .with_pack_targets(u64::MAX, 1);
+        let base_claim = f.claim(&f.second, ArtifactKind::FullHistory);
+        let base_evidence = builder
+            .build_claim(&base_claim, &f.context(), None)
+            .unwrap();
+        verifier.verify(&base_claim, &base_evidence).unwrap();
+        verifier
+            .publish_owned(&base_claim, &base_evidence, &f.context())
+            .await
+            .unwrap();
+        let base_manifest = verifier
+            .verify_manifest(
+                &base_claim.record.key,
+                base_evidence.manifest(),
+                base_evidence.artifact_count(),
+            )
+            .unwrap();
+        let ArtifactPayload::FullHistory(base_history) = base_manifest.payload else {
+            panic!("wrong payload")
+        };
+        let base_packs = verifier
+            .read_history_level_manifest(&base_history.levels[0])
+            .unwrap()
+            .packs;
+        assert!(base_packs.len() > 1, "test requires many physical packs");
+        let baseline_hashes = base_packs
+            .iter()
+            .flat_map(|pair| [pair.pack.hash.clone(), pair.index.hash.clone()])
+            .chain(std::iter::once(
+                base_history.levels[0].level_manifest.hash.clone(),
+            ))
+            .collect::<HashSet<_>>();
+        let _ = verifier.take_publication_uploads();
+        let _ = verifier.take_receipt_reuse_probes();
+
+        // The warm worker still has every old pack locally. Publication must
+        // nevertheless trust the prior level receipt and upload/hash only the
+        // new tail, its nested level manifest, anchor, and root.
+        fs::write(f.repo.join("warm-tail"), b"warm\n").unwrap();
+        run(&f.repo, &["add", "."]);
+        run(&f.repo, &["commit", "--quiet", "-m", "warm tail"]);
+        let warm_target = run(&f.repo, &["rev-parse", "HEAD"]);
+        let warm_claim = f.claim(&warm_target, ArtifactKind::FullHistory);
+        let warm_evidence = builder
+            .build_claim(
+                &warm_claim,
+                &f.context(),
+                Some(&HistoryReuseBase {
+                    key: base_claim.record.key,
+                    evidence: base_evidence,
+                }),
+            )
+            .unwrap();
+        verifier.verify(&warm_claim, &warm_evidence).unwrap();
+        verifier
+            .publish_owned(&warm_claim, &warm_evidence, &f.context())
+            .await
+            .unwrap();
+        let warm_uploads = verifier.take_publication_uploads();
+        assert_eq!(
+            verifier.take_receipt_reuse_probes(),
+            1,
+            "warm reuse performed per-pack durable probes instead of one level probe"
+        );
+        assert!(
+            warm_uploads
+                .iter()
+                .all(|hash| !baseline_hashes.contains(hash)),
+            "warm incremental publication touched an old physical pack"
+        );
+        let warm_manifest = verifier
+            .verify_manifest(
+                &warm_claim.record.key,
+                warm_evidence.manifest(),
+                warm_evidence.artifact_count(),
+            )
+            .unwrap();
+        let ArtifactPayload::FullHistory(warm_history) = warm_manifest.payload else {
+            panic!("wrong payload")
+        };
+        assert_eq!(
+            warm_history.levels[0].level_manifest,
+            base_history.levels[0].level_manifest
+        );
+
+        fs::write(f.repo.join("remote-tail"), b"tail\n").unwrap();
+        run(&f.repo, &["add", "."]);
+        run(&f.repo, &["commit", "--quiet", "-m", "remote tail"]);
+        let target = run(&f.repo, &["rev-parse", "HEAD"]);
+        let fresh_cas = Cas::new(f._root.path().join("fresh-worker-cas")).unwrap();
+        for level in &warm_history.levels {
+            let packs = verifier.read_history_level_manifest(level).unwrap().packs;
+            for pair in &packs {
+                assert!(!fresh_cas.path(&pair.pack.hash).exists());
+                assert!(!fresh_cas.path(&pair.index.hash).exists());
+            }
+        }
+        let fresh_verifier = CasCompletionVerifier::with_limits_and_storage(
+            fresh_cas.clone(),
+            durable,
+            Default::default(),
+        )
+        .unwrap()
+        .with_proof_key(&proof_key)
+        .unwrap();
+        let fresh_builder =
+            TypedArtifactBuilder::with_verifier(&f.repo, fresh_cas.clone(), fresh_verifier.clone());
+        let claim = f.claim(&target, ArtifactKind::FullHistory);
+        let evidence = fresh_builder
+            .build_claim(
+                &claim,
+                &f.context(),
+                Some(&HistoryReuseBase {
+                    key: warm_claim.record.key,
+                    evidence: warm_evidence,
+                }),
+            )
+            .unwrap();
+        fresh_verifier.verify(&claim, &evidence).unwrap();
+        let manifest = fresh_verifier
+            .verify_manifest(
+                &claim.record.key,
+                evidence.manifest(),
+                evidence.artifact_count(),
+            )
+            .unwrap();
+        let ArtifactPayload::FullHistory(history) = manifest.payload else {
+            panic!("wrong payload")
+        };
+        assert_eq!(history.levels[0], warm_history.levels[0]);
+        for pair in &base_packs {
+            assert!(
+                !fresh_cas.path(&pair.pack.hash).exists()
+                    && !fresh_cas.path(&pair.index.hash).exists(),
+                "routine reuse hydrated an untouched durable level"
+            );
         }
     }
 
@@ -1197,7 +1657,7 @@ mod tests {
                 panic!("wrong payload")
             };
             assert_eq!(payload.levels.len(), 1);
-            assert!(payload.levels[0].packs.len() > 1);
+            assert!(payload.levels[0].proof.pack_count > 1);
             payload.levels[0].clone()
         };
 

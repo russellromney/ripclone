@@ -10,6 +10,7 @@ use crate::artifact_scheduler::{
 };
 use crate::cas::Cas;
 use crate::manifest::MetadataChunk;
+use crate::storage::StorageRef;
 use anyhow::{Context, Result, bail};
 use hmac::{Hmac, KeyInit, Mac};
 use prost::Message;
@@ -283,17 +284,31 @@ pub struct FullHistoryLevel {
     pub tier: u32,
     pub base_exclusive: Vec<String>,
     pub tips: Vec<String>,
-    pub packs: Vec<GitPackPair>,
-    /// Verifier-authenticated proof that `packs` contain exactly this level's
-    /// semantic object set. Reuse validates this small receipt and immutable CAS
-    /// descriptors instead of rescanning old pack bytes.
+    /// One immutable small manifest owns all physical pack descriptors. The
+    /// top-level artifact stays O(log history) even when a level has many packs.
+    pub level_manifest: CasBlob,
+    /// Verifier-authenticated proof that the nested manifest's packs contain
+    /// exactly this level's semantic object set.
     pub proof: FullHistoryLevelProof,
+}
+
+pub const HISTORY_LEVEL_MANIFEST_SCHEMA: u32 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HistoryLevelManifest {
+    pub schema_version: u32,
+    pub packs: Vec<GitPackPair>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FullHistoryLevelProof {
     pub verifier: String,
+    /// Artifact commit that first created or compacted this immutable level.
+    pub origin_commit: String,
+    pub pack_count: u64,
+    pub pack_bytes: u64,
     pub object_count: u64,
     pub object_set_digest: String,
     pub seal: String,
@@ -303,6 +318,9 @@ impl FullHistoryLevelProof {
     pub(crate) fn unsealed() -> Self {
         Self {
             verifier: String::new(),
+            origin_commit: String::new(),
+            pack_count: 0,
+            pack_bytes: 0,
             object_count: 0,
             object_set_digest: String::new(),
             seal: String::new(),
@@ -316,7 +334,10 @@ struct HistoryLevelSealPayload<'a> {
     tier: u32,
     base_exclusive: &'a [String],
     tips: &'a [String],
-    packs: &'a [GitPackPair],
+    level_manifest: &'a CasBlob,
+    origin_commit: &'a str,
+    pack_count: u64,
+    pack_bytes: u64,
     object_count: u64,
     object_set_digest: &'a str,
 }
@@ -371,7 +392,7 @@ impl ArtifactPayload {
                 history
                     .levels
                     .iter()
-                    .map(|level| level.packs.len() as u64 * 2)
+                    .map(|level| level.proof.pack_count.saturating_mul(2) + 1)
                     .sum::<u64>()
                     + 1
             }
@@ -455,6 +476,262 @@ impl ArtifactManifest {
         }
         Ok(())
     }
+
+    fn publication_children(&self) -> (Vec<CasBlob>, HashSet<String>) {
+        let mut children = Vec::new();
+        let mut receipt_backed = HashSet::new();
+        match &self.payload {
+            ArtifactPayload::Head(head) => {
+                for pair in &head.packs {
+                    children.extend([pair.pack.clone(), pair.index.clone()]);
+                }
+                children.push(head.prebuilt_index.clone());
+            }
+            ArtifactPayload::FullHistory(history) => {
+                children.push(history.target_commit_object.clone());
+                for level in &history.levels {
+                    children.push(level.level_manifest.clone());
+                    if level.proof.origin_commit != self.key.commit {
+                        receipt_backed.insert(level.level_manifest.hash.clone());
+                    }
+                }
+            }
+            ArtifactPayload::Files(files) => {
+                children.push(files.target_commit_object.clone());
+                children.push(files.metadata.clone());
+                children.extend(files.archive_chunks.iter().cloned());
+                children.extend(files.zstd_dictionary.iter().cloned());
+            }
+        }
+        (children, receipt_backed)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StorageScrubReport {
+    pub objects: u64,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadyScrubCursor {
+    /// Highest Ready job fully checked or quarantined.
+    pub after_id: i64,
+    /// Next descriptor within the first Ready job after `after_id`.
+    pub object_offset: usize,
+    /// Binds a partial descriptor offset to one immutable Ready publication.
+    pub active_artifact_id: Option<i64>,
+    pub active_manifest: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReadyScrubReport {
+    pub jobs_completed: u64,
+    /// Small control-plane root manifests reread to resume descriptor cursors.
+    pub manifest_bytes_read: u64,
+    pub objects_verified: u64,
+    pub bytes_verified: u64,
+    pub jobs_quarantined: u64,
+    pub cycle_completed: bool,
+}
+
+/// Restartable backend-neutral Ready-artifact scrub. The caller persists the
+/// small cursor (for example in the maintenance loop's metadata store) and can
+/// bound each invocation by jobs, objects, and bytes. Confirmed corruption
+/// atomically clears published aliases and requeues the immutable artifact key.
+pub async fn scrub_ready_artifacts<
+    P: crate::artifact_scheduler_backend::ArtifactSchedulerPersistence + ?Sized,
+>(
+    scheduler: &P,
+    verifier: &CasCompletionVerifier,
+    cursor: &mut ReadyScrubCursor,
+    page_jobs: usize,
+    max_objects: usize,
+    max_bytes: u64,
+    cancelled: &tokio_util::sync::CancellationToken,
+) -> Result<ReadyScrubReport> {
+    if cursor.after_id < 0
+        || page_jobs == 0
+        || max_objects == 0
+        || max_bytes == 0
+        || page_jobs > 1000
+    {
+        bail!("invalid Ready scrub bounds or cursor");
+    }
+    let records = scheduler.ready_page(cursor.after_id, page_jobs).await?;
+    let mut report = ReadyScrubReport::default();
+    if records.is_empty() {
+        cursor.after_id = 0;
+        cursor.object_offset = 0;
+        cursor.active_artifact_id = None;
+        cursor.active_manifest = None;
+        report.cycle_completed = true;
+        return Ok(report);
+    }
+    'records: for record in records {
+        if cancelled.is_cancelled() {
+            bail!("Ready artifact scrub cancelled");
+        }
+        let manifest_hash = record
+            .manifest
+            .as_deref()
+            .context("Ready scrub record has no manifest")?;
+        if cursor.object_offset > 0
+            && (cursor.active_artifact_id != Some(record.id)
+                || cursor.active_manifest.as_deref() != Some(manifest_hash))
+        {
+            cursor.object_offset = 0;
+        }
+        cursor.active_artifact_id = Some(record.id);
+        cursor.active_manifest = Some(manifest_hash.to_owned());
+        let root_len = verifier
+            .storage
+            .size(manifest_hash)
+            .context("stat Ready scrub root")?;
+        if root_len > verifier.limits.manifest_bytes {
+            let changed = scheduler
+                .quarantine_ready(record.id, manifest_hash, "manifest exceeds verifier limit")
+                .await?;
+            if changed {
+                report.jobs_quarantined += 1;
+            }
+            cursor.after_id = record.id;
+            cursor.object_offset = 0;
+            cursor.active_artifact_id = None;
+            cursor.active_manifest = None;
+            continue;
+        }
+        let mut root_output = BoundedWriter::new(Vec::new(), verifier.limits.manifest_bytes);
+        if let Err(error) = verifier.copy_storage_hash_bounded(
+            manifest_hash,
+            verifier.limits.manifest_bytes,
+            "Ready scrub root",
+            &mut root_output,
+        ) {
+            if format!("{error:#}").contains("object quarantined") {
+                let changed = scheduler
+                    .quarantine_ready(record.id, manifest_hash, &format!("{error:#}"))
+                    .await?;
+                if changed {
+                    report.jobs_quarantined += 1;
+                }
+                cursor.after_id = record.id;
+                cursor.object_offset = 0;
+                cursor.active_artifact_id = None;
+                cursor.active_manifest = None;
+                continue;
+            }
+            return Err(error);
+        }
+        let bytes = root_output.into_inner();
+        report.manifest_bytes_read = report
+            .manifest_bytes_read
+            .checked_add(root_len)
+            .context("Ready scrub manifest byte metric overflow")?;
+        let manifest: ArtifactManifest =
+            serde_json::from_slice(&bytes).context("decode Ready scrub manifest")?;
+        if manifest.validate_envelope().is_err() || !manifest.key.matches(&record.key) {
+            let changed = scheduler
+                .quarantine_ready(record.id, manifest_hash, "manifest/key envelope mismatch")
+                .await?;
+            if changed {
+                report.jobs_quarantined += 1;
+            }
+            cursor.after_id = record.id;
+            cursor.object_offset = 0;
+            cursor.active_artifact_id = None;
+            cursor.active_manifest = None;
+            continue;
+        }
+        let (mut objects, _) = manifest.publication_children();
+        if let ArtifactPayload::FullHistory(history) = &manifest.payload {
+            let level_refs = history
+                .levels
+                .iter()
+                .map(|level| level.level_manifest.hash.as_str())
+                .collect::<HashSet<_>>();
+            objects.retain(|blob| !level_refs.contains(blob.hash.as_str()));
+            for level in &history.levels {
+                match verifier.read_durable_history_level_manifest(level) {
+                    Ok(nested) => {
+                        report.manifest_bytes_read = report
+                            .manifest_bytes_read
+                            .checked_add(level.level_manifest.len)
+                            .context("Ready scrub level-manifest metric overflow")?;
+                        for pair in nested.packs {
+                            objects.extend([pair.pack, pair.index]);
+                        }
+                    }
+                    Err(error) if format!("{error:#}").contains("object quarantined") => {
+                        let changed = scheduler
+                            .quarantine_ready(record.id, manifest_hash, &format!("{error:#}"))
+                            .await?;
+                        if changed {
+                            report.jobs_quarantined += 1;
+                        }
+                        cursor.after_id = record.id;
+                        cursor.object_offset = 0;
+                        cursor.active_artifact_id = None;
+                        cursor.active_manifest = None;
+                        continue 'records;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        objects.sort_by(|left, right| left.hash.cmp(&right.hash));
+        objects.dedup_by(|left, right| left.hash == right.hash && left.len == right.len);
+        if cursor.object_offset > objects.len() {
+            bail!("Ready scrub cursor exceeds descriptor count");
+        }
+        let mut quarantined = false;
+        for (offset, blob) in objects.iter().enumerate().skip(cursor.object_offset) {
+            if report.objects_verified == 0 && blob.len > max_bytes {
+                bail!(
+                    "Ready scrub object {} bytes exceeds per-run byte budget {}",
+                    blob.len,
+                    max_bytes
+                );
+            }
+            if report.objects_verified as usize == max_objects
+                || report.bytes_verified.saturating_add(blob.len) > max_bytes
+            {
+                cursor.object_offset = offset;
+                return Ok(report);
+            }
+            match verifier.scrub_durable_objects(
+                std::slice::from_ref(blob),
+                1,
+                blob.len.max(1),
+                cancelled,
+            ) {
+                Ok(scrubbed) => {
+                    report.objects_verified += scrubbed.objects;
+                    report.bytes_verified += scrubbed.bytes;
+                    cursor.object_offset = offset + 1;
+                }
+                Err(error) if format!("{error:#}").contains("object quarantined") => {
+                    let changed = scheduler
+                        .quarantine_ready(record.id, manifest_hash, &format!("{error:#}"))
+                        .await?;
+                    if changed {
+                        report.jobs_quarantined += 1;
+                    }
+                    quarantined = true;
+                    break;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        cursor.after_id = record.id;
+        cursor.object_offset = 0;
+        cursor.active_artifact_id = None;
+        cursor.active_manifest = None;
+        if !quarantined {
+            report.jobs_completed += 1;
+        }
+    }
+    Ok(report)
 }
 
 fn semantic_digest(schema: u32, key: &ManifestKey, payload: &ArtifactPayload) -> Result<String> {
@@ -512,6 +789,7 @@ impl<W: Write> Write for BoundedWriter<W> {
 #[derive(Clone)]
 pub struct CasCompletionVerifier {
     cas: Cas,
+    storage: StorageRef,
     limits: ArtifactVerificationLimits,
     identity: String,
     proof_key: Option<std::sync::Arc<Vec<u8>>>,
@@ -519,15 +797,22 @@ pub struct CasCompletionVerifier {
     #[cfg(test)]
     owned_verify_calls: std::sync::Arc<std::sync::atomic::AtomicU64>,
     #[cfg(test)]
+    publication_uploads: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    #[cfg(test)]
+    receipt_reuse_probes: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    #[cfg(test)]
     level_scanned_hashes: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl CasCompletionVerifier {
     pub fn new(cas: Cas) -> Self {
+        let storage = crate::storage::local(cas.root())
+            .expect("a validated CAS root must construct local durable storage");
         let limits = ArtifactVerificationLimits::default();
         let proof_key = configured_proof_key();
         Self {
             cas,
+            storage,
             identity: verifier_identity(&limits, proof_key.as_deref().map(Vec::as_slice)),
             limits,
             proof_key,
@@ -535,36 +820,58 @@ impl CasCompletionVerifier {
             #[cfg(test)]
             owned_verify_calls: Default::default(),
             #[cfg(test)]
+            publication_uploads: Default::default(),
+            #[cfg(test)]
+            receipt_reuse_probes: Default::default(),
+            #[cfg(test)]
             level_scanned_hashes: Default::default(),
         }
     }
 
     /// Production constructor: normalized scheduling must fail readiness when
     /// the dedicated proof authority is absent or too short.
-    pub fn from_env(cas: Cas) -> Result<Self> {
-        Self::from_env_with_limits(cas, ArtifactVerificationLimits::default())
+    pub fn from_env(cas: Cas, storage: StorageRef) -> Result<Self> {
+        Self::from_env_with_limits(cas, storage, ArtifactVerificationLimits::default())
     }
 
-    pub fn from_env_with_limits(cas: Cas, limits: ArtifactVerificationLimits) -> Result<Self> {
+    pub fn from_env_with_limits(
+        cas: Cas,
+        storage: StorageRef,
+        limits: ArtifactVerificationLimits,
+    ) -> Result<Self> {
         let key = std::env::var("RIPCLONE_ARTIFACT_PROOF_KEY")
             .context("RIPCLONE_ARTIFACT_PROOF_KEY must be set for normalized artifacts")?;
-        Self::with_limits(cas, limits)?
+        Self::with_limits_and_storage(cas, storage, limits)?
             .with_proof_key(key.as_bytes())
             .context("RIPCLONE_ARTIFACT_PROOF_KEY must contain at least 32 bytes")
     }
 
     pub fn with_limits(cas: Cas, limits: ArtifactVerificationLimits) -> Result<Self> {
+        let storage = crate::storage::local(cas.root())?;
+        Self::with_limits_and_storage(cas, storage, limits)
+    }
+
+    pub fn with_limits_and_storage(
+        cas: Cas,
+        storage: StorageRef,
+        limits: ArtifactVerificationLimits,
+    ) -> Result<Self> {
         limits.validate()?;
         let proof_key = configured_proof_key();
         let identity = verifier_identity(&limits, proof_key.as_deref().map(Vec::as_slice));
         Ok(Self {
             cas,
+            storage,
             limits,
             identity,
             proof_key,
             level_scan_bytes: Default::default(),
             #[cfg(test)]
             owned_verify_calls: Default::default(),
+            #[cfg(test)]
+            publication_uploads: Default::default(),
+            #[cfg(test)]
+            receipt_reuse_probes: Default::default(),
             #[cfg(test)]
             level_scanned_hashes: Default::default(),
         })
@@ -596,13 +903,26 @@ impl CasCompletionVerifier {
             .swap(0, std::sync::atomic::Ordering::Relaxed)
     }
 
+    #[cfg(test)]
+    pub(crate) fn take_publication_uploads(&self) -> Vec<String> {
+        std::mem::take(&mut *self.publication_uploads.lock().unwrap())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_receipt_reuse_probes(&self) -> u64 {
+        self.receipt_reuse_probes
+            .swap(0, std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Verify one freshly built/compacted level exactly once and attach a
     /// durable authenticated receipt. Future syncs validate the receipt and CAS
     /// descriptors in O(level-count), without rereading untouched pack bytes.
     pub(crate) fn verify_and_seal_history_level(
         &self,
         level: &mut FullHistoryLevel,
+        packs: &[GitPackPair],
         expected_objects: &[String],
+        origin_commit: &str,
         cancelled: &tokio_util::sync::CancellationToken,
         scratch: &Path,
     ) -> Result<()> {
@@ -621,8 +941,9 @@ impl CasCompletionVerifier {
             token: previous,
             scratch: previous_scratch,
         };
-        let repo = self.materialize_packs(&level.packs)?;
-        let scanned = level.packs.iter().try_fold(0u64, |total, pair| {
+        Cas::validate_object_id(origin_commit)?;
+        let repo = self.materialize_packs(packs)?;
+        let scanned = packs.iter().try_fold(0u64, |total, pair| {
             total
                 .checked_add(pair.pack.len)
                 .and_then(|value| value.checked_add(pair.index.len))
@@ -632,8 +953,7 @@ impl CasCompletionVerifier {
             .fetch_add(scanned, std::sync::atomic::Ordering::Relaxed);
         #[cfg(test)]
         self.level_scanned_hashes.lock().unwrap().extend(
-            level
-                .packs
+            packs
                 .iter()
                 .flat_map(|pair| [pair.pack.hash.clone(), pair.index.hash.clone()]),
         );
@@ -648,15 +968,27 @@ impl CasCompletionVerifier {
         }
         let object_set_digest = object_set_digest(&expected);
         let verifier = self.identity.clone();
+        let pack_bytes = packs.iter().try_fold(0u64, |total, pair| {
+            total
+                .checked_add(pair.pack.len)
+                .and_then(|value| value.checked_add(pair.index.len))
+                .context("history level pack byte overflow")
+        })?;
         let seal = history_level_seal(
             key,
             &verifier,
             level,
             expected.len() as u64,
             &object_set_digest,
+            origin_commit,
+            packs.len() as u64,
+            pack_bytes,
         )?;
         level.proof = FullHistoryLevelProof {
             verifier,
+            origin_commit: origin_commit.to_owned(),
+            pack_count: packs.len() as u64,
+            pack_bytes,
             object_count: expected.len() as u64,
             object_set_digest,
             seal,
@@ -664,16 +996,88 @@ impl CasCompletionVerifier {
         Ok(())
     }
 
+    pub(crate) fn store_history_level_manifest(&self, packs: Vec<GitPackPair>) -> Result<CasBlob> {
+        if packs.is_empty() {
+            bail!("history level manifest cannot be empty");
+        }
+        let bytes = serde_json::to_vec(&HistoryLevelManifest {
+            schema_version: HISTORY_LEVEL_MANIFEST_SCHEMA,
+            packs,
+        })?;
+        let hash = self.cas.put(&bytes)?;
+        Ok(CasBlob {
+            hash,
+            len: bytes.len() as u64,
+        })
+    }
+
+    pub(crate) fn read_history_level_manifest(
+        &self,
+        level: &FullHistoryLevel,
+    ) -> Result<HistoryLevelManifest> {
+        let bytes = self.read_small_blob(
+            &level.level_manifest,
+            self.limits.manifest_bytes,
+            "history level manifest",
+        )?;
+        self.decode_history_level_manifest(level, &bytes)
+    }
+
+    fn read_durable_history_level_manifest(
+        &self,
+        level: &FullHistoryLevel,
+    ) -> Result<HistoryLevelManifest> {
+        let mut output = BoundedWriter::new(Vec::new(), self.limits.manifest_bytes);
+        let actual = self.copy_storage_hash_bounded(
+            &level.level_manifest.hash,
+            self.limits.manifest_bytes,
+            "durable history level manifest",
+            &mut output,
+        )?;
+        if actual != level.level_manifest.len {
+            bail!("durable history level manifest length mismatch");
+        }
+        self.decode_history_level_manifest(level, &output.into_inner())
+    }
+
+    fn decode_history_level_manifest(
+        &self,
+        level: &FullHistoryLevel,
+        bytes: &[u8],
+    ) -> Result<HistoryLevelManifest> {
+        let manifest: HistoryLevelManifest =
+            serde_json::from_slice(bytes).context("decode history level manifest")?;
+        if serde_json::to_vec(&manifest)? != bytes
+            || manifest.schema_version != HISTORY_LEVEL_MANIFEST_SCHEMA
+            || manifest.packs.len() as u64 != level.proof.pack_count
+        {
+            bail!("history level manifest envelope mismatch");
+        }
+        let bytes = manifest.packs.iter().try_fold(0u64, |total, pair| {
+            total
+                .checked_add(pair.pack.len)
+                .and_then(|value| value.checked_add(pair.index.len))
+                .context("history level pack byte overflow")
+        })?;
+        if bytes != level.proof.pack_bytes {
+            bail!("history level manifest byte count mismatch");
+        }
+        Ok(manifest)
+    }
+
     fn verify_history_level_receipt(&self, level: &FullHistoryLevel) -> Result<()> {
-        // This O(levels) path relies on immutable content addressing after the
-        // initial exact scan. Downloaders still hash every CAS object, and an
-        // independent storage scrub must quarantine same-length at-rest damage;
-        // routine sync never trades back to O(total-history) rescans.
+        // This O(levels) path relies on an authenticated receipt created only
+        // after remote bytes were hashed. Routine sync checks durable descriptor
+        // presence/length; bounded scrub and every actual remote read hash bytes
+        // and quarantine corruption without restoring O(total-history) syncs.
         let key = self
             .proof_key
             .as_ref()
             .context("artifact proof key is required to verify history receipt")?;
         if level.proof.verifier != self.identity
+            || Cas::validate_object_id(&level.proof.origin_commit).is_err()
+            || level.proof.pack_count == 0
+            || level.proof.pack_bytes == 0
             || level.proof.object_count == 0
             || !is_sha256(&level.proof.object_set_digest)
             || !is_sha256(&level.proof.seal)
@@ -686,20 +1090,16 @@ impl CasCompletionVerifier {
             level,
             level.proof.object_count,
             &level.proof.object_set_digest,
+            &level.proof.origin_commit,
+            level.proof.pack_count,
+            level.proof.pack_bytes,
         )?;
         if !constant_time_eq(expected.as_bytes(), level.proof.seal.as_bytes()) {
             bail!("history level proof authentication failed");
         }
-        for pair in &level.packs {
-            for (role, blob) in [("pack", &pair.pack), ("index", &pair.index)] {
-                Cas::validate_artifact_id(&blob.hash)?;
-                let actual = std::fs::metadata(self.cas.path(&blob.hash))
-                    .with_context(|| format!("stat proved history {role}"))?
-                    .len();
-                if actual != blob.len {
-                    bail!("proved history {role} length mismatch");
-                }
-            }
+        Cas::validate_artifact_id(&level.level_manifest.hash)?;
+        if level.level_manifest.len == 0 || level.level_manifest.len > self.limits.manifest_bytes {
+            bail!("history level manifest descriptor is invalid");
         }
         Ok(())
     }
@@ -785,13 +1185,365 @@ impl CasCompletionVerifier {
         result
     }
 
+    fn verify_durable_blob_cancelled(
+        &self,
+        blob: &CasBlob,
+        role: &str,
+        cancelled: &tokio_util::sync::CancellationToken,
+    ) -> Result<()> {
+        if cancelled.is_cancelled() {
+            bail!("artifact durability verification cancelled");
+        }
+        let previous =
+            VERIFICATION_CANCEL.with(|slot| slot.borrow_mut().replace(cancelled.clone()));
+        let previous_scratch = VERIFICATION_SCRATCH.with(|slot| slot.borrow().clone());
+        let _guard = VerificationCancelGuard {
+            token: previous,
+            scratch: previous_scratch,
+        };
+        let mut sink = std::io::sink();
+        let actual = self.copy_storage_hash_bounded(&blob.hash, blob.len, role, &mut sink)?;
+        if actual != blob.len {
+            let quarantined = self.confirm_and_quarantine_remote(&blob.hash, blob.len);
+            bail!(
+                "durable {role} length mismatch{}",
+                if quarantined {
+                    "; object quarantined"
+                } else {
+                    ""
+                }
+            );
+        }
+        Ok(())
+    }
+
+    /// Bounded operator/storage-maintenance scrub. Routine history reuse stays
+    /// O(level-count); callers choose an object/byte budget and advance their
+    /// own cursor across invocations. Every byte read here is SHA-256 verified,
+    /// and a same-length mismatch is deleted from durable storage and cache.
+    pub fn scrub_durable_objects(
+        &self,
+        objects: &[CasBlob],
+        max_objects: usize,
+        max_bytes: u64,
+        cancelled: &tokio_util::sync::CancellationToken,
+    ) -> Result<StorageScrubReport> {
+        if max_objects == 0 || max_bytes == 0 {
+            bail!("storage scrub budgets must be nonzero");
+        }
+        let mut report = StorageScrubReport {
+            objects: 0,
+            bytes: 0,
+        };
+        let mut seen = HashSet::new();
+        for blob in objects {
+            if !seen.insert(blob.hash.as_str()) {
+                continue;
+            }
+            if report.objects as usize == max_objects {
+                break;
+            }
+            let next = report
+                .bytes
+                .checked_add(blob.len)
+                .context("storage scrub byte budget overflow")?;
+            if next > max_bytes {
+                break;
+            }
+            self.verify_durable_blob_cancelled(blob, "scrub object", cancelled)?;
+            report.objects += 1;
+            report.bytes = next;
+        }
+        Ok(report)
+    }
+
+    async fn publish_verified_owned(
+        &self,
+        claim: &ClaimedArtifact,
+        evidence: &CompletionEvidence,
+        context: &crate::artifact_scheduler::ExecutionContext,
+    ) -> Result<()> {
+        if evidence.key() != &claim.record.key || context.cancelled.is_cancelled() {
+            bail!("invalid or cancelled durable artifact publication");
+        }
+        let root_bytes = self
+            .cas
+            .get(evidence.manifest())
+            .context("read verified local root manifest for publication")?;
+        let manifest: ArtifactManifest =
+            serde_json::from_slice(&root_bytes).context("decode publication root manifest")?;
+        manifest.validate_envelope()?;
+        if !manifest.key.matches(evidence.key())
+            || manifest.payload.artifact_count() != evidence.artifact_count()
+        {
+            bail!("publication root does not match verified evidence");
+        }
+        let (mut children, receipt_backed) = manifest.publication_children();
+        let mut new_level_manifests = Vec::new();
+        if let ArtifactPayload::FullHistory(history) = &manifest.payload {
+            for level in &history.levels {
+                if level.proof.origin_commit == manifest.key.commit {
+                    let nested = self.read_history_level_manifest(level)?;
+                    for pair in nested.packs {
+                        children.extend([pair.pack, pair.index]);
+                    }
+                    new_level_manifests.push(level.level_manifest.clone());
+                }
+            }
+        }
+        let new_level_hashes = new_level_manifests
+            .iter()
+            .map(|blob| blob.hash.as_str())
+            .collect::<HashSet<_>>();
+        children.retain(|blob| !new_level_hashes.contains(blob.hash.as_str()));
+        let mut unique = std::collections::BTreeMap::<String, u64>::new();
+        for child in children {
+            match unique.insert(child.hash.clone(), child.len) {
+                Some(previous) if previous != child.len => {
+                    bail!("publication descriptor has conflicting lengths")
+                }
+                _ => {}
+            }
+        }
+
+        // Children become durable first. Objects absent from this worker's
+        // cache are legal only when an authenticated FullHistory level receipt
+        // proved that a prior Ready publication already made them durable.
+        for (hash, len) in unique {
+            if context.cancelled.is_cancelled() {
+                bail!("artifact publication cancelled");
+            }
+            let blob = CasBlob {
+                hash: hash.clone(),
+                len,
+            };
+            if receipt_backed.contains(&hash) {
+                #[cfg(test)]
+                self.receipt_reuse_probes
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let actual = self
+                    .storage
+                    .size(&hash)
+                    .with_context(|| format!("stat durable reused level {hash}"))?;
+                if actual != len {
+                    bail!("durable reused level-manifest length mismatch");
+                }
+                continue;
+            }
+            let path = self.cas.path(&hash);
+            if path.exists() {
+                #[cfg(test)]
+                self.publication_uploads.lock().unwrap().push(hash.clone());
+                let upload = self.storage.put_file_async(&hash, &path);
+                tokio::select! {
+                    _ = context.cancelled.cancelled() => bail!("artifact publication cancelled"),
+                    result = upload => result.with_context(|| format!("publish artifact child {hash}"))?,
+                }
+                let verifier = self.clone();
+                let token = context.cancelled.clone();
+                tokio::task::spawn_blocking(move || {
+                    verifier.verify_durable_blob_cancelled(&blob, "published child", &token)
+                })
+                .await
+                .context("join durable child verification")??;
+            } else {
+                bail!("new publication child is absent from build cache");
+            }
+        }
+
+        // A nested level manifest is that level's durable commit point. Publish
+        // it only after all of its newly sealed physical packs are durable;
+        // later incremental syncs need one O(levels) probe and no pack HEADs.
+        for blob in new_level_manifests {
+            if context.cancelled.is_cancelled() {
+                bail!("artifact level-manifest publication cancelled");
+            }
+            let path = self.cas.path(&blob.hash);
+            if !path.exists() {
+                bail!("new history level manifest is absent from build cache");
+            }
+            #[cfg(test)]
+            self.publication_uploads
+                .lock()
+                .unwrap()
+                .push(blob.hash.clone());
+            let upload = self.storage.put_file_async(&blob.hash, &path);
+            tokio::select! {
+                _ = context.cancelled.cancelled() => bail!("artifact level-manifest publication cancelled"),
+                result = upload => result.with_context(|| format!("publish history level manifest {}", blob.hash))?,
+            }
+            let verifier = self.clone();
+            let token = context.cancelled.clone();
+            tokio::task::spawn_blocking(move || {
+                verifier.verify_durable_blob_cancelled(
+                    &blob,
+                    "published history level manifest",
+                    &token,
+                )
+            })
+            .await
+            .context("join durable history level-manifest verification")??;
+        }
+
+        // The root is the commit point for the immutable object graph and is
+        // deliberately uploaded only after every child passed its barrier.
+        let root_len = self.cas.verify_object(evidence.manifest())?;
+        let root = CasBlob {
+            hash: evidence.manifest().to_owned(),
+            len: root_len,
+        };
+        let root_path = self.cas.path(evidence.manifest());
+        #[cfg(test)]
+        self.publication_uploads
+            .lock()
+            .unwrap()
+            .push(evidence.manifest().to_owned());
+        let upload = self.storage.put_file_async(evidence.manifest(), &root_path);
+        tokio::select! {
+            _ = context.cancelled.cancelled() => bail!("artifact root publication cancelled"),
+            result = upload => result.context("publish artifact root manifest")?,
+        }
+        let verifier = self.clone();
+        let token = context.cancelled.clone();
+        tokio::task::spawn_blocking(move || {
+            verifier.verify_durable_blob_cancelled(&root, "published root manifest", &token)
+        })
+        .await
+        .context("join durable root verification")??;
+        Ok(())
+    }
+
     fn read_hash_bounded(&self, hash: &str, maximum: u64, role: &str) -> Result<Vec<u8>> {
-        Cas::validate_artifact_id(hash).with_context(|| format!("invalid {role} CAS id"))?;
         let mut output = BoundedWriter::new(Vec::new(), maximum);
-        self.cas
-            .copy_to_writer_verified(hash, &mut output)
-            .with_context(|| format!("stream and verify {role}"))?;
+        self.copy_hash_bounded_to_writer(hash, maximum, role, &mut output)?;
         Ok(output.into_inner())
+    }
+
+    fn copy_hash_bounded_to_writer<W: Write>(
+        &self,
+        hash: &str,
+        maximum: u64,
+        role: &str,
+        output: &mut W,
+    ) -> Result<u64> {
+        Cas::validate_artifact_id(hash).with_context(|| format!("invalid {role} CAS id"))?;
+        if self.cas.path(hash).exists() {
+            match self.cas.verify_object(hash) {
+                Ok(length) if length <= maximum => {
+                    return self
+                        .cas
+                        .copy_to_writer_verified(hash, output)
+                        .with_context(|| format!("stream verified local {role}"));
+                }
+                Ok(_) => bail!("{role} exceeds verifier limit"),
+                Err(error) => {
+                    // A bad cache copy must never mask a healthy durable copy.
+                    let _ = self.cas.remove(hash);
+                    if !self.storage.is_remote() {
+                        let _ = self.storage.delete(hash);
+                        return Err(error).with_context(|| format!("verify local {role}"));
+                    }
+                }
+            }
+        }
+
+        self.copy_storage_hash_bounded(hash, maximum, role, output)
+    }
+
+    fn copy_storage_hash_bounded<W: Write>(
+        &self,
+        hash: &str,
+        maximum: u64,
+        role: &str,
+        output: &mut W,
+    ) -> Result<u64> {
+        use sha2::Digest;
+        Cas::validate_artifact_id(hash).with_context(|| format!("invalid durable {role} id"))?;
+        let length = self
+            .storage
+            .size(hash)
+            .with_context(|| format!("stat durable {role}"))?;
+        if length > maximum {
+            bail!("{role} exceeds verifier limit");
+        }
+        let mut hasher = Sha256::new();
+        let mut offset = 0u64;
+        const READ_CHUNK: u64 = 8 * 1024 * 1024;
+        while offset < length {
+            if verification_cancelled() {
+                bail!("artifact verification cancelled");
+            }
+            let wanted = (length - offset).min(READ_CHUNK);
+            let bytes = self
+                .storage
+                .get_range(hash, offset, wanted)
+                .with_context(|| format!("read durable {role} range"))?;
+            if bytes.len() as u64 != wanted {
+                let quarantined = self.confirm_and_quarantine_remote(hash, length);
+                bail!(
+                    "durable {role} range length mismatch{}",
+                    if quarantined {
+                        "; object quarantined"
+                    } else {
+                        ""
+                    }
+                );
+            }
+            hasher.update(&bytes);
+            output.write_all(&bytes)?;
+            offset += wanted;
+        }
+        let actual = hex::encode(hasher.finalize());
+        if actual != hash {
+            let quarantined = self.confirm_and_quarantine_remote(hash, length);
+            bail!(
+                "durable {role} hash mismatch{}",
+                if quarantined {
+                    "; object quarantined"
+                } else {
+                    ""
+                }
+            );
+        }
+        Ok(length)
+    }
+
+    fn confirm_and_quarantine_remote(&self, hash: &str, expected_len: u64) -> bool {
+        match self.storage_hash_matches(hash, expected_len) {
+            Ok(true) | Err(_) => false,
+            Ok(false) => {
+                self.remove_local(hash);
+                let _ = self.storage.delete(hash);
+                true
+            }
+        }
+    }
+
+    fn storage_hash_matches(&self, hash: &str, expected_len: u64) -> Result<bool> {
+        use sha2::Digest;
+        if self.storage.size(hash)? != expected_len {
+            return Ok(false);
+        }
+        let mut offset = 0u64;
+        let mut hasher = Sha256::new();
+        const READ_CHUNK: u64 = 8 * 1024 * 1024;
+        while offset < expected_len {
+            if verification_cancelled() {
+                bail!("artifact verification cancelled");
+            }
+            let wanted = (expected_len - offset).min(READ_CHUNK);
+            let bytes = self.storage.get_range(hash, offset, wanted)?;
+            if bytes.len() as u64 != wanted {
+                return Ok(false);
+            }
+            hasher.update(&bytes);
+            offset += wanted;
+        }
+        Ok(hex::encode(hasher.finalize()) == hash)
+    }
+
+    fn remove_local(&self, hash: &str) {
+        let _ = self.cas.remove(hash);
     }
 
     fn read_small_blob(&self, blob: &CasBlob, maximum: u64, role: &str) -> Result<Vec<u8>> {
@@ -810,19 +1562,10 @@ impl CasCompletionVerifier {
         if blob.len > maximum {
             bail!("{role} exceeds verifier limit");
         }
-        let on_disk = std::fs::metadata(self.cas.path(&blob.hash))
-            .with_context(|| format!("stat {role} CAS object"))?
-            .len();
-        if on_disk != blob.len {
-            bail!("{role} CAS length mismatch");
-        }
         let output =
             std::fs::File::create(path).with_context(|| format!("create streamed {role}"))?;
         let mut output = BoundedWriter::new(output, blob.len);
-        let actual = self
-            .cas
-            .copy_to_writer_verified(&blob.hash, &mut output)
-            .with_context(|| format!("stream and verify {role}"))?;
+        let actual = self.copy_hash_bounded_to_writer(&blob.hash, maximum, role, &mut output)?;
         if actual != blob.len {
             bail!("{role} CAS length mismatch");
         }
@@ -937,11 +1680,13 @@ impl CasCompletionVerifier {
         let pack_count = history
             .levels
             .iter()
-            .try_fold(0usize, |count, level| count.checked_add(level.packs.len()))
+            .try_fold(0u64, |count, level| {
+                count.checked_add(level.proof.pack_count)
+            })
             .context("FullHistory pack count overflow")?;
         if history.target_commit_object.len > self.limits.commit_bytes
             || history.levels.len() > self.limits.packs
-            || pack_count > self.limits.packs
+            || pack_count > self.limits.packs as u64
         {
             bail!("FullHistory artifact exceeds verifier limits");
         }
@@ -969,8 +1714,8 @@ impl CasCompletionVerifier {
         for (index, level) in history.levels.iter().enumerate() {
             validate_canonical_oids(&level.tips, "history level tips")?;
             validate_canonical_oids(&level.base_exclusive, "history level exclusions")?;
-            if level.tips.is_empty() || level.packs.is_empty() {
-                bail!("history level must contain tips and packs");
+            if level.tips.is_empty() {
+                bail!("history level must contain tips");
             }
             if index == 0 {
                 if level.tier != FULL_HISTORY_BASE_TIER || !level.base_exclusive.is_empty() {
@@ -1142,6 +1887,15 @@ impl CompletionVerifier for CasCompletionVerifier {
             Some(&context.scratch),
         )?;
         Ok(())
+    }
+
+    fn publish_owned<'a>(
+        &'a self,
+        claim: &'a ClaimedArtifact,
+        evidence: &'a CompletionEvidence,
+        context: &'a crate::artifact_scheduler::ExecutionContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(self.publish_verified_owned(claim, evidence, context))
     }
 }
 
@@ -1808,13 +2562,19 @@ fn history_level_seal(
     level: &FullHistoryLevel,
     object_count: u64,
     object_set_digest: &str,
+    origin_commit: &str,
+    pack_count: u64,
+    pack_bytes: u64,
 ) -> Result<String> {
     let payload = serde_json::to_vec(&HistoryLevelSealPayload {
         verifier,
         tier: level.tier,
         base_exclusive: &level.base_exclusive,
         tips: &level.tips,
-        packs: &level.packs,
+        level_manifest: &level.level_manifest,
+        origin_commit,
+        pack_count,
+        pack_bytes,
         object_count,
         object_set_digest,
     })?;
@@ -1953,8 +2713,120 @@ mod tests {
     use crate::artifact_scheduler::{ArtifactRecord, ArtifactState};
     use crate::clonepack::{FileEntry, Fragment, FrameInfo};
     use crate::pack::PackBuilder;
+    use crate::storage::StorageBackend as _;
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct MemoryDurableStorage {
+        objects: Mutex<std::collections::HashMap<String, Vec<u8>>>,
+        puts: Mutex<Vec<String>>,
+        fail_put_number: Mutex<Option<usize>>,
+        bad_range_reads: Mutex<std::collections::HashMap<String, usize>>,
+    }
+
+    impl MemoryDurableStorage {
+        fn fail_put_number(&self, number: usize) {
+            *self.fail_put_number.lock().unwrap() = Some(number);
+        }
+
+        fn corrupt_same_length(&self, hash: &str) {
+            let mut objects = self.objects.lock().unwrap();
+            let bytes = objects.get_mut(hash).unwrap();
+            bytes[0] ^= 0xff;
+        }
+
+        fn inject_bad_range_reads(&self, hash: &str, count: usize) {
+            self.bad_range_reads
+                .lock()
+                .unwrap()
+                .insert(hash.to_owned(), count);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::storage::StorageBackend for MemoryDurableStorage {
+        fn get(&self, hash: &str) -> Result<Vec<u8>> {
+            self.objects
+                .lock()
+                .unwrap()
+                .get(hash)
+                .cloned()
+                .context("memory durable object missing")
+        }
+
+        fn get_range(&self, hash: &str, start: u64, len: u64) -> Result<Vec<u8>> {
+            let objects = self.objects.lock().unwrap();
+            let bytes = objects.get(hash).context("memory durable object missing")?;
+            let start = usize::try_from(start)?;
+            let end = start
+                .checked_add(usize::try_from(len)?)
+                .context("range overflow")?;
+            let mut range = bytes
+                .get(start..end)
+                .context("range outside object")?
+                .to_vec();
+            let mut bad_reads = self.bad_range_reads.lock().unwrap();
+            if bad_reads.get_mut(hash).is_some_and(|remaining| {
+                if *remaining == 0 {
+                    false
+                } else {
+                    *remaining -= 1;
+                    true
+                }
+            }) {
+                range[0] ^= 0xff;
+            }
+            Ok(range)
+        }
+
+        fn put(&self, hash: &str, data: &[u8]) -> Result<()> {
+            let mut puts = self.puts.lock().unwrap();
+            puts.push(hash.to_owned());
+            if *self.fail_put_number.lock().unwrap() == Some(puts.len()) {
+                bail!("injected durable put failure");
+            }
+            self.objects
+                .lock()
+                .unwrap()
+                .insert(hash.to_owned(), data.to_vec());
+            Ok(())
+        }
+
+        fn size(&self, hash: &str) -> Result<u64> {
+            Ok(self
+                .objects
+                .lock()
+                .unwrap()
+                .get(hash)
+                .context("memory durable object missing")?
+                .len() as u64)
+        }
+
+        fn delete(&self, hash: &str) -> Result<()> {
+            self.objects.lock().unwrap().remove(hash);
+            Ok(())
+        }
+
+        fn list_hashes(&self) -> Result<Vec<crate::storage::HashEntry>> {
+            Ok(self
+                .objects
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(hash, bytes)| crate::storage::HashEntry {
+                    hash: hash.clone(),
+                    size: bytes.len() as u64,
+                    modified: std::time::SystemTime::now(),
+                })
+                .collect())
+        }
+
+        fn is_remote(&self) -> bool {
+            true
+        }
+    }
 
     struct Fixture {
         _root: tempfile::TempDir,
@@ -2060,18 +2932,24 @@ mod tests {
         fn history(&self) -> ArtifactManifest {
             let objects =
                 crate::git::list_object_shas_with_depth(&self.repo, &self.first, None).unwrap();
+            let packs = self.pairs(&self.first, None);
+            let verifier = CasCompletionVerifier::new(self.cas.clone());
             let mut level = FullHistoryLevel {
                 tier: FULL_HISTORY_BASE_TIER,
                 base_exclusive: vec![],
                 tips: vec![self.first.clone()],
-                packs: self.pairs(&self.first, None),
+                level_manifest: verifier
+                    .store_history_level_manifest(packs.clone())
+                    .unwrap(),
                 proof: FullHistoryLevelProof::unsealed(),
             };
             let scratch = tempfile::tempdir().unwrap();
-            CasCompletionVerifier::new(self.cas.clone())
+            verifier
                 .verify_and_seal_history_level(
                     &mut level,
+                    &packs,
                     &objects,
+                    &self.second,
                     &tokio_util::sync::CancellationToken::new(),
                     scratch.path(),
                 )
@@ -2534,12 +3412,19 @@ mod tests {
         };
         let objects = crate::git::list_object_shas_with_depth(&f.repo, &f.first, None).unwrap();
         let scratch = tempfile::tempdir().unwrap();
-        CasCompletionVerifier::new(f.cas.clone())
+        let verifier = CasCompletionVerifier::new(f.cas.clone())
             .with_proof_key(&key_a)
+            .unwrap();
+        let packs = verifier
+            .read_history_level_manifest(&history.levels[0])
             .unwrap()
+            .packs;
+        verifier
             .verify_and_seal_history_level(
                 &mut history.levels[0],
+                &packs,
                 &objects,
+                &f.second,
                 &tokio_util::sync::CancellationToken::new(),
                 scratch.path(),
             )
@@ -2588,6 +3473,145 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn durable_publication_is_children_first_root_last_and_hash_verified() {
+        let f = Fixture::new();
+        let storage = std::sync::Arc::new(MemoryDurableStorage::default());
+        let verifier = CasCompletionVerifier::with_limits_and_storage(
+            f.cas.clone(),
+            storage.clone(),
+            ArtifactVerificationLimits::default(),
+        )
+        .unwrap()
+        .with_proof_key(&[b'p'; 32])
+        .unwrap();
+        let evidence = f.head().store(&f.cas).unwrap();
+        let claim = ClaimedArtifact {
+            record: ArtifactRecord {
+                id: 41,
+                key: evidence.key().clone(),
+                state: ArtifactState::Running,
+                owner: Some("worker".into()),
+                lease_expires_at: Some(i64::MAX),
+                lease_generation: 2,
+                claim_attempts: 1,
+                retry_count: 0,
+                manifest: None,
+                error: None,
+                failure_class: None,
+            },
+        };
+        verifier.verify(&claim, &evidence).unwrap();
+        let context = crate::artifact_scheduler::ExecutionContext {
+            cancelled: tokio_util::sync::CancellationToken::new(),
+            scratch: f._root.path().join("publish-scratch"),
+        };
+        verifier
+            .publish_owned(&claim, &evidence, &context)
+            .await
+            .unwrap();
+        let puts = storage.puts.lock().unwrap().clone();
+        assert_eq!(puts.last().map(String::as_str), Some(evidence.manifest()));
+        assert_eq!(
+            storage.size(evidence.manifest()).unwrap(),
+            f.cas.verify_object(evidence.manifest()).unwrap()
+        );
+
+        // A fresh process with no local objects reads and hashes the durable
+        // root. Same-length corruption is quarantined on the read path.
+        let fresh_root = tempfile::tempdir().unwrap();
+        let fresh_cas = Cas::new(fresh_root.path().join("cas")).unwrap();
+        let fresh = CasCompletionVerifier::with_limits_and_storage(
+            fresh_cas,
+            storage.clone(),
+            ArtifactVerificationLimits::default(),
+        )
+        .unwrap()
+        .with_proof_key(&[b'p'; 32])
+        .unwrap();
+        storage.inject_bad_range_reads(evidence.manifest(), 1);
+        assert!(
+            fresh
+                .read_hash_bounded(evidence.manifest(), 16 * 1024 * 1024, "transient root")
+                .is_err()
+        );
+        assert!(storage.size(evidence.manifest()).is_ok());
+        fresh
+            .read_hash_bounded(evidence.manifest(), 16 * 1024 * 1024, "healthy root")
+            .unwrap();
+
+        storage.corrupt_same_length(evidence.manifest());
+        assert!(
+            fresh
+                .read_hash_bounded(evidence.manifest(), 16 * 1024 * 1024, "corrupt root")
+                .unwrap_err()
+                .to_string()
+                .contains("quarantined")
+        );
+        assert!(storage.size(evidence.manifest()).is_err());
+    }
+
+    #[tokio::test]
+    async fn publication_failure_never_writes_root_and_bounded_scrub_quarantines() {
+        let f = Fixture::new();
+        let storage = std::sync::Arc::new(MemoryDurableStorage::default());
+        storage.fail_put_number(2);
+        let verifier = CasCompletionVerifier::with_limits_and_storage(
+            f.cas.clone(),
+            storage.clone(),
+            ArtifactVerificationLimits::default(),
+        )
+        .unwrap()
+        .with_proof_key(&[b'q'; 32])
+        .unwrap();
+        let manifest = f.head();
+        let (children, _) = manifest.publication_children();
+        let evidence = manifest.store(&f.cas).unwrap();
+        let claim = ClaimedArtifact {
+            record: ArtifactRecord {
+                id: 42,
+                key: evidence.key().clone(),
+                state: ArtifactState::Running,
+                owner: Some("worker".into()),
+                lease_expires_at: Some(i64::MAX),
+                lease_generation: 1,
+                claim_attempts: 1,
+                retry_count: 0,
+                manifest: None,
+                error: None,
+                failure_class: None,
+            },
+        };
+        let context = crate::artifact_scheduler::ExecutionContext {
+            cancelled: tokio_util::sync::CancellationToken::new(),
+            scratch: f._root.path().join("failed-publish"),
+        };
+        assert!(
+            verifier
+                .publish_owned(&claim, &evidence, &context)
+                .await
+                .is_err()
+        );
+        assert!(storage.size(evidence.manifest()).is_err());
+
+        *storage.fail_put_number.lock().unwrap() = None;
+        let child = children[0].clone();
+        storage
+            .put(&child.hash, &f.cas.get(&child.hash).unwrap())
+            .unwrap();
+        storage.corrupt_same_length(&child.hash);
+        let error = verifier
+            .scrub_durable_objects(
+                std::slice::from_ref(&child),
+                1,
+                child.len,
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("quarantined"));
+        assert!(storage.size(&child.hash).is_err());
+    }
+
     #[test]
     fn digest_descriptor_length_and_payload_kind_cannot_be_relabelled() {
         let f = Fixture::new();
@@ -2614,6 +3638,9 @@ mod tests {
             commit: f.first.clone(),
             ..f.key(ArtifactKind::FullHistory)
         };
+        let junk_manifest = CasCompletionVerifier::new(f.cas.clone())
+            .store_history_level_manifest(f.pairs(&f.first, None))
+            .unwrap();
         let root_with_junk = ArtifactManifest::new(
             &key,
             ArtifactPayload::FullHistory(FullHistoryArtifact {
@@ -2622,7 +3649,7 @@ mod tests {
                     tier: FULL_HISTORY_BASE_TIER,
                     base_exclusive: vec![],
                     tips: vec![f.first.clone()],
-                    packs: f.pairs(&f.first, None),
+                    level_manifest: junk_manifest,
                     proof: FullHistoryLevelProof::unsealed(),
                 }],
             }),
@@ -3001,9 +4028,12 @@ mod tests {
         };
         let root = tempfile::tempdir().unwrap();
         let cas = Cas::new(root.path().join("cas")).unwrap();
+        let storage = crate::storage::local(cas.root()).unwrap();
         match mode.as_str() {
-            "missing" | "short" => assert!(CasCompletionVerifier::from_env(cas).is_err()),
-            "valid" => assert!(CasCompletionVerifier::from_env(cas).is_ok()),
+            "missing" | "short" => {
+                assert!(CasCompletionVerifier::from_env(cas, storage).is_err())
+            }
+            "valid" => assert!(CasCompletionVerifier::from_env(cas, storage).is_ok()),
             _ => panic!("unknown proof-key probe mode"),
         }
     }

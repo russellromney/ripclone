@@ -4,8 +4,10 @@
 //! split admission, generation checks, claim-cap accounting, or publication
 //! alias updates across transactions.
 
+#[cfg(test)]
+use crate::artifact_scheduler::ArtifactTask;
 use crate::artifact_scheduler::{
-    ArtifactKey, ArtifactKind, ArtifactRecord, ArtifactTask, ClaimedArtifact, CompletionEvidence,
+    ArtifactKey, ArtifactKind, ArtifactRecord, ClaimedArtifact, CompletionEvidence,
     CompletionSealAuthority, ExecutionContext, ExecutionOutcome, FailureClass, ObservationOutcome,
     ObservationSnapshot, RetryOutcome, ScheduleOutcome, VerifiedCompletionEvidence,
     validate_evidence, validate_lease,
@@ -148,6 +150,7 @@ pub trait ArtifactSchedulerPersistence: Send + Sync {
     /// Compatibility entrypoint for callers that hold raw builder output. Raw
     /// evidence is always verified by this scheduler's verifier, sealed for the
     /// exact claimed lease, and only then passed to DB-only settlement.
+    #[cfg(test)]
     async fn complete(
         &self,
         claim: &ClaimedArtifact,
@@ -170,6 +173,11 @@ pub trait ArtifactSchedulerPersistence: Send + Sync {
     async fn reconcile_expired(&self) -> Result<(u64, u64)>;
     async fn get(&self, id: i64) -> Result<Option<ArtifactRecord>>;
     async fn get_by_key(&self, key: &ArtifactKey) -> Result<Option<ArtifactRecord>>;
+    /// Restartable maintenance scan ordered by durable job id.
+    async fn ready_page(&self, after_id: i64, limit: usize) -> Result<Vec<ArtifactRecord>>;
+    /// CAS-quarantine one Ready manifest and clear every published alias before
+    /// requeueing the exact immutable key for repair.
+    async fn quarantine_ready(&self, id: i64, manifest: &str, reason: &str) -> Result<bool>;
     async fn published(
         &self,
         workspace: &str,
@@ -304,6 +312,7 @@ pub trait ArtifactSchedulerPersistence: Send + Sync {
         // remains active; only then stamp this in-memory receipt so `complete`
         // performs the DB-only fenced transition.
         let verifier = self.completion_verifier();
+        let verifying_verifier = verifier.clone();
         let verify_claim = claim.clone();
         let verify_evidence = evidence.clone();
         let verify_context = ExecutionContext {
@@ -311,7 +320,7 @@ pub trait ArtifactSchedulerPersistence: Send + Sync {
             scratch: scratch.clone(),
         };
         let mut verifying = tokio::task::spawn_blocking(move || {
-            verifier.verify_owned(&verify_claim, &verify_evidence, &verify_context)
+            verifying_verifier.verify_owned(&verify_claim, &verify_evidence, &verify_context)
         });
         let verification = loop {
             tokio::select! {
@@ -353,6 +362,47 @@ pub trait ArtifactSchedulerPersistence: Send + Sync {
             guard.armed = false;
             return Ok(outcome);
         }
+        // The semantic verifier has accepted the exact evidence, but Ready is
+        // still forbidden until all children are durable and the root manifest
+        // has been published last. Keep heartbeating this same lease while the
+        // verifier's storage policy performs and verifies that publication.
+        let publish_context = ExecutionContext {
+            cancelled: cancel.clone(),
+            scratch: scratch.clone(),
+        };
+        let mut publishing = verifier.publish_owned(claim, &evidence, &publish_context);
+        let publication = loop {
+            tokio::select! {
+                result = &mut publishing => break Some(result),
+                _ = interval.tick() => match self.heartbeat(claim, owner, lease_secs).await {
+                    Ok(true) => {}
+                    Ok(false) => break None,
+                    Err(error) => {
+                        cancel.cancel();
+                        let _ = publishing.await;
+                        let _ = std::fs::remove_dir_all(&scratch);
+                        guard.armed = false;
+                        return Err(error).context("artifact heartbeat failed after draining publisher");
+                    }
+                }
+            }
+        };
+        let Some(publication) = publication else {
+            cancel.cancel();
+            let _ = publishing.await;
+            let _ = std::fs::remove_dir_all(&scratch);
+            guard.armed = false;
+            return Ok(ExecutionOutcome::LostLease);
+        };
+        if let Err(error) = publication {
+            cancel.cancel();
+            let message = format!("artifact durable publication failed: {error}");
+            let _ = std::fs::remove_dir_all(&scratch);
+            let outcome = fail_still_owned(self, claim, owner, &message).await?;
+            guard.armed = false;
+            return Ok(outcome);
+        }
+        drop(publishing);
         let verified = self.completion_sealer().seal(claim, evidence)?;
         let ready = match self.complete_verified(claim, owner, &verified).await {
             Ok(ready) => ready,
@@ -378,6 +428,7 @@ pub trait ArtifactSchedulerPersistence: Send + Sync {
     /// provide fenced primitives; this method guarantees ownership preflight,
     /// internal heartbeats, cooperative cancellation, child draining, and
     /// attempt-unique scratch before any backend can publish.
+    #[cfg(test)]
     async fn run_owned(
         &self,
         claim: &ClaimedArtifact,
@@ -571,6 +622,12 @@ impl ArtifactSchedulerPersistence for crate::artifact_scheduler::ArtifactSchedul
     }
     async fn get_by_key(&self, key: &ArtifactKey) -> Result<Option<ArtifactRecord>> {
         self.get_by_key(key).await
+    }
+    async fn ready_page(&self, after_id: i64, limit: usize) -> Result<Vec<ArtifactRecord>> {
+        self.ready_page(after_id, limit).await
+    }
+    async fn quarantine_ready(&self, id: i64, manifest: &str, reason: &str) -> Result<bool> {
+        self.quarantine_ready(id, manifest, reason).await
     }
     async fn published(
         &self,

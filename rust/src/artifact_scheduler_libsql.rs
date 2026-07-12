@@ -405,6 +405,57 @@ impl ArtifactSchedulerPersistence for LibsqlArtifactScheduler {
         validate_format_version(key.format_version)?;
         get_key(&self.conn().await?, key).await
     }
+    async fn ready_page(&self, after_id: i64, limit: usize) -> Result<Vec<ArtifactRecord>> {
+        if after_id < 0 || !(1..=1000).contains(&limit) {
+            bail!("invalid ready scrub page");
+        }
+        let conn = self.conn().await?;
+        let mut rows = conn
+            .query(
+                &format!(
+                    "{SELECT} WHERE state='ready' AND manifest IS NOT NULL AND id>? ORDER BY id LIMIT ?"
+                ),
+                vec![Value::from(after_id), Value::from(limit as i64)],
+            )
+            .await?;
+        let mut records = Vec::new();
+        while let Some(row) = rows.next().await? {
+            records.push(row_record(row)?);
+        }
+        Ok(records)
+    }
+    async fn quarantine_ready(&self, id: i64, manifest: &str, reason: &str) -> Result<bool> {
+        if id <= 0 || manifest.trim().is_empty() || reason.trim().is_empty() {
+            bail!("invalid ready quarantine request");
+        }
+        let tx = self.tx().await?;
+        let outcome = async {
+            let now = now(&tx).await?;
+            let changed = exec(
+                &tx,
+                "UPDATE artifact_jobs SET state='queued',manifest=NULL,owner=NULL,heartbeat_at=NULL,lease_expires_at=NULL,error=?,failure_class=NULL,updated_at=? WHERE id=? AND state='ready' AND manifest=?",
+                vec![
+                    reason.chars().take(4096).collect::<String>().into(),
+                    now.into(),
+                    id.into(),
+                    manifest.into(),
+                ],
+            )
+            .await?
+                == 1;
+            if changed {
+                exec(
+                    &tx,
+                    "UPDATE artifact_observations SET published_artifact_id=NULL WHERE published_artifact_id=?",
+                    vec![id.into()],
+                )
+                .await?;
+            }
+            Ok(changed)
+        }
+        .await;
+        finish(tx, outcome).await
+    }
     async fn published(
         &self,
         w: &str,
@@ -917,10 +968,11 @@ mod tests {
         let scheduler = scheduler(
             &server.url,
             SchedulerLimits {
-                total_running: 4,
+                total_running: 5,
+                head_running: 1,
                 full_history_running: 2,
                 files_running: 2,
-                workspace_running: 4,
+                workspace_running: 5,
                 ..Default::default()
             },
         )

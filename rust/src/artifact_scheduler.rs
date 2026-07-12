@@ -12,8 +12,12 @@ use sha2::{Digest, Sha256};
 use sqlx::pool::PoolConnection;
 use sqlx::sqlite::{Sqlite, SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow};
 use sqlx::{Row, SqlitePool};
+#[cfg(test)]
 use std::future::Future;
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::path::Path;
+use std::path::PathBuf;
+#[cfg(test)]
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -402,6 +406,30 @@ pub trait CompletionVerifier: Send + Sync {
         }
         Ok(())
     }
+
+    /// Durably publish already-verified evidence before the scheduler may
+    /// transition the claim to Ready. Implementations publish children first
+    /// and the root manifest last, then verify durable presence.
+    fn publish_owned<'a>(
+        &'a self,
+        _claim: &'a ClaimedArtifact,
+        _evidence: &'a CompletionEvidence,
+        context: &'a ExecutionContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            if context.cancelled.is_cancelled() {
+                bail!("artifact publication cancelled");
+            }
+            #[cfg(test)]
+            {
+                Ok(())
+            }
+            #[cfg(not(test))]
+            {
+                bail!("durable artifact publisher is not configured")
+            }
+        })
+    }
 }
 struct StructuralVerifier;
 impl CompletionVerifier for StructuralVerifier {
@@ -470,8 +498,11 @@ pub struct ExecutionContext {
     pub cancelled: CancellationToken,
     pub scratch: PathBuf,
 }
+#[cfg(test)]
 pub type ArtifactTaskFuture = Pin<Box<dyn Future<Output = Result<()>> + Send + 'static>>;
+#[cfg(test)]
 pub struct ArtifactTask(Box<dyn FnOnce(ExecutionContext) -> ArtifactTaskFuture + Send + 'static>);
+#[cfg(test)]
 impl ArtifactTask {
     pub fn cooperative<F, Fut>(f: F) -> Self
     where
@@ -950,6 +981,7 @@ impl ArtifactScheduler {
         Ok(n == 1)
     }
 
+    #[cfg(test)]
     pub async fn complete(
         &self,
         claim: &ClaimedArtifact,
@@ -996,6 +1028,7 @@ impl ArtifactScheduler {
     /// Run cooperative work with internal heartbeats. On lost ownership or any
     /// failure, cancellation is signalled and every child is drained before return.
     /// Attempt-unique scratch prevents a stale child from colliding with a successor.
+    #[cfg(test)]
     pub async fn run_owned(
         &self,
         claim: &ClaimedArtifact,
@@ -1055,6 +1088,40 @@ impl ArtifactScheduler {
             .fetch_optional(&self.pool)
             .await?;
         row.map(row_record).transpose()
+    }
+    pub async fn ready_page(&self, after_id: i64, limit: usize) -> Result<Vec<ArtifactRecord>> {
+        if after_id < 0 || !(1..=1000).contains(&limit) {
+            bail!("invalid ready scrub page");
+        }
+        sqlx::query("SELECT id,workspace,repo,commit_oid,kind,format_version,state,owner,lease_expires_at,lease_generation,claim_attempts,retry_count,manifest,error,failure_class FROM artifact_jobs WHERE state='ready' AND manifest IS NOT NULL AND id>? ORDER BY id LIMIT ?")
+            .bind(after_id)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(row_record)
+            .collect()
+    }
+    pub async fn quarantine_ready(&self, id: i64, manifest: &str, reason: &str) -> Result<bool> {
+        if id <= 0 || manifest.trim().is_empty() || reason.trim().is_empty() {
+            bail!("invalid ready quarantine request");
+        }
+        let mut tx = self.pool.begin().await?;
+        let changed = sqlx::query("UPDATE artifact_jobs SET state='queued',manifest=NULL,owner=NULL,heartbeat_at=NULL,lease_expires_at=NULL,error=?,failure_class=NULL,updated_at=unixepoch() WHERE id=? AND state='ready' AND manifest=?")
+            .bind(reason.chars().take(4096).collect::<String>())
+            .bind(id)
+            .bind(manifest)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected() == 1;
+        if changed {
+            sqlx::query("UPDATE artifact_observations SET published_artifact_id=NULL WHERE published_artifact_id=?")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(changed)
     }
     pub async fn published(
         &self,
@@ -2561,6 +2628,60 @@ mod tests {
             s.get(wrong_claim.record.id).await.unwrap().unwrap().state,
             ArtifactState::Failed
         );
+    }
+
+    #[tokio::test]
+    async fn owned_build_cannot_become_ready_when_durable_publication_fails() {
+        use crate::artifact_scheduler_backend::{ArtifactSchedulerPersistence, OwnedArtifactBuild};
+
+        struct PublishFails;
+        impl CompletionVerifier for PublishFails {
+            fn identity(&self) -> &str {
+                "publish-fails-v1"
+            }
+
+            fn verify(&self, claim: &ClaimedArtifact, evidence: &CompletionEvidence) -> Result<()> {
+                validate_evidence(claim, evidence)
+            }
+
+            fn publish_owned<'a>(
+                &'a self,
+                _claim: &'a ClaimedArtifact,
+                _evidence: &'a CompletionEvidence,
+                _context: &'a ExecutionContext,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>>
+            {
+                Box::pin(async { bail!("injected durable publication failure") })
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("publication-failure.db");
+        let scheduler = ArtifactScheduler::open_with_verifier(
+            &path.to_string_lossy(),
+            Default::default(),
+            Arc::new(PublishFails),
+        )
+        .await
+        .unwrap();
+        let key = key("ws", "durability", ArtifactKind::Head);
+        scheduler.schedule(&key).await.unwrap();
+        let claim = scheduler.claim("worker", 5).await.unwrap().unwrap();
+        let returned = evidence(&claim);
+        let outcome = ArtifactSchedulerPersistence::run_owned_build(
+            &scheduler,
+            &claim,
+            "worker",
+            OwnedArtifactBuild::cooperative(move |_| async move { Ok(returned) }),
+            5,
+            root.path(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, ExecutionOutcome::Failed);
+        let record = scheduler.get(claim.record.id).await.unwrap().unwrap();
+        assert_eq!(record.state, ArtifactState::Failed);
+        assert!(record.manifest.is_none());
     }
 
     #[tokio::test(flavor = "current_thread")]

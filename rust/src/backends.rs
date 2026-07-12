@@ -66,6 +66,23 @@ pub struct Backends {
 }
 
 impl Backends {
+    /// Strict normalized-artifact policy factory. Call exactly once at runtime
+    /// startup and share the returned verifier (or cheap clones of it) with the
+    /// SQL scheduler and every `TypedArtifactBuilder`; do not reconstruct it in
+    /// workers. Missing/short proof authority fails startup here.
+    pub fn normalized_artifact_verifier(
+        &self,
+        limits: crate::artifact_manifest::ArtifactVerificationLimits,
+    ) -> Result<Arc<crate::artifact_manifest::CasCompletionVerifier>> {
+        Ok(Arc::new(
+            crate::artifact_manifest::CasCompletionVerifier::from_env_with_limits(
+                self.cas.clone(),
+                self.storage.clone(),
+                limits,
+            )?,
+        ))
+    }
+
     /// Build storage + metadata store + retention from the environment, factored
     /// out so the server and the worker share it. Does **not** start the
     /// retention sweep loop or migrate legacy refs — those are server-startup
