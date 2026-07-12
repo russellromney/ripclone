@@ -6,7 +6,9 @@
 //! [`ClaimedArtifact`] and typed [`CompletionEvidence`].
 
 use anyhow::{Context, Result, bail};
+use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use sqlx::pool::PoolConnection;
 use sqlx::sqlite::{Sqlite, SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow};
 use sqlx::{Row, SqlitePool};
@@ -193,10 +195,9 @@ pub enum RetryOutcome {
 
 #[derive(Debug, Clone)]
 pub struct CompletionEvidence {
-    pub key: ArtifactKey,
-    pub manifest: String,
-    pub artifact_count: u64,
-    verified_by: Option<String>,
+    key: ArtifactKey,
+    manifest: String,
+    artifact_count: u64,
 }
 impl CompletionEvidence {
     pub fn new(key: ArtifactKey, manifest: impl Into<String>) -> Result<Self> {
@@ -208,7 +209,6 @@ impl CompletionEvidence {
             key,
             manifest,
             artifact_count: 1,
-            verified_by: None,
         })
     }
 
@@ -225,17 +225,161 @@ impl CompletionEvidence {
         Ok(evidence)
     }
 
-    pub(crate) fn mark_verified(&mut self, identity: &str) -> Result<()> {
-        if identity.trim().is_empty() {
-            bail!("completion verifier identity is empty");
-        }
-        self.verified_by = Some(identity.to_owned());
-        Ok(())
+    pub fn key(&self) -> &ArtifactKey {
+        &self.key
     }
 
-    pub(crate) fn is_verified_by(&self, identity: &str) -> bool {
-        self.verified_by.as_deref() == Some(identity)
+    pub fn manifest(&self) -> &str {
+        &self.manifest
     }
+
+    pub fn artifact_count(&self) -> u64 {
+        self.artifact_count
+    }
+}
+
+/// An immutable, attempt-specific capability produced only after the configured
+/// verifier accepts completion evidence. Its authentication tag is bound to
+/// the verifier instance, claim identity, lease generation, exact artifact key,
+/// manifest digest, and artifact count. Callers can inspect raw evidence through
+/// getters, but cannot forge or mutate either raw fields or this capability:
+///
+/// ```compile_fail
+/// use ripclone::artifact_scheduler::CompletionEvidence;
+/// fn forge(evidence: &mut CompletionEvidence) {
+///     evidence.manifest.clear();
+/// }
+/// ```
+#[derive(Clone)]
+pub struct VerifiedCompletionEvidence {
+    evidence: CompletionEvidence,
+    artifact_id: i64,
+    lease_generation: u64,
+    manifest_hash: [u8; 32],
+    tag: [u8; 32],
+}
+
+impl std::fmt::Debug for VerifiedCompletionEvidence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VerifiedCompletionEvidence")
+            .field("key", self.evidence.key())
+            .field("artifact_id", &self.artifact_id)
+            .field("lease_generation", &self.lease_generation)
+            .field("artifact_count", &self.evidence.artifact_count())
+            .finish_non_exhaustive()
+    }
+}
+
+impl VerifiedCompletionEvidence {
+    pub fn evidence(&self) -> &CompletionEvidence {
+        &self.evidence
+    }
+}
+
+type CompletionHmac = Hmac<Sha256>;
+
+/// Per-scheduler-process sealing authority. Even verifiers with the same
+/// advertised identity receive distinct authorities, so capabilities cannot be
+/// transferred between verifier instances or scheduler handles opened with one.
+#[doc(hidden)]
+pub struct CompletionSealAuthority {
+    secret: [u8; 32],
+    verifier_identity: String,
+}
+
+impl CompletionSealAuthority {
+    pub(crate) fn new(verifier_identity: &str) -> Result<Self> {
+        let verifier_identity = verifier_identity.trim();
+        if verifier_identity.is_empty() {
+            bail!("completion verifier identity is empty");
+        }
+        Ok(Self {
+            secret: rand::random(),
+            verifier_identity: verifier_identity.to_owned(),
+        })
+    }
+
+    pub(crate) fn seal(
+        &self,
+        claim: &ClaimedArtifact,
+        evidence: CompletionEvidence,
+    ) -> Result<VerifiedCompletionEvidence> {
+        validate_evidence(claim, &evidence)?;
+        let manifest_hash: [u8; 32] = Sha256::digest(evidence.manifest.as_bytes()).into();
+        let tag = self.tag(claim, &evidence, &manifest_hash)?;
+        Ok(VerifiedCompletionEvidence {
+            evidence,
+            artifact_id: claim.record.id,
+            lease_generation: claim.record.lease_generation,
+            manifest_hash,
+            tag,
+        })
+    }
+
+    pub(crate) fn verify<'a>(
+        &self,
+        claim: &ClaimedArtifact,
+        verified: &'a VerifiedCompletionEvidence,
+    ) -> Result<&'a CompletionEvidence> {
+        if verified.artifact_id != claim.record.id
+            || verified.lease_generation != claim.record.lease_generation
+            || verified.evidence.key != claim.record.key
+        {
+            bail!("verified completion capability does not match claimed artifact attempt");
+        }
+        let manifest_hash: [u8; 32] = Sha256::digest(verified.evidence.manifest.as_bytes()).into();
+        if manifest_hash != verified.manifest_hash {
+            bail!("verified completion capability manifest digest changed");
+        }
+        let mac = self.mac(claim, &verified.evidence, &manifest_hash)?;
+        mac.verify_slice(&verified.tag)
+            .map_err(|_| anyhow::anyhow!("verified completion capability has an invalid seal"))?;
+        Ok(&verified.evidence)
+    }
+
+    fn tag(
+        &self,
+        claim: &ClaimedArtifact,
+        evidence: &CompletionEvidence,
+        manifest_hash: &[u8; 32],
+    ) -> Result<[u8; 32]> {
+        Ok(self
+            .mac(claim, evidence, manifest_hash)?
+            .finalize()
+            .into_bytes()
+            .into())
+    }
+
+    fn mac(
+        &self,
+        claim: &ClaimedArtifact,
+        evidence: &CompletionEvidence,
+        manifest_hash: &[u8; 32],
+    ) -> Result<CompletionHmac> {
+        let mut mac = CompletionHmac::new_from_slice(&self.secret)
+            .map_err(|_| anyhow::anyhow!("invalid completion sealing key"))?;
+        mac.update(b"ripclone-verified-completion-v1\0");
+        update_len_prefixed(&mut mac, self.verifier_identity.as_bytes());
+        mac.update(&claim.record.id.to_be_bytes());
+        mac.update(&claim.record.lease_generation.to_be_bytes());
+        for value in [
+            evidence.key.workspace.as_bytes(),
+            evidence.key.repo.as_bytes(),
+            evidence.key.commit.as_bytes(),
+            evidence.key.kind.as_str().as_bytes(),
+        ] {
+            update_len_prefixed(&mut mac, value);
+        }
+        mac.update(&evidence.key.format_version.to_be_bytes());
+        mac.update(manifest_hash);
+        mac.update(&evidence.artifact_count.to_be_bytes());
+        Ok(mac)
+    }
+}
+
+fn update_len_prefixed(mac: &mut CompletionHmac, value: &[u8]) {
+    mac.update(&(value.len() as u64).to_be_bytes());
+    mac.update(value);
 }
 
 /// Integration hook for mode-specific manifest/CAS validation. Production
@@ -266,7 +410,7 @@ impl CompletionVerifier for StructuralVerifier {
     }
     fn verify(&self, claim: &ClaimedArtifact, evidence: &CompletionEvidence) -> Result<()> {
         validate_evidence(claim, evidence)?;
-        if evidence.artifact_count == 0 {
+        if evidence.artifact_count() == 0 {
             bail!("completion evidence contains no artifacts")
         }
         Ok(())
@@ -315,6 +459,7 @@ pub struct ArtifactScheduler {
     pool: SqlitePool,
     limits: SchedulerLimits,
     pub(crate) verifier: Arc<dyn CompletionVerifier>,
+    pub(crate) completion_sealer: Arc<CompletionSealAuthority>,
 }
 
 /// Context passed to cooperative work. Blocking/external children must be
@@ -587,10 +732,12 @@ impl ArtifactScheduler {
             bail!("scheduler configuration CAS verification failed")
         }
         sqlx::query("COMMIT").execute(&mut *config).await?;
+        let completion_sealer = Arc::new(CompletionSealAuthority::new(verifier_id)?);
         Ok(Self {
             pool,
             limits,
             verifier,
+            completion_sealer,
         })
     }
 
@@ -809,13 +956,23 @@ impl ArtifactScheduler {
         owner: &str,
         evidence: &CompletionEvidence,
     ) -> Result<bool> {
-        if !evidence.is_verified_by(self.verifier.identity()) {
-            self.verifier.verify(claim, evidence)?;
-        }
+        validate_evidence(claim, evidence)?;
+        self.verifier.verify(claim, evidence)?;
+        let verified = self.completion_sealer.seal(claim, evidence.clone())?;
+        self.complete_verified(claim, owner, &verified).await
+    }
+
+    pub(crate) async fn complete_verified(
+        &self,
+        claim: &ClaimedArtifact,
+        owner: &str,
+        verified: &VerifiedCompletionEvidence,
+    ) -> Result<bool> {
+        let evidence = self.completion_sealer.verify(claim, verified)?;
         let mut c = self.immediate().await?;
         let result:Result<bool>=async{
    let now=db_now(&mut c).await?; let won=sqlx::query("UPDATE artifact_jobs SET state='ready',owner=NULL,heartbeat_at=NULL,lease_expires_at=NULL,manifest=?,error=NULL,failure_class=NULL,updated_at=? WHERE id=? AND state='running' AND owner=? AND lease_generation=? AND lease_expires_at>=?")
-    .bind(&evidence.manifest).bind(now).bind(claim.record.id).bind(owner).bind(claim.record.lease_generation as i64).bind(now).execute(&mut *c).await?.rows_affected()==1;
+    .bind(evidence.manifest()).bind(now).bind(claim.record.id).bind(owner).bind(claim.record.lease_generation as i64).bind(now).execute(&mut *c).await?.rows_affected()==1;
    if won{sqlx::query("UPDATE artifact_observations SET published_artifact_id=? WHERE desired_artifact_id=?").bind(claim.record.id).bind(claim.record.id).execute(&mut *c).await?;} Ok(won)
   }.await;
         finish(c, result).await
@@ -1250,10 +1407,10 @@ pub(crate) fn scheduler_fingerprint(limits: &SchedulerLimits, verifier_id: &str)
     )
 }
 pub(crate) fn validate_evidence(c: &ClaimedArtifact, e: &CompletionEvidence) -> Result<()> {
-    if e.manifest.trim().is_empty() {
+    if e.manifest().trim().is_empty() {
         bail!("artifact completion manifest is empty")
     };
-    if e.key != c.record.key {
+    if e.key() != &c.record.key {
         bail!("completion evidence does not match claimed artifact key")
     };
     Ok(())
@@ -1928,6 +2085,86 @@ mod tests {
             )
         );
         assert_eq!([a.is_ok(), b.is_ok()].into_iter().filter(|v| *v).count(), 1);
+    }
+
+    #[tokio::test]
+    async fn verified_completion_capability_is_attempt_and_verifier_instance_bound() {
+        let (s, _d, _) = scheduler(Default::default()).await;
+        let first_key = key("ws", "first", ArtifactKind::Head);
+        let second_key = key("ws", "second", ArtifactKind::Head);
+        s.schedule(&first_key).await.unwrap();
+        s.schedule(&second_key).await.unwrap();
+        let first = s.claim("worker-a", 30).await.unwrap().unwrap();
+        let second = s.claim("worker-b", 30).await.unwrap().unwrap();
+        let raw = evidence(&first);
+        s.verifier.verify(&first, &raw).unwrap();
+        let capability = s.completion_sealer.seal(&first, raw).unwrap();
+        let cloned = capability.clone();
+
+        assert!(s.completion_sealer.verify(&first, &cloned).is_ok());
+        assert!(s.completion_sealer.verify(&second, &cloned).is_err());
+        let next_lease = ClaimedArtifact {
+            record: ArtifactRecord {
+                lease_generation: first.record.lease_generation + 1,
+                ..first.record.clone()
+            },
+        };
+        assert!(s.completion_sealer.verify(&next_lease, &cloned).is_err());
+
+        let same_named_different_instance =
+            CompletionSealAuthority::new(s.verifier.identity()).unwrap();
+        assert!(
+            same_named_different_instance
+                .verify(&first, &cloned)
+                .is_err()
+        );
+
+        assert!(
+            s.complete_verified(&first, "worker-a", &capability)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !s.complete_verified(&first, "worker-a", &capability)
+                .await
+                .unwrap(),
+            "a valid capability cannot replay after its attempt settled"
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_completion_always_runs_the_configured_verifier() {
+        struct CountingVerifier(Arc<std::sync::atomic::AtomicUsize>);
+        impl CompletionVerifier for CountingVerifier {
+            fn identity(&self) -> &str {
+                "counting-verifier-v1"
+            }
+            fn verify(&self, claim: &ClaimedArtifact, evidence: &CompletionEvidence) -> Result<()> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                validate_evidence(claim, evidence)
+            }
+        }
+
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("always-verify.db").to_string_lossy();
+        let scheduler = ArtifactScheduler::open_with_verifier(
+            &path,
+            Default::default(),
+            Arc::new(CountingVerifier(calls.clone())),
+        )
+        .await
+        .unwrap();
+        let k = key("ws", "raw", ArtifactKind::Head);
+        scheduler.schedule(&k).await.unwrap();
+        let claim = scheduler.claim("worker", 30).await.unwrap().unwrap();
+        assert!(
+            scheduler
+                .complete(&claim, "worker", &evidence(&claim))
+                .await
+                .unwrap()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

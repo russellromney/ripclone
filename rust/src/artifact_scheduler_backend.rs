@@ -6,8 +6,9 @@
 
 use crate::artifact_scheduler::{
     ArtifactKey, ArtifactKind, ArtifactRecord, ArtifactTask, ClaimedArtifact, CompletionEvidence,
-    ExecutionContext, ExecutionOutcome, FailureClass, ObservationOutcome, ObservationSnapshot,
-    RetryOutcome, ScheduleOutcome, validate_evidence, validate_lease,
+    CompletionSealAuthority, ExecutionContext, ExecutionOutcome, FailureClass, ObservationOutcome,
+    ObservationSnapshot, RetryOutcome, ScheduleOutcome, VerifiedCompletionEvidence,
+    validate_evidence, validate_lease,
 };
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -77,6 +78,7 @@ impl Drop for PersistenceExecutionGuard {
 #[async_trait]
 pub trait ArtifactSchedulerPersistence: Send + Sync {
     fn completion_verifier(&self) -> Arc<dyn crate::artifact_scheduler::CompletionVerifier>;
+    fn completion_sealer(&self) -> Arc<CompletionSealAuthority>;
     async fn schedule(&self, key: &ArtifactKey) -> Result<ScheduleOutcome>;
     async fn subscribe_consumer(
         &self,
@@ -137,12 +139,27 @@ pub trait ArtifactSchedulerPersistence: Send + Sync {
         lease_secs: i64,
     ) -> Result<bool>;
     async fn owns(&self, claim: &ClaimedArtifact, owner: &str) -> Result<bool>;
+    async fn complete_verified(
+        &self,
+        claim: &ClaimedArtifact,
+        owner: &str,
+        evidence: &VerifiedCompletionEvidence,
+    ) -> Result<bool>;
+    /// Compatibility entrypoint for callers that hold raw builder output. Raw
+    /// evidence is always verified by this scheduler's verifier, sealed for the
+    /// exact claimed lease, and only then passed to DB-only settlement.
     async fn complete(
         &self,
         claim: &ClaimedArtifact,
         owner: &str,
         evidence: &CompletionEvidence,
-    ) -> Result<bool>;
+    ) -> Result<bool> {
+        validate_evidence(claim, evidence)?;
+        let verifier = self.completion_verifier();
+        verifier.verify(claim, evidence)?;
+        let verified = self.completion_sealer().seal(claim, evidence.clone())?;
+        self.complete_verified(claim, owner, &verified).await
+    }
     async fn fail(
         &self,
         claim: &ClaimedArtifact,
@@ -230,7 +247,7 @@ pub trait ArtifactSchedulerPersistence: Send + Sync {
             return Ok(ExecutionOutcome::LostLease);
         };
 
-        let mut evidence = match build_result {
+        let evidence = match build_result {
             Ok(Ok(evidence)) => evidence,
             Ok(Err(error)) => {
                 cancel.cancel();
@@ -287,7 +304,6 @@ pub trait ArtifactSchedulerPersistence: Send + Sync {
         // remains active; only then stamp this in-memory receipt so `complete`
         // performs the DB-only fenced transition.
         let verifier = self.completion_verifier();
-        let verifier_identity = verifier.identity().to_owned();
         let verify_claim = claim.clone();
         let verify_evidence = evidence.clone();
         let verify_context = ExecutionContext {
@@ -337,8 +353,8 @@ pub trait ArtifactSchedulerPersistence: Send + Sync {
             guard.armed = false;
             return Ok(outcome);
         }
-        evidence.mark_verified(&verifier_identity)?;
-        let ready = match self.complete(claim, owner, &evidence).await {
+        let verified = self.completion_sealer().seal(claim, evidence)?;
+        let ready = match self.complete_verified(claim, owner, &verified).await {
             Ok(ready) => ready,
             Err(error) => {
                 cancel.cancel();
@@ -486,6 +502,9 @@ impl ArtifactSchedulerPersistence for crate::artifact_scheduler::ArtifactSchedul
     fn completion_verifier(&self) -> Arc<dyn crate::artifact_scheduler::CompletionVerifier> {
         self.verifier.clone()
     }
+    fn completion_sealer(&self) -> Arc<CompletionSealAuthority> {
+        self.completion_sealer.clone()
+    }
     async fn schedule(&self, key: &ArtifactKey) -> Result<ScheduleOutcome> {
         self.schedule(key).await
     }
@@ -527,13 +546,13 @@ impl ArtifactSchedulerPersistence for crate::artifact_scheduler::ArtifactSchedul
     async fn owns(&self, claim: &ClaimedArtifact, owner: &str) -> Result<bool> {
         self.owns(claim, owner).await
     }
-    async fn complete(
+    async fn complete_verified(
         &self,
         claim: &ClaimedArtifact,
         owner: &str,
-        evidence: &CompletionEvidence,
+        evidence: &VerifiedCompletionEvidence,
     ) -> Result<bool> {
-        self.complete(claim, owner, evidence).await
+        self.complete_verified(claim, owner, evidence).await
     }
     async fn fail(
         &self,

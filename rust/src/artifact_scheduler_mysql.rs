@@ -5,11 +5,13 @@
 //! settlement are O(1) conditional updates and do not take the control lock.
 
 use crate::artifact_scheduler::{
-    ArtifactKey, ArtifactKind, ArtifactRecord, ArtifactState, ClaimedArtifact, CompletionEvidence,
-    CompletionVerifier, FailureClass, ObservationOutcome, ObservationSnapshot, RetryOutcome,
-    ScheduleOutcome, SchedulerLimits, scheduler_fingerprint, validate_evidence, validate_lease,
-    validate_limits, validate_resolved_commit,
+    ArtifactKey, ArtifactKind, ArtifactRecord, ArtifactState, ClaimedArtifact,
+    CompletionSealAuthority, CompletionVerifier, FailureClass, ObservationOutcome, RetryOutcome,
+    ScheduleOutcome, SchedulerLimits, VerifiedCompletionEvidence, scheduler_fingerprint,
+    ObservationSnapshot, validate_lease, validate_limits, validate_resolved_commit,
 };
+#[cfg(test)]
+use crate::artifact_scheduler::{CompletionEvidence, validate_evidence};
 use crate::artifact_scheduler_backend::ArtifactSchedulerPersistence;
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -75,6 +77,7 @@ pub struct MysqlArtifactScheduler {
     pool: MySqlPool,
     limits: SchedulerLimits,
     verifier: Arc<dyn CompletionVerifier>,
+    completion_sealer: Arc<CompletionSealAuthority>,
 }
 
 impl MysqlArtifactScheduler {
@@ -184,10 +187,12 @@ impl MysqlArtifactScheduler {
         if release?.unwrap_or(0) != 1 {
             bail!("mysql artifact scheduler migration lock ownership was lost")
         }
+        let completion_sealer = Arc::new(CompletionSealAuthority::new(verifier.identity())?);
         Ok(Self {
             pool,
             limits,
             verifier,
+            completion_sealer,
         })
     }
 
@@ -984,6 +989,9 @@ impl ArtifactSchedulerPersistence for MysqlArtifactScheduler {
     fn completion_verifier(&self) -> Arc<dyn CompletionVerifier> {
         self.verifier.clone()
     }
+    fn completion_sealer(&self) -> Arc<CompletionSealAuthority> {
+        self.completion_sealer.clone()
+    }
     async fn schedule(&self, key: &ArtifactKey) -> Result<ScheduleOutcome> {
         validate_mysql_key(key)?;
         let (mut tx, now) = self.controlled().await?;
@@ -1466,17 +1474,14 @@ impl ArtifactSchedulerPersistence for MysqlArtifactScheduler {
         Ok(count == 1)
     }
 
-    async fn complete(
+    async fn complete_verified(
         &self,
         claim: &ClaimedArtifact,
         owner: &str,
-        evidence: &CompletionEvidence,
+        verified: &VerifiedCompletionEvidence,
     ) -> Result<bool> {
         check_mysql_len("lease owner", owner, 255)?;
-        validate_evidence(claim, evidence)?;
-        if !evidence.is_verified_by(self.verifier.identity()) {
-            self.verifier.verify(claim, evidence)?;
-        }
+        let evidence = self.completion_sealer.verify(claim, verified)?;
         let mut tx = self.pool.begin().await?;
         let now: i64 = sqlx::query_scalar("SELECT UNIX_TIMESTAMP()")
             .fetch_one(&mut *tx)
@@ -1487,7 +1492,7 @@ impl ArtifactSchedulerPersistence for MysqlArtifactScheduler {
              WHERE id=? AND state='running' AND owner=? AND lease_generation=?
                AND lease_expires_at>=?",
         )
-        .bind(&evidence.manifest)
+        .bind(evidence.manifest())
         .bind(now)
         .bind(claim.record.id)
         .bind(owner)

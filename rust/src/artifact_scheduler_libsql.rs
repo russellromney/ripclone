@@ -4,12 +4,14 @@
 //! transaction. Heartbeat, ownership checks, and settlement are fenced O(1)
 //! statements against the claimed job. No operation rewrites global state.
 
+#[cfg(test)]
+use crate::artifact_scheduler::CompletionEvidence;
 use crate::artifact_scheduler::{
-    ArtifactKey, ArtifactKind, ArtifactRecord, ArtifactState, ClaimedArtifact, CompletionEvidence,
-    CompletionVerifier, FailureClass, ObservationOutcome, ObservationSnapshot, RetryOutcome,
-    ScheduleOutcome, SchedulerLimits, scheduler_fingerprint, validate_evidence,
-    validate_format_version, validate_lease, validate_limits, validate_observation_identity,
-    validate_resolved_commit,
+    ArtifactKey, ArtifactKind, ArtifactRecord, ArtifactState, ClaimedArtifact,
+    CompletionSealAuthority, CompletionVerifier, FailureClass, ObservationOutcome, RetryOutcome,
+    ScheduleOutcome, SchedulerLimits, VerifiedCompletionEvidence, scheduler_fingerprint,
+    ObservationSnapshot, validate_format_version, validate_lease, validate_limits,
+    validate_observation_identity, validate_resolved_commit,
 };
 use crate::artifact_scheduler_backend::ArtifactSchedulerPersistence;
 use anyhow::{Context, Result, bail};
@@ -38,6 +40,7 @@ pub struct LibsqlArtifactScheduler {
     db: Arc<Database>,
     limits: SchedulerLimits,
     verifier: Arc<dyn CompletionVerifier>,
+    completion_sealer: Arc<CompletionSealAuthority>,
 }
 
 impl LibsqlArtifactScheduler {
@@ -114,10 +117,12 @@ impl LibsqlArtifactScheduler {
             bail!("scheduler running-limit configuration differs from existing fleet")
         }
         tx.commit().await?;
+        let completion_sealer = Arc::new(CompletionSealAuthority::new(verifier.identity())?);
         Ok(Self {
             db,
             limits,
             verifier,
+            completion_sealer,
         })
     }
     async fn conn(&self) -> Result<Connection> {
@@ -220,6 +225,9 @@ impl LibsqlArtifactScheduler {
 impl ArtifactSchedulerPersistence for LibsqlArtifactScheduler {
     fn completion_verifier(&self) -> Arc<dyn CompletionVerifier> {
         self.verifier.clone()
+    }
+    fn completion_sealer(&self) -> Arc<CompletionSealAuthority> {
+        self.completion_sealer.clone()
     }
     async fn schedule(&self, key: &ArtifactKey) -> Result<ScheduleOutcome> {
         validate_format_version(key.format_version)?;
@@ -360,13 +368,15 @@ impl ArtifactSchedulerPersistence for LibsqlArtifactScheduler {
         let t = now(&conn).await?;
         Ok(one_i64(&conn,"SELECT count(*) FROM artifact_jobs WHERE id=? AND state='running' AND owner=? AND lease_generation=? AND lease_expires_at>=?",vec![c.record.id.into(),o.into(),(c.record.lease_generation as i64).into(),t.into()]).await?==1)
     }
-    async fn complete(&self, c: &ClaimedArtifact, o: &str, e: &CompletionEvidence) -> Result<bool> {
-        validate_evidence(c, e)?;
-        if !e.is_verified_by(self.verifier.identity()) {
-            self.verifier.verify(c, e)?;
-        }
+    async fn complete_verified(
+        &self,
+        c: &ClaimedArtifact,
+        o: &str,
+        verified: &VerifiedCompletionEvidence,
+    ) -> Result<bool> {
+        let e = self.completion_sealer.verify(c, verified)?;
         let tx = self.tx().await?;
-        let r=async{let t=now(&tx).await?;let won=exec(&tx,"UPDATE artifact_jobs SET state='ready',owner=NULL,heartbeat_at=NULL,lease_expires_at=NULL,manifest=?,error=NULL,failure_class=NULL,updated_at=? WHERE id=? AND state='running' AND owner=? AND lease_generation=? AND lease_expires_at>=?",vec![e.manifest.clone().into(),t.into(),c.record.id.into(),o.into(),(c.record.lease_generation as i64).into(),t.into()]).await?==1;if won{exec(&tx,"UPDATE artifact_observations SET published_artifact_id=? WHERE desired_artifact_id=?",vec![c.record.id.into(),c.record.id.into()]).await?;}Ok(won)}.await;
+        let r=async{let t=now(&tx).await?;let won=exec(&tx,"UPDATE artifact_jobs SET state='ready',owner=NULL,heartbeat_at=NULL,lease_expires_at=NULL,manifest=?,error=NULL,failure_class=NULL,updated_at=? WHERE id=? AND state='running' AND owner=? AND lease_generation=? AND lease_expires_at>=?",vec![e.manifest().into(),t.into(),c.record.id.into(),o.into(),(c.record.lease_generation as i64).into(),t.into()]).await?==1;if won{exec(&tx,"UPDATE artifact_observations SET published_artifact_id=? WHERE desired_artifact_id=?",vec![c.record.id.into(),c.record.id.into()]).await?;}Ok(won)}.await;
         finish(tx, r).await
     }
     async fn fail(

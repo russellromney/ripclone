@@ -5,12 +5,14 @@
 //! settlement are O(1) conditional updates and do not take the control lock.
 
 use crate::artifact_scheduler::{
-    ArtifactKey, ArtifactKind, ArtifactRecord, ArtifactState, ClaimedArtifact, CompletionEvidence,
-    CompletionVerifier, FailureClass, ObservationOutcome, ObservationSnapshot, RetryOutcome,
-    ScheduleOutcome, SchedulerLimits, scheduler_fingerprint, validate_evidence,
-    validate_format_version, validate_lease, validate_limits, validate_observation_identity,
-    validate_resolved_commit,
+    ArtifactKey, ArtifactKind, ArtifactRecord, ArtifactState, ClaimedArtifact,
+    CompletionSealAuthority, CompletionVerifier, FailureClass, ObservationOutcome, RetryOutcome,
+    ScheduleOutcome, SchedulerLimits, VerifiedCompletionEvidence, scheduler_fingerprint,
+    ObservationSnapshot, validate_format_version, validate_lease, validate_limits,
+    validate_observation_identity, validate_resolved_commit,
 };
+#[cfg(test)]
+use crate::artifact_scheduler::{CompletionEvidence, validate_evidence};
 use crate::artifact_scheduler_backend::ArtifactSchedulerPersistence;
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -83,6 +85,7 @@ pub struct PostgresArtifactScheduler {
     pool: PgPool,
     limits: SchedulerLimits,
     verifier: Arc<dyn CompletionVerifier>,
+    completion_sealer: Arc<CompletionSealAuthority>,
 }
 
 impl PostgresArtifactScheduler {
@@ -434,10 +437,12 @@ impl PostgresArtifactScheduler {
             bail!("scheduler running-limit configuration differs from existing fleet")
         }
         migration.commit().await?;
+        let completion_sealer = Arc::new(CompletionSealAuthority::new(verifier.identity())?);
         Ok(Self {
             pool,
             limits,
             verifier,
+            completion_sealer,
         })
     }
 
@@ -676,6 +681,9 @@ fn existing_outcome(record: ArtifactRecord) -> ScheduleOutcome {
 impl ArtifactSchedulerPersistence for PostgresArtifactScheduler {
     fn completion_verifier(&self) -> Arc<dyn CompletionVerifier> {
         self.verifier.clone()
+    }
+    fn completion_sealer(&self) -> Arc<CompletionSealAuthority> {
+        self.completion_sealer.clone()
     }
     async fn schedule(&self, key: &ArtifactKey) -> Result<ScheduleOutcome> {
         validate_format_version(key.format_version)?;
@@ -1132,16 +1140,13 @@ impl ArtifactSchedulerPersistence for PostgresArtifactScheduler {
         Ok(count == 1)
     }
 
-    async fn complete(
+    async fn complete_verified(
         &self,
         claim: &ClaimedArtifact,
         owner: &str,
-        evidence: &CompletionEvidence,
+        verified: &VerifiedCompletionEvidence,
     ) -> Result<bool> {
-        validate_evidence(claim, evidence)?;
-        if !evidence.is_verified_by(self.verifier.identity()) {
-            self.verifier.verify(claim, evidence)?;
-        }
+        let evidence = self.completion_sealer.verify(claim, verified)?;
         let mut tx = self.pool.begin().await?;
         let now: i64 = sqlx::query_scalar("SELECT EXTRACT(EPOCH FROM clock_timestamp())::BIGINT")
             .fetch_one(&mut *tx)
@@ -1152,7 +1157,7 @@ impl ArtifactSchedulerPersistence for PostgresArtifactScheduler {
              WHERE id=$3 AND state='running' AND owner=$4 AND lease_generation=$5
                AND lease_expires_at>=$2",
         )
-        .bind(&evidence.manifest)
+        .bind(evidence.manifest())
         .bind(now)
         .bind(claim.record.id)
         .bind(owner)
