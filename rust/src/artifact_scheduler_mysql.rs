@@ -23,7 +23,7 @@ use sqlx::mysql::MySqlPool;
 use sqlx::{Acquire, MySql, MySqlConnection, Row, Transaction};
 use std::sync::Arc;
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 const V1_TO_V4_TRANSITION: i64 = 401;
 const V2_TO_V4_TRANSITION: i64 = 402;
 const SCHEMA: &[&str] = &[
@@ -218,13 +218,13 @@ impl MysqlArtifactScheduler {
             } else {
                 let version:i64=sqlx::query_scalar("SELECT version FROM artifact_scheduler_schema WHERE id=1").fetch_one(&mut connection).await?;
                 if version > SCHEMA_VERSION && ![V1_TO_V4_TRANSITION,V2_TO_V4_TRANSITION].contains(&version) { bail!("artifact scheduler database is newer than this binary") }
-                if ![1,2,3,SCHEMA_VERSION,V1_TO_V4_TRANSITION,V2_TO_V4_TRANSITION].contains(&version) { bail!("unsupported mysql artifact scheduler schema {version}") }
+                if ![1,2,3,4,SCHEMA_VERSION,V1_TO_V4_TRANSITION,V2_TO_V4_TRANSITION].contains(&version) { bail!("unsupported mysql artifact scheduler schema {version}") }
                 if [V1_TO_V4_TRANSITION,V2_TO_V4_TRANSITION].contains(&version) {
                     preflight_mysql_transition(&mut connection, version).await?;
                 } else {
                     preflight_mysql_schema(&mut connection,version).await?;
                 }
-                if version == 3 || version == SCHEMA_VERSION {
+                if version == 3 || version == 4 || version == SCHEMA_VERSION {
                     for statement in SCHEMA { sqlx::raw_sql(*statement).execute(&mut connection).await?; }
                     sqlx::query("INSERT INTO scheduler_state(id,fairness_cursor) VALUES(1,0) ON DUPLICATE KEY UPDATE id=VALUES(id)").execute(&mut connection).await?;
                 }
@@ -237,7 +237,7 @@ impl MysqlArtifactScheduler {
             if version > SCHEMA_VERSION && ![V1_TO_V4_TRANSITION,V2_TO_V4_TRANSITION].contains(&version) {
                 bail!("artifact scheduler database is newer than this binary")
             }
-            if ![1, 2, 3, SCHEMA_VERSION, V1_TO_V4_TRANSITION, V2_TO_V4_TRANSITION].contains(&version) {
+            if ![1, 2, 3, 4, SCHEMA_VERSION, V1_TO_V4_TRANSITION, V2_TO_V4_TRANSITION].contains(&version) {
                 bail!("unsupported mysql artifact scheduler schema {version}")
             }
             if version == 1 || version == 2 {
@@ -263,7 +263,7 @@ impl MysqlArtifactScheduler {
                 let scopes: Vec<(String,String,i64)> = sqlx::query_as("SELECT DISTINCT workspace,repo,format_version FROM artifact_jobs WHERE state='ready' AND kind IN('head','full_history')").fetch_all(&mut *migration).await?;
                 for (w,r,v) in scopes { refresh_base_retention(&mut migration,&w,&r,v).await?; }
                 let changed=sqlx::query("UPDATE artifact_scheduler_schema SET version=? WHERE id=1 AND version=?").bind(SCHEMA_VERSION).bind(transition).execute(&mut *migration).await?.rows_affected();
-                if changed != 1 { bail!("mysql transition marker changed during v4 publication") }
+                if changed != 1 { bail!("mysql transition marker changed during v5 publication") }
             } else if version == V1_TO_V4_TRANSITION || version == V2_TO_V4_TRANSITION {
                 migration.commit().await?;
                 if version == V1_TO_V4_TRANSITION {
@@ -279,10 +279,10 @@ impl MysqlArtifactScheduler {
                 let scopes: Vec<(String,String,i64)> = sqlx::query_as("SELECT DISTINCT workspace,repo,format_version FROM artifact_jobs WHERE state='ready' AND kind IN('head','full_history')").fetch_all(&mut *migration).await?;
                 for (w,r,v) in scopes { refresh_base_retention(&mut migration,&w,&r,v).await?; }
                 let changed=sqlx::query("UPDATE artifact_scheduler_schema SET version=? WHERE id=1 AND version=?").bind(SCHEMA_VERSION).bind(version).execute(&mut *migration).await?.rows_affected();
-                if changed != 1 { bail!("mysql transition marker changed during resumed v4 publication") }
-            } else if version == 3 {
-                let changed=sqlx::query("UPDATE artifact_scheduler_schema SET version=? WHERE id=1 AND version=3").bind(SCHEMA_VERSION).execute(&mut *migration).await?.rows_affected();
-                if changed != 1 { bail!("mysql v3 marker changed during v4 publication") }
+                if changed != 1 { bail!("mysql transition marker changed during resumed v5 publication") }
+            } else if version == 3 || version == 4 {
+                let changed=sqlx::query("UPDATE artifact_scheduler_schema SET version=? WHERE id=1 AND version=?").bind(SCHEMA_VERSION).bind(version).execute(&mut *migration).await?.rows_affected();
+                if changed != 1 { bail!("mysql v3/v4 marker changed during v5 publication") }
             }
             Self::validate_schema(&mut migration).await?;
 
@@ -2311,7 +2311,7 @@ impl ArtifactSchedulerPersistence for MysqlArtifactScheduler {
         .map_err(Into::into)
     }
 
-    async fn quarantine_ready(
+    async fn quarantine_publication(
         &self,
         key: &ArtifactKey,
         expected_manifest: &str,
@@ -2529,7 +2529,7 @@ mod tests {
             .fetch_one(&control)
             .await
             .unwrap(),
-            4
+            5
         );
         assert_eq!(sqlx::query_scalar::<_,i64>("SELECT count(*) FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name='artifact_gc_sweep'").fetch_one(&control).await.unwrap(), 1);
 
@@ -3279,7 +3279,36 @@ mod tests {
             .fetch_one(migrated_v2.pool())
             .await
             .unwrap(),
-            4
+            5
+        );
+
+        reset(&control).await;
+        for statement in SCHEMA {
+            sqlx::raw_sql(*statement).execute(&control).await.unwrap();
+        }
+        sqlx::query("INSERT INTO artifact_scheduler_schema(id,version) VALUES(1,4)")
+            .execute(&control)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO scheduler_state(id,fairness_cursor) VALUES(1,0)")
+            .execute(&control)
+            .await
+            .unwrap();
+        let migrated_v4 = MysqlArtifactScheduler::from_pool(
+            MySqlPoolOptions::new().connect(&url).await.unwrap(),
+            Default::default(),
+            Arc::new(Accept),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT version FROM artifact_scheduler_schema WHERE id=1"
+            )
+            .fetch_one(migrated_v4.pool())
+            .await
+            .unwrap(),
+            5
         );
 
         for stage in ["marker_only", "base_only", "both_empty", "partial", "full"] {
@@ -3364,7 +3393,7 @@ mod tests {
                 .fetch_one(&control)
                 .await
                 .unwrap(),
-                4
+                5
             );
             let rows:Vec<(String,Option<i16>,Option<i16>)>=sqlx::query_as("SELECT j.kind,r.head_rank,r.pair_rank FROM artifact_base_retention r JOIN artifact_jobs j ON j.id=r.artifact_id ORDER BY j.kind").fetch_all(&control).await.unwrap();
             assert_eq!(
@@ -3467,7 +3496,7 @@ mod tests {
                 .fetch_one(&control)
                 .await
                 .unwrap(),
-                4
+                5
             );
             assert_eq!(sqlx::query_scalar::<_,i64>("SELECT count(*) FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name='artifact_transport_leases'").fetch_one(&control).await.unwrap(),1);
             let rows:Vec<(String,Option<i16>,Option<i16>)>=sqlx::query_as("SELECT j.kind,r.head_rank,r.pair_rank FROM artifact_base_retention r JOIN artifact_jobs j ON j.id=r.artifact_id ORDER BY j.kind").fetch_all(&control).await.unwrap();
@@ -3485,7 +3514,7 @@ mod tests {
         for statement in SCHEMA {
             sqlx::raw_sql(*statement).execute(&control).await.unwrap();
         }
-        sqlx::query("INSERT INTO artifact_scheduler_schema(id,version) VALUES(1,5)")
+        sqlx::query("INSERT INTO artifact_scheduler_schema(id,version) VALUES(1,6)")
             .execute(&control)
             .await
             .unwrap();

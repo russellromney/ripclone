@@ -22,8 +22,9 @@ use async_trait::async_trait;
 use libsql::{Connection, Database, Row, Transaction, TransactionBehavior, Value};
 use std::sync::Arc;
 
-const VERSION: i64 = 4;
-const PROVENANCE: &str = "ripclone-artifact-scheduler-libsql-v4";
+const VERSION: i64 = 5;
+const PROVENANCE: &str = "ripclone-artifact-scheduler-libsql-v5";
+const V4_PROVENANCE: &str = "ripclone-artifact-scheduler-libsql-v4";
 const V3_PROVENANCE: &str = "ripclone-artifact-scheduler-libsql-v3";
 const GC_SWEEP_SCHEMA: &str = "CREATE TABLE artifact_gc_sweep(id INTEGER PRIMARY KEY CHECK(id=1),owner TEXT NOT NULL,expires_at INTEGER NOT NULL)";
 const SCHEMA: &[&str] = &[
@@ -98,6 +99,7 @@ impl LibsqlArtifactScheduler {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .await?;
+        let migration_result: Result<()> = async {
         let existing=one_i64(&tx,"SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN('artifact_scheduler_schema','artifact_jobs','branch_observations','artifact_observations','artifact_consumers','artifact_transport_leases','artifact_base_retention','scheduler_state')",vec![]).await?;
         if existing == 0 {
             for ddl in SCHEMA {
@@ -171,6 +173,9 @@ impl LibsqlArtifactScheduler {
                 }
                 validate_schema(&tx, 3, V3_PROVENANCE).await?;
                 tx.execute("UPDATE artifact_scheduler_schema SET version=?,provenance=? WHERE id=1 AND version=3 AND provenance=?",libsql::params![VERSION,PROVENANCE,V3_PROVENANCE]).await?;
+            } else if version == 4 && provenance == V4_PROVENANCE {
+                validate_schema(&tx, 4, V4_PROVENANCE).await?;
+                tx.execute("UPDATE artifact_scheduler_schema SET version=?,provenance=? WHERE id=1 AND version=4 AND provenance=?",libsql::params![VERSION,PROVENANCE,V4_PROVENANCE]).await?;
             } else if version != VERSION || provenance != PROVENANCE {
                 bail!("unsupported or foreign libsql artifact scheduler schema")
             }
@@ -196,6 +201,17 @@ impl LibsqlArtifactScheduler {
             }
         } else if stored != fingerprint {
             bail!("scheduler running-limit configuration differs from existing fleet")
+        }
+            Ok(())
+        }
+        .await;
+        if let Err(error) = migration_result {
+            if let Err(rollback) = tx.rollback().await {
+                return Err(error).context(format!(
+                    "libsql scheduler migration also failed to roll back: {rollback:#}"
+                ));
+            }
+            return Err(error);
         }
         tx.commit().await?;
         let completion_sealer = Arc::new(CompletionSealAuthority::new(verifier.identity())?);
@@ -730,7 +746,7 @@ impl ArtifactSchedulerPersistence for LibsqlArtifactScheduler {
             .await?;
         let mut records = Vec::new();
         while let Some(row) = rows.next().await? {
-            records.push(row_record(&row)?);
+            records.push(row_record(row)?);
         }
         Ok(records)
     }
@@ -825,7 +841,7 @@ impl ArtifactSchedulerPersistence for LibsqlArtifactScheduler {
         }
         Ok(commits)
     }
-    async fn quarantine_ready(
+    async fn quarantine_publication(
         &self,
         key: &ArtifactKey,
         expected_manifest: &str,
@@ -1360,6 +1376,7 @@ mod tests {
         child: Child,
         _dir: tempfile::TempDir,
         url: String,
+        _permit: tokio::sync::OwnedSemaphorePermit,
     }
     impl Drop for Server {
         fn drop(&mut self) {
@@ -1368,6 +1385,18 @@ mod tests {
         }
     }
     async fn server() -> Option<Server> {
+        static SQLD_TEST_LIMIT: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> =
+            std::sync::OnceLock::new();
+        let permit = SQLD_TEST_LIMIT
+            // sqld startup and teardown are resource-heavy enough that a
+            // default-parallel test run can otherwise interrupt unrelated
+            // databases. Fixtures that need multiple schemas rotate them
+            // sequentially, so one process-wide slot is both safe and bounded.
+            .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("sqld test semaphore never closes");
         let port = TcpListener::bind("127.0.0.1:0")
             .unwrap()
             .local_addr()
@@ -1398,11 +1427,20 @@ mod tests {
                 .await
             {
                 if let Ok(c) = db.connect() {
-                    if c.query("SELECT 1", ()).await.is_ok() {
+                    if c.query("SELECT 1", ()).await.is_ok()
+                        && c.execute_batch("BEGIN IMMEDIATE; ROLLBACK").await.is_ok()
+                    {
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                        if c.query("SELECT 1", ()).await.is_err()
+                            || c.execute_batch("BEGIN IMMEDIATE; ROLLBACK").await.is_err()
+                        {
+                            continue;
+                        }
                         return Some(Server {
                             child,
                             _dir: dir,
                             url,
+                            _permit: permit,
                         });
                     }
                 }
@@ -1451,7 +1489,7 @@ mod tests {
             .unwrap()
     }
     async fn startup_error(url: &str) -> String {
-        match LibsqlArtifactScheduler::from_database(
+        let error = match LibsqlArtifactScheduler::from_database(
             db(url).await,
             Default::default(),
             Arc::new(Accept),
@@ -1460,7 +1498,26 @@ mod tests {
         {
             Ok(_) => panic!("expected scheduler startup rejection"),
             Err(error) => error.to_string(),
+        };
+        // An expected failed migration must release its immediate writer lock
+        // before the adversarial fixture mutates the next shape. libSQL rolls
+        // back a dropped transaction asynchronously, so assert bounded release
+        // instead of racing the next DDL or retrying the failed migration.
+        let connection = db(url).await.connect().unwrap();
+        for _ in 0..10 {
+            if matches!(
+                tokio::time::timeout(
+                    Duration::from_millis(100),
+                    connection.execute_batch("BEGIN IMMEDIATE; ROLLBACK")
+                )
+                .await,
+                Ok(Ok(_))
+            ) {
+                return error;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        panic!("failed libsql migration did not release its writer lock within one second")
     }
     async fn install_version_fixture(url: &str, version: i64, provenance: &str, gc: bool) {
         let database = db(url).await;
@@ -1499,8 +1556,8 @@ mod tests {
         tx.commit().await.unwrap();
     }
 
-    #[tokio::test]
-    async fn released_v3_migrates_to_v4_and_mixed_partial_future_fail_closed() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn released_v3_v4_migrate_to_v5_and_mixed_partial_future_fail_closed() {
         let Some(v3) = server().await else { return };
         install_version_fixture(&v3.url, 3, V3_PROVENANCE, true).await;
         let migrated = scheduler(&v3.url, Default::default()).await;
@@ -1513,7 +1570,7 @@ mod tests {
             )
             .await
             .unwrap(),
-            4
+            5
         );
         assert_eq!(
             one_string(
@@ -1540,10 +1597,36 @@ mod tests {
             )
             .await
             .unwrap(),
-            4
+            5
         );
         drop(migrated_v2);
         drop(v2);
+
+        let Some(v4) = server().await else { return };
+        install_version_fixture(&v4.url, 4, V4_PROVENANCE, true).await;
+        let migrated_v4 = scheduler(&v4.url, Default::default()).await;
+        assert_eq!(
+            one_i64(
+                &migrated_v4.conn().await.unwrap(),
+                "SELECT version FROM artifact_scheduler_schema WHERE id=1",
+                vec![]
+            )
+            .await
+            .unwrap(),
+            5
+        );
+        assert_eq!(
+            one_string(
+                &migrated_v4.conn().await.unwrap(),
+                "SELECT provenance FROM artifact_scheduler_schema WHERE id=1",
+                vec![]
+            )
+            .await
+            .unwrap(),
+            PROVENANCE
+        );
+        drop(migrated_v4);
+        drop(v4);
 
         let Some(missing_base) = server().await else {
             return;
@@ -1585,22 +1668,22 @@ mod tests {
         let Some(partial) = server().await else {
             return;
         };
-        install_version_fixture(&partial.url, 4, PROVENANCE, false).await;
+        install_version_fixture(&partial.url, 5, PROVENANCE, false).await;
         assert!(!startup_error(&partial.url).await.is_empty());
         drop(partial);
 
         let Some(future) = server().await else { return };
         install_version_fixture(
             &future.url,
-            5,
-            "ripclone-artifact-scheduler-libsql-v5",
+            6,
+            "ripclone-artifact-scheduler-libsql-v6",
             true,
         )
         .await;
         assert!(!startup_error(&future.url).await.is_empty());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn same_repo_different_expensive_kinds_run_independently() {
         let Some(server) = server().await else { return };
         let scheduler = scheduler(
@@ -1633,7 +1716,7 @@ mod tests {
         assert!(scheduler.claim("blocked", 5).await.unwrap().is_none());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn concurrent_instances_generation_aba_and_publication() {
         let Some(s) = server().await else { return };
         let a = scheduler(&s.url, Default::default()).await;
@@ -1904,7 +1987,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn consumers_reserve_retries_deadletter_and_verifier_are_fenced() {
         let Some(s) = server().await else { return };
         let limits = SchedulerLimits {
@@ -1996,7 +2079,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reserve_and_fleet_running_caps_are_aggregated() {
         let Some(s) = server().await else { return };
         let limits = SchedulerLimits {
@@ -2057,7 +2140,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn planted_marker_missing_defaults_and_null_state_fail_closed() {
         let Some(s) = server().await else { return };
         let d = db(&s.url).await;
@@ -2077,7 +2160,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn exact_schema_corrupt_rows_and_indexes_fail_closed() {
         let Some(s) = server().await else { return };
         let a = scheduler(&s.url, Default::default()).await;
@@ -2090,6 +2173,8 @@ mod tests {
                 .await
                 .contains("invalid artifact jobs")
         );
+        drop(a);
+        drop(s);
 
         let Some(s) = server().await else { return };
         let a = scheduler(&s.url, Default::default()).await;
@@ -2110,6 +2195,8 @@ mod tests {
                 .await
                 .contains("invalid artifact observations")
         );
+        drop(a);
+        drop(s);
 
         let Some(s) = server().await else { return };
         let a = scheduler(&s.url, Default::default()).await;
@@ -2128,6 +2215,9 @@ mod tests {
                 .await
                 .contains("index artifact_jobs_claim differs")
         );
+        drop(c);
+        drop(a);
+        drop(s);
 
         let Some(s) = server().await else { return };
         let a = scheduler(&s.url, Default::default()).await;
@@ -2145,6 +2235,8 @@ mod tests {
                 .await
                 .contains("invalid artifact jobs")
         );
+        drop(a);
+        drop(s);
 
         let Some(s) = server().await else { return };
         let a = scheduler(&s.url, Default::default()).await;
@@ -2179,6 +2271,8 @@ mod tests {
                 .await
                 .contains("blank artifact manifest")
         );
+        drop(a);
+        drop(s);
 
         let Some(s) = server().await else { return };
         let a = scheduler(&s.url, Default::default()).await;
@@ -2191,6 +2285,8 @@ mod tests {
                 .await
                 .contains("blank artifact lease owner")
         );
+        drop(a);
+        drop(s);
 
         let Some(s) = server().await else { return };
         let a = scheduler(&s.url, Default::default()).await;

@@ -3476,9 +3476,20 @@ fn base_pack(pair: &crate::artifact_manifest::GitPackPair) -> crate::pinned_bund
 // wave may represent verified history as bounded LSM levels; clone planning
 // still consumes one immutable flattened base pack set after verification.
 fn full_history_base_packs(
+    verifier: &crate::artifact_manifest::CasCompletionVerifier,
     history: &crate::artifact_manifest::FullHistoryArtifact,
-) -> Vec<crate::pinned_bundle::StoredPack> {
-    history.history_packs.iter().map(base_pack).collect()
+) -> Result<Vec<crate::pinned_bundle::StoredPack>> {
+    let mut packs = Vec::new();
+    for level in &history.levels {
+        packs.extend(
+            verifier
+                .read_history_level_manifest(level)?
+                .packs
+                .iter()
+                .map(base_pack),
+        );
+    }
+    Ok(packs)
 }
 
 async fn verified_artifact(
@@ -3508,7 +3519,11 @@ async fn verified_artifact(
         .expect("typed artifact verification semaphore never closes");
     let verification: Result<crate::artifact_manifest::ArtifactManifest> = async {
         hydrate_typed_publication(state, key, manifest_hash).await?;
-        let verifier = state.artifact_verifier.clone();
+        let verifier = state
+            .artifact_verifier
+            .as_ref()
+            .context("normalized artifact verifier is not configured")?
+            .clone();
         let verify_key = key.clone();
         let verify_hash = manifest_hash.to_owned();
         tokio::task::spawn_blocking(move || verifier.verify_publication(&verify_key, &verify_hash))
@@ -3524,7 +3539,11 @@ async fn verified_artifact(
             // report by the exact manifest hash: if another publisher replaced
             // it concurrently this stale verifier cannot invalidate the winner.
             let quarantined = scheduler
-                .quarantine_ready(key, manifest_hash, "read-time artifact verification failed")
+                .quarantine_publication(
+                    key,
+                    manifest_hash,
+                    "read-time artifact verification failed",
+                )
                 .await
                 .context("quarantine invalid typed publication")?;
             if quarantined {
@@ -3591,7 +3610,37 @@ async fn hydrate_typed_publication(
     }
     state.cas.put_with_hash(manifest_hash, &manifest_bytes)?;
 
-    let blobs = manifest.payload.referenced_blobs();
+    let mut blobs = manifest
+        .payload
+        .referenced_blobs()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    if let crate::artifact_manifest::ArtifactPayload::FullHistory(history) = &manifest.payload {
+        for level in &history.levels {
+            let bytes = read_storage_object_bounded(
+                state.storage.clone(),
+                level.level_manifest.hash.clone(),
+                MAX_TYPED_ROOT_MANIFEST_BYTES,
+            )
+            .await?;
+            if bytes.len() as u64 != level.level_manifest.len {
+                anyhow::bail!("durable history level-manifest length mismatch");
+            }
+            state
+                .cas
+                .put_with_hash(&level.level_manifest.hash, &bytes)
+                .context("install authenticated history level manifest")?;
+            let nested: crate::artifact_manifest::HistoryLevelManifest =
+                serde_json::from_slice(&bytes).context("decode history level manifest")?;
+            if nested.schema_version != crate::artifact_manifest::HISTORY_LEVEL_MANIFEST_SCHEMA {
+                anyhow::bail!("unsupported history level-manifest schema");
+            }
+            for pair in nested.packs {
+                blobs.extend([pair.pack, pair.index]);
+            }
+        }
+    }
     if blobs.len() > MAX_TYPED_PUBLICATION_OBJECTS {
         anyhow::bail!("typed publication has too many direct CAS objects");
     }
@@ -3610,7 +3659,7 @@ async fn hydrate_typed_publication(
 
     let storage = state.storage.clone();
     let cas = state.cas.clone();
-    let owned = blobs.into_iter().cloned().collect::<Vec<_>>();
+    let owned = blobs;
     tokio::task::spawn_blocking(move || -> Result<()> {
         use sha2::Digest as _;
         use std::io::Write as _;
@@ -3889,7 +3938,11 @@ async fn build_top_up_receipt(
             let ArtifactPayload::FullHistory(history) = history_manifest.payload else {
                 anyhow::bail!("verified History publication decoded as another artifact kind");
             };
-            packs.extend(full_history_base_packs(&history));
+            let verifier = state
+                .artifact_verifier
+                .as_ref()
+                .context("normalized artifact verifier is not configured")?;
+            packs.extend(full_history_base_packs(verifier, &history)?);
         }
         let base = crate::pinned_bundle::VerifiedBaseArtifact {
             commit: base_commit.clone(),
@@ -10871,7 +10924,7 @@ mod tests {
             repo: repo.into(),
             commit: "1".repeat(40),
             kind: ArtifactKind::Head,
-            format_version: 1,
+            format_version: crate::artifact_manifest::ARTIFACT_FORMAT_VERSION,
         };
         scheduler.schedule(&key("owner/saturated")).await.unwrap();
         assert!(
@@ -10897,7 +10950,14 @@ mod tests {
     }
 
     #[tokio::test]
+    // This test intentionally shares the process-wide guard used by tests that
+    // mutate Git origin environment. Holding it for the full async scenario is
+    // the serialization boundary, not an application synchronization pattern.
+    #[allow(clippy::await_holding_lock)]
     async fn normalized_http_serves_verified_exact_head_full_and_files_plans() {
+        let _origin_guard = crate::git::ORIGIN_BASE_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         use crate::artifact_manifest::{
             ArtifactManifest, ArtifactPayload, CasBlob, FilesArtifact, FullHistoryArtifact,
             GitPackPair, HeadArtifact,
@@ -11034,7 +11094,7 @@ mod tests {
             crate::artifact_scheduler::ArtifactScheduler::open_with_verifier(
                 state_root.path().join("scheduler.db").to_str().unwrap(),
                 SchedulerLimits::default(),
-                verifier,
+                verifier.clone(),
             )
             .await
             .unwrap(),
@@ -11085,11 +11145,34 @@ mod tests {
             hash: state.cas.put(&commit_bytes).unwrap(),
             len: commit_bytes.len() as u64,
         };
+        let history_packs = pairs(&source, &state.cas, &first, None);
+        let mut history_level = crate::artifact_manifest::FullHistoryLevel {
+            tier: crate::artifact_manifest::FULL_HISTORY_BASE_TIER,
+            base_exclusive: vec![],
+            tips: vec![first.clone()],
+            level_manifest: verifier
+                .store_history_level_manifest(history_packs.clone())
+                .unwrap(),
+            proof: crate::artifact_manifest::FullHistoryLevelProof::unsealed(),
+        };
+        let history_objects =
+            crate::git::list_object_shas_with_depth(&source, &first, None).unwrap();
+        let history_scratch = tempfile::tempdir().unwrap();
+        verifier
+            .verify_and_seal_history_level(
+                &mut history_level,
+                &history_packs,
+                &history_objects,
+                &target,
+                &tokio_util::sync::CancellationToken::new(),
+                history_scratch.path(),
+            )
+            .unwrap();
         let history = ArtifactManifest::new(
             &artifact_key(&repo_id, &target, ArtifactKind::FullHistory),
             ArtifactPayload::FullHistory(FullHistoryArtifact {
                 target_commit_object: commit_blob.clone(),
-                history_packs: pairs(&source, &state.cas, &first, None),
+                levels: vec![history_level],
             }),
         )
         .unwrap();
@@ -11152,16 +11235,16 @@ mod tests {
                     ArtifactKind::FullHistory,
                     ArtifactKind::Files,
                 ],
-                1,
+                TYPED_ARTIFACT_FORMAT_VERSION,
             )
             .await
             .unwrap();
         let mut evidence = std::collections::HashMap::new();
         for manifest in [head, history, files] {
             let stored = manifest.store(&state.cas).unwrap();
-            evidence.insert(stored.key.kind, stored);
+            evidence.insert(stored.key().kind, stored);
         }
-        let head_manifest_hash = evidence[&ArtifactKind::Head].manifest.clone();
+        let head_manifest_hash = evidence[&ArtifactKind::Head].manifest().to_owned();
         let server_cas = state.cas.clone();
         for _ in 0..3 {
             let claim = scheduler.claim("publisher", 60).await.unwrap().unwrap();
@@ -12509,7 +12592,7 @@ mod tests {
             repo: "acme/widget".into(),
             commit: "1".repeat(40),
             kind: ArtifactKind::Head,
-            format_version: 1,
+            format_version: crate::artifact_manifest::ARTIFACT_FORMAT_VERSION,
         };
         let pack = CasBlob {
             hash: state.cas.put(b"pack").unwrap(),
@@ -12545,7 +12628,7 @@ mod tests {
                 .unwrap()
         );
         state.artifact_scheduler = Some(Arc::new(scheduler));
-        let root = evidence.manifest;
+        let root = evidence.manifest().to_owned();
         let repo = RepoId::github("acme/widget");
 
         assert!(
@@ -12591,7 +12674,7 @@ mod tests {
             repo: "acme/widget".into(),
             commit: "1".repeat(40),
             kind: ArtifactKind::Head,
-            format_version: 1,
+            format_version: crate::artifact_manifest::ARTIFACT_FORMAT_VERSION,
         };
         let blob = |bytes: &[u8]| CasBlob {
             hash: durable_cas.put(bytes).unwrap(),
@@ -12614,11 +12697,11 @@ mod tests {
         .store(&durable_cas)
         .unwrap();
         assert!(!state.cas.path(&pack.hash).exists());
-        hydrate_typed_publication(&state, &key, &evidence.manifest)
+        hydrate_typed_publication(&state, &key, evidence.manifest())
             .await
             .unwrap();
         assert_eq!(state.cas.get(&pack.hash).unwrap(), b"remote-pack");
-        assert!(state.cas.verify_object(&evidence.manifest).is_ok());
+        assert!(state.cas.verify_object(evidence.manifest()).is_ok());
 
         let lying_bytes = b"durable-length-lie";
         let lying_hash = durable_cas.put(lying_bytes).unwrap();
@@ -12638,7 +12721,7 @@ mod tests {
         .unwrap()
         .store(&durable_cas)
         .unwrap();
-        let error = hydrate_typed_publication(&state, &key, &lying.manifest)
+        let error = hydrate_typed_publication(&state, &key, lying.manifest())
             .await
             .unwrap_err();
         assert!(error.to_string().contains("length mismatch"));

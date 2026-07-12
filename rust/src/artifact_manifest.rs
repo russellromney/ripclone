@@ -413,12 +413,7 @@ impl ArtifactPayload {
                 .chain(std::iter::once(&head.prebuilt_index))
                 .collect(),
             Self::FullHistory(history) => std::iter::once(&history.target_commit_object)
-                .chain(
-                    history
-                        .history_packs
-                        .iter()
-                        .flat_map(|pair| [&pair.pack, &pair.index]),
-                )
+                .chain(history.levels.iter().map(|level| &level.level_manifest))
                 .collect(),
             Self::Files(files) => std::iter::once(&files.target_commit_object)
                 .chain(std::iter::once(&files.metadata))
@@ -2047,7 +2042,7 @@ impl CasCompletionVerifier {
         .await
         .context("join durable root verification")??;
         Ok(())
-     }
+    }
 
     /// Re-verify a scheduler publication at read time. The artifact count is
     /// derived from the authenticated manifest instead of trusting a database
@@ -3879,15 +3874,15 @@ mod tests {
         let verifier = CasCompletionVerifier::new(f.cas.clone());
         assert_eq!(
             verifier
-                .verify_publication(&evidence.key, &evidence.manifest)
+                .verify_publication(evidence.key(), evidence.manifest())
                 .unwrap(),
             manifest
         );
-        let mut foreign = evidence.key;
+        let mut foreign = evidence.key().clone();
         foreign.workspace = "foreign-workspace".into();
         assert!(
             verifier
-                .verify_publication(&foreign, &evidence.manifest)
+                .verify_publication(&foreign, evidence.manifest())
                 .is_err()
         );
     }
@@ -4588,8 +4583,10 @@ mod tests {
         // root after the discovery stat but before assessment. Neither stale
         // observation may quarantine the Ready publication or overwrite/delete
         // the canonical repair.
-        let mut root_race_limits = ArtifactVerificationLimits::default();
-        root_race_limits.manifest_bytes = healthy_root.len() as u64;
+        let root_race_limits = ArtifactVerificationLimits {
+            manifest_bytes: healthy_root.len() as u64,
+            ..ArtifactVerificationLimits::default()
+        };
         let root_race_verifier = CasCompletionVerifier::with_limits_and_storage(
             f.cas.clone(),
             storage.clone(),

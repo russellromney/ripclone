@@ -23,7 +23,7 @@ use sqlx::postgres::PgPool;
 use sqlx::{Postgres, Row, Transaction};
 use std::sync::Arc;
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS artifact_scheduler_schema(
  id SMALLINT CONSTRAINT artifact_scheduler_schema_pkey PRIMARY KEY,
@@ -195,7 +195,7 @@ impl PostgresArtifactScheduler {
             if version > SCHEMA_VERSION {
                 bail!("artifact scheduler database is newer than this binary")
             }
-            if ![1, 2, 3, SCHEMA_VERSION].contains(&version) {
+            if ![1, 2, 3, 4, SCHEMA_VERSION].contains(&version) {
                 bail!("unsupported postgres artifact scheduler schema {version}")
             }
             preflight_postgres_schema(&mut migration, version).await?;
@@ -215,7 +215,7 @@ impl PostgresArtifactScheduler {
         if version > SCHEMA_VERSION {
             bail!("artifact scheduler database is newer than this binary")
         }
-        if ![1, 2, 3, SCHEMA_VERSION].contains(&version) {
+        if ![1, 2, 3, 4, SCHEMA_VERSION].contains(&version) {
             bail!("unsupported postgres artifact scheduler schema {version}")
         }
         let missing_columns: i64 = sqlx::query_scalar(
@@ -1862,7 +1862,7 @@ impl ArtifactSchedulerPersistence for PostgresArtifactScheduler {
         .map_err(Into::into)
     }
 
-    async fn quarantine_ready(
+    async fn quarantine_publication(
         &self,
         key: &ArtifactKey,
         expected_manifest: &str,
@@ -2050,7 +2050,7 @@ mod tests {
             .fetch_one(&control)
             .await
             .unwrap(),
-            4
+            5
         );
         assert_eq!(sqlx::query_scalar::<_,i64>("SELECT count(*) FROM information_schema.tables WHERE table_schema=current_schema() AND table_name='artifact_gc_sweep'").fetch_one(&control).await.unwrap(), 1);
 
@@ -3047,7 +3047,30 @@ mod tests {
             .fetch_one(migrated_v2.pool())
             .await
             .unwrap(),
-            4
+            5
+        );
+
+        reset(&control).await;
+        sqlx::raw_sql(SCHEMA).execute(&control).await.unwrap();
+        sqlx::query("INSERT INTO artifact_scheduler_schema(id,version) VALUES(1,4)")
+            .execute(&control)
+            .await
+            .unwrap();
+        let migrated_v4 = PostgresArtifactScheduler::from_pool(
+            PgPoolOptions::new().connect(&url).await.unwrap(),
+            Default::default(),
+            Arc::new(Accept),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT version FROM artifact_scheduler_schema WHERE id=1"
+            )
+            .fetch_one(migrated_v4.pool())
+            .await
+            .unwrap(),
+            5
         );
 
         reset(&control).await;

@@ -709,10 +709,11 @@ impl ArtifactScheduler {
         sqlx::query("BEGIN IMMEDIATE")
             .execute(&mut *migration)
             .await?;
+        let migration_result: Result<()> = async {
         let prior_version: i64 = sqlx::query_scalar("PRAGMA user_version")
             .fetch_one(&mut *migration)
             .await?;
-        if prior_version > 4 {
+        if prior_version > 5 {
             bail!("artifact scheduler database is newer than this binary")
         }
         preflight_sqlite_schema(&mut migration, prior_version).await?;
@@ -848,6 +849,18 @@ impl ArtifactScheduler {
         .await?;
         if invalid_job_formats != 0 {
             bail!("artifact scheduler contains invalid job format versions")
+        }
+        let fence_tables_before: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN(
+               'ready_publication_fence_sequence','ready_publication_fences','ready_publication_fence_members')",
+        )
+        .fetch_one(&mut *migration)
+        .await?;
+        if prior_version >= 3 && fence_tables_before == 0 {
+            sqlx::raw_sql(FENCE_SCHEMA_V3)
+                .execute(&mut *migration)
+                .await
+                .context("add admission fences to transport scheduler lineage")?;
         }
         if prior_version < 3 {
             let legacy_tables: i64 = sqlx::query_scalar(
@@ -993,9 +1006,6 @@ impl ArtifactScheduler {
         ) {
             bail!("ready publication fence operation provenance is invalid")
         }
-        sqlx::raw_sql("PRAGMA user_version=3")
-            .execute(&mut *migration)
-            .await?;
         sqlx::raw_sql("DELETE FROM artifact_base_retention;
           INSERT INTO artifact_base_retention(artifact_id,workspace,repo,format_version,head_rank,pair_rank)
           SELECT id,workspace,repo,format_version,head_rank,NULL FROM (SELECT id,workspace,repo,format_version,row_number() OVER(PARTITION BY workspace,repo,format_version ORDER BY updated_at DESC,id DESC) head_rank FROM artifact_jobs WHERE kind='head' AND state='ready' AND manifest IS NOT NULL AND length(trim(manifest))>0) WHERE head_rank<=8;
@@ -1003,15 +1013,21 @@ impl ArtifactScheduler {
           SELECT head_id,workspace,repo,format_version,NULL,pair_rank FROM (SELECT h.id head_id,h.workspace,h.repo,h.format_version,row_number() OVER(PARTITION BY h.workspace,h.repo,h.format_version ORDER BY CASE WHEN h.updated_at>f.updated_at THEN h.updated_at ELSE f.updated_at END DESC,CASE WHEN h.id>f.id THEN h.id ELSE f.id END DESC) pair_rank FROM artifact_jobs h JOIN artifact_jobs f ON f.workspace=h.workspace AND f.repo=h.repo AND f.commit_oid=h.commit_oid AND f.format_version=h.format_version AND f.kind='full_history' AND f.state='ready' AND f.manifest IS NOT NULL AND length(trim(f.manifest))>0 WHERE h.kind='head' AND h.state='ready' AND h.manifest IS NOT NULL AND length(trim(h.manifest))>0) WHERE pair_rank<=8 ON CONFLICT(artifact_id) DO UPDATE SET pair_rank=excluded.pair_rank;
           INSERT INTO artifact_base_retention(artifact_id,workspace,repo,format_version,head_rank,pair_rank)
           SELECT history_id,workspace,repo,format_version,NULL,pair_rank FROM (SELECT f.id history_id,h.workspace,h.repo,h.format_version,row_number() OVER(PARTITION BY h.workspace,h.repo,h.format_version ORDER BY CASE WHEN h.updated_at>f.updated_at THEN h.updated_at ELSE f.updated_at END DESC,CASE WHEN h.id>f.id THEN h.id ELSE f.id END DESC) pair_rank FROM artifact_jobs h JOIN artifact_jobs f ON f.workspace=h.workspace AND f.repo=h.repo AND f.commit_oid=h.commit_oid AND f.format_version=h.format_version AND f.kind='full_history' AND f.state='ready' AND f.manifest IS NOT NULL AND length(trim(f.manifest))>0 WHERE h.kind='head' AND h.state='ready' AND h.manifest IS NOT NULL AND length(trim(h.manifest))>0) WHERE pair_rank<=8 ON CONFLICT(artifact_id) DO UPDATE SET pair_rank=excluded.pair_rank;
-          PRAGMA user_version=4")
+          PRAGMA user_version=5")
             .execute(&mut *migration)
             .await?;
-        } else if prior_version == 3 {
-            sqlx::query("PRAGMA user_version=4")
-                .execute(&mut *migration)
-                .await?;
+            sqlx::query("COMMIT").execute(&mut *migration).await?;
+            Ok(())
         }
-        sqlx::query("COMMIT").execute(&mut *migration).await?;
+        .await;
+        if let Err(error) = migration_result {
+            if let Err(rollback) = sqlx::query("ROLLBACK").execute(&mut *migration).await {
+                return Err(error).context(format!(
+                    "sqlite scheduler migration also failed to roll back: {rollback:#}"
+                ));
+            }
+            return Err(error);
+        }
         let version: i64 = sqlx::query_scalar("PRAGMA user_version")
             .fetch_one(&pool)
             .await?;
@@ -1032,7 +1048,7 @@ impl ArtifactScheduler {
         )
         .fetch_one(&pool)
         .await?;
-        if version != 3
+        if version != 5
             || required != 4
             || fence_tables != 3
             || fence_columns != 16
@@ -1053,7 +1069,7 @@ impl ArtifactScheduler {
             .filter(|c| !c.is_whitespace())
             .flat_map(char::to_lowercase)
             .collect::<String>();
-        if version != 4
+        if version != 5
             || required != 4
             || base_columns != 6
             || invalid_base != 0
@@ -2133,7 +2149,7 @@ impl ArtifactScheduler {
         .await?;
         Ok(commits)
     }
-    pub async fn quarantine_ready(
+    pub async fn quarantine_publication(
         &self,
         key: &ArtifactKey,
         expected_manifest: &str,
@@ -2411,14 +2427,61 @@ async fn preflight_sqlite_schema(
     if version == 0 || version == 1 {
         return Ok(());
     }
-    let expected_tables = if version == 2 { 6 } else { 8 };
-    let tables: i64 = sqlx::query_scalar("SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN('artifact_jobs','artifact_base_retention','branch_observations','artifact_observations','artifact_consumers','artifact_transport_leases','artifact_gc_sweep','scheduler_state')")
-        .fetch_one(&mut **connection).await?;
-    let expected_indexes = if version == 2 { 4 } else { 5 };
-    let indexes: i64 = sqlx::query_scalar("SELECT count(*) FROM sqlite_master WHERE type='index' AND name IN('artifact_jobs_claim','artifact_jobs_lease','artifact_base_retention_repo','artifact_observations_published','artifact_transport_leases_expiry')")
-        .fetch_one(&mut **connection).await?;
-    if tables != expected_tables || indexes != expected_indexes {
-        bail!("sqlite artifact scheduler schema marker does not match its table/index inventory")
+    let tables: i64 = sqlx::query_scalar("SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN('artifact_jobs','artifact_base_retention','branch_observations','artifact_observations','artifact_consumers','artifact_transport_leases','artifact_gc_sweep','scheduler_state')").fetch_one(&mut **connection).await?;
+    let indexes: i64 = sqlx::query_scalar("SELECT count(*) FROM sqlite_master WHERE type='index' AND name IN('artifact_jobs_claim','artifact_jobs_lease','artifact_base_retention_repo','artifact_observations_published','artifact_transport_leases_expiry')").fetch_one(&mut **connection).await?;
+    let fence_tables: i64 = sqlx::query_scalar("SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN('ready_publication_fence_sequence','ready_publication_fences','ready_publication_fence_members')").fetch_one(&mut **connection).await?;
+    let fence_indexes: i64 = sqlx::query_scalar("SELECT count(*) FROM sqlite_master WHERE type='index' AND name='ready_publication_fences_recovery'").fetch_one(&mut **connection).await?;
+
+    // v2 existed in two exact released lineages: the five-table admission
+    // scheduler and the six-table transport scheduler. v3 diverged into an
+    // admission protocol or the transport retention/GC protocol. v4 is the
+    // approved transport lineage (and, briefly, a combined integration build).
+    // v5 is exclusively the exact union.
+    let inventory_ok = match version {
+        2 => {
+            ((tables == 5 && indexes == 3) || (tables == 6 && indexes == 4))
+                && (fence_tables == 0 || (fence_tables == 3 && fence_indexes == 0))
+        }
+        3 => {
+            (tables == 5 && indexes == 3 && fence_tables == 3 && fence_indexes == 1)
+                || (tables == 8 && indexes == 5 && fence_tables == 0 && fence_indexes == 0)
+        }
+        4 => {
+            tables == 8
+                && indexes == 5
+                && ((fence_tables == 0 && fence_indexes == 0)
+                    || (fence_tables == 3 && fence_indexes == 1))
+        }
+        5 => tables == 8 && indexes == 5 && fence_tables == 3 && fence_indexes == 1,
+        _ => false,
+    };
+    if !inventory_ok {
+        bail!("sqlite artifact scheduler schema marker does not match an approved lineage")
+    }
+    if version >= 3 && fence_tables == 3 {
+        let fence_ddl: Vec<(String, String)> = sqlx::query_as(
+            "SELECT name,sql FROM sqlite_master WHERE (type='table' AND name IN(
+               'ready_publication_fence_sequence','ready_publication_fences','ready_publication_fence_members'))
+               OR (type='index' AND name='ready_publication_fences_recovery') ORDER BY name",
+        )
+        .fetch_all(&mut **connection)
+        .await?;
+        let actual = fence_ddl
+            .into_iter()
+            .map(|(name, sql)| (name, canonical_sqlite_ddl(&sql)))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let expected = [
+            ("ready_publication_fence_members", "createtableready_publication_fence_members(tokentextnotnull,generationintegernotnullcheck(generation>0),artifact_idintegernotnull,manifesttextnotnullcheck(length(trim(manifest))>0),primarykey(token,artifact_id),foreignkey(token,generation)referencesready_publication_fences(token,generation)ondeletecascade,foreignkey(artifact_id)referencesartifact_jobs(id)ondeletecascade)"),
+            ("ready_publication_fence_sequence", "createtableready_publication_fence_sequence(idintegerprimarykeycheck(id=1),generationintegernotnullcheck(generation>=0))"),
+            ("ready_publication_fences", "createtableready_publication_fences(tokentextprimarykey,generationintegernotnulluniquecheck(generation>0),operation_idtextnotnullunique,workspacetextnotnull,repotextnotnull,branchtextnotnull,targettextnotnull,attempt_idtextnotnull,expires_atintegernotnull,statetextnotnullcheck(statein('held','activation_unknown')),unique(token,generation))"),
+            ("ready_publication_fences_recovery", "createindexready_publication_fences_recoveryonready_publication_fences(state,generation,token)"),
+        ]
+        .into_iter()
+        .map(|(name, sql)| (name.to_owned(), sql.to_owned()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+        if actual != expected {
+            bail!("sqlite admission fence DDL differs from its schema marker")
+        }
     }
     let additions: i64 = sqlx::query_scalar("SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN('artifact_base_retention','artifact_gc_sweep')")
         .fetch_one(&mut **connection).await?;
@@ -2428,8 +2491,13 @@ async fn preflight_sqlite_schema(
         }
         return Ok(());
     }
+    // Admission-v3 deliberately has neither transport addition. All other
+    // post-v2 lineages must have both with the exact approved DDL.
+    if version == 3 && tables == 5 {
+        return Ok(());
+    }
     if additions != 2 {
-        bail!("sqlite v3/v4 scheduler is missing retention or GC state")
+        bail!("sqlite transport lineage is missing retention or GC state")
     }
     let base_sql: String = sqlx::query_scalar(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='artifact_base_retention'",
@@ -3227,7 +3295,7 @@ mod tests {
 
         let newest = &candidates[0];
         assert!(
-            !s.quarantine_ready(&newest.key, &"a".repeat(64), "stale report")
+            !s.quarantine_publication(&newest.key, &"a".repeat(64), "stale report")
                 .await
                 .unwrap(),
             "a stale corruption report must not invalidate a replacement manifest"
@@ -3237,7 +3305,7 @@ mod tests {
             ArtifactState::Ready
         );
         assert!(
-            s.quarantine_ready(&newest.key, &"b".repeat(64), "verified corruption")
+            s.quarantine_publication(&newest.key, &"b".repeat(64), "verified corruption")
                 .await
                 .unwrap()
         );
@@ -4601,14 +4669,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn historical_v2_and_e056_v3_migrate_to_v4_while_partial_shapes_fail_closed() {
-        let (v3, _dir, v3_path) = scheduler(Default::default()).await;
-        sqlx::query("PRAGMA user_version=3")
-            .execute(&v3.pool)
-            .await
-            .unwrap();
-        drop(v3);
-        let migrated = ArtifactScheduler::open(&v3_path, Default::default())
+    async fn divergent_lineages_migrate_to_v5_while_partial_shapes_fail_closed() {
+        let (transport_v4, _dir, transport_v4_path) = scheduler(Default::default()).await;
+        sqlx::raw_sql("DROP TABLE ready_publication_fence_members; DROP TABLE ready_publication_fences; DROP TABLE ready_publication_fence_sequence; PRAGMA user_version=4")
+            .execute(&transport_v4.pool).await.unwrap();
+        drop(transport_v4);
+        let migrated = ArtifactScheduler::open(&transport_v4_path, Default::default())
             .await
             .unwrap();
         assert_eq!(
@@ -4616,7 +4682,7 @@ mod tests {
                 .fetch_one(&migrated.pool)
                 .await
                 .unwrap(),
-            4
+            5
         );
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
@@ -4628,8 +4694,40 @@ mod tests {
             3
         );
 
+        let (combined_v4, _dir, combined_v4_path) = scheduler(Default::default()).await;
+        sqlx::query("PRAGMA user_version=4")
+            .execute(&combined_v4.pool)
+            .await
+            .unwrap();
+        drop(combined_v4);
+        let migrated_combined = ArtifactScheduler::open(&combined_v4_path, Default::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("PRAGMA user_version")
+                .fetch_one(&migrated_combined.pool)
+                .await
+                .unwrap(),
+            5
+        );
+
+        let (admission_v3, _dir, admission_v3_path) = scheduler(Default::default()).await;
+        sqlx::raw_sql("DROP TABLE artifact_base_retention; DROP TABLE artifact_gc_sweep; DROP TABLE artifact_transport_leases; PRAGMA user_version=3")
+            .execute(&admission_v3.pool).await.unwrap();
+        drop(admission_v3);
+        let migrated_admission = ArtifactScheduler::open(&admission_v3_path, Default::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("PRAGMA user_version")
+                .fetch_one(&migrated_admission.pool)
+                .await
+                .unwrap(),
+            5
+        );
+
         let (v2, _dir, v2_path) = scheduler(Default::default()).await;
-        sqlx::raw_sql("DROP TABLE artifact_base_retention; DROP TABLE artifact_gc_sweep; PRAGMA user_version=2")
+        sqlx::raw_sql("DROP TABLE ready_publication_fence_members; DROP TABLE ready_publication_fences; DROP TABLE ready_publication_fence_sequence; DROP TABLE artifact_base_retention; DROP TABLE artifact_gc_sweep; PRAGMA user_version=2")
             .execute(&v2.pool).await.unwrap();
         drop(v2);
         let migrated_v2 = ArtifactScheduler::open(&v2_path, Default::default())
@@ -4640,7 +4738,7 @@ mod tests {
                 .fetch_one(&migrated_v2.pool)
                 .await
                 .unwrap(),
-            4
+            5
         );
         assert_eq!(sqlx::query_scalar::<_,i64>("SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN('artifact_base_retention','artifact_gc_sweep')").fetch_one(&migrated_v2.pool).await.unwrap(),2);
 
@@ -4690,7 +4788,7 @@ mod tests {
         );
 
         let (future, _dir, future_path) = scheduler(Default::default()).await;
-        sqlx::query("PRAGMA user_version=5")
+        sqlx::query("PRAGMA user_version=6")
             .execute(&future.pool)
             .await
             .unwrap();
@@ -4702,10 +4800,7 @@ mod tests {
         );
 
         let (concurrent, _dir, concurrent_path) = scheduler(Default::default()).await;
-        sqlx::query("PRAGMA user_version=3")
-            .execute(&concurrent.pool)
-            .await
-            .unwrap();
+        sqlx::raw_sql("DROP TABLE ready_publication_fence_members; DROP TABLE ready_publication_fences; DROP TABLE ready_publication_fence_sequence; PRAGMA user_version=4").execute(&concurrent.pool).await.unwrap();
         drop(concurrent);
         let (first, second) = tokio::join!(
             ArtifactScheduler::open(&concurrent_path, Default::default()),
@@ -5104,7 +5199,7 @@ mod tests {
             vec!["new", "old"]
         );
         assert!(
-            s.quarantine_ready(
+            s.quarantine_publication(
                 &key("ws", "new", ArtifactKind::Head),
                 &"c".repeat(64),
                 "corrupt"

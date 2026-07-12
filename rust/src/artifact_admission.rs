@@ -2354,7 +2354,7 @@ CREATE TABLE ready_publication_fence_members(
     }
 
     #[tokio::test]
-    async fn released_v2_migrates_atomically_to_v3_without_changing_jobs() {
+    async fn released_v2_migrates_atomically_to_union_v5_without_changing_jobs() {
         let f = Fixture::new().await;
         f.add("attempt-1").await;
         f.coordinator
@@ -2366,6 +2366,9 @@ CREATE TABLE ready_publication_fence_members(
             "DROP TABLE ready_publication_fence_members;
              DROP TABLE ready_publication_fences;
              DROP TABLE ready_publication_fence_sequence;
+             DROP TABLE artifact_base_retention;
+             DROP TABLE artifact_gc_sweep;
+             DROP TABLE artifact_transport_leases;
              PRAGMA user_version=2;",
         )
         .execute(&pool)
@@ -2386,7 +2389,7 @@ CREATE TABLE ready_publication_fence_members(
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 5);
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
                 "SELECT generation FROM ready_publication_fence_sequence WHERE id=1",
@@ -2425,13 +2428,16 @@ CREATE TABLE ready_publication_fence_members(
     }
 
     #[tokio::test]
-    async fn mixed_v2_fence_schema_rolls_back_without_partial_v3_mutation() {
+    async fn mixed_v2_fence_schema_rolls_back_without_partial_v5_mutation() {
         let f = Fixture::new().await;
         let pool = sqlx::SqlitePool::connect(&f.db_url).await.unwrap();
         sqlx::raw_sql(
             "DROP TABLE ready_publication_fence_members;
              DROP TABLE ready_publication_fences;
              DROP TABLE ready_publication_fence_sequence;
+             DROP TABLE artifact_base_retention;
+             DROP TABLE artifact_gc_sweep;
+             DROP TABLE artifact_transport_leases;
              CREATE TABLE ready_publication_fences(planted TEXT NOT NULL);
              PRAGMA user_version=2;",
         )
@@ -2455,7 +2461,7 @@ CREATE TABLE ready_publication_fence_members(
         ).fetch_one(&pool).await.unwrap(), 1);
         assert_eq!(sqlx::query_scalar::<_, i64>(
             "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='ready_publication_fence_sequence'"
-        ).fetch_one(&pool).await.unwrap(), 0, "failed v3 migration leaked an earlier DDL statement");
+        ).fetch_one(&pool).await.unwrap(), 0, "failed v5 migration leaked an earlier DDL statement");
     }
 
     #[tokio::test]
@@ -2480,6 +2486,9 @@ CREATE TABLE ready_publication_fence_members(
             "DROP TABLE ready_publication_fence_members;
              DROP TABLE ready_publication_fences;
              DROP TABLE ready_publication_fence_sequence;
+             DROP TABLE artifact_base_retention;
+             DROP TABLE artifact_gc_sweep;
+             DROP TABLE artifact_transport_leases;
              PRAGMA user_version=2;",
         )
         .execute(&pool)

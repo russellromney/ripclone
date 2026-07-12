@@ -522,7 +522,7 @@ mod tests {
             repo: "o/r".into(),
             commit: "1".repeat(40),
             kind: ArtifactKind::Head,
-            format_version: 1,
+            format_version: crate::artifact_manifest::ARTIFACT_FORMAT_VERSION,
         };
         let root = ArtifactManifest::new(
             &key,
@@ -546,7 +546,8 @@ mod tests {
         .unwrap()
         .store(&cas)
         .unwrap()
-        .manifest;
+        .manifest()
+        .to_owned();
         let old = SystemTime::now() - Duration::from_secs(60);
         for hash in [&root, &child, &idx, &pre, &orphan] {
             filetime::set_file_mtime(cas.path(hash), filetime::FileTime::from_system_time(old))

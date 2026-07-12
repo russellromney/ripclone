@@ -705,7 +705,7 @@ mod tests {
                 ..identity(SyncMode::Head)
             },
             CloneRequestIdentity {
-                artifact_format_version: 2,
+                artifact_format_version: CLONE_ARTIFACT_FORMAT_VERSION + 1,
                 ..identity(SyncMode::Head)
             },
         ] {

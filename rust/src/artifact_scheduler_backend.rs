@@ -382,7 +382,7 @@ pub trait ArtifactSchedulerPersistence: Send + Sync {
         format_version: u32,
         limit: u32,
     ) -> Result<Vec<String>>;
-    async fn quarantine_ready(
+    async fn quarantine_publication(
         &self,
         key: &ArtifactKey,
         expected_manifest: &str,
@@ -960,13 +960,13 @@ impl ArtifactSchedulerPersistence for crate::artifact_scheduler::ArtifactSchedul
     ) -> Result<Vec<String>> {
         self.complete_full_base_candidates(w, r, v, limit).await
     }
-    async fn quarantine_ready(
+    async fn quarantine_publication(
         &self,
         key: &ArtifactKey,
         manifest: &str,
         reason: &str,
     ) -> Result<bool> {
-        self.quarantine_ready(key, manifest, reason).await
+        self.quarantine_publication(key, manifest, reason).await
     }
     async fn counts(
         &self,
