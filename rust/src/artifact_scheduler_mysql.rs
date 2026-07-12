@@ -609,6 +609,27 @@ impl MysqlArtifactScheduler {
         if actual_constraints != expected_constraints {
             bail!("mysql artifact scheduler constraint inventory differs from schema version")
         }
+        // An FK owned by any other table can still target scheduler rows and
+        // turn ordinary pruning/supersession deletes into externally-controlled
+        // failures. The constraint is recorded on the child, so validating only
+        // the owned-table inventory above cannot see it. This reverse scan is
+        // deliberately database-wide and fail-closed: scheduler tables do not
+        // define or permit incoming referential dependencies.
+        let incoming_foreign_keys: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM information_schema.key_column_usage k
+             JOIN information_schema.referential_constraints r
+               ON r.constraint_schema=k.constraint_schema
+              AND r.table_name=k.table_name AND r.constraint_name=k.constraint_name
+             WHERE k.referenced_table_schema=DATABASE()
+               AND k.referenced_table_name IN
+                 ('artifact_scheduler_schema','artifact_jobs','branch_observations',
+                  'artifact_observations','artifact_consumers','scheduler_state')",
+        )
+        .fetch_one(&mut **tx)
+        .await?;
+        if incoming_foreign_keys != 0 {
+            bail!("mysql artifact scheduler tables have external foreign-key dependents")
+        }
         for (name, clause) in CHECKS {
             let actual: Option<String> = sqlx::query_scalar(
                 "SELECT lower(check_clause)
@@ -1680,6 +1701,7 @@ mod tests {
 
     async fn reset(pool: &MySqlPool) {
         for statement in [
+            "DROP TABLE IF EXISTS external_scheduler_child",
             "DROP TABLE IF EXISTS artifact_consumers",
             "DROP TABLE IF EXISTS artifact_observations",
             "DROP TABLE IF EXISTS branch_observations",
@@ -2299,6 +2321,65 @@ mod tests {
             .await
             .is_err(),
             "an unexpected foreign-key constraint was accepted"
+        );
+
+        reset(&control).await;
+        let clean = MysqlArtifactScheduler::from_pool(
+            MySqlPoolOptions::new().connect(&url).await.unwrap(),
+            Default::default(),
+            Arc::new(Accept),
+        )
+        .await
+        .unwrap();
+        let blocked_key = key("externally-blocked", ArtifactKind::Head);
+        let blocked_id = outcome_id(&clean.schedule(&blocked_key).await.unwrap());
+        sqlx::query(
+            "CREATE TABLE external_scheduler_child(
+               artifact_id BIGINT NOT NULL PRIMARY KEY,
+               CONSTRAINT external_scheduler_fk FOREIGN KEY(artifact_id)
+                 REFERENCES artifact_jobs(id) ON DELETE RESTRICT) ENGINE=InnoDB",
+        )
+        .execute(clean.pool())
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO external_scheduler_child(artifact_id) VALUES(?)")
+            .bind(blocked_id)
+            .execute(clean.pool())
+            .await
+            .unwrap();
+        assert!(
+            MysqlArtifactScheduler::from_pool(
+                MySqlPoolOptions::new().connect(&url).await.unwrap(),
+                Default::default(),
+                Arc::new(Accept)
+            )
+            .await
+            .is_err(),
+            "an incoming FK owned by an external table was accepted"
+        );
+        assert!(
+            clean
+                .observe(
+                    "ws",
+                    "owner/repo",
+                    "external-fk",
+                    "replacement",
+                    &[ArtifactKind::Head],
+                    1,
+                    None
+                )
+                .await
+                .is_err(),
+            "ON DELETE RESTRICT did not demonstrate the supersession hazard"
+        );
+        assert!(clean.get(blocked_id).await.unwrap().is_some());
+        assert!(
+            clean
+                .get_by_key(&key("replacement", ArtifactKind::Head))
+                .await
+                .unwrap()
+                .is_none(),
+            "failed supersession did not roll back atomically"
         );
 
         reset(&control).await;
