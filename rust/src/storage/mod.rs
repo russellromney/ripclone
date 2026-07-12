@@ -75,6 +75,13 @@ pub trait StorageBackend: Send + Sync {
     /// without downloading the whole object.
     fn size(&self, hash: &str) -> Result<u64>;
 
+    /// Typed object presence probe for maintenance and scrub logic. Backends
+    /// must distinguish an authoritative missing key from a transient probe
+    /// failure; the latter remains an `Err` and must never trigger quarantine.
+    fn stat_object(&self, hash: &str) -> Result<StorageObjectStat> {
+        Ok(StorageObjectStat::Present(self.size(hash)?))
+    }
+
     /// Return a signed URL valid for `expires_in`, if the backend supports
     /// direct client reads. `None` means the server must proxy bytes itself.
     fn signed_url(&self, _hash: &str, _expires_in: Duration) -> Option<String> {
@@ -130,6 +137,12 @@ pub struct HashEntry {
     pub hash: String,
     pub size: u64,
     pub modified: SystemTime,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageObjectStat {
+    Missing,
+    Present(u64),
 }
 
 /// Filesystem-backed storage using the existing CAS layout.
@@ -221,6 +234,17 @@ impl StorageBackend for LocalStorage {
         let path = self.cas.path(hash);
         let meta = std::fs::metadata(&path).with_context(|| format!("stat CAS object {}", hash))?;
         Ok(meta.len())
+    }
+
+    fn stat_object(&self, hash: &str) -> Result<StorageObjectStat> {
+        let path = self.cas.path(hash);
+        match std::fs::metadata(&path) {
+            Ok(metadata) => Ok(StorageObjectStat::Present(metadata.len())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(StorageObjectStat::Missing)
+            }
+            Err(error) => Err(error).with_context(|| format!("stat CAS object {hash}")),
+        }
     }
 
     fn delete(&self, hash: &str) -> Result<()> {

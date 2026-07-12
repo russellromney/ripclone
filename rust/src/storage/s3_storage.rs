@@ -420,6 +420,27 @@ impl StorageBackend for S3Storage {
             .ok_or_else(|| anyhow::anyhow!("S3 head_object missing Content-Length"))
     }
 
+    fn stat_object(&self, hash: &str) -> Result<crate::storage::StorageObjectStat> {
+        let key = self.key(hash)?;
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        let key_owned = key.clone();
+        self.block_on(move || async move {
+            match client.objects().head(&bucket, &key_owned).send().await {
+                Ok(output) => output
+                    .content_length
+                    .map(crate::storage::StorageObjectStat::Present)
+                    .context("S3 head_object missing Content-Length"),
+                Err(error)
+                    if error.code() == Some("NoSuchKey") || error.code() == Some("NotFound") =>
+                {
+                    Ok(crate::storage::StorageObjectStat::Missing)
+                }
+                Err(error) => Err(anyhow::anyhow!("S3 head_object {key_owned}: {error}")),
+            }
+        })
+    }
+
     fn signed_url(&self, hash: &str, expires_in: Duration) -> Option<String> {
         let key = self.key(hash).ok()?;
         let presigned = self

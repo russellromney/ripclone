@@ -513,15 +513,39 @@ pub struct StorageScrubReport {
     pub bytes: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DurableScrubOutcome {
+    Healthy { len: u64, io_bytes: u64 },
+    Transient { io_bytes: u64 },
+    Missing,
+    ConfirmedCorrupt { io_bytes: u64 },
+    Oversize { actual: u64, limit: u64 },
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReadyScrubCursor {
     /// Highest Ready job fully checked or quarantined.
     pub after_id: i64,
-    /// Next descriptor within the first Ready job after `after_id`.
-    pub object_offset: usize,
     /// Binds a partial descriptor offset to one immutable Ready publication.
     pub active_artifact_id: Option<i64>,
     pub active_manifest: Option<String>,
+    pub phase: ReadyScrubPhase,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReadyScrubPhase {
+    #[default]
+    Root,
+    TopObjects {
+        object_offset: usize,
+    },
+    LevelManifest {
+        level_position: usize,
+    },
+    LevelObjects {
+        level_position: usize,
+        object_offset: usize,
+    },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -561,14 +585,11 @@ pub async fn scrub_ready_artifacts<
     let records = scheduler.ready_page(cursor.after_id, page_jobs).await?;
     let mut report = ReadyScrubReport::default();
     if records.is_empty() {
-        cursor.after_id = 0;
-        cursor.object_offset = 0;
-        cursor.active_artifact_id = None;
-        cursor.active_manifest = None;
+        *cursor = ReadyScrubCursor::default();
         report.cycle_completed = true;
         return Ok(report);
     }
-    'records: for record in records {
+    for record in records {
         if cancelled.is_cancelled() {
             bail!("Ready artifact scrub cancelled");
         }
@@ -576,162 +597,684 @@ pub async fn scrub_ready_artifacts<
             .manifest
             .as_deref()
             .context("Ready scrub record has no manifest")?;
-        if cursor.object_offset > 0
-            && (cursor.active_artifact_id != Some(record.id)
-                || cursor.active_manifest.as_deref() != Some(manifest_hash))
+        if cursor.active_artifact_id != Some(record.id)
+            || cursor.active_manifest.as_deref() != Some(manifest_hash)
         {
-            cursor.object_offset = 0;
+            cursor.active_artifact_id = Some(record.id);
+            cursor.active_manifest = Some(manifest_hash.to_owned());
+            cursor.phase = ReadyScrubPhase::Root;
         }
-        cursor.active_artifact_id = Some(record.id);
-        cursor.active_manifest = Some(manifest_hash.to_owned());
-        let root_len = verifier
-            .storage
-            .size(manifest_hash)
-            .context("stat Ready scrub root")?;
+        let root_len = match confirmed_stat(&verifier.storage, manifest_hash) {
+            DurableScrubOutcome::Healthy { len, .. } => len,
+            outcome => {
+                match settle_scrub_outcome(scheduler, &record, manifest_hash, outcome, &mut report)
+                    .await?
+                {
+                    ScrubSettlement::Quarantined => {
+                        finish_scrub_record(cursor, record.id);
+                        continue;
+                    }
+                    ScrubSettlement::Retry => return Ok(report),
+                }
+            }
+        };
         if root_len > verifier.limits.manifest_bytes {
-            let changed = scheduler
-                .quarantine_ready(record.id, manifest_hash, "manifest exceeds verifier limit")
-                .await?;
-            if changed {
-                report.jobs_quarantined += 1;
-            }
-            cursor.after_id = record.id;
-            cursor.object_offset = 0;
-            cursor.active_artifact_id = None;
-            cursor.active_manifest = None;
-            continue;
-        }
-        let mut root_output = BoundedWriter::new(Vec::new(), verifier.limits.manifest_bytes);
-        if let Err(error) = verifier.copy_storage_hash_bounded(
-            manifest_hash,
-            verifier.limits.manifest_bytes,
-            "Ready scrub root",
-            &mut root_output,
-        ) {
-            if format!("{error:#}").contains("object quarantined") {
-                let changed = scheduler
-                    .quarantine_ready(record.id, manifest_hash, &format!("{error:#}"))
-                    .await?;
-                if changed {
-                    report.jobs_quarantined += 1;
-                }
-                cursor.after_id = record.id;
-                cursor.object_offset = 0;
-                cursor.active_artifact_id = None;
-                cursor.active_manifest = None;
-                continue;
-            }
-            return Err(error);
-        }
-        let bytes = root_output.into_inner();
-        report.manifest_bytes_read = report
-            .manifest_bytes_read
-            .checked_add(root_len)
-            .context("Ready scrub manifest byte metric overflow")?;
-        let manifest: ArtifactManifest =
-            serde_json::from_slice(&bytes).context("decode Ready scrub manifest")?;
-        if manifest.validate_envelope().is_err() || !manifest.key.matches(&record.key) {
-            let changed = scheduler
-                .quarantine_ready(record.id, manifest_hash, "manifest/key envelope mismatch")
-                .await?;
-            if changed {
-                report.jobs_quarantined += 1;
-            }
-            cursor.after_id = record.id;
-            cursor.object_offset = 0;
-            cursor.active_artifact_id = None;
-            cursor.active_manifest = None;
-            continue;
-        }
-        let (mut objects, _) = manifest.publication_children();
-        if let ArtifactPayload::FullHistory(history) = &manifest.payload {
-            let level_refs = history
-                .levels
-                .iter()
-                .map(|level| level.level_manifest.hash.as_str())
-                .collect::<HashSet<_>>();
-            objects.retain(|blob| !level_refs.contains(blob.hash.as_str()));
-            for level in &history.levels {
-                match verifier.read_durable_history_level_manifest(level) {
-                    Ok(nested) => {
-                        report.manifest_bytes_read = report
-                            .manifest_bytes_read
-                            .checked_add(level.level_manifest.len)
-                            .context("Ready scrub level-manifest metric overflow")?;
-                        for pair in nested.packs {
-                            objects.extend([pair.pack, pair.index]);
-                        }
-                    }
-                    Err(error) if format!("{error:#}").contains("object quarantined") => {
-                        let changed = scheduler
-                            .quarantine_ready(record.id, manifest_hash, &format!("{error:#}"))
-                            .await?;
-                        if changed {
-                            report.jobs_quarantined += 1;
-                        }
-                        cursor.after_id = record.id;
-                        cursor.object_offset = 0;
-                        cursor.active_artifact_id = None;
-                        cursor.active_manifest = None;
-                        continue 'records;
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
-        }
-        objects.sort_by(|left, right| left.hash.cmp(&right.hash));
-        objects.dedup_by(|left, right| left.hash == right.hash && left.len == right.len);
-        if cursor.object_offset > objects.len() {
-            bail!("Ready scrub cursor exceeds descriptor count");
-        }
-        let mut quarantined = false;
-        for (offset, blob) in objects.iter().enumerate().skip(cursor.object_offset) {
-            if report.objects_verified == 0 && blob.len > max_bytes {
-                bail!(
-                    "Ready scrub object {} bytes exceeds per-run byte budget {}",
-                    blob.len,
-                    max_bytes
-                );
-            }
-            if report.objects_verified as usize == max_objects
-                || report.bytes_verified.saturating_add(blob.len) > max_bytes
+            if settle_scrub_outcome(
+                scheduler,
+                &record,
+                manifest_hash,
+                DurableScrubOutcome::Oversize {
+                    actual: root_len,
+                    limit: verifier.limits.manifest_bytes,
+                },
+                &mut report,
+            )
+            .await?
+                == ScrubSettlement::Retry
             {
-                cursor.object_offset = offset;
                 return Ok(report);
             }
-            match verifier.scrub_durable_objects(
-                std::slice::from_ref(blob),
-                1,
-                blob.len.max(1),
-                cancelled,
-            ) {
-                Ok(scrubbed) => {
-                    report.objects_verified += scrubbed.objects;
-                    report.bytes_verified += scrubbed.bytes;
-                    cursor.object_offset = offset + 1;
-                }
-                Err(error) if format!("{error:#}").contains("object quarantined") => {
-                    let changed = scheduler
-                        .quarantine_ready(record.id, manifest_hash, &format!("{error:#}"))
-                        .await?;
-                    if changed {
-                        report.jobs_quarantined += 1;
+            finish_scrub_record(cursor, record.id);
+            continue;
+        }
+        if !budget_allows(root_len, max_objects, max_bytes, &report)? {
+            return Ok(report);
+        }
+        let root_blob = CasBlob {
+            hash: manifest_hash.to_owned(),
+            len: root_len,
+        };
+        let root_capacity =
+            usize::try_from(root_len).context("Ready scrub root length exceeds usize")?;
+        let mut root_bytes = Vec::with_capacity(root_capacity);
+        let root_outcome = verifier.assess_durable_blob(
+            &root_blob,
+            verifier.limits.manifest_bytes,
+            &mut root_bytes,
+            cancelled,
+        );
+        match root_outcome {
+            DurableScrubOutcome::Healthy { io_bytes, .. } => {
+                charge_scrub(&mut report, io_bytes)?;
+                report.manifest_bytes_read = report
+                    .manifest_bytes_read
+                    .checked_add(io_bytes)
+                    .context("Ready scrub manifest metric overflow")?;
+            }
+            outcome => {
+                match settle_scrub_outcome(scheduler, &record, manifest_hash, outcome, &mut report)
+                    .await?
+                {
+                    ScrubSettlement::Quarantined => {
+                        finish_scrub_record(cursor, record.id);
+                        continue;
                     }
-                    quarantined = true;
-                    break;
+                    ScrubSettlement::Retry => return Ok(report),
                 }
-                Err(error) => return Err(error),
             }
         }
-        cursor.after_id = record.id;
-        cursor.object_offset = 0;
-        cursor.active_artifact_id = None;
-        cursor.active_manifest = None;
-        if !quarantined {
-            report.jobs_completed += 1;
+        let root: ArtifactManifest = match serde_json::from_slice(&root_bytes) {
+            Ok(root) => root,
+            Err(_) => {
+                if !quarantine_invalid_manifest(
+                    scheduler,
+                    &record,
+                    manifest_hash,
+                    "durable root manifest is malformed",
+                    &mut report,
+                )
+                .await?
+                {
+                    return Ok(report);
+                }
+                finish_scrub_record(cursor, record.id);
+                continue;
+            }
+        };
+        if root.validate_envelope().is_err() || !root.key.matches(&record.key) {
+            if !scheduler
+                .quarantine_ready(record.id, manifest_hash, "manifest/key envelope mismatch")
+                .await?
+            {
+                return Ok(report);
+            }
+            report.jobs_quarantined += 1;
+            finish_scrub_record(cursor, record.id);
+            continue;
+        }
+        if matches!(cursor.phase, ReadyScrubPhase::Root) {
+            cursor.phase = ReadyScrubPhase::TopObjects { object_offset: 0 };
+        }
+        validate_progress_budget(&root, &cursor.phase, root_len, max_objects, max_bytes)?;
+        let mut loaded_level: Option<(usize, HistoryLevelManifest)> = None;
+        'job: loop {
+            if cancelled.is_cancelled() {
+                bail!("Ready artifact scrub cancelled");
+            }
+            match cursor.phase.clone() {
+                ReadyScrubPhase::Root => unreachable!("root phase was normalized above"),
+                ReadyScrubPhase::TopObjects { object_offset } => {
+                    let objects = top_level_scrub_objects(&root);
+                    if object_offset >= objects.len() {
+                        cursor.phase = match &root.payload {
+                            ArtifactPayload::FullHistory(history) if !history.levels.is_empty() => {
+                                ReadyScrubPhase::LevelManifest { level_position: 0 }
+                            }
+                            _ => {
+                                report.jobs_completed += 1;
+                                finish_scrub_record(cursor, record.id);
+                                break 'job;
+                            }
+                        };
+                        continue;
+                    }
+                    match scrub_one_with_budget(
+                        scheduler,
+                        verifier,
+                        &record,
+                        manifest_hash,
+                        &objects[object_offset],
+                        max_objects,
+                        max_bytes,
+                        cancelled,
+                        &mut report,
+                    )
+                    .await?
+                    {
+                        ScrubStep::Advanced => {
+                            cursor.phase = ReadyScrubPhase::TopObjects {
+                                object_offset: object_offset + 1,
+                            }
+                        }
+                        ScrubStep::Deferred => return Ok(report),
+                        ScrubStep::Retry => return Ok(report),
+                        ScrubStep::Quarantined => {
+                            finish_scrub_record(cursor, record.id);
+                            break 'job;
+                        }
+                    }
+                }
+                ReadyScrubPhase::LevelManifest { level_position } => {
+                    let ArtifactPayload::FullHistory(history) = &root.payload else {
+                        bail!("level cursor on non-history artifact")
+                    };
+                    if level_position >= history.levels.len() {
+                        report.jobs_completed += 1;
+                        finish_scrub_record(cursor, record.id);
+                        break 'job;
+                    }
+                    let level_ref = &history.levels[level_position].level_manifest;
+                    if level_ref.len > verifier.limits.manifest_bytes {
+                        if settle_scrub_outcome(
+                            scheduler,
+                            &record,
+                            manifest_hash,
+                            DurableScrubOutcome::Oversize {
+                                actual: level_ref.len,
+                                limit: verifier.limits.manifest_bytes,
+                            },
+                            &mut report,
+                        )
+                        .await?
+                            == ScrubSettlement::Retry
+                        {
+                            return Ok(report);
+                        }
+                        finish_scrub_record(cursor, record.id);
+                        break 'job;
+                    }
+                    if !budget_allows(level_ref.len, max_objects, max_bytes, &report)? {
+                        return Ok(report);
+                    }
+                    let capacity = usize::try_from(level_ref.len)
+                        .context("Ready scrub level manifest length exceeds usize")?;
+                    let mut bytes = Vec::with_capacity(capacity);
+                    let outcome = verifier.assess_durable_blob(
+                        level_ref,
+                        verifier.limits.manifest_bytes,
+                        &mut bytes,
+                        cancelled,
+                    );
+                    match outcome {
+                        DurableScrubOutcome::Healthy { io_bytes, .. } => {
+                            charge_scrub(&mut report, io_bytes)?;
+                            report.manifest_bytes_read = report
+                                .manifest_bytes_read
+                                .checked_add(io_bytes)
+                                .context("Ready scrub level-manifest metric overflow")?;
+                            let level = match verifier.decode_history_level_manifest(
+                                &history.levels[level_position],
+                                &bytes,
+                            ) {
+                                Ok(level) => level,
+                                Err(_) => {
+                                    if !quarantine_invalid_manifest(
+                                        scheduler,
+                                        &record,
+                                        manifest_hash,
+                                        "durable history level manifest is malformed",
+                                        &mut report,
+                                    )
+                                    .await?
+                                    {
+                                        return Ok(report);
+                                    }
+                                    finish_scrub_record(cursor, record.id);
+                                    break 'job;
+                                }
+                            };
+                            validate_level_child_budget(
+                                root_len,
+                                level_ref.len,
+                                &level,
+                                0,
+                                max_bytes,
+                            )?;
+                            loaded_level = Some((level_position, level));
+                            cursor.phase = ReadyScrubPhase::LevelObjects {
+                                level_position,
+                                object_offset: 0,
+                            };
+                        }
+                        outcome => match settle_scrub_outcome(
+                            scheduler,
+                            &record,
+                            manifest_hash,
+                            outcome,
+                            &mut report,
+                        )
+                        .await?
+                        {
+                            ScrubSettlement::Quarantined => {
+                                finish_scrub_record(cursor, record.id);
+                                break 'job;
+                            }
+                            ScrubSettlement::Retry => return Ok(report),
+                        },
+                    }
+                }
+                ReadyScrubPhase::LevelObjects {
+                    level_position,
+                    object_offset,
+                } => {
+                    if loaded_level.as_ref().map(|(position, _)| *position) != Some(level_position)
+                    {
+                        let ArtifactPayload::FullHistory(history) = &root.payload else {
+                            bail!("level cursor on non-history artifact")
+                        };
+                        let descriptor = history
+                            .levels
+                            .get(level_position)
+                            .context("scrub level position exceeds history")?;
+                        let level_ref = &descriptor.level_manifest;
+                        if level_ref.len > verifier.limits.manifest_bytes {
+                            if settle_scrub_outcome(
+                                scheduler,
+                                &record,
+                                manifest_hash,
+                                DurableScrubOutcome::Oversize {
+                                    actual: level_ref.len,
+                                    limit: verifier.limits.manifest_bytes,
+                                },
+                                &mut report,
+                            )
+                            .await?
+                                == ScrubSettlement::Retry
+                            {
+                                return Ok(report);
+                            }
+                            finish_scrub_record(cursor, record.id);
+                            break 'job;
+                        }
+                        if !budget_allows(level_ref.len, max_objects, max_bytes, &report)? {
+                            return Ok(report);
+                        }
+                        let capacity = usize::try_from(level_ref.len)
+                            .context("Ready scrub level manifest length exceeds usize")?;
+                        let mut bytes = Vec::with_capacity(capacity);
+                        match verifier.assess_durable_blob(
+                            level_ref,
+                            verifier.limits.manifest_bytes,
+                            &mut bytes,
+                            cancelled,
+                        ) {
+                            DurableScrubOutcome::Healthy { io_bytes, .. } => {
+                                charge_scrub(&mut report, io_bytes)?;
+                                report.manifest_bytes_read = report
+                                    .manifest_bytes_read
+                                    .checked_add(io_bytes)
+                                    .context("Ready scrub level-manifest metric overflow")?;
+                                let level = match verifier
+                                    .decode_history_level_manifest(descriptor, &bytes)
+                                {
+                                    Ok(level) => level,
+                                    Err(_) => {
+                                        if !quarantine_invalid_manifest(
+                                            scheduler,
+                                            &record,
+                                            manifest_hash,
+                                            "durable history level manifest is malformed",
+                                            &mut report,
+                                        )
+                                        .await?
+                                        {
+                                            return Ok(report);
+                                        }
+                                        finish_scrub_record(cursor, record.id);
+                                        break 'job;
+                                    }
+                                };
+                                validate_level_child_budget(
+                                    root_len,
+                                    level_ref.len,
+                                    &level,
+                                    object_offset,
+                                    max_bytes,
+                                )?;
+                                loaded_level = Some((level_position, level));
+                            }
+                            outcome => match settle_scrub_outcome(
+                                scheduler,
+                                &record,
+                                manifest_hash,
+                                outcome,
+                                &mut report,
+                            )
+                            .await?
+                            {
+                                ScrubSettlement::Quarantined => {
+                                    finish_scrub_record(cursor, record.id);
+                                    break 'job;
+                                }
+                                ScrubSettlement::Retry => return Ok(report),
+                            },
+                        }
+                        continue;
+                    }
+                    let level = &loaded_level.as_ref().expect("checked level cache").1;
+                    let objects = level
+                        .packs
+                        .iter()
+                        .flat_map(|pair| [pair.pack.clone(), pair.index.clone()])
+                        .collect::<Vec<_>>();
+                    if object_offset >= objects.len() {
+                        loaded_level = None;
+                        cursor.phase = ReadyScrubPhase::LevelManifest {
+                            level_position: level_position + 1,
+                        };
+                        continue;
+                    }
+                    match scrub_one_with_budget(
+                        scheduler,
+                        verifier,
+                        &record,
+                        manifest_hash,
+                        &objects[object_offset],
+                        max_objects,
+                        max_bytes,
+                        cancelled,
+                        &mut report,
+                    )
+                    .await?
+                    {
+                        ScrubStep::Advanced => {
+                            cursor.phase = ReadyScrubPhase::LevelObjects {
+                                level_position,
+                                object_offset: object_offset + 1,
+                            }
+                        }
+                        ScrubStep::Deferred => return Ok(report),
+                        ScrubStep::Retry => return Ok(report),
+                        ScrubStep::Quarantined => {
+                            finish_scrub_record(cursor, record.id);
+                            break 'job;
+                        }
+                    }
+                }
+            }
         }
     }
     Ok(report)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScrubSettlement {
+    Retry,
+    Quarantined,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScrubStep {
+    Advanced,
+    Deferred,
+    Retry,
+    Quarantined,
+}
+
+fn confirmed_stat(storage: &StorageRef, hash: &str) -> DurableScrubOutcome {
+    use crate::storage::StorageObjectStat;
+    match storage.stat_object(hash) {
+        Ok(StorageObjectStat::Present(len)) => DurableScrubOutcome::Healthy { len, io_bytes: 0 },
+        Ok(StorageObjectStat::Missing) => match storage.stat_object(hash) {
+            Ok(StorageObjectStat::Missing) => DurableScrubOutcome::Missing,
+            _ => DurableScrubOutcome::Transient { io_bytes: 0 },
+        },
+        Err(_) => DurableScrubOutcome::Transient { io_bytes: 0 },
+    }
+}
+
+fn budget_allows(
+    object_len: u64,
+    max_objects: usize,
+    max_bytes: u64,
+    report: &ReadyScrubReport,
+) -> Result<bool> {
+    let worst_case = object_len
+        .checked_mul(2)
+        .context("Ready scrub confirmation budget overflow")?;
+    if worst_case > max_bytes {
+        bail!(
+            "Ready scrub object requires {} bytes including confirmation, exceeding per-run byte budget {}",
+            worst_case,
+            max_bytes
+        );
+    }
+    Ok((report.objects_verified as usize) < max_objects
+        && report.bytes_verified.saturating_add(worst_case) <= max_bytes)
+}
+
+fn confirmation_bytes(lengths: impl IntoIterator<Item = u64>) -> Result<u64> {
+    lengths.into_iter().try_fold(0_u64, |total, len| {
+        total
+            .checked_add(
+                len.checked_mul(2)
+                    .context("Ready scrub confirmation budget overflow")?,
+            )
+            .context("Ready scrub aggregate budget overflow")
+    })
+}
+
+/// Reject configurations that can read control manifests but can never move
+/// the persisted cursor past the next data object. This is evaluated from the
+/// immutable graph, so the same invalid configuration fails on its first run.
+fn validate_progress_budget(
+    root: &ArtifactManifest,
+    phase: &ReadyScrubPhase,
+    root_len: u64,
+    max_objects: usize,
+    max_bytes: u64,
+) -> Result<()> {
+    let top = top_level_scrub_objects(root);
+    let history = match &root.payload {
+        ArtifactPayload::FullHistory(history) => Some(history),
+        _ => None,
+    };
+    let mut required = vec![root_len];
+    match phase {
+        ReadyScrubPhase::Root => unreachable!("root phase is normalized before validation"),
+        ReadyScrubPhase::TopObjects { object_offset } if *object_offset < top.len() => {
+            required.push(top[*object_offset].len);
+            if history.is_some_and(|history| !history.levels.is_empty()) {
+                required.push(0);
+            }
+        }
+        ReadyScrubPhase::TopObjects { .. } => {
+            if let Some(level) = history.and_then(|history| history.levels.first()) {
+                required.push(level.level_manifest.len);
+                if level.proof.pack_count > 0 {
+                    required.push(0);
+                }
+            }
+        }
+        ReadyScrubPhase::LevelManifest { level_position } => {
+            if let Some(level) = history.and_then(|history| history.levels.get(*level_position)) {
+                required.push(level.level_manifest.len);
+                // Every valid published level has at least one pack/index pair.
+                // Use its declared total to reject impossible object budgets;
+                // exact child lengths are checked after the bounded level read.
+                if level.proof.pack_count > 0 {
+                    required.push(0);
+                }
+            }
+        }
+        ReadyScrubPhase::LevelObjects { level_position, .. } => {
+            if let Some(level) = history.and_then(|history| history.levels.get(*level_position)) {
+                required.push(level.level_manifest.len);
+                required.push(0);
+            }
+        }
+    }
+    if required.len() > max_objects {
+        bail!(
+            "Ready scrub bounds cannot advance cursor: need at least {} objects, configured {}",
+            required.len(),
+            max_objects
+        );
+    }
+    let minimum_bytes = confirmation_bytes(required)?;
+    if minimum_bytes > max_bytes {
+        bail!(
+            "Ready scrub bounds cannot advance cursor: need at least {} confirmation bytes, configured {}",
+            minimum_bytes,
+            max_bytes
+        );
+    }
+    Ok(())
+}
+
+fn validate_level_child_budget(
+    root_len: u64,
+    level_ref_len: u64,
+    level: &HistoryLevelManifest,
+    object_offset: usize,
+    max_bytes: u64,
+) -> Result<()> {
+    let child = level
+        .packs
+        .iter()
+        .flat_map(|pair| [&pair.pack, &pair.index])
+        .nth(object_offset);
+    let Some(child) = child else {
+        return Ok(());
+    };
+    let minimum = confirmation_bytes([root_len, level_ref_len, child.len])?;
+    if minimum > max_bytes {
+        bail!(
+            "Ready scrub bounds cannot advance level cursor: need at least {} confirmation bytes, configured {}",
+            minimum,
+            max_bytes
+        );
+    }
+    Ok(())
+}
+
+fn charge_scrub(report: &mut ReadyScrubReport, io_bytes: u64) -> Result<()> {
+    report.objects_verified = report
+        .objects_verified
+        .checked_add(1)
+        .context("Ready scrub object metric overflow")?;
+    report.bytes_verified = report
+        .bytes_verified
+        .checked_add(io_bytes)
+        .context("Ready scrub byte metric overflow")?;
+    Ok(())
+}
+
+async fn settle_scrub_outcome<
+    P: crate::artifact_scheduler_backend::ArtifactSchedulerPersistence + ?Sized,
+>(
+    scheduler: &P,
+    record: &crate::artifact_scheduler::ArtifactRecord,
+    manifest_hash: &str,
+    outcome: DurableScrubOutcome,
+    report: &mut ReadyScrubReport,
+) -> Result<ScrubSettlement> {
+    let reason = match outcome {
+        DurableScrubOutcome::Missing => "durable artifact object is confirmed missing",
+        DurableScrubOutcome::ConfirmedCorrupt { .. } => {
+            "durable artifact object is confirmed corrupt"
+        }
+        DurableScrubOutcome::Oversize { .. } => "durable artifact object exceeds verifier limit",
+        DurableScrubOutcome::Transient { .. } => return Ok(ScrubSettlement::Retry),
+        DurableScrubOutcome::Healthy { .. } => bail!("healthy scrub outcome cannot be settled"),
+    };
+    if scheduler
+        .quarantine_ready(record.id, manifest_hash, reason)
+        .await?
+    {
+        report.jobs_quarantined = report
+            .jobs_quarantined
+            .checked_add(1)
+            .context("Ready scrub quarantine metric overflow")?;
+        Ok(ScrubSettlement::Quarantined)
+    } else {
+        // The manifest changed after ready_page. Preserve the new publication
+        // and retry it without advancing the record cursor.
+        Ok(ScrubSettlement::Retry)
+    }
+}
+
+async fn quarantine_invalid_manifest<
+    P: crate::artifact_scheduler_backend::ArtifactSchedulerPersistence + ?Sized,
+>(
+    scheduler: &P,
+    record: &crate::artifact_scheduler::ArtifactRecord,
+    manifest_hash: &str,
+    reason: &'static str,
+    report: &mut ReadyScrubReport,
+) -> Result<bool> {
+    if scheduler
+        .quarantine_ready(record.id, manifest_hash, reason)
+        .await?
+    {
+        report.jobs_quarantined = report
+            .jobs_quarantined
+            .checked_add(1)
+            .context("Ready scrub quarantine metric overflow")?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+fn finish_scrub_record(cursor: &mut ReadyScrubCursor, record_id: i64) {
+    *cursor = ReadyScrubCursor {
+        after_id: record_id,
+        ..ReadyScrubCursor::default()
+    };
+}
+
+fn top_level_scrub_objects(manifest: &ArtifactManifest) -> Vec<CasBlob> {
+    let mut objects = Vec::new();
+    match &manifest.payload {
+        ArtifactPayload::Head(head) => {
+            for pair in &head.packs {
+                objects.extend([pair.pack.clone(), pair.index.clone()]);
+            }
+            objects.push(head.prebuilt_index.clone());
+        }
+        ArtifactPayload::FullHistory(history) => {
+            objects.push(history.target_commit_object.clone());
+        }
+        ArtifactPayload::Files(files) => {
+            objects.push(files.target_commit_object.clone());
+            objects.push(files.metadata.clone());
+            objects.extend(files.archive_chunks.iter().cloned());
+            objects.extend(files.zstd_dictionary.iter().cloned());
+        }
+    }
+    objects
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn scrub_one_with_budget<
+    P: crate::artifact_scheduler_backend::ArtifactSchedulerPersistence + ?Sized,
+>(
+    scheduler: &P,
+    verifier: &CasCompletionVerifier,
+    record: &crate::artifact_scheduler::ArtifactRecord,
+    manifest_hash: &str,
+    blob: &CasBlob,
+    max_objects: usize,
+    max_bytes: u64,
+    cancelled: &tokio_util::sync::CancellationToken,
+    report: &mut ReadyScrubReport,
+) -> Result<ScrubStep> {
+    if !budget_allows(blob.len, max_objects, max_bytes, report)? {
+        return Ok(ScrubStep::Deferred);
+    }
+    match verifier.scrub_durable_object(blob, blob.len, cancelled) {
+        DurableScrubOutcome::Healthy { io_bytes, .. } => {
+            charge_scrub(report, io_bytes)?;
+            Ok(ScrubStep::Advanced)
+        }
+        outcome => {
+            match settle_scrub_outcome(scheduler, record, manifest_hash, outcome, report).await? {
+                ScrubSettlement::Retry => Ok(ScrubStep::Retry),
+                ScrubSettlement::Quarantined => Ok(ScrubStep::Quarantined),
+            }
+        }
+    }
 }
 
 fn semantic_digest(schema: u32, key: &ManifestKey, payload: &ArtifactPayload) -> Result<String> {
@@ -1023,21 +1566,40 @@ impl CasCompletionVerifier {
         self.decode_history_level_manifest(level, &bytes)
     }
 
-    fn read_durable_history_level_manifest(
+    pub(crate) fn preflight_durable_history_levels(
         &self,
-        level: &FullHistoryLevel,
-    ) -> Result<HistoryLevelManifest> {
-        let mut output = BoundedWriter::new(Vec::new(), self.limits.manifest_bytes);
-        let actual = self.copy_storage_hash_bounded(
-            &level.level_manifest.hash,
-            self.limits.manifest_bytes,
-            "durable history level manifest",
-            &mut output,
-        )?;
-        if actual != level.level_manifest.len {
-            bail!("durable history level manifest length mismatch");
+        history: &FullHistoryArtifact,
+        cancelled: &tokio_util::sync::CancellationToken,
+    ) -> Result<()> {
+        for level in &history.levels {
+            if level.level_manifest.len > self.limits.manifest_bytes {
+                bail!("durable history level manifest exceeds verifier limit");
+            }
+            let capacity = usize::try_from(level.level_manifest.len)
+                .context("durable history level manifest length exceeds usize")?;
+            let mut bytes = Vec::with_capacity(capacity);
+            match self.assess_durable_blob(
+                &level.level_manifest,
+                self.limits.manifest_bytes,
+                &mut bytes,
+                cancelled,
+            ) {
+                DurableScrubOutcome::Healthy { .. } => {
+                    self.decode_history_level_manifest(level, &bytes)?;
+                }
+                DurableScrubOutcome::Missing => bail!("durable history level manifest is missing"),
+                DurableScrubOutcome::ConfirmedCorrupt { .. } => {
+                    bail!("durable history level manifest is corrupt")
+                }
+                DurableScrubOutcome::Oversize { .. } => {
+                    bail!("durable history level manifest exceeds verifier limit")
+                }
+                DurableScrubOutcome::Transient { .. } => {
+                    bail!("durable history level manifest is temporarily unavailable")
+                }
+            }
         }
-        self.decode_history_level_manifest(level, &output.into_inner())
+        Ok(())
     }
 
     fn decode_history_level_manifest(
@@ -1201,26 +1763,22 @@ impl CasCompletionVerifier {
             token: previous,
             scratch: previous_scratch,
         };
-        let mut sink = std::io::sink();
-        let actual = self.copy_storage_hash_bounded(&blob.hash, blob.len, role, &mut sink)?;
-        if actual != blob.len {
-            let quarantined = self.confirm_and_quarantine_remote(&blob.hash, blob.len);
-            bail!(
-                "durable {role} length mismatch{}",
-                if quarantined {
-                    "; object quarantined"
-                } else {
-                    ""
-                }
-            );
+        match self.scrub_durable_object(blob, blob.len, cancelled) {
+            DurableScrubOutcome::Healthy { .. } => Ok(()),
+            DurableScrubOutcome::Missing => bail!("durable {role} is confirmed missing"),
+            DurableScrubOutcome::ConfirmedCorrupt { .. } => {
+                bail!("durable {role} is confirmed corrupt")
+            }
+            DurableScrubOutcome::Oversize { .. } => bail!("durable {role} is oversized"),
+            DurableScrubOutcome::Transient { .. } => bail!("durable {role} read was transient"),
         }
-        Ok(())
     }
 
     /// Bounded operator/storage-maintenance scrub. Routine history reuse stays
     /// O(level-count); callers choose an object/byte budget and advance their
-    /// own cursor across invocations. Every byte read here is SHA-256 verified,
-    /// and a same-length mismatch is deleted from durable storage and cache.
+    /// own cursor across invocations. Every byte read here is SHA-256 verified.
+    /// Shared durable bytes are never deleted by a verifier; metadata owners
+    /// quarantine publications and a verified publisher may repair the object.
     pub fn scrub_durable_objects(
         &self,
         objects: &[CasBlob],
@@ -1255,6 +1813,16 @@ impl CasCompletionVerifier {
             report.bytes = next;
         }
         Ok(report)
+    }
+
+    pub fn scrub_durable_object(
+        &self,
+        blob: &CasBlob,
+        maximum: u64,
+        cancelled: &tokio_util::sync::CancellationToken,
+    ) -> DurableScrubOutcome {
+        let mut sink = std::io::sink();
+        self.assess_durable_blob(blob, maximum, &mut sink, cancelled)
     }
 
     async fn publish_verified_owned(
@@ -1438,11 +2006,10 @@ impl CasCompletionVerifier {
                 Ok(_) => bail!("{role} exceeds verifier limit"),
                 Err(error) => {
                     // A bad cache copy must never mask a healthy durable copy.
-                    let _ = self.cas.remove(hash);
                     if !self.storage.is_remote() {
-                        let _ = self.storage.delete(hash);
                         return Err(error).with_context(|| format!("verify local {role}"));
                     }
+                    let _ = self.cas.remove(hash);
                 }
             }
         }
@@ -1457,93 +2024,120 @@ impl CasCompletionVerifier {
         role: &str,
         output: &mut W,
     ) -> Result<u64> {
-        use sha2::Digest;
         Cas::validate_artifact_id(hash).with_context(|| format!("invalid durable {role} id"))?;
-        let length = self
-            .storage
-            .size(hash)
-            .with_context(|| format!("stat durable {role}"))?;
-        if length > maximum {
-            bail!("{role} exceeds verifier limit");
+        let length = match self.storage.stat_object(hash) {
+            Ok(crate::storage::StorageObjectStat::Present(length)) => length,
+            Ok(crate::storage::StorageObjectStat::Missing) => bail!("durable {role} is missing"),
+            Err(error) => return Err(error).with_context(|| format!("stat durable {role}")),
+        };
+        let blob = CasBlob {
+            hash: hash.to_owned(),
+            len: length,
+        };
+        match self.assess_durable_blob(
+            &blob,
+            maximum,
+            output,
+            &tokio_util::sync::CancellationToken::new(),
+        ) {
+            DurableScrubOutcome::Healthy { len, .. } => Ok(len),
+            DurableScrubOutcome::Missing => bail!("durable {role} is confirmed missing"),
+            DurableScrubOutcome::ConfirmedCorrupt { .. } => {
+                bail!("durable {role} is confirmed corrupt")
+            }
+            DurableScrubOutcome::Oversize { .. } => bail!("durable {role} exceeds verifier limit"),
+            DurableScrubOutcome::Transient { .. } => bail!("durable {role} read was transient"),
         }
-        let mut hasher = Sha256::new();
+    }
+
+    fn assess_durable_blob<W: Write>(
+        &self,
+        blob: &CasBlob,
+        maximum: u64,
+        output: &mut W,
+        cancelled: &tokio_util::sync::CancellationToken,
+    ) -> DurableScrubOutcome {
+        use crate::storage::StorageObjectStat;
+        let first_stat = match self.storage.stat_object(&blob.hash) {
+            Ok(stat) => stat,
+            Err(_) => return DurableScrubOutcome::Transient { io_bytes: 0 },
+        };
+        let actual = match first_stat {
+            StorageObjectStat::Missing => {
+                return match self.storage.stat_object(&blob.hash) {
+                    Ok(StorageObjectStat::Missing) => DurableScrubOutcome::Missing,
+                    _ => DurableScrubOutcome::Transient { io_bytes: 0 },
+                };
+            }
+            StorageObjectStat::Present(actual) => actual,
+        };
+        if actual > maximum {
+            return DurableScrubOutcome::Oversize {
+                actual,
+                limit: maximum,
+            };
+        }
+        if actual != blob.len {
+            return match self.storage.stat_object(&blob.hash) {
+                Ok(StorageObjectStat::Present(second)) if second == actual => {
+                    DurableScrubOutcome::ConfirmedCorrupt { io_bytes: 0 }
+                }
+                Ok(StorageObjectStat::Missing) | Ok(StorageObjectStat::Present(_)) | Err(_) => {
+                    DurableScrubOutcome::Transient { io_bytes: 0 }
+                }
+            };
+        }
+        let (healthy, io_bytes) = match self.hash_storage_once(blob, output, cancelled) {
+            Ok(result) => result,
+            Err(_) => return DurableScrubOutcome::Transient { io_bytes: 0 },
+        };
+        if healthy {
+            return DurableScrubOutcome::Healthy {
+                len: actual,
+                io_bytes,
+            };
+        }
+        let mut sink = std::io::sink();
+        match self.storage.stat_object(&blob.hash) {
+            Ok(StorageObjectStat::Present(second)) if second == blob.len => {
+                match self.hash_storage_once(blob, &mut sink, cancelled) {
+                    Ok((false, confirmation_bytes)) => DurableScrubOutcome::ConfirmedCorrupt {
+                        io_bytes: io_bytes.saturating_add(confirmation_bytes),
+                    },
+                    Ok((true, confirmation_bytes)) => DurableScrubOutcome::Transient {
+                        io_bytes: io_bytes.saturating_add(confirmation_bytes),
+                    },
+                    Err(_) => DurableScrubOutcome::Transient { io_bytes },
+                }
+            }
+            _ => DurableScrubOutcome::Transient { io_bytes },
+        }
+    }
+
+    fn hash_storage_once<W: Write>(
+        &self,
+        blob: &CasBlob,
+        output: &mut W,
+        cancelled: &tokio_util::sync::CancellationToken,
+    ) -> Result<(bool, u64)> {
+        use sha2::Digest;
         let mut offset = 0u64;
+        let mut hasher = Sha256::new();
         const READ_CHUNK: u64 = 8 * 1024 * 1024;
-        while offset < length {
-            if verification_cancelled() {
+        while offset < blob.len {
+            if cancelled.is_cancelled() || verification_cancelled() {
                 bail!("artifact verification cancelled");
             }
-            let wanted = (length - offset).min(READ_CHUNK);
-            let bytes = self
-                .storage
-                .get_range(hash, offset, wanted)
-                .with_context(|| format!("read durable {role} range"))?;
+            let wanted = (blob.len - offset).min(READ_CHUNK);
+            let bytes = self.storage.get_range(&blob.hash, offset, wanted)?;
             if bytes.len() as u64 != wanted {
-                let quarantined = self.confirm_and_quarantine_remote(hash, length);
-                bail!(
-                    "durable {role} range length mismatch{}",
-                    if quarantined {
-                        "; object quarantined"
-                    } else {
-                        ""
-                    }
-                );
+                return Ok((false, offset.saturating_add(bytes.len() as u64)));
             }
             hasher.update(&bytes);
             output.write_all(&bytes)?;
             offset += wanted;
         }
-        let actual = hex::encode(hasher.finalize());
-        if actual != hash {
-            let quarantined = self.confirm_and_quarantine_remote(hash, length);
-            bail!(
-                "durable {role} hash mismatch{}",
-                if quarantined {
-                    "; object quarantined"
-                } else {
-                    ""
-                }
-            );
-        }
-        Ok(length)
-    }
-
-    fn confirm_and_quarantine_remote(&self, hash: &str, expected_len: u64) -> bool {
-        match self.storage_hash_matches(hash, expected_len) {
-            Ok(true) | Err(_) => false,
-            Ok(false) => {
-                self.remove_local(hash);
-                let _ = self.storage.delete(hash);
-                true
-            }
-        }
-    }
-
-    fn storage_hash_matches(&self, hash: &str, expected_len: u64) -> Result<bool> {
-        use sha2::Digest;
-        if self.storage.size(hash)? != expected_len {
-            return Ok(false);
-        }
-        let mut offset = 0u64;
-        let mut hasher = Sha256::new();
-        const READ_CHUNK: u64 = 8 * 1024 * 1024;
-        while offset < expected_len {
-            if verification_cancelled() {
-                bail!("artifact verification cancelled");
-            }
-            let wanted = (expected_len - offset).min(READ_CHUNK);
-            let bytes = self.storage.get_range(hash, offset, wanted)?;
-            if bytes.len() as u64 != wanted {
-                return Ok(false);
-            }
-            hasher.update(&bytes);
-            offset += wanted;
-        }
-        Ok(hex::encode(hasher.finalize()) == hash)
-    }
-
-    fn remove_local(&self, hash: &str) {
-        let _ = self.cas.remove(hash);
+        Ok((hex::encode(hasher.finalize()) == blob.hash, offset))
     }
 
     fn read_small_blob(&self, blob: &CasBlob, maximum: u64, role: &str) -> Result<Vec<u8>> {
@@ -2710,7 +3304,7 @@ fn configure_git_command(command: &mut Command) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::artifact_scheduler::{ArtifactRecord, ArtifactState};
+    use crate::artifact_scheduler::{ArtifactRecord, ArtifactScheduler, ArtifactState};
     use crate::clonepack::{FileEntry, Fragment, FrameInfo};
     use crate::pack::PackBuilder;
     use crate::storage::StorageBackend as _;
@@ -2724,6 +3318,10 @@ mod tests {
         puts: Mutex<Vec<String>>,
         fail_put_number: Mutex<Option<usize>>,
         bad_range_reads: Mutex<std::collections::HashMap<String, usize>>,
+        replace_after_bad_read: Mutex<std::collections::HashMap<String, Vec<u8>>>,
+        failed_stats: Mutex<std::collections::HashMap<String, usize>>,
+        failed_range_reads: Mutex<std::collections::HashMap<String, usize>>,
+        deletes: Mutex<Vec<String>>,
     }
 
     impl MemoryDurableStorage {
@@ -2743,6 +3341,27 @@ mod tests {
                 .unwrap()
                 .insert(hash.to_owned(), count);
         }
+
+        fn replace_after_bad_read(&self, hash: &str, bytes: Vec<u8>) {
+            self.replace_after_bad_read
+                .lock()
+                .unwrap()
+                .insert(hash.to_owned(), bytes);
+        }
+
+        fn inject_failed_stats(&self, hash: &str, count: usize) {
+            self.failed_stats
+                .lock()
+                .unwrap()
+                .insert(hash.to_owned(), count);
+        }
+
+        fn inject_failed_range_reads(&self, hash: &str, count: usize) {
+            self.failed_range_reads
+                .lock()
+                .unwrap()
+                .insert(hash.to_owned(), count);
+        }
     }
 
     #[async_trait::async_trait]
@@ -2757,16 +3376,34 @@ mod tests {
         }
 
         fn get_range(&self, hash: &str, start: u64, len: u64) -> Result<Vec<u8>> {
-            let objects = self.objects.lock().unwrap();
-            let bytes = objects.get(hash).context("memory durable object missing")?;
-            let start = usize::try_from(start)?;
-            let end = start
-                .checked_add(usize::try_from(len)?)
-                .context("range overflow")?;
-            let mut range = bytes
-                .get(start..end)
-                .context("range outside object")?
-                .to_vec();
+            if self
+                .failed_range_reads
+                .lock()
+                .unwrap()
+                .get_mut(hash)
+                .is_some_and(|remaining| {
+                    if *remaining == 0 {
+                        false
+                    } else {
+                        *remaining -= 1;
+                        true
+                    }
+                })
+            {
+                bail!("injected transient range failure");
+            }
+            let mut range = {
+                let objects = self.objects.lock().unwrap();
+                let bytes = objects.get(hash).context("memory durable object missing")?;
+                let start = usize::try_from(start)?;
+                let end = start
+                    .checked_add(usize::try_from(len)?)
+                    .context("range overflow")?;
+                bytes
+                    .get(start..end)
+                    .context("range outside object")?
+                    .to_vec()
+            };
             let mut bad_reads = self.bad_range_reads.lock().unwrap();
             if bad_reads.get_mut(hash).is_some_and(|remaining| {
                 if *remaining == 0 {
@@ -2777,6 +3414,13 @@ mod tests {
                 }
             }) {
                 range[0] ^= 0xff;
+                if let Some(replacement) = self.replace_after_bad_read.lock().unwrap().remove(hash)
+                {
+                    self.objects
+                        .lock()
+                        .unwrap()
+                        .insert(hash.to_owned(), replacement);
+                }
             }
             Ok(range)
         }
@@ -2804,7 +3448,31 @@ mod tests {
                 .len() as u64)
         }
 
+        fn stat_object(&self, hash: &str) -> Result<crate::storage::StorageObjectStat> {
+            if self
+                .failed_stats
+                .lock()
+                .unwrap()
+                .get_mut(hash)
+                .is_some_and(|remaining| {
+                    if *remaining == 0 {
+                        false
+                    } else {
+                        *remaining -= 1;
+                        true
+                    }
+                })
+            {
+                bail!("injected transient stat failure");
+            }
+            Ok(match self.objects.lock().unwrap().get(hash) {
+                Some(bytes) => crate::storage::StorageObjectStat::Present(bytes.len() as u64),
+                None => crate::storage::StorageObjectStat::Missing,
+            })
+        }
+
         fn delete(&self, hash: &str) -> Result<()> {
+            self.deletes.lock().unwrap().push(hash.to_owned());
             self.objects.lock().unwrap().remove(hash);
             Ok(())
         }
@@ -3518,7 +4186,7 @@ mod tests {
         );
 
         // A fresh process with no local objects reads and hashes the durable
-        // root. Same-length corruption is quarantined on the read path.
+        // root. Same-length corruption is rejected without deleting shared bytes.
         let fresh_root = tempfile::tempdir().unwrap();
         let fresh_cas = Cas::new(fresh_root.path().join("cas")).unwrap();
         let fresh = CasCompletionVerifier::with_limits_and_storage(
@@ -3546,9 +4214,10 @@ mod tests {
                 .read_hash_bounded(evidence.manifest(), 16 * 1024 * 1024, "corrupt root")
                 .unwrap_err()
                 .to_string()
-                .contains("quarantined")
+                .contains("confirmed corrupt")
         );
-        assert!(storage.size(evidence.manifest()).is_err());
+        assert!(storage.size(evidence.manifest()).is_ok());
+        assert!(storage.deletes.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -3608,8 +4277,284 @@ mod tests {
                 &tokio_util::sync::CancellationToken::new(),
             )
             .unwrap_err();
-        assert!(format!("{error:#}").contains("quarantined"));
-        assert!(storage.size(&child.hash).is_err());
+        assert!(format!("{error:#}").contains("confirmed corrupt"));
+        assert!(storage.size(&child.hash).is_ok());
+        assert!(storage.deletes.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn malformed_root_and_nested_manifests_quarantine_ready_metadata() {
+        async fn force_ready(
+            database: &Path,
+            scheduler: &ArtifactScheduler,
+            key: &ArtifactKey,
+            manifest: &str,
+        ) -> i64 {
+            scheduler.schedule(key).await.unwrap();
+            let url = format!("sqlite://{}", database.display());
+            let pool = sqlx::SqlitePool::connect(&url).await.unwrap();
+            let id: i64 = sqlx::query_scalar(
+                "SELECT id FROM artifact_jobs WHERE workspace=? AND repo=? AND commit_oid=? AND kind=? AND format_version=?",
+            )
+            .bind(&key.workspace)
+            .bind(&key.repo)
+            .bind(&key.commit)
+            .bind(key.kind.as_str())
+            .bind(key.format_version as i64)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            sqlx::query("UPDATE artifact_jobs SET state='ready',manifest=? WHERE id=?")
+                .bind(manifest)
+                .bind(id)
+                .execute(&pool)
+                .await
+                .unwrap();
+            pool.close().await;
+            id
+        }
+
+        let f = Fixture::new();
+        let storage = std::sync::Arc::new(MemoryDurableStorage::default());
+        let verifier = CasCompletionVerifier::with_limits_and_storage(
+            f.cas.clone(),
+            storage.clone(),
+            ArtifactVerificationLimits::default(),
+        )
+        .unwrap()
+        .with_proof_key(&[b'm'; 32])
+        .unwrap();
+        let database = f._root.path().join("malformed-ready.db");
+        let scheduler = ArtifactScheduler::open(
+            &database.to_string_lossy(),
+            crate::artifact_scheduler::SchedulerLimits::default(),
+        )
+        .await
+        .unwrap();
+
+        let malformed_root = f.blob(b"{");
+        storage.put(&malformed_root.hash, b"{").unwrap();
+        let root_id = force_ready(
+            &database,
+            &scheduler,
+            &f.key(ArtifactKind::Head),
+            &malformed_root.hash,
+        )
+        .await;
+        let mut cursor = ReadyScrubCursor::default();
+        let report = scrub_ready_artifacts(
+            &scheduler,
+            &verifier,
+            &mut cursor,
+            10,
+            100,
+            1024 * 1024,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.jobs_quarantined, 1);
+        assert_eq!(
+            scheduler.get(root_id).await.unwrap().unwrap().state,
+            ArtifactState::Queued
+        );
+
+        // Re-publish the same immutable job with a valid graph. The first
+        // scrub observes a bad snapshot while a concurrent publisher restores
+        // canonical bytes before confirmation. It must retry without clearing
+        // the newly Ready publication or deleting the repaired object.
+        let healthy_manifest = f.head();
+        let healthy_evidence = healthy_manifest.store(&f.cas).unwrap();
+        for child in healthy_manifest.publication_children().0 {
+            storage
+                .put(&child.hash, &f.cas.get(&child.hash).unwrap())
+                .unwrap();
+        }
+        let healthy_root = f.cas.get(healthy_evidence.manifest()).unwrap();
+        storage
+            .put(healthy_evidence.manifest(), &healthy_root)
+            .unwrap();
+        let healthy_id = force_ready(
+            &database,
+            &scheduler,
+            &f.key(ArtifactKind::Head),
+            healthy_evidence.manifest(),
+        )
+        .await;
+        storage.inject_bad_range_reads(healthy_evidence.manifest(), 1);
+        storage.replace_after_bad_read(healthy_evidence.manifest(), healthy_root.clone());
+        cursor = ReadyScrubCursor::default();
+        let race = scrub_ready_artifacts(
+            &scheduler,
+            &verifier,
+            &mut cursor,
+            10,
+            100,
+            1024 * 1024,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(race.jobs_quarantined, 0);
+        assert_eq!(
+            scheduler.get(healthy_id).await.unwrap().unwrap().state,
+            ArtifactState::Ready
+        );
+        assert_eq!(
+            storage.get(healthy_evidence.manifest()).unwrap(),
+            healthy_root
+        );
+        assert!(storage.deletes.lock().unwrap().is_empty());
+
+        let mut manifest = f.history();
+        let malformed_level = f.blob(b"[");
+        let ArtifactPayload::FullHistory(history) = &mut manifest.payload else {
+            panic!("wrong payload")
+        };
+        let level = &mut history.levels[0];
+        level.level_manifest = malformed_level.clone();
+        level.proof.seal = history_level_seal(
+            &[b'm'; 32],
+            verifier.identity(),
+            level,
+            level.proof.object_count,
+            &level.proof.object_set_digest,
+            &level.proof.origin_commit,
+            level.proof.pack_count,
+            level.proof.pack_bytes,
+        )
+        .unwrap();
+        manifest.semantic_digest =
+            semantic_digest(manifest.schema_version, &manifest.key, &manifest.payload).unwrap();
+        let evidence = manifest.store(&f.cas).unwrap();
+        let root_bytes = f.cas.get(evidence.manifest()).unwrap();
+        storage.put(evidence.manifest(), &root_bytes).unwrap();
+        storage.put(&malformed_level.hash, b"[").unwrap();
+        let ArtifactPayload::FullHistory(history) = &manifest.payload else {
+            unreachable!()
+        };
+        storage
+            .put(
+                &history.target_commit_object.hash,
+                &f.cas.get(&history.target_commit_object.hash).unwrap(),
+            )
+            .unwrap();
+        let nested_id = force_ready(
+            &database,
+            &scheduler,
+            &f.key(ArtifactKind::FullHistory),
+            evidence.manifest(),
+        )
+        .await;
+        cursor = ReadyScrubCursor::default();
+        let report = scrub_ready_artifacts(
+            &scheduler,
+            &verifier,
+            &mut cursor,
+            10,
+            100,
+            1024 * 1024,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.jobs_quarantined, 1);
+        assert_eq!(
+            scheduler.get(nested_id).await.unwrap().unwrap().state,
+            ArtifactState::Queued
+        );
+        assert!(storage.size(&malformed_level.hash).is_ok());
+        assert!(storage.deletes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn confirmation_race_preserves_concurrently_repaired_healthy_bytes() {
+        let f = Fixture::new();
+        let storage = std::sync::Arc::new(MemoryDurableStorage::default());
+        let verifier = CasCompletionVerifier::with_limits_and_storage(
+            f.cas.clone(),
+            storage.clone(),
+            ArtifactVerificationLimits::default(),
+        )
+        .unwrap();
+        let bytes = b"canonical healthy durable bytes".to_vec();
+        let blob = CasBlob {
+            hash: f.cas.put(&bytes).unwrap(),
+            len: bytes.len() as u64,
+        };
+        storage.put(&blob.hash, &bytes).unwrap();
+        storage.inject_bad_range_reads(&blob.hash, 1);
+        storage.replace_after_bad_read(&blob.hash, bytes.clone());
+
+        assert!(matches!(
+            verifier.scrub_durable_object(
+                &blob,
+                blob.len,
+                &tokio_util::sync::CancellationToken::new()
+            ),
+            DurableScrubOutcome::Transient { .. }
+        ));
+        assert_eq!(storage.get(&blob.hash).unwrap(), bytes);
+        assert!(storage.deletes.lock().unwrap().is_empty());
+        assert!(matches!(
+            verifier.scrub_durable_object(
+                &blob,
+                blob.len,
+                &tokio_util::sync::CancellationToken::new()
+            ),
+            DurableScrubOutcome::Healthy { .. }
+        ));
+    }
+
+    #[test]
+    fn durable_scrub_outcomes_are_typed_and_transient_failures_are_not_corruption() {
+        let f = Fixture::new();
+        let storage = std::sync::Arc::new(MemoryDurableStorage::default());
+        let verifier = CasCompletionVerifier::with_limits_and_storage(
+            f.cas.clone(),
+            storage.clone(),
+            ArtifactVerificationLimits::default(),
+        )
+        .unwrap();
+        let bytes = b"typed scrub outcome".to_vec();
+        let blob = CasBlob {
+            hash: f.cas.put(&bytes).unwrap(),
+            len: bytes.len() as u64,
+        };
+        storage.put(&blob.hash, &bytes).unwrap();
+        let token = tokio_util::sync::CancellationToken::new();
+
+        storage.inject_failed_stats(&blob.hash, 1);
+        assert!(matches!(
+            verifier.scrub_durable_object(&blob, blob.len, &token),
+            DurableScrubOutcome::Transient { .. }
+        ));
+        storage.inject_failed_range_reads(&blob.hash, 1);
+        assert!(matches!(
+            verifier.scrub_durable_object(&blob, blob.len, &token),
+            DurableScrubOutcome::Transient { .. }
+        ));
+        assert!(matches!(
+            verifier.scrub_durable_object(&blob, blob.len - 1, &token),
+            DurableScrubOutcome::Oversize { .. }
+        ));
+
+        storage.corrupt_same_length(&blob.hash);
+        assert!(matches!(
+            verifier.scrub_durable_object(&blob, blob.len, &token),
+            DurableScrubOutcome::ConfirmedCorrupt { .. }
+        ));
+        assert!(storage.size(&blob.hash).is_ok());
+        assert!(storage.deletes.lock().unwrap().is_empty());
+
+        let missing = CasBlob {
+            hash: "0".repeat(64),
+            len: 1,
+        };
+        assert!(matches!(
+            verifier.scrub_durable_object(&missing, missing.len, &token),
+            DurableScrubOutcome::Missing
+        ));
     }
 
     #[test]

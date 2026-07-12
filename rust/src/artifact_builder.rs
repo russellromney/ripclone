@@ -508,6 +508,8 @@ impl TypedArtifactBuilder {
             let ArtifactPayload::FullHistory(history) = manifest.payload else {
                 bail!("history reuse base has wrong payload");
             };
+            self.verifier
+                .preflight_durable_history_levels(&history, cancelled)?;
             if !self.is_ancestor_cancelled(&base.key.commit, &key.commit, cancelled)? {
                 bail!("history reuse base is not an ancestor of target");
             }
@@ -1115,8 +1117,23 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(format!("{budget_error:#}").contains("exceeds per-run byte budget"));
-        assert_eq!(cursor.object_offset, 0);
+        assert!(format!("{budget_error:#}").contains("confirmation"));
+        assert!(matches!(
+            cursor.phase,
+            crate::artifact_manifest::ReadyScrubPhase::Root
+        ));
+        let object_budget_error = scrub_ready_artifacts(
+            &scheduler,
+            &verifier,
+            &mut cursor,
+            10,
+            2,
+            1024 * 1024 * 1024,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{object_budget_error:#}").contains("need at least 3 objects"));
         let report = scrub_ready_artifacts(
             &scheduler,
             &verifier,
@@ -1145,7 +1162,10 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert!(!durable_cas.path(&corrupt_hash).exists());
+        assert!(
+            durable_cas.path(&corrupt_hash).exists(),
+            "metadata quarantine must not delete shared durable bytes"
+        );
 
         // Rebuild the same durable job id, then begin a partial scrub.
         let retry = scheduler.claim("worker-2", 5).await.unwrap().unwrap();
@@ -1170,7 +1190,7 @@ mod tests {
             &verifier,
             &mut cursor,
             10,
-            1,
+            3,
             1024 * 1024 * 1024,
             &CancellationToken::new(),
         )
@@ -1182,18 +1202,43 @@ mod tests {
             &verifier,
             &mut cursor,
             10,
-            1,
+            3,
             1024 * 1024 * 1024,
             &CancellationToken::new(),
         )
         .await
         .unwrap();
-        assert_eq!(partial.objects_verified, 1);
-        assert_eq!(cursor.object_offset, 1);
+        assert_eq!(partial.objects_verified, 3);
+        assert!(matches!(
+            cursor.phase,
+            crate::artifact_manifest::ReadyScrubPhase::LevelObjects {
+                level_position: 0,
+                object_offset: 0
+            }
+        ));
         assert_eq!(
             cursor.active_manifest.as_deref(),
             Some(rebuilt_manifest.as_str())
         );
+        let bounded_resume = scrub_ready_artifacts(
+            &scheduler,
+            &verifier,
+            &mut cursor,
+            10,
+            3,
+            1024 * 1024 * 1024,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(bounded_resume.objects_verified, 3);
+        assert!(matches!(
+            cursor.phase,
+            crate::artifact_manifest::ReadyScrubPhase::LevelObjects {
+                level_position: 0,
+                object_offset: 1
+            }
+        ));
 
         // Change the immutable root while retaining the same scheduler id. A
         // stale partial offset must reset instead of skipping the new graph.
@@ -1230,15 +1275,21 @@ mod tests {
             &verifier,
             &mut cursor,
             10,
-            1,
+            3,
             1024 * 1024 * 1024,
             &CancellationToken::new(),
         )
         .await
         .unwrap();
-        assert_eq!(resumed.objects_verified, 1);
-        assert_eq!(
-            cursor.object_offset, 1,
+        assert_eq!(resumed.objects_verified, 3);
+        assert!(
+            matches!(
+                cursor.phase,
+                crate::artifact_manifest::ReadyScrubPhase::LevelObjects {
+                    level_position: 0,
+                    object_offset: 0
+                }
+            ),
             "changed manifest did not reset offset"
         );
         assert_eq!(
@@ -1591,7 +1642,7 @@ mod tests {
         }
         let fresh_verifier = CasCompletionVerifier::with_limits_and_storage(
             fresh_cas.clone(),
-            durable,
+            durable.clone(),
             Default::default(),
         )
         .unwrap()
@@ -1605,8 +1656,8 @@ mod tests {
                 &claim,
                 &f.context(),
                 Some(&HistoryReuseBase {
-                    key: warm_claim.record.key,
-                    evidence: warm_evidence,
+                    key: warm_claim.record.key.clone(),
+                    evidence: warm_evidence.clone(),
                 }),
             )
             .unwrap();
@@ -1627,6 +1678,66 @@ mod tests {
                 !fresh_cas.path(&pair.pack.hash).exists()
                     && !fresh_cas.path(&pair.index.hash).exists(),
                 "routine reuse hydrated an untouched durable level"
+            );
+        }
+
+        // A missing nested descriptor makes the authenticated base unusable,
+        // but must not make sync unavailable. A fresh worker deliberately
+        // falls back to one exact cold level without probing old pack objects.
+        durable
+            .delete(&warm_history.levels[0].level_manifest.hash)
+            .unwrap();
+        fs::write(f.repo.join("missing-level-tail"), b"cold fallback\n").unwrap();
+        run(&f.repo, &["add", "."]);
+        run(
+            &f.repo,
+            &["commit", "--quiet", "-m", "missing level fallback"],
+        );
+        let cold_target = run(&f.repo, &["rev-parse", "HEAD"]);
+        let cold_cas = Cas::new(f._root.path().join("missing-level-worker-cas")).unwrap();
+        let cold_verifier = CasCompletionVerifier::with_limits_and_storage(
+            cold_cas.clone(),
+            durable,
+            Default::default(),
+        )
+        .unwrap()
+        .with_proof_key(&proof_key)
+        .unwrap();
+        let cold_builder =
+            TypedArtifactBuilder::with_verifier(&f.repo, cold_cas.clone(), cold_verifier.clone());
+        let cold_claim = f.claim(&cold_target, ArtifactKind::FullHistory);
+        let cold_evidence = cold_builder
+            .build_claim(
+                &cold_claim,
+                &f.context(),
+                Some(&HistoryReuseBase {
+                    key: warm_claim.record.key,
+                    evidence: warm_evidence,
+                }),
+            )
+            .unwrap();
+        cold_verifier.verify(&cold_claim, &cold_evidence).unwrap();
+        let cold_manifest = cold_verifier
+            .verify_manifest(
+                &cold_claim.record.key,
+                cold_evidence.manifest(),
+                cold_evidence.artifact_count(),
+            )
+            .unwrap();
+        let ArtifactPayload::FullHistory(cold_history) = cold_manifest.payload else {
+            panic!("wrong payload")
+        };
+        assert_eq!(cold_history.levels.len(), 1);
+        assert_eq!(cold_history.levels[0].proof.origin_commit, cold_target);
+        assert_ne!(
+            cold_history.levels[0].level_manifest,
+            warm_history.levels[0].level_manifest
+        );
+        for pair in &base_packs {
+            assert!(
+                !cold_cas.path(&pair.pack.hash).exists()
+                    && !cold_cas.path(&pair.index.hash).exists(),
+                "cold fallback unexpectedly hydrated an old pack"
             );
         }
     }
