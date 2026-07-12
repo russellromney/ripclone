@@ -26,14 +26,14 @@ pub enum ArtifactKind {
     Files,
 }
 impl ArtifactKind {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Head => "head",
             Self::FullHistory => "full_history",
             Self::Files => "files",
         }
     }
-    fn parse(s: &str) -> Result<Self> {
+    pub(crate) fn parse(s: &str) -> Result<Self> {
         match s {
             "head" => Ok(Self::Head),
             "full_history" => Ok(Self::FullHistory),
@@ -41,7 +41,7 @@ impl ArtifactKind {
             _ => bail!("unknown artifact kind {s}"),
         }
     }
-    fn expensive(self) -> bool {
+    pub(crate) fn expensive(self) -> bool {
         matches!(self, Self::FullHistory | Self::Files)
     }
 }
@@ -63,7 +63,7 @@ pub enum ArtifactState {
     Failed,
 }
 impl ArtifactState {
-    fn parse(s: &str) -> Result<Self> {
+    pub(crate) fn parse(s: &str) -> Result<Self> {
         match s {
             "queued" => Ok(Self::Queued),
             "running" => Ok(Self::Running),
@@ -81,14 +81,14 @@ pub enum FailureClass {
     DeadLetter,
 }
 impl FailureClass {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Retryable => "retryable",
             Self::Permanent => "permanent",
             Self::DeadLetter => "dead_letter",
         }
     }
-    fn parse(s: &str) -> Result<Self> {
+    pub(crate) fn parse(s: &str) -> Result<Self> {
         match s {
             "retryable" => Ok(Self::Retryable),
             "permanent" => Ok(Self::Permanent),
@@ -247,26 +247,15 @@ impl ArtifactTask {
     {
         Self(Box::new(move |c| Box::pin(f(c))))
     }
+    pub(crate) fn start(self, context: ExecutionContext) -> ArtifactTaskFuture {
+        (self.0)(context)
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecutionOutcome {
     Ready,
     Failed,
     LostLease,
-}
-struct ExecutionGuard {
-    cancel: CancellationToken,
-    scratch: PathBuf,
-    armed: bool,
-}
-impl Drop for ExecutionGuard {
-    fn drop(&mut self) {
-        if self.armed {
-            self.cancel.cancel();
-            let aborted = self.scratch.with_extension("aborted");
-            let _ = std::fs::rename(&self.scratch, aborted);
-        }
-    }
 }
 
 const SCHEMA: &str = r#"
@@ -446,23 +435,7 @@ impl ArtifactScheduler {
         if version != 2 || required != 4 {
             bail!("artifact scheduler migration post-validation failed")
         }
-        let fingerprint = format!(
-            "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
-            limits.total_backlog,
-            limits.workspace_backlog,
-            limits.head_reserved,
-            limits.head_backlog,
-            limits.full_history_backlog,
-            limits.files_backlog,
-            limits.total_running,
-            limits.head_running,
-            limits.full_history_running,
-            limits.files_running,
-            limits.workspace_running,
-            limits.max_claim_attempts,
-            limits.max_manual_retries,
-            verifier_id
-        );
+        let fingerprint = scheduler_fingerprint(&limits, verifier_id);
         let mut config = pool.acquire().await?;
         sqlx::query("BEGIN IMMEDIATE").execute(&mut *config).await?;
         let accepted=sqlx::query("UPDATE scheduler_state SET config_fingerprint=? WHERE id=1 AND (config_fingerprint='' OR config_fingerprint=?)").bind(&fingerprint).bind(&fingerprint).execute(&mut *config).await?.rows_affected()==1;
@@ -692,71 +665,16 @@ impl ArtifactScheduler {
         lease_secs: i64,
         scratch_root: &Path,
     ) -> Result<ExecutionOutcome> {
-        validate_lease(owner, lease_secs)?;
-        validate_evidence(claim, &evidence)?;
-        if !self.owns(claim, owner).await? {
-            bail!("artifact lease is not currently owned")
-        }
-        let scratch = scratch_root.join(format!(
-            "artifact-{}-lease-{}",
-            claim.record.id, claim.record.lease_generation
-        ));
-        std::fs::create_dir(&scratch)
-            .with_context(|| format!("create fenced scratch {}", scratch.display()))?;
-        let cancel = CancellationToken::new();
-        let mut guard = ExecutionGuard {
-            cancel: cancel.clone(),
-            scratch: scratch.clone(),
-            armed: true,
-        };
-        let mut set = tokio::task::JoinSet::new();
-        for task in tasks {
-            let ctx = ExecutionContext {
-                cancelled: cancel.clone(),
-                scratch: scratch.clone(),
-            };
-            set.spawn((task.0)(ctx));
-        }
-        let tick = Duration::from_secs((lease_secs / 3).max(1) as u64);
-        let mut interval = tokio::time::interval(tick);
-        interval.tick().await;
-        let mut failure = None;
-        let mut heartbeat_error = None;
-        while !set.is_empty() {
-            tokio::select! {
-             joined=set.join_next()=>if let Some(result)=joined{match result{Ok(Ok(()))=>{},Ok(Err(e))=>{failure=Some(e.to_string());break},Err(e)=>{failure=Some(if e.is_panic(){"artifact child panicked".into()}else{format!("artifact child cancelled: {e}")});break}}},
-             _=interval.tick()=>match self.heartbeat(claim,owner,lease_secs).await {Ok(true)=>{},Ok(false)=>{failure=Some("artifact lease lost".into());break},Err(e)=>{failure=Some("artifact heartbeat failed".into());heartbeat_error=Some(e);break}}
-            }
-        }
-        if let Some(error) = failure {
-            cancel.cancel();
-            while set.join_next().await.is_some() {}
-            let _ = std::fs::remove_dir_all(&scratch);
-            if let Some(error) = heartbeat_error {
-                return Err(error).context("artifact heartbeat failed after draining children");
-            }
-            if self.owns(claim, owner).await? {
-                let failed = self
-                    .fail(claim, owner, FailureClass::Retryable, &error)
-                    .await?;
-                guard.armed = false;
-                return Ok(if failed {
-                    ExecutionOutcome::Failed
-                } else {
-                    ExecutionOutcome::LostLease
-                });
-            }
-            guard.armed = false;
-            return Ok(ExecutionOutcome::LostLease);
-        }
-        let result = self.complete(claim, owner, &evidence).await?;
-        let _ = std::fs::remove_dir_all(&scratch);
-        guard.armed = false;
-        Ok(if result {
-            ExecutionOutcome::Ready
-        } else {
-            ExecutionOutcome::LostLease
-        })
+        crate::artifact_scheduler_backend::ArtifactSchedulerPersistence::run_owned(
+            self,
+            claim,
+            owner,
+            tasks,
+            evidence,
+            lease_secs,
+            scratch_root,
+        )
+        .await
     }
 
     pub async fn reconcile_expired(&self) -> Result<(u64, u64)> {
@@ -899,8 +817,20 @@ impl ArtifactScheduler {
         .bind(w)
         .fetch_one(&mut **c)
         .await?;
+        let active_expensive: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM artifact_jobs WHERE state IN('queued','running') AND kind IN('full_history','files')",
+        )
+        .fetch_one(&mut **c)
+        .await?;
+        let expensive_add =
+            additions[kindex(ArtifactKind::FullHistory)] + additions[kindex(ArtifactKind::Files)];
         if total as usize + add_total > self.limits.total_backlog
             || workspace as usize + add_total > self.limits.workspace_backlog
+            || active_expensive as usize + expensive_add
+                > self
+                    .limits
+                    .total_backlog
+                    .saturating_sub(self.limits.head_reserved)
         {
             bail!("artifact queue capacity exhausted for atomic observation batch")
         }
@@ -940,16 +870,21 @@ impl ArtifactScheduler {
         .bind(kind.as_str())
         .fetch_one(&mut **c)
         .await?;
-        let total_limit = if kind == ArtifactKind::Head {
-            self.limits.total_backlog
-        } else {
-            self.limits
-                .total_backlog
-                .saturating_sub(self.limits.head_reserved)
-        };
-        if total as usize + add > total_limit
+        let active_expensive: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM artifact_jobs WHERE state IN('queued','running') AND kind IN('full_history','files')",
+        )
+        .fetch_one(&mut **c)
+        .await?;
+        let reserve_exhausted = kind.expensive()
+            && active_expensive as usize + add
+                > self
+                    .limits
+                    .total_backlog
+                    .saturating_sub(self.limits.head_reserved);
+        if total as usize + add > self.limits.total_backlog
             || workspace as usize + add > self.limits.workspace_backlog
             || per as usize + add > self.backlog_limit(kind)
+            || reserve_exhausted
         {
             bail!("artifact queue capacity exhausted for {}", kind.as_str())
         }
@@ -1046,7 +981,7 @@ fn kindex(k: ArtifactKind) -> usize {
         ArtifactKind::Files => 2,
     }
 }
-fn validate_lease(owner: &str, secs: i64) -> Result<()> {
+pub(crate) fn validate_lease(owner: &str, secs: i64) -> Result<()> {
     if owner.trim().is_empty() {
         bail!("lease owner is empty")
     };
@@ -1055,7 +990,7 @@ fn validate_lease(owner: &str, secs: i64) -> Result<()> {
     };
     Ok(())
 }
-fn validate_limits(l: &SchedulerLimits) -> Result<()> {
+pub(crate) fn validate_limits(l: &SchedulerLimits) -> Result<()> {
     if l.total_backlog == 0
         || l.workspace_backlog == 0
         || l.total_running == 0
@@ -1078,7 +1013,26 @@ fn validate_limits(l: &SchedulerLimits) -> Result<()> {
     }
     Ok(())
 }
-fn validate_evidence(c: &ClaimedArtifact, e: &CompletionEvidence) -> Result<()> {
+pub(crate) fn scheduler_fingerprint(limits: &SchedulerLimits, verifier_id: &str) -> String {
+    format!(
+        "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+        limits.total_backlog,
+        limits.workspace_backlog,
+        limits.head_reserved,
+        limits.head_backlog,
+        limits.full_history_backlog,
+        limits.files_backlog,
+        limits.total_running,
+        limits.head_running,
+        limits.full_history_running,
+        limits.files_running,
+        limits.workspace_running,
+        limits.max_claim_attempts,
+        limits.max_manual_retries,
+        verifier_id
+    )
+}
+pub(crate) fn validate_evidence(c: &ClaimedArtifact, e: &CompletionEvidence) -> Result<()> {
     if e.manifest.trim().is_empty() {
         bail!("artifact completion manifest is empty")
     };
@@ -1217,6 +1171,40 @@ mod tests {
             .is_err()
         );
         assert!(s2.counts().await.unwrap().is_empty())
+    }
+
+    #[tokio::test]
+    async fn multi_kind_batch_cannot_consume_reserved_head_backlog() {
+        let (s, _d, _) = scheduler(SchedulerLimits {
+            total_backlog: 3,
+            workspace_backlog: 3,
+            head_reserved: 1,
+            head_backlog: 3,
+            full_history_backlog: 3,
+            files_backlog: 3,
+            ..Default::default()
+        })
+        .await;
+        s.schedule(&key("ws", "existing", ArtifactKind::FullHistory))
+            .await
+            .unwrap();
+        assert!(
+            s.observe(
+                "ws",
+                "o/r",
+                "main",
+                "batch",
+                &[ArtifactKind::FullHistory, ArtifactKind::Files],
+                1,
+                None
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            s.counts().await.unwrap(),
+            vec![(ArtifactKind::FullHistory, ArtifactState::Queued, 1)]
+        );
     }
 
     #[tokio::test]

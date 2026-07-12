@@ -70,6 +70,10 @@ pub mod archive;
 #[doc(hidden)]
 pub mod artifact_scheduler;
 #[doc(hidden)]
+pub mod artifact_scheduler_backend;
+#[doc(hidden)]
+pub mod artifact_scheduler_postgres;
+#[doc(hidden)]
 pub mod auth;
 pub mod backends;
 #[doc(hidden)]

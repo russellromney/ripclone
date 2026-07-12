@@ -20,6 +20,26 @@ impl PostgresMeta {
             .with_context(|| format!("connect postgres metadata {url}"))?;
         Ok(Self { pool })
     }
+
+    /// Reuse the already-authenticated metadata pool for normalized scheduler
+    /// state; callers must not open a second DSN/credential path.
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
+    /// Construct the artifact scheduler on the same pool as ref metadata.
+    pub async fn artifact_scheduler(
+        &self,
+        limits: crate::artifact_scheduler::SchedulerLimits,
+        verifier: std::sync::Arc<dyn crate::artifact_scheduler::CompletionVerifier>,
+    ) -> Result<crate::artifact_scheduler_postgres::PostgresArtifactScheduler> {
+        crate::artifact_scheduler_postgres::PostgresArtifactScheduler::from_pool(
+            self.pool.clone(),
+            limits,
+            verifier,
+        )
+        .await
+    }
 }
 
 #[async_trait]
