@@ -699,10 +699,14 @@ pub async fn scrub_ready_artifacts<
             }
         };
         if root.validate_envelope().is_err() || !root.key.matches(&record.key) {
-            if !scheduler
-                .quarantine_ready(record.id, manifest_hash, "manifest/key envelope mismatch")
-                .await?
-            {
+            let quarantine = scheduler
+                .quarantine_ready(
+                    record.id,
+                    Some(manifest_hash),
+                    "manifest/key envelope mismatch",
+                )
+                .await?;
+            if quarantine == crate::artifact_scheduler::QuarantineOutcome::LostRace {
                 return Ok(report);
             }
             report.jobs_quarantined += 1;
@@ -1188,8 +1192,9 @@ async fn settle_scrub_outcome<
         DurableScrubOutcome::Healthy { .. } => bail!("healthy scrub outcome cannot be settled"),
     };
     if scheduler
-        .quarantine_ready(record.id, manifest_hash, reason)
+        .quarantine_ready(record.id, Some(manifest_hash), reason)
         .await?
+        != crate::artifact_scheduler::QuarantineOutcome::LostRace
     {
         report.jobs_quarantined = report
             .jobs_quarantined
@@ -1213,8 +1218,9 @@ async fn quarantine_invalid_manifest<
     report: &mut ReadyScrubReport,
 ) -> Result<bool> {
     if scheduler
-        .quarantine_ready(record.id, manifest_hash, reason)
+        .quarantine_ready(record.id, Some(manifest_hash), reason)
         .await?
+        != crate::artifact_scheduler::QuarantineOutcome::LostRace
     {
         report.jobs_quarantined = report
             .jobs_quarantined

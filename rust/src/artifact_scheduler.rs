@@ -1815,27 +1815,6 @@ impl ArtifactScheduler {
             .map(row_record)
             .collect()
     }
-    pub async fn quarantine_ready(&self, id: i64, manifest: &str, reason: &str) -> Result<bool> {
-        if id <= 0 || manifest.trim().is_empty() || reason.trim().is_empty() {
-            bail!("invalid ready quarantine request");
-        }
-        let mut tx = self.pool.begin().await?;
-        let changed = sqlx::query("UPDATE artifact_jobs SET state='queued',manifest=NULL,owner=NULL,heartbeat_at=NULL,lease_expires_at=NULL,error=?,failure_class=NULL,updated_at=unixepoch() WHERE id=? AND state='ready' AND manifest=?")
-            .bind(reason.chars().take(4096).collect::<String>())
-            .bind(id)
-            .bind(manifest)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected() == 1;
-        if changed {
-            sqlx::query("UPDATE artifact_observations SET published_artifact_id=NULL WHERE published_artifact_id=?")
-                .bind(id)
-                .execute(&mut *tx)
-                .await?;
-        }
-        tx.commit().await?;
-        Ok(changed)
-    }
     pub async fn published(
         &self,
         w: &str,

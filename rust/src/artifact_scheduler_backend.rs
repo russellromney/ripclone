@@ -228,9 +228,6 @@ pub trait ArtifactSchedulerPersistence: Send + Sync {
     async fn get_by_key(&self, key: &ArtifactKey) -> Result<Option<ArtifactRecord>>;
     /// Restartable maintenance scan ordered by durable job id.
     async fn ready_page(&self, after_id: i64, limit: usize) -> Result<Vec<ArtifactRecord>>;
-    /// CAS-quarantine one Ready manifest and clear every published alias before
-    /// requeueing the exact immutable key for repair.
-    async fn quarantine_ready(&self, id: i64, manifest: &str, reason: &str) -> Result<bool>;
     async fn published(
         &self,
         workspace: &str,
@@ -722,9 +719,6 @@ impl ArtifactSchedulerPersistence for crate::artifact_scheduler::ArtifactSchedul
     }
     async fn ready_page(&self, after_id: i64, limit: usize) -> Result<Vec<ArtifactRecord>> {
         self.ready_page(after_id, limit).await
-    }
-    async fn quarantine_ready(&self, id: i64, manifest: &str, reason: &str) -> Result<bool> {
-        self.quarantine_ready(id, manifest, reason).await
     }
     async fn published(
         &self,

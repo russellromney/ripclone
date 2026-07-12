@@ -1242,16 +1242,17 @@ mod tests {
 
         // Change the immutable root while retaining the same scheduler id. A
         // stale partial offset must reset instead of skipping the new graph.
-        assert!(
+        assert!(matches!(
             ArtifactSchedulerPersistence::quarantine_ready(
                 &scheduler,
                 retry.record.id,
-                &rebuilt_manifest,
+                Some(&rebuilt_manifest),
                 "test rebuild with different physical level layout",
             )
             .await
-            .unwrap()
-        );
+            .unwrap(),
+            crate::artifact_scheduler::QuarantineOutcome::Requeued(_)
+        ));
         let replacement = scheduler.claim("worker-3", 5).await.unwrap().unwrap();
         let different_builder = builder.clone().with_pack_targets(u64::MAX, 1);
         assert_eq!(

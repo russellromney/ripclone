@@ -7,7 +7,7 @@
 use crate::artifact_scheduler::{
     ArtifactKey, ArtifactKind, ArtifactRecord, ArtifactState, ClaimedArtifact,
     CompletionSealAuthority, CompletionVerifier, FailureClass, ObservationOutcome,
-    ObservationSnapshot, RetryOutcome, ScheduleOutcome, SchedulerLimits,
+    ObservationSnapshot, QuarantineOutcome, RetryOutcome, ScheduleOutcome, SchedulerLimits,
     VerifiedCompletionEvidence, scheduler_fingerprint, validate_format_version, validate_lease,
     validate_limits, validate_observation_identity, validate_resolved_commit,
 };
@@ -1297,7 +1297,15 @@ impl ArtifactSchedulerPersistence for PostgresArtifactScheduler {
             .collect()
     }
 
-    async fn quarantine_ready(&self, id: i64, manifest: &str, reason: &str) -> Result<bool> {
+    async fn quarantine_ready(
+        &self,
+        id: i64,
+        manifest: Option<&str>,
+        reason: &str,
+    ) -> Result<QuarantineOutcome> {
+        let Some(manifest) = manifest else {
+            return Ok(QuarantineOutcome::LostRace);
+        };
         if id <= 0 || manifest.trim().is_empty() || reason.trim().is_empty() {
             bail!("invalid ready quarantine request");
         }
@@ -1316,7 +1324,11 @@ impl ArtifactSchedulerPersistence for PostgresArtifactScheduler {
                 .await?;
         }
         tx.commit().await?;
-        Ok(changed)
+        Ok(if changed {
+            QuarantineOutcome::Requeued(id)
+        } else {
+            QuarantineOutcome::LostRace
+        })
     }
 
     async fn published(
