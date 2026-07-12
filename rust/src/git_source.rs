@@ -7,13 +7,20 @@
 
 use crate::artifact_manifest::{CasBlob, GitPackPair};
 use crate::cas::Cas;
-use crate::pack::PackBuilder;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::ffi::CString;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, Read, Seek, Write};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::Duration;
@@ -22,6 +29,11 @@ use tokio_util::sync::CancellationToken;
 pub const GIT_SOURCE_SCHEMA: u32 = 1;
 pub const GIT_SOURCE_FORMAT: u32 = 1;
 const DIGEST_DOMAIN: &[u8] = b"ripclone/git-build-source/semantic/v1\0";
+
+#[cfg(unix)]
+thread_local! {
+    static SCRATCH_CHILD_FD: std::cell::Cell<Option<libc::c_int>> = const { std::cell::Cell::new(None) };
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -235,6 +247,179 @@ impl GitSourceLimits {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct BoundScratch {
+    root: OwnedFd,
+    attempt: OwnedFd,
+    name: std::ffi::OsString,
+    dev: u64,
+    ino: u64,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl BoundScratch {
+    fn new(path: &Path, prefix: &str) -> Result<Self> {
+        let expected = std::fs::metadata(path).context("stat configured Git source scratch")?;
+        if !expected.is_dir() {
+            bail!("configured Git source scratch is not a directory")
+        }
+        let canonical = path
+            .canonicalize()
+            .context("canonicalize configured Git source scratch")?;
+        let canonical_c = CString::new(canonical.as_os_str().as_bytes())?;
+        let fd = unsafe {
+            libc::open(
+                canonical_c.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error()).context("open Git source scratch handle");
+        }
+        let root = unsafe { OwnedFd::from_raw_fd(fd) };
+        let root_stat = fd_stat(root.as_raw_fd())?;
+        if root_stat.st_dev as u64 != expected.dev() || root_stat.st_ino != expected.ino() {
+            bail!("configured Git source scratch changed while binding")
+        }
+        let name = std::ffi::OsString::from(format!(
+            ".{prefix}.{}",
+            hex::encode(rand::random::<[u8; 16]>())
+        ));
+        let name_c = cstring(&name)?;
+        if unsafe { libc::mkdirat(root.as_raw_fd(), name_c.as_ptr(), 0o700) } != 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("create bound Git source scratch attempt");
+        }
+        let attempt = openat_dir(root.as_raw_fd(), &name)?;
+        let stat = fd_stat(attempt.as_raw_fd())?;
+        Ok(Self {
+            root,
+            attempt,
+            name,
+            dev: stat.st_dev as u64,
+            ino: stat.st_ino,
+        })
+    }
+
+    fn path(&self) -> PathBuf {
+        #[cfg(target_os = "linux")]
+        return PathBuf::from(format!("/proc/self/fd/{}", self.attempt.as_raw_fd()));
+        #[cfg(target_os = "macos")]
+        return PathBuf::from(".");
+    }
+
+    fn enter(&self) -> Result<ScratchScope> {
+        let duplicate = unsafe { libc::dup(self.attempt.as_raw_fd()) };
+        if duplicate < 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("duplicate Git source scratch descriptor");
+        }
+        let staging = unsafe { OwnedFd::from_raw_fd(duplicate) };
+        #[cfg(target_os = "linux")]
+        {
+            let previous = SCRATCH_CHILD_FD.with(|slot| slot.replace(Some(staging.as_raw_fd())));
+            Ok(ScratchScope { staging, previous })
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let dot = CString::new(".").unwrap();
+            let old = unsafe {
+                libc::open(
+                    dot.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                )
+            };
+            if old < 0 {
+                return Err(std::io::Error::last_os_error())
+                    .context("save Git source installer thread cwd");
+            }
+            let old = unsafe { OwnedFd::from_raw_fd(old) };
+            if unsafe { pthread_fchdir_np(staging.as_raw_fd()) } != 0 {
+                return Err(std::io::Error::last_os_error())
+                    .context("bind Git source installer thread cwd");
+            }
+            let previous = SCRATCH_CHILD_FD.with(|slot| slot.replace(Some(staging.as_raw_fd())));
+            Ok(ScratchScope {
+                old,
+                staging,
+                previous,
+            })
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl Drop for BoundScratch {
+    fn drop(&mut self) {
+        let _ = remove_dir_contents(self.attempt.as_raw_fd());
+        if let Ok(stat) = entry_stat(self.root.as_raw_fd(), &self.name)
+            && stat.st_dev as u64 == self.dev
+            && stat.st_ino == self.ino
+            && let Ok(name) = cstring(&self.name)
+        {
+            unsafe {
+                libc::unlinkat(self.root.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR);
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct ScratchScope {
+    staging: OwnedFd,
+    previous: Option<libc::c_int>,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ScratchScope {
+    fn drop(&mut self) {
+        SCRATCH_CHILD_FD.with(|slot| slot.set(self.previous));
+        let _ = self.staging.as_raw_fd();
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct ScratchScope {
+    old: OwnedFd,
+    staging: OwnedFd,
+    previous: Option<libc::c_int>,
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for ScratchScope {
+    fn drop(&mut self) {
+        unsafe {
+            pthread_fchdir_np(self.old.as_raw_fd());
+        }
+        SCRATCH_CHILD_FD.with(|slot| slot.set(self.previous));
+        let _ = self.staging.as_raw_fd();
+    }
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn pthread_fchdir_np(fd: libc::c_int) -> libc::c_int;
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+struct BoundScratch;
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+impl BoundScratch {
+    fn new(_: &Path, _: &str) -> Result<Self> {
+        bail!("handle-bound Git source scratch is unsupported on this platform")
+    }
+    fn path(&self) -> PathBuf {
+        unreachable!()
+    }
+    fn enter(&self) -> Result<ScratchScope> {
+        bail!("handle-bound Git source scratch is unsupported on this platform")
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+struct ScratchScope;
+
 /// Storage-neutral sink. Implementations must verify the declared SHA-256 and
 /// length before returning success.
 pub trait GitSourceUploader: Send + Sync {
@@ -259,19 +444,32 @@ pub trait GitSourceLoader: Send + Sync {
     ) -> Result<Vec<u8>>;
 }
 
-#[derive(Clone, Copy)]
-pub struct CasGitSourceStore<'a> {
-    cas: &'a Cas,
+#[derive(Clone)]
+pub struct CasGitSourceStore {
+    root: PathBuf,
 }
-impl<'a> CasGitSourceStore<'a> {
-    pub fn new(cas: &'a Cas) -> Self {
-        Self { cas }
+impl CasGitSourceStore {
+    pub fn new(cas: &Cas) -> Self {
+        let root = if cas.root().is_absolute() {
+            cas.root().to_owned()
+        } else {
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(cas.root())
+        };
+        Self {
+            root: root.canonicalize().unwrap_or(root),
+        }
+    }
+
+    fn cas(&self) -> Result<Cas> {
+        Cas::new(&self.root)
     }
 }
 
-impl GitSourceUploader for CasGitSourceStore<'_> {
+impl GitSourceUploader for CasGitSourceStore {
     fn put_file(&self, blob: &CasBlob, source: &Path) -> Result<()> {
-        let len = self.cas.put_file_with_hash(&blob.hash, source)?;
+        let len = self.cas()?.put_file_with_hash(&blob.hash, source)?;
         if len != blob.len {
             bail!("uploaded Git source child length mismatch")
         }
@@ -281,11 +479,11 @@ impl GitSourceUploader for CasGitSourceStore<'_> {
         if bytes.len() as u64 != blob.len {
             bail!("uploaded Git source root length mismatch")
         }
-        self.cas.put_with_hash(&blob.hash, bytes)
+        self.cas()?.put_with_hash(&blob.hash, bytes)
     }
 }
 
-impl GitSourceLoader for CasGitSourceStore<'_> {
+impl GitSourceLoader for CasGitSourceStore {
     fn load_file(
         &self,
         blob: &CasBlob,
@@ -294,7 +492,7 @@ impl GitSourceLoader for CasGitSourceStore<'_> {
     ) -> Result<()> {
         check_cancelled(cancelled)?;
         validate_blob(blob, u64::MAX)?;
-        copy_verified_create_new(&self.cas.path(&blob.hash), destination, blob, cancelled)
+        copy_verified_create_new(&self.cas()?.path(&blob.hash), destination, blob, cancelled)
     }
     fn load_bytes(
         &self,
@@ -304,8 +502,41 @@ impl GitSourceLoader for CasGitSourceStore<'_> {
     ) -> Result<Vec<u8>> {
         check_cancelled(cancelled)?;
         validate_blob(blob, maximum)?;
-        let bytes = std::fs::read(self.cas.path(&blob.hash)).context("read Git source CAS root")?;
-        verify_bytes(blob, &bytes)?;
+        let path = self.cas()?.path(&blob.hash);
+        let metadata = std::fs::symlink_metadata(&path).context("stat Git source CAS root")?;
+        if !metadata.file_type().is_file() || metadata.len() != blob.len {
+            bail!("Git source CAS root is not the declared regular file")
+        }
+        let capacity: usize = blob
+            .len
+            .try_into()
+            .context("Git source root is too large")?;
+        let mut input = File::open(path).context("open Git source CAS root")?;
+        let mut bytes = Vec::with_capacity(capacity);
+        let mut hasher = Sha256::new();
+        let mut buffer = [0u8; 1024 * 1024];
+        while bytes.len() < capacity {
+            check_cancelled(cancelled)?;
+            let wanted = (capacity - bytes.len()).min(buffer.len());
+            let read = input
+                .read(&mut buffer[..wanted])
+                .context("read Git source CAS root")?;
+            if read == 0 {
+                break;
+            }
+            #[cfg(test)]
+            std::thread::sleep(Duration::from_millis(1));
+            hasher.update(&buffer[..read]);
+            bytes.extend_from_slice(&buffer[..read]);
+        }
+        let mut trailing = [0u8; 1];
+        check_cancelled(cancelled)?;
+        if input.read(&mut trailing)? != 0
+            || bytes.len() != capacity
+            || hex::encode(hasher.finalize()) != blob.hash
+        {
+            bail!("Git source CAS root does not match descriptor")
+        }
         Ok(bytes)
     }
 }
@@ -329,6 +560,9 @@ impl TrustedProviderFetch {
         commit: String,
     ) -> Result<Self> {
         reject_symlink_dir(&repo_path)?;
+        let repo_path = repo_path
+            .canonicalize()
+            .context("bind trusted provider fetch repository")?;
         validate_identity(&workspace, "workspace")?;
         validate_identity(&repo, "repo")?;
         let object_format = detect_object_format(&repo_path)?;
@@ -428,7 +662,15 @@ impl<'a, U: GitSourceUploader> GitSourcePackager<'a, U> {
         cancelled: &CancellationToken,
     ) -> Result<PreparedGitSource> {
         self.limits.validate()?;
-        reject_symlink_dir(self.scratch)?;
+        let attempt = BoundScratch::new(self.scratch, "git-source-pack")?;
+        let _scope = attempt.enter()?;
+        let scratch = attempt.path();
+        let local_cas = Cas::new(
+            self.local_cas
+                .root()
+                .canonicalize()
+                .context("bind local Git source CAS")?,
+        )?;
         check_cancelled(cancelled)?;
         let objects = enumerate_closure(
             &source.repo_path,
@@ -436,35 +678,30 @@ impl<'a, U: GitSourceUploader> GitSourcePackager<'a, U> {
             source.object_format,
             &self.limits,
             cancelled,
+            &scratch,
         )?;
-        let object_set_digest = object_set_digest(&objects);
+        let object_set_digest = objects.digest.clone();
         let pack_scratch = tempfile::Builder::new()
             .prefix("git-source-pack.")
-            .tempdir_in(self.scratch)?;
-        let built = if source.object_format == GitObjectFormat::Sha256 {
-            // The existing partitioner uses a SHA-1-only gix object-size path.
-            // C Git is object-format aware and emits a complete non-thin pack
-            // plus its matching index without interpreting provider metadata.
-            build_sha256_source_pack(
+            .tempdir_in(&scratch)?;
+        let partitions = partition_inventory(
+            &source.repo_path,
+            &objects,
+            &self.limits,
+            pack_scratch.path(),
+            cancelled,
+        )?;
+        let mut built = Vec::with_capacity(partitions.len());
+        for (index, partition) in partitions.iter().enumerate() {
+            built.push(build_source_pack(
                 &source.repo_path,
-                &objects,
-                self.local_cas,
+                partition,
+                &local_cas,
                 pack_scratch.path(),
+                index,
                 cancelled,
-            )?
-        } else {
-            PackBuilder::new_cancellable_in_scratch(
-                &source.repo_path,
-                self.local_cas,
-                pack_scratch.path(),
-                cancelled.clone(),
-            )
-            .build_object_set_packs(
-                &objects,
-                self.limits.target_pack_raw_bytes,
-                false,
-            )?
-        };
+            )?);
+        }
         if built.is_empty() || built.len() > self.limits.max_packs {
             bail!("Git source pack count is out of bounds")
         }
@@ -496,7 +733,7 @@ impl<'a, U: GitSourceUploader> GitSourcePackager<'a, U> {
             commit: source.commit,
             object_format: source.object_format,
             packs,
-            object_count: objects.len() as u64,
+            object_count: objects.count,
             object_set_digest,
             aggregate_pack_bytes,
             semantic_digest: String::new(),
@@ -504,13 +741,7 @@ impl<'a, U: GitSourceUploader> GitSourcePackager<'a, U> {
         manifest.semantic_digest = manifest.compute_semantic_digest()?;
         manifest.validate(&self.limits)?;
         // Verify the locally produced source exactly before any root can be uploaded.
-        verify_local_manifest(
-            &manifest,
-            self.local_cas,
-            self.scratch,
-            &self.limits,
-            cancelled,
-        )?;
+        verify_local_manifest(&manifest, &local_cas, &scratch, &self.limits, cancelled)?;
         let root_bytes = manifest.canonical_bytes()?;
         let root = CasBlob {
             hash: hex::encode(Sha256::digest(&root_bytes)),
@@ -520,9 +751,9 @@ impl<'a, U: GitSourceUploader> GitSourcePackager<'a, U> {
         for pair in &manifest.packs {
             check_cancelled(cancelled)?;
             self.uploader
-                .put_file(&pair.pack, &self.local_cas.path(&pair.pack.hash))?;
+                .put_file(&pair.pack, &local_cas.path(&pair.pack.hash))?;
             self.uploader
-                .put_file(&pair.index, &self.local_cas.path(&pair.index.hash))?;
+                .put_file(&pair.index, &local_cas.path(&pair.index.hash))?;
         }
         check_cancelled(cancelled)?;
         self.uploader.put_bytes(&root, &root_bytes)?;
@@ -531,12 +762,15 @@ impl<'a, U: GitSourceUploader> GitSourcePackager<'a, U> {
 }
 
 pub struct MaterializedGitSource {
-    directory: tempfile::TempDir,
+    _scope: ScratchScope,
+    _scratch: BoundScratch,
+    path: PathBuf,
     commit: String,
+    _same_thread: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 impl MaterializedGitSource {
     pub fn path(&self) -> &Path {
-        self.directory.path()
+        &self.path
     }
     pub fn commit(&self) -> &str {
         &self.commit
@@ -562,7 +796,9 @@ impl<'a, L: GitSourceLoader> GitSourceMaterializer<'a, L> {
         authority: &AuthenticatedGitSource,
         cancelled: &CancellationToken,
     ) -> Result<MaterializedGitSource> {
-        reject_symlink_dir(self.scratch)?;
+        let attempt = BoundScratch::new(self.scratch, "git-source-materialize")?;
+        let scope = attempt.enter()?;
+        let scratch = attempt.path();
         let root_bytes =
             self.loader
                 .load_bytes(&authority.root, self.limits.max_manifest_bytes, cancelled)?;
@@ -575,25 +811,29 @@ impl<'a, L: GitSourceLoader> GitSourceMaterializer<'a, L> {
         {
             bail!("authenticated Git source identity mismatch")
         }
-        let directory = tempfile::Builder::new()
-            .prefix("git-source-materialized.")
-            .tempdir_in(self.scratch)?;
-        init_bare(directory.path(), manifest.object_format)?;
-        let pack_dir = directory.path().join("objects/pack");
+        let directory = scratch.join("repo");
+        std::fs::create_dir(&directory)?;
+        init_bare(&directory, manifest.object_format, cancelled)?;
+        let pack_dir = directory.join("objects/pack");
         for (i, pair) in manifest.packs.iter().enumerate() {
             check_cancelled(cancelled)?;
-            // Git discovers packs by the `pack-*.idx` convention. The suffix
-            // is attempt-local and conveys no identity; content hashes remain
-            // exclusively in the authenticated descriptors.
+            // Verify each pair in an otherwise empty object database. Loading
+            // it into the union first would allow a thin/cross-pack delta to
+            // resolve its base from a previously installed pair.
+            let pair_directory = tempfile::Builder::new()
+                .prefix("git-source-pair.")
+                .tempdir_in(&scratch)?;
+            init_bare(pair_directory.path(), manifest.object_format, cancelled)?;
+            let pair_pack_dir = pair_directory.path().join("objects/pack");
             let base = format!("pack-source-{i:08}");
-            let pack = pack_dir.join(format!("{base}.pack"));
-            let index = pack_dir.join(format!("{base}.idx"));
+            let pack = pair_pack_dir.join(format!("{base}.pack"));
+            let index = pair_pack_dir.join(format!("{base}.idx"));
             self.loader.load_file(&pair.pack, &pack, cancelled)?;
             self.loader.load_file(&pair.index, &index, cancelled)?;
             verify_file_at(&pack, &pair.pack, cancelled)?;
             verify_file_at(&index, &pair.index, cancelled)?;
             safe_git_ok_quiet_cancelled(
-                directory.path(),
+                pair_directory.path(),
                 &[
                     "verify-pack",
                     index.to_str().context("non-UTF8 index path")?,
@@ -601,44 +841,52 @@ impl<'a, L: GitSourceLoader> GitSourceMaterializer<'a, L> {
                 cancelled,
             )
             .context("Git source pack/index pair failed verification")?;
+            std::fs::rename(&pack, pack_dir.join(format!("{base}.pack")))?;
+            std::fs::rename(&index, pack_dir.join(format!("{base}.idx")))?;
         }
-        safe_git_ok(
-            directory.path(),
+        safe_git_ok_cancelled(
+            &directory,
             &["update-ref", "refs/heads/ripclone-source", &manifest.commit],
+            cancelled,
         )?;
-        safe_git_ok(
-            directory.path(),
+        safe_git_ok_cancelled(
+            &directory,
             &["symbolic-ref", "HEAD", "refs/heads/ripclone-source"],
+            cancelled,
         )?;
         safe_git_ok_quiet_cancelled(
-            directory.path(),
+            &directory,
             &["fsck", "--full", "--strict", "--no-dangling"],
             cancelled,
         )?;
         let objects = enumerate_closure(
-            directory.path(),
+            &directory,
             &manifest.commit,
             manifest.object_format,
             &self.limits,
             cancelled,
+            &scratch,
         )?;
-        if objects.len() as u64 != manifest.object_count
-            || object_set_digest(&objects) != manifest.object_set_digest
-        {
+        validate_inventory_sizes(&directory, &objects, &self.limits, None, cancelled)?;
+        if objects.count != manifest.object_count || objects.digest != manifest.object_set_digest {
             bail!("materialized Git source closure does not match manifest")
         }
-        if enumerate_all_objects(
-            directory.path(),
+        let all_objects = enumerate_all_objects(
+            &directory,
             manifest.object_format,
             &self.limits,
             cancelled,
-        )? != objects
-        {
+            &scratch,
+        )?;
+        if all_objects.count != objects.count || all_objects.digest != objects.digest {
             bail!("materialized Git source contains objects outside the exact closure")
         }
         Ok(MaterializedGitSource {
-            directory,
+            _scope: scope,
+            _scratch: attempt,
+            path: directory,
             commit: manifest.commit,
+            _same_thread: std::marker::PhantomData,
         })
     }
 }
@@ -672,40 +920,74 @@ fn verify_local_manifest(
     )?;
     let materializer = GitSourceMaterializer::new(&store, scratch, limits.clone());
     let materialized = materializer.materialize(&auth, cancelled)?;
-    let actual = text(&safe_git(materialized.path(), &["rev-parse", "HEAD"])?)?;
+    let actual = text(&safe_git_cancelled(
+        materialized.path(),
+        &["rev-parse", "HEAD"],
+        cancelled,
+    )?)?;
     if actual != manifest.commit {
         bail!("local Git source verification resolved the wrong commit")
     }
     Ok(())
 }
 
-fn build_sha256_source_pack(
+fn build_source_pack(
     repo: &Path,
-    objects: &[String],
+    objects: &Path,
     cas: &Cas,
     scratch: &Path,
+    partition: usize,
     cancelled: &CancellationToken,
-) -> Result<Vec<(String, u64, String, u64)>> {
+) -> Result<(String, u64, String, u64)> {
     check_cancelled(cancelled)?;
-    let prefix = scratch.join("pack");
-    crate::git::pack_objects_to_prefix_cancelled(repo, objects, &prefix, cancelled)?;
+    let prefix = scratch.join(format!("source-{partition:08}"));
+    let input = File::open(objects).context("open Git source pack partition")?;
+    let mut command = safe_command();
+    command
+        .arg("-C")
+        .arg(repo)
+        .args(["-c", "core.hooksPath=/dev/null", "-c", "pack.threads=1"])
+        .arg("pack-objects")
+        .arg(&prefix)
+        .stdin(Stdio::from(input))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let status = ReapedChild::new(command.spawn().context("spawn Git source pack-objects")?)
+        .wait_cancelled(cancelled, "Git source pack-objects")?;
+    if !status.success() {
+        bail!("Git source pack-objects failed")
+    }
     check_cancelled(cancelled)?;
     let mut pack = None;
     let mut index = None;
     for entry in std::fs::read_dir(scratch)? {
         let path = entry?.path();
+        if !path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(&format!("source-{partition:08}-")))
+        {
+            continue;
+        }
         match path.extension().and_then(|extension| extension.to_str()) {
             Some("pack") if pack.is_none() => pack = Some(path),
             Some("idx") if index.is_none() => index = Some(path),
-            Some("pack" | "idx") => bail!("SHA-256 Git source emitted multiple pack pairs"),
+            Some("pack" | "idx") => bail!("Git source emitted multiple partition pack pairs"),
             _ => {}
         }
     }
-    let pack = pack.context("SHA-256 Git source emitted no pack")?;
-    let index = index.context("SHA-256 Git source emitted no index")?;
+    let pack = pack.context("Git source emitted no pack")?;
+    let index = index.context("Git source emitted no index")?;
     let (pack_hash, pack_len) = cas.put_file(pack)?;
     let (index_hash, index_len) = cas.put_file(index)?;
-    Ok(vec![(pack_hash, pack_len, index_hash, index_len)])
+    Ok((pack_hash, pack_len, index_hash, index_len))
+}
+
+struct ObjectInventory {
+    _directory: tempfile::TempDir,
+    path: PathBuf,
+    count: u64,
+    digest: String,
 }
 
 fn enumerate_closure(
@@ -714,62 +996,62 @@ fn enumerate_closure(
     format: GitObjectFormat,
     limits: &GitSourceLimits,
     cancelled: &CancellationToken,
-) -> Result<Vec<String>> {
+    scratch: &Path,
+) -> Result<ObjectInventory> {
     check_cancelled(cancelled)?;
-    let stdout = rev_list_bounded(repo, commit, limits.max_objects, cancelled)?;
-    let mut objects = Vec::new();
-    let mut seen = HashSet::new();
-    for oid in &stdout {
-        check_cancelled(cancelled)?;
-        validate_oid(oid, format)?;
-        if !seen.insert(oid.to_owned()) {
-            continue;
-        }
-        if seen.len() > limits.max_objects {
-            bail!("Git source object count exceeds limit")
-        }
-        objects.push(oid.to_owned());
-    }
-    objects.sort();
-    if objects.is_empty() || !objects.iter().any(|oid| oid == commit) {
+    let inventory = enumerate_inventory(
+        repo,
+        &["rev-list", "--objects", "--no-object-names", commit],
+        format,
+        limits.max_objects,
+        cancelled,
+        scratch,
+        "reachable Git source objects",
+    )?;
+    if inventory.count == 0 || !inventory_contains(&inventory, commit, cancelled)? {
         bail!("Git source closure is empty or excludes target")
     }
-    let ty = text(&safe_git(repo, &["cat-file", "-t", commit])?)?;
+    let ty = text(&safe_git_cancelled(
+        repo,
+        &["cat-file", "-t", commit],
+        cancelled,
+    )?)?;
     if ty != "commit" {
         bail!("Git source target is not a commit")
     }
-    verify_object_sizes_bounded(repo, &objects, limits, cancelled)?;
-    Ok(objects)
+    Ok(inventory)
 }
 
-fn verify_object_sizes_bounded(
+fn validate_inventory_sizes(
     repo: &Path,
-    objects: &[String],
+    inventory: &ObjectInventory,
     limits: &GitSourceLimits,
+    partition_scratch: Option<&Path>,
     cancelled: &CancellationToken,
-) -> Result<()> {
-    let mut input = tempfile::tempfile().context("create bounded cat-file input")?;
-    for oid in objects {
-        writeln!(input, "{oid}")?;
-    }
-    input.rewind()?;
-    let lines = run_git_lines_bounded_with_input(
-        repo,
-        &[
+) -> Result<Vec<PathBuf>> {
+    let input = File::open(&inventory.path).context("open Git source inventory input")?;
+    let expected_file =
+        File::open(&inventory.path).context("open expected Git source inventory")?;
+    let mut expected = std::io::BufReader::new(expected_file).lines();
+    let mut command = safe_command();
+    command
+        .arg("-C")
+        .arg(repo)
+        .args(["-c", "core.hooksPath=/dev/null"])
+        .args([
             "cat-file",
             "--batch-check=%(objectname) %(objecttype) %(objectsize)",
-        ],
-        objects.len(),
-        cancelled,
-        Some(input),
-    )?;
-    if lines.len() != objects.len() {
-        bail!("Git source object sizing returned an incomplete set")
-    }
-    let expected: HashSet<&str> = objects.iter().map(String::as_str).collect();
-    let mut seen = HashSet::new();
+        ])
+        .stdin(Stdio::from(input))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = command.spawn().context("spawn bounded Git source sizing")?;
     let mut total = 0u64;
-    for line in lines {
+    let mut count = 0u64;
+    let mut partitions = Vec::new();
+    let mut partition: Option<File> = None;
+    let mut partition_bytes = 0u64;
+    crate::git::consume_child_lines_cancellable(child, cancelled, |line| {
         let mut fields = line.split_whitespace();
         let oid = fields.next().context("missing sized Git object id")?;
         let kind = fields.next().context("missing sized Git object type")?;
@@ -778,12 +1060,15 @@ fn verify_object_sizes_bounded(
             .context("missing sized Git object length")?
             .parse()
             .context("parse Git object length")?;
+        let wanted = expected
+            .next()
+            .transpose()?
+            .context("Git source sizing emitted too many objects")?;
         if fields.next().is_some()
-            || !expected.contains(oid)
-            || !seen.insert(oid.to_owned())
+            || oid != wanted
             || !matches!(kind, "commit" | "tree" | "blob" | "tag")
         {
-            bail!("Git source object sizing emitted forged or duplicate data")
+            bail!("Git source object sizing emitted forged or reordered data")
         }
         if size > limits.max_object_bytes {
             bail!("Git source object exceeds per-object limit")
@@ -794,86 +1079,41 @@ fn verify_object_sizes_bounded(
         if total > limits.max_total_object_bytes {
             bail!("Git source objects exceed aggregate limit")
         }
-    }
-    Ok(())
-}
-
-fn rev_list_bounded(
-    repo: &Path,
-    commit: &str,
-    max_objects: usize,
-    cancelled: &CancellationToken,
-) -> Result<Vec<String>> {
-    run_git_lines_bounded(
-        repo,
-        &["rev-list", "--objects", "--no-object-names", commit],
-        max_objects,
-        cancelled,
-    )
-}
-
-fn run_git_lines_bounded(
-    repo: &Path,
-    args: &[&str],
-    max_lines: usize,
-    cancelled: &CancellationToken,
-) -> Result<Vec<String>> {
-    run_git_lines_bounded_with_input(repo, args, max_lines, cancelled, None)
-}
-
-fn run_git_lines_bounded_with_input(
-    repo: &Path,
-    args: &[&str],
-    max_lines: usize,
-    cancelled: &CancellationToken,
-    input: Option<File>,
-) -> Result<Vec<String>> {
-    let mut command = safe_command();
-    command
-        .arg("-C")
-        .arg(repo)
-        .args(["-c", "core.hooksPath=/dev/null"])
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    if let Some(input) = input {
-        command.stdin(Stdio::from(input));
-    }
-    let mut child = command
-        .spawn()
-        .context("spawn bounded Git source command")?;
-    let stdout = child.stdout.take().context("capture Git source rev-list")?;
-    let result = (|| -> Result<Vec<String>> {
-        let mut reader = std::io::BufReader::new(stdout);
-        let mut objects = Vec::new();
-        let mut line = String::with_capacity(65);
-        loop {
-            check_cancelled(cancelled)?;
-            line.clear();
-            let read = reader.read_line(&mut line)?;
-            if read == 0 {
-                break;
-            }
-            if line.len() > 256 {
-                bail!("bounded Git source command emitted an overlong line")
-            }
-            let oid = line.trim_end_matches(&['\r', '\n'][..]);
-            objects.push(oid.to_owned());
-            if objects.len() > max_lines {
-                bail!("bounded Git command output exceeds limit")
-            }
+        count = count
+            .checked_add(1)
+            .context("Git source size count overflow")?;
+        if count > inventory.count {
+            bail!("Git source sizing exceeds inventory count")
         }
-        Ok(objects)
-    })();
-    if result.is_err() {
-        let _ = child.kill();
+        if let Some(root) = partition_scratch {
+            if partition.is_none()
+                || (partition_bytes > 0
+                    && partition_bytes.saturating_add(size) > limits.target_pack_raw_bytes)
+            {
+                if partitions.len() == limits.max_packs {
+                    bail!("Git source partition count exceeds limit")
+                }
+                let path = root.join(format!("partition-{:08}", partitions.len()));
+                partition = Some(
+                    OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&path)?,
+                );
+                partitions.push(path);
+                partition_bytes = 0;
+            }
+            writeln!(partition.as_mut().unwrap(), "{oid}")?;
+            partition_bytes = partition_bytes
+                .checked_add(size)
+                .context("Git source partition size overflow")?;
+        }
+        Ok(())
+    })?;
+    if count != inventory.count || expected.next().transpose()?.is_some() {
+        bail!("Git source object sizing returned an incomplete set")
     }
-    let status = child.wait()?;
-    let objects = result?;
-    if !status.success() {
-        bail!("bounded Git source command failed")
-    }
-    Ok(objects)
+    Ok(partitions)
 }
 
 fn enumerate_all_objects(
@@ -881,54 +1121,164 @@ fn enumerate_all_objects(
     format: GitObjectFormat,
     limits: &GitSourceLimits,
     cancelled: &CancellationToken,
-) -> Result<Vec<String>> {
+    scratch: &Path,
+) -> Result<ObjectInventory> {
     check_cancelled(cancelled)?;
-    let lines = run_git_lines_bounded(
+    enumerate_inventory(
         repo,
         &[
             "cat-file",
             "--batch-all-objects",
             "--batch-check=%(objectname)",
         ],
+        format,
         limits.max_objects,
         cancelled,
-    )?;
-    let mut objects = Vec::new();
-    let mut seen = HashSet::new();
-    for oid in lines {
-        check_cancelled(cancelled)?;
-        validate_oid(&oid, format)?;
-        if seen.insert(oid.clone()) {
-            objects.push(oid);
-            if objects.len() > limits.max_objects {
-                bail!("materialized Git source object count exceeds limit")
-            }
-        }
-    }
-    objects.sort();
-    Ok(objects)
+        scratch,
+        "all materialized Git source objects",
+    )
 }
 
-fn object_set_digest(objects: &[String]) -> String {
+fn enumerate_inventory(
+    repo: &Path,
+    args: &[&str],
+    format: GitObjectFormat,
+    maximum: usize,
+    cancelled: &CancellationToken,
+    scratch: &Path,
+    role: &str,
+) -> Result<ObjectInventory> {
+    let directory = tempfile::Builder::new()
+        .prefix("git-source-inventory.")
+        .tempdir_in(scratch)?;
+    let unsorted = directory.path().join("unsorted");
+    let sorted = directory.path().join("sorted");
+    let mut output = std::io::BufWriter::new(
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&unsorted)?,
+    );
+    let mut command = safe_command();
+    command
+        .arg("-C")
+        .arg(repo)
+        .args(["-c", "core.hooksPath=/dev/null"])
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = command.spawn().with_context(|| format!("spawn {role}"))?;
+    let mut emitted = 0usize;
+    crate::git::consume_child_lines_cancellable(child, cancelled, |oid| {
+        validate_oid(&oid, format)?;
+        emitted = emitted
+            .checked_add(1)
+            .context("Git source line count overflow")?;
+        if emitted > maximum {
+            bail!("{role} exceeds object limit")
+        }
+        writeln!(output, "{oid}")?;
+        Ok(())
+    })?;
+    output.flush()?;
+    sort_unique_file(&unsorted, &sorted, cancelled)?;
+    let mut reader = std::io::BufReader::new(File::open(&sorted)?);
     let mut h = Sha256::new();
     h.update(b"ripclone/git-build-source/object-set/v1\0");
-    for oid in objects {
+    let mut count = 0u64;
+    let mut line = String::with_capacity(format.oid_len() + 1);
+    loop {
+        check_cancelled(cancelled)?;
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+        let oid = line.trim_end_matches(&['\r', '\n'][..]);
+        validate_oid(oid, format)?;
+        count = count
+            .checked_add(1)
+            .context("Git source object count overflow")?;
+        if count > maximum as u64 {
+            bail!("{role} exceeds object limit")
+        }
         h.update((oid.len() as u64).to_be_bytes());
         h.update(oid.as_bytes());
     }
-    hex::encode(h.finalize())
+    Ok(ObjectInventory {
+        _directory: directory,
+        path: sorted,
+        count,
+        digest: hex::encode(h.finalize()),
+    })
 }
 
-fn init_bare(path: &Path, format: GitObjectFormat) -> Result<()> {
+fn sort_unique_file(input: &Path, output: &Path, cancelled: &CancellationToken) -> Result<()> {
+    let mut command = Command::new("sort");
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    command
+        .env_clear()
+        .env("PATH", path)
+        .env("LC_ALL", "C")
+        .args(["-u", "-o"])
+        .arg(output)
+        .arg(input)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    configure_process_group(&mut command);
+    bind_child_to_scratch(&mut command);
+    let status = ReapedChild::new(command.spawn().context("spawn Git source inventory sort")?)
+        .wait_cancelled(cancelled, "Git source inventory sort")?;
+    if !status.success() {
+        bail!("Git source inventory sort failed")
+    }
+    Ok(())
+}
+
+fn inventory_contains(
+    inventory: &ObjectInventory,
+    wanted: &str,
+    cancelled: &CancellationToken,
+) -> Result<bool> {
+    let reader = std::io::BufReader::new(File::open(&inventory.path)?);
+    for line in reader.lines() {
+        check_cancelled(cancelled)?;
+        if line? == wanted {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn partition_inventory(
+    repo: &Path,
+    inventory: &ObjectInventory,
+    limits: &GitSourceLimits,
+    scratch: &Path,
+    cancelled: &CancellationToken,
+) -> Result<Vec<PathBuf>> {
+    let partitions = validate_inventory_sizes(repo, inventory, limits, Some(scratch), cancelled)?;
+    if partitions.is_empty() {
+        bail!("Git source inventory produced no pack partitions")
+    }
+    Ok(partitions)
+}
+
+fn init_bare(path: &Path, format: GitObjectFormat, cancelled: &CancellationToken) -> Result<()> {
     let mut command = safe_command();
-    let output = command
+    command
         .args([
             "init",
             "--bare",
             &format!("--object-format={}", format.git_name()),
         ])
-        .arg(path)
-        .output()?;
+        .arg(path);
+    let output = run_output_bounded_cancelled(
+        command,
+        cancelled,
+        1024 * 1024,
+        "initialize isolated Git source",
+    )?;
     if !output.status.success() {
         bail!(
             "initialize isolated Git source failed: {}",
@@ -939,16 +1289,21 @@ fn init_bare(path: &Path, format: GitObjectFormat) -> Result<()> {
 }
 
 fn safe_git(repo: &Path, args: &[&str]) -> Result<Output> {
-    safe_command()
+    safe_git_cancelled(repo, args, &CancellationToken::new())
+}
+
+fn safe_git_cancelled(repo: &Path, args: &[&str], cancelled: &CancellationToken) -> Result<Output> {
+    let mut command = safe_command();
+    command
         .arg("-C")
         .arg(repo)
         .args(["-c", "core.hooksPath=/dev/null"])
-        .args(args)
-        .output()
+        .args(args);
+    run_output_bounded_cancelled(command, cancelled, 1024 * 1024, "run isolated Git")
         .with_context(|| format!("run isolated git {:?}", args))
 }
-fn safe_git_ok(repo: &Path, args: &[&str]) -> Result<()> {
-    let out = safe_git(repo, args)?;
+fn safe_git_ok_cancelled(repo: &Path, args: &[&str], cancelled: &CancellationToken) -> Result<()> {
+    let out = safe_git_cancelled(repo, args, cancelled)?;
     if !out.status.success() {
         bail!(
             "isolated git {:?} failed: {}",
@@ -957,6 +1312,10 @@ fn safe_git_ok(repo: &Path, args: &[&str]) -> Result<()> {
         )
     }
     Ok(())
+}
+#[cfg(test)]
+fn safe_git_ok(repo: &Path, args: &[&str]) -> Result<()> {
+    safe_git_ok_cancelled(repo, args, &CancellationToken::new())
 }
 fn safe_git_ok_quiet_cancelled(
     repo: &Path,
@@ -968,26 +1327,18 @@ fn safe_git_ok_quiet_cancelled(
     let diagnostic_child = diagnostic
         .try_clone()
         .context("clone isolated Git diagnostic file")?;
-    let mut child = safe_command()
+    let mut command = safe_command();
+    command
         .arg("-C")
         .arg(repo)
         .args(["-c", "core.hooksPath=/dev/null"])
         .args(args)
         .stdout(Stdio::null())
-        .stderr(Stdio::from(diagnostic_child))
+        .stderr(Stdio::from(diagnostic_child));
+    let child = command
         .spawn()
         .with_context(|| format!("run quiet isolated git {:?}", args))?;
-    let status = loop {
-        if cancelled.is_cancelled() {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!("quiet isolated git {:?} cancelled", args)
-        }
-        if let Some(status) = child.try_wait()? {
-            break status;
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    };
+    let status = ReapedChild::new(child).wait_cancelled(cancelled, "quiet isolated Git")?;
     if !status.success() {
         if diagnostic.metadata()?.len() > MAX_DIAGNOSTIC_BYTES {
             bail!(
@@ -1018,7 +1369,100 @@ fn safe_command() -> Command {
         .env("GIT_PAGER", "cat")
         .env("LC_ALL", "C");
     c.stdin(Stdio::null());
+    configure_process_group(&mut c);
+    bind_child_to_scratch(&mut c);
     c
+}
+
+struct ReapedChild {
+    child: Option<std::process::Child>,
+}
+
+impl ReapedChild {
+    fn new(child: std::process::Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    fn wait_cancelled(
+        mut self,
+        cancelled: &CancellationToken,
+        operation: &str,
+    ) -> Result<std::process::ExitStatus> {
+        loop {
+            check_cancelled(cancelled).with_context(|| operation.to_owned())?;
+            match self
+                .child
+                .as_mut()
+                .context("child already reaped")?
+                .try_wait()
+            {
+                Ok(Some(status)) => {
+                    self.child = None;
+                    return Ok(status);
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                Err(error) => return Err(error).with_context(|| format!("poll {operation}")),
+            }
+        }
+    }
+}
+
+impl Drop for ReapedChild {
+    fn drop(&mut self) {
+        if let Some(child) = &mut self.child {
+            kill_child_tree(child);
+            let _ = child.wait();
+        }
+    }
+}
+
+fn kill_child_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
+    let _ = child.kill();
+}
+
+fn configure_process_group(command: &mut Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+}
+
+fn run_output_bounded_cancelled(
+    mut command: Command,
+    cancelled: &CancellationToken,
+    maximum: u64,
+    operation: &str,
+) -> Result<Output> {
+    let mut stdout = tempfile::tempfile().context("create bounded command stdout")?;
+    let mut stderr = tempfile::tempfile().context("create bounded command stderr")?;
+    command
+        .stdout(Stdio::from(stdout.try_clone()?))
+        .stderr(Stdio::from(stderr.try_clone()?));
+    let child = command.spawn().with_context(|| operation.to_owned())?;
+    let status = ReapedChild::new(child).wait_cancelled(cancelled, operation)?;
+    let read_bounded = |file: &mut File| -> Result<Vec<u8>> {
+        if file.metadata()?.len() > maximum {
+            bail!("{operation} output exceeds limit")
+        }
+        file.rewind()?;
+        let mut bytes = Vec::new();
+        file.take(maximum.saturating_add(1))
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > maximum {
+            bail!("{operation} output exceeds limit")
+        }
+        Ok(bytes)
+    };
+    Ok(Output {
+        status,
+        stdout: read_bounded(&mut stdout)?,
+        stderr: read_bounded(&mut stderr)?,
+    })
 }
 fn text(output: &Output) -> Result<String> {
     if !output.status.success() {
@@ -1152,6 +1596,141 @@ fn check_cancelled(cancelled: &CancellationToken) -> Result<()> {
     Ok(())
 }
 
+fn bind_child_to_scratch(command: &mut Command) {
+    #[cfg(unix)]
+    SCRATCH_CHILD_FD.with(|slot| {
+        if let Some(fd) = slot.get() {
+            use std::os::unix::process::CommandExt;
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::fchdir(fd) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+    });
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn cstring(value: &std::ffi::OsStr) -> Result<CString> {
+    CString::new(value.as_bytes()).context("Git source path contains NUL")
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn openat_dir(parent: libc::c_int, name: &std::ffi::OsStr) -> Result<OwnedFd> {
+    let name = cstring(name)?;
+    let fd = unsafe {
+        libc::openat(
+            parent,
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error()).context("open Git source scratch child");
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn fd_stat(fd: libc::c_int) -> Result<libc::stat> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("stat Git source scratch handle");
+    }
+    Ok(unsafe { stat.assume_init() })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn entry_stat(parent: libc::c_int, name: &std::ffi::OsStr) -> Result<libc::stat> {
+    let name = cstring(name)?;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe {
+        libc::fstatat(
+            parent,
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error()).context("stat Git source scratch entry");
+    }
+    Ok(unsafe { stat.assume_init() })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn directory_entries(fd: libc::c_int) -> Result<Vec<std::ffi::OsString>> {
+    let duplicate = unsafe { libc::dup(fd) };
+    if duplicate < 0 {
+        return Err(std::io::Error::last_os_error()).context("duplicate scratch directory handle");
+    }
+    let directory = unsafe { libc::fdopendir(duplicate) };
+    if directory.is_null() {
+        unsafe { libc::close(duplicate) };
+        return Err(std::io::Error::last_os_error()).context("open scratch directory stream");
+    }
+    let mut entries = Vec::new();
+    loop {
+        clear_errno();
+        let entry = unsafe { libc::readdir(directory) };
+        if entry.is_null() {
+            let error = std::io::Error::last_os_error();
+            unsafe { libc::closedir(directory) };
+            if error.raw_os_error() != Some(0) {
+                return Err(error).context("read scratch directory stream");
+            }
+            break;
+        }
+        let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+        if !matches!(name, b"." | b"..") {
+            entries.push(std::ffi::OsString::from_vec(name.to_vec()));
+        }
+    }
+    Ok(entries)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn remove_dir_contents(fd: libc::c_int) -> Result<()> {
+    for name in directory_entries(fd)? {
+        let stat = match entry_stat(fd, &name) {
+            Ok(stat) => stat,
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let name_c = cstring(&name)?;
+        if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
+            let child = openat_dir(fd, &name)?;
+            remove_dir_contents(child.as_raw_fd())?;
+            if unsafe { libc::unlinkat(fd, name_c.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
+                return Err(std::io::Error::last_os_error())
+                    .context("remove Git source scratch directory");
+            }
+        } else if unsafe { libc::unlinkat(fd, name_c.as_ptr(), 0) } != 0 {
+            return Err(std::io::Error::last_os_error()).context("remove Git source scratch entry");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn clear_errno() {
+    unsafe { *libc::__errno_location() = 0 };
+}
+
+#[cfg(target_os = "macos")]
+fn clear_errno() {
+    unsafe { *libc::__error() = 0 };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1252,7 +1831,7 @@ mod tests {
     }
     fn fixture(format: GitObjectFormat) -> (tempfile::TempDir, String) {
         let tmp = tempfile::tempdir().unwrap();
-        init_bare(tmp.path(), format).unwrap();
+        init_bare(tmp.path(), format, &CancellationToken::new()).unwrap();
         let tree = git(tmp.path(), &["mktree"]);
         let mut command = safe_command();
         command.arg("-C").arg(tmp.path()).args([
@@ -1486,6 +2065,90 @@ mod tests {
                 .is_err()
         );
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_child_streams_cancel_reject_and_reap_every_exit() {
+        fn run(output: &str, sleep: bool, cancelled: bool, reject: bool) -> String {
+            let root = tempfile::tempdir().unwrap();
+            let pid_path = root.path().join("pid");
+            let tail = if sleep { "; sleep 30" } else { "" };
+            let script = format!(
+                "echo $$ > '{}'; printf '%s' '{}'{}",
+                pid_path.display(),
+                output,
+                tail
+            );
+            let mut command = Command::new("sh");
+            command
+                .args(["-c", &script])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            configure_process_group(&mut command);
+            let child = command.spawn().unwrap();
+            let token = CancellationToken::new();
+            let canceller = cancelled.then(|| {
+                let token = token.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(50));
+                    token.cancel();
+                })
+            });
+            let mut count = if reject { u64::MAX } else { 0 };
+            let error = crate::git::consume_child_lines_cancellable(child, &token, |line| {
+                if reject && line == "bad" {
+                    bail!("malformed child record")
+                }
+                if line == "io" {
+                    return Err(std::io::Error::other("injected child consumer IO failure").into());
+                }
+                count = count
+                    .checked_add(1)
+                    .context("child record count overflow")?;
+                Ok(())
+            })
+            .unwrap_err();
+            if let Some(canceller) = canceller {
+                canceller.join().unwrap();
+            }
+            let pid: i32 = std::fs::read_to_string(pid_path)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            assert_ne!(unsafe { libc::kill(pid, 0) }, 0, "child was not reaped");
+            format!("{error:#}")
+        }
+
+        assert!(run("partial", true, true, false).contains("cancelled"));
+        assert!(run("", true, true, false).contains("cancelled"));
+        assert!(run("bad\n", false, false, true).contains("malformed"));
+        assert!(run("io\n", false, false, false).contains("IO failure"));
+        assert!(run("ok\n", false, false, true).contains("overflow"));
+    }
+
+    #[test]
+    fn root_stream_cancellation_is_prompt_and_hash_never_returns() {
+        let root = tempfile::tempdir().unwrap();
+        let cas = Cas::new(root.path()).unwrap();
+        let bytes = vec![0x5a; 64 * 1024 * 1024];
+        let hash = cas.put(&bytes).unwrap();
+        let blob = CasBlob {
+            hash,
+            len: bytes.len() as u64,
+        };
+        let token = CancellationToken::new();
+        let worker_token = token.clone();
+        let worker_cas = cas.clone();
+        let worker = std::thread::spawn(move || {
+            CasGitSourceStore::new(&worker_cas).load_bytes(&blob, 128 * 1024 * 1024, &worker_token)
+        });
+        std::thread::sleep(Duration::from_millis(10));
+        let started = std::time::Instant::now();
+        token.cancel();
+        assert!(worker.join().unwrap().is_err());
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
     #[test]
     fn manifest_forgery_duplicate_and_swapped_children_are_rejected() {
         let (_, _, prepared) = roundtrip(GitObjectFormat::Sha1);
@@ -1513,6 +2176,95 @@ mod tests {
         let link = parent.path().join("link");
         symlink(real.path(), &link).unwrap();
         assert!(reject_symlink_dir(&link).is_err());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn bound_scratch_survives_double_swap_and_preserves_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let configured = root.path().join("scratch");
+        std::fs::create_dir(&configured).unwrap();
+        let attempt = BoundScratch::new(&configured, "swap").unwrap();
+        let name = attempt.name.clone();
+        let scope = attempt.enter().unwrap();
+        let moved = root.path().join("moved");
+        std::fs::rename(&configured, &moved).unwrap();
+        std::fs::create_dir(&configured).unwrap();
+        let replacement_attempt = configured.join(&name);
+        std::fs::create_dir(&replacement_attempt).unwrap();
+        std::fs::write(replacement_attempt.join("sentinel"), b"replacement").unwrap();
+        std::fs::create_dir(attempt.path().join("repo")).unwrap();
+        std::fs::write(attempt.path().join("repo/original"), b"bound").unwrap();
+        let moved_again = root.path().join("moved-again");
+        std::fs::rename(&moved, &moved_again).unwrap();
+        std::fs::create_dir(&moved).unwrap();
+        std::fs::write(attempt.path().join("repo/after-swap"), b"bound").unwrap();
+        assert!(moved_again.join(&name).join("repo/original").is_file());
+        assert!(moved_again.join(&name).join("repo/after-swap").is_file());
+        drop(scope);
+        drop(attempt);
+        assert!(!moved_again.join(&name).exists());
+        assert_eq!(
+            std::fs::read(replacement_attempt.join("sentinel")).unwrap(),
+            b"replacement"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn bound_scratch_is_concurrent_and_restores_after_panic() {
+        let root = tempfile::tempdir().unwrap();
+        let one_root = root.path().join("one");
+        let two_root = root.path().join("two");
+        std::fs::create_dir(&one_root).unwrap();
+        std::fs::create_dir(&two_root).unwrap();
+        let one = BoundScratch::new(&one_root, "one").unwrap();
+        let two = BoundScratch::new(&two_root, "two").unwrap();
+        let one_path = one_root.join(&one.name);
+        let two_path = two_root.join(&two.name);
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let spawn =
+            |attempt: BoundScratch, barrier: Arc<std::sync::Barrier>, bytes: &'static [u8]| {
+                std::thread::spawn(move || {
+                    let before = std::env::current_dir().unwrap();
+                    let scope = attempt.enter().unwrap();
+                    barrier.wait();
+                    std::fs::write(attempt.path().join("value"), bytes).unwrap();
+                    let mut child = Command::new("sh");
+                    child.args(["-c", "pwd > child-cwd"]);
+                    bind_child_to_scratch(&mut child);
+                    assert!(child.status().unwrap().success());
+                    barrier.wait();
+                    drop(scope);
+                    assert_eq!(std::env::current_dir().unwrap(), before);
+                    attempt
+                })
+            };
+        let one_thread = spawn(one, barrier.clone(), b"one");
+        let two_thread = spawn(two, barrier.clone(), b"two");
+        let global = std::env::current_dir().unwrap();
+        barrier.wait();
+        assert_eq!(std::env::current_dir().unwrap(), global);
+        barrier.wait();
+        let one = one_thread.join().unwrap();
+        let two = two_thread.join().unwrap();
+        assert_eq!(std::fs::read(one_path.join("value")).unwrap(), b"one");
+        assert_eq!(std::fs::read(two_path.join("value")).unwrap(), b"two");
+        drop(one);
+        drop(two);
+
+        let panic_root = root.path().join("panic");
+        std::fs::create_dir(&panic_root).unwrap();
+        let attempt = BoundScratch::new(&panic_root, "panic").unwrap();
+        let before = std::env::current_dir().unwrap();
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _scope = attempt.enter().unwrap();
+                panic!("scratch panic");
+            }))
+            .is_err()
+        );
+        assert_eq!(std::env::current_dir().unwrap(), before);
     }
 
     #[test]
@@ -1744,6 +2496,172 @@ mod tests {
         .unwrap();
         assert!(
             GitSourceMaterializer::new(&remote, scratch.path(), limits)
+                .materialize(&authority, &CancellationToken::new())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn cross_pack_thin_delta_is_rejected_while_canonical_pairs_pass() {
+        let (repo, base) = complex_fixture();
+        let mut changed = vec![0x5a; 1024 * 1024 + 17];
+        changed[500_000..500_128].fill(0x33);
+        std::fs::write(repo.path().join("large.bin"), changed).unwrap();
+        safe_git_ok(repo.path(), &["add", "large.bin"]).unwrap();
+        commit_worktree(repo.path(), "delta-target");
+        let target = git(repo.path(), &["rev-parse", "HEAD"]);
+        let local_dir = tempfile::tempdir().unwrap();
+        let local = Cas::new(local_dir.path()).unwrap();
+        let remote = MemoryStore::default();
+        let scratch = tempfile::tempdir().unwrap();
+
+        let canonical_fetch = TrustedProviderFetch::from_pinned_fetch(
+            repo.path().to_owned(),
+            "workspace".into(),
+            "repository".into(),
+            target.clone(),
+        )
+        .unwrap();
+        let canonical =
+            GitSourcePackager::new(&local, &remote, scratch.path(), GitSourceLimits::default())
+                .prepare(canonical_fetch, &CancellationToken::new())
+                .unwrap();
+        let canonical_authority = AuthenticatedGitSource::from_registry_record(
+            canonical.root.clone(),
+            "workspace".into(),
+            "repository".into(),
+            target.clone(),
+            GitObjectFormat::Sha1,
+        )
+        .unwrap();
+        let canonical_worker = tempfile::tempdir().unwrap();
+        GitSourceMaterializer::new(&remote, canonical_worker.path(), GitSourceLimits::default())
+            .materialize(&canonical_authority, &CancellationToken::new())
+            .unwrap();
+
+        let base_fetch = TrustedProviderFetch::from_pinned_fetch(
+            repo.path().to_owned(),
+            "workspace".into(),
+            "repository".into(),
+            base.clone(),
+        )
+        .unwrap();
+        let base_source =
+            GitSourcePackager::new(&local, &remote, scratch.path(), GitSourceLimits::default())
+                .prepare(base_fetch, &CancellationToken::new())
+                .unwrap();
+
+        let thin_dir = tempfile::tempdir().unwrap();
+        let thin_pack = thin_dir.path().join("thin.pack");
+        let thin_output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&thin_pack)
+            .unwrap();
+        let mut command = safe_command();
+        command
+            .arg("-C")
+            .arg(repo.path())
+            .args(["pack-objects", "--thin", "--stdout", "--revs"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::from(thin_output))
+            .stderr(Stdio::null());
+        let mut child = command.spawn().unwrap();
+        {
+            let mut stdin = child.stdin.take().unwrap();
+            writeln!(stdin, "{target}").unwrap();
+            writeln!(stdin, "^{base}").unwrap();
+        }
+        assert!(child.wait().unwrap().success());
+        let thin_index = thin_dir.path().join("thin.idx");
+        let mut index_command = safe_command();
+        index_command
+            .arg("-C")
+            .arg(repo.path())
+            .args([
+                "index-pack",
+                "--stdin",
+                "--fix-thin",
+                "-o",
+                thin_index.to_str().unwrap(),
+            ])
+            .stdin(Stdio::from(File::open(&thin_pack).unwrap()));
+        let output = run_output_bounded_cancelled(
+            index_command,
+            &CancellationToken::new(),
+            1024 * 1024,
+            "index thin fixture",
+        )
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "test Git cannot index the cross-pack thin fixture: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let thin_pack_bytes = std::fs::read(&thin_pack).unwrap();
+        let thin_index_bytes = std::fs::read(&thin_index).unwrap();
+        let thin_pair = GitPackPair {
+            pack: CasBlob {
+                hash: hex::encode(Sha256::digest(&thin_pack_bytes)),
+                len: thin_pack_bytes.len() as u64,
+            },
+            index: CasBlob {
+                hash: hex::encode(Sha256::digest(&thin_index_bytes)),
+                len: thin_index_bytes.len() as u64,
+            },
+        };
+        remote.put_bytes(&thin_pair.pack, &thin_pack_bytes).unwrap();
+        remote
+            .put_bytes(&thin_pair.index, &thin_index_bytes)
+            .unwrap();
+        let inventory_scratch = tempfile::tempdir().unwrap();
+        let inventory = enumerate_closure(
+            repo.path(),
+            &target,
+            GitObjectFormat::Sha1,
+            &GitSourceLimits::default(),
+            &CancellationToken::new(),
+            inventory_scratch.path(),
+        )
+        .unwrap();
+        let mut manifest = GitSourceManifest {
+            schema_version: GIT_SOURCE_SCHEMA,
+            source_format_version: GIT_SOURCE_FORMAT,
+            layout: GitSourceLayout::ColdComplete,
+            workspace: "workspace".into(),
+            repo: "repository".into(),
+            commit: target.clone(),
+            object_format: GitObjectFormat::Sha1,
+            packs: base_source.manifest.packs.clone(),
+            object_count: inventory.count,
+            object_set_digest: inventory.digest.clone(),
+            aggregate_pack_bytes: 0,
+            semantic_digest: String::new(),
+        };
+        manifest.packs.push(thin_pair);
+        manifest.aggregate_pack_bytes = manifest
+            .packs
+            .iter()
+            .map(|pair| pair.pack.len + pair.index.len)
+            .sum();
+        manifest.semantic_digest = manifest.compute_semantic_digest().unwrap();
+        let root_bytes = manifest.canonical_bytes().unwrap();
+        let root = CasBlob {
+            hash: hex::encode(Sha256::digest(&root_bytes)),
+            len: root_bytes.len() as u64,
+        };
+        remote.put_bytes(&root, &root_bytes).unwrap();
+        let authority = AuthenticatedGitSource::from_registry_record(
+            root,
+            "workspace".into(),
+            "repository".into(),
+            target,
+            GitObjectFormat::Sha1,
+        )
+        .unwrap();
+        let worker = tempfile::tempdir().unwrap();
+        assert!(
+            GitSourceMaterializer::new(&remote, worker.path(), GitSourceLimits::default())
                 .materialize(&authority, &CancellationToken::new())
                 .is_err()
         );

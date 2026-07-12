@@ -604,7 +604,7 @@ pub fn list_object_shas_bounded<P: AsRef<Path>>(
     Ok(objects)
 }
 
-fn consume_child_lines_cancellable(
+pub(crate) fn consume_child_lines_cancellable(
     mut child: std::process::Child,
     cancelled: &tokio_util::sync::CancellationToken,
     mut consume: impl FnMut(String) -> Result<()>,
