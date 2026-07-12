@@ -93,6 +93,19 @@ impl MysqlMeta {
         );
         Ok(())
     }
+
+    pub async fn artifact_scheduler(
+        &self,
+        limits: crate::artifact_scheduler::SchedulerLimits,
+        verifier: std::sync::Arc<dyn crate::artifact_scheduler::CompletionVerifier>,
+    ) -> Result<crate::artifact_scheduler_mysql::MysqlArtifactScheduler> {
+        crate::artifact_scheduler_mysql::MysqlArtifactScheduler::from_pool(
+            self.pool.clone(),
+            limits,
+            verifier,
+        )
+        .await
+    }
 }
 
 #[async_trait]
