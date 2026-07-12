@@ -18,11 +18,14 @@ use std::io::{BufRead, Read, Seek, Write};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::ffi::OsStrExt;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::os::unix::fs::DirBuilderExt;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
@@ -249,11 +252,7 @@ impl GitSourceLimits {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 struct BoundScratch {
-    root: OwnedFd,
     attempt: OwnedFd,
-    name: std::ffi::OsString,
-    dev: u64,
-    ino: u64,
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -276,7 +275,8 @@ impl BoundScratch {
         if fd < 0 {
             return Err(std::io::Error::last_os_error()).context("open Git source scratch handle");
         }
-        let root = unsafe { OwnedFd::from_raw_fd(fd) };
+        let opened_root = unsafe { OwnedFd::from_raw_fd(fd) };
+        let root = duplicate_cloexec(opened_root.as_raw_fd())?;
         let root_stat = fd_stat(root.as_raw_fd())?;
         if root_stat.st_dev as u64 != expected.dev() || root_stat.st_ino != expected.ino() {
             bail!("configured Git source scratch changed while binding")
@@ -291,110 +291,144 @@ impl BoundScratch {
                 .context("create bound Git source scratch attempt");
         }
         let attempt = openat_dir(root.as_raw_fd(), &name)?;
-        let stat = fd_stat(attempt.as_raw_fd())?;
-        Ok(Self {
-            root,
-            attempt,
-            name,
-            dev: stat.st_dev as u64,
-            ino: stat.st_ino,
-        })
+        Ok(Self { attempt })
     }
 
     fn path(&self) -> PathBuf {
         #[cfg(target_os = "linux")]
-        return PathBuf::from(format!("/proc/self/fd/{}", self.attempt.as_raw_fd()));
+        return capability_path(self.attempt.as_raw_fd());
         #[cfg(target_os = "macos")]
         return PathBuf::from(".");
     }
 
     fn enter(&self) -> Result<ScratchScope> {
-        let duplicate = unsafe { libc::dup(self.attempt.as_raw_fd()) };
-        if duplicate < 0 {
-            return Err(std::io::Error::last_os_error())
-                .context("duplicate Git source scratch descriptor");
-        }
-        let staging = unsafe { OwnedFd::from_raw_fd(duplicate) };
-        #[cfg(target_os = "linux")]
-        {
-            let previous = SCRATCH_CHILD_FD.with(|slot| slot.replace(Some(staging.as_raw_fd())));
-            Ok(ScratchScope { staging, previous })
-        }
-        #[cfg(target_os = "macos")]
-        {
-            let dot = CString::new(".").unwrap();
-            let old = unsafe {
-                libc::open(
-                    dot.as_ptr(),
-                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-                )
-            };
-            if old < 0 {
-                return Err(std::io::Error::last_os_error())
-                    .context("save Git source installer thread cwd");
-            }
-            let old = unsafe { OwnedFd::from_raw_fd(old) };
-            if unsafe { pthread_fchdir_np(staging.as_raw_fd()) } != 0 {
-                return Err(std::io::Error::last_os_error())
-                    .context("bind Git source installer thread cwd");
-            }
-            let previous = SCRATCH_CHILD_FD.with(|slot| slot.replace(Some(staging.as_raw_fd())));
-            Ok(ScratchScope {
-                old,
-                staging,
-                previous,
-            })
-        }
+        enter_scratch_fd(self.attempt.as_raw_fd())
     }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-impl Drop for BoundScratch {
-    fn drop(&mut self) {
-        let _ = remove_dir_contents(self.attempt.as_raw_fd());
-        if let Ok(stat) = entry_stat(self.root.as_raw_fd(), &self.name)
-            && stat.st_dev as u64 == self.dev
-            && stat.st_ino == self.ino
-            && let Ok(name) = cstring(&self.name)
-        {
-            unsafe {
-                libc::unlinkat(self.root.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR);
-            }
+fn enter_scratch_fd(fd: libc::c_int) -> Result<ScratchScope> {
+    let staging = duplicate_cloexec(fd)?;
+    #[cfg(target_os = "linux")]
+    {
+        let previous = SCRATCH_CHILD_FD.with(|slot| slot.replace(Some(staging.as_raw_fd())));
+        Ok(ScratchScope {
+            staging: Some(staging),
+            previous,
+            finished: false,
+        })
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let dot = CString::new(".").unwrap();
+        let old = unsafe {
+            libc::open(
+                dot.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if old < 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("save Git source installer thread cwd");
         }
+        let opened_old = unsafe { OwnedFd::from_raw_fd(old) };
+        let old = duplicate_cloexec(opened_old.as_raw_fd())?;
+        let result = unsafe { pthread_fchdir_np(staging.as_raw_fd()) };
+        if result != 0 {
+            return Err(std::io::Error::from_raw_os_error(result))
+                .context("bind Git source installer thread cwd");
+        }
+        let previous = SCRATCH_CHILD_FD.with(|slot| slot.replace(Some(staging.as_raw_fd())));
+        Ok(ScratchScope {
+            old: Some(old),
+            staging: Some(staging),
+            previous,
+            finished: false,
+        })
     }
 }
 
 #[cfg(target_os = "linux")]
 struct ScratchScope {
-    staging: OwnedFd,
+    staging: Option<OwnedFd>,
     previous: Option<libc::c_int>,
+    finished: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl ScratchScope {
+    fn finish(mut self) -> Result<()> {
+        self.finish_inner()
+    }
+
+    fn finish_inner(&mut self) -> Result<()> {
+        if self.finished {
+            return Ok(());
+        }
+        SCRATCH_CHILD_FD.with(|slot| slot.set(self.previous));
+        self.staging.take();
+        self.finished = true;
+        Ok(())
+    }
 }
 
 #[cfg(target_os = "linux")]
 impl Drop for ScratchScope {
     fn drop(&mut self) {
-        SCRATCH_CHILD_FD.with(|slot| slot.set(self.previous));
-        let _ = self.staging.as_raw_fd();
+        if self.finish_inner().is_err() {
+            std::process::abort();
+        }
     }
 }
 
 #[cfg(target_os = "macos")]
 struct ScratchScope {
-    old: OwnedFd,
-    staging: OwnedFd,
+    old: Option<OwnedFd>,
+    staging: Option<OwnedFd>,
     previous: Option<libc::c_int>,
+    finished: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl ScratchScope {
+    fn finish(mut self) -> Result<()> {
+        self.finish_inner()
+    }
+
+    fn finish_inner(&mut self) -> Result<()> {
+        if self.finished {
+            return Ok(());
+        }
+        #[cfg(test)]
+        if FAIL_PTHREAD_CWD_RESTORE.load(std::sync::atomic::Ordering::SeqCst) {
+            bail!("injected pthread cwd restoration failure")
+        }
+        let old = self.old.as_ref().context("missing saved pthread cwd")?;
+        let result = unsafe { pthread_fchdir_np(old.as_raw_fd()) };
+        if result != 0 {
+            return Err(std::io::Error::from_raw_os_error(result))
+                .context("restore Git source installer thread cwd");
+        }
+        SCRATCH_CHILD_FD.with(|slot| slot.set(self.previous));
+        self.staging.take();
+        self.old.take();
+        self.finished = true;
+        Ok(())
+    }
 }
 
 #[cfg(target_os = "macos")]
 impl Drop for ScratchScope {
     fn drop(&mut self) {
-        unsafe {
-            pthread_fchdir_np(self.old.as_raw_fd());
+        if self.finish_inner().is_err() {
+            std::process::abort();
         }
-        SCRATCH_CHILD_FD.with(|slot| slot.set(self.previous));
-        let _ = self.staging.as_raw_fd();
     }
 }
+
+#[cfg(all(test, target_os = "macos"))]
+static FAIL_PTHREAD_CWD_RESTORE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(target_os = "macos")]
 unsafe extern "C" {
@@ -419,6 +453,13 @@ impl BoundScratch {
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 struct ScratchScope;
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+impl ScratchScope {
+    fn finish(self) -> Result<()> {
+        bail!("handle-bound Git source scratch is unsupported on this platform")
+    }
+}
 
 /// Storage-neutral sink. Implementations must verify the declared SHA-256 and
 /// length before returning success.
@@ -446,30 +487,68 @@ pub trait GitSourceLoader: Send + Sync {
 
 #[derive(Clone)]
 pub struct CasGitSourceStore {
-    root: PathBuf,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    root: Arc<OwnedFd>,
 }
 impl CasGitSourceStore {
-    pub fn new(cas: &Cas) -> Self {
-        let root = if cas.root().is_absolute() {
-            cas.root().to_owned()
-        } else {
-            std::env::current_dir()
-                .unwrap_or_else(|_| PathBuf::from("."))
-                .join(cas.root())
-        };
-        Self {
-            root: root.canonicalize().unwrap_or(root),
+    pub fn new(cas: &Cas) -> Result<Self> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let canonical = cas
+                .root()
+                .canonicalize()
+                .context("canonicalize Git source CAS root")?;
+            let root =
+                open_bound_directory(&canonical).context("bind physical Git source CAS root")?;
+            Ok(Self {
+                root: Arc::new(root),
+            })
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = cas;
+            bail!("handle-bound Git source CAS is unsupported on this platform")
         }
     }
 
-    fn cas(&self) -> Result<Cas> {
-        Cas::new(&self.root)
+    fn with_cas<T>(&self, operation: impl FnOnce(&Cas) -> Result<T>) -> Result<T> {
+        #[cfg(target_os = "linux")]
+        {
+            let cas = Cas::new(capability_path(self.root.as_raw_fd()))?;
+            operation(&cas)
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let scope = enter_scratch_fd(self.root.as_raw_fd())?;
+            let result = Cas::new(".").and_then(|cas| operation(&cas));
+            scope
+                .finish()
+                .context("restore cwd after Git source CAS operation")?;
+            result
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        bail!("handle-bound Git source CAS is unsupported on this platform")
+    }
+
+    fn open_blob(&self, blob: &CasBlob) -> Result<File> {
+        self.with_cas(|cas| {
+            let path = cas.path(&blob.hash);
+            let metadata = std::fs::symlink_metadata(&path)
+                .context("stat handle-bound Git source CAS object")?;
+            if !metadata.file_type().is_file() || metadata.len() != blob.len {
+                bail!("Git source CAS object is not the declared regular file")
+            }
+            File::open(path).context("open handle-bound Git source CAS object")
+        })
     }
 }
 
 impl GitSourceUploader for CasGitSourceStore {
     fn put_file(&self, blob: &CasBlob, source: &Path) -> Result<()> {
-        let len = self.cas()?.put_file_with_hash(&blob.hash, source)?;
+        let source = File::open(source).context("open Git source upload capability")?;
+        let source = duplicate_cloexec(source.as_raw_fd())?;
+        let source_path = capability_file_path(source.as_raw_fd());
+        let len = self.with_cas(|cas| cas.put_file_with_hash(&blob.hash, &source_path))?;
         if len != blob.len {
             bail!("uploaded Git source child length mismatch")
         }
@@ -479,7 +558,7 @@ impl GitSourceUploader for CasGitSourceStore {
         if bytes.len() as u64 != blob.len {
             bail!("uploaded Git source root length mismatch")
         }
-        self.cas()?.put_with_hash(&blob.hash, bytes)
+        self.with_cas(|cas| cas.put_with_hash(&blob.hash, bytes))
     }
 }
 
@@ -492,7 +571,12 @@ impl GitSourceLoader for CasGitSourceStore {
     ) -> Result<()> {
         check_cancelled(cancelled)?;
         validate_blob(blob, u64::MAX)?;
-        copy_verified_create_new(&self.cas()?.path(&blob.hash), destination, blob, cancelled)
+        let input = self.open_blob(blob)?;
+        let output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(destination)?;
+        copy_verified_open(input, output, blob, cancelled)
     }
     fn load_bytes(
         &self,
@@ -502,16 +586,11 @@ impl GitSourceLoader for CasGitSourceStore {
     ) -> Result<Vec<u8>> {
         check_cancelled(cancelled)?;
         validate_blob(blob, maximum)?;
-        let path = self.cas()?.path(&blob.hash);
-        let metadata = std::fs::symlink_metadata(&path).context("stat Git source CAS root")?;
-        if !metadata.file_type().is_file() || metadata.len() != blob.len {
-            bail!("Git source CAS root is not the declared regular file")
-        }
+        let mut input = self.open_blob(blob)?;
         let capacity: usize = blob
             .len
             .try_into()
             .context("Git source root is too large")?;
-        let mut input = File::open(path).context("open Git source CAS root")?;
         let mut bytes = Vec::with_capacity(capacity);
         let mut hasher = Sha256::new();
         let mut buffer = [0u8; 1024 * 1024];
@@ -662,15 +741,15 @@ impl<'a, U: GitSourceUploader> GitSourcePackager<'a, U> {
         cancelled: &CancellationToken,
     ) -> Result<PreparedGitSource> {
         self.limits.validate()?;
-        let attempt = BoundScratch::new(self.scratch, "git-source-pack")?;
-        let _scope = attempt.enter()?;
-        let scratch = attempt.path();
         let local_cas = Cas::new(
             self.local_cas
                 .root()
                 .canonicalize()
-                .context("bind local Git source CAS")?,
+                .context("canonicalize local Git source CAS")?,
         )?;
+        let attempt = BoundScratch::new(self.scratch, "git-source-pack")?;
+        let scope = attempt.enter()?;
+        let scratch = attempt.path();
         check_cancelled(cancelled)?;
         let objects = enumerate_closure(
             &source.repo_path,
@@ -681,14 +760,12 @@ impl<'a, U: GitSourceUploader> GitSourcePackager<'a, U> {
             &scratch,
         )?;
         let object_set_digest = objects.digest.clone();
-        let pack_scratch = tempfile::Builder::new()
-            .prefix("git-source-pack.")
-            .tempdir_in(&scratch)?;
+        let pack_scratch = create_private_subdir(&scratch, "git-source-pack")?;
         let partitions = partition_inventory(
             &source.repo_path,
             &objects,
             &self.limits,
-            pack_scratch.path(),
+            &pack_scratch,
             cancelled,
         )?;
         let mut built = Vec::with_capacity(partitions.len());
@@ -697,7 +774,7 @@ impl<'a, U: GitSourceUploader> GitSourcePackager<'a, U> {
                 &source.repo_path,
                 partition,
                 &local_cas,
-                pack_scratch.path(),
+                &pack_scratch,
                 index,
                 cancelled,
             )?);
@@ -757,6 +834,7 @@ impl<'a, U: GitSourceUploader> GitSourcePackager<'a, U> {
         }
         check_cancelled(cancelled)?;
         self.uploader.put_bytes(&root, &root_bytes)?;
+        scope.finish()?;
         Ok(PreparedGitSource { root, manifest })
     }
 }
@@ -820,11 +898,9 @@ impl<'a, L: GitSourceLoader> GitSourceMaterializer<'a, L> {
             // Verify each pair in an otherwise empty object database. Loading
             // it into the union first would allow a thin/cross-pack delta to
             // resolve its base from a previously installed pair.
-            let pair_directory = tempfile::Builder::new()
-                .prefix("git-source-pair.")
-                .tempdir_in(&scratch)?;
-            init_bare(pair_directory.path(), manifest.object_format, cancelled)?;
-            let pair_pack_dir = pair_directory.path().join("objects/pack");
+            let pair_directory = create_private_subdir(&scratch, "git-source-pair")?;
+            init_bare(&pair_directory, manifest.object_format, cancelled)?;
+            let pair_pack_dir = pair_directory.join("objects/pack");
             let base = format!("pack-source-{i:08}");
             let pack = pair_pack_dir.join(format!("{base}.pack"));
             let index = pair_pack_dir.join(format!("{base}.idx"));
@@ -833,11 +909,8 @@ impl<'a, L: GitSourceLoader> GitSourceMaterializer<'a, L> {
             verify_file_at(&pack, &pair.pack, cancelled)?;
             verify_file_at(&index, &pair.index, cancelled)?;
             safe_git_ok_quiet_cancelled(
-                pair_directory.path(),
-                &[
-                    "verify-pack",
-                    index.to_str().context("non-UTF8 index path")?,
-                ],
+                &pair_directory,
+                &["verify-pack", &format!("objects/pack/{base}.idx")],
                 cancelled,
             )
             .context("Git source pack/index pair failed verification")?;
@@ -898,7 +971,7 @@ fn verify_local_manifest(
     limits: &GitSourceLimits,
     cancelled: &CancellationToken,
 ) -> Result<()> {
-    let store = CasGitSourceStore::new(cas);
+    let store = CasGitSourceStore::new(cas)?;
     let root_bytes = manifest.canonical_bytes()?;
     let prepared = PreparedGitSource {
         root: CasBlob {
@@ -942,10 +1015,15 @@ fn build_source_pack(
     check_cancelled(cancelled)?;
     let prefix = scratch.join(format!("source-{partition:08}"));
     let input = File::open(objects).context("open Git source pack partition")?;
+    let git_dir = text(&safe_git_cancelled(
+        repo,
+        &["rev-parse", "--absolute-git-dir"],
+        cancelled,
+    )?)?;
     let mut command = safe_command();
     command
-        .arg("-C")
-        .arg(repo)
+        .arg("--git-dir")
+        .arg(git_dir)
         .args(["-c", "core.hooksPath=/dev/null", "-c", "pack.threads=1"])
         .arg("pack-objects")
         .arg(&prefix)
@@ -984,7 +1062,6 @@ fn build_source_pack(
 }
 
 struct ObjectInventory {
-    _directory: tempfile::TempDir,
     path: PathBuf,
     count: u64,
     digest: String,
@@ -1148,11 +1225,9 @@ fn enumerate_inventory(
     scratch: &Path,
     role: &str,
 ) -> Result<ObjectInventory> {
-    let directory = tempfile::Builder::new()
-        .prefix("git-source-inventory.")
-        .tempdir_in(scratch)?;
-    let unsorted = directory.path().join("unsorted");
-    let sorted = directory.path().join("sorted");
+    let directory = create_private_subdir(scratch, "git-source-inventory")?;
+    let unsorted = directory.join("unsorted");
+    let sorted = directory.join("sorted");
     let mut output = std::io::BufWriter::new(
         OpenOptions::new()
             .write(true)
@@ -1205,7 +1280,6 @@ fn enumerate_inventory(
         h.update(oid.as_bytes());
     }
     Ok(ObjectInventory {
-        _directory: directory,
         path: sorted,
         count,
         digest: hex::encode(h.finalize()),
@@ -1213,13 +1287,18 @@ fn enumerate_inventory(
 }
 
 fn sort_unique_file(input: &Path, output: &Path, cancelled: &CancellationToken) -> Result<()> {
+    let parent = output
+        .parent()
+        .context("inventory sort output has no parent")?;
+    let sort_tmp = create_private_subdir(parent, "sort-tmp")?;
     let mut command = Command::new("sort");
     let path = std::env::var_os("PATH").unwrap_or_default();
     command
         .env_clear()
         .env("PATH", path)
         .env("LC_ALL", "C")
-        .args(["-u", "-o"])
+        .env("TMPDIR", &sort_tmp)
+        .args(["-S", "32M", "-u", "-o"])
         .arg(output)
         .arg(input)
         .stdin(Stdio::null())
@@ -1515,21 +1594,16 @@ fn verify_bytes(blob: &CasBlob, bytes: &[u8]) -> Result<()> {
     }
     Ok(())
 }
-fn copy_verified_create_new(
-    source: &Path,
-    destination: &Path,
+fn copy_verified_open(
+    mut input: File,
+    mut output: File,
     blob: &CasBlob,
     cancelled: &CancellationToken,
 ) -> Result<()> {
-    let metadata = std::fs::symlink_metadata(source).context("stat Git source CAS child")?;
-    if !metadata.file_type().is_file() {
+    let metadata = input.metadata().context("stat Git source CAS child")?;
+    if !metadata.file_type().is_file() || metadata.len() != blob.len {
         bail!("Git source CAS child is not a regular file")
     }
-    let mut input = File::open(source)?;
-    let mut output = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(destination)?;
     let mut h = Sha256::new();
     let mut len = 0u64;
     let mut buffer = [0u8; 1024 * 1024];
@@ -1614,6 +1688,22 @@ fn bind_child_to_scratch(command: &mut Command) {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+fn create_private_subdir(parent: &Path, prefix: &str) -> Result<PathBuf> {
+    for _ in 0..32 {
+        let name = format!(".{prefix}.{}", hex::encode(rand::random::<[u8; 16]>()));
+        let path = parent.join(name);
+        let mut builder = std::fs::DirBuilder::new();
+        builder.mode(0o700);
+        match builder.create(&path) {
+            Ok(()) => return Ok(path),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error).context("create private Git source subdirectory"),
+        }
+    }
+    bail!("exhausted private Git source subdirectory names")
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn cstring(value: &std::ffi::OsStr) -> Result<CString> {
     CString::new(value.as_bytes()).context("Git source path contains NUL")
 }
@@ -1631,7 +1721,50 @@ fn openat_dir(parent: libc::c_int, name: &std::ffi::OsStr) -> Result<OwnedFd> {
     if fd < 0 {
         return Err(std::io::Error::last_os_error()).context("open Git source scratch child");
     }
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    let opened = unsafe { OwnedFd::from_raw_fd(fd) };
+    duplicate_cloexec(opened.as_raw_fd())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn open_bound_directory(path: &Path) -> Result<OwnedFd> {
+    let path = CString::new(path.as_os_str().as_bytes())?;
+    let fd = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error()).context("open capability directory");
+    }
+    let opened = unsafe { OwnedFd::from_raw_fd(fd) };
+    duplicate_cloexec(opened.as_raw_fd())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn duplicate_cloexec(fd: libc::c_int) -> Result<OwnedFd> {
+    // Keep capabilities out of the descriptor range conventionally reused by
+    // stdio/runtime setup so exec-leak tests cannot be confused by reuse.
+    let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 64) };
+    if duplicate < 0 {
+        return Err(std::io::Error::last_os_error()).context("duplicate capability descriptor");
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(duplicate) })
+}
+
+#[cfg(target_os = "linux")]
+fn capability_path(fd: libc::c_int) -> PathBuf {
+    PathBuf::from(format!("/proc/self/fd/{fd}"))
+}
+
+#[cfg(target_os = "linux")]
+fn capability_file_path(fd: libc::c_int) -> PathBuf {
+    PathBuf::from(format!("/proc/self/fd/{fd}"))
+}
+
+#[cfg(target_os = "macos")]
+fn capability_file_path(fd: libc::c_int) -> PathBuf {
+    PathBuf::from(format!("/dev/fd/{fd}"))
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1641,94 +1774,6 @@ fn fd_stat(fd: libc::c_int) -> Result<libc::stat> {
         return Err(std::io::Error::last_os_error()).context("stat Git source scratch handle");
     }
     Ok(unsafe { stat.assume_init() })
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn entry_stat(parent: libc::c_int, name: &std::ffi::OsStr) -> Result<libc::stat> {
-    let name = cstring(name)?;
-    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-    if unsafe {
-        libc::fstatat(
-            parent,
-            name.as_ptr(),
-            stat.as_mut_ptr(),
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    } != 0
-    {
-        return Err(std::io::Error::last_os_error()).context("stat Git source scratch entry");
-    }
-    Ok(unsafe { stat.assume_init() })
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn directory_entries(fd: libc::c_int) -> Result<Vec<std::ffi::OsString>> {
-    let duplicate = unsafe { libc::dup(fd) };
-    if duplicate < 0 {
-        return Err(std::io::Error::last_os_error()).context("duplicate scratch directory handle");
-    }
-    let directory = unsafe { libc::fdopendir(duplicate) };
-    if directory.is_null() {
-        unsafe { libc::close(duplicate) };
-        return Err(std::io::Error::last_os_error()).context("open scratch directory stream");
-    }
-    let mut entries = Vec::new();
-    loop {
-        clear_errno();
-        let entry = unsafe { libc::readdir(directory) };
-        if entry.is_null() {
-            let error = std::io::Error::last_os_error();
-            unsafe { libc::closedir(directory) };
-            if error.raw_os_error() != Some(0) {
-                return Err(error).context("read scratch directory stream");
-            }
-            break;
-        }
-        let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
-        if !matches!(name, b"." | b"..") {
-            entries.push(std::ffi::OsString::from_vec(name.to_vec()));
-        }
-    }
-    Ok(entries)
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn remove_dir_contents(fd: libc::c_int) -> Result<()> {
-    for name in directory_entries(fd)? {
-        let stat = match entry_stat(fd, &name) {
-            Ok(stat) => stat,
-            Err(error)
-                if error
-                    .downcast_ref::<std::io::Error>()
-                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
-            {
-                continue;
-            }
-            Err(error) => return Err(error),
-        };
-        let name_c = cstring(&name)?;
-        if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
-            let child = openat_dir(fd, &name)?;
-            remove_dir_contents(child.as_raw_fd())?;
-            if unsafe { libc::unlinkat(fd, name_c.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
-                return Err(std::io::Error::last_os_error())
-                    .context("remove Git source scratch directory");
-            }
-        } else if unsafe { libc::unlinkat(fd, name_c.as_ptr(), 0) } != 0 {
-            return Err(std::io::Error::last_os_error()).context("remove Git source scratch entry");
-        }
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn clear_errno() {
-    unsafe { *libc::__errno_location() = 0 };
-}
-
-#[cfg(target_os = "macos")]
-fn clear_errno() {
-    unsafe { *libc::__error() = 0 };
 }
 
 #[cfg(test)]
@@ -1961,7 +2006,7 @@ mod tests {
         let cas_dir = tempfile::tempdir().unwrap();
         let cas = Cas::new(cas_dir.path()).unwrap();
         let scratch = tempfile::tempdir().unwrap();
-        let store = CasGitSourceStore::new(&cas);
+        let store = CasGitSourceStore::new(&cas).unwrap();
         let fetch = TrustedProviderFetch::from_pinned_fetch(
             repo.path().to_owned(),
             "ws".into(),
@@ -2032,7 +2077,7 @@ mod tests {
         let (repo, commit) = fixture(GitObjectFormat::Sha1);
         let cas_dir = tempfile::tempdir().unwrap();
         let cas = Cas::new(cas_dir.path()).unwrap();
-        let store = CasGitSourceStore::new(&cas);
+        let store = CasGitSourceStore::new(&cas).unwrap();
         let scratch = tempfile::tempdir().unwrap();
         let fetch = TrustedProviderFetch::from_pinned_fetch(
             repo.path().to_owned(),
@@ -2141,13 +2186,75 @@ mod tests {
         let worker_token = token.clone();
         let worker_cas = cas.clone();
         let worker = std::thread::spawn(move || {
-            CasGitSourceStore::new(&worker_cas).load_bytes(&blob, 128 * 1024 * 1024, &worker_token)
+            CasGitSourceStore::new(&worker_cas).unwrap().load_bytes(
+                &blob,
+                128 * 1024 * 1024,
+                &worker_token,
+            )
         });
         std::thread::sleep(Duration::from_millis(10));
         let started = std::time::Instant::now();
         token.cancel();
         assert!(worker.join().unwrap().is_err());
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn cas_store_remains_bound_across_root_replacement_and_clone_lifetime() {
+        let parent = tempfile::tempdir().unwrap();
+        let configured = parent.path().join("cas");
+        std::fs::create_dir(&configured).unwrap();
+        let cas = Cas::new(&configured).unwrap();
+        let store = CasGitSourceStore::new(&cas).unwrap();
+        let first_bytes = b"first physical CAS object";
+        let first = CasBlob {
+            hash: hex::encode(Sha256::digest(first_bytes)),
+            len: first_bytes.len() as u64,
+        };
+        store.put_bytes(&first, first_bytes).unwrap();
+
+        let physical = parent.path().join("physical");
+        std::fs::rename(&configured, &physical).unwrap();
+        std::fs::create_dir(&configured).unwrap();
+        std::fs::write(configured.join("replacement-sentinel"), b"replacement").unwrap();
+
+        let second_bytes = b"second physical CAS object after rename";
+        let second = CasBlob {
+            hash: hex::encode(Sha256::digest(second_bytes)),
+            len: second_bytes.len() as u64,
+        };
+        let clone = store.clone();
+        drop(store);
+        clone.put_bytes(&second, second_bytes).unwrap();
+        let token = CancellationToken::new();
+        assert_eq!(clone.load_bytes(&first, 1024, &token).unwrap(), first_bytes);
+        let worker_blob = second.clone();
+        let worker = std::thread::spawn(move || {
+            clone.load_bytes(&worker_blob, 1024, &CancellationToken::new())
+        });
+        assert_eq!(worker.join().unwrap().unwrap(), second_bytes);
+        assert_eq!(
+            std::fs::read(configured.join("replacement-sentinel")).unwrap(),
+            b"replacement"
+        );
+        assert_eq!(std::fs::read_dir(&configured).unwrap().count(), 1);
+        assert!(
+            physical
+                .join(&second.hash[..2])
+                .join(&second.hash)
+                .is_file()
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn cas_store_canonicalization_failure_is_fatal() {
+        let parent = tempfile::tempdir().unwrap();
+        let configured = parent.path().join("cas");
+        let cas = Cas::new(&configured).unwrap();
+        std::fs::remove_dir(&configured).unwrap();
+        assert!(CasGitSourceStore::new(&cas).is_err());
     }
     #[test]
     fn manifest_forgery_duplicate_and_swapped_children_are_rejected() {
@@ -2185,7 +2292,12 @@ mod tests {
         let configured = root.path().join("scratch");
         std::fs::create_dir(&configured).unwrap();
         let attempt = BoundScratch::new(&configured, "swap").unwrap();
-        let name = attempt.name.clone();
+        let name = std::fs::read_dir(&configured)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .file_name();
         let scope = attempt.enter().unwrap();
         let moved = root.path().join("moved");
         std::fs::rename(&configured, &moved).unwrap();
@@ -2199,15 +2311,85 @@ mod tests {
         std::fs::rename(&moved, &moved_again).unwrap();
         std::fs::create_dir(&moved).unwrap();
         std::fs::write(attempt.path().join("repo/after-swap"), b"bound").unwrap();
-        assert!(moved_again.join(&name).join("repo/original").is_file());
-        assert!(moved_again.join(&name).join("repo/after-swap").is_file());
-        drop(scope);
+        let relocated = moved_again.join("relocated-attempt");
+        std::fs::rename(moved_again.join(&name), &relocated).unwrap();
+        std::fs::create_dir(moved_again.join(&name)).unwrap();
+        std::fs::write(moved_again.join(&name).join("final-window"), b"replacement").unwrap();
+        std::fs::write(attempt.path().join("repo/after-final-swap"), b"bound").unwrap();
+        assert!(relocated.join("repo/original").is_file());
+        assert!(relocated.join("repo/after-swap").is_file());
+        assert!(relocated.join("repo/after-final-swap").is_file());
+        scope.finish().unwrap();
         drop(attempt);
-        assert!(!moved_again.join(&name).exists());
+        assert_eq!(
+            std::fs::read(moved_again.join(&name).join("final-window")).unwrap(),
+            b"replacement"
+        );
+        assert!(relocated.join("repo/original").is_file());
         assert_eq!(
             std::fs::read(replacement_attempt.join("sentinel")).unwrap(),
             b"replacement"
         );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn scratch_capabilities_are_closed_by_exec() {
+        let root = tempfile::tempdir().unwrap();
+        let configured = root.path().join("scratch");
+        std::fs::create_dir(&configured).unwrap();
+        let cas_root = root.path().join("cas");
+        let cas = Cas::new(&cas_root).unwrap();
+        let store = CasGitSourceStore::new(&cas).unwrap();
+        let attempt = BoundScratch::new(&configured, "exec").unwrap();
+        let scope = attempt.enter().unwrap();
+        let attempt_fd = attempt.attempt.as_raw_fd().to_string();
+        let staging_fd = scope.staging.as_ref().unwrap().as_raw_fd().to_string();
+        #[cfg(target_os = "macos")]
+        let old_fd = scope.old.as_ref().unwrap().as_raw_fd().to_string();
+        #[cfg(target_os = "linux")]
+        let old_fd = "999999".to_owned();
+        let cas_fd = store.root.as_raw_fd().to_string();
+        let mut child = Command::new("sh");
+        child
+            .args([
+                "-c",
+                "test ! -e /dev/fd/$ATTEMPT_FD && test ! -e /dev/fd/$STAGING_FD && test ! -e /dev/fd/$OLD_FD && test ! -e /dev/fd/$CAS_FD",
+            ])
+            .env("ATTEMPT_FD", attempt_fd)
+            .env("STAGING_FD", staging_fd)
+            .env("OLD_FD", old_fd)
+            .env("CAS_FD", cas_fd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        bind_child_to_scratch(&mut child);
+        assert!(child.status().unwrap().success());
+        scope.finish().unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pthread_cwd_restore_failure_aborts_subprocess() {
+        const INJECT: &str = "RIPCLONE_TEST_FAIL_PTHREAD_CWD_RESTORE";
+        if std::env::var_os(INJECT).is_some() {
+            let root = tempfile::tempdir().unwrap();
+            let attempt = BoundScratch::new(root.path(), "restore-failure").unwrap();
+            let scope = attempt.enter().unwrap();
+            FAIL_PTHREAD_CWD_RESTORE.store(true, std::sync::atomic::Ordering::SeqCst);
+            drop(scope);
+            unreachable!("restore failure must abort")
+        }
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "git_source::tests::pthread_cwd_restore_failure_aborts_subprocess",
+                "--nocapture",
+            ])
+            .env(INJECT, "1")
+            .status()
+            .unwrap();
+        assert!(!status.success());
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -2220,8 +2402,18 @@ mod tests {
         std::fs::create_dir(&two_root).unwrap();
         let one = BoundScratch::new(&one_root, "one").unwrap();
         let two = BoundScratch::new(&two_root, "two").unwrap();
-        let one_path = one_root.join(&one.name);
-        let two_path = two_root.join(&two.name);
+        let one_path = std::fs::read_dir(&one_root)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let two_path = std::fs::read_dir(&two_root)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
         let barrier = Arc::new(std::sync::Barrier::new(3));
         let spawn =
             |attempt: BoundScratch, barrier: Arc<std::sync::Barrier>, bytes: &'static [u8]| {
@@ -2265,6 +2457,48 @@ mod tests {
             .is_err()
         );
         assert_eq!(std::env::current_dir().unwrap(), before);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn cancelled_large_sort_keeps_all_temporary_state_inside_abandoned_attempt() {
+        let root = tempfile::tempdir().unwrap();
+        let configured = root.path().join("scratch");
+        std::fs::create_dir(&configured).unwrap();
+        std::fs::write(root.path().join("outside-sentinel"), b"outside").unwrap();
+        let attempt = BoundScratch::new(&configured, "sort-cancel").unwrap();
+        let scope = attempt.enter().unwrap();
+        let inventory = create_private_subdir(&attempt.path(), "large-sort").unwrap();
+        let input = inventory.join("input");
+        let output = inventory.join("output");
+        let mut writer = std::io::BufWriter::new(File::create(&input).unwrap());
+        for value in (0u64..500_000).rev() {
+            writeln!(writer, "{:040x}", value).unwrap();
+        }
+        writer.flush().unwrap();
+        let token = CancellationToken::new();
+        let cancel = token.clone();
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(2));
+            cancel.cancel();
+        });
+        assert!(sort_unique_file(&input, &output, &token).is_err());
+        canceller.join().unwrap();
+        assert_eq!(
+            std::fs::read(root.path().join("outside-sentinel")).unwrap(),
+            b"outside"
+        );
+        assert_eq!(std::fs::read_dir(&configured).unwrap().count(), 1);
+        assert!(std::fs::read_dir(&inventory).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".sort-tmp.")
+        }));
+        scope.finish().unwrap();
+        drop(attempt);
+        assert_eq!(std::fs::read_dir(&configured).unwrap().count(), 1);
     }
 
     #[test]
