@@ -353,6 +353,25 @@ pub fn materialize_verified_pinned_capability(
     capability: VerifiedPinnedLocalCapability,
     destination: &Path,
 ) -> Result<VerifiedPinnedBundle> {
+    materialize_verified_pinned_capability_cancelled(
+        cas,
+        request,
+        capability,
+        destination,
+        &tokio_util::sync::CancellationToken::new(),
+    )
+}
+
+pub fn materialize_verified_pinned_capability_cancelled(
+    cas: &Cas,
+    request: &PinnedBundleRequest,
+    capability: VerifiedPinnedLocalCapability,
+    destination: &Path,
+    cancelled: &tokio_util::sync::CancellationToken,
+) -> Result<VerifiedPinnedBundle> {
+    if cancelled.is_cancelled() {
+        bail!("pinned bundle materialization cancelled");
+    }
     if capability.request != *request
         || cas
             .root()
@@ -362,7 +381,12 @@ pub fn materialize_verified_pinned_capability(
     {
         bail!("verified pinned capability request/CAS binding mismatch");
     }
-    materialize_pinned_bundle_artifacts(cas, &capability.manifest, destination)?;
+    materialize_pinned_bundle_artifacts_cancelled(
+        cas,
+        &capability.manifest,
+        destination,
+        cancelled,
+    )?;
     Ok(capability.verified)
 }
 
@@ -649,6 +673,40 @@ fn materialize_pinned_bundle_artifacts(
         destination.join(".git/index"),
         cas.get(&manifest.prebuilt_index.hash)?,
     )?;
+    Ok(())
+}
+
+fn materialize_pinned_bundle_artifacts_cancelled(
+    cas: &Cas,
+    manifest: &PinnedBundleManifest,
+    destination: &Path,
+    cancelled: &tokio_util::sync::CancellationToken,
+) -> Result<()> {
+    crate::git::init_cancelled(destination, cancelled)?;
+    let packs = manifest
+        .base_packs
+        .iter()
+        .chain(&manifest.overlay_packs)
+        .map(|pack| {
+            Ok((
+                Bytes::from(cas.get_cancelled(&pack.pack.hash, cancelled)?),
+                Bytes::from(cas.get_cancelled(&pack.index.hash, cancelled)?),
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    crate::clonepack::install_manifest_pack_bytes_cancelled(
+        &destination.join(".git/objects/pack"),
+        packs,
+        cancelled,
+    )?;
+    let index = cas.get_cancelled(&manifest.prebuilt_index.hash, cancelled)?;
+    if cancelled.is_cancelled() {
+        bail!("pinned bundle materialization cancelled");
+    }
+    std::fs::write(destination.join(".git/index"), index)?;
+    if cancelled.is_cancelled() {
+        bail!("pinned bundle materialization cancelled");
+    }
     Ok(())
 }
 
@@ -1039,6 +1097,55 @@ mod tests {
         let one = f.generate(&base, &target, TopUpMode::Full).unwrap();
         let two = f.generate(&base, &target, TopUpMode::Full).unwrap();
         assert_eq!(one, two);
+    }
+
+    #[test]
+    fn pinned_materialization_cancels_mid_cas_stream_without_publication() {
+        let f = Fixture::new();
+        let mut bytes = vec![0u8; 64 * 1024 * 1024];
+        let mut state = 0x9e37_79b9_u32;
+        for chunk in bytes.chunks_mut(4) {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            chunk.copy_from_slice(&state.to_le_bytes()[..chunk.len()]);
+        }
+        std::fs::write(f.repo.join("large.bin"), bytes).unwrap();
+        git(&f.repo, &["add", "large.bin"]);
+        git(&f.repo, &["commit", "-m", "large"]);
+        let target = git_out(&f.repo, &["rev-parse", "HEAD"]);
+        let base = f.base(&target, TopUpMode::Full);
+        let request = f.generate(&base, &target, TopUpMode::Full).unwrap();
+        let capability = verify_pinned_bundle_capability(&f.cas, &request).unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let destination = parent.path().join("destination");
+        let publication = crate::topup::BoundInstall::new(&destination, "pinned-cancel").unwrap();
+        let token = tokio_util::sync::CancellationToken::new();
+        let worker_token = token.clone();
+        let cas = f.cas.clone();
+        let worker_request = request.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let scope = publication.enter_staging().unwrap();
+            let staging = publication.staging_root().join("repo");
+            let _ = started_tx.send(());
+            let result = materialize_verified_pinned_capability_cancelled(
+                &cas,
+                &worker_request,
+                capability,
+                &staging,
+                &worker_token,
+            );
+            drop(scope);
+            (result, publication)
+        });
+        started_rx.recv().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        token.cancel();
+        let (result, publication) = worker.join().unwrap();
+        assert!(format!("{:#}", result.unwrap_err()).contains("cancel"));
+        drop(publication);
+        assert!(!destination.exists());
     }
 
     #[test]

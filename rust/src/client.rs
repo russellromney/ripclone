@@ -148,11 +148,12 @@ impl crate::topup::PinnedBundleInstaller for ClientPinnedInstaller<'_> {
         if self.cancelled.is_cancelled() {
             return Err(crate::topup::BundleInstallFailure::Unavailable);
         }
-        let verified = crate::pinned_bundle::materialize_verified_pinned_capability(
+        let verified = crate::pinned_bundle::materialize_verified_pinned_capability_cancelled(
             self.cas,
             request,
             capability,
             destination,
+            &self.cancelled,
         )
         .map_err(|_| crate::topup::BundleInstallFailure::Integrity)?;
         if self.cancelled.is_cancelled() {
@@ -806,30 +807,45 @@ impl Client {
         &self,
         request: &crate::topup::PinnedBundleRequest,
         hash: &str,
+        cancelled: &tokio_util::sync::CancellationToken,
     ) -> Result<reqwest::Response> {
-        self.refresh_bearer_session().await?;
+        tokio::select! {
+            _ = cancelled.cancelled() => anyhow::bail!("typed clone cancelled"),
+            refreshed = self.refresh_bearer_session() => refreshed?,
+        }
         let url = self.typed_artifact_url(request, hash);
-        let response = self
+        let send = self
             .typed_download_client()
             .get(&url)
             .header("x-ripclone-transport-session", &request.transport_session)
-            .send()
-            .await
-            .with_context(|| format!("fetch repo-bound typed artifact {hash}"))?;
+            .send();
+        let response = tokio::select! {
+            _ = cancelled.cancelled() => anyhow::bail!("typed clone cancelled"),
+            response = send => response.with_context(|| format!("fetch repo-bound typed artifact {hash}"))?,
+        };
         if response.status().is_redirection() {
             let location = response
                 .headers()
                 .get(reqwest::header::LOCATION)
                 .and_then(|value| value.to_str().ok())
                 .context("typed artifact redirect has no valid location")?;
-            return self
-                .raw_http
-                .get(location)
-                .send()
-                .await
-                .context("follow typed artifact signed URL without credentials");
+            let follow = self.raw_http.get(location).send();
+            return tokio::select! {
+                _ = cancelled.cancelled() => anyhow::bail!("typed clone cancelled"),
+                response = follow => response.context("follow typed artifact signed URL without credentials"),
+            };
         }
         Ok(response)
+    }
+
+    async fn typed_retry_sleep(
+        cancelled: &tokio_util::sync::CancellationToken,
+        duration: std::time::Duration,
+    ) -> Result<()> {
+        tokio::select! {
+            _ = cancelled.cancelled() => anyhow::bail!("typed clone cancelled"),
+            _ = tokio::time::sleep(duration) => Ok(()),
+        }
     }
 
     /// Refresh while the current Bearer is still valid. The server preserves
@@ -1192,6 +1208,7 @@ impl Client {
                         .await?;
                     let target = target.as_ref();
                     let publication = crate::topup::BoundInstall::new(target, "files")?;
+                    let _staging_scope = publication.enter_staging()?;
                     let staging = publication.staging_root().join("repo");
                     crate::artifact_manifest::CasCompletionVerifier::new(cas)
                         .materialize_transport_files_cancelled(capability, &staging, cancelled)?;
@@ -1607,10 +1624,11 @@ impl Client {
                 anyhow::bail!("typed clone cancelled")
             }
             attempt += 1;
-            let response = match self.typed_artifact_response(request, hash).await {
+            let response = match self.typed_artifact_response(request, hash, cancelled).await {
                 Ok(response) => response,
                 Err(_error) if attempt < max_attempts => {
-                    tokio::time::sleep(fetch_backoff(base_backoff_ms, attempt)).await;
+                    Self::typed_retry_sleep(cancelled, fetch_backoff(base_backoff_ms, attempt))
+                        .await?;
                     continue;
                 }
                 Err(error) => return Err(error),
@@ -1630,7 +1648,8 @@ impl Client {
             match fetched {
                 Ok(result) => return Ok(result),
                 Err((retryable, _error)) if retryable && attempt < max_attempts => {
-                    tokio::time::sleep(fetch_backoff(base_backoff_ms, attempt)).await;
+                    Self::typed_retry_sleep(cancelled, fetch_backoff(base_backoff_ms, attempt))
+                        .await?;
                 }
                 Err((_, error)) => return Err(error),
             }
@@ -1666,10 +1685,11 @@ impl Client {
             if cancelled.is_cancelled() {
                 anyhow::bail!("typed clone cancelled")
             }
-            let response = match self.typed_artifact_response(request, hash).await {
+            let response = match self.typed_artifact_response(request, hash, cancelled).await {
                 Ok(response) => response,
                 Err(_error) if attempt < max_attempts => {
-                    tokio::time::sleep(fetch_backoff(base_backoff_ms, attempt)).await;
+                    Self::typed_retry_sleep(cancelled, fetch_backoff(base_backoff_ms, attempt))
+                        .await?;
                     continue;
                 }
                 Err(error) => return Err(error),
@@ -1677,9 +1697,13 @@ impl Client {
             if !response.status().is_success() {
                 let retryable = response.status().is_server_error()
                     || response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS;
-                let error = server_error("fetch typed manifest", response).await;
+                let error = anyhow::anyhow!(
+                    "fetch typed manifest failed with HTTP {}",
+                    response.status()
+                );
                 if retryable && attempt < max_attempts {
-                    tokio::time::sleep(fetch_backoff(base_backoff_ms, attempt)).await;
+                    Self::typed_retry_sleep(cancelled, fetch_backoff(base_backoff_ms, attempt))
+                        .await?;
                     continue;
                 }
                 return Err(error);
@@ -1713,7 +1737,8 @@ impl Client {
                     let _ = stop.send(());
                 }
                 if attempt < max_attempts {
-                    tokio::time::sleep(fetch_backoff(base_backoff_ms, attempt)).await;
+                    Self::typed_retry_sleep(cancelled, fetch_backoff(base_backoff_ms, attempt))
+                        .await?;
                     continue;
                 }
                 return Err(error).context("read typed manifest body");
@@ -1724,7 +1749,8 @@ impl Client {
             }
             if actual != hash {
                 if attempt < max_attempts {
-                    tokio::time::sleep(fetch_backoff(base_backoff_ms, attempt)).await;
+                    Self::typed_retry_sleep(cancelled, fetch_backoff(base_backoff_ms, attempt))
+                        .await?;
                     continue;
                 }
                 anyhow::bail!("typed manifest hash mismatch: expected {hash}, got {actual}");
@@ -4045,6 +4071,66 @@ fn local_rev_parse(main_repo: &Path, branch: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn typed_test_request(hash: String) -> crate::topup::PinnedBundleRequest {
+        crate::topup::PinnedBundleRequest {
+            manifest_hash: hash,
+            transport_session: "a".repeat(64),
+            format_version: 1,
+            workspace_id: "github".into(),
+            repo_path: "acme/widget".into(),
+            base_commit: "1".repeat(40),
+            target_commit: "2".repeat(40),
+            branch: "main".into(),
+            mode: crate::topup::TopUpMode::Head,
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_transport_cancels_while_response_headers_stall() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let _socket = socket;
+            futures::future::pending::<()>().await;
+        });
+        let client = Client::new(format!("http://{address}"));
+        let request = typed_test_request("1".repeat(64));
+        let token = tokio_util::sync::CancellationToken::new();
+        let cancel = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            cancel.cancel();
+        });
+        let started = std::time::Instant::now();
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.typed_artifact_response(&request, &"2".repeat(64), &token),
+        )
+        .await
+        .expect("stalled headers must cancel promptly")
+        .unwrap_err();
+        assert!(error.to_string().contains("cancelled"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn typed_transport_cancels_during_retry_backoff() {
+        let token = tokio_util::sync::CancellationToken::new();
+        let cancel = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            cancel.cancel();
+        });
+        let started = std::time::Instant::now();
+        let error = Client::typed_retry_sleep(&token, std::time::Duration::from_secs(30))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("cancelled"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
 
     #[tokio::test]
     async fn typed_transport_preserves_bearer_and_upstream_auth() {

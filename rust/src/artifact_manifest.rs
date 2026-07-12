@@ -4596,19 +4596,25 @@ mod tests {
         let parent = tempfile::tempdir().unwrap();
         let target = parent.path().join("target");
         let publication = crate::topup::BoundInstall::new(&target, "cancel-files").unwrap();
-        let staging = publication.staging_root().join("repo");
         let token = tokio_util::sync::CancellationToken::new();
         let worker_token = token.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
-            verifier.materialize_transport_files_cancelled(capability, &staging, &worker_token)
+            let scope = publication.enter_staging().unwrap();
+            let staging = publication.staging_root().join("repo");
+            let _ = started_tx.send(());
+            let result =
+                verifier.materialize_transport_files_cancelled(capability, &staging, &worker_token);
+            drop(scope);
+            (result, publication)
         });
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while !publication.staging_root().join("repo").exists() {
-            assert!(std::time::Instant::now() < deadline);
-            std::thread::yield_now();
-        }
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
         token.cancel();
-        assert!(worker.join().unwrap().is_err());
+        let (result, publication) = worker.join().unwrap();
+        assert!(result.is_err());
         drop(publication);
         assert!(!target.exists());
     }

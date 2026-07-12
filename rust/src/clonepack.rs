@@ -137,6 +137,38 @@ where
     Ok(total)
 }
 
+pub(crate) fn install_manifest_pack_bytes_cancelled<I>(
+    pack_dir: &Path,
+    packs: I,
+    cancelled: &tokio_util::sync::CancellationToken,
+) -> Result<u64>
+where
+    I: IntoIterator<Item = (Bytes, Bytes)>,
+{
+    std::fs::create_dir_all(pack_dir)
+        .with_context(|| format!("create pack dir {}", pack_dir.display()))?;
+    let mut total = 0u64;
+    for (pack_bytes, idx_bytes) in packs {
+        if pack_bytes.len() < 20 {
+            anyhow::bail!("pack too short ({} bytes)", pack_bytes.len());
+        }
+        let name = hex::encode(&pack_bytes[pack_bytes.len() - 20..]);
+        for (suffix, bytes) in [("pack", &pack_bytes), ("idx", &idx_bytes)] {
+            let mut output = std::fs::File::create(pack_dir.join(format!("pack-{name}.{suffix}")))?;
+            for chunk in bytes.chunks(1024 * 1024) {
+                if cancelled.is_cancelled() {
+                    anyhow::bail!("pack installation cancelled");
+                }
+                std::io::Write::write_all(&mut output, chunk)?;
+            }
+        }
+        total = total
+            .checked_add((pack_bytes.len() + idx_bytes.len()) as u64)
+            .context("pack installation byte count overflow")?;
+    }
+    Ok(total)
+}
+
 /// Collect the distinct clonepack manifest hashes referenced by a `RefInfo`.
 /// Shared by `/status` and GC reachability so both agree on what is reachable.
 pub fn collect_manifest_hashes(info: &crate::RefInfo) -> Vec<String> {

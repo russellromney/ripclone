@@ -292,6 +292,47 @@ impl Cas {
         Ok(data)
     }
 
+    pub(crate) fn get_cancelled(
+        &self,
+        hash: &str,
+        cancelled: &tokio_util::sync::CancellationToken,
+    ) -> Result<Vec<u8>> {
+        let path = self.object_path(hash)?;
+        let mut input =
+            std::fs::File::open(&path).with_context(|| format!("open CAS object {}", hash))?;
+        let expected = input.metadata()?.len();
+        let capacity: usize = expected.try_into().context("CAS object is too large")?;
+        let read_start = Instant::now();
+        let mut data = Vec::with_capacity(capacity);
+        let mut hasher = ObjectHasher::for_object_id(hash)?;
+        let mut chunk = vec![0u8; 1024 * 1024];
+        loop {
+            if cancelled.is_cancelled() {
+                anyhow::bail!("CAS object read cancelled");
+            }
+            let read = input
+                .read(&mut chunk)
+                .with_context(|| format!("read CAS object {}", hash))?;
+            if read == 0 {
+                break;
+            }
+            #[cfg(test)]
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            hasher.update(&chunk[..read]);
+            data.extend_from_slice(&chunk[..read]);
+        }
+        crate::perf::record_cas_read(read_start.elapsed(), data.len() as u64);
+        let actual = hasher.finalize_hex();
+        if actual != hash {
+            anyhow::bail!(
+                "CAS object {} is corrupt: hash mismatch (actual {})",
+                hash,
+                actual
+            );
+        }
+        Ok(data)
+    }
+
     /// Read a byte range from a CAS object without loading the whole file.
     pub fn get_range(&self, hash: &str, start: u64, len: u64) -> Result<Vec<u8>> {
         use std::io::{Seek, SeekFrom};

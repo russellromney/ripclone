@@ -24,12 +24,17 @@ use std::io::{BufRead, BufReader, Write};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::process::{Command, Output};
 use unicode_normalization::UnicodeNormalization;
+
+#[cfg(unix)]
+thread_local! {
+    static INSTALL_STAGING_FD: std::cell::Cell<Option<libc::c_int>> = const { std::cell::Cell::new(None) };
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TopUpMode {
@@ -202,6 +207,7 @@ fn install_pinned_bundle_transaction(
     validate_hash("requested manifest", &request.manifest_hash)?;
     let target = target.as_ref();
     let publication = BoundInstall::new(target, "pinned")?;
+    let _staging_scope = publication.enter_staging()?;
     let staging = publication.staging_root().join("repo");
 
     let verified = installer
@@ -260,6 +266,8 @@ pub(crate) struct BoundInstall {
     staging_name: std::ffi::OsString,
     parent_dev: u64,
     parent_ino: u64,
+    staging_dev: u64,
+    staging_ino: u64,
     published: std::cell::Cell<bool>,
 }
 
@@ -289,26 +297,63 @@ impl BoundInstall {
             return Err(std::io::Error::last_os_error()).context("create fd-bound clone staging");
         }
         let staging = openat_dir(parent.as_raw_fd(), &staging_name)?;
-        let stat = fd_stat(parent.as_raw_fd())?;
+        let parent_stat = fd_stat(parent.as_raw_fd())?;
+        let staging_stat = fd_stat(staging.as_raw_fd())?;
         Ok(Self {
             parent,
             staging,
             parent_path,
             target_name,
             staging_name,
-            parent_dev: stat.st_dev as u64,
-            parent_ino: stat.st_ino as u64,
+            parent_dev: parent_stat.st_dev as u64,
+            parent_ino: parent_stat.st_ino as u64,
+            staging_dev: staging_stat.st_dev as u64,
+            staging_ino: staging_stat.st_ino as u64,
             published: std::cell::Cell::new(false),
         })
     }
     pub(crate) fn staging_root(&self) -> std::path::PathBuf {
         #[cfg(target_os = "linux")]
+        return std::path::PathBuf::from(format!("/proc/self/fd/{}", self.staging.as_raw_fd()));
+        #[cfg(target_os = "macos")]
+        return std::path::PathBuf::from(".");
+    }
+    pub(crate) fn enter_staging(&self) -> Result<StagingScope> {
+        let duplicate = unsafe { libc::dup(self.staging.as_raw_fd()) };
+        if duplicate < 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("duplicate installer staging descriptor");
+        }
+        let staging = unsafe { OwnedFd::from_raw_fd(duplicate) };
+        #[cfg(target_os = "linux")]
         {
-            std::path::PathBuf::from(format!("/proc/self/fd/{}", self.staging.as_raw_fd()))
+            let previous = INSTALL_STAGING_FD.with(|slot| slot.replace(Some(staging.as_raw_fd())));
+            return Ok(StagingScope { staging, previous });
         }
         #[cfg(target_os = "macos")]
         {
-            self.parent_path.join(&self.staging_name)
+            let dot = CString::new(".").unwrap();
+            let old = unsafe {
+                libc::open(
+                    dot.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                )
+            };
+            if old < 0 {
+                return Err(std::io::Error::last_os_error())
+                    .context("save installer thread working directory");
+            }
+            let old = unsafe { OwnedFd::from_raw_fd(old) };
+            if unsafe { pthread_fchdir_np(staging.as_raw_fd()) } != 0 {
+                return Err(std::io::Error::last_os_error())
+                    .context("bind installer thread to staging descriptor");
+            }
+            let previous = INSTALL_STAGING_FD.with(|slot| slot.replace(Some(staging.as_raw_fd())));
+            Ok(StagingScope {
+                old,
+                staging,
+                previous,
+            })
         }
     }
     pub(crate) fn publish_repo(&self) -> Result<()> {
@@ -356,15 +401,13 @@ impl BoundInstall {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 impl Drop for BoundInstall {
     fn drop(&mut self) {
-        if !self.published.get() {
-            let _ = std::fs::remove_dir_all(self.staging_root().join("repo"));
-        }
-        let name = cstring(&self.staging_name);
-        if let Ok(name) = name {
-            unsafe {
-                libc::unlinkat(self.parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR);
-            }
-        }
+        let _ = remove_dir_contents(self.staging.as_raw_fd());
+        let _ = unlink_bound_directory(
+            self.parent.as_raw_fd(),
+            &self.staging_name,
+            self.staging_dev,
+            self.staging_ino,
+        );
     }
 }
 
@@ -378,9 +421,69 @@ impl BoundInstall {
     pub(crate) fn staging_root(&self) -> std::path::PathBuf {
         unreachable!()
     }
+    pub(crate) fn enter_staging(&self) -> Result<StagingScope> {
+        bail!("fd-bound clone publication is unsupported on this platform")
+    }
     pub(crate) fn publish_repo(&self) -> Result<()> {
         bail!("fd-bound clone publication is unsupported on this platform")
     }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) struct StagingScope {
+    staging: OwnedFd,
+    previous: Option<libc::c_int>,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for StagingScope {
+    fn drop(&mut self) {
+        INSTALL_STAGING_FD.with(|slot| slot.set(self.previous));
+        let _ = self.staging.as_raw_fd();
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) struct StagingScope {
+    old: OwnedFd,
+    staging: OwnedFd,
+    previous: Option<libc::c_int>,
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for StagingScope {
+    fn drop(&mut self) {
+        unsafe {
+            pthread_fchdir_np(self.old.as_raw_fd());
+        }
+        INSTALL_STAGING_FD.with(|slot| slot.set(self.previous));
+        let _ = self.staging.as_raw_fd();
+    }
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn pthread_fchdir_np(fd: libc::c_int) -> libc::c_int;
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) struct StagingScope {}
+
+pub(crate) fn bind_child_to_staging(command: &mut Command) {
+    #[cfg(unix)]
+    INSTALL_STAGING_FD.with(|slot| {
+        if let Some(fd) = slot.get() {
+            use std::os::unix::process::CommandExt;
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::fchdir(fd) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+    });
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -516,6 +619,118 @@ fn fd_stat(fd: libc::c_int) -> Result<libc::stat> {
         return Err(std::io::Error::last_os_error()).context("stat clone parent handle");
     }
     Ok(unsafe { stat.assume_init() })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn directory_entries(fd: libc::c_int) -> Result<Vec<std::ffi::OsString>> {
+    let duplicate = unsafe { libc::dup(fd) };
+    if duplicate < 0 {
+        return Err(std::io::Error::last_os_error()).context("duplicate staging directory handle");
+    }
+    let directory = unsafe { libc::fdopendir(duplicate) };
+    if directory.is_null() {
+        unsafe { libc::close(duplicate) };
+        return Err(std::io::Error::last_os_error()).context("open staging directory stream");
+    }
+    let mut entries = Vec::new();
+    loop {
+        clear_errno();
+        let entry = unsafe { libc::readdir(directory) };
+        if entry.is_null() {
+            let error = std::io::Error::last_os_error();
+            unsafe { libc::closedir(directory) };
+            if error.raw_os_error() != Some(0) {
+                return Err(error).context("read staging directory stream");
+            }
+            break;
+        }
+        let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+        if !matches!(name, b"." | b"..") {
+            entries.push(std::ffi::OsString::from_vec(name.to_vec()));
+        }
+    }
+    Ok(entries)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn entry_stat(parent: libc::c_int, name: &std::ffi::OsStr) -> Result<libc::stat> {
+    let name = cstring(name)?;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe {
+        libc::fstatat(
+            parent,
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error()).context("stat staging entry");
+    }
+    Ok(unsafe { stat.assume_init() })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn remove_dir_contents(fd: libc::c_int) -> Result<()> {
+    for name in directory_entries(fd)? {
+        let stat = match entry_stat(fd, &name) {
+            Ok(stat) => stat,
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let name_c = cstring(&name)?;
+        if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
+            let child = openat_dir(fd, &name)?;
+            remove_dir_contents(child.as_raw_fd())?;
+            if unsafe { libc::unlinkat(fd, name_c.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
+                return Err(std::io::Error::last_os_error()).context("remove staging directory");
+            }
+        } else if unsafe { libc::unlinkat(fd, name_c.as_ptr(), 0) } != 0 {
+            return Err(std::io::Error::last_os_error()).context("remove staging entry");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn unlink_bound_directory(
+    parent: libc::c_int,
+    expected_name: &std::ffi::OsStr,
+    expected_dev: u64,
+    expected_ino: u64,
+) -> Result<()> {
+    let mut names = vec![expected_name.to_os_string()];
+    names.extend(directory_entries(parent)?);
+    for name in names {
+        let Ok(stat) = entry_stat(parent, &name) else {
+            continue;
+        };
+        if stat.st_dev as u64 == expected_dev && stat.st_ino == expected_ino {
+            let name = cstring(&name)?;
+            if unsafe { libc::unlinkat(parent, name.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
+                return Err(std::io::Error::last_os_error())
+                    .context("remove bound staging directory");
+            }
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn clear_errno() {
+    unsafe { *libc::__errno_location() = 0 };
+}
+
+#[cfg(target_os = "macos")]
+fn clear_errno() {
+    unsafe { *libc::__error() = 0 };
 }
 
 pub(crate) fn validate_request_binding(
@@ -859,7 +1074,8 @@ fn verify_exact_full_object_store(
     let reachable_path = scratch.path().join("reachable");
     let odb_path = scratch.path().join("odb");
 
-    let mut reachable_child = sanitized_git_command()
+    let mut reachable_command = sanitized_git_command();
+    reachable_command
         .args([
             "-C",
             repo.to_str().context("non-UTF8 repository path")?,
@@ -870,40 +1086,22 @@ fn verify_exact_full_object_store(
             target,
         ])
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()?;
+        .stderr(std::process::Stdio::piped());
+    configure_process_group(&mut reachable_command);
+    let reachable_child = reachable_command.spawn()?;
     let mut reachable_file = std::io::BufWriter::new(std::fs::File::create(&reachable_path)?);
     let mut reachable_count = 0u64;
-    for line in BufReader::new(
-        reachable_child
-            .stdout
-            .take()
-            .context("capture reachable object stream")?,
-    )
-    .lines()
-    {
-        if cancelled.is_cancelled() {
-            let _ = reachable_child.kill();
-            let _ = reachable_child.wait();
-            bail!("clone installation cancelled")
-        }
-        let oid = line?;
-        validate_oid("reachable object", &oid)?;
-        reachable_count = reachable_count
-            .checked_add(1)
-            .context("reachable object count overflow")?;
-        if reachable_count > maximum {
-            let _ = reachable_child.kill();
-            bail!("reachable object count exceeds installer limit")
-        }
-        writeln!(reachable_file, "{oid}")?;
-    }
-    if !reachable_child.wait()?.success() {
-        bail!("reachable object enumeration failed")
-    }
+    reachable_count = consume_reachable_inventory(
+        reachable_child,
+        &mut reachable_file,
+        maximum,
+        reachable_count,
+        cancelled,
+    )?;
     reachable_file.flush()?;
 
-    let mut odb_child = sanitized_git_command()
+    let mut odb_command = sanitized_git_command();
+    odb_command
         .args([
             "-C",
             repo.to_str().context("non-UTF8 repository path")?,
@@ -912,53 +1110,12 @@ fn verify_exact_full_object_store(
             "--batch-check=%(objectname) %(objecttype) %(objectsize)",
         ])
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()?;
+        .stderr(std::process::Stdio::piped());
+    configure_process_group(&mut odb_command);
+    let odb_child = odb_command.spawn()?;
     let mut odb_file = std::io::BufWriter::new(std::fs::File::create(&odb_path)?);
     let mut odb_count = 0u64;
-    for line in BufReader::new(
-        odb_child
-            .stdout
-            .take()
-            .context("capture ODB object stream")?,
-    )
-    .lines()
-    {
-        if cancelled.is_cancelled() {
-            let _ = odb_child.kill();
-            let _ = odb_child.wait();
-            bail!("clone installation cancelled")
-        }
-        let line = line?;
-        let mut fields = line.split_ascii_whitespace();
-        let oid = fields.next().context("ODB object has no id")?;
-        validate_oid("ODB object", oid)?;
-        let kind = fields.next().context("ODB object has no type")?;
-        if !matches!(kind, "commit" | "tree" | "blob" | "tag") {
-            let _ = odb_child.kill();
-            bail!("ODB object has an unsupported type")
-        }
-        let _: u64 = fields
-            .next()
-            .context("ODB object has no size")?
-            .parse()
-            .context("ODB object size is invalid")?;
-        if fields.next().is_some() {
-            let _ = odb_child.kill();
-            bail!("ODB object record has trailing fields")
-        }
-        odb_count = odb_count
-            .checked_add(1)
-            .context("ODB object count overflow")?;
-        if odb_count > maximum {
-            let _ = odb_child.kill();
-            bail!("ODB object count exceeds installer limit")
-        }
-        writeln!(odb_file, "{oid}")?;
-    }
-    if !odb_child.wait()?.success() {
-        bail!("ODB object enumeration failed")
-    }
+    odb_count = consume_odb_inventory(odb_child, &mut odb_file, maximum, odb_count, cancelled)?;
     odb_file.flush()?;
     sort_file(&reachable_path, cancelled)?;
     sort_file(&odb_path, cancelled)?;
@@ -975,22 +1132,76 @@ fn verify_exact_full_object_store(
             break;
         }
     }
+    let _ = (reachable_count, odb_count);
     Ok(())
 }
 
+fn consume_reachable_inventory(
+    child: std::process::Child,
+    writer: &mut dyn Write,
+    maximum: u64,
+    mut count: u64,
+    cancelled: &tokio_util::sync::CancellationToken,
+) -> Result<u64> {
+    crate::git::consume_child_lines_cancellable(child, cancelled, |oid| {
+        validate_oid("reachable object", &oid)?;
+        count = count
+            .checked_add(1)
+            .context("reachable object count overflow")?;
+        if count > maximum {
+            bail!("reachable object count exceeds installer limit")
+        }
+        writeln!(writer, "{oid}")?;
+        Ok(())
+    })?;
+    Ok(count)
+}
+
+fn consume_odb_inventory(
+    child: std::process::Child,
+    writer: &mut dyn Write,
+    maximum: u64,
+    mut count: u64,
+    cancelled: &tokio_util::sync::CancellationToken,
+) -> Result<u64> {
+    crate::git::consume_child_lines_cancellable(child, cancelled, |line| {
+        let mut fields = line.split_ascii_whitespace();
+        let oid = fields.next().context("ODB object has no id")?;
+        validate_oid("ODB object", oid)?;
+        let kind = fields.next().context("ODB object has no type")?;
+        if !matches!(kind, "commit" | "tree" | "blob" | "tag") {
+            bail!("ODB object has an unsupported type")
+        }
+        let _: u64 = fields
+            .next()
+            .context("ODB object has no size")?
+            .parse()
+            .context("ODB object size is invalid")?;
+        if fields.next().is_some() {
+            bail!("ODB object record has trailing fields")
+        }
+        count = count.checked_add(1).context("ODB object count overflow")?;
+        if count > maximum {
+            bail!("ODB object count exceeds installer limit")
+        }
+        writeln!(writer, "{oid}")?;
+        Ok(())
+    })?;
+    Ok(count)
+}
+
 fn sort_file(path: &Path, cancelled: &tokio_util::sync::CancellationToken) -> Result<()> {
-    let mut child = sanitized_sort_command()
-        .arg("-o")
-        .arg(path)
-        .arg(path)
-        .spawn()?;
+    let mut command = sanitized_sort_command();
+    command.arg("-o").arg(path).arg(path);
+    configure_process_group(&mut command);
+    let child = command.spawn()?;
+    let mut child = ReapedChild::new(child);
     let status = loop {
         if cancelled.is_cancelled() {
-            let _ = child.kill();
-            let _ = child.wait();
             bail!("clone installation cancelled")
         }
-        if let Some(status) = child.try_wait()? {
+        if let Some(status) = child.child_mut().try_wait()? {
+            child.mark_reaped();
             break status;
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
@@ -999,6 +1210,45 @@ fn sort_file(path: &Path, cancelled: &tokio_util::sync::CancellationToken) -> Re
         bail!("object inventory sort failed")
     }
     Ok(())
+}
+
+struct ReapedChild {
+    child: Option<std::process::Child>,
+}
+
+impl ReapedChild {
+    fn new(child: std::process::Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    fn child_mut(&mut self) -> &mut std::process::Child {
+        self.child.as_mut().expect("child is present until reaped")
+    }
+
+    fn mark_reaped(&mut self) {
+        self.child = None;
+    }
+}
+
+impl Drop for ReapedChild {
+    fn drop(&mut self) {
+        if let Some(child) = &mut self.child {
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(-(child.id() as i32), libc::SIGKILL);
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+fn configure_process_group(command: &mut Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
 }
 
 fn sanitized_sort_command() -> Command {
@@ -1182,6 +1432,7 @@ fn sanitized_git_command() -> Command {
         .env("GIT_NO_REPLACE_OBJECTS", "1")
         .env("GIT_PAGER", "cat")
         .env("LC_ALL", "C");
+    bind_child_to_staging(&mut command);
     command
 }
 
@@ -1266,12 +1517,129 @@ mod blocker_tests {
         let parent = root.path().join("parent");
         std::fs::create_dir(&parent).unwrap();
         let transaction = BoundInstall::new(&parent.join("repo"), "swap").unwrap();
-        std::fs::create_dir(transaction.staging_root().join("repo")).unwrap();
+        let scope = transaction.enter_staging().unwrap();
+        let staging_name = transaction.staging_name.clone();
         let moved = root.path().join("moved");
         std::fs::rename(&parent, &moved).unwrap();
         std::fs::create_dir(&parent).unwrap();
+        let replacement_staging = parent.join(&staging_name);
+        std::fs::create_dir(&replacement_staging).unwrap();
+        std::fs::write(replacement_staging.join("sentinel"), b"replacement").unwrap();
+        std::fs::create_dir(transaction.staging_root().join("repo")).unwrap();
+        std::fs::write(transaction.staging_root().join("repo/original"), b"bound").unwrap();
+        let moved_again = root.path().join("moved-again");
+        std::fs::rename(&moved, &moved_again).unwrap();
+        std::fs::create_dir(&moved).unwrap();
+        std::fs::write(
+            transaction.staging_root().join("repo/after-second-swap"),
+            b"still-bound",
+        )
+        .unwrap();
         assert!(transaction.publish_repo().is_err());
         assert!(!parent.join("repo").exists());
+        assert_eq!(
+            std::fs::read(replacement_staging.join("sentinel")).unwrap(),
+            b"replacement"
+        );
+        assert!(
+            moved_again
+                .join(&staging_name)
+                .join("repo/original")
+                .exists()
+        );
+        assert!(
+            moved_again
+                .join(&staging_name)
+                .join("repo/after-second-swap")
+                .exists()
+        );
+        drop(scope);
+        drop(transaction);
+        assert!(!moved_again.join(staging_name).exists());
+        assert_eq!(
+            std::fs::read(replacement_staging.join("sentinel")).unwrap(),
+            b"replacement"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn thread_bound_staging_is_isolated_concurrent_and_restored() {
+        let process_cwd = std::env::current_dir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let first_parent = root.path().join("first");
+        let second_parent = root.path().join("second");
+        std::fs::create_dir(&first_parent).unwrap();
+        std::fs::create_dir(&second_parent).unwrap();
+        let first = BoundInstall::new(&first_parent.join("repo"), "one").unwrap();
+        let second = BoundInstall::new(&second_parent.join("repo"), "two").unwrap();
+        let first_path = first_parent.join(&first.staging_name);
+        let second_path = second_parent.join(&second.staging_name);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let spawn = |transaction: BoundInstall,
+                     barrier: std::sync::Arc<std::sync::Barrier>,
+                     value: &'static [u8]| {
+            std::thread::spawn(move || {
+                let before = std::env::current_dir().unwrap();
+                let scope = transaction.enter_staging().unwrap();
+                barrier.wait();
+                std::fs::create_dir("repo").unwrap();
+                std::fs::write("repo/value", value).unwrap();
+                let mut child = std::process::Command::new("sh");
+                child.args(["-c", "pwd > repo/child-cwd"]);
+                bind_child_to_staging(&mut child);
+                assert!(child.status().unwrap().success());
+                barrier.wait();
+                drop(scope);
+                assert_eq!(std::env::current_dir().unwrap(), before);
+                transaction
+            })
+        };
+        let one = spawn(first, barrier.clone(), b"one");
+        let two = spawn(second, barrier.clone(), b"two");
+        barrier.wait();
+        assert_eq!(std::env::current_dir().unwrap(), process_cwd);
+        barrier.wait();
+        let first = one.join().unwrap();
+        let second = two.join().unwrap();
+        assert_eq!(
+            std::fs::read(first_path.join("repo/value")).unwrap(),
+            b"one"
+        );
+        assert_eq!(
+            std::fs::read(second_path.join("repo/value")).unwrap(),
+            b"two"
+        );
+        assert!(first_path.join("repo/child-cwd").is_file());
+        assert!(second_path.join("repo/child-cwd").is_file());
+        drop(first);
+        drop(second);
+        assert_eq!(std::env::current_dir().unwrap(), process_cwd);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn thread_bound_staging_restores_after_error_and_panic() {
+        let root = tempfile::tempdir().unwrap();
+        for panic in [false, true] {
+            let parent = root.path().join(if panic { "panic" } else { "error" });
+            std::fs::create_dir(&parent).unwrap();
+            let transaction = BoundInstall::new(&parent.join("repo"), "restore").unwrap();
+            let before = std::env::current_dir().unwrap();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _scope = transaction.enter_staging().unwrap();
+                if panic {
+                    panic!("installer panic");
+                }
+                Err::<(), _>(anyhow::anyhow!("installer error"))
+            }));
+            if panic {
+                assert!(result.is_err());
+            } else {
+                assert!(result.unwrap().is_err());
+            }
+            assert_eq!(std::env::current_dir().unwrap(), before);
+        }
     }
 
     #[test]
@@ -1295,5 +1663,97 @@ mod blocker_tests {
         assert!(wait_child_cancelled(&mut child, &token).is_err());
         thread.join().unwrap();
         assert!(child.try_wait().unwrap().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inventory_rejects_adversarial_records_and_reaps_every_child() {
+        struct FailingWriter;
+        impl std::io::Write for FailingWriter {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("injected inventory write failure"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        fn run_case(
+            odb: bool,
+            output: &str,
+            maximum: u64,
+            initial: u64,
+            fail_write: bool,
+            cancel: bool,
+        ) -> String {
+            let temp = tempfile::tempdir().unwrap();
+            let pid_path = temp.path().join("pid");
+            let tail = if cancel { "; sleep 30" } else { "" };
+            let script = format!(
+                "echo $$ > '{}'; printf '%s' '{}'{}",
+                pid_path.display(),
+                output,
+                tail
+            );
+            let mut command = Command::new("sh");
+            command
+                .args(["-c", &script])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            configure_process_group(&mut command);
+            let child = command.spawn().unwrap();
+            let token = tokio_util::sync::CancellationToken::new();
+            let canceller = cancel.then(|| {
+                let token = token.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    token.cancel();
+                })
+            });
+            let mut bytes = Vec::new();
+            let mut failing = FailingWriter;
+            let writer: &mut dyn std::io::Write =
+                if fail_write { &mut failing } else { &mut bytes };
+            let error = if odb {
+                consume_odb_inventory(child, writer, maximum, initial, &token).unwrap_err()
+            } else {
+                consume_reachable_inventory(child, writer, maximum, initial, &token).unwrap_err()
+            };
+            if let Some(canceller) = canceller {
+                canceller.join().unwrap();
+            }
+            let pid: i32 = std::fs::read_to_string(pid_path)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            assert_ne!(
+                unsafe { libc::kill(pid, 0) },
+                0,
+                "inventory child was not reaped"
+            );
+            format!("{error:#}")
+        }
+
+        let oid = "1".repeat(40);
+        assert!(run_case(false, "bad\n", 10, 0, false, false).contains("SHA-1"));
+        assert!(
+            run_case(false, &format!("{oid}\n"), u64::MAX, u64::MAX, false, false)
+                .contains("overflow")
+        );
+        assert!(
+            run_case(true, &format!("{oid} delta 1\n"), 10, 0, false, false)
+                .contains("unsupported")
+        );
+        assert!(
+            run_case(true, &format!("{oid} blob 1 extra\n"), 10, 0, false, false)
+                .contains("trailing")
+        );
+        assert!(run_case(true, &format!("{oid} blob 1\n"), 0, 0, false, false).contains("exceeds"));
+        assert!(
+            run_case(true, &format!("{oid} blob 1\n"), 10, 0, true, false)
+                .contains("write failure")
+        );
+        assert!(run_case(true, "partial", 10, 0, false, true).contains("cancelled"));
     }
 }

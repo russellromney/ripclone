@@ -1440,14 +1440,46 @@ fn index_pack_inner(
 }
 
 pub fn init<P: AsRef<Path>>(git_dir: P) -> Result<()> {
-    let status = Command::new("git")
-        .args(["init", "-q", &git_dir.as_ref().to_string_lossy()])
-        .status()
-        .context("git init")?;
+    let mut command = Command::new("git");
+    command.args(["init", "-q", &git_dir.as_ref().to_string_lossy()]);
+    crate::topup::bind_child_to_staging(&mut command);
+    let status = command.status().context("git init")?;
     if !status.success() {
         bail!("git init failed");
     }
     Ok(())
+}
+
+pub(crate) fn init_cancelled<P: AsRef<Path>>(
+    git_dir: P,
+    cancelled: &tokio_util::sync::CancellationToken,
+) -> Result<()> {
+    let mut command = Command::new("git");
+    command.args(["init", "-q"]).arg(git_dir.as_ref());
+    crate::topup::bind_child_to_staging(&mut command);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command.spawn().context("spawn git init")?;
+    loop {
+        if cancelled.is_cancelled() {
+            kill_child_tree(&mut child);
+            let _ = child.wait();
+            bail!("git init cancelled");
+        }
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(_)) => bail!("git init failed"),
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(error) => {
+                kill_child_tree(&mut child);
+                let _ = child.wait();
+                return Err(error).context("wait for git init");
+            }
+        }
+    }
 }
 
 pub fn set_head<P: AsRef<Path>>(git_dir: P, commit: &str) -> Result<()> {
