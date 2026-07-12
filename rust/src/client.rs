@@ -84,6 +84,7 @@ struct ClientPinnedInstaller<'a> {
     cas: &'a Cas,
     approved_origin: &'a str,
     capability: std::sync::Mutex<Option<crate::pinned_bundle::VerifiedPinnedLocalCapability>>,
+    cancelled: tokio_util::sync::CancellationToken,
 }
 
 struct ClientExactGitInstaller<'a> {
@@ -92,6 +93,7 @@ struct ClientExactGitInstaller<'a> {
     head: std::sync::Mutex<Option<crate::artifact_manifest::VerifiedTransportArtifact>>,
     history: std::sync::Mutex<Option<crate::artifact_manifest::VerifiedTransportArtifact>>,
     verified: crate::topup::VerifiedPinnedBundle,
+    cancelled: tokio_util::sync::CancellationToken,
 }
 
 impl crate::topup::PinnedBundleInstaller for ClientExactGitInstaller<'_> {
@@ -105,6 +107,9 @@ impl crate::topup::PinnedBundleInstaller for ClientExactGitInstaller<'_> {
         _: &crate::topup::PinnedBundleRequest,
     ) -> std::result::Result<crate::topup::VerifiedPinnedBundle, crate::topup::BundleInstallFailure>
     {
+        if self.cancelled.is_cancelled() {
+            return Err(crate::topup::BundleInstallFailure::Unavailable);
+        }
         let head = self
             .head
             .lock()
@@ -117,7 +122,7 @@ impl crate::topup::PinnedBundleInstaller for ClientExactGitInstaller<'_> {
             .map_err(|_| crate::topup::BundleInstallFailure::Integrity)?
             .take();
         self.verifier
-            .materialize_transport_git(head, history, destination)
+            .materialize_transport_git_cancelled(head, history, destination, &self.cancelled)
             .map_err(|_| crate::topup::BundleInstallFailure::Integrity)?;
         Ok(self.verified.clone())
     }
@@ -140,13 +145,20 @@ impl crate::topup::PinnedBundleInstaller for ClientPinnedInstaller<'_> {
             .map_err(|_| crate::topup::BundleInstallFailure::Integrity)?
             .take()
             .ok_or(crate::topup::BundleInstallFailure::Integrity)?;
-        crate::pinned_bundle::materialize_verified_pinned_capability(
+        if self.cancelled.is_cancelled() {
+            return Err(crate::topup::BundleInstallFailure::Unavailable);
+        }
+        let verified = crate::pinned_bundle::materialize_verified_pinned_capability(
             self.cas,
             request,
             capability,
             destination,
         )
-        .map_err(|_| crate::topup::BundleInstallFailure::Integrity)
+        .map_err(|_| crate::topup::BundleInstallFailure::Integrity)?;
+        if self.cancelled.is_cancelled() {
+            return Err(crate::topup::BundleInstallFailure::Unavailable);
+        }
+        Ok(verified)
     }
 }
 
@@ -499,7 +511,7 @@ async fn fetch_artifact_to_temp_once(
         Ok(r) => r,
         Err(e) => return Err((true, anyhow::anyhow!("artifact fetch transport error: {e}"))),
     };
-    fetch_artifact_response_to_temp(resp, hash, dir, maximum).await
+    fetch_artifact_response_to_temp(resp, hash, dir, maximum, None).await
 }
 
 async fn fetch_artifact_response_to_temp(
@@ -507,6 +519,7 @@ async fn fetch_artifact_response_to_temp(
     hash: &str,
     dir: &Path,
     maximum: Option<u64>,
+    cancelled: Option<&tokio_util::sync::CancellationToken>,
 ) -> std::result::Result<(tempfile::NamedTempFile, u64), (bool, anyhow::Error)> {
     use tokio::io::AsyncWriteExt;
     let status = resp.status();
@@ -539,7 +552,14 @@ async fn fetch_artifact_response_to_temp(
     let mut stream = resp.bytes_stream();
     let mut hasher = sha2::Sha256::new();
     let mut len = 0u64;
-    while let Some(chunk) = stream.next().await {
+    loop {
+        let next = match cancelled {
+            Some(token) => {
+                tokio::select! { _ = token.cancelled() => return Err((false,anyhow::anyhow!("typed clone cancelled"))), value = stream.next() => value }
+            }
+            None => stream.next().await,
+        };
+        let Some(chunk) = next else { break };
         let chunk = match chunk {
             Ok(chunk) => chunk,
             Err(e) => return Err((true, anyhow::anyhow!("artifact body read error: {e}"))),
@@ -1076,6 +1096,25 @@ impl Client {
         target: P,
         approved_canonical_origin: &str,
     ) -> Result<TypedCloneOutcome> {
+        self.execute_typed_clone_plan_cancellable(
+            plan,
+            target,
+            approved_canonical_origin,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+    }
+
+    pub async fn execute_typed_clone_plan_cancellable<P: AsRef<Path>>(
+        &self,
+        plan: ClonePlan,
+        target: P,
+        approved_canonical_origin: &str,
+        cancelled: &tokio_util::sync::CancellationToken,
+    ) -> Result<TypedCloneOutcome> {
+        if cancelled.is_cancelled() {
+            anyhow::bail!("typed clone cancelled")
+        }
         match plan {
             ClonePlan::Pending { required, .. } => {
                 Err(TypedCloneUnavailable::Pending(required).into())
@@ -1099,18 +1138,23 @@ impl Client {
                         Some(cas) => cas.clone(),
                         None => Cas::new(temporary.as_ref().unwrap().path())?,
                     };
-                    let capability = self.prefetch_pinned_bundle(&cas, &request).await?;
+                    let capability = self
+                        .prefetch_pinned_bundle(&cas, &request, cancelled)
+                        .await?;
                     let installer = ClientPinnedInstaller {
                         cas: &cas,
                         approved_origin: approved_canonical_origin,
                         capability: std::sync::Mutex::new(Some(capability)),
+                        cancelled: cancelled.clone(),
                     };
                     let outcome = if discard_git {
-                        crate::topup::install_pinned_bundle_discard_git(
-                            target, &request, &installer,
+                        crate::topup::install_pinned_bundle_discard_git_cancellable(
+                            target, &request, &installer, cancelled,
                         )?
                     } else {
-                        crate::topup::install_pinned_bundle(target, &request, &installer)?
+                        crate::topup::install_pinned_bundle_cancellable(
+                            target, &request, &installer, cancelled,
+                        )?
                     };
                     if let Err(error) = self.release_typed_transport(&request).await {
                         // Installation is already committed locally. Cleanup is
@@ -1143,25 +1187,16 @@ impl Client {
                             &manifest,
                             &transport_session,
                             crate::artifact_scheduler::ArtifactKind::Files,
+                            cancelled,
                         )
                         .await?;
                     let target = target.as_ref();
-                    if std::fs::symlink_metadata(target).is_ok() {
-                        anyhow::bail!("clone destination already exists: {}", target.display());
-                    }
-                    let parent = target
-                        .parent()
-                        .filter(|path| !path.as_os_str().is_empty())
-                        .unwrap_or_else(|| Path::new("."));
-                    std::fs::create_dir_all(parent)?;
-                    let staging_parent = tempfile::Builder::new()
-                        .prefix("ripclone-files.")
-                        .suffix(".tmp")
-                        .tempdir_in(parent)?;
-                    let staging = staging_parent.path().join("repo");
+                    let publication = crate::topup::BoundInstall::new(target, "files")?;
+                    let staging = publication.staging_root().join("repo");
                     crate::artifact_manifest::CasCompletionVerifier::new(cas)
-                        .materialize_transport_files(capability, &staging)?;
-                    crate::topup::atomic_publish_directory(&staging, target)
+                        .materialize_transport_files_cancelled(capability, &staging, cancelled)?;
+                    publication
+                        .publish_repo()
                         .context("publish exact Files artifact")?;
                     let request =
                         Self::exact_transport_request(&binding, &manifest, &transport_session);
@@ -1192,6 +1227,7 @@ impl Client {
                         None,
                         transport_session,
                         discard_git,
+                        cancelled,
                     )
                     .await
                 }
@@ -1210,6 +1246,7 @@ impl Client {
                         Some(history_manifest),
                         transport_session,
                         false,
+                        cancelled,
                     )
                     .await
                 }
@@ -1243,6 +1280,7 @@ impl Client {
         history_root: Option<String>,
         transport_session: String,
         discard_git: bool,
+        cancelled: &tokio_util::sync::CancellationToken,
     ) -> Result<TypedCloneOutcome> {
         let temporary = if self.cache.is_none() {
             Some(tempfile::tempdir().context("create typed clone CAS")?)
@@ -1260,6 +1298,7 @@ impl Client {
                 &head_root,
                 &transport_session,
                 crate::artifact_scheduler::ArtifactKind::Head,
+                cancelled,
             )
             .await?;
         let history = if let Some(root) = history_root.as_deref() {
@@ -1270,6 +1309,7 @@ impl Client {
                     root,
                     &transport_session,
                     crate::artifact_scheduler::ArtifactKind::FullHistory,
+                    cancelled,
                 )
                 .await?,
             )
@@ -1317,11 +1357,16 @@ impl Client {
             head: std::sync::Mutex::new(Some(head)),
             history: std::sync::Mutex::new(history),
             verified,
+            cancelled: cancelled.clone(),
         };
         let outcome = if discard_git {
-            crate::topup::install_pinned_bundle_discard_git(target, &request, &installer)?
+            crate::topup::install_pinned_bundle_discard_git_cancellable(
+                target, &request, &installer, cancelled,
+            )?
         } else {
-            crate::topup::install_pinned_bundle(target, &request, &installer)?
+            crate::topup::install_pinned_bundle_cancellable(
+                target, &request, &installer, cancelled,
+            )?
         };
         let mut roots = vec![head_root];
         roots.extend(history_root);
@@ -1338,6 +1383,7 @@ impl Client {
         &self,
         cas: &Cas,
         request: &crate::topup::PinnedBundleRequest,
+        cancelled: &tokio_util::sync::CancellationToken,
     ) -> Result<crate::pinned_bundle::VerifiedPinnedLocalCapability> {
         const MAX_PINNED_MANIFEST_BYTES: usize = 16 * 1024 * 1024;
         const MAX_PINNED_ARTIFACTS: usize = 32_768;
@@ -1345,10 +1391,11 @@ impl Client {
         const MAX_PINNED_TOTAL_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
 
         let manifest = self
-            .fetch_small_artifact_bounded(
+            .fetch_small_artifact_bounded_cancelled(
                 request,
                 &request.manifest_hash,
                 MAX_PINNED_MANIFEST_BYTES,
+                cancelled,
             )
             .await?;
         cas.put_with_hash(&request.manifest_hash, &manifest)?;
@@ -1379,7 +1426,13 @@ impl Client {
                 continue;
             }
             let (temp, len) = self
-                .fetch_typed_artifact_to_temp(request, &artifact.hash, cas.root(), artifact.len)
+                .fetch_typed_artifact_to_temp(
+                    request,
+                    &artifact.hash,
+                    cas.root(),
+                    artifact.len,
+                    cancelled,
+                )
                 .await?;
             if len != artifact.len {
                 anyhow::bail!("pinned artifact transport length mismatch");
@@ -1420,11 +1473,12 @@ impl Client {
         root: &str,
         transport_session: &str,
         kind: crate::artifact_scheduler::ArtifactKind,
+        cancelled: &tokio_util::sync::CancellationToken,
     ) -> Result<crate::artifact_manifest::VerifiedTransportArtifact> {
         const MAX_ROOT_BYTES: usize = 16 * 1024 * 1024;
         let request = Self::exact_transport_request(binding, root, transport_session);
         let root_bytes = self
-            .fetch_small_artifact_bounded(&request, root, MAX_ROOT_BYTES)
+            .fetch_small_artifact_bounded_cancelled(&request, root, MAX_ROOT_BYTES, cancelled)
             .await?;
         if cas_hash(&root_bytes) != root {
             anyhow::bail!("typed transport root hash mismatch");
@@ -1451,19 +1505,24 @@ impl Client {
         // anchor and nested level manifests; only hash-verified nested bytes are
         // allowed to delegate the pack/index set in the next step.
         for blob in manifest.payload.referenced_blobs() {
-            self.fetch_exact_descriptor(cas, &request, blob).await?;
+            self.fetch_exact_descriptor(cas, &request, blob, cancelled)
+                .await?;
         }
         let verifier = crate::artifact_manifest::CasCompletionVerifier::new(cas.clone());
         let graph = verifier.transport_referenced_blobs(&manifest, &mut |blob| {
+            if cancelled.is_cancelled() {
+                anyhow::bail!("typed clone artifact prefetch cancelled");
+            }
             if cas.verify_object(&blob.hash)? != blob.len {
                 anyhow::bail!("nested typed descriptor is absent or has wrong length");
             }
             cas.get(&blob.hash)
         })?;
         for blob in &graph {
-            self.fetch_exact_descriptor(cas, &request, blob).await?;
+            self.fetch_exact_descriptor(cas, &request, blob, cancelled)
+                .await?;
         }
-        verifier.verify_transport_artifact(&key, root)
+        verifier.verify_transport_artifact_cancelled(&key, root, cancelled)
     }
 
     async fn fetch_exact_descriptor(
@@ -1471,6 +1530,7 @@ impl Client {
         cas: &Cas,
         request: &crate::topup::PinnedBundleRequest,
         blob: &crate::artifact_manifest::CasBlob,
+        cancelled: &tokio_util::sync::CancellationToken,
     ) -> Result<()> {
         crate::cas::Cas::validate_artifact_id(&blob.hash)?;
         if blob.len == 0 {
@@ -1480,7 +1540,7 @@ impl Client {
             return Ok(());
         }
         let (temp, len) = self
-            .fetch_typed_artifact_to_temp(request, &blob.hash, cas.root(), blob.len)
+            .fetch_typed_artifact_to_temp(request, &blob.hash, cas.root(), blob.len, cancelled)
             .await?;
         if len != blob.len {
             anyhow::bail!("typed artifact transport descriptor length mismatch");
@@ -1538,10 +1598,14 @@ impl Client {
         hash: &str,
         dir: &Path,
         maximum: u64,
+        cancelled: &tokio_util::sync::CancellationToken,
     ) -> Result<(tempfile::NamedTempFile, u64)> {
         let (max_attempts, base_backoff_ms) = fetch_retry_config();
         let mut attempt = 0u32;
         loop {
+            if cancelled.is_cancelled() {
+                anyhow::bail!("typed clone cancelled")
+            }
             attempt += 1;
             let response = match self.typed_artifact_response(request, hash).await {
                 Ok(response) => response,
@@ -1552,7 +1616,14 @@ impl Client {
                 Err(error) => return Err(error),
             };
             let heartbeat = self.typed_auth_heartbeat(request);
-            let fetched = fetch_artifact_response_to_temp(response, hash, dir, Some(maximum)).await;
+            let fetched = fetch_artifact_response_to_temp(
+                response,
+                hash,
+                dir,
+                Some(maximum),
+                Some(cancelled),
+            )
+            .await;
             if let Some(stop) = heartbeat {
                 let _ = stop.send(());
             }
@@ -1566,15 +1637,35 @@ impl Client {
         }
     }
 
+    #[cfg(test)]
     async fn fetch_small_artifact_bounded(
         &self,
         request: &crate::topup::PinnedBundleRequest,
         hash: &str,
         maximum: usize,
     ) -> Result<Vec<u8>> {
+        self.fetch_small_artifact_bounded_cancelled(
+            request,
+            hash,
+            maximum,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+    }
+
+    async fn fetch_small_artifact_bounded_cancelled(
+        &self,
+        request: &crate::topup::PinnedBundleRequest,
+        hash: &str,
+        maximum: usize,
+        cancelled: &tokio_util::sync::CancellationToken,
+    ) -> Result<Vec<u8>> {
         crate::cas::Cas::validate_artifact_id(hash)?;
         let (max_attempts, base_backoff_ms) = fetch_retry_config();
         for attempt in 1..=max_attempts {
+            if cancelled.is_cancelled() {
+                anyhow::bail!("typed clone cancelled")
+            }
             let response = match self.typed_artifact_response(request, hash).await {
                 Ok(response) => response,
                 Err(_error) if attempt < max_attempts => {
@@ -1597,7 +1688,9 @@ impl Client {
             let mut stream = response.bytes_stream();
             let heartbeat = self.typed_auth_heartbeat(request);
             let mut failed = None;
-            while let Some(chunk) = stream.next().await {
+            loop {
+                let next = tokio::select! {_=cancelled.cancelled()=>anyhow::bail!("typed clone cancelled"),value=stream.next()=>value};
+                let Some(chunk) = next else { break };
                 match chunk {
                     Ok(chunk) => {
                         let next = bytes

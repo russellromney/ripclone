@@ -22,7 +22,6 @@ use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::{cell::RefCell, time::Duration};
-use unicode_normalization::UnicodeNormalization;
 
 thread_local! {
     static VERIFICATION_CANCEL: RefCell<Option<tokio_util::sync::CancellationToken>> = const { RefCell::new(None) };
@@ -1494,6 +1493,28 @@ impl CasCompletionVerifier {
         })
     }
 
+    pub fn verify_transport_artifact_cancelled(
+        &self,
+        key: &ArtifactKey,
+        manifest_hash: &str,
+        cancelled: &tokio_util::sync::CancellationToken,
+    ) -> Result<VerifiedTransportArtifact> {
+        if cancelled.is_cancelled() {
+            bail!("artifact verification cancelled");
+        }
+        let previous =
+            VERIFICATION_CANCEL.with(|slot| slot.borrow_mut().replace(cancelled.clone()));
+        let _guard = VerificationCancelGuard {
+            token: previous,
+            scratch: VERIFICATION_SCRATCH.with(|slot| slot.borrow().clone()),
+        };
+        let verified = self.verify_transport_artifact(key, manifest_hash)?;
+        if cancelled.is_cancelled() {
+            bail!("artifact verification cancelled");
+        }
+        Ok(verified)
+    }
+
     fn verify_transport_full_history(
         &self,
         commit: &str,
@@ -1648,6 +1669,29 @@ impl CasCompletionVerifier {
         Ok((head_root, history_root))
     }
 
+    pub fn materialize_transport_git_cancelled(
+        &self,
+        head: VerifiedTransportArtifact,
+        history: Option<VerifiedTransportArtifact>,
+        destination: &Path,
+        cancelled: &tokio_util::sync::CancellationToken,
+    ) -> Result<(String, Option<String>)> {
+        if cancelled.is_cancelled() {
+            bail!("transport Git materialization cancelled")
+        }
+        let previous =
+            VERIFICATION_CANCEL.with(|slot| slot.borrow_mut().replace(cancelled.clone()));
+        let _guard = VerificationCancelGuard {
+            token: previous,
+            scratch: VERIFICATION_SCRATCH.with(|slot| slot.borrow().clone()),
+        };
+        let result = self.materialize_transport_git(head, history, destination);
+        if cancelled.is_cancelled() {
+            bail!("transport Git materialization cancelled")
+        }
+        result
+    }
+
     /// Reconstruct an exact Files artifact into an already-private empty
     /// directory. No Git administrative state is copied to the result.
     pub fn materialize_transport_files(
@@ -1681,6 +1725,9 @@ impl CasCompletionVerifier {
         )?;
         preflight_metadata_counts(&metadata_bytes, &self.limits)?;
         let metadata = MetadataChunk::decode(metadata_bytes.as_slice())?;
+        crate::topup::validate_portable_path_components(
+            metadata.files.iter().map(|entry| entry.path.as_slice()),
+        )?;
         let dictionary = files
             .zstd_dictionary
             .as_ref()
@@ -1700,21 +1747,6 @@ impl CasCompletionVerifier {
             &self.limits,
         )?;
         let source_files = scratch.path().join("files");
-        let file_paths = metadata
-            .files
-            .iter()
-            .map(|entry| crate::fsutil::path_from_bytes(&entry.path).to_path_buf())
-            .collect::<HashSet<_>>();
-        for path in &file_paths {
-            let mut parent = path.parent();
-            while let Some(value) = parent.filter(|value| !value.as_os_str().is_empty()) {
-                if file_paths.contains(value) {
-                    bail!("Files artifact contains a path-prefix collision");
-                }
-                parent = value.parent();
-            }
-        }
-        let mut collision_keys = HashSet::with_capacity(metadata.files.len());
         let mut symlinks = Vec::new();
         for (index, entry) in metadata.files.iter().enumerate() {
             validate_artifact_path(&entry.path)?;
@@ -1722,14 +1754,6 @@ impl CasCompletionVerifier {
                 bail!("Files artifact contains an unsupported worktree mode");
             }
             let relative = crate::fsutil::path_from_bytes(&entry.path);
-            let collision_key = relative
-                .to_string_lossy()
-                .nfc()
-                .flat_map(char::to_lowercase)
-                .collect::<String>();
-            if !collision_keys.insert(collision_key) {
-                bail!("Files artifact contains a case/Unicode-colliding path");
-            }
             let target = destination.join(relative);
             create_physical_parents(destination, relative)?;
             if entry.mode == 0o120000 {
@@ -1800,6 +1824,28 @@ impl CasCompletionVerifier {
             }
         }
         Ok(root)
+    }
+
+    pub fn materialize_transport_files_cancelled(
+        &self,
+        capability: VerifiedTransportArtifact,
+        destination: &Path,
+        cancelled: &tokio_util::sync::CancellationToken,
+    ) -> Result<String> {
+        if cancelled.is_cancelled() {
+            bail!("transport Files materialization cancelled")
+        }
+        let previous =
+            VERIFICATION_CANCEL.with(|slot| slot.borrow_mut().replace(cancelled.clone()));
+        let _guard = VerificationCancelGuard {
+            token: previous,
+            scratch: VERIFICATION_SCRATCH.with(|slot| slot.borrow().clone()),
+        };
+        let result = self.materialize_transport_files(capability, destination);
+        if cancelled.is_cancelled() {
+            bail!("transport Files materialization cancelled")
+        }
+        result
     }
 
     /// Production constructor: normalized scheduling must fail readiness when
@@ -4484,6 +4530,87 @@ mod tests {
             &["fsck", "--connectivity-only", "--no-dangling", &f.second],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn cancellation_during_large_files_stream_leaves_no_published_destination() {
+        let mut f = Fixture::new();
+        let mut content = vec![0u8; 32 * 1024 * 1024];
+        let mut state = 0x1234_5678u32;
+        for byte in &mut content {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            *byte = state as u8;
+        }
+        std::fs::remove_file(f.repo.join("a.txt")).unwrap();
+        std::fs::remove_file(f.repo.join("run.sh")).unwrap();
+        std::fs::write(f.repo.join("large.bin"), &content).unwrap();
+        git(&f.repo, &["add", "--all"]).unwrap();
+        git(&f.repo, &["commit", "--quiet", "-m", "large"]).unwrap();
+        f.second = git(&f.repo, &["rev-parse", "HEAD"]).unwrap();
+        let mut metadata = MetadataChunk::new();
+        let mut compressed = Vec::new();
+        let mut fragments = Vec::new();
+        for block in content.chunks(512 * 1024) {
+            let frame = zstd::encode_all(block, 1).unwrap();
+            let frame_index = metadata.frames.len() as u32;
+            let offset = compressed.len() as u64;
+            compressed.extend_from_slice(&frame);
+            metadata.frames.push(FrameInfo {
+                chunk_index: 0,
+                chunk_offset: offset,
+                compressed_len: frame.len() as u32,
+                raw_len: block.len() as u32,
+            });
+            fragments.push(Fragment {
+                frame_index,
+                frame_offset: 0,
+                raw_len: block.len() as u32,
+            });
+        }
+        metadata.files.push(FileEntry {
+            path: b"large.bin".to_vec(),
+            mode: 0o100644,
+            blob_sha1: hex::decode(git_object_oid("blob", &content)).unwrap(),
+            fragments,
+        });
+        let mut metadata_bytes = Vec::new();
+        metadata.write(&mut metadata_bytes).unwrap();
+        let manifest = ArtifactManifest::new(
+            &f.key(ArtifactKind::Files),
+            ArtifactPayload::Files(FilesArtifact {
+                target_commit_object: f.commit_blob(&f.second),
+                metadata: f.blob(&metadata_bytes),
+                archive_chunks: vec![f.blob(&compressed)],
+                zstd_dictionary: None,
+                gitlinks: vec![],
+            }),
+        )
+        .unwrap();
+        let evidence = manifest.store(&f.cas).unwrap();
+        let verifier = CasCompletionVerifier::new(f.cas.clone());
+        let capability = verifier
+            .verify_transport_artifact(evidence.key(), evidence.manifest())
+            .unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let target = parent.path().join("target");
+        let publication = crate::topup::BoundInstall::new(&target, "cancel-files").unwrap();
+        let staging = publication.staging_root().join("repo");
+        let token = tokio_util::sync::CancellationToken::new();
+        let worker_token = token.clone();
+        let worker = std::thread::spawn(move || {
+            verifier.materialize_transport_files_cancelled(capability, &staging, &worker_token)
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !publication.staging_root().join("repo").exists() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        token.cancel();
+        assert!(worker.join().unwrap().is_err());
+        drop(publication);
+        assert!(!target.exists());
     }
 
     #[cfg(unix)]

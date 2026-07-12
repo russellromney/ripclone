@@ -155,6 +155,7 @@ impl ClonePlanResponse {
                 if Some(target_commit.as_str()) != identity.target_commit {
                     bail!("clone plan target does not match resolved request target");
                 }
+                validate_verified_payload_binding(&payload, identity, &target_commit)?;
                 ClonePlanState::Ready {
                     payload: payload.into(),
                 }
@@ -227,6 +228,7 @@ impl ClonePlanResponse {
                         &self.repo,
                         &self.branch,
                         target,
+                        self.artifact_format_version,
                     )?,
                 }
             }
@@ -355,6 +357,29 @@ fn validate_transport_session(session: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_verified_payload_binding(
+    payload: &ClonePayload,
+    identity: CloneRequestIdentity<'_>,
+    target: &str,
+) -> Result<()> {
+    let binding = match payload {
+        ClonePayload::FilesArchive { binding, .. }
+        | ClonePayload::HeadArtifact { binding, .. }
+        | ClonePayload::FullArtifacts { binding, .. } => binding,
+        ClonePayload::PinnedBundle { .. } => return Ok(()),
+    };
+    if binding.workspace != identity.workspace
+        || binding.repo != identity.repo
+        || binding.branch != identity.branch
+        || binding.mode != identity.mode
+        || binding.target_commit != target
+        || binding.artifact_format_version != identity.artifact_format_version
+    {
+        bail!("verified exact clone binding does not match response envelope");
+    }
+    Ok(())
+}
+
 fn validate_payload(
     payload: &ClonePlanPayload,
     request_mode: SyncMode,
@@ -362,6 +387,7 @@ fn validate_payload(
     repo: &str,
     branch: &str,
     target: &str,
+    artifact_format_version: u32,
 ) -> Result<ClonePayload> {
     Ok(match payload {
         ClonePlanPayload::FilesArchive {
@@ -379,7 +405,7 @@ fn validate_payload(
                     branch: branch.to_owned(),
                     mode: request_mode,
                     target_commit: target.to_owned(),
-                    artifact_format_version: CLONE_ARTIFACT_FORMAT_VERSION,
+                    artifact_format_version,
                 },
             }
         }
@@ -402,7 +428,7 @@ fn validate_payload(
                     branch: branch.to_owned(),
                     mode: request_mode,
                     target_commit: target.to_owned(),
-                    artifact_format_version: CLONE_ARTIFACT_FORMAT_VERSION,
+                    artifact_format_version,
                 },
             }
         }
@@ -427,7 +453,7 @@ fn validate_payload(
                     branch: branch.to_owned(),
                     mode: request_mode,
                     target_commit: target.to_owned(),
-                    artifact_format_version: CLONE_ARTIFACT_FORMAT_VERSION,
+                    artifact_format_version,
                 },
             }
         }
@@ -633,6 +659,22 @@ mod tests {
             let decoded: ClonePlanResponse = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(decoded.validate_for(identity(mode)).unwrap(), plan);
         }
+    }
+
+    #[test]
+    fn server_rejects_rebound_exact_binding_before_serialization() {
+        let mut rebound = binding(SyncMode::Head);
+        rebound.repo = "attacker/repo".into();
+        let plan = ClonePlan::Ready {
+            target_commit: TARGET.into(),
+            payload: ClonePayload::HeadArtifact {
+                manifest: HEAD.into(),
+                discard_git: false,
+                transport_session: SESSION.into(),
+                binding: rebound,
+            },
+        };
+        assert!(ClonePlanResponse::from_verified_plan(identity(SyncMode::Head), plan).is_err());
     }
 
     #[test]
