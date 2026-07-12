@@ -665,6 +665,26 @@ async fn read_normalized_root_bounded(storage: &StorageRef, hash: &str) -> Resul
     .context("read normalized GC root task")?
 }
 
+async fn authenticated_normalized_graph(
+    scheduler: &Arc<dyn crate::artifact_scheduler_backend::ArtifactSchedulerPersistence>,
+    storage: &StorageRef,
+    manifest: crate::artifact_manifest::ArtifactManifest,
+) -> Result<Vec<crate::artifact_manifest::CasBlob>> {
+    let verifier = scheduler.completion_verifier();
+    let storage = storage.clone();
+    tokio::task::spawn_blocking(move || {
+        verifier.authenticated_referenced_blobs(&manifest, &mut |blob| {
+            crate::artifact_manifest::read_durable_descriptor_bounded(
+                &storage,
+                blob,
+                MAX_NORMALIZED_ROOT_BYTES,
+            )
+        })
+    })
+    .await
+    .context("authenticate normalized GC graph task")?
+}
+
 pub(crate) async fn collect_live_normalized_hashes(
     scheduler: Option<&Arc<dyn crate::artifact_scheduler_backend::ArtifactSchedulerPersistence>>,
     storage: &StorageRef,
@@ -700,11 +720,10 @@ pub(crate) async fn collect_live_normalized_hashes(
                         bail!("typed transport root repository identity mismatch")
                     }
                     reachable.extend(
-                        manifest
-                            .payload
-                            .referenced_blobs()
+                        authenticated_normalized_graph(scheduler, storage, manifest)
+                            .await?
                             .into_iter()
-                            .map(|blob| blob.hash.clone()),
+                            .map(|blob| blob.hash),
                     );
                 } else {
                     let capability = crate::pinned_bundle::validate_pinned_manifest_capability(
@@ -760,11 +779,10 @@ async fn collect_live_scheduler_hashes(
             }
             reachable.insert(root.manifest.clone());
             reachable.extend(
-                manifest
-                    .payload
-                    .referenced_blobs()
+                authenticated_normalized_graph(scheduler, storage, manifest)
+                    .await?
                     .into_iter()
-                    .map(|blob| blob.hash.clone()),
+                    .map(|blob| blob.hash),
             );
         }
         after = page.last().map(|root| root.artifact_id);
@@ -1626,6 +1644,164 @@ mod tests {
         assert!(!orphan_path.exists());
         assert!(cas.path(&info.history_levels[0].packs[0].pack).exists());
         assert!(cas.path(&info.history_levels[0].packs[0].idx).exists());
+    }
+
+    #[tokio::test]
+    async fn normalized_gc_retains_authenticated_nested_history_children() {
+        use crate::artifact_manifest::{
+            ArtifactManifest, ArtifactPayload, CasBlob, CasCompletionVerifier,
+            FULL_HISTORY_BASE_TIER, FullHistoryArtifact, FullHistoryLevel, FullHistoryLevelProof,
+        };
+        use crate::artifact_scheduler::{ArtifactKey, ArtifactKind, SchedulerLimits};
+        use crate::pack::PackBuilder;
+
+        fn git(repo: &std::path::Path, args: &[&str]) -> String {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("source");
+        crate::git::init(&repo).unwrap();
+        git(&repo, &["config", "user.name", "test"]);
+        git(&repo, &["config", "user.email", "test@example.invalid"]);
+        std::fs::write(repo.join("file"), b"one").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-m", "one"]);
+        let first = git(&repo, &["rev-parse", "HEAD"]);
+        std::fs::write(repo.join("file"), b"two").unwrap();
+        git(&repo, &["commit", "-am", "two"]);
+        let target = git(&repo, &["rev-parse", "HEAD"]);
+
+        let cas = Cas::new(tmp.path().join("cas")).unwrap();
+        let storage: StorageRef = Arc::new(TestRemoteStorage {
+            inner: local(cas.root()).unwrap(),
+        });
+        let verifier = Arc::new(CasCompletionVerifier::new(cas.clone()));
+        let scheduler = Arc::new(
+            crate::artifact_scheduler::ArtifactScheduler::open_with_verifier(
+                tmp.path().join("scheduler.db").to_str().unwrap(),
+                SchedulerLimits::default(),
+                verifier.clone(),
+            )
+            .await
+            .unwrap(),
+        );
+        let pairs = PackBuilder::new(&repo, &cas)
+            .build_depth_packs(&first, None, 1024 * 1024)
+            .unwrap()
+            .into_iter()
+            .map(
+                |(pack, pack_len, index, index_len)| crate::artifact_manifest::GitPackPair {
+                    pack: CasBlob {
+                        hash: pack,
+                        len: pack_len,
+                    },
+                    index: CasBlob {
+                        hash: index,
+                        len: index_len,
+                    },
+                },
+            )
+            .collect::<Vec<_>>();
+        let mut level = FullHistoryLevel {
+            tier: FULL_HISTORY_BASE_TIER,
+            base_exclusive: vec![],
+            tips: vec![first.clone()],
+            level_manifest: verifier
+                .store_history_level_manifest(pairs.clone())
+                .unwrap(),
+            proof: FullHistoryLevelProof::unsealed(),
+        };
+        let objects = crate::git::list_object_shas_with_depth(&repo, &first, None).unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        verifier
+            .verify_and_seal_history_level(
+                &mut level,
+                &pairs,
+                &objects,
+                &target,
+                &tokio_util::sync::CancellationToken::new(),
+                scratch.path(),
+            )
+            .unwrap();
+        let commit = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["cat-file", "commit", &target])
+            .output()
+            .unwrap()
+            .stdout;
+        let key = ArtifactKey {
+            workspace: "github".into(),
+            repo: "o/r".into(),
+            commit: target,
+            kind: ArtifactKind::FullHistory,
+            format_version: crate::artifact_manifest::ARTIFACT_FORMAT_VERSION,
+        };
+        let evidence = ArtifactManifest::new(
+            &key,
+            ArtifactPayload::FullHistory(FullHistoryArtifact {
+                target_commit_object: CasBlob {
+                    hash: cas.put(&commit).unwrap(),
+                    len: commit.len() as u64,
+                },
+                levels: vec![level.clone()],
+            }),
+        )
+        .unwrap()
+        .store(&cas)
+        .unwrap();
+        scheduler
+            .subscribe_consumer(&key, "gc-test", 60)
+            .await
+            .unwrap();
+        let claim = scheduler.claim("worker", 60).await.unwrap().unwrap();
+        assert!(
+            scheduler
+                .complete(&claim, "worker", &evidence)
+                .await
+                .unwrap()
+        );
+
+        let scheduler_trait: Arc<
+            dyn crate::artifact_scheduler_backend::ArtifactSchedulerPersistence,
+        > = scheduler;
+        let mut reachable = HashSet::new();
+        collect_live_normalized_hashes(Some(&scheduler_trait), &storage, &mut reachable)
+            .await
+            .unwrap();
+        assert!(reachable.contains(evidence.manifest()));
+        assert!(reachable.contains(&level.level_manifest.hash));
+        assert!(reachable.contains(&pairs[0].pack.hash));
+        assert!(reachable.contains(&pairs[0].index.hash));
+
+        // A root remains unusable when its signed nested graph cannot be read
+        // exactly. In particular, GC must not retain children from a corrupt
+        // level manifest merely because their descriptors were once valid.
+        std::fs::write(
+            cas.path(&level.level_manifest.hash),
+            vec![b'x'; level.level_manifest.len as usize],
+        )
+        .unwrap();
+        let mut poisoned = HashSet::new();
+        assert!(
+            collect_live_normalized_hashes(Some(&scheduler_trait), &storage, &mut poisoned)
+                .await
+                .is_err()
+        );
+        assert!(!poisoned.contains(&pairs[0].pack.hash));
+        assert!(!poisoned.contains(&pairs[0].index.hash));
     }
 
     #[tokio::test]

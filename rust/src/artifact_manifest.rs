@@ -246,6 +246,26 @@ pub struct CasBlob {
     pub len: u64,
 }
 
+pub(crate) fn read_durable_descriptor_bounded(
+    storage: &StorageRef,
+    blob: &CasBlob,
+    maximum: u64,
+) -> Result<Vec<u8>> {
+    Cas::validate_artifact_id(&blob.hash)?;
+    if blob.len == 0 || blob.len > maximum {
+        bail!("durable descriptor exceeds bounded read limit")
+    }
+    let declared = storage.size(&blob.hash)?;
+    if declared != blob.len {
+        bail!("durable descriptor length mismatch")
+    }
+    let bytes = storage.get(&blob.hash)?;
+    if bytes.len() as u64 != blob.len || crate::cas::hash(&bytes) != blob.hash {
+        bail!("durable descriptor bytes do not match CAS identity")
+    }
+    Ok(bytes)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GitPackPair {
@@ -1690,6 +1710,73 @@ impl CasCompletionVerifier {
         Ok(manifest)
     }
 
+    pub(crate) fn authenticated_referenced_blobs(
+        &self,
+        manifest: &ArtifactManifest,
+        load_level: &mut dyn FnMut(&CasBlob) -> Result<Vec<u8>>,
+    ) -> Result<Vec<CasBlob>> {
+        manifest.validate_envelope()?;
+        let mut blobs = Vec::new();
+        let mut seen = HashSet::new();
+        let mut push = |blob: CasBlob| -> Result<()> {
+            Cas::validate_artifact_id(&blob.hash)?;
+            if blob.len == 0 || !seen.insert(blob.hash.clone()) {
+                bail!("artifact graph contains an empty or duplicate descriptor")
+            }
+            blobs.push(blob);
+            Ok(())
+        };
+        match &manifest.payload {
+            ArtifactPayload::FullHistory(history) => {
+                if history.levels.len() > self.limits.packs {
+                    bail!("history graph contains too many levels")
+                }
+                push(history.target_commit_object.clone())?;
+                let mut pack_count = 0u64;
+                let mut pack_bytes = 0u64;
+                for level in &history.levels {
+                    self.verify_history_level_receipt(level)?;
+                    push(level.level_manifest.clone())?;
+                    let bytes = load_level(&level.level_manifest)?;
+                    if bytes.len() as u64 != level.level_manifest.len
+                        || crate::cas::hash(&bytes) != level.level_manifest.hash
+                    {
+                        bail!("history level manifest descriptor does not match fetched bytes")
+                    }
+                    let nested = self.decode_history_level_manifest(level, &bytes)?;
+                    pack_count = pack_count
+                        .checked_add(nested.packs.len() as u64)
+                        .context("history graph pack count overflow")?;
+                    if pack_count > self.limits.packs as u64 {
+                        bail!("history graph contains too many packs")
+                    }
+                    for pair in nested.packs {
+                        if pair.pack.len > self.limits.pack_bytes
+                            || pair.index.len > self.limits.pack_index_bytes
+                        {
+                            bail!("history graph pack descriptor exceeds verifier limits")
+                        }
+                        pack_bytes = pack_bytes
+                            .checked_add(pair.pack.len)
+                            .and_then(|value| value.checked_add(pair.index.len))
+                            .context("history graph byte count overflow")?;
+                        if pack_bytes > self.limits.total_pack_bytes {
+                            bail!("history graph exceeds aggregate pack byte limit")
+                        }
+                        push(pair.pack)?;
+                        push(pair.index)?;
+                    }
+                }
+            }
+            _ => {
+                for blob in manifest.payload.referenced_blobs() {
+                    push(blob.clone())?;
+                }
+            }
+        }
+        Ok(blobs)
+    }
+
     fn verify_history_level_receipt(&self, level: &FullHistoryLevel) -> Result<()> {
         // This O(levels) path relies on an authenticated receipt created only
         // after remote bytes were hashed. Routine sync checks durable descriptor
@@ -2587,6 +2674,14 @@ impl CompletionVerifier for CasCompletionVerifier {
             evidence.artifact_count(),
         )?;
         Ok(())
+    }
+
+    fn authenticated_referenced_blobs(
+        &self,
+        manifest: &ArtifactManifest,
+        load_level: &mut dyn FnMut(&CasBlob) -> Result<Vec<u8>>,
+    ) -> Result<Vec<CasBlob>> {
+        self.authenticated_referenced_blobs(manifest, load_level)
     }
 
     fn verify_owned(
@@ -3883,6 +3978,110 @@ mod tests {
         assert!(
             verifier
                 .verify_publication(&foreign, evidence.manifest())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn authenticated_graph_expands_nested_history_and_rejects_adversarial_shapes() {
+        let f = Fixture::new();
+        let verifier = CasCompletionVerifier::new(f.cas.clone());
+        let manifest = f.history();
+        let graph = verifier
+            .authenticated_referenced_blobs(&manifest, &mut |blob| f.cas.get(&blob.hash))
+            .unwrap();
+        let ArtifactPayload::FullHistory(history) = &manifest.payload else {
+            unreachable!()
+        };
+        let nested = verifier
+            .read_history_level_manifest(&history.levels[0])
+            .unwrap();
+        assert!(
+            graph
+                .iter()
+                .any(|blob| blob == &history.levels[0].level_manifest)
+        );
+        assert!(graph.iter().any(|blob| blob == &nested.packs[0].pack));
+        assert!(graph.iter().any(|blob| blob == &nested.packs[0].index));
+
+        assert!(
+            verifier
+                .authenticated_referenced_blobs(&manifest, &mut |_| bail!("missing"))
+                .is_err()
+        );
+        assert!(
+            verifier
+                .authenticated_referenced_blobs(&manifest, &mut |blob| {
+                    let mut bytes = f.cas.get(&blob.hash)?;
+                    bytes[0] ^= 1;
+                    Ok(bytes)
+                })
+                .is_err()
+        );
+
+        let mut duplicate_head = f.head();
+        let ArtifactPayload::Head(head) = &mut duplicate_head.payload else {
+            unreachable!()
+        };
+        head.packs.push(head.packs[0].clone());
+        duplicate_head.semantic_digest = semantic_digest(
+            duplicate_head.schema_version,
+            &duplicate_head.key,
+            &duplicate_head.payload,
+        )
+        .unwrap();
+        assert!(
+            verifier
+                .authenticated_referenced_blobs(&duplicate_head, &mut |_| unreachable!())
+                .is_err()
+        );
+
+        let mut excessive = history.clone();
+        excessive.levels =
+            vec![excessive.levels[0].clone(); ArtifactVerificationLimits::default().packs + 1];
+        let excessive = ArtifactManifest::new(
+            &f.key(ArtifactKind::FullHistory),
+            ArtifactPayload::FullHistory(excessive),
+        )
+        .unwrap();
+        assert!(
+            verifier
+                .authenticated_referenced_blobs(&excessive, &mut |_| unreachable!())
+                .is_err()
+        );
+
+        let packs = nested.packs;
+        let pretty = serde_json::to_string_pretty(&HistoryLevelManifest {
+            schema_version: HISTORY_LEVEL_MANIFEST_SCHEMA,
+            packs: packs.clone(),
+        })
+        .unwrap()
+        .into_bytes();
+        let mut noncanonical = history.clone();
+        noncanonical.levels[0].level_manifest = CasBlob {
+            hash: f.cas.put(&pretty).unwrap(),
+            len: pretty.len() as u64,
+        };
+        let objects = crate::git::list_object_shas_with_depth(&f.repo, &f.first, None).unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        verifier
+            .verify_and_seal_history_level(
+                &mut noncanonical.levels[0],
+                &packs,
+                &objects,
+                &f.second,
+                &tokio_util::sync::CancellationToken::new(),
+                scratch.path(),
+            )
+            .unwrap();
+        let noncanonical = ArtifactManifest::new(
+            &f.key(ArtifactKind::FullHistory),
+            ArtifactPayload::FullHistory(noncanonical),
+        )
+        .unwrap();
+        assert!(
+            verifier
+                .authenticated_referenced_blobs(&noncanonical, &mut |blob| f.cas.get(&blob.hash))
                 .is_err()
         );
     }

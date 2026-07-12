@@ -205,6 +205,7 @@ done
         let dir = tempfile::tempdir().unwrap();
         let recorder = write_recorder(dir.path());
         let out = dir.path().join("argv.txt");
+        let env_out = dir.path().join("argv.txt.env");
 
         let provider = ExecProvider::new(ExecProviderConfig {
             program: recorder,
@@ -223,13 +224,20 @@ done
             .await
             .unwrap();
 
-        // Fire-and-forget: give the short-lived recorder a moment to flush.
+        // Fire-and-forget: wait until the short-lived recorder has flushed
+        // both files. The argv file is written first, so its existence alone
+        // does not prove the following environment snapshot is complete.
         for _ in 0..50 {
-            if out.exists()
-                && std::fs::metadata(&out)
-                    .map(|m| m.len() > 0)
-                    .unwrap_or(false)
-            {
+            let argv_ready = std::fs::metadata(&out)
+                .map(|m| m.len() > 0)
+                .unwrap_or(false);
+            let env_ready = std::fs::read_to_string(&env_out)
+                .map(|contents| {
+                    contents.contains("RIPCLONE_QUEUE=libsql")
+                        && contents.contains("RIPCLONE_TOKEN=secret-token")
+                })
+                .unwrap_or(false);
+            if argv_ready && env_ready {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -244,7 +252,7 @@ done
             "size_class must be a single argv element, not shell-split; got {lines:?}"
         );
 
-        let env_recorded = std::fs::read_to_string(format!("{}.env", out.display())).unwrap();
+        let env_recorded = std::fs::read_to_string(env_out).unwrap();
         assert!(env_recorded.contains("RIPCLONE_QUEUE=libsql"));
         assert!(env_recorded.contains("RIPCLONE_TOKEN=secret-token"));
     }

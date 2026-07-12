@@ -474,6 +474,29 @@ fn update_len_prefixed(mac: &mut CompletionHmac, value: &[u8]) {
 pub trait CompletionVerifier: Send + Sync {
     fn identity(&self) -> &str;
     fn verify(&self, claim: &ClaimedArtifact, evidence: &CompletionEvidence) -> Result<()>;
+    /// Expand the immutable CAS graph delegated by an already-bound root.
+    /// FullHistory implementations must authenticate every nested level before
+    /// returning its physical pack/index children. The loader must return the
+    /// exact bytes for the supplied descriptor.
+    fn authenticated_referenced_blobs(
+        &self,
+        manifest: &crate::artifact_manifest::ArtifactManifest,
+        _load_level: &mut dyn FnMut(&crate::artifact_manifest::CasBlob) -> Result<Vec<u8>>,
+    ) -> Result<Vec<crate::artifact_manifest::CasBlob>> {
+        if matches!(
+            &manifest.payload,
+            crate::artifact_manifest::ArtifactPayload::FullHistory(history)
+                if !history.levels.is_empty()
+        ) {
+            bail!("completion verifier cannot authenticate nested history manifests")
+        }
+        Ok(manifest
+            .payload
+            .referenced_blobs()
+            .into_iter()
+            .cloned()
+            .collect())
+    }
     fn verify_owned(
         &self,
         claim: &ClaimedArtifact,
@@ -2439,8 +2462,8 @@ async fn preflight_sqlite_schema(
     // v5 is exclusively the exact union.
     let inventory_ok = match version {
         2 => {
-            ((tables == 5 && indexes == 3) || (tables == 6 && indexes == 4))
-                && (fence_tables == 0 || (fence_tables == 3 && fence_indexes == 0))
+            (tables == 5 && indexes == 3 && fence_tables == 3 && fence_indexes == 0)
+                || (tables == 6 && indexes == 4 && fence_tables == 0 && fence_indexes == 0)
         }
         3 => {
             (tables == 5 && indexes == 3 && fence_tables == 3 && fence_indexes == 1)
@@ -2457,6 +2480,29 @@ async fn preflight_sqlite_schema(
     };
     if !inventory_ok {
         bail!("sqlite artifact scheduler schema marker does not match an approved lineage")
+    }
+    if version == 2 && fence_tables == 3 {
+        let fence_ddl: Vec<(String, String)> = sqlx::query_as(
+            "SELECT name,sql FROM sqlite_master WHERE type='table' AND name IN(
+               'ready_publication_fence_sequence','ready_publication_fences','ready_publication_fence_members') ORDER BY name",
+        )
+        .fetch_all(&mut **connection)
+        .await?;
+        let actual = fence_ddl
+            .into_iter()
+            .map(|(name, sql)| (name, canonical_sqlite_ddl(&sql)))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let expected = [
+            ("ready_publication_fence_members", "createtableready_publication_fence_members(tokentextnotnull,generationintegernotnullcheck(generation>0),artifact_idintegernotnull,manifesttext,primarykey(token,artifact_id),foreignkey(token,generation)referencesready_publication_fences(token,generation)ondeletecascade,foreignkey(artifact_id)referencesartifact_jobs(id)ondeletecascade)"),
+            ("ready_publication_fence_sequence", "createtableready_publication_fence_sequence(idintegerprimarykeycheck(id=1),generationintegernotnullcheck(generation>=0))"),
+            ("ready_publication_fences", "createtableready_publication_fences(tokentextprimarykey,generationintegernotnulluniquecheck(generation>0),operation_idtextnotnullunique,expires_atintegernotnull,statetextnotnullcheck(statein('held','activation_unknown')),unique(token,generation))"),
+        ]
+        .into_iter()
+        .map(|(name, sql)| (name.to_owned(), sql.to_owned()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+        if actual != expected {
+            bail!("sqlite admission-v2 fence DDL differs from its released provenance")
+        }
     }
     if version >= 3 && fence_tables == 3 {
         let fence_ddl: Vec<(String, String)> = sqlx::query_as(
@@ -4807,6 +4853,65 @@ mod tests {
             ArtifactScheduler::open(&concurrent_path, Default::default())
         );
         assert!(first.is_ok() && second.is_ok());
+    }
+
+    #[tokio::test]
+    async fn v2_hybrids_and_forged_fences_fail_before_mutation_and_release_writer() {
+        async fn rejected_without_mutation(path: &str, pool: &SqlitePool) {
+            assert!(
+                ArtifactScheduler::open(path, Default::default())
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("PRAGMA user_version")
+                    .fetch_one(pool)
+                    .await
+                    .unwrap(),
+                2
+            );
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                sqlx::raw_sql("BEGIN IMMEDIATE; ROLLBACK").execute(pool),
+            )
+            .await
+            .expect("rejected migration retained sqlite writer lock")
+            .unwrap();
+        }
+
+        // Unreleased admission-shaped base without its fence protocol.
+        let (no_fences, _dir, no_fences_path) = scheduler(Default::default()).await;
+        sqlx::raw_sql("DROP TABLE ready_publication_fence_members; DROP TABLE ready_publication_fences; DROP TABLE ready_publication_fence_sequence; DROP TABLE artifact_base_retention; DROP TABLE artifact_gc_sweep; DROP TABLE artifact_transport_leases; PRAGMA user_version=2")
+            .execute(&no_fences.pool).await.unwrap();
+        rejected_without_mutation(&no_fences_path, &no_fences.pool).await;
+
+        // Unreleased transport-shaped base contaminated with admission fences.
+        let (transport_with_fences, _dir, transport_with_fences_path) =
+            scheduler(Default::default()).await;
+        sqlx::raw_sql("DROP TABLE artifact_base_retention; DROP TABLE artifact_gc_sweep; PRAGMA user_version=2")
+            .execute(&transport_with_fences.pool).await.unwrap();
+        rejected_without_mutation(&transport_with_fences_path, &transport_with_fences.pool).await;
+
+        // Exact admission inventory with a column-compatible but unreleased
+        // fence DDL (manifest was never NOT NULL in the released v2 schema).
+        let (forged, _dir, forged_path) = scheduler(Default::default()).await;
+        sqlx::raw_sql(
+            "DROP TABLE ready_publication_fence_members;
+             DROP TABLE ready_publication_fences;
+             DROP TABLE ready_publication_fence_sequence;
+             DROP TABLE artifact_base_retention;
+             DROP TABLE artifact_gc_sweep;
+             DROP TABLE artifact_transport_leases;
+             CREATE TABLE ready_publication_fence_sequence(id INTEGER PRIMARY KEY CHECK(id=1),generation INTEGER NOT NULL CHECK(generation>=0));
+             INSERT INTO ready_publication_fence_sequence(id,generation) VALUES(1,0);
+             CREATE TABLE ready_publication_fences(token TEXT PRIMARY KEY,generation INTEGER NOT NULL UNIQUE CHECK(generation>0),operation_id TEXT NOT NULL UNIQUE,expires_at INTEGER NOT NULL,state TEXT NOT NULL CHECK(state IN('held','activation_unknown')),UNIQUE(token,generation));
+             CREATE TABLE ready_publication_fence_members(token TEXT NOT NULL,generation INTEGER NOT NULL CHECK(generation>0),artifact_id INTEGER NOT NULL,manifest TEXT NOT NULL,PRIMARY KEY(token,artifact_id),FOREIGN KEY(token,generation) REFERENCES ready_publication_fences(token,generation) ON DELETE CASCADE,FOREIGN KEY(artifact_id) REFERENCES artifact_jobs(id) ON DELETE CASCADE);
+             PRAGMA user_version=2",
+        )
+        .execute(&forged.pool)
+        .await
+        .unwrap();
+        rejected_without_mutation(&forged_path, &forged.pool).await;
     }
 
     #[tokio::test]

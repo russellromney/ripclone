@@ -3293,12 +3293,21 @@ async fn typed_root_authorizes_hash(
         {
             return Ok(AuthorizedTypedRoot { allowed: false });
         }
-        let allowed = requested == root
-            || manifest
-                .payload
-                .referenced_blobs()
-                .iter()
-                .any(|blob| blob.hash == requested);
+        let verifier = scheduler.completion_verifier();
+        let storage = state.storage.clone();
+        let graph_manifest = manifest.clone();
+        let graph = tokio::task::spawn_blocking(move || {
+            verifier.authenticated_referenced_blobs(&graph_manifest, &mut |blob| {
+                crate::artifact_manifest::read_durable_descriptor_bounded(
+                    &storage,
+                    blob,
+                    MAX_TYPED_ROOT_MANIFEST_BYTES,
+                )
+            })
+        })
+        .await
+        .context("typed authorization graph task failed")??;
+        let allowed = requested == root || graph.iter().any(|blob| blob.hash == requested);
         return Ok(AuthorizedTypedRoot { allowed });
     }
     let capability = crate::pinned_bundle::validate_pinned_manifest_capability(
@@ -3610,37 +3619,27 @@ async fn hydrate_typed_publication(
     }
     state.cas.put_with_hash(manifest_hash, &manifest_bytes)?;
 
-    let mut blobs = manifest
-        .payload
-        .referenced_blobs()
-        .into_iter()
-        .cloned()
-        .collect::<Vec<_>>();
-    if let crate::artifact_manifest::ArtifactPayload::FullHistory(history) = &manifest.payload {
-        for level in &history.levels {
-            let bytes = read_storage_object_bounded(
-                state.storage.clone(),
-                level.level_manifest.hash.clone(),
+    let verifier = state
+        .artifact_verifier
+        .as_ref()
+        .context("normalized artifact verifier is not configured")?
+        .clone();
+    let graph_manifest = manifest.clone();
+    let graph_storage = state.storage.clone();
+    let graph_cas = state.cas.clone();
+    let blobs = tokio::task::spawn_blocking(move || {
+        verifier.authenticated_referenced_blobs(&graph_manifest, &mut |blob| {
+            let bytes = crate::artifact_manifest::read_durable_descriptor_bounded(
+                &graph_storage,
+                blob,
                 MAX_TYPED_ROOT_MANIFEST_BYTES,
-            )
-            .await?;
-            if bytes.len() as u64 != level.level_manifest.len {
-                anyhow::bail!("durable history level-manifest length mismatch");
-            }
-            state
-                .cas
-                .put_with_hash(&level.level_manifest.hash, &bytes)
-                .context("install authenticated history level manifest")?;
-            let nested: crate::artifact_manifest::HistoryLevelManifest =
-                serde_json::from_slice(&bytes).context("decode history level manifest")?;
-            if nested.schema_version != crate::artifact_manifest::HISTORY_LEVEL_MANIFEST_SCHEMA {
-                anyhow::bail!("unsupported history level-manifest schema");
-            }
-            for pair in nested.packs {
-                blobs.extend([pair.pack, pair.index]);
-            }
-        }
-    }
+            )?;
+            graph_cas.put_with_hash(&blob.hash, &bytes)?;
+            Ok(bytes)
+        })
+    })
+    .await
+    .context("hydrate authenticated artifact graph task failed")??;
     if blobs.len() > MAX_TYPED_PUBLICATION_OBJECTS {
         anyhow::bail!("typed publication has too many direct CAS objects");
     }
@@ -3716,11 +3715,20 @@ async fn republish_transport_root(state: &ServerState, root: &str) -> Result<()>
         .get(root)
         .context("read verified transport root")?;
     let manifest = crate::artifact_manifest::ArtifactManifest::validate_envelope_bytes(&bytes)?;
-    let mut hashes = manifest
-        .payload
-        .referenced_blobs()
+    let verifier = state
+        .artifact_verifier
+        .as_ref()
+        .context("normalized artifact verifier is not configured")?;
+    let mut hashes = verifier
+        .authenticated_referenced_blobs(&manifest, &mut |blob| {
+            let bytes = state.cas.get(&blob.hash)?;
+            if bytes.len() as u64 != blob.len || crate::cas::hash(&bytes) != blob.hash {
+                anyhow::bail!("local history level manifest does not match descriptor")
+            }
+            Ok(bytes)
+        })?
         .into_iter()
-        .map(|blob| blob.hash.clone())
+        .map(|blob| blob.hash)
         .collect::<Vec<_>>();
     hashes.push(root.to_owned());
     for hash in &hashes {
@@ -11099,6 +11107,7 @@ mod tests {
             .await
             .unwrap(),
         );
+        state.artifact_verifier = Some(verifier.clone());
         let repo_id = RepoId::github("acme/widget");
         state
             .ref_store
@@ -11168,6 +11177,8 @@ mod tests {
                 history_scratch.path(),
             )
             .unwrap();
+        let history_level_hash = history_level.level_manifest.hash.clone();
+        let history_pack_hash = history_packs[0].pack.hash.clone();
         let history = ArtifactManifest::new(
             &artifact_key(&repo_id, &target, ArtifactKind::FullHistory),
             ArtifactPayload::FullHistory(FullHistoryArtifact {
@@ -11245,6 +11256,7 @@ mod tests {
             evidence.insert(stored.key().kind, stored);
         }
         let head_manifest_hash = evidence[&ArtifactKind::Head].manifest().to_owned();
+        let history_manifest_hash = evidence[&ArtifactKind::FullHistory].manifest().to_owned();
         let server_cas = state.cas.clone();
         for _ in 0..3 {
             let claim = scheduler.claim("publisher", 60).await.unwrap().unwrap();
@@ -11258,6 +11270,34 @@ mod tests {
         }
         let scheduler_assert = scheduler.clone();
         state.artifact_scheduler = Some(scheduler);
+        assert!(
+            typed_root_authorizes_hash(
+                &state,
+                &repo_id,
+                &history_manifest_hash,
+                &history_level_hash,
+            )
+            .await
+            .unwrap()
+            .allowed
+        );
+        assert!(
+            typed_root_authorizes_hash(
+                &state,
+                &repo_id,
+                &history_manifest_hash,
+                &history_pack_hash,
+            )
+            .await
+            .unwrap()
+            .allowed
+        );
+        assert!(
+            !typed_root_authorizes_hash(&state, &repo_id, &head_manifest_hash, &history_pack_hash,)
+                .await
+                .unwrap()
+                .allowed
+        );
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
