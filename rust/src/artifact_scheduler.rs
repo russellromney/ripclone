@@ -2072,6 +2072,236 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn owned_build_preflights_before_start_and_completes_returned_evidence() {
+        use crate::artifact_scheduler_backend::{ArtifactSchedulerPersistence, OwnedArtifactBuild};
+
+        let (s, d, _) = scheduler(Default::default()).await;
+        let k = key("ws", "owned-build", ArtifactKind::Head);
+        s.schedule(&k).await.unwrap();
+        let claim = s.claim("worker", 5).await.unwrap().unwrap();
+        let stale = ClaimedArtifact {
+            record: ArtifactRecord {
+                lease_generation: claim.record.lease_generation + 1,
+                ..claim.record.clone()
+            },
+        };
+        let started = Arc::new(AtomicBool::new(false));
+        let start_flag = started.clone();
+        let stale_build = OwnedArtifactBuild::cooperative(move |_| async move {
+            start_flag.store(true, Ordering::SeqCst);
+            unreachable!("a stale build must never start")
+        });
+        assert!(
+            ArtifactSchedulerPersistence::run_owned_build(
+                &s,
+                &stale,
+                "worker",
+                stale_build,
+                5,
+                d.path(),
+            )
+            .await
+            .is_err()
+        );
+        assert!(!started.load(Ordering::SeqCst));
+
+        let returned = CompletionEvidence::new(k, "returned-by-owned-build").unwrap();
+        let expected = returned.clone();
+        let outcome = ArtifactSchedulerPersistence::run_owned_build(
+            &s,
+            &claim,
+            "worker",
+            OwnedArtifactBuild::cooperative(move |context| async move {
+                assert!(!context.cancelled.is_cancelled());
+                std::fs::write(context.scratch.join("proof"), b"ok")?;
+                Ok(returned)
+            }),
+            5,
+            d.path(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, ExecutionOutcome::Ready);
+        let record = s.get(claim.record.id).await.unwrap().unwrap();
+        assert_eq!(record.state, ArtifactState::Ready);
+        assert_eq!(record.manifest.as_deref(), Some(expected.manifest.as_str()));
+    }
+
+    #[tokio::test]
+    async fn owned_build_lease_loss_cancels_drains_and_never_publishes() {
+        use crate::artifact_scheduler_backend::{ArtifactSchedulerPersistence, OwnedArtifactBuild};
+
+        let (s, d, _) = scheduler(Default::default()).await;
+        let k = key("ws", "owned-build-loss", ArtifactKind::FullHistory);
+        s.schedule(&k).await.unwrap();
+        let claim = s.claim("worker", 2).await.unwrap().unwrap();
+        let child_observed_cancel = Arc::new(AtomicBool::new(false));
+        let child_drained = Arc::new(AtomicBool::new(false));
+        let observed = child_observed_cancel.clone();
+        let drained = child_drained.clone();
+        let result_evidence = CompletionEvidence::new(k, "must-not-publish").unwrap();
+        let runner = {
+            let scheduler = s.clone();
+            let owned_claim = claim.clone();
+            let scratch_root = d.path().to_path_buf();
+            tokio::spawn(async move {
+                ArtifactSchedulerPersistence::run_owned_build(
+                    &scheduler,
+                    &owned_claim,
+                    "worker",
+                    OwnedArtifactBuild::cooperative(move |context| async move {
+                        let cancelled = context.cancelled.clone();
+                        tokio::task::spawn_blocking(move || {
+                            while !cancelled.is_cancelled() {
+                                std::thread::sleep(Duration::from_millis(10));
+                            }
+                            observed.store(true, Ordering::SeqCst);
+                            std::thread::sleep(Duration::from_millis(40));
+                            drained.store(true, Ordering::SeqCst);
+                        })
+                        .await?;
+                        Ok(result_evidence)
+                    }),
+                    2,
+                    &scratch_root,
+                )
+                .await
+                .unwrap()
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        expire(&s, claim.record.id).await;
+        s.reconcile_expired().await.unwrap();
+        assert_eq!(runner.await.unwrap(), ExecutionOutcome::LostLease);
+        assert!(child_observed_cancel.load(Ordering::SeqCst));
+        assert!(child_drained.load(Ordering::SeqCst));
+        let record = s.get(claim.record.id).await.unwrap().unwrap();
+        assert_ne!(record.state, ArtifactState::Ready);
+        assert!(record.manifest.is_none());
+    }
+
+    #[tokio::test]
+    async fn owned_build_rejected_evidence_fails_attempt_and_cleans_scratch() {
+        use crate::artifact_scheduler_backend::{ArtifactSchedulerPersistence, OwnedArtifactBuild};
+
+        struct RejectReturnedEvidence;
+        impl CompletionVerifier for RejectReturnedEvidence {
+            fn identity(&self) -> &str {
+                "reject-returned-evidence-v1"
+            }
+
+            fn verify(&self, claim: &ClaimedArtifact, evidence: &CompletionEvidence) -> Result<()> {
+                validate_evidence(claim, evidence)?;
+                bail!("CAS receipt is corrupt")
+            }
+        }
+
+        let d = tempfile::tempdir().unwrap();
+        let db = d.path().join("rejected-owned-build.db");
+        let s = ArtifactScheduler::open_with_verifier(
+            db.to_string_lossy().as_ref(),
+            Default::default(),
+            Arc::new(RejectReturnedEvidence),
+        )
+        .await
+        .unwrap();
+        let k = key("ws", "rejected-evidence", ArtifactKind::Files);
+        s.schedule(&k).await.unwrap();
+        let claim = s.claim("worker", 5).await.unwrap().unwrap();
+        let scratch = d.path().join(format!(
+            "artifact-{}-lease-{}",
+            claim.record.id, claim.record.lease_generation
+        ));
+        let outcome = ArtifactSchedulerPersistence::run_owned_build(
+            &s,
+            &claim,
+            "worker",
+            OwnedArtifactBuild::cooperative(move |_| async move {
+                Ok(CompletionEvidence::new(k, "rejected-manifest").unwrap())
+            }),
+            5,
+            d.path(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, ExecutionOutcome::Failed);
+        let record = s.get(claim.record.id).await.unwrap().unwrap();
+        assert_eq!(record.state, ArtifactState::Failed);
+        assert!(record.manifest.is_none());
+        assert!(record.error.unwrap().contains("CAS receipt is corrupt"));
+        assert!(!scratch.exists());
+
+        let retry_key = key("ws", "wrong-evidence", ArtifactKind::Head);
+        s.schedule(&retry_key).await.unwrap();
+        let wrong_claim = s.claim("worker", 5).await.unwrap().unwrap();
+        let wrong_key = key("other-workspace", "wrong-evidence", ArtifactKind::Head);
+        assert_eq!(
+            ArtifactSchedulerPersistence::run_owned_build(
+                &s,
+                &wrong_claim,
+                "worker",
+                OwnedArtifactBuild::cooperative(move |_| async move {
+                    Ok(CompletionEvidence::new(wrong_key, "wrong-key").unwrap())
+                }),
+                5,
+                d.path(),
+            )
+            .await
+            .unwrap(),
+            ExecutionOutcome::Failed
+        );
+        assert_eq!(
+            s.get(wrong_claim.record.id).await.unwrap().unwrap().state,
+            ArtifactState::Failed
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocking_owned_build_does_not_starve_heartbeats() {
+        use crate::artifact_scheduler_backend::{ArtifactSchedulerPersistence, OwnedArtifactBuild};
+        use std::sync::Barrier;
+
+        let (s, d, _) = scheduler(Default::default()).await;
+        let k = key("ws", "blocking-heartbeat", ArtifactKind::Head);
+        s.schedule(&k).await.unwrap();
+        let claim = s.claim("worker", 2).await.unwrap().unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let build_barrier = barrier.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let runner = {
+            let scheduler = s.clone();
+            let owned_claim = claim.clone();
+            let root = d.path().to_path_buf();
+            tokio::spawn(async move {
+                ArtifactSchedulerPersistence::run_owned_build(
+                    &scheduler,
+                    &owned_claim,
+                    "worker",
+                    OwnedArtifactBuild::blocking(move |_| {
+                        let _ = started_tx.send(());
+                        build_barrier.wait();
+                        std::thread::sleep(Duration::from_millis(2_200));
+                        CompletionEvidence::new(k, "blocking-result")
+                    }),
+                    2,
+                    &root,
+                )
+                .await
+                .unwrap()
+            })
+        };
+        // This synchronous rendezvous would deadlock a current-thread runtime
+        // if the build closure were invoked directly on the Tokio worker.
+        started_rx.await.unwrap();
+        barrier.wait();
+        assert_eq!(runner.await.unwrap(), ExecutionOutcome::Ready);
+        assert_eq!(
+            s.get(claim.record.id).await.unwrap().unwrap().state,
+            ArtifactState::Ready
+        );
+    }
+
+    #[tokio::test]
     async fn global_kind_and_per_repo_expensive_caps_are_fleet_wide() {
         let limits = SchedulerLimits {
             total_running: 3,

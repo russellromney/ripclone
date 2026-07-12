@@ -11,9 +11,52 @@ use crate::artifact_scheduler::{
 };
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
+
+pub type OwnedArtifactBuildFuture =
+    Pin<Box<dyn Future<Output = Result<CompletionEvidence>> + Send + 'static>>;
+
+/// The primary unit of scheduler-owned artifact work.
+///
+/// The closure is not invoked until the persistence backend confirms the
+/// claim is still owned. Implementations must await every process or child
+/// task they start before returning so cancellation can drain the whole
+/// attempt before a successor is allowed to publish.
+pub struct OwnedArtifactBuild(
+    Box<dyn FnOnce(ExecutionContext) -> OwnedArtifactBuildFuture + Send + 'static>,
+);
+
+impl OwnedArtifactBuild {
+    pub fn cooperative<F, Fut>(build: F) -> Self
+    where
+        F: FnOnce(ExecutionContext) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<CompletionEvidence>> + Send + 'static,
+    {
+        Self(Box::new(move |context| Box::pin(build(context))))
+    }
+
+    /// Adapt synchronous artifact construction without blocking Tokio's lease
+    /// heartbeat driver. The blocking child is always awaited, so cancellation
+    /// and attempt completion retain a single drain boundary.
+    pub fn blocking<F>(build: F) -> Self
+    where
+        F: FnOnce(ExecutionContext) -> Result<CompletionEvidence> + Send + 'static,
+    {
+        Self::cooperative(move |context| async move {
+            tokio::task::spawn_blocking(move || build(context))
+                .await
+                .context("owned blocking artifact build did not join")?
+        })
+    }
+
+    fn start(self, context: ExecutionContext) -> OwnedArtifactBuildFuture {
+        (self.0)(context)
+    }
+}
 
 struct PersistenceExecutionGuard {
     cancel: CancellationToken,
@@ -120,6 +163,143 @@ pub trait ArtifactSchedulerPersistence: Send + Sync {
         &self,
     ) -> Result<Vec<(ArtifactKind, crate::artifact_scheduler::ArtifactState, u64)>>;
 
+    /// Run one evidence-producing artifact build under a fenced database
+    /// lease. Ownership is checked before `build` is invoked. The lease is
+    /// heartbeated while it runs, and the exact evidence returned by this
+    /// owned attempt is passed to the backend's fenced `complete` operation.
+    async fn run_owned_build(
+        &self,
+        claim: &ClaimedArtifact,
+        owner: &str,
+        build: OwnedArtifactBuild,
+        lease_secs: i64,
+        scratch_root: &Path,
+    ) -> Result<ExecutionOutcome> {
+        validate_lease(owner, lease_secs)?;
+        if !self.owns(claim, owner).await? {
+            bail!("artifact lease is not currently owned")
+        }
+
+        let scratch = scratch_root.join(format!(
+            "artifact-{}-lease-{}",
+            claim.record.id, claim.record.lease_generation
+        ));
+        std::fs::create_dir(&scratch)
+            .with_context(|| format!("create fenced scratch {}", scratch.display()))?;
+        let cancel = CancellationToken::new();
+        let mut guard = PersistenceExecutionGuard {
+            cancel: cancel.clone(),
+            scratch: scratch.clone(),
+            armed: true,
+        };
+        let context = ExecutionContext {
+            cancelled: cancel.clone(),
+            scratch: scratch.clone(),
+        };
+        // Spawn only after the ownership preflight above. The join handle also
+        // turns a build panic into an ordinary failed attempt we can drain.
+        let mut running = tokio::spawn(build.start(context));
+        let mut interval =
+            tokio::time::interval(Duration::from_secs((lease_secs / 3).max(1) as u64));
+        interval.tick().await;
+
+        let build_result = loop {
+            tokio::select! {
+                result = &mut running => break Some(result),
+                _ = interval.tick() => match self.heartbeat(claim, owner, lease_secs).await {
+                    Ok(true) => {}
+                    Ok(false) => break None,
+                    Err(error) => {
+                        cancel.cancel();
+                        let _ = running.await;
+                        let _ = std::fs::remove_dir_all(&scratch);
+                        guard.armed = false;
+                        return Err(error).context("artifact heartbeat failed after draining build");
+                    }
+                }
+            }
+        };
+
+        let Some(build_result) = build_result else {
+            cancel.cancel();
+            let _ = running.await;
+            let _ = std::fs::remove_dir_all(&scratch);
+            guard.armed = false;
+            return Ok(ExecutionOutcome::LostLease);
+        };
+
+        let evidence = match build_result {
+            Ok(Ok(evidence)) => evidence,
+            Ok(Err(error)) => {
+                cancel.cancel();
+                let message = error.to_string();
+                let _ = std::fs::remove_dir_all(&scratch);
+                if self.owns(claim, owner).await? {
+                    let failed = self
+                        .fail(claim, owner, FailureClass::Retryable, &message)
+                        .await?;
+                    guard.armed = false;
+                    return Ok(if failed {
+                        ExecutionOutcome::Failed
+                    } else {
+                        ExecutionOutcome::LostLease
+                    });
+                }
+                guard.armed = false;
+                return Ok(ExecutionOutcome::LostLease);
+            }
+            Err(error) => {
+                cancel.cancel();
+                let message = if error.is_panic() {
+                    "artifact build panicked".to_owned()
+                } else {
+                    format!("artifact build cancelled: {error}")
+                };
+                let _ = std::fs::remove_dir_all(&scratch);
+                if self.owns(claim, owner).await? {
+                    let failed = self
+                        .fail(claim, owner, FailureClass::Retryable, &message)
+                        .await?;
+                    guard.armed = false;
+                    return Ok(if failed {
+                        ExecutionOutcome::Failed
+                    } else {
+                        ExecutionOutcome::LostLease
+                    });
+                }
+                guard.armed = false;
+                return Ok(ExecutionOutcome::LostLease);
+            }
+        };
+
+        if let Err(error) = validate_evidence(claim, &evidence) {
+            cancel.cancel();
+            let message = format!("artifact build returned invalid completion evidence: {error}");
+            let _ = std::fs::remove_dir_all(&scratch);
+            let outcome = fail_still_owned(self, claim, owner, &message).await?;
+            guard.armed = false;
+            return Ok(outcome);
+        }
+        let ready = match self.complete(claim, owner, &evidence).await {
+            Ok(ready) => ready,
+            Err(error) => {
+                cancel.cancel();
+                let message = format!("artifact completion evidence was rejected: {error}");
+                let _ = std::fs::remove_dir_all(&scratch);
+                let outcome = fail_still_owned(self, claim, owner, &message).await?;
+                guard.armed = false;
+                return Ok(outcome);
+            }
+        };
+        let _ = std::fs::remove_dir_all(&scratch);
+        guard.armed = false;
+        Ok(if ready {
+            ExecutionOutcome::Ready
+        } else {
+            ExecutionOutcome::LostLease
+        })
+    }
+
     /// Backend-independent worker protocol. Persistence implementations only
     /// provide fenced primitives; this method guarantees ownership preflight,
     /// internal heartbeats, cooperative cancellation, child draining, and
@@ -220,6 +400,27 @@ pub trait ArtifactSchedulerPersistence: Send + Sync {
             ExecutionOutcome::LostLease
         })
     }
+}
+
+async fn fail_still_owned<P: ArtifactSchedulerPersistence + ?Sized>(
+    persistence: &P,
+    claim: &ClaimedArtifact,
+    owner: &str,
+    message: &str,
+) -> Result<ExecutionOutcome> {
+    if !persistence.owns(claim, owner).await? {
+        return Ok(ExecutionOutcome::LostLease);
+    }
+    Ok(
+        if persistence
+            .fail(claim, owner, FailureClass::Retryable, message)
+            .await?
+        {
+            ExecutionOutcome::Failed
+        } else {
+            ExecutionOutcome::LostLease
+        },
+    )
 }
 
 #[async_trait]
