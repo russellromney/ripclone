@@ -88,6 +88,7 @@ pub mod client;
 #[doc(hidden)]
 pub mod clone_metrics;
 pub mod clone_plan;
+pub mod clone_transport;
 pub mod clonepack;
 pub mod config;
 /// Provider-agnostic compute dispatch (`RIPCLONE_DISPATCH=fly|exec|http|mock`).
