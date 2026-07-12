@@ -6,7 +6,7 @@
 //! visible. Poll/webhook traffic never repairs an unchanged commit; explicit
 //! install/API/button requests may idempotently ensure it.
 
-use crate::artifact_scheduler::{ArtifactKind, ObservationSnapshot, ScheduleOutcome};
+use crate::artifact_scheduler::{ArtifactKind, FailureClass, ObservationSnapshot};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 
@@ -86,15 +86,33 @@ pub enum BranchSyncOutcome {
     Ensured {
         commit: String,
         generation: u64,
-        artifacts: Vec<(ArtifactKind, ScheduleOutcome)>,
+        artifacts: Vec<(ArtifactKind, ArtifactIntentOutcome)>,
     },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TipObservationOutcome {
-    Advanced { generation: u64 },
-    Unchanged { generation: u64 },
-    Stale { current_generation: u64 },
+pub enum ArtifactIntentOutcome {
+    Runnable(i64),
+    Subscribed(i64),
+    Ready(i64),
+    /// Durable desired work that is waiting for runnable-lane capacity.
+    Deferred(i64),
+    Failed(i64, FailureClass),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArtifactObservationOutcome {
+    /// Branch target, exact source root, and every requested mode are durable
+    /// in one transaction. `advanced` is false for an idempotent same-tip
+    /// ensure or when another observer committed the same target first.
+    Recorded {
+        generation: u64,
+        advanced: bool,
+        artifacts: Vec<(ArtifactKind, ArtifactIntentOutcome)>,
+    },
+    Stale {
+        current_generation: u64,
+    },
 }
 
 #[async_trait]
@@ -130,28 +148,18 @@ pub trait ArtifactObservation: Send + Sync {
         branch: &str,
     ) -> Result<ObservationSnapshot>;
 
-    /// Record the exact branch target under the snapshot CAS without admitting
-    /// artifact work. This durable movement must succeed independently of
-    /// per-mode backlog pressure.
-    async fn record_tip(
+    /// Atomically record the exact branch target, source-root retention, and a
+    /// durable intent for every requested mode under the snapshot CAS. Lane
+    /// pressure may make an intent Deferred, but may not roll back the target,
+    /// source root, or another mode. Runnable admission/wakeup occurs after this
+    /// transaction and is never the first durable memory of desired work.
+    async fn record_tip_and_intents(
         &self,
         snapshot: &ObservationSnapshot,
-        commit: &str,
-    ) -> Result<TipObservationOutcome>;
-
-    /// Independently ensure every mode. Implementations must durably remember
-    /// each requested mode even when its runnable lane is saturated: capacity
-    /// may defer execution, but must not roll back another mode or the recorded
-    /// branch target. Retryable failures obey the configured retry cap;
-    /// permanent/dead-lettered work is never revived.
-    async fn ensure_exact(
-        &self,
-        workspace: &str,
-        repo: &str,
-        commit: &str,
+        source: &DurableSourceSnapshot,
         kinds: &[ArtifactKind],
         format_version: u32,
-    ) -> Result<Vec<(ArtifactKind, ScheduleOutcome)>>;
+    ) -> Result<ArtifactObservationOutcome>;
 }
 
 pub struct NormalizedSyncCoordinator<R, S, O> {
@@ -207,50 +215,22 @@ where
             validate_source_identity(request, &commit, &source)?;
             match self
                 .observations
-                .record_tip(&before, &commit)
+                .record_tip_and_intents(&before, &source, &kinds, request.format_version)
                 .await
-                .context("publish normalized branch observation")?
+                .context("atomically publish branch target, source root, and artifact intents")?
             {
-                TipObservationOutcome::Advanced { generation } => {
-                    let artifacts = self
-                        .observations
-                        .ensure_exact(
-                            &request.workspace,
-                            &request.repo,
-                            &commit,
-                            &kinds,
-                            request.format_version,
-                        )
-                        .await
-                        .context("ensure independently scheduled artifact work")?;
+                ArtifactObservationOutcome::Recorded {
+                    generation,
+                    artifacts,
+                    ..
+                } => {
                     return Ok(BranchSyncOutcome::Ensured {
                         commit,
                         generation,
                         artifacts,
                     });
                 }
-                TipObservationOutcome::Unchanged { generation } => {
-                    if request.intent == SyncIntent::ObserveMovement {
-                        return Ok(BranchSyncOutcome::Unchanged { commit, generation });
-                    }
-                    let artifacts = self
-                        .observations
-                        .ensure_exact(
-                            &request.workspace,
-                            &request.repo,
-                            &commit,
-                            &kinds,
-                            request.format_version,
-                        )
-                        .await
-                        .context("ensure concurrently observed artifact work")?;
-                    return Ok(BranchSyncOutcome::Ensured {
-                        commit,
-                        generation,
-                        artifacts,
-                    });
-                }
-                TipObservationOutcome::Stale { .. } => {
+                ArtifactObservationOutcome::Stale { .. } => {
                     // Re-resolve the provider. Reusing `commit` here could let a
                     // delayed webhook or force-push loser regress the branch.
                 }
@@ -347,9 +327,8 @@ mod tests {
     #[derive(Clone)]
     struct Observations {
         snapshots: Arc<Mutex<VecDeque<ObservationSnapshot>>>,
-        outcomes: Arc<Mutex<VecDeque<TipObservationOutcome>>>,
+        outcomes: Arc<Mutex<VecDeque<ArtifactObservationOutcome>>>,
         observed: Arc<Mutex<Vec<String>>>,
-        ensured: Arc<Mutex<Vec<String>>>,
     }
     #[async_trait]
     impl ArtifactObservation for Observations {
@@ -362,34 +341,20 @@ mod tests {
                 .expect("observation snapshot"))
         }
 
-        async fn record_tip(
+        async fn record_tip_and_intents(
             &self,
             _: &ObservationSnapshot,
-            commit: &str,
-        ) -> Result<TipObservationOutcome> {
-            self.observed.lock().unwrap().push(commit.to_owned());
+            source: &DurableSourceSnapshot,
+            _: &[ArtifactKind],
+            _: u32,
+        ) -> Result<ArtifactObservationOutcome> {
+            self.observed.lock().unwrap().push(source.commit.to_owned());
             Ok(self
                 .outcomes
                 .lock()
                 .unwrap()
                 .pop_front()
                 .expect("observation outcome"))
-        }
-
-        async fn ensure_exact(
-            &self,
-            _: &str,
-            _: &str,
-            commit: &str,
-            kinds: &[ArtifactKind],
-            _: u32,
-        ) -> Result<Vec<(ArtifactKind, ScheduleOutcome)>> {
-            self.ensured.lock().unwrap().push(commit.to_owned());
-            Ok(kinds
-                .iter()
-                .enumerate()
-                .map(|(i, kind)| (*kind, ScheduleOutcome::Enqueued(i as i64 + 1)))
-                .collect())
         }
     }
 
@@ -406,7 +371,7 @@ mod tests {
     fn fixture(
         commits: Vec<Result<&str, &str>>,
         snapshots: Vec<ObservationSnapshot>,
-        outcomes: Vec<TipObservationOutcome>,
+        outcomes: Vec<ArtifactObservationOutcome>,
     ) -> (
         NormalizedSyncCoordinator<Resolver, Sources, Observations>,
         Resolver,
@@ -431,7 +396,6 @@ mod tests {
             snapshots: Arc::new(Mutex::new(snapshots.into())),
             outcomes: Arc::new(Mutex::new(outcomes.into())),
             observed: Arc::new(Mutex::new(Vec::new())),
-            ensured: Arc::new(Mutex::new(Vec::new())),
         };
         (
             NormalizedSyncCoordinator::new(resolver.clone(), sources.clone(), observations.clone()),
@@ -452,8 +416,34 @@ mod tests {
         }
     }
 
-    fn scheduled(generation: u64) -> TipObservationOutcome {
-        TipObservationOutcome::Advanced { generation }
+    fn scheduled(generation: u64) -> ArtifactObservationOutcome {
+        ArtifactObservationOutcome::Recorded {
+            generation,
+            advanced: true,
+            artifacts: vec![
+                (ArtifactKind::Head, ArtifactIntentOutcome::Runnable(1)),
+                (
+                    ArtifactKind::FullHistory,
+                    ArtifactIntentOutcome::Deferred(2),
+                ),
+                (ArtifactKind::Files, ArtifactIntentOutcome::Runnable(3)),
+            ],
+        }
+    }
+
+    fn already_recorded(generation: u64) -> ArtifactObservationOutcome {
+        ArtifactObservationOutcome::Recorded {
+            generation,
+            advanced: false,
+            artifacts: vec![
+                (ArtifactKind::Head, ArtifactIntentOutcome::Ready(1)),
+                (
+                    ArtifactKind::FullHistory,
+                    ArtifactIntentOutcome::Subscribed(2),
+                ),
+                (ArtifactKind::Files, ArtifactIntentOutcome::Deferred(3)),
+            ],
+        }
     }
 
     #[tokio::test]
@@ -474,7 +464,6 @@ mod tests {
         assert_eq!(*resolver.calls.lock().unwrap(), 1);
         assert!(sources.calls.lock().unwrap().is_empty());
         assert!(observations.observed.lock().unwrap().is_empty());
-        assert!(observations.ensured.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -495,6 +484,9 @@ mod tests {
                 ref artifacts,
                 ..
             } if artifacts.len() == 3
+                && artifacts.iter().any(|(kind, state)|
+                    *kind == ArtifactKind::FullHistory
+                        && matches!(state, ArtifactIntentOutcome::Deferred(2)))
         ));
         assert_eq!(*sources.calls.lock().unwrap(), vec![C2]);
         assert_eq!(*observations.observed.lock().unwrap(), vec![C2]);
@@ -522,7 +514,7 @@ mod tests {
             vec![Ok(C2), Ok(C3)],
             vec![snapshot(Some(1), Some(C1)), snapshot(Some(2), Some(C2))],
             vec![
-                TipObservationOutcome::Stale {
+                ArtifactObservationOutcome::Stale {
                     current_generation: 2,
                 },
                 scheduled(3),
@@ -546,7 +538,7 @@ mod tests {
         let (coordinator, _, sources, observations) = fixture(
             vec![Ok(C1)],
             vec![snapshot(Some(9), Some(C1))],
-            vec![TipObservationOutcome::Unchanged { generation: 9 }],
+            vec![already_recorded(9)],
         );
         let outcome = coordinator
             .sync_branch(&request(SyncIntent::EnsureCurrent))
@@ -558,7 +550,6 @@ mod tests {
                 if artifacts.len() == 3
         ));
         assert_eq!(*sources.calls.lock().unwrap(), vec![C1]);
-        assert_eq!(*observations.ensured.lock().unwrap(), vec![C1]);
         assert_eq!(*observations.observed.lock().unwrap(), vec![C1]);
     }
 
@@ -568,10 +559,10 @@ mod tests {
             vec![Ok(C1), Ok(C2)],
             vec![snapshot(Some(1), Some(C1)), snapshot(Some(2), Some(C2))],
             vec![
-                TipObservationOutcome::Stale {
+                ArtifactObservationOutcome::Stale {
                     current_generation: 2,
                 },
-                TipObservationOutcome::Unchanged { generation: 2 },
+                already_recorded(2),
             ],
         );
         let outcome = coordinator
@@ -585,7 +576,6 @@ mod tests {
         assert_eq!(*resolver.calls.lock().unwrap(), 2);
         assert_eq!(*sources.calls.lock().unwrap(), vec![C1, C2]);
         assert_eq!(*observations.observed.lock().unwrap(), vec![C1, C2]);
-        assert_eq!(*observations.ensured.lock().unwrap(), vec![C2]);
     }
 
     #[tokio::test]
@@ -593,7 +583,7 @@ mod tests {
         let (coordinator, _, sources, observations) = fixture(
             vec![Ok(C2)],
             vec![snapshot(Some(1), Some(C1))],
-            vec![TipObservationOutcome::Unchanged { generation: 2 }],
+            vec![already_recorded(2)],
         );
         let outcome = coordinator
             .sync_branch(&request(SyncIntent::EnsureCurrent))
@@ -605,7 +595,6 @@ mod tests {
         ));
         assert_eq!(*sources.calls.lock().unwrap(), vec![C2]);
         assert_eq!(*observations.observed.lock().unwrap(), vec![C2]);
-        assert_eq!(*observations.ensured.lock().unwrap(), vec![C2]);
     }
 
     #[tokio::test]
@@ -656,16 +645,16 @@ mod tests {
                 snapshot(Some(3), Some(C3)),
             ],
             vec![
-                TipObservationOutcome::Stale {
+                ArtifactObservationOutcome::Stale {
                     current_generation: 1,
                 },
-                TipObservationOutcome::Stale {
+                ArtifactObservationOutcome::Stale {
                     current_generation: 2,
                 },
-                TipObservationOutcome::Stale {
+                ArtifactObservationOutcome::Stale {
                     current_generation: 3,
                 },
-                TipObservationOutcome::Stale {
+                ArtifactObservationOutcome::Stale {
                     current_generation: 4,
                 },
             ],
