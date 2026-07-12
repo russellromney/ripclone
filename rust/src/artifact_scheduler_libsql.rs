@@ -583,9 +583,25 @@ async fn validate_schema(c: &Connection) -> Result<()> {
             bail!("libsql scheduler index {index} differs from schema version")
         }
     }
-    let invalid=one_i64(c,"SELECT (SELECT count(*) FROM artifact_jobs WHERE format_version IS NULL OR format_version NOT BETWEEN 1 AND 4294967295 OR state NOT IN('queued','running','ready','failed') OR kind NOT IN('head','full_history','files') OR lease_generation IS NULL OR claim_attempts IS NULL OR retry_count IS NULL)+(SELECT count(*) FROM scheduler_state WHERE id<>1 OR fairness_cursor NOT BETWEEN 0 AND 3 OR workspace_cursor IS NULL OR config_fingerprint IS NULL)",vec![]).await?;
-    if invalid != 0 {
-        bail!("libsql artifact scheduler data violates schema invariants")
+    let invalid_jobs=one_i64(c,"SELECT count(*) FROM artifact_jobs WHERE state IS NULL OR typeof(state)<>'text' OR state NOT IN('queued','running','ready','failed') OR kind IS NULL OR typeof(kind)<>'text' OR kind NOT IN('head','full_history','files') OR format_version IS NULL OR typeof(format_version)<>'integer' OR format_version NOT BETWEEN 1 AND 4294967295 OR typeof(id)<>'integer' OR typeof(workspace)<>'text' OR typeof(repo)<>'text' OR typeof(commit_oid)<>'text' OR typeof(lease_generation)<>'integer' OR lease_generation<0 OR typeof(claim_attempts)<>'integer' OR claim_attempts NOT BETWEEN 0 AND 4294967295 OR typeof(retry_count)<>'integer' OR retry_count NOT BETWEEN 0 AND 4294967295 OR typeof(created_at)<>'integer' OR typeof(updated_at)<>'integer' OR (owner IS NOT NULL AND typeof(owner)<>'text') OR (heartbeat_at IS NOT NULL AND typeof(heartbeat_at)<>'integer') OR (lease_expires_at IS NOT NULL AND typeof(lease_expires_at)<>'integer') OR (manifest IS NOT NULL AND typeof(manifest)<>'text') OR (error IS NOT NULL AND typeof(error)<>'text') OR (failure_class IS NOT NULL AND (typeof(failure_class)<>'text' OR failure_class NOT IN('retryable','permanent','dead_letter'))) OR (state='running' AND (owner IS NULL OR length(trim(owner))=0 OR lease_expires_at IS NULL)) OR (state='ready' AND (manifest IS NULL OR length(trim(manifest))=0))",vec![]).await?;
+    if invalid_jobs != 0 {
+        bail!("libsql artifact scheduler contains invalid artifact jobs")
+    }
+    let invalid_observations=one_i64(c,"SELECT count(*) FROM artifact_observations a LEFT JOIN artifact_jobs d ON d.id=a.desired_artifact_id AND d.workspace=a.workspace AND d.repo=a.repo AND d.kind=a.kind AND d.commit_oid=a.desired_commit AND d.format_version=a.format_version AND d.format_version BETWEEN 1 AND 4294967295 LEFT JOIN artifact_jobs p ON p.id=a.published_artifact_id AND p.workspace=a.workspace AND p.repo=a.repo AND p.kind=a.kind AND p.format_version=a.format_version AND p.state='ready' AND p.manifest IS NOT NULL AND length(trim(p.manifest))>0 WHERE typeof(a.workspace)<>'text' OR typeof(a.repo)<>'text' OR typeof(a.branch)<>'text' OR typeof(a.kind)<>'text' OR a.kind NOT IN('head','full_history','files') OR typeof(a.desired_commit)<>'text' OR typeof(a.desired_artifact_id)<>'integer' OR typeof(a.desired_generation)<>'integer' OR a.desired_generation<1 OR (a.published_artifact_id IS NOT NULL AND typeof(a.published_artifact_id)<>'integer') OR typeof(a.format_version)<>'integer' OR a.format_version NOT BETWEEN 1 AND 4294967295 OR typeof(a.observed_at)<>'integer' OR d.id IS NULL OR (a.published_artifact_id IS NOT NULL AND p.id IS NULL)",vec![]).await?;
+    if invalid_observations != 0 {
+        bail!("libsql artifact scheduler contains invalid artifact observations")
+    }
+    let invalid_branches=one_i64(c,"SELECT count(*) FROM branch_observations WHERE typeof(workspace)<>'text' OR typeof(repo)<>'text' OR typeof(branch)<>'text' OR typeof(generation)<>'integer' OR generation<1 OR typeof(desired_commit)<>'text' OR typeof(updated_at)<>'integer'",vec![]).await?;
+    if invalid_branches != 0 {
+        bail!("libsql artifact scheduler contains invalid branch observations")
+    }
+    let invalid_consumers=one_i64(c,"SELECT count(*) FROM artifact_consumers WHERE typeof(artifact_id)<>'integer' OR typeof(consumer_id)<>'text' OR length(trim(consumer_id))=0 OR typeof(expires_at)<>'integer'",vec![]).await?;
+    if invalid_consumers != 0 {
+        bail!("libsql artifact scheduler contains invalid consumers")
+    }
+    let invalid_control=one_i64(c,"SELECT count(*) FROM scheduler_state WHERE id<>1 OR typeof(id)<>'integer' OR typeof(fairness_cursor)<>'integer' OR fairness_cursor NOT BETWEEN 0 AND 3 OR typeof(workspace_cursor)<>'text' OR typeof(config_fingerprint)<>'text'",vec![]).await?;
+    if invalid_control != 0 {
+        bail!("libsql artifact scheduler contains invalid control state")
     }
     Ok(())
 }
@@ -799,6 +815,18 @@ mod tests {
         LibsqlArtifactScheduler::from_database(db(url).await, limits, Arc::new(Accept))
             .await
             .unwrap()
+    }
+    async fn startup_error(url: &str) -> String {
+        match LibsqlArtifactScheduler::from_database(
+            db(url).await,
+            Default::default(),
+            Arc::new(Accept),
+        )
+        .await
+        {
+            Ok(_) => panic!("expected scheduler startup rejection"),
+            Err(error) => error.to_string(),
+        }
     }
 
     #[tokio::test]
@@ -1044,6 +1072,76 @@ mod tests {
             LibsqlArtifactScheduler::from_database(d, Default::default(), Arc::new(Accept))
                 .await
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_schema_corrupt_rows_and_indexes_fail_closed() {
+        let Some(s) = server().await else { return };
+        let a = scheduler(&s.url, Default::default()).await;
+        a.schedule(&key("running-null", ArtifactKind::Head))
+            .await
+            .unwrap();
+        a.conn().await.unwrap().execute("UPDATE artifact_jobs SET state='running',owner=NULL,lease_expires_at=NULL WHERE commit_oid='running-null'",()).await.unwrap();
+        assert!(
+            startup_error(&s.url)
+                .await
+                .contains("invalid artifact jobs")
+        );
+
+        let Some(s) = server().await else { return };
+        let a = scheduler(&s.url, Default::default()).await;
+        a.observe("w", "r", "main", "observed", &[ArtifactKind::Head], 1, None)
+            .await
+            .unwrap();
+        a.conn()
+            .await
+            .unwrap()
+            .execute(
+                "UPDATE artifact_observations SET desired_commit='mismatch'",
+                (),
+            )
+            .await
+            .unwrap();
+        assert!(
+            startup_error(&s.url)
+                .await
+                .contains("invalid artifact observations")
+        );
+
+        let Some(s) = server().await else { return };
+        let a = scheduler(&s.url, Default::default()).await;
+        let c = a.conn().await.unwrap();
+        c.execute("DROP INDEX artifact_jobs_claim", ())
+            .await
+            .unwrap();
+        c.execute(
+            "CREATE INDEX artifact_jobs_claim ON artifact_jobs(kind,state,created_at,id)",
+            (),
+        )
+        .await
+        .unwrap();
+        assert!(
+            startup_error(&s.url)
+                .await
+                .contains("index artifact_jobs_claim differs")
+        );
+
+        let Some(s) = server().await else { return };
+        let a = scheduler(&s.url, Default::default()).await;
+        a.schedule(&key("wrong-type", ArtifactKind::Head))
+            .await
+            .unwrap();
+        a.conn()
+            .await
+            .unwrap()
+            .execute("UPDATE artifact_jobs SET created_at='not-an-integer'", ())
+            .await
+            .unwrap();
+        assert!(
+            startup_error(&s.url)
+                .await
+                .contains("invalid artifact jobs")
         );
     }
 }
