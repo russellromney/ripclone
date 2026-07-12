@@ -1755,6 +1755,21 @@ mod tests {
         );
         assert!(a.heartbeat(&replacement, "worker-c", 5).await.unwrap());
 
+        let dead = key("dead-letter", ArtifactKind::Head);
+        a.schedule(&dead).await.unwrap();
+        let dead_claim = a.claim("dead-worker", 5).await.unwrap().unwrap();
+        sqlx::query("UPDATE artifact_jobs SET claim_attempts=?,lease_expires_at=0 WHERE id=?")
+            .bind(a.limits.max_claim_attempts as i64)
+            .bind(dead_claim.record.id)
+            .execute(a.pool())
+            .await
+            .unwrap();
+        assert_eq!(a.reconcile_expired().await.unwrap().1, 1);
+        assert_eq!(
+            a.retry_failed(&dead).await.unwrap(),
+            RetryOutcome::NotRetryable(FailureClass::DeadLetter)
+        );
+
         // Current completion publishes only the exact desired artifact.
         assert!(
             a.complete(
@@ -2073,7 +2088,55 @@ mod tests {
             ArtifactKind::Head
         );
 
-        // Exact schema validation rejects a lookalike mutation, not merely missing names.
+        // Exact schema validation rejects missing defaults, ineffective named
+        // constraints, and lookalike column shapes.
+        reset(&control).await;
+        let clean = MysqlArtifactScheduler::from_pool(
+            MySqlPoolOptions::new().connect(&url).await.unwrap(),
+            Default::default(),
+            Arc::new(Accept),
+        )
+        .await
+        .unwrap();
+        sqlx::query("ALTER TABLE artifact_jobs ALTER COLUMN lease_generation DROP DEFAULT")
+            .execute(clean.pool())
+            .await
+            .unwrap();
+        assert!(
+            MysqlArtifactScheduler::from_pool(
+                MySqlPoolOptions::new().connect(&url).await.unwrap(),
+                Default::default(),
+                Arc::new(Accept)
+            )
+            .await
+            .is_err()
+        );
+
+        reset(&control).await;
+        let clean = MysqlArtifactScheduler::from_pool(
+            MySqlPoolOptions::new().connect(&url).await.unwrap(),
+            Default::default(),
+            Arc::new(Accept),
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "ALTER TABLE artifact_jobs DROP CHECK artifact_jobs_format,
+             ADD CONSTRAINT artifact_jobs_format CHECK(true OR format_version BETWEEN 1 AND 4294967295)",
+        )
+        .execute(clean.pool())
+        .await
+        .unwrap();
+        assert!(
+            MysqlArtifactScheduler::from_pool(
+                MySqlPoolOptions::new().connect(&url).await.unwrap(),
+                Default::default(),
+                Arc::new(Accept)
+            )
+            .await
+            .is_err()
+        );
+
         reset(&control).await;
         let clean = MysqlArtifactScheduler::from_pool(
             MySqlPoolOptions::new().connect(&url).await.unwrap(),
