@@ -68,6 +68,8 @@ pub mod api_job_queue;
 pub mod api_ref_store;
 pub mod archive;
 #[doc(hidden)]
+pub mod artifact_scheduler;
+#[doc(hidden)]
 pub mod auth;
 pub mod backends;
 #[doc(hidden)]
