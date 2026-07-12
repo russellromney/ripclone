@@ -71,9 +71,9 @@ pub mod archive;
 pub mod artifact_scheduler;
 #[doc(hidden)]
 pub mod artifact_scheduler_backend;
-pub mod artifact_scheduler_mysql;
 #[doc(hidden)]
 pub mod artifact_scheduler_libsql;
+pub mod artifact_scheduler_mysql;
 #[doc(hidden)]
 pub mod artifact_scheduler_postgres;
 #[doc(hidden)]
