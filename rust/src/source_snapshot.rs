@@ -1,6 +1,7 @@
-//! Immutable source roots for normalized synchronization.
+//! Immutable post-build reconstruction checkpoints for normalized synchronization.
 //!
-//! A source snapshot is the exact verified Head + FullHistory pair for one
+//! This is deliberately not the provider-acquired input to a build. A source
+//! snapshot is the exact verified Head + FullHistory pair produced for one
 //! commit. Head owns the target commit/tree/blobs and FullHistory owns every
 //! parent closure, so the pair can reconstruct a complete Git object store on
 //! any worker without consulting a mutable provider mirror.

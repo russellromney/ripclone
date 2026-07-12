@@ -108,6 +108,8 @@ pub mod fsutil;
 #[doc(hidden)]
 pub mod git;
 #[doc(hidden)]
+pub mod git_source;
+#[doc(hidden)]
 pub mod gix_util;
 #[doc(hidden)]
 pub mod job_token;
