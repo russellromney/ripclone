@@ -86,6 +86,9 @@ pub trait ArtifactSchedulerPersistence: Send + Sync {
     fn manifest_cas_quarantine_supported(&self) -> bool {
         false
     }
+    fn ready_publication_pair_fence_supported(&self) -> bool {
+        false
+    }
     async fn schedule(&self, key: &ArtifactKey) -> Result<ScheduleOutcome>;
     async fn subscribe_consumer(
         &self,
@@ -161,6 +164,18 @@ pub trait ArtifactSchedulerPersistence: Send + Sync {
     async fn release_ready_publication_fence(&self, fence: ReadyPublicationFence) -> Result<()> {
         let _ = fence;
         bail!("artifact scheduler backend does not implement Ready publication fencing")
+    }
+    async fn mark_activation_unknown(
+        &self,
+        fence: &ReadyPublicationFence,
+        ttl_secs: i64,
+    ) -> Result<bool> {
+        let _ = (fence, ttl_secs);
+        bail!("artifact scheduler backend does not implement activation recovery fencing")
+    }
+    async fn settle_activation_operation(&self, operation_id: &str) -> Result<()> {
+        let _ = operation_id;
+        bail!("artifact scheduler backend does not implement activation recovery settlement")
     }
     async fn claim(&self, owner: &str, lease_secs: i64) -> Result<Option<ClaimedArtifact>>;
     async fn heartbeat(
@@ -588,6 +603,9 @@ impl ArtifactSchedulerPersistence for crate::artifact_scheduler::ArtifactSchedul
     fn manifest_cas_quarantine_supported(&self) -> bool {
         true
     }
+    fn ready_publication_pair_fence_supported(&self) -> bool {
+        true
+    }
     async fn schedule(&self, key: &ArtifactKey) -> Result<ScheduleOutcome> {
         self.schedule(key).await
     }
@@ -639,6 +657,16 @@ impl ArtifactSchedulerPersistence for crate::artifact_scheduler::ArtifactSchedul
     }
     async fn release_ready_publication_fence(&self, fence: ReadyPublicationFence) -> Result<()> {
         self.release_ready_publication_fence(fence).await
+    }
+    async fn mark_activation_unknown(
+        &self,
+        fence: &ReadyPublicationFence,
+        ttl_secs: i64,
+    ) -> Result<bool> {
+        self.mark_activation_unknown(fence, ttl_secs).await
+    }
+    async fn settle_activation_operation(&self, operation_id: &str) -> Result<()> {
+        self.settle_activation_operation(operation_id).await
     }
     async fn claim(&self, owner: &str, lease: i64) -> Result<Option<ClaimedArtifact>> {
         self.claim(owner, lease).await

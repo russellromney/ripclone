@@ -21,7 +21,8 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 use std::time::Duration;
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 const DEFAULT_CONSUMER_TTL_SECS: i64 = 60 * 60;
@@ -85,10 +86,51 @@ pub struct ArtifactAdmissionCoordinator {
     verification_timeout: Duration,
     verification_cancel_grace: Duration,
     verification_queue_timeout: Duration,
+    activation_timeout: Duration,
     #[cfg(test)]
     after_subscribe: Option<Arc<dyn TestSubscriptionHook>>,
     #[cfg(test)]
     after_activation_fence: Option<Arc<dyn TestActivationFenceHook>>,
+}
+
+struct VerificationTaskGuard {
+    cancelled: CancellationToken,
+    task: Option<JoinHandle<AdmissionVerification>>,
+    permit: Option<OwnedSemaphorePermit>,
+    poisoned_slots: Arc<AtomicUsize>,
+    armed: bool,
+}
+
+impl VerificationTaskGuard {
+    fn poison(&mut self) {
+        self.cancelled.cancel();
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+        if let Some(permit) = self.permit.take() {
+            permit.forget();
+            self.poisoned_slots.fetch_add(1, Ordering::AcqRel);
+        }
+        self.armed = false;
+    }
+
+    fn finish(&mut self) {
+        self.task.take();
+        self.permit.take();
+        self.armed = false;
+    }
+}
+
+impl Drop for VerificationTaskGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            // Dropping the outer reconcile future must never detach verifier
+            // work. Cancellation plus task abortion is immediate; capacity is
+            // conservatively poisoned because blocking children cannot be
+            // proven drained from synchronous Drop.
+            self.poison();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -116,6 +158,9 @@ impl ArtifactAdmissionCoordinator {
         if !scheduler.manifest_cas_quarantine_supported() {
             bail!("admission scheduler lacks manifest-CAS quarantine support")
         }
+        if !scheduler.ready_publication_pair_fence_supported() {
+            bail!("admission scheduler lacks typed Ready publication pair fencing")
+        }
         Ok(Self {
             scheduler,
             ref_store,
@@ -129,6 +174,7 @@ impl ArtifactAdmissionCoordinator {
             verification_timeout: DEFAULT_VERIFICATION_TIMEOUT,
             verification_cancel_grace: DEFAULT_VERIFICATION_CANCEL_GRACE,
             verification_queue_timeout: DEFAULT_VERIFICATION_QUEUE_TIMEOUT,
+            activation_timeout: ACTIVATION_TIMEOUT,
             #[cfg(test)]
             after_subscribe: None,
             #[cfg(test)]
@@ -145,6 +191,12 @@ impl ArtifactAdmissionCoordinator {
     #[cfg(test)]
     fn with_activation_fence_hook(mut self, hook: Arc<dyn TestActivationFenceHook>) -> Self {
         self.after_activation_fence = Some(hook);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_activation_timeout(mut self, timeout: Duration) -> Self {
+        self.activation_timeout = timeout;
         self
     }
 
@@ -201,6 +253,7 @@ impl ArtifactAdmissionCoordinator {
         };
         match repo.state {
             RepoLifecycleState::Active => {
+                self.settle_activation_operation_for(&repo).await?;
                 self.release_attempt_consumers(&repo).await?;
                 return Ok(AdmissionOutcome::AlreadyActive);
             }
@@ -210,6 +263,7 @@ impl ArtifactAdmissionCoordinator {
                         .clone()
                         .unwrap_or_else(|| "repository admission failed".into()),
                 );
+                self.settle_activation_operation_for(&repo).await?;
                 self.release_attempt_consumers(&repo).await?;
                 return Ok(outcome);
             }
@@ -289,6 +343,7 @@ impl ArtifactAdmissionCoordinator {
         };
         match repo.state {
             RepoLifecycleState::Active => {
+                self.settle_activation_operation_for(&repo).await?;
                 self.release_attempt_consumers(&repo).await?;
                 return Ok(AdmissionOutcome::AlreadyActive);
             }
@@ -298,6 +353,7 @@ impl ArtifactAdmissionCoordinator {
                         .clone()
                         .unwrap_or_else(|| "repository admission failed".into()),
                 );
+                self.settle_activation_operation_for(&repo).await?;
                 self.release_attempt_consumers(&repo).await?;
                 return Ok(outcome);
             }
@@ -389,28 +445,57 @@ impl ArtifactAdmissionCoordinator {
         else {
             return Ok(AdmissionOutcome::WaitingForArtifacts);
         };
+        if !self
+            .scheduler
+            .mark_activation_unknown(&fence, ACTIVATION_FENCE_TTL_SECS)
+            .await?
+        {
+            return Ok(AdmissionOutcome::WaitingForArtifacts);
+        }
         #[cfg(test)]
         if let Some(hook) = &self.after_activation_fence {
             hook.fenced().await;
         }
 
         let activation = tokio::time::timeout(
-            ACTIVATION_TIMEOUT,
+            self.activation_timeout,
             self.ref_store
                 .activate_repo(repo_id, branch, target, Some(attempt_id)),
         )
         .await;
-        let release = self.scheduler.release_ready_publication_fence(fence).await;
-        let activated = activation
-            .context("repository activation timed out while publication fence was live")??;
+        let activated = match activation {
+            Ok(Ok(activated)) => activated,
+            Ok(Err(error)) => {
+                // The store may have committed before surfacing an error. Keep
+                // the durable unknown fence for idempotent recovery.
+                return Err(error).context("repository activation outcome is unknown");
+            }
+            Err(_) => {
+                // Cancellation/timeout is ambiguous. A late commit is allowed;
+                // the next pass observes lifecycle state or renews/takes over
+                // this exact operation before retrying the idempotent CAS.
+                return Ok(AdmissionOutcome::WaitingForArtifacts);
+            }
+        };
         if !activated {
-            release?;
-            let _ = self.release_attempt_consumers(&repo).await;
-            return self.reload_outcome(repo_id).await;
+            let current = self.ref_store.load_added_repo(repo_id).await?;
+            let definitely_lost = !current.as_ref().is_some_and(|current| {
+                current.state == RepoLifecycleState::Initializing
+                    && current.initialization_attempt_id.as_deref() == Some(attempt_id)
+                    && current.initialization_target.as_deref() == Some(target)
+            });
+            if definitely_lost {
+                self.scheduler
+                    .release_ready_publication_fence(fence)
+                    .await?;
+                let _ = self.release_attempt_consumers(&repo).await;
+                return self.reload_outcome(repo_id).await;
+            }
+            return Ok(AdmissionOutcome::WaitingForArtifacts);
         }
+        let _ = self.scheduler.release_ready_publication_fence(fence).await;
         // Activation is already durable. A transient cleanup failure must not
         // turn a successfully admitted repository back into an error.
-        let _ = release;
         let _ = self.release_attempt_consumers(&repo).await;
         Ok(AdmissionOutcome::Activated)
     }
@@ -441,6 +526,7 @@ impl ArtifactAdmissionCoordinator {
     /// this before deleting lifecycle state; reconciliation also calls it when
     /// an attempt terminates or loses its CAS race.
     pub async fn release_attempt_consumers(&self, repo: &AddedRepo) -> Result<()> {
+        self.settle_activation_operation_for(repo).await?;
         let Some(attempt_id) = repo.initialization_attempt_id.as_deref() else {
             return Ok(());
         };
@@ -460,6 +546,22 @@ impl ArtifactAdmissionCoordinator {
             }
         }
         Ok(())
+    }
+
+    async fn settle_activation_operation_for(&self, repo: &AddedRepo) -> Result<()> {
+        let Some(attempt_id) = repo.initialization_attempt_id.as_deref() else {
+            return Ok(());
+        };
+        let Some((_, target)) = pinned_identity(repo)? else {
+            return Ok(());
+        };
+        self.scheduler
+            .settle_activation_operation(&activation_fence_consumer_id(
+                &repo.repo_id,
+                target,
+                attempt_id,
+            ))
+            .await
     }
 
     fn key(&self, repo_id: &RepoId, commit: &str, kind: ArtifactKind) -> ArtifactKey {
@@ -528,10 +630,21 @@ impl ArtifactAdmissionCoordinator {
         let verifier = self.verifier.clone();
         let record = record.clone();
         let verify_cancel = cancelled.clone();
-        let mut verification =
+        let verification =
             tokio::spawn(async move { verifier.verify(&record, verify_cancel).await });
+        let mut guard = VerificationTaskGuard {
+            cancelled: cancelled.clone(),
+            task: Some(verification),
+            permit: Some(permit),
+            poisoned_slots: self.poisoned_verifier_slots.clone(),
+            armed: true,
+        };
         let mut did_not_drain = false;
-        let outcome = match tokio::time::timeout(self.verification_timeout, &mut verification).await
+        let outcome = match tokio::time::timeout(
+            self.verification_timeout,
+            guard.task.as_mut().expect("verification task is owned"),
+        )
+        .await
         {
             Ok(Ok(outcome)) => outcome,
             Ok(Err(error)) => AdmissionVerification::Retryable(if error.is_panic() {
@@ -541,7 +654,11 @@ impl ArtifactAdmissionCoordinator {
             }),
             Err(_) => {
                 cancelled.cancel();
-                match tokio::time::timeout(self.verification_cancel_grace, &mut verification).await
+                match tokio::time::timeout(
+                    self.verification_cancel_grace,
+                    guard.task.as_mut().expect("verification task is owned"),
+                )
+                .await
                 {
                     Ok(Ok(AdmissionVerification::Corrupt(error))) => {
                         // Timeout dominates a late semantic result: the verifier
@@ -563,8 +680,6 @@ impl ArtifactAdmissionCoordinator {
                     }),
                     Err(_) => {
                         did_not_drain = true;
-                        verification.abort();
-                        let _ = verification.await;
                         AdmissionVerification::Retryable(
                             "admission verifier did not drain after cancellation".into(),
                         )
@@ -575,8 +690,9 @@ impl ArtifactAdmissionCoordinator {
         if did_not_drain {
             // Quarantine this capacity slot. Releasing it would allow repeated
             // hostile publications to accumulate detached blocking children.
-            permit.forget();
-            self.poisoned_verifier_slots.fetch_add(1, Ordering::AcqRel);
+            guard.poison();
+        } else {
+            guard.finish();
         }
         outcome
     }
@@ -740,13 +856,22 @@ mod tests {
         transient: Mutex<HashSet<String>>,
         hang: Mutex<HashSet<String>>,
         wedged: Mutex<HashSet<String>>,
+        outer_abort: Mutex<HashSet<String>>,
         panic_on: Mutex<HashSet<String>>,
         pause_before: Mutex<HashSet<String>>,
         pause_after: Mutex<HashSet<String>>,
         pause: AtomicBool,
         calls: AtomicUsize,
+        active: AtomicUsize,
         entered: Notify,
         resume: Notify,
+    }
+
+    struct ActiveVerification<'a>(&'a AtomicUsize);
+    impl Drop for ActiveVerification<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
     }
 
     #[async_trait]
@@ -757,6 +882,8 @@ mod tests {
             cancelled: CancellationToken,
         ) -> AdmissionVerification {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            self.active.fetch_add(1, Ordering::SeqCst);
+            let _active = ActiveVerification(&self.active);
             if self.pause.swap(false, Ordering::SeqCst) {
                 self.entered.notify_one();
                 tokio::select! {
@@ -778,6 +905,11 @@ mod tests {
                 return AdmissionVerification::Retryable("test verification timed out".into());
             }
             if self.wedged.lock().await.contains(manifest) {
+                std::future::pending::<()>().await;
+                unreachable!();
+            }
+            if self.outer_abort.lock().await.contains(manifest) {
+                self.entered.notify_one();
                 std::future::pending::<()>().await;
                 unreachable!();
             }
@@ -834,6 +966,100 @@ mod tests {
         scheduler: Arc<ArtifactScheduler>,
         record: ArtifactRecord,
         outcome: Mutex<Option<QuarantineOutcome>>,
+    }
+
+    struct LateCommitRefStore {
+        inner: Arc<FileRefStore>,
+        first: AtomicBool,
+        activation_calls: AtomicUsize,
+        allow_commit: Arc<Notify>,
+        committed: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl RefStore for LateCommitRefStore {
+        async fn load(&self, id: &RepoId) -> Result<Option<crate::RefInfo>> {
+            self.inner.load(id).await
+        }
+        async fn save(&self, id: &RepoId, info: &crate::RefInfo) -> Result<()> {
+            self.inner.save(id, info).await
+        }
+        async fn list(&self) -> Result<Vec<RepoId>> {
+            self.inner.list().await
+        }
+        async fn load_branch(&self, id: &RepoId, branch: &str) -> Result<Option<crate::RefInfo>> {
+            self.inner.load_branch(id, branch).await
+        }
+        async fn save_branch(
+            &self,
+            id: &RepoId,
+            branch: &str,
+            info: &crate::RefInfo,
+        ) -> Result<()> {
+            self.inner.save_branch(id, branch, info).await
+        }
+        async fn update_build_status(
+            &self,
+            id: &RepoId,
+            branch: &str,
+            commit: &str,
+            status: &str,
+        ) -> Result<bool> {
+            self.inner
+                .update_build_status(id, branch, commit, status)
+                .await
+        }
+        async fn touch_last_accessed_at(
+            &self,
+            id: &RepoId,
+            branch: &str,
+            commit: &str,
+        ) -> Result<bool> {
+            self.inner.touch_last_accessed_at(id, branch, commit).await
+        }
+        async fn list_branches(&self, id: &RepoId) -> Result<Vec<String>> {
+            self.inner.list_branches(id).await
+        }
+        async fn add_repo(&self, repo: &AddedRepo) -> Result<()> {
+            self.inner.add_repo(repo).await
+        }
+        async fn load_added_repo(&self, id: &RepoId) -> Result<Option<AddedRepo>> {
+            self.inner.load_added_repo(id).await
+        }
+        async fn remove_added_repo(&self, id: &RepoId) -> Result<()> {
+            self.inner.remove_added_repo(id).await
+        }
+        async fn list_added_repos(&self) -> Result<Vec<AddedRepo>> {
+            self.inner.list_added_repos().await
+        }
+        async fn activate_repo(
+            &self,
+            id: &RepoId,
+            branch: &str,
+            commit: &str,
+            attempt: Option<&str>,
+        ) -> Result<bool> {
+            self.activation_calls.fetch_add(1, Ordering::SeqCst);
+            if !self.first.swap(false, Ordering::SeqCst) {
+                return self.inner.activate_repo(id, branch, commit, attempt).await;
+            }
+            let inner = self.inner.clone();
+            let id = id.clone();
+            let branch = branch.to_owned();
+            let commit = commit.to_owned();
+            let attempt = attempt.map(str::to_owned);
+            let allow_commit = self.allow_commit.clone();
+            let committed = self.committed.clone();
+            tokio::spawn(async move {
+                allow_commit.notified().await;
+                inner
+                    .activate_repo(&id, &branch, &commit, attempt.as_deref())
+                    .await
+                    .unwrap();
+                committed.notify_one();
+            });
+            std::future::pending::<Result<bool>>().await
+        }
     }
 
     #[async_trait]
@@ -1457,6 +1683,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn timed_out_activation_retains_fence_until_late_commit_is_observed() {
+        let f = Fixture::new().await;
+        f.add("attempt-1").await;
+        f.make_required_ready("head", "history").await;
+        let late = Arc::new(LateCommitRefStore {
+            inner: f.refs.clone(),
+            first: AtomicBool::new(true),
+            activation_calls: AtomicUsize::new(0),
+            allow_commit: Arc::new(Notify::new()),
+            committed: Arc::new(Notify::new()),
+        });
+        let coordinator = ArtifactAdmissionCoordinator::new(
+            f.scheduler.clone(),
+            late.clone(),
+            f.verifier.clone(),
+            1,
+        )
+        .unwrap()
+        .with_activation_timeout(Duration::from_millis(100));
+
+        assert_eq!(
+            coordinator.reconcile_repo(&f.repo_id).await.unwrap(),
+            AdmissionOutcome::WaitingForArtifacts
+        );
+        assert_eq!(late.activation_calls.load(Ordering::SeqCst), 1);
+        let pool = sqlx::SqlitePool::connect(&f.db_url).await.unwrap();
+        let state: String = sqlx::query_scalar("SELECT state FROM ready_publication_fences")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(state, "activation_unknown");
+
+        // Even beyond its liveness deadline, an unknown fence remains a safety
+        // root and cannot be quarantined. Recovery renews the same exact
+        // operation and retries its idempotent lifecycle CAS.
+        sqlx::query("UPDATE ready_publication_fences SET expires_at=0")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let head = f
+            .scheduler
+            .get_by_key(&f.key(ArtifactKind::Head))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            f.scheduler
+                .quarantine_ready(head.id, head.manifest.as_deref(), "past-deadline scrub")
+                .await
+                .unwrap(),
+            QuarantineOutcome::LostRace
+        );
+        assert_eq!(
+            coordinator.reconcile_repo(&f.repo_id).await.unwrap(),
+            AdmissionOutcome::Activated
+        );
+        assert_eq!(late.activation_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM ready_publication_fences")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+
+        // The original timed-out call commits after recovery settled the
+        // fence. It is the same idempotent attempt and cannot demote/rewrite
+        // the already Active lifecycle row.
+        late.allow_commit.notify_one();
+        late.committed.notified().await;
+        assert_eq!(
+            coordinator.reconcile_repo(&f.repo_id).await.unwrap(),
+            AdmissionOutcome::AlreadyActive
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM ready_publication_fences")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
     async fn expired_activation_fence_cannot_block_quarantine_after_crash() {
         let f = Fixture::new().await;
         f.add("attempt-1").await;
@@ -1495,7 +1805,8 @@ mod tests {
         );
         let pool = sqlx::SqlitePool::connect(&f.db_url).await.unwrap();
         sqlx::query(
-            "UPDATE artifact_consumers SET expires_at=0 WHERE consumer_id='admission-activation-crash-test'",
+            "UPDATE ready_publication_fences SET expires_at=0
+             WHERE operation_id='admission-activation-crash-test'",
         )
         .execute(&pool)
         .await
@@ -1508,6 +1819,180 @@ mod tests {
             QuarantineOutcome::Requeued(_)
         ));
         drop(fence);
+    }
+
+    #[tokio::test]
+    async fn stale_fence_capability_cannot_delete_reacquired_generation() {
+        let f = Fixture::new().await;
+        f.add("attempt-1").await;
+        f.make_required_ready("head", "history").await;
+        let head = f
+            .scheduler
+            .get_by_key(&f.key(ArtifactKind::Head))
+            .await
+            .unwrap()
+            .unwrap();
+        let history = f
+            .scheduler
+            .get_by_key(&f.key(ArtifactKind::FullHistory))
+            .await
+            .unwrap()
+            .unwrap();
+        let expected = [
+            (head.id, head.manifest.clone()),
+            (history.id, history.manifest.clone()),
+        ];
+        let old = f
+            .scheduler
+            .fence_ready_publications(&expected, "aba-operation", 60)
+            .await
+            .unwrap()
+            .unwrap();
+        let pool = sqlx::SqlitePool::connect(&f.db_url).await.unwrap();
+        sqlx::query(
+            "UPDATE ready_publication_fences SET expires_at=0 WHERE operation_id='aba-operation'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let renewed = f
+            .scheduler
+            .fence_ready_publications(&expected, "aba-operation", 60)
+            .await
+            .unwrap()
+            .unwrap();
+        f.scheduler
+            .release_ready_publication_fence(old)
+            .await
+            .unwrap();
+        assert_eq!(
+            f.scheduler
+                .quarantine_ready(head.id, head.manifest.as_deref(), "scrub")
+                .await
+                .unwrap(),
+            QuarantineOutcome::LostRace,
+            "an old capability must not release a renewed generation"
+        );
+        f.scheduler
+            .release_ready_publication_fence(renewed)
+            .await
+            .unwrap();
+        assert!(matches!(
+            f.scheduler
+                .quarantine_ready(head.id, head.manifest.as_deref(), "scrub")
+                .await
+                .unwrap(),
+            QuarantineOutcome::Requeued(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn forged_ordinary_consumer_names_cannot_block_quarantine() {
+        let f = Fixture::new().await;
+        f.add("attempt-1").await;
+        f.make_required_ready("head", "history").await;
+        let head = f
+            .scheduler
+            .get_by_key(&f.key(ArtifactKind::Head))
+            .await
+            .unwrap()
+            .unwrap();
+        for forged in [
+            "admission-activation-forged",
+            "ADMISSION-ACTIVATION-FORGED",
+            "Admission-Activation-Forged",
+        ] {
+            f.scheduler
+                .subscribe_consumer(&head.key, forged, 60)
+                .await
+                .unwrap();
+        }
+        assert!(matches!(
+            f.scheduler
+                .quarantine_ready(head.id, head.manifest.as_deref(), "real scrub")
+                .await
+                .unwrap(),
+            QuarantineOutcome::Requeued(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn startup_rejects_corrupt_fence_pair_membership() {
+        let f = Fixture::new().await;
+        f.add("attempt-1").await;
+        f.make_required_ready("head", "history").await;
+        let head = f
+            .scheduler
+            .get_by_key(&f.key(ArtifactKind::Head))
+            .await
+            .unwrap()
+            .unwrap();
+        let history = f
+            .scheduler
+            .get_by_key(&f.key(ArtifactKind::FullHistory))
+            .await
+            .unwrap()
+            .unwrap();
+        let _fence = f
+            .scheduler
+            .fence_ready_publications(
+                &[
+                    (head.id, head.manifest.clone()),
+                    (history.id, history.manifest.clone()),
+                ],
+                "corrupt-startup",
+                60,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let pool = sqlx::SqlitePool::connect(&f.db_url).await.unwrap();
+        sqlx::query("DELETE FROM ready_publication_fence_members WHERE artifact_id=?")
+            .bind(history.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let error = match ArtifactScheduler::open(&f.db_url, SchedulerLimits::default()).await {
+            Ok(_) => panic!("corrupt fence membership was accepted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("fence integrity"));
+    }
+
+    #[tokio::test]
+    async fn startup_rejects_orphan_fence_membership() {
+        let f = Fixture::new().await;
+        f.add("attempt-1").await;
+        f.coordinator
+            .subscribe_pinned_attempt(&f.repo_id, "attempt-1")
+            .await
+            .unwrap();
+        let head = f
+            .scheduler
+            .get_by_key(&f.key(ArtifactKind::Head))
+            .await
+            .unwrap()
+            .unwrap();
+        let pool = sqlx::SqlitePool::connect(&f.db_url).await.unwrap();
+        let mut connection = pool.acquire().await.unwrap();
+        sqlx::query("PRAGMA foreign_keys=OFF")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO ready_publication_fence_members(token,generation,artifact_id,manifest)
+             VALUES('orphan',99,?,NULL)",
+        )
+        .bind(head.id)
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+        drop(connection);
+        let error = match ArtifactScheduler::open(&f.db_url, SchedulerLimits::default()).await {
+            Ok(_) => panic!("orphan fence membership was accepted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("fence integrity"));
     }
 
     #[tokio::test]
@@ -1665,5 +2150,55 @@ mod tests {
             AdmissionOutcome::Degraded(message) if message.contains("replace")
         ));
         assert!(started.elapsed() < Duration::from_millis(50));
+    }
+
+    #[tokio::test]
+    async fn repeated_outer_abort_cannot_detach_hostile_verifiers() {
+        let f = Fixture::new().await;
+        f.add("attempt-1").await;
+        f.make_required_ready("outer-abort", "history").await;
+        f.verifier
+            .outer_abort
+            .lock()
+            .await
+            .insert("outer-abort".into());
+        let coordinator = Arc::new(
+            ArtifactAdmissionCoordinator::new(
+                f.scheduler.clone(),
+                f.refs.clone(),
+                f.verifier.clone(),
+                1,
+            )
+            .unwrap()
+            .with_verification_policy(
+                2,
+                Duration::from_secs(10),
+                Duration::from_secs(1),
+            ),
+        );
+        for poisoned in 1..=2 {
+            let running_coordinator = coordinator.clone();
+            let repo_id = f.repo_id.clone();
+            let task =
+                tokio::spawn(async move { running_coordinator.reconcile_repo(&repo_id).await });
+            f.verifier.entered.notified().await;
+            task.abort();
+            let _ = task.await;
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while f.verifier.active.load(Ordering::SeqCst) != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(coordinator.readiness().poisoned_verifier_slots, poisoned);
+        }
+        assert!(!coordinator.readiness().healthy);
+        assert_eq!(f.verifier.active.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            coordinator.reconcile_repo(&f.repo_id).await.unwrap(),
+            AdmissionOutcome::Degraded(_)
+        ));
+        assert_eq!(f.verifier.active.load(Ordering::SeqCst), 0);
     }
 }
