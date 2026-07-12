@@ -387,7 +387,14 @@ fn validate_manifest(value: &str, label: &str) -> Result<()> {
 mod tests {
     use super::*;
     use crate::artifact_scheduler::{ArtifactKey, FailureClass};
+    use crate::cas::Cas;
+    use crate::pack::PackBuilder;
+    use crate::pinned_bundle::{
+        PinnedBundleBuild, StoredPack, VerifiedBaseArtifact, generate_pinned_bundle,
+        verify_pinned_bundle_ready,
+    };
     use crate::topup::{PinnedArtifactDescriptor, PinnedArtifactKind, PinnedTopUpBundle};
+    use std::process::Command;
 
     const W: &str = "workspace-test";
     const R: &str = "acme/repo";
@@ -705,6 +712,115 @@ mod tests {
                 payload: ClonePayload::HeadArtifact { .. },
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn generated_and_cas_verified_bundle_flows_into_exact_target_plan() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        crate::git::init(&repo).unwrap();
+        for (key, value) in [
+            ("user.name", "test"),
+            ("user.email", "test@example.invalid"),
+        ] {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(&repo)
+                    .args(["config", key, value])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let commit = |name: &str, body: &str| {
+            std::fs::write(repo.join(name), body).unwrap();
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(&repo)
+                    .args(["add", "-A"])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(&repo)
+                    .args(["commit", "-m", name])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        let base_commit = commit("base.txt", "base");
+        let cas = Cas::new(root.path().join("cas")).unwrap();
+        let packs = PackBuilder::new(&repo, &cas)
+            .build_depth_packs(&base_commit, Some(1), 1024 * 1024)
+            .unwrap()
+            .into_iter()
+            .map(|(pack, pack_len, index, index_len)| StoredPack {
+                pack: PinnedArtifactDescriptor {
+                    kind: PinnedArtifactKind::BasePack,
+                    hash: pack,
+                    len: pack_len,
+                },
+                index: PinnedArtifactDescriptor {
+                    kind: PinnedArtifactKind::BasePackIndex,
+                    hash: index,
+                    len: index_len,
+                },
+            })
+            .collect();
+        let base = VerifiedBaseArtifact {
+            commit: base_commit.clone(),
+            mode: TopUpMode::Head,
+            packs,
+        };
+        let target = commit("target.txt", "target");
+        let request = generate_pinned_bundle(PinnedBundleBuild {
+            mirror: &repo,
+            cas: &cas,
+            workspace_id: W,
+            repo_path: R,
+            base_commit: &base_commit,
+            base_artifact: &base,
+            target_commit: &target,
+            mode: TopUpMode::Head,
+            branch: BRANCH,
+            canonical_origin: "https://github.com/acme/repo.git",
+        })
+        .unwrap();
+        let verified = verify_pinned_bundle_ready(&cas, &request).unwrap();
+        let receipt = VerifiedTopUpReceipt::from_verified(&verified).unwrap();
+        let plan = plan_clone(ClonePlanningInput {
+            availability: RepositoryAvailability::Active,
+            workspace: W,
+            repo: R,
+            branch: BRANCH,
+            artifact_format_version: 1,
+            mode: SyncMode::Head,
+            target_commit: &target,
+            exact: &ExactArtifacts::default(),
+            top_up: Some(&receipt),
+        })
+        .unwrap();
+        assert!(matches!(
+            plan,
+            ClonePlan::Ready {
+                target_commit,
+                payload: ClonePayload::PinnedBundle { request: planned, .. }
+            } if target_commit == target && planned == request
         ));
     }
 }
