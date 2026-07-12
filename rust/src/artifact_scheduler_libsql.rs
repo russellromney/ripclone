@@ -25,6 +25,8 @@ use std::sync::Arc;
 
 const VERSION: i64 = 6;
 const PROVENANCE: &str = "ripclone-artifact-scheduler-libsql-v6";
+const V1_PROVENANCE: &str = "ripclone-artifact-scheduler-libsql-v1";
+const V2_PROVENANCE: &str = "ripclone-artifact-scheduler-libsql-v2";
 const V5_PROVENANCE: &str = "ripclone-artifact-scheduler-libsql-v5";
 const V4_PROVENANCE: &str = "ripclone-artifact-scheduler-libsql-v4";
 const V3_PROVENANCE: &str = "ripclone-artifact-scheduler-libsql-v3";
@@ -141,7 +143,7 @@ impl LibsqlArtifactScheduler {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .await?;
         let migration_result: Result<()> = async {
-        let existing=one_i64(&tx,"SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN('artifact_scheduler_schema','artifact_jobs','branch_observations','artifact_observations','artifact_consumers','artifact_transport_leases','artifact_base_retention','scheduler_state')",vec![]).await?;
+        let existing = scheduler_schema_object_count(&tx).await?;
         if existing == 0 {
             for ddl in SCHEMA {
                 tx.execute(ddl, ()).await?;
@@ -157,48 +159,7 @@ impl LibsqlArtifactScheduler {
             )
             .await?;
             tx.execute("INSERT INTO ready_publication_fence_sequence(id,generation) VALUES(1,0)",()).await?;
-        } else if existing == 6 {
-            let marker = query_one(
-                &tx,
-                "SELECT version,provenance FROM artifact_scheduler_schema WHERE id=1",
-                vec![],
-            )
-            .await?
-            .context("artifact scheduler schema marker missing")?;
-            if marker.get::<i64>(0)? != 1
-                || marker.get::<String>(1)? != "ripclone-artifact-scheduler-libsql-v1"
-            {
-                bail!("partial or unprovenanced libsql artifact scheduler schema")
-            }
-            tx.execute(SCHEMA[10], ()).await?;
-            tx.execute(SCHEMA[11], ()).await?;
-            tx.execute(SCHEMA[12], ()).await?;
-            tx.execute(SCHEMA[13], ()).await?;
-            tx.execute(GC_SWEEP_SCHEMA, ()).await?;
-            backfill_all_retention(&tx).await?;
-            tx.execute(
-                "UPDATE artifact_scheduler_schema SET version=?,provenance=? WHERE id=1 AND version=1",
-                libsql::params![VERSION, PROVENANCE],
-            )
-            .await?;
-        } else if existing == 7 {
-            let marker = query_one(
-                &tx,
-                "SELECT version,provenance FROM artifact_scheduler_schema WHERE id=1",
-                vec![],
-            )
-            .await?
-            .context("artifact scheduler schema marker missing")?;
-            if marker.get::<i64>(0)? == 2
-                && marker.get::<String>(1)? == "ripclone-artifact-scheduler-libsql-v2"
-            {
-                tx.execute(SCHEMA[12], ()).await?;
-                tx.execute(SCHEMA[13], ()).await?;
-                tx.execute(GC_SWEEP_SCHEMA, ()).await?;
-                backfill_all_retention(&tx).await?;
-                tx.execute("UPDATE artifact_scheduler_schema SET version=?,provenance=? WHERE id=1 AND version=2",libsql::params![VERSION,PROVENANCE]).await?;
-            }
-        } else if existing == 8 {
+        } else {
             let marker = query_one(
                 &tx,
                 "SELECT version,provenance FROM artifact_scheduler_schema WHERE id=1",
@@ -208,25 +169,49 @@ impl LibsqlArtifactScheduler {
             .context("artifact scheduler schema marker missing")?;
             let version = marker.get::<i64>(0)?;
             let provenance = marker.get::<String>(1)?;
-            if version == 3 && provenance == V3_PROVENANCE {
-                let preexisting_gc = one_i64(&tx,"SELECT count(*) FROM sqlite_master WHERE type='table' AND name='artifact_gc_sweep'",vec![]).await?;
-                if preexisting_gc != 1 {
-                    bail!("libsql v3 scheduler is missing its GC table")
+            let released = match (version, provenance.as_str()) {
+                (1, V1_PROVENANCE) | (2, V2_PROVENANCE) | (3, V3_PROVENANCE)
+                | (4, V4_PROVENANCE) | (5, V5_PROVENANCE) | (VERSION, PROVENANCE) => version,
+                _ => {
+                    bail!("unsupported or foreign libsql artifact scheduler schema")
                 }
-                validate_schema(&tx, 3, V3_PROVENANCE).await?;
-                tx.execute("UPDATE artifact_scheduler_schema SET version=?,provenance=? WHERE id=1 AND version=3 AND provenance=?",libsql::params![VERSION,PROVENANCE,V3_PROVENANCE]).await?;
-            } else if version == 4 && provenance == V4_PROVENANCE {
-                validate_schema(&tx, 4, V4_PROVENANCE).await?;
-                tx.execute("UPDATE artifact_scheduler_schema SET version=?,provenance=? WHERE id=1 AND version=4 AND provenance=?",libsql::params![VERSION,PROVENANCE,V4_PROVENANCE]).await?;
-            } else if version == 5 && provenance == V5_PROVENANCE {
-                for ddl in &SCHEMA[14..] { tx.execute(ddl,()).await?; }
-                tx.execute("INSERT INTO ready_publication_fence_sequence(id,generation) VALUES(1,0)",()).await?;
-                tx.execute("UPDATE artifact_scheduler_schema SET version=?,provenance=? WHERE id=1 AND version=5 AND provenance=?",libsql::params![VERSION,PROVENANCE,V5_PROVENANCE]).await?;
-            } else if version != VERSION || provenance != PROVENANCE {
+            };
+            validate_released_schema(&tx, released).await?;
+            if released != VERSION {
+                if released == 1 {
+                    for ddl in &SCHEMA[10..=14] {
+                        tx.execute(ddl, ()).await?;
+                    }
+                    backfill_all_retention(&tx).await?;
+                } else if released == 2 {
+                    for ddl in &SCHEMA[12..=14] {
+                        tx.execute(ddl, ()).await?;
+                    }
+                    backfill_all_retention(&tx).await?;
+                }
+                // The v6 fence schema is created transactionally before the
+                // marker changes. A crash or validation failure can therefore
+                // expose neither a falsely-v6 marker nor a partial fence family.
+                for ddl in &SCHEMA[16..] {
+                    tx.execute(ddl, ()).await?;
+                }
+                tx.execute(
+                    "INSERT INTO ready_publication_fence_sequence(id,generation) VALUES(1,0)",
+                    (),
+                )
+                .await?;
+                let changed = tx
+                    .execute(
+                        "UPDATE artifact_scheduler_schema SET version=?,provenance=? WHERE id=1 AND version=? AND provenance=?",
+                        libsql::params![VERSION, PROVENANCE, released, provenance],
+                    )
+                    .await?;
+                if changed != 1 {
+                    bail!("libsql scheduler migration marker CAS failed")
+                }
+            } else if provenance != PROVENANCE {
                 bail!("unsupported or foreign libsql artifact scheduler schema")
             }
-        } else {
-            bail!("partial or unprovenanced libsql artifact scheduler schema")
         }
         validate_schema(&tx, VERSION, PROVENANCE).await?;
         let fingerprint = scheduler_fingerprint(&limits, identity);
@@ -1051,6 +1036,77 @@ impl ArtifactSchedulerPersistence for LibsqlArtifactScheduler {
     }
 }
 
+fn released_schema_indices(version: i64) -> Result<Vec<usize>> {
+    let mut indices: Vec<usize> = (0..=9).collect();
+    match version {
+        1 => {}
+        2 => indices.extend(10..=11),
+        3..=5 => indices.extend(10..=14),
+        6 => indices.extend(10..SCHEMA.len()),
+        _ => bail!("unsupported libsql artifact scheduler schema version"),
+    }
+    indices.push(15);
+    indices.sort_unstable();
+    Ok(indices)
+}
+
+fn ddl_identity(ddl: &str) -> Result<(String, String)> {
+    let words: Vec<&str> = ddl.split_whitespace().collect();
+    let kind = words.get(1).copied().context("invalid scheduler DDL")?;
+    let name_at = if words.get(2) == Some(&"IF") { 5 } else { 2 };
+    let name = words
+        .get(name_at)
+        .context("invalid scheduler DDL object name")?
+        .split('(')
+        .next()
+        .context("invalid scheduler DDL object name")?
+        .to_owned();
+    Ok((kind.to_owned(), name))
+}
+
+async fn scheduler_schema_object_count(c: &Connection) -> Result<i64> {
+    one_i64(
+        c,
+        "SELECT count(*) FROM sqlite_master WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' AND (name LIKE 'artifact_%' OR name LIKE 'branch_%' OR name LIKE 'scheduler_%' OR name LIKE 'ready_%')",
+        vec![],
+    )
+    .await
+}
+
+/// Proves an exact, actually released libSQL inventory before any migration
+/// DDL runs. Marker-plus-table-count classification is insufficient: it
+/// accepts cross-product hybrids assembled from different releases.
+async fn validate_released_schema(c: &Connection, version: i64) -> Result<()> {
+    let indices = released_schema_indices(version)?;
+    let mut expected = Vec::with_capacity(indices.len());
+    for index in indices {
+        let ddl = SCHEMA[index];
+        let (kind, name) = ddl_identity(ddl)?;
+        expected.push((kind.to_ascii_lowercase(), name, canonical_ddl(ddl)));
+    }
+    expected.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+
+    let mut rows = c
+        .query(
+            "SELECT type,name,sql FROM sqlite_master WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' AND (name LIKE 'artifact_%' OR name LIKE 'branch_%' OR name LIKE 'scheduler_%' OR name LIKE 'ready_%') ORDER BY type,name",
+            (),
+        )
+        .await?;
+    let mut actual = Vec::new();
+    while let Some(row) = rows.next().await? {
+        actual.push((
+            row.get::<String>(0)?,
+            row.get::<String>(1)?,
+            canonical_ddl(&row.get::<String>(2)?),
+        ));
+    }
+    drop(rows);
+    if actual != expected {
+        bail!("libsql artifact scheduler does not match exact released v{version} inventory")
+    }
+    Ok(())
+}
+
 async fn validate_schema(
     c: &Connection,
     expected_version: i64,
@@ -1742,20 +1798,11 @@ mod tests {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .await
             .unwrap();
-        for ddl in SCHEMA {
-            tx.execute(ddl, ()).await.unwrap();
-        }
-        if version == 2 {
-            tx.execute("DROP TABLE artifact_base_retention", ())
-                .await
-                .unwrap();
-            tx.execute("DROP TABLE artifact_gc_sweep", ())
-                .await
-                .unwrap();
-        } else if !gc {
-            tx.execute("DROP TABLE artifact_gc_sweep", ())
-                .await
-                .unwrap();
+        let fixture_version = version.clamp(1, VERSION);
+        for index in released_schema_indices(fixture_version).unwrap() {
+            if index != 14 || gc {
+                tx.execute(SCHEMA[index], ()).await.unwrap();
+            }
         }
         tx.execute(
             "INSERT INTO artifact_scheduler_schema(id,version,provenance) VALUES(1,?,?)",
@@ -1773,7 +1820,23 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn released_v3_v4_migrate_to_v5_and_mixed_partial_future_fail_closed() {
+    async fn released_v1_v2_v3_v4_migrate_to_v6_and_hybrids_fail_closed() {
+        let Some(v1) = server().await else { return };
+        install_version_fixture(&v1.url, 1, V1_PROVENANCE, false).await;
+        let migrated_v1 = scheduler(&v1.url, Default::default()).await;
+        assert_eq!(
+            one_i64(
+                &migrated_v1.conn().await.unwrap(),
+                "SELECT version FROM artifact_scheduler_schema WHERE id=1",
+                vec![]
+            )
+            .await
+            .unwrap(),
+            VERSION
+        );
+        drop(migrated_v1);
+        drop(v1);
+
         let Some(v3) = server().await else { return };
         install_version_fixture(&v3.url, 3, V3_PROVENANCE, true).await;
         let migrated = scheduler(&v3.url, Default::default()).await;
@@ -1803,7 +1866,7 @@ mod tests {
         drop(v3);
 
         let Some(v2) = server().await else { return };
-        install_version_fixture(&v2.url, 2, "ripclone-artifact-scheduler-libsql-v2", false).await;
+        install_version_fixture(&v2.url, 2, V2_PROVENANCE, false).await;
         let migrated_v2 = scheduler(&v2.url, Default::default()).await;
         assert_eq!(
             one_i64(
@@ -1884,9 +1947,76 @@ mod tests {
         let Some(partial) = server().await else {
             return;
         };
-        install_version_fixture(&partial.url, 5, PROVENANCE, false).await;
-        assert!(!startup_error(&partial.url).await.is_empty());
+        install_version_fixture(&partial.url, 5, V5_PROVENANCE, false).await;
+        let partial_error = startup_error(&partial.url).await;
+        assert!(partial_error.contains("exact released v5 inventory"));
+        let partial_connection = db(&partial.url).await.connect().unwrap();
+        assert_eq!(
+            one_i64(
+                &partial_connection,
+                "SELECT version FROM artifact_scheduler_schema WHERE id=1",
+                vec![]
+            )
+            .await
+            .unwrap(),
+            5
+        );
+        assert_eq!(
+            one_i64(
+                &partial_connection,
+                "SELECT count(*) FROM sqlite_master WHERE name LIKE 'ready_publication_fence%'",
+                vec![]
+            )
+            .await
+            .unwrap(),
+            0
+        );
         drop(partial);
+
+        // Force failure after the v6 fence DDL and marker CAS. The whole
+        // migration must roll back, and startup_error also proves the
+        // immediate writer lock is released for the next process.
+        let Some(rollback) = server().await else {
+            return;
+        };
+        install_version_fixture(&rollback.url, 5, V5_PROVENANCE, true).await;
+        db(&rollback.url)
+            .await
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE scheduler_state SET config_fingerprint='incompatible-fleet' WHERE id=1",
+                (),
+            )
+            .await
+            .unwrap();
+        assert!(
+            startup_error(&rollback.url)
+                .await
+                .contains("configuration differs")
+        );
+        let rollback_connection = db(&rollback.url).await.connect().unwrap();
+        assert_eq!(
+            one_i64(
+                &rollback_connection,
+                "SELECT version FROM artifact_scheduler_schema WHERE id=1",
+                vec![]
+            )
+            .await
+            .unwrap(),
+            5
+        );
+        assert_eq!(
+            one_i64(
+                &rollback_connection,
+                "SELECT count(*) FROM sqlite_master WHERE name LIKE 'ready_publication_fence%'",
+                vec![]
+            )
+            .await
+            .unwrap(),
+            0
+        );
+        drop(rollback);
 
         let Some(future) = server().await else { return };
         install_version_fixture(
