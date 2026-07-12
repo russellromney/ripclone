@@ -107,6 +107,13 @@ impl VerifiedTopUpReceipt {
         Ok(Self {
             request: PinnedBundleRequest {
                 manifest_hash: bundle.manifest_hash.clone(),
+                format_version: bundle.bundle.format_version,
+                workspace_id: bundle.bundle.workspace_id.clone(),
+                repo_path: bundle.bundle.repo_path.clone(),
+                base_commit: bundle.bundle.base_commit.clone(),
+                target_commit: bundle.bundle.target_commit.clone(),
+                branch: bundle.bundle.branch.clone(),
+                mode: bundle.bundle.mode,
             },
             workspace: bundle.bundle.workspace_id.clone(),
             repo: bundle.bundle.repo_path.clone(),

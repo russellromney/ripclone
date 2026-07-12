@@ -166,7 +166,16 @@ pub fn generate_pinned_bundle(input: PinnedBundleBuild<'_>) -> Result<PinnedBund
     };
     let bytes = serde_json::to_vec(&stored)?;
     let manifest_hash = input.cas.put(&bytes)?;
-    let request = PinnedBundleRequest { manifest_hash };
+    let request = PinnedBundleRequest {
+        manifest_hash,
+        format_version: stored.verified.bundle.format_version,
+        workspace_id: stored.verified.bundle.workspace_id.clone(),
+        repo_path: stored.verified.bundle.repo_path.clone(),
+        base_commit: stored.verified.bundle.base_commit.clone(),
+        target_commit: stored.verified.bundle.target_commit.clone(),
+        branch: stored.verified.bundle.branch.clone(),
+        mode: stored.verified.bundle.mode,
+    };
     verify_pinned_bundle_ready(input.cas, &request)?;
     Ok(request)
 }
@@ -183,6 +192,7 @@ pub fn verify_pinned_bundle_ready(
     if !stored.verified.manifest_hash.is_empty() {
         bail!("stored pinned manifest contains an unbound receipt hash");
     }
+    crate::topup::validate_request_binding(request, &stored.verified.bundle)?;
     if stored.verified.bundle.format_version != PINNED_BUNDLE_FORMAT_VERSION {
         bail!("unsupported pinned manifest format");
     }
@@ -890,6 +900,7 @@ mod tests {
         stored.verified.bundle.target_commit = base_commit.clone();
         let mutated = PinnedBundleRequest {
             manifest_hash: f.cas.put(&serde_json::to_vec(&stored).unwrap()).unwrap(),
+            ..request.clone()
         };
         assert!(verify_pinned_bundle_ready(&f.cas, &mutated).is_err());
 
@@ -899,6 +910,7 @@ mod tests {
             pinned_bundle_semantic_digest(&stored.verified.bundle, &stored.verified.artifacts);
         let mutated = PinnedBundleRequest {
             manifest_hash: f.cas.put(&serde_json::to_vec(&stored).unwrap()).unwrap(),
+            ..request.clone()
         };
         assert!(verify_pinned_bundle_ready(&f.cas, &mutated).is_err());
 
@@ -906,6 +918,7 @@ mod tests {
         stored.verified.manifest_hash = "a".repeat(64);
         let mutated = PinnedBundleRequest {
             manifest_hash: f.cas.put(&serde_json::to_vec(&stored).unwrap()).unwrap(),
+            ..request.clone()
         };
         assert!(verify_pinned_bundle_ready(&f.cas, &mutated).is_err());
 
@@ -916,6 +929,7 @@ mod tests {
                 .cas
                 .put(&serde_json::to_vec(&with_unknown).unwrap())
                 .unwrap(),
+            ..request.clone()
         };
         assert!(verify_pinned_bundle_ready(&f.cas, &mutated).is_err());
     }
@@ -953,6 +967,7 @@ mod tests {
             pinned_bundle_semantic_digest(&stored.verified.bundle, &stored.verified.artifacts);
         let mutated = PinnedBundleRequest {
             manifest_hash: f.cas.put(&serde_json::to_vec(&stored).unwrap()).unwrap(),
+            ..request.clone()
         };
         assert!(verify_pinned_bundle_ready(&f.cas, &mutated).is_err());
     }

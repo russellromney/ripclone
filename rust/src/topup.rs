@@ -49,6 +49,17 @@ pub struct PinnedTopUpBundle {
 #[serde(deny_unknown_fields)]
 pub struct PinnedBundleRequest {
     pub manifest_hash: String,
+    /// Exact semantic identity expected from the content-addressed manifest.
+    /// These fields are repeated deliberately: the manifest hash alone is not
+    /// sufficient to prevent a valid bundle for another request from being
+    /// substituted at an untrusted transport boundary.
+    pub format_version: u32,
+    pub workspace_id: String,
+    pub repo_path: String,
+    pub base_commit: String,
+    pub target_commit: String,
+    pub branch: String,
+    pub mode: TopUpMode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -149,6 +160,7 @@ pub fn install_pinned_bundle(
     if verified.manifest_hash != request.manifest_hash {
         bail!("verified bundle does not match the requested manifest");
     }
+    validate_request_binding(request, &verified.bundle)?;
     validate_bundle(&verified.bundle, installer.approved_canonical_origin())?;
     validate_artifacts(&verified.artifacts)?;
     if verified.semantic_digest
@@ -165,6 +177,23 @@ pub fn install_pinned_bundle(
         branch: verified.bundle.branch.clone(),
         mode: verified.bundle.mode,
     })
+}
+
+pub(crate) fn validate_request_binding(
+    request: &PinnedBundleRequest,
+    bundle: &PinnedTopUpBundle,
+) -> Result<()> {
+    if request.format_version != bundle.format_version
+        || request.workspace_id != bundle.workspace_id
+        || request.repo_path != bundle.repo_path
+        || request.base_commit != bundle.base_commit
+        || request.target_commit != bundle.target_commit
+        || request.branch != bundle.branch
+        || request.mode != bundle.mode
+    {
+        bail!("verified bundle semantic identity does not match the request");
+    }
+    Ok(())
 }
 
 fn validate_bundle(bundle: &PinnedTopUpBundle, approved_origin: &str) -> Result<()> {

@@ -158,7 +158,14 @@ impl ClonePlanResponse {
                 validate_oid(target, "clone-plan target")?;
                 ClonePlan::Ready {
                     target_commit: target.to_owned(),
-                    payload: validate_payload(payload, self.mode)?,
+                    payload: validate_payload(
+                        payload,
+                        self.mode,
+                        &self.workspace,
+                        &self.repo,
+                        &self.branch,
+                        target,
+                    )?,
                 }
             }
             ClonePlanState::Pending { required } => {
@@ -244,7 +251,14 @@ fn validate_identity(identity: CloneRequestIdentity<'_>) -> Result<()> {
     Ok(())
 }
 
-fn validate_payload(payload: &ClonePlanPayload, request_mode: SyncMode) -> Result<ClonePayload> {
+fn validate_payload(
+    payload: &ClonePlanPayload,
+    request_mode: SyncMode,
+    workspace: &str,
+    repo: &str,
+    branch: &str,
+    target: &str,
+) -> Result<ClonePayload> {
     Ok(match payload {
         ClonePlanPayload::FilesArchive { manifest } if request_mode == SyncMode::Files => {
             validate_hash(manifest, "files manifest")?;
@@ -294,6 +308,17 @@ fn validate_payload(payload: &ClonePlanPayload, request_mode: SyncMode) -> Resul
             }
             validate_hash(&request.manifest_hash, "pinned bundle manifest")?;
             validate_oid(base_commit, "pinned bundle base")?;
+            if request.base_commit != *base_commit || request.mode != *mode {
+                bail!("pinned bundle request disagrees with clone payload");
+            }
+            if request.format_version != 1
+                || request.workspace_id != workspace
+                || request.repo_path != repo
+                || request.target_commit != target
+                || request.branch != branch
+            {
+                bail!("pinned bundle request identity does not match clone request");
+            }
             ClonePayload::PinnedBundle {
                 request: request.clone(),
                 base_commit: base_commit.clone(),
@@ -386,6 +411,19 @@ mod tests {
         }
     }
 
+    fn bundle_request(mode: TopUpMode) -> PinnedBundleRequest {
+        PinnedBundleRequest {
+            manifest_hash: HEAD.into(),
+            format_version: 1,
+            workspace_id: "acme".into(),
+            repo_path: "org/repo".into(),
+            base_commit: BASE.into(),
+            target_commit: TARGET.into(),
+            branch: "main".into(),
+            mode,
+        }
+    }
+
     #[test]
     fn exact_payloads_round_trip_for_each_mode() {
         let cases = [
@@ -438,9 +476,7 @@ mod tests {
         ] {
             let state = ClonePlanState::Ready {
                 payload: ClonePlanPayload::PinnedBundle {
-                    request: PinnedBundleRequest {
-                        manifest_hash: HEAD.into(),
-                    },
+                    request: bundle_request(bundle_mode),
                     base_commit: BASE.into(),
                     mode: bundle_mode,
                     discard_git,
@@ -460,9 +496,7 @@ mod tests {
         ] {
             let state = ClonePlanState::Ready {
                 payload: ClonePlanPayload::PinnedBundle {
-                    request: PinnedBundleRequest {
-                        manifest_hash: HEAD.into(),
-                    },
+                    request: bundle_request(bundle_mode),
                     base_commit: BASE.into(),
                     mode: bundle_mode,
                     discard_git,
@@ -473,6 +507,45 @@ mod tests {
                     .validate_for(identity(request_mode))
                     .is_err()
             );
+        }
+    }
+
+    #[test]
+    fn pinned_manifest_expectations_are_bound_to_the_request_envelope() {
+        let valid = || {
+            response(
+                SyncMode::Head,
+                ClonePlanState::Ready {
+                    payload: ClonePlanPayload::PinnedBundle {
+                        request: bundle_request(TopUpMode::Head),
+                        base_commit: BASE.into(),
+                        mode: TopUpMode::Head,
+                        discard_git: false,
+                    },
+                },
+            )
+        };
+        valid().validate_for(identity(SyncMode::Head)).unwrap();
+
+        for mutation in 0..7 {
+            let mut candidate = valid();
+            let ClonePlanState::Ready {
+                payload: ClonePlanPayload::PinnedBundle { request, .. },
+            } = &mut candidate.state
+            else {
+                unreachable!()
+            };
+            match mutation {
+                0 => request.workspace_id = "other".into(),
+                1 => request.repo_path = "other/repo".into(),
+                2 => request.branch = "other".into(),
+                3 => request.target_commit = BASE.into(),
+                4 => request.base_commit = TARGET.into(),
+                5 => request.mode = TopUpMode::Full,
+                6 => request.format_version = 2,
+                _ => unreachable!(),
+            }
+            assert!(candidate.validate_for(identity(SyncMode::Head)).is_err());
         }
     }
 
@@ -631,6 +704,11 @@ mod tests {
             "state": {"payload": {"kind": "head_artifact", "manifest": HEAD, "discard_git": false}}
         });
         assert!(serde_json::from_value::<ClonePlanResponse>(malformed).is_err());
+
+        let duplicate = format!(
+            r#"{{"protocol_version":1,"protocol_version":1,"workspace":"acme","repo":"org/repo","branch":"main","mode":"head","target_commit":"{TARGET}","artifact_format_version":1,"state":{{"status":"pending","required":["head"]}}}}"#
+        );
+        assert!(serde_json::from_str::<ClonePlanResponse>(&duplicate).is_err());
     }
 
     #[test]

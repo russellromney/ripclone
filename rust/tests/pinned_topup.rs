@@ -143,9 +143,16 @@ fn artifact_descriptors() -> Vec<PinnedArtifactDescriptor> {
     ]
 }
 
-fn request() -> PinnedBundleRequest {
+fn request(plan: &PinnedTopUpBundle) -> PinnedBundleRequest {
     PinnedBundleRequest {
         manifest_hash: "a".repeat(64),
+        format_version: plan.format_version,
+        workspace_id: plan.workspace_id.clone(),
+        repo_path: plan.repo_path.clone(),
+        base_commit: plan.base_commit.clone(),
+        target_commit: plan.target_commit.clone(),
+        branch: plan.branch.clone(),
+        mode: plan.mode,
     }
 }
 
@@ -154,9 +161,10 @@ fn install_plan(
     plan: PinnedTopUpBundle,
     inner: &ArtifactInstaller,
 ) -> Result<ripclone::topup::TopUpOutcome> {
+    let request = request(&plan);
     install_pinned_bundle(
         destination,
-        &request(),
+        &request,
         &BoundInstaller {
             inner,
             bundle: plan,
@@ -226,8 +234,31 @@ fn reused_receipt_cannot_retarget_artifacts_containing_multiple_commits() {
     };
     let root = tempfile::tempdir().unwrap();
     let destination = root.path().join("clone");
-    let err = install_pinned_bundle(&destination, &request(), &bound).unwrap_err();
+    let request = request(&bound.bundle);
+    let err = install_pinned_bundle(&destination, &request, &bound).unwrap_err();
     assert!(err.to_string().contains("semantic digest mismatch"));
+    assert!(!destination.exists());
+}
+
+#[test]
+fn valid_bundle_for_another_request_identity_is_rejected() {
+    let f = Fixture::new();
+    let base = f.commit("base", "base");
+    let target = f.commit("target", "target");
+    let artifact = f.artifact();
+    let install = installer(&artifact);
+    let actual = bundle(&base, &target, TopUpMode::Full);
+    let bound = BoundInstaller {
+        inner: &install,
+        bundle: actual.clone(),
+        digest_bundle: None,
+    };
+    let mut wrong_request = request(&actual);
+    wrong_request.workspace_id = "another-workspace".into();
+    let root = tempfile::tempdir().unwrap();
+    let destination = root.path().join("clone");
+    let err = install_pinned_bundle(&destination, &wrong_request, &bound).unwrap_err();
+    assert!(err.to_string().contains("semantic identity"));
     assert!(!destination.exists());
 }
 
@@ -512,7 +543,13 @@ fn installer_auth_expiry_or_unavailable_failure_is_redacted_and_atomic() {
     ] {
         let root = tempfile::tempdir().unwrap();
         let destination = root.path().join("clone");
-        let err = install_pinned_bundle(&destination, &request(), &Failing(reason)).unwrap_err();
+        let plan = bundle(
+            "1111111111111111111111111111111111111111",
+            "2222222222222222222222222222222222222222",
+            TopUpMode::Full,
+        );
+        let err =
+            install_pinned_bundle(&destination, &request(&plan), &Failing(reason)).unwrap_err();
         assert!(err.to_string().contains(message));
         assert!(!destination.exists());
     }
@@ -577,7 +614,8 @@ fn concurrent_destination_is_never_replaced() {
         },
         final_path: destination.clone(),
     };
-    assert!(install_pinned_bundle(&destination, &request(), &racing).is_err());
+    let request = request(&racing.inner.bundle);
+    assert!(install_pinned_bundle(&destination, &request, &racing).is_err());
     assert_eq!(
         std::fs::read_to_string(destination.join("winner")).unwrap(),
         "keep"
