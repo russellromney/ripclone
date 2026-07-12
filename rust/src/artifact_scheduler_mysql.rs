@@ -6,9 +6,10 @@
 
 use crate::artifact_scheduler::{
     ArtifactKey, ArtifactKind, ArtifactRecord, ArtifactState, ClaimedArtifact,
-    CompletionSealAuthority, CompletionVerifier, FailureClass, ObservationOutcome, RetryOutcome,
-    ScheduleOutcome, SchedulerLimits, VerifiedCompletionEvidence, scheduler_fingerprint,
-    ObservationSnapshot, validate_lease, validate_limits, validate_resolved_commit,
+    CompletionSealAuthority, CompletionVerifier, FailureClass, ObservationOutcome,
+    ObservationSnapshot, RetryOutcome, ScheduleOutcome, SchedulerLimits,
+    VerifiedCompletionEvidence, scheduler_fingerprint, validate_lease, validate_limits,
+    validate_resolved_commit,
 };
 #[cfg(test)]
 use crate::artifact_scheduler::{CompletionEvidence, validate_evidence};

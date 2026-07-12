@@ -63,26 +63,13 @@ pub struct Backends {
     /// Normalized artifact scheduler. Present only when the caller explicitly
     /// supplies a production completion verifier.
     pub artifact_scheduler: Option<Arc<dyn ArtifactSchedulerPersistence>>,
+    /// The exact strict verifier installed in the normalized scheduler. Typed
+    /// builders, admission, clone transport, scrub, and GC must clone this Arc;
+    /// reconstructing policy independently can split format/proof authority.
+    pub artifact_verifier: Option<Arc<CasCompletionVerifier>>,
 }
 
 impl Backends {
-    /// Strict normalized-artifact policy factory. Call exactly once at runtime
-    /// startup and share the returned verifier (or cheap clones of it) with the
-    /// SQL scheduler and every `TypedArtifactBuilder`; do not reconstruct it in
-    /// workers. Missing/short proof authority fails startup here.
-    pub fn normalized_artifact_verifier(
-        &self,
-        limits: crate::artifact_manifest::ArtifactVerificationLimits,
-    ) -> Result<Arc<crate::artifact_manifest::CasCompletionVerifier>> {
-        Ok(Arc::new(
-            crate::artifact_manifest::CasCompletionVerifier::from_env_with_limits(
-                self.cas.clone(),
-                self.storage.clone(),
-                limits,
-            )?,
-        ))
-    }
-
     /// Build storage + metadata store + retention from the environment, factored
     /// out so the server and the worker share it. Does **not** start the
     /// retention sweep loop or migrate legacy refs — those are server-startup
@@ -134,14 +121,6 @@ impl Backends {
         scheduler: SchedulerRequest,
     ) -> Result<Self> {
         let cas = Cas::new(cas_dir)?;
-        let scheduler = match scheduler {
-            SchedulerRequest::Disabled => None,
-            SchedulerRequest::Production => Some((
-                SchedulerLimits::default(),
-                Arc::new(CasCompletionVerifier::new(cas.clone())) as Arc<dyn CompletionVerifier>,
-            )),
-            SchedulerRequest::Injected(limits, verifier) => Some((limits, verifier)),
-        };
         let s3_storage =
             S3Storage::from_env_or_config(&config().storage).context("initialize S3 storage")?;
         let (storage, s3): (StorageRef, Option<Arc<S3Storage>>) = if let Some(s3) = s3_storage {
@@ -154,6 +133,24 @@ impl Backends {
         } else {
             info!("using local storage at {}", cas_dir.display());
             (local(cas_dir)?, None)
+        };
+        let (scheduler, artifact_verifier) = match scheduler {
+            SchedulerRequest::Disabled => (None, None),
+            SchedulerRequest::Production => {
+                let verifier = Arc::new(CasCompletionVerifier::from_env_with_limits(
+                    cas.clone(),
+                    storage.clone(),
+                    crate::artifact_manifest::ArtifactVerificationLimits::default(),
+                )?);
+                (
+                    Some((
+                        SchedulerLimits::default(),
+                        verifier.clone() as Arc<dyn CompletionVerifier>,
+                    )),
+                    Some(verifier),
+                )
+            }
+            SchedulerRequest::Injected(limits, verifier) => (Some((limits, verifier)), None),
         };
         let (ref_store, artifact_scheduler) =
             select_metadata(repo_root, s3.as_ref(), scheduler).await?;
@@ -177,6 +174,7 @@ impl Backends {
             retention,
             repo_root: repo_root.to_path_buf(),
             artifact_scheduler,
+            artifact_verifier,
         })
     }
 }
