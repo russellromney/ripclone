@@ -5216,6 +5216,58 @@ fn assemble_variant(
     ))
 }
 
+/// TEST-ONLY: hand each phase-2 build a distinct sequence number when
+/// `RIPCLONE_TEST_PHASE2_RACE` is set. A regression test uses it to drive two
+/// overlapping same-commit phase-2 builds that produce *different* idx bundles —
+/// reproducing on a small fixture the divergence that `git pack-objects`'
+/// run-to-run non-determinism produces between two concurrent builds of a large
+/// repo on real infra. Returns `None` (no-op) when the hook is unset.
+fn phase2_race_seq() -> Option<u64> {
+    if std::env::var_os("RIPCLONE_TEST_PHASE2_RACE").is_some() {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        Some(SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
+    } else {
+        None
+    }
+}
+
+/// TEST-ONLY companion to [`phase2_race_seq`]: append the build's sequence number
+/// to the idx bundle so two concurrent same-commit builds store *different*
+/// bundles. The nonce is trailing, so pack idx slices (indexed by offset) are
+/// unchanged; only the bundle `ChunkRef` length grows so the client's size check
+/// still matches. No-op when `seq` is `None`.
+fn phase2_race_salt_bundle(
+    cas: &Cas,
+    bundle_ref: Option<ChunkRef>,
+    bundle_hash: String,
+    seq: Option<u64>,
+) -> Result<(Option<ChunkRef>, String)> {
+    let (Some(seq), Some(mut r)) = (seq, bundle_ref.clone()) else {
+        return Ok((bundle_ref, bundle_hash));
+    };
+    if bundle_hash.is_empty() {
+        return Ok((bundle_ref, bundle_hash));
+    }
+    let mut bytes = cas.get(&bundle_hash)?;
+    bytes.extend_from_slice(&seq.to_le_bytes());
+    let hash = cas.put(&bytes)?;
+    r.hash = hash_from_hex(&hash)?;
+    r.len = bytes.len() as u64;
+    Ok((Some(r), hash))
+}
+
+/// TEST-ONLY: per-sequence `(pre-editable, pre-files)` sleeps (ms) that bracket
+/// build 0's two publishes around build 1's, so the current partial files publish
+/// lands build 0's manifest on top of build 1's idx bundle — the exact divergent
+/// interleave. No-op unless `RIPCLONE_TEST_PHASE2_RACE` is set.
+fn phase2_race_delays(seq: Option<u64>) -> (u64, u64) {
+    match seq {
+        Some(0) => (3000, 8000),
+        Some(1) => (4000, 0),
+        _ => (0, 0),
+    }
+}
+
 /// Build a multi-pack-index over `packs` from local CAS. Free-function form.
 ///
 /// Reads each pack's bytes from the *local* CAS (no object-storage fallback), so
@@ -6850,6 +6902,11 @@ async fn build_full_in_background(
         .collect();
     let (full_entries, full_idx_bundle_ref, full_idx_bundle_hash) =
         assemble_variant(cas, storage, &full_tagged)?;
+    // TEST-ONLY: give overlapping same-commit builds distinct idx bundles.
+    let race_seq = phase2_race_seq();
+    let (race_pre_editable_ms, race_pre_files_ms) = phase2_race_delays(race_seq);
+    let (full_idx_bundle_ref, full_idx_bundle_hash) =
+        phase2_race_salt_bundle(cas, full_idx_bundle_ref, full_idx_bundle_hash, race_seq)?;
 
     // The shallow metadata already has the files table and skeleton, and an
     // editable clone ignores the archive, so reuse it and leave archive_chunks
@@ -6895,6 +6952,11 @@ async fn build_full_in_background(
         && let Ok(ms) = ms.parse::<u64>()
     {
         tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+    }
+    // TEST-ONLY: hold this build's editable publish so a concurrent same-commit
+    // build passes its reuse check and starts (see phase2_race_delays).
+    if race_pre_editable_ms > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(race_pre_editable_ms)).await;
     }
 
     // Publish the editable full clonepack. archive_chunks stays empty until the
@@ -7013,14 +7075,29 @@ async fn build_full_in_background(
     );
     upload_artifacts(cas, storage, uploads.clone(), upload_conc).await?;
 
+    // TEST-ONLY: hold this build's files publish so a concurrent same-commit build
+    // completes its editable+files publishes in between (see phase2_race_delays).
+    if race_pre_files_ms > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(race_pre_files_ms)).await;
+    }
+
     // Add the archive to the full clonepack, only if the ref still points at our
-    // commit (a newer sync owns it otherwise, and brings its own archive).
+    // commit AND still carries *this* build's idx bundle. The second guard is the
+    // ownership check: this is a load-modify-save with no lock, and same-commit
+    // builds may overlap (each detached phase 2 keeps running after `/sync`
+    // returns, and should_replace_ref lets an equal-commit save win). This publish
+    // only re-points `manifest`/`metadata_chunk`; it must not do that on top of
+    // another build's `idx_bundle`, or the served idx_bundle_url (that build's
+    // bundle) and manifest.idx_bundle (this build's) would diverge and every
+    // editable clone would fail the idx-bundle hash check. If another same-commit
+    // build now owns the full clonepack, skip — it publishes its own consistent
+    // files variant.
     {
         let mut info = ref_store
             .load_branch(repo_id, branch)
             .await?
             .ok_or_else(|| anyhow::anyhow!("ref vanished before archive publish"))?;
-        if info.commit == commit {
+        if info.commit == commit && info.full_clonepack.idx_bundle == full_idx_bundle_hash {
             info.metadata_chunk = files_metadata_hash.clone();
             info.manifest = files_metadata_hash.clone();
             info.archive = archive_chunk_hashes.first().cloned().unwrap_or_default();
@@ -7031,6 +7108,20 @@ async fn build_full_in_background(
             info.archive_frames = archive_frames;
             info.build_status = None;
             info.build_ms = Some(duration_ms(build_started_at.elapsed()));
+            // Loud integrity guard: the served idx_bundle (full_clonepack.idx_bundle,
+            // signed into idx_bundle_url) MUST equal the idx bundle inside the
+            // manifest we now point clients at, or the clone's hash check fails.
+            let manifest_bundle = files_manifest
+                .idx_bundle
+                .as_ref()
+                .map(|c| crate::clonepack::hash_to_hex(&c.hash))
+                .unwrap_or_default();
+            anyhow::ensure!(
+                manifest_bundle == info.full_clonepack.idx_bundle,
+                "full clonepack idx_bundle integrity for {}@{branch}: served {} != manifest {manifest_bundle}",
+                repo_id.storage_key(),
+                info.full_clonepack.idx_bundle,
+            );
             ref_store
                 .save_branch(repo_id, branch, &info)
                 .await
