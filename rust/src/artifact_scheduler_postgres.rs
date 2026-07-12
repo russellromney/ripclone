@@ -179,13 +179,13 @@ impl PostgresArtifactScheduler {
                  WHEN c.table_name='artifact_observations' AND c.column_name='published_artifact_id'
                    THEN 'YES' ELSE 'NO' END
                OR (c.table_name='artifact_jobs' AND c.column_name='id'
-                   AND c.column_default <> $d$nextval('artifact_jobs_id_seq'::regclass)$d$)
+                   AND c.column_default IS DISTINCT FROM $d$nextval('artifact_jobs_id_seq'::regclass)$d$)
                OR (c.table_name='artifact_jobs' AND c.column_name IN(
                      'lease_generation','claim_attempts','retry_count')
-                   AND c.column_default <> '0')
+                   AND c.column_default IS DISTINCT FROM '0')
                OR (c.table_name='scheduler_state' AND c.column_name IN(
                      'workspace_cursor','config_fingerprint')
-                   AND c.column_default <> $d$''::text$d$)
+                   AND c.column_default IS DISTINCT FROM $d$''::text$d$)
                OR (NOT (
                      (c.table_name='artifact_jobs' AND c.column_name IN(
                        'id','lease_generation','claim_attempts','retry_count'))
@@ -1953,6 +1953,30 @@ mod tests {
             .await
             .is_err(),
             "schema with nullable format_version was accepted"
+        );
+
+        reset(&control).await;
+        let default_pool = PgPoolOptions::new().connect(&url).await.unwrap();
+        PostgresArtifactScheduler::from_pool(
+            default_pool.clone(),
+            Default::default(),
+            Arc::new(Accept),
+        )
+        .await
+        .unwrap();
+        sqlx::query("ALTER TABLE artifact_jobs ALTER COLUMN lease_generation DROP DEFAULT")
+            .execute(&default_pool)
+            .await
+            .unwrap();
+        assert!(
+            PostgresArtifactScheduler::from_pool(
+                PgPoolOptions::new().connect(&url).await.unwrap(),
+                Default::default(),
+                Arc::new(Accept)
+            )
+            .await
+            .is_err(),
+            "schema missing a required lease_generation default was accepted"
         );
 
         reset(&control).await;
