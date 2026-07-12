@@ -6,9 +6,7 @@
 //! visible. Poll/webhook traffic never repairs an unchanged commit; explicit
 //! install/API/button requests may idempotently ensure it.
 
-use crate::artifact_scheduler::{
-    ArtifactKey, ArtifactKind, ObservationOutcome, ObservationSnapshot, ScheduleOutcome,
-};
+use crate::artifact_scheduler::{ArtifactKind, ObservationSnapshot, ScheduleOutcome};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 
@@ -92,6 +90,13 @@ pub enum BranchSyncOutcome {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TipObservationOutcome {
+    Advanced { generation: u64 },
+    Unchanged { generation: u64 },
+    Stale { current_generation: u64 },
+}
+
 #[async_trait]
 pub trait BranchTipResolver: Send + Sync {
     /// Resolve the provider's current branch tip. Webhook payload SHAs are not
@@ -125,17 +130,20 @@ pub trait ArtifactObservation: Send + Sync {
         branch: &str,
     ) -> Result<ObservationSnapshot>;
 
-    async fn observe(
+    /// Record the exact branch target under the snapshot CAS without admitting
+    /// artifact work. This durable movement must succeed independently of
+    /// per-mode backlog pressure.
+    async fn record_tip(
         &self,
         snapshot: &ObservationSnapshot,
         commit: &str,
-        kinds: &[ArtifactKind],
-        format_version: u32,
-    ) -> Result<ObservationOutcome>;
+    ) -> Result<TipObservationOutcome>;
 
-    /// Explicit same-commit repair surface. Implementations schedule missing
-    /// work, subscribe to queued/running work, preserve Ready work, and apply
-    /// the scheduler's bounded retry policy to retryable failures.
+    /// Independently ensure every mode. Implementations must durably remember
+    /// each requested mode even when its runnable lane is saturated: capacity
+    /// may defer execution, but must not roll back another mode or the recorded
+    /// branch target. Retryable failures obey the configured retry cap;
+    /// permanent/dead-lettered work is never revived.
     async fn ensure_exact(
         &self,
         workspace: &str,
@@ -184,33 +192,11 @@ where
             crate::artifact_scheduler::validate_canonical_commit_oid(&commit)
                 .context("provider returned a non-canonical commit")?;
 
-            if before.commit() == Some(commit.as_str()) {
+            if before.commit() == Some(commit.as_str())
+                && request.intent == SyncIntent::ObserveMovement
+            {
                 let generation = before.generation().unwrap_or(0);
-                if request.intent == SyncIntent::ObserveMovement {
-                    return Ok(BranchSyncOutcome::Unchanged { commit, generation });
-                }
-                let source = self
-                    .sources
-                    .acquire_exact(&request.workspace, &request.repo, &commit)
-                    .await
-                    .context("ensure durable source snapshot")?;
-                validate_source_identity(request, &commit, &source)?;
-                let artifacts = self
-                    .observations
-                    .ensure_exact(
-                        &request.workspace,
-                        &request.repo,
-                        &commit,
-                        &kinds,
-                        request.format_version,
-                    )
-                    .await
-                    .context("ensure same-commit artifact work")?;
-                return Ok(BranchSyncOutcome::Ensured {
-                    commit,
-                    generation,
-                    artifacts,
-                });
+                return Ok(BranchSyncOutcome::Unchanged { commit, generation });
             }
 
             let source = self
@@ -221,21 +207,29 @@ where
             validate_source_identity(request, &commit, &source)?;
             match self
                 .observations
-                .observe(&before, &commit, &kinds, request.format_version)
+                .record_tip(&before, &commit)
                 .await
                 .context("publish normalized branch observation")?
             {
-                ObservationOutcome::Accepted {
-                    generation,
-                    artifacts,
-                } => {
+                TipObservationOutcome::Advanced { generation } => {
+                    let artifacts = self
+                        .observations
+                        .ensure_exact(
+                            &request.workspace,
+                            &request.repo,
+                            &commit,
+                            &kinds,
+                            request.format_version,
+                        )
+                        .await
+                        .context("ensure independently scheduled artifact work")?;
                     return Ok(BranchSyncOutcome::Ensured {
                         commit,
                         generation,
                         artifacts,
                     });
                 }
-                ObservationOutcome::Unchanged { generation } => {
+                TipObservationOutcome::Unchanged { generation } => {
                     if request.intent == SyncIntent::ObserveMovement {
                         return Ok(BranchSyncOutcome::Unchanged { commit, generation });
                     }
@@ -256,7 +250,7 @@ where
                         artifacts,
                     });
                 }
-                ObservationOutcome::Stale { .. } => {
+                TipObservationOutcome::Stale { .. } => {
                     // Re-resolve the provider. Reusing `commit` here could let a
                     // delayed webhook or force-push loser regress the branch.
                 }
@@ -292,63 +286,6 @@ fn validate_source_identity(
         bail!("durable source snapshot identity does not match resolved target")
     }
     Ok(())
-}
-
-/// Adapter for the production scheduler. Explicit repair respects the
-/// scheduler's bounded retry policy and never revives permanent/dead-lettered
-/// work.
-#[async_trait]
-impl ArtifactObservation for dyn crate::artifact_scheduler_backend::ArtifactSchedulerPersistence {
-    async fn snapshot(
-        &self,
-        workspace: &str,
-        repo: &str,
-        branch: &str,
-    ) -> Result<ObservationSnapshot> {
-        self.observation_snapshot(workspace, repo, branch).await
-    }
-
-    async fn observe(
-        &self,
-        snapshot: &ObservationSnapshot,
-        commit: &str,
-        kinds: &[ArtifactKind],
-        format_version: u32,
-    ) -> Result<ObservationOutcome> {
-        self.observe_if_changed(snapshot, commit, kinds, format_version)
-            .await
-    }
-
-    async fn ensure_exact(
-        &self,
-        workspace: &str,
-        repo: &str,
-        commit: &str,
-        kinds: &[ArtifactKind],
-        format_version: u32,
-    ) -> Result<Vec<(ArtifactKind, ScheduleOutcome)>> {
-        let mut outcomes = Vec::with_capacity(kinds.len());
-        for kind in kinds {
-            let key = ArtifactKey {
-                workspace: workspace.to_owned(),
-                repo: repo.to_owned(),
-                commit: commit.to_owned(),
-                kind: *kind,
-                format_version,
-            };
-            let mut outcome = self.schedule(&key).await?;
-            if matches!(
-                outcome,
-                ScheduleOutcome::Failed(_, crate::artifact_scheduler::FailureClass::Retryable)
-            ) && let crate::artifact_scheduler::RetryOutcome::Requeued(id) =
-                self.retry_failed(&key).await?
-            {
-                outcome = ScheduleOutcome::Enqueued(id);
-            }
-            outcomes.push((*kind, outcome));
-        }
-        Ok(outcomes)
-    }
 }
 
 #[cfg(test)]
@@ -410,7 +347,7 @@ mod tests {
     #[derive(Clone)]
     struct Observations {
         snapshots: Arc<Mutex<VecDeque<ObservationSnapshot>>>,
-        outcomes: Arc<Mutex<VecDeque<ObservationOutcome>>>,
+        outcomes: Arc<Mutex<VecDeque<TipObservationOutcome>>>,
         observed: Arc<Mutex<Vec<String>>>,
         ensured: Arc<Mutex<Vec<String>>>,
     }
@@ -425,13 +362,11 @@ mod tests {
                 .expect("observation snapshot"))
         }
 
-        async fn observe(
+        async fn record_tip(
             &self,
             _: &ObservationSnapshot,
             commit: &str,
-            _: &[ArtifactKind],
-            _: u32,
-        ) -> Result<ObservationOutcome> {
+        ) -> Result<TipObservationOutcome> {
             self.observed.lock().unwrap().push(commit.to_owned());
             Ok(self
                 .outcomes
@@ -471,7 +406,7 @@ mod tests {
     fn fixture(
         commits: Vec<Result<&str, &str>>,
         snapshots: Vec<ObservationSnapshot>,
-        outcomes: Vec<ObservationOutcome>,
+        outcomes: Vec<TipObservationOutcome>,
     ) -> (
         NormalizedSyncCoordinator<Resolver, Sources, Observations>,
         Resolver,
@@ -517,15 +452,8 @@ mod tests {
         }
     }
 
-    fn scheduled(generation: u64) -> ObservationOutcome {
-        ObservationOutcome::Accepted {
-            generation,
-            artifacts: vec![
-                (ArtifactKind::Head, ScheduleOutcome::Enqueued(1)),
-                (ArtifactKind::FullHistory, ScheduleOutcome::Enqueued(2)),
-                (ArtifactKind::Files, ScheduleOutcome::Enqueued(3)),
-            ],
-        }
+    fn scheduled(generation: u64) -> TipObservationOutcome {
+        TipObservationOutcome::Advanced { generation }
     }
 
     #[tokio::test]
@@ -594,7 +522,7 @@ mod tests {
             vec![Ok(C2), Ok(C3)],
             vec![snapshot(Some(1), Some(C1)), snapshot(Some(2), Some(C2))],
             vec![
-                ObservationOutcome::Stale {
+                TipObservationOutcome::Stale {
                     current_generation: 2,
                 },
                 scheduled(3),
@@ -615,8 +543,11 @@ mod tests {
 
     #[tokio::test]
     async fn explicit_same_commit_request_idempotently_ensures_source_and_jobs() {
-        let (coordinator, _, sources, observations) =
-            fixture(vec![Ok(C1)], vec![snapshot(Some(9), Some(C1))], vec![]);
+        let (coordinator, _, sources, observations) = fixture(
+            vec![Ok(C1)],
+            vec![snapshot(Some(9), Some(C1))],
+            vec![TipObservationOutcome::Unchanged { generation: 9 }],
+        );
         let outcome = coordinator
             .sync_branch(&request(SyncIntent::EnsureCurrent))
             .await
@@ -628,7 +559,33 @@ mod tests {
         ));
         assert_eq!(*sources.calls.lock().unwrap(), vec![C1]);
         assert_eq!(*observations.ensured.lock().unwrap(), vec![C1]);
-        assert!(observations.observed.lock().unwrap().is_empty());
+        assert_eq!(*observations.observed.lock().unwrap(), vec![C1]);
+    }
+
+    #[tokio::test]
+    async fn explicit_same_commit_ensure_is_generation_fenced_and_reresolves() {
+        let (coordinator, resolver, sources, observations) = fixture(
+            vec![Ok(C1), Ok(C2)],
+            vec![snapshot(Some(1), Some(C1)), snapshot(Some(2), Some(C2))],
+            vec![
+                TipObservationOutcome::Stale {
+                    current_generation: 2,
+                },
+                TipObservationOutcome::Unchanged { generation: 2 },
+            ],
+        );
+        let outcome = coordinator
+            .sync_branch(&request(SyncIntent::EnsureCurrent))
+            .await
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            BranchSyncOutcome::Ensured { commit, generation: 2, .. } if commit == C2
+        ));
+        assert_eq!(*resolver.calls.lock().unwrap(), 2);
+        assert_eq!(*sources.calls.lock().unwrap(), vec![C1, C2]);
+        assert_eq!(*observations.observed.lock().unwrap(), vec![C1, C2]);
+        assert_eq!(*observations.ensured.lock().unwrap(), vec![C2]);
     }
 
     #[tokio::test]
@@ -636,7 +593,7 @@ mod tests {
         let (coordinator, _, sources, observations) = fixture(
             vec![Ok(C2)],
             vec![snapshot(Some(1), Some(C1))],
-            vec![ObservationOutcome::Unchanged { generation: 2 }],
+            vec![TipObservationOutcome::Unchanged { generation: 2 }],
         );
         let outcome = coordinator
             .sync_branch(&request(SyncIntent::EnsureCurrent))
@@ -699,16 +656,16 @@ mod tests {
                 snapshot(Some(3), Some(C3)),
             ],
             vec![
-                ObservationOutcome::Stale {
+                TipObservationOutcome::Stale {
                     current_generation: 1,
                 },
-                ObservationOutcome::Stale {
+                TipObservationOutcome::Stale {
                     current_generation: 2,
                 },
-                ObservationOutcome::Stale {
+                TipObservationOutcome::Stale {
                     current_generation: 3,
                 },
-                ObservationOutcome::Stale {
+                TipObservationOutcome::Stale {
                     current_generation: 4,
                 },
             ],
