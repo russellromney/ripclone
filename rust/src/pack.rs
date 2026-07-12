@@ -9,6 +9,7 @@ const HISTORY_REUSE_MAX_PACK_BYTES: u64 = 64 * 1024 * 1024;
 pub struct PackBuilder<'a> {
     repo: PathBuf,
     cas: &'a Cas,
+    scratch: Option<PathBuf>,
 }
 
 /// Result of an LSM incremental build. Each pack is `(pack_hash, pack_len,
@@ -50,6 +51,30 @@ impl<'a> PackBuilder<'a> {
         Self {
             repo: repo.as_ref().to_path_buf(),
             cas,
+            scratch: None,
+        }
+    }
+
+    /// Constrain all pack/index scratch to an attempt-owned directory.
+    pub fn new_in_scratch<P: AsRef<Path>, Q: AsRef<Path>>(
+        repo: P,
+        cas: &'a Cas,
+        scratch: Q,
+    ) -> Self {
+        Self {
+            repo: repo.as_ref().to_path_buf(),
+            cas,
+            scratch: Some(scratch.as_ref().to_path_buf()),
+        }
+    }
+
+    fn tempdir(&self) -> Result<tempfile::TempDir> {
+        match &self.scratch {
+            Some(root) => {
+                std::fs::create_dir_all(root)?;
+                Ok(tempfile::Builder::new().prefix("pack.").tempdir_in(root)?)
+            }
+            None => Ok(tempfile::TempDir::new()?),
         }
     }
 
@@ -137,7 +162,22 @@ impl<'a> PackBuilder<'a> {
     /// accurate cached blob sizes. After the client materializes files it must
     /// clear skip-worktree for those paths.
     pub fn build_prebuilt_index(&self, commit: &str, skeleton_pack_hash: &str) -> Result<String> {
-        let tmp = tempfile::TempDir::new()?;
+        self.build_prebuilt_index_from_packs(commit, &[skeleton_pack_hash.to_owned()])
+    }
+
+    /// Build a ready-to-use index from a complete set of immutable HEAD packs.
+    /// This is the typed-artifact variant of [`Self::build_prebuilt_index`]: a
+    /// large HEAD closure may be partitioned, so installing only one pack would
+    /// make the index accidentally depend on the source mirror.
+    pub fn build_prebuilt_index_from_packs(
+        &self,
+        commit: &str,
+        pack_hashes: &[String],
+    ) -> Result<String> {
+        if pack_hashes.is_empty() {
+            bail!("cannot build prebuilt index without HEAD packs");
+        }
+        let tmp = self.tempdir()?;
         let work = tmp.path();
         let git_dir = work.join(".git");
 
@@ -145,13 +185,15 @@ impl<'a> PackBuilder<'a> {
         let pack_dir = git_dir.join("objects").join("pack");
         std::fs::create_dir_all(&pack_dir)?;
 
-        let pack_data = self
-            .cas
-            .get(skeleton_pack_hash)
-            .context("fetch skeleton pack for index build")?;
-        let pack_path = pack_dir.join("skeleton.pack");
-        std::fs::write(&pack_path, &pack_data)?;
-        git::index_pack(&git_dir, &pack_path)?;
+        for (index, pack_hash) in pack_hashes.iter().enumerate() {
+            let pack_data = self
+                .cas
+                .get(pack_hash)
+                .context("fetch HEAD pack for index build")?;
+            let pack_path = pack_dir.join(format!("head-{index}.pack"));
+            std::fs::write(&pack_path, &pack_data)?;
+            git::index_pack(&git_dir, &pack_path)?;
+        }
 
         git::set_head(&git_dir, commit)?;
         git::read_tree(&git_dir, commit)?;
@@ -493,7 +535,7 @@ impl<'a> PackBuilder<'a> {
         commit: &str,
         max_pack_bytes: u64,
     ) -> Result<Vec<(String, u64, String, u64)>> {
-        let tmp = tempfile::TempDir::new()?;
+        let tmp = self.tempdir()?;
         let prefix = tmp.path().join("pack");
         git::pack_objects_reachable_to_prefix(&self.repo, commit, &prefix, max_pack_bytes)?;
         self.store_packs_from_dir(tmp.path())
@@ -675,7 +717,7 @@ impl<'a> PackBuilder<'a> {
             bail!("no objects to pack");
         }
 
-        let tmp = tempfile::TempDir::new()?;
+        let tmp = self.tempdir()?;
         let prefix = tmp.path().join("pack");
         // The gix encoder is currently undeltified (deterministic, sorted OIDs).
         // Use it for HEAD-closure packs when requested; keep C-git for deltified
