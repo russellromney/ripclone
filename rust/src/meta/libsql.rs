@@ -5,9 +5,10 @@ use super::{MetaDb, RefRow};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use libsql::{Builder, Connection, Database};
+use std::sync::Arc;
 
 pub struct LibsqlMeta {
-    db: Database,
+    db: Arc<Database>,
 }
 
 impl LibsqlMeta {
@@ -16,11 +17,25 @@ impl LibsqlMeta {
             .build()
             .await
             .with_context(|| format!("open libsql remote metadata {url}"))?;
-        Ok(Self { db })
+        Ok(Self { db: Arc::new(db) })
     }
 
     async fn conn(&self) -> Result<Connection> {
         self.db.connect().context("libsql connect")
+    }
+
+    /// Construct the normalized artifact scheduler on this metadata database.
+    pub async fn artifact_scheduler(
+        &self,
+        limits: crate::artifact_scheduler::SchedulerLimits,
+        verifier: std::sync::Arc<dyn crate::artifact_scheduler::CompletionVerifier>,
+    ) -> Result<crate::artifact_scheduler_libsql::LibsqlArtifactScheduler> {
+        crate::artifact_scheduler_libsql::LibsqlArtifactScheduler::from_shared_database(
+            Arc::clone(&self.db),
+            limits,
+            verifier,
+        )
+        .await
     }
 }
 
