@@ -144,6 +144,8 @@ pub mod snapshot;
 #[doc(hidden)]
 pub mod statx_compat;
 pub mod storage;
+#[doc(hidden)]
+pub mod sync_coordinator;
 pub mod topup;
 
 #[cfg(test)]
