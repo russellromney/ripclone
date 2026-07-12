@@ -6,7 +6,8 @@
 //! never gates admission.
 
 use crate::artifact_scheduler::{
-    ArtifactKey, ArtifactKind, ArtifactRecord, ArtifactState, FailureClass, ScheduleOutcome,
+    ArtifactKey, ArtifactKind, ArtifactRecord, ArtifactState, FailureClass, QuarantineOutcome,
+    ScheduleOutcome,
 };
 use crate::artifact_scheduler_backend::ArtifactSchedulerPersistence;
 use crate::provider::RepoId;
@@ -15,16 +16,21 @@ use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use futures::{StreamExt, stream};
 use sha2::{Digest, Sha256};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::time::Duration;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
-const DEFAULT_FORMAT_VERSION: u32 = 1;
 const DEFAULT_CONSUMER_TTL_SECS: i64 = 60 * 60;
+const ACTIVATION_FENCE_TTL_SECS: i64 = 60;
+const ACTIVATION_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_RECONCILE_CONCURRENCY: usize = 8;
-const DEFAULT_VERIFICATION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
-const DEFAULT_VERIFICATION_CANCEL_GRACE: Duration = Duration::from_secs(30);
+const DEFAULT_VERIFICATION_TIMEOUT: Duration = Duration::from_secs(2 * 60);
+const DEFAULT_VERIFICATION_CANCEL_GRACE: Duration = Duration::from_secs(5);
+const DEFAULT_VERIFICATION_QUEUE_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdmissionVerification {
@@ -51,8 +57,19 @@ pub enum AdmissionOutcome {
     Failed(String),
     WaitingForTarget,
     WaitingForArtifacts,
+    /// Verification isolation has lost every capacity slot. Readiness should
+    /// report degraded until the coordinator/verifier process is replaced.
+    Degraded(String),
     StaleAttempt,
     Activated,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmissionReadiness {
+    pub healthy: bool,
+    pub poisoned_verifier_slots: usize,
+    pub verifier_slots: usize,
+    pub busy_verifier_slots: usize,
 }
 
 pub struct ArtifactAdmissionCoordinator {
@@ -63,8 +80,27 @@ pub struct ArtifactAdmissionCoordinator {
     consumer_ttl_secs: i64,
     reconcile_concurrency: usize,
     verification_limit: Arc<Semaphore>,
+    verification_slots: usize,
+    poisoned_verifier_slots: Arc<AtomicUsize>,
     verification_timeout: Duration,
     verification_cancel_grace: Duration,
+    verification_queue_timeout: Duration,
+    #[cfg(test)]
+    after_subscribe: Option<Arc<dyn TestSubscriptionHook>>,
+    #[cfg(test)]
+    after_activation_fence: Option<Arc<dyn TestActivationFenceHook>>,
+}
+
+#[cfg(test)]
+#[async_trait]
+trait TestSubscriptionHook: Send + Sync {
+    async fn subscribed(&self, kind: ArtifactKind);
+}
+
+#[cfg(test)]
+#[async_trait]
+trait TestActivationFenceHook: Send + Sync {
+    async fn fenced(&self);
 }
 
 impl ArtifactAdmissionCoordinator {
@@ -72,18 +108,44 @@ impl ArtifactAdmissionCoordinator {
         scheduler: Arc<dyn ArtifactSchedulerPersistence>,
         ref_store: Arc<dyn RefStore>,
         verifier: Arc<dyn AdmissionPublicationVerifier>,
-    ) -> Self {
-        Self {
+        format_version: u32,
+    ) -> Result<Self> {
+        if format_version == 0 {
+            bail!("admission artifact format version must be nonzero")
+        }
+        if !scheduler.manifest_cas_quarantine_supported() {
+            bail!("admission scheduler lacks manifest-CAS quarantine support")
+        }
+        Ok(Self {
             scheduler,
             ref_store,
             verifier,
-            format_version: DEFAULT_FORMAT_VERSION,
+            format_version,
             consumer_ttl_secs: DEFAULT_CONSUMER_TTL_SECS,
             reconcile_concurrency: DEFAULT_RECONCILE_CONCURRENCY,
             verification_limit: Arc::new(Semaphore::new(DEFAULT_RECONCILE_CONCURRENCY)),
+            verification_slots: DEFAULT_RECONCILE_CONCURRENCY,
+            poisoned_verifier_slots: Arc::new(AtomicUsize::new(0)),
             verification_timeout: DEFAULT_VERIFICATION_TIMEOUT,
             verification_cancel_grace: DEFAULT_VERIFICATION_CANCEL_GRACE,
-        }
+            verification_queue_timeout: DEFAULT_VERIFICATION_QUEUE_TIMEOUT,
+            #[cfg(test)]
+            after_subscribe: None,
+            #[cfg(test)]
+            after_activation_fence: None,
+        })
+    }
+
+    #[cfg(test)]
+    fn with_subscription_hook(mut self, hook: Arc<dyn TestSubscriptionHook>) -> Self {
+        self.after_subscribe = Some(hook);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_activation_fence_hook(mut self, hook: Arc<dyn TestActivationFenceHook>) -> Self {
+        self.after_activation_fence = Some(hook);
+        self
     }
 
     #[cfg(test)]
@@ -101,9 +163,29 @@ impl ArtifactAdmissionCoordinator {
     ) -> Self {
         self.reconcile_concurrency = concurrency;
         self.verification_limit = Arc::new(Semaphore::new(concurrency));
+        self.verification_slots = concurrency;
+        self.poisoned_verifier_slots = Arc::new(AtomicUsize::new(0));
         self.verification_timeout = timeout;
         self.verification_cancel_grace = cancel_grace;
+        self.verification_queue_timeout = timeout.min(DEFAULT_VERIFICATION_QUEUE_TIMEOUT);
         self
+    }
+
+    /// A non-draining verifier may still own blocking children after task
+    /// abortion. Such slots are permanently poisoned in this coordinator;
+    /// recovery is intentionally process/coordinator replacement, never an
+    /// unsafe in-place permit reset.
+    pub fn readiness(&self) -> AdmissionReadiness {
+        let poisoned = self.poisoned_verifier_slots.load(Ordering::Acquire);
+        AdmissionReadiness {
+            healthy: poisoned < self.verification_slots,
+            poisoned_verifier_slots: poisoned,
+            verifier_slots: self.verification_slots,
+            busy_verifier_slots: self
+                .verification_slots
+                .saturating_sub(poisoned)
+                .saturating_sub(self.verification_limit.available_permits()),
+        }
     }
 
     /// Subscribe the immutable artifacts required by one pinned admission.
@@ -147,6 +229,20 @@ impl ArtifactAdmissionCoordinator {
                 .subscribe_consumer(&key, &consumer_id, self.consumer_ttl_secs)
                 .await
                 .with_context(|| format!("subscribe admission {kind:?} artifact"))?;
+            #[cfg(test)]
+            if let Some(hook) = &self.after_subscribe {
+                hook.subscribed(kind).await;
+            }
+            // Subscription is durable. Recheck immediately so replacement or
+            // removal racing either subscription cannot leak the old attempt's
+            // consumer or cause the second artifact to be subscribed.
+            if !self
+                .attempt_is_current(repo_id, target, expected_attempt_id)
+                .await?
+            {
+                self.release_attempt_consumers(&repo).await?;
+                return self.reload_outcome(repo_id).await;
+            }
             if let ScheduleOutcome::Failed(id, class) = outcome {
                 let detail = self.artifact_failure_detail(id).await?;
                 if terminal(class) {
@@ -250,16 +346,12 @@ impl ArtifactAdmissionCoordinator {
         match self.verify_publication(&head).await {
             AdmissionVerification::Verified => {}
             AdmissionVerification::Retryable(_) => {
-                return Ok(AdmissionOutcome::WaitingForArtifacts);
+                return self
+                    .retryable_outcome_if_current(&repo, target, attempt_id)
+                    .await;
             }
             AdmissionVerification::Corrupt(error) => {
-                self.fail_if_current(
-                    &repo,
-                    target,
-                    format!("Head publication is corrupt: {error}"),
-                )
-                .await?;
-                return self.reload_outcome(repo_id).await;
+                return self.repair_corrupt(&repo, target, &head, error).await;
             }
         }
         if !self.attempt_is_current(repo_id, target, attempt_id).await? {
@@ -269,29 +361,56 @@ impl ArtifactAdmissionCoordinator {
         match self.verify_publication(&history).await {
             AdmissionVerification::Verified => {}
             AdmissionVerification::Retryable(_) => {
-                return Ok(AdmissionOutcome::WaitingForArtifacts);
+                return self
+                    .retryable_outcome_if_current(&repo, target, attempt_id)
+                    .await;
             }
             AdmissionVerification::Corrupt(error) => {
-                self.fail_if_current(
-                    &repo,
-                    target,
-                    format!("FullHistory publication is corrupt: {error}"),
-                )
-                .await?;
-                return self.reload_outcome(repo_id).await;
+                return self.repair_corrupt(&repo, target, &history, error).await;
             }
         }
 
-        let activated = self
-            .ref_store
-            .activate_repo(repo_id, branch, target, Some(attempt_id))
-            .await?;
+        if !self.attempt_is_current(repo_id, target, attempt_id).await? {
+            self.release_attempt_consumers(&repo).await?;
+            return self.reload_outcome(repo_id).await;
+        }
+        // Acquire one pairwise manifest-CAS guard. Quarantine cannot withdraw
+        // either publication while this expiring guard is live, closing the
+        // cross-store check/activate window without permanent crash leaks.
+        let activation_consumer = activation_fence_consumer_id(repo_id, target, attempt_id);
+        let expected = [
+            (head.id, head.manifest.clone()),
+            (history.id, history.manifest.clone()),
+        ];
+        let Some(fence) = self
+            .scheduler
+            .fence_ready_publications(&expected, &activation_consumer, ACTIVATION_FENCE_TTL_SECS)
+            .await?
+        else {
+            return Ok(AdmissionOutcome::WaitingForArtifacts);
+        };
+        #[cfg(test)]
+        if let Some(hook) = &self.after_activation_fence {
+            hook.fenced().await;
+        }
+
+        let activation = tokio::time::timeout(
+            ACTIVATION_TIMEOUT,
+            self.ref_store
+                .activate_repo(repo_id, branch, target, Some(attempt_id)),
+        )
+        .await;
+        let release = self.scheduler.release_ready_publication_fence(fence).await;
+        let activated = activation
+            .context("repository activation timed out while publication fence was live")??;
         if !activated {
+            release?;
             let _ = self.release_attempt_consumers(&repo).await;
             return self.reload_outcome(repo_id).await;
         }
         // Activation is already durable. A transient cleanup failure must not
         // turn a successfully admitted repository back into an error.
+        let _ = release;
         let _ = self.release_attempt_consumers(&repo).await;
         Ok(AdmissionOutcome::Activated)
     }
@@ -381,8 +500,14 @@ impl ArtifactAdmissionCoordinator {
     }
 
     async fn verify_publication(&self, record: &ArtifactRecord) -> AdmissionVerification {
+        if !self.readiness().healthy {
+            return AdmissionVerification::Retryable(
+                "all admission verifier capacity is poisoned; replace the isolated verifier coordinator"
+                    .into(),
+            );
+        }
         let permit = match tokio::time::timeout(
-            self.verification_timeout,
+            self.verification_queue_timeout,
             self.verification_limit.clone().acquire_owned(),
         )
         .await
@@ -451,8 +576,70 @@ impl ArtifactAdmissionCoordinator {
             // Quarantine this capacity slot. Releasing it would allow repeated
             // hostile publications to accumulate detached blocking children.
             permit.forget();
+            self.poisoned_verifier_slots.fetch_add(1, Ordering::AcqRel);
         }
         outcome
+    }
+
+    async fn retryable_outcome_if_current(
+        &self,
+        repo: &AddedRepo,
+        target: &str,
+        attempt_id: &str,
+    ) -> Result<AdmissionOutcome> {
+        if !self
+            .attempt_is_current(&repo.repo_id, target, attempt_id)
+            .await?
+        {
+            self.release_attempt_consumers(repo).await?;
+            return self.reload_outcome(&repo.repo_id).await;
+        }
+        let readiness = self.readiness();
+        Ok(if readiness.healthy {
+            AdmissionOutcome::WaitingForArtifacts
+        } else {
+            AdmissionOutcome::Degraded(format!(
+                "all {}/{} admission verifier slots are poisoned; replace the isolated verifier coordinator",
+                readiness.poisoned_verifier_slots, readiness.verifier_slots
+            ))
+        })
+    }
+
+    async fn repair_corrupt(
+        &self,
+        repo: &AddedRepo,
+        target: &str,
+        record: &ArtifactRecord,
+        error: String,
+    ) -> Result<AdmissionOutcome> {
+        if !self
+            .attempt_is_current(
+                &repo.repo_id,
+                target,
+                repo.initialization_attempt_id
+                    .as_deref()
+                    .unwrap_or_default(),
+            )
+            .await?
+        {
+            self.release_attempt_consumers(repo).await?;
+            return self.reload_outcome(&repo.repo_id).await;
+        }
+        let detail = format!("{:?} publication is corrupt: {error}", record.key.kind);
+        match self
+            .scheduler
+            .quarantine_ready(record.id, record.manifest.as_deref(), &detail)
+            .await?
+        {
+            QuarantineOutcome::Requeued(_) | QuarantineOutcome::LostRace => {
+                Ok(AdmissionOutcome::WaitingForArtifacts)
+            }
+            QuarantineOutcome::Exhausted => {
+                self.fail_if_current(repo, target, format!("{detail}; repair retries exhausted"))
+                    .await?;
+                self.reload_outcome(&repo.repo_id).await
+            }
+        }
     }
 
     async fn reload_outcome(&self, repo_id: &RepoId) -> Result<AdmissionOutcome> {
@@ -517,6 +704,20 @@ fn admission_consumer_id(repo_id: &RepoId, branch: &str, target: &str, attempt_i
     format!("admission-{}", hex::encode(digest.finalize()))
 }
 
+fn activation_fence_consumer_id(repo_id: &RepoId, target: &str, attempt_id: &str) -> String {
+    let mut digest = Sha256::new();
+    for component in [
+        repo_id.workspace.as_str(),
+        repo_id.path.as_str(),
+        target,
+        attempt_id,
+    ] {
+        digest.update((component.len() as u64).to_be_bytes());
+        digest.update(component.as_bytes());
+    }
+    format!("admission-activation-{}", hex::encode(digest.finalize()))
+}
+
 fn terminal(class: FailureClass) -> bool {
     matches!(class, FailureClass::Permanent | FailureClass::DeadLetter)
 }
@@ -538,7 +739,10 @@ mod tests {
         corrupt: Mutex<HashSet<String>>,
         transient: Mutex<HashSet<String>>,
         hang: Mutex<HashSet<String>>,
+        wedged: Mutex<HashSet<String>>,
         panic_on: Mutex<HashSet<String>>,
+        pause_before: Mutex<HashSet<String>>,
+        pause_after: Mutex<HashSet<String>>,
         pause: AtomicBool,
         calls: AtomicUsize,
         entered: Notify,
@@ -565,9 +769,17 @@ mod tests {
             let Some(manifest) = record.manifest.as_deref() else {
                 return AdmissionVerification::Corrupt("missing manifest".into());
             };
+            if self.pause_before.lock().await.remove(manifest) {
+                self.entered.notify_one();
+                self.resume.notified().await;
+            }
             if self.hang.lock().await.contains(manifest) {
                 cancelled.cancelled().await;
                 return AdmissionVerification::Retryable("test verification timed out".into());
+            }
+            if self.wedged.lock().await.contains(manifest) {
+                std::future::pending::<()>().await;
+                unreachable!();
             }
             assert!(
                 !self.panic_on.lock().await.contains(manifest),
@@ -578,6 +790,10 @@ mod tests {
             }
             if self.corrupt.lock().await.contains(manifest) {
                 return AdmissionVerification::Corrupt("test corruption".into());
+            }
+            if self.pause_after.lock().await.remove(manifest) {
+                self.entered.notify_one();
+                self.resume.notified().await;
             }
             AdmissionVerification::Verified
         }
@@ -591,6 +807,49 @@ mod tests {
         coordinator: Arc<ArtifactAdmissionCoordinator>,
         repo_id: RepoId,
         db_url: String,
+    }
+
+    struct ReplaceAfterSubscribe {
+        refs: Arc<FileRefStore>,
+        replacement: AddedRepo,
+        replace_after: usize,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl TestSubscriptionHook for ReplaceAfterSubscribe {
+        async fn subscribed(&self, _kind: ArtifactKind) {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if call == self.replace_after {
+                self.refs
+                    .remove_added_repo(&self.replacement.repo_id)
+                    .await
+                    .unwrap();
+                self.refs.add_repo(&self.replacement).await.unwrap();
+            }
+        }
+    }
+
+    struct QuarantineAfterFence {
+        scheduler: Arc<ArtifactScheduler>,
+        record: ArtifactRecord,
+        outcome: Mutex<Option<QuarantineOutcome>>,
+    }
+
+    #[async_trait]
+    impl TestActivationFenceHook for QuarantineAfterFence {
+        async fn fenced(&self) {
+            let outcome = self
+                .scheduler
+                .quarantine_ready(
+                    self.record.id,
+                    self.record.manifest.as_deref(),
+                    "concurrent scrub corruption",
+                )
+                .await
+                .unwrap();
+            *self.outcome.lock().await = Some(outcome);
+        }
     }
 
     impl Fixture {
@@ -609,7 +868,9 @@ mod tests {
                     scheduler.clone(),
                     refs.clone(),
                     verifier.clone(),
+                    1,
                 )
+                .unwrap()
                 .with_consumer_ttl(60),
             );
             Self {
@@ -879,7 +1140,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ready_but_corrupt_publication_fails_closed() {
+    async fn ready_but_corrupt_publication_is_quarantined_and_rebuilt() {
         let f = Fixture::new().await;
         f.add("attempt-1").await;
         f.make_required_ready("head", "corrupt-history").await;
@@ -889,10 +1150,10 @@ mod tests {
             .await
             .insert("corrupt-history".into());
 
-        assert!(matches!(
+        assert_eq!(
             f.coordinator.reconcile_repo(&f.repo_id).await.unwrap(),
-            AdmissionOutcome::Failed(message) if message.contains("corrupt")
-        ));
+            AdmissionOutcome::WaitingForArtifacts
+        );
         assert_eq!(
             f.refs
                 .load_added_repo(&f.repo_id)
@@ -900,8 +1161,83 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .state,
-            RepoLifecycleState::Failed
+            RepoLifecycleState::Initializing
         );
+        let quarantined = f
+            .scheduler
+            .get_by_key(&f.key(ArtifactKind::FullHistory))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(quarantined.state, ArtifactState::Queued);
+        assert_eq!(quarantined.retry_count, 1);
+        assert!(quarantined.manifest.is_none());
+
+        f.verifier.corrupt.lock().await.clear();
+        let claim = f
+            .scheduler
+            .claim("repair-worker", 30)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.record.key.kind, ArtifactKind::FullHistory);
+        let evidence =
+            CompletionEvidence::new(claim.record.key.clone(), "repaired-history").unwrap();
+        assert!(
+            f.scheduler
+                .complete(&claim, "repair-worker", &evidence)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            f.coordinator.reconcile_repo(&f.repo_id).await.unwrap(),
+            AdmissionOutcome::Activated
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_corrupt_rebuilds_fail_only_after_repair_budget_exhausts() {
+        let f = Fixture::new().await;
+        f.add("attempt-1").await;
+        f.make_required_ready("head", "bad-history-0").await;
+        let mut outcome = AdmissionOutcome::WaitingForArtifacts;
+        for generation in 0..8 {
+            let manifest = format!("bad-history-{generation}");
+            f.verifier.corrupt.lock().await.insert(manifest);
+            outcome = f.coordinator.reconcile_repo(&f.repo_id).await.unwrap();
+            if matches!(outcome, AdmissionOutcome::Failed(_)) {
+                break;
+            }
+            assert_eq!(outcome, AdmissionOutcome::WaitingForArtifacts);
+            assert_eq!(
+                f.refs
+                    .load_added_repo(&f.repo_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                RepoLifecycleState::Initializing
+            );
+            let claim = f
+                .scheduler
+                .claim("repair-worker", 30)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(claim.record.key.kind, ArtifactKind::FullHistory);
+            let next = format!("bad-history-{}", generation + 1);
+            let evidence = CompletionEvidence::new(claim.record.key.clone(), next).unwrap();
+            assert!(
+                f.scheduler
+                    .complete(&claim, "repair-worker", &evidence)
+                    .await
+                    .unwrap()
+            );
+        }
+        assert!(matches!(
+            outcome,
+            AdmissionOutcome::Failed(message) if message.contains("repair retries exhausted")
+        ));
     }
 
     #[tokio::test]
@@ -929,6 +1265,62 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    async fn replacement_after_subscription_cleans_exact_old_attempt(replace_after: usize) {
+        let f = Fixture::new().await;
+        f.add("attempt-1").await;
+        let hook = Arc::new(ReplaceAfterSubscribe {
+            refs: f.refs.clone(),
+            replacement: f.repo("attempt-2"),
+            replace_after,
+            calls: AtomicUsize::new(0),
+        });
+        let coordinator = ArtifactAdmissionCoordinator::new(
+            f.scheduler.clone(),
+            f.refs.clone(),
+            f.verifier.clone(),
+            1,
+        )
+        .unwrap()
+        .with_subscription_hook(hook.clone());
+        assert_eq!(
+            coordinator
+                .subscribe_pinned_attempt(&f.repo_id, "attempt-1")
+                .await
+                .unwrap(),
+            AdmissionOutcome::StaleAttempt
+        );
+        assert_eq!(f.consumer_count().await, 0);
+        assert_eq!(
+            f.refs
+                .load_added_repo(&f.repo_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .initialization_attempt_id
+                .as_deref(),
+            Some("attempt-2")
+        );
+        assert_eq!(hook.calls.load(Ordering::SeqCst), replace_after);
+        assert!(
+            f.scheduler
+                .get_by_key(&f.key(ArtifactKind::FullHistory))
+                .await
+                .unwrap()
+                .is_none(),
+            "released unobserved admission work must not survive replacement"
+        );
+    }
+
+    #[tokio::test]
+    async fn replacement_after_first_subscription_cleans_old_consumer() {
+        replacement_after_subscription_cleans_exact_old_attempt(1).await;
+    }
+
+    #[tokio::test]
+    async fn replacement_after_second_subscription_cleans_both_old_consumers() {
+        replacement_after_subscription_cleans_exact_old_attempt(2).await;
     }
 
     #[tokio::test]
@@ -975,6 +1367,149 @@ mod tests {
         assert_eq!(f.consumer_count().await, 0);
     }
 
+    async fn retryable_verification_rechecks_replaced_attempt(paused_manifest: &str) {
+        let f = Fixture::new().await;
+        f.add("attempt-1").await;
+        f.make_required_ready("head", "history").await;
+        f.verifier
+            .transient
+            .lock()
+            .await
+            .insert(paused_manifest.into());
+        f.verifier
+            .pause_before
+            .lock()
+            .await
+            .insert(paused_manifest.into());
+        let coordinator = f.coordinator.clone();
+        let repo_id = f.repo_id.clone();
+        let task = tokio::spawn(async move { coordinator.reconcile_repo(&repo_id).await.unwrap() });
+        f.verifier.entered.notified().await;
+        f.refs.remove_added_repo(&f.repo_id).await.unwrap();
+        f.refs.add_repo(&f.repo("attempt-2")).await.unwrap();
+        f.verifier.resume.notify_one();
+
+        assert_eq!(task.await.unwrap(), AdmissionOutcome::StaleAttempt);
+        assert_eq!(f.consumer_count().await, 0);
+        assert_eq!(
+            f.refs
+                .load_added_repo(&f.repo_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .initialization_attempt_id
+                .as_deref(),
+            Some("attempt-2")
+        );
+    }
+
+    #[tokio::test]
+    async fn head_retryable_return_cleans_replaced_attempt() {
+        retryable_verification_rechecks_replaced_attempt("head").await;
+    }
+
+    #[tokio::test]
+    async fn history_retryable_return_cleans_replaced_attempt() {
+        retryable_verification_rechecks_replaced_attempt("history").await;
+    }
+
+    #[tokio::test]
+    async fn activation_fence_blocks_quarantine_until_lifecycle_cas_finishes() {
+        let f = Fixture::new().await;
+        f.add("attempt-1").await;
+        f.make_required_ready("head", "history").await;
+        let head = f
+            .scheduler
+            .get_by_key(&f.key(ArtifactKind::Head))
+            .await
+            .unwrap()
+            .unwrap();
+        let hook = Arc::new(QuarantineAfterFence {
+            scheduler: f.scheduler.clone(),
+            record: head.clone(),
+            outcome: Mutex::new(None),
+        });
+        let coordinator = ArtifactAdmissionCoordinator::new(
+            f.scheduler.clone(),
+            f.refs.clone(),
+            f.verifier.clone(),
+            1,
+        )
+        .unwrap()
+        .with_activation_fence_hook(hook.clone());
+        assert_eq!(
+            coordinator.reconcile_repo(&f.repo_id).await.unwrap(),
+            AdmissionOutcome::Activated
+        );
+        assert_eq!(
+            *hook.outcome.lock().await,
+            Some(QuarantineOutcome::LostRace)
+        );
+        // The fence is released only after activation is durable, so a later
+        // scrub can withdraw the publication normally.
+        assert!(matches!(
+            f.scheduler
+                .quarantine_ready(head.id, head.manifest.as_deref(), "late scrub corruption")
+                .await
+                .unwrap(),
+            QuarantineOutcome::Requeued(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn expired_activation_fence_cannot_block_quarantine_after_crash() {
+        let f = Fixture::new().await;
+        f.add("attempt-1").await;
+        f.make_required_ready("head", "history").await;
+        let head = f
+            .scheduler
+            .get_by_key(&f.key(ArtifactKind::Head))
+            .await
+            .unwrap()
+            .unwrap();
+        let history = f
+            .scheduler
+            .get_by_key(&f.key(ArtifactKind::FullHistory))
+            .await
+            .unwrap()
+            .unwrap();
+        let fence = f
+            .scheduler
+            .fence_ready_publications(
+                &[
+                    (head.id, head.manifest.clone()),
+                    (history.id, history.manifest.clone()),
+                ],
+                "admission-activation-crash-test",
+                60,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            f.scheduler
+                .quarantine_ready(head.id, head.manifest.as_deref(), "scrub")
+                .await
+                .unwrap(),
+            QuarantineOutcome::LostRace
+        );
+        let pool = sqlx::SqlitePool::connect(&f.db_url).await.unwrap();
+        sqlx::query(
+            "UPDATE artifact_consumers SET expires_at=0 WHERE consumer_id='admission-activation-crash-test'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(matches!(
+            f.scheduler
+                .quarantine_ready(head.id, head.manifest.as_deref(), "scrub after crash")
+                .await
+                .unwrap(),
+            QuarantineOutcome::Requeued(_)
+        ));
+        drop(fence);
+    }
+
     #[tokio::test]
     async fn invalid_or_unpinned_target_never_schedules() {
         let f = Fixture::new().await;
@@ -999,6 +1534,20 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("invalid pinned admission target")
+        );
+    }
+
+    #[tokio::test]
+    async fn coordinator_requires_explicit_nonzero_format_version() {
+        let f = Fixture::new().await;
+        assert!(
+            ArtifactAdmissionCoordinator::new(
+                f.scheduler.clone(),
+                f.refs.clone(),
+                f.verifier.clone(),
+                0,
+            )
+            .is_err()
         );
     }
 
@@ -1050,7 +1599,9 @@ mod tests {
             f.scheduler.clone(),
             f.refs.clone(),
             f.verifier.clone(),
+            1,
         )
+        .unwrap()
         .with_consumer_ttl(60)
         .with_verification_policy(2, Duration::from_millis(25), Duration::from_millis(25));
 
@@ -1066,5 +1617,53 @@ mod tests {
                 .any(|(id, result)| id == &second
                     && matches!(result, Ok(AdmissionOutcome::Activated)))
         );
+    }
+
+    #[tokio::test]
+    async fn all_non_draining_slots_trip_observable_circuit_immediately() {
+        let f = Fixture::new().await;
+        f.add("attempt-1").await;
+        f.make_required_ready("wedged-one", "history-one").await;
+        let second = RepoId {
+            workspace: WorkspaceId::new("workspace-a"),
+            path: "owner/second-wedged".into(),
+        };
+        f.refs
+            .add_repo(&f.repo_for(&second, "attempt-2"))
+            .await
+            .unwrap();
+        f.make_ready_for(&second, "attempt-2", "wedged-two", "history-two")
+            .await;
+        f.verifier
+            .wedged
+            .lock()
+            .await
+            .extend(["wedged-one".into(), "wedged-two".into()]);
+        let coordinator = ArtifactAdmissionCoordinator::new(
+            f.scheduler.clone(),
+            f.refs.clone(),
+            f.verifier.clone(),
+            1,
+        )
+        .unwrap()
+        .with_verification_policy(
+            2,
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+        );
+
+        let outcomes = coordinator.reconcile_all().await.unwrap();
+        assert_eq!(outcomes.len(), 2);
+        let readiness = coordinator.readiness();
+        assert!(!readiness.healthy);
+        assert_eq!(readiness.poisoned_verifier_slots, 2);
+        assert_eq!(readiness.verifier_slots, 2);
+
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            coordinator.reconcile_repo(&f.repo_id).await.unwrap(),
+            AdmissionOutcome::Degraded(message) if message.contains("replace")
+        ));
+        assert!(started.elapsed() < Duration::from_millis(50));
     }
 }

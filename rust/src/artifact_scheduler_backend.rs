@@ -9,8 +9,8 @@ use crate::artifact_scheduler::ArtifactTask;
 use crate::artifact_scheduler::{
     ArtifactKey, ArtifactKind, ArtifactRecord, ClaimedArtifact, CompletionEvidence,
     CompletionSealAuthority, ExecutionContext, ExecutionOutcome, FailureClass, ObservationOutcome,
-    ObservationSnapshot, RetryOutcome, ScheduleOutcome, VerifiedCompletionEvidence,
-    validate_evidence, validate_lease,
+    QuarantineOutcome, ReadyPublicationFence, RetryOutcome, ScheduleOutcome, validate_evidence,
+    ObservationSnapshot, VerifiedCompletionEvidence, validate_lease,
 };
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -81,6 +81,11 @@ impl Drop for PersistenceExecutionGuard {
 pub trait ArtifactSchedulerPersistence: Send + Sync {
     fn completion_verifier(&self) -> Arc<dyn crate::artifact_scheduler::CompletionVerifier>;
     fn completion_sealer(&self) -> Arc<CompletionSealAuthority>;
+    /// Admission must fail startup rather than discover after corruption that
+    /// a backend cannot withdraw a Ready manifest atomically.
+    fn manifest_cas_quarantine_supported(&self) -> bool {
+        false
+    }
     async fn schedule(&self, key: &ArtifactKey) -> Result<ScheduleOutcome>;
     async fn subscribe_consumer(
         &self,
@@ -133,6 +138,30 @@ pub trait ArtifactSchedulerPersistence: Send + Sync {
         .await
     }
     async fn retry_failed(&self, key: &ArtifactKey) -> Result<RetryOutcome>;
+    /// Manifest-CAS withdrawal of a corrupt Ready publication. Backends must
+    /// clear publication aliases in the same transaction.
+    async fn quarantine_ready(
+        &self,
+        id: i64,
+        expected_manifest: Option<&str>,
+        error: &str,
+    ) -> Result<QuarantineOutcome> {
+        let _ = (id, expected_manifest, error);
+        bail!("artifact scheduler backend does not implement manifest-CAS quarantine")
+    }
+    async fn fence_ready_publications(
+        &self,
+        expected: &[(i64, Option<String>)],
+        consumer_id: &str,
+        ttl_secs: i64,
+    ) -> Result<Option<ReadyPublicationFence>> {
+        let _ = (expected, consumer_id, ttl_secs);
+        bail!("artifact scheduler backend does not implement Ready publication fencing")
+    }
+    async fn release_ready_publication_fence(&self, fence: ReadyPublicationFence) -> Result<()> {
+        let _ = fence;
+        bail!("artifact scheduler backend does not implement Ready publication fencing")
+    }
     async fn claim(&self, owner: &str, lease_secs: i64) -> Result<Option<ClaimedArtifact>>;
     async fn heartbeat(
         &self,
@@ -556,6 +585,9 @@ impl ArtifactSchedulerPersistence for crate::artifact_scheduler::ArtifactSchedul
     fn completion_sealer(&self) -> Arc<CompletionSealAuthority> {
         self.completion_sealer.clone()
     }
+    fn manifest_cas_quarantine_supported(&self) -> bool {
+        true
+    }
     async fn schedule(&self, key: &ArtifactKey) -> Result<ScheduleOutcome> {
         self.schedule(key).await
     }
@@ -587,6 +619,26 @@ impl ArtifactSchedulerPersistence for crate::artifact_scheduler::ArtifactSchedul
     }
     async fn retry_failed(&self, key: &ArtifactKey) -> Result<RetryOutcome> {
         self.retry_failed(key).await
+    }
+    async fn quarantine_ready(
+        &self,
+        id: i64,
+        expected_manifest: Option<&str>,
+        error: &str,
+    ) -> Result<QuarantineOutcome> {
+        self.quarantine_ready(id, expected_manifest, error).await
+    }
+    async fn fence_ready_publications(
+        &self,
+        expected: &[(i64, Option<String>)],
+        consumer_id: &str,
+        ttl_secs: i64,
+    ) -> Result<Option<ReadyPublicationFence>> {
+        self.fence_ready_publications(expected, consumer_id, ttl_secs)
+            .await
+    }
+    async fn release_ready_publication_fence(&self, fence: ReadyPublicationFence) -> Result<()> {
+        self.release_ready_publication_fence(fence).await
     }
     async fn claim(&self, owner: &str, lease: i64) -> Result<Option<ClaimedArtifact>> {
         self.claim(owner, lease).await

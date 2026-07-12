@@ -197,6 +197,36 @@ pub enum RetryOutcome {
     Exhausted,
 }
 
+/// Result of atomically withdrawing a Ready publication whose immutable
+/// manifest failed verification.  The manifest value is part of the compare
+/// and swap, so a verifier can never quarantine a replacement publication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuarantineOutcome {
+    Requeued(i64),
+    LostRace,
+    Exhausted,
+}
+
+/// Opaque, expiring proof that exact Ready manifest rows were fenced together.
+/// While live, manifest quarantine cannot withdraw any member publication.
+#[derive(Debug)]
+pub struct ReadyPublicationFence {
+    artifact_ids: Vec<i64>,
+    consumer_id: String,
+}
+
+impl ReadyPublicationFence {
+    pub(crate) fn new(artifact_ids: Vec<i64>, consumer_id: String) -> Self {
+        Self {
+            artifact_ids,
+            consumer_id,
+        }
+    }
+    pub(crate) fn parts(&self) -> (&[i64], &str) {
+        (&self.artifact_ids, &self.consumer_id)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CompletionEvidence {
     key: ArtifactKey,
@@ -789,6 +819,9 @@ impl ArtifactScheduler {
         if consumer_id.trim().is_empty() {
             bail!("artifact consumer id is empty")
         }
+        if consumer_id.starts_with("admission-activation-") {
+            bail!("artifact consumer id uses a reserved activation-fence namespace")
+        }
         if !(2..=86400).contains(&ttl_secs) {
             bail!("consumer subscription TTL is invalid")
         }
@@ -810,6 +843,9 @@ impl ArtifactScheduler {
         finish(c, result).await
     }
     pub async fn release_consumer(&self, artifact_id: i64, consumer_id: &str) -> Result<()> {
+        if consumer_id.starts_with("admission-activation-") {
+            bail!("activation fences require their opaque release capability")
+        }
         let mut c = self.immediate().await?;
         let result:Result<()>=async{
             sqlx::query("DELETE FROM artifact_consumers WHERE artifact_id=? AND consumer_id=?").bind(artifact_id).bind(consumer_id).execute(&mut *c).await?;
@@ -933,6 +969,165 @@ impl ArtifactScheduler {
    sqlx::query("UPDATE artifact_jobs SET state='queued',owner=NULL,heartbeat_at=NULL,lease_expires_at=NULL,retry_count=retry_count+1,error=NULL,failure_class=NULL,updated_at=? WHERE id=? AND state='failed'").bind(now).bind(id).execute(&mut *c).await?;
    Ok(RetryOutcome::Requeued(id))
   }.await;
+        finish(c, result).await
+    }
+
+    pub async fn quarantine_ready(
+        &self,
+        id: i64,
+        expected_manifest: Option<&str>,
+        error: &str,
+    ) -> Result<QuarantineOutcome> {
+        if expected_manifest.is_some_and(|manifest| manifest.trim().is_empty()) {
+            bail!("expected quarantine manifest is empty")
+        }
+        if error.trim().is_empty() {
+            bail!("artifact quarantine error is empty")
+        }
+        let mut c = self.immediate().await?;
+        let result: Result<QuarantineOutcome> = async {
+            let row: Option<(String, Option<String>, i64)> =
+                sqlx::query_as("SELECT state,manifest,retry_count FROM artifact_jobs WHERE id=?")
+                    .bind(id)
+                    .fetch_optional(&mut *c)
+                    .await?;
+            let Some((state, manifest, retries)) = row else {
+                return Ok(QuarantineOutcome::LostRace);
+            };
+            if state != "ready" || manifest.as_deref() != expected_manifest {
+                return Ok(QuarantineOutcome::LostRace);
+            }
+            let now = db_now(&mut c).await?;
+            let fenced: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM artifact_consumers
+                 WHERE artifact_id=? AND consumer_id LIKE 'admission-activation-%' AND expires_at>?",
+            )
+            .bind(id)
+            .bind(now)
+            .fetch_one(&mut *c)
+            .await?;
+            if fenced != 0 {
+                return Ok(QuarantineOutcome::LostRace);
+            }
+            sqlx::query(
+                "UPDATE artifact_observations SET published_artifact_id=NULL
+                 WHERE published_artifact_id=?",
+            )
+            .bind(id)
+            .execute(&mut *c)
+            .await?;
+            if retries as u32 >= self.limits.max_manual_retries {
+                let changed = sqlx::query(
+                    "UPDATE artifact_jobs SET state='failed',owner=NULL,heartbeat_at=NULL,
+                       lease_expires_at=NULL,error=?,failure_class='retryable',updated_at=?
+                     WHERE id=? AND state='ready' AND manifest IS ?",
+                )
+                .bind(error)
+                .bind(now)
+                .bind(id)
+                .bind(expected_manifest)
+                .execute(&mut *c)
+                .await?
+                .rows_affected();
+                return Ok(if changed == 1 {
+                    QuarantineOutcome::Exhausted
+                } else {
+                    QuarantineOutcome::LostRace
+                });
+            }
+            let changed = sqlx::query(
+                "UPDATE artifact_jobs SET state='queued',owner=NULL,heartbeat_at=NULL,
+                   lease_expires_at=NULL,manifest=NULL,retry_count=retry_count+1,error=?,
+                   failure_class=NULL,updated_at=?
+                 WHERE id=? AND state='ready' AND manifest IS ?",
+            )
+            .bind(error)
+            .bind(now)
+            .bind(id)
+            .bind(expected_manifest)
+            .execute(&mut *c)
+            .await?
+            .rows_affected();
+            Ok(if changed == 1 {
+                QuarantineOutcome::Requeued(id)
+            } else {
+                QuarantineOutcome::LostRace
+            })
+        }
+        .await;
+        finish(c, result).await
+    }
+
+    pub async fn fence_ready_publications(
+        &self,
+        expected: &[(i64, Option<String>)],
+        consumer_id: &str,
+        ttl_secs: i64,
+    ) -> Result<Option<ReadyPublicationFence>> {
+        if expected.len() != 2
+            || expected[0].0 == expected[1].0
+            || consumer_id.trim().is_empty()
+            || consumer_id.len() > 255
+            || !(1..=3600).contains(&ttl_secs)
+        {
+            bail!("invalid Ready publication fence")
+        }
+        if !consumer_id.starts_with("admission-activation-") {
+            bail!("Ready publication fence consumer has invalid namespace")
+        }
+        let mut c = self.immediate().await?;
+        let result: Result<Option<ReadyPublicationFence>> = async {
+            for (id, manifest) in expected {
+                let current: Option<(String, Option<String>)> = sqlx::query_as(
+                    "SELECT state,manifest FROM artifact_jobs WHERE id=?",
+                )
+                .bind(id)
+                .fetch_optional(&mut *c)
+                .await?;
+                if !matches!(current, Some((state, current_manifest)) if state == "ready" && current_manifest == *manifest)
+                {
+                    return Ok(None);
+                }
+            }
+            let expires_at = db_now(&mut c).await?.saturating_add(ttl_secs);
+            for (id, _) in expected {
+                sqlx::query(
+                    "INSERT INTO artifact_consumers(artifact_id,consumer_id,expires_at)
+                     VALUES(?,?,?) ON CONFLICT(artifact_id,consumer_id)
+                     DO UPDATE SET expires_at=excluded.expires_at",
+                )
+                .bind(id)
+                .bind(consumer_id)
+                .bind(expires_at)
+                .execute(&mut *c)
+                .await?;
+            }
+            Ok(Some(ReadyPublicationFence::new(
+                expected.iter().map(|(id, _)| *id).collect(),
+                consumer_id.to_owned(),
+            )))
+        }
+        .await;
+        finish(c, result).await
+    }
+
+    pub async fn release_ready_publication_fence(
+        &self,
+        fence: ReadyPublicationFence,
+    ) -> Result<()> {
+        let (ids, consumer_id) = fence.parts();
+        let mut c = self.immediate().await?;
+        let result: Result<()> = async {
+            for id in ids {
+                sqlx::query("DELETE FROM artifact_consumers WHERE artifact_id=? AND consumer_id=?")
+                    .bind(id)
+                    .bind(consumer_id)
+                    .execute(&mut *c)
+                    .await?;
+            }
+            Ok(())
+        }
+        .await;
         finish(c, result).await
     }
 
