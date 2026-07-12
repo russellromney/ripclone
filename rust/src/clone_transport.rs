@@ -14,6 +14,40 @@ use std::collections::HashSet;
 pub const CLONE_PLAN_PROTOCOL_VERSION: u32 = 1;
 pub const MAX_CLONE_PLAN_RESPONSE_BYTES: usize = 64 * 1024;
 
+/// Incremental decoder for HTTP clients that receive a streamed body. The
+/// limit is enforced before appending each chunk, so a peer cannot force the
+/// client to collect an unbounded response before [`ClonePlanResponse`] sees
+/// it.
+#[derive(Debug, Default)]
+pub struct BoundedClonePlanDecoder {
+    bytes: Vec<u8>,
+}
+
+impl BoundedClonePlanDecoder {
+    pub fn new() -> Self {
+        Self {
+            bytes: Vec::with_capacity(4096),
+        }
+    }
+
+    pub fn push(&mut self, chunk: &[u8]) -> Result<()> {
+        let next_len = self
+            .bytes
+            .len()
+            .checked_add(chunk.len())
+            .ok_or_else(|| anyhow::anyhow!("clone-plan response size overflow"))?;
+        if next_len > MAX_CLONE_PLAN_RESPONSE_BYTES {
+            bail!("clone-plan response exceeds protocol size limit");
+        }
+        self.bytes.extend_from_slice(chunk);
+        Ok(())
+    }
+
+    pub fn finish(self, expected: CloneRequestIdentity<'_>) -> Result<ClonePlan> {
+        ClonePlanResponse::decode_for(&self.bytes, expected)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct CloneRequestIdentity<'a> {
     pub workspace: &'a str,
@@ -71,9 +105,9 @@ pub enum ClonePlanPayload {
 }
 
 impl ClonePlanResponse {
-    /// Decode a size-bounded untrusted HTTP body and validate it in one step.
-    /// Clients should use this instead of deserializing the public wire type
-    /// directly.
+    /// Decode an already-buffered body and validate it in one step. Streaming
+    /// HTTP clients must buffer through [`BoundedClonePlanDecoder`] so the size
+    /// limit is applied while receiving, not after an unbounded collection.
     pub fn decode_for(bytes: &[u8], expected: CloneRequestIdentity<'_>) -> Result<ClonePlan> {
         if bytes.len() > MAX_CLONE_PLAN_RESPONSE_BYTES {
             bail!("clone-plan response exceeds protocol size limit");
@@ -727,5 +761,17 @@ mod tests {
         );
         let bytes = serde_json::to_vec(&valid).unwrap();
         assert!(ClonePlanResponse::decode_for(&bytes, identity(SyncMode::Head)).is_ok());
+
+        let mut streamed = BoundedClonePlanDecoder::new();
+        for chunk in bytes.chunks(7) {
+            streamed.push(chunk).unwrap();
+        }
+        assert!(streamed.finish(identity(SyncMode::Head)).is_ok());
+
+        let mut streamed = BoundedClonePlanDecoder::new();
+        streamed
+            .push(&vec![b' '; MAX_CLONE_PLAN_RESPONSE_BYTES])
+            .unwrap();
+        assert!(streamed.push(b"x").is_err());
     }
 }
