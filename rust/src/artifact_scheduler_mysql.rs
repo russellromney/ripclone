@@ -466,26 +466,40 @@ impl MysqlArtifactScheduler {
         if index_count != INDEXES.len() as i64 {
             bail!("mysql artifact scheduler schema has unexpected or missing indexes")
         }
-        let invalid_index_parts: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM information_schema.statistics
-             WHERE table_schema=DATABASE() AND table_name IN
-             ('artifact_scheduler_schema','artifact_jobs','branch_observations',
-              'artifact_observations','artifact_consumers','scheduler_state')
-               AND (sub_part IS NOT NULL OR index_type IS NULL OR index_type<>'BTREE')",
-        )
-        .fetch_one(&mut **tx)
-        .await?;
-        if invalid_index_parts != 0 {
-            bail!("mysql artifact scheduler indexes must be full-column BTREE indexes")
-        }
         for (table, name, columns, unique) in INDEXES {
-            let found: Option<(String,i64)> = sqlx::query_as(
-                "SELECT GROUP_CONCAT(column_name ORDER BY seq_in_index SEPARATOR ','),MIN(non_unique)
+            let found: Vec<(
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<i64>,
+                String,
+                i64,
+                String,
+            )> = sqlx::query_as(
+                "SELECT column_name,collation,expression,sub_part,index_type,non_unique,is_visible
                  FROM information_schema.statistics WHERE table_schema=DATABASE()
-                   AND table_name=? AND index_name=? GROUP BY index_name",
-            ).bind(table).bind(name).fetch_optional(&mut **tx).await?;
-            if found.as_ref().map(|(c, n)| (c.as_str(), *n == 0)) != Some((*columns, *unique)) {
-                bail!("mysql artifact scheduler index definition mismatch for {table}.{name}")
+                   AND table_name=? AND index_name=? ORDER BY seq_in_index",
+            )
+            .bind(table)
+            .bind(name)
+            .fetch_all(&mut **tx)
+            .await?;
+            let expected_columns: Vec<&str> = columns.split(',').collect();
+            if found.len() != expected_columns.len() {
+                bail!("mysql artifact scheduler index arity mismatch for {table}.{name}")
+            }
+            for (part, expected_column) in found.iter().zip(expected_columns) {
+                let (column, order, expression, prefix, index_type, non_unique, visible) = part;
+                if column.as_deref() != Some(expected_column)
+                    || order.as_deref() != Some("A")
+                    || expression.is_some()
+                    || prefix.is_some()
+                    || index_type != "BTREE"
+                    || (*non_unique == 0) != *unique
+                    || visible != "YES"
+                {
+                    bail!("mysql artifact scheduler index definition mismatch for {table}.{name}")
+                }
             }
         }
         const CHECKS: &[(&str, &str)] = &[
@@ -533,16 +547,67 @@ impl MysqlArtifactScheduler {
                 "`fairness_cursor` between 0 and 3",
             ),
         ];
-        let check_count: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM information_schema.table_constraints
-             WHERE constraint_schema=DATABASE() AND constraint_type='CHECK'
+        const CONSTRAINTS: &[(&str, &str, &str)] = &[
+            ("artifact_scheduler_schema", "PRIMARY", "PRIMARY KEY"),
+            (
+                "artifact_scheduler_schema",
+                "artifact_scheduler_schema_singleton",
+                "CHECK",
+            ),
+            ("artifact_jobs", "PRIMARY", "PRIMARY KEY"),
+            ("artifact_jobs", "artifact_jobs_identity", "UNIQUE"),
+            ("artifact_jobs", "artifact_jobs_format", "CHECK"),
+            ("artifact_jobs", "artifact_jobs_state", "CHECK"),
+            ("artifact_jobs", "artifact_jobs_kind", "CHECK"),
+            ("artifact_jobs", "artifact_jobs_lease_generation", "CHECK"),
+            ("artifact_jobs", "artifact_jobs_claim_attempts", "CHECK"),
+            ("artifact_jobs", "artifact_jobs_retry_count", "CHECK"),
+            ("artifact_jobs", "artifact_jobs_failure_class", "CHECK"),
+            ("branch_observations", "PRIMARY", "PRIMARY KEY"),
+            (
+                "branch_observations",
+                "branch_observations_generation",
+                "CHECK",
+            ),
+            ("artifact_observations", "PRIMARY", "PRIMARY KEY"),
+            (
+                "artifact_observations",
+                "artifact_observations_generation",
+                "CHECK",
+            ),
+            (
+                "artifact_observations",
+                "artifact_observations_format",
+                "CHECK",
+            ),
+            ("artifact_consumers", "PRIMARY", "PRIMARY KEY"),
+            ("scheduler_state", "PRIMARY", "PRIMARY KEY"),
+            ("scheduler_state", "scheduler_state_singleton", "CHECK"),
+            ("scheduler_state", "scheduler_state_fairness", "CHECK"),
+        ];
+        let mut actual_constraints: Vec<(String, String, String, String)> = sqlx::query_as(
+            "SELECT table_name,constraint_name,constraint_type,enforced
+             FROM information_schema.table_constraints WHERE constraint_schema=DATABASE()
                AND table_name IN ('artifact_scheduler_schema','artifact_jobs','branch_observations',
-                 'artifact_observations','scheduler_state')",
+                 'artifact_observations','artifact_consumers','scheduler_state')",
         )
-        .fetch_one(&mut **tx)
+        .fetch_all(&mut **tx)
         .await?;
-        if check_count != CHECKS.len() as i64 {
-            bail!("mysql artifact scheduler schema has unexpected or missing checks")
+        actual_constraints.sort();
+        let mut expected_constraints: Vec<(String, String, String, String)> = CONSTRAINTS
+            .iter()
+            .map(|(table, name, kind)| {
+                (
+                    (*table).into(),
+                    (*name).into(),
+                    (*kind).into(),
+                    "YES".into(),
+                )
+            })
+            .collect();
+        expected_constraints.sort();
+        if actual_constraints != expected_constraints {
+            bail!("mysql artifact scheduler constraint inventory differs from schema version")
         }
         for (name, clause) in CHECKS {
             let actual: Option<String> = sqlx::query_scalar(
@@ -2110,6 +2175,130 @@ mod tests {
             )
             .await
             .is_err()
+        );
+
+        reset(&control).await;
+        let clean = MysqlArtifactScheduler::from_pool(
+            MySqlPoolOptions::new().connect(&url).await.unwrap(),
+            Default::default(),
+            Arc::new(Accept),
+        )
+        .await
+        .unwrap();
+        sqlx::query("ALTER TABLE artifact_jobs ALTER CHECK artifact_jobs_state NOT ENFORCED")
+            .execute(clean.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO artifact_jobs(
+               workspace,repo,commit_oid,kind,format_version,state,created_at,updated_at)
+             VALUES('ws','owner/repo','invalid','head',1,'invalid-state',1,1)",
+        )
+        .execute(clean.pool())
+        .await
+        .unwrap();
+        assert!(
+            MysqlArtifactScheduler::from_pool(
+                MySqlPoolOptions::new().connect(&url).await.unwrap(),
+                Default::default(),
+                Arc::new(Accept)
+            )
+            .await
+            .is_err(),
+            "a disabled CHECK admitted invalid state and was accepted on reopen"
+        );
+
+        reset(&control).await;
+        let clean = MysqlArtifactScheduler::from_pool(
+            MySqlPoolOptions::new().connect(&url).await.unwrap(),
+            Default::default(),
+            Arc::new(Accept),
+        )
+        .await
+        .unwrap();
+        sqlx::query("ALTER TABLE artifact_jobs ALTER INDEX artifact_jobs_claim INVISIBLE")
+            .execute(clean.pool())
+            .await
+            .unwrap();
+        assert!(
+            MysqlArtifactScheduler::from_pool(
+                MySqlPoolOptions::new().connect(&url).await.unwrap(),
+                Default::default(),
+                Arc::new(Accept)
+            )
+            .await
+            .is_err(),
+            "an invisible required claim index was accepted"
+        );
+
+        reset(&control).await;
+        let clean = MysqlArtifactScheduler::from_pool(
+            MySqlPoolOptions::new().connect(&url).await.unwrap(),
+            Default::default(),
+            Arc::new(Accept),
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "ALTER TABLE artifact_jobs DROP INDEX artifact_jobs_claim,
+             ADD INDEX artifact_jobs_claim(state DESC,kind,created_at,id)",
+        )
+        .execute(clean.pool())
+        .await
+        .unwrap();
+        assert!(
+            MysqlArtifactScheduler::from_pool(
+                MySqlPoolOptions::new().connect(&url).await.unwrap(),
+                Default::default(),
+                Arc::new(Accept)
+            )
+            .await
+            .is_err(),
+            "a DESC replacement for the required ASC claim index was accepted"
+        );
+
+        reset(&control).await;
+        let clean = MysqlArtifactScheduler::from_pool(
+            MySqlPoolOptions::new().connect(&url).await.unwrap(),
+            Default::default(),
+            Arc::new(Accept),
+        )
+        .await
+        .unwrap();
+        let indexes_before: i64 = sqlx::query_scalar(
+            "SELECT count(DISTINCT index_name) FROM information_schema.statistics
+             WHERE table_schema=DATABASE() AND table_name='artifact_consumers'",
+        )
+        .fetch_one(clean.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "ALTER TABLE artifact_consumers ADD CONSTRAINT planted_fk
+             FOREIGN KEY(artifact_id) REFERENCES artifact_jobs(id)",
+        )
+        .execute(clean.pool())
+        .await
+        .unwrap();
+        let indexes_after: i64 = sqlx::query_scalar(
+            "SELECT count(DISTINCT index_name) FROM information_schema.statistics
+             WHERE table_schema=DATABASE() AND table_name='artifact_consumers'",
+        )
+        .fetch_one(clean.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            indexes_after, indexes_before,
+            "the FK did not reuse the expected PK index"
+        );
+        assert!(
+            MysqlArtifactScheduler::from_pool(
+                MySqlPoolOptions::new().connect(&url).await.unwrap(),
+                Default::default(),
+                Arc::new(Accept)
+            )
+            .await
+            .is_err(),
+            "an unexpected foreign-key constraint was accepted"
         );
 
         reset(&control).await;
