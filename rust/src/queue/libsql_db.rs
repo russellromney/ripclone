@@ -7,8 +7,8 @@ use super::sql::{
     ADD_ATTEMPTS_COLUMN_SQL, ADD_CREDENTIAL_COLUMN_SQL, ADD_INITIALIZATION_ATTEMPT_COLUMN_SQL,
     ADD_SIZE_CLASS_COLUMN_SQL, CREATE_ACTIVE_KEY_INDEX_SQL, CREATE_HISTORY_INDEX_SQL,
     CREATE_STATUS_INDEX_SQL, CREATE_TABLE_SQL, CREATE_WORKERS_HEARTBEAT_INDEX_SQL,
-    CREATE_WORKERS_TABLE_SQL, DROP_LEGACY_ACTIVE_KEY_INDEX_SQL, QueueDb,
-    SUPERSEDED_BY_NEWER_QUEUED, now_secs,
+    CREATE_WORKERS_TABLE_SQL, DROP_LEGACY_ACTIVE_KEY_INDEX_SQL, DeadLetteredInitialization,
+    QueueDb, SUPERSEDED_BY_NEWER_QUEUED, now_secs,
 };
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -49,9 +49,34 @@ impl QueueDb for LibsqlDb {
         // Migrate a legacy table to add the credential column (best-effort: errors
         // "duplicate column" on a fresh table, which is fine).
         let _ = conn.execute(ADD_CREDENTIAL_COLUMN_SQL, ()).await;
-        let _ = conn
+        if let Err(error) = conn
             .execute(ADD_INITIALIZATION_ATTEMPT_COLUMN_SQL, ())
-            .await;
+            .await
+        {
+            if !error
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("duplicate column")
+            {
+                return Err(error).context("add jobs.initialization_attempt_id");
+            }
+        }
+        let mut rows = conn
+            .query(
+                "SELECT count(*) FROM pragma_table_info('jobs') WHERE name='initialization_attempt_id'",
+                (),
+            )
+            .await
+            .context("validate jobs.initialization_attempt_id")?;
+        let attempt_column = rows
+            .next()
+            .await?
+            .context("jobs.initialization_attempt_id validation returned no row")?
+            .get::<i64>(0)?;
+        anyhow::ensure!(
+            attempt_column == 1,
+            "queue schema is missing jobs.initialization_attempt_id"
+        );
         // Same best-effort migration for the attempts column (dead-letter bound).
         let _ = conn.execute(ADD_ATTEMPTS_COLUMN_SQL, ()).await;
         // size_class rank: the claim filter (right-sizing) reads it, and
@@ -180,6 +205,44 @@ impl QueueDb for LibsqlDb {
         )
         .await
         .context("reclaim stale jobs")?;
+        Ok(())
+    }
+
+    async fn dead_lettered_initializations(&self) -> Result<Vec<DeadLetteredInitialization>> {
+        let conn = self.conn().await?;
+        let mut rows = conn
+            .query(
+                "SELECT id,provider,path,branch,initialization_attempt_id,error FROM jobs
+             WHERE status='failed' AND initialization_attempt_id IS NOT NULL
+               AND error LIKE 'dead-lettered after %'",
+                (),
+            )
+            .await
+            .context("list dead-lettered admission jobs")?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(DeadLetteredInitialization {
+                id: row.get::<i64>(0)?,
+                provider: row.get::<String>(1)?,
+                path: row.get::<String>(2)?,
+                branch: row.get::<String>(3)?,
+                initialization_attempt_id: row.get::<String>(4)?,
+                error: row.get::<String>(5)?,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn acknowledge_dead_lettered_initialization(
+        &self,
+        id: i64,
+        attempt_id: &str,
+    ) -> Result<()> {
+        let conn = self.conn().await?;
+        conn.execute(
+            "UPDATE jobs SET initialization_attempt_id=NULL WHERE id=? AND status='failed' AND initialization_attempt_id=?",
+            libsql::params![id, attempt_id],
+        ).await.context("acknowledge dead-lettered admission")?;
         Ok(())
     }
 
@@ -375,7 +438,7 @@ impl QueueDb for LibsqlDb {
         self.conn()
             .await?
             .execute(
-                "DELETE FROM jobs WHERE status = 'failed' AND finished_at < ?",
+                "DELETE FROM jobs WHERE status = 'failed' AND finished_at < ? AND (initialization_attempt_id IS NULL OR error NOT LIKE 'dead-lettered after %')",
                 libsql::params![cutoff],
             )
             .await

@@ -13,7 +13,10 @@ use crate::metrics::{Metrics, SyncPhaseMetrics};
 use crate::oidc::OidcVerifier;
 use crate::pack::PackBuilder;
 use crate::provider::{ProviderInstance, ProviderRegistry, RepoId};
-use crate::queue::{BuildError, BuildJob, EnqueueOutcome, JobQueueRef, JobState};
+use crate::queue::{
+    BuildError, BuildJob, DeadLetteredInitialization, EnqueueOutcome, JobQueueRef, JobState,
+    WorkerQueue,
+};
 use crate::ref_store::{
     AddedRepo, AddedRepoSource, RefStore, RepoLifecycleState, migrate_legacy_refs,
 };
@@ -1473,6 +1476,16 @@ async fn job_claim_handler(
         Ok(q) => q,
         Err(resp) => return resp,
     };
+    if let Err(e) = reconcile_dead_lettered_admissions(&state).await {
+        error!("POST /v1/jobs/claim admission reconciliation failed: {e:#}");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("claim admission reconciliation failed: {e:#}"),
+            }),
+        )
+            .into_response();
+    }
     if req.worker_id.trim().is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -2648,6 +2661,84 @@ async fn activate_admission_for_attempt(
             repo_id.storage_key()
         ),
     }
+}
+
+/// Mark the matching admission attempt failed. A backend `false` is benign for
+/// a stale/removed attempt or when verified activation already won. Any other
+/// `false` for the current attempt violates the lifecycle invariant and is
+/// surfaced for reconciliation rather than silently discarded.
+async fn fail_admission_for_attempt(
+    ref_store: &Arc<dyn RefStore>,
+    repo_id: &RepoId,
+    branch: &str,
+    commit: Option<&str>,
+    failure: &str,
+    attempt_id: &str,
+) -> Result<bool> {
+    if ref_store
+        .fail_repo_initialization(repo_id, branch, commit, failure, Some(attempt_id))
+        .await?
+    {
+        return Ok(true);
+    }
+    match ref_store.load_added_repo(repo_id).await? {
+        None => Ok(false),
+        Some(repo) if repo.initialization_attempt_id.as_deref() != Some(attempt_id) => Ok(false),
+        Some(repo)
+            if repo.state == RepoLifecycleState::Active
+                && commit
+                    .is_none_or(|commit| repo.initialization_target.as_deref() == Some(commit)) =>
+        {
+            // Readiness won concurrently; a late failure must not demote it.
+            Ok(false)
+        }
+        Some(repo)
+            if repo.state == RepoLifecycleState::Failed
+                && commit
+                    .is_none_or(|commit| repo.initialization_target.as_deref() == Some(commit)) =>
+        {
+            // An equivalent concurrent terminal report already won.
+            Ok(true)
+        }
+        current => anyhow::bail!(
+            "matching admission attempt {attempt_id} could not fail {}@{branch} {:?}: {current:?}",
+            repo_id.storage_key(),
+            commit
+        ),
+    }
+}
+
+async fn reconcile_dead_lettered_admissions(state: &ServerState) -> Result<usize> {
+    let Some(queue) = state.worker_queue.as_ref() else {
+        return Ok(0);
+    };
+    let dead_letters = queue.reclaim_stale().await?;
+    let mut reconciled = 0;
+    for dead in dead_letters {
+        reconcile_dead_lettered_initialization(state, &dead).await?;
+        queue
+            .acknowledge_dead_lettered_initialization(dead.id, &dead.initialization_attempt_id)
+            .await?;
+        reconciled += 1;
+    }
+    Ok(reconciled)
+}
+
+pub async fn reconcile_dead_lettered_initialization(
+    state: &ServerState,
+    dead: &DeadLetteredInitialization,
+) -> Result<()> {
+    let repo_id = dead.repo_id();
+    let _ = fail_admission_for_attempt(
+        &state.ref_store,
+        &repo_id,
+        &dead.branch,
+        None,
+        &dead.error,
+        &dead.initialization_attempt_id,
+    )
+    .await?;
+    Ok(())
 }
 
 fn ref_info_serves_commit(info: &RefInfo, clonepack_kind: &str, commit: &str) -> bool {
@@ -7785,16 +7876,15 @@ pub async fn process_build_job(
                     );
                 }
                 if let Some(attempt_id) = initialization_attempt_id.as_deref() {
-                    if let Err(state_err) = state
-                        .ref_store
-                        .fail_repo_initialization(
-                            repo_id,
-                            &effective_branch,
-                            None,
-                            classified.message(),
-                            Some(attempt_id),
-                        )
-                        .await
+                    if let Err(state_err) = fail_admission_for_attempt(
+                        &state.ref_store,
+                        repo_id,
+                        &effective_branch,
+                        None,
+                        classified.message(),
+                        attempt_id,
+                    )
+                    .await
                     {
                         error!(
                             "repo initialization failure update failed for {}@{effective_branch}: {state_err:#}",
@@ -7847,16 +7937,15 @@ pub async fn mark_branch_build_failed(
         None
     };
     if let Some(attempt_id) = initialization_attempt_id {
-        state
-            .ref_store
-            .fail_repo_initialization(
-                repo_id,
-                branch,
-                commit.as_deref(),
-                message,
-                Some(attempt_id),
-            )
-            .await?;
+        fail_admission_for_attempt(
+            &state.ref_store,
+            repo_id,
+            branch,
+            commit.as_deref(),
+            message,
+            attempt_id,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -8164,11 +8253,15 @@ async fn handle_phase2_failure(
             );
         }
     } else if let Some(attempt_id) = action.initialization_attempt_id.as_deref() {
-        if let Err(e) = action
-            .state
-            .ref_store
-            .fail_repo_initialization(repo_id, branch, Some(commit), reason, Some(attempt_id))
-            .await
+        if let Err(e) = fail_admission_for_attempt(
+            &action.state.ref_store,
+            repo_id,
+            branch,
+            Some(commit),
+            reason,
+            attempt_id,
+        )
+        .await
         {
             error!(
                 "repo initialization failure update failed for {}@{branch} {commit}: {e:#}",
@@ -8251,6 +8344,9 @@ fn spawn_build_worker(state: ServerState, mut rx: tokio::sync::mpsc::Receiver<Bu
 /// so build-before-clone still holds. Best-effort: per-repo errors are logged and
 /// skipped. Returns the number of builds triggered. Exposed for tests.
 pub async fn poll_once(state: &ServerState) -> usize {
+    if let Err(e) = reconcile_dead_lettered_admissions(state).await {
+        error!("dead-lettered admission reconciliation failed: {e:#}");
+    }
     let repos = match state.ref_store.list().await {
         Ok(r) => r,
         Err(e) => {
@@ -8350,6 +8446,25 @@ fn spawn_poll_loop(state: ServerState, interval: Duration) {
             let n = poll_once(&state).await;
             if n > 0 {
                 info!("poll fallback: triggered {n} build(s)");
+            }
+        }
+    });
+}
+
+/// Admission dead-letters must be reconciled even when push polling is disabled
+/// and the dispatcher has reduced the fleet to zero workers. This loop is
+/// intentionally independent of both actors.
+fn spawn_admission_deadletter_loop(state: ServerState, interval: Duration) {
+    if state.worker_queue.is_none() {
+        return;
+    }
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval.max(Duration::from_secs(1)));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            if let Err(e) = reconcile_dead_lettered_admissions(&state).await {
+                error!("admission dead-letter reconcile failed: {e:#}");
             }
         }
     });
@@ -8598,7 +8713,9 @@ pub async fn run_server_with_barrier(
     // Reconciliation is not allowed to depend on the periodic poller (which
     // may be disabled). Every initializing row has a durable attempt by this
     // point; enqueue that exact attempt once at startup.
+    reconcile_dead_lettered_admissions(&state).await?;
     enqueue_initializing_repos(&state).await?;
+    spawn_admission_deadletter_loop(state.clone(), Duration::from_secs(5));
 
     // Polling fallback: catches pushes that arrived without a webhook/Actions
     // trigger so build-before-clone still holds. Defaults to 5 minutes so
@@ -8648,6 +8765,7 @@ pub async fn run_server(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::queue::JobQueue;
     use tower::util::ServiceExt;
 
     #[test]
@@ -8695,6 +8813,118 @@ mod tests {
                 .await
                 .is_err(),
             "matching attempt false is an invariant error"
+        );
+        assert!(
+            pin_admission_for_attempt(&state.ref_store, &repo_id, "main", "c1", "current")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !fail_admission_for_attempt(
+                &state.ref_store,
+                &repo_id,
+                "main",
+                Some("c1"),
+                "stale",
+                "stale",
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            fail_admission_for_attempt(
+                &state.ref_store,
+                &repo_id,
+                "main",
+                Some("wrong"),
+                "bad target",
+                "current",
+            )
+            .await
+            .is_err(),
+            "matching attempt false must surface for reconciliation"
+        );
+        assert!(
+            fail_admission_for_attempt(
+                &state.ref_store,
+                &repo_id,
+                "main",
+                Some("c1"),
+                "terminal",
+                "current",
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            fail_admission_for_attempt(
+                &state.ref_store,
+                &repo_id,
+                "main",
+                Some("c1"),
+                "duplicate terminal report",
+                "current",
+            )
+            .await
+            .unwrap(),
+            "equivalent concurrent terminal reports are idempotent"
+        );
+
+        let missing = RepoId::github("acme/removed-admission");
+        assert!(
+            !fail_admission_for_attempt(
+                &state.ref_store,
+                &missing,
+                "main",
+                Some("c1"),
+                "late",
+                "removed",
+            )
+            .await
+            .unwrap(),
+            "a removed admission is a benign stale report"
+        );
+
+        let active = RepoId::github("acme/active-admission");
+        state
+            .ref_store
+            .begin_repo_initialization(&AddedRepo {
+                repo_id: active.clone(),
+                added_at: 1,
+                history_enabled: true,
+                source: AddedRepoSource::Api,
+                repo_size_bytes: None,
+                state: RepoLifecycleState::Initializing,
+                initialization_branch: Some("main".into()),
+                initialization_target: None,
+                activated_at: None,
+                failure: None,
+                initialization_attempt_id: Some("active".into()),
+            })
+            .await
+            .unwrap();
+        assert!(
+            pin_admission_for_attempt(&state.ref_store, &active, "main", "ready", "active")
+                .await
+                .unwrap()
+        );
+        assert!(
+            activate_admission_for_attempt(&state.ref_store, &active, "main", "ready", "active")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !fail_admission_for_attempt(
+                &state.ref_store,
+                &active,
+                "HEAD",
+                Some("ready"),
+                "late failure",
+                "active",
+            )
+            .await
+            .unwrap(),
+            "verified active readiness dominates a late HEAD/main failure"
         );
     }
 
@@ -9326,6 +9556,93 @@ mod tests {
             job.initialization_attempt_id.as_deref(),
             Some(attempt.as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn dispatcher_deadletter_fails_admission_without_poller_or_live_worker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let queue_path = tmp.path().join("admission-queue.db");
+        let queue = Arc::new(
+            crate::queue::SqlJobQueue::new(Box::new(
+                crate::queue::SqliteDb::connect(queue_path.to_str().unwrap())
+                    .await
+                    .unwrap(),
+            ))
+            .await
+            .unwrap()
+            .with_stale_claim_secs(0)
+            .with_max_build_attempts(3),
+        );
+        let mut state = test_state(&tmp);
+        state.build_queue = queue.clone();
+        state.worker_queue = Some(queue.clone());
+
+        let repo_id = RepoId::github("acme/dispatcher-deadletter");
+        let attempt_id = "hard-killed-attempt";
+        state
+            .ref_store
+            .begin_repo_initialization(&AddedRepo {
+                repo_id: repo_id.clone(),
+                added_at: 1,
+                history_enabled: true,
+                source: AddedRepoSource::Api,
+                repo_size_bytes: None,
+                state: RepoLifecycleState::Initializing,
+                initialization_branch: Some("main".into()),
+                initialization_target: None,
+                activated_at: None,
+                failure: None,
+                initialization_attempt_id: Some(attempt_id.into()),
+            })
+            .await
+            .unwrap();
+        queue
+            .enqueue(BuildJob {
+                repo_id: repo_id.clone(),
+                branch: "main".into(),
+                initialization_attempt_id: Some(attempt_id.into()),
+                rev: None,
+                credential: None,
+                recheck: 0,
+                size_bytes: None,
+            })
+            .await
+            .unwrap();
+
+        // Three workers are successively hard-killed: each claim is abandoned.
+        // The always-on server actor, not a fourth worker claim or the repo
+        // poller, must perform the terminal reclaim and lifecycle transition.
+        for worker in ["killed-1", "killed-2", "killed-3"] {
+            queue.claim(worker).await.unwrap().unwrap();
+        }
+        spawn_admission_deadletter_loop(state.clone(), Duration::from_millis(1));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let admission = state
+                    .ref_store
+                    .load_added_repo(&repo_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if admission.state == RepoLifecycleState::Failed {
+                    assert_eq!(
+                        admission.initialization_attempt_id.as_deref(),
+                        Some(attempt_id)
+                    );
+                    assert!(
+                        admission
+                            .failure
+                            .as_deref()
+                            .is_some_and(|error| error.contains("dead-lettered"))
+                    );
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("always-on admission reconciliation did not terminalize dead job");
+        assert!(queue.reclaim_stale().await.unwrap().is_empty());
     }
 
     #[test]

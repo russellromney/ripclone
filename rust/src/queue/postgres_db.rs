@@ -7,7 +7,7 @@
 //! partial unique index. The claim/coalesce orchestration in `SqlJobQueue` is
 //! reused unchanged.
 
-use super::sql::{QueueDb, SUPERSEDED_BY_NEWER_QUEUED, now_secs};
+use super::sql::{DeadLetteredInitialization, QueueDb, SUPERSEDED_BY_NEWER_QUEUED, now_secs};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use sqlx::Row;
@@ -204,6 +204,39 @@ impl QueueDb for PostgresDb {
         Ok(())
     }
 
+    async fn dead_lettered_initializations(&self) -> Result<Vec<DeadLetteredInitialization>> {
+        let rows = sqlx::query(
+            "SELECT id,provider,path,branch,initialization_attempt_id,error FROM jobs
+             WHERE status='failed' AND initialization_attempt_id IS NOT NULL
+               AND error LIKE 'dead-lettered after %'",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("list dead-lettered admission jobs")?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(DeadLetteredInitialization {
+                    id: row.try_get(0)?,
+                    provider: row.try_get(1)?,
+                    path: row.try_get(2)?,
+                    branch: row.try_get(3)?,
+                    initialization_attempt_id: row.try_get(4)?,
+                    error: row.try_get(5)?,
+                })
+            })
+            .collect()
+    }
+
+    async fn acknowledge_dead_lettered_initialization(
+        &self,
+        id: i64,
+        attempt_id: &str,
+    ) -> Result<()> {
+        sqlx::query("UPDATE jobs SET initialization_attempt_id=NULL WHERE id=$1 AND status='failed' AND initialization_attempt_id=$2")
+            .bind(id).bind(attempt_id).execute(&self.pool).await.context("acknowledge dead-lettered admission")?;
+        Ok(())
+    }
+
     async fn job_size_class(&self, id: i64) -> Result<Option<i64>> {
         sqlx::query_scalar("SELECT size_class FROM jobs WHERE id = $1")
             .bind(id)
@@ -359,7 +392,7 @@ impl QueueDb for PostgresDb {
     }
 
     async fn prune_failed(&self, cutoff: i64) -> Result<u64> {
-        let res = sqlx::query("DELETE FROM jobs WHERE status = 'failed' AND finished_at < $1")
+        let res = sqlx::query("DELETE FROM jobs WHERE status = 'failed' AND finished_at < $1 AND (initialization_attempt_id IS NULL OR error NOT LIKE 'dead-lettered after %')")
             .bind(cutoff)
             .execute(&self.pool)
             .await

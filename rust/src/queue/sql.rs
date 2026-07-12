@@ -76,6 +76,27 @@ pub struct ClaimedJob {
     pub credential: Option<secrecy::SecretString>,
 }
 
+/// Admission job terminalized by stale-claim reclamation without a live worker
+/// available to report the lifecycle failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeadLetteredInitialization {
+    pub id: i64,
+    pub provider: String,
+    pub path: String,
+    pub branch: String,
+    pub initialization_attempt_id: String,
+    pub error: String,
+}
+
+impl DeadLetteredInitialization {
+    pub fn repo_id(&self) -> RepoId {
+        RepoId {
+            workspace: ProviderInstanceId::new(self.provider.clone()),
+            path: self.path.clone(),
+        }
+    }
+}
+
 impl ClaimedJob {
     /// Reconstruct the repo identity for the build.
     pub fn repo_id(&self) -> RepoId {
@@ -150,6 +171,16 @@ pub trait QueueDb: Send + Sync {
         max_attempts: i64,
         now: i64,
         dead_letter_error: &str,
+    ) -> Result<()>;
+
+    /// Terminal admission rows produced by stale reclaim. Reads are
+    /// intentionally repeatable; lifecycle reconciliation is attempt-fenced and
+    /// idempotent, so a crash between read and metadata update cannot lose one.
+    async fn dead_lettered_initializations(&self) -> Result<Vec<DeadLetteredInitialization>>;
+    async fn acknowledge_dead_lettered_initialization(
+        &self,
+        id: i64,
+        attempt_id: &str,
     ) -> Result<()>;
 
     /// Current `size_class` for a job id (`None` if the row is missing).
@@ -497,6 +528,13 @@ impl SqlJobQueue {
         self
     }
 
+    /// Override the crash/OOM retry cap. Primarily useful for deterministic
+    /// lifecycle tests; production normally uses `RIPCLONE_QUEUE_MAX_ATTEMPTS`.
+    pub fn with_max_build_attempts(mut self, attempts: i64) -> Self {
+        self.max_build_attempts = attempts.max(1);
+        self
+    }
+
     /// Configured size classes (ordered, smallest first).
     pub fn size_classes(&self) -> &[SizeClass] {
         &self.size_classes
@@ -660,7 +698,7 @@ impl SqlJobQueue {
     /// Same reclaim semantics as `claim_capped` — same stale window, same
     /// max-attempts cap, same dead-letter behavior. Only *when* this runs
     /// changes, never *what* it does.
-    pub async fn reclaim_stale(&self) -> Result<()> {
+    pub async fn reclaim_stale(&self) -> Result<Vec<DeadLetteredInitialization>> {
         let now = now_secs();
         self.db
             .reclaim_stale(
@@ -672,7 +710,8 @@ impl SqlJobQueue {
                     self.max_build_attempts
                 ),
             )
-            .await
+            .await?;
+        self.db.dead_lettered_initializations().await
     }
 
     /// Resolve a size-class *name* to a rank ceiling using this queue's
@@ -695,7 +734,7 @@ impl SqlJobQueue {
         worker_id: &str,
         ceiling: Option<i64>,
     ) -> Result<Option<ClaimedJob>> {
-        self.reclaim_stale().await?;
+        let _ = self.reclaim_stale().await?;
         for attempt in 0..MAX_CLAIM_ATTEMPTS {
             let Some(id) = self.db.next_queued_id(ceiling).await? else {
                 return Ok(None);
@@ -863,6 +902,20 @@ impl JobQueue for SqlJobQueue {
 /// [`ApiJobQueue`](crate::api_job_queue::ApiJobQueue) instead.
 #[async_trait]
 impl WorkerQueue for SqlJobQueue {
+    async fn reclaim_stale_initializations(&self) -> Result<Vec<DeadLetteredInitialization>> {
+        self.reclaim_stale().await
+    }
+
+    async fn acknowledge_dead_lettered_initialization(
+        &self,
+        id: JobId,
+        attempt_id: &str,
+    ) -> Result<()> {
+        self.db
+            .acknowledge_dead_lettered_initialization(id, attempt_id)
+            .await
+    }
+
     async fn claim(&self, worker_id: &str) -> Result<Option<ClaimedJob>> {
         SqlJobQueue::claim(self, worker_id).await
     }
@@ -1261,7 +1314,7 @@ mod tests {
             let q = SqlJobQueue {
                 db,
                 stale_claim_secs: DEFAULT_STALE_CLAIM_SECS,
-                failed_retention_secs: DEFAULT_FAILED_RETENTION_SECS,
+                failed_retention_secs: -1,
                 max_build_attempts: DEFAULT_MAX_BUILD_ATTEMPTS,
                 size_classes: default_size_classes(),
                 max_size_class: None,
@@ -1602,13 +1655,17 @@ mod tests {
             let q = SqlJobQueue {
                 db,
                 stale_claim_secs: 0,
-                failed_retention_secs: DEFAULT_FAILED_RETENTION_SECS,
+                // Make ordinary failed rows immediately eligible so this test
+                // proves the admission-attempt marker alone fences pruning.
+                failed_retention_secs: -1,
                 max_build_attempts: max,
                 size_classes: default_size_classes(),
                 max_size_class: None,
                 heartbeat_timeout_secs: DEFAULT_HEARTBEAT_TIMEOUT_SECS,
             };
-            let enq = q.enqueue(job("o", "r", "main")).await.unwrap();
+            let mut admission = job("o", "r", "main");
+            admission.initialization_attempt_id = Some("attempt-a".into());
+            let enq = q.enqueue(admission).await.unwrap();
             let id = enq.job_id.unwrap();
 
             // Each claim simulates a worker that gets SIGKILLed mid-build: it
@@ -1624,17 +1681,31 @@ mod tests {
 
             // The next claim finds the row over the attempt cap: it dead-letters
             // it to `failed` and there is nothing left to hand out.
+            let dead_letters = q.reclaim_stale().await.unwrap();
+            assert_eq!(dead_letters.len(), 1);
+            assert_eq!(dead_letters[0].initialization_attempt_id, "attempt-a");
+            assert_eq!(
+                q.prune_failed().await.unwrap(),
+                0,
+                "unreported admission dead-letter must be retained"
+            );
+            assert!(matches!(
+                q.job_status(id).await.unwrap(),
+                JobState::Failed(_)
+            ));
+            q.acknowledge_dead_lettered_initialization(id, "attempt-a")
+                .await
+                .unwrap();
+            assert!(q.reclaim_stale().await.unwrap().is_empty());
             assert!(
                 q.claim("w").await.unwrap().is_none(),
                 "{engine}: an over-cap job is dead-lettered, not re-handed-out"
             );
-            match q.job_status(id).await.unwrap() {
-                JobState::Failed(e) => assert!(
-                    e.contains("dead-lettered"),
-                    "{engine}: dead-letter error, got {e:?}"
-                ),
-                other => panic!("{engine}: expected Failed (dead-letter), got {other:?}"),
-            }
+            assert_eq!(
+                q.prune_failed().await.unwrap(),
+                1,
+                "acknowledged admission dead-letter is prunable"
+            );
         }
     }
 

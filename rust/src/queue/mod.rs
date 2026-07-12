@@ -13,6 +13,7 @@
 use crate::provider::RepoId;
 use anyhow::Result;
 use async_trait::async_trait;
+use sha2::{Digest, Sha256};
 use std::fmt;
 use std::sync::Arc;
 
@@ -33,9 +34,10 @@ pub use size_class::{
     resolve_job_size_bytes,
 };
 pub use sql::{
-    ClaimedJob, DEFAULT_HEARTBEAT_TIMEOUT_SECS, SqlJobQueue, make_worker_id, make_worker_id_parts,
-    validate_heartbeat_timing, worker_heartbeat_enabled, worker_heartbeat_enabled_from_env,
-    worker_heartbeat_interval_secs, worker_heartbeat_interval_secs_from,
+    ClaimedJob, DEFAULT_HEARTBEAT_TIMEOUT_SECS, DeadLetteredInitialization, SqlJobQueue,
+    make_worker_id, make_worker_id_parts, validate_heartbeat_timing, worker_heartbeat_enabled,
+    worker_heartbeat_enabled_from_env, worker_heartbeat_interval_secs,
+    worker_heartbeat_interval_secs_from,
 };
 pub use sqlite_db::SqliteDb;
 
@@ -113,15 +115,55 @@ impl std::error::Error for BuildError {}
 
 impl BuildJob {
     /// Coalescing key: concurrent syncs for the same key collapse to one build.
-    /// Uses the repo's storage key plus the branch, so it is stable across
-    /// processes. Slash-joined (not NUL-joined): some SQL engines (Postgres)
-    /// reject `\0` in TEXT columns.
+    /// Every variable component is byte-length-prefixed in the hash input, so
+    /// legal branch names cannot impersonate an admission suffix. Hashing keeps
+    /// the SQL key fixed-size even at maximum legal component lengths. The
+    /// version prefix permits future encoding changes.
     pub fn key(&self) -> String {
-        let base = format!("{}/{}", self.repo_id.storage_key(), self.branch);
-        match self.initialization_attempt_id.as_deref() {
-            Some(attempt_id) => format!("{base}/admission-attempt/{attempt_id}"),
-            None => base,
+        let repo = self.repo_id.storage_key();
+        let mut digest = Sha256::new();
+        for component in [repo.as_bytes(), self.branch.as_bytes()] {
+            digest.update((component.len() as u64).to_be_bytes());
+            digest.update(component);
         }
+        match self.initialization_attempt_id.as_deref() {
+            Some(attempt_id) => {
+                digest.update([1]);
+                digest.update((attempt_id.len() as u64).to_be_bytes());
+                digest.update(attempt_id.as_bytes());
+            }
+            None => digest.update([0]),
+        }
+        format!("v2:{}", hex::encode(digest.finalize()))
+    }
+}
+
+#[cfg(test)]
+mod build_job_key_tests {
+    use super::*;
+
+    fn job(branch: &str, attempt: Option<&str>) -> BuildJob {
+        BuildJob {
+            repo_id: RepoId::github("owner/repo"),
+            branch: branch.to_string(),
+            initialization_attempt_id: attempt.map(str::to_string),
+            rev: None,
+            credential: None,
+            recheck: 0,
+            size_bytes: None,
+        }
+    }
+
+    #[test]
+    fn admission_key_cannot_collide_with_legal_ordinary_branch() {
+        let admission = job("main", Some("X"));
+        let ordinary = job("main/admission-attempt/X", None);
+        assert_ne!(admission.key(), ordinary.key());
+        assert_ne!(admission.key(), job("main", Some("X:a0")).key());
+        assert_eq!(admission.key(), job("main", Some("X")).key());
+        let maximal = job(&"b".repeat(255), Some(&"a".repeat(1024))).key();
+        assert_eq!(maximal.len(), 67);
+        assert!(maximal.is_ascii());
     }
 }
 
@@ -211,6 +253,18 @@ pub type JobQueueRef = Arc<dyn JobQueue>;
 /// traits would make `q.job_status(..)` ambiguous once both are in scope.
 #[async_trait]
 pub trait WorkerQueue: JobQueue {
+    async fn reclaim_stale_initializations(&self) -> Result<Vec<DeadLetteredInitialization>> {
+        Ok(Vec::new())
+    }
+
+    async fn acknowledge_dead_lettered_initialization(
+        &self,
+        _id: JobId,
+        _attempt_id: &str,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// Claim the oldest eligible queued job for this worker, or `None` when the
     /// queue is empty. Returns **exactly one** job, scoped to this caller.
     async fn claim(&self, worker_id: &str) -> Result<Option<ClaimedJob>>;

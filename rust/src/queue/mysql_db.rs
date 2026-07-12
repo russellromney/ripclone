@@ -8,7 +8,7 @@
 //! coalescing backstop is omitted — coalescing is best-effort only (a rare
 //! duplicate is wasted compute, not a wrong result). Orchestration is reused.
 
-use super::sql::{QueueDb, SUPERSEDED_BY_NEWER_QUEUED, now_secs};
+use super::sql::{DeadLetteredInitialization, QueueDb, SUPERSEDED_BY_NEWER_QUEUED, now_secs};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use sqlx::Row;
@@ -82,9 +82,32 @@ impl QueueDb for MysqlDb {
         let _ = sqlx::raw_sql("ALTER TABLE jobs ADD COLUMN credential TEXT")
             .execute(&self.pool)
             .await;
-        let _ = sqlx::raw_sql("ALTER TABLE jobs ADD COLUMN initialization_attempt_id TEXT")
-            .execute(&self.pool)
-            .await;
+        if let Err(error) =
+            sqlx::raw_sql("ALTER TABLE jobs ADD COLUMN initialization_attempt_id TEXT")
+                .execute(&self.pool)
+                .await
+        {
+            let duplicate = error.as_database_error().is_some_and(|db| {
+                db.code().as_deref() == Some("42S21")
+                    || db
+                        .message()
+                        .to_ascii_lowercase()
+                        .contains("duplicate column")
+            });
+            if !duplicate {
+                return Err(error).context("add jobs.initialization_attempt_id");
+            }
+        }
+        let attempt_column: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name='jobs' AND column_name='initialization_attempt_id'",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .context("validate jobs.initialization_attempt_id")?;
+        anyhow::ensure!(
+            attempt_column == 1,
+            "queue schema is missing jobs.initialization_attempt_id"
+        );
         // Same best-effort migration for the attempts column (dead-letter bound).
         let _ = sqlx::raw_sql("ALTER TABLE jobs ADD COLUMN attempts BIGINT NOT NULL DEFAULT 0")
             .execute(&self.pool)
@@ -201,6 +224,39 @@ impl QueueDb for MysqlDb {
         .execute(&self.pool)
         .await
         .context("reclaim stale jobs")?;
+        Ok(())
+    }
+
+    async fn dead_lettered_initializations(&self) -> Result<Vec<DeadLetteredInitialization>> {
+        let rows = sqlx::query(
+            "SELECT id,provider,path,branch,initialization_attempt_id,error FROM jobs
+             WHERE status='failed' AND initialization_attempt_id IS NOT NULL
+               AND error LIKE 'dead-lettered after %'",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("list dead-lettered admission jobs")?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(DeadLetteredInitialization {
+                    id: row.try_get(0)?,
+                    provider: row.try_get(1)?,
+                    path: row.try_get(2)?,
+                    branch: row.try_get(3)?,
+                    initialization_attempt_id: row.try_get(4)?,
+                    error: row.try_get(5)?,
+                })
+            })
+            .collect()
+    }
+
+    async fn acknowledge_dead_lettered_initialization(
+        &self,
+        id: i64,
+        attempt_id: &str,
+    ) -> Result<()> {
+        sqlx::query("UPDATE jobs SET initialization_attempt_id=NULL WHERE id=? AND status='failed' AND initialization_attempt_id=?")
+            .bind(id).bind(attempt_id).execute(&self.pool).await.context("acknowledge dead-lettered admission")?;
         Ok(())
     }
 
@@ -366,7 +422,7 @@ impl QueueDb for MysqlDb {
     }
 
     async fn prune_failed(&self, cutoff: i64) -> Result<u64> {
-        let res = sqlx::query("DELETE FROM jobs WHERE status = 'failed' AND finished_at < ?")
+        let res = sqlx::query("DELETE FROM jobs WHERE status = 'failed' AND finished_at < ? AND (initialization_attempt_id IS NULL OR error NOT LIKE 'dead-lettered after %')")
             .bind(cutoff)
             .execute(&self.pool)
             .await

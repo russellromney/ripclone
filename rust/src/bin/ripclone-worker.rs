@@ -68,7 +68,10 @@ use ripclone::queue::{
     BuildError, BuildJob, JobQueueRef, JobState, WorkerQueueRef, make_worker_id,
     validate_heartbeat_timing, worker_heartbeat_enabled_from_env, worker_heartbeat_interval_secs,
 };
-use ripclone::server::{ServerState, mark_branch_build_failed, process_build_job};
+use ripclone::server::{
+    ServerState, mark_branch_build_failed, process_build_job,
+    reconcile_dead_lettered_initialization,
+};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -226,6 +229,12 @@ async fn main() -> Result<()> {
     let mut idle_since: Option<Instant> = None;
     let mut jobs_done: u64 = 0;
     loop {
+        for dead in queue.reclaim_stale_initializations().await? {
+            reconcile_dead_lettered_initialization(&state, &dead).await?;
+            queue
+                .acknowledge_dead_lettered_initialization(dead.id, &dead.initialization_attempt_id)
+                .await?;
+        }
         let prune_due = pruned_at
             .map(|t| t.elapsed() >= prune_interval)
             .unwrap_or(true);
