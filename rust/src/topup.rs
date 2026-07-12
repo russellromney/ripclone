@@ -263,19 +263,32 @@ fn ensure_not_cancelled(cancelled: &tokio_util::sync::CancellationToken) -> Resu
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-/// The random mode-0700 directory is itself the candidate repository. Success
-/// moves that exact root to the destination. Failure only closes capabilities
-/// and abandons the recognizable `.ripclone-<kind>-<nonce>` root: no pathname
-/// is ever unlinked, so later bounded orphan recovery can be implemented as a
-/// separate maintenance operation with an age/ownership policy.
+/// A random mode-0700 wrapper contains a separately random candidate repository.
+/// Materialization and publication are both relative to held descriptors: the
+/// wrapper's pathname is never used as the rename source. Success moves the
+/// held inner repository to the destination; success and failure both abandon
+/// the wrapper without unlinking any pathname.
+///
+/// The security boundary is other OS principals. The destination parent must
+/// be owned by our effective uid and have no group/other write bits, and that
+/// identity is checked before work starts and immediately before publication.
+/// A malicious same-euid process is the same OS principal (and can already
+/// ptrace, signal, or read this process's credentials); POSIX and macOS expose
+/// no inode-CAS directory rename that could defend against it. We nevertheless
+/// bind and verify the inner inode on both sides of the no-replace rename, and
+/// abort if the impossible-within-this-boundary postcondition is violated.
 pub(crate) struct BoundInstall {
     parent: OwnedFd,
+    wrapper: OwnedFd,
     staging: OwnedFd,
     parent_path: std::path::PathBuf,
     target_name: std::ffi::OsString,
-    staging_name: std::ffi::OsString,
+    #[cfg(test)]
+    wrapper_name: std::ffi::OsString,
+    inner_name: std::ffi::OsString,
     parent_dev: u64,
     parent_ino: u64,
+    parent_uid: u32,
     staging_dev: u64,
     staging_ino: u64,
 }
@@ -297,25 +310,40 @@ impl BoundInstall {
             .to_path_buf();
         let (parent, parent_path) = open_parent_chain(&parent_path)?;
         ensure_absent_at(parent.as_raw_fd(), &target_name)?;
-        let staging_name = std::ffi::OsString::from(format!(
+        let parent_stat = fd_stat(parent.as_raw_fd())?;
+        validate_publication_parent(&parent_stat, None)?;
+        let wrapper_name = std::ffi::OsString::from(format!(
             ".ripclone-{prefix}-{}",
             hex::encode(rand::random::<[u8; 16]>())
         ));
-        let staging_c = cstring(&staging_name)?;
-        if unsafe { libc::mkdirat(parent.as_raw_fd(), staging_c.as_ptr(), 0o700) } != 0 {
+        let wrapper_c = cstring(&wrapper_name)?;
+        if unsafe { libc::mkdirat(parent.as_raw_fd(), wrapper_c.as_ptr(), 0o700) } != 0 {
             return Err(std::io::Error::last_os_error()).context("create fd-bound clone staging");
         }
-        let staging = openat_dir(parent.as_raw_fd(), &staging_name)?;
-        let parent_stat = fd_stat(parent.as_raw_fd())?;
+        let wrapper = openat_dir(parent.as_raw_fd(), &wrapper_name)?;
+        validate_private_staging_dir(&fd_stat(wrapper.as_raw_fd())?, "clone staging wrapper")?;
+        let inner_name =
+            std::ffi::OsString::from(format!(".repo-{}", hex::encode(rand::random::<[u8; 16]>())));
+        let inner_c = cstring(&inner_name)?;
+        if unsafe { libc::mkdirat(wrapper.as_raw_fd(), inner_c.as_ptr(), 0o700) } != 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("create fd-bound inner clone staging");
+        }
+        let staging = openat_dir(wrapper.as_raw_fd(), &inner_name)?;
         let staging_stat = fd_stat(staging.as_raw_fd())?;
+        validate_private_staging_dir(&staging_stat, "inner clone staging")?;
         Ok(Self {
             parent,
+            wrapper,
             staging,
             parent_path,
             target_name,
-            staging_name,
+            #[cfg(test)]
+            wrapper_name,
+            inner_name,
             parent_dev: parent_stat.st_dev as u64,
             parent_ino: parent_stat.st_ino as u64,
+            parent_uid: parent_stat.st_uid,
             staging_dev: staging_stat.st_dev as u64,
             staging_ino: staging_stat.st_ino as u64,
         })
@@ -372,20 +400,23 @@ impl BoundInstall {
             || current.file_type().is_symlink()
             || current.dev() != self.parent_dev
             || current.ino() != self.parent_ino
+            || current.uid() != self.parent_uid
         {
             bail!("clone destination parent changed during installation")
         }
+        let parent_stat = fd_stat(self.parent.as_raw_fd())?;
+        validate_publication_parent(&parent_stat, Some(self))?;
         ensure_absent_at(self.parent.as_raw_fd(), &self.target_name)?;
-        let bound = entry_stat(self.parent.as_raw_fd(), &self.staging_name)?;
+        let bound = entry_stat(self.wrapper.as_raw_fd(), &self.inner_name)?;
         if bound.st_dev as u64 != self.staging_dev || bound.st_ino != self.staging_ino {
-            bail!("clone staging root changed before publication")
+            bail!("inner clone staging changed before publication")
         }
-        let from = cstring(&self.staging_name)?;
+        let from = cstring(&self.inner_name)?;
         let to = cstring(&self.target_name)?;
         #[cfg(target_os = "linux")]
         let rc = unsafe {
             libc::renameat2(
-                self.parent.as_raw_fd(),
+                self.wrapper.as_raw_fd(),
                 from.as_ptr(),
                 self.parent.as_raw_fd(),
                 to.as_ptr(),
@@ -395,7 +426,7 @@ impl BoundInstall {
         #[cfg(target_os = "macos")]
         let rc = unsafe {
             libc::renameatx_np(
-                self.parent.as_raw_fd(),
+                self.wrapper.as_raw_fd(),
                 from.as_ptr(),
                 self.parent.as_raw_fd(),
                 to.as_ptr(),
@@ -405,6 +436,13 @@ impl BoundInstall {
         if rc != 0 {
             return Err(std::io::Error::last_os_error())
                 .context("fd-bound atomic no-replace publication");
+        }
+        let published = entry_stat(self.parent.as_raw_fd(), &self.target_name)
+            .unwrap_or_else(|_| std::process::abort());
+        if published.st_dev as u64 != self.staging_dev || published.st_ino != self.staging_ino {
+            // The rename succeeded but its destination is no longer the held
+            // inode. Only mutation by our own OS principal can produce this.
+            std::process::abort();
         }
         Ok(())
     }
@@ -668,6 +706,32 @@ fn fd_stat(fd: libc::c_int) -> Result<libc::stat> {
         return Err(std::io::Error::last_os_error()).context("stat clone parent handle");
     }
     Ok(unsafe { stat.assume_init() })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn validate_publication_parent(stat: &libc::stat, expected: Option<&BoundInstall>) -> Result<()> {
+    if stat.st_uid != unsafe { libc::geteuid() } {
+        bail!("clone destination parent is not owned by the current OS principal")
+    }
+    if stat.st_mode & 0o022 != 0 {
+        bail!("clone destination parent is writable by another OS principal")
+    }
+    if let Some(expected) = expected
+        && (stat.st_dev as u64 != expected.parent_dev
+            || stat.st_ino != expected.parent_ino
+            || stat.st_uid != expected.parent_uid)
+    {
+        bail!("clone destination parent capability changed during installation")
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn validate_private_staging_dir(stat: &libc::stat, label: &str) -> Result<()> {
+    if stat.st_uid != unsafe { libc::geteuid() } || stat.st_mode & 0o777 != 0o700 {
+        bail!("{label} is not a private mode-0700 directory owned by this OS principal")
+    }
+    Ok(())
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1473,11 +1537,11 @@ mod blocker_tests {
         std::fs::create_dir(&parent).unwrap();
         let transaction = BoundInstall::new(&parent.join("repo"), "swap").unwrap();
         let scope = transaction.enter_staging().unwrap();
-        let staging_name = transaction.staging_name.clone();
+        let wrapper_name = transaction.wrapper_name.clone();
         let moved = root.path().join("moved");
         std::fs::rename(&parent, &moved).unwrap();
         std::fs::create_dir(&parent).unwrap();
-        let replacement_staging = parent.join(&staging_name);
+        let replacement_staging = parent.join(&wrapper_name);
         std::fs::create_dir(&replacement_staging).unwrap();
         std::fs::write(replacement_staging.join("sentinel"), b"replacement").unwrap();
         std::fs::write(transaction.staging_root().join("original"), b"bound").unwrap();
@@ -1495,16 +1559,23 @@ mod blocker_tests {
             std::fs::read(replacement_staging.join("sentinel")).unwrap(),
             b"replacement"
         );
-        assert!(moved_again.join(&staging_name).join("original").exists());
         assert!(
             moved_again
-                .join(&staging_name)
+                .join(&wrapper_name)
+                .join(&transaction.inner_name)
+                .join("original")
+                .exists()
+        );
+        assert!(
+            moved_again
+                .join(&wrapper_name)
+                .join(&transaction.inner_name)
                 .join("after-second-swap")
                 .exists()
         );
         drop(scope);
         drop(transaction);
-        assert!(moved_again.join(staging_name).exists());
+        assert!(moved_again.join(wrapper_name).exists());
         assert_eq!(
             std::fs::read(replacement_staging.join("sentinel")).unwrap(),
             b"replacement"
@@ -1513,32 +1584,46 @@ mod blocker_tests {
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn failed_staging_is_abandoned_without_deleting_swaps_or_unrelated_names() {
+    fn outer_wrapper_double_swap_cannot_redirect_publication_or_delete_replacements() {
         let root = tempfile::tempdir().unwrap();
         let parent = root.path().join("parent");
         std::fs::create_dir(&parent).unwrap();
         std::fs::write(parent.join("unrelated"), b"safe").unwrap();
         let transaction = BoundInstall::new(&parent.join("destination"), "abandon").unwrap();
-        let original_name = transaction.staging_name.clone();
+        let scope = transaction.enter_staging().unwrap();
+        let original_name = transaction.wrapper_name.clone();
         let original = parent.join(&original_name);
-        std::fs::write(original.join("original"), b"bound").unwrap();
-        let moved = parent.join("same-uid-moved-root");
-        std::fs::rename(&original, &moved).unwrap();
+        std::fs::write(transaction.staging_root().join("original"), b"bound").unwrap();
+        scope.finish().unwrap();
+        let moved_once = parent.join("same-uid-moved-root");
+        std::fs::rename(&original, &moved_once).unwrap();
         std::fs::create_dir(&original).unwrap();
         std::fs::write(original.join("replacement-sentinel"), b"replacement").unwrap();
+        let moved_twice = parent.join("same-uid-moved-root-again");
+        std::fs::rename(&moved_once, &moved_twice).unwrap();
+        std::fs::create_dir(&moved_once).unwrap();
+        std::fs::write(moved_once.join("second-sentinel"), b"second").unwrap();
+        transaction.publish_repo().unwrap();
         drop(transaction);
-        assert_eq!(std::fs::read(moved.join("original")).unwrap(), b"bound");
+        assert_eq!(
+            std::fs::read(parent.join("destination/original")).unwrap(),
+            b"bound"
+        );
         assert_eq!(
             std::fs::read(original.join("replacement-sentinel")).unwrap(),
             b"replacement"
         );
+        assert_eq!(
+            std::fs::read(moved_once.join("second-sentinel")).unwrap(),
+            b"second"
+        );
+        assert!(moved_twice.exists());
         assert_eq!(std::fs::read(parent.join("unrelated")).unwrap(), b"safe");
-        assert!(!parent.join("destination").exists());
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn failures_leave_bounded_recognizable_private_roots_and_success_moves_its_root() {
+    fn failures_leave_bounded_private_wrappers_and_success_moves_held_inner_inode() {
         use std::os::unix::fs::PermissionsExt;
         let root = tempfile::tempdir().unwrap();
         let parent = root.path().join("parent");
@@ -1563,11 +1648,16 @@ mod blocker_tests {
         assert_eq!(abandoned.len(), 3);
         assert!(abandoned.iter().all(|entry| {
             entry.metadata().unwrap().permissions().mode() & 0o777 == 0o700
-                && entry.path().join("sentinel").exists()
+                && std::fs::read_dir(entry.path()).unwrap().any(|inner| {
+                    let inner = inner.unwrap();
+                    inner.file_name().to_string_lossy().starts_with(".repo-")
+                        && inner.path().join("sentinel").exists()
+                })
         }));
 
         let transaction = BoundInstall::new(&parent.join("destination"), "success").unwrap();
-        let staging_name = transaction.staging_name.clone();
+        let wrapper_name = transaction.wrapper_name.clone();
+        let held = fd_stat(transaction.staging.as_raw_fd()).unwrap();
         let scope = transaction.enter_staging().unwrap();
         std::fs::write(transaction.staging_root().join("published"), b"exact").unwrap();
         scope.finish().unwrap();
@@ -1577,7 +1667,56 @@ mod blocker_tests {
             std::fs::read(parent.join("destination/published")).unwrap(),
             b"exact"
         );
-        assert!(!parent.join(staging_name).exists());
+        let published = std::fs::symlink_metadata(parent.join("destination")).unwrap();
+        assert_eq!(
+            (published.dev(), published.ino()),
+            (held.st_dev as u64, held.st_ino)
+        );
+        let wrapper = parent.join(wrapper_name);
+        assert!(
+            wrapper.is_dir(),
+            "successful publication abandons its wrapper"
+        );
+        assert_eq!(std::fs::read_dir(wrapper).unwrap().count(), 0);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn parent_writable_by_other_principals_is_rejected_before_staging() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        for mode in [0o770, 0o707, 0o777] {
+            let parent = root.path().join(format!("parent-{mode:o}"));
+            std::fs::create_dir(&parent).unwrap();
+            std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(mode)).unwrap();
+            let result = BoundInstall::new(&parent.join("destination"), "unsafe-parent");
+            assert!(result.is_err(), "accepted parent mode {mode:o}");
+            assert_eq!(std::fs::read_dir(&parent).unwrap().count(), 0);
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn parent_becoming_cross_principal_writable_blocks_publication() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("parent");
+        std::fs::create_dir(&parent).unwrap();
+        let transaction = BoundInstall::new(&parent.join("destination"), "changed-parent").unwrap();
+        let wrapper = parent.join(&transaction.wrapper_name);
+        let scope = transaction.enter_staging().unwrap();
+        std::fs::write(transaction.staging_root().join("sentinel"), b"held").unwrap();
+        scope.finish().unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(transaction.publish_repo().is_err());
+        assert!(!parent.join("destination").exists());
+        assert!(
+            wrapper
+                .join(&transaction.inner_name)
+                .join("sentinel")
+                .exists()
+        );
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1601,7 +1740,7 @@ mod blocker_tests {
         assert!(output.status.success());
         let listed = String::from_utf8_lossy(&output.stdout);
         assert!(
-            !listed.contains(&transaction.staging_name.to_string_lossy().to_string()),
+            !listed.contains(&transaction.wrapper_name.to_string_lossy().to_string()),
             "staging descriptor leaked across exec: {listed}"
         );
         scope.finish().unwrap();
@@ -1618,8 +1757,12 @@ mod blocker_tests {
         std::fs::create_dir(&second_parent).unwrap();
         let first = BoundInstall::new(&first_parent.join("repo"), "one").unwrap();
         let second = BoundInstall::new(&second_parent.join("repo"), "two").unwrap();
-        let first_path = first_parent.join(&first.staging_name);
-        let second_path = second_parent.join(&second.staging_name);
+        let first_path = first_parent
+            .join(&first.wrapper_name)
+            .join(&first.inner_name);
+        let second_path = second_parent
+            .join(&second.wrapper_name)
+            .join(&second.inner_name);
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
         let spawn = |transaction: BoundInstall,
                      barrier: std::sync::Arc<std::sync::Barrier>,
