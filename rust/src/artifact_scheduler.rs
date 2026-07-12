@@ -168,12 +168,12 @@ impl CompletionEvidence {
 /// Integration hook for mode-specific manifest/CAS validation. Production
 /// implementations verify every referenced object before the fenced publish.
 pub trait CompletionVerifier: Send + Sync {
-    fn identity(&self) -> &'static str;
+    fn identity(&self) -> &str;
     fn verify(&self, claim: &ClaimedArtifact, evidence: &CompletionEvidence) -> Result<()>;
 }
 struct StructuralVerifier;
 impl CompletionVerifier for StructuralVerifier {
-    fn identity(&self) -> &'static str {
+    fn identity(&self) -> &str {
         "structural-test-only-v1"
     }
     fn verify(&self, claim: &ClaimedArtifact, evidence: &CompletionEvidence) -> Result<()> {
@@ -1505,7 +1505,7 @@ mod tests {
     async fn concurrent_workers_cannot_establish_different_verifier_identities() {
         struct Named(&'static str);
         impl CompletionVerifier for Named {
-            fn identity(&self) -> &'static str {
+            fn identity(&self) -> &str {
                 self.0
             }
             fn verify(&self, claim: &ClaimedArtifact, evidence: &CompletionEvidence) -> Result<()> {
@@ -1604,7 +1604,7 @@ mod tests {
     async fn kind_specific_completion_verifier_is_a_mandatory_publish_gate() {
         struct RejectFiles;
         impl CompletionVerifier for RejectFiles {
-            fn identity(&self) -> &'static str {
+            fn identity(&self) -> &str {
                 "reject-files-v1"
             }
             fn verify(&self, claim: &ClaimedArtifact, e: &CompletionEvidence) -> Result<()> {
@@ -1981,7 +1981,7 @@ mod tests {
         );
         struct Empty;
         impl CompletionVerifier for Empty {
-            fn identity(&self) -> &'static str {
+            fn identity(&self) -> &str {
                 "  "
             }
             fn verify(&self, _: &ClaimedArtifact, _: &CompletionEvidence) -> Result<()> {
