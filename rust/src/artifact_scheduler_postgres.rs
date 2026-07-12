@@ -1360,6 +1360,24 @@ impl ArtifactSchedulerPersistence for PostgresArtifactScheduler {
         row.map(row_record).transpose()
     }
 
+    async fn latest_complete_full_base(
+        &self,
+        workspace: &str,
+        repo: &str,
+        format_version: u32,
+    ) -> Result<Option<String>> {
+        validate_format_version(format_version)?;
+        sqlx::query_scalar(
+            "SELECT h.commit_oid FROM artifact_jobs h JOIN artifact_jobs f ON f.workspace=h.workspace AND f.repo=h.repo AND f.commit_oid=h.commit_oid AND f.format_version=h.format_version AND f.kind='full_history' WHERE h.workspace=$1 AND h.repo=$2 AND h.format_version=$3 AND h.kind='head' AND h.state='ready' AND f.state='ready' AND h.manifest IS NOT NULL AND length(trim(h.manifest))>0 AND f.manifest IS NOT NULL AND length(trim(f.manifest))>0 ORDER BY GREATEST(h.updated_at,f.updated_at) DESC,GREATEST(h.id,f.id) DESC LIMIT 1",
+        )
+        .bind(workspace)
+        .bind(repo)
+        .bind(format_version as i64)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
     async fn counts(&self) -> Result<Vec<(ArtifactKind, ArtifactState, u64)>> {
         let rows = sqlx::query(
             "SELECT kind,state,count(*) AS count FROM artifact_jobs GROUP BY kind,state ORDER BY kind,state",

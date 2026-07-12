@@ -1829,6 +1829,23 @@ impl ArtifactScheduler {
             None => Ok(None),
         }
     }
+    pub async fn latest_complete_full_base(
+        &self,
+        workspace: &str,
+        repo: &str,
+        format_version: u32,
+    ) -> Result<Option<String>> {
+        validate_format_version(format_version)?;
+        let commit: Option<String> = sqlx::query_scalar(
+            "SELECT h.commit_oid FROM artifact_jobs h JOIN artifact_jobs f ON f.workspace=h.workspace AND f.repo=h.repo AND f.commit_oid=h.commit_oid AND f.format_version=h.format_version AND f.kind='full_history' WHERE h.workspace=? AND h.repo=? AND h.format_version=? AND h.kind='head' AND h.state='ready' AND f.state='ready' AND h.manifest IS NOT NULL AND length(trim(h.manifest))>0 AND f.manifest IS NOT NULL AND length(trim(f.manifest))>0 ORDER BY CASE WHEN h.updated_at>f.updated_at THEN h.updated_at ELSE f.updated_at END DESC, CASE WHEN h.id>f.id THEN h.id ELSE f.id END DESC LIMIT 1",
+        )
+        .bind(workspace)
+        .bind(repo)
+        .bind(format_version as i64)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(commit)
+    }
     pub async fn counts(&self) -> Result<Vec<(ArtifactKind, ArtifactState, u64)>> {
         let rows=sqlx::query("SELECT kind,state,count(*) n FROM artifact_jobs GROUP BY kind,state ORDER BY kind,state").fetch_all(&self.pool).await?;
         rows.into_iter()
@@ -2654,6 +2671,83 @@ mod tests {
                 .unwrap()
                 .state,
             ArtifactState::Ready
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_full_base_survives_history_first_alias_advance() {
+        let (s, _d, _) = scheduler(Default::default()).await;
+        s.observe(
+            "ws",
+            "o/r",
+            "main",
+            "t1",
+            &[ArtifactKind::Head, ArtifactKind::FullHistory],
+            1,
+            None,
+        )
+        .await
+        .unwrap();
+        for _ in 0..2 {
+            let claim = s.claim("old", 60).await.unwrap().unwrap();
+            assert!(s.complete(&claim, "old", &evidence(&claim)).await.unwrap());
+        }
+        assert_eq!(
+            s.latest_complete_full_base("ws", "o/r", 1)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("t1")
+        );
+
+        s.observe(
+            "ws",
+            "o/r",
+            "main",
+            "t2",
+            &[ArtifactKind::Head, ArtifactKind::FullHistory],
+            1,
+            Some(1),
+        )
+        .await
+        .unwrap();
+        let head = s.claim("new-head", 60).await.unwrap().unwrap();
+        assert_eq!(head.record.key.kind, ArtifactKind::Head);
+        let history = s.claim("new-history", 60).await.unwrap().unwrap();
+        assert_eq!(history.record.key.kind, ArtifactKind::FullHistory);
+        assert!(
+            s.complete(&history, "new-history", &evidence(&history))
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            s.published("ws", "o/r", "main", ArtifactKind::FullHistory, 1)
+                .await
+                .unwrap()
+                .unwrap()
+                .key
+                .commit,
+            "t2"
+        );
+        assert_eq!(
+            s.latest_complete_full_base("ws", "o/r", 1)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("t1"),
+            "the independently advanced History alias must not hide T1"
+        );
+        assert!(
+            s.complete(&head, "new-head", &evidence(&head))
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            s.latest_complete_full_base("ws", "o/r", 1)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("t2")
         );
     }
 

@@ -236,6 +236,15 @@ pub trait ArtifactSchedulerPersistence: Send + Sync {
         kind: ArtifactKind,
         format_version: u32,
     ) -> Result<Option<ArtifactRecord>>;
+    /// Newest immutable commit for which both Head and FullHistory are Ready.
+    /// This deliberately does not use either per-kind branch alias: independent
+    /// sibling completion must never hide the previous complete Full base.
+    async fn latest_complete_full_base(
+        &self,
+        workspace: &str,
+        repo: &str,
+        format_version: u32,
+    ) -> Result<Option<String>>;
     async fn counts(
         &self,
     ) -> Result<Vec<(ArtifactKind, crate::artifact_scheduler::ArtifactState, u64)>>;
@@ -729,6 +738,9 @@ impl ArtifactSchedulerPersistence for crate::artifact_scheduler::ArtifactSchedul
         v: u32,
     ) -> Result<Option<ArtifactRecord>> {
         self.published(w, r, b, k, v).await
+    }
+    async fn latest_complete_full_base(&self, w: &str, r: &str, v: u32) -> Result<Option<String>> {
+        self.latest_complete_full_base(w, r, v).await
     }
     async fn counts(
         &self,

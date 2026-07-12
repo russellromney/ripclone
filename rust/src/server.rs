@@ -142,6 +142,13 @@ pub struct ServerState {
     /// Per-repo mutexes so concurrent syncs for the same repo cannot corrupt
     /// the bare mirror directory.
     pub sync_locks: Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Clone-plan work is scoped to this server instance. Keeping these out of
+    /// process globals prevents unrelated test servers/tenants from sharing
+    /// limits, and lets completed singleflight keys be removed deterministically.
+    pub pinned_generation_cells:
+        Arc<StdMutex<HashMap<String, std::sync::Weak<PinnedGenerationCell>>>>,
+    pub pinned_generation_limit: Arc<tokio::sync::Semaphore>,
+    pub artifact_verify_limit: Arc<tokio::sync::Semaphore>,
     /// Last time each `owner/repo/branch` mirror was fetched. Used to skip a
     /// redundant `git fetch` on the resolve hot path when the mirror is fresh.
     pub mirror_freshness: Arc<std::sync::Mutex<HashMap<String, Instant>>>,
@@ -261,6 +268,9 @@ impl ServerState {
             // No webhook secret here (worker has no HTTP; tests install their own).
             webhook_config: Arc::new(WebhookConfig::empty()),
             sync_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            pinned_generation_cells: Arc::new(StdMutex::new(HashMap::new())),
+            pinned_generation_limit: Arc::new(tokio::sync::Semaphore::new(2)),
+            artifact_verify_limit: Arc::new(tokio::sync::Semaphore::new(8)),
             mirror_freshness: Arc::new(std::sync::Mutex::new(HashMap::new())),
             mirror_fresh_ttl: Duration::from_secs(60),
             ref_response_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -402,7 +412,11 @@ struct ClonePlanQuery {
 }
 
 const TYPED_ARTIFACT_FORMAT_VERSION: u32 = 1;
-const CLONE_CONSUMER_TTL_SECS: i64 = 5 * 60;
+// A clone consumer protects both work in flight and immutable artifacts already
+// handed to a downloader. Use the scheduler's maximum lease window: a five
+// minute lease expires during ordinary large-repository clones and permits a
+// publication move/GC race before installation completes.
+const CLONE_CONSUMER_TTL_SECS: i64 = 24 * 60 * 60;
 
 fn default_clonepack_kind() -> String {
     "full".to_string()
@@ -3105,6 +3119,7 @@ fn full_history_base_packs(
 async fn verified_artifact(
     scheduler: &dyn crate::artifact_scheduler_backend::ArtifactSchedulerPersistence,
     verifier: &crate::artifact_manifest::CasCompletionVerifier,
+    verify_limit: &tokio::sync::Semaphore,
     key: &crate::artifact_scheduler::ArtifactKey,
 ) -> Result<
     Option<(
@@ -3122,9 +3137,7 @@ async fn verified_artifact(
         .manifest
         .as_deref()
         .context("ready typed artifact has no manifest")?;
-    static VERIFY_LIMIT: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
-    let _permit = VERIFY_LIMIT
-        .get_or_init(|| tokio::sync::Semaphore::new(8))
+    let _permit = verify_limit
         .acquire()
         .await
         .expect("typed artifact verification semaphore never closes");
@@ -3142,6 +3155,7 @@ async fn verified_artifact(
 async fn load_exact_clone_artifacts(
     scheduler: &dyn crate::artifact_scheduler_backend::ArtifactSchedulerPersistence,
     verifier: &crate::artifact_manifest::CasCompletionVerifier,
+    verify_limit: &tokio::sync::Semaphore,
     repo_id: &RepoId,
     target: &str,
     mode: SyncMode,
@@ -3150,12 +3164,13 @@ async fn load_exact_clone_artifacts(
     async fn receipt(
         scheduler: &dyn crate::artifact_scheduler_backend::ArtifactSchedulerPersistence,
         verifier: &crate::artifact_manifest::CasCompletionVerifier,
+        verify_limit: &tokio::sync::Semaphore,
         repo_id: &RepoId,
         target: &str,
         kind: ArtifactKind,
     ) -> Result<Option<VerifiedArtifactReceipt>> {
         let key = artifact_key(repo_id, target, kind);
-        Ok(verified_artifact(scheduler, verifier, &key)
+        Ok(verified_artifact(scheduler, verifier, verify_limit, &key)
             .await?
             .map(|(receipt, _)| receipt))
     }
@@ -3163,21 +3178,52 @@ async fn load_exact_clone_artifacts(
     let mut exact = ExactArtifacts::default();
     match mode {
         SyncMode::Files => {
-            exact.files =
-                receipt(scheduler, verifier, repo_id, target, ArtifactKind::Files).await?;
+            exact.files = receipt(
+                scheduler,
+                verifier,
+                verify_limit,
+                repo_id,
+                target,
+                ArtifactKind::Files,
+            )
+            .await?;
             if exact.files.is_none() {
-                exact.head =
-                    receipt(scheduler, verifier, repo_id, target, ArtifactKind::Head).await?;
+                exact.head = receipt(
+                    scheduler,
+                    verifier,
+                    verify_limit,
+                    repo_id,
+                    target,
+                    ArtifactKind::Head,
+                )
+                .await?;
             }
         }
         SyncMode::Head => {
-            exact.head = receipt(scheduler, verifier, repo_id, target, ArtifactKind::Head).await?;
+            exact.head = receipt(
+                scheduler,
+                verifier,
+                verify_limit,
+                repo_id,
+                target,
+                ArtifactKind::Head,
+            )
+            .await?;
         }
         SyncMode::Full => {
-            exact.head = receipt(scheduler, verifier, repo_id, target, ArtifactKind::Head).await?;
+            exact.head = receipt(
+                scheduler,
+                verifier,
+                verify_limit,
+                repo_id,
+                target,
+                ArtifactKind::Head,
+            )
+            .await?;
             exact.history = receipt(
                 scheduler,
                 verifier,
+                verify_limit,
                 repo_id,
                 target,
                 ArtifactKind::FullHistory,
@@ -3206,24 +3252,11 @@ async fn published_candidate_commit(
         .map(|record| record.key.commit))
 }
 
-type PinnedGenerationCell =
+pub type PinnedGenerationCell =
     tokio::sync::OnceCell<std::result::Result<crate::topup::PinnedBundleRequest, String>>;
 
-fn pinned_generation_cells()
--> &'static StdMutex<HashMap<String, std::sync::Weak<PinnedGenerationCell>>> {
-    static CELLS: std::sync::OnceLock<
-        StdMutex<HashMap<String, std::sync::Weak<PinnedGenerationCell>>>,
-    > = std::sync::OnceLock::new();
-    CELLS.get_or_init(|| StdMutex::new(HashMap::new()))
-}
-
-fn pinned_generation_limit() -> &'static tokio::sync::Semaphore {
-    static LIMIT: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
-    LIMIT.get_or_init(|| tokio::sync::Semaphore::new(2))
-}
-
-fn pinned_generation_cell(key: String) -> Arc<PinnedGenerationCell> {
-    let mut cells = pinned_generation_cells().lock().unwrap();
+fn pinned_generation_cell(state: &ServerState, key: String) -> Arc<PinnedGenerationCell> {
+    let mut cells = state.pinned_generation_cells.lock().unwrap();
     if let Some(cell) = cells.get(&key).and_then(std::sync::Weak::upgrade) {
         cell
     } else {
@@ -3254,7 +3287,7 @@ async fn generate_pinned_bundle_singleflight(
         TYPED_ARTIFACT_FORMAT_VERSION,
         mode,
     );
-    let cell = pinned_generation_cell(key);
+    let cell = pinned_generation_cell(state, key.clone());
     let workspace = repo_id.workspace.as_str().to_owned();
     let repo = repo_id.path.clone();
     let mirror = mirror.to_path_buf();
@@ -3265,7 +3298,8 @@ async fn generate_pinned_bundle_singleflight(
     let origin = provider.clone_url(&repo_id.path);
     let result = cell
         .get_or_init(|| async move {
-            let _permit = pinned_generation_limit()
+            let _permit = state
+                .pinned_generation_limit
                 .acquire()
                 .await
                 .map_err(|_| "pinned generation limit closed".to_string())?;
@@ -3290,7 +3324,19 @@ async fn generate_pinned_bundle_singleflight(
             .map_err(|error| format!("pinned generation task failed: {error}"))?
         })
         .await;
-    result.clone().map_err(anyhow::Error::msg)
+    let result = result.clone().map_err(anyhow::Error::msg);
+    // Every waiter already owns the same Arc. Removing the weak registry entry
+    // after completion prevents a permanent key leak while preserving in-flight
+    // coalescing; a later request may reuse the immutable generated CAS objects.
+    let mut cells = state.pinned_generation_cells.lock().unwrap();
+    if cells
+        .get(&key)
+        .and_then(std::sync::Weak::upgrade)
+        .is_some_and(|registered| Arc::ptr_eq(&registered, &cell))
+    {
+        cells.remove(&key);
+    }
+    result
 }
 
 async fn build_top_up_receipt(
@@ -3320,16 +3366,21 @@ async fn build_top_up_receipt(
     }
     if top_up_mode == TopUpMode::Full {
         candidates.clear();
-        if let Some(commit) =
-            published_candidate_commit(scheduler, repo_id, branch, ArtifactKind::FullHistory)
-                .await?
+        if let Some(commit) = scheduler
+            .latest_complete_full_base(
+                repo_id.workspace.as_str(),
+                &repo_id.path,
+                TYPED_ARTIFACT_FORMAT_VERSION,
+            )
+            .await?
         {
             candidates.push(commit);
         }
     }
     for base_commit in candidates {
         let head_key = artifact_key(repo_id, &base_commit, ArtifactKind::Head);
-        let Some((_, head_manifest)) = verified_artifact(scheduler, verifier, &head_key).await?
+        let Some((_, head_manifest)) =
+            verified_artifact(scheduler, verifier, &state.artifact_verify_limit, &head_key).await?
         else {
             continue;
         };
@@ -3339,8 +3390,13 @@ async fn build_top_up_receipt(
         let mut packs = head.packs.iter().map(base_pack).collect::<Vec<_>>();
         if top_up_mode == TopUpMode::Full {
             let history_key = artifact_key(repo_id, &base_commit, ArtifactKind::FullHistory);
-            let Some((_, history_manifest)) =
-                verified_artifact(scheduler, verifier, &history_key).await?
+            let Some((_, history_manifest)) = verified_artifact(
+                scheduler,
+                verifier,
+                &state.artifact_verify_limit,
+                &history_key,
+            )
+            .await?
             else {
                 continue;
             };
@@ -3367,7 +3423,8 @@ async fn build_top_up_receipt(
         };
         let verify_cas = state.cas.clone();
         let verify_request = request.clone();
-        let _permit = pinned_generation_limit()
+        let _permit = state
+            .pinned_generation_limit
             .acquire()
             .await
             .expect("pinned generation limit never closes");
@@ -3428,20 +3485,6 @@ async fn typed_clone_plan_inner(
         )
             .into_response();
     };
-    let added = match state.ref_store.load_added_repo(&repo_id).await {
-        Ok(Some(added)) => added,
-        Ok(None) => return repo_not_added_response(),
-        Err(error) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("repo lifecycle lookup failed: {error}"),
-                }),
-            )
-                .into_response();
-        }
-    };
-
     let request_token = upstream_token_from_headers(&headers);
     let credential = match state
         .broker
@@ -3455,6 +3498,23 @@ async fn typed_clone_plan_inner(
     {
         return response;
     }
+
+    // Authorization precedes every lifecycle lookup. Otherwise a caller with
+    // only the shared gateway credential can distinguish "not added" from an
+    // initializing/failed private repository it may not read.
+    let added = match state.ref_store.load_added_repo(&repo_id).await {
+        Ok(Some(added)) => added,
+        Ok(None) => return repo_not_added_response(),
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("repo lifecycle lookup failed: {error}"),
+                }),
+            )
+                .into_response();
+        }
+    };
 
     let availability = match added.state {
         RepoLifecycleState::Initializing => RepositoryAvailability::Initializing,
@@ -3474,43 +3534,43 @@ async fn typed_clone_plan_inner(
         };
     }
 
-    // Keep the mirror lock through bundle construction. The exact SHA is
-    // resolved once after a forced fetch, and a concurrent force-push cannot
-    // prune or replace its object graph midway through generation.
+    // Resolve the point-in-time branch tip without transferring its object
+    // graph. Exact ready plans never need a mutable mirror at all; only a
+    // pinned top-up takes the repo lock and fetches the already-pinned SHA.
     let mirror = state.repo_root.join(repo_id.mirror_dir_name());
-    let lock = repo_lock(&state.sync_locks, &repo_id).await;
-    let _guard = lock.lock().await;
-    if let Err(error) = ensure_mirror(
-        &mirror,
-        &provider,
-        &repo_id,
-        &query.branch,
-        None,
-        credential.as_ref(),
-    )
-    .await
-    {
-        return (
-            StatusCode::BAD_GATEWAY,
-            Json(ErrorResponse {
-                error: format!("resolve clone target: {error:#}"),
-            }),
-        )
-            .into_response();
-    }
-    let resolve_mirror = mirror.clone();
+    let resolve_provider = provider.clone();
+    let resolve_repo = repo_id.clone();
     let resolve_branch = query.branch.clone();
+    let resolve_credential = credential.clone();
+    let _resolve_permit = fetch_semaphore()
+        .acquire()
+        .await
+        .expect("fetch semaphore never closed");
     let target = match tokio::task::spawn_blocking(move || {
-        git::resolve_commit(&resolve_mirror, &resolve_branch)
+        git::ls_remote_commit(
+            &resolve_provider,
+            &resolve_repo,
+            &resolve_branch,
+            resolve_credential.as_ref(),
+        )
     })
     .await
     {
-        Ok(Ok(target)) => target,
-        Ok(Err(error)) => {
+        Ok(Ok(Some(target))) => target,
+        Ok(Ok(None)) => {
             return (
                 StatusCode::NOT_FOUND,
                 Json(ErrorResponse {
-                    error: format!("clone target not found: {error:#}"),
+                    error: "clone target not found".to_string(),
+                }),
+            )
+                .into_response();
+        }
+        Ok(Err(error)) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(ErrorResponse {
+                    error: format!("resolve clone target: {error:#}"),
                 }),
             )
                 .into_response();
@@ -3525,11 +3585,13 @@ async fn typed_clone_plan_inner(
                 .into_response();
         }
     };
+    drop(_resolve_permit);
 
     let verifier = crate::artifact_manifest::CasCompletionVerifier::new(state.cas.clone());
     let exact = match load_exact_clone_artifacts(
         scheduler.as_ref(),
         &verifier,
+        &state.artifact_verify_limit,
         &repo_id,
         &target,
         query.mode,
@@ -3552,6 +3614,28 @@ async fn typed_clone_plan_inner(
         SyncMode::Full => exact.head.is_none() || exact.history.is_none(),
     };
     let top_up = if needs_top_up {
+        // Fetch the pinned target, not a second resolution of the moving branch,
+        // and keep the mirror lock until bundle construction has consumed it.
+        let lock = repo_lock(&state.sync_locks, &repo_id).await;
+        let _guard = lock.lock().await;
+        if let Err(error) = ensure_mirror(
+            &mirror,
+            &provider,
+            &repo_id,
+            &query.branch,
+            Some(&target),
+            credential.as_ref(),
+        )
+        .await
+        {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(ErrorResponse {
+                    error: format!("fetch pinned clone target: {error:#}"),
+                }),
+            )
+                .into_response();
+        }
         match build_top_up_receipt(
             &state,
             scheduler.as_ref(),
@@ -3602,28 +3686,21 @@ async fn typed_clone_plan_inner(
         }
     };
     let convergence_required = convergence_failure_is_fatal(&plan);
-    let required_for_convergence: Vec<_> = match query.mode {
-        SyncMode::Files if exact.files.is_some() => Vec::new(),
-        SyncMode::Files | SyncMode::Head => exact
-            .head
-            .is_none()
-            .then_some(crate::artifact_scheduler::ArtifactKind::Head)
-            .into_iter()
-            .collect(),
-        SyncMode::Full => {
-            let mut required = Vec::with_capacity(2);
-            if exact.head.is_none() {
-                required.push(crate::artifact_scheduler::ArtifactKind::Head);
-            }
-            if exact.history.is_none() {
-                required.push(crate::artifact_scheduler::ArtifactKind::FullHistory);
-            }
-            required
+    let clone_artifacts: Vec<_> = match query.mode {
+        SyncMode::Files if exact.files.is_some() => {
+            vec![crate::artifact_scheduler::ArtifactKind::Files]
         }
+        SyncMode::Files | SyncMode::Head => {
+            vec![crate::artifact_scheduler::ArtifactKind::Head]
+        }
+        SyncMode::Full => vec![
+            crate::artifact_scheduler::ArtifactKind::Head,
+            crate::artifact_scheduler::ArtifactKind::FullHistory,
+        ],
     };
-    if !required_for_convergence.is_empty() {
+    if !clone_artifacts.is_empty() {
         let consumer = clone_consumer_id(&repo_id, &target, query.mode);
-        for kind in &required_for_convergence {
+        for kind in &clone_artifacts {
             let key = artifact_key(&repo_id, &target, *kind);
             let subscribed = match scheduler
                 .subscribe_consumer(&key, &consumer, CLONE_CONSUMER_TTL_SECS)
@@ -9506,6 +9583,9 @@ pub async fn run_server_with_barrier(
         oidc_verifier,
         webhook_config,
         sync_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        pinned_generation_cells: Arc::new(StdMutex::new(HashMap::new())),
+        pinned_generation_limit: Arc::new(tokio::sync::Semaphore::new(2)),
+        artifact_verify_limit: Arc::new(tokio::sync::Semaphore::new(8)),
         mirror_freshness: Arc::new(std::sync::Mutex::new(HashMap::new())),
         mirror_fresh_ttl: Duration::from_secs(60),
         ref_response_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -9873,6 +9953,9 @@ mod tests {
             // No webhook secret here (worker has no HTTP; tests install their own).
             webhook_config: Arc::new(WebhookConfig::empty()),
             sync_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            pinned_generation_cells: Arc::new(StdMutex::new(HashMap::new())),
+            pinned_generation_limit: Arc::new(tokio::sync::Semaphore::new(2)),
+            artifact_verify_limit: Arc::new(tokio::sync::Semaphore::new(8)),
             mirror_freshness: Arc::new(std::sync::Mutex::new(HashMap::new())),
             mirror_fresh_ttl: Duration::from_secs(60),
             ref_response_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -9919,9 +10002,11 @@ mod tests {
 
     #[tokio::test]
     async fn pinned_generation_cell_coalesces_concurrent_exact_keys() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(&root);
         let key = format!("test-singleflight-{}", rand::random::<u64>());
-        let first = pinned_generation_cell(key.clone());
-        let second = pinned_generation_cell(key);
+        let first = pinned_generation_cell(&state, key.clone());
+        let second = pinned_generation_cell(&state, key);
         assert!(Arc::ptr_eq(&first, &second));
         let calls = Arc::new(AtomicUsize::new(0));
         let mut tasks = Vec::new();
@@ -11450,6 +11535,34 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn typed_clone_authorizes_before_revealing_repo_lifecycle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = test_state(&tmp);
+        state.require_repo_auth = true;
+        state.access_verifier = Arc::new(StubVerifier(AccessDecision::Denied));
+        state.artifact_scheduler = Some(Arc::new(
+            crate::artifact_scheduler::ArtifactScheduler::open(
+                tmp.path().join("scheduler.db").to_str().unwrap(),
+                crate::artifact_scheduler::SchedulerLimits::default(),
+            )
+            .await
+            .unwrap(),
+        ));
+        // Deliberately do not add the repository. An unauthorized caller must
+        // receive the same 403 it would for any private lifecycle state, never
+        // the distinguishable repo_not_added response.
+        let response = build_app(state)
+            .oneshot(request_with_auth(
+                "GET",
+                "/v1/repos/github/private/missing/clone-plan?branch=main&mode=head",
+                Some(&auth_header()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
     #[test]
