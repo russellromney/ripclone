@@ -629,7 +629,7 @@ pub async fn scrub_ready_artifacts<
                 len: root_len,
             };
             let mut sink = std::io::sink();
-            let outcome = verifier.assess_durable_blob(
+            let outcome = verifier.assess_observed_durable_blob(
                 &root_blob,
                 verifier.limits.manifest_bytes,
                 &mut sink,
@@ -654,7 +654,7 @@ pub async fn scrub_ready_artifacts<
         let root_capacity =
             usize::try_from(root_len).context("Ready scrub root length exceeds usize")?;
         let mut root_bytes = Vec::with_capacity(root_capacity);
-        let root_outcome = verifier.assess_durable_blob(
+        let root_outcome = verifier.assess_observed_durable_blob(
             &root_blob,
             verifier.limits.manifest_bytes,
             &mut root_bytes,
@@ -2065,6 +2065,33 @@ impl CasCompletionVerifier {
         output: &mut W,
         cancelled: &tokio_util::sync::CancellationToken,
     ) -> DurableScrubOutcome {
+        self.assess_durable_blob_with_authority(blob, maximum, output, cancelled, true)
+    }
+
+    /// Assess a root whose length came from an untrusted storage observation,
+    /// rather than from an authenticated parent manifest. A concurrent repair
+    /// may replace bad bytes under the content-addressed key between the
+    /// caller's initial stat and this assessment. In that case the old observed
+    /// length must never be promoted into evidence that the repaired root is
+    /// corrupt or oversized; restart from a fresh observation instead.
+    fn assess_observed_durable_blob<W: Write>(
+        &self,
+        blob: &CasBlob,
+        maximum: u64,
+        output: &mut W,
+        cancelled: &tokio_util::sync::CancellationToken,
+    ) -> DurableScrubOutcome {
+        self.assess_durable_blob_with_authority(blob, maximum, output, cancelled, false)
+    }
+
+    fn assess_durable_blob_with_authority<W: Write>(
+        &self,
+        blob: &CasBlob,
+        maximum: u64,
+        output: &mut W,
+        cancelled: &tokio_util::sync::CancellationToken,
+        descriptor_len_is_authoritative: bool,
+    ) -> DurableScrubOutcome {
         use crate::storage::StorageObjectStat;
         let first_stat = match self.storage.stat_object(&blob.hash) {
             Ok(stat) => stat,
@@ -2079,6 +2106,9 @@ impl CasCompletionVerifier {
             }
             StorageObjectStat::Present(actual) => actual,
         };
+        if !descriptor_len_is_authoritative && actual != blob.len {
+            return DurableScrubOutcome::Transient { io_bytes: 0 };
+        }
         if actual > maximum {
             return match self.storage.stat_object(&blob.hash) {
                 Ok(StorageObjectStat::Present(second)) if second == actual && second > maximum => {
@@ -4450,6 +4480,53 @@ mod tests {
             healthy_root
         );
         assert!(storage.deletes.lock().unwrap().is_empty());
+
+        // Root length is not authenticated until the root itself hashes. A
+        // repair can therefore replace either an oversized or undersized bad
+        // root after the discovery stat but before assessment. Neither stale
+        // observation may quarantine the Ready publication or overwrite/delete
+        // the canonical repair.
+        let mut root_race_limits = ArtifactVerificationLimits::default();
+        root_race_limits.manifest_bytes = healthy_root.len() as u64;
+        let root_race_verifier = CasCompletionVerifier::with_limits_and_storage(
+            f.cas.clone(),
+            storage.clone(),
+            root_race_limits,
+        )
+        .unwrap()
+        .with_proof_key(&[b'm'; 32])
+        .unwrap();
+        for stale_root in [
+            vec![b'x'; healthy_root.len() + 1],
+            vec![b'y'; healthy_root.len() - 1],
+        ] {
+            storage
+                .put(healthy_evidence.manifest(), &stale_root)
+                .unwrap();
+            storage.replace_after_stat(healthy_evidence.manifest(), healthy_root.clone());
+            cursor = ReadyScrubCursor::default();
+            let length_race = scrub_ready_artifacts(
+                &scheduler,
+                &root_race_verifier,
+                &mut cursor,
+                10,
+                100,
+                1024 * 1024,
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(length_race.jobs_quarantined, 0);
+            assert_eq!(
+                scheduler.get(healthy_id).await.unwrap().unwrap().state,
+                ArtifactState::Ready
+            );
+            assert_eq!(
+                storage.get(healthy_evidence.manifest()).unwrap(),
+                healthy_root
+            );
+            assert!(storage.deletes.lock().unwrap().is_empty());
+        }
 
         let mut manifest = f.history();
         let malformed_level = f.blob(b"[");
