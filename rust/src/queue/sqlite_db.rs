@@ -3,10 +3,11 @@
 //! atomic conditional claim). For multi-machine use the remote `libsql` backend.
 
 use super::sql::{
-    ADD_ATTEMPTS_COLUMN_SQL, ADD_CREDENTIAL_COLUMN_SQL, ADD_SIZE_CLASS_COLUMN_SQL,
-    CREATE_ACTIVE_KEY_INDEX_SQL, CREATE_HISTORY_INDEX_SQL, CREATE_STATUS_INDEX_SQL,
-    CREATE_TABLE_SQL, CREATE_WORKERS_HEARTBEAT_INDEX_SQL, CREATE_WORKERS_TABLE_SQL,
-    DROP_LEGACY_ACTIVE_KEY_INDEX_SQL, QueueDb, SUPERSEDED_BY_NEWER_QUEUED, now_secs,
+    ADD_ATTEMPTS_COLUMN_SQL, ADD_CREDENTIAL_COLUMN_SQL, ADD_INITIALIZATION_ATTEMPT_COLUMN_SQL,
+    ADD_SIZE_CLASS_COLUMN_SQL, CREATE_ACTIVE_KEY_INDEX_SQL, CREATE_HISTORY_INDEX_SQL,
+    CREATE_STATUS_INDEX_SQL, CREATE_TABLE_SQL, CREATE_WORKERS_HEARTBEAT_INDEX_SQL,
+    CREATE_WORKERS_TABLE_SQL, DROP_LEGACY_ACTIVE_KEY_INDEX_SQL, QueueDb,
+    SUPERSEDED_BY_NEWER_QUEUED, now_secs,
 };
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -49,6 +50,9 @@ impl QueueDb for SqliteDb {
         // Migrate a legacy table to add the credential column (best-effort: errors
         // "duplicate column" on a fresh table, which is fine).
         let _ = sqlx::raw_sql(ADD_CREDENTIAL_COLUMN_SQL)
+            .execute(&self.pool)
+            .await;
+        let _ = sqlx::raw_sql(ADD_INITIALIZATION_ATTEMPT_COLUMN_SQL)
             .execute(&self.pool)
             .await;
         // Same best-effort migration for the attempts column (dead-letter bound).
@@ -104,18 +108,20 @@ impl QueueDb for SqliteDb {
         path: &str,
         branch: &str,
         credential: Option<&str>,
+        initialization_attempt_id: Option<&str>,
         size_class: i64,
         created_at: i64,
     ) -> Result<i64> {
         let res = sqlx::query(
-            "INSERT INTO jobs (key, provider, path, branch, status, credential, size_class, created_at)
-             VALUES (?, ?, ?, ?, 'queued', ?, ?, ?)",
+            "INSERT INTO jobs (key, provider, path, branch, status, credential, initialization_attempt_id, size_class, created_at)
+             VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?)",
         )
         .bind(key)
         .bind(provider)
         .bind(path)
         .bind(branch)
         .bind(credential)
+        .bind(initialization_attempt_id)
         .bind(size_class)
         .bind(created_at)
         .execute(&self.pool)
@@ -242,8 +248,8 @@ impl QueueDb for SqliteDb {
     async fn job_fields(
         &self,
         id: i64,
-    ) -> Result<Option<(String, String, String, Option<String>)>> {
-        let row = sqlx::query("SELECT provider, path, branch, credential FROM jobs WHERE id = ?")
+    ) -> Result<Option<(String, String, String, Option<String>, Option<String>)>> {
+        let row = sqlx::query("SELECT provider, path, branch, credential, initialization_attempt_id FROM jobs WHERE id = ?")
             .bind(id)
             .fetch_optional(&self.pool)
             .await
@@ -254,6 +260,7 @@ impl QueueDb for SqliteDb {
                 row.try_get(1)?,
                 row.try_get(2)?,
                 row.try_get(3)?,
+                row.try_get(4)?,
             ))),
             None => Ok(None),
         }

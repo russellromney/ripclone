@@ -66,6 +66,7 @@ impl QueueDb for MysqlDb {
                 finished_at BIGINT,
                 error TEXT,
                 credential TEXT,
+                initialization_attempt_id TEXT,
                 attempts BIGINT NOT NULL DEFAULT 0,
                 size_class BIGINT NOT NULL DEFAULT 0,
                 INDEX idx_jobs_status_created (status, created_at),
@@ -79,6 +80,9 @@ impl QueueDb for MysqlDb {
         // ADD COLUMN IF NOT EXISTS, so this is best-effort: it errors with a
         // duplicate-column code on an up-to-date table, which we ignore.
         let _ = sqlx::raw_sql("ALTER TABLE jobs ADD COLUMN credential TEXT")
+            .execute(&self.pool)
+            .await;
+        let _ = sqlx::raw_sql("ALTER TABLE jobs ADD COLUMN initialization_attempt_id TEXT")
             .execute(&self.pool)
             .await;
         // Same best-effort migration for the attempts column (dead-letter bound).
@@ -107,6 +111,7 @@ impl QueueDb for MysqlDb {
         path: &str,
         branch: &str,
         credential: Option<&str>,
+        initialization_attempt_id: Option<&str>,
         _size_class: i64,
         created_at: i64,
     ) -> Result<i64> {
@@ -118,14 +123,15 @@ impl QueueDb for MysqlDb {
         check_len("path", path, 255)?;
         check_len("branch", branch, 255)?;
         let res = sqlx::query(
-            "INSERT INTO jobs (`key`, provider, path, branch, status, credential, created_at)
-             VALUES (?, ?, ?, ?, 'queued', ?, ?)",
+            "INSERT INTO jobs (`key`, provider, path, branch, status, credential, initialization_attempt_id, created_at)
+             VALUES (?, ?, ?, ?, 'queued', ?, ?, ?)",
         )
         .bind(key)
         .bind(provider)
         .bind(path)
         .bind(branch)
         .bind(credential)
+        .bind(initialization_attempt_id)
         .bind(created_at)
         .execute(&self.pool)
         .await
@@ -234,8 +240,8 @@ impl QueueDb for MysqlDb {
     async fn job_fields(
         &self,
         id: i64,
-    ) -> Result<Option<(String, String, String, Option<String>)>> {
-        let row = sqlx::query("SELECT provider, path, branch, credential FROM jobs WHERE id = ?")
+    ) -> Result<Option<(String, String, String, Option<String>, Option<String>)>> {
+        let row = sqlx::query("SELECT provider, path, branch, credential, initialization_attempt_id FROM jobs WHERE id = ?")
             .bind(id)
             .fetch_optional(&self.pool)
             .await
@@ -246,6 +252,7 @@ impl QueueDb for MysqlDb {
                 row.try_get(1)?,
                 row.try_get(2)?,
                 row.try_get(3)?,
+                row.try_get(4)?,
             ))),
             None => Ok(None),
         }

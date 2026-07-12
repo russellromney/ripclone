@@ -38,6 +38,7 @@ async fn enqueue(path: &str) -> (SqlJobQueue, i64) {
         .enqueue(BuildJob {
             repo_id: RepoId::github(path),
             branch: "main".into(),
+            initialization_attempt_id: None,
             rev: None,
             credential: None,
             recheck: 0,
@@ -53,6 +54,7 @@ async fn enqueue_on(queue: &SqlJobQueue, path: &str) -> i64 {
         .enqueue(BuildJob {
             repo_id: RepoId::github(path),
             branch: "main".into(),
+            initialization_attempt_id: None,
             rev: None,
             credential: None,
             recheck: 0,

@@ -266,6 +266,7 @@ async fn main() -> Result<()> {
                 let job = BuildJob {
                     repo_id: repo_id.clone(),
                     branch: branch.clone(),
+                    initialization_attempt_id: claimed.initialization_attempt_id.clone(),
                     rev: None,
                     credential,
                     // The SQL queue does not persist the re-check counter; a
@@ -299,8 +300,14 @@ async fn main() -> Result<()> {
                         // is the case that still needs a terminal write.
                         if maybe_retryable_msg.is_some()
                             && let Ok(JobState::Failed(err)) = queue.job_status(job_id).await
-                            && let Err(e) =
-                                mark_branch_build_failed(&state, &repo_id, &branch, &err).await
+                            && let Err(e) = mark_branch_build_failed(
+                                &state,
+                                &repo_id,
+                                &branch,
+                                &err,
+                                claimed.initialization_attempt_id.as_deref(),
+                            )
+                            .await
                         {
                             error!(
                                 "failed to mark {}@{} terminal after dead-letter: {e:#}",

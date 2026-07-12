@@ -123,6 +123,7 @@ async fn enqueue_job(path: &str) -> (SqlJobQueue, i64) {
         .enqueue(BuildJob {
             repo_id: RepoId::github(path),
             branch: "main".into(),
+            initialization_attempt_id: None,
             rev: None,
             credential: None,
             recheck: 0,
@@ -376,6 +377,7 @@ async fn claim_returns_one_job_no_foreign_credential() {
         .enqueue(BuildJob {
             repo_id: RepoId::github("acme/plain"),
             branch: "main".into(),
+            initialization_attempt_id: None,
             rev: None,
             credential: None,
             recheck: 0,
@@ -389,6 +391,7 @@ async fn claim_returns_one_job_no_foreign_credential() {
         .enqueue(BuildJob {
             repo_id: RepoId::github("acme/secret"),
             branch: "main".into(),
+            initialization_attempt_id: None,
             rev: None,
             credential: Some(secrecy::SecretString::new(
                 "SUPER-SECRET-UPSTREAM".to_string().into(),

@@ -278,6 +278,7 @@ async fn dead_report_url_job_requeues_not_done() {
         .enqueue(BuildJob {
             repo_id: RepoId::github("acme/dead-url"),
             branch: "main".into(),
+            initialization_attempt_id: None,
             rev: None,
             credential: None,
             recheck: 0,

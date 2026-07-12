@@ -202,6 +202,94 @@ async fn exercise(store: Arc<dyn RefStore>, suffix: &str) {
         store.load_added_repo(&repo).await.unwrap().unwrap().state,
         RepoLifecycleState::Active
     );
+
+    // Remove/re-add creates a new authority domain even at the same SHA. Every
+    // queued, running, or dead-letter report from A is stale against B.
+    let replaced = RepoId::github(format!("admission/{suffix}-readded"));
+    let a = attempt(replaced.clone(), "removed-a", "HEAD");
+    assert!(store.begin_repo_initialization(&a).await.unwrap());
+    assert!(
+        store
+            .pin_repo_initialization(&replaced, "main", "same", Some("removed-a"))
+            .await
+            .unwrap()
+    );
+    store.remove_added_repo(&replaced).await.unwrap();
+    let b = attempt(replaced.clone(), "current-b", "HEAD");
+    assert!(store.begin_repo_initialization(&b).await.unwrap());
+    assert!(
+        store
+            .pin_repo_initialization(&replaced, "main", "same", Some("current-b"))
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .pin_repo_initialization(&replaced, "main", "same", Some("removed-a"))
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .fail_repo_initialization(
+                &replaced,
+                "main",
+                Some("same"),
+                "dead letter from A",
+                Some("removed-a"),
+            )
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .fail_repo_initialization(
+                &replaced,
+                "main",
+                Some("same"),
+                "unrelated sync failure",
+                None,
+            )
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .activate_repo(&replaced, "main", "same", Some("removed-a"))
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .activate_repo(&replaced, "main", "same", Some("current-b"))
+            .await
+            .unwrap()
+    );
+
+    // A legacy gating row is repaired once by CAS and can no longer accept an
+    // anonymous lifecycle report.
+    let legacy = RepoId::github(format!("admission/{suffix}-legacy"));
+    let mut legacy_row = attempt(legacy.clone(), "placeholder", "HEAD");
+    legacy_row.initialization_attempt_id = None;
+    legacy_row.initialization_branch = None;
+    store.add_repo(&legacy_row).await.unwrap();
+    assert!(
+        !store
+            .pin_repo_initialization(&legacy, "main", "legacy-sha", None)
+            .await
+            .unwrap()
+    );
+    let (ra, rb) = tokio::join!(
+        store.repair_legacy_repo_initialization(&legacy, "repair-a"),
+        store.repair_legacy_repo_initialization(&legacy, "repair-b"),
+    );
+    assert_ne!(ra.unwrap(), rb.unwrap());
+    let repaired = store.load_added_repo(&legacy).await.unwrap().unwrap();
+    assert_eq!(repaired.initialization_branch.as_deref(), Some("HEAD"));
+    assert!(matches!(
+        repaired.initialization_attempt_id.as_deref(),
+        Some("repair-a" | "repair-b")
+    ));
 }
 
 #[tokio::test]

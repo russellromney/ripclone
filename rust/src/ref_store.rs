@@ -73,8 +73,9 @@ pub enum AddedRepoSource {
 pub(crate) fn admission_attempt_matches(repo: &AddedRepo, attempt_id: Option<&str>) -> bool {
     match (repo.initialization_attempt_id.as_deref(), attempt_id) {
         (Some(stored), Some(reported)) => stored == reported,
-        // Rolling-upgrade compatibility for rows created before attempt IDs.
-        (None, None) => true,
+        // No anonymous lifecycle mutation: startup reconciliation first assigns
+        // legacy rows a real immutable attempt.
+        (None, None) => false,
         _ => false,
     }
 }
@@ -231,6 +232,15 @@ pub trait RefStore: Send + Sync {
         }
         self.add_repo(repo).await?;
         Ok(true)
+    }
+
+    /// Atomically assign an immutable attempt to a pre-attempt legacy row.
+    async fn repair_legacy_repo_initialization(
+        &self,
+        _repo_id: &RepoId,
+        _attempt_id: &str,
+    ) -> Result<bool> {
+        Ok(false)
     }
 
     /// Load added-repo state, if this repo was explicitly made available.
@@ -756,6 +766,27 @@ impl RefStore for FileRefStore {
         tokio::fs::write(&tmp_path, data).await?;
         tokio::fs::rename(&tmp_path, &path).await?;
         Ok(true)
+    }
+
+    async fn repair_legacy_repo_initialization(
+        &self,
+        repo_id: &RepoId,
+        attempt_id: &str,
+    ) -> Result<bool> {
+        self.mutate_added_repo(repo_id, |repo| {
+            if repo.state != RepoLifecycleState::Initializing
+                || repo.initialization_attempt_id.is_some()
+            {
+                return false;
+            }
+            repo.initialization_branch
+                .get_or_insert_with(|| "HEAD".to_string());
+            repo.initialization_target = None;
+            repo.failure = None;
+            repo.initialization_attempt_id = Some(attempt_id.to_string());
+            true
+        })
+        .await
     }
 
     async fn load_added_repo(&self, repo_id: &RepoId) -> Result<Option<AddedRepo>> {
@@ -1294,6 +1325,27 @@ impl RefStore for S3RefStore {
         anyhow::bail!("S3 admission contention exceeded retry limit for {key}")
     }
 
+    async fn repair_legacy_repo_initialization(
+        &self,
+        repo_id: &RepoId,
+        attempt_id: &str,
+    ) -> Result<bool> {
+        self.mutate_added_repo_cas(repo_id, |repo| {
+            if repo.state != RepoLifecycleState::Initializing
+                || repo.initialization_attempt_id.is_some()
+            {
+                return false;
+            }
+            repo.initialization_branch
+                .get_or_insert_with(|| "HEAD".to_string());
+            repo.initialization_target = None;
+            repo.failure = None;
+            repo.initialization_attempt_id = Some(attempt_id.to_string());
+            true
+        })
+        .await
+    }
+
     async fn pin_repo_initialization(
         &self,
         repo_id: &RepoId,
@@ -1685,6 +1737,16 @@ impl<T: RefStore> RefStore for CachingRefStore<T> {
 
     async fn begin_repo_initialization(&self, repo: &AddedRepo) -> Result<bool> {
         self.inner.begin_repo_initialization(repo).await
+    }
+
+    async fn repair_legacy_repo_initialization(
+        &self,
+        repo_id: &RepoId,
+        attempt_id: &str,
+    ) -> Result<bool> {
+        self.inner
+            .repair_legacy_repo_initialization(repo_id, attempt_id)
+            .await
     }
 
     async fn pin_repo_initialization(

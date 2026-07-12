@@ -66,6 +66,7 @@ pub struct ClaimedJob {
     /// Opaque repo path (`owner/repo` for GitHub).
     pub path: String,
     pub branch: String,
+    pub initialization_attempt_id: Option<String>,
     /// Per-job upstream credential the enqueuer passed (the cloud's per-request
     /// `X-Upstream-Token`), so a cross-process worker can read a private repo it
     /// has no standing credential for. `None` falls back to the worker's broker.
@@ -125,6 +126,7 @@ pub trait QueueDb: Send + Sync {
         path: &str,
         branch: &str,
         credential: Option<&str>,
+        initialization_attempt_id: Option<&str>,
         size_class: i64,
         created_at: i64,
     ) -> Result<i64>;
@@ -163,10 +165,12 @@ pub trait QueueDb: Send + Sync {
     /// `attempts` counter. Returns true iff this call won the row.
     async fn try_claim(&self, id: i64, worker_id: &str, now: i64) -> Result<bool>;
 
-    /// `(provider, path, branch, credential)` for a job id. `credential` is the
+    /// `(provider, path, branch, credential, initialization_attempt_id)` for a job id.
     /// stored base64 blob (or `None`).
-    async fn job_fields(&self, id: i64)
-    -> Result<Option<(String, String, String, Option<String>)>>;
+    async fn job_fields(
+        &self,
+        id: i64,
+    ) -> Result<Option<(String, String, String, Option<String>, Option<String>)>>;
 
     /// Settle a claimed job: `status` is `done` or `failed`, with optional
     /// error. Conditional on the caller still owning the claim — the UPDATE
@@ -697,7 +701,8 @@ impl SqlJobQueue {
                 return Ok(None);
             };
             if self.db.try_claim(id, worker_id, now_secs()).await? {
-                let Some((provider, path, branch, credential)) = self.db.job_fields(id).await?
+                let Some((provider, path, branch, credential, initialization_attempt_id)) =
+                    self.db.job_fields(id).await?
                 else {
                     continue;
                 };
@@ -707,6 +712,7 @@ impl SqlJobQueue {
                     path,
                     branch,
                     credential: decode_credential(credential),
+                    initialization_attempt_id,
                 }));
             }
             // Lost the race for this row. Back off briefly before retrying so N
@@ -801,6 +807,7 @@ impl JobQueue for SqlJobQueue {
                 &job.repo_id.path,
                 &job.branch,
                 credential.as_deref(),
+                job.initialization_attempt_id.as_deref(),
                 size_class,
                 now_secs(),
             )
@@ -902,6 +909,7 @@ pub(crate) const CREATE_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS jobs (
     finished_at INTEGER,
     error TEXT,
     credential TEXT,
+    initialization_attempt_id TEXT,
     attempts INTEGER NOT NULL DEFAULT 0,
     size_class INTEGER NOT NULL DEFAULT 0
 )";
@@ -934,6 +942,8 @@ pub(crate) const CREATE_HISTORY_INDEX_SQL: &str = "CREATE INDEX IF NOT EXISTS id
 /// fresh table, which is ignored). SQLite/libsql have no `ADD COLUMN IF NOT
 /// EXISTS`, hence best-effort; Postgres uses its own `IF NOT EXISTS` form.
 pub(crate) const ADD_CREDENTIAL_COLUMN_SQL: &str = "ALTER TABLE jobs ADD COLUMN credential TEXT";
+pub(crate) const ADD_INITIALIZATION_ATTEMPT_COLUMN_SQL: &str =
+    "ALTER TABLE jobs ADD COLUMN initialization_attempt_id TEXT";
 
 /// Migration for a `jobs` table created before the `attempts` column existed.
 /// Best-effort like [`ADD_CREDENTIAL_COLUMN_SQL`]: errors "duplicate column" on
@@ -982,6 +992,7 @@ mod tests {
         BuildJob {
             repo_id: RepoId::github(format!("{owner}/{repo}")),
             branch: branch.into(),
+            initialization_attempt_id: None,
             rev: None,
             credential: None,
             recheck: 0,
@@ -993,6 +1004,46 @@ mod tests {
         let mut j = job(owner, repo, branch);
         j.size_bytes = Some(size_bytes);
         j
+    }
+
+    #[tokio::test]
+    async fn admission_attempt_is_persisted_and_never_coalesces_across_readd() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = SqlJobQueue::new(Box::new(
+            SqliteDb::connect(&dir.path().join("q.db").to_string_lossy())
+                .await
+                .unwrap(),
+        ))
+        .await
+        .unwrap();
+        let mut a = job("o", "r", "main");
+        a.initialization_attempt_id = Some("removed-a".into());
+        let a_id = q.enqueue(a).await.unwrap().job_id.unwrap();
+        let mut b = job("o", "r", "main");
+        b.initialization_attempt_id = Some("current-b".into());
+        let b_enqueued = q.enqueue(b).await.unwrap();
+        assert_eq!(b_enqueued.outcome, EnqueueOutcome::Enqueued);
+        assert_ne!(Some(a_id), b_enqueued.job_id);
+        let first = q.claim("worker-a").await.unwrap().unwrap();
+        assert_eq!(
+            first.initialization_attempt_id.as_deref(),
+            Some("removed-a")
+        );
+        let second = q.claim("worker-b").await.unwrap().unwrap();
+        assert_eq!(
+            second.initialization_attempt_id.as_deref(),
+            Some("current-b")
+        );
+
+        let ordinary = job("o", "ordinary", "main");
+        assert_eq!(
+            q.enqueue(ordinary.clone()).await.unwrap().outcome,
+            EnqueueOutcome::Enqueued
+        );
+        assert_eq!(
+            q.enqueue(ordinary).await.unwrap().outcome,
+            EnqueueOutcome::Coalesced
+        );
     }
 
     /// Build a fresh queue on each supported local engine, backed by a temp file
@@ -1089,16 +1140,27 @@ mod tests {
             .unwrap();
         db.init().await.unwrap();
         let id = db
-            .insert_job("k", "github", "o/r", "main", Some("dG9rZW4="), 0, 1)
+            .insert_job(
+                "k",
+                "github",
+                "o/r",
+                "main",
+                Some("dG9rZW4="),
+                Some("attempt"),
+                0,
+                1,
+            )
             .await
             .unwrap();
-        let (_, _, _, before) = db.job_fields(id).await.unwrap().unwrap();
+        let (_, _, _, before, attempt) = db.job_fields(id).await.unwrap().unwrap();
         assert_eq!(before.as_deref(), Some("dG9rZW4="));
+        assert_eq!(attempt.as_deref(), Some("attempt"));
         // finish is conditional on owning the claim: claim it as "w" first.
         assert!(db.try_claim(id, "w", 2).await.unwrap());
         assert!(db.finish(id, "w", "done", 3, None).await.unwrap());
-        let (_, _, _, after) = db.job_fields(id).await.unwrap().unwrap();
+        let (_, _, _, after, attempt) = db.job_fields(id).await.unwrap().unwrap();
         assert!(after.is_none(), "credential must be cleared on finish");
+        assert_eq!(attempt.as_deref(), Some("attempt"));
     }
 
     #[tokio::test]
@@ -1125,11 +1187,21 @@ mod tests {
         db.init().await.unwrap(); // idempotent: best-effort ALTER ignores duplicate
         // Inserting a credential now works because the column exists.
         let id = db
-            .insert_job("k", "github", "o/r", "main", Some("Y3JlZA=="), 0, 1)
+            .insert_job(
+                "k",
+                "github",
+                "o/r",
+                "main",
+                Some("Y3JlZA=="),
+                Some("attempt"),
+                0,
+                1,
+            )
             .await
             .unwrap();
-        let (_, _, _, cred) = db.job_fields(id).await.unwrap().unwrap();
+        let (_, _, _, cred, attempt) = db.job_fields(id).await.unwrap().unwrap();
         assert_eq!(cred.as_deref(), Some("Y3JlZA=="));
+        assert_eq!(attempt.as_deref(), Some("attempt"));
         // size_class migration is load-bearing for stale-reclaim escalation.
         assert_eq!(
             db.job_size_class(id).await.unwrap(),
@@ -2068,7 +2140,7 @@ mod tests {
         db.init().await.unwrap(); // idempotent ALTER
         // Insert via QueueDb — requires the size_class column (rank 1 = large).
         let _id = db
-            .insert_job("k", "github", "o/r", "main", None, 1, 1)
+            .insert_job("k", "github", "o/r", "main", None, None, 1, 1)
             .await
             .expect("insert after size_class migration");
         drop(db);

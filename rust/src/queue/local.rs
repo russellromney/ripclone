@@ -71,6 +71,7 @@ mod tests {
         BuildJob {
             repo_id: crate::provider::RepoId::github("o/r"),
             branch: "b".into(),
+            initialization_attempt_id: None,
             rev: None,
             credential: None,
             recheck: 0,

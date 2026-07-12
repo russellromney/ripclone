@@ -51,6 +51,7 @@ impl QueueDb for PostgresDb {
                 finished_at BIGINT,
                 error TEXT,
                 credential TEXT,
+                initialization_attempt_id TEXT,
                 attempts BIGINT NOT NULL DEFAULT 0,
                 size_class BIGINT NOT NULL DEFAULT 0
             )",
@@ -63,6 +64,10 @@ impl QueueDb for PostgresDb {
             .execute(&self.pool)
             .await
             .context("add credential column")?;
+        sqlx::raw_sql("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS initialization_attempt_id TEXT")
+            .execute(&self.pool)
+            .await
+            .context("add initialization attempt column")?;
         // Migrate a legacy table for the attempts column (dead-letter bound).
         sqlx::raw_sql(
             "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS attempts BIGINT NOT NULL DEFAULT 0",
@@ -122,19 +127,21 @@ impl QueueDb for PostgresDb {
         path: &str,
         branch: &str,
         credential: Option<&str>,
+        initialization_attempt_id: Option<&str>,
         _size_class: i64,
         created_at: i64,
     ) -> Result<i64> {
         // size_class is blessed-backend only (sqlite/libsql); postgres lags.
         sqlx::query_scalar(
-            "INSERT INTO jobs (key, provider, path, branch, status, credential, created_at)
-             VALUES ($1, $2, $3, $4, 'queued', $5, $6) RETURNING id",
+            "INSERT INTO jobs (key, provider, path, branch, status, credential, initialization_attempt_id, created_at)
+             VALUES ($1, $2, $3, $4, 'queued', $5, $6, $7) RETURNING id",
         )
         .bind(key)
         .bind(provider)
         .bind(path)
         .bind(branch)
         .bind(credential)
+        .bind(initialization_attempt_id)
         .bind(created_at)
         .fetch_one(&self.pool)
         .await
@@ -233,8 +240,8 @@ impl QueueDb for PostgresDb {
     async fn job_fields(
         &self,
         id: i64,
-    ) -> Result<Option<(String, String, String, Option<String>)>> {
-        let row = sqlx::query("SELECT provider, path, branch, credential FROM jobs WHERE id = $1")
+    ) -> Result<Option<(String, String, String, Option<String>, Option<String>)>> {
+        let row = sqlx::query("SELECT provider, path, branch, credential, initialization_attempt_id FROM jobs WHERE id = $1")
             .bind(id)
             .fetch_optional(&self.pool)
             .await
@@ -245,6 +252,7 @@ impl QueueDb for PostgresDb {
                 row.try_get(1)?,
                 row.try_get(2)?,
                 row.try_get(3)?,
+                row.try_get(4)?,
             ))),
             None => Ok(None),
         }

@@ -56,6 +56,8 @@ pub struct ClaimedJobWire {
     pub branch: String,
     #[serde(default)]
     pub credential: Option<String>,
+    #[serde(default)]
+    pub initialization_attempt_id: Option<String>,
 }
 
 /// Claim response: exactly the one claimed job, or `None` when the queue is empty.
@@ -283,6 +285,7 @@ impl WorkerQueue for ApiJobQueue {
             path: j.path,
             branch: j.branch,
             credential: j.credential.map(|c| SecretString::new(c.into())),
+            initialization_attempt_id: j.initialization_attempt_id,
         }))
     }
 
@@ -384,6 +387,25 @@ impl JobQueue for ApiJobQueue {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn claimed_job_wire_round_trips_admission_attempt_and_reads_legacy_none() {
+        let wire = ClaimedJobWire {
+            id: 1,
+            provider: "github".into(),
+            path: "o/r".into(),
+            branch: "main".into(),
+            credential: None,
+            initialization_attempt_id: Some("attempt".into()),
+        };
+        let json = serde_json::to_value(&wire).unwrap();
+        assert_eq!(json["initialization_attempt_id"], "attempt");
+        let legacy: ClaimedJobWire = serde_json::from_value(serde_json::json!({
+            "id": 2, "provider": "github", "path": "o/r", "branch": "main"
+        }))
+        .unwrap();
+        assert_eq!(legacy.initialization_attempt_id, None);
+    }
 
     #[test]
     fn from_env_needs_url_and_token() {

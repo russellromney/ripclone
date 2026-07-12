@@ -44,6 +44,9 @@ pub use sqlite_db::SqliteDb;
 pub struct BuildJob {
     pub repo_id: RepoId,
     pub branch: String,
+    /// Immutable repo-admission attempt that authorized this initialization
+    /// build. Ordinary syncs carry `None` and may never mutate admission state.
+    pub initialization_attempt_id: Option<String>,
     /// Optional build-commit override (see `SyncRequest.rev`). Only honored on
     /// the in-process [`LocalJobQueue`]; the cross-process [`SqlJobQueue`] builds
     /// the branch tip (rev is not persisted).
@@ -114,7 +117,11 @@ impl BuildJob {
     /// processes. Slash-joined (not NUL-joined): some SQL engines (Postgres)
     /// reject `\0` in TEXT columns.
     pub fn key(&self) -> String {
-        format!("{}/{}", self.repo_id.storage_key(), self.branch)
+        let base = format!("{}/{}", self.repo_id.storage_key(), self.branch);
+        match self.initialization_attempt_id.as_deref() {
+            Some(attempt_id) => format!("{base}/admission-attempt/{attempt_id}"),
+            None => base,
+        }
     }
 }
 

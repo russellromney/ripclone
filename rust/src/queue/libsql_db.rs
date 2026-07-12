@@ -4,10 +4,11 @@
 //! it doesn't bundle SQLite's C core and collide with sqlx.)
 
 use super::sql::{
-    ADD_ATTEMPTS_COLUMN_SQL, ADD_CREDENTIAL_COLUMN_SQL, ADD_SIZE_CLASS_COLUMN_SQL,
-    CREATE_ACTIVE_KEY_INDEX_SQL, CREATE_HISTORY_INDEX_SQL, CREATE_STATUS_INDEX_SQL,
-    CREATE_TABLE_SQL, CREATE_WORKERS_HEARTBEAT_INDEX_SQL, CREATE_WORKERS_TABLE_SQL,
-    DROP_LEGACY_ACTIVE_KEY_INDEX_SQL, QueueDb, SUPERSEDED_BY_NEWER_QUEUED, now_secs,
+    ADD_ATTEMPTS_COLUMN_SQL, ADD_CREDENTIAL_COLUMN_SQL, ADD_INITIALIZATION_ATTEMPT_COLUMN_SQL,
+    ADD_SIZE_CLASS_COLUMN_SQL, CREATE_ACTIVE_KEY_INDEX_SQL, CREATE_HISTORY_INDEX_SQL,
+    CREATE_STATUS_INDEX_SQL, CREATE_TABLE_SQL, CREATE_WORKERS_HEARTBEAT_INDEX_SQL,
+    CREATE_WORKERS_TABLE_SQL, DROP_LEGACY_ACTIVE_KEY_INDEX_SQL, QueueDb,
+    SUPERSEDED_BY_NEWER_QUEUED, now_secs,
 };
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -48,6 +49,9 @@ impl QueueDb for LibsqlDb {
         // Migrate a legacy table to add the credential column (best-effort: errors
         // "duplicate column" on a fresh table, which is fine).
         let _ = conn.execute(ADD_CREDENTIAL_COLUMN_SQL, ()).await;
+        let _ = conn
+            .execute(ADD_INITIALIZATION_ATTEMPT_COLUMN_SQL, ())
+            .await;
         // Same best-effort migration for the attempts column (dead-letter bound).
         let _ = conn.execute(ADD_ATTEMPTS_COLUMN_SQL, ()).await;
         // size_class rank: the claim filter (right-sizing) reads it, and
@@ -97,6 +101,7 @@ impl QueueDb for LibsqlDb {
         path: &str,
         branch: &str,
         credential: Option<&str>,
+        initialization_attempt_id: Option<&str>,
         size_class: i64,
         created_at: i64,
     ) -> Result<i64> {
@@ -105,10 +110,14 @@ impl QueueDb for LibsqlDb {
             Some(s) => libsql::Value::Text(s.to_string()),
             None => libsql::Value::Null,
         };
+        let attempt_val = match initialization_attempt_id {
+            Some(s) => libsql::Value::Text(s.to_string()),
+            None => libsql::Value::Null,
+        };
         conn.execute(
-            "INSERT INTO jobs (key, provider, path, branch, status, credential, size_class, created_at)
-             VALUES (?, ?, ?, ?, 'queued', ?, ?, ?)",
-            libsql::params![key, provider, path, branch, cred_val, size_class, created_at],
+            "INSERT INTO jobs (key, provider, path, branch, status, credential, initialization_attempt_id, size_class, created_at)
+             VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?)",
+            libsql::params![key, provider, path, branch, cred_val, attempt_val, size_class, created_at],
         )
         .await
         .context("insert job")?;
@@ -228,11 +237,11 @@ impl QueueDb for LibsqlDb {
     async fn job_fields(
         &self,
         id: i64,
-    ) -> Result<Option<(String, String, String, Option<String>)>> {
+    ) -> Result<Option<(String, String, String, Option<String>, Option<String>)>> {
         let conn = self.conn().await?;
         let mut rows = conn
             .query(
-                "SELECT provider, path, branch, credential FROM jobs WHERE id = ?",
+                "SELECT provider, path, branch, credential, initialization_attempt_id FROM jobs WHERE id = ?",
                 [id],
             )
             .await
@@ -243,6 +252,7 @@ impl QueueDb for LibsqlDb {
                 row.get::<String>(1)?,
                 row.get::<String>(2)?,
                 row.get::<Option<String>>(3)?,
+                row.get::<Option<String>>(4)?,
             ))),
             None => Ok(None),
         }

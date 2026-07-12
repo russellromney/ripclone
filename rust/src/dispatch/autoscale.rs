@@ -779,6 +779,7 @@ mod tests {
                 path: path.into(),
             },
             branch: "main".into(),
+            initialization_attempt_id: None,
             rev: None,
             credential: None,
             recheck: 0,

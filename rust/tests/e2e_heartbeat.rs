@@ -56,6 +56,7 @@ fn job(path: &str) -> BuildJob {
     BuildJob {
         repo_id: RepoId::github(path),
         branch: "main".into(),
+        initialization_attempt_id: None,
         rev: None,
         credential: None,
         recheck: 0,

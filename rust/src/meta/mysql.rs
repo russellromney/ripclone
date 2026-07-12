@@ -9,6 +9,9 @@ use async_trait::async_trait;
 use sqlx::Row;
 use sqlx::mysql::{MySqlPool, MySqlPoolOptions};
 
+const ADMISSION_INSERT_LOCK_SQL: &str = "SELECT GET_LOCK(SHA2(?, 256), 10)";
+const ADMISSION_CURRENT_BYTES_SQL: &str = "SELECT BINARY data FROM added_repos WHERE repo_key = ?";
+
 /// Reject a value that wouldn't fit a VARCHAR column, so MySQL never silently
 /// truncates a key (which would merge two distinct repos/branches into one row).
 fn check_len(field: &str, value: &str, max: usize) -> Result<()> {
@@ -242,16 +245,43 @@ impl MetaDb for MysqlMeta {
 
     async fn insert_added_repo(&self, repo_key: &str, data: &str) -> Result<bool> {
         check_len("repo_key", repo_key, 512)?;
-        let result = sqlx::query(
-            "INSERT INTO added_repos (repo_key, data) VALUES (?, ?)
-             ON DUPLICATE KEY UPDATE repo_key = repo_key",
-        )
-        .bind(repo_key)
-        .bind(data)
-        .execute(&self.pool)
-        .await
-        .context("insert added repo")?;
-        Ok(result.rows_affected() == 1)
+        // rows_affected is not a reliable insert discriminator when the client
+        // enables CLIENT_FOUND_ROWS. Serialize this key explicitly and inspect
+        // existence on the same connection instead.
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .context("acquire admission insert connection")?;
+        let locked: Option<i64> = sqlx::query_scalar(ADMISSION_INSERT_LOCK_SQL)
+            .bind(repo_key)
+            .fetch_one(&mut *conn)
+            .await
+            .context("lock added repo key")?;
+        anyhow::ensure!(locked == Some(1), "timed out locking added repo key");
+        let exists: Option<i64> =
+            sqlx::query_scalar("SELECT 1 FROM added_repos WHERE repo_key = ?")
+                .bind(repo_key)
+                .fetch_optional(&mut *conn)
+                .await
+                .context("check added repo existence")?;
+        let inserted = if exists.is_none() {
+            sqlx::query("INSERT INTO added_repos (repo_key, data) VALUES (?, ?)")
+                .bind(repo_key)
+                .bind(data)
+                .execute(&mut *conn)
+                .await
+                .context("insert added repo")?;
+            true
+        } else {
+            false
+        };
+        let _: Option<i64> = sqlx::query_scalar("SELECT RELEASE_LOCK(SHA2(?, 256))")
+            .bind(repo_key)
+            .fetch_one(&mut *conn)
+            .await
+            .context("unlock added repo key")?;
+        Ok(inserted)
     }
 
     async fn compare_and_swap_added_repo(
@@ -261,14 +291,40 @@ impl MetaDb for MysqlMeta {
         new_data: &str,
     ) -> Result<bool> {
         check_len("repo_key", repo_key, 512)?;
-        let result = sqlx::query("UPDATE added_repos SET data = ? WHERE repo_key = ? AND data = ?")
-            .bind(new_data)
-            .bind(repo_key)
-            .bind(expected_data)
-            .execute(&self.pool)
+        let mut conn = self
+            .pool
+            .acquire()
             .await
-            .context("CAS added repo")?;
-        Ok(result.rows_affected() == 1)
+            .context("acquire admission CAS connection")?;
+        let locked: Option<i64> = sqlx::query_scalar(ADMISSION_INSERT_LOCK_SQL)
+            .bind(repo_key)
+            .fetch_one(&mut *conn)
+            .await
+            .context("lock added repo key for CAS")?;
+        anyhow::ensure!(
+            locked == Some(1),
+            "timed out locking added repo key for CAS"
+        );
+        let current: Option<Vec<u8>> = sqlx::query_scalar(ADMISSION_CURRENT_BYTES_SQL)
+            .bind(repo_key)
+            .fetch_optional(&mut *conn)
+            .await
+            .context("read byte-exact added repo value")?;
+        let matches = current.as_deref() == Some(expected_data.as_bytes());
+        if matches {
+            sqlx::query("UPDATE added_repos SET data = ? WHERE repo_key = ?")
+                .bind(new_data)
+                .bind(repo_key)
+                .execute(&mut *conn)
+                .await
+                .context("CAS added repo")?;
+        }
+        let _: Option<i64> = sqlx::query_scalar("SELECT RELEASE_LOCK(SHA2(?, 256))")
+            .bind(repo_key)
+            .fetch_one(&mut *conn)
+            .await
+            .context("unlock added repo key after CAS")?;
+        Ok(matches)
     }
 
     async fn get_added_repo(&self, repo_key: &str) -> Result<Option<String>> {
@@ -303,5 +359,21 @@ impl MetaDb for MysqlMeta {
             .await
             .context("mysql metadata health")?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod admission_sql_tests {
+    use super::*;
+
+    #[test]
+    fn admission_insert_does_not_depend_on_affected_rows_semantics() {
+        assert!(ADMISSION_INSERT_LOCK_SQL.contains("GET_LOCK"));
+        assert!(!ADMISSION_INSERT_LOCK_SQL.contains("ON DUPLICATE KEY"));
+    }
+
+    #[test]
+    fn admission_cas_is_byte_exact_not_collation_equal() {
+        assert!(ADMISSION_CURRENT_BYTES_SQL.contains("BINARY data"));
     }
 }

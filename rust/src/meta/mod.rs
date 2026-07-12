@@ -355,6 +355,27 @@ impl RefStore for SqlRefStore {
         }
     }
 
+    async fn repair_legacy_repo_initialization(
+        &self,
+        repo_id: &RepoId,
+        attempt_id: &str,
+    ) -> Result<bool> {
+        self.mutate_admission(repo_id, |repo| {
+            if repo.state != crate::ref_store::RepoLifecycleState::Initializing
+                || repo.initialization_attempt_id.is_some()
+            {
+                return false;
+            }
+            repo.initialization_branch
+                .get_or_insert_with(|| "HEAD".to_string());
+            repo.initialization_target = None;
+            repo.failure = None;
+            repo.initialization_attempt_id = Some(attempt_id.to_string());
+            true
+        })
+        .await
+    }
+
     async fn pin_repo_initialization(
         &self,
         repo_id: &RepoId,
@@ -537,6 +558,57 @@ mod tests {
         assert_eq!(store.list_added_repos().await.unwrap(), vec![added]);
         store.remove_added_repo(&rid).await.unwrap();
         assert!(store.load_added_repo(&rid).await.unwrap().is_none());
+
+        let admission_id = RepoId::github("o/admission");
+        let candidate = |attempt: &str| AddedRepo {
+            repo_id: admission_id.clone(),
+            added_at: 1,
+            history_enabled: true,
+            source: crate::ref_store::AddedRepoSource::Api,
+            repo_size_bytes: None,
+            state: crate::ref_store::RepoLifecycleState::Initializing,
+            initialization_branch: Some("HEAD".into()),
+            initialization_target: None,
+            activated_at: None,
+            failure: None,
+            initialization_attempt_id: Some(attempt.into()),
+        };
+        assert!(
+            store
+                .begin_repo_initialization(&candidate("Attempt-A"))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .begin_repo_initialization(&candidate("attempt-a"))
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .fail_repo_initialization(&admission_id, "HEAD", None, "retry", Some("Attempt-A"),)
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .begin_repo_initialization(&candidate("attempt-a"))
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .load_added_repo(&admission_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .initialization_attempt_id
+                .as_deref(),
+            Some("attempt-a"),
+            "attempt IDs differing only by case must remain byte-distinct"
+        );
+        store.remove_added_repo(&admission_id).await.unwrap();
 
         // Ordering guard: an older sync for a *different* commit is skipped.
         store.save(&rid, &ref_at("c0", Some(50))).await.unwrap();

@@ -156,7 +156,6 @@ impl RefReport {
 /// JSON response for ops that return a boolean (update/touch).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RefReportResponse {
-    #[serde(default)]
     pub updated: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub added_repo: Option<AddedRepo>,
@@ -243,21 +242,15 @@ impl ApiRefStore {
             })?;
         let status = resp.status();
         if status.is_success() {
-            // Body may be empty on pure-ack ops; default updated=true.
-            let text = resp.text().await.unwrap_or_default();
-            if text.trim().is_empty() {
-                return Ok(RefReportResponse {
-                    updated: true,
-                    added_repo: None,
-                });
-            }
-            match serde_json::from_str::<RefReportResponse>(&text) {
-                Ok(r) => Ok(r),
-                Err(_) => Ok(RefReportResponse {
-                    updated: true,
-                    added_repo: None,
-                }),
-            }
+            let text = resp.text().await.map_err(|e| {
+                ApiReportError::retryable(format!("read metadata report response: {e}"))
+            })?;
+            serde_json::from_str::<RefReportResponse>(&text).map_err(|e| {
+                ApiReportError::retryable(format!(
+                    "metadata report returned malformed success JSON: {e}"
+                ))
+                .into()
+            })
         } else if status.as_u16() == 401 || status.as_u16() == 403 {
             let body = resp.text().await.unwrap_or_default();
             Err(ApiReportError::unauthorized(format!(
@@ -462,6 +455,27 @@ mod tests {
     use super::*;
     use crate::provider::RepoId;
     use std::sync::Arc;
+
+    async fn response_server(body: &'static str) -> String {
+        let app =
+            axum::Router::new().route("/v1/refs", axum::routing::post(move || async move { body }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}/v1/refs")
+    }
+
+    #[tokio::test]
+    async fn malformed_or_empty_success_response_fails_closed() {
+        let repo = RepoId::github("acme/api");
+        for body in ["", "not-json", "{}"] {
+            let store = ApiRefStore::new(response_server(body).await, "token").unwrap();
+            let result = store
+                .activate_repo(&repo, "main", "abc", Some("attempt"))
+                .await;
+            assert!(result.is_err(), "body {body:?} must fail closed");
+        }
+    }
 
     #[tokio::test]
     async fn dead_url_is_retryable_api_report_error() {

@@ -548,12 +548,28 @@ async fn seed_added_repos(
                     RepoLifecycleState::Initializing
                 },
                 initialization_branch: (!legacy_ready).then(|| "HEAD".to_string()),
-                initialization_target: legacy_info.as_ref().map(|info| info.commit.clone()),
+                initialization_target: legacy_ready
+                    .then(|| legacy_info.as_ref().map(|info| info.commit.clone()))
+                    .flatten(),
                 activated_at: legacy_ready.then_some(now),
                 failure: None,
-                initialization_attempt_id: None,
+                initialization_attempt_id: (!legacy_ready)
+                    .then(|| hex::encode(rand::random::<[u8; 16]>())),
             })
             .await?;
+    }
+    // Rows written by the first admission-gating release deserialize as
+    // Initializing but have neither an attempt nor always a branch. Repair by
+    // backend CAS so concurrent server startups choose exactly one attempt.
+    for repo in ref_store.list_added_repos().await? {
+        if repo.state == RepoLifecycleState::Initializing
+            && repo.initialization_attempt_id.is_none()
+        {
+            let attempt_id = hex::encode(rand::random::<[u8; 16]>());
+            ref_store
+                .repair_legacy_repo_initialization(&repo.repo_id, &attempt_id)
+                .await?;
+        }
     }
     Ok(())
 }
@@ -1486,6 +1502,7 @@ async fn job_claim_handler(
                 path: c.path,
                 branch: c.branch,
                 credential: c.credential.map(|s| s.expose_secret().to_string()),
+                initialization_attempt_id: c.initialization_attempt_id,
             });
             (StatusCode::OK, Json(ClaimResponse { job })).into_response()
         }
@@ -2212,7 +2229,7 @@ async fn dispatch_repos_post(
                     .into_response();
             }
         };
-        return sync_repo_inner(repo_id, provider.clone(), query, headers, state).await;
+        return sync_repo_inner(repo_id, provider.clone(), query, headers, state, None).await;
     }
 
     if path.ends_with("/snapshot") {
@@ -2566,15 +2583,71 @@ async fn admit_repo_from_artifacts(
     info: &RefInfo,
     attempt_id: Option<&str>,
 ) -> Result<bool> {
+    let Some(attempt_id) = attempt_id else {
+        return Ok(false);
+    };
     if !repo_activation_artifacts_ready(info, &info.commit) {
         return Ok(false);
     }
-    ref_store
-        .pin_repo_initialization(repo_id, branch, &info.commit, attempt_id)
-        .await?;
-    ref_store
-        .activate_repo(repo_id, branch, &info.commit, attempt_id)
-        .await
+    if !pin_admission_for_attempt(ref_store, repo_id, branch, &info.commit, attempt_id).await? {
+        return Ok(false);
+    }
+    activate_admission_for_attempt(ref_store, repo_id, branch, &info.commit, attempt_id).await
+}
+
+async fn pin_admission_for_attempt(
+    ref_store: &Arc<dyn RefStore>,
+    repo_id: &RepoId,
+    branch: &str,
+    commit: &str,
+    attempt_id: &str,
+) -> Result<bool> {
+    if ref_store
+        .pin_repo_initialization(repo_id, branch, commit, Some(attempt_id))
+        .await?
+    {
+        return Ok(true);
+    }
+    match ref_store.load_added_repo(repo_id).await? {
+        Some(repo) if repo.initialization_attempt_id.as_deref() != Some(attempt_id) => Ok(false),
+        Some(repo)
+            if matches!(
+                repo.state,
+                RepoLifecycleState::Active | RepoLifecycleState::Failed
+            ) && repo.initialization_target.as_deref() == Some(commit) =>
+        {
+            Ok(true)
+        }
+        current => anyhow::bail!(
+            "matching admission attempt {attempt_id} could not pin {}@{branch} {commit}: {current:?}",
+            repo_id.storage_key()
+        ),
+    }
+}
+
+async fn activate_admission_for_attempt(
+    ref_store: &Arc<dyn RefStore>,
+    repo_id: &RepoId,
+    branch: &str,
+    commit: &str,
+    attempt_id: &str,
+) -> Result<bool> {
+    if ref_store
+        .activate_repo(repo_id, branch, commit, Some(attempt_id))
+        .await?
+    {
+        return Ok(true);
+    }
+    match ref_store.load_added_repo(repo_id).await? {
+        Some(repo) if repo.initialization_attempt_id.as_deref() != Some(attempt_id) => Ok(false),
+        Some(repo) if repo.is_active() && repo.initialization_target.as_deref() == Some(commit) => {
+            Ok(true)
+        }
+        current => anyhow::bail!(
+            "matching admission attempt {attempt_id} could not activate {}@{branch} {commit}: {current:?}",
+            repo_id.storage_key()
+        ),
+    }
 }
 
 fn ref_info_serves_commit(info: &RefInfo, clonepack_kind: &str, commit: &str) -> bool {
@@ -2938,6 +3011,7 @@ async fn get_ref_inner(
                     let job = BuildJob {
                         repo_id: repo_id.clone(),
                         branch: branch.clone(),
+                        initialization_attempt_id: None,
                         rev: None,
                         credential: credential.clone(),
                         recheck: 0,
@@ -3535,6 +3609,7 @@ async fn sync_repo_inner(
     params: SyncRequest,
     headers: HeaderMap,
     state: ServerState,
+    initialization_attempt_id: Option<String>,
 ) -> Response {
     if let Some(resp) =
         validation::reject_if_invalid(|| validation::validate_git_rev(&params.branch))
@@ -3586,7 +3661,12 @@ async fn sync_repo_inner(
         // worker signals completion on a oneshot. Include the rev override in
         // the coalescing key so syncs for different build commits don't share
         // one build.
-        let key = inproc_build_key(&repo_id, &branch, at_rev.as_deref());
+        let key = inproc_build_key(
+            &repo_id,
+            &branch,
+            at_rev.as_deref(),
+            initialization_attempt_id.as_deref(),
+        );
         let (tx, rx) = tokio::sync::oneshot::channel::<Result<SyncBuildResult, BuildError>>();
         let first = {
             let mut w = state.build_waiters.lock().await;
@@ -3607,6 +3687,7 @@ async fn sync_repo_inner(
             let job = BuildJob {
                 repo_id: repo_id.clone(),
                 branch: branch.clone(),
+                initialization_attempt_id: initialization_attempt_id.clone(),
                 rev: at_rev.clone(),
                 credential,
                 recheck: 0,
@@ -3727,6 +3808,7 @@ async fn sync_repo_inner(
         let job = BuildJob {
             repo_id: repo_id.clone(),
             branch: branch.clone(),
+            initialization_attempt_id: initialization_attempt_id.clone(),
             rev: at_rev.clone(),
             credential,
             recheck: 0,
@@ -3954,21 +4036,24 @@ async fn add_repo_inner(
     // Another /add may have won while this request was preflighting. Always
     // build the branch owned by the durable winning attempt; a delayed loser
     // must not pin the winner to its stale request parameters.
-    let sync_branch = match state.ref_store.load_added_repo(&repo_id).await {
-        Ok(Some(repo)) if !repo.is_active() => repo
-            .initialization_branch
-            .unwrap_or_else(|| params.branch.clone()),
-        Ok(_) => params.branch.clone(),
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("add winner lookup failed: {e}"),
-                }),
-            )
-                .into_response();
-        }
-    };
+    let (sync_branch, initialization_attempt_id) =
+        match state.ref_store.load_added_repo(&repo_id).await {
+            Ok(Some(repo)) if !repo.is_active() => (
+                repo.initialization_branch
+                    .unwrap_or_else(|| params.branch.clone()),
+                repo.initialization_attempt_id,
+            ),
+            Ok(_) => (params.branch.clone(), None),
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("add winner lookup failed: {e}"),
+                    }),
+                )
+                    .into_response();
+            }
+        };
 
     let response = sync_repo_inner(
         repo_id.clone(),
@@ -3979,6 +4064,7 @@ async fn add_repo_inner(
         },
         headers,
         state.clone(),
+        initialization_attempt_id,
     )
     .await;
     if response.status() == StatusCode::OK {
@@ -4022,8 +4108,18 @@ async fn remove_added_repo_inner(repo_id: RepoId, state: ServerState) -> Respons
 /// Coalescing key for the in-process queue: concurrent builds for the same
 /// `repo/branch#rev` collapse onto one. `/sync` and the `/build` webhook MUST
 /// produce the identical key for the same target, or they double-build.
-fn inproc_build_key(repo_id: &RepoId, branch: &str, rev: Option<&str>) -> String {
-    format!("{}/{branch}#{}", repo_id.storage_key(), rev.unwrap_or(""))
+fn inproc_build_key(
+    repo_id: &RepoId,
+    branch: &str,
+    rev: Option<&str>,
+    initialization_attempt_id: Option<&str>,
+) -> String {
+    format!(
+        "{}/{branch}#{}/admission:{}",
+        repo_id.storage_key(),
+        rev.unwrap_or(""),
+        initialization_attempt_id.unwrap_or("")
+    )
 }
 
 /// Byte size for size-class classification at enqueue. Prefers re-sync data
@@ -4117,11 +4213,21 @@ fn github_repo_size_kb_to_bytes(size_kb: u64) -> u64 {
 /// build is queued or folded into one already running; `Err(msg)` if the queue is
 /// full or unavailable.
 async fn trigger_build(state: &ServerState, repo_id: &RepoId, branch: &str) -> Result<(), String> {
-    match state.ref_store.load_added_repo(repo_id).await {
-        Ok(Some(_)) => {}
+    let admission = match state.ref_store.load_added_repo(repo_id).await {
+        Ok(Some(repo)) => repo,
         Ok(None) => return Ok(()),
         Err(e) => return Err(format!("added repo lookup failed: {e}")),
-    }
+    };
+    let initialization_attempt_id = if admission.state == RepoLifecycleState::Initializing {
+        admission.initialization_attempt_id.clone()
+    } else {
+        None
+    };
+    let branch = if admission.state == RepoLifecycleState::Initializing {
+        admission.initialization_branch.as_deref().unwrap_or(branch)
+    } else {
+        branch
+    };
     let credential = state
         .broker
         .fetch_credential(repo_id, None)
@@ -4130,6 +4236,7 @@ async fn trigger_build(state: &ServerState, repo_id: &RepoId, branch: &str) -> R
     let job = BuildJob {
         repo_id: repo_id.clone(),
         branch: branch.to_string(),
+        initialization_attempt_id: initialization_attempt_id.clone(),
         rev: None,
         credential,
         recheck: 0,
@@ -4137,7 +4244,7 @@ async fn trigger_build(state: &ServerState, repo_id: &RepoId, branch: &str) -> R
     };
 
     if state.build_queue.inproc_wait() {
-        let key = inproc_build_key(repo_id, branch, None);
+        let key = inproc_build_key(repo_id, branch, None, initialization_attempt_id.as_deref());
         let first = {
             let mut w = state.build_waiters.lock().await;
             let first = !w.contains_key(&key);
@@ -4161,13 +4268,55 @@ async fn trigger_build(state: &ServerState, repo_id: &RepoId, branch: &str) -> R
     // Release the in-flight marker, or the key stays "building" forever and every
     // later sync/webhook for it coalesces onto nothing.
     if state.build_queue.inproc_wait() {
-        let key = inproc_build_key(repo_id, branch, None);
+        let key = inproc_build_key(repo_id, branch, None, initialization_attempt_id.as_deref());
         state.build_waiters.lock().await.remove(&key);
     }
     Err(match enq {
         Err(e) => format!("build queue unavailable: {e}"),
         _ => "build queue full".to_string(),
     })
+}
+
+async fn trigger_initialization_build(
+    state: &ServerState,
+    repo_id: &RepoId,
+    branch: &str,
+    attempt_id: &str,
+) -> Result<(), String> {
+    let credential = state
+        .broker
+        .fetch_credential(repo_id, None)
+        .map_err(|e| e.to_string())?;
+    let size_bytes = enqueue_size_bytes(state, repo_id, branch).await;
+    enqueue_direct_build(
+        state,
+        BuildJob {
+            repo_id: repo_id.clone(),
+            branch: branch.to_string(),
+            initialization_attempt_id: Some(attempt_id.to_string()),
+            rev: None,
+            credential,
+            recheck: 0,
+            size_bytes,
+        },
+    )
+    .await
+}
+
+async fn enqueue_initializing_repos(state: &ServerState) -> Result<()> {
+    for repo in state.ref_store.list_added_repos().await? {
+        if repo.state == RepoLifecycleState::Initializing
+            && let (Some(branch), Some(attempt_id)) = (
+                repo.initialization_branch.as_deref(),
+                repo.initialization_attempt_id.as_deref(),
+            )
+        {
+            trigger_initialization_build(state, &repo.repo_id, branch, attempt_id)
+                .await
+                .map_err(anyhow::Error::msg)?;
+        }
+    }
+    Ok(())
 }
 
 /// Query for the admin config endpoints: an optional branch selects a
@@ -4769,6 +4918,7 @@ async fn create_snapshot_inner(
         credential.as_ref(),
         &repo_config,
         &lock,
+        None,
         Some(Phase2FailureAction {
             state: state.clone(),
             credential: credential.clone(),
@@ -5946,14 +6096,9 @@ async fn do_sync(
     // repos build concurrently. Safe because auto-gc is off, so the build only
     // reads the mirror's packs.
     mirror_lock: &Arc<tokio::sync::Mutex<()>>,
+    initialization_attempt_id: Option<String>,
     mut phase2_failure: Option<Phase2FailureAction>,
 ) -> Result<SyncBuildResult> {
-    // Capture the immutable attempt once. Any detached completion or delayed
-    // error from this sync must keep reporting the attempt it began under.
-    let initialization_attempt_id = ref_store
-        .load_added_repo(repo_id)
-        .await?
-        .and_then(|repo| repo.initialization_attempt_id);
     if let Some(action) = phase2_failure.as_mut() {
         action.initialization_attempt_id = initialization_attempt_id.clone();
     }
@@ -6678,20 +6823,16 @@ async fn build_and_publish_two_phase(
     // Pin admission to the commit whose exact HEAD artifact is now durable.
     // This is intentionally after upload + ref publication: a failed shallow
     // build must leave the target unpinned so a retry can establish it.
-    ref_store
-        .pin_repo_initialization(
-            repo_id,
-            branch,
-            commit,
-            initialization_attempt_id.as_deref(),
-        )
-        .await
-        .with_context(|| {
-            format!(
-                "pin repo initialization for {}@{branch} {commit}",
-                repo_id.storage_key()
-            )
-        })?;
+    if let Some(attempt_id) = initialization_attempt_id.as_deref() {
+        pin_admission_for_attempt(ref_store, repo_id, branch, commit, attempt_id)
+            .await
+            .with_context(|| {
+                format!(
+                    "pin repo initialization for {}@{branch} {commit}",
+                    repo_id.storage_key()
+                )
+            })?;
+    }
     phases.ref_publish_ms = Some(duration_ms(publish_start.elapsed()));
     info!(
         "two-phase p1: published depth-1 for {} in {:?} (full history building in background)",
@@ -7285,17 +7426,13 @@ async fn build_full_in_background(
                 "refusing to activate {}@{branch} {commit}: incomplete HEAD/full artifacts",
                 repo_id.storage_key()
             );
-            ref_store
-                .activate_repo(
-                    repo_id,
-                    branch,
-                    commit,
-                    initialization_attempt_id.as_deref(),
-                )
-                .await
-                .with_context(|| {
-                    format!("activate repo {}@{branch} {commit}", repo_id.storage_key())
-                })?;
+            if let Some(attempt_id) = initialization_attempt_id.as_deref() {
+                activate_admission_for_attempt(ref_store, repo_id, branch, commit, attempt_id)
+                    .await
+                    .with_context(|| {
+                        format!("activate repo {}@{branch} {commit}", repo_id.storage_key())
+                    })?;
+            }
         }
     }
     settle_storage(cas, storage, retention, uploads, idx_keep).await;
@@ -7462,16 +7599,12 @@ pub async fn process_build_job(
     let repo_id = &job.repo_id;
     let branch = &job.branch;
     let at_rev = job.rev.clone();
-    let initialization_attempt_id = state
-        .ref_store
-        .load_added_repo(repo_id)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|repo| repo.initialization_attempt_id);
+    let initialization_attempt_id = job.initialization_attempt_id.clone();
 
     // Mark as building in the shared metadata store.
-    if let Err(e) = update_current_build_status(state, repo_id, branch, "building").await {
+    if initialization_attempt_id.is_none()
+        && let Err(e) = update_current_build_status(state, repo_id, branch, "building").await
+    {
         error!(
             "build status update failed for {}@{branch}: {e:#}",
             repo_id.storage_key()
@@ -7484,7 +7617,9 @@ pub async fn process_build_job(
     let provider = match state.provider_registry.get(repo_id.workspace.as_str()) {
         Some(p) => p.clone(),
         None => {
-            if let Err(e) = update_current_build_status(state, repo_id, branch, "error").await {
+            if initialization_attempt_id.is_none()
+                && let Err(e) = update_current_build_status(state, repo_id, branch, "error").await
+            {
                 error!(
                     "build status update failed for {}@{branch}: {e:#}",
                     repo_id.storage_key()
@@ -7525,19 +7660,20 @@ pub async fn process_build_job(
         job.credential.as_ref(),
         &repo_config,
         &lock,
+        initialization_attempt_id.clone(),
         if job.recheck == 0 && at_rev.is_none() {
             Some(Phase2FailureAction {
                 state: state.clone(),
                 credential: job.credential.clone(),
                 retry_recheck: Some(1),
-                initialization_attempt_id: None,
+                initialization_attempt_id: initialization_attempt_id.clone(),
             })
         } else {
             Some(Phase2FailureAction {
                 state: state.clone(),
                 credential: job.credential.clone(),
                 retry_recheck: None,
-                initialization_attempt_id: None,
+                initialization_attempt_id: initialization_attempt_id.clone(),
             })
         },
     )
@@ -7581,7 +7717,7 @@ pub async fn process_build_job(
                     );
                 }
             }
-            if inline_full_history {
+            if inline_full_history && initialization_attempt_id.is_none() {
                 if let Err(e) =
                     update_build_status(state, repo_id, &effective_branch, &info.commit, "done")
                         .await
@@ -7638,29 +7774,33 @@ pub async fn process_build_job(
             let classified = classify_build_error(e);
             if let Some(status) = terminal_metadata_status(&classified) {
                 state.metrics.record_build_failed();
-                if let Err(status_err) =
-                    update_current_build_status(state, repo_id, &effective_branch, &status).await
+                if initialization_attempt_id.is_none()
+                    && let Err(status_err) =
+                        update_current_build_status(state, repo_id, &effective_branch, &status)
+                            .await
                 {
                     error!(
                         "build status update failed for {}@{effective_branch}: {status_err:#}",
                         repo_id.storage_key()
                     );
                 }
-                if let Err(state_err) = state
-                    .ref_store
-                    .fail_repo_initialization(
-                        repo_id,
-                        &effective_branch,
-                        None,
-                        classified.message(),
-                        initialization_attempt_id.as_deref(),
-                    )
-                    .await
-                {
-                    error!(
-                        "repo initialization failure update failed for {}@{effective_branch}: {state_err:#}",
-                        repo_id.storage_key()
-                    );
+                if let Some(attempt_id) = initialization_attempt_id.as_deref() {
+                    if let Err(state_err) = state
+                        .ref_store
+                        .fail_repo_initialization(
+                            repo_id,
+                            &effective_branch,
+                            None,
+                            classified.message(),
+                            Some(attempt_id),
+                        )
+                        .await
+                    {
+                        error!(
+                            "repo initialization failure update failed for {}@{effective_branch}: {state_err:#}",
+                            repo_id.storage_key()
+                        );
+                    }
                 }
                 warn!(
                     "background build failed for {}@{effective_branch}: {e}",
@@ -7699,24 +7839,25 @@ pub async fn mark_branch_build_failed(
     repo_id: &RepoId,
     branch: &str,
     message: &str,
+    initialization_attempt_id: Option<&str>,
 ) -> Result<()> {
-    let initialization_attempt_id = state
-        .ref_store
-        .load_added_repo(repo_id)
-        .await?
-        .and_then(|repo| repo.initialization_attempt_id);
-    let commit =
-        update_current_build_status(state, repo_id, branch, &format!("failed: {message}")).await?;
-    state
-        .ref_store
-        .fail_repo_initialization(
-            repo_id,
-            branch,
-            commit.as_deref(),
-            message,
-            initialization_attempt_id.as_deref(),
-        )
-        .await?;
+    let commit = if initialization_attempt_id.is_none() {
+        update_current_build_status(state, repo_id, branch, &format!("failed: {message}")).await?
+    } else {
+        None
+    };
+    if let Some(attempt_id) = initialization_attempt_id {
+        state
+            .ref_store
+            .fail_repo_initialization(
+                repo_id,
+                branch,
+                commit.as_deref(),
+                message,
+                Some(attempt_id),
+            )
+            .await?;
+    }
     Ok(())
 }
 
@@ -7916,7 +8057,15 @@ async fn post_build_freshness_recheck(
         repo_id.storage_key(),
         &tip[..7.min(tip.len())]
     );
-    if let Err(e) = enqueue_recheck_build(state, repo_id, branch, job.recheck + 1).await {
+    if let Err(e) = enqueue_recheck_build(
+        state,
+        repo_id,
+        branch,
+        job.recheck + 1,
+        job.initialization_attempt_id.clone(),
+    )
+    .await
+    {
         warn!(
             "post-build re-check trigger failed for {}: {e}",
             repo_id.storage_key()
@@ -7936,6 +8085,7 @@ async fn enqueue_recheck_build(
     repo_id: &RepoId,
     branch: &str,
     recheck: u32,
+    initialization_attempt_id: Option<String>,
 ) -> Result<(), String> {
     let credential = state
         .broker
@@ -7947,6 +8097,7 @@ async fn enqueue_recheck_build(
         BuildJob {
             repo_id: repo_id.clone(),
             branch: branch.to_string(),
+            initialization_attempt_id,
             rev: None,
             credential,
             recheck,
@@ -7981,16 +8132,18 @@ async fn handle_phase2_failure(
     commit: &str,
     reason: &str,
 ) {
-    let status = format!("failed: {reason}");
-    match update_build_status(&action.state, repo_id, branch, commit, &status).await {
-        Ok(true) => {
-            invalidate_ref_response_cache(&action.state, repo_id, branch);
+    if action.initialization_attempt_id.is_none() {
+        let status = format!("failed: {reason}");
+        match update_build_status(&action.state, repo_id, branch, commit, &status).await {
+            Ok(true) => {
+                invalidate_ref_response_cache(&action.state, repo_id, branch);
+            }
+            Ok(false) => {}
+            Err(e) => error!(
+                "build status update failed for {}@{branch} {commit}: {e:#}",
+                repo_id.storage_key()
+            ),
         }
-        Ok(false) => {}
-        Err(e) => error!(
-            "build status update failed for {}@{branch} {commit}: {e:#}",
-            repo_id.storage_key()
-        ),
     }
 
     if let Some(recheck) = action.retry_recheck {
@@ -7998,6 +8151,7 @@ async fn handle_phase2_failure(
         let job = BuildJob {
             repo_id: repo_id.clone(),
             branch: branch.to_string(),
+            initialization_attempt_id: action.initialization_attempt_id.clone(),
             rev: None,
             credential: action.credential,
             recheck,
@@ -8009,22 +8163,18 @@ async fn handle_phase2_failure(
                 repo_id.storage_key()
             );
         }
-    } else if let Err(e) = action
-        .state
-        .ref_store
-        .fail_repo_initialization(
-            repo_id,
-            branch,
-            Some(commit),
-            reason,
-            action.initialization_attempt_id.as_deref(),
-        )
-        .await
-    {
-        error!(
-            "repo initialization failure update failed for {}@{branch} {commit}: {e:#}",
-            repo_id.storage_key()
-        );
+    } else if let Some(attempt_id) = action.initialization_attempt_id.as_deref() {
+        if let Err(e) = action
+            .state
+            .ref_store
+            .fail_repo_initialization(repo_id, branch, Some(commit), reason, Some(attempt_id))
+            .await
+        {
+            error!(
+                "repo initialization failure update failed for {}@{branch} {commit}: {e:#}",
+                repo_id.storage_key()
+            );
+        }
     }
 }
 
@@ -8069,11 +8219,11 @@ fn spawn_build_worker(state: ServerState, mut rx: tokio::sync::mpsc::Receiver<Bu
                 let _permit = permit;
                 // The waiter key must match the enqueue key, which includes the
                 // rev override.
-                let key = format!(
-                    "{}/{}#{}",
-                    job.repo_id.storage_key(),
-                    job.branch,
-                    job.rev.as_deref().unwrap_or("")
+                let key = inproc_build_key(
+                    &job.repo_id,
+                    &job.branch,
+                    job.rev.as_deref(),
+                    job.initialization_attempt_id.as_deref(),
                 );
                 // Inner spawn isolates a panic so it fails just this job
                 // (signalling its waiters) instead of killing the task with
@@ -8445,6 +8595,11 @@ pub async fn run_server_with_barrier(
         spawn_build_worker(state.clone(), rx);
     }
 
+    // Reconciliation is not allowed to depend on the periodic poller (which
+    // may be disabled). Every initializing row has a durable attempt by this
+    // point; enqueue that exact attempt once at startup.
+    enqueue_initializing_repos(&state).await?;
+
     // Polling fallback: catches pushes that arrived without a webhook/Actions
     // trigger so build-before-clone still holds. Defaults to 5 minutes so
     // webhook-less self-hosts still self-heal missed or stuck builds.
@@ -8494,6 +8649,54 @@ pub async fn run_server(
 mod tests {
     use super::*;
     use tower::util::ServiceExt;
+
+    #[test]
+    fn inproc_admission_attempts_never_coalesce_across_readd() {
+        let repo = RepoId::github("acme/readd");
+        assert_ne!(
+            inproc_build_key(&repo, "main", None, Some("removed-a")),
+            inproc_build_key(&repo, "main", None, Some("current-b"))
+        );
+        assert_eq!(
+            inproc_build_key(&repo, "main", None, None),
+            inproc_build_key(&repo, "main", None, None)
+        );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_false_is_stale_or_invariant_never_silent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(&tmp);
+        let repo_id = RepoId::github("acme/classify");
+        state
+            .ref_store
+            .begin_repo_initialization(&AddedRepo {
+                repo_id: repo_id.clone(),
+                added_at: 1,
+                history_enabled: true,
+                source: AddedRepoSource::Api,
+                repo_size_bytes: None,
+                state: RepoLifecycleState::Initializing,
+                initialization_branch: Some("main".into()),
+                initialization_target: None,
+                activated_at: None,
+                failure: None,
+                initialization_attempt_id: Some("current".into()),
+            })
+            .await
+            .unwrap();
+        assert!(
+            !pin_admission_for_attempt(&state.ref_store, &repo_id, "main", "c1", "stale",)
+                .await
+                .unwrap()
+        );
+        assert!(
+            pin_admission_for_attempt(&state.ref_store, &repo_id, "other", "c1", "current")
+                .await
+                .is_err(),
+            "matching attempt false is an invariant error"
+        );
+    }
 
     // Classification must be TYPE-based (downcast at the do_sync error boundary),
     // not string-matching. These pin the concrete-source → retryable mapping; a
@@ -8827,6 +9030,7 @@ mod tests {
             &crate::repo_config::RepoConfig::default(),
             &lock,
             None,
+            None,
         )
         .await
         .unwrap()
@@ -9071,6 +9275,56 @@ mod tests {
                 .await
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_initializing_row_is_repaired_and_enqueued_without_poller() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, mut rx) = test_state_with_queue(&tmp);
+        let repo_id = RepoId::github("acme/legacy-init");
+        state
+            .ref_store
+            .add_repo(&AddedRepo {
+                repo_id: repo_id.clone(),
+                added_at: 1,
+                history_enabled: true,
+                source: AddedRepoSource::Migration,
+                repo_size_bytes: None,
+                state: RepoLifecycleState::Initializing,
+                initialization_branch: None,
+                initialization_target: Some("obsolete".into()),
+                activated_at: None,
+                failure: Some("old failure".into()),
+                initialization_attempt_id: None,
+            })
+            .await
+            .unwrap();
+        seed_added_repos(
+            &state.ref_store,
+            &state.provider_registry,
+            &WebhookConfig::empty(),
+        )
+        .await
+        .unwrap();
+        let repaired = state
+            .ref_store
+            .load_added_repo(&repo_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let attempt = repaired.initialization_attempt_id.clone().unwrap();
+        assert_eq!(repaired.initialization_branch.as_deref(), Some("HEAD"));
+        assert_eq!(repaired.initialization_target, None);
+        assert_eq!(repaired.failure, None);
+
+        enqueue_initializing_repos(&state).await.unwrap();
+        let job = rx.recv().await.expect("startup reconciliation job");
+        assert_eq!(job.repo_id, repo_id);
+        assert_eq!(job.branch, "HEAD");
+        assert_eq!(
+            job.initialization_attempt_id.as_deref(),
+            Some(attempt.as_str())
         );
     }
 

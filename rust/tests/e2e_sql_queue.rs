@@ -51,6 +51,7 @@ async fn sql_queue_farm_out_sync_then_clone() {
                     let job = BuildJob {
                         repo_id: c.repo_id(),
                         branch: c.branch,
+                        initialization_attempt_id: c.initialization_attempt_id,
                         rev: None,
                         credential: None,
                         recheck: 0,
