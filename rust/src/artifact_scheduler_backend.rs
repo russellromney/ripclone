@@ -7,10 +7,11 @@
 #[cfg(test)]
 use crate::artifact_scheduler::ArtifactTask;
 use crate::artifact_scheduler::{
-    ArtifactKey, ArtifactKind, ArtifactRecord, ClaimedArtifact, CompletionEvidence,
-    CompletionSealAuthority, ExecutionContext, ExecutionOutcome, FailureClass, ObservationOutcome,
-    QuarantineOutcome, ReadyPublicationFence, RetryOutcome, ScheduleOutcome, validate_evidence,
-    ObservationSnapshot, VerifiedCompletionEvidence, validate_lease,
+    ActivationFenceProvenance, ArtifactKey, ArtifactKind, ArtifactRecord, ClaimedArtifact,
+    CompletionEvidence, CompletionSealAuthority, ExecutionContext, ExecutionOutcome, FailureClass,
+    ObservationOutcome, ObservationSnapshot, QuarantineOutcome, ReadyPublicationFence,
+    RetryOutcome, ScheduleOutcome, UnknownActivationFencePage, VerifiedCompletionEvidence,
+    validate_evidence, validate_lease,
 };
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -83,10 +84,7 @@ pub trait ArtifactSchedulerPersistence: Send + Sync {
     fn completion_sealer(&self) -> Arc<CompletionSealAuthority>;
     /// Admission must fail startup rather than discover after corruption that
     /// a backend cannot withdraw a Ready manifest atomically.
-    fn manifest_cas_quarantine_supported(&self) -> bool {
-        false
-    }
-    fn ready_publication_pair_fence_supported(&self) -> bool {
+    fn full_admission_recovery_protocol_supported(&self) -> bool {
         false
     }
     async fn schedule(&self, key: &ArtifactKey) -> Result<ScheduleOutcome>;
@@ -155,10 +153,10 @@ pub trait ArtifactSchedulerPersistence: Send + Sync {
     async fn fence_ready_publications(
         &self,
         expected: &[(i64, Option<String>)],
-        consumer_id: &str,
+        provenance: &ActivationFenceProvenance,
         ttl_secs: i64,
     ) -> Result<Option<ReadyPublicationFence>> {
-        let _ = (expected, consumer_id, ttl_secs);
+        let _ = (expected, provenance, ttl_secs);
         bail!("artifact scheduler backend does not implement Ready publication fencing")
     }
     async fn release_ready_publication_fence(&self, fence: ReadyPublicationFence) -> Result<()> {
@@ -173,9 +171,20 @@ pub trait ArtifactSchedulerPersistence: Send + Sync {
         let _ = (fence, ttl_secs);
         bail!("artifact scheduler backend does not implement activation recovery fencing")
     }
-    async fn settle_activation_operation(&self, operation_id: &str) -> Result<()> {
-        let _ = operation_id;
-        bail!("artifact scheduler backend does not implement activation recovery settlement")
+    async fn recover_activation_fence(
+        &self,
+        provenance: &ActivationFenceProvenance,
+    ) -> Result<Option<ReadyPublicationFence>> {
+        let _ = provenance;
+        bail!("artifact scheduler backend does not implement activation recovery lookup")
+    }
+    async fn unknown_activation_fences_page(
+        &self,
+        after_generation: Option<u64>,
+        limit: usize,
+    ) -> Result<UnknownActivationFencePage> {
+        let _ = (after_generation, limit);
+        bail!("artifact scheduler backend does not implement bounded activation recovery listing")
     }
     async fn claim(&self, owner: &str, lease_secs: i64) -> Result<Option<ClaimedArtifact>>;
     async fn heartbeat(
@@ -600,10 +609,7 @@ impl ArtifactSchedulerPersistence for crate::artifact_scheduler::ArtifactSchedul
     fn completion_sealer(&self) -> Arc<CompletionSealAuthority> {
         self.completion_sealer.clone()
     }
-    fn manifest_cas_quarantine_supported(&self) -> bool {
-        true
-    }
-    fn ready_publication_pair_fence_supported(&self) -> bool {
+    fn full_admission_recovery_protocol_supported(&self) -> bool {
         true
     }
     async fn schedule(&self, key: &ArtifactKey) -> Result<ScheduleOutcome> {
@@ -649,10 +655,10 @@ impl ArtifactSchedulerPersistence for crate::artifact_scheduler::ArtifactSchedul
     async fn fence_ready_publications(
         &self,
         expected: &[(i64, Option<String>)],
-        consumer_id: &str,
+        provenance: &ActivationFenceProvenance,
         ttl_secs: i64,
     ) -> Result<Option<ReadyPublicationFence>> {
-        self.fence_ready_publications(expected, consumer_id, ttl_secs)
+        self.fence_ready_publications(expected, provenance, ttl_secs)
             .await
     }
     async fn release_ready_publication_fence(&self, fence: ReadyPublicationFence) -> Result<()> {
@@ -665,8 +671,19 @@ impl ArtifactSchedulerPersistence for crate::artifact_scheduler::ArtifactSchedul
     ) -> Result<bool> {
         self.mark_activation_unknown(fence, ttl_secs).await
     }
-    async fn settle_activation_operation(&self, operation_id: &str) -> Result<()> {
-        self.settle_activation_operation(operation_id).await
+    async fn recover_activation_fence(
+        &self,
+        provenance: &ActivationFenceProvenance,
+    ) -> Result<Option<ReadyPublicationFence>> {
+        self.recover_activation_fence(provenance).await
+    }
+    async fn unknown_activation_fences_page(
+        &self,
+        after_generation: Option<u64>,
+        limit: usize,
+    ) -> Result<UnknownActivationFencePage> {
+        self.unknown_activation_fences_page(after_generation, limit)
+            .await
     }
     async fn claim(&self, owner: &str, lease: i64) -> Result<Option<ClaimedArtifact>> {
         self.claim(owner, lease).await

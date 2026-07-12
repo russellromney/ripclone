@@ -6,8 +6,8 @@
 //! never gates admission.
 
 use crate::artifact_scheduler::{
-    ArtifactKey, ArtifactKind, ArtifactRecord, ArtifactState, FailureClass, QuarantineOutcome,
-    ScheduleOutcome,
+    ActivationFenceProvenance, ArtifactKey, ArtifactKind, ArtifactRecord, ArtifactState,
+    FailureClass, QuarantineOutcome, ScheduleOutcome,
 };
 use crate::artifact_scheduler_backend::ArtifactSchedulerPersistence;
 use crate::provider::RepoId;
@@ -18,7 +18,7 @@ use futures::{StreamExt, stream};
 use sha2::{Digest, Sha256};
 use std::sync::{
     Arc,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -73,6 +73,14 @@ pub struct AdmissionReadiness {
     pub busy_verifier_slots: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownAdmissionRecoveryPage {
+    pub processed: usize,
+    pub settled: usize,
+    pub retained: usize,
+    pub next_generation: Option<u64>,
+}
+
 pub struct ArtifactAdmissionCoordinator {
     scheduler: Arc<dyn ArtifactSchedulerPersistence>,
     ref_store: Arc<dyn RefStore>,
@@ -87,6 +95,7 @@ pub struct ArtifactAdmissionCoordinator {
     verification_cancel_grace: Duration,
     verification_queue_timeout: Duration,
     activation_timeout: Duration,
+    unknown_recovery_cursor: AtomicU64,
     #[cfg(test)]
     after_subscribe: Option<Arc<dyn TestSubscriptionHook>>,
     #[cfg(test)]
@@ -155,11 +164,8 @@ impl ArtifactAdmissionCoordinator {
         if format_version == 0 {
             bail!("admission artifact format version must be nonzero")
         }
-        if !scheduler.manifest_cas_quarantine_supported() {
-            bail!("admission scheduler lacks manifest-CAS quarantine support")
-        }
-        if !scheduler.ready_publication_pair_fence_supported() {
-            bail!("admission scheduler lacks typed Ready publication pair fencing")
+        if !scheduler.full_admission_recovery_protocol_supported() {
+            bail!("admission scheduler lacks the full typed recovery protocol")
         }
         Ok(Self {
             scheduler,
@@ -175,6 +181,7 @@ impl ArtifactAdmissionCoordinator {
             verification_cancel_grace: DEFAULT_VERIFICATION_CANCEL_GRACE,
             verification_queue_timeout: DEFAULT_VERIFICATION_QUEUE_TIMEOUT,
             activation_timeout: ACTIVATION_TIMEOUT,
+            unknown_recovery_cursor: AtomicU64::new(0),
             #[cfg(test)]
             after_subscribe: None,
             #[cfg(test)]
@@ -433,14 +440,20 @@ impl ArtifactAdmissionCoordinator {
         // Acquire one pairwise manifest-CAS guard. Quarantine cannot withdraw
         // either publication while this expiring guard is live, closing the
         // cross-store check/activate window without permanent crash leaks.
-        let activation_consumer = activation_fence_consumer_id(repo_id, target, attempt_id);
+        let activation_provenance = ActivationFenceProvenance {
+            workspace: repo_id.workspace.as_str().to_owned(),
+            repo: repo_id.path.clone(),
+            branch: branch.to_owned(),
+            target: target.to_owned(),
+            attempt_id: attempt_id.to_owned(),
+        };
         let expected = [
             (head.id, head.manifest.clone()),
             (history.id, history.manifest.clone()),
         ];
         let Some(fence) = self
             .scheduler
-            .fence_ready_publications(&expected, &activation_consumer, ACTIVATION_FENCE_TTL_SECS)
+            .fence_ready_publications(&expected, &activation_provenance, ACTIVATION_FENCE_TTL_SECS)
             .await?
         else {
             return Ok(AdmissionOutcome::WaitingForArtifacts);
@@ -506,6 +519,14 @@ impl ArtifactAdmissionCoordinator {
     pub async fn reconcile_all(
         &self,
     ) -> Result<Vec<(RepoId, Result<AdmissionOutcome, anyhow::Error>)>> {
+        // One bounded durable recovery page per recurring pass prevents a
+        // crashed activation worker from leaving permanent safety roots.
+        let cursor = self.unknown_recovery_cursor.load(Ordering::Acquire);
+        let recovery = self
+            .reconcile_unknown_fences_page((cursor != 0).then_some(cursor), 128)
+            .await?;
+        self.unknown_recovery_cursor
+            .store(recovery.next_generation.unwrap_or(0), Ordering::Release);
         let repos = self.ref_store.list_added_repos().await?;
         let outcomes = stream::iter(
             repos
@@ -520,6 +541,89 @@ impl ArtifactAdmissionCoordinator {
         .collect()
         .await;
         Ok(outcomes)
+    }
+
+    /// Bounded fleet recovery for activation calls whose outcome was unknown
+    /// when their original worker stopped. The durable generation capability
+    /// is the only authority that can settle a root.
+    pub async fn reconcile_unknown_fences_page(
+        &self,
+        after_generation: Option<u64>,
+        limit: usize,
+    ) -> Result<UnknownAdmissionRecoveryPage> {
+        let page = self
+            .scheduler
+            .unknown_activation_fences_page(after_generation, limit)
+            .await?;
+        let mut settled = 0;
+        let mut retained = 0;
+        let processed = page.fences.len();
+        for fence in page.fences {
+            let provenance = fence.provenance().clone();
+            let repo_id = RepoId {
+                workspace: crate::provider::WorkspaceId::new(provenance.workspace.clone()),
+                path: provenance.repo.clone(),
+            };
+            let current = self.ref_store.load_added_repo(&repo_id).await?;
+            let is_current = current.as_ref().is_some_and(|repo| {
+                repo.state == RepoLifecycleState::Initializing
+                    && repo.initialization_branch.as_deref() == Some(&provenance.branch)
+                    && repo.initialization_target.as_deref() == Some(&provenance.target)
+                    && repo.initialization_attempt_id.as_deref() == Some(&provenance.attempt_id)
+            });
+            if !is_current {
+                self.scheduler
+                    .release_ready_publication_fence(fence)
+                    .await?;
+                settled += 1;
+                continue;
+            }
+            if !self
+                .scheduler
+                .mark_activation_unknown(&fence, ACTIVATION_FENCE_TTL_SECS)
+                .await?
+            {
+                retained += 1;
+                continue;
+            }
+            let activation = tokio::time::timeout(
+                self.activation_timeout,
+                self.ref_store.activate_repo(
+                    &repo_id,
+                    &provenance.branch,
+                    &provenance.target,
+                    Some(&provenance.attempt_id),
+                ),
+            )
+            .await;
+            let durable_terminal = match activation {
+                Ok(Ok(true)) => true,
+                Ok(Ok(false)) | Ok(Err(_)) | Err(_) => !self
+                    .ref_store
+                    .load_added_repo(&repo_id)
+                    .await?
+                    .is_some_and(|repo| {
+                        repo.state == RepoLifecycleState::Initializing
+                            && repo.initialization_attempt_id.as_deref()
+                                == Some(&provenance.attempt_id)
+                            && repo.initialization_target.as_deref() == Some(&provenance.target)
+                    }),
+            };
+            if durable_terminal {
+                self.scheduler
+                    .release_ready_publication_fence(fence)
+                    .await?;
+                settled += 1;
+            } else {
+                retained += 1;
+            }
+        }
+        Ok(UnknownAdmissionRecoveryPage {
+            processed,
+            settled,
+            retained,
+            next_generation: page.next_generation,
+        })
     }
 
     /// Release the exact attempt's durable consumers. Removal handlers call
@@ -555,13 +659,19 @@ impl ArtifactAdmissionCoordinator {
         let Some((_, target)) = pinned_identity(repo)? else {
             return Ok(());
         };
-        self.scheduler
-            .settle_activation_operation(&activation_fence_consumer_id(
-                &repo.repo_id,
-                target,
-                attempt_id,
-            ))
-            .await
+        let provenance = ActivationFenceProvenance {
+            workspace: repo.repo_id.workspace.as_str().to_owned(),
+            repo: repo.repo_id.path.clone(),
+            branch: repo.initialization_branch.clone().unwrap_or_default(),
+            target: target.to_owned(),
+            attempt_id: attempt_id.to_owned(),
+        };
+        if let Some(fence) = self.scheduler.recover_activation_fence(&provenance).await? {
+            self.scheduler
+                .release_ready_publication_fence(fence)
+                .await?;
+        }
+        Ok(())
     }
 
     fn key(&self, repo_id: &RepoId, commit: &str, kind: ArtifactKind) -> ArtifactKey {
@@ -818,20 +928,6 @@ fn admission_consumer_id(repo_id: &RepoId, branch: &str, target: &str, attempt_i
         digest.update(component.as_bytes());
     }
     format!("admission-{}", hex::encode(digest.finalize()))
-}
-
-fn activation_fence_consumer_id(repo_id: &RepoId, target: &str, attempt_id: &str) -> String {
-    let mut digest = Sha256::new();
-    for component in [
-        repo_id.workspace.as_str(),
-        repo_id.path.as_str(),
-        target,
-        attempt_id,
-    ] {
-        digest.update((component.len() as u64).to_be_bytes());
-        digest.update(component.as_bytes());
-    }
-    format!("admission-activation-{}", hex::encode(digest.finalize()))
 }
 
 fn terminal(class: FailureClass) -> bool {
@@ -1147,6 +1243,16 @@ mod tests {
             }
         }
 
+        fn provenance(&self, attempt: &str) -> ActivationFenceProvenance {
+            ActivationFenceProvenance {
+                workspace: self.repo_id.workspace.as_str().to_owned(),
+                repo: self.repo_id.path.clone(),
+                branch: "main".into(),
+                target: TARGET.into(),
+                attempt_id: attempt.into(),
+            }
+        }
+
         async fn make_required_ready(&self, head_manifest: &str, history_manifest: &str) {
             self.make_ready_for(&self.repo_id, "attempt-1", head_manifest, history_manifest)
                 .await;
@@ -1191,6 +1297,41 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap()
+        }
+
+        async fn make_unknown_fence(&self, attempt: &str) {
+            let head = self
+                .scheduler
+                .get_by_key(&self.key(ArtifactKind::Head))
+                .await
+                .unwrap()
+                .unwrap();
+            let history = self
+                .scheduler
+                .get_by_key(&self.key(ArtifactKind::FullHistory))
+                .await
+                .unwrap()
+                .unwrap();
+            let fence = self
+                .scheduler
+                .fence_ready_publications(
+                    &[
+                        (head.id, head.manifest.clone()),
+                        (history.id, history.manifest.clone()),
+                    ],
+                    &self.provenance(attempt),
+                    60,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                self.scheduler
+                    .mark_activation_unknown(&fence, 60)
+                    .await
+                    .unwrap()
+            );
+            drop(fence);
         }
     }
 
@@ -1790,7 +1931,7 @@ mod tests {
                     (head.id, head.manifest.clone()),
                     (history.id, history.manifest.clone()),
                 ],
-                "admission-activation-crash-test",
+                &f.provenance("crash-test"),
                 60,
             )
             .await
@@ -1804,13 +1945,10 @@ mod tests {
             QuarantineOutcome::LostRace
         );
         let pool = sqlx::SqlitePool::connect(&f.db_url).await.unwrap();
-        sqlx::query(
-            "UPDATE ready_publication_fences SET expires_at=0
-             WHERE operation_id='admission-activation-crash-test'",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
+        sqlx::query("UPDATE ready_publication_fences SET expires_at=0")
+            .execute(&pool)
+            .await
+            .unwrap();
         assert!(matches!(
             f.scheduler
                 .quarantine_ready(head.id, head.manifest.as_deref(), "scrub after crash")
@@ -1844,20 +1982,18 @@ mod tests {
         ];
         let old = f
             .scheduler
-            .fence_ready_publications(&expected, "aba-operation", 60)
+            .fence_ready_publications(&expected, &f.provenance("aba-attempt"), 60)
             .await
             .unwrap()
             .unwrap();
         let pool = sqlx::SqlitePool::connect(&f.db_url).await.unwrap();
-        sqlx::query(
-            "UPDATE ready_publication_fences SET expires_at=0 WHERE operation_id='aba-operation'",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
+        sqlx::query("UPDATE ready_publication_fences SET expires_at=0")
+            .execute(&pool)
+            .await
+            .unwrap();
         let renewed = f
             .scheduler
-            .fence_ready_publications(&expected, "aba-operation", 60)
+            .fence_ready_publications(&expected, &f.provenance("aba-attempt"), 60)
             .await
             .unwrap()
             .unwrap();
@@ -1884,6 +2020,80 @@ mod tests {
                 .unwrap(),
             QuarantineOutcome::Requeued(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn stale_recovery_capability_cannot_settle_reacquired_generation() {
+        let f = Fixture::new().await;
+        f.add("attempt-1").await;
+        f.make_required_ready("head", "history").await;
+        let head = f
+            .scheduler
+            .get_by_key(&f.key(ArtifactKind::Head))
+            .await
+            .unwrap()
+            .unwrap();
+        let history = f
+            .scheduler
+            .get_by_key(&f.key(ArtifactKind::FullHistory))
+            .await
+            .unwrap()
+            .unwrap();
+        let expected = [
+            (head.id, head.manifest.clone()),
+            (history.id, history.manifest.clone()),
+        ];
+        let provenance = f.provenance("recovery-aba");
+        let acquired = f
+            .scheduler
+            .fence_ready_publications(&expected, &provenance, 60)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            f.scheduler
+                .mark_activation_unknown(&acquired, 60)
+                .await
+                .unwrap()
+        );
+        drop(acquired);
+        let stale = f
+            .scheduler
+            .recover_activation_fence(&provenance)
+            .await
+            .unwrap()
+            .unwrap();
+        let current = f
+            .scheduler
+            .recover_activation_fence(&provenance)
+            .await
+            .unwrap()
+            .unwrap();
+        f.scheduler
+            .release_ready_publication_fence(current)
+            .await
+            .unwrap();
+        let renewed = f
+            .scheduler
+            .fence_ready_publications(&expected, &provenance, 60)
+            .await
+            .unwrap()
+            .unwrap();
+        f.scheduler
+            .release_ready_publication_fence(stale)
+            .await
+            .unwrap();
+        assert_eq!(
+            f.scheduler
+                .quarantine_ready(head.id, head.manifest.as_deref(), "scrub")
+                .await
+                .unwrap(),
+            QuarantineOutcome::LostRace
+        );
+        f.scheduler
+            .release_ready_publication_fence(renewed)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1940,7 +2150,7 @@ mod tests {
                     (head.id, head.manifest.clone()),
                     (history.id, history.manifest.clone()),
                 ],
-                "corrupt-startup",
+                &f.provenance("corrupt-startup"),
                 60,
             )
             .await
@@ -1981,7 +2191,7 @@ mod tests {
             .unwrap();
         sqlx::query(
             "INSERT INTO ready_publication_fence_members(token,generation,artifact_id,manifest)
-             VALUES('orphan',99,?,NULL)",
+             VALUES('orphan',99,?,'orphan-manifest')",
         )
         .bind(head.id)
         .execute(&mut *connection)
@@ -1993,6 +2203,222 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("fence integrity"));
+    }
+
+    #[tokio::test]
+    async fn fence_acquisition_rejects_wrong_typed_pair_and_provenance() {
+        let f = Fixture::new().await;
+        f.add("attempt-1").await;
+        f.make_required_ready("head", "history").await;
+        let head = f
+            .scheduler
+            .get_by_key(&f.key(ArtifactKind::Head))
+            .await
+            .unwrap()
+            .unwrap();
+        let history = f
+            .scheduler
+            .get_by_key(&f.key(ArtifactKind::FullHistory))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            f.scheduler
+                .fence_ready_publications(
+                    &[
+                        (head.id, head.manifest.clone()),
+                        (head.id, head.manifest.clone())
+                    ],
+                    &f.provenance("attempt-1"),
+                    60,
+                )
+                .await
+                .is_err()
+        );
+        let mut wrong = f.provenance("attempt-1");
+        wrong.workspace = "other-workspace".into();
+        assert!(
+            f.scheduler
+                .fence_ready_publications(
+                    &[
+                        (head.id, head.manifest.clone()),
+                        (history.id, history.manifest.clone())
+                    ],
+                    &wrong,
+                    60,
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_fence_recovery_settles_removed_and_replaced_attempts() {
+        for replacement in [false, true] {
+            let f = Fixture::new().await;
+            f.add("attempt-1").await;
+            f.make_required_ready("head", "history").await;
+            f.make_unknown_fence("attempt-1").await;
+            f.refs.remove_added_repo(&f.repo_id).await.unwrap();
+            if replacement {
+                f.refs.add_repo(&f.repo("attempt-2")).await.unwrap();
+            }
+            let page = f
+                .coordinator
+                .reconcile_unknown_fences_page(None, 16)
+                .await
+                .unwrap();
+            assert_eq!(page.processed, 1);
+            assert_eq!(page.settled, 1);
+            assert_eq!(page.retained, 0);
+            let pool = sqlx::SqlitePool::connect(&f.db_url).await.unwrap();
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT count(*) FROM ready_publication_fences")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap(),
+                0
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_fence_listing_is_bounded_and_cursor_monotonic() {
+        let f = Fixture::new().await;
+        f.add("attempt-1").await;
+        f.make_required_ready("head", "history").await;
+        let head = f
+            .scheduler
+            .get_by_key(&f.key(ArtifactKind::Head))
+            .await
+            .unwrap()
+            .unwrap();
+        let history = f
+            .scheduler
+            .get_by_key(&f.key(ArtifactKind::FullHistory))
+            .await
+            .unwrap()
+            .unwrap();
+        let expected = [
+            (head.id, head.manifest.clone()),
+            (history.id, history.manifest.clone()),
+        ];
+        for attempt in ["page-a", "page-b", "page-c"] {
+            let fence = f
+                .scheduler
+                .fence_ready_publications(&expected, &f.provenance(attempt), 60)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                f.scheduler
+                    .mark_activation_unknown(&fence, 60)
+                    .await
+                    .unwrap()
+            );
+        }
+        let first = f
+            .scheduler
+            .unknown_activation_fences_page(None, 2)
+            .await
+            .unwrap();
+        assert_eq!(first.fences.len(), 2);
+        let cursor = first.next_generation.expect("full page has a cursor");
+        let second = f
+            .scheduler
+            .unknown_activation_fences_page(Some(cursor), 2)
+            .await
+            .unwrap();
+        assert_eq!(second.fences.len(), 1);
+        assert!(second.next_generation.is_none());
+        assert!(
+            f.scheduler
+                .unknown_activation_fences_page(None, 129)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn released_v2_migrates_atomically_to_v3_without_changing_jobs() {
+        let f = Fixture::new().await;
+        f.add("attempt-1").await;
+        f.coordinator
+            .subscribe_pinned_attempt(&f.repo_id, "attempt-1")
+            .await
+            .unwrap();
+        let pool = sqlx::SqlitePool::connect(&f.db_url).await.unwrap();
+        sqlx::raw_sql(
+            "DROP TABLE ready_publication_fence_members;
+             DROP TABLE ready_publication_fences;
+             DROP TABLE ready_publication_fence_sequence;
+             PRAGMA user_version=2;",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let jobs_before: i64 = sqlx::query_scalar("SELECT count(*) FROM artifact_jobs")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let reopened = ArtifactScheduler::open(&f.db_url, SchedulerLimits::default())
+            .await
+            .unwrap();
+        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(version, 3);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM artifact_jobs")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            jobs_before
+        );
+        assert!(
+            reopened
+                .unknown_activation_fences_page(None, 1)
+                .await
+                .unwrap()
+                .fences
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_v2_fence_schema_rolls_back_without_partial_v3_mutation() {
+        let f = Fixture::new().await;
+        let pool = sqlx::SqlitePool::connect(&f.db_url).await.unwrap();
+        sqlx::raw_sql(
+            "DROP TABLE ready_publication_fence_members;
+             DROP TABLE ready_publication_fences;
+             DROP TABLE ready_publication_fence_sequence;
+             CREATE TABLE ready_publication_fences(planted TEXT NOT NULL);
+             PRAGMA user_version=2;",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(
+            ArtifactScheduler::open(&f.db_url, SchedulerLimits::default())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("PRAGMA user_version")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM pragma_table_info('ready_publication_fences') WHERE name='planted'"
+        ).fetch_one(&pool).await.unwrap(), 1);
+        assert_eq!(sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='ready_publication_fence_sequence'"
+        ).fetch_one(&pool).await.unwrap(), 0, "failed v3 migration leaked an earlier DDL statement");
     }
 
     #[tokio::test]

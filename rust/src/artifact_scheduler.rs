@@ -214,7 +214,40 @@ pub struct ReadyPublicationFence {
     token: String,
     generation: u64,
     operation_id: String,
+    provenance: ActivationFenceProvenance,
     expected: Vec<(i64, Option<String>)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivationFenceProvenance {
+    pub workspace: String,
+    pub repo: String,
+    pub branch: String,
+    pub target: String,
+    pub attempt_id: String,
+}
+
+impl ActivationFenceProvenance {
+    pub fn operation_id(&self) -> String {
+        let mut digest = Sha256::new();
+        for component in [
+            self.workspace.as_str(),
+            self.repo.as_str(),
+            self.branch.as_str(),
+            self.target.as_str(),
+            self.attempt_id.as_str(),
+        ] {
+            digest.update((component.len() as u64).to_be_bytes());
+            digest.update(component.as_bytes());
+        }
+        format!("admission-operation-{}", hex::encode(digest.finalize()))
+    }
+}
+
+#[derive(Debug)]
+pub struct UnknownActivationFencePage {
+    pub fences: Vec<ReadyPublicationFence>,
+    pub next_generation: Option<u64>,
 }
 
 impl ReadyPublicationFence {
@@ -222,12 +255,14 @@ impl ReadyPublicationFence {
         token: String,
         generation: u64,
         operation_id: String,
+        provenance: ActivationFenceProvenance,
         expected: Vec<(i64, Option<String>)>,
     ) -> Self {
         Self {
             token,
             generation,
             operation_id,
+            provenance,
             expected,
         }
     }
@@ -238,6 +273,9 @@ impl ReadyPublicationFence {
             &self.operation_id,
             &self.expected,
         )
+    }
+    pub fn provenance(&self) -> &ActivationFenceProvenance {
+        &self.provenance
     }
 }
 
@@ -586,19 +624,24 @@ CREATE TABLE IF NOT EXISTS artifact_observations(
  desired_commit TEXT NOT NULL,desired_artifact_id INTEGER NOT NULL,desired_generation INTEGER NOT NULL,
  published_artifact_id INTEGER,format_version INTEGER NOT NULL DEFAULT 1,observed_at INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(workspace,repo,branch,kind));
 CREATE TABLE IF NOT EXISTS artifact_consumers(artifact_id INTEGER NOT NULL,consumer_id TEXT NOT NULL,expires_at INTEGER NOT NULL,PRIMARY KEY(artifact_id,consumer_id));
-CREATE TABLE IF NOT EXISTS ready_publication_fence_sequence(id INTEGER PRIMARY KEY CHECK(id=1),generation INTEGER NOT NULL CHECK(generation>=0));
-INSERT OR IGNORE INTO ready_publication_fence_sequence(id,generation) VALUES(1,0);
-CREATE TABLE IF NOT EXISTS ready_publication_fences(
+CREATE TABLE IF NOT EXISTS scheduler_state(id INTEGER PRIMARY KEY CHECK(id=1),fairness_cursor INTEGER NOT NULL,workspace_cursor TEXT NOT NULL DEFAULT '',config_fingerprint TEXT NOT NULL DEFAULT '');
+INSERT OR IGNORE INTO scheduler_state(id,fairness_cursor) VALUES(1,0);
+"#;
+
+const FENCE_SCHEMA_V3: &str = r#"
+CREATE TABLE ready_publication_fence_sequence(id INTEGER PRIMARY KEY CHECK(id=1),generation INTEGER NOT NULL CHECK(generation>=0));
+INSERT INTO ready_publication_fence_sequence(id,generation) VALUES(1,0);
+CREATE TABLE ready_publication_fences(
  token TEXT PRIMARY KEY,generation INTEGER NOT NULL UNIQUE CHECK(generation>0),operation_id TEXT NOT NULL UNIQUE,
+ workspace TEXT NOT NULL,repo TEXT NOT NULL,branch TEXT NOT NULL,target TEXT NOT NULL,attempt_id TEXT NOT NULL,
  expires_at INTEGER NOT NULL,state TEXT NOT NULL CHECK(state IN('held','activation_unknown')),
  UNIQUE(token,generation));
-CREATE TABLE IF NOT EXISTS ready_publication_fence_members(
- token TEXT NOT NULL,generation INTEGER NOT NULL CHECK(generation>0),artifact_id INTEGER NOT NULL,manifest TEXT,
+CREATE TABLE ready_publication_fence_members(
+ token TEXT NOT NULL,generation INTEGER NOT NULL CHECK(generation>0),artifact_id INTEGER NOT NULL,manifest TEXT NOT NULL CHECK(length(trim(manifest))>0),
  PRIMARY KEY(token,artifact_id),
  FOREIGN KEY(token,generation) REFERENCES ready_publication_fences(token,generation) ON DELETE CASCADE,
  FOREIGN KEY(artifact_id) REFERENCES artifact_jobs(id) ON DELETE CASCADE);
-CREATE TABLE IF NOT EXISTS scheduler_state(id INTEGER PRIMARY KEY CHECK(id=1),fairness_cursor INTEGER NOT NULL,workspace_cursor TEXT NOT NULL DEFAULT '',config_fingerprint TEXT NOT NULL DEFAULT '');
-INSERT OR IGNORE INTO scheduler_state(id,fairness_cursor) VALUES(1,0);
+CREATE INDEX ready_publication_fences_recovery ON ready_publication_fences(state,generation,token);
 "#;
 
 impl ArtifactScheduler {
@@ -639,54 +682,13 @@ impl ArtifactScheduler {
         let prior_version: i64 = sqlx::query_scalar("PRAGMA user_version")
             .fetch_one(&pool)
             .await?;
-        if prior_version > 2 {
+        if prior_version > 3 {
             bail!("artifact scheduler database is newer than this binary")
         }
         sqlx::raw_sql(SCHEMA)
             .execute(&pool)
             .await
             .context("initialize artifact scheduler")?;
-        let fence_schema: String = sqlx::query_scalar(
-            "SELECT lower(sql) FROM sqlite_master WHERE type='table' AND name='ready_publication_fence_members'",
-        )
-        .fetch_one(&pool)
-        .await?;
-        for required in [
-            "foreign key(token,generation)",
-            "references ready_publication_fences(token,generation) on delete cascade",
-            "foreign key(artifact_id) references artifact_jobs(id) on delete cascade",
-        ] {
-            if !fence_schema
-                .split_whitespace()
-                .collect::<String>()
-                .contains(&required.split_whitespace().collect::<String>())
-            {
-                bail!("ready publication fence schema provenance is invalid")
-            }
-        }
-        let invalid_fences: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM (
-               SELECT f.token FROM ready_publication_fences f
-               LEFT JOIN ready_publication_fence_members m
-                 ON m.token=f.token AND m.generation=f.generation
-               LEFT JOIN artifact_jobs j ON j.id=m.artifact_id
-               GROUP BY f.token HAVING count(m.artifact_id)<>2 OR count(j.id)<>2
-             )",
-        )
-        .fetch_one(&pool)
-        .await?;
-        let orphan_members: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM ready_publication_fence_members m
-             LEFT JOIN ready_publication_fences f
-               ON f.token=m.token AND f.generation=m.generation
-             LEFT JOIN artifact_jobs j ON j.id=m.artifact_id
-             WHERE f.token IS NULL OR j.id IS NULL",
-        )
-        .fetch_one(&pool)
-        .await?;
-        if invalid_fences != 0 || orphan_members != 0 {
-            bail!("ready publication fence integrity validation failed")
-        }
         let mut migration = pool.begin().await?;
         for (table, column, definition) in [
             (
@@ -817,7 +819,76 @@ impl ArtifactScheduler {
         if invalid_job_formats != 0 {
             bail!("artifact scheduler contains invalid job format versions")
         }
-        sqlx::raw_sql("PRAGMA user_version=2")
+        if prior_version < 3 {
+            sqlx::raw_sql(FENCE_SCHEMA_V3)
+                .execute(&mut *migration)
+                .await
+                .context("migrate artifact scheduler v2 to v3 Ready fences")?;
+        }
+        let fence_schema: String = sqlx::query_scalar(
+            "SELECT lower(sql) FROM sqlite_master WHERE type='table' AND name='ready_publication_fence_members'",
+        )
+        .fetch_one(&mut *migration)
+        .await?;
+        for required in [
+            "foreign key(token,generation)",
+            "references ready_publication_fences(token,generation) on delete cascade",
+            "foreign key(artifact_id) references artifact_jobs(id) on delete cascade",
+        ] {
+            if !fence_schema
+                .split_whitespace()
+                .collect::<String>()
+                .contains(&required.split_whitespace().collect::<String>())
+            {
+                bail!("ready publication fence schema provenance is invalid")
+            }
+        }
+        let invalid_fences: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM ready_publication_fences f WHERE
+               trim(f.workspace)='' OR trim(f.repo)='' OR trim(f.branch)='' OR trim(f.target)='' OR trim(f.attempt_id)=''
+               OR (SELECT count(*) FROM ready_publication_fence_members m WHERE m.token=f.token AND m.generation=f.generation)<>2
+               OR (SELECT count(*) FROM ready_publication_fence_members m JOIN artifact_jobs j ON j.id=m.artifact_id
+                   WHERE m.token=f.token AND m.generation=f.generation AND j.kind='head' AND j.state='ready'
+                     AND j.manifest=m.manifest AND length(trim(m.manifest))>0
+                     AND j.workspace=f.workspace AND j.repo=f.repo AND j.commit_oid=f.target)<>1
+               OR (SELECT count(*) FROM ready_publication_fence_members m JOIN artifact_jobs j ON j.id=m.artifact_id
+                   WHERE m.token=f.token AND m.generation=f.generation AND j.kind='full_history' AND j.state='ready'
+                     AND j.manifest=m.manifest AND length(trim(m.manifest))>0
+                     AND j.workspace=f.workspace AND j.repo=f.repo AND j.commit_oid=f.target)<>1
+               OR (SELECT count(DISTINCT j.format_version) FROM ready_publication_fence_members m
+                   JOIN artifact_jobs j ON j.id=m.artifact_id WHERE m.token=f.token AND m.generation=f.generation)<>1",
+        )
+        .fetch_one(&mut *migration)
+        .await?;
+        let orphan_members: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM ready_publication_fence_members m
+             LEFT JOIN ready_publication_fences f ON f.token=m.token AND f.generation=m.generation
+             LEFT JOIN artifact_jobs j ON j.id=m.artifact_id WHERE f.token IS NULL OR j.id IS NULL",
+        )
+        .fetch_one(&mut *migration)
+        .await?;
+        if invalid_fences != 0 || orphan_members != 0 {
+            bail!("ready publication fence integrity validation failed")
+        }
+        let provenances: Vec<(String,String,String,String,String,String)> = sqlx::query_as(
+            "SELECT operation_id,workspace,repo,branch,target,attempt_id FROM ready_publication_fences",
+        ).fetch_all(&mut *migration).await?;
+        if provenances.into_iter().any(
+            |(operation_id, workspace, repo, branch, target, attempt_id)| {
+                ActivationFenceProvenance {
+                    workspace,
+                    repo,
+                    branch,
+                    target,
+                    attempt_id,
+                }
+                .operation_id()
+                    != operation_id
+            },
+        ) {
+            bail!("ready publication fence operation provenance is invalid")
+        }
+        sqlx::raw_sql("PRAGMA user_version=3")
             .execute(&mut *migration)
             .await?;
         migration.commit().await?;
@@ -825,7 +896,28 @@ impl ArtifactScheduler {
             .fetch_one(&pool)
             .await?;
         let required:i64=sqlx::query_scalar("SELECT count(*) FROM pragma_table_info('artifact_jobs') WHERE name IN('lease_generation','claim_attempts','retry_count','failure_class')").fetch_one(&pool).await?;
-        if version != 2 || required != 4 {
+        let fence_tables: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN(
+               'ready_publication_fence_sequence','ready_publication_fences','ready_publication_fence_members')",
+        ).fetch_one(&pool).await?;
+        let fence_columns: i64 = sqlx::query_scalar(
+            "SELECT (SELECT count(*) FROM pragma_table_info('ready_publication_fence_sequence'))
+                  +(SELECT count(*) FROM pragma_table_info('ready_publication_fences'))
+                  +(SELECT count(*) FROM pragma_table_info('ready_publication_fence_members'))",
+        )
+        .fetch_one(&pool)
+        .await?;
+        let fence_foreign_keys: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pragma_foreign_key_list('ready_publication_fence_members')",
+        )
+        .fetch_one(&pool)
+        .await?;
+        if version != 3
+            || required != 4
+            || fence_tables != 3
+            || fence_columns != 16
+            || fence_foreign_keys != 3
+        {
             bail!("artifact scheduler migration post-validation failed")
         }
         let mut config = pool.acquire().await?;
@@ -1123,13 +1215,21 @@ impl ArtifactScheduler {
     pub async fn fence_ready_publications(
         &self,
         expected: &[(i64, Option<String>)],
-        operation_id: &str,
+        provenance: &ActivationFenceProvenance,
         ttl_secs: i64,
     ) -> Result<Option<ReadyPublicationFence>> {
+        let operation_id = provenance.operation_id();
         if expected.len() != 2
             || expected[0].0 == expected[1].0
-            || operation_id.trim().is_empty()
-            || operation_id.len() > 255
+            || [
+                &provenance.workspace,
+                &provenance.repo,
+                &provenance.branch,
+                &provenance.target,
+                &provenance.attempt_id,
+            ]
+            .iter()
+            .any(|value| value.trim().is_empty())
             || !(1..=3600).contains(&ttl_secs)
         {
             bail!("invalid Ready publication fence")
@@ -1138,30 +1238,41 @@ impl ArtifactScheduler {
         let mut c = self.immediate().await?;
         let result: Result<Option<ReadyPublicationFence>> = async {
             let now = db_now(&mut c).await?;
-            let existing: Option<(String, i64, i64, String)> = sqlx::query_as(
-                "SELECT token,generation,expires_at,state FROM ready_publication_fences WHERE operation_id=?",
+            let existing: Option<(String, i64, i64, String, String, String, String, String, String)> = sqlx::query_as(
+                "SELECT token,generation,expires_at,state,workspace,repo,branch,target,attempt_id
+                 FROM ready_publication_fences WHERE operation_id=?",
             )
-            .bind(operation_id)
+            .bind(&operation_id)
             .fetch_optional(&mut *c)
             .await?;
-            if let Some((_, _, expires_at, ref state)) = existing {
+            if let Some((_, _, expires_at, ref state, ref workspace, ref repo, ref branch, ref target, ref attempt)) = existing {
+                if workspace!=&provenance.workspace || repo!=&provenance.repo || branch!=&provenance.branch
+                    || target!=&provenance.target || attempt!=&provenance.attempt_id {
+                    bail!("activation operation provenance mismatch")
+                }
                 if expires_at > now && state == "held" {
                     return Ok(None);
                 }
             }
             for (id, manifest) in expected {
-                let current: Option<(String, Option<String>)> = sqlx::query_as(
-                    "SELECT state,manifest FROM artifact_jobs WHERE id=?",
+                let current: Option<(String, String, String, String, i64, String, Option<String>)> = sqlx::query_as(
+                    "SELECT workspace,repo,commit_oid,kind,format_version,state,manifest FROM artifact_jobs WHERE id=?",
                 )
                 .bind(id)
                 .fetch_optional(&mut *c)
                 .await?;
-                if !matches!(current, Some((state, current_manifest)) if state == "ready" && current_manifest == *manifest)
-                {
+                let Some((workspace, repo, commit, kind, format, state, current_manifest)) = current else { return Ok(None) };
+                if state != "ready" || current_manifest != *manifest || manifest.as_deref().is_none_or(|m| m.trim().is_empty())
+                    || workspace != provenance.workspace || repo != provenance.repo || commit != provenance.target {
                     return Ok(None);
                 }
+                if !matches!(kind.as_str(), "head" | "full_history") || format <= 0 { return Ok(None) }
             }
-            if let Some((ref old_token, old_generation, _, ref state)) = existing {
+            let typed: Vec<(String, i64)> = sqlx::query_as(
+                "SELECT kind,format_version FROM artifact_jobs WHERE id IN(?,?) ORDER BY kind",
+            ).bind(expected[0].0).bind(expected[1].0).fetch_all(&mut *c).await?;
+            if typed.len()!=2 || typed[0].0!="full_history" || typed[1].0!="head" || typed[0].1!=typed[1].1 { return Ok(None) }
+            if let Some((ref old_token, old_generation, _, ref state, ..)) = existing {
                 if state == "activation_unknown" {
                     let members: Vec<(i64, Option<String>)> = sqlx::query_as(
                         "SELECT artifact_id,manifest FROM ready_publication_fence_members
@@ -1183,18 +1294,19 @@ impl ArtifactScheduler {
                     .bind(now.saturating_add(ttl_secs))
                     .bind(old_token)
                     .bind(old_generation)
-                    .bind(operation_id)
+                    .bind(&operation_id)
                     .execute(&mut *c)
                     .await?;
                     return Ok(Some(ReadyPublicationFence::new(
                         old_token.clone(),
                         old_generation as u64,
-                        operation_id.to_owned(),
+                        operation_id.clone(),
+                        provenance.clone(),
                         expected.to_vec(),
                     )));
                 }
             }
-            if let Some((old_token, old_generation, _, _)) = existing {
+            if let Some((old_token, old_generation, ..)) = existing {
                 sqlx::query(
                     "DELETE FROM ready_publication_fence_members WHERE token=? AND generation=?",
                 )
@@ -1207,7 +1319,7 @@ impl ArtifactScheduler {
                 )
                 .bind(&old_token)
                 .bind(old_generation)
-                .bind(operation_id)
+                .bind(&operation_id)
                 .execute(&mut *c)
                 .await?;
             }
@@ -1228,12 +1340,17 @@ impl ArtifactScheduler {
             .await?;
             let expires_at = now.saturating_add(ttl_secs);
             sqlx::query(
-                "INSERT INTO ready_publication_fences(token,generation,operation_id,expires_at,state)
-                 VALUES(?,?,?,?, 'held')",
+                "INSERT INTO ready_publication_fences(token,generation,operation_id,workspace,repo,branch,target,attempt_id,expires_at,state)
+                 VALUES(?,?,?,?,?,?,?,?,?, 'held')",
             )
             .bind(&token)
             .bind(generation)
-            .bind(operation_id)
+            .bind(&operation_id)
+            .bind(&provenance.workspace)
+            .bind(&provenance.repo)
+            .bind(&provenance.branch)
+            .bind(&provenance.target)
+            .bind(&provenance.attempt_id)
             .bind(expires_at)
             .execute(&mut *c)
             .await?;
@@ -1252,7 +1369,8 @@ impl ArtifactScheduler {
             Ok(Some(ReadyPublicationFence::new(
                 token,
                 generation as u64,
-                operation_id.to_owned(),
+                operation_id,
+                provenance.clone(),
                 expected.to_vec(),
             )))
         }
@@ -1302,40 +1420,105 @@ impl ArtifactScheduler {
         finish(c, result).await
     }
 
-    pub async fn settle_activation_operation(&self, operation_id: &str) -> Result<()> {
-        if operation_id.trim().is_empty() {
-            bail!("activation operation id is empty")
+    pub async fn recover_activation_fence(
+        &self,
+        provenance: &ActivationFenceProvenance,
+    ) -> Result<Option<ReadyPublicationFence>> {
+        let operation_id = provenance.operation_id();
+        let row: Option<(String, i64)> = sqlx::query_as(
+            "SELECT token,generation FROM ready_publication_fences
+             WHERE operation_id=? AND workspace=? AND repo=? AND branch=? AND target=? AND attempt_id=?
+               AND state='activation_unknown'",
+        )
+        .bind(&operation_id)
+        .bind(&provenance.workspace)
+        .bind(&provenance.repo)
+        .bind(&provenance.branch)
+        .bind(&provenance.target)
+        .bind(&provenance.attempt_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some((token, generation)) = row else {
+            return Ok(None);
+        };
+        let expected = sqlx::query_as(
+            "SELECT artifact_id,manifest FROM ready_publication_fence_members
+             WHERE token=? AND generation=? ORDER BY artifact_id",
+        )
+        .bind(&token)
+        .bind(generation)
+        .fetch_all(&self.pool)
+        .await?;
+        if expected.len() != 2 {
+            bail!("activation recovery fence is not an exact pair")
         }
-        let mut c = self.immediate().await?;
-        let result: Result<()> = async {
-            let current: Option<(String, i64)> = sqlx::query_as(
-                "SELECT token,generation FROM ready_publication_fences WHERE operation_id=?",
+        Ok(Some(ReadyPublicationFence::new(
+            token,
+            generation as u64,
+            operation_id,
+            provenance.clone(),
+            expected,
+        )))
+    }
+
+    pub async fn unknown_activation_fences_page(
+        &self,
+        after_generation: Option<u64>,
+        limit: usize,
+    ) -> Result<UnknownActivationFencePage> {
+        if !(1..=128).contains(&limit) {
+            bail!("unknown activation fence page limit is invalid")
+        }
+        let after = after_generation.unwrap_or(0);
+        if after > i64::MAX as u64 {
+            bail!("unknown activation fence cursor is invalid")
+        }
+        let rows: Vec<(String, i64, String, String, String, String, String, String)> =
+            sqlx::query_as(
+                "SELECT token,generation,operation_id,workspace,repo,branch,target,attempt_id
+             FROM ready_publication_fences WHERE state='activation_unknown' AND generation>?
+             ORDER BY generation LIMIT ?",
             )
-            .bind(operation_id)
-            .fetch_optional(&mut *c)
+            .bind(after as i64)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
             .await?;
-            if let Some((token, generation)) = current {
-                sqlx::query(
-                    "DELETE FROM ready_publication_fence_members WHERE token=? AND generation=?",
-                )
-                .bind(&token)
-                .bind(generation)
-                .execute(&mut *c)
-                .await?;
-                sqlx::query(
-                    "DELETE FROM ready_publication_fences
-                     WHERE token=? AND generation=? AND operation_id=?",
-                )
-                .bind(&token)
-                .bind(generation)
-                .bind(operation_id)
-                .execute(&mut *c)
-                .await?;
+        let mut fences = Vec::with_capacity(rows.len());
+        for (token, generation, operation_id, workspace, repo, branch, target, attempt_id) in rows {
+            let provenance = ActivationFenceProvenance {
+                workspace,
+                repo,
+                branch,
+                target,
+                attempt_id,
+            };
+            if provenance.operation_id() != operation_id {
+                bail!("unknown activation fence operation provenance is invalid")
             }
-            Ok(())
+            let expected = sqlx::query_as(
+                "SELECT artifact_id,manifest FROM ready_publication_fence_members
+                 WHERE token=? AND generation=? ORDER BY artifact_id",
+            )
+            .bind(&token)
+            .bind(generation)
+            .fetch_all(&self.pool)
+            .await?;
+            if expected.len() != 2 {
+                bail!("unknown activation fence is not an exact pair")
+            }
+            fences.push(ReadyPublicationFence::new(
+                token,
+                generation as u64,
+                operation_id,
+                provenance,
+                expected,
+            ));
         }
-        .await;
-        finish(c, result).await
+        let next_generation = (fences.len() == limit).then(|| fences.last().unwrap().generation);
+        Ok(UnknownActivationFencePage {
+            fences,
+            next_generation,
+        })
     }
 
     pub async fn release_ready_publication_fence(
