@@ -13,9 +13,14 @@ For an unrelated force-push, the set difference naturally becomes the target's
 full closure. No client-visible provider credential, temporary ref, capability
 URL, or pin lifetime is involved.
 
-`PinnedBundleInstaller` is the trusted client/CAS boundary. It must authenticate
-the manifest, verify every artifact hash and length, and return a matching
-receipt. Its workspace provider adapter also supplies the exact approved
+The caller supplies only the desired manifest CAS hash, not mutable clone
+semantics. `PinnedBundleInstaller` is the trusted client/CAS boundary. It must
+authenticate the raw manifest, verify every artifact hash and length, and return
+`VerifiedPinnedBundle`: format, base, target, mode, branch, canonical origin,
+and exact ordered artifact descriptors. A stable length-delimited SHA-256 digest
+binds all returned semantics and descriptors and is recomputed before use, so a
+receipt for an artifact set containing multiple commits cannot be retargeted.
+The workspace provider adapter also supplies the exact approved
 canonical origin independently of the bundle; the bundle cannot authorize its
 own host or path. The top-up transaction then discards all installed control state except
 physical objects and the index, writes fresh allowlisted refs/config, clears

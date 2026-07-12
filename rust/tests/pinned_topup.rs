@@ -1,7 +1,8 @@
 use anyhow::{Result, bail};
 use ripclone::topup::{
-    BundleInstallFailure, BundleInstallReceipt, PinnedBundleInstaller, PinnedTopUpBundle,
-    TopUpMode, install_pinned_bundle,
+    BundleInstallFailure, PinnedArtifactDescriptor, PinnedArtifactKind, PinnedBundleInstaller,
+    PinnedBundleRequest, PinnedTopUpBundle, TopUpMode, VerifiedPinnedBundle, install_pinned_bundle,
+    pinned_bundle_semantic_digest,
 };
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -70,7 +71,13 @@ struct ArtifactInstaller {
     mutate: Option<fn(&Path) -> Result<()>>,
 }
 
-impl PinnedBundleInstaller for ArtifactInstaller {
+struct BoundInstaller<'a> {
+    inner: &'a ArtifactInstaller,
+    bundle: PinnedTopUpBundle,
+    digest_bundle: Option<PinnedTopUpBundle>,
+}
+
+impl PinnedBundleInstaller for BoundInstaller<'_> {
     fn approved_canonical_origin(&self) -> &str {
         "https://github.com/acme/repo.git"
     }
@@ -78,41 +85,82 @@ impl PinnedBundleInstaller for ArtifactInstaller {
     fn install_verified(
         &self,
         destination: &Path,
-        bundle: &PinnedTopUpBundle,
-    ) -> std::result::Result<BundleInstallReceipt, BundleInstallFailure> {
+        _: &PinnedBundleRequest,
+    ) -> std::result::Result<VerifiedPinnedBundle, BundleInstallFailure> {
         git(
             None,
             &[
                 "clone",
-                self.artifact.to_str().unwrap(),
+                self.inner.artifact.to_str().unwrap(),
                 destination.to_str().unwrap(),
             ],
         )
         .map_err(|_| BundleInstallFailure::Integrity)?;
         git(
             Some(destination),
-            &["checkout", "--detach", &bundle.target_commit],
+            &["checkout", "--detach", &self.bundle.target_commit],
         )
         .map_err(|_| BundleInstallFailure::Integrity)?;
-        if let Some(mutate) = self.mutate {
+        if let Some(mutate) = self.inner.mutate {
             mutate(destination).map_err(|_| BundleInstallFailure::Integrity)?;
         }
-        Ok(BundleInstallReceipt {
-            manifest_hash: self.manifest.clone(),
-            verified_artifacts: 2,
+        let artifacts = artifact_descriptors();
+        let digest_bundle = self.digest_bundle.as_ref().unwrap_or(&self.bundle);
+        Ok(VerifiedPinnedBundle {
+            manifest_hash: self.inner.manifest.clone(),
+            semantic_digest: pinned_bundle_semantic_digest(digest_bundle, &artifacts),
+            bundle: self.bundle.clone(),
+            artifacts,
         })
     }
 }
 
 fn bundle(base: &str, target: &str, mode: TopUpMode) -> PinnedTopUpBundle {
     PinnedTopUpBundle {
+        format_version: 1,
         base_commit: base.into(),
         target_commit: target.into(),
         branch: "main".into(),
         mode,
-        manifest_hash: "a".repeat(64),
         canonical_origin: "https://github.com/acme/repo.git".into(),
     }
+}
+
+fn artifact_descriptors() -> Vec<PinnedArtifactDescriptor> {
+    vec![
+        PinnedArtifactDescriptor {
+            kind: PinnedArtifactKind::BasePack,
+            hash: "b".repeat(64),
+            len: 100,
+        },
+        PinnedArtifactDescriptor {
+            kind: PinnedArtifactKind::OverlayPack,
+            hash: "c".repeat(64),
+            len: 200,
+        },
+    ]
+}
+
+fn request() -> PinnedBundleRequest {
+    PinnedBundleRequest {
+        manifest_hash: "a".repeat(64),
+    }
+}
+
+fn install_plan(
+    destination: &Path,
+    plan: PinnedTopUpBundle,
+    inner: &ArtifactInstaller,
+) -> Result<ripclone::topup::TopUpOutcome> {
+    install_pinned_bundle(
+        destination,
+        &request(),
+        &BoundInstaller {
+            inner,
+            bundle: plan,
+            digest_bundle: None,
+        },
+    )
 }
 
 fn installer(artifact: &tempfile::TempDir) -> ArtifactInstaller {
@@ -132,9 +180,9 @@ fn full_bundle_installs_exact_target_after_upstream_advances() {
     f.commit("newer", "newer");
     let root = tempfile::tempdir().unwrap();
     let destination = root.path().join("clone");
-    install_pinned_bundle(
+    install_plan(
         &destination,
-        &bundle(&base, &target, TopUpMode::Full),
+        bundle(&base, &target, TopUpMode::Full),
         &installer(&artifact),
     )
     .unwrap();
@@ -145,6 +193,40 @@ fn full_bundle_installs_exact_target_after_upstream_advances() {
         out(&destination, &["config", "branch.main.remote"]),
         "origin"
     );
+    assert_eq!(
+        out(&destination, &["config", "branch.main.merge"]),
+        "refs/heads/main"
+    );
+    assert_eq!(
+        out(&destination, &["config", "remote.origin.url"]),
+        "https://github.com/acme/repo.git"
+    );
+    assert_eq!(
+        out(&destination, &["rev-parse", "refs/remotes/origin/main"]),
+        target
+    );
+}
+
+#[test]
+fn reused_receipt_cannot_retarget_artifacts_containing_multiple_commits() {
+    let f = Fixture::new();
+    let base = f.commit("base", "base");
+    let target1 = f.commit("target1", "one");
+    let target2 = f.commit("target2", "two");
+    let artifact = f.artifact(); // One artifact set physically contains T1 + T2.
+    let install = installer(&artifact);
+    let stale_semantics = bundle(&base, &target1, TopUpMode::Full);
+    let retargeted = bundle(&base, &target2, TopUpMode::Full);
+    let bound = BoundInstaller {
+        inner: &install,
+        bundle: retargeted,
+        digest_bundle: Some(stale_semantics),
+    };
+    let root = tempfile::tempdir().unwrap();
+    let destination = root.path().join("clone");
+    let err = install_pinned_bundle(&destination, &request(), &bound).unwrap_err();
+    assert!(err.to_string().contains("semantic digest mismatch"));
+    assert!(!destination.exists());
 }
 
 #[test]
@@ -159,9 +241,9 @@ fn immutable_bundle_survives_force_push_without_contacting_upstream() {
     git(Some(&f.work), &["push", "--force", "origin", "HEAD:main"]).unwrap();
     let root = tempfile::tempdir().unwrap();
     let destination = root.path().join("clone");
-    install_pinned_bundle(
+    install_plan(
         &destination,
-        &bundle(&base, &target, TopUpMode::Full),
+        bundle(&base, &target, TopUpMode::Full),
         &installer(&artifact),
     )
     .unwrap();
@@ -177,9 +259,9 @@ fn head_bundle_has_exact_depth_one_semantics() {
     let artifact = f.artifact();
     let root = tempfile::tempdir().unwrap();
     let destination = root.path().join("clone");
-    install_pinned_bundle(
+    install_plan(
         &destination,
-        &bundle(&base, &target, TopUpMode::Head),
+        bundle(&base, &target, TopUpMode::Head),
         &installer(&artifact),
     )
     .unwrap();
@@ -200,9 +282,9 @@ fn sparse_clean_base_is_expanded_to_every_target_file() {
     install.mutate = Some(sparse);
     let root = tempfile::tempdir().unwrap();
     let destination = root.path().join("clone");
-    install_pinned_bundle(
+    install_plan(
         &destination,
-        &bundle(&base, &target, TopUpMode::Full),
+        bundle(&base, &target, TopUpMode::Full),
         &install,
     )
     .unwrap();
@@ -229,9 +311,9 @@ fn cached_control_state_and_future_execution_paths_are_discarded() {
     install.mutate = Some(poison);
     let root = tempfile::tempdir().unwrap();
     let destination = root.path().join("clone");
-    install_pinned_bundle(
+    install_plan(
         &destination,
-        &bundle(&target, &target, TopUpMode::Full),
+        bundle(&target, &target, TopUpMode::Full),
         &install,
     )
     .unwrap();
@@ -261,18 +343,60 @@ fn hostile_git_and_nested_object_symlinks_are_rejected() {
         symlink("/tmp", repo.join(".git/objects/evil-link"))?;
         Ok(())
     }
+    fn index_link(repo: &Path) -> Result<()> {
+        std::fs::remove_file(repo.join(".git/index"))?;
+        symlink("/tmp/evil-index", repo.join(".git/index"))?;
+        Ok(())
+    }
+    fn pack_link(repo: &Path) -> Result<()> {
+        let pack = std::fs::read_dir(repo.join(".git/objects/pack"))?
+            .find_map(|e| {
+                e.ok()
+                    .map(|e| e.path())
+                    .filter(|p| p.extension().is_some_and(|x| x == "pack"))
+            })
+            .ok_or_else(|| anyhow::anyhow!("no pack"))?;
+        std::fs::remove_file(&pack)?;
+        symlink("/tmp/evil-pack", pack)?;
+        Ok(())
+    }
+    fn alternate(repo: &Path) -> Result<()> {
+        std::fs::create_dir_all(repo.join(".git/objects/info"))?;
+        std::fs::write(repo.join(".git/objects/info/alternates"), "/tmp/objects")?;
+        Ok(())
+    }
+    fn http_alternate(repo: &Path) -> Result<()> {
+        std::fs::create_dir_all(repo.join(".git/objects/info"))?;
+        std::fs::write(
+            repo.join(".git/objects/info/http-alternates"),
+            "https://evil",
+        )?;
+        Ok(())
+    }
+    fn promisor(repo: &Path) -> Result<()> {
+        std::fs::write(repo.join(".git/objects/pack/evil.promisor"), "x")?;
+        Ok(())
+    }
     let f = Fixture::new();
     let target = f.commit("file", "ok");
     let artifact = f.artifact();
-    for mutate in [git_link as fn(&Path) -> Result<()>, object_link] {
+    for mutate in [
+        git_link as fn(&Path) -> Result<()>,
+        object_link,
+        index_link,
+        pack_link,
+        alternate,
+        http_alternate,
+        promisor,
+    ] {
         let mut install = installer(&artifact);
         install.mutate = Some(mutate);
         let root = tempfile::tempdir().unwrap();
         let destination = root.path().join("clone");
         assert!(
-            install_pinned_bundle(
+            install_plan(
                 &destination,
-                &bundle(&target, &target, TopUpMode::Full),
+                bundle(&target, &target, TopUpMode::Full),
                 &install
             )
             .is_err()
@@ -296,9 +420,9 @@ fn wrong_base_wrong_target_and_bad_receipt_fail_closed() {
         let mut install = installer(&artifact);
         install.manifest = manifest;
         assert!(
-            install_pinned_bundle(
+            install_plan(
                 &destination,
-                &bundle(&base, &requested, TopUpMode::Full),
+                bundle(&base, &requested, TopUpMode::Full),
                 &install
             )
             .is_err()
@@ -348,9 +472,9 @@ fn incomplete_full_closure_is_rejected() {
         Ok(())
     });
     assert!(
-        install_pinned_bundle(
+        install_plan(
             &destination,
-            &bundle(&base, &target, TopUpMode::Full),
+            bundle(&base, &target, TopUpMode::Full),
             &install
         )
         .is_err()
@@ -369,12 +493,11 @@ fn installer_auth_expiry_or_unavailable_failure_is_redacted_and_atomic() {
         fn install_verified(
             &self,
             _: &Path,
-            _: &PinnedTopUpBundle,
-        ) -> std::result::Result<BundleInstallReceipt, BundleInstallFailure> {
+            _: &PinnedBundleRequest,
+        ) -> std::result::Result<VerifiedPinnedBundle, BundleInstallFailure> {
             Err(self.0)
         }
     }
-    let oid = "a".repeat(40);
     for (reason, message) in [
         (BundleInstallFailure::Unauthorized, "authorization denied"),
         (BundleInstallFailure::Expired, "plan expired"),
@@ -387,12 +510,7 @@ fn installer_auth_expiry_or_unavailable_failure_is_redacted_and_atomic() {
     ] {
         let root = tempfile::tempdir().unwrap();
         let destination = root.path().join("clone");
-        let err = install_pinned_bundle(
-            &destination,
-            &bundle(&oid, &oid, TopUpMode::Full),
-            &Failing(reason),
-        )
-        .unwrap_err();
+        let err = install_pinned_bundle(&destination, &request(), &Failing(reason)).unwrap_err();
         assert!(err.to_string().contains(message));
         assert!(!destination.exists());
     }
@@ -400,21 +518,10 @@ fn installer_auth_expiry_or_unavailable_failure_is_redacted_and_atomic() {
 
 #[test]
 fn arbitrary_transport_metadata_is_rejected_before_installer() {
-    struct PanicInstaller;
-    impl PinnedBundleInstaller for PanicInstaller {
-        fn approved_canonical_origin(&self) -> &str {
-            "https://github.com/acme/repo.git"
-        }
-
-        fn install_verified(
-            &self,
-            _: &Path,
-            _: &PinnedTopUpBundle,
-        ) -> std::result::Result<BundleInstallReceipt, BundleInstallFailure> {
-            panic!("installer must not run")
-        }
-    }
-    let oid = "a".repeat(40);
+    let f = Fixture::new();
+    let oid = f.commit("file", "ok");
+    let artifact = f.artifact();
+    let install = installer(&artifact);
     for origin in [
         "file:///tmp/repo",
         "ssh://git@example.com/repo",
@@ -424,18 +531,18 @@ fn arbitrary_transport_metadata_is_rejected_before_installer() {
         let mut plan = bundle(&oid, &oid, TopUpMode::Full);
         plan.canonical_origin = origin.into();
         let root = tempfile::tempdir().unwrap();
-        assert!(install_pinned_bundle(root.path().join("clone"), &plan, &PanicInstaller).is_err());
+        assert!(install_plan(&root.path().join("clone"), plan, &install).is_err());
     }
     let mut plan = bundle(&oid, &oid, TopUpMode::Full);
     plan.branch = "main\"]\n[credential \"evil".into();
     let root = tempfile::tempdir().unwrap();
-    assert!(install_pinned_bundle(root.path().join("clone"), &plan, &PanicInstaller).is_err());
+    assert!(install_plan(&root.path().join("clone"), plan, &install).is_err());
 }
 
 #[test]
 fn concurrent_destination_is_never_replaced() {
     struct Racing<'a> {
-        inner: &'a ArtifactInstaller,
+        inner: BoundInstaller<'a>,
         final_path: PathBuf,
     }
     impl PinnedBundleInstaller for Racing<'_> {
@@ -445,9 +552,9 @@ fn concurrent_destination_is_never_replaced() {
         fn install_verified(
             &self,
             destination: &Path,
-            bundle: &PinnedTopUpBundle,
-        ) -> std::result::Result<BundleInstallReceipt, BundleInstallFailure> {
-            let receipt = self.inner.install_verified(destination, bundle)?;
+            request: &PinnedBundleRequest,
+        ) -> std::result::Result<VerifiedPinnedBundle, BundleInstallFailure> {
+            let receipt = self.inner.install_verified(destination, request)?;
             std::fs::create_dir(&self.final_path).map_err(|_| BundleInstallFailure::Integrity)?;
             std::fs::write(self.final_path.join("winner"), "keep")
                 .map_err(|_| BundleInstallFailure::Integrity)?;
@@ -461,17 +568,14 @@ fn concurrent_destination_is_never_replaced() {
     let root = tempfile::tempdir().unwrap();
     let destination = root.path().join("clone");
     let racing = Racing {
-        inner: &install,
+        inner: BoundInstaller {
+            inner: &install,
+            bundle: bundle(&target, &target, TopUpMode::Full),
+            digest_bundle: None,
+        },
         final_path: destination.clone(),
     };
-    assert!(
-        install_pinned_bundle(
-            &destination,
-            &bundle(&target, &target, TopUpMode::Full),
-            &racing
-        )
-        .is_err()
-    );
+    assert!(install_pinned_bundle(&destination, &request(), &racing).is_err());
     assert_eq!(
         std::fs::read_to_string(destination.join("winner")).unwrap(),
         "keep"

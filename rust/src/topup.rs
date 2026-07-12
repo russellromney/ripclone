@@ -16,6 +16,7 @@
 //! provider credentials are discarded rather than interpreted.
 
 use anyhow::{Context, Result, bail};
+use sha2::{Digest, Sha256};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::ffi::CString;
 use std::path::Path;
@@ -31,20 +32,43 @@ pub enum TopUpMode {
 /// manifest whose artifacts the installer verifies.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PinnedTopUpBundle {
+    pub format_version: u32,
     pub base_commit: String,
     pub target_commit: String,
     pub branch: String,
     pub mode: TopUpMode,
-    pub manifest_hash: String,
     /// Canonical provider URL written for future user-initiated fetches. It is
     /// metadata only and is never contacted during top-up.
     pub canonical_origin: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BundleInstallReceipt {
+pub struct PinnedBundleRequest {
     pub manifest_hash: String,
-    pub verified_artifacts: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinnedArtifactKind {
+    BasePack,
+    OverlayPack,
+    Index,
+    CheckoutMetadata,
+    WorktreeArchive,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinnedArtifactDescriptor {
+    pub kind: PinnedArtifactKind,
+    pub hash: String,
+    pub len: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedPinnedBundle {
+    pub manifest_hash: String,
+    pub semantic_digest: String,
+    pub bundle: PinnedTopUpBundle,
+    pub artifacts: Vec<PinnedArtifactDescriptor>,
 }
 
 pub trait PinnedBundleInstaller {
@@ -55,8 +79,8 @@ pub trait PinnedBundleInstaller {
     fn install_verified(
         &self,
         destination: &Path,
-        bundle: &PinnedTopUpBundle,
-    ) -> std::result::Result<BundleInstallReceipt, BundleInstallFailure>;
+        request: &PinnedBundleRequest,
+    ) -> std::result::Result<VerifiedPinnedBundle, BundleInstallFailure>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,10 +113,10 @@ pub struct TopUpOutcome {
 
 pub fn install_pinned_bundle(
     target: impl AsRef<Path>,
-    bundle: &PinnedTopUpBundle,
+    request: &PinnedBundleRequest,
     installer: &dyn PinnedBundleInstaller,
 ) -> Result<TopUpOutcome> {
-    validate_bundle(bundle, installer.approved_canonical_origin())?;
+    validate_hash("requested manifest", &request.manifest_hash)?;
     let target = target.as_ref();
     if std::fs::symlink_metadata(target).is_ok() {
         bail!("clone destination already exists: {}", target.display());
@@ -109,35 +133,40 @@ pub fn install_pinned_bundle(
         .context("create pinned-bundle staging")?;
     let staging = temp.path().join("repo");
 
-    let receipt = installer
-        .install_verified(&staging, bundle)
+    let verified = installer
+        .install_verified(&staging, request)
         .map_err(|reason| {
             anyhow::anyhow!("authenticated pinned-bundle installation failed: {reason}")
         })?;
-    if receipt.manifest_hash != bundle.manifest_hash || receipt.verified_artifacts == 0 {
-        bail!("pinned-bundle installer returned an invalid verification receipt");
+    if verified.manifest_hash != request.manifest_hash {
+        bail!("verified bundle does not match the requested manifest");
+    }
+    validate_bundle(&verified.bundle, installer.approved_canonical_origin())?;
+    validate_artifacts(&verified.artifacts)?;
+    if verified.semantic_digest
+        != pinned_bundle_semantic_digest(&verified.bundle, &verified.artifacts)
+    {
+        bail!("verified bundle semantic digest mismatch");
     }
 
     normalize_fresh_control_dir(&staging)?;
-    finalize_and_verify(&staging, bundle)?;
+    finalize_and_verify(&staging, &verified.bundle)?;
     atomic_rename_noreplace(&staging, target).context("publish verified pinned bundle")?;
     Ok(TopUpOutcome {
-        target_commit: bundle.target_commit.to_ascii_lowercase(),
-        branch: bundle.branch.clone(),
-        mode: bundle.mode,
+        target_commit: verified.bundle.target_commit.to_ascii_lowercase(),
+        branch: verified.bundle.branch.clone(),
+        mode: verified.bundle.mode,
     })
 }
 
 fn validate_bundle(bundle: &PinnedTopUpBundle, approved_origin: &str) -> Result<()> {
+    if bundle.format_version != 1 {
+        bail!("unsupported pinned-bundle format version");
+    }
     validate_oid("base_commit", &bundle.base_commit)?;
     validate_oid("target_commit", &bundle.target_commit)?;
     if bundle.base_commit.len() != bundle.target_commit.len() {
         bail!("base and target object formats differ");
-    }
-    if bundle.manifest_hash.len() != 64
-        || !bundle.manifest_hash.bytes().all(|b| b.is_ascii_hexdigit())
-    {
-        bail!("manifest_hash must be a full SHA-256 CAS hash");
     }
     if bundle.branch.is_empty()
         || !bundle
@@ -170,6 +199,62 @@ fn validate_bundle(bundle: &PinnedTopUpBundle, approved_origin: &str) -> Result<
         bail!("canonical origin is not the workspace-approved HTTPS provider origin");
     }
     Ok(())
+}
+
+fn validate_artifacts(artifacts: &[PinnedArtifactDescriptor]) -> Result<()> {
+    if artifacts.is_empty() {
+        bail!("verified bundle has no artifact descriptors");
+    }
+    for artifact in artifacts {
+        validate_hash("artifact", &artifact.hash)?;
+        if artifact.len == 0 {
+            bail!("verified bundle contains a zero-length artifact");
+        }
+    }
+    Ok(())
+}
+
+fn validate_hash(label: &str, value: &str) -> Result<()> {
+    if value.len() != 64 || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!("{label} must be a full SHA-256 hash");
+    }
+    Ok(())
+}
+
+/// Stable length-delimited binding over all authenticated semantics and exact
+/// artifact descriptors. Any field, order, hash, or length change alters it.
+pub fn pinned_bundle_semantic_digest(
+    bundle: &PinnedTopUpBundle,
+    artifacts: &[PinnedArtifactDescriptor],
+) -> String {
+    fn field(hasher: &mut Sha256, bytes: &[u8]) {
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(b"ripclone-pinned-bundle-semantics-v1\0");
+    hasher.update(bundle.format_version.to_be_bytes());
+    field(&mut hasher, bundle.base_commit.as_bytes());
+    field(&mut hasher, bundle.target_commit.as_bytes());
+    field(&mut hasher, bundle.branch.as_bytes());
+    hasher.update([match bundle.mode {
+        TopUpMode::Head => 1,
+        TopUpMode::Full => 2,
+    }]);
+    field(&mut hasher, bundle.canonical_origin.as_bytes());
+    hasher.update((artifacts.len() as u64).to_be_bytes());
+    for artifact in artifacts {
+        hasher.update([match artifact.kind {
+            PinnedArtifactKind::BasePack => 1,
+            PinnedArtifactKind::OverlayPack => 2,
+            PinnedArtifactKind::Index => 3,
+            PinnedArtifactKind::CheckoutMetadata => 4,
+            PinnedArtifactKind::WorktreeArchive => 5,
+        }]);
+        field(&mut hasher, artifact.hash.as_bytes());
+        hasher.update(artifact.len.to_be_bytes());
+    }
+    hex::encode(hasher.finalize())
 }
 
 fn validate_oid(label: &str, value: &str) -> Result<()> {
