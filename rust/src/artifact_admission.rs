@@ -2354,6 +2354,65 @@ CREATE TABLE ready_publication_fence_members(
     }
 
     #[tokio::test]
+    async fn startup_rejects_sequence_behind_live_fence_without_mutation() {
+        let f = Fixture::new().await;
+        f.add("attempt-1").await;
+        f.make_required_ready("head", "history").await;
+        let head = f
+            .scheduler
+            .get_by_key(&f.key(ArtifactKind::Head))
+            .await
+            .unwrap()
+            .unwrap();
+        let history = f
+            .scheduler
+            .get_by_key(&f.key(ArtifactKind::FullHistory))
+            .await
+            .unwrap()
+            .unwrap();
+        let _fence = f
+            .scheduler
+            .fence_ready_publications(
+                &[
+                    (head.id, head.manifest.clone()),
+                    (history.id, history.manifest.clone()),
+                ],
+                &f.provenance("sequence-floor"),
+                60,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let pool = sqlx::SqlitePool::connect(&f.db_url).await.unwrap();
+        sqlx::query("UPDATE ready_publication_fence_sequence SET generation=0 WHERE id=1")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let error = match ArtifactScheduler::open(&f.db_url, SchedulerLimits::default()).await {
+            Ok(_) => panic!("startup accepted a sequence behind live fence state"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("sequence is behind"));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT generation FROM ready_publication_fence_sequence WHERE id=1",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM ready_publication_fences")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn released_v2_migrates_atomically_to_union_v6_without_changing_jobs() {
         let f = Fixture::new().await;
         f.add("attempt-1").await;

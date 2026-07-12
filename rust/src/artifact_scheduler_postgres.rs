@@ -321,8 +321,8 @@ async fn validate_postgres_v6_fences(tx: &mut Transaction<'_, Postgres>) -> Resu
         bail!("postgres v6 Ready fence constraints/indexes differ")
     }
     let fks:i64=sqlx::query_scalar("SELECT count(*) FROM pg_constraint c WHERE c.conrelid='ready_publication_fence_members'::regclass AND c.contype='f' AND c.confdeltype='c' AND ((pg_get_constraintdef(c.oid)='FOREIGN KEY (token, generation) REFERENCES ready_publication_fences(token, generation) ON DELETE CASCADE') OR (pg_get_constraintdef(c.oid)='FOREIGN KEY (artifact_id) REFERENCES artifact_jobs(id) ON DELETE CASCADE'))").fetch_one(&mut **tx).await?;
-    let checks:i64=sqlx::query_scalar("SELECT count(*) FROM pg_constraint c WHERE (c.conrelid='ready_publication_fence_sequence'::regclass AND c.contype='c' AND (pg_get_constraintdef(c.oid)='CHECK ((id = 1))' OR pg_get_constraintdef(c.oid)='CHECK ((generation >= 0))')) OR (c.conrelid='ready_publication_fences'::regclass AND c.contype='c' AND (pg_get_constraintdef(c.oid)='CHECK ((generation > 0))' OR pg_get_constraintdef(c.oid) LIKE '%held%activation_unknown%')) OR (c.conrelid='ready_publication_fence_members'::regclass AND c.contype='c' AND pg_get_constraintdef(c.oid)='CHECK ((generation > 0))')").fetch_one(&mut **tx).await?;
-    let manifest_check:i64=sqlx::query_scalar("SELECT count(*) FROM pg_constraint c WHERE c.conrelid='ready_publication_fence_members'::regclass AND c.contype='c' AND pg_get_constraintdef(c.oid) ILIKE '%length%manifest%> 0%'").fetch_one(&mut **tx).await?;
+    let checks:i64=sqlx::query_scalar("SELECT count(*) FROM pg_constraint c WHERE (c.conrelid='ready_publication_fence_sequence'::regclass AND c.contype='c' AND pg_get_constraintdef(c.oid) IN('CHECK ((id = 1))','CHECK ((generation >= 0))')) OR (c.conrelid='ready_publication_fences'::regclass AND c.contype='c' AND (pg_get_constraintdef(c.oid)='CHECK ((generation > 0))' OR regexp_replace(lower(pg_get_constraintdef(c.oid)),'[[:space:]]','','g')='check((state=any(array[''held''::text,''activation_unknown''::text])))')) OR (c.conrelid='ready_publication_fence_members'::regclass AND c.contype='c' AND pg_get_constraintdef(c.oid)='CHECK ((generation > 0))')").fetch_one(&mut **tx).await?;
+    let manifest_check:i64=sqlx::query_scalar("SELECT count(*) FROM pg_constraint c WHERE c.conrelid='ready_publication_fence_members'::regclass AND c.contype='c' AND pg_get_constraintdef(c.oid)='CHECK ((length(TRIM(BOTH FROM manifest)) > 0))'").fetch_one(&mut **tx).await?;
     if fks != 2 || checks != 5 || manifest_check != 1 {
         bail!("postgres v6 Ready fence FK/check definitions differ")
     }
@@ -332,6 +332,13 @@ async fn validate_postgres_v6_fences(tx: &mut Transaction<'_, Postgres>) -> Resu
             .await?;
     if sequence.len() != 1 || sequence[0].0 != 1 || sequence[0].1 < 0 {
         bail!("postgres v6 Ready fence sequence is invalid")
+    }
+    let max_generation: i64 =
+        sqlx::query_scalar("SELECT COALESCE(MAX(generation),0) FROM ready_publication_fences")
+            .fetch_one(&mut **tx)
+            .await?;
+    if sequence[0].1 < max_generation {
+        bail!("postgres v6 Ready fence sequence is behind persisted generations")
     }
     let fences:Vec<(String,i64,String,String,String,String,String,String,i64,String)>=sqlx::query_as("SELECT token,generation,operation_id,workspace,repo,branch,target,attempt_id,expires_at,state FROM ready_publication_fences").fetch_all(&mut **tx).await?;
     let members:Vec<(String,i64,i64,String,Option<String>,Option<String>,Option<String>,Option<String>,Option<i64>,Option<String>,Option<String>)>=sqlx::query_as("SELECT m.token,m.generation,m.artifact_id,m.manifest,j.workspace,j.repo,j.commit_oid,j.kind,j.format_version,j.state,j.manifest FROM ready_publication_fence_members m LEFT JOIN artifact_jobs j ON j.id=m.artifact_id ORDER BY m.token,m.artifact_id").fetch_all(&mut **tx).await?;

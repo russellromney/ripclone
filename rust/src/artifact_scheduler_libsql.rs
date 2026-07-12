@@ -1464,6 +1464,120 @@ async fn validate_schema(
     if invalid_control != 0 {
         bail!("libsql artifact scheduler contains invalid control state")
     }
+    validate_libsql_v6_fence_state(c).await?;
+    Ok(())
+}
+
+async fn validate_libsql_v6_fence_state(c: &Connection) -> Result<()> {
+    let mut sequence_rows = c
+        .query(
+            "SELECT id,generation FROM ready_publication_fence_sequence ORDER BY id",
+            (),
+        )
+        .await?;
+    let mut sequence = Vec::new();
+    while let Some(row) = sequence_rows.next().await? {
+        sequence.push((row.get::<i64>(0)?, row.get::<i64>(1)?));
+    }
+    if sequence.len() != 1 || sequence[0].0 != 1 || sequence[0].1 < 0 {
+        bail!("libsql Ready fence sequence is not the exact singleton")
+    }
+    let max_generation = one_i64(
+        c,
+        "SELECT COALESCE(MAX(generation),0) FROM ready_publication_fences",
+        vec![],
+    )
+    .await?;
+    if sequence[0].1 < max_generation {
+        bail!("libsql Ready fence sequence is behind persisted generations")
+    }
+
+    let mut fence_rows = c.query("SELECT token,generation,operation_id,workspace,repo,branch,target,attempt_id,expires_at,state FROM ready_publication_fences ORDER BY generation,token",()).await?;
+    let mut fences = Vec::new();
+    while let Some(row) = fence_rows.next().await? {
+        fences.push((
+            row.get::<String>(0)?,
+            row.get::<i64>(1)?,
+            row.get::<String>(2)?,
+            row.get::<String>(3)?,
+            row.get::<String>(4)?,
+            row.get::<String>(5)?,
+            row.get::<String>(6)?,
+            row.get::<String>(7)?,
+            row.get::<i64>(8)?,
+            row.get::<String>(9)?,
+        ));
+    }
+    let mut seen_tokens = std::collections::HashSet::new();
+    let mut seen_generations = std::collections::HashSet::new();
+    for (token, generation, operation, workspace, repo, branch, target, attempt, expires, state) in
+        fences
+    {
+        let provenance = ActivationFenceProvenance {
+            workspace: workspace.clone(),
+            repo: repo.clone(),
+            branch: branch.clone(),
+            target: target.clone(),
+            attempt_id: attempt.clone(),
+        };
+        if token.len() != 64
+            || !token
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            || generation <= 0
+            || !seen_tokens.insert(token.clone())
+            || !seen_generations.insert(generation)
+            || operation != provenance.operation_id()
+            || expires <= 0
+            || !matches!(state.as_str(), "held" | "activation_unknown")
+            || [&workspace, &repo, &branch, &attempt]
+                .iter()
+                .any(|v| v.trim().is_empty())
+            || validate_resolved_commit(&target).is_err()
+        {
+            bail!("libsql Ready fence provenance/state is invalid")
+        }
+        let mut rows=c.query("SELECT m.generation,m.artifact_id,m.manifest,j.workspace,j.repo,j.commit_oid,j.kind,j.format_version,j.state,j.manifest FROM ready_publication_fence_members m LEFT JOIN artifact_jobs j ON j.id=m.artifact_id WHERE m.token=? ORDER BY m.artifact_id",[token.clone()]).await?;
+        let mut members = Vec::new();
+        while let Some(row) = rows.next().await? {
+            members.push((
+                row.get::<i64>(0)?,
+                row.get::<i64>(1)?,
+                row.get::<String>(2)?,
+                row.get::<Option<String>>(3)?,
+                row.get::<Option<String>>(4)?,
+                row.get::<Option<String>>(5)?,
+                row.get::<Option<String>>(6)?,
+                row.get::<Option<i64>>(7)?,
+                row.get::<Option<String>>(8)?,
+                row.get::<Option<String>>(9)?,
+            ));
+        }
+        let mut kinds = members
+            .iter()
+            .filter_map(|m| m.6.as_deref())
+            .collect::<Vec<_>>();
+        kinds.sort();
+        if members.len() != 2
+            || kinds != ["full_history", "head"]
+            || members[0].7 != members[1].7
+            || members.iter().any(|m| {
+                m.0 != generation
+                    || m.2.trim().is_empty()
+                    || m.3.as_deref() != Some(workspace.as_str())
+                    || m.4.as_deref() != Some(repo.as_str())
+                    || m.5.as_deref() != Some(target.as_str())
+                    || m.8.as_deref() != Some("ready")
+                    || m.9.as_deref() != Some(m.2.as_str())
+            })
+        {
+            bail!("libsql Ready fence is not an exact Ready Head+Full pair")
+        }
+    }
+    let orphan=one_i64(c,"SELECT count(*) FROM ready_publication_fence_members m LEFT JOIN ready_publication_fences f ON f.token=m.token AND f.generation=m.generation WHERE f.token IS NULL",vec![]).await?;
+    if orphan != 0 {
+        bail!("libsql Ready fence contains orphan members")
+    }
     Ok(())
 }
 async fn reject_rust_blank(c: &Connection, sql: &str, field: &str) -> Result<()> {
@@ -2710,6 +2824,100 @@ mod tests {
         assert!(a.mark_activation_unknown(&fence, 1).await.unwrap());
         tokio::time::sleep(Duration::from_secs(2)).await;
         assert!(a.recover_activation_fence(&p).await.unwrap().is_some());
+        let (_, generation, operation, _) = fence.parts();
+        c.execute(
+            "UPDATE ready_publication_fence_sequence SET generation=0 WHERE id=1",
+            (),
+        )
+        .await
+        .unwrap();
+        assert!(startup_error(&s.url).await.contains("sequence is behind"));
+        c.execute(
+            "UPDATE ready_publication_fence_sequence SET generation=? WHERE id=1",
+            [generation as i64],
+        )
+        .await
+        .unwrap();
+        c.execute(
+            "UPDATE ready_publication_fences SET operation_id='forged'",
+            (),
+        )
+        .await
+        .unwrap();
+        assert!(startup_error(&s.url).await.contains("provenance/state"));
+        c.execute(
+            "UPDATE ready_publication_fences SET operation_id=?",
+            [operation.to_owned()],
+        )
+        .await
+        .unwrap();
+        c.execute(
+            "UPDATE ready_publication_fences SET attempt_id='forged-attempt'",
+            (),
+        )
+        .await
+        .unwrap();
+        assert!(startup_error(&s.url).await.contains("provenance/state"));
+        c.execute(
+            "UPDATE ready_publication_fences SET attempt_id=?",
+            [p.attempt_id.clone()],
+        )
+        .await
+        .unwrap();
+        c.execute(
+            "DELETE FROM ready_publication_fence_members WHERE artifact_id=?",
+            [head],
+        )
+        .await
+        .unwrap();
+        assert!(
+            startup_error(&s.url)
+                .await
+                .contains("exact Ready Head+Full pair")
+        );
+        c.execute("INSERT INTO ready_publication_fence_members(token,generation,artifact_id,manifest) SELECT token,generation,?,'head-manifest' FROM ready_publication_fences",[head]).await.unwrap();
+        c.execute("UPDATE artifact_jobs SET kind='files' WHERE id=?", [head])
+            .await
+            .unwrap();
+        assert!(
+            startup_error(&s.url)
+                .await
+                .contains("exact Ready Head+Full pair")
+        );
+        c.execute("UPDATE artifact_jobs SET kind='head' WHERE id=?", [head])
+            .await
+            .unwrap();
+        c.execute(
+            "UPDATE artifact_jobs SET workspace='forged' WHERE id=?",
+            [head],
+        )
+        .await
+        .unwrap();
+        assert!(
+            startup_error(&s.url)
+                .await
+                .contains("exact Ready Head+Full pair")
+        );
+        c.execute("UPDATE artifact_jobs SET workspace='w' WHERE id=?", [head])
+            .await
+            .unwrap();
+        c.execute(
+            "UPDATE artifact_jobs SET manifest='wrong' WHERE id=?",
+            [head],
+        )
+        .await
+        .unwrap();
+        assert!(
+            startup_error(&s.url)
+                .await
+                .contains("exact Ready Head+Full pair")
+        );
+        c.execute(
+            "UPDATE artifact_jobs SET manifest='head-manifest' WHERE id=?",
+            [head],
+        )
+        .await
+        .unwrap();
         assert!(
             a.live_scheduler_roots_page(None, 512)
                 .await

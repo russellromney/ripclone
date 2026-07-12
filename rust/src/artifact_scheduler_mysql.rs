@@ -262,6 +262,13 @@ async fn preflight_mysql_transition(connection: &mut MySqlConnection, version: i
 }
 
 async fn preflight_mysql_v6_transition(c: &mut MySqlConnection, marker: i64) -> Result<()> {
+    // The transition marker is provenance, not permission to repair a corrupt
+    // core. Prove the exact transport-v5 schema before touching fence DDL.
+    {
+        let mut tx = c.begin().await?;
+        MysqlArtifactScheduler::validate_schema(&mut tx).await?;
+        tx.rollback().await?;
+    }
     let core:i64=sqlx::query_scalar("SELECT count(*) FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name IN('artifact_scheduler_schema','artifact_jobs','branch_observations','artifact_observations','artifact_consumers','artifact_transport_leases','artifact_base_retention','artifact_gc_sweep','scheduler_state')").fetch_one(&mut *c).await?;
     if core != 9 {
         bail!("mysql v6 transition is missing the exact v5 core")
@@ -306,15 +313,161 @@ async fn preflight_mysql_v6_transition(c: &mut MySqlConnection, marker: i64) -> 
             }
         }
     }
-    if fences == 3 {
-        let sequence: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM ready_publication_fence_sequence WHERE id=1 AND generation>=0",
+    validate_mysql_v6_prefix(c, fences).await?;
+    if fences >= 1 {
+        let rows: Vec<(i64, i64)> =
+            sqlx::query_as("SELECT id,generation FROM ready_publication_fence_sequence")
+                .fetch_all(&mut *c)
+                .await?;
+        if rows.len() > 1
+            || rows
+                .first()
+                .is_some_and(|(id, generation)| *id != 1 || *generation < 0)
+            || (marker == V5_TO_V6_VALIDATED && rows.len() != 1)
+        {
+            bail!("mysql v6 transition contains invalid fence sequence state")
+        }
+    }
+    if fences >= 2 {
+        let live: i64 = sqlx::query_scalar("SELECT count(*) FROM ready_publication_fences")
+            .fetch_one(&mut *c)
+            .await?;
+        if live != 0 {
+            bail!("mysql v6 transition contains unprovenanced live fences")
+        }
+    }
+    if fences >= 3 {
+        let members: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM ready_publication_fence_members")
+                .fetch_one(&mut *c)
+                .await?;
+        if members != 0 {
+            bail!("mysql v6 transition contains unprovenanced fence members")
+        }
+    }
+    Ok(())
+}
+
+async fn validate_mysql_v6_prefix(c: &mut MySqlConnection, count: i64) -> Result<()> {
+    let names = [
+        "ready_publication_fence_sequence",
+        "ready_publication_fences",
+        "ready_publication_fence_members",
+    ];
+    for (position, table) in names.iter().enumerate() {
+        let exists:i64=sqlx::query_scalar("SELECT count(*) FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name=? AND engine='InnoDB' AND table_collation='utf8mb4_bin'").bind(table).fetch_one(&mut *c).await?;
+        if (position as i64) < count {
+            if exists != 1 {
+                bail!("mysql v6 transition fence prefix is not canonical")
+            }
+        } else if exists != 0 {
+            bail!("mysql v6 transition fence DDL is not a prefix")
+        }
+    }
+    let expected: &[(&str, &str)] = &[
+        (
+            "ready_publication_fence_sequence",
+            "id:smallint:NO:|generation:bigint:NO:",
+        ),
+        (
+            "ready_publication_fences",
+            "token:varchar(64):NO:utf8mb4_bin|generation:bigint:NO:|operation_id:varchar(96):NO:utf8mb4_bin|workspace:varchar(128):NO:utf8mb4_bin|repo:varchar(320):NO:utf8mb4_bin|branch:varchar(191):NO:utf8mb4_bin|target:varchar(64):NO:utf8mb4_bin|attempt_id:varchar(255):NO:utf8mb4_bin|expires_at:bigint:NO:|state:varchar(24):NO:utf8mb4_bin",
+        ),
+        (
+            "ready_publication_fence_members",
+            "token:varchar(64):NO:utf8mb4_bin|generation:bigint:NO:|artifact_id:bigint:NO:|manifest:longtext:NO:utf8mb4_bin",
+        ),
+    ];
+    for (position, (table, want)) in expected.iter().enumerate().take(count as usize) {
+        let rows:Vec<(String,String,String,Option<String>,String,Option<String>)>=sqlx::query_as("SELECT column_name,lower(column_type),is_nullable,column_default,extra,collation_name FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name=? ORDER BY ordinal_position").bind(table).fetch_all(&mut *c).await?;
+        if rows.iter().any(|r| r.3.is_some() || !r.4.is_empty()) {
+            bail!("mysql v6 transition column default/extra differs")
+        }
+        let actual = rows
+            .iter()
+            .map(|r| format!("{}:{}:{}:{}", r.0, r.1, r.2, r.5.as_deref().unwrap_or("")))
+            .collect::<Vec<_>>()
+            .join("|");
+        if actual != *want {
+            bail!("mysql v6 transition column shape differs: {table}")
+        }
+        let constraints:i64=sqlx::query_scalar("SELECT count(*) FROM information_schema.table_constraints WHERE constraint_schema=DATABASE() AND table_name=?").bind(table).fetch_one(&mut *c).await?;
+        let indexes:i64=sqlx::query_scalar("SELECT count(DISTINCT index_name) FROM information_schema.statistics WHERE table_schema=DATABASE() AND table_name=?").bind(table).fetch_one(&mut *c).await?;
+        let (want_constraints, want_indexes) = match position {
+            0 => (3, 1),
+            1 => (6, 5),
+            _ => (4, 3),
+        };
+        if constraints != want_constraints || indexes != want_indexes {
+            bail!("mysql v6 transition constraint/index inventory differs: {table}")
+        }
+        let actual_indexes: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT non_unique,GROUP_CONCAT(column_name ORDER BY seq_in_index)
+             FROM information_schema.statistics WHERE table_schema=DATABASE() AND table_name=?
+             GROUP BY index_name,non_unique ORDER BY non_unique,GROUP_CONCAT(column_name ORDER BY seq_in_index)",
         )
-        .fetch_one(&mut *c)
+        .bind(table)
+        .fetch_all(&mut *c)
         .await?;
-        let invalid:i64=sqlx::query_scalar("SELECT (SELECT count(*) FROM ready_publication_fences)+(SELECT count(*) FROM ready_publication_fence_members)").fetch_one(&mut *c).await?;
-        if (marker == V5_TO_V6_VALIDATED && sequence != 1) || sequence > 1 || invalid != 0 {
-            bail!("mysql v6 transition contains unprovenanced fence state")
+        let wanted_indexes: Vec<(i64, String)> = match position {
+            0 => vec![(0, "id".into())],
+            1 => vec![
+                (0, "generation".into()),
+                (0, "operation_id".into()),
+                (0, "token".into()),
+                (0, "token,generation".into()),
+                (1, "state,generation,token".into()),
+            ],
+            _ => vec![
+                (0, "token,artifact_id".into()),
+                (1, "artifact_id".into()),
+                (1, "token,generation".into()),
+            ],
+        };
+        if actual_indexes != wanted_indexes {
+            bail!("mysql v6 transition index definitions differ: {table}")
+        }
+    }
+    if count >= 1 {
+        for (name, clause) in [
+            ("ready_fence_sequence_singleton", "`id` = 1"),
+            ("ready_fence_sequence_generation", "`generation` >= 0"),
+        ] {
+            let actual:Option<String>=sqlx::query_scalar("SELECT lower(check_clause) FROM information_schema.check_constraints WHERE constraint_schema=DATABASE() AND constraint_name=?").bind(name).fetch_optional(&mut *c).await?;
+            if actual.as_deref().map(normalize_check).as_deref()
+                != Some(normalize_check(clause).as_str())
+            {
+                bail!("mysql v6 transition check differs: {name}")
+            }
+        }
+    }
+    if count >= 2 {
+        for (name, clause) in [
+            ("ready_fences_generation", "`generation` > 0"),
+            (
+                "ready_fences_state",
+                "`state` in ('held','activation_unknown')",
+            ),
+        ] {
+            let actual:Option<String>=sqlx::query_scalar("SELECT lower(check_clause) FROM information_schema.check_constraints WHERE constraint_schema=DATABASE() AND constraint_name=?").bind(name).fetch_optional(&mut *c).await?;
+            if actual.as_deref().map(normalize_check).as_deref()
+                != Some(normalize_check(clause).as_str())
+            {
+                bail!("mysql v6 transition check differs: {name}")
+            }
+        }
+    }
+    if count >= 3 {
+        let check:Option<String>=sqlx::query_scalar("SELECT lower(check_clause) FROM information_schema.check_constraints WHERE constraint_schema=DATABASE() AND constraint_name='ready_fence_members_generation'").fetch_optional(&mut *c).await?;
+        if check.as_deref().map(normalize_check).as_deref()
+            != Some(normalize_check("`generation` > 0").as_str())
+        {
+            bail!("mysql v6 transition member check differs")
+        }
+        let parent:i64=sqlx::query_scalar("SELECT count(DISTINCT r.constraint_name) FROM information_schema.referential_constraints r JOIN information_schema.key_column_usage k ON k.constraint_schema=r.constraint_schema AND k.table_name=r.table_name AND k.constraint_name=r.constraint_name WHERE r.constraint_schema=DATABASE() AND r.table_name='ready_publication_fence_members' AND r.constraint_name='ready_fence_members_parent' AND r.referenced_table_name='ready_publication_fences' AND r.delete_rule='CASCADE' AND ((k.ordinal_position=1 AND k.column_name='token' AND k.referenced_column_name='token') OR (k.ordinal_position=2 AND k.column_name='generation' AND k.referenced_column_name='generation')) GROUP BY r.constraint_name HAVING count(*)=2").fetch_optional(&mut *c).await?.unwrap_or(0);
+        let artifact:i64=sqlx::query_scalar("SELECT count(*) FROM information_schema.referential_constraints r JOIN information_schema.key_column_usage k ON k.constraint_schema=r.constraint_schema AND k.table_name=r.table_name AND k.constraint_name=r.constraint_name WHERE r.constraint_schema=DATABASE() AND r.table_name='ready_publication_fence_members' AND r.constraint_name='ready_fence_members_artifact' AND r.referenced_table_name='artifact_jobs' AND r.delete_rule='CASCADE' AND k.column_name='artifact_id' AND k.referenced_column_name='id'").fetch_one(&mut *c).await?;
+        if parent != 1 || artifact != 1 {
+            bail!("mysql v6 transition foreign keys differ")
         }
     }
     Ok(())
@@ -528,6 +681,13 @@ async fn validate_mysql_v6_fences(tx: &mut Transaction<'_, MySql>) -> Result<()>
     if sequence.len() != 1 || sequence[0].0 != 1 || sequence[0].1 < 0 {
         bail!("mysql v6 Ready fence sequence is not the singleton")
     }
+    let max_generation: i64 =
+        sqlx::query_scalar("SELECT COALESCE(MAX(generation),0) FROM ready_publication_fences")
+            .fetch_one(&mut **tx)
+            .await?;
+    if sequence[0].1 < max_generation {
+        bail!("mysql v6 Ready fence sequence is behind persisted generations")
+    }
     let fences:Vec<(String,i64,String,String,String,String,String,String,i64,String)>=sqlx::query_as("SELECT token,generation,operation_id,workspace,repo,branch,target,attempt_id,expires_at,state FROM ready_publication_fences").fetch_all(&mut **tx).await?;
     let members:Vec<(String,i64,i64,String,String,String,String,String,i64,String,Option<String>)>=sqlx::query_as("SELECT m.token,m.generation,m.artifact_id,m.manifest,j.workspace,j.repo,j.commit_oid,j.kind,j.format_version,j.state,j.manifest FROM ready_publication_fence_members m LEFT JOIN artifact_jobs j ON j.id=m.artifact_id ORDER BY m.token,m.artifact_id").fetch_all(&mut **tx).await?;
     let mut by_token: HashMap<
@@ -692,12 +852,14 @@ impl MysqlArtifactScheduler {
                 for statement in &SCHEMA[9..] { sqlx::raw_sql(*statement).execute(&mut connection).await?; }
                 sqlx::query("INSERT INTO ready_publication_fence_sequence(id,generation) VALUES(1,0) ON DUPLICATE KEY UPDATE id=VALUES(id)").execute(&mut connection).await?;
                 preflight_mysql_v6_transition(&mut connection,V5_TO_V6_VALIDATED).await?;
+                let mut exact=connection.begin().await?; validate_mysql_v6_fences(&mut exact).await?; exact.rollback().await?;
                 let mut marker=connection.begin().await?;
                 if sqlx::query("UPDATE artifact_scheduler_schema SET version=? WHERE id=1 AND version=?").bind(V5_TO_V6_VALIDATED).bind(V5_TO_V6_DDL).execute(&mut *marker).await?.rows_affected()!=1{bail!("mysql v6 validated marker CAS failed")}
                 marker.commit().await?; version=V5_TO_V6_VALIDATED;
             }
             if version == V5_TO_V6_VALIDATED {
                 preflight_mysql_v6_transition(&mut connection,V5_TO_V6_VALIDATED).await?;
+                let mut exact=connection.begin().await?; validate_mysql_v6_fences(&mut exact).await?; exact.rollback().await?;
                 let mut marker=connection.begin().await?;
                 if sqlx::query("UPDATE artifact_scheduler_schema SET version=? WHERE id=1 AND version=?").bind(SCHEMA_VERSION).bind(V5_TO_V6_VALIDATED).execute(&mut *marker).await?.rows_affected()!=1{bail!("mysql v6 publication marker CAS failed")}
                 marker.commit().await?; version=SCHEMA_VERSION;
@@ -3079,6 +3241,57 @@ mod tests {
         }
     }
 
+    async fn seed_v6_transition(pool: &MySqlPool) {
+        reset(pool).await;
+        for ddl in &SCHEMA[..9] {
+            sqlx::raw_sql(*ddl).execute(pool).await.unwrap();
+        }
+        sqlx::query("INSERT INTO artifact_scheduler_schema(id,version) VALUES(1,?)")
+            .bind(V5_TO_V6_DDL)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO scheduler_state(id,fairness_cursor) VALUES(1,0)")
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    async fn assert_v6_transition_rejected_unchanged(
+        pool: &MySqlPool,
+        url: &str,
+        expected_fence_tables: i64,
+    ) {
+        assert!(
+            MysqlArtifactScheduler::from_pool(
+                MySqlPoolOptions::new().connect(url).await.unwrap(),
+                Default::default(),
+                Arc::new(Accept)
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT version FROM artifact_scheduler_schema WHERE id=1"
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+            V5_TO_V6_DDL
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM information_schema.tables WHERE table_schema=DATABASE()
+                 AND table_name IN('ready_publication_fence_sequence','ready_publication_fences','ready_publication_fence_members')"
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+            expected_fence_tables
+        );
+    }
+
     /// This test is intentionally discoverable in ordinary `cargo test` runs.
     /// It reports a visible skip only when no live test server was configured;
     /// CI must set RIPCLONE_TEST_MYSQL_URL and run this exact test name.
@@ -4570,6 +4783,74 @@ mod tests {
             .is_err(),
             "forged partial sequence was accepted"
         );
+
+        seed_v6_transition(&control).await;
+        sqlx::raw_sql(SCHEMA[9]).execute(&control).await.unwrap();
+        sqlx::raw_sql(SCHEMA[10]).execute(&control).await.unwrap();
+        sqlx::raw_sql(
+            "ALTER TABLE ready_publication_fences
+             DROP CHECK ready_fences_generation,
+             ADD CONSTRAINT ready_fences_generation CHECK(generation>=0)",
+        )
+        .execute(&control)
+        .await
+        .unwrap();
+        assert_v6_transition_rejected_unchanged(&control, &url, 2).await;
+
+        seed_v6_transition(&control).await;
+        sqlx::raw_sql(SCHEMA[9]).execute(&control).await.unwrap();
+        sqlx::raw_sql(SCHEMA[10]).execute(&control).await.unwrap();
+        sqlx::query(
+            "INSERT INTO ready_publication_fences
+             (token,generation,operation_id,workspace,repo,branch,target,attempt_id,expires_at,state)
+             VALUES(REPEAT('a',64),1,'forged-operation','ws','repo','main',REPEAT('b',40),'attempt',1,'held')",
+        )
+        .execute(&control)
+        .await
+        .unwrap();
+        assert_v6_transition_rejected_unchanged(&control, &url, 2).await;
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM ready_publication_fences")
+                .fetch_one(&control)
+                .await
+                .unwrap(),
+            1
+        );
+
+        seed_v6_transition(&control).await;
+        sqlx::raw_sql(SCHEMA[9]).execute(&control).await.unwrap();
+        sqlx::raw_sql(SCHEMA[10]).execute(&control).await.unwrap();
+        sqlx::raw_sql(
+            "ALTER TABLE ready_publication_fences
+             DROP INDEX ready_publication_fences_recovery,
+             ADD INDEX ready_publication_fences_recovery(state,token,generation)",
+        )
+        .execute(&control)
+        .await
+        .unwrap();
+        assert_v6_transition_rejected_unchanged(&control, &url, 2).await;
+
+        seed_v6_transition(&control).await;
+        for ddl in &SCHEMA[9..12] {
+            sqlx::raw_sql(*ddl).execute(&control).await.unwrap();
+        }
+        sqlx::raw_sql(
+            "ALTER TABLE ready_publication_fence_members
+             DROP FOREIGN KEY ready_fence_members_parent",
+        )
+        .execute(&control)
+        .await
+        .unwrap();
+        sqlx::raw_sql(
+            "ALTER TABLE ready_publication_fence_members
+             ADD CONSTRAINT ready_fence_members_parent FOREIGN KEY(token,generation)
+               REFERENCES ready_publication_fences(token,generation) ON DELETE RESTRICT",
+        )
+        .execute(&control)
+        .await
+        .unwrap();
+        assert_v6_transition_rejected_unchanged(&control, &url, 3).await;
+
         reset(&control).await;
         for ddl in &SCHEMA[..9] {
             sqlx::raw_sql(*ddl).execute(&control).await.unwrap();

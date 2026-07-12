@@ -984,6 +984,18 @@ impl ArtifactScheduler {
                 bail!("ready publication fence schema provenance is invalid")
             }
         }
+        let fence_sequence: i64 = sqlx::query_scalar(
+            "SELECT generation FROM ready_publication_fence_sequence WHERE id=1",
+        )
+        .fetch_one(&mut *migration)
+        .await?;
+        let maximum_fence_generation: i64 =
+            sqlx::query_scalar("SELECT COALESCE(MAX(generation),0) FROM ready_publication_fences")
+                .fetch_one(&mut *migration)
+                .await?;
+        if fence_sequence < maximum_fence_generation {
+            bail!("ready publication fence sequence is behind persisted fence state")
+        }
         let invalid_fences: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM ready_publication_fences f WHERE
                trim(f.workspace)='' OR trim(f.repo)='' OR trim(f.branch)='' OR trim(f.target)='' OR trim(f.attempt_id)=''
