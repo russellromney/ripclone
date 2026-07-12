@@ -12,11 +12,18 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::Duration;
 
 pub const PINNED_BUNDLE_FORMAT_VERSION: u32 = 1;
 const HEAD_PACK_TARGET: u64 = 6 * 1024 * 1024;
 const FULL_PACK_TARGET: u64 = 64 * 1024 * 1024;
+pub(crate) const MAX_PINNED_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
+pub(crate) const MAX_PINNED_ARTIFACT_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+
+#[cfg(test)]
+static COMBINED_VERIFY_ENTRIES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -250,9 +257,28 @@ pub fn verify_pinned_bundle_ready(
     cas: &Cas,
     request: &PinnedBundleRequest,
 ) -> Result<VerifiedPinnedBundle> {
+    verify_pinned_bundle_ready_cancelled(cas, request, &tokio_util::sync::CancellationToken::new())
+}
+
+pub fn verify_pinned_bundle_ready_cancelled(
+    cas: &Cas,
+    request: &PinnedBundleRequest,
+    cancelled: &tokio_util::sync::CancellationToken,
+) -> Result<VerifiedPinnedBundle> {
+    verify_pinned_bundle_ready_inner(cas, request, cancelled).map(|(verified, _)| verified)
+}
+
+fn verify_pinned_bundle_ready_inner(
+    cas: &Cas,
+    request: &PinnedBundleRequest,
+    cancelled: &tokio_util::sync::CancellationToken,
+) -> Result<(VerifiedPinnedBundle, PinnedBundleManifest)> {
+    if cancelled.is_cancelled() {
+        bail!("pinned bundle verification cancelled");
+    }
     Cas::validate_artifact_id(&request.manifest_hash)?;
     let bytes = cas
-        .get(&request.manifest_hash)
+        .get_cancelled_bounded(&request.manifest_hash, MAX_PINNED_MANIFEST_BYTES, cancelled)
         .context("fetch pinned manifest")?;
     let mut stored = decode_pinned_bundle_manifest_bytes(&bytes)?;
     if !stored.verified.manifest_hash.is_empty() {
@@ -288,7 +314,15 @@ pub fn verify_pinned_bundle_ready(
         bail!("pinned manifest checkout artifact kind mismatch");
     }
     for artifact in &flattened {
-        if cas.verify_object(&artifact.hash)? != artifact.len {
+        if artifact.len > MAX_PINNED_ARTIFACT_BYTES {
+            bail!("pinned artifact exceeds verification limit");
+        }
+        if cas.verify_object_cancelled_bounded(
+            &artifact.hash,
+            MAX_PINNED_ARTIFACT_BYTES,
+            cancelled,
+        )? != artifact.len
+        {
             bail!("pinned artifact length mismatch");
         }
     }
@@ -302,8 +336,11 @@ pub fn verify_pinned_bundle_ready(
         PinnedArtifactKind::OverlayPack,
         PinnedArtifactKind::OverlayPackIndex,
     )?;
-    let metadata: PinnedCheckoutMetadata =
-        serde_json::from_slice(&cas.get(&stored.checkout_metadata.hash)?)?;
+    let metadata: PinnedCheckoutMetadata = serde_json::from_slice(&cas.get_cancelled_bounded(
+        &stored.checkout_metadata.hash,
+        stored.checkout_metadata.len.min(MAX_PINNED_ARTIFACT_BYTES),
+        cancelled,
+    )?)?;
     if metadata.format_version != PINNED_BUNDLE_FORMAT_VERSION
         || metadata.workspace_id != stored.verified.bundle.workspace_id
         || metadata.repo_path != stored.verified.bundle.repo_path
@@ -315,9 +352,9 @@ pub fn verify_pinned_bundle_ready(
         bail!("pinned checkout metadata mismatch");
     }
 
-    verify_combined_repository(cas, &stored)?;
+    verify_combined_repository_cancelled(cas, &stored, cancelled)?;
     stored.verified.manifest_hash = request.manifest_hash.clone();
-    Ok(stored.verified)
+    Ok((stored.verified.clone(), stored))
 }
 
 /// Opaque one-shot handoff from expensive semantic verification to
@@ -334,8 +371,22 @@ pub fn verify_pinned_bundle_capability(
     cas: &Cas,
     request: &PinnedBundleRequest,
 ) -> Result<VerifiedPinnedLocalCapability> {
-    let verified = verify_pinned_bundle_ready(cas, request)?;
-    let manifest = decode_pinned_bundle_manifest(cas, request)?;
+    verify_pinned_bundle_capability_cancelled(
+        cas,
+        request,
+        &tokio_util::sync::CancellationToken::new(),
+    )
+}
+
+pub fn verify_pinned_bundle_capability_cancelled(
+    cas: &Cas,
+    request: &PinnedBundleRequest,
+    cancelled: &tokio_util::sync::CancellationToken,
+) -> Result<VerifiedPinnedLocalCapability> {
+    let (verified, manifest) = verify_pinned_bundle_ready_inner(cas, request, cancelled)?;
+    if cancelled.is_cancelled() {
+        bail!("pinned bundle verification cancelled");
+    }
     Ok(VerifiedPinnedLocalCapability {
         request: request.clone(),
         cas_root: cas
@@ -431,30 +482,38 @@ fn base_object_ids(cas: &Cas, base: &VerifiedBaseArtifact) -> Result<Vec<String>
     .context("enumerate authoritative verified-base object set")
 }
 
-fn verify_combined_repository(cas: &Cas, stored: &PinnedBundleManifest) -> Result<()> {
+fn verify_combined_repository_cancelled(
+    cas: &Cas,
+    stored: &PinnedBundleManifest,
+    cancelled: &tokio_util::sync::CancellationToken,
+) -> Result<()> {
+    #[cfg(test)]
+    COMBINED_VERIFY_ENTRIES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let repo = tempfile::tempdir()?;
-    materialize_pinned_bundle_artifacts(cas, stored, repo.path())?;
+    materialize_pinned_bundle_artifacts_cancelled(cas, stored, repo.path(), cancelled)?;
     let bundle = &stored.verified.bundle;
-    set_verification_head(repo.path(), &bundle.target_commit, bundle.mode)?;
-    git_ok(
+    set_verification_head_cancelled(repo.path(), &bundle.target_commit, bundle.mode, cancelled)?;
+    git_ok_cancelled(
         repo.path(),
         &[
             "cat-file",
             "-e",
             &format!("{}^{{commit}}", bundle.base_commit),
         ],
+        cancelled,
     )
     .context("combined bundle missing base commit")?;
-    git_ok(
+    git_ok_cancelled(
         repo.path(),
         &[
             "cat-file",
             "-e",
             &format!("{}^{{commit}}", bundle.target_commit),
         ],
+        cancelled,
     )
     .context("combined bundle missing target commit")?;
-    git_ok(
+    git_ok_cancelled(
         repo.path(),
         &[
             "fsck",
@@ -462,24 +521,46 @@ fn verify_combined_repository(cas: &Cas, stored: &PinnedBundleManifest) -> Resul
             "--no-dangling",
             &bundle.target_commit,
         ],
+        cancelled,
     )
     .context("combined bundle target closure is incomplete")?;
     std::fs::write(
         repo.path().join(".git/index"),
-        cas.get(&stored.prebuilt_index.hash)?,
+        cas.get_cancelled_bounded(
+            &stored.prebuilt_index.hash,
+            stored.prebuilt_index.len.min(MAX_PINNED_ARTIFACT_BYTES),
+            cancelled,
+        )?,
     )?;
-    let index_tree = git_stdout(repo.path(), &["write-tree"])?;
-    let target_tree = git_stdout(
+    let index_tree = git_stdout_cancelled(repo.path(), &["write-tree"], cancelled)?;
+    let target_tree = git_stdout_cancelled(
         repo.path(),
         &["rev-parse", &format!("{}^{{tree}}", bundle.target_commit)],
+        cancelled,
     )?;
     if index_tree != target_tree {
         bail!("prebuilt index does not describe exact target tree");
     }
     if bundle.mode == TopUpMode::Head
-        && git_stdout(repo.path(), &["rev-list", "--count", "HEAD"])? != "1"
+        && git_stdout_cancelled(repo.path(), &["rev-list", "--count", "HEAD"], cancelled)? != "1"
     {
         bail!("HEAD pinned bundle is not depth one");
+    }
+    Ok(())
+}
+
+fn set_verification_head_cancelled(
+    repo: &Path,
+    commit: &str,
+    mode: TopUpMode,
+    cancelled: &tokio_util::sync::CancellationToken,
+) -> Result<()> {
+    if cancelled.is_cancelled() {
+        bail!("pinned bundle verification cancelled");
+    }
+    set_verification_head(repo, commit, mode)?;
+    if cancelled.is_cancelled() {
+        bail!("pinned bundle verification cancelled");
     }
     Ok(())
 }
@@ -635,6 +716,17 @@ pub fn decode_pinned_bundle_manifest(
     decode_pinned_bundle_manifest_bytes(&bytes)
 }
 
+pub(crate) fn decode_pinned_bundle_manifest_cancelled(
+    cas: &Cas,
+    request: &PinnedBundleRequest,
+    cancelled: &tokio_util::sync::CancellationToken,
+) -> Result<PinnedBundleManifest> {
+    Cas::validate_artifact_id(&request.manifest_hash)?;
+    let bytes =
+        cas.get_cancelled_bounded(&request.manifest_hash, MAX_PINNED_MANIFEST_BYTES, cancelled)?;
+    decode_pinned_bundle_manifest_bytes(&bytes)
+}
+
 /// Verify an authenticated request and materialize exactly the artifacts that
 /// were covered by that verification. Client adapters should prefer this over
 /// calling the decoder and materializer separately.
@@ -683,31 +775,88 @@ fn materialize_pinned_bundle_artifacts_cancelled(
     cancelled: &tokio_util::sync::CancellationToken,
 ) -> Result<()> {
     crate::git::init_cancelled(destination, cancelled)?;
-    let packs = manifest
-        .base_packs
-        .iter()
-        .chain(&manifest.overlay_packs)
-        .map(|pack| {
-            Ok((
-                Bytes::from(cas.get_cancelled(&pack.pack.hash, cancelled)?),
-                Bytes::from(cas.get_cancelled(&pack.index.hash, cancelled)?),
-            ))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    crate::clonepack::install_manifest_pack_bytes_cancelled(
-        &destination.join(".git/objects/pack"),
-        packs,
+    let pack_dir = destination.join(".git/objects/pack");
+    std::fs::create_dir_all(&pack_dir)?;
+    for pack in manifest.base_packs.iter().chain(&manifest.overlay_packs) {
+        install_stored_pack_streaming_cancelled(cas, pack, &pack_dir, cancelled)?;
+    }
+    let git_dir = destination.join(".git");
+    let mut index = tempfile::Builder::new()
+        .prefix(".pinned-index.")
+        .tempfile_in(&git_dir)?;
+    let index_len = cas.copy_to_writer_verified_cancelled_bounded(
+        &manifest.prebuilt_index.hash,
+        index.as_file_mut(),
+        MAX_PINNED_ARTIFACT_BYTES,
         cancelled,
     )?;
-    let index = cas.get_cancelled(&manifest.prebuilt_index.hash, cancelled)?;
+    if index_len != manifest.prebuilt_index.len {
+        bail!("pinned prebuilt index length mismatch");
+    }
     if cancelled.is_cancelled() {
         bail!("pinned bundle materialization cancelled");
     }
-    std::fs::write(destination.join(".git/index"), index)?;
-    if cancelled.is_cancelled() {
-        bail!("pinned bundle materialization cancelled");
-    }
+    index
+        .persist(git_dir.join("index"))
+        .context("persist pinned prebuilt index")?;
     Ok(())
+}
+
+fn install_stored_pack_streaming_cancelled(
+    cas: &Cas,
+    pack: &StoredPack,
+    pack_dir: &Path,
+    cancelled: &tokio_util::sync::CancellationToken,
+) -> Result<u64> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    if pack.pack.len < 20
+        || pack.pack.len > MAX_PINNED_ARTIFACT_BYTES
+        || pack.index.len > MAX_PINNED_ARTIFACT_BYTES
+    {
+        bail!("pinned pack descriptor exceeds streaming limits");
+    }
+    let mut pack_temp = tempfile::Builder::new()
+        .prefix(".pinned-pack.")
+        .tempfile_in(pack_dir)?;
+    let pack_len = cas.copy_to_writer_verified_cancelled_bounded(
+        &pack.pack.hash,
+        pack_temp.as_file_mut(),
+        MAX_PINNED_ARTIFACT_BYTES,
+        cancelled,
+    )?;
+    if pack_len != pack.pack.len {
+        bail!("pinned pack length mismatch");
+    }
+    pack_temp.as_file_mut().seek(SeekFrom::End(-20))?;
+    let mut trailer = [0u8; 20];
+    pack_temp.as_file_mut().read_exact(&mut trailer)?;
+    let name = hex::encode(trailer);
+
+    let mut index_temp = tempfile::Builder::new()
+        .prefix(".pinned-idx.")
+        .tempfile_in(pack_dir)?;
+    let index_len = cas.copy_to_writer_verified_cancelled_bounded(
+        &pack.index.hash,
+        index_temp.as_file_mut(),
+        MAX_PINNED_ARTIFACT_BYTES,
+        cancelled,
+    )?;
+    if index_len != pack.index.len {
+        bail!("pinned pack index length mismatch");
+    }
+    if cancelled.is_cancelled() {
+        bail!("pinned bundle materialization cancelled");
+    }
+    pack_temp
+        .persist_noclobber(pack_dir.join(format!("pack-{name}.pack")))
+        .context("persist streamed pinned pack")?;
+    index_temp
+        .persist_noclobber(pack_dir.join(format!("pack-{name}.idx")))
+        .context("persist streamed pinned pack index")?;
+    pack_len
+        .checked_add(index_len)
+        .context("pinned pack streaming length overflow")
 }
 
 fn decode_pinned_bundle_manifest_bytes(bytes: &[u8]) -> Result<PinnedBundleManifest> {
@@ -728,6 +877,73 @@ fn git_stdout(repo: &Path, args: &[&str]) -> Result<String> {
         bail!("Git bundle verification failed");
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+fn git_ok_cancelled(
+    repo: &Path,
+    args: &[&str],
+    cancelled: &tokio_util::sync::CancellationToken,
+) -> Result<()> {
+    git_stdout_cancelled(repo, args, cancelled).map(|_| ())
+}
+
+fn git_stdout_cancelled(
+    repo: &Path,
+    args: &[&str],
+    cancelled: &tokio_util::sync::CancellationToken,
+) -> Result<String> {
+    if cancelled.is_cancelled() {
+        bail!("pinned bundle Git verification cancelled");
+    }
+    let mut command = Command::new("git");
+    command
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command
+        .spawn()
+        .context("spawn pinned bundle Git verifier")?;
+    loop {
+        if cancelled.is_cancelled() {
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(-(child.id() as i32), libc::SIGKILL);
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("pinned bundle Git verification cancelled");
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut stdout = Vec::new();
+                if let Some(mut pipe) = child.stdout.take() {
+                    use std::io::Read;
+                    pipe.read_to_end(&mut stdout)?;
+                }
+                if !status.success() {
+                    bail!("Git bundle verification failed");
+                }
+                return Ok(String::from_utf8_lossy(&stdout).trim().to_owned());
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(error) => {
+                #[cfg(unix)]
+                unsafe {
+                    libc::kill(-(child.id() as i32), libc::SIGKILL);
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error).context("wait for pinned bundle Git verifier");
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1145,6 +1361,89 @@ mod tests {
         let (result, publication) = worker.join().unwrap();
         assert!(format!("{:#}", result.unwrap_err()).contains("cancel"));
         drop(publication);
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn cached_pinned_hash_and_combined_verification_are_cancellable() {
+        let f = Fixture::new();
+        let mut bytes = vec![0u8; 64 * 1024 * 1024];
+        let mut state = 0x243f_6a88_u32;
+        for chunk in bytes.chunks_mut(4) {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            chunk.copy_from_slice(&state.to_le_bytes()[..chunk.len()]);
+        }
+        std::fs::write(f.repo.join("cached-large.bin"), bytes).unwrap();
+        git(&f.repo, &["add", "cached-large.bin"]);
+        git(&f.repo, &["commit", "-m", "cached-large"]);
+        let target = git_out(&f.repo, &["rev-parse", "HEAD"]);
+        let base = f.base(&target, TopUpMode::Full);
+        let mut request = f.generate(&base, &target, TopUpMode::Full).unwrap();
+        request.transport_session = "isolated-session".into();
+
+        let parent = tempfile::tempdir().unwrap();
+        let destination = parent.path().join("destination");
+        let token = tokio_util::sync::CancellationToken::new();
+        let worker_token = token.clone();
+        let cas = f.cas.clone();
+        let worker_request = request.clone();
+        let worker = std::thread::spawn(move || {
+            verify_pinned_bundle_capability_cancelled(&cas, &worker_request, &worker_token)
+        });
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        token.cancel();
+        let error = worker.join().unwrap().err().expect("cached hash cancelled");
+        assert!(format!("{error:#}").contains("cancel"));
+        assert!(!destination.exists());
+
+        let baseline = COMBINED_VERIFY_ENTRIES.load(std::sync::atomic::Ordering::SeqCst);
+        let token = tokio_util::sync::CancellationToken::new();
+        let worker_token = token.clone();
+        let cas = f.cas.clone();
+        let worker_request = request.clone();
+        let worker = std::thread::spawn(move || {
+            verify_pinned_bundle_capability_cancelled(&cas, &worker_request, &worker_token)
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while COMBINED_VERIFY_ENTRIES.load(std::sync::atomic::Ordering::SeqCst) == baseline {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "combined verifier did not start"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        token.cancel();
+        let error = worker
+            .join()
+            .unwrap()
+            .err()
+            .expect("combined verification cancelled");
+        assert!(format!("{error:#}").contains("cancel"));
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn verified_capability_cannot_cross_transport_sessions() {
+        let f = Fixture::new();
+        let commit = f.commit("base", "base");
+        let base = f.base(&commit, TopUpMode::Head);
+        let mut request = f.generate(&base, &commit, TopUpMode::Head).unwrap();
+        request.transport_session = "session-a".into();
+        let capability = verify_pinned_bundle_capability(&f.cas, &request).unwrap();
+        let mut other_session = request.clone();
+        other_session.transport_session = "session-b".into();
+        let parent = tempfile::tempdir().unwrap();
+        let destination = parent.path().join("destination");
+        let error = materialize_verified_pinned_capability(
+            &f.cas,
+            &other_session,
+            capability,
+            &destination,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("binding mismatch"));
         assert!(!destination.exists());
     }
 

@@ -254,6 +254,72 @@ impl Cas {
         }
     }
 
+    pub(crate) fn install_hashed_file_cancelled_bounded<P: AsRef<Path>>(
+        &self,
+        hash: &str,
+        source: P,
+        maximum: u64,
+        cancelled: &tokio_util::sync::CancellationToken,
+    ) -> Result<()> {
+        let source = source.as_ref();
+        if source.metadata()?.len() > maximum {
+            anyhow::bail!("CAS install source exceeds bounded verification limit");
+        }
+        let path = self.object_path(hash)?;
+        if path.exists() {
+            match self.verify_object_cancelled_bounded(hash, maximum, cancelled) {
+                Ok(_) => {
+                    std::fs::remove_file(source)?;
+                    return Ok(());
+                }
+                Err(error) if cancelled.is_cancelled() => return Err(error),
+                Err(_) => {}
+            }
+        }
+        let mut input = std::fs::File::open(source)
+            .with_context(|| format!("open CAS install source {}", source.display()))?;
+        let mut hasher = ObjectHasher::for_object_id(hash)?;
+        let mut length = 0u64;
+        let mut buffer = vec![0u8; 1024 * 1024];
+        loop {
+            if cancelled.is_cancelled() {
+                anyhow::bail!("CAS install verification cancelled");
+            }
+            let read = input.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            length = length
+                .checked_add(read as u64)
+                .context("CAS install source length overflow")?;
+            if length > maximum {
+                anyhow::bail!("CAS install source exceeds bounded verification limit");
+            }
+            hasher.update(&buffer[..read]);
+        }
+        if hasher.finalize_hex() != hash {
+            anyhow::bail!("hash mismatch while installing CAS object {hash}");
+        }
+        if cancelled.is_cancelled() {
+            anyhow::bail!("CAS install verification cancelled");
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        match std::fs::rename(source, &path) {
+            Ok(()) => Ok(()),
+            Err(_first_error) if path.exists() => {
+                if self.verify_object_cancelled_bounded(hash, maximum, cancelled)? == length {
+                    std::fs::remove_file(source)?;
+                    Ok(())
+                } else {
+                    anyhow::bail!("racing CAS object has unexpected length")
+                }
+            }
+            Err(error) => Err(error).with_context(|| format!("rename CAS object {hash}")),
+        }
+    }
+
     fn install_verified_temp(
         &self,
         hash: &str,
@@ -292,15 +358,22 @@ impl Cas {
         Ok(data)
     }
 
-    pub(crate) fn get_cancelled(
+    /// Hash-verified streaming read with a hard allocation/I/O ceiling and
+    /// cooperative cancellation. The metadata check is only an early reject:
+    /// the loop enforces the ceiling again in case the file grows concurrently.
+    pub(crate) fn get_cancelled_bounded(
         &self,
         hash: &str,
+        maximum: u64,
         cancelled: &tokio_util::sync::CancellationToken,
     ) -> Result<Vec<u8>> {
         let path = self.object_path(hash)?;
         let mut input =
             std::fs::File::open(&path).with_context(|| format!("open CAS object {}", hash))?;
         let expected = input.metadata()?.len();
+        if expected > maximum {
+            anyhow::bail!("CAS object exceeds bounded read limit");
+        }
         let capacity: usize = expected.try_into().context("CAS object is too large")?;
         let read_start = Instant::now();
         let mut data = Vec::with_capacity(capacity);
@@ -315,6 +388,12 @@ impl Cas {
                 .with_context(|| format!("read CAS object {}", hash))?;
             if read == 0 {
                 break;
+            }
+            if (data.len() as u64)
+                .checked_add(read as u64)
+                .is_none_or(|len| len > maximum)
+            {
+                anyhow::bail!("CAS object exceeds bounded read limit");
             }
             #[cfg(test)]
             std::thread::sleep(std::time::Duration::from_millis(1));
@@ -390,6 +469,49 @@ impl Cas {
         Ok(len)
     }
 
+    /// Verify a cached object without an unbounded read and remain responsive
+    /// while hashing multi-gigabyte pinned artifacts.
+    pub(crate) fn verify_object_cancelled_bounded(
+        &self,
+        hash: &str,
+        maximum: u64,
+        cancelled: &tokio_util::sync::CancellationToken,
+    ) -> Result<u64> {
+        let path = self.object_path(hash)?;
+        let mut file =
+            std::fs::File::open(&path).with_context(|| format!("open CAS object {hash}"))?;
+        if file.metadata()?.len() > maximum {
+            anyhow::bail!("CAS object exceeds bounded verification limit");
+        }
+        let mut hasher = ObjectHasher::for_object_id(hash)?;
+        let mut buf = vec![0u8; 1024 * 1024];
+        let mut len = 0u64;
+        loop {
+            if cancelled.is_cancelled() {
+                anyhow::bail!("CAS object verification cancelled");
+            }
+            let n = file
+                .read(&mut buf)
+                .with_context(|| format!("read CAS object {hash}"))?;
+            if n == 0 {
+                break;
+            }
+            #[cfg(test)]
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            len = len
+                .checked_add(n as u64)
+                .context("CAS object length overflow")?;
+            if len > maximum {
+                anyhow::bail!("CAS object exceeds bounded verification limit");
+            }
+            hasher.update(&buf[..n]);
+        }
+        if hasher.finalize_hex() != hash {
+            anyhow::bail!("CAS object {hash} is corrupt");
+        }
+        Ok(len)
+    }
+
     pub fn copy_to_writer_verified<W: Write>(&self, hash: &str, writer: &mut W) -> Result<u64> {
         self.copy_to_writer_verified_with(hash, writer, |_| {})
     }
@@ -400,9 +522,22 @@ impl Cas {
         writer: &mut W,
         cancelled: &tokio_util::sync::CancellationToken,
     ) -> Result<u64> {
+        self.copy_to_writer_verified_cancelled_bounded(hash, writer, u64::MAX, cancelled)
+    }
+
+    pub(crate) fn copy_to_writer_verified_cancelled_bounded<W: Write>(
+        &self,
+        hash: &str,
+        writer: &mut W,
+        maximum: u64,
+        cancelled: &tokio_util::sync::CancellationToken,
+    ) -> Result<u64> {
         let path = self.object_path(hash)?;
         let mut file =
             std::fs::File::open(&path).with_context(|| format!("open CAS object {hash}"))?;
+        if file.metadata()?.len() > maximum {
+            anyhow::bail!("CAS object exceeds bounded streaming limit");
+        }
         let mut hasher = ObjectHasher::for_object_id(hash)?;
         let mut buf = vec![0u8; 1024 * 1024];
         let mut len = 0u64;
@@ -414,9 +549,15 @@ impl Cas {
             if n == 0 {
                 break;
             }
+            let next = len
+                .checked_add(n as u64)
+                .context("streaming CAS object length overflow")?;
+            if next > maximum {
+                anyhow::bail!("CAS object exceeds bounded streaming limit");
+            }
             writer.write_all(&buf[..n])?;
             hasher.update(&buf[..n]);
-            len += n as u64;
+            len = next;
         }
         if hasher.finalize_hex() != hash {
             anyhow::bail!("CAS object {hash} is corrupt");

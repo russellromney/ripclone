@@ -1402,9 +1402,10 @@ impl Client {
         request: &crate::topup::PinnedBundleRequest,
         cancelled: &tokio_util::sync::CancellationToken,
     ) -> Result<crate::pinned_bundle::VerifiedPinnedLocalCapability> {
-        const MAX_PINNED_MANIFEST_BYTES: usize = 16 * 1024 * 1024;
+        const MAX_PINNED_MANIFEST_BYTES: usize =
+            crate::pinned_bundle::MAX_PINNED_MANIFEST_BYTES as usize;
         const MAX_PINNED_ARTIFACTS: usize = 32_768;
-        const MAX_PINNED_ARTIFACT_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+        const MAX_PINNED_ARTIFACT_BYTES: u64 = crate::pinned_bundle::MAX_PINNED_ARTIFACT_BYTES;
         const MAX_PINNED_TOTAL_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
 
         let manifest = self
@@ -1416,8 +1417,9 @@ impl Client {
             )
             .await?;
         cas.put_with_hash(&request.manifest_hash, &manifest)?;
-        let decoded = crate::pinned_bundle::decode_pinned_bundle_manifest(cas, request)
-            .context("decode bounded pinned bundle manifest")?;
+        let decoded =
+            crate::pinned_bundle::decode_pinned_bundle_manifest_cancelled(cas, request, cancelled)
+                .context("decode bounded pinned bundle manifest")?;
         if decoded.verified.artifacts.len() > MAX_PINNED_ARTIFACTS {
             anyhow::bail!("pinned bundle artifact count exceeds client limit");
         }
@@ -1439,8 +1441,14 @@ impl Client {
             }
         }
         for artifact in &decoded.verified.artifacts {
-            if cas.verify_object(&artifact.hash).ok() == Some(artifact.len) {
-                continue;
+            match cas.verify_object_cancelled_bounded(
+                &artifact.hash,
+                MAX_PINNED_ARTIFACT_BYTES,
+                cancelled,
+            ) {
+                Ok(len) if len == artifact.len => continue,
+                Err(error) if cancelled.is_cancelled() => return Err(error),
+                _ => {}
             }
             let (temp, len) = self
                 .fetch_typed_artifact_to_temp(
@@ -1454,12 +1462,17 @@ impl Client {
             if len != artifact.len {
                 anyhow::bail!("pinned artifact transport length mismatch");
             }
-            cas.install_hashed_file(&artifact.hash, temp.into_temp_path())?;
+            cas.install_hashed_file_cancelled_bounded(
+                &artifact.hash,
+                temp.into_temp_path(),
+                MAX_PINNED_ARTIFACT_BYTES,
+                cancelled,
+            )?;
         }
         // Semantic verification happens once here; the opaque capability is
         // consumed by the installer. CAS reads remain hash-verified while the
         // first pass prevents any unverified materialization attempt.
-        crate::pinned_bundle::verify_pinned_bundle_capability(cas, request)
+        crate::pinned_bundle::verify_pinned_bundle_capability_cancelled(cas, request, cancelled)
     }
 
     fn exact_transport_request(
@@ -1530,10 +1543,10 @@ impl Client {
             if cancelled.is_cancelled() {
                 anyhow::bail!("typed clone artifact prefetch cancelled");
             }
-            if cas.verify_object(&blob.hash)? != blob.len {
+            if cas.verify_object_cancelled_bounded(&blob.hash, blob.len, cancelled)? != blob.len {
                 anyhow::bail!("nested typed descriptor is absent or has wrong length");
             }
-            cas.get(&blob.hash)
+            cas.get_cancelled_bounded(&blob.hash, blob.len, cancelled)
         })?;
         for blob in &graph {
             self.fetch_exact_descriptor(cas, &request, blob, cancelled)
@@ -1549,12 +1562,18 @@ impl Client {
         blob: &crate::artifact_manifest::CasBlob,
         cancelled: &tokio_util::sync::CancellationToken,
     ) -> Result<()> {
+        const MAX_TYPED_ARTIFACT_BYTES: u64 = 16 * 1024 * 1024 * 1024;
         crate::cas::Cas::validate_artifact_id(&blob.hash)?;
         if blob.len == 0 {
             anyhow::bail!("typed artifact contains a zero-length descriptor");
         }
-        if cas.verify_object(&blob.hash).ok() == Some(blob.len) {
-            return Ok(());
+        if blob.len > MAX_TYPED_ARTIFACT_BYTES {
+            anyhow::bail!("typed artifact exceeds client per-object limit");
+        }
+        match cas.verify_object_cancelled_bounded(&blob.hash, MAX_TYPED_ARTIFACT_BYTES, cancelled) {
+            Ok(len) if len == blob.len => return Ok(()),
+            Err(error) if cancelled.is_cancelled() => return Err(error),
+            _ => {}
         }
         let (temp, len) = self
             .fetch_typed_artifact_to_temp(request, &blob.hash, cas.root(), blob.len, cancelled)
@@ -1562,7 +1581,12 @@ impl Client {
         if len != blob.len {
             anyhow::bail!("typed artifact transport descriptor length mismatch");
         }
-        cas.install_hashed_file(&blob.hash, temp.into_temp_path())?;
+        cas.install_hashed_file_cancelled_bounded(
+            &blob.hash,
+            temp.into_temp_path(),
+            MAX_TYPED_ARTIFACT_BYTES,
+            cancelled,
+        )?;
         Ok(())
     }
 
