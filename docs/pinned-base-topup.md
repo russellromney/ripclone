@@ -27,9 +27,21 @@ network, validation, checkout, or publish failure.
 The top-up request contains a configured Git remote name, never a URL, token,
 or authorization header. Public repositories may configure that remote directly
 to the provider. Private GitHub App repositories must point it at a ripclone Git
-proxy (or use a trusted out-of-band Git credential helper). Installation tokens
-remain server-side and must never be serialized in clone plans or embedded in
-client remote URLs.
+proxy. Installation tokens remain server-side and must never be serialized in
+clone plans or embedded in client remote URLs; cached-base credential helpers
+and ambient client Git configuration are deliberately ignored/rejected.
+
+The proxy protocol is an integration gate for enabling this path on a provider:
+it must accept the exact pinned object ID through an immutable, authorization-
+scoped ref (or equivalent exact-object fetch), retain that pin for the clone
+plan's lifetime, and never resolve the provider branch again during fetch. A
+provider is not eligible for top-up until its proxy passes advance, force-push,
+expiry, authorization, and unavailable-pin tests.
+
+Cached bases are treated as hostile input. Their `.git`, common directory, and
+object store must be real and contained under staging. Alternates, partial or
+promisor clones, replace refs, grafts, executable/credential/rewrite config,
+and credential-bearing remote URLs are rejected before repo-scoped Git runs.
 
 The reusable transaction is exposed as
 `ripclone::topup::install_pinned_from_base`. Clone-plan/server integration is

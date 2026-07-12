@@ -116,6 +116,20 @@ fn full_base_tops_up_to_pinned_commit_not_newer_moved_branch() {
     );
     command(Some(&destination), &["fsck", "--connectivity-only", "HEAD"]).unwrap();
     assert_eq!(stdout(Some(&destination), &["status", "--porcelain"]), "");
+    assert_eq!(
+        stdout(
+            Some(&destination),
+            &["config", "--get", "branch.main.remote"]
+        ),
+        "origin"
+    );
+    assert_eq!(
+        stdout(
+            Some(&destination),
+            &["config", "--get", "branch.main.merge"]
+        ),
+        "refs/heads/main"
+    );
 }
 
 #[test]
@@ -223,6 +237,10 @@ fn unavailable_force_pushed_target_fails_explicitly_and_publishes_nothing() {
         .expect("typed fetch failure");
     assert_eq!(fetch.target_commit, removed_target);
     assert!(err.to_string().contains("re-resolve explicitly"));
+    assert!(
+        !format!("{err:?}").contains(&origin.bare.display().to_string()),
+        "fetch failure must not expose the configured upstream URL"
+    );
     assert!(!destination.exists());
     assert_no_staging_dirs(out.path());
 }
@@ -388,10 +406,7 @@ fn embedded_http_credentials_are_rejected_without_echoing_the_secret() {
         },
     )
     .unwrap_err();
-    assert!(
-        err.to_string()
-            .contains("credential helper or ripclone proxy")
-    );
+    assert!(err.to_string().contains("must not contain userinfo"));
     assert!(!format!("{err:#}").contains("super-secret"));
     assert!(!destination.exists());
 }
@@ -418,6 +433,341 @@ fn advertised_non_commit_object_is_never_accepted_as_target() {
     assert!(format!("{err:#}").contains("not a commit"));
     assert!(!destination.exists());
     assert_no_staging_dirs(root.path());
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_staging_repo_is_rejected_without_mutating_external_repo() {
+    use std::os::unix::fs::symlink;
+    let origin = Origin::new();
+    let base = origin.commit("base.txt", "base\n");
+    let target = origin.commit("target.txt", "target\n");
+    let external_root = tempfile::tempdir().unwrap();
+    let external = external_root.path().join("external");
+    install_git_base(&external, &origin, &base, TopUpMode::Full).unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let destination = root.path().join("clone");
+    let err = install_pinned_from_base(
+        &destination,
+        &PinnedTopUp::new(&target, "main", TopUpMode::Full),
+        |path| {
+            symlink(&external, path)?;
+            Ok(())
+        },
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("real directory, not a symlink"));
+    assert_eq!(stdout(Some(&external), &["rev-parse", "HEAD"]), base);
+    assert!(!destination.exists());
+}
+
+#[test]
+fn external_gitdir_indirection_is_rejected() {
+    let origin = Origin::new();
+    let target = origin.commit("base.txt", "base\n");
+    let external = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let destination = root.path().join("clone");
+    let err = install_pinned_from_base(
+        &destination,
+        &PinnedTopUp::new(&target, "main", TopUpMode::Full),
+        |path| {
+            command(
+                None,
+                &[
+                    "init",
+                    "--separate-git-dir",
+                    external.path().join("gitdir").to_str().unwrap(),
+                    path.to_str().unwrap(),
+                ],
+            )?;
+            Ok(())
+        },
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains(".git must be a real directory"));
+    assert!(!destination.exists());
+}
+
+#[test]
+fn external_common_directory_is_rejected() {
+    let origin = Origin::new();
+    let target = origin.commit("base.txt", "base\n");
+    let external = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let destination = root.path().join("clone");
+    let err = install_pinned_from_base(
+        &destination,
+        &PinnedTopUp::new(&target, "main", TopUpMode::Full),
+        |path| {
+            install_git_base(path, &origin, &target, TopUpMode::Full)?;
+            std::fs::write(
+                path.join(".git/commondir"),
+                external.path().display().to_string(),
+            )?;
+            Ok(())
+        },
+    )
+    .unwrap_err();
+    assert!(format!("{err:#}").contains("common directory escapes"));
+    assert!(!destination.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn external_object_directory_symlink_is_rejected() {
+    use std::os::unix::fs::symlink;
+    let origin = Origin::new();
+    let target = origin.commit("base.txt", "base\n");
+    let external = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let destination = root.path().join("clone");
+    let err = install_pinned_from_base(
+        &destination,
+        &PinnedTopUp::new(&target, "main", TopUpMode::Full),
+        |path| {
+            install_git_base(path, &origin, &target, TopUpMode::Full)?;
+            let objects = path.join(".git/objects");
+            std::fs::rename(&objects, external.path().join("objects"))?;
+            symlink(external.path().join("objects"), objects)?;
+            Ok(())
+        },
+    )
+    .unwrap_err();
+    assert!(format!("{err:#}").contains("object directory"));
+    assert!(!destination.exists());
+}
+
+#[test]
+fn alternate_object_storage_is_rejected() {
+    let origin = Origin::new();
+    let target = origin.commit("base.txt", "base\n");
+    let alternate = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let destination = root.path().join("clone");
+    let err = install_pinned_from_base(
+        &destination,
+        &PinnedTopUp::new(&target, "main", TopUpMode::Full),
+        |path| {
+            install_git_base(path, &origin, &target, TopUpMode::Full)?;
+            std::fs::create_dir_all(path.join(".git/objects/info"))?;
+            std::fs::write(
+                path.join(".git/objects/info/alternates"),
+                alternate.path().display().to_string(),
+            )?;
+            Ok(())
+        },
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("alternate object storage"));
+    assert!(!destination.exists());
+}
+
+#[test]
+fn promisor_and_partial_clone_config_are_rejected() {
+    let origin = Origin::new();
+    let target = origin.commit("base.txt", "base\n");
+    for (key, value) in [
+        ("remote.origin.promisor", "true"),
+        ("extensions.partialClone", "origin"),
+        ("remote.origin.partialCloneFilter", "blob:none"),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("clone");
+        let err = install_pinned_from_base(
+            &destination,
+            &PinnedTopUp::new(&target, "main", TopUpMode::Full),
+            |path| {
+                install_git_base(path, &origin, &target, TopUpMode::Full)?;
+                command(Some(path), &["config", key, value])?;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("partial/promisor"));
+        assert!(!destination.exists());
+    }
+}
+
+#[test]
+fn promisor_pack_marker_is_rejected_without_promisor_config() {
+    let origin = Origin::new();
+    let target = origin.commit("base.txt", "base\n");
+    let root = tempfile::tempdir().unwrap();
+    let destination = root.path().join("clone");
+    let err = install_pinned_from_base(
+        &destination,
+        &PinnedTopUp::new(&target, "main", TopUpMode::Full),
+        |path| {
+            install_git_base(path, &origin, &target, TopUpMode::Full)?;
+            std::fs::create_dir_all(path.join(".git/objects/pack"))?;
+            std::fs::write(path.join(".git/objects/pack/pack-deadbeef.promisor"), "")?;
+            Ok(())
+        },
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("promisor pack"));
+    assert!(!destination.exists());
+}
+
+#[test]
+fn replace_refs_and_grafts_are_rejected_even_though_replace_processing_is_disabled() {
+    let origin = Origin::new();
+    let target = origin.commit("base.txt", "base\n");
+    for marker in ["replace", "grafts"] {
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("clone");
+        let err = install_pinned_from_base(
+            &destination,
+            &PinnedTopUp::new(&target, "main", TopUpMode::Full),
+            |path| {
+                install_git_base(path, &origin, &target, TopUpMode::Full)?;
+                if marker == "replace" {
+                    let replace = path.join(".git/refs/replace");
+                    std::fs::create_dir_all(&replace)?;
+                    std::fs::write(replace.join(&target), &target)?;
+                } else {
+                    std::fs::create_dir_all(path.join(".git/info"))?;
+                    std::fs::write(path.join(".git/info/grafts"), format!("{target}\n"))?;
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("forbidden"));
+        assert!(!destination.exists());
+    }
+}
+
+#[test]
+fn executable_and_credential_config_are_rejected_without_execution_or_secret_echo() {
+    let origin = Origin::new();
+    let target = origin.commit("base.txt", "base\n");
+    for key in [
+        "core.fsmonitor",
+        "credential.helper",
+        "url.ext::sh.insteadOf",
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("clone");
+        let marker = root.path().join("should-not-exist");
+        let value = match key {
+            "core.fsmonitor" => format!("touch {}", marker.display()),
+            "credential.helper" => "!echo super-secret".to_owned(),
+            _ => "file://".to_owned(),
+        };
+        let err = install_pinned_from_base(
+            &destination,
+            &PinnedTopUp::new(&target, "main", TopUpMode::Full),
+            |path| {
+                install_git_base(path, &origin, &target, TopUpMode::Full)?;
+                command(Some(path), &["config", key, &value])?;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("forbidden Git config key"));
+        assert!(!format!("{err:#}").contains("super-secret"));
+        assert!(!marker.exists());
+        assert!(!destination.exists());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn executable_checkout_hook_is_disabled_by_sanitized_git_invocation() {
+    use std::os::unix::fs::PermissionsExt;
+    let origin = Origin::new();
+    let base = origin.commit("base.txt", "base\n");
+    let target = origin.commit("target.txt", "target\n");
+    let root = tempfile::tempdir().unwrap();
+    let destination = root.path().join("clone");
+    let marker = root.path().join("hook-executed");
+    install_pinned_from_base(
+        &destination,
+        &PinnedTopUp::new(&target, "main", TopUpMode::Full),
+        |path| {
+            install_git_base(path, &origin, &base, TopUpMode::Full)?;
+            let hook = path.join(".git/hooks/post-checkout");
+            std::fs::write(&hook, format!("#!/bin/sh\ntouch '{}'\n", marker.display()))?;
+            let mut permissions = std::fs::metadata(&hook)?.permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&hook, permissions)?;
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert!(!marker.exists(), "untrusted cached-base hook executed");
+    assert!(
+        !destination.join(".git/hooks/post-checkout").exists(),
+        "untrusted hook must not survive publication"
+    );
+    assert_eq!(stdout(Some(&destination), &["rev-parse", "HEAD"]), target);
+}
+
+#[test]
+fn remote_query_and_fragment_are_rejected() {
+    let origin = Origin::new();
+    let target = origin.commit("base.txt", "base\n");
+    for suffix in ["?token=super-secret", "#super-secret"] {
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("clone");
+        let err = install_pinned_from_base(
+            &destination,
+            &PinnedTopUp::new(&target, "main", TopUpMode::Full),
+            |path| {
+                install_git_base(path, &origin, &target, TopUpMode::Full)?;
+                command(
+                    Some(path),
+                    &[
+                        "remote",
+                        "set-url",
+                        "origin",
+                        &format!("{}{suffix}", origin.url()),
+                    ],
+                )?;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("query parameters, or a fragment"));
+        assert!(!format!("{err:#}").contains("super-secret"));
+        assert!(!destination.exists());
+    }
+}
+
+#[test]
+fn ignored_and_untracked_base_residue_is_removed_before_publish() {
+    let origin = Origin::new();
+    let base = origin.commit(".gitignore", "*.ignored\n");
+    let target = origin.commit("target.txt", "target\n");
+    let root = tempfile::tempdir().unwrap();
+    let destination = root.path().join("clone");
+    install_pinned_from_base(
+        &destination,
+        &PinnedTopUp::new(&target, "main", TopUpMode::Full),
+        |path| {
+            install_git_base(path, &origin, &base, TopUpMode::Full)?;
+            std::fs::write(path.join("poison.ignored"), "remove me")?;
+            std::fs::write(path.join("untracked.txt"), "remove me too")?;
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert!(!destination.join("poison.ignored").exists());
+    assert!(!destination.join("untracked.txt").exists());
+    assert_eq!(
+        stdout(
+            Some(&destination),
+            &[
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                "--ignored=matching"
+            ]
+        ),
+        ""
+    );
 }
 
 fn assert_no_staging_dirs(parent: &Path) {
