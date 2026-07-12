@@ -24,6 +24,8 @@ use sqlx::{Acquire, MySql, MySqlConnection, Row, Transaction};
 use std::sync::Arc;
 
 const SCHEMA_VERSION: i64 = 4;
+const V1_TO_V4_TRANSITION: i64 = 401;
+const V2_TO_V4_TRANSITION: i64 = 402;
 const SCHEMA: &[&str] = &[
     r#"CREATE TABLE IF NOT EXISTS artifact_scheduler_schema(
  id SMALLINT NOT NULL PRIMARY KEY,
@@ -141,6 +143,33 @@ async fn preflight_mysql_schema(connection: &mut MySqlConnection, version: i64) 
     Ok(())
 }
 
+async fn preflight_mysql_transition(connection: &mut MySqlConnection) -> Result<()> {
+    let core:i64=sqlx::query_scalar("SELECT count(*) FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name IN('artifact_scheduler_schema','artifact_jobs','branch_observations','artifact_observations','artifact_consumers','artifact_transport_leases','scheduler_state')").fetch_one(&mut *connection).await?;
+    if core != 7 {
+        bail!("mysql transitional migration is missing core v2 tables")
+    }
+    let base_exists:i64=sqlx::query_scalar("SELECT count(*) FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name='artifact_base_retention'").fetch_one(&mut *connection).await?;
+    if base_exists == 1 {
+        let columns:i64=sqlx::query_scalar("SELECT count(*) FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name='artifact_base_retention'").fetch_one(&mut *connection).await?;
+        let indexes:i64=sqlx::query_scalar("SELECT count(DISTINCT index_name) FROM information_schema.statistics WHERE table_schema=DATABASE() AND table_name='artifact_base_retention'").fetch_one(&mut *connection).await?;
+        let constraints:i64=sqlx::query_scalar("SELECT count(*) FROM information_schema.table_constraints WHERE constraint_schema=DATABASE() AND table_name='artifact_base_retention' AND constraint_name IN('PRIMARY','artifact_base_retention_artifact','artifact_base_retention_ranks')").fetch_one(&mut *connection).await?;
+        let scope:i64=sqlx::query_scalar("SELECT count(*) FROM (SELECT index_name,GROUP_CONCAT(column_name ORDER BY seq_in_index) columns_csv FROM information_schema.statistics WHERE table_schema=DATABASE() AND table_name='artifact_base_retention' GROUP BY index_name) indexes WHERE index_name='artifact_base_retention_scope' AND columns_csv='workspace,repo,format_version'").fetch_one(&mut *connection).await?;
+        if columns != 6 || indexes != 2 || constraints != 3 || scope != 1 {
+            bail!("mysql transitional base-retention table is malformed")
+        }
+    }
+    let gc_exists:i64=sqlx::query_scalar("SELECT count(*) FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name='artifact_gc_sweep'").fetch_one(&mut *connection).await?;
+    if gc_exists == 1 {
+        let columns:i64=sqlx::query_scalar("SELECT count(*) FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name='artifact_gc_sweep'").fetch_one(&mut *connection).await?;
+        let indexes:i64=sqlx::query_scalar("SELECT count(DISTINCT index_name) FROM information_schema.statistics WHERE table_schema=DATABASE() AND table_name='artifact_gc_sweep'").fetch_one(&mut *connection).await?;
+        let constraints:i64=sqlx::query_scalar("SELECT count(*) FROM information_schema.table_constraints WHERE constraint_schema=DATABASE() AND table_name='artifact_gc_sweep' AND constraint_name IN('PRIMARY','artifact_gc_sweep_singleton')").fetch_one(&mut *connection).await?;
+        if columns != 3 || indexes != 1 || constraints != 2 {
+            bail!("mysql transitional GC table is malformed")
+        }
+    }
+    Ok(())
+}
+
 impl MysqlArtifactScheduler {
     pub async fn from_pool(
         pool: MySqlPool,
@@ -175,10 +204,14 @@ impl MysqlArtifactScheduler {
                 3
             } else {
                 let version:i64=sqlx::query_scalar("SELECT version FROM artifact_scheduler_schema WHERE id=1").fetch_one(&mut connection).await?;
-                if version > SCHEMA_VERSION { bail!("artifact scheduler database is newer than this binary") }
-                if ![1,2,3,SCHEMA_VERSION].contains(&version) { bail!("unsupported mysql artifact scheduler schema {version}") }
-                preflight_mysql_schema(&mut connection,version).await?;
-                if version >= 3 {
+                if version > SCHEMA_VERSION && ![V1_TO_V4_TRANSITION,V2_TO_V4_TRANSITION].contains(&version) { bail!("artifact scheduler database is newer than this binary") }
+                if ![1,2,3,SCHEMA_VERSION,V1_TO_V4_TRANSITION,V2_TO_V4_TRANSITION].contains(&version) { bail!("unsupported mysql artifact scheduler schema {version}") }
+                if [V1_TO_V4_TRANSITION,V2_TO_V4_TRANSITION].contains(&version) {
+                    preflight_mysql_transition(&mut connection).await?;
+                } else {
+                    preflight_mysql_schema(&mut connection,version).await?;
+                }
+                if version == 3 || version == SCHEMA_VERSION {
                     for statement in SCHEMA { sqlx::raw_sql(*statement).execute(&mut connection).await?; }
                     sqlx::query("INSERT INTO scheduler_state(id,fairness_cursor) VALUES(1,0) ON DUPLICATE KEY UPDATE id=VALUES(id)").execute(&mut connection).await?;
                 }
@@ -188,30 +221,55 @@ impl MysqlArtifactScheduler {
             let mut migration = connection.begin().await?;
             let locked_version: i64 = sqlx::query_scalar("SELECT version FROM artifact_scheduler_schema WHERE id=1 FOR UPDATE").fetch_one(&mut *migration).await?;
             if locked_version != version { bail!("mysql artifact scheduler version changed under migration lock") }
-            if version > SCHEMA_VERSION {
+            if version > SCHEMA_VERSION && ![V1_TO_V4_TRANSITION,V2_TO_V4_TRANSITION].contains(&version) {
                 bail!("artifact scheduler database is newer than this binary")
             }
-            if ![1, 2, 3, SCHEMA_VERSION].contains(&version) {
+            if ![1, 2, 3, SCHEMA_VERSION, V1_TO_V4_TRANSITION, V2_TO_V4_TRANSITION].contains(&version) {
                 bail!("unsupported mysql artifact scheduler schema {version}")
             }
-            if version < SCHEMA_VERSION {
-                // MySQL DDL implicitly commits. Publish the future marker first
-                // so an old binary fails closed throughout any v2 DDL window.
+            if version == 1 || version == 2 {
+                let transition = if version == 1 { V1_TO_V4_TRANSITION } else { V2_TO_V4_TRANSITION };
                 sqlx::query(
                     "UPDATE artifact_scheduler_schema SET version=? WHERE id=1 AND version=?",
                 )
-                .bind(SCHEMA_VERSION)
+                .bind(transition)
                 .bind(version)
                 .execute(&mut *migration)
                 .await?;
-                if version < 3 {
-                    migration.commit().await?;
+                migration.commit().await?;
+                if version == 1 {
                     for statement in SCHEMA { sqlx::raw_sql(*statement).execute(&mut connection).await?; }
-                    sqlx::query("INSERT INTO scheduler_state(id,fairness_cursor) VALUES(1,0) ON DUPLICATE KEY UPDATE id=VALUES(id)").execute(&mut connection).await?;
-                    migration = connection.begin().await?;
-                    let scopes: Vec<(String,String,i64)> = sqlx::query_as("SELECT DISTINCT workspace,repo,format_version FROM artifact_jobs WHERE state='ready' AND kind IN('head','full_history')").fetch_all(&mut *migration).await?;
-                    for (w,r,v) in scopes { refresh_base_retention(&mut migration,&w,&r,v).await?; }
+                } else {
+                    sqlx::raw_sql(SCHEMA[6]).execute(&mut connection).await?;
+                    sqlx::raw_sql(SCHEMA[7]).execute(&mut connection).await?;
                 }
+                sqlx::query("INSERT INTO scheduler_state(id,fairness_cursor) VALUES(1,0) ON DUPLICATE KEY UPDATE id=VALUES(id)").execute(&mut connection).await?;
+                migration = connection.begin().await?;
+                Self::validate_schema(&mut migration).await?;
+                sqlx::query("DELETE FROM artifact_base_retention").execute(&mut *migration).await?;
+                let scopes: Vec<(String,String,i64)> = sqlx::query_as("SELECT DISTINCT workspace,repo,format_version FROM artifact_jobs WHERE state='ready' AND kind IN('head','full_history')").fetch_all(&mut *migration).await?;
+                for (w,r,v) in scopes { refresh_base_retention(&mut migration,&w,&r,v).await?; }
+                let changed=sqlx::query("UPDATE artifact_scheduler_schema SET version=? WHERE id=1 AND version=?").bind(SCHEMA_VERSION).bind(transition).execute(&mut *migration).await?.rows_affected();
+                if changed != 1 { bail!("mysql transition marker changed during v4 publication") }
+            } else if version == V1_TO_V4_TRANSITION || version == V2_TO_V4_TRANSITION {
+                migration.commit().await?;
+                if version == V1_TO_V4_TRANSITION {
+                    for statement in SCHEMA { sqlx::raw_sql(*statement).execute(&mut connection).await?; }
+                } else {
+                    sqlx::raw_sql(SCHEMA[6]).execute(&mut connection).await?;
+                    sqlx::raw_sql(SCHEMA[7]).execute(&mut connection).await?;
+                }
+                sqlx::query("INSERT INTO scheduler_state(id,fairness_cursor) VALUES(1,0) ON DUPLICATE KEY UPDATE id=VALUES(id)").execute(&mut connection).await?;
+                migration = connection.begin().await?;
+                Self::validate_schema(&mut migration).await?;
+                sqlx::query("DELETE FROM artifact_base_retention").execute(&mut *migration).await?;
+                let scopes: Vec<(String,String,i64)> = sqlx::query_as("SELECT DISTINCT workspace,repo,format_version FROM artifact_jobs WHERE state='ready' AND kind IN('head','full_history')").fetch_all(&mut *migration).await?;
+                for (w,r,v) in scopes { refresh_base_retention(&mut migration,&w,&r,v).await?; }
+                let changed=sqlx::query("UPDATE artifact_scheduler_schema SET version=? WHERE id=1 AND version=?").bind(SCHEMA_VERSION).bind(version).execute(&mut *migration).await?.rows_affected();
+                if changed != 1 { bail!("mysql transition marker changed during resumed v4 publication") }
+            } else if version == 3 {
+                let changed=sqlx::query("UPDATE artifact_scheduler_schema SET version=? WHERE id=1 AND version=3").bind(SCHEMA_VERSION).execute(&mut *migration).await?.rows_affected();
+                if changed != 1 { bail!("mysql v3 marker changed during v4 publication") }
             }
             Self::validate_schema(&mut migration).await?;
 
@@ -3210,6 +3268,101 @@ mod tests {
             .unwrap(),
             4
         );
+
+        for stage in ["marker_only", "base_only", "both_empty", "partial", "full"] {
+            reset(&control).await;
+            for (index, statement) in SCHEMA.iter().enumerate() {
+                if index != 6 && index != 7 {
+                    sqlx::raw_sql(*statement).execute(&control).await.unwrap();
+                }
+            }
+            sqlx::query("INSERT INTO artifact_scheduler_schema(id,version) VALUES(1,?)")
+                .bind(V2_TO_V4_TRANSITION)
+                .execute(&control)
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO scheduler_state(id,fairness_cursor,config_fingerprint) VALUES(1,0,?)",
+            )
+            .bind(scheduler_fingerprint(
+                &Default::default(),
+                "mysql-live-conformance-v1",
+            ))
+            .execute(&control)
+            .await
+            .unwrap();
+            for (kind, manifest) in [("head", "a".repeat(64)), ("full_history", "b".repeat(64))] {
+                sqlx::query("INSERT INTO artifact_jobs(workspace,repo,commit_oid,kind,format_version,state,lease_generation,claim_attempts,retry_count,manifest,created_at,updated_at) VALUES('ws','owner/repo','crash-base',?,1,'ready',0,0,0,?,1,1)")
+                    .bind(kind).bind(manifest).execute(&control).await.unwrap();
+            }
+            if stage != "marker_only" {
+                sqlx::raw_sql(SCHEMA[6]).execute(&control).await.unwrap();
+            }
+            if !["marker_only", "base_only"].contains(&stage) {
+                sqlx::raw_sql(SCHEMA[7]).execute(&control).await.unwrap();
+            }
+            if stage == "partial" || stage == "full" {
+                let head_id: i64 =
+                    sqlx::query_scalar("SELECT id FROM artifact_jobs WHERE kind='head'")
+                        .fetch_one(&control)
+                        .await
+                        .unwrap();
+                sqlx::query("INSERT INTO artifact_base_retention(artifact_id,workspace,repo,format_version,head_rank,pair_rank) VALUES(?,'ws','owner/repo',1,8,NULL)")
+                    .bind(head_id).execute(&control).await.unwrap();
+                if stage == "full" {
+                    let history_id: i64 = sqlx::query_scalar(
+                        "SELECT id FROM artifact_jobs WHERE kind='full_history'",
+                    )
+                    .fetch_one(&control)
+                    .await
+                    .unwrap();
+                    sqlx::query("UPDATE artifact_base_retention SET head_rank=1,pair_rank=1 WHERE artifact_id=?").bind(head_id).execute(&control).await.unwrap();
+                    sqlx::query("INSERT INTO artifact_base_retention(artifact_id,workspace,repo,format_version,head_rank,pair_rank) VALUES(?,'ws','owner/repo',1,NULL,1)").bind(history_id).execute(&control).await.unwrap();
+                }
+            }
+            let first_pool = MySqlPoolOptions::new()
+                .max_connections(8)
+                .connect(&url)
+                .await
+                .unwrap();
+            let second_pool = MySqlPoolOptions::new()
+                .max_connections(8)
+                .connect(&url)
+                .await
+                .unwrap();
+            let (first, second) = tokio::join!(
+                MysqlArtifactScheduler::from_pool(first_pool, Default::default(), Arc::new(Accept)),
+                MysqlArtifactScheduler::from_pool(
+                    second_pool,
+                    Default::default(),
+                    Arc::new(Accept)
+                )
+            );
+            assert!(
+                first.is_ok() && second.is_ok(),
+                "concurrent transition resume failed at {stage}: {:?} / {:?}",
+                first.err(),
+                second.err()
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT version FROM artifact_scheduler_schema WHERE id=1"
+                )
+                .fetch_one(&control)
+                .await
+                .unwrap(),
+                4
+            );
+            let rows:Vec<(String,Option<i16>,Option<i16>)>=sqlx::query_as("SELECT j.kind,r.head_rank,r.pair_rank FROM artifact_base_retention r JOIN artifact_jobs j ON j.id=r.artifact_id ORDER BY j.kind").fetch_all(&control).await.unwrap();
+            assert_eq!(
+                rows,
+                vec![
+                    ("full_history".into(), None, Some(1)),
+                    ("head".into(), Some(1), Some(1))
+                ],
+                "full backfill mismatch after {stage}"
+            );
+        }
 
         reset(&control).await;
         for statement in SCHEMA {
