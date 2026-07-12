@@ -270,6 +270,7 @@ async fn start_server_split_storage_inner(
         repo_root: repo_root.clone(),
         ref_store,
         artifact_scheduler: None,
+        artifact_verifier: None,
         provider_registry,
         broker,
         token_hash: Some(token_hash()),

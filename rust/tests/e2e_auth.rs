@@ -66,6 +66,7 @@ async fn start_repo_auth_server(provider_url: &str) -> Server {
         repo_root: repo_root.clone(),
         ref_store,
         artifact_scheduler: None,
+        artifact_verifier: None,
         provider_registry,
         broker,
         token_hash: Some(hex::encode(Sha256::digest(TOKEN.as_bytes()))),

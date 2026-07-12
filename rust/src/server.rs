@@ -99,6 +99,9 @@ pub struct ServerState {
     /// `None` while the explicit legacy mode remains selected.
     pub artifact_scheduler:
         Option<Arc<dyn crate::artifact_scheduler_backend::ArtifactSchedulerPersistence>>,
+    /// Exact strict verifier shared with the selected scheduler. Every typed
+    /// builder, admission, clone, scrub, and GC path must clone this Arc.
+    pub artifact_verifier: Option<Arc<crate::artifact_manifest::CasCompletionVerifier>>,
     /// Per-repo / per-branch build configuration (ROADMAP §2a). Read at build
     /// time; absent config means today's default (shallow + full).
     pub repo_config: Arc<crate::repo_config::RepoConfigStore>,
@@ -236,6 +239,7 @@ impl ServerState {
             repo_root: b.repo_root,
             ref_store: b.ref_store,
             artifact_scheduler: b.artifact_scheduler,
+            artifact_verifier: b.artifact_verifier,
             provider_registry,
             broker,
             token_hash: None,
@@ -8738,6 +8742,7 @@ pub async fn run_server_with_barrier(
         repo_root: repo_root.to_path_buf(),
         ref_store: b.ref_store,
         artifact_scheduler: b.artifact_scheduler,
+        artifact_verifier: b.artifact_verifier,
         provider_registry,
         broker,
         token_hash: Some(token_hash),
@@ -9103,6 +9108,7 @@ mod tests {
             repo_root,
             ref_store,
             artifact_scheduler: None,
+            artifact_verifier: None,
             provider_registry,
             broker,
             token_hash: Some(token_hash),
