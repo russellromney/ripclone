@@ -126,6 +126,7 @@ pub mod snapshot;
 #[doc(hidden)]
 pub mod statx_compat;
 pub mod storage;
+pub mod topup;
 
 #[cfg(test)]
 pub mod test_fixture;
