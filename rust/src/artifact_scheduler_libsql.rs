@@ -41,6 +41,7 @@ const SCHEMA: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS artifact_transport_leases_expiry ON artifact_transport_leases(expires_at)",
     "CREATE TABLE IF NOT EXISTS artifact_base_retention(artifact_id INTEGER PRIMARY KEY,workspace TEXT NOT NULL,repo TEXT NOT NULL,format_version INTEGER NOT NULL,head_rank INTEGER,pair_rank INTEGER,FOREIGN KEY(artifact_id) REFERENCES artifact_jobs(id) ON DELETE CASCADE,CHECK((head_rank IS NULL OR head_rank BETWEEN 1 AND 8) AND (pair_rank IS NULL OR pair_rank BETWEEN 1 AND 8) AND (head_rank IS NOT NULL OR pair_rank IS NOT NULL)))",
     "CREATE INDEX IF NOT EXISTS artifact_base_retention_scope ON artifact_base_retention(workspace,repo,format_version)",
+    "CREATE TABLE IF NOT EXISTS artifact_gc_sweep(id INTEGER PRIMARY KEY CHECK(id=1),owner TEXT NOT NULL,expires_at INTEGER NOT NULL)",
     "CREATE TABLE IF NOT EXISTS scheduler_state(id INTEGER PRIMARY KEY CHECK(id=1),fairness_cursor INTEGER NOT NULL CHECK(fairness_cursor BETWEEN 0 AND 3),workspace_cursor TEXT NOT NULL DEFAULT '',config_fingerprint TEXT NOT NULL DEFAULT '')",
 ];
 
@@ -102,7 +103,6 @@ impl LibsqlArtifactScheduler {
             for ddl in SCHEMA {
                 tx.execute(ddl, ()).await?;
             }
-            tx.execute(GC_SWEEP_SCHEMA, ()).await?;
             tx.execute(
                 "INSERT INTO artifact_scheduler_schema(id,version,provenance) VALUES(1,?,?)",
                 libsql::params![VERSION, PROVENANCE],
@@ -166,10 +166,10 @@ impl LibsqlArtifactScheduler {
             let provenance = marker.get::<String>(1)?;
             if version == 3 && provenance == V3_PROVENANCE {
                 let preexisting_gc = one_i64(&tx,"SELECT count(*) FROM sqlite_master WHERE type='table' AND name='artifact_gc_sweep'",vec![]).await?;
-                if preexisting_gc != 0 {
-                    bail!("libsql v3 scheduler has an unversioned v4 GC table")
+                if preexisting_gc != 1 {
+                    bail!("libsql v3 scheduler is missing its GC table")
                 }
-                tx.execute(GC_SWEEP_SCHEMA, ()).await?;
+                validate_schema(&tx, 3, V3_PROVENANCE).await?;
                 tx.execute("UPDATE artifact_scheduler_schema SET version=?,provenance=? WHERE id=1 AND version=3 AND provenance=?",libsql::params![VERSION,PROVENANCE,V3_PROVENANCE]).await?;
             } else if version != VERSION || provenance != PROVENANCE {
                 bail!("unsupported or foreign libsql artifact scheduler schema")
@@ -177,7 +177,7 @@ impl LibsqlArtifactScheduler {
         } else {
             bail!("partial or unprovenanced libsql artifact scheduler schema")
         }
-        validate_schema(&tx).await?;
+        validate_schema(&tx, VERSION, PROVENANCE).await?;
         let fingerprint = scheduler_fingerprint(&limits, identity);
         let stored = one_string(
             &tx,
@@ -862,7 +862,11 @@ impl ArtifactSchedulerPersistence for LibsqlArtifactScheduler {
     }
 }
 
-async fn validate_schema(c: &Connection) -> Result<()> {
+async fn validate_schema(
+    c: &Connection,
+    expected_version: i64,
+    expected_provenance: &str,
+) -> Result<()> {
     let row = query_one(
         c,
         "SELECT version,provenance FROM artifact_scheduler_schema WHERE id=1",
@@ -870,7 +874,7 @@ async fn validate_schema(c: &Connection) -> Result<()> {
     )
     .await?
     .context("artifact scheduler schema marker missing")?;
-    if row.get::<i64>(0)? != VERSION || row.get::<String>(1)? != PROVENANCE {
+    if row.get::<i64>(0)? != expected_version || row.get::<String>(1)? != expected_provenance {
         bail!("unsupported or foreign libsql artifact scheduler schema")
     }
     let expected = [
@@ -1468,8 +1472,17 @@ mod tests {
         for ddl in SCHEMA {
             tx.execute(ddl, ()).await.unwrap();
         }
-        if gc {
-            tx.execute(GC_SWEEP_SCHEMA, ()).await.unwrap();
+        if version == 2 {
+            tx.execute("DROP TABLE artifact_base_retention", ())
+                .await
+                .unwrap();
+            tx.execute("DROP TABLE artifact_gc_sweep", ())
+                .await
+                .unwrap();
+        } else if !gc {
+            tx.execute("DROP TABLE artifact_gc_sweep", ())
+                .await
+                .unwrap();
         }
         tx.execute(
             "INSERT INTO artifact_scheduler_schema(id,version,provenance) VALUES(1,?,?)",
@@ -1489,7 +1502,7 @@ mod tests {
     #[tokio::test]
     async fn released_v3_migrates_to_v4_and_mixed_partial_future_fail_closed() {
         let Some(v3) = server().await else { return };
-        install_version_fixture(&v3.url, 3, V3_PROVENANCE, false).await;
+        install_version_fixture(&v3.url, 3, V3_PROVENANCE, true).await;
         let migrated = scheduler(&v3.url, Default::default()).await;
         let connection = migrated.conn().await.unwrap();
         assert_eq!(
@@ -1516,14 +1529,58 @@ mod tests {
         drop(migrated);
         drop(v3);
 
-        let Some(mixed) = server().await else { return };
-        install_version_fixture(&mixed.url, 3, V3_PROVENANCE, true).await;
-        assert!(
-            startup_error(&mixed.url)
-                .await
-                .contains("unversioned v4 GC table")
+        let Some(v2) = server().await else { return };
+        install_version_fixture(&v2.url, 2, "ripclone-artifact-scheduler-libsql-v2", false).await;
+        let migrated_v2 = scheduler(&v2.url, Default::default()).await;
+        assert_eq!(
+            one_i64(
+                &migrated_v2.conn().await.unwrap(),
+                "SELECT version FROM artifact_scheduler_schema WHERE id=1",
+                vec![]
+            )
+            .await
+            .unwrap(),
+            4
         );
-        drop(mixed);
+        drop(migrated_v2);
+        drop(v2);
+
+        let Some(missing_base) = server().await else {
+            return;
+        };
+        install_version_fixture(&missing_base.url, 3, V3_PROVENANCE, true).await;
+        db(&missing_base.url)
+            .await
+            .connect()
+            .unwrap()
+            .execute("DROP TABLE artifact_base_retention", ())
+            .await
+            .unwrap();
+        assert!(!startup_error(&missing_base.url).await.is_empty());
+        drop(missing_base);
+
+        let Some(missing_index) = server().await else {
+            return;
+        };
+        install_version_fixture(&missing_index.url, 3, V3_PROVENANCE, true).await;
+        db(&missing_index.url)
+            .await
+            .connect()
+            .unwrap()
+            .execute("DROP INDEX artifact_base_retention_scope", ())
+            .await
+            .unwrap();
+        assert!(!startup_error(&missing_index.url).await.is_empty());
+        drop(missing_index);
+
+        let Some(wrong_constraint) = server().await else {
+            return;
+        };
+        install_version_fixture(&wrong_constraint.url, 3, V3_PROVENANCE, true).await;
+        let connection = db(&wrong_constraint.url).await.connect().unwrap();
+        connection.execute_batch("DROP TABLE artifact_base_retention; CREATE TABLE artifact_base_retention(artifact_id INTEGER PRIMARY KEY,workspace TEXT NOT NULL,repo TEXT NOT NULL,format_version INTEGER NOT NULL,head_rank INTEGER,pair_rank INTEGER); CREATE INDEX artifact_base_retention_scope ON artifact_base_retention(workspace,repo,format_version)").await.unwrap();
+        assert!(!startup_error(&wrong_constraint.url).await.is_empty());
+        drop(wrong_constraint);
 
         let Some(partial) = server().await else {
             return;

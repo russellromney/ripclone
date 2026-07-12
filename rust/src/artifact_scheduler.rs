@@ -647,6 +647,8 @@ CREATE TABLE IF NOT EXISTS artifact_transport_leases(
  root_hash TEXT NOT NULL,session_id TEXT NOT NULL,workspace TEXT NOT NULL,repo TEXT NOT NULL,
  expires_at INTEGER NOT NULL,PRIMARY KEY(root_hash,session_id));
 CREATE INDEX IF NOT EXISTS artifact_transport_leases_expiry ON artifact_transport_leases(expires_at);
+CREATE TABLE IF NOT EXISTS artifact_gc_sweep(
+ id INTEGER PRIMARY KEY CHECK(id=1),owner TEXT NOT NULL,expires_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS scheduler_state(id INTEGER PRIMARY KEY CHECK(id=1),fairness_cursor INTEGER NOT NULL,workspace_cursor TEXT NOT NULL DEFAULT '',config_fingerprint TEXT NOT NULL DEFAULT '');
 INSERT OR IGNORE INTO scheduler_state(id,fairness_cursor) VALUES(1,0);
 "#;
@@ -703,17 +705,21 @@ impl ArtifactScheduler {
             bail!("completion verifier identity is empty")
         }
         let fingerprint = scheduler_fingerprint(&limits, verifier_id);
+        let mut migration = pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *migration)
+            .await?;
         let prior_version: i64 = sqlx::query_scalar("PRAGMA user_version")
-            .fetch_one(&pool)
+            .fetch_one(&mut *migration)
             .await?;
         if prior_version > 4 {
             bail!("artifact scheduler database is newer than this binary")
         }
+        preflight_sqlite_schema(&mut migration, prior_version).await?;
         sqlx::raw_sql(SCHEMA)
-            .execute(&pool)
+            .execute(&mut *migration)
             .await
             .context("initialize artifact scheduler")?;
-        let mut migration = pool.begin().await?;
         for (table, column, definition) in [
             (
                 "artifact_jobs",
@@ -997,20 +1003,15 @@ impl ArtifactScheduler {
           SELECT head_id,workspace,repo,format_version,NULL,pair_rank FROM (SELECT h.id head_id,h.workspace,h.repo,h.format_version,row_number() OVER(PARTITION BY h.workspace,h.repo,h.format_version ORDER BY CASE WHEN h.updated_at>f.updated_at THEN h.updated_at ELSE f.updated_at END DESC,CASE WHEN h.id>f.id THEN h.id ELSE f.id END DESC) pair_rank FROM artifact_jobs h JOIN artifact_jobs f ON f.workspace=h.workspace AND f.repo=h.repo AND f.commit_oid=h.commit_oid AND f.format_version=h.format_version AND f.kind='full_history' AND f.state='ready' AND f.manifest IS NOT NULL AND length(trim(f.manifest))>0 WHERE h.kind='head' AND h.state='ready' AND h.manifest IS NOT NULL AND length(trim(h.manifest))>0) WHERE pair_rank<=8 ON CONFLICT(artifact_id) DO UPDATE SET pair_rank=excluded.pair_rank;
           INSERT INTO artifact_base_retention(artifact_id,workspace,repo,format_version,head_rank,pair_rank)
           SELECT history_id,workspace,repo,format_version,NULL,pair_rank FROM (SELECT f.id history_id,h.workspace,h.repo,h.format_version,row_number() OVER(PARTITION BY h.workspace,h.repo,h.format_version ORDER BY CASE WHEN h.updated_at>f.updated_at THEN h.updated_at ELSE f.updated_at END DESC,CASE WHEN h.id>f.id THEN h.id ELSE f.id END DESC) pair_rank FROM artifact_jobs h JOIN artifact_jobs f ON f.workspace=h.workspace AND f.repo=h.repo AND f.commit_oid=h.commit_oid AND f.format_version=h.format_version AND f.kind='full_history' AND f.state='ready' AND f.manifest IS NOT NULL AND length(trim(f.manifest))>0 WHERE h.kind='head' AND h.state='ready' AND h.manifest IS NOT NULL AND length(trim(h.manifest))>0) WHERE pair_rank<=8 ON CONFLICT(artifact_id) DO UPDATE SET pair_rank=excluded.pair_rank;
-          PRAGMA user_version=3")
+          PRAGMA user_version=4")
             .execute(&mut *migration)
             .await?;
+        } else if prior_version == 3 {
+            sqlx::query("PRAGMA user_version=4")
+                .execute(&mut *migration)
+                .await?;
         }
-        if prior_version < 4 {
-            sqlx::raw_sql(
-                "CREATE TABLE artifact_gc_sweep(
-                   id INTEGER PRIMARY KEY CHECK(id=1),owner TEXT NOT NULL,expires_at INTEGER NOT NULL);
-                 PRAGMA user_version=4",
-            )
-            .execute(&mut *migration)
-            .await?;
-        }
-        migration.commit().await?;
+        sqlx::query("COMMIT").execute(&mut *migration).await?;
         let version: i64 = sqlx::query_scalar("PRAGMA user_version")
             .fetch_one(&pool)
             .await?;
@@ -2394,6 +2395,67 @@ async fn db_now(c: &mut PoolConnection<Sqlite>) -> Result<i64> {
     Ok(sqlx::query_scalar("SELECT unixepoch()")
         .fetch_one(&mut **c)
         .await?)
+}
+
+fn canonical_sqlite_ddl(sql: &str) -> String {
+    sql.chars()
+        .filter(|character| !character.is_whitespace() && *character != '`' && *character != '"')
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+async fn preflight_sqlite_schema(
+    connection: &mut PoolConnection<Sqlite>,
+    version: i64,
+) -> Result<()> {
+    if version == 0 || version == 1 {
+        return Ok(());
+    }
+    let expected_tables = if version == 2 { 6 } else { 8 };
+    let tables: i64 = sqlx::query_scalar("SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN('artifact_jobs','artifact_base_retention','branch_observations','artifact_observations','artifact_consumers','artifact_transport_leases','artifact_gc_sweep','scheduler_state')")
+        .fetch_one(&mut **connection).await?;
+    let expected_indexes = if version == 2 { 4 } else { 5 };
+    let indexes: i64 = sqlx::query_scalar("SELECT count(*) FROM sqlite_master WHERE type='index' AND name IN('artifact_jobs_claim','artifact_jobs_lease','artifact_base_retention_repo','artifact_observations_published','artifact_transport_leases_expiry')")
+        .fetch_one(&mut **connection).await?;
+    if tables != expected_tables || indexes != expected_indexes {
+        bail!("sqlite artifact scheduler schema marker does not match its table/index inventory")
+    }
+    let additions: i64 = sqlx::query_scalar("SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN('artifact_base_retention','artifact_gc_sweep')")
+        .fetch_one(&mut **connection).await?;
+    if version == 2 {
+        if additions != 0 {
+            bail!("sqlite v2 scheduler contains unversioned v3 additions")
+        }
+        return Ok(());
+    }
+    if additions != 2 {
+        bail!("sqlite v3/v4 scheduler is missing retention or GC state")
+    }
+    let base_sql: String = sqlx::query_scalar(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='artifact_base_retention'",
+    )
+    .fetch_one(&mut **connection)
+    .await?;
+    let base_index_sql: String = sqlx::query_scalar(
+        "SELECT sql FROM sqlite_master WHERE type='index' AND name='artifact_base_retention_repo'",
+    )
+    .fetch_one(&mut **connection)
+    .await?;
+    let gc_sql: String = sqlx::query_scalar(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='artifact_gc_sweep'",
+    )
+    .fetch_one(&mut **connection)
+    .await?;
+    if canonical_sqlite_ddl(&base_sql)
+        != "createtableartifact_base_retention(artifact_idintegerprimarykey,workspacetextnotnull,repotextnotnull,format_versionintegernotnull,head_rankintegercheck(head_rankbetween1and8),pair_rankintegercheck(pair_rankbetween1and8),check(head_rankisnotnullorpair_rankisnotnull),foreignkey(artifact_id)referencesartifact_jobs(id)ondeletecascade)"
+        || canonical_sqlite_ddl(&base_index_sql)
+            != "createindexartifact_base_retention_repoonartifact_base_retention(workspace,repo,format_version,artifact_id)"
+        || canonical_sqlite_ddl(&gc_sql)
+            != "createtableartifact_gc_sweep(idintegerprimarykeycheck(id=1),ownertextnotnull,expires_atintegernotnull)"
+    {
+        bail!("sqlite scheduler retention/GC DDL differs from its schema marker")
+    }
+    Ok(())
 }
 
 fn validate_gc_sweep(owner: &str, ttl_secs: i64) -> Result<()> {
@@ -4539,9 +4601,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn released_v3_migrates_to_v4_and_mixed_partial_future_shapes_fail_closed() {
+    async fn historical_v2_and_e056_v3_migrate_to_v4_while_partial_shapes_fail_closed() {
         let (v3, _dir, v3_path) = scheduler(Default::default()).await;
-        sqlx::raw_sql("DROP TABLE artifact_gc_sweep; PRAGMA user_version=3")
+        sqlx::query("PRAGMA user_version=3")
             .execute(&v3.pool)
             .await
             .unwrap();
@@ -4566,6 +4628,22 @@ mod tests {
             3
         );
 
+        let (v2, _dir, v2_path) = scheduler(Default::default()).await;
+        sqlx::raw_sql("DROP TABLE artifact_base_retention; DROP TABLE artifact_gc_sweep; PRAGMA user_version=2")
+            .execute(&v2.pool).await.unwrap();
+        drop(v2);
+        let migrated_v2 = ArtifactScheduler::open(&v2_path, Default::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("PRAGMA user_version")
+                .fetch_one(&migrated_v2.pool)
+                .await
+                .unwrap(),
+            4
+        );
+        assert_eq!(sqlx::query_scalar::<_,i64>("SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN('artifact_base_retention','artifact_gc_sweep')").fetch_one(&migrated_v2.pool).await.unwrap(),2);
+
         let (partial, _dir, partial_path) = scheduler(Default::default()).await;
         sqlx::query("DROP TABLE artifact_gc_sweep")
             .execute(&partial.pool)
@@ -4578,14 +4656,35 @@ mod tests {
                 .is_err()
         );
 
-        let (mixed, _dir, mixed_path) = scheduler(Default::default()).await;
-        sqlx::query("PRAGMA user_version=3")
-            .execute(&mixed.pool)
+        let (missing_base, _dir, missing_base_path) = scheduler(Default::default()).await;
+        sqlx::raw_sql("DROP TABLE artifact_base_retention; PRAGMA user_version=3")
+            .execute(&missing_base.pool)
             .await
             .unwrap();
-        drop(mixed);
+        drop(missing_base);
         assert!(
-            ArtifactScheduler::open(&mixed_path, Default::default())
+            ArtifactScheduler::open(&missing_base_path, Default::default())
+                .await
+                .is_err()
+        );
+
+        let (missing_index, _dir, missing_index_path) = scheduler(Default::default()).await;
+        sqlx::raw_sql("DROP INDEX artifact_base_retention_repo; PRAGMA user_version=3")
+            .execute(&missing_index.pool)
+            .await
+            .unwrap();
+        drop(missing_index);
+        assert!(
+            ArtifactScheduler::open(&missing_index_path, Default::default())
+                .await
+                .is_err()
+        );
+
+        let (wrong_constraint, _dir, wrong_constraint_path) = scheduler(Default::default()).await;
+        sqlx::raw_sql("DROP TABLE artifact_base_retention; CREATE TABLE artifact_base_retention(artifact_id INTEGER PRIMARY KEY,workspace TEXT NOT NULL,repo TEXT NOT NULL,format_version INTEGER NOT NULL,head_rank INTEGER,pair_rank INTEGER); CREATE INDEX artifact_base_retention_repo ON artifact_base_retention(workspace,repo,format_version,artifact_id); PRAGMA user_version=3").execute(&wrong_constraint.pool).await.unwrap();
+        drop(wrong_constraint);
+        assert!(
+            ArtifactScheduler::open(&wrong_constraint_path, Default::default())
                 .await
                 .is_err()
         );
@@ -4601,6 +4700,18 @@ mod tests {
                 .await
                 .is_err()
         );
+
+        let (concurrent, _dir, concurrent_path) = scheduler(Default::default()).await;
+        sqlx::query("PRAGMA user_version=3")
+            .execute(&concurrent.pool)
+            .await
+            .unwrap();
+        drop(concurrent);
+        let (first, second) = tokio::join!(
+            ArtifactScheduler::open(&concurrent_path, Default::default()),
+            ArtifactScheduler::open(&concurrent_path, Default::default())
+        );
+        assert!(first.is_ok() && second.is_ok());
     }
 
     #[tokio::test]
