@@ -153,12 +153,17 @@ pub trait ArtifactObservation: Send + Sync {
     /// pressure may make an intent Deferred, but may not roll back the target,
     /// source root, or another mode. Runnable admission/wakeup occurs after this
     /// transaction and is never the first durable memory of desired work.
+    /// `EnsureCurrent` may atomically requeue retryable failures below the
+    /// configured cap. `ObserveMovement` must only record/subscribe/report and
+    /// must never consume a retry; permanent, exhausted, and dead-lettered
+    /// failures remain Failed for either intent.
     async fn record_tip_and_intents(
         &self,
         snapshot: &ObservationSnapshot,
         source: &DurableSourceSnapshot,
         kinds: &[ArtifactKind],
         format_version: u32,
+        intent: SyncIntent,
     ) -> Result<ArtifactObservationOutcome>;
 }
 
@@ -215,7 +220,13 @@ where
             validate_source_identity(request, &commit, &source)?;
             match self
                 .observations
-                .record_tip_and_intents(&before, &source, &kinds, request.format_version)
+                .record_tip_and_intents(
+                    &before,
+                    &source,
+                    &kinds,
+                    request.format_version,
+                    request.intent,
+                )
                 .await
                 .context("atomically publish branch target, source root, and artifact intents")?
             {
@@ -329,6 +340,7 @@ mod tests {
         snapshots: Arc<Mutex<VecDeque<ObservationSnapshot>>>,
         outcomes: Arc<Mutex<VecDeque<ArtifactObservationOutcome>>>,
         observed: Arc<Mutex<Vec<String>>>,
+        intents: Arc<Mutex<Vec<SyncIntent>>>,
     }
     #[async_trait]
     impl ArtifactObservation for Observations {
@@ -347,8 +359,10 @@ mod tests {
             source: &DurableSourceSnapshot,
             _: &[ArtifactKind],
             _: u32,
+            intent: SyncIntent,
         ) -> Result<ArtifactObservationOutcome> {
             self.observed.lock().unwrap().push(source.commit.to_owned());
+            self.intents.lock().unwrap().push(intent);
             Ok(self
                 .outcomes
                 .lock()
@@ -396,6 +410,7 @@ mod tests {
             snapshots: Arc::new(Mutex::new(snapshots.into())),
             outcomes: Arc::new(Mutex::new(outcomes.into())),
             observed: Arc::new(Mutex::new(Vec::new())),
+            intents: Arc::new(Mutex::new(Vec::new())),
         };
         (
             NormalizedSyncCoordinator::new(resolver.clone(), sources.clone(), observations.clone()),
@@ -464,6 +479,7 @@ mod tests {
         assert_eq!(*resolver.calls.lock().unwrap(), 1);
         assert!(sources.calls.lock().unwrap().is_empty());
         assert!(observations.observed.lock().unwrap().is_empty());
+        assert!(observations.intents.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -490,6 +506,10 @@ mod tests {
         ));
         assert_eq!(*sources.calls.lock().unwrap(), vec![C2]);
         assert_eq!(*observations.observed.lock().unwrap(), vec![C2]);
+        assert_eq!(
+            *observations.intents.lock().unwrap(),
+            vec![SyncIntent::ObserveMovement]
+        );
     }
 
     #[tokio::test]
@@ -551,6 +571,10 @@ mod tests {
         ));
         assert_eq!(*sources.calls.lock().unwrap(), vec![C1]);
         assert_eq!(*observations.observed.lock().unwrap(), vec![C1]);
+        assert_eq!(
+            *observations.intents.lock().unwrap(),
+            vec![SyncIntent::EnsureCurrent]
+        );
     }
 
     #[tokio::test]
