@@ -2354,7 +2354,7 @@ CREATE TABLE ready_publication_fence_members(
     }
 
     #[tokio::test]
-    async fn released_v2_migrates_atomically_to_union_v5_without_changing_jobs() {
+    async fn released_v2_migrates_atomically_to_union_v6_without_changing_jobs() {
         let f = Fixture::new().await;
         f.add("attempt-1").await;
         f.coordinator
@@ -2389,7 +2389,7 @@ CREATE TABLE ready_publication_fence_members(
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
                 "SELECT generation FROM ready_publication_fence_sequence WHERE id=1",

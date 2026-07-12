@@ -5,11 +5,11 @@
 //! settlement are O(1) conditional updates and do not take the control lock.
 
 use crate::artifact_scheduler::{
-    ArtifactKey, ArtifactKind, ArtifactRecord, ArtifactState, ClaimedArtifact,
-    CompletionSealAuthority, CompletionVerifier, FailureClass, ObservationOutcome,
-    ObservationSnapshot, QuarantineOutcome, RetryOutcome, ScheduleOutcome, SchedulerLimits,
-    VerifiedCompletionEvidence, scheduler_fingerprint, validate_lease, validate_limits,
-    validate_resolved_commit,
+    ActivationFenceProvenance, ArtifactKey, ArtifactKind, ArtifactRecord, ArtifactState,
+    ClaimedArtifact, CompletionSealAuthority, CompletionVerifier, FailureClass, ObservationOutcome,
+    ObservationSnapshot, QuarantineOutcome, ReadyPublicationFence, RetryOutcome, ScheduleOutcome,
+    SchedulerLimits, UnknownActivationFencePage, VerifiedCompletionEvidence, scheduler_fingerprint,
+    validate_lease, validate_limits, validate_resolved_commit,
 };
 #[cfg(test)]
 use crate::artifact_scheduler::{CompletionEvidence, validate_evidence};
@@ -23,9 +23,12 @@ use sqlx::mysql::MySqlPool;
 use sqlx::{Acquire, MySql, MySqlConnection, Row, Transaction};
 use std::sync::Arc;
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 const V1_TO_V4_TRANSITION: i64 = 401;
 const V2_TO_V4_TRANSITION: i64 = 402;
+const V5_TO_V6_DDL: i64 = 501;
+const V5_TO_V6_VALIDATED: i64 = 502;
+const _: () = assert!(V5_TO_V6_DDL > 5 && V5_TO_V6_VALIDATED > 5);
 const SCHEMA: &[&str] = &[
     r#"CREATE TABLE IF NOT EXISTS artifact_scheduler_schema(
  id SMALLINT NOT NULL PRIMARY KEY,
@@ -89,6 +92,9 @@ const SCHEMA: &[&str] = &[
  workspace_cursor VARCHAR(128) NOT NULL DEFAULT '',config_fingerprint VARCHAR(512) NOT NULL DEFAULT '',
  CONSTRAINT scheduler_state_singleton CHECK(id=1),
  CONSTRAINT scheduler_state_fairness CHECK(fairness_cursor BETWEEN 0 AND 3)) ENGINE=InnoDB DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin"#,
+    r#"CREATE TABLE IF NOT EXISTS ready_publication_fence_sequence(id SMALLINT NOT NULL PRIMARY KEY,generation BIGINT NOT NULL,CONSTRAINT ready_fence_sequence_singleton CHECK(id=1),CONSTRAINT ready_fence_sequence_generation CHECK(generation>=0)) ENGINE=InnoDB DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin"#,
+    r#"CREATE TABLE IF NOT EXISTS ready_publication_fences(token VARCHAR(64) NOT NULL PRIMARY KEY,generation BIGINT NOT NULL UNIQUE,operation_id VARCHAR(96) NOT NULL UNIQUE,workspace VARCHAR(128) NOT NULL,repo VARCHAR(320) NOT NULL,branch VARCHAR(191) NOT NULL,target VARCHAR(64) NOT NULL,attempt_id VARCHAR(255) NOT NULL,expires_at BIGINT NOT NULL,state VARCHAR(24) NOT NULL,CONSTRAINT ready_fences_generation CHECK(generation>0),CONSTRAINT ready_fences_state CHECK(state IN('held','activation_unknown')),UNIQUE(token,generation),INDEX ready_publication_fences_recovery(state,generation,token)) ENGINE=InnoDB DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin"#,
+    r#"CREATE TABLE IF NOT EXISTS ready_publication_fence_members(token VARCHAR(64) NOT NULL,generation BIGINT NOT NULL,artifact_id BIGINT NOT NULL,manifest LONGTEXT NOT NULL,PRIMARY KEY(token,artifact_id),CONSTRAINT ready_fence_members_generation CHECK(generation>0),CONSTRAINT ready_fence_members_parent FOREIGN KEY(token,generation) REFERENCES ready_publication_fences(token,generation) ON DELETE CASCADE,CONSTRAINT ready_fence_members_artifact FOREIGN KEY(artifact_id) REFERENCES artifact_jobs(id) ON DELETE CASCADE) ENGINE=InnoDB DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin"#,
 ];
 
 #[derive(Clone)]
@@ -99,6 +105,59 @@ pub struct MysqlArtifactScheduler {
     completion_sealer: Arc<CompletionSealAuthority>,
 }
 struct MysqlGcDeleteFence(Option<Transaction<'static, MySql>>);
+fn validate_mysql_fence(
+    expected: &[(i64, Option<String>)],
+    p: &ActivationFenceProvenance,
+    ttl: i64,
+) -> Result<()> {
+    if expected.len() != 2
+        || expected[0].0 == expected[1].0
+        || expected
+            .iter()
+            .any(|(id, m)| *id <= 0 || m.as_deref().is_none_or(|v| v.trim().is_empty()))
+        || [&p.workspace, &p.repo, &p.branch, &p.target, &p.attempt_id]
+            .iter()
+            .any(|v| v.trim().is_empty())
+        || !(1..=3600).contains(&ttl)
+    {
+        bail!("invalid Ready publication fence")
+    }
+    validate_mysql_identity(&p.workspace, &p.repo, Some(&p.branch))?;
+    Ok(())
+}
+fn mysql_expected(v: &[(i64, Option<String>)]) -> Vec<(i64, Option<String>)> {
+    let mut v = v.to_vec();
+    v.sort_by_key(|x| x.0);
+    v
+}
+async fn exact_ready_pair_mysql(
+    tx: &mut Transaction<'_, MySql>,
+    e: &[(i64, Option<String>)],
+    p: &ActivationFenceProvenance,
+) -> Result<bool> {
+    let rows:Vec<(i64,String,String,String,String,i64,Option<String>)>=sqlx::query_as("SELECT id,workspace,repo,commit_oid,kind,format_version,manifest FROM artifact_jobs WHERE id IN(?,?) AND state='ready' FOR UPDATE").bind(e[0].0).bind(e[1].0).fetch_all(&mut **tx).await?;
+    if rows.len() != 2 {
+        return Ok(false);
+    }
+    let mut kinds = Vec::new();
+    let mut format = None;
+    for (id, w, r, c, k, v, m) in rows {
+        let want = e.iter().find(|x| x.0 == id).unwrap();
+        if w != p.workspace
+            || r != p.repo
+            || c != p.target
+            || m != want.1
+            || m.as_deref().is_none_or(|x| x.trim().is_empty())
+            || format.is_some_and(|x| x != v)
+        {
+            return Ok(false);
+        }
+        format = Some(v);
+        kinds.push(k)
+    }
+    kinds.sort();
+    Ok(kinds == ["full_history", "head"])
+}
 #[async_trait]
 impl GcDeleteFence for MysqlGcDeleteFence {
     async fn release(mut self: Box<Self>) -> Result<()> {
@@ -112,6 +171,16 @@ impl GcDeleteFence for MysqlGcDeleteFence {
 async fn preflight_mysql_schema(connection: &mut MySqlConnection, version: i64) -> Result<()> {
     if version < 2 {
         return Ok(());
+    }
+    let fence_tables:i64=sqlx::query_scalar("SELECT count(*) FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name IN('ready_publication_fence_sequence','ready_publication_fences','ready_publication_fence_members')").fetch_one(&mut *connection).await?;
+    if version == 6 || fence_tables == 3 {
+        let columns:i64=sqlx::query_scalar("SELECT count(*) FROM information_schema.columns WHERE table_schema=DATABASE() AND ((table_name='ready_publication_fence_sequence' AND column_name IN('id','generation')) OR (table_name='ready_publication_fences' AND column_name IN('token','generation','operation_id','workspace','repo','branch','target','attempt_id','expires_at','state')) OR (table_name='ready_publication_fence_members' AND column_name IN('token','generation','artifact_id','manifest')))").fetch_one(&mut *connection).await?;
+        let recovery:i64=sqlx::query_scalar("SELECT count(*) FROM (SELECT index_name,GROUP_CONCAT(column_name ORDER BY seq_in_index) columns_csv FROM information_schema.statistics WHERE table_schema=DATABASE() AND table_name='ready_publication_fences' GROUP BY index_name) i WHERE index_name='ready_publication_fences_recovery' AND columns_csv='state,generation,token'").fetch_one(&mut *connection).await?;
+        if fence_tables != 3 || columns != 16 || recovery != 1 {
+            bail!("mysql v6 Ready fence schema differs from its marker")
+        }
+    } else if version == 5 && fence_tables != 0 {
+        bail!("mysql v5 marker contains a partial v6 Ready fence schema")
     }
     let tables:i64=sqlx::query_scalar("SELECT count(*) FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name IN('artifact_scheduler_schema','artifact_jobs','branch_observations','artifact_observations','artifact_consumers','artifact_transport_leases','artifact_base_retention','artifact_gc_sweep','scheduler_state')").fetch_one(&mut *connection).await?;
     if tables != if version == 2 { 7 } else { 9 } {
@@ -183,6 +252,65 @@ async fn preflight_mysql_transition(connection: &mut MySqlConnection, version: i
     Ok(())
 }
 
+async fn preflight_mysql_v6_transition(c: &mut MySqlConnection, marker: i64) -> Result<()> {
+    let core:i64=sqlx::query_scalar("SELECT count(*) FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name IN('artifact_scheduler_schema','artifact_jobs','branch_observations','artifact_observations','artifact_consumers','artifact_transport_leases','artifact_base_retention','artifact_gc_sweep','scheduler_state')").fetch_one(&mut *c).await?;
+    if core != 9 {
+        bail!("mysql v6 transition is missing the exact v5 core")
+    }
+    let fences:i64=sqlx::query_scalar("SELECT count(*) FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name IN('ready_publication_fence_sequence','ready_publication_fences','ready_publication_fence_members')").fetch_one(&mut *c).await?;
+    let fence_namespace:i64=sqlx::query_scalar("SELECT count(*) FROM information_schema.tables WHERE table_schema=DATABASE() AND LEFT(table_name,23)='ready_publication_fence'").fetch_one(&mut *c).await?;
+    if fence_namespace != fences {
+        bail!("mysql v6 transition contains an unexpected Ready fence table")
+    }
+    if marker == V5_TO_V6_VALIDATED && fences != 3 {
+        bail!("mysql validated v6 transition is incomplete")
+    }
+    for (table, columns, expected_names) in [
+        (
+            "ready_publication_fence_sequence",
+            2_i64,
+            "'id','generation'",
+        ),
+        (
+            "ready_publication_fences",
+            10,
+            "'token','generation','operation_id','workspace','repo','branch','target','attempt_id','expires_at','state'",
+        ),
+        (
+            "ready_publication_fence_members",
+            4,
+            "'token','generation','artifact_id','manifest'",
+        ),
+    ] {
+        let exists:i64=sqlx::query_scalar("SELECT count(*) FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name=?").bind(table).fetch_one(&mut *c).await?;
+        if exists == 1 {
+            let actual:i64=sqlx::query_scalar("SELECT count(*) FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name=?").bind(table).fetch_one(&mut *c).await?;
+            let recognized_sql = format!(
+                "SELECT count(*) FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name=? AND column_name IN({expected_names})"
+            );
+            let recognized: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(recognized_sql))
+                .bind(table)
+                .fetch_one(&mut *c)
+                .await?;
+            if actual != columns || recognized != columns {
+                bail!("mysql v6 transition contains malformed {table}")
+            }
+        }
+    }
+    if fences == 3 {
+        let sequence: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM ready_publication_fence_sequence WHERE id=1 AND generation>=0",
+        )
+        .fetch_one(&mut *c)
+        .await?;
+        let invalid:i64=sqlx::query_scalar("SELECT (SELECT count(*) FROM ready_publication_fences)+(SELECT count(*) FROM ready_publication_fence_members)").fetch_one(&mut *c).await?;
+        if (marker == V5_TO_V6_VALIDATED && sequence != 1) || sequence > 1 || invalid != 0 {
+            bail!("mysql v6 transition contains unprovenanced fence state")
+        }
+    }
+    Ok(())
+}
+
 impl MysqlArtifactScheduler {
     pub async fn from_pool(
         pool: MySqlPool,
@@ -208,7 +336,7 @@ impl MysqlArtifactScheduler {
         }
         let initialized: Result<()> = async {
             let marker_exists:i64=sqlx::query_scalar("SELECT count(*) FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name='artifact_scheduler_schema'").fetch_one(&mut connection).await?;
-            let version: i64 = if marker_exists == 0 {
+            let mut version: i64 = if marker_exists == 0 {
                 let partial:i64=sqlx::query_scalar("SELECT count(*) FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name IN('artifact_jobs','branch_observations','artifact_observations','artifact_consumers','artifact_transport_leases','artifact_base_retention','artifact_gc_sweep','scheduler_state')").fetch_one(&mut connection).await?;
                 if partial != 0 { bail!("unmarked partial mysql artifact scheduler schema") }
                 for statement in SCHEMA { sqlx::raw_sql(*statement).execute(&mut connection).await?; }
@@ -217,27 +345,51 @@ impl MysqlArtifactScheduler {
                 3
             } else {
                 let version:i64=sqlx::query_scalar("SELECT version FROM artifact_scheduler_schema WHERE id=1").fetch_one(&mut connection).await?;
-                if version > SCHEMA_VERSION && ![V1_TO_V4_TRANSITION,V2_TO_V4_TRANSITION].contains(&version) { bail!("artifact scheduler database is newer than this binary") }
-                if ![1,2,3,4,SCHEMA_VERSION,V1_TO_V4_TRANSITION,V2_TO_V4_TRANSITION].contains(&version) { bail!("unsupported mysql artifact scheduler schema {version}") }
+                if version > SCHEMA_VERSION && ![V1_TO_V4_TRANSITION,V2_TO_V4_TRANSITION,V5_TO_V6_DDL,V5_TO_V6_VALIDATED].contains(&version) { bail!("artifact scheduler database is newer than this binary") }
+                if ![1,2,3,4,5,SCHEMA_VERSION,V1_TO_V4_TRANSITION,V2_TO_V4_TRANSITION,V5_TO_V6_DDL,V5_TO_V6_VALIDATED].contains(&version) { bail!("unsupported mysql artifact scheduler schema {version}") }
                 if [V1_TO_V4_TRANSITION,V2_TO_V4_TRANSITION].contains(&version) {
                     preflight_mysql_transition(&mut connection, version).await?;
+                } else if [V5_TO_V6_DDL,V5_TO_V6_VALIDATED].contains(&version) {
+                    preflight_mysql_v6_transition(&mut connection,version).await?;
                 } else {
                     preflight_mysql_schema(&mut connection,version).await?;
                 }
                 if version == 3 || version == 4 || version == SCHEMA_VERSION {
                     for statement in SCHEMA { sqlx::raw_sql(*statement).execute(&mut connection).await?; }
                     sqlx::query("INSERT INTO scheduler_state(id,fairness_cursor) VALUES(1,0) ON DUPLICATE KEY UPDATE id=VALUES(id)").execute(&mut connection).await?;
+                    sqlx::query("INSERT INTO ready_publication_fence_sequence(id,generation) VALUES(1,0) ON DUPLICATE KEY UPDATE id=VALUES(id)").execute(&mut connection).await?;
                 }
                 version
             };
 
+            if version == 5 {
+                let mut marker=connection.begin().await?;
+                if sqlx::query("UPDATE artifact_scheduler_schema SET version=? WHERE id=1 AND version=5").bind(V5_TO_V6_DDL).execute(&mut *marker).await?.rows_affected()!=1{bail!("mysql v5 to v6 transition marker CAS failed")}
+                marker.commit().await?; version=V5_TO_V6_DDL;
+            }
+            if version == V5_TO_V6_DDL {
+                for statement in &SCHEMA[9..] { sqlx::raw_sql(*statement).execute(&mut connection).await?; }
+                sqlx::query("INSERT INTO ready_publication_fence_sequence(id,generation) VALUES(1,0) ON DUPLICATE KEY UPDATE id=VALUES(id)").execute(&mut connection).await?;
+                preflight_mysql_v6_transition(&mut connection,V5_TO_V6_VALIDATED).await?;
+                let mut marker=connection.begin().await?;
+                if sqlx::query("UPDATE artifact_scheduler_schema SET version=? WHERE id=1 AND version=?").bind(V5_TO_V6_VALIDATED).bind(V5_TO_V6_DDL).execute(&mut *marker).await?.rows_affected()!=1{bail!("mysql v6 validated marker CAS failed")}
+                marker.commit().await?; version=V5_TO_V6_VALIDATED;
+            }
+            if version == V5_TO_V6_VALIDATED {
+                preflight_mysql_v6_transition(&mut connection,V5_TO_V6_VALIDATED).await?;
+                let mut marker=connection.begin().await?;
+                if sqlx::query("UPDATE artifact_scheduler_schema SET version=? WHERE id=1 AND version=?").bind(SCHEMA_VERSION).bind(V5_TO_V6_VALIDATED).execute(&mut *marker).await?.rows_affected()!=1{bail!("mysql v6 publication marker CAS failed")}
+                marker.commit().await?; version=SCHEMA_VERSION;
+            }
+
             let mut migration = connection.begin().await?;
             let locked_version: i64 = sqlx::query_scalar("SELECT version FROM artifact_scheduler_schema WHERE id=1 FOR UPDATE").fetch_one(&mut *migration).await?;
+            sqlx::query("INSERT INTO ready_publication_fence_sequence(id,generation) VALUES(1,0) ON DUPLICATE KEY UPDATE id=VALUES(id)").execute(&mut *migration).await?;
             if locked_version != version { bail!("mysql artifact scheduler version changed under migration lock") }
             if version > SCHEMA_VERSION && ![V1_TO_V4_TRANSITION,V2_TO_V4_TRANSITION].contains(&version) {
                 bail!("artifact scheduler database is newer than this binary")
             }
-            if ![1, 2, 3, 4, SCHEMA_VERSION, V1_TO_V4_TRANSITION, V2_TO_V4_TRANSITION].contains(&version) {
+            if ![1, 2, 3, 4, 5, SCHEMA_VERSION, V1_TO_V4_TRANSITION, V2_TO_V4_TRANSITION].contains(&version) {
                 bail!("unsupported mysql artifact scheduler schema {version}")
             }
             if version == 1 || version == 2 {
@@ -280,7 +432,7 @@ impl MysqlArtifactScheduler {
                 for (w,r,v) in scopes { refresh_base_retention(&mut migration,&w,&r,v).await?; }
                 let changed=sqlx::query("UPDATE artifact_scheduler_schema SET version=? WHERE id=1 AND version=?").bind(SCHEMA_VERSION).bind(version).execute(&mut *migration).await?.rows_affected();
                 if changed != 1 { bail!("mysql transition marker changed during resumed v5 publication") }
-            } else if version == 3 || version == 4 {
+            } else if version == 3 || version == 4 || version == 5 {
                 let changed=sqlx::query("UPDATE artifact_scheduler_schema SET version=? WHERE id=1 AND version=?").bind(SCHEMA_VERSION).bind(version).execute(&mut *migration).await?.rows_affected();
                 if changed != 1 { bail!("mysql v3/v4 marker changed during v5 publication") }
             }
@@ -901,7 +1053,8 @@ impl MysqlArtifactScheduler {
                AND k.referenced_table_name IN
                   ('artifact_scheduler_schema','artifact_jobs','branch_observations',
                   'artifact_observations','artifact_consumers','artifact_transport_leases','artifact_base_retention','artifact_gc_sweep','scheduler_state')
-               AND NOT(k.table_name='artifact_base_retention' AND k.constraint_name='artifact_base_retention_artifact')",
+               AND NOT((k.table_name='artifact_base_retention' AND k.constraint_name='artifact_base_retention_artifact')
+                    OR (k.table_name='ready_publication_fence_members' AND k.constraint_name='ready_fence_members_artifact'))",
         )
         .fetch_one(&mut **tx)
         .await?;
@@ -1337,6 +1490,177 @@ impl ArtifactSchedulerPersistence for MysqlArtifactScheduler {
     fn completion_sealer(&self) -> Arc<CompletionSealAuthority> {
         self.completion_sealer.clone()
     }
+    fn full_admission_recovery_protocol_supported(&self) -> bool {
+        true
+    }
+    async fn fence_ready_publications(
+        &self,
+        e: &[(i64, Option<String>)],
+        p: &ActivationFenceProvenance,
+        ttl: i64,
+    ) -> Result<Option<ReadyPublicationFence>> {
+        validate_mysql_fence(e, p, ttl)?;
+        let op = p.operation_id();
+        let token = hex::encode(rand::random::<[u8; 32]>());
+        let (mut tx, now) = self.controlled().await?;
+        let existing:Option<(String,i64,i64,String,String,String,String,String,String)>=sqlx::query_as("SELECT token,generation,expires_at,state,workspace,repo,branch,target,attempt_id FROM ready_publication_fences WHERE operation_id=? FOR UPDATE").bind(&op).fetch_optional(&mut *tx).await?;
+        if let Some((
+            ref old,
+            generation,
+            expires,
+            ref state,
+            ref w,
+            ref r,
+            ref b,
+            ref target,
+            ref attempt,
+        )) = existing
+        {
+            if w != &p.workspace
+                || r != &p.repo
+                || b != &p.branch
+                || target != &p.target
+                || attempt != &p.attempt_id
+            {
+                bail!("activation operation provenance mismatch")
+            }
+            if state == "held" && expires > now {
+                tx.rollback().await?;
+                return Ok(None);
+            }
+            if state == "activation_unknown" {
+                let members:Vec<(i64,Option<String>)>=sqlx::query_as("SELECT artifact_id,manifest FROM ready_publication_fence_members WHERE token=? AND generation=? ORDER BY artifact_id").bind(old).bind(generation).fetch_all(&mut *tx).await?;
+                if members != mysql_expected(e) {
+                    bail!("activation recovery fence membership does not match operation")
+                }
+                tx.commit().await?;
+                return Ok(Some(ReadyPublicationFence::new(
+                    old.clone(),
+                    generation as u64,
+                    op,
+                    p.clone(),
+                    e.to_vec(),
+                )));
+            }
+            sqlx::query("DELETE FROM ready_publication_fences WHERE token=? AND generation=?")
+                .bind(old)
+                .bind(generation)
+                .execute(&mut *tx)
+                .await?;
+        }
+        if !exact_ready_pair_mysql(&mut tx, e, p).await? {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+        let prior: i64 = sqlx::query_scalar(
+            "SELECT generation FROM ready_publication_fence_sequence WHERE id=1 FOR UPDATE",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        let generation = prior
+            .checked_add(1)
+            .context("Ready publication fence generation exhausted")?;
+        sqlx::query(
+            "UPDATE ready_publication_fence_sequence SET generation=? WHERE id=1 AND generation=?",
+        )
+        .bind(generation)
+        .bind(prior)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("INSERT INTO ready_publication_fences(token,generation,operation_id,workspace,repo,branch,target,attempt_id,expires_at,state) VALUES(?,?,?,?,?,?,?,?,?,'held')").bind(&token).bind(generation).bind(&op).bind(&p.workspace).bind(&p.repo).bind(&p.branch).bind(&p.target).bind(&p.attempt_id).bind(now.saturating_add(ttl)).execute(&mut *tx).await?;
+        for (id, m) in e {
+            sqlx::query("INSERT INTO ready_publication_fence_members(token,generation,artifact_id,manifest) VALUES(?,?,?,?)").bind(&token).bind(generation).bind(id).bind(m).execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        Ok(Some(ReadyPublicationFence::new(
+            token,
+            generation as u64,
+            op,
+            p.clone(),
+            e.to_vec(),
+        )))
+    }
+    async fn release_ready_publication_fence(&self, f: ReadyPublicationFence) -> Result<()> {
+        let (token, generation, op, e) = f.parts();
+        let mut tx = self.pool.begin().await?;
+        let m:Vec<(i64,Option<String>)>=sqlx::query_as("SELECT artifact_id,manifest FROM ready_publication_fence_members WHERE token=? AND generation=? ORDER BY artifact_id FOR UPDATE").bind(token).bind(generation as i64).fetch_all(&mut *tx).await?;
+        if m == mysql_expected(e) {
+            sqlx::query("DELETE FROM ready_publication_fences WHERE token=? AND generation=? AND operation_id=?").bind(token).bind(generation as i64).bind(op).execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+    async fn mark_activation_unknown(&self, f: &ReadyPublicationFence, ttl: i64) -> Result<bool> {
+        if !(1..=3600).contains(&ttl) {
+            bail!("activation fence TTL is invalid")
+        }
+        let (token, generation, op, e) = f.parts();
+        let (mut tx, now) = self.controlled().await?;
+        let m:Vec<(i64,Option<String>)>=sqlx::query_as("SELECT artifact_id,manifest FROM ready_publication_fence_members WHERE token=? AND generation=? ORDER BY artifact_id").bind(token).bind(generation as i64).fetch_all(&mut *tx).await?;
+        let changed=m==mysql_expected(e)&&sqlx::query("UPDATE ready_publication_fences SET state='activation_unknown',expires_at=? WHERE token=? AND generation=? AND operation_id=?").bind(now.saturating_add(ttl)).bind(token).bind(generation as i64).bind(op).execute(&mut *tx).await?.rows_affected()==1;
+        tx.commit().await?;
+        Ok(changed)
+    }
+    async fn recover_activation_fence(
+        &self,
+        p: &ActivationFenceProvenance,
+    ) -> Result<Option<ReadyPublicationFence>> {
+        let op = p.operation_id();
+        let row:Option<(String,i64)>=sqlx::query_as("SELECT token,generation FROM ready_publication_fences WHERE operation_id=? AND workspace=? AND repo=? AND branch=? AND target=? AND attempt_id=? AND state='activation_unknown'").bind(&op).bind(&p.workspace).bind(&p.repo).bind(&p.branch).bind(&p.target).bind(&p.attempt_id).fetch_optional(&self.pool).await?;
+        let Some((token, generation)) = row else {
+            return Ok(None);
+        };
+        let e:Vec<(i64,Option<String>)>=sqlx::query_as("SELECT artifact_id,manifest FROM ready_publication_fence_members WHERE token=? AND generation=? ORDER BY artifact_id").bind(&token).bind(generation).fetch_all(&self.pool).await?;
+        if e.len() != 2 {
+            bail!("activation recovery fence is not an exact pair")
+        }
+        Ok(Some(ReadyPublicationFence::new(
+            token,
+            generation as u64,
+            op,
+            p.clone(),
+            e,
+        )))
+    }
+    async fn unknown_activation_fences_page(
+        &self,
+        after: Option<u64>,
+        limit: usize,
+    ) -> Result<UnknownActivationFencePage> {
+        if !(1..=128).contains(&limit) || after.unwrap_or(0) > i64::MAX as u64 {
+            bail!("unknown activation fence page is invalid")
+        }
+        let rows:Vec<(String,i64,String,String,String,String,String,String)>=sqlx::query_as("SELECT token,generation,operation_id,workspace,repo,branch,target,attempt_id FROM ready_publication_fences WHERE state='activation_unknown' AND generation>? ORDER BY generation LIMIT ?").bind(after.unwrap_or(0)as i64).bind(limit as i64).fetch_all(&self.pool).await?;
+        let mut fences = Vec::new();
+        for (token, generation, op, w, r, b, target, attempt) in rows {
+            let p = ActivationFenceProvenance {
+                workspace: w,
+                repo: r,
+                branch: b,
+                target,
+                attempt_id: attempt,
+            };
+            if p.operation_id() != op {
+                bail!("unknown activation fence provenance is invalid")
+            }
+            let e:Vec<(i64,Option<String>)>=sqlx::query_as("SELECT artifact_id,manifest FROM ready_publication_fence_members WHERE token=? AND generation=? ORDER BY artifact_id").bind(&token).bind(generation).fetch_all(&self.pool).await?;
+            if e.len() != 2 {
+                bail!("unknown activation fence is not an exact pair")
+            }
+            fences.push(ReadyPublicationFence::new(
+                token,
+                generation as u64,
+                op,
+                p,
+                e,
+            ))
+        }
+        let next = (fences.len() == limit).then(|| fences.last().unwrap().parts().1);
+        Ok(UnknownActivationFencePage {
+            fences,
+            next_generation: next,
+        })
+    }
 
     async fn acquire_gc_sweep(&self, owner: &str, ttl: i64) -> Result<bool> {
         validate_gc_sweep_args(owner, ttl)?;
@@ -1507,9 +1831,9 @@ impl ArtifactSchedulerPersistence for MysqlArtifactScheduler {
             .fetch_one(&mut *tx)
             .await?;
         let rows = sqlx::query(
-            "WITH candidates(id) AS ((SELECT published_artifact_id FROM artifact_observations WHERE published_artifact_id>? ORDER BY published_artifact_id LIMIT ?) UNION ALL (SELECT artifact_id FROM artifact_consumers WHERE artifact_id>? AND expires_at>? ORDER BY artifact_id LIMIT ?) UNION ALL (SELECT artifact_id FROM artifact_base_retention WHERE artifact_id>? ORDER BY artifact_id LIMIT ?)), page_ids(id) AS (SELECT DISTINCT id FROM candidates ORDER BY id LIMIT ?) SELECT j.id,j.workspace,j.repo,j.commit_oid,j.kind,j.format_version,j.manifest FROM page_ids p JOIN artifact_jobs j ON j.id=p.id WHERE j.state='ready' AND j.manifest IS NOT NULL AND length(trim(j.manifest))>0 ORDER BY j.id",
+            "WITH candidates(id) AS ((SELECT published_artifact_id FROM artifact_observations WHERE published_artifact_id>? ORDER BY published_artifact_id LIMIT ?) UNION ALL (SELECT artifact_id FROM artifact_consumers WHERE artifact_id>? AND expires_at>? ORDER BY artifact_id LIMIT ?) UNION ALL (SELECT artifact_id FROM artifact_base_retention WHERE artifact_id>? ORDER BY artifact_id LIMIT ?) UNION ALL (SELECT m.artifact_id FROM ready_publication_fence_members m JOIN ready_publication_fences f ON f.token=m.token AND f.generation=m.generation WHERE m.artifact_id>? AND (f.state='activation_unknown' OR f.expires_at>?) ORDER BY m.artifact_id LIMIT ?)), page_ids(id) AS (SELECT DISTINCT id FROM candidates ORDER BY id LIMIT ?) SELECT j.id,j.workspace,j.repo,j.commit_oid,j.kind,j.format_version,j.manifest FROM page_ids p JOIN artifact_jobs j ON j.id=p.id WHERE j.state='ready' AND j.manifest IS NOT NULL AND length(trim(j.manifest))>0 ORDER BY j.id",
         )
-        .bind(after_artifact_id.unwrap_or(0)).bind(limit as i64).bind(after_artifact_id.unwrap_or(0)).bind(now).bind(limit as i64).bind(after_artifact_id.unwrap_or(0)).bind(limit as i64).bind(limit as i64)
+        .bind(after_artifact_id.unwrap_or(0)).bind(limit as i64).bind(after_artifact_id.unwrap_or(0)).bind(now).bind(limit as i64).bind(after_artifact_id.unwrap_or(0)).bind(limit as i64).bind(after_artifact_id.unwrap_or(0)).bind(now).bind(limit as i64).bind(limit as i64)
         .fetch_all(&mut *tx).await?;
         tx.commit().await?;
         rows.into_iter()
@@ -2208,14 +2532,19 @@ impl ArtifactSchedulerPersistence for MysqlArtifactScheduler {
         if id <= 0 || manifest.trim().is_empty() || reason.trim().is_empty() {
             bail!("invalid ready quarantine request");
         }
-        let mut tx = self.pool.begin().await?;
-        let changed = sqlx::query("UPDATE artifact_jobs SET state='queued',manifest=NULL,owner=NULL,heartbeat_at=NULL,lease_expires_at=NULL,error=?,failure_class=NULL,updated_at=UNIX_TIMESTAMP() WHERE id=? AND state='ready' AND manifest=?")
-            .bind(reason.chars().take(4096).collect::<String>())
-            .bind(id)
-            .bind(manifest)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected() == 1;
+        let (mut tx, now) = self.controlled().await?;
+        let retries:Option<i64>=sqlx::query_scalar("SELECT retry_count FROM artifact_jobs WHERE id=? AND state='ready' AND manifest=? FOR UPDATE").bind(id).bind(manifest).fetch_optional(&mut *tx).await?;
+        let Some(retries) = retries else {
+            tx.rollback().await?;
+            return Ok(QuarantineOutcome::LostRace);
+        };
+        let fenced:i64=sqlx::query_scalar("SELECT count(*) FROM ready_publication_fence_members m JOIN ready_publication_fences f ON f.token=m.token AND f.generation=m.generation WHERE m.artifact_id=? AND (f.state='activation_unknown' OR f.expires_at>?)").bind(id).bind(now).fetch_one(&mut *tx).await?;
+        if fenced != 0 {
+            tx.rollback().await?;
+            return Ok(QuarantineOutcome::LostRace);
+        }
+        let exhausted = retries as u32 >= self.limits.max_manual_retries;
+        let changed=sqlx::query(if exhausted{"UPDATE artifact_jobs SET state='failed',manifest=NULL,owner=NULL,heartbeat_at=NULL,lease_expires_at=NULL,error=?,failure_class='permanent',updated_at=? WHERE id=? AND state='ready' AND manifest=?"}else{"UPDATE artifact_jobs SET state='queued',manifest=NULL,owner=NULL,heartbeat_at=NULL,lease_expires_at=NULL,retry_count=retry_count+1,error=?,failure_class=NULL,updated_at=? WHERE id=? AND state='ready' AND manifest=?"}).bind(reason.chars().take(4096).collect::<String>()).bind(now).bind(id).bind(manifest).execute(&mut *tx).await?.rows_affected()==1;
         if changed {
             sqlx::query("UPDATE artifact_observations SET published_artifact_id=NULL WHERE published_artifact_id=?")
                 .bind(id)
@@ -2223,10 +2552,12 @@ impl ArtifactSchedulerPersistence for MysqlArtifactScheduler {
                 .await?;
         }
         tx.commit().await?;
-        Ok(if changed {
-            QuarantineOutcome::Requeued(id)
-        } else {
+        Ok(if !changed {
             QuarantineOutcome::LostRace
+        } else if exhausted {
+            QuarantineOutcome::Exhausted
+        } else {
+            QuarantineOutcome::Requeued(id)
         })
     }
 
@@ -2459,6 +2790,10 @@ mod tests {
     async fn reset(pool: &MySqlPool) {
         for statement in [
             "DROP TABLE IF EXISTS external_scheduler_child",
+            "DROP TABLE IF EXISTS ready_publication_fence_rogue",
+            "DROP TABLE IF EXISTS ready_publication_fence_members",
+            "DROP TABLE IF EXISTS ready_publication_fences",
+            "DROP TABLE IF EXISTS ready_publication_fence_sequence",
             "DROP TABLE IF EXISTS artifact_base_retention",
             "DROP TABLE IF EXISTS artifact_gc_sweep",
             "DROP TABLE IF EXISTS artifact_transport_leases",
@@ -2529,9 +2864,60 @@ mod tests {
             .fetch_one(&control)
             .await
             .unwrap(),
-            5
+            6
         );
         assert_eq!(sqlx::query_scalar::<_,i64>("SELECT count(*) FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name='artifact_gc_sweep'").fetch_one(&control).await.unwrap(), 1);
+
+        let target = "a".repeat(40);
+        let head=sqlx::query("INSERT INTO artifact_jobs(workspace,repo,commit_oid,kind,format_version,state,manifest,created_at,updated_at) VALUES('admission-ws','admission/repo',?,'head',1,'ready','head-manifest',0,0)").bind(&target).execute(&control).await.unwrap().last_insert_id() as i64;
+        let full=sqlx::query("INSERT INTO artifact_jobs(workspace,repo,commit_oid,kind,format_version,state,manifest,created_at,updated_at) VALUES('admission-ws','admission/repo',?,'full_history',1,'ready','full-manifest',0,0)").bind(&target).execute(&control).await.unwrap().last_insert_id() as i64;
+        let provenance = ActivationFenceProvenance {
+            workspace: "admission-ws".into(),
+            repo: "admission/repo".into(),
+            branch: "main".into(),
+            target,
+            attempt_id: "live-admission".into(),
+        };
+        let expected = vec![
+            (head, Some("head-manifest".into())),
+            (full, Some("full-manifest".into())),
+        ];
+        let fence = a
+            .fence_ready_publications(&expected, &provenance, 60)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            a.quarantine_ready(head, Some("head-manifest"), "race")
+                .await
+                .unwrap(),
+            QuarantineOutcome::LostRace
+        );
+        assert!(a.mark_activation_unknown(&fence, 1).await.unwrap());
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        assert!(
+            a.recover_activation_fence(&provenance)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            a.live_scheduler_roots_page(None, 512)
+                .await
+                .unwrap()
+                .iter()
+                .any(|r| r.artifact_id == head)
+        );
+        a.release_ready_publication_fence(fence).await.unwrap();
+        assert!(
+            matches!(a.quarantine_ready(head,Some("head-manifest"),"verified corrupt").await.unwrap(),QuarantineOutcome::Requeued(id) if id==head)
+        );
+        sqlx::query("DELETE FROM artifact_jobs WHERE id IN(?,?)")
+            .bind(head)
+            .bind(full)
+            .execute(&control)
+            .await
+            .unwrap();
 
         assert!(a.acquire_gc_sweep("collector", 60).await.unwrap());
         assert!(!b.acquire_gc_sweep("other", 60).await.unwrap());
@@ -3279,7 +3665,7 @@ mod tests {
             .fetch_one(migrated_v2.pool())
             .await
             .unwrap(),
-            5
+            6
         );
 
         reset(&control).await;
@@ -3308,7 +3694,7 @@ mod tests {
             .fetch_one(migrated_v4.pool())
             .await
             .unwrap(),
-            5
+            6
         );
 
         for stage in ["marker_only", "base_only", "both_empty", "partial", "full"] {
@@ -3393,7 +3779,7 @@ mod tests {
                 .fetch_one(&control)
                 .await
                 .unwrap(),
-                5
+                6
             );
             let rows:Vec<(String,Option<i16>,Option<i16>)>=sqlx::query_as("SELECT j.kind,r.head_rank,r.pair_rank FROM artifact_base_retention r JOIN artifact_jobs j ON j.id=r.artifact_id ORDER BY j.kind").fetch_all(&control).await.unwrap();
             assert_eq!(
@@ -3496,7 +3882,7 @@ mod tests {
                 .fetch_one(&control)
                 .await
                 .unwrap(),
-                5
+                6
             );
             assert_eq!(sqlx::query_scalar::<_,i64>("SELECT count(*) FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name='artifact_transport_leases'").fetch_one(&control).await.unwrap(),1);
             let rows:Vec<(String,Option<i16>,Option<i16>)>=sqlx::query_as("SELECT j.kind,r.head_rank,r.pair_rank FROM artifact_base_retention r JOIN artifact_jobs j ON j.id=r.artifact_id ORDER BY j.kind").fetch_all(&control).await.unwrap();
@@ -3514,7 +3900,7 @@ mod tests {
         for statement in SCHEMA {
             sqlx::raw_sql(*statement).execute(&control).await.unwrap();
         }
-        sqlx::query("INSERT INTO artifact_scheduler_schema(id,version) VALUES(1,6)")
+        sqlx::query("INSERT INTO artifact_scheduler_schema(id,version) VALUES(1,99)")
             .execute(&control)
             .await
             .unwrap();
@@ -3771,5 +4157,152 @@ mod tests {
                 .unwrap();
         assert_eq!(released, Some(1));
         eprintln!("EXECUTED mysql_artifact_scheduler_live_conformance");
+    }
+
+    #[tokio::test]
+    async fn mysql_v6_transition_boundaries_live() {
+        let Ok(url) = std::env::var("RIPCLONE_TEST_MYSQL_URL") else {
+            return;
+        };
+        let control = MySqlPoolOptions::new()
+            .max_connections(12)
+            .connect(&url)
+            .await
+            .unwrap();
+        let mut lock_connection = control.acquire().await.unwrap().detach();
+        let lock: i64 = sqlx::query_scalar("SELECT GET_LOCK('ripclone_mysql_scheduler_test',30)")
+            .fetch_one(&mut lock_connection)
+            .await
+            .unwrap();
+        assert_eq!(lock, 1);
+        for stage in 0..=5 {
+            reset(&control).await;
+            for ddl in &SCHEMA[..9] {
+                sqlx::raw_sql(*ddl).execute(&control).await.unwrap();
+            }
+            let marker = if stage == 5 {
+                V5_TO_V6_VALIDATED
+            } else {
+                V5_TO_V6_DDL
+            };
+            sqlx::query("INSERT INTO artifact_scheduler_schema(id,version) VALUES(1,?)")
+                .bind(marker)
+                .execute(&control)
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO scheduler_state(id,fairness_cursor) VALUES(1,0)")
+                .execute(&control)
+                .await
+                .unwrap();
+            if stage >= 1 {
+                sqlx::raw_sql(SCHEMA[9]).execute(&control).await.unwrap();
+            }
+            if stage >= 2 {
+                sqlx::raw_sql(SCHEMA[10]).execute(&control).await.unwrap();
+            }
+            if stage >= 3 {
+                sqlx::raw_sql(SCHEMA[11]).execute(&control).await.unwrap();
+            }
+            if stage >= 4 {
+                sqlx::query(
+                    "INSERT INTO ready_publication_fence_sequence(id,generation) VALUES(1,0)",
+                )
+                .execute(&control)
+                .await
+                .unwrap();
+            }
+            if matches!(stage, 1 | 5) {
+                let p1 = MySqlPoolOptions::new().connect(&url).await.unwrap();
+                let p2 = MySqlPoolOptions::new().connect(&url).await.unwrap();
+                let (a, b) = tokio::join!(
+                    MysqlArtifactScheduler::from_pool(p1, Default::default(), Arc::new(Accept)),
+                    MysqlArtifactScheduler::from_pool(p2, Default::default(), Arc::new(Accept))
+                );
+                assert!(
+                    a.is_ok() && b.is_ok(),
+                    "concurrent resume failed at stage {stage}"
+                );
+            } else {
+                MysqlArtifactScheduler::from_pool(
+                    MySqlPoolOptions::new().connect(&url).await.unwrap(),
+                    Default::default(),
+                    Arc::new(Accept),
+                )
+                .await
+                .unwrap();
+            }
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT version FROM artifact_scheduler_schema WHERE id=1"
+                )
+                .fetch_one(&control)
+                .await
+                .unwrap(),
+                6,
+                "stage {stage}"
+            );
+        }
+        reset(&control).await;
+        for ddl in &SCHEMA[..9] {
+            sqlx::raw_sql(*ddl).execute(&control).await.unwrap();
+        }
+        sqlx::query("INSERT INTO artifact_scheduler_schema(id,version) VALUES(1,?)")
+            .bind(V5_TO_V6_DDL)
+            .execute(&control)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO scheduler_state(id,fairness_cursor) VALUES(1,0)")
+            .execute(&control)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE ready_publication_fence_sequence(id SMALLINT PRIMARY KEY,bogus BIGINT)",
+        )
+        .execute(&control)
+        .await
+        .unwrap();
+        assert!(
+            MysqlArtifactScheduler::from_pool(
+                MySqlPoolOptions::new().connect(&url).await.unwrap(),
+                Default::default(),
+                Arc::new(Accept)
+            )
+            .await
+            .is_err(),
+            "forged partial sequence was accepted"
+        );
+        reset(&control).await;
+        for ddl in &SCHEMA[..9] {
+            sqlx::raw_sql(*ddl).execute(&control).await.unwrap();
+        }
+        sqlx::query("INSERT INTO artifact_scheduler_schema(id,version) VALUES(1,?)")
+            .bind(V5_TO_V6_DDL)
+            .execute(&control)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO scheduler_state(id,fairness_cursor) VALUES(1,0)")
+            .execute(&control)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE ready_publication_fence_rogue(id BIGINT)")
+            .execute(&control)
+            .await
+            .unwrap();
+        assert!(
+            MysqlArtifactScheduler::from_pool(
+                MySqlPoolOptions::new().connect(&url).await.unwrap(),
+                Default::default(),
+                Arc::new(Accept)
+            )
+            .await
+            .is_err(),
+            "extra Ready fence DDL was accepted"
+        );
+        reset(&control).await;
+        let _: Option<i64> =
+            sqlx::query_scalar("SELECT RELEASE_LOCK('ripclone_mysql_scheduler_test')")
+                .fetch_one(&mut lock_connection)
+                .await
+                .unwrap();
     }
 }

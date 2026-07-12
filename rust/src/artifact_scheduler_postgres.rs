@@ -5,11 +5,12 @@
 //! settlement are O(1) conditional updates and do not take the control lock.
 
 use crate::artifact_scheduler::{
-    ArtifactKey, ArtifactKind, ArtifactRecord, ArtifactState, ClaimedArtifact,
-    CompletionSealAuthority, CompletionVerifier, FailureClass, ObservationOutcome,
-    ObservationSnapshot, QuarantineOutcome, RetryOutcome, ScheduleOutcome, SchedulerLimits,
-    VerifiedCompletionEvidence, scheduler_fingerprint, validate_format_version, validate_lease,
-    validate_limits, validate_observation_identity, validate_resolved_commit,
+    ActivationFenceProvenance, ArtifactKey, ArtifactKind, ArtifactRecord, ArtifactState,
+    ClaimedArtifact, CompletionSealAuthority, CompletionVerifier, FailureClass, ObservationOutcome,
+    ObservationSnapshot, QuarantineOutcome, ReadyPublicationFence, RetryOutcome, ScheduleOutcome,
+    SchedulerLimits, UnknownActivationFencePage, VerifiedCompletionEvidence, scheduler_fingerprint,
+    validate_format_version, validate_lease, validate_limits, validate_observation_identity,
+    validate_resolved_commit,
 };
 #[cfg(test)]
 use crate::artifact_scheduler::{CompletionEvidence, validate_evidence};
@@ -23,7 +24,7 @@ use sqlx::postgres::PgPool;
 use sqlx::{Postgres, Row, Transaction};
 use std::sync::Arc;
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS artifact_scheduler_schema(
  id SMALLINT CONSTRAINT artifact_scheduler_schema_pkey PRIMARY KEY,
@@ -97,6 +98,19 @@ CREATE TABLE IF NOT EXISTS scheduler_state(
  CONSTRAINT scheduler_state_singleton CHECK(id=1),
  CONSTRAINT scheduler_state_fairness CHECK(fairness_cursor BETWEEN 0 AND 3));
 INSERT INTO scheduler_state(id,fairness_cursor) VALUES(1,0) ON CONFLICT(id) DO NOTHING;
+CREATE TABLE IF NOT EXISTS ready_publication_fence_sequence(
+ id SMALLINT PRIMARY KEY CHECK(id=1),generation BIGINT NOT NULL CHECK(generation>=0));
+INSERT INTO ready_publication_fence_sequence(id,generation) VALUES(1,0) ON CONFLICT(id) DO NOTHING;
+CREATE TABLE IF NOT EXISTS ready_publication_fences(
+ token TEXT PRIMARY KEY,generation BIGINT NOT NULL UNIQUE CHECK(generation>0),operation_id TEXT NOT NULL UNIQUE,
+ workspace TEXT NOT NULL,repo TEXT NOT NULL,branch TEXT NOT NULL,target TEXT NOT NULL,attempt_id TEXT NOT NULL,
+ expires_at BIGINT NOT NULL,state TEXT NOT NULL CHECK(state IN('held','activation_unknown')),UNIQUE(token,generation));
+CREATE TABLE IF NOT EXISTS ready_publication_fence_members(
+ token TEXT NOT NULL,generation BIGINT NOT NULL CHECK(generation>0),artifact_id BIGINT NOT NULL,
+ manifest TEXT NOT NULL CHECK(length(trim(manifest))>0),PRIMARY KEY(token,artifact_id),
+ FOREIGN KEY(token,generation) REFERENCES ready_publication_fences(token,generation) ON DELETE CASCADE,
+ FOREIGN KEY(artifact_id) REFERENCES artifact_jobs(id) ON DELETE CASCADE);
+CREATE INDEX IF NOT EXISTS ready_publication_fences_recovery ON ready_publication_fences(state,generation,token);
 "#;
 
 #[derive(Clone)]
@@ -107,6 +121,121 @@ pub struct PostgresArtifactScheduler {
     completion_sealer: Arc<CompletionSealAuthority>,
 }
 struct PostgresGcDeleteFence(Option<Transaction<'static, Postgres>>);
+
+fn validate_fence_request(
+    expected: &[(i64, Option<String>)],
+    p: &ActivationFenceProvenance,
+    ttl: i64,
+) -> Result<()> {
+    if expected.len() != 2
+        || expected[0].0 == expected[1].0
+        || expected
+            .iter()
+            .any(|(id, m)| *id <= 0 || m.as_deref().is_none_or(|v| v.trim().is_empty()))
+        || [&p.workspace, &p.repo, &p.branch, &p.target, &p.attempt_id]
+            .iter()
+            .any(|v| v.trim().is_empty())
+        || !(1..=3600).contains(&ttl)
+    {
+        bail!("invalid Ready publication fence")
+    }
+    Ok(())
+}
+fn sorted_expected(expected: &[(i64, Option<String>)]) -> Vec<(i64, Option<String>)> {
+    let mut v = expected.to_vec();
+    v.sort_by_key(|x| x.0);
+    v
+}
+async fn exact_ready_pair_pg(
+    tx: &mut Transaction<'_, Postgres>,
+    expected: &[(i64, Option<String>)],
+    p: &ActivationFenceProvenance,
+) -> Result<bool> {
+    let rows:Vec<(i64,String,String,String,String,i64,Option<String>)>=sqlx::query_as("SELECT id,workspace,repo,commit_oid,kind,format_version,manifest FROM artifact_jobs WHERE id IN($1,$2) AND state='ready' FOR UPDATE").bind(expected[0].0).bind(expected[1].0).fetch_all(&mut **tx).await?;
+    if rows.len() != 2 {
+        return Ok(false);
+    }
+    let mut kinds = Vec::new();
+    let mut format = None;
+    for (id, w, r, c, k, v, m) in rows {
+        let wanted = expected.iter().find(|x| x.0 == id).unwrap();
+        if w != p.workspace
+            || r != p.repo
+            || c != p.target
+            || m != wanted.1
+            || m.as_deref().is_none_or(|x| x.trim().is_empty())
+        {
+            return Ok(false);
+        }
+        if format.is_some_and(|x| x != v) {
+            return Ok(false);
+        }
+        format = Some(v);
+        kinds.push(k);
+    }
+    kinds.sort();
+    Ok(kinds == ["full_history", "head"])
+}
+async fn recover_pg(
+    pool: &PgPool,
+    p: &ActivationFenceProvenance,
+) -> Result<Option<ReadyPublicationFence>> {
+    let op = p.operation_id();
+    let row:Option<(String,i64)>=sqlx::query_as("SELECT token,generation FROM ready_publication_fences WHERE operation_id=$1 AND workspace=$2 AND repo=$3 AND branch=$4 AND target=$5 AND attempt_id=$6 AND state='activation_unknown'").bind(&op).bind(&p.workspace).bind(&p.repo).bind(&p.branch).bind(&p.target).bind(&p.attempt_id).fetch_optional(pool).await?;
+    let Some((token, generation)) = row else {
+        return Ok(None);
+    };
+    let expected:Vec<(i64,Option<String>)>=sqlx::query_as("SELECT artifact_id,manifest FROM ready_publication_fence_members WHERE token=$1 AND generation=$2 ORDER BY artifact_id").bind(&token).bind(generation).fetch_all(pool).await?;
+    if expected.len() != 2 {
+        bail!("activation recovery fence is not an exact pair")
+    }
+    Ok(Some(ReadyPublicationFence::new(
+        token,
+        generation as u64,
+        op,
+        p.clone(),
+        expected,
+    )))
+}
+async fn unknown_page_pg(
+    pool: &PgPool,
+    after: Option<u64>,
+    limit: usize,
+) -> Result<UnknownActivationFencePage> {
+    if !(1..=128).contains(&limit) || after.unwrap_or(0) > i64::MAX as u64 {
+        bail!("unknown activation fence page is invalid")
+    };
+    let rows:Vec<(String,i64,String,String,String,String,String,String)>=sqlx::query_as("SELECT token,generation,operation_id,workspace,repo,branch,target,attempt_id FROM ready_publication_fences WHERE state='activation_unknown' AND generation>$1 ORDER BY generation LIMIT $2").bind(after.unwrap_or(0) as i64).bind(limit as i64).fetch_all(pool).await?;
+    let mut fences = Vec::new();
+    for (token, generation, op, w, r, b, target, attempt) in rows {
+        let p = ActivationFenceProvenance {
+            workspace: w,
+            repo: r,
+            branch: b,
+            target,
+            attempt_id: attempt,
+        };
+        if p.operation_id() != op {
+            bail!("unknown activation fence provenance is invalid")
+        };
+        let expected:Vec<(i64,Option<String>)>=sqlx::query_as("SELECT artifact_id,manifest FROM ready_publication_fence_members WHERE token=$1 AND generation=$2 ORDER BY artifact_id").bind(&token).bind(generation).fetch_all(pool).await?;
+        if expected.len() != 2 {
+            bail!("unknown activation fence is not an exact pair")
+        };
+        fences.push(ReadyPublicationFence::new(
+            token,
+            generation as u64,
+            op,
+            p,
+            expected,
+        ));
+    }
+    let next = (fences.len() == limit).then(|| fences.last().unwrap().parts().1);
+    Ok(UnknownActivationFencePage {
+        fences,
+        next_generation: next,
+    })
+}
 #[async_trait]
 impl GcDeleteFence for PostgresGcDeleteFence {
     async fn release(mut self: Box<Self>) -> Result<()> {
@@ -120,6 +249,16 @@ impl GcDeleteFence for PostgresGcDeleteFence {
 async fn preflight_postgres_schema(tx: &mut Transaction<'_, Postgres>, version: i64) -> Result<()> {
     if version < 2 {
         return Ok(());
+    }
+    let fence_tables:i64=sqlx::query_scalar("SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=current_schema() AND c.relkind='r' AND c.relname IN('ready_publication_fence_sequence','ready_publication_fences','ready_publication_fence_members')").fetch_one(&mut **tx).await?;
+    if version == 6 || fence_tables == 3 {
+        let columns:i64=sqlx::query_scalar("SELECT count(*) FROM information_schema.columns WHERE table_schema=current_schema() AND ((table_name='ready_publication_fence_sequence' AND column_name IN('id','generation')) OR (table_name='ready_publication_fences' AND column_name IN('token','generation','operation_id','workspace','repo','branch','target','attempt_id','expires_at','state')) OR (table_name='ready_publication_fence_members' AND column_name IN('token','generation','artifact_id','manifest')))").fetch_one(&mut **tx).await?;
+        let index:i64=sqlx::query_scalar("SELECT count(*) FROM pg_indexes WHERE schemaname=current_schema() AND indexname='ready_publication_fences_recovery' AND indexdef LIKE '%(state, generation, token)%'").fetch_one(&mut **tx).await?;
+        if fence_tables != 3 || columns != 16 || index != 1 {
+            bail!("postgres v6 Ready fence schema differs from its marker")
+        }
+    } else if version == 5 && fence_tables != 0 {
+        bail!("postgres v5 marker contains a partial v6 Ready fence schema")
     }
     let tables:i64=sqlx::query_scalar("SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=current_schema() AND c.relkind='r' AND c.relname IN('artifact_scheduler_schema','artifact_jobs','branch_observations','artifact_observations','artifact_consumers','artifact_transport_leases','artifact_gc_sweep','artifact_base_retention','scheduler_state')").fetch_one(&mut **tx).await?;
     if tables != if version == 2 { 7 } else { 9 } {
@@ -195,7 +334,7 @@ impl PostgresArtifactScheduler {
             if version > SCHEMA_VERSION {
                 bail!("artifact scheduler database is newer than this binary")
             }
-            if ![1, 2, 3, 4, SCHEMA_VERSION].contains(&version) {
+            if ![1, 2, 3, 4, 5, SCHEMA_VERSION].contains(&version) {
                 bail!("unsupported postgres artifact scheduler schema {version}")
             }
             preflight_postgres_schema(&mut migration, version).await?;
@@ -215,7 +354,7 @@ impl PostgresArtifactScheduler {
         if version > SCHEMA_VERSION {
             bail!("artifact scheduler database is newer than this binary")
         }
-        if ![1, 2, 3, 4, SCHEMA_VERSION].contains(&version) {
+        if ![1, 2, 3, 4, 5, SCHEMA_VERSION].contains(&version) {
             bail!("unsupported postgres artifact scheduler schema {version}")
         }
         let missing_columns: i64 = sqlx::query_scalar(
@@ -938,6 +1077,130 @@ impl ArtifactSchedulerPersistence for PostgresArtifactScheduler {
     fn completion_sealer(&self) -> Arc<CompletionSealAuthority> {
         self.completion_sealer.clone()
     }
+    fn full_admission_recovery_protocol_supported(&self) -> bool {
+        true
+    }
+
+    async fn fence_ready_publications(
+        &self,
+        expected: &[(i64, Option<String>)],
+        provenance: &ActivationFenceProvenance,
+        ttl: i64,
+    ) -> Result<Option<ReadyPublicationFence>> {
+        validate_fence_request(expected, provenance, ttl)?;
+        let operation = provenance.operation_id();
+        let token = hex::encode(rand::random::<[u8; 32]>());
+        let (mut tx, now) = self.controlled().await?;
+        let existing:Option<(String,i64,i64,String,String,String,String,String,String)>=sqlx::query_as("SELECT token,generation,expires_at,state,workspace,repo,branch,target,attempt_id FROM ready_publication_fences WHERE operation_id=$1 FOR UPDATE").bind(&operation).fetch_optional(&mut *tx).await?;
+        if let Some((
+            ref old,
+            generation,
+            expires,
+            ref state,
+            ref w,
+            ref r,
+            ref b,
+            ref target,
+            ref attempt,
+        )) = existing
+        {
+            if w != &provenance.workspace
+                || r != &provenance.repo
+                || b != &provenance.branch
+                || target != &provenance.target
+                || attempt != &provenance.attempt_id
+            {
+                bail!("activation operation provenance mismatch")
+            }
+            if state == "held" && expires > now {
+                tx.rollback().await?;
+                return Ok(None);
+            }
+            if state == "activation_unknown" {
+                let members:Vec<(i64,Option<String>)>=sqlx::query_as("SELECT artifact_id,manifest FROM ready_publication_fence_members WHERE token=$1 AND generation=$2 ORDER BY artifact_id").bind(old).bind(generation).fetch_all(&mut *tx).await?;
+                if sorted_expected(expected) != members {
+                    bail!("activation recovery fence membership does not match operation")
+                }
+                tx.commit().await?;
+                return Ok(Some(ReadyPublicationFence::new(
+                    old.clone(),
+                    generation as u64,
+                    operation,
+                    provenance.clone(),
+                    expected.to_vec(),
+                )));
+            }
+            sqlx::query("DELETE FROM ready_publication_fences WHERE token=$1 AND generation=$2")
+                .bind(old)
+                .bind(generation)
+                .execute(&mut *tx)
+                .await?;
+        }
+        if !exact_ready_pair_pg(&mut tx, expected, provenance).await? {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+        let prior: i64 = sqlx::query_scalar(
+            "SELECT generation FROM ready_publication_fence_sequence WHERE id=1 FOR UPDATE",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        let generation = prior
+            .checked_add(1)
+            .context("Ready publication fence generation exhausted")?;
+        sqlx::query("UPDATE ready_publication_fence_sequence SET generation=$1 WHERE id=1 AND generation=$2").bind(generation).bind(prior).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO ready_publication_fences(token,generation,operation_id,workspace,repo,branch,target,attempt_id,expires_at,state) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,'held')")
+          .bind(&token).bind(generation).bind(&operation).bind(&provenance.workspace).bind(&provenance.repo).bind(&provenance.branch).bind(&provenance.target).bind(&provenance.attempt_id).bind(now.saturating_add(ttl)).execute(&mut *tx).await?;
+        for (id, manifest) in expected {
+            sqlx::query("INSERT INTO ready_publication_fence_members(token,generation,artifact_id,manifest) VALUES($1,$2,$3,$4)").bind(&token).bind(generation).bind(id).bind(manifest).execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        Ok(Some(ReadyPublicationFence::new(
+            token,
+            generation as u64,
+            operation,
+            provenance.clone(),
+            expected.to_vec(),
+        )))
+    }
+    async fn release_ready_publication_fence(&self, fence: ReadyPublicationFence) -> Result<()> {
+        let (token, generation, operation, expected) = fence.parts();
+        let mut tx = self.pool.begin().await?;
+        let members:Vec<(i64,Option<String>)>=sqlx::query_as("SELECT artifact_id,manifest FROM ready_publication_fence_members WHERE token=$1 AND generation=$2 ORDER BY artifact_id FOR UPDATE").bind(token).bind(generation as i64).fetch_all(&mut *tx).await?;
+        if members == sorted_expected(expected) {
+            sqlx::query("DELETE FROM ready_publication_fences WHERE token=$1 AND generation=$2 AND operation_id=$3").bind(token).bind(generation as i64).bind(operation).execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+    async fn mark_activation_unknown(
+        &self,
+        fence: &ReadyPublicationFence,
+        ttl: i64,
+    ) -> Result<bool> {
+        if !(1..=3600).contains(&ttl) {
+            bail!("activation fence TTL is invalid")
+        };
+        let (token, generation, operation, expected) = fence.parts();
+        let (mut tx, now) = self.controlled().await?;
+        let members:Vec<(i64,Option<String>)>=sqlx::query_as("SELECT artifact_id,manifest FROM ready_publication_fence_members WHERE token=$1 AND generation=$2 ORDER BY artifact_id").bind(token).bind(generation as i64).fetch_all(&mut *tx).await?;
+        let changed=members==sorted_expected(expected) && sqlx::query("UPDATE ready_publication_fences SET state='activation_unknown',expires_at=$1 WHERE token=$2 AND generation=$3 AND operation_id=$4").bind(now.saturating_add(ttl)).bind(token).bind(generation as i64).bind(operation).execute(&mut *tx).await?.rows_affected()==1;
+        tx.commit().await?;
+        Ok(changed)
+    }
+    async fn recover_activation_fence(
+        &self,
+        p: &ActivationFenceProvenance,
+    ) -> Result<Option<ReadyPublicationFence>> {
+        recover_pg(&self.pool, p).await
+    }
+    async fn unknown_activation_fences_page(
+        &self,
+        after: Option<u64>,
+        limit: usize,
+    ) -> Result<UnknownActivationFencePage> {
+        unknown_page_pg(&self.pool, after, limit).await
+    }
 
     async fn acquire_gc_sweep(&self, owner: &str, ttl: i64) -> Result<bool> {
         validate_gc_sweep_args(owner, ttl)?;
@@ -1096,7 +1359,7 @@ impl ArtifactSchedulerPersistence for PostgresArtifactScheduler {
             .fetch_one(&mut *tx)
             .await?;
         let rows = sqlx::query(
-            "WITH candidates(id) AS ((SELECT published_artifact_id FROM artifact_observations WHERE published_artifact_id>$1 ORDER BY published_artifact_id LIMIT $3) UNION ALL (SELECT artifact_id FROM artifact_consumers WHERE artifact_id>$1 AND expires_at>$2 ORDER BY artifact_id LIMIT $3) UNION ALL (SELECT artifact_id FROM artifact_base_retention WHERE artifact_id>$1 ORDER BY artifact_id LIMIT $3)), page_ids(id) AS (SELECT DISTINCT id FROM candidates ORDER BY id LIMIT $3) SELECT j.id,j.workspace,j.repo,j.commit_oid,j.kind,j.format_version,j.manifest FROM page_ids p JOIN artifact_jobs j ON j.id=p.id WHERE j.state='ready' AND j.manifest IS NOT NULL AND length(trim(j.manifest))>0 ORDER BY j.id",
+            "WITH candidates(id) AS ((SELECT published_artifact_id FROM artifact_observations WHERE published_artifact_id>$1 ORDER BY published_artifact_id LIMIT $3) UNION ALL (SELECT artifact_id FROM artifact_consumers WHERE artifact_id>$1 AND expires_at>$2 ORDER BY artifact_id LIMIT $3) UNION ALL (SELECT artifact_id FROM artifact_base_retention WHERE artifact_id>$1 ORDER BY artifact_id LIMIT $3) UNION ALL (SELECT m.artifact_id FROM ready_publication_fence_members m JOIN ready_publication_fences f ON f.token=m.token AND f.generation=m.generation WHERE m.artifact_id>$1 AND (f.state='activation_unknown' OR f.expires_at>$2) ORDER BY m.artifact_id LIMIT $3)), page_ids(id) AS (SELECT DISTINCT id FROM candidates ORDER BY id LIMIT $3) SELECT j.id,j.workspace,j.repo,j.commit_oid,j.kind,j.format_version,j.manifest FROM page_ids p JOIN artifact_jobs j ON j.id=p.id WHERE j.state='ready' AND j.manifest IS NOT NULL AND length(trim(j.manifest))>0 ORDER BY j.id",
         )
         .bind(after_artifact_id.unwrap_or(0)).bind(now).bind(limit as i64)
         .fetch_all(&mut *tx).await?;
@@ -1763,14 +2026,20 @@ impl ArtifactSchedulerPersistence for PostgresArtifactScheduler {
         if id <= 0 || manifest.trim().is_empty() || reason.trim().is_empty() {
             bail!("invalid ready quarantine request");
         }
-        let mut tx = self.pool.begin().await?;
-        let changed = sqlx::query("UPDATE artifact_jobs SET state='queued',manifest=NULL,owner=NULL,heartbeat_at=NULL,lease_expires_at=NULL,error=$1,failure_class=NULL,updated_at=EXTRACT(EPOCH FROM clock_timestamp())::BIGINT WHERE id=$2 AND state='ready' AND manifest=$3")
-            .bind(reason.chars().take(4096).collect::<String>())
-            .bind(id)
-            .bind(manifest)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected() == 1;
+        let (mut tx, now) = self.controlled().await?;
+        let row:Option<i64>=sqlx::query_scalar("SELECT retry_count FROM artifact_jobs WHERE id=$1 AND state='ready' AND manifest=$2 FOR UPDATE").bind(id).bind(manifest).fetch_optional(&mut *tx).await?;
+        let Some(retries) = row else {
+            tx.rollback().await?;
+            return Ok(QuarantineOutcome::LostRace);
+        };
+        let fenced:i64=sqlx::query_scalar("SELECT count(*) FROM ready_publication_fence_members m JOIN ready_publication_fences f ON f.token=m.token AND f.generation=m.generation WHERE m.artifact_id=$1 AND (f.state='activation_unknown' OR f.expires_at>$2)").bind(id).bind(now).fetch_one(&mut *tx).await?;
+        if fenced != 0 {
+            tx.rollback().await?;
+            return Ok(QuarantineOutcome::LostRace);
+        }
+        let exhausted = retries as u32 >= self.limits.max_manual_retries;
+        let changed=sqlx::query(if exhausted {"UPDATE artifact_jobs SET state='failed',manifest=NULL,owner=NULL,heartbeat_at=NULL,lease_expires_at=NULL,error=$1,failure_class='permanent',updated_at=$2 WHERE id=$3 AND state='ready' AND manifest=$4"} else {"UPDATE artifact_jobs SET state='queued',manifest=NULL,owner=NULL,heartbeat_at=NULL,lease_expires_at=NULL,retry_count=retry_count+1,error=$1,failure_class=NULL,updated_at=$2 WHERE id=$3 AND state='ready' AND manifest=$4"})
+            .bind(reason.chars().take(4096).collect::<String>()).bind(now).bind(id).bind(manifest).execute(&mut *tx).await?.rows_affected()==1;
         if changed {
             sqlx::query("UPDATE artifact_observations SET published_artifact_id=NULL WHERE published_artifact_id=$1")
                 .bind(id)
@@ -1778,10 +2047,12 @@ impl ArtifactSchedulerPersistence for PostgresArtifactScheduler {
                 .await?;
         }
         tx.commit().await?;
-        Ok(if changed {
-            QuarantineOutcome::Requeued(id)
-        } else {
+        Ok(if !changed {
             QuarantineOutcome::LostRace
+        } else if exhausted {
+            QuarantineOutcome::Exhausted
+        } else {
+            QuarantineOutcome::Requeued(id)
         })
     }
 
@@ -1987,7 +2258,10 @@ mod tests {
 
     async fn reset(pool: &PgPool) {
         sqlx::raw_sql(
-            "DROP TABLE IF EXISTS artifact_base_retention;
+            "DROP TABLE IF EXISTS ready_publication_fence_members;
+             DROP TABLE IF EXISTS ready_publication_fences;
+             DROP TABLE IF EXISTS ready_publication_fence_sequence;
+             DROP TABLE IF EXISTS artifact_base_retention;
              DROP TABLE IF EXISTS artifact_gc_sweep;
              DROP TABLE IF EXISTS artifact_transport_leases;
              DROP TABLE IF EXISTS artifact_consumers;
@@ -2050,9 +2324,56 @@ mod tests {
             .fetch_one(&control)
             .await
             .unwrap(),
-            5
+            6
         );
         assert_eq!(sqlx::query_scalar::<_,i64>("SELECT count(*) FROM information_schema.tables WHERE table_schema=current_schema() AND table_name='artifact_gc_sweep'").fetch_one(&control).await.unwrap(), 1);
+
+        let target = "a".repeat(40);
+        let head_id:i64=sqlx::query_scalar("INSERT INTO artifact_jobs(workspace,repo,commit_oid,kind,format_version,state,manifest,created_at,updated_at) VALUES('admission-ws','admission/repo',$1,'head',1,'ready','head-manifest',0,0) RETURNING id").bind(&target).fetch_one(&control).await.unwrap();
+        let full_id:i64=sqlx::query_scalar("INSERT INTO artifact_jobs(workspace,repo,commit_oid,kind,format_version,state,manifest,created_at,updated_at) VALUES('admission-ws','admission/repo',$1,'full_history',1,'ready','full-manifest',0,0) RETURNING id").bind(&target).fetch_one(&control).await.unwrap();
+        let provenance = ActivationFenceProvenance {
+            workspace: "admission-ws".into(),
+            repo: "admission/repo".into(),
+            branch: "main".into(),
+            target,
+            attempt_id: "live-admission".into(),
+        };
+        let expected = vec![
+            (head_id, Some("head-manifest".into())),
+            (full_id, Some("full-manifest".into())),
+        ];
+        let fence = a
+            .fence_ready_publications(&expected, &provenance, 60)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            a.quarantine_ready(head_id, Some("head-manifest"), "race")
+                .await
+                .unwrap(),
+            QuarantineOutcome::LostRace
+        );
+        assert!(a.mark_activation_unknown(&fence, 1).await.unwrap());
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(
+            a.recover_activation_fence(&provenance)
+                .await
+                .unwrap()
+                .is_some(),
+            "activation_unknown must not expire"
+        );
+        let roots = a.live_scheduler_roots_page(None, 512).await.unwrap();
+        assert!(roots.iter().any(|r| r.artifact_id == head_id));
+        a.release_ready_publication_fence(fence).await.unwrap();
+        assert!(
+            matches!(a.quarantine_ready(head_id,Some("head-manifest"),"verified corrupt").await.unwrap(),QuarantineOutcome::Requeued(id) if id==head_id)
+        );
+        sqlx::query("DELETE FROM artifact_jobs WHERE id IN($1,$2)")
+            .bind(head_id)
+            .bind(full_id)
+            .execute(&control)
+            .await
+            .unwrap();
 
         assert!(a.acquire_gc_sweep("collector", 60).await.unwrap());
         assert!(!b.acquire_gc_sweep("other", 60).await.unwrap());
@@ -3047,7 +3368,7 @@ mod tests {
             .fetch_one(migrated_v2.pool())
             .await
             .unwrap(),
-            5
+            6
         );
 
         reset(&control).await;
@@ -3070,7 +3391,7 @@ mod tests {
             .fetch_one(migrated_v4.pool())
             .await
             .unwrap(),
-            5
+            6
         );
 
         reset(&control).await;

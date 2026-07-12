@@ -736,7 +736,7 @@ impl ArtifactScheduler {
         let prior_version: i64 = sqlx::query_scalar("PRAGMA user_version")
             .fetch_one(&mut *migration)
             .await?;
-        if prior_version > 5 {
+        if prior_version > 6 {
             bail!("artifact scheduler database is newer than this binary")
         }
         preflight_sqlite_schema(&mut migration, prior_version).await?;
@@ -1036,7 +1036,7 @@ impl ArtifactScheduler {
           SELECT head_id,workspace,repo,format_version,NULL,pair_rank FROM (SELECT h.id head_id,h.workspace,h.repo,h.format_version,row_number() OVER(PARTITION BY h.workspace,h.repo,h.format_version ORDER BY CASE WHEN h.updated_at>f.updated_at THEN h.updated_at ELSE f.updated_at END DESC,CASE WHEN h.id>f.id THEN h.id ELSE f.id END DESC) pair_rank FROM artifact_jobs h JOIN artifact_jobs f ON f.workspace=h.workspace AND f.repo=h.repo AND f.commit_oid=h.commit_oid AND f.format_version=h.format_version AND f.kind='full_history' AND f.state='ready' AND f.manifest IS NOT NULL AND length(trim(f.manifest))>0 WHERE h.kind='head' AND h.state='ready' AND h.manifest IS NOT NULL AND length(trim(h.manifest))>0) WHERE pair_rank<=8 ON CONFLICT(artifact_id) DO UPDATE SET pair_rank=excluded.pair_rank;
           INSERT INTO artifact_base_retention(artifact_id,workspace,repo,format_version,head_rank,pair_rank)
           SELECT history_id,workspace,repo,format_version,NULL,pair_rank FROM (SELECT f.id history_id,h.workspace,h.repo,h.format_version,row_number() OVER(PARTITION BY h.workspace,h.repo,h.format_version ORDER BY CASE WHEN h.updated_at>f.updated_at THEN h.updated_at ELSE f.updated_at END DESC,CASE WHEN h.id>f.id THEN h.id ELSE f.id END DESC) pair_rank FROM artifact_jobs h JOIN artifact_jobs f ON f.workspace=h.workspace AND f.repo=h.repo AND f.commit_oid=h.commit_oid AND f.format_version=h.format_version AND f.kind='full_history' AND f.state='ready' AND f.manifest IS NOT NULL AND length(trim(f.manifest))>0 WHERE h.kind='head' AND h.state='ready' AND h.manifest IS NOT NULL AND length(trim(h.manifest))>0) WHERE pair_rank<=8 ON CONFLICT(artifact_id) DO UPDATE SET pair_rank=excluded.pair_rank;
-          PRAGMA user_version=5")
+          PRAGMA user_version=6")
             .execute(&mut *migration)
             .await?;
             sqlx::query("COMMIT").execute(&mut *migration).await?;
@@ -1071,7 +1071,7 @@ impl ArtifactScheduler {
         )
         .fetch_one(&pool)
         .await?;
-        if version != 5
+        if version != 6
             || required != 4
             || fence_tables != 3
             || fence_columns != 16
@@ -1092,7 +1092,7 @@ impl ArtifactScheduler {
             .filter(|c| !c.is_whitespace())
             .flat_map(char::to_lowercase)
             .collect::<String>();
-        if version != 5
+        if version != 6
             || required != 4
             || base_columns != 6
             || invalid_base != 0
@@ -2459,7 +2459,7 @@ async fn preflight_sqlite_schema(
     // scheduler and the six-table transport scheduler. v3 diverged into an
     // admission protocol or the transport retention/GC protocol. v4 is the
     // approved transport lineage (and, briefly, a combined integration build).
-    // v5 is exclusively the exact union.
+    // v5/v6 are exclusively the exact union; v6 records fleet admission parity.
     let inventory_ok = match version {
         2 => {
             (tables == 5 && indexes == 3 && fence_tables == 3 && fence_indexes == 0)
@@ -2475,7 +2475,7 @@ async fn preflight_sqlite_schema(
                 && ((fence_tables == 0 && fence_indexes == 0)
                     || (fence_tables == 3 && fence_indexes == 1))
         }
-        5 => tables == 8 && indexes == 5 && fence_tables == 3 && fence_indexes == 1,
+        5 | 6 => tables == 8 && indexes == 5 && fence_tables == 3 && fence_indexes == 1,
         _ => false,
     };
     if !inventory_ok {
@@ -4728,7 +4728,7 @@ mod tests {
                 .fetch_one(&migrated.pool)
                 .await
                 .unwrap(),
-            5
+            6
         );
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
@@ -4754,7 +4754,7 @@ mod tests {
                 .fetch_one(&migrated_combined.pool)
                 .await
                 .unwrap(),
-            5
+            6
         );
 
         let (admission_v3, _dir, admission_v3_path) = scheduler(Default::default()).await;
@@ -4769,7 +4769,7 @@ mod tests {
                 .fetch_one(&migrated_admission.pool)
                 .await
                 .unwrap(),
-            5
+            6
         );
 
         let (v2, _dir, v2_path) = scheduler(Default::default()).await;
@@ -4784,7 +4784,7 @@ mod tests {
                 .fetch_one(&migrated_v2.pool)
                 .await
                 .unwrap(),
-            5
+            6
         );
         assert_eq!(sqlx::query_scalar::<_,i64>("SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN('artifact_base_retention','artifact_gc_sweep')").fetch_one(&migrated_v2.pool).await.unwrap(),2);
 
@@ -4834,7 +4834,7 @@ mod tests {
         );
 
         let (future, _dir, future_path) = scheduler(Default::default()).await;
-        sqlx::query("PRAGMA user_version=6")
+        sqlx::query("PRAGMA user_version=7")
             .execute(&future.pool)
             .await
             .unwrap();

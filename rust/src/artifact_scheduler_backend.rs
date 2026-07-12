@@ -4,11 +4,10 @@
 //! split admission, generation checks, claim-cap accounting, or publication
 //! alias updates across transactions.
 //!
-//! Schema v4 is an intentionally non-rolling safety boundary: every v3 process
-//! must be drained before the first v4 process migrates the database. Migration
-//! locks serialize v4 starters, and the v4 marker makes subsequent v3 startups
-//! reject the database, but no database marker can revoke an already-running v3
-//! process that lacks the GC publication fence.
+//! Schema upgrades that add publication or GC roots are intentionally
+//! fail-closed rolling boundaries. Migration locks serialize starters, and
+//! newer markers make older binaries reject the database; no marker can revoke
+//! an already-running process, so operators must drain the prior fleet first.
 
 #[cfg(test)]
 use crate::artifact_scheduler::ArtifactTask;
