@@ -140,6 +140,8 @@ pub mod server;
 pub mod sidecar;
 #[doc(hidden)]
 pub mod snapshot;
+#[doc(hidden)]
+pub mod source_snapshot;
 #[cfg(target_os = "linux")]
 #[doc(hidden)]
 pub mod statx_compat;
