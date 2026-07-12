@@ -1674,6 +1674,31 @@ impl ArtifactSchedulerPersistence for MysqlArtifactScheduler {
         })
     }
 
+    async fn ready_candidates(
+        &self,
+        workspace: &str,
+        repo: &str,
+        kind: ArtifactKind,
+        format_version: u32,
+        limit: u32,
+    ) -> Result<Vec<ArtifactRecord>> {
+        validate_mysql_identity(workspace, repo, None)?;
+        if format_version == 0 || !(1..=32).contains(&limit) {
+            bail!("ready candidate format or limit is invalid")
+        }
+        let rows = sqlx::query(
+            "SELECT id,workspace,repo,commit_oid,kind,format_version,state,owner,lease_expires_at,lease_generation,claim_attempts,retry_count,manifest,error,failure_class FROM artifact_jobs WHERE workspace=? AND repo=? AND kind=? AND format_version=? AND state='ready' AND manifest IS NOT NULL AND length(trim(manifest))>0 ORDER BY updated_at DESC,id DESC LIMIT ?",
+        )
+        .bind(workspace)
+        .bind(repo)
+        .bind(kind.as_str())
+        .bind(format_version as i64)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(row_record).collect()
+    }
+
     async fn published(
         &self,
         workspace: &str,
@@ -1707,25 +1732,64 @@ impl ArtifactSchedulerPersistence for MysqlArtifactScheduler {
         row.map(row_record).transpose()
     }
 
-    async fn latest_complete_full_base(
+    async fn complete_full_base_candidates(
         &self,
         workspace: &str,
         repo: &str,
         format_version: u32,
-    ) -> Result<Option<String>> {
+        limit: u32,
+    ) -> Result<Vec<String>> {
         validate_mysql_identity(workspace, repo, None)?;
-        if format_version == 0 {
-            bail!("artifact format version must be positive")
+        if format_version == 0 || !(1..=32).contains(&limit) {
+            bail!("full base candidate format or limit is invalid")
         }
         sqlx::query_scalar(
-            "SELECT h.commit_oid FROM artifact_jobs h JOIN artifact_jobs f ON f.workspace=h.workspace AND f.repo=h.repo AND f.commit_oid=h.commit_oid AND f.format_version=h.format_version AND f.kind='full_history' WHERE h.workspace=? AND h.repo=? AND h.format_version=? AND h.kind='head' AND h.state='ready' AND f.state='ready' AND h.manifest IS NOT NULL AND length(trim(h.manifest))>0 AND f.manifest IS NOT NULL AND length(trim(f.manifest))>0 ORDER BY GREATEST(h.updated_at,f.updated_at) DESC,GREATEST(h.id,f.id) DESC LIMIT 1",
+            "SELECT h.commit_oid FROM artifact_jobs h JOIN artifact_jobs f ON f.workspace=h.workspace AND f.repo=h.repo AND f.commit_oid=h.commit_oid AND f.format_version=h.format_version AND f.kind='full_history' WHERE h.workspace=? AND h.repo=? AND h.format_version=? AND h.kind='head' AND h.state='ready' AND f.state='ready' AND h.manifest IS NOT NULL AND length(trim(h.manifest))>0 AND f.manifest IS NOT NULL AND length(trim(f.manifest))>0 ORDER BY GREATEST(h.updated_at,f.updated_at) DESC,GREATEST(h.id,f.id) DESC LIMIT ?",
         )
         .bind(workspace)
         .bind(repo)
         .bind(format_version as i64)
-        .fetch_optional(&self.pool)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
         .await
         .map_err(Into::into)
+    }
+
+    async fn quarantine_ready(
+        &self,
+        key: &ArtifactKey,
+        expected_manifest: &str,
+        reason: &str,
+    ) -> Result<bool> {
+        validate_mysql_key(key)?;
+        crate::cas::Cas::validate_artifact_id(expected_manifest)?;
+        let mut tx = self.pool.begin().await?;
+        let result = sqlx::query(
+            "UPDATE artifact_jobs SET state='failed',manifest=NULL,error=?,failure_class='retryable',owner=NULL,heartbeat_at=NULL,lease_expires_at=NULL,updated_at=UNIX_TIMESTAMP() WHERE workspace=? AND repo=? AND commit_oid=? AND kind=? AND format_version=? AND state='ready' AND manifest=?",
+        )
+        .bind(reason)
+        .bind(&key.workspace)
+        .bind(&key.repo)
+        .bind(&key.commit)
+        .bind(key.kind.as_str())
+        .bind(key.format_version as i64)
+        .bind(expected_manifest)
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() > 0 {
+            sqlx::query("UPDATE artifact_observations SET published_artifact_id=NULL WHERE workspace=? AND repo=? AND published_artifact_id=(SELECT id FROM artifact_jobs WHERE workspace=? AND repo=? AND commit_oid=? AND kind=? AND format_version=?)")
+                .bind(&key.workspace)
+                .bind(&key.repo)
+                .bind(&key.workspace)
+                .bind(&key.repo)
+                .bind(&key.commit)
+                .bind(key.kind.as_str())
+                .bind(key.format_version as i64)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(result.rows_affected() > 0)
     }
 
     async fn counts(&self) -> Result<Vec<(ArtifactKind, ArtifactState, u64)>> {

@@ -146,6 +146,7 @@ fn artifact_descriptors() -> Vec<PinnedArtifactDescriptor> {
 fn request(plan: &PinnedTopUpBundle) -> PinnedBundleRequest {
     PinnedBundleRequest {
         manifest_hash: "a".repeat(64),
+        transport_session: "b".repeat(64),
         format_version: plan.format_version,
         workspace_id: plan.workspace_id.clone(),
         repo_path: plan.repo_path.clone(),

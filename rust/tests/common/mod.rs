@@ -263,6 +263,9 @@ async fn start_server_split_storage_inner(
     let broker: Arc<dyn ripclone::auth::broker::CredentialBroker> = Arc::new(
         ripclone::auth::broker::StaticBroker::new(provider_registry.clone()),
     );
+    let artifact_verifier = Arc::new(ripclone::artifact_manifest::CasCompletionVerifier::new(
+        cas.clone(),
+    ));
     let state = ServerState {
         cas,
         repo_config: Arc::new(ripclone::repo_config::RepoConfigStore::new(storage.clone())),
@@ -270,7 +273,7 @@ async fn start_server_split_storage_inner(
         repo_root: repo_root.clone(),
         ref_store,
         artifact_scheduler: None,
-        artifact_verifier: None,
+        artifact_verifier: Some(artifact_verifier),
         provider_registry,
         broker,
         token_hash: Some(token_hash()),

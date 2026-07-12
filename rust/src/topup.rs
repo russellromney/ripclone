@@ -49,6 +49,11 @@ pub struct PinnedTopUpBundle {
 #[serde(deny_unknown_fields)]
 pub struct PinnedBundleRequest {
     pub manifest_hash: String,
+    /// Request-specific renewable transport lease. It is deliberately outside
+    /// the content-addressed bundle semantics so concurrent clones of the same
+    /// root cannot release one another's retention lease.
+    #[serde(default)]
+    pub transport_session: String,
     /// Exact semantic identity expected from the content-addressed manifest.
     /// These fields are repeated deliberately: the manifest hash alone is not
     /// sufficient to prevent a valid bundle for another request from being

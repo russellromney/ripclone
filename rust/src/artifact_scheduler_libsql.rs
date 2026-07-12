@@ -424,6 +424,31 @@ impl ArtifactSchedulerPersistence for LibsqlArtifactScheduler {
         }
         Ok(records)
     }
+    async fn ready_candidates(
+        &self,
+        w: &str,
+        r: &str,
+        k: ArtifactKind,
+        v: u32,
+        limit: u32,
+    ) -> Result<Vec<ArtifactRecord>> {
+        validate_format_version(v)?;
+        if !(1..=32).contains(&limit) {
+            bail!("ready candidate limit must be between 1 and 32")
+        }
+        let conn = self.conn().await?;
+        let mut rows = conn
+            .query(
+                &format!("{SELECT} WHERE workspace=? AND repo=? AND kind=? AND format_version=? AND state='ready' AND manifest IS NOT NULL AND length(trim(manifest))>0 ORDER BY updated_at DESC,id DESC LIMIT ?"),
+                vec![Value::from(w), Value::from(r), Value::from(k.as_str()), Value::from(v as i64), Value::from(limit as i64)],
+            )
+            .await?;
+        let mut records = Vec::new();
+        while let Some(row) = rows.next().await? {
+            records.push(row_record(&row)?);
+        }
+        Ok(records)
+    }
     async fn quarantine_ready(
         &self,
         id: i64,
@@ -496,17 +521,45 @@ impl ArtifactSchedulerPersistence for LibsqlArtifactScheduler {
             None => Ok(None),
         }
     }
-    async fn latest_complete_full_base(&self, w: &str, r: &str, v: u32) -> Result<Option<String>> {
+    async fn complete_full_base_candidates(
+        &self,
+        w: &str,
+        r: &str,
+        v: u32,
+        limit: u32,
+    ) -> Result<Vec<String>> {
         validate_format_version(v)?;
+        if !(1..=32).contains(&limit) {
+            bail!("full base candidate limit must be between 1 and 32")
+        }
         let conn = self.conn().await?;
-        Ok(query_one(
-            &conn,
-            "SELECT h.commit_oid FROM artifact_jobs h JOIN artifact_jobs f ON f.workspace=h.workspace AND f.repo=h.repo AND f.commit_oid=h.commit_oid AND f.format_version=h.format_version AND f.kind='full_history' WHERE h.workspace=? AND h.repo=? AND h.format_version=? AND h.kind='head' AND h.state='ready' AND f.state='ready' AND h.manifest IS NOT NULL AND length(trim(h.manifest))>0 AND f.manifest IS NOT NULL AND length(trim(f.manifest))>0 ORDER BY max(h.updated_at,f.updated_at) DESC,max(h.id,f.id) DESC LIMIT 1",
-            vec![w.into(), r.into(), (v as i64).into()],
-        )
-        .await?
-        .map(|row| row.get(0))
-        .transpose()?)
+        let mut rows = conn.query("SELECT h.commit_oid FROM artifact_jobs h JOIN artifact_jobs f ON f.workspace=h.workspace AND f.repo=h.repo AND f.commit_oid=h.commit_oid AND f.format_version=h.format_version AND f.kind='full_history' WHERE h.workspace=? AND h.repo=? AND h.format_version=? AND h.kind='head' AND h.state='ready' AND f.state='ready' AND h.manifest IS NOT NULL AND length(trim(h.manifest))>0 AND f.manifest IS NOT NULL AND length(trim(f.manifest))>0 ORDER BY max(h.updated_at,f.updated_at) DESC,max(h.id,f.id) DESC LIMIT ?",vec![Value::from(w),Value::from(r),Value::from(v as i64),Value::from(limit as i64)]).await?;
+        let mut commits = Vec::new();
+        while let Some(row) = rows.next().await? {
+            commits.push(row.get(0)?);
+        }
+        Ok(commits)
+    }
+    async fn quarantine_ready(
+        &self,
+        key: &ArtifactKey,
+        expected_manifest: &str,
+        reason: &str,
+    ) -> Result<bool> {
+        validate_format_version(key.format_version)?;
+        crate::cas::Cas::validate_artifact_id(expected_manifest)?;
+        let conn = self.conn().await?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .await?;
+        let result: Result<bool> = async {
+            let changed = exec(&tx,"UPDATE artifact_jobs SET state='failed',manifest=NULL,error=?,failure_class='retryable',owner=NULL,heartbeat_at=NULL,lease_expires_at=NULL,updated_at=unixepoch() WHERE workspace=? AND repo=? AND commit_oid=? AND kind=? AND format_version=? AND state='ready' AND manifest=?",vec![reason.into(),key.workspace.clone().into(),key.repo.clone().into(),key.commit.clone().into(),key.kind.as_str().into(),(key.format_version as i64).into(),expected_manifest.into()]).await?;
+            if changed > 0 {
+                exec(&tx,"UPDATE artifact_observations SET published_artifact_id=NULL WHERE workspace=? AND repo=? AND published_artifact_id=(SELECT id FROM artifact_jobs WHERE workspace=? AND repo=? AND commit_oid=? AND kind=? AND format_version=?)",vec![key.workspace.clone().into(),key.repo.clone().into(),key.workspace.clone().into(),key.repo.clone().into(),key.commit.clone().into(),key.kind.as_str().into(),(key.format_version as i64).into()]).await?;
+            }
+            Ok(changed > 0)
+        }.await;
+        finish(tx, result).await
     }
     async fn counts(&self) -> Result<Vec<(ArtifactKind, ArtifactState, u64)>> {
         let conn = self.conn().await?;

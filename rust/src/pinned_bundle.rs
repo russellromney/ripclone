@@ -69,6 +69,67 @@ pub struct PinnedBundleManifest {
     pub prebuilt_index: PinnedArtifactDescriptor,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinnedManifestCapability {
+    pub artifacts: Vec<PinnedArtifactDescriptor>,
+    pub target_commit: String,
+    pub mode: TopUpMode,
+}
+
+/// Validate the canonical, semantic pinned-manifest envelope and return the
+/// exact artifact descriptors it authorizes. This intentionally does not read
+/// child objects; it is the repo-bound download-capability check performed
+/// before the normal full bundle verifier sees locally cached bytes.
+pub fn validate_pinned_manifest_capability(
+    bytes: &[u8],
+    workspace: &str,
+    repo: &str,
+) -> Result<PinnedManifestCapability> {
+    let stored = decode_pinned_bundle_manifest_bytes(bytes)?;
+    if serde_json::to_vec(&stored)? != bytes {
+        bail!("pinned manifest is not canonical JSON")
+    }
+    if !stored.verified.manifest_hash.is_empty()
+        || stored.verified.bundle.workspace_id != workspace
+        || stored.verified.bundle.repo_path != repo
+        || stored.verified.bundle.format_version != PINNED_BUNDLE_FORMAT_VERSION
+    {
+        bail!("pinned manifest capability identity mismatch")
+    }
+    validate_exact_oid(&stored.verified.bundle.base_commit)?;
+    validate_exact_oid(&stored.verified.bundle.target_commit)?;
+    validate_bundle_metadata(
+        &stored.verified.bundle.workspace_id,
+        &stored.verified.bundle.repo_path,
+        &stored.verified.bundle.branch,
+        &stored.verified.bundle.canonical_origin,
+    )?;
+    let expected =
+        pinned_bundle_semantic_digest(&stored.verified.bundle, &stored.verified.artifacts);
+    if stored.verified.semantic_digest != expected {
+        bail!("pinned manifest semantic digest mismatch")
+    }
+    let mut flattened = flatten_packs(&stored.base_packs);
+    flattened.extend(flatten_packs(&stored.overlay_packs));
+    flattened.push(stored.checkout_metadata.clone());
+    flattened.push(stored.prebuilt_index.clone());
+    if flattened != stored.verified.artifacts {
+        bail!("pinned manifest artifact schema/order mismatch")
+    }
+    let mut unique = HashSet::with_capacity(flattened.len());
+    for artifact in &flattened {
+        Cas::validate_artifact_id(&artifact.hash)?;
+        if !unique.insert(artifact.hash.as_str()) {
+            bail!("pinned manifest repeats an artifact hash")
+        }
+    }
+    Ok(PinnedManifestCapability {
+        artifacts: flattened,
+        target_commit: stored.verified.bundle.target_commit,
+        mode: stored.verified.bundle.mode,
+    })
+}
+
 pub fn generate_pinned_bundle(input: PinnedBundleBuild<'_>) -> Result<PinnedBundleRequest> {
     validate_bundle_metadata(
         input.workspace_id,
@@ -168,6 +229,9 @@ pub fn generate_pinned_bundle(input: PinnedBundleBuild<'_>) -> Result<PinnedBund
     let manifest_hash = input.cas.put(&bytes)?;
     let request = PinnedBundleRequest {
         manifest_hash,
+        // Generation/verification is local. A fresh request-scoped transport
+        // session is attached only when a clone plan receipt is issued.
+        transport_session: String::new(),
         format_version: stored.verified.bundle.format_version,
         workspace_id: stored.verified.bundle.workspace_id.clone(),
         repo_path: stored.verified.bundle.repo_path.clone(),

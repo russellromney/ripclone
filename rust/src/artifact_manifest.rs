@@ -401,6 +401,32 @@ impl ArtifactPayload {
             }
         }
     }
+
+    /// Direct immutable CAS objects authorized by this manifest. Nested Git
+    /// objects are contained inside the authenticated pack/archive objects.
+    pub fn referenced_blobs(&self) -> Vec<&CasBlob> {
+        match self {
+            Self::Head(head) => head
+                .packs
+                .iter()
+                .flat_map(|pair| [&pair.pack, &pair.index])
+                .chain(std::iter::once(&head.prebuilt_index))
+                .collect(),
+            Self::FullHistory(history) => std::iter::once(&history.target_commit_object)
+                .chain(
+                    history
+                        .history_packs
+                        .iter()
+                        .flat_map(|pair| [&pair.pack, &pair.index]),
+                )
+                .collect(),
+            Self::Files(files) => std::iter::once(&files.target_commit_object)
+                .chain(std::iter::once(&files.metadata))
+                .chain(files.archive_chunks.iter())
+                .chain(files.zstd_dictionary.iter())
+                .collect(),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -420,6 +446,34 @@ pub struct ArtifactManifest {
 }
 
 impl ArtifactManifest {
+    /// Validate the authenticated envelope without reading its referenced CAS
+    /// objects. Download authorization uses this before allowing a root hash to
+    /// delegate access to exactly its descriptor set; the full verifier still
+    /// runs before publication and clone planning.
+    pub fn validate_envelope_bytes(bytes: &[u8]) -> Result<Self> {
+        let manifest: Self =
+            serde_json::from_slice(bytes).context("decode typed artifact manifest")?;
+        if serde_json::to_vec(&manifest)? != bytes {
+            bail!("typed artifact manifest is not canonical JSON")
+        }
+        if manifest.schema_version != ARTIFACT_MANIFEST_SCHEMA
+            || manifest.key.workspace.trim().is_empty()
+            || manifest.key.repo.trim().is_empty()
+            || manifest.key.format_version == 0
+        {
+            bail!("artifact manifest envelope is invalid")
+        }
+        validate_commit_oid(&manifest.key.commit)?;
+        if manifest.payload.kind() != manifest.key.kind {
+            bail!("artifact payload kind does not match key")
+        }
+        let expected = semantic_digest(manifest.schema_version, &manifest.key, &manifest.payload)?;
+        if manifest.semantic_digest != expected {
+            bail!("artifact manifest semantic digest mismatch")
+        }
+        Ok(manifest)
+    }
+
     pub fn new(key: &ArtifactKey, payload: ArtifactPayload) -> Result<Self> {
         validate_commit_oid(&key.commit)?;
         if key.workspace.trim().is_empty()

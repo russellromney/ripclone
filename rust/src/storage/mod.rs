@@ -21,6 +21,13 @@ pub trait StorageBackend: Send + Sync {
     /// Fetch a byte range from the object by hash.
     fn get_range(&self, hash: &str, start: u64, len: u64) -> Result<Vec<u8>>;
 
+    /// Open a local immutable object for zero-copy-ish HTTP streaming. Remote
+    /// backends normally return a signed URL instead. `None` preserves support
+    /// for custom backends that can only provide buffered reads.
+    fn open_local(&self, _hash: &str) -> Result<Option<std::fs::File>> {
+        Ok(None)
+    }
+
     /// Store the full object by hash.
     fn put(&self, hash: &str, data: &[u8]) -> Result<()>;
 
@@ -189,6 +196,15 @@ impl StorageBackend for LocalStorage {
 
     fn get_range(&self, hash: &str, start: u64, len: u64) -> Result<Vec<u8>> {
         self.cas.get_range(hash, start, len)
+    }
+
+    fn open_local(&self, hash: &str) -> Result<Option<std::fs::File>> {
+        Cas::validate_artifact_id(hash)?;
+        match std::fs::File::open(self.cas.path(hash)) {
+            Ok(file) => Ok(Some(file)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error).with_context(|| format!("open local artifact {hash}")),
+        }
     }
 
     fn put(&self, hash: &str, data: &[u8]) -> Result<()> {

@@ -411,7 +411,7 @@ struct ClonePlanQuery {
     mode: SyncMode,
 }
 
-const TYPED_ARTIFACT_FORMAT_VERSION: u32 = 1;
+const TYPED_ARTIFACT_FORMAT_VERSION: u32 = crate::clone_transport::CLONE_ARTIFACT_FORMAT_VERSION;
 // A clone consumer protects both work in flight and immutable artifacts already
 // handed to a downloader. Use the scheduler's maximum lease window: a five
 // minute lease expires during ordinary large-repository clones and permits a
@@ -2150,6 +2150,43 @@ async fn dispatch_repos_get(
     State(state): State<ServerState>,
     OriginalUri(uri): OriginalUri,
 ) -> impl IntoResponse {
+    if let Some((repo_path, artifact_path)) = path.rsplit_once("/typed-artifacts/") {
+        let Some((root, hash)) = artifact_path.split_once('/') else {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "typed artifact path requires root and object hashes".to_string(),
+                }),
+            )
+                .into_response();
+        };
+        if hash.contains('/') {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "typed artifact path has extra segments".to_string(),
+                }),
+            )
+                .into_response();
+        }
+        let Some((repo_id, provider)) = resolve_repo_id(&state.provider_registry, repo_path) else {
+            return unknown_provider_response();
+        };
+        if let Some(resp) =
+            validation::reject_if_invalid(|| validation::validate_repo_path(provider, &repo_id))
+        {
+            return resp;
+        }
+        return typed_artifact_download_inner(
+            repo_id,
+            provider.clone(),
+            root.to_string(),
+            hash.to_string(),
+            headers,
+            state,
+        )
+        .await;
+    }
     if path.ends_with("/clone-plan") {
         let repo_path = path.strip_suffix("/clone-plan").unwrap();
         let Some((repo_id, provider)) = resolve_repo_id(&state.provider_registry, repo_path) else {
@@ -2321,6 +2358,39 @@ async fn dispatch_repos_post(
     OriginalUri(uri): OriginalUri,
     body: Body,
 ) -> impl IntoResponse {
+    if let Some((repo_path, artifact_path)) = path.rsplit_once("/typed-artifacts/")
+        && let Some((root, action)) = artifact_path.rsplit_once('/')
+        && matches!(action, "release" | "heartbeat")
+    {
+        if root.contains('/') {
+            return (
+                StatusCode::BAD_REQUEST,
+                "invalid typed transport release path",
+            )
+                .into_response();
+        }
+        let Some((repo_id, provider)) = resolve_repo_id(&state.provider_registry, repo_path) else {
+            return unknown_provider_response();
+        };
+        if let Some(resp) =
+            validation::reject_if_invalid(|| validation::validate_repo_path(provider, &repo_id))
+        {
+            return resp;
+        }
+        return if action == "release" {
+            typed_artifact_release_inner(repo_id, provider.clone(), root.to_owned(), headers, state)
+                .await
+        } else {
+            typed_artifact_heartbeat_inner(
+                repo_id,
+                provider.clone(),
+                root.to_owned(),
+                headers,
+                state,
+            )
+            .await
+        };
+    }
     if path.ends_with("/add") {
         let repo_path = path.strip_suffix("/add").unwrap();
         let Some((repo_id, provider)) = resolve_repo_id(&state.provider_registry, repo_path) else {
@@ -2440,6 +2510,112 @@ async fn dispatch_repos_post(
         }),
     )
         .into_response()
+}
+
+async fn typed_artifact_heartbeat_inner(
+    repo_id: RepoId,
+    provider: ProviderInstance,
+    root: String,
+    headers: HeaderMap,
+    state: ServerState,
+) -> Response {
+    if let Some(response) = validate_artifact_hash(&root) {
+        return response;
+    }
+    let request_token = upstream_token_from_headers(&headers);
+    let credential = match state
+        .broker
+        .fetch_credential(&repo_id, request_token.as_ref())
+    {
+        Ok(credential) => credential,
+        Err(error) => return credential_error_response(error),
+    };
+    if let Err(response) =
+        authorize_repo_read(&state, &provider, &repo_id, credential.as_ref(), &headers).await
+    {
+        return response;
+    }
+    let consumer_id = match typed_transport_consumer(&headers) {
+        Ok(consumer) => consumer,
+        Err(_) => return forbidden_repo_response(),
+    };
+    let capability = match typed_root_authorizes_hash(&state, &repo_id, &root, &root).await {
+        Ok(capability) if capability.allowed => capability,
+        Ok(_) => return forbidden_repo_response(),
+        Err(error) => {
+            warn!("typed artifact heartbeat capability rejected: {error:#}");
+            return forbidden_repo_response();
+        }
+    };
+    let Some(scheduler) = state.artifact_scheduler.as_ref() else {
+        return forbidden_repo_response();
+    };
+    for key in &capability.lease_keys {
+        if let Err(error) = scheduler
+            .subscribe_consumer(key, &consumer_id, TYPED_TRANSPORT_CONSUMER_TTL_SECS)
+            .await
+        {
+            warn!("typed artifact heartbeat lease renewal failed: {error:#}");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+async fn typed_artifact_release_inner(
+    repo_id: RepoId,
+    provider: ProviderInstance,
+    root: String,
+    headers: HeaderMap,
+    state: ServerState,
+) -> Response {
+    if let Some(response) = validate_artifact_hash(&root) {
+        return response;
+    }
+    let request_token = upstream_token_from_headers(&headers);
+    let credential = match state
+        .broker
+        .fetch_credential(&repo_id, request_token.as_ref())
+    {
+        Ok(credential) => credential,
+        Err(error) => return credential_error_response(error),
+    };
+    if let Err(response) =
+        authorize_repo_read(&state, &provider, &repo_id, credential.as_ref(), &headers).await
+    {
+        return response;
+    }
+    let consumer_id = match typed_transport_consumer(&headers) {
+        Ok(consumer) => consumer,
+        Err(_) => return forbidden_repo_response(),
+    };
+    let capability = match typed_root_authorizes_hash(&state, &repo_id, &root, &root).await {
+        Ok(capability) if capability.allowed => capability,
+        Ok(_) => return forbidden_repo_response(),
+        Err(error) => {
+            warn!("typed artifact release capability rejected: {error:#}");
+            return forbidden_repo_response();
+        }
+    };
+    let Some(scheduler) = state.artifact_scheduler.as_ref() else {
+        return forbidden_repo_response();
+    };
+    for key in &capability.lease_keys {
+        let Some(record) = (match scheduler.get_by_key(key).await {
+            Ok(record) => record,
+            Err(error) => {
+                warn!("typed artifact transport lease lookup failed: {error:#}");
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+        }) else {
+            continue;
+        };
+        if let Err(error) = scheduler.release_consumer(record.id, &consumer_id).await {
+            warn!("typed artifact transport lease release failed: {error:#}");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    }
+    StatusCode::NO_CONTENT.into_response()
 }
 
 async fn dispatch_repos_delete(
@@ -3029,6 +3205,205 @@ fn clone_plan_http_response(response: ClonePlanResponse) -> Response {
     (status, Json(response)).into_response()
 }
 
+const MAX_TYPED_ROOT_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
+const TYPED_TRANSPORT_CONSUMER_TTL_SECS: i64 = 15 * 60;
+
+struct AuthorizedTypedRoot {
+    allowed: bool,
+    lease_keys: Vec<crate::artifact_scheduler::ArtifactKey>,
+}
+
+fn typed_transport_consumer(headers: &HeaderMap) -> Result<String> {
+    let session = headers
+        .get("x-ripclone-transport-session")
+        .and_then(|value| value.to_str().ok())
+        .context("typed transport session is missing")?;
+    if session.len() != 64
+        || !session
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        anyhow::bail!("typed transport session is invalid");
+    }
+    Ok(format!("transport-{session}"))
+}
+
+async fn read_storage_object_bounded(
+    storage: StorageRef,
+    hash: String,
+    maximum: u64,
+) -> Result<Vec<u8>> {
+    Cas::validate_artifact_id(&hash)?;
+    tokio::task::spawn_blocking(move || {
+        let declared = storage.size(&hash)?;
+        if declared > maximum {
+            anyhow::bail!("typed artifact root exceeds size limit")
+        }
+        let bytes = storage.get(&hash)?;
+        if bytes.len() as u64 != declared || bytes.len() as u64 > maximum {
+            anyhow::bail!("typed artifact root storage length mismatch")
+        }
+        let actual = crate::cas::hash(&bytes);
+        if actual != hash {
+            anyhow::bail!("typed artifact root storage hash mismatch")
+        }
+        Ok(bytes)
+    })
+    .await
+    .context("typed artifact root read task")?
+}
+
+async fn typed_root_authorizes_hash(
+    state: &ServerState,
+    repo_id: &RepoId,
+    root: &str,
+    requested: &str,
+) -> Result<AuthorizedTypedRoot> {
+    let bytes = read_storage_object_bounded(
+        state.storage.clone(),
+        root.to_owned(),
+        MAX_TYPED_ROOT_MANIFEST_BYTES,
+    )
+    .await?;
+    if let Ok(manifest) =
+        crate::artifact_manifest::ArtifactManifest::validate_envelope_bytes(&bytes)
+    {
+        if manifest.key.workspace != repo_id.workspace.as_str() || manifest.key.repo != repo_id.path
+        {
+            return Ok(AuthorizedTypedRoot {
+                allowed: false,
+                lease_keys: Vec::new(),
+            });
+        }
+        let Some(scheduler) = state.artifact_scheduler.as_ref() else {
+            return Ok(AuthorizedTypedRoot {
+                allowed: false,
+                lease_keys: Vec::new(),
+            });
+        };
+        let key = crate::artifact_scheduler::ArtifactKey {
+            workspace: manifest.key.workspace.clone(),
+            repo: manifest.key.repo.clone(),
+            commit: manifest.key.commit.clone(),
+            kind: manifest.key.kind,
+            format_version: manifest.key.format_version,
+        };
+        let Some(record) = scheduler.get_by_key(&key).await? else {
+            return Ok(AuthorizedTypedRoot {
+                allowed: false,
+                lease_keys: Vec::new(),
+            });
+        };
+        if record.state != crate::artifact_scheduler::ArtifactState::Ready
+            || record.manifest.as_deref() != Some(root)
+        {
+            return Ok(AuthorizedTypedRoot {
+                allowed: false,
+                lease_keys: Vec::new(),
+            });
+        }
+        let allowed = requested == root
+            || manifest
+                .payload
+                .referenced_blobs()
+                .iter()
+                .any(|blob| blob.hash == requested);
+        return Ok(AuthorizedTypedRoot {
+            allowed,
+            lease_keys: vec![key],
+        });
+    }
+    let capability = crate::pinned_bundle::validate_pinned_manifest_capability(
+        &bytes,
+        repo_id.workspace.as_str(),
+        &repo_id.path,
+    )?;
+    let mut lease_keys = vec![artifact_key(
+        repo_id,
+        &capability.target_commit,
+        crate::artifact_scheduler::ArtifactKind::Head,
+    )];
+    if capability.mode == crate::topup::TopUpMode::Full {
+        lease_keys.push(artifact_key(
+            repo_id,
+            &capability.target_commit,
+            crate::artifact_scheduler::ArtifactKind::FullHistory,
+        ));
+    }
+    Ok(AuthorizedTypedRoot {
+        allowed: requested == root
+            || capability
+                .artifacts
+                .iter()
+                .any(|artifact| artifact.hash == requested),
+        lease_keys,
+    })
+}
+
+async fn typed_artifact_download_inner(
+    repo_id: RepoId,
+    provider: ProviderInstance,
+    root: String,
+    hash: String,
+    headers: HeaderMap,
+    state: ServerState,
+) -> Response {
+    if let Some(response) = validate_artifact_hash(&root) {
+        return response;
+    }
+    if let Some(response) = validate_artifact_hash(&hash) {
+        return response;
+    }
+    let request_token = upstream_token_from_headers(&headers);
+    let credential = match state
+        .broker
+        .fetch_credential(&repo_id, request_token.as_ref())
+    {
+        Ok(credential) => credential,
+        Err(error) => return credential_error_response(error),
+    };
+    let private =
+        match authorize_repo_read(&state, &provider, &repo_id, credential.as_ref(), &headers).await
+        {
+            Ok(private) => private,
+            Err(response) => return response,
+        };
+    let consumer_id = match typed_transport_consumer(&headers) {
+        Ok(consumer) => consumer,
+        Err(_) => return forbidden_repo_response(),
+    };
+    let capability = match typed_root_authorizes_hash(&state, &repo_id, &root, &hash).await {
+        Ok(capability) if capability.allowed => capability,
+        Ok(_) => return forbidden_repo_response(),
+        Err(error) => {
+            warn!("typed artifact capability rejected: {error:#}");
+            return forbidden_repo_response();
+        }
+    };
+    let Some(scheduler) = state.artifact_scheduler.as_ref() else {
+        return forbidden_repo_response();
+    };
+    for key in &capability.lease_keys {
+        if let Err(error) = scheduler
+            .subscribe_consumer(key, &consumer_id, TYPED_TRANSPORT_CONSUMER_TTL_SECS)
+            .await
+        {
+            warn!("typed artifact transport lease renewal failed: {error:#}");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    }
+    let mut authorized_headers = headers;
+    authorized_headers.insert(
+        "x-ripclone-visibility",
+        if private { "private" } else { "public" }
+            .parse()
+            .expect("static visibility header"),
+    );
+    serve_artifact(hash, state, Some(authorized_headers))
+        .await
+        .into_response()
+}
+
 fn lifecycle_clone_response(
     repo_id: &RepoId,
     branch: &str,
@@ -3092,6 +3467,13 @@ fn convergence_failure_is_fatal(plan: &crate::clone_plan::ClonePlan) -> bool {
     matches!(plan, crate::clone_plan::ClonePlan::Pending { .. })
 }
 
+fn clone_needs_top_up(mode: SyncMode, exact: &ExactArtifacts) -> bool {
+    match mode {
+        SyncMode::Files | SyncMode::Head => exact.head.is_none() && exact.files.is_none(),
+        SyncMode::Full => exact.head.is_none() || exact.history.is_none(),
+    }
+}
+
 fn base_pack(pair: &crate::artifact_manifest::GitPackPair) -> crate::pinned_bundle::StoredPack {
     crate::pinned_bundle::StoredPack {
         pack: crate::topup::PinnedArtifactDescriptor {
@@ -3118,8 +3500,7 @@ fn full_history_base_packs(
 
 async fn verified_artifact(
     scheduler: &dyn crate::artifact_scheduler_backend::ArtifactSchedulerPersistence,
-    verifier: &crate::artifact_manifest::CasCompletionVerifier,
-    verify_limit: &tokio::sync::Semaphore,
+    state: &ServerState,
     key: &crate::artifact_scheduler::ArtifactKey,
 ) -> Result<
     Option<(
@@ -3137,25 +3518,169 @@ async fn verified_artifact(
         .manifest
         .as_deref()
         .context("ready typed artifact has no manifest")?;
-    let _permit = verify_limit
+    let _permit = state
+        .artifact_verify_limit
         .acquire()
         .await
         .expect("typed artifact verification semaphore never closes");
-    let verifier = verifier.clone();
-    let verify_key = key.clone();
-    let verify_hash = manifest_hash.to_owned();
-    let manifest =
+    let verification: Result<crate::artifact_manifest::ArtifactManifest> = async {
+        hydrate_typed_publication(state, key, manifest_hash).await?;
+        let verifier = state.artifact_verifier.clone();
+        let verify_key = key.clone();
+        let verify_hash = manifest_hash.to_owned();
         tokio::task::spawn_blocking(move || verifier.verify_publication(&verify_key, &verify_hash))
             .await
-            .context("typed artifact verification task failed")??;
-    let receipt = VerifiedArtifactReceipt::from_published(&record)?;
+            .context("typed artifact verification task failed")?
+    }
+    .await;
+    let manifest = match verification {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            // The scheduler row was Ready, so missing/corrupt durable bytes are
+            // publication poison rather than an ordinary cache miss. Fence the
+            // report by the exact manifest hash: if another publisher replaced
+            // it concurrently this stale verifier cannot invalidate the winner.
+            let quarantined = scheduler
+                .quarantine_ready(key, manifest_hash, "read-time artifact verification failed")
+                .await
+                .context("quarantine invalid typed publication")?;
+            if quarantined {
+                warn!(
+                    "quarantined corrupt typed publication {}: {error:#}",
+                    manifest_hash
+                );
+                return Ok(None);
+            }
+            warn!(
+                "typed publication changed during failed verification; retry on next plan: {error:#}"
+            );
+            return Ok(None);
+        }
+    };
+    // Fence successful verification too. A retry may replace the manifest
+    // between the first read and semantic verification; never issue a plan for
+    // a root the repo-bound download route will (correctly) reject as stale.
+    let Some(current) = scheduler.get_by_key(key).await? else {
+        return Ok(None);
+    };
+    if current.state != crate::artifact_scheduler::ArtifactState::Ready
+        || current.manifest.as_deref() != Some(manifest_hash)
+    {
+        return Ok(None);
+    }
+    let receipt = VerifiedArtifactReceipt::from_published(&current)?;
     Ok(Some((receipt, manifest)))
+}
+
+const TYPED_HYDRATE_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_TYPED_CHILD_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+const MAX_TYPED_PUBLICATION_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
+const MAX_TYPED_PUBLICATION_OBJECTS: usize = 65_536;
+
+/// Materialize a durable typed publication into the verifier's local CAS.
+///
+/// Durable storage is the source of truth in S3/R2 deployments and the local
+/// CAS is explicitly evictable. Read-time verification must therefore hydrate
+/// cold objects before invoking the CAS-only semantic verifier. Child objects
+/// are copied in bounded ranges to a temporary file, hash checked, and only
+/// then atomically installed in CAS; a truncated/corrupt remote object never
+/// becomes trusted local state.
+async fn hydrate_typed_publication(
+    state: &ServerState,
+    key: &crate::artifact_scheduler::ArtifactKey,
+    manifest_hash: &str,
+) -> Result<()> {
+    let manifest_bytes = read_storage_object_bounded(
+        state.storage.clone(),
+        manifest_hash.to_owned(),
+        MAX_TYPED_ROOT_MANIFEST_BYTES,
+    )
+    .await?;
+    let manifest =
+        crate::artifact_manifest::ArtifactManifest::validate_envelope_bytes(&manifest_bytes)?;
+    if manifest.key.workspace != key.workspace
+        || manifest.key.repo != key.repo
+        || manifest.key.commit != key.commit
+        || manifest.key.kind != key.kind
+        || manifest.key.format_version != key.format_version
+    {
+        anyhow::bail!("durable typed manifest does not match scheduler key");
+    }
+    state.cas.put_with_hash(manifest_hash, &manifest_bytes)?;
+
+    let blobs = manifest.payload.referenced_blobs();
+    if blobs.len() > MAX_TYPED_PUBLICATION_OBJECTS {
+        anyhow::bail!("typed publication has too many direct CAS objects");
+    }
+    let mut total = 0u64;
+    for blob in &blobs {
+        if blob.len > MAX_TYPED_CHILD_BYTES {
+            anyhow::bail!("typed publication child exceeds transport limit");
+        }
+        total = total
+            .checked_add(blob.len)
+            .context("typed publication transport length overflow")?;
+        if total > MAX_TYPED_PUBLICATION_BYTES {
+            anyhow::bail!("typed publication exceeds aggregate transport limit");
+        }
+    }
+
+    let storage = state.storage.clone();
+    let cas = state.cas.clone();
+    let owned = blobs.into_iter().cloned().collect::<Vec<_>>();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        use sha2::Digest as _;
+        use std::io::Write as _;
+
+        for blob in owned {
+            crate::cas::Cas::validate_artifact_id(&blob.hash)?;
+            if cas.verify_object(&blob.hash).ok() == Some(blob.len) {
+                continue;
+            }
+            let declared = storage
+                .size(&blob.hash)
+                .with_context(|| format!("stat durable typed child {}", blob.hash))?;
+            if declared != blob.len {
+                anyhow::bail!("durable typed child length mismatch");
+            }
+            let mut temp = tempfile::Builder::new()
+                .prefix(".typed-hydrate.")
+                .tempfile_in(cas.root())
+                .context("create typed hydration temporary file")?;
+            let mut hasher = sha2::Sha256::new();
+            let mut offset = 0u64;
+            while offset < blob.len {
+                let wanted = (blob.len - offset).min(TYPED_HYDRATE_CHUNK_BYTES);
+                let bytes = storage
+                    .get_range(&blob.hash, offset, wanted)
+                    .with_context(|| format!("hydrate durable typed child {}", blob.hash))?;
+                if bytes.len() as u64 != wanted {
+                    anyhow::bail!("durable typed child returned a short range");
+                }
+                hasher.update(&bytes);
+                temp.as_file_mut().write_all(&bytes)?;
+                offset += wanted;
+            }
+            temp.as_file_mut().flush()?;
+            let actual = hex::encode(hasher.finalize());
+            if actual != blob.hash {
+                anyhow::bail!("durable typed child hash mismatch");
+            }
+            let installed = cas.put_file_with_hash(&blob.hash, temp.path())?;
+            if installed != blob.len {
+                anyhow::bail!("hydrated typed child CAS length mismatch");
+            }
+        }
+        Ok(())
+    })
+    .await
+    .context("typed publication hydration task failed")??;
+    Ok(())
 }
 
 async fn load_exact_clone_artifacts(
     scheduler: &dyn crate::artifact_scheduler_backend::ArtifactSchedulerPersistence,
-    verifier: &crate::artifact_manifest::CasCompletionVerifier,
-    verify_limit: &tokio::sync::Semaphore,
+    state: &ServerState,
     repo_id: &RepoId,
     target: &str,
     mode: SyncMode,
@@ -3163,14 +3688,13 @@ async fn load_exact_clone_artifacts(
     use crate::artifact_scheduler::ArtifactKind;
     async fn receipt(
         scheduler: &dyn crate::artifact_scheduler_backend::ArtifactSchedulerPersistence,
-        verifier: &crate::artifact_manifest::CasCompletionVerifier,
-        verify_limit: &tokio::sync::Semaphore,
+        state: &ServerState,
         repo_id: &RepoId,
         target: &str,
         kind: ArtifactKind,
     ) -> Result<Option<VerifiedArtifactReceipt>> {
         let key = artifact_key(repo_id, target, kind);
-        Ok(verified_artifact(scheduler, verifier, verify_limit, &key)
+        Ok(verified_artifact(scheduler, state, &key)
             .await?
             .map(|(receipt, _)| receipt))
     }
@@ -3178,78 +3702,21 @@ async fn load_exact_clone_artifacts(
     let mut exact = ExactArtifacts::default();
     match mode {
         SyncMode::Files => {
-            exact.files = receipt(
-                scheduler,
-                verifier,
-                verify_limit,
-                repo_id,
-                target,
-                ArtifactKind::Files,
-            )
-            .await?;
+            exact.files = receipt(scheduler, state, repo_id, target, ArtifactKind::Files).await?;
             if exact.files.is_none() {
-                exact.head = receipt(
-                    scheduler,
-                    verifier,
-                    verify_limit,
-                    repo_id,
-                    target,
-                    ArtifactKind::Head,
-                )
-                .await?;
+                exact.head = receipt(scheduler, state, repo_id, target, ArtifactKind::Head).await?;
             }
         }
         SyncMode::Head => {
-            exact.head = receipt(
-                scheduler,
-                verifier,
-                verify_limit,
-                repo_id,
-                target,
-                ArtifactKind::Head,
-            )
-            .await?;
+            exact.head = receipt(scheduler, state, repo_id, target, ArtifactKind::Head).await?;
         }
         SyncMode::Full => {
-            exact.head = receipt(
-                scheduler,
-                verifier,
-                verify_limit,
-                repo_id,
-                target,
-                ArtifactKind::Head,
-            )
-            .await?;
-            exact.history = receipt(
-                scheduler,
-                verifier,
-                verify_limit,
-                repo_id,
-                target,
-                ArtifactKind::FullHistory,
-            )
-            .await?;
+            exact.head = receipt(scheduler, state, repo_id, target, ArtifactKind::Head).await?;
+            exact.history =
+                receipt(scheduler, state, repo_id, target, ArtifactKind::FullHistory).await?;
         }
     }
     Ok(exact)
-}
-
-async fn published_candidate_commit(
-    scheduler: &dyn crate::artifact_scheduler_backend::ArtifactSchedulerPersistence,
-    repo_id: &RepoId,
-    branch: &str,
-    kind: crate::artifact_scheduler::ArtifactKind,
-) -> Result<Option<String>> {
-    Ok(scheduler
-        .published(
-            repo_id.workspace.as_str(),
-            &repo_id.path,
-            branch,
-            kind,
-            TYPED_ARTIFACT_FORMAT_VERSION,
-        )
-        .await?
-        .map(|record| record.key.commit))
 }
 
 pub type PinnedGenerationCell =
@@ -3342,7 +3809,6 @@ async fn generate_pinned_bundle_singleflight(
 async fn build_top_up_receipt(
     state: &ServerState,
     scheduler: &dyn crate::artifact_scheduler_backend::ArtifactSchedulerPersistence,
-    verifier: &crate::artifact_manifest::CasCompletionVerifier,
     repo_id: &RepoId,
     provider: &ProviderInstance,
     mirror: &std::path::Path,
@@ -3358,31 +3824,39 @@ async fn build_top_up_receipt(
         SyncMode::Files | SyncMode::Head => TopUpMode::Head,
         SyncMode::Full => TopUpMode::Full,
     };
-    let mut candidates = Vec::new();
-    if let Some(commit) =
-        published_candidate_commit(scheduler, repo_id, branch, ArtifactKind::Head).await?
-    {
-        candidates.push(commit);
-    }
-    if top_up_mode == TopUpMode::Full {
-        candidates.clear();
-        if let Some(commit) = scheduler
-            .latest_complete_full_base(
+    const MAX_BASE_CANDIDATES: u32 = 8;
+    let candidates = if top_up_mode == TopUpMode::Full {
+        scheduler
+            .complete_full_base_candidates(
                 repo_id.workspace.as_str(),
                 &repo_id.path,
                 TYPED_ARTIFACT_FORMAT_VERSION,
+                MAX_BASE_CANDIDATES,
             )
             .await?
-        {
-            candidates.push(commit);
-        }
-    }
+    } else {
+        scheduler
+            .ready_candidates(
+                repo_id.workspace.as_str(),
+                &repo_id.path,
+                ArtifactKind::Head,
+                TYPED_ARTIFACT_FORMAT_VERSION,
+                MAX_BASE_CANDIDATES,
+            )
+            .await?
+            .into_iter()
+            .map(|record| record.key.commit)
+            .collect()
+    };
     for base_commit in candidates {
         let head_key = artifact_key(repo_id, &base_commit, ArtifactKind::Head);
-        let Some((_, head_manifest)) =
-            verified_artifact(scheduler, verifier, &state.artifact_verify_limit, &head_key).await?
-        else {
-            continue;
+        let head_manifest = match verified_artifact(scheduler, state, &head_key).await {
+            Ok(Some((_, manifest))) => manifest,
+            Ok(None) => continue,
+            Err(error) => {
+                warn!("skip invalid Head top-up base {base_commit}: {error:#}");
+                continue;
+            }
         };
         let ArtifactPayload::Head(head) = head_manifest.payload else {
             anyhow::bail!("verified Head publication decoded as another artifact kind");
@@ -3390,15 +3864,13 @@ async fn build_top_up_receipt(
         let mut packs = head.packs.iter().map(base_pack).collect::<Vec<_>>();
         if top_up_mode == TopUpMode::Full {
             let history_key = artifact_key(repo_id, &base_commit, ArtifactKind::FullHistory);
-            let Some((_, history_manifest)) = verified_artifact(
-                scheduler,
-                verifier,
-                &state.artifact_verify_limit,
-                &history_key,
-            )
-            .await?
-            else {
-                continue;
+            let history_manifest = match verified_artifact(scheduler, state, &history_key).await {
+                Ok(Some((_, manifest))) => manifest,
+                Ok(None) => continue,
+                Err(error) => {
+                    warn!("skip invalid History top-up base {base_commit}: {error:#}");
+                    continue;
+                }
             };
             let ArtifactPayload::FullHistory(history) = history_manifest.payload else {
                 anyhow::bail!("verified History publication decoded as another artifact kind");
@@ -3443,6 +3915,12 @@ async fn build_top_up_receipt(
             .map(|artifact| artifact.hash.clone())
             .collect::<Vec<_>>();
         hashes.push(request.manifest_hash.clone());
+        // Local-only storage has no redirect/grace safety net. Keep the
+        // generated capability root and every delegated object protected for
+        // at least the issued plan's usable lifetime (the protected set is a
+        // conservative durable superset and content-addressed duplicates are
+        // free).
+        state.retention.protect(&hashes).await;
         let storage = state.storage.clone();
         let cas = state.cas.clone();
         futures::stream::iter(hashes.into_iter().map(|hash| {
@@ -3546,7 +4024,7 @@ async fn typed_clone_plan_inner(
         .acquire()
         .await
         .expect("fetch semaphore never closed");
-    let target = match tokio::task::spawn_blocking(move || {
+    let mut target = match tokio::task::spawn_blocking(move || {
         git::ls_remote_commit(
             &resolve_provider,
             &resolve_repo,
@@ -3587,35 +4065,28 @@ async fn typed_clone_plan_inner(
     };
     drop(_resolve_permit);
 
-    let verifier = crate::artifact_manifest::CasCompletionVerifier::new(state.cas.clone());
-    let exact = match load_exact_clone_artifacts(
-        scheduler.as_ref(),
-        &verifier,
-        &state.artifact_verify_limit,
-        &repo_id,
-        &target,
-        query.mode,
-    )
-    .await
-    {
-        Ok(exact) => exact,
-        Err(error) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("typed artifact integrity failure: {error:#}"),
-                }),
-            )
-                .into_response();
-        }
-    };
-    let needs_top_up = match query.mode {
-        SyncMode::Files | SyncMode::Head => exact.head.is_none() && exact.files.is_none(),
-        SyncMode::Full => exact.head.is_none() || exact.history.is_none(),
-    };
+    let mut exact =
+        match load_exact_clone_artifacts(scheduler.as_ref(), &state, &repo_id, &target, query.mode)
+            .await
+        {
+            Ok(exact) => exact,
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("typed artifact integrity failure: {error:#}"),
+                    }),
+                )
+                    .into_response();
+            }
+        };
+    let needs_top_up = clone_needs_top_up(query.mode, &exact);
     let top_up = if needs_top_up {
-        // Fetch the pinned target, not a second resolution of the moving branch,
-        // and keep the mirror lock until bundle construction has consumed it.
+        // The cheap probe is authoritative only for an already-durable exact
+        // plan. Once work is missing, fetch the moving branch once under the
+        // repo lock and resolve that acquired graph as the authoritative target.
+        // A force-push between probe and fetch therefore selects T2 wholly; no
+        // response can mix T1 identity with T2 objects.
         let lock = repo_lock(&state.sync_locks, &repo_id).await;
         let _guard = lock.lock().await;
         if let Err(error) = ensure_mirror(
@@ -3623,7 +4094,7 @@ async fn typed_clone_plan_inner(
             &provider,
             &repo_id,
             &query.branch,
-            Some(&target),
+            None,
             credential.as_ref(),
         )
         .await
@@ -3636,29 +4107,82 @@ async fn typed_clone_plan_inner(
             )
                 .into_response();
         }
-        match build_top_up_receipt(
-            &state,
-            scheduler.as_ref(),
-            &verifier,
-            &repo_id,
-            &provider,
-            &mirror,
-            &query.branch,
-            &target,
-            query.mode,
-        )
+        let fetched_mirror = mirror.clone();
+        let fetched_branch = query.branch.clone();
+        let fetched_target = match tokio::task::spawn_blocking(move || {
+            git::resolve_commit(&fetched_mirror, &fetched_branch)
+        })
         .await
         {
-            Ok(receipt) => receipt,
-            Err(error) => {
+            Ok(Ok(target)) => target,
+            Ok(Err(error)) => {
                 return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
+                    StatusCode::BAD_GATEWAY,
                     Json(ErrorResponse {
-                        error: format!("pinned top-up verification failed: {error:#}"),
+                        error: format!("resolve fetched clone target: {error:#}"),
                     }),
                 )
                     .into_response();
             }
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("fetched clone target task failed: {error}"),
+                    }),
+                )
+                    .into_response();
+            }
+        };
+        if fetched_target != target {
+            target = fetched_target;
+            exact = match load_exact_clone_artifacts(
+                scheduler.as_ref(),
+                &state,
+                &repo_id,
+                &target,
+                query.mode,
+            )
+            .await
+            {
+                Ok(exact) => exact,
+                Err(error) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse {
+                            error: format!("fetched target artifact integrity failure: {error:#}"),
+                        }),
+                    )
+                        .into_response();
+                }
+            };
+        }
+        if clone_needs_top_up(query.mode, &exact) {
+            match build_top_up_receipt(
+                &state,
+                scheduler.as_ref(),
+                &repo_id,
+                &provider,
+                &mirror,
+                &query.branch,
+                &target,
+                query.mode,
+            )
+            .await
+            {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse {
+                            error: format!("pinned top-up verification failed: {error:#}"),
+                        }),
+                    )
+                        .into_response();
+                }
+            }
+        } else {
+            None
         }
     } else {
         None
@@ -6121,6 +6645,9 @@ async fn get_pack(Path(hash): Path<String>, State(state): State<ServerState>) ->
     if let Some(resp) = validate_artifact_hash(&hash) {
         return resp;
     }
+    if state.artifact_scheduler.is_some() {
+        return normalized_unscoped_artifact_response();
+    }
     serve_artifact(hash, state, None).await.into_response()
 }
 
@@ -6130,6 +6657,9 @@ async fn get_object(
 ) -> impl IntoResponse {
     if let Some(resp) = validate_artifact_hash(&sha) {
         return resp;
+    }
+    if state.artifact_scheduler.is_some() {
+        return normalized_unscoped_artifact_response();
     }
     serve_artifact(sha, state, None).await.into_response()
 }
@@ -6163,8 +6693,22 @@ async fn get_artifact(
     if let Some(resp) = validate_artifact_hash(&hash) {
         return resp;
     }
+    if state.artifact_scheduler.is_some() {
+        return normalized_unscoped_artifact_response();
+    }
     serve_artifact(hash, state, Some(headers))
         .await
+        .into_response()
+}
+
+fn normalized_unscoped_artifact_response() -> Response {
+    (
+        StatusCode::GONE,
+        Json(ErrorResponse {
+            error: "normalized typed artifacts require a repo-bound manifest capability"
+                .to_string(),
+        }),
+    )
         .into_response()
 }
 
@@ -6243,6 +6787,14 @@ async fn serve_artifact(
                 .into_response();
         }
     };
+    if total_size == 0 {
+        state.metrics.record_artifact_request(0);
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(axum::http::header::CONTENT_LENGTH, "0")
+            .body(Body::empty())
+            .expect("static empty artifact response");
+    }
 
     // Parse Range header if present.
     let range = headers.as_ref().and_then(|h| {
@@ -6250,6 +6802,125 @@ async fn serve_artifact(
             .and_then(|v| v.to_str().ok())
             .and_then(|v| parse_byte_range(v, total_size))
     });
+
+    // Local CAS objects are streamed from a file descriptor. This avoids the
+    // old `storage.get()` allocation of an entire multi-gigabyte pack before
+    // Axum could emit its first byte. The test barrier intentionally keeps the
+    // buffered path below so deterministic mid-stream fault injection remains
+    // available.
+    if state.artifact_barrier.is_none() {
+        let local = tokio::task::spawn_blocking({
+            let storage = state.storage.clone();
+            let hash = hash.clone();
+            move || storage.open_local(&hash)
+        })
+        .await;
+        if let Ok(Ok(Some(file))) = local {
+            use tokio::io::{AsyncReadExt, AsyncSeekExt};
+            use tokio_util::io::ReaderStream;
+
+            let mut file = tokio::fs::File::from_std(file);
+            let (status, length, content_range) = match range {
+                Some((start, end)) => {
+                    if let Err(error) = file.seek(std::io::SeekFrom::Start(start)).await {
+                        state.metrics.record_error();
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(ErrorResponse {
+                                error: format!("artifact seek failed: {error}"),
+                            }),
+                        )
+                            .into_response();
+                    }
+                    (
+                        StatusCode::PARTIAL_CONTENT,
+                        end - start + 1,
+                        Some(format!("bytes {start}-{end}/{total_size}")),
+                    )
+                }
+                None => (StatusCode::OK, total_size, None),
+            };
+            let stream = ReaderStream::new(file.take(length));
+            let mut response = Response::builder()
+                .status(status)
+                .header(axum::http::header::CONTENT_LENGTH, length.to_string());
+            if let Some(content_range) = content_range {
+                response = response.header(axum::http::header::CONTENT_RANGE, content_range);
+            }
+            state.metrics.record_artifact_request(length);
+            return response
+                .body(Body::from_stream(stream))
+                .expect("static artifact streaming response");
+        }
+    }
+
+    // A custom/non-signing backend may have no local file descriptor. Stream
+    // it through bounded range reads rather than allocating the whole object
+    // (or a caller-selected huge Range) in one `Vec`.
+    if state.artifact_barrier.is_none() {
+        const PROXY_CHUNK_BYTES: u64 = 1024 * 1024;
+        let (start, end, status, content_range) = match range {
+            Some((start, end)) => (
+                start,
+                end,
+                StatusCode::PARTIAL_CONTENT,
+                Some(format!("bytes {start}-{end}/{total_size}")),
+            ),
+            None => (0, total_size - 1, StatusCode::OK, None),
+        };
+        let length = end - start + 1;
+        let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<Bytes>>(2);
+        let storage = state.storage.clone();
+        let streamed_hash = hash.clone();
+        tokio::spawn(async move {
+            let mut offset = start;
+            while offset <= end {
+                let wanted = (end - offset + 1).min(PROXY_CHUNK_BYTES);
+                let storage = storage.clone();
+                let hash = streamed_hash.clone();
+                let result =
+                    tokio::task::spawn_blocking(move || storage.get_range(&hash, offset, wanted))
+                        .await;
+                let bytes = match result {
+                    Ok(Ok(bytes)) if bytes.len() as u64 == wanted => bytes,
+                    Ok(Ok(_)) => {
+                        let _ = tx
+                            .send(Err(std::io::Error::new(
+                                std::io::ErrorKind::UnexpectedEof,
+                                "artifact proxy returned a short range",
+                            )))
+                            .await;
+                        break;
+                    }
+                    Ok(Err(error)) => {
+                        let _ = tx.send(Err(std::io::Error::other(error))).await;
+                        break;
+                    }
+                    Err(error) => {
+                        let _ = tx.send(Err(std::io::Error::other(error))).await;
+                        break;
+                    }
+                };
+                if tx.send(Ok(Bytes::from(bytes))).await.is_err() {
+                    break;
+                }
+                offset += wanted;
+            }
+        });
+        let stream = futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        });
+        let mut response = Response::builder()
+            .status(status)
+            .header(axum::http::header::CONTENT_LENGTH, length.to_string());
+        if let Some(content_range) = content_range {
+            response = response.header(axum::http::header::CONTENT_RANGE, content_range);
+        }
+        state.metrics.record_artifact_request(length);
+        return response
+            .body(Body::from_stream(stream))
+            .expect("static bounded proxy response");
+    }
 
     match range {
         Some((start, end)) => {
@@ -9516,7 +10187,13 @@ pub async fn run_server_with_barrier(
     // Floor the grace at the longest signed-URL lifetime, read from the same
     // place ref responses sign URLs, so a client still holding a valid URL can
     // always finish its clone before any of its chunks become collectible.
-    let url_ttl_floor = ref_signed_url_ttl(false).max(ref_signed_url_ttl(true));
+    // Typed clone plans renew authorization per object and their scheduler
+    // consumer lease lasts 24h. Generated pinned roots are not scheduler rows,
+    // so remote orphan GC must retain them for the same request lifetime.
+    let clone_download_floor = Duration::from_secs(CLONE_CONSUMER_TTL_SECS as u64);
+    let url_ttl_floor = ref_signed_url_ttl(false)
+        .max(ref_signed_url_ttl(true))
+        .max(clone_download_floor);
     let configured_grace = gc_config.grace_period;
     gc_config.floor_grace(url_ttl_floor);
     info!(
@@ -9930,6 +10607,9 @@ mod tests {
         let broker: Arc<dyn CredentialBroker> = Arc::new(crate::auth::broker::StaticBroker::new(
             provider_registry.clone(),
         ));
+        let artifact_verifier = Arc::new(crate::artifact_manifest::CasCompletionVerifier::new(
+            cas.clone(),
+        ));
         ServerState {
             cas,
             repo_config: Arc::new(crate::repo_config::RepoConfigStore::new(storage.clone())),
@@ -9937,7 +10617,7 @@ mod tests {
             repo_root,
             ref_store,
             artifact_scheduler: None,
-            artifact_verifier: None,
+            artifact_verifier: Some(artifact_verifier),
             provider_registry,
             broker,
             token_hash: Some(token_hash),
@@ -10018,6 +10698,7 @@ mod tests {
                     tokio::task::yield_now().await;
                     Ok(crate::topup::PinnedBundleRequest {
                         manifest_hash: "a".repeat(64),
+                        transport_session: "b".repeat(64),
                         format_version: 1,
                         workspace_id: "workspace".into(),
                         repo_path: "owner/repo".into(),
@@ -10158,15 +10839,35 @@ mod tests {
             .output()
             .unwrap();
         assert!(output.status.success());
+        // Advertise T1 to the cheap ls-remote probe, then atomically move the
+        // origin to T2 before the subsequent fetch. The clone-plan response
+        // must be wholly rebound to the graph actually acquired by fetch.
+        run(&origin_repo, &["update-ref", "refs/heads/main", &first]);
         run(&origin_repo, &["update-server-info"]);
+        let old_info_refs = std::fs::read(origin_repo.join("info/refs")).unwrap();
         let origin_files = origin_root.clone();
+        let origin_repo_for_rewrite = origin_repo.clone();
+        let rewrite_target = target.clone();
+        let rewrote = Arc::new(AtomicBool::new(false));
+        let rewrite_once = rewrote.clone();
         let origin_app = Router::new().route(
             "/{*path}",
             get(move |Path(path): Path<String>| {
                 let root = origin_files.clone();
+                let repo = origin_repo_for_rewrite.clone();
+                let target = rewrite_target.clone();
+                let old_info_refs = old_info_refs.clone();
+                let rewrite_once = rewrite_once.clone();
                 async move {
                     if path.split('/').any(|part| matches!(part, "" | "." | "..")) {
                         return StatusCode::NOT_FOUND.into_response();
+                    }
+                    if path == "acme/widget.git/info/refs"
+                        && !rewrite_once.swap(true, Ordering::SeqCst)
+                    {
+                        run(&repo, &["update-ref", "refs/heads/main", &target]);
+                        run(&repo, &["update-server-info"]);
+                        return (StatusCode::OK, old_info_refs).into_response();
                     }
                     match tokio::fs::read(root.join(path)).await {
                         Ok(bytes) => (StatusCode::OK, bytes).into_response(),
@@ -10342,6 +11043,7 @@ mod tests {
                     .unwrap()
             );
         }
+        let scheduler_assert = scheduler.clone();
         state.artifact_scheduler = Some(scheduler);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -10368,6 +11070,17 @@ mod tests {
                 .fetch_typed_clone_plan("acme/widget", "main", mode)
                 .await
                 .unwrap();
+            assert_eq!(
+                match &plan {
+                    ClonePlan::Ready { target_commit, .. }
+                    | ClonePlan::Pending { target_commit, .. } => target_commit,
+                    ClonePlan::RepositoryInitializing | ClonePlan::RepositoryFailed => {
+                        panic!("active repository returned lifecycle plan")
+                    }
+                },
+                &target,
+                "probe-to-fetch rewrite must bind the fetched T2 consistently"
+            );
             assert!(matches!(
                 (&plan, expected),
                 (
@@ -10391,18 +11104,35 @@ mod tests {
                 )
             ));
         }
+        assert!(rewrote.load(Ordering::SeqCst));
         std::fs::write(
             server_cas.path(&head_manifest_hash),
             b"corrupt foreign bytes",
         )
         .unwrap();
-        let error = client
+        let recovered = client
             .fetch_typed_clone_plan("acme/widget", "main", SyncMode::Head)
             .await
-            .unwrap_err();
+            .unwrap();
         assert!(
-            format!("{error:#}").contains("typed artifact integrity failure"),
-            "corrupt ready publication must fail closed: {error:#}"
+            matches!(recovered, ClonePlan::Pending { .. }),
+            "corrupt ready publication must fail closed into rebuild"
+        );
+        let repaired = scheduler_assert
+            .get_by_key(&artifact_key(&repo_id, &target, ArtifactKind::Head))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            repaired.state,
+            crate::artifact_scheduler::ArtifactState::Ready
+        );
+        assert!(
+            scheduler_assert
+                .published("github", "acme/widget", "main", ArtifactKind::Head, 1)
+                .await
+                .unwrap()
+                .is_none()
         );
         server_task.abort();
         origin_task.abort();
@@ -11563,6 +12293,244 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn typed_artifact_capability_is_ready_root_and_repo_bound() {
+        use crate::artifact_manifest::{
+            ArtifactManifest, ArtifactPayload, CasBlob, GitPackPair, HeadArtifact,
+        };
+        use crate::artifact_scheduler::{ArtifactKey, ArtifactKind, SchedulerLimits};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = test_state(&tmp);
+        let scheduler = crate::artifact_scheduler::ArtifactScheduler::open(
+            tmp.path().join("scheduler.db").to_str().unwrap(),
+            SchedulerLimits::default(),
+        )
+        .await
+        .unwrap();
+        let key = ArtifactKey {
+            workspace: "github".into(),
+            repo: "acme/widget".into(),
+            commit: "1".repeat(40),
+            kind: ArtifactKind::Head,
+            format_version: 1,
+        };
+        let pack = CasBlob {
+            hash: state.cas.put(b"pack").unwrap(),
+            len: 4,
+        };
+        let index = CasBlob {
+            hash: state.cas.put(b"index").unwrap(),
+            len: 5,
+        };
+        let prebuilt = CasBlob {
+            hash: state.cas.put(b"prebuilt").unwrap(),
+            len: 8,
+        };
+        let evidence = ArtifactManifest::new(
+            &key,
+            ArtifactPayload::Head(HeadArtifact {
+                packs: vec![GitPackPair {
+                    pack: pack.clone(),
+                    index: index.clone(),
+                }],
+                prebuilt_index: prebuilt.clone(),
+            }),
+        )
+        .unwrap()
+        .store(&state.cas)
+        .unwrap();
+        scheduler.schedule(&key).await.unwrap();
+        let claim = scheduler.claim("worker", 60).await.unwrap().unwrap();
+        assert!(
+            scheduler
+                .complete(&claim, "worker", &evidence)
+                .await
+                .unwrap()
+        );
+        state.artifact_scheduler = Some(Arc::new(scheduler));
+        let root = evidence.manifest;
+        let repo = RepoId::github("acme/widget");
+
+        assert!(
+            typed_root_authorizes_hash(&state, &repo, &root, &root)
+                .await
+                .unwrap()
+                .allowed
+        );
+        assert!(
+            typed_root_authorizes_hash(&state, &repo, &root, &pack.hash)
+                .await
+                .unwrap()
+                .allowed
+        );
+        assert!(
+            !typed_root_authorizes_hash(&state, &repo, &root, &crate::cas::hash(b"not-a-member"))
+                .await
+                .unwrap()
+                .allowed
+        );
+        assert!(
+            !typed_root_authorizes_hash(&state, &RepoId::github("other/widget"), &root, &pack.hash)
+                .await
+                .unwrap()
+                .allowed
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_publication_hydrates_cold_durable_cas_and_rejects_length_lies() {
+        use crate::artifact_manifest::{
+            ArtifactManifest, ArtifactPayload, CasBlob, GitPackPair, HeadArtifact,
+        };
+        use crate::artifact_scheduler::{ArtifactKey, ArtifactKind};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = test_state(&tmp);
+        let durable_root = tmp.path().join("durable");
+        let durable_cas = Cas::new(&durable_root).unwrap();
+        state.storage = crate::storage::local(&durable_root).unwrap();
+        let key = ArtifactKey {
+            workspace: "github".into(),
+            repo: "acme/widget".into(),
+            commit: "1".repeat(40),
+            kind: ArtifactKind::Head,
+            format_version: 1,
+        };
+        let blob = |bytes: &[u8]| CasBlob {
+            hash: durable_cas.put(bytes).unwrap(),
+            len: bytes.len() as u64,
+        };
+        let pack = blob(b"remote-pack");
+        let index = blob(b"remote-index");
+        let prebuilt = blob(b"remote-prebuilt");
+        let evidence = ArtifactManifest::new(
+            &key,
+            ArtifactPayload::Head(HeadArtifact {
+                packs: vec![GitPackPair {
+                    pack: pack.clone(),
+                    index: index.clone(),
+                }],
+                prebuilt_index: prebuilt.clone(),
+            }),
+        )
+        .unwrap()
+        .store(&durable_cas)
+        .unwrap();
+        assert!(!state.cas.path(&pack.hash).exists());
+        hydrate_typed_publication(&state, &key, &evidence.manifest)
+            .await
+            .unwrap();
+        assert_eq!(state.cas.get(&pack.hash).unwrap(), b"remote-pack");
+        assert!(state.cas.verify_object(&evidence.manifest).is_ok());
+
+        let lying_bytes = b"durable-length-lie";
+        let lying_hash = durable_cas.put(lying_bytes).unwrap();
+        let lying = ArtifactManifest::new(
+            &key,
+            ArtifactPayload::Head(HeadArtifact {
+                packs: vec![GitPackPair {
+                    pack: CasBlob {
+                        hash: lying_hash.clone(),
+                        len: lying_bytes.len() as u64 + 1,
+                    },
+                    index,
+                }],
+                prebuilt_index: prebuilt,
+            }),
+        )
+        .unwrap()
+        .store(&durable_cas)
+        .unwrap();
+        let error = hydrate_typed_publication(&state, &key, &lying.manifest)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("length mismatch"));
+        assert!(!state.cas.path(&lying_hash).exists());
+    }
+
+    #[tokio::test]
+    async fn typed_transport_sessions_release_independently_and_abandoned_one_expires() {
+        use crate::artifact_scheduler::{ArtifactKey, ArtifactKind, SchedulerLimits};
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("scheduler.db");
+        let scheduler = crate::artifact_scheduler::ArtifactScheduler::open(
+            db.to_str().unwrap(),
+            SchedulerLimits::default(),
+        )
+        .await
+        .unwrap();
+        let key = ArtifactKey {
+            workspace: "github".into(),
+            repo: "acme/widget".into(),
+            commit: "1".repeat(40),
+            kind: ArtifactKind::Head,
+            format_version: 1,
+        };
+        let first = "transport-a";
+        let second = "transport-b";
+        scheduler.subscribe_consumer(&key, first, 60).await.unwrap();
+        scheduler
+            .subscribe_consumer(&key, second, 60)
+            .await
+            .unwrap();
+        let record = scheduler.get_by_key(&key).await.unwrap().unwrap();
+        scheduler.release_consumer(record.id, first).await.unwrap();
+        assert!(scheduler.get_by_key(&key).await.unwrap().is_some());
+
+        let pool = sqlx::SqlitePool::connect(db.to_str().unwrap())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE artifact_consumers SET expires_at=unixepoch()-1 WHERE consumer_id=?")
+            .bind(second)
+            .execute(&pool)
+            .await
+            .unwrap();
+        scheduler.reconcile_expired().await.unwrap();
+        assert!(scheduler.get_by_key(&key).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn typed_artifact_route_denies_private_access_before_root_lookup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = test_state(&tmp);
+        state.require_repo_auth = true;
+        state.access_verifier = Arc::new(StubVerifier(AccessDecision::Denied));
+        let missing = "a".repeat(64);
+        let response = build_app(state)
+            .oneshot(request_with_auth(
+                "GET",
+                &format!("/v1/repos/github/private/repo/typed-artifacts/{missing}/{missing}"),
+                Some(&auth_header()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn normalized_mode_rejects_unscoped_global_artifact_route() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = test_state(&tmp);
+        state.artifact_scheduler = Some(Arc::new(
+            crate::artifact_scheduler::ArtifactScheduler::open(
+                tmp.path().join("scheduler.db").to_str().unwrap(),
+                crate::artifact_scheduler::SchedulerLimits::default(),
+            )
+            .await
+            .unwrap(),
+        ));
+        let response = build_app(state)
+            .oneshot(request_with_auth(
+                "GET",
+                &format!("/v1/artifacts/{}", "a".repeat(64)),
+                Some(&auth_header()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::GONE);
     }
 
     #[test]

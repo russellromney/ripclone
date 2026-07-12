@@ -453,13 +453,20 @@ async fn fetch_artifact_to_temp_once(
     dir: &Path,
     maximum: Option<u64>,
 ) -> std::result::Result<(tempfile::NamedTempFile, u64), (bool, anyhow::Error)> {
-    use futures::StreamExt;
-    use tokio::io::AsyncWriteExt;
-
     let resp = match client.get(fetch_url).send().await {
         Ok(r) => r,
         Err(e) => return Err((true, anyhow::anyhow!("artifact fetch transport error: {e}"))),
     };
+    fetch_artifact_response_to_temp(resp, hash, dir, maximum).await
+}
+
+async fn fetch_artifact_response_to_temp(
+    resp: reqwest::Response,
+    hash: &str,
+    dir: &Path,
+    maximum: Option<u64>,
+) -> std::result::Result<(tempfile::NamedTempFile, u64), (bool, anyhow::Error)> {
+    use tokio::io::AsyncWriteExt;
     let status = resp.status();
     if !status.is_success() {
         let retryable = status.is_server_error()
@@ -687,7 +694,8 @@ pub struct Client {
     /// "Bearer <jwt>"). Threaded into the streaming extractor so its separate
     /// blocking client authenticates the gateway artifact-fetch fallback the same
     /// way the main client does.
-    auth_header: Option<String>,
+    auth_header: Arc<std::sync::Mutex<Option<String>>>,
+    typed_refresh_lock: Arc<tokio::sync::Mutex<()>>,
     cache: Option<Cas>,
     /// Workspace id. The server resolves its one configured upstream.
     workspace: String,
@@ -698,6 +706,134 @@ pub struct Client {
 }
 
 impl Client {
+    fn typed_artifact_url(
+        &self,
+        request: &crate::topup::PinnedBundleRequest,
+        hash: &str,
+    ) -> String {
+        format!(
+            "{}/v1/repos/{}/{}/typed-artifacts/{}/{}",
+            self.server, request.workspace_id, request.repo_path, request.manifest_hash, hash,
+        )
+    }
+
+    fn typed_download_client(&self) -> reqwest::Client {
+        let mut headers = reqwest::header::HeaderMap::new();
+        let auth_header = self.auth_header.lock().unwrap().clone();
+        if let Some(auth) = &auth_header
+            && let Ok(value) = reqwest::header::HeaderValue::from_str(auth)
+        {
+            headers.insert(reqwest::header::AUTHORIZATION, value);
+        }
+        if let Some(token) = &self.upstream_token
+            && let Ok(value) = reqwest::header::HeaderValue::from_str(token)
+        {
+            headers.insert("x-upstream-token", value);
+        }
+        reqwest::ClientBuilder::new()
+            .user_agent(USER_AGENT)
+            // Never forward gateway/provider credentials to an object-store
+            // redirect. We inspect the 307 and follow it with `raw_http`.
+            .redirect(reqwest::redirect::Policy::none())
+            .default_headers(headers)
+            .build()
+            .expect("build typed artifact HTTP client")
+    }
+
+    async fn typed_artifact_response(
+        &self,
+        request: &crate::topup::PinnedBundleRequest,
+        hash: &str,
+    ) -> Result<reqwest::Response> {
+        self.refresh_bearer_session().await?;
+        let url = self.typed_artifact_url(request, hash);
+        let response = self
+            .typed_download_client()
+            .get(&url)
+            .header("x-ripclone-transport-session", &request.transport_session)
+            .send()
+            .await
+            .with_context(|| format!("fetch repo-bound typed artifact {hash}"))?;
+        if response.status().is_redirection() {
+            let location = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .context("typed artifact redirect has no valid location")?;
+            return self
+                .raw_http
+                .get(location)
+                .send()
+                .await
+                .context("follow typed artifact signed URL without credentials");
+        }
+        Ok(response)
+    }
+
+    /// Refresh while the current Bearer is still valid. The server preserves
+    /// the token's absolute `sxp` cap, so doing this before every independently
+    /// authorized object request extends only the short JWT window—not the
+    /// session lifetime. A clone that outlives the cap fails closed and must
+    /// authenticate again.
+    async fn refresh_bearer_session(&self) -> Result<()> {
+        #[derive(serde::Deserialize)]
+        struct RefreshedToken {
+            token: String,
+        }
+        let current = self.auth_header.lock().unwrap().clone();
+        let Some(_) = current.filter(|value| bearer_needs_refresh(value)) else {
+            return Ok(());
+        };
+        let _refresh = self.typed_refresh_lock.lock().await;
+        let current = self.auth_header.lock().unwrap().clone();
+        let Some(current) = current.filter(|value| bearer_needs_refresh(value)) else {
+            return Ok(());
+        };
+        let response = self
+            .raw_http
+            .post(format!("{}/v1/auth/refresh", self.server))
+            .header(reqwest::header::AUTHORIZATION, &current)
+            .send()
+            .await
+            .context("refresh ripclone session for typed transport")?;
+        if !response.status().is_success() {
+            return Err(server_error("refresh typed transport session", response).await);
+        }
+        let refreshed: RefreshedToken = response
+            .json()
+            .await
+            .context("decode refreshed typed transport session")?;
+        *self.auth_header.lock().unwrap() = Some(format!("Bearer {}", refreshed.token));
+        Ok(())
+    }
+
+    fn typed_auth_heartbeat(
+        &self,
+        request: &crate::topup::PinnedBundleRequest,
+    ) -> Option<tokio::sync::oneshot::Sender<()>> {
+        // The scheduler lease must be renewed for every authentication mode;
+        // long-lived Ripclone tokens do not need JWT refresh but their artifact
+        // consumer would still expire during a single large object transfer.
+        let client = self.clone();
+        let request = request.clone();
+        let (stop, mut stopped) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut stopped => break,
+                    _ = tokio::time::sleep(typed_auth_heartbeat_interval()) => {
+                        if client.refresh_bearer_session().await.is_err()
+                            || client.renew_typed_transport(&request).await.is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        Some(stop)
+    }
+
     pub fn new(server: String) -> Self {
         Self::new_with_token(server, None)
     }
@@ -759,7 +895,8 @@ impl Client {
             server,
             http,
             raw_http: build_http_client(reqwest::header::HeaderMap::new()),
-            auth_header: auth_value,
+            auth_header: Arc::new(std::sync::Mutex::new(auth_value)),
+            typed_refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
             cache,
             workspace: "github".to_string(),
             upstream_token: None,
@@ -812,6 +949,11 @@ impl Client {
     /// credential when one was configured.
     fn request(&self, method: reqwest::Method, url: &str) -> reqwest::RequestBuilder {
         let mut req = self.http.request(method, url);
+        if let Some(auth) = self.auth_header.lock().unwrap().as_deref()
+            && let Ok(value) = reqwest::header::HeaderValue::from_str(auth)
+        {
+            req = req.header(reqwest::header::AUTHORIZATION, value);
+        }
         if let Some(token) = &self.upstream_token
             && let Ok(value) = reqwest::header::HeaderValue::from_str(token)
         {
@@ -850,6 +992,7 @@ impl Client {
         branch: &str,
         mode: SyncMode,
     ) -> Result<ClonePlan> {
+        self.refresh_bearer_session().await?;
         let mode_name = match mode {
             SyncMode::Files => "files",
             SyncMode::Head => "head",
@@ -878,7 +1021,7 @@ impl Client {
             branch,
             mode,
             target_commit: None,
-            artifact_format_version: 1,
+            artifact_format_version: crate::clone_transport::CLONE_ARTIFACT_FORMAT_VERSION,
         })
     }
 
@@ -923,6 +1066,13 @@ impl Client {
                     };
                     let outcome =
                         crate::topup::install_pinned_bundle(target, &request, &installer)?;
+                    if let Err(error) = self.release_typed_transport(&request).await {
+                        // Installation is already committed locally. Cleanup is
+                        // advisory and the short server lease is the crash/error
+                        // fallback, so do not turn a successful clone into a
+                        // failure solely because the ACK was lost.
+                        warn!("typed transport release ACK failed: {error:#}");
+                    }
                     Ok(TypedCloneOutcome::Pinned(outcome))
                 }
                 ClonePayload::PinnedBundle {
@@ -948,7 +1098,11 @@ impl Client {
         const MAX_PINNED_TOTAL_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
 
         let manifest = self
-            .fetch_small_artifact_bounded(&request.manifest_hash, MAX_PINNED_MANIFEST_BYTES)
+            .fetch_small_artifact_bounded(
+                request,
+                &request.manifest_hash,
+                MAX_PINNED_MANIFEST_BYTES,
+            )
             .await?;
         cas.put_with_hash(&request.manifest_hash, &manifest)?;
         let decoded = crate::pinned_bundle::decode_pinned_bundle_manifest(cas, request)
@@ -977,15 +1131,9 @@ impl Client {
             if cas.verify_object(&artifact.hash).ok() == Some(artifact.len) {
                 continue;
             }
-            let gateway = format!("{}/v1/artifacts/{}", self.server, artifact.hash);
-            let (temp, len) = fetch_artifact_to_temp_with_retry(
-                &self.http,
-                &gateway,
-                &artifact.hash,
-                cas.root(),
-                Some(artifact.len),
-            )
-            .await?;
+            let (temp, len) = self
+                .fetch_typed_artifact_to_temp(request, &artifact.hash, cas.root(), artifact.len)
+                .await?;
             if len != artifact.len {
                 anyhow::bail!("pinned artifact transport length mismatch");
             }
@@ -997,31 +1145,156 @@ impl Client {
         Ok(())
     }
 
-    async fn fetch_small_artifact_bounded(&self, hash: &str, maximum: usize) -> Result<Vec<u8>> {
-        crate::cas::Cas::validate_artifact_id(hash)?;
-        let url = format!("{}/v1/artifacts/{hash}", self.server);
-        let response = self.send(self.request(reqwest::Method::GET, &url)).await?;
-        if !response.status().is_success() {
-            return Err(server_error("fetch typed manifest", response).await);
+    async fn release_typed_transport(
+        &self,
+        request: &crate::topup::PinnedBundleRequest,
+    ) -> Result<()> {
+        self.refresh_bearer_session().await?;
+        let url = format!(
+            "{}/v1/repos/{}/{}/typed-artifacts/{}/release",
+            self.server, request.workspace_id, request.repo_path, request.manifest_hash,
+        );
+        let response = self
+            .typed_download_client()
+            .post(url)
+            .header("x-ripclone-transport-session", &request.transport_session)
+            .send()
+            .await
+            .context("release typed transport session")?;
+        if response.status() != reqwest::StatusCode::NO_CONTENT {
+            return Err(server_error("release typed transport session", response).await);
         }
-        let mut bytes = Vec::with_capacity(maximum.min(4096));
-        let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.context("read typed manifest body")?;
-            let next = bytes
-                .len()
-                .checked_add(chunk.len())
-                .context("typed manifest size overflow")?;
-            if next > maximum {
-                anyhow::bail!("typed manifest exceeds client size limit");
+        Ok(())
+    }
+
+    async fn renew_typed_transport(
+        &self,
+        request: &crate::topup::PinnedBundleRequest,
+    ) -> Result<()> {
+        let url = format!(
+            "{}/v1/repos/{}/{}/typed-artifacts/{}/heartbeat",
+            self.server, request.workspace_id, request.repo_path, request.manifest_hash,
+        );
+        let response = self
+            .typed_download_client()
+            .post(url)
+            .header("x-ripclone-transport-session", &request.transport_session)
+            .send()
+            .await
+            .context("renew typed transport session")?;
+        if response.status() != reqwest::StatusCode::NO_CONTENT {
+            return Err(server_error("renew typed transport session", response).await);
+        }
+        Ok(())
+    }
+
+    async fn fetch_typed_artifact_to_temp(
+        &self,
+        request: &crate::topup::PinnedBundleRequest,
+        hash: &str,
+        dir: &Path,
+        maximum: u64,
+    ) -> Result<(tempfile::NamedTempFile, u64)> {
+        let (max_attempts, base_backoff_ms) = fetch_retry_config();
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            let response = match self.typed_artifact_response(request, hash).await {
+                Ok(response) => response,
+                Err(_error) if attempt < max_attempts => {
+                    tokio::time::sleep(fetch_backoff(base_backoff_ms, attempt)).await;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let heartbeat = self.typed_auth_heartbeat(request);
+            let fetched = fetch_artifact_response_to_temp(response, hash, dir, Some(maximum)).await;
+            if let Some(stop) = heartbeat {
+                let _ = stop.send(());
             }
-            bytes.extend_from_slice(&chunk);
+            match fetched {
+                Ok(result) => return Ok(result),
+                Err((retryable, _error)) if retryable && attempt < max_attempts => {
+                    tokio::time::sleep(fetch_backoff(base_backoff_ms, attempt)).await;
+                }
+                Err((_, error)) => return Err(error),
+            }
         }
-        let actual = crate::cas::hash(&bytes);
-        if actual != hash {
-            anyhow::bail!("typed manifest hash mismatch: expected {hash}, got {actual}");
+    }
+
+    async fn fetch_small_artifact_bounded(
+        &self,
+        request: &crate::topup::PinnedBundleRequest,
+        hash: &str,
+        maximum: usize,
+    ) -> Result<Vec<u8>> {
+        crate::cas::Cas::validate_artifact_id(hash)?;
+        let (max_attempts, base_backoff_ms) = fetch_retry_config();
+        for attempt in 1..=max_attempts {
+            let response = match self.typed_artifact_response(request, hash).await {
+                Ok(response) => response,
+                Err(_error) if attempt < max_attempts => {
+                    tokio::time::sleep(fetch_backoff(base_backoff_ms, attempt)).await;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            if !response.status().is_success() {
+                let retryable = response.status().is_server_error()
+                    || response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS;
+                let error = server_error("fetch typed manifest", response).await;
+                if retryable && attempt < max_attempts {
+                    tokio::time::sleep(fetch_backoff(base_backoff_ms, attempt)).await;
+                    continue;
+                }
+                return Err(error);
+            }
+            let mut bytes = Vec::with_capacity(maximum.min(4096));
+            let mut stream = response.bytes_stream();
+            let heartbeat = self.typed_auth_heartbeat(request);
+            let mut failed = None;
+            while let Some(chunk) = stream.next().await {
+                match chunk {
+                    Ok(chunk) => {
+                        let next = bytes
+                            .len()
+                            .checked_add(chunk.len())
+                            .context("typed manifest size overflow")?;
+                        if next > maximum {
+                            anyhow::bail!("typed manifest exceeds client size limit");
+                        }
+                        bytes.extend_from_slice(&chunk);
+                    }
+                    Err(error) => {
+                        failed = Some(error);
+                        break;
+                    }
+                }
+            }
+            if let Some(error) = failed {
+                if let Some(stop) = heartbeat {
+                    let _ = stop.send(());
+                }
+                if attempt < max_attempts {
+                    tokio::time::sleep(fetch_backoff(base_backoff_ms, attempt)).await;
+                    continue;
+                }
+                return Err(error).context("read typed manifest body");
+            }
+            let actual = crate::cas::hash(&bytes);
+            if let Some(stop) = heartbeat {
+                let _ = stop.send(());
+            }
+            if actual != hash {
+                if attempt < max_attempts {
+                    tokio::time::sleep(fetch_backoff(base_backoff_ms, attempt)).await;
+                    continue;
+                }
+                anyhow::bail!("typed manifest hash mismatch: expected {hash}, got {actual}");
+            }
+            return Ok(bytes);
         }
-        Ok(bytes)
+        unreachable!("typed manifest retry loop has at least one attempt")
     }
 
     pub async fn resolve_ref(&self, repo_path: &str, branch: &str) -> Result<RefResponse> {
@@ -2654,7 +2927,7 @@ impl Client {
             let archive_chunks = archive_chunks.to_vec();
             let work_tree2 = work_tree.clone();
             let server = self.server.clone();
-            let auth_header = self.auth_header.clone();
+            let auth_header = self.auth_header.lock().unwrap().clone();
             tokio::task::spawn_blocking(move || {
                 let mut manifest_tmp =
                     tempfile::NamedTempFile::new().context("create temp manifest")?;
@@ -3214,7 +3487,7 @@ impl Client {
             let archive_chunks = archive_chunks.to_vec();
             let work_tree2 = work_tree.clone();
             let server = self.server.clone();
-            let auth_header = self.auth_header.clone();
+            let auth_header = self.auth_header.lock().unwrap().clone();
             tokio::task::spawn_blocking(move || {
                 let mut manifest_tmp =
                     tempfile::NamedTempFile::new().context("create temp manifest")?;
@@ -3281,6 +3554,43 @@ impl Client {
     }
 }
 
+#[cfg(not(test))]
+fn typed_auth_heartbeat_interval() -> std::time::Duration {
+    std::time::Duration::from_secs(60)
+}
+
+fn bearer_needs_refresh(header: &str) -> bool {
+    use base64::Engine as _;
+
+    let Some(token) = header.strip_prefix("Bearer ") else {
+        return false;
+    };
+    let Some(payload) = token.split('.').nth(1) else {
+        // Deliberately refresh opaque Bearers. This supports non-JWT test/dev
+        // issuers and fails closed at the server if they are not refreshable.
+        return true;
+    };
+    let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload) else {
+        return true;
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return true;
+    };
+    let Some(expires_at) = value.get("exp").and_then(serde_json::Value::as_u64) else {
+        return true;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(u64::MAX);
+    expires_at <= now.saturating_add(120)
+}
+
+#[cfg(test)]
+fn typed_auth_heartbeat_interval() -> std::time::Duration {
+    std::time::Duration::from_millis(5)
+}
+
 /// Try to resolve `branch` in a local repo without contacting the server.
 fn local_rev_parse(main_repo: &Path, branch: &str) -> Result<String> {
     let output = std::process::Command::new("git")
@@ -3307,6 +3617,16 @@ mod tests {
         let served = body.clone();
         let app = Router::new()
             .route(
+                "/v1/auth/refresh",
+                axum::routing::post(|headers: HeaderMap| async move {
+                    assert_eq!(
+                        headers.get("authorization").and_then(|v| v.to_str().ok()),
+                        Some("Bearer session-secret")
+                    );
+                    axum::Json(serde_json::json!({"token":"session-secret"}))
+                }),
+            )
+            .route(
                 "/v1/repos/github/acme/widget/clone-plan",
                 get(|headers: HeaderMap| async move {
                     assert_eq!(
@@ -3326,13 +3646,14 @@ mod tests {
                         branch: "main".into(),
                         mode: SyncMode::Head,
                         target_commit: None,
-                        artifact_format_version: 1,
+                        artifact_format_version:
+                            crate::clone_transport::CLONE_ARTIFACT_FORMAT_VERSION,
                         state: crate::clone_transport::ClonePlanState::RepositoryInitializing,
                     })
                 }),
             )
             .route(
-                "/v1/artifacts/{hash}",
+                "/v1/repos/github/acme/widget/typed-artifacts/{root}/{hash}",
                 get(move |headers: HeaderMap| {
                     let served = served.clone();
                     async move {
@@ -3360,12 +3681,188 @@ mod tests {
                 .unwrap(),
             ClonePlan::RepositoryInitializing
         ));
+        let request = crate::topup::PinnedBundleRequest {
+            manifest_hash: hash.clone(),
+            transport_session: "a".repeat(64),
+            format_version: 1,
+            workspace_id: "github".into(),
+            repo_path: "acme/widget".into(),
+            base_commit: "1".repeat(40),
+            target_commit: "2".repeat(40),
+            branch: "main".into(),
+            mode: crate::topup::TopUpMode::Head,
+        };
         let fetched = client
-            .fetch_small_artifact_bounded(&hash, 1024)
+            .fetch_small_artifact_bounded(&request, &hash, 1024)
             .await
             .unwrap();
         assert_eq!(fetched, body);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn typed_redirects_renew_gateway_auth_without_leaking_it_to_object_store() {
+        use axum::{
+            Router,
+            body::Bytes,
+            http::{HeaderMap, StatusCode, header::LOCATION},
+            routing::get,
+        };
+        use std::sync::{Arc, Mutex};
+
+        let body = Bytes::from_static(b"renewable private object");
+        let hash = crate::cas::hash(&body);
+        let object_headers = Arc::new(Mutex::new(Vec::<HeaderMap>::new()));
+        let seen = object_headers.clone();
+        let served = body.clone();
+        let object_app = Router::new().route(
+            "/signed-object",
+            get(move |headers: HeaderMap| {
+                let seen = seen.clone();
+                let served = served.clone();
+                async move {
+                    seen.lock().unwrap().push(headers);
+                    axum::body::Body::from_stream(futures::stream::once(async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                        Ok::<_, std::convert::Infallible>(served)
+                    }))
+                }
+            }),
+        );
+        let object_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let object_address = object_listener.local_addr().unwrap();
+        let object_server =
+            tokio::spawn(async move { axum::serve(object_listener, object_app).await.unwrap() });
+
+        let gateway_headers = Arc::new(Mutex::new(Vec::<HeaderMap>::new()));
+        let gateway_seen = gateway_headers.clone();
+        let releases = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let release_seen = releases.clone();
+        let heartbeats = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let heartbeat_seen = heartbeats.clone();
+        let refreshes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let refresh_seen = refreshes.clone();
+        let location = format!("http://{object_address}/signed-object");
+        let gateway_app = Router::new()
+            .route(
+                "/v1/auth/refresh",
+                axum::routing::post(move |headers: HeaderMap| {
+                    let refresh_seen = refresh_seen.clone();
+                    async move {
+                        assert!(
+                            headers
+                                .get("authorization")
+                                .and_then(|value| value.to_str().ok())
+                                .is_some_and(|value| value.starts_with("Bearer "))
+                        );
+                        let n = refresh_seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                        axum::Json(serde_json::json!({"token": format!("renewed-{n}")}))
+                    }
+                }),
+            )
+            .route(
+                "/v1/repos/github/acme/widget/typed-artifacts/{root}/{hash}",
+                get(move |headers: HeaderMap| {
+                    let gateway_seen = gateway_seen.clone();
+                    let location = location.clone();
+                    async move {
+                        gateway_seen.lock().unwrap().push(headers);
+                        (StatusCode::TEMPORARY_REDIRECT, [(LOCATION, location)])
+                    }
+                }),
+            )
+            .route(
+                "/v1/repos/github/acme/widget/typed-artifacts/{root}/heartbeat",
+                axum::routing::post(move |headers: HeaderMap| {
+                    let heartbeat_seen = heartbeat_seen.clone();
+                    async move {
+                        assert!(headers.get("x-ripclone-transport-session").is_some());
+                        heartbeat_seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        StatusCode::NO_CONTENT
+                    }
+                }),
+            )
+            .route(
+                "/v1/repos/github/acme/widget/typed-artifacts/{root}/release",
+                axum::routing::post(move |headers: HeaderMap| {
+                    let release_seen = release_seen.clone();
+                    async move {
+                        assert!(
+                            headers
+                                .get("authorization")
+                                .and_then(|v| v.to_str().ok())
+                                .is_some_and(|value| value.starts_with("Bearer renewed-"))
+                        );
+                        release_seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        StatusCode::NO_CONTENT
+                    }
+                }),
+            );
+        let gateway_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gateway_address = gateway_listener.local_addr().unwrap();
+        let gateway_server =
+            tokio::spawn(async move { axum::serve(gateway_listener, gateway_app).await.unwrap() });
+
+        let request = crate::topup::PinnedBundleRequest {
+            manifest_hash: hash.clone(),
+            transport_session: "b".repeat(64),
+            format_version: 1,
+            workspace_id: "github".into(),
+            repo_path: "acme/widget".into(),
+            base_commit: "1".repeat(40),
+            target_commit: "2".repeat(40),
+            branch: "main".into(),
+            mode: crate::topup::TopUpMode::Head,
+        };
+        let client =
+            Client::new_with_bearer(format!("http://{gateway_address}"), "session-secret".into())
+                .with_upstream_token("provider-secret");
+        // Every object request returns to the repo-bound gateway. This avoids a
+        // single expiring URL covering a long multi-object clone.
+        for _ in 0..2 {
+            assert_eq!(
+                client
+                    .fetch_small_artifact_bounded(&request, &hash, 1024)
+                    .await
+                    .unwrap(),
+                body
+            );
+        }
+        client.release_typed_transport(&request).await.unwrap();
+        assert_eq!(releases.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(refreshes.load(std::sync::atomic::Ordering::SeqCst) >= 5);
+        assert!(heartbeats.load(std::sync::atomic::Ordering::SeqCst) >= 2);
+
+        let gateway_headers = gateway_headers.lock().unwrap();
+        assert_eq!(gateway_headers.len(), 2);
+        let gateway_tokens = gateway_headers
+            .iter()
+            .map(|headers| {
+                headers
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+        assert_ne!(gateway_tokens[0], gateway_tokens[1]);
+        for (headers, token) in gateway_headers.iter().zip(gateway_tokens) {
+            assert!(token.starts_with("Bearer renewed-"));
+            assert_eq!(
+                headers
+                    .get("x-upstream-token")
+                    .and_then(|v| v.to_str().ok()),
+                Some("provider-secret")
+            );
+        }
+        let object_headers = object_headers.lock().unwrap();
+        assert_eq!(object_headers.len(), 2);
+        for headers in object_headers.iter() {
+            assert!(headers.get("authorization").is_none());
+            assert!(headers.get("x-upstream-token").is_none());
+        }
+        gateway_server.abort();
+        object_server.abort();
     }
 
     #[tokio::test]

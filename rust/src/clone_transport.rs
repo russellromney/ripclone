@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 pub const CLONE_PLAN_PROTOCOL_VERSION: u32 = 1;
+pub const CLONE_ARTIFACT_FORMAT_VERSION: u32 = crate::artifact_manifest::ARTIFACT_MANIFEST_SCHEMA;
 pub const MAX_CLONE_PLAN_RESPONSE_BYTES: usize = 64 * 1024;
 
 /// Incremental decoder for HTTP clients that receive a streamed body. The
@@ -384,6 +385,14 @@ fn validate_payload(
             }
             validate_hash(&request.manifest_hash, "pinned bundle manifest")?;
             validate_oid(base_commit, "pinned bundle base")?;
+            if request.transport_session.len() != 64
+                || !request
+                    .transport_session
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                bail!("pinned bundle transport session is invalid");
+            }
             if request.base_commit != *base_commit || request.mode != *mode {
                 bail!("pinned bundle request disagrees with clone payload");
             }
@@ -470,7 +479,7 @@ mod tests {
             branch: "main",
             mode,
             target_commit: Some(TARGET),
-            artifact_format_version: 1,
+            artifact_format_version: CLONE_ARTIFACT_FORMAT_VERSION,
         }
     }
 
@@ -482,7 +491,7 @@ mod tests {
             branch: "main".into(),
             mode,
             target_commit: Some(TARGET.into()),
-            artifact_format_version: 1,
+            artifact_format_version: CLONE_ARTIFACT_FORMAT_VERSION,
             state,
         }
     }
@@ -490,6 +499,7 @@ mod tests {
     fn bundle_request(mode: TopUpMode) -> PinnedBundleRequest {
         PinnedBundleRequest {
             manifest_hash: HEAD.into(),
+            transport_session: "a".repeat(64),
             format_version: 1,
             workspace_id: "acme".into(),
             repo_path: "org/repo".into(),

@@ -228,6 +228,14 @@ pub trait ArtifactSchedulerPersistence: Send + Sync {
     async fn get_by_key(&self, key: &ArtifactKey) -> Result<Option<ArtifactRecord>>;
     /// Restartable maintenance scan ordered by durable job id.
     async fn ready_page(&self, after_id: i64, limit: usize) -> Result<Vec<ArtifactRecord>>;
+    async fn ready_candidates(
+        &self,
+        workspace: &str,
+        repo: &str,
+        kind: ArtifactKind,
+        format_version: u32,
+        limit: u32,
+    ) -> Result<Vec<ArtifactRecord>>;
     async fn published(
         &self,
         workspace: &str,
@@ -236,15 +244,21 @@ pub trait ArtifactSchedulerPersistence: Send + Sync {
         kind: ArtifactKind,
         format_version: u32,
     ) -> Result<Option<ArtifactRecord>>;
-    /// Newest immutable commit for which both Head and FullHistory are Ready.
-    /// This deliberately does not use either per-kind branch alias: independent
-    /// sibling completion must never hide the previous complete Full base.
-    async fn latest_complete_full_base(
+    /// Bounded newest-first immutable commits for which both Head and
+    /// FullHistory are Ready, independent of mutable per-kind aliases.
+    async fn complete_full_base_candidates(
         &self,
         workspace: &str,
         repo: &str,
         format_version: u32,
-    ) -> Result<Option<String>>;
+        limit: u32,
+    ) -> Result<Vec<String>>;
+    async fn quarantine_ready(
+        &self,
+        key: &ArtifactKey,
+        expected_manifest: &str,
+        reason: &str,
+    ) -> Result<bool>;
     async fn counts(
         &self,
     ) -> Result<Vec<(ArtifactKind, crate::artifact_scheduler::ArtifactState, u64)>>;
@@ -729,6 +743,16 @@ impl ArtifactSchedulerPersistence for crate::artifact_scheduler::ArtifactSchedul
     async fn ready_page(&self, after_id: i64, limit: usize) -> Result<Vec<ArtifactRecord>> {
         self.ready_page(after_id, limit).await
     }
+    async fn ready_candidates(
+        &self,
+        w: &str,
+        r: &str,
+        k: ArtifactKind,
+        v: u32,
+        limit: u32,
+    ) -> Result<Vec<ArtifactRecord>> {
+        self.ready_candidates(w, r, k, v, limit).await
+    }
     async fn published(
         &self,
         w: &str,
@@ -739,8 +763,22 @@ impl ArtifactSchedulerPersistence for crate::artifact_scheduler::ArtifactSchedul
     ) -> Result<Option<ArtifactRecord>> {
         self.published(w, r, b, k, v).await
     }
-    async fn latest_complete_full_base(&self, w: &str, r: &str, v: u32) -> Result<Option<String>> {
-        self.latest_complete_full_base(w, r, v).await
+    async fn complete_full_base_candidates(
+        &self,
+        w: &str,
+        r: &str,
+        v: u32,
+        limit: u32,
+    ) -> Result<Vec<String>> {
+        self.complete_full_base_candidates(w, r, v, limit).await
+    }
+    async fn quarantine_ready(
+        &self,
+        key: &ArtifactKey,
+        manifest: &str,
+        reason: &str,
+    ) -> Result<bool> {
+        self.quarantine_ready(key, manifest, reason).await
     }
     async fn counts(
         &self,

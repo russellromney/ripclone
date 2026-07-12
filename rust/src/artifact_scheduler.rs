@@ -5,6 +5,7 @@
 //! transactions in this database. Builders may only publish through a live
 //! [`ClaimedArtifact`] and typed [`CompletionEvidence`].
 
+use crate::cas::Cas;
 use anyhow::{Context, Result, bail};
 use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
@@ -1829,22 +1830,88 @@ impl ArtifactScheduler {
             None => Ok(None),
         }
     }
-    pub async fn latest_complete_full_base(
+    pub async fn ready_candidates(
+        &self,
+        workspace: &str,
+        repo: &str,
+        kind: ArtifactKind,
+        format_version: u32,
+        limit: u32,
+    ) -> Result<Vec<ArtifactRecord>> {
+        validate_format_version(format_version)?;
+        if !(1..=32).contains(&limit) {
+            bail!("ready candidate limit must be between 1 and 32")
+        }
+        let rows = sqlx::query(
+            "SELECT id,workspace,repo,commit_oid,kind,format_version,state,owner,lease_expires_at,lease_generation,claim_attempts,retry_count,manifest,error,failure_class FROM artifact_jobs WHERE workspace=? AND repo=? AND kind=? AND format_version=? AND state='ready' AND manifest IS NOT NULL AND length(trim(manifest))>0 ORDER BY updated_at DESC,id DESC LIMIT ?",
+        )
+        .bind(workspace)
+        .bind(repo)
+        .bind(kind.as_str())
+        .bind(format_version as i64)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(row_record).collect()
+    }
+    pub async fn complete_full_base_candidates(
         &self,
         workspace: &str,
         repo: &str,
         format_version: u32,
-    ) -> Result<Option<String>> {
+        limit: u32,
+    ) -> Result<Vec<String>> {
         validate_format_version(format_version)?;
-        let commit: Option<String> = sqlx::query_scalar(
-            "SELECT h.commit_oid FROM artifact_jobs h JOIN artifact_jobs f ON f.workspace=h.workspace AND f.repo=h.repo AND f.commit_oid=h.commit_oid AND f.format_version=h.format_version AND f.kind='full_history' WHERE h.workspace=? AND h.repo=? AND h.format_version=? AND h.kind='head' AND h.state='ready' AND f.state='ready' AND h.manifest IS NOT NULL AND length(trim(h.manifest))>0 AND f.manifest IS NOT NULL AND length(trim(f.manifest))>0 ORDER BY CASE WHEN h.updated_at>f.updated_at THEN h.updated_at ELSE f.updated_at END DESC, CASE WHEN h.id>f.id THEN h.id ELSE f.id END DESC LIMIT 1",
+        if !(1..=32).contains(&limit) {
+            bail!("full base candidate limit must be between 1 and 32")
+        }
+        let commits: Vec<String> = sqlx::query_scalar(
+            "SELECT h.commit_oid FROM artifact_jobs h JOIN artifact_jobs f ON f.workspace=h.workspace AND f.repo=h.repo AND f.commit_oid=h.commit_oid AND f.format_version=h.format_version AND f.kind='full_history' WHERE h.workspace=? AND h.repo=? AND h.format_version=? AND h.kind='head' AND h.state='ready' AND f.state='ready' AND h.manifest IS NOT NULL AND length(trim(h.manifest))>0 AND f.manifest IS NOT NULL AND length(trim(f.manifest))>0 ORDER BY CASE WHEN h.updated_at>f.updated_at THEN h.updated_at ELSE f.updated_at END DESC, CASE WHEN h.id>f.id THEN h.id ELSE f.id END DESC LIMIT ?",
         )
         .bind(workspace)
         .bind(repo)
         .bind(format_version as i64)
-        .fetch_optional(&self.pool)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
         .await?;
-        Ok(commit)
+        Ok(commits)
+    }
+    pub async fn quarantine_ready(
+        &self,
+        key: &ArtifactKey,
+        expected_manifest: &str,
+        reason: &str,
+    ) -> Result<bool> {
+        validate_format_version(key.format_version)?;
+        Cas::validate_artifact_id(expected_manifest)?;
+        let mut c = self.immediate().await?;
+        let result: Result<bool> = async {
+            let now = db_now(&mut c).await?;
+            let id: Option<i64> = sqlx::query_scalar(
+                "UPDATE artifact_jobs SET state='failed',manifest=NULL,error=?,failure_class='retryable',owner=NULL,heartbeat_at=NULL,lease_expires_at=NULL,updated_at=? WHERE workspace=? AND repo=? AND commit_oid=? AND kind=? AND format_version=? AND state='ready' AND manifest=? RETURNING id",
+            )
+            .bind(reason)
+            .bind(now)
+            .bind(&key.workspace)
+            .bind(&key.repo)
+            .bind(&key.commit)
+            .bind(key.kind.as_str())
+            .bind(key.format_version as i64)
+            .bind(expected_manifest)
+            .fetch_optional(&mut *c)
+            .await?;
+            if let Some(id) = id {
+                sqlx::query("UPDATE artifact_observations SET published_artifact_id=NULL WHERE published_artifact_id=?")
+                    .bind(id)
+                    .execute(&mut *c)
+                    .await?;
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        }
+        .await;
+        finish(c, result).await
     }
     pub async fn counts(&self) -> Result<Vec<(ArtifactKind, ArtifactState, u64)>> {
         let rows=sqlx::query("SELECT kind,state,count(*) n FROM artifact_jobs GROUP BY kind,state ORDER BY kind,state").fetch_all(&self.pool).await?;
@@ -2693,10 +2760,11 @@ mod tests {
             assert!(s.complete(&claim, "old", &evidence(&claim)).await.unwrap());
         }
         assert_eq!(
-            s.latest_complete_full_base("ws", "o/r", 1)
+            s.complete_full_base_candidates("ws", "o/r", 1, 8)
                 .await
                 .unwrap()
-                .as_deref(),
+                .first()
+                .map(String::as_str),
             Some("t1")
         );
 
@@ -2730,10 +2798,11 @@ mod tests {
             "t2"
         );
         assert_eq!(
-            s.latest_complete_full_base("ws", "o/r", 1)
+            s.complete_full_base_candidates("ws", "o/r", 1, 8)
                 .await
                 .unwrap()
-                .as_deref(),
+                .first()
+                .map(String::as_str),
             Some("t1"),
             "the independently advanced History alias must not hide T1"
         );
@@ -2743,11 +2812,80 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(
-            s.latest_complete_full_base("ws", "o/r", 1)
+            s.complete_full_base_candidates("ws", "o/r", 1, 8)
                 .await
                 .unwrap()
-                .as_deref(),
+                .first()
+                .map(String::as_str),
             Some("t2")
+        );
+    }
+
+    #[tokio::test]
+    async fn candidate_catalog_is_bounded_and_quarantine_is_manifest_fenced() {
+        let (s, _d, _) = scheduler(Default::default()).await;
+        for (generation, commit) in ["old", "new"].into_iter().enumerate() {
+            s.observe(
+                "ws",
+                "o/r",
+                "main",
+                commit,
+                &[ArtifactKind::Head],
+                1,
+                (generation > 0).then_some(generation as u64),
+            )
+            .await
+            .unwrap();
+            let claim = s.claim("worker", 60).await.unwrap().unwrap();
+            let manifest = if commit == "old" {
+                "a".repeat(64)
+            } else {
+                "b".repeat(64)
+            };
+            let evidence = CompletionEvidence::new(claim.record.key.clone(), manifest).unwrap();
+            assert!(s.complete(&claim, "worker", &evidence).await.unwrap());
+        }
+        let candidates = s
+            .ready_candidates("ws", "o/r", ArtifactKind::Head, 1, 1)
+            .await
+            .unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].key.commit, "new");
+        assert!(
+            s.ready_candidates("ws", "o/r", ArtifactKind::Head, 1, 0)
+                .await
+                .is_err()
+        );
+        assert!(
+            s.ready_candidates("ws", "o/r", ArtifactKind::Head, 1, 33)
+                .await
+                .is_err()
+        );
+
+        let newest = &candidates[0];
+        assert!(
+            !s.quarantine_ready(&newest.key, &"a".repeat(64), "stale report")
+                .await
+                .unwrap(),
+            "a stale corruption report must not invalidate a replacement manifest"
+        );
+        assert_eq!(
+            s.get(newest.id).await.unwrap().unwrap().state,
+            ArtifactState::Ready
+        );
+        assert!(
+            s.quarantine_ready(&newest.key, &"b".repeat(64), "verified corruption")
+                .await
+                .unwrap()
+        );
+        let quarantined = s.get(newest.id).await.unwrap().unwrap();
+        assert_eq!(quarantined.state, ArtifactState::Failed);
+        assert!(quarantined.manifest.is_none());
+        assert!(
+            s.published("ws", "o/r", "main", ArtifactKind::Head, 1)
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 

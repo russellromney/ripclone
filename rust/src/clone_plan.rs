@@ -107,6 +107,7 @@ impl VerifiedTopUpReceipt {
         Ok(Self {
             request: PinnedBundleRequest {
                 manifest_hash: bundle.manifest_hash.clone(),
+                transport_session: hex::encode(rand::random::<[u8; 32]>()),
                 format_version: bundle.bundle.format_version,
                 workspace_id: bundle.bundle.workspace_id.clone(),
                 repo_path: bundle.bundle.repo_path.clone(),
@@ -461,6 +462,24 @@ mod tests {
             artifacts,
         };
         VerifiedTopUpReceipt::from_verified(&verified).unwrap()
+    }
+
+    #[test]
+    fn concurrent_plans_for_same_pinned_root_get_distinct_transport_sessions() {
+        let first = bundle(TopUpMode::Head);
+        let second = bundle(TopUpMode::Head);
+        assert_eq!(first.request.manifest_hash, second.request.manifest_hash);
+        assert_ne!(
+            first.request.transport_session,
+            second.request.transport_session
+        );
+        for session in [
+            &first.request.transport_session,
+            &second.request.transport_session,
+        ] {
+            assert_eq!(session.len(), 64);
+            assert!(session.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        }
     }
 
     fn plan(
@@ -822,12 +841,24 @@ mod tests {
             top_up: Some(&receipt),
         })
         .unwrap();
-        assert!(matches!(
-            plan,
-            ClonePlan::Ready {
-                target_commit,
-                payload: ClonePayload::PinnedBundle { request: planned, .. }
-            } if target_commit == target && planned == request
-        ));
+        let ClonePlan::Ready {
+            target_commit,
+            payload: ClonePayload::PinnedBundle { request: planned, .. },
+        } = plan
+        else {
+            panic!("generated verified bundle did not produce a pinned plan")
+        };
+        assert_eq!(target_commit, target);
+        assert_eq!(planned.manifest_hash, request.manifest_hash);
+        assert_eq!(planned.workspace_id, request.workspace_id);
+        assert_eq!(planned.repo_path, request.repo_path);
+        assert_eq!(planned.base_commit, request.base_commit);
+        assert_eq!(planned.target_commit, request.target_commit);
+        assert_eq!(planned.branch, request.branch);
+        assert_eq!(planned.mode, request.mode);
+        assert_eq!(planned.transport_session.len(), 64);
+        assert!(planned.transport_session.bytes().all(|byte| {
+            byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+        }));
     }
 }
