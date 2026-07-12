@@ -23,13 +23,30 @@ use std::{cell::RefCell, time::Duration};
 
 thread_local! {
     static VERIFICATION_CANCEL: RefCell<Option<tokio_util::sync::CancellationToken>> = const { RefCell::new(None) };
+    static VERIFICATION_SCRATCH: RefCell<Option<std::path::PathBuf>> = const { RefCell::new(None) };
 }
 
-struct VerificationCancelGuard(Option<tokio_util::sync::CancellationToken>);
+struct VerificationCancelGuard {
+    token: Option<tokio_util::sync::CancellationToken>,
+    scratch: Option<std::path::PathBuf>,
+}
 impl Drop for VerificationCancelGuard {
     fn drop(&mut self) {
-        VERIFICATION_CANCEL.with(|slot| *slot.borrow_mut() = self.0.take());
+        VERIFICATION_CANCEL.with(|slot| *slot.borrow_mut() = self.token.take());
+        VERIFICATION_SCRATCH.with(|slot| *slot.borrow_mut() = self.scratch.take());
     }
+}
+
+fn verification_tempdir() -> Result<tempfile::TempDir> {
+    VERIFICATION_SCRATCH.with(|slot| match slot.borrow().as_ref() {
+        Some(root) => {
+            std::fs::create_dir_all(root)?;
+            Ok(tempfile::Builder::new()
+                .prefix("verify.")
+                .tempdir_in(root)?)
+        }
+        None => Ok(tempfile::tempdir()?),
+    })
 }
 
 fn verification_cancelled() -> bool {
@@ -42,6 +59,7 @@ fn verification_cancelled() -> bool {
 
 pub const ARTIFACT_MANIFEST_SCHEMA: u32 = 1;
 pub const PRODUCTION_VERIFIER_IDENTITY: &str = "ripclone-typed-cas-artifact-v1";
+pub const FULL_HISTORY_BASE_TIER: u32 = 63;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArtifactVerificationLimits {
@@ -213,8 +231,25 @@ pub struct FullHistoryArtifact {
     /// Raw bytes of the exact target commit. This authenticates its parent
     /// list without making history depend on the separately published Head.
     pub target_commit_object: CasBlob,
-    /// Complete closure of every parent. Empty iff the target is a root.
-    pub history_packs: Vec<GitPackPair>,
+    /// Immutable, oldest-to-newest LSM ranges whose disjoint union is the
+    /// complete closure of every parent. Empty iff the target is a root.
+    /// A level may contain many physical packs; physical download sizing is
+    /// deliberately independent from the number of logical levels.
+    pub levels: Vec<FullHistoryLevel>,
+}
+
+/// One exact immutable history range. Its object set is
+/// `reachable(tips) - reachable(base_exclusive)`. The first (cold) level has
+/// no exclusions. Later levels chain exactly to the preceding level's tips.
+/// Tails begin at tier zero; adjacent compatible equal tiers are recursively
+/// compacted into the next tier.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FullHistoryLevel {
+    pub tier: u32,
+    pub base_exclusive: Vec<String>,
+    pub tips: Vec<String>,
+    pub packs: Vec<GitPackPair>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -263,7 +298,14 @@ impl ArtifactPayload {
     fn artifact_count(&self) -> u64 {
         match self {
             Self::Head(head) => head.packs.len() as u64 * 2 + 1,
-            Self::FullHistory(history) => history.history_packs.len() as u64 * 2 + 1,
+            Self::FullHistory(history) => {
+                history
+                    .levels
+                    .iter()
+                    .map(|level| level.packs.len() as u64 * 2)
+                    .sum::<u64>()
+                    + 1
+            }
             Self::Files(files) => {
                 2 + files.archive_chunks.len() as u64 + u64::from(files.zstd_dictionary.is_some())
             }
@@ -311,8 +353,8 @@ impl ArtifactManifest {
         self.validate_envelope()?;
         let bytes = serde_json::to_vec(self)?;
         let manifest = cas.put(&bytes)?;
-        Ok(CompletionEvidence {
-            key: ArtifactKey {
+        CompletionEvidence::from_manifest(
+            ArtifactKey {
                 workspace: self.key.workspace.clone(),
                 repo: self.key.repo.clone(),
                 commit: self.key.commit.clone(),
@@ -320,8 +362,8 @@ impl ArtifactManifest {
                 format_version: self.key.format_version,
             },
             manifest,
-            artifact_count: self.payload.artifact_count(),
-        })
+            self.payload.artifact_count(),
+        )
     }
 
     fn validate_envelope(&self) -> Result<()> {
@@ -471,12 +513,35 @@ impl CasCompletionVerifier {
         artifact_count: u64,
         cancelled: &tokio_util::sync::CancellationToken,
     ) -> Result<ArtifactManifest> {
+        self.verify_manifest_cancelled_in_scratch(
+            key,
+            manifest_hash,
+            artifact_count,
+            cancelled,
+            None,
+        )
+    }
+
+    pub fn verify_manifest_cancelled_in_scratch(
+        &self,
+        key: &ArtifactKey,
+        manifest_hash: &str,
+        artifact_count: u64,
+        cancelled: &tokio_util::sync::CancellationToken,
+        scratch: Option<&Path>,
+    ) -> Result<ArtifactManifest> {
         if cancelled.is_cancelled() {
             bail!("artifact verification cancelled");
         }
         let previous =
             VERIFICATION_CANCEL.with(|slot| slot.borrow_mut().replace(cancelled.clone()));
-        let _guard = VerificationCancelGuard(previous);
+        let previous_scratch = VERIFICATION_SCRATCH.with(|slot| {
+            std::mem::replace(&mut *slot.borrow_mut(), scratch.map(Path::to_path_buf))
+        });
+        let _guard = VerificationCancelGuard {
+            token: previous,
+            scratch: previous_scratch,
+        };
         let result = self.verify_manifest(key, manifest_hash, artifact_count);
         if cancelled.is_cancelled() {
             bail!("artifact verification cancelled");
@@ -554,7 +619,7 @@ impl CasCompletionVerifier {
         if total > self.limits.total_pack_bytes {
             bail!("Git pack aggregate exceeds verifier limit");
         }
-        let repo = tempfile::tempdir()?;
+        let repo = verification_tempdir()?;
         git(repo.path(), &["init", "--quiet"])?;
         let pack_dir = repo.path().join(".git/objects/pack");
         std::fs::create_dir_all(&pack_dir)?;
@@ -633,8 +698,14 @@ impl CasCompletionVerifier {
     }
 
     fn verify_full_history(&self, commit: &str, history: &FullHistoryArtifact) -> Result<()> {
+        let pack_count = history
+            .levels
+            .iter()
+            .try_fold(0usize, |count, level| count.checked_add(level.packs.len()))
+            .context("FullHistory pack count overflow")?;
         if history.target_commit_object.len > self.limits.commit_bytes
-            || history.history_packs.len() > self.limits.packs
+            || history.levels.len() > self.limits.packs
+            || pack_count > self.limits.packs
         {
             bail!("FullHistory artifact exceeds verifier limits");
         }
@@ -646,15 +717,55 @@ impl CasCompletionVerifier {
         let parsed = parse_exact_commit(commit, &commit_bytes)?;
         drop(commit_bytes);
         if parsed.parents.is_empty() {
-            if !history.history_packs.is_empty() {
+            if !history.levels.is_empty() {
                 bail!("root commit history must be empty");
             }
             return Ok(());
         }
-        if history.history_packs.is_empty() {
-            bail!("non-root commit history contains no packs");
+        if history.levels.is_empty() {
+            bail!("non-root commit history contains no levels");
         }
-        let repo = self.materialize_packs(&history.history_packs)?;
+        let mut expected_tips = parsed.parents.clone();
+        expected_tips.sort();
+        expected_tips.dedup();
+        let mut previous_tips: Option<&[String]> = None;
+        let mut previous_tier = FULL_HISTORY_BASE_TIER + 1;
+        for (index, level) in history.levels.iter().enumerate() {
+            validate_canonical_oids(&level.tips, "history level tips")?;
+            validate_canonical_oids(&level.base_exclusive, "history level exclusions")?;
+            if level.tips.is_empty() || level.packs.is_empty() {
+                bail!("history level must contain tips and packs");
+            }
+            if index == 0 {
+                if level.tier != FULL_HISTORY_BASE_TIER || !level.base_exclusive.is_empty() {
+                    bail!("history cold level has noncanonical range or tier");
+                }
+            } else {
+                if level.tier >= previous_tier || level.tier >= FULL_HISTORY_BASE_TIER {
+                    bail!("history tail tiers are not canonically compacted");
+                }
+                if Some(level.base_exclusive.as_slice()) != previous_tips {
+                    bail!("history level range is not adjacent to its predecessor");
+                }
+            }
+            previous_tips = Some(level.tips.as_slice());
+            previous_tier = level.tier;
+        }
+        if history.levels.last().map(|level| level.tips.as_slice())
+            != Some(expected_tips.as_slice())
+        {
+            bail!("history levels do not terminate at the target parents");
+        }
+
+        let packs = history
+            .levels
+            .iter()
+            .flat_map(|level| level.packs.iter().cloned())
+            .collect::<Vec<_>>();
+        let repo = self.materialize_packs(&packs)?;
+        for level in &history.levels {
+            self.verify_history_level(repo.path(), level)?;
+        }
         for parent in &parsed.parents {
             git(
                 repo.path(),
@@ -672,6 +783,30 @@ impl CasCompletionVerifier {
             .collect::<Vec<_>>();
         compare_exact_object_sets(repo.path(), &parents, self.limits.git_objects)?;
         Ok(())
+    }
+
+    fn verify_history_level(&self, complete: &Path, level: &FullHistoryLevel) -> Result<()> {
+        let repo = self.materialize_packs(&level.packs)?;
+        let info = repo.path().join(".git/objects/info");
+        std::fs::create_dir_all(&info)?;
+        let alternate = complete.join(".git/objects").canonicalize()?;
+        std::fs::write(
+            info.join("alternates"),
+            format!("{}\n", alternate.display()),
+        )?;
+        let exclusions = level
+            .base_exclusive
+            .iter()
+            .map(|oid| format!("^{oid}"))
+            .collect::<Vec<_>>();
+        let revisions = level
+            .tips
+            .iter()
+            .map(String::as_str)
+            .chain(exclusions.iter().map(String::as_str))
+            .collect::<Vec<_>>();
+        compare_exact_object_sets(repo.path(), &revisions, self.limits.git_objects)
+            .context("history level does not match its declared exact range")
     }
 
     fn verify_files(&self, commit: &str, files: &FilesArtifact) -> Result<()> {
@@ -744,7 +879,7 @@ impl CasCompletionVerifier {
             .transpose()?;
         validate_dictionary_policy(&metadata, dictionary.as_deref())?;
 
-        let scratch = tempfile::tempdir()?;
+        let scratch = verification_tempdir()?;
         let chunk_dir = scratch.path().join("chunks");
         std::fs::create_dir(&chunk_dir)?;
         let mut total_compressed = 0u64;
@@ -792,6 +927,25 @@ impl CompletionVerifier for CasCompletionVerifier {
             bail!("completion evidence does not match claimed artifact key");
         }
         self.verify_manifest(&evidence.key, &evidence.manifest, evidence.artifact_count)?;
+        Ok(())
+    }
+
+    fn verify_owned(
+        &self,
+        claim: &ClaimedArtifact,
+        evidence: &CompletionEvidence,
+        context: &crate::artifact_scheduler::ExecutionContext,
+    ) -> Result<()> {
+        if evidence.key != claim.record.key {
+            bail!("completion evidence does not match claimed artifact key");
+        }
+        self.verify_manifest_cancelled_in_scratch(
+            &evidence.key,
+            &evidence.manifest,
+            evidence.artifact_count,
+            &context.cancelled,
+            Some(&context.scratch),
+        )?;
         Ok(())
     }
 }
@@ -1228,8 +1382,20 @@ fn git_object_oid(kind: &str, bytes: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
+fn validate_canonical_oids(oids: &[String], role: &str) -> Result<()> {
+    let mut previous: Option<&str> = None;
+    for oid in oids {
+        Cas::validate_object_id(oid).with_context(|| format!("invalid {role} object id"))?;
+        if previous.is_some_and(|value| value >= oid.as_str()) {
+            bail!("{role} must be sorted and duplicate-free");
+        }
+        previous = Some(oid);
+    }
+    Ok(())
+}
+
 fn compare_exact_object_sets(repo: &Path, revisions: &[&str], maximum: u64) -> Result<()> {
-    let scratch = tempfile::tempdir()?;
+    let scratch = verification_tempdir()?;
     let packed = scratch.path().join("packed");
     let reachable = scratch.path().join("reachable");
     let mut packed_output = std::io::BufWriter::new(std::fs::File::create(&packed)?);
@@ -1430,7 +1596,7 @@ fn git_update_index(repo: &Path, mode: u32, oid: &str, path: &[u8]) -> Result<()
 
 fn git(repo: &Path, args: &[&str]) -> Result<String> {
     const MAX_GIT_DIAGNOSTIC_BYTES: u64 = 1024 * 1024;
-    let scratch = tempfile::tempdir()?;
+    let scratch = verification_tempdir()?;
     let stdout_path = scratch.path().join("stdout");
     let stderr_path = scratch.path().join("stderr");
     let stdout = std::fs::File::create(&stdout_path)?;
@@ -1602,7 +1768,12 @@ mod tests {
                 &self.key(ArtifactKind::FullHistory),
                 ArtifactPayload::FullHistory(FullHistoryArtifact {
                     target_commit_object: self.commit_blob(&self.second),
-                    history_packs: self.pairs(&self.first, None),
+                    levels: vec![FullHistoryLevel {
+                        tier: FULL_HISTORY_BASE_TIER,
+                        base_exclusive: vec![],
+                        tips: vec![self.first.clone()],
+                        packs: self.pairs(&self.first, None),
+                    }],
                 }),
             )
             .unwrap()
@@ -1703,7 +1874,7 @@ mod tests {
             &key,
             ArtifactPayload::FullHistory(FullHistoryArtifact {
                 target_commit_object: f.commit_blob(&f.first),
-                history_packs: vec![],
+                levels: vec![],
             }),
         )
         .unwrap();
@@ -1958,10 +2129,43 @@ mod tests {
         let ArtifactPayload::FullHistory(payload) = &mut history.payload else {
             unreachable!()
         };
-        payload.history_packs.clear();
+        payload.levels.clear();
         history.semantic_digest =
             semantic_digest(history.schema_version, &history.key, &history.payload).unwrap();
         assert!(f.verify(&history).is_err());
+    }
+
+    #[test]
+    fn history_rejects_noncanonical_tiers_ranges_and_tip_order() {
+        let f = Fixture::new();
+
+        let mut wrong_tier = f.history();
+        let ArtifactPayload::FullHistory(payload) = &mut wrong_tier.payload else {
+            unreachable!()
+        };
+        payload.levels[0].tier = 0;
+        let wrong_tier =
+            ArtifactManifest::new(&f.key(ArtifactKind::FullHistory), wrong_tier.payload).unwrap();
+        assert!(f.verify(&wrong_tier).is_err());
+
+        let mut wrong_tip = f.history();
+        let ArtifactPayload::FullHistory(payload) = &mut wrong_tip.payload else {
+            unreachable!()
+        };
+        payload.levels[0].tips = vec![f.second.clone()];
+        let wrong_tip =
+            ArtifactManifest::new(&f.key(ArtifactKind::FullHistory), wrong_tip.payload).unwrap();
+        assert!(f.verify(&wrong_tip).is_err());
+
+        let mut duplicate_tip = f.history();
+        let ArtifactPayload::FullHistory(payload) = &mut duplicate_tip.payload else {
+            unreachable!()
+        };
+        payload.levels[0].tips.push(f.first.clone());
+        let duplicate_tip =
+            ArtifactManifest::new(&f.key(ArtifactKind::FullHistory), duplicate_tip.payload)
+                .unwrap();
+        assert!(f.verify(&duplicate_tip).is_err());
     }
 
     #[test]
@@ -1994,7 +2198,12 @@ mod tests {
             &key,
             ArtifactPayload::FullHistory(FullHistoryArtifact {
                 target_commit_object: f.commit_blob(&f.first),
-                history_packs: f.pairs(&f.first, None),
+                levels: vec![FullHistoryLevel {
+                    tier: FULL_HISTORY_BASE_TIER,
+                    base_exclusive: vec![],
+                    tips: vec![f.first.clone()],
+                    packs: f.pairs(&f.first, None),
+                }],
             }),
         )
         .unwrap();

@@ -196,6 +196,7 @@ pub struct CompletionEvidence {
     pub key: ArtifactKey,
     pub manifest: String,
     pub artifact_count: u64,
+    verified_by: Option<String>,
 }
 impl CompletionEvidence {
     pub fn new(key: ArtifactKey, manifest: impl Into<String>) -> Result<Self> {
@@ -207,7 +208,33 @@ impl CompletionEvidence {
             key,
             manifest,
             artifact_count: 1,
+            verified_by: None,
         })
+    }
+
+    pub fn from_manifest(
+        key: ArtifactKey,
+        manifest: impl Into<String>,
+        artifact_count: u64,
+    ) -> Result<Self> {
+        let mut evidence = Self::new(key, manifest)?;
+        if artifact_count == 0 {
+            bail!("artifact completion contains no artifacts");
+        }
+        evidence.artifact_count = artifact_count;
+        Ok(evidence)
+    }
+
+    pub(crate) fn mark_verified(&mut self, identity: &str) -> Result<()> {
+        if identity.trim().is_empty() {
+            bail!("completion verifier identity is empty");
+        }
+        self.verified_by = Some(identity.to_owned());
+        Ok(())
+    }
+
+    pub(crate) fn is_verified_by(&self, identity: &str) -> bool {
+        self.verified_by.as_deref() == Some(identity)
     }
 }
 
@@ -216,6 +243,21 @@ impl CompletionEvidence {
 pub trait CompletionVerifier: Send + Sync {
     fn identity(&self) -> &str;
     fn verify(&self, claim: &ClaimedArtifact, evidence: &CompletionEvidence) -> Result<()>;
+    fn verify_owned(
+        &self,
+        claim: &ClaimedArtifact,
+        evidence: &CompletionEvidence,
+        context: &ExecutionContext,
+    ) -> Result<()> {
+        if context.cancelled.is_cancelled() {
+            bail!("artifact verification cancelled");
+        }
+        self.verify(claim, evidence)?;
+        if context.cancelled.is_cancelled() {
+            bail!("artifact verification cancelled");
+        }
+        Ok(())
+    }
 }
 struct StructuralVerifier;
 impl CompletionVerifier for StructuralVerifier {
@@ -272,7 +314,7 @@ impl Default for SchedulerLimits {
 pub struct ArtifactScheduler {
     pool: SqlitePool,
     limits: SchedulerLimits,
-    verifier: Arc<dyn CompletionVerifier>,
+    pub(crate) verifier: Arc<dyn CompletionVerifier>,
 }
 
 /// Context passed to cooperative work. Blocking/external children must be
@@ -767,7 +809,9 @@ impl ArtifactScheduler {
         owner: &str,
         evidence: &CompletionEvidence,
     ) -> Result<bool> {
-        self.verifier.verify(claim, evidence)?;
+        if !evidence.is_verified_by(self.verifier.identity()) {
+            self.verifier.verify(claim, evidence)?;
+        }
         let mut c = self.immediate().await?;
         let result:Result<bool>=async{
    let now=db_now(&mut c).await?; let won=sqlx::query("UPDATE artifact_jobs SET state='ready',owner=NULL,heartbeat_at=NULL,lease_expires_at=NULL,manifest=?,error=NULL,failure_class=NULL,updated_at=? WHERE id=? AND state='running' AND owner=? AND lease_generation=? AND lease_expires_at>=?")
@@ -2299,6 +2343,150 @@ mod tests {
             s.get(claim.record.id).await.unwrap().unwrap().state,
             ArtifactState::Ready
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn slow_owned_verification_is_heartbeated_and_not_repeated_at_publish() {
+        use crate::artifact_scheduler_backend::{ArtifactSchedulerPersistence, OwnedArtifactBuild};
+
+        struct SlowOwnedVerifier {
+            owned_calls: Arc<std::sync::atomic::AtomicUsize>,
+            plain_calls: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl CompletionVerifier for SlowOwnedVerifier {
+            fn identity(&self) -> &str {
+                "slow-owned-verifier-v1"
+            }
+            fn verify(&self, _: &ClaimedArtifact, _: &CompletionEvidence) -> Result<()> {
+                self.plain_calls.fetch_add(1, Ordering::SeqCst);
+                bail!("publication repeated production verification")
+            }
+            fn verify_owned(
+                &self,
+                claim: &ClaimedArtifact,
+                evidence: &CompletionEvidence,
+                context: &ExecutionContext,
+            ) -> Result<()> {
+                validate_evidence(claim, evidence)?;
+                self.owned_calls.fetch_add(1, Ordering::SeqCst);
+                for _ in 0..110 {
+                    if context.cancelled.is_cancelled() {
+                        bail!("slow verifier cancelled");
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Ok(())
+            }
+        }
+
+        let d = tempfile::tempdir().unwrap();
+        let owned_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let plain_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let s = ArtifactScheduler::open_with_verifier(
+            d.path().join("slow-verify.db").to_string_lossy().as_ref(),
+            Default::default(),
+            Arc::new(SlowOwnedVerifier {
+                owned_calls: owned_calls.clone(),
+                plain_calls: plain_calls.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+        let k = key("ws", "slow-verify", ArtifactKind::Head);
+        s.schedule(&k).await.unwrap();
+        let claim = s.claim("worker", 2).await.unwrap().unwrap();
+        let outcome = ArtifactSchedulerPersistence::run_owned_build(
+            &s,
+            &claim,
+            "worker",
+            OwnedArtifactBuild::cooperative(move |_| async move {
+                CompletionEvidence::new(k, "verified-result")
+            }),
+            2,
+            d.path(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, ExecutionOutcome::Ready);
+        assert_eq!(owned_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(plain_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn lease_loss_during_owned_verification_cancels_drains_and_never_publishes() {
+        use crate::artifact_scheduler_backend::{ArtifactSchedulerPersistence, OwnedArtifactBuild};
+
+        struct WaitForCancelVerifier {
+            started: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+            drained: Arc<AtomicBool>,
+        }
+        impl CompletionVerifier for WaitForCancelVerifier {
+            fn identity(&self) -> &str {
+                "wait-for-cancel-verifier-v1"
+            }
+            fn verify(&self, _: &ClaimedArtifact, _: &CompletionEvidence) -> Result<()> {
+                bail!("non-owned verification must not run")
+            }
+            fn verify_owned(
+                &self,
+                _: &ClaimedArtifact,
+                _: &CompletionEvidence,
+                context: &ExecutionContext,
+            ) -> Result<()> {
+                if let Some(started) = self.started.lock().unwrap().take() {
+                    let _ = started.send(());
+                }
+                while !context.cancelled.is_cancelled() {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                self.drained.store(true, Ordering::SeqCst);
+                bail!("verification cancelled after lease loss")
+            }
+        }
+
+        let d = tempfile::tempdir().unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let drained = Arc::new(AtomicBool::new(false));
+        let s = ArtifactScheduler::open_with_verifier(
+            d.path().join("verify-loss.db").to_string_lossy().as_ref(),
+            Default::default(),
+            Arc::new(WaitForCancelVerifier {
+                started: std::sync::Mutex::new(Some(started_tx)),
+                drained: drained.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+        let k = key("ws", "verify-loss", ArtifactKind::Files);
+        s.schedule(&k).await.unwrap();
+        let claim = s.claim("worker", 2).await.unwrap().unwrap();
+        let runner = {
+            let s = s.clone();
+            let claim = claim.clone();
+            let root = d.path().to_owned();
+            tokio::spawn(async move {
+                ArtifactSchedulerPersistence::run_owned_build(
+                    &s,
+                    &claim,
+                    "worker",
+                    OwnedArtifactBuild::cooperative(move |_| async move {
+                        CompletionEvidence::new(k, "never-ready")
+                    }),
+                    2,
+                    &root,
+                )
+                .await
+                .unwrap()
+            })
+        };
+        started_rx.await.unwrap();
+        expire(&s, claim.record.id).await;
+        s.reconcile_expired().await.unwrap();
+        assert_eq!(runner.await.unwrap(), ExecutionOutcome::LostLease);
+        assert!(drained.load(Ordering::SeqCst));
+        let record = s.get(claim.record.id).await.unwrap().unwrap();
+        assert_ne!(record.state, ArtifactState::Ready);
+        assert!(record.manifest.is_none());
     }
 
     #[tokio::test]

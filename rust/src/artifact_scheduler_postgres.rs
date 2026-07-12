@@ -674,6 +674,9 @@ fn existing_outcome(record: ArtifactRecord) -> ScheduleOutcome {
 
 #[async_trait]
 impl ArtifactSchedulerPersistence for PostgresArtifactScheduler {
+    fn completion_verifier(&self) -> Arc<dyn CompletionVerifier> {
+        self.verifier.clone()
+    }
     async fn schedule(&self, key: &ArtifactKey) -> Result<ScheduleOutcome> {
         validate_format_version(key.format_version)?;
         let (mut tx, now) = self.controlled().await?;
@@ -1136,7 +1139,9 @@ impl ArtifactSchedulerPersistence for PostgresArtifactScheduler {
         evidence: &CompletionEvidence,
     ) -> Result<bool> {
         validate_evidence(claim, evidence)?;
-        self.verifier.verify(claim, evidence)?;
+        if !evidence.is_verified_by(self.verifier.identity()) {
+            self.verifier.verify(claim, evidence)?;
+        }
         let mut tx = self.pool.begin().await?;
         let now: i64 = sqlx::query_scalar("SELECT EXTRACT(EPOCH FROM clock_timestamp())::BIGINT")
             .fetch_one(&mut *tx)

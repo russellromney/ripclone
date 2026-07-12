@@ -1216,7 +1216,21 @@ pub fn pack_objects_to_prefix_gix<P: AsRef<Path>, Q: AsRef<Path>>(
 /// `git index-pack` subprocess. The pack must already be named `pack-<hash>.pack`
 /// in its directory; gix will detect it and only write the missing `.idx`.
 pub fn index_pack<P: AsRef<Path>, Q: AsRef<Path>>(_git_dir: P, pack_path: Q) -> Result<()> {
-    let pack_path = pack_path.as_ref();
+    index_pack_inner(pack_path.as_ref(), None)
+}
+
+pub fn index_pack_cancelled<P: AsRef<Path>, Q: AsRef<Path>>(
+    _git_dir: P,
+    pack_path: Q,
+    cancelled: &tokio_util::sync::CancellationToken,
+) -> Result<()> {
+    index_pack_inner(pack_path.as_ref(), Some(cancelled))
+}
+
+fn index_pack_inner(
+    pack_path: &Path,
+    cancelled: Option<&tokio_util::sync::CancellationToken>,
+) -> Result<()> {
     let directory = pack_path
         .parent()
         .context("pack path must have a parent directory")?;
@@ -1227,11 +1241,29 @@ pub fn index_pack<P: AsRef<Path>, Q: AsRef<Path>>(_git_dir: P, pack_path: Q) -> 
     let mut progress = gix::features::progress::Discard;
     let thread_limit =
         crate::gix_util::worker_threads("gix-index", crate::gix_util::default_worker_threads());
+    let interrupt = std::sync::Arc::new(AtomicBool::new(
+        cancelled.is_some_and(tokio_util::sync::CancellationToken::is_cancelled),
+    ));
+    let done = std::sync::Arc::new(AtomicBool::new(false));
+    let watcher = cancelled.map(|token| {
+        let token = token.clone();
+        let interrupt = interrupt.clone();
+        let done = done.clone();
+        std::thread::spawn(move || {
+            while !done.load(std::sync::atomic::Ordering::Acquire) {
+                if token.is_cancelled() {
+                    interrupt.store(true, std::sync::atomic::Ordering::Release);
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        })
+    });
     let gix_result = gix_pack::Bundle::write_to_directory(
         &mut reader,
         Some(directory),
         &mut progress,
-        &AtomicBool::new(false),
+        &interrupt,
         None::<&gix::Repository>,
         gix_pack::bundle::write::Options {
             thread_limit: Some(thread_limit),
@@ -1241,6 +1273,13 @@ pub fn index_pack<P: AsRef<Path>, Q: AsRef<Path>>(_git_dir: P, pack_path: Q) -> 
         },
     )
     .context("gix index-pack");
+    done.store(true, std::sync::atomic::Ordering::Release);
+    if let Some(watcher) = watcher {
+        let _ = watcher.join();
+    }
+    if cancelled.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+        bail!("index-pack cancelled");
+    }
 
     match gix_result {
         Ok(outcome) => {
@@ -1257,14 +1296,25 @@ pub fn index_pack<P: AsRef<Path>, Q: AsRef<Path>>(_git_dir: P, pack_path: Q) -> 
                 "gix index-pack failed for {}: {e:#}; falling back to git index-pack",
                 pack_path.display()
             );
-            let status = Command::new("git")
+            let mut child = Command::new("git")
                 .arg("index-pack")
                 .arg(pack_path)
                 .current_dir(directory)
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
-                .status()
+                .spawn()
                 .with_context(|| format!("spawn git index-pack for {}", pack_path.display()))?;
+            let status = loop {
+                if cancelled.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+                    child.kill()?;
+                    let _ = child.wait();
+                    bail!("git index-pack cancelled");
+                }
+                if let Some(status) = child.try_wait()? {
+                    break status;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            };
             if !status.success() {
                 bail!(
                     "git index-pack failed for {} (status {:?})",

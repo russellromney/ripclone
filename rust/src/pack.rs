@@ -214,24 +214,46 @@ impl<'a> PackBuilder<'a> {
         std::fs::create_dir_all(&pack_dir)?;
 
         for (index, pack_hash) in pack_hashes.iter().enumerate() {
+            self.check_cancelled()?;
             let pack_path = pack_dir.join(format!("head-{index}.pack"));
             let mut pack_file = std::fs::File::create(&pack_path)?;
-            self.cas
-                .copy_to_writer_verified(pack_hash, &mut pack_file)
-                .context("stream HEAD pack for index build")?;
+            match &self.cancelled {
+                Some(cancelled) => {
+                    self.cas.copy_to_writer_verified_cancelled(
+                        pack_hash,
+                        &mut pack_file,
+                        cancelled,
+                    )?;
+                }
+                None => {
+                    self.cas
+                        .copy_to_writer_verified(pack_hash, &mut pack_file)?;
+                }
+            }
             pack_file.sync_all()?;
-            git::index_pack(&git_dir, &pack_path)?;
+            match &self.cancelled {
+                Some(cancelled) => git::index_pack_cancelled(&git_dir, &pack_path, cancelled)?,
+                None => git::index_pack(&git_dir, &pack_path)?,
+            }
         }
 
+        self.check_cancelled()?;
         git::set_head(&git_dir, commit)?;
         git::read_tree(&git_dir, commit)?;
+        self.check_cancelled()?;
 
-        let sizes = git::ls_tree_sizes(&self.repo, commit)?;
-        git::update_index_sizes(&git_dir, &sizes)?;
+        // Scheduler-owned typed builds preflight a bounded tree separately.
+        // Avoid rebuilding an unbounded path->size map here; zeroed cached sizes
+        // remain semantically correct and are refreshed as files materialize.
+        if self.cancelled.is_none() {
+            let sizes = git::ls_tree_sizes(&self.repo, commit)?;
+            git::update_index_sizes(&git_dir, &sizes)?;
+        }
 
         // Mark every tracked path as skip-worktree. The client clears this bit
         // for files it actually materializes from the archive.
         git::set_skip_worktree_all(work)?;
+        self.check_cancelled()?;
 
         let index_bytes = std::fs::read(git_dir.join("index")).context("read prebuilt index")?;
         self.cas.put(&index_bytes)

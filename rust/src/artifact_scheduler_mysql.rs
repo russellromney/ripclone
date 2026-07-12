@@ -981,6 +981,9 @@ fn validate_mysql_key(key: &ArtifactKey) -> Result<()> {
 
 #[async_trait]
 impl ArtifactSchedulerPersistence for MysqlArtifactScheduler {
+    fn completion_verifier(&self) -> Arc<dyn CompletionVerifier> {
+        self.verifier.clone()
+    }
     async fn schedule(&self, key: &ArtifactKey) -> Result<ScheduleOutcome> {
         validate_mysql_key(key)?;
         let (mut tx, now) = self.controlled().await?;
@@ -1471,7 +1474,9 @@ impl ArtifactSchedulerPersistence for MysqlArtifactScheduler {
     ) -> Result<bool> {
         check_mysql_len("lease owner", owner, 255)?;
         validate_evidence(claim, evidence)?;
-        self.verifier.verify(claim, evidence)?;
+        if !evidence.is_verified_by(self.verifier.identity()) {
+            self.verifier.verify(claim, evidence)?;
+        }
         let mut tx = self.pool.begin().await?;
         let now: i64 = sqlx::query_scalar("SELECT UNIX_TIMESTAMP()")
             .fetch_one(&mut *tx)

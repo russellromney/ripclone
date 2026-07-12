@@ -353,6 +353,36 @@ impl Cas {
         self.copy_to_writer_verified_with(hash, writer, |_| {})
     }
 
+    pub fn copy_to_writer_verified_cancelled<W: Write>(
+        &self,
+        hash: &str,
+        writer: &mut W,
+        cancelled: &tokio_util::sync::CancellationToken,
+    ) -> Result<u64> {
+        let path = self.object_path(hash)?;
+        let mut file =
+            std::fs::File::open(&path).with_context(|| format!("open CAS object {hash}"))?;
+        let mut hasher = ObjectHasher::for_object_id(hash)?;
+        let mut buf = vec![0u8; 1024 * 1024];
+        let mut len = 0u64;
+        loop {
+            if cancelled.is_cancelled() {
+                anyhow::bail!("streaming CAS object cancelled");
+            }
+            let n = file.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            writer.write_all(&buf[..n])?;
+            hasher.update(&buf[..n]);
+            len += n as u64;
+        }
+        if hasher.finalize_hex() != hash {
+            anyhow::bail!("CAS object {hash} is corrupt");
+        }
+        Ok(len)
+    }
+
     pub fn copy_to_writer_verified_with<W, F>(
         &self,
         hash: &str,

@@ -218,6 +218,9 @@ impl LibsqlArtifactScheduler {
 
 #[async_trait]
 impl ArtifactSchedulerPersistence for LibsqlArtifactScheduler {
+    fn completion_verifier(&self) -> Arc<dyn CompletionVerifier> {
+        self.verifier.clone()
+    }
     async fn schedule(&self, key: &ArtifactKey) -> Result<ScheduleOutcome> {
         validate_format_version(key.format_version)?;
         let tx = self.tx().await?;
@@ -359,7 +362,9 @@ impl ArtifactSchedulerPersistence for LibsqlArtifactScheduler {
     }
     async fn complete(&self, c: &ClaimedArtifact, o: &str, e: &CompletionEvidence) -> Result<bool> {
         validate_evidence(c, e)?;
-        self.verifier.verify(c, e)?;
+        if !e.is_verified_by(self.verifier.identity()) {
+            self.verifier.verify(c, e)?;
+        }
         let tx = self.tx().await?;
         let r=async{let t=now(&tx).await?;let won=exec(&tx,"UPDATE artifact_jobs SET state='ready',owner=NULL,heartbeat_at=NULL,lease_expires_at=NULL,manifest=?,error=NULL,failure_class=NULL,updated_at=? WHERE id=? AND state='running' AND owner=? AND lease_generation=? AND lease_expires_at>=?",vec![e.manifest.clone().into(),t.into(),c.record.id.into(),o.into(),(c.record.lease_generation as i64).into(),t.into()]).await?==1;if won{exec(&tx,"UPDATE artifact_observations SET published_artifact_id=? WHERE desired_artifact_id=?",vec![c.record.id.into(),c.record.id.into()]).await?;}Ok(won)}.await;
         finish(tx, r).await

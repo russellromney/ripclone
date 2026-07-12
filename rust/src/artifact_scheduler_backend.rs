@@ -14,6 +14,7 @@ use async_trait::async_trait;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
@@ -75,6 +76,7 @@ impl Drop for PersistenceExecutionGuard {
 
 #[async_trait]
 pub trait ArtifactSchedulerPersistence: Send + Sync {
+    fn completion_verifier(&self) -> Arc<dyn crate::artifact_scheduler::CompletionVerifier>;
     async fn schedule(&self, key: &ArtifactKey) -> Result<ScheduleOutcome>;
     async fn subscribe_consumer(
         &self,
@@ -228,7 +230,7 @@ pub trait ArtifactSchedulerPersistence: Send + Sync {
             return Ok(ExecutionOutcome::LostLease);
         };
 
-        let evidence = match build_result {
+        let mut evidence = match build_result {
             Ok(Ok(evidence)) => evidence,
             Ok(Err(error)) => {
                 cancel.cancel();
@@ -280,6 +282,62 @@ pub trait ArtifactSchedulerPersistence: Send + Sync {
             guard.armed = false;
             return Ok(outcome);
         }
+        // Verification is part of the owned operation, not publication. Run it
+        // on the blocking pool while the same lease heartbeat/cancellation loop
+        // remains active; only then stamp this in-memory receipt so `complete`
+        // performs the DB-only fenced transition.
+        let verifier = self.completion_verifier();
+        let verifier_identity = verifier.identity().to_owned();
+        let verify_claim = claim.clone();
+        let verify_evidence = evidence.clone();
+        let verify_context = ExecutionContext {
+            cancelled: cancel.clone(),
+            scratch: scratch.clone(),
+        };
+        let mut verifying = tokio::task::spawn_blocking(move || {
+            verifier.verify_owned(&verify_claim, &verify_evidence, &verify_context)
+        });
+        let verification = loop {
+            tokio::select! {
+                result = &mut verifying => break Some(result),
+                _ = interval.tick() => match self.heartbeat(claim, owner, lease_secs).await {
+                    Ok(true) => {}
+                    Ok(false) => break None,
+                    Err(error) => {
+                        cancel.cancel();
+                        let _ = verifying.await;
+                        let _ = std::fs::remove_dir_all(&scratch);
+                        guard.armed = false;
+                        return Err(error).context("artifact heartbeat failed after draining verifier");
+                    }
+                }
+            }
+        };
+        let Some(verification) = verification else {
+            cancel.cancel();
+            let _ = verifying.await;
+            let _ = std::fs::remove_dir_all(&scratch);
+            guard.armed = false;
+            return Ok(ExecutionOutcome::LostLease);
+        };
+        let verification_error = match verification {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(error.to_string()),
+            Err(error) => Some(if error.is_panic() {
+                "artifact verifier panicked".to_owned()
+            } else {
+                format!("artifact verifier cancelled: {error}")
+            }),
+        };
+        if let Some(error) = verification_error {
+            cancel.cancel();
+            let message = format!("artifact completion evidence was rejected: {error}");
+            let _ = std::fs::remove_dir_all(&scratch);
+            let outcome = fail_still_owned(self, claim, owner, &message).await?;
+            guard.armed = false;
+            return Ok(outcome);
+        }
+        evidence.mark_verified(&verifier_identity)?;
         let ready = match self.complete(claim, owner, &evidence).await {
             Ok(ready) => ready,
             Err(error) => {
@@ -425,6 +483,9 @@ async fn fail_still_owned<P: ArtifactSchedulerPersistence + ?Sized>(
 
 #[async_trait]
 impl ArtifactSchedulerPersistence for crate::artifact_scheduler::ArtifactScheduler {
+    fn completion_verifier(&self) -> Arc<dyn crate::artifact_scheduler::CompletionVerifier> {
+        self.verifier.clone()
+    }
     async fn schedule(&self, key: &ArtifactKey) -> Result<ScheduleOutcome> {
         self.schedule(key).await
     }
