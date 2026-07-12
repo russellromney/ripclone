@@ -135,6 +135,52 @@ pub enum ObservationOutcome {
     Stale {
         current_generation: u64,
     },
+    /// The branch already points at this exact commit. No generation changed
+    /// and no artifact work was scheduled.
+    Unchanged {
+        generation: u64,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservationSnapshot {
+    workspace: String,
+    repo: String,
+    branch: String,
+    generation: Option<u64>,
+    commit: Option<String>,
+}
+impl ObservationSnapshot {
+    pub(crate) fn new(
+        workspace: &str,
+        repo: &str,
+        branch: &str,
+        generation: Option<u64>,
+        commit: Option<String>,
+    ) -> Self {
+        Self {
+            workspace: workspace.into(),
+            repo: repo.into(),
+            branch: branch.into(),
+            generation,
+            commit,
+        }
+    }
+    pub fn workspace(&self) -> &str {
+        &self.workspace
+    }
+    pub fn repo(&self) -> &str {
+        &self.repo
+    }
+    pub fn branch(&self) -> &str {
+        &self.branch
+    }
+    pub fn generation(&self) -> Option<u64> {
+        self.generation
+    }
+    pub fn commit(&self) -> Option<&str> {
+        self.commit.as_deref()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -291,12 +337,6 @@ impl ArtifactScheduler {
         limits: SchedulerLimits,
         verifier: Arc<dyn CompletionVerifier>,
     ) -> Result<Self> {
-        validate_limits(&limits)?;
-        let verifier_id = verifier.identity().trim();
-        if verifier_id.is_empty() {
-            bail!("completion verifier identity is empty")
-        }
-        let fingerprint = scheduler_fingerprint(&limits, verifier_id);
         let opts = SqliteConnectOptions::from_str(path)?
             .create_if_missing(true)
             .busy_timeout(Duration::from_secs(10))
@@ -305,6 +345,23 @@ impl ArtifactScheduler {
             .max_connections(8)
             .connect_with(opts)
             .await?;
+        Self::from_pool(pool, limits, verifier).await
+    }
+
+    /// Construct the scheduler on an existing metadata pool. This is the
+    /// production path: ref metadata and artifact scheduling share one
+    /// authenticated SQLite database instead of opening a second DSN.
+    pub async fn from_pool(
+        pool: SqlitePool,
+        limits: SchedulerLimits,
+        verifier: Arc<dyn CompletionVerifier>,
+    ) -> Result<Self> {
+        validate_limits(&limits)?;
+        let verifier_id = verifier.identity().trim();
+        if verifier_id.is_empty() {
+            bail!("completion verifier identity is empty")
+        }
+        let fingerprint = scheduler_fingerprint(&limits, verifier_id);
         let prior_version: i64 = sqlx::query_scalar("PRAGMA user_version")
             .fetch_one(&pool)
             .await?;
@@ -542,8 +599,11 @@ impl ArtifactScheduler {
     }
 
     /// Atomically accept an observation and subscribe every requested kind.
-    /// `expected_generation` is a durable CAS token obtained from the prior
-    /// accepted observation; a loser must re-resolve upstream and retry.
+    /// `expected_generation` is the durable CAS token from
+    /// [`Self::observation_snapshot`]. A different-commit loser must re-resolve
+    /// upstream; an identical commit with all requested kinds/formats already
+    /// observed returns [`ObservationOutcome::Unchanged`] without generation
+    /// churn or scheduling.
     pub async fn observe(
         &self,
         workspace: &str,
@@ -554,6 +614,8 @@ impl ArtifactScheduler {
         format_version: u32,
         expected_generation: Option<u64>,
     ) -> Result<ObservationOutcome> {
+        validate_observation_identity(workspace, repo, branch, "write")?;
+        validate_resolved_commit(commit)?;
         validate_format_version(format_version)?;
         if kinds.is_empty() {
             bail!("observation requests no artifact kinds")
@@ -566,8 +628,15 @@ impl ArtifactScheduler {
         }
         let mut c = self.immediate().await?;
         let result:Result<ObservationOutcome>=async{
-   let current:Option<i64>=sqlx::query_scalar("SELECT generation FROM branch_observations WHERE workspace=? AND repo=? AND branch=?").bind(workspace).bind(repo).bind(branch).fetch_optional(&mut *c).await?;
-   let current=current.map(|v|v as u64);
+   let current:Option<(i64,String)>=sqlx::query_as("SELECT generation,desired_commit FROM branch_observations WHERE workspace=? AND repo=? AND branch=?").bind(workspace).bind(repo).bind(branch).fetch_optional(&mut *c).await?;
+   let current_generation=current.as_ref().map(|(v,_)|*v as u64);
+   let same_commit=current.as_ref().is_some_and(|(_,current_commit)|current_commit==commit);
+   let mut fully_observed=same_commit;
+   if same_commit { for kind in &unique { let present:i64=sqlx::query_scalar("SELECT count(*) FROM artifact_observations WHERE workspace=? AND repo=? AND branch=? AND kind=? AND desired_commit=? AND format_version=?").bind(workspace).bind(repo).bind(branch).bind(kind.as_str()).bind(commit).bind(format_version as i64).fetch_one(&mut *c).await?; fully_observed &= present==1; } }
+   if fully_observed {
+    return Ok(ObservationOutcome::Unchanged{generation:current_generation.context("existing observation has no generation")?})
+   }
+   let current=current_generation;
    if current!=expected_generation{return Ok(ObservationOutcome::Stale{current_generation:current.unwrap_or(0)})}
    let generation=current.unwrap_or(0).checked_add(1).context("observation generation overflow")?;
    // Credit superseded queued work before capacity admission. The transaction
@@ -597,6 +666,37 @@ impl ArtifactScheduler {
    Ok(ObservationOutcome::Accepted{generation,artifacts})
   }.await;
         finish(c, result).await
+    }
+
+    /// Read the CAS token and commit that must bracket an upstream resolution.
+    /// Passing this generation to [`Self::observe`] prevents a late fetch from
+    /// overwriting a newer force-push observation; an identical commit is an
+    /// atomic no-op even if another observer won first.
+    pub async fn observation_snapshot(
+        &self,
+        workspace: &str,
+        repo: &str,
+        branch: &str,
+    ) -> Result<ObservationSnapshot> {
+        validate_observation_identity(workspace, repo, branch, "snapshot")?;
+        let row: Option<(i64, String)> = sqlx::query_as(
+            "SELECT generation,desired_commit FROM branch_observations WHERE workspace=? AND repo=? AND branch=?",
+        )
+        .bind(workspace)
+        .bind(repo)
+        .bind(branch)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(match row {
+            Some((generation, commit)) => ObservationSnapshot::new(
+                workspace,
+                repo,
+                branch,
+                Some(generation as u64),
+                Some(commit),
+            ),
+            None => ObservationSnapshot::new(workspace, repo, branch, None, None),
+        })
     }
 
     pub async fn retry_failed(&self, key: &ArtifactKey) -> Result<RetryOutcome> {
@@ -1035,6 +1135,34 @@ pub(crate) fn validate_format_version(version: u32) -> Result<()> {
     }
     Ok(())
 }
+pub(crate) fn validate_observation_identity(
+    workspace: &str,
+    repo: &str,
+    branch: &str,
+    operation: &str,
+) -> Result<()> {
+    if workspace.trim().is_empty() || repo.trim().is_empty() || branch.trim().is_empty() {
+        bail!("artifact observation {operation} has an empty workspace, repo, or branch")
+    }
+    Ok(())
+}
+pub(crate) fn validate_resolved_commit(commit: &str) -> Result<()> {
+    if commit.trim().is_empty() {
+        bail!("resolved artifact commit is empty")
+    }
+    Ok(())
+}
+pub(crate) fn validate_canonical_commit_oid(commit: &str) -> Result<()> {
+    validate_resolved_commit(commit)?;
+    if commit.len() != 40
+        || !commit
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("resolved artifact commit is not a canonical Git object id")
+    }
+    Ok(())
+}
 pub(crate) fn validate_limits(l: &SchedulerLimits) -> Result<()> {
     if l.total_backlog == 0
         || l.workspace_backlog == 0
@@ -1160,6 +1288,231 @@ mod tests {
                 .count(),
             1
         )
+    }
+
+    #[tokio::test]
+    async fn concurrent_same_branch_same_tip_is_one_accept_and_one_atomic_noop() {
+        let (a, _d, p) = scheduler(Default::default()).await;
+        let b = ArtifactScheduler::open(&p, Default::default())
+            .await
+            .unwrap();
+        let (left, right) = tokio::join!(
+            a.observe(
+                "ws",
+                "o/r",
+                "main",
+                "same-tip",
+                &[ArtifactKind::Head, ArtifactKind::FullHistory],
+                1,
+                None,
+            ),
+            b.observe(
+                "ws",
+                "o/r",
+                "main",
+                "same-tip",
+                &[ArtifactKind::Head, ArtifactKind::FullHistory],
+                1,
+                None,
+            )
+        );
+        let outcomes = [left.unwrap(), right.unwrap()];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(
+                    outcome,
+                    ObservationOutcome::Accepted { generation: 1, .. }
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(
+                    outcome,
+                    ObservationOutcome::Unchanged { generation: 1 }
+                ))
+                .count(),
+            1
+        );
+        let snapshot = a.observation_snapshot("ws", "o/r", "main").await.unwrap();
+        assert_eq!(snapshot.workspace(), "ws");
+        assert_eq!(snapshot.repo(), "o/r");
+        assert_eq!(snapshot.branch(), "main");
+        assert_eq!(snapshot.generation(), Some(1));
+        assert_eq!(snapshot.commit(), Some("same-tip"));
+        assert_eq!(
+            a.counts()
+                .await
+                .unwrap()
+                .iter()
+                .map(|(_, _, n)| n)
+                .sum::<u64>(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_force_push_resolution_cannot_overwrite_newer_observation() {
+        let (scheduler, _d, _p) = scheduler(Default::default()).await;
+        scheduler
+            .observe("ws", "o/r", "main", "t1", &[ArtifactKind::Head], 1, None)
+            .await
+            .unwrap();
+        let snapshot = scheduler
+            .observation_snapshot("ws", "o/r", "main")
+            .await
+            .unwrap();
+        assert_eq!(snapshot.generation(), Some(1));
+        assert!(matches!(
+            crate::artifact_scheduler_backend::ArtifactSchedulerPersistence::observe_if_changed(
+                &scheduler,
+                &snapshot,
+                "2222222222222222222222222222222222222222",
+                &[ArtifactKind::Head],
+                1,
+            )
+            .await
+            .unwrap(),
+            ObservationOutcome::Accepted { generation: 2, .. }
+        ));
+        assert_eq!(
+            crate::artifact_scheduler_backend::ArtifactSchedulerPersistence::observe_if_changed(
+                &scheduler,
+                &snapshot,
+                "3333333333333333333333333333333333333333",
+                &[ArtifactKind::Head],
+                1,
+            )
+            .await
+            .unwrap(),
+            ObservationOutcome::Stale {
+                current_generation: 2,
+            }
+        );
+        assert_eq!(
+            scheduler
+                .observation_snapshot("ws", "o/r", "main")
+                .await
+                .unwrap()
+                .commit(),
+            Some("2222222222222222222222222222222222222222")
+        );
+        for invalid in [
+            "",
+            "short",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "gggggggggggggggggggggggggggggggggggggggg",
+            "1111111111111111111111111111111111111111111111111111111111111111",
+        ] {
+            assert!(
+                crate::artifact_scheduler_backend::ArtifactSchedulerPersistence::observe_if_changed(
+                    &scheduler,
+                    &snapshot,
+                    invalid,
+                    &[ArtifactKind::Head],
+                    1,
+                )
+                .await
+                .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn same_tip_only_noops_when_every_requested_kind_and_format_is_observed() {
+        let (scheduler, _d, _p) = scheduler(Default::default()).await;
+        scheduler
+            .observe("ws", "o/r", "main", "tip", &[ArtifactKind::Head], 1, None)
+            .await
+            .unwrap();
+        assert!(matches!(
+            scheduler
+                .observe(
+                    "ws",
+                    "o/r",
+                    "main",
+                    "tip",
+                    &[ArtifactKind::Head, ArtifactKind::Files],
+                    1,
+                    Some(1),
+                )
+                .await
+                .unwrap(),
+            ObservationOutcome::Accepted { generation: 2, .. }
+        ));
+        assert!(matches!(
+            scheduler
+                .observe(
+                    "ws",
+                    "o/r",
+                    "main",
+                    "tip",
+                    &[ArtifactKind::Head, ArtifactKind::Files],
+                    2,
+                    Some(2),
+                )
+                .await
+                .unwrap(),
+            ObservationOutcome::Accepted { generation: 3, .. }
+        ));
+        assert_eq!(
+            scheduler
+                .observe(
+                    "ws",
+                    "o/r",
+                    "main",
+                    "tip",
+                    &[ArtifactKind::Files, ArtifactKind::Head],
+                    2,
+                    Some(0),
+                )
+                .await
+                .unwrap(),
+            ObservationOutcome::Unchanged { generation: 3 }
+        );
+    }
+
+    #[tokio::test]
+    async fn observation_snapshot_and_write_reject_ambiguous_empty_identity() {
+        let (scheduler, _d, _p) = scheduler(Default::default()).await;
+        for (workspace, repo, branch) in [
+            ("", "o/r", "main"),
+            ("ws", "\t", "main"),
+            ("ws", "o/r", "\n"),
+        ] {
+            assert!(
+                scheduler
+                    .observation_snapshot(workspace, repo, branch)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                scheduler
+                    .observe(
+                        workspace,
+                        repo,
+                        branch,
+                        "tip",
+                        &[ArtifactKind::Head],
+                        1,
+                        None,
+                    )
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(scheduler.counts().await.unwrap().is_empty());
+        for commit in ["", " ", "\t\n"] {
+            assert!(
+                scheduler
+                    .observe("ws", "o/r", "main", commit, &[ArtifactKind::Head], 1, None,)
+                    .await
+                    .is_err()
+            );
+        }
     }
 
     #[tokio::test]
@@ -1851,9 +2204,7 @@ mod tests {
             )
             .await
             .unwrap(),
-            ObservationOutcome::Stale {
-                current_generation: 1
-            }
+            ObservationOutcome::Unchanged { generation: 1 }
         );
         assert!(matches!(
             s.observe(
@@ -1867,7 +2218,7 @@ mod tests {
             )
             .await
             .unwrap(),
-            ObservationOutcome::Accepted { generation: 2, .. }
+            ObservationOutcome::Unchanged { generation: 1 }
         ));
     }
 

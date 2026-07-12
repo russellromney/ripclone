@@ -26,6 +26,18 @@ impl SqliteMeta {
             .with_context(|| format!("open sqlite metadata db {path}"))?;
         Ok(Self { pool })
     }
+
+    /// Construct the normalized artifact scheduler on the same pool as ref
+    /// metadata. Keeping one pool is important for in-memory SQLite URLs and
+    /// avoids a second credentials/configuration path in production.
+    pub async fn artifact_scheduler(
+        &self,
+        limits: crate::artifact_scheduler::SchedulerLimits,
+        verifier: std::sync::Arc<dyn crate::artifact_scheduler::CompletionVerifier>,
+    ) -> Result<crate::artifact_scheduler::ArtifactScheduler> {
+        crate::artifact_scheduler::ArtifactScheduler::from_pool(self.pool.clone(), limits, verifier)
+            .await
+    }
 }
 
 #[async_trait]
@@ -255,5 +267,73 @@ impl MetaDb for SqliteMeta {
             .await
             .context("sqlite metadata health")?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::artifact_manifest::CasCompletionVerifier;
+    use crate::artifact_scheduler::{ArtifactKind, ObservationOutcome, SchedulerLimits};
+    use crate::cas::Cas;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn metadata_and_scheduler_share_one_sqlite_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir
+            .path()
+            .join("metadata.db")
+            .to_string_lossy()
+            .into_owned();
+        let metadata = SqliteMeta::connect(&path).await.unwrap();
+        metadata.init().await.unwrap();
+        let verifier = Arc::new(CasCompletionVerifier::new(
+            Cas::new(dir.path().join("cas")).unwrap(),
+        ));
+        let scheduler = metadata
+            .artifact_scheduler(SchedulerLimits::default(), verifier.clone())
+            .await
+            .unwrap();
+        metadata
+            .add_repo("workspace/repo", r#"{"state":"initializing"}"#)
+            .await
+            .unwrap();
+        assert!(matches!(
+            scheduler
+                .observe(
+                    "workspace",
+                    "repo",
+                    "main",
+                    "tip",
+                    &[ArtifactKind::Head],
+                    1,
+                    None,
+                )
+                .await
+                .unwrap(),
+            ObservationOutcome::Accepted { generation: 1, .. }
+        ));
+
+        let reopened = SqliteMeta::connect(&path).await.unwrap();
+        assert!(
+            reopened
+                .get_added_repo("workspace/repo")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let scheduler = reopened
+            .artifact_scheduler(SchedulerLimits::default(), verifier)
+            .await
+            .unwrap();
+        assert_eq!(
+            scheduler
+                .observation_snapshot("workspace", "repo", "main")
+                .await
+                .unwrap()
+                .commit(),
+            Some("tip")
+        );
     }
 }

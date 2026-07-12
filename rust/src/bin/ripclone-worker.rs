@@ -170,7 +170,7 @@ async fn main() -> Result<()> {
         };
 
     let metrics = Metrics::new();
-    let b = Backends::from_env(&args.cas_dir, &args.repo_root, &metrics).await?;
+    let b = Backends::from_env_for_runtime(&args.cas_dir, &args.repo_root, &metrics).await?;
     let state = ServerState::for_worker(b, build_queue, metrics)?;
 
     // Fleet-unique id (host/machine + pid + start nanos). PID-only collides

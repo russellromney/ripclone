@@ -6,8 +6,9 @@
 
 use crate::artifact_scheduler::{
     ArtifactKey, ArtifactKind, ArtifactRecord, ArtifactState, ClaimedArtifact, CompletionEvidence,
-    CompletionVerifier, FailureClass, ObservationOutcome, RetryOutcome, ScheduleOutcome,
-    SchedulerLimits, scheduler_fingerprint, validate_evidence, validate_lease, validate_limits,
+    CompletionVerifier, FailureClass, ObservationOutcome, ObservationSnapshot, RetryOutcome,
+    ScheduleOutcome, SchedulerLimits, scheduler_fingerprint, validate_evidence, validate_lease,
+    validate_limits, validate_resolved_commit,
 };
 use crate::artifact_scheduler_backend::ArtifactSchedulerPersistence;
 use anyhow::{Context, Result, bail};
@@ -1066,6 +1067,7 @@ impl ArtifactSchedulerPersistence for MysqlArtifactScheduler {
         expected_generation: Option<u64>,
     ) -> Result<ObservationOutcome> {
         validate_mysql_identity(workspace, repo, Some(branch))?;
+        validate_resolved_commit(commit)?;
         check_mysql_len("commit", commit, 64)?;
         if kinds.is_empty() {
             bail!("observation requests no artifact kinds")
@@ -1080,8 +1082,8 @@ impl ArtifactSchedulerPersistence for MysqlArtifactScheduler {
             }
         }
         let (mut tx, now) = self.controlled().await?;
-        let current: Option<i64> = sqlx::query_scalar(
-            "SELECT generation FROM branch_observations
+        let current: Option<(i64, String)> = sqlx::query_as(
+            "SELECT generation,desired_commit FROM branch_observations
              WHERE workspace=? AND repo=? AND branch=?",
         )
         .bind(workspace)
@@ -1089,7 +1091,28 @@ impl ArtifactSchedulerPersistence for MysqlArtifactScheduler {
         .bind(branch)
         .fetch_optional(&mut *tx)
         .await?;
-        let current = current.map(|value| value as u64);
+        let current_generation = current.as_ref().map(|(value, _)| *value as u64);
+        let same_commit = current
+            .as_ref()
+            .is_some_and(|(_, current_commit)| current_commit == commit);
+        let mut fully_observed = same_commit;
+        if same_commit {
+            for kind in &unique {
+                let present: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM artifact_observations WHERE workspace=? AND repo=? AND branch=? AND kind=? AND desired_commit=? AND format_version=?",
+                )
+                .bind(workspace).bind(repo).bind(branch).bind(kind.as_str()).bind(commit)
+                .bind(format_version as i64).fetch_one(&mut *tx).await?;
+                fully_observed &= present == 1;
+            }
+        }
+        if fully_observed {
+            tx.rollback().await?;
+            return Ok(ObservationOutcome::Unchanged {
+                generation: current_generation.context("existing observation has no generation")?,
+            });
+        }
+        let current = current_generation;
         if current != expected_generation {
             tx.rollback().await?;
             return Ok(ObservationOutcome::Stale {
@@ -1250,6 +1273,33 @@ impl ArtifactSchedulerPersistence for MysqlArtifactScheduler {
         };
         tx.commit().await?;
         Ok(outcome)
+    }
+
+    async fn observation_snapshot(
+        &self,
+        workspace: &str,
+        repo: &str,
+        branch: &str,
+    ) -> Result<ObservationSnapshot> {
+        validate_mysql_identity(workspace, repo, Some(branch))?;
+        let row: Option<(i64, String)> = sqlx::query_as(
+            "SELECT generation,desired_commit FROM branch_observations WHERE workspace=? AND repo=? AND branch=?",
+        )
+        .bind(workspace)
+        .bind(repo)
+        .bind(branch)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(match row {
+            Some((generation, commit)) => ObservationSnapshot::new(
+                workspace,
+                repo,
+                branch,
+                Some(generation as u64),
+                Some(commit),
+            ),
+            None => ObservationSnapshot::new(workspace, repo, branch, None, None),
+        })
     }
 
     async fn claim(&self, owner: &str, lease_secs: i64) -> Result<Option<ClaimedArtifact>> {
@@ -1806,6 +1856,25 @@ mod tests {
                 .filter(|v| matches!(v, Ok(ObservationOutcome::Accepted { .. })))
                 .count(),
             1
+        );
+        let snapshot = a
+            .observation_snapshot("ws", "owner/repo", "main")
+            .await
+            .unwrap();
+        assert_eq!(snapshot.generation(), Some(1));
+        assert_eq!(
+            b.observe(
+                "ws",
+                "owner/repo",
+                "main",
+                snapshot.commit().unwrap(),
+                &[ArtifactKind::Files, ArtifactKind::Head],
+                1,
+                None,
+            )
+            .await
+            .unwrap(),
+            ObservationOutcome::Unchanged { generation: 1 }
         );
         assert_eq!(
             a.counts()

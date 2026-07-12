@@ -6,9 +6,10 @@
 
 use crate::artifact_scheduler::{
     ArtifactKey, ArtifactKind, ArtifactRecord, ArtifactState, ClaimedArtifact, CompletionEvidence,
-    CompletionVerifier, FailureClass, ObservationOutcome, RetryOutcome, ScheduleOutcome,
-    SchedulerLimits, scheduler_fingerprint, validate_evidence, validate_format_version,
-    validate_lease, validate_limits,
+    CompletionVerifier, FailureClass, ObservationOutcome, ObservationSnapshot, RetryOutcome,
+    ScheduleOutcome, SchedulerLimits, scheduler_fingerprint, validate_evidence,
+    validate_format_version, validate_lease, validate_limits, validate_observation_identity,
+    validate_resolved_commit,
 };
 use crate::artifact_scheduler_backend::ArtifactSchedulerPersistence;
 use anyhow::{Context, Result, bail};
@@ -255,6 +256,8 @@ impl ArtifactSchedulerPersistence for LibsqlArtifactScheduler {
         v: u32,
         expected: Option<u64>,
     ) -> Result<ObservationOutcome> {
+        validate_observation_identity(w, r, b, "write")?;
+        validate_resolved_commit(c)?;
         validate_format_version(v)?;
         if kinds.is_empty() {
             bail!("observation requests no artifact kinds")
@@ -264,7 +267,13 @@ impl ArtifactSchedulerPersistence for LibsqlArtifactScheduler {
         kinds.dedup();
         let tx = self.tx().await?;
         let result=async{
-   let current=opt_i64(&tx,"SELECT generation FROM branch_observations WHERE workspace=? AND repo=? AND branch=?",vec![w.into(),r.into(),b.into()]).await?.map(|x|x as u64);
+   let current=query_one(&tx,"SELECT generation,desired_commit FROM branch_observations WHERE workspace=? AND repo=? AND branch=?",vec![w.into(),r.into(),b.into()]).await?;
+   let current_generation=current.as_ref().map(|row|row.get::<i64>(0)).transpose()?.map(|x|x as u64);
+   let same_commit=current.as_ref().map(|row|row.get::<String>(1)).transpose()?.as_deref()==Some(c);
+   let mut fully_observed=same_commit;
+   if same_commit{for kind in &kinds{fully_observed &= one_i64(&tx,"SELECT count(*) FROM artifact_observations WHERE workspace=? AND repo=? AND branch=? AND kind=? AND desired_commit=? AND format_version=?",vec![w.into(),r.into(),b.into(),kind.as_str().into(),c.into(),(v as i64).into()]).await?==1;}}
+   if fully_observed{return Ok(ObservationOutcome::Unchanged{generation:current_generation.context("existing observation has no generation")?})}
+   let current=current_generation;
    if current!=expected{return Ok(ObservationOutcome::Stale{current_generation:current.unwrap_or(0)})}let generation=current.unwrap_or(0).checked_add(1).context("observation generation overflow")?;
    for kind in &kinds {exec(&tx,"DELETE FROM artifact_jobs WHERE state='queued' AND id IN(SELECT desired_artifact_id FROM artifact_observations WHERE workspace=? AND repo=? AND branch=? AND kind=?) AND id NOT IN(SELECT desired_artifact_id FROM artifact_observations WHERE NOT(workspace=? AND repo=? AND branch=? AND kind=?)) AND id NOT IN(SELECT artifact_id FROM artifact_consumers)",vec![w.into(),r.into(),b.into(),kind.as_str().into(),w.into(),r.into(),b.into(),kind.as_str().into()]).await?;}
    let mut additions=Vec::new();for kind in &kinds {let key=ArtifactKey{workspace:w.into(),repo:r.into(),commit:c.into(),kind:*kind,format_version:v};if get_key(&tx,&key).await?.is_none(){additions.push(*kind)}}self.preflight(&tx,w,&additions).await?;
@@ -272,6 +281,21 @@ impl ArtifactSchedulerPersistence for LibsqlArtifactScheduler {
    exec(&tx,"INSERT INTO branch_observations(workspace,repo,branch,generation,desired_commit,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(workspace,repo,branch) DO UPDATE SET generation=excluded.generation,desired_commit=excluded.desired_commit,updated_at=excluded.updated_at",vec![w.into(),r.into(),b.into(),(generation as i64).into(),c.into(),now(&tx).await?.into()]).await?;
    exec(&tx,"DELETE FROM artifact_jobs WHERE workspace=? AND repo=? AND state='queued' AND id NOT IN(SELECT desired_artifact_id FROM artifact_observations) AND id NOT IN(SELECT artifact_id FROM artifact_consumers)",vec![w.into(),r.into()]).await?;Ok(ObservationOutcome::Accepted{generation,artifacts})}.await;
         finish(tx, result).await
+    }
+    async fn observation_snapshot(&self, w: &str, r: &str, b: &str) -> Result<ObservationSnapshot> {
+        validate_observation_identity(w, r, b, "snapshot")?;
+        let conn = self.conn().await?;
+        let row=query_one(&conn,"SELECT generation,desired_commit FROM branch_observations WHERE workspace=? AND repo=? AND branch=?",vec![w.into(),r.into(),b.into()]).await?;
+        Ok(match row {
+            Some(row) => ObservationSnapshot::new(
+                w,
+                r,
+                b,
+                Some(row.get::<i64>(0)? as u64),
+                Some(row.get::<String>(1)?),
+            ),
+            None => ObservationSnapshot::new(w, r, b, None, None),
+        })
     }
     async fn retry_failed(&self, key: &ArtifactKey) -> Result<RetryOutcome> {
         validate_format_version(key.format_version)?;
@@ -912,6 +936,26 @@ mod tests {
             o,
             ObservationOutcome::Accepted { generation: 1, .. }
         ));
+        assert_eq!(
+            b.observe(
+                "w",
+                "r",
+                "main",
+                "c1",
+                &[ArtifactKind::Files, ArtifactKind::Head],
+                1,
+                None,
+            )
+            .await
+            .unwrap(),
+            ObservationOutcome::Unchanged { generation: 1 }
+        );
+        let snapshot = b.observation_snapshot("w", "r", "main").await.unwrap();
+        assert_eq!(snapshot.workspace(), "w");
+        assert_eq!(snapshot.repo(), "r");
+        assert_eq!(snapshot.branch(), "main");
+        assert_eq!(snapshot.generation(), Some(1));
+        assert_eq!(snapshot.commit(), Some("c1"));
         assert!(matches!(
             b.observe("w", "r", "main", "c2", &[ArtifactKind::Head], 1, None)
                 .await

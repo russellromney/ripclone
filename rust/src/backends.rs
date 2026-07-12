@@ -8,6 +8,9 @@
 
 use crate::api_job_queue::ApiJobQueue;
 use crate::api_ref_store::ApiRefStore;
+use crate::artifact_manifest::CasCompletionVerifier;
+use crate::artifact_scheduler::{CompletionVerifier, SchedulerLimits};
+use crate::artifact_scheduler_backend::ArtifactSchedulerPersistence;
 use crate::cas::Cas;
 use crate::config::Config;
 use crate::metrics::Metrics;
@@ -57,6 +60,9 @@ pub struct Backends {
     pub ref_store: Arc<dyn RefStore>,
     pub retention: Arc<Retention>,
     pub repo_root: PathBuf,
+    /// Normalized artifact scheduler. Present only when the caller explicitly
+    /// supplies a production completion verifier.
+    pub artifact_scheduler: Option<Arc<dyn ArtifactSchedulerPersistence>>,
 }
 
 impl Backends {
@@ -69,7 +75,56 @@ impl Backends {
         repo_root: &Path,
         metrics: &Arc<Metrics>,
     ) -> Result<Self> {
+        Self::from_env_inner(cas_dir, repo_root, metrics, SchedulerRequest::Disabled).await
+    }
+
+    /// Production server/worker backend selection. The normalized scheduler is
+    /// opt-in until typed builders replace the legacy build worker. Selecting
+    /// it constructs the real CAS verifier and fails startup on any unsupported
+    /// metadata/configuration; there is no fallback to the legacy scheduler.
+    pub async fn from_env_for_runtime(
+        cas_dir: &Path,
+        repo_root: &Path,
+        metrics: &Arc<Metrics>,
+    ) -> Result<Self> {
+        Self::from_env_inner(cas_dir, repo_root, metrics, artifact_scheduler_request()?).await
+    }
+
+    /// Build the regular backends and the normalized artifact scheduler on the
+    /// same SQL metadata connection. Callers must inject the production CAS
+    /// verifier; this API never substitutes the scheduler's structural test
+    /// verifier. Non-SQL metadata configurations fail closed.
+    pub async fn from_env_with_artifact_scheduler(
+        cas_dir: &Path,
+        repo_root: &Path,
+        metrics: &Arc<Metrics>,
+        limits: SchedulerLimits,
+        verifier: Arc<dyn CompletionVerifier>,
+    ) -> Result<Self> {
+        Self::from_env_inner(
+            cas_dir,
+            repo_root,
+            metrics,
+            SchedulerRequest::Injected(limits, verifier),
+        )
+        .await
+    }
+
+    async fn from_env_inner(
+        cas_dir: &Path,
+        repo_root: &Path,
+        metrics: &Arc<Metrics>,
+        scheduler: SchedulerRequest,
+    ) -> Result<Self> {
         let cas = Cas::new(cas_dir)?;
+        let scheduler = match scheduler {
+            SchedulerRequest::Disabled => None,
+            SchedulerRequest::Production => Some((
+                SchedulerLimits::default(),
+                Arc::new(CasCompletionVerifier::new(cas.clone())) as Arc<dyn CompletionVerifier>,
+            )),
+            SchedulerRequest::Injected(limits, verifier) => Some((limits, verifier)),
+        };
         let s3_storage =
             S3Storage::from_env_or_config(&config().storage).context("initialize S3 storage")?;
         let (storage, s3): (StorageRef, Option<Arc<S3Storage>>) = if let Some(s3) = s3_storage {
@@ -83,7 +138,8 @@ impl Backends {
             info!("using local storage at {}", cas_dir.display());
             (local(cas_dir)?, None)
         };
-        let ref_store = select_metadata(repo_root, s3.as_ref()).await?;
+        let (ref_store, artifact_scheduler) =
+            select_metadata(repo_root, s3.as_ref(), scheduler).await?;
         let retention = Arc::new(
             Retention::with_config_and_storage(
                 cas.clone(),
@@ -103,7 +159,31 @@ impl Backends {
             ref_store,
             retention,
             repo_root: repo_root.to_path_buf(),
+            artifact_scheduler,
         })
+    }
+}
+
+enum SchedulerRequest {
+    Disabled,
+    Production,
+    Injected(SchedulerLimits, Arc<dyn CompletionVerifier>),
+}
+
+fn artifact_scheduler_request() -> Result<SchedulerRequest> {
+    let mode = std::env::var("RIPCLONE_ARTIFACT_SCHEDULER").ok();
+    parse_artifact_scheduler_request(mode.as_deref())
+}
+
+fn parse_artifact_scheduler_request(mode: Option<&str>) -> Result<SchedulerRequest> {
+    let mode = mode.unwrap_or("legacy");
+    match mode {
+        "legacy" => Ok(SchedulerRequest::Disabled),
+        "normalized" => Ok(SchedulerRequest::Production),
+        other => anyhow::bail!(
+            "unknown RIPCLONE_ARTIFACT_SCHEDULER mode: {other:?} \
+             (expected 'legacy' or 'normalized')"
+        ),
     }
 }
 
@@ -118,12 +198,19 @@ impl Backends {
 async fn select_metadata(
     repo_root: &Path,
     s3: Option<&Arc<S3Storage>>,
-) -> Result<Arc<dyn RefStore>> {
+    scheduler: Option<(SchedulerLimits, Arc<dyn CompletionVerifier>)>,
+) -> Result<(
+    Arc<dyn RefStore>,
+    Option<Arc<dyn ArtifactSchedulerPersistence>>,
+)> {
     use crate::meta::MetaDb;
     use crate::meta::{LibsqlMeta, MysqlMeta, PostgresMeta, SqlRefStore, SqliteMeta};
 
     let kind =
         env_or("RIPCLONE_METADATA", config().metadata.backend.as_deref()).unwrap_or_default();
+    if scheduler.is_some() {
+        validate_scheduler_metadata_selection(&kind)?;
+    }
 
     // Warn when a SQL queue is paired with per-host file metadata. If the
     // workers run on other hosts, each reads and writes its own local ref files
@@ -145,34 +232,97 @@ async fn select_metadata(
 
     // Each arm wraps its concrete store in CachingRefStore (the read cache) and
     // coerces to Arc<dyn RefStore>.
-    let store: Arc<dyn RefStore> = match kind.as_str() {
+    let (store, artifact_scheduler): (
+        Arc<dyn RefStore>,
+        Option<Arc<dyn ArtifactSchedulerPersistence>>,
+    ) = match kind.as_str() {
         "" => {
+            if scheduler.is_some() {
+                anyhow::bail!(
+                    "artifact scheduler requires an explicit SQL metadata backend \
+                     (RIPCLONE_METADATA=sqlite|postgres|mysql|libsql)"
+                )
+            }
             // Backward compatible: metadata follows storage.
             if let Some(s3) = s3 {
                 info!("metadata store: s3 (default, follows storage)");
-                Arc::new(CachingRefStore::new(S3RefStore::new(s3.clone())))
+                (
+                    Arc::new(CachingRefStore::new(S3RefStore::new(s3.clone()))),
+                    None,
+                )
             } else {
                 info!("metadata store: file (default)");
-                Arc::new(CachingRefStore::new(FileRefStore::new(repo_root)))
+                (
+                    Arc::new(CachingRefStore::new(FileRefStore::new(repo_root))),
+                    None,
+                )
             }
         }
         "file" => {
+            if scheduler.is_some() {
+                anyhow::bail!("artifact scheduler is unavailable with RIPCLONE_METADATA=file")
+            }
             info!("metadata store: file");
-            Arc::new(CachingRefStore::new(FileRefStore::new(repo_root)))
+            (
+                Arc::new(CachingRefStore::new(FileRefStore::new(repo_root))),
+                None,
+            )
         }
         "s3" => {
+            if scheduler.is_some() {
+                anyhow::bail!("artifact scheduler is unavailable with RIPCLONE_METADATA=s3")
+            }
             let s3 = s3.context("RIPCLONE_METADATA=s3 requires S3 storage env (RIPCLONE_S3_*)")?;
             info!("metadata store: s3");
-            Arc::new(CachingRefStore::new(S3RefStore::new(s3.clone())))
+            (
+                Arc::new(CachingRefStore::new(S3RefStore::new(s3.clone()))),
+                None,
+            )
         }
         "sqlite" | "postgres" | "mysql" | "libsql" => {
             let url = env_or("RIPCLONE_METADATA_DB_URL", config().metadata.url.as_deref()).context(
                 "RIPCLONE_METADATA=sqlite|postgres|mysql|libsql requires RIPCLONE_METADATA_DB_URL (or [metadata].url)",
             )?;
-            let db: Box<dyn MetaDb> = match kind.as_str() {
-                "sqlite" => Box::new(SqliteMeta::connect(&url).await?),
-                "postgres" => Box::new(PostgresMeta::connect(&url).await?),
-                "mysql" => Box::new(MysqlMeta::connect(&url).await?),
+            let (db, artifact_scheduler): (
+                Box<dyn MetaDb>,
+                Option<Arc<dyn ArtifactSchedulerPersistence>>,
+            ) = match kind.as_str() {
+                "sqlite" => {
+                    let db = SqliteMeta::connect(&url).await?;
+                    let scheduler = match scheduler.as_ref() {
+                        Some((limits, verifier)) => Some(Arc::new(
+                            db.artifact_scheduler(limits.clone(), verifier.clone())
+                                .await?,
+                        )
+                            as Arc<dyn ArtifactSchedulerPersistence>),
+                        None => None,
+                    };
+                    (Box::new(db), scheduler)
+                }
+                "postgres" => {
+                    let db = PostgresMeta::connect(&url).await?;
+                    let scheduler = match scheduler.as_ref() {
+                        Some((limits, verifier)) => Some(Arc::new(
+                            db.artifact_scheduler(limits.clone(), verifier.clone())
+                                .await?,
+                        )
+                            as Arc<dyn ArtifactSchedulerPersistence>),
+                        None => None,
+                    };
+                    (Box::new(db), scheduler)
+                }
+                "mysql" => {
+                    let db = MysqlMeta::connect(&url).await?;
+                    let scheduler = match scheduler.as_ref() {
+                        Some((limits, verifier)) => Some(Arc::new(
+                            db.artifact_scheduler(limits.clone(), verifier.clone())
+                                .await?,
+                        )
+                            as Arc<dyn ArtifactSchedulerPersistence>),
+                        None => None,
+                    };
+                    (Box::new(db), scheduler)
+                }
                 "libsql" => {
                     if !is_remote_url(&url) {
                         anyhow::bail!(
@@ -182,26 +332,61 @@ async fn select_metadata(
                     }
                     let token = env_or("RIPCLONE_METADATA_DB_TOKEN", config().metadata.token.as_deref())
                         .context("RIPCLONE_METADATA=libsql requires RIPCLONE_METADATA_DB_TOKEN (or [metadata].token)")?;
-                    Box::new(LibsqlMeta::connect_remote(&url, &token).await?)
+                    let db = LibsqlMeta::connect_remote(&url, &token).await?;
+                    let scheduler = match scheduler.as_ref() {
+                        Some((limits, verifier)) => Some(Arc::new(
+                            db.artifact_scheduler(limits.clone(), verifier.clone())
+                                .await?,
+                        )
+                            as Arc<dyn ArtifactSchedulerPersistence>),
+                        None => None,
+                    };
+                    (Box::new(db), scheduler)
                 }
                 _ => unreachable!(),
             };
             info!("metadata store: {kind}");
-            Arc::new(CachingRefStore::new(SqlRefStore::new(db).await?))
+            (
+                Arc::new(CachingRefStore::new(SqlRefStore::new(db).await?)),
+                artifact_scheduler,
+            )
         }
         "api" => {
+            if scheduler.is_some() {
+                anyhow::bail!(
+                    "artifact scheduler cannot use RIPCLONE_METADATA=api; workers need a \
+                     scheduler API or direct SQL metadata connection"
+                )
+            }
             // Worker-only: POSTs ref-writes to the server. No DB URL, no DB token.
             // Fail loudly if the report URL or job token is missing (same style as
             // the libsql arm without its token).
             let store = ApiRefStore::from_env()?;
-            Arc::new(CachingRefStore::new(store))
+            (Arc::new(CachingRefStore::new(store)), None)
         }
         other => anyhow::bail!(
             "unknown RIPCLONE_METADATA backend: {other:?} \
              (expected 'file', 's3', 'sqlite', 'postgres', 'mysql', 'libsql', or 'api')"
         ),
     };
-    Ok(store)
+    Ok((store, artifact_scheduler))
+}
+
+fn validate_scheduler_metadata_selection(kind: &str) -> Result<()> {
+    match kind {
+        "sqlite" | "postgres" | "mysql" | "libsql" => Ok(()),
+        "" => anyhow::bail!(
+            "artifact scheduler requires an explicit SQL metadata backend \
+             (RIPCLONE_METADATA=sqlite|postgres|mysql|libsql)"
+        ),
+        "file" | "s3" | "api" => {
+            anyhow::bail!("artifact scheduler is unavailable with RIPCLONE_METADATA={kind}")
+        }
+        other => anyhow::bail!(
+            "unknown RIPCLONE_METADATA backend for artifact scheduler: {other:?} \
+             (expected 'sqlite', 'postgres', 'mysql', or 'libsql')"
+        ),
+    }
 }
 
 /// The selected queue backend (`RIPCLONE_QUEUE`, default `local`).
@@ -350,7 +535,10 @@ pub fn queue_db_url() -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::env_or;
+    use super::{
+        SchedulerRequest, env_or, parse_artifact_scheduler_request,
+        validate_scheduler_metadata_selection,
+    };
 
     #[test]
     fn env_or_prefers_env_then_config() {
@@ -367,5 +555,52 @@ mod tests {
         // Neither → None.
         unsafe { std::env::remove_var(key) };
         assert_eq!(env_or(key, None), None);
+    }
+
+    #[test]
+    fn artifact_scheduler_selection_is_explicit_sql_only() {
+        for kind in ["sqlite", "postgres", "mysql", "libsql"] {
+            assert!(
+                validate_scheduler_metadata_selection(kind).is_ok(),
+                "{kind}"
+            );
+        }
+        for kind in [
+            "",
+            "file",
+            "s3",
+            "api",
+            "LOCAL",
+            " sqlite",
+            "postgres ",
+            "bogus",
+        ] {
+            let error = validate_scheduler_metadata_selection(kind)
+                .expect_err("unsafe or malformed selection must fail closed")
+                .to_string();
+            assert!(error.contains("artifact scheduler"), "{kind:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn runtime_scheduler_cutover_selector_fails_closed() {
+        assert!(matches!(
+            parse_artifact_scheduler_request(None).unwrap(),
+            SchedulerRequest::Disabled
+        ));
+        assert!(matches!(
+            parse_artifact_scheduler_request(Some("legacy")).unwrap(),
+            SchedulerRequest::Disabled
+        ));
+        assert!(matches!(
+            parse_artifact_scheduler_request(Some("normalized")).unwrap(),
+            SchedulerRequest::Production
+        ));
+        for invalid in ["", "NORMALIZED", " normalized", "auto", "sqlite"] {
+            assert!(
+                parse_artifact_scheduler_request(Some(invalid)).is_err(),
+                "{invalid:?}"
+            );
+        }
     }
 }

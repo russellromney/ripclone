@@ -6,8 +6,8 @@
 
 use crate::artifact_scheduler::{
     ArtifactKey, ArtifactKind, ArtifactRecord, ArtifactTask, ClaimedArtifact, CompletionEvidence,
-    ExecutionContext, ExecutionOutcome, FailureClass, ObservationOutcome, RetryOutcome,
-    ScheduleOutcome, validate_evidence, validate_lease,
+    ExecutionContext, ExecutionOutcome, FailureClass, ObservationOutcome, ObservationSnapshot,
+    RetryOutcome, ScheduleOutcome, validate_evidence, validate_lease,
 };
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -40,6 +40,9 @@ pub trait ArtifactSchedulerPersistence: Send + Sync {
         ttl_secs: i64,
     ) -> Result<ScheduleOutcome>;
     async fn release_consumer(&self, artifact_id: i64, consumer_id: &str) -> Result<()>;
+    /// Atomically publish a resolved upstream tip using the generation returned
+    /// by [`Self::observation_snapshot`]. Implementations must return
+    /// `Unchanged` before the CAS check for an identical, fully-observed tip.
     async fn observe(
         &self,
         workspace: &str,
@@ -50,6 +53,36 @@ pub trait ArtifactSchedulerPersistence: Send + Sync {
         format_version: u32,
         expected_generation: Option<u64>,
     ) -> Result<ObservationOutcome>;
+    /// Snapshot the branch commit and generation before resolving upstream.
+    /// The later `observe` CAS fences concurrent fetches and force pushes.
+    async fn observation_snapshot(
+        &self,
+        workspace: &str,
+        repo: &str,
+        branch: &str,
+    ) -> Result<ObservationSnapshot>;
+    /// Safe production observation entry point. The snapshot carries its
+    /// workspace/repo/branch identity, preventing a generation token from one
+    /// branch being accidentally replayed against another.
+    async fn observe_if_changed(
+        &self,
+        snapshot: &ObservationSnapshot,
+        resolved_commit: &str,
+        kinds: &[ArtifactKind],
+        format_version: u32,
+    ) -> Result<ObservationOutcome> {
+        crate::artifact_scheduler::validate_canonical_commit_oid(resolved_commit)?;
+        self.observe(
+            snapshot.workspace(),
+            snapshot.repo(),
+            snapshot.branch(),
+            resolved_commit,
+            kinds,
+            format_version,
+            snapshot.generation(),
+        )
+        .await
+    }
     async fn retry_failed(&self, key: &ArtifactKey) -> Result<RetryOutcome>;
     async fn claim(&self, owner: &str, lease_secs: i64) -> Result<Option<ClaimedArtifact>>;
     async fn heartbeat(
@@ -216,6 +249,9 @@ impl ArtifactSchedulerPersistence for crate::artifact_scheduler::ArtifactSchedul
         g: Option<u64>,
     ) -> Result<ObservationOutcome> {
         self.observe(w, r, b, c, k, v, g).await
+    }
+    async fn observation_snapshot(&self, w: &str, r: &str, b: &str) -> Result<ObservationSnapshot> {
+        self.observation_snapshot(w, r, b).await
     }
     async fn retry_failed(&self, key: &ArtifactKey) -> Result<RetryOutcome> {
         self.retry_failed(key).await

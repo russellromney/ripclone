@@ -95,6 +95,10 @@ pub struct ServerState {
     pub storage: StorageRef,
     pub repo_root: PathBuf,
     pub ref_store: Arc<dyn RefStore>,
+    /// Normalized typed-artifact scheduler selected for the production runtime.
+    /// `None` while the explicit legacy mode remains selected.
+    pub artifact_scheduler:
+        Option<Arc<dyn crate::artifact_scheduler_backend::ArtifactSchedulerPersistence>>,
     /// Per-repo / per-branch build configuration (ROADMAP §2a). Read at build
     /// time; absent config means today's default (shallow + full).
     pub repo_config: Arc<crate::repo_config::RepoConfigStore>,
@@ -165,6 +169,53 @@ pub struct ServerState {
 }
 
 impl ServerState {
+    /// Snapshot one branch before resolving its upstream tip. Normalized-mode
+    /// trigger paths must pair this with [`Self::observe_resolved_artifacts`]
+    /// instead of calling the low-level generation primitive directly.
+    pub async fn artifact_observation_snapshot(
+        &self,
+        workspace: &str,
+        repo: &str,
+        branch: &str,
+    ) -> Result<crate::artifact_scheduler::ObservationSnapshot> {
+        self.artifact_scheduler
+            .as_ref()
+            .context("normalized artifact scheduler is not selected")?
+            .observation_snapshot(workspace, repo, branch)
+            .await
+    }
+
+    /// Atomically no-op an unchanged exact tip or schedule the requested typed
+    /// siblings behind the snapshot generation fence.
+    pub async fn observe_resolved_artifacts(
+        &self,
+        snapshot: &crate::artifact_scheduler::ObservationSnapshot,
+        resolved_commit: &str,
+        kinds: &[crate::artifact_scheduler::ArtifactKind],
+        format_version: u32,
+    ) -> Result<crate::artifact_scheduler::ObservationOutcome> {
+        self.artifact_scheduler
+            .as_ref()
+            .context("normalized artifact scheduler is not selected")?
+            .observe_if_changed(snapshot, resolved_commit, kinds, format_version)
+            .await
+    }
+
+    /// Backend-neutral claim surface for the typed artifact worker wave. It is
+    /// intentionally separate from the legacy `BuildJob` queue; this wave does
+    /// not claim work until a real typed builder is installed.
+    pub async fn claim_artifact(
+        &self,
+        owner: &str,
+        lease_secs: i64,
+    ) -> Result<Option<crate::artifact_scheduler::ClaimedArtifact>> {
+        self.artifact_scheduler
+            .as_ref()
+            .context("normalized artifact scheduler is not selected")?
+            .claim(owner, lease_secs)
+            .await
+    }
+
     /// Assemble state for a standalone `ripclone-worker`. It uses the real
     /// durable backends but none of the HTTP-only features (auth, rate limiting,
     /// OIDC, fault injection) since it never serves requests — it only runs
@@ -184,6 +235,7 @@ impl ServerState {
             storage: b.storage,
             repo_root: b.repo_root,
             ref_store: b.ref_store,
+            artifact_scheduler: b.artifact_scheduler,
             provider_registry,
             broker,
             token_hash: None,
@@ -1824,6 +1876,11 @@ async fn readyz(State(state): State<ServerState>) -> impl IntoResponse {
 
     if let Err(e) = state.ref_store.health().await {
         problems.push(format!("ref_store: {e:#}"));
+    }
+    if let Some(scheduler) = &state.artifact_scheduler
+        && let Err(e) = scheduler.counts().await
+    {
+        problems.push(format!("artifact_scheduler: {e:#}"));
     }
 
     let ready = problems.is_empty();
@@ -8611,7 +8668,7 @@ pub async fn run_server_with_barrier(
 
     let metrics = Metrics::new();
     // Pluggable storage + metadata store + retention, shared with ripclone-worker.
-    let b = backends::Backends::from_env(cas_dir, repo_root, &metrics).await?;
+    let b = backends::Backends::from_env_for_runtime(cas_dir, repo_root, &metrics).await?;
     let retention_interval: Duration = env::var("RIPCLONE_RETENTION_INTERVAL_SECS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -8680,6 +8737,7 @@ pub async fn run_server_with_barrier(
         storage: b.storage,
         repo_root: repo_root.to_path_buf(),
         ref_store: b.ref_store,
+        artifact_scheduler: b.artifact_scheduler,
         provider_registry,
         broker,
         token_hash: Some(token_hash),
@@ -9044,6 +9102,7 @@ mod tests {
             storage,
             repo_root,
             ref_store,
+            artifact_scheduler: None,
             provider_registry,
             broker,
             token_hash: Some(token_hash),
@@ -11555,6 +11614,51 @@ mod tests {
         let app = build_app(state);
         let response = app.oneshot(test_request("GET", "/readyz")).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn readyz_fails_when_selected_artifact_scheduler_is_unhealthy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = test_state(&tmp);
+        let path = tmp
+            .path()
+            .join("scheduler.db")
+            .to_string_lossy()
+            .into_owned();
+        let scheduler = crate::artifact_scheduler::ArtifactScheduler::open(
+            &path,
+            crate::artifact_scheduler::SchedulerLimits::default(),
+        )
+        .await
+        .unwrap();
+        state.artifact_scheduler = Some(Arc::new(scheduler));
+        let snapshot = state
+            .artifact_observation_snapshot("workspace", "repo", "main")
+            .await
+            .unwrap();
+        assert!(matches!(
+            state
+                .observe_resolved_artifacts(
+                    &snapshot,
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    &[crate::artifact_scheduler::ArtifactKind::Head],
+                    1,
+                )
+                .await
+                .unwrap(),
+            crate::artifact_scheduler::ObservationOutcome::Accepted { generation: 1, .. }
+        ));
+        assert!(state.claim_artifact("worker", 30).await.unwrap().is_some());
+        let pool = sqlx::SqlitePool::connect(&path).await.unwrap();
+        sqlx::query("DROP TABLE artifact_jobs")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let response = build_app(state)
+            .oneshot(test_request("GET", "/readyz"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
