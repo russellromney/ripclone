@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use std::ffi::CString;
 use std::io::{BufRead, BufReader, Write};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -34,6 +34,15 @@ use unicode_normalization::UnicodeNormalization;
 #[cfg(unix)]
 thread_local! {
     static INSTALL_STAGING_FD: std::cell::Cell<Option<libc::c_int>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(all(test, target_os = "macos"))]
+static FORCE_STAGING_RESTORE_FAILURE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+thread_local! {
+    static CLEANUP_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnMut(&str, libc::c_int, &std::ffi::OsStr)>>> = const { std::cell::RefCell::new(None) };
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -207,7 +216,7 @@ fn install_pinned_bundle_transaction(
     validate_hash("requested manifest", &request.manifest_hash)?;
     let target = target.as_ref();
     let publication = BoundInstall::new(target, "pinned")?;
-    let _staging_scope = publication.enter_staging()?;
+    let staging_scope = publication.enter_staging()?;
     let staging = publication.staging_root().join("repo");
 
     let verified = installer
@@ -240,6 +249,7 @@ fn install_pinned_bundle_transaction(
         }
     }
     ensure_not_cancelled(cancelled)?;
+    staging_scope.finish()?;
     publication
         .publish_repo()
         .context("publish verified pinned bundle")?;
@@ -319,16 +329,16 @@ impl BoundInstall {
         return std::path::PathBuf::from(".");
     }
     pub(crate) fn enter_staging(&self) -> Result<StagingScope> {
-        let duplicate = unsafe { libc::dup(self.staging.as_raw_fd()) };
-        if duplicate < 0 {
-            return Err(std::io::Error::last_os_error())
-                .context("duplicate installer staging descriptor");
-        }
-        let staging = unsafe { OwnedFd::from_raw_fd(duplicate) };
+        let staging = dup_cloexec(self.staging.as_raw_fd())
+            .context("duplicate installer staging descriptor")?;
         #[cfg(target_os = "linux")]
         {
             let previous = INSTALL_STAGING_FD.with(|slot| slot.replace(Some(staging.as_raw_fd())));
-            return Ok(StagingScope { staging, previous });
+            return Ok(StagingScope {
+                staging,
+                previous,
+                restored: false,
+            });
         }
         #[cfg(target_os = "macos")]
         {
@@ -353,6 +363,7 @@ impl BoundInstall {
                 old,
                 staging,
                 previous,
+                restored: false,
             })
         }
     }
@@ -433,13 +444,27 @@ impl BoundInstall {
 pub(crate) struct StagingScope {
     staging: OwnedFd,
     previous: Option<libc::c_int>,
+    restored: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl StagingScope {
+    pub(crate) fn finish(mut self) -> Result<()> {
+        self.restore();
+        Ok(())
+    }
+    fn restore(&mut self) {
+        if !self.restored {
+            INSTALL_STAGING_FD.with(|slot| slot.set(self.previous));
+            self.restored = true;
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
 impl Drop for StagingScope {
     fn drop(&mut self) {
-        INSTALL_STAGING_FD.with(|slot| slot.set(self.previous));
-        let _ = self.staging.as_raw_fd();
+        self.restore();
     }
 }
 
@@ -448,16 +473,38 @@ pub(crate) struct StagingScope {
     old: OwnedFd,
     staging: OwnedFd,
     previous: Option<libc::c_int>,
+    restored: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl StagingScope {
+    pub(crate) fn finish(mut self) -> Result<()> {
+        self.restore_or_abort();
+        Ok(())
+    }
+    fn restore_or_abort(&mut self) {
+        if self.restored {
+            return;
+        }
+        let _staging_lifetime = self.staging.as_raw_fd();
+        #[cfg(test)]
+        let injected = FORCE_STAGING_RESTORE_FAILURE.load(std::sync::atomic::Ordering::SeqCst);
+        #[cfg(not(test))]
+        let injected = false;
+        if injected || unsafe { pthread_fchdir_np(self.old.as_raw_fd()) } != 0 {
+            // Continuing on this pthread would resolve every relative path
+            // through attacker-controlled staging. There is no safe recovery.
+            std::process::abort();
+        }
+        INSTALL_STAGING_FD.with(|slot| slot.set(self.previous));
+        self.restored = true;
+    }
 }
 
 #[cfg(target_os = "macos")]
 impl Drop for StagingScope {
     fn drop(&mut self) {
-        unsafe {
-            pthread_fchdir_np(self.old.as_raw_fd());
-        }
-        INSTALL_STAGING_FD.with(|slot| slot.set(self.previous));
-        let _ = self.staging.as_raw_fd();
+        self.restore_or_abort();
     }
 }
 
@@ -468,6 +515,12 @@ unsafe extern "C" {
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub(crate) struct StagingScope {}
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+impl StagingScope {
+    pub(crate) fn finish(self) -> Result<()> {
+        bail!("fd-bound clone publication is unsupported on this platform")
+    }
+}
 
 pub(crate) fn bind_child_to_staging(command: &mut Command) {
     #[cfg(unix)]
@@ -489,6 +542,14 @@ pub(crate) fn bind_child_to_staging(command: &mut Command) {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn cstring(value: &std::ffi::OsStr) -> Result<CString> {
     CString::new(value.as_bytes()).context("path contains NUL")
+}
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn dup_cloexec(fd: libc::c_int) -> Result<OwnedFd> {
+    let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+    if duplicate < 0 {
+        return Err(std::io::Error::last_os_error()).context("duplicate close-on-exec descriptor");
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(duplicate) })
 }
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn openat_dir(parent: libc::c_int, name: &std::ffi::OsStr) -> Result<OwnedFd> {
@@ -623,10 +684,8 @@ fn fd_stat(fd: libc::c_int) -> Result<libc::stat> {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn directory_entries(fd: libc::c_int) -> Result<Vec<std::ffi::OsString>> {
-    let duplicate = unsafe { libc::dup(fd) };
-    if duplicate < 0 {
-        return Err(std::io::Error::last_os_error()).context("duplicate staging directory handle");
-    }
+    let duplicate = dup_cloexec(fd).context("duplicate staging directory handle")?;
+    let duplicate = duplicate.into_raw_fd();
     let directory = unsafe { libc::fdopendir(duplicate) };
     if directory.is_null() {
         unsafe { libc::close(duplicate) };
@@ -684,18 +743,79 @@ fn remove_dir_contents(fd: libc::c_int) -> Result<()> {
             }
             Err(error) => return Err(error),
         };
-        let name_c = cstring(&name)?;
+        run_cleanup_test_hook("after_stat", fd, &name);
+        let child = openat_entry(fd, &name, stat.st_mode)?;
+        let bound = fd_stat(child.as_raw_fd())?;
+        if !same_file_identity(&stat, &bound) {
+            bail!("staging cleanup entry changed before it could be bound")
+        }
         if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
-            let child = openat_dir(fd, &name)?;
             remove_dir_contents(child.as_raw_fd())?;
-            if unsafe { libc::unlinkat(fd, name_c.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
-                return Err(std::io::Error::last_os_error()).context("remove staging directory");
-            }
-        } else if unsafe { libc::unlinkat(fd, name_c.as_ptr(), 0) } != 0 {
-            return Err(std::io::Error::last_os_error()).context("remove staging entry");
+        }
+        let current = entry_stat(fd, &name)?;
+        if !same_file_identity(&bound, &current) {
+            bail!("staging cleanup entry changed after traversal")
+        }
+        run_cleanup_test_hook("before_unlink", fd, &name);
+        let current = entry_stat(fd, &name)?;
+        if !same_file_identity(&bound, &current) {
+            bail!("staging cleanup entry changed before unlink")
+        }
+        let name_c = cstring(&name)?;
+        let flags = if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
+            libc::AT_REMOVEDIR
+        } else {
+            0
+        };
+        if unsafe { libc::unlinkat(fd, name_c.as_ptr(), flags) } != 0 {
+            return Err(std::io::Error::last_os_error()).context("remove bound staging entry");
         }
     }
     Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn openat_entry(
+    parent: libc::c_int,
+    name: &std::ffi::OsStr,
+    mode: libc::mode_t,
+) -> Result<OwnedFd> {
+    if mode & libc::S_IFMT == libc::S_IFDIR {
+        return openat_dir(parent, name);
+    }
+    let name = cstring(name)?;
+    #[cfg(target_os = "linux")]
+    let flags = libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    #[cfg(target_os = "macos")]
+    let flags = if mode & libc::S_IFMT == libc::S_IFLNK {
+        libc::O_SYMLINK | libc::O_CLOEXEC
+    } else {
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC
+    };
+    let fd = unsafe { libc::openat(parent, name.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error()).context("bind staging cleanup entry");
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn same_file_identity(left: &libc::stat, right: &libc::stat) -> bool {
+    left.st_dev == right.st_dev
+        && left.st_ino == right.st_ino
+        && left.st_mode & libc::S_IFMT == right.st_mode & libc::S_IFMT
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn run_cleanup_test_hook(stage: &str, parent: libc::c_int, name: &std::ffi::OsStr) {
+    #[cfg(test)]
+    CLEANUP_TEST_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook(stage, parent, name);
+        }
+    });
+    #[cfg(not(test))]
+    let _ = (stage, parent, name);
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -705,20 +825,20 @@ fn unlink_bound_directory(
     expected_dev: u64,
     expected_ino: u64,
 ) -> Result<()> {
-    let mut names = vec![expected_name.to_os_string()];
-    names.extend(directory_entries(parent)?);
-    for name in names {
-        let Ok(stat) = entry_stat(parent, &name) else {
-            continue;
-        };
-        if stat.st_dev as u64 == expected_dev && stat.st_ino == expected_ino {
-            let name = cstring(&name)?;
-            if unsafe { libc::unlinkat(parent, name.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
-                return Err(std::io::Error::last_os_error())
-                    .context("remove bound staging directory");
-            }
-            return Ok(());
-        }
+    let Ok(stat) = entry_stat(parent, expected_name) else {
+        return Ok(());
+    };
+    if stat.st_dev as u64 != expected_dev || stat.st_ino != expected_ino {
+        return Ok(());
+    }
+    run_cleanup_test_hook("before_root_unlink", parent, expected_name);
+    let current = entry_stat(parent, expected_name)?;
+    if !same_file_identity(&stat, &current) {
+        return Ok(());
+    }
+    let name = cstring(expected_name)?;
+    if unsafe { libc::unlinkat(parent, name.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("remove bound staging directory");
     }
     Ok(())
 }
@@ -1562,6 +1682,93 @@ mod blocker_tests {
         );
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn cleanup_abandons_file_or_directory_swapped_at_each_identity_boundary() {
+        for (stage, directory) in [
+            ("after_stat", false),
+            ("before_unlink", false),
+            ("after_stat", true),
+            ("before_unlink", true),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let parent = root.path().join(format!("parent-{stage}-{directory}"));
+            std::fs::create_dir(&parent).unwrap();
+            let transaction =
+                BoundInstall::new(&parent.join("destination"), "cleanup-race").unwrap();
+            let staging = parent.join(&transaction.staging_name);
+            std::fs::create_dir(staging.join("repo")).unwrap();
+            let victim = staging.join("repo/victim");
+            if directory {
+                std::fs::create_dir(&victim).unwrap();
+                std::fs::write(victim.join("original"), b"bound").unwrap();
+            } else {
+                std::fs::write(&victim, b"bound").unwrap();
+            }
+            let moved = staging.join("repo/original-moved");
+            let moved_for_hook = moved.clone();
+            let replacement = victim.clone();
+            let wanted_stage = stage.to_owned();
+            CLEANUP_TEST_HOOK.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move |actual, _, name| {
+                    if actual != wanted_stage || name != std::ffi::OsStr::new("victim") {
+                        return;
+                    }
+                    std::fs::rename(&replacement, &moved_for_hook).unwrap();
+                    if directory {
+                        std::fs::create_dir(&replacement).unwrap();
+                        std::fs::write(replacement.join("replacement-sentinel"), b"safe").unwrap();
+                    } else {
+                        std::fs::write(&replacement, b"replacement-sentinel").unwrap();
+                    }
+                }));
+            });
+            drop(transaction);
+            CLEANUP_TEST_HOOK.with(|slot| slot.borrow_mut().take());
+            if directory {
+                assert_eq!(
+                    std::fs::read(victim.join("replacement-sentinel")).unwrap(),
+                    b"safe"
+                );
+                assert!(moved.is_dir());
+                if stage == "after_stat" {
+                    assert!(moved.join("original").exists());
+                }
+            } else {
+                assert_eq!(std::fs::read(&victim).unwrap(), b"replacement-sentinel");
+                assert_eq!(std::fs::read(&moved).unwrap(), b"bound");
+            }
+            assert!(!parent.join("destination").exists());
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn staging_capability_is_close_on_exec_after_child_fchdir() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("parent");
+        std::fs::create_dir(&parent).unwrap();
+        let transaction = BoundInstall::new(&parent.join("destination"), "cloexec").unwrap();
+        let scope = transaction.enter_staging().unwrap();
+        let mut command = std::process::Command::new("sh");
+        #[cfg(target_os = "linux")]
+        command.args([
+            "-c",
+            "for f in /proc/self/fd/*; do readlink \"$f\" || true; done",
+        ]);
+        #[cfg(target_os = "macos")]
+        command.args(["-c", "for f in /dev/fd/*; do readlink \"$f\" || true; done"]);
+        bind_child_to_staging(&mut command);
+        let output = command.output().unwrap();
+        assert!(output.status.success());
+        let listed = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !listed.contains(&transaction.staging_name.to_string_lossy().to_string()),
+            "staging descriptor leaked across exec: {listed}"
+        );
+        scope.finish().unwrap();
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn thread_bound_staging_is_isolated_concurrent_and_restored() {
@@ -1640,6 +1847,33 @@ mod blocker_tests {
             }
             assert_eq!(std::env::current_dir().unwrap(), before);
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pthread_restore_failure_aborts_instead_of_reusing_bound_thread() {
+        const CHILD: &str = "RIPCLONE_TEST_STAGING_RESTORE_ABORT_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let root = tempfile::tempdir().unwrap();
+            let parent = root.path().join("parent");
+            std::fs::create_dir(&parent).unwrap();
+            let transaction =
+                BoundInstall::new(&parent.join("destination"), "restore-abort").unwrap();
+            let scope = transaction.enter_staging().unwrap();
+            FORCE_STAGING_RESTORE_FAILURE.store(true, std::sync::atomic::Ordering::SeqCst);
+            drop(scope);
+            panic!("failed CWD restoration did not abort");
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "topup::blocker_tests::pthread_restore_failure_aborts_instead_of_reusing_bound_thread",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .status()
+            .unwrap();
+        assert!(!status.success(), "restoration failure subprocess survived");
     }
 
     #[test]

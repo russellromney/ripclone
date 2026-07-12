@@ -1208,10 +1208,11 @@ impl Client {
                         .await?;
                     let target = target.as_ref();
                     let publication = crate::topup::BoundInstall::new(target, "files")?;
-                    let _staging_scope = publication.enter_staging()?;
+                    let staging_scope = publication.enter_staging()?;
                     let staging = publication.staging_root().join("repo");
                     crate::artifact_manifest::CasCompletionVerifier::new(cas)
                         .materialize_transport_files_cancelled(capability, &staging, cancelled)?;
+                    staging_scope.finish()?;
                     publication
                         .publish_repo()
                         .context("publish exact Files artifact")?;
