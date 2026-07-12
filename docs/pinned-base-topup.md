@@ -1,49 +1,37 @@
-# Pinned base top-up
+# Server-issued pinned top-up bundles
 
-An active repository can satisfy a HEAD or full clone from an older cached base
-while the exact artifact for the latest commit is still building. The client
-installs the base privately, fetches one already-resolved commit, validates it,
-and publishes the completed worktree atomically.
+The client does not top up from GitHub/GitLab and does not trust a cached
+repository's remote. The authenticated ripclone server resolves target `T`
+against its mirror and issues a content-addressed manifest containing:
 
-The commit is resolved **before** this operation. A branch name is never used as
-the fetch target, so a push during the clone cannot silently move the result.
-If the pinned object becomes unavailable after a force-push, the operation
-fails explicitly; its caller may re-resolve and start a new clone, but must not
-substitute the branch's new tip inside the existing clone.
+- exact base OID `B`, target OID `T`, mode, branch, and canonical provider URL;
+- non-thin pack/idx artifacts for objects reachable from `T` but not `B`;
+- exact-target checkout metadata/index and worktree content artifacts;
+- artifact hashes and lengths covered by the authenticated manifest.
 
-## Modes
+For an unrelated force-push, the set difference naturally becomes the target's
+full closure. No client-visible provider credential, temporary ref, capability
+URL, or pin lifetime is involved.
 
-- `Head` accepts an older HEAD base, performs an exact `--depth=1` fetch, and
-  verifies that history from the resulting `HEAD` contains exactly one commit.
-- `Full` requires a non-shallow full base, fetches the missing closure for the
-  exact target, and verifies connectivity before checkout.
+`PinnedBundleInstaller` is the trusted client/CAS boundary. It must authenticate
+the manifest, verify every artifact hash and length, and return a matching
+receipt. Its workspace provider adapter also supplies the exact approved
+canonical origin independently of the bundle; the bundle cannot authorize its
+own host or path. The top-up transaction then discards all installed control state except
+physical objects and the index, writes fresh allowlisted refs/config, clears
+sparse state by rebuilding the index from `T`, verifies base/target/connectivity
+and depth semantics, removes ignored/untracked residue, and atomically publishes.
 
-In both modes the final branch, remote-tracking ref, worktree, and `HEAD` point
-to the requested object ID. The destination remains absent on installer,
-network, validation, checkout, or publish failure.
+The server generator and clone-plan response are required integration work; the
+client must fail closed until a verified bundle is available. There is no direct
+SHA/provider fallback for private repositories.
 
-## Private upstream authentication
+## Existing runtime-Git blocker
 
-The top-up request contains a configured Git remote name, never a URL, token,
-or authorization header. Public repositories may configure that remote directly
-to the provider. Private GitHub App repositories must point it at a ripclone Git
-proxy. Installation tokens remain server-side and must never be serialized in
-clone plans or embedded in client remote URLs; cached-base credential helpers
-and ambient client Git configuration are deliberately ignored/rejected.
-
-The proxy protocol is an integration gate for enabling this path on a provider:
-it must accept the exact pinned object ID through an immutable, authorization-
-scoped ref (or equivalent exact-object fetch), retain that pin for the clone
-plan's lifetime, and never resolve the provider branch again during fetch. A
-provider is not eligible for top-up until its proxy passes advance, force-push,
-expiry, authorization, and unavailable-pin tests.
-
-Cached bases are treated as hostile input. Their `.git`, common directory, and
-object store must be real and contained under staging. Alternates, partial or
-promisor clones, replace refs, grafts, executable/credential/rewrite config,
-and credential-bearing remote URLs are rejected before repo-scoped Git runs.
-
-The reusable transaction is exposed as
-`ripclone::topup::install_pinned_from_base`. Clone-plan/server integration is
-intentionally separate: the server chooses the cached base and authenticated
-transport; this primitive only enforces exact-target installation semantics.
+This primitive currently uses the same `git checkout-index`/validation runtime
+dependency as ripclone's existing editable clone path. That conflicts with the
+README claim that prebuilt binaries require no Git runtime. Resolving that
+existing product/docs inconsistency—by moving checkout/validation fully into
+gix/worktree-writer or explicitly packaging/requiring Git—is a separate release
+gate. The pinned-bundle design introduces no new provider-side Git dependency,
+but it must not be advertised as PATH-free while the shared editable path is not.
