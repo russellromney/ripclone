@@ -412,6 +412,10 @@ impl BoundInstall {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 impl Drop for BoundInstall {
     fn drop(&mut self) {
+        // The random staging root is mode 0700 and its only capability is
+        // CLOEXEC. Cleanup deliberately abandons that bounded private tree on
+        // any identity ambiguity: leaking failed staging is safer than ever
+        // unlinking a concurrently substituted file or directory.
         let _ = remove_dir_contents(self.staging.as_raw_fd());
         let _ = unlink_bound_directory(
             self.parent.as_raw_fd(),
@@ -756,6 +760,10 @@ fn remove_dir_contents(fd: libc::c_int) -> Result<()> {
         if !same_file_identity(&bound, &current) {
             bail!("staging cleanup entry changed after traversal")
         }
+        // This is the last deliberately exposed race boundary. The entry is
+        // inside the private capability-only staging root; recheck after the
+        // hook and abandon the whole root if its name no longer denotes the
+        // bound inode.
         run_cleanup_test_hook("before_unlink", fd, &name);
         let current = entry_stat(fd, &name)?;
         if !same_file_identity(&bound, &current) {
