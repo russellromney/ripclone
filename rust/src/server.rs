@@ -461,9 +461,10 @@ fn default_branch_value() -> String {
 /// Resolve a `{*rest}` path segment from `/v1/repos/{*rest}/...` into a
 /// `(RepoId, ProviderInstance)` pair.
 ///
-/// The first path segment MUST be a registered provider instance id; the
-/// remainder is the opaque repo path. There is no legacy fallback: callers
-/// must address repos as `/v1/repos/{provider}/{path}/...`, even for the
+/// The first path segment MUST be a registered workspace id; the workspace's
+/// single upstream handles the remainder as an opaque repository path. There
+/// is no legacy fallback: callers
+/// must address repos as `/v1/repos/{workspace}/{path}/...`, even for the
 /// built-in `github` default instance.
 fn resolve_repo_id<'a>(
     registry: &'a ProviderRegistry,
@@ -478,7 +479,7 @@ fn resolve_repo_id<'a>(
     let provider = registry.get(provider_id)?;
     Some((
         RepoId {
-            provider: provider.id.clone(),
+            workspace: provider.id.clone(),
             path,
         },
         provider,
@@ -494,13 +495,13 @@ fn repo_id_from_natural_key(registry: &ProviderRegistry, key: &str) -> Option<Re
     }
     if let Some(provider) = registry.get(first) {
         return Some(RepoId {
-            provider: provider.id.clone(),
+            workspace: provider.id.clone(),
             path: rest.join("/"),
         });
     }
     let provider = registry.default_provider();
     Some(RepoId {
-        provider: provider.id.clone(),
+        workspace: provider.id.clone(),
         path: key.to_string(),
     })
 }
@@ -650,7 +651,9 @@ fn reject_invalid_repo_ids(owner: &str, repo: &str) -> Option<Response> {
 pub struct RefResponse {
     pub owner: String,
     pub repo: String,
-    /// Provider instance id (e.g. "github", "gitlab", "my-gitea").
+    /// Workspace owning this repository.
+    pub workspace: String,
+    /// Deprecated compatibility copy of `workspace`.
     pub provider: String,
     /// Hostname of the upstream git provider.
     pub host: String,
@@ -3019,14 +3022,20 @@ fn ref_response(
         artifacts.commit.clone()
     };
 
-    let (owner, repo) = repo_id
-        .github_owner_repo()
-        .map(|(o, r)| (o.to_string(), r.to_string()))
-        .unwrap_or_else(|| (repo_id.provider.as_str().to_string(), repo_id.path.clone()));
+    let (owner, repo) = if provider.kind == crate::provider::ProviderKind::GitHub {
+        repo_id
+            .path
+            .split_once('/')
+            .map(|(o, r)| (o.to_string(), r.to_string()))
+            .unwrap_or_else(|| (repo_id.workspace.as_str().to_string(), repo_id.path.clone()))
+    } else {
+        (repo_id.workspace.as_str().to_string(), repo_id.path.clone())
+    };
     let origin_url = provider.clone_url(&repo_id.path);
     RefResponse {
         owner,
         repo,
+        workspace: repo_id.workspace.as_str().to_string(),
         provider: provider.id.as_str().to_string(),
         host: provider.host.clone(),
         origin_url,
@@ -4270,7 +4279,7 @@ async fn webhook_dispatch_push(
     event: crate::webhook::CanonicalEvent,
 ) -> Response {
     let repo_id = RepoId {
-        provider: provider.id.clone(),
+        workspace: provider.id.clone(),
         path: event.repo.clone(),
     };
     // Validate the payload-supplied path so a hostile push can't escape storage
@@ -4350,7 +4359,7 @@ async fn webhook_dispatch_delete(
     event: crate::webhook::CanonicalEvent,
 ) -> Response {
     let repo_id = RepoId {
-        provider: provider.id.clone(),
+        workspace: provider.id.clone(),
         path: event.repo.clone(),
     };
     if validation::validate_repo_path(provider, &repo_id).is_err() {
@@ -4583,7 +4592,7 @@ async fn create_snapshot_inner(
             let (resp_owner, resp_repo) = repo_id
                 .github_owner_repo()
                 .map(|(o, r)| (o.to_string(), r.to_string()))
-                .unwrap_or_else(|| (repo_id.provider.as_str().to_string(), repo_id.path.clone()));
+                .unwrap_or_else(|| (repo_id.workspace.as_str().to_string(), repo_id.path.clone()));
             (
                 StatusCode::OK,
                 Json(SnapshotResponse {
@@ -7181,7 +7190,7 @@ pub async fn process_build_job(
 
     let start = std::time::Instant::now();
     let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
-    let provider = match state.provider_registry.get(repo_id.provider.as_str()) {
+    let provider = match state.provider_registry.get(repo_id.workspace.as_str()) {
         Some(p) => p.clone(),
         None => {
             if let Err(e) = update_current_build_status(state, repo_id, branch, "error").await {
@@ -7192,11 +7201,11 @@ pub async fn process_build_job(
             }
             warn!(
                 "unknown provider {} for build job",
-                repo_id.provider.as_str()
+                repo_id.workspace.as_str()
             );
             return Err(BuildError::permanent(format!(
                 "unknown provider {}",
-                repo_id.provider.as_str()
+                repo_id.workspace.as_str()
             )));
         }
     };
@@ -7763,7 +7772,7 @@ pub async fn poll_once(state: &ServerState) -> usize {
     for repo_id in repos {
         let Some(provider) = state
             .provider_registry
-            .get(repo_id.provider.as_str())
+            .get(repo_id.workspace.as_str())
             .cloned()
         else {
             continue; // unknown provider; skip
@@ -9259,6 +9268,7 @@ mod tests {
         let resp = RefResponse {
             owner: "acme".to_string(),
             repo: "secret".to_string(),
+            workspace: "github".to_string(),
             provider: "github".to_string(),
             host: "github.com".to_string(),
             origin_url: "https://github.com/acme/secret.git".to_string(),
@@ -10164,7 +10174,7 @@ mod tests {
         mark_added(
             &state,
             RepoId {
-                provider: crate::provider::ProviderInstanceId::new("gitlab"),
+                workspace: crate::provider::ProviderInstanceId::new("gitlab"),
                 path: "group/sub/proj".to_string(),
             },
         )
@@ -10213,7 +10223,7 @@ mod tests {
         mark_added(
             &state,
             RepoId {
-                provider: crate::provider::ProviderInstanceId::new("gitea"),
+                workspace: crate::provider::ProviderInstanceId::new("gitea"),
                 path: "acme/widget".to_string(),
             },
         )
@@ -10248,7 +10258,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (state, mut rx) = provider_webhook_state(&tmp, "gitea", "gitea", "gitea.example.com");
         let repo = RepoId {
-            provider: crate::provider::ProviderInstanceId::new("gitea"),
+            workspace: crate::provider::ProviderInstanceId::new("gitea"),
             path: "acme/widget".to_string(),
         };
         let info = RefInfo {
@@ -10328,7 +10338,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (state, mut rx) = provider_webhook_state(&tmp, "gitlab", "gitlab", "gitlab.com");
         let repo = RepoId {
-            provider: crate::provider::ProviderInstanceId::new("gitlab"),
+            workspace: crate::provider::ProviderInstanceId::new("gitlab"),
             path: "group/sub/proj".to_string(),
         };
         let info = RefInfo {
@@ -10379,7 +10389,7 @@ mod tests {
         mark_added(
             &state,
             RepoId {
-                provider: crate::provider::ProviderInstanceId::new("gitlab"),
+                workspace: crate::provider::ProviderInstanceId::new("gitlab"),
                 path: "group/sub/proj".to_string(),
             },
         )

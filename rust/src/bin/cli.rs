@@ -48,10 +48,12 @@ struct Args {
     #[arg(short, long, env = "RIPCLONE_SERVER")]
     server: Option<String>,
 
-    /// Upstream git provider instance id (e.g. "github", "gitlab", "my-gitea").
-    /// Defaults to the built-in "github" instance unless overridden by config
-    /// or a provider prefix in the repo argument (`gitlab:owner/repo`).
-    #[arg(short, long)]
+    /// Ripclone workspace. Each workspace has exactly one upstream provider.
+    #[arg(long, env = "RIPCLONE_WORKSPACE_ID")]
+    workspace: Option<String>,
+
+    /// Deprecated alias for --workspace.
+    #[arg(short, long, hide = true)]
     provider: Option<String>,
 
     /// Explicit upstream credential token sent as the X-Upstream-Token header.
@@ -162,10 +164,17 @@ enum Commands {
         #[arg(short, long, default_value = "HEAD")]
         branch: String,
     },
-    /// Manage configured git providers (GitHub, GitLab, Gitea, …).
+    /// Manage legacy provider entries. Deprecated: configure one upstream on
+    /// the workspace instead.
+    #[command(hide = true)]
     Provider {
         #[command(subcommand)]
         action: ProviderAction,
+    },
+    /// Configure or inspect this installation's workspace and its one upstream.
+    Workspace {
+        #[command(subcommand)]
+        action: WorkspaceAction,
     },
     /// Snapshot operations for agent-ready repo skeletons.
     #[command(hide = true)]
@@ -335,6 +344,26 @@ enum ProviderAction {
     },
 }
 
+#[derive(Subcommand)]
+enum WorkspaceAction {
+    /// Configure the workspace's sole upstream provider connection.
+    Set {
+        id: String,
+        #[arg(long)]
+        provider: String,
+        #[arg(long)]
+        host: Option<String>,
+        #[arg(long)]
+        token: Option<String>,
+        #[arg(long)]
+        auth_template: Option<String>,
+        #[arg(long)]
+        auth_header_name: Option<String>,
+    },
+    /// Show the selected workspace and upstream.
+    Show,
+}
+
 fn parse_repo(repo: &str) -> Result<(&str, &str)> {
     let parts: Vec<&str> = repo.splitn(2, '/').collect();
     if parts.len() != 2 {
@@ -345,18 +374,18 @@ fn parse_repo(repo: &str) -> Result<(&str, &str)> {
 
 /// Resolve a repo argument into `(provider, repo_path)`.
 ///
-/// Honors an optional `provider:` prefix, falls back to `default_provider`,
+/// Honors an optional `provider:` prefix, falls back to `default_workspace`,
 /// and normalizes GitHub repos to `owner/name`.
 fn resolve_repo(
     repo: &str,
-    default_provider: &str,
+    default_workspace: &str,
     registry: &ripclone::provider::ProviderRegistry,
 ) -> Result<(String, String)> {
     let (provider_override, path) = parse_repo_arg(repo);
-    let provider = provider_override.unwrap_or_else(|| default_provider.to_string());
+    let provider = provider_override.unwrap_or_else(|| default_workspace.to_string());
     if registry.get(&provider).is_none() {
         anyhow::bail!(
-            "unknown provider '{provider}'; register it with `ripclone provider add {provider} ...`"
+            "unknown workspace '{provider}'; configure it with `ripclone workspace set {provider} --provider <kind>`"
         );
     }
     let is_github = registry
@@ -996,6 +1025,69 @@ async fn run_provider_rm(id: &str) -> Result<()> {
     Ok(())
 }
 
+fn run_workspace_set(
+    id: String,
+    provider: String,
+    host: Option<String>,
+    token: Option<String>,
+    auth_template: Option<String>,
+    auth_header_name: Option<String>,
+) -> Result<()> {
+    if id.trim().is_empty() {
+        anyhow::bail!("workspace id cannot be empty");
+    }
+    let entry = ripclone::config::WorkspaceEntry {
+        id: id.clone(),
+        provider,
+        host,
+        token,
+        auth_template,
+        auth_header_name,
+    };
+    // Validate before touching durable config, including provider kind/host,
+    // generic auth templates and SSRF-sensitive host values.
+    let mut validation_registry = ripclone::provider::WorkspaceRegistry::new();
+    validation_registry
+        .merge_workspace(
+            id.clone(),
+            ripclone::provider::ProviderConfig {
+                id: id.clone(),
+                kind: Some(entry.provider.clone()),
+                host: entry.host.clone(),
+                token: entry.token.clone(),
+                auth_template: entry.auth_template.clone(),
+                auth_header_name: entry.auth_header_name.clone(),
+            },
+        )
+        .context("validate workspace upstream")?;
+
+    let mut cfg = ripclone::config::load_global();
+    cfg.default_workspace = Some(id.clone());
+    cfg.workspace = Some(entry);
+    // `workspace set` is the explicit migration boundary: the canonical local
+    // config has one workspace/upstream, so stale provider routing entries must
+    // not keep influencing startup after this succeeds.
+    cfg.default_provider = None;
+    cfg.providers.clear();
+    ripclone::config::save(&cfg)?;
+    println!("configured workspace '{id}'");
+    Ok(())
+}
+
+fn run_workspace_show() -> Result<()> {
+    let cfg = ripclone::config::load_global();
+    let registry = ripclone::provider_config::load_registry_with_config(&cfg)?;
+    let workspace = registry.selected_workspace();
+    let id = workspace.id.as_str();
+    println!(
+        "{}\t{}\t{}",
+        id,
+        workspace.upstream.kind.as_str(),
+        workspace.upstream.host
+    );
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -1013,11 +1105,11 @@ async fn main() -> Result<()> {
         .clone()
         .or_else(|| config.server.clone())
         .unwrap_or_else(|| DEFAULT_SERVER.to_string());
-    let default_provider = args
-        .provider
+    let workspace_override = args
+        .workspace
         .clone()
-        .or_else(|| config.default_provider.clone())
-        .unwrap_or_else(|| "github".to_string());
+        .or_else(|| args.provider.clone())
+        .or_else(|| config.selected_workspace().map(str::to_owned));
 
     // login/logout/version don't need an authenticated client.
     match &args.command {
@@ -1036,11 +1128,38 @@ async fn main() -> Result<()> {
         Commands::Version => return run_version(&server).await,
         Commands::Update => return run_update().await,
         Commands::MintWorkerToken { ttl_days } => return run_mint_worker_token(*ttl_days),
+        Commands::Workspace { action } => {
+            return match action {
+                WorkspaceAction::Set {
+                    id,
+                    provider,
+                    host,
+                    token,
+                    auth_template,
+                    auth_header_name,
+                } => run_workspace_set(
+                    id.clone(),
+                    provider.clone(),
+                    host.clone(),
+                    token.clone(),
+                    auth_template.clone(),
+                    auth_header_name.clone(),
+                ),
+                WorkspaceAction::Show => run_workspace_show(),
+            };
+        }
         _ => {}
     }
 
     let provider_registry =
         ripclone::provider_config::load_registry().context("load provider registry")?;
+    let default_workspace = workspace_override.unwrap_or_else(|| {
+        provider_registry
+            .selected_workspace()
+            .id
+            .as_str()
+            .to_string()
+    });
 
     // Server-token precedence:
     //   RIPCLONE_SERVER_TOKEN_HASH > RIPCLONE_SERVER_TOKEN > saved login token.
@@ -1086,7 +1205,7 @@ async fn main() -> Result<()> {
             None => Client::new(server.clone()),
         }
     }
-    .with_provider(&default_provider);
+    .with_workspace(&default_workspace);
 
     match args.command {
         // Handled before the client is built.
@@ -1095,7 +1214,8 @@ async fn main() -> Result<()> {
         | Commands::Auth { .. }
         | Commands::Version
         | Commands::Update
-        | Commands::MintWorkerToken { .. } => {
+        | Commands::MintWorkerToken { .. }
+        | Commands::Workspace { .. } => {
             unreachable!()
         }
         Commands::Provider { action } => match action {
@@ -1125,7 +1245,7 @@ async fn main() -> Result<()> {
                 run_provider_rm(&id).await?;
             }
             ProviderAction::Test { id, repo, branch } => {
-                let test_client = client.with_provider(&id);
+                let test_client = client.with_workspace(&id);
                 let info = test_client.resolve_ref(&repo, &branch).await?;
                 println!(
                     "provider '{}' resolved {}@{} → {} (default: {})",
@@ -1134,23 +1254,25 @@ async fn main() -> Result<()> {
             }
         },
         Commands::Add { repo } => {
-            let (provider, repo_path) = resolve_repo(&repo, &default_provider, &provider_registry)?;
+            let (provider, repo_path) =
+                resolve_repo(&repo, &default_workspace, &provider_registry)?;
             let upstream_token =
                 resolve_upstream_token(&provider, args.token.as_deref(), &provider_registry)
                     .await?;
             let client = client
-                .with_provider(&provider)
+                .with_workspace(&provider)
                 .with_upstream_token_opt(upstream_token);
             let info = client.add_repo(&repo_path).await?;
             println!("added {} at {}", repo_path, info.commit);
         }
         Commands::Sync { repo, depth, at } => {
-            let (provider, repo_path) = resolve_repo(&repo, &default_provider, &provider_registry)?;
+            let (provider, repo_path) =
+                resolve_repo(&repo, &default_workspace, &provider_registry)?;
             let upstream_token =
                 resolve_upstream_token(&provider, args.token.as_deref(), &provider_registry)
                     .await?;
             let client = client
-                .with_provider(&provider)
+                .with_workspace(&provider)
                 .with_upstream_token_opt(upstream_token);
             let depth = depth.or(config.clone.depth);
             let info = client
@@ -1171,12 +1293,13 @@ async fn main() -> Result<()> {
             no_metrics,
             verify_upstream,
         } => {
-            let (provider, repo_path) = resolve_repo(&repo, &default_provider, &provider_registry)?;
+            let (provider, repo_path) =
+                resolve_repo(&repo, &default_workspace, &provider_registry)?;
             let upstream_token =
                 resolve_upstream_token(&provider, args.token.as_deref(), &provider_registry)
                     .await?;
             let mut client = client
-                .with_provider(&provider)
+                .with_workspace(&provider)
                 .with_upstream_token_opt(upstream_token.clone());
             if no_metrics {
                 client = client.with_metrics_disabled();
@@ -1303,8 +1426,9 @@ async fn main() -> Result<()> {
         Commands::Cat {
             repo, path, branch, ..
         } => {
-            let (provider, repo_path) = resolve_repo(&repo, &default_provider, &provider_registry)?;
-            let client = client.with_provider(&provider);
+            let (provider, repo_path) =
+                resolve_repo(&repo, &default_workspace, &provider_registry)?;
+            let client = client.with_workspace(&provider);
             let content = client.cat_file(&repo_path, &branch, &path).await?;
             std::io::stdout().write_all(&content)?;
         }
@@ -1316,8 +1440,8 @@ async fn main() -> Result<()> {
                 output,
             } => {
                 let (provider, repo_path) =
-                    resolve_repo(&repo, &default_provider, &provider_registry)?;
-                let client = client.with_provider(&provider);
+                    resolve_repo(&repo, &default_workspace, &provider_registry)?;
+                let client = client.with_workspace(&provider);
                 let info = client
                     .create_snapshot(&repo_path, &branch, hot_files)
                     .await?;
@@ -1364,8 +1488,9 @@ async fn main() -> Result<()> {
             branch,
             count,
         } => {
-            let (provider, repo_path) = resolve_repo(&repo, &default_provider, &provider_registry)?;
-            let client = client.with_provider(&provider);
+            let (provider, repo_path) =
+                resolve_repo(&repo, &default_workspace, &provider_registry)?;
+            let client = client.with_workspace(&provider);
             let files = client.hot_files(&repo_path, &branch, count).await?;
             println!("prefetching {} files into {}", files.len(), dir.display());
             let start = std::time::Instant::now();
@@ -1454,8 +1579,9 @@ async fn main() -> Result<()> {
             repo_root,
             dictionary,
         } => {
-            let (provider, repo_path) = resolve_repo(&repo, &default_provider, &provider_registry)?;
-            let client = client.with_provider(&provider);
+            let (provider, repo_path) =
+                resolve_repo(&repo, &default_workspace, &provider_registry)?;
+            let client = client.with_workspace(&provider);
             let (owner, repo_name) = repo_path
                 .split_once('/')
                 .map(|(o, n)| (o.to_string(), n.to_string()))
@@ -1535,10 +1661,10 @@ async fn main() -> Result<()> {
             );
             let main_repo = std::env::current_dir()?.join(dir);
             let repo_path = match repo {
-                Some(r) => resolve_repo(&r, &default_provider, &provider_registry)?.1,
+                Some(r) => resolve_repo(&r, &default_workspace, &provider_registry)?.1,
                 None => {
                     let is_github = provider_registry
-                        .get(&default_provider)
+                        .get(&default_workspace)
                         .map(|p| p.kind == ProviderKind::GitHub)
                         .unwrap_or(false);
                     if is_github {
@@ -1563,8 +1689,9 @@ async fn main() -> Result<()> {
             sample_bytes,
             repo_root,
         } => {
-            let (provider, repo_path) = resolve_repo(&repo, &default_provider, &provider_registry)?;
-            let client = client.with_provider(&provider);
+            let (provider, repo_path) =
+                resolve_repo(&repo, &default_workspace, &provider_registry)?;
+            let client = client.with_workspace(&provider);
             let (owner, repo_name) = repo_path
                 .split_once('/')
                 .map(|(o, n)| (o.to_string(), n.to_string()))
@@ -1702,12 +1829,12 @@ async fn maybe_verify_upstream(
         None => {
             if requested == VerifyUpstream::Always {
                 anyhow::bail!(
-                    "unknown provider '{provider_id}'; \
-                     register it with `ripclone provider add` to use --verify-upstream=always"
+                    "unknown workspace '{provider_id}'; \
+                     configure it with `ripclone workspace set` to use --verify-upstream=always"
                 );
             }
             eprintln!(
-                "warning: --verify-upstream skipped (unknown provider '{provider_id}'); \
+                "warning: --verify-upstream skipped (unknown workspace '{provider_id}'); \
                  the ripclone server remains in the trust base for this clone"
             );
             return Ok(());
@@ -1722,7 +1849,7 @@ async fn maybe_verify_upstream(
             // Anonymous probe. If the repo is public, the returned tip is reused
             // for verification so we only issue one ls-remote to the upstream host.
             let repo_id = RepoId {
-                provider: provider.id.clone(),
+                workspace: provider.id.clone(),
                 path: repo_path.to_string(),
             };
             let provider = provider.clone();
@@ -1760,7 +1887,7 @@ async fn maybe_verify_upstream(
         Some(tip) => tip,
         None => {
             let repo_id = RepoId {
-                provider: provider.id.clone(),
+                workspace: provider.id.clone(),
                 path: repo_path.to_string(),
             };
             let credential = upstream_token.map(|t| SecretString::new(t.to_owned().into()));
@@ -1954,6 +2081,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn clap_accepts_workspace_selection_and_configuration() {
+        let args =
+            Args::try_parse_from(["ripclone", "--workspace", "acme", "clone", "org/repo"]).unwrap();
+        assert_eq!(args.workspace.as_deref(), Some("acme"));
+
+        let args = Args::try_parse_from([
+            "ripclone",
+            "workspace",
+            "set",
+            "acme",
+            "--provider",
+            "gitlab",
+            "--host",
+            "gitlab.example.com",
+        ])
+        .unwrap();
+        match args.command {
+            Commands::Workspace {
+                action: WorkspaceAction::Set { id, provider, .. },
+            } => {
+                assert_eq!(id, "acme");
+                assert_eq!(provider, "gitlab");
+            }
+            _ => panic!("expected workspace set"),
+        }
+    }
+
     fn test_registry() -> ripclone::provider::ProviderRegistry {
         let mut registry = ripclone::provider::ProviderRegistry::new();
         registry
@@ -1990,7 +2145,7 @@ mod tests {
     fn resolve_repo_rejects_unregistered_prefix() {
         let registry = test_registry();
         let err = resolve_repo("gitea.example.com:oven-sh/bun", "github", &registry).unwrap_err();
-        assert!(err.to_string().contains("unknown provider"));
+        assert!(err.to_string().contains("unknown workspace"));
     }
 
     #[test]

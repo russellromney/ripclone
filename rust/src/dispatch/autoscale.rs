@@ -775,7 +775,7 @@ mod tests {
     fn job(path: &str, size_bytes: Option<u64>) -> BuildJob {
         BuildJob {
             repo_id: RepoId {
-                provider: ProviderInstanceId::new("github"),
+                workspace: ProviderInstanceId::new("github"),
                 path: path.into(),
             },
             branch: "main".into(),

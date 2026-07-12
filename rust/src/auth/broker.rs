@@ -59,7 +59,7 @@ impl CredentialBroker for StaticBroker {
         if let Some(token) = request_token {
             return Ok(Some(token.clone()));
         }
-        Ok(self.registry.token(repo_id.provider.as_str()).cloned())
+        Ok(self.registry.token(repo_id.workspace.as_str()).cloned())
     }
 }
 
@@ -370,7 +370,7 @@ impl ProviderAwareBroker {
 
     fn broker_for(&self, repo_id: &RepoId) -> &dyn CredentialBroker {
         self.dynamic
-            .get(repo_id.provider.as_str())
+            .get(repo_id.workspace.as_str())
             .map(|b| b.as_ref())
             .unwrap_or(&self.static_broker)
     }
@@ -390,21 +390,30 @@ impl CredentialBroker for ProviderAwareBroker {
 /// Select the credential broker from the environment.
 ///
 /// Builds a [`ProviderAwareBroker`] with a `StaticBroker` fallback and registers
-/// a `GitHubAppBroker` for the built-in `"github"` instance when
-/// `RIPCLONE_GITHUB_APP_ID` is configured.
+/// a `GitHubAppBroker` for the selected workspace when
+/// `RIPCLONE_GITHUB_APP_ID` is configured. This keeps one installation-backed
+/// provider connection attached to one workspace.
 ///
 /// Returns `Err` if a GitHub App is configured but its settings are invalid, so
 /// a misconfigured deployment fails fast rather than silently mirroring
 /// anonymously.
 pub fn broker_from_env(registry: ProviderRegistry) -> Result<Arc<dyn CredentialBroker>> {
+    let app_workspace = registry.selected_workspace().id.as_str().to_string();
+    let app_workspace_kind = registry.selected_workspace().upstream.kind;
     let mut broker = ProviderAwareBroker::new(registry);
     if let Some(config) = GitHubAppConfig::from_env()? {
+        if app_workspace_kind != crate::provider::ProviderKind::GitHub {
+            anyhow::bail!(
+                "GitHub App credentials cannot be attached to non-GitHub workspace '{}'",
+                app_workspace
+            );
+        }
         let app_id = config.app_id.clone();
         let installation_id = config.installation_id;
         let gh_broker = Arc::new(GitHubAppBroker::new(config)?);
-        broker = broker.register("github", gh_broker);
+        broker = broker.register(app_workspace.clone(), gh_broker);
         info!(
-            "using GitHub App credential broker (app_id={app_id}, installation_id={installation_id})"
+            "using GitHub App credential broker (workspace={app_workspace}, app_id={app_id}, installation_id={installation_id})"
         );
     }
     Ok(Arc::new(broker))
@@ -505,7 +514,7 @@ RwIDAQAB
     fn github_app_broker_ignores_non_github_providers() {
         let broker = test_broker();
         let repo = RepoId {
-            provider: ProviderInstanceId::new("gitlab"),
+            workspace: ProviderInstanceId::new("gitlab"),
             path: "group/proj".to_string(),
         };
         // No request token + non-github provider → anonymous (no network call).
@@ -652,7 +661,7 @@ RwIDAQAB
         let broker = ProviderAwareBroker::new(registry).register("my-gitea", custom.clone());
 
         let repo = RepoId {
-            provider: ProviderInstanceId::new("my-gitea"),
+            workspace: ProviderInstanceId::new("my-gitea"),
             path: "org/repo".to_string(),
         };
         let token = broker
@@ -671,7 +680,7 @@ RwIDAQAB
 
         // A provider with no registered dynamic broker → StaticBroker → None.
         let repo = RepoId {
-            provider: ProviderInstanceId::new("gitlab"),
+            workspace: ProviderInstanceId::new("gitlab"),
             path: "group/proj".to_string(),
         };
         assert!(broker.fetch_credential(&repo, None).unwrap().is_none());

@@ -1159,7 +1159,7 @@ pub async fn register_added_without_build_for_provider(
 ) -> anyhow::Result<()> {
     use ripclone::provider::{ProviderInstanceId, RepoId};
     let repo_id = RepoId {
-        provider: ProviderInstanceId::new(provider),
+        workspace: ProviderInstanceId::new(provider),
         path: path.to_string(),
     };
     register_added_without_build_repo_id(server, repo_id).await

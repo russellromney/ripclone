@@ -119,7 +119,7 @@ pub trait RefStore: Send + Sync {
 
     /// List all repos that have a stored `RefInfo`.
     ///
-    /// Stored keys are provider-qualified as `{provider}/{escaped_path}`.
+    /// Stored keys are workspace-qualified as `{workspace}/{escaped_path}`.
     async fn list(&self) -> Result<Vec<RepoId>>;
 
     /// Load the `RefInfo` for a specific branch.
@@ -621,7 +621,7 @@ impl RefStore for FileRefStore {
 }
 
 /// S3-compatible ref store. Stores one object per repo under
-/// `{prefix}refs/{provider}/{escaped_path}.json`.
+/// `{prefix}refs/{workspace}/{escaped_path}.json`.
 pub struct S3RefStore {
     storage: Arc<S3Storage>,
 }

@@ -60,8 +60,8 @@ pub(crate) fn now_secs() -> i64 {
 #[derive(Debug, Clone)]
 pub struct ClaimedJob {
     pub id: i64,
-    /// Provider instance id (e.g. `github`), persisted so the worker can rebuild
-    /// the full [`RepoId`] and resolve provider-specific credentials.
+    /// Workspace id, persisted in the legacy `provider` column so existing
+    /// queue databases migrate without a table rewrite.
     pub provider: String,
     /// Opaque repo path (`owner/repo` for GitHub).
     pub path: String,
@@ -79,7 +79,7 @@ impl ClaimedJob {
     /// Reconstruct the repo identity for the build.
     pub fn repo_id(&self) -> RepoId {
         RepoId {
-            provider: ProviderInstanceId::new(self.provider.clone()),
+            workspace: ProviderInstanceId::new(self.provider.clone()),
             path: self.path.clone(),
         }
     }
@@ -797,7 +797,7 @@ impl JobQueue for SqlJobQueue {
             .db
             .insert_job(
                 &key,
-                job.repo_id.provider.as_str(),
+                job.repo_id.workspace.as_str(),
                 &job.repo_id.path,
                 &job.branch,
                 credential.as_deref(),

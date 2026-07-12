@@ -20,7 +20,12 @@ use std::path::{Path, PathBuf};
 pub struct Config {
     /// Ripclone server URL.
     pub server: Option<String>,
-    /// Default provider instance id (e.g. "github", "my-gitea").
+    /// Workspace selected by normal CLI commands.
+    pub default_workspace: Option<String>,
+    /// Canonical single-workspace upstream declaration. A workspace has one
+    /// provider connection; use another workspace for another provider.
+    pub workspace: Option<WorkspaceEntry>,
+    /// Deprecated alias for `default_workspace`.
     pub default_provider: Option<String>,
     /// Agent-fleet mode default. When true (or `RIPCLONE_AGENT` is set in the
     /// environment), clones use fleet-sane defaults: depth-1 history and no
@@ -57,6 +62,19 @@ pub struct ProviderEntry {
     pub token: Option<String>,
     pub auth_template: Option<String>,
     /// Optional header name for the credential. Defaults to `Authorization`.
+    pub auth_header_name: Option<String>,
+}
+
+/// A workspace's one upstream provider connection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceEntry {
+    /// Stable workspace id used in repository/artifact keys.
+    pub id: String,
+    /// `github` | `gitlab` | `gitea` | `generic`.
+    pub provider: String,
+    pub host: Option<String>,
+    pub token: Option<String>,
+    pub auth_template: Option<String>,
     pub auth_header_name: Option<String>,
 }
 
@@ -266,9 +284,19 @@ fn save_to(path: &Path, config: &Config) -> Result<()> {
 
 /// Merge two configs: `overrides` wins over `base`.
 impl Config {
+    /// Effective selected workspace, including the legacy
+    /// `default_provider` migration path.
+    pub fn selected_workspace(&self) -> Option<&str> {
+        self.default_workspace
+            .as_deref()
+            .or_else(|| self.workspace.as_ref().map(|w| w.id.as_str()))
+            .or(self.default_provider.as_deref())
+    }
+
     /// Convert declared provider entries into the internal `ProviderConfig` shape.
     pub fn provider_configs(&self) -> Vec<ProviderConfig> {
-        self.providers
+        let mut configs: Vec<_> = self
+            .providers
             .iter()
             .map(|(id, entry)| ProviderConfig {
                 id: id.clone(),
@@ -278,13 +306,31 @@ impl Config {
                 auth_template: entry.auth_template.clone(),
                 auth_header_name: entry.auth_header_name.clone(),
             })
-            .collect()
+            .collect();
+        if let Some(workspace) = &self.workspace {
+            configs.retain(|p| p.id != workspace.id);
+            configs.push(ProviderConfig {
+                id: workspace.id.clone(),
+                kind: Some(workspace.provider.clone()),
+                host: workspace.host.clone(),
+                token: workspace.token.clone(),
+                auth_template: workspace.auth_template.clone(),
+                auth_header_name: workspace.auth_header_name.clone(),
+            });
+        }
+        configs
     }
 }
 
 fn merge(overrides: Config, base: Config) -> Config {
+    let override_workspace_id = overrides.workspace.as_ref().map(|w| w.id.clone());
     Config {
         server: overrides.server.or(base.server),
+        default_workspace: overrides
+            .default_workspace
+            .or(override_workspace_id)
+            .or(base.default_workspace),
+        workspace: overrides.workspace.or(base.workspace),
         default_provider: overrides.default_provider.or(base.default_provider),
         agent: overrides.agent.or(base.agent),
         clone: CloneConfig {
@@ -447,6 +493,8 @@ machine = "l"
         );
         let cfg = Config {
             server: Some("https://ripclone.example.com".into()),
+            default_workspace: None,
+            workspace: None,
             default_provider: Some("my-gitea".into()),
             agent: None,
             clone: CloneConfig {
@@ -593,6 +641,98 @@ default_provider = "my-gitea"
         assert_eq!(p.host.as_deref(), Some("https://gitea.example.com"));
         assert_eq!(p.auth_template.as_deref(), Some("token {{token}}"));
         assert_eq!(p.token.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn canonical_workspace_config_maps_one_upstream_and_selects_it() {
+        let cfg: Config = toml::from_str(
+            r#"
+default_workspace = "acme"
+
+[workspace]
+id = "acme"
+provider = "gitlab"
+host = "https://gitlab.example.com"
+token = "secret"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.selected_workspace(), Some("acme"));
+        let configs = cfg.provider_configs();
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].id, "acme");
+        assert_eq!(configs[0].kind.as_deref(), Some("gitlab"));
+        assert_eq!(
+            configs[0].host.as_deref(),
+            Some("https://gitlab.example.com")
+        );
+    }
+
+    #[test]
+    fn legacy_default_provider_migrates_to_selected_workspace() {
+        let cfg: Config = toml::from_str(
+            r#"
+default_provider = "old-gitea"
+
+[providers.old-gitea]
+kind = "gitea"
+host = "https://gitea.example.com"
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.selected_workspace(), Some("old-gitea"));
+        assert_eq!(cfg.provider_configs()[0].id, "old-gitea");
+    }
+
+    #[test]
+    fn canonical_workspace_overrides_same_id_legacy_provider() {
+        let cfg: Config = toml::from_str(
+            r#"
+[workspace]
+id = "acme"
+provider = "gitlab"
+host = "gitlab.example.com"
+
+[providers.acme]
+kind = "gitea"
+host = "wrong.example.com"
+"#,
+        )
+        .unwrap();
+        let configs = cfg.provider_configs();
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].kind.as_deref(), Some("gitlab"));
+        assert_eq!(configs[0].host.as_deref(), Some("gitlab.example.com"));
+    }
+
+    #[test]
+    fn project_workspace_selection_is_not_shadowed_by_global_default() {
+        let global = Config {
+            default_workspace: Some("global".into()),
+            workspace: Some(WorkspaceEntry {
+                id: "global".into(),
+                provider: "github".into(),
+                host: None,
+                token: None,
+                auth_template: None,
+                auth_header_name: None,
+            }),
+            ..Config::default()
+        };
+        let project = Config {
+            workspace: Some(WorkspaceEntry {
+                id: "project".into(),
+                provider: "gitlab".into(),
+                host: None,
+                token: None,
+                auth_template: None,
+                auth_header_name: None,
+            }),
+            ..Config::default()
+        };
+        let merged = merge(project, global);
+        assert_eq!(merged.selected_workspace(), Some("project"));
     }
 
     #[test]

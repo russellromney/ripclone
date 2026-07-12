@@ -28,7 +28,7 @@ async fn main() -> Result<()> {
     let server_url = resolve_server_url(remote_name)?;
     let token_hash = resolve_server_token();
 
-    let client = Client::new_with_token(server_url, token_hash).with_provider(&provider);
+    let client = Client::new_with_token(server_url, token_hash).with_workspace(&provider);
 
     let (git_dir, work_tree) = git_dirs()?;
 

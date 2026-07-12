@@ -2047,7 +2047,7 @@ mod tests {
     fn authenticated_git_args_refuse_redirects() {
         let provider = leaky_provider("http://127.0.0.1:1/");
         let repo_id = RepoId {
-            provider: crate::provider::ProviderInstanceId::new("selfhost"),
+            workspace: crate::provider::ProviderInstanceId::new("selfhost"),
             path: "repo".to_string(),
         };
         let token = secrecy::SecretString::new("SECRETTOKEN".to_string().into());
@@ -2112,7 +2112,7 @@ mod tests {
 
         let provider = leaky_provider(&format!("http://{provider_addr}"));
         let repo_id = RepoId {
-            provider: crate::provider::ProviderInstanceId::new("selfhost"),
+            workspace: crate::provider::ProviderInstanceId::new("selfhost"),
             path: "repo".to_string(),
         };
         let token = secrecy::SecretString::new("SECRETTOKEN".to_string().into());

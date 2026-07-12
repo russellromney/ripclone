@@ -12,6 +12,8 @@ Internal tuning knobs use code constants at their current defaults.
   stores.
 - `RIPCLONE_UPSTREAM_TOKEN` - upstream provider credential sent as
   `X-Upstream-Token`. Equivalent to `--token`.
+- `RIPCLONE_WORKSPACE_ID` - workspace selected by normal CLI commands.
+  Equivalent to `--workspace`.
 - `RIPCLONE_MODE` - default clone mode when `--mode` is omitted: `editable` or
   `files`.
 - `RIPCLONE_AGENT` - agent-fleet mode. Truthy (`1`/`true`/`yes`/`on`) sets
@@ -27,7 +29,10 @@ Internal tuning knobs use code constants at their current defaults.
 ## Operator
 
 - `RIPCLONE_CONFIG` - path to the global `config.toml`.
-- `RIPCLONE_PROVIDERS` - JSON provider registry override.
+- `RIPCLONE_WORKSPACE` - JSON declaration for the deployment's workspace and
+  its one upstream provider connection. See [Workspace identity](WORKSPACES.md).
+- `RIPCLONE_PROVIDERS` - deprecated provider-registry migration input. Every
+  old provider instance maps to a workspace with the same ID.
 - `RIPCLONE_GITHUB_TOKEN` - token shortcut for the built-in GitHub provider.
 - `RIPCLONE_SERVER_TOKEN` / `RIPCLONE_SERVER_TOKEN_HASH` - server auth for
   clients and self-hosted servers.

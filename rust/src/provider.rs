@@ -1,12 +1,13 @@
-//! Provider / identity abstraction for multi-provider auth (Phases 0–2).
+//! Workspace identity and upstream-provider abstraction.
 //!
 //! This module introduces the addressing seam that lets ripclone move from the
 //! hard-coded GitHub `owner/repo` pair to arbitrary git hosts (GitLab
 //! subgroups, sourcehut `~user/repo`, Launchpad `+git` paths, self-hosted
 //! Gitea/Forgejo, etc.).
 //!
-//! Provider-qualified routes and CLI prefixes identify a configured provider
-//! instance; the bare `owner/repo` shape remains the GitHub default.
+//! A workspace owns exactly one upstream provider connection. Repository and
+//! artifact identity is workspace-qualified; provider kind/host are properties
+//! of that workspace rather than another routing dimension.
 //!
 //! Phase 3+ handoff notes:
 //! - Add OIDC / `Principal` / `authorize()` integration; `CredentialBroker` is
@@ -26,7 +27,7 @@ pub use crate::provider_config::load_registry;
 
 /// Built-in default instance id. All legacy `{owner}/{repo}` routes resolve to
 /// this instance.
-const DEFAULT_PROVIDER_ID: &str = "github";
+pub const DEFAULT_WORKSPACE_ID: &str = "github";
 
 /// Supported git host kinds. `Gitea` covers Forgejo/Codeberg; `Generic` is a
 /// config-only host that uses an explicit credential template.
@@ -68,9 +69,9 @@ impl std::str::FromStr for ProviderKind {
 /// `"company-gitea"`). This is a string newtype so callers cannot pass an
 /// arbitrary `&str` where an instance id is required.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub struct ProviderInstanceId(String);
+pub struct WorkspaceId(String);
 
-impl ProviderInstanceId {
+impl WorkspaceId {
     pub fn new(id: impl Into<String>) -> Self {
         Self(id.into())
     }
@@ -80,17 +81,37 @@ impl ProviderInstanceId {
     }
 }
 
-impl AsRef<str> for ProviderInstanceId {
+fn validate_workspace_id(id: &str) -> Result<()> {
+    if id.is_empty() || id.len() > 64 {
+        anyhow::bail!("workspace id must be 1..=64 characters");
+    }
+    if id == "." || id == ".." {
+        anyhow::bail!("workspace id must not be '.' or '..'");
+    }
+    if !id
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    {
+        anyhow::bail!("workspace id may contain only ASCII letters, digits, '-', '_' and '.'");
+    }
+    Ok(())
+}
+
+impl AsRef<str> for WorkspaceId {
     fn as_ref(&self) -> &str {
         &self.0
     }
 }
 
-impl std::fmt::Display for ProviderInstanceId {
+impl std::fmt::Display for WorkspaceId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
     }
 }
+
+/// Source-compatible name for pre-workspace integrations. Serialized values
+/// and storage keys are unchanged, so existing repositories migrate in place.
+pub type ProviderInstanceId = WorkspaceId;
 
 /// A configured git provider instance.
 ///
@@ -99,7 +120,9 @@ impl std::fmt::Display for ProviderInstanceId {
 /// placeholder; it overrides the preset's default header.
 #[derive(Debug, Clone)]
 pub struct ProviderInstance {
-    pub id: ProviderInstanceId,
+    /// Owning workspace. Kept on the connection during the compatibility
+    /// window because older call sites obtained identity from the provider.
+    pub id: WorkspaceId,
     pub kind: ProviderKind,
     pub host: String,
     /// Optional credential template for `Generic` hosts, or an override for
@@ -183,7 +206,21 @@ impl ProviderInstance {
 
     /// True for the built-in GitHub default instance.
     pub fn is_github_default(&self) -> bool {
-        self.id.as_str() == DEFAULT_PROVIDER_ID
+        self.id.as_str() == DEFAULT_WORKSPACE_ID
+    }
+}
+
+/// One ripclone workspace and its single upstream provider connection.
+#[derive(Debug, Clone)]
+pub struct Workspace {
+    pub id: WorkspaceId,
+    pub upstream: ProviderInstance,
+}
+
+impl Workspace {
+    fn new(id: WorkspaceId, mut upstream: ProviderInstance) -> Self {
+        upstream.id = id.clone();
+        Self { id, upstream }
     }
 }
 
@@ -270,32 +307,39 @@ pub struct ProviderConfig {
     pub auth_header_name: Option<String>,
 }
 
-/// Registry of configured provider instances.
+/// Registry of workspaces. Each workspace contains exactly one upstream
+/// provider connection.
 #[derive(Debug, Clone)]
-pub struct ProviderRegistry {
-    providers: HashMap<String, ProviderInstance>,
+pub struct WorkspaceRegistry {
+    workspaces: HashMap<String, Workspace>,
+    selected: String,
     /// Tier-B passthrough tokens keyed by instance id. Kept separate from
     /// `ProviderInstance` so the broker can decide whether to use a request
     /// token, a configured token, or (later) a minted Tier-A token.
     tokens: HashMap<String, secrecy::SecretString>,
 }
 
-impl ProviderRegistry {
+impl WorkspaceRegistry {
     /// Build a registry containing only the built-in GitHub default instance.
     pub fn new() -> Self {
-        let mut providers = HashMap::new();
-        providers.insert(
-            DEFAULT_PROVIDER_ID.to_string(),
-            ProviderInstance {
-                id: ProviderInstanceId::new(DEFAULT_PROVIDER_ID),
-                kind: ProviderKind::GitHub,
-                host: "github.com".to_string(),
-                auth_template: None,
-                auth_header_name: None,
-            },
+        let mut workspaces = HashMap::new();
+        let id = WorkspaceId::new(DEFAULT_WORKSPACE_ID);
+        workspaces.insert(
+            DEFAULT_WORKSPACE_ID.to_string(),
+            Workspace::new(
+                id.clone(),
+                ProviderInstance {
+                    id,
+                    kind: ProviderKind::GitHub,
+                    host: "github.com".to_string(),
+                    auth_template: None,
+                    auth_header_name: None,
+                },
+            ),
         );
         Self {
-            providers,
+            workspaces,
+            selected: DEFAULT_WORKSPACE_ID.to_string(),
             tokens: HashMap::new(),
         }
     }
@@ -312,9 +356,7 @@ impl ProviderRegistry {
     /// Merge a single provider config into the registry.
     pub fn merge_one(&mut self, cfg: ProviderConfig) -> Result<()> {
         let id = cfg.id;
-        if id.is_empty() {
-            anyhow::bail!("provider config entry missing id");
-        }
+        validate_workspace_id(&id).map_err(|e| anyhow::anyhow!("invalid workspace '{id}': {e}"))?;
 
         let kind = match cfg.kind.as_deref() {
             Some(k) => k.parse()?,
@@ -355,29 +397,63 @@ impl ProviderRegistry {
                 .insert(id.clone(), secrecy::SecretString::new(token.into()));
         }
 
-        self.providers.insert(
+        let workspace_id = WorkspaceId::new(id.clone());
+        self.workspaces.insert(
             id.clone(),
-            ProviderInstance {
-                id: ProviderInstanceId::new(id),
-                kind,
-                host,
-                auth_template: cfg.auth_template,
-                auth_header_name: cfg.auth_header_name,
-            },
+            Workspace::new(
+                workspace_id.clone(),
+                ProviderInstance {
+                    id: workspace_id,
+                    kind,
+                    host,
+                    auth_template: cfg.auth_template,
+                    auth_header_name: cfg.auth_header_name,
+                },
+            ),
         );
         Ok(())
     }
 
-    /// The default `github` instance. Always present.
+    /// Insert or replace a workspace's sole upstream connection.
+    pub fn merge_workspace(
+        &mut self,
+        id: impl Into<String>,
+        mut cfg: ProviderConfig,
+    ) -> Result<()> {
+        cfg.id = id.into();
+        self.merge_one(cfg)
+    }
+
+    /// The selected workspace's upstream provider.
     pub fn default_provider(&self) -> &ProviderInstance {
-        self.providers
-            .get(DEFAULT_PROVIDER_ID)
-            .expect("github default instance is always present")
+        &self
+            .workspaces
+            .get(&self.selected)
+            .expect("selected workspace is present")
+            .upstream
+    }
+
+    pub fn select_workspace(&mut self, id: &str) -> Result<()> {
+        if !self.workspaces.contains_key(id) {
+            anyhow::bail!("workspace '{id}' is not configured");
+        }
+        self.selected = id.to_string();
+        Ok(())
+    }
+
+    pub fn selected_workspace(&self) -> &Workspace {
+        self.workspaces
+            .get(&self.selected)
+            .expect("selected workspace is present")
+    }
+
+    pub fn workspace(&self, id: &str) -> Option<&Workspace> {
+        self.workspaces.get(id)
     }
 
     /// Look up an instance by id.
     pub fn get(&self, id: &str) -> Option<&ProviderInstance> {
-        self.providers.get(id)
+        self.workspaces.get(id).map(|w| &w.upstream)
     }
 
     /// Configured passthrough token for an instance, if any.
@@ -393,11 +469,18 @@ impl ProviderRegistry {
 
     /// Iterate over all configured instances.
     pub fn iter(&self) -> impl Iterator<Item = &ProviderInstance> {
-        self.providers.values()
+        self.workspaces.values().map(|w| &w.upstream)
+    }
+
+    pub fn iter_workspaces(&self) -> impl Iterator<Item = &Workspace> {
+        self.workspaces.values()
     }
 }
 
-impl Default for ProviderRegistry {
+/// Compatibility alias for provider-centric integrations.
+pub type ProviderRegistry = WorkspaceRegistry;
+
+impl Default for WorkspaceRegistry {
     fn default() -> Self {
         Self::new()
     }
@@ -412,7 +495,11 @@ impl Default for ProviderRegistry {
 /// legacy GitHub shape.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct RepoId {
-    pub provider: ProviderInstanceId,
+    // Keep the serialized field name for mixed-version server/worker rollouts.
+    // New readers accept `workspace`; a later protocol bump can flip the write
+    // name once old workers are no longer supported.
+    #[serde(rename = "provider", alias = "workspace")]
+    pub workspace: WorkspaceId,
     pub path: String,
 }
 
@@ -420,21 +507,22 @@ impl RepoId {
     /// Create a `RepoId` for the default `github` instance.
     pub fn github(path: impl Into<String>) -> Self {
         Self {
-            provider: ProviderInstanceId::new(DEFAULT_PROVIDER_ID),
+            workspace: WorkspaceId::new(DEFAULT_WORKSPACE_ID),
             path: path.into(),
         }
     }
 
     /// True when this repo belongs to the built-in `github` default instance.
     pub fn is_github_default(&self) -> bool {
-        self.provider.as_str() == DEFAULT_PROVIDER_ID
+        self.workspace.as_str() == DEFAULT_WORKSPACE_ID
     }
 
     /// Storage key used by `RefStore` implementations.
     ///
-    /// All providers use `{provider}/{escaped_path}`.
+    /// All workspaces use `{workspace}/{escaped_path}`. This is byte-compatible
+    /// with the old provider-qualified key.
     pub fn storage_key(&self) -> String {
-        format!("{}/{}", self.provider.as_str(), escape_path(&self.path))
+        format!("{}/{}", self.workspace.as_str(), escape_path(&self.path))
     }
 
     /// Human-readable key for operator-facing config (the webhook allowlist).
@@ -447,15 +535,19 @@ impl RepoId {
         if self.is_github_default() {
             self.path.clone()
         } else {
-            format!("{}/{}", self.provider.as_str(), self.path)
+            format!("{}/{}", self.workspace.as_str(), self.path)
         }
     }
 
     /// Directory name for the local bare mirror.
     ///
-    /// All providers use `{provider}_{escaped_path}.git`.
+    /// All workspaces use `{workspace}_{escaped_path}.git`.
     pub fn mirror_dir_name(&self) -> String {
-        format!("{}_{}.git", self.provider.as_str(), escape_path(&self.path))
+        format!(
+            "{}_{}.git",
+            self.workspace.as_str(),
+            escape_path(&self.path)
+        )
     }
 
     /// Convenience accessor for callers that still need the legacy owner/repo
@@ -530,12 +622,19 @@ fn decode_hex_byte(a: char, b: char) -> Option<u8> {
 ///
 /// Used by tools that list the ref store; not required by the hot path.
 pub fn parse_storage_key(key: &str) -> Option<RepoId> {
-    let (provider, rest) = key.split_once('/')?;
-    if provider.is_empty() || rest.is_empty() {
+    let (workspace, rest) = key.split_once('/')?;
+    // Be more permissive than new config validation so historical provider IDs
+    // such as `company:gitea` remain listable. Still reject traversal/control
+    // segments; newly created workspaces go through `validate_workspace_id`.
+    if workspace.is_empty()
+        || matches!(workspace, "." | "..")
+        || workspace.bytes().any(|b| b.is_ascii_control())
+        || rest.is_empty()
+    {
         return None;
     }
     Some(RepoId {
-        provider: ProviderInstanceId::new(provider),
+        workspace: WorkspaceId::new(workspace),
         path: unescape_path(rest),
     })
 }
@@ -616,12 +715,98 @@ mod tests {
     }
 
     #[test]
+    fn repo_id_reads_both_identity_names_and_writes_rolling_safe_name() {
+        let legacy = r#"{"provider":"acme","path":"org/repo"}"#;
+        let repo: RepoId = serde_json::from_str(legacy).unwrap();
+        assert_eq!(repo.workspace.as_str(), "acme");
+        assert_eq!(repo.storage_key(), "acme/org%2Frepo");
+        let canonical: RepoId =
+            serde_json::from_str(r#"{"workspace":"acme","path":"org/repo"}"#).unwrap();
+        assert_eq!(canonical, repo);
+
+        let encoded = serde_json::to_value(repo).unwrap();
+        assert_eq!(encoded["provider"], "acme");
+        assert!(encoded.get("workspace").is_none());
+        assert!(
+            serde_json::from_str::<RepoId>(
+                r#"{"provider":"acme","workspace":"evil","path":"org/repo"}"#
+            )
+            .is_err(),
+            "conflicting identity fields must fail closed"
+        );
+    }
+
+    #[test]
+    fn workspace_has_exactly_one_replaceable_upstream() {
+        let mut registry = WorkspaceRegistry::new();
+        registry
+            .merge_workspace(
+                "acme",
+                ProviderConfig {
+                    kind: Some("gitlab".into()),
+                    host: Some("gitlab.example.com".into()),
+                    ..ProviderConfig::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(registry.workspace("acme").unwrap().id.as_str(), "acme");
+        assert_eq!(registry.get("acme").unwrap().kind, ProviderKind::GitLab);
+
+        registry
+            .merge_workspace(
+                "acme",
+                ProviderConfig {
+                    kind: Some("gitea".into()),
+                    host: Some("gitea.example.com".into()),
+                    ..ProviderConfig::default()
+                },
+            )
+            .unwrap();
+        let workspace = registry.workspace("acme").unwrap();
+        assert_eq!(workspace.upstream.kind, ProviderKind::Gitea);
+        assert_eq!(workspace.upstream.host, "gitea.example.com");
+        registry.select_workspace("acme").unwrap();
+        assert_eq!(registry.selected_workspace().id.as_str(), "acme");
+        assert_eq!(registry.default_provider().kind, ProviderKind::Gitea);
+        assert_eq!(
+            registry
+                .iter_workspaces()
+                .filter(|w| w.id.as_str() == "acme")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn workspace_ids_reject_storage_and_route_ambiguity() {
+        for id in ["", ".", "..", "a/b", "a b", "a%2Fb", "🚀"] {
+            let mut registry = WorkspaceRegistry::new();
+            let err = registry
+                .merge_workspace(
+                    id,
+                    ProviderConfig {
+                        kind: Some("github".into()),
+                        ..ProviderConfig::default()
+                    },
+                )
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("invalid workspace"),
+                "{id:?}: {err:#}"
+            );
+        }
+        assert!(parse_storage_key("../org%2Frepo").is_none());
+        assert!(parse_storage_key("acme/org%2Frepo").is_some());
+        assert!(parse_storage_key("legacy:host/org%2Frepo").is_some());
+    }
+
+    #[test]
     fn natural_key_is_unescaped_and_provider_prefixed() {
         // github default: bare owner/repo.
         assert_eq!(RepoId::github("acme/widget").natural_key(), "acme/widget");
         // non-github: provider-prefixed, NOT slash-escaped (unlike storage_key).
         let gl = RepoId {
-            provider: ProviderInstanceId::new("gitlab"),
+            workspace: WorkspaceId::new("gitlab"),
             path: "group/sub/proj".to_string(),
         };
         assert_eq!(gl.natural_key(), "gitlab/group/sub/proj");
@@ -631,7 +816,7 @@ mod tests {
     #[test]
     fn gitlab_subgroup_path_is_escaped_and_prefixed() {
         let repo = RepoId {
-            provider: ProviderInstanceId::new("gitlab"),
+            workspace: WorkspaceId::new("gitlab"),
             path: "g/sub/proj".to_string(),
         };
         assert_eq!(repo.storage_key(), "gitlab/g%2Fsub%2Fproj");
@@ -683,7 +868,7 @@ mod tests {
     #[test]
     fn sourcehut_user_path_is_escaped_and_prefixed() {
         let repo = RepoId {
-            provider: ProviderInstanceId::new("sourcehut"),
+            workspace: WorkspaceId::new("sourcehut"),
             path: "~user/repo".to_string(),
         };
         assert_eq!(repo.storage_key(), "sourcehut/~user%2Frepo");
@@ -693,7 +878,7 @@ mod tests {
     #[test]
     fn launchpad_git_path_is_escaped_and_prefixed() {
         let repo = RepoId {
-            provider: ProviderInstanceId::new("launchpad"),
+            workspace: WorkspaceId::new("launchpad"),
             path: "~owner/project/+git/repo".to_string(),
         };
         // `+` does not need escaping for collision freedom; only `/`, `\`, `%`
@@ -712,11 +897,11 @@ mod tests {
     fn escape_is_collision_free_around_encoded_slash() {
         // "a/b" and "a%2Fb" must not collide after escaping.
         let plain = RepoId {
-            provider: ProviderInstanceId::new("gitea"),
+            workspace: WorkspaceId::new("gitea"),
             path: "a/b".to_string(),
         };
         let encoded = RepoId {
-            provider: ProviderInstanceId::new("gitea"),
+            workspace: WorkspaceId::new("gitea"),
             path: "a%2Fb".to_string(),
         };
         assert_ne!(plain.storage_key(), encoded.storage_key());
@@ -728,15 +913,15 @@ mod tests {
         let cases = vec![
             RepoId::github("owner/repo"),
             RepoId {
-                provider: ProviderInstanceId::new("gitlab"),
+                workspace: WorkspaceId::new("gitlab"),
                 path: "g/sub/proj".to_string(),
             },
             RepoId {
-                provider: ProviderInstanceId::new("sourcehut"),
+                workspace: WorkspaceId::new("sourcehut"),
                 path: "~user/repo".to_string(),
             },
             RepoId {
-                provider: ProviderInstanceId::new("gitea"),
+                workspace: WorkspaceId::new("gitea"),
                 path: "a%2Fb".to_string(),
             },
         ];
@@ -748,7 +933,7 @@ mod tests {
         assert_eq!(
             parse_storage_key("owner/repo").unwrap(),
             RepoId {
-                provider: ProviderInstanceId::new("owner"),
+                workspace: WorkspaceId::new("owner"),
                 path: "repo".to_string(),
             }
         );

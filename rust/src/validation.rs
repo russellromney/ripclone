@@ -167,7 +167,7 @@ mod tests {
     fn validate_repo_path_rejects_traversal_and_control_for_non_github() {
         let p = provider(ProviderKind::GitLab, "gitlab");
         let path = |s: &str| RepoId {
-            provider: crate::provider::ProviderInstanceId::new("gitlab"),
+            workspace: crate::provider::ProviderInstanceId::new("gitlab"),
             path: s.to_string(),
         };
         // Legit subgroup paths pass.

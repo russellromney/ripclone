@@ -149,6 +149,8 @@ pub struct RefResponse {
     pub owner: String,
     pub repo: String,
     #[serde(default)]
+    pub workspace: String,
+    #[serde(default)]
     pub provider: String,
     #[serde(default)]
     pub host: String,
@@ -618,8 +620,8 @@ pub struct Client {
     /// way the main client does.
     auth_header: Option<String>,
     cache: Option<Cas>,
-    /// Upstream git provider instance id (e.g. "github", "gitlab").
-    provider: String,
+    /// Workspace id. The server resolves its one configured upstream.
+    workspace: String,
     /// Upstream credential token sent as `X-Upstream-Token`.
     upstream_token: Option<String>,
     /// When true, suppress the post-clone metrics report regardless of env.
@@ -690,15 +692,20 @@ impl Client {
             raw_http: build_http_client(reqwest::header::HeaderMap::new()),
             auth_header: auth_value,
             cache,
-            provider: "github".to_string(),
+            workspace: "github".to_string(),
             upstream_token: None,
             skip_metrics: false,
         }
     }
 
-    pub fn with_provider(mut self, provider: impl Into<String>) -> Self {
-        self.provider = provider.into();
+    pub fn with_workspace(mut self, workspace: impl Into<String>) -> Self {
+        self.workspace = workspace.into();
         self
+    }
+
+    /// Compatibility alias for pre-workspace callers.
+    pub fn with_provider(self, provider: impl Into<String>) -> Self {
+        self.with_workspace(provider)
     }
 
     pub fn with_upstream_token(mut self, token: impl Into<String>) -> Self {
@@ -723,13 +730,12 @@ impl Client {
         url.rsplit('/').next().map(|s| s.to_string())
     }
 
-    /// Build a request URL for `repo_path`. GitHub repos keep the legacy
-    /// `/v1/repos/{owner}/{repo}` shape; other providers are routed under
-    /// `/v1/repos/{provider}/{repo_path}`.
+    /// Build a request URL for `repo_path`, qualified by the selected workspace.
+    /// The workspace resolves its sole upstream provider server-side.
     fn repo_url(&self, repo_path: &str, suffix: &str) -> String {
         format!(
             "{}/v1/repos/{}/{repo_path}{suffix}",
-            self.server, self.provider
+            self.server, self.workspace
         )
     }
 
@@ -1627,8 +1633,10 @@ impl Client {
             target.display(),
             mode
         );
-        let provider = if info.provider.is_empty() {
-            self.provider.clone()
+        let provider = if !info.workspace.is_empty() {
+            info.workspace.clone()
+        } else if info.provider.is_empty() {
+            self.workspace.clone()
         } else {
             info.provider.clone()
         };
