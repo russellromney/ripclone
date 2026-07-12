@@ -353,7 +353,7 @@ impl ArtifactSchedulerPersistence for LibsqlArtifactScheduler {
         let tx = self.tx().await?;
         let result=async{
   if one_i64(&tx,"SELECT count(*) FROM artifact_jobs WHERE state='running'",vec![]).await?>=self.limits.total_running as i64{return Ok(None)}let row=query_one(&tx,"SELECT fairness_cursor,workspace_cursor FROM scheduler_state WHERE id=1",vec![]).await?.context("scheduler control row missing")?;let cursor=row.get::<i64>(0)?;let wc=row.get::<String>(1)?;let lanes=[ArtifactKind::Head,ArtifactKind::Head,ArtifactKind::FullHistory,ArtifactKind::Files];
-  for off in 0..4 {let pos=(cursor as usize+off)%4;let kind=lanes[pos];if one_i64(&tx,"SELECT count(*) FROM artifact_jobs WHERE state='running' AND kind=?",vec![kind.as_str().into()]).await?>=self.running(kind) as i64{continue}let sql=if kind.expensive(){"SELECT q.id FROM artifact_jobs q WHERE q.state='queued' AND q.kind=? AND (SELECT count(*) FROM artifact_jobs x WHERE x.state='running' AND x.workspace=q.workspace)<? AND NOT EXISTS(SELECT 1 FROM artifact_jobs x WHERE x.state='running' AND x.workspace=q.workspace AND x.repo=q.repo AND x.kind IN('full_history','files')) ORDER BY CASE WHEN q.workspace>? THEN 0 ELSE 1 END,q.workspace,q.created_at,q.id LIMIT 1"}else{"SELECT q.id FROM artifact_jobs q WHERE q.state='queued' AND q.kind=? AND (SELECT count(*) FROM artifact_jobs x WHERE x.state='running' AND x.workspace=q.workspace)<? ORDER BY CASE WHEN q.workspace>? THEN 0 ELSE 1 END,q.workspace,q.created_at,q.id LIMIT 1"};let Some(id)=opt_i64(&tx,sql,vec![kind.as_str().into(),(self.limits.workspace_running as i64).into(),wc.clone().into()]).await? else{continue};let t=now(&tx).await?;if exec(&tx,"UPDATE artifact_jobs SET state='running',owner=?,heartbeat_at=?,lease_expires_at=?,lease_generation=lease_generation+1,claim_attempts=claim_attempts+1,updated_at=? WHERE id=? AND state='queued'",vec![owner.into(),t.into(),(t+lease).into(),t.into(),id.into()]).await?==1{let record=get_id(&tx,id).await?.context("claimed artifact disappeared")?;exec(&tx,"UPDATE scheduler_state SET fairness_cursor=?,workspace_cursor=? WHERE id=1",vec![(((pos+1)%4) as i64).into(),record.key.workspace.clone().into()]).await?;return Ok(Some(ClaimedArtifact{record}))}}
+  for off in 0..4 {let pos=(cursor as usize+off)%4;let kind=lanes[pos];if one_i64(&tx,"SELECT count(*) FROM artifact_jobs WHERE state='running' AND kind=?",vec![kind.as_str().into()]).await?>=self.running(kind) as i64{continue}let sql=if kind.expensive(){"SELECT q.id FROM artifact_jobs q WHERE q.state='queued' AND q.kind=? AND (SELECT count(*) FROM artifact_jobs x WHERE x.state='running' AND x.workspace=q.workspace)<? AND NOT EXISTS(SELECT 1 FROM artifact_jobs x WHERE x.state='running' AND x.workspace=q.workspace AND x.repo=q.repo AND x.kind=q.kind) ORDER BY CASE WHEN q.workspace>? THEN 0 ELSE 1 END,q.workspace,q.created_at,q.id LIMIT 1"}else{"SELECT q.id FROM artifact_jobs q WHERE q.state='queued' AND q.kind=? AND (SELECT count(*) FROM artifact_jobs x WHERE x.state='running' AND x.workspace=q.workspace)<? ORDER BY CASE WHEN q.workspace>? THEN 0 ELSE 1 END,q.workspace,q.created_at,q.id LIMIT 1"};let Some(id)=opt_i64(&tx,sql,vec![kind.as_str().into(),(self.limits.workspace_running as i64).into(),wc.clone().into()]).await? else{continue};let t=now(&tx).await?;if exec(&tx,"UPDATE artifact_jobs SET state='running',owner=?,heartbeat_at=?,lease_expires_at=?,lease_generation=lease_generation+1,claim_attempts=claim_attempts+1,updated_at=? WHERE id=? AND state='queued'",vec![owner.into(),t.into(),(t+lease).into(),t.into(),id.into()]).await?==1{let record=get_id(&tx,id).await?.context("claimed artifact disappeared")?;exec(&tx,"UPDATE scheduler_state SET fairness_cursor=?,workspace_cursor=? WHERE id=1",vec![(((pos+1)%4) as i64).into(),record.key.workspace.clone().into()]).await?;return Ok(Some(ClaimedArtifact{record}))}}
   Ok(None)}.await;
         finish(tx, result).await
     }
@@ -909,6 +909,38 @@ mod tests {
             Ok(_) => panic!("expected scheduler startup rejection"),
             Err(error) => error.to_string(),
         }
+    }
+
+    #[tokio::test]
+    async fn same_repo_different_expensive_kinds_run_independently() {
+        let Some(server) = server().await else { return };
+        let scheduler = scheduler(
+            &server.url,
+            SchedulerLimits {
+                total_running: 4,
+                full_history_running: 2,
+                files_running: 2,
+                workspace_running: 4,
+                ..Default::default()
+            },
+        )
+        .await;
+        scheduler
+            .schedule(&key("full-a", ArtifactKind::FullHistory))
+            .await
+            .unwrap();
+        scheduler
+            .schedule(&key("files-a", ArtifactKind::Files))
+            .await
+            .unwrap();
+        let first = scheduler.claim("first", 5).await.unwrap().unwrap();
+        scheduler
+            .schedule(&key("same-kind-newer", first.record.key.kind))
+            .await
+            .unwrap();
+        let sibling = scheduler.claim("sibling", 5).await.unwrap().unwrap();
+        assert_ne!(first.record.key.kind, sibling.record.key.kind);
+        assert!(scheduler.claim("blocked", 5).await.unwrap().is_none());
     }
 
     #[tokio::test]

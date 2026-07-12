@@ -919,7 +919,7 @@ impl ArtifactScheduler {
     let running:i64=sqlx::query_scalar("SELECT count(*) FROM artifact_jobs WHERE state='running' AND kind=?").bind(kind.as_str()).fetch_one(&mut *c).await?;
     if running as usize>=self.running_limit(kind){continue}
     let id:Option<i64>=if kind.expensive(){
-     sqlx::query_scalar("SELECT q.id FROM artifact_jobs q WHERE q.state='queued' AND q.kind=? AND (SELECT count(*) FROM artifact_jobs wr WHERE wr.state='running' AND wr.workspace=q.workspace)<? AND NOT EXISTS(SELECT 1 FROM artifact_jobs r WHERE r.state='running' AND r.workspace=q.workspace AND r.repo=q.repo AND r.kind IN('full_history','files')) ORDER BY CASE WHEN q.workspace>? THEN 0 ELSE 1 END,q.workspace,q.created_at,q.id LIMIT 1").bind(kind.as_str()).bind(self.limits.workspace_running as i64).bind(&workspace_cursor).fetch_optional(&mut *c).await?
+     sqlx::query_scalar("SELECT q.id FROM artifact_jobs q WHERE q.state='queued' AND q.kind=? AND (SELECT count(*) FROM artifact_jobs wr WHERE wr.state='running' AND wr.workspace=q.workspace)<? AND NOT EXISTS(SELECT 1 FROM artifact_jobs r WHERE r.state='running' AND r.workspace=q.workspace AND r.repo=q.repo AND r.kind=q.kind) ORDER BY CASE WHEN q.workspace>? THEN 0 ELSE 1 END,q.workspace,q.created_at,q.id LIMIT 1").bind(kind.as_str()).bind(self.limits.workspace_running as i64).bind(&workspace_cursor).fetch_optional(&mut *c).await?
     }else{sqlx::query_scalar("SELECT q.id FROM artifact_jobs q WHERE q.state='queued' AND q.kind=? AND (SELECT count(*) FROM artifact_jobs wr WHERE wr.state='running' AND wr.workspace=q.workspace)<? ORDER BY CASE WHEN q.workspace>? THEN 0 ELSE 1 END,q.workspace,q.created_at,q.id LIMIT 1").bind(kind.as_str()).bind(self.limits.workspace_running as i64).bind(&workspace_cursor).fetch_optional(&mut *c).await?};
     let Some(id)=id else{continue}; let now=db_now(&mut c).await?;
     let won=sqlx::query("UPDATE artifact_jobs SET state='running',owner=?,heartbeat_at=?,lease_expires_at=?,lease_generation=lease_generation+1,claim_attempts=claim_attempts+1,updated_at=? WHERE id=? AND state='queued'")
@@ -1419,6 +1419,8 @@ pub(crate) fn validate_evidence(c: &ClaimedArtifact, e: &CompletionEvidence) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::artifact_manifest::CasCompletionVerifier;
+    use crate::cas::Cas;
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -2088,6 +2090,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shared_database_fences_processes_with_different_proof_keys() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("proof-key-fleet.db");
+        let cas = Cas::new(root.path().join("cas")).unwrap();
+        let verifier_a = CasCompletionVerifier::new(cas.clone())
+            .with_proof_key(&[b'a'; 32])
+            .unwrap();
+        let verifier_b = CasCompletionVerifier::new(cas)
+            .with_proof_key(&[b'b'; 32])
+            .unwrap();
+        assert_ne!(verifier_a.identity(), verifier_b.identity());
+        let path = path.to_string_lossy();
+        let (a, b) = tokio::join!(
+            ArtifactScheduler::open_with_verifier(&path, Default::default(), Arc::new(verifier_a)),
+            ArtifactScheduler::open_with_verifier(&path, Default::default(), Arc::new(verifier_b))
+        );
+        assert_eq!(
+            [a.is_ok(), b.is_ok()].into_iter().filter(|ok| *ok).count(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn verified_completion_capability_is_attempt_and_verifier_instance_bound() {
         let (s, _d, _) = scheduler(Default::default()).await;
         let first_key = key("ws", "first", ArtifactKind::Head);
@@ -2147,7 +2172,8 @@ mod tests {
 
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let d = tempfile::tempdir().unwrap();
-        let path = d.path().join("always-verify.db").to_string_lossy();
+        let db_path = d.path().join("always-verify.db");
+        let path = db_path.to_string_lossy();
         let scheduler = ArtifactScheduler::open_with_verifier(
             &path,
             Default::default(),
@@ -2748,11 +2774,15 @@ mod tests {
         assert_eq!(a.record.key.kind, ArtifactKind::Head);
         let b = s.claim("b", 5).await.unwrap().unwrap();
         assert!(b.record.key.kind.expensive());
-        let c = s.claim("c", 5).await.unwrap();
-        assert!(
-            c.is_none(),
-            "same repo expensive exclusion plus HEAD cap must block"
-        );
+        // A newer generation of the running kind remains excluded, while the
+        // independent expensive sibling is allowed to run concurrently.
+        s.schedule(&key("ws", "same-kind-newer", b.record.key.kind))
+            .await
+            .unwrap();
+        let c = s.claim("c", 5).await.unwrap().unwrap();
+        assert!(c.record.key.kind.expensive());
+        assert_ne!(b.record.key.kind, c.record.key.kind);
+        assert!(s.claim("d", 5).await.unwrap().is_none());
     }
 
     #[tokio::test]

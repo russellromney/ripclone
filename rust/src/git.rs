@@ -2,7 +2,7 @@ use crate::provider::{ProviderInstance, RepoId};
 use anyhow::{Context, Result, bail};
 use secrecy::ExposeSecret;
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::AtomicBool;
@@ -537,6 +537,7 @@ pub fn list_object_shas<P: AsRef<Path>>(repo: P, commit: &str) -> Result<Vec<Str
 pub fn list_object_shas_bounded<P: AsRef<Path>>(
     repo: P,
     tips: &[String],
+    base_exclusive: &[String],
     max_depth: Option<usize>,
     max_objects: usize,
     max_object_bytes: u64,
@@ -550,6 +551,11 @@ pub fn list_object_shas_bounded<P: AsRef<Path>>(
         crate::validation::validate_object_id(tip)
             .with_context(|| format!("invalid pinned object tip: {tip}"))?;
     }
+    for base in base_exclusive {
+        crate::validation::validate_object_id(base)
+            .with_context(|| format!("invalid pinned exclusion: {base}"))?;
+    }
+    let source = crate::gix_util::open_repo(repo.as_ref())?;
     let mut command = Command::new("git");
     command
         .arg("-C")
@@ -558,63 +564,169 @@ pub fn list_object_shas_bounded<P: AsRef<Path>>(
     if let Some(depth) = max_depth {
         command.arg(format!("--max-count={}", depth.max(1)));
     }
-    command
-        .args(tips)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = command.spawn().context("spawn bounded git rev-list")?;
-    let stdout = child
-        .stdout
-        .take()
-        .context("capture bounded rev-list stdout")?;
-    let source = crate::gix_util::open_repo(repo.as_ref())?;
+    command.args(tips);
+    if !base_exclusive.is_empty() {
+        command.arg("--not").args(base_exclusive);
+    }
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let child = command.spawn().context("spawn bounded git rev-list")?;
     let mut seen = HashSet::new();
     let mut total = 0u64;
-    for line in std::io::BufRead::lines(std::io::BufReader::new(stdout)) {
-        if cancelled.is_cancelled() {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!("bounded object enumeration cancelled");
-        }
-        let oid = line.context("read bounded rev-list output")?;
+    consume_child_lines_cancellable(child, cancelled, |oid| {
         crate::validation::validate_object_id(&oid)
             .context("rev-list emitted invalid object id")?;
         if !seen.insert(oid.clone()) {
-            continue;
+            return Ok(());
         }
         if seen.len() > max_objects {
-            let _ = child.kill();
-            let _ = child.wait();
             bail!("Git object count exceeds builder limit");
         }
         let id = gix::hash::ObjectId::from_hex(oid.as_bytes())?;
         let size = source.find_header(id)?.size();
         if size > max_object_bytes {
-            let _ = child.kill();
-            let _ = child.wait();
             bail!("Git object exceeds per-object builder limit");
         }
         total = total
             .checked_add(size)
             .context("Git object size overflow")?;
         if total > max_total_bytes {
-            let _ = child.kill();
-            let _ = child.wait();
             bail!("Git object aggregate exceeds builder limit");
         }
-    }
-    let output = child
-        .wait_with_output()
-        .context("wait bounded git rev-list")?;
-    if !output.status.success() {
-        bail!(
-            "bounded git rev-list failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
+        Ok(())
+    })?;
     let mut objects = seen.into_iter().collect::<Vec<_>>();
     objects.sort();
     Ok(objects)
+}
+
+fn consume_child_lines_cancellable(
+    mut child: std::process::Child,
+    cancelled: &tokio_util::sync::CancellationToken,
+    mut consume: impl FnMut(String) -> Result<()>,
+) -> Result<()> {
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            kill_child_tree(&mut child);
+            let _ = child.wait();
+            bail!("capture bounded rev-list stdout");
+        }
+    };
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            kill_child_tree(&mut child);
+            let _ = child.wait();
+            bail!("capture bounded rev-list stderr");
+        }
+    };
+    // A reader thread owns the potentially blocking pipe. The owner of the
+    // child remains responsive to cancellation even when Git emits no newline
+    // (or no output at all), and the bounded channel prevents unbounded pipe
+    // buffering in this process.
+    let (lines_tx, lines_rx) = std::sync::mpsc::sync_channel(256);
+    let stdout_reader = std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut pending = Vec::with_capacity(41);
+        let mut chunk = [0u8; 4096];
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(read) => {
+                    for byte in &chunk[..read] {
+                        if *byte == b'\n' {
+                            if pending.last() == Some(&b'\r') {
+                                pending.pop();
+                            }
+                            let line =
+                                String::from_utf8(std::mem::take(&mut pending)).map_err(|error| {
+                                    std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+                                });
+                            if lines_tx.send(line).is_err() {
+                                return;
+                            }
+                        } else if pending.len() == 128 {
+                            let _ = lines_tx.send(Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "rev-list stdout line exceeds 128 bytes",
+                            )));
+                            return;
+                        } else {
+                            pending.push(*byte);
+                        }
+                    }
+                }
+                Err(error) => {
+                    let _ = lines_tx.send(Err(error));
+                    break;
+                }
+            }
+        }
+        if !pending.is_empty() {
+            let line = String::from_utf8(pending)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error));
+            let _ = lines_tx.send(line);
+        }
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stderr.take(64 * 1024).read_to_end(&mut bytes);
+        bytes
+    });
+    let collection = (|| -> Result<()> {
+        loop {
+            if cancelled.is_cancelled() {
+                bail!("bounded object enumeration cancelled");
+            }
+            let oid = match lines_rx.recv_timeout(Duration::from_millis(10)) {
+                Ok(line) => line.context("read bounded rev-list output")?,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            };
+            consume(oid)?;
+        }
+        Ok(())
+    })();
+    if collection.is_err() {
+        kill_child_tree(&mut child);
+    }
+    let status = match child.wait() {
+        Ok(status) => status,
+        Err(error) => {
+            kill_child_tree(&mut child);
+            let _ = child.wait();
+            drop(lines_rx);
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(error).context("wait bounded git rev-list");
+        }
+    };
+    drop(lines_rx);
+    let _ = stdout_reader.join();
+    let stderr = stderr_reader.join().unwrap_or_default();
+    collection?;
+    if !status.success() {
+        bail!(
+            "bounded git rev-list failed: {}",
+            String::from_utf8_lossy(&stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+fn kill_child_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    unsafe {
+        // rev-list is started as a process-group leader. Kill descendants too,
+        // otherwise a helper inheriting stdout can keep reader joins blocked.
+        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
+    let _ = child.kill();
 }
 
 /// List objects reachable from `to` but not from `from` — i.e. the objects
@@ -3672,5 +3784,71 @@ mod tests {
             head,
             "explicit peel syntax should still work"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellable_child_reader_kills_a_partial_line_stall_promptly() {
+        let token = tokio_util::sync::CancellationToken::new();
+        let trigger = token.clone();
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "printf partial-without-newline; sleep 30"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        std::os::unix::process::CommandExt::process_group(&mut command, 0);
+        let child = command.spawn().unwrap();
+        let started = std::time::Instant::now();
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            trigger.cancel();
+        });
+        let error = consume_child_lines_cancellable(child, &token, |_| Ok(())).unwrap_err();
+        canceller.join().unwrap();
+        assert!(error.to_string().contains("cancelled"));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "hung pipe child was not killed and reaped promptly"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellable_child_reader_reaps_on_consumer_validation_error() {
+        let token = tokio_util::sync::CancellationToken::new();
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "while true; do echo invalid; done"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        std::os::unix::process::CommandExt::process_group(&mut command, 0);
+        let child = command.spawn().unwrap();
+        let started = std::time::Instant::now();
+        let error = consume_child_lines_cancellable(child, &token, |_| {
+            anyhow::bail!("invalid helper output")
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("invalid helper output"));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "helper was not killed and reaped after validation failure"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellable_child_reader_bounds_unterminated_stdout_lines() {
+        let token = tokio_util::sync::CancellationToken::new();
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "head -c 1024 /dev/zero | tr '\\0' x; sleep 30"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        std::os::unix::process::CommandExt::process_group(&mut command, 0);
+        let started = std::time::Instant::now();
+        let error = consume_child_lines_cancellable(command.spawn().unwrap(), &token, |_| Ok(()))
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("exceeds 128 bytes"));
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 }

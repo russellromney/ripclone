@@ -7,8 +7,9 @@
 
 use crate::archive::ArchiveBuilder;
 use crate::artifact_manifest::{
-    ArtifactManifest, ArtifactPayload, CasBlob, CasCompletionVerifier, FULL_HISTORY_BASE_TIER,
-    FilesArtifact, FullHistoryArtifact, FullHistoryLevel, GitPackPair, GitlinkEntry, HeadArtifact,
+    ARTIFACT_FORMAT_VERSION, ArtifactManifest, ArtifactPayload, CasBlob, CasCompletionVerifier,
+    FULL_HISTORY_BASE_TIER, FilesArtifact, FullHistoryArtifact, FullHistoryLevel, GitPackPair,
+    GitlinkEntry, HeadArtifact,
 };
 use crate::artifact_scheduler::{
     ArtifactKey, ArtifactKind, ClaimedArtifact, CompletionEvidence, ExecutionContext,
@@ -19,7 +20,7 @@ use crate::git;
 use crate::pack::PackBuilder;
 use anyhow::{Context, Result, bail};
 use prost::Message;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 const DEFAULT_HEAD_PACK_RAW_BYTES: u64 = 16 * 1024 * 1024;
@@ -72,6 +73,10 @@ pub struct TypedArtifactBuilder {
     compression_level: i32,
     dictionary: Option<Vec<u8>>,
     limits: ArtifactBuildLimits,
+    #[cfg(test)]
+    history_enumerated_objects: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    #[cfg(test)]
+    history_enumerated_bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// A previously completed typed history artifact. Invalid, corrupt, unrelated,
@@ -83,8 +88,15 @@ pub struct HistoryReuseBase {
 }
 
 impl TypedArtifactBuilder {
-    pub fn new(mirror: impl AsRef<Path>, cas: Cas) -> Self {
-        let verifier = CasCompletionVerifier::new(cas.clone());
+    /// Construct a worker with the exact verifier policy established by the
+    /// normalized runtime factory. The scheduler and builder must receive
+    /// clones of this same startup-validated instance so proof authority,
+    /// limits, and fleet identity cannot drift within one process.
+    pub fn with_verifier(
+        mirror: impl AsRef<Path>,
+        cas: Cas,
+        verifier: CasCompletionVerifier,
+    ) -> Self {
         Self {
             mirror: mirror.as_ref().to_owned(),
             cas,
@@ -95,7 +107,17 @@ impl TypedArtifactBuilder {
             compression_level: 3,
             dictionary: None,
             limits: ArtifactBuildLimits::default(),
+            #[cfg(test)]
+            history_enumerated_objects: Default::default(),
+            #[cfg(test)]
+            history_enumerated_bytes: Default::default(),
         }
+    }
+
+    #[cfg(test)]
+    pub fn new(mirror: impl AsRef<Path>, cas: Cas) -> Self {
+        let verifier = CasCompletionVerifier::new(cas.clone());
+        Self::with_verifier(mirror, cas, verifier)
     }
 
     #[cfg(test)]
@@ -103,6 +125,15 @@ impl TypedArtifactBuilder {
         self.head_pack_raw_bytes = head.max(1);
         self.history_pack_raw_bytes = history.max(1);
         self
+    }
+
+    #[cfg(test)]
+    fn take_history_enumeration(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering;
+        (
+            self.history_enumerated_objects.swap(0, Ordering::Relaxed),
+            self.history_enumerated_bytes.swap(0, Ordering::Relaxed),
+        )
     }
 
     pub fn with_limits(mut self, limits: ArtifactBuildLimits) -> Result<Self> {
@@ -147,16 +178,9 @@ impl TypedArtifactBuilder {
             ArtifactKind::Files => self.build_files(&claim.record.key, context, attempt.path())?,
         };
         self.check_cancelled(context)?;
-        if evidence.key != claim.record.key {
+        if evidence.key() != &claim.record.key {
             bail!("completion evidence does not match claimed artifact key");
         }
-        self.verifier.verify_manifest_cancelled_in_scratch(
-            &evidence.key,
-            &evidence.manifest,
-            evidence.artifact_count,
-            &context.cancelled,
-            Some(attempt.path()),
-        )?;
         self.check_cancelled(context)?;
         Ok(evidence)
     }
@@ -176,6 +200,9 @@ impl TypedArtifactBuilder {
     }
 
     fn validate_pinned_target(&self, key: &ArtifactKey) -> Result<()> {
+        if key.format_version != ARTIFACT_FORMAT_VERSION {
+            bail!("unsupported typed artifact format version");
+        }
         Cas::validate_object_id(&key.commit)
             .context("artifact target is not a pinned object id")?;
         if git::object_type(&self.mirror, &key.commit)? != "commit" {
@@ -264,57 +291,35 @@ impl TypedArtifactBuilder {
         parents.sort();
         parents.dedup();
 
-        let desired = self
-            .bounded_closure(&parents, None, &context.cancelled)?
-            .into_iter()
-            .collect::<HashSet<_>>();
-        self.check_cancelled(context)?;
-        let (mut levels, already_present) =
-            self.safe_history_base(key, base, &desired, &context.cancelled, scratch);
-        let packer = PackBuilder::new_cancellable_in_scratch(
-            &self.mirror,
-            &self.cas,
-            scratch,
-            context.cancelled.clone(),
-        );
-
+        let mut levels = self.safe_history_base(key, base, &context.cancelled, scratch);
         if levels.is_empty() {
-            levels.push(FullHistoryLevel {
-                tier: FULL_HISTORY_BASE_TIER,
-                base_exclusive: Vec::new(),
-                tips: parents.clone(),
-                packs: pack_pairs(
-                    packer
-                        .build_object_set_packs(
-                            &desired.iter().cloned().collect::<Vec<_>>(),
-                            self.history_pack_raw_bytes,
-                            false,
-                        )
-                        .context("build cold exact history level")?,
-                ),
-            });
+            let desired = self.bounded_history_range(&parents, &[], &context.cancelled)?;
+            levels.push(self.build_sealed_history_level(
+                FULL_HISTORY_BASE_TIER,
+                Vec::new(),
+                parents.clone(),
+                desired,
+                context,
+                scratch,
+            )?);
         } else {
             let base_exclusive = levels
                 .last()
                 .map(|level| level.tips.clone())
                 .context("verified history base contains no levels")?;
-            let delta = desired
-                .difference(&already_present)
-                .cloned()
-                .collect::<Vec<_>>();
+            let delta =
+                self.bounded_history_range(&parents, &base_exclusive, &context.cancelled)?;
             if delta.is_empty() {
                 bail!("history update produced an empty semantic tail");
             }
-            levels.push(FullHistoryLevel {
-                tier: 0,
+            levels.push(self.build_sealed_history_level(
+                0,
                 base_exclusive,
-                tips: parents.clone(),
-                packs: pack_pairs(
-                    packer
-                        .build_object_set_packs(&delta, self.history_pack_raw_bytes, false)
-                        .context("build exact history level-zero tail")?,
-                ),
-            });
+                parents.clone(),
+                delta,
+                context,
+                scratch,
+            )?);
             self.compact_history_levels(&mut levels, context, scratch)?;
         }
 
@@ -327,20 +332,14 @@ impl TypedArtifactBuilder {
             // Safety limits are correctness boundaries, not LSM policy. If a
             // descriptor set crosses them, make one cold logical baseline; it
             // may still contain many practical physical packs.
-            levels = vec![FullHistoryLevel {
-                tier: FULL_HISTORY_BASE_TIER,
-                base_exclusive: Vec::new(),
-                tips: parents,
-                packs: pack_pairs(
-                    packer
-                        .build_object_set_packs(
-                            &desired.iter().cloned().collect::<Vec<_>>(),
-                            self.history_pack_raw_bytes,
-                            false,
-                        )
-                        .context("rebuild bounded cold history baseline")?,
-                ),
-            }];
+            levels = vec![self.build_sealed_history_level(
+                FULL_HISTORY_BASE_TIER,
+                Vec::new(),
+                parents.clone(),
+                self.bounded_history_range(&parents, &[], &context.cancelled)?,
+                context,
+                scratch,
+            )?];
             pack_count = history_pack_count(&levels)?;
             pack_bytes = history_level_bytes(&levels)?;
         }
@@ -382,97 +381,173 @@ impl TypedArtifactBuilder {
                 .context("history tail tier overflow")?;
             let base_exclusive = levels[left].base_exclusive.clone();
             let tips = levels[right].tips.clone();
-            let objects = self.history_range_objects(&tips, &base_exclusive, &context.cancelled)?;
-            let packs = PackBuilder::new_cancellable_in_scratch(
-                &self.mirror,
-                &self.cas,
-                scratch,
-                context.cancelled.clone(),
-            )
-            .build_object_set_packs(&objects, self.history_pack_raw_bytes, false)
-            .context("compact adjacent same-tier history ranges")?;
+            let objects = self.bounded_history_range(&tips, &base_exclusive, &context.cancelled)?;
             levels.splice(
                 left..=right,
-                [FullHistoryLevel {
+                [self.build_sealed_history_level(
                     tier,
                     base_exclusive,
                     tips,
-                    packs: pack_pairs(packs),
-                }],
+                    objects,
+                    context,
+                    scratch,
+                )?],
             );
             self.check_cancelled(context)?;
         }
         Ok(())
     }
 
-    fn history_range_objects(
+    fn build_sealed_history_level(
+        &self,
+        tier: u32,
+        base_exclusive: Vec<String>,
+        tips: Vec<String>,
+        mut objects: Vec<String>,
+        context: &ExecutionContext,
+        scratch: &Path,
+    ) -> Result<FullHistoryLevel> {
+        objects.sort();
+        objects.dedup();
+        let packs = PackBuilder::new_cancellable_in_scratch(
+            &self.mirror,
+            &self.cas,
+            scratch,
+            context.cancelled.clone(),
+        )
+        .build_object_set_packs(&objects, self.history_pack_raw_bytes, false)
+        .context("build exact sealed history level")?;
+        let mut level = FullHistoryLevel {
+            tier,
+            base_exclusive,
+            tips,
+            packs: pack_pairs(packs),
+            proof: crate::artifact_manifest::FullHistoryLevelProof::unsealed(),
+        };
+        self.verifier.verify_and_seal_history_level(
+            &mut level,
+            &objects,
+            &context.cancelled,
+            scratch,
+        )?;
+        Ok(level)
+    }
+
+    fn bounded_history_range(
         &self,
         tips: &[String],
         base_exclusive: &[String],
         cancelled: &tokio_util::sync::CancellationToken,
     ) -> Result<Vec<String>> {
-        let tips = self
-            .bounded_closure(tips, None, cancelled)?
-            .into_iter()
-            .collect::<HashSet<_>>();
-        let excluded = self
-            .bounded_closure(base_exclusive, None, cancelled)?
-            .into_iter()
-            .collect::<HashSet<_>>();
-        Ok(tips.difference(&excluded).cloned().collect())
+        let objects = git::list_object_shas_bounded(
+            &self.mirror,
+            tips,
+            base_exclusive,
+            None,
+            self.limits.git_objects,
+            self.limits.object_bytes,
+            self.limits.total_object_bytes,
+            cancelled,
+        )?;
+        #[cfg(test)]
+        {
+            let repo = crate::gix_util::open_repo(&self.mirror)?;
+            let bytes = objects.iter().try_fold(0u64, |total, oid| {
+                let id = gix::hash::ObjectId::from_hex(oid.as_bytes())?;
+                total
+                    .checked_add(repo.find_header(id)?.size())
+                    .context("history enumeration byte overflow")
+            })?;
+            self.history_enumerated_objects
+                .fetch_add(objects.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            self.history_enumerated_bytes
+                .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(objects)
     }
 
-    /// Return verified reusable descriptors and their semantic object set. Any
+    /// Return verified reusable descriptors. Any
     /// uncertainty deliberately returns an empty base: reuse is never required
     /// for correctness and a bad base must not poison a new publication.
     fn safe_history_base(
         &self,
         key: &ArtifactKey,
         base: Option<&HistoryReuseBase>,
-        desired: &HashSet<String>,
         cancelled: &tokio_util::sync::CancellationToken,
         scratch: &Path,
-    ) -> (Vec<FullHistoryLevel>, HashSet<String>) {
+    ) -> Vec<FullHistoryLevel> {
         let Some(base) = base else {
-            return (Vec::new(), HashSet::new());
+            return Vec::new();
         };
-        let attempt = || -> Result<(Vec<FullHistoryLevel>, HashSet<String>)> {
+        let attempt = || -> Result<Vec<FullHistoryLevel>> {
             if base.key.workspace != key.workspace
                 || base.key.repo != key.repo
                 || base.key.kind != ArtifactKind::FullHistory
                 || base.key.format_version != key.format_version
-                || base.evidence.key != base.key
+                || base.evidence.key() != &base.key
             {
                 bail!("history reuse base identity mismatch");
             }
             let manifest = self.verifier.verify_manifest_cancelled_in_scratch(
                 &base.key,
-                &base.evidence.manifest,
-                base.evidence.artifact_count,
+                base.evidence.manifest(),
+                base.evidence.artifact_count(),
                 cancelled,
                 Some(scratch),
             )?;
             let ArtifactPayload::FullHistory(history) = manifest.payload else {
                 bail!("history reuse base has wrong payload");
             };
-            if !desired.contains(&base.key.commit) {
+            if !self.is_ancestor_cancelled(&base.key.commit, &key.commit, cancelled)? {
                 bail!("history reuse base is not an ancestor of target");
             }
-            let raw = git::cat_file(&self.mirror, &base.key.commit)?;
-            let mut old = self
-                .bounded_closure(&commit_parents(&raw)?, None, cancelled)?
-                .into_iter()
-                .collect::<HashSet<_>>();
-            old.insert(base.key.commit.clone());
-            if !old.is_subset(desired) {
-                bail!("history reuse base is not a semantic subset");
-            }
-            // The old target anchor was not in its history packs. It is packed
-            // by the delta, while only the exact parent closure is marked reused.
-            old.remove(&base.key.commit);
-            Ok((history.levels, old))
+            Ok(history.levels)
         };
         attempt().unwrap_or_default()
+    }
+
+    fn is_ancestor_cancelled(
+        &self,
+        ancestor: &str,
+        descendant: &str,
+        cancelled: &tokio_util::sync::CancellationToken,
+    ) -> Result<bool> {
+        Cas::validate_object_id(ancestor)?;
+        Cas::validate_object_id(descendant)?;
+        let mut child = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&self.mirror)
+            .args(["merge-base", "--is-ancestor", ancestor, descendant])
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .context("spawn cancellable merge-base ancestry check")?;
+        loop {
+            if cancelled.is_cancelled() {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!("history ancestry check cancelled");
+            }
+            let status = match child.try_wait() {
+                Ok(status) => status,
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(error).context("poll merge-base ancestry check");
+                }
+            };
+            if let Some(status) = status {
+                return match status.code() {
+                    Some(0) => Ok(true),
+                    Some(1) => Ok(false),
+                    _ => bail!("git merge-base ancestry check failed with {status}"),
+                };
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
 
     fn build_files(
@@ -583,6 +658,7 @@ impl TypedArtifactBuilder {
         git::list_object_shas_bounded(
             &self.mirror,
             tips,
+            &[],
             depth,
             self.limits.git_objects,
             self.limits.object_bytes,
@@ -746,7 +822,11 @@ fn collect_tree_identities_bounded(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::artifact_scheduler::{ArtifactRecord, ArtifactState, CompletionVerifier};
+    use crate::artifact_scheduler::{
+        ArtifactRecord, ArtifactScheduler, ArtifactState, CompletionVerifier, ExecutionOutcome,
+    };
+    use crate::artifact_scheduler_backend::ArtifactSchedulerPersistence;
+    use std::collections::HashSet;
     use std::fs;
     use std::io::Write;
     use std::time::{Duration, Instant};
@@ -807,7 +887,7 @@ mod tests {
                         repo: "owner/repo".into(),
                         commit: commit.into(),
                         kind,
-                        format_version: 1,
+                        format_version: ARTIFACT_FORMAT_VERSION,
                     },
                     state: ArtifactState::Running,
                     owner: Some("worker".into()),
@@ -855,6 +935,90 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn owned_scheduler_runs_exactly_one_final_verification_per_build_kind() {
+        let f = Fixture::new();
+        let builder = f.builder();
+        let verifier = builder.verifier.clone();
+        fs::create_dir_all(&f.scratch).unwrap();
+        let database = f._root.path().join("owned-final-verification.db");
+        let scheduler = ArtifactScheduler::open_with_verifier(
+            &database.to_string_lossy(),
+            Default::default(),
+            std::sync::Arc::new(verifier.clone()),
+        )
+        .await
+        .unwrap();
+
+        for kind in [
+            ArtifactKind::Head,
+            ArtifactKind::Files,
+            ArtifactKind::FullHistory,
+        ] {
+            let key = f.claim(&f.second, kind).record.key;
+            scheduler.schedule(&key).await.unwrap();
+            let claim = scheduler.claim("worker", 5).await.unwrap().unwrap();
+            assert_eq!(claim.record.key, key);
+            assert_eq!(verifier.take_owned_verify_calls(), 0);
+            let outcome = ArtifactSchedulerPersistence::run_owned_build(
+                &scheduler,
+                &claim,
+                "worker",
+                builder.clone().owned_build(claim.clone(), None),
+                5,
+                &f.scratch,
+            )
+            .await
+            .unwrap();
+            assert_eq!(outcome, ExecutionOutcome::Ready);
+            assert_eq!(verifier.take_owned_verify_calls(), 1);
+        }
+
+        let base_claim = f.claim(&f.second, ArtifactKind::FullHistory);
+        let base_evidence = builder
+            .build_claim(&base_claim, &f.context(), None)
+            .unwrap();
+        verifier.verify(&base_claim, &base_evidence).unwrap();
+        let baseline_hashes = verifier
+            .take_level_scanned_hashes()
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let _ = verifier.take_level_scan_bytes();
+        fs::write(f.repo.join("incremental"), b"incremental\n").unwrap();
+        run(&f.repo, &["add", "."]);
+        run(&f.repo, &["commit", "--quiet", "-m", "incremental"]);
+        let target = run(&f.repo, &["rev-parse", "HEAD"]);
+        let key = f.claim(&target, ArtifactKind::FullHistory).record.key;
+        scheduler.schedule(&key).await.unwrap();
+        let claim = scheduler.claim("worker", 5).await.unwrap().unwrap();
+        assert_eq!(verifier.take_owned_verify_calls(), 0);
+        let outcome = ArtifactSchedulerPersistence::run_owned_build(
+            &scheduler,
+            &claim,
+            "worker",
+            builder.clone().owned_build(
+                claim.clone(),
+                Some(HistoryReuseBase {
+                    key: base_claim.record.key,
+                    evidence: base_evidence,
+                }),
+            ),
+            5,
+            &f.scratch,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, ExecutionOutcome::Ready);
+        assert_eq!(verifier.take_owned_verify_calls(), 1);
+        assert!(
+            verifier
+                .take_level_scanned_hashes()
+                .iter()
+                .all(|hash| !baseline_hashes.contains(hash)),
+            "incremental build rescanned an untouched history level"
+        );
+    }
+
     #[test]
     fn root_history_is_anchor_only() {
         let f = Fixture::new();
@@ -863,8 +1027,8 @@ mod tests {
         let manifest = CasCompletionVerifier::new(f.cas.clone())
             .verify_manifest(
                 &claim.record.key,
-                &evidence.manifest,
-                evidence.artifact_count,
+                evidence.manifest(),
+                evidence.artifact_count(),
             )
             .unwrap();
         let ArtifactPayload::FullHistory(history) = manifest.payload else {
@@ -919,8 +1083,8 @@ mod tests {
         let base_manifest = CasCompletionVerifier::new(f.cas.clone())
             .verify_manifest(
                 &base_claim.record.key,
-                &base_evidence.manifest,
-                base_evidence.artifact_count,
+                base_evidence.manifest(),
+                base_evidence.artifact_count(),
             )
             .unwrap();
         let ArtifactPayload::FullHistory(base_payload) = base_manifest.payload else {
@@ -947,8 +1111,8 @@ mod tests {
         let manifest = CasCompletionVerifier::new(f.cas.clone())
             .verify_manifest(
                 &claim.record.key,
-                &evidence.manifest,
-                evidence.artifact_count,
+                evidence.manifest(),
+                evidence.artifact_count(),
             )
             .unwrap();
         let ArtifactPayload::FullHistory(payload) = manifest.payload else {
@@ -974,8 +1138,8 @@ mod tests {
         let base_manifest = CasCompletionVerifier::new(f.cas.clone())
             .verify_manifest(
                 &base_claim.record.key,
-                &base_evidence.manifest,
-                base_evidence.artifact_count,
+                base_evidence.manifest(),
+                base_evidence.artifact_count(),
             )
             .unwrap();
         let ArtifactPayload::FullHistory(base_payload) = base_manifest.payload else {
@@ -995,8 +1159,8 @@ mod tests {
         let manifest = CasCompletionVerifier::new(f.cas.clone())
             .verify_manifest(
                 &claim.record.key,
-                &evidence.manifest,
-                evidence.artifact_count,
+                evidence.manifest(),
+                evidence.artifact_count(),
             )
             .unwrap();
         let ArtifactPayload::FullHistory(payload) = manifest.payload else {
@@ -1014,12 +1178,19 @@ mod tests {
             TypedArtifactBuilder::new(&f.repo, f.cas.clone()).with_pack_targets(u64::MAX, 1);
         let mut claim = f.claim(&f.second, ArtifactKind::FullHistory);
         let mut evidence = builder.build_claim(&claim, &f.context(), None).unwrap();
+        let baseline_scan_bytes = builder.verifier.take_level_scan_bytes();
+        assert!(baseline_scan_bytes > 0);
+        let baseline_scanned = builder
+            .verifier
+            .take_level_scanned_hashes()
+            .into_iter()
+            .collect::<HashSet<_>>();
         let baseline = {
             let manifest = CasCompletionVerifier::new(f.cas.clone())
                 .verify_manifest(
                     &claim.record.key,
-                    &evidence.manifest,
-                    evidence.artifact_count,
+                    evidence.manifest(),
+                    evidence.artifact_count(),
                 )
                 .unwrap();
             let ArtifactPayload::FullHistory(payload) = manifest.payload else {
@@ -1031,6 +1202,8 @@ mod tests {
         };
 
         for update in 1..=4 {
+            assert_eq!(builder.verifier.take_level_scan_bytes(), 0);
+            assert!(builder.verifier.take_level_scanned_hashes().is_empty());
             fs::write(f.repo.join(format!("tail-{update}")), format!("{update}\n")).unwrap();
             run(&f.repo, &["add", "."]);
             run(
@@ -1049,11 +1222,23 @@ mod tests {
                     }),
                 )
                 .unwrap();
+            let incremental_scan = builder.verifier.take_level_scan_bytes();
+            let incrementally_scanned = builder.verifier.take_level_scanned_hashes();
+            assert!(
+                incremental_scan > 0,
+                "new/compacted history level was not verified"
+            );
+            assert!(
+                incrementally_scanned
+                    .iter()
+                    .all(|hash| !baseline_scanned.contains(hash)),
+                "incremental verification rescanned an untouched baseline descriptor"
+            );
             let manifest = CasCompletionVerifier::new(f.cas.clone())
                 .verify_manifest(
                     &next_claim.record.key,
-                    &next_evidence.manifest,
-                    next_evidence.artifact_count,
+                    next_evidence.manifest(),
+                    next_evidence.artifact_count(),
                 )
                 .unwrap();
             let ArtifactPayload::FullHistory(payload) = manifest.payload else {
@@ -1072,6 +1257,79 @@ mod tests {
                 4 => assert_eq!(tiers, vec![FULL_HISTORY_BASE_TIER, 2]),
                 _ => unreachable!(),
             }
+            claim = next_claim;
+            evidence = next_evidence;
+        }
+    }
+
+    #[test]
+    fn incremental_history_enumerates_only_tail_or_carried_tiers() {
+        let f = Fixture::new();
+        for index in 0..200 {
+            fs::write(
+                f.repo.join(format!("bulk-{index:03}")),
+                vec![(index % 251) as u8; 4096],
+            )
+            .unwrap();
+        }
+        run(&f.repo, &["add", "."]);
+        run(&f.repo, &["commit", "--quiet", "-m", "large base"]);
+        run(
+            &f.repo,
+            &["commit", "--quiet", "--allow-empty", "-m", "base anchor"],
+        );
+        let base_target = run(&f.repo, &["rev-parse", "HEAD"]);
+        let builder = f.builder().with_pack_targets(u64::MAX, u64::MAX);
+        let mut claim = f.claim(&base_target, ArtifactKind::FullHistory);
+        let mut evidence = builder.build_claim(&claim, &f.context(), None).unwrap();
+        CasCompletionVerifier::new(f.cas.clone())
+            .verify(&claim, &evidence)
+            .unwrap();
+        let (cold_objects, cold_bytes) = builder.take_history_enumeration();
+        assert!(cold_objects > 200);
+        assert!(cold_bytes > 200 * 4096);
+        let baseline_scanned = builder
+            .verifier
+            .take_level_scanned_hashes()
+            .into_iter()
+            .collect::<HashSet<_>>();
+        assert!(!baseline_scanned.is_empty());
+        let _ = builder.verifier.take_level_scan_bytes();
+
+        for (index, expected_max_fraction) in [(1, 10), (2, 5)] {
+            fs::write(f.repo.join(format!("tiny-{index}")), format!("{index}\n")).unwrap();
+            run(&f.repo, &["add", "."]);
+            run(
+                &f.repo,
+                &["commit", "--quiet", "-m", &format!("tiny {index}")],
+            );
+            let target = run(&f.repo, &["rev-parse", "HEAD"]);
+            let next_claim = f.claim(&target, ArtifactKind::FullHistory);
+            let next_evidence = builder
+                .build_claim(
+                    &next_claim,
+                    &f.context(),
+                    Some(&HistoryReuseBase {
+                        key: claim.record.key.clone(),
+                        evidence,
+                    }),
+                )
+                .unwrap();
+            CasCompletionVerifier::new(f.cas.clone())
+                .verify(&next_claim, &next_evidence)
+                .unwrap();
+            let (objects, bytes) = builder.take_history_enumeration();
+            assert!(objects * expected_max_fraction < cold_objects);
+            assert!(bytes * expected_max_fraction < cold_bytes);
+            assert!(
+                builder
+                    .verifier
+                    .take_level_scanned_hashes()
+                    .iter()
+                    .all(|hash| !baseline_scanned.contains(hash)),
+                "tail/carry verification reread the immutable cold level"
+            );
+            assert!(builder.verifier.take_level_scan_bytes() > 0);
             claim = next_claim;
             evidence = next_evidence;
         }
@@ -1163,8 +1421,8 @@ mod tests {
         let manifest = CasCompletionVerifier::new(f.cas.clone())
             .verify_manifest(
                 &claim.record.key,
-                &evidence.manifest,
-                evidence.artifact_count,
+                evidence.manifest(),
+                evidence.artifact_count(),
             )
             .unwrap();
         let ArtifactPayload::Files(files) = manifest.payload else {

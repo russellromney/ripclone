@@ -1038,7 +1038,7 @@ impl ArtifactSchedulerPersistence for PostgresArtifactScheduler {
                             WHERE wr.state='running' AND wr.workspace=q.workspace) < $2
                        AND NOT EXISTS(SELECT 1 FROM artifact_jobs r
                            WHERE r.state='running' AND r.workspace=q.workspace AND r.repo=q.repo
-                             AND r.kind IN('full_history','files'))
+                             AND r.kind=q.kind)
                      ORDER BY CASE WHEN q.workspace>$3 THEN 0 ELSE 1 END,
                               q.workspace,q.created_at,q.id
                      LIMIT 1 FOR UPDATE OF q SKIP LOCKED",
@@ -1968,6 +1968,39 @@ mod tests {
         }))
         .await;
         assert_eq!(claims.iter().filter(|claim| claim.is_some()).count(), 2);
+
+        // Same-repo exclusion is per artifact kind: Files and FullHistory are
+        // independent products and must not recreate a phase sequence.
+        reset(&control).await;
+        let independent = PostgresArtifactScheduler::from_pool(
+            PgPoolOptions::new().connect(&url).await.unwrap(),
+            SchedulerLimits {
+                total_running: 4,
+                full_history_running: 2,
+                files_running: 2,
+                workspace_running: 4,
+                ..Default::default()
+            },
+            Arc::new(Accept),
+        )
+        .await
+        .unwrap();
+        independent
+            .schedule(&key("full-a", ArtifactKind::FullHistory))
+            .await
+            .unwrap();
+        independent
+            .schedule(&key("files-a", ArtifactKind::Files))
+            .await
+            .unwrap();
+        let first = independent.claim("first", 5).await.unwrap().unwrap();
+        independent
+            .schedule(&key("same-kind-newer", first.record.key.kind))
+            .await
+            .unwrap();
+        let sibling = independent.claim("sibling", 5).await.unwrap().unwrap();
+        assert_ne!(first.record.key.kind, sibling.record.key.kind);
+        assert!(independent.claim("blocked", 5).await.unwrap().is_none());
 
         // Aggregate expensive additions, not each kind independently, must
         // preserve the reserved HEAD backlog.

@@ -11,6 +11,7 @@ use crate::artifact_scheduler::{
 use crate::cas::Cas;
 use crate::manifest::MetadataChunk;
 use anyhow::{Context, Result, bail};
+use hmac::{Hmac, KeyInit, Mac};
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use sha1::{Digest as _, Sha1};
@@ -57,8 +58,41 @@ fn verification_cancelled() -> bool {
     })
 }
 
-pub const ARTIFACT_MANIFEST_SCHEMA: u32 = 1;
+/// Wire/storage generation for typed artifacts. Any change to manifest payload
+/// shape must advance both constants before old scheduler rows can collide
+/// with newly built evidence.
+pub const ARTIFACT_MANIFEST_SCHEMA: u32 = 2;
+pub const ARTIFACT_FORMAT_VERSION: u32 = 2;
 pub const PRODUCTION_VERIFIER_IDENTITY: &str = "ripclone-typed-cas-artifact-v1";
+
+fn verifier_identity(limits: &ArtifactVerificationLimits, proof_key: Option<&[u8]>) -> String {
+    use sha2::Digest;
+    let base = if limits == &ArtifactVerificationLimits::default() {
+        PRODUCTION_VERIFIER_IDENTITY.to_owned()
+    } else {
+        limits.verifier_identity()
+    };
+    match proof_key {
+        Some(key) => {
+            let mut digest = Sha256::new();
+            digest.update(b"ripclone/artifact-proof-key-id/v1\0");
+            digest.update(key);
+            format!("{base}:proof:{}", hex::encode(digest.finalize()))
+        }
+        None => format!("{base}:proof:none"),
+    }
+}
+
+fn configured_proof_key() -> Option<std::sync::Arc<Vec<u8>>> {
+    // This authority is deliberately separate from client/server auth and job
+    // bearer tokens. Only trusted verifier processes receive it.
+    let configured = std::env::var("RIPCLONE_ARTIFACT_PROOF_KEY").ok();
+    #[cfg(test)]
+    let configured = configured.or_else(|| Some("ripclone-test-artifact-proof-key-32bytes".into()));
+    configured
+        .filter(|value| value.len() >= 32)
+        .map(|value| std::sync::Arc::new(value.into_bytes()))
+}
 pub const FULL_HISTORY_BASE_TIER: u32 = 63;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -250,6 +284,41 @@ pub struct FullHistoryLevel {
     pub base_exclusive: Vec<String>,
     pub tips: Vec<String>,
     pub packs: Vec<GitPackPair>,
+    /// Verifier-authenticated proof that `packs` contain exactly this level's
+    /// semantic object set. Reuse validates this small receipt and immutable CAS
+    /// descriptors instead of rescanning old pack bytes.
+    pub proof: FullHistoryLevelProof,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FullHistoryLevelProof {
+    pub verifier: String,
+    pub object_count: u64,
+    pub object_set_digest: String,
+    pub seal: String,
+}
+
+impl FullHistoryLevelProof {
+    pub(crate) fn unsealed() -> Self {
+        Self {
+            verifier: String::new(),
+            object_count: 0,
+            object_set_digest: String::new(),
+            seal: String::new(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct HistoryLevelSealPayload<'a> {
+    verifier: &'a str,
+    tier: u32,
+    base_exclusive: &'a [String],
+    tips: &'a [String],
+    packs: &'a [GitPackPair],
+    object_count: u64,
+    object_set_digest: &'a str,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -332,7 +401,9 @@ pub struct ArtifactManifest {
 impl ArtifactManifest {
     pub fn new(key: &ArtifactKey, payload: ArtifactPayload) -> Result<Self> {
         validate_commit_oid(&key.commit)?;
-        if key.workspace.trim().is_empty() || key.repo.trim().is_empty() || key.format_version == 0
+        if key.workspace.trim().is_empty()
+            || key.repo.trim().is_empty()
+            || key.format_version != ARTIFACT_FORMAT_VERSION
         {
             bail!("artifact manifest key is invalid");
         }
@@ -373,7 +444,7 @@ impl ArtifactManifest {
         validate_commit_oid(&self.key.commit)?;
         if self.key.workspace.trim().is_empty()
             || self.key.repo.trim().is_empty()
-            || self.key.format_version == 0
+            || self.key.format_version != ARTIFACT_FORMAT_VERSION
             || self.payload.kind() != self.key.kind
         {
             bail!("artifact manifest key/payload mismatch");
@@ -443,29 +514,194 @@ pub struct CasCompletionVerifier {
     cas: Cas,
     limits: ArtifactVerificationLimits,
     identity: String,
+    proof_key: Option<std::sync::Arc<Vec<u8>>>,
+    level_scan_bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    #[cfg(test)]
+    owned_verify_calls: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    #[cfg(test)]
+    level_scanned_hashes: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl CasCompletionVerifier {
     pub fn new(cas: Cas) -> Self {
+        let limits = ArtifactVerificationLimits::default();
+        let proof_key = configured_proof_key();
         Self {
             cas,
-            limits: ArtifactVerificationLimits::default(),
-            identity: PRODUCTION_VERIFIER_IDENTITY.to_owned(),
+            identity: verifier_identity(&limits, proof_key.as_deref().map(Vec::as_slice)),
+            limits,
+            proof_key,
+            level_scan_bytes: Default::default(),
+            #[cfg(test)]
+            owned_verify_calls: Default::default(),
+            #[cfg(test)]
+            level_scanned_hashes: Default::default(),
         }
+    }
+
+    /// Production constructor: normalized scheduling must fail readiness when
+    /// the dedicated proof authority is absent or too short.
+    pub fn from_env(cas: Cas) -> Result<Self> {
+        Self::from_env_with_limits(cas, ArtifactVerificationLimits::default())
+    }
+
+    pub fn from_env_with_limits(cas: Cas, limits: ArtifactVerificationLimits) -> Result<Self> {
+        let key = std::env::var("RIPCLONE_ARTIFACT_PROOF_KEY")
+            .context("RIPCLONE_ARTIFACT_PROOF_KEY must be set for normalized artifacts")?;
+        Self::with_limits(cas, limits)?
+            .with_proof_key(key.as_bytes())
+            .context("RIPCLONE_ARTIFACT_PROOF_KEY must contain at least 32 bytes")
     }
 
     pub fn with_limits(cas: Cas, limits: ArtifactVerificationLimits) -> Result<Self> {
         limits.validate()?;
-        let identity = if limits == ArtifactVerificationLimits::default() {
-            PRODUCTION_VERIFIER_IDENTITY.to_owned()
-        } else {
-            limits.verifier_identity()
-        };
+        let proof_key = configured_proof_key();
+        let identity = verifier_identity(&limits, proof_key.as_deref().map(Vec::as_slice));
         Ok(Self {
             cas,
             limits,
             identity,
+            proof_key,
+            level_scan_bytes: Default::default(),
+            #[cfg(test)]
+            owned_verify_calls: Default::default(),
+            #[cfg(test)]
+            level_scanned_hashes: Default::default(),
         })
+    }
+
+    pub fn with_proof_key(mut self, key: &[u8]) -> Result<Self> {
+        if key.len() < 32 {
+            bail!("artifact proof key must contain at least 32 bytes");
+        }
+        self.proof_key = Some(std::sync::Arc::new(key.to_vec()));
+        self.identity = verifier_identity(&self.limits, Some(key));
+        Ok(self)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_level_scan_bytes(&self) -> u64 {
+        self.level_scan_bytes
+            .swap(0, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_level_scanned_hashes(&self) -> Vec<String> {
+        std::mem::take(&mut *self.level_scanned_hashes.lock().unwrap())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_owned_verify_calls(&self) -> u64 {
+        self.owned_verify_calls
+            .swap(0, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Verify one freshly built/compacted level exactly once and attach a
+    /// durable authenticated receipt. Future syncs validate the receipt and CAS
+    /// descriptors in O(level-count), without rereading untouched pack bytes.
+    pub(crate) fn verify_and_seal_history_level(
+        &self,
+        level: &mut FullHistoryLevel,
+        expected_objects: &[String],
+        cancelled: &tokio_util::sync::CancellationToken,
+        scratch: &Path,
+    ) -> Result<()> {
+        let key = self
+            .proof_key
+            .as_ref()
+            .context("artifact proof key is required to seal history levels")?;
+        if cancelled.is_cancelled() {
+            bail!("history level verification cancelled");
+        }
+        let previous =
+            VERIFICATION_CANCEL.with(|slot| slot.borrow_mut().replace(cancelled.clone()));
+        let previous_scratch =
+            VERIFICATION_SCRATCH.with(|slot| slot.borrow_mut().replace(scratch.to_path_buf()));
+        let _guard = VerificationCancelGuard {
+            token: previous,
+            scratch: previous_scratch,
+        };
+        let repo = self.materialize_packs(&level.packs)?;
+        let scanned = level.packs.iter().try_fold(0u64, |total, pair| {
+            total
+                .checked_add(pair.pack.len)
+                .and_then(|value| value.checked_add(pair.index.len))
+                .context("history level scan byte overflow")
+        })?;
+        self.level_scan_bytes
+            .fetch_add(scanned, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(test)]
+        self.level_scanned_hashes.lock().unwrap().extend(
+            level
+                .packs
+                .iter()
+                .flat_map(|pair| [pair.pack.hash.clone(), pair.index.hash.clone()]),
+        );
+        let actual = packed_object_ids(repo.path(), self.limits.git_objects)?;
+        let mut expected = expected_objects.to_vec();
+        expected.sort();
+        if expected.windows(2).any(|pair| pair[0] == pair[1]) {
+            bail!("expected history level object set contains duplicates");
+        }
+        if actual != expected {
+            bail!("history level packs do not match expected exact object set");
+        }
+        let object_set_digest = object_set_digest(&expected);
+        let verifier = self.identity.clone();
+        let seal = history_level_seal(
+            key,
+            &verifier,
+            level,
+            expected.len() as u64,
+            &object_set_digest,
+        )?;
+        level.proof = FullHistoryLevelProof {
+            verifier,
+            object_count: expected.len() as u64,
+            object_set_digest,
+            seal,
+        };
+        Ok(())
+    }
+
+    fn verify_history_level_receipt(&self, level: &FullHistoryLevel) -> Result<()> {
+        // This O(levels) path relies on immutable content addressing after the
+        // initial exact scan. Downloaders still hash every CAS object, and an
+        // independent storage scrub must quarantine same-length at-rest damage;
+        // routine sync never trades back to O(total-history) rescans.
+        let key = self
+            .proof_key
+            .as_ref()
+            .context("artifact proof key is required to verify history receipt")?;
+        if level.proof.verifier != self.identity
+            || level.proof.object_count == 0
+            || !is_sha256(&level.proof.object_set_digest)
+            || !is_sha256(&level.proof.seal)
+        {
+            bail!("history level proof envelope is invalid");
+        }
+        let expected = history_level_seal(
+            key,
+            &level.proof.verifier,
+            level,
+            level.proof.object_count,
+            &level.proof.object_set_digest,
+        )?;
+        if !constant_time_eq(expected.as_bytes(), level.proof.seal.as_bytes()) {
+            bail!("history level proof authentication failed");
+        }
+        for pair in &level.packs {
+            for (role, blob) in [("pack", &pair.pack), ("index", &pair.index)] {
+                Cas::validate_artifact_id(&blob.hash)?;
+                let actual = std::fs::metadata(self.cas.path(&blob.hash))
+                    .with_context(|| format!("stat proved history {role}"))?
+                    .len();
+                if actual != blob.len {
+                    bail!("proved history {role} length mismatch");
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn verify_manifest(
@@ -750,6 +986,7 @@ impl CasCompletionVerifier {
             }
             previous_tips = Some(level.tips.as_slice());
             previous_tier = level.tier;
+            self.verify_history_level_receipt(level)?;
         }
         if history.levels.last().map(|level| level.tips.as_slice())
             != Some(expected_tips.as_slice())
@@ -757,56 +994,7 @@ impl CasCompletionVerifier {
             bail!("history levels do not terminate at the target parents");
         }
 
-        let packs = history
-            .levels
-            .iter()
-            .flat_map(|level| level.packs.iter().cloned())
-            .collect::<Vec<_>>();
-        let repo = self.materialize_packs(&packs)?;
-        for level in &history.levels {
-            self.verify_history_level(repo.path(), level)?;
-        }
-        for parent in &parsed.parents {
-            git(
-                repo.path(),
-                &["cat-file", "-e", &format!("{parent}^{{commit}}")],
-            )?;
-            git(
-                repo.path(),
-                &["fsck", "--connectivity-only", "--no-dangling", parent],
-            )?;
-        }
-        let parents = parsed
-            .parents
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>();
-        compare_exact_object_sets(repo.path(), &parents, self.limits.git_objects)?;
         Ok(())
-    }
-
-    fn verify_history_level(&self, complete: &Path, level: &FullHistoryLevel) -> Result<()> {
-        let repo = self.materialize_packs(&level.packs)?;
-        let info = repo.path().join(".git/objects/info");
-        std::fs::create_dir_all(&info)?;
-        let alternate = complete.join(".git/objects").canonicalize()?;
-        std::fs::write(
-            info.join("alternates"),
-            format!("{}\n", alternate.display()),
-        )?;
-        let exclusions = level
-            .base_exclusive
-            .iter()
-            .map(|oid| format!("^{oid}"))
-            .collect::<Vec<_>>();
-        let revisions = level
-            .tips
-            .iter()
-            .map(String::as_str)
-            .chain(exclusions.iter().map(String::as_str))
-            .collect::<Vec<_>>();
-        compare_exact_object_sets(repo.path(), &revisions, self.limits.git_objects)
-            .context("history level does not match its declared exact range")
     }
 
     fn verify_files(&self, commit: &str, files: &FilesArtifact) -> Result<()> {
@@ -923,10 +1111,14 @@ impl CompletionVerifier for CasCompletionVerifier {
     }
 
     fn verify(&self, claim: &ClaimedArtifact, evidence: &CompletionEvidence) -> Result<()> {
-        if evidence.key != claim.record.key {
+        if evidence.key() != &claim.record.key {
             bail!("completion evidence does not match claimed artifact key");
         }
-        self.verify_manifest(&evidence.key, &evidence.manifest, evidence.artifact_count)?;
+        self.verify_manifest(
+            evidence.key(),
+            evidence.manifest(),
+            evidence.artifact_count(),
+        )?;
         Ok(())
     }
 
@@ -936,13 +1128,16 @@ impl CompletionVerifier for CasCompletionVerifier {
         evidence: &CompletionEvidence,
         context: &crate::artifact_scheduler::ExecutionContext,
     ) -> Result<()> {
-        if evidence.key != claim.record.key {
+        #[cfg(test)]
+        self.owned_verify_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if evidence.key() != &claim.record.key {
             bail!("completion evidence does not match claimed artifact key");
         }
         self.verify_manifest_cancelled_in_scratch(
-            &evidence.key,
-            &evidence.manifest,
-            evidence.artifact_count,
+            evidence.key(),
+            evidence.manifest(),
+            evidence.artifact_count(),
             &context.cancelled,
             Some(&context.scratch),
         )?;
@@ -1545,6 +1740,105 @@ fn external_sort(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn packed_object_ids(repo: &Path, maximum: u64) -> Result<Vec<String>> {
+    let mut objects = Vec::new();
+    for entry in std::fs::read_dir(repo.join(".git/objects/pack"))? {
+        let path = entry?.path();
+        if path.extension().is_none_or(|ext| ext != "idx") {
+            continue;
+        }
+        let mut command = Command::new("git");
+        configure_git_command(&mut command);
+        let mut child = command
+            .arg("-C")
+            .arg(repo)
+            .args(["verify-pack", "-v"])
+            .arg(path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let stdout = child.stdout.take().context("capture verify-pack output")?;
+        let enumeration = (|| -> Result<()> {
+            for line in BufReader::new(stdout).lines() {
+                if verification_cancelled() {
+                    bail!("history level verification cancelled");
+                }
+                let line = line?;
+                let Some(oid) = line.split_ascii_whitespace().next() else {
+                    continue;
+                };
+                if is_oid(oid) {
+                    if objects.len() as u64 >= maximum {
+                        bail!("history level object count exceeds verifier limit");
+                    }
+                    objects.push(oid.to_owned());
+                }
+            }
+            Ok(())
+        })();
+        if enumeration.is_err() {
+            let _ = child.kill();
+        }
+        let status = child.wait()?;
+        enumeration?;
+        if !status.success() {
+            bail!("history level pack enumeration failed");
+        }
+    }
+    objects.sort();
+    if objects.windows(2).any(|pair| pair[0] == pair[1]) {
+        bail!("duplicate object appears across history level packs");
+    }
+    Ok(objects)
+}
+
+fn object_set_digest(objects: &[String]) -> String {
+    use sha2::Digest;
+    let mut digest = Sha256::new();
+    for oid in objects {
+        digest.update(oid.as_bytes());
+        digest.update(b"\n");
+    }
+    hex::encode(digest.finalize())
+}
+
+fn history_level_seal(
+    key: &[u8],
+    verifier: &str,
+    level: &FullHistoryLevel,
+    object_count: u64,
+    object_set_digest: &str,
+) -> Result<String> {
+    let payload = serde_json::to_vec(&HistoryLevelSealPayload {
+        verifier,
+        tier: level.tier,
+        base_exclusive: &level.base_exclusive,
+        tips: &level.tips,
+        packs: &level.packs,
+        object_count,
+        object_set_digest,
+    })?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(key)?;
+    mac.update(&payload);
+    Ok(hex::encode(mac.finalize().into_bytes()))
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .fold(0u8, |difference, (left, right)| difference | (left ^ right))
+            == 0
+}
+
 fn is_oid(value: &str) -> bool {
     value.len() == 40
         && value
@@ -1709,7 +2003,7 @@ mod tests {
                 repo: "owner/repo".into(),
                 commit: self.second.clone(),
                 kind,
-                format_version: 1,
+                format_version: ARTIFACT_FORMAT_VERSION,
             }
         }
 
@@ -1764,16 +2058,29 @@ mod tests {
         }
 
         fn history(&self) -> ArtifactManifest {
+            let objects =
+                crate::git::list_object_shas_with_depth(&self.repo, &self.first, None).unwrap();
+            let mut level = FullHistoryLevel {
+                tier: FULL_HISTORY_BASE_TIER,
+                base_exclusive: vec![],
+                tips: vec![self.first.clone()],
+                packs: self.pairs(&self.first, None),
+                proof: FullHistoryLevelProof::unsealed(),
+            };
+            let scratch = tempfile::tempdir().unwrap();
+            CasCompletionVerifier::new(self.cas.clone())
+                .verify_and_seal_history_level(
+                    &mut level,
+                    &objects,
+                    &tokio_util::sync::CancellationToken::new(),
+                    scratch.path(),
+                )
+                .unwrap();
             ArtifactManifest::new(
                 &self.key(ArtifactKind::FullHistory),
                 ArtifactPayload::FullHistory(FullHistoryArtifact {
                     target_commit_object: self.commit_blob(&self.second),
-                    levels: vec![FullHistoryLevel {
-                        tier: FULL_HISTORY_BASE_TIER,
-                        base_exclusive: vec![],
-                        tips: vec![self.first.clone()],
-                        packs: self.pairs(&self.first, None),
-                    }],
+                    levels: vec![level],
                 }),
             )
             .unwrap()
@@ -1830,9 +2137,9 @@ mod tests {
         fn verify(&self, manifest: &ArtifactManifest) -> Result<ArtifactManifest> {
             let evidence = manifest.store(&self.cas)?;
             CasCompletionVerifier::new(self.cas.clone()).verify_manifest(
-                &evidence.key,
-                &evidence.manifest,
-                evidence.artifact_count,
+                evidence.key(),
+                evidence.manifest(),
+                evidence.artifact_count(),
             )
         }
     }
@@ -2028,7 +2335,7 @@ mod tests {
                 .is_err()
         );
         let mut wrong_schema = manifest;
-        wrong_schema.schema_version = 2;
+        wrong_schema.schema_version = ARTIFACT_MANIFEST_SCHEMA + 1;
         let hash = f
             .cas
             .put(&serde_json::to_vec(&wrong_schema).unwrap())
@@ -2048,29 +2355,65 @@ mod tests {
         for wrong in [
             ArtifactKey {
                 workspace: "other".into(),
-                ..evidence.key.clone()
+                ..evidence.key().clone()
             },
             ArtifactKey {
                 kind: ArtifactKind::Files,
-                ..evidence.key.clone()
+                ..evidence.key().clone()
             },
             ArtifactKey {
-                format_version: 2,
-                ..evidence.key.clone()
+                format_version: 1,
+                ..evidence.key().clone()
             },
         ] {
             assert!(
                 verifier
-                    .verify_manifest(&wrong, &evidence.manifest, evidence.artifact_count)
+                    .verify_manifest(&wrong, evidence.manifest(), evidence.artifact_count())
                     .is_err()
             );
         }
         assert!(
             verifier
                 .verify_manifest(
-                    &evidence.key,
-                    &evidence.manifest,
-                    evidence.artifact_count + 1
+                    evidence.key(),
+                    evidence.manifest(),
+                    evidence.artifact_count() + 1
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn persisted_v1_manifest_fails_closed_and_has_a_distinct_scheduler_key() {
+        let f = Fixture::new();
+        let current = f.head();
+        let current_evidence = current.store(&f.cas).unwrap();
+        let mut legacy = current;
+        legacy.schema_version = 1;
+        legacy.key.format_version = 1;
+        legacy.semantic_digest =
+            semantic_digest(legacy.schema_version, &legacy.key, &legacy.payload).unwrap();
+        let hash = f.cas.put(&serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let legacy_key = ArtifactKey {
+            workspace: legacy.key.workspace.clone(),
+            repo: legacy.key.repo.clone(),
+            commit: legacy.key.commit.clone(),
+            kind: legacy.key.kind,
+            format_version: 1,
+        };
+        let legacy_evidence = CompletionEvidence::from_manifest(
+            legacy_key.clone(),
+            hash,
+            legacy.payload.artifact_count(),
+        )
+        .unwrap();
+        assert_ne!(legacy_key, *current_evidence.key());
+        assert!(
+            CasCompletionVerifier::new(f.cas.clone())
+                .verify_manifest(
+                    &legacy_key,
+                    legacy_evidence.manifest(),
+                    legacy_evidence.artifact_count(),
                 )
                 .is_err()
         );
@@ -2169,6 +2512,83 @@ mod tests {
     }
 
     #[test]
+    fn history_level_receipts_survive_restart_and_reject_rotation_or_corruption() {
+        let f = Fixture::new();
+        let key_a = [b'a'; 32];
+        let key_b = [b'b'; 32];
+        let identity_a = CasCompletionVerifier::new(f.cas.clone())
+            .with_proof_key(&key_a)
+            .unwrap()
+            .identity()
+            .to_owned();
+        let identity_b = CasCompletionVerifier::new(f.cas.clone())
+            .with_proof_key(&key_b)
+            .unwrap()
+            .identity()
+            .to_owned();
+        assert_ne!(identity_a, identity_b, "rotated keys must fence the fleet");
+        assert!(!identity_a.contains(std::str::from_utf8(&key_a).unwrap()));
+        let mut manifest = f.history();
+        let ArtifactPayload::FullHistory(history) = &mut manifest.payload else {
+            panic!("wrong payload")
+        };
+        let objects = crate::git::list_object_shas_with_depth(&f.repo, &f.first, None).unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        CasCompletionVerifier::new(f.cas.clone())
+            .with_proof_key(&key_a)
+            .unwrap()
+            .verify_and_seal_history_level(
+                &mut history.levels[0],
+                &objects,
+                &tokio_util::sync::CancellationToken::new(),
+                scratch.path(),
+            )
+            .unwrap();
+        manifest.semantic_digest =
+            semantic_digest(manifest.schema_version, &manifest.key, &manifest.payload).unwrap();
+        let evidence = manifest.store(&f.cas).unwrap();
+
+        // A fresh verifier process with the same dedicated key validates only
+        // the durable receipt/envelope.
+        CasCompletionVerifier::new(f.cas.clone())
+            .with_proof_key(&key_a)
+            .unwrap()
+            .verify_manifest(
+                evidence.key(),
+                evidence.manifest(),
+                evidence.artifact_count(),
+            )
+            .unwrap();
+        assert!(
+            CasCompletionVerifier::new(f.cas.clone())
+                .with_proof_key(&key_b)
+                .unwrap()
+                .verify_manifest(
+                    evidence.key(),
+                    evidence.manifest(),
+                    evidence.artifact_count()
+                )
+                .is_err()
+        );
+
+        let mut corrupt = manifest;
+        let ArtifactPayload::FullHistory(history) = &mut corrupt.payload else {
+            unreachable!()
+        };
+        history.levels[0].proof.seal.replace_range(0..2, "00");
+        corrupt.semantic_digest =
+            semantic_digest(corrupt.schema_version, &corrupt.key, &corrupt.payload).unwrap();
+        let corrupt = corrupt.store(&f.cas).unwrap();
+        assert!(
+            CasCompletionVerifier::new(f.cas.clone())
+                .with_proof_key(&key_a)
+                .unwrap()
+                .verify_manifest(corrupt.key(), corrupt.manifest(), corrupt.artifact_count())
+                .is_err()
+        );
+    }
+
+    #[test]
     fn digest_descriptor_length_and_payload_kind_cannot_be_relabelled() {
         let f = Fixture::new();
         let mut digest = f.head();
@@ -2203,6 +2623,7 @@ mod tests {
                     base_exclusive: vec![],
                     tips: vec![f.first.clone()],
                     packs: f.pairs(&f.first, None),
+                    proof: FullHistoryLevelProof::unsealed(),
                 }],
             }),
         )
@@ -2469,7 +2890,11 @@ mod tests {
         assert_ne!(verifier.identity(), PRODUCTION_VERIFIER_IDENTITY);
         assert!(
             verifier
-                .verify_manifest(&evidence.key, &evidence.manifest, evidence.artifact_count,)
+                .verify_manifest(
+                    evidence.key(),
+                    evidence.manifest(),
+                    evidence.artifact_count()
+                )
                 .is_err()
         );
 
@@ -2481,7 +2906,11 @@ mod tests {
         let verifier = CasCompletionVerifier::with_limits(f.cas.clone(), limits).unwrap();
         assert!(
             verifier
-                .verify_manifest(&evidence.key, &evidence.manifest, evidence.artifact_count,)
+                .verify_manifest(
+                    evidence.key(),
+                    evidence.manifest(),
+                    evidence.artifact_count()
+                )
                 .is_err()
         );
     }
@@ -2532,11 +2961,16 @@ mod tests {
         let f = Fixture::new();
         let evidence = f.head().store(&f.cas).unwrap();
         let verifier = CasCompletionVerifier::new(f.cas.clone());
-        assert_eq!(verifier.identity(), PRODUCTION_VERIFIER_IDENTITY);
+        assert!(
+            verifier
+                .identity()
+                .starts_with(PRODUCTION_VERIFIER_IDENTITY)
+        );
+        assert!(verifier.identity().contains(":proof:"));
         let claim = ClaimedArtifact {
             record: ArtifactRecord {
                 id: 1,
-                key: evidence.key.clone(),
+                key: evidence.key().clone(),
                 state: ArtifactState::Running,
                 owner: Some("worker".into()),
                 lease_expires_at: Some(i64::MAX),
@@ -2549,8 +2983,57 @@ mod tests {
             },
         };
         verifier.verify(&claim, &evidence).unwrap();
-        let mut wrong = evidence;
-        wrong.key.repo = "other/repo".into();
+        let mut wrong_key = evidence.key().clone();
+        wrong_key.repo = "other/repo".into();
+        let wrong = CompletionEvidence::from_manifest(
+            wrong_key,
+            evidence.manifest(),
+            evidence.artifact_count(),
+        )
+        .unwrap();
         assert!(verifier.verify(&claim, &wrong).is_err());
+    }
+
+    #[test]
+    fn from_env_child_probe() {
+        let Ok(mode) = std::env::var("RIPCLONE_PROOF_KEY_TEST_PROBE") else {
+            return;
+        };
+        let root = tempfile::tempdir().unwrap();
+        let cas = Cas::new(root.path().join("cas")).unwrap();
+        match mode.as_str() {
+            "missing" | "short" => assert!(CasCompletionVerifier::from_env(cas).is_err()),
+            "valid" => assert!(CasCompletionVerifier::from_env(cas).is_ok()),
+            _ => panic!("unknown proof-key probe mode"),
+        }
+    }
+
+    #[test]
+    fn production_constructor_strictly_requires_dedicated_proof_key() {
+        let executable = std::env::current_exe().unwrap();
+        for (mode, key) in [
+            ("missing", None),
+            ("short", Some("too-short")),
+            ("valid", Some("a-dedicated-artifact-proof-key-of-32-bytes")),
+        ] {
+            let mut command = std::process::Command::new(&executable);
+            command
+                .args([
+                    "--exact",
+                    "artifact_manifest::tests::from_env_child_probe",
+                    "--nocapture",
+                ])
+                .env("RIPCLONE_PROOF_KEY_TEST_PROBE", mode)
+                .env_remove("RIPCLONE_ARTIFACT_PROOF_KEY");
+            if let Some(key) = key {
+                command.env("RIPCLONE_ARTIFACT_PROOF_KEY", key);
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{mode} proof-key subprocess failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 }

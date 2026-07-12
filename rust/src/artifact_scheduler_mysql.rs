@@ -1356,7 +1356,7 @@ impl ArtifactSchedulerPersistence for MysqlArtifactScheduler {
                             WHERE wr.state='running' AND wr.workspace=q.workspace) < ?
                        AND NOT EXISTS(SELECT 1 FROM artifact_jobs r
                            WHERE r.state='running' AND r.workspace=q.workspace AND r.repo=q.repo
-                             AND r.kind IN('full_history','files'))
+                             AND r.kind=q.kind)
                      ORDER BY CASE WHEN q.workspace>? THEN 0 ELSE 1 END,
                               q.workspace,q.created_at,q.id
                      LIMIT 1 FOR UPDATE SKIP LOCKED",
@@ -2162,7 +2162,8 @@ mod tests {
         );
 
         // Multi-kind observation capacity is atomic. Running caps and the
-        // same-repo expensive exclusion apply across independent workers.
+        // per-kind same-repo exclusion applies across independent workers,
+        // while FullHistory and Files remain independent.
         reset(&control).await;
         let tiny_limits = SchedulerLimits {
             total_backlog: 1,
@@ -2232,9 +2233,19 @@ mod tests {
             .unwrap();
         let expensive = capped.claim("expensive-worker", 5).await.unwrap().unwrap();
         assert!(expensive.record.key.kind.expensive());
+        let sibling = capped
+            .claim("independent-same-repo", 5)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(expensive.record.key.kind, sibling.record.key.kind);
+        capped
+            .schedule(&key("same-kind-newer", expensive.record.key.kind))
+            .await
+            .unwrap();
         assert!(
             capped
-                .claim("blocked-same-repo", 5)
+                .claim("blocked-same-kind", 5)
                 .await
                 .unwrap()
                 .is_none()
