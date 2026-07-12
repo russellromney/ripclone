@@ -1703,10 +1703,23 @@ impl CasCompletionVerifier {
         let ArtifactPayload::Files(files) = manifest.payload else {
             bail!("Files installer received a non-Files transport capability");
         };
-        if std::fs::symlink_metadata(destination).is_ok() {
-            bail!("Files staging destination already exists");
+        match std::fs::symlink_metadata(destination) {
+            Ok(_) => {
+                // BoundInstall now makes its private mode-0700 staging root the
+                // worktree itself. `/proc/self/fd/N` is a stable capability
+                // symlink on Linux, so follow only the root and require its
+                // target to be an empty directory before writing any child.
+                if !std::fs::metadata(destination)?.is_dir()
+                    || std::fs::read_dir(destination)?.next().is_some()
+                {
+                    bail!("Files staging destination is not an empty directory");
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(destination)?;
+            }
+            Err(error) => return Err(error).context("inspect Files staging destination"),
         }
-        std::fs::create_dir(destination)?;
         let scratch = verification_tempdir()?;
         let chunk_dir = scratch.path().join("chunks");
         std::fs::create_dir(&chunk_dir)?;
@@ -4627,7 +4640,7 @@ mod tests {
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
             let scope = publication.enter_staging().unwrap();
-            let staging = publication.staging_root().join("repo");
+            let staging = publication.staging_root();
             let _ = started_tx.send(());
             let result =
                 verifier.materialize_transport_files_cancelled(capability, &staging, &worker_token);

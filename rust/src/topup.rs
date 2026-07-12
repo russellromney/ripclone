@@ -22,9 +22,9 @@ use std::collections::HashMap;
 use std::ffi::CString;
 use std::io::{BufRead, BufReader, Write};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::ffi::OsStrExt;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
@@ -39,11 +39,6 @@ thread_local! {
 #[cfg(all(test, target_os = "macos"))]
 static FORCE_STAGING_RESTORE_FAILURE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
-
-#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
-thread_local! {
-    static CLEANUP_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnMut(&str, libc::c_int, &std::ffi::OsStr)>>> = const { std::cell::RefCell::new(None) };
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TopUpMode {
@@ -217,7 +212,7 @@ fn install_pinned_bundle_transaction(
     let target = target.as_ref();
     let publication = BoundInstall::new(target, "pinned")?;
     let staging_scope = publication.enter_staging()?;
-    let staging = publication.staging_root().join("repo");
+    let staging = publication.staging_root();
 
     let verified = installer
         .install_verified(&staging, request)
@@ -268,6 +263,11 @@ fn ensure_not_cancelled(cancelled: &tokio_util::sync::CancellationToken) -> Resu
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+/// The random mode-0700 directory is itself the candidate repository. Success
+/// moves that exact root to the destination. Failure only closes capabilities
+/// and abandons the recognizable `.ripclone-<kind>-<nonce>` root: no pathname
+/// is ever unlinked, so later bounded orphan recovery can be implemented as a
+/// separate maintenance operation with an age/ownership policy.
 pub(crate) struct BoundInstall {
     parent: OwnedFd,
     staging: OwnedFd,
@@ -278,7 +278,6 @@ pub(crate) struct BoundInstall {
     parent_ino: u64,
     staging_dev: u64,
     staging_ino: u64,
-    published: std::cell::Cell<bool>,
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -319,7 +318,6 @@ impl BoundInstall {
             parent_ino: parent_stat.st_ino as u64,
             staging_dev: staging_stat.st_dev as u64,
             staging_ino: staging_stat.st_ino as u64,
-            published: std::cell::Cell::new(false),
         })
     }
     pub(crate) fn staging_root(&self) -> std::path::PathBuf {
@@ -378,12 +376,16 @@ impl BoundInstall {
             bail!("clone destination parent changed during installation")
         }
         ensure_absent_at(self.parent.as_raw_fd(), &self.target_name)?;
-        let from = cstring(std::ffi::OsStr::new("repo"))?;
+        let bound = entry_stat(self.parent.as_raw_fd(), &self.staging_name)?;
+        if bound.st_dev as u64 != self.staging_dev || bound.st_ino != self.staging_ino {
+            bail!("clone staging root changed before publication")
+        }
+        let from = cstring(&self.staging_name)?;
         let to = cstring(&self.target_name)?;
         #[cfg(target_os = "linux")]
         let rc = unsafe {
             libc::renameat2(
-                self.staging.as_raw_fd(),
+                self.parent.as_raw_fd(),
                 from.as_ptr(),
                 self.parent.as_raw_fd(),
                 to.as_ptr(),
@@ -393,7 +395,7 @@ impl BoundInstall {
         #[cfg(target_os = "macos")]
         let rc = unsafe {
             libc::renameatx_np(
-                self.staging.as_raw_fd(),
+                self.parent.as_raw_fd(),
                 from.as_ptr(),
                 self.parent.as_raw_fd(),
                 to.as_ptr(),
@@ -404,25 +406,7 @@ impl BoundInstall {
             return Err(std::io::Error::last_os_error())
                 .context("fd-bound atomic no-replace publication");
         }
-        self.published.set(true);
         Ok(())
-    }
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-impl Drop for BoundInstall {
-    fn drop(&mut self) {
-        // The random staging root is mode 0700 and its only capability is
-        // CLOEXEC. Cleanup deliberately abandons that bounded private tree on
-        // any identity ambiguity: leaking failed staging is safer than ever
-        // unlinking a concurrently substituted file or directory.
-        let _ = remove_dir_contents(self.staging.as_raw_fd());
-        let _ = unlink_bound_directory(
-            self.parent.as_raw_fd(),
-            &self.staging_name,
-            self.staging_dev,
-            self.staging_ino,
-        );
     }
 }
 
@@ -687,35 +671,6 @@ fn fd_stat(fd: libc::c_int) -> Result<libc::stat> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn directory_entries(fd: libc::c_int) -> Result<Vec<std::ffi::OsString>> {
-    let duplicate = dup_cloexec(fd).context("duplicate staging directory handle")?;
-    let duplicate = duplicate.into_raw_fd();
-    let directory = unsafe { libc::fdopendir(duplicate) };
-    if directory.is_null() {
-        unsafe { libc::close(duplicate) };
-        return Err(std::io::Error::last_os_error()).context("open staging directory stream");
-    }
-    let mut entries = Vec::new();
-    loop {
-        clear_errno();
-        let entry = unsafe { libc::readdir(directory) };
-        if entry.is_null() {
-            let error = std::io::Error::last_os_error();
-            unsafe { libc::closedir(directory) };
-            if error.raw_os_error() != Some(0) {
-                return Err(error).context("read staging directory stream");
-            }
-            break;
-        }
-        let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
-        if !matches!(name, b"." | b"..") {
-            entries.push(std::ffi::OsString::from_vec(name.to_vec()));
-        }
-    }
-    Ok(entries)
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn entry_stat(parent: libc::c_int, name: &std::ffi::OsStr) -> Result<libc::stat> {
     let name = cstring(name)?;
     let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
@@ -731,134 +686,6 @@ fn entry_stat(parent: libc::c_int, name: &std::ffi::OsStr) -> Result<libc::stat>
         return Err(std::io::Error::last_os_error()).context("stat staging entry");
     }
     Ok(unsafe { stat.assume_init() })
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn remove_dir_contents(fd: libc::c_int) -> Result<()> {
-    for name in directory_entries(fd)? {
-        let stat = match entry_stat(fd, &name) {
-            Ok(stat) => stat,
-            Err(error)
-                if error
-                    .downcast_ref::<std::io::Error>()
-                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
-            {
-                continue;
-            }
-            Err(error) => return Err(error),
-        };
-        run_cleanup_test_hook("after_stat", fd, &name);
-        let child = openat_entry(fd, &name, stat.st_mode)?;
-        let bound = fd_stat(child.as_raw_fd())?;
-        if !same_file_identity(&stat, &bound) {
-            bail!("staging cleanup entry changed before it could be bound")
-        }
-        if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
-            remove_dir_contents(child.as_raw_fd())?;
-        }
-        let current = entry_stat(fd, &name)?;
-        if !same_file_identity(&bound, &current) {
-            bail!("staging cleanup entry changed after traversal")
-        }
-        // This is the last deliberately exposed race boundary. The entry is
-        // inside the private capability-only staging root; recheck after the
-        // hook and abandon the whole root if its name no longer denotes the
-        // bound inode.
-        run_cleanup_test_hook("before_unlink", fd, &name);
-        let current = entry_stat(fd, &name)?;
-        if !same_file_identity(&bound, &current) {
-            bail!("staging cleanup entry changed before unlink")
-        }
-        let name_c = cstring(&name)?;
-        let flags = if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
-            libc::AT_REMOVEDIR
-        } else {
-            0
-        };
-        if unsafe { libc::unlinkat(fd, name_c.as_ptr(), flags) } != 0 {
-            return Err(std::io::Error::last_os_error()).context("remove bound staging entry");
-        }
-    }
-    Ok(())
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn openat_entry(
-    parent: libc::c_int,
-    name: &std::ffi::OsStr,
-    mode: libc::mode_t,
-) -> Result<OwnedFd> {
-    if mode & libc::S_IFMT == libc::S_IFDIR {
-        return openat_dir(parent, name);
-    }
-    let name = cstring(name)?;
-    #[cfg(target_os = "linux")]
-    let flags = libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-    #[cfg(target_os = "macos")]
-    let flags = if mode & libc::S_IFMT == libc::S_IFLNK {
-        libc::O_SYMLINK | libc::O_CLOEXEC
-    } else {
-        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC
-    };
-    let fd = unsafe { libc::openat(parent, name.as_ptr(), flags) };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error()).context("bind staging cleanup entry");
-    }
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn same_file_identity(left: &libc::stat, right: &libc::stat) -> bool {
-    left.st_dev == right.st_dev
-        && left.st_ino == right.st_ino
-        && left.st_mode & libc::S_IFMT == right.st_mode & libc::S_IFMT
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn run_cleanup_test_hook(stage: &str, parent: libc::c_int, name: &std::ffi::OsStr) {
-    #[cfg(test)]
-    CLEANUP_TEST_HOOK.with(|hook| {
-        if let Some(hook) = hook.borrow_mut().as_mut() {
-            hook(stage, parent, name);
-        }
-    });
-    #[cfg(not(test))]
-    let _ = (stage, parent, name);
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn unlink_bound_directory(
-    parent: libc::c_int,
-    expected_name: &std::ffi::OsStr,
-    expected_dev: u64,
-    expected_ino: u64,
-) -> Result<()> {
-    let Ok(stat) = entry_stat(parent, expected_name) else {
-        return Ok(());
-    };
-    if stat.st_dev as u64 != expected_dev || stat.st_ino != expected_ino {
-        return Ok(());
-    }
-    run_cleanup_test_hook("before_root_unlink", parent, expected_name);
-    let current = entry_stat(parent, expected_name)?;
-    if !same_file_identity(&stat, &current) {
-        return Ok(());
-    }
-    let name = cstring(expected_name)?;
-    if unsafe { libc::unlinkat(parent, name.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
-        return Err(std::io::Error::last_os_error()).context("remove bound staging directory");
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn clear_errno() {
-    unsafe { *libc::__errno_location() = 0 };
-}
-
-#[cfg(target_os = "macos")]
-fn clear_errno() {
-    unsafe { *libc::__error() = 0 };
 }
 
 pub(crate) fn validate_request_binding(
@@ -1653,13 +1480,12 @@ mod blocker_tests {
         let replacement_staging = parent.join(&staging_name);
         std::fs::create_dir(&replacement_staging).unwrap();
         std::fs::write(replacement_staging.join("sentinel"), b"replacement").unwrap();
-        std::fs::create_dir(transaction.staging_root().join("repo")).unwrap();
-        std::fs::write(transaction.staging_root().join("repo/original"), b"bound").unwrap();
+        std::fs::write(transaction.staging_root().join("original"), b"bound").unwrap();
         let moved_again = root.path().join("moved-again");
         std::fs::rename(&moved, &moved_again).unwrap();
         std::fs::create_dir(&moved).unwrap();
         std::fs::write(
-            transaction.staging_root().join("repo/after-second-swap"),
+            transaction.staging_root().join("after-second-swap"),
             b"still-bound",
         )
         .unwrap();
@@ -1669,21 +1495,16 @@ mod blocker_tests {
             std::fs::read(replacement_staging.join("sentinel")).unwrap(),
             b"replacement"
         );
+        assert!(moved_again.join(&staging_name).join("original").exists());
         assert!(
             moved_again
                 .join(&staging_name)
-                .join("repo/original")
-                .exists()
-        );
-        assert!(
-            moved_again
-                .join(&staging_name)
-                .join("repo/after-second-swap")
+                .join("after-second-swap")
                 .exists()
         );
         drop(scope);
         drop(transaction);
-        assert!(!moved_again.join(staging_name).exists());
+        assert!(moved_again.join(staging_name).exists());
         assert_eq!(
             std::fs::read(replacement_staging.join("sentinel")).unwrap(),
             b"replacement"
@@ -1692,62 +1513,71 @@ mod blocker_tests {
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn cleanup_abandons_file_or_directory_swapped_at_each_identity_boundary() {
-        for (stage, directory) in [
-            ("after_stat", false),
-            ("before_unlink", false),
-            ("after_stat", true),
-            ("before_unlink", true),
-        ] {
-            let root = tempfile::tempdir().unwrap();
-            let parent = root.path().join(format!("parent-{stage}-{directory}"));
-            std::fs::create_dir(&parent).unwrap();
-            let transaction =
-                BoundInstall::new(&parent.join("destination"), "cleanup-race").unwrap();
-            let staging = parent.join(&transaction.staging_name);
-            std::fs::create_dir(staging.join("repo")).unwrap();
-            let victim = staging.join("repo/victim");
-            if directory {
-                std::fs::create_dir(&victim).unwrap();
-                std::fs::write(victim.join("original"), b"bound").unwrap();
-            } else {
-                std::fs::write(&victim, b"bound").unwrap();
-            }
-            let moved = staging.join("repo/original-moved");
-            let moved_for_hook = moved.clone();
-            let replacement = victim.clone();
-            let wanted_stage = stage.to_owned();
-            CLEANUP_TEST_HOOK.with(|slot| {
-                *slot.borrow_mut() = Some(Box::new(move |actual, _, name| {
-                    if actual != wanted_stage || name != std::ffi::OsStr::new("victim") {
-                        return;
-                    }
-                    std::fs::rename(&replacement, &moved_for_hook).unwrap();
-                    if directory {
-                        std::fs::create_dir(&replacement).unwrap();
-                        std::fs::write(replacement.join("replacement-sentinel"), b"safe").unwrap();
-                    } else {
-                        std::fs::write(&replacement, b"replacement-sentinel").unwrap();
-                    }
-                }));
-            });
+    fn failed_staging_is_abandoned_without_deleting_swaps_or_unrelated_names() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("parent");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::write(parent.join("unrelated"), b"safe").unwrap();
+        let transaction = BoundInstall::new(&parent.join("destination"), "abandon").unwrap();
+        let original_name = transaction.staging_name.clone();
+        let original = parent.join(&original_name);
+        std::fs::write(original.join("original"), b"bound").unwrap();
+        let moved = parent.join("same-uid-moved-root");
+        std::fs::rename(&original, &moved).unwrap();
+        std::fs::create_dir(&original).unwrap();
+        std::fs::write(original.join("replacement-sentinel"), b"replacement").unwrap();
+        drop(transaction);
+        assert_eq!(std::fs::read(moved.join("original")).unwrap(), b"bound");
+        assert_eq!(
+            std::fs::read(original.join("replacement-sentinel")).unwrap(),
+            b"replacement"
+        );
+        assert_eq!(std::fs::read(parent.join("unrelated")).unwrap(), b"safe");
+        assert!(!parent.join("destination").exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn failures_leave_bounded_recognizable_private_roots_and_success_moves_its_root() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("parent");
+        std::fs::create_dir(&parent).unwrap();
+        for _ in 0..3 {
+            let transaction = BoundInstall::new(&parent.join("destination"), "failed").unwrap();
+            let scope = transaction.enter_staging().unwrap();
+            std::fs::write(transaction.staging_root().join("sentinel"), b"abandoned").unwrap();
+            scope.finish().unwrap();
             drop(transaction);
-            CLEANUP_TEST_HOOK.with(|slot| slot.borrow_mut().take());
-            if directory {
-                assert_eq!(
-                    std::fs::read(victim.join("replacement-sentinel")).unwrap(),
-                    b"safe"
-                );
-                assert!(moved.is_dir());
-                if stage == "after_stat" {
-                    assert!(moved.join("original").exists());
-                }
-            } else {
-                assert_eq!(std::fs::read(&victim).unwrap(), b"replacement-sentinel");
-                assert_eq!(std::fs::read(&moved).unwrap(), b"bound");
-            }
-            assert!(!parent.join("destination").exists());
         }
+        let abandoned = std::fs::read_dir(&parent)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".ripclone-failed-")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(abandoned.len(), 3);
+        assert!(abandoned.iter().all(|entry| {
+            entry.metadata().unwrap().permissions().mode() & 0o777 == 0o700
+                && entry.path().join("sentinel").exists()
+        }));
+
+        let transaction = BoundInstall::new(&parent.join("destination"), "success").unwrap();
+        let staging_name = transaction.staging_name.clone();
+        let scope = transaction.enter_staging().unwrap();
+        std::fs::write(transaction.staging_root().join("published"), b"exact").unwrap();
+        scope.finish().unwrap();
+        transaction.publish_repo().unwrap();
+        drop(transaction);
+        assert_eq!(
+            std::fs::read(parent.join("destination/published")).unwrap(),
+            b"exact"
+        );
+        assert!(!parent.join(staging_name).exists());
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1798,10 +1628,9 @@ mod blocker_tests {
                 let before = std::env::current_dir().unwrap();
                 let scope = transaction.enter_staging().unwrap();
                 barrier.wait();
-                std::fs::create_dir("repo").unwrap();
-                std::fs::write("repo/value", value).unwrap();
+                std::fs::write("value", value).unwrap();
                 let mut child = std::process::Command::new("sh");
-                child.args(["-c", "pwd > repo/child-cwd"]);
+                child.args(["-c", "pwd > child-cwd"]);
                 bind_child_to_staging(&mut child);
                 assert!(child.status().unwrap().success());
                 barrier.wait();
@@ -1817,16 +1646,10 @@ mod blocker_tests {
         barrier.wait();
         let first = one.join().unwrap();
         let second = two.join().unwrap();
-        assert_eq!(
-            std::fs::read(first_path.join("repo/value")).unwrap(),
-            b"one"
-        );
-        assert_eq!(
-            std::fs::read(second_path.join("repo/value")).unwrap(),
-            b"two"
-        );
-        assert!(first_path.join("repo/child-cwd").is_file());
-        assert!(second_path.join("repo/child-cwd").is_file());
+        assert_eq!(std::fs::read(first_path.join("value")).unwrap(), b"one");
+        assert_eq!(std::fs::read(second_path.join("value")).unwrap(), b"two");
+        assert!(first_path.join("child-cwd").is_file());
+        assert!(second_path.join("child-cwd").is_file());
         drop(first);
         drop(second);
         assert_eq!(std::env::current_dir().unwrap(), process_cwd);
