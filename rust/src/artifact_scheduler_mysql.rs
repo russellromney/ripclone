@@ -14,7 +14,7 @@ use crate::artifact_scheduler::{
 #[cfg(test)]
 use crate::artifact_scheduler::{CompletionEvidence, validate_evidence};
 use crate::artifact_scheduler_backend::{
-    ArtifactSchedulerPersistence, TRANSPORT_ROOT_PAGE_MAX, TransportRootLease,
+    ArtifactSchedulerPersistence, SchedulerGcRoot, TRANSPORT_ROOT_PAGE_MAX, TransportRootLease,
     validate_transport_lease_identity,
 };
 use anyhow::{Context, Result, bail};
@@ -23,7 +23,7 @@ use sqlx::mysql::MySqlPool;
 use sqlx::{Acquire, MySql, Row, Transaction};
 use std::sync::Arc;
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 const SCHEMA: &[&str] = &[
     r#"CREATE TABLE IF NOT EXISTS artifact_scheduler_schema(
  id SMALLINT NOT NULL PRIMARY KEY,
@@ -73,6 +73,12 @@ const SCHEMA: &[&str] = &[
  root_hash VARCHAR(64) NOT NULL,session_id VARCHAR(64) NOT NULL,
  workspace VARCHAR(128) NOT NULL,repo VARCHAR(320) NOT NULL,expires_at BIGINT NOT NULL,
  PRIMARY KEY(root_hash,session_id), INDEX artifact_transport_leases_expiry(expires_at)) ENGINE=InnoDB DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin"#,
+    r#"CREATE TABLE IF NOT EXISTS artifact_base_retention(
+ artifact_id BIGINT NOT NULL PRIMARY KEY,workspace VARCHAR(128) NOT NULL,repo VARCHAR(320) NOT NULL,
+ format_version BIGINT NOT NULL,head_rank SMALLINT,pair_rank SMALLINT,
+ CONSTRAINT artifact_base_retention_artifact FOREIGN KEY(artifact_id) REFERENCES artifact_jobs(id) ON DELETE CASCADE,
+ CONSTRAINT artifact_base_retention_ranks CHECK((head_rank IS NULL OR head_rank BETWEEN 1 AND 8) AND (pair_rank IS NULL OR pair_rank BETWEEN 1 AND 8) AND (head_rank IS NOT NULL OR pair_rank IS NOT NULL)),
+ INDEX artifact_base_retention_scope(workspace,repo,format_version)) ENGINE=InnoDB DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin"#,
     r#"CREATE TABLE IF NOT EXISTS scheduler_state(
  id SMALLINT NOT NULL PRIMARY KEY, fairness_cursor BIGINT NOT NULL,
  workspace_cursor VARCHAR(128) NOT NULL DEFAULT '',config_fingerprint VARCHAR(512) NOT NULL DEFAULT '',
@@ -138,15 +144,18 @@ impl MysqlArtifactScheduler {
             if version > SCHEMA_VERSION {
                 bail!("artifact scheduler database is newer than this binary")
             }
-            if version != 1 && version != SCHEMA_VERSION {
+            if ![1, 2, SCHEMA_VERSION].contains(&version) {
                 bail!("unsupported mysql artifact scheduler schema {version}")
             }
             Self::validate_schema(&mut migration).await?;
-            if version == 1 {
+            if version < SCHEMA_VERSION {
+                let scopes: Vec<(String,String,i64)> = sqlx::query_as("SELECT DISTINCT workspace,repo,format_version FROM artifact_jobs WHERE state='ready' AND kind IN('head','full_history')").fetch_all(&mut *migration).await?;
+                for (w,r,v) in scopes { refresh_base_retention(&mut migration,&w,&r,v).await?; }
                 sqlx::query(
-                    "UPDATE artifact_scheduler_schema SET version=? WHERE id=1 AND version=1",
+                    "UPDATE artifact_scheduler_schema SET version=? WHERE id=1 AND version=?",
                 )
                 .bind(SCHEMA_VERSION)
+                .bind(version)
                 .execute(&mut *migration)
                 .await?;
             }
@@ -358,6 +367,48 @@ impl MysqlArtifactScheduler {
                 "NO",
                 None,
             ),
+            (
+                "artifact_base_retention",
+                "artifact_id",
+                "bigint",
+                "NO",
+                None,
+            ),
+            (
+                "artifact_base_retention",
+                "workspace",
+                "varchar(128)",
+                "NO",
+                None,
+            ),
+            (
+                "artifact_base_retention",
+                "repo",
+                "varchar(320)",
+                "NO",
+                None,
+            ),
+            (
+                "artifact_base_retention",
+                "format_version",
+                "bigint",
+                "NO",
+                None,
+            ),
+            (
+                "artifact_base_retention",
+                "head_rank",
+                "smallint",
+                "YES",
+                None,
+            ),
+            (
+                "artifact_base_retention",
+                "pair_rank",
+                "smallint",
+                "YES",
+                None,
+            ),
             ("scheduler_state", "id", "smallint", "NO", None),
             ("scheduler_state", "fairness_cursor", "bigint", "NO", None),
             (
@@ -379,7 +430,7 @@ impl MysqlArtifactScheduler {
             "SELECT count(*) FROM information_schema.columns
              WHERE table_schema=DATABASE() AND table_name IN
              ('artifact_scheduler_schema','artifact_jobs','branch_observations',
-              'artifact_observations','artifact_consumers','artifact_transport_leases','scheduler_state')",
+              'artifact_observations','artifact_consumers','artifact_transport_leases','artifact_base_retention','scheduler_state')",
         )
         .fetch_one(&mut **tx)
         .await?;
@@ -390,7 +441,7 @@ impl MysqlArtifactScheduler {
             "SELECT count(*) FROM information_schema.tables
              WHERE table_schema=DATABASE() AND table_name IN
              ('artifact_scheduler_schema','artifact_jobs','branch_observations',
-              'artifact_observations','artifact_consumers','artifact_transport_leases','scheduler_state')
+              'artifact_observations','artifact_consumers','artifact_transport_leases','artifact_base_retention','scheduler_state')
                AND (engine IS NULL OR engine<>'InnoDB' OR table_collation IS NULL
                     OR table_collation<>'utf8mb4_bin')",
         )
@@ -403,7 +454,7 @@ impl MysqlArtifactScheduler {
             "SELECT count(*) FROM information_schema.columns
              WHERE table_schema=DATABASE() AND table_name IN
              ('artifact_scheduler_schema','artifact_jobs','branch_observations',
-              'artifact_observations','artifact_consumers','artifact_transport_leases','scheduler_state')
+              'artifact_observations','artifact_consumers','artifact_transport_leases','artifact_base_retention','scheduler_state')
                AND data_type IN('varchar','text','longtext')
                AND (collation_name IS NULL OR collation_name<>'utf8mb4_bin')",
         )
@@ -425,7 +476,7 @@ impl MysqlArtifactScheduler {
             "SELECT count(*) FROM information_schema.columns
              WHERE table_schema=DATABASE() AND table_name IN
              ('artifact_scheduler_schema','artifact_jobs','branch_observations',
-              'artifact_observations','artifact_consumers','artifact_transport_leases','scheduler_state')
+              'artifact_observations','artifact_consumers','artifact_transport_leases','artifact_base_retention','scheduler_state')
                AND NOT(table_name='artifact_jobs' AND column_name='id')
                AND (extra IS NULL OR extra<>'')",
         )
@@ -523,13 +574,20 @@ impl MysqlArtifactScheduler {
                 "expires_at",
                 false,
             ),
+            ("artifact_base_retention", "PRIMARY", "artifact_id", true),
+            (
+                "artifact_base_retention",
+                "artifact_base_retention_scope",
+                "workspace,repo,format_version",
+                false,
+            ),
             ("scheduler_state", "PRIMARY", "id", true),
         ];
         let index_count: i64 = sqlx::query_scalar(
             "SELECT count(DISTINCT table_name,index_name) FROM information_schema.statistics
              WHERE table_schema=DATABASE() AND table_name IN
               ('artifact_scheduler_schema','artifact_jobs','branch_observations',
-              'artifact_observations','artifact_consumers','artifact_transport_leases','scheduler_state')",
+              'artifact_observations','artifact_consumers','artifact_transport_leases','artifact_base_retention','scheduler_state')",
         )
         .fetch_one(&mut **tx)
         .await?;
@@ -616,6 +674,10 @@ impl MysqlArtifactScheduler {
                 "scheduler_state_fairness",
                 "`fairness_cursor` between 0 and 3",
             ),
+            (
+                "artifact_base_retention_ranks",
+                "(`head_rank` is null or `head_rank` between 1 and 8) and (`pair_rank` is null or `pair_rank` between 1 and 8) and (`head_rank` is not null or `pair_rank` is not null)",
+            ),
         ];
         const CONSTRAINTS: &[(&str, &str, &str)] = &[
             ("artifact_scheduler_schema", "PRIMARY", "PRIMARY KEY"),
@@ -652,6 +714,17 @@ impl MysqlArtifactScheduler {
             ),
             ("artifact_consumers", "PRIMARY", "PRIMARY KEY"),
             ("artifact_transport_leases", "PRIMARY", "PRIMARY KEY"),
+            ("artifact_base_retention", "PRIMARY", "PRIMARY KEY"),
+            (
+                "artifact_base_retention",
+                "artifact_base_retention_artifact",
+                "FOREIGN KEY",
+            ),
+            (
+                "artifact_base_retention",
+                "artifact_base_retention_ranks",
+                "CHECK",
+            ),
             ("scheduler_state", "PRIMARY", "PRIMARY KEY"),
             ("scheduler_state", "scheduler_state_singleton", "CHECK"),
             ("scheduler_state", "scheduler_state_fairness", "CHECK"),
@@ -660,7 +733,7 @@ impl MysqlArtifactScheduler {
             "SELECT table_name,constraint_name,constraint_type,enforced
              FROM information_schema.table_constraints WHERE constraint_schema=DATABASE()
                AND table_name IN ('artifact_scheduler_schema','artifact_jobs','branch_observations',
-                 'artifact_observations','artifact_consumers','artifact_transport_leases','scheduler_state')",
+                 'artifact_observations','artifact_consumers','artifact_transport_leases','artifact_base_retention','scheduler_state')",
         )
         .fetch_all(&mut **tx)
         .await?;
@@ -694,12 +767,17 @@ impl MysqlArtifactScheduler {
              WHERE k.referenced_table_schema=DATABASE()
                AND k.referenced_table_name IN
                   ('artifact_scheduler_schema','artifact_jobs','branch_observations',
-                  'artifact_observations','artifact_consumers','artifact_transport_leases','scheduler_state')",
+                  'artifact_observations','artifact_consumers','artifact_transport_leases','artifact_base_retention','scheduler_state')
+               AND NOT(k.table_name='artifact_base_retention' AND k.constraint_name='artifact_base_retention_artifact')",
         )
         .fetch_one(&mut **tx)
         .await?;
         if incoming_foreign_keys != 0 {
             bail!("mysql artifact scheduler tables have external foreign-key dependents")
+        }
+        let retention_fk: i64 = sqlx::query_scalar("SELECT count(*) FROM information_schema.referential_constraints r JOIN information_schema.key_column_usage k ON k.constraint_schema=r.constraint_schema AND k.table_name=r.table_name AND k.constraint_name=r.constraint_name WHERE r.constraint_schema=DATABASE() AND r.table_name='artifact_base_retention' AND r.constraint_name='artifact_base_retention_artifact' AND r.referenced_table_name='artifact_jobs' AND r.delete_rule='CASCADE' AND k.column_name='artifact_id' AND k.referenced_column_name='id'").fetch_one(&mut **tx).await?;
+        if retention_fk != 1 {
+            bail!("mysql artifact base retention foreign key differs from schema version")
         }
         for (name, clause) in CHECKS {
             let actual: Option<String> = sqlx::query_scalar(
@@ -762,6 +840,10 @@ impl MysqlArtifactScheduler {
         .await?;
         if invalid_branches != 0 {
             bail!("mysql artifact scheduler contains invalid branch observations")
+        }
+        let invalid_retention: i64 = sqlx::query_scalar("SELECT count(*) FROM artifact_base_retention r LEFT JOIN artifact_jobs j ON j.id=r.artifact_id WHERE j.id IS NULL OR j.workspace<>r.workspace OR j.repo<>r.repo OR j.format_version<>r.format_version OR (r.head_rank IS NULL AND r.pair_rank IS NULL) OR (r.head_rank IS NOT NULL AND r.head_rank NOT BETWEEN 1 AND 8) OR (r.pair_rank IS NOT NULL AND r.pair_rank NOT BETWEEN 1 AND 8)").fetch_one(&mut **tx).await?;
+        if invalid_retention != 0 {
+            bail!("mysql artifact scheduler contains invalid base retention")
         }
         let invalid_transport: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM artifact_transport_leases
@@ -1006,6 +1088,36 @@ fn kind_index(kind: ArtifactKind) -> usize {
         ArtifactKind::Files => 2,
     }
 }
+
+async fn refresh_base_retention(
+    tx: &mut Transaction<'_, MySql>,
+    w: &str,
+    r: &str,
+    v: i64,
+) -> Result<()> {
+    sqlx::query(
+        "DELETE FROM artifact_base_retention WHERE workspace=? AND repo=? AND format_version=?",
+    )
+    .bind(w)
+    .bind(r)
+    .bind(v)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query("INSERT INTO artifact_base_retention(artifact_id,workspace,repo,format_version,head_rank) SELECT id,workspace,repo,format_version,rank_value FROM (SELECT id,workspace,repo,format_version,row_number() OVER(ORDER BY updated_at DESC,id DESC) rank_value FROM artifact_jobs WHERE workspace=? AND repo=? AND format_version=? AND kind='head' AND state='ready' AND manifest IS NOT NULL AND length(trim(manifest))>0) ranked WHERE rank_value<=8").bind(w).bind(r).bind(v).execute(&mut **tx).await?;
+    for history in [false, true] {
+        let id = if history { "history_id" } else { "head_id" };
+        let sql = format!(
+            "INSERT INTO artifact_base_retention(artifact_id,workspace,repo,format_version,pair_rank) SELECT {id},workspace,repo,format_version,rank_value FROM (SELECT h.id head_id,f.id history_id,h.workspace,h.repo,h.format_version,row_number() OVER(ORDER BY GREATEST(h.updated_at,f.updated_at) DESC,GREATEST(h.id,f.id) DESC) rank_value FROM artifact_jobs h JOIN artifact_jobs f ON f.workspace=h.workspace AND f.repo=h.repo AND f.commit_oid=h.commit_oid AND f.format_version=h.format_version AND f.kind='full_history' AND f.state='ready' AND f.manifest IS NOT NULL AND length(trim(f.manifest))>0 WHERE h.workspace=? AND h.repo=? AND h.format_version=? AND h.kind='head' AND h.state='ready' AND h.manifest IS NOT NULL AND length(trim(h.manifest))>0) ranked WHERE rank_value<=8 ON DUPLICATE KEY UPDATE pair_rank=VALUES(pair_rank)"
+        );
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(w)
+            .bind(r)
+            .bind(v)
+            .execute(&mut **tx)
+            .await?;
+    }
+    Ok(())
+}
 fn outcome_id(outcome: &ScheduleOutcome) -> i64 {
     match outcome {
         ScheduleOutcome::Enqueued(id)
@@ -1167,6 +1279,53 @@ impl ArtifactSchedulerPersistence for MysqlArtifactScheduler {
             })
             .collect()
     }
+
+    async fn live_scheduler_roots_page(
+        &self,
+        after_artifact_id: Option<i64>,
+        limit: u32,
+    ) -> Result<Vec<SchedulerGcRoot>> {
+        if limit == 0
+            || limit > TRANSPORT_ROOT_PAGE_MAX
+            || after_artifact_id.is_some_and(|id| id < 0)
+        {
+            bail!("scheduler GC root page cursor or limit is invalid")
+        }
+        let mut tx = self.pool.begin().await?;
+        let now: i64 = sqlx::query_scalar("SELECT UNIX_TIMESTAMP()")
+            .fetch_one(&mut *tx)
+            .await?;
+        let rows = sqlx::query(
+            "SELECT j.id,j.workspace,j.repo,j.commit_oid,j.kind,j.format_version,j.manifest
+             FROM artifact_jobs j WHERE j.id>? AND j.state='ready'
+               AND j.manifest IS NOT NULL AND length(trim(j.manifest))>0
+               AND (EXISTS(SELECT 1 FROM artifact_observations o WHERE o.published_artifact_id=j.id)
+                    OR EXISTS(SELECT 1 FROM artifact_consumers c WHERE c.artifact_id=j.id AND c.expires_at>?)
+                    OR EXISTS(SELECT 1 FROM artifact_base_retention r WHERE r.artifact_id=j.id))
+             ORDER BY j.id LIMIT ?",
+        )
+        .bind(after_artifact_id.unwrap_or(0)).bind(now).bind(limit as i64)
+        .fetch_all(&mut *tx).await?;
+        tx.commit().await?;
+        rows.into_iter()
+            .map(|row| {
+                let version = u32::try_from(row.try_get::<i64, _>("format_version")?)
+                    .context("scheduler GC root format")?;
+                Ok(SchedulerGcRoot {
+                    artifact_id: row.try_get("id")?,
+                    key: ArtifactKey {
+                        workspace: row.try_get("workspace")?,
+                        repo: row.try_get("repo")?,
+                        commit: row.try_get("commit_oid")?,
+                        kind: ArtifactKind::parse(row.try_get("kind")?)?,
+                        format_version: version,
+                    },
+                    manifest: row.try_get("manifest")?,
+                })
+            })
+            .collect()
+    }
+
     async fn schedule(&self, key: &ArtifactKey) -> Result<ScheduleOutcome> {
         validate_mysql_key(key)?;
         let (mut tx, now) = self.controlled().await?;
@@ -1689,6 +1848,13 @@ impl ArtifactSchedulerPersistence for MysqlArtifactScheduler {
             .bind(claim.record.id)
             .execute(&mut *tx)
             .await?;
+            refresh_base_retention(
+                &mut tx,
+                &claim.record.key.workspace,
+                &claim.record.key.repo,
+                claim.record.key.format_version as i64,
+            )
+            .await?;
         }
         tx.commit().await?;
         Ok(won)
@@ -1968,6 +2134,13 @@ impl ArtifactSchedulerPersistence for MysqlArtifactScheduler {
                 .bind(key.format_version as i64)
                 .execute(&mut *tx)
                 .await?;
+            refresh_base_retention(
+                &mut tx,
+                &key.workspace,
+                &key.repo,
+                key.format_version as i64,
+            )
+            .await?;
         }
         tx.commit().await?;
         Ok(result.rows_affected() > 0)
@@ -2077,6 +2250,7 @@ mod tests {
     async fn reset(pool: &MySqlPool) {
         for statement in [
             "DROP TABLE IF EXISTS external_scheduler_child",
+            "DROP TABLE IF EXISTS artifact_base_retention",
             "DROP TABLE IF EXISTS artifact_transport_leases",
             "DROP TABLE IF EXISTS artifact_consumers",
             "DROP TABLE IF EXISTS artifact_observations",
@@ -2193,6 +2367,54 @@ mod tests {
                 .await
                 .unwrap()
         );
+
+        let mut gc_ids = Vec::new();
+        for (commit, manifest) in [
+            ("gc-consumer", "gc-a"),
+            ("gc-published", "gc-b"),
+            ("gc-superseded", "gc-c"),
+            ("gc-expired", "gc-d"),
+        ] {
+            let result = sqlx::query("INSERT INTO artifact_jobs(workspace,repo,commit_oid,kind,format_version,state,manifest,created_at,updated_at) VALUES('gc-ws','gc/repo',?,'files',1,'ready',?,UNIX_TIMESTAMP(),UNIX_TIMESTAMP())").bind(commit).bind(manifest).execute(a.pool()).await.unwrap();
+            gc_ids.push(result.last_insert_id() as i64);
+        }
+        sqlx::query("INSERT INTO artifact_consumers(artifact_id,consumer_id,expires_at) VALUES(?,'admission',UNIX_TIMESTAMP()+60),(?,'expired',UNIX_TIMESTAMP()-1)").bind(gc_ids[0]).bind(gc_ids[3]).execute(a.pool()).await.unwrap();
+        sqlx::query("INSERT INTO artifact_observations(workspace,repo,branch,kind,desired_commit,desired_artifact_id,desired_generation,published_artifact_id,format_version,observed_at) VALUES('gc-ws','gc/repo','main','files','gc-published',?,1,?,1,UNIX_TIMESTAMP())").bind(gc_ids[1]).bind(gc_ids[1]).execute(a.pool()).await.unwrap();
+        let roots = a.live_scheduler_roots_page(None, 512).await.unwrap();
+        assert!(roots.iter().any(|r| r.artifact_id == gc_ids[0]));
+        assert!(roots.iter().any(|r| r.artifact_id == gc_ids[1]));
+        assert!(
+            !roots
+                .iter()
+                .any(|r| r.artifact_id == gc_ids[2] || r.artifact_id == gc_ids[3])
+        );
+        assert_eq!(
+            a.live_scheduler_roots_page(Some(gc_ids[0]), 1)
+                .await
+                .unwrap()[0]
+                .artifact_id,
+            gc_ids[1]
+        );
+        a.release_consumer(gc_ids[0], "admission").await.unwrap();
+        let roots = a.live_scheduler_roots_page(None, 512).await.unwrap();
+        assert!(!roots.iter().any(|r| r.artifact_id == gc_ids[0]));
+        assert!(roots.iter().any(|r| r.artifact_id == gc_ids[1]));
+        sqlx::query("DELETE FROM artifact_observations WHERE workspace='gc-ws'")
+            .execute(a.pool())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM artifact_consumers WHERE artifact_id IN (?,?,?,?)")
+            .bind(gc_ids[0])
+            .bind(gc_ids[1])
+            .bind(gc_ids[2])
+            .bind(gc_ids[3])
+            .execute(a.pool())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM artifact_jobs WHERE workspace='gc-ws'")
+            .execute(a.pool())
+            .await
+            .unwrap();
 
         // Exact identity and atomic dedup across independent pools.
         let duplicate = key("dedup", ArtifactKind::Head);

@@ -14,7 +14,7 @@ use crate::artifact_scheduler::{
 #[cfg(test)]
 use crate::artifact_scheduler::{CompletionEvidence, validate_evidence};
 use crate::artifact_scheduler_backend::{
-    ArtifactSchedulerPersistence, TRANSPORT_ROOT_PAGE_MAX, TransportRootLease,
+    ArtifactSchedulerPersistence, SchedulerGcRoot, TRANSPORT_ROOT_PAGE_MAX, TransportRootLease,
     validate_transport_lease_identity,
 };
 use anyhow::{Context, Result, bail};
@@ -23,7 +23,7 @@ use sqlx::postgres::PgPool;
 use sqlx::{Postgres, Row, Transaction};
 use std::sync::Arc;
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS artifact_scheduler_schema(
  id SMALLINT CONSTRAINT artifact_scheduler_schema_pkey PRIMARY KEY,
@@ -80,6 +80,13 @@ CREATE TABLE IF NOT EXISTS artifact_transport_leases(
  CONSTRAINT artifact_transport_leases_pkey PRIMARY KEY(root_hash,session_id));
 CREATE INDEX IF NOT EXISTS artifact_transport_leases_expiry
  ON artifact_transport_leases(expires_at);
+CREATE TABLE IF NOT EXISTS artifact_base_retention(
+ artifact_id BIGINT CONSTRAINT artifact_base_retention_pkey PRIMARY KEY,
+ workspace TEXT NOT NULL,repo TEXT NOT NULL,format_version BIGINT NOT NULL,
+ head_rank SMALLINT,pair_rank SMALLINT,
+ CONSTRAINT artifact_base_retention_artifact FOREIGN KEY(artifact_id) REFERENCES artifact_jobs(id) ON DELETE CASCADE,
+ CONSTRAINT artifact_base_retention_ranks CHECK((head_rank IS NULL OR head_rank BETWEEN 1 AND 8) AND (pair_rank IS NULL OR pair_rank BETWEEN 1 AND 8) AND (head_rank IS NOT NULL OR pair_rank IS NOT NULL)));
+CREATE INDEX IF NOT EXISTS artifact_base_retention_scope ON artifact_base_retention(workspace,repo,format_version);
 CREATE TABLE IF NOT EXISTS scheduler_state(
  id SMALLINT CONSTRAINT scheduler_state_pkey PRIMARY KEY,
  fairness_cursor BIGINT NOT NULL,
@@ -131,7 +138,7 @@ impl PostgresArtifactScheduler {
         if version > SCHEMA_VERSION {
             bail!("artifact scheduler database is newer than this binary")
         }
-        if version != 1 && version != SCHEMA_VERSION {
+        if ![1, 2, SCHEMA_VERSION].contains(&version) {
             bail!("unsupported postgres artifact scheduler schema {version}")
         }
         let missing_columns: i64 = sqlx::query_scalar(
@@ -388,6 +395,33 @@ impl PostgresArtifactScheduler {
         if transport_index_count != 2 || transport_foreign_keys != 0 {
             bail!("postgres artifact transport schema has unexpected indexes or foreign keys")
         }
+        let retention_columns: i64 = sqlx::query_scalar("WITH expected(column_name,data_type,is_nullable) AS (VALUES ('artifact_id','bigint','NO'),('workspace','text','NO'),('repo','text','NO'),('format_version','bigint','NO'),('head_rank','smallint','YES'),('pair_rank','smallint','YES')) SELECT count(*) FROM expected e JOIN information_schema.columns c ON c.table_schema=current_schema() AND c.table_name='artifact_base_retention' AND c.column_name=e.column_name AND c.data_type=e.data_type AND c.is_nullable=e.is_nullable WHERE c.column_default IS NULL").fetch_one(&mut *migration).await?;
+        let retention_column_count: i64 = sqlx::query_scalar("SELECT count(*) FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='artifact_base_retention'").fetch_one(&mut *migration).await?;
+        let retention_constraints: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_constraint c WHERE c.conrelid='artifact_base_retention'::regclass AND ((c.conname='artifact_base_retention_pkey' AND c.contype='p' AND pg_get_constraintdef(c.oid)='PRIMARY KEY (artifact_id)') OR (c.conname='artifact_base_retention_artifact' AND c.contype='f' AND c.confrelid='artifact_jobs'::regclass AND c.confdeltype='c' AND pg_get_constraintdef(c.oid)='FOREIGN KEY (artifact_id) REFERENCES artifact_jobs(id) ON DELETE CASCADE') OR (c.conname='artifact_base_retention_ranks' AND c.contype='c' AND pg_get_constraintdef(c.oid) ILIKE '%head_rank%' AND pg_get_constraintdef(c.oid) ILIKE '%pair_rank%' AND pg_get_constraintdef(c.oid) LIKE '%8%'))").fetch_one(&mut *migration).await?;
+        let retention_constraint_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_constraint WHERE conrelid='artifact_base_retention'::regclass",
+        )
+        .fetch_one(&mut *migration)
+        .await?;
+        let retention_indexes: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_index WHERE indrelid='artifact_base_retention'::regclass",
+        )
+        .fetch_one(&mut *migration)
+        .await?;
+        let retention_scope_exact: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_indexes WHERE schemaname=current_schema() AND indexname='artifact_base_retention_scope' AND indexdef LIKE '%(workspace, repo, format_version)%'").fetch_one(&mut *migration).await?;
+        if retention_columns != 6
+            || retention_column_count != 6
+            || retention_constraints != 3
+            || retention_constraint_count != 3
+            || retention_indexes != 2
+            || retention_scope_exact != 1
+        {
+            bail!("postgres artifact base retention schema differs from schema version")
+        }
+        let invalid_retention: i64 = sqlx::query_scalar("SELECT count(*) FROM artifact_base_retention r LEFT JOIN artifact_jobs j ON j.id=r.artifact_id WHERE j.id IS NULL OR j.workspace<>r.workspace OR j.repo<>r.repo OR j.format_version<>r.format_version OR (r.head_rank IS NULL AND r.pair_rank IS NULL) OR (r.head_rank IS NOT NULL AND r.head_rank NOT BETWEEN 1 AND 8) OR (r.pair_rank IS NOT NULL AND r.pair_rank NOT BETWEEN 1 AND 8)").fetch_one(&mut *migration).await?;
+        if invalid_retention != 0 {
+            bail!("postgres artifact scheduler contains invalid base retention")
+        }
         let invalid_jobs: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM artifact_jobs WHERE
                state NOT IN('queued','running','ready','failed')
@@ -458,11 +492,18 @@ impl PostgresArtifactScheduler {
         if invalid_control != 0 {
             bail!("postgres artifact scheduler contains invalid control state")
         }
-        if version == 1 {
-            sqlx::query("UPDATE artifact_scheduler_schema SET version=$1 WHERE id=1 AND version=1")
-                .bind(SCHEMA_VERSION)
-                .execute(&mut *migration)
-                .await?;
+        if version < SCHEMA_VERSION {
+            let scopes: Vec<(String,String,i64)> = sqlx::query_as("SELECT DISTINCT workspace,repo,format_version FROM artifact_jobs WHERE state='ready' AND kind IN('head','full_history')").fetch_all(&mut *migration).await?;
+            for (w, r, v) in scopes {
+                refresh_base_retention(&mut migration, &w, &r, v).await?;
+            }
+            sqlx::query(
+                "UPDATE artifact_scheduler_schema SET version=$1 WHERE id=1 AND version=$2",
+            )
+            .bind(SCHEMA_VERSION)
+            .bind(version)
+            .execute(&mut *migration)
+            .await?;
         }
         let fingerprint = scheduler_fingerprint(&limits, verifier_id);
         let stored: String = sqlx::query_scalar(
@@ -720,6 +761,36 @@ fn kind_index(kind: ArtifactKind) -> usize {
         ArtifactKind::Files => 2,
     }
 }
+
+async fn refresh_base_retention(
+    tx: &mut Transaction<'_, Postgres>,
+    w: &str,
+    r: &str,
+    v: i64,
+) -> Result<()> {
+    sqlx::query(
+        "DELETE FROM artifact_base_retention WHERE workspace=$1 AND repo=$2 AND format_version=$3",
+    )
+    .bind(w)
+    .bind(r)
+    .bind(v)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query("INSERT INTO artifact_base_retention(artifact_id,workspace,repo,format_version,head_rank) SELECT id,workspace,repo,format_version,rank FROM (SELECT id,workspace,repo,format_version,row_number() OVER(ORDER BY updated_at DESC,id DESC)::SMALLINT rank FROM artifact_jobs WHERE workspace=$1 AND repo=$2 AND format_version=$3 AND kind='head' AND state='ready' AND manifest IS NOT NULL AND length(trim(manifest))>0) ranked WHERE rank<=8").bind(w).bind(r).bind(v).execute(&mut **tx).await?;
+    for history in [false, true] {
+        let id = if history { "history_id" } else { "head_id" };
+        let sql = format!(
+            "INSERT INTO artifact_base_retention(artifact_id,workspace,repo,format_version,pair_rank) SELECT {id},workspace,repo,format_version,rank FROM (SELECT h.id head_id,f.id history_id,h.workspace,h.repo,h.format_version,row_number() OVER(ORDER BY GREATEST(h.updated_at,f.updated_at) DESC,GREATEST(h.id,f.id) DESC)::SMALLINT rank FROM artifact_jobs h JOIN artifact_jobs f ON f.workspace=h.workspace AND f.repo=h.repo AND f.commit_oid=h.commit_oid AND f.format_version=h.format_version AND f.kind='full_history' AND f.state='ready' AND f.manifest IS NOT NULL AND length(trim(f.manifest))>0 WHERE h.workspace=$1 AND h.repo=$2 AND h.format_version=$3 AND h.kind='head' AND h.state='ready' AND h.manifest IS NOT NULL AND length(trim(h.manifest))>0) ranked WHERE rank<=8 ON CONFLICT(artifact_id) DO UPDATE SET pair_rank=EXCLUDED.pair_rank"
+        );
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(w)
+            .bind(r)
+            .bind(v)
+            .execute(&mut **tx)
+            .await?;
+    }
+    Ok(())
+}
 fn outcome_id(outcome: &ScheduleOutcome) -> i64 {
     match outcome {
         ScheduleOutcome::Enqueued(id)
@@ -835,6 +906,53 @@ impl ArtifactSchedulerPersistence for PostgresArtifactScheduler {
             })
             .collect()
     }
+
+    async fn live_scheduler_roots_page(
+        &self,
+        after_artifact_id: Option<i64>,
+        limit: u32,
+    ) -> Result<Vec<SchedulerGcRoot>> {
+        if limit == 0
+            || limit > TRANSPORT_ROOT_PAGE_MAX
+            || after_artifact_id.is_some_and(|id| id < 0)
+        {
+            bail!("scheduler GC root page cursor or limit is invalid")
+        }
+        let mut tx = self.pool.begin().await?;
+        let now: i64 = sqlx::query_scalar("SELECT EXTRACT(EPOCH FROM clock_timestamp())::BIGINT")
+            .fetch_one(&mut *tx)
+            .await?;
+        let rows = sqlx::query(
+            "SELECT j.id,j.workspace,j.repo,j.commit_oid,j.kind,j.format_version,j.manifest
+             FROM artifact_jobs j WHERE j.id>$1 AND j.state='ready'
+               AND j.manifest IS NOT NULL AND length(trim(j.manifest))>0
+               AND (EXISTS(SELECT 1 FROM artifact_observations o WHERE o.published_artifact_id=j.id)
+                    OR EXISTS(SELECT 1 FROM artifact_consumers c WHERE c.artifact_id=j.id AND c.expires_at>$2)
+                    OR EXISTS(SELECT 1 FROM artifact_base_retention r WHERE r.artifact_id=j.id))
+             ORDER BY j.id LIMIT $3",
+        )
+        .bind(after_artifact_id.unwrap_or(0)).bind(now).bind(limit as i64)
+        .fetch_all(&mut *tx).await?;
+        tx.commit().await?;
+        rows.into_iter()
+            .map(|row| {
+                let version = u32::try_from(row.try_get::<i64, _>("format_version")?)
+                    .context("scheduler GC root format")?;
+                Ok(SchedulerGcRoot {
+                    artifact_id: row.try_get("id")?,
+                    key: ArtifactKey {
+                        workspace: row.try_get("workspace")?,
+                        repo: row.try_get("repo")?,
+                        commit: row.try_get("commit_oid")?,
+                        kind: ArtifactKind::parse(row.try_get("kind")?)?,
+                        format_version: version,
+                    },
+                    manifest: row.try_get("manifest")?,
+                })
+            })
+            .collect()
+    }
+
     async fn schedule(&self, key: &ArtifactKey) -> Result<ScheduleOutcome> {
         validate_format_version(key.format_version)?;
         let (mut tx, now) = self.controlled().await?;
@@ -1327,6 +1445,13 @@ impl ArtifactSchedulerPersistence for PostgresArtifactScheduler {
             .bind(claim.record.id)
             .execute(&mut *tx)
             .await?;
+            refresh_base_retention(
+                &mut tx,
+                &claim.record.key.workspace,
+                &claim.record.key.repo,
+                claim.record.key.format_version as i64,
+            )
+            .await?;
         }
         tx.commit().await?;
         Ok(won)
@@ -1592,6 +1717,13 @@ impl ArtifactSchedulerPersistence for PostgresArtifactScheduler {
                 .bind(id)
                 .execute(&mut *tx)
                 .await?;
+            refresh_base_retention(
+                &mut tx,
+                &key.workspace,
+                &key.repo,
+                key.format_version as i64,
+            )
+            .await?;
         }
         tx.commit().await?;
         Ok(id.is_some())
@@ -1684,7 +1816,8 @@ mod tests {
 
     async fn reset(pool: &PgPool) {
         sqlx::raw_sql(
-            "DROP TABLE IF EXISTS artifact_transport_leases;
+            "DROP TABLE IF EXISTS artifact_base_retention;
+             DROP TABLE IF EXISTS artifact_transport_leases;
              DROP TABLE IF EXISTS artifact_consumers;
              DROP TABLE IF EXISTS artifact_observations;
              DROP TABLE IF EXISTS branch_observations;
@@ -1829,6 +1962,51 @@ mod tests {
                 .await
                 .unwrap()
         );
+
+        let mut gc_ids = Vec::new();
+        for (commit, manifest) in [
+            ("gc-consumer", "gc-a"),
+            ("gc-published", "gc-b"),
+            ("gc-superseded", "gc-c"),
+            ("gc-expired", "gc-d"),
+        ] {
+            let id: i64 = sqlx::query_scalar("INSERT INTO artifact_jobs(workspace,repo,commit_oid,kind,format_version,state,manifest,created_at,updated_at) VALUES('gc-ws','gc/repo',$1,'files',1,'ready',$2,EXTRACT(EPOCH FROM clock_timestamp())::BIGINT,EXTRACT(EPOCH FROM clock_timestamp())::BIGINT) RETURNING id").bind(commit).bind(manifest).fetch_one(a.pool()).await.unwrap();
+            gc_ids.push(id);
+        }
+        sqlx::query("INSERT INTO artifact_consumers(artifact_id,consumer_id,expires_at) VALUES($1,'admission',EXTRACT(EPOCH FROM clock_timestamp())::BIGINT+60),($2,'expired',EXTRACT(EPOCH FROM clock_timestamp())::BIGINT-1)").bind(gc_ids[0]).bind(gc_ids[3]).execute(a.pool()).await.unwrap();
+        sqlx::query("INSERT INTO artifact_observations(workspace,repo,branch,kind,desired_commit,desired_artifact_id,desired_generation,published_artifact_id,format_version,observed_at) VALUES('gc-ws','gc/repo','main','files','gc-published',$1,1,$1,1,EXTRACT(EPOCH FROM clock_timestamp())::BIGINT)").bind(gc_ids[1]).execute(a.pool()).await.unwrap();
+        let roots = a.live_scheduler_roots_page(None, 512).await.unwrap();
+        assert!(roots.iter().any(|r| r.artifact_id == gc_ids[0]));
+        assert!(roots.iter().any(|r| r.artifact_id == gc_ids[1]));
+        assert!(
+            !roots
+                .iter()
+                .any(|r| r.artifact_id == gc_ids[2] || r.artifact_id == gc_ids[3])
+        );
+        assert_eq!(
+            a.live_scheduler_roots_page(Some(gc_ids[0]), 1)
+                .await
+                .unwrap()[0]
+                .artifact_id,
+            gc_ids[1]
+        );
+        a.release_consumer(gc_ids[0], "admission").await.unwrap();
+        let roots = a.live_scheduler_roots_page(None, 512).await.unwrap();
+        assert!(!roots.iter().any(|r| r.artifact_id == gc_ids[0]));
+        assert!(roots.iter().any(|r| r.artifact_id == gc_ids[1]));
+        sqlx::query("DELETE FROM artifact_observations WHERE workspace='gc-ws'")
+            .execute(a.pool())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM artifact_consumers WHERE artifact_id=ANY($1)")
+            .bind(&gc_ids)
+            .execute(a.pool())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM artifact_jobs WHERE workspace='gc-ws'")
+            .execute(a.pool())
+            .await
+            .unwrap();
 
         let mut zero = key("zero", ArtifactKind::Head);
         zero.format_version = 0;
