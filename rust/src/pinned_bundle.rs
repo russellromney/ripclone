@@ -72,6 +72,7 @@ pub struct PinnedBundleManifest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PinnedManifestCapability {
     pub artifacts: Vec<PinnedArtifactDescriptor>,
+    pub base_commit: String,
     pub target_commit: String,
     pub mode: TopUpMode,
 }
@@ -125,6 +126,7 @@ pub fn validate_pinned_manifest_capability(
     }
     Ok(PinnedManifestCapability {
         artifacts: flattened,
+        base_commit: stored.verified.bundle.base_commit,
         target_commit: stored.verified.bundle.target_commit,
         mode: stored.verified.bundle.mode,
     })
@@ -316,6 +318,52 @@ pub fn verify_pinned_bundle_ready(
     verify_combined_repository(cas, &stored)?;
     stored.verified.manifest_hash = request.manifest_hash.clone();
     Ok(stored.verified)
+}
+
+/// Opaque one-shot handoff from expensive semantic verification to
+/// materialization. It is bound to the exact request and local CAS root and is
+/// intentionally neither Clone nor serializable.
+pub struct VerifiedPinnedLocalCapability {
+    request: PinnedBundleRequest,
+    cas_root: std::path::PathBuf,
+    verified: VerifiedPinnedBundle,
+    manifest: PinnedBundleManifest,
+}
+
+pub fn verify_pinned_bundle_capability(
+    cas: &Cas,
+    request: &PinnedBundleRequest,
+) -> Result<VerifiedPinnedLocalCapability> {
+    let verified = verify_pinned_bundle_ready(cas, request)?;
+    let manifest = decode_pinned_bundle_manifest(cas, request)?;
+    Ok(VerifiedPinnedLocalCapability {
+        request: request.clone(),
+        cas_root: cas
+            .root()
+            .canonicalize()
+            .context("canonicalize verified pinned CAS")?,
+        verified,
+        manifest,
+    })
+}
+
+pub fn materialize_verified_pinned_capability(
+    cas: &Cas,
+    request: &PinnedBundleRequest,
+    capability: VerifiedPinnedLocalCapability,
+    destination: &Path,
+) -> Result<VerifiedPinnedBundle> {
+    if capability.request != *request
+        || cas
+            .root()
+            .canonicalize()
+            .context("canonicalize materialization CAS")?
+            != capability.cas_root
+    {
+        bail!("verified pinned capability request/CAS binding mismatch");
+    }
+    materialize_pinned_bundle_artifacts(cas, &capability.manifest, destination)?;
+    Ok(capability.verified)
 }
 
 fn verify_base_artifact(cas: &Cas, base: &VerifiedBaseArtifact) -> Result<()> {
@@ -776,6 +824,47 @@ mod tests {
             let verified = verify_pinned_bundle_ready(&f.cas, &request).unwrap();
             assert_eq!(verified.bundle.base_commit, verified.bundle.target_commit);
         }
+    }
+
+    #[test]
+    fn verified_capability_is_request_cas_bound_and_detects_post_verify_mutation() {
+        let f = Fixture::new();
+        let base_commit = f.commit("base", "base");
+        let base = f.base(&base_commit, TopUpMode::Head);
+        let target = f.commit("target", "target");
+        let request = f.generate(&base, &target, TopUpMode::Head).unwrap();
+
+        let capability = verify_pinned_bundle_capability(&f.cas, &request).unwrap();
+        let other_root = tempfile::tempdir().unwrap();
+        let other = Cas::new(other_root.path()).unwrap();
+        assert!(
+            materialize_verified_pinned_capability(
+                &other,
+                &request,
+                capability,
+                tempfile::tempdir().unwrap().path(),
+            )
+            .is_err(),
+            "capability replayed against another CAS root"
+        );
+
+        let capability = verify_pinned_bundle_capability(&f.cas, &request).unwrap();
+        let manifest = decode_pinned_bundle_manifest(&f.cas, &request).unwrap();
+        std::fs::write(
+            f.cas_path(&manifest.prebuilt_index.hash),
+            b"mutated after verify",
+        )
+        .unwrap();
+        assert!(
+            materialize_verified_pinned_capability(
+                &f.cas,
+                &request,
+                capability,
+                tempfile::tempdir().unwrap().path(),
+            )
+            .is_err(),
+            "post-verification CAS mutation reached materialization"
+        );
     }
 
     #[test]

@@ -2535,11 +2535,11 @@ async fn typed_artifact_heartbeat_inner(
     {
         return response;
     }
-    let consumer_id = match typed_transport_consumer(&headers) {
-        Ok(consumer) => consumer,
+    let session = match typed_transport_session(&headers) {
+        Ok(session) => session,
         Err(_) => return forbidden_repo_response(),
     };
-    let capability = match typed_root_authorizes_hash(&state, &repo_id, &root, &root).await {
+    let _capability = match typed_root_authorizes_hash(&state, &repo_id, &root, &root).await {
         Ok(capability) if capability.allowed => capability,
         Ok(_) => return forbidden_repo_response(),
         Err(error) => {
@@ -2550,11 +2550,19 @@ async fn typed_artifact_heartbeat_inner(
     let Some(scheduler) = state.artifact_scheduler.as_ref() else {
         return forbidden_repo_response();
     };
-    for key in &capability.lease_keys {
-        if let Err(error) = scheduler
-            .subscribe_consumer(key, &consumer_id, TYPED_TRANSPORT_CONSUMER_TTL_SECS)
-            .await
-        {
+    match scheduler
+        .renew_transport_root(
+            &root,
+            &session,
+            repo_id.workspace.as_str(),
+            &repo_id.path,
+            TYPED_TRANSPORT_CONSUMER_TTL_SECS,
+        )
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return forbidden_repo_response(),
+        Err(error) => {
             warn!("typed artifact heartbeat lease renewal failed: {error:#}");
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
@@ -2585,11 +2593,11 @@ async fn typed_artifact_release_inner(
     {
         return response;
     }
-    let consumer_id = match typed_transport_consumer(&headers) {
-        Ok(consumer) => consumer,
+    let session = match typed_transport_session(&headers) {
+        Ok(session) => session,
         Err(_) => return forbidden_repo_response(),
     };
-    let capability = match typed_root_authorizes_hash(&state, &repo_id, &root, &root).await {
+    let _capability = match typed_root_authorizes_hash(&state, &repo_id, &root, &root).await {
         Ok(capability) if capability.allowed => capability,
         Ok(_) => return forbidden_repo_response(),
         Err(error) => {
@@ -2600,17 +2608,13 @@ async fn typed_artifact_release_inner(
     let Some(scheduler) = state.artifact_scheduler.as_ref() else {
         return forbidden_repo_response();
     };
-    for key in &capability.lease_keys {
-        let Some(record) = (match scheduler.get_by_key(key).await {
-            Ok(record) => record,
-            Err(error) => {
-                warn!("typed artifact transport lease lookup failed: {error:#}");
-                return StatusCode::SERVICE_UNAVAILABLE.into_response();
-            }
-        }) else {
-            continue;
-        };
-        if let Err(error) = scheduler.release_consumer(record.id, &consumer_id).await {
+    match scheduler
+        .release_transport_root(&root, &session, repo_id.workspace.as_str(), &repo_id.path)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return forbidden_repo_response(),
+        Err(error) => {
             warn!("typed artifact transport lease release failed: {error:#}");
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
@@ -3210,10 +3214,9 @@ const TYPED_TRANSPORT_CONSUMER_TTL_SECS: i64 = 15 * 60;
 
 struct AuthorizedTypedRoot {
     allowed: bool,
-    lease_keys: Vec<crate::artifact_scheduler::ArtifactKey>,
 }
 
-fn typed_transport_consumer(headers: &HeaderMap) -> Result<String> {
+fn typed_transport_session(headers: &HeaderMap) -> Result<String> {
     let session = headers
         .get("x-ripclone-transport-session")
         .and_then(|value| value.to_str().ok())
@@ -3225,7 +3228,7 @@ fn typed_transport_consumer(headers: &HeaderMap) -> Result<String> {
     {
         anyhow::bail!("typed transport session is invalid");
     }
-    Ok(format!("transport-{session}"))
+    Ok(session.to_owned())
 }
 
 async fn read_storage_object_bounded(
@@ -3270,16 +3273,10 @@ async fn typed_root_authorizes_hash(
     {
         if manifest.key.workspace != repo_id.workspace.as_str() || manifest.key.repo != repo_id.path
         {
-            return Ok(AuthorizedTypedRoot {
-                allowed: false,
-                lease_keys: Vec::new(),
-            });
+            return Ok(AuthorizedTypedRoot { allowed: false });
         }
         let Some(scheduler) = state.artifact_scheduler.as_ref() else {
-            return Ok(AuthorizedTypedRoot {
-                allowed: false,
-                lease_keys: Vec::new(),
-            });
+            return Ok(AuthorizedTypedRoot { allowed: false });
         };
         let key = crate::artifact_scheduler::ArtifactKey {
             workspace: manifest.key.workspace.clone(),
@@ -3289,18 +3286,12 @@ async fn typed_root_authorizes_hash(
             format_version: manifest.key.format_version,
         };
         let Some(record) = scheduler.get_by_key(&key).await? else {
-            return Ok(AuthorizedTypedRoot {
-                allowed: false,
-                lease_keys: Vec::new(),
-            });
+            return Ok(AuthorizedTypedRoot { allowed: false });
         };
         if record.state != crate::artifact_scheduler::ArtifactState::Ready
             || record.manifest.as_deref() != Some(root)
         {
-            return Ok(AuthorizedTypedRoot {
-                allowed: false,
-                lease_keys: Vec::new(),
-            });
+            return Ok(AuthorizedTypedRoot { allowed: false });
         }
         let allowed = requested == root
             || manifest
@@ -3308,35 +3299,19 @@ async fn typed_root_authorizes_hash(
                 .referenced_blobs()
                 .iter()
                 .any(|blob| blob.hash == requested);
-        return Ok(AuthorizedTypedRoot {
-            allowed,
-            lease_keys: vec![key],
-        });
+        return Ok(AuthorizedTypedRoot { allowed });
     }
     let capability = crate::pinned_bundle::validate_pinned_manifest_capability(
         &bytes,
         repo_id.workspace.as_str(),
         &repo_id.path,
     )?;
-    let mut lease_keys = vec![artifact_key(
-        repo_id,
-        &capability.target_commit,
-        crate::artifact_scheduler::ArtifactKind::Head,
-    )];
-    if capability.mode == crate::topup::TopUpMode::Full {
-        lease_keys.push(artifact_key(
-            repo_id,
-            &capability.target_commit,
-            crate::artifact_scheduler::ArtifactKind::FullHistory,
-        ));
-    }
     Ok(AuthorizedTypedRoot {
         allowed: requested == root
             || capability
                 .artifacts
                 .iter()
                 .any(|artifact| artifact.hash == requested),
-        lease_keys,
     })
 }
 
@@ -3368,11 +3343,11 @@ async fn typed_artifact_download_inner(
             Ok(private) => private,
             Err(response) => return response,
         };
-    let consumer_id = match typed_transport_consumer(&headers) {
-        Ok(consumer) => consumer,
+    let session = match typed_transport_session(&headers) {
+        Ok(session) => session,
         Err(_) => return forbidden_repo_response(),
     };
-    let capability = match typed_root_authorizes_hash(&state, &repo_id, &root, &hash).await {
+    let _capability = match typed_root_authorizes_hash(&state, &repo_id, &root, &hash).await {
         Ok(capability) if capability.allowed => capability,
         Ok(_) => return forbidden_repo_response(),
         Err(error) => {
@@ -3383,11 +3358,19 @@ async fn typed_artifact_download_inner(
     let Some(scheduler) = state.artifact_scheduler.as_ref() else {
         return forbidden_repo_response();
     };
-    for key in &capability.lease_keys {
-        if let Err(error) = scheduler
-            .subscribe_consumer(key, &consumer_id, TYPED_TRANSPORT_CONSUMER_TTL_SECS)
-            .await
-        {
+    match scheduler
+        .renew_transport_root(
+            &root,
+            &session,
+            repo_id.workspace.as_str(),
+            &repo_id.path,
+            TYPED_TRANSPORT_CONSUMER_TTL_SECS,
+        )
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return forbidden_repo_response(),
+        Err(error) => {
             warn!("typed artifact transport lease renewal failed: {error:#}");
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
@@ -3678,6 +3661,37 @@ async fn hydrate_typed_publication(
     Ok(())
 }
 
+async fn republish_transport_root(state: &ServerState, root: &str) -> Result<()> {
+    let bytes = state
+        .cas
+        .get(root)
+        .context("read verified transport root")?;
+    let manifest = crate::artifact_manifest::ArtifactManifest::validate_envelope_bytes(&bytes)?;
+    let mut hashes = manifest
+        .payload
+        .referenced_blobs()
+        .into_iter()
+        .map(|blob| blob.hash.clone())
+        .collect::<Vec<_>>();
+    hashes.push(root.to_owned());
+    for hash in &hashes {
+        state
+            .storage
+            .put_file_async(hash, &state.cas.path(hash))
+            .await
+            .with_context(|| format!("republish leased transport object {hash}"))?;
+    }
+    // Local retention re-stats immediately before unlinking. Touching after the
+    // catalog commit makes a mark taken before registration detect the change
+    // and skip this pass; remote uploads similarly refresh object mtime.
+    let now = filetime::FileTime::now();
+    for hash in hashes {
+        filetime::set_file_mtime(state.cas.path(&hash), now)
+            .with_context(|| format!("touch leased transport object {hash}"))?;
+    }
+    Ok(())
+}
+
 async fn load_exact_clone_artifacts(
     scheduler: &dyn crate::artifact_scheduler_backend::ArtifactSchedulerPersistence,
     state: &ServerState,
@@ -3915,15 +3929,23 @@ async fn build_top_up_receipt(
             .map(|artifact| artifact.hash.clone())
             .collect::<Vec<_>>();
         hashes.push(request.manifest_hash.clone());
-        // Local-only storage has no redirect/grace safety net. Keep the
-        // generated capability root and every delegated object protected for
-        // at least the issued plan's usable lifetime (the protected set is a
-        // conservative durable superset and content-addressed duplicates are
-        // free).
-        state.retention.protect(&hashes).await;
+        let receipt = VerifiedTopUpReceipt::from_verified(&verified)?;
+        let transport = receipt.transport_request();
+        // Register before upload: a concurrent GC/retention pass that observes
+        // the lease but cannot yet read its root fails closed and deletes
+        // nothing. The plan is not issued until every durable upload succeeds.
+        scheduler
+            .register_transport_root(
+                &transport.manifest_hash,
+                &transport.transport_session,
+                &transport.workspace_id,
+                &transport.repo_path,
+                TYPED_TRANSPORT_CONSUMER_TTL_SECS,
+            )
+            .await?;
         let storage = state.storage.clone();
         let cas = state.cas.clone();
-        futures::stream::iter(hashes.into_iter().map(|hash| {
+        let publication = futures::stream::iter(hashes.into_iter().map(|hash| {
             let storage = storage.clone();
             let path = cas.path(&hash);
             async move {
@@ -3935,8 +3957,19 @@ async fn build_top_up_receipt(
         }))
         .buffer_unordered(8)
         .try_collect::<Vec<_>>()
-        .await?;
-        return Ok(Some(VerifiedTopUpReceipt::from_verified(&verified)?));
+        .await;
+        if let Err(error) = publication {
+            let _ = scheduler
+                .release_transport_root(
+                    &transport.manifest_hash,
+                    &transport.transport_session,
+                    &transport.workspace_id,
+                    &transport.repo_path,
+                )
+                .await;
+            return Err(error);
+        }
+        return Ok(Some(receipt));
     }
     Ok(None)
 }
@@ -4209,7 +4242,102 @@ async fn typed_clone_plan_inner(
                 .into_response();
         }
     };
+    if matches!(plan, crate::clone_plan::ClonePlan::Pending { .. }) {
+        // A branch-local mirror is not a fleet-durable input contract. Until
+        // the normalized builder publishes a durable target snapshot/pack
+        // lease, fail explicitly rather than promise convergence to a pinned
+        // point-in-time target that another worker cannot reconstruct.
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "typed artifact target input is not yet durably published".to_string(),
+            }),
+        )
+            .into_response();
+    }
     let convergence_required = convergence_failure_is_fatal(&plan);
+    let exact_transport_roots: Vec<(&str, &str)> = match &plan {
+        crate::clone_plan::ClonePlan::Ready {
+            payload:
+                crate::clone_plan::ClonePayload::FilesArchive {
+                    manifest,
+                    transport_session,
+                }
+                | crate::clone_plan::ClonePayload::HeadArtifact {
+                    manifest,
+                    transport_session,
+                    ..
+                },
+            ..
+        } => vec![(manifest, transport_session)],
+        crate::clone_plan::ClonePlan::Ready {
+            payload:
+                crate::clone_plan::ClonePayload::FullArtifacts {
+                    head_manifest,
+                    history_manifest,
+                    transport_session,
+                },
+            ..
+        } => vec![
+            (head_manifest, transport_session),
+            (history_manifest, transport_session),
+        ],
+        _ => Vec::new(),
+    };
+    let mut registered_roots = Vec::new();
+    for (root, session) in exact_transport_roots {
+        if let Err(error) = scheduler
+            .register_transport_root(
+                root,
+                session,
+                repo_id.workspace.as_str(),
+                &repo_id.path,
+                TYPED_TRANSPORT_CONSUMER_TTL_SECS,
+            )
+            .await
+        {
+            for (registered_root, registered_session) in registered_roots {
+                let _ = scheduler
+                    .release_transport_root(
+                        registered_root,
+                        registered_session,
+                        repo_id.workspace.as_str(),
+                        &repo_id.path,
+                    )
+                    .await;
+            }
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse {
+                    error: format!("register typed transport root: {error:#}"),
+                }),
+            )
+                .into_response();
+        }
+        if let Err(error) = republish_transport_root(&state, root).await {
+            let _ = scheduler
+                .release_transport_root(root, session, repo_id.workspace.as_str(), &repo_id.path)
+                .await;
+            for (registered_root, registered_session) in registered_roots {
+                let _ = scheduler
+                    .release_transport_root(
+                        registered_root,
+                        registered_session,
+                        repo_id.workspace.as_str(),
+                        &repo_id.path,
+                    )
+                    .await;
+            }
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse {
+                    error: format!("publish typed transport root: {error:#}"),
+                }),
+            )
+                .into_response();
+        }
+        registered_roots.push((root, session));
+    }
     let clone_artifacts: Vec<_> = match query.mode {
         SyncMode::Files if exact.files.is_some() => {
             vec![crate::artifact_scheduler::ArtifactKind::Files]
@@ -10170,6 +10298,9 @@ pub async fn run_server_with_barrier(
     let metrics = Metrics::new();
     // Pluggable storage + metadata store + retention, shared with ripclone-worker.
     let b = backends::Backends::from_env_for_runtime(cas_dir, repo_root, &metrics).await?;
+    b.retention
+        .set_artifact_scheduler(b.artifact_scheduler.clone())
+        .await;
     let retention_interval: Duration = env::var("RIPCLONE_RETENTION_INTERVAL_SECS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -10187,20 +10318,18 @@ pub async fn run_server_with_barrier(
     // Floor the grace at the longest signed-URL lifetime, read from the same
     // place ref responses sign URLs, so a client still holding a valid URL can
     // always finish its clone before any of its chunks become collectible.
-    // Typed clone plans renew authorization per object and their scheduler
-    // consumer lease lasts 24h. Generated pinned roots are not scheduler rows,
-    // so remote orphan GC must retain them for the same request lifetime.
-    let clone_download_floor = Duration::from_secs(CLONE_CONSUMER_TTL_SECS as u64);
-    let url_ttl_floor = ref_signed_url_ttl(false)
-        .max(ref_signed_url_ttl(true))
-        .max(clone_download_floor);
+    // Active typed downloads are retained by durable request-scoped catalog
+    // roots. The generic orphan grace still must cover already-issued signed
+    // URLs from legacy/ref responses.
+    let url_ttl_floor = ref_signed_url_ttl(false).max(ref_signed_url_ttl(true));
     let configured_grace = gc_config.grace_period;
     gc_config.floor_grace(url_ttl_floor);
     info!(
         "remote GC effective grace = {:?} (configured {:?}, signed-URL TTL floor {:?}), warm TTL = {:?}",
         gc_config.grace_period, configured_grace, url_ttl_floor, gc_config.warm_ttl
     );
-    let remote_gc = RemoteGc::new(b.storage.clone(), b.ref_store.clone(), gc_config);
+    let remote_gc = RemoteGc::new(b.storage.clone(), b.ref_store.clone(), gc_config)
+        .with_artifact_scheduler(b.artifact_scheduler.clone());
     remote_gc.spawn(remote_gc_interval);
 
     let refs_path = repo_root.join(".ripclone-refs.json");
@@ -10756,6 +10885,7 @@ mod tests {
             target_commit: "2".repeat(40),
             payload: crate::clone_plan::ClonePayload::FilesArchive {
                 manifest: "a".repeat(64),
+                transport_session: "b".repeat(64),
             },
         };
         let pending = crate::clone_plan::ClonePlan::Pending {
@@ -11061,6 +11191,7 @@ mod tests {
             format!("http://{address}"),
             Some(hex::encode(Sha256::digest("secret"))),
         );
+        let mut transport_sessions = Vec::new();
         for (mode, expected) in [
             (SyncMode::Files, "files"),
             (SyncMode::Head, "head"),
@@ -11103,7 +11234,73 @@ mod tests {
                     "full"
                 )
             ));
+            let session = match &plan {
+                ClonePlan::Ready {
+                    payload:
+                        ClonePayload::FilesArchive {
+                            transport_session, ..
+                        }
+                        | ClonePayload::HeadArtifact {
+                            transport_session, ..
+                        }
+                        | ClonePayload::FullArtifacts {
+                            transport_session, ..
+                        },
+                    ..
+                } => transport_session,
+                _ => unreachable!("fixture publishes exact ready artifacts"),
+            };
+            assert_eq!(session.len(), 64);
+            let root = match &plan {
+                ClonePlan::Ready {
+                    payload:
+                        ClonePayload::FilesArchive { manifest, .. }
+                        | ClonePayload::HeadArtifact { manifest, .. },
+                    ..
+                } => manifest,
+                ClonePlan::Ready {
+                    payload: ClonePayload::FullArtifacts { head_manifest, .. },
+                    ..
+                } => head_manifest,
+                _ => unreachable!(),
+            };
+            let artifact_url = format!(
+                "http://{address}/v1/repos/github/acme/widget/typed-artifacts/{root}/{root}"
+            );
+            let response = reqwest::Client::new()
+                .get(&artifact_url)
+                .header(reqwest::header::AUTHORIZATION, auth_header())
+                .header("x-ripclone-transport-session", session)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            let denied = reqwest::Client::new()
+                .get(&artifact_url)
+                .header(reqwest::header::AUTHORIZATION, auth_header())
+                .header("x-ripclone-transport-session", "d".repeat(64))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(denied.status(), reqwest::StatusCode::FORBIDDEN);
+            transport_sessions.push(session.clone());
         }
+        assert_eq!(
+            transport_sessions
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            3
+        );
+        assert_eq!(
+            scheduler_assert
+                .live_transport_roots_page(None, 10)
+                .await
+                .unwrap()
+                .len(),
+            4,
+            "files + head + two full roots must all be durably leased"
+        );
         assert!(rewrote.load(Ordering::SeqCst));
         std::fs::write(
             server_cas.path(&head_manifest_hash),
@@ -11113,11 +11310,8 @@ mod tests {
         let recovered = client
             .fetch_typed_clone_plan("acme/widget", "main", SyncMode::Head)
             .await
-            .unwrap();
-        assert!(
-            matches!(recovered, ClonePlan::Pending { .. }),
-            "corrupt ready publication must fail closed into rebuild"
-        );
+            .unwrap_err();
+        assert!(recovered.to_string().contains("not yet durably published"));
         let repaired = scheduler_assert
             .get_by_key(&artifact_key(&repo_id, &target, ArtifactKind::Head))
             .await
@@ -12453,7 +12647,7 @@ mod tests {
 
     #[tokio::test]
     async fn typed_transport_sessions_release_independently_and_abandoned_one_expires() {
-        use crate::artifact_scheduler::{ArtifactKey, ArtifactKind, SchedulerLimits};
+        use crate::artifact_scheduler::SchedulerLimits;
         let tmp = tempfile::tempdir().unwrap();
         let db = tmp.path().join("scheduler.db");
         let scheduler = crate::artifact_scheduler::ArtifactScheduler::open(
@@ -12462,34 +12656,50 @@ mod tests {
         )
         .await
         .unwrap();
-        let key = ArtifactKey {
-            workspace: "github".into(),
-            repo: "acme/widget".into(),
-            commit: "1".repeat(40),
-            kind: ArtifactKind::Head,
-            format_version: 1,
-        };
-        let first = "transport-a";
-        let second = "transport-b";
-        scheduler.subscribe_consumer(&key, first, 60).await.unwrap();
+        let root = "a".repeat(64);
+        let first = "b".repeat(64);
+        let second = "c".repeat(64);
         scheduler
-            .subscribe_consumer(&key, second, 60)
+            .register_transport_root(&root, &first, "github", "acme/widget", 60)
             .await
             .unwrap();
-        let record = scheduler.get_by_key(&key).await.unwrap().unwrap();
-        scheduler.release_consumer(record.id, first).await.unwrap();
-        assert!(scheduler.get_by_key(&key).await.unwrap().is_some());
+        scheduler
+            .register_transport_root(&root, &second, "github", "acme/widget", 60)
+            .await
+            .unwrap();
+        assert!(
+            scheduler
+                .release_transport_root(&root, &first, "github", "acme/widget")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            scheduler
+                .live_transport_roots_page(None, 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
 
         let pool = sqlx::SqlitePool::connect(db.to_str().unwrap())
             .await
             .unwrap();
-        sqlx::query("UPDATE artifact_consumers SET expires_at=unixepoch()-1 WHERE consumer_id=?")
-            .bind(second)
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "UPDATE artifact_transport_leases SET expires_at=unixepoch()-1 WHERE session_id=?",
+        )
+        .bind(second)
+        .execute(&pool)
+        .await
+        .unwrap();
         scheduler.reconcile_expired().await.unwrap();
-        assert!(scheduler.get_by_key(&key).await.unwrap().is_none());
+        assert!(
+            scheduler
+                .live_transport_roots_page(None, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

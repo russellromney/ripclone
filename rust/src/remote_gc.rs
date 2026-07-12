@@ -4,7 +4,7 @@ use crate::clonepack::{
 use crate::ref_store::RefStore;
 use crate::storage::{HashEntry, StorageRef};
 use crate::{ClonepackArtifacts, HistoryLevel, PackArtifact, RefInfo, SizedPack};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use prost::Message;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -108,6 +108,8 @@ pub struct RemoteGc {
     storage: StorageRef,
     ref_store: Arc<dyn RefStore>,
     config: GcConfig,
+    artifact_scheduler:
+        Option<Arc<dyn crate::artifact_scheduler_backend::ArtifactSchedulerPersistence>>,
 }
 
 impl RemoteGc {
@@ -116,7 +118,16 @@ impl RemoteGc {
             storage,
             ref_store,
             config,
+            artifact_scheduler: None,
         }
+    }
+
+    pub fn with_artifact_scheduler(
+        mut self,
+        scheduler: Option<Arc<dyn crate::artifact_scheduler_backend::ArtifactSchedulerPersistence>>,
+    ) -> Self {
+        self.artifact_scheduler = scheduler;
+        self
     }
 
     pub fn from_env(storage: StorageRef, ref_store: Arc<dyn RefStore>) -> Self {
@@ -191,7 +202,13 @@ impl RemoteGc {
             }
         }
 
-        let reachable = reachable_hashes(&self.ref_store, &self.storage, false).await?;
+        let mut reachable = reachable_hashes(&self.ref_store, &self.storage, false).await?;
+        collect_live_normalized_hashes(
+            self.artifact_scheduler.as_ref(),
+            &self.storage,
+            &mut reachable,
+        )
+        .await?;
         let storage = self.storage.clone();
         let entries = tokio::task::spawn_blocking(move || storage.list_hashes())
             .await
@@ -239,6 +256,24 @@ impl RemoteGc {
             }
         }
 
+        // Fence root publication before the final reference check and hold that
+        // durable lease through deletion. Without this, a transport capability
+        // can be registered in the last instruction window after the check but
+        // before delete_batch removes its already-old CAS objects.
+        let gc_owner = if !to_delete.is_empty() && !self.config.dry_run {
+            if let Some(scheduler) = self.artifact_scheduler.as_ref() {
+                let owner = format!("remote-gc-{}", hex::encode(rand::random::<[u8; 16]>()));
+                if !scheduler.acquire_gc_sweep(&owner, 600).await? {
+                    bail!("another remote GC sweep holds the publication fence")
+                }
+                Some(owner)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         // Reference-time double-check. The reachable snapshot was taken before we
         // listed every object and walked every manifest — a long window. A sync
         // that re-references an already-stored object (a reused pack/chunk) during
@@ -247,7 +282,29 @@ impl RemoteGc {
         // seen) and drop any candidate that became reachable during the pass.
         // Rescued objects are now reachable, so they are not re-tombstoned.
         if !to_delete.is_empty() {
-            let reachable_now = reachable_hashes(&self.ref_store, &self.storage, true).await?;
+            let recheck: Result<HashSet<String>> = async {
+                let mut reachable_now =
+                    reachable_hashes(&self.ref_store, &self.storage, true).await?;
+                collect_live_normalized_hashes(
+                    self.artifact_scheduler.as_ref(),
+                    &self.storage,
+                    &mut reachable_now,
+                )
+                .await?;
+                Ok(reachable_now)
+            }
+            .await;
+            let reachable_now = match recheck {
+                Ok(value) => value,
+                Err(error) => {
+                    if let (Some(scheduler), Some(owner)) =
+                        (self.artifact_scheduler.as_ref(), gc_owner.as_ref())
+                    {
+                        let _ = scheduler.release_gc_sweep(owner).await;
+                    }
+                    return Err(error);
+                }
+            };
             let before = to_delete.len();
             to_delete.retain(|entry| !reachable_now.contains(&entry.hash));
             let rescued = before - to_delete.len();
@@ -280,31 +337,123 @@ impl RemoteGc {
         report.objects_tombstoned = next_ledger.len() as u64;
 
         if to_delete.is_empty() {
+            if let (Some(scheduler), Some(owner)) =
+                (self.artifact_scheduler.as_ref(), gc_owner.as_ref())
+            {
+                scheduler.release_gc_sweep(owner).await?;
+            }
             self.persist_ledger(&next_ledger, &mut report).await;
             return Ok(report);
         }
 
-        let hashes: Vec<String> = to_delete.iter().map(|e| e.hash.clone()).collect();
-        let storage = self.storage.clone();
-        let hashes_clone = hashes.clone();
-        match tokio::task::spawn_blocking(move || storage.delete_batch(&hashes_clone))
-            .await
-            .context("delete batch task panicked")?
+        let heartbeat_cancel = tokio_util::sync::CancellationToken::new();
+        let heartbeat = if let (Some(scheduler), Some(owner)) =
+            (self.artifact_scheduler.clone(), gc_owner.clone())
         {
-            Ok(deleted) => {
-                report.objects_deleted = deleted;
-                if (deleted as usize) < hashes.len() {
-                    report.errors.push(format!(
-                        "delete_batch returned {} deleted, expected {}",
-                        deleted,
-                        hashes.len()
-                    ));
+            let cancel = heartbeat_cancel.clone();
+            Some(tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = cancel.cancelled() => return Ok::<(), anyhow::Error>(()),
+                        _ = tokio::time::sleep(Duration::from_secs(30)) => {
+                            if !scheduler.renew_gc_sweep(&owner, 600).await? {
+                                bail!("remote GC lost its publication fence")
+                            }
+                        }
+                    }
+                }
+            }))
+        } else {
+            None
+        };
+        report.objects_deleted = 0;
+        report.bytes_reclaimed = 0;
+        // A fresh ownership check precedes every bounded external delete call.
+        // This both limits the amount of work after a lost lease and ensures a
+        // collector never starts another batch on the strength of a stale
+        // heartbeat result.
+        for batch in to_delete.chunks(128) {
+            let mut transactional_fence = None;
+            if let (Some(scheduler), Some(owner)) =
+                (self.artifact_scheduler.as_ref(), gc_owner.as_ref())
+            {
+                match scheduler.renew_gc_sweep(owner, 600).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        report
+                            .errors
+                            .push("remote GC lost its publication fence before delete".into());
+                        break;
+                    }
+                    Err(error) => {
+                        report
+                            .errors
+                            .push(format!("renew GC publication fence: {error}"));
+                        break;
+                    }
+                }
+                match scheduler.lock_gc_delete_batch(owner).await {
+                    Ok(fence) => transactional_fence = Some(fence),
+                    Err(error) => {
+                        report
+                            .errors
+                            .push(format!("lock transactional GC delete fence: {error}"));
+                        break;
+                    }
                 }
             }
-            Err(e) => {
-                report.errors.push(format!("delete_batch failed: {}", e));
-                report.objects_deleted = 0;
-                report.bytes_reclaimed = 0;
+            let hashes = batch
+                .iter()
+                .map(|entry| entry.hash.clone())
+                .collect::<Vec<_>>();
+            let expected = hashes.len();
+            let storage = self.storage.clone();
+            let deletion = tokio::task::spawn_blocking(move || storage.delete_batch(&hashes)).await;
+            let release = match transactional_fence {
+                Some(fence) => fence.release().await,
+                None => Ok(()),
+            };
+            if let Err(error) = release {
+                report
+                    .errors
+                    .push(format!("release transactional GC delete fence: {error}"));
+                break;
+            }
+            match deletion.context("delete batch task panicked")? {
+                Ok(deleted) => {
+                    report.objects_deleted += deleted;
+                    if deleted as usize == expected {
+                        report.bytes_reclaimed += batch.iter().map(|entry| entry.size).sum::<u64>();
+                    } else {
+                        report.errors.push(format!(
+                            "delete_batch returned {deleted} deleted, expected {expected}"
+                        ));
+                        break;
+                    }
+                }
+                Err(error) => {
+                    report.errors.push(format!("delete_batch failed: {error}"));
+                    break;
+                }
+            }
+        }
+        heartbeat_cancel.cancel();
+        if let Some(task) = heartbeat {
+            match task.await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => report.errors.push(error.to_string()),
+                Err(error) => report
+                    .errors
+                    .push(format!("GC fence heartbeat failed: {error}")),
+            }
+        }
+        if let (Some(scheduler), Some(owner)) =
+            (self.artifact_scheduler.as_ref(), gc_owner.as_ref())
+        {
+            if let Err(error) = scheduler.release_gc_sweep(owner).await {
+                report
+                    .errors
+                    .push(format!("release GC publication fence: {error}"));
             }
         }
 
@@ -492,6 +641,140 @@ pub(crate) async fn reachable_hashes(
     Ok(reachable)
 }
 
+const MAX_NORMALIZED_ROOT_BYTES: u64 = 16 * 1024 * 1024;
+
+async fn read_normalized_root_bounded(storage: &StorageRef, hash: &str) -> Result<Vec<u8>> {
+    crate::cas::Cas::validate_artifact_id(hash)?;
+    let storage = storage.clone();
+    let hash = hash.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let declared = storage.size(&hash)?;
+        if declared > MAX_NORMALIZED_ROOT_BYTES {
+            bail!("normalized GC root exceeds manifest limit")
+        }
+        let bytes = storage.get(&hash)?;
+        if bytes.len() as u64 != declared {
+            bail!("normalized GC root length mismatch")
+        }
+        if crate::cas::hash(&bytes) != hash {
+            bail!("normalized GC root hash mismatch")
+        }
+        Ok(bytes)
+    })
+    .await
+    .context("read normalized GC root task")?
+}
+
+pub(crate) async fn collect_live_normalized_hashes(
+    scheduler: Option<&Arc<dyn crate::artifact_scheduler_backend::ArtifactSchedulerPersistence>>,
+    storage: &StorageRef,
+    reachable: &mut HashSet<String>,
+) -> Result<()> {
+    let Some(scheduler) = scheduler else {
+        return Ok(());
+    };
+    collect_live_scheduler_hashes(scheduler, storage, reachable).await?;
+    let mut cursor: Option<(String, String)> = None;
+    let mut parsed_roots = HashSet::new();
+    loop {
+        let page = scheduler
+            .live_transport_roots_page(
+                cursor
+                    .as_ref()
+                    .map(|(root, session)| (root.as_str(), session.as_str())),
+                crate::artifact_scheduler_backend::TRANSPORT_ROOT_PAGE_MAX,
+            )
+            .await?;
+        if page.is_empty() {
+            break;
+        }
+        for lease in &page {
+            if parsed_roots.insert(lease.root_hash.clone()) {
+                let bytes = read_normalized_root_bounded(storage, &lease.root_hash).await?;
+                reachable.insert(lease.root_hash.clone());
+                if let Ok(manifest) =
+                    crate::artifact_manifest::ArtifactManifest::validate_envelope_bytes(&bytes)
+                {
+                    if manifest.key.workspace != lease.workspace || manifest.key.repo != lease.repo
+                    {
+                        bail!("typed transport root repository identity mismatch")
+                    }
+                    reachable.extend(
+                        manifest
+                            .payload
+                            .referenced_blobs()
+                            .into_iter()
+                            .map(|blob| blob.hash.clone()),
+                    );
+                } else {
+                    let capability = crate::pinned_bundle::validate_pinned_manifest_capability(
+                        &bytes,
+                        &lease.workspace,
+                        &lease.repo,
+                    )?;
+                    reachable.extend(
+                        capability
+                            .artifacts
+                            .into_iter()
+                            .map(|artifact| artifact.hash),
+                    );
+                }
+            }
+        }
+        let last = page.last().expect("nonempty transport root page");
+        cursor = Some((last.root_hash.clone(), last.session_id.clone()));
+        if page.len() < crate::artifact_scheduler_backend::TRANSPORT_ROOT_PAGE_MAX as usize {
+            break;
+        }
+    }
+    Ok(())
+}
+
+async fn collect_live_scheduler_hashes(
+    scheduler: &Arc<dyn crate::artifact_scheduler_backend::ArtifactSchedulerPersistence>,
+    storage: &StorageRef,
+    reachable: &mut HashSet<String>,
+) -> Result<()> {
+    let mut after = None;
+    loop {
+        let page = scheduler
+            .live_scheduler_roots_page(
+                after,
+                crate::artifact_scheduler_backend::TRANSPORT_ROOT_PAGE_MAX,
+            )
+            .await?;
+        if page.is_empty() {
+            break;
+        }
+        for root in &page {
+            let bytes = read_normalized_root_bounded(storage, &root.manifest).await?;
+            let manifest =
+                crate::artifact_manifest::ArtifactManifest::validate_envelope_bytes(&bytes)?;
+            if manifest.key.workspace != root.key.workspace
+                || manifest.key.repo != root.key.repo
+                || manifest.key.commit != root.key.commit
+                || manifest.key.kind != root.key.kind
+                || manifest.key.format_version != root.key.format_version
+            {
+                bail!("scheduler GC root key mismatch")
+            }
+            reachable.insert(root.manifest.clone());
+            reachable.extend(
+                manifest
+                    .payload
+                    .referenced_blobs()
+                    .into_iter()
+                    .map(|blob| blob.hash.clone()),
+            );
+        }
+        after = page.last().map(|root| root.artifact_id);
+        if page.len() < crate::artifact_scheduler_backend::TRANSPORT_ROOT_PAGE_MAX as usize {
+            break;
+        }
+    }
+    Ok(())
+}
+
 /// Fetch a manifest by hash and add all of its ChunkRef hashes to the set.
 async fn collect_manifest_refs(
     storage: &StorageRef,
@@ -617,6 +900,106 @@ mod tests {
     /// against the local filesystem in tests.
     struct TestRemoteStorage {
         inner: StorageRef,
+    }
+
+    struct ListBarrierStorage {
+        inner: StorageRef,
+        entered: Arc<std::sync::Barrier>,
+        release: Arc<std::sync::Barrier>,
+    }
+
+    struct OversizedRootStorage {
+        inner: StorageRef,
+        root: String,
+        gets: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl StorageBackend for OversizedRootStorage {
+        fn get(&self, h: &str) -> Result<Vec<u8>> {
+            if h == self.root {
+                self.gets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            self.inner.get(h)
+        }
+        fn get_range(&self, h: &str, s: u64, l: u64) -> Result<Vec<u8>> {
+            self.inner.get_range(h, s, l)
+        }
+        fn put(&self, h: &str, d: &[u8]) -> Result<()> {
+            self.inner.put(h, d)
+        }
+        async fn get_meta(&self, k: &str) -> Result<Option<Vec<u8>>> {
+            self.inner.get_meta(k).await
+        }
+        async fn put_meta(&self, k: &str, d: &[u8]) -> Result<()> {
+            self.inner.put_meta(k, d).await
+        }
+        fn size(&self, h: &str) -> Result<u64> {
+            if h == self.root {
+                Ok(MAX_NORMALIZED_ROOT_BYTES + 1)
+            } else {
+                self.inner.size(h)
+            }
+        }
+        fn is_remote(&self) -> bool {
+            true
+        }
+        fn regions(&self) -> Vec<String> {
+            self.inner.regions()
+        }
+        fn delete(&self, h: &str) -> Result<()> {
+            self.inner.delete(h)
+        }
+        fn delete_batch(&self, h: &[String]) -> Result<u64> {
+            self.inner.delete_batch(h)
+        }
+        fn list_hashes(&self) -> Result<Vec<HashEntry>> {
+            self.inner.list_hashes()
+        }
+        fn health(&self) -> Result<()> {
+            self.inner.health()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StorageBackend for ListBarrierStorage {
+        fn get(&self, h: &str) -> Result<Vec<u8>> {
+            self.inner.get(h)
+        }
+        fn get_range(&self, h: &str, s: u64, l: u64) -> Result<Vec<u8>> {
+            self.inner.get_range(h, s, l)
+        }
+        fn put(&self, h: &str, d: &[u8]) -> Result<()> {
+            self.inner.put(h, d)
+        }
+        async fn get_meta(&self, k: &str) -> Result<Option<Vec<u8>>> {
+            self.inner.get_meta(k).await
+        }
+        async fn put_meta(&self, k: &str, d: &[u8]) -> Result<()> {
+            self.inner.put_meta(k, d).await
+        }
+        fn size(&self, h: &str) -> Result<u64> {
+            self.inner.size(h)
+        }
+        fn is_remote(&self) -> bool {
+            true
+        }
+        fn regions(&self) -> Vec<String> {
+            self.inner.regions()
+        }
+        fn delete(&self, h: &str) -> Result<()> {
+            self.inner.delete(h)
+        }
+        fn delete_batch(&self, h: &[String]) -> Result<u64> {
+            self.inner.delete_batch(h)
+        }
+        fn list_hashes(&self) -> Result<Vec<HashEntry>> {
+            self.entered.wait();
+            self.release.wait();
+            self.inner.list_hashes()
+        }
+        fn health(&self) -> Result<()> {
+            self.inner.health()
+        }
     }
 
     #[async_trait::async_trait]
@@ -1488,5 +1871,207 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_ne!(info.build_status.as_deref(), Some(EVICTED_BUILD_STATUS));
+    }
+
+    #[tokio::test]
+    async fn live_transport_root_keeps_root_and_delegated_objects() {
+        use crate::artifact_manifest::{
+            ArtifactManifest, ArtifactPayload, CasBlob, GitPackPair, HeadArtifact,
+        };
+        use crate::artifact_scheduler::{ArtifactKey, ArtifactKind, SchedulerLimits};
+
+        let temp = tempfile::tempdir().unwrap();
+        let cas = crate::cas::Cas::new(temp.path().join("cas")).unwrap();
+        let storage = crate::storage::local(cas.root()).unwrap();
+        let child = cas.put(b"transport child").unwrap();
+        let index = cas.put(b"transport index").unwrap();
+        let prebuilt = cas.put(b"transport prebuilt").unwrap();
+        let key = ArtifactKey {
+            workspace: "ws".into(),
+            repo: "o/r".into(),
+            commit: "1".repeat(40),
+            kind: ArtifactKind::Head,
+            format_version: 1,
+        };
+        let root = ArtifactManifest::new(
+            &key,
+            ArtifactPayload::Head(HeadArtifact {
+                packs: vec![GitPackPair {
+                    pack: CasBlob {
+                        hash: child.clone(),
+                        len: 15,
+                    },
+                    index: CasBlob {
+                        hash: index.clone(),
+                        len: 15,
+                    },
+                }],
+                prebuilt_index: CasBlob {
+                    hash: prebuilt.clone(),
+                    len: 18,
+                },
+            }),
+        )
+        .unwrap()
+        .store(&cas)
+        .unwrap()
+        .manifest;
+        let scheduler = Arc::new(
+            crate::artifact_scheduler::ArtifactScheduler::open(
+                temp.path().join("scheduler.db").to_str().unwrap(),
+                SchedulerLimits::default(),
+            )
+            .await
+            .unwrap(),
+        );
+        for session in ["a".repeat(64), "b".repeat(64)] {
+            scheduler
+                .register_transport_root(&root, &session, "ws", "o/r", 60)
+                .await
+                .unwrap();
+        }
+        let scheduler: Arc<dyn crate::artifact_scheduler_backend::ArtifactSchedulerPersistence> =
+            scheduler;
+        let mut reachable = HashSet::new();
+        collect_live_normalized_hashes(Some(&scheduler), &storage, &mut reachable)
+            .await
+            .unwrap();
+        assert!(reachable.contains(&root));
+        assert!(reachable.contains(&child));
+        assert!(reachable.contains(&index));
+        assert!(reachable.contains(&prebuilt));
+    }
+
+    #[tokio::test]
+    async fn transport_root_registered_during_sweep_is_rescued_by_recheck() {
+        use crate::artifact_manifest::{
+            ArtifactManifest, ArtifactPayload, CasBlob, GitPackPair, HeadArtifact,
+        };
+        use crate::artifact_scheduler::{ArtifactKey, ArtifactKind, SchedulerLimits};
+        let temp = tempfile::tempdir().unwrap();
+        let cas = Cas::new(temp.path().join("cas")).unwrap();
+        let local = local(cas.root()).unwrap();
+        let child = cas.put(b"child").unwrap();
+        let idx = cas.put(b"index").unwrap();
+        let pre = cas.put(b"pre").unwrap();
+        let key = ArtifactKey {
+            workspace: "ws".into(),
+            repo: "o/r".into(),
+            commit: "1".repeat(40),
+            kind: ArtifactKind::Head,
+            format_version: 1,
+        };
+        let root = ArtifactManifest::new(
+            &key,
+            ArtifactPayload::Head(HeadArtifact {
+                packs: vec![GitPackPair {
+                    pack: CasBlob {
+                        hash: child.clone(),
+                        len: 5,
+                    },
+                    index: CasBlob {
+                        hash: idx.clone(),
+                        len: 5,
+                    },
+                }],
+                prebuilt_index: CasBlob {
+                    hash: pre.clone(),
+                    len: 3,
+                },
+            }),
+        )
+        .unwrap()
+        .store(&cas)
+        .unwrap()
+        .manifest;
+        let old = SystemTime::now() - Duration::from_secs(3600);
+        for hash in [&root, &child, &idx, &pre] {
+            filetime::set_file_mtime(cas.path(hash), filetime::FileTime::from_system_time(old))
+                .unwrap();
+        }
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let storage: StorageRef = Arc::new(ListBarrierStorage {
+            inner: local,
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+        let refs: Arc<dyn RefStore> = Arc::new(FileRefStore::new(&temp.path().join("refs")));
+        let concrete = Arc::new(
+            crate::artifact_scheduler::ArtifactScheduler::open(
+                temp.path().join("scheduler.db").to_str().unwrap(),
+                SchedulerLimits::default(),
+            )
+            .await
+            .unwrap(),
+        );
+        let scheduler: Arc<dyn crate::artifact_scheduler_backend::ArtifactSchedulerPersistence> =
+            concrete.clone();
+        let aged = unix_secs(SystemTime::now()).saturating_sub(60);
+        seed_ledger(
+            &storage,
+            &[(&root, aged), (&child, aged), (&idx, aged), (&pre, aged)],
+        )
+        .await;
+        let gc = RemoteGc::new(
+            storage,
+            refs,
+            GcConfig {
+                grace_period: Duration::ZERO,
+                warm_ttl: Duration::from_secs(1),
+                dry_run: false,
+            },
+        )
+        .with_artifact_scheduler(Some(scheduler));
+        let task = tokio::spawn(async move { gc.run().await.unwrap() });
+        tokio::task::spawn_blocking(move || entered.wait())
+            .await
+            .unwrap();
+        concrete
+            .register_transport_root(&root, &"a".repeat(64), "ws", "o/r", 60)
+            .await
+            .unwrap();
+        tokio::task::spawn_blocking(move || release.wait())
+            .await
+            .unwrap();
+        let report = task.await.unwrap();
+        assert_eq!(report.objects_deleted, 0);
+        for hash in [&root, &child, &idx, &pre] {
+            assert!(cas.path(hash).exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_leased_root_is_rejected_before_storage_get() {
+        let temp = tempfile::tempdir().unwrap();
+        let cas = Cas::new(temp.path().join("cas")).unwrap();
+        let root = "f".repeat(64);
+        let gets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let storage: StorageRef = Arc::new(OversizedRootStorage {
+            inner: local(cas.root()).unwrap(),
+            root: root.clone(),
+            gets: gets.clone(),
+        });
+        let concrete = Arc::new(
+            crate::artifact_scheduler::ArtifactScheduler::open(
+                temp.path().join("scheduler.db").to_str().unwrap(),
+                Default::default(),
+            )
+            .await
+            .unwrap(),
+        );
+        concrete
+            .register_transport_root(&root, &"a".repeat(64), "ws", "o/r", 60)
+            .await
+            .unwrap();
+        let scheduler: Arc<dyn crate::artifact_scheduler_backend::ArtifactSchedulerPersistence> =
+            concrete;
+        let mut reachable = HashSet::new();
+        assert!(
+            collect_live_normalized_hashes(Some(&scheduler), &storage, &mut reachable)
+                .await
+                .is_err()
+        );
+        assert_eq!(gets.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 }

@@ -63,6 +63,54 @@ impl OwnedArtifactBuild {
     }
 }
 
+/// Durable request-scoped capability root. The canonical root manifest owns
+/// the delegated child list; persistence stores only identity and expiry so
+/// GC and authorization never diverge from authenticated manifest semantics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransportRootLease {
+    pub root_hash: String,
+    pub session_id: String,
+    pub workspace: String,
+    pub repo: String,
+    pub expires_at: i64,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchedulerGcRoot {
+    pub artifact_id: i64,
+    pub key: ArtifactKey,
+    pub manifest: String,
+}
+pub const TRANSPORT_ROOT_PAGE_MAX: u32 = 512;
+
+#[async_trait]
+pub trait GcDeleteFence: Send {
+    /// Release the database transaction/advisory lock held across one bounded
+    /// external delete call. Dropping an implementation must also roll back.
+    async fn release(self: Box<Self>) -> Result<()>;
+}
+
+pub(crate) fn validate_transport_lease_identity(
+    root_hash: &str,
+    session_id: &str,
+    workspace: &str,
+    repo: &str,
+    ttl_secs: i64,
+) -> Result<()> {
+    crate::cas::Cas::validate_artifact_id(root_hash)?;
+    if session_id.len() != 64
+        || !session_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || workspace.trim().is_empty()
+        || repo.trim().is_empty()
+        || ttl_secs <= 0
+        || ttl_secs > 24 * 60 * 60
+    {
+        bail!("transport root lease identity or TTL is invalid");
+    }
+    Ok(())
+}
+
 struct PersistenceExecutionGuard {
     cancel: CancellationToken,
     scratch: PathBuf,
@@ -87,6 +135,76 @@ pub trait ArtifactSchedulerPersistence: Send + Sync {
     fn full_admission_recovery_protocol_supported(&self) -> bool {
         false
     }
+
+    /// Acquire the fleet-wide deletion fence. Root-creating mutations must
+    /// reject while another live owner holds it. The database clock is the
+    /// authority for expiry so a crashed collector cannot deadlock syncs.
+    async fn acquire_gc_sweep(&self, owner: &str, ttl_secs: i64) -> Result<bool> {
+        let _ = (owner, ttl_secs);
+        bail!("GC sweep fencing is not implemented by this scheduler backend")
+    }
+    async fn renew_gc_sweep(&self, owner: &str, ttl_secs: i64) -> Result<bool> {
+        let _ = (owner, ttl_secs);
+        bail!("GC sweep fencing is not implemented by this scheduler backend")
+    }
+    async fn release_gc_sweep(&self, owner: &str) -> Result<()> {
+        let _ = owner;
+        bail!("GC sweep fencing is not implemented by this scheduler backend")
+    }
+    async fn lock_gc_delete_batch(&self, owner: &str) -> Result<Box<dyn GcDeleteFence>> {
+        let _ = owner;
+        bail!("transactional GC delete fencing is not implemented by this scheduler backend")
+    }
+    async fn register_transport_root(
+        &self,
+        root_hash: &str,
+        session_id: &str,
+        workspace: &str,
+        repo: &str,
+        ttl_secs: i64,
+    ) -> Result<()> {
+        let _ = (root_hash, session_id, workspace, repo, ttl_secs);
+        bail!("transport root leases are not implemented by this scheduler backend")
+    }
+    /// Renew only an already-issued exact root/session/repository capability.
+    /// Returns false for an unknown, expired, or cross-repository session.
+    async fn renew_transport_root(
+        &self,
+        root_hash: &str,
+        session_id: &str,
+        workspace: &str,
+        repo: &str,
+        ttl_secs: i64,
+    ) -> Result<bool> {
+        let _ = (root_hash, session_id, workspace, repo, ttl_secs);
+        bail!("transport root leases are not implemented by this scheduler backend")
+    }
+    async fn release_transport_root(
+        &self,
+        root_hash: &str,
+        session_id: &str,
+        workspace: &str,
+        repo: &str,
+    ) -> Result<bool> {
+        let _ = (root_hash, session_id, workspace, repo);
+        bail!("transport root leases are not implemented by this scheduler backend")
+    }
+    async fn live_transport_roots_page(
+        &self,
+        after: Option<(&str, &str)>,
+        limit: u32,
+    ) -> Result<Vec<TransportRootLease>> {
+        let _ = (after, limit);
+        bail!("transport root leases are not implemented by this scheduler backend")
+    }
+    async fn live_scheduler_roots_page(
+        &self,
+        after_artifact_id: Option<i64>,
+        limit: u32,
+    ) -> Result<Vec<SchedulerGcRoot>> {
+        let _ = (after_artifact_id, limit);
+        bail!("scheduler GC roots are not implemented by this scheduler backend")
+    }
     async fn schedule(&self, key: &ArtifactKey) -> Result<ScheduleOutcome>;
     async fn subscribe_consumer(
         &self,
@@ -94,6 +212,11 @@ pub trait ArtifactSchedulerPersistence: Send + Sync {
         consumer_id: &str,
         ttl_secs: i64,
     ) -> Result<ScheduleOutcome>;
+    /// Release only after the operation that consumes this artifact has durably
+    /// settled its own publication. In particular, builders must keep a live
+    /// consumer for every reused old base/level across child upload, root upload,
+    /// verification, and `complete`; fresh-output grace does not protect reused
+    /// old objects in the upload-to-completion gap.
     async fn release_consumer(&self, artifact_id: i64, consumer_id: &str) -> Result<()>;
     /// Atomically publish a resolved upstream tip using the generation returned
     /// by [`Self::observation_snapshot`]. Implementations must return
@@ -631,6 +754,65 @@ impl ArtifactSchedulerPersistence for crate::artifact_scheduler::ArtifactSchedul
     }
     fn full_admission_recovery_protocol_supported(&self) -> bool {
         true
+    }
+
+    async fn acquire_gc_sweep(&self, owner: &str, ttl_secs: i64) -> Result<bool> {
+        self.acquire_gc_sweep(owner, ttl_secs).await
+    }
+    async fn renew_gc_sweep(&self, owner: &str, ttl_secs: i64) -> Result<bool> {
+        self.renew_gc_sweep(owner, ttl_secs).await
+    }
+    async fn release_gc_sweep(&self, owner: &str) -> Result<()> {
+        self.release_gc_sweep(owner).await
+    }
+    async fn lock_gc_delete_batch(&self, owner: &str) -> Result<Box<dyn GcDeleteFence>> {
+        self.lock_gc_delete_batch(owner).await
+    }
+    async fn register_transport_root(
+        &self,
+        root: &str,
+        session: &str,
+        workspace: &str,
+        repo: &str,
+        ttl: i64,
+    ) -> Result<()> {
+        self.register_transport_root(root, session, workspace, repo, ttl)
+            .await
+    }
+    async fn renew_transport_root(
+        &self,
+        root: &str,
+        session: &str,
+        workspace: &str,
+        repo: &str,
+        ttl: i64,
+    ) -> Result<bool> {
+        self.renew_transport_root(root, session, workspace, repo, ttl)
+            .await
+    }
+    async fn release_transport_root(
+        &self,
+        root: &str,
+        session: &str,
+        workspace: &str,
+        repo: &str,
+    ) -> Result<bool> {
+        self.release_transport_root(root, session, workspace, repo)
+            .await
+    }
+    async fn live_transport_roots_page(
+        &self,
+        after: Option<(&str, &str)>,
+        limit: u32,
+    ) -> Result<Vec<TransportRootLease>> {
+        self.live_transport_roots_page(after, limit).await
+    }
+    async fn live_scheduler_roots_page(
+        &self,
+        after: Option<i64>,
+        limit: u32,
+    ) -> Result<Vec<SchedulerGcRoot>> {
+        self.live_scheduler_roots_page(after, limit).await
     }
     async fn schedule(&self, key: &ArtifactKey) -> Result<ScheduleOutcome> {
         self.schedule(key).await

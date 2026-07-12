@@ -14,8 +14,8 @@ use crate::artifact_scheduler::{
 #[cfg(test)]
 use crate::artifact_scheduler::{CompletionEvidence, validate_evidence};
 use crate::artifact_scheduler_backend::{
-    ArtifactSchedulerPersistence, SchedulerGcRoot, TRANSPORT_ROOT_PAGE_MAX, TransportRootLease,
-    validate_transport_lease_identity,
+    ArtifactSchedulerPersistence, GcDeleteFence, SchedulerGcRoot, TRANSPORT_ROOT_PAGE_MAX,
+    TransportRootLease, validate_transport_lease_identity,
 };
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -80,6 +80,9 @@ CREATE TABLE IF NOT EXISTS artifact_transport_leases(
  CONSTRAINT artifact_transport_leases_pkey PRIMARY KEY(root_hash,session_id));
 CREATE INDEX IF NOT EXISTS artifact_transport_leases_expiry
  ON artifact_transport_leases(expires_at);
+CREATE TABLE IF NOT EXISTS artifact_gc_sweep(
+ id SMALLINT CONSTRAINT artifact_gc_sweep_pkey PRIMARY KEY,owner TEXT NOT NULL,expires_at BIGINT NOT NULL,
+ CONSTRAINT artifact_gc_sweep_singleton CHECK(id=1));
 CREATE TABLE IF NOT EXISTS artifact_base_retention(
  artifact_id BIGINT CONSTRAINT artifact_base_retention_pkey PRIMARY KEY,
  workspace TEXT NOT NULL,repo TEXT NOT NULL,format_version BIGINT NOT NULL,
@@ -102,6 +105,16 @@ pub struct PostgresArtifactScheduler {
     limits: SchedulerLimits,
     verifier: Arc<dyn CompletionVerifier>,
     completion_sealer: Arc<CompletionSealAuthority>,
+}
+struct PostgresGcDeleteFence(Option<Transaction<'static, Postgres>>);
+#[async_trait]
+impl GcDeleteFence for PostgresGcDeleteFence {
+    async fn release(mut self: Box<Self>) -> Result<()> {
+        if let Some(tx) = self.0.take() {
+            tx.commit().await?;
+        }
+        Ok(())
+    }
 }
 
 impl PostgresArtifactScheduler {
@@ -421,6 +434,29 @@ impl PostgresArtifactScheduler {
         let invalid_retention: i64 = sqlx::query_scalar("SELECT count(*) FROM artifact_base_retention r LEFT JOIN artifact_jobs j ON j.id=r.artifact_id WHERE j.id IS NULL OR j.workspace<>r.workspace OR j.repo<>r.repo OR j.format_version<>r.format_version OR (r.head_rank IS NULL AND r.pair_rank IS NULL) OR (r.head_rank IS NOT NULL AND r.head_rank NOT BETWEEN 1 AND 8) OR (r.pair_rank IS NOT NULL AND r.pair_rank NOT BETWEEN 1 AND 8)").fetch_one(&mut *migration).await?;
         if invalid_retention != 0 {
             bail!("postgres artifact scheduler contains invalid base retention")
+        }
+        let gc_columns: i64 = sqlx::query_scalar("WITH expected(column_name,data_type,is_nullable) AS (VALUES ('id','smallint','NO'),('owner','text','NO'),('expires_at','bigint','NO')) SELECT count(*) FROM expected e JOIN information_schema.columns c ON c.table_schema=current_schema() AND c.table_name='artifact_gc_sweep' AND c.column_name=e.column_name AND c.data_type=e.data_type AND c.is_nullable=e.is_nullable WHERE c.column_default IS NULL").fetch_one(&mut *migration).await?;
+        let gc_column_count: i64 = sqlx::query_scalar("SELECT count(*) FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='artifact_gc_sweep'").fetch_one(&mut *migration).await?;
+        let gc_constraints: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_constraint c WHERE c.conrelid='artifact_gc_sweep'::regclass AND ((c.conname='artifact_gc_sweep_pkey' AND c.contype='p' AND pg_get_constraintdef(c.oid)='PRIMARY KEY (id)') OR (c.conname='artifact_gc_sweep_singleton' AND c.contype='c' AND pg_get_constraintdef(c.oid)='CHECK ((id = 1))'))").fetch_one(&mut *migration).await?;
+        let gc_constraint_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_constraint WHERE conrelid='artifact_gc_sweep'::regclass",
+        )
+        .fetch_one(&mut *migration)
+        .await?;
+        let gc_index_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_index WHERE indrelid='artifact_gc_sweep'::regclass",
+        )
+        .fetch_one(&mut *migration)
+        .await?;
+        let invalid_gc: i64 = sqlx::query_scalar("SELECT count(*) FROM artifact_gc_sweep WHERE id<>1 OR length(trim(owner))=0 OR length(owner)>200").fetch_one(&mut *migration).await?;
+        if gc_columns != 3
+            || gc_column_count != 3
+            || gc_constraints != 2
+            || gc_constraint_count != 2
+            || gc_index_count != 1
+            || invalid_gc != 0
+        {
+            bail!("postgres artifact GC sweep schema differs from schema version")
         }
         let invalid_jobs: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM artifact_jobs WHERE
@@ -810,6 +846,24 @@ fn existing_outcome(record: ArtifactRecord) -> ScheduleOutcome {
     }
 }
 
+fn validate_gc_sweep_args(owner: &str, ttl: i64) -> Result<()> {
+    if owner.trim().is_empty() || owner.len() > 200 || !(1..=600).contains(&ttl) {
+        bail!("GC sweep owner or TTL is invalid")
+    }
+    Ok(())
+}
+
+async fn ensure_gc_unfenced_pg(tx: &mut Transaction<'_, Postgres>, now: i64) -> Result<()> {
+    let fence: Option<(String, i64)> =
+        sqlx::query_as("SELECT owner,expires_at FROM artifact_gc_sweep WHERE id=1 FOR UPDATE")
+            .fetch_optional(&mut **tx)
+            .await?;
+    if fence.is_some_and(|(_, expires_at)| expires_at > now) {
+        bail!("artifact publication is temporarily fenced by remote GC")
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl ArtifactSchedulerPersistence for PostgresArtifactScheduler {
     fn completion_verifier(&self) -> Arc<dyn CompletionVerifier> {
@@ -817,6 +871,58 @@ impl ArtifactSchedulerPersistence for PostgresArtifactScheduler {
     }
     fn completion_sealer(&self) -> Arc<CompletionSealAuthority> {
         self.completion_sealer.clone()
+    }
+
+    async fn acquire_gc_sweep(&self, owner: &str, ttl: i64) -> Result<bool> {
+        validate_gc_sweep_args(owner, ttl)?;
+        let (mut tx, now) = self.controlled().await?;
+        let won = sqlx::query("INSERT INTO artifact_gc_sweep(id,owner,expires_at) VALUES(1,$1,$2) ON CONFLICT(id) DO UPDATE SET owner=EXCLUDED.owner,expires_at=EXCLUDED.expires_at WHERE artifact_gc_sweep.expires_at<=$3 OR artifact_gc_sweep.owner=EXCLUDED.owner")
+            .bind(owner).bind(now + ttl).bind(now).execute(&mut *tx).await?.rows_affected() == 1;
+        tx.commit().await?;
+        Ok(won)
+    }
+    async fn renew_gc_sweep(&self, owner: &str, ttl: i64) -> Result<bool> {
+        validate_gc_sweep_args(owner, ttl)?;
+        let (mut tx, now) = self.controlled().await?;
+        let won = sqlx::query(
+            "UPDATE artifact_gc_sweep SET expires_at=$1 WHERE id=1 AND owner=$2 AND expires_at>$3",
+        )
+        .bind(now + ttl)
+        .bind(owner)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            == 1;
+        tx.commit().await?;
+        Ok(won)
+    }
+    async fn release_gc_sweep(&self, owner: &str) -> Result<()> {
+        validate_gc_sweep_args(owner, 1)?;
+        sqlx::query("DELETE FROM artifact_gc_sweep WHERE id=1 AND owner=$1")
+            .bind(owner)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+    async fn lock_gc_delete_batch(&self, owner: &str) -> Result<Box<dyn GcDeleteFence>> {
+        validate_gc_sweep_args(owner, 1)?;
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT id FROM scheduler_state WHERE id=1 FOR UPDATE")
+            .execute(&mut *tx)
+            .await?;
+        let now: i64 = sqlx::query_scalar("SELECT EXTRACT(EPOCH FROM clock_timestamp())::BIGINT")
+            .fetch_one(&mut *tx)
+            .await?;
+        let held: Option<(String, i64)> =
+            sqlx::query_as("SELECT owner,expires_at FROM artifact_gc_sweep WHERE id=1 FOR UPDATE")
+                .fetch_optional(&mut *tx)
+                .await?;
+        if !held.is_some_and(|(held_owner, expires_at)| held_owner == owner && expires_at > now) {
+            tx.rollback().await?;
+            bail!("remote GC does not own the live publication fence")
+        }
+        Ok(Box::new(PostgresGcDeleteFence(Some(tx))))
     }
     async fn register_transport_root(
         &self,
@@ -828,6 +934,7 @@ impl ArtifactSchedulerPersistence for PostgresArtifactScheduler {
     ) -> Result<()> {
         validate_transport_lease_identity(root, session, workspace, repo, ttl)?;
         let (mut tx, now) = self.controlled().await?;
+        ensure_gc_unfenced_pg(&mut tx, now).await?;
         let foreign: i64 = sqlx::query_scalar("SELECT count(*) FROM artifact_transport_leases WHERE session_id=$1 AND (workspace<>$2 OR repo<>$3)")
             .bind(session).bind(workspace).bind(repo).fetch_one(&mut *tx).await?;
         if foreign != 0 {
@@ -923,13 +1030,7 @@ impl ArtifactSchedulerPersistence for PostgresArtifactScheduler {
             .fetch_one(&mut *tx)
             .await?;
         let rows = sqlx::query(
-            "SELECT j.id,j.workspace,j.repo,j.commit_oid,j.kind,j.format_version,j.manifest
-             FROM artifact_jobs j WHERE j.id>$1 AND j.state='ready'
-               AND j.manifest IS NOT NULL AND length(trim(j.manifest))>0
-               AND (EXISTS(SELECT 1 FROM artifact_observations o WHERE o.published_artifact_id=j.id)
-                    OR EXISTS(SELECT 1 FROM artifact_consumers c WHERE c.artifact_id=j.id AND c.expires_at>$2)
-                    OR EXISTS(SELECT 1 FROM artifact_base_retention r WHERE r.artifact_id=j.id))
-             ORDER BY j.id LIMIT $3",
+            "WITH candidates(id) AS ((SELECT published_artifact_id FROM artifact_observations WHERE published_artifact_id>$1 ORDER BY published_artifact_id LIMIT $3) UNION ALL (SELECT artifact_id FROM artifact_consumers WHERE artifact_id>$1 AND expires_at>$2 ORDER BY artifact_id LIMIT $3) UNION ALL (SELECT artifact_id FROM artifact_base_retention WHERE artifact_id>$1 ORDER BY artifact_id LIMIT $3)), page_ids(id) AS (SELECT DISTINCT id FROM candidates ORDER BY id LIMIT $3) SELECT j.id,j.workspace,j.repo,j.commit_oid,j.kind,j.format_version,j.manifest FROM page_ids p JOIN artifact_jobs j ON j.id=p.id WHERE j.state='ready' AND j.manifest IS NOT NULL AND length(trim(j.manifest))>0 ORDER BY j.id",
         )
         .bind(after_artifact_id.unwrap_or(0)).bind(now).bind(limit as i64)
         .fetch_all(&mut *tx).await?;
@@ -956,6 +1057,7 @@ impl ArtifactSchedulerPersistence for PostgresArtifactScheduler {
     async fn schedule(&self, key: &ArtifactKey) -> Result<ScheduleOutcome> {
         validate_format_version(key.format_version)?;
         let (mut tx, now) = self.controlled().await?;
+        ensure_gc_unfenced_pg(&mut tx, now).await?;
         self.preflight_batch(
             &mut tx,
             &key.workspace,
@@ -984,6 +1086,7 @@ impl ArtifactSchedulerPersistence for PostgresArtifactScheduler {
             bail!("consumer subscription TTL is invalid")
         }
         let (mut tx, now) = self.controlled().await?;
+        ensure_gc_unfenced_pg(&mut tx, now).await?;
         self.preflight_batch(
             &mut tx,
             &key.workspace,
@@ -1051,6 +1154,7 @@ impl ArtifactSchedulerPersistence for PostgresArtifactScheduler {
             }
         }
         let (mut tx, now) = self.controlled().await?;
+        ensure_gc_unfenced_pg(&mut tx, now).await?;
         let current: Option<(i64, String)> = sqlx::query_as(
             "SELECT generation,desired_commit FROM branch_observations
              WHERE workspace=$1 AND repo=$2 AND branch=$3",
@@ -1419,6 +1523,7 @@ impl ArtifactSchedulerPersistence for PostgresArtifactScheduler {
         let now: i64 = sqlx::query_scalar("SELECT EXTRACT(EPOCH FROM clock_timestamp())::BIGINT")
             .fetch_one(&mut *tx)
             .await?;
+        ensure_gc_unfenced_pg(&mut tx, now).await?;
         let won = sqlx::query(
             "UPDATE artifact_jobs SET state='ready',owner=NULL,heartbeat_at=NULL,
                 lease_expires_at=NULL,manifest=$1,error=NULL,failure_class=NULL,updated_at=$2
@@ -1817,6 +1922,7 @@ mod tests {
     async fn reset(pool: &PgPool) {
         sqlx::raw_sql(
             "DROP TABLE IF EXISTS artifact_base_retention;
+             DROP TABLE IF EXISTS artifact_gc_sweep;
              DROP TABLE IF EXISTS artifact_transport_leases;
              DROP TABLE IF EXISTS artifact_consumers;
              DROP TABLE IF EXISTS artifact_observations;
@@ -1864,6 +1970,25 @@ mod tests {
         );
         let a = a.unwrap();
         let b = b.unwrap();
+
+        assert!(a.acquire_gc_sweep("collector", 60).await.unwrap());
+        assert!(!b.acquire_gc_sweep("other", 60).await.unwrap());
+        let delete_fence = a.lock_gc_delete_batch("collector").await.unwrap();
+        let blocked = {
+            let b = b.clone();
+            tokio::spawn(async move {
+                b.register_transport_root(&"f".repeat(64), &"e".repeat(64), "ws", "owner/repo", 60)
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !blocked.is_finished(),
+            "postgres publication bypassed delete transaction lock"
+        );
+        delete_fence.release().await.unwrap();
+        assert!(blocked.await.unwrap().is_err());
+        a.release_gc_sweep("collector").await.unwrap();
 
         let root0 = format!("{:064x}", 1);
         let root1 = format!("{:064x}", 2);

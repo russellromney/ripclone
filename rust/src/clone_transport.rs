@@ -95,14 +95,17 @@ pub enum ClonePlanState {
 pub enum ClonePlanPayload {
     FilesArchive {
         manifest: String,
+        transport_session: String,
     },
     HeadArtifact {
         manifest: String,
         discard_git: bool,
+        transport_session: String,
     },
     FullArtifacts {
         head_manifest: String,
         history_manifest: String,
+        transport_session: String,
     },
     PinnedBundle {
         request: PinnedBundleRequest,
@@ -276,20 +279,30 @@ impl ClonePlanResponse {
 impl From<ClonePayload> for ClonePlanPayload {
     fn from(value: ClonePayload) -> Self {
         match value {
-            ClonePayload::FilesArchive { manifest } => Self::FilesArchive { manifest },
+            ClonePayload::FilesArchive {
+                manifest,
+                transport_session,
+            } => Self::FilesArchive {
+                manifest,
+                transport_session,
+            },
             ClonePayload::HeadArtifact {
                 manifest,
                 discard_git,
+                transport_session,
             } => Self::HeadArtifact {
                 manifest,
                 discard_git,
+                transport_session,
             },
             ClonePayload::FullArtifacts {
                 head_manifest,
                 history_manifest,
+                transport_session,
             } => Self::FullArtifacts {
                 head_manifest,
                 history_manifest,
+                transport_session,
             },
             ClonePayload::PinnedBundle {
                 request,
@@ -328,6 +341,17 @@ fn validate_identity(identity: CloneRequestIdentity<'_>) -> Result<()> {
     Ok(())
 }
 
+fn validate_transport_session(session: &str) -> Result<()> {
+    if session.len() != 64
+        || !session
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("clone transport session is invalid");
+    }
+    Ok(())
+}
+
 fn validate_payload(
     payload: &ClonePlanPayload,
     request_mode: SyncMode,
@@ -337,36 +361,47 @@ fn validate_payload(
     target: &str,
 ) -> Result<ClonePayload> {
     Ok(match payload {
-        ClonePlanPayload::FilesArchive { manifest } if request_mode == SyncMode::Files => {
+        ClonePlanPayload::FilesArchive {
+            manifest,
+            transport_session,
+        } if request_mode == SyncMode::Files => {
             validate_hash(manifest, "files manifest")?;
+            validate_transport_session(transport_session)?;
             ClonePayload::FilesArchive {
                 manifest: manifest.clone(),
+                transport_session: transport_session.clone(),
             }
         }
         ClonePlanPayload::HeadArtifact {
             manifest,
             discard_git,
+            transport_session,
         } if (request_mode == SyncMode::Files && *discard_git)
             || (request_mode == SyncMode::Head && !*discard_git) =>
         {
             validate_hash(manifest, "head manifest")?;
+            validate_transport_session(transport_session)?;
             ClonePayload::HeadArtifact {
                 manifest: manifest.clone(),
                 discard_git: *discard_git,
+                transport_session: transport_session.clone(),
             }
         }
         ClonePlanPayload::FullArtifacts {
             head_manifest,
             history_manifest,
+            transport_session,
         } if request_mode == SyncMode::Full => {
             validate_hash(head_manifest, "head manifest")?;
             validate_hash(history_manifest, "history manifest")?;
+            validate_transport_session(transport_session)?;
             if head_manifest == history_manifest {
                 bail!("full clone plan aliases head and history manifests");
             }
             ClonePayload::FullArtifacts {
                 head_manifest: head_manifest.clone(),
                 history_manifest: history_manifest.clone(),
+                transport_session: transport_session.clone(),
             }
         }
         ClonePlanPayload::PinnedBundle {
@@ -471,6 +506,7 @@ mod tests {
     const BASE: &str = "1111111111111111111111111111111111111111";
     const HEAD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const HISTORY: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const SESSION: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 
     fn identity(mode: SyncMode) -> CloneRequestIdentity<'static> {
         CloneRequestIdentity {
@@ -517,6 +553,7 @@ mod tests {
                 SyncMode::Files,
                 ClonePayload::FilesArchive {
                     manifest: HEAD.into(),
+                    transport_session: SESSION.into(),
                 },
             ),
             (
@@ -524,6 +561,7 @@ mod tests {
                 ClonePayload::HeadArtifact {
                     manifest: HEAD.into(),
                     discard_git: true,
+                    transport_session: SESSION.into(),
                 },
             ),
             (
@@ -531,6 +569,7 @@ mod tests {
                 ClonePayload::HeadArtifact {
                     manifest: HEAD.into(),
                     discard_git: false,
+                    transport_session: SESSION.into(),
                 },
             ),
             (
@@ -538,6 +577,7 @@ mod tests {
                 ClonePayload::FullArtifacts {
                     head_manifest: HEAD.into(),
                     history_manifest: HISTORY.into(),
+                    transport_session: SESSION.into(),
                 },
             ),
         ];
@@ -643,6 +683,7 @@ mod tests {
                 payload: ClonePlanPayload::HeadArtifact {
                     manifest: HEAD.into(),
                     discard_git: false,
+                    transport_session: SESSION.into(),
                 },
             },
         );
@@ -681,6 +722,7 @@ mod tests {
                 ClonePlanState::Ready {
                     payload: ClonePlanPayload::FilesArchive {
                         manifest: HEAD.into(),
+                        transport_session: SESSION.into(),
                     },
                 },
             ),
@@ -690,6 +732,7 @@ mod tests {
                     payload: ClonePlanPayload::FullArtifacts {
                         head_manifest: HEAD.into(),
                         history_manifest: HEAD.into(),
+                        transport_session: SESSION.into(),
                     },
                 },
             ),
@@ -699,6 +742,17 @@ mod tests {
                     payload: ClonePlanPayload::HeadArtifact {
                         manifest: "A".repeat(64),
                         discard_git: false,
+                        transport_session: SESSION.into(),
+                    },
+                },
+            ),
+            response(
+                SyncMode::Head,
+                ClonePlanState::Ready {
+                    payload: ClonePlanPayload::HeadArtifact {
+                        manifest: HEAD.into(),
+                        discard_git: false,
+                        transport_session: "C".repeat(64),
                     },
                 },
             ),
@@ -769,6 +823,7 @@ mod tests {
                 payload: ClonePlanPayload::HeadArtifact {
                     manifest: HEAD.into(),
                     discard_git: false,
+                    transport_session: SESSION.into(),
                 },
             },
         );
@@ -808,6 +863,7 @@ mod tests {
                 payload: ClonePlanPayload::HeadArtifact {
                     manifest: HEAD.into(),
                     discard_git: false,
+                    transport_session: SESSION.into(),
                 },
             },
         );
@@ -835,6 +891,7 @@ mod tests {
                 payload: ClonePlanPayload::HeadArtifact {
                     manifest: HEAD.into(),
                     discard_git: false,
+                    transport_session: SESSION.into(),
                 },
             },
         );

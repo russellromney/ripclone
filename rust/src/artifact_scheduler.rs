@@ -573,6 +573,17 @@ pub struct ArtifactScheduler {
     pub(crate) completion_sealer: Arc<CompletionSealAuthority>,
 }
 
+struct SqliteGcDeleteFence(Option<PoolConnection<Sqlite>>);
+#[async_trait::async_trait]
+impl crate::artifact_scheduler_backend::GcDeleteFence for SqliteGcDeleteFence {
+    async fn release(mut self: Box<Self>) -> Result<()> {
+        if let Some(mut connection) = self.0.take() {
+            sqlx::query("COMMIT").execute(&mut *connection).await?;
+        }
+        Ok(())
+    }
+}
+
 /// Context passed to cooperative work. Blocking/external children must be
 /// awaited by the returned future, observe `cancelled`, and write only beneath
 /// `scratch`. Publication outside [`ArtifactScheduler::run_owned`] is forbidden.
@@ -617,6 +628,12 @@ CREATE TABLE IF NOT EXISTS artifact_jobs(
  UNIQUE(workspace,repo,commit_oid,kind,format_version));
 CREATE INDEX IF NOT EXISTS artifact_jobs_claim ON artifact_jobs(state,kind,created_at,id);
 CREATE INDEX IF NOT EXISTS artifact_jobs_lease ON artifact_jobs(state,lease_expires_at);
+CREATE TABLE IF NOT EXISTS artifact_base_retention(
+ artifact_id INTEGER PRIMARY KEY,workspace TEXT NOT NULL,repo TEXT NOT NULL,format_version INTEGER NOT NULL,
+ head_rank INTEGER CHECK(head_rank BETWEEN 1 AND 8),pair_rank INTEGER CHECK(pair_rank BETWEEN 1 AND 8),
+ CHECK(head_rank IS NOT NULL OR pair_rank IS NOT NULL),
+ FOREIGN KEY(artifact_id) REFERENCES artifact_jobs(id) ON DELETE CASCADE);
+CREATE INDEX IF NOT EXISTS artifact_base_retention_repo ON artifact_base_retention(workspace,repo,format_version,artifact_id);
 CREATE TABLE IF NOT EXISTS branch_observations(
  workspace TEXT NOT NULL,repo TEXT NOT NULL,branch TEXT NOT NULL,generation INTEGER NOT NULL,
  desired_commit TEXT NOT NULL,updated_at INTEGER NOT NULL,PRIMARY KEY(workspace,repo,branch));
@@ -624,7 +641,14 @@ CREATE TABLE IF NOT EXISTS artifact_observations(
  workspace TEXT NOT NULL,repo TEXT NOT NULL,branch TEXT NOT NULL,kind TEXT NOT NULL,
  desired_commit TEXT NOT NULL,desired_artifact_id INTEGER NOT NULL,desired_generation INTEGER NOT NULL,
  published_artifact_id INTEGER,format_version INTEGER NOT NULL DEFAULT 1,observed_at INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(workspace,repo,branch,kind));
+CREATE INDEX IF NOT EXISTS artifact_observations_published ON artifact_observations(published_artifact_id);
 CREATE TABLE IF NOT EXISTS artifact_consumers(artifact_id INTEGER NOT NULL,consumer_id TEXT NOT NULL,expires_at INTEGER NOT NULL,PRIMARY KEY(artifact_id,consumer_id));
+CREATE TABLE IF NOT EXISTS artifact_transport_leases(
+ root_hash TEXT NOT NULL,session_id TEXT NOT NULL,workspace TEXT NOT NULL,repo TEXT NOT NULL,
+ expires_at INTEGER NOT NULL,PRIMARY KEY(root_hash,session_id));
+CREATE INDEX IF NOT EXISTS artifact_transport_leases_expiry ON artifact_transport_leases(expires_at);
+CREATE TABLE IF NOT EXISTS artifact_gc_sweep(
+ id INTEGER PRIMARY KEY CHECK(id=1),owner TEXT NOT NULL,expires_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS scheduler_state(id INTEGER PRIMARY KEY CHECK(id=1),fairness_cursor INTEGER NOT NULL,workspace_cursor TEXT NOT NULL DEFAULT '',config_fingerprint TEXT NOT NULL DEFAULT '');
 INSERT OR IGNORE INTO scheduler_state(id,fairness_cursor) VALUES(1,0);
 "#;
@@ -658,7 +682,8 @@ impl ArtifactScheduler {
             .create_if_missing(true)
             .foreign_keys(true)
             .busy_timeout(Duration::from_secs(10))
-            .journal_mode(SqliteJournalMode::Wal);
+            .journal_mode(SqliteJournalMode::Wal)
+            .foreign_keys(true);
         let pool = SqlitePoolOptions::new()
             .max_connections(8)
             .connect_with(opts)
@@ -967,6 +992,16 @@ impl ArtifactScheduler {
         sqlx::raw_sql("PRAGMA user_version=3")
             .execute(&mut *migration)
             .await?;
+        sqlx::raw_sql("DELETE FROM artifact_base_retention;
+          INSERT INTO artifact_base_retention(artifact_id,workspace,repo,format_version,head_rank,pair_rank)
+          SELECT id,workspace,repo,format_version,head_rank,NULL FROM (SELECT id,workspace,repo,format_version,row_number() OVER(PARTITION BY workspace,repo,format_version ORDER BY updated_at DESC,id DESC) head_rank FROM artifact_jobs WHERE kind='head' AND state='ready' AND manifest IS NOT NULL AND length(trim(manifest))>0) WHERE head_rank<=8;
+          INSERT INTO artifact_base_retention(artifact_id,workspace,repo,format_version,head_rank,pair_rank)
+          SELECT head_id,workspace,repo,format_version,NULL,pair_rank FROM (SELECT h.id head_id,h.workspace,h.repo,h.format_version,row_number() OVER(PARTITION BY h.workspace,h.repo,h.format_version ORDER BY CASE WHEN h.updated_at>f.updated_at THEN h.updated_at ELSE f.updated_at END DESC,CASE WHEN h.id>f.id THEN h.id ELSE f.id END DESC) pair_rank FROM artifact_jobs h JOIN artifact_jobs f ON f.workspace=h.workspace AND f.repo=h.repo AND f.commit_oid=h.commit_oid AND f.format_version=h.format_version AND f.kind='full_history' AND f.state='ready' AND f.manifest IS NOT NULL AND length(trim(f.manifest))>0 WHERE h.kind='head' AND h.state='ready' AND h.manifest IS NOT NULL AND length(trim(h.manifest))>0) WHERE pair_rank<=8 ON CONFLICT(artifact_id) DO UPDATE SET pair_rank=excluded.pair_rank;
+          INSERT INTO artifact_base_retention(artifact_id,workspace,repo,format_version,head_rank,pair_rank)
+          SELECT history_id,workspace,repo,format_version,NULL,pair_rank FROM (SELECT f.id history_id,h.workspace,h.repo,h.format_version,row_number() OVER(PARTITION BY h.workspace,h.repo,h.format_version ORDER BY CASE WHEN h.updated_at>f.updated_at THEN h.updated_at ELSE f.updated_at END DESC,CASE WHEN h.id>f.id THEN h.id ELSE f.id END DESC) pair_rank FROM artifact_jobs h JOIN artifact_jobs f ON f.workspace=h.workspace AND f.repo=h.repo AND f.commit_oid=h.commit_oid AND f.format_version=h.format_version AND f.kind='full_history' AND f.state='ready' AND f.manifest IS NOT NULL AND length(trim(f.manifest))>0 WHERE h.kind='head' AND h.state='ready' AND h.manifest IS NOT NULL AND length(trim(h.manifest))>0) WHERE pair_rank<=8 ON CONFLICT(artifact_id) DO UPDATE SET pair_rank=excluded.pair_rank;
+          PRAGMA user_version=3")
+            .execute(&mut *migration)
+            .await?;
         migration.commit().await?;
         let version: i64 = sqlx::query_scalar("PRAGMA user_version")
             .fetch_one(&pool)
@@ -994,6 +1029,11 @@ impl ArtifactScheduler {
             || fence_columns != 16
             || fence_foreign_keys != 3
         {
+            bail!("artifact scheduler migration post-validation failed")
+        }
+        let base_columns:i64=sqlx::query_scalar("SELECT count(*) FROM pragma_table_info('artifact_base_retention') WHERE name IN('artifact_id','workspace','repo','format_version','head_rank','pair_rank')").fetch_one(&pool).await?;
+        let invalid_base:i64=sqlx::query_scalar("SELECT count(*) FROM artifact_base_retention b LEFT JOIN artifact_jobs j ON j.id=b.artifact_id WHERE j.id IS NULL OR j.workspace<>b.workspace OR j.repo<>b.repo OR j.format_version<>b.format_version OR (b.head_rank IS NULL AND b.pair_rank IS NULL) OR b.head_rank NOT BETWEEN 1 AND 8 OR b.pair_rank NOT BETWEEN 1 AND 8").fetch_one(&pool).await?;
+        if version != 3 || required != 4 || base_columns != 6 || invalid_base != 0 {
             bail!("artifact scheduler migration post-validation failed")
         }
         let mut config = pool.acquire().await?;
@@ -1044,6 +1084,72 @@ impl ArtifactScheduler {
         finish(c, result).await
     }
 
+    pub async fn acquire_gc_sweep(&self, owner: &str, ttl_secs: i64) -> Result<bool> {
+        validate_gc_sweep(owner, ttl_secs)?;
+        let mut c = self.immediate().await?;
+        let result: Result<bool> = async {
+            let now = db_now(&mut c).await?;
+            Ok(sqlx::query("INSERT INTO artifact_gc_sweep(id,owner,expires_at) VALUES(1,?,?) ON CONFLICT(id) DO UPDATE SET owner=excluded.owner,expires_at=excluded.expires_at WHERE artifact_gc_sweep.expires_at<=? OR artifact_gc_sweep.owner=excluded.owner")
+                .bind(owner).bind(now + ttl_secs).bind(now).execute(&mut *c).await?.rows_affected() == 1)
+        }.await;
+        finish(c, result).await
+    }
+
+    pub async fn renew_gc_sweep(&self, owner: &str, ttl_secs: i64) -> Result<bool> {
+        validate_gc_sweep(owner, ttl_secs)?;
+        let mut c = self.immediate().await?;
+        let result: Result<bool> = async {
+            let now = db_now(&mut c).await?;
+            Ok(sqlx::query(
+                "UPDATE artifact_gc_sweep SET expires_at=? WHERE id=1 AND owner=? AND expires_at>?",
+            )
+            .bind(now + ttl_secs)
+            .bind(owner)
+            .bind(now)
+            .execute(&mut *c)
+            .await?
+            .rows_affected()
+                == 1)
+        }
+        .await;
+        finish(c, result).await
+    }
+
+    pub async fn release_gc_sweep(&self, owner: &str) -> Result<()> {
+        validate_gc_sweep(owner, 1)?;
+        let mut c = self.immediate().await?;
+        let result: Result<()> = async {
+            sqlx::query("DELETE FROM artifact_gc_sweep WHERE id=1 AND owner=?")
+                .bind(owner)
+                .execute(&mut *c)
+                .await?;
+            Ok(())
+        }
+        .await;
+        finish(c, result).await
+    }
+
+    pub async fn lock_gc_delete_batch(
+        &self,
+        owner: &str,
+    ) -> Result<Box<dyn crate::artifact_scheduler_backend::GcDeleteFence>> {
+        validate_gc_sweep(owner, 1)?;
+        let mut c = self.immediate().await?;
+        let now = db_now(&mut c).await?;
+        let held: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM artifact_gc_sweep WHERE id=1 AND owner=? AND expires_at>?",
+        )
+        .bind(owner)
+        .bind(now)
+        .fetch_one(&mut *c)
+        .await?;
+        if held != 1 {
+            let _ = sqlx::query("ROLLBACK").execute(&mut *c).await;
+            bail!("remote GC does not own the live publication fence")
+        }
+        Ok(Box::new(SqliteGcDeleteFence(Some(c))))
+    }
+
     pub async fn subscribe_consumer(
         &self,
         key: &ArtifactKey,
@@ -1059,6 +1165,7 @@ impl ArtifactScheduler {
         }
         let mut c = self.immediate().await?;
         let result: Result<ScheduleOutcome> = async {
+            assert_gc_unfenced(&mut c).await?;
             let outcome = self.schedule_in(&mut c, key).await?;
             let now=db_now(&mut c).await?;
             sqlx::query(
@@ -1081,6 +1188,123 @@ impl ArtifactScheduler {
             sqlx::query("DELETE FROM artifact_jobs WHERE id=? AND state='queued' AND id NOT IN(SELECT desired_artifact_id FROM artifact_observations) AND id NOT IN(SELECT artifact_id FROM artifact_consumers)").bind(artifact_id).execute(&mut *c).await?;Ok(())
         }.await;
         finish(c, result).await
+    }
+
+    pub async fn register_transport_root(
+        &self,
+        root: &str,
+        session: &str,
+        workspace: &str,
+        repo: &str,
+        ttl: i64,
+    ) -> Result<()> {
+        crate::artifact_scheduler_backend::validate_transport_lease_identity(
+            root, session, workspace, repo, ttl,
+        )?;
+        let mut c = self.immediate().await?;
+        let result:Result<()>=async{
+            assert_gc_unfenced(&mut c).await?;
+            let foreign:i64=sqlx::query_scalar("SELECT count(*) FROM artifact_transport_leases WHERE session_id=? AND (workspace<>? OR repo<>?)").bind(session).bind(workspace).bind(repo).fetch_one(&mut *c).await?;
+            if foreign != 0 { bail!("transport session is already bound to another repository") }
+            let now=db_now(&mut c).await?;
+            let changed=sqlx::query("INSERT INTO artifact_transport_leases(root_hash,session_id,workspace,repo,expires_at) VALUES(?,?,?,?,?) ON CONFLICT(root_hash,session_id) DO UPDATE SET expires_at=excluded.expires_at WHERE artifact_transport_leases.workspace=excluded.workspace AND artifact_transport_leases.repo=excluded.repo").bind(root).bind(session).bind(workspace).bind(repo).bind(now+ttl).execute(&mut *c).await?.rows_affected();
+            if changed != 1 { bail!("transport root identity conflict") } Ok(())}.await;
+        finish(c, result).await
+    }
+    pub async fn renew_transport_root(
+        &self,
+        root: &str,
+        session: &str,
+        workspace: &str,
+        repo: &str,
+        ttl: i64,
+    ) -> Result<bool> {
+        crate::artifact_scheduler_backend::validate_transport_lease_identity(
+            root, session, workspace, repo, ttl,
+        )?;
+        let mut c = self.immediate().await?;
+        let result:Result<bool>=async{let now=db_now(&mut c).await?;Ok(sqlx::query("UPDATE artifact_transport_leases SET expires_at=? WHERE root_hash=? AND session_id=? AND workspace=? AND repo=? AND expires_at>?").bind(now+ttl).bind(root).bind(session).bind(workspace).bind(repo).bind(now).execute(&mut *c).await?.rows_affected()==1)}.await;
+        finish(c, result).await
+    }
+    pub async fn release_transport_root(
+        &self,
+        root: &str,
+        session: &str,
+        workspace: &str,
+        repo: &str,
+    ) -> Result<bool> {
+        crate::artifact_scheduler_backend::validate_transport_lease_identity(
+            root, session, workspace, repo, 1,
+        )?;
+        let mut c = self.immediate().await?;
+        let result:Result<bool>=async{Ok(sqlx::query("DELETE FROM artifact_transport_leases WHERE root_hash=? AND session_id=? AND workspace=? AND repo=?").bind(root).bind(session).bind(workspace).bind(repo).execute(&mut *c).await?.rows_affected()==1)}.await;
+        finish(c, result).await
+    }
+    pub async fn live_transport_roots_page(
+        &self,
+        after: Option<(&str, &str)>,
+        limit: u32,
+    ) -> Result<Vec<crate::artifact_scheduler_backend::TransportRootLease>> {
+        if limit == 0 || limit > crate::artifact_scheduler_backend::TRANSPORT_ROOT_PAGE_MAX {
+            bail!("transport root page limit is invalid")
+        }
+        let mut c = self.pool.acquire().await?;
+        let now = db_now(&mut c).await?;
+        let rows = match after {
+            Some((root, session)) => {
+                crate::cas::Cas::validate_artifact_id(root)?;
+                sqlx::query("SELECT root_hash,session_id,workspace,repo,expires_at FROM artifact_transport_leases WHERE expires_at>? AND (root_hash>? OR (root_hash=? AND session_id>?)) ORDER BY root_hash,session_id LIMIT ?")
+                    .bind(now).bind(root).bind(root).bind(session).bind(limit as i64).fetch_all(&mut *c).await?
+            }
+            None => sqlx::query("SELECT root_hash,session_id,workspace,repo,expires_at FROM artifact_transport_leases WHERE expires_at>? ORDER BY root_hash,session_id LIMIT ?")
+                .bind(now).bind(limit as i64).fetch_all(&mut *c).await?,
+        };
+        rows.into_iter()
+            .map(|r| {
+                Ok(crate::artifact_scheduler_backend::TransportRootLease {
+                    root_hash: r.try_get("root_hash")?,
+                    session_id: r.try_get("session_id")?,
+                    workspace: r.try_get("workspace")?,
+                    repo: r.try_get("repo")?,
+                    expires_at: r.try_get("expires_at")?,
+                })
+            })
+            .collect()
+    }
+    pub async fn live_scheduler_roots_page(
+        &self,
+        after: Option<i64>,
+        limit: u32,
+    ) -> Result<Vec<crate::artifact_scheduler_backend::SchedulerGcRoot>> {
+        if limit == 0 || limit > crate::artifact_scheduler_backend::TRANSPORT_ROOT_PAGE_MAX {
+            bail!("scheduler GC root page limit is invalid")
+        }
+        if after.is_some_and(|id| id < 0) {
+            bail!("scheduler GC cursor is invalid")
+        }
+        let mut c = self.pool.acquire().await?;
+        let now = db_now(&mut c).await?;
+        // Seek each root source directly.  Driving this page from artifact_jobs
+        // would scan every unrooted job between sparse live ids (potentially the
+        // whole fleet) before finding `limit` rows.
+        let rows=sqlx::query("WITH candidates(id) AS (SELECT published_artifact_id FROM (SELECT published_artifact_id FROM artifact_observations WHERE published_artifact_id>? ORDER BY published_artifact_id LIMIT ?) UNION ALL SELECT artifact_id FROM (SELECT artifact_id FROM artifact_consumers WHERE artifact_id>? AND expires_at>? ORDER BY artifact_id LIMIT ?) UNION ALL SELECT artifact_id FROM (SELECT artifact_id FROM artifact_base_retention WHERE artifact_id>? ORDER BY artifact_id LIMIT ?)), page_ids(id) AS (SELECT DISTINCT id FROM candidates ORDER BY id LIMIT ?) SELECT j.id,j.workspace,j.repo,j.commit_oid,j.kind,j.format_version,j.manifest FROM page_ids p JOIN artifact_jobs j ON j.id=p.id WHERE j.state='ready' AND j.manifest IS NOT NULL AND length(trim(j.manifest))>0 ORDER BY j.id")
+            .bind(after.unwrap_or(0)).bind(limit as i64).bind(after.unwrap_or(0)).bind(now).bind(limit as i64).bind(after.unwrap_or(0)).bind(limit as i64).bind(limit as i64).fetch_all(&mut *c).await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(crate::artifact_scheduler_backend::SchedulerGcRoot {
+                    artifact_id: row.try_get("id")?,
+                    key: ArtifactKey {
+                        workspace: row.try_get("workspace")?,
+                        repo: row.try_get("repo")?,
+                        commit: row.try_get("commit_oid")?,
+                        kind: ArtifactKind::parse(row.try_get("kind")?)?,
+                        format_version: u32::try_from(row.try_get::<i64, _>("format_version")?)
+                            .context("scheduler GC root format")?,
+                    },
+                    manifest: row.try_get("manifest")?,
+                })
+            })
+            .collect()
     }
 
     /// Atomically accept an observation and subscribe every requested kind.
@@ -1113,6 +1337,7 @@ impl ArtifactScheduler {
         }
         let mut c = self.immediate().await?;
         let result:Result<ObservationOutcome>=async{
+   assert_gc_unfenced(&mut c).await?;
    let current:Option<(i64,String)>=sqlx::query_as("SELECT generation,desired_commit FROM branch_observations WHERE workspace=? AND repo=? AND branch=?").bind(workspace).bind(repo).bind(branch).fetch_optional(&mut *c).await?;
    let current_generation=current.as_ref().map(|(v,_)|*v as u64);
    let same_commit=current.as_ref().is_some_and(|(_,current_commit)|current_commit==commit);
@@ -1706,9 +1931,10 @@ impl ArtifactScheduler {
         let evidence = self.completion_sealer.verify(claim, verified)?;
         let mut c = self.immediate().await?;
         let result:Result<bool>=async{
+   assert_gc_unfenced(&mut c).await?;
    let now=db_now(&mut c).await?; let won=sqlx::query("UPDATE artifact_jobs SET state='ready',owner=NULL,heartbeat_at=NULL,lease_expires_at=NULL,manifest=?,error=NULL,failure_class=NULL,updated_at=? WHERE id=? AND state='running' AND owner=? AND lease_generation=? AND lease_expires_at>=?")
     .bind(evidence.manifest()).bind(now).bind(claim.record.id).bind(owner).bind(claim.record.lease_generation as i64).bind(now).execute(&mut *c).await?.rows_affected()==1;
-   if won{sqlx::query("UPDATE artifact_observations SET published_artifact_id=? WHERE desired_artifact_id=?").bind(claim.record.id).bind(claim.record.id).execute(&mut *c).await?;} Ok(won)
+   if won{sqlx::query("UPDATE artifact_observations SET published_artifact_id=? WHERE desired_artifact_id=?").bind(claim.record.id).bind(claim.record.id).execute(&mut *c).await?;refresh_base_retention_conn(&mut c,&claim.record.key.workspace,&claim.record.key.repo,claim.record.key.format_version).await?;} Ok(won)
   }.await;
         finish(c, result).await
     }
@@ -1779,6 +2005,10 @@ impl ArtifactScheduler {
             .execute(&mut **c)
             .await?;
         sqlx::query("DELETE FROM artifact_consumers WHERE expires_at<=?")
+            .bind(now)
+            .execute(&mut **c)
+            .await?;
+        sqlx::query("DELETE FROM artifact_transport_leases WHERE rowid IN (SELECT rowid FROM artifact_transport_leases WHERE expires_at<=? ORDER BY expires_at,root_hash,session_id LIMIT 512)")
             .bind(now)
             .execute(&mut **c)
             .await?;
@@ -1904,6 +2134,8 @@ impl ArtifactScheduler {
                 sqlx::query("UPDATE artifact_observations SET published_artifact_id=NULL WHERE published_artifact_id=?")
                     .bind(id)
                     .execute(&mut *c)
+                    .await?;
+                refresh_base_retention_conn(&mut c, &key.workspace, &key.repo, key.format_version)
                     .await?;
                 Ok(true)
             } else {
@@ -2136,6 +2368,49 @@ async fn db_now(c: &mut PoolConnection<Sqlite>) -> Result<i64> {
     Ok(sqlx::query_scalar("SELECT unixepoch()")
         .fetch_one(&mut **c)
         .await?)
+}
+
+fn validate_gc_sweep(owner: &str, ttl_secs: i64) -> Result<()> {
+    if owner.trim().is_empty() || owner.len() > 200 || !(1..=600).contains(&ttl_secs) {
+        bail!("GC sweep owner or TTL is invalid")
+    }
+    Ok(())
+}
+
+async fn assert_gc_unfenced(c: &mut PoolConnection<Sqlite>) -> Result<()> {
+    let now = db_now(c).await?;
+    let fenced: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM artifact_gc_sweep WHERE id=1 AND expires_at>?")
+            .bind(now)
+            .fetch_one(&mut **c)
+            .await?;
+    if fenced != 0 {
+        bail!("artifact publication is temporarily fenced by remote GC")
+    }
+    Ok(())
+}
+
+async fn refresh_base_retention_conn(
+    c: &mut PoolConnection<Sqlite>,
+    workspace: &str,
+    repo: &str,
+    format_version: u32,
+) -> Result<()> {
+    sqlx::query(
+        "DELETE FROM artifact_base_retention WHERE workspace=? AND repo=? AND format_version=?",
+    )
+    .bind(workspace)
+    .bind(repo)
+    .bind(format_version as i64)
+    .execute(&mut **c)
+    .await?;
+    sqlx::query("INSERT INTO artifact_base_retention(artifact_id,workspace,repo,format_version,head_rank,pair_rank) SELECT id,workspace,repo,format_version,row_number() OVER(ORDER BY updated_at DESC,id DESC),NULL FROM artifact_jobs WHERE workspace=? AND repo=? AND format_version=? AND kind='head' AND state='ready' AND manifest IS NOT NULL AND length(trim(manifest))>0 ORDER BY updated_at DESC,id DESC LIMIT 8")
+        .bind(workspace).bind(repo).bind(format_version as i64).execute(&mut **c).await?;
+    sqlx::query("INSERT INTO artifact_base_retention(artifact_id,workspace,repo,format_version,head_rank,pair_rank) SELECT head_id,?,?,?,NULL,pair_rank FROM (SELECT h.id head_id,f.id history_id,row_number() OVER(ORDER BY CASE WHEN h.updated_at>f.updated_at THEN h.updated_at ELSE f.updated_at END DESC,CASE WHEN h.id>f.id THEN h.id ELSE f.id END DESC) pair_rank FROM artifact_jobs h JOIN artifact_jobs f ON f.workspace=h.workspace AND f.repo=h.repo AND f.commit_oid=h.commit_oid AND f.format_version=h.format_version AND f.kind='full_history' AND f.state='ready' AND f.manifest IS NOT NULL AND length(trim(f.manifest))>0 WHERE h.workspace=? AND h.repo=? AND h.format_version=? AND h.kind='head' AND h.state='ready' AND h.manifest IS NOT NULL AND length(trim(h.manifest))>0) WHERE pair_rank<=8 ON CONFLICT(artifact_id) DO UPDATE SET pair_rank=excluded.pair_rank")
+        .bind(workspace).bind(repo).bind(format_version as i64).bind(workspace).bind(repo).bind(format_version as i64).execute(&mut **c).await?;
+    sqlx::query("INSERT INTO artifact_base_retention(artifact_id,workspace,repo,format_version,head_rank,pair_rank) SELECT history_id,?,?,?,NULL,pair_rank FROM (SELECT h.id head_id,f.id history_id,row_number() OVER(ORDER BY CASE WHEN h.updated_at>f.updated_at THEN h.updated_at ELSE f.updated_at END DESC,CASE WHEN h.id>f.id THEN h.id ELSE f.id END DESC) pair_rank FROM artifact_jobs h JOIN artifact_jobs f ON f.workspace=h.workspace AND f.repo=h.repo AND f.commit_oid=h.commit_oid AND f.format_version=h.format_version AND f.kind='full_history' AND f.state='ready' AND f.manifest IS NOT NULL AND length(trim(f.manifest))>0 WHERE h.workspace=? AND h.repo=? AND h.format_version=? AND h.kind='head' AND h.state='ready' AND h.manifest IS NOT NULL AND length(trim(h.manifest))>0) WHERE pair_rank<=8 ON CONFLICT(artifact_id) DO UPDATE SET pair_rank=excluded.pair_rank")
+        .bind(workspace).bind(repo).bind(format_version as i64).bind(workspace).bind(repo).bind(format_version as i64).execute(&mut **c).await?;
+    Ok(())
 }
 async fn finish<T>(mut c: PoolConnection<Sqlite>, r: Result<T>) -> Result<T> {
     match r {
@@ -4143,5 +4418,621 @@ mod tests {
                 .is_err(),
             "sqlite adopted a planted migration marker over ready/published state"
         );
+    }
+
+    #[tokio::test]
+    async fn transport_root_lease_is_session_repo_fenced_and_expires() {
+        let (s, _d, path) = scheduler(SchedulerLimits::default()).await;
+        let root = "a".repeat(64);
+        let session = "b".repeat(64);
+        s.register_transport_root(&root, &session, "ws", "o/r", 60)
+            .await
+            .unwrap();
+        assert_eq!(
+            s.live_transport_roots_page(None, 10).await.unwrap().len(),
+            1
+        );
+        assert!(
+            s.register_transport_root(&root, &session, "ws", "other/r", 60)
+                .await
+                .is_err()
+        );
+        let second_root = "c".repeat(64);
+        s.register_transport_root(&second_root, &session, "ws", "o/r", 60)
+            .await
+            .unwrap();
+        assert!(
+            !s.renew_transport_root(&root, &session, "ws", "other/r", 60)
+                .await
+                .unwrap()
+        );
+        let pool = sqlx::SqlitePool::connect(&path).await.unwrap();
+        sqlx::query("UPDATE artifact_transport_leases SET expires_at=unixepoch()-1")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            !s.renew_transport_root(&root, &session, "ws", "o/r", 60)
+                .await
+                .unwrap()
+        );
+        s.reconcile_expired().await.unwrap();
+        assert!(
+            s.live_transport_roots_page(None, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn gc_sweep_fences_every_normalized_root_publication_path_and_expires() {
+        let (s, _d, _path) = scheduler(SchedulerLimits::default()).await;
+        let pending = key("ws", "pending", ArtifactKind::Head);
+        s.schedule(&pending).await.unwrap();
+        let claim = s.claim("worker", 60).await.unwrap().unwrap();
+
+        assert!(s.acquire_gc_sweep("collector-a", 60).await.unwrap());
+        assert!(!s.acquire_gc_sweep("collector-b", 60).await.unwrap());
+        assert!(!s.renew_gc_sweep("collector-b", 60).await.unwrap());
+        assert!(
+            s.register_transport_root(&"a".repeat(64), &"b".repeat(64), "ws", "o/r", 60)
+                .await
+                .is_err()
+        );
+        assert!(
+            s.subscribe_consumer(&key("ws", "consumer", ArtifactKind::Files), "clone", 60)
+                .await
+                .is_err()
+        );
+        assert!(
+            s.observe("ws", "o/r", "main", "tip", &[ArtifactKind::Head], 1, None)
+                .await
+                .is_err()
+        );
+        assert!(
+            s.complete(&claim, "worker", &evidence(&claim))
+                .await
+                .is_err()
+        );
+
+        s.release_gc_sweep("collector-b").await.unwrap();
+        assert!(!s.acquire_gc_sweep("collector-b", 60).await.unwrap());
+        sqlx::query("UPDATE artifact_gc_sweep SET expires_at=unixepoch()-1")
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        assert!(s.acquire_gc_sweep("collector-b", 60).await.unwrap());
+        assert!(!s.renew_gc_sweep("collector-a", 60).await.unwrap());
+        s.release_gc_sweep("collector-b").await.unwrap();
+        assert!(
+            s.complete(&claim, "worker", &evidence(&claim))
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn transactional_delete_fence_blocks_publication_past_lease_expiry() {
+        let (scheduler, _d, _path) = scheduler(SchedulerLimits::default()).await;
+        let scheduler = Arc::new(scheduler);
+        let completing = key("ws", "complete", ArtifactKind::Head);
+        scheduler.schedule(&completing).await.unwrap();
+        let claim = scheduler.claim("worker", 60).await.unwrap().unwrap();
+        assert!(scheduler.acquire_gc_sweep("collector", 1).await.unwrap());
+        let fence = scheduler.lock_gc_delete_batch("collector").await.unwrap();
+        let registration = {
+            let scheduler = scheduler.clone();
+            tokio::spawn(async move {
+                scheduler
+                    .register_transport_root(&"a".repeat(64), &"b".repeat(64), "ws", "o/r", 60)
+                    .await
+            })
+        };
+        let subscription = {
+            let scheduler = scheduler.clone();
+            tokio::spawn(async move {
+                scheduler
+                    .subscribe_consumer(&key("ws", "subscribe", ArtifactKind::Files), "clone", 60)
+                    .await
+            })
+        };
+        let completion = {
+            let scheduler = scheduler.clone();
+            tokio::spawn(async move {
+                scheduler
+                    .complete(&claim, "worker", &evidence(&claim))
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(
+            !registration.is_finished() && !subscription.is_finished() && !completion.is_finished(),
+            "a publication path escaped while the external delete transaction was still live"
+        );
+        fence.release().await.unwrap();
+        registration.await.unwrap().unwrap();
+        subscription.await.unwrap().unwrap();
+        assert!(completion.await.unwrap().unwrap());
+        assert_eq!(
+            scheduler
+                .live_transport_roots_page(None, 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn builder_consumer_roots_reused_base_through_publication_settlement() {
+        let (s, _d, _path) = scheduler(SchedulerLimits::default()).await;
+        let base = key("ws", "old-base", ArtifactKind::Files);
+        s.subscribe_consumer(&base, "builder:output", 60)
+            .await
+            .unwrap();
+        let base_claim = s.claim("worker", 60).await.unwrap().unwrap();
+        s.complete(&base_claim, "worker", &evidence(&base_claim))
+            .await
+            .unwrap();
+
+        let output = key("ws", "output", ArtifactKind::Head);
+        s.schedule(&output).await.unwrap();
+        let output_claim = s.claim("worker", 60).await.unwrap().unwrap();
+        assert!(s.acquire_gc_sweep("collector", 60).await.unwrap());
+        assert!(
+            s.complete(&output_claim, "worker", &evidence(&output_claim))
+                .await
+                .is_err(),
+            "output unexpectedly settled while GC held publication fence"
+        );
+        let roots = s.live_scheduler_roots_page(None, 20).await.unwrap();
+        assert!(
+            roots.iter().any(|root| root.key == base),
+            "reused base disappeared in upload-to-completion gap"
+        );
+        s.release_gc_sweep("collector").await.unwrap();
+        assert!(
+            s.complete(&output_claim, "worker", &evidence(&output_claim))
+                .await
+                .unwrap()
+        );
+        s.release_consumer(base_claim.record.id, "builder:output")
+            .await
+            .unwrap();
+        assert!(
+            !s.live_scheduler_roots_page(None, 20)
+                .await
+                .unwrap()
+                .iter()
+                .any(|root| root.key == base)
+        );
+    }
+
+    #[tokio::test]
+    async fn transport_root_catalog_paginates_with_stable_composite_cursor() {
+        let (s, _d, path) = scheduler(SchedulerLimits::default()).await;
+        let pool = sqlx::SqlitePool::connect(&path).await.unwrap();
+        for value in 0..=crate::artifact_scheduler_backend::TRANSPORT_ROOT_PAGE_MAX {
+            let root = format!("{value:064x}");
+            let session = format!("{:064x}", value + 10_000);
+            sqlx::query("INSERT INTO artifact_transport_leases(root_hash,session_id,workspace,repo,expires_at) VALUES(?,?,?,?,unixepoch()+60)")
+                .bind(root).bind(session).bind("ws").bind("o/r").execute(&pool).await.unwrap();
+        }
+        let first = s
+            .live_transport_roots_page(
+                None,
+                crate::artifact_scheduler_backend::TRANSPORT_ROOT_PAGE_MAX,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            first.len(),
+            crate::artifact_scheduler_backend::TRANSPORT_ROOT_PAGE_MAX as usize
+        );
+        let last = first.last().unwrap();
+        let second = s
+            .live_transport_roots_page(
+                Some((&last.root_hash, &last.session_id)),
+                crate::artifact_scheduler_backend::TRANSPORT_ROOT_PAGE_MAX,
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_transport_renew_cannot_resurrect_release() {
+        let (scheduler, _d, _path) = scheduler(SchedulerLimits::default()).await;
+        let scheduler = Arc::new(scheduler);
+        let root = "d".repeat(64);
+        let session = "e".repeat(64);
+        scheduler
+            .register_transport_root(&root, &session, "ws", "o/r", 60)
+            .await
+            .unwrap();
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let renew = {
+            let scheduler = scheduler.clone();
+            let barrier = barrier.clone();
+            let root = root.clone();
+            let session = session.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                scheduler
+                    .renew_transport_root(&root, &session, "ws", "o/r", 60)
+                    .await
+                    .unwrap()
+            })
+        };
+        let release = {
+            let scheduler = scheduler.clone();
+            let barrier = barrier.clone();
+            let root = root.clone();
+            let session = session.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                scheduler
+                    .release_transport_root(&root, &session, "ws", "o/r")
+                    .await
+                    .unwrap()
+            })
+        };
+        barrier.wait().await;
+        let _ = renew.await.unwrap();
+        assert!(release.await.unwrap());
+        assert!(
+            scheduler
+                .live_transport_roots_page(None, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduler_gc_roots_cover_published_or_live_consumed_only() {
+        let (s, _d, _path) = scheduler(SchedulerLimits::default()).await;
+        let published_key = key("ws", "published", ArtifactKind::Head);
+        s.observe(
+            "ws",
+            "o/r",
+            "main",
+            "published",
+            &[ArtifactKind::Head],
+            1,
+            None,
+        )
+        .await
+        .unwrap();
+        let claim = s.claim("worker", 60).await.unwrap().unwrap();
+        s.complete(
+            &claim,
+            "worker",
+            &CompletionEvidence::new(published_key.clone(), "a".repeat(64)).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let consumed = key("ws", "consumed", ArtifactKind::Files);
+        s.subscribe_consumer(&consumed, "admission", 60)
+            .await
+            .unwrap();
+        let claim = s.claim("worker", 60).await.unwrap().unwrap();
+        s.complete(
+            &claim,
+            "worker",
+            &CompletionEvidence::new(consumed.clone(), "b".repeat(64)).unwrap(),
+        )
+        .await
+        .unwrap();
+        let roots = s.live_scheduler_roots_page(None, 10).await.unwrap();
+        assert_eq!(roots.len(), 2);
+
+        let consumed_record = s.get_by_key(&consumed).await.unwrap().unwrap();
+        sqlx::query("UPDATE artifact_consumers SET expires_at=unixepoch()-1 WHERE artifact_id=?")
+            .bind(consumed_record.id)
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        let roots = s.live_scheduler_roots_page(None, 10).await.unwrap();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].key, published_key);
+
+        s.observe(
+            "ws",
+            "o/r",
+            "main",
+            "replacement",
+            &[ArtifactKind::Head],
+            1,
+            None,
+        )
+        .await
+        .unwrap();
+        let roots = s.live_scheduler_roots_page(None, 10).await.unwrap();
+        assert_eq!(
+            roots.len(),
+            1,
+            "newest retained Head base was lost during alias advance"
+        );
+    }
+
+    #[tokio::test]
+    async fn base_retention_survives_head_first_pair_advance() {
+        let (s, _d, _path) = scheduler(Default::default()).await;
+        let keys = [
+            key("ws", "old", ArtifactKind::Head),
+            key("ws", "old", ArtifactKind::FullHistory),
+        ];
+        for k in &keys {
+            s.subscribe_consumer(k, "seed", 60).await.unwrap();
+        }
+        for manifest in ["a".repeat(64), "b".repeat(64)] {
+            let c = s.claim("worker", 60).await.unwrap().unwrap();
+            s.complete(
+                &c,
+                "worker",
+                &CompletionEvidence::new(c.record.key.clone(), manifest).unwrap(),
+            )
+            .await
+            .unwrap();
+        }
+        for k in &keys {
+            let r = s.get_by_key(k).await.unwrap().unwrap();
+            s.release_consumer(r.id, "seed").await.unwrap();
+        }
+        assert_eq!(
+            s.live_scheduler_roots_page(None, 20).await.unwrap().len(),
+            2
+        );
+
+        let new_head = key("ws", "new", ArtifactKind::Head);
+        s.subscribe_consumer(&new_head, "seed", 60).await.unwrap();
+        let c = s.claim("worker", 60).await.unwrap().unwrap();
+        s.complete(
+            &c,
+            "worker",
+            &CompletionEvidence::new(c.record.key.clone(), "c".repeat(64)).unwrap(),
+        )
+        .await
+        .unwrap();
+        let r = s.get_by_key(&new_head).await.unwrap().unwrap();
+        s.release_consumer(r.id, "seed").await.unwrap();
+        assert_eq!(
+            s.live_scheduler_roots_page(None, 20).await.unwrap().len(),
+            3,
+            "older complete pair was broken by Head-first advance"
+        );
+        let new_history = key("ws", "new", ArtifactKind::FullHistory);
+        s.subscribe_consumer(&new_history, "seed", 60)
+            .await
+            .unwrap();
+        let c = s.claim("worker", 60).await.unwrap().unwrap();
+        s.complete(
+            &c,
+            "worker",
+            &CompletionEvidence::new(c.record.key.clone(), "d".repeat(64)).unwrap(),
+        )
+        .await
+        .unwrap();
+        let r = s.get_by_key(&new_history).await.unwrap().unwrap();
+        s.release_consumer(r.id, "seed").await.unwrap();
+        assert_eq!(
+            s.live_scheduler_roots_page(None, 20).await.unwrap().len(),
+            4
+        );
+    }
+
+    #[tokio::test]
+    async fn base_retention_survives_history_first_pair_advance() {
+        let (s, _d, _path) = scheduler(Default::default()).await;
+        for kind in [ArtifactKind::Head, ArtifactKind::FullHistory] {
+            let k = key("ws", "old", kind);
+            s.subscribe_consumer(&k, "seed", 60).await.unwrap();
+        }
+        for manifest in ["a".repeat(64), "b".repeat(64)] {
+            let c = s.claim("worker", 60).await.unwrap().unwrap();
+            s.complete(
+                &c,
+                "worker",
+                &CompletionEvidence::new(c.record.key.clone(), manifest).unwrap(),
+            )
+            .await
+            .unwrap();
+            s.release_consumer(c.record.id, "seed").await.unwrap();
+        }
+        let history = key("ws", "new", ArtifactKind::FullHistory);
+        s.observe(
+            "ws",
+            "o/r",
+            "main",
+            "new",
+            &[ArtifactKind::FullHistory],
+            1,
+            None,
+        )
+        .await
+        .unwrap();
+        s.subscribe_consumer(&history, "seed", 60).await.unwrap();
+        let c = s.claim("worker", 60).await.unwrap().unwrap();
+        s.complete(
+            &c,
+            "worker",
+            &CompletionEvidence::new(c.record.key.clone(), "c".repeat(64)).unwrap(),
+        )
+        .await
+        .unwrap();
+        s.release_consumer(c.record.id, "seed").await.unwrap();
+        assert_eq!(
+            s.live_scheduler_roots_page(None, 20).await.unwrap().len(),
+            3,
+            "older complete pair was broken by History-first advance"
+        );
+    }
+
+    #[tokio::test]
+    async fn quarantined_newest_complete_base_falls_back_to_retained_older_pair() {
+        let (s, _d, _path) = scheduler(Default::default()).await;
+        for (commit, head_manifest, history_manifest) in [
+            ("old", "a".repeat(64), "b".repeat(64)),
+            ("new", "c".repeat(64), "d".repeat(64)),
+        ] {
+            for (kind, manifest) in [
+                (ArtifactKind::Head, head_manifest),
+                (ArtifactKind::FullHistory, history_manifest),
+            ] {
+                let k = key("ws", commit, kind);
+                s.subscribe_consumer(&k, "seed", 60).await.unwrap();
+                let c = s.claim("worker", 60).await.unwrap().unwrap();
+                s.complete(
+                    &c,
+                    "worker",
+                    &CompletionEvidence::new(c.record.key.clone(), manifest).unwrap(),
+                )
+                .await
+                .unwrap();
+                s.release_consumer(c.record.id, "seed").await.unwrap();
+            }
+        }
+        assert_eq!(
+            s.complete_full_base_candidates("ws", "o/r", 1, 8)
+                .await
+                .unwrap(),
+            vec!["new", "old"]
+        );
+        assert!(
+            s.quarantine_ready(
+                &key("ws", "new", ArtifactKind::Head),
+                &"c".repeat(64),
+                "corrupt"
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(
+            s.complete_full_base_candidates("ws", "o/r", 1, 8)
+                .await
+                .unwrap(),
+            vec!["old"]
+        );
+        let roots = s.live_scheduler_roots_page(None, 20).await.unwrap();
+        assert!(
+            roots
+                .iter()
+                .any(|root| root.key.commit == "old" && root.key.kind == ArtifactKind::Head)
+        );
+        assert!(
+            roots
+                .iter()
+                .any(|root| root.key.commit == "old" && root.key.kind == ArtifactKind::FullHistory)
+        );
+    }
+
+    #[tokio::test]
+    async fn base_retention_keeps_exact_newest_eight_pairs_with_tied_timestamps() {
+        let (s, _d, _path) = scheduler(Default::default()).await;
+        let head_times = [4_i64, 1, 4, 3, 2, 3, 1, 4, 2, 4, 3, 4];
+        let history_times = [1_i64, 4, 2, 3, 4, 1, 3, 2, 4, 4, 3, 1];
+        let mut pairs = Vec::new();
+        for index in 0..12_i64 {
+            let head_id = 100 + index * 2;
+            let history_id = head_id + 1;
+            for (id, kind, updated) in [
+                (head_id, "head", head_times[index as usize]),
+                (history_id, "full_history", history_times[index as usize]),
+            ] {
+                sqlx::query("INSERT INTO artifact_jobs(id,workspace,repo,commit_oid,kind,format_version,state,lease_generation,claim_attempts,retry_count,manifest,created_at,updated_at) VALUES(?,'ws','o/r',?,?,1,'ready',0,0,0,?,0,?)")
+                    .bind(id).bind(format!("commit-{index}")) .bind(kind)
+                    .bind(format!("{id:064x}")).bind(updated).execute(&s.pool).await.unwrap();
+            }
+            pairs.push((
+                head_times[index as usize].max(history_times[index as usize]),
+                history_id,
+                head_id,
+                history_id,
+            ));
+        }
+        let mut c = s.immediate().await.unwrap();
+        refresh_base_retention_conn(&mut c, "ws", "o/r", 1)
+            .await
+            .unwrap();
+        finish(c, Ok(())).await.unwrap();
+
+        pairs.sort_by_key(|pair| std::cmp::Reverse((pair.0, pair.1)));
+        let expected = pairs
+            .iter()
+            .take(8)
+            .flat_map(|pair| [pair.2, pair.3])
+            .collect::<std::collections::HashSet<_>>();
+        let retained = sqlx::query_scalar::<_, i64>(
+            "SELECT artifact_id FROM artifact_base_retention WHERE pair_rank IS NOT NULL",
+        )
+        .fetch_all(&s.pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>();
+        assert_eq!(retained, expected);
+        assert_eq!(retained.len(), 16);
+    }
+
+    #[tokio::test]
+    async fn scheduler_gc_page_query_uses_materialized_indexes_not_fleet_reranking() {
+        let (s, _d, _path) = scheduler(Default::default()).await;
+        for id in [1_i64, 1_000_000_i64] {
+            sqlx::query("INSERT INTO artifact_jobs(id,workspace,repo,commit_oid,kind,format_version,state,lease_generation,claim_attempts,retry_count,manifest,created_at,updated_at) VALUES(?, 'ws','o/r',?,'files',1,'ready',0,0,0,?,0,0)")
+                .bind(id).bind(format!("commit-{id}")).bind(format!("{id:064x}")).execute(&s.pool).await.unwrap();
+            sqlx::query("INSERT INTO artifact_consumers(artifact_id,consumer_id,expires_at) VALUES(?,'live',unixepoch()+60)")
+                .bind(id).execute(&s.pool).await.unwrap();
+        }
+        let page = s.live_scheduler_roots_page(Some(1), 1).await.unwrap();
+        assert_eq!(
+            page[0].artifact_id, 1_000_000,
+            "sparse rooted id was not reached"
+        );
+        let rows=sqlx::query("EXPLAIN QUERY PLAN WITH candidates(id) AS (SELECT published_artifact_id FROM (SELECT published_artifact_id FROM artifact_observations WHERE published_artifact_id>? ORDER BY published_artifact_id LIMIT ?) UNION ALL SELECT artifact_id FROM (SELECT artifact_id FROM artifact_consumers WHERE artifact_id>? AND expires_at>? ORDER BY artifact_id LIMIT ?) UNION ALL SELECT artifact_id FROM (SELECT artifact_id FROM artifact_base_retention WHERE artifact_id>? ORDER BY artifact_id LIMIT ?)), page_ids(id) AS (SELECT DISTINCT id FROM candidates ORDER BY id LIMIT ?) SELECT j.id FROM page_ids p JOIN artifact_jobs j ON j.id=p.id WHERE j.state='ready' AND j.manifest IS NOT NULL AND length(trim(j.manifest))>0 ORDER BY j.id")
+            .bind(0_i64).bind(512_i64).bind(0_i64).bind(0_i64).bind(512_i64).bind(0_i64).bind(512_i64).bind(512_i64).fetch_all(&s.pool).await.unwrap();
+        let plan = rows
+            .iter()
+            .map(|row| row.get::<String, _>("detail"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            plan.contains("artifact_observations_published")
+                && plan.contains("sqlite_autoindex_artifact_consumers_1")
+                && plan.contains("INTEGER PRIMARY KEY (rowid>?)"),
+            "GC root sources were not independent indexed cursor seeks: {plan}"
+        );
+        assert!(
+            !plan.contains("SCAN j"),
+            "GC page scanned sparse artifact_jobs fleet state: {plan}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduler_gc_pagination_survives_more_than_page_of_duplicate_root_sources() {
+        let (s, _d, _path) = scheduler(Default::default()).await;
+        let mut tx = s.pool.begin().await.unwrap();
+        for id in 1_i64..=600 {
+            sqlx::query("INSERT INTO artifact_jobs(id,workspace,repo,commit_oid,kind,format_version,state,lease_generation,claim_attempts,retry_count,manifest,created_at,updated_at) VALUES(?,'ws','o/r',?,'files',1,'ready',0,0,0,?,0,?)")
+                .bind(id).bind(format!("commit-{id}")).bind(format!("{id:064x}"))
+                .bind(id).execute(&mut *tx).await.unwrap();
+            sqlx::query("INSERT INTO artifact_consumers(artifact_id,consumer_id,expires_at) VALUES(?,'live',unixepoch()+60)")
+                .bind(id).execute(&mut *tx).await.unwrap();
+            sqlx::query("INSERT INTO artifact_observations(workspace,repo,branch,kind,desired_commit,desired_artifact_id,desired_generation,published_artifact_id,format_version,observed_at) VALUES('ws','o/r',?,'files',?,?,1,?,1,0)")
+                .bind(format!("branch-{id}")).bind(format!("commit-{id}"))
+                .bind(id).bind(id).execute(&mut *tx).await.unwrap();
+        }
+        tx.commit().await.unwrap();
+        let first = s.live_scheduler_roots_page(None, 512).await.unwrap();
+        assert_eq!(first.len(), 512);
+        let second = s
+            .live_scheduler_roots_page(first.last().map(|root| root.artifact_id), 512)
+            .await
+            .unwrap();
+        assert_eq!(second.len(), 88);
+        assert_eq!(second.first().unwrap().artifact_id, 513);
+        assert_eq!(second.last().unwrap().artifact_id, 600);
     }
 }

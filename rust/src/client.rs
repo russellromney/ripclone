@@ -90,6 +90,7 @@ pub enum TypedCloneOutcome {
 struct ClientPinnedInstaller<'a> {
     cas: &'a Cas,
     approved_origin: &'a str,
+    capability: std::sync::Mutex<Option<crate::pinned_bundle::VerifiedPinnedLocalCapability>>,
 }
 
 impl crate::topup::PinnedBundleInstaller for ClientPinnedInstaller<'_> {
@@ -103,8 +104,19 @@ impl crate::topup::PinnedBundleInstaller for ClientPinnedInstaller<'_> {
         request: &crate::topup::PinnedBundleRequest,
     ) -> std::result::Result<crate::topup::VerifiedPinnedBundle, crate::topup::BundleInstallFailure>
     {
-        crate::pinned_bundle::verify_and_materialize_pinned_bundle(self.cas, request, destination)
-            .map_err(|_| crate::topup::BundleInstallFailure::Integrity)
+        let capability = self
+            .capability
+            .lock()
+            .map_err(|_| crate::topup::BundleInstallFailure::Integrity)?
+            .take()
+            .ok_or(crate::topup::BundleInstallFailure::Integrity)?;
+        crate::pinned_bundle::materialize_verified_pinned_capability(
+            self.cas,
+            request,
+            capability,
+            destination,
+        )
+        .map_err(|_| crate::topup::BundleInstallFailure::Integrity)
     }
 }
 
@@ -1059,10 +1071,11 @@ impl Client {
                         Some(cas) => cas.clone(),
                         None => Cas::new(temporary.as_ref().unwrap().path())?,
                     };
-                    self.prefetch_pinned_bundle(&cas, &request).await?;
+                    let capability = self.prefetch_pinned_bundle(&cas, &request).await?;
                     let installer = ClientPinnedInstaller {
                         cas: &cas,
                         approved_origin: approved_canonical_origin,
+                        capability: std::sync::Mutex::new(Some(capability)),
                     };
                     let outcome =
                         crate::topup::install_pinned_bundle(target, &request, &installer)?;
@@ -1091,7 +1104,7 @@ impl Client {
         &self,
         cas: &Cas,
         request: &crate::topup::PinnedBundleRequest,
-    ) -> Result<()> {
+    ) -> Result<crate::pinned_bundle::VerifiedPinnedLocalCapability> {
         const MAX_PINNED_MANIFEST_BYTES: usize = 16 * 1024 * 1024;
         const MAX_PINNED_ARTIFACTS: usize = 32_768;
         const MAX_PINNED_ARTIFACT_BYTES: u64 = 16 * 1024 * 1024 * 1024;
@@ -1139,10 +1152,10 @@ impl Client {
             }
             cas.install_hashed_file(&artifact.hash, temp.into_temp_path())?;
         }
-        // Re-verification happens once here and again inside the installer. The
+        // Semantic verification happens once here; the opaque capability is
+        // consumed by the installer. CAS reads remain hash-verified while the
         // first pass prevents any unverified materialization attempt.
-        crate::pinned_bundle::verify_pinned_bundle_ready(cas, request)?;
-        Ok(())
+        crate::pinned_bundle::verify_pinned_bundle_capability(cas, request)
     }
 
     async fn release_typed_transport(

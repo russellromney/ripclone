@@ -14,8 +14,8 @@ use crate::artifact_scheduler::{
 #[cfg(test)]
 use crate::artifact_scheduler::{CompletionEvidence, validate_evidence};
 use crate::artifact_scheduler_backend::{
-    ArtifactSchedulerPersistence, SchedulerGcRoot, TRANSPORT_ROOT_PAGE_MAX, TransportRootLease,
-    validate_transport_lease_identity,
+    ArtifactSchedulerPersistence, GcDeleteFence, SchedulerGcRoot, TRANSPORT_ROOT_PAGE_MAX,
+    TransportRootLease, validate_transport_lease_identity,
 };
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -79,6 +79,9 @@ const SCHEMA: &[&str] = &[
  CONSTRAINT artifact_base_retention_artifact FOREIGN KEY(artifact_id) REFERENCES artifact_jobs(id) ON DELETE CASCADE,
  CONSTRAINT artifact_base_retention_ranks CHECK((head_rank IS NULL OR head_rank BETWEEN 1 AND 8) AND (pair_rank IS NULL OR pair_rank BETWEEN 1 AND 8) AND (head_rank IS NOT NULL OR pair_rank IS NOT NULL)),
  INDEX artifact_base_retention_scope(workspace,repo,format_version)) ENGINE=InnoDB DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin"#,
+    r#"CREATE TABLE IF NOT EXISTS artifact_gc_sweep(
+ id SMALLINT NOT NULL PRIMARY KEY,owner VARCHAR(200) NOT NULL,expires_at BIGINT NOT NULL,
+ CONSTRAINT artifact_gc_sweep_singleton CHECK(id=1)) ENGINE=InnoDB DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin"#,
     r#"CREATE TABLE IF NOT EXISTS scheduler_state(
  id SMALLINT NOT NULL PRIMARY KEY, fairness_cursor BIGINT NOT NULL,
  workspace_cursor VARCHAR(128) NOT NULL DEFAULT '',config_fingerprint VARCHAR(512) NOT NULL DEFAULT '',
@@ -92,6 +95,16 @@ pub struct MysqlArtifactScheduler {
     limits: SchedulerLimits,
     verifier: Arc<dyn CompletionVerifier>,
     completion_sealer: Arc<CompletionSealAuthority>,
+}
+struct MysqlGcDeleteFence(Option<Transaction<'static, MySql>>);
+#[async_trait]
+impl GcDeleteFence for MysqlGcDeleteFence {
+    async fn release(mut self: Box<Self>) -> Result<()> {
+        if let Some(tx) = self.0.take() {
+            tx.commit().await?;
+        }
+        Ok(())
+    }
 }
 
 impl MysqlArtifactScheduler {
@@ -409,6 +422,9 @@ impl MysqlArtifactScheduler {
                 "YES",
                 None,
             ),
+            ("artifact_gc_sweep", "id", "smallint", "NO", None),
+            ("artifact_gc_sweep", "owner", "varchar(200)", "NO", None),
+            ("artifact_gc_sweep", "expires_at", "bigint", "NO", None),
             ("scheduler_state", "id", "smallint", "NO", None),
             ("scheduler_state", "fairness_cursor", "bigint", "NO", None),
             (
@@ -430,7 +446,7 @@ impl MysqlArtifactScheduler {
             "SELECT count(*) FROM information_schema.columns
              WHERE table_schema=DATABASE() AND table_name IN
              ('artifact_scheduler_schema','artifact_jobs','branch_observations',
-              'artifact_observations','artifact_consumers','artifact_transport_leases','artifact_base_retention','scheduler_state')",
+              'artifact_observations','artifact_consumers','artifact_transport_leases','artifact_base_retention','artifact_gc_sweep','scheduler_state')",
         )
         .fetch_one(&mut **tx)
         .await?;
@@ -441,7 +457,7 @@ impl MysqlArtifactScheduler {
             "SELECT count(*) FROM information_schema.tables
              WHERE table_schema=DATABASE() AND table_name IN
              ('artifact_scheduler_schema','artifact_jobs','branch_observations',
-              'artifact_observations','artifact_consumers','artifact_transport_leases','artifact_base_retention','scheduler_state')
+              'artifact_observations','artifact_consumers','artifact_transport_leases','artifact_base_retention','artifact_gc_sweep','scheduler_state')
                AND (engine IS NULL OR engine<>'InnoDB' OR table_collation IS NULL
                     OR table_collation<>'utf8mb4_bin')",
         )
@@ -454,7 +470,7 @@ impl MysqlArtifactScheduler {
             "SELECT count(*) FROM information_schema.columns
              WHERE table_schema=DATABASE() AND table_name IN
              ('artifact_scheduler_schema','artifact_jobs','branch_observations',
-              'artifact_observations','artifact_consumers','artifact_transport_leases','artifact_base_retention','scheduler_state')
+              'artifact_observations','artifact_consumers','artifact_transport_leases','artifact_base_retention','artifact_gc_sweep','scheduler_state')
                AND data_type IN('varchar','text','longtext')
                AND (collation_name IS NULL OR collation_name<>'utf8mb4_bin')",
         )
@@ -476,7 +492,7 @@ impl MysqlArtifactScheduler {
             "SELECT count(*) FROM information_schema.columns
              WHERE table_schema=DATABASE() AND table_name IN
              ('artifact_scheduler_schema','artifact_jobs','branch_observations',
-              'artifact_observations','artifact_consumers','artifact_transport_leases','artifact_base_retention','scheduler_state')
+              'artifact_observations','artifact_consumers','artifact_transport_leases','artifact_base_retention','artifact_gc_sweep','scheduler_state')
                AND NOT(table_name='artifact_jobs' AND column_name='id')
                AND (extra IS NULL OR extra<>'')",
         )
@@ -581,13 +597,14 @@ impl MysqlArtifactScheduler {
                 "workspace,repo,format_version",
                 false,
             ),
+            ("artifact_gc_sweep", "PRIMARY", "id", true),
             ("scheduler_state", "PRIMARY", "id", true),
         ];
         let index_count: i64 = sqlx::query_scalar(
             "SELECT count(DISTINCT table_name,index_name) FROM information_schema.statistics
              WHERE table_schema=DATABASE() AND table_name IN
               ('artifact_scheduler_schema','artifact_jobs','branch_observations',
-              'artifact_observations','artifact_consumers','artifact_transport_leases','artifact_base_retention','scheduler_state')",
+              'artifact_observations','artifact_consumers','artifact_transport_leases','artifact_base_retention','artifact_gc_sweep','scheduler_state')",
         )
         .fetch_one(&mut **tx)
         .await?;
@@ -678,6 +695,7 @@ impl MysqlArtifactScheduler {
                 "artifact_base_retention_ranks",
                 "(`head_rank` is null or `head_rank` between 1 and 8) and (`pair_rank` is null or `pair_rank` between 1 and 8) and (`head_rank` is not null or `pair_rank` is not null)",
             ),
+            ("artifact_gc_sweep_singleton", "`id` = 1"),
         ];
         const CONSTRAINTS: &[(&str, &str, &str)] = &[
             ("artifact_scheduler_schema", "PRIMARY", "PRIMARY KEY"),
@@ -725,6 +743,8 @@ impl MysqlArtifactScheduler {
                 "artifact_base_retention_ranks",
                 "CHECK",
             ),
+            ("artifact_gc_sweep", "PRIMARY", "PRIMARY KEY"),
+            ("artifact_gc_sweep", "artifact_gc_sweep_singleton", "CHECK"),
             ("scheduler_state", "PRIMARY", "PRIMARY KEY"),
             ("scheduler_state", "scheduler_state_singleton", "CHECK"),
             ("scheduler_state", "scheduler_state_fairness", "CHECK"),
@@ -733,7 +753,7 @@ impl MysqlArtifactScheduler {
             "SELECT table_name,constraint_name,constraint_type,enforced
              FROM information_schema.table_constraints WHERE constraint_schema=DATABASE()
                AND table_name IN ('artifact_scheduler_schema','artifact_jobs','branch_observations',
-                 'artifact_observations','artifact_consumers','artifact_transport_leases','artifact_base_retention','scheduler_state')",
+                 'artifact_observations','artifact_consumers','artifact_transport_leases','artifact_base_retention','artifact_gc_sweep','scheduler_state')",
         )
         .fetch_all(&mut **tx)
         .await?;
@@ -767,7 +787,7 @@ impl MysqlArtifactScheduler {
              WHERE k.referenced_table_schema=DATABASE()
                AND k.referenced_table_name IN
                   ('artifact_scheduler_schema','artifact_jobs','branch_observations',
-                  'artifact_observations','artifact_consumers','artifact_transport_leases','artifact_base_retention','scheduler_state')
+                  'artifact_observations','artifact_consumers','artifact_transport_leases','artifact_base_retention','artifact_gc_sweep','scheduler_state')
                AND NOT(k.table_name='artifact_base_retention' AND k.constraint_name='artifact_base_retention_artifact')",
         )
         .fetch_one(&mut **tx)
@@ -1178,6 +1198,24 @@ fn validate_mysql_key(key: &ArtifactKey) -> Result<()> {
     Ok(())
 }
 
+fn validate_gc_sweep_args(owner: &str, ttl: i64) -> Result<()> {
+    if owner.trim().is_empty() || owner.len() > 200 || !(1..=600).contains(&ttl) {
+        bail!("GC sweep owner or TTL is invalid")
+    }
+    Ok(())
+}
+
+async fn ensure_gc_unfenced_mysql(tx: &mut Transaction<'_, MySql>, now: i64) -> Result<()> {
+    let fence: Option<(String, i64)> =
+        sqlx::query_as("SELECT owner,expires_at FROM artifact_gc_sweep WHERE id=1 FOR UPDATE")
+            .fetch_optional(&mut **tx)
+            .await?;
+    if fence.is_some_and(|(_, expires_at)| expires_at > now) {
+        bail!("artifact publication is temporarily fenced by remote GC")
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl ArtifactSchedulerPersistence for MysqlArtifactScheduler {
     fn completion_verifier(&self) -> Arc<dyn CompletionVerifier> {
@@ -1185,6 +1223,65 @@ impl ArtifactSchedulerPersistence for MysqlArtifactScheduler {
     }
     fn completion_sealer(&self) -> Arc<CompletionSealAuthority> {
         self.completion_sealer.clone()
+    }
+
+    async fn acquire_gc_sweep(&self, owner: &str, ttl: i64) -> Result<bool> {
+        validate_gc_sweep_args(owner, ttl)?;
+        let (mut tx, now) = self.controlled().await?;
+        sqlx::query("INSERT INTO artifact_gc_sweep(id,owner,expires_at) VALUES(1,?,?) ON DUPLICATE KEY UPDATE owner=IF(expires_at<=? OR owner=VALUES(owner),VALUES(owner),owner),expires_at=IF(expires_at<=? OR owner=VALUES(owner),VALUES(expires_at),expires_at)")
+            .bind(owner).bind(now + ttl).bind(now).bind(now).execute(&mut *tx).await?;
+        let held: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM artifact_gc_sweep WHERE id=1 AND owner=? AND expires_at>?",
+        )
+        .bind(owner)
+        .bind(now)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(held == 1)
+    }
+    async fn renew_gc_sweep(&self, owner: &str, ttl: i64) -> Result<bool> {
+        validate_gc_sweep_args(owner, ttl)?;
+        let (mut tx, now) = self.controlled().await?;
+        let won = sqlx::query(
+            "UPDATE artifact_gc_sweep SET expires_at=? WHERE id=1 AND owner=? AND expires_at>?",
+        )
+        .bind(now + ttl)
+        .bind(owner)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            == 1;
+        tx.commit().await?;
+        Ok(won)
+    }
+    async fn release_gc_sweep(&self, owner: &str) -> Result<()> {
+        validate_gc_sweep_args(owner, 1)?;
+        sqlx::query("DELETE FROM artifact_gc_sweep WHERE id=1 AND owner=?")
+            .bind(owner)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+    async fn lock_gc_delete_batch(&self, owner: &str) -> Result<Box<dyn GcDeleteFence>> {
+        validate_gc_sweep_args(owner, 1)?;
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT id FROM scheduler_state WHERE id=1 FOR UPDATE")
+            .execute(&mut *tx)
+            .await?;
+        let now: i64 = sqlx::query_scalar("SELECT UNIX_TIMESTAMP()")
+            .fetch_one(&mut *tx)
+            .await?;
+        let held: Option<(String, i64)> =
+            sqlx::query_as("SELECT owner,expires_at FROM artifact_gc_sweep WHERE id=1 FOR UPDATE")
+                .fetch_optional(&mut *tx)
+                .await?;
+        if !held.is_some_and(|(held_owner, expires_at)| held_owner == owner && expires_at > now) {
+            tx.rollback().await?;
+            bail!("remote GC does not own the live publication fence")
+        }
+        Ok(Box::new(MysqlGcDeleteFence(Some(tx))))
     }
     async fn register_transport_root(
         &self,
@@ -1196,6 +1293,7 @@ impl ArtifactSchedulerPersistence for MysqlArtifactScheduler {
     ) -> Result<()> {
         validate_transport_lease_identity(root, session, workspace, repo, ttl)?;
         let (mut tx, now) = self.controlled().await?;
+        ensure_gc_unfenced_mysql(&mut tx, now).await?;
         let foreign: i64 = sqlx::query_scalar("SELECT count(*) FROM artifact_transport_leases WHERE session_id=? AND (workspace<>? OR repo<>?)")
             .bind(session).bind(workspace).bind(repo).fetch_one(&mut *tx).await?;
         if foreign != 0 {
@@ -1296,15 +1394,9 @@ impl ArtifactSchedulerPersistence for MysqlArtifactScheduler {
             .fetch_one(&mut *tx)
             .await?;
         let rows = sqlx::query(
-            "SELECT j.id,j.workspace,j.repo,j.commit_oid,j.kind,j.format_version,j.manifest
-             FROM artifact_jobs j WHERE j.id>? AND j.state='ready'
-               AND j.manifest IS NOT NULL AND length(trim(j.manifest))>0
-               AND (EXISTS(SELECT 1 FROM artifact_observations o WHERE o.published_artifact_id=j.id)
-                    OR EXISTS(SELECT 1 FROM artifact_consumers c WHERE c.artifact_id=j.id AND c.expires_at>?)
-                    OR EXISTS(SELECT 1 FROM artifact_base_retention r WHERE r.artifact_id=j.id))
-             ORDER BY j.id LIMIT ?",
+            "WITH candidates(id) AS ((SELECT published_artifact_id FROM artifact_observations WHERE published_artifact_id>? ORDER BY published_artifact_id LIMIT ?) UNION ALL (SELECT artifact_id FROM artifact_consumers WHERE artifact_id>? AND expires_at>? ORDER BY artifact_id LIMIT ?) UNION ALL (SELECT artifact_id FROM artifact_base_retention WHERE artifact_id>? ORDER BY artifact_id LIMIT ?)), page_ids(id) AS (SELECT DISTINCT id FROM candidates ORDER BY id LIMIT ?) SELECT j.id,j.workspace,j.repo,j.commit_oid,j.kind,j.format_version,j.manifest FROM page_ids p JOIN artifact_jobs j ON j.id=p.id WHERE j.state='ready' AND j.manifest IS NOT NULL AND length(trim(j.manifest))>0 ORDER BY j.id",
         )
-        .bind(after_artifact_id.unwrap_or(0)).bind(now).bind(limit as i64)
+        .bind(after_artifact_id.unwrap_or(0)).bind(limit as i64).bind(after_artifact_id.unwrap_or(0)).bind(now).bind(limit as i64).bind(after_artifact_id.unwrap_or(0)).bind(limit as i64).bind(limit as i64)
         .fetch_all(&mut *tx).await?;
         tx.commit().await?;
         rows.into_iter()
@@ -1329,6 +1421,7 @@ impl ArtifactSchedulerPersistence for MysqlArtifactScheduler {
     async fn schedule(&self, key: &ArtifactKey) -> Result<ScheduleOutcome> {
         validate_mysql_key(key)?;
         let (mut tx, now) = self.controlled().await?;
+        ensure_gc_unfenced_mysql(&mut tx, now).await?;
         self.preflight_batch(
             &mut tx,
             &key.workspace,
@@ -1358,6 +1451,7 @@ impl ArtifactSchedulerPersistence for MysqlArtifactScheduler {
             bail!("consumer subscription TTL is invalid")
         }
         let (mut tx, now) = self.controlled().await?;
+        ensure_gc_unfenced_mysql(&mut tx, now).await?;
         self.preflight_batch(
             &mut tx,
             &key.workspace,
@@ -1427,6 +1521,7 @@ impl ArtifactSchedulerPersistence for MysqlArtifactScheduler {
             }
         }
         let (mut tx, now) = self.controlled().await?;
+        ensure_gc_unfenced_mysql(&mut tx, now).await?;
         let current: Option<(i64, String)> = sqlx::query_as(
             "SELECT generation,desired_commit FROM branch_observations
              WHERE workspace=? AND repo=? AND branch=?",
@@ -1820,6 +1915,7 @@ impl ArtifactSchedulerPersistence for MysqlArtifactScheduler {
         let now: i64 = sqlx::query_scalar("SELECT UNIX_TIMESTAMP()")
             .fetch_one(&mut *tx)
             .await?;
+        ensure_gc_unfenced_mysql(&mut tx, now).await?;
         let won = sqlx::query(
             "UPDATE artifact_jobs SET state='ready',owner=NULL,heartbeat_at=NULL,
                 lease_expires_at=NULL,manifest=?,error=NULL,failure_class=NULL,updated_at=?
@@ -2251,6 +2347,7 @@ mod tests {
         for statement in [
             "DROP TABLE IF EXISTS external_scheduler_child",
             "DROP TABLE IF EXISTS artifact_base_retention",
+            "DROP TABLE IF EXISTS artifact_gc_sweep",
             "DROP TABLE IF EXISTS artifact_transport_leases",
             "DROP TABLE IF EXISTS artifact_consumers",
             "DROP TABLE IF EXISTS artifact_observations",
@@ -2301,6 +2398,25 @@ mod tests {
             MysqlArtifactScheduler::from_pool(b_pool, Default::default(), Arc::new(Accept))
         );
         let (a, b) = (a.unwrap(), b.unwrap());
+
+        assert!(a.acquire_gc_sweep("collector", 60).await.unwrap());
+        assert!(!b.acquire_gc_sweep("other", 60).await.unwrap());
+        let delete_fence = a.lock_gc_delete_batch("collector").await.unwrap();
+        let blocked = {
+            let b = b.clone();
+            tokio::spawn(async move {
+                b.register_transport_root(&"f".repeat(64), &"e".repeat(64), "ws", "owner/repo", 60)
+                    .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !blocked.is_finished(),
+            "mysql publication bypassed delete transaction lock"
+        );
+        delete_fence.release().await.unwrap();
+        assert!(blocked.await.unwrap().is_err());
+        a.release_gc_sweep("collector").await.unwrap();
 
         let root0 = format!("{:064x}", 1);
         let root1 = format!("{:064x}", 2);

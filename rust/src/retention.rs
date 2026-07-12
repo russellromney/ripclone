@@ -1,6 +1,6 @@
 use crate::cas::Cas;
 use crate::metrics::Metrics;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -32,6 +32,9 @@ pub struct Retention {
     /// `protected` side list is stale or incomplete.
     ref_store: Option<Arc<dyn crate::ref_store::RefStore>>,
     storage: Option<crate::storage::StorageRef>,
+    artifact_scheduler: Arc<
+        RwLock<Option<Arc<dyn crate::artifact_scheduler_backend::ArtifactSchedulerPersistence>>>,
+    >,
 }
 
 impl Retention {
@@ -71,7 +74,15 @@ impl Retention {
             durable_storage,
             ref_store: None,
             storage: None,
+            artifact_scheduler: Arc::new(RwLock::new(None)),
         })
+    }
+
+    pub async fn set_artifact_scheduler(
+        &self,
+        scheduler: Option<Arc<dyn crate::artifact_scheduler_backend::ArtifactSchedulerPersistence>>,
+    ) {
+        *self.artifact_scheduler.write().await = scheduler;
     }
 
     /// Protect, on every run, exactly the hashes the live refs point at (read via
@@ -136,6 +147,64 @@ impl Retention {
 
     /// Run a single retention pass. Called by the background task and tests.
     pub async fn run_once(&self) -> Result<()> {
+        let scheduler = self.artifact_scheduler.read().await.clone();
+        let owner = scheduler.as_ref().map(|_| {
+            format!(
+                "local-retention-{}",
+                hex::encode(rand::random::<[u8; 16]>())
+            )
+        });
+        if let (Some(scheduler), Some(owner)) = (scheduler.as_ref(), owner.as_ref())
+            && !scheduler.acquire_gc_sweep(owner, 600).await?
+        {
+            bail!("another collector holds the artifact publication fence")
+        }
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let heartbeat = if let (Some(scheduler), Some(owner)) = (scheduler.clone(), owner.clone()) {
+            let cancel = cancel.clone();
+            Some(tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = cancel.cancelled() => return Ok::<(), anyhow::Error>(()),
+                        _ = tokio::time::sleep(Duration::from_secs(30)) => {
+                            if !scheduler.renew_gc_sweep(&owner, 600).await? {
+                                bail!("local retention lost its publication fence")
+                            }
+                        }
+                    }
+                }
+            }))
+        } else {
+            None
+        };
+        let transactional_fence =
+            if let (Some(scheduler), Some(owner)) = (scheduler.as_ref(), owner.as_ref()) {
+                Some(scheduler.lock_gc_delete_batch(owner).await?)
+            } else {
+                None
+            };
+        let result = self.run_once_fenced().await;
+        let transactional_release = match transactional_fence {
+            Some(fence) => fence.release().await,
+            None => Ok(()),
+        };
+        cancel.cancel();
+        let heartbeat_result = match heartbeat {
+            Some(task) => task.await.context("retention fence heartbeat panicked")?,
+            None => Ok(()),
+        };
+        let release_result = if let (Some(scheduler), Some(owner)) = (scheduler, owner) {
+            scheduler.release_gc_sweep(&owner).await
+        } else {
+            Ok(())
+        };
+        result?;
+        transactional_release?;
+        heartbeat_result?;
+        release_result
+    }
+
+    async fn run_once_fenced(&self) -> Result<()> {
         let mut protected = self.protected.read().await.clone();
         // Union in everything the live refs point at, computed fresh this run, so
         // a stale/incomplete side list can never cause a referenced artifact to
@@ -146,6 +215,14 @@ impl Retention {
                 .await
                 .context("compute reachable set for retention")?;
             protected.extend(reachable);
+            let scheduler = self.artifact_scheduler.read().await.clone();
+            crate::remote_gc::collect_live_normalized_hashes(
+                scheduler.as_ref(),
+                storage,
+                &mut protected,
+            )
+            .await
+            .context("compute live transport roots for retention")?;
         }
         let cas = self.cas.clone();
         let max_age = self.max_age;
@@ -175,6 +252,13 @@ impl Retention {
                     if let Some(max_age) = max_age
                         && entry.age >= max_age
                     {
+                        if std::fs::metadata(&entry.path)
+                            .and_then(|metadata| metadata.modified())
+                            .is_ok_and(|modified| modified != entry.mtime)
+                        {
+                            remaining.push(entry);
+                            continue;
+                        }
                         if !is_durable(&entry.hash) {
                             warn!(
                                 "skipping eviction of {}: not confirmed in durable storage",
@@ -212,6 +296,12 @@ impl Retention {
                         for entry in candidates {
                             if freed >= target {
                                 break;
+                            }
+                            if std::fs::metadata(&entry.path)
+                                .and_then(|metadata| metadata.modified())
+                                .is_ok_and(|modified| modified != entry.mtime)
+                            {
+                                continue;
                             }
                             if !is_durable(&entry.hash) {
                                 warn!(
@@ -409,6 +499,88 @@ mod tests {
             path.exists(),
             "a ref-reachable artifact must survive even when absent from the side list"
         );
+    }
+
+    #[tokio::test]
+    async fn retention_uses_same_live_transport_root_graph_as_remote_gc() {
+        use crate::artifact_manifest::{
+            ArtifactManifest, ArtifactPayload, CasBlob, GitPackPair, HeadArtifact,
+        };
+        use crate::artifact_scheduler::{ArtifactKey, ArtifactKind};
+        use crate::ref_store::FileRefStore;
+        let tmp = tempfile::tempdir().unwrap();
+        let cas_root = tmp.path().join("cas");
+        let repo_root = tmp.path().join("repos");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        let cas = make_cas(&cas_root);
+        let child = cas.put(b"child").unwrap();
+        let idx = cas.put(b"index").unwrap();
+        let pre = cas.put(b"pre").unwrap();
+        let orphan = cas.put(b"orphan").unwrap();
+        let key = ArtifactKey {
+            workspace: "ws".into(),
+            repo: "o/r".into(),
+            commit: "1".repeat(40),
+            kind: ArtifactKind::Head,
+            format_version: 1,
+        };
+        let root = ArtifactManifest::new(
+            &key,
+            ArtifactPayload::Head(HeadArtifact {
+                packs: vec![GitPackPair {
+                    pack: CasBlob {
+                        hash: child.clone(),
+                        len: 5,
+                    },
+                    index: CasBlob {
+                        hash: idx.clone(),
+                        len: 5,
+                    },
+                }],
+                prebuilt_index: CasBlob {
+                    hash: pre.clone(),
+                    len: 3,
+                },
+            }),
+        )
+        .unwrap()
+        .store(&cas)
+        .unwrap()
+        .manifest;
+        let old = SystemTime::now() - Duration::from_secs(60);
+        for hash in [&root, &child, &idx, &pre, &orphan] {
+            filetime::set_file_mtime(cas.path(hash), filetime::FileTime::from_system_time(old))
+                .unwrap();
+        }
+        let scheduler = Arc::new(
+            crate::artifact_scheduler::ArtifactScheduler::open(
+                tmp.path().join("scheduler.db").to_str().unwrap(),
+                Default::default(),
+            )
+            .await
+            .unwrap(),
+        );
+        scheduler
+            .register_transport_root(&root, &"a".repeat(64), "ws", "o/r", 60)
+            .await
+            .unwrap();
+        let scheduler: Arc<dyn crate::artifact_scheduler_backend::ArtifactSchedulerPersistence> =
+            scheduler;
+        let refs: Arc<dyn crate::ref_store::RefStore> = Arc::new(FileRefStore::new(&repo_root));
+        let retention = Retention::with_config(
+            cas.clone(),
+            Metrics::new(),
+            Some(Duration::from_secs(1)),
+            None,
+        )
+        .unwrap()
+        .with_ref_store(refs, crate::storage::local(&cas_root).unwrap());
+        retention.set_artifact_scheduler(Some(scheduler)).await;
+        retention.run_once().await.unwrap();
+        for hash in [&root, &child, &idx, &pre] {
+            assert!(cas.path(hash).exists());
+        }
+        assert!(!cas.path(&orphan).exists());
     }
 
     #[tokio::test]

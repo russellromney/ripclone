@@ -14,8 +14,8 @@ use crate::artifact_scheduler::{
     validate_limits, validate_observation_identity, validate_resolved_commit,
 };
 use crate::artifact_scheduler_backend::{
-    ArtifactSchedulerPersistence, SchedulerGcRoot, TRANSPORT_ROOT_PAGE_MAX, TransportRootLease,
-    validate_transport_lease_identity,
+    ArtifactSchedulerPersistence, GcDeleteFence, SchedulerGcRoot, TRANSPORT_ROOT_PAGE_MAX,
+    TransportRootLease, validate_transport_lease_identity,
 };
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -39,6 +39,7 @@ const SCHEMA: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS artifact_transport_leases_expiry ON artifact_transport_leases(expires_at)",
     "CREATE TABLE IF NOT EXISTS artifact_base_retention(artifact_id INTEGER PRIMARY KEY,workspace TEXT NOT NULL,repo TEXT NOT NULL,format_version INTEGER NOT NULL,head_rank INTEGER,pair_rank INTEGER,FOREIGN KEY(artifact_id) REFERENCES artifact_jobs(id) ON DELETE CASCADE,CHECK((head_rank IS NULL OR head_rank BETWEEN 1 AND 8) AND (pair_rank IS NULL OR pair_rank BETWEEN 1 AND 8) AND (head_rank IS NOT NULL OR pair_rank IS NOT NULL)))",
     "CREATE INDEX IF NOT EXISTS artifact_base_retention_scope ON artifact_base_retention(workspace,repo,format_version)",
+    "CREATE TABLE IF NOT EXISTS artifact_gc_sweep(id INTEGER PRIMARY KEY CHECK(id=1),owner TEXT NOT NULL,expires_at INTEGER NOT NULL)",
     "CREATE TABLE IF NOT EXISTS scheduler_state(id INTEGER PRIMARY KEY CHECK(id=1),fairness_cursor INTEGER NOT NULL CHECK(fairness_cursor BETWEEN 0 AND 3),workspace_cursor TEXT NOT NULL DEFAULT '',config_fingerprint TEXT NOT NULL DEFAULT '')",
 ];
 
@@ -48,6 +49,16 @@ pub struct LibsqlArtifactScheduler {
     limits: SchedulerLimits,
     verifier: Arc<dyn CompletionVerifier>,
     completion_sealer: Arc<CompletionSealAuthority>,
+}
+struct LibsqlGcDeleteFence(Option<Transaction>);
+#[async_trait]
+impl GcDeleteFence for LibsqlGcDeleteFence {
+    async fn release(mut self: Box<Self>) -> Result<()> {
+        if let Some(tx) = self.0.take() {
+            tx.commit().await?;
+        }
+        Ok(())
+    }
 }
 
 impl LibsqlArtifactScheduler {
@@ -275,6 +286,68 @@ impl ArtifactSchedulerPersistence for LibsqlArtifactScheduler {
     fn completion_sealer(&self) -> Arc<CompletionSealAuthority> {
         self.completion_sealer.clone()
     }
+
+    async fn acquire_gc_sweep(&self, owner: &str, ttl: i64) -> Result<bool> {
+        validate_gc_sweep_args(owner, ttl)?;
+        let tx = self.tx().await?;
+        let result = async {
+            let t = now(&tx).await?;
+            let changed = exec(&tx,"INSERT INTO artifact_gc_sweep(id,owner,expires_at) VALUES(1,?,?) ON CONFLICT(id) DO UPDATE SET owner=excluded.owner,expires_at=excluded.expires_at WHERE artifact_gc_sweep.expires_at<=? OR artifact_gc_sweep.owner=excluded.owner",vec![owner.into(),(t+ttl).into(),t.into()]).await?;
+            Ok(changed == 1)
+        }.await;
+        finish(tx, result).await
+    }
+    async fn renew_gc_sweep(&self, owner: &str, ttl: i64) -> Result<bool> {
+        validate_gc_sweep_args(owner, ttl)?;
+        let tx = self.tx().await?;
+        let result = async {
+            let t = now(&tx).await?;
+            Ok(exec(
+                &tx,
+                "UPDATE artifact_gc_sweep SET expires_at=? WHERE id=1 AND owner=? AND expires_at>?",
+                vec![(t + ttl).into(), owner.into(), t.into()],
+            )
+            .await?
+                == 1)
+        }
+        .await;
+        finish(tx, result).await
+    }
+    async fn release_gc_sweep(&self, owner: &str) -> Result<()> {
+        validate_gc_sweep_args(owner, 1)?;
+        let tx = self.tx().await?;
+        let result = async {
+            exec(
+                &tx,
+                "DELETE FROM artifact_gc_sweep WHERE id=1 AND owner=?",
+                vec![owner.into()],
+            )
+            .await?;
+            Ok(())
+        }
+        .await;
+        finish(tx, result).await
+    }
+    async fn lock_gc_delete_batch(&self, owner: &str) -> Result<Box<dyn GcDeleteFence>> {
+        validate_gc_sweep_args(owner, 1)?;
+        let tx = self.tx().await?;
+        let t = now(&tx).await?;
+        let held = query_one(
+            &tx,
+            "SELECT owner,expires_at FROM artifact_gc_sweep WHERE id=1",
+            vec![],
+        )
+        .await?;
+        let valid = match held {
+            Some(row) => row.get::<String>(0)? == owner && row.get::<i64>(1)? > t,
+            None => false,
+        };
+        if !valid {
+            tx.rollback().await?;
+            bail!("remote GC does not own the live publication fence")
+        }
+        Ok(Box::new(LibsqlGcDeleteFence(Some(tx))))
+    }
     async fn register_transport_root(
         &self,
         root: &str,
@@ -286,6 +359,7 @@ impl ArtifactSchedulerPersistence for LibsqlArtifactScheduler {
         validate_transport_lease_identity(root, session, workspace, repo, ttl)?;
         let tx = self.tx().await?;
         let r: Result<()> = async {
+            ensure_gc_unfenced_libsql(&tx).await?;
             if one_i64(&tx, "SELECT count(*) FROM artifact_transport_leases WHERE session_id=? AND (workspace<>? OR repo<>?)", vec![session.into(), workspace.into(), repo.into()]).await? != 0 {
                 bail!("transport session is already bound to another repository")
             }
@@ -377,13 +451,19 @@ impl ArtifactSchedulerPersistence for LibsqlArtifactScheduler {
         }
         let c = self.conn().await?;
         let t = now(&c).await?;
+        let cursor = after_artifact_id.unwrap_or(0);
         let args: Vec<Value> = vec![
-            after_artifact_id.unwrap_or(0).into(),
+            cursor.into(),
+            (limit as i64).into(),
+            cursor.into(),
             t.into(),
+            (limit as i64).into(),
+            cursor.into(),
+            (limit as i64).into(),
             (limit as i64).into(),
         ];
         let mut rows = c.query(
-            "SELECT j.id,j.workspace,j.repo,j.commit_oid,j.kind,j.format_version,j.manifest FROM artifact_jobs j WHERE j.id>? AND j.state='ready' AND j.manifest IS NOT NULL AND length(trim(j.manifest))>0 AND (EXISTS(SELECT 1 FROM artifact_observations o WHERE o.published_artifact_id=j.id) OR EXISTS(SELECT 1 FROM artifact_consumers c WHERE c.artifact_id=j.id AND c.expires_at>?) OR EXISTS(SELECT 1 FROM artifact_base_retention r WHERE r.artifact_id=j.id)) ORDER BY j.id LIMIT ?",
+            "WITH candidates(id) AS (SELECT published_artifact_id FROM (SELECT published_artifact_id FROM artifact_observations WHERE published_artifact_id>? ORDER BY published_artifact_id LIMIT ?) UNION ALL SELECT artifact_id FROM (SELECT artifact_id FROM artifact_consumers WHERE artifact_id>? AND expires_at>? ORDER BY artifact_id LIMIT ?) UNION ALL SELECT artifact_id FROM (SELECT artifact_id FROM artifact_base_retention WHERE artifact_id>? ORDER BY artifact_id LIMIT ?)), page_ids(id) AS (SELECT DISTINCT id FROM candidates ORDER BY id LIMIT ?) SELECT j.id,j.workspace,j.repo,j.commit_oid,j.kind,j.format_version,j.manifest FROM page_ids p JOIN artifact_jobs j ON j.id=p.id WHERE j.state='ready' AND j.manifest IS NOT NULL AND length(trim(j.manifest))>0 ORDER BY j.id",
             args,
         ).await?;
         let mut out = Vec::new();
@@ -408,7 +488,11 @@ impl ArtifactSchedulerPersistence for LibsqlArtifactScheduler {
     async fn schedule(&self, key: &ArtifactKey) -> Result<ScheduleOutcome> {
         validate_format_version(key.format_version)?;
         let tx = self.tx().await?;
-        let r = self.schedule_in(&tx, key, true).await;
+        let r = async {
+            ensure_gc_unfenced_libsql(&tx).await?;
+            self.schedule_in(&tx, key, true).await
+        }
+        .await;
         finish(tx, r).await
     }
     async fn subscribe_consumer(
@@ -425,7 +509,7 @@ impl ArtifactSchedulerPersistence for LibsqlArtifactScheduler {
             bail!("consumer subscription TTL is invalid")
         }
         let tx = self.tx().await?;
-        let r=async{let out=self.schedule_in(&tx,key,true).await?;exec(&tx,"INSERT INTO artifact_consumers(artifact_id,consumer_id,expires_at) VALUES(?,?,?) ON CONFLICT(artifact_id,consumer_id) DO UPDATE SET expires_at=excluded.expires_at",vec![outcome_id(&out).into(),id.into(),(now(&tx).await?+ttl).into()]).await?;Ok(out)}.await;
+        let r=async{ensure_gc_unfenced_libsql(&tx).await?;let out=self.schedule_in(&tx,key,true).await?;exec(&tx,"INSERT INTO artifact_consumers(artifact_id,consumer_id,expires_at) VALUES(?,?,?) ON CONFLICT(artifact_id,consumer_id) DO UPDATE SET expires_at=excluded.expires_at",vec![outcome_id(&out).into(),id.into(),(now(&tx).await?+ttl).into()]).await?;Ok(out)}.await;
         finish(tx, r).await
     }
     async fn release_consumer(&self, aid: i64, id: &str) -> Result<()> {
@@ -454,6 +538,7 @@ impl ArtifactSchedulerPersistence for LibsqlArtifactScheduler {
         kinds.dedup();
         let tx = self.tx().await?;
         let result=async{
+   ensure_gc_unfenced_libsql(&tx).await?;
    let current=query_one(&tx,"SELECT generation,desired_commit FROM branch_observations WHERE workspace=? AND repo=? AND branch=?",vec![w.into(),r.into(),b.into()]).await?;
    let current_generation=current.as_ref().map(|row|row.get::<i64>(0)).transpose()?.map(|x|x as u64);
    let same_commit=current.as_ref().map(|row|row.get::<String>(1)).transpose()?.as_deref()==Some(c);
@@ -552,7 +637,7 @@ impl ArtifactSchedulerPersistence for LibsqlArtifactScheduler {
     ) -> Result<bool> {
         let e = self.completion_sealer.verify(c, verified)?;
         let tx = self.tx().await?;
-        let r=async{let t=now(&tx).await?;let won=exec(&tx,"UPDATE artifact_jobs SET state='ready',owner=NULL,heartbeat_at=NULL,lease_expires_at=NULL,manifest=?,error=NULL,failure_class=NULL,updated_at=? WHERE id=? AND state='running' AND owner=? AND lease_generation=? AND lease_expires_at>=?",vec![e.manifest().into(),t.into(),c.record.id.into(),o.into(),(c.record.lease_generation as i64).into(),t.into()]).await?==1;if won{exec(&tx,"UPDATE artifact_observations SET published_artifact_id=? WHERE desired_artifact_id=?",vec![c.record.id.into(),c.record.id.into()]).await?;refresh_base_retention(&tx,&c.record.key.workspace,&c.record.key.repo,c.record.key.format_version as i64).await?;}Ok(won)}.await;
+        let r=async{ensure_gc_unfenced_libsql(&tx).await?;let t=now(&tx).await?;let won=exec(&tx,"UPDATE artifact_jobs SET state='ready',owner=NULL,heartbeat_at=NULL,lease_expires_at=NULL,manifest=?,error=NULL,failure_class=NULL,updated_at=? WHERE id=? AND state='running' AND owner=? AND lease_generation=? AND lease_expires_at>=?",vec![e.manifest().into(),t.into(),c.record.id.into(),o.into(),(c.record.lease_generation as i64).into(),t.into()]).await?==1;if won{exec(&tx,"UPDATE artifact_observations SET published_artifact_id=? WHERE desired_artifact_id=?",vec![c.record.id.into(),c.record.id.into()]).await?;refresh_base_retention(&tx,&c.record.key.workspace,&c.record.key.repo,c.record.key.format_version as i64).await?;}Ok(won)}.await;
         finish(tx, r).await
     }
     async fn fail(
@@ -837,6 +922,7 @@ async fn validate_schema(c: &Connection) -> Result<()> {
                 "pair_rank",
             ],
         ),
+        ("artifact_gc_sweep", &["id", "owner", "expires_at"]),
         (
             "scheduler_state",
             &[
@@ -920,6 +1006,7 @@ async fn validate_schema(c: &Connection) -> Result<()> {
                 "check((head_rankisnullorhead_rankbetween1and8)and(pair_rankisnullorpair_rankbetween1and8)and(head_rankisnotnullorpair_rankisnotnull))",
             ],
         ),
+        ("artifact_gc_sweep", &["check(id=1)"]),
         (
             "scheduler_state",
             &["check(id=1)", "check(fairness_cursorbetween0and3)"],
@@ -1146,6 +1233,26 @@ async fn exec(c: &Connection, sql: &str, p: Vec<Value>) -> Result<u64> {
 async fn now(c: &Connection) -> Result<i64> {
     one_i64(c, "SELECT unixepoch()", vec![]).await
 }
+fn validate_gc_sweep_args(owner: &str, ttl: i64) -> Result<()> {
+    if owner.trim().is_empty() || owner.len() > 200 || !(1..=600).contains(&ttl) {
+        bail!("GC sweep owner or TTL is invalid")
+    }
+    Ok(())
+}
+async fn ensure_gc_unfenced_libsql(c: &Connection) -> Result<()> {
+    let t = now(c).await?;
+    if one_i64(
+        c,
+        "SELECT count(*) FROM artifact_gc_sweep WHERE id=1 AND expires_at>?",
+        vec![t.into()],
+    )
+    .await?
+        != 0
+    {
+        bail!("artifact publication is temporarily fenced by remote GC")
+    }
+    Ok(())
+}
 async fn finish<T>(tx: Transaction, r: Result<T>) -> Result<T> {
     match r {
         Ok(v) => {
@@ -1361,6 +1468,24 @@ mod tests {
         let Some(s) = server().await else { return };
         let a = scheduler(&s.url, Default::default()).await;
         let b = scheduler(&s.url, Default::default()).await;
+        assert!(a.acquire_gc_sweep("collector", 60).await.unwrap());
+        assert!(!b.acquire_gc_sweep("other", 60).await.unwrap());
+        let delete_fence = a.lock_gc_delete_batch("collector").await.unwrap();
+        let blocked = {
+            let b = b.clone();
+            tokio::spawn(async move {
+                b.register_transport_root(&"f".repeat(64), &"e".repeat(64), "ws", "owner/repo", 60)
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !blocked.is_finished(),
+            "libsql publication bypassed delete transaction lock"
+        );
+        delete_fence.release().await.unwrap();
+        assert!(blocked.await.unwrap().is_err());
+        a.release_gc_sweep("collector").await.unwrap();
         let root0 = format!("{:064x}", 1);
         let root1 = format!("{:064x}", 2);
         let session0 = format!("{:064x}", 10_001);

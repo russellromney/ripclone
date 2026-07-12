@@ -8,6 +8,10 @@ use crate::artifact_scheduler::{ArtifactKind, ArtifactRecord, ArtifactState};
 use crate::topup::{
     PinnedBundleRequest, TopUpMode, VerifiedPinnedBundle, pinned_bundle_semantic_digest,
 };
+
+fn new_transport_session() -> String {
+    hex::encode(rand::random::<[u8; 32]>())
+}
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
@@ -87,6 +91,9 @@ pub struct VerifiedTopUpReceipt {
 }
 
 impl VerifiedTopUpReceipt {
+    pub(crate) fn transport_request(&self) -> &PinnedBundleRequest {
+        &self.request
+    }
     #[allow(dead_code)] // production bundle-plan wiring lands in the cutover wave
     pub(crate) fn from_verified(bundle: &VerifiedPinnedBundle) -> Result<Self> {
         validate_manifest(&bundle.manifest_hash, "pinned bundle")?;
@@ -107,7 +114,7 @@ impl VerifiedTopUpReceipt {
         Ok(Self {
             request: PinnedBundleRequest {
                 manifest_hash: bundle.manifest_hash.clone(),
-                transport_session: hex::encode(rand::random::<[u8; 32]>()),
+                transport_session: new_transport_session(),
                 format_version: bundle.bundle.format_version,
                 workspace_id: bundle.bundle.workspace_id.clone(),
                 repo_path: bundle.bundle.repo_path.clone(),
@@ -150,14 +157,17 @@ pub struct ClonePlanningInput<'a> {
 pub enum ClonePayload {
     FilesArchive {
         manifest: String,
+        transport_session: String,
     },
     HeadArtifact {
         manifest: String,
         discard_git: bool,
+        transport_session: String,
     },
     FullArtifacts {
         head_manifest: String,
         history_manifest: String,
+        transport_session: String,
     },
     PinnedBundle {
         request: PinnedBundleRequest,
@@ -202,12 +212,14 @@ pub fn plan_clone(input: ClonePlanningInput<'_>) -> Result<ClonePlan> {
                 validate_exact(files, &input, ArtifactKind::Files)?;
                 ready(ClonePayload::FilesArchive {
                     manifest: files.manifest.clone(),
+                    transport_session: new_transport_session(),
                 })
             } else if let Some(head) = &input.exact.head {
                 validate_exact(head, &input, ArtifactKind::Head)?;
                 ready(ClonePayload::HeadArtifact {
                     manifest: head.manifest.clone(),
                     discard_git: true,
+                    transport_session: new_transport_session(),
                 })
             } else if let Some(bundle) = input.top_up {
                 validate_top_up(bundle, &input, TopUpMode::Head)?;
@@ -230,6 +242,7 @@ pub fn plan_clone(input: ClonePlanningInput<'_>) -> Result<ClonePlan> {
                 ready(ClonePayload::HeadArtifact {
                     manifest: head.manifest.clone(),
                     discard_git: false,
+                    transport_session: new_transport_session(),
                 })
             } else if let Some(bundle) = input.top_up {
                 validate_top_up(bundle, &input, TopUpMode::Head)?;
@@ -265,6 +278,7 @@ pub fn plan_clone(input: ClonePlanningInput<'_>) -> Result<ClonePlan> {
                 ready(ClonePayload::FullArtifacts {
                     head_manifest: head.manifest.clone(),
                     history_manifest: history.manifest.clone(),
+                    transport_session: new_transport_session(),
                 })
             } else if let Some(bundle) = input.top_up {
                 validate_top_up(bundle, &input, TopUpMode::Full)?;
@@ -843,7 +857,9 @@ mod tests {
         .unwrap();
         let ClonePlan::Ready {
             target_commit,
-            payload: ClonePayload::PinnedBundle { request: planned, .. },
+            payload: ClonePayload::PinnedBundle {
+                request: planned, ..
+            },
         } = plan
         else {
             panic!("generated verified bundle did not produce a pinned plan")
@@ -857,8 +873,11 @@ mod tests {
         assert_eq!(planned.branch, request.branch);
         assert_eq!(planned.mode, request.mode);
         assert_eq!(planned.transport_session.len(), 64);
-        assert!(planned.transport_session.bytes().all(|byte| {
-            byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
-        }));
+        assert!(
+            planned
+                .transport_session
+                .bytes()
+                .all(|byte| { byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte) })
+        );
     }
 }
