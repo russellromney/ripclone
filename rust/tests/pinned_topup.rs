@@ -2,7 +2,7 @@ use anyhow::{Result, bail};
 use ripclone::topup::{
     BundleInstallFailure, PinnedArtifactDescriptor, PinnedArtifactKind, PinnedBundleInstaller,
     PinnedBundleRequest, PinnedTopUpBundle, TopUpMode, VerifiedPinnedBundle, install_pinned_bundle,
-    pinned_bundle_semantic_digest,
+    install_pinned_bundle_discard_git, pinned_bundle_semantic_digest,
 };
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -216,6 +216,32 @@ fn full_bundle_installs_exact_target_after_upstream_advances() {
         out(&destination, &["rev-parse", "refs/remotes/origin/main"]),
         target
     );
+}
+
+#[test]
+fn files_top_up_discards_git_before_atomic_publication() {
+    let f = Fixture::new();
+    let base = f.commit("base", "base");
+    let target = f.commit("target", "target");
+    let artifact = f.artifact();
+    let plan = bundle(&base, &target, TopUpMode::Head);
+    let request = request(&plan);
+    let install = installer(&artifact);
+    let bound = BoundInstaller {
+        inner: &install,
+        bundle: plan,
+        digest_bundle: None,
+    };
+    let root = tempfile::tempdir().unwrap();
+    let destination = root.path().join("files");
+    install_pinned_bundle_discard_git(&destination, &request, &bound).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(destination.join("target")).unwrap(),
+        "target"
+    );
+    assert!(std::fs::symlink_metadata(destination.join(".git")).is_err());
+    assert!(!destination.join(".git/config").exists());
+    assert!(!destination.join(".git/hooks").exists());
 }
 
 #[test]

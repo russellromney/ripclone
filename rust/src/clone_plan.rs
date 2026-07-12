@@ -140,6 +140,20 @@ pub struct ExactArtifacts {
     pub files: Option<VerifiedArtifactReceipt>,
 }
 
+/// Request identity retained after the authenticated wire envelope is decoded.
+/// Exact artifact roots do not contain a branch, so dropping this information
+/// would make it impossible for the installer to create the requested ref
+/// without trusting caller-supplied metadata a second time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExactCloneBinding {
+    pub(crate) workspace: String,
+    pub(crate) repo: String,
+    pub(crate) branch: String,
+    pub(crate) mode: SyncMode,
+    pub(crate) target_commit: String,
+    pub(crate) artifact_format_version: u32,
+}
+
 #[derive(Debug, Clone)]
 pub struct ClonePlanningInput<'a> {
     pub availability: RepositoryAvailability,
@@ -158,16 +172,19 @@ pub enum ClonePayload {
     FilesArchive {
         manifest: String,
         transport_session: String,
+        binding: ExactCloneBinding,
     },
     HeadArtifact {
         manifest: String,
         discard_git: bool,
         transport_session: String,
+        binding: ExactCloneBinding,
     },
     FullArtifacts {
         head_manifest: String,
         history_manifest: String,
         transport_session: String,
+        binding: ExactCloneBinding,
     },
     PinnedBundle {
         request: PinnedBundleRequest,
@@ -201,6 +218,14 @@ pub fn plan_clone(input: ClonePlanningInput<'_>) -> Result<ClonePlan> {
         RepositoryAvailability::Active => {}
     }
     validate_request_identity(&input)?;
+    let binding = || ExactCloneBinding {
+        workspace: input.workspace.to_owned(),
+        repo: input.repo.to_owned(),
+        branch: input.branch.to_owned(),
+        mode: input.mode,
+        target_commit: input.target_commit.to_owned(),
+        artifact_format_version: input.artifact_format_version,
+    };
     let ready = |payload| ClonePlan::Ready {
         target_commit: input.target_commit.to_owned(),
         payload,
@@ -213,6 +238,7 @@ pub fn plan_clone(input: ClonePlanningInput<'_>) -> Result<ClonePlan> {
                 ready(ClonePayload::FilesArchive {
                     manifest: files.manifest.clone(),
                     transport_session: new_transport_session(),
+                    binding: binding(),
                 })
             } else if let Some(head) = &input.exact.head {
                 validate_exact(head, &input, ArtifactKind::Head)?;
@@ -220,6 +246,7 @@ pub fn plan_clone(input: ClonePlanningInput<'_>) -> Result<ClonePlan> {
                     manifest: head.manifest.clone(),
                     discard_git: true,
                     transport_session: new_transport_session(),
+                    binding: binding(),
                 })
             } else if let Some(bundle) = input.top_up {
                 validate_top_up(bundle, &input, TopUpMode::Head)?;
@@ -243,6 +270,7 @@ pub fn plan_clone(input: ClonePlanningInput<'_>) -> Result<ClonePlan> {
                     manifest: head.manifest.clone(),
                     discard_git: false,
                     transport_session: new_transport_session(),
+                    binding: binding(),
                 })
             } else if let Some(bundle) = input.top_up {
                 validate_top_up(bundle, &input, TopUpMode::Head)?;
@@ -279,6 +307,7 @@ pub fn plan_clone(input: ClonePlanningInput<'_>) -> Result<ClonePlan> {
                     head_manifest: head.manifest.clone(),
                     history_manifest: history.manifest.clone(),
                     transport_session: new_transport_session(),
+                    binding: binding(),
                 })
             } else if let Some(bundle) = input.top_up {
                 validate_top_up(bundle, &input, TopUpMode::Full)?;

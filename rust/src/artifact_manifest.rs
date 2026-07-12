@@ -19,9 +19,10 @@ use sha1::{Digest as _, Sha1};
 use sha2::Sha256;
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::{cell::RefCell, time::Duration};
+use unicode_normalization::UnicodeNormalization;
 
 thread_local! {
     static VERIFICATION_CANCEL: RefCell<Option<tokio_util::sync::CancellationToken>> = const { RefCell::new(None) };
@@ -1430,6 +1431,16 @@ pub struct CasCompletionVerifier {
     level_scanned_hashes: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 }
 
+/// One-shot local capability produced only after a request-bound transport
+/// root and every delegated object have been independently reverified. It is
+/// deliberately not serializable or cloneable and grants no publication
+/// authority.
+pub struct VerifiedTransportArtifact {
+    manifest_hash: String,
+    manifest: ArtifactManifest,
+    cas_root: PathBuf,
+}
+
 impl CasCompletionVerifier {
     pub fn new(cas: Cas) -> Self {
         let storage = crate::storage::local(cas.root())
@@ -1452,6 +1463,343 @@ impl CasCompletionVerifier {
             #[cfg(test)]
             level_scanned_hashes: Default::default(),
         }
+    }
+
+    pub fn verify_transport_artifact(
+        &self,
+        key: &ArtifactKey,
+        manifest_hash: &str,
+    ) -> Result<VerifiedTransportArtifact> {
+        Cas::validate_artifact_id(manifest_hash)?;
+        let bytes = self.read_hash_bounded(
+            manifest_hash,
+            self.limits.manifest_bytes,
+            "transport artifact manifest",
+        )?;
+        let manifest = ArtifactManifest::validate_envelope_bytes(&bytes)?;
+        if !manifest.key.matches(key) {
+            bail!("transport artifact root does not match exact request identity");
+        }
+        match &manifest.payload {
+            ArtifactPayload::Head(head) => self.verify_head(&key.commit, head)?,
+            ArtifactPayload::Files(files) => self.verify_files(&key.commit, files)?,
+            ArtifactPayload::FullHistory(history) => {
+                self.verify_transport_full_history(&key.commit, history)?
+            }
+        }
+        Ok(VerifiedTransportArtifact {
+            manifest_hash: manifest_hash.to_owned(),
+            manifest,
+            cas_root: self.cas.root().canonicalize()?,
+        })
+    }
+
+    fn verify_transport_full_history(
+        &self,
+        commit: &str,
+        history: &FullHistoryArtifact,
+    ) -> Result<()> {
+        let commit_bytes = self.read_small_blob(
+            &history.target_commit_object,
+            self.limits.commit_bytes,
+            "history commit anchor",
+        )?;
+        let parsed = parse_exact_commit(commit, &commit_bytes)?;
+        if parsed.parents.is_empty() {
+            if !history.levels.is_empty() {
+                bail!("root commit history must be empty");
+            }
+            return Ok(());
+        }
+        if history.levels.is_empty() || history.levels.len() > self.limits.packs {
+            bail!("non-root commit history has an invalid level count");
+        }
+        let mut expected_tips = parsed.parents;
+        expected_tips.sort();
+        expected_tips.dedup();
+        let mut previous_tips: Option<&[String]> = None;
+        let mut previous_tier = FULL_HISTORY_BASE_TIER + 1;
+        let mut total_packs = 0u64;
+        let mut seen = HashSet::new();
+        for (index, level) in history.levels.iter().enumerate() {
+            validate_canonical_oids(&level.tips, "history level tips")?;
+            validate_canonical_oids(&level.base_exclusive, "history level exclusions")?;
+            if level.tips.is_empty()
+                || (index == 0
+                    && (level.tier != FULL_HISTORY_BASE_TIER || !level.base_exclusive.is_empty()))
+                || (index > 0
+                    && (level.tier >= previous_tier
+                        || level.tier >= FULL_HISTORY_BASE_TIER
+                        || Some(level.base_exclusive.as_slice()) != previous_tips))
+            {
+                bail!("history transport levels are not canonical and adjacent");
+            }
+            self.validate_transport_history_level_receipt(level)?;
+            let nested = self.read_history_level_manifest(level)?;
+            total_packs = total_packs
+                .checked_add(nested.packs.len() as u64)
+                .context("history transport pack count overflow")?;
+            if total_packs > self.limits.packs as u64 {
+                bail!("history transport graph contains too many packs");
+            }
+            for pair in nested.packs {
+                for blob in [pair.pack, pair.index] {
+                    if !seen.insert(blob.hash) {
+                        bail!("history transport graph repeats a pack descriptor");
+                    }
+                }
+            }
+            previous_tips = Some(level.tips.as_slice());
+            previous_tier = level.tier;
+        }
+        if history.levels.last().map(|level| level.tips.as_slice())
+            != Some(expected_tips.as_slice())
+        {
+            bail!("history levels do not terminate at the target parents");
+        }
+        Ok(())
+    }
+
+    fn consume_transport_capability(
+        &self,
+        capability: VerifiedTransportArtifact,
+    ) -> Result<(String, ArtifactManifest)> {
+        if self.cas.root().canonicalize()? != capability.cas_root {
+            bail!("transport artifact capability belongs to another CAS");
+        }
+        if self.cas.verify_object(&capability.manifest_hash)? == 0 {
+            bail!("transport artifact root disappeared after verification");
+        }
+        Ok((capability.manifest_hash, capability.manifest))
+    }
+
+    /// Materialize only verified pack/index bytes and the verified target index.
+    /// Git refs/config/checkout are deliberately created by the outer staging
+    /// transaction after this method returns.
+    pub fn materialize_transport_git(
+        &self,
+        head: VerifiedTransportArtifact,
+        history: Option<VerifiedTransportArtifact>,
+        destination: &Path,
+    ) -> Result<(String, Option<String>)> {
+        let (head_root, head_manifest) = self.consume_transport_capability(head)?;
+        let ArtifactPayload::Head(head) = head_manifest.payload else {
+            bail!("Head installer received a non-Head transport capability");
+        };
+        let mut packs = head.packs.clone();
+        let history_root = if let Some(history) = history {
+            let (root, history_manifest) = self.consume_transport_capability(history)?;
+            if history_manifest.key.workspace != head_manifest.key.workspace
+                || history_manifest.key.repo != head_manifest.key.repo
+                || history_manifest.key.commit != head_manifest.key.commit
+                || history_manifest.key.format_version != head_manifest.key.format_version
+            {
+                bail!("Head and FullHistory capabilities have different identities");
+            }
+            let ArtifactPayload::FullHistory(history) = history_manifest.payload else {
+                bail!("Full installer received a non-history transport capability");
+            };
+            let mut seen = packs
+                .iter()
+                .map(|pair| (pair.pack.hash.clone(), pair.index.hash.clone()))
+                .collect::<HashSet<_>>();
+            for level in &history.levels {
+                for pair in self.read_history_level_manifest(level)?.packs {
+                    if seen.insert((pair.pack.hash.clone(), pair.index.hash.clone())) {
+                        packs.push(pair);
+                    }
+                }
+            }
+            Some(root)
+        } else {
+            None
+        };
+        // Each advertised pair must stand alone. Verifying only the combined
+        // directory would let a thin/cross-pack delta smuggle an undeclared
+        // dependency through another pair.
+        for pair in &packs {
+            self.materialize_packs(std::slice::from_ref(pair))?;
+        }
+        let verified_repo = self.materialize_packs(&packs)?;
+        crate::git::init(destination)?;
+        let source_pack = verified_repo.path().join(".git/objects/pack");
+        let target_pack = destination.join(".git/objects/pack");
+        for entry in std::fs::read_dir(source_pack)? {
+            let entry = entry?;
+            let metadata = entry.metadata()?;
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                bail!("verified pack staging contains a non-file entry");
+            }
+            let target = target_pack.join(entry.file_name());
+            let mut input = std::fs::File::open(entry.path())?;
+            let mut output = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(target)?;
+            std::io::copy(&mut input, &mut output)?;
+            output.sync_all()?;
+        }
+        self.stream_blob_to(
+            &head.prebuilt_index,
+            self.limits.pack_index_bytes,
+            "Head prebuilt index",
+            &destination.join(".git/index"),
+        )?;
+        Ok((head_root, history_root))
+    }
+
+    /// Reconstruct an exact Files artifact into an already-private empty
+    /// directory. No Git administrative state is copied to the result.
+    pub fn materialize_transport_files(
+        &self,
+        capability: VerifiedTransportArtifact,
+        destination: &Path,
+    ) -> Result<String> {
+        let (root, manifest) = self.consume_transport_capability(capability)?;
+        let ArtifactPayload::Files(files) = manifest.payload else {
+            bail!("Files installer received a non-Files transport capability");
+        };
+        if std::fs::symlink_metadata(destination).is_ok() {
+            bail!("Files staging destination already exists");
+        }
+        std::fs::create_dir(destination)?;
+        let scratch = verification_tempdir()?;
+        let chunk_dir = scratch.path().join("chunks");
+        std::fs::create_dir(&chunk_dir)?;
+        for (index, chunk) in files.archive_chunks.iter().enumerate() {
+            self.stream_blob_to(
+                chunk,
+                self.limits.archive_chunk_bytes,
+                "Files archive chunk",
+                &chunk_dir.join(index.to_string()),
+            )?;
+        }
+        let metadata_bytes = self.read_small_blob(
+            &files.metadata,
+            self.limits.metadata_bytes,
+            "Files metadata",
+        )?;
+        preflight_metadata_counts(&metadata_bytes, &self.limits)?;
+        let metadata = MetadataChunk::decode(metadata_bytes.as_slice())?;
+        let dictionary = files
+            .zstd_dictionary
+            .as_ref()
+            .map(|blob| {
+                self.read_small_blob(blob, self.limits.dictionary_bytes, "Files dictionary")
+            })
+            .transpose()?;
+        let verification_repo = scratch.path().join("repo");
+        std::fs::create_dir(&verification_repo)?;
+        git(&verification_repo, &["init", "--quiet"])?;
+        reconstruct_files_to_index(
+            &metadata,
+            &chunk_dir,
+            dictionary.as_deref(),
+            &files.gitlinks,
+            &verification_repo,
+            &self.limits,
+        )?;
+        let source_files = scratch.path().join("files");
+        let file_paths = metadata
+            .files
+            .iter()
+            .map(|entry| crate::fsutil::path_from_bytes(&entry.path).to_path_buf())
+            .collect::<HashSet<_>>();
+        for path in &file_paths {
+            let mut parent = path.parent();
+            while let Some(value) = parent.filter(|value| !value.as_os_str().is_empty()) {
+                if file_paths.contains(value) {
+                    bail!("Files artifact contains a path-prefix collision");
+                }
+                parent = value.parent();
+            }
+        }
+        let mut collision_keys = HashSet::with_capacity(metadata.files.len());
+        let mut symlinks = Vec::new();
+        for (index, entry) in metadata.files.iter().enumerate() {
+            validate_artifact_path(&entry.path)?;
+            if !matches!(entry.mode, 0o100644 | 0o100755 | 0o120000) {
+                bail!("Files artifact contains an unsupported worktree mode");
+            }
+            let relative = crate::fsutil::path_from_bytes(&entry.path);
+            let collision_key = relative
+                .to_string_lossy()
+                .nfc()
+                .flat_map(char::to_lowercase)
+                .collect::<String>();
+            if !collision_keys.insert(collision_key) {
+                bail!("Files artifact contains a case/Unicode-colliding path");
+            }
+            let target = destination.join(relative);
+            create_physical_parents(destination, relative)?;
+            if entry.mode == 0o120000 {
+                symlinks.push((index, target));
+                continue;
+            }
+            let mut input = std::fs::File::open(source_files.join(index.to_string()))?;
+            let mut output = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&target)
+                .with_context(|| format!("create exact Files path {}", target.display()))?;
+            std::io::copy(&mut input, &mut output)?;
+            output.sync_all()?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = if entry.mode == 0o100755 { 0o755 } else { 0o644 };
+                std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode))?;
+            }
+        }
+        for (index, target) in symlinks {
+            let bytes = std::fs::read(source_files.join(index.to_string()))?;
+            create_worktree_symlink(&bytes, &target)?;
+        }
+        if std::fs::symlink_metadata(destination.join(".git")).is_ok() {
+            bail!("Files materialization produced Git administrative state");
+        }
+        let mut materialized_entries = 0usize;
+        for entry in walkdir::WalkDir::new(destination).follow_links(false) {
+            if !entry?.file_type().is_dir() {
+                materialized_entries += 1;
+            }
+        }
+        if materialized_entries != metadata.files.len() {
+            bail!("Files materialization produced an inexact path inventory");
+        }
+        for entry in &metadata.files {
+            let path = destination.join(crate::fsutil::path_from_bytes(&entry.path));
+            let metadata = std::fs::symlink_metadata(&path)?;
+            let bytes = if entry.mode == 0o120000 {
+                if !metadata.file_type().is_symlink() {
+                    bail!("Files materialization changed a symlink entry type");
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::ffi::OsStrExt;
+                    std::fs::read_link(&path)?.as_os_str().as_bytes().to_vec()
+                }
+                #[cfg(not(unix))]
+                unreachable!("symlink materialization already failed on this platform")
+            } else {
+                if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+                    bail!("Files materialization changed a regular entry type");
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let executable = metadata.permissions().mode() & 0o111 != 0;
+                    if executable != (entry.mode == 0o100755) {
+                        bail!("Files materialization changed executable mode");
+                    }
+                }
+                std::fs::read(&path)?
+            };
+            if hex::decode(git_object_oid("blob", &bytes))? != entry.blob_sha1 {
+                bail!("Files materialization content inventory mismatch");
+            }
+        }
+        Ok(root)
     }
 
     /// Production constructor: normalized scheduling must fail readiness when
@@ -1715,6 +2063,29 @@ impl CasCompletionVerifier {
         manifest: &ArtifactManifest,
         load_level: &mut dyn FnMut(&CasBlob) -> Result<Vec<u8>>,
     ) -> Result<Vec<CasBlob>> {
+        self.referenced_blobs_from_authenticated_root(manifest, load_level, true)
+    }
+
+    /// Expand a manifest whose root hash was authenticated by a request-bound
+    /// transport capability. The server-only history seal is intentionally not
+    /// re-evaluated here: clients do not possess that secret. The immutable root
+    /// authenticates the receipt bytes, while every nested manifest and child is
+    /// still hash/length checked and the installed Git closure is independently
+    /// verified before publication.
+    pub fn transport_referenced_blobs(
+        &self,
+        manifest: &ArtifactManifest,
+        load_level: &mut dyn FnMut(&CasBlob) -> Result<Vec<u8>>,
+    ) -> Result<Vec<CasBlob>> {
+        self.referenced_blobs_from_authenticated_root(manifest, load_level, false)
+    }
+
+    fn referenced_blobs_from_authenticated_root(
+        &self,
+        manifest: &ArtifactManifest,
+        load_level: &mut dyn FnMut(&CasBlob) -> Result<Vec<u8>>,
+        verify_server_seal: bool,
+    ) -> Result<Vec<CasBlob>> {
         manifest.validate_envelope()?;
         let mut blobs = Vec::new();
         let mut seen = HashSet::new();
@@ -1735,7 +2106,11 @@ impl CasCompletionVerifier {
                 let mut pack_count = 0u64;
                 let mut pack_bytes = 0u64;
                 for level in &history.levels {
-                    self.verify_history_level_receipt(level)?;
+                    if verify_server_seal {
+                        self.verify_history_level_receipt(level)?;
+                    } else {
+                        self.validate_transport_history_level_receipt(level)?;
+                    }
                     push(level.level_manifest.clone())?;
                     let bytes = load_level(&level.level_manifest)?;
                     if bytes.len() as u64 != level.level_manifest.len
@@ -1775,6 +2150,24 @@ impl CasCompletionVerifier {
             }
         }
         Ok(blobs)
+    }
+
+    fn validate_transport_history_level_receipt(&self, level: &FullHistoryLevel) -> Result<()> {
+        if level.proof.verifier.is_empty()
+            || Cas::validate_object_id(&level.proof.origin_commit).is_err()
+            || level.proof.pack_count == 0
+            || level.proof.pack_bytes == 0
+            || level.proof.object_count == 0
+            || !is_sha256(&level.proof.object_set_digest)
+            || !is_sha256(&level.proof.seal)
+        {
+            bail!("history level proof envelope is invalid");
+        }
+        Cas::validate_artifact_id(&level.level_manifest.hash)?;
+        if level.level_manifest.len == 0 || level.level_manifest.len > self.limits.manifest_bytes {
+            bail!("history level manifest descriptor is invalid");
+        }
+        Ok(())
     }
 
     fn verify_history_level_receipt(&self, level: &FullHistoryLevel) -> Result<()> {
@@ -3045,6 +3438,9 @@ fn reconstruct_files_to_index(
     let mut paths = HashSet::<Vec<u8>>::with_capacity(metadata.files.len() + gitlinks.len());
     for (file_index, entry) in metadata.files.iter().enumerate() {
         validate_artifact_path(&entry.path)?;
+        if !matches!(entry.mode, 0o100644 | 0o100755 | 0o120000) {
+            bail!("Files metadata contains an unsupported worktree mode");
+        }
         if !paths.insert(entry.path.clone()) {
             bail!("Files artifact contains duplicate paths");
         }
@@ -3099,6 +3495,48 @@ fn validate_artifact_path(bytes: &[u8]) -> Result<()> {
         bail!("Files artifact path enters Git administrative namespace");
     }
     Ok(())
+}
+
+fn create_physical_parents(root: &Path, relative: &Path) -> Result<()> {
+    let mut current = root.to_path_buf();
+    let parent = relative
+        .parent()
+        .context("Files artifact path has no parent")?;
+    for component in parent.components() {
+        let std::path::Component::Normal(name) = component else {
+            bail!("Files artifact parent path is not relative and normalized");
+        };
+        current.push(name);
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+                    bail!("Files artifact parent is not a physical directory");
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&current)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+fn create_worktree_symlink(bytes: &[u8], target: &Path) -> Result<()> {
+    if bytes.is_empty() || bytes.contains(&0) || bytes.len() > 1024 * 1024 {
+        bail!("Files symlink target is empty, contains NUL, or exceeds limit");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(bytes), target)?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (bytes, target);
+        bail!("safe Files symlink installation is unsupported on this platform");
+    }
 }
 
 fn open_file_range(path: &Path, start: u64, len: u64) -> Result<std::io::Take<std::fs::File>> {
@@ -3980,6 +4418,94 @@ mod tests {
                 .verify_publication(&foreign, evidence.manifest())
                 .is_err()
         );
+    }
+
+    #[test]
+    fn transport_capabilities_materialize_exact_files_and_complete_git_objects() {
+        let f = Fixture::new();
+        let verifier = CasCompletionVerifier::new(f.cas.clone());
+        let files = f.files();
+        let files_evidence = files.store(&f.cas).unwrap();
+        verifier
+            .transport_referenced_blobs(&files, &mut |blob| f.cas.get(&blob.hash))
+            .unwrap();
+        let files_capability = verifier
+            .verify_transport_artifact(files_evidence.key(), files_evidence.manifest())
+            .unwrap();
+        let files_parent = tempfile::tempdir().unwrap();
+        let files_destination = files_parent.path().join("files");
+        verifier
+            .materialize_transport_files(files_capability, &files_destination)
+            .unwrap();
+        assert_eq!(fs::read(files_destination.join("a.txt")).unwrap(), b"two\n");
+        assert_eq!(
+            fs::read(files_destination.join("run.sh")).unwrap(),
+            b"#!/bin/sh\nexit 0\n"
+        );
+        assert!(fs::symlink_metadata(files_destination.join(".git")).is_err());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_ne!(
+                fs::metadata(files_destination.join("run.sh"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o111,
+                0
+            );
+        }
+
+        let head = f.head();
+        let head_evidence = head.store(&f.cas).unwrap();
+        let history = f.history();
+        let history_evidence = history.store(&f.cas).unwrap();
+        verifier
+            .transport_referenced_blobs(&history, &mut |blob| f.cas.get(&blob.hash))
+            .unwrap();
+        let head_capability = verifier
+            .verify_transport_artifact(head_evidence.key(), head_evidence.manifest())
+            .unwrap();
+        let history_capability = verifier
+            .verify_transport_artifact(history_evidence.key(), history_evidence.manifest())
+            .unwrap();
+        let git_parent = tempfile::tempdir().unwrap();
+        let git_destination = git_parent.path().join("repo");
+        verifier
+            .materialize_transport_git(head_capability, Some(history_capability), &git_destination)
+            .unwrap();
+        fs::write(git_destination.join(".git/HEAD"), format!("{}\n", f.second)).unwrap();
+        assert_eq!(
+            git(&git_destination, &["rev-list", "--count", "HEAD"]).unwrap(),
+            "2"
+        );
+        git(
+            &git_destination,
+            &["fsck", "--connectivity-only", "--no-dangling", &f.second],
+        )
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn files_parent_creation_never_traverses_a_symlink() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("escape")).unwrap();
+        assert!(create_physical_parents(root.path(), Path::new("escape/file")).is_err());
+        assert!(!outside.path().join("file").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn files_symlink_preserves_repository_data_without_traversing_it() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let link = root.path().join("link");
+        create_worktree_symlink(outside.path().as_os_str().as_encoded_bytes(), &link).unwrap();
+        assert_eq!(fs::read_link(&link).unwrap(), outside.path());
+        assert!(fs::read_dir(outside.path()).unwrap().next().is_none());
+        assert!(create_worktree_symlink(b"bad\0target", &root.path().join("bad")).is_err());
     }
 
     #[test]

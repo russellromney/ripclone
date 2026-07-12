@@ -5,7 +5,7 @@
 //! validated before a client may dispatch to an installer.
 
 use crate::artifact_scheduler::ArtifactKind;
-use crate::clone_plan::{ClonePayload, ClonePlan, SyncMode};
+use crate::clone_plan::{ClonePayload, ClonePlan, ExactCloneBinding, SyncMode};
 use crate::topup::{PinnedBundleRequest, TopUpMode};
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -282,6 +282,7 @@ impl From<ClonePayload> for ClonePlanPayload {
             ClonePayload::FilesArchive {
                 manifest,
                 transport_session,
+                ..
             } => Self::FilesArchive {
                 manifest,
                 transport_session,
@@ -290,6 +291,7 @@ impl From<ClonePayload> for ClonePlanPayload {
                 manifest,
                 discard_git,
                 transport_session,
+                ..
             } => Self::HeadArtifact {
                 manifest,
                 discard_git,
@@ -299,6 +301,7 @@ impl From<ClonePayload> for ClonePlanPayload {
                 head_manifest,
                 history_manifest,
                 transport_session,
+                ..
             } => Self::FullArtifacts {
                 head_manifest,
                 history_manifest,
@@ -370,6 +373,14 @@ fn validate_payload(
             ClonePayload::FilesArchive {
                 manifest: manifest.clone(),
                 transport_session: transport_session.clone(),
+                binding: ExactCloneBinding {
+                    workspace: workspace.to_owned(),
+                    repo: repo.to_owned(),
+                    branch: branch.to_owned(),
+                    mode: request_mode,
+                    target_commit: target.to_owned(),
+                    artifact_format_version: CLONE_ARTIFACT_FORMAT_VERSION,
+                },
             }
         }
         ClonePlanPayload::HeadArtifact {
@@ -385,6 +396,14 @@ fn validate_payload(
                 manifest: manifest.clone(),
                 discard_git: *discard_git,
                 transport_session: transport_session.clone(),
+                binding: ExactCloneBinding {
+                    workspace: workspace.to_owned(),
+                    repo: repo.to_owned(),
+                    branch: branch.to_owned(),
+                    mode: request_mode,
+                    target_commit: target.to_owned(),
+                    artifact_format_version: CLONE_ARTIFACT_FORMAT_VERSION,
+                },
             }
         }
         ClonePlanPayload::FullArtifacts {
@@ -402,6 +421,14 @@ fn validate_payload(
                 head_manifest: head_manifest.clone(),
                 history_manifest: history_manifest.clone(),
                 transport_session: transport_session.clone(),
+                binding: ExactCloneBinding {
+                    workspace: workspace.to_owned(),
+                    repo: repo.to_owned(),
+                    branch: branch.to_owned(),
+                    mode: request_mode,
+                    target_commit: target.to_owned(),
+                    artifact_format_version: CLONE_ARTIFACT_FORMAT_VERSION,
+                },
             }
         }
         ClonePlanPayload::PinnedBundle {
@@ -532,6 +559,17 @@ mod tests {
         }
     }
 
+    fn binding(mode: SyncMode) -> ExactCloneBinding {
+        ExactCloneBinding {
+            workspace: "acme".into(),
+            repo: "org/repo".into(),
+            branch: "main".into(),
+            mode,
+            target_commit: TARGET.into(),
+            artifact_format_version: CLONE_ARTIFACT_FORMAT_VERSION,
+        }
+    }
+
     fn bundle_request(mode: TopUpMode) -> PinnedBundleRequest {
         PinnedBundleRequest {
             manifest_hash: HEAD.into(),
@@ -554,6 +592,7 @@ mod tests {
                 ClonePayload::FilesArchive {
                     manifest: HEAD.into(),
                     transport_session: SESSION.into(),
+                    binding: binding(SyncMode::Files),
                 },
             ),
             (
@@ -562,6 +601,7 @@ mod tests {
                     manifest: HEAD.into(),
                     discard_git: true,
                     transport_session: SESSION.into(),
+                    binding: binding(SyncMode::Files),
                 },
             ),
             (
@@ -570,6 +610,7 @@ mod tests {
                     manifest: HEAD.into(),
                     discard_git: false,
                     transport_session: SESSION.into(),
+                    binding: binding(SyncMode::Head),
                 },
             ),
             (
@@ -578,6 +619,7 @@ mod tests {
                     head_manifest: HEAD.into(),
                     history_manifest: HISTORY.into(),
                     transport_session: SESSION.into(),
+                    binding: binding(SyncMode::Full),
                 },
             ),
         ];

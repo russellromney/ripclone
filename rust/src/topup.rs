@@ -140,6 +140,26 @@ pub fn install_pinned_bundle(
     request: &PinnedBundleRequest,
     installer: &dyn PinnedBundleInstaller,
 ) -> Result<TopUpOutcome> {
+    install_pinned_bundle_transaction(target, request, installer, false)
+}
+
+/// Files-mode top-up. Verification and checkout happen with Git available in
+/// private staging; the administrative directory is discarded before the
+/// same atomic publish used by ordinary pinned installs.
+pub fn install_pinned_bundle_discard_git(
+    target: impl AsRef<Path>,
+    request: &PinnedBundleRequest,
+    installer: &dyn PinnedBundleInstaller,
+) -> Result<TopUpOutcome> {
+    install_pinned_bundle_transaction(target, request, installer, true)
+}
+
+fn install_pinned_bundle_transaction(
+    target: impl AsRef<Path>,
+    request: &PinnedBundleRequest,
+    installer: &dyn PinnedBundleInstaller,
+    discard_git: bool,
+) -> Result<TopUpOutcome> {
     validate_hash("requested manifest", &request.manifest_hash)?;
     let target = target.as_ref();
     if std::fs::symlink_metadata(target).is_ok() {
@@ -176,12 +196,24 @@ pub fn install_pinned_bundle(
 
     normalize_fresh_control_dir(&staging)?;
     finalize_and_verify(&staging, &verified.bundle)?;
+    if discard_git {
+        let git = staging.join(".git");
+        require_physical_dir(&git, ".git")?;
+        std::fs::remove_dir_all(&git).context("discard Git control state in Files staging")?;
+        if std::fs::symlink_metadata(&git).is_ok() {
+            bail!("Files top-up retained Git administrative state");
+        }
+    }
     atomic_rename_noreplace(&staging, target).context("publish verified pinned bundle")?;
     Ok(TopUpOutcome {
         target_commit: verified.bundle.target_commit.to_ascii_lowercase(),
         branch: verified.bundle.branch.clone(),
         mode: verified.bundle.mode,
     })
+}
+
+pub(crate) fn atomic_publish_directory(from: &Path, to: &Path) -> Result<()> {
+    atomic_rename_noreplace(from, to)
 }
 
 pub(crate) fn validate_request_binding(

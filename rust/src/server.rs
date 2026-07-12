@@ -4323,6 +4323,7 @@ async fn typed_clone_plan_inner(
                 crate::clone_plan::ClonePayload::FilesArchive {
                     manifest,
                     transport_session,
+                    ..
                 }
                 | crate::clone_plan::ClonePayload::HeadArtifact {
                     manifest,
@@ -4337,6 +4338,7 @@ async fn typed_clone_plan_inner(
                     head_manifest,
                     history_manifest,
                     transport_session,
+                    ..
                 },
             ..
         } => vec![
@@ -10947,6 +10949,14 @@ mod tests {
             payload: crate::clone_plan::ClonePayload::FilesArchive {
                 manifest: "a".repeat(64),
                 transport_session: "b".repeat(64),
+                binding: crate::clone_plan::ExactCloneBinding {
+                    workspace: "workspace".into(),
+                    repo: "owner/clone".into(),
+                    branch: "main".into(),
+                    mode: SyncMode::Files,
+                    target_commit: "2".repeat(40),
+                    artifact_format_version: crate::artifact_manifest::ARTIFACT_MANIFEST_SCHEMA,
+                },
             },
         };
         let pending = crate::clone_plan::ClonePlan::Pending {
@@ -11406,6 +11416,35 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(denied.status(), reqwest::StatusCode::FORBIDDEN);
+            let install_plan = client
+                .fetch_typed_clone_plan("acme/widget", "main", mode)
+                .await
+                .unwrap();
+            let destination = fixture.path().join(format!("typed-install-{expected}"));
+            client
+                .execute_typed_clone_plan(
+                    install_plan,
+                    &destination,
+                    "https://github.com/acme/widget.git",
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                std::fs::read(destination.join("file.txt")).unwrap(),
+                b"target\n"
+            );
+            match mode {
+                SyncMode::Files => assert!(
+                    std::fs::symlink_metadata(destination.join(".git")).is_err(),
+                    "Files install must publish no Git state"
+                ),
+                SyncMode::Head => {
+                    assert_eq!(run(&destination, &["rev-list", "--count", "HEAD"]), "1")
+                }
+                SyncMode::Full => {
+                    assert_eq!(run(&destination, &["rev-list", "--count", "HEAD"]), "2")
+                }
+            }
             transport_sessions.push(session.clone());
         }
         assert_eq!(
@@ -12024,7 +12063,19 @@ mod tests {
         })
         .await
         .expect("always-on admission reconciliation did not terminalize dead job");
-        assert!(queue.reclaim_stale().await.unwrap().is_empty());
+        // Lifecycle failure is persisted immediately before the queue ACK.
+        // Observe the actual ACK boundary with a bounded wait instead of
+        // assuming one scheduler yield is enough on every runtime.
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if queue.reclaim_stale().await.unwrap().is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dead-letter lifecycle failure was not followed by queue ACK");
     }
 
     #[test]

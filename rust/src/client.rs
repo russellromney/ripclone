@@ -60,8 +60,6 @@ pub enum TypedCloneUnavailable {
     Pending(Vec<crate::artifact_scheduler::ArtifactKind>),
     RepositoryInitializing,
     RepositoryFailed,
-    ExactInstallerUnavailable,
-    FilesTopUpInstallerUnavailable,
 }
 
 impl std::fmt::Display for TypedCloneUnavailable {
@@ -70,12 +68,6 @@ impl std::fmt::Display for TypedCloneUnavailable {
             Self::Pending(required) => write!(f, "typed clone artifacts are pending: {required:?}"),
             Self::RepositoryInitializing => f.write_str("repository base is still initializing"),
             Self::RepositoryFailed => f.write_str("repository initialization failed"),
-            Self::ExactInstallerUnavailable => {
-                f.write_str("this client does not yet install exact typed artifact manifests")
-            }
-            Self::FilesTopUpInstallerUnavailable => {
-                f.write_str("this client cannot atomically discard Git after a Files top-up")
-            }
         }
     }
 }
@@ -85,12 +77,50 @@ impl std::error::Error for TypedCloneUnavailable {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TypedCloneOutcome {
     Pinned(crate::topup::TopUpOutcome),
+    ExactFiles { target_commit: String },
 }
 
 struct ClientPinnedInstaller<'a> {
     cas: &'a Cas,
     approved_origin: &'a str,
     capability: std::sync::Mutex<Option<crate::pinned_bundle::VerifiedPinnedLocalCapability>>,
+}
+
+struct ClientExactGitInstaller<'a> {
+    verifier: &'a crate::artifact_manifest::CasCompletionVerifier,
+    approved_origin: &'a str,
+    head: std::sync::Mutex<Option<crate::artifact_manifest::VerifiedTransportArtifact>>,
+    history: std::sync::Mutex<Option<crate::artifact_manifest::VerifiedTransportArtifact>>,
+    verified: crate::topup::VerifiedPinnedBundle,
+}
+
+impl crate::topup::PinnedBundleInstaller for ClientExactGitInstaller<'_> {
+    fn approved_canonical_origin(&self) -> &str {
+        self.approved_origin
+    }
+
+    fn install_verified(
+        &self,
+        destination: &Path,
+        _: &crate::topup::PinnedBundleRequest,
+    ) -> std::result::Result<crate::topup::VerifiedPinnedBundle, crate::topup::BundleInstallFailure>
+    {
+        let head = self
+            .head
+            .lock()
+            .map_err(|_| crate::topup::BundleInstallFailure::Integrity)?
+            .take()
+            .ok_or(crate::topup::BundleInstallFailure::Integrity)?;
+        let history = self
+            .history
+            .lock()
+            .map_err(|_| crate::topup::BundleInstallFailure::Integrity)?
+            .take();
+        self.verifier
+            .materialize_transport_git(head, history, destination)
+            .map_err(|_| crate::topup::BundleInstallFailure::Integrity)?;
+        Ok(self.verified.clone())
+    }
 }
 
 impl crate::topup::PinnedBundleInstaller for ClientPinnedInstaller<'_> {
@@ -1037,11 +1067,9 @@ impl Client {
         })
     }
 
-    /// Execute the installer support that is safe today. Pinned Head/Full
-    /// bundles are downloaded into a private CAS, fully verified, materialized
-    /// in staging, and atomically published. Exact typed manifests and the
-    /// Files discard-Git transaction return typed capability errors instead of
-    /// falling back to an unverified legacy path.
+    /// Execute a request-bound typed plan without consulting legacy clone or
+    /// provider endpoints. Every variant stages privately and publishes with a
+    /// no-replace atomic rename only after semantic verification.
     pub async fn execute_typed_clone_plan<P: AsRef<Path>>(
         &self,
         plan: ClonePlan,
@@ -1059,7 +1087,7 @@ impl Client {
             ClonePlan::Ready { payload, .. } => match payload {
                 ClonePayload::PinnedBundle {
                     request,
-                    discard_git: false,
+                    discard_git,
                     ..
                 } => {
                     let temporary = if self.cache.is_none() {
@@ -1077,8 +1105,13 @@ impl Client {
                         approved_origin: approved_canonical_origin,
                         capability: std::sync::Mutex::new(Some(capability)),
                     };
-                    let outcome =
-                        crate::topup::install_pinned_bundle(target, &request, &installer)?;
+                    let outcome = if discard_git {
+                        crate::topup::install_pinned_bundle_discard_git(
+                            target, &request, &installer,
+                        )?
+                    } else {
+                        crate::topup::install_pinned_bundle(target, &request, &installer)?
+                    };
                     if let Err(error) = self.release_typed_transport(&request).await {
                         // Installation is already committed locally. Cleanup is
                         // advisory and the short server lease is the crash/error
@@ -1088,16 +1121,217 @@ impl Client {
                     }
                     Ok(TypedCloneOutcome::Pinned(outcome))
                 }
-                ClonePayload::PinnedBundle {
-                    discard_git: true, ..
-                } => Err(TypedCloneUnavailable::FilesTopUpInstallerUnavailable.into()),
-                ClonePayload::FilesArchive { .. }
-                | ClonePayload::HeadArtifact { .. }
-                | ClonePayload::FullArtifacts { .. } => {
-                    Err(TypedCloneUnavailable::ExactInstallerUnavailable.into())
+                ClonePayload::FilesArchive {
+                    manifest,
+                    transport_session,
+                    binding,
+                } => {
+                    self.validate_exact_binding(&binding, SyncMode::Files)?;
+                    let temporary = if self.cache.is_none() {
+                        Some(tempfile::tempdir().context("create typed clone CAS")?)
+                    } else {
+                        None
+                    };
+                    let cas = match &self.cache {
+                        Some(cas) => cas.clone(),
+                        None => Cas::new(temporary.as_ref().unwrap().path())?,
+                    };
+                    let capability = self
+                        .prefetch_exact_artifact(
+                            &cas,
+                            &binding,
+                            &manifest,
+                            &transport_session,
+                            crate::artifact_scheduler::ArtifactKind::Files,
+                        )
+                        .await?;
+                    let target = target.as_ref();
+                    if std::fs::symlink_metadata(target).is_ok() {
+                        anyhow::bail!("clone destination already exists: {}", target.display());
+                    }
+                    let parent = target
+                        .parent()
+                        .filter(|path| !path.as_os_str().is_empty())
+                        .unwrap_or_else(|| Path::new("."));
+                    std::fs::create_dir_all(parent)?;
+                    let staging_parent = tempfile::Builder::new()
+                        .prefix("ripclone-files.")
+                        .suffix(".tmp")
+                        .tempdir_in(parent)?;
+                    let staging = staging_parent.path().join("repo");
+                    crate::artifact_manifest::CasCompletionVerifier::new(cas)
+                        .materialize_transport_files(capability, &staging)?;
+                    crate::topup::atomic_publish_directory(&staging, target)
+                        .context("publish exact Files artifact")?;
+                    let request =
+                        Self::exact_transport_request(&binding, &manifest, &transport_session);
+                    if let Err(error) = self.release_typed_transport(&request).await {
+                        warn!("typed Files transport release ACK failed: {error:#}");
+                    }
+                    Ok(TypedCloneOutcome::ExactFiles {
+                        target_commit: binding.target_commit,
+                    })
+                }
+                ClonePayload::HeadArtifact {
+                    manifest,
+                    discard_git,
+                    transport_session,
+                    binding,
+                } => {
+                    let expected_mode = if discard_git {
+                        SyncMode::Files
+                    } else {
+                        SyncMode::Head
+                    };
+                    self.validate_exact_binding(&binding, expected_mode)?;
+                    self.execute_exact_git(
+                        target.as_ref(),
+                        approved_canonical_origin,
+                        binding,
+                        manifest,
+                        None,
+                        transport_session,
+                        discard_git,
+                    )
+                    .await
+                }
+                ClonePayload::FullArtifacts {
+                    head_manifest,
+                    history_manifest,
+                    transport_session,
+                    binding,
+                } => {
+                    self.validate_exact_binding(&binding, SyncMode::Full)?;
+                    self.execute_exact_git(
+                        target.as_ref(),
+                        approved_canonical_origin,
+                        binding,
+                        head_manifest,
+                        Some(history_manifest),
+                        transport_session,
+                        false,
+                    )
+                    .await
                 }
             },
         }
+    }
+
+    fn validate_exact_binding(
+        &self,
+        binding: &crate::clone_plan::ExactCloneBinding,
+        mode: SyncMode,
+    ) -> Result<()> {
+        if binding.workspace != self.workspace
+            || binding.mode != mode
+            || binding.repo.is_empty()
+            || binding.branch.is_empty()
+            || binding.artifact_format_version
+                != crate::clone_transport::CLONE_ARTIFACT_FORMAT_VERSION
+        {
+            anyhow::bail!("typed clone execution binding does not match this client/request");
+        }
+        Ok(())
+    }
+
+    async fn execute_exact_git(
+        &self,
+        target: &Path,
+        approved_origin: &str,
+        binding: crate::clone_plan::ExactCloneBinding,
+        head_root: String,
+        history_root: Option<String>,
+        transport_session: String,
+        discard_git: bool,
+    ) -> Result<TypedCloneOutcome> {
+        let temporary = if self.cache.is_none() {
+            Some(tempfile::tempdir().context("create typed clone CAS")?)
+        } else {
+            None
+        };
+        let cas = match &self.cache {
+            Some(cas) => cas.clone(),
+            None => Cas::new(temporary.as_ref().unwrap().path())?,
+        };
+        let head = self
+            .prefetch_exact_artifact(
+                &cas,
+                &binding,
+                &head_root,
+                &transport_session,
+                crate::artifact_scheduler::ArtifactKind::Head,
+            )
+            .await?;
+        let history = if let Some(root) = history_root.as_deref() {
+            Some(
+                self.prefetch_exact_artifact(
+                    &cas,
+                    &binding,
+                    root,
+                    &transport_session,
+                    crate::artifact_scheduler::ArtifactKind::FullHistory,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        let mode = if history_root.is_some() {
+            crate::topup::TopUpMode::Full
+        } else {
+            crate::topup::TopUpMode::Head
+        };
+        let bundle = crate::topup::PinnedTopUpBundle {
+            format_version: 1,
+            workspace_id: binding.workspace.clone(),
+            repo_path: binding.repo.clone(),
+            base_commit: binding.target_commit.clone(),
+            target_commit: binding.target_commit.clone(),
+            branch: binding.branch.clone(),
+            mode,
+            canonical_origin: approved_origin.to_owned(),
+        };
+        let mut artifacts = vec![crate::topup::PinnedArtifactDescriptor {
+            kind: crate::topup::PinnedArtifactKind::BasePack,
+            hash: head_root.clone(),
+            len: cas.verify_object(&head_root)?,
+        }];
+        if let Some(root) = history_root.as_deref() {
+            artifacts.push(crate::topup::PinnedArtifactDescriptor {
+                kind: crate::topup::PinnedArtifactKind::OverlayPack,
+                hash: root.to_owned(),
+                len: cas.verify_object(root)?,
+            });
+        }
+        let verified = crate::topup::VerifiedPinnedBundle {
+            manifest_hash: head_root.clone(),
+            semantic_digest: crate::topup::pinned_bundle_semantic_digest(&bundle, &artifacts),
+            bundle,
+            artifacts,
+        };
+        let request = Self::exact_transport_request(&binding, &head_root, &transport_session);
+        let verifier = crate::artifact_manifest::CasCompletionVerifier::new(cas);
+        let installer = ClientExactGitInstaller {
+            verifier: &verifier,
+            approved_origin,
+            head: std::sync::Mutex::new(Some(head)),
+            history: std::sync::Mutex::new(history),
+            verified,
+        };
+        let outcome = if discard_git {
+            crate::topup::install_pinned_bundle_discard_git(target, &request, &installer)?
+        } else {
+            crate::topup::install_pinned_bundle(target, &request, &installer)?
+        };
+        let mut roots = vec![head_root];
+        roots.extend(history_root);
+        for root in roots {
+            let release = Self::exact_transport_request(&binding, &root, &transport_session);
+            if let Err(error) = self.release_typed_transport(&release).await {
+                warn!("typed exact transport release ACK failed: {error:#}");
+            }
+        }
+        Ok(TypedCloneOutcome::Pinned(outcome))
     }
 
     async fn prefetch_pinned_bundle(
@@ -1156,6 +1390,103 @@ impl Client {
         // consumed by the installer. CAS reads remain hash-verified while the
         // first pass prevents any unverified materialization attempt.
         crate::pinned_bundle::verify_pinned_bundle_capability(cas, request)
+    }
+
+    fn exact_transport_request(
+        binding: &crate::clone_plan::ExactCloneBinding,
+        root: &str,
+        transport_session: &str,
+    ) -> crate::topup::PinnedBundleRequest {
+        crate::topup::PinnedBundleRequest {
+            manifest_hash: root.to_owned(),
+            transport_session: transport_session.to_owned(),
+            format_version: 1,
+            workspace_id: binding.workspace.clone(),
+            repo_path: binding.repo.clone(),
+            base_commit: binding.target_commit.clone(),
+            target_commit: binding.target_commit.clone(),
+            branch: binding.branch.clone(),
+            mode: match binding.mode {
+                SyncMode::Files | SyncMode::Head => crate::topup::TopUpMode::Head,
+                SyncMode::Full => crate::topup::TopUpMode::Full,
+            },
+        }
+    }
+
+    async fn prefetch_exact_artifact(
+        &self,
+        cas: &Cas,
+        binding: &crate::clone_plan::ExactCloneBinding,
+        root: &str,
+        transport_session: &str,
+        kind: crate::artifact_scheduler::ArtifactKind,
+    ) -> Result<crate::artifact_manifest::VerifiedTransportArtifact> {
+        const MAX_ROOT_BYTES: usize = 16 * 1024 * 1024;
+        let request = Self::exact_transport_request(binding, root, transport_session);
+        let root_bytes = self
+            .fetch_small_artifact_bounded(&request, root, MAX_ROOT_BYTES)
+            .await?;
+        if cas_hash(&root_bytes) != root {
+            anyhow::bail!("typed transport root hash mismatch");
+        }
+        cas.put_with_hash(root, &root_bytes)?;
+        let manifest =
+            crate::artifact_manifest::ArtifactManifest::validate_envelope_bytes(&root_bytes)?;
+        let key = crate::artifact_scheduler::ArtifactKey {
+            workspace: binding.workspace.clone(),
+            repo: binding.repo.clone(),
+            commit: binding.target_commit.clone(),
+            kind,
+            format_version: binding.artifact_format_version,
+        };
+        if manifest.key.workspace != key.workspace
+            || manifest.key.repo != key.repo
+            || manifest.key.commit != key.commit
+            || manifest.key.kind != key.kind
+            || manifest.key.format_version != key.format_version
+        {
+            anyhow::bail!("typed artifact root identity does not match clone request");
+        }
+        // Fetch direct descriptors first. For FullHistory these are the commit
+        // anchor and nested level manifests; only hash-verified nested bytes are
+        // allowed to delegate the pack/index set in the next step.
+        for blob in manifest.payload.referenced_blobs() {
+            self.fetch_exact_descriptor(cas, &request, blob).await?;
+        }
+        let verifier = crate::artifact_manifest::CasCompletionVerifier::new(cas.clone());
+        let graph = verifier.transport_referenced_blobs(&manifest, &mut |blob| {
+            if cas.verify_object(&blob.hash)? != blob.len {
+                anyhow::bail!("nested typed descriptor is absent or has wrong length");
+            }
+            cas.get(&blob.hash)
+        })?;
+        for blob in &graph {
+            self.fetch_exact_descriptor(cas, &request, blob).await?;
+        }
+        verifier.verify_transport_artifact(&key, root)
+    }
+
+    async fn fetch_exact_descriptor(
+        &self,
+        cas: &Cas,
+        request: &crate::topup::PinnedBundleRequest,
+        blob: &crate::artifact_manifest::CasBlob,
+    ) -> Result<()> {
+        crate::cas::Cas::validate_artifact_id(&blob.hash)?;
+        if blob.len == 0 {
+            anyhow::bail!("typed artifact contains a zero-length descriptor");
+        }
+        if cas.verify_object(&blob.hash).ok() == Some(blob.len) {
+            return Ok(());
+        }
+        let (temp, len) = self
+            .fetch_typed_artifact_to_temp(request, &blob.hash, cas.root(), blob.len)
+            .await?;
+        if len != blob.len {
+            anyhow::bail!("typed artifact transport descriptor length mismatch");
+        }
+        cas.install_hashed_file(&blob.hash, temp.into_temp_path())?;
+        Ok(())
     }
 
     async fn release_typed_transport(
