@@ -376,9 +376,21 @@ impl ArtifactSchedulerPersistence for LibsqlArtifactScheduler {
     ) -> Result<Option<ArtifactRecord>> {
         validate_format_version(v)?;
         let conn = self.conn().await?;
-        let id=opt_i64(&conn,"SELECT j.id FROM artifact_observations a JOIN artifact_jobs j ON j.id=a.published_artifact_id AND j.workspace=a.workspace AND j.repo=a.repo AND j.kind=a.kind AND j.format_version=a.format_version WHERE a.workspace=? AND a.repo=? AND a.branch=? AND a.kind=? AND a.format_version=? AND j.state='ready' AND j.manifest IS NOT NULL AND length(trim(j.manifest))>0",vec![w.into(),r.into(),b.into(),k.as_str().into(),(v as i64).into()]).await?;
+        let id=opt_i64(&conn,"SELECT j.id FROM artifact_observations a JOIN artifact_jobs j ON j.id=a.published_artifact_id AND j.workspace=a.workspace AND j.repo=a.repo AND j.kind=a.kind AND j.format_version=a.format_version WHERE a.workspace=? AND a.repo=? AND a.branch=? AND a.kind=? AND a.format_version=? AND j.state='ready' AND j.manifest IS NOT NULL",vec![w.into(),r.into(),b.into(),k.as_str().into(),(v as i64).into()]).await?;
         match id {
-            Some(id) => get_id(&conn, id).await,
+            Some(id) => {
+                let record = get_id(&conn, id)
+                    .await?
+                    .context("published artifact disappeared")?;
+                if record
+                    .manifest
+                    .as_deref()
+                    .is_none_or(|manifest| manifest.trim().is_empty())
+                {
+                    bail!("published libsql artifact has a blank manifest")
+                }
+                Ok(Some(record))
+            }
             None => Ok(None),
         }
     }
@@ -587,6 +599,18 @@ async fn validate_schema(c: &Connection) -> Result<()> {
     if invalid_jobs != 0 {
         bail!("libsql artifact scheduler contains invalid artifact jobs")
     }
+    reject_rust_blank(
+        c,
+        "SELECT owner FROM artifact_jobs WHERE state='running'",
+        "artifact lease owner",
+    )
+    .await?;
+    reject_rust_blank(
+        c,
+        "SELECT manifest FROM artifact_jobs WHERE state='ready'",
+        "artifact manifest",
+    )
+    .await?;
     let invalid_observations=one_i64(c,"SELECT count(*) FROM artifact_observations a LEFT JOIN artifact_jobs d ON d.id=a.desired_artifact_id AND d.workspace=a.workspace AND d.repo=a.repo AND d.kind=a.kind AND d.commit_oid=a.desired_commit AND d.format_version=a.format_version AND d.format_version BETWEEN 1 AND 4294967295 LEFT JOIN artifact_jobs p ON p.id=a.published_artifact_id AND p.workspace=a.workspace AND p.repo=a.repo AND p.kind=a.kind AND p.format_version=a.format_version AND p.state='ready' AND p.manifest IS NOT NULL AND length(trim(p.manifest))>0 WHERE typeof(a.workspace)<>'text' OR typeof(a.repo)<>'text' OR typeof(a.branch)<>'text' OR typeof(a.kind)<>'text' OR a.kind NOT IN('head','full_history','files') OR typeof(a.desired_commit)<>'text' OR typeof(a.desired_artifact_id)<>'integer' OR typeof(a.desired_generation)<>'integer' OR a.desired_generation<1 OR (a.published_artifact_id IS NOT NULL AND typeof(a.published_artifact_id)<>'integer') OR typeof(a.format_version)<>'integer' OR a.format_version NOT BETWEEN 1 AND 4294967295 OR typeof(a.observed_at)<>'integer' OR d.id IS NULL OR (a.published_artifact_id IS NOT NULL AND p.id IS NULL)",vec![]).await?;
     if invalid_observations != 0 {
         bail!("libsql artifact scheduler contains invalid artifact observations")
@@ -599,9 +623,24 @@ async fn validate_schema(c: &Connection) -> Result<()> {
     if invalid_consumers != 0 {
         bail!("libsql artifact scheduler contains invalid consumers")
     }
+    reject_rust_blank(
+        c,
+        "SELECT consumer_id FROM artifact_consumers",
+        "artifact consumer id",
+    )
+    .await?;
     let invalid_control=one_i64(c,"SELECT count(*) FROM scheduler_state WHERE id<>1 OR typeof(id)<>'integer' OR typeof(fairness_cursor)<>'integer' OR fairness_cursor NOT BETWEEN 0 AND 3 OR typeof(workspace_cursor)<>'text' OR typeof(config_fingerprint)<>'text'",vec![]).await?;
     if invalid_control != 0 {
         bail!("libsql artifact scheduler contains invalid control state")
+    }
+    Ok(())
+}
+async fn reject_rust_blank(c: &Connection, sql: &str, field: &str) -> Result<()> {
+    let mut rows = c.query(sql, ()).await?;
+    while let Some(row) = rows.next().await? {
+        if row.get::<String>(0)?.trim().is_empty() {
+            bail!("libsql artifact scheduler contains blank {field}")
+        }
     }
     Ok(())
 }
@@ -744,7 +783,7 @@ mod tests {
             .unwrap()
             .port();
         let dir = tempfile::tempdir().unwrap();
-        let Ok(mut child) = Command::new("sqld")
+        let child = Command::new("sqld")
             .arg("--db-path")
             .arg(dir.path().join("db"))
             .arg("--http-listen-addr")
@@ -753,9 +792,13 @@ mod tests {
             .arg(format!("http://127.0.0.1:{port}"))
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .spawn()
-        else {
-            return None;
+            .spawn();
+        let mut child = match child {
+            Ok(child) => child,
+            Err(error) if std::env::var_os("RIPCLONE_REQUIRE_SQLD_TESTS").is_some() => {
+                panic!("required sqld conformance server is unavailable: {error}")
+            }
+            Err(_) => return None,
         };
         let url = format!("http://127.0.0.1:{port}");
         for _ in 0..100 {
@@ -1142,6 +1185,71 @@ mod tests {
             startup_error(&s.url)
                 .await
                 .contains("invalid artifact jobs")
+        );
+
+        let Some(s) = server().await else { return };
+        let a = scheduler(&s.url, Default::default()).await;
+        let k = key("blank-manifest", ArtifactKind::Head);
+        a.observe("w", "r", "main", &k.commit, &[ArtifactKind::Head], 1, None)
+            .await
+            .unwrap();
+        let claim = a.claim("owner", 30).await.unwrap().unwrap();
+        a.complete(
+            &claim,
+            "owner",
+            &CompletionEvidence::new(k, "valid").unwrap(),
+        )
+        .await
+        .unwrap();
+        a.conn()
+            .await
+            .unwrap()
+            .execute(
+                "UPDATE artifact_jobs SET manifest=char(9) WHERE state='ready'",
+                (),
+            )
+            .await
+            .unwrap();
+        assert!(
+            a.published("w", "r", "main", ArtifactKind::Head, 1)
+                .await
+                .is_err()
+        );
+        assert!(
+            startup_error(&s.url)
+                .await
+                .contains("blank artifact manifest")
+        );
+
+        let Some(s) = server().await else { return };
+        let a = scheduler(&s.url, Default::default()).await;
+        a.schedule(&key("blank-owner", ArtifactKind::Head))
+            .await
+            .unwrap();
+        a.conn().await.unwrap().execute("UPDATE artifact_jobs SET state='running',owner=char(10),lease_expires_at=9999999999 WHERE commit_oid='blank-owner'",()).await.unwrap();
+        assert!(
+            startup_error(&s.url)
+                .await
+                .contains("blank artifact lease owner")
+        );
+
+        let Some(s) = server().await else { return };
+        let a = scheduler(&s.url, Default::default()).await;
+        let consumer = key("blank-consumer", ArtifactKind::Head);
+        let artifact_id = outcome_id(&a.subscribe_consumer(&consumer, "valid", 30).await.unwrap());
+        a.conn()
+            .await
+            .unwrap()
+            .execute(
+                "UPDATE artifact_consumers SET consumer_id=char(160) WHERE artifact_id=?",
+                [artifact_id],
+            )
+            .await
+            .unwrap();
+        assert!(
+            startup_error(&s.url)
+                .await
+                .contains("blank artifact consumer id")
         );
     }
 }

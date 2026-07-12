@@ -82,8 +82,13 @@ databases() {
     [ -x "$bin" ] || { echo "error: missing $bin" >&2; exit 1; }
     echo "databases: running prebuilt $bin"
     ( cd "$ROOT/rust" && "$bin" --nocapture )
+    local lib_bin="$CI_ARTIFACTS/ripclone-lib-tests"
+    [ -x "$lib_bin" ] || { echo "error: missing $lib_bin" >&2; exit 1; }
+    echo "databases: running required normalized libsql scheduler conformance"
+    ( cd "$ROOT/rust" && RIPCLONE_REQUIRE_SQLD_TESTS=1 "$lib_bin" artifact_scheduler_libsql::tests --nocapture )
   else
     ( cd "$ROOT/rust" && cargo test --profile "$CARGO_PROFILE" --locked --test e2e_worker_libsql -- --nocapture )
+    ( cd "$ROOT/rust" && RIPCLONE_REQUIRE_SQLD_TESTS=1 cargo test --profile "$CARGO_PROFILE" --locked --lib artifact_scheduler_libsql::tests -- --nocapture )
   fi
 }
 
