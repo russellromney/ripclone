@@ -111,7 +111,9 @@ impl ProviderGit for GitCliProvider {
         branch: String,
         credential: Option<SecretString>,
     ) -> std::result::Result<String, ProviderFailure> {
-        tokio::task::spawn_blocking(move || {
+        let cancelled = CancellationToken::new();
+        let blocking_cancel = cancelled.clone();
+        let handle = tokio::task::spawn_blocking(move || {
             validate_access(&provider, &repo, &branch)?;
             let query = canonical_branch_ref(&branch)?;
             let url = provider_clone_url(&provider, &repo.path);
@@ -123,7 +125,7 @@ impl ProviderGit for GitCliProvider {
                 ]),
                 &provider,
                 credential.as_ref(),
-                &CancellationToken::new(),
+                &blocking_cancel,
             )?;
             if !output.status.success() {
                 return Err(classify_git_failure(
@@ -132,14 +134,21 @@ impl ProviderGit for GitCliProvider {
                 ));
             }
             parse_exact_tip(&output.stdout, &query)
-        })
-        .await
-        .map_err(|_| {
-            ProviderFailure::new(
-                ProviderFailureKind::Unavailable,
-                "provider tip task did not join",
-            )
-        })?
+        });
+        let mut guard = ProviderTaskGuard::new(cancelled, handle);
+        let result = guard
+            .handle
+            .as_mut()
+            .expect("provider task installed")
+            .await
+            .map_err(|_| {
+                ProviderFailure::new(
+                    ProviderFailureKind::Unavailable,
+                    "provider tip task did not join",
+                )
+            })?;
+        guard.disarm();
+        result
     }
 }
 
@@ -543,6 +552,40 @@ struct AcquisitionTaskGuard<T> {
     cancelled: CancellationToken,
     handle: Option<tokio::task::JoinHandle<Result<T>>>,
     armed: bool,
+}
+
+struct ProviderTaskGuard<T> {
+    cancelled: CancellationToken,
+    handle: Option<tokio::task::JoinHandle<std::result::Result<T, ProviderFailure>>>,
+    armed: bool,
+}
+
+impl<T> ProviderTaskGuard<T> {
+    fn new(
+        cancelled: CancellationToken,
+        handle: tokio::task::JoinHandle<std::result::Result<T, ProviderFailure>>,
+    ) -> Self {
+        Self {
+            cancelled,
+            handle: Some(handle),
+            armed: true,
+        }
+    }
+    fn disarm(&mut self) {
+        self.armed = false;
+        self.handle = None;
+    }
+}
+
+impl<T> Drop for ProviderTaskGuard<T> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.cancelled.cancel();
+            // The blocking Git runner kills and waits for its child before the
+            // detached cleanup task exits.
+            self.handle.take();
+        }
+    }
 }
 
 impl<T> AcquisitionTaskGuard<T> {
