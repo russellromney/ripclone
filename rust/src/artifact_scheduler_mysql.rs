@@ -9,7 +9,7 @@ use crate::artifact_scheduler::{
     ClaimedArtifact, CompletionSealAuthority, CompletionVerifier, FailureClass, ObservationOutcome,
     ObservationSnapshot, QuarantineOutcome, ReadyPublicationFence, RetryOutcome, ScheduleOutcome,
     SchedulerLimits, UnknownActivationFencePage, VerifiedCompletionEvidence, scheduler_fingerprint,
-    validate_lease, validate_limits, validate_resolved_commit,
+    scheduler_limits_fingerprint, validate_lease, validate_limits, validate_resolved_commit,
 };
 #[cfg(test)]
 use crate::artifact_scheduler::{CompletionEvidence, validate_evidence};
@@ -24,12 +24,15 @@ use sqlx::{Acquire, MySql, MySqlConnection, Row, Transaction};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 const V1_TO_V4_TRANSITION: i64 = 401;
 const V2_TO_V4_TRANSITION: i64 = 402;
 const V5_TO_V6_DDL: i64 = 501;
 const V5_TO_V6_VALIDATED: i64 = 502;
+const V6_TO_V7_DDL: i64 = 601;
+const V6_TO_V7_VALIDATED: i64 = 602;
 const _: () = assert!(V5_TO_V6_DDL > 5 && V5_TO_V6_VALIDATED > 5);
+const _: () = assert!(V6_TO_V7_DDL > 6 && V6_TO_V7_VALIDATED > 6);
 const SCHEMA: &[&str] = &[
     r#"CREATE TABLE IF NOT EXISTS artifact_scheduler_schema(
  id SMALLINT NOT NULL PRIMARY KEY,
@@ -752,6 +755,29 @@ async fn validate_mysql_v6_fences(tx: &mut Transaction<'_, MySql>) -> Result<()>
     Ok(())
 }
 
+async fn validate_mysql_v7_limits_capability(
+    c: &mut MySqlConnection,
+    required: bool,
+) -> Result<()> {
+    let row:Option<(String,String,Option<String>,Option<String>,String)>=sqlx::query_as("SELECT lower(column_type),is_nullable,column_default,collation_name,extra FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name='scheduler_state' AND column_name='limits_fingerprint'").fetch_optional(&mut *c).await?;
+    if row.is_some()
+        && row
+            != Some((
+                "varchar(64)".into(),
+                "NO".into(),
+                Some("".into()),
+                Some("utf8mb4_bin".into()),
+                "".into(),
+            ))
+    {
+        bail!("mysql v7 scheduler limits capability differs")
+    }
+    if required && row.is_none() {
+        bail!("mysql v7 scheduler limits capability is absent")
+    }
+    Ok(())
+}
+
 impl MysqlArtifactScheduler {
     pub async fn from_pool(
         pool: MySqlPool,
@@ -778,7 +804,7 @@ impl MysqlArtifactScheduler {
         let initialized: Result<()> = async {
             let marker_exists:i64=sqlx::query_scalar("SELECT count(*) FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name='artifact_scheduler_schema'").fetch_one(&mut connection).await?;
             let mut version: i64 = if marker_exists == 0 {
-                let partial:i64=sqlx::query_scalar("SELECT count(*) FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name IN('artifact_jobs','branch_observations','artifact_observations','artifact_consumers','artifact_transport_leases','artifact_base_retention','artifact_gc_sweep','scheduler_state')").fetch_one(&mut connection).await?;
+                let partial:i64=sqlx::query_scalar("SELECT count(*) FROM information_schema.tables WHERE table_schema=DATABASE() AND (table_name IN('artifact_jobs','branch_observations','artifact_observations','artifact_consumers','artifact_transport_leases','artifact_base_retention','artifact_gc_sweep','scheduler_state','branch_source_generations','branch_source_current','artifact_intents') OR table_name LIKE 'git\\_source\\_%' ESCAPE '\\\\')").fetch_one(&mut connection).await?;
                 if partial != 0 { bail!("unmarked partial mysql artifact scheduler schema") }
                 // Fresh databases first publish the exact transport-only v5
                 // shape. Fence DDL is forbidden until marker 501 is durable.
@@ -788,12 +814,16 @@ impl MysqlArtifactScheduler {
                 5
             } else {
                 let version:i64=sqlx::query_scalar("SELECT version FROM artifact_scheduler_schema WHERE id=1").fetch_one(&mut connection).await?;
-                if version > SCHEMA_VERSION && ![V1_TO_V4_TRANSITION,V2_TO_V4_TRANSITION,V5_TO_V6_DDL,V5_TO_V6_VALIDATED].contains(&version) { bail!("artifact scheduler database is newer than this binary") }
-                if ![1,2,3,4,5,SCHEMA_VERSION,V1_TO_V4_TRANSITION,V2_TO_V4_TRANSITION,V5_TO_V6_DDL,V5_TO_V6_VALIDATED].contains(&version) { bail!("unsupported mysql artifact scheduler schema {version}") }
+                if version > SCHEMA_VERSION && ![V1_TO_V4_TRANSITION,V2_TO_V4_TRANSITION,V5_TO_V6_DDL,V5_TO_V6_VALIDATED,V6_TO_V7_DDL,V6_TO_V7_VALIDATED].contains(&version) { bail!("artifact scheduler database is newer than this binary") }
+                if ![1,2,3,4,5,6,SCHEMA_VERSION,V1_TO_V4_TRANSITION,V2_TO_V4_TRANSITION,V5_TO_V6_DDL,V5_TO_V6_VALIDATED,V6_TO_V7_DDL,V6_TO_V7_VALIDATED].contains(&version) { bail!("unsupported mysql artifact scheduler schema {version}") }
                 if [V1_TO_V4_TRANSITION,V2_TO_V4_TRANSITION].contains(&version) {
                     preflight_mysql_transition(&mut connection, version).await?;
                 } else if [V5_TO_V6_DDL,V5_TO_V6_VALIDATED].contains(&version) {
                     preflight_mysql_v6_transition(&mut connection,version).await?;
+                } else if [V6_TO_V7_DDL,V6_TO_V7_VALIDATED].contains(&version) {
+                    let mut exact=connection.begin().await?; Self::validate_schema(&mut exact).await?; validate_mysql_v6_fences(&mut exact).await?; exact.rollback().await?;
+                    validate_mysql_v7_limits_capability(&mut connection,version==V6_TO_V7_VALIDATED).await?;
+                    crate::git_source_registry::validate_mysql_v7_prefix(&mut connection,version==V6_TO_V7_VALIDATED).await?;
                 } else {
                     preflight_mysql_schema(&mut connection,version).await?;
                 }
@@ -861,8 +891,43 @@ impl MysqlArtifactScheduler {
                 preflight_mysql_v6_transition(&mut connection,V5_TO_V6_VALIDATED).await?;
                 let mut exact=connection.begin().await?; validate_mysql_v6_fences(&mut exact).await?; exact.rollback().await?;
                 let mut marker=connection.begin().await?;
-                if sqlx::query("UPDATE artifact_scheduler_schema SET version=? WHERE id=1 AND version=?").bind(SCHEMA_VERSION).bind(V5_TO_V6_VALIDATED).execute(&mut *marker).await?.rows_affected()!=1{bail!("mysql v6 publication marker CAS failed")}
-                marker.commit().await?; version=SCHEMA_VERSION;
+                if sqlx::query("UPDATE artifact_scheduler_schema SET version=6 WHERE id=1 AND version=?").bind(V5_TO_V6_VALIDATED).execute(&mut *marker).await?.rows_affected()!=1{bail!("mysql v6 publication marker CAS failed")}
+                marker.commit().await?; version=6;
+            }
+
+            if version==6 {
+                let mut exact=connection.begin().await?;Self::validate_schema(&mut exact).await?;validate_mysql_v6_fences(&mut exact).await?;exact.rollback().await?;
+                validate_mysql_v7_limits_capability(&mut connection,false).await?;
+                let premature:i64=sqlx::query_scalar("SELECT count(*) FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name='scheduler_state' AND column_name='limits_fingerprint'").fetch_one(&mut connection).await?;if premature!=0{bail!("mysql v6 contains premature v7 limits capability")}
+                crate::git_source_registry::validate_mysql_v7_prefix(&mut connection,false).await?;
+                let mut marker=connection.begin().await?;
+                if sqlx::query("UPDATE artifact_scheduler_schema SET version=? WHERE id=1 AND version=6").bind(V6_TO_V7_DDL).execute(&mut *marker).await?.rows_affected()!=1{bail!("mysql v7 transition marker CAS failed")}
+                marker.commit().await?;version=V6_TO_V7_DDL;
+            }
+            if version==V6_TO_V7_DDL {
+                validate_mysql_v7_limits_capability(&mut connection,false).await?;
+                let limits_column:i64=sqlx::query_scalar("SELECT count(*) FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name='scheduler_state' AND column_name='limits_fingerprint'").fetch_one(&mut connection).await?;
+                if limits_column==0{sqlx::raw_sql("ALTER TABLE scheduler_state ADD COLUMN limits_fingerprint VARCHAR(64) NOT NULL DEFAULT ''").execute(&mut connection).await?;}
+                validate_mysql_v7_limits_capability(&mut connection,true).await?;
+                let durable_limits=scheduler_limits_fingerprint(&limits);
+                let existing:String=sqlx::query_scalar("SELECT limits_fingerprint FROM scheduler_state WHERE id=1").fetch_one(&mut connection).await?;
+                if existing.is_empty(){sqlx::query("UPDATE scheduler_state SET limits_fingerprint=? WHERE id=1 AND limits_fingerprint=''").bind(&durable_limits).execute(&mut connection).await?;}else if existing!=durable_limits{bail!("mysql scheduler limits capability differs during v7 migration")}
+                for ddl in crate::git_source_registry::MYSQL_V7_TABLES {crate::git_source_registry::validate_mysql_v7_prefix(&mut connection,false).await?;sqlx::raw_sql(*ddl).execute(&mut connection).await?;}
+                crate::git_source_registry::validate_mysql_v7_prefix(&mut connection,true).await?;
+                sqlx::query("INSERT INTO git_source_acquisition_sequence(id,generation) VALUES(1,0) ON DUPLICATE KEY UPDATE id=VALUES(id)").execute(&mut connection).await?;
+                sqlx::query("INSERT INTO git_source_maintenance(id) VALUES(1) ON DUPLICATE KEY UPDATE id=VALUES(id)").execute(&mut connection).await?;
+                crate::git_source_registry::validate_mysql_v7_state(&mut connection).await?;
+                let mut marker=connection.begin().await?;
+                if sqlx::query("UPDATE artifact_scheduler_schema SET version=? WHERE id=1 AND version=?").bind(V6_TO_V7_VALIDATED).bind(V6_TO_V7_DDL).execute(&mut *marker).await?.rows_affected()!=1{bail!("mysql v7 validated marker CAS failed")}
+                marker.commit().await?;version=V6_TO_V7_VALIDATED;
+            }
+            if version==V6_TO_V7_VALIDATED {
+                validate_mysql_v7_limits_capability(&mut connection,true).await?;
+                let stored_limits:String=sqlx::query_scalar("SELECT limits_fingerprint FROM scheduler_state WHERE id=1").fetch_one(&mut connection).await?;if stored_limits!=scheduler_limits_fingerprint(&limits){bail!("mysql scheduler limits capability differs before v7 publication")}
+                crate::git_source_registry::validate_mysql_v7_prefix(&mut connection,true).await?;crate::git_source_registry::validate_mysql_v7_state(&mut connection).await?;
+                let mut marker=connection.begin().await?;
+                if sqlx::query("UPDATE artifact_scheduler_schema SET version=? WHERE id=1 AND version=?").bind(SCHEMA_VERSION).bind(V6_TO_V7_VALIDATED).execute(&mut *marker).await?.rows_affected()!=1{bail!("mysql v7 publication marker CAS failed")}
+                marker.commit().await?;version=SCHEMA_VERSION;
             }
 
             let mut migration = connection.begin().await?;
@@ -870,6 +935,12 @@ impl MysqlArtifactScheduler {
             if locked_version != version || version != SCHEMA_VERSION { bail!("mysql artifact scheduler version changed under migration lock") }
             Self::validate_schema(&mut migration).await?;
             validate_mysql_v6_fences(&mut migration).await?;
+            migration.rollback().await?;
+            crate::git_source_registry::validate_mysql_v7_prefix(&mut connection,true).await?;
+            crate::git_source_registry::validate_mysql_v7_state(&mut connection).await?;
+            validate_mysql_v7_limits_capability(&mut connection,true).await?;
+            let stored_limits:String=sqlx::query_scalar("SELECT limits_fingerprint FROM scheduler_state WHERE id=1").fetch_one(&mut connection).await?;if stored_limits!=scheduler_limits_fingerprint(&limits){bail!("mysql scheduler limits capability differs from fleet")}
+            let mut migration=connection.begin().await?;
 
             let fingerprint = scheduler_fingerprint(&limits, verifier_id);
             if fingerprint.chars().count() > 512 {
@@ -1148,8 +1219,22 @@ impl MysqlArtifactScheduler {
         )
         .fetch_one(&mut **tx)
         .await?;
-        if count != COLUMNS.len() as i64 {
+        let limits_column:i64=sqlx::query_scalar("SELECT count(*) FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name='scheduler_state' AND column_name='limits_fingerprint'").fetch_one(&mut **tx).await?;
+        if count != COLUMNS.len() as i64 + limits_column {
             bail!("mysql artifact scheduler schema has unexpected or missing columns")
+        }
+        if limits_column == 1 {
+            let shape:Option<(String,String,Option<String>,Option<String>)>=sqlx::query_as("SELECT lower(column_type),is_nullable,column_default,collation_name FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name='scheduler_state' AND column_name='limits_fingerprint'").fetch_optional(&mut **tx).await?;
+            if shape
+                != Some((
+                    "varchar(64)".into(),
+                    "NO".into(),
+                    Some("".into()),
+                    Some("utf8mb4_bin".into()),
+                ))
+            {
+                bail!("mysql scheduler limits capability column differs")
+            }
         }
         let invalid_tables: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM information_schema.tables
@@ -1487,7 +1572,8 @@ impl MysqlArtifactScheduler {
                   ('artifact_scheduler_schema','artifact_jobs','branch_observations',
                   'artifact_observations','artifact_consumers','artifact_transport_leases','artifact_base_retention','artifact_gc_sweep','scheduler_state')
                AND NOT((k.table_name='artifact_base_retention' AND k.constraint_name='artifact_base_retention_artifact')
-                    OR (k.table_name='ready_publication_fence_members' AND k.constraint_name='ready_fence_members_artifact'))",
+                    OR (k.table_name='ready_publication_fence_members' AND k.constraint_name='ready_fence_members_artifact')
+                    OR (k.table_name='artifact_intents' AND k.constraint_name='artifact_intents_artifact'))",
         )
         .fetch_one(&mut **tx)
         .await?;
@@ -2283,6 +2369,29 @@ impl ArtifactSchedulerPersistence for MysqlArtifactScheduler {
                         format_version: version,
                     },
                     manifest: row.try_get("manifest")?,
+                })
+            })
+            .collect()
+    }
+
+    async fn live_source_objects_page(
+        &self,
+        after: Option<(&str, &str)>,
+        limit: u32,
+    ) -> Result<Vec<crate::git_source_registry::SourceGcObject>> {
+        if limit == 0 || limit > crate::git_source_registry::SOURCE_ROOT_PAGE_MAX {
+            bail!("source GC page limit is invalid")
+        }
+        let (hash, owner) = after.unwrap_or(("", ""));
+        let rows=sqlx::query("WITH objects(hash,len,owner) AS (SELECT root_hash,root_len,CONCAT('r:',root_hash) FROM git_source_roots UNION ALL SELECT child_hash,child_len,CONCAT('r:',root_hash,':',LPAD(ordinal,20,'0')) FROM git_source_members UNION ALL SELECT root_hash,root_len,CONCAT('a:',token) FROM git_source_acquisitions WHERE state='activation_unknown' OR (state='graph_published' AND expires_at>UNIX_TIMESTAMP()) UNION ALL SELECT m.child_hash,m.child_len,CONCAT('a:',m.token,':',LPAD(m.ordinal,20,'0')) FROM git_source_acquisition_members m JOIN git_source_acquisitions a ON a.token=m.token WHERE a.state='activation_unknown' OR (a.state='graph_published' AND a.expires_at>UNIX_TIMESTAMP())) SELECT hash,len,owner FROM objects WHERE hash>? OR (hash=? AND owner>?) ORDER BY hash,owner LIMIT ?")
+            .bind(hash).bind(hash).bind(owner).bind(limit as i64).fetch_all(&self.pool).await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(crate::git_source_registry::SourceGcObject {
+                    hash: row.try_get("hash")?,
+                    len: u64::try_from(row.try_get::<i64, _>("len")?)
+                        .context("source GC object length")?,
+                    owner: row.try_get("owner")?,
                 })
             })
             .collect()
@@ -3222,6 +3331,17 @@ mod tests {
     async fn reset(pool: &MySqlPool) {
         for statement in [
             "DROP TABLE IF EXISTS external_scheduler_child",
+            "DROP TABLE IF EXISTS artifact_intents",
+            "DROP TABLE IF EXISTS git_source_consumers",
+            "DROP TABLE IF EXISTS branch_source_current",
+            "DROP TABLE IF EXISTS branch_source_generations",
+            "DROP TABLE IF EXISTS git_source_desires",
+            "DROP TABLE IF EXISTS git_source_acquisition_members",
+            "DROP TABLE IF EXISTS git_source_acquisitions",
+            "DROP TABLE IF EXISTS git_source_acquisition_sequence",
+            "DROP TABLE IF EXISTS git_source_maintenance",
+            "DROP TABLE IF EXISTS git_source_members",
+            "DROP TABLE IF EXISTS git_source_roots",
             "DROP TABLE IF EXISTS ready_publication_fence_rogue",
             "DROP TABLE IF EXISTS ready_publication_fence_members",
             "DROP TABLE IF EXISTS ready_publication_fences",
@@ -4749,7 +4869,7 @@ mod tests {
                 .fetch_one(&control)
                 .await
                 .unwrap(),
-                6,
+                SCHEMA_VERSION,
                 "stage {stage}"
             );
         }
@@ -4881,6 +5001,133 @@ mod tests {
         let _: Option<i64> =
             sqlx::query_scalar("SELECT RELEASE_LOCK('ripclone_mysql_scheduler_test')")
                 .fetch_one(&mut lock_connection)
+                .await
+                .unwrap();
+    }
+
+    #[tokio::test]
+    async fn mysql_v7_source_registry_transition_live() {
+        let Ok(url) = std::env::var("RIPCLONE_TEST_MYSQL_URL") else {
+            return;
+        };
+        let control = MySqlPoolOptions::new()
+            .max_connections(12)
+            .connect(&url)
+            .await
+            .unwrap();
+        let mut lock = control.acquire().await.unwrap().detach();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT GET_LOCK('ripclone_mysql_scheduler_test',30)")
+                .fetch_one(&mut lock)
+                .await
+                .unwrap(),
+            1
+        );
+        const TABLES: &[&str] = &[
+            "git_source_roots",
+            "git_source_members",
+            "git_source_acquisition_sequence",
+            "git_source_acquisitions",
+            "git_source_acquisition_members",
+            "git_source_desires",
+            "branch_source_generations",
+            "branch_source_current",
+            "git_source_consumers",
+            "artifact_intents",
+            "git_source_maintenance",
+        ];
+        for keep in 0..=TABLES.len() {
+            reset(&control).await;
+            MysqlArtifactScheduler::from_pool(
+                MySqlPoolOptions::new().connect(&url).await.unwrap(),
+                Default::default(),
+                Arc::new(Accept),
+            )
+            .await
+            .unwrap();
+            sqlx::query("UPDATE artifact_scheduler_schema SET version=? WHERE id=1")
+                .bind(V6_TO_V7_DDL)
+                .execute(&control)
+                .await
+                .unwrap();
+            for table in TABLES[keep..].iter().rev() {
+                sqlx::query(sqlx::AssertSqlSafe(format!("DROP TABLE {table}")))
+                    .execute(&control)
+                    .await
+                    .unwrap();
+            }
+            MysqlArtifactScheduler::from_pool(
+                MySqlPoolOptions::new().connect(&url).await.unwrap(),
+                Default::default(),
+                Arc::new(Accept),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT version FROM artifact_scheduler_schema WHERE id=1"
+                )
+                .fetch_one(&control)
+                .await
+                .unwrap(),
+                SCHEMA_VERSION,
+                "v7 prefix {keep}"
+            );
+        }
+        sqlx::query("UPDATE artifact_scheduler_schema SET version=? WHERE id=1")
+            .bind(V6_TO_V7_VALIDATED)
+            .execute(&control)
+            .await
+            .unwrap();
+        MysqlArtifactScheduler::from_pool(
+            MySqlPoolOptions::new().connect(&url).await.unwrap(),
+            Default::default(),
+            Arc::new(Accept),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT version FROM artifact_scheduler_schema WHERE id=1"
+            )
+            .fetch_one(&control)
+            .await
+            .unwrap(),
+            SCHEMA_VERSION
+        );
+
+        sqlx::query("UPDATE artifact_scheduler_schema SET version=? WHERE id=1")
+            .bind(V6_TO_V7_DDL)
+            .execute(&control)
+            .await
+            .unwrap();
+        sqlx::raw_sql("ALTER TABLE git_source_roots MODIFY semantic_digest VARCHAR(63) NOT NULL")
+            .execute(&control)
+            .await
+            .unwrap();
+        assert!(
+            MysqlArtifactScheduler::from_pool(
+                MySqlPoolOptions::new().connect(&url).await.unwrap(),
+                Default::default(),
+                Arc::new(Accept)
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT version FROM artifact_scheduler_schema WHERE id=1"
+            )
+            .fetch_one(&control)
+            .await
+            .unwrap(),
+            V6_TO_V7_DDL
+        );
+        assert_eq!(sqlx::query_scalar::<_,String>("SELECT lower(column_type) FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name='git_source_roots' AND column_name='semantic_digest'").fetch_one(&control).await.unwrap(),"varchar(63)");
+        reset(&control).await;
+        let _: Option<i64> =
+            sqlx::query_scalar("SELECT RELEASE_LOCK('ripclone_mysql_scheduler_test')")
+                .fetch_one(&mut lock)
                 .await
                 .unwrap();
     }
