@@ -17,6 +17,7 @@ use ::libsql::{Connection, Value};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
+use std::path::PathBuf;
 
 use crate::artifact_manifest::CasBlob;
 use crate::artifact_scheduler::{
@@ -24,8 +25,8 @@ use crate::artifact_scheduler::{
 };
 use crate::artifact_scheduler_backend::SOURCE_INTENT_CONSUMER_PREFIX;
 use crate::git_source::{
-    AuthenticatedGitSource, GitSourceLimits, GitSourcePackager, GitSourceUploader,
-    PreparedGitSource,
+    AuthenticatedGitSource, GitSourceLimits, GitSourceLoader, GitSourceMaterializer,
+    GitSourcePackager, GitSourceUploader, MaterializedGitSource, PreparedGitSource,
 };
 use crate::storage::StorageRef;
 use crate::sync_coordinator::{
@@ -381,39 +382,63 @@ impl LibsqlGitSourceRegistry {
         }
         let plan = packager.owned_upload_plan(prepared)?;
         let publication_cancel = cancelled.child_token();
-        let heartbeat_cancel = publication_cancel.clone();
+        let _cancel_on_drop = publication_cancel.clone().drop_guard();
         let registry = self.clone();
-        let heartbeat_acquisition = acquisition.clone();
-        let mut heartbeat = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
-            loop {
-                tokio::select! {
-                    _=heartbeat_cancel.cancelled()=>return Ok(()),
-                    _=interval.tick()=>{
-                        if !registry.renew(&heartbeat_acquisition,60).await?{
-                            heartbeat_cancel.cancel();
-                            bail!("libsql source acquisition lease was lost during upload")
+        let supervisor_acquisition = acquisition.clone();
+        let supervisor_cancel = publication_cancel.clone();
+        let supervisor = tokio::spawn(async move {
+            let heartbeat_cancel = supervisor_cancel.clone();
+            let heartbeat_acquisition = supervisor_acquisition.clone();
+            let heartbeat_registry = registry.clone();
+            let mut heartbeat = tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+                loop {
+                    tokio::select! {
+                        _=heartbeat_cancel.cancelled()=>return Ok(()),
+                        _=interval.tick()=>{
+                            if !heartbeat_registry.renew(&heartbeat_acquisition,60).await?{
+                                heartbeat_cancel.cancel();
+                                bail!("libsql source acquisition lease was lost during upload")
+                            }
                         }
                     }
                 }
+            });
+            let upload_cancel = supervisor_cancel.clone();
+            let mut upload = tokio::task::spawn_blocking(move || plan.publish(&upload_cancel));
+            let result: Result<()> = async {
+                tokio::select! {
+                    result=&mut upload=>{
+                        supervisor_cancel.cancel();
+                        let upload_result=result.context("libsql source upload task did not join")?;
+                        let heartbeat_result=heartbeat.await.context("libsql source upload heartbeat did not join")?;
+                        heartbeat_result?;upload_result
+                    }
+                    result=&mut heartbeat=>{
+                        supervisor_cancel.cancel();
+                        let heartbeat_result=result.context("libsql source upload heartbeat did not join")?;
+                        let upload_result=upload.await.context("cancelled libsql source upload did not join")?;
+                        heartbeat_result?;upload_result
+                    }
+                }
             }
+            .await;
+            if let Err(error) = result {
+                if let Err(settlement) = registry
+                    .fail(&supervisor_acquisition, FailureClass::Retryable)
+                    .await
+                {
+                    return Err(error).context(format!(
+                        "failed libsql source upload could not settle retryably: {settlement}"
+                    ));
+                }
+                return Err(error);
+            }
+            Ok(())
         });
-        let upload_cancel = publication_cancel.clone();
-        let mut upload = tokio::task::spawn_blocking(move || plan.publish(&upload_cancel));
-        tokio::select! {
-            result=&mut upload=>{
-                publication_cancel.cancel();
-                let upload_result=result.context("libsql source upload task did not join")?;
-                let heartbeat_result=heartbeat.await.context("libsql source upload heartbeat did not join")?;
-                heartbeat_result?;upload_result
-            }
-            result=&mut heartbeat=>{
-                publication_cancel.cancel();
-                let heartbeat_result=result.context("libsql source upload heartbeat did not join")?;
-                let upload_result=upload.await.context("cancelled libsql source upload did not join")?;
-                heartbeat_result?;upload_result
-            }
-        }
+        supervisor
+            .await
+            .context("libsql source upload supervisor did not join")?
     }
 
     pub async fn fail(
@@ -442,6 +467,17 @@ impl LibsqlGitSourceRegistry {
         acquisition: &GitSourceAcquisition,
         prepared: &PreparedGitSource,
         cancelled: &CancellationToken,
+    ) -> Result<DurableSourceSnapshot> {
+        self.register_inner(acquisition, prepared, cancelled, false)
+            .await
+    }
+
+    async fn register_inner(
+        &self,
+        acquisition: &GitSourceAcquisition,
+        prepared: &PreparedGitSource,
+        cancelled: &CancellationToken,
+        inject_lost_commit_ack: bool,
     ) -> Result<DurableSourceSnapshot> {
         let view = prepared.registry_view(&self.source_limits)?;
         verify_acquisition_identity(acquisition, &view)?;
@@ -513,7 +549,18 @@ impl LibsqlGitSourceRegistry {
                 Err(error)
             }
             Ok(snapshot) => match transaction.commit().await {
-                Ok(()) => Ok(snapshot),
+                Ok(()) if !inject_lost_commit_ack => Ok(snapshot),
+                Ok(()) => {
+                    let _ = self.mark_activation_unknown(acquisition).await?;
+                    match self.reconcile_activation(acquisition).await? {
+                        SourceAcquireOutcome::Ready(snapshot) => Ok(snapshot),
+                        SourceAcquireOutcome::Failed { class, .. } => bail!(
+                            "injected ambiguous libsql registration settled failed: {}",
+                            class.as_str()
+                        ),
+                        _ => bail!("injected ambiguous libsql source registration did not settle"),
+                    }
+                }
                 Err(error) => {
                     let _ = self.mark_activation_unknown(acquisition).await?;
                     match self.reconcile_activation(acquisition).await? {
@@ -632,6 +679,105 @@ impl LibsqlGitSourceRegistry {
         Ok(connection.execute("DELETE FROM git_source_consumers WHERE root_hash=? AND session_id=? AND purpose='builder'",values![root_hash.into(),session_id.into()]).await?==1)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub async fn with_materialized_builder_source<L, F, T>(
+        &self,
+        artifact_id: i64,
+        artifact_owner: &str,
+        lease_generation: u64,
+        workspace: &str,
+        repo: &str,
+        commit: &str,
+        session_id: &str,
+        ttl_secs: i64,
+        loader: L,
+        scratch: PathBuf,
+        cancelled: &CancellationToken,
+        work: F,
+    ) -> Result<T>
+    where
+        L: GitSourceLoader + Send + Sync + 'static,
+        F: FnOnce(&MaterializedGitSource, &CancellationToken) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let authority = self
+            .claim_authenticated(
+                artifact_id,
+                artifact_owner,
+                lease_generation,
+                workspace,
+                repo,
+                commit,
+                session_id,
+                ttl_secs,
+            )
+            .await?;
+        let root = authority.root_hash().to_owned();
+        let owned_cancel = cancelled.child_token();
+        let _cancel_on_drop = owned_cancel.clone().drop_guard();
+        let limits = self.source_limits.clone();
+        let registry = self.clone();
+        let supervisor_root = root.clone();
+        let supervisor_session = session_id.to_owned();
+        let supervisor_owner = artifact_owner.to_owned();
+        let supervisor_cancel = owned_cancel.clone();
+        let supervisor = tokio::spawn(async move {
+            let task_cancel = supervisor_cancel.clone();
+            let mut task = tokio::task::spawn_blocking(move || {
+                let materialized = GitSourceMaterializer::new(&loader, &scratch, limits)
+                    .materialize(&authority, &task_cancel)?;
+                work(&materialized, &task_cancel)
+            });
+            let heartbeat_root = supervisor_root.clone();
+            let heartbeat_session = supervisor_session.clone();
+            let heartbeat_owner = supervisor_owner;
+            let heartbeat_cancel = supervisor_cancel.clone();
+            let heartbeat_registry = registry.clone();
+            let heartbeat_period = std::time::Duration::from_millis(
+                ((ttl_secs as u64).saturating_mul(1000) / 3).clamp(100, 10_000),
+            );
+            let mut heartbeat = tokio::spawn(async move {
+                let mut interval = tokio::time::interval(heartbeat_period);
+                loop {
+                    tokio::select! {
+                        _=heartbeat_cancel.cancelled()=>return Ok(()),
+                        _=interval.tick()=>{
+                            if !heartbeat_registry.renew_builder_claim(artifact_id,&heartbeat_owner,lease_generation,&heartbeat_root,&heartbeat_session,ttl_secs).await?{
+                                heartbeat_cancel.cancel();
+                                bail!("libsql builder source or artifact lease was lost during materialization")
+                            }
+                        }
+                    }
+                }
+            });
+            let (task_result, heartbeat_result) = tokio::select! {
+                value=&mut task=>{
+                    supervisor_cancel.cancel();
+                    let task_result=value.context("libsql builder source task did not join").and_then(|result|result);
+                    let heartbeat_result=heartbeat.await.context("libsql builder source heartbeat did not join").and_then(|result|result);
+                    (task_result,heartbeat_result)
+                },
+                beat=&mut heartbeat=>{
+                    supervisor_cancel.cancel();
+                    let heartbeat_result=beat.context("libsql builder source heartbeat did not join").and_then(|result|result);
+                    let task_result=task.await.context("cancelled libsql builder source task did not join").and_then(|result|result);
+                    (task_result,heartbeat_result)
+                }
+            };
+            let released = registry
+                .release_builder_claim(&supervisor_root, &supervisor_session)
+                .await?;
+            if !released {
+                bail!("libsql builder source claim disappeared before release")
+            }
+            heartbeat_result?;
+            task_result
+        });
+        supervisor
+            .await
+            .context("libsql builder source supervisor did not join")?
+    }
+
     pub async fn promote_deferred_page(&self, limit: u32) -> Result<u32> {
         if limit == 0 || limit > 256 {
             bail!("libsql deferred intent promotion page is invalid")
@@ -683,7 +829,7 @@ impl LibsqlGitSourceRegistry {
             bail!("libsql intent reconciliation page is invalid")
         }
         let connection = self.database.connect()?;
-        let mut rows=connection.query("SELECT i.id,i.artifact_id,i.consumer_id FROM artifact_intents i JOIN artifact_jobs j ON j.id=i.artifact_id WHERE i.state='promoted' AND j.state IN('ready','failed') ORDER BY i.id LIMIT ?",[limit as i64]).await?;
+        let mut rows=connection.query("SELECT i.id,i.artifact_id,i.consumer_id FROM artifact_intents i JOIN artifact_jobs j ON j.id=i.artifact_id WHERE i.state='promoted' AND (j.state='failed' OR (j.state='ready' AND NOT EXISTS(SELECT 1 FROM artifact_observations o WHERE o.desired_artifact_id=i.artifact_id OR o.published_artifact_id=i.artifact_id) AND NOT EXISTS(SELECT 1 FROM artifact_base_retention b WHERE b.artifact_id=i.artifact_id) AND NOT EXISTS(SELECT 1 FROM artifact_consumers c WHERE c.artifact_id=i.artifact_id AND c.consumer_id<>i.consumer_id AND c.expires_at>unixepoch()) AND NOT EXISTS(SELECT 1 FROM ready_publication_fence_members m JOIN ready_publication_fences f ON f.token=m.token AND f.generation=m.generation WHERE m.artifact_id=i.artifact_id AND (f.state='activation_unknown' OR f.expires_at>unixepoch())))) ORDER BY i.id LIMIT ?",[limit as i64]).await?;
         let mut candidates = Vec::new();
         while let Some(row) = rows.next().await? {
             candidates.push((
@@ -700,7 +846,7 @@ impl LibsqlGitSourceRegistry {
                 .transaction_with_behavior(::libsql::TransactionBehavior::Immediate)
                 .await?;
             let result:Result<bool>=async{
-                let terminal=one_i64_params(&transaction,"SELECT count(*) FROM artifact_intents i JOIN artifact_jobs j ON j.id=i.artifact_id WHERE i.id=? AND i.artifact_id=? AND i.consumer_id=? AND i.state='promoted' AND (j.state='ready' OR (j.state='failed' AND (j.failure_class IN('permanent','dead_letter') OR (j.failure_class='retryable' AND j.retry_count>=?))))",values![id.into(),artifact.into(),consumer.clone().into(),(self.scheduler_limits.max_manual_retries as i64).into()]).await?;
+                let terminal=one_i64_params(&transaction,"SELECT count(*) FROM artifact_intents i JOIN artifact_jobs j ON j.id=i.artifact_id WHERE i.id=? AND i.artifact_id=? AND i.consumer_id=? AND i.state='promoted' AND ((j.state='failed' AND (j.failure_class IN('permanent','dead_letter') OR (j.failure_class='retryable' AND j.retry_count>=?))) OR (j.state='ready' AND NOT EXISTS(SELECT 1 FROM artifact_observations o WHERE o.desired_artifact_id=i.artifact_id OR o.published_artifact_id=i.artifact_id) AND NOT EXISTS(SELECT 1 FROM artifact_base_retention b WHERE b.artifact_id=i.artifact_id) AND NOT EXISTS(SELECT 1 FROM artifact_consumers c WHERE c.artifact_id=i.artifact_id AND c.consumer_id<>i.consumer_id AND c.expires_at>unixepoch()) AND NOT EXISTS(SELECT 1 FROM ready_publication_fence_members m JOIN ready_publication_fences f ON f.token=m.token AND f.generation=m.generation WHERE m.artifact_id=i.artifact_id AND (f.state='activation_unknown' OR f.expires_at>unixepoch()))))",values![id.into(),artifact.into(),consumer.clone().into(),(self.scheduler_limits.max_manual_retries as i64).into()]).await?;
                 if terminal!=1{return Ok(false)}
                 let source=transaction.execute("DELETE FROM git_source_consumers WHERE consumer_id=? AND purpose='intent'",[consumer.clone()]).await?;
                 let core=transaction.execute("DELETE FROM artifact_consumers WHERE artifact_id=? AND consumer_id=?",values![artifact.into(),consumer.into()]).await?;
@@ -1207,6 +1353,21 @@ async fn one_string(connection: &Connection, sql: &str) -> Result<String> {
     Ok(value)
 }
 
+#[cfg(test)]
+async fn one_string_params(
+    connection: &Connection,
+    sql: &str,
+    params: Vec<Value>,
+) -> Result<String> {
+    let mut rows = connection.query(sql, params).await?;
+    let row = rows.next().await?.context("libsql scalar row missing")?;
+    let value = row.get(0)?;
+    if rows.next().await?.is_some() {
+        bail!("libsql scalar query returned multiple rows")
+    }
+    Ok(value)
+}
+
 async fn one_maintenance(
     connection: &Connection,
 ) -> Result<(i64, String, i64, String, i64, String, i64)> {
@@ -1270,9 +1431,12 @@ fn ddl_name(statement: &str) -> &str {
 mod tests {
     use super::*;
     use crate::artifact_scheduler::{ClaimedArtifact, CompletionEvidence, CompletionVerifier};
+    use crate::artifact_scheduler_backend::ArtifactSchedulerPersistence;
     use crate::artifact_scheduler_libsql::LibsqlArtifactScheduler;
+    use crate::git_source::{GitSourceLoader, GitSourcePackager, GitSourceUploader};
     use crate::storage::{HashEntry, LocalStorage, StorageBackend};
     use std::net::TcpListener;
+    use std::path::Path;
     use std::process::{Child, Command, Stdio};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1393,6 +1557,97 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Default)]
+    struct SlowUploader {
+        entered: Arc<AtomicBool>,
+        cancelled: Arc<AtomicBool>,
+        finished: Arc<AtomicBool>,
+    }
+    impl GitSourceUploader for SlowUploader {
+        fn put_file(
+            &self,
+            blob: &CasBlob,
+            source: &Path,
+            cancelled: &CancellationToken,
+        ) -> Result<()> {
+            self.entered.store(true, Ordering::SeqCst);
+            let result = (|| {
+                for _ in 0..500 {
+                    if cancelled.is_cancelled() {
+                        self.cancelled.store(true, Ordering::SeqCst);
+                        bail!("cancelled slow libsql upload")
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                let bytes = std::fs::read(source)?;
+                if bytes.len() as u64 != blob.len
+                    || hex::encode(Sha256::digest(&bytes)) != blob.hash
+                {
+                    bail!("slow libsql upload input mismatch")
+                }
+                Ok(())
+            })();
+            self.finished.store(true, Ordering::SeqCst);
+            result
+        }
+        fn put_bytes(
+            &self,
+            blob: &CasBlob,
+            bytes: &[u8],
+            cancelled: &CancellationToken,
+        ) -> Result<()> {
+            if cancelled.is_cancelled() {
+                self.cancelled.store(true, Ordering::SeqCst);
+                bail!("cancelled slow libsql root upload")
+            }
+            if bytes.len() as u64 != blob.len || hex::encode(Sha256::digest(bytes)) != blob.hash {
+                bail!("slow libsql root mismatch")
+            }
+            Ok(())
+        }
+    }
+
+    #[derive(Clone)]
+    struct BlockingLoader {
+        inner: StorageRef,
+        entered: Arc<AtomicBool>,
+        cancelled: Arc<AtomicBool>,
+        finished: Arc<AtomicBool>,
+    }
+    impl GitSourceLoader for BlockingLoader {
+        fn load_file(
+            &self,
+            _blob: &CasBlob,
+            _destination: &Path,
+            cancelled: &CancellationToken,
+        ) -> Result<()> {
+            self.entered.store(true, Ordering::SeqCst);
+            loop {
+                if cancelled.is_cancelled() {
+                    self.cancelled.store(true, Ordering::SeqCst);
+                    self.finished.store(true, Ordering::SeqCst);
+                    bail!("cancelled blocking libsql source load")
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+        fn load_bytes(
+            &self,
+            blob: &CasBlob,
+            maximum: u64,
+            cancelled: &CancellationToken,
+        ) -> Result<Vec<u8>> {
+            if cancelled.is_cancelled() || blob.len > maximum {
+                bail!("invalid blocking libsql source root read")
+            }
+            let bytes = self.inner.get(&blob.hash)?;
+            if bytes.len() as u64 != blob.len || hex::encode(Sha256::digest(&bytes)) != blob.hash {
+                bail!("blocking libsql source root mismatch")
+            }
+            Ok(bytes)
+        }
+    }
+
     #[tokio::test]
     async fn exact_source_schema_round_trip_and_planted_ddl_rejected() {
         let Some((_server, _db, connection)) = connection().await else {
@@ -1477,6 +1732,94 @@ mod tests {
             .await
             .unwrap();
         assert!(validate_v7_schema(&connection).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn source_configuration_seal_and_limits_survive_restart_and_reject_drift() {
+        let Some((_server, database, _connection)) = connection().await else {
+            return;
+        };
+        let shared = Arc::new(database);
+        let scheduler_limits = SchedulerLimits::default();
+        LibsqlArtifactScheduler::from_shared_database(
+            shared.clone(),
+            scheduler_limits.clone(),
+            Arc::new(Accept),
+        )
+        .await
+        .unwrap();
+        let storage_dir = tempfile::tempdir().unwrap();
+        let storage: StorageRef = Arc::new(LocalStorage::new(storage_dir.path()).unwrap());
+        let source_limits = GitSourceLimits::default();
+        let original = LibsqlGitSourceRegistry::new(
+            shared.clone(),
+            storage.clone(),
+            scheduler_limits.clone(),
+            source_limits.clone(),
+            [7; 32],
+        )
+        .await
+        .unwrap();
+        let sealed_identity = original.fleet_seal_identity();
+        drop(original);
+
+        let restarted = LibsqlGitSourceRegistry::new(
+            shared.clone(),
+            storage.clone(),
+            scheduler_limits.clone(),
+            source_limits.clone(),
+            [7; 32],
+        )
+        .await
+        .unwrap();
+        assert_eq!(restarted.fleet_seal_identity(), sealed_identity);
+        drop(restarted);
+
+        let mut changed_source_limits = source_limits;
+        changed_source_limits.max_packs += 1;
+        let source_error = match LibsqlGitSourceRegistry::new(
+            shared.clone(),
+            storage.clone(),
+            scheduler_limits.clone(),
+            changed_source_limits,
+            [7; 32],
+        )
+        .await
+        {
+            Ok(_) => panic!("libsql source limit drift was accepted"),
+            Err(error) => error.to_string(),
+        };
+        assert!(source_error.contains("limits or authority seal differ"));
+
+        let seal_error = match LibsqlGitSourceRegistry::new(
+            shared.clone(),
+            storage.clone(),
+            scheduler_limits.clone(),
+            GitSourceLimits::default(),
+            [6; 32],
+        )
+        .await
+        {
+            Ok(_) => panic!("libsql source authority seal drift was accepted"),
+            Err(error) => error.to_string(),
+        };
+        assert!(seal_error.contains("limits or authority seal differ"));
+
+        let mut changed_scheduler_limits = scheduler_limits;
+        changed_scheduler_limits.workspace_running += 1;
+        let scheduler_error = match LibsqlGitSourceRegistry::new(
+            shared,
+            storage,
+            changed_scheduler_limits,
+            GitSourceLimits::default(),
+            [7; 32],
+        )
+        .await
+        {
+            Ok(_) => panic!("libsql source scheduler-limit drift was accepted"),
+            Err(error) => error.to_string(),
+        };
+        assert!(scheduler_error.contains("scheduler limits differ"));
     }
 
     #[tokio::test]
@@ -1666,7 +2009,7 @@ mod tests {
         connection
             .execute(
                 "UPDATE git_source_acquisitions SET root_hash=upper(root_hash) WHERE token=?",
-                [acquisition.token.clone()],
+                values![acquisition.token.clone().into()],
             )
             .await
             .unwrap();
@@ -1728,11 +2071,11 @@ mod tests {
         ));
     }
 
-    async fn registered_source(
+    fn prepared_source(
         registry: &LibsqlGitSourceRegistry,
         workspace: &str,
         commit: &str,
-    ) -> DurableSourceSnapshot {
+    ) -> PreparedGitSource {
         let pack_bytes = format!("pack-{commit}").into_bytes();
         let index_bytes = format!("index-{commit}").into_bytes();
         let pack = CasBlob {
@@ -1754,6 +2097,15 @@ mod tests {
             .storage
             .put(&view.root.hash, &view.root_bytes)
             .unwrap();
+        prepared
+    }
+
+    async fn registered_source(
+        registry: &LibsqlGitSourceRegistry,
+        workspace: &str,
+        commit: &str,
+    ) -> DurableSourceSnapshot {
+        let prepared = prepared_source(registry, workspace, commit);
         let permit = match registry
             .begin_acquisition(
                 workspace,
@@ -1779,6 +2131,608 @@ mod tests {
             .register(&acquisition, &prepared, &CancellationToken::new())
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn committed_registration_with_lost_ack_recovers_exact_snapshot() {
+        let Some((_server, database, _connection)) = connection().await else {
+            return;
+        };
+        let limits = SchedulerLimits::default();
+        let shared = Arc::new(database);
+        LibsqlArtifactScheduler::from_shared_database(
+            shared.clone(),
+            limits.clone(),
+            Arc::new(Accept),
+        )
+        .await
+        .unwrap();
+        let storage_dir = tempfile::tempdir().unwrap();
+        let storage: StorageRef = Arc::new(LocalStorage::new(storage_dir.path()).unwrap());
+        let registry = LibsqlGitSourceRegistry::new(
+            shared.clone(),
+            storage,
+            limits,
+            GitSourceLimits::default(),
+            [2; 32],
+        )
+        .await
+        .unwrap();
+        let commit = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let prepared = prepared_source(&registry, "ws", commit);
+        let permit = match registry
+            .begin_acquisition(
+                "ws",
+                "o/r",
+                commit,
+                SOURCE_FORMAT_VERSION,
+                "worker",
+                "lost-ack",
+                60,
+                SyncIntent::EnsureCurrent,
+            )
+            .await
+            .unwrap()
+        {
+            SourceBeginOutcome::PermitToPrepare(permit) => permit,
+            _ => panic!("lost-ack source preparation was not admitted"),
+        };
+        let (acquisition, _) = registry
+            .bind_prepared_graph(&permit, &prepared)
+            .await
+            .unwrap();
+        let snapshot = registry
+            .register_inner(&acquisition, &prepared, &CancellationToken::new(), true)
+            .await
+            .unwrap();
+        assert_eq!(snapshot.manifest(), prepared.root().hash);
+        let db = shared.connect().unwrap();
+        assert_eq!(
+            one_string_params(
+                &db,
+                "SELECT state FROM git_source_acquisitions WHERE token=?",
+                values![acquisition.token.clone().into()],
+            )
+            .await
+            .unwrap(),
+            "registered"
+        );
+        assert_eq!(
+            one_string_params(
+                &db,
+                "SELECT state FROM git_source_desires WHERE workspace='ws' AND repo='o/r' AND commit_oid=?",
+                values![commit.into()],
+            )
+            .await
+            .unwrap(),
+            "registered"
+        );
+        assert!(matches!(
+            registry
+                .begin_acquisition(
+                    "ws",
+                    "o/r",
+                    commit,
+                    SOURCE_FORMAT_VERSION,
+                    "other",
+                    "after-lost-ack",
+                    60,
+                    SyncIntent::EnsureCurrent,
+                )
+                .await
+                .unwrap(),
+            SourceBeginOutcome::Ready(ready) if ready.manifest() == snapshot.manifest()
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn upload_lease_loss_cancels_drains_and_settles_retryably() {
+        let Some((_server, database, _connection)) = connection().await else {
+            return;
+        };
+        let limits = SchedulerLimits::default();
+        let shared = Arc::new(database);
+        LibsqlArtifactScheduler::from_shared_database(
+            shared.clone(),
+            limits.clone(),
+            Arc::new(Accept),
+        )
+        .await
+        .unwrap();
+        let storage_dir = tempfile::tempdir().unwrap();
+        let storage: StorageRef = Arc::new(LocalStorage::new(storage_dir.path()).unwrap());
+        let registry = LibsqlGitSourceRegistry::new(
+            shared.clone(),
+            storage,
+            limits,
+            GitSourceLimits::default(),
+            [5; 32],
+        )
+        .await
+        .unwrap();
+        let commit = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let prepared = prepared_source(&registry, "ws", commit);
+        let permit = match registry
+            .begin_acquisition(
+                "ws",
+                "o/r",
+                commit,
+                SOURCE_FORMAT_VERSION,
+                "worker",
+                "upload-lease-loss",
+                60,
+                SyncIntent::EnsureCurrent,
+            )
+            .await
+            .unwrap()
+        {
+            SourceBeginOutcome::PermitToPrepare(permit) => permit,
+            _ => panic!("upload source preparation was not admitted"),
+        };
+        let (acquisition, publication) = registry
+            .bind_prepared_graph(&permit, &prepared)
+            .await
+            .unwrap();
+        let view = prepared.registry_view(&GitSourceLimits::default()).unwrap();
+        let local_dir = tempfile::tempdir().unwrap();
+        let local = crate::cas::Cas::new(local_dir.path()).unwrap();
+        for member in &view.members {
+            let bytes = registry.storage.get(&member.blob.hash).unwrap();
+            local.put_with_hash(&member.blob.hash, &bytes).unwrap();
+        }
+        let uploader = SlowUploader::default();
+        let scratch = tempfile::tempdir().unwrap();
+        let packager = GitSourcePackager::new(
+            &local,
+            &uploader,
+            scratch.path(),
+            GitSourceLimits::default(),
+        );
+        shared
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE git_source_acquisitions SET expires_at=0 WHERE token=?",
+                values![acquisition.token.clone().into()],
+            )
+            .await
+            .unwrap();
+        assert!(
+            registry
+                .publish_protected(
+                    &acquisition,
+                    &packager,
+                    &prepared,
+                    &publication,
+                    &CancellationToken::new(),
+                )
+                .await
+                .is_err()
+        );
+        assert!(uploader.entered.load(Ordering::SeqCst));
+        assert!(uploader.cancelled.load(Ordering::SeqCst));
+        assert!(uploader.finished.load(Ordering::SeqCst));
+        let db = shared.connect().unwrap();
+        assert_eq!(
+            one_string_params(
+                &db,
+                "SELECT state || ':' || failure_class FROM git_source_acquisitions WHERE token=?",
+                values![acquisition.token.clone().into()],
+            )
+            .await
+            .unwrap(),
+            "failed:retryable"
+        );
+        assert_eq!(
+            one_string_params(
+                &db,
+                "SELECT state || ':' || failure_class FROM git_source_desires WHERE workspace='ws' AND repo='o/r' AND commit_oid=?",
+                values![commit.into()],
+            )
+            .await
+            .unwrap(),
+            "failed:retryable"
+        );
+
+        let abort_commit = "abababababababababababababababababababab";
+        let abort_prepared = prepared_source(&registry, "ws", abort_commit);
+        let abort_permit = match registry
+            .begin_acquisition(
+                "ws",
+                "o/r",
+                abort_commit,
+                SOURCE_FORMAT_VERSION,
+                "worker",
+                "upload-caller-abort",
+                60,
+                SyncIntent::EnsureCurrent,
+            )
+            .await
+            .unwrap()
+        {
+            SourceBeginOutcome::PermitToPrepare(permit) => permit,
+            _ => panic!("aborted upload source preparation was not admitted"),
+        };
+        let (abort_acquisition, abort_publication) = registry
+            .bind_prepared_graph(&abort_permit, &abort_prepared)
+            .await
+            .unwrap();
+        let abort_view = abort_prepared
+            .registry_view(&GitSourceLimits::default())
+            .unwrap();
+        let abort_objects = abort_view
+            .members
+            .iter()
+            .map(|member| {
+                (
+                    member.blob.hash.clone(),
+                    registry.storage.get(&member.blob.hash).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let abort_uploader = SlowUploader::default();
+        let abort_flags = abort_uploader.clone();
+        let abort_registry = registry.clone();
+        let abort_acquisition_for_task = abort_acquisition.clone();
+        let abort_task = tokio::spawn(async move {
+            let local_dir = tempfile::tempdir().unwrap();
+            let local = crate::cas::Cas::new(local_dir.path()).unwrap();
+            for (hash, bytes) in abort_objects {
+                local.put_with_hash(&hash, &bytes).unwrap();
+            }
+            let scratch = tempfile::tempdir().unwrap();
+            let packager = GitSourcePackager::new(
+                &local,
+                &abort_uploader,
+                scratch.path(),
+                GitSourceLimits::default(),
+            );
+            abort_registry
+                .publish_protected(
+                    &abort_acquisition_for_task,
+                    &packager,
+                    &abort_prepared,
+                    &abort_publication,
+                    &CancellationToken::new(),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !abort_flags.entered.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("aborted libsql upload never entered child worker");
+        abort_task.abort();
+        assert!(abort_task.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let settled = one_string_params(
+                    &db,
+                    "SELECT state || ':' || failure_class FROM git_source_acquisitions WHERE token=?",
+                    values![abort_acquisition.token.clone().into()],
+                )
+                .await;
+                if abort_flags.finished.load(Ordering::SeqCst)
+                    && abort_flags.cancelled.load(Ordering::SeqCst)
+                    && matches!(settled.as_deref(), Ok("failed:retryable"))
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("aborted libsql upload did not drain and settle retryably");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn builder_lease_loss_cancels_drains_and_releases_source_claim() {
+        let Some((_server, database, _connection)) = connection().await else {
+            return;
+        };
+        let limits = SchedulerLimits::default();
+        let shared = Arc::new(database);
+        LibsqlArtifactScheduler::from_shared_database(
+            shared.clone(),
+            limits.clone(),
+            Arc::new(Accept),
+        )
+        .await
+        .unwrap();
+        let storage_dir = tempfile::tempdir().unwrap();
+        let storage: StorageRef = Arc::new(LocalStorage::new(storage_dir.path()).unwrap());
+        let registry = LibsqlGitSourceRegistry::new(
+            shared.clone(),
+            storage,
+            limits,
+            GitSourceLimits::default(),
+            [1; 32],
+        )
+        .await
+        .unwrap();
+        let commit = "cccccccccccccccccccccccccccccccccccccccc";
+        let source = registered_source(&registry, "ws", commit).await;
+        let snapshot = registry.snapshot("ws", "o/r", "main").await.unwrap();
+        let artifact_id = match registry
+            .record_tip_and_intents(
+                &snapshot,
+                &source,
+                &[ArtifactKind::Head],
+                1,
+                SyncIntent::EnsureCurrent,
+            )
+            .await
+            .unwrap()
+        {
+            ArtifactObservationOutcome::Recorded { artifacts, .. } => match artifacts[0].1 {
+                ArtifactIntentOutcome::Subscribed(id) => id,
+                _ => panic!("builder source intent was not promoted"),
+            },
+            _ => panic!("builder source observation was stale"),
+        };
+        let db = shared.connect().unwrap();
+        db.execute(
+            "UPDATE artifact_jobs SET state='running',owner='builder',lease_generation=4,lease_expires_at=unixepoch()+60 WHERE id=?",
+            [artifact_id],
+        )
+        .await
+        .unwrap();
+        let entered = Arc::new(AtomicBool::new(false));
+        let child_cancelled = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
+        let loader = BlockingLoader {
+            inner: registry.storage.clone(),
+            entered: entered.clone(),
+            cancelled: child_cancelled.clone(),
+            finished: finished.clone(),
+        };
+        let scratch = tempfile::tempdir().unwrap();
+        let scratch_path = scratch.path().to_owned();
+        let task_registry = registry.clone();
+        let session = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        let task = tokio::spawn(async move {
+            task_registry
+                .with_materialized_builder_source(
+                    artifact_id,
+                    "builder",
+                    4,
+                    "ws",
+                    "o/r",
+                    commit,
+                    session,
+                    1,
+                    loader,
+                    scratch_path,
+                    &CancellationToken::new(),
+                    |_source, _cancelled| Ok(()),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !entered.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("libsql builder materialization never entered child loader");
+        db.execute(
+            "UPDATE artifact_jobs SET lease_expires_at=0 WHERE id=?",
+            [artifact_id],
+        )
+        .await
+        .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3), task)
+                .await
+                .expect("libsql builder lease-loss worker did not drain")
+                .unwrap()
+                .is_err()
+        );
+        assert!(child_cancelled.load(Ordering::SeqCst));
+        assert!(finished.load(Ordering::SeqCst));
+        assert_eq!(
+            one_i64_params(
+                &db,
+                "SELECT count(*) FROM git_source_consumers WHERE session_id=?",
+                values![session.into()],
+            )
+            .await
+            .unwrap(),
+            0
+        );
+
+        db.execute(
+            "UPDATE artifact_jobs SET state='running',owner='builder',lease_generation=5,lease_expires_at=unixepoch()+60 WHERE id=?",
+            [artifact_id],
+        )
+        .await
+        .unwrap();
+        let abort_entered = Arc::new(AtomicBool::new(false));
+        let abort_cancelled = Arc::new(AtomicBool::new(false));
+        let abort_finished = Arc::new(AtomicBool::new(false));
+        let abort_loader = BlockingLoader {
+            inner: registry.storage.clone(),
+            entered: abort_entered.clone(),
+            cancelled: abort_cancelled.clone(),
+            finished: abort_finished.clone(),
+        };
+        let abort_scratch = tempfile::tempdir().unwrap();
+        let abort_scratch_path = abort_scratch.path().to_owned();
+        let abort_registry = registry.clone();
+        let abort_session = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        let abort_task = tokio::spawn(async move {
+            abort_registry
+                .with_materialized_builder_source(
+                    artifact_id,
+                    "builder",
+                    5,
+                    "ws",
+                    "o/r",
+                    commit,
+                    abort_session,
+                    60,
+                    abort_loader,
+                    abort_scratch_path,
+                    &CancellationToken::new(),
+                    |_source, _cancelled| Ok(()),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !abort_entered.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("aborted libsql builder never entered child loader");
+        abort_task.abort();
+        assert!(abort_task.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let consumers = one_i64_params(
+                    &db,
+                    "SELECT count(*) FROM git_source_consumers WHERE session_id=?",
+                    values![abort_session.into()],
+                )
+                .await;
+                if abort_finished.load(Ordering::SeqCst)
+                    && abort_cancelled.load(Ordering::SeqCst)
+                    && matches!(consumers, Ok(0))
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("aborted libsql builder did not drain and release its source claim");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminal_reconciliation_races_quarantine_without_partial_consumer_settlement() {
+        let Some((_server, database, _connection)) = connection().await else {
+            return;
+        };
+        let limits = SchedulerLimits::default();
+        let shared = Arc::new(database);
+        let scheduler = LibsqlArtifactScheduler::from_shared_database(
+            shared.clone(),
+            limits.clone(),
+            Arc::new(Accept),
+        )
+        .await
+        .unwrap();
+        let storage_dir = tempfile::tempdir().unwrap();
+        let storage: StorageRef = Arc::new(LocalStorage::new(storage_dir.path()).unwrap());
+        let registry = LibsqlGitSourceRegistry::new(
+            shared.clone(),
+            storage,
+            limits,
+            GitSourceLimits::default(),
+            [0; 32],
+        )
+        .await
+        .unwrap();
+        let commit = "dddddddddddddddddddddddddddddddddddddddd";
+        let source = registered_source(&registry, "ws", commit).await;
+        let snapshot = registry.snapshot("ws", "o/r", "main").await.unwrap();
+        assert!(matches!(
+            registry
+                .record_tip_and_intents(
+                    &snapshot,
+                    &source,
+                    &[
+                        ArtifactKind::Head,
+                        ArtifactKind::FullHistory,
+                        ArtifactKind::Files,
+                    ],
+                    1,
+                    SyncIntent::EnsureCurrent,
+                )
+                .await
+                .unwrap(),
+            ArtifactObservationOutcome::Recorded { .. }
+        ));
+        let db = shared.connect().unwrap();
+        let manifest = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        db.execute(
+            "UPDATE artifact_jobs SET state='ready',manifest=?,owner=NULL,lease_expires_at=NULL",
+            [manifest],
+        )
+        .await
+        .unwrap();
+        let mut rows = db
+            .query(
+                "SELECT i.artifact_id,i.consumer_id FROM artifact_intents i ORDER BY i.id",
+                (),
+            )
+            .await
+            .unwrap();
+        let mut intents = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            intents.push((row.get::<i64>(0).unwrap(), row.get::<String>(1).unwrap()));
+        }
+        drop(rows);
+        assert_eq!(intents.len(), 3);
+
+        let reconcile_registry = registry.clone();
+        let reconcile =
+            tokio::spawn(async move { reconcile_registry.reconcile_terminal_intents(512).await });
+        let mut quarantines = tokio::task::JoinSet::new();
+        for (artifact_id, _) in &intents {
+            let scheduler = scheduler.clone();
+            let artifact_id = *artifact_id;
+            quarantines.spawn(async move {
+                scheduler
+                    .quarantine_ready(artifact_id, Some(manifest), "adversarial race")
+                    .await
+            });
+        }
+        let settled = reconcile.await.unwrap().unwrap();
+        assert_eq!(settled, 0);
+        while let Some(result) = quarantines.join_next().await {
+            result.unwrap().unwrap();
+        }
+
+        validate_v7_schema(&db).await.unwrap();
+        for (artifact_id, consumer) in intents {
+            let intent = one_i64_params(
+                &db,
+                "SELECT count(*) FROM artifact_intents WHERE artifact_id=? AND consumer_id=?",
+                values![artifact_id.into(), consumer.clone().into()],
+            )
+            .await
+            .unwrap();
+            let source_consumer = one_i64_params(
+                &db,
+                "SELECT count(*) FROM git_source_consumers WHERE consumer_id=? AND purpose='intent'",
+                values![consumer.clone().into()],
+            )
+            .await
+            .unwrap();
+            let artifact_consumer = one_i64_params(
+                &db,
+                "SELECT count(*) FROM artifact_consumers WHERE artifact_id=? AND consumer_id=?",
+                values![artifact_id.into(), consumer.into()],
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                one_string_params(
+                    &db,
+                    "SELECT state FROM artifact_jobs WHERE id=?",
+                    values![artifact_id.into()],
+                )
+                .await
+                .unwrap(),
+                "queued"
+            );
+            assert_eq!(intent, 1);
+            assert_eq!(intent, source_consumer);
+            assert_eq!(intent, artifact_consumer);
+        }
     }
 
     #[tokio::test]
@@ -1876,6 +2830,15 @@ mod tests {
         );
 
         connection.execute("UPDATE artifact_jobs SET state='ready',owner=NULL,lease_expires_at=NULL,manifest='cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc' WHERE id=?",[second_job]).await.unwrap();
+        assert_eq!(registry.reconcile_terminal_intents(16).await.unwrap(), 0);
+        connection
+            .execute("DELETE FROM artifact_observations", ())
+            .await
+            .unwrap();
+        connection
+            .execute("DELETE FROM artifact_base_retention", ())
+            .await
+            .unwrap();
         assert_eq!(registry.reconcile_terminal_intents(16).await.unwrap(), 2);
         connection
             .execute("DELETE FROM branch_source_current", ())
