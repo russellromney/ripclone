@@ -41,7 +41,7 @@ const PG_SOURCE_TABLES: &[&str] = &[
 ];
 
 pub(crate) async fn validate_postgres_v7(c: &mut PgConnection, complete: bool) -> Result<()> {
-    let names:Vec<String>=sqlx::query_scalar("SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=current_schema() AND c.relkind='r' AND (c.relname LIKE 'git\\_source\\_%' ESCAPE '\\' OR c.relname IN('branch_source_generations','branch_source_current','artifact_intents')) ORDER BY c.relname").fetch_all(&mut *c).await?;
+    let names:Vec<String>=sqlx::query_scalar("SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=current_schema() AND c.relkind='r' AND (c.relname LIKE 'git\\_source\\_%' ESCAPE '\\' OR c.relname LIKE 'branch\\_source\\_%' ESCAPE '\\' OR c.relname LIKE 'artifact\\_intents%' ESCAPE '\\') ORDER BY c.relname").fetch_all(&mut *c).await?;
     if complete && names != PG_SOURCE_TABLES {
         bail!("postgres v7 source registry table inventory differs")
     }
@@ -62,6 +62,22 @@ pub(crate) async fn validate_postgres_v7(c: &mut PgConnection, complete: bool) -
     let invalid_defaults:i64=sqlx::query_scalar("SELECT count(*) FROM information_schema.columns WHERE table_schema=current_schema() AND table_name=ANY($1) AND column_default IS NOT NULL AND NOT ((table_name='artifact_intents' AND column_name='id' AND column_default=$2) OR (table_name='git_source_desires' AND column_name='retry_count' AND column_default='0') OR (table_name='git_source_maintenance' AND ((column_name IN('intent_cursor','acquisition_cursor','updated_at') AND column_default='0') OR (column_name IN('intent_workspace_cursor','root_cursor','config_fingerprint') AND column_default=$3))))").bind(PG_SOURCE_TABLES).bind("nextval('artifact_intents_id_seq'::regclass)").bind("''::text").fetch_one(&mut *c).await?;
     if invalid_defaults != 0 {
         bail!("postgres v7 source registry defaults differ")
+    }
+    let defaults:i64=sqlx::query_scalar("SELECT count(*) FROM information_schema.columns WHERE table_schema=current_schema() AND table_name=ANY($1) AND column_default IS NOT NULL").bind(PG_SOURCE_TABLES).fetch_one(&mut *c).await?;
+    let retry_default:Option<String>=sqlx::query_scalar("SELECT column_default FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='git_source_desires' AND column_name='retry_count'").fetch_optional(&mut *c).await?;
+    if defaults != 8 || retry_default.as_deref() != Some("0") {
+        bail!("postgres v7 source registry required defaults differ")
+    }
+    let indexes:i64=sqlx::query_scalar("SELECT count(*) FROM pg_index x JOIN pg_class r ON r.oid=x.indrelid JOIN pg_namespace n ON n.oid=r.relnamespace WHERE n.nspname=current_schema() AND r.relname=ANY($1)").bind(PG_SOURCE_TABLES).fetch_one(&mut *c).await?;
+    let exact_indexes:i64=sqlx::query_scalar("WITH expected(name,keys) AS (VALUES ('git_source_members_child',ARRAY['child_hash','root_hash']::text[]),('git_source_acquisitions_recovery',ARRAY['state','generation','token']::text[]),('git_source_acquisition_members_child',ARRAY['child_hash','token']::text[]),('branch_source_generations_root',ARRAY['root_hash','workspace','repo']::text[]),('git_source_consumers_expiry',ARRAY['expires_at','root_hash','consumer_id']::text[]),('artifact_intents_promotion',ARRAY['state','updated_at','id']::text[]),('artifact_intents_source',ARRAY['source_root_hash','state','id']::text[])) SELECT count(*) FROM expected e JOIN pg_class i ON i.relname=e.name JOIN pg_namespace n ON n.oid=i.relnamespace AND n.nspname=current_schema() JOIN pg_index x ON x.indexrelid=i.oid WHERE NOT x.indisunique AND x.indpred IS NULL AND x.indexprs IS NULL AND ARRAY(SELECT pg_get_indexdef(i.oid,s,true) FROM generate_series(1,x.indnkeyatts) s ORDER BY s)=e.keys").fetch_one(&mut *c).await?;
+    if indexes != 29 || exact_indexes != 7 {
+        bail!("postgres v7 source registry index inventory differs")
+    }
+    let fks:i64=sqlx::query_scalar("SELECT count(*) FROM pg_constraint k JOIN pg_class owned ON owned.oid=k.conrelid JOIN pg_class referenced ON referenced.oid=k.confrelid JOIN pg_namespace n ON n.oid=owned.relnamespace WHERE n.nspname=current_schema() AND k.contype='f' AND (owned.relname=ANY($1) OR referenced.relname=ANY($1))").bind(PG_SOURCE_TABLES).fetch_one(&mut *c).await?;
+    let intent_fks:i64=sqlx::query_scalar("SELECT count(*) FROM pg_constraint k WHERE k.conrelid='artifact_intents'::regclass AND k.contype='f' AND k.confdeltype='r' AND pg_get_constraintdef(k.oid) IN('FOREIGN KEY (workspace, repo, branch, branch_generation) REFERENCES branch_source_generations(workspace, repo, branch, generation) ON DELETE RESTRICT','FOREIGN KEY (source_root_hash, workspace, repo, commit_oid, source_format_version) REFERENCES git_source_roots(root_hash, workspace, repo, commit_oid, source_format_version) ON DELETE RESTRICT','FOREIGN KEY (artifact_id) REFERENCES artifact_jobs(id) ON DELETE RESTRICT')").fetch_one(&mut *c).await?;
+    let checks:i64=sqlx::query_scalar("SELECT count(*) FROM pg_constraint k JOIN pg_class r ON r.oid=k.conrelid JOIN pg_namespace n ON n.oid=r.relnamespace WHERE n.nspname=current_schema() AND r.relname=ANY($1) AND k.contype='c'").bind(PG_SOURCE_TABLES).fetch_one(&mut *c).await?;
+    if fks != 11 || intent_fks != 3 || checks != 34 {
+        bail!("postgres v7 source registry constraint inventory differs")
     }
     let singleton:i64=sqlx::query_scalar("SELECT count(*) FROM git_source_maintenance WHERE id=1 AND intent_cursor>=0 AND acquisition_cursor>=0").fetch_one(&mut *c).await?;
     let sequence: Option<(i16, i64)> =
@@ -199,6 +215,11 @@ impl PostgresGitSourceRegistry {
         )?;
         let mut tx = self.pool.begin().await?;
         let now = postgres_time(&mut tx).await?;
+        let prior: i64 = sqlx::query_scalar(
+            "SELECT generation FROM git_source_acquisition_sequence WHERE id=1 FOR UPDATE",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
         if let Some(token)=sqlx::query_scalar::<_,String>("SELECT token FROM git_source_acquisitions WHERE workspace=$1 AND repo=$2 AND commit_oid=$3 AND source_format_version=$4 AND state IN('held','graph_published') AND expires_at<=$5 FOR UPDATE").bind(workspace).bind(repo).bind(commit).bind(source_format_version as i64).bind(now).fetch_optional(&mut *tx).await?{
             sqlx::query("UPDATE git_source_desires SET state='failed',root_hash=NULL,failure_class='retryable',acquisition_token=NULL,updated_at=$1 WHERE acquisition_token=$2 AND state='acquiring'").bind(now).bind(&token).execute(&mut *tx).await?;
             sqlx::query("UPDATE git_source_acquisitions SET state='failed',active_identity=NULL,failure_class='retryable',expires_at=0 WHERE token=$1 AND state IN('held','graph_published')").bind(&token).execute(&mut *tx).await?;
@@ -210,11 +231,6 @@ impl PostgresGitSourceRegistry {
             let class=FailureClass::parse(row.try_get::<String,_>("failure_class")?.as_str())?;let retries=checked_u32(row.try_get("retry_count")?,"source retry count")?;
             if intent==SyncIntent::ObserveMovement||class!=FailureClass::Retryable||retries>=self.scheduler_limits.max_manual_retries{tx.commit().await?;return Ok(SourceBeginOutcome::Failed{class,retries})}
         }
-        let prior: i64 = sqlx::query_scalar(
-            "SELECT generation FROM git_source_acquisition_sequence WHERE id=1 FOR UPDATE",
-        )
-        .fetch_one(&mut *tx)
-        .await?;
         let generation = prior.checked_add(1).context("source generation overflow")?;
         sqlx::query(
             "UPDATE git_source_acquisition_sequence SET generation=$1 WHERE id=1 AND generation=$2",
@@ -259,6 +275,9 @@ impl PostgresGitSourceRegistry {
         }
         let mut tx = self.pool.begin().await?;
         let now = postgres_time(&mut tx).await?;
+        sqlx::query("SELECT id FROM scheduler_state WHERE id=1 FOR UPDATE")
+            .fetch_one(&mut *tx)
+            .await?;
         let sweep: i64 =
             sqlx::query_scalar("SELECT count(*) FROM artifact_gc_sweep WHERE expires_at>$1")
                 .bind(now)
@@ -380,6 +399,7 @@ impl PostgresGitSourceRegistry {
         cancelled: &CancellationToken,
     ) -> Result<DurableSourceSnapshot> {
         if cancelled.is_cancelled() {
+            self.fail(a, FailureClass::Retryable).await?;
             bail!("Git source registration cancelled")
         }
         let view = prepared.registry_view(&self.source_limits)?;
@@ -399,12 +419,23 @@ impl PostgresGitSourceRegistry {
             verify_storage_graph(&storage, &blobs, &root_hash, &root_bytes, &blocking)
         });
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
-        loop {
+        let verification:Result<()>=async{loop {
             tokio::select! {result=&mut verify=>{result.context("Git source verifier did not join")??;break},_=cancelled.cancelled()=>{verify_cancel.cancel();verify.await.context("cancelled Git source verifier did not join")??;bail!("Git source registration cancelled")},_=interval.tick()=>if !self.renew(a,60).await?{verify_cancel.cancel();verify.await.context("lease-lost Git source verifier did not join")??;bail!("Git source acquisition lease was lost during verification")}}
+        }Ok(())}.await;
+        if let Err(error) = verification {
+            let _ = self.fail(a, FailureClass::Retryable).await?;
+            return Err(error);
         }
         let mut unknown = self.pool.begin().await?;
         if sqlx::query("UPDATE git_source_acquisitions SET state='activation_unknown' WHERE token=$1 AND generation=$2 AND operation_id=$3 AND state='graph_published'").bind(&a.token).bind(a.generation as i64).bind(&a.operation_id).execute(&mut *unknown).await?.rows_affected()!=1{bail!("source registration capability was lost")}
-        unknown.commit().await?;
+        if let Err(error) = unknown.commit().await {
+            let state:Option<String>=sqlx::query_scalar("SELECT state FROM git_source_acquisitions WHERE token=$1 AND generation=$2 AND operation_id=$3").bind(&a.token).bind(a.generation as i64).bind(&a.operation_id).fetch_optional(&self.pool).await?;
+            if state.as_deref() != Some("activation_unknown") {
+                let _ = self.fail(a, FailureClass::Retryable).await?;
+                return Err(error)
+                    .context("source activation-unknown transition acknowledgement was lost");
+            }
+        }
         let registration:Result<DurableSourceSnapshot>=async{let mut tx=self.pool.begin().await?;let now=postgres_time(&mut tx).await?;
             let descriptor:Option<(String,i64,String,String,String,i64,i64)>=sqlx::query_as("SELECT root_hash,root_len,object_format,semantic_digest,object_set_digest,object_count,total_bytes FROM git_source_acquisitions WHERE token=$1 AND generation=$2 AND operation_id=$3 AND state='activation_unknown' FOR UPDATE").bind(&a.token).bind(a.generation as i64).bind(&a.operation_id).fetch_optional(&mut *tx).await?;let expected=(view.root.hash.clone(),checked_i64(view.root.len,"root length")?,view.object_format.to_owned(),view.semantic_digest.clone(),view.object_set_digest.clone(),checked_i64(view.object_count,"object count")?,checked_i64(view.total_bytes,"source bytes")?);if descriptor!=Some(expected){bail!("source acquisition descriptor differs at registration")}
             let members:Vec<(i64,String,i64,String)>=sqlx::query_as("SELECT ordinal,child_hash,child_len,kind FROM git_source_acquisition_members WHERE token=$1 ORDER BY ordinal").bind(&a.token).fetch_all(&mut *tx).await?;if members.len()!=view.members.len()||members.iter().zip(&view.members).any(|(got,want)|got.0!=want.ordinal as i64||got.1!=want.blob.hash||got.2!=want.blob.len as i64||got.3!=want.kind){bail!("source acquisition members differ at registration")}
@@ -413,14 +444,14 @@ impl PostgresGitSourceRegistry {
             sqlx::query("UPDATE git_source_acquisitions SET state='registered',active_identity=NULL,expires_at=0 WHERE token=$1 AND generation=$2 AND state='activation_unknown'").bind(&a.token).bind(a.generation as i64).execute(&mut *tx).await?;sqlx::query("UPDATE git_source_desires SET state='registered',root_hash=$1,failure_class=NULL,acquisition_token=NULL,updated_at=$2 WHERE acquisition_token=$3 AND state='acquiring'").bind(&view.root.hash).bind(now).bind(&a.token).execute(&mut *tx).await?;let snapshot=DurableSourceSnapshot::registered(view.workspace.clone(),view.repo.clone(),view.commit.clone(),view.root.hash.clone(),a.token.clone(),a.generation)?;tx.commit().await?;Ok(snapshot)}.await;
         match registration {
             Ok(v) => Ok(v),
-            Err(error) => match self.recover_unknown(a).await? {
+            Err(error) => match self.reconcile_activation_unknown(a).await? {
                 Some(v) => Ok(v),
                 None => Err(error).context("PostgreSQL source registration settled failed"),
             },
         }
     }
 
-    async fn recover_unknown(
+    pub async fn reconcile_activation_unknown(
         &self,
         a: &GitSourceAcquisition,
     ) -> Result<Option<DurableSourceSnapshot>> {
@@ -555,15 +586,15 @@ impl PostgresGitSourceRegistry {
         )
         .fetch_one(&self.pool)
         .await?;
-        let ids: Vec<i64> = sqlx::query_scalar(
-            "WITH ranked AS (SELECT id,workspace,updated_at,row_number() OVER(PARTITION BY workspace ORDER BY updated_at,id) AS lane_rank FROM artifact_intents WHERE state='deferred') SELECT id FROM ranked ORDER BY lane_rank,CASE WHEN workspace>$1 THEN 0 ELSE 1 END,workspace,updated_at,id LIMIT $2",
+        let ids: Vec<(i64,String)> = sqlx::query_as(
+            "WITH ranked AS (SELECT id,workspace,updated_at,row_number() OVER(PARTITION BY workspace ORDER BY updated_at,id) AS lane_rank FROM artifact_intents WHERE state='deferred') SELECT id,workspace FROM ranked ORDER BY lane_rank,CASE WHEN workspace>$1 THEN 0 ELSE 1 END,workspace,updated_at,id LIMIT $2",
         )
         .bind(&cursor)
-        .bind((limit as i64) * 64)
+        .bind(4096_i64)
         .fetch_all(&self.pool)
         .await?;
         let mut promoted = 0;
-        for id in ids {
+        for (id, candidate_workspace) in ids {
             if promoted >= limit {
                 break;
             }
@@ -571,22 +602,26 @@ impl PostgresGitSourceRegistry {
             sqlx::query("SELECT id FROM scheduler_state WHERE id=1 FOR UPDATE")
                 .fetch_one(&mut *tx)
                 .await?;
-            let Some(row)=sqlx::query("SELECT workspace,repo,branch,branch_generation,commit_oid,kind,format_version,consumer_id FROM artifact_intents WHERE id=$1 AND state='deferred' FOR UPDATE").bind(id).fetch_optional(&mut *tx).await? else{tx.rollback().await?;continue};
+            sqlx::query("UPDATE git_source_maintenance SET intent_cursor=$1,intent_workspace_cursor=$2,updated_at=EXTRACT(EPOCH FROM clock_timestamp())::BIGINT WHERE id=1").bind(id).bind(&candidate_workspace).execute(&mut *tx).await?;
+            let Some(row)=sqlx::query("SELECT workspace,repo,branch,branch_generation,commit_oid,kind,format_version,consumer_id FROM artifact_intents WHERE id=$1 AND state='deferred' FOR UPDATE").bind(id).fetch_optional(&mut *tx).await? else{tx.commit().await?;continue};
             let workspace: String = row.try_get("workspace")?;
             let kind = ArtifactKind::parse(row.try_get("kind")?)?;
-            if !postgres_capacity(&mut tx, &self.scheduler_limits, &workspace, kind).await? {
-                tx.rollback().await?;
+            let repo: &str = row.try_get("repo")?;
+            let commit: &str = row.try_get("commit_oid")?;
+            let format: i64 = row.try_get("format_version")?;
+            let existing:Option<i64>=sqlx::query_scalar("SELECT id FROM artifact_jobs WHERE workspace=$1 AND repo=$2 AND commit_oid=$3 AND kind=$4 AND format_version=$5").bind(&workspace).bind(repo).bind(commit).bind(kind.as_str()).bind(format).fetch_optional(&mut *tx).await?;
+            if existing.is_none()
+                && !postgres_capacity(&mut tx, &self.scheduler_limits, &workspace, kind).await?
+            {
+                tx.commit().await?;
                 continue;
             }
-            let artifact = postgres_ensure_job(
-                &mut tx,
-                &workspace,
-                row.try_get("repo")?,
-                row.try_get("commit_oid")?,
-                kind,
-                row.try_get("format_version")?,
-            )
-            .await?;
+            let artifact = match existing {
+                Some(id) => id,
+                None => {
+                    postgres_ensure_job(&mut tx, &workspace, repo, commit, kind, format).await?
+                }
+            };
             sqlx::query("UPDATE artifact_intents SET state='promoted',artifact_id=$1,updated_at=EXTRACT(EPOCH FROM clock_timestamp())::BIGINT WHERE id=$2 AND state='deferred'").bind(artifact).bind(id).execute(&mut *tx).await?;
             sqlx::query("INSERT INTO artifact_consumers(artifact_id,consumer_id,expires_at) VALUES($1,$2,$3) ON CONFLICT(artifact_id,consumer_id) DO UPDATE SET expires_at=excluded.expires_at").bind(artifact).bind(row.try_get::<String,_>("consumer_id")?).bind(SOURCE_INTENT_RETENTION_EXPIRY).execute(&mut *tx).await?;
             postgres_upsert_observation(
@@ -601,7 +636,6 @@ impl PostgresGitSourceRegistry {
                 row.try_get("format_version")?,
             )
             .await?;
-            sqlx::query("UPDATE git_source_maintenance SET intent_workspace_cursor=$1,intent_cursor=$2,updated_at=EXTRACT(EPOCH FROM clock_timestamp())::BIGINT WHERE id=1").bind(&workspace).bind(id).execute(&mut *tx).await?;
             tx.commit().await?;
             promoted += 1
         }
