@@ -1874,6 +1874,35 @@ mod tests {
             "failed",
             "cancelled verification left an active acquisition"
         );
+        let retry_permit = match registry
+            .begin_acquisition(
+                "ws",
+                "o/r",
+                &concurrent_commit,
+                1,
+                "retry",
+                "retry",
+                60,
+                SyncIntent::EnsureCurrent,
+            )
+            .await
+            .unwrap()
+        {
+            SourceBeginOutcome::PermitToPrepare(permit) => permit,
+            _ => panic!("cancelled acquisition was not retryable"),
+        };
+        let (retry_acquisition, _) = registry
+            .bind_prepared_graph(&retry_permit, &concurrent_source)
+            .await
+            .unwrap();
+        let retry_snapshot = registry
+            .register(
+                &retry_acquisition,
+                &concurrent_source,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
         let snapshot = match registry
             .begin_acquisition(
                 "ws",
@@ -2058,6 +2087,41 @@ mod tests {
         // cross-row proofs. Startup validation must reject every malformed
         // hybrid, while a rollback proves the negative test is non-destructive.
         let mut corrupt = pool.acquire().await.unwrap().detach();
+        let mismatch_consumer: String = sqlx::query_scalar(
+            "SELECT consumer_id FROM artifact_intents WHERE workspace='ws' ORDER BY id LIMIT 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql("START TRANSACTION")
+            .execute(&mut corrupt)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE artifact_intents SET source_root_hash=?,commit_oid=? WHERE consumer_id=?",
+        )
+        .bind(retry_snapshot.manifest())
+        .bind(retry_snapshot.commit())
+        .bind(&mismatch_consumer)
+        .execute(&mut corrupt)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE git_source_consumers SET root_hash=?,commit_oid=? WHERE consumer_id=?")
+            .bind(retry_snapshot.manifest())
+            .bind(retry_snapshot.commit())
+            .bind(&mismatch_consumer)
+            .execute(&mut corrupt)
+            .await
+            .unwrap();
+        assert!(
+            validate_mysql_v7_state(&mut corrupt).await.is_err(),
+            "intent generation A was accepted with registered source B"
+        );
+        sqlx::raw_sql("ROLLBACK")
+            .execute(&mut corrupt)
+            .await
+            .unwrap();
+
         sqlx::raw_sql("START TRANSACTION")
             .execute(&mut corrupt)
             .await
