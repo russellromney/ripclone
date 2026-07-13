@@ -596,12 +596,52 @@ pub struct ArtifactScheduler {
     pub(crate) completion_sealer: Arc<CompletionSealAuthority>,
 }
 
-struct SqliteGcDeleteFence(Option<PoolConnection<Sqlite>>);
+struct ImmediateTransaction {
+    connection: Option<PoolConnection<Sqlite>>,
+}
+
+impl ImmediateTransaction {
+    async fn begin(pool: &SqlitePool) -> Result<Self> {
+        let mut transaction = Self {
+            connection: Some(pool.acquire().await?),
+        };
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *transaction)
+            .await?;
+        Ok(transaction)
+    }
+    fn release(mut self) {
+        drop(self.connection.take());
+    }
+}
+impl std::ops::Deref for ImmediateTransaction {
+    type Target = sqlx::SqliteConnection;
+    fn deref(&self) -> &Self::Target {
+        self.connection.as_ref().expect("transaction connection")
+    }
+}
+impl std::ops::DerefMut for ImmediateTransaction {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.connection.as_mut().expect("transaction connection")
+    }
+}
+impl Drop for ImmediateTransaction {
+    fn drop(&mut self) {
+        if let Some(connection) = self.connection.take() {
+            drop(connection.detach());
+        }
+    }
+}
+
+struct SqliteGcDeleteFence(Option<ImmediateTransaction>);
 #[async_trait::async_trait]
 impl crate::artifact_scheduler_backend::GcDeleteFence for SqliteGcDeleteFence {
     async fn release(mut self: Box<Self>) -> Result<()> {
         if let Some(mut connection) = self.0.take() {
-            sqlx::query("COMMIT").execute(&mut *connection).await?;
+            if let Err(error) = sqlx::query("COMMIT").execute(&mut *connection).await {
+                return Err(error).context("commit GC delete fence; connection retired");
+            }
+            connection.release();
         }
         Ok(())
     }
@@ -728,10 +768,7 @@ impl ArtifactScheduler {
             bail!("completion verifier identity is empty")
         }
         let fingerprint = scheduler_fingerprint(&limits, verifier_id);
-        let mut migration = pool.acquire().await?;
-        sqlx::query("BEGIN IMMEDIATE")
-            .execute(&mut *migration)
-            .await?;
+        let mut migration = ImmediateTransaction::begin(&pool).await?;
         let migration_result: Result<()> = async {
         let prior_version: i64 = sqlx::query_scalar("PRAGMA user_version")
             .fetch_one(&mut *migration)
@@ -1064,18 +1101,22 @@ impl ArtifactScheduler {
             sqlx::query("PRAGMA user_version=7")
                 .execute(&mut *migration)
                 .await?;
-            sqlx::query("COMMIT").execute(&mut *migration).await?;
             Ok(())
         }
         .await;
         if let Err(error) = migration_result {
             if let Err(rollback) = sqlx::query("ROLLBACK").execute(&mut *migration).await {
                 return Err(error).context(format!(
-                    "sqlite scheduler migration also failed to roll back: {rollback:#}"
+                    "sqlite scheduler migration also failed to roll back; connection retired: {rollback:#}"
                 ));
             }
+            migration.release();
             return Err(error);
         }
+        if let Err(error) = sqlx::query("COMMIT").execute(&mut *migration).await {
+            return Err(error).context("commit sqlite scheduler migration; connection retired");
+        }
+        migration.release();
         let version: i64 = sqlx::query_scalar("PRAGMA user_version")
             .fetch_one(&pool)
             .await?;
@@ -1127,9 +1168,12 @@ impl ArtifactScheduler {
         {
             bail!("artifact scheduler migration post-validation failed")
         }
-        let mut config = pool.acquire().await?;
-        sqlx::query("BEGIN IMMEDIATE").execute(&mut *config).await?;
+        let mut config = ImmediateTransaction::begin(&pool).await?;
         let limits_fingerprint = scheduler_limits_fingerprint(&limits);
+        let config_result:Result<()>=async{
+        let state_rows:Vec<(i64,String,String)>=sqlx::query_as("SELECT id,config_fingerprint,limits_fingerprint FROM scheduler_state").fetch_all(&mut *config).await?;
+        let limits_column:i64=sqlx::query_scalar("SELECT count(*) FROM pragma_table_info('scheduler_state') WHERE name='limits_fingerprint' AND upper(type)='TEXT' AND [notnull]=1 AND dflt_value=\"''\" AND pk=0").fetch_one(&mut *config).await?;
+        if state_rows.len()!=1||state_rows[0].0!=1||limits_column!=1{bail!("scheduler limits state schema or singleton is invalid")}
         let stored: String =
             sqlx::query_scalar("SELECT config_fingerprint FROM scheduler_state WHERE id=1")
                 .fetch_one(&mut *config)
@@ -1148,7 +1192,6 @@ impl ArtifactScheduler {
             stored == fingerprint
         };
         if !accepted {
-            let _ = sqlx::query("ROLLBACK").execute(&mut *config).await;
             bail!("scheduler running-limit configuration differs from existing fleet")
         }
         let stored: String =
@@ -1156,7 +1199,6 @@ impl ArtifactScheduler {
                 .fetch_one(&mut *config)
                 .await?;
         if stored != fingerprint {
-            let _ = sqlx::query("ROLLBACK").execute(&mut *config).await;
             bail!("scheduler configuration CAS verification failed")
         }
         let stored_limits: String =
@@ -1171,14 +1213,15 @@ impl ArtifactScheduler {
                 .rows_affected()
                 != 1
             {
-                let _ = sqlx::query("ROLLBACK").execute(&mut *config).await;
                 bail!("scheduler limits fingerprint CAS failed")
             }
         } else if stored_limits != limits_fingerprint {
-            let _ = sqlx::query("ROLLBACK").execute(&mut *config).await;
             bail!("scheduler limits fingerprint differs from existing fleet")
         }
-        sqlx::query("COMMIT").execute(&mut *config).await?;
+        let sealed_limits:String=sqlx::query_scalar("SELECT limits_fingerprint FROM scheduler_state WHERE id=1").fetch_one(&mut *config).await?;
+        if sealed_limits!=limits_fingerprint||sealed_limits.len()!=64||sealed_limits.as_bytes().iter().any(|byte|!byte.is_ascii_digit()&&!(*byte>=b'a'&&*byte<=b'f')){bail!("scheduler limits fingerprint sealing failed")}
+        Ok(())}.await;
+        finish(config, config_result).await?;
         let completion_sealer = Arc::new(CompletionSealAuthority::new(verifier_id)?);
         Ok(Self {
             pool,
@@ -1255,7 +1298,11 @@ impl ArtifactScheduler {
         .fetch_one(&mut *c)
         .await?;
         if held != 1 {
-            let _ = sqlx::query("ROLLBACK").execute(&mut *c).await;
+            if let Err(rollback) = sqlx::query("ROLLBACK").execute(&mut *c).await {
+                return Err(rollback)
+                    .context("rollback failed GC delete fence; connection retired");
+            }
+            c.release();
             bail!("remote GC does not own the live publication fence")
         }
         Ok(Box::new(SqliteGcDeleteFence(Some(c))))
@@ -2124,7 +2171,7 @@ impl ArtifactScheduler {
     }
     async fn reconcile_at_conn(
         &self,
-        c: &mut PoolConnection<Sqlite>,
+        c: &mut sqlx::SqliteConnection,
         now: i64,
     ) -> Result<(u64, u64)> {
         sqlx::query(
@@ -2132,23 +2179,23 @@ impl ArtifactScheduler {
                SELECT token FROM ready_publication_fences WHERE state='held' AND expires_at<=?)",
         )
         .bind(now)
-        .execute(&mut **c)
+        .execute(&mut *c)
         .await?;
         sqlx::query("DELETE FROM ready_publication_fences WHERE state='held' AND expires_at<=?")
             .bind(now)
-            .execute(&mut **c)
+            .execute(&mut *c)
             .await?;
         sqlx::query("DELETE FROM artifact_consumers WHERE expires_at<=?")
             .bind(now)
-            .execute(&mut **c)
+            .execute(&mut *c)
             .await?;
         sqlx::query("DELETE FROM artifact_transport_leases WHERE rowid IN (SELECT rowid FROM artifact_transport_leases WHERE expires_at<=? ORDER BY expires_at,root_hash,session_id LIMIT 512)")
             .bind(now)
-            .execute(&mut **c)
+            .execute(&mut *c)
             .await?;
-        sqlx::query("DELETE FROM artifact_jobs WHERE state='queued' AND id NOT IN(SELECT desired_artifact_id FROM artifact_observations) AND id NOT IN(SELECT artifact_id FROM artifact_consumers)").execute(&mut **c).await?;
-        let failed=sqlx::query("UPDATE artifact_jobs SET state='failed',owner=NULL,heartbeat_at=NULL,lease_expires_at=NULL,error='lease expired after attempt limit',failure_class='dead_letter',updated_at=? WHERE state='running' AND lease_expires_at<=? AND claim_attempts>=?").bind(now).bind(now).bind(self.limits.max_claim_attempts as i64).execute(&mut **c).await?.rows_affected();
-        let queued=sqlx::query("UPDATE artifact_jobs SET state='queued',owner=NULL,heartbeat_at=NULL,lease_expires_at=NULL,error='lease expired; reclaimed',updated_at=? WHERE state='running' AND lease_expires_at<=? AND claim_attempts<?").bind(now).bind(now).bind(self.limits.max_claim_attempts as i64).execute(&mut **c).await?.rows_affected();
+        sqlx::query("DELETE FROM artifact_jobs WHERE state='queued' AND id NOT IN(SELECT desired_artifact_id FROM artifact_observations) AND id NOT IN(SELECT artifact_id FROM artifact_consumers)").execute(&mut *c).await?;
+        let failed=sqlx::query("UPDATE artifact_jobs SET state='failed',owner=NULL,heartbeat_at=NULL,lease_expires_at=NULL,error='lease expired after attempt limit',failure_class='dead_letter',updated_at=? WHERE state='running' AND lease_expires_at<=? AND claim_attempts>=?").bind(now).bind(now).bind(self.limits.max_claim_attempts as i64).execute(&mut *c).await?.rows_affected();
+        let queued=sqlx::query("UPDATE artifact_jobs SET state='queued',owner=NULL,heartbeat_at=NULL,lease_expires_at=NULL,error='lease expired; reclaimed',updated_at=? WHERE state='running' AND lease_expires_at<=? AND claim_attempts<?").bind(now).bind(now).bind(self.limits.max_claim_attempts as i64).execute(&mut *c).await?.rows_affected();
         Ok((queued, failed))
     }
 
@@ -2292,14 +2339,12 @@ impl ArtifactScheduler {
             .collect()
     }
 
-    async fn immediate(&self) -> Result<PoolConnection<Sqlite>> {
-        let mut c = self.pool.acquire().await?;
-        sqlx::query("BEGIN IMMEDIATE").execute(&mut *c).await?;
-        Ok(c)
+    async fn immediate(&self) -> Result<ImmediateTransaction> {
+        ImmediateTransaction::begin(&self.pool).await
     }
     async fn schedule_in(
         &self,
-        c: &mut PoolConnection<Sqlite>,
+        c: &mut sqlx::SqliteConnection,
         key: &ArtifactKey,
     ) -> Result<ScheduleOutcome> {
         self.preflight_batch(
@@ -2315,7 +2360,7 @@ impl ArtifactScheduler {
     }
     async fn schedule_in_unchecked(
         &self,
-        c: &mut PoolConnection<Sqlite>,
+        c: &mut sqlx::SqliteConnection,
         key: &ArtifactKey,
     ) -> Result<ScheduleOutcome> {
         if let Some(r) = get_key_conn(c, key).await? {
@@ -2329,12 +2374,12 @@ impl ArtifactScheduler {
             });
         }
         let now = db_now(c).await?;
-        let res=sqlx::query("INSERT INTO artifact_jobs(workspace,repo,commit_oid,kind,format_version,state,created_at,updated_at)VALUES(?,?,?,?,?,'queued',?,?)").bind(&key.workspace).bind(&key.repo).bind(&key.commit).bind(key.kind.as_str()).bind(key.format_version as i64).bind(now).bind(now).execute(&mut **c).await?;
+        let res=sqlx::query("INSERT INTO artifact_jobs(workspace,repo,commit_oid,kind,format_version,state,created_at,updated_at)VALUES(?,?,?,?,?,'queued',?,?)").bind(&key.workspace).bind(&key.repo).bind(&key.commit).bind(key.kind.as_str()).bind(key.format_version as i64).bind(now).bind(now).execute(&mut *c).await?;
         Ok(ScheduleOutcome::Enqueued(res.last_insert_rowid()))
     }
     async fn preflight_batch(
         &self,
-        c: &mut PoolConnection<Sqlite>,
+        c: &mut sqlx::SqliteConnection,
         w: &str,
         r: &str,
         commit: &str,
@@ -2358,18 +2403,18 @@ impl ArtifactScheduler {
         let total: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM artifact_jobs WHERE state IN('queued','running')",
         )
-        .fetch_one(&mut **c)
+        .fetch_one(&mut *c)
         .await?;
         let workspace: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM artifact_jobs WHERE state IN('queued','running') AND workspace=?",
         )
         .bind(w)
-        .fetch_one(&mut **c)
+        .fetch_one(&mut *c)
         .await?;
         let active_expensive: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM artifact_jobs WHERE state IN('queued','running') AND kind IN('full_history','files')",
         )
-        .fetch_one(&mut **c)
+        .fetch_one(&mut *c)
         .await?;
         let expensive_add =
             additions[kindex(ArtifactKind::FullHistory)] + additions[kindex(ArtifactKind::Files)];
@@ -2397,7 +2442,7 @@ impl ArtifactScheduler {
     }
     async fn preflight_capacity(
         &self,
-        c: &mut PoolConnection<Sqlite>,
+        c: &mut sqlx::SqliteConnection,
         kind: ArtifactKind,
         w: &str,
         add: usize,
@@ -2405,24 +2450,24 @@ impl ArtifactScheduler {
         let total: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM artifact_jobs WHERE state IN('queued','running')",
         )
-        .fetch_one(&mut **c)
+        .fetch_one(&mut *c)
         .await?;
         let workspace: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM artifact_jobs WHERE state IN('queued','running') AND workspace=?",
         )
         .bind(w)
-        .fetch_one(&mut **c)
+        .fetch_one(&mut *c)
         .await?;
         let per: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM artifact_jobs WHERE state IN('queued','running') AND kind=?",
         )
         .bind(kind.as_str())
-        .fetch_one(&mut **c)
+        .fetch_one(&mut *c)
         .await?;
         let active_expensive: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM artifact_jobs WHERE state IN('queued','running') AND kind IN('full_history','files')",
         )
-        .fetch_one(&mut **c)
+        .fetch_one(&mut *c)
         .await?;
         let reserve_exhausted = kind.expensive()
             && active_expensive as usize + add
@@ -2456,12 +2501,12 @@ impl ArtifactScheduler {
 }
 
 const SELECT: &str = "SELECT id,workspace,repo,commit_oid,kind,format_version,state,owner,lease_expires_at,lease_generation,claim_attempts,retry_count,manifest,error,failure_class FROM artifact_jobs WHERE workspace=? AND repo=? AND commit_oid=? AND kind=? AND format_version=?";
-async fn get_conn(c: &mut PoolConnection<Sqlite>, id: i64) -> Result<Option<ArtifactRecord>> {
-    let row=sqlx::query("SELECT id,workspace,repo,commit_oid,kind,format_version,state,owner,lease_expires_at,lease_generation,claim_attempts,retry_count,manifest,error,failure_class FROM artifact_jobs WHERE id=?").bind(id).fetch_optional(&mut **c).await?;
+async fn get_conn(c: &mut sqlx::SqliteConnection, id: i64) -> Result<Option<ArtifactRecord>> {
+    let row=sqlx::query("SELECT id,workspace,repo,commit_oid,kind,format_version,state,owner,lease_expires_at,lease_generation,claim_attempts,retry_count,manifest,error,failure_class FROM artifact_jobs WHERE id=?").bind(id).fetch_optional(&mut *c).await?;
     row.map(row_record).transpose()
 }
 async fn get_key_conn(
-    c: &mut PoolConnection<Sqlite>,
+    c: &mut sqlx::SqliteConnection,
     k: &ArtifactKey,
 ) -> Result<Option<ArtifactRecord>> {
     let row = sqlx::query(SELECT)
@@ -2470,7 +2515,7 @@ async fn get_key_conn(
         .bind(&k.commit)
         .bind(k.kind.as_str())
         .bind(k.format_version as i64)
-        .fetch_optional(&mut **c)
+        .fetch_optional(&mut *c)
         .await?;
     row.map(row_record).transpose()
 }
@@ -2498,9 +2543,9 @@ fn row_record(r: SqliteRow) -> Result<ArtifactRecord> {
             .transpose()?,
     })
 }
-async fn db_now(c: &mut PoolConnection<Sqlite>) -> Result<i64> {
+async fn db_now(c: &mut sqlx::SqliteConnection) -> Result<i64> {
     Ok(sqlx::query_scalar("SELECT unixepoch()")
-        .fetch_one(&mut **c)
+        .fetch_one(&mut *c)
         .await?)
 }
 
@@ -2512,16 +2557,16 @@ fn canonical_sqlite_ddl(sql: &str) -> String {
 }
 
 async fn preflight_sqlite_schema(
-    connection: &mut PoolConnection<Sqlite>,
+    connection: &mut sqlx::SqliteConnection,
     version: i64,
 ) -> Result<()> {
     if version == 0 || version == 1 {
         return Ok(());
     }
-    let tables: i64 = sqlx::query_scalar("SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN('artifact_jobs','artifact_base_retention','branch_observations','artifact_observations','artifact_consumers','artifact_transport_leases','artifact_gc_sweep','scheduler_state')").fetch_one(&mut **connection).await?;
-    let indexes: i64 = sqlx::query_scalar("SELECT count(*) FROM sqlite_master WHERE type='index' AND name IN('artifact_jobs_claim','artifact_jobs_lease','artifact_base_retention_repo','artifact_observations_published','artifact_transport_leases_expiry')").fetch_one(&mut **connection).await?;
-    let fence_tables: i64 = sqlx::query_scalar("SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN('ready_publication_fence_sequence','ready_publication_fences','ready_publication_fence_members')").fetch_one(&mut **connection).await?;
-    let fence_indexes: i64 = sqlx::query_scalar("SELECT count(*) FROM sqlite_master WHERE type='index' AND name='ready_publication_fences_recovery'").fetch_one(&mut **connection).await?;
+    let tables: i64 = sqlx::query_scalar("SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN('artifact_jobs','artifact_base_retention','branch_observations','artifact_observations','artifact_consumers','artifact_transport_leases','artifact_gc_sweep','scheduler_state')").fetch_one(&mut *connection).await?;
+    let indexes: i64 = sqlx::query_scalar("SELECT count(*) FROM sqlite_master WHERE type='index' AND name IN('artifact_jobs_claim','artifact_jobs_lease','artifact_base_retention_repo','artifact_observations_published','artifact_transport_leases_expiry')").fetch_one(&mut *connection).await?;
+    let fence_tables: i64 = sqlx::query_scalar("SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN('ready_publication_fence_sequence','ready_publication_fences','ready_publication_fence_members')").fetch_one(&mut *connection).await?;
+    let fence_indexes: i64 = sqlx::query_scalar("SELECT count(*) FROM sqlite_master WHERE type='index' AND name='ready_publication_fences_recovery'").fetch_one(&mut *connection).await?;
 
     // v2 existed in two exact released lineages: the five-table admission
     // scheduler and the six-table transport scheduler. v3 diverged into an
@@ -2557,7 +2602,7 @@ async fn preflight_sqlite_schema(
             "SELECT name,sql FROM sqlite_master WHERE type='table' AND name IN(
                'ready_publication_fence_sequence','ready_publication_fences','ready_publication_fence_members') ORDER BY name",
         )
-        .fetch_all(&mut **connection)
+        .fetch_all(&mut *connection)
         .await?;
         let actual = fence_ddl
             .into_iter()
@@ -2581,7 +2626,7 @@ async fn preflight_sqlite_schema(
                'ready_publication_fence_sequence','ready_publication_fences','ready_publication_fence_members'))
                OR (type='index' AND name='ready_publication_fences_recovery') ORDER BY name",
         )
-        .fetch_all(&mut **connection)
+        .fetch_all(&mut *connection)
         .await?;
         let actual = fence_ddl
             .into_iter()
@@ -2601,7 +2646,7 @@ async fn preflight_sqlite_schema(
         }
     }
     let additions: i64 = sqlx::query_scalar("SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN('artifact_base_retention','artifact_gc_sweep')")
-        .fetch_one(&mut **connection).await?;
+        .fetch_one(&mut *connection).await?;
     if version == 2 {
         if additions != 0 {
             bail!("sqlite v2 scheduler contains unversioned v3 additions")
@@ -2619,17 +2664,17 @@ async fn preflight_sqlite_schema(
     let base_sql: String = sqlx::query_scalar(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='artifact_base_retention'",
     )
-    .fetch_one(&mut **connection)
+    .fetch_one(&mut *connection)
     .await?;
     let base_index_sql: String = sqlx::query_scalar(
         "SELECT sql FROM sqlite_master WHERE type='index' AND name='artifact_base_retention_repo'",
     )
-    .fetch_one(&mut **connection)
+    .fetch_one(&mut *connection)
     .await?;
     let gc_sql: String = sqlx::query_scalar(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='artifact_gc_sweep'",
     )
-    .fetch_one(&mut **connection)
+    .fetch_one(&mut *connection)
     .await?;
     if canonical_sqlite_ddl(&base_sql)
         != "createtableartifact_base_retention(artifact_idintegerprimarykey,workspacetextnotnull,repotextnotnull,format_versionintegernotnull,head_rankintegercheck(head_rankbetween1and8),pair_rankintegercheck(pair_rankbetween1and8),check(head_rankisnotnullorpair_rankisnotnull),foreignkey(artifact_id)referencesartifact_jobs(id)ondeletecascade)"
@@ -2650,12 +2695,12 @@ fn validate_gc_sweep(owner: &str, ttl_secs: i64) -> Result<()> {
     Ok(())
 }
 
-async fn assert_gc_unfenced(c: &mut PoolConnection<Sqlite>) -> Result<()> {
+async fn assert_gc_unfenced(c: &mut sqlx::SqliteConnection) -> Result<()> {
     let now = db_now(c).await?;
     let fenced: i64 =
         sqlx::query_scalar("SELECT count(*) FROM artifact_gc_sweep WHERE id=1 AND expires_at>?")
             .bind(now)
-            .fetch_one(&mut **c)
+            .fetch_one(&mut *c)
             .await?;
     if fenced != 0 {
         bail!("artifact publication is temporarily fenced by remote GC")
@@ -2664,7 +2709,7 @@ async fn assert_gc_unfenced(c: &mut PoolConnection<Sqlite>) -> Result<()> {
 }
 
 async fn refresh_base_retention_conn(
-    c: &mut PoolConnection<Sqlite>,
+    c: &mut sqlx::SqliteConnection,
     workspace: &str,
     repo: &str,
     format_version: u32,
@@ -2675,26 +2720,36 @@ async fn refresh_base_retention_conn(
     .bind(workspace)
     .bind(repo)
     .bind(format_version as i64)
-    .execute(&mut **c)
+    .execute(&mut *c)
     .await?;
     sqlx::query("INSERT INTO artifact_base_retention(artifact_id,workspace,repo,format_version,head_rank,pair_rank) SELECT id,workspace,repo,format_version,row_number() OVER(ORDER BY updated_at DESC,id DESC),NULL FROM artifact_jobs WHERE workspace=? AND repo=? AND format_version=? AND kind='head' AND state='ready' AND manifest IS NOT NULL AND length(trim(manifest))>0 ORDER BY updated_at DESC,id DESC LIMIT 8")
-        .bind(workspace).bind(repo).bind(format_version as i64).execute(&mut **c).await?;
+        .bind(workspace).bind(repo).bind(format_version as i64).execute(&mut *c).await?;
     sqlx::query("INSERT INTO artifact_base_retention(artifact_id,workspace,repo,format_version,head_rank,pair_rank) SELECT head_id,?,?,?,NULL,pair_rank FROM (SELECT h.id head_id,f.id history_id,row_number() OVER(ORDER BY CASE WHEN h.updated_at>f.updated_at THEN h.updated_at ELSE f.updated_at END DESC,CASE WHEN h.id>f.id THEN h.id ELSE f.id END DESC) pair_rank FROM artifact_jobs h JOIN artifact_jobs f ON f.workspace=h.workspace AND f.repo=h.repo AND f.commit_oid=h.commit_oid AND f.format_version=h.format_version AND f.kind='full_history' AND f.state='ready' AND f.manifest IS NOT NULL AND length(trim(f.manifest))>0 WHERE h.workspace=? AND h.repo=? AND h.format_version=? AND h.kind='head' AND h.state='ready' AND h.manifest IS NOT NULL AND length(trim(h.manifest))>0) WHERE pair_rank<=8 ON CONFLICT(artifact_id) DO UPDATE SET pair_rank=excluded.pair_rank")
-        .bind(workspace).bind(repo).bind(format_version as i64).bind(workspace).bind(repo).bind(format_version as i64).execute(&mut **c).await?;
+        .bind(workspace).bind(repo).bind(format_version as i64).bind(workspace).bind(repo).bind(format_version as i64).execute(&mut *c).await?;
     sqlx::query("INSERT INTO artifact_base_retention(artifact_id,workspace,repo,format_version,head_rank,pair_rank) SELECT history_id,?,?,?,NULL,pair_rank FROM (SELECT h.id head_id,f.id history_id,row_number() OVER(ORDER BY CASE WHEN h.updated_at>f.updated_at THEN h.updated_at ELSE f.updated_at END DESC,CASE WHEN h.id>f.id THEN h.id ELSE f.id END DESC) pair_rank FROM artifact_jobs h JOIN artifact_jobs f ON f.workspace=h.workspace AND f.repo=h.repo AND f.commit_oid=h.commit_oid AND f.format_version=h.format_version AND f.kind='full_history' AND f.state='ready' AND f.manifest IS NOT NULL AND length(trim(f.manifest))>0 WHERE h.workspace=? AND h.repo=? AND h.format_version=? AND h.kind='head' AND h.state='ready' AND h.manifest IS NOT NULL AND length(trim(h.manifest))>0) WHERE pair_rank<=8 ON CONFLICT(artifact_id) DO UPDATE SET pair_rank=excluded.pair_rank")
-        .bind(workspace).bind(repo).bind(format_version as i64).bind(workspace).bind(repo).bind(format_version as i64).execute(&mut **c).await?;
+        .bind(workspace).bind(repo).bind(format_version as i64).bind(workspace).bind(repo).bind(format_version as i64).execute(&mut *c).await?;
     Ok(())
 }
-async fn finish<T>(mut c: PoolConnection<Sqlite>, r: Result<T>) -> Result<T> {
+async fn finish<T>(mut c: ImmediateTransaction, r: Result<T>) -> Result<T> {
     match r {
-        Ok(v) => {
-            sqlx::query("COMMIT").execute(&mut *c).await?;
-            Ok(v)
-        }
-        Err(e) => {
-            let _ = sqlx::query("ROLLBACK").execute(&mut *c).await;
-            Err(e)
-        }
+        Ok(v) => match sqlx::query("COMMIT").execute(&mut *c).await {
+            Ok(_) => {
+                c.release();
+                Ok(v)
+            }
+            Err(error) => {
+                Err(error).context("commit artifact scheduler transaction; connection retired")
+            }
+        },
+        Err(error) => match sqlx::query("ROLLBACK").execute(&mut *c).await {
+            Ok(_) => {
+                c.release();
+                Err(error)
+            }
+            Err(rollback) => Err(error).context(format!(
+                "rollback artifact scheduler transaction failed; connection retired: {rollback}"
+            )),
+        },
     }
 }
 fn outcome_id(o: &ScheduleOutcome) -> i64 {
@@ -3618,6 +3673,97 @@ mod tests {
             ArtifactScheduler::open(&p, b)
         );
         assert_eq!([x.is_ok(), y.is_ok()].into_iter().filter(|v| *v).count(), 1);
+        let pool = SqlitePool::connect(&format!("sqlite://{p}")).await.unwrap();
+        let sealed: String =
+            sqlx::query_scalar("SELECT limits_fingerprint FROM scheduler_state WHERE id=1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            sealed
+                == scheduler_limits_fingerprint(&SchedulerLimits {
+                    workspace_running: 2,
+                    ..Default::default()
+                })
+                || sealed
+                    == scheduler_limits_fingerprint(&SchedulerLimits {
+                        workspace_running: 3,
+                        ..Default::default()
+                    })
+        );
+        let mut fresh = pool.acquire().await.unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *fresh)
+            .await
+            .unwrap();
+        sqlx::query("ROLLBACK").execute(&mut *fresh).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_scheduler_state_missing_limits_fingerprint_migrates_exactly() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d
+            .path()
+            .join("legacy-limits.db")
+            .to_string_lossy()
+            .to_string();
+        let scheduler = ArtifactScheduler::open(&p, Default::default())
+            .await
+            .unwrap();
+        sqlx::query("ALTER TABLE scheduler_state DROP COLUMN limits_fingerprint")
+            .execute(&scheduler.pool)
+            .await
+            .unwrap();
+        drop(scheduler);
+        let reopened = ArtifactScheduler::open(&p, Default::default())
+            .await
+            .unwrap();
+        let row:(String,i64)=sqlx::query_as("SELECT limits_fingerprint,(SELECT count(*) FROM pragma_table_info('scheduler_state') WHERE name='limits_fingerprint' AND upper(type)='TEXT' AND [notnull]=1 AND dflt_value=\"''\" AND pk=0) FROM scheduler_state WHERE id=1").fetch_one(&reopened.pool).await.unwrap();
+        assert_eq!(
+            row.0,
+            scheduler_limits_fingerprint(&SchedulerLimits::default())
+        );
+        assert_eq!(row.1, 1);
+    }
+
+    #[tokio::test]
+    async fn malformed_scheduler_limits_column_and_state_fail_closed() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d
+            .path()
+            .join("malformed-limits.db")
+            .to_string_lossy()
+            .to_string();
+        let scheduler = ArtifactScheduler::open(&p, Default::default())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE scheduler_state SET limits_fingerprint='bad'")
+            .execute(&scheduler.pool)
+            .await
+            .unwrap();
+        drop(scheduler);
+        assert!(
+            ArtifactScheduler::open(&p, Default::default())
+                .await
+                .is_err()
+        );
+
+        let d2 = tempfile::tempdir().unwrap();
+        let p2 = d2
+            .path()
+            .join("malformed-column.db")
+            .to_string_lossy()
+            .to_string();
+        let scheduler = ArtifactScheduler::open(&p2, Default::default())
+            .await
+            .unwrap();
+        sqlx::raw_sql("ALTER TABLE scheduler_state RENAME TO scheduler_state_old; CREATE TABLE scheduler_state(id INTEGER PRIMARY KEY CHECK(id=1),fairness_cursor INTEGER NOT NULL,workspace_cursor TEXT NOT NULL DEFAULT '',config_fingerprint TEXT NOT NULL DEFAULT '',limits_fingerprint INTEGER NOT NULL DEFAULT 0); INSERT INTO scheduler_state SELECT id,fairness_cursor,workspace_cursor,config_fingerprint,0 FROM scheduler_state_old; DROP TABLE scheduler_state_old;").execute(&scheduler.pool).await.unwrap();
+        drop(scheduler);
+        assert!(
+            ArtifactScheduler::open(&p2, Default::default())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -5067,6 +5213,23 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn dropped_gc_delete_fence_closes_transaction_and_does_not_lock_pool() {
+        let (scheduler, _d, _path) = scheduler(SchedulerLimits::default()).await;
+        assert!(scheduler.acquire_gc_sweep("collector", 60).await.unwrap());
+        let fence = scheduler.lock_gc_delete_batch("collector").await.unwrap();
+        drop(fence);
+        let replacement = tokio::time::timeout(
+            Duration::from_secs(2),
+            scheduler.lock_gc_delete_batch("collector"),
+        )
+        .await
+        .expect("dropped fence retained SQLite write lock")
+        .unwrap();
+        replacement.release().await.unwrap();
+        scheduler.release_gc_sweep("collector").await.unwrap();
     }
 
     #[tokio::test]

@@ -48,6 +48,12 @@ enum RegistrationCommitFault {
     FailWithOpenTransaction,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum TransactionCommitFault {
+    None,
+    FailWithOpenTransaction,
+}
+
 pub const SOURCE_FORMAT_VERSION: u32 = 1;
 pub const SOURCE_ROOT_PAGE_MAX: u32 = 512;
 
@@ -241,6 +247,47 @@ pub struct SqliteGitSourceRegistry {
     seal: Arc<[u8; 32]>,
 }
 
+struct ImmediateTransaction {
+    connection: Option<PoolConnection<Sqlite>>,
+}
+
+impl ImmediateTransaction {
+    async fn begin(pool: &SqlitePool) -> Result<Self> {
+        let mut transaction = Self {
+            connection: Some(pool.acquire().await?),
+        };
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *transaction)
+            .await?;
+        Ok(transaction)
+    }
+
+    fn release(mut self) {
+        drop(self.connection.take());
+    }
+}
+
+impl std::ops::Deref for ImmediateTransaction {
+    type Target = sqlx::SqliteConnection;
+    fn deref(&self) -> &Self::Target {
+        self.connection.as_ref().expect("transaction connection")
+    }
+}
+
+impl std::ops::DerefMut for ImmediateTransaction {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.connection.as_mut().expect("transaction connection")
+    }
+}
+
+impl Drop for ImmediateTransaction {
+    fn drop(&mut self) {
+        if let Some(connection) = self.connection.take() {
+            drop(connection.detach());
+        }
+    }
+}
+
 impl SqliteGitSourceRegistry {
     pub async fn new(
         pool: SqlitePool,
@@ -258,8 +305,7 @@ impl SqliteGitSourceRegistry {
         };
         let fingerprint = registry.source_fingerprint();
         let scheduler_fingerprint = scheduler_limits_fingerprint(&registry.scheduler_limits);
-        let mut c = registry.pool.acquire().await?;
-        sqlx::query("BEGIN IMMEDIATE").execute(&mut *c).await?;
+        let mut c = ImmediateTransaction::begin(&registry.pool).await?;
         let result:Result<()>=async{
             let durable_scheduler_fingerprint:String=sqlx::query_scalar("SELECT limits_fingerprint FROM scheduler_state WHERE id=1").fetch_one(&mut *c).await.context("source registry requires an initialized durable scheduler limits capability")?;
             if durable_scheduler_fingerprint!=scheduler_fingerprint{bail!("source registry scheduler limits differ from the durable scheduler capability")}
@@ -274,7 +320,7 @@ impl SqliteGitSourceRegistry {
             else if stored.as_str()!=fingerprint{bail!("source registry limits or authority seal differ from fleet configuration")}
             Ok(())
         }.await;
-        finish(&mut c, result).await?;
+        finish(c, result).await?;
         Ok(registry)
     }
 
@@ -382,6 +428,33 @@ impl SqliteGitSourceRegistry {
         ttl_secs: i64,
         intent: SyncIntent,
     ) -> Result<SourceBeginOutcome> {
+        self.begin_acquisition_with_commit_fault(
+            workspace,
+            repo,
+            commit,
+            source_format_version,
+            owner,
+            attempt_id,
+            ttl_secs,
+            intent,
+            TransactionCommitFault::None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn begin_acquisition_with_commit_fault(
+        &self,
+        workspace: &str,
+        repo: &str,
+        commit: &str,
+        source_format_version: u32,
+        owner: &str,
+        attempt_id: &str,
+        ttl_secs: i64,
+        intent: SyncIntent,
+        commit_fault: TransactionCommitFault,
+    ) -> Result<SourceBeginOutcome> {
         validate_acquire_identity(
             workspace,
             repo,
@@ -391,8 +464,7 @@ impl SqliteGitSourceRegistry {
             attempt_id,
             ttl_secs,
         )?;
-        let mut c = self.pool.acquire().await?;
-        sqlx::query("BEGIN IMMEDIATE").execute(&mut *c).await?;
+        let mut c = ImmediateTransaction::begin(&self.pool).await?;
         let result = self
             .begin_in(
                 &mut c,
@@ -406,13 +478,13 @@ impl SqliteGitSourceRegistry {
                 intent,
             )
             .await;
-        finish(&mut c, result).await
+        finish_with_commit_fault(c, result, commit_fault).await
     }
 
     #[allow(clippy::too_many_arguments)]
     async fn begin_in(
         &self,
-        c: &mut PoolConnection<Sqlite>,
+        c: &mut sqlx::SqliteConnection,
         workspace: &str,
         repo: &str,
         commit: &str,
@@ -423,22 +495,22 @@ impl SqliteGitSourceRegistry {
         intent: SyncIntent,
     ) -> Result<SourceBeginOutcome> {
         let now: i64 = sqlx::query_scalar("SELECT unixepoch()")
-            .fetch_one(&mut **c)
+            .fetch_one(&mut *c)
             .await?;
         self.reclaim_expired_identity_in(c, workspace, repo, commit, source_format_version, now)
             .await?;
         if let Some(row) = sqlx::query("SELECT state,root_hash,failure_class,retry_count,acquisition_token FROM git_source_desires WHERE workspace=? AND repo=? AND commit_oid=? AND source_format_version=?")
-            .bind(workspace).bind(repo).bind(commit).bind(source_format_version as i64).fetch_optional(&mut **c).await? {
+            .bind(workspace).bind(repo).bind(commit).bind(source_format_version as i64).fetch_optional(&mut *c).await? {
             let state: String = row.try_get("state")?;
             if state == "registered" {
                 let root: String = row.try_get("root_hash")?;
                 let (token, generation):(String,i64)=sqlx::query_as("SELECT token,generation FROM git_source_acquisitions WHERE workspace=? AND repo=? AND commit_oid=? AND source_format_version=? AND root_hash=? AND state='registered' ORDER BY generation DESC LIMIT 1")
-                    .bind(workspace).bind(repo).bind(commit).bind(source_format_version as i64).bind(&root).fetch_one(&mut **c).await?;
+                    .bind(workspace).bind(repo).bind(commit).bind(source_format_version as i64).bind(&root).fetch_one(&mut *c).await?;
                 return Ok(SourceBeginOutcome::Ready(DurableSourceSnapshot::registered(workspace.to_owned(),repo.to_owned(),commit.to_owned(),root,token,checked_u64(generation,"source generation")?)?));
             }
             if state == "acquiring" {
                 let token:String=row.try_get("acquisition_token")?;
-                let (generation,acq_state):(i64,String)=sqlx::query_as("SELECT generation,state FROM git_source_acquisitions WHERE token=?").bind(&token).fetch_one(&mut **c).await?;
+                let (generation,acq_state):(i64,String)=sqlx::query_as("SELECT generation,state FROM git_source_acquisitions WHERE token=?").bind(&token).fetch_one(&mut *c).await?;
                 let generation=checked_u64(generation,"source generation")?;
                 return Ok(if acq_state=="activation_unknown" { SourceBeginOutcome::ActivationUnknown{token,generation} } else { SourceBeginOutcome::Deferred{token,generation} });
             }
@@ -448,7 +520,7 @@ impl SqliteGitSourceRegistry {
         }
         let prior: i64 =
             sqlx::query_scalar("SELECT generation FROM git_source_acquisition_sequence WHERE id=1")
-                .fetch_one(&mut **c)
+                .fetch_one(&mut *c)
                 .await?;
         let generation = prior.checked_add(1).context("source generation overflow")?;
         if sqlx::query(
@@ -456,7 +528,7 @@ impl SqliteGitSourceRegistry {
         )
         .bind(generation)
         .bind(prior)
-        .execute(&mut **c)
+        .execute(&mut *c)
         .await?
         .rows_affected()
             != 1
@@ -464,11 +536,11 @@ impl SqliteGitSourceRegistry {
             bail!("source generation CAS failed")
         }
         let token = hex::encode(rand::random::<[u8; 32]>());
-        let operation_id = operation_id(workspace, repo, commit, attempt_id);
+        let operation_id = operation_id(workspace, repo, commit, attempt_id, generation);
         sqlx::query("INSERT INTO git_source_acquisitions(token,generation,operation_id,workspace,repo,commit_oid,source_format_version,owner,attempt_id,expires_at,state,failure_class) VALUES(?,?,?,?,?,?,?,?,?,?,'held',NULL)")
-            .bind(&token).bind(generation).bind(&operation_id).bind(workspace).bind(repo).bind(commit).bind(source_format_version as i64).bind(owner).bind(attempt_id).bind(now+ttl_secs).execute(&mut **c).await?;
+            .bind(&token).bind(generation).bind(&operation_id).bind(workspace).bind(repo).bind(commit).bind(source_format_version as i64).bind(owner).bind(attempt_id).bind(now+ttl_secs).execute(&mut *c).await?;
         sqlx::query("INSERT INTO git_source_desires(workspace,repo,commit_oid,source_format_version,state,root_hash,failure_class,retry_count,acquisition_token,updated_at) VALUES(?,?,?,?,'acquiring',NULL,NULL,0,?,?) ON CONFLICT(workspace,repo,commit_oid,source_format_version) DO UPDATE SET state='acquiring',root_hash=NULL,failure_class=NULL,retry_count=git_source_desires.retry_count+1,acquisition_token=excluded.acquisition_token,updated_at=excluded.updated_at")
-            .bind(workspace).bind(repo).bind(commit).bind(source_format_version as i64).bind(&token).bind(now).execute(&mut **c).await?;
+            .bind(workspace).bind(repo).bind(commit).bind(source_format_version as i64).bind(&token).bind(now).execute(&mut *c).await?;
         Ok(SourceBeginOutcome::PermitToPrepare(
             GitSourcePreparePermit {
                 token,
@@ -497,8 +569,7 @@ impl SqliteGitSourceRegistry {
         {
             bail!("prepared graph identity differs from held source acquisition")
         }
-        let mut c = self.pool.acquire().await?;
-        sqlx::query("BEGIN IMMEDIATE").execute(&mut *c).await?;
+        let mut c = ImmediateTransaction::begin(&self.pool).await?;
         let result:Result<(GitSourceAcquisition,GitSourcePublicationPermit)>=async{
             let now:i64=sqlx::query_scalar("SELECT unixepoch()").fetch_one(&mut *c).await?;
             let sweep:i64=sqlx::query_scalar("SELECT count(*) FROM artifact_gc_sweep WHERE expires_at>?").bind(now).fetch_one(&mut *c).await?;
@@ -511,12 +582,12 @@ impl SqliteGitSourceRegistry {
             let publication=GitSourcePublicationPermit{token:prepare.token.clone(),generation:prepare.generation,workspace:prepare.workspace.clone(),repo:prepare.repo.clone(),commit:prepare.commit.clone(),root:view.root.clone()};
             Ok((acquisition,publication))
         }.await;
-        finish(&mut c, result).await
+        finish(c, result).await
     }
 
     async fn reclaim_expired_identity_in(
         &self,
-        c: &mut PoolConnection<Sqlite>,
+        c: &mut sqlx::SqliteConnection,
         workspace: &str,
         repo: &str,
         commit: &str,
@@ -524,9 +595,9 @@ impl SqliteGitSourceRegistry {
         now: i64,
     ) -> Result<()> {
         if let Some(token)=sqlx::query_scalar::<_,String>("SELECT token FROM git_source_acquisitions WHERE workspace=? AND repo=? AND commit_oid=? AND source_format_version=? AND state IN('held','graph_published') AND expires_at<=?")
-            .bind(workspace).bind(repo).bind(commit).bind(source_format_version as i64).bind(now).fetch_optional(&mut **c).await? {
-            if sqlx::query("UPDATE git_source_desires SET state='failed',root_hash=NULL,failure_class='retryable',acquisition_token=NULL,updated_at=? WHERE acquisition_token=? AND state='acquiring'").bind(now).bind(&token).execute(&mut **c).await?.rows_affected()!=1 { bail!("expired source desire settlement lost") }
-            if sqlx::query("UPDATE git_source_acquisitions SET state='failed',failure_class='retryable',expires_at=0 WHERE token=? AND state IN('held','graph_published')").bind(&token).execute(&mut **c).await?.rows_affected()!=1 { bail!("expired source acquisition settlement lost") }
+            .bind(workspace).bind(repo).bind(commit).bind(source_format_version as i64).bind(now).fetch_optional(&mut *c).await? {
+            if sqlx::query("UPDATE git_source_desires SET state='failed',root_hash=NULL,failure_class='retryable',acquisition_token=NULL,updated_at=? WHERE acquisition_token=? AND state='acquiring'").bind(now).bind(&token).execute(&mut *c).await?.rows_affected()!=1 { bail!("expired source desire settlement lost") }
+            if sqlx::query("UPDATE git_source_acquisitions SET state='failed',failure_class='retryable',expires_at=0 WHERE token=? AND state IN('held','graph_published')").bind(&token).execute(&mut *c).await?.rows_affected()!=1 { bail!("expired source acquisition settlement lost") }
         }
         Ok(())
     }
@@ -548,8 +619,7 @@ impl SqliteGitSourceRegistry {
         prepare: &GitSourcePreparePermit,
         class: FailureClass,
     ) -> Result<bool> {
-        let mut c = self.pool.acquire().await?;
-        sqlx::query("BEGIN IMMEDIATE").execute(&mut *c).await?;
+        let mut c = ImmediateTransaction::begin(&self.pool).await?;
         let result:Result<bool>=async{
             if sqlx::query("UPDATE git_source_acquisitions SET state='failed',failure_class=?,expires_at=0 WHERE token=? AND generation=? AND operation_id=? AND owner=? AND attempt_id=? AND state='held'")
                 .bind(class.as_str()).bind(&prepare.token).bind(prepare.generation as i64).bind(&prepare.operation_id).bind(&prepare.owner).bind(&prepare.attempt_id).execute(&mut *c).await?.rows_affected()!=1{return Ok(false)}
@@ -557,7 +627,7 @@ impl SqliteGitSourceRegistry {
                 .bind(class.as_str()).bind(&prepare.token).execute(&mut *c).await?.rows_affected()!=1{bail!("source preparation desire settlement lost")}
             Ok(true)
         }.await;
-        finish(&mut c, result).await
+        finish(c, result).await
     }
 
     pub async fn renew(&self, acquisition: &GitSourceAcquisition, ttl_secs: i64) -> Result<bool> {
@@ -617,8 +687,7 @@ impl SqliteGitSourceRegistry {
         acquisition: &GitSourceAcquisition,
         class: FailureClass,
     ) -> Result<bool> {
-        let mut c = self.pool.acquire().await?;
-        sqlx::query("BEGIN IMMEDIATE").execute(&mut *c).await?;
+        let mut c = ImmediateTransaction::begin(&self.pool).await?;
         let result:Result<bool>=async{
             let desire=sqlx::query("UPDATE git_source_desires SET state='failed',root_hash=NULL,failure_class=?,acquisition_token=NULL,updated_at=unixepoch() WHERE acquisition_token=? AND state='acquiring'")
                 .bind(class.as_str()).bind(&acquisition.token).execute(&mut *c).await?.rows_affected();
@@ -627,7 +696,7 @@ impl SqliteGitSourceRegistry {
                 .bind(class.as_str()).bind(&acquisition.token).bind(acquisition.generation as i64).bind(&acquisition.operation_id).execute(&mut *c).await?.rows_affected()!=1{bail!("source failure capability lost")}
             Ok(true)
         }.await;
-        finish(&mut c, result).await
+        finish(c, result).await
     }
 
     async fn register_once(
@@ -671,8 +740,7 @@ impl SqliteGitSourceRegistry {
                 }
             }
         }
-        let mut c = self.pool.acquire().await?;
-        sqlx::query("BEGIN IMMEDIATE").execute(&mut *c).await?;
+        let mut c = ImmediateTransaction::begin(&self.pool).await?;
         let result:Result<DurableSourceSnapshot>=async{
             let now:i64=sqlx::query_scalar("SELECT unixepoch()").fetch_one(&mut *c).await?;
             assert_exact_graph(&mut c,acquisition,&view,now).await?;
@@ -684,24 +752,32 @@ impl SqliteGitSourceRegistry {
             DurableSourceSnapshot::registered(view.workspace.clone(),view.repo.clone(),view.commit.clone(),view.root.hash.clone(),acquisition.token.clone(),acquisition.generation)
         }.await;
         match result {
-            Err(error) => {
-                let _ = sqlx::query("ROLLBACK").execute(&mut *c).await;
-                Err(error.context("source registration failed before commit"))
-            }
+            Err(error) => match sqlx::query("ROLLBACK").execute(&mut *c).await {
+                Ok(_) => {
+                    c.release();
+                    Err(error.context("source registration failed before commit"))
+                }
+                Err(rollback) => Err(error).context(format!(
+                    "source registration rollback failed; connection retired: {rollback}"
+                )),
+            },
             Ok(_snapshot) if commit_fault == RegistrationCommitFault::FailWithOpenTransaction => {
                 let error = anyhow::anyhow!("injected COMMIT failure with an open transaction");
-                let _ = c.close().await;
                 Err(AmbiguousRegistrationAck(error).into())
             }
             Ok(snapshot) => match sqlx::query("COMMIT").execute(&mut *c).await {
-                Ok(_) if commit_fault == RegistrationCommitFault::AckLostAfterCommit => Err(
-                    AmbiguousRegistrationAck(anyhow::anyhow!("injected lost COMMIT ACK")).into(),
-                ),
-                Ok(_) => Ok(snapshot),
-                Err(error) => {
-                    let _ = c.close().await;
-                    Err(AmbiguousRegistrationAck(error.into()).into())
+                Ok(_) if commit_fault == RegistrationCommitFault::AckLostAfterCommit => {
+                    c.release();
+                    Err(
+                        AmbiguousRegistrationAck(anyhow::anyhow!("injected lost COMMIT ACK"))
+                            .into(),
+                    )
                 }
+                Ok(_) => {
+                    c.release();
+                    Ok(snapshot)
+                }
+                Err(error) => Err(AmbiguousRegistrationAck(error.into()).into()),
             },
         }
     }
@@ -763,8 +839,7 @@ impl SqliteGitSourceRegistry {
         &self,
         acquisition: &GitSourceAcquisition,
     ) -> Result<SourceAcquireOutcome> {
-        let mut c = self.pool.acquire().await?;
-        sqlx::query("BEGIN IMMEDIATE").execute(&mut *c).await?;
+        let mut c = ImmediateTransaction::begin(&self.pool).await?;
         let result: Result<SourceAcquireOutcome> = async {
             let state: String = sqlx::query_scalar("SELECT state FROM git_source_acquisitions WHERE token=? AND generation=? AND operation_id=? AND root_hash=?")
                 .bind(&acquisition.token).bind(acquisition.generation as i64).bind(&acquisition.operation_id).bind(&acquisition.root.hash).fetch_one(&mut *c).await?;
@@ -783,7 +858,7 @@ impl SqliteGitSourceRegistry {
             let retries:i64=sqlx::query_scalar("SELECT retry_count FROM git_source_desires WHERE workspace=? AND repo=? AND commit_oid=? AND source_format_version=?").bind(&acquisition.workspace).bind(&acquisition.repo).bind(&acquisition.commit).bind(acquisition.source_format_version as i64).fetch_one(&mut *c).await?;
             Ok(SourceAcquireOutcome::Failed{class:FailureClass::Retryable,retries:checked_u32(retries,"source retry count")?})
         }.await;
-        finish(&mut c, result).await
+        finish(c, result).await
     }
 
     pub async fn source_gc_page(
@@ -830,8 +905,7 @@ impl SqliteGitSourceRegistry {
         {
             bail!("builder source claim is invalid")
         }
-        let mut c = self.pool.acquire().await?;
-        sqlx::query("BEGIN IMMEDIATE").execute(&mut *c).await?;
+        let mut c = ImmediateTransaction::begin(&self.pool).await?;
         let result:Result<AuthenticatedGitSource>=async{
             let row=sqlx::query("SELECT r.root_hash,r.root_len,r.object_format,r.registration_generation,r.registration_operation FROM artifact_intents i JOIN artifact_jobs j ON j.id=i.artifact_id JOIN git_source_roots r ON r.root_hash=i.source_root_hash WHERE i.artifact_id=? AND i.state='promoted' AND i.workspace=? AND i.repo=? AND i.commit_oid=? AND i.source_format_version=? AND j.state='running' AND j.owner=? AND j.lease_generation=? AND j.lease_expires_at>unixepoch() AND r.state='registered'").bind(artifact_id).bind(workspace).bind(repo).bind(commit).bind(SOURCE_FORMAT_VERSION as i64).bind(artifact_owner).bind(lease_generation as i64).fetch_optional(&mut *c).await?.context("promoted artifact does not own a live registered source claim")?;
             let root=CasBlob{hash:row.try_get("root_hash")?,len:checked_u64(row.try_get("root_len")?,"root length")?};
@@ -843,7 +917,7 @@ impl SqliteGitSourceRegistry {
             let mac=evidence_mac(&self.seal,&root,workspace,repo,commit,object_format,generation,&operation);
             AuthenticatedGitSource::from_registry_record(GitSourceRegistryRecord{root,workspace:workspace.into(),repo:repo.into(),commit:commit.into(),object_format,evidence_mac:mac})
         }.await;
-        finish(&mut c, result).await
+        finish(c, result).await
     }
 
     pub async fn renew_builder_claim(
@@ -965,8 +1039,7 @@ impl SqliteGitSourceRegistry {
             if promoted >= limit {
                 break;
             }
-            let mut c = self.pool.acquire().await?;
-            sqlx::query("BEGIN IMMEDIATE").execute(&mut *c).await?;
+            let mut c = ImmediateTransaction::begin(&self.pool).await?;
             let result:Result<bool>=async{
                 sqlx::query("UPDATE git_source_maintenance SET intent_cursor=?,intent_workspace_cursor=?,updated_at=unixepoch() WHERE id=1").bind(id).bind(&candidate_workspace).execute(&mut *c).await?;
                 let row=match sqlx::query("SELECT workspace,repo,branch,branch_generation,commit_oid,kind,format_version,consumer_id FROM artifact_intents WHERE id=? AND state='deferred'").bind(id).fetch_optional(&mut *c).await?{Some(v)=>v,None=>return Ok(false)};
@@ -980,7 +1053,7 @@ impl SqliteGitSourceRegistry {
                     .bind(&workspace).bind(&repo).bind(&branch).bind(kind.as_str()).bind(&commit).bind(artifact_id).bind(generation).bind(artifact_id).bind(artifact_id).bind(format).execute(&mut *c).await?;
                 Ok(true)
             }.await;
-            if finish(&mut c, result).await? {
+            if finish(c, result).await? {
                 promoted += 1
             }
         }
@@ -1006,8 +1079,7 @@ impl SqliteGitSourceRegistry {
         }
         let mut settled = 0;
         for (id, artifact_id, consumer) in rows {
-            let mut c = self.pool.acquire().await?;
-            sqlx::query("BEGIN IMMEDIATE").execute(&mut *c).await?;
+            let mut c = ImmediateTransaction::begin(&self.pool).await?;
             let result: Result<bool> = async {
                 let terminal:i64=sqlx::query_scalar("SELECT count(*) FROM artifact_intents i JOIN artifact_jobs j ON j.id=i.artifact_id WHERE i.id=? AND i.artifact_id=? AND i.consumer_id=? AND i.state='promoted' AND (j.state='ready' OR (j.state='failed' AND (j.failure_class IN('permanent','dead_letter') OR (j.failure_class='retryable' AND j.retry_count>=?))))")
                     .bind(id).bind(artifact_id).bind(&consumer).bind(self.scheduler_limits.max_manual_retries as i64).fetch_one(&mut *c).await?;
@@ -1027,7 +1099,7 @@ impl SqliteGitSourceRegistry {
                 Ok(true)
             }
             .await;
-            if finish(&mut c, result).await? {
+            if finish(c, result).await? {
                 settled += 1
             }
         }
@@ -1038,8 +1110,7 @@ impl SqliteGitSourceRegistry {
         if limit == 0 || limit > 512 {
             bail!("source metadata prune page is invalid")
         }
-        let mut c = self.pool.acquire().await?;
-        sqlx::query("BEGIN IMMEDIATE").execute(&mut *c).await?;
+        let mut c = ImmediateTransaction::begin(&self.pool).await?;
         let result:Result<u64>=async{
             let mut changed=0;
             changed+=sqlx::query("DELETE FROM git_source_consumers WHERE rowid IN(SELECT rowid FROM git_source_consumers WHERE purpose='builder' AND expires_at<=unixepoch() ORDER BY expires_at,root_hash,consumer_id LIMIT ?)").bind(limit as i64).execute(&mut *c).await?.rows_affected();
@@ -1048,15 +1119,14 @@ impl SqliteGitSourceRegistry {
             changed+=sqlx::query("DELETE FROM git_source_acquisitions WHERE token IN(SELECT a.token FROM git_source_acquisitions a LEFT JOIN git_source_desires d ON d.acquisition_token=a.token WHERE a.state='failed' AND a.generation<=? AND d.acquisition_token IS NULL ORDER BY a.generation LIMIT ?)").bind(cutoff).bind(limit as i64).execute(&mut *c).await?.rows_affected();
             Ok(changed)
         }.await;
-        finish(&mut c, result).await
+        finish(c, result).await
     }
 
     pub async fn retire_registered_roots_page(&self, grace_secs: i64, limit: u32) -> Result<u32> {
         if !(60..=30 * 24 * 60 * 60).contains(&grace_secs) || limit == 0 || limit > 256 {
             bail!("source root retirement grace or page is invalid")
         }
-        let mut c = self.pool.acquire().await?;
-        sqlx::query("BEGIN IMMEDIATE").execute(&mut *c).await?;
+        let mut c = ImmediateTransaction::begin(&self.pool).await?;
         let result:Result<u32>=async{
             let sweep:i64=sqlx::query_scalar("SELECT count(*) FROM artifact_gc_sweep WHERE expires_at>unixepoch()").fetch_one(&mut *c).await?;
             if sweep!=0{bail!("source root retirement is fenced by live GC sweep")}
@@ -1073,7 +1143,7 @@ impl SqliteGitSourceRegistry {
             sqlx::query("UPDATE git_source_maintenance SET root_cursor=?,updated_at=unixepoch() WHERE id=1").bind(roots.last().expect("nonempty retirement page")).execute(&mut *c).await?;
             Ok(roots.len() as u32)
         }.await;
-        finish(&mut c, result).await
+        finish(c, result).await
     }
 }
 
@@ -1121,8 +1191,7 @@ impl ArtifactObservation for SqliteGitSourceRegistry {
                 unique.push(*kind)
             }
         }
-        let mut c = self.pool.acquire().await?;
-        sqlx::query("BEGIN IMMEDIATE").execute(&mut *c).await?;
+        let mut c = ImmediateTransaction::begin(&self.pool).await?;
         let result:Result<ArtifactObservationOutcome>=async{
             let registered:i64=sqlx::query_scalar("SELECT count(*) FROM git_source_acquisitions a JOIN git_source_roots r ON r.root_hash=a.root_hash WHERE a.token=? AND a.generation=? AND a.state='registered' AND a.workspace=? AND a.repo=? AND a.commit_oid=? AND a.root_hash=? AND r.state='registered'")
                 .bind(source.registration_token()).bind(source.registration_generation() as i64).bind(source.workspace()).bind(source.repo()).bind(source.commit()).bind(source.manifest()).fetch_one(&mut *c).await?;
@@ -1174,33 +1243,33 @@ impl ArtifactObservation for SqliteGitSourceRegistry {
             }
             Ok(ArtifactObservationOutcome::Recorded{generation,advanced:!same,artifacts:outcomes})
         }.await;
-        finish(&mut c, result).await
+        finish(c, result).await
     }
 }
 
 async fn capacity_available(
-    c: &mut PoolConnection<Sqlite>,
+    c: &mut sqlx::SqliteConnection,
     limits: &SchedulerLimits,
     workspace: &str,
     kind: ArtifactKind,
 ) -> Result<bool> {
     let total: i64 =
         sqlx::query_scalar("SELECT count(*) FROM artifact_jobs WHERE state IN('queued','running')")
-            .fetch_one(&mut **c)
+            .fetch_one(&mut *c)
             .await?;
     let local: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM artifact_jobs WHERE state IN('queued','running') AND workspace=?",
     )
     .bind(workspace)
-    .fetch_one(&mut **c)
+    .fetch_one(&mut *c)
     .await?;
     let lane: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM artifact_jobs WHERE state IN('queued','running') AND kind=?",
     )
     .bind(kind.as_str())
-    .fetch_one(&mut **c)
+    .fetch_one(&mut *c)
     .await?;
-    let expensive:i64=sqlx::query_scalar("SELECT count(*) FROM artifact_jobs WHERE state IN('queued','running') AND kind IN('full_history','files')").fetch_one(&mut **c).await?;
+    let expensive:i64=sqlx::query_scalar("SELECT count(*) FROM artifact_jobs WHERE state IN('queued','running') AND kind IN('full_history','files')").fetch_one(&mut *c).await?;
     let lane_limit = match kind {
         ArtifactKind::Head => limits.head_backlog,
         ArtifactKind::FullHistory => limits.full_history_backlog,
@@ -1214,26 +1283,26 @@ async fn capacity_available(
 }
 
 async fn ensure_job(
-    c: &mut PoolConnection<Sqlite>,
+    c: &mut sqlx::SqliteConnection,
     workspace: &str,
     repo: &str,
     commit: &str,
     kind: ArtifactKind,
     format: i64,
 ) -> Result<i64> {
-    if let Some(id)=sqlx::query_scalar::<_,i64>("SELECT id FROM artifact_jobs WHERE workspace=? AND repo=? AND commit_oid=? AND kind=? AND format_version=?").bind(workspace).bind(repo).bind(commit).bind(kind.as_str()).bind(format).fetch_optional(&mut **c).await?{return Ok(id)}
-    Ok(sqlx::query("INSERT INTO artifact_jobs(workspace,repo,commit_oid,kind,format_version,state,created_at,updated_at) VALUES(?,?,?,?,?,'queued',unixepoch(),unixepoch())").bind(workspace).bind(repo).bind(commit).bind(kind.as_str()).bind(format).execute(&mut **c).await?.last_insert_rowid())
+    if let Some(id)=sqlx::query_scalar::<_,i64>("SELECT id FROM artifact_jobs WHERE workspace=? AND repo=? AND commit_oid=? AND kind=? AND format_version=?").bind(workspace).bind(repo).bind(commit).bind(kind.as_str()).bind(format).fetch_optional(&mut *c).await?{return Ok(id)}
+    Ok(sqlx::query("INSERT INTO artifact_jobs(workspace,repo,commit_oid,kind,format_version,state,created_at,updated_at) VALUES(?,?,?,?,?,'queued',unixepoch(),unixepoch())").bind(workspace).bind(repo).bind(commit).bind(kind.as_str()).bind(format).execute(&mut *c).await?.last_insert_rowid())
 }
 
 async fn job_outcome(
-    c: &mut PoolConnection<Sqlite>,
+    c: &mut sqlx::SqliteConnection,
     id: i64,
     intent: SyncIntent,
     max_retries: u32,
 ) -> Result<ArtifactIntentOutcome> {
     let row = sqlx::query("SELECT state,failure_class,retry_count FROM artifact_jobs WHERE id=?")
         .bind(id)
-        .fetch_one(&mut **c)
+        .fetch_one(&mut *c)
         .await?;
     let mut state: String = row.try_get("state")?;
     let class = row
@@ -1246,7 +1315,7 @@ async fn job_outcome(
         && class == Some(FailureClass::Retryable)
         && retries < max_retries
         && sqlx::query("UPDATE artifact_jobs SET state='queued',owner=NULL,heartbeat_at=NULL,lease_expires_at=NULL,manifest=NULL,error=NULL,failure_class=NULL,retry_count=retry_count+1,updated_at=unixepoch() WHERE id=? AND state='failed' AND failure_class='retryable' AND retry_count=?")
-            .bind(id).bind(retries as i64).execute(&mut **c).await?.rows_affected()==1
+            .bind(id).bind(retries as i64).execute(&mut *c).await?.rows_affected()==1
     {
         state = "queued".into()
     }
@@ -1258,18 +1327,18 @@ async fn job_outcome(
     })
 }
 
-pub(crate) async fn migrate_sqlite_v7_in(c: &mut PoolConnection<Sqlite>) -> Result<()> {
-    let planted:i64=sqlx::query_scalar("SELECT count(*) FROM sqlite_master WHERE name LIKE 'git_source_%' OR name LIKE 'branch_source_%' OR name LIKE 'artifact_intents%' OR tbl_name IN('git_source_roots','git_source_members','git_source_acquisition_sequence','git_source_acquisitions','git_source_acquisition_members','git_source_desires','branch_source_generations','branch_source_current','git_source_consumers','artifact_intents','git_source_maintenance')").fetch_one(&mut **c).await?;
+pub(crate) async fn migrate_sqlite_v7_in(c: &mut sqlx::SqliteConnection) -> Result<()> {
+    let planted:i64=sqlx::query_scalar("SELECT count(*) FROM sqlite_master WHERE name LIKE 'git_source_%' OR name LIKE 'branch_source_%' OR name LIKE 'artifact_intents%' OR tbl_name IN('git_source_roots','git_source_members','git_source_acquisition_sequence','git_source_acquisitions','git_source_acquisition_members','git_source_desires','branch_source_generations','branch_source_current','git_source_consumers','artifact_intents','git_source_maintenance')").fetch_one(&mut *c).await?;
     if planted != 0 {
         bail!("partial or planted Git source registry schema detected")
     }
-    sqlx::raw_sql(SQLITE_V7_SCHEMA).execute(&mut **c).await?;
+    sqlx::raw_sql(SQLITE_V7_SCHEMA).execute(&mut *c).await?;
     validate_sqlite_v7_in(c).await
 }
 
-pub(crate) async fn validate_sqlite_v7_in(c: &mut PoolConnection<Sqlite>) -> Result<()> {
+pub(crate) async fn validate_sqlite_v7_in(c: &mut sqlx::SqliteConnection) -> Result<()> {
     let expected = expected_sqlite_v7_ddl()?;
-    let actual_rows:Vec<(String,String)>=sqlx::query_as("SELECT name,sql FROM sqlite_master WHERE sql IS NOT NULL AND (name LIKE 'git_source_%' OR name LIKE 'branch_source_%' OR name LIKE 'artifact_intents%' OR tbl_name IN('git_source_roots','git_source_members','git_source_acquisition_sequence','git_source_acquisitions','git_source_acquisition_members','git_source_desires','branch_source_generations','branch_source_current','git_source_consumers','artifact_intents','git_source_maintenance')) ORDER BY name").fetch_all(&mut **c).await?;
+    let actual_rows:Vec<(String,String)>=sqlx::query_as("SELECT name,sql FROM sqlite_master WHERE sql IS NOT NULL AND (name LIKE 'git_source_%' OR name LIKE 'branch_source_%' OR name LIKE 'artifact_intents%' OR tbl_name IN('git_source_roots','git_source_members','git_source_acquisition_sequence','git_source_acquisitions','git_source_acquisition_members','git_source_desires','branch_source_generations','branch_source_current','git_source_consumers','artifact_intents','git_source_maintenance')) ORDER BY name").fetch_all(&mut *c).await?;
     let actual = actual_rows
         .into_iter()
         .map(|(name, sql)| (name, canonical_ddl(&sql)))
@@ -1278,7 +1347,7 @@ pub(crate) async fn validate_sqlite_v7_in(c: &mut PoolConnection<Sqlite>) -> Res
         bail!("Git source registry DDL inventory or definition is not exact")
     }
     let fk = sqlx::query("PRAGMA foreign_key_check")
-        .fetch_all(&mut **c)
+        .fetch_all(&mut *c)
         .await?;
     if fk.iter().any(|row| {
         let table: String = row.get("table");
@@ -1290,29 +1359,41 @@ pub(crate) async fn validate_sqlite_v7_in(c: &mut PoolConnection<Sqlite>) -> Res
     }
     let singleton: Vec<(i64, i64)> =
         sqlx::query_as("SELECT id,generation FROM git_source_acquisition_sequence")
-            .fetch_all(&mut **c)
+            .fetch_all(&mut *c)
             .await?;
     let max: i64 =
         sqlx::query_scalar("SELECT COALESCE(MAX(generation),0) FROM git_source_acquisitions")
-            .fetch_one(&mut **c)
+            .fetch_one(&mut *c)
             .await?;
     if singleton.len() != 1 || singleton[0].0 != 1 || singleton[0].1 < max {
         bail!("Git source acquisition sequence is invalid")
     }
-    let bad:i64=sqlx::query_scalar("SELECT count(*) FROM git_source_acquisitions a WHERE (a.state='held' AND EXISTS(SELECT 1 FROM git_source_acquisition_members m WHERE m.token=a.token)) OR (a.state IN('graph_published','activation_unknown','registered') AND (a.root_hash IS NULL OR NOT EXISTS(SELECT 1 FROM git_source_acquisition_members m WHERE m.token=a.token))) OR EXISTS(SELECT 1 FROM git_source_acquisition_members m WHERE m.token=a.token GROUP BY m.token HAVING MIN(m.ordinal)<>0 OR MAX(m.ordinal)+1<>count(*) OR count(*)%2<>0 OR SUM(CASE WHEN (m.ordinal%2=0 AND m.kind='pack') OR (m.ordinal%2=1 AND m.kind='index') THEN 0 ELSE 1 END)<>0 OR SUM(m.child_len)<>a.total_bytes)").fetch_one(&mut **c).await?;
+    let operation_rows:Vec<(i64,String,String,String,String,String)>=sqlx::query_as("SELECT generation,workspace,repo,commit_oid,attempt_id,operation_id FROM git_source_acquisitions").fetch_all(&mut *c).await?;
+    if operation_rows
+        .iter()
+        .any(|(generation, workspace, repo, commit, attempt, stored)| {
+            stored != &operation_id(workspace, repo, commit, attempt, *generation)
+        })
+    {
+        bail!("Git source acquisition operation provenance is invalid")
+    }
+    let bad:i64=sqlx::query_scalar("SELECT count(*) FROM git_source_acquisitions a WHERE (a.state='held' AND EXISTS(SELECT 1 FROM git_source_acquisition_members m WHERE m.token=a.token)) OR (a.state IN('graph_published','activation_unknown','registered') AND (a.root_hash IS NULL OR NOT EXISTS(SELECT 1 FROM git_source_acquisition_members m WHERE m.token=a.token))) OR EXISTS(SELECT 1 FROM git_source_acquisition_members m WHERE m.token=a.token GROUP BY m.token HAVING MIN(m.ordinal)<>0 OR MAX(m.ordinal)+1<>count(*) OR count(*)%2<>0 OR SUM(CASE WHEN (m.ordinal%2=0 AND m.kind='pack') OR (m.ordinal%2=1 AND m.kind='index') THEN 0 ELSE 1 END)<>0 OR SUM(m.child_len)<>a.total_bytes)").fetch_one(&mut *c).await?;
     if bad != 0 {
         bail!("Git source provisional graphs are invalid")
     }
-    let invalid_roots:i64=sqlx::query_scalar("SELECT count(*) FROM git_source_roots r WHERE length(r.root_hash)<>64 OR r.root_hash GLOB '*[^0-9a-f]*' OR length(r.semantic_digest)<>64 OR r.semantic_digest GLOB '*[^0-9a-f]*' OR length(r.object_set_digest)<>64 OR r.object_set_digest GLOB '*[^0-9a-f]*' OR NOT EXISTS(SELECT 1 FROM git_source_members m WHERE m.root_hash=r.root_hash GROUP BY m.root_hash HAVING MIN(m.ordinal)=0 AND MAX(m.ordinal)+1=count(*) AND count(*)%2=0 AND SUM(m.child_len)=r.total_bytes AND SUM(CASE WHEN (m.ordinal%2=0 AND m.kind='pack') OR (m.ordinal%2=1 AND m.kind='index') THEN 0 ELSE 1 END)=0) OR EXISTS(SELECT 1 FROM git_source_members m WHERE m.root_hash=r.root_hash AND (length(m.child_hash)<>64 OR m.child_hash GLOB '*[^0-9a-f]*'))").fetch_one(&mut **c).await?;
-    let invalid_provisional:i64=sqlx::query_scalar("SELECT count(*) FROM git_source_acquisitions a WHERE (a.root_hash IS NOT NULL AND (length(a.root_hash)<>64 OR a.root_hash GLOB '*[^0-9a-f]*')) OR (a.semantic_digest IS NOT NULL AND (length(a.semantic_digest)<>64 OR a.semantic_digest GLOB '*[^0-9a-f]*')) OR (a.object_set_digest IS NOT NULL AND (length(a.object_set_digest)<>64 OR a.object_set_digest GLOB '*[^0-9a-f]*')) OR EXISTS(SELECT 1 FROM git_source_acquisition_members m WHERE m.token=a.token AND (length(m.child_hash)<>64 OR m.child_hash GLOB '*[^0-9a-f]*'))").fetch_one(&mut **c).await?;
-    let invalid_registered_acquisitions:i64=sqlx::query_scalar("SELECT count(*) FROM git_source_acquisitions a LEFT JOIN git_source_roots r ON r.root_hash=a.root_hash WHERE a.state='registered' AND (r.root_hash IS NULL OR r.state<>'registered' OR r.root_len<>a.root_len OR r.workspace<>a.workspace OR r.repo<>a.repo OR r.commit_oid<>a.commit_oid OR r.source_format_version<>a.source_format_version OR r.object_format<>a.object_format OR r.semantic_digest<>a.semantic_digest OR r.object_set_digest<>a.object_set_digest OR r.object_count<>a.object_count OR r.total_bytes<>a.total_bytes OR r.registration_operation<>a.operation_id OR r.registration_generation<>a.generation OR EXISTS(SELECT 1 FROM git_source_acquisition_members am LEFT JOIN git_source_members m ON m.root_hash=r.root_hash AND m.ordinal=am.ordinal WHERE am.token=a.token AND (m.ordinal IS NULL OR m.child_hash<>am.child_hash OR m.child_len<>am.child_len OR m.kind<>am.kind)) OR EXISTS(SELECT 1 FROM git_source_members m LEFT JOIN git_source_acquisition_members am ON am.token=a.token AND am.ordinal=m.ordinal WHERE m.root_hash=r.root_hash AND am.ordinal IS NULL))").fetch_one(&mut **c).await?;
-    let invalid_registered_roots:i64=sqlx::query_scalar("SELECT count(*) FROM git_source_roots r WHERE r.state='registered' AND NOT EXISTS(SELECT 1 FROM git_source_acquisitions a WHERE a.state='registered' AND a.root_hash=r.root_hash AND a.root_len=r.root_len AND a.workspace=r.workspace AND a.repo=r.repo AND a.commit_oid=r.commit_oid AND a.source_format_version=r.source_format_version AND a.object_format=r.object_format AND a.semantic_digest=r.semantic_digest AND a.object_set_digest=r.object_set_digest AND a.object_count=r.object_count AND a.total_bytes=r.total_bytes AND a.operation_id=r.registration_operation AND a.generation=r.registration_generation)").fetch_one(&mut **c).await?;
-    let conflicting_graph_descriptors:i64=sqlx::query_scalar("SELECT count(*) FROM (SELECT hash,count(DISTINCT len||':'||kind) variants FROM (SELECT root_hash hash,root_len len,'root' kind FROM git_source_roots UNION ALL SELECT root_hash,root_len,'root' FROM git_source_acquisitions WHERE root_hash IS NOT NULL UNION ALL SELECT child_hash,child_len,kind FROM git_source_members UNION ALL SELECT child_hash,child_len,kind FROM git_source_acquisition_members) GROUP BY hash HAVING variants<>1)").fetch_one(&mut **c).await?;
-    let root_child_aliases:i64=sqlx::query_scalar("SELECT count(*) FROM (SELECT root_hash hash FROM git_source_roots UNION SELECT root_hash FROM git_source_acquisitions WHERE root_hash IS NOT NULL) r JOIN (SELECT child_hash hash FROM git_source_members UNION SELECT child_hash FROM git_source_acquisition_members) m USING(hash)").fetch_one(&mut **c).await?;
-    let invalid_desires:i64=sqlx::query_scalar("SELECT count(*) FROM git_source_desires d LEFT JOIN git_source_acquisitions a ON a.token=d.acquisition_token LEFT JOIN git_source_roots r ON r.root_hash=d.root_hash WHERE d.source_format_version<>1 OR (d.state='acquiring' AND (a.token IS NULL OR a.workspace<>d.workspace OR a.repo<>d.repo OR a.commit_oid<>d.commit_oid OR a.source_format_version<>d.source_format_version OR a.state NOT IN('held','graph_published','activation_unknown'))) OR (d.state='registered' AND (r.root_hash IS NULL OR r.workspace<>d.workspace OR r.repo<>d.repo OR r.commit_oid<>d.commit_oid OR r.source_format_version<>d.source_format_version OR r.state<>'registered'))").fetch_one(&mut **c).await?;
-    let invalid_branches:i64=sqlx::query_scalar("SELECT count(*) FROM branch_source_current c JOIN branch_source_generations g USING(workspace,repo,branch,generation) LEFT JOIN branch_observations b USING(workspace,repo,branch) WHERE b.generation<>g.generation OR b.desired_commit<>g.commit_oid OR NOT EXISTS(SELECT 1 FROM git_source_roots r WHERE r.root_hash=g.root_hash AND r.workspace=g.workspace AND r.repo=g.repo AND r.commit_oid=g.commit_oid)").fetch_one(&mut **c).await?;
-    let invalid_intents:i64=sqlx::query_scalar("SELECT count(*) FROM artifact_intents i JOIN branch_source_generations g ON g.workspace=i.workspace AND g.repo=i.repo AND g.branch=i.branch AND g.generation=i.branch_generation LEFT JOIN git_source_consumers c ON c.root_hash=i.source_root_hash AND c.consumer_id=i.consumer_id LEFT JOIN artifact_jobs j ON j.id=i.artifact_id LEFT JOIN artifact_consumers ac ON ac.artifact_id=i.artifact_id AND ac.consumer_id=i.consumer_id LEFT JOIN git_source_desires d ON d.workspace=i.workspace AND d.repo=i.repo AND d.commit_oid=i.commit_oid WHERE g.root_hash<>i.source_root_hash OR g.commit_oid<>i.commit_oid OR d.workspace IS NULL OR d.source_format_version<>i.source_format_version OR d.state<>'registered' OR d.root_hash<>i.source_root_hash OR c.consumer_id IS NULL OR c.purpose<>'intent' OR (i.state='promoted' AND (j.id IS NULL OR ac.consumer_id IS NULL OR j.workspace<>i.workspace OR j.repo<>i.repo OR j.commit_oid<>i.commit_oid OR j.kind<>i.kind OR j.format_version<>i.format_version))").fetch_one(&mut **c).await?;
-    let invalid_maintenance:i64=sqlx::query_scalar("SELECT CASE WHEN count(*)<>1 THEN 1 ELSE COALESCE(MAX(CASE WHEN id<>1 OR intent_cursor<0 OR acquisition_cursor<0 OR (root_cursor<>'' AND (length(root_cursor)<>64 OR root_cursor GLOB '*[^0-9a-f]*')) OR (config_fingerprint<>'' AND (length(config_fingerprint)<>64 OR config_fingerprint GLOB '*[^0-9a-f]*')) THEN 1 ELSE 0 END),1) END FROM git_source_maintenance").fetch_one(&mut **c).await?;
+    let invalid_roots:i64=sqlx::query_scalar("SELECT count(*) FROM git_source_roots r WHERE length(r.root_hash)<>64 OR r.root_hash GLOB '*[^0-9a-f]*' OR length(r.semantic_digest)<>64 OR r.semantic_digest GLOB '*[^0-9a-f]*' OR length(r.object_set_digest)<>64 OR r.object_set_digest GLOB '*[^0-9a-f]*' OR NOT EXISTS(SELECT 1 FROM git_source_members m WHERE m.root_hash=r.root_hash GROUP BY m.root_hash HAVING MIN(m.ordinal)=0 AND MAX(m.ordinal)+1=count(*) AND count(*)%2=0 AND SUM(m.child_len)=r.total_bytes AND SUM(CASE WHEN (m.ordinal%2=0 AND m.kind='pack') OR (m.ordinal%2=1 AND m.kind='index') THEN 0 ELSE 1 END)=0) OR EXISTS(SELECT 1 FROM git_source_members m WHERE m.root_hash=r.root_hash AND (length(m.child_hash)<>64 OR m.child_hash GLOB '*[^0-9a-f]*'))").fetch_one(&mut *c).await?;
+    let invalid_provisional:i64=sqlx::query_scalar("SELECT count(*) FROM git_source_acquisitions a WHERE length(a.token)<>64 OR a.token GLOB '*[^0-9a-f]*' OR (a.root_hash IS NOT NULL AND (length(a.root_hash)<>64 OR a.root_hash GLOB '*[^0-9a-f]*')) OR (a.semantic_digest IS NOT NULL AND (length(a.semantic_digest)<>64 OR a.semantic_digest GLOB '*[^0-9a-f]*')) OR (a.object_set_digest IS NOT NULL AND (length(a.object_set_digest)<>64 OR a.object_set_digest GLOB '*[^0-9a-f]*')) OR EXISTS(SELECT 1 FROM git_source_acquisition_members m WHERE m.token=a.token AND (length(m.child_hash)<>64 OR m.child_hash GLOB '*[^0-9a-f]*'))").fetch_one(&mut *c).await?;
+    let invalid_registered_acquisitions:i64=sqlx::query_scalar("SELECT count(*) FROM git_source_acquisitions a LEFT JOIN git_source_roots r ON r.root_hash=a.root_hash WHERE a.state='registered' AND (r.root_hash IS NULL OR r.state<>'registered' OR r.root_len<>a.root_len OR r.workspace<>a.workspace OR r.repo<>a.repo OR r.commit_oid<>a.commit_oid OR r.source_format_version<>a.source_format_version OR r.object_format<>a.object_format OR r.semantic_digest<>a.semantic_digest OR r.object_set_digest<>a.object_set_digest OR r.object_count<>a.object_count OR r.total_bytes<>a.total_bytes OR r.registration_operation<>a.operation_id OR r.registration_generation<>a.generation OR EXISTS(SELECT 1 FROM git_source_acquisition_members am LEFT JOIN git_source_members m ON m.root_hash=r.root_hash AND m.ordinal=am.ordinal WHERE am.token=a.token AND (m.ordinal IS NULL OR m.child_hash<>am.child_hash OR m.child_len<>am.child_len OR m.kind<>am.kind)) OR EXISTS(SELECT 1 FROM git_source_members m LEFT JOIN git_source_acquisition_members am ON am.token=a.token AND am.ordinal=m.ordinal WHERE m.root_hash=r.root_hash AND am.ordinal IS NULL))").fetch_one(&mut *c).await?;
+    let invalid_registered_roots:i64=sqlx::query_scalar("SELECT count(*) FROM git_source_roots r WHERE r.state='registered' AND NOT EXISTS(SELECT 1 FROM git_source_acquisitions a WHERE a.state='registered' AND a.root_hash=r.root_hash AND a.root_len=r.root_len AND a.workspace=r.workspace AND a.repo=r.repo AND a.commit_oid=r.commit_oid AND a.source_format_version=r.source_format_version AND a.object_format=r.object_format AND a.semantic_digest=r.semantic_digest AND a.object_set_digest=r.object_set_digest AND a.object_count=r.object_count AND a.total_bytes=r.total_bytes AND a.operation_id=r.registration_operation AND a.generation=r.registration_generation)").fetch_one(&mut *c).await?;
+    let conflicting_graph_descriptors:i64=sqlx::query_scalar("SELECT count(*) FROM (SELECT hash,count(DISTINCT len||':'||kind) variants FROM (SELECT root_hash hash,root_len len,'root' kind FROM git_source_roots UNION ALL SELECT root_hash,root_len,'root' FROM git_source_acquisitions WHERE root_hash IS NOT NULL UNION ALL SELECT child_hash,child_len,kind FROM git_source_members UNION ALL SELECT child_hash,child_len,kind FROM git_source_acquisition_members) GROUP BY hash HAVING variants<>1)").fetch_one(&mut *c).await?;
+    let root_child_aliases:i64=sqlx::query_scalar("SELECT count(*) FROM (SELECT root_hash hash FROM git_source_roots UNION SELECT root_hash FROM git_source_acquisitions WHERE root_hash IS NOT NULL) r JOIN (SELECT child_hash hash FROM git_source_members UNION SELECT child_hash FROM git_source_acquisition_members) m USING(hash)").fetch_one(&mut *c).await?;
+    let invalid_desires:i64=sqlx::query_scalar("SELECT count(*) FROM git_source_desires d LEFT JOIN git_source_acquisitions a ON a.token=d.acquisition_token LEFT JOIN git_source_roots r ON r.root_hash=d.root_hash WHERE d.source_format_version<>1 OR (d.state='acquiring' AND (a.token IS NULL OR a.workspace<>d.workspace OR a.repo<>d.repo OR a.commit_oid<>d.commit_oid OR a.source_format_version<>d.source_format_version OR a.state NOT IN('held','graph_published','activation_unknown'))) OR (d.state='registered' AND (r.root_hash IS NULL OR r.workspace<>d.workspace OR r.repo<>d.repo OR r.commit_oid<>d.commit_oid OR r.source_format_version<>d.source_format_version OR r.state<>'registered'))").fetch_one(&mut *c).await?;
+    let orphan_acquisition_desires:i64=sqlx::query_scalar("SELECT count(*) FROM git_source_acquisitions a WHERE (a.state IN('held','graph_published','activation_unknown') AND NOT EXISTS(SELECT 1 FROM git_source_desires d WHERE d.state='acquiring' AND d.acquisition_token=a.token AND d.workspace=a.workspace AND d.repo=a.repo AND d.commit_oid=a.commit_oid AND d.source_format_version=a.source_format_version)) OR (a.state='registered' AND NOT EXISTS(SELECT 1 FROM git_source_desires d WHERE d.state='registered' AND d.acquisition_token IS NULL AND d.root_hash=a.root_hash AND d.workspace=a.workspace AND d.repo=a.repo AND d.commit_oid=a.commit_oid AND d.source_format_version=a.source_format_version))").fetch_one(&mut *c).await?;
+    let orphan_registered_root_desires:i64=sqlx::query_scalar("SELECT count(*) FROM git_source_roots r WHERE r.state='registered' AND NOT EXISTS(SELECT 1 FROM git_source_desires d WHERE d.state='registered' AND d.root_hash=r.root_hash AND d.workspace=r.workspace AND d.repo=r.repo AND d.commit_oid=r.commit_oid AND d.source_format_version=r.source_format_version)").fetch_one(&mut *c).await?;
+    let invalid_branches:i64=sqlx::query_scalar("SELECT count(*) FROM branch_source_current c JOIN branch_source_generations g USING(workspace,repo,branch,generation) LEFT JOIN branch_observations b USING(workspace,repo,branch) WHERE b.workspace IS NULL OR b.generation<>g.generation OR b.desired_commit<>g.commit_oid OR NOT EXISTS(SELECT 1 FROM git_source_roots r JOIN git_source_desires d ON d.root_hash=r.root_hash AND d.workspace=r.workspace AND d.repo=r.repo AND d.commit_oid=r.commit_oid AND d.source_format_version=r.source_format_version WHERE r.root_hash=g.root_hash AND r.workspace=g.workspace AND r.repo=g.repo AND r.commit_oid=g.commit_oid AND r.source_format_version=g.source_format_version AND r.state='registered' AND d.state='registered')").fetch_one(&mut *c).await?;
+    let invalid_intents:i64=sqlx::query_scalar("SELECT count(*) FROM artifact_intents i JOIN branch_source_generations g ON g.workspace=i.workspace AND g.repo=i.repo AND g.branch=i.branch AND g.generation=i.branch_generation LEFT JOIN git_source_consumers c ON c.root_hash=i.source_root_hash AND c.consumer_id=i.consumer_id LEFT JOIN artifact_jobs j ON j.id=i.artifact_id LEFT JOIN artifact_consumers ac ON ac.artifact_id=i.artifact_id AND ac.consumer_id=i.consumer_id LEFT JOIN git_source_desires d ON d.workspace=i.workspace AND d.repo=i.repo AND d.commit_oid=i.commit_oid WHERE g.root_hash<>i.source_root_hash OR g.commit_oid<>i.commit_oid OR d.workspace IS NULL OR d.source_format_version<>i.source_format_version OR d.state<>'registered' OR d.root_hash<>i.source_root_hash OR c.consumer_id IS NULL OR c.purpose<>'intent' OR (i.state='promoted' AND (j.id IS NULL OR ac.consumer_id IS NULL OR j.workspace<>i.workspace OR j.repo<>i.repo OR j.commit_oid<>i.commit_oid OR j.kind<>i.kind OR j.format_version<>i.format_version))").fetch_one(&mut *c).await?;
+    let orphan_intent_consumers:i64=sqlx::query_scalar("SELECT count(*) FROM git_source_consumers c WHERE c.purpose='intent' AND NOT EXISTS(SELECT 1 FROM artifact_intents i WHERE i.consumer_id=c.consumer_id AND i.source_root_hash=c.root_hash AND i.workspace=c.workspace AND i.repo=c.repo AND i.commit_oid=c.commit_oid AND i.source_format_version=c.source_format_version)").fetch_one(&mut *c).await?;
+    let invalid_maintenance:i64=sqlx::query_scalar("SELECT CASE WHEN count(*)<>1 THEN 1 ELSE COALESCE(MAX(CASE WHEN id<>1 OR intent_cursor<0 OR acquisition_cursor<0 OR (root_cursor<>'' AND (length(root_cursor)<>64 OR root_cursor GLOB '*[^0-9a-f]*')) OR (config_fingerprint<>'' AND (length(config_fingerprint)<>64 OR config_fingerprint GLOB '*[^0-9a-f]*')) THEN 1 ELSE 0 END),1) END FROM git_source_maintenance").fetch_one(&mut *c).await?;
     if invalid_roots
         + invalid_provisional
         + invalid_registered_acquisitions
@@ -1320,8 +1401,11 @@ pub(crate) async fn validate_sqlite_v7_in(c: &mut PoolConnection<Sqlite>) -> Res
         + conflicting_graph_descriptors
         + root_child_aliases
         + invalid_desires
+        + orphan_acquisition_desires
+        + orphan_registered_root_desires
         + invalid_branches
         + invalid_intents
+        + orphan_intent_consumers
         + invalid_maintenance
         != 0
     {
@@ -1367,17 +1451,17 @@ fn canonical_ddl(sql: &str) -> String {
 }
 
 async fn assert_exact_graph(
-    c: &mut PoolConnection<Sqlite>,
+    c: &mut sqlx::SqliteConnection,
     a: &GitSourceAcquisition,
     v: &GitSourceRegistryView,
     now: i64,
 ) -> Result<()> {
     let found:i64=sqlx::query_scalar("SELECT count(*) FROM git_source_acquisitions WHERE token=? AND generation=? AND operation_id=? AND workspace=? AND repo=? AND commit_oid=? AND source_format_version=? AND root_hash=? AND root_len=? AND state='graph_published' AND expires_at>?")
-        .bind(&a.token).bind(a.generation as i64).bind(&a.operation_id).bind(&v.workspace).bind(&v.repo).bind(&v.commit).bind(v.source_format_version as i64).bind(&v.root.hash).bind(checked_i64(v.root.len,"root length")?).bind(now).fetch_one(&mut **c).await?;
+        .bind(&a.token).bind(a.generation as i64).bind(&a.operation_id).bind(&v.workspace).bind(&v.repo).bind(&v.commit).bind(v.source_format_version as i64).bind(&v.root.hash).bind(checked_i64(v.root.len,"root length")?).bind(now).fetch_one(&mut *c).await?;
     if found != 1 {
         bail!("source acquisition is stale or mismatched")
     }
-    let members:Vec<(i64,String,i64,String)>=sqlx::query_as("SELECT ordinal,child_hash,child_len,kind FROM git_source_acquisition_members WHERE token=? ORDER BY ordinal").bind(&a.token).fetch_all(&mut **c).await?;
+    let members:Vec<(i64,String,i64,String)>=sqlx::query_as("SELECT ordinal,child_hash,child_len,kind FROM git_source_acquisition_members WHERE token=? ORDER BY ordinal").bind(&a.token).fetch_all(&mut *c).await?;
     if members.len() != v.members.len()
         || members.iter().zip(&v.members).any(|(x, y)| {
             x.0 != y.ordinal as i64
@@ -1427,16 +1511,37 @@ fn validate_acquire_identity(
     };
     crate::artifact_scheduler::validate_canonical_commit_oid(commit)
 }
-async fn finish<T>(c: &mut PoolConnection<Sqlite>, result: Result<T>) -> Result<T> {
+async fn finish<T>(c: ImmediateTransaction, result: Result<T>) -> Result<T> {
+    finish_with_commit_fault(c, result, TransactionCommitFault::None).await
+}
+
+async fn finish_with_commit_fault<T>(
+    mut c: ImmediateTransaction,
+    result: Result<T>,
+    commit_fault: TransactionCommitFault,
+) -> Result<T> {
     match result {
         Ok(v) => {
-            sqlx::query("COMMIT").execute(&mut **c).await?;
-            Ok(v)
+            if commit_fault == TransactionCommitFault::FailWithOpenTransaction {
+                bail!("injected transaction COMMIT failure with an open transaction")
+            }
+            match sqlx::query("COMMIT").execute(&mut *c).await {
+                Ok(_) => {
+                    c.release();
+                    Ok(v)
+                }
+                Err(error) => Err(error).context("commit registry transaction; connection retired"),
+            }
         }
-        Err(e) => {
-            let _ = sqlx::query("ROLLBACK").execute(&mut **c).await;
-            Err(e)
-        }
+        Err(error) => match sqlx::query("ROLLBACK").execute(&mut *c).await {
+            Ok(_) => {
+                c.release();
+                Err(error)
+            }
+            Err(rollback) => Err(error).context(format!(
+                "rollback registry transaction failed; connection retired: {rollback}"
+            )),
+        },
     }
 }
 fn checked_i64(v: u64, label: &str) -> Result<i64> {
@@ -1448,12 +1553,19 @@ fn checked_u64(v: i64, label: &str) -> Result<u64> {
 fn checked_u32(v: i64, label: &str) -> Result<u32> {
     u32::try_from(v).with_context(|| format!("{label} exceeds range"))
 }
-fn operation_id(workspace: &str, repo: &str, commit: &str, attempt: &str) -> String {
+fn operation_id(
+    workspace: &str,
+    repo: &str,
+    commit: &str,
+    attempt: &str,
+    generation: i64,
+) -> String {
     let mut h = Sha256::new();
     for v in [workspace, repo, commit, attempt] {
         h.update((v.len() as u64).to_be_bytes());
         h.update(v.as_bytes());
     }
+    h.update(generation.to_be_bytes());
     hex::encode(h.finalize())
 }
 fn parse_object_format(v: &str) -> Result<GitObjectFormat> {
@@ -1802,6 +1914,182 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_begin_commit_retires_connection_and_rolls_back_all_writes() {
+        let (_scheduler, registry, pool, _temp) = fixture().await;
+        let commit = "8".repeat(40);
+        assert!(
+            registry
+                .begin_acquisition_with_commit_fault(
+                    "ws",
+                    "o/r",
+                    &commit,
+                    SOURCE_FORMAT_VERSION,
+                    "owner",
+                    "attempt",
+                    60,
+                    SyncIntent::EnsureCurrent,
+                    TransactionCommitFault::FailWithOpenTransaction,
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT generation FROM git_source_acquisition_sequence WHERE id=1"
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM git_source_acquisitions")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM git_source_desires")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(matches!(
+            registry
+                .begin_acquisition(
+                    "ws",
+                    "o/r",
+                    &commit,
+                    SOURCE_FORMAT_VERSION,
+                    "owner",
+                    "attempt",
+                    60,
+                    SyncIntent::EnsureCurrent,
+                )
+                .await
+                .unwrap(),
+            SourceBeginOutcome::PermitToPrepare(_)
+        ));
+        let mut fresh = pool.acquire().await.unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *fresh)
+            .await
+            .unwrap();
+        sqlx::query("ROLLBACK").execute(&mut *fresh).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropped_inflight_begin_bind_and_settlement_never_contaminate_pool() {
+        let (_scheduler, registry, pool, _temp) = fixture().await;
+        let commit = "7".repeat(40);
+        let mut begin = ImmediateTransaction::begin(&pool).await.unwrap();
+        assert!(matches!(
+            registry
+                .begin_in(
+                    &mut begin,
+                    "ws",
+                    "o/r",
+                    &commit,
+                    1,
+                    "owner",
+                    "attempt",
+                    60,
+                    SyncIntent::EnsureCurrent
+                )
+                .await
+                .unwrap(),
+            SourceBeginOutcome::PermitToPrepare(_)
+        ));
+        drop(begin);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM git_source_acquisitions")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+
+        let permit = match registry
+            .begin_acquisition(
+                "ws",
+                "o/r",
+                &commit,
+                1,
+                "owner",
+                "attempt",
+                60,
+                SyncIntent::EnsureCurrent,
+            )
+            .await
+            .unwrap()
+        {
+            SourceBeginOutcome::PermitToPrepare(v) => v,
+            _ => panic!(),
+        };
+        let source = prepared(&registry, &commit);
+        let view = source.registry_view(&GitSourceLimits::default()).unwrap();
+        let mut bind = ImmediateTransaction::begin(&pool).await.unwrap();
+        sqlx::query("UPDATE git_source_acquisitions SET root_hash=?,root_len=?,object_format=?,semantic_digest=?,object_set_digest=?,object_count=?,total_bytes=?,state='graph_published' WHERE token=? AND state='held'")
+            .bind(&view.root.hash).bind(view.root.len as i64).bind(view.object_format).bind(&view.semantic_digest).bind(&view.object_set_digest).bind(view.object_count as i64).bind(view.total_bytes as i64).bind(&permit.token).execute(&mut *bind).await.unwrap();
+        sqlx::query("INSERT INTO git_source_acquisition_members(token,ordinal,child_hash,child_len,kind) VALUES(?,0,?,?,'pack')")
+            .bind(&permit.token).bind(&view.members[0].blob.hash).bind(view.members[0].blob.len as i64).execute(&mut *bind).await.unwrap();
+        drop(bind);
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT state FROM git_source_acquisitions WHERE token=?"
+            )
+            .bind(&permit.token)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            "held"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM git_source_acquisition_members WHERE token=?"
+            )
+            .bind(&permit.token)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0
+        );
+        let (acquisition, _) = registry
+            .bind_prepared_graph(&permit, &source)
+            .await
+            .unwrap();
+
+        let mut settlement = ImmediateTransaction::begin(&pool).await.unwrap();
+        sqlx::query("UPDATE git_source_acquisitions SET state='failed',failure_class='retryable' WHERE token=?")
+            .bind(&permit.token).execute(&mut *settlement).await.unwrap();
+        sqlx::query("UPDATE git_source_desires SET state='failed',failure_class='retryable',acquisition_token=NULL WHERE acquisition_token=?")
+            .bind(&permit.token).execute(&mut *settlement).await.unwrap();
+        drop(settlement);
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT state FROM git_source_acquisitions WHERE token=?"
+            )
+            .bind(&permit.token)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            "graph_published"
+        );
+        registry
+            .register(&acquisition, &source, &CancellationToken::new())
+            .await
+            .unwrap();
+        let mut fresh = pool.acquire().await.unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *fresh)
+            .await
+            .unwrap();
+        sqlx::query("ROLLBACK").execute(&mut *fresh).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn independent_registries_dedupe_before_preparation() {
         let (_scheduler, first, _pool, temp) = fixture().await;
         let second_pool = SqlitePool::connect(&format!(
@@ -1891,7 +2179,7 @@ mod tests {
                 &commit,
                 SOURCE_FORMAT_VERSION,
                 "new",
-                "new",
+                "old",
                 60,
                 SyncIntent::EnsureCurrent,
             )
@@ -1965,6 +2253,57 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn retryable_prepare_failure_allows_same_attempt_id_with_generation_fencing() {
+        let (_scheduler, registry, _pool, _temp) = fixture().await;
+        let commit = "0".repeat(40);
+        let first = match registry
+            .begin_acquisition(
+                "ws",
+                "o/r",
+                &commit,
+                SOURCE_FORMAT_VERSION,
+                "owner",
+                "same",
+                60,
+                SyncIntent::EnsureCurrent,
+            )
+            .await
+            .unwrap()
+        {
+            SourceBeginOutcome::PermitToPrepare(permit) => permit,
+            _ => panic!("expected first permit"),
+        };
+        assert!(
+            registry
+                .fail_preparation(&first, FailureClass::Retryable)
+                .await
+                .unwrap()
+        );
+        let second = match registry
+            .begin_acquisition(
+                "ws",
+                "o/r",
+                &commit,
+                SOURCE_FORMAT_VERSION,
+                "owner",
+                "same",
+                60,
+                SyncIntent::EnsureCurrent,
+            )
+            .await
+            .unwrap()
+        {
+            SourceBeginOutcome::PermitToPrepare(permit) => permit,
+            _ => panic!("expected same-attempt retry permit"),
+        };
+        assert!(second.generation > first.generation);
+        assert_ne!(second.operation_id, first.operation_id);
+        let source = prepared(&registry, &commit);
+        assert!(registry.bind_prepared_graph(&first, &source).await.is_err());
+        assert!(registry.bind_prepared_graph(&second, &source).await.is_ok());
     }
 
     #[tokio::test]
@@ -3148,6 +3487,198 @@ mod tests {
         };
         sqlx::query("INSERT INTO git_source_acquisition_members(token,ordinal,child_hash,child_len,kind) VALUES(?,0,?,1,'pack')")
             .bind(&permit.token).bind("a".repeat(64)).execute(&pool).await.unwrap();
+        assert_registry_validation_fails(&pool).await;
+    }
+
+    #[tokio::test]
+    async fn validator_recomputes_operation_provenance_for_held_and_bound_graphs() {
+        let (_scheduler, registry, pool, _temp) = fixture().await;
+        let commit = "b".repeat(40);
+        let permit = match registry
+            .begin_acquisition(
+                "ws",
+                "o/r",
+                &commit,
+                SOURCE_FORMAT_VERSION,
+                "owner",
+                "attempt",
+                60,
+                SyncIntent::EnsureCurrent,
+            )
+            .await
+            .unwrap()
+        {
+            SourceBeginOutcome::PermitToPrepare(permit) => permit,
+            _ => panic!("expected held acquisition"),
+        };
+        sqlx::query("UPDATE git_source_acquisitions SET operation_id=? WHERE token=?")
+            .bind("c".repeat(64))
+            .bind(&permit.token)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_registry_validation_fails(&pool).await;
+        sqlx::query("UPDATE git_source_acquisitions SET operation_id=? WHERE token=?")
+            .bind(&permit.operation_id)
+            .bind(&permit.token)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let source = prepared(&registry, &commit);
+        registry
+            .bind_prepared_graph(&permit, &source)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE git_source_acquisitions SET operation_id=? WHERE token=?")
+            .bind("d".repeat(64))
+            .bind(&permit.token)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_registry_validation_fails(&pool).await;
+    }
+
+    #[tokio::test]
+    async fn validator_rejects_noncanonical_acquisition_token() {
+        let (_scheduler, _registry, pool, _temp) = fixture().await;
+        let commit = "c".repeat(40);
+        let operation = operation_id("ws", "o/r", &commit, "attempt", 1);
+        sqlx::query("UPDATE git_source_acquisition_sequence SET generation=1 WHERE id=1")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO git_source_acquisitions(token,generation,operation_id,workspace,repo,commit_oid,source_format_version,owner,attempt_id,expires_at,state) VALUES('bad',1,?,'ws','o/r',?,1,'owner','attempt',unixepoch()+60,'held')")
+            .bind(operation).bind(&commit).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO git_source_desires(workspace,repo,commit_oid,source_format_version,state,retry_count,acquisition_token,updated_at) VALUES('ws','o/r',?,1,'acquiring',0,'bad',unixepoch())")
+            .bind(commit).execute(&pool).await.unwrap();
+        assert_registry_validation_fails(&pool).await;
+    }
+
+    #[tokio::test]
+    async fn validator_rejects_orphan_held_acquisition() {
+        let (_scheduler, registry, pool, _temp) = fixture().await;
+        let permit = match registry
+            .begin_acquisition(
+                "ws",
+                "o/r",
+                &"d".repeat(40),
+                1,
+                "owner",
+                "attempt",
+                60,
+                SyncIntent::EnsureCurrent,
+            )
+            .await
+            .unwrap()
+        {
+            SourceBeginOutcome::PermitToPrepare(v) => v,
+            _ => panic!(),
+        };
+        sqlx::query("DELETE FROM git_source_desires WHERE acquisition_token=?")
+            .bind(&permit.token)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_registry_validation_fails(&pool).await;
+    }
+
+    #[tokio::test]
+    async fn validator_rejects_orphan_bound_graph_acquisition() {
+        let (_scheduler, registry, pool, _temp) = fixture().await;
+        let commit = "e".repeat(40);
+        let permit = match registry
+            .begin_acquisition(
+                "ws",
+                "o/r",
+                &commit,
+                1,
+                "owner",
+                "attempt",
+                60,
+                SyncIntent::EnsureCurrent,
+            )
+            .await
+            .unwrap()
+        {
+            SourceBeginOutcome::PermitToPrepare(v) => v,
+            _ => panic!(),
+        };
+        registry
+            .bind_prepared_graph(&permit, &prepared(&registry, &commit))
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM git_source_desires WHERE acquisition_token=?")
+            .bind(&permit.token)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_registry_validation_fails(&pool).await;
+    }
+
+    #[tokio::test]
+    async fn validator_rejects_registered_graph_without_reverse_desire() {
+        let (_scheduler, registry, pool, _temp) = fixture().await;
+        let source = prepared(&registry, &"f".repeat(40));
+        let acquisition = match registry
+            .protect_prepared(&source, "owner", "attempt", 60, SyncIntent::EnsureCurrent)
+            .await
+            .unwrap()
+        {
+            SourceAcquireOutcome::Acquired { acquisition, .. } => acquisition,
+            _ => panic!(),
+        };
+        registry
+            .register(&acquisition, &source, &CancellationToken::new())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM git_source_desires WHERE state='registered'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_registry_validation_fails(&pool).await;
+    }
+
+    #[tokio::test]
+    async fn validator_rejects_current_branch_without_core_observation() {
+        let (_scheduler, registry, pool, _temp) = fixture().await;
+        let commit = "a".repeat(40);
+        let source = prepared(&registry, &commit);
+        let acquisition = match registry
+            .protect_prepared(&source, "owner", "attempt", 60, SyncIntent::EnsureCurrent)
+            .await
+            .unwrap()
+        {
+            SourceAcquireOutcome::Acquired { acquisition, .. } => acquisition,
+            _ => panic!(),
+        };
+        let snapshot = registry
+            .register(&acquisition, &source, &CancellationToken::new())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO branch_source_generations(workspace,repo,branch,generation,commit_oid,source_format_version,root_hash,created_at) VALUES('ws','o/r','main',1,?,1,?,unixepoch())").bind(&commit).bind(snapshot.manifest()).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO branch_source_current(workspace,repo,branch,generation) VALUES('ws','o/r','main',1)").execute(&pool).await.unwrap();
+        assert_registry_validation_fails(&pool).await;
+    }
+
+    #[tokio::test]
+    async fn validator_rejects_orphan_intent_source_consumer() {
+        let (_scheduler, registry, pool, _temp) = fixture().await;
+        let commit = "b".repeat(40);
+        let source = prepared(&registry, &commit);
+        let acquisition = match registry
+            .protect_prepared(&source, "owner", "attempt", 60, SyncIntent::EnsureCurrent)
+            .await
+            .unwrap()
+        {
+            SourceAcquireOutcome::Acquired { acquisition, .. } => acquisition,
+            _ => panic!(),
+        };
+        let snapshot = registry
+            .register(&acquisition, &source, &CancellationToken::new())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO git_source_consumers(root_hash,consumer_id,session_id,workspace,repo,commit_oid,source_format_version,purpose,expires_at) VALUES(?,'orphan','orphan-session','ws','o/r',?,1,'intent',?)")
+            .bind(snapshot.manifest()).bind(commit).bind(i64::MAX).execute(&pool).await.unwrap();
         assert_registry_validation_fails(&pool).await;
     }
 
