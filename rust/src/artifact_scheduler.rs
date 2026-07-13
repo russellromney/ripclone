@@ -2800,14 +2800,8 @@ pub(crate) fn validate_resolved_commit(commit: &str) -> Result<()> {
 }
 pub(crate) fn validate_canonical_commit_oid(commit: &str) -> Result<()> {
     validate_resolved_commit(commit)?;
-    if commit.len() != 40
-        || !commit
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        bail!("resolved artifact commit is not a canonical Git object id")
-    }
-    Ok(())
+    crate::validation::validate_object_id(commit)
+        .context("resolved artifact commit is not a canonical Git object id")
 }
 pub(crate) fn validate_limits(l: &SchedulerLimits) -> Result<()> {
     if l.total_backlog == 0

@@ -138,6 +138,8 @@ pub mod repo_config;
 #[doc(hidden)]
 pub mod retention;
 #[doc(hidden)]
+pub mod runtime_adapters;
+#[doc(hidden)]
 pub mod secure_file;
 pub mod server;
 #[doc(hidden)]
