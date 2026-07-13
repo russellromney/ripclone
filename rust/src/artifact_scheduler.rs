@@ -3091,7 +3091,6 @@ mod tests {
             "short",
             "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
             "gggggggggggggggggggggggggggggggggggggggg",
-            "1111111111111111111111111111111111111111111111111111111111111111",
         ] {
             assert!(
                 crate::artifact_scheduler_backend::ArtifactSchedulerPersistence::observe_if_changed(
@@ -3105,6 +3104,7 @@ mod tests {
                 .is_err()
             );
         }
+        assert!(validate_canonical_commit_oid(&"1".repeat(64)).is_ok());
     }
 
     #[tokio::test]
