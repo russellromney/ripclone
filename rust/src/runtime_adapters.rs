@@ -8,7 +8,7 @@
 //! activation.
 
 use crate::artifact_scheduler::FailureClass;
-use crate::auth::broker::CredentialBroker;
+use crate::auth::broker::{CredentialBroker, CredentialFailure, CredentialFailureKind};
 use crate::cas::Cas;
 use crate::git_source::{
     CasGitSourceStore, GIT_SOURCE_FORMAT, GitSourceLimits, GitSourcePackager, GitSourceUploader,
@@ -164,7 +164,7 @@ impl WorkspaceProviderAccess {
         Self { workspaces, broker }
     }
 
-    fn resolve(
+    async fn resolve(
         &self,
         workspace: &str,
         repo: &str,
@@ -181,7 +181,11 @@ impl WorkspaceProviderAccess {
             path: repo.to_owned(),
         };
         crate::validation::validate_repo_path(&configured.upstream, &repo_id)?;
-        let credential = self.broker.fetch_credential(&repo_id, None)?;
+        let credential = self
+            .broker
+            .clone()
+            .fetch_credential_async(repo_id.clone(), None)
+            .await?;
         Ok((configured.upstream.clone(), repo_id, credential))
     }
 }
@@ -215,15 +219,11 @@ impl<G: ProviderGit> BranchTipResolver for ProviderCurrentTipResolver<G> {
         repo: &str,
         branch: &str,
     ) -> Result<String> {
-        // A dynamic credential broker may mint over HTTP. Keep that synchronous
-        // compatibility seam off the async executor.
-        let access = self.access.clone();
-        let workspace = workspace.to_owned();
-        let repo_path = repo.to_owned();
-        let (provider, repo, credential) =
-            tokio::task::spawn_blocking(move || access.resolve(&workspace, &repo_path))
-                .await
-                .context("workspace credential task did not join")??;
+        let (provider, repo, credential) = self
+            .access
+            .resolve(workspace, repo)
+            .await
+            .map_err(classify_credential_failure)?;
         self.git
             .current_tip(provider, repo, branch.to_owned(), credential)
             .await
@@ -285,10 +285,11 @@ impl ExactSourcePreparer for GitCliExactSourcePreparer {
         let scratch_root = self.scratch_root.clone();
         let limits = self.limits.clone();
         let blocking_cancel = cancelled.clone();
+        let (provider, repo_id, credential) = access
+            .resolve(&workspace, &repo)
+            .await
+            .map_err(classify_credential_failure)?;
         let mut task = tokio::task::spawn_blocking(move || {
-            let (provider, repo_id, credential) = access
-                .resolve(&workspace, &repo)
-                .map_err(classify_credential_failure)?;
             prepare_exact_blocking(
                 provider,
                 repo_id,
@@ -328,6 +329,8 @@ pub struct SqliteDurableSourceAcquirer<P, U = CasGitSourceStore> {
     lease_secs: i64,
     heartbeat: Duration,
     shutdown: CancellationToken,
+    #[cfg(test)]
+    registration_lost_ack: bool,
 }
 
 impl<P, U: Clone> Clone for SqliteDurableSourceAcquirer<P, U> {
@@ -343,6 +346,8 @@ impl<P, U: Clone> Clone for SqliteDurableSourceAcquirer<P, U> {
             lease_secs: self.lease_secs,
             heartbeat: self.heartbeat,
             shutdown: self.shutdown.clone(),
+            #[cfg(test)]
+            registration_lost_ack: self.registration_lost_ack,
         }
     }
 }
@@ -373,6 +378,8 @@ impl<P, U> SqliteDurableSourceAcquirer<P, U> {
             lease_secs: DEFAULT_SOURCE_LEASE_SECS,
             heartbeat: DEFAULT_HEARTBEAT,
             shutdown,
+            #[cfg(test)]
+            registration_lost_ack: false,
         })
     }
 
@@ -380,6 +387,12 @@ impl<P, U> SqliteDurableSourceAcquirer<P, U> {
     fn with_timing(mut self, lease_secs: i64, heartbeat: Duration) -> Self {
         self.lease_secs = lease_secs;
         self.heartbeat = heartbeat;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_registration_lost_ack(mut self) -> Self {
+        self.registration_lost_ack = true;
         self
     }
 }
@@ -536,11 +549,22 @@ where
                 .await?;
             return Err(error.context("publish protected Git source graph"));
         }
-        match self
+        #[cfg(test)]
+        let registration = if self.registration_lost_ack {
+            self.registry
+                .register_with_lost_ack_for_test(&acquisition, &prepared, &cancelled)
+                .await
+        } else {
+            self.registry
+                .register(&acquisition, &prepared, &cancelled)
+                .await
+        };
+        #[cfg(not(test))]
+        let registration = self
             .registry
             .register(&acquisition, &prepared, &cancelled)
-            .await
-        {
+            .await;
+        match registration {
             Ok(source) => Ok(DurableSourceAcquireOutcome::Ready(source)),
             Err(error) => {
                 let _ = self
@@ -929,20 +953,15 @@ fn io_provider_failure(error: std::io::Error) -> ProviderFailure {
 }
 
 fn classify_credential_failure(error: anyhow::Error) -> ProviderFailure {
-    let detail = error.to_string().to_ascii_lowercase();
-    let kind = if detail.contains("rate limit")
-        || detail.contains("429")
-        || detail.contains("too many requests")
-    {
-        ProviderFailureKind::RateLimited
-    } else if detail.contains("timed out")
-        || detail.contains("connect")
-        || detail.contains("server error")
-        || detail.contains("http 5")
-    {
-        ProviderFailureKind::Unavailable
-    } else {
-        ProviderFailureKind::Authentication
+    let kind = match error.downcast_ref::<CredentialFailure>().map(|e| e.kind()) {
+        Some(CredentialFailureKind::Authentication) => ProviderFailureKind::Authentication,
+        Some(CredentialFailureKind::RateLimited) => ProviderFailureKind::RateLimited,
+        Some(CredentialFailureKind::Unavailable) => ProviderFailureKind::Unavailable,
+        Some(CredentialFailureKind::InvalidResponse) => ProviderFailureKind::InvalidResponse,
+        // Static broker/configuration failures have no transport status and are
+        // permanent. Dynamic brokers must return CredentialFailure so retry
+        // policy never depends on message text.
+        None => ProviderFailureKind::Authentication,
     };
     ProviderFailure::new(
         kind,
@@ -1159,6 +1178,64 @@ mod tests {
         assert_eq!(resolving.await.unwrap().unwrap(), "4".repeat(40));
     }
 
+    struct FailingCredentialBroker(CredentialFailureKind);
+
+    impl CredentialBroker for FailingCredentialBroker {
+        fn fetch_credential(
+            &self,
+            _repo_id: &RepoId,
+            _request_token: Option<&SecretString>,
+        ) -> Result<Option<SecretString>> {
+            Err(anyhow::Error::new(CredentialFailure::new(
+                self.0,
+                "sensitive upstream diagnostic must not escape",
+            )))
+        }
+    }
+
+    #[tokio::test]
+    async fn current_tip_maps_typed_credential_failures_before_provider_git() {
+        for (credential_kind, expected) in [
+            (
+                CredentialFailureKind::Authentication,
+                ProviderFailureKind::Authentication,
+            ),
+            (
+                CredentialFailureKind::RateLimited,
+                ProviderFailureKind::RateLimited,
+            ),
+            (
+                CredentialFailureKind::Unavailable,
+                ProviderFailureKind::Unavailable,
+            ),
+            (
+                CredentialFailureKind::InvalidResponse,
+                ProviderFailureKind::InvalidResponse,
+            ),
+        ] {
+            let (workspaces, _) = two_workspaces();
+            let git = Arc::new(RecordingProviderGit {
+                tips: Arc::new(Mutex::new(VecDeque::new())),
+                calls: Arc::new(Mutex::new(Vec::new())),
+            });
+            let resolver = ProviderCurrentTipResolver::new(
+                WorkspaceProviderAccess::new(
+                    workspaces,
+                    Arc::new(FailingCredentialBroker(credential_kind)),
+                ),
+                git.clone(),
+            );
+            let error = resolver
+                .resolve_current_tip("alpha", "g/r", "main")
+                .await
+                .unwrap_err();
+            let provider = error.downcast_ref::<ProviderFailure>().unwrap();
+            assert_eq!(provider.kind(), expected);
+            assert!(!error.to_string().contains("sensitive upstream"));
+            assert!(git.calls.lock().await.is_empty());
+        }
+    }
+
     struct RegistryFixture {
         registry: SqliteGitSourceRegistry,
         pool: SqlitePool,
@@ -1278,17 +1355,39 @@ mod tests {
         shutdown: CancellationToken,
     ) -> SqliteDurableSourceAcquirer<FakePreparer> {
         let remote_cas = Cas::new(&fixture.remote_cas_root).unwrap();
+        acquirer_with_uploader(
+            fixture,
+            preparer,
+            shutdown,
+            CasGitSourceStore::new(&remote_cas).unwrap(),
+        )
+    }
+
+    fn acquirer_with_uploader<U: GitSourceUploader + Clone>(
+        fixture: &RegistryFixture,
+        preparer: Arc<FakePreparer>,
+        shutdown: CancellationToken,
+        uploader: U,
+    ) -> SqliteDurableSourceAcquirer<FakePreparer, U> {
         SqliteDurableSourceAcquirer::new(
             fixture.registry.clone(),
             preparer,
             fixture.local_cas_root.clone(),
-            CasGitSourceStore::new(&remote_cas).unwrap(),
+            uploader,
             fixture.scratch_root.clone(),
             GitSourceLimits::default(),
             "adapter-test".into(),
             shutdown,
         )
         .unwrap()
+    }
+
+    async fn desire_state(fixture: &RegistryFixture, commit: &str) -> (String, Option<String>) {
+        sqlx::query_as("SELECT state,failure_class FROM git_source_desires WHERE commit_oid=?")
+            .bind(commit)
+            .fetch_one(&fixture.pool)
+            .await
+            .unwrap()
     }
 
     #[tokio::test]
@@ -1329,6 +1428,283 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(roots, 2);
+    }
+
+    #[tokio::test]
+    async fn activation_unknown_does_zero_provider_upload_or_registration_work() {
+        let fixture = registry_fixture().await;
+        let preparer = Arc::new(FakePreparer::new(fixture.local_cas_root.clone()));
+        let commit = "0".repeat(40);
+        let permit = match fixture
+            .registry
+            .begin_acquisition(
+                "alpha",
+                "g/r",
+                &commit,
+                GIT_SOURCE_FORMAT,
+                "prior-owner",
+                "prior-attempt",
+                60,
+                SyncIntent::EnsureCurrent,
+            )
+            .await
+            .unwrap()
+        {
+            SourceBeginOutcome::PermitToPrepare(permit) => permit,
+            _ => panic!("unexpected begin outcome"),
+        };
+        let prepared = preparer
+            .prepare_exact(
+                "alpha".into(),
+                "g/r".into(),
+                commit.clone(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let (acquisition, _) = fixture
+            .registry
+            .bind_prepared_graph(&permit, &prepared)
+            .await
+            .unwrap();
+        assert!(
+            fixture
+                .registry
+                .mark_activation_unknown(&acquisition)
+                .await
+                .unwrap()
+        );
+        preparer.calls.store(0, Ordering::SeqCst);
+
+        let adapter = acquirer(&fixture, preparer.clone(), CancellationToken::new());
+        assert!(matches!(
+            adapter
+                .acquire_exact("alpha", "g/r", &commit, SyncIntent::EnsureCurrent)
+                .await
+                .unwrap(),
+            DurableSourceAcquireOutcome::ActivationUnknown
+        ));
+        assert_eq!(preparer.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM git_source_roots")
+                .fetch_one(&fixture.pool)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn bind_failure_is_settled_retryable_without_upload_or_registration() {
+        let fixture = registry_fixture().await;
+        sqlx::query(
+            "CREATE TRIGGER inject_bind_failure BEFORE INSERT ON git_source_acquisition_members BEGIN SELECT RAISE(ABORT,'injected bind failure'); END",
+        )
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+        let preparer = Arc::new(FakePreparer::new(fixture.local_cas_root.clone()));
+        let adapter = acquirer(&fixture, preparer.clone(), CancellationToken::new());
+        let commit = "1".repeat(40);
+        assert!(
+            adapter
+                .acquire_exact("alpha", "g/r", &commit, SyncIntent::EnsureCurrent)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            desire_state(&fixture, &commit).await,
+            ("failed".into(), Some("retryable".into()))
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM git_source_roots")
+                .fetch_one(&fixture.pool)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[derive(Clone)]
+    struct FailingUploader;
+
+    impl GitSourceUploader for FailingUploader {
+        fn put_file(
+            &self,
+            _blob: &CasBlob,
+            _source: &Path,
+            _cancelled: &CancellationToken,
+        ) -> Result<()> {
+            bail!("injected upload failure")
+        }
+
+        fn put_bytes(
+            &self,
+            _blob: &CasBlob,
+            _bytes: &[u8],
+            _cancelled: &CancellationToken,
+        ) -> Result<()> {
+            bail!("injected upload failure")
+        }
+    }
+
+    #[tokio::test]
+    async fn uploader_failure_is_settled_retryable_without_registration() {
+        let fixture = registry_fixture().await;
+        let preparer = Arc::new(FakePreparer::new(fixture.local_cas_root.clone()));
+        let adapter = acquirer_with_uploader(
+            &fixture,
+            preparer,
+            CancellationToken::new(),
+            FailingUploader,
+        );
+        let commit = "2".repeat(40);
+        assert!(
+            adapter
+                .acquire_exact("alpha", "g/r", &commit, SyncIntent::EnsureCurrent)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            desire_state(&fixture, &commit).await,
+            ("failed".into(), Some("retryable".into()))
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM git_source_roots")
+                .fetch_one(&fixture.pool)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[derive(Clone, Default)]
+    struct CancellationAwareUploader {
+        started: Arc<AtomicBool>,
+        observed_cancel: Arc<AtomicBool>,
+    }
+
+    impl GitSourceUploader for CancellationAwareUploader {
+        fn put_file(
+            &self,
+            _blob: &CasBlob,
+            _source: &Path,
+            cancelled: &CancellationToken,
+        ) -> Result<()> {
+            self.started.store(true, Ordering::SeqCst);
+            while !cancelled.is_cancelled() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            self.observed_cancel.store(true, Ordering::SeqCst);
+            bail!("upload cancelled")
+        }
+
+        fn put_bytes(
+            &self,
+            _blob: &CasBlob,
+            _bytes: &[u8],
+            _cancelled: &CancellationToken,
+        ) -> Result<()> {
+            bail!("unexpected root upload after cancellation")
+        }
+    }
+
+    #[tokio::test]
+    async fn caller_drop_during_upload_cancels_drains_and_settles_retryable() {
+        let fixture = registry_fixture().await;
+        let preparer = Arc::new(FakePreparer::new(fixture.local_cas_root.clone()));
+        let uploader = CancellationAwareUploader::default();
+        let adapter = acquirer_with_uploader(
+            &fixture,
+            preparer,
+            CancellationToken::new(),
+            uploader.clone(),
+        );
+        let commit = "6".repeat(40);
+        let request = tokio::spawn({
+            let commit = commit.clone();
+            async move {
+                adapter
+                    .acquire_exact("alpha", "g/r", &commit, SyncIntent::EnsureCurrent)
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !uploader.started.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        request.abort();
+        let _ = request.await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !uploader.observed_cancel.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+            loop {
+                if desire_state(&fixture, &commit).await
+                    == ("failed".into(), Some("retryable".into()))
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM git_source_roots")
+                .fetch_one(&fixture.pool)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn registration_failure_is_settled_retryable_after_successful_upload() {
+        let fixture = registry_fixture().await;
+        sqlx::query(
+            "CREATE TRIGGER inject_registration_failure BEFORE INSERT ON git_source_roots BEGIN SELECT RAISE(ABORT,'injected registration failure'); END",
+        )
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+        let preparer = Arc::new(FakePreparer::new(fixture.local_cas_root.clone()));
+        let adapter = acquirer(&fixture, preparer, CancellationToken::new());
+        let commit = "3".repeat(40);
+        assert!(
+            adapter
+                .acquire_exact("alpha", "g/r", &commit, SyncIntent::EnsureCurrent)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            desire_state(&fixture, &commit).await,
+            ("failed".into(), Some("retryable".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn lost_registration_ack_reconciles_to_ready_through_run_exact() {
+        let fixture = registry_fixture().await;
+        let preparer = Arc::new(FakePreparer::new(fixture.local_cas_root.clone()));
+        let adapter = acquirer(&fixture, preparer.clone(), CancellationToken::new())
+            .with_registration_lost_ack();
+        let commit = "4".repeat(40);
+        assert!(matches!(
+            adapter
+                .acquire_exact("alpha", "g/r", &commit, SyncIntent::EnsureCurrent)
+                .await
+                .unwrap(),
+            DurableSourceAcquireOutcome::Ready(_)
+        ));
+        assert_eq!(preparer.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            desire_state(&fixture, &commit).await,
+            ("registered".into(), None)
+        );
     }
 
     #[tokio::test]
@@ -1687,6 +2063,41 @@ mod tests {
             let error = classify_git_failure("test", text.as_bytes());
             assert_eq!(error.kind(), kind);
             assert_eq!(kind.failure_class(), class);
+        }
+    }
+
+    #[test]
+    fn credential_failure_classification_uses_typed_broker_status() {
+        for (credential_kind, provider_kind, class) in [
+            (
+                CredentialFailureKind::Authentication,
+                ProviderFailureKind::Authentication,
+                FailureClass::Permanent,
+            ),
+            (
+                CredentialFailureKind::RateLimited,
+                ProviderFailureKind::RateLimited,
+                FailureClass::Retryable,
+            ),
+            (
+                CredentialFailureKind::Unavailable,
+                ProviderFailureKind::Unavailable,
+                FailureClass::Retryable,
+            ),
+            (
+                CredentialFailureKind::InvalidResponse,
+                ProviderFailureKind::InvalidResponse,
+                FailureClass::Permanent,
+            ),
+        ] {
+            // Deliberately use a misleading message. Classification must be
+            // driven only by the typed broker failure, never its text.
+            let provider = classify_credential_failure(anyhow::Error::new(CredentialFailure::new(
+                credential_kind,
+                "HTTP 401 timed out 503",
+            )));
+            assert_eq!(provider.kind(), provider_kind);
+            assert_eq!(provider.kind().failure_class(), class);
         }
     }
 

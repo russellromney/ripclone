@@ -814,6 +814,22 @@ impl SqliteGitSourceRegistry {
         .await
     }
 
+    #[cfg(test)]
+    pub(crate) async fn register_with_lost_ack_for_test(
+        &self,
+        acquisition: &GitSourceAcquisition,
+        prepared: &PreparedGitSource,
+        cancelled: &CancellationToken,
+    ) -> Result<DurableSourceSnapshot> {
+        self.register_or_recover_inner(
+            acquisition,
+            prepared,
+            cancelled,
+            RegistrationCommitFault::AckLostAfterCommit,
+        )
+        .await
+    }
+
     async fn register_or_recover_inner(
         &self,
         acquisition: &GitSourceAcquisition,

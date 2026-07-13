@@ -11,7 +11,9 @@
 
 use crate::provider::{ProviderRegistry, RepoId};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -20,11 +22,49 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialFailureKind {
+    Authentication,
+    RateLimited,
+    Unavailable,
+    InvalidResponse,
+}
+
+#[derive(Debug, Clone)]
+pub struct CredentialFailure {
+    kind: CredentialFailureKind,
+    message: String,
+}
+
+impl CredentialFailure {
+    pub fn new(kind: CredentialFailureKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+
+    pub fn kind(&self) -> CredentialFailureKind {
+        self.kind
+    }
+}
+
+impl std::fmt::Display for CredentialFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for CredentialFailure {}
+
+type TokenExchange =
+    dyn Fn(&str, &str) -> std::result::Result<String, CredentialFailure> + Send + Sync;
+
 /// Abstraction over how ripclone obtains an upstream git credential.
 ///
 /// Implementations must be `Send + Sync` because they live in `ServerState` and
 /// are used from async handlers and the background build worker.
-pub trait CredentialBroker: Send + Sync {
+pub trait CredentialBroker: Send + Sync + 'static {
     /// Return a token to use when syncing `repo_id`, or `None` if the repo
     /// should be mirrored anonymously.
     ///
@@ -36,6 +76,23 @@ pub trait CredentialBroker: Send + Sync {
         repo_id: &RepoId,
         request_token: Option<&SecretString>,
     ) -> Result<Option<SecretString>>;
+
+    /// Async-safe acquisition seam. The default keeps an arbitrary synchronous
+    /// broker off the executor. Brokers with network-backed refresh should
+    /// override this to coalesce before entering the blocking pool.
+    fn fetch_credential_async(
+        self: Arc<Self>,
+        repo_id: RepoId,
+        request_token: Option<SecretString>,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<SecretString>>> + Send>> {
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                self.fetch_credential(&repo_id, request_token.as_ref())
+            })
+            .await
+            .context("credential broker task did not join")?
+        })
+    }
 }
 
 /// Tier-B passthrough broker: request token → configured instance token → none.
@@ -199,6 +256,25 @@ pub struct GitHubAppBroker {
     encoding_key: EncodingKey,
     api_base: String,
     cache: Mutex<HashMap<u64, CachedToken>>,
+    mint_state: Mutex<MintState>,
+    mint_done: Condvar,
+    async_mint_state: tokio::sync::Mutex<AsyncMintState>,
+    async_mint_done: tokio::sync::Notify,
+    token_exchange: Arc<TokenExchange>,
+}
+
+#[derive(Default)]
+struct MintState {
+    active: bool,
+    generation: u64,
+    last_failure: Option<(u64, CredentialFailure)>,
+}
+
+#[derive(Default)]
+struct AsyncMintState {
+    active: bool,
+    generation: u64,
+    last_failure: Option<(u64, CredentialFailure)>,
 }
 
 impl GitHubAppBroker {
@@ -213,42 +289,111 @@ impl GitHubAppBroker {
             encoding_key,
             api_base: config.api_base,
             cache: Mutex::new(HashMap::new()),
+            mint_state: Mutex::new(MintState::default()),
+            mint_done: Condvar::new(),
+            async_mint_state: tokio::sync::Mutex::new(AsyncMintState::default()),
+            async_mint_done: tokio::sync::Notify::new(),
+            token_exchange: Arc::new(post_installation_token),
         })
+    }
+
+    #[cfg(test)]
+    fn with_token_exchange(
+        config: GitHubAppConfig,
+        token_exchange: Arc<TokenExchange>,
+    ) -> Result<Self> {
+        let mut broker = Self::new(config)?;
+        broker.token_exchange = token_exchange;
+        Ok(broker)
     }
 
     /// Return a cached installation token if still fresh, otherwise mint a new
     /// one and cache it.
     fn installation_token(&self) -> Result<SecretString> {
-        let now = SystemTime::now();
-        if let Some(cached) = self
-            .cache
-            .lock()
-            .expect("broker cache mutex poisoned")
-            .get(&self.installation_id)
-            && cached.is_fresh(now)
-        {
-            return Ok(cached.token.clone());
-        }
+        loop {
+            if let Some(token) = self.cached_token() {
+                return Ok(token);
+            }
 
-        let fresh = self.mint_installation_token()?;
-        let token = fresh.token.clone();
+            let mut state = self.mint_state.lock().expect("broker mint mutex poisoned");
+            // Close the race between the optimistic cache check and acquiring
+            // the singleflight gate.
+            if let Some(token) = self.cached_token() {
+                return Ok(token);
+            }
+            if state.active {
+                let observed_generation = state.generation;
+                while state.active {
+                    state = self
+                        .mint_done
+                        .wait(state)
+                        .expect("broker mint mutex poisoned while waiting");
+                }
+                if let Some(token) = self.cached_token() {
+                    return Ok(token);
+                }
+                if let Some((generation, error)) = &state.last_failure
+                    && *generation > observed_generation
+                {
+                    return Err(anyhow::Error::new(error.clone()));
+                }
+                continue;
+            }
+
+            state.active = true;
+            drop(state);
+            let minted = self.mint_installation_token();
+            let mut state = self
+                .mint_state
+                .lock()
+                .expect("broker mint mutex poisoned after exchange");
+            state.generation = state.generation.wrapping_add(1);
+            match &minted {
+                Ok(fresh) => {
+                    self.cache
+                        .lock()
+                        .expect("broker cache mutex poisoned")
+                        .insert(self.installation_id, fresh.clone());
+                    state.last_failure = None;
+                }
+                Err(error) => {
+                    state.last_failure = Some((state.generation, error.clone()));
+                }
+            }
+            state.active = false;
+            self.mint_done.notify_all();
+            return minted.map(|fresh| fresh.token).map_err(anyhow::Error::new);
+        }
+    }
+
+    fn cached_token(&self) -> Option<SecretString> {
         self.cache
             .lock()
             .expect("broker cache mutex poisoned")
-            .insert(self.installation_id, fresh);
-        Ok(token)
+            .get(&self.installation_id)
+            .filter(|cached| cached.is_fresh(SystemTime::now()))
+            .map(|cached| cached.token.clone())
     }
 
     /// Sign an app JWT and exchange it for an installation access token.
-    fn mint_installation_token(&self) -> Result<CachedToken> {
-        let jwt = self.build_app_jwt()?;
+    fn mint_installation_token(&self) -> std::result::Result<CachedToken, CredentialFailure> {
+        let jwt = self.build_app_jwt().map_err(|_| {
+            CredentialFailure::new(
+                CredentialFailureKind::Authentication,
+                "sign GitHub App authentication token",
+            )
+        })?;
         let url = format!(
             "{}/app/installations/{}/access_tokens",
             self.api_base, self.installation_id
         );
-        let body = post_installation_token(&url, &jwt)?;
-        let parsed: InstallationTokenResponse =
-            serde_json::from_str(&body).context("parse installation token response")?;
+        let body = (self.token_exchange)(&url, &jwt)?;
+        let parsed: InstallationTokenResponse = serde_json::from_str(&body).map_err(|_| {
+            CredentialFailure::new(
+                CredentialFailureKind::InvalidResponse,
+                "parse GitHub App installation token response",
+            )
+        })?;
         let expires_at = parse_rfc3339(&parsed.expires_at)
             // GitHub installation tokens last one hour; fall back to that if the
             // timestamp is ever unparseable so we still refresh on schedule.
@@ -294,19 +439,89 @@ impl CredentialBroker for GitHubAppBroker {
         let _ = repo_id;
         self.installation_token().map(Some)
     }
+
+    fn fetch_credential_async(
+        self: Arc<Self>,
+        repo_id: RepoId,
+        request_token: Option<SecretString>,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<SecretString>>> + Send>> {
+        Box::pin(async move {
+            if let Some(token) = request_token {
+                return Ok(Some(token));
+            }
+            let _ = repo_id;
+            let entry_generation = self.async_mint_state.lock().await.generation;
+            loop {
+                if let Some(token) = self.cached_token() {
+                    return Ok(Some(token));
+                }
+                let mut state = self.async_mint_state.lock().await;
+                if let Some(token) = self.cached_token() {
+                    return Ok(Some(token));
+                }
+                if let Some((generation, failure)) = &state.last_failure
+                    && *generation > entry_generation
+                {
+                    return Err(anyhow::Error::new(failure.clone()));
+                }
+                if state.active {
+                    // Register interest before dropping the state lock so the
+                    // elected minter cannot notify between those operations.
+                    let notified = self.async_mint_done.notified();
+                    drop(state);
+                    notified.await;
+                    continue;
+                }
+                state.active = true;
+                drop(state);
+
+                // Supervise independently from the request that elected this
+                // generation. Dropping that request cannot strand active=true
+                // or abandon its waiters.
+                let broker = self.clone();
+                tokio::spawn(async move {
+                    // Waiters park as async tasks. Only this supervisor consumes
+                    // a blocking-pool thread for signing/HTTP.
+                    let minting = broker.clone();
+                    let joined =
+                        tokio::task::spawn_blocking(move || minting.installation_token()).await;
+                    let failure = match joined {
+                        Ok(Ok(_)) => None,
+                        Ok(Err(error)) => {
+                            Some(error.downcast::<CredentialFailure>().unwrap_or_else(|_| {
+                                CredentialFailure::new(
+                                    CredentialFailureKind::InvalidResponse,
+                                    "GitHub App credential mint failed without a typed cause",
+                                )
+                            }))
+                        }
+                        Err(_) => Some(CredentialFailure::new(
+                            CredentialFailureKind::Unavailable,
+                            "GitHub App credential mint task did not join",
+                        )),
+                    };
+                    let mut state = broker.async_mint_state.lock().await;
+                    state.generation = state.generation.wrapping_add(1);
+                    state.last_failure = failure.map(|failure| (state.generation, failure));
+                    state.active = false;
+                    broker.async_mint_done.notify_waiters();
+                });
+            }
+        })
+    }
 }
 
 /// POST the app JWT to GitHub's installation-token endpoint and return the
 /// response body. Runs the blocking HTTP request on a scoped thread so it is
 /// safe to call from inside an async (tokio) context without nesting runtimes.
-fn post_installation_token(url: &str, jwt: &str) -> Result<String> {
+fn post_installation_token(url: &str, jwt: &str) -> std::result::Result<String, CredentialFailure> {
     std::thread::scope(|scope| {
         scope
-            .spawn(|| -> Result<String> {
+            .spawn(|| -> std::result::Result<String, CredentialFailure> {
                 let client = reqwest::blocking::Client::builder()
                     .timeout(Duration::from_secs(15))
                     .build()
-                    .context("build GitHub App http client")?;
+                    .map_err(|_| credential_unavailable("build GitHub App HTTP client"))?;
                 let resp = client
                     .post(url)
                     .header(reqwest::header::USER_AGENT, "ripclone")
@@ -314,23 +529,38 @@ fn post_installation_token(url: &str, jwt: &str) -> Result<String> {
                     .header("X-GitHub-Api-Version", "2022-11-28")
                     .bearer_auth(jwt)
                     .send()
-                    .context("request GitHub App installation token")?;
+                    .map_err(|_| credential_unavailable("request GitHub App installation token"))?;
                 let status = resp.status();
-                let text = resp
-                    .text()
-                    .context("read GitHub App installation token response")?;
                 if !status.is_success() {
-                    // Truncate the upstream body: it carries GitHub's error
-                    // message, which is plenty for debugging without dumping an
-                    // unbounded response into the logs.
-                    let snippet: String = text.chars().take(300).collect();
-                    anyhow::bail!("GitHub App token endpoint returned {status}: {snippet}");
+                    // Classify from status before attempting to read the body.
+                    // An interrupted error body must not turn a permanent 401
+                    // into a retryable transport failure, and upstream bodies
+                    // are not retained in broker errors.
+                    return Err(credential_http_failure(status));
                 }
+                let text = resp.text().map_err(|_| {
+                    credential_unavailable("read GitHub App installation token response")
+                })?;
                 Ok(text)
             })
             .join()
-            .map_err(|_| anyhow::anyhow!("GitHub App token request thread panicked"))?
+            .map_err(|_| credential_unavailable("GitHub App token request thread panicked"))?
     })
+}
+
+fn credential_unavailable(message: impl Into<String>) -> CredentialFailure {
+    CredentialFailure::new(CredentialFailureKind::Unavailable, message)
+}
+
+fn credential_http_failure(status: reqwest::StatusCode) -> CredentialFailure {
+    let kind = if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        CredentialFailureKind::RateLimited
+    } else if status.is_server_error() {
+        CredentialFailureKind::Unavailable
+    } else {
+        CredentialFailureKind::Authentication
+    };
+    CredentialFailure::new(kind, format!("GitHub App token endpoint returned {status}"))
 }
 
 /// Parse an RFC 3339 timestamp into a `SystemTime`, or `None` if malformed.
@@ -348,14 +578,14 @@ fn parse_rfc3339(s: &str) -> Option<SystemTime> {
 /// registration change, not a change to the dispatch logic.
 pub struct ProviderAwareBroker {
     dynamic: HashMap<String, Arc<dyn CredentialBroker>>,
-    static_broker: StaticBroker,
+    static_broker: Arc<StaticBroker>,
 }
 
 impl ProviderAwareBroker {
     pub fn new(registry: ProviderRegistry) -> Self {
         Self {
             dynamic: HashMap::new(),
-            static_broker: StaticBroker::new(registry),
+            static_broker: Arc::new(StaticBroker::new(registry)),
         }
     }
 
@@ -373,7 +603,7 @@ impl ProviderAwareBroker {
         self.dynamic
             .get(repo_id.workspace.as_str())
             .map(|b| b.as_ref())
-            .unwrap_or(&self.static_broker)
+            .unwrap_or(self.static_broker.as_ref())
     }
 }
 
@@ -385,6 +615,19 @@ impl CredentialBroker for ProviderAwareBroker {
     ) -> Result<Option<SecretString>> {
         self.broker_for(repo_id)
             .fetch_credential(repo_id, request_token)
+    }
+
+    fn fetch_credential_async(
+        self: Arc<Self>,
+        repo_id: RepoId,
+        request_token: Option<SecretString>,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<SecretString>>> + Send>> {
+        let broker = self
+            .dynamic
+            .get(repo_id.workspace.as_str())
+            .cloned()
+            .unwrap_or_else(|| self.static_broker.clone());
+        broker.fetch_credential_async(repo_id, request_token)
     }
 }
 
@@ -565,6 +808,472 @@ RwIDAQAB
             .fetch_credential(&RepoId::github("o/r"), None)
             .unwrap_err();
         assert!(format!("{err:#}").contains("GitHub App installation token"));
+    }
+
+    fn test_config() -> GitHubAppConfig {
+        GitHubAppConfig {
+            app_id: "12345".to_string(),
+            installation_id: 67890,
+            private_key_pem: SecretString::from(TEST_PRIVATE_KEY),
+            api_base: DEFAULT_GITHUB_API_BASE.to_string(),
+        }
+    }
+
+    fn token_response(token: &str) -> String {
+        format!(r#"{{"token":"{token}","expires_at":"2099-01-01T00:00:00Z"}}"#)
+    }
+
+    #[test]
+    fn concurrent_cold_miss_is_singleflight_and_all_callers_share_token() {
+        use std::sync::Barrier;
+
+        let exchanges = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let broker = Arc::new(
+            GitHubAppBroker::with_token_exchange(test_config(), {
+                let exchanges = exchanges.clone();
+                let entered = entered.clone();
+                let release = release.clone();
+                Arc::new(move |_, _| {
+                    if exchanges.fetch_add(1, Ordering::SeqCst) == 0 {
+                        entered.wait();
+                        release.wait();
+                    }
+                    Ok(token_response("ghs_singleflight"))
+                })
+            })
+            .unwrap(),
+        );
+
+        let callers = (0..12)
+            .map(|_| {
+                let broker = broker.clone();
+                std::thread::spawn(move || {
+                    broker
+                        .fetch_credential(&RepoId::github("o/r"), None)
+                        .unwrap()
+                        .unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        entered.wait();
+        // The first exchange is held open while every other caller reaches the
+        // broker. None may start another exchange.
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(exchanges.load(Ordering::SeqCst), 1);
+        release.wait();
+        for caller in callers {
+            assert_eq!(caller.join().unwrap().expose_secret(), "ghs_singleflight");
+        }
+        assert_eq!(exchanges.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn concurrent_cold_miss_shares_transient_failure_without_retry_stampede() {
+        use std::sync::Barrier;
+
+        let exchanges = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let broker = Arc::new(
+            GitHubAppBroker::with_token_exchange(test_config(), {
+                let exchanges = exchanges.clone();
+                let entered = entered.clone();
+                let release = release.clone();
+                Arc::new(move |_, _| {
+                    if exchanges.fetch_add(1, Ordering::SeqCst) == 0 {
+                        entered.wait();
+                        release.wait();
+                    }
+                    Err(credential_unavailable("injected 503"))
+                })
+            })
+            .unwrap(),
+        );
+        let callers = (0..12)
+            .map(|_| {
+                let broker = broker.clone();
+                std::thread::spawn(move || {
+                    broker
+                        .fetch_credential(&RepoId::github("o/r"), None)
+                        .unwrap_err()
+                })
+            })
+            .collect::<Vec<_>>();
+        entered.wait();
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(exchanges.load(Ordering::SeqCst), 1);
+        release.wait();
+        for caller in callers {
+            let error = caller.join().unwrap();
+            assert_eq!(
+                error.downcast_ref::<CredentialFailure>().unwrap().kind(),
+                CredentialFailureKind::Unavailable
+            );
+        }
+        assert_eq!(exchanges.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn async_singleflight_uses_one_blocking_slot_while_waiters_park() {
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let exchanges = Arc::new(AtomicUsize::new(0));
+        let broker = Arc::new(
+            GitHubAppBroker::with_token_exchange(test_config(), {
+                let started = started.clone();
+                let release = release.clone();
+                let exchanges = exchanges.clone();
+                Arc::new(move |_, _| {
+                    exchanges.fetch_add(1, Ordering::SeqCst);
+                    started.store(true, Ordering::SeqCst);
+                    while !release.load(Ordering::SeqCst) {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Ok(token_response("ghs_async_singleflight"))
+                })
+            })
+            .unwrap(),
+        );
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(2)
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let callers = (0..32)
+                    .map(|_| {
+                        let broker = broker.clone();
+                        tokio::spawn(async move {
+                            broker
+                                .fetch_credential_async(RepoId::github("o/r"), None)
+                                .await
+                                .unwrap()
+                                .unwrap()
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while !started.load(Ordering::SeqCst) {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+
+                // With the old design, the second blocking slot was occupied
+                // by a Condvar waiter and this sentinel could not run until the
+                // token exchange was released.
+                tokio::time::timeout(
+                    Duration::from_millis(500),
+                    tokio::task::spawn_blocking(|| 7),
+                )
+                .await
+                .expect("credential waiters exhausted the blocking pool")
+                .unwrap();
+                assert_eq!(exchanges.load(Ordering::SeqCst), 1);
+                release.store(true, Ordering::SeqCst);
+                for caller in callers {
+                    assert_eq!(
+                        caller.await.unwrap().expose_secret(),
+                        "ghs_async_singleflight"
+                    );
+                }
+            });
+        assert_eq!(exchanges.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn async_singleflight_shares_failure_then_allows_later_retry() {
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let exchanges = Arc::new(AtomicUsize::new(0));
+        let broker = Arc::new(
+            GitHubAppBroker::with_token_exchange(test_config(), {
+                let started = started.clone();
+                let release = release.clone();
+                let exchanges = exchanges.clone();
+                Arc::new(move |_, _| {
+                    let call = exchanges.fetch_add(1, Ordering::SeqCst);
+                    if call == 0 {
+                        started.store(true, Ordering::SeqCst);
+                        while !release.load(Ordering::SeqCst) {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(credential_unavailable("injected 503"))
+                    } else {
+                        Ok(token_response("ghs_after_failure"))
+                    }
+                })
+            })
+            .unwrap(),
+        );
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(2)
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let start = Arc::new(tokio::sync::Barrier::new(33));
+                let callers = (0..32)
+                    .map(|_| {
+                        let broker = broker.clone();
+                        let start = start.clone();
+                        tokio::spawn(async move {
+                            start.wait().await;
+                            broker
+                                .fetch_credential_async(RepoId::github("o/r"), None)
+                                .await
+                                .unwrap_err()
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                start.wait().await;
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while !started.load(Ordering::SeqCst) {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                // Give every barrier-released caller a chance to join the
+                // active generation before completing it.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                assert_eq!(exchanges.load(Ordering::SeqCst), 1);
+                release.store(true, Ordering::SeqCst);
+                for caller in callers {
+                    let error = caller.await.unwrap();
+                    assert_eq!(
+                        error.downcast_ref::<CredentialFailure>().unwrap().kind(),
+                        CredentialFailureKind::Unavailable
+                    );
+                }
+                assert_eq!(exchanges.load(Ordering::SeqCst), 1);
+
+                let recovered = broker
+                    .clone()
+                    .fetch_credential_async(RepoId::github("o/r"), None)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(recovered.expose_secret(), "ghs_after_failure");
+                assert_eq!(exchanges.load(Ordering::SeqCst), 2);
+            });
+    }
+
+    #[test]
+    fn dropping_elected_async_caller_does_not_strand_successful_mint() {
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let exchanges = Arc::new(AtomicUsize::new(0));
+        let broker = Arc::new(
+            GitHubAppBroker::with_token_exchange(test_config(), {
+                let started = started.clone();
+                let release = release.clone();
+                let exchanges = exchanges.clone();
+                Arc::new(move |_, _| {
+                    exchanges.fetch_add(1, Ordering::SeqCst);
+                    started.store(true, Ordering::SeqCst);
+                    while !release.load(Ordering::SeqCst) {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Ok(token_response("ghs_survived_drop"))
+                })
+            })
+            .unwrap(),
+        );
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(2)
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let elected = tokio::spawn({
+                    let broker = broker.clone();
+                    async move {
+                        broker
+                            .fetch_credential_async(RepoId::github("o/r"), None)
+                            .await
+                    }
+                });
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while !started.load(Ordering::SeqCst) {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                let waiter = tokio::spawn({
+                    let broker = broker.clone();
+                    async move {
+                        broker
+                            .fetch_credential_async(RepoId::github("o/r"), None)
+                            .await
+                    }
+                });
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                elected.abort();
+                let _ = elected.await;
+                release.store(true, Ordering::SeqCst);
+                let token = tokio::time::timeout(Duration::from_secs(2), waiter)
+                    .await
+                    .expect("waiter stranded after elected caller drop")
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(token.expose_secret(), "ghs_survived_drop");
+                assert_eq!(exchanges.load(Ordering::SeqCst), 1);
+            });
+    }
+
+    #[test]
+    fn dropping_elected_async_caller_settles_failure_and_later_retry_succeeds() {
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let exchanges = Arc::new(AtomicUsize::new(0));
+        let broker = Arc::new(
+            GitHubAppBroker::with_token_exchange(test_config(), {
+                let started = started.clone();
+                let release = release.clone();
+                let exchanges = exchanges.clone();
+                Arc::new(move |_, _| {
+                    let call = exchanges.fetch_add(1, Ordering::SeqCst);
+                    if call == 0 {
+                        started.store(true, Ordering::SeqCst);
+                        while !release.load(Ordering::SeqCst) {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(credential_unavailable("injected failure after drop"))
+                    } else {
+                        Ok(token_response("ghs_retry_after_drop"))
+                    }
+                })
+            })
+            .unwrap(),
+        );
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(2)
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let elected = tokio::spawn({
+                    let broker = broker.clone();
+                    async move {
+                        broker
+                            .fetch_credential_async(RepoId::github("o/r"), None)
+                            .await
+                    }
+                });
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while !started.load(Ordering::SeqCst) {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                let waiter = tokio::spawn({
+                    let broker = broker.clone();
+                    async move {
+                        broker
+                            .fetch_credential_async(RepoId::github("o/r"), None)
+                            .await
+                    }
+                });
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                elected.abort();
+                let _ = elected.await;
+                release.store(true, Ordering::SeqCst);
+                let error = tokio::time::timeout(Duration::from_secs(2), waiter)
+                    .await
+                    .expect("failure waiter stranded after elected caller drop")
+                    .unwrap()
+                    .unwrap_err();
+                assert_eq!(
+                    error.downcast_ref::<CredentialFailure>().unwrap().kind(),
+                    CredentialFailureKind::Unavailable
+                );
+                assert_eq!(exchanges.load(Ordering::SeqCst), 1);
+                let token = broker
+                    .clone()
+                    .fetch_credential_async(RepoId::github("o/r"), None)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(token.expose_secret(), "ghs_retry_after_drop");
+                assert_eq!(exchanges.load(Ordering::SeqCst), 2);
+            });
+    }
+
+    #[test]
+    fn transient_singleflight_failure_does_not_poison_the_next_mint() {
+        let exchanges = Arc::new(AtomicUsize::new(0));
+        let broker = GitHubAppBroker::with_token_exchange(test_config(), {
+            let exchanges = exchanges.clone();
+            Arc::new(move |_, _| {
+                if exchanges.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err(credential_unavailable("injected 504"))
+                } else {
+                    Ok(token_response("ghs_recovered"))
+                }
+            })
+        })
+        .unwrap();
+        let first = broker
+            .fetch_credential(&RepoId::github("o/r"), None)
+            .unwrap_err();
+        assert_eq!(
+            first.downcast_ref::<CredentialFailure>().unwrap().kind(),
+            CredentialFailureKind::Unavailable
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                broker
+                    .fetch_credential(&RepoId::github("o/r"), None)
+                    .unwrap()
+                    .unwrap()
+                    .expose_secret(),
+                "ghs_recovered"
+            );
+        }
+        assert_eq!(exchanges.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn github_token_http_statuses_are_typed_without_message_matching() {
+        for (status, expected) in [
+            (
+                reqwest::StatusCode::UNAUTHORIZED,
+                CredentialFailureKind::Authentication,
+            ),
+            (
+                reqwest::StatusCode::FORBIDDEN,
+                CredentialFailureKind::Authentication,
+            ),
+            (
+                reqwest::StatusCode::TOO_MANY_REQUESTS,
+                CredentialFailureKind::RateLimited,
+            ),
+            (
+                reqwest::StatusCode::BAD_GATEWAY,
+                CredentialFailureKind::Unavailable,
+            ),
+            (
+                reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                CredentialFailureKind::Unavailable,
+            ),
+            (
+                reqwest::StatusCode::GATEWAY_TIMEOUT,
+                CredentialFailureKind::Unavailable,
+            ),
+        ] {
+            assert_eq!(credential_http_failure(status).kind(), expected);
+        }
     }
 
     #[test]
