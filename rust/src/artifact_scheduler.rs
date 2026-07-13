@@ -1219,7 +1219,7 @@ impl ArtifactScheduler {
             bail!("scheduler limits fingerprint differs from existing fleet")
         }
         let sealed_limits:String=sqlx::query_scalar("SELECT limits_fingerprint FROM scheduler_state WHERE id=1").fetch_one(&mut *config).await?;
-        if sealed_limits!=limits_fingerprint||sealed_limits.len()!=64||sealed_limits.as_bytes().iter().any(|byte|!byte.is_ascii_digit()&&!(*byte>=b'a'&&*byte<=b'f')){bail!("scheduler limits fingerprint sealing failed")}
+        if sealed_limits!=limits_fingerprint||sealed_limits.len()!=64||sealed_limits.as_bytes().iter().any(|byte|!(byte.is_ascii_digit()||(*byte>=b'a'&&*byte<=b'f'))){bail!("scheduler limits fingerprint sealing failed")}
         Ok(())}.await;
         finish(config, config_result).await?;
         let completion_sealer = Arc::new(CompletionSealAuthority::new(verifier_id)?);

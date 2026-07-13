@@ -11,8 +11,8 @@ use crate::artifact_scheduler::{
     ClaimedArtifact, CompletionSealAuthority, CompletionVerifier, FailureClass, ObservationOutcome,
     ObservationSnapshot, QuarantineOutcome, ReadyPublicationFence, RetryOutcome, ScheduleOutcome,
     SchedulerLimits, UnknownActivationFencePage, VerifiedCompletionEvidence, scheduler_fingerprint,
-    validate_format_version, validate_lease, validate_limits, validate_observation_identity,
-    validate_resolved_commit,
+    scheduler_limits_fingerprint, validate_format_version, validate_lease, validate_limits,
+    validate_observation_identity, validate_resolved_commit,
 };
 use crate::artifact_scheduler_backend::{
     ArtifactSchedulerPersistence, GcDeleteFence, SchedulerGcRoot, TRANSPORT_ROOT_PAGE_MAX,
@@ -23,8 +23,9 @@ use async_trait::async_trait;
 use libsql::{Connection, Database, Row, Transaction, TransactionBehavior, Value};
 use std::sync::Arc;
 
-const VERSION: i64 = 6;
-const PROVENANCE: &str = "ripclone-artifact-scheduler-libsql-v6";
+const VERSION: i64 = 7;
+const PROVENANCE: &str = "ripclone-artifact-scheduler-libsql-v7";
+const V6_PROVENANCE: &str = "ripclone-artifact-scheduler-libsql-v6";
 const V1_PROVENANCE: &str = "ripclone-artifact-scheduler-libsql-v1";
 const V2_PROVENANCE: &str = "ripclone-artifact-scheduler-libsql-v2";
 const V5_PROVENANCE: &str = "ripclone-artifact-scheduler-libsql-v5";
@@ -47,12 +48,13 @@ const SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS artifact_base_retention(artifact_id INTEGER PRIMARY KEY,workspace TEXT NOT NULL,repo TEXT NOT NULL,format_version INTEGER NOT NULL,head_rank INTEGER,pair_rank INTEGER,FOREIGN KEY(artifact_id) REFERENCES artifact_jobs(id) ON DELETE CASCADE,CHECK((head_rank IS NULL OR head_rank BETWEEN 1 AND 8) AND (pair_rank IS NULL OR pair_rank BETWEEN 1 AND 8) AND (head_rank IS NOT NULL OR pair_rank IS NOT NULL)))",
     "CREATE INDEX IF NOT EXISTS artifact_base_retention_scope ON artifact_base_retention(workspace,repo,format_version)",
     "CREATE TABLE IF NOT EXISTS artifact_gc_sweep(id INTEGER PRIMARY KEY CHECK(id=1),owner TEXT NOT NULL,expires_at INTEGER NOT NULL)",
-    "CREATE TABLE IF NOT EXISTS scheduler_state(id INTEGER PRIMARY KEY CHECK(id=1),fairness_cursor INTEGER NOT NULL CHECK(fairness_cursor BETWEEN 0 AND 3),workspace_cursor TEXT NOT NULL DEFAULT '',config_fingerprint TEXT NOT NULL DEFAULT '')",
+    "CREATE TABLE IF NOT EXISTS scheduler_state(id INTEGER PRIMARY KEY CHECK(id=1),fairness_cursor INTEGER NOT NULL CHECK(fairness_cursor BETWEEN 0 AND 3),workspace_cursor TEXT NOT NULL DEFAULT '',config_fingerprint TEXT NOT NULL DEFAULT '',limits_fingerprint TEXT NOT NULL DEFAULT '')",
     "CREATE TABLE IF NOT EXISTS ready_publication_fence_sequence(id INTEGER PRIMARY KEY CHECK(id=1),generation INTEGER NOT NULL CHECK(generation>=0))",
     "CREATE TABLE IF NOT EXISTS ready_publication_fences(token TEXT PRIMARY KEY,generation INTEGER NOT NULL UNIQUE CHECK(generation>0),operation_id TEXT NOT NULL UNIQUE,workspace TEXT NOT NULL,repo TEXT NOT NULL,branch TEXT NOT NULL,target TEXT NOT NULL,attempt_id TEXT NOT NULL,expires_at INTEGER NOT NULL,state TEXT NOT NULL CHECK(state IN('held','activation_unknown')),UNIQUE(token,generation))",
     "CREATE TABLE IF NOT EXISTS ready_publication_fence_members(token TEXT NOT NULL,generation INTEGER NOT NULL CHECK(generation>0),artifact_id INTEGER NOT NULL,manifest TEXT NOT NULL CHECK(length(trim(manifest))>0),PRIMARY KEY(token,artifact_id),FOREIGN KEY(token,generation) REFERENCES ready_publication_fences(token,generation) ON DELETE CASCADE,FOREIGN KEY(artifact_id) REFERENCES artifact_jobs(id) ON DELETE CASCADE)",
     "CREATE INDEX IF NOT EXISTS ready_publication_fences_recovery ON ready_publication_fences(state,generation,token)",
 ];
+const V6_SCHEDULER_STATE_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS scheduler_state(id INTEGER PRIMARY KEY CHECK(id=1),fairness_cursor INTEGER NOT NULL CHECK(fairness_cursor BETWEEN 0 AND 3),workspace_cursor TEXT NOT NULL DEFAULT '',config_fingerprint TEXT NOT NULL DEFAULT '')";
 
 #[derive(Clone)]
 pub struct LibsqlArtifactScheduler {
@@ -148,6 +150,7 @@ impl LibsqlArtifactScheduler {
             for ddl in SCHEMA {
                 tx.execute(ddl, ()).await?;
             }
+            crate::git_source_registry::libsql::install_v7_schema(&tx).await?;
             tx.execute(
                 "INSERT INTO artifact_scheduler_schema(id,version,provenance) VALUES(1,?,?)",
                 libsql::params![VERSION, PROVENANCE],
@@ -171,7 +174,8 @@ impl LibsqlArtifactScheduler {
             let provenance = marker.get::<String>(1)?;
             let released = match (version, provenance.as_str()) {
                 (1, V1_PROVENANCE) | (2, V2_PROVENANCE) | (3, V3_PROVENANCE)
-                | (4, V4_PROVENANCE) | (5, V5_PROVENANCE) | (VERSION, PROVENANCE) => version,
+                | (4, V4_PROVENANCE) | (5, V5_PROVENANCE)
+                | (6, V6_PROVENANCE) | (VERSION, PROVENANCE) => version,
                 _ => {
                     bail!("unsupported or foreign libsql artifact scheduler schema")
                 }
@@ -189,17 +193,24 @@ impl LibsqlArtifactScheduler {
                     }
                     backfill_all_retention(&tx).await?;
                 }
-                // The v6 fence schema is created transactionally before the
-                // marker changes. A crash or validation failure can therefore
-                // expose neither a falsely-v6 marker nor a partial fence family.
-                for ddl in &SCHEMA[16..] {
-                    tx.execute(ddl, ()).await?;
+                if released < 6 {
+                    // The v6 fence schema is created transactionally before
+                    // either later marker changes.
+                    for ddl in &SCHEMA[16..] {
+                        tx.execute(ddl, ()).await?;
+                    }
+                    tx.execute(
+                        "INSERT INTO ready_publication_fence_sequence(id,generation) VALUES(1,0)",
+                        (),
+                    )
+                    .await?;
                 }
                 tx.execute(
-                    "INSERT INTO ready_publication_fence_sequence(id,generation) VALUES(1,0)",
+                    "ALTER TABLE scheduler_state ADD COLUMN limits_fingerprint TEXT NOT NULL DEFAULT ''",
                     (),
                 )
                 .await?;
+                crate::git_source_registry::libsql::install_v7_schema(&tx).await?;
                 let changed = tx
                     .execute(
                         "UPDATE artifact_scheduler_schema SET version=?,provenance=? WHERE id=1 AND version=? AND provenance=?",
@@ -214,6 +225,7 @@ impl LibsqlArtifactScheduler {
             }
         }
         validate_schema(&tx, VERSION, PROVENANCE).await?;
+        crate::git_source_registry::libsql::validate_v7_schema(&tx).await?;
         let fingerprint = scheduler_fingerprint(&limits, identity);
         let stored = one_string(
             &tx,
@@ -232,6 +244,26 @@ impl LibsqlArtifactScheduler {
             }
         } else if stored != fingerprint {
             bail!("scheduler running-limit configuration differs from existing fleet")
+        }
+        let limits_fingerprint = scheduler_limits_fingerprint(&limits);
+        let stored_limits = one_string(
+            &tx,
+            "SELECT limits_fingerprint FROM scheduler_state WHERE id=1",
+            vec![],
+        )
+        .await?;
+        if stored_limits.is_empty() {
+            let changed = exec(
+                &tx,
+                "UPDATE scheduler_state SET limits_fingerprint=? WHERE id=1 AND limits_fingerprint=''",
+                vec![limits_fingerprint.clone().into()],
+            )
+            .await?;
+            if changed != 1 {
+                bail!("libsql scheduler limits fingerprint CAS failed")
+            }
+        } else if stored_limits != limits_fingerprint {
+            bail!("scheduler limits differ from existing fleet")
         }
             Ok(())
         }
@@ -693,6 +725,35 @@ impl ArtifactSchedulerPersistence for LibsqlArtifactScheduler {
         Ok(out)
     }
 
+    async fn live_source_objects_page(
+        &self,
+        after: Option<(&str, &str)>,
+        limit: u32,
+    ) -> Result<Vec<crate::git_source_registry::SourceGcObject>> {
+        if limit == 0 || limit > crate::git_source_registry::SOURCE_ROOT_PAGE_MAX {
+            bail!("libsql source GC page limit is invalid")
+        }
+        let (hash, owner) = after.unwrap_or(("", ""));
+        let connection = self.conn().await?;
+        let arguments: Vec<Value> = vec![
+            hash.into(),
+            hash.into(),
+            owner.into(),
+            (limit as i64).into(),
+        ];
+        let mut rows = connection.query("WITH objects(hash,len,owner) AS (SELECT root_hash,root_len,'r:'||root_hash FROM git_source_roots UNION ALL SELECT child_hash,child_len,'r:'||root_hash||':'||printf('%020d',ordinal) FROM git_source_members UNION ALL SELECT root_hash,root_len,'a:'||token FROM git_source_acquisitions WHERE state='activation_unknown' OR (state='graph_published' AND expires_at>unixepoch()) UNION ALL SELECT m.child_hash,m.child_len,'a:'||m.token||':'||printf('%020d',m.ordinal) FROM git_source_acquisition_members m JOIN git_source_acquisitions a ON a.token=m.token WHERE a.state='activation_unknown' OR (a.state='graph_published' AND a.expires_at>unixepoch())) SELECT hash,len,owner FROM objects WHERE hash>? OR (hash=? AND owner>?) ORDER BY hash,owner LIMIT ?", arguments).await?;
+        let mut objects = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let length: i64 = row.get(1)?;
+            objects.push(crate::git_source_registry::SourceGcObject {
+                hash: row.get(0)?,
+                len: u64::try_from(length).context("libsql source GC length is negative")?,
+                owner: row.get(2)?,
+            });
+        }
+        Ok(objects)
+    }
+
     async fn schedule(&self, key: &ArtifactKey) -> Result<ScheduleOutcome> {
         validate_format_version(key.format_version)?;
         let tx = self.tx().await?;
@@ -1044,7 +1105,7 @@ fn released_schema_indices(version: i64) -> Result<Vec<usize>> {
             indices.push(15);
         }
         3..=5 => indices.extend(10..=15),
-        6 => indices.extend(10..SCHEMA.len()),
+        6 | 7 => indices.extend(10..SCHEMA.len()),
         _ => bail!("unsupported libsql artifact scheduler schema version"),
     }
     indices.sort_unstable();
@@ -1068,7 +1129,7 @@ fn ddl_identity(ddl: &str) -> Result<(String, String)> {
 async fn scheduler_schema_object_count(c: &Connection) -> Result<i64> {
     one_i64(
         c,
-        "SELECT count(*) FROM sqlite_master WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' AND (name LIKE 'artifact_%' OR name LIKE 'branch_%' OR name LIKE 'scheduler_%' OR name LIKE 'ready_%')",
+        "SELECT count(*) FROM sqlite_master WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' AND (name LIKE 'artifact_%' OR name LIKE 'branch_%' OR name LIKE 'scheduler_%' OR name LIKE 'ready_%' OR name LIKE 'git_source_%')",
         vec![],
     )
     .await
@@ -1081,7 +1142,11 @@ async fn validate_released_schema(c: &Connection, version: i64) -> Result<()> {
     let indices = released_schema_indices(version)?;
     let mut expected = Vec::with_capacity(indices.len());
     for index in indices {
-        let ddl = SCHEMA[index];
+        let ddl = if version < 7 && index == 15 {
+            V6_SCHEDULER_STATE_SCHEMA
+        } else {
+            SCHEMA[index]
+        };
         let (kind, name) = ddl_identity(ddl)?;
         expected.push((kind.to_ascii_lowercase(), name, canonical_ddl(ddl)));
     }
@@ -1089,7 +1154,7 @@ async fn validate_released_schema(c: &Connection, version: i64) -> Result<()> {
 
     let mut rows = c
         .query(
-            "SELECT type,name,sql FROM sqlite_master WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' AND (name LIKE 'artifact_%' OR name LIKE 'branch_%' OR name LIKE 'scheduler_%' OR name LIKE 'ready_%') ORDER BY type,name",
+            "SELECT type,name,sql FROM sqlite_master WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' AND (name LIKE 'artifact_%' OR name LIKE 'branch_%' OR name LIKE 'scheduler_%' OR name LIKE 'ready_%') AND name<>'artifact_intents' AND name NOT LIKE 'artifact_intents_%' AND name NOT LIKE 'branch_source_%' ORDER BY type,name",
             (),
         )
         .await?;
@@ -1209,6 +1274,7 @@ async fn validate_schema(
                 "fairness_cursor",
                 "workspace_cursor",
                 "config_fingerprint",
+                "limits_fingerprint",
             ],
         ),
         ("ready_publication_fence_sequence", &["id", "generation"]),
@@ -1249,7 +1315,12 @@ async fn validate_schema(
                 bail!("libsql scheduler counter column shape is unsafe")
             };
             if table == "scheduler_state"
-                && ["workspace_cursor", "config_fingerprint"].contains(&name.as_str())
+                && [
+                    "workspace_cursor",
+                    "config_fingerprint",
+                    "limits_fingerprint",
+                ]
+                .contains(&name.as_str())
                 && (notnull != 1 || default.as_deref() != Some("''"))
             {
                 bail!("libsql scheduler control column shape is unsafe")
@@ -1459,7 +1530,7 @@ async fn validate_schema(
         "artifact consumer id",
     )
     .await?;
-    let invalid_control=one_i64(c,"SELECT count(*) FROM scheduler_state WHERE id<>1 OR typeof(id)<>'integer' OR typeof(fairness_cursor)<>'integer' OR fairness_cursor NOT BETWEEN 0 AND 3 OR typeof(workspace_cursor)<>'text' OR typeof(config_fingerprint)<>'text'",vec![]).await?;
+    let invalid_control=one_i64(c,"SELECT count(*) FROM scheduler_state WHERE id<>1 OR typeof(id)<>'integer' OR typeof(fairness_cursor)<>'integer' OR fairness_cursor NOT BETWEEN 0 AND 3 OR typeof(workspace_cursor)<>'text' OR typeof(config_fingerprint)<>'text' OR typeof(limits_fingerprint)<>'text' OR (limits_fingerprint<>'' AND (length(limits_fingerprint)<>64 OR limits_fingerprint GLOB '*[^0-9a-f]*'))",vec![]).await?;
     if invalid_control != 0 {
         bail!("libsql artifact scheduler contains invalid control state")
     }
@@ -1921,8 +1992,21 @@ mod tests {
         let fixture_version = version.clamp(1, VERSION);
         for index in released_schema_indices(fixture_version).unwrap() {
             if index != 14 || gc {
-                tx.execute(SCHEMA[index], ()).await.unwrap();
+                let ddl = if fixture_version < 7 && index == 15 {
+                    V6_SCHEDULER_STATE_SCHEMA
+                } else {
+                    SCHEMA[index]
+                };
+                tx.execute(ddl, ()).await.unwrap();
             }
+        }
+        if fixture_version >= 6 {
+            tx.execute(
+                "INSERT INTO ready_publication_fence_sequence(id,generation) VALUES(1,0)",
+                (),
+            )
+            .await
+            .unwrap();
         }
         tx.execute(
             "INSERT INTO artifact_scheduler_schema(id,version,provenance) VALUES(1,?,?)",
@@ -1940,7 +2024,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn released_v1_v2_v3_v4_migrate_to_v6_and_hybrids_fail_closed() {
+    async fn released_versions_migrate_to_v7_and_hybrids_fail_closed() {
         let Some(v1) = server().await else { return };
         install_version_fixture(&v1.url, 1, V1_PROVENANCE, false).await;
         let migrated_v1 = scheduler(&v1.url, Default::default()).await;
@@ -1969,7 +2053,7 @@ mod tests {
             )
             .await
             .unwrap(),
-            6
+            VERSION
         );
         assert_eq!(
             one_string(
@@ -1996,7 +2080,7 @@ mod tests {
             )
             .await
             .unwrap(),
-            6
+            VERSION
         );
         drop(migrated_v2);
         drop(v2);
@@ -2012,7 +2096,7 @@ mod tests {
             )
             .await
             .unwrap(),
-            6
+            VERSION
         );
         assert_eq!(
             one_string(
@@ -2026,6 +2110,43 @@ mod tests {
         );
         drop(migrated_v4);
         drop(v4);
+
+        let Some(v6) = server().await else { return };
+        install_version_fixture(&v6.url, 6, V6_PROVENANCE, true).await;
+        let migrated_v6 = scheduler(&v6.url, Default::default()).await;
+        let connection = migrated_v6.conn().await.unwrap();
+        assert_eq!(
+            one_i64(
+                &connection,
+                "SELECT version FROM artifact_scheduler_schema WHERE id=1",
+                vec![]
+            )
+            .await
+            .unwrap(),
+            VERSION
+        );
+        assert_eq!(
+            one_i64(
+                &connection,
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='git_source_roots'",
+                vec![]
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            one_string(
+                &connection,
+                "SELECT limits_fingerprint FROM scheduler_state WHERE id=1",
+                vec![]
+            )
+            .await
+            .unwrap(),
+            scheduler_limits_fingerprint(&SchedulerLimits::default())
+        );
+        drop(migrated_v6);
+        drop(v6);
 
         let Some(missing_base) = server().await else {
             return;
@@ -2141,8 +2262,8 @@ mod tests {
         let Some(future) = server().await else { return };
         install_version_fixture(
             &future.url,
-            7,
-            "ripclone-artifact-scheduler-libsql-v7",
+            8,
+            "ripclone-artifact-scheduler-libsql-v8",
             true,
         )
         .await;
