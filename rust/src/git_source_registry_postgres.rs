@@ -97,6 +97,19 @@ pub(crate) async fn validate_postgres_v7(c: &mut PgConnection, complete: bool) -
     {
         bail!("postgres v7 source acquisition operation provenance is invalid")
     }
+    let identities:Vec<(String,Option<String>,String,String,String,i64)>=sqlx::query_as("SELECT state,active_identity,workspace,repo,commit_oid,source_format_version FROM git_source_acquisitions").fetch_all(&mut *c).await?;
+    for (state, stored, workspace, repo, commit, version) in identities {
+        if matches!(
+            state.as_str(),
+            "held" | "graph_published" | "activation_unknown"
+        ) {
+            let version = checked_u32(version, "source format version")?;
+            let expected = source_identity(&workspace, &repo, &commit, version);
+            if stored.as_deref() != Some(expected.as_str()) {
+                bail!("postgres v7 source acquisition active identity is invalid")
+            }
+        }
+    }
     let invalid:i64=sqlx::query_scalar(r#"SELECT
       (SELECT count(*) FROM git_source_roots r WHERE r.root_hash !~ '^[0-9a-f]{64}$' OR r.semantic_digest !~ '^[0-9a-f]{64}$' OR r.object_set_digest !~ '^[0-9a-f]{64}$' OR (r.object_format='sha1' AND r.commit_oid !~ '^[0-9a-f]{40}$') OR (r.object_format='sha256' AND r.commit_oid !~ '^[0-9a-f]{64}$') OR NOT EXISTS(SELECT 1 FROM git_source_members m WHERE m.root_hash=r.root_hash GROUP BY m.root_hash HAVING min(m.ordinal)=0 AND max(m.ordinal)+1=count(*) AND count(*)%2=0 AND sum(m.child_len)=r.total_bytes AND sum(CASE WHEN (m.ordinal%2=0 AND m.kind='pack') OR (m.ordinal%2=1 AND m.kind='index') THEN 0 ELSE 1 END)=0))+
       (SELECT count(*) FROM git_source_members WHERE child_hash !~ '^[0-9a-f]{64}$')+
@@ -1475,6 +1488,46 @@ mod tests {
             .await
             .unwrap();
         let mut corrupt = pool.acquire().await.unwrap().detach();
+        let identity_commit = "f".repeat(40);
+        let identity_permit = match registry
+            .begin_acquisition(
+                "ws",
+                "o/r",
+                &identity_commit,
+                1,
+                "owner",
+                "identity-test",
+                60,
+                SyncIntent::EnsureCurrent,
+            )
+            .await
+            .unwrap()
+        {
+            SourceBeginOutcome::PermitToPrepare(permit) => permit,
+            _ => panic!("expected identity-test Held capability"),
+        };
+        sqlx::raw_sql("BEGIN").execute(&mut corrupt).await.unwrap();
+        sqlx::query(
+            "UPDATE git_source_acquisitions SET active_identity='planted-identity' WHERE token=$1",
+        )
+        .bind(&identity_permit.token)
+        .execute(&mut corrupt)
+        .await
+        .unwrap();
+        assert!(
+            validate_postgres_v7(&mut corrupt, true).await.is_err(),
+            "forged active source identity was accepted"
+        );
+        sqlx::raw_sql("ROLLBACK")
+            .execute(&mut corrupt)
+            .await
+            .unwrap();
+        assert!(
+            registry
+                .fail_preparation(&identity_permit, FailureClass::Retryable)
+                .await
+                .unwrap()
+        );
         let mismatch_consumer: String = sqlx::query_scalar(
             "SELECT consumer_id FROM artifact_intents WHERE workspace='ws' ORDER BY id LIMIT 1",
         )
