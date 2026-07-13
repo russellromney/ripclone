@@ -672,7 +672,7 @@ CREATE TABLE IF NOT EXISTS artifact_transport_leases(
 CREATE INDEX IF NOT EXISTS artifact_transport_leases_expiry ON artifact_transport_leases(expires_at);
 CREATE TABLE IF NOT EXISTS artifact_gc_sweep(
  id INTEGER PRIMARY KEY CHECK(id=1),owner TEXT NOT NULL,expires_at INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS scheduler_state(id INTEGER PRIMARY KEY CHECK(id=1),fairness_cursor INTEGER NOT NULL,workspace_cursor TEXT NOT NULL DEFAULT '',config_fingerprint TEXT NOT NULL DEFAULT '');
+CREATE TABLE IF NOT EXISTS scheduler_state(id INTEGER PRIMARY KEY CHECK(id=1),fairness_cursor INTEGER NOT NULL,workspace_cursor TEXT NOT NULL DEFAULT '',config_fingerprint TEXT NOT NULL DEFAULT '',limits_fingerprint TEXT NOT NULL DEFAULT '');
 INSERT OR IGNORE INTO scheduler_state(id,fairness_cursor) VALUES(1,0);
 "#;
 
@@ -792,6 +792,11 @@ impl ArtifactScheduler {
                 "scheduler_state",
                 "config_fingerprint",
                 "config_fingerprint TEXT NOT NULL DEFAULT ''",
+            ),
+            (
+                "scheduler_state",
+                "limits_fingerprint",
+                "limits_fingerprint TEXT NOT NULL DEFAULT ''",
             ),
         ] {
             let exists: i64 =
@@ -1124,6 +1129,7 @@ impl ArtifactScheduler {
         }
         let mut config = pool.acquire().await?;
         sqlx::query("BEGIN IMMEDIATE").execute(&mut *config).await?;
+        let limits_fingerprint = scheduler_limits_fingerprint(&limits);
         let stored: String =
             sqlx::query_scalar("SELECT config_fingerprint FROM scheduler_state WHERE id=1")
                 .fetch_one(&mut *config)
@@ -1152,6 +1158,25 @@ impl ArtifactScheduler {
         if stored != fingerprint {
             let _ = sqlx::query("ROLLBACK").execute(&mut *config).await;
             bail!("scheduler configuration CAS verification failed")
+        }
+        let stored_limits: String =
+            sqlx::query_scalar("SELECT limits_fingerprint FROM scheduler_state WHERE id=1")
+                .fetch_one(&mut *config)
+                .await?;
+        if stored_limits.is_empty() {
+            if sqlx::query("UPDATE scheduler_state SET limits_fingerprint=? WHERE id=1 AND limits_fingerprint=''")
+                .bind(&limits_fingerprint)
+                .execute(&mut *config)
+                .await?
+                .rows_affected()
+                != 1
+            {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *config).await;
+                bail!("scheduler limits fingerprint CAS failed")
+            }
+        } else if stored_limits != limits_fingerprint {
+            let _ = sqlx::query("ROLLBACK").execute(&mut *config).await;
+            bail!("scheduler limits fingerprint differs from existing fleet")
         }
         sqlx::query("COMMIT").execute(&mut *config).await?;
         let completion_sealer = Arc::new(CompletionSealAuthority::new(verifier_id)?);
@@ -2771,6 +2796,27 @@ pub(crate) fn scheduler_fingerprint(limits: &SchedulerLimits, verifier_id: &str)
         limits.max_manual_retries,
         verifier_id
     )
+}
+pub(crate) fn scheduler_limits_fingerprint(limits: &SchedulerLimits) -> String {
+    let mut digest = Sha256::new();
+    for value in [
+        limits.total_backlog,
+        limits.workspace_backlog,
+        limits.head_reserved,
+        limits.head_backlog,
+        limits.full_history_backlog,
+        limits.files_backlog,
+        limits.total_running,
+        limits.head_running,
+        limits.full_history_running,
+        limits.files_running,
+        limits.workspace_running,
+    ] {
+        digest.update((value as u64).to_be_bytes());
+    }
+    digest.update(limits.max_claim_attempts.to_be_bytes());
+    digest.update(limits.max_manual_retries.to_be_bytes());
+    hex::encode(digest.finalize())
 }
 pub(crate) fn validate_evidence(c: &ClaimedArtifact, e: &CompletionEvidence) -> Result<()> {
     if e.manifest().trim().is_empty() {
