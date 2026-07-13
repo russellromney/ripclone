@@ -1267,6 +1267,7 @@ mod tests {
         child: Child,
         _dir: tempfile::TempDir,
         url: String,
+        _permit: tokio::sync::OwnedSemaphorePermit,
     }
     impl Drop for Server {
         fn drop(&mut self) {
@@ -1275,6 +1276,14 @@ mod tests {
         }
     }
     async fn server() -> Option<Server> {
+        static SQLD_TEST_LIMIT: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> =
+            std::sync::OnceLock::new();
+        let permit = SQLD_TEST_LIMIT
+            .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("sqld source test semaphore never closes");
         let port = TcpListener::bind("127.0.0.1:0")
             .unwrap()
             .local_addr()
@@ -1310,6 +1319,7 @@ mod tests {
                     child,
                     _dir: dir,
                     url,
+                    _permit: permit,
                 });
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -1757,19 +1767,18 @@ mod tests {
             )
             .await
             .unwrap();
+        let bulk_connection = shared.connect().unwrap();
+        let bulk = bulk_connection
+            .transaction_with_behavior(::libsql::TransactionBehavior::Immediate)
+            .await
+            .unwrap();
         for format in 2..=66 {
-            let snapshot = registry.snapshot("a", "o/r", "main").await.unwrap();
-            registry
-                .record_tip_and_intents(
-                    &snapshot,
-                    &source_a,
-                    &[ArtifactKind::Head],
-                    format,
-                    SyncIntent::EnsureCurrent,
-                )
-                .await
-                .unwrap();
+            let consumer = format!("intent:{:048x}", format);
+            let session = format!("{:064x}", format);
+            bulk.execute("INSERT INTO artifact_intents(workspace,repo,branch,branch_generation,source_root_hash,source_format_version,commit_oid,kind,format_version,state,artifact_id,consumer_id,created_at,updated_at) VALUES('a','o/r','main',1,?,1,?,'head',?,'deferred',NULL,?,unixepoch(),unixepoch())",values![source_a.manifest().into(),source_a.commit().into(),(format as i64).into(),consumer.clone().into()]).await.unwrap();
+            bulk.execute("INSERT INTO git_source_consumers(root_hash,consumer_id,session_id,workspace,repo,commit_oid,source_format_version,purpose,expires_at) VALUES(?,?,?,'a','o/r',?,1,'intent',9223372036854775807)",values![source_a.manifest().into(),consumer.into(),session.into(),source_a.commit().into()]).await.unwrap();
         }
+        bulk.commit().await.unwrap();
         let source_z =
             registered_source(&registry, "z", "4444444444444444444444444444444444444444").await;
         let snapshot = registry.snapshot("z", "o/r", "main").await.unwrap();
