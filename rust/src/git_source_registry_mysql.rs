@@ -134,6 +134,10 @@ async fn validate_table(c: &mut MySqlConnection, table: &str) -> Result<()> {
     if signature.as_deref() != Some(expected_signature) {
         bail!("mysql v7 source column definitions differ: {table}")
     }
+    let noncanonical_indexes:i64=sqlx::query_scalar("SELECT count(*) FROM information_schema.statistics WHERE table_schema=DATABASE() AND table_name=? AND (index_type<>'BTREE' OR is_visible<>'YES' OR expression IS NOT NULL OR sub_part IS NOT NULL OR collation<>'A')").bind(table).fetch_one(&mut *c).await?;
+    if noncanonical_indexes != 0 {
+        bail!("mysql v7 source index definitions differ: {table}")
+    }
     let mut indexes:Vec<(String,i64,String)>=sqlx::query_as("SELECT index_name,non_unique,GROUP_CONCAT(column_name ORDER BY seq_in_index) FROM information_schema.statistics WHERE table_schema=DATABASE() AND table_name=? GROUP BY index_name,non_unique ORDER BY index_name").bind(table).fetch_all(&mut *c).await?;
     indexes.sort();
     if indexes != expected_indexes(table) {
@@ -316,8 +320,29 @@ fn expected_checks(table: &str) -> &'static [(&'static str, &'static str)] {
 fn normalize_mysql_check(v: &str) -> String {
     let mut normalized = String::with_capacity(v.len());
     let mut quoted = false;
-    for c in v.chars() {
+    let chars = v.chars().collect::<Vec<_>>();
+    let mut index = 0;
+    while index < chars.len() {
+        if !quoted && chars[index..].starts_with(&['_', 'u', 't', 'f', '8', 'm', 'b', '4']) {
+            index += 8;
+            continue;
+        }
+        let c = chars[index];
         if c == '\\' {
+            let mut end = index;
+            while end < chars.len() && chars[end] == '\\' {
+                end += 1;
+            }
+            if end < chars.len() && chars[end] == '\'' {
+                quoted = !quoted;
+                normalized.push('\'');
+                index = end + 1;
+                continue;
+            }
+            for escaped in &chars[index..end] {
+                normalized.push(*escaped);
+            }
+            index = end;
             continue;
         } else if c == '\'' {
             quoted = !quoted;
@@ -327,8 +352,8 @@ fn normalize_mysql_check(v: &str) -> String {
         } else if c != '`' {
             normalized.push(c.to_ascii_lowercase());
         }
+        index += 1;
     }
-    normalized = normalized.replace("_utf8mb4", "");
     let parenthesized = normalize_mysql_parentheses(&normalized);
     let mut compact = String::with_capacity(parenthesized.len());
     let mut quoted = false;
@@ -676,6 +701,19 @@ pub(crate) async fn validate_mysql_v7_state(c: &mut MySqlConnection) -> Result<(
     {
         bail!("mysql v7 source acquisition provenance is invalid")
     }
+    let identities:Vec<(String,Option<String>,String,String,String,i64)>=sqlx::query_as("SELECT state,active_identity,workspace,repo,commit_oid,source_format_version FROM git_source_acquisitions").fetch_all(&mut *c).await?;
+    for (state, stored, workspace, repo, commit, version) in identities {
+        if matches!(
+            state.as_str(),
+            "held" | "graph_published" | "activation_unknown"
+        ) {
+            let version = checked_u32(version, "source format version")?;
+            let expected = source_identity(&workspace, &repo, &commit, version);
+            if stored.as_deref() != Some(expected.as_str()) {
+                bail!("mysql v7 source acquisition active identity is invalid")
+            }
+        }
+    }
     let singleton:i64=sqlx::query_scalar("SELECT count(*) FROM git_source_maintenance WHERE id=1 AND intent_cursor>=0 AND acquisition_cursor>=0").fetch_one(&mut *c).await?;
     if singleton != 1 {
         bail!("mysql v7 source maintenance singleton is invalid")
@@ -683,9 +721,9 @@ pub(crate) async fn validate_mysql_v7_state(c: &mut MySqlConnection) -> Result<(
     let invalid:i64=sqlx::query_scalar("SELECT
       (SELECT count(*) FROM git_source_roots r WHERE r.root_hash NOT REGEXP '^[0-9a-f]{64}$' OR r.semantic_digest NOT REGEXP '^[0-9a-f]{64}$' OR r.object_set_digest NOT REGEXP '^[0-9a-f]{64}$' OR (r.object_format='sha1' AND r.commit_oid NOT REGEXP '^[0-9a-f]{40}$') OR (r.object_format='sha256' AND r.commit_oid NOT REGEXP '^[0-9a-f]{64}$') OR NOT EXISTS(SELECT 1 FROM git_source_members m WHERE m.root_hash=r.root_hash GROUP BY m.root_hash HAVING MIN(m.ordinal)=0 AND MAX(m.ordinal)+1=count(*) AND MOD(count(*),2)=0 AND SUM(m.child_len)=r.total_bytes AND SUM(CASE WHEN (MOD(m.ordinal,2)=0 AND m.kind='pack') OR (MOD(m.ordinal,2)=1 AND m.kind='index') THEN 0 ELSE 1 END)=0))+
       (SELECT count(*) FROM git_source_members WHERE child_hash NOT REGEXP '^[0-9a-f]{64}$')+(SELECT count(*) FROM git_source_acquisition_members WHERE child_hash NOT REGEXP '^[0-9a-f]{64}$')+
-      (SELECT count(*) FROM git_source_acquisitions a WHERE token NOT REGEXP '^[0-9a-f]{64}$' OR (root_hash IS NOT NULL AND root_hash NOT REGEXP '^[0-9a-f]{64}$') OR (semantic_digest IS NOT NULL AND semantic_digest NOT REGEXP '^[0-9a-f]{64}$') OR (object_set_digest IS NOT NULL AND object_set_digest NOT REGEXP '^[0-9a-f]{64}$') OR (state IN('held','graph_published','activation_unknown') AND active_identity IS NULL) OR (state IN('registered','failed') AND active_identity IS NOT NULL) OR (state='held' AND EXISTS(SELECT 1 FROM git_source_acquisition_members m WHERE m.token=a.token)) OR (state IN('graph_published','activation_unknown','registered') AND NOT EXISTS(SELECT 1 FROM git_source_acquisition_members m WHERE m.token=a.token)) OR EXISTS(SELECT 1 FROM git_source_acquisition_members m WHERE m.token=a.token GROUP BY m.token HAVING MIN(m.ordinal)<>0 OR MAX(m.ordinal)+1<>count(*) OR MOD(count(*),2)<>0 OR SUM(m.child_len)<>a.total_bytes OR SUM(CASE WHEN (MOD(m.ordinal,2)=0 AND m.kind='pack') OR (MOD(m.ordinal,2)=1 AND m.kind='index') THEN 0 ELSE 1 END)<>0))+
+      (SELECT count(*) FROM git_source_acquisitions a WHERE token NOT REGEXP '^[0-9a-f]{64}$' OR (commit_oid NOT REGEXP '^[0-9a-f]{40}$' AND commit_oid NOT REGEXP '^[0-9a-f]{64}$') OR (object_format='sha1' AND commit_oid NOT REGEXP '^[0-9a-f]{40}$') OR (object_format='sha256' AND commit_oid NOT REGEXP '^[0-9a-f]{64}$') OR (root_hash IS NOT NULL AND root_hash NOT REGEXP '^[0-9a-f]{64}$') OR (semantic_digest IS NOT NULL AND semantic_digest NOT REGEXP '^[0-9a-f]{64}$') OR (object_set_digest IS NOT NULL AND object_set_digest NOT REGEXP '^[0-9a-f]{64}$') OR (state IN('held','graph_published','activation_unknown') AND active_identity IS NULL) OR (state IN('registered','failed') AND active_identity IS NOT NULL) OR (state='held' AND EXISTS(SELECT 1 FROM git_source_acquisition_members m WHERE m.token=a.token)) OR (state IN('graph_published','activation_unknown','registered') AND NOT EXISTS(SELECT 1 FROM git_source_acquisition_members m WHERE m.token=a.token)) OR EXISTS(SELECT 1 FROM git_source_acquisition_members m WHERE m.token=a.token GROUP BY m.token HAVING MIN(m.ordinal)<>0 OR MAX(m.ordinal)+1<>count(*) OR MOD(count(*),2)<>0 OR SUM(m.child_len)<>a.total_bytes OR SUM(CASE WHEN (MOD(m.ordinal,2)=0 AND m.kind='pack') OR (MOD(m.ordinal,2)=1 AND m.kind='index') THEN 0 ELSE 1 END)<>0))+
       (SELECT count(*) FROM git_source_acquisitions a LEFT JOIN git_source_roots r ON r.root_hash=a.root_hash WHERE a.state='registered' AND (r.root_hash IS NULL OR r.state<>'registered' OR r.registration_operation<>a.operation_id OR r.registration_generation<>a.generation OR r.workspace<>a.workspace OR r.repo<>a.repo OR r.commit_oid<>a.commit_oid OR r.source_format_version<>a.source_format_version OR r.root_len<>a.root_len OR r.object_format<>a.object_format OR r.semantic_digest<>a.semantic_digest OR r.object_set_digest<>a.object_set_digest OR r.object_count<>a.object_count OR r.total_bytes<>a.total_bytes))+
-      (SELECT count(*) FROM git_source_desires d LEFT JOIN git_source_acquisitions a ON a.token=d.acquisition_token LEFT JOIN git_source_roots r ON r.root_hash=d.root_hash WHERE d.source_format_version<>1 OR (d.state='acquiring' AND (a.token IS NULL OR a.workspace<>d.workspace OR a.repo<>d.repo OR a.commit_oid<>d.commit_oid OR a.state NOT IN('held','graph_published','activation_unknown'))) OR (d.state='registered' AND (r.root_hash IS NULL OR r.workspace<>d.workspace OR r.repo<>d.repo OR r.commit_oid<>d.commit_oid OR r.state<>'registered')))+
+      (SELECT count(*) FROM git_source_desires d LEFT JOIN git_source_acquisitions a ON a.token=d.acquisition_token LEFT JOIN git_source_roots r ON r.root_hash=d.root_hash WHERE d.source_format_version<>1 OR (d.commit_oid NOT REGEXP '^[0-9a-f]{40}$' AND d.commit_oid NOT REGEXP '^[0-9a-f]{64}$') OR (d.state='acquiring' AND (a.token IS NULL OR a.workspace<>d.workspace OR a.repo<>d.repo OR a.commit_oid<>d.commit_oid OR a.source_format_version<>d.source_format_version OR a.state NOT IN('held','graph_published','activation_unknown'))) OR (d.state='registered' AND (r.root_hash IS NULL OR r.workspace<>d.workspace OR r.repo<>d.repo OR r.commit_oid<>d.commit_oid OR r.source_format_version<>d.source_format_version OR r.state<>'registered')))+
       (SELECT count(*) FROM branch_source_current current JOIN branch_source_generations g ON g.workspace=current.workspace AND g.repo=current.repo AND g.branch=current.branch AND g.generation=current.generation LEFT JOIN branch_observations b ON b.workspace=current.workspace AND b.repo=current.repo AND b.branch=current.branch WHERE b.workspace IS NULL OR b.generation<>g.generation OR b.desired_commit<>g.commit_oid)+
       (SELECT count(*) FROM git_source_consumers c LEFT JOIN git_source_roots r ON r.root_hash=c.root_hash AND r.workspace=c.workspace AND r.repo=c.repo AND r.commit_oid=c.commit_oid AND r.source_format_version=c.source_format_version WHERE r.root_hash IS NULL OR c.session_id NOT REGEXP '^[0-9a-f]{64}$')+
       (SELECT count(*) FROM artifact_intents i LEFT JOIN branch_source_generations g ON g.workspace=i.workspace AND g.repo=i.repo AND g.branch=i.branch AND g.generation=i.branch_generation LEFT JOIN git_source_consumers c ON c.consumer_id=i.consumer_id AND c.root_hash=i.source_root_hash AND c.purpose='intent' LEFT JOIN artifact_jobs j ON j.id=i.artifact_id WHERE g.workspace IS NULL OR g.root_hash<>i.source_root_hash OR g.commit_oid<>i.commit_oid OR g.source_format_version<>i.source_format_version OR c.root_hash IS NULL OR i.consumer_id NOT REGEXP '^intent:[0-9a-f]{48}$' OR c.expires_at<>9223372036854775807 OR (SELECT count(*) FROM git_source_consumers sibling WHERE sibling.consumer_id=i.consumer_id)<>1 OR (SELECT count(*) FROM artifact_intents sibling WHERE sibling.consumer_id=i.consumer_id)<>1 OR (i.state='deferred' AND (i.artifact_id IS NOT NULL OR EXISTS(SELECT 1 FROM artifact_consumers ac WHERE ac.consumer_id=i.consumer_id))) OR (i.state='promoted' AND (j.id IS NULL OR j.workspace<>i.workspace OR j.repo<>i.repo OR j.commit_oid<>i.commit_oid OR j.kind<>i.kind OR j.format_version<>i.format_version OR (SELECT count(*) FROM artifact_consumers sibling WHERE sibling.consumer_id=i.consumer_id)<>1 OR NOT EXISTS(SELECT 1 FROM artifact_consumers ac WHERE ac.artifact_id=i.artifact_id AND ac.consumer_id=i.consumer_id AND ac.expires_at=9223372036854775807))))").fetch_one(&mut *c).await?;
@@ -2092,6 +2130,77 @@ mod tests {
         // cross-row proofs. Startup validation must reject every malformed
         // hybrid, while a rollback proves the negative test is non-destructive.
         let mut corrupt = pool.acquire().await.unwrap().detach();
+        let held_identity_commit = "f".repeat(40);
+        let held_identity = match registry
+            .begin_acquisition(
+                "ws",
+                "o/r",
+                &held_identity_commit,
+                1,
+                "owner",
+                "identity-test",
+                60,
+                SyncIntent::EnsureCurrent,
+            )
+            .await
+            .unwrap()
+        {
+            SourceBeginOutcome::PermitToPrepare(permit) => permit,
+            _ => panic!("expected identity-test Held capability"),
+        };
+        sqlx::raw_sql("START TRANSACTION")
+            .execute(&mut corrupt)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE git_source_acquisitions SET active_identity='planted-identity' WHERE token=?",
+        )
+        .bind(&held_identity.token)
+        .execute(&mut corrupt)
+        .await
+        .unwrap();
+        assert!(
+            validate_mysql_v7_state(&mut corrupt).await.is_err(),
+            "forged active source identity was accepted"
+        );
+        sqlx::raw_sql("ROLLBACK")
+            .execute(&mut corrupt)
+            .await
+            .unwrap();
+
+        let malformed_commit = "not-an-object-id";
+        sqlx::raw_sql("START TRANSACTION")
+            .execute(&mut corrupt)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE git_source_acquisitions SET commit_oid=?,operation_id=?,active_identity=? WHERE token=?")
+            .bind(malformed_commit)
+            .bind(operation_id("ws", "o/r", malformed_commit, "identity-test", held_identity.generation as i64))
+            .bind(source_identity("ws", "o/r", malformed_commit, 1))
+            .bind(&held_identity.token)
+            .execute(&mut corrupt)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE git_source_desires SET commit_oid=? WHERE workspace='ws' AND repo='o/r' AND commit_oid=? AND source_format_version=1")
+            .bind(malformed_commit)
+            .bind(&held_identity_commit)
+            .execute(&mut corrupt)
+            .await
+            .unwrap();
+        assert!(
+            validate_mysql_v7_state(&mut corrupt).await.is_err(),
+            "held acquisition with malformed commit syntax was accepted"
+        );
+        sqlx::raw_sql("ROLLBACK")
+            .execute(&mut corrupt)
+            .await
+            .unwrap();
+        assert!(
+            registry
+                .fail_preparation(&held_identity, FailureClass::Retryable)
+                .await
+                .unwrap()
+        );
         let mismatch_consumer: String = sqlx::query_scalar(
             "SELECT consumer_id FROM artifact_intents WHERE workspace='ws' ORDER BY id LIMIT 1",
         )
