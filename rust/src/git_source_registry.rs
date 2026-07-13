@@ -69,6 +69,11 @@ mod mysql;
 pub use mysql::MysqlGitSourceRegistry;
 pub(crate) use mysql::{MYSQL_V7_TABLES, validate_mysql_v7_prefix, validate_mysql_v7_state};
 
+#[path = "git_source_registry_postgres.rs"]
+mod postgres;
+pub use postgres::PostgresGitSourceRegistry;
+pub(crate) use postgres::{POSTGRES_V7_SCHEMA, validate_postgres_v7};
+
 pub(crate) const SQLITE_V7_SCHEMA: &str = r#"
 CREATE TABLE git_source_roots(
  root_hash TEXT PRIMARY KEY,root_len INTEGER NOT NULL CHECK(root_len>0),workspace TEXT NOT NULL,repo TEXT NOT NULL,commit_oid TEXT NOT NULL,

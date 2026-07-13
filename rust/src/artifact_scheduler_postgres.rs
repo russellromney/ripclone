@@ -9,8 +9,8 @@ use crate::artifact_scheduler::{
     ClaimedArtifact, CompletionSealAuthority, CompletionVerifier, FailureClass, ObservationOutcome,
     ObservationSnapshot, QuarantineOutcome, ReadyPublicationFence, RetryOutcome, ScheduleOutcome,
     SchedulerLimits, UnknownActivationFencePage, VerifiedCompletionEvidence, scheduler_fingerprint,
-    validate_format_version, validate_lease, validate_limits, validate_observation_identity,
-    validate_resolved_commit,
+    scheduler_limits_fingerprint, validate_format_version, validate_lease, validate_limits,
+    validate_observation_identity, validate_resolved_commit,
 };
 #[cfg(test)]
 use crate::artifact_scheduler::{CompletionEvidence, validate_evidence};
@@ -25,7 +25,7 @@ use sqlx::{Postgres, Row, Transaction};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS artifact_scheduler_schema(
  id SMALLINT CONSTRAINT artifact_scheduler_schema_pkey PRIMARY KEY,
@@ -96,6 +96,7 @@ CREATE TABLE IF NOT EXISTS scheduler_state(
  id SMALLINT CONSTRAINT scheduler_state_pkey PRIMARY KEY,
  fairness_cursor BIGINT NOT NULL,
  workspace_cursor TEXT NOT NULL DEFAULT '',config_fingerprint TEXT NOT NULL DEFAULT '',
+ limits_fingerprint TEXT NOT NULL DEFAULT '',
  CONSTRAINT scheduler_state_singleton CHECK(id=1),
  CONSTRAINT scheduler_state_fairness CHECK(fairness_cursor BETWEEN 0 AND 3));
 INSERT INTO scheduler_state(id,fairness_cursor) VALUES(1,0) ON CONFLICT(id) DO NOTHING;
@@ -252,7 +253,7 @@ async fn preflight_postgres_schema(tx: &mut Transaction<'_, Postgres>, version: 
         return Ok(());
     }
     let fence_tables:i64=sqlx::query_scalar("SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=current_schema() AND c.relkind='r' AND c.relname IN('ready_publication_fence_sequence','ready_publication_fences','ready_publication_fence_members')").fetch_one(&mut **tx).await?;
-    if version == 6 || fence_tables == 3 {
+    if version >= 6 || fence_tables == 3 {
         let columns:i64=sqlx::query_scalar("SELECT count(*) FROM information_schema.columns WHERE table_schema=current_schema() AND ((table_name='ready_publication_fence_sequence' AND column_name IN('id','generation')) OR (table_name='ready_publication_fences' AND column_name IN('token','generation','operation_id','workspace','repo','branch','target','attempt_id','expires_at','state')) OR (table_name='ready_publication_fence_members' AND column_name IN('token','generation','artifact_id','manifest')))").fetch_one(&mut **tx).await?;
         let index:i64=sqlx::query_scalar("SELECT count(*) FROM pg_indexes WHERE schemaname=current_schema() AND indexname='ready_publication_fences_recovery' AND indexdef LIKE '%(state, generation, token)%'").fetch_one(&mut **tx).await?;
         if fence_tables != 3 || columns != 16 || index != 1 {
@@ -439,7 +440,7 @@ impl PostgresArtifactScheduler {
             if version > SCHEMA_VERSION {
                 bail!("artifact scheduler database is newer than this binary")
             }
-            if ![1, 2, 3, 4, 5, SCHEMA_VERSION].contains(&version) {
+            if ![1, 2, 3, 4, 5, 6, SCHEMA_VERSION].contains(&version) {
                 bail!("unsupported postgres artifact scheduler schema {version}")
             }
             preflight_postgres_schema(&mut migration, version).await?;
@@ -447,6 +448,7 @@ impl PostgresArtifactScheduler {
                 // A released v6 marker must already describe the exact schema;
                 // CREATE IF NOT EXISTS must not repair a forged production DB.
                 validate_postgres_v6_fences(&mut migration).await?;
+                crate::git_source_registry::validate_postgres_v7(&mut migration, true).await?;
             } else {
                 sqlx::raw_sql(SCHEMA).execute(&mut *migration).await?;
             }
@@ -465,8 +467,34 @@ impl PostgresArtifactScheduler {
         if version > SCHEMA_VERSION {
             bail!("artifact scheduler database is newer than this binary")
         }
-        if ![1, 2, 3, 4, 5, SCHEMA_VERSION].contains(&version) {
+        if ![1, 2, 3, 4, 5, 6, SCHEMA_VERSION].contains(&version) {
             bail!("unsupported postgres artifact scheduler schema {version}")
+        }
+        if version < SCHEMA_VERSION {
+            crate::git_source_registry::validate_postgres_v7(&mut migration, false).await?;
+            sqlx::raw_sql(crate::git_source_registry::POSTGRES_V7_SCHEMA)
+                .execute(&mut *migration)
+                .await?;
+            let durable_limits = scheduler_limits_fingerprint(&limits);
+            let adopted = sqlx::query(
+                "UPDATE scheduler_state SET limits_fingerprint=$1
+                 WHERE id=1 AND limits_fingerprint=''",
+            )
+            .bind(&durable_limits)
+            .execute(&mut *migration)
+            .await?
+            .rows_affected();
+            if adopted != 1 {
+                let stored: String = sqlx::query_scalar(
+                    "SELECT limits_fingerprint FROM scheduler_state WHERE id=1 FOR UPDATE",
+                )
+                .fetch_one(&mut *migration)
+                .await?;
+                if stored != durable_limits {
+                    bail!("postgres scheduler limits capability differs during v7 migration")
+                }
+            }
+            crate::git_source_registry::validate_postgres_v7(&mut migration, true).await?;
         }
         let missing_columns: i64 = sqlx::query_scalar(
             "WITH expected(table_name,column_name) AS (VALUES
@@ -493,7 +521,7 @@ impl PostgresArtifactScheduler {
               ('artifact_transport_leases','workspace'),('artifact_transport_leases','repo'),
               ('artifact_transport_leases','expires_at'),('scheduler_state','id'),
               ('scheduler_state','fairness_cursor'),('scheduler_state','workspace_cursor'),
-              ('scheduler_state','config_fingerprint'))
+              ('scheduler_state','config_fingerprint'),('scheduler_state','limits_fingerprint'))
              SELECT count(*) FROM expected e LEFT JOIN information_schema.columns c
                ON c.table_schema=current_schema() AND c.table_name=e.table_name
               AND c.column_name=e.column_name WHERE c.column_name IS NULL",
@@ -535,13 +563,13 @@ impl PostgresArtifactScheduler {
                      'lease_generation','claim_attempts','retry_count')
                    AND c.column_default IS DISTINCT FROM '0')
                OR (c.table_name='scheduler_state' AND c.column_name IN(
-                     'workspace_cursor','config_fingerprint')
+                     'workspace_cursor','config_fingerprint','limits_fingerprint')
                    AND c.column_default IS DISTINCT FROM $d$''::text$d$)
                OR (NOT (
                      (c.table_name='artifact_jobs' AND c.column_name IN(
                        'id','lease_generation','claim_attempts','retry_count'))
                      OR (c.table_name='scheduler_state' AND c.column_name IN(
-                       'workspace_cursor','config_fingerprint')))
+                       'workspace_cursor','config_fingerprint','limits_fingerprint')))
                    AND c.column_default IS NOT NULL))",
         )
         .fetch_one(&mut *migration)
@@ -554,7 +582,7 @@ impl PostgresArtifactScheduler {
         )
         .fetch_one(&mut *migration)
         .await?;
-        if invalid_column_shape != 0 || scheduler_column_count != 48 {
+        if invalid_column_shape != 0 || scheduler_column_count != 49 {
             bail!("postgres artifact scheduler column shape differs from schema version")
         }
         let required_constraints: i64 = sqlx::query_scalar(
@@ -849,6 +877,15 @@ impl PostgresArtifactScheduler {
             }
         }
         validate_postgres_v6_fences(&mut migration).await?;
+        crate::git_source_registry::validate_postgres_v7(&mut migration, true).await?;
+        let stored_limits: String = sqlx::query_scalar(
+            "SELECT limits_fingerprint FROM scheduler_state WHERE id=1 FOR UPDATE",
+        )
+        .fetch_one(&mut *migration)
+        .await?;
+        if stored_limits != scheduler_limits_fingerprint(&limits) {
+            bail!("postgres scheduler limits capability differs from fleet")
+        }
         if version < SCHEMA_VERSION {
             sqlx::query(
                 "UPDATE artifact_scheduler_schema SET version=$1 WHERE id=1 AND version=$2",
@@ -2369,7 +2406,18 @@ mod tests {
 
     async fn reset(pool: &PgPool) {
         sqlx::raw_sql(
-            "DROP TABLE IF EXISTS ready_publication_fence_members;
+            "DROP TABLE IF EXISTS artifact_intents;
+             DROP TABLE IF EXISTS git_source_consumers;
+             DROP TABLE IF EXISTS branch_source_current;
+             DROP TABLE IF EXISTS branch_source_generations;
+             DROP TABLE IF EXISTS git_source_desires;
+             DROP TABLE IF EXISTS git_source_acquisition_members;
+             DROP TABLE IF EXISTS git_source_acquisitions;
+             DROP TABLE IF EXISTS git_source_acquisition_sequence;
+             DROP TABLE IF EXISTS git_source_maintenance;
+             DROP TABLE IF EXISTS git_source_members;
+             DROP TABLE IF EXISTS git_source_roots;
+             DROP TABLE IF EXISTS ready_publication_fence_members;
              DROP TABLE IF EXISTS ready_publication_fences;
              DROP TABLE IF EXISTS ready_publication_fence_sequence;
              DROP TABLE IF EXISTS artifact_base_retention;
@@ -2435,7 +2483,7 @@ mod tests {
             .fetch_one(&control)
             .await
             .unwrap(),
-            6
+            7
         );
         assert_eq!(sqlx::query_scalar::<_,i64>("SELECT count(*) FROM information_schema.tables WHERE table_schema=current_schema() AND table_name='artifact_gc_sweep'").fetch_one(&control).await.unwrap(), 1);
 
@@ -3507,7 +3555,7 @@ mod tests {
             .fetch_one(migrated_v2.pool())
             .await
             .unwrap(),
-            6
+            7
         );
 
         reset(&control).await;
@@ -3530,7 +3578,7 @@ mod tests {
             .fetch_one(migrated_v4.pool())
             .await
             .unwrap(),
-            6
+            7
         );
 
         reset(&control).await;
