@@ -158,11 +158,11 @@ async fn validate_table(c: &mut MySqlConnection, table: &str) -> Result<()> {
         bail!("mysql v7 source constraint definitions differ: {table}")
     }
     for (name, clause) in expected_checks(table) {
-        let stored:Option<String>=sqlx::query_scalar("SELECT lower(check_clause) FROM information_schema.check_constraints WHERE constraint_schema=DATABASE() AND constraint_name=?").bind(name).fetch_optional(&mut *c).await?;
-        if stored.as_deref().map(normalize_mysql_check).as_deref()
-            != Some(normalize_mysql_check(clause).as_str())
-        {
-            bail!("mysql v7 source CHECK differs: {name}")
+        let stored:Option<String>=sqlx::query_scalar("SELECT check_clause FROM information_schema.check_constraints WHERE constraint_schema=DATABASE() AND constraint_name=?").bind(name).fetch_optional(&mut *c).await?;
+        let actual = stored.as_deref().map(normalize_mysql_check);
+        let expected = normalize_mysql_check(clause);
+        if actual.as_deref() != Some(expected.as_str()) {
+            bail!("mysql v7 source CHECK differs: {name}; actual={actual:?}; expected={expected}")
         }
     }
     let mut fks:Vec<(String,String,String,String)>=sqlx::query_as("SELECT r.constraint_name,r.referenced_table_name,r.delete_rule,GROUP_CONCAT(CONCAT(k.column_name,'=',k.referenced_column_name) ORDER BY k.ordinal_position) FROM information_schema.referential_constraints r JOIN information_schema.key_column_usage k ON k.constraint_schema=r.constraint_schema AND k.table_name=r.table_name AND k.constraint_name=r.constraint_name WHERE r.constraint_schema=DATABASE() AND r.table_name=? GROUP BY r.constraint_name,r.referenced_table_name,r.delete_rule ORDER BY r.constraint_name").bind(table).fetch_all(&mut *c).await?;
@@ -309,11 +309,146 @@ fn expected_checks(table: &str) -> &'static [(&'static str, &'static str)] {
     }
 }
 fn normalize_mysql_check(v: &str) -> String {
-    v.to_lowercase()
-        .replace("_utf8mb4", "")
-        .chars()
-        .filter(|c| !c.is_whitespace() && *c != '`' && *c != '(' && *c != ')' && *c != '\\')
-        .collect()
+    let mut normalized = String::with_capacity(v.len());
+    let mut quoted = false;
+    for c in v.chars() {
+        if c == '\\' {
+            continue;
+        } else if c == '\'' {
+            quoted = !quoted;
+            normalized.push(c);
+        } else if quoted {
+            normalized.push(c);
+        } else if c != '`' {
+            normalized.push(c.to_ascii_lowercase());
+        }
+    }
+    normalized = normalized.replace("_utf8mb4", "");
+    let parenthesized = normalize_mysql_parentheses(&normalized);
+    let mut compact = String::with_capacity(parenthesized.len());
+    let mut quoted = false;
+    for c in parenthesized.chars() {
+        if c == '\'' {
+            quoted = !quoted;
+            compact.push(c);
+        } else if quoted || !c.is_whitespace() {
+            compact.push(c);
+        }
+    }
+    compact
+}
+
+fn normalize_mysql_parentheses(value: &str) -> String {
+    fn matching(chars: &[char], open: usize) -> Option<usize> {
+        let mut depth = 0_i64;
+        let mut quoted = false;
+        for (index, c) in chars.iter().enumerate().skip(open) {
+            if *c == '\'' {
+                quoted = !quoted;
+            } else if !quoted {
+                match c {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(index);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        None
+    }
+
+    fn has_boolean(chars: &[char]) -> bool {
+        let mut depth = 0_i64;
+        let mut quoted = false;
+        let mut word = String::new();
+        let mut between = false;
+        let finish_word = |word: &mut String, between: &mut bool| -> bool {
+            let logical = match word.as_str() {
+                "between" => {
+                    *between = true;
+                    false
+                }
+                "and" if *between => {
+                    *between = false;
+                    false
+                }
+                "and" | "or" => true,
+                _ => false,
+            };
+            word.clear();
+            logical
+        };
+        for c in chars {
+            if *c == '\'' {
+                if depth == 0 && finish_word(&mut word, &mut between) {
+                    return true;
+                }
+                quoted = !quoted;
+            } else if !quoted {
+                match c {
+                    '(' => {
+                        if depth == 0 && finish_word(&mut word, &mut between) {
+                            return true;
+                        }
+                        depth += 1;
+                    }
+                    ')' => {
+                        if depth == 0 && finish_word(&mut word, &mut between) {
+                            return true;
+                        }
+                        depth -= 1;
+                    }
+                    c if depth == 0 && (c.is_ascii_alphanumeric() || *c == '_') => word.push(*c),
+                    _ if depth == 0 && finish_word(&mut word, &mut between) => return true,
+                    _ => {}
+                }
+            }
+        }
+        finish_word(&mut word, &mut between)
+    }
+
+    fn recurse(chars: &[char]) -> String {
+        if chars.first() == Some(&'(') && matching(chars, 0) == Some(chars.len() - 1) {
+            return recurse(&chars[1..chars.len() - 1]);
+        }
+        let mut output = String::new();
+        let mut index = 0;
+        while index < chars.len() {
+            if chars[index] != '(' {
+                output.push(chars[index]);
+                index += 1;
+                continue;
+            }
+            let close =
+                matching(chars, index).expect("validated MySQL CHECK has balanced parentheses");
+            let content = recurse(&chars[index + 1..close]);
+            let token = output
+                .chars()
+                .rev()
+                .skip_while(|c| c.is_whitespace())
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect::<String>();
+            let call_or_list = !token.is_empty() && !matches!(token.as_str(), "and" | "or" | "not");
+            if call_or_list || has_boolean(&chars[index + 1..close]) {
+                output.push('(');
+                output.push_str(&content);
+                output.push(')');
+            } else {
+                output.push_str(&content);
+            }
+            index = close + 1;
+        }
+        output
+    }
+
+    recurse(&value.chars().collect::<Vec<_>>())
 }
 fn fk(rows: &[(&str, &str, &str, &str)]) -> Vec<(String, String, String, String)> {
     let mut v = rows
@@ -543,12 +678,12 @@ pub(crate) async fn validate_mysql_v7_state(c: &mut MySqlConnection) -> Result<(
     let invalid:i64=sqlx::query_scalar("SELECT
       (SELECT count(*) FROM git_source_roots r WHERE r.root_hash NOT REGEXP '^[0-9a-f]{64}$' OR r.semantic_digest NOT REGEXP '^[0-9a-f]{64}$' OR r.object_set_digest NOT REGEXP '^[0-9a-f]{64}$' OR (r.object_format='sha1' AND r.commit_oid NOT REGEXP '^[0-9a-f]{40}$') OR (r.object_format='sha256' AND r.commit_oid NOT REGEXP '^[0-9a-f]{64}$') OR NOT EXISTS(SELECT 1 FROM git_source_members m WHERE m.root_hash=r.root_hash GROUP BY m.root_hash HAVING MIN(m.ordinal)=0 AND MAX(m.ordinal)+1=count(*) AND MOD(count(*),2)=0 AND SUM(m.child_len)=r.total_bytes AND SUM(CASE WHEN (MOD(m.ordinal,2)=0 AND m.kind='pack') OR (MOD(m.ordinal,2)=1 AND m.kind='index') THEN 0 ELSE 1 END)=0))+
       (SELECT count(*) FROM git_source_members WHERE child_hash NOT REGEXP '^[0-9a-f]{64}$')+(SELECT count(*) FROM git_source_acquisition_members WHERE child_hash NOT REGEXP '^[0-9a-f]{64}$')+
-      (SELECT count(*) FROM git_source_acquisitions a WHERE token NOT REGEXP '^[0-9a-f]{64}$' OR (root_hash IS NOT NULL AND root_hash NOT REGEXP '^[0-9a-f]{64}$') OR (semantic_digest IS NOT NULL AND semantic_digest NOT REGEXP '^[0-9a-f]{64}$') OR (object_set_digest IS NOT NULL AND object_set_digest NOT REGEXP '^[0-9a-f]{64}$') OR (state IN('held','graph_published','activation_unknown') AND active_identity IS NULL) OR (state IN('registered','failed') AND active_identity IS NOT NULL) OR (state='held' AND EXISTS(SELECT 1 FROM git_source_acquisition_members m WHERE m.token=a.token)) OR (state IN('graph_published','activation_unknown','registered') AND NOT EXISTS(SELECT 1 FROM git_source_acquisition_members m WHERE m.token=a.token)) OR EXISTS(SELECT 1 FROM git_source_acquisition_members m WHERE m.token=a.token GROUP BY m.token HAVING MIN(m.ordinal)<>0 OR MAX(m.ordinal)+1<>count(*) OR MOD(count(*),2)<>0 OR SUM(m.child_len)<>a.total_bytes))+
-      (SELECT count(*) FROM git_source_acquisitions a LEFT JOIN git_source_roots r ON r.root_hash=a.root_hash WHERE a.state='registered' AND (r.root_hash IS NULL OR r.state<>'registered' OR r.registration_operation<>a.operation_id OR r.registration_generation<>a.generation OR r.workspace<>a.workspace OR r.repo<>a.repo OR r.commit_oid<>a.commit_oid OR r.source_format_version<>a.source_format_version OR r.root_len<>a.root_len OR r.semantic_digest<>a.semantic_digest OR r.object_set_digest<>a.object_set_digest OR r.object_count<>a.object_count OR r.total_bytes<>a.total_bytes))+
+      (SELECT count(*) FROM git_source_acquisitions a WHERE token NOT REGEXP '^[0-9a-f]{64}$' OR (root_hash IS NOT NULL AND root_hash NOT REGEXP '^[0-9a-f]{64}$') OR (semantic_digest IS NOT NULL AND semantic_digest NOT REGEXP '^[0-9a-f]{64}$') OR (object_set_digest IS NOT NULL AND object_set_digest NOT REGEXP '^[0-9a-f]{64}$') OR (state IN('held','graph_published','activation_unknown') AND active_identity IS NULL) OR (state IN('registered','failed') AND active_identity IS NOT NULL) OR (state='held' AND EXISTS(SELECT 1 FROM git_source_acquisition_members m WHERE m.token=a.token)) OR (state IN('graph_published','activation_unknown','registered') AND NOT EXISTS(SELECT 1 FROM git_source_acquisition_members m WHERE m.token=a.token)) OR EXISTS(SELECT 1 FROM git_source_acquisition_members m WHERE m.token=a.token GROUP BY m.token HAVING MIN(m.ordinal)<>0 OR MAX(m.ordinal)+1<>count(*) OR MOD(count(*),2)<>0 OR SUM(m.child_len)<>a.total_bytes OR SUM(CASE WHEN (MOD(m.ordinal,2)=0 AND m.kind='pack') OR (MOD(m.ordinal,2)=1 AND m.kind='index') THEN 0 ELSE 1 END)<>0))+
+      (SELECT count(*) FROM git_source_acquisitions a LEFT JOIN git_source_roots r ON r.root_hash=a.root_hash WHERE a.state='registered' AND (r.root_hash IS NULL OR r.state<>'registered' OR r.registration_operation<>a.operation_id OR r.registration_generation<>a.generation OR r.workspace<>a.workspace OR r.repo<>a.repo OR r.commit_oid<>a.commit_oid OR r.source_format_version<>a.source_format_version OR r.root_len<>a.root_len OR r.object_format<>a.object_format OR r.semantic_digest<>a.semantic_digest OR r.object_set_digest<>a.object_set_digest OR r.object_count<>a.object_count OR r.total_bytes<>a.total_bytes))+
       (SELECT count(*) FROM git_source_desires d LEFT JOIN git_source_acquisitions a ON a.token=d.acquisition_token LEFT JOIN git_source_roots r ON r.root_hash=d.root_hash WHERE d.source_format_version<>1 OR (d.state='acquiring' AND (a.token IS NULL OR a.workspace<>d.workspace OR a.repo<>d.repo OR a.commit_oid<>d.commit_oid OR a.state NOT IN('held','graph_published','activation_unknown'))) OR (d.state='registered' AND (r.root_hash IS NULL OR r.workspace<>d.workspace OR r.repo<>d.repo OR r.commit_oid<>d.commit_oid OR r.state<>'registered')))+
       (SELECT count(*) FROM branch_source_current current JOIN branch_source_generations g ON g.workspace=current.workspace AND g.repo=current.repo AND g.branch=current.branch AND g.generation=current.generation LEFT JOIN branch_observations b ON b.workspace=current.workspace AND b.repo=current.repo AND b.branch=current.branch WHERE b.workspace IS NULL OR b.generation<>g.generation OR b.desired_commit<>g.commit_oid)+
       (SELECT count(*) FROM git_source_consumers c LEFT JOIN git_source_roots r ON r.root_hash=c.root_hash AND r.workspace=c.workspace AND r.repo=c.repo AND r.commit_oid=c.commit_oid AND r.source_format_version=c.source_format_version WHERE r.root_hash IS NULL OR c.session_id NOT REGEXP '^[0-9a-f]{64}$')+
-      (SELECT count(*) FROM artifact_intents i LEFT JOIN git_source_consumers c ON c.consumer_id=i.consumer_id AND c.root_hash=i.source_root_hash AND c.purpose='intent' LEFT JOIN artifact_jobs j ON j.id=i.artifact_id WHERE c.root_hash IS NULL OR i.consumer_id NOT REGEXP '^intent:[0-9a-f]{48}$' OR c.expires_at<>9223372036854775807 OR (i.state='deferred' AND (i.artifact_id IS NOT NULL OR EXISTS(SELECT 1 FROM artifact_consumers ac WHERE ac.consumer_id=i.consumer_id))) OR (i.state='promoted' AND (j.id IS NULL OR j.workspace<>i.workspace OR j.repo<>i.repo OR j.commit_oid<>i.commit_oid OR j.kind<>i.kind OR j.format_version<>i.format_version OR NOT EXISTS(SELECT 1 FROM artifact_consumers ac WHERE ac.artifact_id=i.artifact_id AND ac.consumer_id=i.consumer_id AND ac.expires_at=9223372036854775807))))").fetch_one(&mut *c).await?;
+      (SELECT count(*) FROM artifact_intents i LEFT JOIN branch_source_generations g ON g.workspace=i.workspace AND g.repo=i.repo AND g.branch=i.branch AND g.generation=i.branch_generation LEFT JOIN git_source_consumers c ON c.consumer_id=i.consumer_id AND c.root_hash=i.source_root_hash AND c.purpose='intent' LEFT JOIN artifact_jobs j ON j.id=i.artifact_id WHERE g.workspace IS NULL OR g.root_hash<>i.source_root_hash OR g.commit_oid<>i.commit_oid OR g.source_format_version<>i.source_format_version OR c.root_hash IS NULL OR i.consumer_id NOT REGEXP '^intent:[0-9a-f]{48}$' OR c.expires_at<>9223372036854775807 OR (SELECT count(*) FROM git_source_consumers sibling WHERE sibling.consumer_id=i.consumer_id)<>1 OR (SELECT count(*) FROM artifact_intents sibling WHERE sibling.consumer_id=i.consumer_id)<>1 OR (i.state='deferred' AND (i.artifact_id IS NOT NULL OR EXISTS(SELECT 1 FROM artifact_consumers ac WHERE ac.consumer_id=i.consumer_id))) OR (i.state='promoted' AND (j.id IS NULL OR j.workspace<>i.workspace OR j.repo<>i.repo OR j.commit_oid<>i.commit_oid OR j.kind<>i.kind OR j.format_version<>i.format_version OR (SELECT count(*) FROM artifact_consumers sibling WHERE sibling.consumer_id=i.consumer_id)<>1 OR NOT EXISTS(SELECT 1 FROM artifact_consumers ac WHERE ac.artifact_id=i.artifact_id AND ac.consumer_id=i.consumer_id AND ac.expires_at=9223372036854775807))))").fetch_one(&mut *c).await?;
     let reverse_invalid:i64=sqlx::query_scalar("SELECT
       (SELECT count(*) FROM git_source_roots r WHERE r.state='registered' AND (NOT EXISTS(SELECT 1 FROM git_source_acquisitions a WHERE a.state='registered' AND a.root_hash=r.root_hash AND a.operation_id=r.registration_operation AND a.generation=r.registration_generation) OR NOT EXISTS(SELECT 1 FROM git_source_desires d WHERE d.state='registered' AND d.root_hash=r.root_hash AND d.workspace=r.workspace AND d.repo=r.repo AND d.commit_oid=r.commit_oid AND d.source_format_version=r.source_format_version)))+
       (SELECT count(*) FROM git_source_acquisitions a WHERE (a.state IN('held','graph_published','activation_unknown') AND NOT EXISTS(SELECT 1 FROM git_source_desires d WHERE d.state='acquiring' AND d.acquisition_token=a.token AND d.workspace=a.workspace AND d.repo=a.repo AND d.commit_oid=a.commit_oid AND d.source_format_version=a.source_format_version)) OR (a.state='registered' AND NOT EXISTS(SELECT 1 FROM git_source_desires d WHERE d.state='registered' AND d.root_hash=a.root_hash AND d.workspace=a.workspace AND d.repo=a.repo AND d.commit_oid=a.commit_oid AND d.source_format_version=a.source_format_version)) OR (a.state='registered' AND (EXISTS(SELECT 1 FROM git_source_acquisition_members am LEFT JOIN git_source_members m ON m.root_hash=a.root_hash AND m.ordinal=am.ordinal WHERE am.token=a.token AND (m.ordinal IS NULL OR m.child_hash<>am.child_hash OR m.child_len<>am.child_len OR m.kind<>am.kind)) OR EXISTS(SELECT 1 FROM git_source_members m LEFT JOIN git_source_acquisition_members am ON am.token=a.token AND am.ordinal=m.ordinal WHERE m.root_hash=a.root_hash AND am.ordinal IS NULL))))+
@@ -999,7 +1134,11 @@ impl MysqlGitSourceRegistry {
             len: checked_u64(row.try_get("root_len")?, "root length")?,
         };
         let consumer = format!("builder:{artifact_id}:{session_id}");
-        sqlx::query("INSERT INTO git_source_consumers(root_hash,consumer_id,session_id,workspace,repo,commit_oid,source_format_version,purpose,expires_at) VALUES(?,?,?,?,?,?,?,'builder',UNIX_TIMESTAMP()+?) ON DUPLICATE KEY UPDATE expires_at=IF(session_id=VALUES(session_id) AND workspace=VALUES(workspace) AND repo=VALUES(repo) AND commit_oid=VALUES(commit_oid),VALUES(expires_at),expires_at)").bind(&root.hash).bind(&consumer).bind(session_id).bind(workspace).bind(repo).bind(commit).bind(SOURCE_FORMAT_VERSION as i64).bind(ttl).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO git_source_consumers(root_hash,consumer_id,session_id,workspace,repo,commit_oid,source_format_version,purpose,expires_at) VALUES(?,?,?,?,?,?,?,'builder',UNIX_TIMESTAMP()+?) ON DUPLICATE KEY UPDATE expires_at=IF(root_hash=VALUES(root_hash) AND consumer_id=VALUES(consumer_id) AND session_id=VALUES(session_id) AND workspace=VALUES(workspace) AND repo=VALUES(repo) AND commit_oid=VALUES(commit_oid) AND source_format_version=VALUES(source_format_version) AND purpose='builder',VALUES(expires_at),expires_at)").bind(&root.hash).bind(&consumer).bind(session_id).bind(workspace).bind(repo).bind(commit).bind(SOURCE_FORMAT_VERSION as i64).bind(ttl).execute(&mut *tx).await?;
+        let exact:i64=sqlx::query_scalar("SELECT count(*) FROM git_source_consumers WHERE root_hash=? AND consumer_id=? AND session_id=? AND workspace=? AND repo=? AND commit_oid=? AND source_format_version=? AND purpose='builder' AND expires_at>UNIX_TIMESTAMP()").bind(&root.hash).bind(&consumer).bind(session_id).bind(workspace).bind(repo).bind(commit).bind(SOURCE_FORMAT_VERSION as i64).fetch_one(&mut *tx).await?;
+        if exact != 1 {
+            bail!("builder source session is already bound to another identity")
+        }
         let object_format =
             parse_object_format(row.try_get::<String, _>("object_format")?.as_str())?;
         let generation: i64 = row.try_get("registration_generation")?;
@@ -1075,22 +1214,23 @@ impl MysqlGitSourceRegistry {
             let Some(row)=sqlx::query("SELECT workspace,repo,branch,branch_generation,commit_oid,kind,format_version,consumer_id FROM artifact_intents WHERE id=? AND state='deferred' FOR UPDATE").bind(id).fetch_optional(&mut *tx).await? else{tx.commit().await?;continue};
             let workspace: String = row.try_get("workspace")?;
             let kind = ArtifactKind::parse(row.try_get("kind")?)?;
-            if !mysql_capacity(&mut tx, &self.scheduler_limits, &workspace, kind).await? {
+            let repo: &str = row.try_get("repo")?;
+            let commit: &str = row.try_get("commit_oid")?;
+            let format: i64 = row.try_get("format_version")?;
+            let existing:Option<i64>=sqlx::query_scalar("SELECT id FROM artifact_jobs WHERE workspace=? AND repo=? AND commit_oid=? AND kind=? AND format_version=?").bind(&workspace).bind(repo).bind(commit).bind(kind.as_str()).bind(format).fetch_optional(&mut *tx).await?;
+            if existing.is_none()
+                && !mysql_capacity(&mut tx, &self.scheduler_limits, &workspace, kind).await?
+            {
                 // Persist rotation even when this workspace is saturated. A
                 // rollback here would pin every invocation to the same blocked
                 // prefix and recreate starvation across page boundaries.
                 tx.commit().await?;
                 continue;
             }
-            let artifact = mysql_ensure_job(
-                &mut tx,
-                &workspace,
-                row.try_get("repo")?,
-                row.try_get("commit_oid")?,
-                kind,
-                row.try_get("format_version")?,
-            )
-            .await?;
+            let artifact = match existing {
+                Some(id) => id,
+                None => mysql_ensure_job(&mut tx, &workspace, repo, commit, kind, format).await?,
+            };
             sqlx::query("UPDATE artifact_intents SET state='promoted',artifact_id=?,updated_at=UNIX_TIMESTAMP() WHERE id=? AND state='deferred'").bind(artifact).bind(id).execute(&mut *tx).await?;
             sqlx::query("INSERT INTO artifact_consumers(artifact_id,consumer_id,expires_at) VALUES(?,?,?) ON DUPLICATE KEY UPDATE expires_at=VALUES(expires_at)").bind(artifact).bind(row.try_get::<String,_>("consumer_id")?).bind(SOURCE_INTENT_RETENTION_EXPIRY).execute(&mut *tx).await?;
             mysql_upsert_observation(
@@ -1163,13 +1303,13 @@ impl MysqlGitSourceRegistry {
         }
         let mut tx = self.pool.begin().await?;
         let mut changed=sqlx::query("DELETE FROM git_source_consumers WHERE purpose='builder' AND expires_at<=UNIX_TIMESTAMP() ORDER BY expires_at,root_hash,consumer_id LIMIT ?").bind(limit as i64).execute(&mut *tx).await?.rows_affected();
-        changed+=sqlx::query("DELETE g FROM branch_source_generations g LEFT JOIN branch_source_current c ON c.workspace=g.workspace AND c.repo=g.repo AND c.branch=g.branch AND c.generation=g.generation LEFT JOIN artifact_intents i ON i.workspace=g.workspace AND i.repo=g.repo AND i.branch=g.branch AND i.branch_generation=g.generation WHERE c.workspace IS NULL AND i.id IS NULL ORDER BY g.created_at,g.workspace,g.repo,g.branch,g.generation LIMIT ?").bind(limit as i64).execute(&mut *tx).await?.rows_affected();
+        changed+=sqlx::query("DELETE FROM branch_source_generations WHERE (workspace,repo,branch,generation) IN (SELECT workspace,repo,branch,generation FROM (SELECT g.workspace,g.repo,g.branch,g.generation FROM branch_source_generations g LEFT JOIN branch_source_current c ON c.workspace=g.workspace AND c.repo=g.repo AND c.branch=g.branch AND c.generation=g.generation LEFT JOIN artifact_intents i ON i.workspace=g.workspace AND i.repo=g.repo AND i.branch=g.branch AND i.branch_generation=g.generation WHERE c.workspace IS NULL AND i.id IS NULL ORDER BY g.created_at,g.workspace,g.repo,g.branch,g.generation LIMIT ?) victims)").bind(limit as i64).execute(&mut *tx).await?.rows_affected();
         let cutoff: i64 = sqlx::query_scalar(
             "SELECT GREATEST(0,generation-1024) FROM git_source_acquisition_sequence WHERE id=1",
         )
         .fetch_one(&mut *tx)
         .await?;
-        changed+=sqlx::query("DELETE a FROM git_source_acquisitions a LEFT JOIN git_source_desires d ON d.acquisition_token=a.token WHERE a.state='failed' AND a.generation<=? AND d.acquisition_token IS NULL ORDER BY a.generation LIMIT ?").bind(cutoff).bind(limit as i64).execute(&mut *tx).await?.rows_affected();
+        changed+=sqlx::query("DELETE FROM git_source_acquisitions WHERE token IN (SELECT token FROM (SELECT a.token FROM git_source_acquisitions a LEFT JOIN git_source_desires d ON d.acquisition_token=a.token WHERE a.state='failed' AND a.generation<=? AND d.acquisition_token IS NULL ORDER BY a.generation LIMIT ?) victims)").bind(cutoff).bind(limit as i64).execute(&mut *tx).await?.rows_affected();
         tx.commit().await?;
         Ok(changed)
     }
@@ -1824,6 +1964,92 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        let deferred=sqlx::query("SELECT id,workspace,repo,commit_oid,kind,format_version FROM artifact_intents WHERE workspace='ws' AND state='deferred' ORDER BY id LIMIT 1").fetch_one(&pool).await.unwrap();
+        let existing_artifact=sqlx::query("INSERT INTO artifact_jobs(workspace,repo,commit_oid,kind,format_version,state,created_at,updated_at) VALUES(?,?,?,?,?,'queued',UNIX_TIMESTAMP(),UNIX_TIMESTAMP())")
+            .bind(deferred.try_get::<String,_>("workspace").unwrap())
+            .bind(deferred.try_get::<String,_>("repo").unwrap())
+            .bind(deferred.try_get::<String,_>("commit_oid").unwrap())
+            .bind(deferred.try_get::<String,_>("kind").unwrap())
+            .bind(deferred.try_get::<i64,_>("format_version").unwrap())
+            .execute(&pool)
+            .await
+            .unwrap()
+            .last_insert_id() as i64;
+        assert_eq!(
+            registry.promote_deferred_page(1).await.unwrap(),
+            1,
+            "a deferred intent did not reuse an existing job at capacity"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, Option<i64>>(
+                "SELECT artifact_id FROM artifact_intents WHERE id=? AND state='promoted'"
+            )
+            .bind(deferred.try_get::<i64, _>("id").unwrap())
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            Some(existing_artifact)
+        );
+
+        let promoted:Vec<i64>=sqlx::query_scalar("SELECT artifact_id FROM artifact_intents WHERE workspace='ws' AND state='promoted' ORDER BY id LIMIT 2").fetch_all(&pool).await.unwrap();
+        assert_eq!(promoted.len(), 2);
+        for (ordinal, artifact) in promoted.iter().enumerate() {
+            sqlx::query("UPDATE artifact_jobs SET state='running',owner=?,heartbeat_at=UNIX_TIMESTAMP(),lease_expires_at=UNIX_TIMESTAMP()+60,lease_generation=1,claim_attempts=1 WHERE id=?")
+                .bind(format!("builder-{ordinal}"))
+                .bind(artifact)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        let shared_session = "e".repeat(64);
+        registry
+            .claim_authenticated(
+                promoted[0],
+                "builder-0",
+                1,
+                "ws",
+                "o/r",
+                &"a".repeat(40),
+                &shared_session,
+                60,
+            )
+            .await
+            .unwrap();
+        assert!(
+            registry
+                .claim_authenticated(
+                    promoted[1],
+                    "builder-1",
+                    1,
+                    "ws",
+                    "o/r",
+                    &"a".repeat(40),
+                    &shared_session,
+                    60,
+                )
+                .await
+                .is_err(),
+            "builder session collision returned authority without an exact lease"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM git_source_consumers WHERE session_id=?"
+            )
+            .bind(&shared_session)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            1
+        );
+        sqlx::query("UPDATE git_source_consumers SET expires_at=0 WHERE session_id=?")
+            .bind(&shared_session)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            registry.prune_metadata_page(16).await.unwrap() >= 1,
+            "expired builder metadata was not pruned"
+        );
         validate_mysql_v7_state(&mut pool.acquire().await.unwrap().detach())
             .await
             .unwrap();
@@ -1832,6 +2058,31 @@ mod tests {
         // cross-row proofs. Startup validation must reject every malformed
         // hybrid, while a rollback proves the negative test is non-destructive.
         let mut corrupt = pool.acquire().await.unwrap().detach();
+        sqlx::raw_sql("START TRANSACTION")
+            .execute(&mut corrupt)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE git_source_acquisitions SET operation_id='planted-operation' WHERE token=?",
+        )
+        .bind(snapshot.registration_token())
+        .execute(&mut corrupt)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE git_source_roots SET registration_operation='planted-operation' WHERE root_hash=?")
+            .bind(snapshot.manifest())
+            .execute(&mut corrupt)
+            .await
+            .unwrap();
+        assert!(
+            validate_mysql_v7_state(&mut corrupt).await.is_err(),
+            "non-deterministic acquisition operation provenance was accepted"
+        );
+        sqlx::raw_sql("ROLLBACK")
+            .execute(&mut corrupt)
+            .await
+            .unwrap();
+
         sqlx::raw_sql("START TRANSACTION")
             .execute(&mut corrupt)
             .await
@@ -1845,6 +2096,69 @@ mod tests {
         assert!(
             validate_mysql_v7_state(&mut corrupt).await.is_err(),
             "registered acquisition/root descriptor disagreement was accepted"
+        );
+        sqlx::raw_sql("ROLLBACK")
+            .execute(&mut corrupt)
+            .await
+            .unwrap();
+
+        sqlx::raw_sql("START TRANSACTION")
+            .execute(&mut corrupt)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE git_source_acquisition_members SET kind='index' WHERE token=? AND ordinal=0",
+        )
+        .bind(snapshot.registration_token())
+        .execute(&mut corrupt)
+        .await
+        .unwrap();
+        assert!(
+            validate_mysql_v7_state(&mut corrupt).await.is_err(),
+            "provisional pack/index parity corruption was accepted"
+        );
+        sqlx::raw_sql("ROLLBACK")
+            .execute(&mut corrupt)
+            .await
+            .unwrap();
+
+        sqlx::raw_sql("START TRANSACTION")
+            .execute(&mut corrupt)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE git_source_acquisitions SET object_format='sha256' WHERE token=?")
+            .bind(snapshot.registration_token())
+            .execute(&mut corrupt)
+            .await
+            .unwrap();
+        assert!(
+            validate_mysql_v7_state(&mut corrupt).await.is_err(),
+            "registered acquisition/root object-format mismatch was accepted"
+        );
+        sqlx::raw_sql("ROLLBACK")
+            .execute(&mut corrupt)
+            .await
+            .unwrap();
+
+        let shared_consumer: String = sqlx::query_scalar(
+            "SELECT consumer_id FROM artifact_intents WHERE workspace='ws' ORDER BY id LIMIT 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql("START TRANSACTION")
+            .execute(&mut corrupt)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO artifact_intents(workspace,repo,branch,branch_generation,source_root_hash,source_format_version,commit_oid,kind,format_version,state,artifact_id,consumer_id,created_at,updated_at) SELECT workspace,repo,branch,branch_generation,source_root_hash,source_format_version,commit_oid,'full_history',format_version,'deferred',NULL,?,created_at,updated_at FROM artifact_intents WHERE consumer_id=? LIMIT 1")
+            .bind(&shared_consumer)
+            .bind(&shared_consumer)
+            .execute(&mut corrupt)
+            .await
+            .unwrap();
+        assert!(
+            validate_mysql_v7_state(&mut corrupt).await.is_err(),
+            "one source consumer was accepted for multiple intents"
         );
         sqlx::raw_sql("ROLLBACK")
             .execute(&mut corrupt)

@@ -3478,7 +3478,7 @@ mod tests {
             .fetch_one(&control)
             .await
             .unwrap(),
-            6
+            7
         );
         assert_eq!(sqlx::query_scalar::<_,i64>("SELECT count(*) FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name='artifact_gc_sweep'").fetch_one(&control).await.unwrap(), 1);
 
@@ -4307,7 +4307,7 @@ mod tests {
             .fetch_one(migrated_v2.pool())
             .await
             .unwrap(),
-            6
+            7
         );
 
         reset(&control).await;
@@ -4336,7 +4336,7 @@ mod tests {
             .fetch_one(migrated_v4.pool())
             .await
             .unwrap(),
-            6
+            7
         );
 
         for stage in ["marker_only", "base_only", "both_empty", "partial", "full"] {
@@ -4421,7 +4421,7 @@ mod tests {
                 .fetch_one(&control)
                 .await
                 .unwrap(),
-                6
+                7
             );
             let rows:Vec<(String,Option<i16>,Option<i16>)>=sqlx::query_as("SELECT j.kind,r.head_rank,r.pair_rank FROM artifact_base_retention r JOIN artifact_jobs j ON j.id=r.artifact_id ORDER BY j.kind").fetch_all(&control).await.unwrap();
             assert_eq!(
@@ -4524,7 +4524,7 @@ mod tests {
                 .fetch_one(&control)
                 .await
                 .unwrap(),
-                6
+                7
             );
             assert_eq!(sqlx::query_scalar::<_,i64>("SELECT count(*) FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name='artifact_transport_leases'").fetch_one(&control).await.unwrap(),1);
             let rows:Vec<(String,Option<i16>,Option<i16>)>=sqlx::query_as("SELECT j.kind,r.head_rank,r.pair_rank FROM artifact_base_retention r JOIN artifact_jobs j ON j.id=r.artifact_id ORDER BY j.kind").fetch_all(&control).await.unwrap();
@@ -5153,6 +5153,25 @@ mod tests {
             .await
             .is_err(),
             "same-count weakened v7 CHECK was accepted"
+        );
+        reset(&control).await;
+        MysqlArtifactScheduler::from_pool(
+            MySqlPoolOptions::new().connect(&url).await.unwrap(),
+            Default::default(),
+            Arc::new(Accept),
+        )
+        .await
+        .unwrap();
+        sqlx::raw_sql("ALTER TABLE git_source_roots DROP CHECK git_source_roots_shape,ADD CONSTRAINT git_source_roots_shape CHECK(root_len>0 AND source_format_version BETWEEN 1 AND 4294967295 AND object_format IN('sha1','sha256') AND CHAR_LENGTH(semantic_digest)=64 AND CHAR_LENGTH(object_set_digest)=64 AND object_count>0 AND total_bytes>0 AND registration_generation>0 AND state IN('REGISTERED','quarantined'))").execute(&control).await.unwrap();
+        assert!(
+            MysqlArtifactScheduler::from_pool(
+                MySqlPoolOptions::new().connect(&url).await.unwrap(),
+                Default::default(),
+                Arc::new(Accept)
+            )
+            .await
+            .is_err(),
+            "binary-collation CHECK literal mutation was accepted"
         );
         reset(&control).await;
         MysqlArtifactScheduler::from_pool(
