@@ -3290,6 +3290,19 @@ mod tests {
     use super::*;
     use sqlx::mysql::MySqlPoolOptions;
 
+    fn mysql_test_url(test: &str) -> Option<String> {
+        match std::env::var("RIPCLONE_TEST_MYSQL_URL") {
+            Ok(url) => Some(url),
+            Err(_) if std::env::var_os("RIPCLONE_REQUIRE_MYSQL_TESTS").is_some() => {
+                panic!("{test} requires RIPCLONE_TEST_MYSQL_URL")
+            }
+            Err(_) => {
+                eprintln!("SKIP {test}: RIPCLONE_TEST_MYSQL_URL unset");
+                None
+            }
+        }
+    }
+
     struct Accept;
     impl CompletionVerifier for Accept {
         fn identity(&self) -> &'static str {
@@ -3330,6 +3343,7 @@ mod tests {
 
     async fn reset(pool: &MySqlPool) {
         for statement in [
+            "DROP TABLE IF EXISTS external_source_child",
             "DROP TABLE IF EXISTS external_scheduler_child",
             "DROP TABLE IF EXISTS artifact_intents",
             "DROP TABLE IF EXISTS git_source_consumers",
@@ -3416,10 +3430,7 @@ mod tests {
     /// CI must set RIPCLONE_TEST_MYSQL_URL and run this exact test name.
     #[tokio::test]
     async fn mysql_artifact_scheduler_live_conformance() {
-        let Ok(url) = std::env::var("RIPCLONE_TEST_MYSQL_URL") else {
-            eprintln!(
-                "SKIP mysql_artifact_scheduler_live_conformance: RIPCLONE_TEST_MYSQL_URL unset"
-            );
+        let Some(url) = mysql_test_url("mysql_artifact_scheduler_live_conformance") else {
             return;
         };
         let control = MySqlPoolOptions::new()
@@ -4792,7 +4803,7 @@ mod tests {
 
     #[tokio::test]
     async fn mysql_v6_transition_boundaries_live() {
-        let Ok(url) = std::env::var("RIPCLONE_TEST_MYSQL_URL") else {
+        let Some(url) = mysql_test_url("mysql_v6_transition_boundaries_live") else {
             return;
         };
         let control = MySqlPoolOptions::new()
@@ -5007,7 +5018,7 @@ mod tests {
 
     #[tokio::test]
     async fn mysql_v7_source_registry_transition_live() {
-        let Ok(url) = std::env::var("RIPCLONE_TEST_MYSQL_URL") else {
+        let Some(url) = mysql_test_url("mysql_v7_source_registry_transition_live") else {
             return;
         };
         let control = MySqlPoolOptions::new()
@@ -5124,6 +5135,76 @@ mod tests {
             V6_TO_V7_DDL
         );
         assert_eq!(sqlx::query_scalar::<_,String>("SELECT lower(column_type) FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name='git_source_roots' AND column_name='semantic_digest'").fetch_one(&control).await.unwrap(),"varchar(63)");
+        reset(&control).await;
+        MysqlArtifactScheduler::from_pool(
+            MySqlPoolOptions::new().connect(&url).await.unwrap(),
+            Default::default(),
+            Arc::new(Accept),
+        )
+        .await
+        .unwrap();
+        sqlx::raw_sql("ALTER TABLE git_source_roots DROP CHECK git_source_roots_shape,ADD CONSTRAINT git_source_roots_shape CHECK(true)").execute(&control).await.unwrap();
+        assert!(
+            MysqlArtifactScheduler::from_pool(
+                MySqlPoolOptions::new().connect(&url).await.unwrap(),
+                Default::default(),
+                Arc::new(Accept)
+            )
+            .await
+            .is_err(),
+            "same-count weakened v7 CHECK was accepted"
+        );
+        reset(&control).await;
+        MysqlArtifactScheduler::from_pool(
+            MySqlPoolOptions::new().connect(&url).await.unwrap(),
+            Default::default(),
+            Arc::new(Accept),
+        )
+        .await
+        .unwrap();
+        sqlx::raw_sql("ALTER TABLE git_source_members DROP FOREIGN KEY git_source_members_root")
+            .execute(&control)
+            .await
+            .unwrap();
+        sqlx::raw_sql("ALTER TABLE git_source_members ADD CONSTRAINT git_source_members_root FOREIGN KEY(root_hash) REFERENCES git_source_roots(root_hash) ON DELETE CASCADE").execute(&control).await.unwrap();
+        assert!(
+            MysqlArtifactScheduler::from_pool(
+                MySqlPoolOptions::new().connect(&url).await.unwrap(),
+                Default::default(),
+                Arc::new(Accept)
+            )
+            .await
+            .is_err(),
+            "wrong v7 FK delete rule was accepted"
+        );
+        reset(&control).await;
+        MysqlArtifactScheduler::from_pool(
+            MySqlPoolOptions::new().connect(&url).await.unwrap(),
+            Default::default(),
+            Arc::new(Accept),
+        )
+        .await
+        .unwrap();
+        sqlx::raw_sql(
+            "CREATE TABLE external_source_child(
+               root_hash VARCHAR(64) NOT NULL PRIMARY KEY,
+               CONSTRAINT external_source_fk FOREIGN KEY(root_hash)
+                 REFERENCES git_source_roots(root_hash) ON DELETE RESTRICT
+             ) ENGINE=InnoDB DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin",
+        )
+        .execute(&control)
+        .await
+        .unwrap();
+        assert!(
+            MysqlArtifactScheduler::from_pool(
+                MySqlPoolOptions::new().connect(&url).await.unwrap(),
+                Default::default(),
+                Arc::new(Accept)
+            )
+            .await
+            .is_err(),
+            "external incoming v7 FK was accepted"
+        );
         reset(&control).await;
         let _: Option<i64> =
             sqlx::query_scalar("SELECT RELEASE_LOCK('ripclone_mysql_scheduler_test')")

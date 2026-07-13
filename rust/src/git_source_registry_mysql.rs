@@ -34,7 +34,7 @@ pub(crate) async fn validate_mysql_v7_prefix(
     c: &mut MySqlConnection,
     complete: bool,
 ) -> Result<()> {
-    let names:Vec<String>=sqlx::query_scalar("SELECT table_name FROM information_schema.tables WHERE table_schema=DATABASE() AND (table_name LIKE 'git\\_source\\_%' ESCAPE '\\\\' OR table_name IN('branch_source_generations','branch_source_current','artifact_intents')) ORDER BY table_name").fetch_all(&mut *c).await?;
+    let names:Vec<String>=sqlx::query_scalar("SELECT table_name FROM information_schema.tables WHERE table_schema=DATABASE() AND (table_name LIKE 'git\\_source\\_%' ESCAPE '\\\\' OR table_name LIKE 'branch\\_source\\_%' ESCAPE '\\\\' OR table_name LIKE 'artifact\\_intents%' ESCAPE '\\\\') ORDER BY table_name").fetch_all(&mut *c).await?;
     let mut prefix = 0usize;
     for (position, table) in TABLES.iter().enumerate() {
         if names.iter().any(|name| name == table) {
@@ -50,6 +50,12 @@ pub(crate) async fn validate_mysql_v7_prefix(
     }
     if complete && prefix != TABLES.len() {
         bail!("mysql v7 source registry is incomplete")
+    }
+    if complete {
+        let incoming:i64=sqlx::query_scalar("SELECT count(DISTINCT CONCAT(k.table_name,CHAR(0),k.constraint_name)) FROM information_schema.key_column_usage k WHERE k.referenced_table_schema=DATABASE() AND k.referenced_table_name IN('git_source_roots','git_source_acquisitions','branch_source_generations','artifact_intents','git_source_consumers','git_source_members','git_source_desires')").fetch_one(&mut *c).await?;
+        if incoming != 9 {
+            bail!("mysql v7 source registry has external or missing reverse foreign keys")
+        }
     }
     Ok(())
 }
@@ -146,7 +152,245 @@ async fn validate_table(c: &mut MySqlConnection, table: &str) -> Result<()> {
     if constraints != expected_constraints {
         bail!("mysql v7 source constraint inventory differs: {table}")
     }
+    let mut actual:Vec<(String,String)>=sqlx::query_as("SELECT constraint_name,constraint_type FROM information_schema.table_constraints WHERE constraint_schema=DATABASE() AND table_name=? ORDER BY constraint_name").bind(table).fetch_all(&mut *c).await?;
+    actual.sort();
+    if actual != expected_constraint_inventory(table) {
+        bail!("mysql v7 source constraint definitions differ: {table}")
+    }
+    for (name, clause) in expected_checks(table) {
+        let stored:Option<String>=sqlx::query_scalar("SELECT lower(check_clause) FROM information_schema.check_constraints WHERE constraint_schema=DATABASE() AND constraint_name=?").bind(name).fetch_optional(&mut *c).await?;
+        if stored.as_deref().map(normalize_mysql_check).as_deref()
+            != Some(normalize_mysql_check(clause).as_str())
+        {
+            bail!("mysql v7 source CHECK differs: {name}")
+        }
+    }
+    let mut fks:Vec<(String,String,String,String)>=sqlx::query_as("SELECT r.constraint_name,r.referenced_table_name,r.delete_rule,GROUP_CONCAT(CONCAT(k.column_name,'=',k.referenced_column_name) ORDER BY k.ordinal_position) FROM information_schema.referential_constraints r JOIN information_schema.key_column_usage k ON k.constraint_schema=r.constraint_schema AND k.table_name=r.table_name AND k.constraint_name=r.constraint_name WHERE r.constraint_schema=DATABASE() AND r.table_name=? GROUP BY r.constraint_name,r.referenced_table_name,r.delete_rule ORDER BY r.constraint_name").bind(table).fetch_all(&mut *c).await?;
+    fks.sort();
+    if fks != expected_fks(table) {
+        bail!("mysql v7 source foreign keys differ: {table}")
+    }
     Ok(())
+}
+
+fn inventory(rows: &[(&str, &str)]) -> Vec<(String, String)> {
+    let mut v = rows
+        .iter()
+        .map(|x| (x.0.into(), x.1.into()))
+        .collect::<Vec<_>>();
+    v.sort();
+    v
+}
+fn expected_constraint_inventory(table: &str) -> Vec<(String, String)> {
+    inventory(match table {
+        "git_source_roots" => &[
+            ("PRIMARY", "PRIMARY KEY"),
+            ("registration_operation", "UNIQUE"),
+            ("registration_generation", "UNIQUE"),
+            ("git_source_roots_identity", "UNIQUE"),
+            ("git_source_roots_binding", "UNIQUE"),
+            ("git_source_roots_shape", "CHECK"),
+        ],
+        "git_source_members" => &[
+            ("PRIMARY", "PRIMARY KEY"),
+            ("git_source_members_identity", "UNIQUE"),
+            ("git_source_members_shape", "CHECK"),
+            ("git_source_members_root", "FOREIGN KEY"),
+        ],
+        "git_source_acquisition_sequence" => &[
+            ("PRIMARY", "PRIMARY KEY"),
+            ("git_source_acquisition_sequence_shape", "CHECK"),
+        ],
+        "git_source_acquisitions" => &[
+            ("PRIMARY", "PRIMARY KEY"),
+            ("generation", "UNIQUE"),
+            ("operation_id", "UNIQUE"),
+            ("active_identity", "UNIQUE"),
+            ("git_source_acquisitions_generation", "CHECK"),
+            ("git_source_acquisitions_failure", "CHECK"),
+            ("git_source_acquisitions_shape", "CHECK"),
+        ],
+        "git_source_acquisition_members" => &[
+            ("PRIMARY", "PRIMARY KEY"),
+            ("git_source_acquisition_members_identity", "UNIQUE"),
+            ("git_source_acquisition_members_shape", "CHECK"),
+            ("git_source_acquisition_members_parent", "FOREIGN KEY"),
+        ],
+        "git_source_desires" => &[
+            ("PRIMARY", "PRIMARY KEY"),
+            ("git_source_desires_failure", "CHECK"),
+            ("git_source_desires_shape", "CHECK"),
+            ("git_source_desires_root", "FOREIGN KEY"),
+            ("git_source_desires_acquisition", "FOREIGN KEY"),
+        ],
+        "branch_source_generations" => &[
+            ("PRIMARY", "PRIMARY KEY"),
+            ("branch_source_generations_shape", "CHECK"),
+            ("branch_source_generations_root", "FOREIGN KEY"),
+        ],
+        "branch_source_current" => &[
+            ("PRIMARY", "PRIMARY KEY"),
+            ("branch_source_current_generation", "FOREIGN KEY"),
+        ],
+        "git_source_consumers" => &[
+            ("PRIMARY", "PRIMARY KEY"),
+            ("session_id", "UNIQUE"),
+            ("git_source_consumers_shape", "CHECK"),
+            ("git_source_consumers_root", "FOREIGN KEY"),
+        ],
+        "artifact_intents" => &[
+            ("PRIMARY", "PRIMARY KEY"),
+            ("artifact_intents_identity", "UNIQUE"),
+            ("artifact_intents_shape", "CHECK"),
+            ("artifact_intents_generation", "FOREIGN KEY"),
+            ("artifact_intents_source", "FOREIGN KEY"),
+            ("artifact_intents_artifact", "FOREIGN KEY"),
+        ],
+        "git_source_maintenance" => &[
+            ("PRIMARY", "PRIMARY KEY"),
+            ("git_source_maintenance_shape", "CHECK"),
+        ],
+        _ => &[],
+    })
+}
+fn expected_checks(table: &str) -> &'static [(&'static str, &'static str)] {
+    match table {
+        "git_source_roots" => &[(
+            "git_source_roots_shape",
+            "root_len>0 AND source_format_version BETWEEN 1 AND 4294967295 AND object_format IN('sha1','sha256') AND CHAR_LENGTH(semantic_digest)=64 AND CHAR_LENGTH(object_set_digest)=64 AND object_count>0 AND total_bytes>0 AND registration_generation>0 AND state IN('registered','quarantined')",
+        )],
+        "git_source_members" => &[(
+            "git_source_members_shape",
+            "ordinal>=0 AND child_len>0 AND kind IN('pack','index') AND CHAR_LENGTH(child_hash)=64",
+        )],
+        "git_source_acquisition_sequence" => &[(
+            "git_source_acquisition_sequence_shape",
+            "id=1 AND generation>=0",
+        )],
+        "git_source_acquisitions" => &[
+            ("git_source_acquisitions_generation", "generation>0"),
+            (
+                "git_source_acquisitions_failure",
+                "failure_class IS NULL OR failure_class IN('retryable','permanent','dead_letter')",
+            ),
+            (
+                "git_source_acquisitions_shape",
+                "(state='held' AND active_identity IS NOT NULL AND root_hash IS NULL AND root_len IS NULL AND object_format IS NULL AND semantic_digest IS NULL AND object_set_digest IS NULL AND object_count IS NULL AND total_bytes IS NULL AND failure_class IS NULL) OR (state IN('graph_published','activation_unknown') AND active_identity IS NOT NULL AND root_hash IS NOT NULL AND root_len>0 AND object_format IN('sha1','sha256') AND semantic_digest IS NOT NULL AND object_set_digest IS NOT NULL AND object_count>0 AND total_bytes>0 AND failure_class IS NULL) OR (state='registered' AND active_identity IS NULL AND root_hash IS NOT NULL AND root_len>0 AND object_format IN('sha1','sha256') AND semantic_digest IS NOT NULL AND object_set_digest IS NOT NULL AND object_count>0 AND total_bytes>0 AND failure_class IS NULL) OR (state='failed' AND active_identity IS NULL AND failure_class IS NOT NULL)",
+            ),
+        ],
+        "git_source_acquisition_members" => &[(
+            "git_source_acquisition_members_shape",
+            "ordinal>=0 AND child_len>0 AND kind IN('pack','index') AND CHAR_LENGTH(child_hash)=64",
+        )],
+        "git_source_desires" => &[
+            (
+                "git_source_desires_failure",
+                "failure_class IS NULL OR failure_class IN('retryable','permanent','dead_letter')",
+            ),
+            (
+                "git_source_desires_shape",
+                "retry_count BETWEEN 0 AND 4294967295 AND ((state='acquiring' AND acquisition_token IS NOT NULL AND root_hash IS NULL AND failure_class IS NULL) OR (state='registered' AND acquisition_token IS NULL AND root_hash IS NOT NULL AND failure_class IS NULL) OR (state='failed' AND acquisition_token IS NULL AND root_hash IS NULL AND failure_class IS NOT NULL))",
+            ),
+        ],
+        "branch_source_generations" => &[("branch_source_generations_shape", "generation>0")],
+        "git_source_consumers" => &[(
+            "git_source_consumers_shape",
+            "purpose IN('intent','builder')",
+        )],
+        "artifact_intents" => &[(
+            "artifact_intents_shape",
+            "format_version BETWEEN 1 AND 4294967295 AND kind IN('head','full_history','files') AND ((state='deferred' AND artifact_id IS NULL) OR (state='promoted' AND artifact_id IS NOT NULL))",
+        )],
+        "git_source_maintenance" => &[(
+            "git_source_maintenance_shape",
+            "id=1 AND intent_cursor>=0 AND acquisition_cursor>=0",
+        )],
+        _ => &[],
+    }
+}
+fn normalize_mysql_check(v: &str) -> String {
+    v.to_lowercase()
+        .replace("_utf8mb4", "")
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '`' && *c != '(' && *c != ')' && *c != '\\')
+        .collect()
+}
+fn fk(rows: &[(&str, &str, &str, &str)]) -> Vec<(String, String, String, String)> {
+    let mut v = rows
+        .iter()
+        .map(|x| (x.0.into(), x.1.into(), x.2.into(), x.3.into()))
+        .collect::<Vec<_>>();
+    v.sort();
+    v
+}
+fn expected_fks(table: &str) -> Vec<(String, String, String, String)> {
+    fk(match table {
+        "git_source_members" => &[(
+            "git_source_members_root",
+            "git_source_roots",
+            "RESTRICT",
+            "root_hash=root_hash",
+        )],
+        "git_source_acquisition_members" => &[(
+            "git_source_acquisition_members_parent",
+            "git_source_acquisitions",
+            "CASCADE",
+            "token=token",
+        )],
+        "git_source_desires" => &[
+            (
+                "git_source_desires_acquisition",
+                "git_source_acquisitions",
+                "RESTRICT",
+                "acquisition_token=token",
+            ),
+            (
+                "git_source_desires_root",
+                "git_source_roots",
+                "RESTRICT",
+                "root_hash=root_hash",
+            ),
+        ],
+        "branch_source_generations" => &[(
+            "branch_source_generations_root",
+            "git_source_roots",
+            "RESTRICT",
+            "root_hash=root_hash,workspace=workspace,repo=repo,commit_oid=commit_oid,source_format_version=source_format_version",
+        )],
+        "branch_source_current" => &[(
+            "branch_source_current_generation",
+            "branch_source_generations",
+            "RESTRICT",
+            "workspace=workspace,repo=repo,branch=branch,generation=generation",
+        )],
+        "git_source_consumers" => &[(
+            "git_source_consumers_root",
+            "git_source_roots",
+            "RESTRICT",
+            "root_hash=root_hash,workspace=workspace,repo=repo,commit_oid=commit_oid,source_format_version=source_format_version",
+        )],
+        "artifact_intents" => &[
+            (
+                "artifact_intents_artifact",
+                "artifact_jobs",
+                "RESTRICT",
+                "artifact_id=id",
+            ),
+            (
+                "artifact_intents_generation",
+                "branch_source_generations",
+                "RESTRICT",
+                "workspace=workspace,repo=repo,branch=branch,branch_generation=generation",
+            ),
+            (
+                "artifact_intents_source",
+                "git_source_roots",
+                "RESTRICT",
+                "source_root_hash=root_hash,workspace=workspace,repo=repo,commit_oid=commit_oid,source_format_version=source_format_version",
+            ),
+        ],
+        _ => &[],
+    })
 }
 
 fn expected_indexes(table: &str) -> Vec<(String, i64, String)> {
@@ -299,13 +543,20 @@ pub(crate) async fn validate_mysql_v7_state(c: &mut MySqlConnection) -> Result<(
     let invalid:i64=sqlx::query_scalar("SELECT
       (SELECT count(*) FROM git_source_roots r WHERE r.root_hash NOT REGEXP '^[0-9a-f]{64}$' OR r.semantic_digest NOT REGEXP '^[0-9a-f]{64}$' OR r.object_set_digest NOT REGEXP '^[0-9a-f]{64}$' OR (r.object_format='sha1' AND r.commit_oid NOT REGEXP '^[0-9a-f]{40}$') OR (r.object_format='sha256' AND r.commit_oid NOT REGEXP '^[0-9a-f]{64}$') OR NOT EXISTS(SELECT 1 FROM git_source_members m WHERE m.root_hash=r.root_hash GROUP BY m.root_hash HAVING MIN(m.ordinal)=0 AND MAX(m.ordinal)+1=count(*) AND MOD(count(*),2)=0 AND SUM(m.child_len)=r.total_bytes AND SUM(CASE WHEN (MOD(m.ordinal,2)=0 AND m.kind='pack') OR (MOD(m.ordinal,2)=1 AND m.kind='index') THEN 0 ELSE 1 END)=0))+
       (SELECT count(*) FROM git_source_members WHERE child_hash NOT REGEXP '^[0-9a-f]{64}$')+(SELECT count(*) FROM git_source_acquisition_members WHERE child_hash NOT REGEXP '^[0-9a-f]{64}$')+
-      (SELECT count(*) FROM git_source_acquisitions a WHERE token NOT REGEXP '^[0-9a-f]{64}$' OR (state IN('held','graph_published','activation_unknown') AND active_identity IS NULL) OR (state IN('registered','failed') AND active_identity IS NOT NULL) OR (state='held' AND EXISTS(SELECT 1 FROM git_source_acquisition_members m WHERE m.token=a.token)) OR (state IN('graph_published','activation_unknown','registered') AND NOT EXISTS(SELECT 1 FROM git_source_acquisition_members m WHERE m.token=a.token)) OR EXISTS(SELECT 1 FROM git_source_acquisition_members m WHERE m.token=a.token GROUP BY m.token HAVING MIN(m.ordinal)<>0 OR MAX(m.ordinal)+1<>count(*) OR MOD(count(*),2)<>0 OR SUM(m.child_len)<>a.total_bytes))+
+      (SELECT count(*) FROM git_source_acquisitions a WHERE token NOT REGEXP '^[0-9a-f]{64}$' OR (root_hash IS NOT NULL AND root_hash NOT REGEXP '^[0-9a-f]{64}$') OR (semantic_digest IS NOT NULL AND semantic_digest NOT REGEXP '^[0-9a-f]{64}$') OR (object_set_digest IS NOT NULL AND object_set_digest NOT REGEXP '^[0-9a-f]{64}$') OR (state IN('held','graph_published','activation_unknown') AND active_identity IS NULL) OR (state IN('registered','failed') AND active_identity IS NOT NULL) OR (state='held' AND EXISTS(SELECT 1 FROM git_source_acquisition_members m WHERE m.token=a.token)) OR (state IN('graph_published','activation_unknown','registered') AND NOT EXISTS(SELECT 1 FROM git_source_acquisition_members m WHERE m.token=a.token)) OR EXISTS(SELECT 1 FROM git_source_acquisition_members m WHERE m.token=a.token GROUP BY m.token HAVING MIN(m.ordinal)<>0 OR MAX(m.ordinal)+1<>count(*) OR MOD(count(*),2)<>0 OR SUM(m.child_len)<>a.total_bytes))+
       (SELECT count(*) FROM git_source_acquisitions a LEFT JOIN git_source_roots r ON r.root_hash=a.root_hash WHERE a.state='registered' AND (r.root_hash IS NULL OR r.state<>'registered' OR r.registration_operation<>a.operation_id OR r.registration_generation<>a.generation OR r.workspace<>a.workspace OR r.repo<>a.repo OR r.commit_oid<>a.commit_oid OR r.source_format_version<>a.source_format_version OR r.root_len<>a.root_len OR r.semantic_digest<>a.semantic_digest OR r.object_set_digest<>a.object_set_digest OR r.object_count<>a.object_count OR r.total_bytes<>a.total_bytes))+
       (SELECT count(*) FROM git_source_desires d LEFT JOIN git_source_acquisitions a ON a.token=d.acquisition_token LEFT JOIN git_source_roots r ON r.root_hash=d.root_hash WHERE d.source_format_version<>1 OR (d.state='acquiring' AND (a.token IS NULL OR a.workspace<>d.workspace OR a.repo<>d.repo OR a.commit_oid<>d.commit_oid OR a.state NOT IN('held','graph_published','activation_unknown'))) OR (d.state='registered' AND (r.root_hash IS NULL OR r.workspace<>d.workspace OR r.repo<>d.repo OR r.commit_oid<>d.commit_oid OR r.state<>'registered')))+
       (SELECT count(*) FROM branch_source_current current JOIN branch_source_generations g ON g.workspace=current.workspace AND g.repo=current.repo AND g.branch=current.branch AND g.generation=current.generation LEFT JOIN branch_observations b ON b.workspace=current.workspace AND b.repo=current.repo AND b.branch=current.branch WHERE b.workspace IS NULL OR b.generation<>g.generation OR b.desired_commit<>g.commit_oid)+
       (SELECT count(*) FROM git_source_consumers c LEFT JOIN git_source_roots r ON r.root_hash=c.root_hash AND r.workspace=c.workspace AND r.repo=c.repo AND r.commit_oid=c.commit_oid AND r.source_format_version=c.source_format_version WHERE r.root_hash IS NULL OR c.session_id NOT REGEXP '^[0-9a-f]{64}$')+
       (SELECT count(*) FROM artifact_intents i LEFT JOIN git_source_consumers c ON c.consumer_id=i.consumer_id AND c.root_hash=i.source_root_hash AND c.purpose='intent' LEFT JOIN artifact_jobs j ON j.id=i.artifact_id WHERE c.root_hash IS NULL OR i.consumer_id NOT REGEXP '^intent:[0-9a-f]{48}$' OR c.expires_at<>9223372036854775807 OR (i.state='deferred' AND (i.artifact_id IS NOT NULL OR EXISTS(SELECT 1 FROM artifact_consumers ac WHERE ac.consumer_id=i.consumer_id))) OR (i.state='promoted' AND (j.id IS NULL OR j.workspace<>i.workspace OR j.repo<>i.repo OR j.commit_oid<>i.commit_oid OR j.kind<>i.kind OR j.format_version<>i.format_version OR NOT EXISTS(SELECT 1 FROM artifact_consumers ac WHERE ac.artifact_id=i.artifact_id AND ac.consumer_id=i.consumer_id AND ac.expires_at=9223372036854775807))))").fetch_one(&mut *c).await?;
-    if invalid != 0 {
+    let reverse_invalid:i64=sqlx::query_scalar("SELECT
+      (SELECT count(*) FROM git_source_roots r WHERE r.state='registered' AND (NOT EXISTS(SELECT 1 FROM git_source_acquisitions a WHERE a.state='registered' AND a.root_hash=r.root_hash AND a.operation_id=r.registration_operation AND a.generation=r.registration_generation) OR NOT EXISTS(SELECT 1 FROM git_source_desires d WHERE d.state='registered' AND d.root_hash=r.root_hash AND d.workspace=r.workspace AND d.repo=r.repo AND d.commit_oid=r.commit_oid AND d.source_format_version=r.source_format_version)))+
+      (SELECT count(*) FROM git_source_acquisitions a WHERE (a.state IN('held','graph_published','activation_unknown') AND NOT EXISTS(SELECT 1 FROM git_source_desires d WHERE d.state='acquiring' AND d.acquisition_token=a.token AND d.workspace=a.workspace AND d.repo=a.repo AND d.commit_oid=a.commit_oid AND d.source_format_version=a.source_format_version)) OR (a.state='registered' AND NOT EXISTS(SELECT 1 FROM git_source_desires d WHERE d.state='registered' AND d.root_hash=a.root_hash AND d.workspace=a.workspace AND d.repo=a.repo AND d.commit_oid=a.commit_oid AND d.source_format_version=a.source_format_version)) OR (a.state='registered' AND (EXISTS(SELECT 1 FROM git_source_acquisition_members am LEFT JOIN git_source_members m ON m.root_hash=a.root_hash AND m.ordinal=am.ordinal WHERE am.token=a.token AND (m.ordinal IS NULL OR m.child_hash<>am.child_hash OR m.child_len<>am.child_len OR m.kind<>am.kind)) OR EXISTS(SELECT 1 FROM git_source_members m LEFT JOIN git_source_acquisition_members am ON am.token=a.token AND am.ordinal=m.ordinal WHERE m.root_hash=a.root_hash AND am.ordinal IS NULL))))+
+      (SELECT count(*) FROM (SELECT hash FROM (SELECT root_hash hash,root_len len,'root' kind FROM git_source_roots UNION ALL SELECT root_hash,root_len,'root' FROM git_source_acquisitions WHERE root_hash IS NOT NULL UNION ALL SELECT child_hash,child_len,kind FROM git_source_members UNION ALL SELECT child_hash,child_len,kind FROM git_source_acquisition_members) descriptors GROUP BY hash HAVING count(DISTINCT CONCAT(len,':',kind))<>1) conflicts)+
+      (SELECT count(*) FROM (SELECT root_hash hash FROM git_source_roots UNION SELECT root_hash FROM git_source_acquisitions WHERE root_hash IS NOT NULL) roots JOIN (SELECT child_hash hash FROM git_source_members UNION SELECT child_hash FROM git_source_acquisition_members) children ON children.hash=roots.hash)+
+      (SELECT count(*) FROM git_source_consumers c WHERE c.purpose='intent' AND NOT EXISTS(SELECT 1 FROM artifact_intents i WHERE i.consumer_id=c.consumer_id AND i.source_root_hash=c.root_hash))+
+      (SELECT count(*) FROM artifact_consumers ac WHERE ac.consumer_id LIKE 'intent:%' AND (ac.expires_at<>9223372036854775807 OR NOT EXISTS(SELECT 1 FROM artifact_intents i WHERE i.state='promoted' AND i.consumer_id=ac.consumer_id AND i.artifact_id=ac.artifact_id)))").fetch_one(&mut *c).await?;
+    if invalid + reverse_invalid != 0 {
         bail!("mysql v7 source registry persisted state is invalid")
     }
     Ok(())
@@ -354,11 +605,11 @@ impl MysqlGitSourceRegistry {
         .fetch_one(&mut *tx)
         .await?;
         if stored.is_empty() {
-            let state:i64=sqlx::query_scalar("SELECT (SELECT generation FROM git_source_acquisition_sequence WHERE id=1)+(SELECT count(*) FROM git_source_roots)+(SELECT count(*) FROM git_source_acquisitions)+(SELECT count(*) FROM git_source_desires)+(SELECT count(*) FROM branch_source_generations)+(SELECT count(*) FROM artifact_intents)").fetch_one(&mut *tx).await?;
+            let state:i64=sqlx::query_scalar("SELECT (SELECT generation FROM git_source_acquisition_sequence WHERE id=1)+(SELECT count(*) FROM git_source_roots)+(SELECT count(*) FROM git_source_members)+(SELECT count(*) FROM git_source_acquisitions)+(SELECT count(*) FROM git_source_acquisition_members)+(SELECT count(*) FROM git_source_desires)+(SELECT count(*) FROM branch_source_generations)+(SELECT count(*) FROM branch_source_current)+(SELECT count(*) FROM git_source_consumers)+(SELECT count(*) FROM artifact_intents)+(SELECT count(*) FROM git_source_maintenance WHERE id<>1 OR intent_cursor<>0 OR intent_workspace_cursor<>'' OR acquisition_cursor<>0 OR root_cursor<>'' OR updated_at<>0)").fetch_one(&mut *tx).await?;
             if state != 0 {
                 bail!("empty MySQL source registry fingerprint has authoritative state")
             }
-            sqlx::query("UPDATE git_source_maintenance SET config_fingerprint=? WHERE id=1 AND config_fingerprint=''").bind(&fingerprint).execute(&mut *tx).await?;
+            if sqlx::query("UPDATE git_source_maintenance SET config_fingerprint=? WHERE id=1 AND config_fingerprint='' AND intent_cursor=0 AND intent_workspace_cursor='' AND acquisition_cursor=0 AND root_cursor='' AND updated_at=0").bind(&fingerprint).execute(&mut *tx).await?.rows_affected()!=1{bail!("MySQL source registry configuration CAS failed")}
         } else if stored != fingerprint {
             bail!("MySQL source registry limits or authority seal differ from fleet configuration")
         }
@@ -428,6 +679,14 @@ impl MysqlGitSourceRegistry {
         )?;
         let mut tx = self.pool.begin().await?;
         let now = mysql_time(&mut tx).await?;
+        // Serialize the first observation of an identity as well as retries.
+        // Relying on an absent-row gap lock makes correctness depend on the
+        // server isolation level (READ COMMITTED does not provide that lock).
+        let prior: i64 = sqlx::query_scalar(
+            "SELECT generation FROM git_source_acquisition_sequence WHERE id=1 FOR UPDATE",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
         if let Some(token)=sqlx::query_scalar::<_,String>("SELECT token FROM git_source_acquisitions WHERE workspace=? AND repo=? AND commit_oid=? AND source_format_version=? AND state IN('held','graph_published') AND expires_at<=? FOR UPDATE").bind(workspace).bind(repo).bind(commit).bind(source_format_version as i64).bind(now).fetch_optional(&mut *tx).await?{
             sqlx::query("UPDATE git_source_desires SET state='failed',root_hash=NULL,failure_class='retryable',acquisition_token=NULL,updated_at=? WHERE acquisition_token=? AND state='acquiring'").bind(now).bind(&token).execute(&mut *tx).await?;
             sqlx::query("UPDATE git_source_acquisitions SET state='failed',active_identity=NULL,failure_class='retryable',expires_at=0 WHERE token=? AND state IN('held','graph_published')").bind(&token).execute(&mut *tx).await?;
@@ -439,11 +698,6 @@ impl MysqlGitSourceRegistry {
             let class=FailureClass::parse(row.try_get::<String,_>("failure_class")?.as_str())?;let retries=checked_u32(row.try_get("retry_count")?,"source retry count")?;
             if intent==SyncIntent::ObserveMovement||class!=FailureClass::Retryable||retries>=self.scheduler_limits.max_manual_retries{tx.commit().await?;return Ok(SourceBeginOutcome::Failed{class,retries})}
         }
-        let prior: i64 = sqlx::query_scalar(
-            "SELECT generation FROM git_source_acquisition_sequence WHERE id=1 FOR UPDATE",
-        )
-        .fetch_one(&mut *tx)
-        .await?;
         let generation = prior.checked_add(1).context("source generation overflow")?;
         sqlx::query(
             "UPDATE git_source_acquisition_sequence SET generation=? WHERE id=1 AND generation=?",
@@ -488,6 +742,11 @@ impl MysqlGitSourceRegistry {
         }
         let mut tx = self.pool.begin().await?;
         let now = mysql_time(&mut tx).await?;
+        // Share the same control lock as GC root discovery/retirement so the
+        // absence proof and graph publication cannot race one another.
+        sqlx::query("SELECT id FROM scheduler_state WHERE id=1 FOR UPDATE")
+            .fetch_one(&mut *tx)
+            .await?;
         let sweep: i64 =
             sqlx::query_scalar("SELECT count(*) FROM artifact_gc_sweep WHERE expires_at>?")
                 .bind(now)
@@ -608,6 +867,10 @@ impl MysqlGitSourceRegistry {
         prepared: &PreparedGitSource,
         cancelled: &CancellationToken,
     ) -> Result<DurableSourceSnapshot> {
+        if cancelled.is_cancelled() {
+            self.fail(a, FailureClass::Retryable).await?;
+            bail!("Git source registration cancelled")
+        }
         let view = prepared.registry_view(&self.source_limits)?;
         verify_acquisition_identity(a, &view)?;
         let storage = self.storage.clone();
@@ -625,12 +888,27 @@ impl MysqlGitSourceRegistry {
             verify_storage_graph(&storage, &blobs, &root_hash, &root_bytes, &blocking)
         });
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
-        loop {
+        let verification: Result<()> = async {
+            loop {
             tokio::select! {result=&mut verify=>{result.context("Git source verifier did not join")??;break},_=cancelled.cancelled()=>{verify_cancel.cancel();verify.await.context("cancelled Git source verifier did not join")??;bail!("Git source registration cancelled")},_=interval.tick()=>if !self.renew(a,60).await?{verify_cancel.cancel();verify.await.context("lease-lost Git source verifier did not join")??;bail!("Git source acquisition lease was lost during verification")}}
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(error) = verification {
+            let _ = self.fail(a, FailureClass::Retryable).await?;
+            return Err(error);
         }
         let mut unknown = self.pool.begin().await?;
         if sqlx::query("UPDATE git_source_acquisitions SET state='activation_unknown' WHERE token=? AND generation=? AND operation_id=? AND state='graph_published'").bind(&a.token).bind(a.generation as i64).bind(&a.operation_id).execute(&mut *unknown).await?.rows_affected()!=1{bail!("source registration capability was lost")}
-        unknown.commit().await?;
+        if let Err(error) = unknown.commit().await {
+            let state:Option<String>=sqlx::query_scalar("SELECT state FROM git_source_acquisitions WHERE token=? AND generation=? AND operation_id=?").bind(&a.token).bind(a.generation as i64).bind(&a.operation_id).fetch_optional(&self.pool).await?;
+            if state.as_deref() != Some("activation_unknown") {
+                let _ = self.fail(a, FailureClass::Retryable).await?;
+                return Err(error)
+                    .context("source activation-unknown transition acknowledgement was lost");
+            }
+        }
         let registration:Result<DurableSourceSnapshot>=async{let mut tx=self.pool.begin().await?;let now=mysql_time(&mut tx).await?;
             let descriptor:Option<(String,i64,String,String,String,i64,i64)>=sqlx::query_as("SELECT root_hash,root_len,object_format,semantic_digest,object_set_digest,object_count,total_bytes FROM git_source_acquisitions WHERE token=? AND generation=? AND operation_id=? AND state='activation_unknown' FOR UPDATE").bind(&a.token).bind(a.generation as i64).bind(&a.operation_id).fetch_optional(&mut *tx).await?;let expected=(view.root.hash.clone(),checked_i64(view.root.len,"root length")?,view.object_format.to_owned(),view.semantic_digest.clone(),view.object_set_digest.clone(),checked_i64(view.object_count,"object count")?,checked_i64(view.total_bytes,"source bytes")?);if descriptor!=Some(expected){bail!("source acquisition descriptor differs at registration")}
             let members:Vec<(i64,String,i64,String)>=sqlx::query_as("SELECT ordinal,child_hash,child_len,kind FROM git_source_acquisition_members WHERE token=? ORDER BY ordinal").bind(&a.token).fetch_all(&mut *tx).await?;if members.len()!=view.members.len()||members.iter().zip(&view.members).any(|(got,want)|got.0!=want.ordinal as i64||got.1!=want.blob.hash||got.2!=want.blob.len as i64||got.3!=want.kind){bail!("source acquisition members differ at registration")}
@@ -639,14 +917,14 @@ impl MysqlGitSourceRegistry {
             sqlx::query("UPDATE git_source_acquisitions SET state='registered',active_identity=NULL,expires_at=0 WHERE token=? AND generation=? AND state='activation_unknown'").bind(&a.token).bind(a.generation as i64).execute(&mut *tx).await?;sqlx::query("UPDATE git_source_desires SET state='registered',root_hash=?,failure_class=NULL,acquisition_token=NULL,updated_at=? WHERE acquisition_token=? AND state='acquiring'").bind(&view.root.hash).bind(now).bind(&a.token).execute(&mut *tx).await?;let snapshot=DurableSourceSnapshot::registered(view.workspace.clone(),view.repo.clone(),view.commit.clone(),view.root.hash.clone(),a.token.clone(),a.generation)?;tx.commit().await?;Ok(snapshot)}.await;
         match registration {
             Ok(v) => Ok(v),
-            Err(error) => match self.recover_unknown(a).await? {
+            Err(error) => match self.reconcile_activation_unknown(a).await? {
                 Some(v) => Ok(v),
                 None => Err(error).context("MySQL source registration settled failed"),
             },
         }
     }
 
-    async fn recover_unknown(
+    pub async fn reconcile_activation_unknown(
         &self,
         a: &GitSourceAcquisition,
     ) -> Result<Option<DurableSourceSnapshot>> {
@@ -773,14 +1051,19 @@ impl MysqlGitSourceRegistry {
         if limit == 0 || limit > 256 {
             bail!("deferred intent promotion page is invalid")
         }
-        let ids: Vec<i64> = sqlx::query_scalar(
-            "SELECT id FROM artifact_intents WHERE state='deferred' ORDER BY updated_at,id LIMIT ?",
+        let cursor: String = sqlx::query_scalar(
+            "SELECT intent_workspace_cursor FROM git_source_maintenance WHERE id=1",
         )
-        .bind((limit as i64) * 16)
+        .fetch_one(&self.pool)
+        .await?;
+        let scan_limit = (limit as i64).saturating_mul(16).clamp(64, 4096);
+        let ids: Vec<(i64,String)> = sqlx::query_as(
+            "WITH candidates AS (SELECT id,workspace,row_number() OVER(PARTITION BY workspace ORDER BY updated_at,id) round_number FROM artifact_intents WHERE state='deferred') SELECT id,workspace FROM candidates ORDER BY round_number,CASE WHEN workspace>? THEN 0 ELSE 1 END,workspace,id LIMIT ?",
+        ).bind(&cursor).bind(scan_limit)
         .fetch_all(&self.pool)
         .await?;
         let mut promoted = 0;
-        for id in ids {
+        for (id, candidate_workspace) in ids {
             if promoted >= limit {
                 break;
             }
@@ -788,11 +1071,15 @@ impl MysqlGitSourceRegistry {
             sqlx::query("SELECT id FROM scheduler_state WHERE id=1 FOR UPDATE")
                 .fetch_one(&mut *tx)
                 .await?;
-            let Some(row)=sqlx::query("SELECT workspace,repo,commit_oid,kind,format_version,consumer_id FROM artifact_intents WHERE id=? AND state='deferred' FOR UPDATE").bind(id).fetch_optional(&mut *tx).await? else{tx.rollback().await?;continue};
+            sqlx::query("UPDATE git_source_maintenance SET intent_cursor=?,intent_workspace_cursor=?,updated_at=UNIX_TIMESTAMP() WHERE id=1").bind(id).bind(&candidate_workspace).execute(&mut *tx).await?;
+            let Some(row)=sqlx::query("SELECT workspace,repo,branch,branch_generation,commit_oid,kind,format_version,consumer_id FROM artifact_intents WHERE id=? AND state='deferred' FOR UPDATE").bind(id).fetch_optional(&mut *tx).await? else{tx.commit().await?;continue};
             let workspace: String = row.try_get("workspace")?;
             let kind = ArtifactKind::parse(row.try_get("kind")?)?;
             if !mysql_capacity(&mut tx, &self.scheduler_limits, &workspace, kind).await? {
-                tx.rollback().await?;
+                // Persist rotation even when this workspace is saturated. A
+                // rollback here would pin every invocation to the same blocked
+                // prefix and recreate starvation across page boundaries.
+                tx.commit().await?;
                 continue;
             }
             let artifact = mysql_ensure_job(
@@ -806,6 +1093,18 @@ impl MysqlGitSourceRegistry {
             .await?;
             sqlx::query("UPDATE artifact_intents SET state='promoted',artifact_id=?,updated_at=UNIX_TIMESTAMP() WHERE id=? AND state='deferred'").bind(artifact).bind(id).execute(&mut *tx).await?;
             sqlx::query("INSERT INTO artifact_consumers(artifact_id,consumer_id,expires_at) VALUES(?,?,?) ON DUPLICATE KEY UPDATE expires_at=VALUES(expires_at)").bind(artifact).bind(row.try_get::<String,_>("consumer_id")?).bind(SOURCE_INTENT_RETENTION_EXPIRY).execute(&mut *tx).await?;
+            mysql_upsert_observation(
+                &mut tx,
+                &workspace,
+                row.try_get("repo")?,
+                row.try_get("branch")?,
+                row.try_get("branch_generation")?,
+                row.try_get("commit_oid")?,
+                kind,
+                artifact,
+                row.try_get("format_version")?,
+            )
+            .await?;
             tx.commit().await?;
             promoted += 1
         }
@@ -856,6 +1155,69 @@ impl MysqlGitSourceRegistry {
             settled += 1
         }
         Ok(settled)
+    }
+
+    pub async fn prune_metadata_page(&self, limit: u32) -> Result<u64> {
+        if limit == 0 || limit > 512 {
+            bail!("source metadata prune page is invalid")
+        }
+        let mut tx = self.pool.begin().await?;
+        let mut changed=sqlx::query("DELETE FROM git_source_consumers WHERE purpose='builder' AND expires_at<=UNIX_TIMESTAMP() ORDER BY expires_at,root_hash,consumer_id LIMIT ?").bind(limit as i64).execute(&mut *tx).await?.rows_affected();
+        changed+=sqlx::query("DELETE g FROM branch_source_generations g LEFT JOIN branch_source_current c ON c.workspace=g.workspace AND c.repo=g.repo AND c.branch=g.branch AND c.generation=g.generation LEFT JOIN artifact_intents i ON i.workspace=g.workspace AND i.repo=g.repo AND i.branch=g.branch AND i.branch_generation=g.generation WHERE c.workspace IS NULL AND i.id IS NULL ORDER BY g.created_at,g.workspace,g.repo,g.branch,g.generation LIMIT ?").bind(limit as i64).execute(&mut *tx).await?.rows_affected();
+        let cutoff: i64 = sqlx::query_scalar(
+            "SELECT GREATEST(0,generation-1024) FROM git_source_acquisition_sequence WHERE id=1",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        changed+=sqlx::query("DELETE a FROM git_source_acquisitions a LEFT JOIN git_source_desires d ON d.acquisition_token=a.token WHERE a.state='failed' AND a.generation<=? AND d.acquisition_token IS NULL ORDER BY a.generation LIMIT ?").bind(cutoff).bind(limit as i64).execute(&mut *tx).await?.rows_affected();
+        tx.commit().await?;
+        Ok(changed)
+    }
+
+    pub async fn retire_registered_roots_page(&self, grace_secs: i64, limit: u32) -> Result<u32> {
+        if !(60..=30 * 24 * 60 * 60).contains(&grace_secs) || limit == 0 || limit > 256 {
+            bail!("source root retirement grace or page is invalid")
+        }
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT id FROM scheduler_state WHERE id=1 FOR UPDATE")
+            .fetch_one(&mut *tx)
+            .await?;
+        let sweep: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM artifact_gc_sweep WHERE expires_at>UNIX_TIMESTAMP()",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        if sweep != 0 {
+            bail!("source root retirement is fenced by live GC sweep")
+        }
+        let cursor: String = sqlx::query_scalar(
+            "SELECT root_cursor FROM git_source_maintenance WHERE id=1 FOR UPDATE",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        let roots:Vec<String>=sqlx::query_scalar("SELECT r.root_hash FROM git_source_roots r WHERE r.state='registered' AND r.registered_at<=UNIX_TIMESTAMP()-? AND r.root_hash>? AND NOT EXISTS(SELECT 1 FROM branch_source_generations g WHERE g.root_hash=r.root_hash) AND NOT EXISTS(SELECT 1 FROM artifact_intents i WHERE i.source_root_hash=r.root_hash) AND NOT EXISTS(SELECT 1 FROM git_source_consumers c WHERE c.root_hash=r.root_hash) AND NOT EXISTS(SELECT 1 FROM git_source_acquisitions a WHERE a.root_hash=r.root_hash AND a.state IN('held','graph_published','activation_unknown')) ORDER BY r.root_hash LIMIT ? FOR UPDATE").bind(grace_secs).bind(&cursor).bind(limit as i64).fetch_all(&mut *tx).await?;
+        if roots.is_empty() {
+            if !cursor.is_empty() {
+                sqlx::query("UPDATE git_source_maintenance SET root_cursor='',updated_at=UNIX_TIMESTAMP() WHERE id=1").execute(&mut *tx).await?;
+            }
+            tx.commit().await?;
+            return Ok(0);
+        }
+        for root in &roots {
+            sqlx::query("DELETE FROM git_source_desires WHERE root_hash=? AND state='registered'")
+                .bind(root)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("DELETE FROM git_source_acquisitions WHERE root_hash=? AND state IN('registered','failed')").bind(root).execute(&mut *tx).await?;
+            sqlx::query("DELETE FROM git_source_members WHERE root_hash=?")
+                .bind(root)
+                .execute(&mut *tx)
+                .await?;
+            if sqlx::query("DELETE FROM git_source_roots WHERE root_hash=? AND state='registered' AND NOT EXISTS(SELECT 1 FROM branch_source_generations WHERE root_hash=?) AND NOT EXISTS(SELECT 1 FROM artifact_intents WHERE source_root_hash=?) AND NOT EXISTS(SELECT 1 FROM git_source_consumers WHERE root_hash=?)").bind(root).bind(root).bind(root).bind(root).execute(&mut *tx).await?.rows_affected()!=1{bail!("source root retirement lost its reference proof")}
+        }
+        sqlx::query("UPDATE git_source_maintenance SET root_cursor=?,updated_at=UNIX_TIMESTAMP() WHERE id=1").bind(roots.last().unwrap()).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(roots.len() as u32)
     }
 }
 
@@ -983,6 +1345,18 @@ impl ArtifactObservation for MysqlGitSourceRegistry {
             sqlx::query("INSERT INTO git_source_consumers(root_hash,consumer_id,session_id,workspace,repo,commit_oid,source_format_version,purpose,expires_at) VALUES(?,?,?,?,?,?,?,'intent',?)").bind(source.manifest()).bind(&consumer).bind(session).bind(source.workspace()).bind(source.repo()).bind(source.commit()).bind(SOURCE_FORMAT_VERSION as i64).bind(SOURCE_INTENT_RETENTION_EXPIRY).execute(&mut *tx).await?;
             if let Some(artifact) = artifact {
                 sqlx::query("INSERT INTO artifact_consumers(artifact_id,consumer_id,expires_at) VALUES(?,?,?)").bind(artifact).bind(&consumer).bind(SOURCE_INTENT_RETENTION_EXPIRY).execute(&mut *tx).await?;
+                mysql_upsert_observation(
+                    &mut tx,
+                    snapshot.workspace(),
+                    snapshot.repo(),
+                    snapshot.branch(),
+                    generation as i64,
+                    source.commit(),
+                    kind,
+                    artifact,
+                    format_version as i64,
+                )
+                .await?;
                 outcomes.push((
                     kind,
                     mysql_job_outcome(
@@ -1004,6 +1378,21 @@ impl ArtifactObservation for MysqlGitSourceRegistry {
             artifacts: outcomes,
         })
     }
+}
+
+async fn mysql_upsert_observation(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    workspace: &str,
+    repo: &str,
+    branch: &str,
+    generation: i64,
+    commit: &str,
+    kind: ArtifactKind,
+    artifact: i64,
+    format: i64,
+) -> Result<()> {
+    sqlx::query("INSERT INTO artifact_observations(workspace,repo,branch,kind,desired_commit,desired_artifact_id,desired_generation,published_artifact_id,format_version,observed_at) VALUES(?,?,?,?,?,?,?,CASE WHEN (SELECT state FROM artifact_jobs WHERE id=?)='ready' THEN ? ELSE NULL END,?,UNIX_TIMESTAMP()) ON DUPLICATE KEY UPDATE desired_commit=VALUES(desired_commit),desired_artifact_id=VALUES(desired_artifact_id),desired_generation=VALUES(desired_generation),published_artifact_id=CASE WHEN VALUES(published_artifact_id) IS NOT NULL THEN VALUES(published_artifact_id) WHEN artifact_observations.format_version=VALUES(format_version) THEN artifact_observations.published_artifact_id ELSE NULL END,format_version=VALUES(format_version),observed_at=VALUES(observed_at)").bind(workspace).bind(repo).bind(branch).bind(kind.as_str()).bind(commit).bind(artifact).bind(generation).bind(artifact).bind(artifact).bind(format).execute(&mut **tx).await?;
+    Ok(())
 }
 
 async fn mysql_capacity(
@@ -1111,7 +1500,11 @@ mod tests {
     }
     #[tokio::test]
     async fn mysql_source_registry_lifecycle_live() {
-        let Ok(url) = std::env::var("RIPCLONE_TEST_MYSQL_URL") else {
+        let Some(url) = std::env::var("RIPCLONE_TEST_MYSQL_URL").ok() else {
+            if std::env::var_os("RIPCLONE_REQUIRE_MYSQL_TESTS").is_some() {
+                panic!("mysql_source_registry_lifecycle_live requires RIPCLONE_TEST_MYSQL_URL")
+            }
+            eprintln!("SKIP mysql_source_registry_lifecycle_live: RIPCLONE_TEST_MYSQL_URL unset");
             return;
         };
         let pool = MySqlPoolOptions::new()
@@ -1159,16 +1552,39 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let limits = SchedulerLimits::default();
+        let limits = SchedulerLimits {
+            workspace_backlog: 1,
+            ..SchedulerLimits::default()
+        };
         MysqlArtifactScheduler::from_pool(pool.clone(), limits.clone(), Arc::new(Accept))
             .await
             .unwrap();
         let temp = tempfile::tempdir().unwrap();
         let storage = crate::storage::local(temp.path()).unwrap();
+        sqlx::query("UPDATE git_source_maintenance SET intent_cursor=1 WHERE id=1")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            MysqlGitSourceRegistry::new(
+                pool.clone(),
+                storage.clone(),
+                limits.clone(),
+                GitSourceLimits::default(),
+                [7; 32]
+            )
+            .await
+            .is_err(),
+            "non-pristine empty fingerprint was adopted"
+        );
+        sqlx::query("UPDATE git_source_maintenance SET intent_cursor=0 WHERE id=1")
+            .execute(&pool)
+            .await
+            .unwrap();
         let registry = MysqlGitSourceRegistry::new(
             pool.clone(),
             storage.clone(),
-            limits,
+            limits.clone(),
             GitSourceLimits::default(),
             [7; 32],
         )
@@ -1233,6 +1649,91 @@ mod tests {
                 .await
                 .is_ok()
         );
+        let concurrent_commit = "c".repeat(40);
+        let concurrent_source = prepared_source_for_registry_test(
+            "ws",
+            "o/r",
+            &concurrent_commit,
+            CasBlob {
+                hash: hex::encode(Sha256::digest(pack_bytes)),
+                len: 4,
+            },
+            CasBlob {
+                hash: hex::encode(Sha256::digest(index_bytes)),
+                len: 5,
+            },
+        )
+        .unwrap();
+        let concurrent_view = concurrent_source
+            .registry_view(&GitSourceLimits::default())
+            .unwrap();
+        storage
+            .put(&concurrent_view.root.hash, &concurrent_view.root_bytes)
+            .unwrap();
+        let left = registry.clone();
+        let right = registry.clone();
+        let (one, two) = tokio::join!(
+            left.begin_acquisition(
+                "ws",
+                "o/r",
+                &concurrent_commit,
+                1,
+                "one",
+                "one",
+                60,
+                SyncIntent::EnsureCurrent
+            ),
+            right.begin_acquisition(
+                "ws",
+                "o/r",
+                &concurrent_commit,
+                1,
+                "two",
+                "two",
+                60,
+                SyncIntent::EnsureCurrent
+            )
+        );
+        let one = one.unwrap();
+        let two = two.unwrap();
+        assert!(matches!(
+            (&one, &two),
+            (
+                SourceBeginOutcome::PermitToPrepare(_),
+                SourceBeginOutcome::Deferred { .. }
+            ) | (
+                SourceBeginOutcome::Deferred { .. },
+                SourceBeginOutcome::PermitToPrepare(_)
+            )
+        ));
+        let concurrent_permit = match (one, two) {
+            (SourceBeginOutcome::PermitToPrepare(v), _)
+            | (_, SourceBeginOutcome::PermitToPrepare(v)) => v,
+            _ => unreachable!(),
+        };
+        let (concurrent_acquisition, _) = registry
+            .bind_prepared_graph(&concurrent_permit, &concurrent_source)
+            .await
+            .unwrap();
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        assert!(
+            registry
+                .register(&concurrent_acquisition, &concurrent_source, &cancelled)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT state FROM git_source_acquisitions WHERE token=?"
+            )
+            .bind(&concurrent_acquisition.token)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            "failed",
+            "cancelled verification left an active acquisition"
+        );
         let snapshot = match registry
             .begin_acquisition(
                 "ws",
@@ -1265,9 +1766,160 @@ mod tests {
             matches!(outcome,ArtifactObservationOutcome::Recorded{artifacts,..} if artifacts.len()==2)
         );
         assert_eq!(sqlx::query_scalar::<_,i64>("SELECT count(*) FROM git_source_consumers WHERE purpose='intent' AND expires_at=9223372036854775807").fetch_one(&pool).await.unwrap(),2);
+        assert_eq!(sqlx::query_scalar::<_,i64>("SELECT count(*) FROM artifact_observations WHERE workspace='ws' AND repo='o/r' AND branch='main'").fetch_one(&pool).await.unwrap(),1,"only the immediately promoted mode publishes an observation under workspace capacity one");
+        sqlx::query("INSERT INTO artifact_gc_sweep(id,owner,expires_at) VALUES(1,'test',UNIX_TIMESTAMP()+60)").execute(&pool).await.unwrap();
+        assert!(registry.retire_registered_roots_page(60, 1).await.is_err());
+        sqlx::query("DELETE FROM artifact_gc_sweep")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            registry.retire_registered_roots_page(60, 1).await.unwrap(),
+            0,
+            "live branch and intent roots are not retired"
+        );
+
+        // More than 64 old deferred rows in one saturated workspace must not
+        // hide a first-round eligible workspace behind the scan prefix.
+        let mut planted = pool.acquire().await.unwrap();
+        sqlx::query("SET FOREIGN_KEY_CHECKS=0")
+            .execute(&mut *planted)
+            .await
+            .unwrap();
+        for ordinal in 0..80i64 {
+            sqlx::query("INSERT INTO artifact_intents(workspace,repo,branch,branch_generation,source_root_hash,source_format_version,commit_oid,kind,format_version,state,artifact_id,consumer_id,created_at,updated_at) VALUES('ws','o/r',?,1,?,1,?,'head',?,'deferred',NULL,?,1,1)").bind(format!("blocked-{ordinal}")).bind(&view.root.hash).bind("a".repeat(40)).bind(1000+ordinal).bind(format!("plant-blocked-{ordinal}")).execute(&mut *planted).await.unwrap();
+        }
+        sqlx::query("INSERT INTO branch_observations(workspace,repo,branch,generation,desired_commit,updated_at) VALUES('z','o/r','eligible',1,?,1)").bind("b".repeat(40)).execute(&mut *planted).await.unwrap();
+        sqlx::query("INSERT INTO artifact_intents(workspace,repo,branch,branch_generation,source_root_hash,source_format_version,commit_oid,kind,format_version,state,artifact_id,consumer_id,created_at,updated_at) VALUES('z','o/r','eligible',1,?,1,?,'head',1,'deferred',NULL,'plant-eligible',1,1)").bind(&view.root.hash).bind("b".repeat(40)).execute(&mut *planted).await.unwrap();
+        sqlx::query("SET FOREIGN_KEY_CHECKS=1")
+            .execute(&mut *planted)
+            .await
+            .unwrap();
+        drop(planted);
+        assert_eq!(registry.promote_deferred_page(1).await.unwrap(), 1);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM artifact_intents WHERE workspace='z' AND state='promoted'"
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            1,
+            "fair promotion skipped the saturated >64-row prefix"
+        );
+        assert_eq!(sqlx::query_scalar::<_,i64>("SELECT count(*) FROM artifact_observations WHERE workspace='z' AND branch='eligible'").fetch_one(&pool).await.unwrap(),1,"deferred promotion atomically published observation");
+        sqlx::query("DELETE FROM artifact_consumers WHERE consumer_id LIKE 'plant-%'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM artifact_observations WHERE workspace='z'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM artifact_intents WHERE consumer_id LIKE 'plant-%'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM branch_observations WHERE workspace='z'")
+            .execute(&pool)
+            .await
+            .unwrap();
         validate_mysql_v7_state(&mut pool.acquire().await.unwrap().detach())
             .await
             .unwrap();
+
+        // The forward FKs and row CHECKs deliberately cannot express these
+        // cross-row proofs. Startup validation must reject every malformed
+        // hybrid, while a rollback proves the negative test is non-destructive.
+        let mut corrupt = pool.acquire().await.unwrap().detach();
+        sqlx::raw_sql("START TRANSACTION")
+            .execute(&mut corrupt)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE git_source_acquisitions SET semantic_digest=? WHERE token=?")
+            .bind("d".repeat(64))
+            .bind(snapshot.registration_token())
+            .execute(&mut corrupt)
+            .await
+            .unwrap();
+        assert!(
+            validate_mysql_v7_state(&mut corrupt).await.is_err(),
+            "registered acquisition/root descriptor disagreement was accepted"
+        );
+        sqlx::raw_sql("ROLLBACK")
+            .execute(&mut corrupt)
+            .await
+            .unwrap();
+
+        sqlx::raw_sql("START TRANSACTION")
+            .execute(&mut corrupt)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM git_source_desires WHERE root_hash=?")
+            .bind(snapshot.manifest())
+            .execute(&mut corrupt)
+            .await
+            .unwrap();
+        assert!(
+            validate_mysql_v7_state(&mut corrupt).await.is_err(),
+            "registered root and acquisition without a durable desire were accepted"
+        );
+        sqlx::raw_sql("ROLLBACK")
+            .execute(&mut corrupt)
+            .await
+            .unwrap();
+
+        sqlx::raw_sql("START TRANSACTION")
+            .execute(&mut corrupt)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM artifact_intents WHERE workspace='ws'")
+            .execute(&mut corrupt)
+            .await
+            .unwrap();
+        assert!(
+            validate_mysql_v7_state(&mut corrupt).await.is_err(),
+            "orphaned intent source/artifact consumers were accepted"
+        );
+        sqlx::raw_sql("ROLLBACK")
+            .execute(&mut corrupt)
+            .await
+            .unwrap();
+
+        sqlx::raw_sql("START TRANSACTION")
+            .execute(&mut corrupt)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE git_source_acquisitions SET semantic_digest=? WHERE token=?")
+            .bind("A".repeat(64))
+            .bind(snapshot.registration_token())
+            .execute(&mut corrupt)
+            .await
+            .unwrap();
+        assert!(
+            validate_mysql_v7_state(&mut corrupt).await.is_err(),
+            "uppercase acquisition digest was accepted"
+        );
+        sqlx::raw_sql("ROLLBACK")
+            .execute(&mut corrupt)
+            .await
+            .unwrap();
+
+        sqlx::raw_sql("CREATE TABLE branch_source_planted(id BIGINT PRIMARY KEY) ENGINE=InnoDB")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            validate_mysql_v7_prefix(&mut pool.acquire().await.unwrap().detach(), true)
+                .await
+                .is_err(),
+            "planted source-namespace table was accepted"
+        );
+        sqlx::raw_sql("DROP TABLE branch_source_planted")
+            .execute(&pool)
+            .await
+            .unwrap();
+        validate_mysql_v7_state(&mut corrupt).await.unwrap();
         let _: Option<i64> =
             sqlx::query_scalar("SELECT RELEASE_LOCK('ripclone_mysql_source_registry_test')")
                 .fetch_one(&mut lock)
