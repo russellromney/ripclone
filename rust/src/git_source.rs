@@ -810,6 +810,9 @@ pub struct AuthenticatedGitSource {
 }
 
 impl AuthenticatedGitSource {
+    pub(crate) fn root_hash(&self) -> &str {
+        &self.root.hash
+    }
     /// Mint the worker capability from an already authenticated durable
     /// registry row. This function does not perform or pretend to perform that
     /// transaction; the future registry adapter owns that responsibility.
@@ -865,6 +868,30 @@ pub struct GitSourcePackager<'a, U: GitSourceUploader> {
     limits: GitSourceLimits,
 }
 
+pub(crate) struct OwnedGitSourceUpload<U: GitSourceUploader> {
+    local_cas_root: PathBuf,
+    uploader: U,
+    root: CasBlob,
+    root_bytes: Vec<u8>,
+    packs: Vec<GitPackPair>,
+}
+
+impl<U: GitSourceUploader> OwnedGitSourceUpload<U> {
+    pub(crate) fn publish(self, cancelled: &CancellationToken) -> Result<()> {
+        let local_cas = Cas::new(self.local_cas_root)?;
+        for pair in &self.packs {
+            check_cancelled(cancelled)?;
+            self.uploader
+                .put_file(&pair.pack, &local_cas.path(&pair.pack.hash), cancelled)?;
+            self.uploader
+                .put_file(&pair.index, &local_cas.path(&pair.index.hash), cancelled)?;
+        }
+        check_cancelled(cancelled)?;
+        self.uploader
+            .put_bytes(&self.root, &self.root_bytes, cancelled)
+    }
+}
+
 impl<'a, U: GitSourceUploader> GitSourcePackager<'a, U> {
     pub fn new(
         local_cas: &'a Cas,
@@ -893,7 +920,7 @@ impl<'a, U: GitSourceUploader> GitSourcePackager<'a, U> {
 
     /// Build and fully verify the immutable source graph in local CAS. No
     /// durable object is written: callers must first register the returned
-    /// graph as a provisional GC root, then call [`Self::publish_prepared`].
+    /// graph as a provisional GC root, then publish it through the registry.
     pub fn prepare_local(
         &self,
         source: TrustedProviderFetch,
@@ -987,18 +1014,35 @@ impl<'a, U: GitSourceUploader> GitSourcePackager<'a, U> {
         Ok(PreparedGitSource { root, manifest })
     }
 
-    /// Publish an already-protected provisional graph. Publication order is a
-    /// safety property: every child is durable before the sole root.
-    pub(crate) fn publish_prepared(
+    pub(crate) fn owned_upload_plan(
         &self,
         prepared: &PreparedGitSource,
-        permit: &crate::git_source_registry::GitSourcePublicationPermit,
-        cancelled: &CancellationToken,
-    ) -> Result<()> {
-        permit.validate(prepared)?;
-        self.publish_unchecked(prepared, cancelled)
+    ) -> Result<OwnedGitSourceUpload<U>>
+    where
+        U: Clone,
+    {
+        let root_bytes = prepared.manifest.canonical_bytes()?;
+        let expected = CasBlob {
+            hash: hex::encode(Sha256::digest(&root_bytes)),
+            len: root_bytes.len() as u64,
+        };
+        if expected != prepared.root {
+            bail!("prepared Git source root is not canonical")
+        }
+        Ok(OwnedGitSourceUpload {
+            local_cas_root: self
+                .local_cas
+                .root()
+                .canonicalize()
+                .context("canonicalize local Git source CAS")?,
+            uploader: (*self.uploader).clone(),
+            root: prepared.root.clone(),
+            root_bytes,
+            packs: prepared.manifest.packs.clone(),
+        })
     }
 
+    #[cfg(test)]
     fn publish_unchecked(
         &self,
         prepared: &PreparedGitSource,
