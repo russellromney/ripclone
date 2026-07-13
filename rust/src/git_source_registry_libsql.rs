@@ -7,19 +7,31 @@
 
 use super::{
     GitSourceAcquisition, GitSourcePreparePermit, GitSourcePublicationPermit,
-    SOURCE_FORMAT_VERSION, SOURCE_ROOT_PAGE_MAX, SQLITE_V7_SCHEMA, SourceAcquireOutcome,
-    SourceBeginOutcome, SourceGcObject, canonical_ddl, checked_i64, checked_u32, checked_u64,
-    expected_sqlite_v7_ddl, operation_id, validate_acquire_identity, verify_acquisition_identity,
-    verify_storage_graph,
+    GitSourceRegistryRecord, SOURCE_FORMAT_VERSION, SOURCE_INTENT_RETENTION_EXPIRY,
+    SOURCE_ROOT_PAGE_MAX, SQLITE_V7_SCHEMA, SourceAcquireOutcome, SourceBeginOutcome,
+    SourceGcObject, canonical_ddl, checked_i64, checked_u32, checked_u64, evidence_mac,
+    expected_sqlite_v7_ddl, operation_id, parse_object_format, validate_acquire_identity,
+    verify_acquisition_identity, verify_storage_graph,
 };
 use ::libsql::{Connection, Value};
 use anyhow::{Context, Result, bail};
+use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 
-use crate::artifact_scheduler::{FailureClass, SchedulerLimits, scheduler_limits_fingerprint};
-use crate::git_source::{GitSourceLimits, GitSourcePackager, GitSourceUploader, PreparedGitSource};
+use crate::artifact_manifest::CasBlob;
+use crate::artifact_scheduler::{
+    ArtifactKind, FailureClass, ObservationSnapshot, SchedulerLimits, scheduler_limits_fingerprint,
+};
+use crate::artifact_scheduler_backend::SOURCE_INTENT_CONSUMER_PREFIX;
+use crate::git_source::{
+    AuthenticatedGitSource, GitSourceLimits, GitSourcePackager, GitSourceUploader,
+    PreparedGitSource,
+};
 use crate::storage::StorageRef;
-use crate::sync_coordinator::{DurableSourceSnapshot, SyncIntent};
+use crate::sync_coordinator::{
+    ArtifactIntentOutcome, ArtifactObservation, ArtifactObservationOutcome, DurableSourceSnapshot,
+    SyncIntent,
+};
 use tokio_util::sync::CancellationToken;
 
 macro_rules! values {
@@ -546,6 +558,199 @@ impl LibsqlGitSourceRegistry {
         finish(transaction, result).await
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub async fn claim_authenticated(
+        &self,
+        artifact_id: i64,
+        artifact_owner: &str,
+        lease_generation: u64,
+        workspace: &str,
+        repo: &str,
+        commit: &str,
+        session_id: &str,
+        ttl_secs: i64,
+    ) -> Result<AuthenticatedGitSource> {
+        if artifact_id <= 0
+            || artifact_owner.trim().is_empty()
+            || lease_generation == 0
+            || session_id.len() != 64
+            || !session_id
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            || !(1..=86400).contains(&ttl_secs)
+        {
+            bail!("libsql builder source claim is invalid")
+        }
+        let connection = self.database.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(::libsql::TransactionBehavior::Immediate)
+            .await?;
+        let result:Result<AuthenticatedGitSource>=async{
+            let mut rows=transaction.query("SELECT r.root_hash,r.root_len,r.object_format,r.registration_generation,r.registration_operation FROM artifact_intents i JOIN artifact_jobs j ON j.id=i.artifact_id JOIN git_source_roots r ON r.root_hash=i.source_root_hash WHERE i.artifact_id=? AND i.state='promoted' AND i.workspace=? AND i.repo=? AND i.commit_oid=? AND i.source_format_version=? AND j.state='running' AND j.owner=? AND j.lease_generation=? AND j.lease_expires_at>unixepoch() AND r.state='registered'",values![artifact_id.into(),workspace.into(),repo.into(),commit.into(),(SOURCE_FORMAT_VERSION as i64).into(),artifact_owner.into(),(lease_generation as i64).into()]).await?;
+            let row=rows.next().await?.context("promoted libsql artifact does not own a live source claim")?;
+            let root=CasBlob{hash:row.get(0)?,len:checked_u64(row.get(1)?,"root length")?};let object_format=parse_object_format(&row.get::<String>(2)?)?;let generation:i64=row.get(3)?;let operation:String=row.get(4)?;drop(rows);
+            let consumer=format!("builder:{artifact_id}:{session_id}");
+            let changed=transaction.execute("INSERT INTO git_source_consumers(root_hash,consumer_id,session_id,workspace,repo,commit_oid,source_format_version,purpose,expires_at) VALUES(?,?,?,?,?,?,?,'builder',unixepoch()+?) ON CONFLICT(root_hash,consumer_id) DO UPDATE SET expires_at=excluded.expires_at WHERE git_source_consumers.session_id=excluded.session_id AND git_source_consumers.workspace=excluded.workspace AND git_source_consumers.repo=excluded.repo AND git_source_consumers.commit_oid=excluded.commit_oid",values![root.hash.clone().into(),consumer.into(),session_id.into(),workspace.into(),repo.into(),commit.into(),(SOURCE_FORMAT_VERSION as i64).into(),ttl_secs.into()]).await?;
+            if changed!=1{bail!("libsql builder source capability conflicts with existing claim")}
+            let mac=evidence_mac(&self.seal,&root,workspace,repo,commit,object_format,generation,&operation);
+            AuthenticatedGitSource::from_registry_record(GitSourceRegistryRecord{root,workspace:workspace.into(),repo:repo.into(),commit:commit.into(),object_format,evidence_mac:mac})
+        }.await;
+        finish(transaction, result).await
+    }
+
+    pub async fn renew_builder_claim(
+        &self,
+        artifact_id: i64,
+        artifact_owner: &str,
+        lease_generation: u64,
+        root_hash: &str,
+        session_id: &str,
+        ttl_secs: i64,
+    ) -> Result<bool> {
+        if artifact_id <= 0
+            || artifact_owner.trim().is_empty()
+            || lease_generation == 0
+            || !(1..=86400).contains(&ttl_secs)
+        {
+            bail!("libsql builder source claim TTL is invalid")
+        }
+        let connection = self.database.connect()?;
+        Ok(connection.execute("UPDATE git_source_consumers SET expires_at=unixepoch()+? WHERE root_hash=? AND session_id=? AND purpose='builder' AND expires_at>unixepoch() AND EXISTS(SELECT 1 FROM artifact_intents i JOIN artifact_jobs j ON j.id=i.artifact_id WHERE i.artifact_id=? AND i.source_root_hash=git_source_consumers.root_hash AND i.state='promoted' AND j.state='running' AND j.owner=? AND j.lease_generation=? AND j.lease_expires_at>unixepoch())",values![ttl_secs.into(),root_hash.into(),session_id.into(),artifact_id.into(),artifact_owner.into(),(lease_generation as i64).into()]).await?==1)
+    }
+
+    pub async fn release_builder_claim(&self, root_hash: &str, session_id: &str) -> Result<bool> {
+        let connection = self.database.connect()?;
+        Ok(connection.execute("DELETE FROM git_source_consumers WHERE root_hash=? AND session_id=? AND purpose='builder'",values![root_hash.into(),session_id.into()]).await?==1)
+    }
+
+    pub async fn promote_deferred_page(&self, limit: u32) -> Result<u32> {
+        if limit == 0 || limit > 256 {
+            bail!("libsql deferred intent promotion page is invalid")
+        }
+        let connection = self.database.connect()?;
+        let cursor = one_string(
+            &connection,
+            "SELECT intent_workspace_cursor FROM git_source_maintenance WHERE id=1",
+        )
+        .await?;
+        let scan_limit = (limit as i64).saturating_mul(16).clamp(64, 4096);
+        let mut rows=connection.query("WITH candidates AS (SELECT id,workspace,row_number() OVER(PARTITION BY workspace ORDER BY updated_at,id) round FROM artifact_intents WHERE state='deferred') SELECT id,workspace FROM candidates ORDER BY round,CASE WHEN workspace>? THEN 0 ELSE 1 END,workspace,id LIMIT ?",values![cursor.into(),scan_limit.into()]).await?;
+        let mut candidates = Vec::new();
+        while let Some(row) = rows.next().await? {
+            candidates.push((row.get::<i64>(0)?, row.get::<String>(1)?))
+        }
+        drop(rows);
+        let mut promoted = 0;
+        for (id, candidate_workspace) in candidates {
+            if promoted >= limit {
+                break;
+            }
+            let connection = self.database.connect()?;
+            let transaction = connection
+                .transaction_with_behavior(::libsql::TransactionBehavior::Immediate)
+                .await?;
+            let result:Result<bool>=async{
+                transaction.execute("UPDATE git_source_maintenance SET intent_cursor=?,intent_workspace_cursor=?,updated_at=unixepoch() WHERE id=1",values![id.into(),candidate_workspace.into()]).await?;
+                let mut rows=transaction.query("SELECT workspace,repo,branch,branch_generation,commit_oid,kind,format_version,consumer_id FROM artifact_intents WHERE id=? AND state='deferred'",[id]).await?;
+                let Some(row)=rows.next().await? else{return Ok(false)};
+                let workspace:String=row.get(0)?;let repo:String=row.get(1)?;let branch:String=row.get(2)?;let generation:i64=row.get(3)?;let commit:String=row.get(4)?;let kind=ArtifactKind::parse(&row.get::<String>(5)?)?;let format:i64=row.get(6)?;let consumer:String=row.get(7)?;drop(rows);
+                let existing=one_i64_params(&transaction,"SELECT count(*) FROM artifact_jobs WHERE workspace=? AND repo=? AND commit_oid=? AND kind=? AND format_version=?",values![workspace.clone().into(),repo.clone().into(),commit.clone().into(),kind.as_str().into(),format.into()]).await?;
+                if existing==0&&!libsql_capacity(&transaction,&self.scheduler_limits,&workspace,kind).await?{return Ok(false)}
+                let artifact=libsql_ensure_job(&transaction,&workspace,&repo,&commit,kind,format).await?;
+                if transaction.execute("UPDATE artifact_intents SET state='promoted',artifact_id=?,updated_at=unixepoch() WHERE id=? AND state='deferred'",values![artifact.into(),id.into()]).await?!=1{return Ok(false)}
+                transaction.execute("INSERT INTO artifact_consumers(artifact_id,consumer_id,expires_at) VALUES(?,?,?) ON CONFLICT(artifact_id,consumer_id) DO UPDATE SET expires_at=excluded.expires_at",values![artifact.into(),consumer.into(),SOURCE_INTENT_RETENTION_EXPIRY.into()]).await?;
+                upsert_artifact_observation(&transaction,&workspace,&repo,&branch,kind,&commit,artifact,generation,format).await?;
+                Ok(true)
+            }.await;
+            if finish(transaction, result).await? {
+                promoted += 1
+            }
+        }
+        Ok(promoted)
+    }
+
+    pub async fn reconcile_terminal_intents(&self, limit: u32) -> Result<u32> {
+        if limit == 0 || limit > 512 {
+            bail!("libsql intent reconciliation page is invalid")
+        }
+        let connection = self.database.connect()?;
+        let mut rows=connection.query("SELECT i.id,i.artifact_id,i.consumer_id FROM artifact_intents i JOIN artifact_jobs j ON j.id=i.artifact_id WHERE i.state='promoted' AND j.state IN('ready','failed') ORDER BY i.id LIMIT ?",[limit as i64]).await?;
+        let mut candidates = Vec::new();
+        while let Some(row) = rows.next().await? {
+            candidates.push((
+                row.get::<i64>(0)?,
+                row.get::<i64>(1)?,
+                row.get::<String>(2)?,
+            ))
+        }
+        drop(rows);
+        let mut settled = 0;
+        for (id, artifact, consumer) in candidates {
+            let connection = self.database.connect()?;
+            let transaction = connection
+                .transaction_with_behavior(::libsql::TransactionBehavior::Immediate)
+                .await?;
+            let result:Result<bool>=async{
+                let terminal=one_i64_params(&transaction,"SELECT count(*) FROM artifact_intents i JOIN artifact_jobs j ON j.id=i.artifact_id WHERE i.id=? AND i.artifact_id=? AND i.consumer_id=? AND i.state='promoted' AND (j.state='ready' OR (j.state='failed' AND (j.failure_class IN('permanent','dead_letter') OR (j.failure_class='retryable' AND j.retry_count>=?))))",values![id.into(),artifact.into(),consumer.clone().into(),(self.scheduler_limits.max_manual_retries as i64).into()]).await?;
+                if terminal!=1{return Ok(false)}
+                let source=transaction.execute("DELETE FROM git_source_consumers WHERE consumer_id=? AND purpose='intent'",[consumer.clone()]).await?;
+                let core=transaction.execute("DELETE FROM artifact_consumers WHERE artifact_id=? AND consumer_id=?",values![artifact.into(),consumer.into()]).await?;
+                if source!=1||core!=1{bail!("libsql terminal intent consumers are incomplete")}
+                if transaction.execute("DELETE FROM artifact_intents WHERE id=? AND artifact_id=? AND state='promoted'",values![id.into(),artifact.into()]).await?!=1{bail!("libsql terminal intent settlement lost")}
+                Ok(true)
+            }.await;
+            if finish(transaction, result).await? {
+                settled += 1
+            }
+        }
+        Ok(settled)
+    }
+
+    pub async fn prune_metadata_page(&self, limit: u32) -> Result<u64> {
+        if limit == 0 || limit > 1024 {
+            bail!("libsql source metadata prune page is invalid")
+        }
+        let connection = self.database.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(::libsql::TransactionBehavior::Immediate)
+            .await?;
+        let result:Result<u64>=async{
+            let mut changed=transaction.execute("DELETE FROM git_source_consumers WHERE rowid IN(SELECT rowid FROM git_source_consumers WHERE purpose='builder' AND expires_at<=unixepoch() ORDER BY expires_at,root_hash,consumer_id LIMIT ?)",[limit as i64]).await?;
+            changed+=transaction.execute("DELETE FROM branch_source_generations WHERE rowid IN(SELECT g.rowid FROM branch_source_generations g LEFT JOIN branch_source_current c ON c.workspace=g.workspace AND c.repo=g.repo AND c.branch=g.branch AND c.generation=g.generation LEFT JOIN artifact_intents i ON i.workspace=g.workspace AND i.repo=g.repo AND i.branch=g.branch AND i.branch_generation=g.generation WHERE c.workspace IS NULL AND i.id IS NULL ORDER BY g.created_at,g.workspace,g.repo,g.branch,g.generation LIMIT ?)",[limit as i64]).await?;
+            Ok(changed)
+        }.await;
+        finish(transaction, result).await
+    }
+
+    pub async fn retire_registered_roots_page(&self, grace_secs: i64, limit: u32) -> Result<u32> {
+        if grace_secs < 60 || limit == 0 || limit > 256 {
+            bail!("libsql source retirement grace or page is invalid")
+        }
+        let connection = self.database.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(::libsql::TransactionBehavior::Immediate)
+            .await?;
+        let result:Result<u32>=async{
+            if one_i64(&transaction,"SELECT count(*) FROM artifact_gc_sweep WHERE expires_at>unixepoch()").await?!=0{bail!("libsql source retirement is fenced by live GC sweep")}
+            let cursor=one_string(&transaction,"SELECT root_cursor FROM git_source_maintenance WHERE id=1").await?;
+            let mut rows=transaction.query("SELECT r.root_hash FROM git_source_roots r WHERE r.state='registered' AND r.registered_at<=unixepoch()-? AND r.root_hash>? AND NOT EXISTS(SELECT 1 FROM branch_source_generations g WHERE g.root_hash=r.root_hash) AND NOT EXISTS(SELECT 1 FROM artifact_intents i WHERE i.source_root_hash=r.root_hash) AND NOT EXISTS(SELECT 1 FROM git_source_consumers c WHERE c.root_hash=r.root_hash) AND NOT EXISTS(SELECT 1 FROM git_source_acquisitions a WHERE a.root_hash=r.root_hash AND a.state IN('held','graph_published','activation_unknown')) ORDER BY r.root_hash LIMIT ?",values![grace_secs.into(),cursor.into(),(limit as i64).into()]).await?;
+            let mut roots=Vec::new();while let Some(row)=rows.next().await?{roots.push(row.get::<String>(0)?)}drop(rows);
+            let mut retired=0;
+            for root in &roots{
+                transaction.execute("DELETE FROM git_source_desires WHERE root_hash=? AND state='registered'",[root.clone()]).await?;
+                transaction.execute("DELETE FROM git_source_acquisition_members WHERE token IN(SELECT token FROM git_source_acquisitions WHERE root_hash=? AND state='registered')",[root.clone()]).await?;
+                transaction.execute("DELETE FROM git_source_acquisitions WHERE root_hash=? AND state='registered'",[root.clone()]).await?;
+                transaction.execute("DELETE FROM git_source_members WHERE root_hash=?",[root.clone()]).await?;
+                if transaction.execute("DELETE FROM git_source_roots WHERE root_hash=? AND state='registered' AND NOT EXISTS(SELECT 1 FROM branch_source_generations WHERE root_hash=?) AND NOT EXISTS(SELECT 1 FROM artifact_intents WHERE source_root_hash=?) AND NOT EXISTS(SELECT 1 FROM git_source_consumers WHERE root_hash=?)",values![root.clone().into(),root.clone().into(),root.clone().into(),root.clone().into()]).await?!=1{bail!("libsql source root retirement lost reference proof")}
+                retired+=1;
+            }
+            let next=if roots.len()==limit as usize{roots.last().cloned().unwrap_or_default()}else{String::new()};
+            transaction.execute("UPDATE git_source_maintenance SET root_cursor=?,updated_at=unixepoch() WHERE id=1",[next]).await?;
+            Ok(retired)
+        }.await;
+        finish(transaction, result).await
+    }
+
     pub async fn source_gc_page(
         &self,
         after: Option<(&str, &str)>,
@@ -607,6 +812,213 @@ impl LibsqlGitSourceRegistry {
         hash.update(scheduler.max_manual_retries.to_be_bytes());
         hex::encode(hash.finalize())
     }
+}
+
+#[async_trait]
+impl ArtifactObservation for LibsqlGitSourceRegistry {
+    async fn snapshot(
+        &self,
+        workspace: &str,
+        repo: &str,
+        branch: &str,
+    ) -> Result<ObservationSnapshot> {
+        let connection = self.database.connect()?;
+        let mut rows = connection
+            .query(
+                "SELECT generation,desired_commit FROM branch_observations WHERE workspace=? AND repo=? AND branch=?",
+                values![workspace.into(), repo.into(), branch.into()],
+            )
+            .await?;
+        match rows.next().await? {
+            Some(row) => Ok(ObservationSnapshot::new(
+                workspace,
+                repo,
+                branch,
+                Some(checked_u64(row.get(0)?, "branch generation")?),
+                Some(row.get(1)?),
+            )),
+            None => Ok(ObservationSnapshot::new(
+                workspace, repo, branch, None, None,
+            )),
+        }
+    }
+
+    async fn record_tip_and_intents(
+        &self,
+        snapshot: &ObservationSnapshot,
+        source: &DurableSourceSnapshot,
+        kinds: &[ArtifactKind],
+        format_version: u32,
+        intent: SyncIntent,
+    ) -> Result<ArtifactObservationOutcome> {
+        if snapshot.workspace() != source.workspace()
+            || snapshot.repo() != source.repo()
+            || kinds.is_empty()
+            || format_version == 0
+        {
+            bail!("libsql source observation identity is invalid")
+        }
+        let mut unique = Vec::new();
+        for kind in kinds {
+            if !unique.contains(kind) {
+                unique.push(*kind)
+            }
+        }
+        let connection = self.database.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(::libsql::TransactionBehavior::Immediate)
+            .await?;
+        let result: Result<ArtifactObservationOutcome> = async {
+            let registered=one_i64_params(&transaction,"SELECT count(*) FROM git_source_acquisitions a JOIN git_source_roots r ON r.root_hash=a.root_hash WHERE a.token=? AND a.generation=? AND a.state='registered' AND a.workspace=? AND a.repo=? AND a.commit_oid=? AND a.root_hash=? AND r.state='registered'",values![source.registration_token().into(),(source.registration_generation() as i64).into(),source.workspace().into(),source.repo().into(),source.commit().into(),source.manifest().into()]).await?;
+            if registered != 1 {
+                bail!("libsql source snapshot is not an exact registered capability")
+            }
+            let mut current_rows=transaction.query("SELECT generation,desired_commit FROM branch_observations WHERE workspace=? AND repo=? AND branch=?",values![snapshot.workspace().into(),snapshot.repo().into(),snapshot.branch().into()]).await?;
+            let current=match current_rows.next().await?{Some(row)=>Some((row.get::<i64>(0)?,row.get::<String>(1)?)),None=>None};drop(current_rows);
+            let current_generation=current.as_ref().map(|value|checked_u64(value.0,"branch generation")).transpose()?;
+            if current_generation!=snapshot.generation(){return Ok(ArtifactObservationOutcome::Stale{current_generation:current_generation.unwrap_or(0)})}
+            let same=current.as_ref().is_some_and(|(_,commit)|commit==source.commit());
+            let generation=if same{current_generation.context("same-tip branch lacks generation")?}else{current_generation.unwrap_or(0).checked_add(1).context("branch generation overflow")?};
+            if !same{
+                let mut deferred_rows=transaction.query("SELECT consumer_id FROM artifact_intents WHERE workspace=? AND repo=? AND branch=? AND state='deferred'",values![snapshot.workspace().into(),snapshot.repo().into(),snapshot.branch().into()]).await?;
+                let mut deferred=Vec::new();while let Some(row)=deferred_rows.next().await?{deferred.push(row.get::<String>(0)?)}drop(deferred_rows);
+                for consumer in deferred{transaction.execute("DELETE FROM git_source_consumers WHERE consumer_id=? AND purpose='intent'",[consumer]).await?;}
+                transaction.execute("DELETE FROM artifact_intents WHERE workspace=? AND repo=? AND branch=? AND state='deferred'",values![snapshot.workspace().into(),snapshot.repo().into(),snapshot.branch().into()]).await?;
+                transaction.execute("INSERT INTO branch_source_generations(workspace,repo,branch,generation,commit_oid,source_format_version,root_hash,created_at) VALUES(?,?,?,?,?,?,?,unixepoch())",values![snapshot.workspace().into(),snapshot.repo().into(),snapshot.branch().into(),(generation as i64).into(),source.commit().into(),(SOURCE_FORMAT_VERSION as i64).into(),source.manifest().into()]).await?;
+                transaction.execute("INSERT INTO branch_observations(workspace,repo,branch,generation,desired_commit,updated_at) VALUES(?,?,?,?,?,unixepoch()) ON CONFLICT(workspace,repo,branch) DO UPDATE SET generation=excluded.generation,desired_commit=excluded.desired_commit,updated_at=excluded.updated_at",values![snapshot.workspace().into(),snapshot.repo().into(),snapshot.branch().into(),(generation as i64).into(),source.commit().into()]).await?;
+                transaction.execute("INSERT INTO branch_source_current(workspace,repo,branch,generation) VALUES(?,?,?,?) ON CONFLICT(workspace,repo,branch) DO UPDATE SET generation=excluded.generation",values![snapshot.workspace().into(),snapshot.repo().into(),snapshot.branch().into(),(generation as i64).into()]).await?;
+            }else{
+                let exact=one_i64_params(&transaction,"SELECT count(*) FROM branch_source_generations g JOIN branch_source_current c USING(workspace,repo,branch,generation) WHERE g.workspace=? AND g.repo=? AND g.branch=? AND g.generation=? AND g.commit_oid=? AND g.root_hash=?",values![snapshot.workspace().into(),snapshot.repo().into(),snapshot.branch().into(),(generation as i64).into(),source.commit().into(),source.manifest().into()]).await?;
+                if exact!=1{bail!("same-tip libsql source generation differs from registered capability")}
+            }
+            let mut outcomes=Vec::new();
+            for kind in unique{
+                let mut intent_rows=transaction.query("SELECT id,state,artifact_id FROM artifact_intents WHERE workspace=? AND repo=? AND branch=? AND branch_generation=? AND kind=? AND format_version=?",values![snapshot.workspace().into(),snapshot.repo().into(),snapshot.branch().into(),(generation as i64).into(),kind.as_str().into(),(format_version as i64).into()]).await?;
+                if let Some(row)=intent_rows.next().await?{
+                    let id:i64=row.get(0)?;let state:String=row.get(1)?;let artifact:Option<i64>=row.get(2)?;drop(intent_rows);
+                    if state=="deferred"{outcomes.push((kind,ArtifactIntentOutcome::Deferred(id)));continue}
+                    outcomes.push((kind,libsql_job_outcome(&transaction,artifact.context("promoted intent lacks artifact")?,intent,self.scheduler_limits.max_manual_retries).await?));continue
+                }
+                drop(intent_rows);
+                let consumer=format!("{}{}",SOURCE_INTENT_CONSUMER_PREFIX,hex::encode(rand::random::<[u8;24]>()));
+                let session=hex::encode(rand::random::<[u8;32]>());
+                let existing=one_i64_params(&transaction,"SELECT count(*) FROM artifact_jobs WHERE workspace=? AND repo=? AND commit_oid=? AND kind=? AND format_version=?",values![snapshot.workspace().into(),snapshot.repo().into(),source.commit().into(),kind.as_str().into(),(format_version as i64).into()]).await?;
+                let promote=existing==1||libsql_capacity(&transaction,&self.scheduler_limits,snapshot.workspace(),kind).await?;
+                let artifact=if promote{Some(libsql_ensure_job(&transaction,snapshot.workspace(),snapshot.repo(),source.commit(),kind,format_version as i64).await?)}else{None};
+                transaction.execute("INSERT INTO artifact_intents(workspace,repo,branch,branch_generation,source_root_hash,source_format_version,commit_oid,kind,format_version,state,artifact_id,consumer_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,unixepoch(),unixepoch())",values![snapshot.workspace().into(),snapshot.repo().into(),snapshot.branch().into(),(generation as i64).into(),source.manifest().into(),(SOURCE_FORMAT_VERSION as i64).into(),source.commit().into(),kind.as_str().into(),(format_version as i64).into(),if promote{"promoted".into()}else{"deferred".into()},artifact.into(),consumer.clone().into()]).await?;
+                let intent_id=one_i64(&transaction,"SELECT last_insert_rowid()").await?;
+                transaction.execute("INSERT INTO git_source_consumers(root_hash,consumer_id,session_id,workspace,repo,commit_oid,source_format_version,purpose,expires_at) VALUES(?,?,?,?,?,?,?,'intent',?)",values![source.manifest().into(),consumer.clone().into(),session.into(),source.workspace().into(),source.repo().into(),source.commit().into(),(SOURCE_FORMAT_VERSION as i64).into(),SOURCE_INTENT_RETENTION_EXPIRY.into()]).await?;
+                if let Some(artifact)=artifact{
+                    transaction.execute("INSERT INTO artifact_consumers(artifact_id,consumer_id,expires_at) VALUES(?,?,?)",values![artifact.into(),consumer.into(),SOURCE_INTENT_RETENTION_EXPIRY.into()]).await?;
+                    upsert_artifact_observation(&transaction,snapshot.workspace(),snapshot.repo(),snapshot.branch(),kind,source.commit(),artifact,generation as i64,format_version as i64).await?;
+                    outcomes.push((kind,libsql_job_outcome(&transaction,artifact,intent,self.scheduler_limits.max_manual_retries).await?));
+                }else{outcomes.push((kind,ArtifactIntentOutcome::Deferred(intent_id)))}
+            }
+            Ok(ArtifactObservationOutcome::Recorded{generation,advanced:!same,artifacts:outcomes})
+        }.await;
+        finish(transaction, result).await
+    }
+}
+
+async fn libsql_capacity(
+    connection: &Connection,
+    limits: &SchedulerLimits,
+    workspace: &str,
+    kind: ArtifactKind,
+) -> Result<bool> {
+    let total = one_i64(
+        connection,
+        "SELECT count(*) FROM artifact_jobs WHERE state IN('queued','running')",
+    )
+    .await?;
+    let local = one_i64_params(
+        connection,
+        "SELECT count(*) FROM artifact_jobs WHERE state IN('queued','running') AND workspace=?",
+        [Value::from(workspace)].into(),
+    )
+    .await?;
+    let lane = one_i64_params(
+        connection,
+        "SELECT count(*) FROM artifact_jobs WHERE state IN('queued','running') AND kind=?",
+        [Value::from(kind.as_str())].into(),
+    )
+    .await?;
+    let expensive=one_i64(connection,"SELECT count(*) FROM artifact_jobs WHERE state IN('queued','running') AND kind IN('full_history','files')").await?;
+    let lane_limit = match kind {
+        ArtifactKind::Head => limits.head_backlog,
+        ArtifactKind::FullHistory => limits.full_history_backlog,
+        ArtifactKind::Files => limits.files_backlog,
+    };
+    Ok(total < limits.total_backlog as i64
+        && local < limits.workspace_backlog as i64
+        && lane < lane_limit as i64
+        && (!matches!(kind, ArtifactKind::FullHistory | ArtifactKind::Files)
+            || expensive < limits.total_backlog.saturating_sub(limits.head_reserved) as i64))
+}
+
+async fn libsql_ensure_job(
+    connection: &Connection,
+    workspace: &str,
+    repo: &str,
+    commit: &str,
+    kind: ArtifactKind,
+    format: i64,
+) -> Result<i64> {
+    let mut rows=connection.query("SELECT id FROM artifact_jobs WHERE workspace=? AND repo=? AND commit_oid=? AND kind=? AND format_version=?",values![workspace.into(),repo.into(),commit.into(),kind.as_str().into(),format.into()]).await?;
+    if let Some(row) = rows.next().await? {
+        return Ok(row.get(0)?);
+    }
+    drop(rows);
+    connection.execute("INSERT INTO artifact_jobs(workspace,repo,commit_oid,kind,format_version,state,created_at,updated_at) VALUES(?,?,?,?,?,'queued',unixepoch(),unixepoch())",values![workspace.into(),repo.into(),commit.into(),kind.as_str().into(),format.into()]).await?;
+    one_i64(connection, "SELECT last_insert_rowid()").await
+}
+
+async fn libsql_job_outcome(
+    connection: &Connection,
+    id: i64,
+    intent: SyncIntent,
+    max_retries: u32,
+) -> Result<ArtifactIntentOutcome> {
+    let mut rows = connection
+        .query(
+            "SELECT state,failure_class,retry_count FROM artifact_jobs WHERE id=?",
+            [id],
+        )
+        .await?;
+    let row = rows
+        .next()
+        .await?
+        .context("libsql artifact intent job missing")?;
+    let mut state: String = row.get(0)?;
+    let class = row
+        .get::<Option<String>>(1)?
+        .map(|value| FailureClass::parse(&value))
+        .transpose()?;
+    let retries = checked_u32(row.get(2)?, "artifact retries")?;
+    drop(rows);
+    if state=="failed"&&intent==SyncIntent::EnsureCurrent&&class==Some(FailureClass::Retryable)&&retries<max_retries&&connection.execute("UPDATE artifact_jobs SET state='queued',owner=NULL,heartbeat_at=NULL,lease_expires_at=NULL,manifest=NULL,error=NULL,failure_class=NULL,retry_count=retry_count+1,updated_at=unixepoch() WHERE id=? AND state='failed' AND failure_class='retryable' AND retry_count=?",values![id.into(),(retries as i64).into()]).await?==1{state="queued".into()}
+    Ok(match state.as_str() {
+        "ready" => ArtifactIntentOutcome::Ready(id),
+        "failed" => ArtifactIntentOutcome::Failed(id, class.unwrap_or(FailureClass::Permanent)),
+        "queued" | "running" => ArtifactIntentOutcome::Subscribed(id),
+        _ => bail!("libsql artifact job state is invalid"),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn upsert_artifact_observation(
+    connection: &Connection,
+    workspace: &str,
+    repo: &str,
+    branch: &str,
+    kind: ArtifactKind,
+    commit: &str,
+    artifact: i64,
+    generation: i64,
+    format: i64,
+) -> Result<()> {
+    connection.execute("INSERT INTO artifact_observations(workspace,repo,branch,kind,desired_commit,desired_artifact_id,desired_generation,published_artifact_id,format_version,observed_at) VALUES(?,?,?,?,?,?,?,CASE WHEN (SELECT state FROM artifact_jobs WHERE id=?)='ready' THEN ? ELSE NULL END,?,unixepoch()) ON CONFLICT(workspace,repo,branch,kind) DO UPDATE SET desired_commit=excluded.desired_commit,desired_artifact_id=excluded.desired_artifact_id,desired_generation=excluded.desired_generation,published_artifact_id=CASE WHEN excluded.published_artifact_id IS NOT NULL THEN excluded.published_artifact_id WHEN artifact_observations.format_version=excluded.format_version THEN artifact_observations.published_artifact_id ELSE NULL END,format_version=excluded.format_version,observed_at=excluded.observed_at",values![workspace.into(),repo.into(),branch.into(),kind.as_str().into(),commit.into(),artifact.into(),generation.into(),artifact.into(),artifact.into(),format.into()]).await?;
+    Ok(())
 }
 
 pub(crate) async fn install_v7_schema(connection: &Connection) -> Result<()> {
@@ -1065,5 +1477,282 @@ mod tests {
             }
         ));
         drop(server);
+    }
+
+    async fn registered_source(
+        registry: &LibsqlGitSourceRegistry,
+        workspace: &str,
+        commit: &str,
+    ) -> DurableSourceSnapshot {
+        let pack_bytes = format!("pack-{commit}").into_bytes();
+        let index_bytes = format!("index-{commit}").into_bytes();
+        let pack = CasBlob {
+            hash: hex::encode(Sha256::digest(&pack_bytes)),
+            len: pack_bytes.len() as u64,
+        };
+        let index = CasBlob {
+            hash: hex::encode(Sha256::digest(&index_bytes)),
+            len: index_bytes.len() as u64,
+        };
+        registry.storage.put(&pack.hash, &pack_bytes).unwrap();
+        registry.storage.put(&index.hash, &index_bytes).unwrap();
+        let prepared = crate::git_source::prepared_source_for_registry_test(
+            workspace, "o/r", commit, pack, index,
+        )
+        .unwrap();
+        let view = prepared.registry_view(&GitSourceLimits::default()).unwrap();
+        registry
+            .storage
+            .put(&view.root.hash, &view.root_bytes)
+            .unwrap();
+        let permit = match registry
+            .begin_acquisition(
+                workspace,
+                "o/r",
+                commit,
+                SOURCE_FORMAT_VERSION,
+                "worker",
+                &format!("attempt-{commit}"),
+                60,
+                SyncIntent::EnsureCurrent,
+            )
+            .await
+            .unwrap()
+        {
+            SourceBeginOutcome::PermitToPrepare(permit) => permit,
+            _ => panic!("source preparation was not admitted"),
+        };
+        let (acquisition, _publication) = registry
+            .bind_prepared_graph(&permit, &prepared)
+            .await
+            .unwrap();
+        registry
+            .register(&acquisition, &prepared, &CancellationToken::new())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn intents_builder_alias_and_gc_retirement_are_atomic() {
+        let Some((_server, database, _connection)) = connection().await else {
+            return;
+        };
+        let limits = SchedulerLimits::default();
+        let shared = Arc::new(database);
+        LibsqlArtifactScheduler::from_shared_database(
+            shared.clone(),
+            limits.clone(),
+            Arc::new(Accept),
+        )
+        .await
+        .unwrap();
+        let storage_dir = tempfile::tempdir().unwrap();
+        let storage: StorageRef = Arc::new(LocalStorage::new(storage_dir.path()).unwrap());
+        let registry = LibsqlGitSourceRegistry::new(
+            shared.clone(),
+            storage,
+            limits,
+            GitSourceLimits::default(),
+            [3; 32],
+        )
+        .await
+        .unwrap();
+        let first_commit = "1111111111111111111111111111111111111111";
+        let first = registered_source(&registry, "ws", first_commit).await;
+        let snapshot = registry.snapshot("ws", "o/r", "main").await.unwrap();
+        let first_outcome = registry
+            .record_tip_and_intents(
+                &snapshot,
+                &first,
+                &[ArtifactKind::Head],
+                1,
+                SyncIntent::EnsureCurrent,
+            )
+            .await
+            .unwrap();
+        let ArtifactObservationOutcome::Recorded { artifacts, .. } = first_outcome else {
+            panic!("first source observation was stale")
+        };
+        let first_job = match artifacts[0].1 {
+            ArtifactIntentOutcome::Subscribed(id) => id,
+            _ => panic!("first Head intent was not promoted"),
+        };
+        let connection = shared.connect().unwrap();
+        assert_eq!(one_i64(&connection,"SELECT count(*) FROM artifact_intents i JOIN git_source_consumers s ON s.consumer_id=i.consumer_id JOIN artifact_consumers a ON a.consumer_id=i.consumer_id AND a.artifact_id=i.artifact_id WHERE i.state='promoted' AND s.expires_at=9223372036854775807 AND a.expires_at=9223372036854775807").await.unwrap(),1);
+        connection.execute("UPDATE artifact_jobs SET state='ready',manifest=?,updated_at=unixepoch() WHERE id=?",values!["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),first_job.into()]).await.unwrap();
+        connection.execute("UPDATE artifact_observations SET published_artifact_id=? WHERE desired_artifact_id=?",values![first_job.into(),first_job.into()]).await.unwrap();
+
+        let second_commit = "2222222222222222222222222222222222222222";
+        let second = registered_source(&registry, "ws", second_commit).await;
+        let snapshot = registry.snapshot("ws", "o/r", "main").await.unwrap();
+        registry
+            .record_tip_and_intents(
+                &snapshot,
+                &second,
+                &[ArtifactKind::Head],
+                1,
+                SyncIntent::EnsureCurrent,
+            )
+            .await
+            .unwrap();
+        assert_eq!(one_i64(&connection,"SELECT published_artifact_id FROM artifact_observations WHERE workspace='ws' AND repo='o/r' AND branch='main' AND kind='head'").await.unwrap(),first_job);
+        let second_job=one_i64(&connection,"SELECT desired_artifact_id FROM artifact_observations WHERE workspace='ws' AND repo='o/r' AND branch='main' AND kind='head'").await.unwrap();
+        connection.execute("UPDATE artifact_jobs SET state='running',owner='builder',lease_generation=1,lease_expires_at=unixepoch()+60 WHERE id=?",[second_job]).await.unwrap();
+        let session = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let authority = registry
+            .claim_authenticated(
+                second_job,
+                "builder",
+                1,
+                "ws",
+                "o/r",
+                second_commit,
+                session,
+                60,
+            )
+            .await
+            .unwrap();
+        assert_eq!(authority.root_hash(), second.manifest());
+        assert!(
+            registry
+                .renew_builder_claim(second_job, "builder", 1, second.manifest(), session, 60)
+                .await
+                .unwrap()
+        );
+        assert!(
+            registry
+                .release_builder_claim(second.manifest(), session)
+                .await
+                .unwrap()
+        );
+
+        connection.execute("UPDATE artifact_jobs SET state='ready',owner=NULL,lease_expires_at=NULL,manifest='cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc' WHERE id=?",[second_job]).await.unwrap();
+        assert_eq!(registry.reconcile_terminal_intents(16).await.unwrap(), 2);
+        connection
+            .execute("DELETE FROM branch_source_current", ())
+            .await
+            .unwrap();
+        registry.prune_metadata_page(32).await.unwrap();
+        connection
+            .execute(
+                "UPDATE git_source_roots SET registered_at=unixepoch()-3600",
+                (),
+            )
+            .await
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO artifact_gc_sweep(id,owner,expires_at) VALUES(1,'gc',unixepoch()+60)",
+                (),
+            )
+            .await
+            .unwrap();
+        assert!(registry.retire_registered_roots_page(60, 16).await.is_err());
+        connection
+            .execute("DELETE FROM artifact_gc_sweep", ())
+            .await
+            .unwrap();
+        assert_eq!(
+            registry.retire_registered_roots_page(60, 16).await.unwrap(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn fair_promotion_reaches_workspace_beyond_long_blocked_prefix() {
+        let Some((_server, database, _connection)) = connection().await else {
+            return;
+        };
+        let limits = SchedulerLimits {
+            total_backlog: 1,
+            workspace_backlog: 1,
+            head_reserved: 0,
+            head_backlog: 1,
+            full_history_backlog: 1,
+            files_backlog: 1,
+            total_running: 3,
+            head_running: 1,
+            full_history_running: 1,
+            files_running: 1,
+            workspace_running: 1,
+            ..SchedulerLimits::default()
+        };
+        let shared = Arc::new(database);
+        LibsqlArtifactScheduler::from_shared_database(
+            shared.clone(),
+            limits.clone(),
+            Arc::new(Accept),
+        )
+        .await
+        .unwrap();
+        let storage_dir = tempfile::tempdir().unwrap();
+        let storage: StorageRef = Arc::new(LocalStorage::new(storage_dir.path()).unwrap());
+        let registry = LibsqlGitSourceRegistry::new(
+            shared.clone(),
+            storage,
+            limits,
+            GitSourceLimits::default(),
+            [4; 32],
+        )
+        .await
+        .unwrap();
+        let source_a =
+            registered_source(&registry, "a", "3333333333333333333333333333333333333333").await;
+        let snapshot = registry.snapshot("a", "o/r", "main").await.unwrap();
+        registry
+            .record_tip_and_intents(
+                &snapshot,
+                &source_a,
+                &[ArtifactKind::Head],
+                1,
+                SyncIntent::EnsureCurrent,
+            )
+            .await
+            .unwrap();
+        for format in 2..=66 {
+            let snapshot = registry.snapshot("a", "o/r", "main").await.unwrap();
+            registry
+                .record_tip_and_intents(
+                    &snapshot,
+                    &source_a,
+                    &[ArtifactKind::Head],
+                    format,
+                    SyncIntent::EnsureCurrent,
+                )
+                .await
+                .unwrap();
+        }
+        let source_z =
+            registered_source(&registry, "z", "4444444444444444444444444444444444444444").await;
+        let snapshot = registry.snapshot("z", "o/r", "main").await.unwrap();
+        registry
+            .record_tip_and_intents(
+                &snapshot,
+                &source_z,
+                &[ArtifactKind::Head],
+                1,
+                SyncIntent::EnsureCurrent,
+            )
+            .await
+            .unwrap();
+        let connection = shared.connect().unwrap();
+        connection.execute("UPDATE artifact_jobs SET state='ready',manifest='dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd'",()).await.unwrap();
+        connection
+            .execute(
+                "UPDATE git_source_maintenance SET intent_workspace_cursor='a' WHERE id=1",
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(registry.promote_deferred_page(1).await.unwrap(), 1);
+        assert_eq!(
+            one_string(
+                &connection,
+                "SELECT workspace FROM artifact_intents WHERE state='promoted' AND workspace='z'"
+            )
+            .await
+            .unwrap(),
+            "z"
+        );
     }
 }
