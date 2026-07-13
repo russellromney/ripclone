@@ -15,7 +15,7 @@ use crate::artifact_scheduler::{
 use crate::artifact_scheduler::{CompletionEvidence, validate_evidence};
 use crate::artifact_scheduler_backend::{
     ArtifactSchedulerPersistence, GcDeleteFence, SchedulerGcRoot, TRANSPORT_ROOT_PAGE_MAX,
-    TransportRootLease, validate_transport_lease_identity,
+    TransportRootLease, validate_public_consumer_id, validate_transport_lease_identity,
 };
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -2313,9 +2313,7 @@ impl ArtifactSchedulerPersistence for MysqlArtifactScheduler {
         ttl_secs: i64,
     ) -> Result<ScheduleOutcome> {
         validate_mysql_key(key)?;
-        if consumer_id.trim().is_empty() {
-            bail!("artifact consumer id is empty")
-        }
+        validate_public_consumer_id(consumer_id)?;
         check_mysql_len("consumer id", consumer_id, 255)?;
         if !(2..=86400).contains(&ttl_secs) {
             bail!("consumer subscription TTL is invalid")
@@ -2347,6 +2345,7 @@ impl ArtifactSchedulerPersistence for MysqlArtifactScheduler {
     }
 
     async fn release_consumer(&self, artifact_id: i64, consumer_id: &str) -> Result<()> {
+        validate_public_consumer_id(consumer_id)?;
         let (mut tx, _) = self.controlled().await?;
         sqlx::query("DELETE FROM artifact_consumers WHERE artifact_id=? AND consumer_id=?")
             .bind(artifact_id)

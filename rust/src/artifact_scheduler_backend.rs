@@ -94,6 +94,20 @@ pub struct SchedulerGcRoot {
     pub manifest: String,
 }
 pub const TRANSPORT_ROOT_PAGE_MAX: u32 = 512;
+pub(crate) const SOURCE_INTENT_CONSUMER_PREFIX: &str = "intent:";
+
+/// The source registry owns the `intent:` consumer namespace and mutates both
+/// retention tables atomically. General scheduler callers must never be able
+/// to manufacture or release one half of that paired durable claim.
+pub(crate) fn validate_public_consumer_id(consumer_id: &str) -> Result<()> {
+    if consumer_id.trim().is_empty() {
+        bail!("artifact consumer id is empty")
+    }
+    if consumer_id.starts_with(SOURCE_INTENT_CONSUMER_PREFIX) {
+        bail!("artifact consumer id uses the reserved source-intent namespace")
+    }
+    Ok(())
+}
 
 pub(crate) fn unsupported_source_gc_page<T>() -> Result<Vec<T>> {
     bail!("Git source GC roots are not implemented by this scheduler backend")

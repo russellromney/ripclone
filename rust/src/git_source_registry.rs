@@ -9,6 +9,7 @@ use crate::artifact_manifest::CasBlob;
 use crate::artifact_scheduler::{
     ArtifactKind, FailureClass, ObservationSnapshot, SchedulerLimits, scheduler_limits_fingerprint,
 };
+use crate::artifact_scheduler_backend::SOURCE_INTENT_CONSUMER_PREFIX;
 use crate::git_source::{
     AuthenticatedGitSource, GitObjectFormat, GitSourceLimits, GitSourceLoader,
     GitSourceMaterializer, GitSourcePackager, GitSourceRegistryView, GitSourceUploader,
@@ -27,6 +28,8 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
+
+const SOURCE_INTENT_RETENTION_EXPIRY: i64 = i64::MAX;
 
 #[derive(Debug)]
 struct AmbiguousRegistrationAck(anyhow::Error);
@@ -1048,7 +1051,7 @@ impl SqliteGitSourceRegistry {
                 if existing==0&&!capacity_available(&mut c,&self.scheduler_limits,&workspace,kind).await?{return Ok(false)}
                 let artifact_id=ensure_job(&mut c,&workspace,&repo,&commit,kind,format).await?;
                 if sqlx::query("UPDATE artifact_intents SET state='promoted',artifact_id=?,updated_at=unixepoch() WHERE id=? AND state='deferred'").bind(artifact_id).bind(id).execute(&mut *c).await?.rows_affected()!=1{return Ok(false)}
-                sqlx::query("INSERT INTO artifact_consumers(artifact_id,consumer_id,expires_at) VALUES(?,?,?) ON CONFLICT(artifact_id,consumer_id) DO UPDATE SET expires_at=excluded.expires_at").bind(artifact_id).bind(row.try_get::<String,_>("consumer_id")?).bind(i64::MAX).execute(&mut *c).await?;
+                sqlx::query("INSERT INTO artifact_consumers(artifact_id,consumer_id,expires_at) VALUES(?,?,?) ON CONFLICT(artifact_id,consumer_id) DO UPDATE SET expires_at=excluded.expires_at").bind(artifact_id).bind(row.try_get::<String,_>("consumer_id")?).bind(SOURCE_INTENT_RETENTION_EXPIRY).execute(&mut *c).await?;
                 sqlx::query("INSERT INTO artifact_observations(workspace,repo,branch,kind,desired_commit,desired_artifact_id,desired_generation,published_artifact_id,format_version,observed_at) VALUES(?,?,?,?,?,?,?,CASE WHEN (SELECT state FROM artifact_jobs WHERE id=?)='ready' THEN ? ELSE NULL END,?,unixepoch()) ON CONFLICT(workspace,repo,branch,kind) DO UPDATE SET desired_commit=excluded.desired_commit,desired_artifact_id=excluded.desired_artifact_id,desired_generation=excluded.desired_generation,published_artifact_id=CASE WHEN excluded.published_artifact_id IS NOT NULL THEN excluded.published_artifact_id WHEN artifact_observations.format_version=excluded.format_version THEN artifact_observations.published_artifact_id ELSE NULL END,format_version=excluded.format_version,observed_at=excluded.observed_at")
                     .bind(&workspace).bind(&repo).bind(&branch).bind(kind.as_str()).bind(&commit).bind(artifact_id).bind(generation).bind(artifact_id).bind(artifact_id).bind(format).execute(&mut *c).await?;
                 Ok(true)
@@ -1225,7 +1228,7 @@ impl ArtifactObservation for SqliteGitSourceRegistry {
                     outcomes.push((kind,job_outcome(&mut c,artifact_id,intent,self.scheduler_limits.max_manual_retries).await?));
                     let _=consumer;continue
                 }
-                let consumer_id=format!("intent:{}",hex::encode(rand::random::<[u8;24]>()));let session_id=hex::encode(rand::random::<[u8;32]>());
+                let consumer_id=format!("{}{}",SOURCE_INTENT_CONSUMER_PREFIX,hex::encode(rand::random::<[u8;24]>()));let session_id=hex::encode(rand::random::<[u8;32]>());
                 let existing:i64=sqlx::query_scalar("SELECT count(*) FROM artifact_jobs WHERE workspace=? AND repo=? AND commit_oid=? AND kind=? AND format_version=?").bind(snapshot.workspace()).bind(snapshot.repo()).bind(source.commit()).bind(kind.as_str()).bind(format_version as i64).fetch_one(&mut *c).await?;
                 let promote=existing==1||capacity_available(&mut c,&self.scheduler_limits,snapshot.workspace(),kind).await?;
                 let artifact_id=if promote{Some(ensure_job(&mut c,snapshot.workspace(),snapshot.repo(),source.commit(),kind,format_version as i64).await?)}else{None};
@@ -1233,9 +1236,9 @@ impl ArtifactObservation for SqliteGitSourceRegistry {
                 let inserted=sqlx::query("INSERT INTO artifact_intents(workspace,repo,branch,branch_generation,source_root_hash,source_format_version,commit_oid,kind,format_version,state,artifact_id,consumer_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,unixepoch(),unixepoch())")
                     .bind(snapshot.workspace()).bind(snapshot.repo()).bind(snapshot.branch()).bind(generation as i64).bind(source.manifest()).bind(SOURCE_FORMAT_VERSION as i64).bind(source.commit()).bind(kind.as_str()).bind(format_version as i64).bind(state).bind(artifact_id).bind(&consumer_id).execute(&mut *c).await?.last_insert_rowid();
                 sqlx::query("INSERT INTO git_source_consumers(root_hash,consumer_id,session_id,workspace,repo,commit_oid,source_format_version,purpose,expires_at) VALUES(?,?,?,?,?,?,?,'intent',?)")
-                    .bind(source.manifest()).bind(&consumer_id).bind(session_id).bind(source.workspace()).bind(source.repo()).bind(source.commit()).bind(SOURCE_FORMAT_VERSION as i64).bind(i64::MAX).execute(&mut *c).await?;
+                    .bind(source.manifest()).bind(&consumer_id).bind(session_id).bind(source.workspace()).bind(source.repo()).bind(source.commit()).bind(SOURCE_FORMAT_VERSION as i64).bind(SOURCE_INTENT_RETENTION_EXPIRY).execute(&mut *c).await?;
                 if let Some(artifact_id)=artifact_id{
-                    sqlx::query("INSERT INTO artifact_consumers(artifact_id,consumer_id,expires_at) VALUES(?,?,?)").bind(artifact_id).bind(&consumer_id).bind(i64::MAX).execute(&mut *c).await?;
+                    sqlx::query("INSERT INTO artifact_consumers(artifact_id,consumer_id,expires_at) VALUES(?,?,?)").bind(artifact_id).bind(&consumer_id).bind(SOURCE_INTENT_RETENTION_EXPIRY).execute(&mut *c).await?;
                     sqlx::query("INSERT INTO artifact_observations(workspace,repo,branch,kind,desired_commit,desired_artifact_id,desired_generation,published_artifact_id,format_version,observed_at) VALUES(?,?,?,?,?,?,?,CASE WHEN (SELECT state FROM artifact_jobs WHERE id=?)='ready' THEN ? ELSE NULL END,?,unixepoch()) ON CONFLICT(workspace,repo,branch,kind) DO UPDATE SET desired_commit=excluded.desired_commit,desired_artifact_id=excluded.desired_artifact_id,desired_generation=excluded.desired_generation,published_artifact_id=CASE WHEN excluded.published_artifact_id IS NOT NULL THEN excluded.published_artifact_id WHEN artifact_observations.format_version=excluded.format_version THEN artifact_observations.published_artifact_id ELSE NULL END,format_version=excluded.format_version,observed_at=excluded.observed_at")
                         .bind(snapshot.workspace()).bind(snapshot.repo()).bind(snapshot.branch()).bind(kind.as_str()).bind(source.commit()).bind(artifact_id).bind(generation as i64).bind(artifact_id).bind(artifact_id).bind(format_version as i64).execute(&mut *c).await?;
                     outcomes.push((kind,job_outcome(&mut c,artifact_id,intent,self.scheduler_limits.max_manual_retries).await?));
@@ -1391,8 +1394,15 @@ pub(crate) async fn validate_sqlite_v7_in(c: &mut sqlx::SqliteConnection) -> Res
     let orphan_acquisition_desires:i64=sqlx::query_scalar("SELECT count(*) FROM git_source_acquisitions a WHERE (a.state IN('held','graph_published','activation_unknown') AND NOT EXISTS(SELECT 1 FROM git_source_desires d WHERE d.state='acquiring' AND d.acquisition_token=a.token AND d.workspace=a.workspace AND d.repo=a.repo AND d.commit_oid=a.commit_oid AND d.source_format_version=a.source_format_version)) OR (a.state='registered' AND NOT EXISTS(SELECT 1 FROM git_source_desires d WHERE d.state='registered' AND d.acquisition_token IS NULL AND d.root_hash=a.root_hash AND d.workspace=a.workspace AND d.repo=a.repo AND d.commit_oid=a.commit_oid AND d.source_format_version=a.source_format_version))").fetch_one(&mut *c).await?;
     let orphan_registered_root_desires:i64=sqlx::query_scalar("SELECT count(*) FROM git_source_roots r WHERE r.state='registered' AND NOT EXISTS(SELECT 1 FROM git_source_desires d WHERE d.state='registered' AND d.root_hash=r.root_hash AND d.workspace=r.workspace AND d.repo=r.repo AND d.commit_oid=r.commit_oid AND d.source_format_version=r.source_format_version)").fetch_one(&mut *c).await?;
     let invalid_branches:i64=sqlx::query_scalar("SELECT count(*) FROM branch_source_current c JOIN branch_source_generations g USING(workspace,repo,branch,generation) LEFT JOIN branch_observations b USING(workspace,repo,branch) WHERE b.workspace IS NULL OR b.generation<>g.generation OR b.desired_commit<>g.commit_oid OR NOT EXISTS(SELECT 1 FROM git_source_roots r JOIN git_source_desires d ON d.root_hash=r.root_hash AND d.workspace=r.workspace AND d.repo=r.repo AND d.commit_oid=r.commit_oid AND d.source_format_version=r.source_format_version WHERE r.root_hash=g.root_hash AND r.workspace=g.workspace AND r.repo=g.repo AND r.commit_oid=g.commit_oid AND r.source_format_version=g.source_format_version AND r.state='registered' AND d.state='registered')").fetch_one(&mut *c).await?;
-    let invalid_intents:i64=sqlx::query_scalar("SELECT count(*) FROM artifact_intents i JOIN branch_source_generations g ON g.workspace=i.workspace AND g.repo=i.repo AND g.branch=i.branch AND g.generation=i.branch_generation LEFT JOIN git_source_consumers c ON c.root_hash=i.source_root_hash AND c.consumer_id=i.consumer_id LEFT JOIN artifact_jobs j ON j.id=i.artifact_id LEFT JOIN artifact_consumers ac ON ac.artifact_id=i.artifact_id AND ac.consumer_id=i.consumer_id LEFT JOIN git_source_desires d ON d.workspace=i.workspace AND d.repo=i.repo AND d.commit_oid=i.commit_oid WHERE g.root_hash<>i.source_root_hash OR g.commit_oid<>i.commit_oid OR d.workspace IS NULL OR d.source_format_version<>i.source_format_version OR d.state<>'registered' OR d.root_hash<>i.source_root_hash OR c.consumer_id IS NULL OR c.purpose<>'intent' OR (i.state='promoted' AND (j.id IS NULL OR ac.consumer_id IS NULL OR j.workspace<>i.workspace OR j.repo<>i.repo OR j.commit_oid<>i.commit_oid OR j.kind<>i.kind OR j.format_version<>i.format_version))").fetch_one(&mut *c).await?;
-    let orphan_intent_consumers:i64=sqlx::query_scalar("SELECT count(*) FROM git_source_consumers c WHERE c.purpose='intent' AND NOT EXISTS(SELECT 1 FROM artifact_intents i WHERE i.consumer_id=c.consumer_id AND i.source_root_hash=c.root_hash AND i.workspace=c.workspace AND i.repo=c.repo AND i.commit_oid=c.commit_oid AND i.source_format_version=c.source_format_version)").fetch_one(&mut *c).await?;
+    let invalid_intents:i64=sqlx::query_scalar("SELECT count(*) FROM artifact_intents i JOIN branch_source_generations g ON g.workspace=i.workspace AND g.repo=i.repo AND g.branch=i.branch AND g.generation=i.branch_generation LEFT JOIN git_source_consumers c ON c.root_hash=i.source_root_hash AND c.consumer_id=i.consumer_id LEFT JOIN artifact_jobs j ON j.id=i.artifact_id LEFT JOIN git_source_desires d ON d.workspace=i.workspace AND d.repo=i.repo AND d.commit_oid=i.commit_oid WHERE length(i.consumer_id)<>55 OR substr(i.consumer_id,1,7)<>'intent:' OR substr(i.consumer_id,8) GLOB '*[^0-9a-f]*' OR (SELECT count(*) FROM artifact_intents sibling WHERE sibling.consumer_id=i.consumer_id)<>1 OR g.root_hash<>i.source_root_hash OR g.commit_oid<>i.commit_oid OR d.workspace IS NULL OR d.source_format_version<>i.source_format_version OR d.state<>'registered' OR d.root_hash<>i.source_root_hash OR c.consumer_id IS NULL OR length(c.session_id)<>64 OR c.session_id GLOB '*[^0-9a-f]*' OR c.workspace<>i.workspace OR c.repo<>i.repo OR c.commit_oid<>i.commit_oid OR c.source_format_version<>i.source_format_version OR c.purpose<>'intent' OR c.expires_at<>9223372036854775807 OR (i.state='promoted' AND (j.id IS NULL OR j.workspace<>i.workspace OR j.repo<>i.repo OR j.commit_oid<>i.commit_oid OR j.kind<>i.kind OR j.format_version<>i.format_version))").fetch_one(&mut *c).await?;
+    // Source intents are durable lifecycle roots, not expiring client sessions.
+    // Their source and artifact claims therefore remain paired at i64::MAX
+    // until terminal intent settlement deletes both in one transaction.
+    let invalid_intent_artifact_consumers:i64=sqlx::query_scalar("SELECT count(*) FROM artifact_intents i WHERE (i.state='deferred' AND EXISTS(SELECT 1 FROM artifact_consumers ac WHERE ac.consumer_id=i.consumer_id)) OR (i.state='promoted' AND ((SELECT count(*) FROM artifact_consumers ac WHERE ac.consumer_id=i.consumer_id)<>1 OR NOT EXISTS(SELECT 1 FROM artifact_consumers ac WHERE ac.consumer_id=i.consumer_id AND ac.artifact_id=i.artifact_id AND ac.expires_at=9223372036854775807)))").fetch_one(&mut *c).await?;
+    let orphan_intent_consumers:i64=sqlx::query_scalar("SELECT count(*) FROM git_source_consumers c WHERE c.purpose='intent' AND (length(c.consumer_id)<>55 OR substr(c.consumer_id,1,7)<>'intent:' OR substr(c.consumer_id,8) GLOB '*[^0-9a-f]*' OR length(c.session_id)<>64 OR c.session_id GLOB '*[^0-9a-f]*' OR c.expires_at<>9223372036854775807 OR NOT EXISTS(SELECT 1 FROM artifact_intents i WHERE i.consumer_id=c.consumer_id AND i.source_root_hash=c.root_hash AND i.workspace=c.workspace AND i.repo=c.repo AND i.commit_oid=c.commit_oid AND i.source_format_version=c.source_format_version))").fetch_one(&mut *c).await?;
+    // Non-prefixed rows are valid scheduler consumers. The reserved namespace
+    // gives us enough provenance to reject a completely orphaned intent claim.
+    let orphan_intent_artifact_consumers:i64=sqlx::query_scalar("SELECT count(*) FROM artifact_consumers ac WHERE substr(ac.consumer_id,1,7)='intent:' AND (ac.expires_at<>9223372036854775807 OR (SELECT count(*) FROM artifact_intents i WHERE i.state='promoted' AND i.consumer_id=ac.consumer_id AND i.artifact_id=ac.artifact_id)<>1)").fetch_one(&mut *c).await?;
     let invalid_maintenance:i64=sqlx::query_scalar("SELECT CASE WHEN count(*)<>1 THEN 1 ELSE COALESCE(MAX(CASE WHEN id<>1 OR intent_cursor<0 OR acquisition_cursor<0 OR (root_cursor<>'' AND (length(root_cursor)<>64 OR root_cursor GLOB '*[^0-9a-f]*')) OR (config_fingerprint<>'' AND (length(config_fingerprint)<>64 OR config_fingerprint GLOB '*[^0-9a-f]*')) THEN 1 ELSE 0 END),1) END FROM git_source_maintenance").fetch_one(&mut *c).await?;
     if invalid_roots
         + invalid_provisional
@@ -1405,7 +1415,9 @@ pub(crate) async fn validate_sqlite_v7_in(c: &mut sqlx::SqliteConnection) -> Res
         + orphan_registered_root_desires
         + invalid_branches
         + invalid_intents
+        + invalid_intent_artifact_consumers
         + orphan_intent_consumers
+        + orphan_intent_artifact_consumers
         + invalid_maintenance
         != 0
     {
@@ -1811,6 +1823,68 @@ mod tests {
             .put(&view.root.hash, &view.root_bytes)
             .unwrap();
         prepared
+    }
+
+    async fn registered_source(
+        registry: &SqliteGitSourceRegistry,
+        commit: &str,
+    ) -> DurableSourceSnapshot {
+        let source = prepared(registry, commit);
+        let acquisition = match registry
+            .protect_prepared(&source, "owner", "attempt", 60, SyncIntent::EnsureCurrent)
+            .await
+            .unwrap()
+        {
+            SourceAcquireOutcome::Acquired { acquisition, .. } => acquisition,
+            _ => panic!("expected source acquisition"),
+        };
+        registry
+            .register(&acquisition, &source, &CancellationToken::new())
+            .await
+            .unwrap()
+    }
+
+    async fn promoted_head_intent(
+        registry: &SqliteGitSourceRegistry,
+        pool: &SqlitePool,
+        commit: &str,
+    ) -> (i64, String) {
+        let source = registered_source(registry, commit).await;
+        let before = registry.snapshot("ws", "o/r", "main").await.unwrap();
+        let outcome = registry
+            .record_tip_and_intents(
+                &before,
+                &source,
+                &[ArtifactKind::Head],
+                1,
+                SyncIntent::EnsureCurrent,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            ArtifactObservationOutcome::Recorded { ref artifacts, .. }
+                if matches!(artifacts[0].1, ArtifactIntentOutcome::Subscribed(_))
+        ));
+        sqlx::query_as(
+            "SELECT artifact_id,consumer_id FROM artifact_intents WHERE state='promoted'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn assert_registry_validation_passes(pool: &SqlitePool) {
+        let mut connection = pool.acquire().await.unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        validate_sqlite_v7_in(&mut connection).await.unwrap();
+        sqlx::query("ROLLBACK")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
     }
 
     async fn assert_registry_validation_fails(pool: &SqlitePool) {
@@ -3679,6 +3753,186 @@ mod tests {
             .unwrap();
         sqlx::query("INSERT INTO git_source_consumers(root_hash,consumer_id,session_id,workspace,repo,commit_oid,source_format_version,purpose,expires_at) VALUES(?,'orphan','orphan-session','ws','o/r',?,1,'intent',?)")
             .bind(snapshot.manifest()).bind(commit).bind(i64::MAX).execute(&pool).await.unwrap();
+        assert_registry_validation_fails(&pool).await;
+    }
+
+    #[tokio::test]
+    async fn validator_rejects_malformed_intent_consumer_capability() {
+        let (_scheduler, registry, pool, _temp) = fixture().await;
+        let (_artifact, consumer) = promoted_head_intent(&registry, &pool, &"c".repeat(40)).await;
+        assert_registry_validation_passes(&pool).await;
+        let malformed = format!("intent:{}", "d".repeat(47));
+        sqlx::query("UPDATE artifact_intents SET consumer_id=? WHERE consumer_id=?")
+            .bind(&malformed)
+            .bind(&consumer)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE git_source_consumers SET consumer_id=? WHERE consumer_id=?")
+            .bind(&malformed)
+            .bind(&consumer)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE artifact_consumers SET consumer_id=? WHERE consumer_id=?")
+            .bind(&malformed)
+            .bind(&consumer)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_registry_validation_fails(&pool).await;
+    }
+
+    #[tokio::test]
+    async fn validator_rejects_malformed_intent_source_session_capability() {
+        let (_scheduler, registry, pool, _temp) = fixture().await;
+        let (_artifact, consumer) = promoted_head_intent(&registry, &pool, &"d".repeat(40)).await;
+        assert_registry_validation_passes(&pool).await;
+        sqlx::query(
+            "UPDATE git_source_consumers SET session_id='not-a-capability' WHERE consumer_id=?",
+        )
+        .bind(consumer)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_registry_validation_fails(&pool).await;
+    }
+
+    #[tokio::test]
+    async fn validator_rejects_deferred_intent_with_artifact_consumer() {
+        let limits = SchedulerLimits {
+            total_backlog: 1,
+            workspace_backlog: 1,
+            head_reserved: 1,
+            ..Default::default()
+        };
+        let (_scheduler, registry, pool, _temp) = fixture_with_limits(limits).await;
+        let blocker = sqlx::query("INSERT INTO artifact_jobs(workspace,repo,commit_oid,kind,format_version,state,created_at,updated_at) VALUES('ws','o/r',?,'head',1,'queued',unixepoch(),unixepoch())")
+            .bind("e".repeat(40)).execute(&pool).await.unwrap().last_insert_rowid();
+        let source = registered_source(&registry, &"f".repeat(40)).await;
+        let before = registry.snapshot("ws", "o/r", "main").await.unwrap();
+        let outcome = registry
+            .record_tip_and_intents(
+                &before,
+                &source,
+                &[ArtifactKind::Head],
+                1,
+                SyncIntent::EnsureCurrent,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            ArtifactObservationOutcome::Recorded { ref artifacts, .. }
+                if matches!(artifacts[0].1, ArtifactIntentOutcome::Deferred(_))
+        ));
+        let consumer: String =
+            sqlx::query_scalar("SELECT consumer_id FROM artifact_intents WHERE state='deferred'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_registry_validation_passes(&pool).await;
+        sqlx::query(
+            "INSERT INTO artifact_consumers(artifact_id,consumer_id,expires_at) VALUES(?,?,?)",
+        )
+        .bind(blocker)
+        .bind(consumer)
+        .bind(SOURCE_INTENT_RETENTION_EXPIRY)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_registry_validation_fails(&pool).await;
+    }
+
+    #[tokio::test]
+    async fn validator_rejects_promoted_intent_with_extra_wrong_artifact_consumer() {
+        let (_scheduler, registry, pool, _temp) = fixture().await;
+        let (_artifact, consumer) = promoted_head_intent(&registry, &pool, &"1".repeat(40)).await;
+        let wrong = sqlx::query("INSERT INTO artifact_jobs(workspace,repo,commit_oid,kind,format_version,state,created_at,updated_at) VALUES('ws','o/r',?,'files',1,'queued',unixepoch(),unixepoch())")
+            .bind("2".repeat(40)).execute(&pool).await.unwrap().last_insert_rowid();
+        assert_registry_validation_passes(&pool).await;
+        sqlx::query(
+            "INSERT INTO artifact_consumers(artifact_id,consumer_id,expires_at) VALUES(?,?,?)",
+        )
+        .bind(wrong)
+        .bind(consumer)
+        .bind(SOURCE_INTENT_RETENTION_EXPIRY)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_registry_validation_fails(&pool).await;
+    }
+
+    #[tokio::test]
+    async fn validator_rejects_promoted_intent_with_only_wrong_artifact_consumer() {
+        let (_scheduler, registry, pool, _temp) = fixture().await;
+        let (artifact, consumer) = promoted_head_intent(&registry, &pool, &"3".repeat(40)).await;
+        let wrong = sqlx::query("INSERT INTO artifact_jobs(workspace,repo,commit_oid,kind,format_version,state,created_at,updated_at) VALUES('ws','o/r',?,'files',1,'queued',unixepoch(),unixepoch())")
+            .bind("4".repeat(40)).execute(&pool).await.unwrap().last_insert_rowid();
+        assert_registry_validation_passes(&pool).await;
+        sqlx::query("DELETE FROM artifact_consumers WHERE artifact_id=? AND consumer_id=?")
+            .bind(artifact)
+            .bind(&consumer)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO artifact_consumers(artifact_id,consumer_id,expires_at) VALUES(?,?,?)",
+        )
+        .bind(wrong)
+        .bind(consumer)
+        .bind(SOURCE_INTENT_RETENTION_EXPIRY)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_registry_validation_fails(&pool).await;
+    }
+
+    #[tokio::test]
+    async fn validator_rejects_fully_orphaned_reserved_artifact_consumer() {
+        let (_scheduler, registry, pool, _temp) = fixture().await;
+        let (artifact, _consumer) = promoted_head_intent(&registry, &pool, &"5".repeat(40)).await;
+        assert_registry_validation_passes(&pool).await;
+        sqlx::query(
+            "INSERT INTO artifact_consumers(artifact_id,consumer_id,expires_at) VALUES(?,?,?)",
+        )
+        .bind(artifact)
+        .bind(format!("intent:{}", "6".repeat(48)))
+        .bind(SOURCE_INTENT_RETENTION_EXPIRY)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_registry_validation_fails(&pool).await;
+    }
+
+    #[tokio::test]
+    async fn validator_rejects_nonpermanent_or_unpaired_intent_retention() {
+        let (_scheduler, registry, pool, _temp) = fixture().await;
+        let (artifact, consumer) = promoted_head_intent(&registry, &pool, &"7".repeat(40)).await;
+        assert_registry_validation_passes(&pool).await;
+        sqlx::query("UPDATE git_source_consumers SET expires_at=? WHERE consumer_id=?")
+            .bind(SOURCE_INTENT_RETENTION_EXPIRY - 1)
+            .bind(&consumer)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_registry_validation_fails(&pool).await;
+        sqlx::query("UPDATE git_source_consumers SET expires_at=? WHERE consumer_id=?")
+            .bind(SOURCE_INTENT_RETENTION_EXPIRY)
+            .bind(&consumer)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_registry_validation_passes(&pool).await;
+        sqlx::query(
+            "UPDATE artifact_consumers SET expires_at=? WHERE artifact_id=? AND consumer_id=?",
+        )
+        .bind(SOURCE_INTENT_RETENTION_EXPIRY - 1)
+        .bind(artifact)
+        .bind(consumer)
+        .execute(&pool)
+        .await
+        .unwrap();
         assert_registry_validation_fails(&pool).await;
     }
 

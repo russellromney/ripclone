@@ -1315,9 +1315,7 @@ impl ArtifactScheduler {
         ttl_secs: i64,
     ) -> Result<ScheduleOutcome> {
         validate_format_version(key.format_version)?;
-        if consumer_id.trim().is_empty() {
-            bail!("artifact consumer id is empty")
-        }
+        crate::artifact_scheduler_backend::validate_public_consumer_id(consumer_id)?;
         if !(2..=86400).contains(&ttl_secs) {
             bail!("consumer subscription TTL is invalid")
         }
@@ -1340,6 +1338,7 @@ impl ArtifactScheduler {
         finish(c, result).await
     }
     pub async fn release_consumer(&self, artifact_id: i64, consumer_id: &str) -> Result<()> {
+        crate::artifact_scheduler_backend::validate_public_consumer_id(consumer_id)?;
         let mut c = self.immediate().await?;
         let result:Result<()>=async{
             sqlx::query("DELETE FROM artifact_consumers WHERE artifact_id=? AND consumer_id=?").bind(artifact_id).bind(consumer_id).execute(&mut *c).await?;
@@ -2961,6 +2960,26 @@ mod tests {
                 .count(),
             1
         )
+    }
+
+    #[tokio::test]
+    async fn public_consumer_api_rejects_reserved_source_intent_namespace() {
+        let (scheduler, _temp, _path) = scheduler(Default::default()).await;
+        let reserved = format!("intent:{}", "a".repeat(48));
+        assert!(
+            scheduler
+                .subscribe_consumer(&key("ws", "a", ArtifactKind::Head), &reserved, 60)
+                .await
+                .is_err()
+        );
+        assert!(scheduler.release_consumer(1, &reserved).await.is_err());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM artifact_jobs")
+                .fetch_one(&scheduler.pool)
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]

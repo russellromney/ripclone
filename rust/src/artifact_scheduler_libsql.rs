@@ -16,7 +16,7 @@ use crate::artifact_scheduler::{
 };
 use crate::artifact_scheduler_backend::{
     ArtifactSchedulerPersistence, GcDeleteFence, SchedulerGcRoot, TRANSPORT_ROOT_PAGE_MAX,
-    TransportRootLease, validate_transport_lease_identity,
+    TransportRootLease, validate_public_consumer_id, validate_transport_lease_identity,
 };
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -710,9 +710,7 @@ impl ArtifactSchedulerPersistence for LibsqlArtifactScheduler {
         ttl: i64,
     ) -> Result<ScheduleOutcome> {
         validate_format_version(key.format_version)?;
-        if id.trim().is_empty() {
-            bail!("artifact consumer id is empty")
-        }
+        validate_public_consumer_id(id)?;
         if !(2..=86400).contains(&ttl) {
             bail!("consumer subscription TTL is invalid")
         }
@@ -721,6 +719,7 @@ impl ArtifactSchedulerPersistence for LibsqlArtifactScheduler {
         finish(tx, r).await
     }
     async fn release_consumer(&self, aid: i64, id: &str) -> Result<()> {
+        validate_public_consumer_id(id)?;
         let tx = self.tx().await?;
         let r=async{exec(&tx,"DELETE FROM artifact_consumers WHERE artifact_id=? AND consumer_id=?",vec![aid.into(),id.into()]).await?;exec(&tx,"DELETE FROM artifact_jobs WHERE id=? AND state='queued' AND id NOT IN(SELECT desired_artifact_id FROM artifact_observations) AND id NOT IN(SELECT artifact_id FROM artifact_consumers)",vec![aid.into()]).await?;Ok(())}.await;
         finish(tx, r).await
