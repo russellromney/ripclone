@@ -70,7 +70,7 @@ pub(crate) async fn validate_postgres_v7(c: &mut PgConnection, complete: bool) -
     if constraints != PG_V7_CONSTRAINT_SIGNATURE {
         bail!("postgres v7 source registry constraint definitions differ")
     }
-    let invalid_tables:i64=sqlx::query_scalar("SELECT count(*) FROM pg_class r JOIN pg_namespace n ON n.oid=r.relnamespace WHERE n.nspname=current_schema() AND r.relname=ANY($1) AND (r.relkind<>'r' OR r.relpersistence<>'p' OR r.relrowsecurity OR r.relforcerowsecurity OR r.relreplident<>'d')").bind(PG_SOURCE_TABLES).fetch_one(&mut *c).await?;
+    let invalid_tables:i64=sqlx::query_scalar("SELECT count(*) FROM pg_class r JOIN pg_namespace n ON n.oid=r.relnamespace WHERE n.nspname=current_schema() AND r.relname=ANY($1) AND (r.relkind<>'r' OR r.relpersistence<>'p' OR r.relrowsecurity OR r.relforcerowsecurity OR r.relreplident<>'d' OR r.relhassubclass OR r.relhasrules)").bind(PG_SOURCE_TABLES).fetch_one(&mut *c).await?;
     let user_triggers:i64=sqlx::query_scalar("SELECT count(*) FROM pg_trigger t JOIN pg_class r ON r.oid=t.tgrelid JOIN pg_namespace n ON n.oid=r.relnamespace WHERE n.nspname=current_schema() AND r.relname=ANY($1) AND NOT t.tgisinternal").bind(PG_SOURCE_TABLES).fetch_one(&mut *c).await?;
     if invalid_tables != 0 || user_triggers != 0 {
         bail!("postgres v7 source registry table properties differ")
@@ -87,6 +87,16 @@ pub(crate) async fn validate_postgres_v7(c: &mut PgConnection, complete: bool) -
     if singleton != 1 || sequence.is_none_or(|v| v.0 != 1 || v.1 < max_generation) {
         bail!("postgres v7 source registry singleton state is invalid")
     }
+    let operations:Vec<(String,String,String,String,String,i64)>=sqlx::query_as("SELECT operation_id,workspace,repo,commit_oid,attempt_id,generation FROM git_source_acquisitions").fetch_all(&mut *c).await?;
+    if operations
+        .iter()
+        .any(|(stored, workspace, repo, commit, attempt, generation)| {
+            *generation <= 0
+                || operation_id(workspace, repo, commit, attempt, *generation) != *stored
+        })
+    {
+        bail!("postgres v7 source acquisition operation provenance is invalid")
+    }
     let invalid:i64=sqlx::query_scalar(r#"SELECT
       (SELECT count(*) FROM git_source_roots r WHERE r.root_hash !~ '^[0-9a-f]{64}$' OR r.semantic_digest !~ '^[0-9a-f]{64}$' OR r.object_set_digest !~ '^[0-9a-f]{64}$' OR (r.object_format='sha1' AND r.commit_oid !~ '^[0-9a-f]{40}$') OR (r.object_format='sha256' AND r.commit_oid !~ '^[0-9a-f]{64}$') OR NOT EXISTS(SELECT 1 FROM git_source_members m WHERE m.root_hash=r.root_hash GROUP BY m.root_hash HAVING min(m.ordinal)=0 AND max(m.ordinal)+1=count(*) AND count(*)%2=0 AND sum(m.child_len)=r.total_bytes AND sum(CASE WHEN (m.ordinal%2=0 AND m.kind='pack') OR (m.ordinal%2=1 AND m.kind='index') THEN 0 ELSE 1 END)=0))+
       (SELECT count(*) FROM git_source_members WHERE child_hash !~ '^[0-9a-f]{64}$')+
@@ -96,7 +106,7 @@ pub(crate) async fn validate_postgres_v7(c: &mut PgConnection, complete: bool) -
       (SELECT count(*) FROM git_source_desires d LEFT JOIN git_source_acquisitions a ON a.token=d.acquisition_token LEFT JOIN git_source_roots r ON r.root_hash=d.root_hash WHERE d.source_format_version<>1 OR d.commit_oid !~ '^[0-9a-f]{40}$|^[0-9a-f]{64}$' OR (d.state='acquiring' AND (a.token IS NULL OR a.workspace<>d.workspace OR a.repo<>d.repo OR a.commit_oid<>d.commit_oid OR a.source_format_version<>d.source_format_version OR a.state NOT IN('held','graph_published','activation_unknown'))) OR (d.state='registered' AND (r.root_hash IS NULL OR r.workspace<>d.workspace OR r.repo<>d.repo OR r.commit_oid<>d.commit_oid OR r.source_format_version<>d.source_format_version OR r.state<>'registered')))+
       (SELECT count(*) FROM branch_source_current current JOIN branch_source_generations g ON g.workspace=current.workspace AND g.repo=current.repo AND g.branch=current.branch AND g.generation=current.generation LEFT JOIN branch_observations b ON b.workspace=current.workspace AND b.repo=current.repo AND b.branch=current.branch WHERE b.workspace IS NULL OR b.generation<>g.generation OR b.desired_commit<>g.commit_oid)+
       (SELECT count(*) FROM git_source_consumers c LEFT JOIN git_source_roots r ON r.root_hash=c.root_hash AND r.workspace=c.workspace AND r.repo=c.repo AND r.commit_oid=c.commit_oid AND r.source_format_version=c.source_format_version WHERE r.root_hash IS NULL OR c.session_id !~ '^[0-9a-f]{64}$')+
-      (SELECT count(*) FROM artifact_intents i LEFT JOIN git_source_consumers c ON c.consumer_id=i.consumer_id AND c.root_hash=i.source_root_hash AND c.purpose='intent' LEFT JOIN artifact_jobs j ON j.id=i.artifact_id WHERE c.root_hash IS NULL OR i.consumer_id !~ '^intent:[0-9a-f]{48}$' OR c.expires_at<>9223372036854775807 OR (SELECT count(*) FROM git_source_consumers sibling WHERE sibling.consumer_id=i.consumer_id)<>1 OR (i.state='deferred' AND (i.artifact_id IS NOT NULL OR EXISTS(SELECT 1 FROM artifact_consumers ac WHERE ac.consumer_id=i.consumer_id))) OR (i.state='promoted' AND (j.id IS NULL OR j.workspace<>i.workspace OR j.repo<>i.repo OR j.commit_oid<>i.commit_oid OR j.kind<>i.kind OR j.format_version<>i.format_version OR (SELECT count(*) FROM artifact_consumers ac WHERE ac.consumer_id=i.consumer_id)<>1 OR NOT EXISTS(SELECT 1 FROM artifact_consumers ac WHERE ac.artifact_id=i.artifact_id AND ac.consumer_id=i.consumer_id AND ac.expires_at=9223372036854775807))))"#).fetch_one(&mut *c).await?;
+      (SELECT count(*) FROM artifact_intents i LEFT JOIN branch_source_generations g ON g.workspace=i.workspace AND g.repo=i.repo AND g.branch=i.branch AND g.generation=i.branch_generation LEFT JOIN git_source_consumers c ON c.consumer_id=i.consumer_id AND c.root_hash=i.source_root_hash AND c.purpose='intent' LEFT JOIN artifact_jobs j ON j.id=i.artifact_id WHERE g.workspace IS NULL OR g.root_hash<>i.source_root_hash OR g.commit_oid<>i.commit_oid OR g.source_format_version<>i.source_format_version OR c.root_hash IS NULL OR i.consumer_id !~ '^intent:[0-9a-f]{48}$' OR c.expires_at<>9223372036854775807 OR (SELECT count(*) FROM git_source_consumers sibling WHERE sibling.consumer_id=i.consumer_id)<>1 OR (SELECT count(*) FROM artifact_intents sibling WHERE sibling.consumer_id=i.consumer_id)<>1 OR (i.state='deferred' AND (i.artifact_id IS NOT NULL OR EXISTS(SELECT 1 FROM artifact_consumers ac WHERE ac.consumer_id=i.consumer_id))) OR (i.state='promoted' AND (j.id IS NULL OR j.workspace<>i.workspace OR j.repo<>i.repo OR j.commit_oid<>i.commit_oid OR j.kind<>i.kind OR j.format_version<>i.format_version OR (SELECT count(*) FROM artifact_consumers ac WHERE ac.consumer_id=i.consumer_id)<>1 OR NOT EXISTS(SELECT 1 FROM artifact_consumers ac WHERE ac.artifact_id=i.artifact_id AND ac.consumer_id=i.consumer_id AND ac.expires_at=9223372036854775807))))"#).fetch_one(&mut *c).await?;
     let reverse_invalid:i64=sqlx::query_scalar(r#"SELECT
       (SELECT count(*) FROM git_source_roots r WHERE r.state='registered' AND (NOT EXISTS(SELECT 1 FROM git_source_acquisitions a WHERE a.state='registered' AND a.root_hash=r.root_hash AND a.operation_id=r.registration_operation AND a.generation=r.registration_generation) OR NOT EXISTS(SELECT 1 FROM git_source_desires d WHERE d.state='registered' AND d.root_hash=r.root_hash AND d.workspace=r.workspace AND d.repo=r.repo AND d.commit_oid=r.commit_oid AND d.source_format_version=r.source_format_version)))+
       (SELECT count(*) FROM git_source_acquisitions a WHERE (a.state IN('held','graph_published','activation_unknown') AND NOT EXISTS(SELECT 1 FROM git_source_desires d WHERE d.state='acquiring' AND d.acquisition_token=a.token AND d.workspace=a.workspace AND d.repo=a.repo AND d.commit_oid=a.commit_oid AND d.source_format_version=a.source_format_version)) OR (a.state='registered' AND NOT EXISTS(SELECT 1 FROM git_source_desires d WHERE d.state='registered' AND d.root_hash=a.root_hash AND d.workspace=a.workspace AND d.repo=a.repo AND d.commit_oid=a.commit_oid AND d.source_format_version=a.source_format_version)) OR (a.state='registered' AND (EXISTS(SELECT 1 FROM git_source_acquisition_members am LEFT JOIN git_source_members m ON m.root_hash=a.root_hash AND m.ordinal=am.ordinal WHERE am.token=a.token AND (m.ordinal IS NULL OR m.child_hash<>am.child_hash OR m.child_len<>am.child_len OR m.kind<>am.kind)) OR EXISTS(SELECT 1 FROM git_source_members m LEFT JOIN git_source_acquisition_members am ON am.token=a.token AND am.ordinal=m.ordinal WHERE m.root_hash=a.root_hash AND am.ordinal IS NULL))))+
@@ -1452,13 +1462,104 @@ mod tests {
             SourceBeginOutcome::PermitToPrepare(permit) => permit,
             _ => panic!("cancelled registration was not retryable"),
         };
-        assert!(
-            registry
-                .fail_preparation(&retry_permit, FailureClass::Retryable)
-                .await
-                .unwrap()
-        );
+        let (retry_acquisition, _) = registry
+            .bind_prepared_graph(&retry_permit, &prepared_cancel)
+            .await
+            .unwrap();
+        let retry_durable = registry
+            .register(
+                &retry_acquisition,
+                &prepared_cancel,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
         let mut corrupt = pool.acquire().await.unwrap().detach();
+        let mismatch_consumer: String = sqlx::query_scalar(
+            "SELECT consumer_id FROM artifact_intents WHERE workspace='ws' ORDER BY id LIMIT 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql("BEGIN").execute(&mut corrupt).await.unwrap();
+        sqlx::query(
+            "UPDATE artifact_intents SET source_root_hash=$1,commit_oid=$2 WHERE consumer_id=$3",
+        )
+        .bind(retry_durable.manifest())
+        .bind(retry_durable.commit())
+        .bind(&mismatch_consumer)
+        .execute(&mut corrupt)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE git_source_consumers SET root_hash=$1,commit_oid=$2 WHERE consumer_id=$3",
+        )
+        .bind(retry_durable.manifest())
+        .bind(retry_durable.commit())
+        .bind(&mismatch_consumer)
+        .execute(&mut corrupt)
+        .await
+        .unwrap();
+        assert!(
+            validate_postgres_v7(&mut corrupt, true).await.is_err(),
+            "intent generation A was accepted with registered source B"
+        );
+        sqlx::raw_sql("ROLLBACK")
+            .execute(&mut corrupt)
+            .await
+            .unwrap();
+
+        sqlx::raw_sql("BEGIN").execute(&mut corrupt).await.unwrap();
+        sqlx::query(
+            "UPDATE git_source_acquisitions SET operation_id='planted-operation' WHERE token=$1",
+        )
+        .bind(durable.registration_token())
+        .execute(&mut corrupt)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE git_source_roots SET registration_operation='planted-operation' WHERE root_hash=$1")
+            .bind(durable.manifest())
+            .execute(&mut corrupt)
+            .await
+            .unwrap();
+        assert!(
+            validate_postgres_v7(&mut corrupt, true).await.is_err(),
+            "non-deterministic acquisition operation provenance was accepted"
+        );
+        sqlx::raw_sql("ROLLBACK")
+            .execute(&mut corrupt)
+            .await
+            .unwrap();
+
+        sqlx::raw_sql("BEGIN").execute(&mut corrupt).await.unwrap();
+        sqlx::query("INSERT INTO artifact_intents(workspace,repo,branch,branch_generation,source_root_hash,source_format_version,commit_oid,kind,format_version,state,artifact_id,consumer_id,created_at,updated_at) SELECT workspace,repo,branch,branch_generation,source_root_hash,source_format_version,commit_oid,kind,format_version+1000,'deferred',NULL,consumer_id,created_at,updated_at FROM artifact_intents WHERE consumer_id=$1")
+            .bind(&mismatch_consumer)
+            .execute(&mut corrupt)
+            .await
+            .unwrap();
+        assert!(
+            validate_postgres_v7(&mut corrupt, true).await.is_err(),
+            "one source consumer was accepted for multiple intents"
+        );
+        sqlx::raw_sql("ROLLBACK")
+            .execute(&mut corrupt)
+            .await
+            .unwrap();
+
+        sqlx::raw_sql("BEGIN").execute(&mut corrupt).await.unwrap();
+        sqlx::raw_sql("CREATE TABLE planted_source_child() INHERITS (git_source_roots)")
+            .execute(&mut corrupt)
+            .await
+            .unwrap();
+        assert!(
+            validate_postgres_v7(&mut corrupt, true).await.is_err(),
+            "source-table inheritance was accepted"
+        );
+        sqlx::raw_sql("ROLLBACK")
+            .execute(&mut corrupt)
+            .await
+            .unwrap();
+
         sqlx::raw_sql("BEGIN").execute(&mut corrupt).await.unwrap();
         sqlx::query(
             "UPDATE git_source_acquisition_members SET kind='index' WHERE token=$1 AND ordinal=0",
