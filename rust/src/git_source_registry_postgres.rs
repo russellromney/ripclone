@@ -1510,6 +1510,20 @@ mod tests {
             .unwrap();
 
         sqlx::raw_sql("BEGIN").execute(&mut corrupt).await.unwrap();
+        sqlx::raw_sql("CREATE RULE planted_source_rule AS ON DELETE TO git_source_maintenance DO INSTEAD NOTHING")
+            .execute(&mut corrupt)
+            .await
+            .unwrap();
+        assert!(
+            validate_postgres_v7(&mut corrupt, true).await.is_err(),
+            "source-table rewrite rule was accepted"
+        );
+        sqlx::raw_sql("ROLLBACK")
+            .execute(&mut corrupt)
+            .await
+            .unwrap();
+
+        sqlx::raw_sql("BEGIN").execute(&mut corrupt).await.unwrap();
         sqlx::query(
             "UPDATE git_source_acquisitions SET operation_id='planted-operation' WHERE token=$1",
         )
