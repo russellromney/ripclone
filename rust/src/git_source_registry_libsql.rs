@@ -1381,6 +1381,25 @@ mod tests {
             .await
             .unwrap();
         assert!(validate_v7_schema(&connection).await.is_err());
+        connection
+            .execute("DROP INDEX artifact_intents_source", ())
+            .await
+            .unwrap();
+        connection
+            .execute(
+                "CREATE INDEX artifact_intents_source ON artifact_intents(source_root_hash,state,id)",
+                (),
+            )
+            .await
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE git_source_maintenance SET root_cursor='NOT-A-HASH' WHERE id=1",
+                (),
+            )
+            .await
+            .unwrap();
+        assert!(validate_v7_schema(&connection).await.is_err());
     }
 
     #[tokio::test]
@@ -1421,46 +1440,73 @@ mod tests {
         .await
         .unwrap();
         let commit = "0123456789012345678901234567890123456789";
-        let first = registry
-            .begin_acquisition(
-                "ws",
-                "o/r",
-                commit,
-                SOURCE_FORMAT_VERSION,
-                "worker-a",
-                "attempt-a",
-                60,
-                SyncIntent::EnsureCurrent,
-            )
-            .await
-            .unwrap();
-        let SourceBeginOutcome::PermitToPrepare(permit) = first else {
-            panic!("first acquisition did not mint a Held preparation permit")
-        };
+        let mut tasks = tokio::task::JoinSet::new();
+        for index in 0..8 {
+            let registry = registry.clone();
+            tasks.spawn(async move {
+                registry
+                    .begin_acquisition(
+                        "ws",
+                        "o/r",
+                        commit,
+                        SOURCE_FORMAT_VERSION,
+                        &format!("worker-{index}"),
+                        &format!("attempt-{index}"),
+                        60,
+                        SyncIntent::EnsureCurrent,
+                    )
+                    .await
+            });
+        }
+        let mut permit = None;
+        let mut deferred = 0;
+        while let Some(result) = tasks.join_next().await {
+            match result.unwrap().unwrap() {
+                SourceBeginOutcome::PermitToPrepare(value) => {
+                    assert!(
+                        permit.replace(value).is_none(),
+                        "concurrent libsql starts minted multiple permits"
+                    )
+                }
+                SourceBeginOutcome::Deferred { .. } => deferred += 1,
+                _ => panic!("concurrent libsql start returned unexpected state"),
+            }
+        }
+        let permit = permit.expect("concurrent libsql starts did not mint a permit");
+        assert_eq!(deferred, 7);
+        let restarted = LibsqlGitSourceRegistry::new(
+            registry.database.clone(),
+            registry.storage.clone(),
+            registry.scheduler_limits.clone(),
+            registry.source_limits.clone(),
+            [9; 32],
+        )
+        .await
+        .unwrap();
         assert!(matches!(
-            registry
+            restarted
                 .begin_acquisition(
                     "ws",
                     "o/r",
                     commit,
                     SOURCE_FORMAT_VERSION,
-                    "worker-b",
-                    "attempt-b",
+                    "restart",
+                    "restart",
                     60,
-                    SyncIntent::EnsureCurrent,
+                    SyncIntent::EnsureCurrent
                 )
                 .await
                 .unwrap(),
             SourceBeginOutcome::Deferred { .. }
         ));
         assert!(
-            registry
+            restarted
                 .fail_preparation(&permit, FailureClass::Retryable)
                 .await
                 .unwrap()
         );
         assert!(matches!(
-            registry
+            restarted
                 .begin_acquisition(
                     "ws",
                     "o/r",
