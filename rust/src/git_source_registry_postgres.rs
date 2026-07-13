@@ -9,7 +9,7 @@ CREATE TABLE git_source_members(root_hash TEXT NOT NULL,ordinal BIGINT NOT NULL 
 CREATE INDEX git_source_members_child ON git_source_members(child_hash,root_hash);
 CREATE TABLE git_source_acquisition_sequence(id SMALLINT PRIMARY KEY CHECK(id=1),generation BIGINT NOT NULL CHECK(generation>=0));
 INSERT INTO git_source_acquisition_sequence(id,generation) VALUES(1,0);
-CREATE TABLE git_source_acquisitions(token TEXT PRIMARY KEY,generation BIGINT NOT NULL UNIQUE CHECK(generation>0),operation_id TEXT NOT NULL UNIQUE,active_identity TEXT UNIQUE,workspace TEXT NOT NULL,repo TEXT NOT NULL,commit_oid TEXT NOT NULL,source_format_version BIGINT NOT NULL,owner TEXT NOT NULL,attempt_id TEXT NOT NULL,root_hash TEXT,root_len BIGINT,object_format TEXT,semantic_digest TEXT,object_set_digest TEXT,object_count BIGINT,total_bytes BIGINT,expires_at BIGINT NOT NULL,state TEXT NOT NULL CHECK(state IN('held','graph_published','activation_unknown','registered','failed')),failure_class TEXT CHECK(failure_class IN('retryable','permanent','dead_letter')),CHECK((state='held' AND active_identity IS NOT NULL AND root_hash IS NULL AND failure_class IS NULL) OR (state IN('graph_published','activation_unknown') AND active_identity IS NOT NULL AND root_hash IS NOT NULL AND root_len>0 AND object_count>0 AND total_bytes>0 AND failure_class IS NULL) OR (state='registered' AND active_identity IS NULL AND root_hash IS NOT NULL AND failure_class IS NULL) OR (state='failed' AND active_identity IS NULL AND failure_class IS NOT NULL)));
+CREATE TABLE git_source_acquisitions(token TEXT PRIMARY KEY,generation BIGINT NOT NULL UNIQUE CHECK(generation>0),operation_id TEXT NOT NULL UNIQUE,active_identity TEXT UNIQUE,workspace TEXT NOT NULL,repo TEXT NOT NULL,commit_oid TEXT NOT NULL,source_format_version BIGINT NOT NULL,owner TEXT NOT NULL,attempt_id TEXT NOT NULL,root_hash TEXT,root_len BIGINT,object_format TEXT,semantic_digest TEXT,object_set_digest TEXT,object_count BIGINT,total_bytes BIGINT,expires_at BIGINT NOT NULL,state TEXT NOT NULL CHECK(state IN('held','graph_published','activation_unknown','registered','failed')),failure_class TEXT CHECK(failure_class IN('retryable','permanent','dead_letter')),CHECK((state='held' AND active_identity IS NOT NULL AND root_hash IS NULL AND root_len IS NULL AND object_format IS NULL AND semantic_digest IS NULL AND object_set_digest IS NULL AND object_count IS NULL AND total_bytes IS NULL AND failure_class IS NULL) OR (state IN('graph_published','activation_unknown') AND active_identity IS NOT NULL AND root_hash IS NOT NULL AND root_len>0 AND object_format IN('sha1','sha256') AND semantic_digest IS NOT NULL AND object_set_digest IS NOT NULL AND object_count>0 AND total_bytes>0 AND failure_class IS NULL) OR (state='registered' AND active_identity IS NULL AND root_hash IS NOT NULL AND root_len>0 AND object_format IN('sha1','sha256') AND semantic_digest IS NOT NULL AND object_set_digest IS NOT NULL AND object_count>0 AND total_bytes>0 AND failure_class IS NULL) OR (state='failed' AND active_identity IS NULL AND failure_class IS NOT NULL)));
 CREATE INDEX git_source_acquisitions_recovery ON git_source_acquisitions(state,generation,token);
 CREATE TABLE git_source_acquisition_members(token TEXT NOT NULL,ordinal BIGINT NOT NULL CHECK(ordinal>=0),child_hash TEXT NOT NULL,child_len BIGINT NOT NULL CHECK(child_len>0),kind TEXT NOT NULL CHECK(kind IN('pack','index')),PRIMARY KEY(token,ordinal),UNIQUE(token,child_hash),FOREIGN KEY(token) REFERENCES git_source_acquisitions(token) ON DELETE CASCADE);
 CREATE INDEX git_source_acquisition_members_child ON git_source_acquisition_members(child_hash,token);
@@ -44,7 +44,7 @@ const PG_SOURCE_TABLES: &[&str] = &[
 // the ordered column layout and the exact semantic constraint multiset rather
 // than generated object names.
 const PG_V7_COLUMN_SIGNATURE: &str = r##"[["artifact_intents", "id", "bigint", "NO", "nextval('artifact_intents_id_seq'::regclass)", "", "NO", "", "NEVER", ""], ["artifact_intents", "workspace", "text", "NO", "", "", "NO", "", "NEVER", ""], ["artifact_intents", "repo", "text", "NO", "", "", "NO", "", "NEVER", ""], ["artifact_intents", "branch", "text", "NO", "", "", "NO", "", "NEVER", ""], ["artifact_intents", "branch_generation", "bigint", "NO", "", "", "NO", "", "NEVER", ""], ["artifact_intents", "source_root_hash", "text", "NO", "", "", "NO", "", "NEVER", ""], ["artifact_intents", "source_format_version", "bigint", "NO", "", "", "NO", "", "NEVER", ""], ["artifact_intents", "commit_oid", "text", "NO", "", "", "NO", "", "NEVER", ""], ["artifact_intents", "kind", "text", "NO", "", "", "NO", "", "NEVER", ""], ["artifact_intents", "format_version", "bigint", "NO", "", "", "NO", "", "NEVER", ""], ["artifact_intents", "state", "text", "NO", "", "", "NO", "", "NEVER", ""], ["artifact_intents", "artifact_id", "bigint", "YES", "", "", "NO", "", "NEVER", ""], ["artifact_intents", "consumer_id", "text", "NO", "", "", "NO", "", "NEVER", ""], ["artifact_intents", "created_at", "bigint", "NO", "", "", "NO", "", "NEVER", ""], ["artifact_intents", "updated_at", "bigint", "NO", "", "", "NO", "", "NEVER", ""], ["branch_source_current", "workspace", "text", "NO", "", "", "NO", "", "NEVER", ""], ["branch_source_current", "repo", "text", "NO", "", "", "NO", "", "NEVER", ""], ["branch_source_current", "branch", "text", "NO", "", "", "NO", "", "NEVER", ""], ["branch_source_current", "generation", "bigint", "NO", "", "", "NO", "", "NEVER", ""], ["branch_source_generations", "workspace", "text", "NO", "", "", "NO", "", "NEVER", ""], ["branch_source_generations", "repo", "text", "NO", "", "", "NO", "", "NEVER", ""], ["branch_source_generations", "branch", "text", "NO", "", "", "NO", "", "NEVER", ""], ["branch_source_generations", "generation", "bigint", "NO", "", "", "NO", "", "NEVER", ""], ["branch_source_generations", "commit_oid", "text", "NO", "", "", "NO", "", "NEVER", ""], ["branch_source_generations", "source_format_version", "bigint", "NO", "", "", "NO", "", "NEVER", ""], ["branch_source_generations", "root_hash", "text", "NO", "", "", "NO", "", "NEVER", ""], ["branch_source_generations", "created_at", "bigint", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_acquisition_members", "token", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_acquisition_members", "ordinal", "bigint", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_acquisition_members", "child_hash", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_acquisition_members", "child_len", "bigint", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_acquisition_members", "kind", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_acquisition_sequence", "id", "smallint", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_acquisition_sequence", "generation", "bigint", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_acquisitions", "token", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_acquisitions", "generation", "bigint", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_acquisitions", "operation_id", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_acquisitions", "active_identity", "text", "YES", "", "", "NO", "", "NEVER", ""], ["git_source_acquisitions", "workspace", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_acquisitions", "repo", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_acquisitions", "commit_oid", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_acquisitions", "source_format_version", "bigint", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_acquisitions", "owner", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_acquisitions", "attempt_id", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_acquisitions", "root_hash", "text", "YES", "", "", "NO", "", "NEVER", ""], ["git_source_acquisitions", "root_len", "bigint", "YES", "", "", "NO", "", "NEVER", ""], ["git_source_acquisitions", "object_format", "text", "YES", "", "", "NO", "", "NEVER", ""], ["git_source_acquisitions", "semantic_digest", "text", "YES", "", "", "NO", "", "NEVER", ""], ["git_source_acquisitions", "object_set_digest", "text", "YES", "", "", "NO", "", "NEVER", ""], ["git_source_acquisitions", "object_count", "bigint", "YES", "", "", "NO", "", "NEVER", ""], ["git_source_acquisitions", "total_bytes", "bigint", "YES", "", "", "NO", "", "NEVER", ""], ["git_source_acquisitions", "expires_at", "bigint", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_acquisitions", "state", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_acquisitions", "failure_class", "text", "YES", "", "", "NO", "", "NEVER", ""], ["git_source_consumers", "root_hash", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_consumers", "consumer_id", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_consumers", "session_id", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_consumers", "workspace", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_consumers", "repo", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_consumers", "commit_oid", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_consumers", "source_format_version", "bigint", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_consumers", "purpose", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_consumers", "expires_at", "bigint", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_desires", "workspace", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_desires", "repo", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_desires", "commit_oid", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_desires", "source_format_version", "bigint", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_desires", "state", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_desires", "root_hash", "text", "YES", "", "", "NO", "", "NEVER", ""], ["git_source_desires", "failure_class", "text", "YES", "", "", "NO", "", "NEVER", ""], ["git_source_desires", "retry_count", "bigint", "NO", "0", "", "NO", "", "NEVER", ""], ["git_source_desires", "acquisition_token", "text", "YES", "", "", "NO", "", "NEVER", ""], ["git_source_desires", "updated_at", "bigint", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_maintenance", "id", "smallint", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_maintenance", "intent_cursor", "bigint", "NO", "0", "", "NO", "", "NEVER", ""], ["git_source_maintenance", "intent_workspace_cursor", "text", "NO", "''::text", "", "NO", "", "NEVER", ""], ["git_source_maintenance", "acquisition_cursor", "bigint", "NO", "0", "", "NO", "", "NEVER", ""], ["git_source_maintenance", "root_cursor", "text", "NO", "''::text", "", "NO", "", "NEVER", ""], ["git_source_maintenance", "config_fingerprint", "text", "NO", "''::text", "", "NO", "", "NEVER", ""], ["git_source_maintenance", "updated_at", "bigint", "NO", "0", "", "NO", "", "NEVER", ""], ["git_source_members", "root_hash", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_members", "ordinal", "bigint", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_members", "child_hash", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_members", "child_len", "bigint", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_members", "kind", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_roots", "root_hash", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_roots", "root_len", "bigint", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_roots", "workspace", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_roots", "repo", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_roots", "commit_oid", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_roots", "source_format_version", "bigint", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_roots", "object_format", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_roots", "semantic_digest", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_roots", "object_set_digest", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_roots", "object_count", "bigint", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_roots", "total_bytes", "bigint", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_roots", "registration_operation", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_roots", "registration_generation", "bigint", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_roots", "state", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_roots", "created_at", "bigint", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_roots", "registered_at", "bigint", "NO", "", "", "NO", "", "NEVER", ""]]"##;
-const PG_V7_CONSTRAINT_SIGNATURE: &str = r##"[["artifact_intents", "c", true, false, false, "CHECK (format_version >= 1 AND format_version <= '4294967295'::bigint)"], ["artifact_intents", "c", true, false, false, "CHECK (kind = ANY (ARRAY['head'::text, 'full_history'::text, 'files'::text]))"], ["artifact_intents", "c", true, false, false, "CHECK (state = 'deferred'::text AND artifact_id IS NULL OR state = 'promoted'::text AND artifact_id IS NOT NULL)"], ["artifact_intents", "c", true, false, false, "CHECK (state = ANY (ARRAY['deferred'::text, 'promoted'::text]))"], ["artifact_intents", "f", true, false, false, "FOREIGN KEY (artifact_id) REFERENCES artifact_jobs(id) ON DELETE RESTRICT"], ["artifact_intents", "f", true, false, false, "FOREIGN KEY (source_root_hash, workspace, repo, commit_oid, source_format_version) REFERENCES git_source_roots(root_hash, workspace, repo, commit_oid, source_format_version) ON DELETE RESTRICT"], ["artifact_intents", "f", true, false, false, "FOREIGN KEY (workspace, repo, branch, branch_generation) REFERENCES branch_source_generations(workspace, repo, branch, generation) ON DELETE RESTRICT"], ["artifact_intents", "p", true, false, false, "PRIMARY KEY (id)"], ["artifact_intents", "u", true, false, false, "UNIQUE (workspace, repo, branch, branch_generation, kind, format_version)"], ["branch_source_current", "f", true, false, false, "FOREIGN KEY (workspace, repo, branch, generation) REFERENCES branch_source_generations(workspace, repo, branch, generation) ON DELETE RESTRICT"], ["branch_source_current", "p", true, false, false, "PRIMARY KEY (workspace, repo, branch)"], ["branch_source_generations", "c", true, false, false, "CHECK (generation > 0)"], ["branch_source_generations", "f", true, false, false, "FOREIGN KEY (root_hash, workspace, repo, commit_oid, source_format_version) REFERENCES git_source_roots(root_hash, workspace, repo, commit_oid, source_format_version) ON DELETE RESTRICT"], ["branch_source_generations", "p", true, false, false, "PRIMARY KEY (workspace, repo, branch, generation)"], ["git_source_acquisition_members", "c", true, false, false, "CHECK (child_len > 0)"], ["git_source_acquisition_members", "c", true, false, false, "CHECK (kind = ANY (ARRAY['pack'::text, 'index'::text]))"], ["git_source_acquisition_members", "c", true, false, false, "CHECK (ordinal >= 0)"], ["git_source_acquisition_members", "f", true, false, false, "FOREIGN KEY (token) REFERENCES git_source_acquisitions(token) ON DELETE CASCADE"], ["git_source_acquisition_members", "p", true, false, false, "PRIMARY KEY (token, ordinal)"], ["git_source_acquisition_members", "u", true, false, false, "UNIQUE (token, child_hash)"], ["git_source_acquisition_sequence", "c", true, false, false, "CHECK (generation >= 0)"], ["git_source_acquisition_sequence", "c", true, false, false, "CHECK (id = 1)"], ["git_source_acquisition_sequence", "p", true, false, false, "PRIMARY KEY (id)"], ["git_source_acquisitions", "c", true, false, false, "CHECK (failure_class = ANY (ARRAY['retryable'::text, 'permanent'::text, 'dead_letter'::text]))"], ["git_source_acquisitions", "c", true, false, false, "CHECK (generation > 0)"], ["git_source_acquisitions", "c", true, false, false, "CHECK (state = 'held'::text AND active_identity IS NOT NULL AND root_hash IS NULL AND failure_class IS NULL OR (state = ANY (ARRAY['graph_published'::text, 'activation_unknown'::text])) AND active_identity IS NOT NULL AND root_hash IS NOT NULL AND root_len > 0 AND object_count > 0 AND total_bytes > 0 AND failure_class IS NULL OR state = 'registered'::text AND active_identity IS NULL AND root_hash IS NOT NULL AND failure_class IS NULL OR state = 'failed'::text AND active_identity IS NULL AND failure_class IS NOT NULL)"], ["git_source_acquisitions", "c", true, false, false, "CHECK (state = ANY (ARRAY['held'::text, 'graph_published'::text, 'activation_unknown'::text, 'registered'::text, 'failed'::text]))"], ["git_source_acquisitions", "p", true, false, false, "PRIMARY KEY (token)"], ["git_source_acquisitions", "u", true, false, false, "UNIQUE (active_identity)"], ["git_source_acquisitions", "u", true, false, false, "UNIQUE (generation)"], ["git_source_acquisitions", "u", true, false, false, "UNIQUE (operation_id)"], ["git_source_consumers", "c", true, false, false, "CHECK (purpose = ANY (ARRAY['intent'::text, 'builder'::text]))"], ["git_source_consumers", "f", true, false, false, "FOREIGN KEY (root_hash, workspace, repo, commit_oid, source_format_version) REFERENCES git_source_roots(root_hash, workspace, repo, commit_oid, source_format_version) ON DELETE RESTRICT"], ["git_source_consumers", "p", true, false, false, "PRIMARY KEY (root_hash, consumer_id)"], ["git_source_consumers", "u", true, false, false, "UNIQUE (session_id)"], ["git_source_desires", "c", true, false, false, "CHECK (failure_class = ANY (ARRAY['retryable'::text, 'permanent'::text, 'dead_letter'::text]))"], ["git_source_desires", "c", true, false, false, "CHECK (retry_count >= 0 AND retry_count <= '4294967295'::bigint)"], ["git_source_desires", "c", true, false, false, "CHECK (state = 'acquiring'::text AND acquisition_token IS NOT NULL AND root_hash IS NULL AND failure_class IS NULL OR state = 'registered'::text AND acquisition_token IS NULL AND root_hash IS NOT NULL AND failure_class IS NULL OR state = 'failed'::text AND acquisition_token IS NULL AND root_hash IS NULL AND failure_class IS NOT NULL)"], ["git_source_desires", "c", true, false, false, "CHECK (state = ANY (ARRAY['acquiring'::text, 'registered'::text, 'failed'::text]))"], ["git_source_desires", "f", true, false, false, "FOREIGN KEY (acquisition_token) REFERENCES git_source_acquisitions(token) ON DELETE RESTRICT"], ["git_source_desires", "f", true, false, false, "FOREIGN KEY (root_hash) REFERENCES git_source_roots(root_hash) ON DELETE RESTRICT"], ["git_source_desires", "p", true, false, false, "PRIMARY KEY (workspace, repo, commit_oid, source_format_version)"], ["git_source_maintenance", "c", true, false, false, "CHECK (acquisition_cursor >= 0)"], ["git_source_maintenance", "c", true, false, false, "CHECK (id = 1)"], ["git_source_maintenance", "c", true, false, false, "CHECK (intent_cursor >= 0)"], ["git_source_maintenance", "p", true, false, false, "PRIMARY KEY (id)"], ["git_source_members", "c", true, false, false, "CHECK (child_len > 0)"], ["git_source_members", "c", true, false, false, "CHECK (kind = ANY (ARRAY['pack'::text, 'index'::text]))"], ["git_source_members", "c", true, false, false, "CHECK (ordinal >= 0)"], ["git_source_members", "f", true, false, false, "FOREIGN KEY (root_hash) REFERENCES git_source_roots(root_hash) ON DELETE RESTRICT"], ["git_source_members", "p", true, false, false, "PRIMARY KEY (root_hash, ordinal)"], ["git_source_members", "u", true, false, false, "UNIQUE (root_hash, child_hash)"], ["git_source_roots", "c", true, false, false, "CHECK (length(object_set_digest) = 64)"], ["git_source_roots", "c", true, false, false, "CHECK (length(semantic_digest) = 64)"], ["git_source_roots", "c", true, false, false, "CHECK (object_count > 0)"], ["git_source_roots", "c", true, false, false, "CHECK (object_format = ANY (ARRAY['sha1'::text, 'sha256'::text]))"], ["git_source_roots", "c", true, false, false, "CHECK (registration_generation > 0)"], ["git_source_roots", "c", true, false, false, "CHECK (root_len > 0)"], ["git_source_roots", "c", true, false, false, "CHECK (source_format_version >= 1 AND source_format_version <= '4294967295'::bigint)"], ["git_source_roots", "c", true, false, false, "CHECK (state = ANY (ARRAY['registered'::text, 'quarantined'::text]))"], ["git_source_roots", "c", true, false, false, "CHECK (total_bytes > 0)"], ["git_source_roots", "p", true, false, false, "PRIMARY KEY (root_hash)"], ["git_source_roots", "u", true, false, false, "UNIQUE (registration_generation)"], ["git_source_roots", "u", true, false, false, "UNIQUE (registration_operation)"], ["git_source_roots", "u", true, false, false, "UNIQUE (root_hash, workspace, repo, commit_oid, source_format_version)"], ["git_source_roots", "u", true, false, false, "UNIQUE (workspace, repo, commit_oid, source_format_version)"]]"##;
+const PG_V7_CONSTRAINT_SIGNATURE: &str = r##"[["artifact_intents", "c", true, false, false, "CHECK (format_version >= 1 AND format_version <= '4294967295'::bigint)"], ["artifact_intents", "c", true, false, false, "CHECK (kind = ANY (ARRAY['head'::text, 'full_history'::text, 'files'::text]))"], ["artifact_intents", "c", true, false, false, "CHECK (state = 'deferred'::text AND artifact_id IS NULL OR state = 'promoted'::text AND artifact_id IS NOT NULL)"], ["artifact_intents", "c", true, false, false, "CHECK (state = ANY (ARRAY['deferred'::text, 'promoted'::text]))"], ["artifact_intents", "f", true, false, false, "FOREIGN KEY (artifact_id) REFERENCES artifact_jobs(id) ON DELETE RESTRICT"], ["artifact_intents", "f", true, false, false, "FOREIGN KEY (source_root_hash, workspace, repo, commit_oid, source_format_version) REFERENCES git_source_roots(root_hash, workspace, repo, commit_oid, source_format_version) ON DELETE RESTRICT"], ["artifact_intents", "f", true, false, false, "FOREIGN KEY (workspace, repo, branch, branch_generation) REFERENCES branch_source_generations(workspace, repo, branch, generation) ON DELETE RESTRICT"], ["artifact_intents", "p", true, false, false, "PRIMARY KEY (id)"], ["artifact_intents", "u", true, false, false, "UNIQUE (workspace, repo, branch, branch_generation, kind, format_version)"], ["branch_source_current", "f", true, false, false, "FOREIGN KEY (workspace, repo, branch, generation) REFERENCES branch_source_generations(workspace, repo, branch, generation) ON DELETE RESTRICT"], ["branch_source_current", "p", true, false, false, "PRIMARY KEY (workspace, repo, branch)"], ["branch_source_generations", "c", true, false, false, "CHECK (generation > 0)"], ["branch_source_generations", "f", true, false, false, "FOREIGN KEY (root_hash, workspace, repo, commit_oid, source_format_version) REFERENCES git_source_roots(root_hash, workspace, repo, commit_oid, source_format_version) ON DELETE RESTRICT"], ["branch_source_generations", "p", true, false, false, "PRIMARY KEY (workspace, repo, branch, generation)"], ["git_source_acquisition_members", "c", true, false, false, "CHECK (child_len > 0)"], ["git_source_acquisition_members", "c", true, false, false, "CHECK (kind = ANY (ARRAY['pack'::text, 'index'::text]))"], ["git_source_acquisition_members", "c", true, false, false, "CHECK (ordinal >= 0)"], ["git_source_acquisition_members", "f", true, false, false, "FOREIGN KEY (token) REFERENCES git_source_acquisitions(token) ON DELETE CASCADE"], ["git_source_acquisition_members", "p", true, false, false, "PRIMARY KEY (token, ordinal)"], ["git_source_acquisition_members", "u", true, false, false, "UNIQUE (token, child_hash)"], ["git_source_acquisition_sequence", "c", true, false, false, "CHECK (generation >= 0)"], ["git_source_acquisition_sequence", "c", true, false, false, "CHECK (id = 1)"], ["git_source_acquisition_sequence", "p", true, false, false, "PRIMARY KEY (id)"], ["git_source_acquisitions", "c", true, false, false, "CHECK (failure_class = ANY (ARRAY['retryable'::text, 'permanent'::text, 'dead_letter'::text]))"], ["git_source_acquisitions", "c", true, false, false, "CHECK (generation > 0)"], ["git_source_acquisitions", "c", true, false, false, "CHECK (state = 'held'::text AND active_identity IS NOT NULL AND root_hash IS NULL AND root_len IS NULL AND object_format IS NULL AND semantic_digest IS NULL AND object_set_digest IS NULL AND object_count IS NULL AND total_bytes IS NULL AND failure_class IS NULL OR (state = ANY (ARRAY['graph_published'::text, 'activation_unknown'::text])) AND active_identity IS NOT NULL AND root_hash IS NOT NULL AND root_len > 0 AND (object_format = ANY (ARRAY['sha1'::text, 'sha256'::text])) AND semantic_digest IS NOT NULL AND object_set_digest IS NOT NULL AND object_count > 0 AND total_bytes > 0 AND failure_class IS NULL OR state = 'registered'::text AND active_identity IS NULL AND root_hash IS NOT NULL AND root_len > 0 AND (object_format = ANY (ARRAY['sha1'::text, 'sha256'::text])) AND semantic_digest IS NOT NULL AND object_set_digest IS NOT NULL AND object_count > 0 AND total_bytes > 0 AND failure_class IS NULL OR state = 'failed'::text AND active_identity IS NULL AND failure_class IS NOT NULL)"], ["git_source_acquisitions", "c", true, false, false, "CHECK (state = ANY (ARRAY['held'::text, 'graph_published'::text, 'activation_unknown'::text, 'registered'::text, 'failed'::text]))"], ["git_source_acquisitions", "p", true, false, false, "PRIMARY KEY (token)"], ["git_source_acquisitions", "u", true, false, false, "UNIQUE (active_identity)"], ["git_source_acquisitions", "u", true, false, false, "UNIQUE (generation)"], ["git_source_acquisitions", "u", true, false, false, "UNIQUE (operation_id)"], ["git_source_consumers", "c", true, false, false, "CHECK (purpose = ANY (ARRAY['intent'::text, 'builder'::text]))"], ["git_source_consumers", "f", true, false, false, "FOREIGN KEY (root_hash, workspace, repo, commit_oid, source_format_version) REFERENCES git_source_roots(root_hash, workspace, repo, commit_oid, source_format_version) ON DELETE RESTRICT"], ["git_source_consumers", "p", true, false, false, "PRIMARY KEY (root_hash, consumer_id)"], ["git_source_consumers", "u", true, false, false, "UNIQUE (session_id)"], ["git_source_desires", "c", true, false, false, "CHECK (failure_class = ANY (ARRAY['retryable'::text, 'permanent'::text, 'dead_letter'::text]))"], ["git_source_desires", "c", true, false, false, "CHECK (retry_count >= 0 AND retry_count <= '4294967295'::bigint)"], ["git_source_desires", "c", true, false, false, "CHECK (state = 'acquiring'::text AND acquisition_token IS NOT NULL AND root_hash IS NULL AND failure_class IS NULL OR state = 'registered'::text AND acquisition_token IS NULL AND root_hash IS NOT NULL AND failure_class IS NULL OR state = 'failed'::text AND acquisition_token IS NULL AND root_hash IS NULL AND failure_class IS NOT NULL)"], ["git_source_desires", "c", true, false, false, "CHECK (state = ANY (ARRAY['acquiring'::text, 'registered'::text, 'failed'::text]))"], ["git_source_desires", "f", true, false, false, "FOREIGN KEY (acquisition_token) REFERENCES git_source_acquisitions(token) ON DELETE RESTRICT"], ["git_source_desires", "f", true, false, false, "FOREIGN KEY (root_hash) REFERENCES git_source_roots(root_hash) ON DELETE RESTRICT"], ["git_source_desires", "p", true, false, false, "PRIMARY KEY (workspace, repo, commit_oid, source_format_version)"], ["git_source_maintenance", "c", true, false, false, "CHECK (acquisition_cursor >= 0)"], ["git_source_maintenance", "c", true, false, false, "CHECK (id = 1)"], ["git_source_maintenance", "c", true, false, false, "CHECK (intent_cursor >= 0)"], ["git_source_maintenance", "p", true, false, false, "PRIMARY KEY (id)"], ["git_source_members", "c", true, false, false, "CHECK (child_len > 0)"], ["git_source_members", "c", true, false, false, "CHECK (kind = ANY (ARRAY['pack'::text, 'index'::text]))"], ["git_source_members", "c", true, false, false, "CHECK (ordinal >= 0)"], ["git_source_members", "f", true, false, false, "FOREIGN KEY (root_hash) REFERENCES git_source_roots(root_hash) ON DELETE RESTRICT"], ["git_source_members", "p", true, false, false, "PRIMARY KEY (root_hash, ordinal)"], ["git_source_members", "u", true, false, false, "UNIQUE (root_hash, child_hash)"], ["git_source_roots", "c", true, false, false, "CHECK (length(object_set_digest) = 64)"], ["git_source_roots", "c", true, false, false, "CHECK (length(semantic_digest) = 64)"], ["git_source_roots", "c", true, false, false, "CHECK (object_count > 0)"], ["git_source_roots", "c", true, false, false, "CHECK (object_format = ANY (ARRAY['sha1'::text, 'sha256'::text]))"], ["git_source_roots", "c", true, false, false, "CHECK (registration_generation > 0)"], ["git_source_roots", "c", true, false, false, "CHECK (root_len > 0)"], ["git_source_roots", "c", true, false, false, "CHECK (source_format_version >= 1 AND source_format_version <= '4294967295'::bigint)"], ["git_source_roots", "c", true, false, false, "CHECK (state = ANY (ARRAY['registered'::text, 'quarantined'::text]))"], ["git_source_roots", "c", true, false, false, "CHECK (total_bytes > 0)"], ["git_source_roots", "p", true, false, false, "PRIMARY KEY (root_hash)"], ["git_source_roots", "u", true, false, false, "UNIQUE (registration_generation)"], ["git_source_roots", "u", true, false, false, "UNIQUE (registration_operation)"], ["git_source_roots", "u", true, false, false, "UNIQUE (root_hash, workspace, repo, commit_oid, source_format_version)"], ["git_source_roots", "u", true, false, false, "UNIQUE (workspace, repo, commit_oid, source_format_version)"]]"##;
 
 pub(crate) async fn validate_postgres_v7(c: &mut PgConnection, complete: bool) -> Result<()> {
     let names:Vec<String>=sqlx::query_scalar("SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=current_schema() AND c.relkind IN('r','p','v','m','f') AND (c.relname LIKE 'git\\_source\\_%' ESCAPE '\\' OR c.relname LIKE 'branch\\_source\\_%' ESCAPE '\\' OR c.relname LIKE 'artifact\\_intents%' ESCAPE '\\') ORDER BY c.relname").fetch_all(&mut *c).await?;
@@ -115,7 +115,7 @@ pub(crate) async fn validate_postgres_v7(c: &mut PgConnection, complete: bool) -
       (SELECT count(*) FROM git_source_roots r WHERE r.root_hash !~ '^[0-9a-f]{64}$' OR r.semantic_digest !~ '^[0-9a-f]{64}$' OR r.object_set_digest !~ '^[0-9a-f]{64}$' OR (r.object_format='sha1' AND r.commit_oid !~ '^[0-9a-f]{40}$') OR (r.object_format='sha256' AND r.commit_oid !~ '^[0-9a-f]{64}$') OR NOT EXISTS(SELECT 1 FROM git_source_members m WHERE m.root_hash=r.root_hash GROUP BY m.root_hash HAVING min(m.ordinal)=0 AND max(m.ordinal)+1=count(*) AND count(*)%2=0 AND sum(m.child_len)=r.total_bytes AND sum(CASE WHEN (m.ordinal%2=0 AND m.kind='pack') OR (m.ordinal%2=1 AND m.kind='index') THEN 0 ELSE 1 END)=0))+
       (SELECT count(*) FROM git_source_members WHERE child_hash !~ '^[0-9a-f]{64}$')+
       (SELECT count(*) FROM git_source_acquisition_members WHERE child_hash !~ '^[0-9a-f]{64}$')+
-      (SELECT count(*) FROM git_source_acquisitions a WHERE a.token !~ '^[0-9a-f]{64}$' OR (a.root_hash IS NOT NULL AND a.root_hash !~ '^[0-9a-f]{64}$') OR (a.semantic_digest IS NOT NULL AND a.semantic_digest !~ '^[0-9a-f]{64}$') OR (a.object_set_digest IS NOT NULL AND a.object_set_digest !~ '^[0-9a-f]{64}$') OR (a.state IN('graph_published','activation_unknown','registered') AND (a.root_hash IS NULL OR a.root_len IS NULL OR a.root_len<=0 OR a.semantic_digest IS NULL OR a.object_set_digest IS NULL OR a.object_format NOT IN('sha1','sha256') OR a.object_count IS NULL OR a.object_count<=0 OR a.total_bytes IS NULL OR a.total_bytes<=0)) OR (a.object_format='sha1' AND a.commit_oid !~ '^[0-9a-f]{40}$') OR (a.object_format='sha256' AND a.commit_oid !~ '^[0-9a-f]{64}$') OR (a.state IN('held','graph_published','activation_unknown') AND a.active_identity IS NULL) OR (a.state IN('registered','failed') AND a.active_identity IS NOT NULL) OR (a.state='held' AND EXISTS(SELECT 1 FROM git_source_acquisition_members m WHERE m.token=a.token)) OR (a.state IN('graph_published','activation_unknown','registered') AND NOT EXISTS(SELECT 1 FROM git_source_acquisition_members m WHERE m.token=a.token)) OR EXISTS(SELECT 1 FROM git_source_acquisition_members m WHERE m.token=a.token GROUP BY m.token HAVING min(m.ordinal)<>0 OR max(m.ordinal)+1<>count(*) OR count(*)%2<>0 OR sum(m.child_len)<>a.total_bytes OR sum(CASE WHEN (m.ordinal%2=0 AND m.kind='pack') OR (m.ordinal%2=1 AND m.kind='index') THEN 0 ELSE 1 END)<>0))+
+      (SELECT count(*) FROM git_source_acquisitions a WHERE a.token !~ '^[0-9a-f]{64}$' OR (a.root_hash IS NOT NULL AND a.root_hash !~ '^[0-9a-f]{64}$') OR (a.semantic_digest IS NOT NULL AND a.semantic_digest !~ '^[0-9a-f]{64}$') OR (a.object_set_digest IS NOT NULL AND a.object_set_digest !~ '^[0-9a-f]{64}$') OR (a.state='held' AND (a.root_hash IS NOT NULL OR a.root_len IS NOT NULL OR a.object_format IS NOT NULL OR a.semantic_digest IS NOT NULL OR a.object_set_digest IS NOT NULL OR a.object_count IS NOT NULL OR a.total_bytes IS NOT NULL)) OR (a.state IN('graph_published','activation_unknown','registered') AND (a.root_hash IS NULL OR a.root_len IS NULL OR a.root_len<=0 OR a.semantic_digest IS NULL OR a.object_set_digest IS NULL OR a.object_format NOT IN('sha1','sha256') OR a.object_count IS NULL OR a.object_count<=0 OR a.total_bytes IS NULL OR a.total_bytes<=0)) OR (a.object_format='sha1' AND a.commit_oid !~ '^[0-9a-f]{40}$') OR (a.object_format='sha256' AND a.commit_oid !~ '^[0-9a-f]{64}$') OR (a.state IN('held','graph_published','activation_unknown') AND a.active_identity IS NULL) OR (a.state IN('registered','failed') AND a.active_identity IS NOT NULL) OR (a.state='held' AND EXISTS(SELECT 1 FROM git_source_acquisition_members m WHERE m.token=a.token)) OR (a.state IN('graph_published','activation_unknown','registered') AND NOT EXISTS(SELECT 1 FROM git_source_acquisition_members m WHERE m.token=a.token)) OR EXISTS(SELECT 1 FROM git_source_acquisition_members m WHERE m.token=a.token GROUP BY m.token HAVING min(m.ordinal)<>0 OR max(m.ordinal)+1<>count(*) OR count(*)%2<>0 OR sum(m.child_len)<>a.total_bytes OR sum(CASE WHEN (m.ordinal%2=0 AND m.kind='pack') OR (m.ordinal%2=1 AND m.kind='index') THEN 0 ELSE 1 END)<>0))+
       (SELECT count(*) FROM git_source_acquisitions a LEFT JOIN git_source_roots r ON r.root_hash=a.root_hash WHERE a.state='registered' AND (r.root_hash IS NULL OR r.state<>'registered' OR r.registration_operation<>a.operation_id OR r.registration_generation<>a.generation OR r.workspace<>a.workspace OR r.repo<>a.repo OR r.commit_oid<>a.commit_oid OR r.source_format_version<>a.source_format_version OR r.root_len<>a.root_len OR r.object_format<>a.object_format OR r.semantic_digest<>a.semantic_digest OR r.object_set_digest<>a.object_set_digest OR r.object_count<>a.object_count OR r.total_bytes<>a.total_bytes))+
       (SELECT count(*) FROM git_source_desires d LEFT JOIN git_source_acquisitions a ON a.token=d.acquisition_token LEFT JOIN git_source_roots r ON r.root_hash=d.root_hash WHERE d.source_format_version<>1 OR d.commit_oid !~ '^[0-9a-f]{40}$|^[0-9a-f]{64}$' OR (d.state='acquiring' AND (a.token IS NULL OR a.workspace<>d.workspace OR a.repo<>d.repo OR a.commit_oid<>d.commit_oid OR a.source_format_version<>d.source_format_version OR a.state NOT IN('held','graph_published','activation_unknown'))) OR (d.state='registered' AND (r.root_hash IS NULL OR r.workspace<>d.workspace OR r.repo<>d.repo OR r.commit_oid<>d.commit_oid OR r.source_format_version<>d.source_format_version OR r.state<>'registered')))+
       (SELECT count(*) FROM branch_source_current current JOIN branch_source_generations g ON g.workspace=current.workspace AND g.repo=current.repo AND g.branch=current.branch AND g.generation=current.generation LEFT JOIN branch_observations b ON b.workspace=current.workspace AND b.repo=current.repo AND b.branch=current.branch WHERE b.workspace IS NULL OR b.generation<>g.generation OR b.desired_commit<>g.commit_oid)+
@@ -413,19 +413,43 @@ impl PostgresGitSourceRegistry {
             bail!("source acquisition and publication permit differ")
         }
         let plan = packager.owned_upload_plan(prepared)?;
-        let owned = cancelled.child_token();
-        let beat_cancel = owned.clone();
+        let publication_cancel = cancelled.child_token();
+        let _cancel_on_drop = publication_cancel.clone().drop_guard();
         let registry = (*self).clone();
-        let acquisition = a.clone();
-        let mut beat = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
-            loop {
-                tokio::select! {_ = beat_cancel.cancelled()=>return Ok(()),_=interval.tick()=>if !registry.renew(&acquisition,60).await?{beat_cancel.cancel();bail!("source acquisition lease was lost during upload")}}
+        let supervisor_acquisition = a.clone();
+        let supervisor_cancel = publication_cancel.clone();
+        let supervisor = tokio::spawn(async move {
+            let heartbeat_cancel = supervisor_cancel.clone();
+            let heartbeat_acquisition = supervisor_acquisition.clone();
+            let heartbeat_registry = registry.clone();
+            let mut heartbeat = tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+                loop {
+                    tokio::select! {_ = heartbeat_cancel.cancelled()=>return Ok(()),_=interval.tick()=>if !heartbeat_registry.renew(&heartbeat_acquisition,60).await?{heartbeat_cancel.cancel();bail!("PostgreSQL source acquisition lease was lost during upload")}}
+                }
+            });
+            let upload_cancel = supervisor_cancel.clone();
+            let mut upload = tokio::task::spawn_blocking(move || plan.publish(&upload_cancel));
+            let result:Result<()>=async{tokio::select! {
+                result=&mut upload=>{supervisor_cancel.cancel();let uploaded=result.context("PostgreSQL source upload task did not join")?;let heartbeat_result=heartbeat.await.context("PostgreSQL source upload heartbeat did not join")?;heartbeat_result?;uploaded},
+                result=&mut heartbeat=>{supervisor_cancel.cancel();let heartbeat_result=result.context("PostgreSQL source upload heartbeat did not join")?;let uploaded=upload.await.context("cancelled PostgreSQL source upload task did not join")?;heartbeat_result?;uploaded}
+            }}.await;
+            if let Err(error) = result {
+                if let Err(settlement) = registry
+                    .fail(&supervisor_acquisition, FailureClass::Retryable)
+                    .await
+                {
+                    return Err(error).context(format!(
+                        "failed PostgreSQL source upload could not settle retryably: {settlement}"
+                    ));
+                }
+                return Err(error);
             }
+            Ok(())
         });
-        let upload_cancel = owned.clone();
-        let mut upload = tokio::task::spawn_blocking(move || plan.publish(&upload_cancel));
-        tokio::select! {result=&mut upload=>{owned.cancel();let uploaded=result.context("source upload task did not join")?;beat.await.context("source upload heartbeat did not join")??;uploaded},result=&mut beat=>{owned.cancel();let heartbeat=result.context("source upload heartbeat did not join")?;let uploaded=upload.await.context("cancelled source upload task did not join")?;heartbeat?;uploaded}}
+        supervisor
+            .await
+            .context("PostgreSQL source upload supervisor did not join")?
     }
 
     pub async fn register(
@@ -1051,8 +1075,13 @@ mod tests {
         ClaimedArtifact, CompletionEvidence, CompletionVerifier, validate_evidence,
     };
     use crate::artifact_scheduler_postgres::PostgresArtifactScheduler;
-    use crate::git_source::prepared_source_for_registry_test;
+    use crate::git_source::{
+        GitSourcePackager, GitSourceUploader, prepared_source_for_registry_test,
+    };
     use sqlx::postgres::PgPoolOptions;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
 
     struct Accept;
     impl CompletionVerifier for Accept {
@@ -1062,6 +1091,156 @@ mod tests {
         fn verify(&self, claim: &ClaimedArtifact, evidence: &CompletionEvidence) -> Result<()> {
             validate_evidence(claim, evidence)
         }
+    }
+
+    #[derive(Clone, Default)]
+    struct SlowUploader {
+        entered: Arc<AtomicBool>,
+        cancelled: Arc<AtomicBool>,
+        finished: Arc<AtomicBool>,
+    }
+
+    impl GitSourceUploader for SlowUploader {
+        fn put_file(
+            &self,
+            blob: &CasBlob,
+            source: &Path,
+            cancelled: &CancellationToken,
+        ) -> Result<()> {
+            self.entered.store(true, Ordering::SeqCst);
+            let result = (|| {
+                for _ in 0..500 {
+                    if cancelled.is_cancelled() {
+                        self.cancelled.store(true, Ordering::SeqCst);
+                        bail!("cancelled slow PostgreSQL upload")
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                let bytes = std::fs::read(source)?;
+                if bytes.len() as u64 != blob.len
+                    || hex::encode(Sha256::digest(&bytes)) != blob.hash
+                {
+                    bail!("slow PostgreSQL upload input mismatch")
+                }
+                Ok(())
+            })();
+            self.finished.store(true, Ordering::SeqCst);
+            result
+        }
+
+        fn put_bytes(
+            &self,
+            blob: &CasBlob,
+            bytes: &[u8],
+            cancelled: &CancellationToken,
+        ) -> Result<()> {
+            if cancelled.is_cancelled() {
+                self.cancelled.store(true, Ordering::SeqCst);
+                bail!("cancelled slow PostgreSQL root upload")
+            }
+            if bytes.len() as u64 != blob.len || hex::encode(Sha256::digest(bytes)) != blob.hash {
+                bail!("slow PostgreSQL root mismatch")
+            }
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct FailingUploader;
+
+    impl GitSourceUploader for FailingUploader {
+        fn put_file(
+            &self,
+            _blob: &CasBlob,
+            _source: &Path,
+            _cancelled: &CancellationToken,
+        ) -> Result<()> {
+            bail!("injected PostgreSQL child upload failure")
+        }
+
+        fn put_bytes(
+            &self,
+            _blob: &CasBlob,
+            _bytes: &[u8],
+            _cancelled: &CancellationToken,
+        ) -> Result<()> {
+            bail!("injected PostgreSQL root upload failure")
+        }
+    }
+
+    async fn bound_upload_source(
+        registry: &PostgresGitSourceRegistry,
+        storage: &StorageRef,
+        commit: &str,
+        attempt: &str,
+        pack: CasBlob,
+        index: CasBlob,
+    ) -> (
+        PreparedGitSource,
+        GitSourceAcquisition,
+        GitSourcePublicationPermit,
+    ) {
+        let prepared = prepared_source_for_registry_test("ws", "o/r", commit, pack, index).unwrap();
+        let view = prepared.registry_view(&GitSourceLimits::default()).unwrap();
+        storage.put(&view.root.hash, &view.root_bytes).unwrap();
+        let permit = match registry
+            .begin_acquisition(
+                "ws",
+                "o/r",
+                commit,
+                SOURCE_FORMAT_VERSION,
+                "worker",
+                attempt,
+                60,
+                SyncIntent::EnsureCurrent,
+            )
+            .await
+            .unwrap()
+        {
+            SourceBeginOutcome::PermitToPrepare(permit) => permit,
+            _ => panic!("PostgreSQL upload source preparation was not admitted"),
+        };
+        let (acquisition, publication) = registry
+            .bind_prepared_graph(&permit, &prepared)
+            .await
+            .unwrap();
+        (prepared, acquisition, publication)
+    }
+
+    fn local_upload_cas(
+        registry: &PostgresGitSourceRegistry,
+        prepared: &PreparedGitSource,
+    ) -> (tempfile::TempDir, crate::cas::Cas) {
+        let directory = tempfile::tempdir().unwrap();
+        let local = crate::cas::Cas::new(directory.path()).unwrap();
+        for member in prepared
+            .registry_view(&GitSourceLimits::default())
+            .unwrap()
+            .members
+        {
+            let bytes = registry.storage.get(&member.blob.hash).unwrap();
+            local.put_with_hash(&member.blob.hash, &bytes).unwrap();
+        }
+        (directory, local)
+    }
+
+    async fn assert_retryable_failure(pool: &PgPool, acquisition: &GitSourceAcquisition) {
+        let acquisition_state: String = sqlx::query_scalar(
+            "SELECT state || ':' || failure_class FROM git_source_acquisitions WHERE token=$1",
+        )
+        .bind(&acquisition.token)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(acquisition_state, "failed:retryable");
+        let desire_state: String = sqlx::query_scalar("SELECT state || ':' || failure_class FROM git_source_desires WHERE acquisition_token IS NULL AND workspace=$1 AND repo=$2 AND commit_oid=$3")
+            .bind(&acquisition.workspace)
+            .bind(&acquisition.repo)
+            .bind(&acquisition.commit)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(desire_state, "failed:retryable");
     }
 
     async fn reset(pool: &PgPool) {
@@ -1097,6 +1276,257 @@ mod tests {
             .await
             .unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn postgres_v7_source_registry_upload_fault_matrix() {
+        let Some(url) = std::env::var("RIPCLONE_TEST_PG_URL").ok() else {
+            if std::env::var_os("RIPCLONE_REQUIRE_PG_TESTS").is_some() {
+                panic!(
+                    "postgres_v7_source_registry_upload_fault_matrix requires RIPCLONE_TEST_PG_URL"
+                )
+            }
+            eprintln!(
+                "SKIP postgres_v7_source_registry_upload_fault_matrix: RIPCLONE_TEST_PG_URL unset"
+            );
+            return;
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(16)
+            .connect(&url)
+            .await
+            .unwrap();
+        let mut lock = pool.acquire().await.unwrap().detach();
+        sqlx::query("SELECT pg_advisory_lock(731904220)")
+            .execute(&mut lock)
+            .await
+            .unwrap();
+        reset(&pool).await;
+        let limits = SchedulerLimits::default();
+        PostgresArtifactScheduler::from_pool(pool.clone(), limits.clone(), Arc::new(Accept))
+            .await
+            .unwrap();
+        let storage_dir = tempfile::tempdir().unwrap();
+        let storage = crate::storage::local(storage_dir.path()).unwrap();
+        let registry = PostgresGitSourceRegistry::new(
+            pool.clone(),
+            storage.clone(),
+            limits,
+            GitSourceLimits::default(),
+            [9; 32],
+        )
+        .await
+        .unwrap();
+        let pack_bytes = b"fault-pack";
+        let index_bytes = b"fault-index";
+        let pack = CasBlob {
+            hash: hex::encode(Sha256::digest(pack_bytes)),
+            len: pack_bytes.len() as u64,
+        };
+        let index = CasBlob {
+            hash: hex::encode(Sha256::digest(index_bytes)),
+            len: index_bytes.len() as u64,
+        };
+        storage.put(&pack.hash, pack_bytes).unwrap();
+        storage.put(&index.hash, index_bytes).unwrap();
+
+        let explicit_commit = "1".repeat(40);
+        let (explicit_prepared, explicit_acquisition, explicit_publication) = bound_upload_source(
+            &registry,
+            &storage,
+            &explicit_commit,
+            "explicit-cancel",
+            pack.clone(),
+            index.clone(),
+        )
+        .await;
+        let (_explicit_local_dir, explicit_local) = local_upload_cas(&registry, &explicit_prepared);
+        let explicit_uploader = SlowUploader::default();
+        let explicit_scratch = tempfile::tempdir().unwrap();
+        let explicit_packager = GitSourcePackager::new(
+            &explicit_local,
+            &explicit_uploader,
+            explicit_scratch.path(),
+            GitSourceLimits::default(),
+        );
+        let explicit_cancel = CancellationToken::new();
+        explicit_cancel.cancel();
+        assert!(
+            registry
+                .publish_protected(
+                    &explicit_acquisition,
+                    &explicit_packager,
+                    &explicit_prepared,
+                    &explicit_publication,
+                    &explicit_cancel,
+                )
+                .await
+                .is_err(),
+            "pre-cancelled PostgreSQL upload succeeded"
+        );
+        assert_retryable_failure(&pool, &explicit_acquisition).await;
+
+        let failure_commit = "2".repeat(40);
+        let (failure_prepared, failure_acquisition, failure_publication) = bound_upload_source(
+            &registry,
+            &storage,
+            &failure_commit,
+            "uploader-failure",
+            pack.clone(),
+            index.clone(),
+        )
+        .await;
+        let (_failure_local_dir, failure_local) = local_upload_cas(&registry, &failure_prepared);
+        let failure_scratch = tempfile::tempdir().unwrap();
+        let failure_packager = GitSourcePackager::new(
+            &failure_local,
+            &FailingUploader,
+            failure_scratch.path(),
+            GitSourceLimits::default(),
+        );
+        assert!(
+            registry
+                .publish_protected(
+                    &failure_acquisition,
+                    &failure_packager,
+                    &failure_prepared,
+                    &failure_publication,
+                    &CancellationToken::new(),
+                )
+                .await
+                .is_err(),
+            "failing PostgreSQL uploader succeeded"
+        );
+        assert_retryable_failure(&pool, &failure_acquisition).await;
+
+        let lease_commit = "3".repeat(40);
+        let (lease_prepared, lease_acquisition, lease_publication) = bound_upload_source(
+            &registry,
+            &storage,
+            &lease_commit,
+            "lease-loss",
+            pack.clone(),
+            index.clone(),
+        )
+        .await;
+        let (_lease_local_dir, lease_local) = local_upload_cas(&registry, &lease_prepared);
+        let lease_uploader = SlowUploader::default();
+        let lease_scratch = tempfile::tempdir().unwrap();
+        let lease_packager = GitSourcePackager::new(
+            &lease_local,
+            &lease_uploader,
+            lease_scratch.path(),
+            GitSourceLimits::default(),
+        );
+        sqlx::query("UPDATE git_source_acquisitions SET expires_at=0 WHERE token=$1")
+            .bind(&lease_acquisition.token)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            registry
+                .publish_protected(
+                    &lease_acquisition,
+                    &lease_packager,
+                    &lease_prepared,
+                    &lease_publication,
+                    &CancellationToken::new(),
+                )
+                .await
+                .is_err(),
+            "PostgreSQL upload survived acquisition lease loss"
+        );
+        if lease_uploader.entered.load(Ordering::SeqCst) {
+            assert!(lease_uploader.cancelled.load(Ordering::SeqCst));
+            assert!(lease_uploader.finished.load(Ordering::SeqCst));
+        }
+        assert_retryable_failure(&pool, &lease_acquisition).await;
+
+        let abort_commit = "4".repeat(40);
+        let (abort_prepared, abort_acquisition, abort_publication) = bound_upload_source(
+            &registry,
+            &storage,
+            &abort_commit,
+            "caller-abort",
+            pack,
+            index,
+        )
+        .await;
+        let abort_objects = abort_prepared
+            .registry_view(&GitSourceLimits::default())
+            .unwrap()
+            .members
+            .into_iter()
+            .map(|member| {
+                (
+                    member.blob.hash.clone(),
+                    registry.storage.get(&member.blob.hash).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let abort_uploader = SlowUploader::default();
+        let abort_flags = abort_uploader.clone();
+        let abort_registry = registry.clone();
+        let abort_acquisition_for_task = abort_acquisition.clone();
+        let abort_task = tokio::spawn(async move {
+            let local_dir = tempfile::tempdir().unwrap();
+            let local = crate::cas::Cas::new(local_dir.path()).unwrap();
+            for (hash, bytes) in abort_objects {
+                local.put_with_hash(&hash, &bytes).unwrap();
+            }
+            let scratch = tempfile::tempdir().unwrap();
+            let packager = GitSourcePackager::new(
+                &local,
+                &abort_uploader,
+                scratch.path(),
+                GitSourceLimits::default(),
+            );
+            abort_registry
+                .publish_protected(
+                    &abort_acquisition_for_task,
+                    &packager,
+                    &abort_prepared,
+                    &abort_publication,
+                    &CancellationToken::new(),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !abort_flags.entered.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("aborted PostgreSQL upload never entered child worker");
+        abort_task.abort();
+        assert!(abort_task.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let settled: Option<String> = sqlx::query_scalar(
+                    "SELECT CASE WHEN failure_class IS NULL THEN state ELSE state || ':' || failure_class END FROM git_source_acquisitions WHERE token=$1",
+                )
+                .bind(&abort_acquisition.token)
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
+                if abort_flags.finished.load(Ordering::SeqCst)
+                    && abort_flags.cancelled.load(Ordering::SeqCst)
+                    && settled.as_deref() == Some("failed:retryable")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("aborted PostgreSQL upload did not drain and settle retryably");
+        assert_retryable_failure(&pool, &abort_acquisition).await;
+
+        reset(&pool).await;
+        sqlx::query("SELECT pg_advisory_unlock(731904220)")
+            .execute(&mut lock)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1507,6 +1937,14 @@ mod tests {
             SourceBeginOutcome::PermitToPrepare(permit) => permit,
             _ => panic!("expected identity-test Held capability"),
         };
+        assert!(
+            sqlx::query("UPDATE git_source_acquisitions SET root_len=1,object_format='sha1',semantic_digest=repeat('a',64),object_set_digest=repeat('b',64),object_count=1,total_bytes=1 WHERE token=$1")
+                .bind(&identity_permit.token)
+                .execute(&pool)
+                .await
+                .is_err(),
+            "Held acquisition accepted non-NULL graph descriptors"
+        );
         sqlx::raw_sql("BEGIN").execute(&mut corrupt).await.unwrap();
         sqlx::query(
             "UPDATE git_source_acquisitions SET active_identity='planted-identity' WHERE token=$1",
