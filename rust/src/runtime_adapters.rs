@@ -215,7 +215,15 @@ impl<G: ProviderGit> BranchTipResolver for ProviderCurrentTipResolver<G> {
         repo: &str,
         branch: &str,
     ) -> Result<String> {
-        let (provider, repo, credential) = self.access.resolve(workspace, repo)?;
+        // A dynamic credential broker may mint over HTTP. Keep that synchronous
+        // compatibility seam off the async executor.
+        let access = self.access.clone();
+        let workspace = workspace.to_owned();
+        let repo_path = repo.to_owned();
+        let (provider, repo, credential) =
+            tokio::task::spawn_blocking(move || access.resolve(&workspace, &repo_path))
+                .await
+                .context("workspace credential task did not join")??;
         self.git
             .current_tip(provider, repo, branch.to_owned(), credential)
             .await
@@ -272,15 +280,15 @@ impl ExactSourcePreparer for GitCliExactSourcePreparer {
         commit: String,
         cancelled: CancellationToken,
     ) -> std::result::Result<PreparedGitSource, ProviderFailure> {
-        let (provider, repo_id, credential) =
-            self.access.resolve(&workspace, &repo).map_err(|e| {
-                ProviderFailure::new(ProviderFailureKind::Authentication, e.to_string())
-            })?;
+        let access = self.access.clone();
         let cas_root = self.local_cas_root.clone();
         let scratch_root = self.scratch_root.clone();
         let limits = self.limits.clone();
         let blocking_cancel = cancelled.clone();
         let mut task = tokio::task::spawn_blocking(move || {
+            let (provider, repo_id, credential) = access
+                .resolve(&workspace, &repo)
+                .map_err(classify_credential_failure)?;
             prepare_exact_blocking(
                 provider,
                 repo_id,
@@ -918,6 +926,28 @@ fn read_bounded(mut file: File) -> std::result::Result<Vec<u8>, ProviderFailure>
 
 fn io_provider_failure(error: std::io::Error) -> ProviderFailure {
     ProviderFailure::new(ProviderFailureKind::Unavailable, error.to_string())
+}
+
+fn classify_credential_failure(error: anyhow::Error) -> ProviderFailure {
+    let detail = error.to_string().to_ascii_lowercase();
+    let kind = if detail.contains("rate limit")
+        || detail.contains("429")
+        || detail.contains("too many requests")
+    {
+        ProviderFailureKind::RateLimited
+    } else if detail.contains("timed out")
+        || detail.contains("connect")
+        || detail.contains("server error")
+        || detail.contains("http 5")
+    {
+        ProviderFailureKind::Unavailable
+    } else {
+        ProviderFailureKind::Authentication
+    };
+    ProviderFailure::new(
+        kind,
+        format!("workspace credential acquisition failed ({kind:?})"),
+    )
 }
 
 fn classify_git_failure(operation: &str, stderr: &[u8]) -> ProviderFailure {
