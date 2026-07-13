@@ -56,6 +56,11 @@ pub(crate) async fn validate_mysql_v7_prefix(
         if incoming != 9 {
             bail!("mysql v7 source registry has external or missing reverse foreign keys")
         }
+        let triggers:i64=sqlx::query_scalar("SELECT count(*) FROM information_schema.triggers WHERE event_object_schema=DATABASE() AND event_object_table IN('git_source_roots','git_source_members','git_source_acquisition_sequence','git_source_acquisitions','git_source_acquisition_members','git_source_desires','branch_source_generations','branch_source_current','git_source_consumers','artifact_intents','git_source_maintenance')").fetch_one(&mut *c).await?;
+        let partitions:i64=sqlx::query_scalar("SELECT count(*) FROM information_schema.partitions WHERE table_schema=DATABASE() AND table_name IN('git_source_roots','git_source_members','git_source_acquisition_sequence','git_source_acquisitions','git_source_acquisition_members','git_source_desires','branch_source_generations','branch_source_current','git_source_consumers','artifact_intents','git_source_maintenance') AND partition_name IS NOT NULL").fetch_one(&mut *c).await?;
+        if triggers != 0 || partitions != 0 {
+            bail!("mysql v7 source registry trigger or partition definitions differ")
+        }
     }
     Ok(())
 }

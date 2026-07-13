@@ -5009,6 +5009,28 @@ mod tests {
             "extra Ready fence DDL was accepted"
         );
         reset(&control).await;
+        MysqlArtifactScheduler::from_pool(
+            MySqlPoolOptions::new().connect(&url).await.unwrap(),
+            Default::default(),
+            Arc::new(Accept),
+        )
+        .await
+        .unwrap();
+        sqlx::raw_sql("CREATE TRIGGER planted_source_trigger BEFORE INSERT ON git_source_maintenance FOR EACH ROW SET NEW.updated_at=0")
+            .execute(&control)
+            .await
+            .unwrap();
+        assert!(
+            MysqlArtifactScheduler::from_pool(
+                MySqlPoolOptions::new().connect(&url).await.unwrap(),
+                Default::default(),
+                Arc::new(Accept)
+            )
+            .await
+            .is_err(),
+            "source-table trigger was accepted"
+        );
+        reset(&control).await;
         let _: Option<i64> =
             sqlx::query_scalar("SELECT RELEASE_LOCK('ripclone_mysql_scheduler_test')")
                 .fetch_one(&mut lock_connection)
