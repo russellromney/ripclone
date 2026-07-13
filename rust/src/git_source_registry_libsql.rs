@@ -1100,6 +1100,9 @@ pub(crate) async fn validate_v7_schema(connection: &Connection) -> Result<()> {
     drop(operation_rows);
     let maintenance = one_i64(connection, "SELECT CASE WHEN count(*)<>1 THEN 1 ELSE COALESCE(MAX(CASE WHEN id<>1 OR intent_cursor<0 OR acquisition_cursor<0 OR (root_cursor<>'' AND (length(root_cursor)<>64 OR root_cursor GLOB '*[^0-9a-f]*')) OR (config_fingerprint<>'' AND (length(config_fingerprint)<>64 OR config_fingerprint GLOB '*[^0-9a-f]*')) THEN 1 ELSE 0 END),1) END FROM git_source_maintenance").await?;
     let invalid_graphs = one_i64(connection, "SELECT count(*) FROM git_source_acquisitions a WHERE length(a.token)<>64 OR a.token GLOB '*[^0-9a-f]*' OR (a.state='held' AND EXISTS(SELECT 1 FROM git_source_acquisition_members m WHERE m.token=a.token)) OR (a.state IN('graph_published','activation_unknown','registered') AND (a.root_hash IS NULL OR NOT EXISTS(SELECT 1 FROM git_source_acquisition_members m WHERE m.token=a.token))) OR EXISTS(SELECT 1 FROM git_source_acquisition_members m WHERE m.token=a.token GROUP BY m.token HAVING MIN(m.ordinal)<>0 OR MAX(m.ordinal)+1<>count(*) OR count(*)%2<>0 OR SUM(CASE WHEN (m.ordinal%2=0 AND m.kind='pack') OR (m.ordinal%2=1 AND m.kind='index') THEN 0 ELSE 1 END)<>0 OR SUM(m.child_len)<>a.total_bytes)").await?;
+    let invalid_provisional = one_i64(connection, "SELECT count(*) FROM git_source_acquisitions a WHERE length(a.token)<>64 OR a.token GLOB '*[^0-9a-f]*' OR (a.root_hash IS NOT NULL AND (length(a.root_hash)<>64 OR a.root_hash GLOB '*[^0-9a-f]*')) OR (a.semantic_digest IS NOT NULL AND (length(a.semantic_digest)<>64 OR a.semantic_digest GLOB '*[^0-9a-f]*')) OR (a.object_set_digest IS NOT NULL AND (length(a.object_set_digest)<>64 OR a.object_set_digest GLOB '*[^0-9a-f]*')) OR EXISTS(SELECT 1 FROM git_source_acquisition_members m WHERE m.token=a.token AND (length(m.child_hash)<>64 OR m.child_hash GLOB '*[^0-9a-f]*'))").await?;
+    let foreign_key_violations =
+        one_i64(connection, "SELECT count(*) FROM pragma_foreign_key_check").await?;
     let invalid_roots = one_i64(connection, "SELECT count(*) FROM git_source_roots r WHERE length(r.root_hash)<>64 OR r.root_hash GLOB '*[^0-9a-f]*' OR length(r.semantic_digest)<>64 OR r.semantic_digest GLOB '*[^0-9a-f]*' OR length(r.object_set_digest)<>64 OR r.object_set_digest GLOB '*[^0-9a-f]*' OR NOT EXISTS(SELECT 1 FROM git_source_members m WHERE m.root_hash=r.root_hash GROUP BY m.root_hash HAVING MIN(m.ordinal)=0 AND MAX(m.ordinal)+1=count(*) AND count(*)%2=0 AND SUM(m.child_len)=r.total_bytes AND SUM(CASE WHEN (m.ordinal%2=0 AND m.kind='pack') OR (m.ordinal%2=1 AND m.kind='index') THEN 0 ELSE 1 END)=0) OR EXISTS(SELECT 1 FROM git_source_members m WHERE m.root_hash=r.root_hash AND (length(m.child_hash)<>64 OR m.child_hash GLOB '*[^0-9a-f]*'))").await?;
     let invalid_registered = one_i64(connection, "SELECT count(*) FROM git_source_acquisitions a LEFT JOIN git_source_roots r ON r.root_hash=a.root_hash WHERE a.state='registered' AND (r.root_hash IS NULL OR r.state<>'registered' OR r.root_len<>a.root_len OR r.workspace<>a.workspace OR r.repo<>a.repo OR r.commit_oid<>a.commit_oid OR r.source_format_version<>a.source_format_version OR r.object_format<>a.object_format OR r.semantic_digest<>a.semantic_digest OR r.object_set_digest<>a.object_set_digest OR r.object_count<>a.object_count OR r.total_bytes<>a.total_bytes OR r.registration_operation<>a.operation_id OR r.registration_generation<>a.generation OR EXISTS(SELECT 1 FROM git_source_acquisition_members am LEFT JOIN git_source_members m ON m.root_hash=r.root_hash AND m.ordinal=am.ordinal WHERE am.token=a.token AND (m.ordinal IS NULL OR m.child_hash<>am.child_hash OR m.child_len<>am.child_len OR m.kind<>am.kind)) OR EXISTS(SELECT 1 FROM git_source_members m LEFT JOIN git_source_acquisition_members am ON am.token=a.token AND am.ordinal=m.ordinal WHERE m.root_hash=r.root_hash AND am.ordinal IS NULL))").await?;
     let roots_without_registration = one_i64(connection, "SELECT count(*) FROM git_source_roots r WHERE r.state='registered' AND NOT EXISTS(SELECT 1 FROM git_source_acquisitions a WHERE a.state='registered' AND a.root_hash=r.root_hash AND a.root_len=r.root_len AND a.workspace=r.workspace AND a.repo=r.repo AND a.commit_oid=r.commit_oid AND a.source_format_version=r.source_format_version AND a.object_format=r.object_format AND a.semantic_digest=r.semantic_digest AND a.object_set_digest=r.object_set_digest AND a.object_count=r.object_count AND a.total_bytes=r.total_bytes AND a.operation_id=r.registration_operation AND a.generation=r.registration_generation)").await?;
@@ -1115,6 +1118,8 @@ pub(crate) async fn validate_v7_schema(connection: &Connection) -> Result<()> {
     let orphan_artifact_consumers = one_i64(connection, "SELECT count(*) FROM artifact_consumers ac WHERE substr(ac.consumer_id,1,7)='intent:' AND (ac.expires_at<>9223372036854775807 OR (SELECT count(*) FROM artifact_intents i WHERE i.state='promoted' AND i.consumer_id=ac.consumer_id AND i.artifact_id=ac.artifact_id)<>1)").await?;
     if maintenance
         + invalid_graphs
+        + invalid_provisional
+        + foreign_key_violations
         + invalid_roots
         + invalid_registered
         + roots_without_registration
@@ -1451,6 +1456,15 @@ mod tests {
             .await
             .unwrap();
         assert!(validate_v7_schema(&connection).await.is_err());
+        connection
+            .execute(
+                "UPDATE git_source_maintenance SET root_cursor='' WHERE id=1",
+                (),
+            )
+            .await
+            .unwrap();
+        connection.execute_batch("PRAGMA foreign_keys=OFF; INSERT INTO git_source_members(root_hash,ordinal,child_hash,child_len,kind) VALUES('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',0,'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',1,'pack');").await.unwrap();
+        assert!(validate_v7_schema(&connection).await.is_err());
     }
 
     #[tokio::test]
@@ -1482,7 +1496,7 @@ mod tests {
         let storage_dir = tempfile::tempdir().unwrap();
         let storage: StorageRef = Arc::new(LocalStorage::new(storage_dir.path()).unwrap());
         let registry = LibsqlGitSourceRegistry::new(
-            shared,
+            shared.clone(),
             storage,
             limits,
             GitSourceLimits::default(),
@@ -1601,7 +1615,7 @@ mod tests {
         });
         let storage: StorageRef = slow.clone();
         let registry = LibsqlGitSourceRegistry::new(
-            shared,
+            shared.clone(),
             storage,
             limits,
             GitSourceLimits::default(),
@@ -1648,6 +1662,31 @@ mod tests {
             .bind_prepared_graph(&permit, &prepared)
             .await
             .unwrap();
+        let connection = shared.connect().unwrap();
+        connection
+            .execute(
+                "UPDATE git_source_acquisitions SET root_hash=upper(root_hash) WHERE token=?",
+                [acquisition.token.clone()],
+            )
+            .await
+            .unwrap();
+        assert!(validate_v7_schema(&connection).await.is_err());
+        connection
+            .execute(
+                "UPDATE git_source_acquisitions SET root_hash=? WHERE token=?",
+                values![
+                    view.root.hash.clone().into(),
+                    acquisition.token.clone().into()
+                ],
+            )
+            .await
+            .unwrap();
+        connection.execute("UPDATE git_source_acquisitions SET semantic_digest=upper(semantic_digest),object_set_digest=upper(object_set_digest) WHERE token=?",[acquisition.token.clone()]).await.unwrap();
+        assert!(validate_v7_schema(&connection).await.is_err());
+        connection.execute("UPDATE git_source_acquisitions SET semantic_digest=?,object_set_digest=? WHERE token=?",values![view.semantic_digest.clone().into(),view.object_set_digest.clone().into(),acquisition.token.clone().into()]).await.unwrap();
+        connection.execute("UPDATE git_source_acquisition_members SET child_hash=upper(child_hash) WHERE token=? AND ordinal=0",[acquisition.token.clone()]).await.unwrap();
+        assert!(validate_v7_schema(&connection).await.is_err());
+        connection.execute("UPDATE git_source_acquisition_members SET child_hash=? WHERE token=? AND ordinal=0",values![view.members[0].blob.hash.clone().into(),acquisition.token.clone().into()]).await.unwrap();
         let cancelled = CancellationToken::new();
         let trigger = cancelled.clone();
         let slow_for_cancel = slow.clone();
