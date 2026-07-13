@@ -5203,6 +5203,30 @@ mod tests {
         )
         .await
         .unwrap();
+        sqlx::raw_sql(
+            "ALTER TABLE git_source_roots ALTER CHECK git_source_roots_shape NOT ENFORCED",
+        )
+        .execute(&control)
+        .await
+        .unwrap();
+        assert!(
+            MysqlArtifactScheduler::from_pool(
+                MySqlPoolOptions::new().connect(&url).await.unwrap(),
+                Default::default(),
+                Arc::new(Accept)
+            )
+            .await
+            .is_err(),
+            "non-enforced source CHECK was accepted"
+        );
+        reset(&control).await;
+        MysqlArtifactScheduler::from_pool(
+            MySqlPoolOptions::new().connect(&url).await.unwrap(),
+            Default::default(),
+            Arc::new(Accept),
+        )
+        .await
+        .unwrap();
         sqlx::raw_sql(r#"ALTER TABLE git_source_roots DROP CHECK git_source_roots_shape,ADD CONSTRAINT git_source_roots_shape CHECK(root_len>0 AND source_format_version BETWEEN 1 AND 4294967295 AND object_format IN('sha1','sha256') AND CHAR_LENGTH(semantic_digest)=64 AND CHAR_LENGTH(object_set_digest)=64 AND object_count>0 AND total_bytes>0 AND registration_generation>0 AND state IN('\registered','quarantined'))"#).execute(&control).await.unwrap();
         assert!(
             MysqlArtifactScheduler::from_pool(

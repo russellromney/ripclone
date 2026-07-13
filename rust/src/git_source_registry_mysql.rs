@@ -161,6 +161,10 @@ async fn validate_table(c: &mut MySqlConnection, table: &str) -> Result<()> {
     if constraints != expected_constraints {
         bail!("mysql v7 source constraint inventory differs: {table}")
     }
+    let unenforced:i64=sqlx::query_scalar("SELECT count(*) FROM information_schema.table_constraints WHERE constraint_schema=DATABASE() AND table_name=? AND enforced<>'YES'").bind(table).fetch_one(&mut *c).await?;
+    if unenforced != 0 {
+        bail!("mysql v7 source constraints are not enforced: {table}")
+    }
     let mut actual:Vec<(String,String)>=sqlx::query_as("SELECT constraint_name,constraint_type FROM information_schema.table_constraints WHERE constraint_schema=DATABASE() AND table_name=? ORDER BY constraint_name").bind(table).fetch_all(&mut *c).await?;
     actual.sort();
     if actual != expected_constraint_inventory(table) {
