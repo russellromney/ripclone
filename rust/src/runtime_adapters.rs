@@ -1123,6 +1123,42 @@ mod tests {
         assert_eq!(calls[0].0, "alpha");
     }
 
+    struct SlowBroker;
+
+    impl CredentialBroker for SlowBroker {
+        fn fetch_credential(
+            &self,
+            _repo_id: &RepoId,
+            _request_token: Option<&SecretString>,
+        ) -> Result<Option<SecretString>> {
+            std::thread::sleep(Duration::from_millis(200));
+            Ok(None)
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn credential_minting_cannot_block_a_current_thread_runtime() {
+        let (workspaces, _) = two_workspaces();
+        let git = Arc::new(RecordingProviderGit {
+            tips: Arc::new(Mutex::new(VecDeque::from([Ok("4".repeat(40))]))),
+            calls: Arc::new(Mutex::new(Vec::new())),
+        });
+        let resolver = ProviderCurrentTipResolver::new(
+            WorkspaceProviderAccess::new(workspaces, Arc::new(SlowBroker)),
+            git,
+        );
+        let started = std::time::Instant::now();
+        let resolving =
+            tokio::spawn(async move { resolver.resolve_current_tip("alpha", "g/r", "main").await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            started.elapsed() < Duration::from_millis(150),
+            "credential broker blocked the async executor"
+        );
+        assert!(!resolving.is_finished());
+        assert_eq!(resolving.await.unwrap().unwrap(), "4".repeat(40));
+    }
+
     struct RegistryFixture {
         registry: SqliteGitSourceRegistry,
         pool: SqlitePool,
