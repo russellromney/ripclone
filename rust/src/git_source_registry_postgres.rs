@@ -40,6 +40,12 @@ const PG_SOURCE_TABLES: &[&str] = &[
     "git_source_roots",
 ];
 
+// PostgreSQL assigns names to unnamed constraints, so the durable contract is
+// the ordered column layout and the exact semantic constraint multiset rather
+// than generated object names.
+const PG_V7_COLUMN_SIGNATURE: &str = r##"[["artifact_intents", "id", "bigint", "NO", "nextval('artifact_intents_id_seq'::regclass)", "", "NO", "", "NEVER", ""], ["artifact_intents", "workspace", "text", "NO", "", "", "NO", "", "NEVER", ""], ["artifact_intents", "repo", "text", "NO", "", "", "NO", "", "NEVER", ""], ["artifact_intents", "branch", "text", "NO", "", "", "NO", "", "NEVER", ""], ["artifact_intents", "branch_generation", "bigint", "NO", "", "", "NO", "", "NEVER", ""], ["artifact_intents", "source_root_hash", "text", "NO", "", "", "NO", "", "NEVER", ""], ["artifact_intents", "source_format_version", "bigint", "NO", "", "", "NO", "", "NEVER", ""], ["artifact_intents", "commit_oid", "text", "NO", "", "", "NO", "", "NEVER", ""], ["artifact_intents", "kind", "text", "NO", "", "", "NO", "", "NEVER", ""], ["artifact_intents", "format_version", "bigint", "NO", "", "", "NO", "", "NEVER", ""], ["artifact_intents", "state", "text", "NO", "", "", "NO", "", "NEVER", ""], ["artifact_intents", "artifact_id", "bigint", "YES", "", "", "NO", "", "NEVER", ""], ["artifact_intents", "consumer_id", "text", "NO", "", "", "NO", "", "NEVER", ""], ["artifact_intents", "created_at", "bigint", "NO", "", "", "NO", "", "NEVER", ""], ["artifact_intents", "updated_at", "bigint", "NO", "", "", "NO", "", "NEVER", ""], ["branch_source_current", "workspace", "text", "NO", "", "", "NO", "", "NEVER", ""], ["branch_source_current", "repo", "text", "NO", "", "", "NO", "", "NEVER", ""], ["branch_source_current", "branch", "text", "NO", "", "", "NO", "", "NEVER", ""], ["branch_source_current", "generation", "bigint", "NO", "", "", "NO", "", "NEVER", ""], ["branch_source_generations", "workspace", "text", "NO", "", "", "NO", "", "NEVER", ""], ["branch_source_generations", "repo", "text", "NO", "", "", "NO", "", "NEVER", ""], ["branch_source_generations", "branch", "text", "NO", "", "", "NO", "", "NEVER", ""], ["branch_source_generations", "generation", "bigint", "NO", "", "", "NO", "", "NEVER", ""], ["branch_source_generations", "commit_oid", "text", "NO", "", "", "NO", "", "NEVER", ""], ["branch_source_generations", "source_format_version", "bigint", "NO", "", "", "NO", "", "NEVER", ""], ["branch_source_generations", "root_hash", "text", "NO", "", "", "NO", "", "NEVER", ""], ["branch_source_generations", "created_at", "bigint", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_acquisition_members", "token", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_acquisition_members", "ordinal", "bigint", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_acquisition_members", "child_hash", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_acquisition_members", "child_len", "bigint", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_acquisition_members", "kind", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_acquisition_sequence", "id", "smallint", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_acquisition_sequence", "generation", "bigint", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_acquisitions", "token", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_acquisitions", "generation", "bigint", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_acquisitions", "operation_id", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_acquisitions", "active_identity", "text", "YES", "", "", "NO", "", "NEVER", ""], ["git_source_acquisitions", "workspace", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_acquisitions", "repo", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_acquisitions", "commit_oid", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_acquisitions", "source_format_version", "bigint", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_acquisitions", "owner", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_acquisitions", "attempt_id", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_acquisitions", "root_hash", "text", "YES", "", "", "NO", "", "NEVER", ""], ["git_source_acquisitions", "root_len", "bigint", "YES", "", "", "NO", "", "NEVER", ""], ["git_source_acquisitions", "object_format", "text", "YES", "", "", "NO", "", "NEVER", ""], ["git_source_acquisitions", "semantic_digest", "text", "YES", "", "", "NO", "", "NEVER", ""], ["git_source_acquisitions", "object_set_digest", "text", "YES", "", "", "NO", "", "NEVER", ""], ["git_source_acquisitions", "object_count", "bigint", "YES", "", "", "NO", "", "NEVER", ""], ["git_source_acquisitions", "total_bytes", "bigint", "YES", "", "", "NO", "", "NEVER", ""], ["git_source_acquisitions", "expires_at", "bigint", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_acquisitions", "state", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_acquisitions", "failure_class", "text", "YES", "", "", "NO", "", "NEVER", ""], ["git_source_consumers", "root_hash", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_consumers", "consumer_id", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_consumers", "session_id", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_consumers", "workspace", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_consumers", "repo", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_consumers", "commit_oid", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_consumers", "source_format_version", "bigint", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_consumers", "purpose", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_consumers", "expires_at", "bigint", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_desires", "workspace", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_desires", "repo", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_desires", "commit_oid", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_desires", "source_format_version", "bigint", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_desires", "state", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_desires", "root_hash", "text", "YES", "", "", "NO", "", "NEVER", ""], ["git_source_desires", "failure_class", "text", "YES", "", "", "NO", "", "NEVER", ""], ["git_source_desires", "retry_count", "bigint", "NO", "0", "", "NO", "", "NEVER", ""], ["git_source_desires", "acquisition_token", "text", "YES", "", "", "NO", "", "NEVER", ""], ["git_source_desires", "updated_at", "bigint", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_maintenance", "id", "smallint", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_maintenance", "intent_cursor", "bigint", "NO", "0", "", "NO", "", "NEVER", ""], ["git_source_maintenance", "intent_workspace_cursor", "text", "NO", "''::text", "", "NO", "", "NEVER", ""], ["git_source_maintenance", "acquisition_cursor", "bigint", "NO", "0", "", "NO", "", "NEVER", ""], ["git_source_maintenance", "root_cursor", "text", "NO", "''::text", "", "NO", "", "NEVER", ""], ["git_source_maintenance", "config_fingerprint", "text", "NO", "''::text", "", "NO", "", "NEVER", ""], ["git_source_maintenance", "updated_at", "bigint", "NO", "0", "", "NO", "", "NEVER", ""], ["git_source_members", "root_hash", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_members", "ordinal", "bigint", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_members", "child_hash", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_members", "child_len", "bigint", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_members", "kind", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_roots", "root_hash", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_roots", "root_len", "bigint", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_roots", "workspace", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_roots", "repo", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_roots", "commit_oid", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_roots", "source_format_version", "bigint", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_roots", "object_format", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_roots", "semantic_digest", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_roots", "object_set_digest", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_roots", "object_count", "bigint", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_roots", "total_bytes", "bigint", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_roots", "registration_operation", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_roots", "registration_generation", "bigint", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_roots", "state", "text", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_roots", "created_at", "bigint", "NO", "", "", "NO", "", "NEVER", ""], ["git_source_roots", "registered_at", "bigint", "NO", "", "", "NO", "", "NEVER", ""]]"##;
+const PG_V7_CONSTRAINT_SIGNATURE: &str = r##"[["artifact_intents", "c", true, false, false, "CHECK (format_version >= 1 AND format_version <= '4294967295'::bigint)"], ["artifact_intents", "c", true, false, false, "CHECK (kind = ANY (ARRAY['head'::text, 'full_history'::text, 'files'::text]))"], ["artifact_intents", "c", true, false, false, "CHECK (state = 'deferred'::text AND artifact_id IS NULL OR state = 'promoted'::text AND artifact_id IS NOT NULL)"], ["artifact_intents", "c", true, false, false, "CHECK (state = ANY (ARRAY['deferred'::text, 'promoted'::text]))"], ["artifact_intents", "f", true, false, false, "FOREIGN KEY (artifact_id) REFERENCES artifact_jobs(id) ON DELETE RESTRICT"], ["artifact_intents", "f", true, false, false, "FOREIGN KEY (source_root_hash, workspace, repo, commit_oid, source_format_version) REFERENCES git_source_roots(root_hash, workspace, repo, commit_oid, source_format_version) ON DELETE RESTRICT"], ["artifact_intents", "f", true, false, false, "FOREIGN KEY (workspace, repo, branch, branch_generation) REFERENCES branch_source_generations(workspace, repo, branch, generation) ON DELETE RESTRICT"], ["artifact_intents", "p", true, false, false, "PRIMARY KEY (id)"], ["artifact_intents", "u", true, false, false, "UNIQUE (workspace, repo, branch, branch_generation, kind, format_version)"], ["branch_source_current", "f", true, false, false, "FOREIGN KEY (workspace, repo, branch, generation) REFERENCES branch_source_generations(workspace, repo, branch, generation) ON DELETE RESTRICT"], ["branch_source_current", "p", true, false, false, "PRIMARY KEY (workspace, repo, branch)"], ["branch_source_generations", "c", true, false, false, "CHECK (generation > 0)"], ["branch_source_generations", "f", true, false, false, "FOREIGN KEY (root_hash, workspace, repo, commit_oid, source_format_version) REFERENCES git_source_roots(root_hash, workspace, repo, commit_oid, source_format_version) ON DELETE RESTRICT"], ["branch_source_generations", "p", true, false, false, "PRIMARY KEY (workspace, repo, branch, generation)"], ["git_source_acquisition_members", "c", true, false, false, "CHECK (child_len > 0)"], ["git_source_acquisition_members", "c", true, false, false, "CHECK (kind = ANY (ARRAY['pack'::text, 'index'::text]))"], ["git_source_acquisition_members", "c", true, false, false, "CHECK (ordinal >= 0)"], ["git_source_acquisition_members", "f", true, false, false, "FOREIGN KEY (token) REFERENCES git_source_acquisitions(token) ON DELETE CASCADE"], ["git_source_acquisition_members", "p", true, false, false, "PRIMARY KEY (token, ordinal)"], ["git_source_acquisition_members", "u", true, false, false, "UNIQUE (token, child_hash)"], ["git_source_acquisition_sequence", "c", true, false, false, "CHECK (generation >= 0)"], ["git_source_acquisition_sequence", "c", true, false, false, "CHECK (id = 1)"], ["git_source_acquisition_sequence", "p", true, false, false, "PRIMARY KEY (id)"], ["git_source_acquisitions", "c", true, false, false, "CHECK (failure_class = ANY (ARRAY['retryable'::text, 'permanent'::text, 'dead_letter'::text]))"], ["git_source_acquisitions", "c", true, false, false, "CHECK (generation > 0)"], ["git_source_acquisitions", "c", true, false, false, "CHECK (state = 'held'::text AND active_identity IS NOT NULL AND root_hash IS NULL AND failure_class IS NULL OR (state = ANY (ARRAY['graph_published'::text, 'activation_unknown'::text])) AND active_identity IS NOT NULL AND root_hash IS NOT NULL AND root_len > 0 AND object_count > 0 AND total_bytes > 0 AND failure_class IS NULL OR state = 'registered'::text AND active_identity IS NULL AND root_hash IS NOT NULL AND failure_class IS NULL OR state = 'failed'::text AND active_identity IS NULL AND failure_class IS NOT NULL)"], ["git_source_acquisitions", "c", true, false, false, "CHECK (state = ANY (ARRAY['held'::text, 'graph_published'::text, 'activation_unknown'::text, 'registered'::text, 'failed'::text]))"], ["git_source_acquisitions", "p", true, false, false, "PRIMARY KEY (token)"], ["git_source_acquisitions", "u", true, false, false, "UNIQUE (active_identity)"], ["git_source_acquisitions", "u", true, false, false, "UNIQUE (generation)"], ["git_source_acquisitions", "u", true, false, false, "UNIQUE (operation_id)"], ["git_source_consumers", "c", true, false, false, "CHECK (purpose = ANY (ARRAY['intent'::text, 'builder'::text]))"], ["git_source_consumers", "f", true, false, false, "FOREIGN KEY (root_hash, workspace, repo, commit_oid, source_format_version) REFERENCES git_source_roots(root_hash, workspace, repo, commit_oid, source_format_version) ON DELETE RESTRICT"], ["git_source_consumers", "p", true, false, false, "PRIMARY KEY (root_hash, consumer_id)"], ["git_source_consumers", "u", true, false, false, "UNIQUE (session_id)"], ["git_source_desires", "c", true, false, false, "CHECK (failure_class = ANY (ARRAY['retryable'::text, 'permanent'::text, 'dead_letter'::text]))"], ["git_source_desires", "c", true, false, false, "CHECK (retry_count >= 0 AND retry_count <= '4294967295'::bigint)"], ["git_source_desires", "c", true, false, false, "CHECK (state = 'acquiring'::text AND acquisition_token IS NOT NULL AND root_hash IS NULL AND failure_class IS NULL OR state = 'registered'::text AND acquisition_token IS NULL AND root_hash IS NOT NULL AND failure_class IS NULL OR state = 'failed'::text AND acquisition_token IS NULL AND root_hash IS NULL AND failure_class IS NOT NULL)"], ["git_source_desires", "c", true, false, false, "CHECK (state = ANY (ARRAY['acquiring'::text, 'registered'::text, 'failed'::text]))"], ["git_source_desires", "f", true, false, false, "FOREIGN KEY (acquisition_token) REFERENCES git_source_acquisitions(token) ON DELETE RESTRICT"], ["git_source_desires", "f", true, false, false, "FOREIGN KEY (root_hash) REFERENCES git_source_roots(root_hash) ON DELETE RESTRICT"], ["git_source_desires", "p", true, false, false, "PRIMARY KEY (workspace, repo, commit_oid, source_format_version)"], ["git_source_maintenance", "c", true, false, false, "CHECK (acquisition_cursor >= 0)"], ["git_source_maintenance", "c", true, false, false, "CHECK (id = 1)"], ["git_source_maintenance", "c", true, false, false, "CHECK (intent_cursor >= 0)"], ["git_source_maintenance", "p", true, false, false, "PRIMARY KEY (id)"], ["git_source_members", "c", true, false, false, "CHECK (child_len > 0)"], ["git_source_members", "c", true, false, false, "CHECK (kind = ANY (ARRAY['pack'::text, 'index'::text]))"], ["git_source_members", "c", true, false, false, "CHECK (ordinal >= 0)"], ["git_source_members", "f", true, false, false, "FOREIGN KEY (root_hash) REFERENCES git_source_roots(root_hash) ON DELETE RESTRICT"], ["git_source_members", "p", true, false, false, "PRIMARY KEY (root_hash, ordinal)"], ["git_source_members", "u", true, false, false, "UNIQUE (root_hash, child_hash)"], ["git_source_roots", "c", true, false, false, "CHECK (length(object_set_digest) = 64)"], ["git_source_roots", "c", true, false, false, "CHECK (length(semantic_digest) = 64)"], ["git_source_roots", "c", true, false, false, "CHECK (object_count > 0)"], ["git_source_roots", "c", true, false, false, "CHECK (object_format = ANY (ARRAY['sha1'::text, 'sha256'::text]))"], ["git_source_roots", "c", true, false, false, "CHECK (registration_generation > 0)"], ["git_source_roots", "c", true, false, false, "CHECK (root_len > 0)"], ["git_source_roots", "c", true, false, false, "CHECK (source_format_version >= 1 AND source_format_version <= '4294967295'::bigint)"], ["git_source_roots", "c", true, false, false, "CHECK (state = ANY (ARRAY['registered'::text, 'quarantined'::text]))"], ["git_source_roots", "c", true, false, false, "CHECK (total_bytes > 0)"], ["git_source_roots", "p", true, false, false, "PRIMARY KEY (root_hash)"], ["git_source_roots", "u", true, false, false, "UNIQUE (registration_generation)"], ["git_source_roots", "u", true, false, false, "UNIQUE (registration_operation)"], ["git_source_roots", "u", true, false, false, "UNIQUE (root_hash, workspace, repo, commit_oid, source_format_version)"], ["git_source_roots", "u", true, false, false, "UNIQUE (workspace, repo, commit_oid, source_format_version)"]]"##;
+
 pub(crate) async fn validate_postgres_v7(c: &mut PgConnection, complete: bool) -> Result<()> {
     let names:Vec<String>=sqlx::query_scalar("SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=current_schema() AND c.relkind='r' AND (c.relname LIKE 'git\\_source\\_%' ESCAPE '\\' OR c.relname LIKE 'branch\\_source\\_%' ESCAPE '\\' OR c.relname LIKE 'artifact\\_intents%' ESCAPE '\\') ORDER BY c.relname").fetch_all(&mut *c).await?;
     if complete && names != PG_SOURCE_TABLES {
@@ -51,33 +57,23 @@ pub(crate) async fn validate_postgres_v7(c: &mut PgConnection, complete: bool) -
     if !complete {
         return Ok(());
     }
-    let columns:i64=sqlx::query_scalar("SELECT count(*) FROM information_schema.columns WHERE table_schema=current_schema() AND table_name = ANY($1)").bind(PG_SOURCE_TABLES).fetch_one(&mut *c).await?;
-    if columns != 101 {
-        bail!("postgres v7 source registry column inventory differs")
-    }
-    let shape:(i64,i64,i64,i64)=sqlx::query_as("SELECT count(*) FILTER(WHERE data_type='smallint'),count(*) FILTER(WHERE data_type='bigint'),count(*) FILTER(WHERE data_type='text'),count(*) FILTER(WHERE is_nullable='YES') FROM information_schema.columns WHERE table_schema=current_schema() AND table_name=ANY($1)").bind(PG_SOURCE_TABLES).fetch_one(&mut *c).await?;
-    if shape != (2, 37, 62, 13) {
+    let columns:String=sqlx::query_scalar("SELECT jsonb_agg(jsonb_build_array(table_name,column_name,data_type,is_nullable,coalesce(column_default,''),coalesce(collation_name,''),is_identity,coalesce(identity_generation,''),is_generated,coalesce(generation_expression,'')) ORDER BY table_name,ordinal_position)::text FROM information_schema.columns WHERE table_schema=current_schema() AND table_name=ANY($1)").bind(PG_SOURCE_TABLES).fetch_one(&mut *c).await?;
+    if columns != PG_V7_COLUMN_SIGNATURE {
         bail!("postgres v7 source registry column definitions differ")
     }
-    let invalid_defaults:i64=sqlx::query_scalar("SELECT count(*) FROM information_schema.columns WHERE table_schema=current_schema() AND table_name=ANY($1) AND column_default IS NOT NULL AND NOT ((table_name='artifact_intents' AND column_name='id' AND column_default=$2) OR (table_name='git_source_desires' AND column_name='retry_count' AND column_default='0') OR (table_name='git_source_maintenance' AND ((column_name IN('intent_cursor','acquisition_cursor','updated_at') AND column_default='0') OR (column_name IN('intent_workspace_cursor','root_cursor','config_fingerprint') AND column_default=$3))))").bind(PG_SOURCE_TABLES).bind("nextval('artifact_intents_id_seq'::regclass)").bind("''::text").fetch_one(&mut *c).await?;
-    if invalid_defaults != 0 {
-        bail!("postgres v7 source registry defaults differ")
-    }
-    let defaults:i64=sqlx::query_scalar("SELECT count(*) FROM information_schema.columns WHERE table_schema=current_schema() AND table_name=ANY($1) AND column_default IS NOT NULL").bind(PG_SOURCE_TABLES).fetch_one(&mut *c).await?;
-    let retry_default:Option<String>=sqlx::query_scalar("SELECT column_default FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='git_source_desires' AND column_name='retry_count'").fetch_optional(&mut *c).await?;
-    if defaults != 8 || retry_default.as_deref() != Some("0") {
-        bail!("postgres v7 source registry required defaults differ")
-    }
     let indexes:i64=sqlx::query_scalar("SELECT count(*) FROM pg_index x JOIN pg_class r ON r.oid=x.indrelid JOIN pg_namespace n ON n.oid=r.relnamespace WHERE n.nspname=current_schema() AND r.relname=ANY($1)").bind(PG_SOURCE_TABLES).fetch_one(&mut *c).await?;
-    let exact_indexes:i64=sqlx::query_scalar("WITH expected(name,keys) AS (VALUES ('git_source_members_child',ARRAY['child_hash','root_hash']::text[]),('git_source_acquisitions_recovery',ARRAY['state','generation','token']::text[]),('git_source_acquisition_members_child',ARRAY['child_hash','token']::text[]),('branch_source_generations_root',ARRAY['root_hash','workspace','repo']::text[]),('git_source_consumers_expiry',ARRAY['expires_at','root_hash','consumer_id']::text[]),('artifact_intents_promotion',ARRAY['state','updated_at','id']::text[]),('artifact_intents_source',ARRAY['source_root_hash','state','id']::text[])) SELECT count(*) FROM expected e JOIN pg_class i ON i.relname=e.name JOIN pg_namespace n ON n.oid=i.relnamespace AND n.nspname=current_schema() JOIN pg_index x ON x.indexrelid=i.oid WHERE NOT x.indisunique AND x.indpred IS NULL AND x.indexprs IS NULL AND ARRAY(SELECT pg_get_indexdef(i.oid,s,true) FROM generate_series(1,x.indnkeyatts) s ORDER BY s)=e.keys").fetch_one(&mut *c).await?;
+    let exact_indexes:i64=sqlx::query_scalar("WITH expected(name,keys) AS (VALUES ('git_source_members_child',ARRAY['child_hash','root_hash']::text[]),('git_source_acquisitions_recovery',ARRAY['state','generation','token']::text[]),('git_source_acquisition_members_child',ARRAY['child_hash','token']::text[]),('branch_source_generations_root',ARRAY['root_hash','workspace','repo']::text[]),('git_source_consumers_expiry',ARRAY['expires_at','root_hash','consumer_id']::text[]),('artifact_intents_promotion',ARRAY['state','updated_at','id']::text[]),('artifact_intents_source',ARRAY['source_root_hash','state','id']::text[])) SELECT count(*) FROM expected e JOIN pg_class i ON i.relname=e.name JOIN pg_namespace n ON n.oid=i.relnamespace AND n.nspname=current_schema() JOIN pg_index x ON x.indexrelid=i.oid JOIN pg_am am ON am.oid=i.relam WHERE NOT x.indisunique AND NOT x.indisprimary AND x.indisvalid AND x.indisready AND x.indislive AND x.indnatts=x.indnkeyatts AND am.amname='btree' AND x.indpred IS NULL AND x.indexprs IS NULL AND ARRAY(SELECT pg_get_indexdef(i.oid,s,true) FROM generate_series(1,x.indnkeyatts) s ORDER BY s)=e.keys").fetch_one(&mut *c).await?;
     if indexes != 29 || exact_indexes != 7 {
         bail!("postgres v7 source registry index inventory differs")
     }
-    let fks:i64=sqlx::query_scalar("SELECT count(*) FROM pg_constraint k JOIN pg_class owned ON owned.oid=k.conrelid JOIN pg_class referenced ON referenced.oid=k.confrelid JOIN pg_namespace n ON n.oid=owned.relnamespace WHERE n.nspname=current_schema() AND k.contype='f' AND (owned.relname=ANY($1) OR referenced.relname=ANY($1))").bind(PG_SOURCE_TABLES).fetch_one(&mut *c).await?;
-    let intent_fks:i64=sqlx::query_scalar("SELECT count(*) FROM pg_constraint k WHERE k.conrelid='artifact_intents'::regclass AND k.contype='f' AND k.confdeltype='r' AND pg_get_constraintdef(k.oid) IN('FOREIGN KEY (workspace, repo, branch, branch_generation) REFERENCES branch_source_generations(workspace, repo, branch, generation) ON DELETE RESTRICT','FOREIGN KEY (source_root_hash, workspace, repo, commit_oid, source_format_version) REFERENCES git_source_roots(root_hash, workspace, repo, commit_oid, source_format_version) ON DELETE RESTRICT','FOREIGN KEY (artifact_id) REFERENCES artifact_jobs(id) ON DELETE RESTRICT')").fetch_one(&mut *c).await?;
-    let checks:i64=sqlx::query_scalar("SELECT count(*) FROM pg_constraint k JOIN pg_class r ON r.oid=k.conrelid JOIN pg_namespace n ON n.oid=r.relnamespace WHERE n.nspname=current_schema() AND r.relname=ANY($1) AND k.contype='c'").bind(PG_SOURCE_TABLES).fetch_one(&mut *c).await?;
-    if fks != 11 || intent_fks != 3 || checks != 34 {
-        bail!("postgres v7 source registry constraint inventory differs")
+    let constraints:String=sqlx::query_scalar("SELECT jsonb_agg(jsonb_build_array(CASE WHEN owned_ns.nspname=current_schema() THEN owned.relname ELSE owned_ns.nspname||'.'||owned.relname END,k.contype,k.convalidated,k.condeferrable,k.condeferred,pg_get_constraintdef(k.oid,true)) ORDER BY CASE WHEN owned_ns.nspname=current_schema() THEN owned.relname ELSE owned_ns.nspname||'.'||owned.relname END,k.contype,pg_get_constraintdef(k.oid,true))::text FROM pg_constraint k JOIN pg_class owned ON owned.oid=k.conrelid JOIN pg_namespace owned_ns ON owned_ns.oid=owned.relnamespace LEFT JOIN pg_class referenced ON referenced.oid=k.confrelid LEFT JOIN pg_namespace referenced_ns ON referenced_ns.oid=referenced.relnamespace WHERE (owned_ns.nspname=current_schema() AND owned.relname=ANY($1)) OR (referenced_ns.nspname=current_schema() AND referenced.relname=ANY($1))").bind(PG_SOURCE_TABLES).fetch_one(&mut *c).await?;
+    if constraints != PG_V7_CONSTRAINT_SIGNATURE {
+        bail!("postgres v7 source registry constraint definitions differ")
+    }
+    let invalid_tables:i64=sqlx::query_scalar("SELECT count(*) FROM pg_class r JOIN pg_namespace n ON n.oid=r.relnamespace WHERE n.nspname=current_schema() AND r.relname=ANY($1) AND (r.relkind<>'r' OR r.relpersistence<>'p' OR r.relrowsecurity OR r.relforcerowsecurity OR r.relreplident<>'d')").bind(PG_SOURCE_TABLES).fetch_one(&mut *c).await?;
+    let user_triggers:i64=sqlx::query_scalar("SELECT count(*) FROM pg_trigger t JOIN pg_class r ON r.oid=t.tgrelid JOIN pg_namespace n ON n.oid=r.relnamespace WHERE n.nspname=current_schema() AND r.relname=ANY($1) AND NOT t.tgisinternal").bind(PG_SOURCE_TABLES).fetch_one(&mut *c).await?;
+    if invalid_tables != 0 || user_triggers != 0 {
+        bail!("postgres v7 source registry table properties differ")
     }
     let singleton:i64=sqlx::query_scalar("SELECT count(*) FROM git_source_maintenance WHERE id=1 AND intent_cursor>=0 AND acquisition_cursor>=0").fetch_one(&mut *c).await?;
     let sequence: Option<(i16, i64)> =
@@ -91,8 +87,24 @@ pub(crate) async fn validate_postgres_v7(c: &mut PgConnection, complete: bool) -
     if singleton != 1 || sequence.is_none_or(|v| v.0 != 1 || v.1 < max_generation) {
         bail!("postgres v7 source registry singleton state is invalid")
     }
-    let invalid:i64=sqlx::query_scalar("SELECT (SELECT count(*) FROM git_source_roots r WHERE r.root_hash !~ '^[0-9a-f]{64}$' OR r.semantic_digest !~ '^[0-9a-f]{64}$' OR r.object_set_digest !~ '^[0-9a-f]{64}$' OR NOT EXISTS(SELECT 1 FROM git_source_members m WHERE m.root_hash=r.root_hash GROUP BY m.root_hash HAVING min(m.ordinal)=0 AND max(m.ordinal)+1=count(*) AND count(*)%2=0 AND sum(m.child_len)=r.total_bytes)) + (SELECT count(*) FROM git_source_acquisitions a WHERE a.token !~ '^[0-9a-f]{64}$' OR (a.state IN('held','graph_published','activation_unknown') AND a.active_identity IS NULL) OR (a.state IN('registered','failed') AND a.active_identity IS NOT NULL)) + (SELECT count(*) FROM artifact_intents i LEFT JOIN git_source_consumers c ON c.consumer_id=i.consumer_id AND c.root_hash=i.source_root_hash AND c.purpose='intent' LEFT JOIN artifact_jobs j ON j.id=i.artifact_id WHERE c.root_hash IS NULL OR i.consumer_id !~ '^intent:[0-9a-f]{48}$' OR c.expires_at<>9223372036854775807 OR (i.state='deferred' AND (i.artifact_id IS NOT NULL OR EXISTS(SELECT 1 FROM artifact_consumers ac WHERE ac.consumer_id=i.consumer_id))) OR (i.state='promoted' AND (j.id IS NULL OR NOT EXISTS(SELECT 1 FROM artifact_consumers ac WHERE ac.artifact_id=i.artifact_id AND ac.consumer_id=i.consumer_id AND ac.expires_at=9223372036854775807))))").fetch_one(&mut *c).await?;
-    if invalid != 0 {
+    let invalid:i64=sqlx::query_scalar(r#"SELECT
+      (SELECT count(*) FROM git_source_roots r WHERE r.root_hash !~ '^[0-9a-f]{64}$' OR r.semantic_digest !~ '^[0-9a-f]{64}$' OR r.object_set_digest !~ '^[0-9a-f]{64}$' OR (r.object_format='sha1' AND r.commit_oid !~ '^[0-9a-f]{40}$') OR (r.object_format='sha256' AND r.commit_oid !~ '^[0-9a-f]{64}$') OR NOT EXISTS(SELECT 1 FROM git_source_members m WHERE m.root_hash=r.root_hash GROUP BY m.root_hash HAVING min(m.ordinal)=0 AND max(m.ordinal)+1=count(*) AND count(*)%2=0 AND sum(m.child_len)=r.total_bytes AND sum(CASE WHEN (m.ordinal%2=0 AND m.kind='pack') OR (m.ordinal%2=1 AND m.kind='index') THEN 0 ELSE 1 END)=0))+
+      (SELECT count(*) FROM git_source_members WHERE child_hash !~ '^[0-9a-f]{64}$')+
+      (SELECT count(*) FROM git_source_acquisition_members WHERE child_hash !~ '^[0-9a-f]{64}$')+
+      (SELECT count(*) FROM git_source_acquisitions a WHERE a.token !~ '^[0-9a-f]{64}$' OR (a.root_hash IS NOT NULL AND a.root_hash !~ '^[0-9a-f]{64}$') OR (a.semantic_digest IS NOT NULL AND a.semantic_digest !~ '^[0-9a-f]{64}$') OR (a.object_set_digest IS NOT NULL AND a.object_set_digest !~ '^[0-9a-f]{64}$') OR (a.state IN('graph_published','activation_unknown','registered') AND (a.root_hash IS NULL OR a.semantic_digest IS NULL OR a.object_set_digest IS NULL OR a.object_format NOT IN('sha1','sha256'))) OR (a.object_format='sha1' AND a.commit_oid !~ '^[0-9a-f]{40}$') OR (a.object_format='sha256' AND a.commit_oid !~ '^[0-9a-f]{64}$') OR (a.state IN('held','graph_published','activation_unknown') AND a.active_identity IS NULL) OR (a.state IN('registered','failed') AND a.active_identity IS NOT NULL) OR (a.state='held' AND EXISTS(SELECT 1 FROM git_source_acquisition_members m WHERE m.token=a.token)) OR (a.state IN('graph_published','activation_unknown','registered') AND NOT EXISTS(SELECT 1 FROM git_source_acquisition_members m WHERE m.token=a.token)) OR EXISTS(SELECT 1 FROM git_source_acquisition_members m WHERE m.token=a.token GROUP BY m.token HAVING min(m.ordinal)<>0 OR max(m.ordinal)+1<>count(*) OR count(*)%2<>0 OR sum(m.child_len)<>a.total_bytes OR sum(CASE WHEN (m.ordinal%2=0 AND m.kind='pack') OR (m.ordinal%2=1 AND m.kind='index') THEN 0 ELSE 1 END)<>0))+
+      (SELECT count(*) FROM git_source_acquisitions a LEFT JOIN git_source_roots r ON r.root_hash=a.root_hash WHERE a.state='registered' AND (r.root_hash IS NULL OR r.state<>'registered' OR r.registration_operation<>a.operation_id OR r.registration_generation<>a.generation OR r.workspace<>a.workspace OR r.repo<>a.repo OR r.commit_oid<>a.commit_oid OR r.source_format_version<>a.source_format_version OR r.root_len<>a.root_len OR r.object_format<>a.object_format OR r.semantic_digest<>a.semantic_digest OR r.object_set_digest<>a.object_set_digest OR r.object_count<>a.object_count OR r.total_bytes<>a.total_bytes))+
+      (SELECT count(*) FROM git_source_desires d LEFT JOIN git_source_acquisitions a ON a.token=d.acquisition_token LEFT JOIN git_source_roots r ON r.root_hash=d.root_hash WHERE d.source_format_version<>1 OR d.commit_oid !~ '^[0-9a-f]{40}$|^[0-9a-f]{64}$' OR (d.state='acquiring' AND (a.token IS NULL OR a.workspace<>d.workspace OR a.repo<>d.repo OR a.commit_oid<>d.commit_oid OR a.source_format_version<>d.source_format_version OR a.state NOT IN('held','graph_published','activation_unknown'))) OR (d.state='registered' AND (r.root_hash IS NULL OR r.workspace<>d.workspace OR r.repo<>d.repo OR r.commit_oid<>d.commit_oid OR r.source_format_version<>d.source_format_version OR r.state<>'registered')))+
+      (SELECT count(*) FROM branch_source_current current JOIN branch_source_generations g ON g.workspace=current.workspace AND g.repo=current.repo AND g.branch=current.branch AND g.generation=current.generation LEFT JOIN branch_observations b ON b.workspace=current.workspace AND b.repo=current.repo AND b.branch=current.branch WHERE b.workspace IS NULL OR b.generation<>g.generation OR b.desired_commit<>g.commit_oid)+
+      (SELECT count(*) FROM git_source_consumers c LEFT JOIN git_source_roots r ON r.root_hash=c.root_hash AND r.workspace=c.workspace AND r.repo=c.repo AND r.commit_oid=c.commit_oid AND r.source_format_version=c.source_format_version WHERE r.root_hash IS NULL OR c.session_id !~ '^[0-9a-f]{64}$')+
+      (SELECT count(*) FROM artifact_intents i LEFT JOIN git_source_consumers c ON c.consumer_id=i.consumer_id AND c.root_hash=i.source_root_hash AND c.purpose='intent' LEFT JOIN artifact_jobs j ON j.id=i.artifact_id WHERE c.root_hash IS NULL OR i.consumer_id !~ '^intent:[0-9a-f]{48}$' OR c.expires_at<>9223372036854775807 OR (SELECT count(*) FROM git_source_consumers sibling WHERE sibling.consumer_id=i.consumer_id)<>1 OR (i.state='deferred' AND (i.artifact_id IS NOT NULL OR EXISTS(SELECT 1 FROM artifact_consumers ac WHERE ac.consumer_id=i.consumer_id))) OR (i.state='promoted' AND (j.id IS NULL OR j.workspace<>i.workspace OR j.repo<>i.repo OR j.commit_oid<>i.commit_oid OR j.kind<>i.kind OR j.format_version<>i.format_version OR (SELECT count(*) FROM artifact_consumers ac WHERE ac.consumer_id=i.consumer_id)<>1 OR NOT EXISTS(SELECT 1 FROM artifact_consumers ac WHERE ac.artifact_id=i.artifact_id AND ac.consumer_id=i.consumer_id AND ac.expires_at=9223372036854775807))))"#).fetch_one(&mut *c).await?;
+    let reverse_invalid:i64=sqlx::query_scalar(r#"SELECT
+      (SELECT count(*) FROM git_source_roots r WHERE r.state='registered' AND (NOT EXISTS(SELECT 1 FROM git_source_acquisitions a WHERE a.state='registered' AND a.root_hash=r.root_hash AND a.operation_id=r.registration_operation AND a.generation=r.registration_generation) OR NOT EXISTS(SELECT 1 FROM git_source_desires d WHERE d.state='registered' AND d.root_hash=r.root_hash AND d.workspace=r.workspace AND d.repo=r.repo AND d.commit_oid=r.commit_oid AND d.source_format_version=r.source_format_version)))+
+      (SELECT count(*) FROM git_source_acquisitions a WHERE (a.state IN('held','graph_published','activation_unknown') AND NOT EXISTS(SELECT 1 FROM git_source_desires d WHERE d.state='acquiring' AND d.acquisition_token=a.token AND d.workspace=a.workspace AND d.repo=a.repo AND d.commit_oid=a.commit_oid AND d.source_format_version=a.source_format_version)) OR (a.state='registered' AND NOT EXISTS(SELECT 1 FROM git_source_desires d WHERE d.state='registered' AND d.root_hash=a.root_hash AND d.workspace=a.workspace AND d.repo=a.repo AND d.commit_oid=a.commit_oid AND d.source_format_version=a.source_format_version)) OR (a.state='registered' AND (EXISTS(SELECT 1 FROM git_source_acquisition_members am LEFT JOIN git_source_members m ON m.root_hash=a.root_hash AND m.ordinal=am.ordinal WHERE am.token=a.token AND (m.ordinal IS NULL OR m.child_hash<>am.child_hash OR m.child_len<>am.child_len OR m.kind<>am.kind)) OR EXISTS(SELECT 1 FROM git_source_members m LEFT JOIN git_source_acquisition_members am ON am.token=a.token AND am.ordinal=m.ordinal WHERE m.root_hash=a.root_hash AND am.ordinal IS NULL))))+
+      (SELECT count(*) FROM (SELECT hash FROM (SELECT root_hash hash,root_len len,'root' kind FROM git_source_roots UNION ALL SELECT root_hash,root_len,'root' FROM git_source_acquisitions WHERE root_hash IS NOT NULL UNION ALL SELECT child_hash,child_len,kind FROM git_source_members UNION ALL SELECT child_hash,child_len,kind FROM git_source_acquisition_members) descriptors GROUP BY hash HAVING count(DISTINCT len::text||':'||kind)<>1) conflicts)+
+      (SELECT count(*) FROM (SELECT root_hash hash FROM git_source_roots UNION SELECT root_hash FROM git_source_acquisitions WHERE root_hash IS NOT NULL) roots JOIN (SELECT child_hash hash FROM git_source_members UNION SELECT child_hash FROM git_source_acquisition_members) children ON children.hash=roots.hash)+
+      (SELECT count(*) FROM git_source_consumers c WHERE c.purpose='intent' AND NOT EXISTS(SELECT 1 FROM artifact_intents i WHERE i.consumer_id=c.consumer_id AND i.source_root_hash=c.root_hash))+
+      (SELECT count(*) FROM artifact_consumers ac WHERE ac.consumer_id LIKE 'intent:%' AND (ac.expires_at<>9223372036854775807 OR NOT EXISTS(SELECT 1 FROM artifact_intents i WHERE i.state='promoted' AND i.consumer_id=ac.consumer_id AND i.artifact_id=ac.artifact_id)))"#).fetch_one(&mut *c).await?;
+    if invalid + reverse_invalid != 0 {
         bail!("postgres v7 source registry persisted state is invalid")
     }
     Ok(())
@@ -139,11 +151,11 @@ impl PostgresGitSourceRegistry {
         .fetch_one(&mut *tx)
         .await?;
         if stored.is_empty() {
-            let state:i64=sqlx::query_scalar("SELECT (SELECT generation FROM git_source_acquisition_sequence WHERE id=1)+(SELECT count(*) FROM git_source_roots)+(SELECT count(*) FROM git_source_acquisitions)+(SELECT count(*) FROM git_source_desires)+(SELECT count(*) FROM branch_source_generations)+(SELECT count(*) FROM artifact_intents)").fetch_one(&mut *tx).await?;
+            let state:i64=sqlx::query_scalar("SELECT (SELECT generation FROM git_source_acquisition_sequence WHERE id=1)+(SELECT count(*) FROM git_source_roots)+(SELECT count(*) FROM git_source_members)+(SELECT count(*) FROM git_source_acquisitions)+(SELECT count(*) FROM git_source_acquisition_members)+(SELECT count(*) FROM git_source_desires)+(SELECT count(*) FROM branch_source_generations)+(SELECT count(*) FROM branch_source_current)+(SELECT count(*) FROM git_source_consumers)+(SELECT count(*) FROM artifact_intents)+(SELECT count(*) FROM git_source_maintenance WHERE id<>1 OR intent_cursor<>0 OR intent_workspace_cursor<>'' OR acquisition_cursor<>0 OR root_cursor<>'' OR updated_at<>0)").fetch_one(&mut *tx).await?;
             if state != 0 {
                 bail!("empty PostgreSQL source registry fingerprint has authoritative state")
             }
-            sqlx::query("UPDATE git_source_maintenance SET config_fingerprint=$1 WHERE id=1 AND config_fingerprint=''").bind(&fingerprint).execute(&mut *tx).await?;
+            if sqlx::query("UPDATE git_source_maintenance SET config_fingerprint=$1 WHERE id=1 AND config_fingerprint='' AND intent_cursor=0 AND intent_workspace_cursor='' AND acquisition_cursor=0 AND root_cursor='' AND updated_at=0").bind(&fingerprint).execute(&mut *tx).await?.rows_affected()!=1{bail!("PostgreSQL source registry configuration CAS failed")}
         } else if stored != fingerprint {
             bail!(
                 "PostgreSQL source registry limits or authority seal differ from fleet configuration"
@@ -1065,7 +1077,11 @@ mod tests {
 
     #[tokio::test]
     async fn postgres_v7_source_registry_live_matrix() {
-        let Ok(url) = std::env::var("RIPCLONE_TEST_PG_URL") else {
+        let Some(url) = std::env::var("RIPCLONE_TEST_PG_URL").ok() else {
+            if std::env::var_os("RIPCLONE_REQUIRE_PG_TESTS").is_some() {
+                panic!("postgres_v7_source_registry_live_matrix requires RIPCLONE_TEST_PG_URL")
+            }
+            eprintln!("SKIP postgres_v7_source_registry_live_matrix: RIPCLONE_TEST_PG_URL unset");
             return;
         };
         let pool = PgPoolOptions::new()
@@ -1079,7 +1095,10 @@ mod tests {
             .await
             .unwrap();
         reset(&pool).await;
-        let limits = SchedulerLimits::default();
+        let limits = SchedulerLimits {
+            workspace_backlog: 1,
+            ..SchedulerLimits::default()
+        };
         let (a, b) = tokio::join!(
             PostgresArtifactScheduler::from_pool(pool.clone(), limits.clone(), Arc::new(Accept)),
             PostgresArtifactScheduler::from_pool(pool.clone(), limits.clone(), Arc::new(Accept))
@@ -1106,6 +1125,54 @@ mod tests {
         )
         .await
         .unwrap();
+        let concurrent_commit = "c".repeat(40);
+        let left = registry.clone();
+        let right = registry.clone();
+        let (one, two) = tokio::join!(
+            left.begin_acquisition(
+                "ws",
+                "o/r",
+                &concurrent_commit,
+                1,
+                "one",
+                "one",
+                60,
+                SyncIntent::EnsureCurrent
+            ),
+            right.begin_acquisition(
+                "ws",
+                "o/r",
+                &concurrent_commit,
+                1,
+                "two",
+                "two",
+                60,
+                SyncIntent::EnsureCurrent
+            )
+        );
+        let one = one.unwrap();
+        let two = two.unwrap();
+        assert!(matches!(
+            (&one, &two),
+            (
+                SourceBeginOutcome::PermitToPrepare(_),
+                SourceBeginOutcome::Deferred { .. }
+            ) | (
+                SourceBeginOutcome::Deferred { .. },
+                SourceBeginOutcome::PermitToPrepare(_)
+            )
+        ));
+        let concurrent_permit = match (one, two) {
+            (SourceBeginOutcome::PermitToPrepare(permit), _)
+            | (_, SourceBeginOutcome::PermitToPrepare(permit)) => permit,
+            _ => unreachable!(),
+        };
+        assert!(
+            registry
+                .fail_preparation(&concurrent_permit, FailureClass::Retryable)
+                .await
+                .unwrap()
+        );
         assert!(
             PostgresGitSourceRegistry::new(
                 pool.clone(),
@@ -1190,6 +1257,60 @@ mod tests {
             .register(&acquisition, &prepared, &CancellationToken::new())
             .await
             .unwrap();
+        let gc_commit = "d".repeat(40);
+        let gc_source = prepared_source_for_registry_test(
+            "ws",
+            "o/r",
+            &gc_commit,
+            view.members[0].blob.clone(),
+            view.members[1].blob.clone(),
+        )
+        .unwrap();
+        let gc_view = gc_source
+            .registry_view(&GitSourceLimits::default())
+            .unwrap();
+        storage
+            .put(&gc_view.root.hash, &gc_view.root_bytes)
+            .unwrap();
+        let gc_permit = match registry
+            .begin_acquisition(
+                "ws",
+                "o/r",
+                &gc_commit,
+                1,
+                "owner",
+                "gc-race",
+                60,
+                SyncIntent::EnsureCurrent,
+            )
+            .await
+            .unwrap()
+        {
+            SourceBeginOutcome::PermitToPrepare(permit) => permit,
+            _ => panic!("expected GC-race Held capability"),
+        };
+        sqlx::query("INSERT INTO artifact_gc_sweep(id,owner,expires_at) VALUES(1,'test',EXTRACT(EPOCH FROM clock_timestamp())::BIGINT+60)").execute(&pool).await.unwrap();
+        assert!(
+            registry
+                .bind_prepared_graph(&gc_permit, &gc_source)
+                .await
+                .is_err(),
+            "graph publication crossed a live GC sweep"
+        );
+        sqlx::query("DELETE FROM artifact_gc_sweep")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (gc_acquisition, _) = registry
+            .bind_prepared_graph(&gc_permit, &gc_source)
+            .await
+            .unwrap();
+        assert!(
+            registry
+                .fail(&gc_acquisition, FailureClass::Retryable)
+                .await
+                .unwrap()
+        );
         let before = registry.snapshot("ws", "o/r", "main").await.unwrap();
         let observed = registry
             .record_tip_and_intents(
@@ -1220,8 +1341,54 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap(),
-            3
+            1,
+            "only the admitted mode publishes an observation"
         );
+        // A saturated workspace with more than a page of older deferred rows
+        // must not hide another workspace's first eligible intent.
+        let mut planted = pool.acquire().await.unwrap().detach();
+        sqlx::query("SET session_replication_role='replica'")
+            .execute(&mut planted)
+            .await
+            .unwrap();
+        for ordinal in 0..80_i64 {
+            sqlx::query("INSERT INTO artifact_intents(workspace,repo,branch,branch_generation,source_root_hash,source_format_version,commit_oid,kind,format_version,state,artifact_id,consumer_id,created_at,updated_at) VALUES('ws','o/r',$1,1,$2,1,$3,'head',$4,'deferred',NULL,$5,1,1)").bind(format!("blocked-{ordinal}")).bind(&view.root.hash).bind("a".repeat(40)).bind(1000+ordinal).bind(format!("plant-blocked-{ordinal}")).execute(&mut planted).await.unwrap();
+        }
+        sqlx::query("INSERT INTO branch_observations(workspace,repo,branch,generation,desired_commit,updated_at) VALUES('z','o/r','eligible',1,$1,1)").bind("a".repeat(40)).execute(&mut planted).await.unwrap();
+        sqlx::query("INSERT INTO artifact_intents(workspace,repo,branch,branch_generation,source_root_hash,source_format_version,commit_oid,kind,format_version,state,artifact_id,consumer_id,created_at,updated_at) VALUES('z','o/r','eligible',1,$1,1,$2,'head',1,'deferred',NULL,'plant-eligible',1,1)").bind(&view.root.hash).bind("a".repeat(40)).execute(&mut planted).await.unwrap();
+        sqlx::query("SET session_replication_role='origin'")
+            .execute(&mut planted)
+            .await
+            .unwrap();
+        drop(planted);
+        assert_eq!(registry.promote_deferred_page(1).await.unwrap(), 1);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM artifact_intents WHERE workspace='z' AND state='promoted'"
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            1,
+            "fair promotion was pinned behind a saturated >64-row prefix"
+        );
+        assert_eq!(sqlx::query_scalar::<_,i64>("SELECT count(*) FROM artifact_observations WHERE workspace='z' AND branch='eligible'").fetch_one(&pool).await.unwrap(),1,"deferred promotion did not atomically publish its observation");
+        sqlx::query("DELETE FROM artifact_consumers WHERE consumer_id LIKE 'plant-%'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM artifact_observations WHERE workspace='z'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM artifact_intents WHERE consumer_id LIKE 'plant-%'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM branch_observations WHERE workspace='z'")
+            .execute(&pool)
+            .await
+            .unwrap();
         let prepared_cancel = prepared_source_for_registry_test(
             "ws",
             "o/r",
@@ -1266,25 +1433,139 @@ mod tests {
                 .is_err(),
             "pre-cancelled registration was admitted"
         );
-        // A cancelled verifier preserves an activation-recoverable/failed durable state; restart does not mint another active identity.
-        assert!(matches!(
+        // Cancellation settles both rows to retryable failure. A deliberate
+        // retry may therefore acquire a new capability immediately.
+        let retry_permit = match registry
+            .begin_acquisition(
+                "ws",
+                "o/r",
+                &"b".repeat(40),
+                1,
+                "owner",
+                "restart",
+                60,
+                SyncIntent::EnsureCurrent,
+            )
+            .await
+            .unwrap()
+        {
+            SourceBeginOutcome::PermitToPrepare(permit) => permit,
+            _ => panic!("cancelled registration was not retryable"),
+        };
+        assert!(
             registry
-                .begin_acquisition(
-                    "ws",
-                    "o/r",
-                    &"b".repeat(40),
-                    1,
-                    "owner",
-                    "restart",
-                    60,
-                    SyncIntent::EnsureCurrent
-                )
+                .fail_preparation(&retry_permit, FailureClass::Retryable)
                 .await
-                .unwrap(),
-            SourceBeginOutcome::Failed { .. }
-                | SourceBeginOutcome::ActivationUnknown { .. }
-                | SourceBeginOutcome::Deferred { .. }
-        ));
+                .unwrap()
+        );
+        let mut corrupt = pool.acquire().await.unwrap().detach();
+        sqlx::raw_sql("BEGIN").execute(&mut corrupt).await.unwrap();
+        sqlx::query(
+            "UPDATE git_source_acquisition_members SET kind='index' WHERE token=$1 AND ordinal=0",
+        )
+        .bind(durable.registration_token())
+        .execute(&mut corrupt)
+        .await
+        .unwrap();
+        assert!(
+            validate_postgres_v7(&mut corrupt, true).await.is_err(),
+            "provisional pack/index parity corruption was accepted"
+        );
+        sqlx::raw_sql("ROLLBACK")
+            .execute(&mut corrupt)
+            .await
+            .unwrap();
+
+        sqlx::raw_sql("BEGIN").execute(&mut corrupt).await.unwrap();
+        sqlx::query("UPDATE git_source_acquisitions SET semantic_digest=$1 WHERE token=$2")
+            .bind("A".repeat(64))
+            .bind(&cancel_acquisition.token)
+            .execute(&mut corrupt)
+            .await
+            .unwrap();
+        assert!(
+            validate_postgres_v7(&mut corrupt, true).await.is_err(),
+            "uppercase provisional digest was accepted"
+        );
+        sqlx::raw_sql("ROLLBACK")
+            .execute(&mut corrupt)
+            .await
+            .unwrap();
+
+        let (consumer, other_artifact):(String,i64)=sqlx::query_as("SELECT i.consumer_id,(SELECT id FROM artifact_jobs WHERE workspace='z' LIMIT 1) FROM artifact_intents i WHERE i.workspace='ws' AND i.state='promoted' LIMIT 1").fetch_one(&pool).await.unwrap();
+        sqlx::raw_sql("BEGIN").execute(&mut corrupt).await.unwrap();
+        sqlx::query("INSERT INTO artifact_consumers(artifact_id,consumer_id,expires_at) VALUES($1,$2,9223372036854775807)")
+            .bind(other_artifact)
+            .bind(&consumer)
+            .execute(&mut corrupt)
+            .await
+            .unwrap();
+        assert!(
+            validate_postgres_v7(&mut corrupt, true).await.is_err(),
+            "one intent consumer was accepted on multiple artifacts"
+        );
+        sqlx::raw_sql("ROLLBACK")
+            .execute(&mut corrupt)
+            .await
+            .unwrap();
+
+        sqlx::raw_sql("BEGIN").execute(&mut corrupt).await.unwrap();
+        sqlx::raw_sql(
+            "ALTER TABLE git_source_maintenance ALTER COLUMN root_cursor TYPE VARCHAR(64)",
+        )
+        .execute(&mut corrupt)
+        .await
+        .unwrap();
+        assert!(
+            validate_postgres_v7(&mut corrupt, true).await.is_err(),
+            "same-shape column type mutation was accepted"
+        );
+        sqlx::raw_sql("ROLLBACK")
+            .execute(&mut corrupt)
+            .await
+            .unwrap();
+
+        let retry_check:String=sqlx::query_scalar("SELECT conname FROM pg_constraint WHERE conrelid='git_source_desires'::regclass AND contype='c' AND pg_get_constraintdef(oid,true)=$1")
+            .bind("CHECK (retry_count >= 0 AND retry_count <= '4294967295'::bigint)")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        sqlx::raw_sql("BEGIN").execute(&mut corrupt).await.unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "ALTER TABLE git_source_desires DROP CONSTRAINT \"{}\"",
+            retry_check.replace('"', "\"\"")
+        )))
+        .execute(&mut corrupt)
+        .await
+        .unwrap();
+        sqlx::raw_sql(
+            "ALTER TABLE git_source_desires ADD CONSTRAINT planted_retry CHECK(retry_count>=0)",
+        )
+        .execute(&mut corrupt)
+        .await
+        .unwrap();
+        assert!(
+            validate_postgres_v7(&mut corrupt, true).await.is_err(),
+            "same-count weakened CHECK was accepted"
+        );
+        sqlx::raw_sql("ROLLBACK")
+            .execute(&mut corrupt)
+            .await
+            .unwrap();
+
+        sqlx::raw_sql("BEGIN").execute(&mut corrupt).await.unwrap();
+        sqlx::raw_sql("CREATE TABLE external_source_child(root_hash TEXT PRIMARY KEY REFERENCES git_source_roots(root_hash) ON DELETE RESTRICT)")
+            .execute(&mut corrupt)
+            .await
+            .unwrap();
+        assert!(
+            validate_postgres_v7(&mut corrupt, true).await.is_err(),
+            "external incoming source FK was accepted"
+        );
+        sqlx::raw_sql("ROLLBACK")
+            .execute(&mut corrupt)
+            .await
+            .unwrap();
         validate_postgres_v7(&mut pool.acquire().await.unwrap().detach(), true)
             .await
             .unwrap();
