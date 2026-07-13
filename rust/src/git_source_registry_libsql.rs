@@ -462,16 +462,25 @@ impl LibsqlGitSourceRegistry {
         let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(10));
         loop {
             tokio::select! {
-                result=&mut verification=>{result.context("libsql source storage verifier did not join")??;break}
+                result=&mut verification=>{
+                    match result.context("libsql source storage verifier did not join")?{
+                        Ok(())=>break,
+                        Err(error)=>{let _=self.fail(acquisition,FailureClass::Retryable).await?;return Err(error)}
+                    }
+                }
                 _=cancelled.cancelled()=>{
                     verification_cancel.cancel();
-                    verification.await.context("cancelled libsql source verifier did not join")??;
+                    let drained=verification.await.context("cancelled libsql source verifier did not join")?;
+                    let _=self.fail(acquisition,FailureClass::Retryable).await?;
+                    drained?;
                     bail!("libsql source registration cancelled")
                 }
                 _=heartbeat.tick()=>{
                     if !self.renew(acquisition,60).await?{
                         verification_cancel.cancel();
-                        verification.await.context("lease-lost libsql source verifier did not join")??;
+                        let drained=verification.await.context("lease-lost libsql source verifier did not join")?;
+                        let _=self.fail(acquisition,FailureClass::Retryable).await?;
+                        drained?;
                         bail!("libsql source acquisition lease was lost during verification")
                     }
                 }
@@ -1257,10 +1266,11 @@ mod tests {
     use super::*;
     use crate::artifact_scheduler::{ClaimedArtifact, CompletionEvidence, CompletionVerifier};
     use crate::artifact_scheduler_libsql::LibsqlArtifactScheduler;
-    use crate::storage::LocalStorage;
+    use crate::storage::{HashEntry, LocalStorage, StorageBackend};
     use std::net::TcpListener;
     use std::process::{Child, Command, Stdio};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
     struct Server {
@@ -1344,6 +1354,37 @@ mod tests {
         }
         fn verify(&self, claim: &ClaimedArtifact, evidence: &CompletionEvidence) -> Result<()> {
             crate::artifact_scheduler::validate_evidence(claim, evidence)
+        }
+    }
+
+    struct SlowStorage {
+        inner: StorageRef,
+        entered: AtomicBool,
+        finished: AtomicBool,
+    }
+    #[async_trait]
+    impl StorageBackend for SlowStorage {
+        fn get(&self, hash: &str) -> Result<Vec<u8>> {
+            self.inner.get(hash)
+        }
+        fn get_range(&self, hash: &str, start: u64, len: u64) -> Result<Vec<u8>> {
+            self.entered.store(true, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let result = self.inner.get_range(hash, start, len);
+            self.finished.store(true, Ordering::SeqCst);
+            result
+        }
+        fn put(&self, hash: &str, data: &[u8]) -> Result<()> {
+            self.inner.put(hash, data)
+        }
+        fn size(&self, hash: &str) -> Result<u64> {
+            self.inner.size(hash)
+        }
+        fn delete(&self, hash: &str) -> Result<()> {
+            self.inner.delete(hash)
+        }
+        fn list_hashes(&self) -> Result<Vec<HashEntry>> {
+            self.inner.list_hashes()
         }
     }
 
@@ -1535,6 +1576,117 @@ mod tests {
             }
         ));
         drop(server);
+    }
+
+    #[tokio::test]
+    async fn registration_cancellation_drains_verifier_and_settles_failure() {
+        let Some((_server, database, _connection)) = connection().await else {
+            return;
+        };
+        let limits = SchedulerLimits::default();
+        let shared = Arc::new(database);
+        LibsqlArtifactScheduler::from_shared_database(
+            shared.clone(),
+            limits.clone(),
+            Arc::new(Accept),
+        )
+        .await
+        .unwrap();
+        let storage_dir = tempfile::tempdir().unwrap();
+        let inner: StorageRef = Arc::new(LocalStorage::new(storage_dir.path()).unwrap());
+        let slow = Arc::new(SlowStorage {
+            inner: inner.clone(),
+            entered: AtomicBool::new(false),
+            finished: AtomicBool::new(false),
+        });
+        let storage: StorageRef = slow.clone();
+        let registry = LibsqlGitSourceRegistry::new(
+            shared,
+            storage,
+            limits,
+            GitSourceLimits::default(),
+            [8; 32],
+        )
+        .await
+        .unwrap();
+        let commit = "5555555555555555555555555555555555555555";
+        let pack_bytes = b"cancel-pack";
+        let index_bytes = b"cancel-index";
+        let pack = CasBlob {
+            hash: hex::encode(Sha256::digest(pack_bytes)),
+            len: pack_bytes.len() as u64,
+        };
+        let index = CasBlob {
+            hash: hex::encode(Sha256::digest(index_bytes)),
+            len: index_bytes.len() as u64,
+        };
+        inner.put(&pack.hash, pack_bytes).unwrap();
+        inner.put(&index.hash, index_bytes).unwrap();
+        let prepared =
+            crate::git_source::prepared_source_for_registry_test("ws", "o/r", commit, pack, index)
+                .unwrap();
+        let view = prepared.registry_view(&GitSourceLimits::default()).unwrap();
+        inner.put(&view.root.hash, &view.root_bytes).unwrap();
+        let permit = match registry
+            .begin_acquisition(
+                "ws",
+                "o/r",
+                commit,
+                1,
+                "worker",
+                "cancel",
+                60,
+                SyncIntent::EnsureCurrent,
+            )
+            .await
+            .unwrap()
+        {
+            SourceBeginOutcome::PermitToPrepare(value) => value,
+            _ => panic!("cancel test source not admitted"),
+        };
+        let (acquisition, _) = registry
+            .bind_prepared_graph(&permit, &prepared)
+            .await
+            .unwrap();
+        let cancelled = CancellationToken::new();
+        let trigger = cancelled.clone();
+        let slow_for_cancel = slow.clone();
+        let cancel_task = tokio::spawn(async move {
+            while !slow_for_cancel.entered.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await
+            }
+            trigger.cancel();
+        });
+        assert!(
+            registry
+                .register(&acquisition, &prepared, &cancelled)
+                .await
+                .is_err()
+        );
+        cancel_task.await.unwrap();
+        assert!(
+            slow.finished.load(Ordering::SeqCst),
+            "cancelled verifier was not drained"
+        );
+        assert!(matches!(
+            registry
+                .begin_acquisition(
+                    "ws",
+                    "o/r",
+                    commit,
+                    1,
+                    "observer",
+                    "observer",
+                    60,
+                    SyncIntent::ObserveMovement
+                )
+                .await
+                .unwrap(),
+            SourceBeginOutcome::Failed {
+                class: FailureClass::Retryable,
+                ..
+            }
+        ));
     }
 
     async fn registered_source(
