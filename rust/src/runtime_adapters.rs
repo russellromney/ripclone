@@ -11,8 +11,8 @@ use crate::artifact_scheduler::FailureClass;
 use crate::auth::broker::CredentialBroker;
 use crate::cas::Cas;
 use crate::git_source::{
-    CasGitSourceStore, GIT_SOURCE_FORMAT, GitSourceLimits, GitSourcePackager, PreparedGitSource,
-    TrustedProviderFetch,
+    CasGitSourceStore, GIT_SOURCE_FORMAT, GitSourceLimits, GitSourcePackager, GitSourceUploader,
+    PreparedGitSource, TrustedProviderFetch,
 };
 use crate::git_source_registry::{SourceBeginOutcome, SqliteGitSourceRegistry};
 use crate::provider::{ProviderInstance, RepoId, WorkspaceId, WorkspaceRegistry};
@@ -309,11 +309,11 @@ impl ExactSourcePreparer for GitCliExactSourcePreparer {
 
 /// SQLite implementation of normalized durable acquisition. It owns no branch
 /// policy: it receives one already-resolved exact target from the coordinator.
-pub struct SqliteDurableSourceAcquirer<P> {
+pub struct SqliteDurableSourceAcquirer<P, U = CasGitSourceStore> {
     registry: SqliteGitSourceRegistry,
     preparer: Arc<P>,
     local_cas_root: PathBuf,
-    uploader: CasGitSourceStore,
+    uploader: U,
     scratch_root: PathBuf,
     limits: GitSourceLimits,
     owner: String,
@@ -322,7 +322,7 @@ pub struct SqliteDurableSourceAcquirer<P> {
     shutdown: CancellationToken,
 }
 
-impl<P> Clone for SqliteDurableSourceAcquirer<P> {
+impl<P, U: Clone> Clone for SqliteDurableSourceAcquirer<P, U> {
     fn clone(&self) -> Self {
         Self {
             registry: self.registry.clone(),
@@ -339,13 +339,13 @@ impl<P> Clone for SqliteDurableSourceAcquirer<P> {
     }
 }
 
-impl<P> SqliteDurableSourceAcquirer<P> {
+impl<P, U> SqliteDurableSourceAcquirer<P, U> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         registry: SqliteGitSourceRegistry,
         preparer: Arc<P>,
         local_cas_root: PathBuf,
-        uploader: CasGitSourceStore,
+        uploader: U,
         scratch_root: PathBuf,
         limits: GitSourceLimits,
         owner: String,
@@ -377,7 +377,11 @@ impl<P> SqliteDurableSourceAcquirer<P> {
 }
 
 #[async_trait]
-impl<P: ExactSourcePreparer> DurableSourceAcquirer for SqliteDurableSourceAcquirer<P> {
+impl<P, U> DurableSourceAcquirer for SqliteDurableSourceAcquirer<P, U>
+where
+    P: ExactSourcePreparer,
+    U: GitSourceUploader + Clone + Send + Sync + 'static,
+{
     async fn acquire_exact(
         &self,
         workspace: &str,
@@ -410,7 +414,11 @@ impl<P: ExactSourcePreparer> DurableSourceAcquirer for SqliteDurableSourceAcquir
     }
 }
 
-impl<P: ExactSourcePreparer> SqliteDurableSourceAcquirer<P> {
+impl<P, U> SqliteDurableSourceAcquirer<P, U>
+where
+    P: ExactSourcePreparer,
+    U: GitSourceUploader + Clone + Send + Sync + 'static,
+{
     async fn run_exact(
         &self,
         workspace: String,
@@ -1234,11 +1242,27 @@ mod tests {
             .unwrap();
         assert!(matches!(second, DurableSourceAcquireOutcome::Ready(_)));
         assert_eq!(preparer.calls.load(Ordering::SeqCst), 1);
+        let sha256 = "9".repeat(64);
+        assert!(matches!(
+            adapter
+                .acquire_exact("alpha", "g/r", &sha256, SyncIntent::EnsureCurrent)
+                .await
+                .unwrap(),
+            DurableSourceAcquireOutcome::Ready(_)
+        ));
+        assert!(matches!(
+            adapter
+                .acquire_exact("alpha", "g/r", &sha256, SyncIntent::EnsureCurrent)
+                .await
+                .unwrap(),
+            DurableSourceAcquireOutcome::Ready(_)
+        ));
+        assert_eq!(preparer.calls.load(Ordering::SeqCst), 2);
         let roots: i64 = sqlx::query_scalar("SELECT count(*) FROM git_source_roots")
             .fetch_one(&fixture.pool)
             .await
             .unwrap();
-        assert_eq!(roots, 1);
+        assert_eq!(roots, 2);
     }
 
     #[tokio::test]
