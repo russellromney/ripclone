@@ -3610,9 +3610,9 @@ dependencies = [
 
 [[package]]
 name = "rand"
-version = "0.10.1"
+version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d2e8e8bcc7961af1fdac401278c6a831614941f6164ee3bf4ce61b7edb162207"
+checksum = "c7f5fa3a058cd35567ef9bfa5e75732bee0f9e4c55fa90477bef2dfcdbc4be80"
 dependencies = [
  "chacha20",
  "getrandom 0.4.2",
@@ -3790,7 +3790,7 @@ dependencies = [
  "hyper-rustls 0.27.9",
  "hyper-util",
  "md5",
- "rand 0.10.1",
+ "rand 0.10.2",
  "rustls 0.23.40",
  "rustls-native-certs 0.8.4",
  "serde",
@@ -3862,7 +3862,7 @@ dependencies = [
  "proptest",
  "prost 0.14.4",
  "prost-build",
- "rand 0.10.1",
+ "rand 0.10.2",
  "rayon",
  "reqwest",
  "rpassword",
@@ -4611,7 +4611,7 @@ dependencies = [
  "log",
  "md-5",
  "memchr",
- "rand 0.10.1",
+ "rand 0.10.2",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -4916,9 +4916,9 @@ dependencies = [
 
 [[package]]
 name = "toml"
-version = "1.1.2+spec-1.1.0"
+version = "1.1.3+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "81f3d15e84cbcd896376e6730314d59fb5a87f31e4b038454184435cd57defee"
+checksum = "53c96ecdfa941c8fc4fcaed14f99ada8ebed502eef533015095a07e3301d4c3c"
 dependencies = [
  "indexmap",
  "serde_core",
@@ -4949,9 +4949,9 @@ dependencies = [
 
 [[package]]
 name = "toml_writer"
-version = "1.1.1+spec-1.1.0"
+version = "1.1.2+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "756daf9b1013ebe47a8776667b466417e2d4c5679d441c26230efd9ef78692db"
+checksum = "7d56353a2a665ad0f41a421187180aab746c8c325620617ad883a99a1cbe66d2"
 
 [[package]]
 name = "tower"
