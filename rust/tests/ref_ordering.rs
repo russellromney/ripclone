@@ -9,9 +9,8 @@
 //! read-then-write TOCTOU (or no ordering guard at all) lets an older write
 //! clobber a newer one and fails this test.
 //!
-//! `FileRefStore` and SQLite run unconditionally. Postgres / MySQL / libsql /
-//! S3 run only when their connection env vars are set, mirroring the existing
-//! meta and S3 e2e tests.
+//! `FileRefStore` and SQLite run unconditionally. S3 runs when its local fixture
+//! supplies connection variables.
 
 use ripclone::RefInfo;
 use ripclone::provider::RepoId;
@@ -117,70 +116,6 @@ async fn sqlite_ref_store_newest_wins() {
             .unwrap(),
     );
     assert_newest_wins(store, RepoId::github("o/race"), "SqliteMeta").await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn postgres_ref_store_newest_wins() {
-    use ripclone::meta::{PostgresMeta, SqlRefStore};
-    let Ok(url) = std::env::var("RIPCLONE_TEST_PG_URL") else {
-        eprintln!("SKIP postgres_ref_store_newest_wins: RIPCLONE_TEST_PG_URL unset");
-        return;
-    };
-    let pool = sqlx::postgres::PgPool::connect(&url).await.unwrap();
-    sqlx::query("DROP TABLE IF EXISTS refs")
-        .execute(&pool)
-        .await
-        .unwrap();
-    pool.close().await;
-    let store: Arc<dyn RefStore> = Arc::new(
-        SqlRefStore::new(Box::new(PostgresMeta::connect(&url).await.unwrap()))
-            .await
-            .unwrap(),
-    );
-    assert_newest_wins(store, RepoId::github("o/race"), "PostgresMeta").await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn mysql_ref_store_newest_wins() {
-    use ripclone::meta::{MysqlMeta, SqlRefStore};
-    let Ok(url) = std::env::var("RIPCLONE_TEST_MYSQL_URL") else {
-        eprintln!("SKIP mysql_ref_store_newest_wins: RIPCLONE_TEST_MYSQL_URL unset");
-        return;
-    };
-    let pool = sqlx::mysql::MySqlPool::connect(&url).await.unwrap();
-    sqlx::query("DROP TABLE IF EXISTS refs")
-        .execute(&pool)
-        .await
-        .unwrap();
-    pool.close().await;
-    let store: Arc<dyn RefStore> = Arc::new(
-        SqlRefStore::new(Box::new(MysqlMeta::connect(&url).await.unwrap()))
-            .await
-            .unwrap(),
-    );
-    assert_newest_wins(store, RepoId::github("o/race"), "MysqlMeta").await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn libsql_ref_store_newest_wins() {
-    use ripclone::meta::{LibsqlMeta, SqlRefStore};
-    let (Ok(url), Ok(token)) = (
-        std::env::var("RIPCLONE_TEST_LIBSQL_URL"),
-        std::env::var("RIPCLONE_TEST_LIBSQL_TOKEN"),
-    ) else {
-        eprintln!("SKIP libsql_ref_store_newest_wins: RIPCLONE_TEST_LIBSQL_URL / _TOKEN unset");
-        return;
-    };
-    let store: Arc<dyn RefStore> = Arc::new(
-        SqlRefStore::new(Box::new(
-            LibsqlMeta::connect_remote(&url, &token).await.unwrap(),
-        ))
-        .await
-        .unwrap(),
-    );
-    // A remote shared DB may have leftover rows from a prior run; use a fresh
-    // repo key each time so the race starts from empty.
-    assert_newest_wins(store, unique_repo("libsql-race"), "LibsqlMeta").await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -671,8 +671,8 @@ mod tests {
             "AWS_SECRET_ACCESS_KEY" => Some("secret".into()),
             "UNRELATED" => Some("nope".into()),
             // DB creds are no longer in the bag: a farm-out worker is token-only.
-            "RIPCLONE_QUEUE_DB_URL" => Some("libsql://x".into()),
-            "RIPCLONE_METADATA_DB_URL" => Some("postgres://m".into()),
+            "RIPCLONE_QUEUE_DB_URL" => Some("/decoy/queue.db".into()),
+            "RIPCLONE_METADATA_DB_URL" => Some("/decoy/metadata.db".into()),
             "RIPCLONE_QUEUE_DB_TOKEN" => Some("qtok".into()),
             "RIPCLONE_METADATA_DB_TOKEN" => Some("mtok".into()),
             _ => None,

@@ -1,6 +1,6 @@
 //! Diskless multi-machine farm-out regression test.
 //!
-//! The whole point of the `postgres`/`mysql`/`libsql` queues is workers on *other*
+//! Authenticated API workers are intended to run on *other*
 //! machines: they share storage + the queue + the metadata store, but NOT the
 //! bare-mirror `repo_root`. The other worker e2e tests run the worker with the
 //! server's own `repo_root`, so the server always has the mirror — they cannot

@@ -15,9 +15,7 @@ use crate::cas::Cas;
 use crate::config::Config;
 use crate::metrics::Metrics;
 use crate::queue::sql::QueueDb;
-use crate::queue::{
-    BuildJob, JobQueueRef, LibsqlDb, LocalJobQueue, MysqlDb, PostgresDb, SqlJobQueue, SqliteDb,
-};
+use crate::queue::{BuildJob, JobQueueRef, LocalJobQueue, SqlJobQueue, SqliteDb};
 use crate::ref_store::{CachingRefStore, FileRefStore, RefStore, S3RefStore};
 use crate::retention::Retention;
 use crate::storage::{S3Storage, StorageRef, local};
@@ -51,6 +49,29 @@ fn env_or(key: &str, cfg_val: Option<&str>) -> Option<String> {
         .ok()
         .filter(|v| !v.is_empty())
         .or_else(|| cfg_val.map(str::to_string))
+}
+
+const REMOVED_DATABASE_BACKENDS: &[&str] = &["mysql", "postgres", "postgresql", "libsql", "sqld"];
+
+fn reject_removed_database_backend(selector: &str, value: &str) -> Result<()> {
+    if REMOVED_DATABASE_BACKENDS.contains(&value) {
+        anyhow::bail!(
+            "unsupported {selector} database backend {value:?}: SQLite is the only supported database"
+        )
+    }
+    Ok(())
+}
+
+/// Validate effective database selectors without opening storage or starting
+/// runtime work. Binaries call this before creating directories or listeners.
+pub fn validate_database_configuration() -> Result<()> {
+    let metadata =
+        env_or("RIPCLONE_METADATA", config().metadata.backend.as_deref()).unwrap_or_default();
+    let queue = env_or("RIPCLONE_QUEUE", config().queue.backend.as_deref())
+        .unwrap_or_else(|| "local".to_string());
+    reject_removed_database_backend("metadata", &metadata)?;
+    reject_removed_database_backend("queue", &queue)?;
+    Ok(())
 }
 
 /// Durable + cache backends needed to run a build.
@@ -120,6 +141,9 @@ impl Backends {
         metrics: &Arc<Metrics>,
         scheduler: SchedulerRequest,
     ) -> Result<Self> {
+        // Validate effective selectors before opening local/S3 storage, creating
+        // fallback state, or starting any listener/background task.
+        validate_database_configuration()?;
         let cas = Cas::new(cas_dir)?;
         let s3_storage =
             S3Storage::from_env_or_config(&config().storage).context("initialize S3 storage")?;
@@ -203,10 +227,9 @@ fn parse_artifact_scheduler_request(mode: Option<&str>) -> Result<SchedulerReque
 }
 
 /// Select the metadata store from `RIPCLONE_METADATA`:
-/// `file` | `s3` | `sqlite` | `postgres` | `mysql` | `libsql` | `api`. Unset
+/// `file` | `s3` | `sqlite` | `api`. Unset
 /// preserves the historical default: S3 when S3 storage is configured, else
-/// file. SQL backends read `RIPCLONE_METADATA_DB_URL` (+
-/// `RIPCLONE_METADATA_DB_TOKEN` for libsql). `api` is worker-only: it POSTs
+/// file. SQLite reads `RIPCLONE_METADATA_DB_URL`. `api` is worker-only: it POSTs
 /// ref-writes to `RIPCLONE_METADATA_REPORT_URL` with
 /// `RIPCLONE_METADATA_JOB_TOKEN` and holds no DB credentials. The result is
 /// always wrapped in `CachingRefStore`.
@@ -218,11 +241,11 @@ async fn select_metadata(
     Arc<dyn RefStore>,
     Option<Arc<dyn ArtifactSchedulerPersistence>>,
 )> {
-    use crate::meta::MetaDb;
-    use crate::meta::{LibsqlMeta, MysqlMeta, PostgresMeta, SqlRefStore, SqliteMeta};
+    use crate::meta::{SqlRefStore, SqliteMeta};
 
     let kind =
         env_or("RIPCLONE_METADATA", config().metadata.backend.as_deref()).unwrap_or_default();
+    reject_removed_database_backend("metadata", &kind)?;
     if scheduler.is_some() {
         validate_scheduler_metadata_selection(&kind)?;
     }
@@ -235,11 +258,11 @@ async fn select_metadata(
     let resolves_to_file = kind == "file" || (kind.is_empty() && s3.is_none());
     if resolves_to_file {
         let queue = queue_kind();
-        if matches!(queue.as_str(), "sqlite" | "postgres" | "mysql" | "libsql") {
+        if queue == "sqlite" {
             warn!(
                 "RIPCLONE_QUEUE={queue} is SQL but the metadata store resolves to per-host \
                  files. If workers don't share this filesystem, set a shared metadata store \
-                 (RIPCLONE_METADATA=s3|sqlite|postgres|mysql|libsql|api) so the server and \
+                 (RIPCLONE_METADATA=s3|sqlite|api) so the server and \
                  workers share refs."
             );
         }
@@ -255,7 +278,7 @@ async fn select_metadata(
             if scheduler.is_some() {
                 anyhow::bail!(
                     "artifact scheduler requires an explicit SQL metadata backend \
-                     (RIPCLONE_METADATA=sqlite|postgres|mysql|libsql)"
+                     (RIPCLONE_METADATA=sqlite)"
                 )
             }
             // Backward compatible: metadata follows storage.
@@ -294,75 +317,22 @@ async fn select_metadata(
                 None,
             )
         }
-        "sqlite" | "postgres" | "mysql" | "libsql" => {
+        "sqlite" => {
             let url = env_or("RIPCLONE_METADATA_DB_URL", config().metadata.url.as_deref()).context(
-                "RIPCLONE_METADATA=sqlite|postgres|mysql|libsql requires RIPCLONE_METADATA_DB_URL (or [metadata].url)",
+                "RIPCLONE_METADATA=sqlite requires RIPCLONE_METADATA_DB_URL (or [metadata].url)",
             )?;
-            let (db, artifact_scheduler): (
-                Box<dyn MetaDb>,
-                Option<Arc<dyn ArtifactSchedulerPersistence>>,
-            ) = match kind.as_str() {
-                "sqlite" => {
-                    let db = SqliteMeta::connect(&url).await?;
-                    let scheduler = match scheduler.as_ref() {
-                        Some((limits, verifier)) => Some(Arc::new(
-                            db.artifact_scheduler(limits.clone(), verifier.clone())
-                                .await?,
-                        )
-                            as Arc<dyn ArtifactSchedulerPersistence>),
-                        None => None,
-                    };
-                    (Box::new(db), scheduler)
-                }
-                "postgres" => {
-                    let db = PostgresMeta::connect(&url).await?;
-                    let scheduler = match scheduler.as_ref() {
-                        Some((limits, verifier)) => Some(Arc::new(
-                            db.artifact_scheduler(limits.clone(), verifier.clone())
-                                .await?,
-                        )
-                            as Arc<dyn ArtifactSchedulerPersistence>),
-                        None => None,
-                    };
-                    (Box::new(db), scheduler)
-                }
-                "mysql" => {
-                    let db = MysqlMeta::connect(&url).await?;
-                    let scheduler = match scheduler.as_ref() {
-                        Some((limits, verifier)) => Some(Arc::new(
-                            db.artifact_scheduler(limits.clone(), verifier.clone())
-                                .await?,
-                        )
-                            as Arc<dyn ArtifactSchedulerPersistence>),
-                        None => None,
-                    };
-                    (Box::new(db), scheduler)
-                }
-                "libsql" => {
-                    if !is_remote_url(&url) {
-                        anyhow::bail!(
-                            "RIPCLONE_METADATA=libsql is remote-only; RIPCLONE_METADATA_DB_URL \
-                             must be a libsql:// or https:// url (local file → use sqlite)"
-                        );
-                    }
-                    let token = env_or("RIPCLONE_METADATA_DB_TOKEN", config().metadata.token.as_deref())
-                        .context("RIPCLONE_METADATA=libsql requires RIPCLONE_METADATA_DB_TOKEN (or [metadata].token)")?;
-                    let db = LibsqlMeta::connect_remote(&url, &token).await?;
-                    let scheduler = match scheduler.as_ref() {
-                        Some((limits, verifier)) => Some(Arc::new(
-                            db.artifact_scheduler(limits.clone(), verifier.clone())
-                                .await?,
-                        )
-                            as Arc<dyn ArtifactSchedulerPersistence>),
-                        None => None,
-                    };
-                    (Box::new(db), scheduler)
-                }
-                _ => unreachable!(),
+            let db = SqliteMeta::connect(&url).await?;
+            let artifact_scheduler = match scheduler.as_ref() {
+                Some((limits, verifier)) => Some(Arc::new(
+                    db.artifact_scheduler(limits.clone(), verifier.clone())
+                        .await?,
+                )
+                    as Arc<dyn ArtifactSchedulerPersistence>),
+                None => None,
             };
             info!("metadata store: {kind}");
             (
-                Arc::new(CachingRefStore::new(SqlRefStore::new(db).await?)),
+                Arc::new(CachingRefStore::new(SqlRefStore::new(Box::new(db)).await?)),
                 artifact_scheduler,
             )
         }
@@ -374,14 +344,13 @@ async fn select_metadata(
                 )
             }
             // Worker-only: POSTs ref-writes to the server. No DB URL, no DB token.
-            // Fail loudly if the report URL or job token is missing (same style as
-            // the libsql arm without its token).
+            // Fail loudly if the report URL or job token is missing.
             let store = ApiRefStore::from_env()?;
             (Arc::new(CachingRefStore::new(store)), None)
         }
         other => anyhow::bail!(
             "unknown RIPCLONE_METADATA backend: {other:?} \
-             (expected 'file', 's3', 'sqlite', 'postgres', 'mysql', 'libsql', or 'api')"
+             (expected 'file', 's3', 'sqlite', or 'api')"
         ),
     };
     Ok((store, artifact_scheduler))
@@ -389,17 +358,17 @@ async fn select_metadata(
 
 fn validate_scheduler_metadata_selection(kind: &str) -> Result<()> {
     match kind {
-        "sqlite" | "postgres" | "mysql" | "libsql" => Ok(()),
+        "sqlite" => Ok(()),
         "" => anyhow::bail!(
             "artifact scheduler requires an explicit SQL metadata backend \
-             (RIPCLONE_METADATA=sqlite|postgres|mysql|libsql)"
+             (RIPCLONE_METADATA=sqlite)"
         ),
         "file" | "s3" | "api" => {
             anyhow::bail!("artifact scheduler is unavailable with RIPCLONE_METADATA={kind}")
         }
         other => anyhow::bail!(
             "unknown RIPCLONE_METADATA backend for artifact scheduler: {other:?} \
-             (expected 'sqlite', 'postgres', 'mysql', or 'libsql')"
+             (expected 'sqlite')"
         ),
     }
 }
@@ -427,12 +396,12 @@ pub fn queue_kind() -> String {
 }
 
 /// Select the queue for the **server** from `RIPCLONE_QUEUE`:
-/// `local` (in-process worker) | `sqlite` (local file, single-box farm-out) |
-/// `postgres` / `mysql` (network db, multi-machine) | `libsql` (remote Turso
-/// Cloud, multi-machine). The SQL backends run builds in separate
+/// `local` (in-process worker) | `sqlite` (local file, single-box farm-out).
+/// The SQLite backend runs builds in separate
 /// `ripclone-worker` processes.
 pub async fn select_queue() -> Result<QueueBackend> {
     let kind = queue_kind();
+    reject_removed_database_backend("queue", &kind)?;
     match kind.as_str() {
         "local" => {
             let (queue, rx, depth) = LocalJobQueue::new(LOCAL_QUEUE_CAPACITY);
@@ -443,7 +412,7 @@ pub async fn select_queue() -> Result<QueueBackend> {
                 depth,
             })
         }
-        "sqlite" | "postgres" | "mysql" | "libsql" => {
+        "sqlite" => {
             let queue = connect_sql_queue().await?;
             info!("using SQL build queue (RIPCLONE_QUEUE={kind}); builds run in ripclone-worker");
             Ok(QueueBackend::Sql {
@@ -452,12 +421,12 @@ pub async fn select_queue() -> Result<QueueBackend> {
         }
         "api" => anyhow::bail!(
             "RIPCLONE_QUEUE=api is worker-only (a farm-out worker claims over HTTP). \
-             The server holds the real queue — set RIPCLONE_QUEUE=sqlite|postgres|mysql|libsql \
+             The server holds the real queue — set RIPCLONE_QUEUE=sqlite \
              on the server."
         ),
         other => anyhow::bail!(
             "unknown RIPCLONE_QUEUE backend: {other:?} \
-             (expected 'local', 'sqlite', 'postgres', 'mysql', or 'libsql')"
+             (expected 'local' or 'sqlite')"
         ),
     }
 }
@@ -475,13 +444,14 @@ pub enum WorkerQueueBackend {
 /// (the server side), `api` is valid here — this is the farm-out path.
 pub async fn connect_worker_queue(max_size_class: Option<&str>) -> Result<WorkerQueueBackend> {
     let kind = queue_kind();
+    reject_removed_database_backend("queue", &kind)?;
     match kind.as_str() {
         "api" => {
             let queue = ApiJobQueue::from_env()?;
             info!("using API build queue (RIPCLONE_QUEUE=api); no DB credentials on this worker");
             Ok(WorkerQueueBackend::Api(Arc::new(queue)))
         }
-        "sqlite" | "postgres" | "mysql" | "libsql" => {
+        "sqlite" => {
             let queue = connect_sql_queue()
                 .await?
                 .with_max_size_class(max_size_class)
@@ -490,61 +460,37 @@ pub async fn connect_worker_queue(max_size_class: Option<&str>) -> Result<Worker
         }
         "local" => anyhow::bail!(
             "RIPCLONE_QUEUE=local is the in-process server queue; a standalone worker \
-             needs RIPCLONE_QUEUE=api (farm-out) or sqlite|postgres|mysql|libsql (direct)"
+             needs RIPCLONE_QUEUE=api (farm-out) or sqlite (direct)"
         ),
         other => anyhow::bail!(
             "unknown RIPCLONE_QUEUE backend: {other:?} \
-             (expected 'api', 'sqlite', 'postgres', 'mysql', or 'libsql')"
+             (expected 'api' or 'sqlite')"
         ),
     }
 }
 
 /// Build the SQL-backed queue from env, shared by the server and the worker.
 /// - `sqlite` → local file at `RIPCLONE_QUEUE_DB_URL` (mature, single-box).
-/// - `postgres` → `postgres://…` at `RIPCLONE_QUEUE_DB_URL` (network, multi-machine).
-/// - `mysql` → `mysql://…` at `RIPCLONE_QUEUE_DB_URL` (network, multi-machine).
-/// - `libsql` → **remote** Turso Cloud at `RIPCLONE_QUEUE_DB_URL` (a `libsql://`
-///   / `https://` url) with `RIPCLONE_QUEUE_DB_TOKEN`.
 pub async fn connect_sql_queue() -> Result<SqlJobQueue> {
     let kind = queue_kind();
+    reject_removed_database_backend("queue", &kind)?;
     let url = queue_db_url()?;
     let db: Box<dyn QueueDb> = match kind.as_str() {
         "sqlite" => Box::new(SqliteDb::connect(&url).await?),
-        "postgres" => Box::new(PostgresDb::connect(&url).await?),
-        "mysql" => Box::new(MysqlDb::connect(&url).await?),
-        "libsql" => {
-            if !is_remote_url(&url) {
-                anyhow::bail!(
-                    "RIPCLONE_QUEUE=libsql is remote-only; RIPCLONE_QUEUE_DB_URL must be a \
-                     libsql:// or https:// url (for a local file use RIPCLONE_QUEUE=sqlite)"
-                );
-            }
-            let token = env_or("RIPCLONE_QUEUE_DB_TOKEN", config().queue.token.as_deref()).context(
-                "RIPCLONE_QUEUE=libsql requires RIPCLONE_QUEUE_DB_TOKEN (or [queue].token) for the remote database",
-            )?;
-            Box::new(LibsqlDb::connect_remote(&url, &token).await?)
-        }
         other => anyhow::bail!(
             "RIPCLONE_QUEUE={other:?} is not a SQL queue backend \
-             (expected 'sqlite', 'postgres', 'mysql', or 'libsql')"
+             (expected 'sqlite')"
         ),
     };
     let classes = crate::queue::load_size_classes(&config().queue.size_classes)?;
     SqlJobQueue::new_with_classes(db, classes).await
 }
 
-fn is_remote_url(url: &str) -> bool {
-    ["libsql://", "http://", "https://", "ws://", "wss://"]
-        .iter()
-        .any(|p| url.starts_with(p))
-}
-
 /// The SQL queue connection URL, required by the SQL backends.
 pub fn queue_db_url() -> Result<String> {
     env_or("RIPCLONE_QUEUE_DB_URL", config().queue.url.as_deref()).context(
-        "RIPCLONE_QUEUE=sqlite|postgres|mysql|libsql requires RIPCLONE_QUEUE_DB_URL \
-         (or [queue].url in config.toml) — sqlite: a local path; postgres: postgres://…; \
-         mysql: mysql://…; libsql: a remote libsql:// url",
+        "RIPCLONE_QUEUE=sqlite requires RIPCLONE_QUEUE_DB_URL \
+         (or [queue].url in config.toml) — use a local SQLite path",
     )
 }
 
@@ -574,21 +520,9 @@ mod tests {
 
     #[test]
     fn artifact_scheduler_selection_is_explicit_sql_only() {
-        for kind in ["sqlite", "postgres", "mysql", "libsql"] {
-            assert!(
-                validate_scheduler_metadata_selection(kind).is_ok(),
-                "{kind}"
-            );
-        }
+        assert!(validate_scheduler_metadata_selection("sqlite").is_ok());
         for kind in [
-            "",
-            "file",
-            "s3",
-            "api",
-            "LOCAL",
-            " sqlite",
-            "postgres ",
-            "bogus",
+            "", "file", "s3", "api", "LOCAL", " sqlite", "network-db", "bogus",
         ] {
             let error = validate_scheduler_metadata_selection(kind)
                 .expect_err("unsafe or malformed selection must fail closed")

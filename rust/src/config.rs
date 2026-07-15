@@ -99,26 +99,22 @@ pub struct StorageConfig {
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MetadataConfig {
-    /// `file` | `s3` | `sqlite` | `postgres` | `mysql` | `libsql` | `api`.
+    /// `file` | `s3` | `sqlite` | `api`.
     /// Unset follows storage (s3 if configured, else file). `api` is worker-only
     /// (report URL + job token; no DB credentials).
     pub backend: Option<String>,
-    /// Connection URL for the SQL backends.
+    /// SQLite database path.
     pub url: Option<String>,
-    /// Auth token for `libsql` (remote), stored as written.
-    pub token: Option<String>,
 }
 
 /// Server-side build queue. `RIPCLONE_QUEUE*` env vars override.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct QueueConfig {
-    /// `local` | `sqlite` | `postgres` | `mysql` | `libsql`. Unset = `local`.
+    /// `local` | `sqlite`. Unset = `local`.
     pub backend: Option<String>,
-    /// Connection URL for the SQL backends.
+    /// SQLite database path.
     pub url: Option<String>,
-    /// Auth token for `libsql` (remote), stored as written.
-    pub token: Option<String>,
     /// Ordered size classes for the SQL queue claim filter (see
     /// [`crate::queue::size_class`]). Empty → launch default `small | large`.
     /// Also overridable via `RIPCLONE_SIZE_CLASSES` JSON.
@@ -353,12 +349,10 @@ fn merge(overrides: Config, base: Config) -> Config {
         metadata: MetadataConfig {
             backend: overrides.metadata.backend.or(base.metadata.backend),
             url: overrides.metadata.url.or(base.metadata.url),
-            token: overrides.metadata.token.or(base.metadata.token),
         },
         queue: QueueConfig {
             backend: overrides.queue.backend.or(base.queue.backend),
             url: overrides.queue.url.or(base.queue.url),
-            token: overrides.queue.token.or(base.queue.token),
             size_classes: if overrides.queue.size_classes.is_empty() {
                 base.queue.size_classes
             } else {
@@ -503,15 +497,13 @@ machine = "l"
             },
             providers,
             queue: QueueConfig {
-                backend: Some("postgres".into()),
-                url: Some("postgres://db/ripclone".into()),
-                token: None,
+                backend: Some("sqlite".into()),
+                url: Some("/tmp/ripclone-queue.db".into()),
                 size_classes: vec![],
             },
             metadata: MetadataConfig {
-                backend: Some("postgres".into()),
-                url: Some("postgres://db/ripclone".into()),
-                token: None,
+                backend: Some("sqlite".into()),
+                url: Some("/tmp/ripclone-metadata.db".into()),
             },
             storage: StorageConfig {
                 backend: Some("s3".into()),
@@ -542,9 +534,9 @@ machine = "l"
                 .and_then(|entry| entry.token.as_deref()),
             Some("provider-token")
         );
-        assert_eq!(loaded.queue.backend.as_deref(), Some("postgres"));
-        assert_eq!(loaded.queue.url.as_deref(), Some("postgres://db/ripclone"));
-        assert_eq!(loaded.metadata.backend.as_deref(), Some("postgres"));
+        assert_eq!(loaded.queue.backend.as_deref(), Some("sqlite"));
+        assert_eq!(loaded.queue.url.as_deref(), Some("/tmp/ripclone-queue.db"));
+        assert_eq!(loaded.metadata.backend.as_deref(), Some("sqlite"));
         assert_eq!(loaded.storage.backend.as_deref(), Some("s3"));
         assert_eq!(loaded.storage.bucket.as_deref(), Some("my-bucket"));
         assert!(loaded.token.is_none());

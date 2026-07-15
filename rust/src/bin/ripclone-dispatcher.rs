@@ -16,7 +16,7 @@
 //!   workers. Never exceeded.
 //! - Queue env (`RIPCLONE_QUEUE`, `RIPCLONE_QUEUE_DB_URL`, …) for the
 //!   **dispatcher's own** connection: it polls a SQL queue with a workers
-//!   registry (`sqlite` or `libsql`) so live counts work. These DB creds are
+//!   registry (`sqlite`) so live counts work. These DB creds are
 //!   **not** forwarded to workers.
 //! - Worker env bag keys present in **this** process are forwarded into each
 //!   `WorkerSpec.env` (queue, storage, metadata, upstream-cred — see
@@ -81,10 +81,7 @@ async fn main() -> Result<()> {
 
     let queue = backends::connect_sql_queue().await?;
     if !queue.supports_worker_registry() {
-        bail!(
-            "dispatcher requires RIPCLONE_QUEUE=sqlite|libsql so live_worker_count \
-             works (postgres/mysql lag the workers registry)"
-        );
+        bail!("dispatcher requires RIPCLONE_QUEUE=sqlite so live_worker_count works");
     }
     let queue = Arc::new(queue);
 

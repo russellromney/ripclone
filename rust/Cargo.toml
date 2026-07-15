@@ -87,13 +87,8 @@ async-trait = "0.1.89"
 # (the GitHub App broker signs JWTs; OIDC verifies them).
 jsonwebtoken = { version = "10.4.0", features = ["rust_crypto"] }
 subtle = "2"
-# Pluggable SQL queue + metadata backends: sqlite (local), postgres/mysql
-# (network), libsql (remote Turso Cloud).
-sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls", "sqlite", "postgres", "mysql"] }
-# remote-only: `remote` + `tls` (hyper + hyper-rustls) WITHOUT `core`, so libsql
-# does NOT bundle SQLite's C library (which would collide with sqlx's bundled
-# SQLite — "Once poisoned"). `tls` supplies the HTTP connector build() requires.
-libsql = { version = "0.9", default-features = false, features = ["remote", "tls"] }
+# SQLite is the only SQL metadata and queue backend.
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite"] }
 gix = "0.85.0"
 gix-pack = "0.72.0"
 rpassword = "7"

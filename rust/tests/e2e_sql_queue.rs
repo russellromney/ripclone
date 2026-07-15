@@ -1,13 +1,11 @@
 //! End-to-end test for the pluggable SQL queue: `/sync` enqueues a build into a
-//! shared libsql (local-file) jobs table and a *separate* worker (here, a
+//! shared SQLite jobs table and a *separate* worker (here, a
 //! background task standing in for the `ripclone-worker` process) claims it,
 //! runs `process_build_job`, and acks. The server observes completion by polling
 //! the job's status — proving sync can be farmed out to a process that shares
 //! only storage + metadata + the queue.
 //!
-//! Uses the SQLite backend for reliable cross-process access; the libsql
-//! (remote) binding shares the same orchestration and is covered by the unit
-//! tests for the SQL logic.
+//! Uses the SQLite backend for reliable cross-process access.
 
 mod common;
 

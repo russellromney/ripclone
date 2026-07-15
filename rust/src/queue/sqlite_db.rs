@@ -1,6 +1,7 @@
 //! [`QueueDb`] backed by plain SQLite via `sqlx` — the mature, default local
 //! engine. Reliable multi-process access on one host (WAL + busy_timeout + the
-//! atomic conditional claim). For multi-machine use the remote `libsql` backend.
+//! atomic conditional claim). Remote workers claim through the authenticated
+//! server API rather than opening the SQLite file.
 
 use super::sql::{
     ADD_ATTEMPTS_COLUMN_SQL, ADD_CREDENTIAL_COLUMN_SQL, ADD_INITIALIZATION_ATTEMPT_COLUMN_SQL,

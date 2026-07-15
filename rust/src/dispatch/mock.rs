@@ -97,7 +97,7 @@ mod tests {
 
     fn spec(size: &str) -> WorkerSpec {
         let mut env = BTreeMap::new();
-        env.insert("RIPCLONE_QUEUE".into(), "libsql".into());
+        env.insert("RIPCLONE_QUEUE".into(), "sqlite".into());
         WorkerSpec::new(size, env)
     }
 
@@ -120,7 +120,7 @@ mod tests {
         assert_eq!(calls[0].size_class, "small");
         assert_eq!(
             calls[0].env.get("RIPCLONE_QUEUE").map(String::as_str),
-            Some("libsql")
+            Some("sqlite")
         );
         assert_eq!(calls[1].size_class, "large");
 
@@ -131,7 +131,7 @@ mod tests {
                 .env
                 .get("RIPCLONE_QUEUE")
                 .map(String::as_str),
-            Some("libsql")
+            Some("sqlite")
         );
     }
 

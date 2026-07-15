@@ -17,18 +17,12 @@ use sha2::{Digest, Sha256};
 use std::fmt;
 use std::sync::Arc;
 
-pub mod libsql_db;
 pub mod local;
-pub mod mysql_db;
-pub mod postgres_db;
 pub mod size_class;
 pub mod sql;
 pub mod sqlite_db;
 
-pub use libsql_db::LibsqlDb;
 pub use local::LocalJobQueue;
-pub use mysql_db::MysqlDb;
-pub use postgres_db::PostgresDb;
 pub use size_class::{
     SizeClass, classify_rank, default_size_classes, load_size_classes, prior_clonepack_bytes,
     resolve_job_size_bytes,

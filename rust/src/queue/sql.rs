@@ -1,11 +1,10 @@
-//! SQL-backed cross-process queue, shared across two SQLite-compatible engines:
-//! `sqlite` (local file, via `sqlx`) and `libsql` (remote Turso Cloud). The
+//! SQL-backed cross-process queue using SQLite (local file, via `sqlx`). The
 //! server `enqueue`s; a separate `ripclone-worker` process `claim`s, builds, and
 //! `ack`s.
 //!
 //! [`QueueDb`] is a tiny per-engine adapter that returns plain Rust types (no
 //! engine types leak); [`SqlJobQueue`] holds one and contains all the queue
-//! orchestration, so the logic is written once and runs on either engine.
+//! orchestration, so database details stay behind the adapter.
 //!
 //! ## Portability / correctness
 //!
@@ -125,8 +124,7 @@ pub(crate) fn decode_credential(enc: Option<String>) -> Option<secrecy::SecretSt
 }
 
 /// Per-engine adapter. Each method runs one or two statements on a fresh
-/// connection and returns plain Rust types. Implemented by `SqliteDb` and
-/// `LibsqlDb`.
+/// connection and returns plain Rust types. Implemented by `SqliteDb`.
 #[async_trait]
 pub trait QueueDb: Send + Sync {
     /// Create the `jobs` table and indexes (best-effort on the partial unique
@@ -241,12 +239,7 @@ pub trait QueueDb: Send + Sync {
     /// Returns `(rank, count)` pairs for ranks that have at least one pending
     /// job, ordered by rank ascending.
     ///
-    /// Blessed backends (sqlite/libsql) implement a real `GROUP BY size_class`.
-    /// Lagging backends (postgres/mysql) approximate: they do not persist the
-    /// enqueue rank reliably, so they report the entire pending depth under a
-    /// single sentinel rank of [`i64::MAX`]. [`SqlJobQueue::pending_by_class`]
-    /// clamps that to the largest configured class so the dispatcher never
-    /// under-sizes a worker on a lagging engine.
+    /// SQLite implements a real `GROUP BY size_class`.
     async fn count_queued_by_size_class(&self) -> Result<Vec<(i64, i64)>>;
 
     /// Delete `failed` jobs finished before `cutoff` (epoch secs). Returns the
@@ -254,15 +247,13 @@ pub trait QueueDb: Send + Sync {
     /// version-live-at-time-T history and stay small at real commit rates).
     async fn prune_failed(&self, cutoff: i64) -> Result<u64>;
 
-    /// Whether this engine owns a `workers` registry table (sqlite/libsql).
-    /// Lagging backends return false — heartbeat and live-count must fail
-    /// loudly rather than silently report a zero fleet.
+    /// Whether this engine owns a `workers` registry table.
     fn supports_worker_registry(&self) -> bool {
         false
     }
 
-    /// Upsert a worker heartbeat row (`workers` registry). Blessed backends
-    /// only (sqlite/libsql). Lagging backends error — never silently no-op.
+    /// Upsert a worker heartbeat row (`workers` registry). Implementations
+    /// without the registry error rather than silently no-op.
     async fn upsert_heartbeat(
         &self,
         _worker_id: &str,
@@ -270,18 +261,12 @@ pub trait QueueDb: Send + Sync {
         _current_job: Option<i64>,
         _now: i64,
     ) -> Result<()> {
-        anyhow::bail!(
-            "worker registry requires RIPCLONE_QUEUE=sqlite|libsql \
-             (postgres/mysql lag the workers table)"
-        )
+        anyhow::bail!("worker registry requires RIPCLONE_QUEUE=sqlite")
     }
 
     /// Count workers with `last_heartbeat >= cutoff`. Blessed backends only.
     async fn count_live_workers(&self, _cutoff: i64) -> Result<i64> {
-        anyhow::bail!(
-            "worker registry requires RIPCLONE_QUEUE=sqlite|libsql \
-             (postgres/mysql lag the workers table)"
-        )
+        anyhow::bail!("worker registry requires RIPCLONE_QUEUE=sqlite")
     }
 
     /// Count live workers that can claim jobs of rank `min_rank` (inclusive).
@@ -291,19 +276,13 @@ pub trait QueueDb: Send + Sync {
     /// Used by the dispatcher so a small-only live worker does not block
     /// starting a large-capable worker for a large pending job.
     async fn count_live_workers_capable(&self, _cutoff: i64, _min_rank: i64) -> Result<i64> {
-        anyhow::bail!(
-            "worker registry requires RIPCLONE_QUEUE=sqlite|libsql \
-             (postgres/mysql lag the workers table)"
-        )
+        anyhow::bail!("worker registry requires RIPCLONE_QUEUE=sqlite")
     }
 
     /// Delete workers with `last_heartbeat < cutoff` (hard age-out). Blessed
     /// backends only.
     async fn prune_stale_workers(&self, _cutoff: i64) -> Result<u64> {
-        anyhow::bail!(
-            "worker registry requires RIPCLONE_QUEUE=sqlite|libsql \
-             (postgres/mysql lag the workers table)"
-        )
+        anyhow::bail!("worker registry requires RIPCLONE_QUEUE=sqlite")
     }
 }
 
@@ -545,9 +524,7 @@ impl SqlJobQueue {
         self.heartbeat_timeout_secs
     }
 
-    /// True when this queue engine has a `workers` registry (sqlite/libsql).
-    /// Postgres/MySQL lag — callers must not treat a zero live-count as "no
-    /// workers" on those backends.
+    /// True when this queue engine has a `workers` registry.
     pub fn supports_worker_registry(&self) -> bool {
         self.db.supports_worker_registry()
     }
@@ -569,10 +546,7 @@ impl SqlJobQueue {
         now: i64,
     ) -> Result<()> {
         if !self.db.supports_worker_registry() {
-            anyhow::bail!(
-                "worker heartbeat requires RIPCLONE_QUEUE=sqlite|libsql \
-                 (postgres/mysql lag the workers registry)"
-            );
+            anyhow::bail!("worker heartbeat requires RIPCLONE_QUEUE=sqlite");
         }
         if worker_id.is_empty() {
             anyhow::bail!("worker_id must not be empty");
@@ -596,10 +570,7 @@ impl SqlJobQueue {
     /// excluded.
     pub async fn live_worker_count_at(&self, now: i64) -> Result<usize> {
         if !self.db.supports_worker_registry() {
-            anyhow::bail!(
-                "live_worker_count requires RIPCLONE_QUEUE=sqlite|libsql \
-                 (postgres/mysql lag the workers registry)"
-            );
+            anyhow::bail!("live_worker_count requires RIPCLONE_QUEUE=sqlite");
         }
         let cutoff = now - self.heartbeat_timeout_secs;
         // Hard age-out so the table does not grow with dead workers forever.
@@ -624,10 +595,7 @@ impl SqlJobQueue {
     /// [`live_worker_count_capable`] with an explicit clock (tests).
     pub async fn live_worker_count_capable_at(&self, min_rank: i64, now: i64) -> Result<usize> {
         if !self.db.supports_worker_registry() {
-            anyhow::bail!(
-                "live_worker_count_capable requires RIPCLONE_QUEUE=sqlite|libsql \
-                 (postgres/mysql lag the workers registry)"
-            );
+            anyhow::bail!("live_worker_count_capable requires RIPCLONE_QUEUE=sqlite");
         }
         let cutoff = now - self.heartbeat_timeout_secs;
         self.db.prune_stale_workers(cutoff).await.map_err(|e| {
@@ -948,7 +916,7 @@ impl WorkerQueue for SqlJobQueue {
     }
 }
 
-/// Shared DDL for both engines (blessed: sqlite + libsql).
+/// Shared SQLite queue DDL.
 pub(crate) const CREATE_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS jobs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     key TEXT NOT NULL,
@@ -992,8 +960,8 @@ pub(crate) const CREATE_HISTORY_INDEX_SQL: &str = "CREATE INDEX IF NOT EXISTS id
 /// Migration for a `jobs` table created before the `credential` column existed.
 /// `CREATE TABLE IF NOT EXISTS` is a no-op on an existing table, so it never adds
 /// the column — run this ALTER best-effort (it errors "duplicate column" on a
-/// fresh table, which is ignored). SQLite/libsql have no `ADD COLUMN IF NOT
-/// EXISTS`, hence best-effort; Postgres uses its own `IF NOT EXISTS` form.
+/// fresh table, which is ignored). SQLite has no `ADD COLUMN IF NOT EXISTS`,
+/// hence best-effort.
 pub(crate) const ADD_CREDENTIAL_COLUMN_SQL: &str = "ALTER TABLE jobs ADD COLUMN credential TEXT";
 pub(crate) const ADD_INITIALIZATION_ATTEMPT_COLUMN_SQL: &str =
     "ALTER TABLE jobs ADD COLUMN initialization_attempt_id TEXT";
@@ -1005,7 +973,7 @@ pub(crate) const ADD_ATTEMPTS_COLUMN_SQL: &str =
     "ALTER TABLE jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0";
 
 /// Migration for a `jobs` table created before the `size_class` column existed.
-/// Blessed backends only (sqlite/libsql). Best-effort like the other ALTERs.
+/// Best-effort like the other SQLite ALTERs.
 /// Default 0 = smallest class so legacy rows stay claimable by every worker.
 /// Stale-reclaim bumps this rung so a larger worker can pick the job up next
 /// (claim filter lands in O2).
@@ -1013,7 +981,7 @@ pub(crate) const ADD_SIZE_CLASS_COLUMN_SQL: &str =
     "ALTER TABLE jobs ADD COLUMN size_class INTEGER NOT NULL DEFAULT 0";
 
 /// Worker heartbeat/registry table (dispatcher autoscaler live-count). Blessed
-/// backends only (sqlite/libsql). One row per worker: id, size ceiling, optional
+/// SQLite only. One row per worker: id, size ceiling, optional
 /// current job, last heartbeat. Stale rows age out of
 /// [`SqlJobQueue::live_worker_count`] after the configured timeout.
 pub(crate) const CREATE_WORKERS_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS workers (
@@ -1099,10 +1067,8 @@ mod tests {
         );
     }
 
-    /// Build a fresh queue on each supported local engine, backed by a temp file
-    /// (a per-op connection model needs a real file, not `:memory:`). The libsql
-    /// backend is remote-only (Turso Cloud) and can't be exercised in CI; it
-    /// shares this exact orchestration + SQL, so the logic is covered by sqlite.
+    /// Build a fresh queue backed by a temp file (a per-op connection model
+    /// needs a real file, not `:memory:`).
     async fn queues() -> Vec<(&'static str, Arc<SqlJobQueue>, tempfile::TempDir)> {
         let mut out = Vec::new();
         for engine in ["sqlite"] {
@@ -1860,17 +1826,9 @@ mod tests {
         );
     }
 
-    // ---- Postgres / MySQL: exercised against a real server (env-gated) --------
-    //
-    // These need a live network DB, so they run only when RIPCLONE_TEST_PG_URL /
-    // RIPCLONE_TEST_MYSQL_URL is set (e.g. by scripts/test-queue-sql.sh against
-    // docker). They cover the dialect-sensitive paths: DDL,
-    // `$N` vs `?` placeholders, RETURNING vs last_insert_id, coalescing (partial
-    // index on pg, best-effort on mysql), the conditional-UPDATE claim, and
-    // status/error reads. Single test per engine → no intra-engine concurrency.
-
-    /// Full queue lifecycle on a fresh queue: enqueue, coalesce, distinct key,
-    /// claim ordering, ack done/failed, drain, and a fresh job after completion.
+    /// Full queue lifecycle helper: enqueue, coalesce, distinct key, claim
+    /// ordering, ack done/failed, drain, and a fresh job after completion.
+    #[allow(dead_code)]
     async fn exercise_core(q: &SqlJobQueue) {
         // Per-job credential: round-trips through this engine's INSERT + SELECT
         // decode, and the ack runs the finish UPDATE that clears it (the cleared
@@ -1928,54 +1886,6 @@ mod tests {
         let fresh = q.enqueue(job("o", "r", "main")).await.unwrap();
         assert_eq!(fresh.outcome, EnqueueOutcome::Enqueued);
         assert_ne!(fresh.job_id, Some(id));
-    }
-
-    #[tokio::test]
-    async fn postgres_queue_lifecycle() {
-        let Ok(url) = std::env::var("RIPCLONE_TEST_PG_URL") else {
-            eprintln!("SKIP postgres_queue_lifecycle: RIPCLONE_TEST_PG_URL unset");
-            return;
-        };
-        let pool = sqlx::postgres::PgPool::connect(&url)
-            .await
-            .expect("connect pg");
-        sqlx::query("DROP TABLE IF EXISTS jobs")
-            .execute(&pool)
-            .await
-            .expect("drop jobs");
-        pool.close().await;
-        let q = SqlJobQueue::new(Box::new(
-            crate::queue::postgres_db::PostgresDb::connect(&url)
-                .await
-                .unwrap(),
-        ))
-        .await
-        .unwrap();
-        exercise_core(&q).await;
-    }
-
-    #[tokio::test]
-    async fn mysql_queue_lifecycle() {
-        let Ok(url) = std::env::var("RIPCLONE_TEST_MYSQL_URL") else {
-            eprintln!("SKIP mysql_queue_lifecycle: RIPCLONE_TEST_MYSQL_URL unset");
-            return;
-        };
-        let pool = sqlx::mysql::MySqlPool::connect(&url)
-            .await
-            .expect("connect mysql");
-        sqlx::query("DROP TABLE IF EXISTS jobs")
-            .execute(&pool)
-            .await
-            .expect("drop jobs");
-        pool.close().await;
-        let q = SqlJobQueue::new(Box::new(
-            crate::queue::mysql_db::MysqlDb::connect(&url)
-                .await
-                .unwrap(),
-        ))
-        .await
-        .unwrap();
-        exercise_core(&q).await;
     }
 
     /// Two-class launch config: small ≤ 100 bytes, large catch-all.

@@ -1,7 +1,5 @@
-//! SQL-backed metadata store: makes the ref/metadata layer (`RefStore`)
-//! pluggable onto SQLite / Postgres / MySQL / libsql (Turso Cloud), so operators
-//! can keep ripclone's per-repo/branch `RefInfo` in a database they already run
-//! instead of files or S3.
+//! SQL-backed metadata store using SQLite. Legacy file and S3 ref stores remain
+//! separate rollback paths until normalized cutover.
 //!
 //! [`MetaDb`] is a tiny per-engine adapter that returns plain Rust types (no
 //! engine types leak); [`SqlRefStore`] holds one and implements the existing
@@ -16,14 +14,8 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use std::time::SystemTime;
 
-pub mod libsql;
-pub mod mysql;
-pub mod postgres;
 pub mod sqlite;
 
-pub use libsql::LibsqlMeta;
-pub use mysql::MysqlMeta;
-pub use postgres::PostgresMeta;
 pub use sqlite::SqliteMeta;
 
 /// One stored ref row, decoded to plain types.
@@ -39,7 +31,8 @@ pub struct RefRow {
 
 /// Per-engine adapter over a `refs(repo_key, branch, commit_id, synced_at,
 /// data)` table. `repo_key` is the repo's [`RepoId::storage_key`]. Implemented
-/// by `SqliteMeta`, `PostgresMeta`, `MysqlMeta`, `LibsqlMeta`.
+/// by `SqliteMeta`. It intentionally exposes plain domain types so a future
+/// adapter does not require changes to shared ref-store policy.
 #[async_trait]
 pub trait MetaDb: Send + Sync {
     /// Create the `refs` table if absent.
@@ -737,45 +730,5 @@ mod tests {
             store.load_build(&rid, "Z").await.unwrap().is_none(),
             "incomplete build must not be reused"
         );
-    }
-
-    #[tokio::test]
-    async fn postgres_refstore_lifecycle() {
-        let Ok(url) = std::env::var("RIPCLONE_TEST_PG_URL") else {
-            eprintln!("SKIP postgres_refstore_lifecycle: RIPCLONE_TEST_PG_URL unset");
-            return;
-        };
-        let pool = sqlx::postgres::PgPool::connect(&url)
-            .await
-            .expect("connect pg");
-        sqlx::query("DROP TABLE IF EXISTS refs")
-            .execute(&pool)
-            .await
-            .unwrap();
-        pool.close().await;
-        let store = SqlRefStore::new(Box::new(PostgresMeta::connect(&url).await.unwrap()))
-            .await
-            .unwrap();
-        exercise(&store).await;
-    }
-
-    #[tokio::test]
-    async fn mysql_refstore_lifecycle() {
-        let Ok(url) = std::env::var("RIPCLONE_TEST_MYSQL_URL") else {
-            eprintln!("SKIP mysql_refstore_lifecycle: RIPCLONE_TEST_MYSQL_URL unset");
-            return;
-        };
-        let pool = sqlx::mysql::MySqlPool::connect(&url)
-            .await
-            .expect("connect mysql");
-        sqlx::query("DROP TABLE IF EXISTS refs")
-            .execute(&pool)
-            .await
-            .unwrap();
-        pool.close().await;
-        let store = SqlRefStore::new(Box::new(MysqlMeta::connect(&url).await.unwrap()))
-            .await
-            .unwrap();
-        exercise(&store).await;
     }
 }

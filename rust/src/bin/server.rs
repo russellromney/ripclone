@@ -46,6 +46,7 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+    ripclone::backends::validate_database_configuration()?;
     let cas_dir = args.cas_dir.unwrap_or_else(default_cas_dir);
     let repo_root = args.repo_root.unwrap_or_else(default_repo_root);
     run_server(&cas_dir, &repo_root, &args.host, args.port).await

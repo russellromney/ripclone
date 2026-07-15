@@ -9,10 +9,8 @@
 //!
 //! Env:
 //! - `RIPCLONE_QUEUE` = `api` (token-only farm-out, no DB creds) | `sqlite`
-//!   (local file) | `postgres` | `mysql` (network db) | `libsql` (remote Turso
-//!   Cloud). The SQL kinds hold a direct DB connection (trusted single-box); the
-//!   SQL kinds' url comes from `RIPCLONE_QUEUE_DB_URL` (+ `RIPCLONE_QUEUE_DB_TOKEN`
-//!   for libsql). `api` holds **no** database credentials.
+//!   (local file). SQLite direct workers are trusted single-box processes and
+//!   read the path from `RIPCLONE_QUEUE_DB_URL`; `api` holds no DB credentials.
 //! - For `RIPCLONE_QUEUE=api`: `RIPCLONE_QUEUE_API_URL` (the server base URL that
 //!   serves `POST /v1/jobs/*`) + `RIPCLONE_METADATA_JOB_TOKEN` (the one signed,
 //!   expiring bearer token that authenticates claim/ack/heartbeat **and** the
@@ -156,6 +154,7 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+    backends::validate_database_configuration()?;
     std::fs::create_dir_all(&args.cas_dir)?;
     std::fs::create_dir_all(&args.repo_root)?;
 
@@ -184,7 +183,7 @@ async fn main() -> Result<()> {
         if !queue.supports_worker_registry() {
             bail!(
                 "RIPCLONE_WORKER_HEARTBEAT is set but RIPCLONE_QUEUE={} does not \
-                 support the workers registry (need sqlite or libsql; postgres/mysql lag)",
+                 support the workers registry (use RIPCLONE_QUEUE=sqlite)",
                 backends::queue_kind()
             );
         }

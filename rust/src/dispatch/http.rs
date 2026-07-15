@@ -151,7 +151,7 @@ mod tests {
         .unwrap();
 
         let mut env = BTreeMap::new();
-        env.insert("RIPCLONE_QUEUE".into(), "libsql".into());
+        env.insert("RIPCLONE_QUEUE".into(), "sqlite".into());
         let spec = WorkerSpec::new("large", env);
         provider.ensure_worker(&spec).await.unwrap();
 

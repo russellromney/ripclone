@@ -410,7 +410,7 @@ mod tests {
 
     fn spec() -> WorkerSpec {
         let mut env = BTreeMap::new();
-        env.insert("RIPCLONE_QUEUE".into(), "libsql".into());
+        env.insert("RIPCLONE_QUEUE".into(), "sqlite".into());
         WorkerSpec::new("small", env)
     }
 

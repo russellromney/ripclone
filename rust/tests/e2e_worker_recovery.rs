@@ -13,8 +13,7 @@ use common::*;
 use ripclone::provider::RepoId;
 use sqlx::Row;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -37,9 +36,6 @@ impl EnvGuard {
         unsafe { std::env::set_var(key, value.as_ref()) };
     }
 
-    fn remove(&self, key: &'static str) {
-        unsafe { std::env::remove_var(key) };
-    }
 }
 
 impl Drop for EnvGuard {
@@ -263,173 +259,6 @@ async fn worker_kill_mid_build_reclaims_sqlite_queue_sqlite_metadata() {
         .expect("add repo");
     recover_after_killed_worker_with_sqlite_queue(&queue_db, &server, "recover-sqlite", &want)
         .await;
-}
-
-fn sqld_available() -> bool {
-    Command::new("sqld")
-        .arg("--help")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-struct Proc(Child);
-impl Drop for Proc {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
-fn start_sqld(port: u16, data: &Path) -> Proc {
-    let proc = Proc(
-        Command::new("sqld")
-            .arg("--http-listen-addr")
-            .arg(format!("127.0.0.1:{port}"))
-            .arg("--db-path")
-            .arg(data)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn sqld"),
-    );
-    for _ in 0..200 {
-        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return proc;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    panic!("sqld did not become ready on port {port}");
-}
-
-async fn libsql_job_status(url: &str) -> Option<(String, i64)> {
-    let db = libsql::Builder::new_remote(url.to_string(), "dev".to_string())
-        .build()
-        .await
-        .expect("open libsql probe");
-    let conn = db.connect().expect("connect libsql probe");
-    let mut rows = conn
-        .query("SELECT status, attempts FROM jobs ORDER BY id LIMIT 1", ())
-        .await
-        .expect("query libsql job");
-    rows.next().await.expect("read libsql row").map(|r| {
-        (
-            r.get::<String>(0).expect("status"),
-            r.get::<i64>(1).expect("attempts"),
-        )
-    })
-}
-
-async fn wait_libsql_claimed(url: &str) {
-    for _ in 0..200 {
-        if let Some((status, attempts)) = libsql_job_status(url).await
-            && status == "claimed"
-            && attempts == 1
-        {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("worker never claimed libsql job");
-}
-
-async fn wait_libsql_done_after_reclaim(url: &str) {
-    for _ in 0..240 {
-        if let Some((status, attempts)) = libsql_job_status(url).await
-            && status == "done"
-            && attempts >= 2
-        {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    }
-    panic!(
-        "libsql job did not finish after reclaim; last={:?}",
-        libsql_job_status(url).await
-    );
-}
-
-#[tokio::test]
-async fn worker_kill_mid_build_reclaims_libsql_queue_and_metadata() {
-    // Fails if libsql-backed queue claims are not reclaimed after a worker dies
-    // during the observable archive-build phase, or if libsql metadata publishes
-    // a recovered ref whose bytes are not cloneable.
-    let _lock = ENV_LOCK.lock().await;
-    if !sqld_available() {
-        eprintln!("SKIP: sqld not installed; install it to run libsql recovery e2e");
-        return;
-    }
-    let keys = recovery_env_keys();
-    let env = EnvGuard::new(&keys);
-
-    let data = tempfile::tempdir().expect("sqld data dir");
-    let port = free_port();
-    let _sqld = start_sqld(port, data.path());
-    let url = format!("http://127.0.0.1:{port}");
-
-    env.set("RIPCLONE_QUEUE", "libsql");
-    env.set("RIPCLONE_QUEUE_DB_URL", &url);
-    env.set("RIPCLONE_QUEUE_DB_TOKEN", "dev");
-    env.set("RIPCLONE_QUEUE_STALE_SECS", "1");
-    env.set("RIPCLONE_QUEUE_MAX_ATTEMPTS", "4");
-    env.set("RIPCLONE_TEST_SYNC_MAX_ATTEMPTS", "40");
-    env.set("RIPCLONE_SYNC_WAIT_SECS", "120");
-    env.set("RIPCLONE_METADATA", "libsql");
-    env.set("RIPCLONE_METADATA_DB_URL", &url);
-    env.set("RIPCLONE_METADATA_DB_TOKEN", "dev");
-    env.set("RIPCLONE_TEST_ARCHIVE_DELAY_MS", DELAY_MS);
-    init(false);
-
-    let server = start_server().await;
-    let origin = make_origin("acme", "recover-libsql");
-    let want = origin.commit(&[("a.txt", "recovered\n")], "c1");
-    origin.publish();
-
-    let worker1 = spawn_worker(&server.cas_dir, &server.repo_root);
-    let client = server.client();
-    let sync_task =
-        tokio::spawn(async move { client.sync_repo("acme/recover-libsql", None).await });
-
-    wait_libsql_claimed(&url).await;
-    wait_archive_building(&server, "recover-libsql", &want).await;
-    worker1.kill_and_wait();
-
-    env.remove("RIPCLONE_TEST_ARCHIVE_DELAY_MS");
-    let _worker2 = spawn_worker(&server.cas_dir, &server.repo_root);
-
-    let resp = tokio::time::timeout(Duration::from_secs(180), sync_task)
-        .await
-        .expect("replacement libsql worker did not wake the sync waiter after reclaim")
-        .expect("sync task joined")
-        .expect("replacement libsql worker should finish the reclaimed job");
-    assert_eq!(resp.commit, want);
-    wait_libsql_done_after_reclaim(&url).await;
-
-    let (_g, c) = wait_repo_cloneable(&server, "acme", "recover-libsql", "1").await;
-    assert_eq!(read(&c, "a.txt"), "recovered\n");
-    assert!(git_ok(&c, &["fsck", "--connectivity-only", "HEAD"]));
-
-    wait_archive_settled(&server, "recover-libsql", &want).await;
-    let (_fg, files) = clone_only(
-        &server,
-        "acme",
-        "recover-libsql",
-        0,
-        ripclone::mode::CloneMode::Files,
-    )
-    .await
-    .expect("files clone after recovered libsql archive build");
-    assert_eq!(read(&files, "a.txt"), "recovered\n");
 }
 
 #[derive(Clone)]

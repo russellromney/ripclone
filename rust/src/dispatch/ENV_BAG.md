@@ -48,10 +48,9 @@ lane name such as `small` or `large`), not an env var.
 
 | Category | Env var | Required | Default | Purpose |
 |----------|---------|----------|---------|---------|
-| **Queue (claim)** | `RIPCLONE_QUEUE` | Yes | `local` | Queue backend. Token-only farm-out uses `api`; direct single-box uses `sqlite`/`postgres`/`mysql`/`libsql`. |
+| **Queue (claim)** | `RIPCLONE_QUEUE` | Yes | `local` | Queue backend. Token-only farm-out uses `api`; direct single-box uses `sqlite`. |
 | | `RIPCLONE_QUEUE_API_URL` | Yes, when `RIPCLONE_QUEUE=api` | — | Server base URL serving `POST /v1/jobs/*`. No DB creds on the worker. |
 | | `RIPCLONE_QUEUE_DB_URL` | Yes, when `RIPCLONE_QUEUE` is SQL (direct, single-box) | — | DB path/URL for SQL queues. **Never set on a farm-out worker.** |
-| | `RIPCLONE_QUEUE_DB_TOKEN` | Yes, when `RIPCLONE_QUEUE=libsql` (direct) | — | Auth token for remote libsql queue. **Never set on a farm-out worker.** |
 | **Storage (upload)** | `RIPCLONE_S3_ENDPOINT` | Yes, for S3 | — | S3-compatible endpoint. Also accepts `AWS_ENDPOINT_URL_S3`. |
 | | `RIPCLONE_S3_REGION` | No | `us-east-1` | S3 region. Also accepts `AWS_REGION`. |
 | | `RIPCLONE_S3_BUCKET` | Yes, for S3 | — | Target bucket. Also accepts `BUCKET_NAME`. |
@@ -60,9 +59,8 @@ lane name such as `small` or `large`), not an env var.
 | | `AWS_ACCESS_KEY_ID` | Yes, for S3 | — | S3 access key. |
 | | `AWS_SECRET_ACCESS_KEY` | Yes, for S3 | — | S3 secret key. |
 | | `AWS_SESSION_TOKEN` | No | — | Optional temporary S3 session token. |
-| **Metadata target** (direct DB — single-box self-host only) | `RIPCLONE_METADATA` | No | `file` (follows storage) | Metadata backend: `file` \| `s3` \| `sqlite` \| `postgres` \| `mysql` \| `libsql` \| `api`. Farm-out uses `api` (no DB creds); direct SQL is single-box only. |
+| **Metadata target** (direct DB — single-box self-host only) | `RIPCLONE_METADATA` | No | `file` (follows storage) | Metadata backend: `file` \| `s3` \| `sqlite` \| `api`. Farm-out uses `api` (no DB creds); direct SQLite is single-box only. |
 | | `RIPCLONE_METADATA_DB_URL` | Yes, when `RIPCLONE_METADATA` is SQL (direct) | — | DB path/URL for SQL metadata. **Never set on a farm-out worker.** |
-| | `RIPCLONE_METADATA_DB_TOKEN` | Yes, when `RIPCLONE_METADATA=libsql` (direct) | — | Auth token for remote libsql metadata. **Never set on a farm-out worker.** |
 | **Metadata target** (`api` — token-only farm-out) | `RIPCLONE_METADATA_REPORT_URL` | Yes, when `RIPCLONE_METADATA=api` | — | Absolute `http(s)` URL of the server's `POST /v1/refs` report endpoint. Missing → worker fails at startup. |
 | | `RIPCLONE_METADATA_JOB_TOKEN` | Yes, when `RIPCLONE_QUEUE=api` or `RIPCLONE_METADATA=api` | — | The **one** signed, expiring HMAC bearer (`rcjt1.…`) for all four endpoints (claim/ack/heartbeat/refs); no repo or job scope. Operator-provisioned (`ripclone mint-worker-token`, default 90d) — a Fly machine secret, or forwarded by the dispatcher for exec/http. Sent as `Authorization: Bearer …`. Missing → worker fails at startup. Malformed/expired/wrong-secret → 401, no state change; the worker exits cleanly for respawn. |
 | **Upstream-credential source** | `RIPCLONE_PROVIDERS` | One source required | — | JSON provider registry; supplies instance tokens and auth templates. |
@@ -85,7 +83,7 @@ follows storage (`s3` if S3 storage is configured, else `file`) — `file` only
 works when every worker shares the server's filesystem, so farm-out deploys
 must set `RIPCLONE_METADATA` explicitly. Token-only farm-out sets
 `RIPCLONE_METADATA=api` (+ `RIPCLONE_QUEUE=api`); single-box self-host may use a
-direct SQL backend (`sqlite`/`postgres`/`mysql`/`libsql`). If no upstream
+direct SQLite backend. If no upstream
 credential source is configured, anonymous upstream clones are attempted.
 
 ## Provider checklist
@@ -99,9 +97,9 @@ Before starting a worker, a provider must set:
      `RIPCLONE_QUEUE_API_URL` + `RIPCLONE_METADATA=api` +
      `RIPCLONE_METADATA_REPORT_URL` + `RIPCLONE_METADATA_JOB_TOKEN`. No
      `*_DB_URL` / `*_DB_TOKEN` — workers hold zero DB creds.
-   - **Single-box direct SQL (trusted):** `RIPCLONE_QUEUE=sqlite|…` +
-     `RIPCLONE_QUEUE_DB_URL` + `RIPCLONE_METADATA=sqlite|…` +
-     `RIPCLONE_METADATA_DB_URL` (+ `*_DB_TOKEN` for libsql).
+   - **Single-box direct SQLite (trusted):** `RIPCLONE_QUEUE=sqlite` +
+     `RIPCLONE_QUEUE_DB_URL` + `RIPCLONE_METADATA=sqlite` +
+     `RIPCLONE_METADATA_DB_URL`.
 4. One upstream-credential source (`RIPCLONE_PROVIDERS`, `RIPCLONE_GITHUB_TOKEN`,
    or GitHub App vars).
 5. Optional: `RIPCLONE_MAX_SIZE_CLASS` and lifecycle flags.

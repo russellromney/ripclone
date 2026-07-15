@@ -39,13 +39,16 @@ url = "/tmp/ripclone-config-test-meta.db"
     );
 
     // Env always wins over the file.
-    unsafe { std::env::set_var("RIPCLONE_QUEUE", "postgres") };
-    assert_eq!(backends::queue_kind(), "postgres");
+    unsafe { std::env::set_var("RIPCLONE_QUEUE", "sqlite") };
+    assert_eq!(backends::queue_kind(), "sqlite");
 
     unsafe {
-        std::env::set_var("RIPCLONE_QUEUE_DB_URL", "postgres://override/db");
+        std::env::set_var("RIPCLONE_QUEUE_DB_URL", "/tmp/ripclone-override.db");
     }
-    assert_eq!(backends::queue_db_url().unwrap(), "postgres://override/db");
+    assert_eq!(
+        backends::queue_db_url().unwrap(),
+        "/tmp/ripclone-override.db"
+    );
 
     unsafe {
         std::env::remove_var("RIPCLONE_QUEUE");
