@@ -44,11 +44,6 @@ BINS=(ripclone ripclone-server ripclone-worker ripclone-dispatcher git-remote-ri
 
 TESTS=(
   e2e_gitea_provider
-  e2e_worker_postgres
-  e2e_worker_mysql
-  e2e_metadata_postgres
-  e2e_metadata_mysql
-  e2e_worker_libsql
   e2e_remote_gc_s3
 )
 

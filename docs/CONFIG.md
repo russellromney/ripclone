@@ -38,9 +38,8 @@ Internal tuning knobs use code constants at their current defaults.
   clients and self-hosted servers.
 - `RIPCLONE_S3_ENDPOINT`, `RIPCLONE_S3_REGION`, `RIPCLONE_S3_BUCKET`,
   `RIPCLONE_S3_PREFIX`, `RIPCLONE_S3_CACHE_DIR` - object storage backend.
-- `RIPCLONE_METADATA`, `RIPCLONE_METADATA_DB_URL`,
-  `RIPCLONE_METADATA_DB_TOKEN` - metadata/ref-store backend.
-- `RIPCLONE_QUEUE`, `RIPCLONE_QUEUE_DB_URL`, `RIPCLONE_QUEUE_DB_TOKEN` - build
+- `RIPCLONE_METADATA`, `RIPCLONE_METADATA_DB_URL` - metadata/ref-store backend.
+- `RIPCLONE_QUEUE`, `RIPCLONE_QUEUE_DB_URL` - build
   queue backend.
 - `RIPCLONE_SIZE_CLASSES` - JSON array of size classes for the SQL queue claim
   filter (overrides `[[queue.size_classes]]` in config.toml). Each entry:

@@ -1,5 +1,13 @@
 # Changelog
 
+## SQLite-only database compatibility notice
+
+SQLite is the only supported database. MySQL, PostgreSQL, and libSQL/sqld state
+is not readable by the new binary, and there is no automatic migration. Retain
+the old binary and its data for rollback or start with SQLite using
+[`BACKENDS.md`](BACKENDS.md). Mentions of removed databases below are historical
+release notes, not current support claims.
+
 This file tracks what has already landed in ripclone. For upcoming work see `internal/ROADMAP.md`.
 
 ## Worker heartbeat / registry (D3)

@@ -57,8 +57,10 @@ export GIT_CONFIG_GLOBAL="$GITCONFIG"
 PORT=$(( 20000 + RANDOM % 40000 ))
 SERVER_URL="http://127.0.0.1:$PORT"
 SERVER_PID=""
+WORKER_PID=""
 
 cleanup() {
+  [ -n "$WORKER_PID" ] && kill "$WORKER_PID" 2>/dev/null || true
   [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null || true
   rm -rf "$BASE_DIR"
 }
@@ -92,6 +94,11 @@ publish() { # work_dir owner repo
 }
 
 start_server() {
+  if [ -n "$WORKER_PID" ]; then
+    kill "$WORKER_PID" 2>/dev/null || true
+    wait "$WORKER_PID" 2>/dev/null || true
+    WORKER_PID=""
+  fi
   # Fully reap any previous server and bind a fresh port. Reusing the same port
   # right after killing the old process races the OS releasing it ("Address
   # already in use"), e.g. on the LSM restart below.
@@ -106,7 +113,28 @@ start_server() {
     --host 127.0.0.1 --port "$PORT" >"$BASE_DIR/server.log" 2>&1 &
   SERVER_PID=$!
   for _ in $(seq 1 200); do
-    if curl -fsS -o /dev/null "$SERVER_URL/readyz" 2>/dev/null; then return 0; fi
+    if curl -fsS -o /dev/null "$SERVER_URL/readyz" 2>/dev/null; then
+      case "${RIPCLONE_E2E_START_WORKER:-}" in
+        direct)
+          "$BIN_DIR/ripclone-worker" --cas-dir "$CAS_DIR" --repo-root "$BASE_DIR/worker-repos" \
+            --idle-poll-ms 50 >"$BASE_DIR/worker.log" 2>&1 &
+          WORKER_PID=$!
+          ;;
+        api)
+          job_token="$("$CLI_BIN" mint-worker-token --ttl-days 1)"
+          env -u RIPCLONE_QUEUE_DB_URL -u RIPCLONE_METADATA_DB_URL \
+            RIPCLONE_QUEUE=api RIPCLONE_QUEUE_API_URL="$SERVER_URL" \
+            RIPCLONE_METADATA=api RIPCLONE_METADATA_REPORT_URL="$SERVER_URL/v1/refs" \
+            RIPCLONE_METADATA_JOB_TOKEN="$job_token" \
+            "$BIN_DIR/ripclone-worker" --cas-dir "$CAS_DIR" --repo-root "$BASE_DIR/api-worker-repos" \
+              --idle-poll-ms 50 >"$BASE_DIR/worker.log" 2>&1 &
+          WORKER_PID=$!
+          ;;
+        "") ;;
+        *) fail "unknown RIPCLONE_E2E_START_WORKER=${RIPCLONE_E2E_START_WORKER}" ;;
+      esac
+      return 0
+    fi
     if ! kill -0 "$SERVER_PID" 2>/dev/null; then cat "$BASE_DIR/server.log"; fail "server died"; fi
     sleep 0.1
   done
@@ -195,6 +223,11 @@ sync_repo acme files
 clone_repo acme files "$BASE_DIR/c-files" --mode files
 assert_file "$BASE_DIR/c-files" only.txt "hello"
 pass "files mode materialized worktree"
+
+if [ "${RIPCLONE_E2E_SMOKE:-0}" = 1 ]; then
+  echo "E2E COMPOSITION SMOKE PASSED"
+  exit 0
+fi
 
 # === special files: symlink + executable bit ==================================
 echo "==> symlinks + exec bits"

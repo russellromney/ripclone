@@ -70,28 +70,6 @@ gitea() {
   fi
 }
 
-# Real network databases for the queue + metadata adapters the default suite can
-# only compile-check: Postgres + MySQL via throwaway docker containers, and
-# libsql against a local `sqld`. Needs docker; the libsql leg also needs `sqld`
-# on PATH (the test auto-skips without it).
-databases() {
-  export CARGO_PROFILE="${CARGO_PROFILE:-ci}"
-  bash "$ROOT/scripts/test-queue-sql.sh"
-  if [ -n "${CI_ARTIFACTS:-}" ]; then
-    local bin="$CI_ARTIFACTS/e2e_worker_libsql"
-    [ -x "$bin" ] || { echo "error: missing $bin" >&2; exit 1; }
-    echo "databases: running prebuilt $bin"
-    ( cd "$ROOT/rust" && "$bin" --nocapture )
-    local lib_bin="$CI_ARTIFACTS/ripclone-lib-tests"
-    [ -x "$lib_bin" ] || { echo "error: missing $lib_bin" >&2; exit 1; }
-    echo "databases: running required normalized libsql scheduler conformance"
-    ( cd "$ROOT/rust" && RIPCLONE_REQUIRE_SQLD_TESTS=1 "$lib_bin" artifact_scheduler_libsql::tests --nocapture )
-  else
-    ( cd "$ROOT/rust" && cargo test --profile "$CARGO_PROFILE" --locked --test e2e_worker_libsql -- --nocapture )
-    ( cd "$ROOT/rust" && RIPCLONE_REQUIRE_SQLD_TESTS=1 cargo test --profile "$CARGO_PROFILE" --locked --lib artifact_scheduler_libsql::tests -- --nocapture )
-  fi
-}
-
 # Benchmark-harness smoke test. The benchmark scripts talk to the server over
 # raw HTTP, so a change to the server's contract (like the B5 added-repos gate)
 # does not recompile them — it silently breaks the harness against the next
@@ -112,7 +90,7 @@ benchmark() {
 }
 
 # Compile-once fan-out: product bins + integration tests for
-# gitea/databases/docker/e2e/benchmark/s3gc. See scripts/ci-build-artifacts.sh.
+# gitea/docker/e2e/benchmark/s3gc. See scripts/ci-build-artifacts.sh.
 ci_build() {
   bash "$ROOT/scripts/ci-build-artifacts.sh"
 }
@@ -162,7 +140,6 @@ case "$STAGE" in
   test) run_tests ;;
   e2e) e2e ;;
   flake) flake ;;
-  databases) databases ;;
   ci-build|s3gc-build) ci_build ;;
   # Pass through any remaining args (e.g. a single test name for sharding).
   # Without this, `scripts/ci.sh s3gc some_test` ignored the name and every
@@ -171,7 +148,7 @@ case "$STAGE" in
   gitea) gitea ;;
   benchmark) benchmark ;;
   all) lint; run_tests; e2e ;;
-  *) echo "usage: scripts/ci.sh [lint|test|e2e|flake|databases|ci-build|s3gc|gitea|benchmark|all]" >&2; exit 2 ;;
+  *) echo "usage: scripts/ci.sh [lint|test|e2e|flake|ci-build|s3gc|gitea|benchmark|all]" >&2; exit 2 ;;
 esac
 
 echo "ci.sh: stage '$STAGE' OK"

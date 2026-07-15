@@ -20,7 +20,8 @@ identical no matter which backend you pick. Set it with `RIPCLONE_QUEUE` (see
 | Backend | When | Workers |
 |---|---|---|
 | `local` (in-process) | single binary, no extra infra | the server's own in-process worker |
-| SQL (`sqlite` / `libsql` / Postgres / MySQL) | scale out across machines | run N `ripclone-worker` processes against the shared queue |
+| SQLite (direct) | scale up on one trusted host | run N `ripclone-worker` processes sharing the SQLite queue file |
+| Authenticated API | scale out across machines | remote workers claim over HTTP with no database credentials |
 
 Coalescing means at most one active job per `owner/repo/branch`, and a worker
 drains everything it can claim, so a burst of pushes needs few workers.
