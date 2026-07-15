@@ -27,6 +27,10 @@ export RIPCLONE_SERVER_TOKEN="${RIPCLONE_SERVER_TOKEN:-e2e-local-token}"
 # reach this file:// origin. This is a single-tenant local e2e, so use the
 # documented trust-mode escape hatch (the shared token is the only auth here).
 export RIPCLONE_TRUST_GATEWAY=1
+# API workers poll the same loopback address as the CLI. Keep the fixture's
+# credential-isolation traffic from exhausting the production-default bucket.
+export RIPCLONE_RATE_LIMIT_BURST="${RIPCLONE_RATE_LIMIT_BURST:-100000}"
+export RIPCLONE_RATE_LIMIT_PER_SEC="${RIPCLONE_RATE_LIMIT_PER_SEC:-100000}"
 sha256() { if command -v sha256sum >/dev/null; then sha256sum | awk '{print $1}'; else shasum -a 256 | awk '{print $1}'; fi; }
 TOKEN_HASH=$(printf '%s' "$RIPCLONE_SERVER_TOKEN" | sha256)
 
