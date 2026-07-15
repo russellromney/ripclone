@@ -73,7 +73,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.10
       # Reads the pinned channel + components from rust-toolchain.toml; caches the
       # cargo registry + target/ (keyed by Cargo.lock). cache-workspaces -> rust/.
       - uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -99,7 +99,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.10
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           cache-workspaces: rust
@@ -129,7 +129,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.10
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           cache-workspaces: rust
@@ -426,7 +426,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.10
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           cache-workspaces: rust
@@ -435,7 +435,7 @@ jobs:
         run: bash scripts/install-build-deps.sh
       # Zig is ~100MB; cache the venv so we do not re-download every run.
       - name: Cache cargo-zigbuild + zig
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.zigbuild
           key: zigbuild-0.15.2-${{ runner.os }}
