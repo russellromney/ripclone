@@ -35,7 +35,6 @@ impl EnvGuard {
     fn set(&self, key: &'static str, value: impl AsRef<str>) {
         unsafe { std::env::set_var(key, value.as_ref()) };
     }
-
 }
 
 impl Drop for EnvGuard {

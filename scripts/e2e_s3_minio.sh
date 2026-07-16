@@ -24,10 +24,13 @@ for bin in "$SERVER" "$CLI"; do
 done
 
 cleanup() {
+  local status=$?
   if [ -n "$WORKER_PID" ]; then kill "$WORKER_PID" 2>/dev/null || true; wait "$WORKER_PID" 2>/dev/null || true; fi
   if [ -n "$SERVER_PID" ]; then kill "$SERVER_PID" 2>/dev/null || true; wait "$SERVER_PID" 2>/dev/null || true; fi
   docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
   rm -rf "$BASE"
+  trap - EXIT
+  exit "$status"
 }
 trap cleanup EXIT
 
@@ -52,7 +55,8 @@ aws --endpoint-url "$ENDPOINT" s3api create-bucket --bucket "$BUCKET" >/dev/null
 ORIGINS="$BASE/origins"
 mkdir -p "$ORIGINS/acme"
 make_origin() {
-  local repo="$1" value="$2" work="$BASE/work-$repo" bare="$ORIGINS/acme/$repo.git"
+  local repo="$1" value="$2"
+  local work="$BASE/work-$repo" bare="$ORIGINS/acme/$repo.git"
   git init -q -b main "$work"
   git -C "$work" config user.email test@example.com
   git -C "$work" config user.name Test

@@ -522,7 +522,14 @@ mod tests {
     fn artifact_scheduler_selection_is_explicit_sql_only() {
         assert!(validate_scheduler_metadata_selection("sqlite").is_ok());
         for kind in [
-            "", "file", "s3", "api", "LOCAL", " sqlite", "network-db", "bogus",
+            "",
+            "file",
+            "s3",
+            "api",
+            "LOCAL",
+            " sqlite",
+            "network-db",
+            "bogus",
         ] {
             let error = validate_scheduler_metadata_selection(kind)
                 .expect_err("unsafe or malformed selection must fail closed")
