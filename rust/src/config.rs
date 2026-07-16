@@ -97,7 +97,7 @@ pub struct StorageConfig {
 
 /// Server-side metadata (ref) store. `RIPCLONE_METADATA*` env vars override.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct MetadataConfig {
     /// `file` | `s3` | `sqlite` | `api`.
     /// Unset follows storage (s3 if configured, else file). `api` is worker-only
@@ -109,7 +109,7 @@ pub struct MetadataConfig {
 
 /// Server-side build queue. `RIPCLONE_QUEUE*` env vars override.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct QueueConfig {
     /// `local` | `sqlite`. Unset = `local`.
     pub backend: Option<String>,

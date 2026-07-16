@@ -52,11 +52,47 @@ fn env_or(key: &str, cfg_val: Option<&str>) -> Option<String> {
 }
 
 const REMOVED_DATABASE_BACKENDS: &[&str] = &["mysql", "postgres", "postgresql", "libsql", "sqld"];
+const REMOVED_DATABASE_URL_SCHEMES: &[&str] = &[
+    "mysql",
+    "postgres",
+    "postgresql",
+    "libsql",
+    "sqld",
+    "http",
+    "https",
+];
 
 fn reject_removed_database_backend(selector: &str, value: &str) -> Result<()> {
     if REMOVED_DATABASE_BACKENDS.contains(&value) {
         anyhow::bail!(
             "unsupported {selector} database backend {value:?}: SQLite is the only supported database"
+        )
+    }
+    Ok(())
+}
+
+fn reject_removed_database_url(selector: &str, backend: &str, url: Option<&str>) -> Result<()> {
+    // Authenticated API workers deliberately receive direct-database decoys in
+    // isolation tests. They consume only API URLs and the job token.
+    if backend == "api" {
+        return Ok(());
+    }
+    let Some((scheme, _)) = url.and_then(|value| value.trim().split_once(':')) else {
+        return Ok(());
+    };
+    let scheme = scheme.to_ascii_lowercase();
+    if REMOVED_DATABASE_URL_SCHEMES.contains(&scheme.as_str()) {
+        anyhow::bail!(
+            "unsupported {selector} database URL scheme {scheme:?}: SQLite is the only supported database"
+        )
+    }
+    Ok(())
+}
+
+fn reject_removed_database_token(selector: &str, backend: &str, key: &str) -> Result<()> {
+    if backend != "api" && std::env::var_os(key).is_some_and(|value| !value.is_empty()) {
+        anyhow::bail!(
+            "unsupported stale {key} for {selector}: database tokens were removed; SQLite uses no database token"
         )
     }
     Ok(())
@@ -71,6 +107,18 @@ pub fn validate_database_configuration() -> Result<()> {
         .unwrap_or_else(|| "local".to_string());
     reject_removed_database_backend("metadata", &metadata)?;
     reject_removed_database_backend("queue", &queue)?;
+    reject_removed_database_url(
+        "metadata",
+        &metadata,
+        env_or("RIPCLONE_METADATA_DB_URL", config().metadata.url.as_deref()).as_deref(),
+    )?;
+    reject_removed_database_url(
+        "queue",
+        &queue,
+        env_or("RIPCLONE_QUEUE_DB_URL", config().queue.url.as_deref()).as_deref(),
+    )?;
+    reject_removed_database_token("metadata", &metadata, "RIPCLONE_METADATA_DB_TOKEN")?;
+    reject_removed_database_token("queue", &queue, "RIPCLONE_QUEUE_DB_TOKEN")?;
     Ok(())
 }
 
