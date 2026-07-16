@@ -360,11 +360,11 @@ impl BoundInstall {
         #[cfg(target_os = "linux")]
         {
             let previous = INSTALL_STAGING_FD.with(|slot| slot.replace(Some(staging.as_raw_fd())));
-            return Ok(StagingScope {
-                staging,
+            Ok(StagingScope {
+                _staging: staging,
                 previous,
                 restored: false,
-            });
+            })
         }
         #[cfg(target_os = "macos")]
         {
@@ -468,7 +468,8 @@ impl BoundInstall {
 
 #[cfg(target_os = "linux")]
 pub(crate) struct StagingScope {
-    staging: OwnedFd,
+    // Keep the staging directory capability alive for the scope lifetime.
+    _staging: OwnedFd,
     previous: Option<libc::c_int>,
     restored: bool,
 }
@@ -717,13 +718,23 @@ fn validate_publication_parent(stat: &libc::stat, expected: Option<&BoundInstall
         bail!("clone destination parent is writable by another OS principal")
     }
     if let Some(expected) = expected
-        && (stat.st_dev as u64 != expected.parent_dev
+        && (device_id(stat) != expected.parent_dev
             || stat.st_ino != expected.parent_ino
             || stat.st_uid != expected.parent_uid)
     {
         bail!("clone destination parent capability changed during installation")
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn device_id(stat: &libc::stat) -> u64 {
+    stat.st_dev
+}
+
+#[cfg(target_os = "macos")]
+fn device_id(stat: &libc::stat) -> u64 {
+    stat.st_dev as u64
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
