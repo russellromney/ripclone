@@ -972,7 +972,9 @@ fn classify_credential_failure(error: anyhow::Error) -> ProviderFailure {
 fn classify_git_failure(operation: &str, stderr: &[u8]) -> ProviderFailure {
     let detail = String::from_utf8_lossy(stderr).to_ascii_lowercase();
     let kind = if detail.contains("rate limit")
-        || detail.contains("429")
+        || detail
+            .split(|character: char| !character.is_ascii_alphanumeric())
+            .any(|token| token == "429")
         || detail.contains("too many requests")
     {
         ProviderFailureKind::RateLimited
@@ -2056,6 +2058,11 @@ mod tests {
             ),
             (
                 "couldn't find remote ref",
+                ProviderFailureKind::RefNotFound,
+                FailureClass::Permanent,
+            ),
+            (
+                "fatal: remote error: upload-pack: not our ref dead429beef",
                 ProviderFailureKind::RefNotFound,
                 FailureClass::Permanent,
             ),
