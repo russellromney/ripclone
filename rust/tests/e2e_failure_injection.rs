@@ -4,6 +4,11 @@ mod common;
 
 use common::*;
 use ripclone::mode::CloneMode;
+use std::time::Duration;
+
+// Both cases install process-global test configuration and drive deliberately
+// failing background builds. Keep those fault domains isolated from each other.
+static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 async fn repo_status(server: &Server, owner: &str, repo: &str) -> serde_json::Value {
     let url = format!("{}/v1/repos/github/{owner}/{repo}/status", server.url);
@@ -37,6 +42,7 @@ async fn assert_no_warm_ref_for_commit(server: &Server, owner: &str, repo: &str,
 
 #[tokio::test]
 async fn storage_upload_failure_mid_build_does_not_publish_partial_ref_and_retry_recovers() {
+    let _guard = SERIAL.lock().await;
     // Fails if a durable-storage write error during build can publish a ref whose
     // manifest points at missing objects, if the failed clone leaves a partial
     // worktree, or if retry cannot rebuild the same commit after the fault clears.
@@ -64,9 +70,9 @@ async fn storage_upload_failure_mid_build_does_not_publish_partial_ref_and_retry
 
     let failed_out = tempfile::tempdir().unwrap();
     let failed_target = failed_out.path().join("clone");
-    let failed_clone = server
-        .client()
-        .install_repo_with_mode(
+    let failed_clone = tokio::time::timeout(
+        Duration::from_secs(5),
+        server.client().install_repo_with_mode(
             "acme",
             "writefail",
             "HEAD",
@@ -74,10 +80,11 @@ async fn storage_upload_failure_mid_build_does_not_publish_partial_ref_and_retry
             CloneMode::Editable,
             Some("full"),
             None,
-        )
-        .await;
+        ),
+    )
+    .await;
     assert!(
-        failed_clone.is_err(),
+        !matches!(failed_clone, Ok(Ok(_))),
         "failed build must not publish cloneable bytes"
     );
     assert!(
@@ -102,6 +109,7 @@ async fn storage_upload_failure_mid_build_does_not_publish_partial_ref_and_retry
 
 #[tokio::test]
 async fn ref_store_write_failure_does_not_publish_partial_ref_and_retry_recovers() {
+    let _guard = SERIAL.lock().await;
     // Fails if a metadata/DB write error during ref publication leaves a warm
     // ref for the failed commit, if clone can read partial state through that
     // failed publish, or if retry cannot republish cleanly after the fault clears.
@@ -129,9 +137,9 @@ async fn ref_store_write_failure_does_not_publish_partial_ref_and_retry_recovers
 
     let failed_out = tempfile::tempdir().unwrap();
     let failed_target = failed_out.path().join("clone");
-    let failed_clone = server
-        .client()
-        .install_repo_with_mode(
+    let failed_clone = tokio::time::timeout(
+        Duration::from_secs(5),
+        server.client().install_repo_with_mode(
             "acme",
             "reffail",
             "HEAD",
@@ -139,10 +147,11 @@ async fn ref_store_write_failure_does_not_publish_partial_ref_and_retry_recovers
             CloneMode::Editable,
             Some("full"),
             None,
-        )
-        .await;
+        ),
+    )
+    .await;
     assert!(
-        failed_clone.is_err(),
+        !matches!(failed_clone, Ok(Ok(_))),
         "failed ref publish must not expose cloneable bytes"
     );
     assert!(

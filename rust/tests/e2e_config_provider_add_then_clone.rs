@@ -69,7 +69,6 @@ async fn provider_add_then_config_driven_clone() {
     }
 
     let project = tempfile::tempdir().unwrap();
-    write_project_config(project.path());
     let bin = ripclone_bin();
 
     // Add the provider via the CLI before starting the server, so the server
@@ -100,6 +99,10 @@ async fn provider_add_then_config_driven_clone() {
         String::from_utf8_lossy(&add_out.stdout),
         String::from_utf8_lossy(&add_out.stderr)
     );
+    // Do not select the provider before `provider add` has created it. Loading
+    // that project config during the add command would fail on the intentionally
+    // not-yet-configured selection instead of exercising provider creation.
+    write_project_config(project.path());
 
     let server = start_server().await;
 

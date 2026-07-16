@@ -227,7 +227,8 @@ done
         // Fire-and-forget: wait until the short-lived recorder has flushed
         // both files. The argv file is written first, so its existence alone
         // does not prove the following environment snapshot is complete.
-        for _ in 0..50 {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
             let argv_ready = std::fs::metadata(&out)
                 .map(|m| m.len() > 0)
                 .unwrap_or(false);
@@ -240,6 +241,10 @@ done
             if argv_ready && env_ready {
                 break;
             }
+            assert!(
+                Instant::now() < deadline,
+                "recorder child did not flush argv and environment within 10s"
+            );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
 

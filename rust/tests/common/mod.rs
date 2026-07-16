@@ -307,11 +307,15 @@ async fn start_server_split_storage_inner(
         while let Some(job) = rx.recv().await {
             let state = worker_state.clone();
             tokio::spawn(async move {
+                // Must match server::inproc_build_key exactly. This helper owns
+                // a fault-injecting local worker loop instead of the production
+                // spawner, so waiter identity cannot be shared directly.
                 let key = format!(
-                    "{}/{}#{}",
+                    "{}/{}#{}/admission:{}",
                     job.repo_id.storage_key(),
                     job.branch,
-                    job.rev.as_deref().unwrap_or("")
+                    job.rev.as_deref().unwrap_or(""),
+                    job.initialization_attempt_id.as_deref().unwrap_or("")
                 );
                 let st = state.clone();
                 let result = match tokio::spawn(async move {
