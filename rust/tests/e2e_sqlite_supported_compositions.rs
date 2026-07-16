@@ -8,6 +8,17 @@ fn repo_root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap()
 }
 
+fn product_bin_dir() -> std::path::PathBuf {
+    std::env::var_os("RIPCLONE_BIN_DIR")
+        .map(Into::into)
+        .unwrap_or_else(|| {
+            Path::new(env!("CARGO_BIN_EXE_ripclone-server"))
+                .parent()
+                .expect("Cargo product binary directory")
+                .to_path_buf()
+        })
+}
+
 fn run_local_row(name: &str, worker: Option<&str>, metadata: &str, queue: &str) {
     let tmp = tempfile::tempdir().unwrap();
     let output = Command::new("bash")
@@ -15,15 +26,7 @@ fn run_local_row(name: &str, worker: Option<&str>, metadata: &str, queue: &str) 
         .env_clear()
         .env("PATH", std::env::var("PATH").unwrap())
         .env("HOME", tmp.path())
-        .env(
-            "RIPCLONE_BIN_DIR",
-            std::env::var("RIPCLONE_BIN_DIR").unwrap_or_else(|_| {
-                repo_root()
-                    .join("rust/target/release")
-                    .display()
-                    .to_string()
-            }),
-        )
+        .env("RIPCLONE_BIN_DIR", product_bin_dir())
         .env("RIPCLONE_E2E_SMOKE", "1")
         .env("RIPCLONE_METADATA", metadata)
         .env("RIPCLONE_METADATA_DB_URL", tmp.path().join("metadata.db"))
@@ -90,15 +93,7 @@ async fn every_supported_composition_row_is_executed() {
     let output = Command::new("bash")
         .arg(repo_root().join("scripts/e2e_s3_minio.sh"))
         .env("RIPCLONE_REQUIRE_MINIO", "1")
-        .env(
-            "RIPCLONE_BIN_DIR",
-            std::env::var("RIPCLONE_BIN_DIR").unwrap_or_else(|_| {
-                repo_root()
-                    .join("rust/target/release")
-                    .display()
-                    .to_string()
-            }),
-        )
+        .env("RIPCLONE_BIN_DIR", product_bin_dir())
         .output()
         .unwrap();
     assert!(

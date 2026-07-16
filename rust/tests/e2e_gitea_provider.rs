@@ -343,6 +343,8 @@ async fn gitea_server_side_token_end_to_end() {
                 clone_dir.to_str().unwrap(),
                 "--mode",
                 "editable",
+                "--depth",
+                "1",
                 "--verify-upstream",
                 "never",
                 "--no-metrics",
@@ -364,6 +366,69 @@ async fn gitea_server_side_token_end_to_end() {
     assert_eq!(
         std::fs::read_to_string(clone_dir.join("hello.txt")).unwrap(),
         "server-side token works\n"
+    );
+    assert!(
+        clone_dir.join(".git/shallow").exists(),
+        "Head clone must retain shallow semantics"
+    );
+
+    let full_dir = cwd.join("clone-full");
+    assert_ripclone_ok(
+        &ripclone(
+            &config_path,
+            &server.url,
+            cwd,
+            &[
+                "clone",
+                &repo_arg,
+                full_dir.to_str().unwrap(),
+                "--mode",
+                "editable",
+                "--depth",
+                "0",
+                "--verify-upstream",
+                "never",
+                "--no-metrics",
+            ],
+        ),
+        "full clone",
+    );
+    assert_eq!(
+        head_fingerprint(&full_dir),
+        reference,
+        "Full clone must match the authenticated private upstream"
+    );
+    assert!(
+        !full_dir.join(".git/shallow").exists(),
+        "Full clone must not be shallow"
+    );
+
+    let files_dir = cwd.join("clone-files");
+    assert_ripclone_ok(
+        &ripclone(
+            &config_path,
+            &server.url,
+            cwd,
+            &[
+                "clone",
+                &repo_arg,
+                files_dir.to_str().unwrap(),
+                "--mode",
+                "files",
+                "--verify-upstream",
+                "never",
+                "--no-metrics",
+            ],
+        ),
+        "Files clone",
+    );
+    assert_eq!(
+        std::fs::read_to_string(files_dir.join("hello.txt")).unwrap(),
+        "server-side token works\n"
+    );
+    assert!(
+        !files_dir.join(".git").exists(),
+        "Files clone must not materialize Git metadata"
     );
 
     // --- Update propagation: push, sync, re-clone, assert the update landed ---

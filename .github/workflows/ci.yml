@@ -191,7 +191,7 @@ jobs:
         test: ${{ fromJSON(needs.s3gc-tests.outputs.tests) }}
     services:
       minio:
-        image: minio/minio:latest
+        image: minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
         command: server /data
         env:
           MINIO_ROOT_USER: minioadmin
@@ -239,7 +239,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       gitea:
-        image: gitea/gitea:latest
+        image: gitea/gitea@sha256:2edc102cbb636ae1ddac5fa0c715aa5b03079dee13ac6800b2cef6d4e912e718
         env:
           GITEA__security__INSTALL_LOCK: "true"
           GITEA__database__DB_TYPE: sqlite3
@@ -265,7 +265,7 @@ jobs:
             sleep 0.5
           done
           curl -sf http://127.0.0.1:3000/api/v1/version >/dev/null
-          cid="$(docker ps --filter ancestor=gitea/gitea:latest --format '{{.ID}}' | head -n1)"
+          cid="$(docker ps --filter ancestor=gitea/gitea@sha256:2edc102cbb636ae1ddac5fa0c715aa5b03079dee13ac6800b2cef6d4e912e718 --format '{{.ID}}' | head -n1)"
           test -n "$cid"
           docker exec -u git "$cid" gitea admin user create \
             --admin --username ci --password ci-password-123 \

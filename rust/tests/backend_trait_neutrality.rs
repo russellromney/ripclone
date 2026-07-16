@@ -1,7 +1,11 @@
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 use ripclone::artifact_manifest::CasBlob;
-use ripclone::artifact_scheduler::ArtifactScheduler;
+use ripclone::artifact_scheduler::{
+    ArtifactKey, ArtifactKind, ArtifactRecord, ClaimedArtifact, CompletionSealAuthority,
+    FailureClass, ObservationOutcome, ObservationSnapshot, RetryOutcome, ScheduleOutcome,
+    VerifiedCompletionEvidence,
+};
 use ripclone::artifact_scheduler_backend::ArtifactSchedulerPersistence;
 use ripclone::git_source::{GitSourceLoader, GitSourceUploader};
 use ripclone::meta::{MetaDb, RefRow};
@@ -9,6 +13,7 @@ use ripclone::queue::DeadLetteredInitialization;
 use ripclone::queue::sql::QueueDb;
 use ripclone::sync_coordinator::{DurableSourceAcquireOutcome, DurableSourceAcquirer, SyncIntent};
 use std::path::Path;
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 fn neutral_error<T>() -> Result<T> {
@@ -153,6 +158,146 @@ impl QueueDb for NeutralQueue {
 
 struct NeutralSources;
 
+struct NeutralScheduler;
+
+#[async_trait]
+impl ArtifactSchedulerPersistence for NeutralScheduler {
+    fn completion_verifier(&self) -> Arc<dyn ripclone::artifact_scheduler::CompletionVerifier> {
+        panic!("database-agnostic test adapter")
+    }
+
+    fn completion_sealer(&self) -> Arc<CompletionSealAuthority> {
+        panic!("database-agnostic test adapter")
+    }
+
+    async fn schedule(&self, _: &ArtifactKey) -> Result<ScheduleOutcome> {
+        neutral_error()
+    }
+
+    async fn subscribe_consumer(
+        &self,
+        _: &ArtifactKey,
+        _: &str,
+        _: i64,
+    ) -> Result<ScheduleOutcome> {
+        neutral_error()
+    }
+
+    async fn release_consumer(&self, _: i64, _: &str) -> Result<()> {
+        neutral_error()
+    }
+
+    async fn observe(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: &[ArtifactKind],
+        _: u32,
+        _: Option<u64>,
+    ) -> Result<ObservationOutcome> {
+        neutral_error()
+    }
+
+    async fn observation_snapshot(&self, _: &str, _: &str, _: &str) -> Result<ObservationSnapshot> {
+        neutral_error()
+    }
+
+    async fn retry_failed(&self, _: &ArtifactKey) -> Result<RetryOutcome> {
+        neutral_error()
+    }
+
+    async fn claim(&self, _: &str, _: i64) -> Result<Option<ClaimedArtifact>> {
+        neutral_error()
+    }
+
+    async fn heartbeat(&self, _: &ClaimedArtifact, _: &str, _: i64) -> Result<bool> {
+        neutral_error()
+    }
+
+    async fn owns(&self, _: &ClaimedArtifact, _: &str) -> Result<bool> {
+        neutral_error()
+    }
+
+    async fn complete_verified(
+        &self,
+        _: &ClaimedArtifact,
+        _: &str,
+        _: &VerifiedCompletionEvidence,
+    ) -> Result<bool> {
+        neutral_error()
+    }
+
+    async fn fail(&self, _: &ClaimedArtifact, _: &str, _: FailureClass, _: &str) -> Result<bool> {
+        neutral_error()
+    }
+
+    async fn reconcile_expired(&self) -> Result<(u64, u64)> {
+        neutral_error()
+    }
+
+    async fn get(&self, _: i64) -> Result<Option<ArtifactRecord>> {
+        neutral_error()
+    }
+
+    async fn get_by_key(&self, _: &ArtifactKey) -> Result<Option<ArtifactRecord>> {
+        neutral_error()
+    }
+
+    async fn ready_page(&self, _: i64, _: usize) -> Result<Vec<ArtifactRecord>> {
+        neutral_error()
+    }
+
+    async fn ready_candidates(
+        &self,
+        _: &str,
+        _: &str,
+        _: ArtifactKind,
+        _: u32,
+        _: u32,
+    ) -> Result<Vec<ArtifactRecord>> {
+        neutral_error()
+    }
+
+    async fn published(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: ArtifactKind,
+        _: u32,
+    ) -> Result<Option<ArtifactRecord>> {
+        neutral_error()
+    }
+
+    async fn complete_full_base_candidates(
+        &self,
+        _: &str,
+        _: &str,
+        _: u32,
+        _: u32,
+    ) -> Result<Vec<String>> {
+        neutral_error()
+    }
+
+    async fn quarantine_publication(&self, _: &ArtifactKey, _: &str, _: &str) -> Result<bool> {
+        neutral_error()
+    }
+
+    async fn counts(
+        &self,
+    ) -> Result<
+        Vec<(
+            ArtifactKind,
+            ripclone::artifact_scheduler::ArtifactState,
+            u64,
+        )>,
+    > {
+        neutral_error()
+    }
+}
+
 #[async_trait]
 impl DurableSourceAcquirer for NeutralSources {
     async fn acquire_exact(
@@ -195,7 +340,7 @@ where
 
 #[tokio::test]
 async fn shared_backend_contracts_compile_without_database_types() {
-    assert_contracts::<NeutralMeta, NeutralQueue, ArtifactScheduler, NeutralSources>();
+    assert_contracts::<NeutralMeta, NeutralQueue, NeutralScheduler, NeutralSources>();
 
     assert!(
         NeutralMeta

@@ -41,6 +41,7 @@ if [ -n "$public_matches" ]; then
 fi
 fail_matches "CI and examples" "$ROOT/.github" "$ROOT/.env.example" "$ROOT/tests"
 fail_matches "scripts" "$ROOT/scripts" --glob '!audit-sqlite-only-support.sh'
+fail_matches "Cargo policy and configuration" "$ROOT/rust/deny.toml" "$ROOT/rust/.cargo"
 
 for file in \
   rust/src/artifact_scheduler_mysql.rs rust/src/artifact_scheduler_postgres.rs rust/src/artifact_scheduler_libsql.rs \

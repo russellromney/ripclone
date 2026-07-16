@@ -47,6 +47,9 @@ fn setup_sqlite_queue() -> tempfile::TempDir {
     unsafe {
         std::env::set_var("RIPCLONE_QUEUE", "sqlite");
         std::env::set_var("RIPCLONE_QUEUE_DB_URL", &db_path);
+        // The reaper case overrides this process-global knob. Tests in this
+        // binary are serialized, but the environment survives between them.
+        std::env::remove_var("RIPCLONE_QUEUE_STALE_SECS");
     }
     init(false);
     qdir
@@ -908,19 +911,25 @@ async fn dispatcher_reconcile_drains_workers_over_api_queue() {
     let id_b = enqueue_sized(&queue, "acme/api-disp-b", Some(SMALL_BYTES)).await;
     assert_eq!(queue.depth().await, 2);
 
-    // One worker drains both jobs serially — proves the API path without piling
-    // pollers on the server's rate limiter.
+    // Launch exactly one worker, then let that worker drain both jobs serially.
+    // Re-running reconcile before the child has emitted its first heartbeat can
+    // observe live=0 and start another process; under a loaded full-suite run
+    // that feedback loop creates avoidable contention and makes this credential
+    // isolation proof timing-dependent.
     let mut backoff = BackoffState::new();
-    reconcile_until_done(
-        &queue,
-        &provider,
-        &worker_env,
-        /*max_workers=*/ 1,
-        &[id_a, id_b],
-        Duration::from_secs(120),
-        &mut backoff,
-    )
+    let first = reconcile_once(ReconcileInputs {
+        queue: &queue,
+        provider: &provider,
+        max_workers: 1,
+        worker_env: &worker_env,
+        backoff: &mut backoff,
+        now: Instant::now(),
+    })
     .await;
+    let first = first.expect("dispatcher launches token-only API worker");
+    assert_eq!(first.started, 1, "exactly one API worker starts: {first:?}");
+    assert_eq!(first.failed, 0, "API worker launch succeeds: {first:?}");
+    wait_all_done(&queue, &[id_a, id_b], Duration::from_secs(120)).await;
     assert_eq!(
         queue.depth().await,
         0,
@@ -953,12 +962,11 @@ async fn dispatcher_reconcile_drains_workers_over_api_queue() {
 async fn dispatcher_reaper_reclaims_dead_worker_on_reconcile() {
     let _guard = SERIAL.lock().await;
     let _qdir = setup_sqlite_queue();
-    // Short stale window: the killed worker's claim must become
-    // reclaim-eligible quickly (test timeout), while staying long enough that
-    // the REAL healthy worker's own claim->build->ack cycle for a trivial
-    // repo (well under a second) is never caught by it.
+    // Short, but not hair-trigger, stale window: the killed worker's claim must
+    // become reclaim-eligible within the test timeout while a healthy worker
+    // still gets enough time to build under loaded CI scheduling.
     unsafe {
-        std::env::set_var("RIPCLONE_QUEUE_STALE_SECS", "1");
+        std::env::set_var("RIPCLONE_QUEUE_STALE_SECS", "5");
     }
     let server = start_server().await;
     let wrapper_dir = tempfile::tempdir().expect("wrapper dir");

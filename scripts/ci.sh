@@ -28,6 +28,7 @@ lint() {
 # (gitea/databases/s3gc/e2e/…) use prebuilt binaries from ci-build instead;
 # staging the full suite there was ~30m cold and is not worth it.
 run_tests() {
+  bash "$ROOT/scripts/audit-sqlite-only-support.sh"
   ( cd "$ROOT/rust" && cargo test --profile ci --all-targets --locked )
 }
 
