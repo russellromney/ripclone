@@ -415,13 +415,14 @@ impl BoundInstall {
         let to = cstring(&self.target_name)?;
         #[cfg(target_os = "linux")]
         let rc = unsafe {
-            libc::renameat2(
+            libc::syscall(
+                libc::SYS_renameat2,
                 self.wrapper.as_raw_fd(),
                 from.as_ptr(),
                 self.parent.as_raw_fd(),
                 to.as_ptr(),
                 libc::RENAME_NOREPLACE,
-            )
+            ) as libc::c_int
         };
         #[cfg(target_os = "macos")]
         let rc = unsafe {

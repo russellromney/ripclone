@@ -41,6 +41,10 @@ for line in sys.stdin:
         msg = json.loads(line)
     except ValueError:
         continue
+    if msg.get("reason") == "compiler-message":
+        rendered = msg.get("message", {}).get("rendered")
+        if rendered:
+            print(rendered, file=sys.stderr, end="")
     if msg.get("executable") and msg.get("profile", {}).get("test"):
         print(msg["executable"])
 ' | tail -n1)"
