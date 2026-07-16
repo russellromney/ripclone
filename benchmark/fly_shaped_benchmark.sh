@@ -134,8 +134,20 @@ ensure_repo_added() {
 }
 
 get_default_branch() {
-  curl -fsS -H "$(auth_header)" "${SERVER_URL%/}/v1/repos/$PROVIDER/$(repo_owner)/$(repo_name)/refs/HEAD" 2>/dev/null \
-    | python3 -c 'import sys,json; print(json.load(sys.stdin).get("default_branch","HEAD"))'
+  local out branch
+  for _ in $(seq 1 120); do
+    out=$(curl -fsS -H "$(auth_header)" "${SERVER_URL%/}/v1/repos/$PROVIDER/$(repo_owner)/$(repo_name)/refs/HEAD" 2>/dev/null || true)
+    if [ -n "$out" ]; then
+      branch=$(printf '%s' "$out" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("default_branch","HEAD"))' 2>/dev/null || true)
+      if [ -n "$branch" ]; then
+        printf '%s\n' "$branch"
+        return 0
+      fi
+    fi
+    sleep 0.25
+  done
+  echo "error: default branch unavailable after 30s" >&2
+  return 1
 }
 
 head_ref_json() {
@@ -189,14 +201,19 @@ wait_for_ref_ready() {
   echo "  waiting for full clonepack artifacts to be consistent ..." >&2
   while true; do
     local out commit ready
-    out=$(head_ref_json "$branch")
-    commit=$(echo "$out" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("commit",""))')
+    out=$(head_ref_json "$branch" || true)
+    if [ -z "$out" ]; then
+      commit=""
+      ready=""
+    else
+      commit=$(echo "$out" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("commit",""))')
     # A full editable clone is ready when the server advertises full-history
     # artifacts for the tip. Field names have drifted across server versions, so
     # accept any of them: full_pack (legacy single pack), pack_chunk_urls /
     # idx_bundle_url (older LSM full history), or clonepack_manifest with
     # archive_ready (current). Empty strings count as absent.
-    ready=$(echo "$out" | python3 -c 'import sys,json; d=json.load(sys.stdin); print("1" if (d.get("full_pack") or d.get("pack_chunk_urls") or d.get("idx_bundle_url") or (d.get("clonepack_manifest") and d.get("archive_ready"))) else "")')
+      ready=$(echo "$out" | python3 -c 'import sys,json; d=json.load(sys.stdin); print("1" if (d.get("full_pack") or d.get("pack_chunk_urls") or d.get("idx_bundle_url") or (d.get("clonepack_manifest") and d.get("archive_ready"))) else "")')
+    fi
     if [ -n "$commit" ] && [ -n "$ready" ]; then
       echo "  artifacts ready for $commit" >&2
       echo "$commit"

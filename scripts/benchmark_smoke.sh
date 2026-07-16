@@ -210,7 +210,7 @@ phase_real_server() {
       bash "$BENCH" "$REPO" 1000 1 "$BASE_DIR/target2" >"$log" 2>&1; then
     cat "$log" >&2
     # The harness swallows response bodies, so name the likely cause here.
-    if ! grep -q 'repo .* is added' "$log"; then
+    if ! grep -Eq 'repo .* (is )?added' "$log"; then
       echo "HINT: the harness never added $REPO. The server rejects sync/refs/clone" >&2
       echo "      for a repo that was never added: 404 {\"code\":\"repo_not_added\"}." >&2
     fi
@@ -219,7 +219,7 @@ phase_real_server() {
 
   if grep -q 'repo_not_added' "$log"; then cat "$log" >&2; fail "harness hit repo_not_added"; fi
   if grep -q 'FAILED' "$log"; then cat "$log" >&2; fail "a benchmark run failed"; fi
-  grep -q 'repo .* is added' "$log" || { cat "$log" >&2; fail "harness never added the repo"; }
+  grep -Eq 'repo .* (is )?added' "$log" || { cat "$log" >&2; fail "harness never added the repo"; }
   grep -qE 'ripclone full \(depth=0\) +median= *[0-9]+ms' "$log" \
     || { cat "$log" >&2; fail "harness produced no timing row"; }
 

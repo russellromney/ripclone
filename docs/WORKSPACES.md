@@ -45,7 +45,7 @@ ripclone workspace show
 Normal commands select a workspace, never a provider:
 
 ```text
-ripclone --workspace acme clone owner/repo
+ripclone clone --workspace acme owner/repo
 ```
 
 `--provider`, provider-prefixed repository arguments, `[providers.*]`,
