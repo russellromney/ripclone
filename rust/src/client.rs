@@ -33,6 +33,41 @@ struct ServerError {
     code: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ArtifactPendingResponse {
+    code: String,
+    commit: String,
+}
+
+/// The selected artifact is not yet available for the commit this clone pinned.
+#[derive(Debug)]
+pub struct ArtifactPending {
+    pub commit: String,
+    pub mode: String,
+}
+
+impl std::fmt::Display for ArtifactPending {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} artifact is still pending for {}; retry with `ripclone clone --at {}`",
+            self.mode, self.commit, self.commit
+        )
+    }
+}
+
+impl std::error::Error for ArtifactPending {}
+
+fn validate_manifest_commit(manifest: &ClonepackManifest, pinned: &str) -> Result<()> {
+    if manifest.commit != pinned {
+        anyhow::bail!(
+            "clonepack integrity error: manifest commit {} does not match pinned commit {pinned}",
+            manifest.commit
+        );
+    }
+    Ok(())
+}
+
 /// A presigned artifact URL failed (most likely expired mid-clone). The bytes
 /// are served ONLY by the signed URLs in the ref response — the hosted server no
 /// longer serves content by bare hash — so the right recovery is to re-resolve
@@ -208,6 +243,25 @@ pub struct RefResponse {
 
 fn ref_archive_ready_default() -> bool {
     true
+}
+
+fn ref_poll_config() -> (usize, std::time::Duration) {
+    const DEFAULT_ATTEMPTS: usize = 40;
+    const DEFAULT_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+    if std::env::var_os("RIPCLONE_TESTING").is_none() {
+        return (DEFAULT_ATTEMPTS, DEFAULT_DELAY);
+    }
+    let attempts = std::env::var("RIPCLONE_TEST_REF_MAX_ATTEMPTS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_ATTEMPTS);
+    let delay = std::env::var("RIPCLONE_TEST_REF_POLL_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(DEFAULT_DELAY);
+    (attempts, delay)
 }
 
 /// Return the chunk refs that make up the head-blobs pack, falling back to the
@@ -605,6 +659,33 @@ pub struct CloneOutcome {
     pub bytes: u64,
 }
 
+#[derive(Default)]
+struct InstallIdentity {
+    pinned: Option<String>,
+    clone_id: Option<String>,
+    cold: bool,
+}
+
+struct AbortOnDrop<T>(Option<tokio::task::JoinHandle<T>>);
+
+impl<T> AbortOnDrop<T> {
+    fn new(handle: tokio::task::JoinHandle<T>) -> Self {
+        Self(Some(handle))
+    }
+
+    async fn join(mut self) -> std::result::Result<T, tokio::task::JoinError> {
+        self.0.take().expect("join handle present").await
+    }
+}
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Client {
     server: String,
@@ -778,38 +859,97 @@ impl Client {
         clonepack: Option<&str>,
         rev: Option<&str>,
     ) -> Result<RefResponse> {
-        let mut url = self.repo_url(repo_path, &format!("/refs/{branch}"));
-        let mut q: Vec<String> = Vec::new();
-        if let Some(kind) = clonepack {
-            q.push(format!("clonepack={}", kind));
-        }
-        if let Some(r) = rev {
-            q.push(format!("rev={}", urlencoding::encode(r)));
-        }
-        if !q.is_empty() {
-            url.push('?');
-            url.push_str(&q.join("&"));
-        }
-        // The cloud returns 202 while it warms a cold repo (the webhook-sync
-        // queue builds it on demand), or 503 if its queue is briefly full. Poll
-        // the same request until it's built, then read the ref.
-        let max_attempts = 40usize;
+        let mut pinned = None;
+        self.resolve_ref_for_operation(
+            repo_path,
+            branch,
+            clonepack,
+            rev,
+            &mut pinned,
+            clonepack.unwrap_or("full"),
+        )
+        .await
+    }
+
+    async fn resolve_ref_for_operation(
+        &self,
+        repo_path: &str,
+        branch: &str,
+        clonepack: Option<&str>,
+        rev: Option<&str>,
+        pinned: &mut Option<String>,
+        pending_mode: &str,
+    ) -> Result<RefResponse> {
+        let (max_attempts, poll_delay) = ref_poll_config();
         // Track whether any attempt polled a cold build (202/503) before
         // success, so the post-clone metrics report can label the clone cold.
         let mut polled = false;
         for attempt in 0..max_attempts {
+            let mut url = self.repo_url(repo_path, &format!("/refs/{branch}"));
+            let mut q: Vec<String> = Vec::new();
+            if let Some(kind) = clonepack {
+                q.push(format!("clonepack={kind}"));
+            }
+            if let Some(commit) = pinned.as_deref() {
+                q.push(format!("pinned={commit}"));
+            } else if let Some(r) = rev {
+                q.push(format!("rev={}", urlencoding::encode(r)));
+            }
+            if !q.is_empty() {
+                url.push('?');
+                url.push_str(&q.join("&"));
+            }
             let resp = self.send(self.request(reqwest::Method::GET, &url)).await?;
             let status = resp.status();
-            if status == reqwest::StatusCode::ACCEPTED
-                || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
-            {
+            if status == reqwest::StatusCode::ACCEPTED {
+                let pending: ArtifactPendingResponse = resp.json().await.with_context(|| {
+                    format!("invalid protocol-2 pending response for {repo_path}")
+                })?;
+                if pending.code != "artifact_pending" {
+                    anyhow::bail!(
+                        "invalid protocol-2 pending response code {:?} for {repo_path}",
+                        pending.code
+                    );
+                }
+                crate::validation::validate_object_id(&pending.commit)
+                    .with_context(|| format!("invalid pending commit for {repo_path}"))?;
+                if let Some(expected) = pinned.as_deref() {
+                    if pending.commit != expected {
+                        anyhow::bail!(
+                            "ref integrity error: pinned commit {expected} changed to {} in a pending response",
+                            pending.commit
+                        );
+                    }
+                } else {
+                    *pinned = Some(pending.commit.clone());
+                }
                 polled = true;
                 if attempt == 0 {
                     eprintln!("ripclone: warming {repo_path} — this can take a moment…");
                 }
                 if attempt + 1 < max_attempts {
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    tokio::time::sleep(poll_delay).await;
                     continue;
+                }
+                let commit = pinned.clone().expect("valid 202 establishes a pin");
+                return Err(anyhow::Error::new(ArtifactPending {
+                    commit,
+                    mode: pending_mode.to_string(),
+                }));
+            }
+            if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+                polled = true;
+                if attempt == 0 {
+                    eprintln!("ripclone: warming {repo_path} — this can take a moment…");
+                }
+                if attempt + 1 < max_attempts {
+                    tokio::time::sleep(poll_delay).await;
+                    continue;
+                }
+                if let Some(commit) = pinned.as_deref() {
+                    anyhow::bail!(
+                        "ref lookup for pinned commit {commit} remained unavailable after {max_attempts} attempts"
+                    );
                 }
                 anyhow::bail!("{repo_path} is still building after {max_attempts} attempts");
             }
@@ -823,6 +963,18 @@ impl Client {
                     .and_then(|v| v.to_str().ok())
                     .map(str::to_string);
                 let mut info: RefResponse = resp.json().await?;
+                crate::validation::validate_object_id(&info.commit)
+                    .with_context(|| format!("invalid ready commit for {repo_path}"))?;
+                if let Some(expected) = pinned.as_deref() {
+                    if info.commit != expected {
+                        anyhow::bail!(
+                            "ref integrity error: pinned commit {expected} changed to {} in a ready response",
+                            info.commit
+                        );
+                    }
+                } else {
+                    *pinned = Some(info.commit.clone());
+                }
                 info.clone_id = clone_id;
                 info.cold = polled;
                 return Ok(info);
@@ -1237,7 +1389,54 @@ impl Client {
         target: P,
         mode: CloneMode,
         clonepack: Option<&str>,
+        mut bench: Option<&mut Benchmark>,
+    ) -> Result<CloneOutcome> {
+        const STALE_URL_MAX_RETRIES: u32 = 2;
+        let mut identity = InstallIdentity::default();
+        let mut stale_retries = 0u32;
+        loop {
+            let result = self
+                .install_repo_with_mode_at_attempt(
+                    repo_path,
+                    branch,
+                    rev,
+                    target.as_ref(),
+                    mode,
+                    clonepack,
+                    bench.as_deref_mut(),
+                    &mut identity,
+                )
+                .await;
+            match result {
+                Ok(outcome) => return Ok(outcome),
+                Err(error) if should_retry_stale(stale_retries, STALE_URL_MAX_RETRIES, &error) => {
+                    if target.as_ref().exists() {
+                        anyhow::bail!(
+                            "stale signed-URL attempt left a published target at {}",
+                            target.as_ref().display()
+                        );
+                    }
+                    stale_retries += 1;
+                    eprintln!(
+                        "ripclone: artifact URLs expired mid-clone — refreshing the pinned commit and retrying (attempt {stale_retries})…"
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn install_repo_with_mode_at_attempt<P: AsRef<Path>>(
+        &self,
+        repo_path: &str,
+        branch: &str,
+        rev: Option<&str>,
+        target: P,
+        mode: CloneMode,
+        clonepack: Option<&str>,
         bench: Option<&mut Benchmark>,
+        identity: &mut InstallIdentity,
     ) -> Result<CloneOutcome> {
         let target = target.as_ref().to_path_buf();
         info!(
@@ -1257,17 +1456,6 @@ impl Client {
         crate::perf::reset_perf_counters();
         let _ = crate::worktree_writer::take_write_timing();
 
-        // 1. Resolve ref (full-history by default; fast clones can request shallow).
-        let mut info = self
-            .resolve_ref_with_clonepack(repo_path, branch, clonepack, rev)
-            .await?;
-        bench.mark_resolve();
-        // Capture the metrics-relevant facts from the FIRST successful resolve:
-        // the cloud mints a fresh clone id (and usage event) on each resolve, so
-        // the archive-ready re-resolve below would otherwise overwrite the id we
-        // want to report against.
-        let clone_id = info.clone_id.clone();
-        let mut cold = info.cold;
         // `files` | `depth1` | `full`, derived from the mode and requested
         // clonepack variant (depth=1 ⇒ "shallow").
         let metric_mode: &'static str = if mode.needs_archive() {
@@ -1277,6 +1465,34 @@ impl Client {
         } else {
             "full"
         };
+        // 1. Resolve the moving selector once. A pending or ready response
+        // establishes `identity.pinned`; every later poll and retry uses the
+        // metadata-only pinned query.
+        let mut info = self
+            .resolve_ref_for_operation(
+                repo_path,
+                branch,
+                clonepack,
+                rev,
+                &mut identity.pinned,
+                metric_mode,
+            )
+            .await?;
+        bench.mark_resolve();
+        if identity.clone_id.is_none() {
+            identity.clone_id = info.clone_id.clone();
+        }
+        identity.cold |= info.cold;
+        let pinned = identity
+            .pinned
+            .clone()
+            .context("ref resolution completed without a pinned commit")?;
+        if info.commit != pinned {
+            anyhow::bail!(
+                "ref integrity error: response commit {} does not match pinned commit {pinned}",
+                info.commit
+            );
+        }
         info!("resolved to commit {}", &info.commit[..7]);
 
         // Files mode needs the zstd archive. The server publishes an editable
@@ -1286,19 +1502,30 @@ impl Client {
         // ref-resolve 202 poll above doesn't capture for files mode, so record
         // it for the metrics label.
         if mode.needs_archive() && !info.archive_ready {
-            cold = true;
-            let max = 40usize;
+            identity.cold = true;
+            let (max, poll_delay) = ref_poll_config();
             for _ in 0..max {
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                tokio::time::sleep(poll_delay).await;
                 info = self
-                    .resolve_ref_with_clonepack(repo_path, branch, clonepack, rev)
+                    .resolve_ref_for_operation(
+                        repo_path,
+                        branch,
+                        clonepack,
+                        rev,
+                        &mut identity.pinned,
+                        metric_mode,
+                    )
                     .await?;
+                identity.cold |= info.cold;
                 if info.archive_ready {
                     break;
                 }
             }
             if !info.archive_ready {
-                anyhow::bail!("archive still building for {repo_path}");
+                return Err(anyhow::Error::new(ArtifactPending {
+                    commit: pinned.clone(),
+                    mode: metric_mode.to_string(),
+                }));
             }
         }
 
@@ -1313,17 +1540,18 @@ impl Client {
         let (manifest_tx, manifest_rx) = tokio::sync::oneshot::channel::<Arc<ClonepackManifest>>();
 
         // 2. Start manifest + metadata downloads concurrently.
-        let manifest_task = self.clone().spawn_fetch_manifest(
+        let manifest_task = AbortOnDrop::new(self.clone().spawn_fetch_manifest(
             info.clonepack_manifest.clone(),
             info.clonepack_manifest_url.clone(),
             manifest_tx,
-        );
+        ));
 
         let metadata_hash = info.metadata_chunk.clone();
         let metadata_url = info.metadata_chunk_url.clone();
-        let metadata_task = self
-            .clone()
-            .spawn_fetch_metadata(metadata_hash, metadata_url);
+        let metadata_task = AbortOnDrop::new(
+            self.clone()
+                .spawn_fetch_metadata(metadata_hash, metadata_url),
+        );
 
         // 3. Spawn the archive-chunk downloader. It waits for the manifest to be
         // decoded before fetching anything (so it follows the manifest's chunk
@@ -1343,7 +1571,7 @@ impl Client {
         ) = bounded(archive_channel_depth);
         let archive_bridge = if mode.needs_archive() {
             let archive_tx = archive_tx.clone();
-            Some(tokio::task::spawn_blocking(move || {
+            Some(AbortOnDrop::new(tokio::task::spawn_blocking(move || {
                 while let Some(msg) = archive_async_rx.blocking_recv() {
                     let send_start = Instant::now();
                     if archive_tx.send(msg).is_err() {
@@ -1351,7 +1579,7 @@ impl Client {
                     }
                     crate::perf::record_archive_send_wait(send_start.elapsed());
                 }
-            }))
+            })))
         } else {
             None
         };
@@ -1359,10 +1587,11 @@ impl Client {
         let archive_urls = info.archive_chunk_urls.clone();
         let archive_downloads = if mode.needs_archive() {
             bench.start_archive_download();
-            Some(
-                self.clone()
-                    .spawn_chunk_downloads(archive_urls, manifest_rx, archive_async_tx),
-            )
+            Some(AbortOnDrop::new(self.clone().spawn_chunk_downloads(
+                archive_urls,
+                manifest_rx,
+                archive_async_tx,
+            )))
         } else {
             drop(archive_async_tx);
             drop(manifest_rx);
@@ -1371,10 +1600,11 @@ impl Client {
         drop(archive_tx);
 
         // 4. Wait for manifest + metadata.
-        let (manifest, metadata) =
-            tokio::try_join!(manifest_task, metadata_task).context("fetch manifest/metadata")?;
+        let (manifest, metadata) = tokio::try_join!(manifest_task.join(), metadata_task.join())
+            .context("fetch manifest/metadata")?;
         let manifest = manifest.context("fetch clonepack manifest")?;
         let metadata = metadata.context("fetch metadata chunk")?;
+        validate_manifest_commit(&manifest, &pinned)?;
         let metadata = Arc::new(metadata);
         bench.mark_manifest();
         bench.add_bytes(metadata_bytes(&metadata), 0);
@@ -1483,11 +1713,11 @@ impl Client {
             let rx = archive_rx;
             let manifest_path = manifest_path.clone();
             let work_tree = install_root.clone();
-            Some(tokio::task::spawn_blocking(move || {
+            Some(AbortOnDrop::new(tokio::task::spawn_blocking(move || {
                 // Keep the temp manifest file alive for the duration of extraction.
                 let _guard = manifest_tmp;
                 extract_archive_from_chunk_receiver(&manifest_path, Some(&work_tree), None, rx)
-            }))
+            })))
         } else {
             drop(archive_rx);
             // The temp file can be dropped; nothing needs the manifest on disk.
@@ -1498,11 +1728,14 @@ impl Client {
         // 8. Wait for downloads + workers.
         let mut archive_bytes = 0u64;
         if let Some(handle) = archive_downloads {
-            let bytes = handle.await.context("archive download coordinator")??;
+            let bytes = handle
+                .join()
+                .await
+                .context("archive download coordinator")??;
             archive_bytes = bytes;
         }
         if let Some(handle) = archive_bridge {
-            handle.await.context("archive download bridge")?;
+            handle.join().await.context("archive download bridge")?;
         }
         // Editable single-download path: download the small depth packs in
         // parallel and, as each lands, install it and extract its blobs into the
@@ -1522,6 +1755,7 @@ impl Client {
         }
         if let Some(handle) = archive_worker {
             let stats = handle
+                .join()
                 .await
                 .context("archive worker join")?
                 .context("archive extraction")?;
@@ -1636,10 +1870,10 @@ impl Client {
             provider,
             owner: info.owner.clone(),
             name: info.repo.clone(),
-            commit: info.commit.clone(),
+            commit: pinned,
             mode: metric_mode,
-            cold,
-            clone_id,
+            cold: identity.cold,
+            clone_id: identity.clone_id.clone(),
             bytes: report.total_bytes(),
         })
     }
@@ -1755,23 +1989,23 @@ impl Client {
             let client = self.clone();
             let bundle_ref = bundle_ref.clone();
             let idx_bundle_url = info.idx_bundle_url.clone();
-            tokio::spawn(async move {
+            AbortOnDrop::new(tokio::spawn(async move {
                 client
                     .fetch_chunk_ref(&bundle_ref, idx_bundle_url.as_deref())
                     .await
                     .context("fetch idx bundle")
-            })
+            }))
         });
         let midx_task = manifest.midx.as_ref().map(|midx_ref| {
             let client = self.clone();
             let midx_ref = midx_ref.clone();
             let midx_url = info.midx_url.clone();
-            tokio::spawn(async move {
+            AbortOnDrop::new(tokio::spawn(async move {
                 client
                     .fetch_chunk_ref(&midx_ref, midx_url.as_deref())
                     .await
                     .context("fetch pre-built multi-pack-index")
-            })
+            }))
         });
 
         // Validate every blob sha1 length up front so `build_blob_path_map`
@@ -1815,7 +2049,9 @@ impl Client {
         // per-pack round-trips from 2 to 1). Falls back to per-pack idx fetches
         // for older manifests without a bundle.
         let idx_bundle: Option<Arc<bytes::Bytes>> = match idx_bundle_task {
-            Some(task) => Some(Arc::new(task.await.context("idx bundle fetch task")??)),
+            Some(task) => Some(Arc::new(
+                task.join().await.context("idx bundle fetch task")??,
+            )),
             None => None,
         };
 
@@ -2027,6 +2263,7 @@ impl Client {
         // with slower per-object lookups.
         if let Some(midx_task) = midx_task {
             match midx_task
+                .join()
                 .await
                 .context("pre-built MIDX fetch task")
                 .and_then(|r| r)
@@ -3175,6 +3412,16 @@ mod tests {
     fn retry_decision_never_retries_a_non_stale_error() {
         let other = anyhow::anyhow!("repo not found");
         assert!(!should_retry_stale(0, 2, &other));
+    }
+
+    #[test]
+    fn manifest_commit_must_match_the_operation_pin() {
+        let manifest = ClonepackManifest {
+            commit: "b".repeat(40),
+            ..Default::default()
+        };
+        let error = validate_manifest_commit(&manifest, &"a".repeat(40)).unwrap_err();
+        assert!(format!("{error:#}").contains("clonepack integrity error"));
     }
 
     /// A first-run user who points at a server that isn't running (or a wrong

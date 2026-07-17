@@ -84,6 +84,45 @@ fn take_test_artifact_barrier() -> Option<ArtifactBarrier> {
     TEST_ARTIFACT_BARRIER.lock().unwrap().take()
 }
 
+/// Test-only operation counters. They are opt-in and are never exported as
+/// production metrics; integration fixtures use them to prove that exact
+/// metadata polling does not enter upstream or build work.
+#[doc(hidden)]
+#[derive(Default)]
+pub struct TestWorkCounts {
+    pinned_requests: AtomicUsize,
+    ref_point_reads: AtomicUsize,
+    upstream_accesses: AtomicUsize,
+    enqueues: AtomicUsize,
+    source_acquisitions: AtomicUsize,
+    builder_entries: AtomicUsize,
+}
+
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TestWorkSnapshot {
+    pub pinned_requests: usize,
+    pub ref_point_reads: usize,
+    pub upstream_accesses: usize,
+    pub enqueues: usize,
+    pub source_acquisitions: usize,
+    pub builder_entries: usize,
+}
+
+impl TestWorkCounts {
+    #[doc(hidden)]
+    pub fn snapshot(&self) -> TestWorkSnapshot {
+        TestWorkSnapshot {
+            pinned_requests: self.pinned_requests.load(Ordering::Relaxed),
+            ref_point_reads: self.ref_point_reads.load(Ordering::Relaxed),
+            upstream_accesses: self.upstream_accesses.load(Ordering::Relaxed),
+            enqueues: self.enqueues.load(Ordering::Relaxed),
+            source_acquisitions: self.source_acquisitions.load(Ordering::Relaxed),
+            builder_entries: self.builder_entries.load(Ordering::Relaxed),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct ServerState {
     pub cas: Cas,
@@ -157,6 +196,8 @@ pub struct ServerState {
     /// self-host that fully trusts whoever holds the shared server token (the old
     /// behavior); then visibility falls back to the client-supplied header.
     pub require_repo_auth: bool,
+    #[doc(hidden)]
+    pub test_work_counts: Option<Arc<TestWorkCounts>>,
 }
 
 impl ServerState {
@@ -206,6 +247,7 @@ impl ServerState {
             // but unused, and auth enforcement is irrelevant here.
             access_verifier: Arc::new(HttpAccessVerifier::new()),
             require_repo_auth: false,
+            test_work_counts: None,
         })
     }
 }
@@ -233,6 +275,19 @@ fn fail_first_fetches_from_env() -> usize {
         );
     }
     n
+}
+
+fn mirror_fresh_ttl_from_env() -> Duration {
+    let Some(ms) = std::env::var("RIPCLONE_TEST_MIRROR_FRESH_TTL_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    else {
+        return Duration::from_secs(60);
+    };
+    tracing::warn!(
+        "TEST MIRROR TTL ACTIVE: {ms}ms (RIPCLONE_TEST_MIRROR_FRESH_TTL_MS); this must NOT be set in production"
+    );
+    Duration::from_millis(ms)
 }
 
 #[derive(Clone)]
@@ -325,6 +380,11 @@ pub struct RefQuery {
     /// Pairs with `sync?rev=...`: clone the artifacts built for that commit.
     #[serde(default)]
     pub rev: Option<String>,
+    /// Exact commit learned from an earlier v2 response in this clone operation.
+    /// Unlike `rev`, this is metadata-only and never contacts the upstream or
+    /// schedules work.
+    #[serde(default)]
+    pub pinned: Option<String>,
 }
 
 fn default_clonepack_kind() -> String {
@@ -384,6 +444,14 @@ pub struct BuildRequest {
 #[derive(Serialize)]
 pub struct BuildResponse {
     pub status: String,
+    pub queue_depth: usize,
+}
+
+#[derive(Serialize)]
+pub struct ArtifactPendingResponse {
+    pub code: &'static str,
+    pub commit: String,
+    pub status: &'static str,
     pub queue_depth: usize,
 }
 
@@ -2418,6 +2486,30 @@ fn selected_clonepack_artifacts<'a>(
     }
 }
 
+/// Select exactly the variant requested by a v2 client. The legacy selector
+/// above intentionally retains its shallow-to-full and top-level fallbacks for
+/// protocol-v1 callers.
+fn exact_clonepack_artifacts<'a>(
+    info: &'a RefInfo,
+    clonepack_kind: &str,
+) -> Option<&'a crate::ClonepackArtifacts> {
+    match clonepack_kind {
+        "shallow" => Some(&info.shallow_clonepack),
+        "full" => Some(&info.full_clonepack),
+        _ => None,
+    }
+}
+
+fn exact_ref_info_serves_commit(info: &RefInfo, clonepack_kind: &str, commit: &str) -> bool {
+    if info.build_status.as_deref() == Some(crate::remote_gc::EVICTED_BUILD_STATUS) {
+        return false;
+    }
+    matches!(
+        exact_clonepack_artifacts(info, clonepack_kind),
+        Some(artifacts) if !artifacts.manifest.is_empty() && artifacts.commit == commit
+    )
+}
+
 fn selected_clonepack_manifest(info: &RefInfo, clonepack_kind: &str) -> String {
     let artifacts = selected_clonepack_artifacts(info, clonepack_kind);
     if artifacts.manifest.is_empty() {
@@ -2442,6 +2534,83 @@ fn ref_info_serves_commit(info: &RefInfo, clonepack_kind: &str, commit: &str) ->
     }
     !selected_clonepack_manifest(info, clonepack_kind).is_empty()
         && selected_clonepack_commit(info, clonepack_kind) == commit
+}
+
+fn request_protocol(headers: &HeaderMap) -> Option<u32> {
+    headers
+        .get("x-ripclone-protocol")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse().ok())
+}
+
+fn artifact_pending_response(commit: &str, queue_depth: usize) -> Response {
+    (
+        StatusCode::ACCEPTED,
+        Json(ArtifactPendingResponse {
+            code: "artifact_pending",
+            commit: commit.to_string(),
+            status: "building",
+            queue_depth,
+        }),
+    )
+        .into_response()
+}
+
+/// A post-pin lookup performs only a fixed set of repo-scoped point reads.
+/// Missing exact metadata is a normal pending result: branch publication may
+/// have replaced the only row for this commit, and pinning does not create a
+/// retention lease.
+async fn load_pinned_ref_info(
+    ref_store: &Arc<dyn RefStore>,
+    counts: Option<&TestWorkCounts>,
+    repo_id: &RepoId,
+    branch: &str,
+    pinned: &str,
+    clonepack_kind: &str,
+) -> Result<Option<(String, RefInfo)>> {
+    if let Some(counts) = counts {
+        counts.ref_point_reads.fetch_add(1, Ordering::Relaxed);
+    }
+    let branch_info = ref_store.load_branch(repo_id, branch).await?;
+    if let Some(info) = branch_info.as_ref()
+        && exact_ref_info_serves_commit(info, clonepack_kind, pinned)
+    {
+        return Ok(Some((branch.to_string(), info.clone())));
+    }
+
+    let effective_branch = branch_info
+        .as_ref()
+        .filter(|_| branch == "HEAD")
+        .map(|info| info.default_branch.as_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(branch);
+    let exact_key = ref_store_key(effective_branch, Some(pinned), Some(pinned));
+    if exact_key != branch {
+        if let Some(counts) = counts {
+            counts.ref_point_reads.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some(info) = ref_store.load_branch(repo_id, &exact_key).await?
+            && exact_ref_info_serves_commit(&info, clonepack_kind, pinned)
+        {
+            return Ok(Some((exact_key, info)));
+        }
+    }
+
+    if effective_branch != branch {
+        let branch_exact_key = ref_store_key(branch, Some(pinned), Some(pinned));
+        if branch_exact_key != exact_key {
+            if let Some(counts) = counts {
+                counts.ref_point_reads.fetch_add(1, Ordering::Relaxed);
+            }
+            if let Some(info) = ref_store.load_branch(repo_id, &branch_exact_key).await?
+                && exact_ref_info_serves_commit(&info, clonepack_kind, pinned)
+            {
+                return Ok(Some((branch_exact_key, info)));
+            }
+        }
+    }
+
+    Ok(None)
 }
 
 /// Returns true when the branch's stored HEAD ref exists, matches the requested
@@ -2604,6 +2773,30 @@ async fn get_ref_inner(
     {
         return resp;
     }
+    if let Some(pinned) = params.pinned.as_deref()
+        && let Some(resp) = validation::reject_if_invalid(|| validation::validate_object_id(pinned))
+    {
+        return resp;
+    }
+    if params.rev.is_some() && params.pinned.is_some() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "rev and pinned cannot be combined".to_string(),
+            }),
+        )
+            .into_response();
+    }
+    let protocol_v2 = request_protocol(&headers) == Some(2);
+    if params.pinned.is_some() && !protocol_v2 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "pinned ref lookups require ripclone protocol 2".to_string(),
+            }),
+        )
+            .into_response();
+    }
     match repo_is_added(&state, &repo_id).await {
         Ok(true) => {}
         Ok(false) => return repo_not_added_response(),
@@ -2635,14 +2828,68 @@ async fn get_ref_inner(
             Err(resp) => return resp,
         };
 
+    if let Some(pinned) = params.pinned.as_deref() {
+        if let Some(counts) = state.test_work_counts.as_deref() {
+            counts.pinned_requests.fetch_add(1, Ordering::Relaxed);
+        }
+        let resolved = match load_pinned_ref_info(
+            &state.ref_store,
+            state.test_work_counts.as_deref(),
+            &repo_id,
+            &branch,
+            pinned,
+            &params.clonepack,
+        )
+        .await
+        {
+            Ok(resolved) => resolved,
+            Err(e) => {
+                state.metrics.record_error();
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("pinned ref lookup failed: {e}"),
+                    }),
+                )
+                    .into_response();
+            }
+        };
+        let Some((_key, info)) = resolved else {
+            return artifact_pending_response(pinned, 1);
+        };
+        let response_branch = if branch == "HEAD" && !info.default_branch.is_empty() {
+            info.default_branch.clone()
+        } else {
+            branch.clone()
+        };
+        let response = ref_response(
+            &repo_id,
+            &provider,
+            response_branch,
+            &info,
+            &state.storage,
+            &params.clonepack,
+            private,
+        );
+        if response.commit != pinned || response.clonepack_manifest.is_empty() {
+            return artifact_pending_response(pinned, 1);
+        }
+        return (StatusCode::OK, Json(response)).into_response();
+    }
+
     // Serialize syncs for this repo so concurrent fetches do not corrupt the
     // bare mirror directory. Acquiring the lock also means any in-progress sync
     // for this repo has finished by the time we proceed.
     let fresh_key = format!("{}/{}", repo_id.storage_key(), branch);
     let lock = repo_lock(&state.sync_locks, &repo_id).await;
     let _guard = lock.lock().await;
+    let cache_variant = if protocol_v2 {
+        format!("v2:{}", params.clonepack)
+    } else {
+        params.clonepack.clone()
+    };
     if params.rev.is_none()
-        && let Some(resp) = cached_ref_response(&state, &repo_id, &branch, &params.clonepack)
+        && let Some(resp) = cached_ref_response(&state, &repo_id, &branch, &cache_variant)
     {
         // A cached hit is still a real access for warm-TTL accounting; bump
         // last_accessed_at on the branch row this response came from.
@@ -2662,6 +2909,9 @@ async fn get_ref_inner(
     // Skip the `git fetch` when the mirror was refreshed within the TTL — by a
     // recent resolve, or by the sync we just waited on while holding the lock.
     if !mirror_is_fresh(&state, &fresh_key) {
+        if let Some(counts) = state.test_work_counts.as_deref() {
+            counts.upstream_accesses.fetch_add(1, Ordering::Relaxed);
+        }
         if let Err(e) = ensure_mirror(
             &mirror_dir,
             &provider,
@@ -2775,10 +3025,13 @@ async fn get_ref_inner(
                 }
                 _ => false,
             };
+            let exact_variant_pending =
+                protocol_v2 && !exact_ref_info_serves_commit(&info, &params.clonepack, &commit);
             if (params.rev.is_none()
                 && full_clonepack_pending_for_tip(&info, &params.clonepack, &commit))
                 || pending_for_rev
                 || evicted_for_rev
+                || exact_variant_pending
             {
                 // Evicted refs have no artifacts to serve; enqueue a rebuild so a
                 // client that only polls GET will eventually see a 200. A ref that
@@ -2810,14 +3063,19 @@ async fn get_ref_inner(
                         );
                     }
                 }
-                return (
-                    StatusCode::ACCEPTED,
-                    Json(BuildResponse {
-                        status: "building".to_string(),
-                        queue_depth: state.build_queue.depth().await,
-                    }),
-                )
-                    .into_response();
+                let queue_depth = state.build_queue.depth().await;
+                return if protocol_v2 {
+                    artifact_pending_response(&commit, queue_depth)
+                } else {
+                    (
+                        StatusCode::ACCEPTED,
+                        Json(BuildResponse {
+                            status: "building".to_string(),
+                            queue_depth,
+                        }),
+                    )
+                        .into_response()
+                };
             }
             // A successful read of an existing ref keeps it warm: atomically bump
             // last_accessed_at without clobbering a concurrent sync's newer data.
@@ -2844,13 +3102,7 @@ async fn get_ref_inner(
                 private,
             );
             if info.build_status.is_none() && params.rev.is_none() {
-                cache_ref_response(
-                    &state,
-                    &repo_id,
-                    &effective_branch,
-                    &params.clonepack,
-                    &resp,
-                );
+                cache_ref_response(&state, &repo_id, &effective_branch, &cache_variant, &resp);
             }
             (StatusCode::OK, Json(resp)).into_response()
         }
@@ -7166,6 +7418,10 @@ pub async fn process_build_job(
     state: &ServerState,
     job: &BuildJob,
 ) -> Result<SyncBuildResult, BuildError> {
+    if let Some(counts) = state.test_work_counts.as_deref() {
+        counts.builder_entries.fetch_add(1, Ordering::Relaxed);
+        counts.source_acquisitions.fetch_add(1, Ordering::Relaxed);
+    }
     let repo_id = &job.repo_id;
     let branch = &job.branch;
     let at_rev = job.rev.clone();
@@ -7624,6 +7880,9 @@ async fn enqueue_recheck_build(
 }
 
 async fn enqueue_direct_build(state: &ServerState, job: BuildJob) -> Result<(), String> {
+    if let Some(counts) = state.test_work_counts.as_deref() {
+        counts.enqueues.fetch_add(1, Ordering::Relaxed);
+    }
     // Count metrics off the outcome so the queue-depth gauge stays balanced: only
     // a genuinely new job bumps it (and its completion decrements it). A coalesced
     // enqueue drains no job, so it must not touch the gauge.
@@ -8081,7 +8340,7 @@ pub async fn run_server_with_barrier(
         webhook_config,
         sync_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         mirror_freshness: Arc::new(std::sync::Mutex::new(HashMap::new())),
-        mirror_fresh_ttl: Duration::from_secs(60),
+        mirror_fresh_ttl: mirror_fresh_ttl_from_env(),
         ref_response_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
         artifact_fetch_count: Arc::new(AtomicUsize::new(0)),
         fail_first_fetches: fail_first_fetches_from_env(),
@@ -8089,6 +8348,7 @@ pub async fn run_server_with_barrier(
         readyz_cache: Arc::new(std::sync::Mutex::new(None)),
         access_verifier: Arc::new(HttpAccessVerifier::new()),
         require_repo_auth: require_repo_auth_from_env(),
+        test_work_counts: None,
     };
 
     // Only the local queue runs builds in-process.
@@ -8145,6 +8405,79 @@ pub async fn run_server(
 mod tests {
     use super::*;
     use tower::util::ServiceExt;
+
+    #[test]
+    fn protocol_v2_requires_the_requested_clonepack_variant() {
+        let full = crate::ClonepackArtifacts {
+            commit: "a".repeat(40),
+            manifest: "full-manifest".to_string(),
+            ..Default::default()
+        };
+        let shallow = crate::ClonepackArtifacts {
+            commit: "a".repeat(40),
+            manifest: "shallow-manifest".to_string(),
+            ..Default::default()
+        };
+        let full_only = RefInfo {
+            commit: "a".repeat(40),
+            full_clonepack: full.clone(),
+            clonepack_manifest: full.manifest.clone(),
+            ..Default::default()
+        };
+        assert!(
+            ref_info_serves_commit(&full_only, "shallow", &"a".repeat(40)),
+            "legacy selector retains shallow-to-full fallback"
+        );
+        assert!(!exact_ref_info_serves_commit(
+            &full_only,
+            "shallow",
+            &"a".repeat(40)
+        ));
+        assert!(exact_ref_info_serves_commit(
+            &full_only,
+            "full",
+            &"a".repeat(40)
+        ));
+
+        let shallow_only = RefInfo {
+            commit: "a".repeat(40),
+            shallow_clonepack: shallow,
+            ..Default::default()
+        };
+        assert!(exact_ref_info_serves_commit(
+            &shallow_only,
+            "shallow",
+            &"a".repeat(40)
+        ));
+        assert!(!exact_ref_info_serves_commit(
+            &shallow_only,
+            "full",
+            &"a".repeat(40)
+        ));
+    }
+
+    #[test]
+    fn protocol_v2_rejects_empty_evicted_and_mismatched_artifacts() {
+        let commit = "a".repeat(40);
+        let mut info = RefInfo {
+            commit: commit.clone(),
+            full_clonepack: crate::ClonepackArtifacts {
+                commit: commit.clone(),
+                manifest: "manifest".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(exact_ref_info_serves_commit(&info, "full", &commit));
+        info.full_clonepack.manifest.clear();
+        assert!(!exact_ref_info_serves_commit(&info, "full", &commit));
+        info.full_clonepack.manifest = "manifest".to_string();
+        info.full_clonepack.commit = "b".repeat(40);
+        assert!(!exact_ref_info_serves_commit(&info, "full", &commit));
+        info.full_clonepack.commit = commit.clone();
+        info.build_status = Some(crate::remote_gc::EVICTED_BUILD_STATUS.to_string());
+        assert!(!exact_ref_info_serves_commit(&info, "full", &commit));
+    }
 
     // Classification must be TYPE-based (downcast at the do_sync error boundary),
     // not string-matching. These pin the concrete-source → retryable mapping; a
@@ -8288,6 +8621,7 @@ mod tests {
             // the authz-specific tests override these two fields with a fake.
             access_verifier: Arc::new(HttpAccessVerifier::new()),
             require_repo_auth: false,
+            test_work_counts: None,
         }
     }
 

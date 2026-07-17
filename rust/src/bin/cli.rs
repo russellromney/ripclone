@@ -1228,63 +1228,38 @@ async fn main() -> Result<()> {
             } else {
                 Some(ripclone::mode::clonepack_kind_for_depth(depth))
             };
-            // Content bytes come only from the signed URLs in the ref response. If
-            // one expires mid-clone, re-resolve the ref (mints fresh URLs and
-            // re-runs the server's access check) and retry — a couple of times,
-            // so a short signed-URL TTL stays safe for a long clone. Each attempt
-            // re-resolves, since install_repo_with_mode_at resolves the ref itself.
-            const STALE_URL_MAX_RETRIES: u32 = 2;
-            let mut stale_retries = 0u32;
-            // End-to-end wall clock for the clone, for the metrics report.
-            let clone_started = std::time::Instant::now();
-            let outcome = loop {
-                let res = client
-                    .install_repo_with_mode_at(
-                        &repo_path,
-                        &branch,
-                        at.as_deref(),
-                        &target,
-                        mode,
-                        clonepack_kind,
-                        if enable_bench {
-                            Some(&mut benchmark)
-                        } else {
-                            None
-                        },
-                    )
-                    .await;
-                match res {
-                    Ok(outcome) => break outcome,
-                    Err(e)
-                        if ripclone::client::should_retry_stale(
-                            stale_retries,
-                            STALE_URL_MAX_RETRIES,
-                            &e,
-                        ) =>
-                    {
-                        stale_retries += 1;
-                        eprintln!(
-                            "ripclone: artifact URLs expired mid-clone — re-resolving and retrying (attempt {stale_retries})…"
-                        );
-                    }
-                    Err(e) => return Err(e),
-                }
-            };
-            let total_ms = clone_started.elapsed().as_millis() as u64;
-            println!("installed {} into {}", repo_path, target.display());
-            maybe_verify_upstream(
+            let upstream_snapshot = observe_upstream_for_verification(
                 &provider,
                 &repo_path,
                 &branch,
                 at.as_deref(),
                 mode,
-                &target,
                 upstream_token.as_deref(),
-                &outcome.commit,
                 verify_upstream,
                 &provider_registry,
             )
             .await?;
+            // End-to-end wall clock for the clone, for the metrics report.
+            let clone_started = std::time::Instant::now();
+            let outcome = client
+                .install_repo_with_mode_at(
+                    &repo_path,
+                    &branch,
+                    at.as_deref(),
+                    &target,
+                    mode,
+                    clonepack_kind,
+                    if enable_bench {
+                        Some(&mut benchmark)
+                    } else {
+                        None
+                    },
+                )
+                .await?;
+            let total_ms = clone_started.elapsed().as_millis() as u64;
+            println!("installed {} into {}", repo_path, target.display());
+            verify_upstream_snapshot(&target, &outcome.commit, upstream_snapshot.as_deref())
+                .await?;
             if enable_bench {
                 let report = benchmark.finish();
                 println!("{}", serde_json::to_string_pretty(&report)?);
@@ -1655,20 +1630,18 @@ fn provider_instance(provider_id: &str, registry: &ProviderRegistry) -> Option<P
 /// Files-mode clones are not verifiable this way and are skipped (with a warning
 /// when explicitly requested).
 #[allow(clippy::too_many_arguments)]
-async fn maybe_verify_upstream(
+async fn observe_upstream_for_verification(
     provider_id: &str,
     repo_path: &str,
     branch: &str,
     at: Option<&str>,
     mode: CloneMode,
-    target: &std::path::Path,
     upstream_token: Option<&str>,
-    installed_commit: &str,
     requested: VerifyUpstream,
     registry: &ProviderRegistry,
-) -> Result<()> {
+) -> Result<Option<String>> {
     if requested == VerifyUpstream::Never {
-        return Ok(());
+        return Ok(None);
     }
     if let Some(rev) = at {
         match requested {
@@ -1683,7 +1656,7 @@ async fn maybe_verify_upstream(
                     "warning: --verify-upstream skipped for --at {rev}; \
                      the ripclone server remains in the trust base for this clone"
                 );
-                return Ok(());
+                return Ok(None);
             }
             VerifyUpstream::Never => unreachable!(),
         }
@@ -1694,7 +1667,7 @@ async fn maybe_verify_upstream(
                 "warning: --verify-upstream is not supported for files-mode clones; skipping"
             );
         }
-        return Ok(());
+        return Ok(None);
     }
 
     let provider = match provider_instance(provider_id, registry) {
@@ -1710,7 +1683,7 @@ async fn maybe_verify_upstream(
                 "warning: --verify-upstream skipped (unknown provider '{provider_id}'); \
                  the ripclone server remains in the trust base for this clone"
             );
-            return Ok(());
+            return Ok(None);
         }
     };
 
@@ -1737,23 +1710,23 @@ async fn maybe_verify_upstream(
                     eprintln!(
                         "warning: --verify-upstream skipped (private upstream without credential); the ripclone server remains in the trust base for this clone"
                     );
-                    return Ok(());
+                    return Ok(None);
                 }
                 Ok(Err(e)) => {
                     eprintln!(
                         "warning: --verify-upstream skipped (upstream probe failed: {e:#}); the ripclone server remains in the trust base for this clone"
                     );
-                    return Ok(());
+                    return Ok(None);
                 }
                 Err(e) => {
                     eprintln!(
                         "warning: --verify-upstream skipped (upstream probe task failed: {e}); the ripclone server remains in the trust base for this clone"
                     );
-                    return Ok(());
+                    return Ok(None);
                 }
             };
         }
-        VerifyUpstream::Never => return Ok(()),
+        VerifyUpstream::Never => return Ok(None),
     }
 
     let upstream_tip = match upstream_tip {
@@ -1788,7 +1761,7 @@ async fn maybe_verify_upstream(
                             "warning: --verify-upstream skipped (upstream unreachable: {e:#}); \
                              the ripclone server remains in the trust base for this clone"
                         );
-                        return Ok(());
+                        return Ok(None);
                     }
                     anyhow::bail!(
                         "upstream verification failed: could not reach upstream host: {e:#}"
@@ -1801,6 +1774,17 @@ async fn maybe_verify_upstream(
         }
     };
 
+    Ok(Some(upstream_tip))
+}
+
+async fn verify_upstream_snapshot(
+    target: &std::path::Path,
+    installed_commit: &str,
+    upstream_tip: Option<&str>,
+) -> Result<()> {
+    let Some(upstream_tip) = upstream_tip else {
+        return Ok(());
+    };
     if upstream_tip != installed_commit {
         anyhow::bail!(
             "upstream verification failed: installed commit {installed_commit} does not match upstream tip {upstream_tip}"
