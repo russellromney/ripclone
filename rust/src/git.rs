@@ -1441,7 +1441,9 @@ fn index_pack_inner(
 
 pub fn init<P: AsRef<Path>>(git_dir: P) -> Result<()> {
     let mut command = Command::new("git");
-    command.args(["init", "-q", &git_dir.as_ref().to_string_lossy()]);
+    command
+        .args(["init", "-q"])
+        .arg(crate::topup::child_staging_path(git_dir.as_ref())?);
     crate::topup::bind_child_to_staging(&mut command);
     let status = command.status().context("git init")?;
     if !status.success() {
@@ -1455,7 +1457,9 @@ pub(crate) fn init_cancelled<P: AsRef<Path>>(
     cancelled: &tokio_util::sync::CancellationToken,
 ) -> Result<()> {
     let mut command = Command::new("git");
-    command.args(["init", "-q"]).arg(git_dir.as_ref());
+    command
+        .args(["init", "-q"])
+        .arg(crate::topup::child_staging_path(git_dir.as_ref())?);
     crate::topup::bind_child_to_staging(&mut command);
     #[cfg(unix)]
     {

@@ -1796,7 +1796,10 @@ impl CasCompletionVerifier {
             bail!("Files materialization produced Git administrative state");
         }
         let mut materialized_entries = 0usize;
-        for entry in walkdir::WalkDir::new(destination).follow_links(false) {
+        // A Linux BoundInstall destination is a `/proc/self/fd/N` capability
+        // symlink. Resolve that root explicitly with `/.`, while continuing to
+        // refuse traversal through every symlink inside the worktree.
+        for entry in walkdir::WalkDir::new(destination.join(".")).follow_links(false) {
             if !entry?.file_type().is_dir() {
                 materialized_entries += 1;
             }

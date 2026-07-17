@@ -1260,10 +1260,10 @@ fn build_source_pack(
     let mut command = safe_command();
     command
         .arg("--git-dir")
-        .arg(git_dir)
+        .arg(child_bound_path(Path::new(&git_dir))?)
         .args(["-c", "core.hooksPath=/dev/null", "-c", "pack.threads=1"])
         .arg("pack-objects")
-        .arg(&prefix)
+        .arg(child_bound_path(&prefix)?)
         .stdin(Stdio::from(input))
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -1350,7 +1350,7 @@ fn validate_inventory_sizes(
     let mut command = safe_command();
     command
         .arg("-C")
-        .arg(repo)
+        .arg(child_bound_path(repo)?)
         .args(["-c", "core.hooksPath=/dev/null"])
         .args([
             "cat-file",
@@ -1474,7 +1474,7 @@ fn enumerate_inventory(
     let mut command = safe_command();
     command
         .arg("-C")
-        .arg(repo)
+        .arg(child_bound_path(repo)?)
         .args(["-c", "core.hooksPath=/dev/null"])
         .args(args)
         .stdout(Stdio::piped())
@@ -1534,10 +1534,10 @@ fn sort_unique_file(input: &Path, output: &Path, cancelled: &CancellationToken) 
         .env_clear()
         .env("PATH", path)
         .env("LC_ALL", "C")
-        .env("TMPDIR", &sort_tmp)
+        .env("TMPDIR", child_bound_path(&sort_tmp)?)
         .args(["-S", "32M", "-u", "-o"])
-        .arg(output)
-        .arg(input)
+        .arg(child_bound_path(output)?)
+        .arg(child_bound_path(input)?)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -1588,7 +1588,7 @@ fn init_bare(path: &Path, format: GitObjectFormat, cancelled: &CancellationToken
             "--bare",
             &format!("--object-format={}", format.git_name()),
         ])
-        .arg(path);
+        .arg(child_bound_path(path)?);
     let output = run_output_bounded_cancelled(
         command,
         cancelled,
@@ -1612,7 +1612,7 @@ fn safe_git_cancelled(repo: &Path, args: &[&str], cancelled: &CancellationToken)
     let mut command = safe_command();
     command
         .arg("-C")
-        .arg(repo)
+        .arg(child_bound_path(repo)?)
         .args(["-c", "core.hooksPath=/dev/null"])
         .args(args);
     run_output_bounded_cancelled(command, cancelled, 1024 * 1024, "run isolated Git")
@@ -1646,7 +1646,7 @@ fn safe_git_ok_quiet_cancelled(
     let mut command = safe_command();
     command
         .arg("-C")
-        .arg(repo)
+        .arg(child_bound_path(repo)?)
         .args(["-c", "core.hooksPath=/dev/null"])
         .args(args)
         .stdout(Stdio::null())
@@ -1922,6 +1922,53 @@ fn bind_child_to_scratch(command: &mut Command) {
             }
         }
     });
+}
+
+/// Linux capability paths name descriptors that must remain `CLOEXEC`. Child
+/// processes are already `fchdir`-bound to the same directory in `pre_exec`,
+/// so translate descendants of that exact directory to relative arguments
+/// instead of passing a `/proc/self/fd/*` name that disappears at exec.
+fn child_bound_path(path: &Path) -> Result<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        let Some(remainder) = path.strip_prefix("/proc/self/fd").ok() else {
+            return Ok(path.to_owned());
+        };
+        let mut components = remainder.components();
+        let Some(std::path::Component::Normal(raw_fd)) = components.next() else {
+            return Ok(path.to_owned());
+        };
+        let Some(raw_fd) = raw_fd
+            .to_str()
+            .and_then(|value| value.parse::<libc::c_int>().ok())
+        else {
+            return Ok(path.to_owned());
+        };
+        let Some(bound_fd) = SCRATCH_CHILD_FD.with(|slot| slot.get()) else {
+            return Ok(path.to_owned());
+        };
+        let source = fd_stat(raw_fd)?;
+        let bound = fd_stat(bound_fd)?;
+        if source.st_dev != bound.st_dev || source.st_ino != bound.st_ino {
+            return Ok(path.to_owned());
+        }
+        let relative: PathBuf = components.collect();
+        if relative.components().any(|part| {
+            !matches!(
+                part,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )
+        }) {
+            bail!("Git source child path escapes its bound scratch directory")
+        }
+        return Ok(if relative.as_os_str().is_empty() {
+            PathBuf::from(".")
+        } else {
+            relative
+        });
+    }
+    #[cfg(not(target_os = "linux"))]
+    Ok(path.to_owned())
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -2616,6 +2663,30 @@ mod tests {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        bind_child_to_scratch(&mut child);
+        assert!(child.status().unwrap().success());
+        scope.finish().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cloexec_capability_paths_become_bound_relative_child_arguments() {
+        let root = tempfile::tempdir().unwrap();
+        let attempt = BoundScratch::new(root.path(), "child-path").unwrap();
+        let scope = attempt.enter().unwrap();
+        std::fs::write(attempt.path().join("sentinel"), b"bound").unwrap();
+        let child_path = child_bound_path(&attempt.path().join("sentinel")).unwrap();
+        assert_eq!(child_path, Path::new("sentinel"));
+
+        let mut child = Command::new("sh");
+        child
+            .args([
+                "-c",
+                "test -f \"$1\" && test ! -e /proc/self/fd/$ATTEMPT_FD",
+                "scratch-child",
+            ])
+            .arg(child_path)
+            .env("ATTEMPT_FD", attempt.attempt.as_raw_fd().to_string());
         bind_child_to_scratch(&mut child);
         assert!(child.status().unwrap().success());
         scope.finish().unwrap();

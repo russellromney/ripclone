@@ -567,6 +567,53 @@ pub(crate) fn bind_child_to_staging(command: &mut Command) {
     });
 }
 
+/// Linux capability paths name descriptors that must remain `CLOEXEC`. Child
+/// processes are already `fchdir`-bound to the same directory in `pre_exec`,
+/// so translate descendants of that exact directory to relative arguments
+/// instead of passing a `/proc/self/fd/*` name that disappears at exec.
+pub(crate) fn child_staging_path(path: &Path) -> Result<std::path::PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        let Some(remainder) = path.strip_prefix("/proc/self/fd").ok() else {
+            return Ok(path.to_owned());
+        };
+        let mut components = remainder.components();
+        let Some(std::path::Component::Normal(raw_fd)) = components.next() else {
+            return Ok(path.to_owned());
+        };
+        let Some(raw_fd) = raw_fd
+            .to_str()
+            .and_then(|value| value.parse::<libc::c_int>().ok())
+        else {
+            return Ok(path.to_owned());
+        };
+        let Some(bound_fd) = INSTALL_STAGING_FD.with(|slot| slot.get()) else {
+            return Ok(path.to_owned());
+        };
+        let source = fd_stat(raw_fd)?;
+        let bound = fd_stat(bound_fd)?;
+        if source.st_dev != bound.st_dev || source.st_ino != bound.st_ino {
+            return Ok(path.to_owned());
+        }
+        let relative: std::path::PathBuf = components.collect();
+        if relative.components().any(|part| {
+            !matches!(
+                part,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )
+        }) {
+            bail!("clone child path escapes its bound staging directory")
+        }
+        return Ok(if relative.as_os_str().is_empty() {
+            std::path::PathBuf::from(".")
+        } else {
+            relative
+        });
+    }
+    #[cfg(not(target_os = "linux"))]
+    Ok(path.to_owned())
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn cstring(value: &std::ffi::OsStr) -> Result<CString> {
     CString::new(value.as_bytes()).context("path contains NUL")
@@ -960,6 +1007,19 @@ fn validate_oid(label: &str, value: &str) -> Result<()> {
 /// Keep only physical `.git/objects` and `.git/index`, then create all other
 /// control state ourselves. This is an allowlist, not a config blacklist.
 fn normalize_fresh_control_dir(repo: &Path) -> Result<()> {
+    // On Linux the transaction root is the exact `/proc/self/fd/N`
+    // capability held by BoundInstall. Follow only that already-validated root
+    // link; every child is still inspected without following its final link.
+    #[cfg(target_os = "linux")]
+    let repo_meta = if repo.starts_with("/proc/self/fd")
+        && child_staging_path(repo)?.as_path() == Path::new(".")
+    {
+        std::fs::metadata(repo)
+    } else {
+        std::fs::symlink_metadata(repo)
+    }
+    .context("installer did not create repo")?;
+    #[cfg(not(target_os = "linux"))]
     let repo_meta = std::fs::symlink_metadata(repo).context("installer did not create repo")?;
     if !repo_meta.file_type().is_dir() || repo_meta.file_type().is_symlink() {
         bail!("installer repository must be a physical directory");
@@ -1105,11 +1165,12 @@ fn verify_exact_full_object_store(
     let reachable_path = scratch.path().join("reachable");
     let odb_path = scratch.path().join("odb");
 
+    let repo = child_staging_path(repo)?;
     let mut reachable_command = sanitized_git_command();
     reachable_command
+        .arg("-C")
+        .arg(&repo)
         .args([
-            "-C",
-            repo.to_str().context("non-UTF8 repository path")?,
             "rev-list",
             "--objects",
             "--no-object-names",
@@ -1133,9 +1194,9 @@ fn verify_exact_full_object_store(
 
     let mut odb_command = sanitized_git_command();
     odb_command
+        .arg("-C")
+        .arg(&repo)
         .args([
-            "-C",
-            repo.to_str().context("non-UTF8 repository path")?,
             "cat-file",
             "--batch-all-objects",
             "--batch-check=%(objectname) %(objecttype) %(objectsize)",
@@ -1396,7 +1457,7 @@ fn git_output_cancelled(
             "core.fsmonitor=false",
         ])
         .arg("-C")
-        .arg(repo)
+        .arg(child_staging_path(repo)?)
         .args(args)
         .stdout(stdout)
         .stderr(stderr);
@@ -1438,7 +1499,7 @@ fn git_output(repo: &Path, args: &[&str]) -> Result<Output> {
             "core.fsmonitor=false",
         ])
         .arg("-C")
-        .arg(repo)
+        .arg(child_staging_path(repo)?)
         .args(args)
         .output()
         .with_context(|| format!("run Git validation in {}", repo.display()))
@@ -1739,14 +1800,27 @@ mod blocker_tests {
         std::fs::create_dir(&parent).unwrap();
         let transaction = BoundInstall::new(&parent.join("destination"), "cloexec").unwrap();
         let scope = transaction.enter_staging().unwrap();
+        std::fs::write(transaction.staging_root().join("sentinel"), b"bound").unwrap();
+        let child_path = child_staging_path(&transaction.staging_root().join("sentinel")).unwrap();
+        #[cfg(target_os = "linux")]
+        assert_eq!(child_path, Path::new("sentinel"));
         let mut command = std::process::Command::new("sh");
         #[cfg(target_os = "linux")]
-        command.args([
-            "-c",
-            "for f in /proc/self/fd/*; do readlink \"$f\" || true; done",
-        ]);
+        command
+            .args([
+                "-c",
+                "test -f \"$1\"; found=$?; for f in /proc/self/fd/*; do readlink \"$f\" || true; done; exit $found",
+                "staging-child",
+            ])
+            .arg(&child_path);
         #[cfg(target_os = "macos")]
-        command.args(["-c", "for f in /dev/fd/*; do readlink \"$f\" || true; done"]);
+        command
+            .args([
+                "-c",
+                "test -f \"$1\"; found=$?; for f in /dev/fd/*; do readlink \"$f\" || true; done; exit $found",
+                "staging-child",
+            ])
+            .arg(&child_path);
         bind_child_to_staging(&mut command);
         let output = command.output().unwrap();
         assert!(output.status.success());
