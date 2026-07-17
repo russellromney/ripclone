@@ -28,7 +28,11 @@ lint() {
 # (gitea/databases/s3gc/e2e/…) use prebuilt binaries from ci-build instead;
 # staging the full suite there was ~30m cold and is not worth it.
 run_tests() {
-  ( cd "$ROOT/rust" && cargo test --profile ci --all-targets --locked )
+  ( isolated_config="$(mktemp -d "${TMPDIR:-/tmp}/ripclone-ci-test.XXXXXX")"
+    trap 'rm -rf "$isolated_config"' EXIT
+    export RIPCLONE_CONFIG="$isolated_config/config.toml"
+    cd "$ROOT/rust"
+    cargo test --profile ci --all-targets --locked )
 }
 
 e2e() {
