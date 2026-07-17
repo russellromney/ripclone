@@ -3286,6 +3286,8 @@ mod tests {
         std::fs::create_dir(&scratch).unwrap();
         let session = "b".repeat(64);
         let task_session = session.clone();
+        let task_cancel = CancellationToken::new();
+        let child_task_cancel = task_cancel.clone();
         let task = tokio::spawn(async move {
             task_registry
                 .with_materialized_builder_source(
@@ -3296,16 +3298,31 @@ mod tests {
                     "o/r",
                     &"3".repeat(40),
                     &task_session,
-                    1,
+                    6,
                     loader,
                     scratch,
-                    &CancellationToken::new(),
+                    &child_task_cancel,
                     |_source, _cancel| Ok(()),
                 )
                 .await
         });
-        while !started.load(Ordering::SeqCst) {
-            tokio::task::yield_now().await;
+        let mut task = task;
+        let startup = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !started.load(Ordering::SeqCst) && !task.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        if startup.is_err() {
+            task_cancel.cancel();
+            let drained = tokio::time::timeout(std::time::Duration::from_secs(3), &mut task).await;
+            panic!(
+                "builder source child did not start within 10 seconds; drain result: {drained:?}"
+            );
+        }
+        if !started.load(Ordering::SeqCst) {
+            let result = task.await;
+            panic!("builder source child exited before its blocking load began: {result:?}");
         }
         sqlx::query("UPDATE artifact_jobs SET lease_expires_at=unixepoch()-1 WHERE id=?")
             .bind(artifact)
