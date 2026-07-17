@@ -6,6 +6,8 @@ use ripclone::topup::{
 };
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(target_os = "linux")]
+use std::{fs::File, os::fd::AsRawFd, os::unix::process::CommandExt};
 
 struct Fixture {
     _root: tempfile::TempDir,
@@ -87,15 +89,8 @@ impl PinnedBundleInstaller for BoundInstaller<'_> {
         destination: &Path,
         _: &PinnedBundleRequest,
     ) -> std::result::Result<VerifiedPinnedBundle, BundleInstallFailure> {
-        git(
-            None,
-            &[
-                "clone",
-                self.inner.artifact.to_str().unwrap(),
-                destination.to_str().unwrap(),
-            ],
-        )
-        .map_err(|_| BundleInstallFailure::Integrity)?;
+        clone_into(&self.inner.artifact, destination)
+            .map_err(|_| BundleInstallFailure::Integrity)?;
         git(
             Some(destination),
             &["checkout", "--detach", &self.bundle.target_commit],
@@ -651,9 +646,20 @@ fn concurrent_destination_is_never_replaced() {
 
 fn git(repo: Option<&Path>, args: &[&str]) -> Result<()> {
     let mut command = Command::new("git");
+    #[cfg(target_os = "linux")]
+    let capability = repo.map(open_linux_capability).transpose()?.flatten();
     if let Some(repo) = repo {
+        #[cfg(target_os = "linux")]
+        command.arg("-C").arg(if capability.is_some() {
+            Path::new(".")
+        } else {
+            repo
+        });
+        #[cfg(not(target_os = "linux"))]
         command.arg("-C").arg(repo);
     }
+    #[cfg(target_os = "linux")]
+    bind_to_capability(&mut command, capability.as_ref());
     let output = command
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -665,6 +671,59 @@ fn git(repo: Option<&Path>, args: &[&str]) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn clone_into(source: &Path, destination: &Path) -> Result<()> {
+    let mut command = Command::new("git");
+    #[cfg(target_os = "linux")]
+    let capability = open_linux_capability(destination)?;
+    #[cfg(target_os = "linux")]
+    let destination_arg = if capability.is_some() {
+        Path::new(".")
+    } else {
+        destination
+    };
+    #[cfg(not(target_os = "linux"))]
+    let destination_arg = destination;
+    #[cfg(target_os = "linux")]
+    bind_to_capability(&mut command, capability.as_ref());
+    let output = command
+        .arg("clone")
+        .arg(source)
+        .arg(destination_arg)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()?;
+    if !output.status.success() {
+        bail!(
+            "git clone failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn open_linux_capability(path: &Path) -> Result<Option<File>> {
+    if path.starts_with("/proc/self/fd") {
+        Ok(Some(File::open(path)?))
+    } else {
+        Ok(None)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn bind_to_capability(command: &mut Command, capability: Option<&File>) {
+    if let Some(capability) = capability {
+        let fd = capability.as_raw_fd();
+        unsafe {
+            command.pre_exec(move || {
+                if libc::fchdir(fd) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
 }
 
 fn out(repo: &Path, args: &[&str]) -> String {
