@@ -1961,11 +1961,11 @@ fn child_bound_path(path: &Path) -> Result<PathBuf> {
         }) {
             bail!("Git source child path escapes its bound scratch directory")
         }
-        return Ok(if relative.as_os_str().is_empty() {
+        Ok(if relative.as_os_str().is_empty() {
             PathBuf::from(".")
         } else {
             relative
-        });
+        })
     }
     #[cfg(not(target_os = "linux"))]
     Ok(path.to_owned())

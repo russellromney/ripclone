@@ -604,11 +604,11 @@ pub(crate) fn child_staging_path(path: &Path) -> Result<std::path::PathBuf> {
         }) {
             bail!("clone child path escapes its bound staging directory")
         }
-        return Ok(if relative.as_os_str().is_empty() {
+        Ok(if relative.as_os_str().is_empty() {
             std::path::PathBuf::from(".")
         } else {
             relative
-        });
+        })
     }
     #[cfg(not(target_os = "linux"))]
     Ok(path.to_owned())
