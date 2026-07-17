@@ -2610,6 +2610,19 @@ async fn load_pinned_ref_info(
         }
     }
 
+    // Rev-targeted builds (for example `clone --at HEAD~1`) are also indexed
+    // directly by resolved commit. This remains a single repo-scoped point read
+    // and lets the private pin discard the caller's symbolic selector after the
+    // first response without losing compatibility with commit-keyed reuse.
+    if let Some(counts) = counts {
+        counts.ref_point_reads.fetch_add(1, Ordering::Relaxed);
+    }
+    if let Some(info) = ref_store.load_build(repo_id, pinned).await?
+        && exact_ref_info_serves_commit(&info, clonepack_kind, pinned)
+    {
+        return Ok(Some((String::new(), info)));
+    }
+
     Ok(None)
 }
 
