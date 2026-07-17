@@ -12,6 +12,8 @@ use axum::{Json, Router};
 use common::*;
 use ripclone::client::{ArtifactPending, Client};
 use ripclone::mode::CloneMode;
+use ripclone::provider::RepoId;
+use ripclone::ref_store::{FileRefStore, RefStore};
 use serde_json::json;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -644,6 +646,19 @@ async fn release_cli_installs_the_fetched_snapshot_after_branch_movement() {
             .await
             .expect("selected variant ready")
             .commit;
+        if mode == CloneMode::Files {
+            let exact_store = FileRefStore::new(&server.repo_root);
+            let repo_id = RepoId::github(format!("acme/{repo}"));
+            let exact_a = exact_store
+                .load_branch(&repo_id, "HEAD")
+                .await
+                .expect("load file-store A ref")
+                .expect("file-store A ref present");
+            exact_store
+                .save_branch(&repo_id, &format!("HEAD#{pinned}"), &exact_a)
+                .await
+                .expect("publish exact file-store A fixture");
+        }
 
         let (proxy, entered, proceed, requests, proxy_task) =
             start_ref_barrier_proxy(&server.url, mode == CloneMode::Files).await;
@@ -674,7 +689,22 @@ async fn release_cli_installs_the_fetched_snapshot_after_branch_movement() {
             .expect("ref barrier alive");
         origin.commit(&[("value.txt", "B\n")], "B");
         origin.publish();
-        assert_ne!(git(&origin.bare, &["rev-parse", "HEAD"]), pinned);
+        let newer = git(&origin.bare, &["rev-parse", "HEAD"]);
+        assert_ne!(newer, pinned);
+        if mode == CloneMode::Files {
+            server
+                .client()
+                .sync_repo(&format!("acme/{repo}"), None)
+                .await
+                .expect("publish B through file ref store");
+            let published_b = server
+                .client()
+                .resolve_ref_with_clonepack(&format!("acme/{repo}"), "HEAD", Some("full"), None)
+                .await
+                .expect("file-store branch row B ready")
+                .commit;
+            assert_eq!(published_b, newer);
+        }
         proceed.send(()).expect("release fetched A response");
         let output = tokio::time::timeout(
             Duration::from_secs(60),

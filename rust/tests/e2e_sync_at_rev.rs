@@ -197,6 +197,16 @@ async fn public_cli_clones_at_a_full_sha() {
     let out = tempfile::tempdir().expect("CLI output");
     let target = out.path().join("clone");
     let binary = cargo_bin("ripclone");
+    if let Some(dir) = std::env::var_os("RIPCLONE_BIN_DIR") {
+        assert_eq!(
+            binary.canonicalize().expect("canonical selected CLI"),
+            std::path::PathBuf::from(dir)
+                .join("ripclone")
+                .canonicalize()
+                .expect("canonical requested CLI"),
+            "full-SHA proof must spawn the requested release binary"
+        );
+    }
     let server_url = server.url.clone();
     let wanted = pinned.clone();
     let target_for_child = target.clone();

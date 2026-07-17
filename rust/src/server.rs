@@ -2806,10 +2806,15 @@ async fn get_ref_inner(
 
     let mirror_dir = state.repo_root.join(repo_id.mirror_dir_name());
     let request_token = upstream_token_from_headers(&headers);
-    let credential = match state
-        .broker
-        .fetch_credential(&repo_id, request_token.as_ref())
-    {
+    let credential = match if params.pinned.is_some() {
+        state
+            .broker
+            .fetch_cached_credential(&repo_id, request_token.as_ref())
+    } else {
+        state
+            .broker
+            .fetch_credential(&repo_id, request_token.as_ref())
+    } {
         Ok(c) => c,
         Err(e) => return credential_error_response(e),
     };
