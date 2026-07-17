@@ -100,6 +100,7 @@ pub struct Server {
     pub cas_dir: PathBuf,
     pub storage_dir: PathBuf,
     pub repo_root: PathBuf,
+    pub work_counts: Option<Arc<ripclone::server::TestWorkCounts>>,
     pub _dir: TempDir,
 }
 
@@ -258,6 +259,7 @@ async fn start_server_split_storage_inner(
         .with_ref_store(ref_store.clone(), storage.clone()),
     );
     let (local_queue, mut rx, depth) = ripclone::queue::LocalJobQueue::new(16);
+    let work_counts = Arc::new(ripclone::server::TestWorkCounts::default());
     let build_queue: ripclone::queue::JobQueueRef = Arc::new(local_queue);
     let provider_registry = ripclone::provider::ProviderRegistry::new();
     let broker: Arc<dyn ripclone::auth::broker::CredentialBroker> = Arc::new(
@@ -292,6 +294,7 @@ async fn start_server_split_storage_inner(
         readyz_cache: Arc::new(std::sync::Mutex::new(None)),
         access_verifier: Arc::new(ripclone::auth::access::HttpAccessVerifier::new()),
         require_repo_auth: false,
+        test_work_counts: Some(Arc::clone(&work_counts)),
     };
 
     let worker_state = state.clone();
@@ -358,6 +361,7 @@ async fn start_server_split_storage_inner(
         cas_dir,
         storage_dir,
         repo_root,
+        work_counts: Some(work_counts),
         _dir: dir,
     }
 }
@@ -754,6 +758,7 @@ async fn start_server_inner(
         storage_dir: cas_dir.clone(),
         cas_dir,
         repo_root,
+        work_counts: None,
         _dir: dir,
     }
 }
@@ -1684,6 +1689,15 @@ pub fn spawn_worker_args(cas_dir: &Path, repo_root: &Path, extra: &[&str]) -> Wo
 /// bins) over the compile-time `env!("CARGO_BIN_EXE_*")` path, which is baked
 /// to the *build* machine and breaks after artifact download.
 pub fn cargo_bin(name: &str) -> std::path::PathBuf {
+    if let Some(dir) = std::env::var_os("RIPCLONE_BIN_DIR") {
+        let path = std::path::PathBuf::from(dir).join(name);
+        assert!(
+            path.is_file(),
+            "RIPCLONE_BIN_DIR selected missing binary {}",
+            path.display()
+        );
+        return path;
+    }
     let key = format!("CARGO_BIN_EXE_{name}");
     if let Ok(p) = std::env::var(&key) {
         return std::path::PathBuf::from(p);

@@ -88,6 +88,7 @@ async fn start_repo_auth_server(provider_url: &str) -> Server {
         readyz_cache: Arc::new(std::sync::Mutex::new(None)),
         access_verifier: Arc::new(ripclone::auth::access::HttpAccessVerifier::new()),
         require_repo_auth: true,
+        test_work_counts: None,
     };
 
     let app = build_app(state);
@@ -105,6 +106,7 @@ async fn start_repo_auth_server(provider_url: &str) -> Server {
         storage_dir: cas_dir.clone(),
         cas_dir,
         repo_root,
+        work_counts: None,
         _dir: dir,
     }
 }

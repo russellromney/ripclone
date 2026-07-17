@@ -37,6 +37,7 @@ static SERVER_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 static PREFIX_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn s3_env() -> Option<S3Env> {
+    let required = std::env::var_os("RIPCLONE_REQUIRE_MINIO").is_some();
     let endpoint = std::env::var("RIPCLONE_S3_ENDPOINT")
         .ok()
         .filter(|s| !s.is_empty())
@@ -44,11 +45,17 @@ fn s3_env() -> Option<S3Env> {
             std::env::var("AWS_ENDPOINT_URL_S3")
                 .ok()
                 .filter(|s| !s.is_empty())
-        })?;
+        });
     let bucket = std::env::var("RIPCLONE_S3_BUCKET")
         .ok()
         .filter(|s| !s.is_empty())
-        .or_else(|| std::env::var("BUCKET_NAME").ok().filter(|s| !s.is_empty()))?;
+        .or_else(|| std::env::var("BUCKET_NAME").ok().filter(|s| !s.is_empty()));
+    if required {
+        assert!(endpoint.is_some(), "RIPCLONE_S3_ENDPOINT is required");
+        assert!(bucket.is_some(), "RIPCLONE_S3_BUCKET is required");
+    }
+    let endpoint = endpoint?;
+    let bucket = bucket?;
     let region = std::env::var("RIPCLONE_S3_REGION")
         .ok()
         .filter(|s| !s.is_empty())
@@ -126,6 +133,31 @@ fn write_cli_session_token(home: &std::path::Path, server: &str, token: &str) {
         serde_json::to_vec_pretty(&body).expect("token json"),
     )
     .expect("write token store");
+}
+
+fn required_ripclone_bin() -> std::path::PathBuf {
+    let binary = cargo_bin("ripclone");
+    if std::env::var_os("RIPCLONE_REQUIRE_MINIO").is_some() {
+        let dir = std::env::var_os("RIPCLONE_BIN_DIR")
+            .map(std::path::PathBuf::from)
+            .expect("RIPCLONE_BIN_DIR is required for the MinIO pinning proof");
+        assert_eq!(
+            binary.canonicalize().expect("canonical release binary"),
+            dir.join("ripclone")
+                .canonicalize()
+                .expect("canonical RIPCLONE_BIN_DIR binary"),
+            "CLI-spawning proof must use RIPCLONE_BIN_DIR"
+        );
+    }
+    let version = std::process::Command::new(&binary)
+        .arg("--version")
+        .output()
+        .expect("run selected ripclone --version");
+    assert!(
+        version.status.success(),
+        "selected ripclone reports version"
+    );
+    binary
 }
 
 fn free_port() -> u16 {
@@ -351,11 +383,23 @@ struct BarrierState {
     entered: Option<tokio::sync::oneshot::Sender<()>>,
     proceed: Option<tokio::sync::oneshot::Receiver<()>>,
     consumed: std::sync::atomic::AtomicBool,
+    signed_headers: Vec<String>,
 }
 
 pub struct BarrierProxy {
     pub url: String,
+    state: Arc<std::sync::Mutex<BarrierState>>,
     _handle: tokio::task::JoinHandle<()>,
+}
+
+impl BarrierProxy {
+    fn signed_headers(&self) -> Vec<String> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .signed_headers
+            .clone()
+    }
 }
 
 impl Drop for BarrierProxy {
@@ -390,6 +434,11 @@ async fn proxy_signed_get_barrier(
     barrier: Arc<std::sync::Mutex<BarrierState>>,
 ) {
     eprintln!("BARRIER PROXY: signed GET received");
+    barrier
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .signed_headers
+        .push(String::from_utf8_lossy(&header).into_owned());
     let Ok(mut backend) = tokio::net::TcpStream::connect(target).await else {
         return;
     };
@@ -542,7 +591,9 @@ pub async fn start_barrier_proxy(
         entered: Some(entered),
         proceed: Some(proceed),
         consumed: std::sync::atomic::AtomicBool::new(false),
+        signed_headers: Vec::new(),
     }));
+    let observable_state = Arc::clone(&state);
 
     let handle = tokio::spawn(async move {
         loop {
@@ -560,6 +611,7 @@ pub async fn start_barrier_proxy(
 
     BarrierProxy {
         url: format!("http://127.0.0.1:{port}"),
+        state: observable_state,
         _handle: handle,
     }
 }
@@ -590,6 +642,7 @@ async fn start_s3_server_faulting(env: &S3Env, prefix: &str, fail_first: usize) 
         // read go through to the durable store, keeping /status and /ref resolve
         // coherent with the out-of-band writes.
         std::env::set_var("RIPCLONE_REF_CACHE_TTL_SECS", "0");
+        std::env::set_var("RIPCLONE_TEST_MIRROR_FRESH_TTL_MS", "0");
         // Fast re-attach when a build outlives the server's ~25s wait window.
         // Production clients keep the 2s default (this var unset).
         std::env::set_var("RIPCLONE_TEST_SYNC_POLL_MS", "100");
@@ -626,6 +679,7 @@ async fn start_s3_server_faulting(env: &S3Env, prefix: &str, fail_first: usize) 
         cas_dir: cas_dir.clone(),
         storage_dir: cas_dir,
         repo_root,
+        work_counts: None,
         _dir: dir,
     }
 }
@@ -1311,7 +1365,128 @@ async fn expired_signed_url_fails_clone_cleanly() {
 
 #[ignore = "requires S3 credentials"]
 #[tokio::test]
-async fn expired_bearer_and_signed_url_mid_cli_clone_fail_cleanly() {
+async fn expired_signed_url_retry_stays_on_pinned_commit() {
+    let direct_env = match s3_env() {
+        Some(env) => env,
+        None => {
+            eprintln!("SKIP: RIPCLONE_S3_ENDPOINT/BUCKET not set");
+            return;
+        }
+    };
+    let _server_lock = SERVER_LOCK.lock().await;
+    let prefix = unique_prefix();
+    let suffix = repo_suffix(&prefix);
+    let repo = format!("pinrefresh-{suffix}");
+    let mut guard = CleanupGuard::new(direct_env.clone(), prefix.clone());
+
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (proceed_tx, proceed_rx) = tokio::sync::oneshot::channel();
+    let proxy = start_barrier_proxy(&direct_env.endpoint, 16, true, entered_tx, proceed_rx).await;
+    let server = start_s3_server(&direct_env, &prefix).await;
+    let origin = make_origin("acme", &repo);
+    guard.track_repo("acme", &repo);
+    origin.commit(&[("value.txt", "A\n"), ("stable.txt", "stable\n")], "A");
+    origin.publish();
+    add_acme_repo(&server, &repo).await;
+    server
+        .client()
+        .sync_repo(&format!("acme/{repo}"), None)
+        .await
+        .expect("sync A");
+    let pinned = server
+        .client()
+        .resolve_ref_with_clonepack(&format!("acme/{repo}"), "HEAD", Some("shallow"), None)
+        .await
+        .expect("shallow A ready")
+        .commit;
+
+    unsafe {
+        std::env::set_var("RIPCLONE_SIGNED_URL_TTL_SECS", "1");
+        std::env::set_var("RIPCLONE_TEST_DOWNLOAD_CONCURRENCY", "1");
+        std::env::set_var("RIPCLONE_TEST_SIGNED_URL_PROXY", &proxy.url);
+    }
+    let out = tempfile::tempdir().expect("clone out");
+    let target = out.path().join("clone");
+    let binary = required_ripclone_bin();
+    let child = std::process::Command::new(&binary)
+        .arg("--server")
+        .arg(&server.url)
+        .arg("clone")
+        .arg(format!("acme/{repo}"))
+        .arg(&target)
+        .arg("--depth")
+        .arg("1")
+        .arg("--no-metrics")
+        .arg("--verify-upstream=never")
+        .env("RIPCLONE_SERVER_TOKEN", TOKEN)
+        .env("RIPCLONE_NO_METRICS", "1")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn release CLI clone");
+
+    tokio::time::timeout(Duration::from_secs(30), entered_rx)
+        .await
+        .expect("signed request reached barrier")
+        .expect("barrier sender alive");
+    origin.commit(&[("value.txt", "B\n"), ("stable.txt", "stable\n")], "B");
+    origin.publish();
+    let newer = git(&origin.bare, &["rev-parse", "HEAD"]);
+    assert_ne!(pinned, newer);
+    sleep(Duration::from_secs(2)).await;
+    proceed_tx
+        .send(())
+        .expect("expire and close first signed request");
+
+    let output = tokio::time::timeout(
+        Duration::from_secs(60),
+        tokio::task::spawn_blocking(move || child.wait_with_output()),
+    )
+    .await
+    .expect("release CLI remained bounded")
+    .expect("join release CLI")
+    .expect("wait release CLI");
+    unsafe {
+        std::env::remove_var("RIPCLONE_SIGNED_URL_TTL_SECS");
+        std::env::remove_var("RIPCLONE_TEST_DOWNLOAD_CONCURRENCY");
+        std::env::remove_var("RIPCLONE_TEST_SIGNED_URL_PROXY");
+    }
+    assert!(
+        output.status.success(),
+        "pinned refresh clone failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(git(&target, &["rev-parse", "HEAD"]), pinned);
+    assert_eq!(
+        std::fs::read_to_string(target.join("value.txt")).unwrap(),
+        "A\n"
+    );
+    assert!(git_ok(&target, &["fsck", "--connectivity-only", "HEAD"]));
+    let headers = proxy.signed_headers();
+    assert!(
+        headers.len() >= 2,
+        "stale attempt plus refreshed signed request"
+    );
+    assert!(
+        headers
+            .iter()
+            .all(|header| !header.to_ascii_lowercase().contains("authorization:")),
+        "artifact-host requests must not carry Ripclone authorization: {headers:?}"
+    );
+
+    cleanup_prefix(&direct_env, &prefix)
+        .await
+        .expect("cleanup prefix");
+    cleanup_repo_refs(&direct_env, "acme", &repo)
+        .await
+        .expect("cleanup refs");
+    guard.disable();
+}
+
+#[ignore = "requires S3 credentials"]
+#[tokio::test]
+async fn expired_bearer_blocks_pinned_refresh() {
     // Fails if the CLI falls back to an unauthenticated artifact path after a
     // stale signed URL, if re-resolving a ref with an expired bearer token still
     // exposes private bytes, or if the failed clone leaves a partial checkout.
@@ -1367,9 +1542,7 @@ async fn expired_bearer_and_signed_url_mid_cli_clone_fail_cleanly() {
     // prebuilt binary against a separately-downloaded CLI) over the compile-time
     // path baked into env!("CARGO_BIN_EXE_ripclone"), which points at the build
     // machine and breaks after artifact download.
-    let ripclone_bin = std::env::var_os("CARGO_BIN_EXE_ripclone")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from(env!("CARGO_BIN_EXE_ripclone")));
+    let ripclone_bin = required_ripclone_bin();
     let mut child = std::process::Command::new(&ripclone_bin)
         .arg("--server")
         .arg(&server.url)
