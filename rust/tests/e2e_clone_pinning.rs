@@ -109,6 +109,8 @@ fn env_lock() -> &'static tokio::sync::Mutex<()> {
 struct RefBarrierState {
     upstream: String,
     held: Arc<AtomicBool>,
+    requests: Arc<Mutex<Vec<String>>>,
+    force_first_archive_pending: bool,
     entered: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
     proceed: Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
 }
@@ -120,6 +122,14 @@ async fn ref_barrier_proxy(
     headers: HeaderMap,
     body: Bytes,
 ) -> axum::response::Response {
+    let is_ref = uri.path().contains("/refs/");
+    if is_ref {
+        state
+            .requests
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(uri.to_string());
+    }
     let url = format!("{}{}", state.upstream, uri);
     let mut request = reqwest::Client::new().request(method, url).body(body);
     for (name, value) in headers.iter() {
@@ -130,9 +140,10 @@ async fn ref_barrier_proxy(
     let response = request.send().await.expect("forward proxy request");
     let status = response.status();
     let response_headers = response.headers().clone();
-    let bytes = response.bytes().await.expect("forward proxy body");
+    let mut bytes = response.bytes().await.expect("forward proxy body");
 
-    if uri.path().contains("/refs/") && !state.held.swap(true, Ordering::SeqCst) {
+    let first_ref = is_ref && !state.held.swap(true, Ordering::SeqCst);
+    if first_ref {
         if let Some(entered) = state
             .entered
             .lock()
@@ -144,12 +155,17 @@ async fn ref_barrier_proxy(
         if let Some(proceed) = state.proceed.lock().await.take() {
             proceed.await.expect("release fetched ref");
         }
+        if state.force_first_archive_pending {
+            let mut body: serde_json::Value =
+                serde_json::from_slice(&bytes).expect("ready ref JSON");
+            body["archive_ready"] = serde_json::Value::Bool(false);
+            bytes = Bytes::from(serde_json::to_vec(&body).expect("encode pending archive ref"));
+        }
     }
 
     let mut output = axum::http::Response::builder().status(status);
     for name in [
         axum::http::header::CONTENT_TYPE,
-        axum::http::header::CONTENT_LENGTH,
         axum::http::HeaderName::from_static("x-ripclone-clone-id"),
     ] {
         if let Some(value) = response_headers.get(&name) {
@@ -161,17 +177,22 @@ async fn ref_barrier_proxy(
 
 async fn start_ref_barrier_proxy(
     upstream: &str,
+    force_first_archive_pending: bool,
 ) -> (
     String,
     tokio::sync::oneshot::Receiver<()>,
     tokio::sync::oneshot::Sender<()>,
+    Arc<Mutex<Vec<String>>>,
     tokio::task::JoinHandle<()>,
 ) {
     let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
     let (proceed_tx, proceed_rx) = tokio::sync::oneshot::channel();
+    let requests = Arc::new(Mutex::new(Vec::new()));
     let state = RefBarrierState {
         upstream: upstream.to_string(),
         held: Arc::new(AtomicBool::new(false)),
+        requests: Arc::clone(&requests),
+        force_first_archive_pending,
         entered: Arc::new(Mutex::new(Some(entered_tx))),
         proceed: Arc::new(tokio::sync::Mutex::new(Some(proceed_rx))),
     };
@@ -185,7 +206,13 @@ async fn start_ref_barrier_proxy(
     let task = tokio::spawn(async move {
         axum::serve(listener, app).await.expect("ref barrier proxy");
     });
-    (format!("http://{address}"), entered_rx, proceed_tx, task)
+    (
+        format!("http://{address}"),
+        entered_rx,
+        proceed_tx,
+        requests,
+        task,
+    )
 }
 
 fn selected_cli_binary() -> std::path::PathBuf {
@@ -441,7 +468,7 @@ async fn overwritten_branch_metadata_returns_pending_for_the_pin_without_upstrea
     let after = counts.snapshot();
     assert_eq!(after.pinned_requests - before.pinned_requests, 1);
     let reads = after.ref_point_reads - before.ref_point_reads;
-    assert!((1..=4).contains(&reads), "bounded point reads: {reads}");
+    assert!((1..=3).contains(&reads), "bounded point reads: {reads}");
     assert_eq!(after.upstream_accesses, before.upstream_accesses);
     assert_eq!(after.enqueues, before.enqueues);
     assert_eq!(after.source_acquisitions, before.source_acquisitions);
@@ -618,7 +645,8 @@ async fn release_cli_installs_the_fetched_snapshot_after_branch_movement() {
             .expect("selected variant ready")
             .commit;
 
-        let (proxy, entered, proceed, proxy_task) = start_ref_barrier_proxy(&server.url).await;
+        let (proxy, entered, proceed, requests, proxy_task) =
+            start_ref_barrier_proxy(&server.url, mode == CloneMode::Files).await;
         let out = tempfile::tempdir().expect("release clone output");
         let target = out.path().join("clone");
         let mut command = std::process::Command::new(&binary);
@@ -673,6 +701,19 @@ async fn release_cli_installs_the_fetched_snapshot_after_branch_movement() {
             assert_eq!(target.join(".git/shallow").exists(), depth == 1);
         } else {
             assert!(!target.join(".git").exists());
+            let requests = requests.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(
+                requests.len() >= 2,
+                "Files readiness must poll: {requests:?}"
+            );
+            assert!(!requests[0].contains("pinned="));
+            assert!(
+                requests
+                    .iter()
+                    .skip(1)
+                    .all(|request| request.contains(&format!("pinned={pinned}"))),
+                "Files readiness repinned or moved: {requests:?}"
+            );
         }
     }
 }

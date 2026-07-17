@@ -1399,6 +1399,21 @@ async fn expired_signed_url_retry_stays_on_pinned_commit() {
         .await
         .expect("shallow A ready")
         .commit;
+    // Preserve one exact A row in the existing S3 ref-store architecture so
+    // the refresh case exercises the "exact metadata remains available" path
+    // after the moving HEAD/main rows are genuinely overwritten by B. This is
+    // fixture data, not production retention behavior.
+    let exact_store = make_s3_ref_store(make_s3_storage(&direct_env, &prefix).unwrap());
+    let repo_id = RepoId::github(format!("acme/{repo}"));
+    let exact_a = exact_store
+        .load_branch(&repo_id, "HEAD")
+        .await
+        .expect("load S3 A ref")
+        .expect("S3 A ref present");
+    exact_store
+        .save_branch(&repo_id, &format!("HEAD#{pinned}"), &exact_a)
+        .await
+        .expect("publish exact S3 A fixture");
 
     unsafe {
         std::env::set_var("RIPCLONE_SIGNED_URL_TTL_SECS", "1");
@@ -1433,6 +1448,18 @@ async fn expired_signed_url_retry_stays_on_pinned_commit() {
     origin.publish();
     let newer = git(&origin.bare, &["rev-parse", "HEAD"]);
     assert_ne!(pinned, newer);
+    server
+        .client()
+        .sync_repo(&format!("acme/{repo}"), None)
+        .await
+        .expect("publish B through S3 ref store");
+    let published_b = server
+        .client()
+        .resolve_ref_with_clonepack(&format!("acme/{repo}"), "HEAD", Some("shallow"), None)
+        .await
+        .expect("S3 branch row B ready")
+        .commit;
+    assert_eq!(published_b, newer);
     sleep(Duration::from_secs(2)).await;
     proceed_tx
         .send(())

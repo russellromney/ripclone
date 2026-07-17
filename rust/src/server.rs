@@ -2578,13 +2578,7 @@ async fn load_pinned_ref_info(
         return Ok(Some((branch.to_string(), info.clone())));
     }
 
-    let effective_branch = branch_info
-        .as_ref()
-        .filter(|_| branch == "HEAD")
-        .map(|info| info.default_branch.as_str())
-        .filter(|name| !name.is_empty())
-        .unwrap_or(branch);
-    let exact_key = ref_store_key(effective_branch, Some(pinned), Some(pinned));
+    let exact_key = ref_store_key(branch, Some(pinned), Some(pinned));
     if exact_key != branch {
         if let Some(counts) = counts {
             counts.ref_point_reads.fetch_add(1, Ordering::Relaxed);
@@ -2596,31 +2590,19 @@ async fn load_pinned_ref_info(
         }
     }
 
-    if effective_branch != branch {
-        let branch_exact_key = ref_store_key(branch, Some(pinned), Some(pinned));
-        if branch_exact_key != exact_key {
-            if let Some(counts) = counts {
-                counts.ref_point_reads.fetch_add(1, Ordering::Relaxed);
-            }
-            if let Some(info) = ref_store.load_branch(repo_id, &branch_exact_key).await?
-                && exact_ref_info_serves_commit(&info, clonepack_kind, pinned)
-            {
-                return Ok(Some((branch_exact_key, info)));
-            }
+    // A rev build of the default branch is also published under this exact
+    // alias. It preserves symbolic selectors such as `HEAD~1` after the first
+    // response has discarded the selector in favor of the resolved commit.
+    let head_exact_key = ref_store_key("HEAD", Some(pinned), Some(pinned));
+    if head_exact_key != branch && head_exact_key != exact_key {
+        if let Some(counts) = counts {
+            counts.ref_point_reads.fetch_add(1, Ordering::Relaxed);
         }
-    }
-
-    // Rev-targeted builds (for example `clone --at HEAD~1`) are also indexed
-    // directly by resolved commit. This remains a single repo-scoped point read
-    // and lets the private pin discard the caller's symbolic selector after the
-    // first response without losing compatibility with commit-keyed reuse.
-    if let Some(counts) = counts {
-        counts.ref_point_reads.fetch_add(1, Ordering::Relaxed);
-    }
-    if let Some(info) = ref_store.load_build(repo_id, pinned).await?
-        && exact_ref_info_serves_commit(&info, clonepack_kind, pinned)
-    {
-        return Ok(Some((String::new(), info)));
+        if let Some(info) = ref_store.load_branch(repo_id, &head_exact_key).await?
+            && exact_ref_info_serves_commit(&info, clonepack_kind, pinned)
+        {
+            return Ok(Some((head_exact_key, info)));
+        }
     }
 
     Ok(None)
@@ -2834,12 +2816,14 @@ async fn get_ref_inner(
 
     // AU1: authorize the caller for this repo BEFORE the cache-hit return below,
     // so a cached private repo is never served to a caller without access.
-    let private =
-        match authorize_repo_read(&state, &provider, &repo_id, credential.as_ref(), &headers).await
-        {
-            Ok(p) => p,
-            Err(resp) => return resp,
-        };
+    let private = match if params.pinned.is_some() {
+        authorize_repo_read_cached(&state, &provider, &repo_id, credential.as_ref(), &headers).await
+    } else {
+        authorize_repo_read(&state, &provider, &repo_id, credential.as_ref(), &headers).await
+    } {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
 
     if let Some(pinned) = params.pinned.as_deref() {
         if let Some(counts) = state.test_work_counts.as_deref() {
@@ -3434,6 +3418,31 @@ async fn authorize_repo_read(
         AccessDecision::Public => Ok(false),
         AccessDecision::PrivateAuthorized => Ok(true),
         AccessDecision::Denied => Err(forbidden_repo_response()),
+    }
+}
+
+/// Pinned metadata reads may reuse the authorization established by the first
+/// moving request, but they never refresh it through the provider. Missing or
+/// expired cached authorization fails closed, preserving both repository
+/// isolation and the exact-read no-upstream boundary.
+async fn authorize_repo_read_cached(
+    state: &ServerState,
+    provider: &ProviderInstance,
+    repo_id: &RepoId,
+    credential: Option<&secrecy::SecretString>,
+    headers: &HeaderMap,
+) -> Result<bool, Response> {
+    if !state.require_repo_auth {
+        return Ok(visibility_is_private(headers));
+    }
+    match state
+        .access_verifier
+        .verify_cached(provider, &repo_id.path, credential)
+        .await
+    {
+        Some(AccessDecision::Public) => Ok(false),
+        Some(AccessDecision::PrivateAuthorized) => Ok(true),
+        Some(AccessDecision::Denied) | None => Err(forbidden_repo_response()),
     }
 }
 
@@ -5294,6 +5303,33 @@ fn ref_store_key(branch: &str, at_rev: Option<&str>, commit: Option<&str>) -> St
     }
 }
 
+/// A rev build of the default branch also gets an exact `HEAD#<commit>` alias.
+/// This is not a retention lane: it mirrors the existing commit-keyed rev row
+/// and is updated at the same three publication points. It lets a stateless
+/// pinned poll that began as `HEAD?rev=...` find the build without listing refs
+/// or consulting the commit-reuse scan.
+fn exact_head_alias(branch: &str, default_branch: &str, commit: &str) -> Option<String> {
+    let default_exact = ref_store_key(default_branch, Some(commit), Some(commit));
+    (branch == default_exact).then(|| ref_store_key("HEAD", Some(commit), Some(commit)))
+}
+
+async fn save_build_ref(
+    ref_store: &Arc<dyn RefStore>,
+    repo_id: &RepoId,
+    branch: &str,
+    default_branch: &str,
+    commit: &str,
+    info: &RefInfo,
+) -> Result<()> {
+    ref_store.save_branch(repo_id, branch, info).await?;
+    if let Some(alias) = exact_head_alias(branch, default_branch, commit)
+        && alias != branch
+    {
+        ref_store.save_branch(repo_id, &alias, info).await?;
+    }
+    Ok(())
+}
+
 fn tuple_to_sized(p: &(String, u64, String, u64)) -> crate::SizedPack {
     crate::SizedPack {
         pack: p.0.clone(),
@@ -6681,8 +6717,7 @@ async fn build_and_publish_two_phase(
     phases.upload_p1_ms = Some(duration_ms(upload_start.elapsed()));
 
     let publish_start = Instant::now();
-    ref_store
-        .save_branch(repo_id, branch, &info)
+    save_build_ref(ref_store, repo_id, branch, default_branch, commit, &info)
         .await
         .with_context(|| format!("persist depth=1 ref for {}@{branch}", repo_id.storage_key()))?;
     phases.ref_publish_ms = Some(duration_ms(publish_start.elapsed()));
@@ -7259,8 +7294,7 @@ async fn build_full_in_background(
                 info.head_base_packs = sized;
             }
             info.build_status = Some("archive building".to_string());
-            ref_store
-                .save_branch(repo_id, branch, &info)
+            save_build_ref(ref_store, repo_id, branch, default_branch, commit, &info)
                 .await
                 .with_context(|| {
                     format!(
@@ -7387,8 +7421,7 @@ async fn build_full_in_background(
                 repo_id.storage_key(),
                 info.full_clonepack.idx_bundle,
             );
-            ref_store
-                .save_branch(repo_id, branch, &info)
+            save_build_ref(ref_store, repo_id, branch, default_branch, commit, &info)
                 .await
                 .with_context(|| {
                     format!("persist files ref for {}@{branch}", repo_id.storage_key())
@@ -9533,6 +9566,29 @@ mod tests {
         }
     }
 
+    struct CachedOnlyVerifier(AccessDecision);
+
+    #[async_trait::async_trait]
+    impl AccessVerifier for CachedOnlyVerifier {
+        async fn verify(
+            &self,
+            _p: &ProviderInstance,
+            _path: &str,
+            _c: Option<&secrecy::SecretString>,
+        ) -> AccessDecision {
+            panic!("pinned authorization must not call the provider verifier")
+        }
+
+        async fn verify_cached(
+            &self,
+            _p: &ProviderInstance,
+            _path: &str,
+            _c: Option<&secrecy::SecretString>,
+        ) -> Option<AccessDecision> {
+            Some(self.0)
+        }
+    }
+
     /// AU1 gate decisions: trust mode falls back to the header; enforced mode
     /// maps the verifier's decision to public/private/403.
     #[tokio::test]
@@ -9574,6 +9630,28 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn pinned_authorization_is_cached_only_and_fails_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = test_state(&tmp);
+        state.require_repo_auth = true;
+        let provider = state.provider_registry.get("github").unwrap().clone();
+        let repo = RepoId::github("o/r");
+        let headers = HeaderMap::new();
+
+        state.access_verifier = Arc::new(CachedOnlyVerifier(AccessDecision::PrivateAuthorized));
+        assert!(
+            authorize_repo_read_cached(&state, &provider, &repo, None, &headers)
+                .await
+                .unwrap()
+        );
+        state.access_verifier = Arc::new(StubVerifier(AccessDecision::Public));
+        let response = authorize_repo_read_cached(&state, &provider, &repo, None, &headers)
+            .await
+            .unwrap_err();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
     /// End-to-end: a `refs` read for a repo the caller can't access returns 403

@@ -43,6 +43,17 @@ pub trait AccessVerifier: Send + Sync {
         repo_path: &str,
         credential: Option<&SecretString>,
     ) -> AccessDecision;
+
+    /// Return a still-fresh cached decision without contacting the provider.
+    /// `None` means there is no decision that can be reused safely.
+    async fn verify_cached(
+        &self,
+        _provider: &ProviderInstance,
+        _repo_path: &str,
+        _credential: Option<&SecretString>,
+    ) -> Option<AccessDecision> {
+        None
+    }
 }
 
 fn credential_fingerprint(cred: &SecretString) -> u64 {
@@ -61,6 +72,10 @@ fn credential_fingerprint(cred: &SecretString) -> u64 {
 pub struct HttpAccessVerifier {
     client: reqwest::Client,
     ttl: Duration,
+    /// A clone may poll for ~80s and refresh a private URL later in the same
+    /// operation. Reuse the already-proved decision for that bounded window;
+    /// ordinary moving reads still refresh at `ttl`.
+    pinned_ttl: Duration,
     /// repo clone URL -> (cached_at, is_public)
     public_cache: RwLock<HashMap<String, (Instant, bool)>>,
     /// (repo clone URL, credential fingerprint) -> (cached_at, authorized)
@@ -77,6 +92,9 @@ impl HttpAccessVerifier {
         Self {
             client,
             ttl,
+            // Matches the default private signed-URL exposure window. A pinned
+            // request after this bound fails closed instead of probing upstream.
+            pinned_ttl: Duration::from_secs(300),
             public_cache: RwLock::new(HashMap::new()),
             authz_cache: RwLock::new(HashMap::new()),
         }
@@ -184,6 +202,39 @@ impl AccessVerifier for HttpAccessVerifier {
             _ => AccessDecision::Denied,
         }
     }
+
+    async fn verify_cached(
+        &self,
+        provider: &ProviderInstance,
+        repo_path: &str,
+        credential: Option<&SecretString>,
+    ) -> Option<AccessDecision> {
+        let url = Self::info_refs_url(provider, repo_path);
+        let public = self
+            .public_cache
+            .read()
+            .await
+            .get(&url)
+            .filter(|(at, _)| at.elapsed() < self.pinned_ttl)
+            .map(|(_, value)| *value)?;
+        if public {
+            return Some(AccessDecision::Public);
+        }
+        let credential = credential?;
+        let key = (url, credential_fingerprint(credential));
+        self.authz_cache
+            .read()
+            .await
+            .get(&key)
+            .filter(|(at, _)| at.elapsed() < self.pinned_ttl)
+            .map(|(_, authorized)| {
+                if *authorized {
+                    AccessDecision::PrivateAuthorized
+                } else {
+                    AccessDecision::Denied
+                }
+            })
+    }
 }
 
 #[cfg(test)]
@@ -216,5 +267,31 @@ mod tests {
         let b = SecretString::new("tok-b".to_string().into());
         assert_eq!(credential_fingerprint(&a), credential_fingerprint(&a2));
         assert_ne!(credential_fingerprint(&a), credential_fingerprint(&b));
+    }
+
+    #[tokio::test]
+    async fn cached_verification_never_needs_a_provider_request() {
+        let verifier = HttpAccessVerifier::new();
+        let provider = gh();
+        let url = HttpAccessVerifier::info_refs_url(&provider, "o/r");
+        verifier.public_cache.write().await.insert(
+            url.clone(),
+            (Instant::now() - Duration::from_secs(61), false),
+        );
+        let credential = SecretString::new("token".to_string().into());
+        verifier.authz_cache.write().await.insert(
+            (url, credential_fingerprint(&credential)),
+            (Instant::now() - Duration::from_secs(61), true),
+        );
+        assert_eq!(
+            verifier
+                .verify_cached(&provider, "o/r", Some(&credential))
+                .await,
+            Some(AccessDecision::PrivateAuthorized)
+        );
+        assert_eq!(
+            verifier.verify_cached(&provider, "missing", None).await,
+            None
+        );
     }
 }

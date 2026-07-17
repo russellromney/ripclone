@@ -14,8 +14,10 @@ use prost::Message;
 use serde::Deserialize;
 use sha2::Digest as Sha2Digest;
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tracing::{info, warn};
 
@@ -666,22 +668,54 @@ struct InstallIdentity {
     cold: bool,
 }
 
-struct AbortOnDrop<T>(Option<tokio::task::JoinHandle<T>>);
+type CleanupFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 
-impl<T> AbortOnDrop<T> {
-    fn new(handle: tokio::task::JoinHandle<T>) -> Self {
-        Self(Some(handle))
-    }
+#[derive(Clone, Default)]
+struct AttemptCleanup(Arc<Mutex<Vec<CleanupFuture>>>);
 
-    async fn join(mut self) -> std::result::Result<T, tokio::task::JoinError> {
-        self.0.take().expect("join handle present").await
+impl AttemptCleanup {
+    async fn drain(&self) {
+        let pending = {
+            let mut pending = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut *pending)
+        };
+        futures::future::join_all(pending).await;
     }
 }
 
-impl<T> Drop for AbortOnDrop<T> {
+struct AbortOnDrop<T: Send + 'static> {
+    handle: Option<tokio::task::JoinHandle<T>>,
+    cleanup: AttemptCleanup,
+}
+
+impl<T: Send + 'static> AbortOnDrop<T> {
+    fn new(handle: tokio::task::JoinHandle<T>, cleanup: AttemptCleanup) -> Self {
+        Self {
+            handle: Some(handle),
+            cleanup,
+        }
+    }
+
+    async fn join(mut self) -> std::result::Result<T, tokio::task::JoinError> {
+        self.handle.take().expect("join handle present").await
+    }
+}
+
+impl<T: Send + 'static> Drop for AbortOnDrop<T> {
     fn drop(&mut self) {
-        if let Some(handle) = self.0.take() {
+        if let Some(handle) = self.handle.take() {
             handle.abort();
+            self.cleanup
+                .0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(Box::pin(async move {
+                    // `abort` cancels async tasks immediately. A blocking task
+                    // already running cannot be cancelled, so awaiting its
+                    // handle is what prevents a stale-URL retry from overlapping
+                    // the prior attempt's archive or pack worker.
+                    let _ = handle.await;
+                }));
         }
     }
 }
@@ -1395,6 +1429,7 @@ impl Client {
         let mut identity = InstallIdentity::default();
         let mut stale_retries = 0u32;
         loop {
+            let cleanup = AttemptCleanup::default();
             let result = self
                 .install_repo_with_mode_at_attempt(
                     repo_path,
@@ -1405,8 +1440,10 @@ impl Client {
                     clonepack,
                     bench.as_deref_mut(),
                     &mut identity,
+                    &cleanup,
                 )
                 .await;
+            cleanup.drain().await;
             match result {
                 Ok(outcome) => return Ok(outcome),
                 Err(error) if should_retry_stale(stale_retries, STALE_URL_MAX_RETRIES, &error) => {
@@ -1437,6 +1474,7 @@ impl Client {
         clonepack: Option<&str>,
         bench: Option<&mut Benchmark>,
         identity: &mut InstallIdentity,
+        cleanup: &AttemptCleanup,
     ) -> Result<CloneOutcome> {
         let target = target.as_ref().to_path_buf();
         info!(
@@ -1540,17 +1578,21 @@ impl Client {
         let (manifest_tx, manifest_rx) = tokio::sync::oneshot::channel::<Arc<ClonepackManifest>>();
 
         // 2. Start manifest + metadata downloads concurrently.
-        let manifest_task = AbortOnDrop::new(self.clone().spawn_fetch_manifest(
-            info.clonepack_manifest.clone(),
-            info.clonepack_manifest_url.clone(),
-            manifest_tx,
-        ));
+        let manifest_task = AbortOnDrop::new(
+            self.clone().spawn_fetch_manifest(
+                info.clonepack_manifest.clone(),
+                info.clonepack_manifest_url.clone(),
+                manifest_tx,
+            ),
+            cleanup.clone(),
+        );
 
         let metadata_hash = info.metadata_chunk.clone();
         let metadata_url = info.metadata_chunk_url.clone();
         let metadata_task = AbortOnDrop::new(
             self.clone()
                 .spawn_fetch_metadata(metadata_hash, metadata_url),
+            cleanup.clone(),
         );
 
         // 3. Spawn the archive-chunk downloader. It waits for the manifest to be
@@ -1571,15 +1613,18 @@ impl Client {
         ) = bounded(archive_channel_depth);
         let archive_bridge = if mode.needs_archive() {
             let archive_tx = archive_tx.clone();
-            Some(AbortOnDrop::new(tokio::task::spawn_blocking(move || {
-                while let Some(msg) = archive_async_rx.blocking_recv() {
-                    let send_start = Instant::now();
-                    if archive_tx.send(msg).is_err() {
-                        break;
+            Some(AbortOnDrop::new(
+                tokio::task::spawn_blocking(move || {
+                    while let Some(msg) = archive_async_rx.blocking_recv() {
+                        let send_start = Instant::now();
+                        if archive_tx.send(msg).is_err() {
+                            break;
+                        }
+                        crate::perf::record_archive_send_wait(send_start.elapsed());
                     }
-                    crate::perf::record_archive_send_wait(send_start.elapsed());
-                }
-            })))
+                }),
+                cleanup.clone(),
+            ))
         } else {
             None
         };
@@ -1587,11 +1632,11 @@ impl Client {
         let archive_urls = info.archive_chunk_urls.clone();
         let archive_downloads = if mode.needs_archive() {
             bench.start_archive_download();
-            Some(AbortOnDrop::new(self.clone().spawn_chunk_downloads(
-                archive_urls,
-                manifest_rx,
-                archive_async_tx,
-            )))
+            Some(AbortOnDrop::new(
+                self.clone()
+                    .spawn_chunk_downloads(archive_urls, manifest_rx, archive_async_tx),
+                cleanup.clone(),
+            ))
         } else {
             drop(archive_async_tx);
             drop(manifest_rx);
@@ -1713,11 +1758,14 @@ impl Client {
             let rx = archive_rx;
             let manifest_path = manifest_path.clone();
             let work_tree = install_root.clone();
-            Some(AbortOnDrop::new(tokio::task::spawn_blocking(move || {
-                // Keep the temp manifest file alive for the duration of extraction.
-                let _guard = manifest_tmp;
-                extract_archive_from_chunk_receiver(&manifest_path, Some(&work_tree), None, rx)
-            })))
+            Some(AbortOnDrop::new(
+                tokio::task::spawn_blocking(move || {
+                    // Keep the temp manifest file alive for the duration of extraction.
+                    let _guard = manifest_tmp;
+                    extract_archive_from_chunk_receiver(&manifest_path, Some(&work_tree), None, rx)
+                }),
+                cleanup.clone(),
+            ))
         } else {
             drop(archive_rx);
             // The temp file can be dropped; nothing needs the manifest on disk.
@@ -1743,7 +1791,14 @@ impl Client {
         let mut prebuilt_blob_pack_bytes = 0u64;
         if mode.needs_pack_worktree() {
             prebuilt_blob_pack_bytes = self
-                .install_editable_packs(&manifest, &info, &pack_dir, &install_root, &metadata)
+                .install_editable_packs(
+                    &manifest,
+                    &info,
+                    &pack_dir,
+                    &install_root,
+                    &metadata,
+                    cleanup,
+                )
                 .await
                 .context("install editable packs")?;
             bench.mark_write();
@@ -1976,6 +2031,7 @@ impl Client {
         pack_dir: &std::path::Path,
         work_tree: &std::path::Path,
         metadata: &MetadataChunk,
+        cleanup: &AttemptCleanup,
     ) -> Result<u64> {
         use futures::stream::{self, StreamExt, TryStreamExt};
 
@@ -1989,23 +2045,29 @@ impl Client {
             let client = self.clone();
             let bundle_ref = bundle_ref.clone();
             let idx_bundle_url = info.idx_bundle_url.clone();
-            AbortOnDrop::new(tokio::spawn(async move {
-                client
-                    .fetch_chunk_ref(&bundle_ref, idx_bundle_url.as_deref())
-                    .await
-                    .context("fetch idx bundle")
-            }))
+            AbortOnDrop::new(
+                tokio::spawn(async move {
+                    client
+                        .fetch_chunk_ref(&bundle_ref, idx_bundle_url.as_deref())
+                        .await
+                        .context("fetch idx bundle")
+                }),
+                cleanup.clone(),
+            )
         });
         let midx_task = manifest.midx.as_ref().map(|midx_ref| {
             let client = self.clone();
             let midx_ref = midx_ref.clone();
             let midx_url = info.midx_url.clone();
-            AbortOnDrop::new(tokio::spawn(async move {
-                client
-                    .fetch_chunk_ref(&midx_ref, midx_url.as_deref())
-                    .await
-                    .context("fetch pre-built multi-pack-index")
-            }))
+            AbortOnDrop::new(
+                tokio::spawn(async move {
+                    client
+                        .fetch_chunk_ref(&midx_ref, midx_url.as_deref())
+                        .await
+                        .context("fetch pre-built multi-pack-index")
+                }),
+                cleanup.clone(),
+            )
         });
 
         // Validate every blob sha1 length up front so `build_blob_path_map`
@@ -2155,67 +2217,83 @@ impl Client {
                 let work_tree = work_tree.to_path_buf();
                 let blob_map = Arc::clone(&blob_map);
                 let worktree_writer = Arc::clone(&worktree_writer);
+                let cleanup = cleanup.clone();
                 async move {
                     let (i, history_only, pack_body, idx_bytes) = res?;
                     let bytes = (pack_body.len() + idx_bytes.len()) as u64;
-                    let result = tokio::task::spawn_blocking(
-                        move || -> Result<crate::extract::PackExtractResult> {
-                            if pack_body.len() < 20 {
-                                anyhow::bail!("pack {} too short ({} bytes)", i, pack_body.len());
-                            }
-                            let (name, pack_bytes) = match pack_body {
-                                PackBody::Buffered(pack_bytes) => {
-                                    // Git names packs by the 20-byte trailer sha; the idx
-                                    // pairs to the pack by basename.
-                                    let name = hex::encode(&pack_bytes[pack_bytes.len() - 20..]);
-                                    std::fs::write(
-                                        pack_dir.join(format!("pack-{}.pack", name)),
-                                        &pack_bytes,
-                                    )
-                                    .with_context(|| format!("write pack {}", name))?;
-                                    (name, Some(pack_bytes))
+                    let result = AbortOnDrop::new(
+                        tokio::task::spawn_blocking(
+                            move || -> Result<crate::extract::PackExtractResult> {
+                                if pack_body.len() < 20 {
+                                    anyhow::bail!(
+                                        "pack {} too short ({} bytes)",
+                                        i,
+                                        pack_body.len()
+                                    );
                                 }
-                                PackBody::TempFile { file, len } => {
-                                    use std::io::{Read, Seek, SeekFrom};
-                                    let mut reader = file
-                                        .as_file()
-                                        .try_clone()
-                                        .context("clone streamed pack file")?;
-                                    reader
-                                        .seek(SeekFrom::Start(len - 20))
-                                        .context("seek streamed pack trailer")?;
-                                    let mut trailer = [0u8; 20];
-                                    reader
-                                        .read_exact(&mut trailer)
-                                        .context("read streamed pack trailer")?;
-                                    let name = hex::encode(trailer);
-                                    file.persist(pack_dir.join(format!("pack-{}.pack", name)))
-                                        .with_context(|| {
-                                            format!("install streamed pack {}", name)
-                                        })?;
-                                    (name, None)
-                                }
-                            };
-                            std::fs::write(pack_dir.join(format!("pack-{}.idx", name)), &idx_bytes)
+                                let (name, pack_bytes) = match pack_body {
+                                    PackBody::Buffered(pack_bytes) => {
+                                        // Git names packs by the 20-byte trailer sha; the idx
+                                        // pairs to the pack by basename.
+                                        let name =
+                                            hex::encode(&pack_bytes[pack_bytes.len() - 20..]);
+                                        std::fs::write(
+                                            pack_dir.join(format!("pack-{}.pack", name)),
+                                            &pack_bytes,
+                                        )
+                                        .with_context(|| format!("write pack {}", name))?;
+                                        (name, Some(pack_bytes))
+                                    }
+                                    PackBody::TempFile { file, len } => {
+                                        use std::io::{Read, Seek, SeekFrom};
+                                        let mut reader = file
+                                            .as_file()
+                                            .try_clone()
+                                            .context("clone streamed pack file")?;
+                                        reader
+                                            .seek(SeekFrom::Start(len - 20))
+                                            .context("seek streamed pack trailer")?;
+                                        let mut trailer = [0u8; 20];
+                                        reader
+                                            .read_exact(&mut trailer)
+                                            .context("read streamed pack trailer")?;
+                                        let name = hex::encode(trailer);
+                                        file.persist(pack_dir.join(format!("pack-{}.pack", name)))
+                                            .with_context(|| {
+                                                format!("install streamed pack {}", name)
+                                            })?;
+                                        (name, None)
+                                    }
+                                };
+                                std::fs::write(
+                                    pack_dir.join(format!("pack-{}.idx", name)),
+                                    &idx_bytes,
+                                )
                                 .with_context(|| format!("write idx {}", name))?;
-                            if history_only {
-                                return Ok(crate::extract::PackExtractResult {
-                                    files: 0,
-                                    stats: Vec::new(),
-                                });
-                            }
-                            let Some(pack_bytes) = pack_bytes else {
-                                anyhow::bail!("head pack {} was not buffered for extraction", i);
-                            };
-                            crate::extract::extract_blobs_from_pack_bytes(
-                                &pack_bytes,
-                                &blob_map,
-                                &work_tree,
-                                &worktree_writer,
-                            )
-                            .with_context(|| format!("extract pack {}", name))
-                        },
+                                if history_only {
+                                    return Ok(crate::extract::PackExtractResult {
+                                        files: 0,
+                                        stats: Vec::new(),
+                                    });
+                                }
+                                let Some(pack_bytes) = pack_bytes else {
+                                    anyhow::bail!(
+                                        "head pack {} was not buffered for extraction",
+                                        i
+                                    );
+                                };
+                                crate::extract::extract_blobs_from_pack_bytes(
+                                    &pack_bytes,
+                                    &blob_map,
+                                    &work_tree,
+                                    &worktree_writer,
+                                )
+                                .with_context(|| format!("extract pack {}", name))
+                            },
+                        ),
+                        cleanup,
                     )
+                    .join()
                     .await
                     .context("spawn pack install task")??;
                     Ok::<(u64, crate::extract::PackExtractResult), anyhow::Error>((bytes, result))
@@ -3412,6 +3490,38 @@ mod tests {
     fn retry_decision_never_retries_a_non_stale_error() {
         let other = anyhow::anyhow!("repo not found");
         assert!(!should_retry_stale(0, 2, &other));
+    }
+
+    #[tokio::test]
+    async fn attempt_cleanup_joins_a_running_blocking_worker() {
+        let cleanup = AttemptCleanup::default();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker = AbortOnDrop::new(
+            tokio::task::spawn_blocking(move || {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            }),
+            cleanup.clone(),
+        );
+        tokio::task::spawn_blocking(move || started_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(worker);
+
+        let cleanup_wait = cleanup.clone();
+        let mut drain = Box::pin(cleanup_wait.drain());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut drain)
+                .await
+                .is_err(),
+            "cleanup must wait for an already-running blocking worker"
+        );
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), drain)
+            .await
+            .expect("blocking worker joined before retry");
     }
 
     #[test]
