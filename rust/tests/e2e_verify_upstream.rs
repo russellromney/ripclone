@@ -68,7 +68,18 @@ async fn run_clone_with_token(
             cmd.arg(a);
         }
         let mut child = cmd.spawn().expect("spawn ripclone clone");
-        let status = child.wait().expect("wait for ripclone clone");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("poll ripclone clone") {
+                break status;
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().expect("kill timed-out ripclone clone");
+                let _ = child.wait().expect("reap timed-out ripclone clone");
+                panic!("ripclone clone timed out after 60s; killed and reaped");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        };
         let stdout = std::fs::read(stdout_tmp.path()).expect("read stdout temp");
         let stderr = std::fs::read(stderr_tmp.path()).expect("read stderr temp");
         Output {
@@ -198,7 +209,11 @@ async fn verify_upstream_auto_detects_stale_tip_on_public_repo() {
         .sync_repo("acme/verify-auto-stale", None)
         .await
         .expect("sync");
-    wait_for_warm(&server, "acme/verify-auto-stale", Some("shallow")).await;
+    server
+        .client()
+        .resolve_ref_with_clonepack("acme/verify-auto-stale", "main", Some("full"), None)
+        .await
+        .expect("cache A on the concrete branch");
 
     // Advance upstream without re-syncing the server.
     origin.commit(&[("a.txt", "b\n")], "b");
@@ -210,7 +225,7 @@ async fn verify_upstream_auto_detects_stale_tip_on_public_repo() {
         &server,
         "acme/verify-auto-stale",
         &target,
-        &["--verify-upstream=auto"],
+        &["--branch", "main", "--verify-upstream=auto"],
     )
     .await;
 
@@ -243,7 +258,11 @@ async fn verify_upstream_always_detects_stale_tip() {
         .sync_repo("acme/verify-stale", None)
         .await
         .expect("sync");
-    wait_for_warm(&server, "acme/verify-stale", Some("shallow")).await;
+    server
+        .client()
+        .resolve_ref_with_clonepack("acme/verify-stale", "main", Some("full"), None)
+        .await
+        .expect("cache A on the concrete branch");
 
     // Advance upstream without re-syncing the server. The server still serves
     // the older commit, but the upstream tip has moved.
@@ -256,7 +275,7 @@ async fn verify_upstream_always_detects_stale_tip() {
         &server,
         "acme/verify-stale",
         &target,
-        &["--verify-upstream"],
+        &["--branch", "main", "--verify-upstream"],
     )
     .await;
 
