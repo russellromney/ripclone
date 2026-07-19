@@ -2464,7 +2464,13 @@ fn exact_ref_info_serves_commit(info: &RefInfo, clonepack_kind: &str, commit: &s
     }
     matches!(
         exact_clonepack_artifacts(info, clonepack_kind),
-        Some(artifacts) if !artifacts.manifest.is_empty() && artifacts.commit == commit
+        Some(artifacts)
+            if !artifacts.manifest.is_empty()
+                && if artifacts.commit.is_empty() {
+                    info.commit == commit
+                } else {
+                    artifacts.commit == commit
+                }
     )
 }
 
@@ -2526,11 +2532,6 @@ async fn load_pinned_ref_info(
     clonepack_kind: &str,
 ) -> Result<Option<(String, RefInfo)>> {
     let branch_info = ref_store.load_branch(repo_id, branch).await?;
-    if let Some(info) = branch_info.as_ref()
-        && exact_ref_info_serves_commit(info, clonepack_kind, pinned)
-    {
-        return Ok(Some((branch.to_string(), info.clone())));
-    }
 
     let exact_key = ref_store_key(branch, Some(pinned), Some(pinned));
     if exact_key != branch
@@ -2556,6 +2557,18 @@ async fn load_pinned_ref_info(
         && exact_ref_info_serves_commit(&info, clonepack_kind, pinned)
     {
         return Ok(Some((default_exact_key, info)));
+    }
+
+    // The moving row is the final compatibility candidate. During phase-one
+    // publication it may enclose the new tip while carrying the prior commit's
+    // full-history variant. Never combine that carried manifest with the new
+    // row's top-level pack/archive fields; only the enclosing pinned row is
+    // internally consistent for a pinned response.
+    if let Some(info) = branch_info
+        && info.commit == pinned
+        && exact_ref_info_serves_commit(&info, clonepack_kind, pinned)
+    {
+        return Ok(Some((branch.to_string(), info)));
     }
 
     Ok(None)
@@ -5222,15 +5235,6 @@ fn ref_store_key(branch: &str, at_rev: Option<&str>, commit: Option<&str>) -> St
     }
 }
 
-async fn save_build_ref(
-    ref_store: &Arc<dyn RefStore>,
-    repo_id: &RepoId,
-    branch: &str,
-    info: &RefInfo,
-) -> Result<()> {
-    ref_store.save_branch(repo_id, branch, info).await
-}
-
 fn tuple_to_sized(p: &(String, u64, String, u64)) -> crate::SizedPack {
     crate::SizedPack {
         pack: p.0.clone(),
@@ -6618,7 +6622,8 @@ async fn build_and_publish_two_phase(
     phases.upload_p1_ms = Some(duration_ms(upload_start.elapsed()));
 
     let publish_start = Instant::now();
-    save_build_ref(ref_store, repo_id, branch, &info)
+    ref_store
+        .save_branch(repo_id, branch, &info)
         .await
         .with_context(|| format!("persist depth=1 ref for {}@{branch}", repo_id.storage_key()))?;
     phases.ref_publish_ms = Some(duration_ms(publish_start.elapsed()));
@@ -7195,7 +7200,8 @@ async fn build_full_in_background(
                 info.head_base_packs = sized;
             }
             info.build_status = Some("archive building".to_string());
-            save_build_ref(ref_store, repo_id, branch, &info)
+            ref_store
+                .save_branch(repo_id, branch, &info)
                 .await
                 .with_context(|| {
                     format!(
@@ -7322,7 +7328,8 @@ async fn build_full_in_background(
                 repo_id.storage_key(),
                 info.full_clonepack.idx_bundle,
             );
-            save_build_ref(ref_store, repo_id, branch, &info)
+            ref_store
+                .save_branch(repo_id, branch, &info)
                 .await
                 .with_context(|| {
                     format!("persist files ref for {}@{branch}", repo_id.storage_key())
@@ -8416,6 +8423,31 @@ mod tests {
         info.full_clonepack.commit = commit.clone();
         info.build_status = Some(crate::remote_gc::EVICTED_BUILD_STATUS.to_string());
         assert!(!exact_ref_info_serves_commit(&info, "full", &commit));
+    }
+
+    #[test]
+    fn omitted_variant_commit_inherits_the_enclosing_ref_commit() {
+        let commit = "a".repeat(40);
+        let info = RefInfo {
+            commit: commit.clone(),
+            full_clonepack: crate::ClonepackArtifacts {
+                commit: commit.clone(),
+                manifest: "legacy-manifest".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut encoded = serde_json::to_value(info).expect("serialize compatibility fixture");
+        encoded["full_clonepack"]
+            .as_object_mut()
+            .expect("full clonepack object")
+            .remove("commit");
+        let decoded: RefInfo =
+            serde_json::from_value(encoded).expect("deserialize legacy ref without commit field");
+
+        assert!(decoded.full_clonepack.commit.is_empty());
+        assert!(exact_ref_info_serves_commit(&decoded, "full", &commit));
+        assert_eq!(selected_clonepack_commit(&decoded, "full"), commit);
     }
 
     // Classification must be TYPE-based (downcast at the do_sync error boundary),

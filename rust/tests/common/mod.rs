@@ -119,6 +119,41 @@ pub struct PinnedPathProbe {
     enqueues: std::sync::atomic::AtomicUsize,
 }
 
+pub struct PhaseOnePublishBarrier {
+    armed: std::sync::atomic::AtomicBool,
+    consumed: std::sync::atomic::AtomicBool,
+    entered: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    proceed: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+}
+
+impl PhaseOnePublishBarrier {
+    pub fn arm(&self) {
+        self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    async fn after_save(&self, info: &ripclone::RefInfo) {
+        if !self.armed.load(std::sync::atomic::Ordering::SeqCst)
+            || info.build_status.as_deref() != Some("full history building")
+            || self
+                .consumed
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
+        if let Some(entered) = self
+            .entered
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            let _ = entered.send(());
+        }
+        if let Some(proceed) = self.proceed.lock().await.take() {
+            let _ = proceed.await;
+        }
+    }
+}
+
 impl PinnedPathProbe {
     pub fn arm(&self) {
         self.branch_reads
@@ -178,6 +213,7 @@ impl ripclone::queue::JobQueue for ProbedJobQueue {
 struct ProbedRefStore {
     inner: Arc<dyn ripclone::ref_store::RefStore>,
     probe: Arc<PinnedPathProbe>,
+    phase_one_barrier: Option<Arc<PhaseOnePublishBarrier>>,
 }
 
 #[async_trait::async_trait]
@@ -234,7 +270,11 @@ impl ripclone::ref_store::RefStore for ProbedRefStore {
         branch: &str,
         info: &ripclone::RefInfo,
     ) -> anyhow::Result<()> {
-        self.inner.save_branch(repo_id, branch, info).await
+        self.inner.save_branch(repo_id, branch, info).await?;
+        if let Some(barrier) = &self.phase_one_barrier {
+            barrier.after_save(info).await;
+        }
+        Ok(())
     }
 
     async fn update_build_status(
@@ -379,13 +419,32 @@ pub async fn start_server_with_barrier(barrier: ArtifactBarrier) -> Server {
 }
 
 pub async fn start_server_split_storage() -> Server {
-    start_server_split_storage_inner(None, None, None).await
+    start_server_split_storage_inner(None, None, None, None).await
 }
 
 /// Start a split-storage server with a deterministic artifact download barrier.
 /// See [`ripclone::server::ArtifactBarrier`].
 pub async fn start_server_split_storage_barrier(barrier: ArtifactBarrier) -> Server {
-    start_server_split_storage_inner(Some(barrier), None, None).await
+    start_server_split_storage_inner(Some(barrier), None, None, None).await
+}
+
+pub async fn start_server_split_storage_phase_one_barrier() -> (
+    Server,
+    Arc<PhaseOnePublishBarrier>,
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (proceed_tx, proceed_rx) = tokio::sync::oneshot::channel();
+    let barrier = Arc::new(PhaseOnePublishBarrier {
+        armed: std::sync::atomic::AtomicBool::new(false),
+        consumed: std::sync::atomic::AtomicBool::new(false),
+        entered: std::sync::Mutex::new(Some(entered_tx)),
+        proceed: tokio::sync::Mutex::new(Some(proceed_rx)),
+    });
+    let server =
+        start_server_split_storage_inner(None, None, None, Some(Arc::clone(&barrier))).await;
+    (server, barrier, entered_rx, proceed_tx)
 }
 
 /// Start a split-storage server whose durable-storage uploads fail after a
@@ -396,7 +455,7 @@ pub async fn start_server_split_storage_failing_put(
     fail_after_successes: usize,
     failures: usize,
 ) -> Server {
-    start_server_split_storage_inner(None, Some((fail_after_successes, failures)), None).await
+    start_server_split_storage_inner(None, Some((fail_after_successes, failures)), None, None).await
 }
 
 /// Start a split-storage server whose ref-store writes fail after a configurable
@@ -407,13 +466,14 @@ pub async fn start_server_split_storage_failing_ref_save(
     fail_after_successes: usize,
     failures: usize,
 ) -> Server {
-    start_server_split_storage_inner(None, None, Some((fail_after_successes, failures))).await
+    start_server_split_storage_inner(None, None, Some((fail_after_successes, failures)), None).await
 }
 
 async fn start_server_split_storage_inner(
     barrier: Option<ArtifactBarrier>,
     fail_put: Option<(usize, usize)>,
     fail_ref: Option<(usize, usize)>,
+    phase_one_barrier: Option<Arc<PhaseOnePublishBarrier>>,
 ) -> Server {
     init_tracing();
     let dir = tempfile::tempdir().expect("server dir");
@@ -452,6 +512,7 @@ async fn start_server_split_storage_inner(
     let ref_store: Arc<dyn ripclone::ref_store::RefStore> = Arc::new(ProbedRefStore {
         inner: ref_store,
         probe: Arc::clone(&pinned_path_probe),
+        phase_one_barrier,
     });
     let metrics = ripclone::metrics::Metrics::new();
     let retention = Arc::new(

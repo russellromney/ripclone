@@ -1015,11 +1015,18 @@ impl Client {
                 info.cold = polled;
                 return Ok(info);
             }
+            let authorization_failure = matches!(
+                status,
+                reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+            );
             let error = server_error("ref lookup failed", resp).await;
             if let Some(commit) = pinned.as_deref() {
-                return Err(error.context(format!(
-                    "refresh of pinned commit {commit} was not authorized"
-                )));
+                let context = if authorization_failure {
+                    format!("refresh of pinned commit {commit} was not authorized")
+                } else {
+                    format!("refresh of pinned commit {commit} failed")
+                };
+                return Err(error.context(context));
             }
             return Err(error);
         }
