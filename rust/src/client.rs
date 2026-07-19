@@ -697,7 +697,9 @@ impl<T: Send + 'static> AbortOnDrop<T> {
     }
 
     async fn join(mut self) -> std::result::Result<T, tokio::task::JoinError> {
-        self.handle.take().expect("join handle present").await
+        let result = self.handle.as_mut().expect("join handle present").await;
+        self.handle.take();
+        result
     }
 }
 
@@ -1013,7 +1015,13 @@ impl Client {
                 info.cold = polled;
                 return Ok(info);
             }
-            return Err(server_error("ref lookup failed", resp).await);
+            let error = server_error("ref lookup failed", resp).await;
+            if let Some(commit) = pinned.as_deref() {
+                return Err(error.context(format!(
+                    "refresh of pinned commit {commit} was not authorized"
+                )));
+            }
+            return Err(error);
         }
         anyhow::bail!("ref lookup did not complete")
     }
@@ -1645,10 +1653,22 @@ impl Client {
         drop(archive_tx);
 
         // 4. Wait for manifest + metadata.
-        let (manifest, metadata) = tokio::try_join!(manifest_task.join(), metadata_task.join())
-            .context("fetch manifest/metadata")?;
-        let manifest = manifest.context("fetch clonepack manifest")?;
-        let metadata = metadata.context("fetch metadata chunk")?;
+        let manifest = async {
+            manifest_task
+                .join()
+                .await
+                .context("join clonepack manifest fetch")?
+                .context("fetch clonepack manifest")
+        };
+        let metadata = async {
+            metadata_task
+                .join()
+                .await
+                .context("join metadata chunk fetch")?
+                .context("fetch metadata chunk")
+        };
+        let (manifest, metadata) =
+            tokio::try_join!(manifest, metadata).context("fetch manifest/metadata")?;
         validate_manifest_commit(&manifest, &pinned)?;
         let metadata = Arc::new(metadata);
         bench.mark_manifest();
@@ -3493,35 +3513,67 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn attempt_cleanup_joins_a_running_blocking_worker() {
+    async fn cancelled_join_keeps_blocking_sibling_armed_until_retry_cleanup() {
         let cleanup = AttemptCleanup::default();
-        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let fixture = tempfile::tempdir().unwrap();
+        let target = fixture.path().join("target");
+        let staging = fixture.path().join("staging");
+        let staging_worker = staging.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let worker = AbortOnDrop::new(
+        let sibling = AbortOnDrop::new(
             tokio::task::spawn_blocking(move || {
+                std::fs::create_dir_all(&staging_worker).unwrap();
                 started_tx.send(()).unwrap();
                 release_rx.recv().unwrap();
+                std::fs::remove_dir_all(&staging_worker).unwrap();
+                Ok::<(), anyhow::Error>(())
             }),
             cleanup.clone(),
         );
-        tokio::task::spawn_blocking(move || started_rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        drop(worker);
+        let stale = AbortOnDrop::new(
+            tokio::spawn(async move {
+                started_rx.await.unwrap();
+                Err::<(), anyhow::Error>(anyhow::Error::new(StaleSignedUrl))
+            }),
+            cleanup.clone(),
+        );
+
+        let stale_join = async {
+            stale.join().await.context("join stale task")??;
+            Ok::<(), anyhow::Error>(())
+        };
+        let sibling_join = async {
+            sibling.join().await.context("join blocking sibling")??;
+            Ok::<(), anyhow::Error>(())
+        };
+        let error = tokio::try_join!(stale_join, sibling_join)
+            .expect_err("stale task cancels the sibling join future");
+        assert!(is_stale_signed_url(&error));
 
         let cleanup_wait = cleanup.clone();
-        let mut drain = Box::pin(cleanup_wait.drain());
+        let next_attempt_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let next_attempt_flag = Arc::clone(&next_attempt_started);
+        let mut drain_then_retry = Box::pin(async move {
+            cleanup_wait.drain().await;
+            next_attempt_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
         assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(20), &mut drain)
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut drain_then_retry)
                 .await
                 .is_err(),
-            "cleanup must wait for an already-running blocking worker"
+            "retry cleanup must wait for the cancelled join's blocking sibling"
         );
+        assert!(!next_attempt_started.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(staging.exists());
+        assert!(!target.exists());
         release_tx.send(()).unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(1), drain)
+        tokio::time::timeout(std::time::Duration::from_secs(1), drain_then_retry)
             .await
-            .expect("blocking worker joined before retry");
+            .expect("blocking sibling joined before retry");
+        assert!(next_attempt_started.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!staging.exists());
+        assert!(!target.exists());
     }
 
     #[test]

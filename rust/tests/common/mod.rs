@@ -100,8 +100,208 @@ pub struct Server {
     pub cas_dir: PathBuf,
     pub storage_dir: PathBuf,
     pub repo_root: PathBuf,
-    pub work_counts: Option<Arc<ripclone::server::TestWorkCounts>>,
+    pub pinned_path_probe: Option<Arc<PinnedPathProbe>>,
     pub _dir: TempDir,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PinnedPathSnapshot {
+    pub branch_reads: usize,
+    pub enqueues: usize,
+}
+
+#[derive(Default)]
+pub struct PinnedPathProbe {
+    armed: std::sync::atomic::AtomicBool,
+    branch_reads: std::sync::atomic::AtomicUsize,
+    enqueues: std::sync::atomic::AtomicUsize,
+}
+
+impl PinnedPathProbe {
+    pub fn arm(&self) {
+        self.branch_reads
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+        self.enqueues.store(0, std::sync::atomic::Ordering::SeqCst);
+        self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn snapshot(&self) -> PinnedPathSnapshot {
+        PinnedPathSnapshot {
+            branch_reads: self.branch_reads.load(std::sync::atomic::Ordering::SeqCst),
+            enqueues: self.enqueues.load(std::sync::atomic::Ordering::SeqCst),
+        }
+    }
+
+    fn is_armed(&self) -> bool {
+        self.armed.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+struct ProbedJobQueue {
+    inner: ripclone::queue::JobQueueRef,
+    probe: Arc<PinnedPathProbe>,
+}
+
+#[async_trait::async_trait]
+impl ripclone::queue::JobQueue for ProbedJobQueue {
+    async fn enqueue(
+        &self,
+        job: ripclone::queue::BuildJob,
+    ) -> anyhow::Result<ripclone::queue::Enqueued> {
+        if self.probe.is_armed() {
+            self.probe
+                .enqueues
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            panic!("pinned metadata lookup must not enqueue build work");
+        }
+        self.inner.enqueue(job).await
+    }
+
+    async fn job_status(
+        &self,
+        job_id: ripclone::queue::JobId,
+    ) -> anyhow::Result<ripclone::queue::JobState> {
+        self.inner.job_status(job_id).await
+    }
+
+    async fn depth(&self) -> usize {
+        self.inner.depth().await
+    }
+
+    fn inproc_wait(&self) -> bool {
+        self.inner.inproc_wait()
+    }
+}
+
+struct ProbedRefStore {
+    inner: Arc<dyn ripclone::ref_store::RefStore>,
+    probe: Arc<PinnedPathProbe>,
+}
+
+#[async_trait::async_trait]
+impl ripclone::ref_store::RefStore for ProbedRefStore {
+    async fn load(
+        &self,
+        repo_id: &ripclone::provider::RepoId,
+    ) -> anyhow::Result<Option<ripclone::RefInfo>> {
+        self.inner.load(repo_id).await
+    }
+
+    async fn save(
+        &self,
+        repo_id: &ripclone::provider::RepoId,
+        info: &ripclone::RefInfo,
+    ) -> anyhow::Result<()> {
+        self.inner.save(repo_id, info).await
+    }
+
+    async fn list(&self) -> anyhow::Result<Vec<ripclone::provider::RepoId>> {
+        if self.probe.is_armed() {
+            panic!("pinned metadata lookup must not scan repositories");
+        }
+        self.inner.list().await
+    }
+
+    async fn load_branch(
+        &self,
+        repo_id: &ripclone::provider::RepoId,
+        branch: &str,
+    ) -> anyhow::Result<Option<ripclone::RefInfo>> {
+        if self.probe.is_armed() {
+            self.probe
+                .branch_reads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        self.inner.load_branch(repo_id, branch).await
+    }
+
+    async fn load_build(
+        &self,
+        repo_id: &ripclone::provider::RepoId,
+        commit: &str,
+    ) -> anyhow::Result<Option<ripclone::RefInfo>> {
+        if self.probe.is_armed() {
+            panic!("pinned metadata lookup must not scan builds");
+        }
+        self.inner.load_build(repo_id, commit).await
+    }
+
+    async fn save_branch(
+        &self,
+        repo_id: &ripclone::provider::RepoId,
+        branch: &str,
+        info: &ripclone::RefInfo,
+    ) -> anyhow::Result<()> {
+        self.inner.save_branch(repo_id, branch, info).await
+    }
+
+    async fn update_build_status(
+        &self,
+        repo_id: &ripclone::provider::RepoId,
+        branch: &str,
+        expected_commit: &str,
+        status: &str,
+    ) -> anyhow::Result<bool> {
+        self.inner
+            .update_build_status(repo_id, branch, expected_commit, status)
+            .await
+    }
+
+    async fn touch_last_accessed_at(
+        &self,
+        repo_id: &ripclone::provider::RepoId,
+        branch: &str,
+        expected_commit: &str,
+    ) -> anyhow::Result<bool> {
+        self.inner
+            .touch_last_accessed_at(repo_id, branch, expected_commit)
+            .await
+    }
+
+    async fn delete_branch(
+        &self,
+        repo_id: &ripclone::provider::RepoId,
+        branch: &str,
+    ) -> anyhow::Result<()> {
+        self.inner.delete_branch(repo_id, branch).await
+    }
+
+    async fn list_branches(
+        &self,
+        repo_id: &ripclone::provider::RepoId,
+    ) -> anyhow::Result<Vec<String>> {
+        if self.probe.is_armed() {
+            panic!("pinned metadata lookup must not scan branches");
+        }
+        self.inner.list_branches(repo_id).await
+    }
+
+    async fn add_repo(&self, repo: &ripclone::ref_store::AddedRepo) -> anyhow::Result<()> {
+        self.inner.add_repo(repo).await
+    }
+
+    async fn load_added_repo(
+        &self,
+        repo_id: &ripclone::provider::RepoId,
+    ) -> anyhow::Result<Option<ripclone::ref_store::AddedRepo>> {
+        self.inner.load_added_repo(repo_id).await
+    }
+
+    async fn remove_added_repo(&self, repo_id: &ripclone::provider::RepoId) -> anyhow::Result<()> {
+        self.inner.remove_added_repo(repo_id).await
+    }
+
+    async fn list_added_repos(&self) -> anyhow::Result<Vec<ripclone::ref_store::AddedRepo>> {
+        self.inner.list_added_repos().await
+    }
+
+    async fn invalidate(&self, repo_id: &ripclone::provider::RepoId, branch: &str) {
+        self.inner.invalidate(repo_id, branch).await
+    }
+
+    async fn health(&self) -> anyhow::Result<()> {
+        self.inner.health().await
+    }
 }
 
 impl Server {
@@ -246,6 +446,11 @@ async fn start_server_split_storage_inner(
         } else {
             base_ref_store
         };
+    let pinned_path_probe = Arc::new(PinnedPathProbe::default());
+    let ref_store: Arc<dyn ripclone::ref_store::RefStore> = Arc::new(ProbedRefStore {
+        inner: ref_store,
+        probe: Arc::clone(&pinned_path_probe),
+    });
     let metrics = ripclone::metrics::Metrics::new();
     let retention = Arc::new(
         ripclone::retention::Retention::with_config_and_storage(
@@ -259,8 +464,10 @@ async fn start_server_split_storage_inner(
         .with_ref_store(ref_store.clone(), storage.clone()),
     );
     let (local_queue, mut rx, depth) = ripclone::queue::LocalJobQueue::new(16);
-    let work_counts = Arc::new(ripclone::server::TestWorkCounts::default());
-    let build_queue: ripclone::queue::JobQueueRef = Arc::new(local_queue);
+    let build_queue: ripclone::queue::JobQueueRef = Arc::new(ProbedJobQueue {
+        inner: Arc::new(local_queue),
+        probe: Arc::clone(&pinned_path_probe),
+    });
     let provider_registry = ripclone::provider::ProviderRegistry::new();
     let broker: Arc<dyn ripclone::auth::broker::CredentialBroker> = Arc::new(
         ripclone::auth::broker::StaticBroker::new(provider_registry.clone()),
@@ -294,7 +501,6 @@ async fn start_server_split_storage_inner(
         readyz_cache: Arc::new(std::sync::Mutex::new(None)),
         access_verifier: Arc::new(ripclone::auth::access::HttpAccessVerifier::new()),
         require_repo_auth: false,
-        test_work_counts: Some(Arc::clone(&work_counts)),
     };
 
     let worker_state = state.clone();
@@ -361,7 +567,7 @@ async fn start_server_split_storage_inner(
         cas_dir,
         storage_dir,
         repo_root,
-        work_counts: Some(work_counts),
+        pinned_path_probe: Some(pinned_path_probe),
         _dir: dir,
     }
 }
@@ -758,7 +964,7 @@ async fn start_server_inner(
         storage_dir: cas_dir.clone(),
         cas_dir,
         repo_root,
-        work_counts: None,
+        pinned_path_probe: None,
         _dir: dir,
     }
 }

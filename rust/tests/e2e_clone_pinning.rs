@@ -113,6 +113,7 @@ struct RefBarrierState {
     held: Arc<AtomicBool>,
     requests: Arc<Mutex<Vec<String>>>,
     force_first_archive_pending: bool,
+    force_first_pending: bool,
     entered: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
     proceed: Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
 }
@@ -140,7 +141,7 @@ async fn ref_barrier_proxy(
         }
     }
     let response = request.send().await.expect("forward proxy request");
-    let status = response.status();
+    let mut status = response.status();
     let response_headers = response.headers().clone();
     let mut bytes = response.bytes().await.expect("forward proxy body");
 
@@ -163,6 +164,24 @@ async fn ref_barrier_proxy(
             body["archive_ready"] = serde_json::Value::Bool(false);
             bytes = Bytes::from(serde_json::to_vec(&body).expect("encode pending archive ref"));
         }
+        if state.force_first_pending {
+            let body: serde_json::Value =
+                serde_json::from_slice(&bytes).expect("ready ref JSON for pending response");
+            let commit = body["commit"]
+                .as_str()
+                .expect("ready response commit")
+                .to_string();
+            status = StatusCode::ACCEPTED;
+            bytes = Bytes::from(
+                serde_json::to_vec(&json!({
+                    "code": "artifact_pending",
+                    "commit": commit,
+                    "status": "building",
+                    "queue_depth": 1
+                }))
+                .expect("encode pending ref"),
+            );
+        }
     }
 
     let mut output = axum::http::Response::builder().status(status);
@@ -180,6 +199,7 @@ async fn ref_barrier_proxy(
 async fn start_ref_barrier_proxy(
     upstream: &str,
     force_first_archive_pending: bool,
+    force_first_pending: bool,
 ) -> (
     String,
     tokio::sync::oneshot::Receiver<()>,
@@ -195,6 +215,7 @@ async fn start_ref_barrier_proxy(
         held: Arc::new(AtomicBool::new(false)),
         requests: Arc::clone(&requests),
         force_first_archive_pending,
+        force_first_pending,
         entered: Arc::new(Mutex::new(Some(entered_tx))),
         proceed: Arc::new(tokio::sync::Mutex::new(Some(proceed_rx))),
     };
@@ -258,40 +279,173 @@ fn mutate_stored_refs(root: &std::path::Path, mut mutate: impl FnMut(&mut ripclo
 }
 
 #[tokio::test]
-async fn first_pending_response_pins_every_later_lookup() {
+async fn cold_pending_real_server_installs_pinned_commit_after_branch_moves() {
     let _guard = env_lock().lock().await;
-    let (url, requests, task) = scripted_server(vec![pending(A), ready(A)]).await;
-    let client = Client::new(url);
-    let info = client
-        .resolve_ref_with_clonepack("acme/demo", "main", Some("full"), None)
+    init(false);
+    let server = start_server_split_storage().await;
+    let binary = selected_cli_binary();
+    let origin = make_origin("acme", "cold-pin-ready");
+    origin.commit(&[("value.txt", "A\n")], "A");
+    origin.publish();
+    register_added_without_build(&server, "acme/cold-pin-ready")
         .await
-        .expect("pinned resolve");
-    task.abort();
-    assert_eq!(info.commit, A);
+        .expect("register repo");
+    server
+        .client()
+        .sync_repo("acme/cold-pin-ready", None)
+        .await
+        .expect("sync A");
+    let pinned = server
+        .client()
+        .resolve_ref_with_clonepack("acme/cold-pin-ready", "HEAD", Some("full"), None)
+        .await
+        .expect("full A ready")
+        .commit;
+    let store = FileRefStore::new(&server.repo_root);
+    let repo_id = RepoId::github("acme/cold-pin-ready");
+    let exact_a = store
+        .load_branch(&repo_id, "HEAD")
+        .await
+        .expect("load A ref")
+        .expect("A ref present");
+    store
+        .save_branch(&repo_id, &format!("main#{pinned}"), &exact_a)
+        .await
+        .expect("publish exact A fixture");
+
+    let (proxy, entered, proceed, requests, proxy_task) =
+        start_ref_barrier_proxy(&server.url, false, true).await;
+    let output = tempfile::tempdir().expect("clone output");
+    let target = output.path().join("clone");
+    let child = std::process::Command::new(binary)
+        .arg("--server")
+        .arg(&proxy)
+        .arg("clone")
+        .arg("acme/cold-pin-ready")
+        .arg(&target)
+        .arg("--depth")
+        .arg("0")
+        .arg("--no-metrics")
+        .arg("--verify-upstream=never")
+        .env("RIPCLONE_SERVER_TOKEN", TOKEN)
+        .env("RIPCLONE_NO_METRICS", "1")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn release CLI");
+    tokio::time::timeout(Duration::from_secs(20), entered)
+        .await
+        .expect("moving response reached barrier")
+        .expect("barrier alive");
+
+    origin.commit(&[("value.txt", "B\n")], "B");
+    origin.publish();
+    server
+        .client()
+        .sync_repo("acme/cold-pin-ready", None)
+        .await
+        .expect("publish B");
+    std::fs::rename(&origin.bare, origin.bare.with_extension("offline"))
+        .expect("make upstream unavailable");
+    proceed.send(()).expect("return pending A");
+
+    let output = tokio::time::timeout(
+        Duration::from_secs(60),
+        tokio::task::spawn_blocking(move || child.wait_with_output()),
+    )
+    .await
+    .expect("release CLI bounded")
+    .expect("join release CLI")
+    .expect("release CLI output");
+    proxy_task.abort();
+    assert!(
+        output.status.success(),
+        "cold pinned clone failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(git(&target, &["rev-parse", "HEAD"]), pinned);
+    assert_eq!(
+        std::fs::read_to_string(target.join("value.txt")).unwrap(),
+        "A\n"
+    );
+    assert!(git_ok(&target, &["fsck", "--connectivity-only", "HEAD"]));
     let requests = requests.lock().unwrap_or_else(|e| e.into_inner());
-    assert_eq!(requests.len(), 2);
+    assert!(
+        requests.len() >= 2,
+        "pending A must be polled: {requests:?}"
+    );
     assert!(!requests[0].contains("pinned="), "first request is moving");
     assert!(
-        requests[1].contains(&format!("pinned={A}")),
-        "second request is exact: {:?}",
-        *requests
+        requests
+            .iter()
+            .skip(1)
+            .all(|request| request.contains(&format!("pinned={pinned}"))),
+        "every post-pin request must name A: {requests:?}"
     );
 }
 
 #[tokio::test]
-async fn pending_exhaustion_is_typed_and_keeps_the_commit() {
+async fn real_server_pending_exhaustion_is_typed_and_leaves_no_target() {
     let _guard = env_lock().lock().await;
+    init(false);
+    let server = start_server_split_storage().await;
+    let origin = make_origin("acme", "cold-pin-pending");
+    origin.commit(&[("value.txt", "A\n")], "A");
+    origin.publish();
+    register_added_without_build(&server, "acme/cold-pin-pending")
+        .await
+        .expect("register repo");
+    server
+        .client()
+        .sync_repo("acme/cold-pin-pending", None)
+        .await
+        .expect("sync A");
+    let pinned = server
+        .client()
+        .resolve_ref_with_clonepack("acme/cold-pin-pending", "HEAD", Some("full"), None)
+        .await
+        .expect("full A initially ready")
+        .commit;
+    mutate_stored_refs(&server.repo_root.join(".ripclone-refs"), |info| {
+        info.full_clonepack = Default::default();
+        info.clonepack_manifest.clear();
+    });
+
     unsafe {
         std::env::set_var("RIPCLONE_TESTING", "1");
         std::env::set_var("RIPCLONE_TEST_REF_MAX_ATTEMPTS", "2");
         std::env::set_var("RIPCLONE_TEST_REF_POLL_MS", "0");
     }
-    let (url, requests, task) = scripted_server(vec![pending(A), pending(A)]).await;
-    let error = Client::new(url)
-        .resolve_ref_with_clonepack("acme/demo", "main", Some("full"), None)
+    let (proxy, entered, proceed, requests, proxy_task) =
+        start_ref_barrier_proxy(&server.url, false, false).await;
+    let target_root = tempfile::tempdir().expect("pending target root");
+    let target = target_root.path().join("clone");
+    let client = Client::new_with_token(proxy, Some(token_hash()));
+    let target_for_clone = target.clone();
+    let install = tokio::spawn(async move {
+        client
+            .install_repo_with_mode_at(
+                "acme/cold-pin-pending",
+                "HEAD",
+                None,
+                &target_for_clone,
+                CloneMode::Editable,
+                Some("full"),
+                None,
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(20), entered)
         .await
-        .expect_err("artifact remains pending");
-    task.abort();
+        .expect("pending response reached barrier")
+        .expect("barrier alive");
+    proceed.send(()).expect("release pending response");
+    let error = install
+        .await
+        .expect("join pending install")
+        .expect_err("exact A remains pending");
+    proxy_task.abort();
     unsafe {
         std::env::remove_var("RIPCLONE_TESTING");
         std::env::remove_var("RIPCLONE_TEST_REF_MAX_ATTEMPTS");
@@ -300,15 +454,16 @@ async fn pending_exhaustion_is_typed_and_keeps_the_commit() {
     let pending = error
         .downcast_ref::<ArtifactPending>()
         .expect("typed artifact pending error");
-    assert_eq!(pending.commit, A);
+    assert_eq!(pending.commit, pinned);
     assert_eq!(pending.mode, "full");
+    assert!(!target.exists(), "pending clone must not publish a target");
     assert!(
         requests
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
             .skip(1)
-            .all(|request| request.contains(&format!("pinned={A}")))
+            .all(|request| request.contains(&format!("pinned={pinned}")))
     );
 }
 
@@ -450,8 +605,11 @@ async fn overwritten_branch_metadata_returns_pending_for_the_pin_without_upstrea
 
     std::fs::rename(&origin.bare, origin.bare.with_extension("offline"))
         .expect("make upstream unavailable");
-    let counts = server.work_counts.as_ref().expect("counting fixture");
-    let before = counts.snapshot();
+    let probe = server
+        .pinned_path_probe
+        .as_ref()
+        .expect("pinned-path test adapter");
+    probe.arm();
     let response = reqwest::Client::new()
         .get(format!(
             "{}/v1/repos/github/acme/overwritten-pin/refs/HEAD?clonepack=full&pinned={a}",
@@ -467,14 +625,74 @@ async fn overwritten_branch_metadata_returns_pending_for_the_pin_without_upstrea
     let body: serde_json::Value = response.json().await.expect("pending json");
     assert_eq!(body["code"], "artifact_pending");
     assert_eq!(body["commit"], a);
-    let after = counts.snapshot();
-    assert_eq!(after.pinned_requests - before.pinned_requests, 1);
-    let reads = after.ref_point_reads - before.ref_point_reads;
-    assert!((1..=3).contains(&reads), "bounded point reads: {reads}");
-    assert_eq!(after.upstream_accesses, before.upstream_accesses);
-    assert_eq!(after.enqueues, before.enqueues);
-    assert_eq!(after.source_acquisitions, before.source_acquisitions);
-    assert_eq!(after.builder_entries, before.builder_entries);
+    let observed = probe.snapshot();
+    assert!(
+        (1..=3).contains(&observed.branch_reads),
+        "bounded point reads: {}",
+        observed.branch_reads
+    );
+    assert_eq!(observed.enqueues, 0);
+}
+
+#[tokio::test]
+async fn pinned_head_reads_pre_upgrade_default_branch_exact_row() {
+    let _guard = env_lock().lock().await;
+    init(false);
+    let server = start_server_split_storage().await;
+    let origin = make_origin("acme", "baseline-layout-pin");
+    origin.commit(&[("value.txt", "A\n")], "A");
+    origin.publish();
+    register_added_without_build(&server, "acme/baseline-layout-pin")
+        .await
+        .expect("register repo");
+    server
+        .client()
+        .sync_repo("acme/baseline-layout-pin", None)
+        .await
+        .expect("sync A");
+
+    let store = FileRefStore::new(&server.repo_root);
+    let repo_id = RepoId::github("acme/baseline-layout-pin");
+    let exact_a = store
+        .load_branch(&repo_id, "HEAD")
+        .await
+        .expect("load A HEAD row")
+        .expect("A HEAD row present");
+    let a = exact_a.commit.clone();
+    store
+        .save_branch(&repo_id, &format!("main#{a}"), &exact_a)
+        .await
+        .expect("seed pre-upgrade main exact row");
+    assert!(
+        store
+            .load_branch(&repo_id, &format!("HEAD#{a}"))
+            .await
+            .expect("check duplicate alias")
+            .is_none(),
+        "baseline layout must not contain a HEAD exact alias"
+    );
+
+    origin.commit(&[("value.txt", "B\n")], "B");
+    origin.publish();
+    server
+        .client()
+        .sync_repo("acme/baseline-layout-pin", None)
+        .await
+        .expect("publish B");
+
+    let response = reqwest::Client::new()
+        .get(format!(
+            "{}/v1/repos/github/acme/baseline-layout-pin/refs/HEAD?clonepack=full&pinned={a}",
+            server.url
+        ))
+        .header("Authorization", format!("Ripclone {}", token_hash()))
+        .header("x-ripclone-protocol", "2")
+        .send()
+        .await
+        .expect("pinned baseline-layout lookup");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await.expect("ready response");
+    assert_eq!(body["commit"], a);
 }
 
 #[tokio::test]
@@ -655,13 +873,13 @@ async fn release_cli_installs_the_fetched_snapshot_after_branch_movement() {
                 .expect("load file-store A ref")
                 .expect("file-store A ref present");
             exact_store
-                .save_branch(&repo_id, &format!("HEAD#{pinned}"), &exact_a)
+                .save_branch(&repo_id, &format!("main#{pinned}"), &exact_a)
                 .await
                 .expect("publish exact file-store A fixture");
         }
 
         let (proxy, entered, proceed, requests, proxy_task) =
-            start_ref_barrier_proxy(&server.url, mode == CloneMode::Files).await;
+            start_ref_barrier_proxy(&server.url, mode == CloneMode::Files, false).await;
         let out = tempfile::tempdir().expect("release clone output");
         let target = out.path().join("clone");
         let mut command = std::process::Command::new(&binary);

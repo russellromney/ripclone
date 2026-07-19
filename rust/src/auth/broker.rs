@@ -36,17 +36,6 @@ pub trait CredentialBroker: Send + Sync {
         repo_id: &RepoId,
         request_token: Option<&SecretString>,
     ) -> Result<Option<SecretString>>;
-
-    /// Return a credential already available in memory without refreshing it
-    /// through a provider. A request-scoped token is always safe to reuse;
-    /// implementations with internal or static caches may override this.
-    fn fetch_cached_credential(
-        &self,
-        _repo_id: &RepoId,
-        request_token: Option<&SecretString>,
-    ) -> Result<Option<SecretString>> {
-        Ok(request_token.cloned())
-    }
 }
 
 /// Tier-B passthrough broker: request token → configured instance token → none.
@@ -71,14 +60,6 @@ impl CredentialBroker for StaticBroker {
             return Ok(Some(token.clone()));
         }
         Ok(self.registry.token(repo_id.provider.as_str()).cloned())
-    }
-
-    fn fetch_cached_credential(
-        &self,
-        repo_id: &RepoId,
-        request_token: Option<&SecretString>,
-    ) -> Result<Option<SecretString>> {
-        self.fetch_credential(repo_id, request_token)
     }
 }
 
@@ -312,27 +293,6 @@ impl CredentialBroker for GitHubAppBroker {
         }
         self.installation_token().map(Some)
     }
-
-    fn fetch_cached_credential(
-        &self,
-        repo_id: &RepoId,
-        request_token: Option<&SecretString>,
-    ) -> Result<Option<SecretString>> {
-        if let Some(token) = request_token {
-            return Ok(Some(token.clone()));
-        }
-        if !repo_id.is_github_default() {
-            return Ok(None);
-        }
-        let now = SystemTime::now();
-        Ok(self
-            .cache
-            .lock()
-            .expect("broker cache mutex poisoned")
-            .get(&self.installation_id)
-            .filter(|cached| cached.is_fresh(now))
-            .map(|cached| cached.token.clone()))
-    }
 }
 
 /// POST the app JWT to GitHub's installation-token endpoint and return the
@@ -424,15 +384,6 @@ impl CredentialBroker for ProviderAwareBroker {
     ) -> Result<Option<SecretString>> {
         self.broker_for(repo_id)
             .fetch_credential(repo_id, request_token)
-    }
-
-    fn fetch_cached_credential(
-        &self,
-        repo_id: &RepoId,
-        request_token: Option<&SecretString>,
-    ) -> Result<Option<SecretString>> {
-        self.broker_for(repo_id)
-            .fetch_cached_credential(repo_id, request_token)
     }
 }
 
@@ -575,29 +526,6 @@ RwIDAQAB
         );
         let token = broker
             .fetch_credential(&RepoId::github("o/r"), None)
-            .unwrap()
-            .expect("cached token");
-        assert_eq!(token.expose_secret(), "ghs_cached");
-    }
-
-    #[test]
-    fn github_app_cached_fetch_never_mints_or_refreshes() {
-        let broker = test_broker();
-        assert!(
-            broker
-                .fetch_cached_credential(&RepoId::github("o/r"), None)
-                .unwrap()
-                .is_none()
-        );
-        broker.cache.lock().unwrap().insert(
-            broker.installation_id,
-            CachedToken {
-                token: SecretString::from("ghs_cached"),
-                expires_at: SystemTime::now() + Duration::from_secs(3600),
-            },
-        );
-        let token = broker
-            .fetch_cached_credential(&RepoId::github("o/r"), None)
             .unwrap()
             .expect("cached token");
         assert_eq!(token.expose_secret(), "ghs_cached");

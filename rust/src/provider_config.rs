@@ -21,10 +21,6 @@ fn parse_providers_json(data: &str) -> Result<ProvidersFile> {
 pub fn load_registry_with_config(config: &crate::config::Config) -> Result<ProviderRegistry> {
     let mut registry = ProviderRegistry::new();
 
-    // File configuration provides the baseline. Environment configuration is
-    // merged afterward so operator overrides follow `env > config > defaults`.
-    merge_configs(&mut registry, config.provider_configs())?;
-
     if let Some(json) = std::env::var("RIPCLONE_PROVIDERS")
         .ok()
         .filter(|t| !t.is_empty())
@@ -33,9 +29,12 @@ pub fn load_registry_with_config(config: &crate::config::Config) -> Result<Provi
         merge_configs(&mut registry, file.providers)?;
     }
 
-    if let Some(token) = std::env::var("RIPCLONE_GITHUB_TOKEN")
-        .ok()
-        .filter(|t| !t.is_empty())
+    merge_configs(&mut registry, config.provider_configs())?;
+
+    if registry.token("github").is_none()
+        && let Some(token) = std::env::var("RIPCLONE_GITHUB_TOKEN")
+            .ok()
+            .filter(|t| !t.is_empty())
     {
         registry.set_token("github", token);
     }
@@ -130,45 +129,6 @@ mod tests {
     }
 
     #[test]
-    fn env_json_overrides_toml_provider_fields_and_token() {
-        let _guard = lock_env();
-        let old = std::env::var_os("RIPCLONE_PROVIDERS");
-        unsafe {
-            std::env::set_var(
-                "RIPCLONE_PROVIDERS",
-                r#"{"providers":[{"id":"gitea","kind":"gitea","host":"http://127.0.0.1:4242","token":"env-token"}]}"#,
-            );
-        }
-        let mut providers = HashMap::new();
-        providers.insert(
-            "gitea".to_string(),
-            ProviderEntry {
-                kind: "gitea".into(),
-                host: Some("http://localhost:3000".into()),
-                token: Some("config-token".into()),
-                auth_template: None,
-                auth_header_name: None,
-            },
-        );
-
-        let registry = load_registry_with_config(&Config {
-            providers,
-            ..Config::default()
-        })
-        .unwrap();
-        restore_env("RIPCLONE_PROVIDERS", old);
-
-        assert_eq!(
-            registry.get("gitea").map(|provider| provider.host.as_str()),
-            Some("http://127.0.0.1:4242")
-        );
-        assert_eq!(
-            registry.token("gitea").unwrap().expose_secret(),
-            "env-token"
-        );
-    }
-
-    #[test]
     fn github_env_token_fills_default_when_config_has_no_token() {
         let _guard = lock_env();
         let old = std::env::var_os("RIPCLONE_GITHUB_TOKEN");
@@ -183,7 +143,7 @@ mod tests {
     }
 
     #[test]
-    fn github_env_token_overrides_config_token() {
+    fn config_github_token_beats_legacy_env() {
         let _guard = lock_env();
         let old = std::env::var_os("RIPCLONE_GITHUB_TOKEN");
         unsafe {
@@ -208,6 +168,9 @@ mod tests {
         .unwrap();
         restore_env("RIPCLONE_GITHUB_TOKEN", old);
 
-        assert_eq!(registry.token("github").unwrap().expose_secret(), "gh-env");
+        assert_eq!(
+            registry.token("github").unwrap().expose_secret(),
+            "gh-config"
+        );
     }
 }
