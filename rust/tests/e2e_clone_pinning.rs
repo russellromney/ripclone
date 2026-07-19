@@ -974,11 +974,12 @@ async fn pinned_lookup_uses_exact_a_while_phase_one_b_is_paused() {
         .as_ref()
         .expect("pinned-path test adapter");
     probe.arm();
+    let pinned_url = format!(
+        "{}/v1/repos/github/acme/phase-one-pin/refs/main?clonepack=full&pinned={a}",
+        server.url
+    );
     let response = reqwest::Client::new()
-        .get(format!(
-            "{}/v1/repos/github/acme/phase-one-pin/refs/main?clonepack=full&pinned={a}",
-            server.url
-        ))
+        .get(&pinned_url)
         .header("Authorization", format!("Ripclone {}", token_hash()))
         .header("x-ripclone-protocol", "2")
         .timeout(Duration::from_secs(5))
@@ -988,7 +989,34 @@ async fn pinned_lookup_uses_exact_a_while_phase_one_b_is_paused() {
     assert_eq!(response.status(), StatusCode::OK);
     let body: serde_json::Value = response.json().await.expect("ready A response");
     assert_eq!(body["commit"], a);
-    assert_eq!(probe.snapshot().branch_reads, 2);
+    assert_eq!(body["clonepack_manifest"], exact_a.full_clonepack.manifest);
+    let exact_observed = probe.snapshot();
+    assert_eq!(exact_observed.branch_reads, 2);
+    assert_eq!(exact_observed.enqueues, 0);
+
+    // With the exact row absent, the paused moving B row still carries
+    // Full(A). It must not satisfy pin A because its enclosing/top-level fields
+    // belong to B. This makes the moving-row guard independently non-vacuous.
+    store
+        .delete_branch(&repo_id, &format!("main#{a}"))
+        .await
+        .expect("remove exact A fixture");
+    probe.arm();
+    let pending = reqwest::Client::new()
+        .get(&pinned_url)
+        .header("Authorization", format!("Ripclone {}", token_hash()))
+        .header("x-ripclone-protocol", "2")
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+        .expect("pinned fallback lookup while B phase one is paused");
+    assert_eq!(pending.status(), StatusCode::ACCEPTED);
+    let pending: serde_json::Value = pending.json().await.expect("pending A response");
+    assert_eq!(pending["code"], "artifact_pending");
+    assert_eq!(pending["commit"], a);
+    let fallback_observed = probe.snapshot();
+    assert_eq!(fallback_observed.branch_reads, 2);
+    assert_eq!(fallback_observed.enqueues, 0);
 
     proceed.send(()).expect("release B phase-one publication");
     tokio::time::timeout(Duration::from_secs(20), &mut sync_b)
