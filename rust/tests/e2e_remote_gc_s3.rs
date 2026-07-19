@@ -9,7 +9,7 @@
 
 mod common;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use common::*;
 use ripclone::auth::access::{AccessDecision, AccessVerifier};
 use ripclone::mode::CloneMode;
@@ -962,34 +962,63 @@ async fn delete_key_batches(env: &S3Env, client: &s3::Client, keys: Vec<String>)
     Ok(())
 }
 
-async fn cleanup_prefix(env: &S3Env, prefix: &str) -> Result<()> {
-    let client = cleanup_s3_client(env)?;
-
+async fn list_cleanup_keys(env: &S3Env, client: &s3::Client, prefix: &str) -> Result<Vec<String>> {
     let mut keys = Vec::new();
     let mut continuation = None::<String>;
     loop {
-        let mut req = client
-            .objects()
-            .list_v2(&env.bucket)
-            .prefix(prefix)
-            .context("set cleanup list prefix")?;
-        if let Some(token) = continuation.take() {
-            req = req
-                .continuation_token(token)
-                .context("set cleanup continuation token")?;
+        let mut output = None;
+        let mut last_error = None;
+        for attempt in 1..=3 {
+            let mut req = client
+                .objects()
+                .list_v2(&env.bucket)
+                .prefix(prefix)
+                .context("set cleanup list prefix")?;
+            if let Some(token) = continuation.as_deref() {
+                req = req
+                    .continuation_token(token)
+                    .context("set cleanup continuation token")?;
+            }
+            match req.send().await {
+                Ok(found) => {
+                    output = Some(found);
+                    break;
+                }
+                Err(error) => {
+                    last_error = Some(error);
+                    if attempt < 3 {
+                        sleep(Duration::from_millis(100 * attempt)).await;
+                    }
+                }
+            }
         }
-        let output = req.send().await.context("S3 list for cleanup")?;
+        let output = match output {
+            Some(output) => output,
+            None => {
+                return Err(last_error.expect("a failed cleanup list has an error"))
+                    .context("S3 cleanup list after 3 attempts");
+            }
+        };
         for obj in output.contents {
             keys.push(obj.key);
         }
         if !output.is_truncated {
             break;
         }
-        continuation = output.next_continuation_token;
-        if continuation.is_none() {
-            break;
+        let next = output
+            .next_continuation_token
+            .context("truncated cleanup list omitted its continuation token")?;
+        if continuation.as_deref() == Some(next.as_str()) {
+            bail!("truncated cleanup list repeated its continuation token");
         }
+        continuation = Some(next);
     }
+    Ok(keys)
+}
+
+async fn cleanup_prefix(env: &S3Env, prefix: &str) -> Result<()> {
+    let client = cleanup_s3_client(env)?;
+    let keys = list_cleanup_keys(env, &client, prefix).await?;
 
     delete_key_batches(env, &client, keys).await
 }
@@ -1005,30 +1034,7 @@ async fn cleanup_repo_refs(env: &S3Env, owner: &str, repo: &str) -> Result<()> {
     let head_key = format!("{prefix}refs/{storage_key}.json");
     let branch_prefix = format!("{prefix}refs/{storage_key}/");
     let mut keys = vec![head_key];
-    let mut continuation = None::<String>;
-    loop {
-        let mut req = client
-            .objects()
-            .list_v2(&env.bucket)
-            .prefix(&branch_prefix)
-            .context("set cleanup ref list prefix")?;
-        if let Some(token) = continuation.take() {
-            req = req
-                .continuation_token(token)
-                .context("set cleanup ref continuation token")?;
-        }
-        let output = req.send().await.context("S3 list refs for cleanup")?;
-        for obj in output.contents {
-            keys.push(obj.key);
-        }
-        if !output.is_truncated {
-            break;
-        }
-        continuation = output.next_continuation_token;
-        if continuation.is_none() {
-            break;
-        }
-    }
+    keys.extend(list_cleanup_keys(env, &client, &branch_prefix).await?);
 
     delete_key_batches(env, &client, keys).await
 }
