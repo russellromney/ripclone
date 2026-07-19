@@ -536,7 +536,7 @@ async fn verify_upstream_auto_skips_non_tip_rev() {
         .expect("sync at HEAD~1");
     server
         .client()
-        .resolve_ref_with_clonepack("acme/verify-at-auto", "HEAD~1", Some("full"), None)
+        .resolve_ref_with_clonepack("acme/verify-at-auto", "HEAD", Some("full"), Some("HEAD~1"))
         .await
         .expect("warm full at HEAD~1");
 
@@ -587,7 +587,12 @@ async fn verify_upstream_always_fails_non_tip_rev() {
         .expect("sync at HEAD~1");
     server
         .client()
-        .resolve_ref_with_clonepack("acme/verify-at-always", "HEAD~1", Some("full"), None)
+        .resolve_ref_with_clonepack(
+            "acme/verify-at-always",
+            "HEAD",
+            Some("full"),
+            Some("HEAD~1"),
+        )
         .await
         .expect("warm full at HEAD~1");
 

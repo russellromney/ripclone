@@ -333,10 +333,14 @@ async fn cold_pending_real_server_installs_pinned_commit_after_branch_moves() {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("spawn release CLI");
-    tokio::time::timeout(Duration::from_secs(20), entered)
-        .await
-        .expect("moving response reached barrier")
-        .expect("barrier alive");
+    if !matches!(
+        tokio::time::timeout(Duration::from_secs(20), entered).await,
+        Ok(Ok(()))
+    ) {
+        let output = wait_child_output_bounded(child, Duration::from_secs(1)).await;
+        proxy_task.abort();
+        panic!("release CLI never reached moving-response barrier: {output:?}");
+    }
 
     origin.commit(&[("value.txt", "B\n")], "B");
     origin.publish();
@@ -349,14 +353,9 @@ async fn cold_pending_real_server_installs_pinned_commit_after_branch_moves() {
         .expect("make upstream unavailable");
     proceed.send(()).expect("return pending A");
 
-    let output = tokio::time::timeout(
-        Duration::from_secs(60),
-        tokio::task::spawn_blocking(move || child.wait_with_output()),
-    )
-    .await
-    .expect("release CLI bounded")
-    .expect("join release CLI")
-    .expect("release CLI output");
+    let output = wait_child_output_bounded(child, Duration::from_secs(60))
+        .await
+        .expect("release CLI bounded, killed, and reaped on timeout");
     proxy_task.abort();
     assert!(
         output.status.success(),
@@ -603,6 +602,24 @@ async fn overwritten_branch_metadata_returns_pending_for_the_pin_without_upstrea
         .commit;
     assert_ne!(a, b);
 
+    // Let B's archive publication finish before arming the request-path
+    // adapter, so background ref-store reads cannot contaminate the exact
+    // three-candidate count below.
+    let durable = FileRefStore::new(&server.repo_root);
+    let repo_id = RepoId::github("acme/overwritten-pin");
+    let mut settled = false;
+    for _ in 0..200 {
+        if matches!(
+            durable.load_branch(&repo_id, "HEAD").await,
+            Ok(Some(info)) if info.build_status.is_none()
+        ) {
+            settled = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(settled, "B fixture background publication settled");
+
     std::fs::rename(&origin.bare, origin.bare.with_extension("offline"))
         .expect("make upstream unavailable");
     let probe = server
@@ -626,11 +643,7 @@ async fn overwritten_branch_metadata_returns_pending_for_the_pin_without_upstrea
     assert_eq!(body["code"], "artifact_pending");
     assert_eq!(body["commit"], a);
     let observed = probe.snapshot();
-    assert!(
-        (1..=3).contains(&observed.branch_reads),
-        "bounded point reads: {}",
-        observed.branch_reads
-    );
+    assert_eq!(observed.branch_reads, 3, "bounded exact point reads");
     assert_eq!(observed.enqueues, 0);
 }
 
@@ -901,10 +914,14 @@ async fn release_cli_installs_the_fetched_snapshot_after_branch_movement() {
             command.args(["--mode", "files"]);
         }
         let child = command.spawn().expect("spawn selected CLI");
-        tokio::time::timeout(Duration::from_secs(20), entered)
-            .await
-            .expect("CLI ref request reached barrier")
-            .expect("ref barrier alive");
+        if !matches!(
+            tokio::time::timeout(Duration::from_secs(20), entered).await,
+            Ok(Ok(()))
+        ) {
+            let output = wait_child_output_bounded(child, Duration::from_secs(1)).await;
+            proxy_task.abort();
+            panic!("release CLI never reached ref barrier: {output:?}");
+        }
         origin.commit(&[("value.txt", "B\n")], "B");
         origin.publish();
         let newer = git(&origin.bare, &["rev-parse", "HEAD"]);
@@ -924,14 +941,9 @@ async fn release_cli_installs_the_fetched_snapshot_after_branch_movement() {
             assert_eq!(published_b, newer);
         }
         proceed.send(()).expect("release fetched A response");
-        let output = tokio::time::timeout(
-            Duration::from_secs(60),
-            tokio::task::spawn_blocking(move || child.wait_with_output()),
-        )
-        .await
-        .expect("release CLI clone bounded")
-        .expect("release CLI wait task")
-        .expect("release CLI output");
+        let output = wait_child_output_bounded(child, Duration::from_secs(60))
+            .await
+            .expect("release CLI clone bounded, killed, and reaped on timeout");
         proxy_task.abort();
         assert!(
             output.status.success(),

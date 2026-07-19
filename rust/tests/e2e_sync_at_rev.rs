@@ -180,9 +180,9 @@ async fn public_cli_clones_at_a_full_sha() {
     let pinned = origin.commit(&[("a.txt", "pinned\n")], "pinned");
     origin.commit(&[("a.txt", "tip\n")], "tip");
     origin.publish();
-    register_added_without_build(&server, "acme/at-full-sha")
+    ensure_added(&server, "acme/at-full-sha")
         .await
-        .expect("register full-SHA fixture");
+        .expect("add and build full-SHA fixture through the public workflow");
     server
         .client()
         .sync_repo_at("acme/at-full-sha", Some(&pinned), None)
@@ -207,33 +207,27 @@ async fn public_cli_clones_at_a_full_sha() {
             "full-SHA proof must spawn the requested release binary"
         );
     }
-    let server_url = server.url.clone();
-    let wanted = pinned.clone();
-    let target_for_child = target.clone();
-    let output = tokio::time::timeout(
-        Duration::from_secs(60),
-        tokio::task::spawn_blocking(move || {
-            std::process::Command::new(binary)
-                .arg("--server")
-                .arg(server_url)
-                .arg("clone")
-                .arg("acme/at-full-sha")
-                .arg(&target_for_child)
-                .arg("--at")
-                .arg(wanted)
-                .arg("--depth")
-                .arg("0")
-                .arg("--verify-upstream=never")
-                .arg("--no-metrics")
-                .env("RIPCLONE_SERVER_TOKEN", TOKEN)
-                .env("RIPCLONE_NO_METRICS", "1")
-                .output()
-        }),
-    )
-    .await
-    .expect("full-SHA CLI bounded")
-    .expect("join full-SHA CLI")
-    .expect("spawn full-SHA CLI");
+    let child = std::process::Command::new(binary)
+        .arg("--server")
+        .arg(&server.url)
+        .arg("clone")
+        .arg("acme/at-full-sha")
+        .arg(&target)
+        .arg("--at")
+        .arg(&pinned)
+        .arg("--depth")
+        .arg("0")
+        .arg("--verify-upstream=never")
+        .arg("--no-metrics")
+        .env("RIPCLONE_SERVER_TOKEN", TOKEN)
+        .env("RIPCLONE_NO_METRICS", "1")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn full-SHA CLI");
+    let output = wait_child_output_bounded(child, Duration::from_secs(60))
+        .await
+        .expect("full-SHA CLI bounded, killed, and reaped on timeout");
     assert!(
         output.status.success(),
         "full-SHA clone failed\nstdout:\n{}\nstderr:\n{}",

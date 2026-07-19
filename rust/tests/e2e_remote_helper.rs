@@ -53,51 +53,23 @@ async fn remote_helper_clones_through_ripclone_server() {
     // Run `git clone` with an internal timeout so a hung helper surfaces its
     // stderr in the test output instead of blocking the whole cargo run.
     let clone_timeout = std::time::Duration::from_secs(60);
-    let output = tokio::task::spawn_blocking({
-        let target = target.clone();
-        let server_url = server.url.clone();
-        move || {
-            let mut child = std::process::Command::new("git")
-                .arg("clone")
-                .arg("--depth")
-                .arg("1")
-                .arg("ripclone://github/acme/helper.git")
-                .arg(&target)
-                .env("PATH", new_path)
-                .env("RIPCLONE_SERVER", server_url)
-                .env("RIPCLONE_SERVER_TOKEN", TOKEN)
-                .env("RUST_LOG", "debug")
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .spawn()
-                .expect("spawn git clone");
-
-            let start = std::time::Instant::now();
-            loop {
-                if let Some(status) = child.try_wait().expect("try_wait git clone") {
-                    let mut out = child.wait_with_output().expect("collect output");
-                    out.status = status;
-                    break out;
-                }
-                if start.elapsed() > clone_timeout {
-                    let _ = child.kill();
-                    let out = child.wait_with_output().expect("collect output after kill");
-                    eprintln!(
-                        "git clone stdout:\n{}",
-                        String::from_utf8_lossy(&out.stdout)
-                    );
-                    eprintln!(
-                        "git clone stderr:\n{}",
-                        String::from_utf8_lossy(&out.stderr)
-                    );
-                    panic!("git clone through remote helper timed out");
-                }
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-        }
-    })
-    .await
-    .expect("spawn_blocking");
+    let child = std::process::Command::new("git")
+        .arg("clone")
+        .arg("--depth")
+        .arg("1")
+        .arg("ripclone://github/acme/helper.git")
+        .arg(&target)
+        .env("PATH", new_path)
+        .env("RIPCLONE_SERVER", &server.url)
+        .env("RIPCLONE_SERVER_TOKEN", TOKEN)
+        .env("RUST_LOG", "debug")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn git clone");
+    let output = wait_child_output_bounded(child, clone_timeout)
+        .await
+        .expect("git clone through remote helper bounded, killed, and reaped on timeout");
 
     if !output.status.success() {
         eprintln!(

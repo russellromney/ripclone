@@ -5,12 +5,14 @@
 //! `ripclone::client::Client` then drives real sync + clone round-trips.
 #![allow(dead_code)]
 
+use anyhow::Context;
 use ripclone::client::Client;
 use ripclone::server::{
     ArtifactBarrier, RateLimiter, ServerState, build_app, run_server_with_barrier,
 };
 use ripclone::storage::{HashEntry, StorageBackend, StorageRef};
 use sha2::{Digest, Sha256};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
@@ -1919,6 +1921,72 @@ pub fn cargo_bin(name: &str) -> std::path::PathBuf {
         }
         other => panic!("unknown cargo bin {other}; set CARGO_BIN_EXE_{other}"),
     }
+}
+
+/// Collect a piped child without allowing either pipe backpressure or a timeout
+/// to detach it. Reader threads drain stdout/stderr while the waiter polls; on
+/// timeout the child is killed and reaped before this returns.
+pub async fn wait_child_output_bounded(
+    mut child: std::process::Child,
+    timeout: Duration,
+) -> anyhow::Result<std::process::Output> {
+    tokio::task::spawn_blocking(move || {
+        let stdout = child.stdout.take().map(|mut pipe| {
+            std::thread::spawn(move || {
+                let mut bytes = Vec::new();
+                pipe.read_to_end(&mut bytes)
+                    .context("read bounded child stdout")?;
+                Ok::<_, anyhow::Error>(bytes)
+            })
+        });
+        let stderr = child.stderr.take().map(|mut pipe| {
+            std::thread::spawn(move || {
+                let mut bytes = Vec::new();
+                pipe.read_to_end(&mut bytes)
+                    .context("read bounded child stderr")?;
+                Ok::<_, anyhow::Error>(bytes)
+            })
+        });
+        let deadline = std::time::Instant::now() + timeout;
+        let mut timed_out = false;
+        let status = loop {
+            if let Some(status) = child.try_wait().context("poll bounded child")? {
+                break status;
+            }
+            if std::time::Instant::now() >= deadline {
+                timed_out = true;
+                child.kill().context("kill timed-out child")?;
+                break child.wait().context("reap timed-out child")?;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        let join_pipe = |reader: Option<std::thread::JoinHandle<anyhow::Result<Vec<u8>>>>| {
+            reader
+                .map(|reader| {
+                    reader
+                        .join()
+                        .map_err(|_| anyhow::anyhow!("bounded child pipe reader panicked"))?
+                })
+                .transpose()
+                .map(|bytes| bytes.unwrap_or_default())
+        };
+        let stdout = join_pipe(stdout)?;
+        let stderr = join_pipe(stderr)?;
+        if timed_out {
+            anyhow::bail!(
+                "child exceeded {timeout:?}; killed and reaped\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&stdout),
+                String::from_utf8_lossy(&stderr)
+            );
+        }
+        Ok(std::process::Output {
+            status,
+            stdout,
+            stderr,
+        })
+    })
+    .await
+    .context("join bounded child waiter")?
 }
 
 pub fn spawn_worker_with(

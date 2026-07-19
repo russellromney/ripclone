@@ -19,7 +19,6 @@ use ripclone::remote_gc::{GcConfig, RemoteGc};
 use ripclone::server::{ServerState, build_app, run_server};
 use ripclone::storage::{S3Storage, StorageBackend};
 use sha2::{Digest, Sha256};
-use std::io::Read;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -150,48 +149,10 @@ fn required_ripclone_bin() -> std::path::PathBuf {
     binary
 }
 
-fn wait_child_output_bounded(
-    mut child: std::process::Child,
-    timeout: Duration,
-) -> Result<std::process::Output> {
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        if let Some(status) = child.try_wait().context("poll CLI child")? {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            anyhow::bail!("CLI child exceeded {timeout:?}; killed and reaped");
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    };
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    if let Some(mut pipe) = child.stdout.take() {
-        pipe.read_to_end(&mut stdout).context("read CLI stdout")?;
-    }
-    if let Some(mut pipe) = child.stderr.take() {
-        pipe.read_to_end(&mut stderr).context("read CLI stderr")?;
-    }
-    Ok(std::process::Output {
-        status,
-        stdout,
-        stderr,
-    })
-}
-
 async fn wait_child_output(child: std::process::Child) -> std::process::Output {
-    tokio::time::timeout(
-        Duration::from_secs(65),
-        tokio::task::spawn_blocking(move || {
-            wait_child_output_bounded(child, Duration::from_secs(60))
-        }),
-    )
-    .await
-    .expect("CLI wait task remained bounded")
-    .expect("join CLI wait task")
-    .expect("wait for bounded CLI child")
+    wait_child_output_bounded(child, Duration::from_secs(60))
+        .await
+        .expect("wait for bounded CLI child")
 }
 
 fn free_port() -> u16 {
@@ -1691,8 +1652,9 @@ async fn expired_signed_url_retry_stays_on_pinned_commit() {
         Ok(Ok(()))
     ) {
         let _ = child.kill();
-        let output =
-            wait_child_output_bounded(child, Duration::from_secs(5)).expect("wait failed clone");
+        let output = wait_child_output_bounded(child, Duration::from_secs(5))
+            .await
+            .expect("wait failed clone");
         panic!(
             "CLI clone never reached the signed-URL barrier\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
@@ -1828,8 +1790,9 @@ async fn revoked_authorization_blocks_pinned_refresh() {
         Ok(Ok(()))
     ) {
         let _ = child.kill();
-        let output =
-            wait_child_output_bounded(child, Duration::from_secs(5)).expect("wait failed clone");
+        let output = wait_child_output_bounded(child, Duration::from_secs(5))
+            .await
+            .expect("wait failed clone");
         panic!(
             "CLI clone never reached the signed-URL barrier\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
