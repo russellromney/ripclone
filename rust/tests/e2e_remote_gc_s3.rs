@@ -10,20 +10,60 @@
 mod common;
 
 use anyhow::{Context, Result};
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use common::*;
+use ripclone::auth::access::{AccessDecision, AccessVerifier};
 use ripclone::mode::CloneMode;
 use ripclone::provider::RepoId;
 use ripclone::ref_store::{CachingRefStore, RefStore, S3RefStore};
 use ripclone::remote_gc::{GcConfig, RemoteGc};
-use ripclone::server::run_server;
+use ripclone::server::{ServerState, build_app, run_server};
 use ripclone::storage::{S3Storage, StorageBackend};
 use sha2::{Digest, Sha256};
+use std::io::Read;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::sleep;
+
+struct ToggleAccessVerifier {
+    allowed: std::sync::atomic::AtomicBool,
+    calls: AtomicU64,
+}
+
+impl ToggleAccessVerifier {
+    fn new(allowed: bool) -> Self {
+        Self {
+            allowed: std::sync::atomic::AtomicBool::new(allowed),
+            calls: AtomicU64::new(0),
+        }
+    }
+
+    fn set_allowed(&self, allowed: bool) {
+        self.allowed.store(allowed, Ordering::SeqCst);
+    }
+
+    fn calls(&self) -> u64 {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl AccessVerifier for ToggleAccessVerifier {
+    async fn verify(
+        &self,
+        _provider: &ripclone::provider::ProviderInstance,
+        _repo_path: &str,
+        _credential: Option<&secrecy::SecretString>,
+    ) -> AccessDecision {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.allowed.load(Ordering::SeqCst) {
+            AccessDecision::PrivateAuthorized
+        } else {
+            AccessDecision::Denied
+        }
+    }
+}
 
 #[derive(Clone)]
 struct S3Env {
@@ -85,56 +125,6 @@ fn repo_suffix(prefix: &str) -> String {
         .to_string()
 }
 
-fn token_exp(token: &str) -> u64 {
-    let payload = token.split('.').nth(1).expect("JWT payload");
-    let decoded = URL_SAFE_NO_PAD.decode(payload).expect("base64url payload");
-    let claims: serde_json::Value = serde_json::from_slice(&decoded).expect("JWT JSON");
-    claims["exp"].as_u64().expect("exp claim")
-}
-
-async fn mint_session_token(server: &Server) -> String {
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .unwrap();
-    let resp = client
-        .post(format!("{}/v1/auth/login", server.url))
-        .form(&[
-            ("secret", TOKEN),
-            ("callback", "http://127.0.0.1:0/"),
-            ("state", "combined-expiry"),
-        ])
-        .send()
-        .await
-        .expect("login request");
-    assert_eq!(
-        resp.status(),
-        reqwest::StatusCode::SEE_OTHER,
-        "login redirects to callback"
-    );
-    let loc = resp
-        .headers()
-        .get("location")
-        .and_then(|v| v.to_str().ok())
-        .expect("location header");
-    loc.split_once("token=")
-        .and_then(|(_, rest)| rest.split('&').next())
-        .expect("token in redirect")
-        .to_string()
-}
-
-fn write_cli_session_token(home: &std::path::Path, server: &str, token: &str) {
-    let config_dir = home.join(".config").join("ripclone");
-    std::fs::create_dir_all(&config_dir).expect("create ripclone config dir");
-    let key = format!("session:{}", server.trim_end_matches('/'));
-    let body = serde_json::json!({ key: token });
-    std::fs::write(
-        config_dir.join("tokens.json"),
-        serde_json::to_vec_pretty(&body).expect("token json"),
-    )
-    .expect("write token store");
-}
-
 fn required_ripclone_bin() -> std::path::PathBuf {
     let binary = cargo_bin("ripclone");
     if std::env::var_os("RIPCLONE_REQUIRE_MINIO").is_some() {
@@ -158,6 +148,50 @@ fn required_ripclone_bin() -> std::path::PathBuf {
         "selected ripclone reports version"
     );
     binary
+}
+
+fn wait_child_output_bounded(
+    mut child: std::process::Child,
+    timeout: Duration,
+) -> Result<std::process::Output> {
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait().context("poll CLI child")? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!("CLI child exceeded {timeout:?}; killed and reaped");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        pipe.read_to_end(&mut stdout).context("read CLI stdout")?;
+    }
+    if let Some(mut pipe) = child.stderr.take() {
+        pipe.read_to_end(&mut stderr).context("read CLI stderr")?;
+    }
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+async fn wait_child_output(child: std::process::Child) -> std::process::Output {
+    tokio::time::timeout(
+        Duration::from_secs(65),
+        tokio::task::spawn_blocking(move || {
+            wait_child_output_bounded(child, Duration::from_secs(60))
+        }),
+    )
+    .await
+    .expect("CLI wait task remained bounded")
+    .expect("join CLI wait task")
+    .expect("wait for bounded CLI child")
 }
 
 fn free_port() -> u16 {
@@ -679,7 +713,130 @@ async fn start_s3_server_faulting(env: &S3Env, prefix: &str, fail_first: usize) 
         cas_dir: cas_dir.clone(),
         storage_dir: cas_dir,
         repo_root,
-        work_counts: None,
+        pinned_path_probe: None,
+        _dir: dir,
+    }
+}
+
+/// Start the existing S3-backed fixture with repository authorization enforced
+/// through a controllable test verifier. This uses the same production
+/// `ServerState`, S3 storage/ref store, local queue, and build worker as the
+/// ordinary fixture; only the authorization adapter is injected by the test.
+async fn start_s3_server_authorized(
+    env: &S3Env,
+    prefix: &str,
+    verifier: Arc<dyn AccessVerifier>,
+) -> Server {
+    unsafe {
+        std::env::set_var("RIPCLONE_S3_ENDPOINT", &env.endpoint);
+        std::env::set_var("RIPCLONE_S3_BUCKET", &env.bucket);
+        std::env::set_var("RIPCLONE_S3_REGION", &env.region);
+        std::env::set_var("RIPCLONE_S3_PREFIX", prefix);
+        std::env::set_var("RIPCLONE_REMOTE_GC_INTERVAL_SECS", "0");
+        std::env::set_var("RIPCLONE_RETENTION_INTERVAL_SECS", "999999");
+        std::env::set_var("RIPCLONE_REF_CACHE_TTL_SECS", "0");
+        std::env::set_var("RIPCLONE_TEST_MIRROR_FRESH_TTL_MS", "0");
+        std::env::set_var("RIPCLONE_TEST_SYNC_POLL_MS", "100");
+    }
+    common::init(false);
+
+    let dir = tempfile::tempdir().expect("authorized S3 server temp dir");
+    let cas_dir = dir.path().join("cas");
+    let repo_root = dir.path().join("repos");
+    std::fs::create_dir_all(&cas_dir).unwrap();
+    std::fs::create_dir_all(&repo_root).unwrap();
+    unsafe {
+        std::env::set_var("RIPCLONE_S3_CACHE_DIR", cas_dir.to_str().unwrap());
+    }
+
+    let metrics = ripclone::metrics::Metrics::new();
+    let backends = ripclone::backends::Backends::from_env(&cas_dir, &repo_root, &metrics)
+        .await
+        .expect("authorized S3 backends");
+    let (local_queue, mut rx, depth) = ripclone::queue::LocalJobQueue::new(16);
+    let build_queue: ripclone::queue::JobQueueRef = Arc::new(local_queue);
+    let provider_registry = ripclone::provider::ProviderRegistry::new();
+    let broker: Arc<dyn ripclone::auth::broker::CredentialBroker> = Arc::new(
+        ripclone::auth::broker::StaticBroker::new(provider_registry.clone()),
+    );
+    let state = ServerState {
+        cas: backends.cas,
+        repo_config: Arc::new(ripclone::repo_config::RepoConfigStore::new(
+            backends.storage.clone(),
+        )),
+        storage: backends.storage,
+        repo_root: repo_root.clone(),
+        ref_store: backends.ref_store,
+        provider_registry,
+        broker,
+        token_hash: Some(token_hash()),
+        jwt: None,
+        metrics,
+        rate_limiter: ripclone::server::RateLimiter::new(1_000_000, 1_000_000.0),
+        retention: backends.retention,
+        build_queue,
+        worker_queue: None,
+        build_queue_depth: depth,
+        build_waiters: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        oidc_verifier: None,
+        webhook_config: Arc::new(ripclone::webhook::WebhookConfig::empty()),
+        sync_locks: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        mirror_freshness: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        mirror_fresh_ttl: Duration::from_secs(0),
+        ref_response_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        artifact_fetch_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        fail_first_fetches: 0,
+        artifact_barrier: None,
+        readyz_cache: Arc::new(std::sync::Mutex::new(None)),
+        access_verifier: verifier,
+        require_repo_auth: true,
+    };
+
+    let worker_state = state.clone();
+    tokio::spawn(async move {
+        while let Some(job) = rx.recv().await {
+            let state = worker_state.clone();
+            tokio::spawn(async move {
+                let key = format!(
+                    "{}/{}#{}",
+                    job.repo_id.storage_key(),
+                    job.branch,
+                    job.rev.as_deref().unwrap_or("")
+                );
+                let result = ripclone::server::process_build_job(&state, &job).await;
+                state
+                    .build_queue_depth
+                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                if let Some(senders) = state.build_waiters.lock().await.remove(&key) {
+                    for sender in senders {
+                        let _ = sender.send(result.clone());
+                    }
+                }
+            });
+        }
+    });
+
+    let port = free_port();
+    let app = build_app(state);
+    tokio::spawn(async move {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+            .await
+            .expect("bind authorized S3 server");
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .expect("serve authorized S3 server");
+    });
+    wait_for_server(port).await;
+
+    Server {
+        url: format!("http://127.0.0.1:{port}"),
+        cas_dir: cas_dir.clone(),
+        storage_dir: cas_dir,
+        repo_root,
+        pinned_path_probe: None,
         _dir: dir,
     }
 }
@@ -701,6 +858,97 @@ fn make_s3_ref_store(storage: Arc<S3Storage>) -> Arc<dyn RefStore> {
     Arc::new(CachingRefStore::new(S3RefStore::new(storage)))
 }
 
+/// Build the tiny shallow fixture on local storage, then copy its real CAS
+/// objects and ref rows into the existing S3 fixture. The signed-URL tests need
+/// real S3 reads, signing, mutation, and client installation; they do not need
+/// to spend minutes rebuilding full history through S3 before that journey can
+/// start.
+async fn seed_shallow_s3_fixture(
+    env: &S3Env,
+    prefix: &str,
+    repo: &str,
+) -> (String, Arc<dyn RefStore>, ripclone::RefInfo, Server) {
+    let fixture = start_server_split_storage().await;
+    add_acme_repo(&fixture, repo).await;
+    fixture
+        .client()
+        .sync_repo(&format!("acme/{repo}"), None)
+        .await
+        .expect("build local shallow fixture");
+    let pinned = fixture
+        .client()
+        .resolve_ref_with_clonepack(&format!("acme/{repo}"), "HEAD", Some("shallow"), None)
+        .await
+        .expect("local shallow fixture ready")
+        .commit;
+
+    let repo_id = RepoId::github(format!("acme/{repo}"));
+    let local_refs = ripclone::ref_store::FileRefStore::new(&fixture.repo_root);
+    let info = local_refs
+        .load_branch(&repo_id, "HEAD")
+        .await
+        .expect("load local A ref")
+        .expect("local A ref present");
+    assert_eq!(info.shallow_clonepack.commit, pinned);
+    assert!(!info.shallow_clonepack.manifest.is_empty());
+
+    let local_storage =
+        ripclone::storage::local(&fixture.storage_dir).expect("open local fixture storage");
+    let s3_storage = make_s3_storage(env, prefix).expect("open S3 fixture storage");
+    for entry in local_storage
+        .list_hashes()
+        .expect("list local fixture artifacts")
+    {
+        let data = local_storage
+            .get(&entry.hash)
+            .expect("read local fixture artifact");
+        s3_storage
+            .put_async(&entry.hash, &data)
+            .await
+            .expect("upload fixture artifact to S3");
+    }
+
+    let s3_refs: Arc<dyn RefStore> = Arc::new(S3RefStore::new(s3_storage));
+    let default_branch = info.default_branch.clone();
+    s3_refs
+        .save_branch(&repo_id, "HEAD", &info)
+        .await
+        .expect("publish S3 HEAD fixture");
+    s3_refs
+        .save_branch(&repo_id, &default_branch, &info)
+        .await
+        .expect("publish S3 default-branch fixture");
+    s3_refs
+        .save_branch(&repo_id, &format!("{default_branch}#{pinned}"), &info)
+        .await
+        .expect("publish exact S3 A fixture");
+    (pinned, s3_refs, info, fixture)
+}
+
+async fn publish_moving_s3_row(
+    ref_store: &Arc<dyn RefStore>,
+    repo_id: &RepoId,
+    previous: &ripclone::RefInfo,
+    commit: &str,
+) {
+    let info = ripclone::RefInfo {
+        commit: commit.to_string(),
+        default_branch: previous.default_branch.clone(),
+        build_status: Some("building".to_string()),
+        synced_at: Some(previous.synced_at.unwrap_or(0).saturating_add(1)),
+        generation: Some(previous.generation.unwrap_or(0).saturating_add(1)),
+        ..Default::default()
+    };
+    ref_store
+        .save_branch(repo_id, "HEAD", &info)
+        .await
+        .expect("publish moving S3 HEAD row");
+    ref_store
+        .save_branch(repo_id, &info.default_branch, &info)
+        .await
+        .expect("publish moving S3 default-branch row");
+}
+
 /// Cleanup client with the same timeout/retry posture as production S3Storage.
 /// The s3 crate default (~10s, few retries) flakes on MinIO `delete_objects`
 /// batches under CI load — not a credentials failure (would be 403, not timeout).
@@ -709,10 +957,8 @@ fn cleanup_s3_client(env: &S3Env) -> Result<s3::Client> {
         .context("create S3 cleanup builder")?
         .region(&env.region)
         .auth(s3::Auth::from_env().context("S3 auth for cleanup")?)
-        .timeout(Duration::from_secs(30))
-        .max_attempts(5)
-        .base_retry_delay(Duration::from_millis(200))
-        .max_retry_delay(Duration::from_secs(2))
+        .timeout(Duration::from_secs(10))
+        .max_attempts(1)
         .build()
         .context("build cleanup S3 client")
 }
@@ -725,15 +971,32 @@ async fn delete_key_batches(env: &S3Env, client: &s3::Client, keys: Vec<String>)
         if chunk.is_empty() {
             continue;
         }
-        client
-            .objects()
-            .delete_objects(&env.bucket)
-            .objects(&chunk)
-            .context("build cleanup delete batch")?
-            .quiet(true)
-            .send()
-            .await
-            .context("S3 cleanup delete_objects")?;
+        let mut last_error = None;
+        for attempt in 1..=3 {
+            match client
+                .objects()
+                .delete_objects(&env.bucket)
+                .objects(&chunk)
+                .context("build cleanup delete batch")?
+                .quiet(true)
+                .send()
+                .await
+            {
+                Ok(_) => {
+                    last_error = None;
+                    break;
+                }
+                Err(error) => {
+                    last_error = Some(error);
+                    if attempt < 3 {
+                        sleep(Duration::from_millis(100 * attempt)).await;
+                    }
+                }
+            }
+        }
+        if let Some(error) = last_error {
+            return Err(error).context("S3 cleanup delete_objects after 3 attempts");
+        }
     }
     Ok(())
 }
@@ -1382,48 +1645,31 @@ async fn expired_signed_url_retry_stays_on_pinned_commit() {
     let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
     let (proceed_tx, proceed_rx) = tokio::sync::oneshot::channel();
     let proxy = start_barrier_proxy(&direct_env.endpoint, 16, true, entered_tx, proceed_rx).await;
-    let server = start_s3_server(&direct_env, &prefix).await;
+    let verifier = Arc::new(ToggleAccessVerifier::new(true));
+    let server = start_s3_server_authorized(
+        &direct_env,
+        &prefix,
+        Arc::clone(&verifier) as Arc<dyn AccessVerifier>,
+    )
+    .await;
     let origin = make_origin("acme", &repo);
     guard.track_repo("acme", &repo);
     origin.commit(&[("value.txt", "A\n"), ("stable.txt", "stable\n")], "A");
     origin.publish();
-    add_acme_repo(&server, &repo).await;
-    server
-        .client()
-        .sync_repo(&format!("acme/{repo}"), None)
-        .await
-        .expect("sync A");
-    let pinned = server
-        .client()
-        .resolve_ref_with_clonepack(&format!("acme/{repo}"), "HEAD", Some("shallow"), None)
-        .await
-        .expect("shallow A ready")
-        .commit;
-    // Preserve one exact A row in the existing S3 ref-store architecture so
-    // the refresh case exercises the "exact metadata remains available" path
-    // after the moving HEAD/main rows are genuinely overwritten by B. This is
-    // fixture data, not production retention behavior.
-    let exact_store = make_s3_ref_store(make_s3_storage(&direct_env, &prefix).unwrap());
+    let (pinned, exact_store, exact_a, _fixture) =
+        seed_shallow_s3_fixture(&direct_env, &prefix, &repo).await;
     let repo_id = RepoId::github(format!("acme/{repo}"));
-    let exact_a = exact_store
-        .load_branch(&repo_id, "HEAD")
-        .await
-        .expect("load S3 A ref")
-        .expect("S3 A ref present");
-    exact_store
-        .save_branch(&repo_id, &format!("HEAD#{pinned}"), &exact_a)
-        .await
-        .expect("publish exact S3 A fixture");
+    add_acme_repo(&server, &repo).await;
 
     unsafe {
-        std::env::set_var("RIPCLONE_SIGNED_URL_TTL_SECS", "1");
+        std::env::set_var("RIPCLONE_SIGNED_URL_TTL_PRIVATE_SECS", "1");
         std::env::set_var("RIPCLONE_TEST_DOWNLOAD_CONCURRENCY", "1");
         std::env::set_var("RIPCLONE_TEST_SIGNED_URL_PROXY", &proxy.url);
     }
     let out = tempfile::tempdir().expect("clone out");
     let target = out.path().join("clone");
     let binary = required_ripclone_bin();
-    let child = std::process::Command::new(&binary)
+    let mut child = std::process::Command::new(&binary)
         .arg("--server")
         .arg(&server.url)
         .arg("clone")
@@ -1440,41 +1686,40 @@ async fn expired_signed_url_retry_stays_on_pinned_commit() {
         .spawn()
         .expect("spawn release CLI clone");
 
-    tokio::time::timeout(Duration::from_secs(30), entered_rx)
-        .await
-        .expect("signed request reached barrier")
-        .expect("barrier sender alive");
+    if !matches!(
+        tokio::time::timeout(Duration::from_secs(30), entered_rx).await,
+        Ok(Ok(()))
+    ) {
+        let _ = child.kill();
+        let output =
+            wait_child_output_bounded(child, Duration::from_secs(5)).expect("wait failed clone");
+        panic!(
+            "CLI clone never reached the signed-URL barrier\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
     origin.commit(&[("value.txt", "B\n"), ("stable.txt", "stable\n")], "B");
     origin.publish();
     let newer = git(&origin.bare, &["rev-parse", "HEAD"]);
     assert_ne!(pinned, newer);
-    server
-        .client()
-        .sync_repo(&format!("acme/{repo}"), None)
+    publish_moving_s3_row(&exact_store, &repo_id, &exact_a, &newer).await;
+    let published_b = exact_store
+        .load_branch(&repo_id, "HEAD")
         .await
-        .expect("publish B through S3 ref store");
-    let published_b = server
-        .client()
-        .resolve_ref_with_clonepack(&format!("acme/{repo}"), "HEAD", Some("shallow"), None)
-        .await
-        .expect("S3 branch row B ready")
+        .expect("load published S3 B row")
+        .expect("published S3 B row present")
         .commit;
     assert_eq!(published_b, newer);
+    let authorization_calls_before_refresh = verifier.calls();
     sleep(Duration::from_secs(2)).await;
     proceed_tx
         .send(())
         .expect("expire and close first signed request");
 
-    let output = tokio::time::timeout(
-        Duration::from_secs(60),
-        tokio::task::spawn_blocking(move || child.wait_with_output()),
-    )
-    .await
-    .expect("release CLI remained bounded")
-    .expect("join release CLI")
-    .expect("wait release CLI");
+    let output = wait_child_output(child).await;
     unsafe {
-        std::env::remove_var("RIPCLONE_SIGNED_URL_TTL_SECS");
+        std::env::remove_var("RIPCLONE_SIGNED_URL_TTL_PRIVATE_SECS");
         std::env::remove_var("RIPCLONE_TEST_DOWNLOAD_CONCURRENCY");
         std::env::remove_var("RIPCLONE_TEST_SIGNED_URL_PROXY");
     }
@@ -1490,6 +1735,10 @@ async fn expired_signed_url_retry_stays_on_pinned_commit() {
         "A\n"
     );
     assert!(git_ok(&target, &["fsck", "--connectivity-only", "HEAD"]));
+    assert!(
+        verifier.calls() > authorization_calls_before_refresh,
+        "pinned signed-URL refresh must re-enter repository authorization"
+    );
     let headers = proxy.signed_headers();
     assert!(
         headers.len() >= 2,
@@ -1513,10 +1762,7 @@ async fn expired_signed_url_retry_stays_on_pinned_commit() {
 
 #[ignore = "requires S3 credentials"]
 #[tokio::test]
-async fn expired_bearer_blocks_pinned_refresh() {
-    // Fails if the CLI falls back to an unauthenticated artifact path after a
-    // stale signed URL, if re-resolving a ref with an expired bearer token still
-    // exposes private bytes, or if the failed clone leaves a partial checkout.
+async fn revoked_authorization_blocks_pinned_refresh() {
     let direct_env = match s3_env() {
         Some(e) => e,
         None => {
@@ -1534,41 +1780,31 @@ async fn expired_bearer_blocks_pinned_refresh() {
     let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
     let (proceed_tx, proceed_rx) = tokio::sync::oneshot::channel();
     let proxy = start_barrier_proxy(&direct_env.endpoint, 16, true, entered_tx, proceed_rx).await;
-    let server = start_s3_server(&direct_env, &prefix).await;
+    let verifier = Arc::new(ToggleAccessVerifier::new(true));
+    let server = start_s3_server_authorized(
+        &direct_env,
+        &prefix,
+        Arc::clone(&verifier) as Arc<dyn AccessVerifier>,
+    )
+    .await;
 
     let origin = make_origin("acme", &repo);
     guard.track_repo("acme", &repo);
-    let body = "combined expiry must not leak bytes\n".repeat(128);
-    origin.commit(&[("a.txt", &body), ("b.txt", "stable\n")], "c1");
+    origin.commit(&[("value.txt", "A\n"), ("stable.txt", "stable\n")], "A");
     origin.publish();
-
+    let (pinned, exact_store, exact_a, _fixture) =
+        seed_shallow_s3_fixture(&direct_env, &prefix, &repo).await;
+    let repo_id = RepoId::github(format!("acme/{repo}"));
     add_acme_repo(&server, &repo).await;
-    server
-        .client()
-        .sync_repo(&format!("acme/{repo}"), None)
-        .await
-        .expect("sync");
 
     unsafe {
-        std::env::set_var("RIPCLONE_JWT_TTL_SECS", "12");
-    }
-    let token = mint_session_token(&server).await;
-    let token_expires_at = token_exp(&token);
-    unsafe {
-        std::env::remove_var("RIPCLONE_JWT_TTL_SECS");
-        std::env::set_var("RIPCLONE_SIGNED_URL_TTL_SECS", "1");
+        std::env::set_var("RIPCLONE_SIGNED_URL_TTL_PRIVATE_SECS", "1");
         std::env::set_var("RIPCLONE_TEST_DOWNLOAD_CONCURRENCY", "1");
         std::env::set_var("RIPCLONE_TEST_SIGNED_URL_PROXY", &proxy.url);
     }
 
-    let home = tempfile::tempdir().expect("cli home");
-    write_cli_session_token(home.path(), &server.url, &token);
     let out = tempfile::tempdir().expect("clone out");
     let target = out.path().join("clone");
-    // Prefer the runtime env (set by cargo test, or by CI when running a
-    // prebuilt binary against a separately-downloaded CLI) over the compile-time
-    // path baked into env!("CARGO_BIN_EXE_ripclone"), which points at the build
-    // machine and breaks after artifact download.
     let ripclone_bin = required_ripclone_bin();
     let mut child = std::process::Command::new(&ripclone_bin)
         .arg("--server")
@@ -1580,14 +1816,8 @@ async fn expired_bearer_blocks_pinned_refresh() {
         .arg("1")
         .arg("--no-metrics")
         .arg("--verify-upstream=never")
-        .env("HOME", home.path())
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("RIPCLONE_SERVER_TOKEN", TOKEN)
         .env("RIPCLONE_NO_METRICS", "1")
-        .env_remove("RIPCLONE_SERVER_TOKEN")
-        .env_remove("RIPCLONE_SERVER_TOKEN_HASH")
-        .env_remove("RIPCLONE_TOKEN")
-        .env_remove("RIPCLONE_TOKEN_HASH")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -1598,35 +1828,33 @@ async fn expired_bearer_blocks_pinned_refresh() {
         Ok(Ok(()))
     ) {
         let _ = child.kill();
-        let output = child.wait_with_output().expect("wait failed clone");
+        let output =
+            wait_child_output_bounded(child, Duration::from_secs(5)).expect("wait failed clone");
         panic!(
             "CLI clone never reached the signed-URL barrier\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
     }
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time")
-        .as_secs();
-    if token_expires_at > now {
-        sleep(Duration::from_secs(token_expires_at - now + 1)).await;
-    }
+    origin.commit(&[("value.txt", "B\n"), ("stable.txt", "stable\n")], "B");
+    origin.publish();
+    let newer = git(&origin.bare, &["rev-parse", "HEAD"]);
+    assert_ne!(pinned, newer);
+    publish_moving_s3_row(&exact_store, &repo_id, &exact_a, &newer).await;
+    verifier.set_allowed(false);
+    sleep(Duration::from_secs(2)).await;
     proceed_tx.send(()).expect("release signed-URL barrier");
 
-    let output = tokio::task::spawn_blocking(move || child.wait_with_output())
-        .await
-        .expect("join CLI wait")
-        .expect("wait CLI clone");
+    let output = wait_child_output(child).await;
     unsafe {
-        std::env::remove_var("RIPCLONE_SIGNED_URL_TTL_SECS");
+        std::env::remove_var("RIPCLONE_SIGNED_URL_TTL_PRIVATE_SECS");
         std::env::remove_var("RIPCLONE_TEST_DOWNLOAD_CONCURRENCY");
         std::env::remove_var("RIPCLONE_TEST_SIGNED_URL_PROXY");
     }
 
     assert!(
         !output.status.success(),
-        "combined bearer/signed-URL expiry must fail, stdout:\n{}\nstderr:\n{}",
+        "revoked authorization must fail the pinned refresh, stdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
@@ -1636,12 +1864,23 @@ async fn expired_bearer_blocks_pinned_refresh() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        combined.contains("401") || combined.to_lowercase().contains("unauthorized"),
-        "retry after stale signed URL must fail at the expired bearer boundary, got:\n{combined}"
+        combined.contains("403") || combined.to_lowercase().contains("access denied"),
+        "retry after stale signed URL must fail at repository authorization, got:\n{combined}"
+    );
+    assert!(
+        combined.contains(&pinned),
+        "authorization error must identify pinned commit {pinned}, got:\n{combined}"
     );
     assert!(
         !target.exists(),
-        "failed combined-expiry clone must not leave a partial checkout"
+        "denied pinned refresh must not leave a partial checkout"
+    );
+    assert!(
+        proxy
+            .signed_headers()
+            .iter()
+            .all(|header| !header.to_ascii_lowercase().contains("authorization:")),
+        "artifact-host requests must not carry Ripclone authorization"
     );
 
     cleanup_prefix(&direct_env, &prefix)

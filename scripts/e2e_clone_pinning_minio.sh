@@ -17,16 +17,16 @@ command -v docker >/dev/null || {
 }
 
 cleanup() {
-  docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+  timeout 20 docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
-docker image inspect "$MINIO_IMAGE" >/dev/null 2>&1 || docker pull "$MINIO_IMAGE"
-docker run --rm -d --name "$CONTAINER" -p 127.0.0.1::9000 \
+timeout 15 docker image inspect "$MINIO_IMAGE" >/dev/null 2>&1 || timeout 120 docker pull "$MINIO_IMAGE"
+timeout 30 docker run --rm -d --name "$CONTAINER" -p 127.0.0.1::9000 \
   -e MINIO_ROOT_USER=minioadmin \
   -e MINIO_ROOT_PASSWORD=minioadmin \
   "$MINIO_IMAGE" server /data >/dev/null
-HOST_PORT="$(docker port "$CONTAINER" 9000/tcp | awk -F: 'NR==1 {print $NF}')"
+HOST_PORT="$(timeout 10 docker port "$CONTAINER" 9000/tcp | awk -F: 'NR==1 {print $NF}')"
 test -n "$HOST_PORT" || {
   echo "error: Docker did not publish MinIO port" >&2
   exit 1
@@ -46,7 +46,7 @@ test "$ready" -eq 1 || {
   exit 1
 }
 
-docker exec "$CONTAINER" sh -c \
+timeout 30 docker exec "$CONTAINER" sh -c \
   "mc alias set local http://127.0.0.1:9000 minioadmin minioadmin >/dev/null && mc mb local/$BUCKET >/dev/null"
 
 export RIPCLONE_REQUIRE_MINIO=1
@@ -56,14 +56,18 @@ export RIPCLONE_S3_REGION=us-east-1
 export AWS_ACCESS_KEY_ID=minioadmin
 export AWS_SECRET_ACCESS_KEY=minioadmin
 
-tests=(
-  expired_signed_url_retry_stays_on_pinned_commit
-  expired_bearer_blocks_pinned_refresh
-)
+if [ "$#" -gt 0 ]; then
+  tests=("$@")
+else
+  tests=(
+    expired_signed_url_retry_stays_on_pinned_commit
+    revoked_authorization_blocks_pinned_refresh
+  )
+fi
 
 for test_name in "${tests[@]}"; do
   echo "minio pinning proof: $test_name"
-  timeout 300 bash "$ROOT/scripts/ci.sh" s3gc "$test_name"
+  bash "$ROOT/scripts/ci.sh" s3gc "$test_name"
 done
 
 echo "MinIO image: $MINIO_IMAGE"
