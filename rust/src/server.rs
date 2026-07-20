@@ -409,6 +409,7 @@ pub struct BuildResponse {
 pub struct ArtifactPendingResponse {
     pub code: &'static str,
     pub commit: String,
+    pub branch: String,
     pub status: &'static str,
     pub queue_depth: usize,
 }
@@ -2462,6 +2463,9 @@ fn exact_ref_info_serves_commit(info: &RefInfo, clonepack_kind: &str, commit: &s
     if info.build_status.as_deref() == Some(crate::remote_gc::EVICTED_BUILD_STATUS) {
         return false;
     }
+    if info.commit != commit {
+        return false;
+    }
     matches!(
         exact_clonepack_artifacts(info, clonepack_kind),
         Some(artifacts)
@@ -2507,12 +2511,13 @@ fn request_protocol(headers: &HeaderMap) -> Option<u32> {
         .and_then(|value| value.trim().parse().ok())
 }
 
-fn artifact_pending_response(commit: &str, queue_depth: usize) -> Response {
+fn artifact_pending_response(commit: &str, branch: &str, queue_depth: usize) -> Response {
     (
         StatusCode::ACCEPTED,
         Json(ArtifactPendingResponse {
             code: "artifact_pending",
             commit: commit.to_string(),
+            branch: branch.to_string(),
             status: "building",
             queue_depth,
         }),
@@ -2812,7 +2817,7 @@ async fn get_ref_inner(
             }
         };
         let Some((_key, info)) = resolved else {
-            return artifact_pending_response(pinned, 1);
+            return artifact_pending_response(pinned, &branch, 1);
         };
         let response_branch = if branch == "HEAD" && !info.default_branch.is_empty() {
             info.default_branch.clone()
@@ -2822,14 +2827,14 @@ async fn get_ref_inner(
         let response = ref_response(
             &repo_id,
             &provider,
-            response_branch,
+            response_branch.clone(),
             &info,
             &state.storage,
             &params.clonepack,
             private,
         );
         if response.commit != pinned || response.clonepack_manifest.is_empty() {
-            return artifact_pending_response(pinned, 1);
+            return artifact_pending_response(pinned, &response_branch, 1);
         }
         return (StatusCode::OK, Json(response)).into_response();
     }
@@ -3019,7 +3024,7 @@ async fn get_ref_inner(
                 }
                 let queue_depth = state.build_queue.depth().await;
                 return if protocol_v2 {
-                    artifact_pending_response(&commit, queue_depth)
+                    artifact_pending_response(&commit, &effective_branch, queue_depth)
                 } else {
                     (
                         StatusCode::ACCEPTED,

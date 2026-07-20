@@ -39,6 +39,8 @@ struct ServerError {
 struct ArtifactPendingResponse {
     code: String,
     commit: String,
+    #[serde(default)]
+    branch: Option<String>,
 }
 
 /// The selected artifact is not yet available for the commit this clone pinned.
@@ -664,6 +666,7 @@ pub struct CloneOutcome {
 #[derive(Default)]
 struct InstallIdentity {
     pinned: Option<String>,
+    resolved_branch: Option<String>,
     clone_id: Option<String>,
     cold: bool,
 }
@@ -673,13 +676,27 @@ type CleanupFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 #[derive(Clone, Default)]
 struct AttemptCleanup(Arc<Mutex<Vec<CleanupFuture>>>);
 
+#[derive(Default)]
+struct AttemptStaging {
+    overlay_dirs: Option<overlay::OverlayDirs>,
+    temp_install: Option<tempfile::TempDir>,
+}
+
 impl AttemptCleanup {
     async fn drain(&self) {
-        let pending = {
-            let mut pending = self.0.lock().unwrap_or_else(|e| e.into_inner());
-            std::mem::take(&mut *pending)
-        };
-        futures::future::join_all(pending).await;
+        loop {
+            let pending = {
+                let mut pending = self.0.lock().unwrap_or_else(|e| e.into_inner());
+                std::mem::take(&mut *pending)
+            };
+            if pending.is_empty() {
+                break;
+            }
+            // Awaiting one cancelled parent can drop child guards that append
+            // more handles, so drain to a fixed point before retrying or
+            // removing staging.
+            futures::future::join_all(pending).await;
+        }
     }
 }
 
@@ -896,12 +913,14 @@ impl Client {
         rev: Option<&str>,
     ) -> Result<RefResponse> {
         let mut pinned = None;
+        let mut resolved_branch = None;
         self.resolve_ref_for_operation(
             repo_path,
             branch,
             clonepack,
             rev,
             &mut pinned,
+            &mut resolved_branch,
             clonepack.unwrap_or("full"),
         )
         .await
@@ -914,6 +933,7 @@ impl Client {
         clonepack: Option<&str>,
         rev: Option<&str>,
         pinned: &mut Option<String>,
+        resolved_branch: &mut Option<String>,
         pending_mode: &str,
     ) -> Result<RefResponse> {
         let (max_attempts, poll_delay) = ref_poll_config();
@@ -921,7 +941,12 @@ impl Client {
         // success, so the post-clone metrics report can label the clone cold.
         let mut polled = false;
         for attempt in 0..max_attempts {
-            let mut url = self.repo_url(repo_path, &format!("/refs/{branch}"));
+            let request_branch = if pinned.is_some() {
+                resolved_branch.as_deref().unwrap_or(branch)
+            } else {
+                branch
+            };
+            let mut url = self.repo_url(repo_path, &format!("/refs/{request_branch}"));
             let mut q: Vec<String> = Vec::new();
             if let Some(kind) = clonepack {
                 q.push(format!("clonepack={kind}"));
@@ -958,6 +983,19 @@ impl Client {
                     }
                 } else {
                     *pinned = Some(pending.commit.clone());
+                }
+                if let Some(response_branch) = pending.branch.filter(|value| !value.is_empty()) {
+                    crate::validation::validate_git_rev(&response_branch)
+                        .with_context(|| format!("invalid pending branch for {repo_path}"))?;
+                    if let Some(expected) = resolved_branch.as_deref() {
+                        if response_branch != expected {
+                            anyhow::bail!(
+                                "ref integrity error: resolved branch {expected} changed to {response_branch} in a pending response"
+                            );
+                        }
+                    } else {
+                        *resolved_branch = Some(response_branch);
+                    }
                 }
                 polled = true;
                 if attempt == 0 {
@@ -1001,6 +1039,8 @@ impl Client {
                 let mut info: RefResponse = resp.json().await?;
                 crate::validation::validate_object_id(&info.commit)
                     .with_context(|| format!("invalid ready commit for {repo_path}"))?;
+                crate::validation::validate_git_rev(&info.branch)
+                    .with_context(|| format!("invalid ready branch for {repo_path}"))?;
                 if let Some(expected) = pinned.as_deref() {
                     if info.commit != expected {
                         anyhow::bail!(
@@ -1010,6 +1050,16 @@ impl Client {
                     }
                 } else {
                     *pinned = Some(info.commit.clone());
+                }
+                if let Some(expected) = resolved_branch.as_deref() {
+                    if info.branch != expected {
+                        anyhow::bail!(
+                            "ref integrity error: resolved branch {expected} changed to {} in a ready response",
+                            info.branch
+                        );
+                    }
+                } else {
+                    *resolved_branch = Some(info.branch.clone());
                 }
                 info.clone_id = clone_id;
                 info.cold = polled;
@@ -1057,11 +1107,22 @@ impl Client {
         hash: &str,
         signed_url: Option<&str>,
     ) -> Result<bytes::Bytes> {
+        self.fetch_artifact_with_url_cache(hash, signed_url, true)
+            .await
+    }
+
+    async fn fetch_artifact_with_url_cache(
+        &self,
+        hash: &str,
+        signed_url: Option<&str>,
+        use_cache: bool,
+    ) -> Result<bytes::Bytes> {
         let gateway_url = format!("{}/v1/artifacts/{}", self.server, hash);
         let fetch_url = signed_url.unwrap_or(&gateway_url);
         let use_signed_url = signed_url.is_some();
 
-        if let Some(cache) = &self.cache
+        if use_cache
+            && let Some(cache) = &self.cache
             && let Some(key) = self.cache_key_from_artifact_url(&gateway_url)
             && let Ok(data) = cache.get(&key)
         {
@@ -1087,13 +1148,63 @@ impl Client {
             fetch_artifact_with_retry(&self.http, &gateway_url, hash).await?
         };
 
-        if let Some(cache) = &self.cache
+        if use_cache
+            && let Some(cache) = &self.cache
             && let Some(key) = self.cache_key_from_artifact_url(&gateway_url)
         {
             let _ = cache.put_with_hash(&key, &data);
         }
 
         Ok(data)
+    }
+
+    #[allow(deprecated)]
+    async fn fetch_validated_manifest(
+        &self,
+        hash: &str,
+        signed_url: Option<&str>,
+        pinned: &str,
+    ) -> Result<ClonepackManifest> {
+        let decode = |data: &[u8]| -> Result<ClonepackManifest> {
+            let mut manifest =
+                ClonepackManifest::decode(data).context("decode clonepack manifest")?;
+            // Backwards compatibility: older manifests store the head-blobs
+            // pack as one field. Normalize only after the commit binding has
+            // been decoded from the same bytes.
+            if manifest.head_blobs_chunks.is_empty()
+                && let Some(pack) = manifest.head_blobs_pack.take()
+            {
+                manifest.head_blobs_chunks.push(pack);
+            }
+            validate_manifest_commit(&manifest, pinned)?;
+            Ok(manifest)
+        };
+
+        if let Some(cache) = &self.cache
+            && let Ok(data) = cache.get(hash)
+        {
+            return match decode(&data) {
+                Ok(manifest) => Ok(manifest),
+                Err(error) => {
+                    // A manifest whose embedded commit is wrong is not a valid
+                    // cache entry for this operation. Remove it before
+                    // returning so a later lookup cannot hit rejected bytes.
+                    let _ = cache.remove(hash);
+                    Err(error)
+                }
+            };
+        }
+
+        // Do not let generic artifact caching publish bytes before their
+        // embedded commit has been checked against the operation pin.
+        let data = self
+            .fetch_artifact_with_url_cache(hash, signed_url, false)
+            .await?;
+        let manifest = decode(&data)?;
+        if let Some(cache) = &self.cache {
+            let _ = cache.put_with_hash(hash, &data);
+        }
+        Ok(manifest)
     }
 
     /// Fetch an artifact referenced by a `ChunkRef`, optionally using a signed URL.
@@ -1195,14 +1306,13 @@ impl Client {
         if info.clonepack_manifest.is_empty() {
             anyhow::bail!("ref is missing clonepack manifest; run sync first");
         }
-        let manifest_data = self
-            .fetch_artifact_with_url(
+        let clonepack = self
+            .fetch_validated_manifest(
                 &info.clonepack_manifest,
                 info.clonepack_manifest_url.as_deref(),
+                &info.commit,
             )
             .await?;
-        let clonepack = ClonepackManifest::decode(manifest_data.as_ref())
-            .context("decode clonepack manifest")?;
         let metadata_ref = clonepack
             .metadata_chunk
             .as_ref()
@@ -1491,6 +1601,43 @@ impl Client {
         identity: &mut InstallIdentity,
         cleanup: &AttemptCleanup,
     ) -> Result<CloneOutcome> {
+        // Staging owns filesystem cleanup outside the inner attempt future.
+        // Task guards unwind first; blocking workers are then joined; only
+        // after that is it safe to remove a temp tree or unmounted overlay.
+        let mut staging = AttemptStaging::default();
+        let result = self
+            .install_repo_with_mode_at_attempt_inner(
+                repo_path,
+                branch,
+                rev,
+                target,
+                mode,
+                clonepack,
+                bench,
+                identity,
+                cleanup,
+                &mut staging,
+            )
+            .await;
+        cleanup.drain().await;
+        drop(staging);
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn install_repo_with_mode_at_attempt_inner<P: AsRef<Path>>(
+        &self,
+        repo_path: &str,
+        branch: &str,
+        rev: Option<&str>,
+        target: P,
+        mode: CloneMode,
+        clonepack: Option<&str>,
+        bench: Option<&mut Benchmark>,
+        identity: &mut InstallIdentity,
+        cleanup: &AttemptCleanup,
+        staging: &mut AttemptStaging,
+    ) -> Result<CloneOutcome> {
         let target = target.as_ref().to_path_buf();
         info!(
             "installing {}#{} into {} with mode {:?}",
@@ -1528,6 +1675,7 @@ impl Client {
                 clonepack,
                 rev,
                 &mut identity.pinned,
+                &mut identity.resolved_branch,
                 metric_mode,
             )
             .await?;
@@ -1566,6 +1714,7 @@ impl Client {
                         clonepack,
                         rev,
                         &mut identity.pinned,
+                        &mut identity.resolved_branch,
                         metric_mode,
                     )
                     .await?;
@@ -1597,6 +1746,7 @@ impl Client {
             self.clone().spawn_fetch_manifest(
                 info.clonepack_manifest.clone(),
                 info.clonepack_manifest_url.clone(),
+                pinned.clone(),
                 manifest_tx,
             ),
             cleanup.clone(),
@@ -1676,7 +1826,6 @@ impl Client {
         };
         let (manifest, metadata) =
             tokio::try_join!(manifest, metadata).context("fetch manifest/metadata")?;
-        validate_manifest_commit(&manifest, &pinned)?;
         let metadata = Arc::new(metadata);
         bench.mark_manifest();
         bench.add_bytes(metadata_bytes(&metadata), 0);
@@ -1692,7 +1841,7 @@ impl Client {
         let use_overlay =
             mode.needs_worktree() && self.should_use_overlay(&metadata, &staging_dir).await;
 
-        let overlay_dirs = if use_overlay {
+        staging.overlay_dirs = if use_overlay {
             Some(
                 overlay::OverlayDirs::create(&staging_dir, &target)
                     .context("create overlay staging dirs")?,
@@ -1704,13 +1853,12 @@ impl Client {
         // Hold the temp-dir handle for the whole install so any early failure
         // removes the partial directory on drop. After a successful rename onto
         // `target`, its drop is a no-op.
-        let mut _temp_install: Option<tempfile::TempDir> = None;
-        let install_root = if let Some(ref dirs) = overlay_dirs {
+        let install_root = if let Some(ref dirs) = staging.overlay_dirs {
             dirs.lower.clone()
         } else {
             let tmp = temp_install_dir(&target)?;
             let path = tmp.path().to_path_buf();
-            _temp_install = Some(tmp);
+            staging.temp_install = Some(tmp);
             path
         };
         let git_dir = install_root.join(".git");
@@ -1865,7 +2013,7 @@ impl Client {
             self.write_origin_config(&origin_url, &git_dir)?;
         }
 
-        if let Some(dirs) = overlay_dirs {
+        if let Some(dirs) = staging.overlay_dirs.take() {
             overlay::mount_dirs(&dirs).context("mount overlay at target")?;
             // Mount succeeded; keep the staging tree (it backs the mount). Any
             // failure before this point drops `dirs` and removes the staging.
@@ -2536,23 +2684,14 @@ impl Client {
         self,
         hash: String,
         signed_url: Option<String>,
+        pinned: String,
         manifest_tx: tokio::sync::oneshot::Sender<Arc<ClonepackManifest>>,
     ) -> tokio::task::JoinHandle<Result<Arc<ClonepackManifest>>> {
         tokio::spawn(async move {
-            let data = self
-                .fetch_artifact_with_url(&hash, signed_url.as_deref())
+            let manifest = self
+                .fetch_validated_manifest(&hash, signed_url.as_deref(), &pinned)
                 .await
                 .context("fetch clonepack manifest")?;
-            let mut manifest =
-                ClonepackManifest::decode(data.as_ref()).context("decode clonepack manifest")?;
-            // Backwards compatibility: older manifests store the head-blobs pack as
-            // a single `head_blobs_pack` field. Treat it as one chunk so the
-            // pipeline can use it without special cases.
-            if manifest.head_blobs_chunks.is_empty()
-                && let Some(pack) = manifest.head_blobs_pack.take()
-            {
-                manifest.head_blobs_chunks.push(pack);
-            }
             let manifest = Arc::new(manifest);
             // Hand the manifest to the downloader. Ignore the error: the receiver
             // is absent in non-archive modes. On the failure paths above, the
@@ -3040,6 +3179,12 @@ impl Client {
             anyhow::bail!("ref is missing clonepack manifest; run sync first");
         }
 
+        // Validate the manifest identity before creating or modifying the git
+        // directory. Remote-helper failures must not leave a partial seed that
+        // claims the pinned commit while containing another commit's objects.
+        let dl_start = Instant::now();
+        let (clonepack, metadata) = self.fetch_clonepack(info).await?;
+
         std::fs::create_dir_all(&git_dir)?;
         std::fs::create_dir_all(git_dir.join("refs").join("heads"))?;
         std::fs::create_dir_all(git_dir.join("refs").join("tags"))?;
@@ -3072,8 +3217,6 @@ impl Client {
         let pack_dir = git_dir.join("objects").join("pack");
         std::fs::create_dir_all(&pack_dir)?;
 
-        let dl_start = Instant::now();
-        let (clonepack, metadata) = self.fetch_clonepack(info).await?;
         info!(
             "downloaded metadata chunk ({} bytes) in {:?}",
             metadata.skeleton_pack.len()
@@ -3524,16 +3667,20 @@ mod tests {
         let cleanup = AttemptCleanup::default();
         let fixture = tempfile::tempdir().unwrap();
         let target = fixture.path().join("target");
-        let staging = fixture.path().join("staging");
+        let staging_owner = tempfile::Builder::new()
+            .prefix("clone.")
+            .tempdir_in(fixture.path())
+            .unwrap();
+        let staging = staging_owner.path().to_path_buf();
         let staging_worker = staging.clone();
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let sibling = AbortOnDrop::new(
             tokio::task::spawn_blocking(move || {
-                std::fs::create_dir_all(&staging_worker).unwrap();
+                std::fs::write(staging_worker.join("partial"), b"started").unwrap();
                 started_tx.send(()).unwrap();
                 release_rx.recv().unwrap();
-                std::fs::remove_dir_all(&staging_worker).unwrap();
+                std::fs::write(staging_worker.join("late-write"), b"finished").unwrap();
                 Ok::<(), anyhow::Error>(())
             }),
             cleanup.clone(),
@@ -3561,8 +3708,11 @@ mod tests {
         let cleanup_wait = cleanup.clone();
         let next_attempt_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let next_attempt_flag = Arc::clone(&next_attempt_started);
+        let staging_after_cleanup = staging.clone();
         let mut drain_then_retry = Box::pin(async move {
             cleanup_wait.drain().await;
+            drop(staging_owner);
+            assert!(!staging_after_cleanup.exists());
             next_attempt_flag.store(true, std::sync::atomic::Ordering::SeqCst);
         });
         assert!(
