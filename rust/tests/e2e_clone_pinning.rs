@@ -74,6 +74,7 @@ fn pending(commit: &str) -> (StatusCode, serde_json::Value) {
         json!({
             "code": "artifact_pending",
             "commit": commit,
+            "branch": "main",
             "status": "building",
             "queue_depth": 1
         }),
@@ -565,6 +566,31 @@ async fn ready_response_cannot_change_an_established_pin() {
 }
 
 #[tokio::test]
+async fn pending_head_switches_pinned_polls_to_the_concrete_branch() {
+    let _guard = env_lock().lock().await;
+    unsafe {
+        std::env::set_var("RIPCLONE_TESTING", "1");
+        std::env::set_var("RIPCLONE_TEST_REF_POLL_MS", "0");
+    }
+    let (url, requests, task) = scripted_server(vec![pending(A), ready(A)]).await;
+    Client::new(url)
+        .resolve_ref_with_clonepack("acme/demo", "HEAD", Some("full"), Some("HEAD~1"))
+        .await
+        .expect("pending rev continues at its concrete branch");
+    task.abort();
+    unsafe {
+        std::env::remove_var("RIPCLONE_TESTING");
+        std::env::remove_var("RIPCLONE_TEST_REF_POLL_MS");
+    }
+    let requests = requests.lock().unwrap_or_else(|e| e.into_inner());
+    assert!(requests[0].contains("/refs/HEAD?"));
+    assert!(requests[0].contains("rev=HEAD~1"));
+    assert!(requests[1].contains("/refs/main?"));
+    assert!(requests[1].contains(&format!("pinned={A}")));
+    assert!(!requests[1].contains("rev="));
+}
+
+#[tokio::test]
 async fn pinned_refresh_distinguishes_authorization_from_server_failure() {
     let _guard = env_lock().lock().await;
     unsafe {
@@ -684,6 +710,123 @@ async fn mismatched_variant_never_enters_the_moving_response_cache() {
     assert_eq!(cached.status(), StatusCode::OK);
     let cached: serde_json::Value = cached.json().await.expect("cached A response");
     assert_eq!(cached["commit"], a);
+}
+
+#[tokio::test]
+async fn mismatched_manifest_is_rejected_before_install_and_never_cached() {
+    let _guard = env_lock().lock().await;
+    init(false);
+    let server = start_server_split_storage().await;
+    let origin = make_origin("acme", "manifest-cache-guard");
+    origin.commit(&[("value.txt", "A\n")], "A");
+    origin.publish();
+    register_added_without_build(&server, "acme/manifest-cache-guard")
+        .await
+        .expect("register manifest fixture");
+    server
+        .client()
+        .sync_repo("acme/manifest-cache-guard", None)
+        .await
+        .expect("sync manifest fixture");
+    let (pinned, bad_manifest) =
+        replace_full_manifest_commit(&server, "acme/manifest-cache-guard", B).await;
+
+    let root = tempfile::tempdir().expect("manifest test root");
+    let cache_dir = root.path().join("cache");
+    let target = root.path().join("clone");
+    let client =
+        Client::new_with_token_and_cache(server.url.clone(), Some(token_hash()), Some(&cache_dir));
+    let first = client
+        .install_repo_with_mode_at(
+            "acme/manifest-cache-guard",
+            "main",
+            None,
+            &target,
+            CloneMode::Editable,
+            Some("full"),
+            None,
+        )
+        .await
+        .expect_err("manifest B must be rejected under pin A");
+    let first = format!("{first:#}");
+    assert!(first.contains(&format!("manifest commit {B}")));
+    assert!(first.contains(&format!("pinned commit {pinned}")));
+    assert!(
+        !target.exists(),
+        "integrity failure must not publish a target"
+    );
+    let cache = ripclone::cas::Cas::new(&cache_dir).expect("open client cache");
+    assert!(
+        cache.get(&bad_manifest).is_err(),
+        "rejected manifest bytes must not enter the client cache"
+    );
+
+    // Remove the only network copy. A second attempt must fail to fetch it,
+    // rather than reproducing the integrity error from a forbidden cache hit.
+    std::fs::remove_file(server.storage_path(&bad_manifest))
+        .expect("remove mismatched manifest from test storage");
+    let second = client
+        .install_repo_with_mode_at(
+            "acme/manifest-cache-guard",
+            "main",
+            None,
+            &target,
+            CloneMode::Editable,
+            Some("full"),
+            None,
+        )
+        .await
+        .expect_err("later lookup cannot hit rejected manifest bytes");
+    let second = format!("{second:#}");
+    assert!(
+        !second.contains("manifest commit"),
+        "unexpected cache hit: {second}"
+    );
+    assert!(!target.exists());
+}
+
+#[tokio::test]
+async fn worktree_rejects_mismatched_manifest_before_git_registration() {
+    let _guard = env_lock().lock().await;
+    init(false);
+    let server = start_server_split_storage().await;
+    let origin = make_origin("acme", "worktree-manifest-guard");
+    origin.commit(&[("value.txt", "A\n")], "A");
+    origin.publish();
+    register_added_without_build(&server, "acme/worktree-manifest-guard")
+        .await
+        .expect("register worktree fixture");
+    server
+        .client()
+        .sync_repo("acme/worktree-manifest-guard", None)
+        .await
+        .expect("sync worktree fixture");
+    let (pinned, _) =
+        replace_full_manifest_commit(&server, "acme/worktree-manifest-guard", B).await;
+
+    let root = tempfile::tempdir().expect("worktree root");
+    let main_repo = root.path().join("main");
+    let clone_status = std::process::Command::new("git")
+        .args([
+            "clone",
+            origin.bare.to_str().unwrap(),
+            main_repo.to_str().unwrap(),
+        ])
+        .status()
+        .expect("clone main worktree fixture");
+    assert!(clone_status.success());
+    let target = root.path().join("linked");
+    let error = server
+        .client()
+        .add_worktree("acme/worktree-manifest-guard", "main", &main_repo, &target)
+        .await
+        .expect_err("worktree must reject manifest B under pin A");
+    let error = format!("{error:#}");
+    assert!(error.contains(&format!("manifest commit {B}")));
+    assert!(error.contains(&format!("pinned commit {pinned}")));
+    assert!(!target.exists());
+    let registrations = git(&main_repo, &["worktree", "list", "--porcelain"]);
+    assert!(!registrations.contains(target.to_str().unwrap()));
 }
 
 #[tokio::test]
@@ -807,8 +950,8 @@ async fn overwritten_branch_metadata_returns_pending_for_the_pin_without_upstrea
     let observed = probe.snapshot();
     assert_eq!(
         observed.branch_reads,
-        3 * (requests.len() - 1),
-        "each exact poll performs only the three bounded point reads"
+        2 * (requests.len() - 1),
+        "concrete-branch exact polls perform only moving and exact point reads"
     );
     assert_eq!(observed.enqueues, 0);
 }

@@ -172,6 +172,52 @@ async fn clone_at_rev_waits_for_the_background_full_build() {
     assert_repo_usable(&dir, "1");
 }
 
+/// A rev-only repository layout has `<default-branch>#<commit>` but no moving
+/// `HEAD` row. The first pending response must carry the concrete branch so the
+/// same clone operation can poll that exact key without retrying from `rev`.
+#[tokio::test]
+async fn clone_at_rev_first_operation_uses_exact_only_layout() {
+    setup(true);
+    let server = start_server().await;
+    let origin = make_origin("acme", "at-exact-only");
+    let pinned = origin.commit(&[("a.txt", "old\n")], "old");
+    origin.commit(&[("a.txt", "tip\n")], "tip");
+    origin.publish();
+    register_added_without_build(&server, "acme/at-exact-only")
+        .await
+        .expect("register exact-only fixture");
+
+    server
+        .client()
+        .sync_repo_at("acme/at-exact-only", Some("HEAD~1"), None)
+        .await
+        .expect("start rev-only build");
+
+    let store = ripclone::ref_store::FileRefStore::new(&server.repo_root);
+    let repo_id = ripclone::provider::RepoId::github("acme/at-exact-only");
+    assert!(
+        ripclone::ref_store::RefStore::load_branch(&store, &repo_id, "HEAD")
+            .await
+            .expect("load absent HEAD")
+            .is_none(),
+        "fixture must not create a moving HEAD compatibility row"
+    );
+
+    let (_guard, target) = clone_only_at(
+        &server,
+        "acme",
+        "at-exact-only",
+        Some("HEAD~1"),
+        0,
+        CloneMode::Editable,
+    )
+    .await
+    .expect("one clone operation reaches the rev-only exact row");
+    assert_eq!(git(&target, &["rev-parse", "HEAD"]), pinned);
+    assert_eq!(read(&target, "a.txt"), "old\n");
+    assert_repo_usable(&target, "1");
+}
+
 #[tokio::test]
 async fn public_cli_clones_at_a_full_sha() {
     setup(true);

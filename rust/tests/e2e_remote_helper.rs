@@ -96,3 +96,70 @@ async fn remote_helper_clones_through_ripclone_server() {
     let origin_url = git(&target, &["remote", "get-url", "origin"]);
     assert_eq!(origin_url, "ripclone://github/acme/helper.git");
 }
+
+#[tokio::test]
+async fn remote_helper_rejects_manifest_for_another_commit_without_partial_clone() {
+    init(false);
+    let origin = make_origin("acme", "helper-integrity");
+    origin.commit(&[("README.md", "commit A\n")], "A");
+    origin.publish();
+    let server = start_server_split_storage().await;
+    register_added_without_build(&server, "acme/helper-integrity")
+        .await
+        .expect("register helper integrity fixture");
+    server
+        .client()
+        .sync_repo("acme/helper-integrity", None)
+        .await
+        .expect("sync helper integrity fixture");
+    let (pinned, _) = replace_full_manifest_commit(
+        &server,
+        "acme/helper-integrity",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    )
+    .await;
+
+    let helper_bin = std::env::var("CARGO_BIN_EXE_git-remote-ripclone")
+        .expect("CARGO_BIN_EXE_git-remote-ripclone not set");
+    let bin_dir = tempfile::tempdir().unwrap();
+    let helper_link = bin_dir.path().join("git-remote-ripclone");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&helper_bin, &helper_link).unwrap();
+    #[cfg(not(unix))]
+    std::fs::copy(&helper_bin, &helper_link).unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let target = out.path().join("clone");
+    let path = format!(
+        "{}:{}",
+        bin_dir.path().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let child = std::process::Command::new("git")
+        .arg("clone")
+        .arg("ripclone://github/acme/helper-integrity.git")
+        .arg(&target)
+        .env("PATH", path)
+        .env("RIPCLONE_SERVER", &server.url)
+        .env("RIPCLONE_SERVER_TOKEN", TOKEN)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn integrity clone");
+    let output = wait_child_output_bounded(child, std::time::Duration::from_secs(60))
+        .await
+        .expect("integrity clone bounded and reaped");
+    assert!(
+        !output.status.success(),
+        "manifest mismatch must fail git clone"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("clonepack integrity error"), "{stderr}");
+    assert!(
+        stderr.contains(&pinned),
+        "error must name pinned A: {stderr}"
+    );
+    assert!(
+        !target.exists(),
+        "git clone must clean its target after helper integrity failure"
+    );
+}

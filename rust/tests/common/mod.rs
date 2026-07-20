@@ -6,6 +6,7 @@
 #![allow(dead_code)]
 
 use anyhow::Context;
+use prost::Message;
 use ripclone::client::Client;
 use ripclone::server::{
     ArtifactBarrier, RateLimiter, ServerState, build_app, run_server_with_barrier,
@@ -368,6 +369,51 @@ impl Server {
     pub fn storage_path(&self, hash: &str) -> PathBuf {
         self.storage_dir.join(&hash[..2]).join(hash)
     }
+}
+
+/// Replace only the embedded commit of a published full manifest, then point
+/// the real ref row at those content-addressed bytes. This creates a realistic
+/// response-commit A / manifest-commit B integrity fixture without changing
+/// production code or bypassing the normal artifact endpoint.
+pub async fn replace_full_manifest_commit(
+    server: &Server,
+    repo_path: &str,
+    replacement: &str,
+) -> (String, String) {
+    let store = ripclone::ref_store::FileRefStore::new(&server.repo_root);
+    let repo_id = ripclone::provider::RepoId::github(repo_path);
+    let mut published = None;
+    for _ in 0..200 {
+        if let Ok(Some(info)) =
+            ripclone::ref_store::RefStore::load_branch(&store, &repo_id, "main").await
+            && info.build_status.is_none()
+            && !info.full_clonepack.manifest.is_empty()
+        {
+            published = Some(info);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let mut info = published.expect("full manifest publication settled");
+    let pinned = info.commit.clone();
+    let storage = ripclone::storage::local(&server.storage_dir).expect("open test storage");
+    let bytes = storage
+        .get(&info.full_clonepack.manifest)
+        .expect("read published full manifest");
+    let mut manifest = ripclone::clonepack::ClonepackManifest::decode(bytes.as_slice())
+        .expect("decode published full manifest");
+    manifest.commit = replacement.to_string();
+    let bytes = manifest.encode_to_vec();
+    let hash = ripclone::cas::hash(&bytes);
+    storage
+        .put(&hash, &bytes)
+        .expect("publish mismatched manifest fixture");
+    info.full_clonepack.manifest = hash.clone();
+    info.clonepack_manifest = hash.clone();
+    ripclone::ref_store::RefStore::save_branch(&store, &repo_id, "main", &info)
+        .await
+        .expect("publish mismatched full-manifest ref");
+    (pinned, hash)
 }
 
 /// Initialize a tracing subscriber once so server-side `info!`/`warn!`/`error!`
