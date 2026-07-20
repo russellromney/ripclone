@@ -2587,13 +2587,17 @@ impl Client {
         // Files are materialized; clear skip-worktree for every tracked path.
         let path_bytes: Vec<Vec<u8>> = metadata.files.iter().map(|e| e.path.clone()).collect();
         let work_tree2 = work_tree.to_path_buf();
-        tokio::task::spawn_blocking(move || {
-            crate::git::clear_skip_worktree_index_with_stats_byte_iter(
-                &work_tree2,
-                path_bytes.iter().map(Vec::as_slice),
-                &stat_cache,
-            )
-        })
+        AbortOnDrop::new(
+            tokio::task::spawn_blocking(move || {
+                crate::git::clear_skip_worktree_index_with_stats_byte_iter(
+                    &work_tree2,
+                    path_bytes.iter().map(Vec::as_slice),
+                    &stat_cache,
+                )
+            }),
+            cleanup.clone(),
+        )
+        .join()
         .await
         .context("spawn clear skip-worktree and refresh index stats")??;
 
@@ -2618,17 +2622,25 @@ impl Client {
                 Err(e) => {
                     tracing::warn!("pre-built MIDX fetch failed ({e:#}); building locally");
                     let work_tree3 = work_tree.to_path_buf();
-                    let _ = tokio::task::spawn_blocking(move || {
-                        crate::git::write_multi_pack_index(&work_tree3)
-                    })
+                    let _ = AbortOnDrop::new(
+                        tokio::task::spawn_blocking(move || {
+                            crate::git::write_multi_pack_index(&work_tree3)
+                        }),
+                        cleanup.clone(),
+                    )
+                    .join()
                     .await;
                 }
             }
         } else {
             let work_tree3 = work_tree.to_path_buf();
-            let _ = tokio::task::spawn_blocking(move || {
-                crate::git::write_multi_pack_index(&work_tree3)
-            })
+            let _ = AbortOnDrop::new(
+                tokio::task::spawn_blocking(move || {
+                    crate::git::write_multi_pack_index(&work_tree3)
+                }),
+                cleanup.clone(),
+            )
+            .join()
             .await;
         }
 

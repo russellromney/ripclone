@@ -10,6 +10,7 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
 use common::*;
+use prost::Message;
 use ripclone::client::{ArtifactPending, Client};
 use ripclone::mode::CloneMode;
 use ripclone::provider::RepoId;
@@ -21,6 +22,31 @@ use std::time::Duration;
 
 const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+struct EnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+impl EnvGuard {
+    fn capture(keys: &[&'static str]) -> Self {
+        Self(
+            keys.iter()
+                .map(|key| (*key, std::env::var_os(key)))
+                .collect(),
+        )
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        for (key, value) in &self.0 {
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+}
 
 #[derive(Clone)]
 struct ScriptState {
@@ -843,6 +869,170 @@ async fn worktree_rejects_mismatched_manifest_before_git_registration() {
     assert!(!target.exists());
     let registrations = git(&main_repo, &["worktree", "list", "--porcelain"]);
     assert!(!registrations.contains(target.to_str().unwrap()));
+}
+
+#[tokio::test]
+async fn cancelling_real_clone_waits_for_midx_writer_before_staging_cleanup() {
+    let _guard = env_lock().lock().await;
+    init(false);
+    let server = start_server_split_storage().await;
+    let origin = make_origin("acme", "cancel-midx");
+    origin.commit(&[("value.txt", "A\n")], "A");
+    origin.publish();
+    register_added_without_build(&server, "acme/cancel-midx")
+        .await
+        .expect("register cancellation fixture");
+    server
+        .client()
+        .sync_repo("acme/cancel-midx", None)
+        .await
+        .expect("sync cancellation fixture");
+
+    // Remove the optional pregenerated MIDX from an otherwise valid manifest
+    // so the public install path deterministically reaches its blocking local
+    // MIDX fallback after all worktree bytes have been staged.
+    let store = FileRefStore::new(&server.repo_root);
+    let repo_id = RepoId::github("acme/cancel-midx");
+    let mut info = None;
+    for _ in 0..200 {
+        if let Ok(Some(candidate)) = store.load_branch(&repo_id, "main").await
+            && candidate.build_status.is_none()
+            && !candidate.full_clonepack.manifest.is_empty()
+        {
+            info = Some(candidate);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let mut info = info.expect("full cancellation fixture settled");
+    let storage = ripclone::storage::local(&server.storage_dir).expect("open test storage");
+    let bytes = storage
+        .get(&info.full_clonepack.manifest)
+        .expect("read full manifest");
+    let mut manifest = ripclone::clonepack::ClonepackManifest::decode(bytes.as_slice())
+        .expect("decode full manifest");
+    manifest.midx = None;
+    let bytes = manifest.encode_to_vec();
+    let hash = ripclone::cas::hash(&bytes);
+    storage.put(&hash, &bytes).expect("write no-MIDX manifest");
+    info.full_clonepack.manifest = hash.clone();
+    info.full_clonepack.midx.clear();
+    info.clonepack_manifest = hash;
+    store
+        .save_branch(&repo_id, "main", &info)
+        .await
+        .expect("publish no-MIDX fixture");
+
+    let root = tempfile::tempdir().expect("cancellation output");
+    let wrapper_dir = root.path().join("bin");
+    std::fs::create_dir_all(&wrapper_dir).unwrap();
+    let entered = root.path().join("entered");
+    let proceed = root.path().join("proceed");
+    let real_git = String::from_utf8(
+        std::process::Command::new("sh")
+            .args(["-c", "command -v git"])
+            .output()
+            .expect("locate git")
+            .stdout,
+    )
+    .expect("git path utf8")
+    .trim()
+    .to_string();
+    let wrapper = wrapper_dir.join("git");
+    std::fs::write(
+        &wrapper,
+        r#"#!/bin/sh
+for arg in "$@"; do
+  if [ "$arg" = "multi-pack-index" ]; then
+    : >"$RIPCLONE_TEST_MIDX_ENTERED"
+    waited=0
+    while [ ! -f "$RIPCLONE_TEST_MIDX_PROCEED" ]; do
+      if [ "$waited" -ge 400 ]; then exit 124; fi
+      sleep 0.05
+      waited=$((waited + 1))
+    done
+    break
+  fi
+done
+exec "$RIPCLONE_TEST_REAL_GIT" "$@"
+"#,
+    )
+    .expect("write MIDX wrapper");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let original_path = std::env::var_os("PATH").unwrap_or_default();
+    let _env_guard = EnvGuard::capture(&[
+        "PATH",
+        "RIPCLONE_TEST_REAL_GIT",
+        "RIPCLONE_TEST_MIDX_ENTERED",
+        "RIPCLONE_TEST_MIDX_PROCEED",
+    ]);
+    unsafe {
+        std::env::set_var(
+            "PATH",
+            format!(
+                "{}:{}",
+                wrapper_dir.display(),
+                original_path.to_string_lossy()
+            ),
+        );
+        std::env::set_var("RIPCLONE_TEST_REAL_GIT", &real_git);
+        std::env::set_var("RIPCLONE_TEST_MIDX_ENTERED", &entered);
+        std::env::set_var("RIPCLONE_TEST_MIDX_PROCEED", &proceed);
+    }
+
+    let target = root.path().join("clone");
+    let target_for_install = target.clone();
+    let client = server.client();
+    let mut install = tokio::spawn(async move {
+        client
+            .install_repo_with_mode_at(
+                "acme/cancel-midx",
+                "main",
+                None,
+                &target_for_install,
+                CloneMode::Editable,
+                Some("full"),
+                None,
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while !entered.exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("real clone reached blocking MIDX fallback");
+
+    install.abort();
+    tokio::time::timeout(Duration::from_secs(2), &mut install)
+        .await
+        .expect("cancelled public install task joined")
+        .expect_err("public install was cancelled");
+    let staged = std::fs::read_dir(root.path())
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("clone.") && name.ends_with(".tmp"))
+        })
+        .expect("staging remains while cancelled blocking writer runs");
+    assert!(!target.exists());
+    std::fs::write(&proceed, b"go").expect("release MIDX writer");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while staged.exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("cancellation reaper removed staging after writer exit");
+    assert!(!target.exists());
 }
 
 #[tokio::test]
