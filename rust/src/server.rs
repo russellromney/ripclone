@@ -2521,7 +2521,7 @@ fn artifact_pending_response(commit: &str, branch: &str, queue_depth: usize) -> 
         }),
     )
         .into_response();
-    if let Ok(value) = branch.parse() {
+    if let Ok(value) = urlencoding::encode(branch).parse() {
         response
             .headers_mut()
             .insert(axum::http::header::CONTENT_LOCATION, value);
@@ -8461,14 +8461,14 @@ mod tests {
 
     #[tokio::test]
     async fn protocol_two_pending_body_keeps_the_four_field_shape() {
-        let response = artifact_pending_response(&"a".repeat(40), "main", 3);
+        let response = artifact_pending_response(&"a".repeat(40), "rélease/東京", 3);
         assert_eq!(response.status(), StatusCode::ACCEPTED);
         assert_eq!(
             response
                 .headers()
                 .get(axum::http::header::CONTENT_LOCATION)
                 .and_then(|value| value.to_str().ok()),
-            Some("main")
+            Some("r%C3%A9lease%2F%E6%9D%B1%E4%BA%AC")
         );
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await

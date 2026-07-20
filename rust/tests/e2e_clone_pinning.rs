@@ -76,7 +76,9 @@ async fn scripted_ref(
     if let Some(content_location) = content_location {
         response.headers_mut().insert(
             axum::http::header::CONTENT_LOCATION,
-            content_location.parse().expect("valid branch hint"),
+            urlencoding::encode(&content_location)
+                .parse()
+                .expect("valid encoded branch hint"),
         );
     }
     response
@@ -143,6 +145,13 @@ fn ready(commit: &str) -> (StatusCode, serde_json::Value) {
             "archive_ready": true
         }),
     )
+}
+
+fn ready_on(commit: &str, branch: &str) -> (StatusCode, serde_json::Value) {
+    let (status, mut body) = ready(commit);
+    body["branch"] = json!(branch);
+    body["default_branch"] = json!(branch);
+    (status, body)
 }
 
 fn env_lock() -> &'static tokio::sync::Mutex<()> {
@@ -614,7 +623,9 @@ async fn pending_head_switches_pinned_polls_to_the_concrete_branch() {
         std::env::set_var("RIPCLONE_TESTING", "1");
         std::env::set_var("RIPCLONE_TEST_REF_POLL_MS", "0");
     }
-    let (url, requests, task) = scripted_server(vec![pending_on(A, "main"), ready(A)]).await;
+    let concrete = "rélease/東京";
+    let (url, requests, task) =
+        scripted_server(vec![pending_on(A, concrete), ready_on(A, concrete)]).await;
     Client::new(url)
         .resolve_ref_with_clonepack("acme/demo", "HEAD", Some("full"), Some("HEAD~1"))
         .await
@@ -627,7 +638,8 @@ async fn pending_head_switches_pinned_polls_to_the_concrete_branch() {
     let requests = requests.lock().unwrap_or_else(|e| e.into_inner());
     assert!(requests[0].contains("/refs/HEAD?"));
     assert!(requests[0].contains("rev=HEAD~1"));
-    assert!(requests[1].contains("/refs/main?"));
+    let decoded = urlencoding::decode(&requests[1]).expect("decode concrete branch request");
+    assert!(decoded.contains(&format!("/refs/{concrete}?")));
     assert!(requests[1].contains(&format!("pinned={A}")));
     assert!(!requests[1].contains("rev="));
 }

@@ -1038,7 +1038,11 @@ impl Client {
                         value
                             .to_str()
                             .context("invalid Content-Location on pending ref response")
-                            .map(str::to_string)
+                            .and_then(|value| {
+                                urlencoding::decode(value)
+                                    .context("invalid escaped branch in pending Content-Location")
+                                    .map(|value| value.into_owned())
+                            })
                     })
                     .transpose()?;
                 let pending: ArtifactPendingResponse = resp.json().await.with_context(|| {
