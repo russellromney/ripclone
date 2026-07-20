@@ -171,3 +171,116 @@ async fn clone_at_rev_waits_for_the_background_full_build() {
     assert_eq!(read(&dir, "a.txt"), "1\n");
     assert_repo_usable(&dir, "1");
 }
+
+/// A rev-only repository layout has `<default-branch>#<commit>` but no moving
+/// `HEAD` row. The first pending response must carry the concrete branch so the
+/// same clone operation can poll that exact key without retrying from `rev`.
+#[tokio::test]
+async fn clone_at_rev_first_operation_uses_exact_only_layout() {
+    setup(true);
+    let server = start_server().await;
+    let origin = make_origin("acme", "at-exact-only");
+    let pinned = origin.commit(&[("a.txt", "old\n")], "old");
+    origin.commit(&[("a.txt", "tip\n")], "tip");
+    origin.publish();
+    register_added_without_build(&server, "acme/at-exact-only")
+        .await
+        .expect("register exact-only fixture");
+
+    server
+        .client()
+        .sync_repo_at("acme/at-exact-only", Some("HEAD~1"), None)
+        .await
+        .expect("start rev-only build");
+
+    let store = ripclone::ref_store::FileRefStore::new(&server.repo_root);
+    let repo_id = ripclone::provider::RepoId::github("acme/at-exact-only");
+    assert!(
+        ripclone::ref_store::RefStore::load_branch(&store, &repo_id, "HEAD")
+            .await
+            .expect("load absent HEAD")
+            .is_none(),
+        "fixture must not create a moving HEAD compatibility row"
+    );
+
+    let (_guard, target) = clone_only_at(
+        &server,
+        "acme",
+        "at-exact-only",
+        Some("HEAD~1"),
+        0,
+        CloneMode::Editable,
+    )
+    .await
+    .expect("one clone operation reaches the rev-only exact row");
+    assert_eq!(git(&target, &["rev-parse", "HEAD"]), pinned);
+    assert_eq!(read(&target, "a.txt"), "old\n");
+    assert_repo_usable(&target, "1");
+}
+
+#[tokio::test]
+async fn public_cli_clones_at_a_full_sha() {
+    setup(true);
+    let server = start_server().await;
+    let origin = make_origin("acme", "at-full-sha");
+    let pinned = origin.commit(&[("a.txt", "pinned\n")], "pinned");
+    origin.commit(&[("a.txt", "tip\n")], "tip");
+    origin.publish();
+    ensure_added(&server, "acme/at-full-sha")
+        .await
+        .expect("add and build full-SHA fixture through the public workflow");
+    server
+        .client()
+        .sync_repo_at("acme/at-full-sha", Some(&pinned), None)
+        .await
+        .expect("sync at full SHA");
+    server
+        .client()
+        .resolve_ref_with_clonepack("acme/at-full-sha", "HEAD", Some("full"), Some(&pinned))
+        .await
+        .expect("full-SHA build ready");
+
+    let out = tempfile::tempdir().expect("CLI output");
+    let target = out.path().join("clone");
+    let binary = cargo_bin("ripclone");
+    if let Some(dir) = std::env::var_os("RIPCLONE_BIN_DIR") {
+        assert_eq!(
+            binary.canonicalize().expect("canonical selected CLI"),
+            std::path::PathBuf::from(dir)
+                .join("ripclone")
+                .canonicalize()
+                .expect("canonical requested CLI"),
+            "full-SHA proof must spawn the requested release binary"
+        );
+    }
+    let child = std::process::Command::new(binary)
+        .arg("--server")
+        .arg(&server.url)
+        .arg("clone")
+        .arg("acme/at-full-sha")
+        .arg(&target)
+        .arg("--at")
+        .arg(&pinned)
+        .arg("--depth")
+        .arg("0")
+        .arg("--verify-upstream=never")
+        .arg("--no-metrics")
+        .env("RIPCLONE_SERVER_TOKEN", TOKEN)
+        .env("RIPCLONE_NO_METRICS", "1")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn full-SHA CLI");
+    let output = wait_child_output_bounded(child, Duration::from_secs(60))
+        .await
+        .expect("full-SHA CLI bounded, killed, and reaped on timeout");
+    assert!(
+        output.status.success(),
+        "full-SHA clone failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(git(&target, &["rev-parse", "HEAD"]), pinned);
+    assert_eq!(read(&target, "a.txt"), "pinned\n");
+    assert_repo_usable(&target, "1");
+}

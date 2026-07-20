@@ -61,7 +61,7 @@ mod musl_global_allocator {
 /// crate version, so the two binaries can be released on their own cadence as
 /// long as their protocol versions match. Surfaced at `/v1/version` and by
 /// `ripclone version`.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 #[doc(hidden)]
 pub mod api_job_queue;

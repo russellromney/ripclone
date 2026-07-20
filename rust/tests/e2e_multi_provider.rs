@@ -10,6 +10,16 @@ use common::*;
 use ripclone::client::Client;
 use ripclone::mode::CloneMode;
 
+async fn start_provider_server(providers: &str) -> Server {
+    let isolated_config = origin_root().join("missing-provider-test-config.toml");
+    let isolated_config = isolated_config.to_string_lossy().into_owned();
+    start_server_env(&[
+        ("RIPCLONE_CONFIG", &isolated_config),
+        ("RIPCLONE_PROVIDERS", providers),
+    ])
+    .await
+}
+
 #[tokio::test]
 async fn generic_provider_sync_and_clone_through_http_origin() {
     init(false);
@@ -29,7 +39,7 @@ async fn generic_provider_sync_and_clone_through_http_origin() {
         }]
     });
     let providers_str = providers.to_string();
-    let server = start_server_env(&[("RIPCLONE_PROVIDERS", &providers_str)]).await;
+    let server = start_provider_server(&providers_str).await;
 
     // Sync through the explicit-provider route.
     let client = server.client_with_provider("localgit", Some("test-token"));
@@ -127,7 +137,7 @@ async fn github_provider_injects_basic_x_access_token_auth_header() {
         }]
     });
     let providers_str = providers.to_string();
-    let server = start_server_env(&[("RIPCLONE_PROVIDERS", &providers_str)]).await;
+    let server = start_provider_server(&providers_str).await;
     let client = server.client_with_provider("github-http", None);
     client.add_repo("acme/http").await.expect("add repo");
     client
@@ -163,7 +173,7 @@ async fn gitlab_provider_injects_basic_oauth2_auth_header() {
         }]
     });
     let providers_str = providers.to_string();
-    let server = start_server_env(&[("RIPCLONE_PROVIDERS", &providers_str)]).await;
+    let server = start_provider_server(&providers_str).await;
     let client = server.client_with_provider("gitlab", None);
     client.add_repo("acme/http").await.expect("add repo");
     client
@@ -198,7 +208,7 @@ async fn gitea_provider_injects_token_auth_header() {
         }]
     });
     let providers_str = providers.to_string();
-    let server = start_server_env(&[("RIPCLONE_PROVIDERS", &providers_str)]).await;
+    let server = start_provider_server(&providers_str).await;
     let client = server.client_with_provider("gitea", None);
     client.add_repo("acme/http").await.expect("add repo");
     client
@@ -257,7 +267,7 @@ async fn provider_upstream_rejects_wrong_or_absent_auth_headers() {
             }]
         });
         let providers_str = providers.to_string();
-        let server = start_server_env(&[("RIPCLONE_PROVIDERS", &providers_str)]).await;
+        let server = start_provider_server(&providers_str).await;
         let client = server.client_with_provider(provider_id, None);
         register_added_without_build_for_provider(
             &server,

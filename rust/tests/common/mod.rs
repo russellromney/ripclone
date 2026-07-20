@@ -5,12 +5,15 @@
 //! `ripclone::client::Client` then drives real sync + clone round-trips.
 #![allow(dead_code)]
 
+use anyhow::Context;
+use prost::Message;
 use ripclone::client::Client;
 use ripclone::server::{
     ArtifactBarrier, RateLimiter, ServerState, build_app, run_server_with_barrier,
 };
 use ripclone::storage::{HashEntry, StorageBackend, StorageRef};
 use sha2::{Digest, Sha256};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
@@ -100,7 +103,248 @@ pub struct Server {
     pub cas_dir: PathBuf,
     pub storage_dir: PathBuf,
     pub repo_root: PathBuf,
+    pub pinned_path_probe: Option<Arc<PinnedPathProbe>>,
     pub _dir: TempDir,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PinnedPathSnapshot {
+    pub branch_reads: usize,
+    pub enqueues: usize,
+}
+
+#[derive(Default)]
+pub struct PinnedPathProbe {
+    armed: std::sync::atomic::AtomicBool,
+    branch_reads: std::sync::atomic::AtomicUsize,
+    enqueues: std::sync::atomic::AtomicUsize,
+}
+
+pub struct PhaseOnePublishBarrier {
+    armed: std::sync::atomic::AtomicBool,
+    consumed: std::sync::atomic::AtomicBool,
+    entered: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    proceed: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+}
+
+impl PhaseOnePublishBarrier {
+    pub fn arm(&self) {
+        self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    async fn after_save(&self, info: &ripclone::RefInfo) {
+        if !self.armed.load(std::sync::atomic::Ordering::SeqCst)
+            || info.build_status.as_deref() != Some("full history building")
+            || self
+                .consumed
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
+        if let Some(entered) = self
+            .entered
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            let _ = entered.send(());
+        }
+        if let Some(proceed) = self.proceed.lock().await.take() {
+            let _ = proceed.await;
+        }
+    }
+}
+
+impl PinnedPathProbe {
+    pub fn arm(&self) {
+        self.branch_reads
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+        self.enqueues.store(0, std::sync::atomic::Ordering::SeqCst);
+        self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn snapshot(&self) -> PinnedPathSnapshot {
+        PinnedPathSnapshot {
+            branch_reads: self.branch_reads.load(std::sync::atomic::Ordering::SeqCst),
+            enqueues: self.enqueues.load(std::sync::atomic::Ordering::SeqCst),
+        }
+    }
+
+    fn is_armed(&self) -> bool {
+        self.armed.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+struct ProbedJobQueue {
+    inner: ripclone::queue::JobQueueRef,
+    probe: Arc<PinnedPathProbe>,
+}
+
+#[async_trait::async_trait]
+impl ripclone::queue::JobQueue for ProbedJobQueue {
+    async fn enqueue(
+        &self,
+        job: ripclone::queue::BuildJob,
+    ) -> anyhow::Result<ripclone::queue::Enqueued> {
+        if self.probe.is_armed() {
+            self.probe
+                .enqueues
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            panic!("pinned metadata lookup must not enqueue build work");
+        }
+        self.inner.enqueue(job).await
+    }
+
+    async fn job_status(
+        &self,
+        job_id: ripclone::queue::JobId,
+    ) -> anyhow::Result<ripclone::queue::JobState> {
+        self.inner.job_status(job_id).await
+    }
+
+    async fn depth(&self) -> usize {
+        self.inner.depth().await
+    }
+
+    fn inproc_wait(&self) -> bool {
+        self.inner.inproc_wait()
+    }
+}
+
+struct ProbedRefStore {
+    inner: Arc<dyn ripclone::ref_store::RefStore>,
+    probe: Arc<PinnedPathProbe>,
+    phase_one_barrier: Option<Arc<PhaseOnePublishBarrier>>,
+}
+
+#[async_trait::async_trait]
+impl ripclone::ref_store::RefStore for ProbedRefStore {
+    async fn load(
+        &self,
+        repo_id: &ripclone::provider::RepoId,
+    ) -> anyhow::Result<Option<ripclone::RefInfo>> {
+        self.inner.load(repo_id).await
+    }
+
+    async fn save(
+        &self,
+        repo_id: &ripclone::provider::RepoId,
+        info: &ripclone::RefInfo,
+    ) -> anyhow::Result<()> {
+        self.inner.save(repo_id, info).await
+    }
+
+    async fn list(&self) -> anyhow::Result<Vec<ripclone::provider::RepoId>> {
+        if self.probe.is_armed() {
+            panic!("pinned metadata lookup must not scan repositories");
+        }
+        self.inner.list().await
+    }
+
+    async fn load_branch(
+        &self,
+        repo_id: &ripclone::provider::RepoId,
+        branch: &str,
+    ) -> anyhow::Result<Option<ripclone::RefInfo>> {
+        if self.probe.is_armed() {
+            self.probe
+                .branch_reads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        self.inner.load_branch(repo_id, branch).await
+    }
+
+    async fn load_build(
+        &self,
+        repo_id: &ripclone::provider::RepoId,
+        commit: &str,
+    ) -> anyhow::Result<Option<ripclone::RefInfo>> {
+        if self.probe.is_armed() {
+            panic!("pinned metadata lookup must not scan builds");
+        }
+        self.inner.load_build(repo_id, commit).await
+    }
+
+    async fn save_branch(
+        &self,
+        repo_id: &ripclone::provider::RepoId,
+        branch: &str,
+        info: &ripclone::RefInfo,
+    ) -> anyhow::Result<()> {
+        self.inner.save_branch(repo_id, branch, info).await?;
+        if let Some(barrier) = &self.phase_one_barrier {
+            barrier.after_save(info).await;
+        }
+        Ok(())
+    }
+
+    async fn update_build_status(
+        &self,
+        repo_id: &ripclone::provider::RepoId,
+        branch: &str,
+        expected_commit: &str,
+        status: &str,
+    ) -> anyhow::Result<bool> {
+        self.inner
+            .update_build_status(repo_id, branch, expected_commit, status)
+            .await
+    }
+
+    async fn touch_last_accessed_at(
+        &self,
+        repo_id: &ripclone::provider::RepoId,
+        branch: &str,
+        expected_commit: &str,
+    ) -> anyhow::Result<bool> {
+        self.inner
+            .touch_last_accessed_at(repo_id, branch, expected_commit)
+            .await
+    }
+
+    async fn delete_branch(
+        &self,
+        repo_id: &ripclone::provider::RepoId,
+        branch: &str,
+    ) -> anyhow::Result<()> {
+        self.inner.delete_branch(repo_id, branch).await
+    }
+
+    async fn list_branches(
+        &self,
+        repo_id: &ripclone::provider::RepoId,
+    ) -> anyhow::Result<Vec<String>> {
+        if self.probe.is_armed() {
+            panic!("pinned metadata lookup must not scan branches");
+        }
+        self.inner.list_branches(repo_id).await
+    }
+
+    async fn add_repo(&self, repo: &ripclone::ref_store::AddedRepo) -> anyhow::Result<()> {
+        self.inner.add_repo(repo).await
+    }
+
+    async fn load_added_repo(
+        &self,
+        repo_id: &ripclone::provider::RepoId,
+    ) -> anyhow::Result<Option<ripclone::ref_store::AddedRepo>> {
+        self.inner.load_added_repo(repo_id).await
+    }
+
+    async fn remove_added_repo(&self, repo_id: &ripclone::provider::RepoId) -> anyhow::Result<()> {
+        self.inner.remove_added_repo(repo_id).await
+    }
+
+    async fn list_added_repos(&self) -> anyhow::Result<Vec<ripclone::ref_store::AddedRepo>> {
+        self.inner.list_added_repos().await
+    }
+
+    async fn invalidate(&self, repo_id: &ripclone::provider::RepoId, branch: &str) {
+        self.inner.invalidate(repo_id, branch).await
+    }
+
+    async fn health(&self) -> anyhow::Result<()> {
+        self.inner.health().await
+    }
 }
 
 impl Server {
@@ -125,6 +369,51 @@ impl Server {
     pub fn storage_path(&self, hash: &str) -> PathBuf {
         self.storage_dir.join(&hash[..2]).join(hash)
     }
+}
+
+/// Replace only the embedded commit of a published full manifest, then point
+/// the real ref row at those content-addressed bytes. This creates a realistic
+/// response-commit A / manifest-commit B integrity fixture without changing
+/// production code or bypassing the normal artifact endpoint.
+pub async fn replace_full_manifest_commit(
+    server: &Server,
+    repo_path: &str,
+    replacement: &str,
+) -> (String, String) {
+    let store = ripclone::ref_store::FileRefStore::new(&server.repo_root);
+    let repo_id = ripclone::provider::RepoId::github(repo_path);
+    let mut published = None;
+    for _ in 0..200 {
+        if let Ok(Some(info)) =
+            ripclone::ref_store::RefStore::load_branch(&store, &repo_id, "main").await
+            && info.build_status.is_none()
+            && !info.full_clonepack.manifest.is_empty()
+        {
+            published = Some(info);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let mut info = published.expect("full manifest publication settled");
+    let pinned = info.commit.clone();
+    let storage = ripclone::storage::local(&server.storage_dir).expect("open test storage");
+    let bytes = storage
+        .get(&info.full_clonepack.manifest)
+        .expect("read published full manifest");
+    let mut manifest = ripclone::clonepack::ClonepackManifest::decode(bytes.as_slice())
+        .expect("decode published full manifest");
+    manifest.commit = replacement.to_string();
+    let bytes = manifest.encode_to_vec();
+    let hash = ripclone::cas::hash(&bytes);
+    storage
+        .put(&hash, &bytes)
+        .expect("publish mismatched manifest fixture");
+    info.full_clonepack.manifest = hash.clone();
+    info.clonepack_manifest = hash.clone();
+    ripclone::ref_store::RefStore::save_branch(&store, &repo_id, "main", &info)
+        .await
+        .expect("publish mismatched full-manifest ref");
+    (pinned, hash)
 }
 
 /// Initialize a tracing subscriber once so server-side `info!`/`warn!`/`error!`
@@ -176,13 +465,32 @@ pub async fn start_server_with_barrier(barrier: ArtifactBarrier) -> Server {
 }
 
 pub async fn start_server_split_storage() -> Server {
-    start_server_split_storage_inner(None, None, None).await
+    start_server_split_storage_inner(None, None, None, None).await
 }
 
 /// Start a split-storage server with a deterministic artifact download barrier.
 /// See [`ripclone::server::ArtifactBarrier`].
 pub async fn start_server_split_storage_barrier(barrier: ArtifactBarrier) -> Server {
-    start_server_split_storage_inner(Some(barrier), None, None).await
+    start_server_split_storage_inner(Some(barrier), None, None, None).await
+}
+
+pub async fn start_server_split_storage_phase_one_barrier() -> (
+    Server,
+    Arc<PhaseOnePublishBarrier>,
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (proceed_tx, proceed_rx) = tokio::sync::oneshot::channel();
+    let barrier = Arc::new(PhaseOnePublishBarrier {
+        armed: std::sync::atomic::AtomicBool::new(false),
+        consumed: std::sync::atomic::AtomicBool::new(false),
+        entered: std::sync::Mutex::new(Some(entered_tx)),
+        proceed: tokio::sync::Mutex::new(Some(proceed_rx)),
+    });
+    let server =
+        start_server_split_storage_inner(None, None, None, Some(Arc::clone(&barrier))).await;
+    (server, barrier, entered_rx, proceed_tx)
 }
 
 /// Start a split-storage server whose durable-storage uploads fail after a
@@ -193,7 +501,7 @@ pub async fn start_server_split_storage_failing_put(
     fail_after_successes: usize,
     failures: usize,
 ) -> Server {
-    start_server_split_storage_inner(None, Some((fail_after_successes, failures)), None).await
+    start_server_split_storage_inner(None, Some((fail_after_successes, failures)), None, None).await
 }
 
 /// Start a split-storage server whose ref-store writes fail after a configurable
@@ -204,13 +512,14 @@ pub async fn start_server_split_storage_failing_ref_save(
     fail_after_successes: usize,
     failures: usize,
 ) -> Server {
-    start_server_split_storage_inner(None, None, Some((fail_after_successes, failures))).await
+    start_server_split_storage_inner(None, None, Some((fail_after_successes, failures)), None).await
 }
 
 async fn start_server_split_storage_inner(
     barrier: Option<ArtifactBarrier>,
     fail_put: Option<(usize, usize)>,
     fail_ref: Option<(usize, usize)>,
+    phase_one_barrier: Option<Arc<PhaseOnePublishBarrier>>,
 ) -> Server {
     init_tracing();
     let dir = tempfile::tempdir().expect("server dir");
@@ -245,6 +554,12 @@ async fn start_server_split_storage_inner(
         } else {
             base_ref_store
         };
+    let pinned_path_probe = Arc::new(PinnedPathProbe::default());
+    let ref_store: Arc<dyn ripclone::ref_store::RefStore> = Arc::new(ProbedRefStore {
+        inner: ref_store,
+        probe: Arc::clone(&pinned_path_probe),
+        phase_one_barrier,
+    });
     let metrics = ripclone::metrics::Metrics::new();
     let retention = Arc::new(
         ripclone::retention::Retention::with_config_and_storage(
@@ -258,7 +573,10 @@ async fn start_server_split_storage_inner(
         .with_ref_store(ref_store.clone(), storage.clone()),
     );
     let (local_queue, mut rx, depth) = ripclone::queue::LocalJobQueue::new(16);
-    let build_queue: ripclone::queue::JobQueueRef = Arc::new(local_queue);
+    let build_queue: ripclone::queue::JobQueueRef = Arc::new(ProbedJobQueue {
+        inner: Arc::new(local_queue),
+        probe: Arc::clone(&pinned_path_probe),
+    });
     let provider_registry = ripclone::provider::ProviderRegistry::new();
     let broker: Arc<dyn ripclone::auth::broker::CredentialBroker> = Arc::new(
         ripclone::auth::broker::StaticBroker::new(provider_registry.clone()),
@@ -358,6 +676,7 @@ async fn start_server_split_storage_inner(
         cas_dir,
         storage_dir,
         repo_root,
+        pinned_path_probe: Some(pinned_path_probe),
         _dir: dir,
     }
 }
@@ -754,6 +1073,7 @@ async fn start_server_inner(
         storage_dir: cas_dir.clone(),
         cas_dir,
         repo_root,
+        pinned_path_probe: None,
         _dir: dir,
     }
 }
@@ -1684,6 +2004,15 @@ pub fn spawn_worker_args(cas_dir: &Path, repo_root: &Path, extra: &[&str]) -> Wo
 /// bins) over the compile-time `env!("CARGO_BIN_EXE_*")` path, which is baked
 /// to the *build* machine and breaks after artifact download.
 pub fn cargo_bin(name: &str) -> std::path::PathBuf {
+    if let Some(dir) = std::env::var_os("RIPCLONE_BIN_DIR") {
+        let path = std::path::PathBuf::from(dir).join(name);
+        assert!(
+            path.is_file(),
+            "RIPCLONE_BIN_DIR selected missing binary {}",
+            path.display()
+        );
+        return path;
+    }
     let key = format!("CARGO_BIN_EXE_{name}");
     if let Ok(p) = std::env::var(&key) {
         return std::path::PathBuf::from(p);
@@ -1699,6 +2028,72 @@ pub fn cargo_bin(name: &str) -> std::path::PathBuf {
         }
         other => panic!("unknown cargo bin {other}; set CARGO_BIN_EXE_{other}"),
     }
+}
+
+/// Collect a piped child without allowing either pipe backpressure or a timeout
+/// to detach it. Reader threads drain stdout/stderr while the waiter polls; on
+/// timeout the child is killed and reaped before this returns.
+pub async fn wait_child_output_bounded(
+    mut child: std::process::Child,
+    timeout: Duration,
+) -> anyhow::Result<std::process::Output> {
+    tokio::task::spawn_blocking(move || {
+        let stdout = child.stdout.take().map(|mut pipe| {
+            std::thread::spawn(move || {
+                let mut bytes = Vec::new();
+                pipe.read_to_end(&mut bytes)
+                    .context("read bounded child stdout")?;
+                Ok::<_, anyhow::Error>(bytes)
+            })
+        });
+        let stderr = child.stderr.take().map(|mut pipe| {
+            std::thread::spawn(move || {
+                let mut bytes = Vec::new();
+                pipe.read_to_end(&mut bytes)
+                    .context("read bounded child stderr")?;
+                Ok::<_, anyhow::Error>(bytes)
+            })
+        });
+        let deadline = std::time::Instant::now() + timeout;
+        let mut timed_out = false;
+        let status = loop {
+            if let Some(status) = child.try_wait().context("poll bounded child")? {
+                break status;
+            }
+            if std::time::Instant::now() >= deadline {
+                timed_out = true;
+                child.kill().context("kill timed-out child")?;
+                break child.wait().context("reap timed-out child")?;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        let join_pipe = |reader: Option<std::thread::JoinHandle<anyhow::Result<Vec<u8>>>>| {
+            reader
+                .map(|reader| {
+                    reader
+                        .join()
+                        .map_err(|_| anyhow::anyhow!("bounded child pipe reader panicked"))?
+                })
+                .transpose()
+                .map(|bytes| bytes.unwrap_or_default())
+        };
+        let stdout = join_pipe(stdout)?;
+        let stderr = join_pipe(stderr)?;
+        if timed_out {
+            anyhow::bail!(
+                "child exceeded {timeout:?}; killed and reaped\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&stdout),
+                String::from_utf8_lossy(&stderr)
+            );
+        }
+        Ok(std::process::Output {
+            status,
+            stdout,
+            stderr,
+        })
+    })
+    .await
+    .context("join bounded child waiter")?
 }
 
 pub fn spawn_worker_with(

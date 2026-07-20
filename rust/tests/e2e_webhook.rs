@@ -20,6 +20,14 @@ use tempfile::TempDir;
 
 const SECRET: &str = "whsecret-e2e";
 
+async fn start_provider_server_env(extra: &[(&str, &str)]) -> Server {
+    let isolated_config = origin_root().join("missing-webhook-provider-test-config.toml");
+    let isolated_config = isolated_config.to_string_lossy().into_owned();
+    let mut env = vec![("RIPCLONE_CONFIG", isolated_config.as_str())];
+    env.extend_from_slice(extra);
+    start_server_env(&env).await
+}
+
 fn sign_github(body: &[u8]) -> String {
     let mut mac = Hmac::<Sha256>::new_from_slice(SECRET.as_bytes()).unwrap();
     mac.update(body);
@@ -344,7 +352,7 @@ async fn gitlab_webhook_push_builds_before_clone() {
     origin.publish();
 
     let providers = webhook_providers_json(&origin.url, "gitlab");
-    let server = start_server_env(&[
+    let server = start_provider_server_env(&[
         ("RIPCLONE_PROVIDERS", &providers),
         ("RIPCLONE_WEBHOOK_SECRET_GITLAB", SECRET),
     ])
@@ -400,7 +408,8 @@ async fn provider_webhook_builds_use_provider_auth_headers() {
             webhook_provider_with_token_json(provider_id, kind, &origin.url, Some(token));
         let secret_env = webhook_secret_env(provider_id);
         let server =
-            start_server_env(&[("RIPCLONE_PROVIDERS", &providers), (&secret_env, SECRET)]).await;
+            start_provider_server_env(&[("RIPCLONE_PROVIDERS", &providers), (&secret_env, SECRET)])
+                .await;
 
         register_added_without_build_for_provider(&server, provider_id, &repo)
             .await
@@ -428,7 +437,7 @@ async fn gitea_webhook_push_builds_before_clone() {
     origin.publish();
 
     let providers = webhook_providers_json(&origin.url, "gitea");
-    let server = start_server_env(&[
+    let server = start_provider_server_env(&[
         ("RIPCLONE_PROVIDERS", &providers),
         ("RIPCLONE_WEBHOOK_SECRET_GITEA", SECRET),
     ])
@@ -478,7 +487,7 @@ async fn gitea_webhook_branch_delete_cleans_up_ref() {
     git(&origin.bare, &["update-server-info"]);
 
     let providers = webhook_providers_json(&origin.url, "gitea");
-    let server = start_server_env(&[
+    let server = start_provider_server_env(&[
         ("RIPCLONE_PROVIDERS", &providers),
         ("RIPCLONE_WEBHOOK_SECRET_GITEA", SECRET),
     ])

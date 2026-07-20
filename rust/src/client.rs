@@ -14,8 +14,11 @@ use prost::Message;
 use serde::Deserialize;
 use sha2::Digest as Sha2Digest;
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tracing::{info, warn};
 
@@ -31,6 +34,41 @@ struct ServerError {
     error: Option<String>,
     #[serde(default)]
     code: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArtifactPendingResponse {
+    code: String,
+    commit: String,
+}
+
+/// The selected artifact is not yet available for the commit this clone pinned.
+#[derive(Debug)]
+pub struct ArtifactPending {
+    pub commit: String,
+    pub mode: String,
+}
+
+impl std::fmt::Display for ArtifactPending {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} artifact is still pending for {}; retry with `ripclone clone --at {}`",
+            self.mode, self.commit, self.commit
+        )
+    }
+}
+
+impl std::error::Error for ArtifactPending {}
+
+fn validate_manifest_commit(manifest: &ClonepackManifest, pinned: &str) -> Result<()> {
+    if manifest.commit != pinned {
+        anyhow::bail!(
+            "clonepack integrity error: manifest commit {} does not match pinned commit {pinned}",
+            manifest.commit
+        );
+    }
+    Ok(())
 }
 
 /// A presigned artifact URL failed (most likely expired mid-clone). The bytes
@@ -208,6 +246,25 @@ pub struct RefResponse {
 
 fn ref_archive_ready_default() -> bool {
     true
+}
+
+fn ref_poll_config() -> (usize, std::time::Duration) {
+    const DEFAULT_ATTEMPTS: usize = 40;
+    const DEFAULT_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+    if std::env::var_os("RIPCLONE_TESTING").is_none() {
+        return (DEFAULT_ATTEMPTS, DEFAULT_DELAY);
+    }
+    let attempts = std::env::var("RIPCLONE_TEST_REF_MAX_ATTEMPTS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_ATTEMPTS);
+    let delay = std::env::var("RIPCLONE_TEST_REF_POLL_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(DEFAULT_DELAY);
+    (attempts, delay)
 }
 
 /// Return the chunk refs that make up the head-blobs pack, falling back to the
@@ -605,6 +662,151 @@ pub struct CloneOutcome {
     pub bytes: u64,
 }
 
+#[derive(Default)]
+struct InstallIdentity {
+    pinned: Option<String>,
+    resolved_branch: Option<String>,
+    clone_id: Option<String>,
+    cold: bool,
+}
+
+type CleanupFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+#[derive(Default)]
+struct AttemptCleanupInner {
+    pending: Mutex<Vec<CleanupFuture>>,
+    active_guards: AtomicUsize,
+    closed: AtomicBool,
+    changed: tokio::sync::Notify,
+}
+
+#[derive(Clone, Default)]
+struct AttemptCleanup(Arc<AttemptCleanupInner>);
+
+#[derive(Default)]
+struct AttemptStaging {
+    overlay_dirs: Option<overlay::OverlayDirs>,
+    temp_install: Option<tempfile::TempDir>,
+}
+
+type SharedAttemptStaging = Arc<Mutex<Option<AttemptStaging>>>;
+
+fn spawn_attempt_reaper(
+    cleanup: AttemptCleanup,
+    staging: SharedAttemptStaging,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        cleanup.drain_closed().await;
+        let staging = staging.lock().unwrap_or_else(|e| e.into_inner()).take();
+        drop(staging);
+    })
+}
+
+impl AttemptCleanup {
+    fn guard_started(&self) {
+        self.0.active_guards.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn guard_finished(&self) {
+        let previous = self.0.active_guards.fetch_sub(1, Ordering::SeqCst);
+        debug_assert!(previous > 0, "attempt cleanup guard underflow");
+        self.0.changed.notify_one();
+    }
+
+    fn push(&self, future: CleanupFuture) {
+        self.0
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(future);
+        self.0.changed.notify_one();
+    }
+
+    fn close(&self) {
+        self.0.closed.store(true, Ordering::SeqCst);
+        self.0.changed.notify_one();
+    }
+
+    async fn drain(&self) {
+        loop {
+            let pending = {
+                let mut pending = self.0.pending.lock().unwrap_or_else(|e| e.into_inner());
+                std::mem::take(&mut *pending)
+            };
+            if pending.is_empty() {
+                break;
+            }
+            // Awaiting one cancelled parent can drop child guards that append
+            // more handles, so drain to a fixed point before retrying or
+            // removing staging.
+            futures::future::join_all(pending).await;
+        }
+    }
+
+    async fn drain_closed(&self) {
+        loop {
+            let changed = self.0.changed.notified();
+            self.drain().await;
+            if self.0.closed.load(Ordering::SeqCst)
+                && self.0.active_guards.load(Ordering::SeqCst) == 0
+            {
+                // No guard can enqueue after the attempt is closed and all
+                // registered guards have finished. One last drain closes the
+                // race with a guard that enqueued immediately before decrement.
+                self.drain().await;
+                return;
+            }
+            changed.await;
+        }
+    }
+}
+
+struct CloseAttemptOnDrop(AttemptCleanup);
+
+impl Drop for CloseAttemptOnDrop {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
+
+struct AbortOnDrop<T: Send + 'static> {
+    handle: Option<tokio::task::JoinHandle<T>>,
+    cleanup: AttemptCleanup,
+}
+
+impl<T: Send + 'static> AbortOnDrop<T> {
+    fn new(handle: tokio::task::JoinHandle<T>, cleanup: AttemptCleanup) -> Self {
+        cleanup.guard_started();
+        Self {
+            handle: Some(handle),
+            cleanup,
+        }
+    }
+
+    async fn join(mut self) -> std::result::Result<T, tokio::task::JoinError> {
+        let result = self.handle.as_mut().expect("join handle present").await;
+        self.handle.take();
+        self.cleanup.guard_finished();
+        result
+    }
+}
+
+impl<T: Send + 'static> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+            self.cleanup.push(Box::pin(async move {
+                // `abort` cancels async tasks immediately. A blocking task
+                // already running cannot be cancelled, so awaiting its
+                // handle is what prevents a stale-URL retry from overlapping
+                // the prior attempt's archive or pack worker.
+                let _ = handle.await;
+            }));
+            self.cleanup.guard_finished();
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Client {
     server: String,
@@ -778,38 +980,132 @@ impl Client {
         clonepack: Option<&str>,
         rev: Option<&str>,
     ) -> Result<RefResponse> {
-        let mut url = self.repo_url(repo_path, &format!("/refs/{branch}"));
-        let mut q: Vec<String> = Vec::new();
-        if let Some(kind) = clonepack {
-            q.push(format!("clonepack={}", kind));
-        }
-        if let Some(r) = rev {
-            q.push(format!("rev={}", urlencoding::encode(r)));
-        }
-        if !q.is_empty() {
-            url.push('?');
-            url.push_str(&q.join("&"));
-        }
-        // The cloud returns 202 while it warms a cold repo (the webhook-sync
-        // queue builds it on demand), or 503 if its queue is briefly full. Poll
-        // the same request until it's built, then read the ref.
-        let max_attempts = 40usize;
+        let mut pinned = None;
+        let mut resolved_branch = None;
+        self.resolve_ref_for_operation(
+            repo_path,
+            branch,
+            clonepack,
+            rev,
+            &mut pinned,
+            &mut resolved_branch,
+            clonepack.unwrap_or("full"),
+        )
+        .await
+    }
+
+    async fn resolve_ref_for_operation(
+        &self,
+        repo_path: &str,
+        branch: &str,
+        clonepack: Option<&str>,
+        rev: Option<&str>,
+        pinned: &mut Option<String>,
+        resolved_branch: &mut Option<String>,
+        pending_mode: &str,
+    ) -> Result<RefResponse> {
+        let (max_attempts, poll_delay) = ref_poll_config();
         // Track whether any attempt polled a cold build (202/503) before
         // success, so the post-clone metrics report can label the clone cold.
         let mut polled = false;
         for attempt in 0..max_attempts {
+            let request_branch = if pinned.is_some() {
+                resolved_branch.as_deref().unwrap_or(branch)
+            } else {
+                branch
+            };
+            let mut url = self.repo_url(repo_path, &format!("/refs/{request_branch}"));
+            let mut q: Vec<String> = Vec::new();
+            if let Some(kind) = clonepack {
+                q.push(format!("clonepack={kind}"));
+            }
+            if let Some(commit) = pinned.as_deref() {
+                q.push(format!("pinned={commit}"));
+            } else if let Some(r) = rev {
+                q.push(format!("rev={}", urlencoding::encode(r)));
+            }
+            if !q.is_empty() {
+                url.push('?');
+                url.push_str(&q.join("&"));
+            }
             let resp = self.send(self.request(reqwest::Method::GET, &url)).await?;
             let status = resp.status();
-            if status == reqwest::StatusCode::ACCEPTED
-                || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
-            {
+            if status == reqwest::StatusCode::ACCEPTED {
+                let pending_branch = resp
+                    .headers()
+                    .get(reqwest::header::CONTENT_LOCATION)
+                    .map(|value| {
+                        value
+                            .to_str()
+                            .context("invalid Content-Location on pending ref response")
+                            .and_then(|value| {
+                                urlencoding::decode(value)
+                                    .context("invalid escaped branch in pending Content-Location")
+                                    .map(|value| value.into_owned())
+                            })
+                    })
+                    .transpose()?;
+                let pending: ArtifactPendingResponse = resp.json().await.with_context(|| {
+                    format!("invalid protocol-2 pending response for {repo_path}")
+                })?;
+                if pending.code != "artifact_pending" {
+                    anyhow::bail!(
+                        "invalid protocol-2 pending response code {:?} for {repo_path}",
+                        pending.code
+                    );
+                }
+                crate::validation::validate_object_id(&pending.commit)
+                    .with_context(|| format!("invalid pending commit for {repo_path}"))?;
+                if let Some(expected) = pinned.as_deref() {
+                    if pending.commit != expected {
+                        anyhow::bail!(
+                            "ref integrity error: pinned commit {expected} changed to {} in a pending response",
+                            pending.commit
+                        );
+                    }
+                } else {
+                    *pinned = Some(pending.commit.clone());
+                }
+                if let Some(response_branch) = pending_branch.filter(|value| !value.is_empty()) {
+                    crate::validation::validate_git_rev(&response_branch)
+                        .with_context(|| format!("invalid pending branch for {repo_path}"))?;
+                    if let Some(expected) = resolved_branch.as_deref() {
+                        if response_branch != expected {
+                            anyhow::bail!(
+                                "ref integrity error: resolved branch {expected} changed to {response_branch} in a pending response"
+                            );
+                        }
+                    } else {
+                        *resolved_branch = Some(response_branch);
+                    }
+                }
                 polled = true;
                 if attempt == 0 {
                     eprintln!("ripclone: warming {repo_path} — this can take a moment…");
                 }
                 if attempt + 1 < max_attempts {
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    tokio::time::sleep(poll_delay).await;
                     continue;
+                }
+                let commit = pinned.clone().expect("valid 202 establishes a pin");
+                return Err(anyhow::Error::new(ArtifactPending {
+                    commit,
+                    mode: pending_mode.to_string(),
+                }));
+            }
+            if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+                polled = true;
+                if attempt == 0 {
+                    eprintln!("ripclone: warming {repo_path} — this can take a moment…");
+                }
+                if attempt + 1 < max_attempts {
+                    tokio::time::sleep(poll_delay).await;
+                    continue;
+                }
+                if let Some(commit) = pinned.as_deref() {
+                    anyhow::bail!(
+                        "ref lookup for pinned commit {commit} remained unavailable after {max_attempts} attempts"
+                    );
                 }
                 anyhow::bail!("{repo_path} is still building after {max_attempts} attempts");
             }
@@ -823,11 +1119,48 @@ impl Client {
                     .and_then(|v| v.to_str().ok())
                     .map(str::to_string);
                 let mut info: RefResponse = resp.json().await?;
+                crate::validation::validate_object_id(&info.commit)
+                    .with_context(|| format!("invalid ready commit for {repo_path}"))?;
+                crate::validation::validate_git_rev(&info.branch)
+                    .with_context(|| format!("invalid ready branch for {repo_path}"))?;
+                if let Some(expected) = pinned.as_deref() {
+                    if info.commit != expected {
+                        anyhow::bail!(
+                            "ref integrity error: pinned commit {expected} changed to {} in a ready response",
+                            info.commit
+                        );
+                    }
+                } else {
+                    *pinned = Some(info.commit.clone());
+                }
+                if let Some(expected) = resolved_branch.as_deref() {
+                    if info.branch != expected {
+                        anyhow::bail!(
+                            "ref integrity error: resolved branch {expected} changed to {} in a ready response",
+                            info.branch
+                        );
+                    }
+                } else {
+                    *resolved_branch = Some(info.branch.clone());
+                }
                 info.clone_id = clone_id;
                 info.cold = polled;
                 return Ok(info);
             }
-            return Err(server_error("ref lookup failed", resp).await);
+            let authorization_failure = matches!(
+                status,
+                reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+            );
+            let error = server_error("ref lookup failed", resp).await;
+            if let Some(commit) = pinned.as_deref() {
+                let context = if authorization_failure {
+                    format!("refresh of pinned commit {commit} was not authorized")
+                } else {
+                    format!("refresh of pinned commit {commit} failed")
+                };
+                return Err(error.context(context));
+            }
+            return Err(error);
         }
         anyhow::bail!("ref lookup did not complete")
     }
@@ -856,11 +1189,22 @@ impl Client {
         hash: &str,
         signed_url: Option<&str>,
     ) -> Result<bytes::Bytes> {
+        self.fetch_artifact_with_url_cache(hash, signed_url, true)
+            .await
+    }
+
+    async fn fetch_artifact_with_url_cache(
+        &self,
+        hash: &str,
+        signed_url: Option<&str>,
+        use_cache: bool,
+    ) -> Result<bytes::Bytes> {
         let gateway_url = format!("{}/v1/artifacts/{}", self.server, hash);
         let fetch_url = signed_url.unwrap_or(&gateway_url);
         let use_signed_url = signed_url.is_some();
 
-        if let Some(cache) = &self.cache
+        if use_cache
+            && let Some(cache) = &self.cache
             && let Some(key) = self.cache_key_from_artifact_url(&gateway_url)
             && let Ok(data) = cache.get(&key)
         {
@@ -886,13 +1230,63 @@ impl Client {
             fetch_artifact_with_retry(&self.http, &gateway_url, hash).await?
         };
 
-        if let Some(cache) = &self.cache
+        if use_cache
+            && let Some(cache) = &self.cache
             && let Some(key) = self.cache_key_from_artifact_url(&gateway_url)
         {
             let _ = cache.put_with_hash(&key, &data);
         }
 
         Ok(data)
+    }
+
+    #[allow(deprecated)]
+    async fn fetch_validated_manifest(
+        &self,
+        hash: &str,
+        signed_url: Option<&str>,
+        pinned: &str,
+    ) -> Result<ClonepackManifest> {
+        let decode = |data: &[u8]| -> Result<ClonepackManifest> {
+            let mut manifest =
+                ClonepackManifest::decode(data).context("decode clonepack manifest")?;
+            // Backwards compatibility: older manifests store the head-blobs
+            // pack as one field. Normalize only after the commit binding has
+            // been decoded from the same bytes.
+            if manifest.head_blobs_chunks.is_empty()
+                && let Some(pack) = manifest.head_blobs_pack.take()
+            {
+                manifest.head_blobs_chunks.push(pack);
+            }
+            validate_manifest_commit(&manifest, pinned)?;
+            Ok(manifest)
+        };
+
+        if let Some(cache) = &self.cache
+            && let Ok(data) = cache.get(hash)
+        {
+            return match decode(&data) {
+                Ok(manifest) => Ok(manifest),
+                Err(error) => {
+                    // A manifest whose embedded commit is wrong is not a valid
+                    // cache entry for this operation. Remove it before
+                    // returning so a later lookup cannot hit rejected bytes.
+                    let _ = cache.remove(hash);
+                    Err(error)
+                }
+            };
+        }
+
+        // Do not let generic artifact caching publish bytes before their
+        // embedded commit has been checked against the operation pin.
+        let data = self
+            .fetch_artifact_with_url_cache(hash, signed_url, false)
+            .await?;
+        let manifest = decode(&data)?;
+        if let Some(cache) = &self.cache {
+            let _ = cache.put_with_hash(hash, &data);
+        }
+        Ok(manifest)
     }
 
     /// Fetch an artifact referenced by a `ChunkRef`, optionally using a signed URL.
@@ -994,14 +1388,13 @@ impl Client {
         if info.clonepack_manifest.is_empty() {
             anyhow::bail!("ref is missing clonepack manifest; run sync first");
         }
-        let manifest_data = self
-            .fetch_artifact_with_url(
+        let clonepack = self
+            .fetch_validated_manifest(
                 &info.clonepack_manifest,
                 info.clonepack_manifest_url.as_deref(),
+                &info.commit,
             )
             .await?;
-        let clonepack = ClonepackManifest::decode(manifest_data.as_ref())
-            .context("decode clonepack manifest")?;
         let metadata_ref = clonepack
             .metadata_chunk
             .as_ref()
@@ -1237,7 +1630,87 @@ impl Client {
         target: P,
         mode: CloneMode,
         clonepack: Option<&str>,
+        mut bench: Option<&mut Benchmark>,
+    ) -> Result<CloneOutcome> {
+        const STALE_URL_MAX_RETRIES: u32 = 2;
+        let mut identity = InstallIdentity::default();
+        let mut stale_retries = 0u32;
+        loop {
+            let cleanup = AttemptCleanup::default();
+            let result = self
+                .install_repo_with_mode_at_attempt(
+                    repo_path,
+                    branch,
+                    rev,
+                    target.as_ref(),
+                    mode,
+                    clonepack,
+                    bench.as_deref_mut(),
+                    &mut identity,
+                    &cleanup,
+                )
+                .await;
+            match result {
+                Ok(outcome) => return Ok(outcome),
+                Err(error) if should_retry_stale(stale_retries, STALE_URL_MAX_RETRIES, &error) => {
+                    if target.as_ref().exists() {
+                        anyhow::bail!(
+                            "stale signed-URL attempt left a published target at {}",
+                            target.as_ref().display()
+                        );
+                    }
+                    stale_retries += 1;
+                    eprintln!(
+                        "ripclone: artifact URLs expired mid-clone — refreshing the pinned commit and retrying (attempt {stale_retries})…"
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn install_repo_with_mode_at_attempt<P: AsRef<Path>>(
+        &self,
+        repo_path: &str,
+        branch: &str,
+        rev: Option<&str>,
+        target: P,
+        mode: CloneMode,
+        clonepack: Option<&str>,
         bench: Option<&mut Benchmark>,
+        identity: &mut InstallIdentity,
+        cleanup: &AttemptCleanup,
+    ) -> Result<CloneOutcome> {
+        // Staging owns filesystem cleanup outside the inner attempt future.
+        // Task guards unwind first; blocking workers are then joined; only
+        // after that is it safe to remove a temp tree or unmounted overlay.
+        let staging = Arc::new(Mutex::new(Some(AttemptStaging::default())));
+        let reaper = spawn_attempt_reaper(cleanup.clone(), Arc::clone(&staging));
+        let close_on_drop = CloseAttemptOnDrop(cleanup.clone());
+        let result = self
+            .install_repo_with_mode_at_attempt_inner(
+                repo_path, branch, rev, target, mode, clonepack, bench, identity, cleanup, &staging,
+            )
+            .await;
+        drop(close_on_drop);
+        reaper.await.context("attempt cleanup task")?;
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn install_repo_with_mode_at_attempt_inner<P: AsRef<Path>>(
+        &self,
+        repo_path: &str,
+        branch: &str,
+        rev: Option<&str>,
+        target: P,
+        mode: CloneMode,
+        clonepack: Option<&str>,
+        bench: Option<&mut Benchmark>,
+        identity: &mut InstallIdentity,
+        cleanup: &AttemptCleanup,
+        staging: &SharedAttemptStaging,
     ) -> Result<CloneOutcome> {
         let target = target.as_ref().to_path_buf();
         info!(
@@ -1257,17 +1730,6 @@ impl Client {
         crate::perf::reset_perf_counters();
         let _ = crate::worktree_writer::take_write_timing();
 
-        // 1. Resolve ref (full-history by default; fast clones can request shallow).
-        let mut info = self
-            .resolve_ref_with_clonepack(repo_path, branch, clonepack, rev)
-            .await?;
-        bench.mark_resolve();
-        // Capture the metrics-relevant facts from the FIRST successful resolve:
-        // the cloud mints a fresh clone id (and usage event) on each resolve, so
-        // the archive-ready re-resolve below would otherwise overwrite the id we
-        // want to report against.
-        let clone_id = info.clone_id.clone();
-        let mut cold = info.cold;
         // `files` | `depth1` | `full`, derived from the mode and requested
         // clonepack variant (depth=1 ⇒ "shallow").
         let metric_mode: &'static str = if mode.needs_archive() {
@@ -1277,6 +1739,35 @@ impl Client {
         } else {
             "full"
         };
+        // 1. Resolve the moving selector once. A pending or ready response
+        // establishes `identity.pinned`; every later poll and retry uses the
+        // metadata-only pinned query.
+        let mut info = self
+            .resolve_ref_for_operation(
+                repo_path,
+                branch,
+                clonepack,
+                rev,
+                &mut identity.pinned,
+                &mut identity.resolved_branch,
+                metric_mode,
+            )
+            .await?;
+        bench.mark_resolve();
+        if identity.clone_id.is_none() {
+            identity.clone_id = info.clone_id.clone();
+        }
+        identity.cold |= info.cold;
+        let pinned = identity
+            .pinned
+            .clone()
+            .context("ref resolution completed without a pinned commit")?;
+        if info.commit != pinned {
+            anyhow::bail!(
+                "ref integrity error: response commit {} does not match pinned commit {pinned}",
+                info.commit
+            );
+        }
         info!("resolved to commit {}", &info.commit[..7]);
 
         // Files mode needs the zstd archive. The server publishes an editable
@@ -1286,19 +1777,31 @@ impl Client {
         // ref-resolve 202 poll above doesn't capture for files mode, so record
         // it for the metrics label.
         if mode.needs_archive() && !info.archive_ready {
-            cold = true;
-            let max = 40usize;
+            identity.cold = true;
+            let (max, poll_delay) = ref_poll_config();
             for _ in 0..max {
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                tokio::time::sleep(poll_delay).await;
                 info = self
-                    .resolve_ref_with_clonepack(repo_path, branch, clonepack, rev)
+                    .resolve_ref_for_operation(
+                        repo_path,
+                        branch,
+                        clonepack,
+                        rev,
+                        &mut identity.pinned,
+                        &mut identity.resolved_branch,
+                        metric_mode,
+                    )
                     .await?;
+                identity.cold |= info.cold;
                 if info.archive_ready {
                     break;
                 }
             }
             if !info.archive_ready {
-                anyhow::bail!("archive still building for {repo_path}");
+                return Err(anyhow::Error::new(ArtifactPending {
+                    commit: pinned.clone(),
+                    mode: metric_mode.to_string(),
+                }));
             }
         }
 
@@ -1313,17 +1816,23 @@ impl Client {
         let (manifest_tx, manifest_rx) = tokio::sync::oneshot::channel::<Arc<ClonepackManifest>>();
 
         // 2. Start manifest + metadata downloads concurrently.
-        let manifest_task = self.clone().spawn_fetch_manifest(
-            info.clonepack_manifest.clone(),
-            info.clonepack_manifest_url.clone(),
-            manifest_tx,
+        let manifest_task = AbortOnDrop::new(
+            self.clone().spawn_fetch_manifest(
+                info.clonepack_manifest.clone(),
+                info.clonepack_manifest_url.clone(),
+                pinned.clone(),
+                manifest_tx,
+            ),
+            cleanup.clone(),
         );
 
         let metadata_hash = info.metadata_chunk.clone();
         let metadata_url = info.metadata_chunk_url.clone();
-        let metadata_task = self
-            .clone()
-            .spawn_fetch_metadata(metadata_hash, metadata_url);
+        let metadata_task = AbortOnDrop::new(
+            self.clone()
+                .spawn_fetch_metadata(metadata_hash, metadata_url),
+            cleanup.clone(),
+        );
 
         // 3. Spawn the archive-chunk downloader. It waits for the manifest to be
         // decoded before fetching anything (so it follows the manifest's chunk
@@ -1343,15 +1852,18 @@ impl Client {
         ) = bounded(archive_channel_depth);
         let archive_bridge = if mode.needs_archive() {
             let archive_tx = archive_tx.clone();
-            Some(tokio::task::spawn_blocking(move || {
-                while let Some(msg) = archive_async_rx.blocking_recv() {
-                    let send_start = Instant::now();
-                    if archive_tx.send(msg).is_err() {
-                        break;
+            Some(AbortOnDrop::new(
+                tokio::task::spawn_blocking(move || {
+                    while let Some(msg) = archive_async_rx.blocking_recv() {
+                        let send_start = Instant::now();
+                        if archive_tx.send(msg).is_err() {
+                            break;
+                        }
+                        crate::perf::record_archive_send_wait(send_start.elapsed());
                     }
-                    crate::perf::record_archive_send_wait(send_start.elapsed());
-                }
-            }))
+                }),
+                cleanup.clone(),
+            ))
         } else {
             None
         };
@@ -1359,10 +1871,11 @@ impl Client {
         let archive_urls = info.archive_chunk_urls.clone();
         let archive_downloads = if mode.needs_archive() {
             bench.start_archive_download();
-            Some(
+            Some(AbortOnDrop::new(
                 self.clone()
                     .spawn_chunk_downloads(archive_urls, manifest_rx, archive_async_tx),
-            )
+                cleanup.clone(),
+            ))
         } else {
             drop(archive_async_tx);
             drop(manifest_rx);
@@ -1371,10 +1884,22 @@ impl Client {
         drop(archive_tx);
 
         // 4. Wait for manifest + metadata.
+        let manifest = async {
+            manifest_task
+                .join()
+                .await
+                .context("join clonepack manifest fetch")?
+                .context("fetch clonepack manifest")
+        };
+        let metadata = async {
+            metadata_task
+                .join()
+                .await
+                .context("join metadata chunk fetch")?
+                .context("fetch metadata chunk")
+        };
         let (manifest, metadata) =
-            tokio::try_join!(manifest_task, metadata_task).context("fetch manifest/metadata")?;
-        let manifest = manifest.context("fetch clonepack manifest")?;
-        let metadata = metadata.context("fetch metadata chunk")?;
+            tokio::try_join!(manifest, metadata).context("fetch manifest/metadata")?;
         let metadata = Arc::new(metadata);
         bench.mark_manifest();
         bench.add_bytes(metadata_bytes(&metadata), 0);
@@ -1398,17 +1923,28 @@ impl Client {
         } else {
             None
         };
+        let overlay_lower = overlay_dirs.as_ref().map(|dirs| dirs.lower.clone());
+        staging
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+            .expect("attempt staging present")
+            .overlay_dirs = overlay_dirs;
 
         // Hold the temp-dir handle for the whole install so any early failure
         // removes the partial directory on drop. After a successful rename onto
         // `target`, its drop is a no-op.
-        let mut _temp_install: Option<tempfile::TempDir> = None;
-        let install_root = if let Some(ref dirs) = overlay_dirs {
-            dirs.lower.clone()
+        let install_root = if let Some(lower) = overlay_lower {
+            lower
         } else {
             let tmp = temp_install_dir(&target)?;
             let path = tmp.path().to_path_buf();
-            _temp_install = Some(tmp);
+            staging
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_mut()
+                .expect("attempt staging present")
+                .temp_install = Some(tmp);
             path
         };
         let git_dir = install_root.join(".git");
@@ -1483,11 +2019,14 @@ impl Client {
             let rx = archive_rx;
             let manifest_path = manifest_path.clone();
             let work_tree = install_root.clone();
-            Some(tokio::task::spawn_blocking(move || {
-                // Keep the temp manifest file alive for the duration of extraction.
-                let _guard = manifest_tmp;
-                extract_archive_from_chunk_receiver(&manifest_path, Some(&work_tree), None, rx)
-            }))
+            Some(AbortOnDrop::new(
+                tokio::task::spawn_blocking(move || {
+                    // Keep the temp manifest file alive for the duration of extraction.
+                    let _guard = manifest_tmp;
+                    extract_archive_from_chunk_receiver(&manifest_path, Some(&work_tree), None, rx)
+                }),
+                cleanup.clone(),
+            ))
         } else {
             drop(archive_rx);
             // The temp file can be dropped; nothing needs the manifest on disk.
@@ -1498,11 +2037,14 @@ impl Client {
         // 8. Wait for downloads + workers.
         let mut archive_bytes = 0u64;
         if let Some(handle) = archive_downloads {
-            let bytes = handle.await.context("archive download coordinator")??;
+            let bytes = handle
+                .join()
+                .await
+                .context("archive download coordinator")??;
             archive_bytes = bytes;
         }
         if let Some(handle) = archive_bridge {
-            handle.await.context("archive download bridge")?;
+            handle.join().await.context("archive download bridge")?;
         }
         // Editable single-download path: download the small depth packs in
         // parallel and, as each lands, install it and extract its blobs into the
@@ -1510,7 +2052,14 @@ impl Client {
         let mut prebuilt_blob_pack_bytes = 0u64;
         if mode.needs_pack_worktree() {
             prebuilt_blob_pack_bytes = self
-                .install_editable_packs(&manifest, &info, &pack_dir, &install_root, &metadata)
+                .install_editable_packs(
+                    &manifest,
+                    &info,
+                    &pack_dir,
+                    &install_root,
+                    &metadata,
+                    cleanup,
+                )
                 .await
                 .context("install editable packs")?;
             bench.mark_write();
@@ -1522,6 +2071,7 @@ impl Client {
         }
         if let Some(handle) = archive_worker {
             let stats = handle
+                .join()
                 .await
                 .context("archive worker join")?
                 .context("archive extraction")?;
@@ -1549,6 +2099,13 @@ impl Client {
             self.write_origin_config(&origin_url, &git_dir)?;
         }
 
+        let overlay_dirs = staging
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+            .expect("attempt staging present")
+            .overlay_dirs
+            .take();
         if let Some(dirs) = overlay_dirs {
             overlay::mount_dirs(&dirs).context("mount overlay at target")?;
             // Mount succeeded; keep the staging tree (it backs the mount). Any
@@ -1636,10 +2193,10 @@ impl Client {
             provider,
             owner: info.owner.clone(),
             name: info.repo.clone(),
-            commit: info.commit.clone(),
+            commit: pinned,
             mode: metric_mode,
-            cold,
-            clone_id,
+            cold: identity.cold,
+            clone_id: identity.clone_id.clone(),
             bytes: report.total_bytes(),
         })
     }
@@ -1742,6 +2299,7 @@ impl Client {
         pack_dir: &std::path::Path,
         work_tree: &std::path::Path,
         metadata: &MetadataChunk,
+        cleanup: &AttemptCleanup,
     ) -> Result<u64> {
         use futures::stream::{self, StreamExt, TryStreamExt};
 
@@ -1755,23 +2313,29 @@ impl Client {
             let client = self.clone();
             let bundle_ref = bundle_ref.clone();
             let idx_bundle_url = info.idx_bundle_url.clone();
-            tokio::spawn(async move {
-                client
-                    .fetch_chunk_ref(&bundle_ref, idx_bundle_url.as_deref())
-                    .await
-                    .context("fetch idx bundle")
-            })
+            AbortOnDrop::new(
+                tokio::spawn(async move {
+                    client
+                        .fetch_chunk_ref(&bundle_ref, idx_bundle_url.as_deref())
+                        .await
+                        .context("fetch idx bundle")
+                }),
+                cleanup.clone(),
+            )
         });
         let midx_task = manifest.midx.as_ref().map(|midx_ref| {
             let client = self.clone();
             let midx_ref = midx_ref.clone();
             let midx_url = info.midx_url.clone();
-            tokio::spawn(async move {
-                client
-                    .fetch_chunk_ref(&midx_ref, midx_url.as_deref())
-                    .await
-                    .context("fetch pre-built multi-pack-index")
-            })
+            AbortOnDrop::new(
+                tokio::spawn(async move {
+                    client
+                        .fetch_chunk_ref(&midx_ref, midx_url.as_deref())
+                        .await
+                        .context("fetch pre-built multi-pack-index")
+                }),
+                cleanup.clone(),
+            )
         });
 
         // Validate every blob sha1 length up front so `build_blob_path_map`
@@ -1815,7 +2379,9 @@ impl Client {
         // per-pack round-trips from 2 to 1). Falls back to per-pack idx fetches
         // for older manifests without a bundle.
         let idx_bundle: Option<Arc<bytes::Bytes>> = match idx_bundle_task {
-            Some(task) => Some(Arc::new(task.await.context("idx bundle fetch task")??)),
+            Some(task) => Some(Arc::new(
+                task.join().await.context("idx bundle fetch task")??,
+            )),
             None => None,
         };
 
@@ -1919,67 +2485,83 @@ impl Client {
                 let work_tree = work_tree.to_path_buf();
                 let blob_map = Arc::clone(&blob_map);
                 let worktree_writer = Arc::clone(&worktree_writer);
+                let cleanup = cleanup.clone();
                 async move {
                     let (i, history_only, pack_body, idx_bytes) = res?;
                     let bytes = (pack_body.len() + idx_bytes.len()) as u64;
-                    let result = tokio::task::spawn_blocking(
-                        move || -> Result<crate::extract::PackExtractResult> {
-                            if pack_body.len() < 20 {
-                                anyhow::bail!("pack {} too short ({} bytes)", i, pack_body.len());
-                            }
-                            let (name, pack_bytes) = match pack_body {
-                                PackBody::Buffered(pack_bytes) => {
-                                    // Git names packs by the 20-byte trailer sha; the idx
-                                    // pairs to the pack by basename.
-                                    let name = hex::encode(&pack_bytes[pack_bytes.len() - 20..]);
-                                    std::fs::write(
-                                        pack_dir.join(format!("pack-{}.pack", name)),
-                                        &pack_bytes,
-                                    )
-                                    .with_context(|| format!("write pack {}", name))?;
-                                    (name, Some(pack_bytes))
+                    let result = AbortOnDrop::new(
+                        tokio::task::spawn_blocking(
+                            move || -> Result<crate::extract::PackExtractResult> {
+                                if pack_body.len() < 20 {
+                                    anyhow::bail!(
+                                        "pack {} too short ({} bytes)",
+                                        i,
+                                        pack_body.len()
+                                    );
                                 }
-                                PackBody::TempFile { file, len } => {
-                                    use std::io::{Read, Seek, SeekFrom};
-                                    let mut reader = file
-                                        .as_file()
-                                        .try_clone()
-                                        .context("clone streamed pack file")?;
-                                    reader
-                                        .seek(SeekFrom::Start(len - 20))
-                                        .context("seek streamed pack trailer")?;
-                                    let mut trailer = [0u8; 20];
-                                    reader
-                                        .read_exact(&mut trailer)
-                                        .context("read streamed pack trailer")?;
-                                    let name = hex::encode(trailer);
-                                    file.persist(pack_dir.join(format!("pack-{}.pack", name)))
-                                        .with_context(|| {
-                                            format!("install streamed pack {}", name)
-                                        })?;
-                                    (name, None)
-                                }
-                            };
-                            std::fs::write(pack_dir.join(format!("pack-{}.idx", name)), &idx_bytes)
+                                let (name, pack_bytes) = match pack_body {
+                                    PackBody::Buffered(pack_bytes) => {
+                                        // Git names packs by the 20-byte trailer sha; the idx
+                                        // pairs to the pack by basename.
+                                        let name =
+                                            hex::encode(&pack_bytes[pack_bytes.len() - 20..]);
+                                        std::fs::write(
+                                            pack_dir.join(format!("pack-{}.pack", name)),
+                                            &pack_bytes,
+                                        )
+                                        .with_context(|| format!("write pack {}", name))?;
+                                        (name, Some(pack_bytes))
+                                    }
+                                    PackBody::TempFile { file, len } => {
+                                        use std::io::{Read, Seek, SeekFrom};
+                                        let mut reader = file
+                                            .as_file()
+                                            .try_clone()
+                                            .context("clone streamed pack file")?;
+                                        reader
+                                            .seek(SeekFrom::Start(len - 20))
+                                            .context("seek streamed pack trailer")?;
+                                        let mut trailer = [0u8; 20];
+                                        reader
+                                            .read_exact(&mut trailer)
+                                            .context("read streamed pack trailer")?;
+                                        let name = hex::encode(trailer);
+                                        file.persist(pack_dir.join(format!("pack-{}.pack", name)))
+                                            .with_context(|| {
+                                                format!("install streamed pack {}", name)
+                                            })?;
+                                        (name, None)
+                                    }
+                                };
+                                std::fs::write(
+                                    pack_dir.join(format!("pack-{}.idx", name)),
+                                    &idx_bytes,
+                                )
                                 .with_context(|| format!("write idx {}", name))?;
-                            if history_only {
-                                return Ok(crate::extract::PackExtractResult {
-                                    files: 0,
-                                    stats: Vec::new(),
-                                });
-                            }
-                            let Some(pack_bytes) = pack_bytes else {
-                                anyhow::bail!("head pack {} was not buffered for extraction", i);
-                            };
-                            crate::extract::extract_blobs_from_pack_bytes(
-                                &pack_bytes,
-                                &blob_map,
-                                &work_tree,
-                                &worktree_writer,
-                            )
-                            .with_context(|| format!("extract pack {}", name))
-                        },
+                                if history_only {
+                                    return Ok(crate::extract::PackExtractResult {
+                                        files: 0,
+                                        stats: Vec::new(),
+                                    });
+                                }
+                                let Some(pack_bytes) = pack_bytes else {
+                                    anyhow::bail!(
+                                        "head pack {} was not buffered for extraction",
+                                        i
+                                    );
+                                };
+                                crate::extract::extract_blobs_from_pack_bytes(
+                                    &pack_bytes,
+                                    &blob_map,
+                                    &work_tree,
+                                    &worktree_writer,
+                                )
+                                .with_context(|| format!("extract pack {}", name))
+                            },
+                        ),
+                        cleanup,
                     )
+                    .join()
                     .await
                     .context("spawn pack install task")??;
                     Ok::<(u64, crate::extract::PackExtractResult), anyhow::Error>((bytes, result))
@@ -2009,13 +2591,17 @@ impl Client {
         // Files are materialized; clear skip-worktree for every tracked path.
         let path_bytes: Vec<Vec<u8>> = metadata.files.iter().map(|e| e.path.clone()).collect();
         let work_tree2 = work_tree.to_path_buf();
-        tokio::task::spawn_blocking(move || {
-            crate::git::clear_skip_worktree_index_with_stats_byte_iter(
-                &work_tree2,
-                path_bytes.iter().map(Vec::as_slice),
-                &stat_cache,
-            )
-        })
+        AbortOnDrop::new(
+            tokio::task::spawn_blocking(move || {
+                crate::git::clear_skip_worktree_index_with_stats_byte_iter(
+                    &work_tree2,
+                    path_bytes.iter().map(Vec::as_slice),
+                    &stat_cache,
+                )
+            }),
+            cleanup.clone(),
+        )
+        .join()
         .await
         .context("spawn clear skip-worktree and refresh index stats")??;
 
@@ -2027,6 +2613,7 @@ impl Client {
         // with slower per-object lookups.
         if let Some(midx_task) = midx_task {
             match midx_task
+                .join()
                 .await
                 .context("pre-built MIDX fetch task")
                 .and_then(|r| r)
@@ -2039,17 +2626,25 @@ impl Client {
                 Err(e) => {
                     tracing::warn!("pre-built MIDX fetch failed ({e:#}); building locally");
                     let work_tree3 = work_tree.to_path_buf();
-                    let _ = tokio::task::spawn_blocking(move || {
-                        crate::git::write_multi_pack_index(&work_tree3)
-                    })
+                    let _ = AbortOnDrop::new(
+                        tokio::task::spawn_blocking(move || {
+                            crate::git::write_multi_pack_index(&work_tree3)
+                        }),
+                        cleanup.clone(),
+                    )
+                    .join()
                     .await;
                 }
             }
         } else {
             let work_tree3 = work_tree.to_path_buf();
-            let _ = tokio::task::spawn_blocking(move || {
-                crate::git::write_multi_pack_index(&work_tree3)
-            })
+            let _ = AbortOnDrop::new(
+                tokio::task::spawn_blocking(move || {
+                    crate::git::write_multi_pack_index(&work_tree3)
+                }),
+                cleanup.clone(),
+            )
+            .join()
             .await;
         }
 
@@ -2194,23 +2789,14 @@ impl Client {
         self,
         hash: String,
         signed_url: Option<String>,
+        pinned: String,
         manifest_tx: tokio::sync::oneshot::Sender<Arc<ClonepackManifest>>,
     ) -> tokio::task::JoinHandle<Result<Arc<ClonepackManifest>>> {
         tokio::spawn(async move {
-            let data = self
-                .fetch_artifact_with_url(&hash, signed_url.as_deref())
+            let manifest = self
+                .fetch_validated_manifest(&hash, signed_url.as_deref(), &pinned)
                 .await
                 .context("fetch clonepack manifest")?;
-            let mut manifest =
-                ClonepackManifest::decode(data.as_ref()).context("decode clonepack manifest")?;
-            // Backwards compatibility: older manifests store the head-blobs pack as
-            // a single `head_blobs_pack` field. Treat it as one chunk so the
-            // pipeline can use it without special cases.
-            if manifest.head_blobs_chunks.is_empty()
-                && let Some(pack) = manifest.head_blobs_pack.take()
-            {
-                manifest.head_blobs_chunks.push(pack);
-            }
             let manifest = Arc::new(manifest);
             // Hand the manifest to the downloader. Ignore the error: the receiver
             // is absent in non-archive modes. On the failure paths above, the
@@ -2698,6 +3284,12 @@ impl Client {
             anyhow::bail!("ref is missing clonepack manifest; run sync first");
         }
 
+        // Validate the manifest identity before creating or modifying the git
+        // directory. Remote-helper failures must not leave a partial seed that
+        // claims the pinned commit while containing another commit's objects.
+        let dl_start = Instant::now();
+        let (clonepack, metadata) = self.fetch_clonepack(info).await?;
+
         std::fs::create_dir_all(&git_dir)?;
         std::fs::create_dir_all(git_dir.join("refs").join("heads"))?;
         std::fs::create_dir_all(git_dir.join("refs").join("tags"))?;
@@ -2730,8 +3322,6 @@ impl Client {
         let pack_dir = git_dir.join("objects").join("pack");
         std::fs::create_dir_all(&pack_dir)?;
 
-        let dl_start = Instant::now();
-        let (clonepack, metadata) = self.fetch_clonepack(info).await?;
         info!(
             "downloaded metadata chunk ({} bytes) in {:?}",
             metadata.skeleton_pack.len()
@@ -3175,6 +3765,147 @@ mod tests {
     fn retry_decision_never_retries_a_non_stale_error() {
         let other = anyhow::anyhow!("repo not found");
         assert!(!should_retry_stale(0, 2, &other));
+    }
+
+    #[tokio::test]
+    async fn cancelled_join_keeps_blocking_sibling_armed_until_retry_cleanup() {
+        let cleanup = AttemptCleanup::default();
+        let fixture = tempfile::tempdir().unwrap();
+        let target = fixture.path().join("target");
+        let staging_owner = tempfile::Builder::new()
+            .prefix("clone.")
+            .tempdir_in(fixture.path())
+            .unwrap();
+        let staging = staging_owner.path().to_path_buf();
+        let staging_worker = staging.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let sibling = AbortOnDrop::new(
+            tokio::task::spawn_blocking(move || {
+                std::fs::write(staging_worker.join("partial"), b"started").unwrap();
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                std::fs::write(staging_worker.join("late-write"), b"finished").unwrap();
+                Ok::<(), anyhow::Error>(())
+            }),
+            cleanup.clone(),
+        );
+        let stale = AbortOnDrop::new(
+            tokio::spawn(async move {
+                started_rx.await.unwrap();
+                Err::<(), anyhow::Error>(anyhow::Error::new(StaleSignedUrl))
+            }),
+            cleanup.clone(),
+        );
+
+        let stale_join = async {
+            stale.join().await.context("join stale task")??;
+            Ok::<(), anyhow::Error>(())
+        };
+        let sibling_join = async {
+            sibling.join().await.context("join blocking sibling")??;
+            Ok::<(), anyhow::Error>(())
+        };
+        let error = tokio::try_join!(stale_join, sibling_join)
+            .expect_err("stale task cancels the sibling join future");
+        assert!(is_stale_signed_url(&error));
+
+        let cleanup_wait = cleanup.clone();
+        let next_attempt_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let next_attempt_flag = Arc::clone(&next_attempt_started);
+        let staging_after_cleanup = staging.clone();
+        let mut drain_then_retry = Box::pin(async move {
+            cleanup_wait.drain().await;
+            drop(staging_owner);
+            assert!(!staging_after_cleanup.exists());
+            next_attempt_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut drain_then_retry)
+                .await
+                .is_err(),
+            "retry cleanup must wait for the cancelled join's blocking sibling"
+        );
+        assert!(!next_attempt_started.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(staging.exists());
+        assert!(!target.exists());
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), drain_then_retry)
+            .await
+            .expect("blocking sibling joined before retry");
+        assert!(next_attempt_started.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!staging.exists());
+        assert!(!target.exists());
+    }
+
+    #[tokio::test]
+    async fn cancelled_clone_reaper_joins_worker_before_removing_staging() {
+        let cleanup = AttemptCleanup::default();
+        let fixture = tempfile::tempdir().unwrap();
+        let target = fixture.path().join("target");
+        let staging_owner = tempfile::Builder::new()
+            .prefix("clone.")
+            .tempdir_in(fixture.path())
+            .unwrap();
+        let staging_path = staging_owner.path().to_path_buf();
+        let staging = Arc::new(Mutex::new(Some(AttemptStaging {
+            overlay_dirs: None,
+            temp_install: Some(staging_owner),
+        })));
+        let mut reaper = spawn_attempt_reaper(cleanup.clone(), Arc::clone(&staging));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker_path = staging_path.clone();
+        let operation_cleanup = cleanup.clone();
+        let mut operation = tokio::spawn(async move {
+            let _close_on_drop = CloseAttemptOnDrop(operation_cleanup.clone());
+            let _worker = AbortOnDrop::new(
+                tokio::task::spawn_blocking(move || {
+                    std::fs::write(worker_path.join("partial"), b"started").unwrap();
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    std::fs::write(worker_path.join("late-write"), b"finished").unwrap();
+                }),
+                operation_cleanup,
+            );
+            std::future::pending::<()>().await;
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), started_rx)
+            .await
+            .expect("blocking worker started")
+            .expect("worker start signal");
+        operation.abort();
+        tokio::time::timeout(std::time::Duration::from_secs(1), &mut operation)
+            .await
+            .expect("cancelled clone task joined")
+            .expect_err("clone task was cancelled");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut reaper)
+                .await
+                .is_err(),
+            "operation cancellation must not remove staging before blocking work exits"
+        );
+        assert!(staging_path.exists());
+        assert!(!target.exists());
+
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), &mut reaper)
+            .await
+            .expect("cancelled clone reaper completed")
+            .expect("reaper task joined");
+        assert!(!staging_path.exists());
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn manifest_commit_must_match_the_operation_pin() {
+        let manifest = ClonepackManifest {
+            commit: "b".repeat(40),
+            ..Default::default()
+        };
+        let error = validate_manifest_commit(&manifest, &"a".repeat(40)).unwrap_err();
+        assert!(format!("{error:#}").contains("clonepack integrity error"));
     }
 
     /// A first-run user who points at a server that isn't running (or a wrong

@@ -105,6 +105,7 @@ async fn start_repo_auth_server(provider_url: &str) -> Server {
         storage_dir: cas_dir.clone(),
         cas_dir,
         repo_root,
+        pinned_path_probe: None,
         _dir: dir,
     }
 }
@@ -437,7 +438,7 @@ async fn expired_bearer_token_fails_clone_cleanly() {
     let target = out.path().join("clone");
     let clone_target = target.clone();
     let repo_path = "acme/jwtexp".to_string();
-    let clone_task = tokio::spawn(async move {
+    let mut clone_task = tokio::spawn(async move {
         client
             .install_repo_with_mode_at(
                 &repo_path,
@@ -453,7 +454,15 @@ async fn expired_bearer_token_fails_clone_cleanly() {
 
     // Wait until the server has sent the first bytes and is stalled mid-body,
     // then wait until the JWT has definitely expired before releasing the barrier.
-    entered_rx.await.expect("barrier entered");
+    if !matches!(
+        tokio::time::timeout(Duration::from_secs(20), entered_rx).await,
+        Ok(Ok(()))
+    ) {
+        clone_task.abort();
+        let _ = tokio::time::timeout(Duration::from_secs(5), &mut clone_task).await;
+        unsafe { std::env::remove_var("RIPCLONE_JWT_TTL_SECS") };
+        panic!("clone did not reach the artifact barrier within 20 seconds");
+    }
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time")
@@ -463,7 +472,15 @@ async fn expired_bearer_token_fails_clone_cleanly() {
     }
     proceed_tx.send(()).expect("release barrier");
 
-    let res = clone_task.await.expect("clone task joined");
+    let res = match tokio::time::timeout(Duration::from_secs(20), &mut clone_task).await {
+        Ok(joined) => joined.expect("clone task joined"),
+        Err(_) => {
+            clone_task.abort();
+            let _ = tokio::time::timeout(Duration::from_secs(5), &mut clone_task).await;
+            unsafe { std::env::remove_var("RIPCLONE_JWT_TTL_SECS") };
+            panic!("expired-bearer clone did not finish within 20 seconds");
+        }
+    };
     unsafe { std::env::remove_var("RIPCLONE_JWT_TTL_SECS") };
 
     assert!(

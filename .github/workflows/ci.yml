@@ -263,13 +263,14 @@ jobs:
     needs: [changes, s3gc-tests, ci-build]
     if: ${{ needs.changes.outputs.docker == 'true' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 8
     strategy:
       fail-fast: false
       matrix:
         test: ${{ fromJSON(needs.s3gc-tests.outputs.tests) }}
     services:
       minio:
-        image: minio/minio:latest
+        image: minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
         command: server /data
         env:
           MINIO_ROOT_USER: minioadmin
@@ -301,6 +302,7 @@ jobs:
           aws --endpoint-url http://127.0.0.1:9000 --region us-east-1 s3 mb "s3://${SHARD_BUCKET}"
           echo "RIPCLONE_S3_BUCKET=${SHARD_BUCKET}" >> "$GITHUB_ENV"
       - name: S3 GC e2e against MinIO (${{ matrix.test }})
+        timeout-minutes: 6
         env:
           S3GC_TEST_BIN: ${{ github.workspace }}/bin/e2e_remote_gc_s3
           CARGO_BIN_EXE_ripclone: ${{ github.workspace }}/bin/ripclone

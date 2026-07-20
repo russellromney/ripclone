@@ -139,6 +139,23 @@ s3gc() {
     filter+=(--exact "$test_name")
   fi
 
+  if [ -n "$test_name" ]; then
+    local listed
+    if [ -n "${S3GC_TEST_BIN:-}" ]; then
+      listed="$(timeout 60 "$S3GC_TEST_BIN" --ignored --list)"
+    else
+      listed="$(cd "$ROOT/rust" && timeout 60 cargo test --profile ci --locked --test e2e_remote_gc_s3 -- --ignored --list)"
+    fi
+    if ! grep -Fqx "$test_name: test" <<<"$listed"; then
+      echo "error: exact S3 test '$test_name' is missing" >&2
+      exit 1
+    fi
+  fi
+
+  local log
+  log="$(mktemp "${TMPDIR:-/tmp}/ripclone-s3gc.XXXXXX")"
+  local rc
+  local timeout_secs="${S3GC_TIMEOUT_SECS:-300}"
   if [ -n "${S3GC_TEST_BIN:-}" ]; then
     if [ ! -x "$S3GC_TEST_BIN" ]; then
       echo "error: S3GC_TEST_BIN=$S3GC_TEST_BIN is not executable" >&2
@@ -146,10 +163,38 @@ s3gc() {
     fi
     echo "s3gc: running prebuilt $S3GC_TEST_BIN ${filter[*]}"
     # Liberate from cargo so the binary's cwd/tmp behavior matches a direct run.
-    ( cd "$ROOT/rust" && "$S3GC_TEST_BIN" "${filter[@]}" )
+    set +e
+    (cd "$ROOT/rust" && timeout "$timeout_secs" "$S3GC_TEST_BIN" "${filter[@]}") 2>&1 | tee "$log"
+    rc=${PIPESTATUS[0]}
+    set -e
   else
-    ( cd "$ROOT/rust" && cargo test --profile ci --locked --test e2e_remote_gc_s3 -- "${filter[@]}" )
+    set +e
+    (cd "$ROOT/rust" && timeout "$timeout_secs" cargo test --profile ci --locked --test e2e_remote_gc_s3 -- "${filter[@]}") 2>&1 | tee "$log"
+    rc=${PIPESTATUS[0]}
+    set -e
   fi
+  if [ "$rc" -ne 0 ]; then
+    rm -f "$log"
+    return "$rc"
+  fi
+  if grep -Fq "SKIP" "$log"; then
+    echo "error: S3 proof emitted SKIP" >&2
+    rm -f "$log"
+    exit 1
+  fi
+  if [ -n "$test_name" ]; then
+    grep -Fq "running 1 test" "$log" || {
+      echo "error: exact S3 filter ran zero or multiple tests" >&2
+      rm -f "$log"
+      exit 1
+    }
+    grep -Eq "test result: ok\. 1 passed; 0 failed;" "$log" || {
+      echo "error: exact S3 proof did not report one passing test" >&2
+      rm -f "$log"
+      exit 1
+    }
+  fi
+  rm -f "$log"
 }
 
 case "$STAGE" in
