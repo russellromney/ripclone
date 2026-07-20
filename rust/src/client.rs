@@ -17,6 +17,7 @@ use sha2::Digest as Sha2Digest;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tracing::{info, warn};
@@ -39,8 +40,6 @@ struct ServerError {
 struct ArtifactPendingResponse {
     code: String,
     commit: String,
-    #[serde(default)]
-    branch: Option<String>,
 }
 
 /// The selected artifact is not yet available for the commit this clone pinned.
@@ -673,8 +672,16 @@ struct InstallIdentity {
 
 type CleanupFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 
+#[derive(Default)]
+struct AttemptCleanupInner {
+    pending: Mutex<Vec<CleanupFuture>>,
+    active_guards: AtomicUsize,
+    closed: AtomicBool,
+    changed: tokio::sync::Notify,
+}
+
 #[derive(Clone, Default)]
-struct AttemptCleanup(Arc<Mutex<Vec<CleanupFuture>>>);
+struct AttemptCleanup(Arc<AttemptCleanupInner>);
 
 #[derive(Default)]
 struct AttemptStaging {
@@ -682,11 +689,48 @@ struct AttemptStaging {
     temp_install: Option<tempfile::TempDir>,
 }
 
+type SharedAttemptStaging = Arc<Mutex<Option<AttemptStaging>>>;
+
+fn spawn_attempt_reaper(
+    cleanup: AttemptCleanup,
+    staging: SharedAttemptStaging,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        cleanup.drain_closed().await;
+        let staging = staging.lock().unwrap_or_else(|e| e.into_inner()).take();
+        drop(staging);
+    })
+}
+
 impl AttemptCleanup {
+    fn guard_started(&self) {
+        self.0.active_guards.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn guard_finished(&self) {
+        let previous = self.0.active_guards.fetch_sub(1, Ordering::SeqCst);
+        debug_assert!(previous > 0, "attempt cleanup guard underflow");
+        self.0.changed.notify_one();
+    }
+
+    fn push(&self, future: CleanupFuture) {
+        self.0
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(future);
+        self.0.changed.notify_one();
+    }
+
+    fn close(&self) {
+        self.0.closed.store(true, Ordering::SeqCst);
+        self.0.changed.notify_one();
+    }
+
     async fn drain(&self) {
         loop {
             let pending = {
-                let mut pending = self.0.lock().unwrap_or_else(|e| e.into_inner());
+                let mut pending = self.0.pending.lock().unwrap_or_else(|e| e.into_inner());
                 std::mem::take(&mut *pending)
             };
             if pending.is_empty() {
@@ -698,6 +742,31 @@ impl AttemptCleanup {
             futures::future::join_all(pending).await;
         }
     }
+
+    async fn drain_closed(&self) {
+        loop {
+            let changed = self.0.changed.notified();
+            self.drain().await;
+            if self.0.closed.load(Ordering::SeqCst)
+                && self.0.active_guards.load(Ordering::SeqCst) == 0
+            {
+                // No guard can enqueue after the attempt is closed and all
+                // registered guards have finished. One last drain closes the
+                // race with a guard that enqueued immediately before decrement.
+                self.drain().await;
+                return;
+            }
+            changed.await;
+        }
+    }
+}
+
+struct CloseAttemptOnDrop(AttemptCleanup);
+
+impl Drop for CloseAttemptOnDrop {
+    fn drop(&mut self) {
+        self.0.close();
+    }
 }
 
 struct AbortOnDrop<T: Send + 'static> {
@@ -707,6 +776,7 @@ struct AbortOnDrop<T: Send + 'static> {
 
 impl<T: Send + 'static> AbortOnDrop<T> {
     fn new(handle: tokio::task::JoinHandle<T>, cleanup: AttemptCleanup) -> Self {
+        cleanup.guard_started();
         Self {
             handle: Some(handle),
             cleanup,
@@ -716,6 +786,7 @@ impl<T: Send + 'static> AbortOnDrop<T> {
     async fn join(mut self) -> std::result::Result<T, tokio::task::JoinError> {
         let result = self.handle.as_mut().expect("join handle present").await;
         self.handle.take();
+        self.cleanup.guard_finished();
         result
     }
 }
@@ -724,17 +795,14 @@ impl<T: Send + 'static> Drop for AbortOnDrop<T> {
     fn drop(&mut self) {
         if let Some(handle) = self.handle.take() {
             handle.abort();
-            self.cleanup
-                .0
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push(Box::pin(async move {
-                    // `abort` cancels async tasks immediately. A blocking task
-                    // already running cannot be cancelled, so awaiting its
-                    // handle is what prevents a stale-URL retry from overlapping
-                    // the prior attempt's archive or pack worker.
-                    let _ = handle.await;
-                }));
+            self.cleanup.push(Box::pin(async move {
+                // `abort` cancels async tasks immediately. A blocking task
+                // already running cannot be cancelled, so awaiting its
+                // handle is what prevents a stale-URL retry from overlapping
+                // the prior attempt's archive or pack worker.
+                let _ = handle.await;
+            }));
+            self.cleanup.guard_finished();
         }
     }
 }
@@ -963,6 +1031,16 @@ impl Client {
             let resp = self.send(self.request(reqwest::Method::GET, &url)).await?;
             let status = resp.status();
             if status == reqwest::StatusCode::ACCEPTED {
+                let pending_branch = resp
+                    .headers()
+                    .get(reqwest::header::CONTENT_LOCATION)
+                    .map(|value| {
+                        value
+                            .to_str()
+                            .context("invalid Content-Location on pending ref response")
+                            .map(str::to_string)
+                    })
+                    .transpose()?;
                 let pending: ArtifactPendingResponse = resp.json().await.with_context(|| {
                     format!("invalid protocol-2 pending response for {repo_path}")
                 })?;
@@ -984,7 +1062,7 @@ impl Client {
                 } else {
                     *pinned = Some(pending.commit.clone());
                 }
-                if let Some(response_branch) = pending.branch.filter(|value| !value.is_empty()) {
+                if let Some(response_branch) = pending_branch.filter(|value| !value.is_empty()) {
                     crate::validation::validate_git_rev(&response_branch)
                         .with_context(|| format!("invalid pending branch for {repo_path}"))?;
                     if let Some(expected) = resolved_branch.as_deref() {
@@ -1568,7 +1646,6 @@ impl Client {
                     &cleanup,
                 )
                 .await;
-            cleanup.drain().await;
             match result {
                 Ok(outcome) => return Ok(outcome),
                 Err(error) if should_retry_stale(stale_retries, STALE_URL_MAX_RETRIES, &error) => {
@@ -1604,23 +1681,16 @@ impl Client {
         // Staging owns filesystem cleanup outside the inner attempt future.
         // Task guards unwind first; blocking workers are then joined; only
         // after that is it safe to remove a temp tree or unmounted overlay.
-        let mut staging = AttemptStaging::default();
+        let staging = Arc::new(Mutex::new(Some(AttemptStaging::default())));
+        let reaper = spawn_attempt_reaper(cleanup.clone(), Arc::clone(&staging));
+        let close_on_drop = CloseAttemptOnDrop(cleanup.clone());
         let result = self
             .install_repo_with_mode_at_attempt_inner(
-                repo_path,
-                branch,
-                rev,
-                target,
-                mode,
-                clonepack,
-                bench,
-                identity,
-                cleanup,
-                &mut staging,
+                repo_path, branch, rev, target, mode, clonepack, bench, identity, cleanup, &staging,
             )
             .await;
-        cleanup.drain().await;
-        drop(staging);
+        drop(close_on_drop);
+        reaper.await.context("attempt cleanup task")?;
         result
     }
 
@@ -1636,7 +1706,7 @@ impl Client {
         bench: Option<&mut Benchmark>,
         identity: &mut InstallIdentity,
         cleanup: &AttemptCleanup,
-        staging: &mut AttemptStaging,
+        staging: &SharedAttemptStaging,
     ) -> Result<CloneOutcome> {
         let target = target.as_ref().to_path_buf();
         info!(
@@ -1841,7 +1911,7 @@ impl Client {
         let use_overlay =
             mode.needs_worktree() && self.should_use_overlay(&metadata, &staging_dir).await;
 
-        staging.overlay_dirs = if use_overlay {
+        let overlay_dirs = if use_overlay {
             Some(
                 overlay::OverlayDirs::create(&staging_dir, &target)
                     .context("create overlay staging dirs")?,
@@ -1849,16 +1919,28 @@ impl Client {
         } else {
             None
         };
+        let overlay_lower = overlay_dirs.as_ref().map(|dirs| dirs.lower.clone());
+        staging
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+            .expect("attempt staging present")
+            .overlay_dirs = overlay_dirs;
 
         // Hold the temp-dir handle for the whole install so any early failure
         // removes the partial directory on drop. After a successful rename onto
         // `target`, its drop is a no-op.
-        let install_root = if let Some(ref dirs) = staging.overlay_dirs {
-            dirs.lower.clone()
+        let install_root = if let Some(lower) = overlay_lower {
+            lower
         } else {
             let tmp = temp_install_dir(&target)?;
             let path = tmp.path().to_path_buf();
-            staging.temp_install = Some(tmp);
+            staging
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_mut()
+                .expect("attempt staging present")
+                .temp_install = Some(tmp);
             path
         };
         let git_dir = install_root.join(".git");
@@ -2013,7 +2095,14 @@ impl Client {
             self.write_origin_config(&origin_url, &git_dir)?;
         }
 
-        if let Some(dirs) = staging.overlay_dirs.take() {
+        let overlay_dirs = staging
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+            .expect("attempt staging present")
+            .overlay_dirs
+            .take();
+        if let Some(dirs) = overlay_dirs {
             overlay::mount_dirs(&dirs).context("mount overlay at target")?;
             // Mount succeeded; keep the staging tree (it backs the mount). Any
             // failure before this point drops `dirs` and removes the staging.
@@ -3730,6 +3819,66 @@ mod tests {
             .expect("blocking sibling joined before retry");
         assert!(next_attempt_started.load(std::sync::atomic::Ordering::SeqCst));
         assert!(!staging.exists());
+        assert!(!target.exists());
+    }
+
+    #[tokio::test]
+    async fn cancelled_clone_reaper_joins_worker_before_removing_staging() {
+        let cleanup = AttemptCleanup::default();
+        let fixture = tempfile::tempdir().unwrap();
+        let target = fixture.path().join("target");
+        let staging_owner = tempfile::Builder::new()
+            .prefix("clone.")
+            .tempdir_in(fixture.path())
+            .unwrap();
+        let staging_path = staging_owner.path().to_path_buf();
+        let staging = Arc::new(Mutex::new(Some(AttemptStaging {
+            overlay_dirs: None,
+            temp_install: Some(staging_owner),
+        })));
+        let mut reaper = spawn_attempt_reaper(cleanup.clone(), Arc::clone(&staging));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker_path = staging_path.clone();
+        let operation_cleanup = cleanup.clone();
+        let mut operation = tokio::spawn(async move {
+            let _close_on_drop = CloseAttemptOnDrop(operation_cleanup.clone());
+            let _worker = AbortOnDrop::new(
+                tokio::task::spawn_blocking(move || {
+                    std::fs::write(worker_path.join("partial"), b"started").unwrap();
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    std::fs::write(worker_path.join("late-write"), b"finished").unwrap();
+                }),
+                operation_cleanup,
+            );
+            std::future::pending::<()>().await;
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), started_rx)
+            .await
+            .expect("blocking worker started")
+            .expect("worker start signal");
+        operation.abort();
+        tokio::time::timeout(std::time::Duration::from_secs(1), &mut operation)
+            .await
+            .expect("cancelled clone task joined")
+            .expect_err("clone task was cancelled");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut reaper)
+                .await
+                .is_err(),
+            "operation cancellation must not remove staging before blocking work exits"
+        );
+        assert!(staging_path.exists());
+        assert!(!target.exists());
+
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), &mut reaper)
+            .await
+            .expect("cancelled clone reaper completed")
+            .expect("reaper task joined");
+        assert!(!staging_path.exists());
         assert!(!target.exists());
     }
 

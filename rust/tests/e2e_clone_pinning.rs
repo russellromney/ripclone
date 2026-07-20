@@ -37,12 +37,23 @@ async fn scripted_ref(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .push(uri.to_string());
-    let (status, body) = state
+    let (status, mut body) = state
         .responses
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(0);
-    (status, Json(body))
+    let content_location = body
+        .as_object_mut()
+        .and_then(|object| object.remove("__content_location"))
+        .and_then(|value| value.as_str().map(str::to_string));
+    let mut response = (status, Json(body)).into_response();
+    if let Some(content_location) = content_location {
+        response.headers_mut().insert(
+            axum::http::header::CONTENT_LOCATION,
+            content_location.parse().expect("valid branch hint"),
+        );
+    }
+    response
 }
 
 async fn scripted_server(
@@ -74,11 +85,16 @@ fn pending(commit: &str) -> (StatusCode, serde_json::Value) {
         json!({
             "code": "artifact_pending",
             "commit": commit,
-            "branch": "main",
             "status": "building",
             "queue_depth": 1
         }),
     )
+}
+
+fn pending_on(commit: &str, branch: &str) -> (StatusCode, serde_json::Value) {
+    let (status, mut body) = pending(commit);
+    body["__content_location"] = json!(branch);
+    (status, body)
 }
 
 fn ready(commit: &str) -> (StatusCode, serde_json::Value) {
@@ -572,7 +588,7 @@ async fn pending_head_switches_pinned_polls_to_the_concrete_branch() {
         std::env::set_var("RIPCLONE_TESTING", "1");
         std::env::set_var("RIPCLONE_TEST_REF_POLL_MS", "0");
     }
-    let (url, requests, task) = scripted_server(vec![pending(A), ready(A)]).await;
+    let (url, requests, task) = scripted_server(vec![pending_on(A, "main"), ready(A)]).await;
     Client::new(url)
         .resolve_ref_with_clonepack("acme/demo", "HEAD", Some("full"), Some("HEAD~1"))
         .await

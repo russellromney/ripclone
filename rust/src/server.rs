@@ -409,7 +409,6 @@ pub struct BuildResponse {
 pub struct ArtifactPendingResponse {
     pub code: &'static str,
     pub commit: String,
-    pub branch: String,
     pub status: &'static str,
     pub queue_depth: usize,
 }
@@ -2512,17 +2511,22 @@ fn request_protocol(headers: &HeaderMap) -> Option<u32> {
 }
 
 fn artifact_pending_response(commit: &str, branch: &str, queue_depth: usize) -> Response {
-    (
+    let mut response = (
         StatusCode::ACCEPTED,
         Json(ArtifactPendingResponse {
             code: "artifact_pending",
             commit: commit.to_string(),
-            branch: branch.to_string(),
             status: "building",
             queue_depth,
         }),
     )
-        .into_response()
+        .into_response();
+    if let Ok(value) = branch.parse() {
+        response
+            .headers_mut()
+            .insert(axum::http::header::CONTENT_LOCATION, value);
+    }
+    response
 }
 
 /// A post-pin lookup performs only a fixed set of repo-scoped point reads.
@@ -8453,6 +8457,29 @@ mod tests {
         assert!(decoded.full_clonepack.commit.is_empty());
         assert!(exact_ref_info_serves_commit(&decoded, "full", &commit));
         assert_eq!(selected_clonepack_commit(&decoded, "full"), commit);
+    }
+
+    #[tokio::test]
+    async fn protocol_two_pending_body_keeps_the_four_field_shape() {
+        let response = artifact_pending_response(&"a".repeat(40), "main", 3);
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_LOCATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("main")
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read pending body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("pending JSON");
+        let keys = body.as_object().expect("pending object");
+        assert_eq!(keys.len(), 4);
+        assert_eq!(body["code"], "artifact_pending");
+        assert_eq!(body["commit"], "a".repeat(40));
+        assert_eq!(body["status"], "building");
+        assert_eq!(body["queue_depth"], 3);
     }
 
     // Classification must be TYPE-based (downcast at the do_sync error boundary),
