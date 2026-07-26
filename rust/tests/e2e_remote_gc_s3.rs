@@ -10,6 +10,11 @@
 mod common;
 
 use anyhow::{Context, Result, bail};
+use axum::Router;
+use axum::body::Bytes;
+use axum::extract::{OriginalUri, State};
+use axum::http::{HeaderMap, Method, StatusCode};
+use axum::routing::any;
 use common::*;
 use ripclone::auth::access::{AccessDecision, AccessVerifier};
 use ripclone::mode::CloneMode;
@@ -375,6 +380,8 @@ pub async fn start_delay_proxy(target_endpoint: &str, delay: Duration) -> DelayP
 struct BarrierState {
     after_bytes: usize,
     close_on_proceed: bool,
+    arm_marker: Option<std::path::PathBuf>,
+    request_fragment: Option<String>,
     entered: Option<tokio::sync::oneshot::Sender<()>>,
     proceed: Option<tokio::sync::oneshot::Receiver<()>>,
     consumed: std::sync::atomic::AtomicBool,
@@ -384,7 +391,212 @@ struct BarrierState {
 pub struct BarrierProxy {
     pub url: String,
     state: Arc<std::sync::Mutex<BarrierState>>,
-    _handle: tokio::task::JoinHandle<()>,
+    handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+#[derive(Clone)]
+struct RefTraceState {
+    upstream: String,
+    refs: Arc<std::sync::Mutex<Vec<String>>>,
+    metrics: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    first_ref: Arc<std::sync::atomic::AtomicBool>,
+    ready_count: Arc<std::sync::atomic::AtomicUsize>,
+    pinned_count: Arc<std::sync::atomic::AtomicUsize>,
+    refresh_pinned_index: usize,
+    refresh_entered: Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+    refresh_proceed: Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
+    force_first_pending: bool,
+}
+
+async fn ref_trace_forward(
+    State(state): State<RefTraceState>,
+    method: Method,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> axum::response::Response {
+    let is_ref = uri.path().contains("/refs/");
+    let is_metrics = uri.path().contains("/v1/clones/") && uri.path().ends_with("/metrics");
+    if is_ref {
+        state
+            .refs
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(uri.to_string());
+        if uri.query().is_some_and(|query| query.contains("pinned=")) {
+            let pinned_index = state.pinned_count.fetch_add(1, Ordering::SeqCst);
+            if pinned_index == state.refresh_pinned_index {
+                if let Some(entered) = state
+                    .refresh_entered
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .take()
+                {
+                    let _ = entered.send(());
+                }
+                if let Some(proceed) = state.refresh_proceed.lock().await.take() {
+                    tokio::time::timeout(Duration::from_secs(30), proceed)
+                        .await
+                        .expect("traced refresh released within 30 seconds")
+                        .expect("traced refresh barrier sender remained alive");
+                }
+            }
+        }
+    }
+    if is_metrics && let Ok(value) = serde_json::from_slice::<serde_json::Value>(&body) {
+        state
+            .metrics
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(value);
+    }
+
+    let url = format!("{}{}", state.upstream, uri);
+    let mut request = reqwest::Client::new().request(method, url).body(body);
+    for (name, value) in &headers {
+        if name != axum::http::header::HOST {
+            request = request.header(name, value);
+        }
+    }
+    let response = request.send().await.expect("forward traced request");
+    let mut status = response.status();
+    let response_headers = response.headers().clone();
+    let mut bytes = response.bytes().await.expect("read traced response");
+    let transform_pending =
+        is_ref && state.force_first_pending && !state.first_ref.swap(true, Ordering::SeqCst);
+    if transform_pending {
+        let ready: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("first traced ref is ready JSON");
+        let commit = ready["commit"].as_str().expect("ready commit");
+        let branch = ready["branch"].as_str().expect("ready branch");
+        status = StatusCode::ACCEPTED;
+        bytes = Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "code": "artifact_pending",
+                "commit": commit,
+                "status": "building",
+                "queue_depth": 1
+            }))
+            .expect("encode traced pending response"),
+        );
+        let output = axum::http::Response::builder()
+            .status(status)
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .header(
+                axum::http::header::CONTENT_LOCATION,
+                urlencoding::encode(branch).as_ref(),
+            );
+        return output
+            .body(axum::body::Body::from(bytes))
+            .expect("pending trace response");
+    }
+
+    let mut output = axum::http::Response::builder().status(status);
+    if let Some(value) = response_headers.get(axum::http::header::CONTENT_TYPE) {
+        output = output.header(axum::http::header::CONTENT_TYPE, value);
+    }
+    if is_ref && status == StatusCode::OK {
+        let ready_index = state.ready_count.fetch_add(1, Ordering::SeqCst);
+        let clone_id = if ready_index == 0 {
+            "first-clone-id"
+        } else {
+            "refresh-clone-id"
+        };
+        output = output.header("x-ripclone-clone-id", clone_id);
+    }
+    output
+        .body(axum::body::Body::from(bytes))
+        .expect("traced response")
+}
+
+struct RefTraceProxy {
+    url: String,
+    state: RefTraceState,
+    handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl RefTraceProxy {
+    fn refs(&self) -> Vec<String> {
+        self.state
+            .refs
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    fn metrics(&self) -> Vec<serde_json::Value> {
+        self.state
+            .metrics
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    async fn shutdown(mut self) {
+        if let Some(mut handle) = self.handle.take() {
+            handle.abort();
+            let joined = tokio::time::timeout(Duration::from_secs(5), &mut handle)
+                .await
+                .expect("ref trace proxy joined within five seconds");
+            assert!(joined.is_err(), "aborted ref trace unexpectedly succeeded");
+        }
+    }
+}
+
+impl Drop for RefTraceProxy {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
+}
+
+async fn start_ref_trace_proxy(
+    upstream: &str,
+    force_first_pending: bool,
+    pause_refresh: bool,
+) -> (
+    RefTraceProxy,
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ref trace proxy");
+    let address = listener.local_addr().expect("ref trace address");
+    let (refresh_tx, refresh_rx) = tokio::sync::oneshot::channel();
+    let (refresh_proceed_tx, refresh_proceed_rx) = tokio::sync::oneshot::channel();
+    let state = RefTraceState {
+        upstream: upstream.to_string(),
+        refs: Arc::new(std::sync::Mutex::new(Vec::new())),
+        metrics: Arc::new(std::sync::Mutex::new(Vec::new())),
+        first_ref: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        ready_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        pinned_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        refresh_pinned_index: usize::from(force_first_pending),
+        refresh_entered: Arc::new(std::sync::Mutex::new(Some(refresh_tx))),
+        refresh_proceed: Arc::new(tokio::sync::Mutex::new(
+            pause_refresh.then_some(refresh_proceed_rx),
+        )),
+        force_first_pending,
+    };
+    let app = Router::new()
+        .route("/{*path}", any(ref_trace_forward))
+        .with_state(state.clone());
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve ref trace proxy");
+    });
+    (
+        RefTraceProxy {
+            url: format!("http://{address}"),
+            state,
+            handle: Some(handle),
+        },
+        refresh_rx,
+        refresh_proceed_tx,
+    )
 }
 
 impl BarrierProxy {
@@ -395,11 +607,26 @@ impl BarrierProxy {
             .signed_headers
             .clone()
     }
+
+    async fn shutdown(mut self) {
+        if let Some(mut handle) = self.handle.take() {
+            handle.abort();
+            let joined = tokio::time::timeout(Duration::from_secs(5), &mut handle)
+                .await
+                .expect("barrier proxy joined within five seconds");
+            assert!(
+                joined.is_err(),
+                "aborted barrier proxy unexpectedly succeeded"
+            );
+        }
+    }
 }
 
 impl Drop for BarrierProxy {
     fn drop(&mut self) {
-        self._handle.abort();
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
     }
 }
 
@@ -429,11 +656,12 @@ async fn proxy_signed_get_barrier(
     barrier: Arc<std::sync::Mutex<BarrierState>>,
 ) {
     eprintln!("BARRIER PROXY: signed GET received");
+    let request_header = String::from_utf8_lossy(&header).into_owned();
     barrier
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .signed_headers
-        .push(String::from_utf8_lossy(&header).into_owned());
+        .push(request_header.clone());
     let Ok(mut backend) = tokio::net::TcpStream::connect(target).await else {
         return;
     };
@@ -465,18 +693,23 @@ async fn proxy_signed_get_barrier(
     }
     let mut pending_body: Vec<u8> = leftover.to_vec();
 
-    let (after_bytes, close_on_proceed, entered, proceed) = {
+    let (after_bytes, close_on_proceed, entered, proceed, arm_marker) = {
         let mut b = barrier.lock().unwrap();
-        if !b.consumed.load(std::sync::atomic::Ordering::SeqCst) {
+        let selected = b
+            .request_fragment
+            .as_ref()
+            .is_none_or(|fragment| request_header.contains(fragment));
+        if selected && !b.consumed.load(std::sync::atomic::Ordering::SeqCst) {
             b.consumed.store(true, std::sync::atomic::Ordering::SeqCst);
             (
                 b.after_bytes,
                 b.close_on_proceed,
                 b.entered.take(),
                 b.proceed.take(),
+                b.arm_marker.clone(),
             )
         } else {
-            (usize::MAX, false, None, None)
+            (usize::MAX, false, None, None, None)
         }
     };
 
@@ -515,12 +748,24 @@ async fn proxy_signed_get_barrier(
         copied += take;
     }
 
+    if let Some(marker) = arm_marker {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while !marker.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("selected signed request overlapped a staging writer");
+    }
     if let Some(entered) = entered {
         eprintln!("BARRIER PROXY: entered barrier after {copied} bytes");
         let _ = entered.send(());
     }
     let should_continue = if let Some(proceed) = proceed {
-        proceed.await.is_ok() && !close_on_proceed
+        matches!(
+            tokio::time::timeout(Duration::from_secs(30), proceed).await,
+            Ok(Ok(()))
+        ) && !close_on_proceed
     } else {
         false
     };
@@ -574,6 +819,48 @@ pub async fn start_barrier_proxy(
     entered: tokio::sync::oneshot::Sender<()>,
     proceed: tokio::sync::oneshot::Receiver<()>,
 ) -> BarrierProxy {
+    start_barrier_proxy_inner(
+        target_endpoint,
+        after_bytes,
+        close_on_proceed,
+        entered,
+        proceed,
+        None,
+        None,
+    )
+    .await
+}
+
+async fn start_barrier_proxy_for_request_after_marker(
+    target_endpoint: &str,
+    after_bytes: usize,
+    close_on_proceed: bool,
+    entered: tokio::sync::oneshot::Sender<()>,
+    proceed: tokio::sync::oneshot::Receiver<()>,
+    arm_marker: std::path::PathBuf,
+    request_fragment: String,
+) -> BarrierProxy {
+    start_barrier_proxy_inner(
+        target_endpoint,
+        after_bytes,
+        close_on_proceed,
+        entered,
+        proceed,
+        Some(arm_marker),
+        Some(request_fragment),
+    )
+    .await
+}
+
+async fn start_barrier_proxy_inner(
+    target_endpoint: &str,
+    after_bytes: usize,
+    close_on_proceed: bool,
+    entered: tokio::sync::oneshot::Sender<()>,
+    proceed: tokio::sync::oneshot::Receiver<()>,
+    arm_marker: Option<std::path::PathBuf>,
+    request_fragment: Option<String>,
+) -> BarrierProxy {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind barrier proxy");
@@ -583,6 +870,8 @@ pub async fn start_barrier_proxy(
     let state = Arc::new(std::sync::Mutex::new(BarrierState {
         after_bytes,
         close_on_proceed,
+        arm_marker,
+        request_fragment,
         entered: Some(entered),
         proceed: Some(proceed),
         consumed: std::sync::atomic::AtomicBool::new(false),
@@ -591,23 +880,29 @@ pub async fn start_barrier_proxy(
     let observable_state = Arc::clone(&state);
 
     let handle = tokio::spawn(async move {
+        let mut connections = tokio::task::JoinSet::new();
         loop {
-            let (client, _) = match listener.accept().await {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-            let state = state.clone();
-            let target = target.clone();
-            tokio::spawn(async move {
-                proxy_one_connection_barrier(client, target, state).await;
-            });
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let (client, _) = match accepted {
+                        Ok(connection) => connection,
+                        Err(_) => continue,
+                    };
+                    let state = state.clone();
+                    let target = target.clone();
+                    connections.spawn(async move {
+                        proxy_one_connection_barrier(client, target, state).await;
+                    });
+                }
+                Some(_) = connections.join_next(), if !connections.is_empty() => {}
+            }
         }
     });
 
     BarrierProxy {
         url: format!("http://127.0.0.1:{port}"),
         state: observable_state,
-        _handle: handle,
+        handle: Some(handle),
     }
 }
 
@@ -1609,9 +1904,12 @@ async fn expired_signed_url_retry_stays_on_pinned_commit() {
     let repo = format!("pinrefresh-{suffix}");
     let mut guard = CleanupGuard::new(direct_env.clone(), prefix.clone());
 
+    let out = tempfile::tempdir().expect("clone out");
+    let target = out.path().join("clone");
+    let writer_entered = out.path().join("writer-entered");
+    let writer_proceed = out.path().join("writer-proceed");
     let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
     let (proceed_tx, proceed_rx) = tokio::sync::oneshot::channel();
-    let proxy = start_barrier_proxy(&direct_env.endpoint, 16, true, entered_tx, proceed_rx).await;
     let verifier = Arc::new(ToggleAccessVerifier::new(true));
     let server = start_s3_server_authorized(
         &direct_env,
@@ -1619,12 +1917,42 @@ async fn expired_signed_url_retry_stays_on_pinned_commit() {
         Arc::clone(&verifier) as Arc<dyn AccessVerifier>,
     )
     .await;
+    let (ref_trace, mut refresh_entered, _refresh_proceed) =
+        start_ref_trace_proxy(&server.url, true, false).await;
     let origin = make_origin("acme", &repo);
     guard.track_repo("acme", &repo);
-    origin.commit(&[("value.txt", "A\n"), ("stable.txt", "stable\n")], "A");
+    // Two distinct >2 MiB blobs cross the production 4 MiB HEAD-pack target,
+    // yielding two real shallow packs. That lets one pack writer remain active
+    // while the other pack's signed request fails through the normal
+    // propagating path.
+    let large_a = vec![b'a'; 3 * 1024 * 1024];
+    let large_b = vec![b'b'; 3 * 1024 * 1024];
+    origin.commit_bytes(
+        &[
+            ("value.txt", b"A\n".as_slice()),
+            ("stable.txt", b"stable\n".as_slice()),
+            ("large-a.bin", large_a.as_slice()),
+            ("large-b.bin", large_b.as_slice()),
+        ],
+        "A",
+    );
     origin.publish();
     let (pinned, exact_store, exact_a, _fixture) =
         seed_shallow_s3_fixture(&direct_env, &prefix, &repo).await;
+    assert!(
+        exact_a.packs.len() >= 2,
+        "retry fixture must publish at least two real shallow packs"
+    );
+    let proxy = start_barrier_proxy_for_request_after_marker(
+        &direct_env.endpoint,
+        16,
+        true,
+        entered_tx,
+        proceed_rx,
+        writer_entered.clone(),
+        exact_a.packs[1].pack.clone(),
+    )
+    .await;
     let repo_id = RepoId::github(format!("acme/{repo}"));
     add_acme_repo(&server, &repo).await;
 
@@ -1632,32 +1960,31 @@ async fn expired_signed_url_retry_stays_on_pinned_commit() {
         std::env::set_var("RIPCLONE_SIGNED_URL_TTL_PRIVATE_SECS", "1");
         std::env::set_var("RIPCLONE_TEST_DOWNLOAD_CONCURRENCY", "1");
         std::env::set_var("RIPCLONE_TEST_SIGNED_URL_PROXY", &proxy.url);
+        std::env::set_var("RIPCLONE_TESTING", "1");
+        std::env::set_var("RIPCLONE_TEST_ATTEMPT_WRITER_ENTERED", &writer_entered);
+        std::env::set_var("RIPCLONE_TEST_ATTEMPT_WRITER_PROCEED", &writer_proceed);
     }
-    let out = tempfile::tempdir().expect("clone out");
-    let target = out.path().join("clone");
     let binary = required_ripclone_bin();
-    let mut child = std::process::Command::new(&binary)
+    let mut command = std::process::Command::new(&binary);
+    command
         .arg("--server")
-        .arg(&server.url)
+        .arg(&ref_trace.url)
         .arg("clone")
         .arg(format!("acme/{repo}"))
         .arg(&target)
         .arg("--depth")
         .arg("1")
-        .arg("--no-metrics")
         .arg("--verify-upstream=never")
         .env("RIPCLONE_SERVER_TOKEN", TOKEN)
-        .env("RIPCLONE_NO_METRICS", "1")
+        .env_remove("RIPCLONE_NO_METRICS")
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn release CLI clone");
+        .stderr(std::process::Stdio::piped());
+    let child = spawn_bounded_child(&mut command).expect("spawn release CLI clone");
 
     if !matches!(
         tokio::time::timeout(Duration::from_secs(30), entered_rx).await,
         Ok(Ok(()))
     ) {
-        let _ = child.kill();
         let output = wait_child_output_bounded(child, Duration::from_secs(5))
             .await
             .expect("wait failed clone");
@@ -1680,16 +2007,56 @@ async fn expired_signed_url_retry_stays_on_pinned_commit() {
         .commit;
     assert_eq!(published_b, newer);
     let authorization_calls_before_refresh = verifier.calls();
+    assert!(
+        writer_entered.exists(),
+        "signed-URL barrier must arm only after a staging writer is in flight"
+    );
+    let initial_staging = std::fs::read_dir(out.path())
+        .expect("read clone output root")
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("clone.") && name.ends_with(".tmp"))
+        })
+        .expect("first attempt staging exists while writer is held");
     sleep(Duration::from_secs(2)).await;
     proceed_tx
         .send(())
         .expect("expire and close first signed request");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), &mut refresh_entered)
+            .await
+            .is_err(),
+        "attempt two began before the held staging writer was released"
+    );
+    assert!(
+        initial_staging.exists(),
+        "staging was removed while its writer was still held"
+    );
+    std::fs::write(&writer_proceed, b"go").expect("release staging writer");
+    // The artifact fetcher preserves its existing bounded transport retry
+    // budget before classifying the failed signed URL as stale. Allow that
+    // production budget to finish; this signal still fires before the exact
+    // request is forwarded to the (potentially slow) S3-backed ref store.
+    tokio::time::timeout(Duration::from_secs(90), &mut refresh_entered)
+        .await
+        .expect("exact refresh began after writer release and signed-fetch retries")
+        .expect("ref trace refresh signal remained alive");
+    assert!(
+        !initial_staging.exists(),
+        "exact refresh began before the prior attempt staging was drained"
+    );
 
     let output = wait_child_output(child).await;
     unsafe {
         std::env::remove_var("RIPCLONE_SIGNED_URL_TTL_PRIVATE_SECS");
         std::env::remove_var("RIPCLONE_TEST_DOWNLOAD_CONCURRENCY");
         std::env::remove_var("RIPCLONE_TEST_SIGNED_URL_PROXY");
+        std::env::remove_var("RIPCLONE_TESTING");
+        std::env::remove_var("RIPCLONE_TEST_ATTEMPT_WRITER_ENTERED");
+        std::env::remove_var("RIPCLONE_TEST_ATTEMPT_WRITER_PROCEED");
     }
     assert!(
         output.status.success(),
@@ -1702,11 +2069,36 @@ async fn expired_signed_url_retry_stays_on_pinned_commit() {
         std::fs::read_to_string(target.join("value.txt")).unwrap(),
         "A\n"
     );
+    assert_eq!(
+        std::fs::metadata(target.join("large-a.bin"))
+            .expect("first pack-backed file installed")
+            .len(),
+        3 * 1024 * 1024
+    );
+    assert_eq!(
+        std::fs::metadata(target.join("large-b.bin"))
+            .expect("second pack-backed file installed")
+            .len(),
+        3 * 1024 * 1024
+    );
     assert!(git_ok(&target, &["fsck", "--connectivity-only", "HEAD"]));
     assert!(
         verifier.calls() > authorization_calls_before_refresh,
         "pinned signed-URL refresh must re-enter repository authorization"
     );
+    let refs = ref_trace.refs();
+    assert!(!refs[0].contains("pinned="), "first request is moving");
+    assert!(
+        refs.iter()
+            .skip(1)
+            .all(|request| request.contains(&format!("pinned={pinned}"))),
+        "every request after pinning must be exact A: {refs:?}"
+    );
+    let metrics = ref_trace.metrics();
+    assert_eq!(metrics.len(), 1, "release CLI reports one clone outcome");
+    assert_eq!(metrics[0]["cloneId"], "first-clone-id");
+    assert_eq!(metrics[0]["commit"], pinned);
+    assert_eq!(metrics[0]["cold"], true);
     let headers = proxy.signed_headers();
     assert!(
         headers.len() >= 2,
@@ -1718,6 +2110,8 @@ async fn expired_signed_url_retry_stays_on_pinned_commit() {
             .all(|header| !header.to_ascii_lowercase().contains("authorization:")),
         "artifact-host requests must not carry Ripclone authorization: {headers:?}"
     );
+    proxy.shutdown().await;
+    ref_trace.shutdown().await;
 
     cleanup_prefix(&direct_env, &prefix)
         .await
@@ -1755,6 +2149,8 @@ async fn revoked_authorization_blocks_pinned_refresh() {
         Arc::clone(&verifier) as Arc<dyn AccessVerifier>,
     )
     .await;
+    let (ref_trace, mut refresh_entered, refresh_proceed) =
+        start_ref_trace_proxy(&server.url, false, true).await;
 
     let origin = make_origin("acme", &repo);
     guard.track_repo("acme", &repo);
@@ -1774,9 +2170,10 @@ async fn revoked_authorization_blocks_pinned_refresh() {
     let out = tempfile::tempdir().expect("clone out");
     let target = out.path().join("clone");
     let ripclone_bin = required_ripclone_bin();
-    let mut child = std::process::Command::new(&ripclone_bin)
+    let mut command = std::process::Command::new(&ripclone_bin);
+    command
         .arg("--server")
-        .arg(&server.url)
+        .arg(&ref_trace.url)
         .arg("clone")
         .arg(format!("acme/{repo}"))
         .arg(&target)
@@ -1787,15 +2184,13 @@ async fn revoked_authorization_blocks_pinned_refresh() {
         .env("RIPCLONE_SERVER_TOKEN", TOKEN)
         .env("RIPCLONE_NO_METRICS", "1")
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn ripclone clone");
+        .stderr(std::process::Stdio::piped());
+    let child = spawn_bounded_child(&mut command).expect("spawn ripclone clone");
 
     if !matches!(
         tokio::time::timeout(Duration::from_secs(30), entered_rx).await,
         Ok(Ok(()))
     ) {
-        let _ = child.kill();
         let output = wait_child_output_bounded(child, Duration::from_secs(5))
             .await
             .expect("wait failed clone");
@@ -1810,9 +2205,21 @@ async fn revoked_authorization_blocks_pinned_refresh() {
     let newer = git(&origin.bare, &["rev-parse", "HEAD"]);
     assert_ne!(pinned, newer);
     publish_moving_s3_row(&exact_store, &repo_id, &exact_a, &newer).await;
-    verifier.set_allowed(false);
     sleep(Duration::from_secs(2)).await;
     proceed_tx.send(()).expect("release signed-URL barrier");
+    tokio::time::timeout(Duration::from_secs(20), &mut refresh_entered)
+        .await
+        .expect("denied exact refresh reached server")
+        .expect("denied refresh trace remained alive");
+    let signed_requests_before_denial = proxy.signed_headers().len();
+    assert!(
+        signed_requests_before_denial >= 1,
+        "fixture must observe the original signed artifact request"
+    );
+    verifier.set_allowed(false);
+    refresh_proceed
+        .send(())
+        .expect("release exact refresh into denied authorization");
 
     let output = wait_child_output(child).await;
     unsafe {
@@ -1851,6 +2258,21 @@ async fn revoked_authorization_blocks_pinned_refresh() {
             .all(|header| !header.to_ascii_lowercase().contains("authorization:")),
         "artifact-host requests must not carry Ripclone authorization"
     );
+    assert_eq!(
+        proxy.signed_headers().len(),
+        signed_requests_before_denial,
+        "denied authorization must not mint or issue another signed artifact request"
+    );
+    let refs = ref_trace.refs();
+    assert!(!refs[0].contains("pinned="), "first request is moving");
+    assert!(
+        refs.iter()
+            .skip(1)
+            .all(|request| request.contains(&format!("pinned={pinned}"))),
+        "denied refresh must still name exact A: {refs:?}"
+    );
+    proxy.shutdown().await;
+    ref_trace.shutdown().await;
 
     cleanup_prefix(&direct_env, &prefix)
         .await
