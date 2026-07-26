@@ -119,7 +119,8 @@ fn spawn_clone_at_probe_barrier(
         barrier.wrapper_dir.display(),
         std::env::var("PATH").unwrap_or_default()
     );
-    Command::new(binary)
+    let mut command = Command::new(binary);
+    command
         .arg("--server")
         .arg(&server.url)
         .arg("clone")
@@ -142,9 +143,8 @@ fn spawn_clone_at_probe_barrier(
         .env("RIPCLONE_SERVER_TOKEN", TOKEN)
         .env("RIPCLONE_NO_METRICS", "1")
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn release CLI at probe barrier")
+        .stderr(Stdio::piped());
+    spawn_bounded_child(&mut command).expect("spawn release CLI at probe barrier")
 }
 
 /// Run the CLI `clone` subcommand against `server` with optional extra args.

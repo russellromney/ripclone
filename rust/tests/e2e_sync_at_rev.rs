@@ -253,7 +253,8 @@ async fn public_cli_clones_at_a_full_sha() {
             "full-SHA proof must spawn the requested release binary"
         );
     }
-    let child = std::process::Command::new(binary)
+    let mut command = std::process::Command::new(binary);
+    command
         .arg("--server")
         .arg(&server.url)
         .arg("clone")
@@ -268,9 +269,8 @@ async fn public_cli_clones_at_a_full_sha() {
         .env("RIPCLONE_SERVER_TOKEN", TOKEN)
         .env("RIPCLONE_NO_METRICS", "1")
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn full-SHA CLI");
+        .stderr(std::process::Stdio::piped());
+    let child = spawn_bounded_child(&mut command).expect("spawn full-SHA CLI");
     let output = wait_child_output_bounded(child, Duration::from_secs(60))
         .await
         .expect("full-SHA CLI bounded, killed, and reaped on timeout");

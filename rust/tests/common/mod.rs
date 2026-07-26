@@ -111,6 +111,7 @@ pub struct Server {
 pub struct PinnedPathSnapshot {
     pub branch_reads: usize,
     pub enqueues: usize,
+    pub builder_entries: usize,
 }
 
 #[derive(Default)]
@@ -118,6 +119,7 @@ pub struct PinnedPathProbe {
     armed: std::sync::atomic::AtomicBool,
     branch_reads: std::sync::atomic::AtomicUsize,
     enqueues: std::sync::atomic::AtomicUsize,
+    builder_entries: std::sync::atomic::AtomicUsize,
 }
 
 pub struct PhaseOnePublishBarrier {
@@ -150,7 +152,10 @@ impl PhaseOnePublishBarrier {
             let _ = entered.send(());
         }
         if let Some(proceed) = self.proceed.lock().await.take() {
-            let _ = proceed.await;
+            tokio::time::timeout(Duration::from_secs(20), proceed)
+                .await
+                .expect("phase-one publication barrier released within 20 seconds")
+                .expect("phase-one publication barrier sender remained alive");
         }
     }
 }
@@ -160,13 +165,22 @@ impl PinnedPathProbe {
         self.branch_reads
             .store(0, std::sync::atomic::Ordering::SeqCst);
         self.enqueues.store(0, std::sync::atomic::Ordering::SeqCst);
+        self.builder_entries
+            .store(0, std::sync::atomic::Ordering::SeqCst);
         self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn disarm(&self) {
+        self.armed.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn snapshot(&self) -> PinnedPathSnapshot {
         PinnedPathSnapshot {
             branch_reads: self.branch_reads.load(std::sync::atomic::Ordering::SeqCst),
             enqueues: self.enqueues.load(std::sync::atomic::Ordering::SeqCst),
+            builder_entries: self
+                .builder_entries
+                .load(std::sync::atomic::Ordering::SeqCst),
         }
     }
 
@@ -613,8 +627,14 @@ async fn start_server_split_storage_inner(
     };
 
     let worker_state = state.clone();
+    let worker_probe = Arc::clone(&pinned_path_probe);
     tokio::spawn(async move {
         while let Some(job) = rx.recv().await {
+            if worker_probe.is_armed() {
+                worker_probe
+                    .builder_entries
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
             let state = worker_state.clone();
             tokio::spawn(async move {
                 let key = format!(
@@ -2030,9 +2050,43 @@ pub fn cargo_bin(name: &str) -> std::path::PathBuf {
     }
 }
 
-/// Collect a piped child without allowing either pipe backpressure or a timeout
-/// to detach it. Reader threads drain stdout/stderr while the waiter polls; on
-/// timeout the child is killed and reaped before this returns.
+/// Spawn a child in a dedicated process group so bounded teardown can terminate
+/// Git or other descendants that inherit its stdout/stderr pipes.
+pub fn spawn_bounded_child(command: &mut Command) -> std::io::Result<Child> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    command.spawn()
+}
+
+#[cfg(unix)]
+fn kill_child_process_group(child: &mut Child) -> std::io::Result<()> {
+    let pid = child.id() as libc::pid_t;
+    // SAFETY: the child was spawned by `spawn_bounded_child` as the leader of
+    // its own process group; a negative pid targets that group only.
+    let result = unsafe { libc::kill(-pid, libc::SIGKILL) };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_child_process_group(child: &mut Child) -> std::io::Result<()> {
+    child.kill()
+}
+
+/// Collect a piped child without allowing pipe backpressure, descendants, or a
+/// timeout to detach it. Reader threads drain stdout/stderr while the waiter
+/// polls. The dedicated process group is killed before pipe readers are joined,
+/// so a Git descendant cannot retain a writer and make this helper hang.
 pub async fn wait_child_output_bounded(
     mut child: std::process::Child,
     timeout: Duration,
@@ -2062,11 +2116,16 @@ pub async fn wait_child_output_bounded(
             }
             if std::time::Instant::now() >= deadline {
                 timed_out = true;
-                child.kill().context("kill timed-out child")?;
+                kill_child_process_group(&mut child)
+                    .context("kill timed-out child process group")?;
                 break child.wait().context("reap timed-out child")?;
             }
             std::thread::sleep(Duration::from_millis(25));
         };
+        // The direct process can exit while a descendant remains alive with an
+        // inherited pipe. Terminate any residual group members before joining
+        // the readers. ESRCH simply means the group is already empty.
+        kill_child_process_group(&mut child).context("reap child process group descendants")?;
         let join_pipe = |reader: Option<std::thread::JoinHandle<anyhow::Result<Vec<u8>>>>| {
             reader
                 .map(|reader| {

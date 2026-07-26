@@ -53,7 +53,8 @@ async fn remote_helper_clones_through_ripclone_server() {
     // Run `git clone` with an internal timeout so a hung helper surfaces its
     // stderr in the test output instead of blocking the whole cargo run.
     let clone_timeout = std::time::Duration::from_secs(60);
-    let child = std::process::Command::new("git")
+    let mut command = std::process::Command::new("git");
+    command
         .arg("clone")
         .arg("--depth")
         .arg("1")
@@ -64,9 +65,8 @@ async fn remote_helper_clones_through_ripclone_server() {
         .env("RIPCLONE_SERVER_TOKEN", TOKEN)
         .env("RUST_LOG", "debug")
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn git clone");
+        .stderr(std::process::Stdio::piped());
+    let child = spawn_bounded_child(&mut command).expect("spawn git clone");
     let output = wait_child_output_bounded(child, clone_timeout)
         .await
         .expect("git clone through remote helper bounded, killed, and reaped on timeout");
@@ -134,7 +134,8 @@ async fn remote_helper_rejects_manifest_for_another_commit_without_partial_clone
         bin_dir.path().display(),
         std::env::var("PATH").unwrap_or_default()
     );
-    let child = std::process::Command::new("git")
+    let mut command = std::process::Command::new("git");
+    command
         .arg("clone")
         .arg("ripclone://github/acme/helper-integrity.git")
         .arg(&target)
@@ -142,9 +143,8 @@ async fn remote_helper_rejects_manifest_for_another_commit_without_partial_clone
         .env("RIPCLONE_SERVER", &server.url)
         .env("RIPCLONE_SERVER_TOKEN", TOKEN)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn integrity clone");
+        .stderr(std::process::Stdio::piped());
+    let child = spawn_bounded_child(&mut command).expect("spawn integrity clone");
     let output = wait_child_output_bounded(child, std::time::Duration::from_secs(60))
         .await
         .expect("integrity clone bounded and reaped");
