@@ -2540,8 +2540,6 @@ async fn load_pinned_ref_info(
     pinned: &str,
     clonepack_kind: &str,
 ) -> Result<Option<(String, RefInfo)>> {
-    let branch_info = ref_store.load_branch(repo_id, branch).await?;
-
     let exact_key = ref_store_key(branch, Some(pinned), Some(pinned));
     if exact_key != branch
         && let Some(info) = ref_store.load_branch(repo_id, &exact_key).await?
@@ -2549,6 +2547,12 @@ async fn load_pinned_ref_info(
     {
         return Ok(Some((exact_key, info)));
     }
+
+    // A concrete exact hit above is the common post-pin case and needs one
+    // backend read. Load the moving row only after that miss: HEAD needs it to
+    // discover the pre-upgrade default-branch key, and any branch may use it as
+    // the final settled-row compatibility fallback.
+    let branch_info = ref_store.load_branch(repo_id, branch).await?;
 
     // Pre-upgrade rev builds already live at `<default-branch>#<commit>`.
     // A pinned HEAD lookup can derive that one concrete key from the HEAD row

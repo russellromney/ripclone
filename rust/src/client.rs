@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 mod tuning;
@@ -625,6 +625,41 @@ fn fsync_tree(root: &Path) -> Result<()> {
     crate::worktree_writer::fsync_paths_durable(&files, &dirs)
 }
 
+/// Deterministic subprocess-e2e barrier for one staging writer. It is inert
+/// unless the existing testing gate and both marker paths are present. The
+/// elected blocking worker remains owned by `AttemptCleanup`, allowing the
+/// release CLI test to prove stale-URL retry cannot overlap it.
+fn wait_for_test_attempt_writer() -> Result<()> {
+    if std::env::var_os("RIPCLONE_TESTING").as_deref() != Some(std::ffi::OsStr::new("1")) {
+        return Ok(());
+    }
+    let (Some(entered), Some(proceed)) = (
+        std::env::var_os("RIPCLONE_TEST_ATTEMPT_WRITER_ENTERED"),
+        std::env::var_os("RIPCLONE_TEST_ATTEMPT_WRITER_PROCEED"),
+    ) else {
+        return Ok(());
+    };
+    let entered = PathBuf::from(entered);
+    let proceed = PathBuf::from(proceed);
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&entered)
+    {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+        Err(error) => return Err(error).context("create attempt-writer test marker"),
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !proceed.exists() {
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!("attempt-writer test barrier exceeded 20 seconds");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Deserialize)]
 pub struct SnapshotResponse {
     pub owner: String,
@@ -691,6 +726,10 @@ struct AttemptStaging {
 
 type SharedAttemptStaging = Arc<Mutex<Option<AttemptStaging>>>;
 
+// This cleanup ownership deliberately covers arbitrary cancellation of the
+// public install future, not only the ordinary stale-URL retry path. Tokio
+// cannot stop spawn_blocking work that has begun, so detached cancellation
+// must retain the staging tree until every registered writer has exited.
 fn spawn_attempt_reaper(
     cleanup: AttemptCleanup,
     staging: SharedAttemptStaging,
@@ -1014,7 +1053,12 @@ impl Client {
             } else {
                 branch
             };
-            let mut url = self.repo_url(repo_path, &format!("/refs/{request_branch}"));
+            // Branches are wildcard path values, not URL syntax. Re-encode the
+            // concrete branch learned from Content-Location before composing
+            // the next request so valid delimiters such as `#` and `%` cannot
+            // become a fragment or otherwise change the request target.
+            let encoded_branch = urlencoding::encode(request_branch);
+            let mut url = self.repo_url(repo_path, &format!("/refs/{encoded_branch}"));
             let mut q: Vec<String> = Vec::new();
             if let Some(kind) = clonepack {
                 q.push(format!("clonepack={kind}"));
@@ -1109,7 +1153,7 @@ impl Client {
                 }
                 anyhow::bail!("{repo_path} is still building after {max_attempts} attempts");
             }
-            if status.is_success() {
+            if status == reqwest::StatusCode::OK {
                 // Capture the hosted server's per-clone id from the response
                 // header before the body is consumed. Absent on a self-hosted or
                 // older server, which leaves `clone_id` None.
@@ -1262,31 +1306,13 @@ impl Client {
             Ok(manifest)
         };
 
-        if let Some(cache) = &self.cache
-            && let Ok(data) = cache.get(hash)
-        {
-            return match decode(&data) {
-                Ok(manifest) => Ok(manifest),
-                Err(error) => {
-                    // A manifest whose embedded commit is wrong is not a valid
-                    // cache entry for this operation. Remove it before
-                    // returning so a later lookup cannot hit rejected bytes.
-                    let _ = cache.remove(hash);
-                    Err(error)
-                }
-            };
-        }
-
-        // Do not let generic artifact caching publish bytes before their
-        // embedded commit has been checked against the operation pin.
-        let data = self
-            .fetch_artifact_with_url_cache(hash, signed_url, false)
-            .await?;
-        let manifest = decode(&data)?;
-        if let Some(cache) = &self.cache {
-            let _ = cache.put_with_hash(hash, &data);
-        }
-        Ok(manifest)
+        // The CAS is keyed by the verified content hash, so immutable bytes may
+        // be retained even when their embedded commit is wrong for this
+        // operation. Identity remains a per-use check: every cached or fetched
+        // manifest is decoded and compared with the operation pin here before
+        // any installation work starts.
+        let data = self.fetch_artifact_with_url(hash, signed_url).await?;
+        decode(&data)
     }
 
     /// Fetch an artifact referenced by a `ChunkRef`, optionally using a signed URL.
@@ -2492,6 +2518,7 @@ impl Client {
                     let result = AbortOnDrop::new(
                         tokio::task::spawn_blocking(
                             move || -> Result<crate::extract::PackExtractResult> {
+                                wait_for_test_attempt_writer()?;
                                 if pack_body.len() < 20 {
                                     anyhow::bail!(
                                         "pack {} too short ({} bytes)",
