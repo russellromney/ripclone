@@ -107,6 +107,17 @@ async fn scripted_server(
     (format!("http://{addr}"), requests, task)
 }
 
+async fn abort_server_task(mut task: tokio::task::JoinHandle<()>) {
+    task.abort();
+    let joined = tokio::time::timeout(Duration::from_secs(5), &mut task)
+        .await
+        .expect("aborted test server joined within five seconds");
+    assert!(
+        joined.is_err(),
+        "aborted test server unexpectedly succeeded"
+    );
+}
+
 fn pending(commit: &str) -> (StatusCode, serde_json::Value) {
     (
         StatusCode::ACCEPTED,
@@ -159,6 +170,26 @@ fn env_lock() -> &'static tokio::sync::Mutex<()> {
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn bounded_child_reaps_descendants_that_inherit_output_pipes() {
+    let mut command = std::process::Command::new("sh");
+    command
+        .args(["-c", "(sleep 30) & exit 0"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let child = spawn_bounded_child(&mut command).expect("spawn descendant fixture");
+    let started = std::time::Instant::now();
+    let output = wait_child_output_bounded(child, Duration::from_secs(2))
+        .await
+        .expect("child group and inherited pipes are bounded");
+    assert!(output.status.success());
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "pipe readers waited for the 30-second descendant"
+    );
+}
+
 #[derive(Clone)]
 struct RefBarrierState {
     upstream: String,
@@ -196,6 +227,7 @@ async fn ref_barrier_proxy(
     let mut status = response.status();
     let response_headers = response.headers().clone();
     let mut bytes = response.bytes().await.expect("forward proxy body");
+    let mut pending_content_location = None;
 
     let first_ref = is_ref && !state.held.swap(true, Ordering::SeqCst);
     if first_ref {
@@ -208,7 +240,10 @@ async fn ref_barrier_proxy(
             entered.send(()).expect("signal fetched ref");
         }
         if let Some(proceed) = state.proceed.lock().await.take() {
-            proceed.await.expect("release fetched ref");
+            tokio::time::timeout(Duration::from_secs(20), proceed)
+                .await
+                .expect("ref barrier released within 20 seconds")
+                .expect("ref barrier sender remained alive");
         }
         if state.force_first_archive_pending {
             let mut body: serde_json::Value =
@@ -223,6 +258,12 @@ async fn ref_barrier_proxy(
                 .as_str()
                 .expect("ready response commit")
                 .to_string();
+            pending_content_location = Some(
+                body["branch"]
+                    .as_str()
+                    .expect("ready response concrete branch")
+                    .to_string(),
+            );
             status = StatusCode::ACCEPTED;
             bytes = Bytes::from(
                 serde_json::to_vec(&json!({
@@ -244,6 +285,12 @@ async fn ref_barrier_proxy(
         if let Some(value) = response_headers.get(&name) {
             output = output.header(name, value);
         }
+    }
+    if let Some(branch) = pending_content_location {
+        output = output.header(
+            axum::http::header::CONTENT_LOCATION,
+            urlencoding::encode(&branch).as_ref(),
+        );
     }
     output.body(Body::from(bytes)).expect("proxy response")
 }
@@ -369,7 +416,8 @@ async fn cold_pending_real_server_installs_pinned_commit_after_branch_moves() {
         start_ref_barrier_proxy(&server.url, false, true).await;
     let output = tempfile::tempdir().expect("clone output");
     let target = output.path().join("clone");
-    let child = std::process::Command::new(binary)
+    let mut command = std::process::Command::new(binary);
+    command
         .arg("--server")
         .arg(&proxy)
         .arg("clone")
@@ -382,15 +430,14 @@ async fn cold_pending_real_server_installs_pinned_commit_after_branch_moves() {
         .env("RIPCLONE_SERVER_TOKEN", TOKEN)
         .env("RIPCLONE_NO_METRICS", "1")
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn release CLI");
+        .stderr(std::process::Stdio::piped());
+    let child = spawn_bounded_child(&mut command).expect("spawn release CLI");
     if !matches!(
         tokio::time::timeout(Duration::from_secs(20), entered).await,
         Ok(Ok(()))
     ) {
         let output = wait_child_output_bounded(child, Duration::from_secs(1)).await;
-        proxy_task.abort();
+        abort_server_task(proxy_task).await;
         panic!("release CLI never reached moving-response barrier: {output:?}");
     }
 
@@ -408,7 +455,7 @@ async fn cold_pending_real_server_installs_pinned_commit_after_branch_moves() {
     let output = wait_child_output_bounded(child, Duration::from_secs(60))
         .await
         .expect("release CLI bounded, killed, and reaped on timeout");
-    proxy_task.abort();
+    abort_server_task(proxy_task).await;
     assert!(
         output.status.success(),
         "cold pinned clone failed\nstdout:\n{}\nstderr:\n{}",
@@ -474,7 +521,7 @@ async fn real_server_pending_exhaustion_is_typed_and_leaves_no_target() {
     let target = target_root.path().join("clone");
     let client = Client::new_with_token(proxy, Some(token_hash()));
     let target_for_clone = target.clone();
-    let install = tokio::spawn(async move {
+    let mut install = tokio::spawn(async move {
         client
             .install_repo_with_mode_at(
                 "acme/cold-pin-pending",
@@ -492,11 +539,17 @@ async fn real_server_pending_exhaustion_is_typed_and_leaves_no_target() {
         .expect("pending response reached barrier")
         .expect("barrier alive");
     proceed.send(()).expect("release pending response");
-    let error = install
-        .await
-        .expect("join pending install")
-        .expect_err("exact A remains pending");
-    proxy_task.abort();
+    let error = match tokio::time::timeout(Duration::from_secs(20), &mut install).await {
+        Ok(joined) => joined
+            .expect("join pending install")
+            .expect_err("exact A remains pending"),
+        Err(_) => {
+            install.abort();
+            let _ = tokio::time::timeout(Duration::from_secs(5), &mut install).await;
+            panic!("pending install did not finish within 20 seconds");
+        }
+    };
+    abort_server_task(proxy_task).await;
     unsafe {
         std::env::remove_var("RIPCLONE_TESTING");
         std::env::remove_var("RIPCLONE_TEST_REF_MAX_ATTEMPTS");
@@ -531,7 +584,7 @@ async fn changing_pending_commit_is_an_integrity_error() {
         .resolve_ref_with_clonepack("acme/demo", "main", Some("full"), None)
         .await
         .expect_err("changing pending commit must fail");
-    task.abort();
+    abort_server_task(task).await;
     unsafe {
         std::env::remove_var("RIPCLONE_TESTING");
         std::env::remove_var("RIPCLONE_TEST_REF_MAX_ATTEMPTS");
@@ -550,7 +603,7 @@ async fn malformed_pending_commit_is_a_protocol_error() {
         .resolve_ref_with_clonepack("acme/demo", "main", Some("full"), None)
         .await
         .expect_err("malformed pending commit must fail");
-    task.abort();
+    abort_server_task(task).await;
     assert!(format!("{error:#}").contains("invalid pending commit"));
     let requests = requests.lock().unwrap_or_else(|e| e.into_inner());
     assert_eq!(requests.len(), 1, "malformed response never retries");
@@ -572,7 +625,7 @@ async fn service_unavailable_switches_to_exact_only_after_a_pin_exists() {
         .resolve_ref_with_clonepack("acme/demo", "main", Some("full"), None)
         .await
         .expect("pre-pin 503 may retry moving selector");
-    pre_pin_task.abort();
+    abort_server_task(pre_pin_task).await;
     {
         let pre_pin_requests = pre_pin_requests.lock().unwrap_or_else(|e| e.into_inner());
         assert!(
@@ -588,7 +641,7 @@ async fn service_unavailable_switches_to_exact_only_after_a_pin_exists() {
         .resolve_ref_with_clonepack("acme/demo", "main", Some("full"), None)
         .await
         .expect("post-pin 503 retries exact selector");
-    post_pin_task.abort();
+    abort_server_task(post_pin_task).await;
     let post_pin_requests = post_pin_requests.lock().unwrap_or_else(|e| e.into_inner());
     assert!(!post_pin_requests[0].contains("pinned="));
     assert!(
@@ -611,7 +664,7 @@ async fn ready_response_cannot_change_an_established_pin() {
         .resolve_ref_with_clonepack("acme/demo", "main", Some("full"), None)
         .await
         .expect_err("ready response cannot change pin");
-    task.abort();
+    abort_server_task(task).await;
     assert!(format!("{error:#}").contains("integrity error"));
     assert!(requests.lock().unwrap_or_else(|e| e.into_inner())[1].contains(&format!("pinned={A}")));
 }
@@ -623,25 +676,123 @@ async fn pending_head_switches_pinned_polls_to_the_concrete_branch() {
         std::env::set_var("RIPCLONE_TESTING", "1");
         std::env::set_var("RIPCLONE_TEST_REF_POLL_MS", "0");
     }
-    let concrete = "rélease/東京";
-    let (url, requests, task) =
-        scripted_server(vec![pending_on(A, concrete), ready_on(A, concrete)]).await;
-    Client::new(url)
-        .resolve_ref_with_clonepack("acme/demo", "HEAD", Some("full"), Some("HEAD~1"))
-        .await
-        .expect("pending rev continues at its concrete branch");
-    task.abort();
+    assert!(
+        std::process::Command::new("git")
+            .args(["check-ref-format", "refs/heads/release#one"])
+            .status()
+            .expect("validate delimiter-bearing branch")
+            .success(),
+        "release#one must remain a valid Git branch fixture"
+    );
+    for concrete in ["rélease/東京", "release#one", "percent%branch"] {
+        let (url, requests, task) =
+            scripted_server(vec![pending_on(A, concrete), ready_on(A, concrete)]).await;
+        Client::new(url)
+            .resolve_ref_with_clonepack("acme/demo", "HEAD", Some("full"), Some("HEAD~1"))
+            .await
+            .expect("pending rev continues at its concrete branch");
+        abort_server_task(task).await;
+        let requests = requests.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(requests[0].contains("/refs/HEAD?"));
+        assert!(requests[0].contains("rev=HEAD~1"));
+        assert!(
+            requests[1].contains(&format!("/refs/{}?", urlencoding::encode(concrete))),
+            "concrete branch must remain one encoded request path: {:?}",
+            requests[1]
+        );
+        let decoded = urlencoding::decode(&requests[1]).expect("decode concrete branch request");
+        assert!(decoded.contains(&format!("/refs/{concrete}?")));
+        assert!(requests[1].contains(&format!("pinned={A}")));
+        assert!(!requests[1].contains("rev="));
+    }
     unsafe {
         std::env::remove_var("RIPCLONE_TESTING");
         std::env::remove_var("RIPCLONE_TEST_REF_POLL_MS");
     }
+}
+
+#[tokio::test]
+async fn real_server_pending_head_preserves_delimiter_branch_on_exact_poll() {
+    let _guard = env_lock().lock().await;
+    init(false);
+    unsafe {
+        std::env::set_var("RIPCLONE_TESTING", "1");
+        std::env::set_var("RIPCLONE_TEST_REF_POLL_MS", "0");
+    }
+    let server = start_server_split_storage().await;
+    let origin = make_origin("acme", "delimiter-branch");
+    git(&origin.work, &["branch", "-m", "release#one"]);
+    let commit = origin.commit(&[("value.txt", "A\n")], "A");
+    git(
+        &origin.work,
+        &["push", "-q", "--force", origin.bare_str(), "release#one"],
+    );
+    git(
+        &origin.bare,
+        &["symbolic-ref", "HEAD", "refs/heads/release#one"],
+    );
+    register_added_without_build(&server, "acme/delimiter-branch")
+        .await
+        .expect("register delimiter branch repo");
+    let settled = sync_until_archive_ready(&server, "acme", "delimiter-branch").await;
+    assert_eq!(settled.commit, commit);
+    let ready = server
+        .client()
+        .resolve_ref_with_clonepack("acme/delimiter-branch", "HEAD", Some("full"), None)
+        .await
+        .expect("delimiter branch is ready before forcing the 202");
+    assert_eq!(ready.commit, commit);
+    assert_eq!(ready.branch, "release#one");
+
+    let (proxy, entered, proceed, requests, proxy_task) =
+        start_ref_barrier_proxy(&server.url, false, true).await;
+    let resolve = tokio::spawn(async move {
+        Client::new_with_token(proxy, Some(token_hash()))
+            .resolve_ref_with_clonepack("acme/delimiter-branch", "HEAD", Some("full"), None)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(20), entered)
+        .await
+        .expect("real ready response reached pending barrier")
+        .expect("pending barrier alive");
+    proceed.send(()).expect("release forced pending response");
+    let response = tokio::time::timeout(Duration::from_secs(20), resolve)
+        .await
+        .expect("delimiter exact poll completed")
+        .expect("join delimiter exact poll")
+        .expect("resolve delimiter branch");
+    abort_server_task(proxy_task).await;
+
+    assert_eq!(response.commit, commit);
+    assert_eq!(response.branch, "release#one");
     let requests = requests.lock().unwrap_or_else(|e| e.into_inner());
+    assert_eq!(requests.len(), 2, "one moving and one exact request");
     assert!(requests[0].contains("/refs/HEAD?"));
-    assert!(requests[0].contains("rev=HEAD~1"));
-    let decoded = urlencoding::decode(&requests[1]).expect("decode concrete branch request");
-    assert!(decoded.contains(&format!("/refs/{concrete}?")));
-    assert!(requests[1].contains(&format!("pinned={A}")));
-    assert!(!requests[1].contains("rev="));
+    assert!(
+        requests[1].contains("/refs/release%23one?"),
+        "delimiter must be part of the encoded path, not a fragment: {requests:?}"
+    );
+    assert!(requests[1].contains(&format!("pinned={commit}")));
+
+    unsafe {
+        std::env::remove_var("RIPCLONE_TESTING");
+        std::env::remove_var("RIPCLONE_TEST_REF_POLL_MS");
+    }
+}
+
+#[tokio::test]
+async fn ready_ref_requires_http_200() {
+    let _guard = env_lock().lock().await;
+    let (_, ready_body) = ready(A);
+    let (url, requests, task) = scripted_server(vec![(StatusCode::CREATED, ready_body)]).await;
+    let error = Client::new(url)
+        .resolve_ref_with_clonepack("acme/demo", "main", Some("full"), None)
+        .await
+        .expect_err("201 with a ready-shaped body is not protocol success");
+    abort_server_task(task).await;
+    let error = format!("{error:#}");
+    assert!(error.contains("ref lookup failed"), "{error}");
+    assert_eq!(requests.lock().unwrap_or_else(|e| e.into_inner()).len(), 1);
 }
 
 #[tokio::test]
@@ -661,7 +812,7 @@ async fn pinned_refresh_distinguishes_authorization_from_server_failure() {
         .resolve_ref_with_clonepack("acme/demo", "main", Some("full"), None)
         .await
         .expect_err("403 pinned refresh must fail");
-    forbidden_task.abort();
+    abort_server_task(forbidden_task).await;
     let forbidden = format!("{forbidden:#}");
     assert!(forbidden.contains(&format!("refresh of pinned commit {A} was not authorized")));
     assert!(forbidden.contains("access revoked"));
@@ -678,7 +829,7 @@ async fn pinned_refresh_distinguishes_authorization_from_server_failure() {
         .resolve_ref_with_clonepack("acme/demo", "main", Some("full"), None)
         .await
         .expect_err("500 pinned refresh must fail");
-    server_task.abort();
+    abort_server_task(server_task).await;
     let server_failure = format!("{server_failure:#}");
     assert!(server_failure.contains(&format!("refresh of pinned commit {A} failed")));
     assert!(server_failure.contains("ref store unavailable"));
@@ -739,10 +890,17 @@ async fn mismatched_variant_never_enters_the_moving_response_cache() {
         .header("Authorization", format!("Ripclone {}", token_hash()))
         .header("x-ripclone-protocol", "2")
     };
-    let rejected = request().send().await.expect("mismatched lookup");
-    assert_eq!(rejected.status(), StatusCode::ACCEPTED);
-    let rejected: serde_json::Value = rejected.json().await.expect("pending response");
-    assert_eq!(rejected["commit"], a);
+    for attempt in 1..=2 {
+        let rejected = request().send().await.expect("mismatched lookup");
+        assert_eq!(
+            rejected.status(),
+            StatusCode::ACCEPTED,
+            "stored mismatch request {attempt} must remain pending"
+        );
+        let rejected: serde_json::Value = rejected.json().await.expect("pending response");
+        assert_eq!(rejected["code"], "artifact_pending");
+        assert_eq!(rejected["commit"], a);
+    }
 
     store
         .save_branch(&repo_id, "main", &valid_a)
@@ -763,11 +921,14 @@ async fn mismatched_variant_never_enters_the_moving_response_cache() {
     let cached = request().send().await.expect("cached lookup");
     assert_eq!(cached.status(), StatusCode::OK);
     let cached: serde_json::Value = cached.json().await.expect("cached A response");
-    assert_eq!(cached["commit"], a);
+    assert_eq!(
+        cached, ready,
+        "cache hit must retain the guarded A snapshot"
+    );
 }
 
 #[tokio::test]
-async fn mismatched_manifest_is_rejected_before_install_and_never_cached() {
+async fn cached_mismatched_manifest_is_rejected_on_every_use() {
     let _guard = env_lock().lock().await;
     init(false);
     let server = start_server_split_storage().await;
@@ -811,12 +972,12 @@ async fn mismatched_manifest_is_rejected_before_install_and_never_cached() {
     );
     let cache = ripclone::cas::Cas::new(&cache_dir).expect("open client cache");
     assert!(
-        cache.get(&bad_manifest).is_err(),
-        "rejected manifest bytes must not enter the client cache"
+        cache.get(&bad_manifest).is_ok(),
+        "hash-valid immutable bytes may remain in the artifact CAS"
     );
 
-    // Remove the only network copy. A second attempt must fail to fetch it,
-    // rather than reproducing the integrity error from a forbidden cache hit.
+    // Remove the only network copy. A second attempt now necessarily reads the
+    // immutable cached bytes and must repeat the per-use semantic rejection.
     std::fs::remove_file(server.storage_path(&bad_manifest))
         .expect("remove mismatched manifest from test storage");
     let second = client
@@ -830,11 +991,12 @@ async fn mismatched_manifest_is_rejected_before_install_and_never_cached() {
             None,
         )
         .await
-        .expect_err("later lookup cannot hit rejected manifest bytes");
+        .expect_err("cached manifest B must still be rejected under pin A");
     let second = format!("{second:#}");
     assert!(
-        !second.contains("manifest commit"),
-        "unexpected cache hit: {second}"
+        second.contains(&format!("manifest commit {B}"))
+            && second.contains(&format!("pinned commit {pinned}")),
+        "cached bytes bypassed per-use identity validation: {second}"
     );
     assert!(!target.exists());
 }
@@ -1144,7 +1306,7 @@ async fn overwritten_branch_metadata_returns_pending_for_the_pin_without_upstrea
             panic!("overwritten metadata install did not finish within 20 seconds");
         }
     };
-    proxy_task.abort();
+    abort_server_task(proxy_task).await;
     unsafe {
         std::env::remove_var("RIPCLONE_TESTING");
         std::env::remove_var("RIPCLONE_TEST_REF_MAX_ATTEMPTS");
@@ -1172,6 +1334,7 @@ async fn overwritten_branch_metadata_returns_pending_for_the_pin_without_upstrea
         "concrete-branch exact polls perform only moving and exact point reads"
     );
     assert_eq!(observed.enqueues, 0);
+    assert_eq!(observed.builder_entries, 0);
 }
 
 #[tokio::test]
@@ -1264,6 +1427,189 @@ async fn pinned_head_reads_pre_upgrade_default_branch_exact_row() {
 }
 
 #[tokio::test]
+async fn settled_moving_row_is_identical_after_legacy_variant_round_trip() {
+    let _guard = env_lock().lock().await;
+    init(false);
+    let server = start_server_split_storage().await;
+    let origin = make_origin("acme", "legacy-moving-pin");
+    origin.commit(&[("value.txt", "A\n")], "A");
+    origin.publish();
+    register_added_without_build(&server, "acme/legacy-moving-pin")
+        .await
+        .expect("register repo");
+    server
+        .client()
+        .sync_repo("acme/legacy-moving-pin", None)
+        .await
+        .expect("sync A");
+
+    let store = FileRefStore::new(&server.repo_root);
+    let repo_id = RepoId::github("acme/legacy-moving-pin");
+    let mut settled = None;
+    for _ in 0..200 {
+        if let Ok(Some(info)) = store.load_branch(&repo_id, "main").await
+            && info.build_status.is_none()
+            && !info.full_clonepack.manifest.is_empty()
+        {
+            settled = Some(info);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let settled = settled.expect("moving A publication settled");
+    let a = settled.commit.clone();
+    assert!(
+        store
+            .load_branch(&repo_id, &format!("main#{a}"))
+            .await
+            .expect("check exact row")
+            .is_none(),
+        "fixture must exercise the settled moving-row fallback"
+    );
+    let pinned_url = format!(
+        "{}/v1/repos/github/acme/legacy-moving-pin/refs/main?clonepack=full&pinned={a}",
+        server.url
+    );
+    let request = || {
+        reqwest::Client::new()
+            .get(&pinned_url)
+            .header("Authorization", format!("Ripclone {}", token_hash()))
+            .header("x-ripclone-protocol", "2")
+            .timeout(Duration::from_secs(5))
+    };
+
+    // Count the real source-acquisition boundary without production
+    // instrumentation. The wrapper records mirror clone/fetch commands and
+    // delegates every invocation to the actual Git binary.
+    let source_probe = tempfile::tempdir().expect("source probe");
+    let source_log = source_probe.path().join("source.log");
+    std::fs::write(&source_log, b"").expect("initialize source log");
+    let real_git = String::from_utf8(
+        std::process::Command::new("sh")
+            .args(["-c", "command -v git"])
+            .output()
+            .expect("locate git")
+            .stdout,
+    )
+    .expect("git path utf8")
+    .trim()
+    .to_string();
+    let wrapper = source_probe.path().join("git");
+    std::fs::write(
+        &wrapper,
+        r#"#!/bin/sh
+for arg in "$@"; do
+  if [ "$arg" = "fetch" ] || [ "$arg" = "clone" ]; then
+    printf '%s\n' "$*" >>"$RIPCLONE_TEST_SOURCE_LOG"
+    if [ "$RIPCLONE_TEST_SOURCE_FORBIDDEN" = "1" ]; then
+      exit 97
+    fi
+    break
+  fi
+done
+exec "$RIPCLONE_TEST_REAL_GIT" "$@"
+"#,
+    )
+    .expect("write source probe");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
+            .expect("make source probe executable");
+    }
+    let original_path = std::env::var_os("PATH").unwrap_or_default();
+    let _source_env = EnvGuard::capture(&[
+        "PATH",
+        "RIPCLONE_TEST_REAL_GIT",
+        "RIPCLONE_TEST_SOURCE_LOG",
+        "RIPCLONE_TEST_SOURCE_FORBIDDEN",
+    ]);
+    unsafe {
+        std::env::set_var(
+            "PATH",
+            format!(
+                "{}:{}",
+                source_probe.path().display(),
+                original_path.to_string_lossy()
+            ),
+        );
+        std::env::set_var("RIPCLONE_TEST_REAL_GIT", &real_git);
+        std::env::set_var("RIPCLONE_TEST_SOURCE_LOG", &source_log);
+        std::env::set_var("RIPCLONE_TEST_SOURCE_FORBIDDEN", "1");
+    }
+    // Exact metadata reads do not need a mirror. Removing it makes any
+    // accidental source acquisition cross the failing Git adapter instead of
+    // disappearing behind the mirror-freshness cache.
+    std::fs::remove_dir_all(server.repo_root.join(repo_id.mirror_dir_name()))
+        .expect("remove mirror before pinned metadata reads");
+
+    let probe = server
+        .pinned_path_probe
+        .as_ref()
+        .expect("pinned-path test adapter");
+    probe.arm();
+    let before = request().send().await.expect("modern moving-row lookup");
+    assert_eq!(before.status(), StatusCode::OK);
+    let before: serde_json::Value = before.json().await.expect("modern ready response");
+    let before_work = probe.snapshot();
+    assert_eq!(before_work.branch_reads, 2);
+    assert_eq!(before_work.enqueues, 0);
+    assert_eq!(before_work.builder_entries, 0);
+
+    let mut serialized = serde_json::to_value(&settled).expect("serialize settled row");
+    serialized["full_clonepack"]
+        .as_object_mut()
+        .expect("full clonepack object")
+        .remove("commit");
+    let legacy: ripclone::RefInfo =
+        serde_json::from_value(serialized).expect("deserialize omitted variant commit");
+    assert!(legacy.full_clonepack.commit.is_empty());
+    store
+        .save_branch(&repo_id, "main", &legacy)
+        .await
+        .expect("store legacy moving row");
+
+    probe.arm();
+    let after = request().send().await.expect("legacy moving-row lookup");
+    assert_eq!(after.status(), StatusCode::OK);
+    let after: serde_json::Value = after.json().await.expect("legacy ready response");
+    let after_work = probe.snapshot();
+    assert_eq!(after_work.branch_reads, 2);
+    assert_eq!(after_work.enqueues, 0);
+    assert_eq!(after_work.builder_entries, 0);
+    assert!(
+        std::fs::read_to_string(&source_log)
+            .expect("read exact-path source log")
+            .is_empty(),
+        "pinned metadata reads must not enter mirror source acquisition"
+    );
+    assert_eq!(
+        after, before,
+        "omitting the compatible variant commit must not change the exact response"
+    );
+
+    // Non-vacuity control: the same server's ordinary sync path must cross the
+    // wrapped source boundary and produce at least one fetch record.
+    probe.disarm();
+    unsafe {
+        std::env::set_var("RIPCLONE_TEST_SOURCE_FORBIDDEN", "0");
+    }
+    origin.commit(&[("value.txt", "B\n")], "B source control");
+    origin.publish();
+    server
+        .client()
+        .sync_repo("acme/legacy-moving-pin", None)
+        .await
+        .expect("ordinary sync reaches source control");
+    assert!(
+        !std::fs::read_to_string(&source_log)
+            .expect("read source control log")
+            .is_empty(),
+        "source boundary control did not observe mirror acquisition"
+    );
+}
+
+#[tokio::test]
 async fn pinned_lookup_uses_exact_a_while_phase_one_b_is_paused() {
     let _guard = env_lock().lock().await;
     init(false);
@@ -1298,6 +1644,23 @@ async fn pinned_lookup_uses_exact_a_while_phase_one_b_is_paused() {
         .save_branch(&repo_id, &format!("main#{a}"), &exact_a)
         .await
         .expect("publish exact A fixture");
+    let pinned_url = format!(
+        "{}/v1/repos/github/acme/phase-one-pin/refs/main?clonepack=full&pinned={a}",
+        server.url
+    );
+    let exact_snapshot = reqwest::Client::new()
+        .get(&pinned_url)
+        .header("Authorization", format!("Ripclone {}", token_hash()))
+        .header("x-ripclone-protocol", "2")
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+        .expect("baseline exact A lookup");
+    assert_eq!(exact_snapshot.status(), StatusCode::OK);
+    let exact_snapshot: serde_json::Value = exact_snapshot
+        .json()
+        .await
+        .expect("baseline exact A response");
 
     barrier.arm();
     let b = origin.commit(&[("value.txt", "B\n")], "B");
@@ -1335,10 +1698,6 @@ async fn pinned_lookup_uses_exact_a_while_phase_one_b_is_paused() {
         .as_ref()
         .expect("pinned-path test adapter");
     probe.arm();
-    let pinned_url = format!(
-        "{}/v1/repos/github/acme/phase-one-pin/refs/main?clonepack=full&pinned={a}",
-        server.url
-    );
     let response = reqwest::Client::new()
         .get(&pinned_url)
         .header("Authorization", format!("Ripclone {}", token_hash()))
@@ -1349,11 +1708,17 @@ async fn pinned_lookup_uses_exact_a_while_phase_one_b_is_paused() {
         .expect("pinned lookup while B phase one is paused");
     assert_eq!(response.status(), StatusCode::OK);
     let body: serde_json::Value = response.json().await.expect("ready A response");
-    assert_eq!(body["commit"], a);
-    assert_eq!(body["clonepack_manifest"], exact_a.full_clonepack.manifest);
+    assert_eq!(
+        body, exact_snapshot,
+        "phase-one publication must not mix any B field or URL into exact A"
+    );
     let exact_observed = probe.snapshot();
-    assert_eq!(exact_observed.branch_reads, 2);
+    assert_eq!(
+        exact_observed.branch_reads, 1,
+        "concrete exact hit is one point read"
+    );
     assert_eq!(exact_observed.enqueues, 0);
+    assert_eq!(exact_observed.builder_entries, 0);
 
     // With the exact row absent, the paused moving B row still carries
     // Full(A). It must not satisfy pin A because its enclosing/top-level fields
@@ -1378,6 +1743,7 @@ async fn pinned_lookup_uses_exact_a_while_phase_one_b_is_paused() {
     let fallback_observed = probe.snapshot();
     assert_eq!(fallback_observed.branch_reads, 2);
     assert_eq!(fallback_observed.enqueues, 0);
+    assert_eq!(fallback_observed.builder_entries, 0);
 
     proceed.send(()).expect("release B phase-one publication");
     tokio::time::timeout(Duration::from_secs(20), &mut sync_b)
@@ -1540,11 +1906,7 @@ async fn release_cli_installs_the_fetched_snapshot_after_branch_movement() {
         register_added_without_build(&server, &format!("acme/{repo}"))
             .await
             .expect("register release fixture");
-        server
-            .client()
-            .sync_repo(&format!("acme/{repo}"), None)
-            .await
-            .expect("sync release fixture");
+        let settled = sync_until_archive_ready(&server, "acme", &repo).await;
         let variant = if mode == CloneMode::Files {
             "full"
         } else {
@@ -1556,6 +1918,7 @@ async fn release_cli_installs_the_fetched_snapshot_after_branch_movement() {
             .await
             .expect("selected variant ready")
             .commit;
+        assert_eq!(pinned, settled.commit);
         if mode == CloneMode::Files {
             let exact_store = FileRefStore::new(&server.repo_root);
             let repo_id = RepoId::github(format!("acme/{repo}"));
@@ -1592,13 +1955,13 @@ async fn release_cli_installs_the_fetched_snapshot_after_branch_movement() {
         if mode == CloneMode::Files {
             command.args(["--mode", "files"]);
         }
-        let child = command.spawn().expect("spawn selected CLI");
+        let child = spawn_bounded_child(&mut command).expect("spawn selected CLI");
         if !matches!(
             tokio::time::timeout(Duration::from_secs(20), entered).await,
             Ok(Ok(()))
         ) {
             let output = wait_child_output_bounded(child, Duration::from_secs(1)).await;
-            proxy_task.abort();
+            abort_server_task(proxy_task).await;
             panic!("release CLI never reached ref barrier: {output:?}");
         }
         origin.commit(&[("value.txt", "B\n")], "B");
@@ -1623,7 +1986,7 @@ async fn release_cli_installs_the_fetched_snapshot_after_branch_movement() {
         let output = wait_child_output_bounded(child, Duration::from_secs(60))
             .await
             .expect("release CLI clone bounded, killed, and reaped on timeout");
-        proxy_task.abort();
+        abort_server_task(proxy_task).await;
         assert!(
             output.status.success(),
             "release {name} clone failed\nstdout:\n{}\nstderr:\n{}",
