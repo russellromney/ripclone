@@ -401,6 +401,9 @@ struct RefTraceState {
     metrics: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
     first_ref: Arc<std::sync::atomic::AtomicBool>,
     ready_count: Arc<std::sync::atomic::AtomicUsize>,
+    initial_pack_url: Arc<std::sync::Mutex<Option<(usize, String)>>>,
+    initial_pinned_entered: Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+    initial_pinned_proceed: Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
     refresh_signal: Arc<std::sync::Mutex<RefreshSignal>>,
     refresh_proceed: Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
     force_first_pending: bool,
@@ -427,6 +430,20 @@ async fn ref_trace_forward(
             .unwrap_or_else(|error| error.into_inner())
             .push(uri.to_string());
         if uri.query().is_some_and(|query| query.contains("pinned=")) {
+            let initial_entered = state
+                .initial_pinned_entered
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take();
+            if let Some(entered) = initial_entered {
+                let _ = entered.send(());
+                if let Some(proceed) = state.initial_pinned_proceed.lock().await.take() {
+                    tokio::time::timeout(Duration::from_secs(120), proceed)
+                        .await
+                        .expect("initial pinned request released within 120 seconds")
+                        .expect("initial pinned request barrier sender remained alive");
+                }
+            }
             // Arming and request ingress share one lock: a pinned request that
             // arrived before the selected signed-URL barrier cannot consume the
             // signal intended to prove the subsequent exact refresh.
@@ -507,6 +524,25 @@ async fn ref_trace_forward(
     }
     if is_ref && status == StatusCode::OK {
         let ready_index = state.ready_count.fetch_add(1, Ordering::SeqCst);
+        if ready_index == 0
+            && let Some((pack_index, signed_url)) = state
+                .initial_pack_url
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take()
+        {
+            let mut ready: serde_json::Value =
+                serde_json::from_slice(&bytes).expect("initial ready ref JSON");
+            let pack_urls = ready["pack_chunk_urls"]
+                .as_array_mut()
+                .expect("initial ready ref has signed pack URLs");
+            assert!(
+                pack_index < pack_urls.len(),
+                "selected pack URL index {pack_index} is in range"
+            );
+            pack_urls[pack_index] = serde_json::Value::String(signed_url);
+            bytes = Bytes::from(serde_json::to_vec(&ready).expect("encode initial ready ref"));
+        }
         let clone_id = if ready_index == 0 {
             "first-clone-id"
         } else {
@@ -526,6 +562,26 @@ struct RefTraceProxy {
 }
 
 impl RefTraceProxy {
+    fn replace_initial_pack_url(&self, pack_index: usize, signed_url: String) {
+        let expires_in_one_second = url::Url::parse(&signed_url)
+            .expect("selected signed pack URL parses")
+            .query_pairs()
+            .any(|(key, value)| key.eq_ignore_ascii_case("x-amz-expires") && value == "1");
+        assert!(
+            expires_in_one_second,
+            "selected pack URL must be a genuine one-second presign"
+        );
+        let mut replacement = self
+            .state
+            .initial_pack_url
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        assert!(
+            replacement.replace((pack_index, signed_url)).is_none(),
+            "initial pack URL replacement configured once"
+        );
+    }
+
     fn arm_next_pinned_refresh(&self) {
         let mut signal = self
             .state
@@ -583,11 +639,15 @@ async fn start_ref_trace_proxy(
     RefTraceProxy,
     tokio::sync::oneshot::Receiver<()>,
     tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
 ) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind ref trace proxy");
     let address = listener.local_addr().expect("ref trace address");
+    let (initial_tx, initial_rx) = tokio::sync::oneshot::channel();
+    let (initial_proceed_tx, initial_proceed_rx) = tokio::sync::oneshot::channel();
     let (refresh_tx, refresh_rx) = tokio::sync::oneshot::channel();
     let (refresh_proceed_tx, refresh_proceed_rx) = tokio::sync::oneshot::channel();
     let state = RefTraceState {
@@ -596,6 +656,13 @@ async fn start_ref_trace_proxy(
         metrics: Arc::new(std::sync::Mutex::new(Vec::new())),
         first_ref: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         ready_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        initial_pack_url: Arc::new(std::sync::Mutex::new(None)),
+        initial_pinned_entered: Arc::new(std::sync::Mutex::new(
+            force_first_pending.then_some(initial_tx),
+        )),
+        initial_pinned_proceed: Arc::new(tokio::sync::Mutex::new(
+            force_first_pending.then_some(initial_proceed_rx),
+        )),
         refresh_signal: Arc::new(std::sync::Mutex::new(RefreshSignal {
             armed: false,
             entered: Some(refresh_tx),
@@ -619,6 +686,8 @@ async fn start_ref_trace_proxy(
             state,
             handle: Some(handle),
         },
+        initial_rx,
+        initial_proceed_tx,
         refresh_rx,
         refresh_proceed_tx,
     )
@@ -908,6 +977,26 @@ async fn start_barrier_proxy_for_request_after_marker(
         entered,
         proceed,
         Some(arm_marker),
+        Some(request_fragment),
+    )
+    .await
+}
+
+async fn start_barrier_proxy_for_request(
+    target_endpoint: &str,
+    after_bytes: usize,
+    close_on_proceed: bool,
+    entered: tokio::sync::oneshot::Sender<()>,
+    proceed: tokio::sync::oneshot::Receiver<()>,
+    request_fragment: String,
+) -> BarrierProxy {
+    start_barrier_proxy_inner(
+        target_endpoint,
+        after_bytes,
+        close_on_proceed,
+        entered,
+        proceed,
+        None,
         Some(request_fragment),
     )
     .await
@@ -1979,8 +2068,13 @@ async fn expired_signed_url_retry_stays_on_pinned_commit() {
         Arc::clone(&verifier) as Arc<dyn AccessVerifier>,
     )
     .await;
-    let (ref_trace, mut refresh_entered, _refresh_proceed) =
-        start_ref_trace_proxy(&server.url, true, false).await;
+    let (
+        ref_trace,
+        initial_pinned_entered,
+        initial_pinned_proceed,
+        mut refresh_entered,
+        _refresh_proceed,
+    ) = start_ref_trace_proxy(&server.url, true, false).await;
     let origin = make_origin("acme", &repo);
     guard.track_repo("acme", &repo);
     // Two distinct >2 MiB blobs cross the production 4 MiB HEAD-pack target,
@@ -2019,7 +2113,6 @@ async fn expired_signed_url_retry_stays_on_pinned_commit() {
     add_acme_repo(&server, &repo).await;
 
     unsafe {
-        std::env::set_var("RIPCLONE_SIGNED_URL_TTL_PRIVATE_SECS", "1");
         std::env::set_var("RIPCLONE_TEST_DOWNLOAD_CONCURRENCY", "1");
         std::env::set_var("RIPCLONE_TEST_SIGNED_URL_PROXY", &proxy.url);
         std::env::set_var("RIPCLONE_TESTING", "1");
@@ -2027,6 +2120,11 @@ async fn expired_signed_url_retry_stays_on_pinned_commit() {
         std::env::set_var("RIPCLONE_TEST_ATTEMPT_WRITER_PROCEED", &writer_proceed);
         std::env::set_var("RIPCLONE_TEST_ATTEMPT_CLEANUP_ENTERED", &cleanup_entered);
     }
+    let short_pack_url = make_s3_storage(&direct_env, &prefix)
+        .expect("selected pack signing storage")
+        .signed_url(&exact_a.packs[1].pack, Duration::from_secs(1))
+        .expect("selected pack supports one-second signing");
+    ref_trace.replace_initial_pack_url(1, short_pack_url);
     let binary = required_ripclone_bin();
     let mut command = std::process::Command::new(&binary);
     command
@@ -2049,19 +2147,18 @@ async fn expired_signed_url_retry_stays_on_pinned_commit() {
     let child = spawn_bounded_child(&mut command).expect("spawn release CLI clone");
 
     if !matches!(
-        tokio::time::timeout(Duration::from_secs(30), entered_rx).await,
+        tokio::time::timeout(Duration::from_secs(30), initial_pinned_entered).await,
         Ok(Ok(()))
     ) {
         let output = wait_child_output_bounded(child, Duration::from_secs(5))
             .await
             .expect("wait failed clone");
         panic!(
-            "CLI clone never reached the signed-URL barrier\nstdout:\n{}\nstderr:\n{}",
+            "CLI clone never requested pinned A after its first pending response\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
     }
-    ref_trace.arm_next_pinned_refresh();
     origin.commit(&[("value.txt", "B\n"), ("stable.txt", "stable\n")], "B");
     origin.publish();
     let newer = git(&origin.bare, &["rev-parse", "HEAD"]);
@@ -2074,6 +2171,23 @@ async fn expired_signed_url_retry_stays_on_pinned_commit() {
         .expect("published S3 B row present")
         .commit;
     assert_eq!(published_b, newer);
+    initial_pinned_proceed
+        .send(())
+        .expect("release initial exact-A metadata request");
+    if !matches!(
+        tokio::time::timeout(Duration::from_secs(30), entered_rx).await,
+        Ok(Ok(()))
+    ) {
+        let output = wait_child_output_bounded(child, Duration::from_secs(5))
+            .await
+            .expect("wait failed clone");
+        panic!(
+            "CLI clone never reached the selected signed-URL barrier\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    ref_trace.arm_next_pinned_refresh();
     let authorization_calls_before_refresh = verifier.calls();
     assert!(
         writer_entered.exists(),
@@ -2125,7 +2239,6 @@ async fn expired_signed_url_retry_stays_on_pinned_commit() {
 
     let output = wait_child_output(child).await;
     unsafe {
-        std::env::remove_var("RIPCLONE_SIGNED_URL_TTL_PRIVATE_SECS");
         std::env::remove_var("RIPCLONE_TEST_DOWNLOAD_CONCURRENCY");
         std::env::remove_var("RIPCLONE_TEST_SIGNED_URL_PROXY");
         std::env::remove_var("RIPCLONE_TESTING");
@@ -2216,7 +2329,6 @@ async fn revoked_authorization_blocks_pinned_refresh() {
 
     let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
     let (proceed_tx, proceed_rx) = tokio::sync::oneshot::channel();
-    let proxy = start_barrier_proxy(&direct_env.endpoint, 16, true, entered_tx, proceed_rx).await;
     let verifier = Arc::new(ToggleAccessVerifier::new(true));
     let server = start_s3_server_authorized(
         &direct_env,
@@ -2224,8 +2336,13 @@ async fn revoked_authorization_blocks_pinned_refresh() {
         Arc::clone(&verifier) as Arc<dyn AccessVerifier>,
     )
     .await;
-    let (ref_trace, mut refresh_entered, refresh_proceed) =
-        start_ref_trace_proxy(&server.url, false, true).await;
+    let (
+        ref_trace,
+        initial_pinned_entered,
+        initial_pinned_proceed,
+        mut refresh_entered,
+        refresh_proceed,
+    ) = start_ref_trace_proxy(&server.url, true, true).await;
 
     let origin = make_origin("acme", &repo);
     guard.track_repo("acme", &repo);
@@ -2233,14 +2350,31 @@ async fn revoked_authorization_blocks_pinned_refresh() {
     origin.publish();
     let (pinned, exact_store, exact_a, _fixture) =
         seed_shallow_s3_fixture(&direct_env, &prefix, &repo).await;
+    assert!(
+        !exact_a.packs.is_empty(),
+        "authorization fixture must publish a real shallow pack"
+    );
+    let proxy = start_barrier_proxy_for_request(
+        &direct_env.endpoint,
+        16,
+        true,
+        entered_tx,
+        proceed_rx,
+        exact_a.packs[0].pack.clone(),
+    )
+    .await;
     let repo_id = RepoId::github(format!("acme/{repo}"));
     add_acme_repo(&server, &repo).await;
 
     unsafe {
-        std::env::set_var("RIPCLONE_SIGNED_URL_TTL_PRIVATE_SECS", "1");
         std::env::set_var("RIPCLONE_TEST_DOWNLOAD_CONCURRENCY", "1");
         std::env::set_var("RIPCLONE_TEST_SIGNED_URL_PROXY", &proxy.url);
     }
+    let short_pack_url = make_s3_storage(&direct_env, &prefix)
+        .expect("selected pack signing storage")
+        .signed_url(&exact_a.packs[0].pack, Duration::from_secs(1))
+        .expect("selected pack supports one-second signing");
+    ref_trace.replace_initial_pack_url(0, short_pack_url);
 
     let out = tempfile::tempdir().expect("clone out");
     let target = out.path().join("clone");
@@ -2263,6 +2397,27 @@ async fn revoked_authorization_blocks_pinned_refresh() {
     let child = spawn_bounded_child(&mut command).expect("spawn ripclone clone");
 
     if !matches!(
+        tokio::time::timeout(Duration::from_secs(30), initial_pinned_entered).await,
+        Ok(Ok(()))
+    ) {
+        let output = wait_child_output_bounded(child, Duration::from_secs(5))
+            .await
+            .expect("wait failed clone");
+        panic!(
+            "CLI clone never requested pinned A after its first pending response\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    origin.commit(&[("value.txt", "B\n"), ("stable.txt", "stable\n")], "B");
+    origin.publish();
+    let newer = git(&origin.bare, &["rev-parse", "HEAD"]);
+    assert_ne!(pinned, newer);
+    publish_moving_s3_row(&exact_store, &repo_id, &exact_a, &newer).await;
+    initial_pinned_proceed
+        .send(())
+        .expect("release initial exact-A metadata request");
+    if !matches!(
         tokio::time::timeout(Duration::from_secs(30), entered_rx).await,
         Ok(Ok(()))
     ) {
@@ -2270,17 +2425,12 @@ async fn revoked_authorization_blocks_pinned_refresh() {
             .await
             .expect("wait failed clone");
         panic!(
-            "CLI clone never reached the signed-URL barrier\nstdout:\n{}\nstderr:\n{}",
+            "CLI clone never reached the selected signed-URL barrier\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
     }
     ref_trace.arm_next_pinned_refresh();
-    origin.commit(&[("value.txt", "B\n"), ("stable.txt", "stable\n")], "B");
-    origin.publish();
-    let newer = git(&origin.bare, &["rev-parse", "HEAD"]);
-    assert_ne!(pinned, newer);
-    publish_moving_s3_row(&exact_store, &repo_id, &exact_a, &newer).await;
     sleep(Duration::from_secs(2)).await;
     proceed_tx.send(()).expect("release signed-URL barrier");
     tokio::time::timeout(Duration::from_secs(20), &mut refresh_entered)
@@ -2299,7 +2449,6 @@ async fn revoked_authorization_blocks_pinned_refresh() {
 
     let output = wait_child_output(child).await;
     unsafe {
-        std::env::remove_var("RIPCLONE_SIGNED_URL_TTL_PRIVATE_SECS");
         std::env::remove_var("RIPCLONE_TEST_DOWNLOAD_CONCURRENCY");
         std::env::remove_var("RIPCLONE_TEST_SIGNED_URL_PROXY");
     }
