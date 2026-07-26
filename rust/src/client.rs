@@ -650,10 +650,14 @@ fn wait_for_test_attempt_writer() -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
         Err(error) => return Err(error).context("create attempt-writer test marker"),
     }
-    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    // The real MinIO composition mutates S3 metadata before releasing this
+    // worker, which can exceed a single object-store request timeout on a
+    // loaded runner. Keep the safety bound below the test's 300-second cap
+    // while ensuring cleanup, rather than this hook, owns worker termination.
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
     while !proceed.exists() {
         if std::time::Instant::now() >= deadline {
-            anyhow::bail!("attempt-writer test barrier exceeded 20 seconds");
+            anyhow::bail!("attempt-writer test barrier exceeded 120 seconds");
         }
         std::thread::sleep(Duration::from_millis(10));
     }
