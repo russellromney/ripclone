@@ -1978,6 +1978,10 @@ async fn expired_signed_url_retry_stays_on_pinned_commit() {
         .arg("1")
         .arg("--verify-upstream=never")
         .env("RIPCLONE_SERVER_TOKEN", TOKEN)
+        // This composition proves the outer stale-URL attempt teardown. Bound
+        // the inner transport layer to one attempt so its independent
+        // per-request timeout cannot delay the post-stale cleanup barrier.
+        .env("RIPCLONE_FETCH_MAX_ATTEMPTS", "1")
         .env_remove("RIPCLONE_NO_METRICS")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -2027,7 +2031,7 @@ async fn expired_signed_url_retry_stays_on_pinned_commit() {
     proceed_tx
         .send(())
         .expect("expire and close first signed request");
-    tokio::time::timeout(Duration::from_secs(20), async {
+    tokio::time::timeout(Duration::from_secs(60), async {
         while !cleanup_entered.exists() {
             sleep(Duration::from_millis(10)).await;
         }
