@@ -660,6 +660,31 @@ fn wait_for_test_attempt_writer() -> Result<()> {
     Ok(())
 }
 
+/// Mark the exact lifecycle point where a stale inner attempt has returned but
+/// cleanup still owns a live task. This is test-only and lets the subprocess
+/// proof distinguish cleanup blocking from unrelated artifact-fetch retries.
+fn mark_test_stale_attempt_cleanup(cleanup: &AttemptCleanup, error: &anyhow::Error) {
+    if std::env::var_os("RIPCLONE_TESTING").as_deref() != Some(std::ffi::OsStr::new("1"))
+        || !is_stale_signed_url(error)
+    {
+        return;
+    }
+    let owns_task = cleanup.0.active_guards.load(Ordering::SeqCst) > 0
+        || !cleanup
+            .0
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_empty();
+    if !owns_task {
+        return;
+    }
+    let Some(marker) = std::env::var_os("RIPCLONE_TEST_ATTEMPT_CLEANUP_ENTERED") else {
+        return;
+    };
+    std::fs::write(marker, b"entered").expect("write stale-attempt cleanup test marker");
+}
+
 #[derive(Debug, Deserialize)]
 pub struct SnapshotResponse {
     pub owner: String,
@@ -1719,6 +1744,9 @@ impl Client {
                 repo_path, branch, rev, target, mode, clonepack, bench, identity, cleanup, &staging,
             )
             .await;
+        if let Err(error) = &result {
+            mark_test_stale_attempt_cleanup(cleanup, error);
+        }
         drop(close_on_drop);
         reaper.await.context("attempt cleanup task")?;
         result

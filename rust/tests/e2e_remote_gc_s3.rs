@@ -1908,6 +1908,7 @@ async fn expired_signed_url_retry_stays_on_pinned_commit() {
     let target = out.path().join("clone");
     let writer_entered = out.path().join("writer-entered");
     let writer_proceed = out.path().join("writer-proceed");
+    let cleanup_entered = out.path().join("cleanup-entered");
     let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
     let (proceed_tx, proceed_rx) = tokio::sync::oneshot::channel();
     let verifier = Arc::new(ToggleAccessVerifier::new(true));
@@ -1963,6 +1964,7 @@ async fn expired_signed_url_retry_stays_on_pinned_commit() {
         std::env::set_var("RIPCLONE_TESTING", "1");
         std::env::set_var("RIPCLONE_TEST_ATTEMPT_WRITER_ENTERED", &writer_entered);
         std::env::set_var("RIPCLONE_TEST_ATTEMPT_WRITER_PROCEED", &writer_proceed);
+        std::env::set_var("RIPCLONE_TEST_ATTEMPT_CLEANUP_ENTERED", &cleanup_entered);
     }
     let binary = required_ripclone_bin();
     let mut command = std::process::Command::new(&binary);
@@ -2025,21 +2027,27 @@ async fn expired_signed_url_retry_stays_on_pinned_commit() {
     proceed_tx
         .send(())
         .expect("expire and close first signed request");
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while !cleanup_entered.exists() {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("stale inner attempt returned while cleanup still owned its writer");
     assert!(
         tokio::time::timeout(Duration::from_millis(500), &mut refresh_entered)
             .await
             .is_err(),
-        "attempt two began before the held staging writer was released"
+        "attempt two began after stale classification but before the held writer was released"
     );
     assert!(
         initial_staging.exists(),
         "staging was removed while its writer was still held"
     );
     std::fs::write(&writer_proceed, b"go").expect("release staging writer");
-    // The artifact fetcher preserves its existing bounded transport retry
-    // budget before classifying the failed signed URL as stale. Allow that
-    // production budget to finish; this signal still fires before the exact
-    // request is forwarded to the (potentially slow) S3-backed ref store.
+    // Artifact transport retries finished before the cleanup marker above.
+    // This signal fires only after the held worker exits and the old staging
+    // tree is drained, before the exact request reaches the S3-backed ref store.
     tokio::time::timeout(Duration::from_secs(90), &mut refresh_entered)
         .await
         .expect("exact refresh began after writer release and signed-fetch retries")
@@ -2057,6 +2065,7 @@ async fn expired_signed_url_retry_stays_on_pinned_commit() {
         std::env::remove_var("RIPCLONE_TESTING");
         std::env::remove_var("RIPCLONE_TEST_ATTEMPT_WRITER_ENTERED");
         std::env::remove_var("RIPCLONE_TEST_ATTEMPT_WRITER_PROCEED");
+        std::env::remove_var("RIPCLONE_TEST_ATTEMPT_CLEANUP_ENTERED");
     }
     assert!(
         output.status.success(),
