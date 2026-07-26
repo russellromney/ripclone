@@ -1853,12 +1853,9 @@ async fn remote_gc_during_faulting_clone_is_safe() {
     origin.commit(&[("a.txt", "gc race\n"), ("b.txt", "x\n")], "c1");
     origin.publish();
 
+    let (_pinned, _exact_store, _exact_a, _fixture) =
+        seed_shallow_s3_fixture(&env, &prefix, &repo).await;
     add_acme_repo(&server, &repo).await;
-    server
-        .client()
-        .sync_repo(&format!("acme/{repo}"), None)
-        .await
-        .expect("sync");
 
     // Redirect only the presigned artifact URLs through the barrier proxy.
     // Serialize editable downloads so the first large signed-URL GET deterministically
@@ -1871,7 +1868,7 @@ async fn remote_gc_during_faulting_clone_is_safe() {
     // Start the clone on a faulting server and let it begin resolving/downloading.
     let client = server.client();
     let repo_path = format!("acme/{repo}");
-    let clone_task = tokio::spawn(async move {
+    let mut clone_task = tokio::spawn(async move {
         let out = tempfile::tempdir().expect("clone temp dir");
         let target = out.path().join("clone");
         let result = client
@@ -1909,10 +1906,26 @@ async fn remote_gc_during_faulting_clone_is_safe() {
     let report = gc.run().await.expect("remote gc run during clone");
     eprintln!("GC during clone: {report:?}");
 
-    // Release the barrier and let the clone finish (or fail cleanly).
-    proceed_tx.send(()).expect("release barrier");
+    // Release the barrier and let the clone finish (or fail cleanly). The
+    // proxy's hold is independently bounded; if a slow GC outlives it, the
+    // receiver is already gone and the clone must take the clean-failure arm
+    // below rather than making the test panic on this test-only signal.
+    if proceed_tx.send(()).is_err() {
+        eprintln!("GC outlived the bounded proxy hold; verifying clean clone failure");
+    }
 
-    let (result, _out, target) = clone_task.await.expect("clone task joined");
+    let (result, _out, target) =
+        match tokio::time::timeout(Duration::from_secs(30), &mut clone_task).await {
+            Ok(joined) => joined.expect("clone task joined"),
+            Err(_) => {
+                clone_task.abort();
+                tokio::time::timeout(Duration::from_secs(5), &mut clone_task)
+                    .await
+                    .expect("aborted clone task joined within five seconds")
+                    .expect_err("aborted clone task must be cancelled");
+                panic!("clone task did not settle within 30 seconds after GC");
+            }
+        };
     unsafe {
         std::env::remove_var("RIPCLONE_TEST_SIGNED_URL_PROXY");
         std::env::remove_var("RIPCLONE_TEST_DOWNLOAD_CONCURRENCY");
