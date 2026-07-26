@@ -401,11 +401,14 @@ struct RefTraceState {
     metrics: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
     first_ref: Arc<std::sync::atomic::AtomicBool>,
     ready_count: Arc<std::sync::atomic::AtomicUsize>,
-    pinned_count: Arc<std::sync::atomic::AtomicUsize>,
-    refresh_pinned_index: usize,
-    refresh_entered: Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+    refresh_signal: Arc<std::sync::Mutex<RefreshSignal>>,
     refresh_proceed: Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
     force_first_pending: bool,
+}
+
+struct RefreshSignal {
+    armed: bool,
+    entered: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 async fn ref_trace_forward(
@@ -424,16 +427,23 @@ async fn ref_trace_forward(
             .unwrap_or_else(|error| error.into_inner())
             .push(uri.to_string());
         if uri.query().is_some_and(|query| query.contains("pinned=")) {
-            let pinned_index = state.pinned_count.fetch_add(1, Ordering::SeqCst);
-            if pinned_index == state.refresh_pinned_index {
-                if let Some(entered) = state
-                    .refresh_entered
+            // Arming and request ingress share one lock: a pinned request that
+            // arrived before the selected signed-URL barrier cannot consume the
+            // signal intended to prove the subsequent exact refresh.
+            let entered = {
+                let mut signal = state
+                    .refresh_signal
                     .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .take()
-                {
-                    let _ = entered.send(());
+                    .unwrap_or_else(|error| error.into_inner());
+                if signal.armed {
+                    signal.armed = false;
+                    signal.entered.take()
+                } else {
+                    None
                 }
+            };
+            if let Some(entered) = entered {
+                let _ = entered.send(());
                 if let Some(proceed) = state.refresh_proceed.lock().await.take() {
                     tokio::time::timeout(Duration::from_secs(30), proceed)
                         .await
@@ -516,6 +526,20 @@ struct RefTraceProxy {
 }
 
 impl RefTraceProxy {
+    fn arm_next_pinned_refresh(&self) {
+        let mut signal = self
+            .state
+            .refresh_signal
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        assert!(!signal.armed, "pinned refresh signal already armed");
+        assert!(
+            signal.entered.is_some(),
+            "pinned refresh signal was already consumed"
+        );
+        signal.armed = true;
+    }
+
     fn refs(&self) -> Vec<String> {
         self.state
             .refs
@@ -572,9 +596,10 @@ async fn start_ref_trace_proxy(
         metrics: Arc::new(std::sync::Mutex::new(Vec::new())),
         first_ref: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         ready_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        pinned_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        refresh_pinned_index: usize::from(force_first_pending),
-        refresh_entered: Arc::new(std::sync::Mutex::new(Some(refresh_tx))),
+        refresh_signal: Arc::new(std::sync::Mutex::new(RefreshSignal {
+            armed: false,
+            entered: Some(refresh_tx),
+        })),
         refresh_proceed: Arc::new(tokio::sync::Mutex::new(
             pause_refresh.then_some(refresh_proceed_rx),
         )),
@@ -2036,6 +2061,7 @@ async fn expired_signed_url_retry_stays_on_pinned_commit() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+    ref_trace.arm_next_pinned_refresh();
     origin.commit(&[("value.txt", "B\n"), ("stable.txt", "stable\n")], "B");
     origin.publish();
     let newer = git(&origin.bare, &["rev-parse", "HEAD"]);
@@ -2249,6 +2275,7 @@ async fn revoked_authorization_blocks_pinned_refresh() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+    ref_trace.arm_next_pinned_refresh();
     origin.commit(&[("value.txt", "B\n"), ("stable.txt", "stable\n")], "B");
     origin.publish();
     let newer = git(&origin.bare, &["rev-parse", "HEAD"]);
