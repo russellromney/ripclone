@@ -370,13 +370,13 @@ pub async fn start_delay_proxy(target_endpoint: &str, delay: Duration) -> DelayP
     }
 }
 
-/// Deterministic mid-download barrier for signed-URL GETs.
+/// Deterministic barrier for signed-URL GETs.
 ///
-/// The first presigned GET whose response body is larger than `after_bytes` is
-/// forwarded until exactly `after_bytes` have been sent, then the proxy signals
-/// `entered` and waits on `proceed`. After the test releases the barrier the
-/// proxy either closes the connection (`close_on_proceed = true`) or copies the
-/// remainder (`false`).
+/// The selected presigned GET signals `entered` and waits on `proceed`. With
+/// `close_on_proceed`, the proxy returns a complete 403 without forwarding the
+/// selected request, deterministically modeling an expired signed URL. Otherwise
+/// it forwards `after_bytes`, holds the remaining response body, and copies the
+/// remainder after release.
 struct BarrierState {
     after_bytes: usize,
     close_on_proceed: bool,
@@ -662,6 +662,62 @@ async fn proxy_signed_get_barrier(
         .unwrap_or_else(|e| e.into_inner())
         .signed_headers
         .push(request_header.clone());
+
+    let (after_bytes, close_on_proceed, entered, proceed, arm_marker) = {
+        let mut b = barrier.lock().unwrap();
+        let selected = b
+            .request_fragment
+            .as_ref()
+            .is_none_or(|fragment| request_header.contains(fragment));
+        if selected && !b.consumed.load(std::sync::atomic::Ordering::SeqCst) {
+            b.consumed.store(true, std::sync::atomic::Ordering::SeqCst);
+            (
+                b.after_bytes,
+                b.close_on_proceed,
+                b.entered.take(),
+                b.proceed.take(),
+                b.arm_marker.clone(),
+            )
+        } else {
+            (usize::MAX, false, None, None, None)
+        }
+    };
+
+    // A complete 403 is a deterministic signed-URL expiry response. Relying on
+    // a truncated HTTP body to become an immediate transport error varied by
+    // platform and could leave the client waiting for its request timeout.
+    if close_on_proceed && entered.is_some() {
+        if let Some(marker) = arm_marker {
+            tokio::time::timeout(Duration::from_secs(20), async {
+                while !marker.exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("selected signed request overlapped a staging writer");
+        }
+        if let Some(entered) = entered {
+            eprintln!("BARRIER PROXY: entered expired-response barrier");
+            let _ = entered.send(());
+        }
+        let released = if let Some(proceed) = proceed {
+            matches!(
+                tokio::time::timeout(Duration::from_secs(30), proceed).await,
+                Ok(Ok(()))
+            )
+        } else {
+            false
+        };
+        if released {
+            let _ = client
+                .write_all(
+                    b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await;
+        }
+        return;
+    }
+
     let Ok(mut backend) = tokio::net::TcpStream::connect(target).await else {
         return;
     };
@@ -692,26 +748,6 @@ async fn proxy_signed_get_barrier(
         return;
     }
     let mut pending_body: Vec<u8> = leftover.to_vec();
-
-    let (after_bytes, close_on_proceed, entered, proceed, arm_marker) = {
-        let mut b = barrier.lock().unwrap();
-        let selected = b
-            .request_fragment
-            .as_ref()
-            .is_none_or(|fragment| request_header.contains(fragment));
-        if selected && !b.consumed.load(std::sync::atomic::Ordering::SeqCst) {
-            b.consumed.store(true, std::sync::atomic::Ordering::SeqCst);
-            (
-                b.after_bytes,
-                b.close_on_proceed,
-                b.entered.take(),
-                b.proceed.take(),
-                b.arm_marker.clone(),
-            )
-        } else {
-            (usize::MAX, false, None, None, None)
-        }
-    };
 
     if entered.is_none() {
         // Barrier already consumed; just copy the rest (buffered body first).
@@ -765,7 +801,7 @@ async fn proxy_signed_get_barrier(
         matches!(
             tokio::time::timeout(Duration::from_secs(30), proceed).await,
             Ok(Ok(()))
-        ) && !close_on_proceed
+        )
     } else {
         false
     };
@@ -2030,7 +2066,7 @@ async fn expired_signed_url_retry_stays_on_pinned_commit() {
     sleep(Duration::from_secs(2)).await;
     proceed_tx
         .send(())
-        .expect("expire and close first signed request");
+        .expect("expire first signed request with a storage denial");
     tokio::time::timeout(Duration::from_secs(60), async {
         while !cleanup_entered.exists() {
             sleep(Duration::from_millis(10)).await;
