@@ -625,62 +625,19 @@ fn fsync_tree(root: &Path) -> Result<()> {
     crate::worktree_writer::fsync_paths_durable(&files, &dirs)
 }
 
-/// Deterministic subprocess-e2e barrier for one staging writer. It is inert
-/// unless the existing testing gate and both marker paths are present. The
-/// elected blocking worker remains owned by `AttemptCleanup`, allowing the
-/// release CLI test to prove stale-URL retry cannot overlap it.
-fn wait_for_test_attempt_writer() -> Result<()> {
-    if std::env::var_os("RIPCLONE_TESTING").as_deref() != Some(std::ffi::OsStr::new("1")) {
-        return Ok(());
-    }
-    let (Some(entered), Some(proceed)) = (
-        std::env::var_os("RIPCLONE_TEST_ATTEMPT_WRITER_ENTERED"),
-        std::env::var_os("RIPCLONE_TEST_ATTEMPT_WRITER_PROCEED"),
-    ) else {
-        return Ok(());
-    };
-    let entered = PathBuf::from(entered);
-    let proceed = PathBuf::from(proceed);
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&entered)
-    {
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
-        Err(error) => return Err(error).context("create attempt-writer test marker"),
-    }
-    // The real MinIO composition mutates S3 metadata before releasing this
-    // worker, which can exceed a single object-store request timeout on a
-    // loaded runner. Keep the safety bound below the test's 300-second cap
-    // while ensuring cleanup, rather than this hook, owns worker termination.
-    let deadline = std::time::Instant::now() + Duration::from_secs(120);
-    while !proceed.exists() {
-        if std::time::Instant::now() >= deadline {
-            anyhow::bail!("attempt-writer test barrier exceeded 120 seconds");
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    Ok(())
-}
-
 /// Mark the exact lifecycle point where a stale inner attempt has returned but
 /// cleanup still owns a live task. This is test-only and lets the subprocess
 /// proof distinguish cleanup blocking from unrelated artifact-fetch retries.
-fn mark_test_stale_attempt_cleanup(cleanup: &AttemptCleanup, error: &anyhow::Error) {
+fn mark_test_stale_attempt_cleanup(error: &anyhow::Error) {
     if std::env::var_os("RIPCLONE_TESTING").as_deref() != Some(std::ffi::OsStr::new("1"))
         || !is_stale_signed_url(error)
     {
         return;
     }
-    let owns_task = cleanup.0.active_guards.load(Ordering::SeqCst) > 0
-        || !cleanup
-            .0
-            .pending
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .is_empty();
-    if !owns_task {
+    let Some(writer_marker) = std::env::var_os("RIPCLONE_TEST_ATTEMPT_WRITER_ENTERED") else {
+        return;
+    };
+    if !std::fs::read(writer_marker).is_ok_and(|value| value == b"active") {
         return;
     }
     let Some(marker) = std::env::var_os("RIPCLONE_TEST_ATTEMPT_CLEANUP_ENTERED") else {
@@ -873,6 +830,63 @@ impl<T: Send + 'static> Drop for AbortOnDrop<T> {
             self.cleanup.guard_finished();
         }
     }
+}
+
+/// Deterministic subprocess-e2e sibling that writes inside the real attempt
+/// staging tree and remains owned by `AttemptCleanup` while a selected
+/// signed-URL request fails. It replaces the old per-pack-parser barrier: the
+/// stale error can now return without depending on buffered stream ordering,
+/// while cleanup still has genuine blocking staging work to drain.
+fn spawn_test_attempt_staging_writer(
+    staging_root: &Path,
+    cleanup: &AttemptCleanup,
+) -> Option<AbortOnDrop<Result<()>>> {
+    if std::env::var_os("RIPCLONE_TESTING").as_deref() != Some(std::ffi::OsStr::new("1")) {
+        return None;
+    }
+    let (Some(entered), Some(proceed)) = (
+        std::env::var_os("RIPCLONE_TEST_ATTEMPT_WRITER_ENTERED"),
+        std::env::var_os("RIPCLONE_TEST_ATTEMPT_WRITER_PROCEED"),
+    ) else {
+        return None;
+    };
+    let entered = PathBuf::from(entered);
+    let proceed = PathBuf::from(proceed);
+    let staging_marker = staging_root.join(".ripclone-test-writer");
+    Some(AbortOnDrop::new(
+        tokio::task::spawn_blocking(move || {
+            let mut entered_file = match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&entered)
+            {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+                Err(error) => {
+                    return Err(error).context("create attempt-writer test marker");
+                }
+            };
+            use std::io::Write;
+            entered_file
+                .write_all(b"active")
+                .context("mark attempt staging writer active")?;
+            std::fs::write(&staging_marker, b"active")
+                .context("write active attempt staging marker")?;
+            let deadline = std::time::Instant::now() + Duration::from_secs(120);
+            while !proceed.exists() {
+                if std::time::Instant::now() >= deadline {
+                    anyhow::bail!("attempt-writer test barrier exceeded 120 seconds");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            // This write must succeed before cleanup may remove the staging
+            // tree. The e2e then proves the tree disappears before retry.
+            std::fs::write(staging_marker, b"released")
+                .context("write released attempt staging marker")?;
+            std::fs::write(entered, b"released").context("mark attempt staging writer released")
+        }),
+        cleanup.clone(),
+    ))
 }
 
 #[derive(Clone)]
@@ -1749,7 +1763,7 @@ impl Client {
             )
             .await;
         if let Err(error) = &result {
-            mark_test_stale_attempt_cleanup(cleanup, error);
+            mark_test_stale_attempt_cleanup(error);
         }
         drop(close_on_drop);
         reaper.await.context("attempt cleanup task")?;
@@ -2007,6 +2021,7 @@ impl Client {
         };
         let git_dir = install_root.join(".git");
         let files_only = matches!(mode, CloneMode::Files);
+        let _test_staging_writer = spawn_test_attempt_staging_writer(&install_root, cleanup);
 
         if !files_only {
             std::fs::create_dir_all(&git_dir)?;
@@ -2550,7 +2565,6 @@ impl Client {
                     let result = AbortOnDrop::new(
                         tokio::task::spawn_blocking(
                             move || -> Result<crate::extract::PackExtractResult> {
-                                wait_for_test_attempt_writer()?;
                                 if pack_body.len() < 20 {
                                     anyhow::bail!(
                                         "pack {} too short ({} bytes)",

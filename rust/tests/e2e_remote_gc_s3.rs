@@ -2086,8 +2086,8 @@ async fn expired_signed_url_retry_stays_on_pinned_commit() {
         initial_pinned_entered,
         initial_pinned_proceed,
         mut refresh_entered,
-        _refresh_proceed,
-    ) = start_ref_trace_proxy(&server.url, true, false).await;
+        refresh_proceed,
+    ) = start_ref_trace_proxy(&server.url, true, true).await;
     let origin = make_origin("acme", &repo);
     guard.track_repo("acme", &repo);
     // Two distinct >2 MiB blobs cross the production 4 MiB HEAD-pack target,
@@ -2109,8 +2109,8 @@ async fn expired_signed_url_retry_stays_on_pinned_commit() {
     let (pinned, exact_store, exact_a, _fixture) =
         seed_shallow_s3_fixture(&direct_env, &prefix, &repo).await;
     assert!(
-        exact_a.packs.len() >= 2,
-        "retry fixture must publish at least two real shallow packs"
+        !exact_a.packs.is_empty(),
+        "retry fixture must publish a real shallow pack"
     );
     let proxy = start_barrier_proxy_for_request_after_marker(
         &direct_env.endpoint,
@@ -2119,15 +2119,18 @@ async fn expired_signed_url_retry_stays_on_pinned_commit() {
         entered_tx,
         proceed_rx,
         writer_entered.clone(),
-        exact_a.packs[1].pack.clone(),
+        exact_a.packs[0].pack.clone(),
     )
     .await;
+    let selected_pack = exact_a.packs[0].pack.clone();
     let repo_id = RepoId::github(format!("acme/{repo}"));
     add_acme_repo(&server, &repo).await;
 
     unsafe {
+        // The selected first pack fails while the separately owned staging
+        // writer is held, so no other artifact request participates in the
+        // stale classification boundary.
         std::env::set_var("RIPCLONE_TEST_DOWNLOAD_CONCURRENCY", "1");
-        std::env::set_var("RIPCLONE_TEST_SIGNED_URL_PROXY", &proxy.url);
         std::env::set_var("RIPCLONE_TESTING", "1");
         std::env::set_var("RIPCLONE_TEST_ATTEMPT_WRITER_ENTERED", &writer_entered);
         std::env::set_var("RIPCLONE_TEST_ATTEMPT_WRITER_PROCEED", &writer_proceed);
@@ -2135,9 +2138,21 @@ async fn expired_signed_url_retry_stays_on_pinned_commit() {
     }
     let short_pack_url = make_s3_storage(&direct_env, &prefix)
         .expect("selected pack signing storage")
-        .signed_url(&exact_a.packs[1].pack, Duration::from_secs(1))
+        .signed_url(&exact_a.packs[0].pack, Duration::from_secs(1))
         .expect("selected pack supports one-second signing");
-    ref_trace.replace_initial_pack_url(1, short_pack_url);
+    let mut short_pack_url =
+        url::Url::parse(&short_pack_url).expect("selected signed pack URL parses");
+    let proxy_origin = url::Url::parse(&proxy.url).expect("signed URL proxy parses");
+    short_pack_url
+        .set_scheme(proxy_origin.scheme())
+        .expect("selected signed pack proxy scheme");
+    short_pack_url
+        .set_host(proxy_origin.host_str())
+        .expect("selected signed pack proxy host");
+    short_pack_url
+        .set_port(proxy_origin.port())
+        .expect("selected signed pack proxy port");
+    ref_trace.replace_initial_pack_url(0, short_pack_url.to_string());
     let binary = required_ripclone_bin();
     let mut command = std::process::Command::new(&binary);
     command
@@ -2184,6 +2199,10 @@ async fn expired_signed_url_retry_stays_on_pinned_commit() {
         .expect("published S3 B row present")
         .commit;
     assert_eq!(published_b, newer);
+    // The one-second presign must already be expired when ready metadata makes
+    // it observable. This selected first pack is the only pack download allowed
+    // to start while the independently owned staging writer is held.
+    sleep(Duration::from_secs(2)).await;
     initial_pinned_proceed
         .send(())
         .expect("release initial exact-A metadata request");
@@ -2200,6 +2219,16 @@ async fn expired_signed_url_retry_stays_on_pinned_commit() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+    let selected_headers = proxy.signed_headers();
+    assert_eq!(
+        selected_headers.len(),
+        1,
+        "only the selected initial pack may use the proxy before refresh: {selected_headers:?}"
+    );
+    assert!(
+        selected_headers[0].contains(&selected_pack),
+        "initial proxied request must be the selected stale pack: {selected_headers:?}"
+    );
     ref_trace.arm_next_pinned_refresh();
     let authorization_calls_before_refresh = verifier.calls();
     assert!(
@@ -2216,17 +2245,25 @@ async fn expired_signed_url_retry_stays_on_pinned_commit() {
                 .is_some_and(|name| name.starts_with("clone.") && name.ends_with(".tmp"))
         })
         .expect("first attempt staging exists while writer is held");
-    sleep(Duration::from_secs(2)).await;
     proceed_tx
         .send(())
         .expect("expire first signed request with a storage denial");
-    tokio::time::timeout(Duration::from_secs(60), async {
+    let cleanup_wait = tokio::time::timeout(Duration::from_secs(60), async {
         while !cleanup_entered.exists() {
             sleep(Duration::from_millis(10)).await;
         }
     })
-    .await
-    .expect("stale inner attempt returned while cleanup still owned its writer");
+    .await;
+    if cleanup_wait.is_err() {
+        let output = wait_child_output_bounded(child, Duration::from_secs(5))
+            .await
+            .expect("collect CLI output after stale cleanup timeout");
+        panic!(
+            "stale inner attempt did not return while cleanup owned its writer\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
     assert!(
         tokio::time::timeout(Duration::from_millis(500), &mut refresh_entered)
             .await
@@ -2249,6 +2286,15 @@ async fn expired_signed_url_retry_stays_on_pinned_commit() {
         !initial_staging.exists(),
         "exact refresh began before the prior attempt staging was drained"
     );
+    // Only refreshed signed URLs need to re-enter the observable proxy. The
+    // ref request is paused before it reaches the server, so this environment
+    // change cannot affect initial manifests, history packs, or setup traffic.
+    unsafe {
+        std::env::set_var("RIPCLONE_TEST_SIGNED_URL_PROXY", &proxy.url);
+    }
+    refresh_proceed
+        .send(())
+        .expect("release exact refresh into authorized server");
 
     let output = wait_child_output(child).await;
     unsafe {
