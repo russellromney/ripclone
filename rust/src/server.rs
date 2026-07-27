@@ -2824,7 +2824,7 @@ async fn get_ref_inner(
                     .into_response();
             }
         };
-        let Some((_key, info)) = resolved else {
+        let Some((served_key, info)) = resolved else {
             return artifact_pending_response(pinned, &branch, 1);
         };
         let response_branch = if branch == "HEAD" && !info.default_branch.is_empty() {
@@ -2843,6 +2843,16 @@ async fn get_ref_inner(
         );
         if response.commit != pinned || response.clonepack_manifest.is_empty() {
             return artifact_pending_response(pinned, &response_branch, 1);
+        }
+        if let Err(e) = state
+            .ref_store
+            .touch_last_accessed_at(&repo_id, &served_key, &info.commit)
+            .await
+        {
+            warn!(
+                "failed to touch last_accessed_at for pinned {}@{}: {e:#}",
+                served_key, info.commit
+            );
         }
         return (StatusCode::OK, Json(response)).into_response();
     }
@@ -11711,6 +11721,136 @@ mod tests {
         assert!(
             updated.last_accessed_at.unwrap() > old_ts,
             "last_accessed_at must advance on a successful ref read"
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_exact_read_touches_only_the_served_exact_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(&tmp);
+        let ref_store = state.ref_store.clone();
+        let rid = RepoId::github("acme/widget");
+        mark_added(&state, rid.clone()).await;
+
+        let pinned = "a".repeat(40);
+        let newer = "b".repeat(40);
+        let old_ts = 1;
+        let exact_key = ref_store_key("main", Some(&pinned), Some(&pinned));
+        let mut exact = complete_ref(&pinned, "manifest-a");
+        exact.last_accessed_at = Some(old_ts);
+        let mut moving = complete_ref(&newer, "manifest-b");
+        moving.last_accessed_at = Some(old_ts);
+        ref_store
+            .save_branch(&rid, &exact_key, &exact)
+            .await
+            .unwrap();
+        ref_store.save_branch(&rid, "main", &moving).await.unwrap();
+
+        let app = build_app(state);
+        let response = app
+            .oneshot(protocol_request(
+                &format!("/v1/repos/github/acme/widget/refs/main?clonepack=full&pinned={pinned}"),
+                Some("2"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let exact_after = ref_store
+            .load_branch(&rid, &exact_key)
+            .await
+            .unwrap()
+            .unwrap();
+        let moving_after = ref_store.load_branch(&rid, "main").await.unwrap().unwrap();
+        assert!(
+            exact_after.last_accessed_at.unwrap() > old_ts,
+            "a successful pinned exact hit keeps the row it served warm"
+        );
+        assert_eq!(
+            moving_after.last_accessed_at,
+            Some(old_ts),
+            "an exact hit must not touch the unrelated moving row"
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_moving_fallback_touches_the_row_it_served() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(&tmp);
+        let ref_store = state.ref_store.clone();
+        let rid = RepoId::github("acme/widget");
+        mark_added(&state, rid.clone()).await;
+
+        let pinned = "a".repeat(40);
+        let old_ts = 1;
+        let mut moving = complete_ref(&pinned, "manifest-a");
+        moving.last_accessed_at = Some(old_ts);
+        ref_store.save_branch(&rid, "main", &moving).await.unwrap();
+
+        let app = build_app(state);
+        let response = app
+            .oneshot(protocol_request(
+                &format!("/v1/repos/github/acme/widget/refs/main?clonepack=full&pinned={pinned}"),
+                Some("2"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let moving_after = ref_store.load_branch(&rid, "main").await.unwrap().unwrap();
+        assert!(
+            moving_after.last_accessed_at.unwrap() > old_ts,
+            "a successful settled moving-row fallback keeps that row warm"
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_pending_read_touches_no_candidate_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(&tmp);
+        let ref_store = state.ref_store.clone();
+        let rid = RepoId::github("acme/widget");
+        mark_added(&state, rid.clone()).await;
+
+        let pinned = "a".repeat(40);
+        let other = "b".repeat(40);
+        let old_ts = 1;
+        let exact_key = ref_store_key("main", Some(&pinned), Some(&pinned));
+        let mut mismatched_exact = complete_ref(&other, "manifest-b-exact");
+        mismatched_exact.last_accessed_at = Some(old_ts);
+        let mut moving = complete_ref(&other, "manifest-b-moving");
+        moving.last_accessed_at = Some(old_ts);
+        ref_store
+            .save_branch(&rid, &exact_key, &mismatched_exact)
+            .await
+            .unwrap();
+        ref_store.save_branch(&rid, "main", &moving).await.unwrap();
+
+        let app = build_app(state);
+        let response = app
+            .oneshot(protocol_request(
+                &format!("/v1/repos/github/acme/widget/refs/main?clonepack=full&pinned={pinned}"),
+                Some("2"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let exact_after = ref_store
+            .load_branch(&rid, &exact_key)
+            .await
+            .unwrap()
+            .unwrap();
+        let moving_after = ref_store.load_branch(&rid, "main").await.unwrap().unwrap();
+        assert_eq!(
+            exact_after.last_accessed_at,
+            Some(old_ts),
+            "a mismatched exact candidate must not be kept warm"
+        );
+        assert_eq!(
+            moving_after.last_accessed_at,
+            Some(old_ts),
+            "a pending pinned lookup must not touch an unrelated moving row"
         );
     }
 
