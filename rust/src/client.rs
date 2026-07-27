@@ -634,7 +634,7 @@ fn mark_test_stale_attempt_cleanup(error: &anyhow::Error) {
     {
         return;
     }
-    let Some(writer_marker) = std::env::var_os("RIPCLONE_TEST_ATTEMPT_WRITER_ENTERED") else {
+    let Some(writer_marker) = std::env::var_os("RIPCLONE_TEST_PACK_WORKER_ENTERED") else {
         return;
     };
     if !std::fs::read(writer_marker).is_ok_and(|value| value == b"active") {
@@ -644,6 +644,50 @@ fn mark_test_stale_attempt_cleanup(error: &anyhow::Error) {
         return;
     };
     std::fs::write(marker, b"entered").expect("write stale-attempt cleanup test marker");
+}
+
+/// Pause one real pack-install worker after its pack and index have been
+/// written into attempt staging. This test-only barrier proves that stale-URL
+/// teardown drains already-running blocking work before starting a retry.
+fn wait_for_test_pack_worker(pack_index: usize) -> Result<()> {
+    if std::env::var_os("RIPCLONE_TESTING").as_deref() != Some(std::ffi::OsStr::new("1")) {
+        return Ok(());
+    }
+    let Some(selected) = std::env::var_os("RIPCLONE_TEST_PACK_WORKER_INDEX") else {
+        return Ok(());
+    };
+    if selected.to_string_lossy().parse::<usize>().ok() != Some(pack_index) {
+        return Ok(());
+    }
+    let (Some(entered), Some(proceed)) = (
+        std::env::var_os("RIPCLONE_TEST_PACK_WORKER_ENTERED"),
+        std::env::var_os("RIPCLONE_TEST_PACK_WORKER_PROCEED"),
+    ) else {
+        return Ok(());
+    };
+    let entered = PathBuf::from(entered);
+    let proceed = PathBuf::from(proceed);
+    let mut entered_file = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&entered)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+        Err(error) => return Err(error).context("create pack-worker test marker"),
+    };
+    use std::io::Write;
+    entered_file
+        .write_all(b"active")
+        .context("mark pack worker active")?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    while !proceed.exists() {
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!("pack-worker test barrier exceeded 120 seconds");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::fs::write(entered, b"released").context("mark pack worker released")
 }
 
 #[derive(Debug, Deserialize)]
@@ -830,63 +874,6 @@ impl<T: Send + 'static> Drop for AbortOnDrop<T> {
             self.cleanup.guard_finished();
         }
     }
-}
-
-/// Deterministic subprocess-e2e sibling that writes inside the real attempt
-/// staging tree and remains owned by `AttemptCleanup` while a selected
-/// signed-URL request fails. It replaces the old per-pack-parser barrier: the
-/// stale error can now return without depending on buffered stream ordering,
-/// while cleanup still has genuine blocking staging work to drain.
-fn spawn_test_attempt_staging_writer(
-    staging_root: &Path,
-    cleanup: &AttemptCleanup,
-) -> Option<AbortOnDrop<Result<()>>> {
-    if std::env::var_os("RIPCLONE_TESTING").as_deref() != Some(std::ffi::OsStr::new("1")) {
-        return None;
-    }
-    let (Some(entered), Some(proceed)) = (
-        std::env::var_os("RIPCLONE_TEST_ATTEMPT_WRITER_ENTERED"),
-        std::env::var_os("RIPCLONE_TEST_ATTEMPT_WRITER_PROCEED"),
-    ) else {
-        return None;
-    };
-    let entered = PathBuf::from(entered);
-    let proceed = PathBuf::from(proceed);
-    let staging_marker = staging_root.join(".ripclone-test-writer");
-    Some(AbortOnDrop::new(
-        tokio::task::spawn_blocking(move || {
-            let mut entered_file = match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&entered)
-            {
-                Ok(file) => file,
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
-                Err(error) => {
-                    return Err(error).context("create attempt-writer test marker");
-                }
-            };
-            use std::io::Write;
-            entered_file
-                .write_all(b"active")
-                .context("mark attempt staging writer active")?;
-            std::fs::write(&staging_marker, b"active")
-                .context("write active attempt staging marker")?;
-            let deadline = std::time::Instant::now() + Duration::from_secs(120);
-            while !proceed.exists() {
-                if std::time::Instant::now() >= deadline {
-                    anyhow::bail!("attempt-writer test barrier exceeded 120 seconds");
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            // This write must succeed before cleanup may remove the staging
-            // tree. The e2e then proves the tree disappears before retry.
-            std::fs::write(staging_marker, b"released")
-                .context("write released attempt staging marker")?;
-            std::fs::write(entered, b"released").context("mark attempt staging writer released")
-        }),
-        cleanup.clone(),
-    ))
 }
 
 #[derive(Clone)]
@@ -2021,8 +2008,6 @@ impl Client {
         };
         let git_dir = install_root.join(".git");
         let files_only = matches!(mode, CloneMode::Files);
-        let _test_staging_writer = spawn_test_attempt_staging_writer(&install_root, cleanup);
-
         if !files_only {
             std::fs::create_dir_all(&git_dir)?;
             std::fs::create_dir_all(git_dir.join("refs").join("heads"))?;
@@ -2611,6 +2596,7 @@ impl Client {
                                     &idx_bytes,
                                 )
                                 .with_context(|| format!("write idx {}", name))?;
+                                wait_for_test_pack_worker(i)?;
                                 if history_only {
                                     return Ok(crate::extract::PackExtractResult {
                                         files: 0,

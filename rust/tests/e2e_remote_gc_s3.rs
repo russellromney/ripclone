@@ -373,19 +373,20 @@ pub async fn start_delay_proxy(target_endpoint: &str, delay: Duration) -> DelayP
 /// Deterministic barrier for signed-URL GETs.
 ///
 /// The selected presigned GET signals `entered` and waits on `proceed`. With
-/// `close_on_proceed`, the proxy returns a complete 403 without forwarding the
-/// selected request, deterministically modeling an expired signed URL. Otherwise
-/// it forwards `after_bytes`, holds the remaining response body, and copies the
+/// `wait_before_backend`, the proxy then forwards the request to storage. This
+/// lets MinIO itself reject a presign that expired while held. Otherwise it
+/// forwards `after_bytes`, holds the remaining response body, and copies the
 /// remainder after release.
 struct BarrierState {
     after_bytes: usize,
-    close_on_proceed: bool,
+    wait_before_backend: bool,
     arm_marker: Option<std::path::PathBuf>,
     request_fragment: Option<String>,
     entered: Option<tokio::sync::oneshot::Sender<()>>,
     proceed: Option<tokio::sync::oneshot::Receiver<()>>,
     consumed: std::sync::atomic::AtomicBool,
     signed_headers: Vec<String>,
+    selected_backend_statuses: Vec<u16>,
 }
 
 pub struct BarrierProxy {
@@ -702,6 +703,14 @@ impl BarrierProxy {
             .clone()
     }
 
+    fn selected_backend_statuses(&self) -> Vec<u16> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .selected_backend_statuses
+            .clone()
+    }
+
     async fn shutdown(mut self) {
         if let Some(mut handle) = self.handle.take() {
             handle.abort();
@@ -757,7 +766,7 @@ async fn proxy_signed_get_barrier(
         .signed_headers
         .push(request_header.clone());
 
-    let (after_bytes, close_on_proceed, entered, proceed, arm_marker) = {
+    let (after_bytes, wait_before_backend, selected, mut entered, mut proceed, arm_marker) = {
         let mut b = barrier.lock().unwrap();
         let selected = b
             .request_fragment
@@ -767,34 +776,32 @@ async fn proxy_signed_get_barrier(
             b.consumed.store(true, std::sync::atomic::Ordering::SeqCst);
             (
                 b.after_bytes,
-                b.close_on_proceed,
+                b.wait_before_backend,
+                true,
                 b.entered.take(),
                 b.proceed.take(),
                 b.arm_marker.clone(),
             )
         } else {
-            (usize::MAX, false, None, None, None)
+            (usize::MAX, false, false, None, None, None)
         }
     };
 
-    // A complete 403 is a deterministic signed-URL expiry response. Relying on
-    // a truncated HTTP body to become an immediate transport error varied by
-    // platform and could leave the client waiting for its request timeout.
-    if close_on_proceed && entered.is_some() {
-        if let Some(marker) = arm_marker {
+    if wait_before_backend {
+        if let Some(marker) = arm_marker.as_ref() {
             tokio::time::timeout(Duration::from_secs(20), async {
                 while !marker.exists() {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             })
             .await
-            .expect("selected signed request overlapped a staging writer");
+            .expect("selected signed request overlapped a real pack worker");
         }
-        if let Some(entered) = entered {
-            eprintln!("BARRIER PROXY: entered expired-response barrier");
+        if let Some(entered) = entered.take() {
+            eprintln!("BARRIER PROXY: entered pre-storage barrier");
             let _ = entered.send(());
         }
-        let released = if let Some(proceed) = proceed {
+        let released = if let Some(proceed) = proceed.take() {
             matches!(
                 tokio::time::timeout(Duration::from_secs(30), proceed).await,
                 Ok(Ok(()))
@@ -802,14 +809,9 @@ async fn proxy_signed_get_barrier(
         } else {
             false
         };
-        if released {
-            let _ = client
-                .write_all(
-                    b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                )
-                .await;
+        if !released {
+            return;
         }
-        return;
     }
 
     let Ok(mut backend) = tokio::net::TcpStream::connect(target).await else {
@@ -823,6 +825,19 @@ async fn proxy_signed_get_barrier(
     let Some(resp_header) = read_response_header(&mut backend).await else {
         return;
     };
+    if selected {
+        let status = String::from_utf8_lossy(&resp_header)
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|status| status.parse::<u16>().ok())
+            .expect("selected storage response has an HTTP status");
+        barrier
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .selected_backend_statuses
+            .push(status);
+    }
     eprintln!("BARRIER PROXY: response header received, forwarding");
     // `read_response_header` stops at the end of the header block, but its
     // buffered reads may have already pulled body bytes past the CRLFCRLF
@@ -843,7 +858,7 @@ async fn proxy_signed_get_barrier(
     }
     let mut pending_body: Vec<u8> = leftover.to_vec();
 
-    if entered.is_none() {
+    if wait_before_backend || entered.is_none() {
         // Barrier already consumed; just copy the rest (buffered body first).
         if !pending_body.is_empty() && client.write_all(&pending_body).await.is_err() {
             return;
@@ -878,14 +893,14 @@ async fn proxy_signed_get_barrier(
         copied += take;
     }
 
-    if let Some(marker) = arm_marker {
+    if let Some(marker) = arm_marker.as_ref() {
         tokio::time::timeout(Duration::from_secs(20), async {
             while !marker.exists() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
-        .expect("selected signed request overlapped a staging writer");
+        .expect("selected signed request overlapped a real pack worker");
     }
     if let Some(entered) = entered {
         eprintln!("BARRIER PROXY: entered barrier after {copied} bytes");
@@ -945,14 +960,14 @@ async fn proxy_one_connection_barrier(
 pub async fn start_barrier_proxy(
     target_endpoint: &str,
     after_bytes: usize,
-    close_on_proceed: bool,
+    wait_before_backend: bool,
     entered: tokio::sync::oneshot::Sender<()>,
     proceed: tokio::sync::oneshot::Receiver<()>,
 ) -> BarrierProxy {
     start_barrier_proxy_inner(
         target_endpoint,
         after_bytes,
-        close_on_proceed,
+        wait_before_backend,
         entered,
         proceed,
         None,
@@ -964,7 +979,7 @@ pub async fn start_barrier_proxy(
 async fn start_barrier_proxy_for_request_after_marker(
     target_endpoint: &str,
     after_bytes: usize,
-    close_on_proceed: bool,
+    wait_before_backend: bool,
     entered: tokio::sync::oneshot::Sender<()>,
     proceed: tokio::sync::oneshot::Receiver<()>,
     arm_marker: std::path::PathBuf,
@@ -973,7 +988,7 @@ async fn start_barrier_proxy_for_request_after_marker(
     start_barrier_proxy_inner(
         target_endpoint,
         after_bytes,
-        close_on_proceed,
+        wait_before_backend,
         entered,
         proceed,
         Some(arm_marker),
@@ -985,7 +1000,7 @@ async fn start_barrier_proxy_for_request_after_marker(
 async fn start_barrier_proxy_for_request(
     target_endpoint: &str,
     after_bytes: usize,
-    close_on_proceed: bool,
+    wait_before_backend: bool,
     entered: tokio::sync::oneshot::Sender<()>,
     proceed: tokio::sync::oneshot::Receiver<()>,
     request_fragment: String,
@@ -993,7 +1008,7 @@ async fn start_barrier_proxy_for_request(
     start_barrier_proxy_inner(
         target_endpoint,
         after_bytes,
-        close_on_proceed,
+        wait_before_backend,
         entered,
         proceed,
         None,
@@ -1005,7 +1020,7 @@ async fn start_barrier_proxy_for_request(
 async fn start_barrier_proxy_inner(
     target_endpoint: &str,
     after_bytes: usize,
-    close_on_proceed: bool,
+    wait_before_backend: bool,
     entered: tokio::sync::oneshot::Sender<()>,
     proceed: tokio::sync::oneshot::Receiver<()>,
     arm_marker: Option<std::path::PathBuf>,
@@ -1019,13 +1034,14 @@ async fn start_barrier_proxy_inner(
 
     let state = Arc::new(std::sync::Mutex::new(BarrierState {
         after_bytes,
-        close_on_proceed,
+        wait_before_backend,
         arm_marker,
         request_fragment,
         entered: Some(entered),
         proceed: Some(proceed),
         consumed: std::sync::atomic::AtomicBool::new(false),
         signed_headers: Vec::new(),
+        selected_backend_statuses: Vec::new(),
     }));
     let observable_state = Arc::clone(&state);
 
@@ -1842,7 +1858,7 @@ async fn remote_gc_during_faulting_clone_is_safe() {
     let mut guard = CleanupGuard::new(env.clone(), prefix.clone());
 
     // Stall the first signed-URL GET mid-body; GC will run while the proxy is
-    // blocked. close_on_proceed=false so the clone can finish after release.
+    // blocked. wait_before_backend=false so the clone can finish after release.
     let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
     let (proceed_tx, proceed_rx) = tokio::sync::oneshot::channel();
     let proxy = start_barrier_proxy(&env.endpoint, 16, false, entered_tx, proceed_rx).await;
@@ -2109,9 +2125,11 @@ async fn expired_signed_url_retry_stays_on_pinned_commit() {
     let (pinned, exact_store, exact_a, _fixture) =
         seed_shallow_s3_fixture(&direct_env, &prefix, &repo).await;
     assert!(
-        !exact_a.packs.is_empty(),
-        "retry fixture must publish a real shallow pack"
+        exact_a.packs.len() >= 2,
+        "retry fixture must publish two real shallow packs"
     );
+    let worker_pack_index = 0usize;
+    let expiring_pack_index = 1usize;
     let proxy = start_barrier_proxy_for_request_after_marker(
         &direct_env.endpoint,
         16,
@@ -2119,26 +2137,33 @@ async fn expired_signed_url_retry_stays_on_pinned_commit() {
         entered_tx,
         proceed_rx,
         writer_entered.clone(),
-        exact_a.packs[0].pack.clone(),
+        exact_a.packs[expiring_pack_index].pack.clone(),
     )
     .await;
-    let selected_pack = exact_a.packs[0].pack.clone();
+    let selected_pack = exact_a.packs[expiring_pack_index].pack.clone();
     let repo_id = RepoId::github(format!("acme/{repo}"));
     add_acme_repo(&server, &repo).await;
 
     unsafe {
-        // The selected first pack fails while the separately owned staging
-        // writer is held, so no other artifact request participates in the
-        // stale classification boundary.
-        std::env::set_var("RIPCLONE_TEST_DOWNLOAD_CONCURRENCY", "1");
+        // Two production pack pipelines run together: pack zero reaches its
+        // real blocking install worker, while pack one's expired presign is
+        // forwarded to MinIO and rejected.
+        std::env::set_var("RIPCLONE_TEST_DOWNLOAD_CONCURRENCY", "2");
         std::env::set_var("RIPCLONE_TESTING", "1");
-        std::env::set_var("RIPCLONE_TEST_ATTEMPT_WRITER_ENTERED", &writer_entered);
-        std::env::set_var("RIPCLONE_TEST_ATTEMPT_WRITER_PROCEED", &writer_proceed);
+        std::env::set_var(
+            "RIPCLONE_TEST_PACK_WORKER_INDEX",
+            worker_pack_index.to_string(),
+        );
+        std::env::set_var("RIPCLONE_TEST_PACK_WORKER_ENTERED", &writer_entered);
+        std::env::set_var("RIPCLONE_TEST_PACK_WORKER_PROCEED", &writer_proceed);
         std::env::set_var("RIPCLONE_TEST_ATTEMPT_CLEANUP_ENTERED", &cleanup_entered);
     }
     let short_pack_url = make_s3_storage(&direct_env, &prefix)
         .expect("selected pack signing storage")
-        .signed_url(&exact_a.packs[0].pack, Duration::from_secs(1))
+        .signed_url(
+            &exact_a.packs[expiring_pack_index].pack,
+            Duration::from_secs(1),
+        )
         .expect("selected pack supports one-second signing");
     let mut short_pack_url =
         url::Url::parse(&short_pack_url).expect("selected signed pack URL parses");
@@ -2152,7 +2177,7 @@ async fn expired_signed_url_retry_stays_on_pinned_commit() {
     short_pack_url
         .set_port(proxy_origin.port())
         .expect("selected signed pack proxy port");
-    ref_trace.replace_initial_pack_url(0, short_pack_url.to_string());
+    ref_trace.replace_initial_pack_url(expiring_pack_index, short_pack_url.to_string());
     let binary = required_ripclone_bin();
     let mut command = std::process::Command::new(&binary);
     command
@@ -2199,9 +2224,9 @@ async fn expired_signed_url_retry_stays_on_pinned_commit() {
         .expect("published S3 B row present")
         .commit;
     assert_eq!(published_b, newer);
-    // The one-second presign must already be expired when ready metadata makes
-    // it observable. This selected first pack is the only pack download allowed
-    // to start while the independently owned staging writer is held.
+    // The one-second presign is already expired when ready metadata makes it
+    // observable. The proxy waits for pack zero's real install worker before
+    // forwarding pack one's request to MinIO.
     sleep(Duration::from_secs(2)).await;
     initial_pinned_proceed
         .send(())
@@ -2233,7 +2258,7 @@ async fn expired_signed_url_retry_stays_on_pinned_commit() {
     let authorization_calls_before_refresh = verifier.calls();
     assert!(
         writer_entered.exists(),
-        "signed-URL barrier must arm only after a staging writer is in flight"
+        "signed-URL barrier must arm only after a real pack worker is in flight"
     );
     let initial_staging = std::fs::read_dir(out.path())
         .expect("read clone output root")
@@ -2247,7 +2272,7 @@ async fn expired_signed_url_retry_stays_on_pinned_commit() {
         .expect("first attempt staging exists while writer is held");
     proceed_tx
         .send(())
-        .expect("expire first signed request with a storage denial");
+        .expect("forward expired signed request to storage");
     let cleanup_wait = tokio::time::timeout(Duration::from_secs(60), async {
         while !cleanup_entered.exists() {
             sleep(Duration::from_millis(10)).await;
@@ -2264,6 +2289,11 @@ async fn expired_signed_url_retry_stays_on_pinned_commit() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+    assert_eq!(
+        proxy.selected_backend_statuses(),
+        vec![403],
+        "MinIO itself must reject the selected expired presign"
+    );
     assert!(
         tokio::time::timeout(Duration::from_millis(500), &mut refresh_entered)
             .await
@@ -2274,7 +2304,7 @@ async fn expired_signed_url_retry_stays_on_pinned_commit() {
         initial_staging.exists(),
         "staging was removed while its writer was still held"
     );
-    std::fs::write(&writer_proceed, b"go").expect("release staging writer");
+    std::fs::write(&writer_proceed, b"go").expect("release real pack worker");
     // Artifact transport retries finished before the cleanup marker above.
     // This signal fires only after the held worker exits and the old staging
     // tree is drained, before the exact request reaches the S3-backed ref store.
@@ -2301,8 +2331,9 @@ async fn expired_signed_url_retry_stays_on_pinned_commit() {
         std::env::remove_var("RIPCLONE_TEST_DOWNLOAD_CONCURRENCY");
         std::env::remove_var("RIPCLONE_TEST_SIGNED_URL_PROXY");
         std::env::remove_var("RIPCLONE_TESTING");
-        std::env::remove_var("RIPCLONE_TEST_ATTEMPT_WRITER_ENTERED");
-        std::env::remove_var("RIPCLONE_TEST_ATTEMPT_WRITER_PROCEED");
+        std::env::remove_var("RIPCLONE_TEST_PACK_WORKER_INDEX");
+        std::env::remove_var("RIPCLONE_TEST_PACK_WORKER_ENTERED");
+        std::env::remove_var("RIPCLONE_TEST_PACK_WORKER_PROCEED");
         std::env::remove_var("RIPCLONE_TEST_ATTEMPT_CLEANUP_ENTERED");
     }
     assert!(
@@ -2497,6 +2528,11 @@ async fn revoked_authorization_blocks_pinned_refresh() {
         .expect("denied exact refresh reached server")
         .expect("denied refresh trace remained alive");
     let signed_requests_before_denial = proxy.signed_headers().len();
+    assert_eq!(
+        proxy.selected_backend_statuses(),
+        vec![403],
+        "MinIO itself must reject the selected expired presign"
+    );
     assert!(
         signed_requests_before_denial >= 1,
         "fixture must observe the original signed artifact request"
