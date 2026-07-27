@@ -53,7 +53,7 @@ impl std::fmt::Display for ArtifactPending {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} artifact is still pending for {}; retry with `ripclone clone --at {}`",
+            "{} artifact is still pending for {}; retry the same clone command with `--at {}`",
             self.mode, self.commit, self.commit
         )
     }
@@ -3965,6 +3965,26 @@ mod tests {
         };
         let error = validate_manifest_commit(&manifest, &"a".repeat(40)).unwrap_err();
         assert!(format!("{error:#}").contains("clonepack integrity error"));
+    }
+
+    #[test]
+    fn pending_artifact_guidance_preserves_the_repository_argument() {
+        let commit = "a".repeat(40);
+        let rendered = ArtifactPending {
+            commit: commit.clone(),
+            mode: "full".to_string(),
+        }
+        .to_string();
+        assert!(
+            rendered.contains(&format!(
+                "retry the same clone command with `--at {commit}`"
+            )),
+            "pending guidance must tell the user how to amend their complete command: {rendered}"
+        );
+        assert!(
+            !rendered.contains("`ripclone clone --at"),
+            "pending guidance must not print a command with the required repository omitted: {rendered}"
+        );
     }
 
     /// A first-run user who points at a server that isn't running (or a wrong
