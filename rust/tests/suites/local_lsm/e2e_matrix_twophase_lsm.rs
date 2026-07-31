@@ -3,7 +3,7 @@
 //! in the background, archive deferred to phase 2). Covers depth=1 / depth=0 /
 //! files across first sync, re-sync, and multi-commit growth.
 
-mod common;
+use crate::common;
 use common::*;
 
 #[tokio::test]

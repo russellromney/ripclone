@@ -3,7 +3,7 @@
 //! Stands up a local git origin served over HTTP, registers it as a `generic`
 //! provider, and exercises sync + clone through the explicit-provider URL form.
 
-mod common;
+use crate::common;
 
 use base64::Engine;
 use common::*;

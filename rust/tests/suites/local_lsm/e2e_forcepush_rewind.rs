@@ -9,7 +9,7 @@
 //! abandoned commit. Ordering by history depth alone would keep serving the old
 //! tree; this pins that the confirmed tip wins regardless of depth.
 
-mod common;
+use crate::common;
 
 use common::*;
 

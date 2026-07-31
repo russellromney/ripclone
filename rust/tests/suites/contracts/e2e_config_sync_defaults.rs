@@ -1,6 +1,7 @@
 //! End-to-end test that project `ripclone.toml` drives `default_provider` and
 //! `clone.depth` for a `ripclone sync`, even when run from a nested
 //! subdirectory.
+//! Included in the consolidated `contracts` integration-test crate.
 //!
 //! A mock server captures the request path and query; no real upstream or build
 //! is needed.

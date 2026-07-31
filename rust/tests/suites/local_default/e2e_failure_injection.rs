@@ -1,6 +1,6 @@
 //! Failure-injection e2e tests for build/clone fault boundaries.
 
-mod common;
+use crate::common;
 
 use common::*;
 use ripclone::mode::CloneMode;

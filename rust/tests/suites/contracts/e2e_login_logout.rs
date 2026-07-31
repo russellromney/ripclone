@@ -1,4 +1,5 @@
 //! End-to-end test for self-host `ripclone login` and `ripclone auth logout`.
+//! Included in the consolidated `contracts` integration-test crate.
 //!
 //! Runs the CLI as a subprocess with an isolated $HOME and verifies that a
 //! non-cloud `ripclone login` uses the self-host paste flow.

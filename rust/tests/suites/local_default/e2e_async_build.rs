@@ -2,7 +2,7 @@
 //! the bounded background worker (survives disconnect, rate-bounded) and waits
 //! for completion; concurrent syncs for the same repo coalesce onto one build.
 
-mod common;
+use crate::common;
 
 use common::*;
 use ripclone::mode::CloneMode;

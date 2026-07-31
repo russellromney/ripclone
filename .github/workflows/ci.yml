@@ -90,7 +90,7 @@ jobs:
   # One compile (ci profile + mold + sccache) for fan-out jobs that only need
   # runnable bins or a handful of integration tests. Those jobs DOWNLOAD these
   # and never invoke cargo. The unit/integration `test` job self-compiles —
-  # staging the full suite here was ~30m cold (50+ linked test binaries).
+  # staging the full suite here was ~30m cold (roughly 40 linked test binaries).
   ci-build:
     runs-on: ubuntu-latest
     env:

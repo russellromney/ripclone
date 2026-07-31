@@ -2,7 +2,7 @@
 //! read/write endpoint, branch overrides, validation, and that a configured
 //! compression level still produces a correct clone (config drives the build).
 
-mod common;
+use crate::common;
 
 use common::*;
 use ripclone::mode::CloneMode;

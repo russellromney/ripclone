@@ -1,7 +1,7 @@
 //! End-to-end tests for the `/v1/repos/{provider}/{owner}/{repo}/status` endpoint
 //! (repo sync status + byte-usage accounting).
 
-mod common;
+use crate::common;
 
 use common::*;
 

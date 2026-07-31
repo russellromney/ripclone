@@ -2,7 +2,7 @@
 //! background), NON-LSM history. Covers depth=1 / depth=0 / files across first
 //! sync, re-sync, and multi-commit growth, with background-build polling.
 
-mod common;
+use crate::common;
 use common::*;
 
 #[tokio::test]

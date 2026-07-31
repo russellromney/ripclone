@@ -26,7 +26,8 @@ lint() {
 #
 # This job self-compiles (ci profile + sccache/rust-cache). Fan-out jobs
 # (gitea/databases/s3gc/e2e/…) use prebuilt binaries from ci-build instead;
-# staging the full suite there was ~30m cold and is not worth it.
+# staging the full suite there was ~30m cold before integration-test
+# consolidation and is not worth it.
 run_tests() {
   ( cd "$ROOT/rust" && cargo test --profile ci --all-targets --locked )
 }

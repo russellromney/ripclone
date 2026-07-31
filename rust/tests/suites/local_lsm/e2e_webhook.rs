@@ -6,7 +6,7 @@
 //! clone the pushed commit and verify it byte-for-byte. That's the actual
 //! "artifacts are ready before the clone" claim.
 
-mod common;
+use crate::common;
 
 use base64::Engine;
 use common::*;
