@@ -4,7 +4,7 @@
 //! it through the helper using `git clone ripclone://...`. Exercises server
 //! URL resolution, auth token handling, and shallow clone negotiation.
 
-use crate::common;
+mod common;
 
 use common::*;
 

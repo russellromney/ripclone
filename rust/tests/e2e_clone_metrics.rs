@@ -13,7 +13,7 @@
 //!   2. No header (self-host / older server) ⇒ no POST at all.
 //!   3. A failing metrics endpoint ⇒ the clone still succeeds (report swallows it).
 
-use crate::common;
+mod common;
 
 use common::*;
 

@@ -3,7 +3,7 @@
 //! older commit then a newer one, and clone each at its rev to verify the
 //! artifacts built for that exact commit.
 
-use crate::common;
+mod common;
 
 use common::*;
 use ripclone::mode::CloneMode;

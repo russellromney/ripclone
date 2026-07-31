@@ -2,7 +2,7 @@
 //! `file://` origin (no network). Covers every clone mode positively, plus
 //! negative paths (corrupt artifact, missing chunk) and ref serialization.
 
-use crate::common;
+mod common;
 
 use common::*;
 use ripclone::mode::CloneMode;

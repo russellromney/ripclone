@@ -3,7 +3,7 @@
 //! These tests exercise the real CLI binary against a real in-process server and
 //! real `file://` git origins. No mocks.
 
-use crate::common;
+mod common;
 
 use common::*;
 

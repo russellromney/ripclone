@@ -2,7 +2,7 @@
 //! real in-process server (the user-facing surface of the version-reconciliation
 //! work).
 
-use crate::common;
+mod common;
 
 use common::*;
 use std::sync::Arc;
