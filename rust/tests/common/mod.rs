@@ -17,7 +17,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
-use std::sync::{Arc, Once};
+use std::sync::{Arc, Once, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
 
@@ -33,10 +33,11 @@ pub fn origin_root() -> &'static Path {
 
 /// Configure process env once. `lsm` enables the incremental build with an
 /// aggressive (1-byte) seal threshold so every non-empty tail seals a level.
-pub fn init(lsm: bool) {
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        // SAFETY: set once, before any server/client/sync reads them.
+fn init_env(lsm: bool) {
+    static LSM_MODE: OnceLock<bool> = OnceLock::new();
+    let configured_lsm = LSM_MODE.get_or_init(|| {
+        // SAFETY: this shared initializer serializes all writes and completes
+        // before any caller can construct a server, client, or sync operation.
         unsafe {
             std::env::set_var("RIPCLONE_SERVER_TOKEN", TOKEN);
             std::env::set_var("RIPCLONE_NO_CACHE", "1");
@@ -53,13 +54,19 @@ pub fn init(lsm: bool) {
             // single-tenant local e2e tests, so use the documented trust-mode
             // escape hatch (the shared token is the only auth here).
             std::env::set_var("RIPCLONE_TRUST_GATEWAY", "1");
-            // Two-phase publish and async builds are always on (no env toggle);
-            // the helpers below poll for the background full/files variants.
-            if lsm {
-                std::env::set_var("RIPCLONE_LSM", "1");
-            }
+            // Two-phase publish and async builds are always on (no env toggle).
+            std::env::set_var("RIPCLONE_LSM", if lsm { "1" } else { "0" });
         }
+        lsm
     });
+    assert_eq!(
+        *configured_lsm, lsm,
+        "tests in one executable must use the same LSM mode"
+    );
+}
+
+pub fn init(lsm: bool) {
+    init_env(lsm);
 }
 
 pub fn token_hash() -> String {
@@ -1546,23 +1553,7 @@ pub fn read(dir: &Path, name: &str) -> String {
 /// every test in the binary. The LSM build seals every advancing tail and
 /// compacts at `max_levels` (16).
 pub fn setup(lsm: bool) {
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| unsafe {
-        std::env::set_var("RIPCLONE_SERVER_TOKEN", TOKEN);
-        std::env::set_var("RIPCLONE_NO_CACHE", "1");
-        // Tests poll clones aggressively; don't let the default rate limiter
-        // throttle them. Test-only — production keeps its configured limits.
-        std::env::set_var("RIPCLONE_RATE_LIMIT_BURST", "1000000");
-        std::env::set_var("RIPCLONE_RATE_LIMIT_PER_SEC", "1000000");
-        std::env::set_var(
-            "RIPCLONE_ORIGIN_BASE",
-            format!("file://{}", origin_root().display()),
-        );
-        // Single-tenant local e2e: AU1 access enforcement can't probe file://
-        // origins over HTTP, so use the documented trust-mode escape hatch.
-        std::env::set_var("RIPCLONE_TRUST_GATEWAY", "1");
-        std::env::set_var("RIPCLONE_LSM", if lsm { "1" } else { "0" });
-    });
+    init_env(lsm);
 }
 
 /// Clone the full (depth=0) editable variant, waiting for it to reach
