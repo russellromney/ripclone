@@ -1693,6 +1693,35 @@ async fn pinned_lookup_uses_exact_a_while_phase_one_b_is_paused() {
             .collect::<Vec<_>>()
     );
 
+    // Pinning B with the explicit Full top-up opt-in derives A solely from the
+    // carried manifest. Exact Full(B) is still blocked, so this remains a 202
+    // whose public identity is B.
+    let top_up = reqwest::Client::new()
+        .get(format!(
+            "{}/v1/repos/github/acme/phase-one-pin/refs/main?clonepack=full&pinned={b}&top_up=true",
+            server.url
+        ))
+        .header("Authorization", format!("Ripclone {}", token_hash()))
+        .header("x-ripclone-protocol", "2")
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+        .expect("top-up lookup while B phase one is paused");
+    assert_eq!(top_up.status(), StatusCode::ACCEPTED);
+    let top_up: serde_json::Value = top_up.json().await.expect("top-up pending response");
+    assert_eq!(top_up["code"], "artifact_pending");
+    assert_eq!(top_up["commit"], b);
+    assert_eq!(top_up["top_up_supported"], true);
+    assert_eq!(top_up["top_up_base"]["commit"], a);
+    assert_eq!(
+        top_up["top_up_base"]["clonepack_manifest"],
+        moving_b.full_clonepack.manifest
+    );
+    assert_ne!(
+        top_up["top_up_base"]["metadata_chunk"], moving_b.metadata_chunk,
+        "the response must not mix B's top-level metadata into carried A"
+    );
+
     let probe = server
         .pinned_path_probe
         .as_ref()

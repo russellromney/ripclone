@@ -8,6 +8,7 @@ use crate::extract::{extract_archive_from_chunk_receiver, extract_clonepack_stre
 use crate::git;
 use crate::mode::CloneMode;
 use crate::overlay;
+use crate::provider::{ProviderInstance, ProviderInstanceId, ProviderKind, RepoId};
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, bounded};
 use prost::Message;
@@ -40,6 +41,10 @@ struct ServerError {
 struct ArtifactPendingResponse {
     code: String,
     commit: String,
+    #[serde(default)]
+    top_up_supported: Option<bool>,
+    #[serde(default)]
+    top_up_base: Option<RefResponse>,
 }
 
 /// The selected artifact is not yet available for the commit this clone pinned.
@@ -265,6 +270,56 @@ fn ref_poll_config() -> (usize, std::time::Duration) {
         .map(std::time::Duration::from_millis)
         .unwrap_or(DEFAULT_DELAY);
     (attempts, delay)
+}
+
+fn managed_git_timeout() -> Duration {
+    const PRODUCTION_TIMEOUT: Duration = Duration::from_secs(300);
+    if std::env::var_os("RIPCLONE_TESTING").is_none() {
+        return PRODUCTION_TIMEOUT;
+    }
+    std::env::var("RIPCLONE_TEST_GIT_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .map(Duration::from_millis)
+        .unwrap_or(PRODUCTION_TIMEOUT)
+}
+
+fn local_provider_origin(provider: &ProviderInstance, repo_path: &str) -> String {
+    if provider.is_github_default()
+        && provider.host == "github.com"
+        && let Some(base) = std::env::var("RIPCLONE_ORIGIN_BASE")
+            .ok()
+            .filter(|base| !base.is_empty())
+    {
+        format!("{}/{}.git", base.trim_end_matches('/'), repo_path)
+    } else {
+        provider.clone_url(repo_path)
+    }
+}
+
+async fn delay_test_top_up_plan_once() {
+    if std::env::var_os("RIPCLONE_TESTING").is_none() {
+        return;
+    }
+    let Some(delay) = std::env::var("RIPCLONE_TEST_TOP_UP_PLAN_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+    else {
+        return;
+    };
+    let Some(marker) = std::env::var_os("RIPCLONE_TEST_TOP_UP_PLAN_DELAY_MARKER") else {
+        return;
+    };
+    if std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(marker)
+        .is_ok()
+    {
+        tokio::time::sleep(Duration::from_millis(delay)).await;
+    }
 }
 
 /// Return the chunk refs that make up the head-blobs pack, falling back to the
@@ -727,6 +782,37 @@ pub struct CloneOutcome {
     pub bytes: u64,
 }
 
+#[derive(Debug)]
+enum InstallPlan {
+    Exact {
+        target: String,
+        artifact: String,
+        response: RefResponse,
+    },
+    TopUp {
+        target: String,
+        artifact: String,
+        base_response: RefResponse,
+    },
+}
+
+impl InstallPlan {
+    fn into_parts(self) -> (String, String, RefResponse, bool) {
+        match self {
+            Self::Exact {
+                target,
+                artifact,
+                response,
+            } => (target, artifact, response, false),
+            Self::TopUp {
+                target,
+                artifact,
+                base_response,
+            } => (target, artifact, base_response, true),
+        }
+    }
+}
+
 #[derive(Default)]
 struct InstallIdentity {
     pinned: Option<String>,
@@ -843,6 +929,49 @@ struct AbortOnDrop<T: Send + 'static> {
     cleanup: AttemptCleanup,
 }
 
+struct ManagedGitChild {
+    child: Option<tokio::process::Child>,
+    process_group: Option<i32>,
+    cleanup: AttemptCleanup,
+}
+
+impl ManagedGitChild {
+    fn new(child: tokio::process::Child, cleanup: AttemptCleanup) -> Self {
+        Self {
+            process_group: child.id().map(|pid| pid as i32),
+            child: Some(child),
+            cleanup,
+        }
+    }
+
+    fn terminate(&mut self) {
+        #[cfg(unix)]
+        if let Some(group) = self.process_group {
+            // The child starts a fresh process group, so this also kills an
+            // HTTP remote helper or hook-like descendant before staging drops.
+            unsafe {
+                libc::kill(-group, libc::SIGKILL);
+            }
+        }
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.start_kill();
+        }
+    }
+}
+
+impl Drop for ManagedGitChild {
+    fn drop(&mut self) {
+        if self.child.is_some() {
+            self.terminate();
+        }
+        if let Some(mut child) = self.child.take() {
+            self.cleanup.push(Box::pin(async move {
+                let _ = child.wait().await;
+            }));
+        }
+    }
+}
+
 impl<T: Send + 'static> AbortOnDrop<T> {
     fn new(handle: tokio::task::JoinHandle<T>, cleanup: AttemptCleanup) -> Self {
         cleanup.guard_started();
@@ -891,6 +1020,10 @@ pub struct Client {
     cache: Option<Cas>,
     /// Upstream git provider instance id (e.g. "github", "gitlab").
     provider: String,
+    /// Locally configured provider boundary used for a pending Full top-up.
+    /// A non-default provider id alone is insufficient: its host/template must
+    /// come from the client's own registry, never from the server response.
+    provider_instance: Option<ProviderInstance>,
     /// Upstream credential token sent as `X-Upstream-Token`.
     upstream_token: Option<String>,
     /// When true, suppress the post-clone metrics report regardless of env.
@@ -962,6 +1095,13 @@ impl Client {
             auth_header: auth_value,
             cache,
             provider: "github".to_string(),
+            provider_instance: Some(ProviderInstance {
+                id: ProviderInstanceId::new("github"),
+                kind: ProviderKind::GitHub,
+                host: "github.com".to_string(),
+                auth_template: None,
+                auth_header_name: None,
+            }),
             upstream_token: None,
             skip_metrics: false,
         }
@@ -969,6 +1109,15 @@ impl Client {
 
     pub fn with_provider(mut self, provider: impl Into<String>) -> Self {
         self.provider = provider.into();
+        if self.provider != "github" {
+            self.provider_instance = None;
+        }
+        self
+    }
+
+    pub fn with_provider_instance(mut self, provider: ProviderInstance) -> Self {
+        self.provider = provider.id.as_str().to_string();
+        self.provider_instance = Some(provider);
         self
     }
 
@@ -1051,16 +1200,26 @@ impl Client {
     ) -> Result<RefResponse> {
         let mut pinned = None;
         let mut resolved_branch = None;
-        self.resolve_ref_for_operation(
-            repo_path,
-            branch,
-            clonepack,
-            rev,
-            &mut pinned,
-            &mut resolved_branch,
-            clonepack.unwrap_or("full"),
-        )
-        .await
+        let mut clone_id = None;
+        let mut cold = false;
+        match self
+            .resolve_ref_for_operation(
+                repo_path,
+                branch,
+                clonepack,
+                rev,
+                &mut pinned,
+                &mut resolved_branch,
+                clonepack.unwrap_or("full"),
+                false,
+                &mut clone_id,
+                &mut cold,
+            )
+            .await?
+        {
+            InstallPlan::Exact { response, .. } => Ok(response),
+            InstallPlan::TopUp { .. } => unreachable!("top-up was not requested"),
+        }
     }
 
     async fn resolve_ref_for_operation(
@@ -1072,12 +1231,16 @@ impl Client {
         pinned: &mut Option<String>,
         resolved_branch: &mut Option<String>,
         pending_mode: &str,
-    ) -> Result<RefResponse> {
+        allow_top_up: bool,
+        first_clone_id: &mut Option<String>,
+        cold: &mut bool,
+    ) -> Result<InstallPlan> {
         let (max_attempts, poll_delay) = ref_poll_config();
         // Track whether any attempt polled a cold build (202/503) before
         // success, so the post-clone metrics report can label the clone cold.
         let mut polled = false;
         for attempt in 0..max_attempts {
+            let requested_top_up = allow_top_up && pinned.is_some();
             let request_branch = if pinned.is_some() {
                 resolved_branch.as_deref().unwrap_or(branch)
             } else {
@@ -1095,6 +1258,9 @@ impl Client {
             }
             if let Some(commit) = pinned.as_deref() {
                 q.push(format!("pinned={commit}"));
+                if requested_top_up {
+                    q.push("top_up=true".to_string());
+                }
             } else if let Some(r) = rev {
                 q.push(format!("rev={}", urlencoding::encode(r)));
             }
@@ -1105,6 +1271,14 @@ impl Client {
             let resp = self.send(self.request(reqwest::Method::GET, &url)).await?;
             let status = resp.status();
             if status == reqwest::StatusCode::ACCEPTED {
+                let response_clone_id = resp
+                    .headers()
+                    .get("x-ripclone-clone-id")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string);
+                if first_clone_id.is_none() {
+                    *first_clone_id = response_clone_id;
+                }
                 let pending_branch = resp
                     .headers()
                     .get(reqwest::header::CONTENT_LOCATION)
@@ -1154,8 +1328,55 @@ impl Client {
                     }
                 }
                 polled = true;
+                *cold = true;
+                if requested_top_up && pending.top_up_supported == Some(true) {
+                    let target = pinned.clone().expect("valid 202 establishes a pin");
+                    let Some(base_response) = pending.top_up_base else {
+                        return Err(anyhow::Error::new(ArtifactPending {
+                            commit: target,
+                            mode: pending_mode.to_string(),
+                        }));
+                    };
+                    crate::validation::validate_object_id(&base_response.commit)
+                        .with_context(|| format!("invalid top-up base commit for {repo_path}"))?;
+                    crate::validation::validate_git_rev(&base_response.branch)
+                        .with_context(|| format!("invalid top-up base branch for {repo_path}"))?;
+                    crate::validation::validate_git_rev(&base_response.default_branch)
+                        .with_context(|| {
+                            format!("invalid top-up base default branch for {repo_path}")
+                        })?;
+                    if let Some(expected) = resolved_branch.as_deref()
+                        && base_response.branch != expected
+                    {
+                        anyhow::bail!(
+                            "ref integrity error: top-up base branch {} does not match resolved branch {expected}",
+                            base_response.branch
+                        );
+                    }
+                    if base_response.shallow || base_response.clonepack_manifest.is_empty() {
+                        anyhow::bail!(
+                            "invalid top-up plan for pinned commit {target}: base is not a complete Full artifact"
+                        );
+                    }
+                    if base_response.commit == target {
+                        anyhow::bail!(
+                            "invalid top-up plan for pinned commit {target}: base is not distinct"
+                        );
+                    }
+                    return Ok(InstallPlan::TopUp {
+                        target,
+                        artifact: base_response.commit.clone(),
+                        base_response,
+                    });
+                }
                 if attempt == 0 {
                     eprintln!("ripclone: warming {repo_path} — this can take a moment…");
+                }
+                // The first ordinary 202 exists to establish B. Eligible Full
+                // clones immediately make the one pinned opt-in request; only
+                // old servers (missing the new fields) enter the bounded poll.
+                if allow_top_up && !requested_top_up {
+                    continue;
                 }
                 if attempt + 1 < max_attempts {
                     tokio::time::sleep(poll_delay).await;
@@ -1192,6 +1413,9 @@ impl Client {
                     .get("x-ripclone-clone-id")
                     .and_then(|v| v.to_str().ok())
                     .map(str::to_string);
+                if first_clone_id.is_none() {
+                    *first_clone_id = clone_id;
+                }
                 let mut info: RefResponse = resp.json().await?;
                 crate::validation::validate_object_id(&info.commit)
                     .with_context(|| format!("invalid ready commit for {repo_path}"))?;
@@ -1217,9 +1441,14 @@ impl Client {
                 } else {
                     *resolved_branch = Some(info.branch.clone());
                 }
-                info.clone_id = clone_id;
-                info.cold = polled;
-                return Ok(info);
+                *cold |= polled;
+                info.clone_id = first_clone_id.clone();
+                info.cold = *cold;
+                return Ok(InstallPlan::Exact {
+                    target: pinned.clone().expect("ready response establishes a pin"),
+                    artifact: info.commit.clone(),
+                    response: info,
+                });
             }
             let authorization_failure = matches!(
                 status,
@@ -1801,7 +2030,9 @@ impl Client {
         // 1. Resolve the moving selector once. A pending or ready response
         // establishes `identity.pinned`; every later poll and retry uses the
         // metadata-only pinned query.
-        let mut info = self
+        let allow_top_up =
+            rev.is_none() && mode == CloneMode::Editable && clonepack == Some("full");
+        let plan = self
             .resolve_ref_for_operation(
                 repo_path,
                 branch,
@@ -1810,24 +2041,37 @@ impl Client {
                 &mut identity.pinned,
                 &mut identity.resolved_branch,
                 metric_mode,
+                allow_top_up,
+                &mut identity.clone_id,
+                &mut identity.cold,
             )
             .await?;
         bench.mark_resolve();
-        if identity.clone_id.is_none() {
-            identity.clone_id = info.clone_id.clone();
+        let (plan_target, artifact, mut info, top_up) = plan.into_parts();
+        if top_up {
+            delay_test_top_up_plan_once().await;
         }
-        identity.cold |= info.cold;
         let pinned = identity
             .pinned
             .clone()
             .context("ref resolution completed without a pinned commit")?;
-        if info.commit != pinned {
+        if plan_target != pinned {
             anyhow::bail!(
-                "ref integrity error: response commit {} does not match pinned commit {pinned}",
+                "ref integrity error: plan target {plan_target} does not match pinned commit {pinned}"
+            );
+        }
+        if info.commit != artifact {
+            anyhow::bail!(
+                "ref integrity error: response commit {} does not match artifact commit {artifact}",
                 info.commit
             );
         }
-        info!("resolved to commit {}", &info.commit[..7]);
+        info!(
+            "resolved target {} using {} artifact {}",
+            &pinned[..7],
+            if top_up { "base" } else { "exact" },
+            &artifact[..7]
+        );
 
         // Files mode needs the zstd archive. The server publishes an editable
         // clonepack first and adds the archive a moment later, so wait for it
@@ -1840,7 +2084,7 @@ impl Client {
             let (max, poll_delay) = ref_poll_config();
             for _ in 0..max {
                 tokio::time::sleep(poll_delay).await;
-                info = self
+                info = match self
                     .resolve_ref_for_operation(
                         repo_path,
                         branch,
@@ -1849,9 +2093,15 @@ impl Client {
                         &mut identity.pinned,
                         &mut identity.resolved_branch,
                         metric_mode,
+                        false,
+                        &mut identity.clone_id,
+                        &mut identity.cold,
                     )
-                    .await?;
-                identity.cold |= info.cold;
+                    .await?
+                {
+                    InstallPlan::Exact { response, .. } => response,
+                    InstallPlan::TopUp { .. } => unreachable!("files mode does not request top-up"),
+                };
                 if info.archive_ready {
                     break;
                 }
@@ -1879,7 +2129,7 @@ impl Client {
             self.clone().spawn_fetch_manifest(
                 info.clonepack_manifest.clone(),
                 info.clonepack_manifest_url.clone(),
-                pinned.clone(),
+                artifact.clone(),
                 manifest_tx,
             ),
             cleanup.clone(),
@@ -2143,9 +2393,25 @@ impl Client {
         // separate `add_bytes` for the archive total is needed.
         bench.mark_archive_download(archive_bytes + prebuilt_blob_pack_bytes);
 
-        // 9. Origin config + finalization.
+        // 9. A top-up installs Full(A) privately, then fetches and checks the
+        // exact pinned B before any rename or mount can expose the staging tree.
+        if top_up {
+            self.top_up_staged_repo(repo_path, &install_root, &artifact, &pinned, cleanup)
+                .await
+                .with_context(|| {
+                    format!("top-up of pinned commit {pinned} from base {artifact}")
+                })?;
+        }
+
+        // 10. Origin config + finalization.
         if !files_only {
-            let origin_url = if info.origin_url.is_empty() {
+            let origin_url = if top_up {
+                let provider = self
+                    .provider_instance
+                    .as_ref()
+                    .context("top-up requires the locally configured provider instance")?;
+                local_provider_origin(provider, repo_path)
+            } else if info.origin_url.is_empty() {
                 if let Some((owner, repo)) = repo_path.split_once('/') {
                     format!("https://github.com/{owner}/{repo}.git")
                 } else {
@@ -2947,6 +3213,303 @@ impl Client {
         );
         std::fs::write(git_dir.join("config"), config)?;
         Ok(())
+    }
+
+    async fn top_up_staged_repo(
+        &self,
+        repo_path: &str,
+        install_root: &Path,
+        base: &str,
+        target: &str,
+        cleanup: &AttemptCleanup,
+    ) -> Result<()> {
+        let top_up_started = Instant::now();
+        crate::validation::validate_object_id(base).context("invalid top-up base object id")?;
+        crate::validation::validate_object_id(target).context("invalid top-up target object id")?;
+        let provider = self
+            .provider_instance
+            .as_ref()
+            .filter(|provider| provider.id.as_str() == self.provider)
+            .context(
+                "top-up is unavailable because the selected provider has no local client configuration",
+            )?;
+        let repo_id = RepoId {
+            provider: provider.id.clone(),
+            path: repo_path.to_string(),
+        };
+        crate::validation::validate_repo_path(provider, &repo_id)
+            .context("invalid local provider repository path for top-up")?;
+
+        if install_root.join(".git/shallow").exists() {
+            anyhow::bail!("top-up base unexpectedly contains a shallow boundary");
+        }
+        let installed = self
+            .run_managed_git(install_root, ["rev-parse", "HEAD"], None, cleanup)
+            .await?;
+        if installed.trim() != base {
+            anyhow::bail!(
+                "installed top-up base HEAD {} does not match declared base {base}",
+                installed.trim()
+            );
+        }
+        let test_unchanged = if std::env::var_os("RIPCLONE_TESTING").is_some() {
+            std::env::var_os("RIPCLONE_TEST_TOP_UP_UNCHANGED_PATH").map(PathBuf::from)
+        } else {
+            None
+        };
+        let unchanged_mtime_before = test_unchanged
+            .as_ref()
+            .and_then(|path| std::fs::metadata(install_root.join(path)).ok())
+            .and_then(|metadata| metadata.modified().ok());
+
+        let origin = local_provider_origin(provider, repo_path);
+        let auth_header = match self.upstream_token.as_deref() {
+            Some(token) => Some(provider.auth_header(token).context(
+                "the locally configured provider cannot construct its authentication header",
+            )?),
+            None => None,
+        };
+        let fetch_args = vec![
+            "fetch".to_string(),
+            "--no-write-fetch-head".to_string(),
+            "--no-tags".to_string(),
+            "--no-recurse-submodules".to_string(),
+            "--refmap=".to_string(),
+            "--".to_string(),
+            origin,
+            target.to_string(),
+        ];
+        self.run_managed_git_owned(install_root, fetch_args, auth_header.as_ref(), cleanup)
+            .await
+            .with_context(|| format!("exact upstream fetch of pinned commit {target}"))?;
+
+        let repo = install_root.to_path_buf();
+        let target_for_parse = target.to_string();
+        let parent = AbortOnDrop::new(
+            tokio::task::spawn_blocking(move || {
+                crate::git::parent_commit(&repo, &target_for_parse)
+            }),
+            cleanup.clone(),
+        )
+        .join()
+        .await
+        .context("join top-up commit validation")??;
+        if parent.as_deref() != Some(base) {
+            anyhow::bail!(
+                "pinned commit {target} is not a single-parent child of top-up base {base}"
+            );
+        }
+
+        self.run_managed_git(install_root, ["reset", "--hard", target], None, cleanup)
+            .await
+            .with_context(|| format!("update staged worktree to pinned commit {target}"))?;
+        let head = self
+            .run_managed_git(install_root, ["rev-parse", "HEAD"], None, cleanup)
+            .await?;
+        if head.trim() != target {
+            anyhow::bail!(
+                "top-up staged HEAD {} does not match pinned commit {target}",
+                head.trim()
+            );
+        }
+        let head_ref = self
+            .run_managed_git(install_root, ["symbolic-ref", "-q", "HEAD"], None, cleanup)
+            .await?;
+        if !head_ref.trim().starts_with("refs/heads/") {
+            anyhow::bail!("top-up staged HEAD is not attached to a branch");
+        }
+        let status = self
+            .run_managed_git(
+                install_root,
+                ["status", "--porcelain=v1", "--untracked-files=all"],
+                None,
+                cleanup,
+            )
+            .await?;
+        if !status.trim().is_empty() {
+            anyhow::bail!("top-up staged worktree is not clean");
+        }
+        if let (Some(path), Some(before), Some(log)) = (
+            test_unchanged,
+            unchanged_mtime_before,
+            std::env::var_os("RIPCLONE_TEST_TOP_UP_METRICS_LOG"),
+        ) {
+            let after = std::fs::metadata(install_root.join(path))
+                .context("stat test top-up unchanged path after update")?
+                .modified()
+                .context("read test top-up unchanged mtime after update")?;
+            let nanos = |time: std::time::SystemTime| {
+                time.duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            };
+            std::fs::write(
+                log,
+                format!(
+                    "before_mtime_ns={}\nafter_mtime_ns={}\nexact_fetches=1\ntop_up_ms={}\n",
+                    nanos(before),
+                    nanos(after),
+                    top_up_started.elapsed().as_millis()
+                ),
+            )
+            .context("write test top-up metrics log")?;
+        }
+        Ok(())
+    }
+
+    async fn run_managed_git<const N: usize>(
+        &self,
+        repo: &Path,
+        args: [&str; N],
+        auth_header: Option<&(String, String)>,
+        cleanup: &AttemptCleanup,
+    ) -> Result<String> {
+        self.run_managed_git_owned(
+            repo,
+            args.into_iter().map(str::to_string).collect(),
+            auth_header,
+            cleanup,
+        )
+        .await
+    }
+
+    async fn run_managed_git_owned(
+        &self,
+        repo: &Path,
+        args: Vec<String>,
+        auth_header: Option<&(String, String)>,
+        cleanup: &AttemptCleanup,
+    ) -> Result<String> {
+        use std::io::{Read, Seek};
+        use std::process::Stdio;
+
+        let mut stdout_file = tempfile::tempfile().context("create top-up Git stdout file")?;
+        let child_stdout = stdout_file
+            .try_clone()
+            .context("clone top-up Git stdout file")?;
+        let mut stderr = tempfile::tempfile().context("create top-up Git stderr file")?;
+        let child_stderr = stderr.try_clone().context("clone top-up Git stderr file")?;
+        let mut command = tokio::process::Command::new("git");
+        command
+            .env_clear()
+            .env("HOME", "/nonexistent")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_NO_REPLACE_OBJECTS", "1")
+            .env("GIT_PAGER", "cat")
+            .env("LC_ALL", "C")
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(child_stdout))
+            .stderr(Stdio::from(child_stderr));
+        if let Some(path) = std::env::var_os("PATH") {
+            command.env("PATH", path);
+        }
+        if let Some(root) = std::env::var_os("SystemRoot") {
+            command.env("SystemRoot", root);
+        }
+        command.args([
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "credential.helper=",
+            "-c",
+            "maintenance.auto=false",
+            "-c",
+            "gc.auto=0",
+            "-c",
+            "protocol.version=2",
+            "-c",
+            "fetch.fsckObjects=true",
+            "-c",
+            "transfer.fsckObjects=true",
+        ]);
+        if let Some((name, value)) = auth_header {
+            command
+                .args(["-c", &format!("http.extraHeader={name}: {value}")])
+                .args(["-c", "http.followRedirects=false"]);
+        }
+        command.arg("-C").arg(repo).args(&args);
+        #[cfg(unix)]
+        unsafe {
+            use std::os::unix::process::CommandExt;
+            command.as_std_mut().pre_exec(|| {
+                if libc::setpgid(0, 0) == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
+        let child = command
+            .spawn()
+            .context("spawn managed top-up Git command")?;
+        let mut managed = ManagedGitChild::new(child, cleanup.clone());
+        let timeout = managed_git_timeout();
+        let status = match tokio::time::timeout(
+            timeout,
+            managed
+                .child
+                .as_mut()
+                .expect("managed child present")
+                .wait(),
+        )
+        .await
+        {
+            Ok(status) => status.context("wait for managed top-up Git command")?,
+            Err(_) => {
+                managed.terminate();
+                let _ = managed
+                    .child
+                    .as_mut()
+                    .expect("managed child present")
+                    .wait()
+                    .await;
+                managed.child.take();
+                anyhow::bail!(
+                    "top-up Git command timed out after {} seconds",
+                    timeout.as_secs()
+                );
+            }
+        };
+        managed.child.take();
+        if !status.success() {
+            stderr.rewind().context("rewind top-up Git stderr")?;
+            let mut detail = String::new();
+            stderr
+                .read_to_string(&mut detail)
+                .context("read top-up Git stderr")?;
+            if let Some((_, value)) = auth_header {
+                detail = detail.replace(value, "<redacted>");
+            }
+            if let Some(token) = self.upstream_token.as_deref() {
+                detail = detail.replace(token, "<redacted>");
+            }
+            let detail = detail
+                .lines()
+                .rev()
+                .filter(|line| !line.trim().is_empty())
+                .take(4)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join("\n");
+            if detail.is_empty() {
+                anyhow::bail!("top-up Git command failed with {status}");
+            }
+            anyhow::bail!("top-up Git command failed: {detail}");
+        }
+        stdout_file
+            .rewind()
+            .context("rewind managed top-up Git stdout")?;
+        let mut stdout = Vec::new();
+        stdout_file
+            .read_to_end(&mut stdout)
+            .context("read managed top-up Git stdout")?;
+        Ok(String::from_utf8_lossy(&stdout).into_owned())
     }
 
     /// Materialize the working tree for a git worktree into `work_tree`.

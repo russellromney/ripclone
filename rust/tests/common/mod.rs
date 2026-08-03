@@ -486,13 +486,13 @@ pub async fn start_server_with_barrier(barrier: ArtifactBarrier) -> Server {
 }
 
 pub async fn start_server_split_storage() -> Server {
-    start_server_split_storage_inner(None, None, None, None).await
+    start_server_split_storage_inner(None, None, None, None, None).await
 }
 
 /// Start a split-storage server with a deterministic artifact download barrier.
 /// See [`ripclone::server::ArtifactBarrier`].
 pub async fn start_server_split_storage_barrier(barrier: ArtifactBarrier) -> Server {
-    start_server_split_storage_inner(Some(barrier), None, None, None).await
+    start_server_split_storage_inner(Some(barrier), None, None, None, None).await
 }
 
 pub async fn start_server_split_storage_phase_one_barrier() -> (
@@ -510,7 +510,34 @@ pub async fn start_server_split_storage_phase_one_barrier() -> (
         proceed: tokio::sync::Mutex::new(Some(proceed_rx)),
     });
     let server =
-        start_server_split_storage_inner(None, None, None, Some(Arc::clone(&barrier))).await;
+        start_server_split_storage_inner(None, None, None, Some(Arc::clone(&barrier)), None).await;
+    (server, barrier, entered_rx, proceed_tx)
+}
+
+pub async fn start_server_split_storage_phase_one_barrier_with_registry(
+    provider_registry: ripclone::provider::ProviderRegistry,
+) -> (
+    Server,
+    Arc<PhaseOnePublishBarrier>,
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (proceed_tx, proceed_rx) = tokio::sync::oneshot::channel();
+    let barrier = Arc::new(PhaseOnePublishBarrier {
+        armed: std::sync::atomic::AtomicBool::new(false),
+        consumed: std::sync::atomic::AtomicBool::new(false),
+        entered: std::sync::Mutex::new(Some(entered_tx)),
+        proceed: tokio::sync::Mutex::new(Some(proceed_rx)),
+    });
+    let server = start_server_split_storage_inner(
+        None,
+        None,
+        None,
+        Some(Arc::clone(&barrier)),
+        Some(provider_registry),
+    )
+    .await;
     (server, barrier, entered_rx, proceed_tx)
 }
 
@@ -522,7 +549,14 @@ pub async fn start_server_split_storage_failing_put(
     fail_after_successes: usize,
     failures: usize,
 ) -> Server {
-    start_server_split_storage_inner(None, Some((fail_after_successes, failures)), None, None).await
+    start_server_split_storage_inner(
+        None,
+        Some((fail_after_successes, failures)),
+        None,
+        None,
+        None,
+    )
+    .await
 }
 
 /// Start a split-storage server whose ref-store writes fail after a configurable
@@ -533,7 +567,14 @@ pub async fn start_server_split_storage_failing_ref_save(
     fail_after_successes: usize,
     failures: usize,
 ) -> Server {
-    start_server_split_storage_inner(None, None, Some((fail_after_successes, failures)), None).await
+    start_server_split_storage_inner(
+        None,
+        None,
+        Some((fail_after_successes, failures)),
+        None,
+        None,
+    )
+    .await
 }
 
 async fn start_server_split_storage_inner(
@@ -541,6 +582,7 @@ async fn start_server_split_storage_inner(
     fail_put: Option<(usize, usize)>,
     fail_ref: Option<(usize, usize)>,
     phase_one_barrier: Option<Arc<PhaseOnePublishBarrier>>,
+    provider_registry: Option<ripclone::provider::ProviderRegistry>,
 ) -> Server {
     init_tracing();
     let dir = tempfile::tempdir().expect("server dir");
@@ -598,7 +640,7 @@ async fn start_server_split_storage_inner(
         inner: Arc::new(local_queue),
         probe: Arc::clone(&pinned_path_probe),
     });
-    let provider_registry = ripclone::provider::ProviderRegistry::new();
+    let provider_registry = provider_registry.unwrap_or_default();
     let broker: Arc<dyn ripclone::auth::broker::CredentialBroker> = Arc::new(
         ripclone::auth::broker::StaticBroker::new(provider_registry.clone()),
     );
@@ -1291,6 +1333,29 @@ impl HttpOrigin {
         self.auth_status_count("403")
     }
 
+    pub fn auth_success_count(&self) -> usize {
+        self.auth_status_count("200")
+    }
+
+    pub fn auth_success_bytes(&self) -> u64 {
+        let Some(path) = &self.auth_log else {
+            return 0;
+        };
+        let Ok(log) = std::fs::read_to_string(path) else {
+            return 0;
+        };
+        log.lines()
+            .filter(|line| line.split('\t').next() == Some("200"))
+            .filter_map(|line| line.rsplit('\t').next()?.parse::<u64>().ok())
+            .sum()
+    }
+
+    pub fn clear_auth_log(&self) {
+        if let Some(path) = &self.auth_log {
+            std::fs::write(path, "").expect("clear HTTP origin request log");
+        }
+    }
+
     fn auth_status_count(&self, status: &str) -> usize {
         let Some(path) = &self.auth_log else {
             return 0;
@@ -1360,8 +1425,13 @@ class AuthHandler(http.server.SimpleHTTPRequestHandler):
         return self.headers.get('Authorization') == EXPECTED_AUTH
 
     def record(self, status):
+        size = 0
+        if status == 200:
+            path = self.translate_path(self.path.split('?', 1)[0])
+            if os.path.isfile(path):
+                size = os.path.getsize(path)
         with open(LOG, 'a', encoding='utf-8') as f:
-            f.write(f"{status}\t{self.command}\t{self.path}\t{self.headers.get('Authorization', '')}\n")
+            f.write(f"{status}\t{self.command}\t{self.path}\t{self.headers.get('Authorization', '')}\t{size}\n")
 
     def do_GET(self):
         if not self.check_auth():

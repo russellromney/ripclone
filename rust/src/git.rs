@@ -3310,6 +3310,42 @@ mod tests {
         assert!(!oids.is_empty());
     }
 
+    #[test]
+    fn parent_commit_is_none_for_a_merge() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        let run = |args: &[&str]| {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::write(repo.join("base"), b"base\n").unwrap();
+        run(&["add", "base"]);
+        run(&["commit", "-q", "-m", "base"]);
+        run(&["checkout", "-q", "-b", "side"]);
+        std::fs::write(repo.join("side"), b"side\n").unwrap();
+        run(&["add", "side"]);
+        run(&["commit", "-q", "-m", "side"]);
+        run(&["checkout", "-q", "main"]);
+        std::fs::write(repo.join("main"), b"main\n").unwrap();
+        run(&["add", "main"]);
+        run(&["commit", "-q", "-m", "main"]);
+        run(&["merge", "-q", "--no-ff", "side", "-m", "merge"]);
+        let merge = resolve_commit(repo, "HEAD").unwrap();
+        assert_eq!(parent_commit(repo, &merge).unwrap(), None);
+    }
+
     /// Negative cases for gix metadata queries (Phase 1).
     #[test]
     fn gix_metadata_negative_cases() {

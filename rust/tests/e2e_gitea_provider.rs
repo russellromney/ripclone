@@ -56,8 +56,8 @@ fn gitea_env() -> Option<GiteaEnv> {
     })
 }
 
-fn ripclone_bin() -> String {
-    std::env::var("CARGO_BIN_EXE_ripclone").expect("CARGO_BIN_EXE_ripclone not set")
+fn ripclone_bin() -> std::path::PathBuf {
+    cargo_bin("ripclone")
 }
 
 fn now_nanos() -> u128 {
@@ -233,6 +233,11 @@ fn assert_ripclone_ok(out: &std::process::Output, what: &str) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires Gitea"]
 async fn gitea_server_side_token_end_to_end() {
+    assert_eq!(
+        std::env::var("RIPCLONE_REQUIRE_GITEA").as_deref(),
+        Ok("1"),
+        "run through scripts/e2e_full_topup_gitea.sh"
+    );
     let Some(env) = gitea_env() else {
         eprintln!(
             "skipping: set RIPCLONE_GITEA_URL + RIPCLONE_GITEA_TOKEN (+ RIPCLONE_GITEA_USER) \
@@ -316,7 +321,10 @@ async fn gitea_server_side_token_end_to_end() {
     // Start the in-process server. It loads RIPCLONE_PROVIDERS (real token)
     // then merges config.toml (blank token). Post-fix the blank is filtered and
     // the real token survives; pre-fix it clobbered and every sync 401'd.
-    let server = start_server().await;
+    let registry = ripclone::provider::ProviderRegistry::load()
+        .expect("load server registry with real Gitea token and blank config token");
+    let (server, phase_one_barrier, phase_one_entered, phase_one_proceed) =
+        start_server_split_storage_phase_one_barrier_with_registry(registry).await;
 
     // --- Clone through ripclone with NO client-side token --------------------
     let work = tempfile::tempdir().unwrap();
@@ -374,6 +382,16 @@ async fn gitea_server_side_token_end_to_end() {
         &ripclone(&config_path, &server.url, cwd, &["sync", &repo_arg]),
         "sync after update",
     );
+    server
+        .client_with_provider("gitea", Some(&env.token))
+        .resolve_ref_with_clonepack(
+            &format!("{}/{}", env.user, repo),
+            "main",
+            Some("full"),
+            None,
+        )
+        .await
+        .expect("wait for exact Full update before server-token regression clone");
     let clone_dir2 = cwd.join("clone2");
     assert_ripclone_ok(
         &ripclone(
@@ -402,6 +420,95 @@ async fn gitea_server_side_token_end_to_end() {
         clone_dir2.join("update.txt").exists(),
         "the re-clone must contain the newly pushed file"
     );
+
+    // --- Pending Full(B): release CLI installs A, exact-fetches private B ---
+    // Give the release client the same locally configured provider instance and
+    // token. The server's copy remains separately captured in its registry.
+    let add_local_token = Command::new(ripclone_bin())
+        .args([
+            "provider", "add", "gitea", "--kind", "gitea", "--host", &env.url, "--token",
+            &env.token,
+        ])
+        .env("HOME", config_dir.path())
+        .env("RIPCLONE_CONFIG", &config_path)
+        .output()
+        .expect("configure release client Gitea token");
+    assert_ripclone_ok(&add_local_token, "configure local Gitea token");
+
+    let top_up_target = push_commit(&env, &repo, "top-up.txt", "private B\n");
+    phase_one_barrier.arm();
+    let sync_client = server.client_with_provider("gitea", Some(&env.token));
+    let repo_for_sync = format!("{}/{}", env.user, repo);
+    let mut pending_sync =
+        tokio::spawn(async move { sync_client.sync_repo(&repo_for_sync, None).await });
+    tokio::time::timeout(std::time::Duration::from_secs(20), phase_one_entered)
+        .await
+        .expect("private B reached phase-one publication")
+        .expect("private phase-one barrier alive");
+
+    let top_up_dir = cwd.join("top-up-clone");
+    assert_ripclone_ok(
+        &ripclone(
+            &config_path,
+            &server.url,
+            cwd,
+            &[
+                "clone",
+                &repo_arg,
+                top_up_dir.to_str().unwrap(),
+                "--mode",
+                "editable",
+                "--verify-upstream",
+                "never",
+                "--no-metrics",
+            ],
+        ),
+        "private one-commit Full top-up",
+    );
+    assert_eq!(head_fingerprint(&top_up_dir), top_up_target);
+    assert!(!pending_sync.is_finished(), "Full(B) must still be blocked");
+
+    // Missing local credentials can still authorize metadata through the
+    // server's registry, but must fail at the private upstream boundary.
+    let clear_local_token = Command::new(ripclone_bin())
+        .args([
+            "provider", "add", "gitea", "--kind", "gitea", "--host", &env.url, "--token", "",
+        ])
+        .env("HOME", config_dir.path())
+        .env("RIPCLONE_CONFIG", &config_path)
+        .output()
+        .expect("clear release client Gitea token");
+    assert_ripclone_ok(&clear_local_token, "clear local Gitea token");
+    let missing_dir = cwd.join("top-up-missing-token");
+    let missing = ripclone(
+        &config_path,
+        &server.url,
+        cwd,
+        &[
+            "clone",
+            &repo_arg,
+            missing_dir.to_str().unwrap(),
+            "--mode",
+            "editable",
+            "--verify-upstream",
+            "never",
+            "--no-metrics",
+        ],
+    );
+    assert!(!missing.status.success());
+    assert!(!missing_dir.exists());
+    assert!(
+        String::from_utf8_lossy(&missing.stderr).contains(&top_up_target.0),
+        "missing-token failure must retain pinned B: {}",
+        String::from_utf8_lossy(&missing.stderr)
+    );
+
+    phase_one_proceed.send(()).expect("release private Full(B)");
+    tokio::time::timeout(std::time::Duration::from_secs(20), &mut pending_sync)
+        .await
+        .expect("private Full(B) finished after release")
+        .expect("join private B sync")
+        .expect("sync private B");
 
     delete_repo(&http, &env, &repo).await;
 }

@@ -343,6 +343,10 @@ pub struct RefQuery {
     /// schedules work.
     #[serde(default)]
     pub pinned: Option<String>,
+    /// Opt in to a one-commit Full-clone top-up plan on a pending pinned lookup.
+    /// Ignored on moving, rev-targeted, and non-Full requests.
+    #[serde(default)]
+    pub top_up: bool,
 }
 
 fn default_clonepack_kind() -> String {
@@ -411,6 +415,10 @@ pub struct ArtifactPendingResponse {
     pub commit: String,
     pub status: &'static str,
     pub queue_depth: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_up_supported: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_up_base: Option<RefResponse>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -2511,6 +2519,16 @@ fn request_protocol(headers: &HeaderMap) -> Option<u32> {
 }
 
 fn artifact_pending_response(commit: &str, branch: &str, queue_depth: usize) -> Response {
+    artifact_pending_response_with_top_up(commit, branch, queue_depth, None, None)
+}
+
+fn artifact_pending_response_with_top_up(
+    commit: &str,
+    branch: &str,
+    queue_depth: usize,
+    top_up_supported: Option<bool>,
+    top_up_base: Option<RefResponse>,
+) -> Response {
     let mut response = (
         StatusCode::ACCEPTED,
         Json(ArtifactPendingResponse {
@@ -2518,6 +2536,8 @@ fn artifact_pending_response(commit: &str, branch: &str, queue_depth: usize) -> 
             commit: commit.to_string(),
             status: "building",
             queue_depth,
+            top_up_supported,
+            top_up_base,
         }),
     )
         .into_response();
@@ -2527,6 +2547,178 @@ fn artifact_pending_response(commit: &str, branch: &str, queue_depth: usize) -> 
             .insert(axum::http::header::CONTENT_LOCATION, value);
     }
     response
+}
+
+fn checked_manifest_hash(chunk: &crate::clonepack::ChunkRef) -> Option<String> {
+    if chunk.hash.len() != 32 || chunk.len == 0 {
+        return None;
+    }
+    Some(crate::clonepack::hash_to_hex(&chunk.hash))
+}
+
+/// Build an ordinary Full ref response for the carried base using only hashes
+/// and ordering authenticated by that base manifest. The enclosing phase-one
+/// row's top-level pack/archive lists belong to the pending target and are
+/// intentionally never consulted here.
+fn ref_response_from_manifest(
+    repo_id: &RepoId,
+    provider: &ProviderInstance,
+    branch: String,
+    manifest_hash: &str,
+    manifest: &ClonepackManifest,
+    storage: &crate::storage::StorageRef,
+    private: bool,
+) -> Option<RefResponse> {
+    if manifest.default_branch.is_empty()
+        || crate::validation::validate_git_rev(&manifest.default_branch).is_err()
+    {
+        return None;
+    }
+    let metadata_chunk = checked_manifest_hash(manifest.metadata_chunk.as_ref()?)?;
+    let archive_hashes = manifest
+        .archive_chunks
+        .iter()
+        .map(checked_manifest_hash)
+        .collect::<Option<Vec<_>>>()?;
+    let head_blob_hashes = manifest
+        .head_blobs_chunks
+        .iter()
+        .map(checked_manifest_hash)
+        .collect::<Option<Vec<_>>>()?;
+    let head_blobs_idx = match manifest.head_blobs_idx.as_ref() {
+        Some(chunk) => Some(checked_manifest_hash(chunk)?),
+        None => None,
+    };
+    let mut pack_hashes = Vec::with_capacity(manifest.packs.len());
+    let mut idx_hashes = Vec::with_capacity(manifest.packs.len());
+    for entry in &manifest.packs {
+        pack_hashes.push(checked_manifest_hash(entry.pack.as_ref()?)?);
+        idx_hashes.push(checked_manifest_hash(entry.idx.as_ref()?)?);
+    }
+    if manifest.packs.is_empty() {
+        return None;
+    }
+    let midx = match manifest.midx.as_ref() {
+        Some(chunk) => Some(checked_manifest_hash(chunk)?),
+        None => None,
+    };
+    let idx_bundle = match manifest.idx_bundle.as_ref() {
+        Some(chunk) => Some(checked_manifest_hash(chunk)?),
+        None => None,
+    };
+    if let Some(bundle) = manifest.idx_bundle.as_ref() {
+        for entry in &manifest.packs {
+            let idx = entry.idx.as_ref()?;
+            if entry
+                .idx_bundle_offset
+                .checked_add(idx.len)
+                .is_none_or(|end| end > bundle.len)
+            {
+                return None;
+            }
+        }
+    }
+    let ttl = ref_signed_url_ttl(private);
+    let signed = |hash: &str| signed_url(storage, ttl, hash);
+    let signed_list = |hashes: &[String]| {
+        let urls = hashes.iter().map(|hash| signed(hash)).collect::<Vec<_>>();
+        (!urls.iter().all(Option::is_none)).then_some(urls)
+    };
+    let (owner, repo) = repo_id
+        .github_owner_repo()
+        .map(|(owner, repo)| (owner.to_string(), repo.to_string()))
+        .unwrap_or_else(|| (repo_id.provider.as_str().to_string(), repo_id.path.clone()));
+    Some(RefResponse {
+        owner,
+        repo,
+        provider: provider.id.as_str().to_string(),
+        host: provider.host.clone(),
+        origin_url: provider.clone_url(&repo_id.path),
+        branch,
+        default_branch: manifest.default_branch.clone(),
+        commit: manifest.commit.clone(),
+        parent_commit: manifest.parent_commit.clone(),
+        full_pack: String::new(),
+        clonepack_manifest: manifest_hash.to_string(),
+        clonepack_manifest_url: signed(manifest_hash),
+        metadata_chunk_url: signed(&metadata_chunk),
+        metadata_chunk,
+        archive_chunk_urls: signed_list(&archive_hashes),
+        head_blobs_chunk_urls: signed_list(&head_blob_hashes),
+        head_blobs_idx_url: head_blobs_idx.as_deref().and_then(signed),
+        pack_chunk_urls: signed_list(&pack_hashes),
+        pack_idx_urls: signed_list(&idx_hashes),
+        midx_url: midx.as_deref().and_then(signed),
+        idx_bundle_url: idx_bundle.as_deref().and_then(signed),
+        shallow: false,
+        archive_ready: !manifest.archive_chunks.is_empty(),
+    })
+}
+
+async fn carried_full_top_up_response(
+    ref_store: &Arc<dyn RefStore>,
+    repo_id: &RepoId,
+    provider: &ProviderInstance,
+    branch: &str,
+    pinned: &str,
+    storage: &crate::storage::StorageRef,
+    private: bool,
+) -> Option<RefResponse> {
+    let info = ref_store
+        .load_branch(repo_id, branch)
+        .await
+        .ok()
+        .flatten()?;
+    if info.commit != pinned {
+        return None;
+    }
+    let parent = info.parent_commit.as_deref()?;
+    let artifact = info.full_clonepack.commit.as_str();
+    let manifest_hash = info.full_clonepack.manifest.as_str();
+    if parent != artifact
+        || artifact.is_empty()
+        || manifest_hash.is_empty()
+        || crate::validation::validate_object_id(parent).is_err()
+        || crate::cas::Cas::validate_artifact_id(manifest_hash).is_err()
+    {
+        return None;
+    }
+    let storage_for_read = Arc::clone(storage);
+    let manifest_hash_for_read = manifest_hash.to_string();
+    let test_read_log = (std::env::var_os("RIPCLONE_TESTING").is_some())
+        .then(|| std::env::var_os("RIPCLONE_TEST_TOP_UP_MANIFEST_READ_LOG"))
+        .flatten();
+    let bytes = tokio::task::spawn_blocking(move || {
+        let bytes = storage_for_read.get(&manifest_hash_for_read)?;
+        if let Some(log) = test_read_log {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(log)?;
+            writeln!(file, "{manifest_hash_for_read}")?;
+        }
+        anyhow::Ok(bytes)
+    })
+    .await
+    .ok()?
+    .ok()?;
+    if crate::cas::hash(&bytes) != manifest_hash {
+        return None;
+    }
+    let manifest = ClonepackManifest::decode(bytes.as_slice()).ok()?;
+    if manifest.commit != artifact {
+        return None;
+    }
+    ref_response_from_manifest(
+        repo_id,
+        provider,
+        branch.to_string(),
+        manifest_hash,
+        &manifest,
+        storage,
+        private,
+    )
 }
 
 /// A post-pin lookup performs only a fixed set of repo-scoped point reads.
@@ -2825,6 +3017,19 @@ async fn get_ref_inner(
             }
         };
         let Some((served_key, info)) = resolved else {
+            if params.top_up && params.clonepack == "full" {
+                let base = carried_full_top_up_response(
+                    &state.ref_store,
+                    &repo_id,
+                    &provider,
+                    &branch,
+                    pinned,
+                    &state.storage,
+                    private,
+                )
+                .await;
+                return artifact_pending_response_with_top_up(pinned, &branch, 1, Some(true), base);
+            }
             return artifact_pending_response(pinned, &branch, 1);
         };
         let response_branch = if branch == "HEAD" && !info.default_branch.is_empty() {
@@ -3139,6 +3344,23 @@ fn ref_signed_url_ttl(private: bool) -> Duration {
             REF_SIGNED_URL_TTL_PUBLIC_SECS,
         ))
     }
+}
+
+async fn wait_test_phase_two_barrier(commit: &str) -> Result<()> {
+    let Some(dir) = std::env::var_os("RIPCLONE_TEST_PHASE2_BARRIER_DIR").map(PathBuf::from) else {
+        return Ok(());
+    };
+    std::fs::create_dir_all(&dir).context("create test phase-two barrier directory")?;
+    std::fs::write(dir.join("entered"), format!("{commit}\n"))
+        .context("signal test phase-two barrier")?;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !dir.join("proceed").exists() {
+        if Instant::now() >= deadline {
+            anyhow::bail!("test phase-two barrier was not released within 60 seconds");
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    Ok(())
 }
 
 fn ref_response(
@@ -6657,6 +6879,7 @@ async fn build_and_publish_two_phase(
     );
     phases.publish_p1_ms = Some(duration_ms(t_total.elapsed()));
     let _ = t; // p1 assemble/upload time folded into the total above
+    wait_test_phase_two_barrier(commit).await?;
 
     // ---- PHASE 2: full history, in the background (survives the request) ----
     let cas2 = cas.clone();
