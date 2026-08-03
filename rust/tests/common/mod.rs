@@ -104,6 +104,36 @@ fn free_port() -> u16 {
     panic!("free_port: no unused loopback port after 1000 attempts");
 }
 
+/// Wait for the actual HTTP service, not merely for the listener socket.
+///
+/// A raw TCP connect can succeed in the narrow interval before Axum is ready
+/// to serve requests. Requiring two consecutive `/readyz` responses also
+/// catches a listener that starts and then immediately exits during parallel
+/// test startup.
+async fn wait_for_server_ready(port: u16, label: &str) {
+    let client = reqwest::Client::new();
+    let url = format!("http://127.0.0.1:{port}/readyz");
+    let mut consecutive = 0;
+    for _ in 0..400 {
+        if client
+            .get(&url)
+            .send()
+            .await
+            .map(|response| response.status().is_success())
+            .unwrap_or(false)
+        {
+            consecutive += 1;
+            if consecutive == 2 {
+                return;
+            }
+        } else {
+            consecutive = 0;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("{label} server on port {port} did not become HTTP-ready");
+}
+
 /// A running in-process server. Keeps its storage dir alive for the test.
 pub struct Server {
     pub url: String,
@@ -590,7 +620,6 @@ async fn start_server_split_storage_inner(
     let storage_dir = dir.path().join("storage");
     let repo_root = dir.path().join("repos");
     std::fs::create_dir_all(&repo_root).unwrap();
-    let port = free_port();
 
     let cas = ripclone::cas::Cas::new(&cas_dir).unwrap();
     let base_storage: StorageRef = Arc::new(RemoteLocalStorage {
@@ -716,6 +745,10 @@ async fn start_server_split_storage_inner(
     });
 
     let app = build_app(state);
+    // Choose the port only when the listener is ready to spawn. Selecting it
+    // before constructing the server leaves a long unbound window in which an
+    // unrelated process can claim it.
+    let port = free_port();
     tokio::spawn(async move {
         let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
         let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
@@ -725,21 +758,7 @@ async fn start_server_split_storage_inner(
         )
         .await;
     });
-    let mut ready = false;
-    for _ in 0..400 {
-        if tokio::net::TcpStream::connect(("127.0.0.1", port))
-            .await
-            .is_ok()
-        {
-            ready = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    assert!(
-        ready,
-        "split-storage server on port {port} did not become ready"
-    );
+    wait_for_server_ready(port, "split-storage").await;
     Server {
         url: format!("http://127.0.0.1:{port}"),
         cas_dir,
@@ -1091,10 +1110,12 @@ async fn start_server_inner(
     let dir = tempfile::tempdir().expect("server dir");
     let cas_dir = dir.path().join("cas");
     let repo_root = dir.path().join("repos");
-    let port = free_port();
     let (cas2, repos2) = (cas_dir.clone(), repo_root.clone());
 
     let _start_guard = SERVER_START_LOCK.lock().await;
+    // Tests can queue on SERVER_START_LOCK for several seconds. Do not choose
+    // a free port until this server can actually start binding it.
+    let port = free_port();
     if fail_first > 0 {
         // SAFETY: set under SERVER_START_LOCK and removed before it drops, so no
         // concurrently-constructing server observes it.
@@ -1111,20 +1132,10 @@ async fn start_server_inner(
     tokio::spawn(async move {
         let _ = run_server_with_barrier(&cas2, &repos2, "127.0.0.1", port, artifact_barrier).await;
     });
-    // Wait until the port accepts connections. The server state (including the
-    // fault threshold read) is constructed before the listener binds, so by the
-    // time the port is up the env var has been consumed.
-    let mut ready = false;
-    for _ in 0..400 {
-        if tokio::net::TcpStream::connect(("127.0.0.1", port))
-            .await
-            .is_ok()
-        {
-            ready = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    // Wait for the HTTP service. The server state (including the fault
+    // threshold read) is constructed before `/readyz` can succeed, so by then
+    // the temporary env vars have been consumed.
+    wait_for_server_ready(port, "default").await;
     if fail_first > 0 {
         unsafe {
             std::env::remove_var("RIPCLONE_TEST_FAIL_FIRST_FETCHES");
@@ -1136,7 +1147,6 @@ async fn start_server_inner(
         }
     }
     drop(_start_guard);
-    assert!(ready, "server on port {port} did not become ready");
     Server {
         url: format!("http://127.0.0.1:{port}"),
         storage_dir: cas_dir.clone(),
@@ -1288,6 +1298,18 @@ pub struct HttpOrigin {
     auth_log: Option<PathBuf>,
     _dir: TempDir,
     _server: std::process::Child,
+}
+
+impl Drop for HttpOrigin {
+    fn drop(&mut self) {
+        // The in-process Ripclone server may still have a background
+        // `git ls-remote` against this origin while its Tokio runtime is
+        // shutting down. Stop and reap the owned HTTP child before `_dir`
+        // removes the served repository so that Git observes EOF instead of
+        // waiting forever on a server whose document root disappeared.
+        let _ = self._server.kill();
+        let _ = self._server.wait();
+    }
 }
 
 impl HttpOrigin {

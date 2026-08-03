@@ -298,28 +298,56 @@ fn local_provider_origin(provider: &ProviderInstance, repo_path: &str) -> String
     }
 }
 
-async fn delay_test_top_up_plan_once() {
-    if std::env::var_os("RIPCLONE_TESTING").is_none() {
-        return;
+async fn wait_test_top_up_staging_barrier(staging: &Path) -> Result<()> {
+    if std::env::var_os("RIPCLONE_TESTING").as_deref() != Some(std::ffi::OsStr::new("1")) {
+        return Ok(());
     }
-    let Some(delay) = std::env::var("RIPCLONE_TEST_TOP_UP_PLAN_DELAY_MS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| *value > 0)
+    let Some(dir) = std::env::var_os("RIPCLONE_TEST_TOP_UP_STAGING_BARRIER_DIR").map(PathBuf::from)
     else {
-        return;
+        return Ok(());
     };
-    let Some(marker) = std::env::var_os("RIPCLONE_TEST_TOP_UP_PLAN_DELAY_MARKER") else {
-        return;
-    };
-    if std::fs::OpenOptions::new()
+    std::fs::create_dir_all(&dir).context("create top-up staging barrier directory")?;
+    let entered = dir.join("entered");
+    let mut entered_file = match std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(marker)
-        .is_ok()
+        .open(&entered)
     {
-        tokio::time::sleep(Duration::from_millis(delay)).await;
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+        Err(error) => return Err(error).context("create top-up staging barrier marker"),
+    };
+    use std::io::Write;
+    writeln!(entered_file, "{}", staging.display()).context("record first top-up staging path")?;
+    let proceed = dir.join("proceed");
+    for _ in 0..1_000 {
+        if proceed.exists() {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
+    anyhow::bail!("top-up staging barrier was not released within 10 seconds")
+}
+
+fn record_test_managed_git(command: &str, elapsed: Duration) -> Result<()> {
+    if std::env::var_os("RIPCLONE_TESTING").as_deref() != Some(std::ffi::OsStr::new("1")) {
+        return Ok(());
+    }
+    let Some(log) = std::env::var_os("RIPCLONE_TEST_TOP_UP_GIT_LOG") else {
+        return Ok(());
+    };
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log)
+        .context("open managed top-up Git timing log")?;
+    writeln!(
+        file,
+        "command={command}\tduration_us={}",
+        elapsed.as_micros()
+    )
+    .context("record managed top-up Git timing")
 }
 
 /// Return the chunk refs that make up the head-blobs pack, falling back to the
@@ -2048,9 +2076,6 @@ impl Client {
             .await?;
         bench.mark_resolve();
         let (plan_target, artifact, mut info, top_up) = plan.into_parts();
-        if top_up {
-            delay_test_top_up_plan_once().await;
-        }
         let pinned = identity
             .pinned
             .clone()
@@ -2256,6 +2281,9 @@ impl Client {
                 .temp_install = Some(tmp);
             path
         };
+        if top_up {
+            wait_test_top_up_staging_barrier(&install_root).await?;
+        }
         let git_dir = install_root.join(".git");
         let files_only = matches!(mode, CloneMode::Files);
         if !files_only {
@@ -3346,10 +3374,10 @@ impl Client {
             std::fs::write(
                 log,
                 format!(
-                    "before_mtime_ns={}\nafter_mtime_ns={}\nexact_fetches=1\ntop_up_ms={}\n",
+                    "before_mtime_ns={}\nafter_mtime_ns={}\ntop_up_phase_us={}\n",
                     nanos(before),
                     nanos(after),
-                    top_up_started.elapsed().as_millis()
+                    top_up_started.elapsed().as_micros()
                 ),
             )
             .context("write test top-up metrics log")?;
@@ -3383,6 +3411,8 @@ impl Client {
         use std::io::{Read, Seek};
         use std::process::Stdio;
 
+        let command_started = Instant::now();
+        let command_name = args.first().cloned().unwrap_or_default();
         let mut stdout_file = tempfile::tempfile().context("create top-up Git stdout file")?;
         let child_stdout = stdout_file
             .try_clone()
@@ -3509,6 +3539,7 @@ impl Client {
         stdout_file
             .read_to_end(&mut stdout)
             .context("read managed top-up Git stdout")?;
+        record_test_managed_git(&command_name, command_started.elapsed())?;
         Ok(String::from_utf8_lossy(&stdout).into_owned())
     }
 
