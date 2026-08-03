@@ -5,6 +5,29 @@
 mod common;
 
 use common::*;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+async fn protocol_one_guard(
+    request: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if request
+        .headers()
+        .get("x-ripclone-protocol")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u32>().ok())
+        .is_some_and(|protocol| protocol > 1)
+    {
+        return (
+            axum::http::StatusCode::UPGRADE_REQUIRED,
+            "protocol 1 fixture rejected newer client",
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
 
 /// Positive: `/v1/version` is served by a real server with no credentials and
 /// reports this build's version + wire protocol.
@@ -82,4 +105,38 @@ async fn server_allows_missing_or_unparseable_protocol() {
             "protocol header {header:?} must not be rejected as too-new"
         );
     }
+}
+
+/// A protocol-2 client fails clearly against a protocol-1 guard, and the guard
+/// rejects it before the ref handler can run.
+#[tokio::test]
+async fn protocol_two_client_is_rejected_by_protocol_one_guard_fixture() {
+    let handler_ran = Arc::new(AtomicBool::new(false));
+    let handler_flag = Arc::clone(&handler_ran);
+    let app = axum::Router::new()
+        .route(
+            "/v1/repos/{*path}",
+            axum::routing::get(move || {
+                let handler_flag = Arc::clone(&handler_flag);
+                async move {
+                    handler_flag.store(true, Ordering::SeqCst);
+                    axum::Json(serde_json::json!({}))
+                }
+            }),
+        )
+        .layer(axum::middleware::from_fn(protocol_one_guard));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let error = ripclone::client::Client::new(format!("http://{address}"))
+        .resolve_ref_with_clonepack("acme/demo", "main", Some("full"), None)
+        .await
+        .expect_err("protocol-1 server must reject protocol-2 client");
+    server.abort();
+    assert!(
+        format!("{error:#}").contains("protocol 1 fixture rejected newer client"),
+        "clear protocol rejection: {error:#}"
+    );
+    assert!(!handler_ran.load(Ordering::SeqCst));
 }

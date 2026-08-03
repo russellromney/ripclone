@@ -1,3 +1,4 @@
+//! Included in the consolidated `contracts` integration-test crate.
 //! The cold full-history build reuses git's existing pack deltas via
 //! `pack-objects --revs` and splits the output with `--max-pack-size`.
 //! That split path — collecting an arbitrary

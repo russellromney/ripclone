@@ -1,3 +1,4 @@
+//! Included in the consolidated `contracts` integration-test crate.
 //! Concurrency/ordering property test for the "a newer sync never loses to an
 //! older one" invariant (adversarial review findings M1/M2/M3, suggested test
 //! #1).

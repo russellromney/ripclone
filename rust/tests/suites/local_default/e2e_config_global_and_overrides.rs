@@ -5,7 +5,7 @@
 //! `files` mode at `depth = 1`; we verify a bare `ripclone clone` honors that,
 //! then verify `--mode editable --depth 0` overrides the config.
 
-mod common;
+use crate::common;
 
 use common::*;
 use std::process::Command;

@@ -10,7 +10,7 @@
 //!
 //! All clones run with stdin closed to prove the headless path never prompts.
 
-mod common;
+use crate::common;
 
 use common::*;
 use std::process::{Command, Stdio};

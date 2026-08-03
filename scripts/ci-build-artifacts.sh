@@ -3,7 +3,7 @@
 # product bins (docker/e2e/benchmark) plus the integration/lib test binaries
 # those jobs run. Stages stable names under rust/target/ci-artifacts/ for upload.
 #
-# Not the full unit/integration suite (~50 linked binaries) — that is the
+# Not the full unit/integration suite (roughly 45 linked binaries) — that is the
 # `test` job's job. Keep this list to what fan-out actually executes.
 #
 # Usage: scripts/ci-build-artifacts.sh

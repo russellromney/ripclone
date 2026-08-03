@@ -4,7 +4,7 @@
 //! raw token, then runs `ripclone sync` without any server-token env var. The
 //! CLI should fall back to the legacy JSON token, hash it, and authenticate.
 
-mod common;
+use crate::common;
 
 use common::*;
 use std::process::Command;

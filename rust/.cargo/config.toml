@@ -1,4 +1,4 @@
-# Use the mold linker on Linux x86_64-gnu builds. CI builds ~50 integration
+# Use the mold linker on Linux x86_64-gnu builds. CI builds roughly 45 integration
 # test binaries per Linux job (rust/tests/*.rs) and rust-cache cannot speed up
 # linking — mold cuts link time 3-5x, which compounds across every Linux job
 # that builds those binaries (test, e2e, databases, docker, s3gc, gitea).

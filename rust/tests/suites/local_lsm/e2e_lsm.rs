@@ -2,7 +2,7 @@
 //! a 1-byte seal threshold so every non-empty tail seals a level). Drives real
 //! server sync + client full clones across multiple seal cycles and a rewrite.
 
-mod common;
+use crate::common;
 
 use common::*;
 use ripclone::mode::CloneMode;

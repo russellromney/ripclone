@@ -47,6 +47,9 @@ fn setup_sqlite_queue() -> tempfile::TempDir {
     unsafe {
         std::env::set_var("RIPCLONE_QUEUE", "sqlite");
         std::env::set_var("RIPCLONE_QUEUE_DB_URL", &db_path);
+        // Tests may shorten this process-global setting. Reset every serialized
+        // fixture to the production default unless the test explicitly opts in.
+        std::env::remove_var("RIPCLONE_QUEUE_STALE_SECS");
     }
     init(false);
     qdir
@@ -953,11 +956,11 @@ async fn dispatcher_reaper_reclaims_dead_worker_on_reconcile() {
     let _guard = SERIAL.lock().await;
     let _qdir = setup_sqlite_queue();
     // Short stale window: the killed worker's claim must become
-    // reclaim-eligible quickly (test timeout), while staying long enough that
-    // the REAL healthy worker's own claim->build->ack cycle for a trivial
-    // repo (well under a second) is never caught by it.
+    // reclaim-eligible within the test timeout, while staying long enough that
+    // a REAL healthy worker is not itself repeatedly reaped on a loaded CI
+    // runner before its claim->build->ack cycle finishes.
     unsafe {
-        std::env::set_var("RIPCLONE_QUEUE_STALE_SECS", "1");
+        std::env::set_var("RIPCLONE_QUEUE_STALE_SECS", "15");
     }
     let server = start_server().await;
     let wrapper_dir = tempfile::tempdir().expect("wrapper dir");

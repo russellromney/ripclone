@@ -77,6 +77,11 @@ impl Drop for OverlayDirs {
     fn drop(&mut self) {
         if !self.mounted.load(std::sync::atomic::Ordering::Relaxed) {
             let _ = std::fs::remove_dir_all(&self.base);
+            // `create` also creates the final mount point. Before a successful
+            // mount it is ours and should not make a failed clone look
+            // published. Remove only an empty directory so an external writer
+            // racing with the clone cannot have its data deleted.
+            let _ = std::fs::remove_dir(&self.mount_point);
         }
     }
 }
@@ -188,14 +193,20 @@ mod tests {
     fn unmounted_overlay_staging_is_removed_on_drop() {
         let staging = tempfile::tempdir().unwrap();
         let mp = tempfile::tempdir().unwrap();
+        let mount_point = mp.path().join("mnt");
         let base = {
-            let dirs = OverlayDirs::create(staging.path(), &mp.path().join("mnt")).unwrap();
+            let dirs = OverlayDirs::create(staging.path(), &mount_point).unwrap();
             assert!(dirs.base.exists());
+            assert!(mount_point.exists());
             dirs.base.clone()
         };
         assert!(
             !base.exists(),
             "unmounted overlay staging must be removed on drop"
+        );
+        assert!(
+            !mount_point.exists(),
+            "unmounted overlay target must be removed on drop"
         );
     }
 
