@@ -329,6 +329,38 @@ async fn wait_test_top_up_staging_barrier(staging: &Path) -> Result<()> {
     anyhow::bail!("top-up staging barrier was not released within 10 seconds")
 }
 
+/// Test-only synchronization point after the first ordinary pending response
+/// has established B, but before the client makes its pinned top-up request.
+/// This lets the direct proof advance the upstream branch only after pinning.
+async fn wait_test_top_up_pin_barrier() -> Result<()> {
+    if std::env::var_os("RIPCLONE_TESTING").as_deref() != Some(std::ffi::OsStr::new("1")) {
+        return Ok(());
+    }
+    let Some(dir) = std::env::var_os("RIPCLONE_TEST_TOP_UP_PIN_BARRIER_DIR").map(PathBuf::from)
+    else {
+        return Ok(());
+    };
+    std::fs::create_dir_all(&dir).context("create top-up pin barrier directory")?;
+    let entered = dir.join("entered");
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&entered)
+    {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+        Err(error) => return Err(error).context("create top-up pin barrier marker"),
+    }
+    let proceed = dir.join("proceed");
+    for _ in 0..1_000 {
+        if proceed.exists() {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    anyhow::bail!("top-up pin barrier was not released within 10 seconds")
+}
+
 fn record_test_managed_git(command: &str, elapsed: Duration) -> Result<()> {
     if std::env::var_os("RIPCLONE_TESTING").as_deref() != Some(std::ffi::OsStr::new("1")) {
         return Ok(());
@@ -1404,6 +1436,9 @@ impl Client {
                 // clones immediately make the one pinned opt-in request; only
                 // old servers (missing the new fields) enter the bounded poll.
                 if allow_top_up && !requested_top_up {
+                    // This is after the ordinary 202 has established B and
+                    // before the first pinned/top_up request.
+                    wait_test_top_up_pin_barrier().await?;
                     continue;
                 }
                 if attempt + 1 < max_attempts {

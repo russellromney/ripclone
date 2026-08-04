@@ -231,30 +231,41 @@ async fn wait_for_full_b_to_settle(
     upstream_token: &str,
     target: &str,
 ) {
-    let client = server.client_with_provider("gitea", Some(upstream_token));
     let mut last = String::from("no response");
     for _ in 0..80 {
-        match client.sync_repo(repo_path, None).await {
-            Ok(response)
-                if response.commit == target
-                    && response.archive_ready
-                    && !response.clonepack_manifest.is_empty() =>
-            {
-                return;
+        let url = format!(
+            "{}/v1/repos/gitea/{repo_path}/refs/main?clonepack=full&pinned={target}",
+            server.url
+        );
+        match reqwest::Client::new()
+            .get(url)
+            .header("Authorization", format!("Ripclone {}", token_hash()))
+            .header("X-Upstream-Token", upstream_token)
+            .header("x-ripclone-protocol", "2")
+            .send()
+            .await
+        {
+            Ok(response) if response.status() == reqwest::StatusCode::OK => {
+                let status = response.status();
+                match response.json::<serde_json::Value>().await {
+                    Ok(body)
+                        if body["commit"] == target
+                            && body["clonepack_manifest"]
+                                .as_str()
+                                .is_some_and(|manifest| !manifest.is_empty()) =>
+                    {
+                        return;
+                    }
+                    Ok(body) => last = format!("status={status} body={body}"),
+                    Err(error) => last = format!("status={status} decode error: {error}"),
+                }
             }
-            Ok(response) => {
-                last = format!(
-                    "commit={} archive_ready={} manifest_empty={}",
-                    response.commit,
-                    response.archive_ready,
-                    response.clonepack_manifest.is_empty()
-                );
-            }
-            Err(error) => last = format!("sync error: {error:#}"),
+            Ok(response) => last = format!("status={}", response.status()),
+            Err(error) => last = format!("metadata request error: {error:#}"),
         }
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
-    panic!("private Full(B) never settled before fixture teardown: {last}");
+    panic!("private Full(B) never settled through pinned metadata before fixture teardown: {last}");
 }
 
 // Multi-threaded runtime is required: the test body makes BLOCKING subprocess
