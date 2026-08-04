@@ -225,6 +225,38 @@ fn assert_ripclone_ok(out: &std::process::Output, what: &str) {
     );
 }
 
+async fn wait_for_full_b_to_settle(
+    server: &Server,
+    repo_path: &str,
+    upstream_token: &str,
+    target: &str,
+) {
+    let client = server.client_with_provider("gitea", Some(upstream_token));
+    let mut last = String::from("no response");
+    for _ in 0..80 {
+        match client.sync_repo(repo_path, None).await {
+            Ok(response)
+                if response.commit == target
+                    && response.archive_ready
+                    && !response.clonepack_manifest.is_empty() =>
+            {
+                return;
+            }
+            Ok(response) => {
+                last = format!(
+                    "commit={} archive_ready={} manifest_empty={}",
+                    response.commit,
+                    response.archive_ready,
+                    response.clonepack_manifest.is_empty()
+                );
+            }
+            Err(error) => last = format!("sync error: {error:#}"),
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    panic!("private Full(B) never settled before fixture teardown: {last}");
+}
+
 // Multi-threaded runtime is required: the test body makes BLOCKING subprocess
 // calls (`ripclone`, `git`) that must run concurrently with the in-process
 // `ripclone` server (spawned onto this same runtime). On the default
@@ -439,8 +471,9 @@ async fn gitea_server_side_token_end_to_end() {
     phase_one_barrier.arm();
     let sync_client = server.client_with_provider("gitea", Some(&env.token));
     let repo_for_sync = format!("{}/{}", env.user, repo);
+    let repo_for_pending_sync = repo_for_sync.clone();
     let mut pending_sync =
-        tokio::spawn(async move { sync_client.sync_repo(&repo_for_sync, None).await });
+        tokio::spawn(async move { sync_client.sync_repo(&repo_for_pending_sync, None).await });
     tokio::time::timeout(std::time::Duration::from_secs(20), phase_one_entered)
         .await
         .expect("private B reached phase-one publication")
@@ -509,6 +542,7 @@ async fn gitea_server_side_token_end_to_end() {
         .expect("private Full(B) finished after release")
         .expect("join private B sync")
         .expect("sync private B");
+    wait_for_full_b_to_settle(&server, &repo_for_sync, &env.token, &top_up_target.0).await;
 
     delete_repo(&http, &env, &repo).await;
 }

@@ -2059,7 +2059,7 @@ impl Client {
         // establishes `identity.pinned`; every later poll and retry uses the
         // metadata-only pinned query.
         let allow_top_up =
-            rev.is_none() && mode == CloneMode::Editable && clonepack == Some("full");
+            rev.is_none() && mode == CloneMode::Editable && clonepack.unwrap_or("full") == "full";
         let plan = self
             .resolve_ref_for_operation(
                 repo_path,
@@ -2090,6 +2090,12 @@ impl Client {
                 "ref integrity error: response commit {} does not match artifact commit {artifact}",
                 info.commit
             );
+        }
+        // A top-up's provider requirement is known as soon as the server has
+        // supplied its plan. Fail before downloading Full(A), rather than after
+        // spending the base artifact transfer on an impossible exact fetch.
+        if top_up {
+            self.top_up_provider_for(repo_path)?;
         }
         info!(
             "resolved target {} using {} artifact {}",
@@ -2293,11 +2299,20 @@ impl Client {
             std::fs::create_dir_all(git_dir.join("info"))?;
 
             let branch_name = if branch == "HEAD" {
-                if info.default_branch.is_empty() {
-                    "main"
-                } else {
-                    &info.default_branch
-                }
+                // The pinned B response establishes the resolved branch. A
+                // carried Full(A) manifest can predate an upstream default-
+                // branch rename, so never attach B to its stale default name.
+                identity
+                    .resolved_branch
+                    .as_deref()
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or_else(|| {
+                        if info.default_branch.is_empty() {
+                            "main"
+                        } else {
+                            &info.default_branch
+                        }
+                    })
             } else {
                 branch
             };
@@ -3243,17 +3258,7 @@ impl Client {
         Ok(())
     }
 
-    async fn top_up_staged_repo(
-        &self,
-        repo_path: &str,
-        install_root: &Path,
-        base: &str,
-        target: &str,
-        cleanup: &AttemptCleanup,
-    ) -> Result<()> {
-        let top_up_started = Instant::now();
-        crate::validation::validate_object_id(base).context("invalid top-up base object id")?;
-        crate::validation::validate_object_id(target).context("invalid top-up target object id")?;
+    fn top_up_provider_for(&self, repo_path: &str) -> Result<&ProviderInstance> {
         let provider = self
             .provider_instance
             .as_ref()
@@ -3267,6 +3272,21 @@ impl Client {
         };
         crate::validation::validate_repo_path(provider, &repo_id)
             .context("invalid local provider repository path for top-up")?;
+        Ok(provider)
+    }
+
+    async fn top_up_staged_repo(
+        &self,
+        repo_path: &str,
+        install_root: &Path,
+        base: &str,
+        target: &str,
+        cleanup: &AttemptCleanup,
+    ) -> Result<()> {
+        let top_up_started = Instant::now();
+        crate::validation::validate_object_id(base).context("invalid top-up base object id")?;
+        crate::validation::validate_object_id(target).context("invalid top-up target object id")?;
+        let provider = self.top_up_provider_for(repo_path)?;
 
         if install_root.join(".git/shallow").exists() {
             anyhow::bail!("top-up base unexpectedly contains a shallow boundary");

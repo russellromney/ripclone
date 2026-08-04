@@ -486,7 +486,7 @@ async fn blocked_full_b_tops_up_carried_direct_parent_a_and_publishes_exact_b() 
         .await
         .expect("resolve full A");
     assert_eq!(ready_a.commit, a);
-    let base_manifest = ready_a.clonepack_manifest.clone();
+    let mut base_manifest = ready_a.clonepack_manifest.clone();
     assert!(!base_manifest.is_empty());
 
     std::fs::write(origin.work.join("modified.txt"), b"after\n").unwrap();
@@ -536,6 +536,46 @@ async fn blocked_full_b_tops_up_carried_direct_parent_a_and_publishes_exact_b() 
         .await
         .expect("B reached phase-one publication")
         .expect("phase-one barrier alive");
+
+    // Model a default-branch rename between A and B. The carried A manifest
+    // still says `master`, while the B row (and resolved HEAD branch) is
+    // `main`. Top-up must attach the published B worktree to `main`.
+    let store = FileRefStore::new(&server.repo_root);
+    let repo_id = RepoId {
+        provider: ProviderInstanceId::new("counting"),
+        path: "acme/full-topup".to_string(),
+    };
+    let mut moving_row = None;
+    for candidate in store.list_branches(&repo_id).await.expect("list B rows") {
+        if let Some(info) = store
+            .load_branch(&repo_id, &candidate)
+            .await
+            .expect("load candidate B row")
+        {
+            if info.commit != b || info.full_clonepack.commit != a {
+                continue;
+            }
+            moving_row = Some((candidate, info));
+            break;
+        }
+    }
+    let (moving_branch, mut moving) = moving_row.expect("moving B row");
+    assert_eq!(moving.commit, b);
+    assert_eq!(moving.full_clonepack.commit, a);
+    let storage = Cas::new(&server.storage_dir).expect("open split storage CAS");
+    let bytes = storage
+        .get(&moving.full_clonepack.manifest)
+        .expect("read carried Full(A) manifest");
+    let mut carried = ClonepackManifest::decode(bytes.as_slice()).expect("decode carried manifest");
+    carried.default_branch = "master".to_string();
+    base_manifest = storage
+        .put(&carried.encode_to_vec())
+        .expect("store renamed-default carried manifest");
+    moving.full_clonepack.manifest = base_manifest.clone();
+    store
+        .save_branch(&repo_id, &moving_branch, &moving)
+        .await
+        .expect("publish carried manifest with obsolete default branch");
     origin.clear_auth_log();
 
     // Advance the real branch again after the server has pinned/published B's
@@ -626,7 +666,7 @@ exec "$real_git" "$@"
                 None,
                 &target,
                 CloneMode::Editable,
-                Some("full"),
+                None,
                 None,
             ),
     )
@@ -649,6 +689,11 @@ exec "$real_git" "$@"
     probe.disarm();
     assert_eq!(outcome.commit, b);
     assert_eq!(git(&target, &["rev-parse", "HEAD"]), b);
+    assert_eq!(
+        git(&target, &["symbolic-ref", "--short", "HEAD"]),
+        "main",
+        "a HEAD top-up must use B's resolved branch, not A's stale default branch"
+    );
     assert_eq!(git(&target, &["rev-list", "--count", "HEAD"]), "2");
     assert_eq!(
         git(

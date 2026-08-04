@@ -2656,7 +2656,7 @@ fn ref_response_from_manifest(
 }
 
 async fn carried_full_top_up_response(
-    ref_store: &Arc<dyn RefStore>,
+    info: &RefInfo,
     repo_id: &RepoId,
     provider: &ProviderInstance,
     branch: &str,
@@ -2664,12 +2664,12 @@ async fn carried_full_top_up_response(
     storage: &crate::storage::StorageRef,
     private: bool,
 ) -> Option<RefResponse> {
-    let info = ref_store
-        .load_branch(repo_id, branch)
-        .await
-        .ok()
-        .flatten()?;
-    if info.commit != pinned {
+    // The caller supplies the same moving-row snapshot that missed exact B.
+    // Do not read it again here: Full(B) could publish between reads, which
+    // would otherwise turn an exact-ready response into a pending top-up miss.
+    if info.commit != pinned
+        || info.build_status.as_deref() == Some(crate::remote_gc::EVICTED_BUILD_STATUS)
+    {
         return None;
     }
     let parent = info.parent_commit.as_deref()?;
@@ -2721,6 +2721,14 @@ async fn carried_full_top_up_response(
     )
 }
 
+/// Result of a pinned lookup. `Pending` retains the one moving-row snapshot
+/// that established the miss so top-up planning cannot observe a different
+/// publication state than exact selection.
+enum PinnedRefLookup {
+    Exact { key: String, info: RefInfo },
+    Pending { moving: Option<RefInfo> },
+}
+
 /// A post-pin lookup performs only a fixed set of repo-scoped point reads.
 /// Missing exact metadata is a normal pending result: branch publication may
 /// have replaced the only row for this commit, and pinning does not create a
@@ -2731,13 +2739,16 @@ async fn load_pinned_ref_info(
     branch: &str,
     pinned: &str,
     clonepack_kind: &str,
-) -> Result<Option<(String, RefInfo)>> {
+) -> Result<PinnedRefLookup> {
     let exact_key = ref_store_key(branch, Some(pinned), Some(pinned));
     if exact_key != branch
         && let Some(info) = ref_store.load_branch(repo_id, &exact_key).await?
         && exact_ref_info_serves_commit(&info, clonepack_kind, pinned)
     {
-        return Ok(Some((exact_key, info)));
+        return Ok(PinnedRefLookup::Exact {
+            key: exact_key,
+            info,
+        });
     }
 
     // A concrete exact hit above is the common post-pin case and needs one
@@ -2761,7 +2772,10 @@ async fn load_pinned_ref_info(
         && let Some(info) = ref_store.load_branch(repo_id, &default_exact_key).await?
         && exact_ref_info_serves_commit(&info, clonepack_kind, pinned)
     {
-        return Ok(Some((default_exact_key, info)));
+        return Ok(PinnedRefLookup::Exact {
+            key: default_exact_key,
+            info,
+        });
     }
 
     // The moving row is the final compatibility candidate. During phase-one
@@ -2769,14 +2783,19 @@ async fn load_pinned_ref_info(
     // full-history variant. Never combine that carried manifest with the new
     // row's top-level pack/archive fields; only the enclosing pinned row is
     // internally consistent for a pinned response.
-    if let Some(info) = branch_info
+    if let Some(info) = branch_info.as_ref()
         && info.commit == pinned
-        && exact_ref_info_serves_commit(&info, clonepack_kind, pinned)
+        && exact_ref_info_serves_commit(info, clonepack_kind, pinned)
     {
-        return Ok(Some((branch.to_string(), info)));
+        return Ok(PinnedRefLookup::Exact {
+            key: branch.to_string(),
+            info: info.clone(),
+        });
     }
 
-    Ok(None)
+    Ok(PinnedRefLookup::Pending {
+        moving: branch_info,
+    })
 }
 
 /// Returns true when the branch's stored HEAD ref exists, matches the requested
@@ -3016,21 +3035,35 @@ async fn get_ref_inner(
                     .into_response();
             }
         };
-        let Some((served_key, info)) = resolved else {
-            if params.top_up && params.clonepack == "full" {
-                let base = carried_full_top_up_response(
-                    &state.ref_store,
-                    &repo_id,
-                    &provider,
-                    &branch,
-                    pinned,
-                    &state.storage,
-                    private,
-                )
-                .await;
-                return artifact_pending_response_with_top_up(pinned, &branch, 1, Some(true), base);
+        let (served_key, info) = match resolved {
+            PinnedRefLookup::Exact { key, info } => (key, info),
+            PinnedRefLookup::Pending { moving } => {
+                if params.top_up && params.clonepack == "full" {
+                    let base = match moving.as_ref() {
+                        Some(info) => {
+                            carried_full_top_up_response(
+                                info,
+                                &repo_id,
+                                &provider,
+                                &branch,
+                                pinned,
+                                &state.storage,
+                                private,
+                            )
+                            .await
+                        }
+                        None => None,
+                    };
+                    return artifact_pending_response_with_top_up(
+                        pinned,
+                        &branch,
+                        1,
+                        Some(true),
+                        base,
+                    );
+                }
+                return artifact_pending_response(pinned, &branch, 1);
             }
-            return artifact_pending_response(pinned, &branch, 1);
         };
         let response_branch = if branch == "HEAD" && !info.default_branch.is_empty() {
             info.default_branch.clone()
@@ -3347,6 +3380,9 @@ fn ref_signed_url_ttl(private: bool) -> Duration {
 }
 
 async fn wait_test_phase_two_barrier(commit: &str) -> Result<()> {
+    if std::env::var_os("RIPCLONE_TESTING").as_deref() != Some(std::ffi::OsStr::new("1")) {
+        return Ok(());
+    }
     let Some(dir) = std::env::var_os("RIPCLONE_TEST_PHASE2_BARRIER_DIR").map(PathBuf::from) else {
         return Ok(());
     };
@@ -11771,6 +11807,93 @@ mod tests {
             ..Default::default()
         };
         assert!(!ref_info_serves_commit(&info, "full", "commit1"));
+    }
+
+    #[tokio::test]
+    async fn carried_top_up_rejects_evicted_row_before_signing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = crate::storage::local(tmp.path()).unwrap();
+        let base = "a".repeat(40);
+        let target = "b".repeat(40);
+        let info = RefInfo {
+            commit: target.clone(),
+            parent_commit: Some(base.clone()),
+            full_clonepack: crate::ClonepackArtifacts {
+                commit: base,
+                manifest: "0".repeat(64),
+                ..Default::default()
+            },
+            build_status: Some(crate::remote_gc::EVICTED_BUILD_STATUS.to_string()),
+            ..Default::default()
+        };
+        let provider = ProviderInstance {
+            id: crate::provider::ProviderInstanceId::new("github"),
+            kind: crate::provider::ProviderKind::GitHub,
+            host: "github.com".to_string(),
+            auth_template: None,
+            auth_header_name: None,
+        };
+        assert!(
+            carried_full_top_up_response(
+                &info,
+                &RepoId::github("acme/widget"),
+                &provider,
+                "main",
+                &target,
+                &storage,
+                false,
+            )
+            .await
+            .is_none(),
+            "an evicted carried row must not issue signed base URLs"
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_top_up_retains_one_moving_row_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store: Arc<dyn RefStore> = Arc::new(crate::ref_store::FileRefStore::new(tmp.path()));
+        let repo_id = RepoId::github("acme/widget");
+        let base = "a".repeat(40);
+        let target = "b".repeat(40);
+        let pending = RefInfo {
+            commit: target.clone(),
+            parent_commit: Some(base.clone()),
+            full_clonepack: crate::ClonepackArtifacts {
+                commit: base.clone(),
+                manifest: "0".repeat(64),
+                ..Default::default()
+            },
+            build_status: Some(BUILDING_FULL_HISTORY.to_string()),
+            ..Default::default()
+        };
+        store.save_branch(&repo_id, "main", &pending).await.unwrap();
+
+        let lookup = load_pinned_ref_info(&store, &repo_id, "main", &target, "full")
+            .await
+            .unwrap();
+
+        // Simulate phase-two publication after the lookup. The top-up caller
+        // must decide from `lookup`, not re-read this now-exact moving row.
+        let mut exact = pending.clone();
+        exact.full_clonepack.commit = target.clone();
+        exact.build_status = None;
+        store.save_branch(&repo_id, "main", &exact).await.unwrap();
+
+        match lookup {
+            PinnedRefLookup::Pending {
+                moving: Some(snapshot),
+            } => {
+                assert_eq!(snapshot.commit, target);
+                assert_eq!(snapshot.full_clonepack.commit, base);
+                assert_eq!(
+                    snapshot.build_status.as_deref(),
+                    Some(BUILDING_FULL_HISTORY),
+                    "top-up planning is linearized at the first moving-row snapshot"
+                );
+            }
+            _ => panic!("pending moving row must be retained for one-snapshot top-up planning"),
+        }
     }
 
     #[tokio::test]

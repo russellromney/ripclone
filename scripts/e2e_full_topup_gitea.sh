@@ -109,5 +109,9 @@ if grep -Fq "SKIP" "$log"; then
   echo "error: Gitea proof emitted SKIP" >&2
   exit 1
 fi
+if grep -Fq "full clone build failed" "$log"; then
+  echo "error: Gitea proof logged a failed detached Full build" >&2
+  exit 1
+fi
 rm -f "$log"
 echo "Gitea image: $GITEA_IMAGE"

@@ -41,6 +41,8 @@ jobs:
               - 'rust/**'
               - 'tests/fly/Dockerfile*'
               - 'scripts/fly_client_test.sh'
+              - 'scripts/e2e_full_topup_minio.sh'
+              - 'scripts/e2e_full_topup_gitea.sh'
               - '.github/workflows/ci.yml'
             bench:
               - 'rust/**'
