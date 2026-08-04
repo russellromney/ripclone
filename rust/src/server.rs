@@ -3379,8 +3379,12 @@ fn ref_signed_url_ttl(private: bool) -> Duration {
     }
 }
 
+fn explicit_test_mode(value: Option<&std::ffi::OsStr>) -> bool {
+    value == Some(std::ffi::OsStr::new("1"))
+}
+
 async fn wait_test_phase_two_barrier(commit: &str) -> Result<()> {
-    if std::env::var_os("RIPCLONE_TESTING").as_deref() != Some(std::ffi::OsStr::new("1")) {
+    if !explicit_test_mode(std::env::var_os("RIPCLONE_TESTING").as_deref()) {
         return Ok(());
     }
     let Some(dir) = std::env::var_os("RIPCLONE_TEST_PHASE2_BARRIER_DIR").map(PathBuf::from) else {
@@ -11894,6 +11898,14 @@ mod tests {
             }
             _ => panic!("pending moving row must be retained for one-snapshot top-up planning"),
         }
+    }
+
+    #[test]
+    fn phase_two_barrier_requires_explicit_test_mode() {
+        assert!(!explicit_test_mode(None));
+        assert!(!explicit_test_mode(Some(std::ffi::OsStr::new("0"))));
+        assert!(!explicit_test_mode(Some(std::ffi::OsStr::new("true"))));
+        assert!(explicit_test_mode(Some(std::ffi::OsStr::new("1"))));
     }
 
     #[tokio::test]

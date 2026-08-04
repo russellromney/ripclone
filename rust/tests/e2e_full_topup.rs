@@ -909,6 +909,105 @@ server_enqueues={} server_builder_entries={} full_b_blocked=true",
 }
 
 #[tokio::test]
+async fn missing_local_provider_fails_before_base_artifacts_download() {
+    let _guard = env_lock().lock().await;
+    init(false);
+    let upstream_token = "missing-provider-token";
+    let origin = make_http_origin_with_auth(
+        "acme/full-topup-missing-provider",
+        "token missing-provider-token",
+    );
+    let provider = ProviderInstance {
+        id: ProviderInstanceId::new("gitea"),
+        kind: ProviderKind::Generic,
+        host: origin.url.clone(),
+        auth_template: Some("token {token}".to_string()),
+        auth_header_name: None,
+    };
+    let mut registry = ProviderRegistry::new();
+    registry
+        .merge_one(ProviderConfig {
+            id: "gitea".to_string(),
+            kind: Some("generic".to_string()),
+            host: Some(origin.url.clone()),
+            token: Some(upstream_token.to_string()),
+            auth_template: Some("token {token}".to_string()),
+            auth_header_name: None,
+        })
+        .expect("configure server provider");
+    let (server, barrier, entered, proceed) =
+        start_server_split_storage_phase_one_barrier_with_registry(registry).await;
+    let a = origin.commit(&[("value.txt", "A\\n")], "A");
+    origin.publish();
+    register_added_without_build_for_provider(&server, "gitea", "acme/full-topup-missing-provider")
+        .await
+        .expect("register gitea provider repo");
+    server
+        .client()
+        .with_provider_instance(provider.clone())
+        .with_upstream_token(upstream_token)
+        .sync_repo("acme/full-topup-missing-provider", None)
+        .await
+        .expect("publish Full(A)");
+
+    barrier.arm();
+    let b = origin.commit(&[("value.txt", "B\\n")], "B");
+    origin.publish();
+    let sync_client = server
+        .client()
+        .with_provider_instance(provider)
+        .with_upstream_token(upstream_token);
+    let mut sync_b = tokio::spawn(async move {
+        sync_client
+            .sync_repo("acme/full-topup-missing-provider", None)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(20), entered)
+        .await
+        .expect("B reached phase-one publication")
+        .expect("phase-one barrier alive");
+
+    let output = tempfile::tempdir().unwrap();
+    let target = output.path().join("clone");
+    let cache = output.path().join("cache");
+    let error = ripclone::client::Client::new_with_token_and_cache(
+        server.url.clone(),
+        Some(token_hash()),
+        Some(&cache),
+    )
+    .with_provider("gitea")
+    .with_upstream_token(upstream_token)
+    .install_repo_with_mode_at(
+        "acme/full-topup-missing-provider",
+        "HEAD",
+        None,
+        &target,
+        CloneMode::Editable,
+        Some("full"),
+        None,
+    )
+    .await
+    .expect_err("missing local provider configuration must reject top-up");
+    assert!(format!("{error:#}").contains("no local client configuration"));
+    assert!(
+        !target.exists(),
+        "rejected top-up must not publish a target"
+    );
+    assert!(
+        std::fs::read_dir(&cache).unwrap().next().is_none(),
+        "provider validation must run before any carried Full(A) artifact download"
+    );
+
+    proceed.send(()).expect("release Full(B)");
+    tokio::time::timeout(Duration::from_secs(20), &mut sync_b)
+        .await
+        .expect("Full(B) finished after release")
+        .expect("join Full(B) sync")
+        .expect("sync Full(B)");
+    assert_ne!(a, b);
+}
+
+#[tokio::test]
 async fn server_named_decoy_is_ignored_for_local_provider_exact_fetch() {
     let _guard = env_lock().lock().await;
     init(false);
