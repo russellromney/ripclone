@@ -2026,6 +2026,15 @@ async fn expired_signed_url_fails_clone_cleanly() {
     }
 
     let client = server.client();
+    // `sync` returns after phase-one publication. A first/root commit has no
+    // safe Full base to top up from, so a top-up-aware clone correctly returns
+    // typed pending until exact Full is ready. Wait through the metadata-only
+    // resolver here so this fixture reaches the behavior it is meant to test:
+    // downloading an exact artifact through a URL that expires in flight.
+    client
+        .resolve_ref_with_clonepack(&format!("acme/{repo}"), "main", Some("full"), None)
+        .await
+        .expect("wait for exact Full before testing signed-URL expiry");
     let out = tempfile::tempdir().unwrap();
     let target = out.path().join("clone");
     let res = client
@@ -2045,13 +2054,10 @@ async fn expired_signed_url_fails_clone_cleanly() {
         std::env::remove_var("RIPCLONE_TEST_SIGNED_URL_PROXY");
     }
 
+    let error = res.expect_err("clone with expired signed URLs must fail");
     assert!(
-        res.is_err(),
-        "clone with expired signed URLs must fail, got {res:?}"
-    );
-    assert!(
-        ripclone::client::is_stale_signed_url(&res.unwrap_err()),
-        "expected StaleSignedUrl in error chain"
+        ripclone::client::is_stale_signed_url(&error),
+        "expected StaleSignedUrl in error chain, got: {error:#}"
     );
     assert!(
         !target.exists(),
