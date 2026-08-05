@@ -49,7 +49,7 @@ zlib-ng = ["flate2/zlib-ng"]
 anyhow = "1"
 axum = "0.8"
 bytes = "1"
-base64 = "0.22"
+base64 = "0.23"
 byteorder = "1.5"
 chrono = "0.4"
 crossbeam-channel = "0.5"
@@ -84,7 +84,7 @@ secrecy = "0.10.3"
 async-trait = "0.1.89"
 # `rust_crypto` selects the pure-Rust crypto provider so RS256 sign/verify work
 # (the GitHub App broker signs JWTs; OIDC verifies them).
-jsonwebtoken = { version = "10.4.0", features = ["rust_crypto"] }
+jsonwebtoken = { version = "11.0.0", features = ["rust_crypto"] }
 subtle = "2"
 # Pluggable SQL queue + metadata backends: sqlite (local), postgres/mysql
 # (network), libsql (remote Turso Cloud).
@@ -93,8 +93,8 @@ sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio",
 # does NOT bundle SQLite's C library (which would collide with sqlx's bundled
 # SQLite — "Once poisoned"). `tls` supplies the HTTP connector build() requires.
 libsql = { version = "0.9", default-features = false, features = ["remote", "tls"] }
-gix = "0.85.0"
-gix-pack = "0.72.0"
+gix = "0.86.0"
+gix-pack = "0.73.0"
 rpassword = "7"
 toml = "1.1"
 
