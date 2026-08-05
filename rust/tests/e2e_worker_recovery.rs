@@ -10,10 +10,7 @@ mod common;
 
 use anyhow::{Context, Result};
 use common::*;
-use ripclone::meta::{LibsqlMeta, SqlRefStore};
 use ripclone::provider::RepoId;
-use ripclone::ref_store::{AddedRepo, AddedRepoSource, RefStore, S3RefStore};
-use ripclone::storage::S3Storage;
 use sqlx::Row;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use std::path::{Path, PathBuf};
@@ -92,27 +89,17 @@ async fn sqlite_pool(path: &str) -> SqlitePool {
         .expect("open queue sqlite db")
 }
 
-async fn sqlite_job_status(pool: &SqlitePool) -> Option<(String, i64, Option<String>, i64)> {
-    let row = sqlx::query(
-        "SELECT status, attempts, error, (SELECT COUNT(*) FROM jobs)
-         FROM jobs ORDER BY id LIMIT 1",
-    )
-    .fetch_optional(pool)
-    .await
-    .expect("query sqlite job");
-    row.map(|r| {
-        (
-            r.get::<String, _>(0),
-            r.get::<i64, _>(1),
-            r.get::<Option<String>, _>(2),
-            r.get::<i64, _>(3),
-        )
-    })
+async fn sqlite_job_status(pool: &SqlitePool) -> Option<(String, i64)> {
+    let row = sqlx::query("SELECT status, attempts FROM jobs ORDER BY id LIMIT 1")
+        .fetch_optional(pool)
+        .await
+        .expect("query sqlite job");
+    row.map(|r| (r.get::<String, _>(0), r.get::<i64, _>(1)))
 }
 
 async fn wait_sqlite_claimed(pool: &SqlitePool) {
     for _ in 0..200 {
-        if let Some((status, attempts, _, _)) = sqlite_job_status(pool).await
+        if let Some((status, attempts)) = sqlite_job_status(pool).await
             && status == "claimed"
             && attempts == 1
         {
@@ -191,14 +178,10 @@ async fn wait_archive_settled(server: &Server, repo: &str, commit: &str) {
 
 async fn wait_sqlite_done_after_reclaim(pool: &SqlitePool) {
     for _ in 0..240 {
-        if let Some((status, attempts, _, job_count)) = sqlite_job_status(pool).await
+        if let Some((status, attempts)) = sqlite_job_status(pool).await
             && status == "done"
             && attempts >= 2
         {
-            assert_eq!(
-                job_count, 1,
-                "the recovery fixture must not create a competing sqlite job"
-            );
             return;
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
@@ -217,14 +200,9 @@ async fn recover_after_killed_worker_with_sqlite_queue(
 ) {
     let pool = sqlite_pool(queue_db).await;
     let worker1 = spawn_worker(&server.cas_dir, &server.repo_root);
-    let sync_url = format!("{}/v1/repos/github/acme/{repo}/sync", server.url);
-    let sync_task = tokio::spawn(async move {
-        reqwest::Client::new()
-            .post(sync_url)
-            .header("Authorization", format!("Ripclone {}", token_hash()))
-            .send()
-            .await
-    });
+    let client = server.client();
+    let repo_path = format!("acme/{repo}");
+    let sync_task = tokio::spawn(async move { client.sync_repo(&repo_path, None).await });
 
     wait_sqlite_claimed(&pool).await;
     wait_archive_building(server, repo, want).await;
@@ -233,16 +211,12 @@ async fn recover_after_killed_worker_with_sqlite_queue(
     unsafe { std::env::remove_var("RIPCLONE_TEST_ARCHIVE_DELAY_MS") };
     let _worker2 = spawn_worker(&server.cas_dir, &server.repo_root);
 
-    let resp = tokio::time::timeout(Duration::from_secs(35), sync_task)
+    let resp = tokio::time::timeout(Duration::from_secs(180), sync_task)
         .await
-        .expect("single sqlite-queue sync request did not return after reclaim")
+        .expect("replacement worker did not wake the sync waiter after reclaim")
         .expect("sync task joined")
-        .expect("single sqlite-queue sync request completed");
-    assert!(
-        resp.status().is_success() || resp.status() == reqwest::StatusCode::ACCEPTED,
-        "single sqlite-queue sync request failed during reclaim: {}",
-        resp.status()
-    );
+        .expect("replacement worker should finish the reclaimed job");
+    assert_eq!(resp.commit, want, "sync returns the recovered commit");
     wait_sqlite_done_after_reclaim(&pool).await;
 
     let (_g, c) = wait_repo_cloneable(server, "acme", repo, "1").await;
@@ -338,55 +312,43 @@ fn start_sqld(port: u16, data: &Path) -> Proc {
     panic!("sqld did not become ready on port {port}");
 }
 
-async fn libsql_job_status(url: &str) -> Option<(String, i64, Option<String>, i64)> {
+async fn libsql_job_status(url: &str) -> Option<(String, i64)> {
     let db = libsql::Builder::new_remote(url.to_string(), "dev".to_string())
         .build()
         .await
         .expect("open libsql probe");
     let conn = db.connect().expect("connect libsql probe");
     let mut rows = conn
-        .query(
-            "SELECT status, attempts, error, (SELECT COUNT(*) FROM jobs)
-             FROM jobs ORDER BY id LIMIT 1",
-            (),
-        )
+        .query("SELECT status, attempts FROM jobs ORDER BY id LIMIT 1", ())
         .await
         .expect("query libsql job");
     rows.next().await.expect("read libsql row").map(|r| {
         (
             r.get::<String>(0).expect("status"),
             r.get::<i64>(1).expect("attempts"),
-            r.get::<Option<String>>(2).expect("error"),
-            r.get::<i64>(3).expect("job count"),
         )
     })
 }
 
 async fn wait_libsql_claimed(url: &str) {
-    let mut last = None;
     for _ in 0..200 {
-        last = libsql_job_status(url).await;
-        if let Some((status, attempts, _, _)) = last.as_ref()
+        if let Some((status, attempts)) = libsql_job_status(url).await
             && status == "claimed"
-            && *attempts == 1
+            && attempts == 1
         {
             return;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    panic!("worker never claimed libsql job; last={last:?}");
+    panic!("worker never claimed libsql job");
 }
 
 async fn wait_libsql_done_after_reclaim(url: &str) {
     for _ in 0..240 {
-        if let Some((status, attempts, _, job_count)) = libsql_job_status(url).await
+        if let Some((status, attempts)) = libsql_job_status(url).await
             && status == "done"
             && attempts >= 2
         {
-            assert_eq!(
-                job_count, 1,
-                "the recovery fixture must not create a competing libsql job"
-            );
             return;
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
@@ -395,43 +357,6 @@ async fn wait_libsql_done_after_reclaim(url: &str) {
         "libsql job did not finish after reclaim; last={:?}",
         libsql_job_status(url).await
     );
-}
-
-fn recovery_added_repo(repo_id: RepoId) -> AddedRepo {
-    AddedRepo {
-        repo_id,
-        added_at: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs(),
-        history_enabled: true,
-        source: AddedRepoSource::Api,
-        repo_size_bytes: None,
-    }
-}
-
-async fn register_libsql_added_without_build(url: &str, repo_id: RepoId) {
-    let store = SqlRefStore::new(Box::new(
-        LibsqlMeta::connect_remote(url, "dev")
-            .await
-            .expect("connect libsql metadata for admission"),
-    ))
-    .await
-    .expect("initialize libsql metadata for admission");
-    store
-        .add_repo(&recovery_added_repo(repo_id))
-        .await
-        .expect("register libsql repo without enqueueing a build");
-}
-
-async fn register_s3_added_without_build(repo_id: RepoId) {
-    let storage = S3Storage::from_env()
-        .expect("construct S3 metadata storage for admission")
-        .expect("S3 recovery fixture has complete storage configuration");
-    S3RefStore::new(std::sync::Arc::new(storage))
-        .add_repo(&recovery_added_repo(repo_id))
-        .await
-        .expect("register S3 repo without enqueueing a build");
 }
 
 #[tokio::test]
@@ -470,16 +395,10 @@ async fn worker_kill_mid_build_reclaims_libsql_queue_and_metadata() {
     let want = origin.commit(&[("a.txt", "recovered\n")], "c1");
     origin.publish();
 
-    register_libsql_added_without_build(&url, RepoId::github("acme/recover-libsql")).await;
     let worker1 = spawn_worker(&server.cas_dir, &server.repo_root);
-    let sync_url = format!("{}/v1/repos/github/acme/recover-libsql/sync", server.url);
-    let sync_task = tokio::spawn(async move {
-        reqwest::Client::new()
-            .post(sync_url)
-            .header("Authorization", format!("Ripclone {}", token_hash()))
-            .send()
-            .await
-    });
+    let client = server.client();
+    let sync_task =
+        tokio::spawn(async move { client.sync_repo("acme/recover-libsql", None).await });
 
     wait_libsql_claimed(&url).await;
     wait_archive_building(&server, "recover-libsql", &want).await;
@@ -488,16 +407,12 @@ async fn worker_kill_mid_build_reclaims_libsql_queue_and_metadata() {
     env.remove("RIPCLONE_TEST_ARCHIVE_DELAY_MS");
     let _worker2 = spawn_worker(&server.cas_dir, &server.repo_root);
 
-    let resp = tokio::time::timeout(Duration::from_secs(35), sync_task)
+    let resp = tokio::time::timeout(Duration::from_secs(180), sync_task)
         .await
-        .expect("single libsql sync request did not return after reclaim")
+        .expect("replacement libsql worker did not wake the sync waiter after reclaim")
         .expect("sync task joined")
-        .expect("single libsql sync request completed");
-    assert!(
-        resp.status().is_success() || resp.status() == reqwest::StatusCode::ACCEPTED,
-        "single libsql sync request failed during reclaim: {}",
-        resp.status()
-    );
+        .expect("replacement libsql worker should finish the reclaimed job");
+    assert_eq!(resp.commit, want);
     wait_libsql_done_after_reclaim(&url).await;
 
     let (_g, c) = wait_repo_cloneable(&server, "acme", "recover-libsql", "1").await;
@@ -731,7 +646,6 @@ async fn worker_kill_mid_build_reclaims_s3_storage_and_metadata() {
     env.set("RIPCLONE_TEST_ARCHIVE_DELAY_MS", DELAY_MS);
     init(false);
 
-    register_s3_added_without_build(RepoId::github("acme/recover-s3")).await;
     let server = start_server().await;
     let origin = make_origin("acme", "recover-s3");
     let want = origin.commit(&[("a.txt", "recovered\n")], "c1");

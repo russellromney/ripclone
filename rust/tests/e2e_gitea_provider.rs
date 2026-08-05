@@ -28,6 +28,28 @@ use std::path::Path;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+struct ScopedEnvVar {
+    key: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl ScopedEnvVar {
+    fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+        let previous = std::env::var_os(key);
+        unsafe { std::env::set_var(key, value) };
+        Self { key, previous }
+    }
+}
+
+impl Drop for ScopedEnvVar {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(value) => unsafe { std::env::set_var(self.key, value) },
+            None => unsafe { std::env::remove_var(self.key) },
+        }
+    }
+}
+
 /// Live Gitea coordinates, or `None` when the env is not configured (test skips).
 struct GiteaEnv {
     /// Base URL, e.g. `http://127.0.0.1:3000` (http on localhost in CI).
@@ -225,7 +247,7 @@ fn assert_ripclone_ok(out: &std::process::Output, what: &str) {
     );
 }
 
-async fn wait_for_full_b_to_settle(
+async fn wait_for_editable_full_b_to_settle(
     server: &Server,
     repo_path: &str,
     upstream_token: &str,
@@ -265,7 +287,9 @@ async fn wait_for_full_b_to_settle(
         }
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
-    panic!("private Full(B) never settled through pinned metadata before fixture teardown: {last}");
+    panic!(
+        "private editable Full(B) never settled through pinned metadata before fixture teardown: {last}"
+    );
 }
 
 // Multi-threaded runtime is required: the test body makes BLOCKING subprocess
@@ -336,11 +360,8 @@ async fn gitea_server_side_token_end_to_end() {
         }]
     })
     .to_string();
-    // SAFETY: single-threaded test setup, before the server is constructed.
-    unsafe {
-        std::env::set_var("RIPCLONE_PROVIDERS", &providers_json);
-        std::env::set_var("RIPCLONE_CONFIG", &config_path);
-    }
+    let _providers = ScopedEnvVar::set("RIPCLONE_PROVIDERS", &providers_json);
+    let _config = ScopedEnvVar::set("RIPCLONE_CONFIG", &config_path);
 
     // Write the clobbering shared config with the REAL client binary:
     // `provider add gitea --token ""`. This is precisely the config a client
@@ -510,6 +531,28 @@ async fn gitea_server_side_token_end_to_end() {
         "private one-commit Full top-up",
     );
     assert_eq!(head_fingerprint(&top_up_dir), top_up_target);
+    assert_eq!(
+        git_stdout(
+            &top_up_dir,
+            &["status", "--porcelain=v1", "--untracked-files=all"]
+        ),
+        "",
+        "private top-up worktree must be clean"
+    );
+    assert_eq!(
+        git_stdout(&top_up_dir, &["rev-parse", "--is-shallow-repository"]),
+        "false",
+        "private top-up must retain full history"
+    );
+    assert!(
+        git_ok(&top_up_dir, &["fsck", "--connectivity-only", "HEAD"]),
+        "private top-up repository must pass connectivity fsck"
+    );
+    assert_eq!(
+        git_stdout(&top_up_dir, &["config", "--get", "remote.origin.url"]),
+        plain_url(&env, &repo),
+        "top-up origin must be the locally configured Gitea provider"
+    );
     assert!(!pending_sync.is_finished(), "Full(B) must still be blocked");
 
     // Missing local credentials can still authorize metadata through the
@@ -553,7 +596,7 @@ async fn gitea_server_side_token_end_to_end() {
         .expect("private Full(B) finished after release")
         .expect("join private B sync")
         .expect("sync private B");
-    wait_for_full_b_to_settle(&server, &repo_for_sync, &env.token, &top_up_target.0).await;
+    wait_for_editable_full_b_to_settle(&server, &repo_for_sync, &env.token, &top_up_target.0).await;
 
     delete_repo(&http, &env, &repo).await;
 }

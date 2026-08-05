@@ -17,6 +17,7 @@ use ripclone::provider::{
     ProviderConfig, ProviderInstance, ProviderInstanceId, ProviderKind, ProviderRegistry, RepoId,
 };
 use ripclone::ref_store::{FileRefStore, RefStore};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -46,6 +47,94 @@ impl Drop for ScopedEnvVar {
             None => unsafe { std::env::remove_var(self.key) },
         }
     }
+}
+
+async fn start_failing_upstream_decoy() -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind failing upstream decoy");
+    let url = format!("http://{}", listener.local_addr().expect("decoy address"));
+    let requests = Arc::new(AtomicUsize::new(0));
+    let observed = requests.clone();
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            observed.fetch_add(1, Ordering::SeqCst);
+            let mut request = [0_u8; 1024];
+            let _ = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut request)).await;
+            let _ = stream
+                .write_all(
+                    b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await;
+        }
+    });
+    (url, requests, task)
+}
+
+async fn start_authenticated_redirect_source() -> (
+    String,
+    Arc<std::sync::Mutex<Option<String>>>,
+    Arc<AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+    tokio::task::JoinHandle<()>,
+) {
+    let target = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind redirect target");
+    let target_url = format!("http://{}", target.local_addr().expect("target address"));
+    let target_requests = Arc::new(AtomicUsize::new(0));
+    let target_observed = target_requests.clone();
+    let target_task = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = target.accept().await else {
+                return;
+            };
+            target_observed.fetch_add(1, Ordering::SeqCst);
+            let mut request = [0_u8; 4096];
+            let _ = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut request)).await;
+            let _ = stream
+                .write_all(
+                    b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await;
+        }
+    });
+
+    let source = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind redirect source");
+    let source_url = format!("http://{}", source.local_addr().expect("source address"));
+    let source_request = Arc::new(std::sync::Mutex::new(None));
+    let source_observed = source_request.clone();
+    let source_task = tokio::spawn(async move {
+        let Ok((mut stream, _)) = source.accept().await else {
+            return;
+        };
+        let mut request = [0_u8; 4096];
+        let bytes =
+            match tokio::time::timeout(Duration::from_secs(5), stream.read(&mut request)).await {
+                Ok(Ok(bytes)) => bytes,
+                _ => 0,
+            };
+        *source_observed
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) =
+            Some(String::from_utf8_lossy(&request[..bytes]).into_owned());
+        let response = format!(
+            "HTTP/1.1 302 Found\r\nLocation: {target_url}/acme/full-topup-redirect.git/info/refs?service=git-upload-pack\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        let _ = stream.write_all(response.as_bytes()).await;
+    });
+    (
+        source_url,
+        source_request,
+        target_requests,
+        source_task,
+        target_task,
+    )
 }
 
 struct MinioAuditProxy {
@@ -546,7 +635,7 @@ async fn blocked_full_b_tops_up_carried_direct_parent_a_and_publishes_exact_b() 
     probe.arm();
     let output = tempfile::tempdir().unwrap();
     let target = output.path().join("clone");
-    let pin_barrier = output.path().join("pin-barrier");
+    let staging_barrier = output.path().join("staging-barrier");
     let top_up_metrics = output.path().join("top-up-metrics.txt");
     let managed_git_log = output.path().join("managed-git.log");
     let manifest_reads = output.path().join("manifest-reads.txt");
@@ -602,14 +691,14 @@ exec "$real_git" "$@"
             original_path.to_string_lossy()
         ),
     );
-    unsafe {
-        std::env::set_var("RIPCLONE_TESTING", "1");
-        std::env::set_var("RIPCLONE_TEST_TOP_UP_UNCHANGED_PATH", "unchanged.bin");
-        std::env::set_var("RIPCLONE_TEST_TOP_UP_METRICS_LOG", &top_up_metrics);
-        std::env::set_var("RIPCLONE_TEST_TOP_UP_GIT_LOG", &managed_git_log);
-        std::env::set_var("RIPCLONE_TEST_TOP_UP_MANIFEST_READ_LOG", &manifest_reads);
-        std::env::set_var("RIPCLONE_TEST_TOP_UP_PIN_BARRIER_DIR", &pin_barrier);
-    }
+    let _testing = ScopedEnvVar::set("RIPCLONE_TESTING", "1");
+    let _unchanged_path = ScopedEnvVar::set("RIPCLONE_TEST_TOP_UP_UNCHANGED_PATH", "unchanged.bin");
+    let _metrics_log = ScopedEnvVar::set("RIPCLONE_TEST_TOP_UP_METRICS_LOG", &top_up_metrics);
+    let _git_log = ScopedEnvVar::set("RIPCLONE_TEST_TOP_UP_GIT_LOG", &managed_git_log);
+    let _manifest_log =
+        ScopedEnvVar::set("RIPCLONE_TEST_TOP_UP_MANIFEST_READ_LOG", &manifest_reads);
+    let _staging_barrier =
+        ScopedEnvVar::set("RIPCLONE_TEST_TOP_UP_STAGING_BARRIER_DIR", &staging_barrier);
     let total_top_up_started = std::time::Instant::now();
     let target_for_install = target.clone();
     let install_client = server
@@ -630,32 +719,24 @@ exec "$real_git" "$@"
             .await
     });
     for _ in 0..800 {
-        if pin_barrier.join("entered").exists() {
+        if staging_barrier.join("entered").exists() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     assert!(
-        pin_barrier.join("entered").exists(),
-        "the client must pin B from its first ordinary pending response"
+        staging_barrier.join("entered").exists(),
+        "the client must acquire the carried-A top-up plan before branch movement"
     );
-    // This is deliberately after the client has pinned B and before it can
-    // issue its pinned top-up request. The production-generated B row remains
-    // untouched; exact fetch must not follow the now-advanced branch to C.
+    // This is deliberately after the server has issued the carried-A plan and
+    // the client has created its private staging root. The production-generated
+    // B row remains untouched; exact fetch must not follow the now-advanced C.
     let c = origin.commit(&[("c-only.txt", "C\n")], "C");
     origin.publish();
     assert_ne!(c, b);
-    std::fs::write(pin_barrier.join("proceed"), b"continue\n").unwrap();
+    std::fs::write(staging_barrier.join("proceed"), b"continue\n").unwrap();
     let outcome = tokio::time::timeout(Duration::from_secs(15), &mut install).await;
     let total_top_up_us = total_top_up_started.elapsed().as_micros();
-    unsafe {
-        std::env::remove_var("RIPCLONE_TEST_TOP_UP_METRICS_LOG");
-        std::env::remove_var("RIPCLONE_TEST_TOP_UP_GIT_LOG");
-        std::env::remove_var("RIPCLONE_TEST_TOP_UP_MANIFEST_READ_LOG");
-        std::env::remove_var("RIPCLONE_TEST_TOP_UP_PIN_BARRIER_DIR");
-        std::env::remove_var("RIPCLONE_TEST_TOP_UP_UNCHANGED_PATH");
-        std::env::remove_var("RIPCLONE_TESTING");
-    }
     let outcome = outcome
         .expect("top-up completed while Full(B) stayed blocked")
         .expect("top-up clone task joined")
@@ -798,9 +879,9 @@ server_enqueues={} server_builder_entries={} full_b_blocked=true",
         format!("{}/acme/full-topup.git", origin.url)
     );
 
-    // The top-up above already proved that C was live after B was pinned. Put
-    // the moving branch back on B only for the distinct exact-B precedence
-    // control below, which must resolve Full(B) rather than a new C build.
+    // Restore B only so the intentionally blocked phase-two task can finish
+    // during fixture teardown. Exact-B precedence is proven separately while
+    // Full(A) is still carried by B's moving phase-one row.
     git(&origin.work, &["reset", "--hard", &b]);
     origin.publish();
     proceed.send(()).expect("release Full(B)");
@@ -809,56 +890,6 @@ server_enqueues={} server_builder_entries={} full_b_blocked=true",
         .expect("Full(B) finished after release")
         .expect("join B sync")
         .expect("sync B");
-
-    let ready_b = server
-        .client()
-        .with_provider_instance(provider.clone())
-        .with_upstream_token(upstream_token)
-        .resolve_ref_with_clonepack("acme/full-topup", "main", Some("full"), None)
-        .await
-        .expect("wait for exact Full(B)");
-    assert_eq!(ready_b.commit, b);
-
-    // Once exact Full(B) is ready it wins before any top-up/provider work. A
-    // local decoy provider would fail immediately if the client contacted it.
-    let exact_root = tempfile::tempdir().unwrap();
-    let exact_target = exact_root.path().join("clone");
-    std::fs::write(&manifest_reads, "").unwrap();
-    unsafe {
-        std::env::set_var("RIPCLONE_TESTING", "1");
-        std::env::set_var("RIPCLONE_TEST_TOP_UP_MANIFEST_READ_LOG", &manifest_reads);
-    }
-    let exact = server
-        .client()
-        .with_provider_instance(ProviderInstance {
-            id: ProviderInstanceId::new("counting"),
-            kind: ProviderKind::Generic,
-            host: "http://127.0.0.1:9".to_string(),
-            auth_template: Some("token {token}".to_string()),
-            auth_header_name: None,
-        })
-        .install_repo_with_mode_at(
-            "acme/full-topup",
-            "HEAD",
-            None,
-            &exact_target,
-            CloneMode::Editable,
-            Some("full"),
-            None,
-        )
-        .await
-        .expect("exact Full(B) ignores decoy upstream");
-    unsafe {
-        std::env::remove_var("RIPCLONE_TEST_TOP_UP_MANIFEST_READ_LOG");
-        std::env::remove_var("RIPCLONE_TESTING");
-    }
-    assert_eq!(exact.commit, b);
-    assert_eq!(git(&exact_target, &["rev-parse", "HEAD"]), b);
-    assert_eq!(
-        std::fs::read_to_string(&manifest_reads).unwrap(),
-        "",
-        "exact Full(B) must win without reading the carried-A manifest"
-    );
 
     // Non-vacuity control for the server-source counter: an ordinary sync on
     // the same server must cross the wrapped mirror clone/fetch boundary.
@@ -879,6 +910,181 @@ server_enqueues={} server_builder_entries={} full_b_blocked=true",
             .count()
             > server_source_acquisitions,
         "server source counter control did not observe ordinary mirror acquisition"
+    );
+}
+
+#[tokio::test]
+async fn exact_full_b_precedes_available_carried_a_without_manifest_or_upstream() {
+    let _guard = env_lock().lock().await;
+    init(false);
+    let upstream_token = "exact-precedence-token";
+    let origin = make_http_origin_with_auth(
+        "acme/full-topup-exact-precedence",
+        "token exact-precedence-token",
+    );
+    let provider = ProviderInstance {
+        id: ProviderInstanceId::new("counting"),
+        kind: ProviderKind::Generic,
+        host: origin.url.clone(),
+        auth_template: Some("token {token}".to_string()),
+        auth_header_name: None,
+    };
+    let mut registry = ProviderRegistry::new();
+    registry
+        .merge_one(ProviderConfig {
+            id: "counting".to_string(),
+            kind: Some("generic".to_string()),
+            host: Some(origin.url.clone()),
+            token: Some(upstream_token.to_string()),
+            auth_template: Some("token {token}".to_string()),
+            auth_header_name: None,
+        })
+        .expect("configure counting upstream");
+    let (server, barrier, entered, proceed) =
+        start_server_split_storage_phase_one_barrier_with_registry(registry).await;
+
+    let a = origin.commit(&[("value.txt", "A\n")], "A");
+    origin.publish();
+    register_added_without_build_for_provider(
+        &server,
+        "counting",
+        "acme/full-topup-exact-precedence",
+    )
+    .await
+    .expect("register repo");
+    server
+        .client()
+        .with_provider_instance(provider.clone())
+        .with_upstream_token(upstream_token)
+        .sync_repo("acme/full-topup-exact-precedence", None)
+        .await
+        .expect("publish Full(A)");
+    let ready_a = server
+        .client()
+        .with_provider_instance(provider.clone())
+        .with_upstream_token(upstream_token)
+        .resolve_ref_with_clonepack(
+            "acme/full-topup-exact-precedence",
+            "main",
+            Some("full"),
+            None,
+        )
+        .await
+        .expect("resolve exact Full(A)");
+    assert_eq!(ready_a.commit, a);
+
+    barrier.arm();
+    let b = origin.commit(&[("value.txt", "B\n")], "B");
+    origin.publish();
+    let sync_client = server
+        .client()
+        .with_provider_instance(provider.clone())
+        .with_upstream_token(upstream_token);
+    let mut sync_b = tokio::spawn(async move {
+        sync_client
+            .sync_repo("acme/full-topup-exact-precedence", None)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(20), entered)
+        .await
+        .expect("B reached phase-one publication")
+        .expect("phase-one barrier alive");
+
+    origin.clear_auth_log();
+    let output = tempfile::tempdir().unwrap();
+    let target = output.path().join("clone");
+    let pin_barrier = output.path().join("pin-barrier");
+    let manifest_reads = output.path().join("manifest-reads.txt");
+    std::fs::write(&manifest_reads, "").unwrap();
+    let _testing = ScopedEnvVar::set("RIPCLONE_TESTING", "1");
+    let _pin_barrier = ScopedEnvVar::set("RIPCLONE_TEST_TOP_UP_PIN_BARRIER_DIR", &pin_barrier);
+    let _manifest_log =
+        ScopedEnvVar::set("RIPCLONE_TEST_TOP_UP_MANIFEST_READ_LOG", &manifest_reads);
+    let (decoy_url, decoy_requests, decoy_task) = start_failing_upstream_decoy().await;
+    let decoy_provider = ProviderInstance {
+        host: decoy_url,
+        ..provider.clone()
+    };
+    let install_client = server
+        .client()
+        .with_provider_instance(decoy_provider)
+        .with_upstream_token(upstream_token);
+    let target_for_install = target.clone();
+    let mut install = tokio::spawn(async move {
+        install_client
+            .install_repo_with_mode_at(
+                "acme/full-topup-exact-precedence",
+                "HEAD",
+                None,
+                &target_for_install,
+                CloneMode::Editable,
+                Some("full"),
+                None,
+            )
+            .await
+    });
+    for _ in 0..800 {
+        if pin_barrier.join("entered").exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        pin_barrier.join("entered").exists(),
+        "the first ordinary pending response must pin B before exact B publishes"
+    );
+
+    // Full(A) is still a coherent carried base on B's phase-one row. Publish
+    // Full(B) before the client issues its pinned top-up request, then prove the
+    // exact row wins without consulting either the carried manifest or upstream.
+    proceed.send(()).expect("release Full(B)");
+    tokio::time::timeout(Duration::from_secs(20), &mut sync_b)
+        .await
+        .expect("Full(B) finishes")
+        .expect("join Full(B) sync")
+        .expect("sync Full(B)");
+    let ready_b = server
+        .client()
+        .with_provider_instance(provider.clone())
+        .with_upstream_token(upstream_token)
+        .resolve_ref_with_clonepack(
+            "acme/full-topup-exact-precedence",
+            "main",
+            Some("full"),
+            None,
+        )
+        .await
+        .expect("wait for exact Full(B) publication");
+    assert_eq!(ready_b.commit, b);
+    // Phase-two publication itself legitimately fetched from the real source.
+    // From this point onward, the paused client's exact-B response must use
+    // only server artifacts and never either upstream endpoint.
+    origin.clear_auth_log();
+    std::fs::write(pin_barrier.join("proceed"), b"continue\n").unwrap();
+    let outcome = tokio::time::timeout(Duration::from_secs(15), &mut install)
+        .await
+        .expect("exact B clone completes")
+        .expect("exact B clone task joins")
+        .expect("exact B clone succeeds");
+    decoy_task.abort();
+
+    assert_eq!(outcome.commit, b);
+    assert_eq!(git(&target, &["rev-parse", "HEAD"]), b);
+    assert_eq!(
+        std::fs::read_to_string(&manifest_reads).unwrap(),
+        "",
+        "exact Full(B) must win before the carried Full(A) manifest is read"
+    );
+    assert_eq!(
+        origin.auth_success_count(),
+        0,
+        "exact Full(B) must not fetch from the original upstream"
+    );
+    assert_eq!(origin.auth_reject_count(), 0);
+    assert_eq!(
+        decoy_requests.load(Ordering::SeqCst),
+        0,
+        "exact Full(B) must not contact the decoy top-up provider"
     );
 }
 
@@ -1716,10 +1922,8 @@ async fn cancellation_and_timeout_reap_git_helpers_before_staging_cleanup() {
 
     let timeout_target = output.path().join("timed-out");
     let (timeout_host, timeout_accepted, timeout_closed) = hanging_origin();
-    unsafe {
-        std::env::set_var("RIPCLONE_TESTING", "1");
-        std::env::set_var("RIPCLONE_TEST_GIT_TIMEOUT_MS", "1000");
-    }
+    let _testing = ScopedEnvVar::set("RIPCLONE_TESTING", "1");
+    let _timeout = ScopedEnvVar::set("RIPCLONE_TEST_GIT_TIMEOUT_MS", "1000");
     let timeout_result = server
         .client()
         .with_provider_instance(ProviderInstance {
@@ -1739,10 +1943,6 @@ async fn cancellation_and_timeout_reap_git_helpers_before_staging_cleanup() {
             None,
         )
         .await;
-    unsafe {
-        std::env::remove_var("RIPCLONE_TEST_GIT_TIMEOUT_MS");
-        std::env::remove_var("RIPCLONE_TESTING");
-    }
     let timeout_error = timeout_result.expect_err("hanging Git fetch must time out");
     assert!(format!("{timeout_error:#}").contains("timed out"));
     timeout_accepted
@@ -1874,6 +2074,118 @@ async fn locally_configured_gitea_token_is_used_only_for_the_exact_fetch() {
 }
 
 #[tokio::test]
+async fn authenticated_top_up_fetch_refuses_redirect_without_credential_leak() {
+    let _guard = env_lock().lock().await;
+    init(false);
+    let secret = "redirect-top-up-token";
+    let origin = make_http_origin("acme/full-topup-redirect");
+    let provider = ProviderInstance {
+        id: ProviderInstanceId::new("redirect"),
+        kind: ProviderKind::Generic,
+        host: origin.url.clone(),
+        auth_template: Some("{token}".to_string()),
+        auth_header_name: Some("PRIVATE-TOKEN".to_string()),
+    };
+    let mut registry = ProviderRegistry::new();
+    registry
+        .merge_one(ProviderConfig {
+            id: "redirect".to_string(),
+            kind: Some("generic".to_string()),
+            host: Some(origin.url.clone()),
+            token: Some(secret.to_string()),
+            auth_template: Some("{token}".to_string()),
+            auth_header_name: Some("PRIVATE-TOKEN".to_string()),
+        })
+        .expect("configure redirect provider");
+    let (server, barrier, entered, proceed) =
+        start_server_split_storage_phase_one_barrier_with_registry(registry).await;
+    origin.commit(&[("value.txt", "A\n")], "A");
+    origin.publish();
+    register_added_without_build_for_provider(&server, "redirect", "acme/full-topup-redirect")
+        .await
+        .expect("register redirect provider repo");
+    server
+        .client()
+        .with_provider_instance(provider.clone())
+        .with_upstream_token(secret)
+        .sync_repo("acme/full-topup-redirect", None)
+        .await
+        .expect("publish Full(A)");
+
+    barrier.arm();
+    let b = origin.commit(&[("value.txt", "B\n")], "B");
+    origin.publish();
+    let sync_client = server
+        .client()
+        .with_provider_instance(provider.clone())
+        .with_upstream_token(secret);
+    let mut sync_b = tokio::spawn(async move {
+        sync_client
+            .sync_repo("acme/full-topup-redirect", None)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(20), entered)
+        .await
+        .expect("B reached phase-one publication")
+        .expect("phase-one barrier alive");
+
+    let (redirect_url, source_request, target_requests, source_task, target_task) =
+        start_authenticated_redirect_source().await;
+    let redirect_provider = ProviderInstance {
+        host: redirect_url,
+        ..provider
+    };
+    let output = tempfile::tempdir().unwrap();
+    let target = output.path().join("clone");
+    let error = server
+        .client()
+        .with_provider_instance(redirect_provider)
+        .with_upstream_token(secret)
+        .install_repo_with_mode_at(
+            "acme/full-topup-redirect",
+            "HEAD",
+            None,
+            &target,
+            CloneMode::Editable,
+            Some("full"),
+            None,
+        )
+        .await
+        .expect_err("an authenticated redirect must fail closed");
+    source_task.await.expect("redirect source task joined");
+    target_task.abort();
+
+    let request = source_request
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone()
+        .expect("redirect source received the top-up Git request");
+    assert!(
+        request
+            .to_ascii_lowercase()
+            .contains("private-token: redirect-top-up-token"),
+        "the configured credential must reach only the configured source: {request}"
+    );
+    assert_eq!(
+        target_requests.load(Ordering::SeqCst),
+        0,
+        "the redirect target must receive neither a request nor the credential"
+    );
+    assert!(!target.exists());
+    assert!(
+        format!("{error:#}").contains(&b),
+        "the failure must retain the pinned B identity"
+    );
+
+    proceed.send(()).expect("release Full(B)");
+    tokio::time::timeout(Duration::from_secs(20), &mut sync_b)
+        .await
+        .expect("Full(B) finished after release")
+        .expect("join Full(B) sync")
+        .expect("sync Full(B)");
+}
+
+#[tokio::test]
 #[ignore = "requires digest-pinned MinIO runner"]
 async fn minio_signed_base_stale_url_refresh_remains_pinned_to_b() {
     let _guard = env_lock().lock().await;
@@ -1889,19 +2201,16 @@ async fn minio_signed_base_stale_url_refresh_remains_pinned_to_b() {
     // The server keeps using the direct S3 endpoint. Only client-facing signed
     // URLs are rewritten through this audit hop, which records the artifact
     // request headers before forwarding them byte-for-byte to MinIO.
-    unsafe {
-        std::env::set_var("RIPCLONE_TEST_SIGNED_URL_PROXY", &audit.url);
-        // Production's optional local cache keeps server-side build reads off
-        // the single-threaded fixture runtime. Client artifact reads still use
-        // real MinIO presigned URLs through `audit`.
-        std::env::set_var("RIPCLONE_S3_CACHE_DIR", controls.path().join("s3-cache"));
-    }
+    let _signed_url_proxy = ScopedEnvVar::set("RIPCLONE_TEST_SIGNED_URL_PROXY", &audit.url);
+    // Production's optional local cache keeps server-side build reads off the
+    // single-threaded fixture runtime. Client artifact reads still use real
+    // MinIO presigned URLs through `audit`.
+    let server_cache_dir =
+        ScopedEnvVar::set("RIPCLONE_S3_CACHE_DIR", controls.path().join("s3-cache"));
     let server = start_server().await;
     let (clone_proxy, refresh_entered, refresh_proceed) =
         start_clone_id_proxy_with_pinned_pause(&server.url, 0, 2).await;
-    unsafe {
-        std::env::remove_var("RIPCLONE_S3_CACHE_DIR");
-    }
+    drop(server_cache_dir);
     let origin = make_origin("acme", "full-topup-minio");
     let a = origin.commit(&[("value.txt", "A\n")], "A");
     origin.publish();
@@ -1929,12 +2238,11 @@ async fn minio_signed_base_stale_url_refresh_remains_pinned_to_b() {
 
     let phase_barrier = controls.path().join("phase-two");
     let staging_barrier = controls.path().join("staging-barrier");
-    unsafe {
-        std::env::set_var("RIPCLONE_TEST_PHASE2_BARRIER_DIR", &phase_barrier);
-        std::env::set_var("RIPCLONE_SIGNED_URL_TTL_SECS", "1");
-        std::env::set_var("RIPCLONE_TESTING", "1");
-        std::env::set_var("RIPCLONE_TEST_TOP_UP_STAGING_BARRIER_DIR", &staging_barrier);
-    }
+    let _phase_two_barrier = ScopedEnvVar::set("RIPCLONE_TEST_PHASE2_BARRIER_DIR", &phase_barrier);
+    let _signed_url_ttl = ScopedEnvVar::set("RIPCLONE_SIGNED_URL_TTL_SECS", "1");
+    let _testing = ScopedEnvVar::set("RIPCLONE_TESTING", "1");
+    let _staging_barrier =
+        ScopedEnvVar::set("RIPCLONE_TEST_TOP_UP_STAGING_BARRIER_DIR", &staging_barrier);
     let b = origin.commit(&[("value.txt", "B\n")], "B");
     origin.publish();
     let sync_client = server.client();
@@ -2021,13 +2329,6 @@ async fn minio_signed_base_stale_url_refresh_remains_pinned_to_b() {
         .await
         .expect("refreshed top-up completed")
         .expect("top-up install task joined");
-    unsafe {
-        std::env::remove_var("RIPCLONE_TEST_TOP_UP_STAGING_BARRIER_DIR");
-        std::env::remove_var("RIPCLONE_TESTING");
-        std::env::remove_var("RIPCLONE_SIGNED_URL_TTL_SECS");
-        std::env::remove_var("RIPCLONE_TEST_PHASE2_BARRIER_DIR");
-        std::env::remove_var("RIPCLONE_TEST_SIGNED_URL_PROXY");
-    }
     let outcome = outcome.expect("fresh pinned-B plan succeeds after stale base URL");
     assert_eq!(outcome.commit, b);
     assert!(outcome.cold, "the first 202 must survive the stale retry");
