@@ -92,5 +92,9 @@ if grep -Fq "SKIP" "$log"; then
   echo "error: MinIO proof emitted SKIP" >&2
   exit 1
 fi
+if grep -Fq "full clone build failed" "$log" || grep -Fq "fatal:" "$log"; then
+  echo "error: MinIO proof logged a detached full-clone build failure" >&2
+  exit 1
+fi
 rm -f "$log"
 echo "MinIO image: $MINIO_IMAGE"

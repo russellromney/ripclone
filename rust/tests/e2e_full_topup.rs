@@ -113,16 +113,29 @@ async fn start_authenticated_redirect_source() -> (
         let Ok((mut stream, _)) = source.accept().await else {
             return;
         };
-        let mut request = [0_u8; 4096];
-        let bytes =
-            match tokio::time::timeout(Duration::from_secs(5), stream.read(&mut request)).await {
-                Ok(Ok(bytes)) => bytes,
-                _ => 0,
-            };
+        // A single TCP read is not guaranteed to contain the complete request
+        // headers. Preserve the existing timeout and 4 KiB cap, but capture a
+        // complete header block before asserting credential delivery.
+        let request = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut request = Vec::with_capacity(4096);
+            let mut chunk = [0_u8; 1024];
+            while request.len() < 4096 && !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let chunk_len = (4096 - request.len()).min(chunk.len());
+                let bytes = stream.read(&mut chunk[..chunk_len]).await?;
+                if bytes == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..bytes]);
+            }
+            Ok::<_, std::io::Error>(request)
+        })
+        .await
+        .expect("redirect source request completed before timeout")
+        .expect("read redirect source request");
         *source_observed
             .lock()
             .unwrap_or_else(|error| error.into_inner()) =
-            Some(String::from_utf8_lossy(&request[..bytes]).into_owned());
+            Some(String::from_utf8_lossy(&request).into_owned());
         let response = format!(
             "HTTP/1.1 302 Found\r\nLocation: {target_url}/acme/full-topup-redirect.git/info/refs?service=git-upload-pack\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
         );
@@ -135,6 +148,46 @@ async fn start_authenticated_redirect_source() -> (
         source_task,
         target_task,
     )
+}
+
+async fn wait_for_archive_settled(server: &Server, repo: &str, commit: &str) {
+    let url = format!("{}/v1/repos/github/{repo}/status", server.url);
+    let client = reqwest::Client::new();
+    let mut last = String::new();
+    for _ in 0..360 {
+        let response = client
+            .get(&url)
+            .header("Authorization", format!("Ripclone {}", token_hash()))
+            .header("x-ripclone-protocol", "2")
+            .send()
+            .await
+            .expect("read-only archive status request");
+        let status = response.status();
+        let text = response
+            .text()
+            .await
+            .expect("read-only archive status body");
+        last = format!("{status} {text}");
+        if status.is_success() {
+            let body: serde_json::Value = serde_json::from_str(&text).expect("archive status json");
+            if body["refs"].as_array().is_some_and(|refs| {
+                refs.iter().any(|reference| {
+                    reference["branch"] != "HEAD"
+                        && reference["commit"] == commit
+                        && (reference["build_status"].is_null()
+                            || reference["build_status"] == "done")
+                        && reference["warm"] == true
+                        && reference["manifest"]
+                            .as_str()
+                            .is_some_and(|manifest| !manifest.is_empty())
+                })
+            }) {
+                return;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    panic!("MinIO archive build did not settle for {repo}@{commit}: {last}");
 }
 
 struct MinioAuditProxy {
@@ -2384,4 +2437,7 @@ signed_requests={} authenticated_pinned_requests={} ripclone_auth_requests={}",
         .expect("MinIO Full(B) finished after release")
         .expect("join MinIO B sync")
         .expect("sync MinIO B");
+    // `sync_repo` completes after phase one. Keep the local source and the
+    // server alive until the detached archive worker reports B fully settled.
+    wait_for_archive_settled(&server, "acme/full-topup-minio", &b).await;
 }
