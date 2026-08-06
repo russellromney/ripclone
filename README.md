@@ -141,8 +141,10 @@ which the rest of this quick start uses:
 export RIPCLONE_SERVER=http://localhost:8000
 ```
 
-Make a repo available and build its artifacts with `add`. This registers the
-repo on the server and builds the first clonepack so the first clone is warm:
+Make a repo available and admit its first immutable build with `add`. This
+registers the repo and returns as soon as the ready check or existing queue
+accepts the exact upstream commit; artifact construction continues in the
+background:
 
 ```bash
 cargo run --release --bin ripclone -- add oven-sh/bun
@@ -192,7 +194,11 @@ jobs:
 
 The `github` in the path is the provider instance (see [`docs/PROVIDERS.md`](docs/PROVIDERS.md)). For private repos the server needs read access to the upstream — configure a token for the provider, or pass one per request in the `X-Upstream-Token` header.
 
-ripclone validates the hashed `RIPCLONE_SERVER_TOKEN`, syncs the mirror, builds artifacts for the new `HEAD`, and returns the artifact hashes. (If your secret store already holds the hash, set it as `RIPCLONE_SERVER_TOKEN_HASH` and send it directly.)
+ripclone validates the hashed `RIPCLONE_SERVER_TOKEN`, resolves one exact `HEAD`
+commit, and returns `202` with that commit once the queue accepts it. The
+response is not a claim that artifact construction has finished. (If your
+secret store already holds the hash, set it as `RIPCLONE_SERVER_TOKEN_HASH` and
+send it directly.)
 
 ### Native push webhook (no per-repo workflow)
 
@@ -203,13 +209,13 @@ Instead of (or alongside) the Actions workflow, point a provider webhook at the 
 - **Secret:** the value of `RIPCLONE_WEBHOOK_SECRET_GITHUB` (the legacy `RIPCLONE_WEBHOOK_SECRET` is still honored for github)
 - **Events:** the `push` event.
 
-The server verifies the provider HMAC (`X-Hub-Signature-256`) over the raw body — constant-time, before any parse — then triggers a build via the same queue `/sync` uses, so artifacts are ready before any clone. Fail-closed: a provider with no configured secret returns `503`; a bad signature `401`. Branch deletes clean up that ref; tags/ping are acknowledged with no build.
+The server verifies the provider HMAC (`X-Hub-Signature-256`) over the raw body — constant-time, before any parse — validates the full `after` object ID, and admits that exact commit through the same queue `/sync` uses. The webhook does not perform another tip probe and returns before artifact construction completes. Fail-closed: a provider with no configured secret returns `503`; a bad signature `401`. Branch deletes clean up that ref; tags/ping are acknowledged with no build.
 
 By default the **default branch** is always warmed and other branches only if already built (so throwaway branches don't warm). Set `RIPCLONE_WEBHOOK_WARM_ALL=1` to warm every pushed branch, or `RIPCLONE_WEBHOOK_ALLOWLIST` to restrict which repos warm (comma-separated; GitHub repos are `owner/repo`, other providers are prefixed: `gitlab/group/sub/proj`). The receiver is provider-agnostic — **GitHub, GitLab, and Gitea/Forgejo** are supported (point the provider at `/webhooks/{provider}`, e.g. `/webhooks/gitlab`). Two per-provider notes: GitLab must use the **secret-token** webhook setting (the value of `X-Gitlab-Token`), not the newer signing-token scheme; and a Gitea/Forgejo webhook must have the **Delete** event enabled for branch-delete cleanup to fire. See [`docs/WEBHOOKS.md`](docs/WEBHOOKS.md).
 
 ### Polling fallback
 
-For repos without a webhook, or to catch a missed delivery, the server periodically `ls-remote`s known repos and builds any whose tip moved. This is on by default every 5 minutes; `RIPCLONE_POLL_INTERVAL_SECS` tunes it and `0` turns it off. This is a backstop; webhooks/Actions are the prompt path.
+For repos without a webhook, or to catch a missed delivery, the server periodically `ls-remote`s known repos and admits any exact tip that moved. This is on by default every 5 minutes; `RIPCLONE_POLL_INTERVAL_SECS` tunes it and `0` turns it off. `RIPCLONE_LS_REMOTE_TIMEOUT_SECS` bounds each probe (30 seconds by default). This is a backstop; webhooks/Actions are the prompt path.
 
 ## CLI usage
 
@@ -251,7 +257,7 @@ RIPCLONE_AGENT=1 ripclone clone owner/repo
 # Print a per-phase benchmark report after the clone
 ripclone clone owner/repo --bench
 
-# Build/refresh artifacts on the server
+# Admit/refresh the exact branch tip on the server; ordinary sync returns fast
 ripclone sync owner/repo
 ripclone sync owner/repo --depth 1             # shallow mirror
 ripclone sync owner/repo --at HEAD~5           # build at a past rev
@@ -320,7 +326,7 @@ ripclone splits into a **server** — it resolves refs, serves artifacts, and en
 
 - **Artifact store.** Where clonepacks live: object storage (S3 / R2 / Tigris / MinIO), with signed URLs so clients read straight from it, or local disk. Local disk also caches hot artifacts in front of object storage. A background GC drops artifacts nothing references (after a grace period, so an in-flight upload is never deleted).
 - **Metadata store.** The ref → clonepack mapping and build status. Any database SQLx supports (Postgres, MySQL, SQLite, libsql/Turso), or a file / object-storage store. Writes are ordered so a newer sync never loses to an older one.
-- **Sync queue.** Pending build jobs: in-process for a single box, or SQL-backed so workers can claim jobs across machines. Upstream credentials are resolved per worker and never stored in the queue.
+- **Sync queue.** Pending build jobs: in-process for a single box, or SQL-backed so workers can claim jobs across machines. Each active ordinary job carries its exact admitted commit and its existing per-job upstream credential transport. SQL active-key uniqueness covers queued and claimed rows; the local queue is process-lifetime only.
 
 **Your git host stays the source of truth** for repos, refs, permissions, and writes. Clients download artifacts (signed URL or server proxy), decompress, and write files straight to disk. Public endpoints are rate-limited.
 
