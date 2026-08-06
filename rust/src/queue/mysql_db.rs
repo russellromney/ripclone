@@ -3,10 +3,9 @@
 //!
 //! Dialect notes vs sqlite: `key` is a reserved word so it is backticked; ids are
 //! `AUTO_INCREMENT` read via `last_insert_id()`; indexed text columns are
-//! `VARCHAR`; the status index is declared inline (MySQL has no
-//! `CREATE INDEX IF NOT EXISTS`); and MySQL has **no partial indexes**, so the
-//! coalescing backstop is omitted — coalescing is best-effort only (a rare
-//! duplicate is wasted compute, not a wrong result). Orchestration is reused.
+//! `VARCHAR`; and MySQL's lack of partial indexes is handled with a generated
+//! nullable `active_key` column whose unique index covers queued + claimed rows.
+//! Orchestration is reused.
 
 use super::sql::{QueueDb, SUPERSEDED_BY_NEWER_QUEUED, now_secs};
 use anyhow::{Context, Result};
@@ -55,7 +54,7 @@ impl QueueDb for MysqlDb {
         sqlx::raw_sql(
             "CREATE TABLE IF NOT EXISTS jobs (
                 id BIGINT AUTO_INCREMENT PRIMARY KEY,
-                `key` VARCHAR(512) NOT NULL,
+                `key` VARCHAR(1024) NOT NULL,
                 provider VARCHAR(255) NOT NULL,
                 path VARCHAR(255) NOT NULL,
                 branch VARCHAR(255) NOT NULL,
@@ -65,9 +64,14 @@ impl QueueDb for MysqlDb {
                 claimed_at BIGINT,
                 finished_at BIGINT,
                 error TEXT,
+                admitted_commit VARCHAR(64),
+                admitted_default_branch VARCHAR(255),
                 credential TEXT,
                 attempts BIGINT NOT NULL DEFAULT 0,
                 size_class BIGINT NOT NULL DEFAULT 0,
+                active_key VARBINARY(1024) GENERATED ALWAYS AS
+                    (IF(status IN ('queued', 'claimed'), CONVERT(`key` USING binary), NULL)) STORED,
+                UNIQUE INDEX idx_jobs_active_key (active_key),
                 INDEX idx_jobs_status_created (status, created_at),
                 INDEX idx_jobs_provider_path_finished (provider, path, finished_at)
             )",
@@ -81,6 +85,12 @@ impl QueueDb for MysqlDb {
         let _ = sqlx::raw_sql("ALTER TABLE jobs ADD COLUMN credential TEXT")
             .execute(&self.pool)
             .await;
+        let _ = sqlx::raw_sql("ALTER TABLE jobs ADD COLUMN admitted_commit VARCHAR(64)")
+            .execute(&self.pool)
+            .await;
+        let _ = sqlx::raw_sql("ALTER TABLE jobs ADD COLUMN admitted_default_branch VARCHAR(255)")
+            .execute(&self.pool)
+            .await;
         // Same best-effort migration for the attempts column (dead-letter bound).
         let _ = sqlx::raw_sql("ALTER TABLE jobs ADD COLUMN attempts BIGINT NOT NULL DEFAULT 0")
             .execute(&self.pool)
@@ -89,15 +99,67 @@ impl QueueDb for MysqlDb {
         let _ = sqlx::raw_sql("ALTER TABLE jobs ADD COLUMN size_class BIGINT NOT NULL DEFAULT 0")
             .execute(&self.pool)
             .await;
+        sqlx::raw_sql(
+            "UPDATE jobs
+             SET status = 'failed', finished_at = UNIX_TIMESTAMP(),
+                 error = 'legacy active job has no admitted commit; resubmit sync',
+                 worker_id = NULL, credential = NULL
+             WHERE status IN ('queued', 'claimed')
+               AND (admitted_commit IS NULL OR admitted_commit = '')",
+        )
+        .execute(&self.pool)
+        .await
+        .context("settle legacy active jobs")?;
+        sqlx::raw_sql("ALTER TABLE jobs MODIFY COLUMN `key` VARCHAR(1024) NOT NULL")
+            .execute(&self.pool)
+            .await
+            .context("widen MySQL queue key column")?;
+        // Remove both legacy names before recreating the projection. MySQL
+        // has no partial-index syntax, and an existing name would otherwise
+        // make the ADD INDEX below succeed without enforcing the new key.
+        let _ = sqlx::raw_sql("ALTER TABLE jobs DROP INDEX idx_jobs_active_key")
+            .execute(&self.pool)
+            .await;
+        let _ = sqlx::raw_sql("ALTER TABLE jobs DROP INDEX idx_jobs_queued_key")
+            .execute(&self.pool)
+            .await;
+        let add_active = sqlx::raw_sql(
+            "ALTER TABLE jobs ADD COLUMN active_key VARBINARY(1024) GENERATED ALWAYS AS
+                (IF(status IN ('queued', 'claimed'), CONVERT(`key` USING binary), NULL)) STORED",
+        )
+        .execute(&self.pool)
+        .await;
+        if let Err(e) = add_active
+            && !e
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("duplicate column")
+        {
+            return Err(e).context("add MySQL active-key projection");
+        }
+        let add_index =
+            sqlx::raw_sql("ALTER TABLE jobs ADD UNIQUE INDEX idx_jobs_active_key (active_key)")
+                .execute(&self.pool)
+                .await;
+        if let Err(e) = add_index
+            && !e
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("duplicate key name")
+        {
+            return Err(e).context("create MySQL active-key uniqueness index");
+        }
         Ok(())
     }
 
     async fn active_job_id(&self, key: &str) -> Result<Option<i64>> {
-        sqlx::query_scalar("SELECT id FROM jobs WHERE `key` = ? AND status = 'queued' LIMIT 1")
-            .bind(key)
-            .fetch_optional(&self.pool)
-            .await
-            .context("query active job")
+        sqlx::query_scalar(
+            "SELECT id FROM jobs WHERE `key` = ? AND status IN ('queued', 'claimed') LIMIT 1",
+        )
+        .bind(key)
+        .fetch_optional(&self.pool)
+        .await
+        .context("query active job")
     }
 
     async fn insert_job(
@@ -106,6 +168,8 @@ impl QueueDb for MysqlDb {
         provider: &str,
         path: &str,
         branch: &str,
+        admitted_commit: Option<&str>,
+        admitted_default_branch: Option<&str>,
         credential: Option<&str>,
         _size_class: i64,
         created_at: i64,
@@ -113,18 +177,20 @@ impl QueueDb for MysqlDb {
         // size_class is blessed-backend only (sqlite/libsql); mysql lags.
         // VARCHAR key columns: reject an over-long value instead of letting MySQL
         // silently truncate it (which would collide two jobs onto one key).
-        check_len("key", key, 512)?;
+        check_len("key", key, 1024)?;
         check_len("provider", provider, 255)?;
         check_len("path", path, 255)?;
         check_len("branch", branch, 255)?;
         let res = sqlx::query(
-            "INSERT INTO jobs (`key`, provider, path, branch, status, credential, created_at)
-             VALUES (?, ?, ?, ?, 'queued', ?, ?)",
+            "INSERT INTO jobs (`key`, provider, path, branch, admitted_commit, admitted_default_branch, status, credential, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?)",
         )
         .bind(key)
         .bind(provider)
         .bind(path)
         .bind(branch)
+        .bind(admitted_commit)
+        .bind(admitted_default_branch)
         .bind(credential)
         .bind(created_at)
         .execute(&self.pool)
@@ -234,18 +300,31 @@ impl QueueDb for MysqlDb {
     async fn job_fields(
         &self,
         id: i64,
-    ) -> Result<Option<(String, String, String, Option<String>)>> {
-        let row = sqlx::query("SELECT provider, path, branch, credential FROM jobs WHERE id = ?")
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await
-            .context("fetch job fields")?;
+    ) -> Result<
+        Option<(
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        )>,
+    > {
+        let row = sqlx::query(
+            "SELECT provider, path, branch, admitted_commit, admitted_default_branch, credential FROM jobs WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("fetch job fields")?;
         match row {
             Some(row) => Ok(Some((
                 row.try_get(0)?,
                 row.try_get(1)?,
                 row.try_get(2)?,
                 row.try_get(3)?,
+                row.try_get(4)?,
+                row.try_get(5)?,
             ))),
             None => Ok(None),
         }

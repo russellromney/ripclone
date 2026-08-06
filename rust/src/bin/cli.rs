@@ -91,9 +91,9 @@ enum Commands {
         #[arg(long, default_value = "90")]
         ttl_days: u64,
     },
-    /// Make a repo available to clone on the server.
+    /// Make a repo available and admit its exact first build; returns fast.
     Add { repo: String },
-    /// Sync a repo on the server.
+    /// Admit the exact branch tip for a background sync; returns fast unless --at is used.
     Sync {
         repo: String,
         /// Git history depth to mirror. 1 gives a shallow clonepack; 0 means no
@@ -1141,8 +1141,15 @@ async fn main() -> Result<()> {
             let client = client
                 .with_provider(&provider)
                 .with_upstream_token_opt(upstream_token);
-            let info = client.add_repo(&repo_path).await?;
-            println!("added {} at {}", repo_path, info.commit);
+            let admission = client.admit_add_repo(&repo_path).await?;
+            if admission.accepted {
+                println!("added {}; accepted {}", repo_path, admission.commit);
+            } else {
+                println!(
+                    "added {}; already current at {}",
+                    repo_path, admission.commit
+                );
+            }
         }
         Commands::Sync { repo, depth, at } => {
             let (provider, repo_path) = resolve_repo(&repo, &default_provider, &provider_registry)?;
@@ -1153,10 +1160,17 @@ async fn main() -> Result<()> {
                 .with_provider(&provider)
                 .with_upstream_token_opt(upstream_token);
             let depth = depth.or(config.clone.depth);
-            let info = client
-                .sync_repo_at(&repo_path, at.as_deref(), depth)
-                .await?;
-            println!("synced {} to {}", repo_path, info.commit);
+            if let Some(at) = at.as_deref() {
+                let info = client.sync_repo_at(&repo_path, Some(at), depth).await?;
+                println!("synced {} to {}", repo_path, info.commit);
+            } else {
+                let admission = client.admit_sync_repo(&repo_path, depth).await?;
+                if admission.accepted {
+                    println!("accepted {}", admission.commit);
+                } else {
+                    println!("already current at {}", admission.commit);
+                }
+            }
         }
         Commands::Clone {
             repo,

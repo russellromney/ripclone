@@ -47,6 +47,31 @@ struct ArtifactPendingResponse {
     top_up_base: Option<RefResponse>,
 }
 
+#[derive(Debug, Deserialize)]
+struct SyncAcceptedResponse {
+    status: String,
+    #[serde(default)]
+    queue_depth: usize,
+    #[serde(default)]
+    commit: Option<String>,
+    #[serde(default)]
+    branch: Option<String>,
+}
+
+/// Result of one ordinary sync/add admission request. A caller that only needs
+/// readiness can use [`Client::sync_repo`] / [`Client::add_repo`], which poll
+/// exact pinned metadata after a 202. CLI and webhook-style callers can use the
+/// admission methods and return as soon as this value is available.
+#[derive(Debug, Clone)]
+pub struct SyncAdmission {
+    pub commit: String,
+    pub branch: String,
+    pub accepted: bool,
+    pub ready: Option<RefResponse>,
+    pub status: String,
+    pub queue_depth: usize,
+}
+
 /// The selected artifact is not yet available for the commit this clone pinned.
 #[derive(Debug)]
 pub struct ArtifactPending {
@@ -1377,15 +1402,15 @@ impl Client {
                 if let Some(response_branch) = pending_branch.filter(|value| !value.is_empty()) {
                     crate::validation::validate_git_rev(&response_branch)
                         .with_context(|| format!("invalid pending branch for {repo_path}"))?;
-                    if let Some(expected) = resolved_branch.as_deref() {
-                        if response_branch != expected {
-                            anyhow::bail!(
-                                "ref integrity error: resolved branch {expected} changed to {response_branch} in a pending response"
-                            );
-                        }
-                    } else {
-                        *resolved_branch = Some(response_branch);
+                    if let Some(expected) = resolved_branch.as_deref()
+                        && expected != "HEAD"
+                        && response_branch != expected
+                    {
+                        anyhow::bail!(
+                            "ref integrity error: resolved branch {expected} changed to {response_branch} in a pending response"
+                        );
                     }
+                    *resolved_branch = Some(response_branch);
                 }
                 polled = true;
                 *cold = true;
@@ -1494,16 +1519,16 @@ impl Client {
                 } else {
                     *pinned = Some(info.commit.clone());
                 }
-                if let Some(expected) = resolved_branch.as_deref() {
-                    if info.branch != expected {
-                        anyhow::bail!(
-                            "ref integrity error: resolved branch {expected} changed to {} in a ready response",
-                            info.branch
-                        );
-                    }
-                } else {
-                    *resolved_branch = Some(info.branch.clone());
+                if let Some(expected) = resolved_branch.as_deref()
+                    && expected != "HEAD"
+                    && info.branch != expected
+                {
+                    anyhow::bail!(
+                        "ref integrity error: resolved branch {expected} changed to {} in a ready response",
+                        info.branch
+                    );
                 }
+                *resolved_branch = Some(info.branch.clone());
                 *cold |= polled;
                 info.clone_id = first_clone_id.clone();
                 info.cold = *cold;
@@ -1818,35 +1843,49 @@ impl Client {
     }
 
     pub async fn sync_repo(&self, repo_path: &str, depth: Option<usize>) -> Result<RefResponse> {
-        self.sync_repo_at(repo_path, None, depth).await
+        let admission = self.admit_sync_repo(repo_path, depth).await?;
+        if let Some(ready) = admission.ready {
+            return Ok(ready);
+        }
+        self.wait_for_admitted_sync(repo_path, &admission).await
     }
 
     pub async fn add_repo(&self, repo_path: &str) -> Result<RefResponse> {
+        let admission = self.admit_add_repo(repo_path).await?;
+        if let Some(ready) = admission.ready {
+            return Ok(ready);
+        }
+        self.wait_for_admitted_sync(repo_path, &admission).await
+    }
+
+    /// Admit an ordinary default-branch sync and return immediately after a
+    /// ready hit or queue acceptance. This is the fast path used by the CLI.
+    pub async fn admit_sync_repo(
+        &self,
+        repo_path: &str,
+        depth: Option<usize>,
+    ) -> Result<SyncAdmission> {
+        self.admit_sync_request(repo_path, None, depth).await
+    }
+
+    /// Register and admit an ordinary default-branch build, returning after the
+    /// durable registration plus ready detection or queue acceptance.
+    pub async fn admit_add_repo(&self, repo_path: &str) -> Result<SyncAdmission> {
         let mut url = self.repo_url(repo_path, "/add");
         url.push_str("?source=cli");
-        let max_attempts = std::env::var("RIPCLONE_SYNC_MAX_ATTEMPTS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(40usize);
-        let poll = test_sync_poll_interval();
-        for attempt in 0..max_attempts {
-            let resp = self.send(self.request(reqwest::Method::POST, &url)).await?;
-            let status = resp.status();
-            if status == reqwest::StatusCode::OK {
-                return Ok(resp.json().await?);
-            }
-            if status == reqwest::StatusCode::ACCEPTED
-                || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
-            {
-                if attempt + 1 < max_attempts {
-                    tokio::time::sleep(poll).await;
-                    continue;
-                }
-                anyhow::bail!("add still building after {max_attempts} attempts");
-            }
-            return Err(server_error("add failed", resp).await);
+        let resp = self.send(self.request(reqwest::Method::POST, &url)).await?;
+        if resp.status() == reqwest::StatusCode::OK {
+            let ready: RefResponse = resp.json().await?;
+            return Ok(SyncAdmission {
+                commit: ready.commit.clone(),
+                branch: ready.branch.clone(),
+                accepted: false,
+                ready: Some(ready),
+                status: "ready".to_string(),
+                queue_depth: 0,
+            });
         }
-        anyhow::bail!("add did not complete")
+        self.parse_sync_admission_response(resp, "add").await
     }
 
     /// Like [`sync_repo`] but builds at `rev` (e.g. "HEAD~5" or a SHA) instead of
@@ -1860,7 +1899,11 @@ impl Client {
         rev: Option<&str>,
         depth: Option<usize>,
     ) -> Result<RefResponse> {
-        self.sync_inner(repo_path, None, rev, depth).await
+        if rev.is_some() {
+            self.sync_inner_legacy(repo_path, None, rev, depth).await
+        } else {
+            self.sync_inner(repo_path, None, None, depth).await
+        }
     }
 
     /// Sync a specific branch instead of the repo's default. Each branch is its
@@ -1870,7 +1913,120 @@ impl Client {
         self.sync_inner(repo_path, Some(branch), None, None).await
     }
 
+    async fn admit_sync_request(
+        &self,
+        repo_path: &str,
+        branch: Option<&str>,
+        depth: Option<usize>,
+    ) -> Result<SyncAdmission> {
+        let mut url = self.repo_url(repo_path, "/sync");
+        let mut q: Vec<String> = Vec::new();
+        if let Some(branch) = branch {
+            q.push(format!("branch={}", urlencoding::encode(branch)));
+        }
+        if let Some(depth) = depth {
+            q.push(format!("depth={depth}"));
+        }
+        if !q.is_empty() {
+            url.push('?');
+            url.push_str(&q.join("&"));
+        }
+        let resp = self.send(self.request(reqwest::Method::POST, &url)).await?;
+        if resp.status() == reqwest::StatusCode::OK {
+            let ready: RefResponse = resp.json().await?;
+            return Ok(SyncAdmission {
+                commit: ready.commit.clone(),
+                branch: ready.branch.clone(),
+                accepted: false,
+                ready: Some(ready),
+                status: "ready".to_string(),
+                queue_depth: 0,
+            });
+        }
+        self.parse_sync_admission_response(resp, "sync").await
+    }
+
+    async fn parse_sync_admission_response(
+        &self,
+        resp: reqwest::Response,
+        context: &str,
+    ) -> Result<SyncAdmission> {
+        if resp.status() != reqwest::StatusCode::ACCEPTED {
+            return Err(server_error(&format!("{context} failed"), resp).await);
+        }
+        let accepted: SyncAcceptedResponse = resp
+            .json()
+            .await
+            .with_context(|| format!("invalid exact {context} admission response"))?;
+        let commit = accepted
+            .commit
+            .context("server accepted sync without an admitted commit")?;
+        let branch = accepted.branch.unwrap_or_else(|| "HEAD".to_string());
+        crate::validation::validate_object_id(&commit)
+            .context("server returned invalid admitted commit")?;
+        crate::validation::validate_git_rev(&branch)
+            .context("server returned invalid admitted branch")?;
+        Ok(SyncAdmission {
+            commit,
+            branch,
+            accepted: true,
+            ready: None,
+            status: accepted.status,
+            queue_depth: accepted.queue_depth,
+        })
+    }
+
+    async fn wait_for_admitted_sync(
+        &self,
+        repo_path: &str,
+        admission: &SyncAdmission,
+    ) -> Result<RefResponse> {
+        let mut pinned = Some(admission.commit.clone());
+        // HEAD is a selector, not the concrete metadata key. Let the first
+        // exact pinned GET learn the advertised default branch (for example,
+        // `main`) from Content-Location; concrete admissions remain pinned to
+        // their admitted branch.
+        let mut resolved_branch = (admission.branch != "HEAD").then(|| admission.branch.clone());
+        let mut clone_id = None;
+        let mut cold = false;
+        match self
+            .resolve_ref_for_operation(
+                repo_path,
+                &admission.branch,
+                Some("full"),
+                None,
+                &mut pinned,
+                &mut resolved_branch,
+                "full",
+                false,
+                &mut clone_id,
+                &mut cold,
+            )
+            .await?
+        {
+            InstallPlan::Exact { response, .. } => Ok(response),
+            InstallPlan::TopUp { .. } => unreachable!("sync readiness does not top up"),
+        }
+    }
+
     async fn sync_inner(
+        &self,
+        repo_path: &str,
+        branch: Option<&str>,
+        rev: Option<&str>,
+        depth: Option<usize>,
+    ) -> Result<RefResponse> {
+        if rev.is_some() {
+            return self.sync_inner_legacy(repo_path, branch, rev, depth).await;
+        }
+        let admission = self.admit_sync_request(repo_path, branch, depth).await?;
+        if let Some(ready) = admission.ready {
+            return Ok(ready);
+        }
+        self.wait_for_admitted_sync(repo_path, &admission).await
+    }
+
+    async fn sync_inner_legacy(
         &self,
         repo_path: &str,
         branch: Option<&str>,

@@ -2,7 +2,7 @@ use crate::provider::{ProviderInstance, RepoId};
 use anyhow::{Context, Result, bail};
 use secrecy::ExposeSecret;
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::AtomicBool;
@@ -1461,6 +1461,46 @@ pub fn ls_remote_commit(
     ref_name: &str,
     credential: Option<&secrecy::SecretString>,
 ) -> Result<Option<String>> {
+    Ok(ls_remote_tip(provider, repo_id, ref_name, credential)?.map(|tip| tip.commit))
+}
+
+/// The exact tip returned by one `ls-remote` advertisement. `default_branch` is
+/// populated only when the requested ref is `HEAD` and the server advertises a
+/// symbolic target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteTip {
+    pub commit: String,
+    pub default_branch: Option<String>,
+}
+
+/// Resolve a remote ref with an owned timeout. The child is placed in its own
+/// process group, stdout/stderr are drained concurrently, and a timeout kills
+/// the group and waits for the direct child before returning. Callers can rely
+/// on this being one bounded, killed, and reaped probe rather than a detached
+/// `spawn_blocking(Command::output())` task.
+pub fn ls_remote_tip(
+    provider: &ProviderInstance,
+    repo_id: &RepoId,
+    ref_name: &str,
+    credential: Option<&secrecy::SecretString>,
+) -> Result<Option<RemoteTip>> {
+    let timeout = std::env::var("RIPCLONE_LS_REMOTE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(30));
+    ls_remote_tip_with_timeout(provider, repo_id, ref_name, credential, timeout)
+}
+
+/// Testable form of [`ls_remote_tip`] with an explicit bound.
+pub fn ls_remote_tip_with_timeout(
+    provider: &ProviderInstance,
+    repo_id: &RepoId,
+    ref_name: &str,
+    credential: Option<&secrecy::SecretString>,
+    timeout: Duration,
+) -> Result<Option<RemoteTip>> {
     crate::validation::validate_repo_path(provider, repo_id)
         .with_context(|| format!("invalid repo path: {}", repo_id.storage_key()))?;
     if ref_name != "HEAD" {
@@ -1485,28 +1525,164 @@ pub fn ls_remote_commit(
     } else {
         format!("refs/heads/{ref_name}")
     };
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .args(&git_args)
-        .args(["ls-remote", "--", &url, &query])
-        .output()
-        .context("git ls-remote")?;
-    if !output.status.success() {
-        return Err(upstream_git_error(
-            "ls-remote",
-            &url,
-            auth_header,
-            &output.stderr,
+        .args(["ls-remote", "--symref", "--", &url, &query])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command.spawn().context("spawn git ls-remote")?;
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            let _ = kill_ls_remote_process_group(&mut child);
+            let _ = child.wait();
+            anyhow::bail!("open ls-remote stdout");
+        }
+    };
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            let _ = kill_ls_remote_process_group(&mut child);
+            let _ = child.wait();
+            anyhow::bail!("open ls-remote stderr");
+        }
+    };
+    let stdout_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = std::io::BufReader::new(stdout).read_to_end(&mut bytes);
+        (result, bytes)
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = std::io::BufReader::new(stderr).read_to_end(&mut bytes);
+        (result, bytes)
+    });
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(error) => {
+                let kill_error = kill_ls_remote_process_group(&mut child).err();
+                let reap_error = child.wait().err();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                if let Some(kill_error) = kill_error {
+                    return Err(kill_error).context("kill failed ls-remote process group");
+                }
+                if let Some(reap_error) = reap_error {
+                    return Err(reap_error).context("reap failed git ls-remote");
+                }
+                return Err(error).context("poll git ls-remote");
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            let kill_error = kill_ls_remote_process_group(&mut child).err();
+            let reap_result = child.wait();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            if let Some(error) = kill_error {
+                return Err(error).context("kill timed-out ls-remote process group");
+            }
+            reap_result.context("reap timed-out git ls-remote")?;
+            anyhow::bail!("git ls-remote timed out after {timeout:?}");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    // `git` can exit while a helper or descendant still owns an inherited
+    // stdout/stderr pipe. Kill the process group before joining the reader
+    // threads so a normally exiting direct child cannot turn collection into an
+    // unbounded wait.
+    let group_kill_error = kill_ls_remote_process_group(&mut child).err();
+    let (stdout_result, stdout) = stdout_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("ls-remote stdout reader panicked"))?;
+    stdout_result.context("read ls-remote stdout")?;
+    let (stderr_result, stderr) = stderr_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("ls-remote stderr reader panicked"))?;
+    stderr_result.context("read ls-remote stderr")?;
+    if let Some(error) = group_kill_error {
+        return Err(error).context("kill ls-remote process group");
+    }
+    if !status.success() {
+        return Err(upstream_git_error("ls-remote", &url, auth_header, &stderr));
+    }
+    let stdout = String::from_utf8_lossy(&stdout);
+    let mut default_branch = None;
+    let mut commit = None;
+    let mut saw_output = false;
+    for line in stdout.lines() {
+        if !line.trim().is_empty() {
+            saw_output = true;
+        }
+        if let Some(symbolic) = line.strip_prefix("ref: refs/heads/")
+            && let Some(branch) = symbolic
+                .strip_suffix("\tHEAD")
+                .or_else(|| symbolic.strip_suffix(" HEAD"))
+            && !branch.is_empty()
+            && crate::validation::validate_git_rev(branch).is_ok()
+        {
+            default_branch = Some(branch.to_string());
+            continue;
+        }
+        if line.starts_with("ref: ") {
+            return Err(anyhow::anyhow!(
+                "git ls-remote returned malformed symbolic ref"
+            ));
+        }
+        let Some((sha, _remote_ref)) = line.split_once('\t') else {
+            return Err(anyhow::anyhow!(
+                "git ls-remote returned malformed advertisement"
+            ));
+        };
+        let sha = sha.trim();
+        if crate::validation::validate_object_id(sha).is_err() {
+            return Err(anyhow::anyhow!(
+                "git ls-remote returned malformed object id"
+            ));
+        }
+        commit = Some(sha.to_string());
+        break;
+    }
+    if saw_output && commit.is_none() {
+        return Err(anyhow::anyhow!(
+            "git ls-remote returned no object id for requested ref"
         ));
     }
-    // Output is lines of "<sha>\t<ref>"; take the first ref's SHA.
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let sha = stdout
-        .lines()
-        .next()
-        .and_then(|line| line.split('\t').next())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-    Ok(sha)
+    Ok(commit.map(|commit| RemoteTip {
+        commit,
+        default_branch,
+    }))
+}
+
+fn kill_ls_remote_process_group(child: &mut std::process::Child) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let pid = child.id() as libc::pid_t;
+        let result = unsafe { libc::kill(-pid, libc::SIGKILL) };
+        if result != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        match child.kill() {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
 }
 
 /// Cross-process advisory lock guarding a repo's bare mirror directory.
@@ -1792,9 +1968,7 @@ fn is_full_hex_object_id(rev: &str) -> bool {
 }
 
 fn branch_fetch_refspec(branch: &str) -> Option<String> {
-    if branch == "HEAD"
-        || branch.is_empty()
-        || branch.contains(['*', '?', '[', ':', ' ', '~', '^', '#'])
+    if branch == "HEAD" || branch.is_empty() || branch.contains(['*', '?', '[', ':', ' ', '~', '^'])
     {
         return None;
     }
@@ -2218,6 +2392,52 @@ mod tests {
             None,
             "glob ref name is rejected, not matched"
         );
+    }
+
+    #[test]
+    fn ls_remote_timeout_kills_reaps_and_closes_the_fixture_connection() {
+        use std::sync::mpsc;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (accepted_tx, accepted_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("ls-remote connected");
+            accepted_tx.send(()).unwrap();
+            // Do not send an HTTP response. The process-group kill must close the
+            // client socket, which lets this bounded fixture thread return.
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+            let _ = stream.read(&mut buf);
+        });
+
+        let _env = ORIGIN_BASE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("RIPCLONE_ORIGIN_BASE", format!("http://{addr}")) };
+        let registry = crate::provider::ProviderRegistry::new();
+        let provider = registry.default_provider();
+        let result = ls_remote_tip_with_timeout(
+            provider,
+            &crate::provider::RepoId::github("acme/timeout"),
+            "HEAD",
+            None,
+            Duration::from_millis(100),
+        );
+        unsafe { std::env::remove_var("RIPCLONE_ORIGIN_BASE") };
+
+        accepted_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("bounded ls-remote fixture accepted the request");
+        assert!(
+            result
+                .expect_err("the hanging advertisement must time out")
+                .to_string()
+                .contains("timed out"),
+            "timeout must be surfaced after the child is killed and reaped"
+        );
+        server
+            .join()
+            .expect("the fixture connection closed after process-group kill");
     }
 
     #[test]

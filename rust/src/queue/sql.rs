@@ -17,10 +17,10 @@
 //!   one worker can flip a given row out of `queued` (SQLite serialises
 //!   writers), so no job is double-claimed. Lost races retry.
 //! - Ids come from `last_insert_rowid()`, not `RETURNING`.
-//! - **Coalescing** (one build per repo/branch) is best-effort:
-//!   `SELECT active`-then-`INSERT`, with a partial unique index attempted as a
-//!   backstop. A rare duplicate job is wasted compute, not a wrong result — the
-//!   poller watches its own job id and builds are idempotent into the CAS.
+//! - **Coalescing** is keyed by repo, branch, and exact admitted commit. The
+//!   enqueue transaction first finds an active exact key and the partial unique
+//!   index covers both `queued` and `claimed` rows as a database backstop. A
+//!   later exact commit is intentionally a distinct job; a duplicate is not.
 
 #[cfg(test)]
 use super::size_class::default_size_classes;
@@ -29,7 +29,7 @@ use super::{
     BuildError, BuildJob, EnqueueOutcome, Enqueued, JobId, JobQueue, JobState, WorkerQueue,
 };
 use crate::provider::{ProviderInstanceId, RepoId};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -66,6 +66,13 @@ pub struct ClaimedJob {
     /// Opaque repo path (`owner/repo` for GitHub).
     pub path: String,
     pub branch: String,
+    /// Exact ordinary tip commit admitted by the server. `None` identifies a
+    /// historical rev job or a legacy row that must be rejected before source
+    /// work by the worker.
+    pub admitted_commit: Option<String>,
+    /// Concrete upstream default branch learned during HEAD admission, when
+    /// available. This does not affect coalescing identity.
+    pub admitted_default_branch: Option<String>,
     /// Per-job upstream credential the enqueuer passed (the cloud's per-request
     /// `X-Upstream-Token`), so a cross-process worker can read a private repo it
     /// has no standing credential for. `None` falls back to the worker's broker.
@@ -107,8 +114,9 @@ pub(crate) fn decode_credential(enc: Option<String>) -> Option<secrecy::SecretSt
 /// `LibsqlDb`.
 #[async_trait]
 pub trait QueueDb: Send + Sync {
-    /// Create the `jobs` table and indexes (best-effort on the partial unique
-    /// index, which not every engine enforces).
+    /// Create the `jobs` table and indexes. Active-key uniqueness is required on
+    /// every supported adapter; initialization fails closed if the backend
+    /// cannot enforce it.
     async fn init(&self) -> Result<()>;
 
     /// Id of the active (queued or claimed) job for `key`, if any.
@@ -124,6 +132,8 @@ pub trait QueueDb: Send + Sync {
         provider: &str,
         path: &str,
         branch: &str,
+        admitted_commit: Option<&str>,
+        admitted_default_branch: Option<&str>,
         credential: Option<&str>,
         size_class: i64,
         created_at: i64,
@@ -163,10 +173,22 @@ pub trait QueueDb: Send + Sync {
     /// `attempts` counter. Returns true iff this call won the row.
     async fn try_claim(&self, id: i64, worker_id: &str, now: i64) -> Result<bool>;
 
-    /// `(provider, path, branch, credential)` for a job id. `credential` is the
-    /// stored base64 blob (or `None`).
-    async fn job_fields(&self, id: i64)
-    -> Result<Option<(String, String, String, Option<String>)>>;
+    /// `(provider, path, branch, admitted_commit, admitted_default_branch,
+    /// credential)` for a job id.
+    /// `credential` is the stored base64 blob (or `None`).
+    async fn job_fields(
+        &self,
+        id: i64,
+    ) -> Result<
+        Option<(
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        )>,
+    >;
 
     /// Settle a claimed job: `status` is `done` or `failed`, with optional
     /// error. Conditional on the caller still owning the claim — the UPDATE
@@ -189,10 +211,10 @@ pub trait QueueDb: Send + Sync {
     /// Requeue a retryable build failure while the caller still owns the claim.
     /// Returns false if the claim was reclaimed or otherwise settled first.
     ///
-    /// If a newer job for the same key is already `queued` (push-during-build),
-    /// requeue would violate the unique queued-key index — instead the claim is
-    /// settled terminal `failed` with [`SUPERSEDED_BY_NEWER_QUEUED`] and this
-    /// returns true (the worker's result is acknowledged, not lost as an error).
+    /// If a legacy same-key queued sibling exists, requeue may violate the
+    /// active-key constraint; settle the redundant claim terminally with
+    /// [`SUPERSEDED_BY_NEWER_QUEUED`]. New exact B/C admissions use different
+    /// keys and therefore retry independently.
     async fn requeue_claim(&self, id: i64, worker_id: &str, error: &str) -> Result<bool>;
 
     /// `(status, error)` for a job id.
@@ -697,7 +719,14 @@ impl SqlJobQueue {
                 return Ok(None);
             };
             if self.db.try_claim(id, worker_id, now_secs()).await? {
-                let Some((provider, path, branch, credential)) = self.db.job_fields(id).await?
+                let Some((
+                    provider,
+                    path,
+                    branch,
+                    admitted_commit,
+                    admitted_default_branch,
+                    credential,
+                )) = self.db.job_fields(id).await?
                 else {
                     continue;
                 };
@@ -706,6 +735,8 @@ impl SqlJobQueue {
                     provider,
                     path,
                     branch,
+                    admitted_commit,
+                    admitted_default_branch,
                     credential: decode_credential(credential),
                 }));
             }
@@ -780,6 +811,15 @@ fn retry_backoff(attempts: i64) -> std::time::Duration {
 #[async_trait]
 impl JobQueue for SqlJobQueue {
     async fn enqueue(&self, job: BuildJob) -> Result<Enqueued> {
+        if job.rev.is_none() {
+            let Some(commit) = job.admitted_commit.as_deref() else {
+                anyhow::bail!(
+                    "ordinary tip build must carry an admitted commit; legacy jobs cannot be enqueued"
+                );
+            };
+            crate::validation::validate_object_id(commit)
+                .context("validate admitted build commit")?;
+        }
         let key = job.key();
         let size_class = classify_rank(job.size_bytes, &self.size_classes);
         // Best-effort coalesce: fold into an already-active job for this key.
@@ -800,6 +840,8 @@ impl JobQueue for SqlJobQueue {
                 job.repo_id.provider.as_str(),
                 &job.repo_id.path,
                 &job.branch,
+                job.admitted_commit.as_deref(),
+                job.admitted_default_branch.as_deref(),
                 credential.as_deref(),
                 size_class,
                 now_secs(),
@@ -901,6 +943,8 @@ pub(crate) const CREATE_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS jobs (
     claimed_at INTEGER,
     finished_at INTEGER,
     error TEXT,
+    admitted_commit TEXT,
+    admitted_default_branch TEXT,
     credential TEXT,
     attempts INTEGER NOT NULL DEFAULT 0,
     size_class INTEGER NOT NULL DEFAULT 0
@@ -909,20 +953,22 @@ pub(crate) const CREATE_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS jobs (
 pub(crate) const CREATE_STATUS_INDEX_SQL: &str =
     "CREATE INDEX IF NOT EXISTS idx_jobs_status_created ON jobs(status, created_at)";
 
-/// Drop the older index that made (queued OR claimed) unique per key. That
-/// uniqueness blocked queuing a fresh build for a key whose previous build was
-/// already claimed (and had already fetched), so a push arriving mid-build was
-/// dropped until the next push. Best-effort.
+/// Drop the older active-key index before recreating the immutable-key
+/// constraint. Best-effort because fresh databases do not have it.
 pub(crate) const DROP_LEGACY_ACTIVE_KEY_INDEX_SQL: &str =
     "DROP INDEX IF EXISTS idx_jobs_active_key";
 
-/// Best-effort coalescing backstop: at most one *queued* build per key, so
-/// concurrent pushes collapse into one. A claimed build can coexist with a
-/// queued one, so a push that lands while a build is in flight gets its own
-/// queued job and builds the newer commit next.
+/// An older schema used this name for a queued-only index. Drop it before
+/// installing the active (queued + claimed) constraint.
+pub(crate) const DROP_LEGACY_QUEUED_KEY_INDEX_SQL: &str =
+    "DROP INDEX IF EXISTS idx_jobs_queued_key";
+
+/// Database-enforced coalescing backstop: at most one queued or claimed build
+/// per immutable key. A later admitted commit has a different key and remains
+/// a distinct job.
 pub(crate) const CREATE_ACTIVE_KEY_INDEX_SQL: &str =
-    "CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_queued_key
-     ON jobs(key) WHERE status = 'queued'";
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_active_key
+     ON jobs(key) WHERE status IN ('queued', 'claimed')";
 
 /// Index for the build/version history queries over retained `done` jobs
 /// ("what was synced for this repo over time").
@@ -934,6 +980,21 @@ pub(crate) const CREATE_HISTORY_INDEX_SQL: &str = "CREATE INDEX IF NOT EXISTS id
 /// fresh table, which is ignored). SQLite/libsql have no `ADD COLUMN IF NOT
 /// EXISTS`, hence best-effort; Postgres uses its own `IF NOT EXISTS` form.
 pub(crate) const ADD_CREDENTIAL_COLUMN_SQL: &str = "ALTER TABLE jobs ADD COLUMN credential TEXT";
+
+/// Migration for the immutable admission column. Active legacy rows are settled
+/// before the active-key index is created; workers never guess their target.
+pub(crate) const ADD_ADMITTED_COMMIT_COLUMN_SQL: &str =
+    "ALTER TABLE jobs ADD COLUMN admitted_commit TEXT";
+
+pub(crate) const ADD_ADMITTED_DEFAULT_BRANCH_COLUMN_SQL: &str =
+    "ALTER TABLE jobs ADD COLUMN admitted_default_branch TEXT";
+
+pub(crate) const SETTLE_LEGACY_ACTIVE_SQL: &str = "UPDATE jobs
+    SET status = 'failed', finished_at = CAST(strftime('%s','now') AS INTEGER),
+        error = 'legacy active job has no admitted commit; resubmit sync',
+        worker_id = NULL, credential = NULL
+    WHERE status IN ('queued', 'claimed')
+      AND (admitted_commit IS NULL OR admitted_commit = '')";
 
 /// Migration for a `jobs` table created before the `attempts` column existed.
 /// Best-effort like [`ADD_CREDENTIAL_COLUMN_SQL`]: errors "duplicate column" on
@@ -964,12 +1025,12 @@ pub(crate) const CREATE_WORKERS_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS wo
 pub(crate) const CREATE_WORKERS_HEARTBEAT_INDEX_SQL: &str =
     "CREATE INDEX IF NOT EXISTS idx_workers_last_heartbeat ON workers(last_heartbeat)";
 
-/// Terminal error when a claimed job cannot requeue because a newer job for the
-/// same key is already `queued` (push-during-build). The older claim is
-/// redundant — the newer job builds the tip — so we settle it instead of
-/// tripping the unique `idx_jobs_queued_key` and leaving the row stuck.
+/// Retained compatibility error for a legacy/repaired queue state where a
+/// claimed row encounters a queued sibling with the same key. New immutable
+/// active-key rows cannot reach that state because the database constraint
+/// covers both statuses.
 pub(crate) const SUPERSEDED_BY_NEWER_QUEUED: &str =
-    "superseded by newer queued job for the same repo/branch";
+    "superseded by newer queued job for the same active key";
 
 #[cfg(test)]
 mod tests {
@@ -979,10 +1040,21 @@ mod tests {
     use std::sync::Arc;
 
     fn job(owner: &str, repo: &str, branch: &str) -> BuildJob {
+        job_at(
+            owner,
+            repo,
+            branch,
+            "1111111111111111111111111111111111111111",
+        )
+    }
+
+    fn job_at(owner: &str, repo: &str, branch: &str, commit: &str) -> BuildJob {
         BuildJob {
             repo_id: RepoId::github(format!("{owner}/{repo}")),
             branch: branch.into(),
             rev: None,
+            admitted_commit: Some(commit.into()),
+            admitted_default_branch: None,
             credential: None,
             recheck: 0,
             size_bytes: None,
@@ -1041,6 +1113,11 @@ mod tests {
                 ("github", "o/r", "main"),
                 "{engine}"
             );
+            assert_eq!(
+                claimed.admitted_commit.as_deref(),
+                Some("1111111111111111111111111111111111111111"),
+                "{engine}: exact admission must survive claim"
+            );
             assert_eq!(q.depth().await, 0, "{engine}: claimed no longer queued");
             assert!(q.claim("w1").await.unwrap().is_none(), "{engine}");
 
@@ -1089,15 +1166,25 @@ mod tests {
             .unwrap();
         db.init().await.unwrap();
         let id = db
-            .insert_job("k", "github", "o/r", "main", Some("dG9rZW4="), 0, 1)
+            .insert_job(
+                "k",
+                "github",
+                "o/r",
+                "main",
+                None,
+                None,
+                Some("dG9rZW4="),
+                0,
+                1,
+            )
             .await
             .unwrap();
-        let (_, _, _, before) = db.job_fields(id).await.unwrap().unwrap();
+        let (_, _, _, _, _, before) = db.job_fields(id).await.unwrap().unwrap();
         assert_eq!(before.as_deref(), Some("dG9rZW4="));
         // finish is conditional on owning the claim: claim it as "w" first.
         assert!(db.try_claim(id, "w", 2).await.unwrap());
         assert!(db.finish(id, "w", "done", 3, None).await.unwrap());
-        let (_, _, _, after) = db.job_fields(id).await.unwrap().unwrap();
+        let (_, _, _, _, _, after) = db.job_fields(id).await.unwrap().unwrap();
         assert!(after.is_none(), "credential must be cleared on finish");
     }
 
@@ -1118,17 +1205,43 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        let legacy_id = sqlx::query(
+            "INSERT INTO jobs (key, provider, path, branch, status, created_at) \
+             VALUES ('legacy-key', 'github', 'o/legacy', 'main', 'queued', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
         pool.close().await;
 
         let db = SqliteDb::connect(&path.to_string_lossy()).await.unwrap();
         db.init().await.unwrap(); // adds credential / attempts / size_class columns
         db.init().await.unwrap(); // idempotent: best-effort ALTER ignores duplicate
+        assert_eq!(
+            db.status(legacy_id).await.unwrap(),
+            Some((
+                "failed".to_string(),
+                Some("legacy active job has no admitted commit; resubmit sync".to_string())
+            )),
+            "legacy active work must settle without guessing a source tip"
+        );
         // Inserting a credential now works because the column exists.
         let id = db
-            .insert_job("k", "github", "o/r", "main", Some("Y3JlZA=="), 0, 1)
+            .insert_job(
+                "k",
+                "github",
+                "o/r",
+                "main",
+                None,
+                None,
+                Some("Y3JlZA=="),
+                0,
+                1,
+            )
             .await
             .unwrap();
-        let (_, _, _, cred) = db.job_fields(id).await.unwrap().unwrap();
+        let (_, _, _, _, _, cred) = db.job_fields(id).await.unwrap().unwrap();
         assert_eq!(cred.as_deref(), Some("Y3JlZA=="));
         // size_class migration is load-bearing for stale-reclaim escalation.
         assert_eq!(
@@ -1219,52 +1332,60 @@ mod tests {
         }
     }
 
-    /// Push-during-build leaves a newer `queued` job for the same key. A
-    /// retryable requeue of the older claim must NOT trip the unique index and
-    /// stuck-claimed forever — it settles terminal "superseded" so the newer
-    /// job alone builds the tip.
+    /// A later immutable commit gets a distinct queued job. Retrying the older
+    /// claim remains valid because its exact key is distinct from the newer one.
     #[tokio::test]
-    async fn retryable_ack_supersedes_when_newer_job_already_queued() {
+    async fn retryable_ack_requeues_older_commit_when_later_commit_is_queued() {
         for (engine, q, _dir) in queues().await {
-            let first = q.enqueue(job("o", "r", "main")).await.unwrap();
+            let first = q
+                .enqueue(job_at(
+                    "o",
+                    "r",
+                    "main",
+                    "1111111111111111111111111111111111111111",
+                ))
+                .await
+                .unwrap();
             let old_id = first.job_id.unwrap();
             let claimed = q.claim("w1").await.unwrap().unwrap();
             assert_eq!(claimed.id, old_id, "{engine}");
 
-            // Push while build is in flight → fresh queued job for same key.
-            let second = q.enqueue(job("o", "r", "main")).await.unwrap();
+            // Push while build is in flight → a fresh queued job for commit C.
+            let second = q
+                .enqueue(job_at(
+                    "o",
+                    "r",
+                    "main",
+                    "2222222222222222222222222222222222222222",
+                ))
+                .await
+                .unwrap();
             assert_eq!(second.outcome, EnqueueOutcome::Enqueued, "{engine}");
             let new_id = second.job_id.unwrap();
             assert_ne!(old_id, new_id, "{engine}");
 
-            // Transient failure on the old claim: cannot requeue (unique key).
+            // The older immutable job can be retried independently.
             assert!(
                 q.ack(claimed.id, "w1", Err(BuildError::retryable("storage 503")))
                     .await
                     .unwrap(),
-                "{engine}: ack must settle (supersede), not error"
+                "{engine}: retryable ack should requeue the old exact job"
             );
-            match q.job_status(old_id).await.unwrap() {
-                JobState::Failed(e) => assert!(
-                    e.contains("superseded"),
-                    "{engine}: expected superseded, got {e:?}"
-                ),
-                other => panic!("{engine}: expected Failed(superseded), got {other:?}"),
-            }
-            // Newer job is still queued and claimable.
+            assert!(matches!(
+                q.job_status(old_id).await.unwrap(),
+                JobState::Pending
+            ));
             assert!(matches!(
                 q.job_status(new_id).await.unwrap(),
                 JobState::Pending
             ));
-            let next = q.claim("w2").await.unwrap().unwrap();
-            assert_eq!(next.id, new_id, "{engine}: only the newer job is claimed");
         }
     }
 
-    /// Same push-during-build setup: a hard-killed older claim must supersede
-    /// on stale-reclaim (not fail the whole reclaim batch on unique conflict).
+    /// A hard-killed claim for commit B is reclaimed without disturbing a
+    /// separately queued commit C for the same repo and branch.
     #[tokio::test]
-    async fn stale_reclaim_supersedes_when_newer_job_already_queued() {
+    async fn stale_reclaim_preserves_later_commit_job() {
         for engine in ["sqlite"] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("q.db").to_string_lossy().to_string();
@@ -1280,23 +1401,39 @@ mod tests {
                 heartbeat_timeout_secs: DEFAULT_HEARTBEAT_TIMEOUT_SECS,
             };
 
-            let first = q.enqueue(job("o", "r", "main")).await.unwrap();
+            let first = q
+                .enqueue(job_at(
+                    "o",
+                    "r",
+                    "main",
+                    "1111111111111111111111111111111111111111",
+                ))
+                .await
+                .unwrap();
             let old_id = first.job_id.unwrap();
             let _claimed = q.claim("w1").await.unwrap().unwrap();
-            let second = q.enqueue(job("o", "r", "main")).await.unwrap();
+            let second = q
+                .enqueue(job_at(
+                    "o",
+                    "r",
+                    "main",
+                    "2222222222222222222222222222222222222222",
+                ))
+                .await
+                .unwrap();
             let new_id = second.job_id.unwrap();
 
-            // Next claim reclaims the stale older row: must supersede it and
-            // hand out the newer queued job (not error, not stuck).
+            // Next claim reclaims the stale older row and returns it to queued;
+            // the newer exact job remains queued too.
             let next = q.claim("w2").await.unwrap().unwrap();
-            assert_eq!(next.id, new_id, "{engine}");
-            match q.job_status(old_id).await.unwrap() {
-                JobState::Failed(e) => assert!(
-                    e.contains("superseded"),
-                    "{engine}: expected superseded, got {e:?}"
-                ),
-                other => panic!("{engine}: expected Failed(superseded), got {other:?}"),
-            }
+            assert_eq!(
+                next.id, old_id,
+                "{engine}: stale B should be requeued first"
+            );
+            assert!(matches!(
+                q.job_status(new_id).await.unwrap(),
+                JobState::Pending
+            ));
         }
     }
 
@@ -1381,26 +1518,51 @@ mod tests {
         }
     }
 
-    /// A push that arrives while the prior build for the same key is already
-    /// claimed (and has already fetched) must get its own queued job, so the
-    /// newer commit is built next — not coalesced onto the in-flight build and
-    /// dropped. A second push while that fresh job is still queued does coalesce.
+    /// A duplicate exact admission coalesces even while the first job is
+    /// claimed. A later exact commit remains a distinct active job, and a
+    /// duplicate admission of that later commit coalesces onto it.
     #[tokio::test]
-    async fn enqueues_fresh_job_when_prior_is_claimed() {
+    async fn coalesces_claimed_exact_job_but_admits_later_commit() {
         for (engine, q, _dir) in queues().await {
-            q.enqueue(job("o", "r", "main")).await.unwrap();
+            let first = q
+                .enqueue(job_at(
+                    "o",
+                    "r",
+                    "main",
+                    "1111111111111111111111111111111111111111",
+                ))
+                .await
+                .unwrap();
             let _claimed = q.claim("w").await.unwrap().unwrap();
             assert_eq!(
                 q.enqueue(job("o", "r", "main")).await.unwrap().outcome,
-                EnqueueOutcome::Enqueued,
-                "{engine}: a push during an in-flight build gets its own queued job"
-            );
-            assert_eq!(q.depth().await, 1, "{engine}: one fresh queued job");
-            // A further push while that job is queued coalesces onto it.
-            assert_eq!(
-                q.enqueue(job("o", "r", "main")).await.unwrap().outcome,
                 EnqueueOutcome::Coalesced,
-                "{engine}: further pushes collapse into the queued job"
+                "{engine}: duplicate exact admission coalesces onto claimed work"
+            );
+            assert_eq!(q.depth().await, 0, "{engine}: the exact B job is claimed");
+            let later = q
+                .enqueue(job_at(
+                    "o",
+                    "r",
+                    "main",
+                    "2222222222222222222222222222222222222222",
+                ))
+                .await
+                .unwrap();
+            assert_eq!(later.outcome, EnqueueOutcome::Enqueued, "{engine}");
+            assert_ne!(first.job_id, later.job_id, "{engine}");
+            assert_eq!(
+                q.enqueue(job_at(
+                    "o",
+                    "r",
+                    "main",
+                    "2222222222222222222222222222222222222222",
+                ))
+                .await
+                .unwrap()
+                .outcome,
+                EnqueueOutcome::Coalesced,
+                "{engine}: duplicate C admission coalesces onto the queued job"
             );
             assert_eq!(q.depth().await, 1, "{engine}: still one queued job");
         }
@@ -2067,8 +2229,19 @@ mod tests {
         db.init().await.unwrap();
         db.init().await.unwrap(); // idempotent ALTER
         // Insert via QueueDb — requires the size_class column (rank 1 = large).
+        let admitted_commit = "1".repeat(40);
         let _id = db
-            .insert_job("k", "github", "o/r", "main", None, 1, 1)
+            .insert_job(
+                "k",
+                "github",
+                "o/r",
+                "main",
+                Some(&admitted_commit),
+                None,
+                None,
+                1,
+                1,
+            )
             .await
             .expect("insert after size_class migration");
         drop(db);
@@ -2078,17 +2251,16 @@ mod tests {
             .unwrap()
             .with_max_size_class(Some("small"))
             .unwrap();
-        assert!(
-            small.claim("w").await.unwrap().is_none(),
-            "migrated large-ranked job must be filtered from small workers"
-        );
-        drop(small);
-
         let large = SqlJobQueue::new_with_classes(make_db("sqlite", &path_s).await, two_classes())
             .await
             .unwrap()
             .with_max_size_class(Some("large"))
             .unwrap();
+        assert!(
+            small.claim("w").await.unwrap().is_none(),
+            "migrated large-ranked job must be filtered from small workers"
+        );
+        drop(small);
         assert_eq!(
             large.claim("w").await.unwrap().unwrap().path,
             "o/r",
