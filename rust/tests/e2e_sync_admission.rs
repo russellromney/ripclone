@@ -368,8 +368,10 @@ async fn e2e_sync_admission() {
 
     // Concurrent duplicates before claim: the production barrier keeps B in the
     // queue while both real HTTP handlers race their one independent probe.
-    let ((b_dup_one_status, b_dup_one, _), (b_dup_two_status, b_dup_two, _)) =
-        tokio::join!(post_sync(&server, None), post_sync(&server, None),);
+    let (
+        (b_dup_one_status, b_dup_one, b_dup_one_elapsed),
+        (b_dup_two_status, b_dup_two, b_dup_two_elapsed),
+    ) = tokio::join!(post_sync(&server, None), post_sync(&server, None),);
     assert_eq!(b_dup_one_status, reqwest::StatusCode::ACCEPTED);
     assert_eq!(response_commit(&b_dup_one), b);
     assert_eq!(b_dup_two_status, reqwest::StatusCode::ACCEPTED);
@@ -389,7 +391,8 @@ async fn e2e_sync_admission() {
 
     // Duplicate after the worker has claimed B but before source work still
     // coalesces to the same full immutable key.
-    let (b_dup_claimed_status, b_dup_claimed, _) = post_sync(&server, None).await;
+    let (b_dup_claimed_status, b_dup_claimed, b_dup_claimed_elapsed) =
+        post_sync(&server, None).await;
     assert_eq!(b_dup_claimed_status, reqwest::StatusCode::ACCEPTED);
     assert_eq!(response_commit(&b_dup_claimed), b);
     assert_eq!(
@@ -462,6 +465,17 @@ async fn e2e_sync_admission() {
         probe.tip_probes.load(std::sync::atomic::Ordering::SeqCst),
         tip_probes_before_webhook,
         "signed webhook replay must not perform a moving-tip probe"
+    );
+    eprintln!(
+        "admission_latencies_ms replay={} ready={} B={} dup_before_claim=[{},{}] dup_after_claim={} C={} webhook_phase1={}",
+        replay_elapsed.as_millis(),
+        ready_elapsed.as_millis(),
+        b_elapsed.as_millis(),
+        b_dup_one_elapsed.as_millis(),
+        b_dup_two_elapsed.as_millis(),
+        b_dup_claimed_elapsed.as_millis(),
+        c_elapsed.as_millis(),
+        b_phase1_elapsed.as_millis(),
     );
 
     // Release Full(B), then wait on the full-publication counter for both B and
