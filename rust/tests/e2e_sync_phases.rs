@@ -58,14 +58,21 @@ async fn cold_sync_reports_all_phase_timings() {
     init_bench();
     let server = start_server().await;
     let origin = make_origin("acme", "phasescold");
-    origin.commit(&[("README.md", "cold\n")], "c1");
+    let c1 = origin.commit(&[("README.md", "cold\n")], "c1");
     origin.publish();
     register_added_without_build(&server, "acme/phasescold")
         .await
         .expect("add repo");
 
     let client = reqwest::Client::new();
-    let sync_url = format!("{}/v1/repos/github/acme/phasescold/sync", server.url);
+    // Ordinary `/sync` is now an admission endpoint and returns 202 before
+    // phase timings exist. Keep this timing-specific regression on the
+    // explicitly pinned legacy route whose ready 200 payload still carries
+    // the detailed phase data.
+    let sync_url = format!(
+        "{}/v1/repos/github/acme/phasescold/sync?rev={c1}",
+        server.url
+    );
     let sync: ripclone::server::SyncResponse = client
         .post(&sync_url)
         .header("Authorization", format!("Ripclone {}", token_hash()))
@@ -81,29 +88,36 @@ async fn cold_sync_reports_all_phase_timings() {
     assert_all_phases_present(&sync.phases, "cold");
 }
 
-/// Poll `/sync` until the full clonepack manifest is published (phase 2 done),
-/// returning the full `SyncResponse` so callers can inspect phase timings.
+/// Poll the exact pinned metadata path until the full clonepack manifest is
+/// published (phase 2 done). This is the compatibility wait used after an
+/// accepted ordinary admission; it never repeats the moving `/sync` POST.
 async fn sync_response_until_manifest(
     client: &reqwest::Client,
     server: &Server,
     owner: &str,
     repo: &str,
-) -> ripclone::server::SyncResponse {
-    let url = format!("{}/v1/repos/github/{owner}/{repo}/sync", server.url);
+    commit: &str,
+) -> ripclone::client::RefResponse {
+    let url = format!(
+        "{}/v1/repos/github/{owner}/{repo}/refs/main%23{commit}?clonepack=full&pinned={commit}",
+        server.url
+    );
     for _ in 0..160 {
-        let resp: ripclone::server::SyncResponse = client
-            .post(&url)
+        let response = client
+            .get(&url)
             .header("Authorization", format!("Ripclone {}", token_hash()))
+            .header(
+                "x-ripclone-protocol",
+                ripclone::PROTOCOL_VERSION.to_string(),
+            )
             .send()
             .await
-            .expect("sync request")
-            .error_for_status()
-            .expect("sync 2xx")
-            .json()
-            .await
-            .expect("sync json");
-        if !resp.ref_info.clonepack_manifest.is_empty() {
-            return resp;
+            .expect("pinned ref request");
+        if response.status() == reqwest::StatusCode::OK {
+            let resp: ripclone::client::RefResponse = response.json().await.expect("ref json");
+            if !resp.clonepack_manifest.is_empty() {
+                return resp;
+            }
         }
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
@@ -115,14 +129,17 @@ async fn incremental_sync_reports_all_phase_timings() {
     init_bench();
     let server = start_server().await;
     let origin = make_origin("acme", "phasesinc");
-    origin.commit(&[("README.md", "v1\n")], "c1");
+    let c1 = origin.commit(&[("README.md", "v1\n")], "c1");
     origin.publish();
     register_added_without_build(&server, "acme/phasesinc")
         .await
         .expect("add repo");
 
     let client = reqwest::Client::new();
-    let sync_url = format!("{}/v1/repos/github/acme/phasesinc/sync", server.url);
+    let sync_url = format!(
+        "{}/v1/repos/github/acme/phasesinc/sync?rev={c1}",
+        server.url
+    );
 
     // Cold sync.
     let cold: ripclone::server::SyncResponse = client
@@ -141,11 +158,15 @@ async fn incremental_sync_reports_all_phase_timings() {
 
     // Let the background full-history build finish so the next sync's storage
     // amplification report includes history packs.
-    let _ = sync_response_until_manifest(&client, &server, "acme", "phasesinc").await;
+    let _ = sync_response_until_manifest(&client, &server, "acme", "phasesinc", &c1).await;
 
     // Incremental sync: add a commit and re-sync.
-    origin.commit(&[("README.md", "v2\n")], "c2");
+    let c2 = origin.commit(&[("README.md", "v2\n")], "c2");
     origin.publish();
+    let sync_url = format!(
+        "{}/v1/repos/github/acme/phasesinc/sync?rev={c2}",
+        server.url
+    );
     let inc: ripclone::server::SyncResponse = client
         .post(&sync_url)
         .header("Authorization", format!("Ripclone {}", token_hash()))

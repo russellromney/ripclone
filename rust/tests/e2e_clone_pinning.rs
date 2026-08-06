@@ -715,10 +715,6 @@ async fn pending_head_switches_pinned_polls_to_the_concrete_branch() {
 async fn real_server_pending_head_preserves_delimiter_branch_on_exact_poll() {
     let _guard = env_lock().lock().await;
     init(false);
-    unsafe {
-        std::env::set_var("RIPCLONE_TESTING", "1");
-        std::env::set_var("RIPCLONE_TEST_REF_POLL_MS", "0");
-    }
     let server = start_server_split_storage().await;
     let origin = make_origin("acme", "delimiter-branch");
     git(&origin.work, &["branch", "-m", "release#one"]);
@@ -743,6 +739,10 @@ async fn real_server_pending_head_preserves_delimiter_branch_on_exact_poll() {
         .expect("delimiter branch is ready before forcing the 202");
     assert_eq!(ready.commit, commit);
     assert_eq!(ready.branch, "release#one");
+    unsafe {
+        std::env::set_var("RIPCLONE_TESTING", "1");
+        std::env::set_var("RIPCLONE_TEST_REF_POLL_MS", "0");
+    }
 
     let (proxy, entered, proceed, requests, proxy_task) =
         start_ref_barrier_proxy(&server.url, false, true).await;
@@ -1261,6 +1261,13 @@ async fn overwritten_branch_metadata_returns_pending_for_the_pin_without_upstrea
         .expect("moving A response reached barrier")
         .expect("barrier alive");
 
+    // The install has already captured its bounded two-attempt poll config.
+    // Let the independent compatibility sync use its normal build wait, then
+    // restore the short config before releasing the pinned install.
+    unsafe {
+        std::env::remove_var("RIPCLONE_TEST_REF_MAX_ATTEMPTS");
+        std::env::remove_var("RIPCLONE_TEST_REF_POLL_MS");
+    }
     let b = origin.commit(&[("value.txt", "B\n")], "B");
     origin.publish();
     assert_ne!(a, b);
@@ -1269,6 +1276,10 @@ async fn overwritten_branch_metadata_returns_pending_for_the_pin_without_upstrea
         .sync_repo("acme/overwritten-pin", None)
         .await
         .expect("sync B");
+    unsafe {
+        std::env::set_var("RIPCLONE_TEST_REF_MAX_ATTEMPTS", "2");
+        std::env::set_var("RIPCLONE_TEST_REF_POLL_MS", "0");
+    }
 
     // Let B's archive publication finish before arming the request-path
     // adapter, so background ref-store reads cannot contaminate the exact

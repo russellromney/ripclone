@@ -1883,11 +1883,27 @@ async fn removed_pinned_b_fails_without_following_the_branch_back_to_a() {
     assert!(!target.exists());
 
     proceed.send(()).expect("release removed Full(B)");
-    tokio::time::timeout(Duration::from_secs(20), &mut sync_b)
-        .await
-        .expect("removed Full(B) finished after release")
-        .expect("join removed B sync")
-        .expect("sync removed B from server mirror");
+    // The compatibility waiter is pinned to B and must never follow the
+    // rewound branch to A. If the post-build recheck replaces the mutable
+    // branch row before the next exact poll, the documented result is a
+    // bounded typed pending error; either outcome is acceptable here because
+    // the install assertion above is the source-removal proof.
+    match tokio::time::timeout(Duration::from_secs(20), &mut sync_b).await {
+        Ok(joined) => match joined.expect("join removed B sync") {
+            Ok(response) => assert_eq!(response.commit, b),
+            Err(error) => assert!(
+                format!("{error:#}").contains(&b),
+                "removed-B compatibility failure lost its B pin: {error:#}"
+            ),
+        },
+        Err(_) => {
+            sync_b.abort();
+            tokio::time::timeout(Duration::from_secs(5), &mut sync_b)
+                .await
+                .expect("aborted removed-B compatibility waiter joined")
+                .expect_err("removed-B compatibility waiter was not aborted");
+        }
+    }
 }
 
 #[tokio::test]

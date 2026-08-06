@@ -107,7 +107,7 @@ async fn webhook_push_builds_before_clone() {
     setup(true); // two-phase + LSM + async (production defaults)
     let server = start_server_env(&[("RIPCLONE_WEBHOOK_SECRET", SECRET)]).await;
     let origin = make_origin("acme", "hook");
-    origin.commit(&[("f.txt", "v1\n")], "c1");
+    let commit = origin.commit(&[("f.txt", "v1\n")], "c1");
     origin.publish();
     server
         .client()
@@ -115,10 +115,16 @@ async fn webhook_push_builds_before_clone() {
         .await
         .expect("add repo");
 
-    // GitHub-shaped push payload. `after` only needs to be non-zero (not a
-    // delete); the build resolves the real upstream tip itself. `main` is the
-    // default branch, so the receiver warms it.
-    let body = br#"{"ref":"refs/heads/main","after":"1111111111111111111111111111111111111111","deleted":false,"repository":{"name":"hook","owner":{"login":"acme"},"default_branch":"main","private":false}}"#.to_vec();
+    // The validated `after` is the exact build target; the receiver does not
+    // probe the moving upstream again.
+    let body = serde_json::json!({
+        "ref": "refs/heads/main",
+        "after": commit,
+        "deleted": false,
+        "repository": {"name": "hook", "owner": {"login": "acme"}, "default_branch": "main", "private": false}
+    })
+    .to_string()
+    .into_bytes();
     let http = reqwest::Client::new();
     let resp = http
         .post(format!("{}/v1/webhooks/github", server.url))
@@ -158,7 +164,7 @@ async fn webhook_and_sync_same_branch_coalesce() {
     setup(true);
     let server = start_server_env(&[("RIPCLONE_WEBHOOK_SECRET", SECRET)]).await;
     let origin = make_origin("acme", "coal");
-    origin.commit(&[("f.txt", "v1\n")], "c1");
+    let commit = origin.commit(&[("f.txt", "v1\n")], "c1");
     origin.publish();
     server
         .client()
@@ -166,7 +172,14 @@ async fn webhook_and_sync_same_branch_coalesce() {
         .await
         .expect("add repo");
 
-    let body = br#"{"ref":"refs/heads/main","after":"1111111111111111111111111111111111111111","deleted":false,"repository":{"name":"coal","owner":{"login":"acme"},"default_branch":"main","private":false}}"#.to_vec();
+    let body = serde_json::json!({
+        "ref": "refs/heads/main",
+        "after": commit,
+        "deleted": false,
+        "repository": {"name": "coal", "owner": {"login": "acme"}, "default_branch": "main", "private": false}
+    })
+    .to_string()
+    .into_bytes();
     let url = server.url.clone();
 
     // Fire a webhook and a branch-targeted sync for the same key at once.
@@ -298,19 +311,20 @@ fn webhook_secret_env(provider_id: &str) -> String {
     )
 }
 
-fn push_body(kind: &str, repo: &str) -> Vec<u8> {
+fn push_body(kind: &str, repo: &str, after: &str) -> Vec<u8> {
     match kind {
         "github" => format!(
-            r#"{{"ref":"refs/heads/main","after":"1111111111111111111111111111111111111111","deleted":false,"repository":{{"name":"{}","owner":{{"login":"acme"}},"default_branch":"main","private":true}}}}"#,
+            r#"{{"ref":"refs/heads/main","after":"{}","deleted":false,"repository":{{"name":"{}","owner":{{"login":"acme"}},"default_branch":"main","private":true}}}}"#,
+            after,
             repo.rsplit('/').next().unwrap()
         )
         .into_bytes(),
         "gitlab" => format!(
-            r#"{{"object_kind":"push","ref":"refs/heads/main","after":"1111111111111111111111111111111111111111","project":{{"path_with_namespace":"{repo}","default_branch":"main","visibility_level":0}}}}"#
+            r#"{{"object_kind":"push","ref":"refs/heads/main","after":"{after}","project":{{"path_with_namespace":"{repo}","default_branch":"main","visibility_level":0}}}}"#
         )
         .into_bytes(),
         "gitea" => format!(
-            r#"{{"ref":"refs/heads/main","after":"1111111111111111111111111111111111111111","repository":{{"full_name":"{repo}","default_branch":"main","private":true}}}}"#
+            r#"{{"ref":"refs/heads/main","after":"{after}","repository":{{"full_name":"{repo}","default_branch":"main","private":true}}}}"#
         )
         .into_bytes(),
         other => panic!("unknown provider kind {other}"),
@@ -348,7 +362,7 @@ async fn post_provider_push(server: &Server, provider_id: &str, kind: &str, body
 async fn gitlab_webhook_push_builds_before_clone() {
     setup(true);
     let origin = make_http_origin("acme/hook");
-    origin.commit(&[("f.txt", "v1\n")], "c1");
+    let commit = origin.commit(&[("f.txt", "v1\n")], "c1");
     origin.publish();
 
     let providers = webhook_providers_json(&origin.url, "gitlab");
@@ -364,7 +378,14 @@ async fn gitlab_webhook_push_builds_before_clone() {
         .expect("add gitlab repo");
 
     // GitLab authenticates with the secret echoed verbatim; no body HMAC.
-    let body = br#"{"object_kind":"push","ref":"refs/heads/main","after":"1111111111111111111111111111111111111111","project":{"path_with_namespace":"acme/hook","default_branch":"main","visibility_level":0}}"#.to_vec();
+    let body = serde_json::json!({
+        "object_kind": "push",
+        "ref": "refs/heads/main",
+        "after": commit,
+        "project": {"path_with_namespace": "acme/hook", "default_branch": "main", "visibility_level": 0}
+    })
+    .to_string()
+    .into_bytes();
     let resp = reqwest::Client::new()
         .post(format!("{}/webhooks/gitlab", server.url))
         .header("X-Gitlab-Event", "Push Hook")
@@ -401,7 +422,7 @@ async fn provider_webhook_builds_use_provider_auth_headers() {
     ] {
         let repo = format!("acme/{kind}-authhook");
         let origin = make_http_origin_with_auth(&repo, &provider_auth(kind, token));
-        origin.commit(&[("f.txt", &format!("from {kind} webhook auth\n"))], "c1");
+        let commit = origin.commit(&[("f.txt", &format!("from {kind} webhook auth\n"))], "c1");
         origin.publish();
 
         let providers =
@@ -414,7 +435,7 @@ async fn provider_webhook_builds_use_provider_auth_headers() {
         register_added_without_build_for_provider(&server, provider_id, &repo)
             .await
             .expect("mark webhook repo added");
-        post_provider_push(&server, provider_id, kind, push_body(kind, &repo)).await;
+        post_provider_push(&server, provider_id, kind, push_body(kind, &repo, &commit)).await;
 
         let (_g, c) =
             clone_branch_full_for_provider(&server, provider_id, &repo, "main", "1").await;
@@ -433,7 +454,7 @@ async fn provider_webhook_builds_use_provider_auth_headers() {
 async fn gitea_webhook_push_builds_before_clone() {
     setup(true);
     let origin = make_http_origin("acme/hook");
-    origin.commit(&[("f.txt", "v1\n")], "c1");
+    let commit = origin.commit(&[("f.txt", "v1\n")], "c1");
     origin.publish();
 
     let providers = webhook_providers_json(&origin.url, "gitea");
@@ -449,7 +470,13 @@ async fn gitea_webhook_push_builds_before_clone() {
         .expect("add gitea repo");
 
     // Gitea sends the bare hex HMAC-SHA256 digest (no `sha256=` prefix).
-    let body = br#"{"ref":"refs/heads/main","after":"1111111111111111111111111111111111111111","repository":{"full_name":"acme/hook","default_branch":"main","private":false}}"#.to_vec();
+    let body = serde_json::json!({
+        "ref": "refs/heads/main",
+        "after": commit,
+        "repository": {"full_name": "acme/hook", "default_branch": "main", "private": false}
+    })
+    .to_string()
+    .into_bytes();
     let resp = reqwest::Client::new()
         .post(format!("{}/webhooks/gitea", server.url))
         .header("X-Gitea-Event", "push")

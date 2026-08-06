@@ -94,7 +94,7 @@ async fn sync_response_reports_phase_timings_and_status_reports_build_ms() {
         .add_repo("acme/synctiming")
         .await
         .expect("add synctiming");
-    origin.commit(&[("README.md", "sync timings\nupdated\n")], "c2");
+    let c2 = origin.commit(&[("README.md", "sync timings\nupdated\n")], "c2");
     origin.publish();
     let client = reqwest::Client::new();
     let before_metrics = client
@@ -109,7 +109,13 @@ async fn sync_response_reports_phase_timings_and_status_reports_build_ms() {
         .expect("metrics text");
     let before_publish_p1 =
         prometheus_value(&before_metrics, "ripclone_sync_publish_p1_ms_total").unwrap_or(0);
-    let sync_url = format!("{}/v1/repos/github/acme/synctiming/sync", server.url);
+    // Ordinary `/sync` now returns exact admission before build timing data
+    // exists. Exercise the unchanged explicit-revision ready payload for this
+    // phase-timing/metrics regression.
+    let sync_url = format!(
+        "{}/v1/repos/github/acme/synctiming/sync?rev={c2}",
+        server.url
+    );
     let sync_resp = client
         .post(&sync_url)
         .header("Authorization", format!("Ripclone {}", token_hash()))

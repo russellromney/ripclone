@@ -52,6 +52,8 @@ async fn sql_queue_farm_out_sync_then_clone() {
                         repo_id: c.repo_id(),
                         branch: c.branch,
                         rev: None,
+                        admitted_commit: c.admitted_commit,
+                        admitted_default_branch: c.admitted_default_branch,
                         credential: None,
                         recheck: 0,
                         size_bytes: None,

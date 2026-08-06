@@ -69,6 +69,44 @@ pub fn init(lsm: bool) {
     init_env(lsm);
 }
 
+/// Claim the exact job a SQL adapter test just admitted, settling unrelated
+/// rows that a shared lifecycle database may contain. The adapter gate runs
+/// after queue lifecycle unit tests, which intentionally leave synthetic rows
+/// behind; claiming globally must not make the e2e assertion depend on row
+/// ordering.
+pub async fn claim_exact_sql_job(
+    queue: &ripclone::queue::SqlJobQueue,
+    worker_id: &str,
+    expected_commit: &str,
+) -> ripclone::queue::ClaimedJob {
+    use ripclone::queue::BuildError;
+
+    for _ in 0..64 {
+        let claimed = queue
+            .claim(worker_id)
+            .await
+            .expect("claim SQL lifecycle row")
+            .expect("expected admitted SQL job in queue");
+        if claimed.admitted_commit.as_deref() == Some(expected_commit) {
+            return claimed;
+        }
+        assert!(
+            queue
+                .ack(
+                    claimed.id,
+                    worker_id,
+                    Err(BuildError::permanent(
+                        "settle unrelated lifecycle fixture row",
+                    )),
+                )
+                .await
+                .expect("settle unrelated SQL lifecycle row"),
+            "unrelated lifecycle row claim was lost",
+        );
+    }
+    panic!("admitted SQL job {expected_commit} was not claimed after draining stale rows");
+}
+
 pub fn token_hash() -> String {
     hex::encode(Sha256::digest(TOKEN.as_bytes()))
 }
@@ -707,7 +745,11 @@ async fn start_server_split_storage_inner(
     let worker_state = state.clone();
     let worker_probe = Arc::clone(&pinned_path_probe);
     tokio::spawn(async move {
-        while let Some(job) = rx.recv().await {
+        loop {
+            ripclone::server::admission_test_before_claim().await;
+            let Some(job) = rx.recv().await else {
+                break;
+            };
             if worker_probe.is_armed() {
                 worker_probe
                     .builder_entries
@@ -715,12 +757,8 @@ async fn start_server_split_storage_inner(
             }
             let state = worker_state.clone();
             tokio::spawn(async move {
-                let key = format!(
-                    "{}/{}#{}",
-                    job.repo_id.storage_key(),
-                    job.branch,
-                    job.rev.as_deref().unwrap_or("")
-                );
+                ripclone::server::admission_test_after_claim().await;
+                let key = job.key();
                 let st = state.clone();
                 let result = match tokio::spawn(async move {
                     ripclone::server::process_build_job(&st, &job).await
@@ -735,8 +773,21 @@ async fn start_server_split_storage_inner(
                 state
                     .build_queue_depth
                     .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                if let Some(senders) = state.build_waiters.lock().await.remove(&key) {
+                let keep_marker = matches!(
+                    &result,
+                    Ok(result)
+                        if result.info.build_status.as_deref()
+                            == Some("full history building")
+                );
+                if !keep_marker && let Some(senders) = state.build_waiters.lock().await.remove(&key)
+                {
                     for sender in senders {
+                        let _ = sender.send(result.clone());
+                    }
+                } else if keep_marker
+                    && let Some(senders) = state.build_waiters.lock().await.get_mut(&key)
+                {
+                    for sender in senders.drain(..) {
                         let _ = sender.send(result.clone());
                     }
                 }
@@ -1625,6 +1676,16 @@ async fn register_added_without_build_repo_id(
 
         let url = std::env::var("RIPCLONE_METADATA_DB_URL")?;
         return SqlRefStore::new(Box::new(SqliteMeta::connect(&url).await?))
+            .await?
+            .add_repo(&added)
+            .await;
+    }
+    if std::env::var("RIPCLONE_METADATA").ok().as_deref() == Some("libsql") {
+        use ripclone::meta::{LibsqlMeta, SqlRefStore};
+
+        let url = std::env::var("RIPCLONE_METADATA_DB_URL")?;
+        let token = std::env::var("RIPCLONE_METADATA_DB_TOKEN")?;
+        return SqlRefStore::new(Box::new(LibsqlMeta::connect_remote(&url, &token).await?))
             .await?
             .add_repo(&added)
             .await;

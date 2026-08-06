@@ -2,12 +2,12 @@
 //! non-coalesced** syncs for the **same repository** run without interleaving
 //! corruption.
 //!
-//! Coalescing collapses concurrent syncs for the *same* key (`repo/branch`) into
-//! one build — the easy case, covered elsewhere. The hard case, and the whole
-//! point of this effort, is *distinct* builds for one repo running at once over
-//! one shared bare mirror: they exercise the shrunk per-repo lock (fetch +
-//! commit-graph serialized; the heavy pack/archive/history build runs lock-free)
-//! and the full clonepack pipeline under real concurrency.
+//! Same exact admissions coalesce, while distinct admitted commits remain
+//! independent builds for one repo over one shared bare mirror. The hard case,
+//! and the whole point of this effort, is those distinct builds running at once:
+//! they exercise the shrunk per-repo lock (fetch + commit-graph serialized; the
+//! heavy pack/archive/history build runs lock-free) and the full clonepack
+//! pipeline under real concurrency.
 //!
 //! We force genuine concurrency with **distinct branches of one repo** (each is
 //! its own ref + clonepack, so they don't coalesce and are independently
@@ -214,12 +214,11 @@ async fn concurrent_builds_during_tip_advancing_fetch_stay_correct() {
 }
 
 /// The fast-moving-repo case on a SINGLE branch: commits land in quick
-/// succession while syncs fire. Concurrent same-branch syncs coalesce (one build
-/// at a time), but the churn still overlaps a build's read of the mirror with the
-/// next sync's fetch + the prior build's background phase 2. The system must
-/// never corrupt and must converge to the final commit with full, correct
-/// history. (Per-commit intermediate states aren't separately retrievable —
-/// the server keeps one entry per branch — so we assert convergence + integrity.)
+/// succession while sync admissions fire. Each observed exact commit is allowed
+/// to remain its own immutable job, so this test uses the fast admission API for
+/// the churn and reserves the readiness-oriented compatibility call for the
+/// settled final tip. The system must never corrupt and must converge to the
+/// final commit with full, correct history.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fast_moving_single_branch_converges_and_stays_correct() {
     unsafe { std::env::set_var("RIPCLONE_BUILD_CONCURRENCY", "8") };
@@ -244,18 +243,23 @@ async fn fast_moving_single_branch_converges_and_stays_correct() {
                 .await
                 .expect("add fast");
         }
-        // Fire a sync without waiting, so it overlaps later commits/fetches.
+        // Fire an admission without waiting for artifact readiness, so it
+        // overlaps later commits/fetches without making an intermediate exact
+        // target impossible to observe after the branch advances again.
         let client = server.client();
         handles.push(tokio::spawn(async move {
-            client.sync_repo("acme/fast", None).await
+            client.admit_sync_repo("acme/fast", None).await
         }));
     }
-    // Drain the in-flight syncs; intermediate results vary (each returns whatever
-    // tip was current), so we don't assert on them — only that none errored.
+    // Drain the in-flight admissions; each response must identify the exact
+    // target accepted for that request, but no intermediate target is required
+    // to remain the branch's final row after later commits publish.
     for h in handles {
-        h.await
+        let admission = h
+            .await
             .expect("join")
-            .unwrap_or_else(|e| panic!("churn sync failed: {e}"));
+            .unwrap_or_else(|e| panic!("churn admission failed: {e}"));
+        assert!(!admission.commit.is_empty());
     }
 
     // One clean sync of the settled tip, then verify convergence + integrity:

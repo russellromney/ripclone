@@ -11,11 +11,13 @@ mod common;
 use anyhow::{Context, Result};
 use common::*;
 use ripclone::provider::RepoId;
+use ripclone::ref_store::{AddedRepo, AddedRepoSource, RefStore, S3RefStore};
 use sqlx::Row;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -394,6 +396,9 @@ async fn worker_kill_mid_build_reclaims_libsql_queue_and_metadata() {
     let origin = make_origin("acme", "recover-libsql");
     let want = origin.commit(&[("a.txt", "recovered\n")], "c1");
     origin.publish();
+    register_added_without_build(&server, "acme/recover-libsql")
+        .await
+        .expect("add libsql recovery repo");
 
     let worker1 = spawn_worker(&server.cas_dir, &server.repo_root);
     let client = server.client();
@@ -651,5 +656,23 @@ async fn worker_kill_mid_build_reclaims_s3_storage_and_metadata() {
     let want = origin.commit(&[("a.txt", "recovered\n")], "c1");
     origin.publish();
 
+    let s3_storage = ripclone::storage::S3Storage::from_env()
+        .expect("open S3 metadata storage")
+        .expect("S3 metadata storage configured");
+    let s3_refs = S3RefStore::new(Arc::new(s3_storage));
+    let added = AddedRepo {
+        repo_id: RepoId::github("acme/recover-s3"),
+        added_at: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+        history_enabled: true,
+        source: AddedRepoSource::Api,
+        repo_size_bytes: None,
+    };
+    s3_refs
+        .add_repo(&added)
+        .await
+        .expect("add S3 metadata repo");
     recover_after_killed_worker_with_sqlite_queue(&queue_db, &server, "recover-s3", &want).await;
 }
