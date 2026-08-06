@@ -92,7 +92,12 @@ enum Commands {
         ttl_days: u64,
     },
     /// Make a repo available and admit its exact first build; returns fast.
-    Add { repo: String },
+    Add {
+        repo: String,
+        /// Wait for the admitted commit's Full artifacts before returning.
+        #[arg(long)]
+        wait: bool,
+    },
     /// Admit the exact branch tip for a background sync; returns fast unless --at is used.
     Sync {
         repo: String,
@@ -105,6 +110,9 @@ enum Commands {
         /// Lets you exercise the incremental path without upstream advancing.
         #[arg(long)]
         at: Option<String>,
+        /// Wait for the admitted commit's Full artifacts before returning.
+        #[arg(long)]
+        wait: bool,
     },
     /// Clone a repo using a snapshot and a background sidecar.
     Clone {
@@ -1133,7 +1141,7 @@ async fn main() -> Result<()> {
                 );
             }
         },
-        Commands::Add { repo } => {
+        Commands::Add { repo, wait } => {
             let (provider, repo_path) = resolve_repo(&repo, &default_provider, &provider_registry)?;
             let upstream_token =
                 resolve_upstream_token(&provider, args.token.as_deref(), &provider_registry)
@@ -1141,17 +1149,27 @@ async fn main() -> Result<()> {
             let client = client
                 .with_provider(&provider)
                 .with_upstream_token_opt(upstream_token);
-            let admission = client.admit_add_repo(&repo_path).await?;
-            if admission.accepted {
-                println!("added {}; accepted {}", repo_path, admission.commit);
+            if wait {
+                let info = client.add_repo(&repo_path).await?;
+                println!("added {} at {}", repo_path, info.commit);
             } else {
-                println!(
-                    "added {}; already current at {}",
-                    repo_path, admission.commit
-                );
+                let admission = client.admit_add_repo(&repo_path).await?;
+                if admission.accepted {
+                    println!("added {}; accepted {}", repo_path, admission.commit);
+                } else {
+                    println!(
+                        "added {}; already current at {}",
+                        repo_path, admission.commit
+                    );
+                }
             }
         }
-        Commands::Sync { repo, depth, at } => {
+        Commands::Sync {
+            repo,
+            depth,
+            at,
+            wait,
+        } => {
             let (provider, repo_path) = resolve_repo(&repo, &default_provider, &provider_registry)?;
             let upstream_token =
                 resolve_upstream_token(&provider, args.token.as_deref(), &provider_registry)
@@ -1162,6 +1180,9 @@ async fn main() -> Result<()> {
             let depth = depth.or(config.clone.depth);
             if let Some(at) = at.as_deref() {
                 let info = client.sync_repo_at(&repo_path, Some(at), depth).await?;
+                println!("synced {} to {}", repo_path, info.commit);
+            } else if wait {
+                let info = client.sync_repo(&repo_path, depth).await?;
                 println!("synced {} to {}", repo_path, info.commit);
             } else {
                 let admission = client.admit_sync_repo(&repo_path, depth).await?;

@@ -93,7 +93,7 @@ async fn agent_mode_defaults_to_depth1_and_is_explicit() {
             cwd.path(),
             &server.url,
             true,
-            &["add", "acme/fleet"],
+            &["add", "acme/fleet", "--wait"],
         )
         .await,
     );
@@ -105,7 +105,7 @@ async fn agent_mode_defaults_to_depth1_and_is_explicit() {
             cwd.path(),
             &server.url,
             true,
-            &["sync", "acme/fleet"],
+            &["sync", "acme/fleet", "--wait"],
         )
         .await,
     );
@@ -208,7 +208,7 @@ async fn agent_files_mode_fleet_clone_is_correct() {
             cwd.path(),
             &server.url,
             true,
-            &["add", "acme/worktree"],
+            &["add", "acme/worktree", "--wait"],
         )
         .await,
     );
@@ -220,7 +220,7 @@ async fn agent_files_mode_fleet_clone_is_correct() {
             cwd.path(),
             &server.url,
             true,
-            &["sync", "acme/worktree"],
+            &["sync", "acme/worktree", "--wait"],
         )
         .await,
     );

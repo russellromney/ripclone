@@ -40,6 +40,17 @@ already current at <commit>
 admission path. It also returns after ready detection or queue acceptance, not
 after the builder finishes.
 
+The CLI's `add` and `sync` commands are fast by default. A script that needs
+the historical readiness-oriented behavior can pass `--wait`:
+
+```text
+ripclone add owner/repo --wait
+ripclone sync owner/repo --wait
+```
+
+`--wait` performs the one admission request, then polls the exact pinned
+metadata path below. It never repeats a moving `POST /add` or `POST /sync`.
+
 ## Exact identity and workers
 
 Active work is keyed by repository storage key, branch, and full admitted
@@ -77,8 +88,9 @@ GET /v1/repos/<provider>/<repo>/refs/<branch>?pinned=<B>&clonepack=full
 ```
 
 They do not repeat a moving `POST /sync` or `POST /add`, re-resolve the branch,
-or create another job. Callers that only need admission can use the client's
-admission methods or the normal CLI commands.
+or create another job. The CLI `--wait` forms use these same compatibility
+methods; callers that only need admission can use the client's admission
+methods or the normal CLI commands.
 
 ## `sync --at REV`
 

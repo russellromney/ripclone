@@ -108,7 +108,7 @@ async fn provider_add_then_config_driven_clone() {
         home.path(),
         project.path(),
         Some(&server.url),
-        &["add", "acme/provider_add"],
+        &["add", "acme/provider_add", "--wait"],
     )
     .await;
     assert!(
@@ -123,7 +123,7 @@ async fn provider_add_then_config_driven_clone() {
         home.path(),
         project.path(),
         Some(&server.url),
-        &["sync", "acme/provider_add"],
+        &["sync", "acme/provider_add", "--wait"],
     )
     .await;
     assert!(

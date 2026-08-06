@@ -88,7 +88,7 @@ async fn global_config_defaults_and_cli_overrides() {
         home.path(),
         cwd.path(),
         &server.url,
-        &["add", "acme/config"],
+        &["add", "acme/config", "--wait"],
     )
     .await;
     assert!(
@@ -104,7 +104,7 @@ async fn global_config_defaults_and_cli_overrides() {
         home.path(),
         cwd.path(),
         &server.url,
-        &["sync", "acme/config"],
+        &["sync", "acme/config", "--wait"],
     )
     .await;
     assert!(

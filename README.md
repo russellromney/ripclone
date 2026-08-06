@@ -260,7 +260,12 @@ ripclone clone owner/repo --bench
 # Admit/refresh the exact branch tip on the server; ordinary sync returns fast
 ripclone sync owner/repo
 ripclone sync owner/repo --depth 1             # shallow mirror
+ripclone sync owner/repo --wait                # wait for exact Full readiness
 ripclone sync owner/repo --at HEAD~5           # build at a past rev
+
+# Register and admit a repo; add is fast unless --wait is requested
+ripclone add owner/repo
+ripclone add owner/repo --wait                 # wait for exact Full readiness
 
 # Add a fast worktree inside an existing clone (experimental, alpha)
 ripclone worktree ../wt -b HEAD
