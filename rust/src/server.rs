@@ -174,7 +174,11 @@ pub struct AdmissionTestProbe {
     pub artifact_uploads: AtomicUsize,
     pub fetch_targets: StdMutex<Vec<String>>,
     pub builder_targets: StdMutex<Vec<String>>,
+    pub failure_targets: StdMutex<Vec<(String, String)>>,
+    pub http_trace: StdMutex<Vec<String>>,
     full_notify: Arc<tokio::sync::Notify>,
+    failure_notify: Arc<tokio::sync::Notify>,
+    http_notify: Arc<tokio::sync::Notify>,
 }
 
 impl Default for AdmissionTestProbe {
@@ -196,7 +200,11 @@ impl Default for AdmissionTestProbe {
             artifact_uploads: AtomicUsize::new(0),
             fetch_targets: StdMutex::new(Vec::new()),
             builder_targets: StdMutex::new(Vec::new()),
+            failure_targets: StdMutex::new(Vec::new()),
+            http_trace: StdMutex::new(Vec::new()),
             full_notify: Arc::new(tokio::sync::Notify::new()),
+            failure_notify: Arc::new(tokio::sync::Notify::new()),
+            http_notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 }
@@ -207,6 +215,38 @@ impl AdmissionTestProbe {
             let notified = self.full_notify.notified();
             if self.full_publishes.load(Ordering::SeqCst) >= count {
                 break;
+            }
+            notified.await;
+        }
+    }
+
+    pub async fn wait_until_failure(&self, count: usize) {
+        loop {
+            let notified = self.failure_notify.notified();
+            if self
+                .failure_targets
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len()
+                >= count
+            {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    pub async fn wait_until_http_trace_len(&self, count: usize) {
+        loop {
+            let notified = self.http_notify.notified();
+            if self
+                .http_trace
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len()
+                >= count
+            {
+                return;
             }
             notified.await;
         }
@@ -320,6 +360,28 @@ fn admission_test_full_published(commit: &str) {
         probe.full_publishes.fetch_add(1, Ordering::SeqCst);
         probe.full_notify.notify_waiters();
         tracing::debug!("admission test observed full publication for {commit}");
+    }
+}
+
+fn admission_test_build_failure(commit: Option<&str>, message: &str) {
+    if let Some(probe) = admission_test_probe() {
+        probe
+            .failure_targets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((commit.unwrap_or_default().to_string(), message.to_string()));
+        probe.failure_notify.notify_waiters();
+    }
+}
+
+fn admission_test_http(event: String) {
+    if let Some(probe) = admission_test_probe() {
+        probe
+            .http_trace
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(event);
+        probe.http_notify.notify_waiters();
     }
 }
 
@@ -2359,6 +2421,7 @@ async fn dispatch_repos_post(
 ) -> impl IntoResponse {
     if path.ends_with("/add") {
         let repo_path = path.strip_suffix("/add").unwrap();
+        admission_test_http(format!("POST /v1/repos/{repo_path}/add"));
         let Some((repo_id, provider)) = resolve_repo_id(&state.provider_registry, repo_path) else {
             return unknown_provider_response();
         };
@@ -2384,6 +2447,7 @@ async fn dispatch_repos_post(
 
     if path.ends_with("/sync") {
         let repo_path = path.strip_suffix("/sync").unwrap();
+        admission_test_http(format!("POST /v1/repos/{repo_path}/sync"));
         let Some((repo_id, provider)) = resolve_repo_id(&state.provider_registry, repo_path) else {
             return unknown_provider_response();
         };
@@ -3239,6 +3303,13 @@ async fn get_ref_inner(
             }),
         )
             .into_response();
+    }
+    if let Some(pinned) = params.pinned.as_deref() {
+        admission_test_http(format!(
+            "GET /v1/repos/{}/refs/{branch}?pinned={pinned}&clonepack={}",
+            repo_id.storage_key(),
+            params.clonepack
+        ));
     }
     let protocol_v2 = request_protocol(&headers) == Some(2);
     if params.pinned.is_some() && !protocol_v2 {
@@ -4263,43 +4334,21 @@ async fn sync_repo_inner(
 
     let start = Instant::now();
     let requested_branch = params.branch;
-    let provider_probe = provider.clone();
-    let repo_probe = repo_id.clone();
-    let branch_probe = requested_branch.clone();
-    let credential_probe = credential.clone();
     admission_test_tip_probe();
     let tip = {
         let _permit = fetch_semaphore()
             .acquire()
             .await
             .expect("fetch semaphore never closed");
-        tokio::task::spawn_blocking(move || {
-            git::ls_remote_tip(
-                &provider_probe,
-                &repo_probe,
-                &branch_probe,
-                credential_probe.as_ref(),
-            )
-        })
-        .await
+        git::ls_remote_tip_async(&provider, &repo_id, &requested_branch, credential.as_ref()).await
     };
     let tip = match tip {
-        Ok(Ok(Some(tip))) => tip,
-        Ok(Ok(None)) => {
+        Ok(Some(tip)) => tip,
+        Ok(None) => {
             return (
                 StatusCode::NOT_FOUND,
                 Json(ErrorResponse {
                     error: format!("upstream ref not found: {requested_branch}"),
-                }),
-            )
-                .into_response();
-        }
-        Ok(Err(e)) => {
-            state.metrics.record_error();
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(ErrorResponse {
-                    error: format!("upstream tip probe failed: {e:#}"),
                 }),
             )
                 .into_response();
@@ -4309,7 +4358,7 @@ async fn sync_repo_inner(
             return (
                 StatusCode::BAD_GATEWAY,
                 Json(ErrorResponse {
-                    error: format!("upstream tip probe task failed: {e}"),
+                    error: format!("upstream tip probe failed: {e:#}"),
                 }),
             )
                 .into_response();
@@ -5231,36 +5280,21 @@ async fn build_handler(
         Ok(c) => c,
         Err(e) => return credential_error_response(e),
     };
-    let provider_probe = provider.clone();
-    let repo_probe = job_repo_id.clone();
     admission_test_tip_probe();
     let tip = {
         let _permit = fetch_semaphore()
             .acquire()
             .await
             .expect("fetch semaphore never closed");
-        tokio::task::spawn_blocking(move || {
-            git::ls_remote_tip(&provider_probe, &repo_probe, "HEAD", credential.as_ref())
-        })
-        .await
+        git::ls_remote_tip_async(&provider, &job_repo_id, "HEAD", credential.as_ref()).await
     };
     let tip = match tip {
-        Ok(Ok(Some(tip))) => tip,
-        Ok(Ok(None)) => {
+        Ok(Some(tip)) => tip,
+        Ok(None) => {
             return (
                 StatusCode::NOT_FOUND,
                 Json(ErrorResponse {
                     error: "upstream HEAD has no commit".to_string(),
-                }),
-            )
-                .into_response();
-        }
-        Ok(Err(e)) => {
-            state.metrics.record_error();
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(ErrorResponse {
-                    error: format!("upstream HEAD probe failed: {e:#}"),
                 }),
             )
                 .into_response();
@@ -5270,7 +5304,7 @@ async fn build_handler(
             return (
                 StatusCode::BAD_GATEWAY,
                 Json(ErrorResponse {
-                    error: format!("upstream HEAD probe task failed: {e}"),
+                    error: format!("upstream HEAD probe failed: {e:#}"),
                 }),
             )
                 .into_response();
@@ -6955,10 +6989,6 @@ async fn do_sync(
     // Legacy fallback: any ls-remote error falls through to the normal fetch
     // below. Ordinary admissions never enter this worker-side probe.
     if at_rev.is_none() && admitted_commit.is_none() {
-        let provider_ls = provider.clone();
-        let repo_id_ls = repo_id.clone();
-        let branch_ls = branch.to_string();
-        let credential_ls = credential.cloned();
         // ls-remote is an upstream round-trip, so it lives under the same fetch cap
         // as a real fetch — otherwise a thundering herd of no-op syncs is exactly
         // the uncapped upstream chatter the cap exists to prevent. Held only across
@@ -6969,16 +6999,7 @@ async fn do_sync(
                 .acquire()
                 .await
                 .expect("fetch semaphore never closed");
-            tokio::task::spawn_blocking(move || {
-                git::ls_remote_commit(
-                    &provider_ls,
-                    &repo_id_ls,
-                    &branch_ls,
-                    credential_ls.as_ref(),
-                )
-            })
-            .await
-            .unwrap_or(Ok(None))
+            git::ls_remote_commit_async(provider, repo_id, branch, credential).await
         };
         if let Ok(Some(tip)) = tip
             && let Some(prev) =
@@ -7562,25 +7583,12 @@ async fn build_and_publish_two_phase(
                 if prev_commit != commit && new_gen < prev_gen
         );
     if rewound_to_shallower {
-        let provider_rc = provider.clone();
-        let repo_id_rc = repo_id.clone();
-        let branch_rc = branch.to_string();
-        let credential_rc = credential.cloned();
         let upstream_tip = {
             let _probe_permit = fetch_semaphore()
                 .acquire()
                 .await
                 .expect("fetch semaphore never closed");
-            tokio::task::spawn_blocking(move || {
-                git::ls_remote_commit(
-                    &provider_rc,
-                    &repo_id_rc,
-                    &branch_rc,
-                    credential_rc.as_ref(),
-                )
-            })
-            .await
-            .unwrap_or(Ok(None))
+            git::ls_remote_commit_async(provider, repo_id, branch, credential).await
         };
         if let Ok(Some(tip)) = upstream_tip
             && tip == commit
@@ -8439,7 +8447,7 @@ pub async fn process_build_job(
     }
 
     // Mark as building in the shared metadata store.
-    if let Err(e) = update_current_build_status(state, repo_id, branch, "building").await {
+    if let Err(e) = update_job_build_status(state, job, branch, "building").await {
         error!(
             "build status update failed for {}@{branch}: {e:#}",
             repo_id.storage_key()
@@ -8452,7 +8460,7 @@ pub async fn process_build_job(
     let provider = match state.provider_registry.get(repo_id.provider.as_str()) {
         Some(p) => p.clone(),
         None => {
-            if let Err(e) = update_current_build_status(state, repo_id, branch, "error").await {
+            if let Err(e) = update_job_build_status(state, job, branch, "error").await {
                 error!(
                     "build status update failed for {}@{branch}: {e:#}",
                     repo_id.storage_key()
@@ -8627,10 +8635,11 @@ pub async fn process_build_job(
             // `/status` look terminal while the queue still has the job — the
             // stale-until-repushed mode A7 was meant to kill.
             let classified = classify_build_error(e);
+            admission_test_build_failure(job.admitted_commit.as_deref(), classified.message());
             if let Some(status) = terminal_metadata_status(&classified) {
                 state.metrics.record_build_failed();
                 if let Err(status_err) =
-                    update_current_build_status(state, repo_id, &effective_branch, &status).await
+                    update_job_build_status(state, job, &effective_branch, &status).await
                 {
                     error!(
                         "build status update failed for {}@{effective_branch}: {status_err:#}",
@@ -8837,17 +8846,11 @@ async fn post_build_freshness_recheck(
 
     // One bounded ls-remote round-trip, under the same cap as a real fetch.
     let tip = {
-        let provider_ls = provider.clone();
-        let repo_id_ls = repo_id.clone();
-        let branch_ls = branch.clone();
         let _permit = fetch_semaphore()
             .acquire()
             .await
             .expect("fetch semaphore never closed");
-        let probe = tokio::task::spawn_blocking(move || {
-            git::ls_remote_tip(&provider_ls, &repo_id_ls, &branch_ls, credential.as_ref())
-        });
-        probe.await.unwrap_or(Ok(None))
+        git::ls_remote_tip_async(provider, repo_id, branch, credential.as_ref()).await
     };
     let Ok(Some(tip)) = tip else {
         return;
@@ -9082,9 +9085,6 @@ pub async fn poll_once(state: &ServerState) -> usize {
         for branch in branches {
             // Cheap tip probe, under the same fetch cap as a real fetch so a sweep
             // can't become uncapped upstream chatter. Best-effort.
-            let provider_ls = provider.clone();
-            let repo_ls = repo_id.clone();
-            let branch_ls = branch.clone();
             let credential = match state.broker.fetch_credential(&repo_id, None) {
                 Ok(c) => c,
                 Err(e) => {
@@ -9100,11 +9100,7 @@ pub async fn poll_once(state: &ServerState) -> usize {
                     .acquire()
                     .await
                     .expect("fetch semaphore never closed");
-                tokio::task::spawn_blocking(move || {
-                    git::ls_remote_tip(&provider_ls, &repo_ls, &branch_ls, credential.as_ref())
-                })
-                .await
-                .unwrap_or(Ok(None))
+                git::ls_remote_tip_async(&provider, &repo_id, &branch, credential.as_ref()).await
             };
             let Ok(Some(tip)) = tip else {
                 continue; // unknown ref / probe failed
@@ -9183,6 +9179,26 @@ async fn update_build_status(
                 repo_id.storage_key()
             )
         })
+}
+
+/// Status writes for immutable ordinary jobs are fenced by their admitted
+/// commit. A B job that fails before publication must not mark the previously
+/// served A row (or a later C row) as building/failed. Historical `rev` jobs do
+/// not carry a pre-resolved object identity and retain their existing behavior.
+async fn update_job_build_status(
+    state: &ServerState,
+    job: &BuildJob,
+    branch: &str,
+    status: &str,
+) -> Result<Option<String>> {
+    if job.rev.is_none()
+        && let Some(commit) = job.admitted_commit.as_deref()
+    {
+        return update_build_status(state, &job.repo_id, branch, commit, status)
+            .await
+            .map(|updated| updated.then(|| commit.to_string()));
+    }
+    update_current_build_status(state, &job.repo_id, branch, status).await
 }
 
 async fn update_current_build_status(
@@ -11057,6 +11073,105 @@ mod tests {
             state.build_waiters.lock().await.is_empty(),
             "queue rejection must release the exact local marker"
         );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn oidc_build_wakeup_ignores_body_target_and_admits_one_probed_head() {
+        use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+
+        let _lock = crate::git::ORIGIN_BASE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let origin_base = tempfile::tempdir().unwrap();
+        let origin_path = origin_base.path().join("acme").join("widget.git");
+        std::fs::create_dir_all(origin_path.parent().unwrap()).unwrap();
+        let origin = crate::test_fixture::init_bare(&origin_path);
+        let head = crate::test_fixture::commit(&origin, &[("f.txt", b"HEAD\n")]);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut state, mut rx) = test_state_with_queue(&tmp);
+        mark_added(&state, RepoId::github("acme/widget")).await;
+        const AUDIENCE: &str = "ripclone-test-audience";
+        const KID: &str = "ripclone-test-kid";
+        state.oidc_verifier = Some(crate::oidc::OidcVerifier::new_for_test(
+            AUDIENCE.to_string(),
+            KID,
+            crate::auth::broker::tests::TEST_PUBLIC_KEY.as_bytes(),
+        ));
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let claims = serde_json::json!({
+            "sub": "repo:acme/widget:ref:refs/heads/main",
+            "iss": "https://token.actions.githubusercontent.com",
+            "aud": AUDIENCE,
+            "repository": "acme/widget",
+            "repository_owner": "acme",
+            "repository_id": "123",
+            "iat": now,
+            "exp": now + 300
+        });
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some(KID.to_string());
+        let oidc = encode(
+            &header,
+            &claims,
+            &EncodingKey::from_rsa_pem(crate::auth::broker::tests::TEST_PRIVATE_KEY.as_bytes())
+                .unwrap(),
+        )
+        .unwrap();
+        let decoy = "ffffffffffffffffffffffffffffffffffffffff";
+        let body = serde_json::json!({
+            "owner": "acme",
+            "repo": "widget",
+            "commit": decoy,
+            "ref": "refs/heads/body-decoy"
+        });
+        let probe = Arc::new(AdmissionTestProbe::default());
+        let _probe_guard = install_admission_test_probe(Arc::clone(&probe));
+        unsafe {
+            std::env::set_var("RIPCLONE_ORIGIN_BASE", origin_base.path());
+            std::env::set_var("RIPCLONE_TESTING", "1");
+        }
+        let response = build_app(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/build")
+                    .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))))
+                    .header("Authorization", format!("Bearer {oidc}"))
+                    .header("X-Ripclone-Token", hex::encode(Sha256::digest("secret")))
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        unsafe {
+            std::env::remove_var("RIPCLONE_ORIGIN_BASE");
+            std::env::remove_var("RIPCLONE_TESTING");
+        }
+
+        let response_status = response.status();
+        let response_body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            response_status,
+            StatusCode::ACCEPTED,
+            "OIDC build response: {}",
+            String::from_utf8_lossy(&response_body)
+        );
+        assert_eq!(probe.tip_probes.load(Ordering::SeqCst), 1);
+        assert_eq!(probe.queue_inserts.load(Ordering::SeqCst), 1);
+        let job = rx.try_recv().expect("OIDC wakeup enqueued exact HEAD job");
+        assert_eq!(job.repo_id, RepoId::github("acme/widget"));
+        assert_eq!(job.branch, "main");
+        assert_eq!(job.admitted_commit.as_deref(), Some(head.as_str()));
+        assert_ne!(job.admitted_commit.as_deref(), Some(decoy));
+        assert!(rx.try_recv().is_err(), "one HEAD probe admitted one job");
     }
 
     #[tokio::test]

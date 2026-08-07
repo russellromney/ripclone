@@ -1735,29 +1735,21 @@ async fn observe_upstream_for_verification(
                 provider: provider.id.clone(),
                 path: repo_path.to_string(),
             };
-            let provider = provider.clone();
-            let branch = branch.to_string();
-            upstream_tip = match tokio::task::spawn_blocking(move || {
-                ripclone::git::ls_remote_commit(&provider, &repo_id, &branch, None)
-            })
+            upstream_tip = match ripclone::git::ls_remote_commit_async(
+                &provider, &repo_id, branch, None,
+            )
             .await
             {
-                Ok(Ok(Some(sha))) => Some(sha),
-                Ok(Ok(None)) => {
+                Ok(Some(sha)) => Some(sha),
+                Ok(None) => {
                     eprintln!(
                         "warning: --verify-upstream skipped (private upstream without credential); the ripclone server remains in the trust base for this clone"
                     );
                     return Ok(None);
                 }
-                Ok(Err(e)) => {
-                    eprintln!(
-                        "warning: --verify-upstream skipped (upstream probe failed: {e:#}); the ripclone server remains in the trust base for this clone"
-                    );
-                    return Ok(None);
-                }
                 Err(e) => {
                     eprintln!(
-                        "warning: --verify-upstream skipped (upstream probe task failed: {e}); the ripclone server remains in the trust base for this clone"
+                        "warning: --verify-upstream skipped (upstream probe failed: {e:#}); the ripclone server remains in the trust base for this clone"
                     );
                     return Ok(None);
                 }
@@ -1774,25 +1766,21 @@ async fn observe_upstream_for_verification(
                 path: repo_path.to_string(),
             };
             let credential = upstream_token.map(|t| SecretString::new(t.to_owned().into()));
-            let provider = provider.clone();
-            let branch_owned = branch.to_string();
-            match tokio::task::spawn_blocking(move || {
-                ripclone::git::ls_remote_commit(
-                    &provider,
-                    &repo_id,
-                    &branch_owned,
-                    credential.as_ref(),
-                )
-            })
+            match ripclone::git::ls_remote_commit_async(
+                &provider,
+                &repo_id,
+                branch,
+                credential.as_ref(),
+            )
             .await
             {
-                Ok(Ok(Some(sha))) => sha,
-                Ok(Ok(None)) => {
+                Ok(Some(sha)) => sha,
+                Ok(None) => {
                     anyhow::bail!(
                         "upstream verification failed: ref '{branch}' not found on upstream host"
                     );
                 }
-                Ok(Err(e)) => {
+                Err(e) => {
                     if requested == VerifyUpstream::Auto {
                         eprintln!(
                             "warning: --verify-upstream skipped (upstream unreachable: {e:#}); \
@@ -1803,9 +1791,6 @@ async fn observe_upstream_for_verification(
                     anyhow::bail!(
                         "upstream verification failed: could not reach upstream host: {e:#}"
                     );
-                }
-                Err(e) => {
-                    anyhow::bail!("upstream verification failed: ls-remote task failed: {e}");
                 }
             }
         }

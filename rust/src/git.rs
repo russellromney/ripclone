@@ -2,7 +2,7 @@ use crate::provider::{ProviderInstance, RepoId};
 use anyhow::{Context, Result, bail};
 use secrecy::ExposeSecret;
 use std::collections::{HashMap, HashSet};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::AtomicBool;
@@ -1450,11 +1450,9 @@ fn upstream_failure_is_retryable(url: &str, auth_header: Option<(String, String)
 
 /// Resolve the upstream tip of `ref_name` via `git ls-remote` — one
 /// reference-advertisement round-trip with **no object transfer**. Returns the
-/// hex commit SHA, or `None` if the ref is absent upstream. Used as a cheap
-/// pre-check so a `/sync` of an unchanged repo can no-op without a full fetch.
-///
-/// Best-effort by contract: callers treat an `Err` (network blip, host down) as
-/// "unknown" and fall through to the normal fetch+build — never as a failure.
+/// hex commit SHA, or `None` if the ref is absent upstream. Individual callers
+/// decide whether an upstream error is best-effort (legacy worker checks) or
+/// fail-closed (ordinary immutable admission).
 pub fn ls_remote_commit(
     provider: &ProviderInstance,
     repo_id: &RepoId,
@@ -1462,6 +1460,18 @@ pub fn ls_remote_commit(
     credential: Option<&secrecy::SecretString>,
 ) -> Result<Option<String>> {
     Ok(ls_remote_tip(provider, repo_id, ref_name, credential)?.map(|tip| tip.commit))
+}
+
+/// Cancellation-owned async form of [`ls_remote_commit`].
+pub async fn ls_remote_commit_async(
+    provider: &ProviderInstance,
+    repo_id: &RepoId,
+    ref_name: &str,
+    credential: Option<&secrecy::SecretString>,
+) -> Result<Option<String>> {
+    Ok(ls_remote_tip_async(provider, repo_id, ref_name, credential)
+        .await?
+        .map(|tip| tip.commit))
 }
 
 /// The exact tip returned by one `ls-remote` advertisement. `default_branch` is
@@ -1493,6 +1503,228 @@ pub fn ls_remote_tip(
     ls_remote_tip_with_timeout(provider, repo_id, ref_name, credential, timeout)
 }
 
+/// Resolve a remote ref without detaching the Git process from the calling
+/// future. The child owns a fresh process group. Timeout and arbitrary future
+/// cancellation kill that whole group; a reaper always waits for the direct
+/// child. Temporary files drain output without pipe backpressure or helper
+/// descendants keeping a pipe open.
+pub async fn ls_remote_tip_async(
+    provider: &ProviderInstance,
+    repo_id: &RepoId,
+    ref_name: &str,
+    credential: Option<&secrecy::SecretString>,
+) -> Result<Option<RemoteTip>> {
+    let timeout = std::env::var("RIPCLONE_LS_REMOTE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(30));
+    ls_remote_tip_async_with_timeout(provider, repo_id, ref_name, credential, timeout).await
+}
+
+/// Testable cancellation-owned form of [`ls_remote_tip_async`].
+pub async fn ls_remote_tip_async_with_timeout(
+    provider: &ProviderInstance,
+    repo_id: &RepoId,
+    ref_name: &str,
+    credential: Option<&secrecy::SecretString>,
+    timeout: Duration,
+) -> Result<Option<RemoteTip>> {
+    let (url, git_args, auth_header, query) =
+        prepare_ls_remote(provider, repo_id, ref_name, credential)?;
+    if url.is_empty() {
+        return Ok(None);
+    }
+    let mut stdout = tempfile::tempfile().context("create ls-remote stdout file")?;
+    let child_stdout = stdout.try_clone().context("clone ls-remote stdout file")?;
+    let mut stderr = tempfile::tempfile().context("create ls-remote stderr file")?;
+    let child_stderr = stderr.try_clone().context("clone ls-remote stderr file")?;
+    let mut command = tokio::process::Command::new("git");
+    command
+        .args(&git_args)
+        .args(["ls-remote", "--symref", "--", &url, &query])
+        .stdout(Stdio::from(child_stdout))
+        .stderr(Stdio::from(child_stderr));
+    #[cfg(unix)]
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        command.as_std_mut().pre_exec(|| {
+            if libc::setpgid(0, 0) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
+    let child = command.spawn().context("spawn git ls-remote")?;
+    let mut managed = ManagedLsRemoteChild::new(child);
+    let status = match tokio::time::timeout(timeout, managed.child_mut().wait()).await {
+        Ok(status) => status.context("wait for git ls-remote")?,
+        Err(_) => {
+            managed.terminate();
+            let reap = managed.child_mut().wait().await;
+            managed.child.take();
+            reap.context("reap timed-out git ls-remote")?;
+            anyhow::bail!("git ls-remote timed out after {timeout:?}");
+        }
+    };
+    // The direct Git process can exit before an HTTP helper. Terminate any
+    // residual group member before releasing ownership, then mark the already-
+    // waited direct child as consumed so Drop does not schedule another wait.
+    managed.terminate();
+    managed.child.take();
+
+    stdout.rewind().context("rewind ls-remote stdout")?;
+    let mut stdout_bytes = Vec::new();
+    stdout
+        .read_to_end(&mut stdout_bytes)
+        .context("read ls-remote stdout")?;
+    stderr.rewind().context("rewind ls-remote stderr")?;
+    let mut stderr_bytes = Vec::new();
+    stderr
+        .read_to_end(&mut stderr_bytes)
+        .context("read ls-remote stderr")?;
+    if !status.success() {
+        return Err(upstream_git_error(
+            "ls-remote",
+            &url,
+            auth_header,
+            &stderr_bytes,
+        ));
+    }
+    parse_ls_remote_output(&stdout_bytes)
+}
+
+struct ManagedLsRemoteChild {
+    child: Option<tokio::process::Child>,
+    process_group: Option<i32>,
+}
+
+impl ManagedLsRemoteChild {
+    fn new(child: tokio::process::Child) -> Self {
+        Self {
+            process_group: child.id().map(|pid| pid as i32),
+            child: Some(child),
+        }
+    }
+
+    fn child_mut(&mut self) -> &mut tokio::process::Child {
+        self.child
+            .as_mut()
+            .expect("managed ls-remote child present")
+    }
+
+    fn terminate(&mut self) {
+        #[cfg(unix)]
+        if let Some(group) = self.process_group {
+            // SAFETY: the child starts a new process group whose id is its pid.
+            // ESRCH only means every group member already exited.
+            unsafe {
+                libc::kill(-group, libc::SIGKILL);
+            }
+        }
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.start_kill();
+        }
+    }
+}
+
+impl Drop for ManagedLsRemoteChild {
+    fn drop(&mut self) {
+        if self.child.is_none() {
+            return;
+        }
+        self.terminate();
+        let mut child = self.child.take().expect("managed child checked above");
+        // A dropped request future cannot await cleanup itself. Keep ownership
+        // in the runtime until wait(2) observes the direct child; the process
+        // group was synchronously killed above, so descendants cannot outlive
+        // this cancellation boundary.
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _ = child.wait().await;
+            });
+        }
+    }
+}
+
+fn prepare_ls_remote(
+    provider: &ProviderInstance,
+    repo_id: &RepoId,
+    ref_name: &str,
+    credential: Option<&secrecy::SecretString>,
+) -> Result<(String, Vec<String>, Option<(String, String)>, String)> {
+    crate::validation::validate_repo_path(provider, repo_id)
+        .with_context(|| format!("invalid repo path: {}", repo_id.storage_key()))?;
+    if ref_name != "HEAD" {
+        crate::validation::validate_git_rev(ref_name)
+            .with_context(|| format!("invalid ref: {ref_name}"))?;
+        if ref_name.contains(['*', '?', '[']) {
+            return Ok((String::new(), Vec::new(), None, String::new()));
+        }
+    }
+    let (url, git_args) = upstream_url_and_auth(provider, repo_id, credential);
+    let auth_header = upstream_auth_header(provider, credential);
+    let query = if ref_name == "HEAD" {
+        "HEAD".to_string()
+    } else if ref_name.starts_with("refs/") {
+        ref_name.to_string()
+    } else {
+        format!("refs/heads/{ref_name}")
+    };
+    Ok((url, git_args, auth_header, query))
+}
+
+fn parse_ls_remote_output(stdout: &[u8]) -> Result<Option<RemoteTip>> {
+    let stdout = String::from_utf8_lossy(stdout);
+    let mut default_branch = None;
+    let mut commit = None;
+    let mut saw_output = false;
+    for line in stdout.lines() {
+        if !line.trim().is_empty() {
+            saw_output = true;
+        }
+        if let Some(symbolic) = line.strip_prefix("ref: refs/heads/")
+            && let Some(branch) = symbolic
+                .strip_suffix("\tHEAD")
+                .or_else(|| symbolic.strip_suffix(" HEAD"))
+            && !branch.is_empty()
+            && crate::validation::validate_git_rev(branch).is_ok()
+        {
+            default_branch = Some(branch.to_string());
+            continue;
+        }
+        if line.starts_with("ref: ") {
+            return Err(anyhow::anyhow!(
+                "git ls-remote returned malformed symbolic ref"
+            ));
+        }
+        let Some((sha, _remote_ref)) = line.split_once('\t') else {
+            return Err(anyhow::anyhow!(
+                "git ls-remote returned malformed advertisement"
+            ));
+        };
+        let sha = sha.trim();
+        if crate::validation::validate_object_id(sha).is_err() {
+            return Err(anyhow::anyhow!(
+                "git ls-remote returned malformed object id"
+            ));
+        }
+        commit = Some(sha.to_string());
+        break;
+    }
+    if saw_output && commit.is_none() {
+        return Err(anyhow::anyhow!(
+            "git ls-remote returned no object id for requested ref"
+        ));
+    }
+    Ok(commit.map(|commit| RemoteTip {
+        commit,
+        default_branch,
+    }))
+}
+
 /// Testable form of [`ls_remote_tip`] with an explicit bound.
 pub fn ls_remote_tip_with_timeout(
     provider: &ProviderInstance,
@@ -1501,30 +1733,11 @@ pub fn ls_remote_tip_with_timeout(
     credential: Option<&secrecy::SecretString>,
     timeout: Duration,
 ) -> Result<Option<RemoteTip>> {
-    crate::validation::validate_repo_path(provider, repo_id)
-        .with_context(|| format!("invalid repo path: {}", repo_id.storage_key()))?;
-    if ref_name != "HEAD" {
-        crate::validation::validate_git_rev(ref_name)
-            .with_context(|| format!("invalid ref: {}", ref_name))?;
-        // `validate_git_rev` permits glob metacharacters that a real refname can't
-        // contain. In a `refs/heads/<name>` refspec they'd make ls-remote match a
-        // *pattern*, so the first-line parse below could return some other ref's
-        // SHA. Such a name has no build to reuse anyway — skip the probe.
-        if ref_name.contains(['*', '?', '[']) {
-            return Ok(None);
-        }
+    let (url, git_args, auth_header, query) =
+        prepare_ls_remote(provider, repo_id, ref_name, credential)?;
+    if url.is_empty() {
+        return Ok(None);
     }
-    let (url, git_args) = upstream_url_and_auth(provider, repo_id, credential);
-    let auth_header = upstream_auth_header(provider, credential);
-    // A bare branch name maps to refs/heads/<name>; a full ref (refs/heads/... or
-    // refs/tags/...) is passed through unchanged; HEAD is queried directly.
-    let query = if ref_name == "HEAD" {
-        "HEAD".to_string()
-    } else if ref_name.starts_with("refs/") {
-        ref_name.to_string()
-    } else {
-        format!("refs/heads/{ref_name}")
-    };
     let mut command = Command::new("git");
     command
         .args(&git_args)
@@ -1614,52 +1827,7 @@ pub fn ls_remote_tip_with_timeout(
     if !status.success() {
         return Err(upstream_git_error("ls-remote", &url, auth_header, &stderr));
     }
-    let stdout = String::from_utf8_lossy(&stdout);
-    let mut default_branch = None;
-    let mut commit = None;
-    let mut saw_output = false;
-    for line in stdout.lines() {
-        if !line.trim().is_empty() {
-            saw_output = true;
-        }
-        if let Some(symbolic) = line.strip_prefix("ref: refs/heads/")
-            && let Some(branch) = symbolic
-                .strip_suffix("\tHEAD")
-                .or_else(|| symbolic.strip_suffix(" HEAD"))
-            && !branch.is_empty()
-            && crate::validation::validate_git_rev(branch).is_ok()
-        {
-            default_branch = Some(branch.to_string());
-            continue;
-        }
-        if line.starts_with("ref: ") {
-            return Err(anyhow::anyhow!(
-                "git ls-remote returned malformed symbolic ref"
-            ));
-        }
-        let Some((sha, _remote_ref)) = line.split_once('\t') else {
-            return Err(anyhow::anyhow!(
-                "git ls-remote returned malformed advertisement"
-            ));
-        };
-        let sha = sha.trim();
-        if crate::validation::validate_object_id(sha).is_err() {
-            return Err(anyhow::anyhow!(
-                "git ls-remote returned malformed object id"
-            ));
-        }
-        commit = Some(sha.to_string());
-        break;
-    }
-    if saw_output && commit.is_none() {
-        return Err(anyhow::anyhow!(
-            "git ls-remote returned no object id for requested ref"
-        ));
-    }
-    Ok(commit.map(|commit| RemoteTip {
-        commit,
-        default_branch,
-    }))
+    parse_ls_remote_output(&stdout)
 }
 
 fn kill_ls_remote_process_group(child: &mut std::process::Child) -> std::io::Result<()> {
