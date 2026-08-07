@@ -13,6 +13,7 @@ use common::*;
 use ripclone::backends;
 use ripclone::mode::CloneMode;
 use ripclone::queue::BuildError;
+use secrecy::ExposeSecret;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -112,6 +113,7 @@ async fn worker_farm_out_libsql_against_real_sqld() {
         .expect("register libsql farm-out repo");
     let admitted_b = server
         .client()
+        .with_upstream_token("first-libsql-credential")
         .admit_sync_repo("acme/lq", None)
         .await
         .expect("admit libsql B");
@@ -126,14 +128,23 @@ async fn worker_farm_out_libsql_against_real_sqld() {
         claimed_b.admitted_commit.as_deref(),
         Some(commit_b.as_str())
     );
+    assert_eq!(
+        claimed_b
+            .credential
+            .as_ref()
+            .map(|credential| credential.expose_secret()),
+        Some("first-libsql-credential")
+    );
 
     let duplicate_b = server
         .client()
+        .with_upstream_token("claimed-duplicate-decoy")
         .admit_sync_repo("acme/lq", None)
         .await
         .expect("duplicate claimed B admission");
     assert_eq!(duplicate_b.commit, commit_b);
     assert_eq!(duplicate_b.status, "coalesced");
+    eprintln!("libsql active_rows_B=1 claimed_rows=1 queued_rows=0 credential_owner=first");
 
     let commit_c = origin.commit(&[("a.txt", "via-libsql-c\n")], "c");
     origin.publish();

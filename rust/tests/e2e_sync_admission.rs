@@ -7,6 +7,8 @@ mod common;
 
 use common::*;
 use hmac::{Hmac, KeyInit, Mac};
+use prost::Message;
+use ripclone::clonepack::{ClonepackManifest, hash_to_hex, manifest_chunk_refs};
 use ripclone::ref_store::{FileRefStore, RefStore};
 use ripclone::server::AdmissionTestProbe;
 use serde_json::Value;
@@ -147,6 +149,56 @@ fn hanging_origin() -> (
     (format!("http://{addr}"), accepted_rx, closed_rx, thread)
 }
 
+fn matching_processes(marker: &str) -> Vec<String> {
+    let output = std::process::Command::new("ps")
+        .args(["-axo", "pid=,ppid=,state=,command="])
+        .output()
+        .expect("inspect process table");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| line.contains(marker) && !line.contains("ps -axo"))
+        .map(str::to_string)
+        .collect()
+}
+
+async fn wait_for_no_matching_process(marker: &str) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let matches = matching_processes(marker);
+            if matches.is_empty() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "ls-remote process tree survived: {:?}",
+            matching_processes(marker)
+        )
+    });
+}
+
+async fn run_cli(server: &Server, args: &[&str]) -> (std::process::Output, Duration) {
+    let home = tempfile::tempdir().expect("CLI home");
+    let started = Instant::now();
+    let mut command = std::process::Command::new(cargo_bin("ripclone"));
+    command
+        .arg("--server")
+        .arg(&server.url)
+        .args(args)
+        .env("HOME", home.path())
+        .env("RIPCLONE_SERVER_TOKEN", TOKEN)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let child = spawn_bounded_child(&mut command).expect("spawn ripclone CLI");
+    let output = wait_child_output_bounded(child, Duration::from_secs(20))
+        .await
+        .expect("CLI completed within bounded admission window");
+    (output, started.elapsed())
+}
+
 fn reset_probe(probe: &AdmissionTestProbe) {
     probe
         .enqueue_attempts
@@ -177,6 +229,43 @@ fn reset_probe(probe: &AdmissionTestProbe) {
         .store(0, std::sync::atomic::Ordering::SeqCst);
     probe.fetch_targets.lock().unwrap().clear();
     probe.builder_targets.lock().unwrap().clear();
+    probe.failure_targets.lock().unwrap().clear();
+    probe.http_trace.lock().unwrap().clear();
+}
+
+fn assert_full_artifacts(
+    storage: &ripclone::storage::StorageRef,
+    info: &ripclone::RefInfo,
+    commit: &str,
+) {
+    assert_eq!(info.commit, commit, "ref identity");
+    assert_eq!(info.full_clonepack.commit, commit, "full artifact identity");
+    assert!(
+        !info.full_clonepack.manifest.is_empty(),
+        "full manifest is present"
+    );
+    let bytes = storage
+        .get(&info.full_clonepack.manifest)
+        .expect("load exact full manifest bytes");
+    assert_eq!(
+        ripclone::cas::hash(&bytes),
+        info.full_clonepack.manifest,
+        "full manifest hash"
+    );
+    let manifest = ClonepackManifest::decode(bytes.as_slice()).expect("decode exact full manifest");
+    assert_eq!(manifest.commit, commit, "manifest commit identity");
+    let chunks = manifest_chunk_refs(&manifest);
+    assert!(!chunks.is_empty(), "full manifest names artifact chunks");
+    for chunk in chunks {
+        let hash = hash_to_hex(&chunk.hash);
+        let bytes = storage.get(&hash).expect("load exact manifest artifact");
+        assert_eq!(bytes.len() as u64, chunk.len, "artifact length for {hash}");
+        assert_eq!(
+            ripclone::cas::hash(&bytes),
+            hash,
+            "artifact hash for {hash}"
+        );
+    }
 }
 
 /// Direct local composition: ready no-op, fast accepted response, duplicate
@@ -411,13 +500,29 @@ async fn e2e_sync_admission() {
     assert_eq!(response_commit(&b_dup_one), b);
     assert_eq!(b_dup_two_status, reqwest::StatusCode::ACCEPTED);
     assert_eq!(response_commit(&b_dup_two), b);
+    let (cli_sync, cli_sync_elapsed) = run_cli(&server, &["sync", "acme/immutable"]).await;
+    assert!(
+        cli_sync.status.success(),
+        "CLI sync failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&cli_sync.stdout),
+        String::from_utf8_lossy(&cli_sync.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&cli_sync.stdout).trim(),
+        format!("accepted {b}"),
+        "normal CLI sync reports admission identity"
+    );
+    assert!(
+        cli_sync_elapsed < Duration::from_secs(5),
+        "CLI sync waited for the blocked worker: {cli_sync_elapsed:?}"
+    );
     assert_eq!(
         probe
             .queue_inserts
             .load(std::sync::atomic::Ordering::SeqCst),
         1
     );
-    assert_eq!(probe.coalesces.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(probe.coalesces.load(std::sync::atomic::Ordering::SeqCst), 3);
 
     wait_entered(&probe.before_claim, 1).await;
     probe.before_claim.release();
@@ -436,7 +541,7 @@ async fn e2e_sync_admission() {
             .load(std::sync::atomic::Ordering::SeqCst),
         1
     );
-    assert_eq!(probe.coalesces.load(std::sync::atomic::Ordering::SeqCst), 3);
+    assert_eq!(probe.coalesces.load(std::sync::atomic::Ordering::SeqCst), 4);
 
     probe.after_claim.release();
     probe.after_claim.disarm();
@@ -463,7 +568,7 @@ async fn e2e_sync_admission() {
             .load(std::sync::atomic::Ordering::SeqCst),
         2
     );
-    assert_eq!(probe.coalesces.load(std::sync::atomic::Ordering::SeqCst), 3);
+    assert_eq!(probe.coalesces.load(std::sync::atomic::Ordering::SeqCst), 4);
 
     // Release B's exact fetch and observe both exact targets before releasing
     // the real builder boundary. No branch-tip substitution is possible here.
@@ -495,28 +600,51 @@ async fn e2e_sync_admission() {
             .load(std::sync::atomic::Ordering::SeqCst),
         2
     );
-    assert_eq!(probe.coalesces.load(std::sync::atomic::Ordering::SeqCst), 4);
+    assert_eq!(probe.coalesces.load(std::sync::atomic::Ordering::SeqCst), 5);
     assert_eq!(
         probe.tip_probes.load(std::sync::atomic::Ordering::SeqCst),
         tip_probes_before_webhook,
         "signed webhook replay must not perform a moving-tip probe"
     );
     eprintln!(
-        "admission_latencies_ms replay={} ready={} B={} dup_before_claim=[{},{}] dup_after_claim={} C={} webhook_phase1={}",
+        "admission_latencies_ms replay={} ready={} B={} dup_before_claim=[{},{}] cli_sync={} dup_after_claim={} C={} webhook_phase1={}",
         replay_elapsed.as_millis(),
         ready_elapsed.as_millis(),
         b_elapsed.as_millis(),
         b_dup_one_elapsed.as_millis(),
         b_dup_two_elapsed.as_millis(),
+        cli_sync_elapsed.as_millis(),
         b_dup_claimed_elapsed.as_millis(),
         c_elapsed.as_millis(),
         b_phase1_elapsed.as_millis(),
     );
 
-    // Release Full(B), then wait on the full-publication counter for both B and
-    // C. The C worker was admitted earlier and remains a distinct queue item.
+    // Hold C before claim so Full(B)'s exact metadata and every named artifact
+    // can be inspected before the ordinary branch advances. This proves B was
+    // not merely counted at a builder hook and then overwritten by C.
+    probe.before_claim.arm();
     probe.phase2_entry.release();
     probe.phase2_entry.disarm();
+    tokio::time::timeout(Duration::from_secs(60), probe.wait_until_full_published(1))
+        .await
+        .expect("B full publication completed");
+    wait_entered(&probe.before_claim, 1).await;
+
+    let store = FileRefStore::new(&server.repo_root);
+    let repo_id = ripclone::provider::RepoId::github("acme/immutable");
+    let b_build = store
+        .load_build(&repo_id, &b)
+        .await
+        .expect("load exact B build")
+        .expect("exact B build remains addressable before C publication");
+    let local_storage = ripclone::storage::local(&server.storage_dir)
+        .expect("open local artifact storage for exact proof");
+    assert_full_artifacts(&local_storage, &b_build, &b);
+
+    // C was already a distinct queued job. Release its claim and require its
+    // own exact publication as well.
+    probe.before_claim.release();
+    probe.before_claim.disarm();
     tokio::time::timeout(Duration::from_secs(60), probe.wait_until_full_published(2))
         .await
         .expect("B and C full publications completed");
@@ -556,8 +684,6 @@ async fn e2e_sync_admission() {
         2
     );
 
-    let store = FileRefStore::new(&server.repo_root);
-    let repo_id = ripclone::provider::RepoId::github("acme/immutable");
     let final_ref = store
         .load_branch(&repo_id, "main")
         .await
@@ -568,6 +694,7 @@ async fn e2e_sync_admission() {
         final_ref.full_clonepack.commit == c,
         "final full artifact is C"
     );
+    assert_full_artifacts(&local_storage, &final_ref, &c);
 
     // An older linear webhook may still be admitted as its own immutable
     // target when its branch metadata has already moved to C, but its ordered
@@ -711,5 +838,235 @@ async fn e2e_sync_admission() {
         probe
             .artifact_uploads
             .load(std::sync::atomic::Ordering::SeqCst),
+    );
+
+    // Cancellation is a separate ownership boundary from the wall timeout:
+    // drop the real HTTP request while its Git child is connected, then require
+    // the socket, direct process, and any helper descendant to be gone long
+    // before the configured 30-second timeout could fire.
+    reset_probe(&probe);
+    let (cancel_base, cancel_accepted, cancel_closed, cancel_thread) = hanging_origin();
+    let cancel_marker = cancel_base.clone();
+    let old_origin = std::env::var_os("RIPCLONE_ORIGIN_BASE");
+    let old_timeout = std::env::var_os("RIPCLONE_LS_REMOTE_TIMEOUT_SECS");
+    unsafe {
+        std::env::set_var("RIPCLONE_ORIGIN_BASE", &cancel_base);
+        std::env::set_var("RIPCLONE_LS_REMOTE_TIMEOUT_SECS", "30");
+    }
+    let cancel_url = format!("{}/v1/repos/github/acme/immutable/sync", server.url);
+    let cancel_started = Instant::now();
+    let cancel_request = tokio::spawn(async move {
+        reqwest::Client::new()
+            .post(cancel_url)
+            .header("Authorization", format!("Ripclone {}", token_hash()))
+            .send()
+            .await
+    });
+    cancel_accepted
+        .recv_timeout(Duration::from_secs(3))
+        .expect("cancelled request reached ls-remote");
+    cancel_request.abort();
+    let _ = cancel_request.await;
+    assert!(
+        cancel_closed
+            .recv_timeout(Duration::from_secs(5))
+            .expect("cancelled ls-remote closed its socket"),
+        "request cancellation left the ls-remote connection open"
+    );
+    cancel_thread.join().expect("cancellation fixture reaped");
+    wait_for_no_matching_process(&cancel_marker).await;
+    assert!(
+        cancel_started.elapsed() < Duration::from_secs(10),
+        "cancellation cleanup fell through to the 30-second wall timeout"
+    );
+    unsafe {
+        match old_origin {
+            Some(value) => std::env::set_var("RIPCLONE_ORIGIN_BASE", value),
+            None => std::env::remove_var("RIPCLONE_ORIGIN_BASE"),
+        }
+        match old_timeout {
+            Some(value) => std::env::set_var("RIPCLONE_LS_REMOTE_TIMEOUT_SECS", value),
+            None => std::env::remove_var("RIPCLONE_LS_REMOTE_TIMEOUT_SECS"),
+        }
+    }
+    assert_eq!(
+        probe
+            .queue_inserts
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "cancelled resolution admitted work"
+    );
+
+    // A compatibility caller performs one moving POST, learns the exact target,
+    // and then waits exclusively through authenticated pinned metadata GETs.
+    let wait_commit = origin.commit(&[("value.txt", "wait\n")], "compatibility wait");
+    origin.publish();
+    reset_probe(&probe);
+    probe.phase2_entry.arm();
+    let wait_client = server.client();
+    let wait_task = tokio::spawn(async move {
+        wait_client
+            .sync_repo("acme/immutable", None)
+            .await
+            .expect("compatibility sync becomes ready")
+    });
+    wait_entered(&probe.phase2_entry, 1).await;
+    tokio::time::timeout(Duration::from_secs(10), probe.wait_until_http_trace_len(2))
+        .await
+        .expect("compatibility caller reached pinned GET");
+    let trace = probe.http_trace.lock().unwrap().clone();
+    assert_eq!(
+        trace.first().map(String::as_str),
+        Some("POST /v1/repos/github/acme/immutable/sync")
+    );
+    assert_eq!(
+        trace.iter().filter(|event| event.contains("/sync")).count(),
+        1,
+        "compatibility wait repeated moving sync: {trace:?}"
+    );
+    assert!(
+        trace.iter().skip(1).all(|event| event.starts_with(&format!(
+            "GET /v1/repos/{}/refs/main?pinned={wait_commit}&clonepack=full",
+            repo_id.storage_key()
+        ))),
+        "compatibility wait used an unpinned or mutating follow-up: {trace:?}"
+    );
+    probe.phase2_entry.release();
+    probe.phase2_entry.disarm();
+    let waited = tokio::time::timeout(Duration::from_secs(60), wait_task)
+        .await
+        .expect("compatibility wait completed")
+        .expect("compatibility task joined");
+    assert_eq!(waited.commit, wait_commit);
+
+    // Admit an exact target, make only that object unreachable before the
+    // claimed worker may fetch, and prove the real local queue/worker reports
+    // that target's failure without building the now-visible older tip.
+    let unavailable = origin.commit(&[("value.txt", "unavailable\n")], "unavailable");
+    origin.publish();
+    let before_unavailable = store
+        .load_branch(&repo_id, "main")
+        .await
+        .expect("load ref before unavailable target")
+        .expect("prior ready ref exists");
+    let unavailable_storage = tree_snapshot(&server.storage_dir);
+    reset_probe(&probe);
+    probe.after_claim.arm();
+    let (unavailable_status, unavailable_body, _) = post_sync(&server, None).await;
+    assert_eq!(unavailable_status, reqwest::StatusCode::ACCEPTED);
+    assert_eq!(response_commit(&unavailable_body), unavailable);
+    wait_entered(&probe.after_claim, 1).await;
+    git(&origin.work, &["reset", "--hard", &wait_commit]);
+    origin.publish();
+    git(&origin.bare, &["reflog", "expire", "--expire=now", "--all"]);
+    git(&origin.bare, &["gc", "--prune=now"]);
+    assert!(
+        !git_ok(
+            &origin.bare,
+            &["cat-file", "-e", &format!("{unavailable}^{{commit}}")]
+        ),
+        "unavailable target fixture still exposes the admitted object"
+    );
+    probe.after_claim.release();
+    probe.after_claim.disarm();
+    tokio::time::timeout(Duration::from_secs(30), probe.wait_until_failure(1))
+        .await
+        .expect("unavailable exact target failed clearly");
+    let failures = probe.failure_targets.lock().unwrap().clone();
+    assert_eq!(failures.len(), 1, "one unavailable-target failure");
+    assert_eq!(
+        failures[0].0, unavailable,
+        "failure retains admitted identity"
+    );
+    assert!(!failures[0].1.is_empty(), "failure includes a clear cause");
+    assert_eq!(
+        probe.fetch_targets.lock().unwrap().as_slice(),
+        [unavailable.as_str()],
+        "worker attempted only the unavailable admitted object"
+    );
+    assert!(
+        probe.builder_targets.lock().unwrap().is_empty(),
+        "unavailable job fell forward into a builder"
+    );
+    let after_unavailable = store
+        .load_branch(&repo_id, "main")
+        .await
+        .expect("load ref after unavailable target")
+        .expect("prior ready ref remains");
+    assert_eq!(after_unavailable.commit, wait_commit);
+    assert_eq!(
+        after_unavailable.build_status,
+        before_unavailable.build_status
+    );
+    assert_eq!(
+        unavailable_storage,
+        tree_snapshot(&server.storage_dir),
+        "unavailable exact job wrote artifacts"
+    );
+
+    // An evicted completed row is not treated as ready and its historical done
+    // job does not block one fresh exact admission.
+    let mut evicted = after_unavailable;
+    evicted.build_status = Some("evicted".to_string());
+    store
+        .save_branch(&repo_id, "main", &evicted)
+        .await
+        .expect("mark exact row evicted");
+    let mut evicted_head = store
+        .load_branch(&repo_id, "HEAD")
+        .await
+        .expect("load exact HEAD alias before eviction")
+        .expect("HEAD alias exists");
+    assert_eq!(evicted_head.commit, wait_commit);
+    evicted_head.build_status = Some("evicted".to_string());
+    store
+        .save_branch(&repo_id, "HEAD", &evicted_head)
+        .await
+        .expect("mark exact HEAD alias evicted");
+    reset_probe(&probe);
+    probe.before_claim.arm();
+    let (evicted_status, evicted_body, evicted_elapsed) = post_sync(&server, None).await;
+    assert_eq!(evicted_status, reqwest::StatusCode::ACCEPTED);
+    assert_eq!(response_commit(&evicted_body), wait_commit);
+    assert_eq!(
+        probe
+            .queue_inserts
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "evicted target admitted exactly one fresh active job"
+    );
+    wait_entered(&probe.before_claim, 1).await;
+
+    // The normal CLI add path returns after registration and admission while
+    // the real worker remains held at the evicted job's before-claim barrier.
+    let add_origin = make_origin("acme", "cli-add");
+    let add_commit = add_origin.commit(&[("added.txt", "added\n")], "CLI add");
+    add_origin.publish();
+    let (cli_add, cli_add_elapsed) = run_cli(&server, &["add", "acme/cli-add"]).await;
+    assert!(
+        cli_add.status.success(),
+        "CLI add failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&cli_add.stdout),
+        String::from_utf8_lossy(&cli_add.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&cli_add.stdout).trim(),
+        format!("added acme/cli-add; accepted {add_commit}")
+    );
+    wait_entered(&probe.before_claim, 1).await;
+    assert_eq!(
+        probe
+            .queue_inserts
+            .load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "evicted sync and CLI add each admitted one exact job"
+    );
+    probe.before_claim.release();
+    probe.before_claim.disarm();
+    eprintln!(
+        "closed_gap_timings_ms cancellation={} evicted_readmission={} cli_add={} active_rows_evicted=1 active_rows_cli_add=1",
+        cancel_started.elapsed().as_millis(),
+        evicted_elapsed.as_millis(),
+        cli_add_elapsed.as_millis(),
     );
 }

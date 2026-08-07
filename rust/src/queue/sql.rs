@@ -1133,17 +1133,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn per_job_credential_round_trips_through_the_queue() {
+    async fn first_exact_job_credential_survives_duplicate_coalescing() {
         use secrecy::ExposeSecret;
         for (engine, q, _dir) in queues().await {
             let mut j = job("o", "r", "main");
             j.credential = Some(secrecy::SecretString::new(
-                "ghs_secret123".to_string().into(),
+                "first-credential".to_string().into(),
             ));
-            q.enqueue(j).await.unwrap();
+            let first = q.enqueue(j).await.unwrap();
+            let mut before_claim_duplicate = job("o", "r", "main");
+            before_claim_duplicate.credential = Some(secrecy::SecretString::new(
+                "before-claim-decoy".to_string().into(),
+            ));
+            let duplicate = q.enqueue(before_claim_duplicate).await.unwrap();
+            assert_eq!(duplicate.outcome, EnqueueOutcome::Coalesced, "{engine}");
+            assert_eq!(duplicate.job_id, first.job_id, "{engine}");
             let claimed = q.claim("w1").await.unwrap().unwrap();
-            let cred = claimed.credential.expect("credential persisted");
-            assert_eq!(cred.expose_secret(), "ghs_secret123", "{engine}");
+            let mut after_claim_duplicate = job("o", "r", "main");
+            after_claim_duplicate.credential = Some(secrecy::SecretString::new(
+                "after-claim-decoy".to_string().into(),
+            ));
+            let claimed_duplicate = q.enqueue(after_claim_duplicate).await.unwrap();
+            assert_eq!(
+                claimed_duplicate.outcome,
+                EnqueueOutcome::Coalesced,
+                "{engine}"
+            );
+            assert_eq!(claimed_duplicate.job_id, Some(claimed.id), "{engine}");
+            let cred = claimed.credential.expect("first credential persisted");
+            assert_eq!(cred.expose_secret(), "first-credential", "{engine}");
+            eprintln!("{engine}: active_rows_for_exact_key=1 credential_owner=first-accepted");
         }
     }
 
@@ -1565,6 +1584,7 @@ mod tests {
                 "{engine}: duplicate C admission coalesces onto the queued job"
             );
             assert_eq!(q.depth().await, 1, "{engine}: still one queued job");
+            eprintln!("{engine}: active_rows_B=1 active_rows_C=1 queued_rows=1 claimed_rows=1");
         }
     }
 
@@ -1897,15 +1917,72 @@ mod tests {
         {
             use secrecy::ExposeSecret;
             let mut j = job("o", "r", "cred");
-            j.credential = Some(secrecy::SecretString::new("dG9rZW4=".to_string().into()));
-            q.enqueue(j).await.unwrap();
+            j.credential = Some(secrecy::SecretString::new("first-token".to_string().into()));
+            let first = q.enqueue(j).await.unwrap();
+            let mut queued_duplicate = job("o", "r", "cred");
+            queued_duplicate.credential = Some(secrecy::SecretString::new(
+                "queued-decoy-token".to_string().into(),
+            ));
+            let duplicate = q.enqueue(queued_duplicate).await.unwrap();
+            assert_eq!(duplicate.outcome, EnqueueOutcome::Coalesced);
+            assert_eq!(duplicate.job_id, first.job_id);
             let c = q.claim("wc").await.unwrap().unwrap();
+            let mut claimed_duplicate = job("o", "r", "cred");
+            claimed_duplicate.credential = Some(secrecy::SecretString::new(
+                "claimed-decoy-token".to_string().into(),
+            ));
+            let duplicate = q.enqueue(claimed_duplicate).await.unwrap();
+            assert_eq!(duplicate.outcome, EnqueueOutcome::Coalesced);
+            assert_eq!(duplicate.job_id, Some(c.id));
             assert_eq!(
                 c.credential.as_ref().map(|s| s.expose_secret().to_string()),
-                Some("dG9rZW4=".to_string()),
-                "credential round-trips through the queue DB"
+                Some("first-token".to_string()),
+                "the first accepted credential survives queued and claimed duplicates"
             );
+            eprintln!("active_rows_for_exact_credential_key=1");
             q.ack(c.id, "wc", Ok(())).await.unwrap();
+        }
+
+        // Dialect-sensitive active uniqueness: B stays the sole active row
+        // after claim, while C on the same repo/branch is a second immutable
+        // key. Both exact identities must survive their claim transport.
+        {
+            let b_commit = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+            let c_commit = "cccccccccccccccccccccccccccccccccccccccc";
+            let b = q
+                .enqueue(job_at("o", "r", "immutable", b_commit))
+                .await
+                .unwrap();
+            let claimed_b = q.claim("immutable-worker").await.unwrap().unwrap();
+            assert_eq!(claimed_b.admitted_commit.as_deref(), Some(b_commit));
+            let duplicate_b = q
+                .enqueue(job_at("o", "r", "immutable", b_commit))
+                .await
+                .unwrap();
+            assert_eq!(duplicate_b.outcome, EnqueueOutcome::Coalesced);
+            assert_eq!(duplicate_b.job_id, b.job_id);
+            let c = q
+                .enqueue(job_at("o", "r", "immutable", c_commit))
+                .await
+                .unwrap();
+            assert_eq!(c.outcome, EnqueueOutcome::Enqueued);
+            assert_ne!(c.job_id, b.job_id);
+            assert_eq!(q.depth().await, 1, "only queued C contributes to depth");
+            let duplicate_c = q
+                .enqueue(job_at("o", "r", "immutable", c_commit))
+                .await
+                .unwrap();
+            assert_eq!(duplicate_c.outcome, EnqueueOutcome::Coalesced);
+            assert_eq!(duplicate_c.job_id, c.job_id);
+            eprintln!("active_rows_B=1 active_rows_C=1 queued_rows=1 claimed_rows=1");
+            q.ack(claimed_b.id, "immutable-worker", Ok(()))
+                .await
+                .unwrap();
+            let claimed_c = q.claim("immutable-worker").await.unwrap().unwrap();
+            assert_eq!(claimed_c.admitted_commit.as_deref(), Some(c_commit));
+            q.ack(claimed_c.id, "immutable-worker", Ok(()))
+                .await
+                .unwrap();
         }
 
         let enq = q.enqueue(job("o", "r", "main")).await.unwrap();
