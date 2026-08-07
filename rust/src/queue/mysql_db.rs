@@ -71,7 +71,7 @@ impl QueueDb for MysqlDb {
                 size_class BIGINT NOT NULL DEFAULT 0,
                 active_key VARBINARY(1024) GENERATED ALWAYS AS
                     (IF(status IN ('queued', 'claimed'), CONVERT(`key` USING binary), NULL)) STORED,
-                UNIQUE INDEX idx_jobs_active_key (active_key),
+                UNIQUE INDEX idx_jobs_active_identity_v3 (active_key),
                 INDEX idx_jobs_status_created (status, created_at),
                 INDEX idx_jobs_provider_path_finished (provider, path, finished_at)
             )",
@@ -114,15 +114,8 @@ impl QueueDb for MysqlDb {
             .execute(&self.pool)
             .await
             .context("widen MySQL queue key column")?;
-        // Remove both legacy names before recreating the projection. MySQL
-        // has no partial-index syntax, and an existing name would otherwise
-        // make the ADD INDEX below succeed without enforcing the new key.
-        let _ = sqlx::raw_sql("ALTER TABLE jobs DROP INDEX idx_jobs_active_key")
-            .execute(&self.pool)
-            .await;
-        let _ = sqlx::raw_sql("ALTER TABLE jobs DROP INDEX idx_jobs_queued_key")
-            .execute(&self.pool)
-            .await;
+        // Monotonic v3 migration: add the projection and versioned uniqueness
+        // backstop without ever dropping an index during normal startup.
         let add_active = sqlx::raw_sql(
             "ALTER TABLE jobs ADD COLUMN active_key VARBINARY(1024) GENERATED ALWAYS AS
                 (IF(status IN ('queued', 'claimed'), CONVERT(`key` USING binary), NULL)) STORED",
@@ -137,10 +130,11 @@ impl QueueDb for MysqlDb {
         {
             return Err(e).context("add MySQL active-key projection");
         }
-        let add_index =
-            sqlx::raw_sql("ALTER TABLE jobs ADD UNIQUE INDEX idx_jobs_active_key (active_key)")
-                .execute(&self.pool)
-                .await;
+        let add_index = sqlx::raw_sql(
+            "ALTER TABLE jobs ADD UNIQUE INDEX idx_jobs_active_identity_v3 (active_key)",
+        )
+        .execute(&self.pool)
+        .await;
         if let Err(e) = add_index
             && !e
                 .to_string()
@@ -153,13 +147,11 @@ impl QueueDb for MysqlDb {
     }
 
     async fn active_job_id(&self, key: &str) -> Result<Option<i64>> {
-        sqlx::query_scalar(
-            "SELECT id FROM jobs WHERE `key` = ? AND status IN ('queued', 'claimed') LIMIT 1",
-        )
-        .bind(key)
-        .fetch_optional(&self.pool)
-        .await
-        .context("query active job")
+        sqlx::query_scalar("SELECT id FROM jobs WHERE active_key = CONVERT(? USING binary) LIMIT 1")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await
+            .context("query active job")
     }
 
     async fn insert_job(

@@ -953,21 +953,13 @@ pub(crate) const CREATE_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS jobs (
 pub(crate) const CREATE_STATUS_INDEX_SQL: &str =
     "CREATE INDEX IF NOT EXISTS idx_jobs_status_created ON jobs(status, created_at)";
 
-/// Drop the older active-key index before recreating the immutable-key
-/// constraint. Best-effort because fresh databases do not have it.
-pub(crate) const DROP_LEGACY_ACTIVE_KEY_INDEX_SQL: &str =
-    "DROP INDEX IF EXISTS idx_jobs_active_key";
-
-/// An older schema used this name for a queued-only index. Drop it before
-/// installing the active (queued + claimed) constraint.
-pub(crate) const DROP_LEGACY_QUEUED_KEY_INDEX_SQL: &str =
-    "DROP INDEX IF EXISTS idx_jobs_queued_key";
-
 /// Database-enforced coalescing backstop: at most one queued or claimed build
 /// per immutable key. A later admitted commit has a different key and remains
-/// a distinct job.
+/// a distinct job. The versioned name makes this a monotonic migration: startup
+/// adds the v3 constraint but never drops either an already-correct constraint
+/// or a legacy queued-only backstop.
 pub(crate) const CREATE_ACTIVE_KEY_INDEX_SQL: &str =
-    "CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_active_key
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_active_identity_v3
      ON jobs(key) WHERE status IN ('queued', 'claimed')";
 
 /// Index for the build/version history queries over retained `done` jobs
@@ -1899,6 +1891,72 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_sqlite_initialization_never_removes_active_uniqueness() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("restart-race.db");
+        let path_text = path.to_string_lossy().to_string();
+        let queue = Arc::new(
+            SqlJobQueue::new(Box::new(SqliteDb::connect(&path_text).await.unwrap()))
+                .await
+                .unwrap(),
+        );
+        let first = queue
+            .enqueue(job_at(
+                "o",
+                "r",
+                "restart-race",
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(first.outcome, EnqueueOutcome::Enqueued);
+
+        let mut tasks = Vec::new();
+        for _ in 0..12 {
+            let path = path_text.clone();
+            tasks.push(tokio::spawn(async move {
+                SqlJobQueue::new(Box::new(SqliteDb::connect(&path).await.unwrap()))
+                    .await
+                    .unwrap();
+            }));
+            let queue = Arc::clone(&queue);
+            tasks.push(tokio::spawn(async move {
+                let outcome = queue
+                    .enqueue(job_at(
+                        "o",
+                        "r",
+                        "restart-race",
+                        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    ))
+                    .await
+                    .unwrap()
+                    .outcome;
+                assert_eq!(outcome, EnqueueOutcome::Coalesced);
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+
+        let pool = sqlx::sqlite::SqlitePool::connect(&format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        let active: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE status IN ('queued', 'claimed')")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(active, 1, "restart races preserve one active exact job");
+        let index_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_jobs_active_identity_v3'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(index_count, 1, "versioned active index remains installed");
+    }
+
     // ---- Postgres / MySQL: exercised against a real server (env-gated) --------
     //
     // These need a live network DB, so they run only when RIPCLONE_TEST_PG_URL /
@@ -2040,14 +2098,42 @@ mod tests {
             .await
             .expect("drop jobs");
         pool.close().await;
-        let q = SqlJobQueue::new(Box::new(
-            crate::queue::postgres_db::PostgresDb::connect(&url)
-                .await
-                .unwrap(),
-        ))
-        .await
-        .unwrap();
+        let q = Arc::new(
+            SqlJobQueue::new(Box::new(
+                crate::queue::postgres_db::PostgresDb::connect(&url)
+                    .await
+                    .unwrap(),
+            ))
+            .await
+            .unwrap(),
+        );
         exercise_core(&q).await;
+        let race = job_at("o", "r", "pg-restart", "a".repeat(40).as_str());
+        q.enqueue(race).await.unwrap();
+        let mut tasks = Vec::new();
+        for _ in 0..6 {
+            let url = url.clone();
+            tasks.push(tokio::spawn(async move {
+                SqlJobQueue::new(Box::new(
+                    crate::queue::postgres_db::PostgresDb::connect(&url)
+                        .await
+                        .unwrap(),
+                ))
+                .await
+                .unwrap();
+            }));
+            let q = Arc::clone(&q);
+            tasks.push(tokio::spawn(async move {
+                let duplicate = q
+                    .enqueue(job_at("o", "r", "pg-restart", &"a".repeat(40)))
+                    .await
+                    .unwrap();
+                assert_eq!(duplicate.outcome, EnqueueOutcome::Coalesced);
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
     }
 
     #[tokio::test]
@@ -2064,14 +2150,55 @@ mod tests {
             .await
             .expect("drop jobs");
         pool.close().await;
-        let q = SqlJobQueue::new(Box::new(
-            crate::queue::mysql_db::MysqlDb::connect(&url)
-                .await
-                .unwrap(),
-        ))
-        .await
-        .unwrap();
+        let q = Arc::new(
+            SqlJobQueue::new(Box::new(
+                crate::queue::mysql_db::MysqlDb::connect(&url)
+                    .await
+                    .unwrap(),
+            ))
+            .await
+            .unwrap(),
+        );
         exercise_core(&q).await;
+
+        let upper = q
+            .enqueue(job_at("o", "r", "Feature", &"d".repeat(40)))
+            .await
+            .unwrap();
+        let lower = q
+            .enqueue(job_at("o", "r", "feature", &"d".repeat(40)))
+            .await
+            .unwrap();
+        assert_eq!(upper.outcome, EnqueueOutcome::Enqueued);
+        assert_eq!(lower.outcome, EnqueueOutcome::Enqueued);
+        assert_ne!(upper.job_id, lower.job_id, "Git branch case is significant");
+
+        let race = job_at("o", "r", "mysql-restart", &"e".repeat(40));
+        q.enqueue(race).await.unwrap();
+        let mut tasks = Vec::new();
+        for _ in 0..6 {
+            let url = url.clone();
+            tasks.push(tokio::spawn(async move {
+                SqlJobQueue::new(Box::new(
+                    crate::queue::mysql_db::MysqlDb::connect(&url)
+                        .await
+                        .unwrap(),
+                ))
+                .await
+                .unwrap();
+            }));
+            let q = Arc::clone(&q);
+            tasks.push(tokio::spawn(async move {
+                let duplicate = q
+                    .enqueue(job_at("o", "r", "mysql-restart", &"e".repeat(40)))
+                    .await
+                    .unwrap();
+                assert_eq!(duplicate.outcome, EnqueueOutcome::Coalesced);
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
     }
 
     /// Two-class launch config: small ≤ 100 bytes, large catch-all.

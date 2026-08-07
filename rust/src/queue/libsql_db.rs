@@ -7,8 +7,7 @@ use super::sql::{
     ADD_ADMITTED_COMMIT_COLUMN_SQL, ADD_ADMITTED_DEFAULT_BRANCH_COLUMN_SQL,
     ADD_ATTEMPTS_COLUMN_SQL, ADD_CREDENTIAL_COLUMN_SQL, ADD_SIZE_CLASS_COLUMN_SQL,
     CREATE_ACTIVE_KEY_INDEX_SQL, CREATE_HISTORY_INDEX_SQL, CREATE_STATUS_INDEX_SQL,
-    CREATE_TABLE_SQL, CREATE_WORKERS_HEARTBEAT_INDEX_SQL, CREATE_WORKERS_TABLE_SQL,
-    DROP_LEGACY_ACTIVE_KEY_INDEX_SQL, DROP_LEGACY_QUEUED_KEY_INDEX_SQL, QueueDb,
+    CREATE_TABLE_SQL, CREATE_WORKERS_HEARTBEAT_INDEX_SQL, CREATE_WORKERS_TABLE_SQL, QueueDb,
     SETTLE_LEGACY_ACTIVE_SQL, SUPERSEDED_BY_NEWER_QUEUED, now_secs,
 };
 use anyhow::{Context, Result};
@@ -65,8 +64,6 @@ impl QueueDb for LibsqlDb {
         conn.execute(CREATE_STATUS_INDEX_SQL, ())
             .await
             .context("create status index")?;
-        let _ = conn.execute(DROP_LEGACY_ACTIVE_KEY_INDEX_SQL, ()).await;
-        let _ = conn.execute(DROP_LEGACY_QUEUED_KEY_INDEX_SQL, ()).await;
         conn.execute(CREATE_ACTIVE_KEY_INDEX_SQL, ())
             .await
             .context("create active-key uniqueness index")?;

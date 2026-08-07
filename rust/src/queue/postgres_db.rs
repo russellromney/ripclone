@@ -104,15 +104,10 @@ impl QueueDb for PostgresDb {
         .execute(&self.pool)
         .await
         .context("create status index")?;
-        // Replace both legacy index names with the active constraint.
-        let _ = sqlx::raw_sql("DROP INDEX IF EXISTS idx_jobs_active_key")
-            .execute(&self.pool)
-            .await;
-        let _ = sqlx::raw_sql("DROP INDEX IF EXISTS idx_jobs_queued_key")
-            .execute(&self.pool)
-            .await;
+        // Monotonic v3 migration: use a versioned name and never remove an
+        // existing uniqueness backstop during concurrent process startup.
         sqlx::raw_sql(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_active_key
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_active_identity_v3
              ON jobs(key) WHERE status IN ('queued', 'claimed')",
         )
         .execute(&self.pool)
