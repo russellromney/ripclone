@@ -1366,12 +1366,15 @@ fn upstream_auth_header(
 
 fn upstream_git_error(
     op: &'static str,
-    url: &str,
+    _url: &str,
     auth_header: Option<(String, String)>,
     stderr: &[u8],
 ) -> anyhow::Error {
     let detail = sanitize_git_stderr(stderr, auth_header.as_ref());
-    let retryable = upstream_failure_is_retryable(url, auth_header);
+    // Classify the result of this Git operation. Never issue a second provider
+    // request to guess whether the first one was retryable: admission owns one
+    // bounded ls-remote process and its result is the whole probe boundary.
+    let retryable = upstream_failure_is_retryable(stderr);
     anyhow::Error::new(UpstreamGitError::with_detail(op, retryable, detail))
 }
 
@@ -1410,42 +1413,28 @@ fn sanitize_git_stderr(stderr: &[u8], auth_header: Option<&(String, String)>) ->
     }
 }
 
-fn upstream_failure_is_retryable(url: &str, auth_header: Option<(String, String)>) -> bool {
-    let Ok(parsed) = url::Url::parse(url) else {
-        return false;
-    };
-    if !matches!(parsed.scheme(), "http" | "https") {
-        return false;
-    }
-
-    let Ok(client) = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-    else {
-        return true;
-    };
-    let mut req = client
-        .get(url)
-        .header(reqwest::header::USER_AGENT, "ripclone");
-    if let Some((name, value)) = auth_header
-        && let (Ok(name), Ok(value)) = (
-            reqwest::header::HeaderName::from_bytes(name.as_bytes()),
-            reqwest::header::HeaderValue::from_str(&value),
-        )
-    {
-        req = req.header(name, value);
-    }
-
-    match req.send() {
-        Ok(resp) => {
-            let status = resp.status();
-            status == reqwest::StatusCode::TOO_MANY_REQUESTS
-                || status == reqwest::StatusCode::REQUEST_TIMEOUT
-                || status.is_server_error()
-        }
-        Err(e) => e.is_timeout() || e.is_connect(),
-    }
+fn upstream_failure_is_retryable(stderr: &[u8]) -> bool {
+    let detail = String::from_utf8_lossy(stderr).to_ascii_lowercase();
+    let retryable_transport_failure = [
+        "returned error: 408",
+        "returned error: 429",
+        "operation timed out",
+        "connection timed out",
+        "connection reset",
+        "failed to connect",
+        "could not resolve host",
+        "couldn't connect to server",
+        "remote end hung up unexpectedly",
+    ]
+    .iter()
+    .any(|needle| detail.contains(needle));
+    let retryable_server_error = detail
+        .split("returned error: ")
+        .skip(1)
+        .filter_map(|suffix| suffix.get(..3))
+        .filter_map(|status| status.parse::<u16>().ok())
+        .any(|status| (500..600).contains(&status));
+    retryable_transport_failure || retryable_server_error
 }
 
 /// Resolve the upstream tip of `ref_name` via `git ls-remote` — one
@@ -1968,6 +1957,7 @@ pub fn sync_bare_mirror<P: AsRef<Path>>(
             auth_header.clone(),
             branch,
             rev,
+            true,
         )?;
     } else if mirror_dir.as_ref().exists() {
         // A `--mirror` clone is configured with `+refs/*:refs/*` (and prunes), so
@@ -2040,6 +2030,38 @@ pub fn sync_bare_mirror<P: AsRef<Path>>(
     Ok(())
 }
 
+/// Fetch one admitted immutable commit without consulting or transferring the
+/// moving branch. The object is retained under an internal ref so a subsequent
+/// branch advance or deletion cannot change this job's source acquisition.
+pub fn sync_bare_mirror_admitted<P: AsRef<Path>>(
+    mirror_dir: P,
+    provider: &ProviderInstance,
+    repo_id: &RepoId,
+    commit: &str,
+    credential: Option<&secrecy::SecretString>,
+) -> Result<()> {
+    crate::validation::validate_repo_path(provider, repo_id)
+        .with_context(|| format!("invalid repo path: {}", repo_id.storage_key()))?;
+    crate::validation::validate_object_id(commit)
+        .with_context(|| format!("invalid admitted commit: {commit}"))?;
+    if !is_full_hex_object_id(commit) {
+        bail!("admitted commit must be a full object id: {commit}");
+    }
+
+    let _mirror_lock = MirrorLock::acquire(mirror_dir.as_ref())?;
+    let (url, git_args) = upstream_url_and_auth(provider, repo_id, credential);
+    let auth_header = upstream_auth_header(provider, credential);
+    sync_bare_mirror_rev(
+        mirror_dir.as_ref(),
+        &url,
+        &git_args,
+        auth_header,
+        "HEAD",
+        commit,
+        false,
+    )
+}
+
 fn ensure_bare_origin(mirror_dir: &Path, url: &str) -> Result<()> {
     if !mirror_dir.exists() {
         std::fs::create_dir_all(mirror_dir.parent().unwrap_or(Path::new("")))?;
@@ -2089,6 +2111,7 @@ fn sync_bare_mirror_rev(
     auth_header: Option<(String, String)>,
     branch: &str,
     rev: &str,
+    include_branch: bool,
 ) -> Result<()> {
     ensure_bare_origin(mirror_dir, url)?;
 
@@ -2096,7 +2119,7 @@ fn sync_bare_mirror_rev(
         "{rev}:refs/ripclone/revs/{}",
         rev_internal_ref_name(rev)
     )];
-    if let Some(branch_refspec) = branch_fetch_refspec(branch) {
+    if include_branch && let Some(branch_refspec) = branch_fetch_refspec(branch) {
         refspecs.push(branch_refspec);
     }
 
@@ -2324,47 +2347,32 @@ mod tests {
     use rayon::scope;
     use std::io::Read;
 
-    fn one_response_url(status: &str) -> String {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let status = status.to_string();
-        std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut buf = [0; 1024];
-            let _ = stream.read(&mut buf);
-            write!(
-                stream,
-                "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-            )
-            .unwrap();
-        });
-        format!("http://{addr}/repo.git")
-    }
-
     #[test]
-    fn upstream_probe_retries_only_transient_http_statuses() {
-        for status in [
-            "408 Request Timeout",
-            "429 Too Many Requests",
-            "503 Service Unavailable",
+    fn upstream_failure_classification_uses_the_git_result() {
+        for detail in [
+            "fatal: unable to access: The requested URL returned error: 408",
+            "fatal: unable to access: The requested URL returned error: 429",
+            "fatal: unable to access: The requested URL returned error: 501",
+            "fatal: unable to access: The requested URL returned error: 503",
+            "fatal: unable to access: Failed to connect to host",
+            "fatal: unable to access: Could not resolve host",
         ] {
             assert!(
-                upstream_failure_is_retryable(&one_response_url(status), None),
-                "{status} should be retryable"
+                upstream_failure_is_retryable(detail.as_bytes()),
+                "{detail} should be retryable"
             );
         }
 
-        for status in [
-            "200 OK",
-            "302 Found",
-            "400 Bad Request",
-            "401 Unauthorized",
-            "403 Forbidden",
-            "404 Not Found",
+        for detail in [
+            "fatal: unable to access: The requested URL returned error: 400",
+            "fatal: unable to access: The requested URL returned error: 401",
+            "fatal: unable to access: The requested URL returned error: 403",
+            "fatal: unable to access: The requested URL returned error: 404",
+            "fatal: remote error: upload-pack: not our ref deadbeef",
         ] {
             assert!(
-                !upstream_failure_is_retryable(&one_response_url(status), None),
-                "{status} should be terminal"
+                !upstream_failure_is_retryable(detail.as_bytes()),
+                "{detail} should be terminal"
             );
         }
     }
@@ -2716,6 +2724,76 @@ mod tests {
             resolve_commit(&mirror, "other").is_err(),
             "rev sync must not fetch unrelated branches"
         );
+    }
+
+    #[test]
+    fn admitted_fetch_transfers_only_the_pinned_commit_not_the_moving_branch() {
+        use crate::provider::{ProviderRegistry, RepoId};
+        let base = tempfile::tempdir().unwrap();
+        let origin = base.path().join("acme").join("widget.git");
+        std::fs::create_dir_all(origin.parent().unwrap()).unwrap();
+        let src = crate::test_fixture::init_bare(&origin);
+        let commit_b = crate::test_fixture::commit(&src, &[("README.md", b"B")]);
+        let commit_c = crate::test_fixture::commit(&src, &[("README.md", b"C")]);
+        let mirror = base.path().join("mirror-admitted.git");
+        let registry = ProviderRegistry::new();
+        let provider = registry.default_provider();
+        let repo_id = RepoId::github("acme/widget");
+
+        let _env = ORIGIN_BASE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("RIPCLONE_ORIGIN_BASE", base.path()) };
+        sync_bare_mirror_admitted(&mirror, provider, &repo_id, &commit_b, None).unwrap();
+        unsafe { std::env::remove_var("RIPCLONE_ORIGIN_BASE") };
+
+        assert_eq!(resolve_commit(&mirror, &commit_b).unwrap(), commit_b);
+        assert!(
+            resolve_commit(&mirror, &commit_c).is_err(),
+            "the later branch tip must not be transferred by B's exact fetch"
+        );
+        assert!(
+            resolve_commit(&mirror, "main").is_err(),
+            "an immutable fetch must not update the moving branch ref"
+        );
+    }
+
+    #[test]
+    fn admitted_fetch_survives_branch_deletion_when_commit_remains_available() {
+        use crate::provider::{ProviderRegistry, RepoId};
+        let base = tempfile::tempdir().unwrap();
+        let origin = base.path().join("acme").join("deleted.git");
+        std::fs::create_dir_all(origin.parent().unwrap()).unwrap();
+        let src = crate::test_fixture::init_bare(&origin);
+        let commit_b = crate::test_fixture::commit(&src, &[("README.md", b"B")]);
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&origin)
+                .args(["update-ref", "refs/keep/admitted-b", &commit_b])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&origin)
+                .args(["update-ref", "-d", "refs/heads/main"])
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let mirror = base.path().join("mirror-deleted.git");
+        let registry = ProviderRegistry::new();
+        let provider = registry.default_provider();
+        let repo_id = RepoId::github("acme/deleted");
+        let _env = ORIGIN_BASE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("RIPCLONE_ORIGIN_BASE", base.path()) };
+        sync_bare_mirror_admitted(&mirror, provider, &repo_id, &commit_b, None).unwrap();
+        unsafe { std::env::remove_var("RIPCLONE_ORIGIN_BASE") };
+
+        assert_eq!(resolve_commit(&mirror, &commit_b).unwrap(), commit_b);
+        assert!(resolve_commit(&mirror, "main").is_err());
     }
 
     #[test]

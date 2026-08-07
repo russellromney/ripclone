@@ -93,6 +93,7 @@ pub struct AdmissionTestBarrier {
     released: AtomicBool,
     entered: AtomicUsize,
     notify: Arc<tokio::sync::Notify>,
+    armed_notify: Arc<tokio::sync::Notify>,
 }
 
 impl Default for AdmissionTestBarrier {
@@ -102,6 +103,7 @@ impl Default for AdmissionTestBarrier {
             released: AtomicBool::new(false),
             entered: AtomicUsize::new(0),
             notify: Arc::new(tokio::sync::Notify::new()),
+            armed_notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 }
@@ -111,6 +113,7 @@ impl AdmissionTestBarrier {
         self.entered.store(0, Ordering::SeqCst);
         self.released.store(false, Ordering::SeqCst);
         self.armed.store(true, Ordering::SeqCst);
+        self.armed_notify.notify_waiters();
     }
 
     pub fn disarm(&self) {
@@ -151,6 +154,10 @@ impl AdmissionTestBarrier {
             }
             notified.await;
         }
+    }
+
+    fn is_armed(&self) -> bool {
+        self.armed.load(Ordering::SeqCst)
     }
 }
 
@@ -296,6 +303,31 @@ fn admission_test_probe() -> Option<Arc<AdmissionTestProbe>> {
 pub async fn admission_test_before_claim() {
     if let Some(probe) = admission_test_probe() {
         probe.before_claim.wait().await;
+    }
+}
+
+/// Receive a local job while allowing a newly armed test gate to interrupt a
+/// worker already parked on an empty channel. This keeps the observable gate on
+/// the real pre-receive side of the local claim boundary.
+async fn admission_test_recv_before_claim(
+    rx: &mut tokio::sync::mpsc::Receiver<BuildJob>,
+) -> Option<BuildJob> {
+    let Some(probe) = admission_test_probe() else {
+        return rx.recv().await;
+    };
+    loop {
+        if probe.before_claim.is_armed() {
+            probe.before_claim.wait().await;
+            return rx.recv().await;
+        }
+        let armed = probe.before_claim.armed_notify.notified();
+        if probe.before_claim.is_armed() {
+            continue;
+        }
+        tokio::select! {
+            _ = armed => continue,
+            job = rx.recv() => return job,
+        }
     }
 }
 
@@ -2709,6 +2741,14 @@ fn stamp_mirror_fresh(state: &ServerState, key: &str) {
     map.insert(key.to_string(), Instant::now());
 }
 
+fn invalidate_mirror_fresh(state: &ServerState, key: &str) {
+    state
+        .mirror_freshness
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(key);
+}
+
 const REF_RESPONSE_CACHE_TTL: Duration = Duration::from_secs(30);
 
 fn ref_response_cache_key(repo_id: &RepoId, branch: &str, clonepack: &str) -> String {
@@ -3130,21 +3170,31 @@ async fn load_pinned_ref_info(
     })
 }
 
-/// Returns true when the branch's stored HEAD ref exists, matches the requested
-/// commit, and has been marked evicted. This lets rev requests trigger the same
-/// 202 rebuild path that tip requests use.
+/// Returns true when either the commit-keyed historical row or the moving row
+/// matches the requested commit and is evicted. The historical lookup is
+/// essential after the branch advances: `main#B` may be cold while `main` is a
+/// complete C, and a `--at B` caller still needs a schedulable rebuild.
 async fn branch_ref_is_evicted_for_commit(
     ref_store: &Arc<dyn RefStore>,
     repo_id: &RepoId,
     branch: &str,
     commit: &str,
 ) -> bool {
-    matches!(
-        ref_store.load_branch(repo_id, branch).await.ok().flatten(),
-        Some(info)
-            if info.commit == commit
-                && info.build_status.as_deref() == Some(crate::remote_gc::EVICTED_BUILD_STATUS)
-    )
+    for key in [
+        ref_store_key(branch, Some(commit), Some(commit)),
+        branch.to_string(),
+    ] {
+        if matches!(
+            ref_store.load_branch(repo_id, &key).await.ok().flatten(),
+            Some(info)
+                if info.commit == commit
+                    && info.build_status.as_deref()
+                        == Some(crate::remote_gc::EVICTED_BUILD_STATUS)
+        ) {
+            return true;
+        }
+    }
+    false
 }
 
 fn full_clonepack_pending_for_tip(info: &RefInfo, clonepack_kind: &str, commit: &str) -> bool {
@@ -3431,7 +3481,46 @@ async fn get_ref_inner(
                 served_key, info.commit
             );
         }
+        // This exact authenticated read is the compatibility readiness
+        // boundary for a build that may have completed in another process.
+        // Retire any unpinned response cached before admission so the caller's
+        // next ordinary HEAD/branch clone cannot fall back to the old commit.
+        invalidate_ref_response_cache(&state, &repo_id, &response_branch);
+        invalidate_ref_response_cache(&state, &repo_id, "HEAD");
         return (StatusCode::OK, Json(response)).into_response();
+    }
+
+    // A phase-one row is already an authenticated, immutable statement of the
+    // admitted target. For protocol-2 Full reads, report that target as pending
+    // directly from metadata instead of reacquiring the moving source merely
+    // to discover the same commit. HEAD may still be the prior alias while the
+    // phase-two task is blocked, so follow its stored default-branch name to
+    // the freshly published concrete row.
+    if protocol_v2 && params.rev.is_none() {
+        let mut candidates = vec![branch.clone()];
+        if branch == "HEAD"
+            && let Ok(Some(head)) = state.ref_store.load_branch(&repo_id, "HEAD").await
+            && !head.default_branch.is_empty()
+            && head.default_branch != "HEAD"
+        {
+            candidates.push(head.default_branch);
+        }
+        for candidate in candidates {
+            if let Ok(Some(info)) = state.ref_store.load_branch(&repo_id, &candidate).await
+                && !info.commit.is_empty()
+                && full_clonepack_pending_for_tip(&info, &params.clonepack, &info.commit)
+            {
+                return artifact_pending_response(
+                    &info.commit,
+                    if candidate == "HEAD" {
+                        branch.as_str()
+                    } else {
+                        candidate.as_str()
+                    },
+                    state.build_queue_depth.load(Ordering::Relaxed),
+                );
+            }
+        }
     }
 
     // Serialize syncs for this repo so concurrent fetches do not corrupt the
@@ -3653,11 +3742,16 @@ async fn get_ref_inner(
                     // after the repo has been re-warmed by the rebuild. For a
                     // concrete-branch request this is identical to `effective_branch`.
                     let size_bytes = enqueue_size_bytes(&state, &repo_id, &branch).await;
+                    // Historical eviction stays in the historical lane. It
+                    // rebuilds the commit-keyed `branch#commit` row and must
+                    // not republish the moving branch, which may already be at
+                    // a newer commit.
+                    let historical_rev = params.rev.clone();
                     let job = BuildJob {
                         repo_id: repo_id.clone(),
                         branch: branch.clone(),
-                        rev: None,
-                        admitted_commit: Some(commit.clone()),
+                        rev: historical_rev.clone(),
+                        admitted_commit: historical_rev.is_none().then(|| commit.clone()),
                         admitted_default_branch: None,
                         credential: credential.clone(),
                         recheck: 0,
@@ -4311,11 +4405,19 @@ async fn sync_repo_inner(
     if params.rev.is_some() {
         return sync_repo_inner_legacy(repo_id, provider, params, headers, state).await;
     }
-    match repo_is_added(&state, &repo_id).await {
-        Ok(true) => {}
-        Ok(false) => return repo_not_added_response(),
-        Err(resp) => return resp,
-    }
+    let added_repo = match state.ref_store.load_added_repo(&repo_id).await {
+        Ok(Some(added)) => added,
+        Ok(None) => return repo_not_added_response(),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("added repo lookup failed: {e}"),
+                }),
+            )
+                .into_response();
+        }
+    };
 
     let request_token = upstream_token_from_headers(&headers);
     let credential = match state
@@ -4382,21 +4484,12 @@ async fn sync_repo_inner(
     // not call reuse_existing_build/touch/access-time helpers here: a ready
     // unchanged sync after its one probe has no queue, source, builder, or
     // metadata mutation side effect.
-    let ready = match state
+    let loaded_branch = match state
         .ref_store
         .load_branch(&repo_id, &effective_branch)
         .await
     {
-        Ok(Some(info))
-            if exact_ref_info_serves_commit(&info, "full", &commit)
-                && !info
-                    .build_status
-                    .as_deref()
-                    .is_some_and(|status| status.starts_with("failed: ")) =>
-        {
-            Some(info)
-        }
-        Ok(_) => None,
+        Ok(info) => info,
         Err(e) => {
             state.metrics.record_error();
             return (
@@ -4408,13 +4501,20 @@ async fn sync_repo_inner(
                 .into_response();
         }
     };
+    let ready = loaded_branch.as_ref().filter(|info| {
+        exact_ref_info_serves_commit(info, "full", &commit)
+            && !info
+                .build_status
+                .as_deref()
+                .is_some_and(|status| status.starts_with("failed: "))
+    });
     if let Some(info) = ready {
         state.metrics.record_sync(start.elapsed());
         let resp = sync_response_without_storage_read(
             &repo_id,
             &provider,
             effective_branch,
-            &info,
+            info,
             &state.storage,
             "full",
             private,
@@ -4424,7 +4524,25 @@ async fn sync_repo_inner(
     }
 
     let admitted_branch = effective_branch.clone();
-    let size_bytes = enqueue_size_bytes(&state, &repo_id, &admitted_branch).await;
+    let prior_size_bytes = loaded_branch.as_ref().and_then(|info| {
+        let bytes = crate::queue::prior_clonepack_bytes(info);
+        (bytes > 0).then_some(bytes)
+    });
+    let size_bytes =
+        crate::queue::resolve_job_size_bytes(prior_size_bytes, added_repo.repo_size_bytes);
+    // A prior unpinned HEAD/branch clone may have populated this process's
+    // caches with A. Clear those read caches before admission so the response
+    // boundary remains exactly the queue call; later reads can observe B from
+    // a separate worker instead of continuing to serve A.
+    invalidate_ref_response_cache(&state, &repo_id, &admitted_branch);
+    invalidate_ref_response_cache(&state, &repo_id, "HEAD");
+    state.ref_store.invalidate(&repo_id, &admitted_branch).await;
+    state.ref_store.invalidate(&repo_id, "HEAD").await;
+    invalidate_mirror_fresh(
+        &state,
+        &format!("{}/{}", repo_id.storage_key(), admitted_branch),
+    );
+    invalidate_mirror_fresh(&state, &format!("{}/HEAD", repo_id.storage_key()));
     let job = BuildJob {
         repo_id: repo_id.clone(),
         branch: admitted_branch.clone(),
@@ -4455,7 +4573,10 @@ async fn sync_repo_inner(
                 EnqueueOutcome::Full => "full",
             }
             .to_string(),
-            queue_depth: state.build_queue.depth().await,
+            // Admission is complete once enqueue returns. This process-local
+            // counter is an informational hint and never performs a second
+            // database operation after durable acceptance.
+            queue_depth: state.build_queue_depth.load(Ordering::Relaxed),
             commit: Some(commit),
             branch: Some(admitted_branch),
         }),
@@ -5332,7 +5453,7 @@ async fn build_handler(
                     EnqueueOutcome::Full => "full",
                 }
                 .to_string(),
-                queue_depth: state.build_queue.depth().await,
+                queue_depth: state.build_queue_depth.load(Ordering::Relaxed),
                 commit: Some(tip.commit),
                 branch: Some(admitted_branch),
             }),
@@ -7067,7 +7188,8 @@ async fn do_sync(
     let provider_sync = provider.clone();
     let repo_id_sync = repo_id.clone();
     let branch_sync = branch.to_string();
-    let rev_sync = admitted_commit.or(at_rev).map(str::to_string);
+    let admitted_commit_sync = admitted_commit.map(str::to_string);
+    let historical_rev_sync = at_rev.map(str::to_string);
     let credential_sync = credential.cloned();
     admission_test_fetch_entry(admitted_commit.or(at_rev)).await;
     // Cap concurrent upstream fetches across the process (bandwidth + upstream
@@ -7077,14 +7199,24 @@ async fn do_sync(
         .await
         .expect("fetch semaphore never closed");
     tokio::task::spawn_blocking(move || {
-        git::sync_bare_mirror(
-            &mirror_dir_sync,
-            &provider_sync,
-            &repo_id_sync,
-            &branch_sync,
-            rev_sync.as_deref(),
-            credential_sync.as_ref(),
-        )
+        if let Some(commit) = admitted_commit_sync.as_deref() {
+            git::sync_bare_mirror_admitted(
+                &mirror_dir_sync,
+                &provider_sync,
+                &repo_id_sync,
+                commit,
+                credential_sync.as_ref(),
+            )
+        } else {
+            git::sync_bare_mirror(
+                &mirror_dir_sync,
+                &provider_sync,
+                &repo_id_sync,
+                &branch_sync,
+                historical_rev_sync.as_deref(),
+                credential_sync.as_ref(),
+            )
+        }
     })
     .await
     .context("sync task")??;
@@ -8584,23 +8716,29 @@ pub async fn process_build_job(
                     );
                 }
             }
-            // A successful sync marks the mirror fresh so a following resolve
-            // doesn't re-fetch. Stamp both the concrete branch and the original
-            // requested branch (e.g. HEAD).
-            stamp_mirror_fresh(
-                state,
-                &format!("{}/{effective_branch}", repo_id.storage_key()),
-            );
-            // Ordinary HEAD admission may be canonicalized to the advertised
-            // concrete branch before the job reaches the worker. Preserve the
-            // historical literal-HEAD freshness boundary too, so a phase-one
-            // ref resolve does not refetch a source that the admitted job has
-            // already fetched while Full remains in the detached phase.
-            if at_rev.is_none() {
-                stamp_mirror_fresh(state, &format!("{}/HEAD", repo_id.storage_key()));
-            }
-            if branch != &effective_branch {
-                stamp_mirror_fresh(state, &format!("{}/{branch}", repo_id.storage_key()));
+            // A moving/historical sync updates branch refs and can satisfy a
+            // following selector resolve from the mirror freshness cache. An
+            // immutable admitted fetch intentionally transfers only its object
+            // and does not update any moving ref, so marking HEAD/branch fresh
+            // here would make the ref endpoint skip its required branch fetch
+            // and either serve A or report HEAD missing.
+            if job.admitted_commit.is_none() {
+                stamp_mirror_fresh(
+                    state,
+                    &format!("{}/{effective_branch}", repo_id.storage_key()),
+                );
+                if at_rev.is_none() {
+                    stamp_mirror_fresh(state, &format!("{}/HEAD", repo_id.storage_key()));
+                }
+                if branch != &effective_branch {
+                    stamp_mirror_fresh(state, &format!("{}/{branch}", repo_id.storage_key()));
+                }
+            } else {
+                invalidate_mirror_fresh(
+                    state,
+                    &format!("{}/{effective_branch}", repo_id.storage_key()),
+                );
+                invalidate_mirror_fresh(state, &format!("{}/HEAD", repo_id.storage_key()));
             }
             invalidate_ref_response_cache(state, repo_id, &effective_branch);
             info!(
@@ -8674,18 +8812,25 @@ fn terminal_metadata_status(err: &BuildError) -> Option<String> {
     }
 }
 
-/// Write a terminal `failed: …` build status on the branch tip. Used by the
+/// Write a terminal `failed: …` build status for the job's admitted commit. Used by the
 /// cross-process worker after `ack` dead-letters a retryable error at the
 /// attempts cap — `process_build_job` intentionally leaves metadata non-terminal
 /// for retryable failures so intermediate retries don't look permanent.
-pub async fn mark_branch_build_failed(
+pub async fn mark_admitted_build_failed(
     state: &ServerState,
     repo_id: &RepoId,
     branch: &str,
+    admitted_commit: &str,
     message: &str,
 ) -> Result<()> {
-    let _ =
-        update_current_build_status(state, repo_id, branch, &format!("failed: {message}")).await?;
+    let _ = update_build_status(
+        state,
+        repo_id,
+        branch,
+        admitted_commit,
+        &format!("failed: {message}"),
+    )
+    .await?;
     Ok(())
 }
 
@@ -8997,8 +9142,7 @@ fn spawn_build_worker(state: ServerState, mut rx: tokio::sync::mpsc::Receiver<Bu
             // Test-only gate: an accepted local job can be observed in the
             // queue before the worker claims it. The production path returns
             // immediately because this is a no-op when no probe is installed.
-            admission_test_before_claim().await;
-            let Some(job) = rx.recv().await else {
+            let Some(job) = admission_test_recv_before_claim(&mut rx).await else {
                 break;
             };
             // Block here until a build slot frees, so we never spawn faster than
@@ -11077,6 +11221,95 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
+    async fn ordinary_http_returns_after_enqueue_without_querying_queue_depth() {
+        struct DepthMustNotRunQueue;
+
+        #[async_trait::async_trait]
+        impl crate::queue::JobQueue for DepthMustNotRunQueue {
+            async fn enqueue(&self, _job: BuildJob) -> anyhow::Result<crate::queue::Enqueued> {
+                Ok(crate::queue::Enqueued {
+                    outcome: EnqueueOutcome::Enqueued,
+                    job_id: Some(1),
+                })
+            }
+
+            async fn depth(&self) -> usize {
+                std::future::pending().await
+            }
+        }
+
+        let _env = crate::git::ORIGIN_BASE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let origin_base = tempfile::tempdir().unwrap();
+        let origin_path = origin_base.path().join("acme").join("accepted.git");
+        std::fs::create_dir_all(origin_path.parent().unwrap()).unwrap();
+        let origin = crate::test_fixture::init_bare(&origin_path);
+        let commit = crate::test_fixture::commit(&origin, &[("README.md", b"accepted")]);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = test_state(&tmp);
+        state.build_queue = Arc::new(DepthMustNotRunQueue);
+        let repo_id = RepoId::github("acme/accepted");
+        mark_added(&state, repo_id).await;
+        unsafe { std::env::set_var("RIPCLONE_ORIGIN_BASE", origin_base.path()) };
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            build_app(state).oneshot(test_request(
+                "POST",
+                "/v1/repos/github/acme/accepted/sync?branch=main",
+            )),
+        )
+        .await
+        .expect("accepted response must not wait for queue depth")
+        .unwrap();
+        unsafe { std::env::remove_var("RIPCLONE_ORIGIN_BASE") };
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["commit"], commit);
+    }
+
+    #[tokio::test]
+    async fn dead_lettered_b_cannot_mark_newer_c_failed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(&tmp);
+        let repo_id = RepoId::github("acme/fenced-failure");
+        let b = "b".repeat(40);
+        let c = "c".repeat(40);
+        state
+            .ref_store
+            .save_branch(
+                &repo_id,
+                "main",
+                &RefInfo {
+                    commit: c.clone(),
+                    build_status: Some("done".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        mark_admitted_build_failed(&state, &repo_id, "main", &b, "attempts exhausted")
+            .await
+            .unwrap();
+
+        let current = state
+            .ref_store
+            .load_branch(&repo_id, "main")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.commit, c);
+        assert_eq!(current.build_status.as_deref(), Some("done"));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn oidc_build_wakeup_ignores_body_target_and_admits_one_probed_head() {
         use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 
@@ -11135,7 +11368,7 @@ mod tests {
             std::env::set_var("RIPCLONE_ORIGIN_BASE", origin_base.path());
             std::env::set_var("RIPCLONE_TESTING", "1");
         }
-        let response = build_app(state)
+        let response = build_app(state.clone())
             .oneshot(
                 axum::http::Request::builder()
                     .method("POST")
@@ -13481,10 +13714,85 @@ mod tests {
             .expect("evicted ref read must enqueue a rebuild");
         assert_eq!(job.repo_id, rid);
         assert_eq!(job.branch, "main");
-        assert!(job.rev.is_none());
+        assert_eq!(job.rev.as_deref(), Some(tip.as_str()));
+        assert!(job.admitted_commit.is_none());
         assert!(
             rx.try_recv().is_err(),
             "exactly one rebuild must be enqueued"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn evicted_historical_b_with_current_c_enqueues_historical_rebuild() {
+        let _lock = crate::git::ORIGIN_BASE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let base = tempfile::tempdir().unwrap();
+        let origin_path = base.path().join("acme").join("history.git");
+        std::fs::create_dir_all(origin_path.parent().unwrap()).unwrap();
+        let origin = crate::test_fixture::init_bare(&origin_path);
+        let b = crate::test_fixture::commit(&origin, &[("f.txt", b"B")]);
+        let c = crate::test_fixture::commit(&origin, &[("f.txt", b"C")]);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, mut rx) = test_state_with_queue(&tmp);
+        let rid = RepoId::github("acme/history");
+        mark_added(&state, rid.clone()).await;
+        state
+            .ref_store
+            .save_branch(
+                &rid,
+                "main",
+                &RefInfo {
+                    commit: c.clone(),
+                    build_status: Some("done".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let historical_key = ref_store_key("main", Some(&b), Some(&b));
+        state
+            .ref_store
+            .save_branch(
+                &rid,
+                &historical_key,
+                &RefInfo {
+                    commit: b.clone(),
+                    build_status: Some(crate::remote_gc::EVICTED_BUILD_STATUS.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        unsafe { std::env::set_var("RIPCLONE_ORIGIN_BASE", base.path()) };
+        let response = build_app(state.clone())
+            .oneshot(request_with_auth(
+                "GET",
+                &format!("/v1/repos/github/acme/history/refs/main?rev={b}"),
+                Some(&auth_header()),
+            ))
+            .await
+            .unwrap();
+        unsafe { std::env::remove_var("RIPCLONE_ORIGIN_BASE") };
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let job = rx.try_recv().expect("historical B rebuild admitted");
+        assert_eq!(job.branch, "main");
+        assert_eq!(job.rev.as_deref(), Some(b.as_str()));
+        assert!(job.admitted_commit.is_none());
+        assert_eq!(
+            state
+                .ref_store
+                .load_branch(&rid, "main")
+                .await
+                .unwrap()
+                .unwrap()
+                .commit,
+            c,
+            "historical admission must not move the current branch"
         );
     }
 

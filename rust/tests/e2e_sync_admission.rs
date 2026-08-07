@@ -120,14 +120,18 @@ fn hanging_origin() -> (
     String,
     std::sync::mpsc::Receiver<()>,
     std::sync::mpsc::Receiver<bool>,
+    Arc<std::sync::atomic::AtomicUsize>,
     std::thread::JoinHandle<()>,
 ) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("hanging origin listener");
     let addr = listener.local_addr().expect("hanging origin address");
     let (accepted_tx, accepted_rx) = std::sync::mpsc::channel();
     let (closed_tx, closed_rx) = std::sync::mpsc::channel();
+    let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let thread_connections = Arc::clone(&connections);
     let thread = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("bounded ls-remote connected");
+        thread_connections.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         accepted_tx
             .send(())
             .expect("report hanging origin connection");
@@ -145,8 +149,31 @@ fn hanging_origin() -> (
         closed_tx
             .send(closed_by_client)
             .expect("report hanging origin closure");
+        // Keep observing the provider boundary briefly after Git closes the
+        // first request. A hidden retryability request would establish a
+        // second real connection here even though the internal probe counter
+        // still says one.
+        listener.set_nonblocking(true).unwrap();
+        let observe_until = Instant::now() + Duration::from_millis(750);
+        while Instant::now() < observe_until {
+            match listener.accept() {
+                Ok((_extra, _)) => {
+                    thread_connections.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("observe provider connections: {error}"),
+            }
+        }
     });
-    (format!("http://{addr}"), accepted_rx, closed_rx, thread)
+    (
+        format!("http://{addr}"),
+        accepted_rx,
+        closed_rx,
+        connections,
+        thread,
+    )
 }
 
 fn matching_processes(marker: &str) -> Vec<String> {
@@ -478,6 +505,9 @@ async fn e2e_sync_admission() {
     probe.fetch_entry.arm();
     probe.builder_entry.arm();
     probe.phase2_entry.arm();
+    // The worker is now stopped on the pre-receive side of the real local
+    // claim boundary. B will remain in the channel until this gate is released.
+    wait_entered(&probe.before_claim, 1).await;
     let (b_status, b_body, b_elapsed) = post_sync(&server, None).await;
     assert_eq!(
         b_status,
@@ -485,6 +515,8 @@ async fn e2e_sync_admission() {
         "B admission: {b_body}"
     );
     assert_eq!(response_commit(&b_body), b);
+    assert_eq!(b_body["queue_depth"], 1, "B is observably queued");
+    assert_eq!(probe.after_claim.entered(), 0, "B has not been claimed");
     assert!(
         b_elapsed < Duration::from_secs(5),
         "B response waited for blocked worker: {b_elapsed:?}"
@@ -524,7 +556,7 @@ async fn e2e_sync_admission() {
     );
     assert_eq!(probe.coalesces.load(std::sync::atomic::Ordering::SeqCst), 3);
 
-    wait_entered(&probe.before_claim, 1).await;
+    assert_eq!(b_body["queue_depth"], 1, "one B remains queued");
     probe.before_claim.release();
     probe.before_claim.disarm();
     wait_entered(&probe.after_claim, 1).await;
@@ -761,7 +793,8 @@ async fn e2e_sync_admission() {
     let timeout_builders = probe
         .builder_entries
         .load(std::sync::atomic::Ordering::SeqCst);
-    let (hanging_base, accepted_rx, closed_rx, hanging_thread) = hanging_origin();
+    let (hanging_base, accepted_rx, closed_rx, hanging_connections, hanging_thread) =
+        hanging_origin();
     let old_origin = std::env::var_os("RIPCLONE_ORIGIN_BASE");
     let old_timeout = std::env::var_os("RIPCLONE_LS_REMOTE_TIMEOUT_SECS");
     unsafe {
@@ -796,6 +829,11 @@ async fn e2e_sync_admission() {
     hanging_thread
         .join()
         .expect("timeout fixture thread reaped");
+    assert_eq!(
+        hanging_connections.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "one admission probe must make exactly one provider connection"
+    );
     assert_eq!(
         probe
             .queue_inserts
@@ -845,7 +883,8 @@ async fn e2e_sync_admission() {
     // the socket, direct process, and any helper descendant to be gone long
     // before the configured 30-second timeout could fire.
     reset_probe(&probe);
-    let (cancel_base, cancel_accepted, cancel_closed, cancel_thread) = hanging_origin();
+    let (cancel_base, cancel_accepted, cancel_closed, cancel_connections, cancel_thread) =
+        hanging_origin();
     let cancel_marker = cancel_base.clone();
     let old_origin = std::env::var_os("RIPCLONE_ORIGIN_BASE");
     let old_timeout = std::env::var_os("RIPCLONE_LS_REMOTE_TIMEOUT_SECS");
@@ -874,6 +913,11 @@ async fn e2e_sync_admission() {
         "request cancellation left the ls-remote connection open"
     );
     cancel_thread.join().expect("cancellation fixture reaped");
+    assert_eq!(
+        cancel_connections.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "cancelled admission must not start a second provider request"
+    );
     wait_for_no_matching_process(&cancel_marker).await;
     assert!(
         cancel_started.elapsed() < Duration::from_secs(10),

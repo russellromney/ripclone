@@ -68,7 +68,7 @@ use ripclone::queue::{
     BuildError, BuildJob, JobQueueRef, JobState, WorkerQueueRef, make_worker_id,
     validate_heartbeat_timing, worker_heartbeat_enabled_from_env, worker_heartbeat_interval_secs,
 };
-use ripclone::server::{ServerState, mark_branch_build_failed, process_build_job};
+use ripclone::server::{ServerState, mark_admitted_build_failed, process_build_job};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -299,6 +299,7 @@ async fn main() -> Result<()> {
                         format!("fetch credential for queued job {}", repo_id.storage_key())
                     })?;
                 let branch = claimed.branch.clone();
+                let terminal_commit = admitted_commit.clone();
                 let job = BuildJob {
                     repo_id: repo_id.clone(),
                     branch: branch.clone(),
@@ -337,8 +338,14 @@ async fn main() -> Result<()> {
                         // is the case that still needs a terminal write.
                         if maybe_retryable_msg.is_some()
                             && let Ok(JobState::Failed(err)) = queue.job_status(job_id).await
-                            && let Err(e) =
-                                mark_branch_build_failed(&state, &repo_id, &branch, &err).await
+                            && let Err(e) = mark_admitted_build_failed(
+                                &state,
+                                &repo_id,
+                                &branch,
+                                &terminal_commit,
+                                &err,
+                            )
+                            .await
                         {
                             error!(
                                 "failed to mark {}@{} terminal after dead-letter: {e:#}",
