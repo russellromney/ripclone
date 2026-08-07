@@ -247,6 +247,41 @@ async fn e2e_sync_admission() {
         "complete webhook replay wrote artifacts"
     );
 
+    // A correctly signed push with a malformed immutable target is ignored
+    // before probing, queueing, or mutating durable state. This is a
+    // non-vacuous control: the valid signed replay immediately above exercised
+    // the same authenticated route and exact-admission parser.
+    let malformed_refs = tree_snapshot(&server.repo_root);
+    let malformed_storage = tree_snapshot(&server.storage_dir);
+    let malformed_probe_count = probe.tip_probes.load(std::sync::atomic::Ordering::SeqCst);
+    let malformed_enqueue_count = probe
+        .enqueue_attempts
+        .load(std::sync::atomic::Ordering::SeqCst);
+    let (malformed_status, _) = post_webhook(&server, "main", "not-an-object-id").await;
+    assert_eq!(malformed_status, reqwest::StatusCode::OK);
+    assert_eq!(
+        probe.tip_probes.load(std::sync::atomic::Ordering::SeqCst),
+        malformed_probe_count,
+        "malformed signed target performed a tip probe"
+    );
+    assert_eq!(
+        probe
+            .enqueue_attempts
+            .load(std::sync::atomic::Ordering::SeqCst),
+        malformed_enqueue_count,
+        "malformed signed target reached admission"
+    );
+    assert_eq!(
+        malformed_refs,
+        tree_snapshot(&server.repo_root),
+        "malformed signed target wrote ref metadata"
+    );
+    assert_eq!(
+        malformed_storage,
+        tree_snapshot(&server.storage_dir),
+        "malformed signed target wrote artifacts"
+    );
+
     // A complete unchanged sync performs exactly one admission probe and one
     // metadata read, while the durable ref/artifact trees stay byte-identical.
     let refs_before = tree_snapshot(&server.repo_root);
