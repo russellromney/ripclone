@@ -3180,20 +3180,29 @@ async fn load_pinned_ref_info(
     })
 }
 
-/// Returns true when either the commit-keyed historical row or the moving row
-/// matches the requested commit and is evicted. The historical lookup is
-/// essential after the branch advances: `main#B` may be cold while `main` is a
-/// complete C, and a `--at B` caller still needs a schedulable rebuild.
+/// Returns true when the commit-keyed historical row, pre-upgrade raw-revision
+/// row, or moving row matches the requested commit and is evicted. Historical
+/// lookups are essential after the branch advances: `main#B` or `main#HEAD~2`
+/// may be cold while `main` is a complete C, and a `--at B` caller still needs
+/// a schedulable rebuild.
 async fn branch_ref_is_evicted_for_commit(
     ref_store: &Arc<dyn RefStore>,
     repo_id: &RepoId,
     branch: &str,
     commit: &str,
+    raw_rev: Option<&str>,
 ) -> bool {
-    for key in [
-        ref_store_key(branch, Some(commit), Some(commit)),
-        branch.to_string(),
-    ] {
+    let mut keys = vec![ref_store_key(branch, Some(commit), Some(commit))];
+    if let Some(raw_rev) = raw_rev {
+        let legacy_key = ref_store_key(branch, Some(raw_rev), None);
+        if !keys.contains(&legacy_key) {
+            keys.push(legacy_key);
+        }
+    }
+    if !keys.iter().any(|key| key == branch) {
+        keys.push(branch.to_string());
+    }
+    for key in keys {
         if matches!(
             ref_store.load_branch(repo_id, &key).await.ok().flatten(),
             Some(info)
@@ -3216,6 +3225,12 @@ fn full_clonepack_pending_for_tip(info: &RefInfo, clonepack_kind: &str, commit: 
         && info.commit == commit
         && info.build_status.as_deref() == Some(BUILDING_FULL_HISTORY)
         && !ref_info_serves_commit(info, clonepack_kind, commit)
+}
+
+fn phase_one_shallow_ready_for_tip(info: &RefInfo, clonepack_kind: &str, commit: &str) -> bool {
+    clonepack_kind == "shallow"
+        && info.build_status.as_deref() == Some(BUILDING_FULL_HISTORY)
+        && exact_ref_info_serves_commit(info, clonepack_kind, commit)
 }
 
 /// `build_status` set on a phase-1 row while the full history + archive build
@@ -3492,11 +3507,11 @@ async fn get_ref_inner(
     }
 
     // A phase-one row is already an authenticated, immutable statement of the
-    // admitted target. For protocol-2 Full reads, report that target as pending
-    // directly from metadata instead of reacquiring the moving source merely
-    // to discover the same commit. HEAD may still be the prior alias while the
-    // phase-two task is blocked, so follow its stored default-branch name to
-    // the freshly published concrete row.
+    // admitted target. Serve its published shallow artifact, or report its Full
+    // artifact pending, directly from metadata instead of reacquiring the
+    // moving source merely to discover the same commit. HEAD may still be the
+    // prior alias while phase two is blocked, so follow its stored
+    // default-branch name to the freshly published concrete row.
     if protocol_v2 && params.rev.is_none() {
         let mut candidates = vec![branch.clone()];
         if branch == "HEAD"
@@ -3507,17 +3522,43 @@ async fn get_ref_inner(
             candidates.push(head.default_branch);
         }
         for candidate in candidates {
-            if let Ok(Some(info)) = state.ref_store.load_branch(&repo_id, &candidate).await
-                && !info.commit.is_empty()
-                && full_clonepack_pending_for_tip(&info, &params.clonepack, &info.commit)
-            {
+            let Ok(Some(info)) = state.ref_store.load_branch(&repo_id, &candidate).await else {
+                continue;
+            };
+            if info.commit.is_empty() {
+                continue;
+            }
+            let response_branch = if candidate == "HEAD" && !info.default_branch.is_empty() {
+                info.default_branch.clone()
+            } else {
+                candidate.clone()
+            };
+            if phase_one_shallow_ready_for_tip(&info, &params.clonepack, &info.commit) {
+                let response = ref_response(
+                    &repo_id,
+                    &provider,
+                    response_branch,
+                    &info,
+                    &state.storage,
+                    &params.clonepack,
+                    private,
+                );
+                if let Err(e) = state
+                    .ref_store
+                    .touch_last_accessed_at(&repo_id, &candidate, &info.commit)
+                    .await
+                {
+                    warn!(
+                        "failed to touch phase-one shallow {}@{}: {e:#}",
+                        candidate, info.commit
+                    );
+                }
+                return (StatusCode::OK, Json(response)).into_response();
+            }
+            if full_clonepack_pending_for_tip(&info, &params.clonepack, &info.commit) {
                 return artifact_pending_response(
                     &info.commit,
-                    if candidate == "HEAD" {
-                        branch.as_str()
-                    } else {
-                        candidate.as_str()
-                    },
+                    &response_branch,
                     state.build_queue_depth.load(Ordering::Relaxed),
                 );
             }
@@ -3700,6 +3741,7 @@ async fn get_ref_inner(
                     &repo_id,
                     &effective_branch,
                     &commit,
+                    params.rev.as_deref(),
                 )
                 .await;
             let is_evicted =
@@ -3770,12 +3812,17 @@ async fn get_ref_inner(
                         recheck: 0,
                         size_bytes,
                     };
-                    if let Err(e) = enqueue_direct_build(&state, job).await {
+                    if let Err(error) = enqueue_direct_build(&state, job).await {
                         warn!(
-                            "failed to enqueue rebuild for evicted {}@{}: {e:#}",
+                            "failed to enqueue rebuild for evicted {}@{}: {error}",
                             repo_id.storage_key(),
                             effective_branch
                         );
+                        return (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(ErrorResponse { error }),
+                        )
+                            .into_response();
                     }
                 }
                 let queue_depth = state.build_queue_depth.load(Ordering::Relaxed);
@@ -10590,6 +10637,10 @@ mod tests {
             !full_clonepack_pending_for_tip(&info, "shallow", new_commit),
             "shallow is already exact for the new commit"
         );
+        assert!(
+            phase_one_shallow_ready_for_tip(&info, "shallow", new_commit),
+            "phase-one shallow metadata is immediately usable"
+        );
     }
 
     #[test]
@@ -13526,6 +13577,174 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn protocol_v2_evicted_get_returns_503_when_local_queue_is_full() {
+        let _lock = crate::git::ORIGIN_BASE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let origin_base = tempfile::tempdir().unwrap();
+        let origin_path = origin_base.path().join("acme").join("evicted-full.git");
+        std::fs::create_dir_all(origin_path.parent().unwrap()).unwrap();
+        let origin = crate::test_fixture::init_bare(&origin_path);
+        let commit = crate::test_fixture::commit(&origin, &[("f.txt", b"ready")]);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = test_state(&tmp);
+        let (queue, mut rx, depth) = crate::queue::LocalJobQueue::new(1);
+        queue
+            .enqueue(BuildJob {
+                repo_id: RepoId::github("acme/filler"),
+                branch: "main".to_string(),
+                rev: None,
+                admitted_commit: Some("f".repeat(40)),
+                admitted_default_branch: None,
+                credential: None,
+                recheck: 0,
+                size_bytes: None,
+            })
+            .await
+            .unwrap();
+        state.build_queue = Arc::new(queue);
+        state.build_queue_depth = Arc::clone(&depth);
+        let repo_id = RepoId::github("acme/evicted-full");
+        mark_added(&state, repo_id.clone()).await;
+        state
+            .ref_store
+            .save_branch(
+                &repo_id,
+                "main",
+                &RefInfo {
+                    commit,
+                    build_status: Some(crate::remote_gc::EVICTED_BUILD_STATUS.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        unsafe {
+            std::env::set_var("RIPCLONE_ORIGIN_BASE", origin_base.path());
+            std::env::set_var("RIPCLONE_TESTING", "1");
+        }
+
+        let response = build_app(state.clone())
+            .oneshot(protocol_request(
+                "/v1/repos/github/acme/evicted-full/refs/main?clonepack=shallow",
+                Some("2"),
+            ))
+            .await
+            .unwrap();
+        unsafe {
+            std::env::remove_var("RIPCLONE_ORIGIN_BASE");
+            std::env::remove_var("RIPCLONE_TESTING");
+        }
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("build queue full"));
+        assert_eq!(depth.load(Ordering::SeqCst), 1, "only the filler remains");
+        let filler = rx.try_recv().expect("preexisting filler remains queued");
+        assert_eq!(filler.repo_id, RepoId::github("acme/filler"));
+        assert!(rx.try_recv().is_err(), "no eviction rebuild was inserted");
+        assert!(state.storage.list_hashes().unwrap().is_empty());
+        assert!(state.build_waiters.lock().await.is_empty());
+        assert_eq!(
+            state
+                .ref_store
+                .load_branch(&repo_id, "main")
+                .await
+                .unwrap()
+                .unwrap()
+                .build_status
+                .as_deref(),
+            Some(crate::remote_gc::EVICTED_BUILD_STATUS),
+            "queue rejection cannot claim that a rebuild started"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn protocol_v2_evicted_get_returns_503_when_queue_errors() {
+        struct ErrorQueue {
+            attempts: Arc<AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::queue::JobQueue for ErrorQueue {
+            async fn enqueue(&self, _job: BuildJob) -> anyhow::Result<crate::queue::Enqueued> {
+                self.attempts.fetch_add(1, Ordering::SeqCst);
+                anyhow::bail!("forced queue outage")
+            }
+
+            async fn depth(&self) -> usize {
+                0
+            }
+        }
+
+        let _lock = crate::git::ORIGIN_BASE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let origin_base = tempfile::tempdir().unwrap();
+        let origin_path = origin_base.path().join("acme").join("evicted-error.git");
+        std::fs::create_dir_all(origin_path.parent().unwrap()).unwrap();
+        let origin = crate::test_fixture::init_bare(&origin_path);
+        let commit = crate::test_fixture::commit(&origin, &[("f.txt", b"ready")]);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = test_state(&tmp);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        state.build_queue = Arc::new(ErrorQueue {
+            attempts: Arc::clone(&attempts),
+        });
+        let repo_id = RepoId::github("acme/evicted-error");
+        mark_added(&state, repo_id.clone()).await;
+        state
+            .ref_store
+            .save_branch(
+                &repo_id,
+                "main",
+                &RefInfo {
+                    commit,
+                    build_status: Some(crate::remote_gc::EVICTED_BUILD_STATUS.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        unsafe { std::env::set_var("RIPCLONE_ORIGIN_BASE", origin_base.path()) };
+
+        let response = build_app(state.clone())
+            .oneshot(protocol_request(
+                "/v1/repos/github/acme/evicted-error/refs/main?clonepack=shallow",
+                Some("2"),
+            ))
+            .await
+            .unwrap();
+        unsafe { std::env::remove_var("RIPCLONE_ORIGIN_BASE") };
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("forced queue outage"));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert!(state.storage.list_hashes().unwrap().is_empty());
+        assert_eq!(
+            state
+                .ref_store
+                .load_branch(&repo_id, "main")
+                .await
+                .unwrap()
+                .unwrap()
+                .build_status
+                .as_deref(),
+            Some(crate::remote_gc::EVICTED_BUILD_STATUS),
+            "queue outage cannot claim that a rebuild started"
+        );
+    }
+
+    #[tokio::test]
     async fn branch_ref_is_evicted_for_commit_detects_evicted_head() {
         let tmp = tempfile::tempdir().unwrap();
         let repo_root = tmp.path().join("repos");
@@ -13542,15 +13761,15 @@ mod tests {
         ref_store.save_branch(&rid, "main", &evicted).await.unwrap();
 
         assert!(
-            branch_ref_is_evicted_for_commit(&ref_store, &rid, "main", "abc123").await,
+            branch_ref_is_evicted_for_commit(&ref_store, &rid, "main", "abc123", None).await,
             "must detect evicted ref for matching commit"
         );
         assert!(
-            !branch_ref_is_evicted_for_commit(&ref_store, &rid, "main", "other").await,
+            !branch_ref_is_evicted_for_commit(&ref_store, &rid, "main", "other", None).await,
             "must not flag a different commit"
         );
         assert!(
-            !branch_ref_is_evicted_for_commit(&ref_store, &rid, "feature", "abc123").await,
+            !branch_ref_is_evicted_for_commit(&ref_store, &rid, "feature", "abc123", None).await,
             "must not flag a missing branch"
         );
     }
@@ -13864,7 +14083,7 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
-    async fn evicted_symbolic_history_is_pinned_before_claim_and_rebuilds_original_commit() {
+    async fn evicted_legacy_raw_symbolic_history_is_pinned_and_rebuilds_original_commit() {
         let _lock = crate::git::ORIGIN_BASE_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -13893,7 +14112,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let historical_key = ref_store_key("main", Some(&b), Some(&b));
+        let historical_key = ref_store_key("main", Some("HEAD~2"), None);
         state
             .ref_store
             .save_branch(
@@ -13957,7 +14176,7 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
-    async fn evicted_historical_get_rejects_sql_api_queue_without_insertion() {
+    async fn evicted_legacy_raw_history_rejects_sql_api_queue_without_insertion() {
         let _lock = crate::git::ORIGIN_BASE_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -14002,7 +14221,7 @@ mod tests {
             .ref_store
             .save_branch(
                 &rid,
-                &ref_store_key("main", Some(&b), Some(&b)),
+                &ref_store_key("main", Some("HEAD~2"), None),
                 &RefInfo {
                     commit: b,
                     build_status: Some(crate::remote_gc::EVICTED_BUILD_STATUS.to_string()),

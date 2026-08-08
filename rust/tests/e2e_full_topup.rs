@@ -717,7 +717,10 @@ real_git='{}'
 for arg in "$@"; do
   if [ "$arg" = "fetch" ] || [ "$arg" = "clone" ]; then
     case " $* " in
-      *"$server_root"*) printf '%s\n' "$*" >>"$source_log" ;;
+      *"$server_root"*)
+        printf '%s\n' "$*" >>"$source_log"
+        if [ "$RIPCLONE_TEST_SOURCE_FORBIDDEN" = "1" ]; then exit 97; fi
+        ;;
     esac
     break
   fi
@@ -745,6 +748,48 @@ exec "$real_git" "$@"
         ),
     );
     let _testing = ScopedEnvVar::set("RIPCLONE_TESTING", "1");
+
+    // Phase one has already published Shallow(B), while Full(B) remains
+    // stopped at the production barrier. Make the real server Git boundary
+    // fail: this ordinary, unpinned protocol-v2 read must still serve B from
+    // authenticated metadata without attempting source acquisition.
+    let source_forbidden = ScopedEnvVar::set("RIPCLONE_TEST_SOURCE_FORBIDDEN", "1");
+    let shallow_response = reqwest::Client::new()
+        .get(format!(
+            "{}/v1/repos/counting/acme/full-topup/refs/main?clonepack=shallow",
+            server.url
+        ))
+        .header("Authorization", format!("Ripclone {}", token_hash()))
+        .header("X-Upstream-Token", upstream_token)
+        .header("x-ripclone-protocol", "2")
+        .send()
+        .await
+        .expect("phase-one shallow metadata request");
+    assert_eq!(shallow_response.status(), StatusCode::OK);
+    let shallow: serde_json::Value = shallow_response
+        .json()
+        .await
+        .expect("phase-one shallow response");
+    assert_eq!(shallow["commit"], b);
+    assert_eq!(shallow["shallow"], true);
+    assert!(
+        shallow["clonepack_manifest"]
+            .as_str()
+            .is_some_and(|manifest| !manifest.is_empty()),
+        "phase one must publish a usable shallow manifest"
+    );
+    assert!(
+        std::fs::read_to_string(&source_log)
+            .expect("phase-one shallow source log")
+            .is_empty(),
+        "published Shallow(B) must not reacquire upstream while Full(B) is active"
+    );
+    assert!(
+        !sync_b.is_finished(),
+        "Full(B) remains blocked during shallow read"
+    );
+    drop(source_forbidden);
+
     let _unchanged_path = ScopedEnvVar::set("RIPCLONE_TEST_TOP_UP_UNCHANGED_PATH", "unchanged.bin");
     let _metrics_log = ScopedEnvVar::set("RIPCLONE_TEST_TOP_UP_METRICS_LOG", &top_up_metrics);
     let _git_log = ScopedEnvVar::set("RIPCLONE_TEST_TOP_UP_GIT_LOG", &managed_git_log);
