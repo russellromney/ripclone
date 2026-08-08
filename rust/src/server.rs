@@ -92,39 +92,48 @@ pub struct AdmissionTestBarrier {
     armed: AtomicBool,
     released: AtomicBool,
     entered: AtomicUsize,
-    notify: Arc<tokio::sync::Notify>,
-    armed_notify: Arc<tokio::sync::Notify>,
+    signal: tokio::sync::watch::Sender<u64>,
 }
 
 impl Default for AdmissionTestBarrier {
     fn default() -> Self {
+        let (signal, _) = tokio::sync::watch::channel(0);
         Self {
             armed: AtomicBool::new(false),
             released: AtomicBool::new(false),
             entered: AtomicUsize::new(0),
-            notify: Arc::new(tokio::sync::Notify::new()),
-            armed_notify: Arc::new(tokio::sync::Notify::new()),
+            signal,
         }
     }
 }
 
 impl AdmissionTestBarrier {
+    fn signal(&self) {
+        self.signal.send_modify(|generation| {
+            *generation = generation.wrapping_add(1);
+        });
+    }
+
+    fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.signal.subscribe()
+    }
+
     pub fn arm(&self) {
         self.entered.store(0, Ordering::SeqCst);
         self.released.store(false, Ordering::SeqCst);
         self.armed.store(true, Ordering::SeqCst);
-        self.armed_notify.notify_waiters();
+        self.signal();
     }
 
     pub fn disarm(&self) {
         self.armed.store(false, Ordering::SeqCst);
         self.released.store(true, Ordering::SeqCst);
-        self.notify.notify_waiters();
+        self.signal();
     }
 
     pub fn release(&self) {
         self.released.store(true, Ordering::SeqCst);
-        self.notify.notify_waiters();
+        self.signal();
     }
 
     pub fn entered(&self) -> usize {
@@ -133,11 +142,11 @@ impl AdmissionTestBarrier {
 
     pub async fn wait_until_entered(&self, count: usize) {
         while self.entered() < count {
-            let notified = self.notify.notified();
+            let mut signal = self.subscribe();
             if self.entered() >= count {
                 break;
             }
-            notified.await;
+            let _ = signal.changed().await;
         }
     }
 
@@ -146,13 +155,13 @@ impl AdmissionTestBarrier {
             return;
         }
         self.entered.fetch_add(1, Ordering::SeqCst);
-        self.notify.notify_waiters();
+        self.signal();
         loop {
-            let notified = self.notify.notified();
+            let mut signal = self.subscribe();
             if self.released.load(Ordering::SeqCst) || !self.armed.load(Ordering::SeqCst) {
                 return;
             }
-            notified.await;
+            let _ = signal.changed().await;
         }
     }
 
@@ -320,12 +329,13 @@ async fn admission_test_recv_before_claim(
             probe.before_claim.wait().await;
             return rx.recv().await;
         }
-        let armed = probe.before_claim.armed_notify.notified();
+        let mut armed = probe.before_claim.subscribe();
         if probe.before_claim.is_armed() {
             continue;
         }
         tokio::select! {
-            _ = armed => continue,
+            biased;
+            _ = armed.changed() => continue,
             job = rx.recv() => return job,
         }
     }
@@ -3198,28 +3208,19 @@ async fn branch_ref_is_evicted_for_commit(
 }
 
 fn full_clonepack_pending_for_tip(info: &RefInfo, clonepack_kind: &str, commit: &str) -> bool {
-    // Evicted refs have no artifacts at all, so even a shallow request must
-    // wait for a rebuild. For the ordinary "full history building" case the
-    // shallow skeleton is already available and can be served immediately.
-    let is_evicted = info.build_status.as_deref() == Some(crate::remote_gc::EVICTED_BUILD_STATUS);
-    (clonepack_kind != "shallow" || is_evicted)
+    // This metadata-only shortcut is exclusively for a phase-one row whose
+    // detached Full build is already active. Eviction also counts as pending,
+    // but it has no active worker: it must fall through to the source/rebuild
+    // path below so an initial protocol-v2 GET admits work before it pins.
+    clonepack_kind != "shallow"
         && info.commit == commit
-        && pending_build_status(info)
+        && info.build_status.as_deref() == Some(BUILDING_FULL_HISTORY)
         && !ref_info_serves_commit(info, clonepack_kind, commit)
 }
 
 /// `build_status` set on a phase-1 row while the full history + archive build
 /// runs in the background.
 pub(crate) const BUILDING_FULL_HISTORY: &str = "full history building";
-
-/// Statuses that tell the ref endpoint to return 202 and let the client/sync
-/// path trigger a fresh build.
-fn pending_build_status(info: &RefInfo) -> bool {
-    matches!(
-        info.build_status.as_deref(),
-        Some(BUILDING_FULL_HISTORY) | Some(crate::remote_gc::EVICTED_BUILD_STATUS)
-    )
-}
 
 /// Load stored artifacts for the resolved commit. Returns the ref-store key
 /// where the artifacts live alongside the `RefInfo`, so callers can atomically
@@ -3746,7 +3747,19 @@ async fn get_ref_inner(
                     // rebuilds the commit-keyed `branch#commit` row and must
                     // not republish the moving branch, which may already be at
                     // a newer commit.
-                    let historical_rev = params.rev.clone();
+                    let historical_rev = params.rev.as_ref().map(|_| commit.clone());
+                    if historical_rev.is_some() && !state.build_queue.inproc_wait() {
+                        return (
+                            StatusCode::NOT_IMPLEMENTED,
+                            Json(ErrorResponse {
+                                error:
+                                    "rev override (?rev=) is not supported on the cross-process \
+                                        queue; use the local queue (RIPCLONE_QUEUE=local)"
+                                        .to_string(),
+                            }),
+                        )
+                            .into_response();
+                    }
                     let job = BuildJob {
                         repo_id: repo_id.clone(),
                         branch: branch.clone(),
@@ -3765,7 +3778,7 @@ async fn get_ref_inner(
                         );
                     }
                 }
-                let queue_depth = state.build_queue.depth().await;
+                let queue_depth = state.build_queue_depth.load(Ordering::Relaxed);
                 return if protocol_v2 {
                     artifact_pending_response(&commit, &effective_branch, queue_depth)
                 } else {
@@ -13294,6 +13307,61 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn before_claim_barrier_cannot_lose_arm_or_release_wakeups() {
+        let _lock = crate::git::ORIGIN_BASE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let probe = Arc::new(AdmissionTestProbe::default());
+        let _guard = install_admission_test_probe(Arc::clone(&probe));
+        unsafe { std::env::set_var("RIPCLONE_TESTING", "1") };
+
+        for generation in 0..64 {
+            probe.before_claim.disarm();
+            let (queue, mut rx, _depth) = crate::queue::LocalJobQueue::new(1);
+            let mut receiver =
+                tokio::spawn(async move { admission_test_recv_before_claim(&mut rx).await });
+            tokio::task::yield_now().await;
+
+            probe.before_claim.arm();
+            queue
+                .enqueue(BuildJob {
+                    repo_id: RepoId::github(format!("acme/barrier-{generation}")),
+                    branch: "main".to_string(),
+                    rev: None,
+                    admitted_commit: Some(format!("{generation:040x}")),
+                    admitted_default_branch: None,
+                    credential: None,
+                    recheck: 0,
+                    size_bytes: None,
+                })
+                .await
+                .unwrap();
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                probe.before_claim.wait_until_entered(1),
+            )
+            .await
+            .expect("armed receive must enter the pre-claim gate");
+            assert!(
+                !receiver.is_finished(),
+                "generation {generation} crossed the claim boundary before release"
+            );
+
+            probe.before_claim.release();
+            let job = tokio::time::timeout(Duration::from_secs(1), &mut receiver)
+                .await
+                .expect("release signal must not be lost")
+                .unwrap()
+                .expect("queued job remains available after release");
+            assert_eq!(job.repo_id.path, format!("acme/barrier-{generation}"));
+        }
+
+        probe.before_claim.disarm();
+        unsafe { std::env::remove_var("RIPCLONE_TESTING") };
+    }
+
+    #[tokio::test]
     async fn reuse_existing_build_rejects_evicted_ref() {
         let tmp = tempfile::tempdir().unwrap();
         let repo_root = tmp.path().join("repos");
@@ -13368,7 +13436,7 @@ mod tests {
     }
 
     #[test]
-    fn full_clonepack_pending_for_tip_treats_evicted_as_pending_for_shallow() {
+    fn metadata_only_full_pending_excludes_evicted_rows() {
         let info = RefInfo {
             commit: "commit1".to_string(),
             build_status: Some(crate::remote_gc::EVICTED_BUILD_STATUS.to_string()),
@@ -13380,9 +13448,81 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            full_clonepack_pending_for_tip(&info, "shallow", "commit1"),
-            "evicted tip must be pending even for shallow clonepacks"
+            !full_clonepack_pending_for_tip(&info, "full", "commit1"),
+            "evicted tips must reach rebuild admission instead of the metadata-only shortcut"
         );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn protocol_v2_ordinary_evicted_get_enqueues_once_and_becomes_ready() {
+        let _lock = crate::git::ORIGIN_BASE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let origin_base = tempfile::tempdir().unwrap();
+        let origin_path = origin_base.path().join("acme").join("evicted.git");
+        std::fs::create_dir_all(origin_path.parent().unwrap()).unwrap();
+        let origin = crate::test_fixture::init_bare(&origin_path);
+        let commit = crate::test_fixture::commit(&origin, &[("f.txt", b"ready")]);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, mut rx) = test_state_with_queue(&tmp);
+        let repo_id = RepoId::github("acme/evicted");
+        mark_added(&state, repo_id.clone()).await;
+        state
+            .ref_store
+            .save_branch(
+                &repo_id,
+                "main",
+                &RefInfo {
+                    commit: commit.clone(),
+                    build_status: Some(crate::remote_gc::EVICTED_BUILD_STATUS.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        unsafe { std::env::set_var("RIPCLONE_ORIGIN_BASE", origin_base.path()) };
+        let app = build_app(state.clone());
+        let first = app
+            .clone()
+            .oneshot(protocol_request(
+                "/v1/repos/github/acme/evicted/refs/main?clonepack=shallow",
+                Some("2"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
+        let first_body = axum::body::to_bytes(first.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let first_body: serde_json::Value = serde_json::from_slice(&first_body).unwrap();
+        assert_eq!(first_body["commit"], commit);
+
+        let job = rx
+            .try_recv()
+            .expect("initial protocol-v2 GET must admit the evicted ordinary ref");
+        assert_eq!(job.branch, "main");
+        assert!(job.rev.is_none());
+        assert_eq!(job.admitted_commit.as_deref(), Some(commit.as_str()));
+        assert!(rx.try_recv().is_err(), "exactly one rebuild is admitted");
+
+        let built = process_build_job(&state, &job)
+            .await
+            .expect("admitted evicted ref rebuild");
+        assert_eq!(built.info.commit, commit);
+        let ready = app
+            .oneshot(protocol_request(
+                &format!(
+                    "/v1/repos/github/acme/evicted/refs/main?clonepack=shallow&pinned={commit}"
+                ),
+                Some("2"),
+            ))
+            .await
+            .unwrap();
+        unsafe { std::env::remove_var("RIPCLONE_ORIGIN_BASE") };
+        assert_eq!(ready.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -13724,7 +13864,7 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
-    async fn evicted_historical_b_with_current_c_enqueues_historical_rebuild() {
+    async fn evicted_symbolic_history_is_pinned_before_claim_and_rebuilds_original_commit() {
         let _lock = crate::git::ORIGIN_BASE_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -13733,7 +13873,8 @@ mod tests {
         std::fs::create_dir_all(origin_path.parent().unwrap()).unwrap();
         let origin = crate::test_fixture::init_bare(&origin_path);
         let b = crate::test_fixture::commit(&origin, &[("f.txt", b"B")]);
-        let c = crate::test_fixture::commit(&origin, &[("f.txt", b"C")]);
+        let _c = crate::test_fixture::commit(&origin, &[("f.txt", b"C")]);
+        let d = crate::test_fixture::commit(&origin, &[("f.txt", b"D")]);
 
         let tmp = tempfile::tempdir().unwrap();
         let (state, mut rx) = test_state_with_queue(&tmp);
@@ -13745,7 +13886,7 @@ mod tests {
                 &rid,
                 "main",
                 &RefInfo {
-                    commit: c.clone(),
+                    commit: d.clone(),
                     build_status: Some("done".to_string()),
                     ..Default::default()
                 },
@@ -13771,18 +13912,28 @@ mod tests {
         let response = build_app(state.clone())
             .oneshot(request_with_auth(
                 "GET",
-                &format!("/v1/repos/github/acme/history/refs/main?rev={b}"),
+                "/v1/repos/github/acme/history/refs/main?rev=HEAD~2&clonepack=shallow",
                 Some(&auth_header()),
             ))
             .await
             .unwrap();
-        unsafe { std::env::remove_var("RIPCLONE_ORIGIN_BASE") };
 
         assert_eq!(response.status(), StatusCode::ACCEPTED);
+        // The job remains queued (strictly before claim) while upstream moves.
+        // Its historical target must already be the resolved B, not HEAD~2.
+        let e = crate::test_fixture::commit(&origin, &[("f.txt", b"E")]);
         let job = rx.try_recv().expect("historical B rebuild admitted");
         assert_eq!(job.branch, "main");
         assert_eq!(job.rev.as_deref(), Some(b.as_str()));
         assert!(job.admitted_commit.is_none());
+        let built = process_build_job(&state, &job)
+            .await
+            .expect("historical B rebuild after branch advancement");
+        unsafe { std::env::remove_var("RIPCLONE_ORIGIN_BASE") };
+        assert_eq!(
+            built.info.commit, b,
+            "queued HEAD~2 must remain pinned to B"
+        );
         assert_eq!(
             state
                 .ref_store
@@ -13791,8 +13942,92 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .commit,
-            c,
+            d,
             "historical admission must not move the current branch"
+        );
+        assert_ne!(
+            built.info.commit, e,
+            "historical B must not fall forward to E"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "exactly one historical job is admitted"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn evicted_historical_get_rejects_sql_api_queue_without_insertion() {
+        let _lock = crate::git::ORIGIN_BASE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let base = tempfile::tempdir().unwrap();
+        let origin_path = base.path().join("acme").join("history-sql.git");
+        std::fs::create_dir_all(origin_path.parent().unwrap()).unwrap();
+        let origin = crate::test_fixture::init_bare(&origin_path);
+        let b = crate::test_fixture::commit(&origin, &[("f.txt", b"B")]);
+        let _c = crate::test_fixture::commit(&origin, &[("f.txt", b"C")]);
+        let d = crate::test_fixture::commit(&origin, &[("f.txt", b"D")]);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = test_state(&tmp);
+        let queue_path = tmp.path().join("historical-queue.db");
+        let queue = Arc::new(
+            crate::queue::SqlJobQueue::new(Box::new(
+                crate::queue::SqliteDb::connect(&queue_path.to_string_lossy())
+                    .await
+                    .unwrap(),
+            ))
+            .await
+            .unwrap(),
+        );
+        state.build_queue = queue.clone();
+        state.worker_queue = Some(Arc::clone(&queue));
+        let rid = RepoId::github("acme/history-sql");
+        mark_added(&state, rid.clone()).await;
+        state
+            .ref_store
+            .save_branch(
+                &rid,
+                "main",
+                &RefInfo {
+                    commit: d,
+                    build_status: Some("done".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        state
+            .ref_store
+            .save_branch(
+                &rid,
+                &ref_store_key("main", Some(&b), Some(&b)),
+                &RefInfo {
+                    commit: b,
+                    build_status: Some(crate::remote_gc::EVICTED_BUILD_STATUS.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        unsafe { std::env::set_var("RIPCLONE_ORIGIN_BASE", base.path()) };
+        let response = build_app(state)
+            .oneshot(request_with_auth(
+                "GET",
+                "/v1/repos/github/acme/history-sql/refs/main?rev=HEAD~2",
+                Some(&auth_header()),
+            ))
+            .await
+            .unwrap();
+        unsafe { std::env::remove_var("RIPCLONE_ORIGIN_BASE") };
+
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(
+            crate::queue::JobQueue::depth(queue.as_ref()).await,
+            0,
+            "unsupported historical work must not create a SQL/API queue row"
         );
     }
 

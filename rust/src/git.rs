@@ -1415,9 +1415,46 @@ fn sanitize_git_stderr(stderr: &[u8], auth_header: Option<&(String, String)>) ->
 
 fn upstream_failure_is_retryable(stderr: &[u8]) -> bool {
     let detail = String::from_utf8_lossy(stderr).to_ascii_lowercase();
-    let retryable_transport_failure = [
-        "returned error: 408",
-        "returned error: 429",
+    let statuses: Vec<u16> = detail
+        .split("returned error: ")
+        .skip(1)
+        .filter_map(|suffix| suffix.get(..3))
+        .filter_map(|status| status.parse::<u16>().ok())
+        .collect();
+    if statuses
+        .iter()
+        .any(|status| *status == 408 || *status == 429 || (500..600).contains(status))
+    {
+        return true;
+    }
+    if statuses.iter().any(|status| (400..500).contains(status)) {
+        return false;
+    }
+
+    // These are target/authentication failures for which replaying the same
+    // immutable job cannot help. Keep this list deliberately narrower than the
+    // transport list below: an unfamiliar curl/TLS failure should retain the
+    // queue's bounded retry behavior rather than becoming terminal.
+    if [
+        "authentication failed",
+        "invalid username or password",
+        "could not read username",
+        "repository not found",
+        "does not appear to be a git repository",
+        "not our ref",
+        "unadvertised object",
+        "couldn't find remote ref",
+        "remote ref does not exist",
+        "invalid refspec",
+        "invalid ref name",
+    ]
+    .iter()
+    .any(|needle| detail.contains(needle))
+    {
+        return false;
+    }
+
+    if [
         "operation timed out",
         "connection timed out",
         "connection reset",
@@ -1425,16 +1462,25 @@ fn upstream_failure_is_retryable(stderr: &[u8]) -> bool {
         "could not resolve host",
         "couldn't connect to server",
         "remote end hung up unexpectedly",
+        "http/2 stream",
+        "internal_error",
+        "tls connection was non-properly terminated",
+        "tls connection terminated unexpectedly",
+        "empty reply from server",
+        "failure receiving data from the peer",
+        "recv failure",
+        "ssl_error_syscall",
     ]
     .iter()
-    .any(|needle| detail.contains(needle));
-    let retryable_server_error = detail
-        .split("returned error: ")
-        .skip(1)
-        .filter_map(|suffix| suffix.get(..3))
-        .filter_map(|status| status.parse::<u16>().ok())
-        .any(|status| (500..600).contains(&status));
-    retryable_transport_failure || retryable_server_error
+    .any(|needle| detail.contains(needle))
+    {
+        return true;
+    }
+
+    // The removed provider re-probe treated any request-level failure without
+    // an HTTP response as retryable. Preserve that conservative behavior from
+    // the one Git result: bounded queue attempts still cap an unknown failure.
+    true
 }
 
 /// Resolve the upstream tip of `ref_name` via `git ls-remote` — one
@@ -2356,6 +2402,12 @@ mod tests {
             "fatal: unable to access: The requested URL returned error: 503",
             "fatal: unable to access: Failed to connect to host",
             "fatal: unable to access: Could not resolve host",
+            "RPC failed; curl 92 HTTP/2 stream 5 was not closed cleanly: INTERNAL_ERROR",
+            "gnutls_handshake() failed: The TLS connection was non-properly terminated",
+            "fatal: unable to access: Empty reply from server",
+            "RPC failed; curl 56 Failure receiving data from the peer",
+            "OpenSSL SSL_read: SSL_ERROR_SYSCALL, errno 54",
+            "an unfamiliar transport failure without an HTTP response",
         ] {
             assert!(
                 upstream_failure_is_retryable(detail.as_bytes()),
@@ -2368,7 +2420,11 @@ mod tests {
             "fatal: unable to access: The requested URL returned error: 401",
             "fatal: unable to access: The requested URL returned error: 403",
             "fatal: unable to access: The requested URL returned error: 404",
+            "fatal: Authentication failed for repository",
+            "fatal: couldn't find remote ref refs/heads/missing",
+            "fatal: invalid refspec 'refs/heads/bad..ref'",
             "fatal: remote error: upload-pack: not our ref deadbeef",
+            "Server does not allow request for unadvertised object deadbeef",
         ] {
             assert!(
                 !upstream_failure_is_retryable(detail.as_bytes()),
