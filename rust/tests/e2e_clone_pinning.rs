@@ -1210,7 +1210,7 @@ exec "$RIPCLONE_TEST_REAL_GIT" "$@"
 }
 
 #[tokio::test]
-async fn overwritten_branch_metadata_returns_pending_for_the_pin_without_upstream() {
+async fn overwritten_branch_metadata_serves_the_exact_pin_without_upstream() {
     let _guard = env_lock().lock().await;
     init(false);
     let server = start_server_split_storage().await;
@@ -1307,10 +1307,10 @@ async fn overwritten_branch_metadata_returns_pending_for_the_pin_without_upstrea
         .expect("pinned-path test adapter");
     probe.arm();
     proceed.send(()).expect("release ready A metadata");
-    let error = match tokio::time::timeout(Duration::from_secs(20), &mut install).await {
+    let outcome = match tokio::time::timeout(Duration::from_secs(20), &mut install).await {
         Ok(joined) => joined
             .expect("join overwritten install")
-            .expect_err("overwritten A metadata must exhaust as pending"),
+            .expect("overwritten A metadata remains exactly addressable"),
         Err(_) => {
             install.abort();
             let _ = tokio::time::timeout(Duration::from_secs(5), &mut install).await;
@@ -1323,12 +1323,8 @@ async fn overwritten_branch_metadata_returns_pending_for_the_pin_without_upstrea
         std::env::remove_var("RIPCLONE_TEST_REF_MAX_ATTEMPTS");
         std::env::remove_var("RIPCLONE_TEST_REF_POLL_MS");
     }
-    let pending = error
-        .downcast_ref::<ArtifactPending>()
-        .expect("overwritten metadata ends in typed pending");
-    assert_eq!(pending.commit, a);
-    assert_eq!(pending.mode, "files");
-    assert!(!target.exists(), "pending clone must not publish a target");
+    assert_eq!(outcome.commit, a);
+    assert_eq!(read(&target, "value.txt"), "A\n");
     let requests = requests.lock().unwrap_or_else(|e| e.into_inner());
     assert!(!requests[0].contains("pinned="));
     assert!(
@@ -1341,8 +1337,8 @@ async fn overwritten_branch_metadata_returns_pending_for_the_pin_without_upstrea
     let observed = probe.snapshot();
     assert_eq!(
         observed.branch_reads,
-        2 * (requests.len() - 1),
-        "concrete-branch exact polls perform only moving and exact point reads"
+        requests.len() - 1,
+        "every pinned request resolves directly through the immutable exact row"
     );
     assert_eq!(observed.enqueues, 0);
     assert_eq!(observed.builder_entries, 0);
@@ -1469,6 +1465,10 @@ async fn settled_moving_row_is_identical_after_legacy_variant_round_trip() {
     }
     let settled = settled.expect("moving A publication settled");
     let a = settled.commit.clone();
+    store
+        .delete_branch(&repo_id, &format!("main#{a}"))
+        .await
+        .expect("remove immutable alias to exercise legacy moving-row fallback");
     assert!(
         store
             .load_branch(&repo_id, &format!("main#{a}"))

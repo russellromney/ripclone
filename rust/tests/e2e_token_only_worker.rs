@@ -388,6 +388,45 @@ async fn api_worker_preserves_first_credential_and_exact_commit_after_tip_moves(
         .expect("load ordinary branch")
         .expect("ordinary branch exists");
     assert_eq!(ordinary.commit, c, "ordinary branch must settle at C");
+
+    // C publication must leave B addressable through exact metadata, not only
+    // retain unreferenced CAS bytes. Reload B after C, then resolve it through
+    // the authenticated public pinned-metadata path and prove that response
+    // names the live exact artifact. A ready exact lookup must not reacquire the
+    // private origin.
+    let exact_b_after_c = store
+        .load_build(&repo_id, &b)
+        .await
+        .expect("reload exact B after C")
+        .expect("B exact metadata remains addressable after C");
+    assert_eq!(exact_b_after_c.commit, b);
+    assert_eq!(exact_b_after_c.full_clonepack.manifest, full_b_manifest);
+    origin.clear_auth_log();
+    let pinned_response = reqwest::Client::new()
+        .get(format!(
+            "{}/v1/repos/credential-http/acme/api-immutable/refs/main?clonepack=full&pinned={b}",
+            server.url
+        ))
+        .header("Authorization", format!("Ripclone {}", token_hash()))
+        .header("x-ripclone-protocol", ripclone::PROTOCOL_VERSION)
+        .header("X-Upstream-Token", T1)
+        .send()
+        .await
+        .expect("authenticated public pinned B metadata request");
+    assert_eq!(pinned_response.status(), reqwest::StatusCode::OK);
+    let pinned_b: ripclone::client::RefResponse = pinned_response
+        .json()
+        .await
+        .expect("decode public pinned B metadata");
+    assert_eq!(pinned_b.commit, b);
+    assert_eq!(pinned_b.branch, "main");
+    assert_eq!(pinned_b.clonepack_manifest, full_b_manifest);
+    assert!(server.cas_path(&pinned_b.clonepack_manifest).exists());
+    assert_eq!(
+        origin.auth_success_count(),
+        0,
+        "ready pinned B metadata must not reacquire upstream source"
+    );
     assert!(
         server.cas_path(&full_b_manifest).exists(),
         "publishing C must retain B's exact full artifact"
@@ -412,7 +451,7 @@ async fn api_worker_preserves_first_credential_and_exact_commit_after_tip_moves(
     assert!(!decoy_queue.exists());
     assert!(!decoy_meta.exists());
     println!(
-        "API_WORKER_IMMUTABLE_EVIDENCE B={b} C={c} admission_ms={} active_B_after_duplicate=1 durable_jobs={rows} T1_object_requests={t1_object_requests} T2_discovery_requests={t2_discovery} T2_object_requests={t2_object_requests} decoy_databases_touched=false ordinary_tip={}",
+        "API_WORKER_IMMUTABLE_EVIDENCE B={b} C={c} admission_ms={} active_B_after_duplicate=1 durable_jobs={rows} T1_object_requests={t1_object_requests} T2_discovery_requests={t2_discovery} T2_object_requests={t2_object_requests} B_metadata_reloaded_after_C=true B_public_pinned_metadata_after_C=true B_pinned_upstream_requests=0 decoy_databases_touched=false ordinary_tip={}",
         first_elapsed.as_millis(),
         ordinary.commit
     );

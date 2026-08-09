@@ -314,6 +314,7 @@ async fn e2e_sync_admission() {
     let server = start_server_env(&[("RIPCLONE_WEBHOOK_SECRET", WEBHOOK_SECRET)]).await;
     let origin = make_origin("acme", "immutable");
 
+    let older = origin.commit(&[("value.txt", "older\n")], "older");
     let a = origin.commit(&[("value.txt", "A\n")], "A");
     origin.publish();
     register_added_without_build(&server, "acme/immutable")
@@ -728,12 +729,32 @@ async fn e2e_sync_admission() {
     );
     assert_full_artifacts(&local_storage, &final_ref, &c);
 
-    // An older linear webhook may still be admitted as its own immutable
-    // target when its branch metadata has already moved to C, but its ordered
-    // publication must not move the ordinary branch back to A.
+    // A delayed older webhook sees A's exact completed alias after the ordinary
+    // branch has moved to C. It is a mutation-free replay: no probe, queue,
+    // fetch, build, ref/artifact write, or branch rollback.
     let tip_probes_before_old_webhook = probe.tip_probes.load(std::sync::atomic::Ordering::SeqCst);
-    probe.before_claim.arm();
-    probe.fetch_entry.arm();
+    let old_webhook_counts = (
+        probe
+            .queue_inserts
+            .load(std::sync::atomic::Ordering::SeqCst),
+        probe
+            .exact_fetches
+            .load(std::sync::atomic::Ordering::SeqCst),
+        probe
+            .builder_entries
+            .load(std::sync::atomic::Ordering::SeqCst),
+        probe
+            .full_publishes
+            .load(std::sync::atomic::Ordering::SeqCst),
+        probe
+            .ref_store_writes
+            .load(std::sync::atomic::Ordering::SeqCst),
+        probe
+            .artifact_uploads
+            .load(std::sync::atomic::Ordering::SeqCst),
+    );
+    let old_webhook_refs = tree_snapshot(&server.repo_root);
+    let old_webhook_storage = tree_snapshot(&server.storage_dir);
     let (old_webhook_status, old_webhook_elapsed) = post_webhook(&server, "main", &a).await;
     assert_eq!(old_webhook_status, reqwest::StatusCode::OK);
     assert!(old_webhook_elapsed < Duration::from_secs(5));
@@ -741,13 +762,85 @@ async fn e2e_sync_admission() {
         probe
             .queue_inserts
             .load(std::sync::atomic::Ordering::SeqCst),
-        3,
-        "older webhook gets a separate exact attempt"
+        old_webhook_counts.0,
+        "complete older webhook replay must not enqueue"
     );
     assert_eq!(
         probe.tip_probes.load(std::sync::atomic::Ordering::SeqCst),
         tip_probes_before_old_webhook,
         "older signed webhook must not probe the moving tip"
+    );
+    assert_eq!(
+        probe
+            .exact_fetches
+            .load(std::sync::atomic::Ordering::SeqCst),
+        old_webhook_counts.1
+    );
+    assert_eq!(
+        probe
+            .builder_entries
+            .load(std::sync::atomic::Ordering::SeqCst),
+        old_webhook_counts.2
+    );
+    assert_eq!(
+        probe
+            .full_publishes
+            .load(std::sync::atomic::Ordering::SeqCst),
+        old_webhook_counts.3
+    );
+    assert_eq!(
+        probe
+            .ref_store_writes
+            .load(std::sync::atomic::Ordering::SeqCst),
+        old_webhook_counts.4
+    );
+    assert_eq!(
+        probe
+            .artifact_uploads
+            .load(std::sync::atomic::Ordering::SeqCst),
+        old_webhook_counts.5
+    );
+    assert_eq!(tree_snapshot(&server.repo_root), old_webhook_refs);
+    assert_eq!(tree_snapshot(&server.storage_dir), old_webhook_storage);
+    let final_after_old = store
+        .load_branch(&repo_id, "main")
+        .await
+        .expect("reload final branch")
+        .expect("final branch remains present");
+    assert_eq!(
+        final_after_old.commit, c,
+        "older webhook must not move the ordinary branch backward"
+    );
+    assert_eq!(final_after_old.full_clonepack.commit, c);
+
+    // Non-alias control: the older ancestor was never built on its own. A
+    // delayed webhook for it must therefore create one distinct exact job, and
+    // every phase of that late build must remain fenced away from ordinary C.
+    let exact_older_key = format!("main#{older}");
+    assert!(
+        store
+            .load_branch(&repo_id, &exact_older_key)
+            .await
+            .expect("check exact older alias")
+            .is_none(),
+        "control commit must not already have exact metadata"
+    );
+    probe.before_claim.arm();
+    probe.fetch_entry.arm();
+    let (legacy_old_status, legacy_old_elapsed) = post_webhook(&server, "main", &older).await;
+    assert_eq!(legacy_old_status, reqwest::StatusCode::OK);
+    assert!(legacy_old_elapsed < Duration::from_secs(5));
+    assert_eq!(
+        probe
+            .queue_inserts
+            .load(std::sync::atomic::Ordering::SeqCst),
+        old_webhook_counts.0 + 1,
+        "unbuilt older commit admits one immutable job"
+    );
+    assert_eq!(
+        probe.tip_probes.load(std::sync::atomic::Ordering::SeqCst),
+        tip_probes_before_old_webhook,
+        "trusted delayed webhook must not probe even when it rebuilds"
     );
     wait_entered(&probe.before_claim, 1).await;
     probe.before_claim.release();
@@ -760,24 +853,30 @@ async fn e2e_sync_admission() {
             .unwrap()
             .last()
             .map(String::as_str),
-        Some(a.as_str()),
-        "older webhook fetches its exact admitted commit"
+        Some(older.as_str()),
+        "late older job exact-fetches its admitted commit"
     );
     probe.fetch_entry.release();
     probe.fetch_entry.disarm();
-    tokio::time::timeout(Duration::from_secs(60), probe.wait_until_full_published(3))
-        .await
-        .expect("older webhook exact build completed");
-    let final_after_old = store
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        probe.wait_until_full_published(old_webhook_counts.3 + 1),
+    )
+    .await
+    .expect("late exact older build completed");
+    let final_after_old_rebuild = store
         .load_branch(&repo_id, "main")
         .await
-        .expect("reload final branch")
-        .expect("final branch remains present");
-    assert_eq!(
-        final_after_old.commit, c,
-        "older webhook must not move the ordinary branch backward"
-    );
-    assert_eq!(final_after_old.full_clonepack.commit, c);
+        .expect("reload branch after late A build")
+        .expect("ordinary branch remains present");
+    assert_eq!(final_after_old_rebuild.commit, c);
+    assert_eq!(final_after_old_rebuild.full_clonepack.commit, c);
+    let rebuilt_exact_older = store
+        .load_branch(&repo_id, &exact_older_key)
+        .await
+        .expect("reload exact older metadata")
+        .expect("late job published exact older metadata");
+    assert_full_artifacts(&local_storage, &rebuilt_exact_older, &older);
 
     // A real HTTP admission whose one ls-remote hangs is bounded and leaves no
     // queue/source/build side effect. The fixture also proves the killed child

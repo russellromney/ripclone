@@ -1510,8 +1510,9 @@ pub async fn ls_remote_commit_async(
 }
 
 /// The exact tip returned by one `ls-remote` advertisement. `default_branch` is
-/// populated only when the requested ref is `HEAD` and the server advertises a
-/// symbolic target.
+/// populated whenever the server advertises a symbolic `HEAD`, including when
+/// the requested ref is a concrete branch. Both identities come from the same
+/// bounded Git process/provider advertisement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteTip {
     pub commit: String,
@@ -1566,7 +1567,7 @@ pub async fn ls_remote_tip_async_with_timeout(
     credential: Option<&secrecy::SecretString>,
     timeout: Duration,
 ) -> Result<Option<RemoteTip>> {
-    let (url, git_args, auth_header, query) =
+    let (url, git_args, auth_header, queries, requested_remote_ref) =
         prepare_ls_remote(provider, repo_id, ref_name, credential)?;
     if url.is_empty() {
         return Ok(None);
@@ -1578,7 +1579,8 @@ pub async fn ls_remote_tip_async_with_timeout(
     let mut command = tokio::process::Command::new("git");
     command
         .args(&git_args)
-        .args(["ls-remote", "--symref", "--", &url, &query])
+        .args(["ls-remote", "--symref", "--", &url])
+        .args(&queries)
         .stdout(Stdio::from(child_stdout))
         .stderr(Stdio::from(child_stderr));
     #[cfg(unix)]
@@ -1628,7 +1630,7 @@ pub async fn ls_remote_tip_async_with_timeout(
             &stderr_bytes,
         ));
     }
-    parse_ls_remote_output(&stdout_bytes)
+    parse_ls_remote_output(&stdout_bytes, &requested_remote_ref)
 }
 
 struct ManagedLsRemoteChild {
@@ -1689,37 +1691,47 @@ fn prepare_ls_remote(
     repo_id: &RepoId,
     ref_name: &str,
     credential: Option<&secrecy::SecretString>,
-) -> Result<(String, Vec<String>, Option<(String, String)>, String)> {
+) -> Result<(
+    String,
+    Vec<String>,
+    Option<(String, String)>,
+    Vec<String>,
+    String,
+)> {
     crate::validation::validate_repo_path(provider, repo_id)
         .with_context(|| format!("invalid repo path: {}", repo_id.storage_key()))?;
     if ref_name != "HEAD" {
         crate::validation::validate_git_rev(ref_name)
             .with_context(|| format!("invalid ref: {ref_name}"))?;
         if ref_name.contains(['*', '?', '[']) {
-            return Ok((String::new(), Vec::new(), None, String::new()));
+            return Ok((String::new(), Vec::new(), None, Vec::new(), String::new()));
         }
     }
     let (url, git_args) = upstream_url_and_auth(provider, repo_id, credential);
     let auth_header = upstream_auth_header(provider, credential);
-    let query = if ref_name == "HEAD" {
+    let requested_remote_ref = if ref_name == "HEAD" {
         "HEAD".to_string()
     } else if ref_name.starts_with("refs/") {
         ref_name.to_string()
     } else {
         format!("refs/heads/{ref_name}")
     };
-    Ok((url, git_args, auth_header, query))
+    let mut queries = vec![requested_remote_ref.clone()];
+    if requested_remote_ref != "HEAD" {
+        // `ls-remote` obtains one advertisement regardless of the number of
+        // patterns. Ask that same bounded process for symbolic HEAD so a named
+        // branch admission can initialize an exact-only mirror with the
+        // upstream default-branch identity without a second provider request.
+        queries.push("HEAD".to_string());
+    }
+    Ok((url, git_args, auth_header, queries, requested_remote_ref))
 }
 
-fn parse_ls_remote_output(stdout: &[u8]) -> Result<Option<RemoteTip>> {
+fn parse_ls_remote_output(stdout: &[u8], requested_remote_ref: &str) -> Result<Option<RemoteTip>> {
     let stdout = String::from_utf8_lossy(stdout);
     let mut default_branch = None;
     let mut commit = None;
-    let mut saw_output = false;
     for line in stdout.lines() {
-        if !line.trim().is_empty() {
-            saw_output = true;
-        }
         if let Some(symbolic) = line.strip_prefix("ref: refs/heads/")
             && let Some(branch) = symbolic
                 .strip_suffix("\tHEAD")
@@ -1735,7 +1747,7 @@ fn parse_ls_remote_output(stdout: &[u8]) -> Result<Option<RemoteTip>> {
                 "git ls-remote returned malformed symbolic ref"
             ));
         }
-        let Some((sha, _remote_ref)) = line.split_once('\t') else {
+        let Some((sha, remote_ref)) = line.split_once('\t') else {
             return Err(anyhow::anyhow!(
                 "git ls-remote returned malformed advertisement"
             ));
@@ -1746,14 +1758,13 @@ fn parse_ls_remote_output(stdout: &[u8]) -> Result<Option<RemoteTip>> {
                 "git ls-remote returned malformed object id"
             ));
         }
-        commit = Some(sha.to_string());
-        break;
+        if remote_ref.trim() == requested_remote_ref {
+            commit = Some(sha.to_string());
+        }
     }
-    if saw_output && commit.is_none() {
-        return Err(anyhow::anyhow!(
-            "git ls-remote returned no object id for requested ref"
-        ));
-    }
+    // A named-ref query also asks for HEAD. Seeing only HEAD means the requested
+    // branch is absent, which is a normal `None`/404 result rather than a
+    // malformed advertisement.
     Ok(commit.map(|commit| RemoteTip {
         commit,
         default_branch,
@@ -1768,7 +1779,7 @@ pub fn ls_remote_tip_with_timeout(
     credential: Option<&secrecy::SecretString>,
     timeout: Duration,
 ) -> Result<Option<RemoteTip>> {
-    let (url, git_args, auth_header, query) =
+    let (url, git_args, auth_header, queries, requested_remote_ref) =
         prepare_ls_remote(provider, repo_id, ref_name, credential)?;
     if url.is_empty() {
         return Ok(None);
@@ -1776,7 +1787,8 @@ pub fn ls_remote_tip_with_timeout(
     let mut command = Command::new("git");
     command
         .args(&git_args)
-        .args(["ls-remote", "--symref", "--", &url, &query])
+        .args(["ls-remote", "--symref", "--", &url])
+        .args(&queries)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     #[cfg(unix)]
@@ -1862,7 +1874,7 @@ pub fn ls_remote_tip_with_timeout(
     if !status.success() {
         return Err(upstream_git_error("ls-remote", &url, auth_header, &stderr));
     }
-    parse_ls_remote_output(&stdout)
+    parse_ls_remote_output(&stdout, &requested_remote_ref)
 }
 
 fn kill_ls_remote_process_group(child: &mut std::process::Child) -> std::io::Result<()> {
@@ -1995,14 +2007,18 @@ pub fn sync_bare_mirror<P: AsRef<Path>>(
     // therefore never pass `--depth`: a depth-limited fetch would re-shallow an
     // already-complete mirror. depth=1 ("head") clones are still cheap — they're
     // a content-addressed subset built at pack time, not a shallower mirror.
-    // A full object id can use the narrow historical fetch when the caller
-    // supplied a concrete branch. For `branch == HEAD`, a fresh bare repo must
-    // discover and retain the upstream default branch; otherwise `git init
-    // --bare` leaves HEAD on the platform default (often `master`) and the
-    // historical artifact is published under the wrong branch key. Keep that
-    // first-operation compatibility path on the full mirror fetch. Ordinary
-    // admitted work uses `sync_bare_mirror_admitted` and remains exact-only.
-    if let Some(rev) = rev.filter(|rev| is_full_hex_object_id(rev) && branch != "HEAD") {
+    // A full object id always uses the narrow historical fetch. When HEAD is
+    // the selector, obtain its symbolic target through one bounded `ls-remote`
+    // first and retain that identity locally after the exact fetch. This keeps
+    // historical behavior portable without downloading unrelated branches or
+    // tags. Ordinary admitted work uses `sync_bare_mirror_admitted` and gets the
+    // same identity from its existing admission advertisement.
+    if let Some(rev) = rev.filter(|rev| is_full_hex_object_id(rev)) {
+        let default_branch = if branch == "HEAD" {
+            ls_remote_tip(provider, repo_id, "HEAD", credential)?.and_then(|tip| tip.default_branch)
+        } else {
+            None
+        };
         sync_bare_mirror_rev(
             mirror_dir.as_ref(),
             &url,
@@ -2012,6 +2028,9 @@ pub fn sync_bare_mirror<P: AsRef<Path>>(
             rev,
             true,
         )?;
+        if let Some(default_branch) = default_branch.as_deref() {
+            set_bare_default_branch(mirror_dir.as_ref(), default_branch)?;
+        }
     } else if mirror_dir.as_ref().exists() {
         // A `--mirror` clone is configured with `+refs/*:refs/*` (and prunes), so
         // a plain `git fetch origin` advances every branch + HEAD to the latest.
@@ -2123,18 +2142,23 @@ pub fn sync_bare_mirror_admitted<P: AsRef<Path>>(
     // it. This is a local symbolic-ref update only; it neither fetches nor
     // publishes the moving branch.
     if let Some(default_branch) = default_branch.filter(|branch| *branch != "HEAD") {
-        crate::validation::validate_git_rev(default_branch)
-            .with_context(|| format!("invalid admitted default branch: {default_branch}"))?;
-        let head_ref = format!("refs/heads/{default_branch}");
-        let status = Command::new("git")
-            .arg("-C")
-            .arg(mirror_dir.as_ref().as_os_str())
-            .args(["symbolic-ref", "HEAD", &head_ref])
-            .status()
-            .context("set exact mirror default branch")?;
-        if !status.success() {
-            bail!("setting exact mirror default branch failed");
-        }
+        set_bare_default_branch(mirror_dir.as_ref(), default_branch)?;
+    }
+    Ok(())
+}
+
+fn set_bare_default_branch(mirror_dir: &Path, default_branch: &str) -> Result<()> {
+    crate::validation::validate_git_rev(default_branch)
+        .with_context(|| format!("invalid default branch: {default_branch}"))?;
+    let head_ref = format!("refs/heads/{default_branch}");
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(mirror_dir.as_os_str())
+        .args(["symbolic-ref", "HEAD", &head_ref])
+        .status()
+        .context("set exact mirror default branch")?;
+    if !status.success() {
+        bail!("setting exact mirror default branch failed");
     }
     Ok(())
 }
@@ -2820,7 +2844,17 @@ mod tests {
         let origin = base.path().join("acme").join("head-rev.git");
         std::fs::create_dir_all(origin.parent().unwrap()).unwrap();
         let src = crate::test_fixture::init_bare(&origin);
-        let commit = crate::test_fixture::commit(&src, &[("README.md", b"hi")]);
+        let commit = crate::test_fixture::commit(&src, &[("README.md", b"pinned")]);
+        let later = crate::test_fixture::commit(&src, &[("README.md", b"later")]);
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&origin)
+                .args(["update-ref", "refs/tags/unrelated", &later])
+                .status()
+                .unwrap()
+                .success()
+        );
 
         let registry = ProviderRegistry::new();
         let provider = registry.default_provider();
@@ -2833,8 +2867,51 @@ mod tests {
         unsafe { std::env::remove_var("RIPCLONE_ORIGIN_BASE") };
 
         assert_eq!(default_branch(&mirror).unwrap(), "main");
-        assert_eq!(resolve_commit(&mirror, "HEAD").unwrap(), commit);
         assert_eq!(resolve_commit(&mirror, &commit).unwrap(), commit);
+        assert!(
+            resolve_commit(&mirror, &later).is_err(),
+            "historical full-SHA sync must not fetch the newer branch tip"
+        );
+        assert!(
+            resolve_commit(&mirror, "refs/tags/unrelated").is_err(),
+            "historical full-SHA sync must not fetch unrelated tags"
+        );
+        assert!(
+            resolve_commit(&mirror, "refs/heads/main").is_err(),
+            "default-branch discovery must not fetch the moving branch"
+        );
+    }
+
+    #[test]
+    fn ls_remote_named_ref_returns_tip_and_default_branch_from_one_advertisement() {
+        use crate::provider::{ProviderRegistry, RepoId};
+        let base = tempfile::tempdir().unwrap();
+        let origin = base.path().join("acme").join("named-tip.git");
+        std::fs::create_dir_all(origin.parent().unwrap()).unwrap();
+        let src = crate::test_fixture::init_bare(&origin);
+        let main = crate::test_fixture::commit(&src, &[("README.md", b"main")]);
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&origin)
+                .args(["update-ref", "refs/heads/feature", &main])
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let registry = ProviderRegistry::new();
+        let provider = registry.default_provider();
+        let repo_id = RepoId::github("acme/named-tip");
+        let _env = ORIGIN_BASE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("RIPCLONE_ORIGIN_BASE", base.path()) };
+        let tip = ls_remote_tip(provider, &repo_id, "feature", None)
+            .unwrap()
+            .expect("feature advertised");
+        unsafe { std::env::remove_var("RIPCLONE_ORIGIN_BASE") };
+
+        assert_eq!(tip.commit, main);
+        assert_eq!(tip.default_branch.as_deref(), Some("main"));
     }
 
     #[test]
