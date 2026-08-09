@@ -22,7 +22,19 @@ impl ClientTuning {
             .and_then(|s| s.parse::<usize>().ok())
             .filter(|&n| n > 0);
         let editable_download_concurrency = test_pack_concurrency.unwrap_or(cores);
-        let pack_parse_threads = test_pack_concurrency.unwrap_or(cores);
+        let requested_pack_threads = test_pack_concurrency.unwrap_or(cores);
+        #[cfg(target_os = "linux")]
+        let pack_parse_threads =
+            crate::worktree_writer::linux_fd_safe_writer_concurrency(requested_pack_threads);
+        #[cfg(not(target_os = "linux"))]
+        let pack_parse_threads = requested_pack_threads;
+        if pack_parse_threads < requested_pack_threads {
+            tracing::debug!(
+                requested_pack_threads,
+                pack_parse_threads,
+                "capping pack parser concurrency to the process file-descriptor budget"
+            );
+        }
         tracing::debug!(
             fetch_concurrency,
             archive_fetch_concurrency,
