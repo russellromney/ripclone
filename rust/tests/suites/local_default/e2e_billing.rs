@@ -63,20 +63,26 @@ async fn status_reports_nonzero_bytes_after_sync() {
     sync_until_manifest(&server, "acme", "billing").await;
 
     let status = get_status(&server, "acme", "billing", None).await;
-    // The async build persists the ref under both the resolved branch (`main`)
-    // and the literal `HEAD` alias (so any process can resolve `/sync HEAD` from
-    // the shared metadata store), so two ref rows appear for the one commit.
+    // The async build persists the ref under the resolved branch (`main`), the
+    // literal `HEAD` alias (so any process can resolve `/sync HEAD` from the
+    // shared metadata store), and the immutable `main#<commit>` alias used by
+    // pinned readers after the moving branch advances.
     let refs = status["refs"].as_array().unwrap();
-    assert_eq!(refs.len(), 2, "HEAD alias + resolved branch");
+    assert_eq!(refs.len(), 3, "HEAD + moving + immutable ref aliases");
     let branch = refs
         .iter()
         .find(|r| r["branch"] == "main")
         .expect("resolved main ref present");
+    let commit = branch["commit"].as_str().expect("main commit");
+    assert!(
+        refs.iter().any(|r| r["branch"] == format!("main#{commit}")),
+        "immutable main#<commit> ref present"
+    );
     assert!(branch["bytes"].as_u64().unwrap() > 0);
     assert_eq!(branch["bytes"], branch["unique_bytes"]);
     assert!(status["total_bytes"].as_u64().unwrap() > 0);
-    // The HEAD alias and `main` share the same artifacts, so the repo total
-    // dedups them.
+    // All three aliases share the same artifacts, so the repo total dedups
+    // them.
     assert_eq!(status["total_bytes"], status["total_unique_bytes"]);
     assert!(status["regions"][0]["unique_bytes"].as_u64().unwrap() > 0);
 }
