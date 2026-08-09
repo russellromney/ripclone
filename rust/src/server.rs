@@ -7249,6 +7249,7 @@ async fn do_sync(
     let repo_id_sync = repo_id.clone();
     let branch_sync = branch.to_string();
     let admitted_commit_sync = admitted_commit.map(str::to_string);
+    let admitted_default_branch_sync = admitted_default_branch.map(str::to_string);
     let historical_rev_sync = at_rev.map(str::to_string);
     let credential_sync = credential.cloned();
     admission_test_fetch_entry(admitted_commit.or(at_rev)).await;
@@ -7265,6 +7266,7 @@ async fn do_sync(
                 &provider_sync,
                 &repo_id_sync,
                 commit,
+                admitted_default_branch_sync.as_deref(),
                 credential_sync.as_ref(),
             )
         } else {

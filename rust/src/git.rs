@@ -2084,6 +2084,7 @@ pub fn sync_bare_mirror_admitted<P: AsRef<Path>>(
     provider: &ProviderInstance,
     repo_id: &RepoId,
     commit: &str,
+    default_branch: Option<&str>,
     credential: Option<&secrecy::SecretString>,
 ) -> Result<()> {
     crate::validation::validate_repo_path(provider, repo_id)
@@ -2105,7 +2106,30 @@ pub fn sync_bare_mirror_admitted<P: AsRef<Path>>(
         "HEAD",
         commit,
         false,
-    )
+    )?;
+
+    // An exact-only fetch intentionally does not create the moving branch ref,
+    // but a newly initialized bare repository otherwise keeps Git's platform
+    // default (often `master`) as HEAD. Retain the default branch discovered by
+    // the admission probe so a later historical expression such as `HEAD~2`
+    // resolves against the right branch after the ordinary mirror fetch fills
+    // it. This is a local symbolic-ref update only; it neither fetches nor
+    // publishes the moving branch.
+    if let Some(default_branch) = default_branch.filter(|branch| *branch != "HEAD") {
+        crate::validation::validate_git_rev(default_branch)
+            .with_context(|| format!("invalid admitted default branch: {default_branch}"))?;
+        let head_ref = format!("refs/heads/{default_branch}");
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(mirror_dir.as_ref().as_os_str())
+            .args(["symbolic-ref", "HEAD", &head_ref])
+            .status()
+            .context("set exact mirror default branch")?;
+        if !status.success() {
+            bail!("setting exact mirror default branch failed");
+        }
+    }
+    Ok(())
 }
 
 fn ensure_bare_origin(mirror_dir: &Path, url: &str) -> Result<()> {
@@ -2798,7 +2822,8 @@ mod tests {
 
         let _env = ORIGIN_BASE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::set_var("RIPCLONE_ORIGIN_BASE", base.path()) };
-        sync_bare_mirror_admitted(&mirror, provider, &repo_id, &commit_b, None).unwrap();
+        sync_bare_mirror_admitted(&mirror, provider, &repo_id, &commit_b, Some("main"), None)
+            .unwrap();
         unsafe { std::env::remove_var("RIPCLONE_ORIGIN_BASE") };
 
         assert_eq!(resolve_commit(&mirror, &commit_b).unwrap(), commit_b);
@@ -2810,6 +2835,19 @@ mod tests {
             resolve_commit(&mirror, "main").is_err(),
             "an immutable fetch must not update the moving branch ref"
         );
+        assert_eq!(
+            default_branch(&mirror).unwrap(),
+            "main",
+            "exact admission retains the probed default branch without fetching it"
+        );
+
+        // A later historical sync fills the moving refs. HEAD must then use the
+        // admission-time default branch rather than the bare-init default.
+        unsafe { std::env::set_var("RIPCLONE_ORIGIN_BASE", base.path()) };
+        sync_bare_mirror(&mirror, provider, &repo_id, "HEAD", Some("HEAD~1"), None).unwrap();
+        unsafe { std::env::remove_var("RIPCLONE_ORIGIN_BASE") };
+        assert_eq!(resolve_commit(&mirror, "HEAD~1").unwrap(), commit_b);
+        assert_eq!(resolve_commit(&mirror, "HEAD").unwrap(), commit_c);
     }
 
     #[test]
@@ -2845,7 +2883,8 @@ mod tests {
         let repo_id = RepoId::github("acme/deleted");
         let _env = ORIGIN_BASE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::set_var("RIPCLONE_ORIGIN_BASE", base.path()) };
-        sync_bare_mirror_admitted(&mirror, provider, &repo_id, &commit_b, None).unwrap();
+        sync_bare_mirror_admitted(&mirror, provider, &repo_id, &commit_b, Some("main"), None)
+            .unwrap();
         unsafe { std::env::remove_var("RIPCLONE_ORIGIN_BASE") };
 
         assert_eq!(resolve_commit(&mirror, &commit_b).unwrap(), commit_b);
