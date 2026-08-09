@@ -1325,7 +1325,7 @@ impl Client {
         // success, so the post-clone metrics report can label the clone cold.
         let mut polled = false;
         for attempt in 0..max_attempts {
-            let requested_top_up = allow_top_up && pinned.is_some();
+            let requested_top_up = allow_top_up && pinned.is_some() && rev.is_none();
             let request_branch = if pinned.is_some() {
                 resolved_branch.as_deref().unwrap_or(branch)
             } else {
@@ -1346,7 +1346,12 @@ impl Client {
                 if requested_top_up {
                     q.push("top_up=true".to_string());
                 }
-            } else if let Some(r) = rev {
+            }
+            // Keep the explicit historical selector on pinned readiness polls.
+            // This is what distinguishes the established `sync --at` result
+            // lane from an ordinary branch pin; ordinary pins never gain access
+            // to commit-keyed historical metadata.
+            if let Some(r) = rev {
                 q.push(format!("rev={}", urlencoding::encode(r)));
             }
             if !q.is_empty() {
