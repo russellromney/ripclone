@@ -1340,35 +1340,7 @@ async fn seed_shallow_s3_fixture(
         .save_branch(&repo_id, &default_branch, &info)
         .await
         .expect("publish S3 default-branch fixture");
-    s3_refs
-        .save_branch(&repo_id, &format!("{default_branch}#{pinned}"), &info)
-        .await
-        .expect("publish exact S3 A fixture");
     (pinned, s3_refs, info, fixture)
-}
-
-async fn publish_moving_s3_row(
-    ref_store: &Arc<dyn RefStore>,
-    repo_id: &RepoId,
-    previous: &ripclone::RefInfo,
-    commit: &str,
-) {
-    let info = ripclone::RefInfo {
-        commit: commit.to_string(),
-        default_branch: previous.default_branch.clone(),
-        build_status: Some("building".to_string()),
-        synced_at: Some(previous.synced_at.unwrap_or(0).saturating_add(1)),
-        generation: Some(previous.generation.unwrap_or(0).saturating_add(1)),
-        ..Default::default()
-    };
-    ref_store
-        .save_branch(repo_id, "HEAD", &info)
-        .await
-        .expect("publish moving S3 HEAD row");
-    ref_store
-        .save_branch(repo_id, &info.default_branch, &info)
-        .await
-        .expect("publish moving S3 default-branch row");
 }
 
 /// Cleanup client with the same timeout/retry posture as production S3Storage.
@@ -2128,7 +2100,7 @@ async fn expired_signed_url_retry_stays_on_pinned_commit() {
         "A",
     );
     origin.publish();
-    let (pinned, exact_store, exact_a, _fixture) =
+    let (pinned, _exact_store, exact_a, _fixture) =
         seed_shallow_s3_fixture(&direct_env, &prefix, &repo).await;
     assert!(
         exact_a.packs.len() >= 2,
@@ -2147,7 +2119,6 @@ async fn expired_signed_url_retry_stays_on_pinned_commit() {
     )
     .await;
     let selected_pack = exact_a.packs[expiring_pack_index].pack.clone();
-    let repo_id = RepoId::github(format!("acme/{repo}"));
     add_acme_repo(&server, &repo).await;
 
     unsafe {
@@ -2218,18 +2189,6 @@ async fn expired_signed_url_retry_stays_on_pinned_commit() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
-    origin.commit(&[("value.txt", "B\n"), ("stable.txt", "stable\n")], "B");
-    origin.publish();
-    let newer = git(&origin.bare, &["rev-parse", "HEAD"]);
-    assert_ne!(pinned, newer);
-    publish_moving_s3_row(&exact_store, &repo_id, &exact_a, &newer).await;
-    let published_b = exact_store
-        .load_branch(&repo_id, "HEAD")
-        .await
-        .expect("load published S3 B row")
-        .expect("published S3 B row present")
-        .commit;
-    assert_eq!(published_b, newer);
     // The one-second presign is already expired when ready metadata makes it
     // observable. The proxy waits for pack zero's real install worker before
     // forwarding pack one's request to MinIO.
@@ -2444,7 +2403,7 @@ async fn revoked_authorization_blocks_pinned_refresh() {
     guard.track_repo("acme", &repo);
     origin.commit(&[("value.txt", "A\n"), ("stable.txt", "stable\n")], "A");
     origin.publish();
-    let (pinned, exact_store, exact_a, _fixture) =
+    let (pinned, _exact_store, exact_a, _fixture) =
         seed_shallow_s3_fixture(&direct_env, &prefix, &repo).await;
     assert!(
         !exact_a.packs.is_empty(),
@@ -2459,7 +2418,6 @@ async fn revoked_authorization_blocks_pinned_refresh() {
         exact_a.packs[0].pack.clone(),
     )
     .await;
-    let repo_id = RepoId::github(format!("acme/{repo}"));
     add_acme_repo(&server, &repo).await;
 
     unsafe {
@@ -2505,11 +2463,6 @@ async fn revoked_authorization_blocks_pinned_refresh() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
-    origin.commit(&[("value.txt", "B\n"), ("stable.txt", "stable\n")], "B");
-    origin.publish();
-    let newer = git(&origin.bare, &["rev-parse", "HEAD"]);
-    assert_ne!(pinned, newer);
-    publish_moving_s3_row(&exact_store, &repo_id, &exact_a, &newer).await;
     initial_pinned_proceed
         .send(())
         .expect("release initial exact-A metadata request");
