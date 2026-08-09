@@ -591,7 +591,19 @@ async fn blocked_full_b_tops_up_carried_direct_parent_a_and_publishes_exact_b() 
     let (server, barrier, entered, proceed) =
         start_server_split_storage_phase_one_barrier_with_registry(registry).await;
 
-    let large = vec![b'u'; 2 * 1024 * 1024];
+    // SplitMix64 gives this blob deterministic high entropy. Repeated bytes
+    // compress too well to detect an accidental retransmission of unchanged
+    // content, so keep this large enough to make the byte budget load-bearing.
+    let mut state = 0x4d59_5df4_d0f3_3173_u64;
+    let mut large = Vec::with_capacity(12 * 1024 * 1024);
+    while large.len() < large.capacity() {
+        state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut value = state;
+        value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        value ^= value >> 31;
+        large.extend_from_slice(&value.to_le_bytes());
+    }
     for (path, bytes) in [
         ("modified.txt", b"before\n".as_slice()),
         ("deleted.txt", b"delete me\n".as_slice()),
@@ -608,6 +620,7 @@ async fn blocked_full_b_tops_up_carried_direct_parent_a_and_publishes_exact_b() 
     #[cfg(unix)]
     std::os::unix::fs::symlink("modified.txt", origin.work.join("link")).unwrap();
     let a = commit_all(&origin.work, "A");
+    let unchanged_blob = git(&origin.work, &["hash-object", "unchanged.bin"]);
     origin.publish();
 
     register_added_without_build_for_provider(&server, "counting", "acme/full-topup")
@@ -933,6 +946,11 @@ exec "$real_git" "$@"
         upstream_bytes > 0,
         "the counting upstream must observe exact-fetch response bytes"
     );
+    assert!(
+        upstream_bytes < (large.len() / 8) as u64,
+        "top-up transferred {upstream_bytes} bytes for a {}-byte unchanged blob",
+        large.len()
+    );
     assert_eq!(origin.auth_reject_count(), 0);
     let server_source_acquisitions = std::fs::read_to_string(&source_log)
         .expect("server source acquisition log")
@@ -955,6 +973,38 @@ server_enqueues={} server_builder_entries={} full_b_blocked=true",
         metric("after_mtime_ns"),
         observed.enqueues,
         observed.builder_entries,
+    );
+
+    // Non-vacuity control: an empty Git repository fetching the same pinned B
+    // must transfer A's incompressible unchanged blob. This proves the HTTP
+    // byte counter can see the regression excluded by the top-up ceiling.
+    origin.clear_auth_log();
+    let fresh = tempfile::tempdir().expect("fresh-fetch control repo");
+    git(fresh.path(), &["init", "-q"]);
+    let auth_arg = format!("http.extraHeader=Authorization: token {upstream_token}");
+    let remote = format!("{}/acme/full-topup.git", origin.url);
+    git(
+        fresh.path(),
+        &["-c", &auth_arg, "fetch", "--no-tags", "--", &remote, &b],
+    );
+    assert_eq!(
+        git(fresh.path(), &["cat-file", "-t", &unchanged_blob]),
+        "blob"
+    );
+    let fresh_fetch_bytes = origin.auth_success_bytes();
+    assert!(
+        fresh_fetch_bytes > (large.len() * 3 / 4) as u64,
+        "fresh-fetch control observed only {fresh_fetch_bytes} bytes for a {}-byte incompressible blob",
+        large.len()
+    );
+    assert!(
+        upstream_bytes * 8 < fresh_fetch_bytes,
+        "top-up {upstream_bytes} bytes was not a small fraction of fresh fetch {fresh_fetch_bytes}"
+    );
+    println!(
+        "TOP_UP_BYTE_CONTROL unchanged_blob_bytes={} top_up_bytes={upstream_bytes} fresh_fetch_bytes={fresh_fetch_bytes} ratio_x={:.1}",
+        large.len(),
+        fresh_fetch_bytes as f64 / upstream_bytes as f64
     );
     #[cfg(unix)]
     {
