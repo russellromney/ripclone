@@ -937,7 +937,7 @@ exec "$real_git" "$@"
         "one top-up plan must read exactly Full(A)'s carried manifest"
     );
     let upstream_requests = origin.auth_success_count();
-    let upstream_bytes = origin.auth_success_bytes();
+    let upstream_bytes = origin.auth_success_get_body_bytes();
     assert!(
         upstream_requests > 0,
         "the exact B fetch must reach the counting upstream"
@@ -991,7 +991,7 @@ server_enqueues={} server_builder_entries={} full_b_blocked=true",
         git(fresh.path(), &["cat-file", "-t", &unchanged_blob]),
         "blob"
     );
-    let fresh_fetch_bytes = origin.auth_success_bytes();
+    let fresh_fetch_bytes = origin.auth_success_get_body_bytes();
     assert!(
         fresh_fetch_bytes > (large.len() * 3 / 4) as u64,
         "fresh-fetch control observed only {fresh_fetch_bytes} bytes for a {}-byte incompressible blob",

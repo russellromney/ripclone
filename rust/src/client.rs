@@ -3047,9 +3047,19 @@ impl Client {
                 async move {
                     let (i, history_only, pack_body, idx_bytes) = res?;
                     let bytes = (pack_body.len() + idx_bytes.len()) as u64;
+                    let fd_permit = if history_only {
+                        None
+                    } else {
+                        Some(tuning::acquire_pack_parse_fd_permit().await)
+                    };
                     let result = AbortOnDrop::new(
                         tokio::task::spawn_blocking(
                             move || -> Result<crate::extract::PackExtractResult> {
+                                // Own the global Linux descriptor lease for the
+                                // complete parser/writer lifetime, including
+                                // deferred io_uring windows. On other platforms
+                                // this is a zero-sized no-op guard.
+                                let _fd_permit = fd_permit;
                                 if pack_body.len() < 20 {
                                     anyhow::bail!(
                                         "pack {} too short ({} bytes)",

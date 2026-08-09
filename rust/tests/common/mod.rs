@@ -1418,7 +1418,7 @@ impl HttpOrigin {
         self.auth_status_count("200")
     }
 
-    pub fn auth_success_bytes(&self) -> u64 {
+    pub fn auth_success_get_body_bytes(&self) -> u64 {
         let Some(path) = &self.auth_log else {
             return 0;
         };
@@ -1546,7 +1546,7 @@ class AuthHandler(http.server.SimpleHTTPRequestHandler):
 
     def record(self, status):
         size = 0
-        if status == 200:
+        if status == 200 and self.command == 'GET':
             path = self.translate_path(self.path.split('?', 1)[0])
             if os.path.isfile(path):
                 size = os.path.getsize(path)
