@@ -3637,9 +3637,7 @@ async fn get_ref_inner(
                     if key == "HEAD" {
                         continue;
                     }
-                    if key.rsplit_once('#').is_some_and(|(_, suffix)| {
-                        crate::validation::validate_object_id(suffix).is_ok()
-                    }) {
+                    if is_commit_keyed_historical_ref(&key) {
                         continue;
                     }
                     if let Ok(Some(info)) = state.ref_store.load_branch(&repo_id, &key).await
@@ -4290,10 +4288,10 @@ async fn build_repo_status(
     let mut unique_chunks: HashMap<String, u64> = HashMap::new();
 
     for branch in branches {
-        // Historical `sync --at` metadata is not an upstream source ref. Git
-        // forbids `#` in ref names, so never expose those compatibility keys as
-        // public branches.
-        if branch.contains('#') {
+        // Historical `sync --at` metadata is not an upstream source ref. Keep
+        // those pre-existing commit-keyed compatibility rows out of status
+        // without hiding valid Git branches that contain `#`.
+        if is_commit_keyed_historical_ref(&branch) {
             continue;
         }
         let Some(info) = state.ref_store.load_branch(repo_id, &branch).await? else {
@@ -6428,14 +6426,19 @@ fn sweep_stale_tempdirs(dir: &std::path::Path, max_age: Duration) {
 /// real branch entry and never get stuck reusing a stale/incomplete rev-keyed
 /// build from an older server version. Sequential rev syncs at the same commit
 /// still share this key, so they stay incremental. Tip builds use the branch
-/// directly. The git ref-name grammar forbids `#`, so this can never collide
-/// with a real branch.
+/// directly. This is the pre-existing historical compatibility layout; ordinary
+/// admitted work must never use it.
 fn ref_store_key(branch: &str, at_rev: Option<&str>, commit: Option<&str>) -> String {
     match (at_rev, commit) {
         (Some(_), Some(commit)) => format!("{branch}#{commit}"),
         (Some(rev), None) => format!("{branch}#{rev}"),
         (None, _) => branch.to_string(),
     }
+}
+
+fn is_commit_keyed_historical_ref(key: &str) -> bool {
+    key.rsplit_once('#')
+        .is_some_and(|(_, suffix)| crate::validation::validate_object_id(suffix).is_ok())
 }
 
 fn tuple_to_sized(p: &(String, u64, String, u64)) -> crate::SizedPack {
@@ -9314,8 +9317,9 @@ pub async fn poll_once(state: &ServerState) -> usize {
         };
         for branch in branches {
             // Historical `sync --at` metadata is not an upstream branch. Do
-            // not turn its internal key into an `ls-remote` request.
-            if branch.contains('#') {
+            // not turn its commit-keyed compatibility key into an `ls-remote`
+            // request, while preserving valid source branches containing `#`.
+            if is_commit_keyed_historical_ref(&branch) {
                 continue;
             }
             // Cheap tip probe, under the same fetch cap as a real fetch so a sweep

@@ -764,6 +764,25 @@ async fn real_server_pending_head_preserves_delimiter_branch_on_exact_poll() {
         .expect("delimiter branch is ready before forcing the 202");
     assert_eq!(ready.commit, commit);
     assert_eq!(ready.branch, "release#one");
+    let status = reqwest::Client::new()
+        .get(format!(
+            "{}/v1/repos/github/acme/delimiter-branch/status",
+            server.url
+        ))
+        .header("Authorization", format!("Ripclone {}", token_hash()))
+        .send()
+        .await
+        .expect("status for delimiter branch");
+    assert_eq!(status.status(), StatusCode::OK);
+    let status: serde_json::Value = status.json().await.expect("delimiter status response");
+    assert!(
+        status["refs"]
+            .as_array()
+            .expect("status refs")
+            .iter()
+            .any(|entry| entry["branch"] == "release#one" && entry["commit"] == commit),
+        "a real source branch containing # must remain visible in public status: {status:?}"
+    );
     unsafe {
         std::env::set_var("RIPCLONE_TESTING", "1");
         std::env::set_var("RIPCLONE_TEST_REF_POLL_MS", "0");
